@@ -30,6 +30,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx.utils import tree_flatten
 
 from . import generate as generate_module
 from .generate import GenerationDefaults, GenerationRequest, SamplingParams
@@ -47,6 +48,7 @@ from .utils import (
     _finite_batch_schedule,
     _finite_text_pad_width,
     _get_processor_tokenizer,
+    _is_vlm_model,
     _mlx_rng_key,
     _length_dependent_ropes,
     _normalize_mlx_messages,
@@ -61,6 +63,8 @@ from .utils import (
     _vlm_batch_family,
     _vlm_family_divergence,
     _vlm_family_is_plannable,
+    _vlm_image_encoder,
+    _vlm_image_features,
     _vlm_pipeline_disposable_keys,
     _vlm_token_aligned_sidecars,
     _vlm_width_survey,
@@ -232,14 +236,41 @@ def completion_logps(model, batch, temperature):
     return -_row_contiguous_cross_entropy(logits, targets, reduction="none").reshape(targets.shape)
 
 
-def grpo_logps(temperature, scorer=None, *, differentiated):
-    """(model, batch, lengths, indices=None) -> log-probs: the logits path, or scorer's runtime CCE with its own temperature over the flat positions in indices; zero outside the response; differentiated=False keeps the scorer on its loss-only kernel."""
-    if scorer is None:
-        return lambda model, batch, _lengths, _indices=None: completion_logps(model, batch, temperature)
+def _shared_prefix_hidden(model, batch, prefix):
+    """_preference_hidden's states, zero over prefix: each group's leading tokens (a vision batch, images included, for
+    a vision model), run once for its consecutive rows, whose own batch then needs only ids."""
+    from .utils import _forward_text_hidden_states, _get_text_backbone, _prefix_cache, _vlm_hidden_states
 
-    def logps(model, batch, lengths, indices=None):
+    backbone = _get_text_backbone(model)
+    ids = _preference_ids(batch)
+    groups, shared = _preference_ids(prefix).shape
+    recorded = _prefix_cache(backbone)
+    if isinstance(prefix, Mapping):
+        _vlm_hidden_states(model, prefix, cache=recorded)
+    else:
+        backbone(prefix, cache=recorded)
+    extended = _prefix_cache(backbone, recorded, ids.shape[0] // groups, interleaved=True)
+    positions = {}
+    if isinstance(prefix, Mapping) and prefix.get("_unsloth_collated_position_ids"):
+        # The suffix is text, so MRoPE continues past the prompt's largest position on all axes, the image's included.
+        start = prefix["position_ids"].max(axis=-1, keepdims=True).max(axis=0, keepdims=True) + 1
+        steps = mx.repeat(start, ids.shape[0] // groups, axis=1) + mx.arange(ids.shape[1] - 1 - shared)
+        positions["position_ids"] = mx.broadcast_to(steps, (prefix["position_ids"].shape[0], *steps.shape[1:]))
+    hidden = _forward_text_hidden_states(model, ids[:, shared:-1], cache=extended, **positions)
+    return mx.concatenate([mx.zeros((ids.shape[0], shared, hidden.shape[-1]), hidden.dtype), hidden], axis=1)
+
+
+def grpo_logps(temperature, scorer=None, *, differentiated):
+    """(model, batch, lengths, indices=None, prefix=None) -> log-probs: the logits path, or scorer's runtime CCE with its
+    own temperature over the flat positions in indices, through the shared prompt prefix; zero outside the response;
+    differentiated=False keeps the scorer on its loss-only kernel."""
+    if scorer is None:
+        return lambda model, batch, _lengths, _indices=None, _prefix=None: completion_logps(model, batch, temperature)
+
+    def logps(model, batch, lengths, indices=None, prefix=None):
         supervised = _response_mask(_preference_ids(batch)[:, 1:], lengths) > 0
-        return -scorer(model, batch, supervised, indices, logit_sums=False, differentiated=differentiated)[0]
+        shared = {} if prefix is None else {"hidden": _shared_prefix_hidden(model, batch, prefix)}
+        return -scorer(model, batch, supervised, indices, logit_sums=False, differentiated=differentiated, **shared)[0]
 
     return logps
 
@@ -267,7 +298,7 @@ def _scored_as_step(logps, step_compiled):
 
     toggles, compiled, failed = {}, {}, []
 
-    def traced(model, batch, lengths, indices=None):
+    def traced(model, batch, lengths, indices=None, prefix=None):
         if step_compiled() and not failed:
             # Compiled like the step: its fused kernels differ from the eager ones in some vision towers (Qwen3.5's).
             # A trace keeps its model and the Python numbers it read, such as the adapter scales a reference turns
@@ -282,16 +313,16 @@ def _scored_as_step(logps, step_compiled):
             rng = _mlx_rng_key()
             try:
                 if key not in compiled:
-                    run = lambda batch, lengths, indices: mx.value_and_grad(
-                        lambda anchor: (anchor, logps(model, batch, lengths, indices)))(mx.array(0.0))[0][1]
+                    run = lambda batch, lengths, indices, prefix: mx.value_and_grad(
+                        lambda anchor: (anchor, logps(model, batch, lengths, indices, prefix)))(mx.array(0.0))[0][1]
                     compiled[key] = mx.compile(run, inputs=[model.state, mx.random.state], outputs=[mx.random.state])
-                return compiled[key](batch, lengths, indices)
+                return compiled[key](batch, lengths, indices, prefix)
             except Exception as error:
                 # Scoring runs while a batch is fetched, outside the step's compile fallback: score eagerly instead.
                 failed.append(error)
                 _restore_mlx_rng_key(rng)
                 warnings.warn(f"Unsloth: compiling GRPO scoring failed ({error}); scoring eagerly.", RuntimeWarning)
-        run = lambda: (mx.array(0.0), logps(model, batch, lengths, indices))
+        run = lambda: (mx.array(0.0), logps(model, batch, lengths, indices, prefix))
         return nn.value_and_grad(model, run)()[0][1]
 
     return traced
@@ -308,6 +339,8 @@ def grpo_terms(objective, new, advantages, mask, *, old=None, ref=None):
     keep = mask > 0
     zero = mx.array(0.0, mx.float32)
     new = mx.where(keep, new, zero)
+    if isinstance(old, tuple):  # old log-probs not yet known are the step's own: no update separates them
+        old = mx.where(old[1], old[0], mx.stop_gradient(new))
     old = None if old is None else mx.where(keep, old, zero)
     ref = None if ref is None else mx.where(keep, ref, zero)
     advantages = advantages[:, None]
@@ -375,18 +408,20 @@ def grpo_metric_values(summed):
     return values
 
 
-def make_grpo_loss_fn(objective, *, scorer=None, differentiated=True):
-    """GRPO loss over a micro-batch (tokens, lengths, normalizers, advantages, kept, old_logps, ref_logps, cce_indices, sample weights); kept zeroes rows TRL masks as truncated."""
+def make_grpo_loss_fn(objective, *, scorer=None, report_logps=False, differentiated=True):
+    """GRPO loss over a micro-batch (tokens, lengths, normalizers, advantages, kept, old_logps or (them, whether they are known), ref_logps, cce_indices, sample weights, shared prompt ids); kept zeroes rows TRL masks as truncated; report_logps pairs the stats with the per-token log-probs."""
     logps = grpo_logps(objective.temperature, scorer, differentiated=differentiated)
 
     def loss_fn(
         model, batch, lengths, normalizers, advantages, kept, old=None, ref=None, cce_indices=None, weights=None,
+        prefix=None,
     ):
-        new = logps(model, batch, lengths, cce_indices)
+        new = logps(model, batch, lengths, cce_indices, prefix)
         mask = _response_mask(_preference_ids(batch)[:, 1:], lengths) * kept[:, None].astype(mx.float32)
         per_token, kl, coef_1 = grpo_terms(objective, new, advantages, mask, old=old, ref=ref)
         loss = _reduce(objective, per_token, mask, normalizers, weights)
-        return loss, mx.array(1, dtype=mx.int32), grpo_stats(objective, kl, coef_1, advantages, mask)
+        stats = grpo_stats(objective, kl, coef_1, advantages, mask)
+        return loss, mx.array(1, dtype=mx.int32), (stats, mx.stop_gradient(new)) if report_logps else stats
 
     loss_fn._unsloth_supervised_tokens = _supervised_tokens
     loss_fn._unsloth_preference_metrics = GRPO_LOSS_METRICS
@@ -399,11 +434,11 @@ def make_grpo_loss_fn(objective, *, scorer=None, differentiated=True):
     return loss_fn
 
 
-def make_grpo_cce_loss_fn(model, objective):
+def make_grpo_cce_loss_fn(model, objective, *, report_logps=False):
     """The GRPO loss scored through runtime CCE when the head allows it."""
     return make_grpo_loss_fn(objective, scorer=_make_preference_cce_scorer(
         model, temperature=objective.temperature,
-    ))
+    ), report_logps=report_logps)
 
 
 
@@ -810,6 +845,7 @@ class _Generation:
     skipped: dict | None = None
     weights: np.ndarray | None = None
     eager: bool = False
+    features: list | None = None
     vision_inputs: dict | None = None  # (first row, width) -> that micro-batch's vision inputs
 
 
@@ -824,9 +860,11 @@ class GRPOBatchPlan:
         sampling, score_temperature, scale_rewards, mask_truncated_completions,
         with_old_logps, with_reference, max_seq_length, seed, counts_tokens=True,
         processor=None, model_config=None, vision=False, rollout_old=False, group_by_length=False, layout_block=1,
-        skip_zero_advantage=False, sample_weighting=None, media_signatures=None,
+        skip_zero_advantage=False, sample_weighting=None, media_signatures=None, prefix_grouping=False,
+        first_pass_slots=0,
     ):
         self._dataset = dataset
+        self._first_pass_slots = first_pass_slots
         self._media_signatures = media_signatures
         self._tokenizer = tokenizer
         self._processor = processor
@@ -853,12 +891,15 @@ class GRPOBatchPlan:
         self.group_by_length = group_by_length
         self.skip_zero_advantage = skip_zero_advantage
         self.sample_weighting = sample_weighting
+        self._prefix = prefix_grouping
+        self._prefix_tokr = float(os.environ.get("UNSLOTH_GRPO_PREFIX_GROUPER_TOKR", "1.3"))
         self._layout_rows = batch_size * layout_block
         self.eos_id = int(tokenizer.eos_token_id)
         pad_id = getattr(tokenizer, "pad_token_id", None)
         self.pad_id = self.eos_id if pad_id is None else int(pad_id)
         self._anchor = 0
         self._current = None
+        self._features = None
         self._model = None
         self._shape_plan = None
         self._cce_bounds = None
@@ -893,6 +934,8 @@ class GRPOBatchPlan:
         old and reference log-probs are scored as the loss scores."""
         if self.with_reference and reference_policy is None:
             raise ValueError("Unsloth MLX GRPO: this plan scores a reference policy.")
+        if self._prefix and scorer is None:
+            raise ValueError("Unsloth MLX GRPO: a shared-prompt plan needs the loss's runtime CCE scorer.")
         self._model = model
         self._reward_funcs = list(reward_funcs)
         self._reward_weights = (
@@ -953,6 +996,8 @@ class GRPOBatchPlan:
         return np.random.default_rng(_derived_seed(self.seed, visit, 1)).permutation(rows)
 
     def _vision_family(self, inputs):
+        # Shared image features follow the images' shapes, which the survey already classes.
+        inputs = {key: value for key, value in inputs.items() if key != "cached_image_features"}
         _width, axes, padable, forbidden = _vlm_width_survey(
             inputs, disposable_keys=_vlm_pipeline_disposable_keys(self._model_config),
         )
@@ -964,7 +1009,8 @@ class GRPOBatchPlan:
         False when a family cannot be planned."""
         if self._families is not None:
             return True
-        if self._processor is None:
+        # An engaged shared prompt lays out whole groups per micro-step, which the surveyed families do not plan.
+        if self._processor is None or self._prefix:
             return False
         surveyed, entries = {}, []
         with _preserved_preprocessing_rng():
@@ -1024,16 +1070,56 @@ class GRPOBatchPlan:
             lengths[row] = (prompt_length, len(sequence))
         return batch, lengths
 
-    def _inputs(self, batch, lengths, media, held=None, key=None):
+    def _inputs(self, batch, lengths, media, ids_only=False, features=None, held=None, key=None):
         if self._processor is None:
             return mx.array(batch)
+        if ids_only:
+            mask = (np.arange(batch.shape[1])[None] < lengths[:, 1:]).astype(np.int32)
+            return {"input_ids": mx.array(batch), "attention_mask": mx.array(mask)}
         # A micro-batch's processor outputs serve its old and reference scores and every iteration over it.
         if held is None or key not in held:
             inputs = _grpo_vision_batch(self._processor, self._model_config, batch, lengths, media)
-            if held is None:
-                return inputs
-            held[key] = inputs
-        return dict(held[key])
+            if held is not None:
+                held[key] = inputs
+        inputs = dict(inputs if held is None else held[key])
+        cached = [value for value in features or () if value is not None]
+        if cached:
+            inputs["cached_image_features"] = mx.concatenate(cached, axis=-2)
+        return inputs
+
+    def _shared_image_features(self, prompts, encoded, order):
+        """Per laid-out row, its prompt's image features, encoded once per generation for every pass to read; None
+        unless each pass would compute these: a frozen tower without active dropout that the reference leaves as is."""
+        distinct = [prompt for prompt in dict.fromkeys(prompts) if encoded and encoded[prompt][2]]
+        encoder = _vlm_image_encoder(self._model) if distinct else None
+        reference = self._reference_policy if self.with_reference else None
+        tokens = list(generate_module._media_token_ids(self._model_config))
+        if not tokens or encoder is None or any(
+            tree_flatten(module.trainable_parameters()) for module in encoder.modules
+        ) or reference is not None and (
+            reference.model is not None or not reference.leaves_untouched(encoder.module_ids)
+        ):
+            return None
+        features = {}
+        # A micro-batch of prompts per tower run, so no run holds more images than a training forward.
+        for start in range(0, len(distinct), self.batch_size):
+            chunk = distinct[start:start + self.batch_size]
+            ids = [self._prompt_ids[prompt] for prompt in chunk]
+            batch, lengths = self._pack(ids, np.array(list(map(len, ids))), self._width(max(map(len, ids))))
+            encoded_features = _vlm_image_features(self._model, _grpo_vision_batch(
+                self._processor, self._model_config, batch, lengths, [encoded[prompt][1:3] for prompt in chunk],
+            ))
+            counts = [int(np.isin(prompt_ids, tokens).sum()) for prompt_ids in ids]
+            # A tower may pad its output past the valid rows, which come first, prompt by prompt.
+            if encoded_features is None or encoded_features.shape[-2] < sum(counts):
+                return None
+            offsets = np.cumsum([0, *counts])
+            features.update(
+                (prompt, encoded_features[..., low:high, :])
+                for prompt, low, high in zip(chunk, offsets, offsets[1:])
+            )
+        mx.eval(list(features.values()))
+        return [features.get(prompts[row]) for row in order]
 
     def configure_cce_compaction(self, enabled=True):
         self._cce_bounds = (min(map(len, self._prompt_ids)), max(self._max_tokens)) if enabled else None
@@ -1048,15 +1134,69 @@ class GRPOBatchPlan:
         capacity = grpo_cce_capacity(len(lengths), width, *self._cce_bounds)
         return None if capacity is None else mx.array(grpo_cce_indices(lengths, width, capacity))
 
-    def _score(self, scorer, visit, sequences, prompt_lengths, media, skipped=(), held=None):
+    def _prefix_ids(self, batch, lengths, media=None, features=None):
+        """[groups, shared] leading prompt tokens each group's rows share, or None unless that cuts padded tokens by
+        _prefix_tokr; shared, a multiple of 32, stops short of the last prompt token, which predicts the completion.
+        A vision model gets a vision batch of them with each group's images, which must all lie within them."""
+        if not self._prefix:
+            return None
+        size = self.num_generations
+        rows, width = batch.shape
+        groups, shared = rows // size, (int(lengths[:, 0].min()) - 1) // 32 * 32
+        if shared <= 0 or rows % size or (
+            batch.reshape(groups, -1, width)[:, :, :shared] != batch[::size, None, :shared]
+        ).any():
+            return None
+        full, split = rows * (width - 1), groups * shared + rows * (width - 1 - shared)
+        if full < self._prefix_tokr * split:
+            return None
+        if self._processor is None:
+            return mx.array(batch[::size, :shared])
+        media = None if media is None else media[::size]
+        if media is not None and any(images for _, images in media):
+            # A media token past shared would leave its features without a place in the prompt that runs once.
+            tokens = generate_module._media_token_ids(self._model_config)
+            prompt = np.arange(shared, width)[None] < lengths[::size, :1]
+            if not tokens or np.isin(batch[::size, shared:], list(tokens))[prompt].any():
+                return None
+        return self._inputs(
+            batch[::size, :shared], np.full((groups, 2), shared, dtype=np.int32), media,
+            features=None if features is None else features[::size],
+        )
+
+    @property
+    def needs_step_logps(self):
+        """Whether the trainer must hand each step's log-probs to keep_old_logps: a later iteration reads them."""
+        return self._first_pass_slots > 0 and self._repeats > self.steps_per_generation
+
+    def keep_old_logps(self, index, logps):
+        """Keep a micro-step's own log-probs as its slot's old ones if the plan left them unscored."""
+        generation = self._current
+        if generation is None or generation.old is None or generation.visit != self._generation_start(index):
+            raise RuntimeError(f"Unsloth MLX GRPO: micro-step {index}'s generation is not the current one.")
+        position = ((index - generation.visit) % self.steps_per_generation) * self.batch_size
+        rows = range(position, min(position + self.batch_size, len(generation.sequences)))
+        # Deferral and keeping are per slot, so a slot's rows are all known or all not.
+        if generation.old[position] is not None:
+            return
+        logps = np.array(logps, dtype=np.float32)
+        for offset, row in enumerate(rows):
+            generation.old[row] = logps[offset, :len(generation.sequences[row]) - 1]
+
+    def _score(self, scorer, visit, sequences, prompt_lengths, media, skipped=(), deferred=0, held=None):
         values = []
         for start in range(0, len(sequences), self.batch_size):
             chunk = sequences[start:start + self.batch_size]
             if start // self.batch_size in skipped:
                 values.extend(np.zeros(len(sequence) - 1, dtype=np.float32) for sequence in chunk)
                 continue
-            inputs, lengths, width = self._slot_inputs(visit, start, chunk, prompt_lengths, media, held)
-            logps = np.array(scorer(inputs, mx.array(lengths), self._cce_indices(lengths, width)), dtype=np.float32)
+            if start // self.batch_size < deferred:
+                values.extend([None] * len(chunk))
+                continue
+            inputs, lengths, width, prefix = self._slot_inputs(visit, start, chunk, prompt_lengths, media, held)
+            logps = np.array(
+                scorer(inputs, mx.array(lengths), self._cce_indices(lengths, width), prefix), dtype=np.float32,
+            )
             values.extend(logps[row, :len(sequence) - 1] for row, sequence in enumerate(chunk))
         return values
 
@@ -1064,7 +1204,11 @@ class GRPOBatchPlan:
         width = self._planned(self._width(max(len(sequence) for sequence in chunk)), visit + start // self.batch_size)
         batch, lengths = self._pack(chunk, prompt_lengths[start:start + self.batch_size], width)
         media = None if media is None else media[start:start + self.batch_size]
-        return self._inputs(batch, lengths, media, held, (start, width)), lengths, width
+        features = None if self._features is None else self._features[start:start + self.batch_size]
+        prefix = self._prefix_ids(batch, lengths, media, features)
+        return self._inputs(
+            batch, lengths, media, ids_only=prefix is not None, features=features, held=held, key=(start, width),
+        ), lengths, width, prefix
 
     def _generation_family_drift(self, visit, sequences, prompt_lengths, media):
         """The first micro-batch of a generation whose vision family left its survey, found before any is scored."""
@@ -1178,7 +1322,15 @@ class GRPOBatchPlan:
         # Exactly zero, not TRL's zero std: a rounded group mean leaves a tiny advantage that still has gradient.
         dead = (advantages == 0) & self.skip_zero_advantage
         eager = False
-        if self.group_by_length or self.skip_zero_advantage:
+        if self._prefix:
+            # Whole groups in each micro-batch; grpo_prefix_grouping admits only layouts whose block is a whole generation.
+            size = self.num_generations
+            dead_groups = dead.reshape(-1, size).all(axis=1)
+            longest = (prompt_lengths + lengths).reshape(-1, size).max(axis=1) * self.group_by_length
+            groups = np.array(list(dict.fromkeys(order // size)))
+            groups = grpo_row_layout(groups, self._layout_rows // size, lambda g: (dead_groups[g], longest[g]))
+            order = (groups[:, None] * size + np.arange(size)).reshape(-1)
+        elif self.group_by_length or self.skip_zero_advantage:
             key = lambda row: (dead[row], prompt_lengths[row] + lengths[row] if self.group_by_length else 0)  # noqa: E731
             free = grpo_row_layout(order, self._layout_rows, key)
             if self._families is None:
@@ -1203,6 +1355,7 @@ class GRPOBatchPlan:
         ]
         prompt_lengths = prompt_lengths[order]
         media = [encoded[prompts[row]][1:3] for row in order] if encoded else None
+        self._features = self._shared_image_features(prompts, encoded, order)
         if self._families is not None:
             # A family that left its survey trains eagerly, so its old and reference log-probs are scored eagerly too.
             if not eager and self._step_compiled() and (self.with_old_logps or self.with_reference):
@@ -1219,14 +1372,16 @@ class GRPOBatchPlan:
                 old = [rollout[row] for row in order]
             elif self.with_old_logps:
                 old = self._score(
-                    lambda batch, lengths, indices: mx.stop_gradient(self._logps(self._model, batch, lengths, indices)),
-                    visit, sequences, prompt_lengths, media, skipped, held,
+                    lambda batch, lengths, indices, prefix: mx.stop_gradient(
+                        self._logps(self._model, batch, lengths, indices, prefix)
+                    ),
+                    visit, sequences, prompt_lengths, media, skipped, self._first_pass_slots, held,
                 )
             if self.with_reference:
                 ref = self._score(
-                    lambda batch, lengths, indices: self._reference_policy.forward(
+                    lambda batch, lengths, indices, prefix: self._reference_policy.forward(
                         self._model, batch, lengths,
-                        response_scorer=lambda model, batch, lengths: self._reference_logps(model, batch, lengths, indices),
+                        response_scorer=lambda model, batch, lengths: self._reference_logps(model, batch, lengths, indices, prefix),
                     ),
                     visit, sequences, prompt_lengths, media, held=held,
                 )
@@ -1236,7 +1391,7 @@ class GRPOBatchPlan:
             visit=visit, sequences=sequences, prompt_lengths=prompt_lengths,
             advantages=advantages[order], kept=kept[order].astype(np.int32), old=old, ref=ref,
             generation_tokens=int(lengths.sum()), media=media, skipped=skipped,
-            weights=None if weights is None else weights[order], eager=eager, vision_inputs=held,
+            weights=None if weights is None else weights[order], eager=eager, features=self._features, vision_inputs=held,
         )
 
     def _rollout_logps(self, prompts, results, completion_ids):
@@ -1282,7 +1437,8 @@ class GRPOBatchPlan:
         family = (
             "grpo_tuple", ((rows, "sequence"), "int32"), ((rows, 2), "int32"),
             ((2,), "float32"), ((rows,), "float32"), ((rows,), "int32"),
-            held if self.with_old_logps else None, held if self.with_reference else None,
+            ((held, ((), "bool")) if self._first_pass_slots else held) if self.with_old_logps else None,
+            held if self.with_reference else None,
         )
         if self.sample_weighting is not None:
             family = (*family, ((rows,), "float32"))
@@ -1306,7 +1462,8 @@ class GRPOBatchPlan:
         """Micro-batch for schedule entry index at its planned width whatever the phase; refetching an entry reuses its generation instead of sampling again."""
         start = self._generation_start(index)
         if self._current is None or self._current.visit != start:
-            self._current = None  # its held vision inputs must not stay alive through the next rollout
+            # Its held vision inputs and image features must not stay alive through the next rollout.
+            self._features = self._current = None
             self._current = self._generate(start)
         generation = self._current
         position = ((index - start) % self.steps_per_generation) * self.batch_size
@@ -1320,24 +1477,39 @@ class GRPOBatchPlan:
                 return None
             table = np.zeros((len(sequences), width - 1), dtype=np.float32)
             for offset, row in enumerate(rows):
-                table[offset, :len(values[row])] = values[row]
+                if values[row] is not None:
+                    table[offset, :len(values[row])] = values[row]
+                elif index - start >= self.steps_per_generation:
+                    raise RuntimeError("Unsloth MLX GRPO: a first pass's log-probs were not kept as the old ones.")
             return mx.array(table)
 
+        old = held(generation.old)
+        if old is not None and self._first_pass_slots:
+            old = (old, mx.array(generation.old[position] is not None))
+
         media = None if generation.media is None else generation.media[position:position + self.batch_size]
+        features = None if generation.features is None else generation.features[position:position + self.batch_size]
+        # The shared prompt carries each group's images, so the rows' own batch skips the processor.
+        prefix = self._prefix_ids(batch, lengths, media, features)
         materialized = (
-            self._inputs(batch, lengths, media, generation.vision_inputs, (position, width)), mx.array(lengths),
+            self._inputs(batch, lengths, media, ids_only=prefix is not None, features=features,
+                         held=generation.vision_inputs, key=(position, width)), mx.array(lengths),
             mx.array([self.steps_per_generation, generation.generation_tokens], dtype=mx.float32),
             mx.array(generation.advantages[position:position + self.batch_size]),
             mx.array(generation.kept[position:position + self.batch_size]),
-            held(generation.old), held(generation.ref),
+            old, held(generation.ref),
         )
         if self._families is not None and phase is not None and self._family_drift is None and not generation.eager:
             divergence = _vlm_family_divergence(self._families[index], self._vision_family(materialized[0])[0])
             if divergence is not None:
                 self._family_drift = f"batch {index}: {divergence}"
         indices = self._cce_indices(lengths, width)
-        if generation.weights is not None:
-            return (*materialized, indices, mx.array(generation.weights[position:position + self.batch_size]))
+        weights = generation.weights
+        weights = None if weights is None else mx.array(weights[position:position + self.batch_size])
+        if self._prefix:
+            return (*materialized, indices, weights, prefix)
+        if weights is not None:
+            return (*materialized, indices, weights)
         return materialized if indices is None else (*materialized, indices)
 
     def runs_eager(self, index):
@@ -1426,15 +1598,18 @@ def create_grpo_batch_plan(
     num_iterations, grad_accum, sampling, max_seq_length, score_temperature=None, scale_rewards="group",
     mask_truncated_completions=False, with_reference=False, max_prompt_length=None,
     shuffle=True, seed=None, num_batches=None, num_epochs=None, processor=None, model_config=None,
-    group_by_length=False, skip_zero_advantage=False, sample_weighting=None,
+    group_by_length=False, skip_zero_advantage=False, sample_weighting=None, prefix_grouping=False,
+    first_pass_old_logps=False,
     rollout_logprobs_as_old=False,
 ):
     """Encode prompts once and lay out TRL's RepeatSampler schedule; batch_size counts completions, a generation samples
     batch_size * steps_per_generation of them, num_generations per prompt; score_temperature defaults to the sampling
     temperature; a VLM processor replaces tokenizer; within each optimizer step group_by_length sorts rows by length and
-    skip_zero_advantage puts zero-advantage rows last; sample_weighting is grpo_sample_weighting's;
-    rollout_logprobs_as_old takes old log-probs from tokenizer-only rollouts sampled unfiltered at the scoring
-    temperature instead of a forward."""
+    skip_zero_advantage puts zero-advantage rows last; sample_weighting is grpo_sample_weighting's; prefix_grouping
+    (grpo_prefix_grouping's) lays out whole groups per micro-batch and runs each shared prompt once;
+    first_pass_old_logps leaves micro-steps that train before their generation's first update unscored, for a caller
+    that hands their own log-probs back (keep_old_logps); rollout_logprobs_as_old takes old log-probs from
+    tokenizer-only rollouts sampled unfiltered at the scoring temperature instead of a forward."""
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
     prompt_ids, max_tokens, vision, signatures = _encode_grpo_prompts(
@@ -1447,6 +1622,10 @@ def create_grpo_batch_plan(
         )
     chunk = batch_size * steps_per_generation // num_generations
     repeats = steps_per_generation * num_iterations
+    with_old_logps = grad_accum % repeats != 0
+    # Accumulation windows restart with generations (at the start, a resume, each epoch), so a generation opens a
+    # multiple of gcd(repeats, grad_accum) micro-steps into its window, and that many of its micro-steps precede an update.
+    first_pass = math.gcd(repeats, grad_accum) if first_pass_old_logps and with_old_logps else 0
     order = _RepeatSamplerOrder(len(prompt_ids), _normalize_seed(seed), shuffle)
 
     def batches_for_epoch(epoch):
@@ -1489,6 +1668,7 @@ def create_grpo_batch_plan(
         processor=processor, model_config=model_config, vision=vision, rollout_old=rollout_old,
         group_by_length=group_by_length, layout_block=math.gcd(steps_per_generation, grad_accum),
         skip_zero_advantage=skip_zero_advantage, sample_weighting=sample_weighting, media_signatures=signatures,
+        prefix_grouping=prefix_grouping, first_pass_slots=first_pass,
     )
 
 
@@ -1566,6 +1746,97 @@ def grpo_layout_options(objective, *, distributed=False):
             not distributed and objective.beta == 0 and objective.loss_type in ("grpo", "dapo", "dr_grpo")
         ),
     }
+
+
+def grpo_prefix_grouping(config, *, distributed=False, model=None, announced=None, hint=True):
+    """Whether whole groups per micro-batch keep every step's gradient, draw no per-row noise, and fit model. Warns, on
+    every rank, why a requested prefix_grouper is refused, or, when off and given hint, prints that model and config
+    would admit it; each message once per announced set (a trainer keeps one), every time without one."""
+    if not config.prefix_grouper and model is None:
+        return False
+    batch_size, size = config.per_device_train_batch_size, config.num_generations
+    checks = (
+        (config.loss_type == "bnpo", "loss_type='bnpo' normalizes each micro-batch by its own tokens"),
+        (batch_size % size, f"per_device_train_batch_size={batch_size} holds no whole groups of num_generations={size}"),
+        (config.gradient_accumulation_steps % config.steps_per_generation,
+         f"a generation's {config.steps_per_generation} micro-steps span several optimizer steps"),
+        (distributed, "distributed processes split each generation"),
+        (getattr(config, "neftune_noise_alpha", 0), "NEFTune draws its noise per row"),
+    )
+    problem = next((message for failed, message in checks if failed), None)
+    if problem is None and model is not None:
+        scorer = _make_preference_cce_scorer(model, temperature=config.temperature) if config.use_cce else None
+        problem = grpo_prefix_problem(model, scorer, config.max_seq_length, dropout_disabled=config.disable_dropout)
+    if config.prefix_grouper:
+        message = problem and f"Unsloth MLX GRPO: prefix_grouper is off, since {problem}."
+    else:
+        text = _PREFIX_VLM_HINT if _is_vlm_model(model) else _PREFIX_HINT
+        message = None if problem or not hint else text.format(size)
+    if message and message not in (announced or ()):
+        if not config.prefix_grouper:
+            print(message)
+        else:
+            # A fresh registry leaves deduplication to announced, filled only once delivered (an "error" filter raises).
+            # Every rank warns: raised on rank 0 alone, an "error" filter would leave the others hung in a collective.
+            caller = sys._getframe(1)
+            warnings.warn_explicit(
+                message, UserWarning, caller.f_code.co_filename, caller.f_lineno,
+                module=caller.f_globals.get("__name__"), registry={},
+            )
+        if announced is not None:
+            announced.add(message)
+    return bool(config.prefix_grouper) and problem is None
+
+
+_PREFIX_HINT = (
+    "Unsloth: prefix_grouper=True would run each shared prompt once for its {} completions, in micro-batches whose "
+    "prompts share enough tokens; measured at num_generations=8 on Qwen3 text: 19% (short prompts) to 59% (long "
+    "prompts) less GRPO training time."
+)
+_PREFIX_VLM_HINT = (
+    "Unsloth: prefix_grouper=True would run each shared prompt and its images once for its {} completions, in "
+    "micro-batches whose prompts share enough tokens; measured at num_generations=8: 12% (Qwen3.5) to 47% (Gemma 4) "
+    "less GRPO training time on image prompts."
+)
+# mlx-lm stacks whose attention applies RoPE at cache.offset and masks through cache.make_mask on every layer.
+_PREFIX_MODEL_TYPES = ("llama", "qwen2", "qwen3")
+# mlx-vlm stacks whose caches the shared-prompt forward covers: qwen3_5's linear attention, gemma4's windows, K/V.
+_PREFIX_VLM_MODEL_TYPES = ("qwen3_5", "gemma4")
+
+
+def grpo_prefix_problem(model, scorer, max_seq_length, *, dropout_disabled=False):
+    """Why a shared-prompt forward cannot run model, or None."""
+    from . import utils
+
+    if scorer is None:
+        return "it scores through the runtime CCE head, which use_cce=False or this model's head rules out"
+    backbone = utils._get_text_backbone(model)
+    # mlx-vlm's qwen3_5 wrapper keeps its type only on its config.
+    model_type = getattr(model, "model_type", None) or utils._config_get(getattr(model, "config", None), "model_type")
+    types = _PREFIX_VLM_MODEL_TYPES if utils._is_vlm_model(model) else _PREFIX_MODEL_TYPES
+    if model_type not in types or backbone is None:
+        return (
+            f"model_type={model_type!r} is not one of {', '.join(_PREFIX_MODEL_TYPES)}, "
+            f"or {', '.join(_PREFIX_VLM_MODEL_TYPES)} as a vision model"
+        )
+    if getattr(model, "_unsloth_text_only_vlm", False):
+        return "it is a text-only load of a vision model, which this forward does not cover"
+    ropes = utils._length_dependent_ropes(backbone)
+    if ropes:
+        return f"its RoPE ({', '.join(ropes)}) may depend on the forward's length, not only the position"
+    if utils._shared_kv_slot_count(model):
+        return "this mlx-vlm leaves its K/V sharing to Unsloth's own slots, which cannot hold a shared prompt"
+    if any(getattr(layer, "enable_moe", False) for layer in backbone.layers):
+        return "its mixture-of-experts layers are not covered"
+    window = getattr(backbone, "sliding_window", None)
+    if any(getattr(layer, "use_sliding", False) for layer in backbone.layers) and (window or 0) < max_seq_length:
+        return f"its {window}-token sliding window is shorter than max_seq_length={max_seq_length}"
+    if not dropout_disabled and any(
+        utils._get_mlx_dropout_probability(getattr(module, "dropout", None)) > 0
+        for _, module in utils.iter_mlx_lora_modules(model)
+    ):
+        return "LoRA dropout would draw one mask over each shared prompt instead of one per row"
+    return None
 
 
 def _is_torch_module(func):
@@ -1697,6 +1968,19 @@ def _resolve_scalerl_options(config):
             warnings.warn(f"Unsloth MLX GRPO: {name} is not supported on MLX and is ignored.", stacklevel=4)
 
 
+def _resolve_prefix_grouper(config):
+    """CUDA Unsloth's UNSLOTH_GRPO_PREFIX_GROUPER is the field's default, which stays off when it is unset (CUDA's is on)."""
+    if config.prefix_grouper is None:
+        value = os.environ.get("UNSLOTH_GRPO_PREFIX_GROUPER", "0").strip().lower()
+        config.prefix_grouper = value not in ("", "0", "false", "no", "off")
+        if config.prefix_grouper:
+            warnings.warn(
+                f"Unsloth MLX GRPO: UNSLOTH_GRPO_PREFIX_GROUPER={value} sets prefix_grouper=True, as on CUDA Unsloth; "
+                "set the field to choose explicitly.",
+                stacklevel=4,
+            )
+
+
 def resolve_grpo_config(config):
     """CUDA Unsloth's GRPOConfig rewrites, then TRL 0.24's ``__post_init__``."""
     if config.use_vllm:
@@ -1799,6 +2083,7 @@ def resolve_grpo_config(config):
             stacklevel=3,
         )
     _resolve_scalerl_options(config)
+    _resolve_prefix_grouper(config)
     grpo_objective(config)
     grpo_sampling(config)
 

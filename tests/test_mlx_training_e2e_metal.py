@@ -2788,6 +2788,64 @@ def test_grpo_skipped_micro_step_opens_a_window_as_a_zero_gradient(tmp_path, mon
     assert all(mx.array_equal(value, trained[1][key]).item() for key, value in skipped[1].items())
 
 
+def _kept_old_logps_match_scored(monkeypatch, train, rtol=0.0, atol=0.0):
+    """train() with every old log-prob scored by a forward of its own, then with first passes' kept: the same old
+    log-probs wherever the second has them, bitwise, and the same losses and model within tolerance. Which deferred."""
+    import numpy as np
+    from unsloth_zoo.mlx import grpo
+    olds, runs, materialize = [], [], grpo.GRPOBatchPlan.materialize
+    monkeypatch.setattr(grpo.GRPOBatchPlan, "materialize", lambda self, index, **kw: (
+        lambda out: olds[-1].append(out[5]) or out)(materialize(self, index, **kw)))
+    for scored in ("1", "0"):
+        monkeypatch.setenv("UNSLOTH_GRPO_SCORE_OLD_LOGPS", scored)
+        olds.append([])
+        trainer = train()
+        runs.append((trainer._train_loss_history, dict(tree_flatten(trainer.model.parameters()))))
+    (scored, kept), ((losses, params), (again, retrained)) = olds, runs
+    known = [flag.item() for _, flag in kept]
+    assert len(scored) == len(kept) and not any(isinstance(old, tuple) for old in scored)
+    assert all(np.array_equal(table, old) for (table, _), flag, old in zip(kept, known, scored) if flag)
+    assert np.allclose(losses, again, rtol=rtol, atol=0) and all(mx.allclose(value, retrained[key], rtol=rtol, atol=atol).item() for key, value in params.items())  # noqa: E501
+    return [not flag for flag in known]
+
+
+@metal_only
+@pytest.mark.parametrize("iterations,spg,accum,beta,compiled,prefix,dead,deferred", [
+    (2, 2, 2, 0.0, False, False, False, [1, 1, 0, 0]), (2, 2, 2, 0.04, True, False, False, [1, 1, 0, 0]),
+    (3, 4, 2, 0.0, True, False, False, [1, 1] + [0] * 10), (1, 2, 1, 0.0, True, False, False, [1, 0]),
+    (2, 2, 2, 0.0, True, True, False, [1, 1, 0, 0]),
+    (2, 2, 2, 0.0, True, False, True, [1, 0, 0, 0]),  # each generation's second group has no advantage: skipped
+])
+def test_grpo_first_passes_keep_the_old_log_probs_a_forward_scores(tmp_path, monkeypatch, iterations, spg, accum, beta, compiled, prefix, dead, deferred):  # noqa: E501
+    import types
+    from huggingface_hub import snapshot_download
+    from transformers import AutoTokenizer, Qwen3Config, Qwen3ForCausalLM
+    from unsloth_zoo.mlx import generate as generate_module, grpo
+    from unsloth_zoo.mlx.trainer import MLXGRPOConfig, MLXGRPOTrainer
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(snapshot_download("Qwen/Qwen3-0.6B", allow_patterns=["*.json", "*.txt"], local_files_only=True))  # noqa: E501
+    except Exception:
+        pytest.skip("Qwen/Qwen3-0.6B's tokenizer is not cached")
+    Qwen3ForCausalLM(Qwen3Config(hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, head_dim=16, vocab_size=len(tokenizer), tie_word_embeddings=True)).save_pretrained(tmp_path / "tiny")  # noqa: E501
+    tokenizer.save_pretrained(tmp_path / "tiny")
+    monkeypatch.setattr(generate_module, "generate_batch", lambda model, tokenizer, requests, defaults=None: [
+        types.SimpleNamespace(token_ids=[100 + row % 3] * (1 + row % 4) + [7], finish_reason="stop") for row in range(len(requests))])  # noqa: E501
+
+    def train():
+        model, tok = FastMLXModel.from_pretrained(str(tmp_path / "tiny"), load_in_4bit=False, max_seq_length=128)
+        model = FastMLXModel.get_peft_model(model, r=4, lora_alpha=8, lora_dropout=0, max_seq_length=128)
+        trainer = MLXGRPOTrainer(model, tok, [{"prompt": "apples " * 40 * prefix + f"Count apples {i}."} for i in range(8)], reward_funcs=lambda prompts, completion_ids, **_: [0.0 if dead and p.endswith(("1.", "3.", "5.", "7.")) else float(len(c) + c[0]) for p, c in zip(prompts, completion_ids)], args=MLXGRPOConfig(  # noqa: E501
+            output_dir=str(tmp_path / "run"), max_steps=2 * spg * iterations // accum, per_device_train_batch_size=2, num_generations=2, steps_per_generation=spg, gradient_accumulation_steps=accum, num_iterations=iterations,  # noqa: E501
+            max_completion_length=6, max_seq_length=128, prefix_grouper=prefix, loss_type="dapo", beta=beta, learning_rate=1e-3, lr_scheduler_type="constant", warmup_steps=0,  # noqa: E501
+            logging_steps=1, seed=0, compile=compiled, shuffle_dataset=False))
+        trainer.train()
+        return trainer
+    shared, prefix_ids = [], grpo.GRPOBatchPlan._prefix_ids
+    monkeypatch.setattr(grpo.GRPOBatchPlan, "_prefix_ids", lambda *a: shared.append(prefix_ids(*a)) or shared[-1])
+    assert _kept_old_logps_match_scored(monkeypatch, train) == [bool(d) for d in deferred] * 2
+    assert {ids is not None for ids in shared} == {prefix}
+
+
 @metal_only
 @pytest.mark.parametrize("head", ["dense", "quantized", "softcap"])
 def test_grpo_cce_scores_like_the_logits(monkeypatch, head):
@@ -2819,11 +2877,15 @@ def test_grpo_cce_scores_like_the_logits(monkeypatch, head):
 
 
 @metal_only
-@pytest.mark.parametrize("vision", [False, True])
-def test_grpo_first_pass_ratio_is_one_for_image_prompts(tmp_path, monkeypatch, vision):
+@pytest.mark.parametrize("tower,beta,prefix,scored_runs,kept_runs", [
+    ("frozen", 0.0, False, 1, 1), ("frozen", 0.04, False, 1, 1), ("frozen", 0.0, True, 1, 1),
+    # Per generation: two old scorings (none when kept) and two reference ones, each after a rollout forward, and four steps.
+    ("trained", 0.0, False, 8, 4), ("frozen-lora", 0.04, False, 12, 8),
+])
+def test_grpo_first_pass_ratio_is_one_for_image_prompts(tmp_path, monkeypatch, tower, beta, prefix, scored_runs, kept_runs):  # noqa: E501
     """Old log-probs of an image batch the rollout already ran equal the step's own, frozen tower or trained: Gemma 4's
     vision attention is an mx.compile helper that traced inputs bypass, so the scorer and the step must trace the same
-    arrays, the trainable parameters."""
+    arrays, the trainable parameters. A tower every pass runs alike runs once per generation, here padding its output."""
     import shutil, types, PIL.Image, mlx_vlm.utils, mlx_vlm.models.gemma4 as gemma4
     from huggingface_hub import snapshot_download
     from unsloth_zoo.mlx import generate as generate_module, grpo, trainer as mlx_trainer
@@ -2843,37 +2905,63 @@ def test_grpo_first_pass_ratio_is_one_for_image_prompts(tmp_path, monkeypatch, v
     mx.save_safetensors(str(checkpoint / "model.safetensors"), dict(tree_flatten(tiny.parameters())), {"format": "mlx"})
     monkeypatch.setattr(generate_module, "generate_batch", lambda model, processor, requests, defaults=None: [
         types.SimpleNamespace(token_ids=[100 + row % 7] * (2 + row % 5), finish_reason="stop") for row in range(len(requests))])
-    scored, terms, pairs = grpo._scored_as_step, grpo.grpo_terms, []
+    scored, terms, pairs, gaps, calls, own, shared = grpo._scored_as_step, grpo.grpo_terms, [], [], [], [], grpo._shared_prefix_hidden
 
     def rolled_out(logps, step_compiled):
         score = scored(logps, step_compiled)
 
-        def run(model, batch, *rest):
+        def run(model, batch, lengths, indices, prefix):
             mx.eval(grpo.completion_logps(model, batch, 1.0))  # the rollout's forward of this batch, without gradients
-            return score(model, batch, *rest)
+            plain = lambda inputs: inputs and {k: v for k, v in inputs.items() if k != "cached_image_features"}  # noqa: E731
+            own.append(1)  # the batch's and its prefix's own tower runs, uncounted, against the shared features
+            gaps.append(mx.abs(logps(model, batch, lengths, indices, prefix) - logps(model, plain(batch), lengths, indices, plain(prefix))).max().item())  # noqa: E501
+            own.clear()
+            return score(model, batch, lengths, indices, prefix)
         return run
     monkeypatch.setattr(grpo, "_scored_as_step", rolled_out)
     monkeypatch.setattr(grpo, "grpo_terms", lambda objective, new, advantages, mask, *, old=None, ref=None: pairs.append(
         (mx.stop_gradient(new), old, mask)) or terms(objective, new, advantages, mask, old=old, ref=ref))
-    model, processor = FastMLXModel.from_pretrained(str(checkpoint), load_in_4bit=False, max_seq_length=1024)
-    data = [{"prompt": [{"role": "user", "content": f"Describe picture {i}."}], "image": PIL.Image.new("RGB", (64, 64), (60 * i, 90, 160))} for i in range(2)]  # noqa: E501
-    model = FastMLXModel.get_peft_model(model, r=4, lora_alpha=8, max_seq_length=1024, finetune_vision_layers=vision)
-    assert any(key.startswith("vision_tower") for key, _ in tree_flatten(model.trainable_parameters())) is vision
-    trainer = mlx_trainer.MLXGRPOTrainer(model, processor, data, processor=processor, args=mlx_trainer.MLXGRPOConfig(  # noqa: E501
-        output_dir=str(tmp_path / "out"), max_steps=1, per_device_train_batch_size=2, num_generations=2, num_iterations=2, gradient_accumulation_steps=2, max_completion_length=8,  # noqa: E501
-        max_seq_length=1024, logging_steps=1, loss_type="dapo", beta=0.0, compile=False, shuffle_dataset=False), reward_funcs=lambda completion_ids, **_: [float(len(c)) for c in completion_ids])  # noqa: E501
-    trainer.train()
-    assert len(pairs) == 2 and all(old is not None for _, old, _ in pairs)
-    for new, old, mask in pairs:
+    monkeypatch.setattr(grpo, "_shared_prefix_hidden", lambda *args: calls.append("prefix") or shared(*args))
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER_TOKR", "0")
+    runs = []
+    data = [{"prompt": [{"role": "user", "content": f"Describe picture {i}." + " Look closely." * 16}], "image": PIL.Image.new("RGB", (64, 64), (60 * i, 90, 160))} for i in range(2)]  # noqa: E501
+
+    def train():
+        model, processor = FastMLXModel.from_pretrained(str(checkpoint), load_in_4bit=False, max_seq_length=1024)
+        if not runs:  # the tower as loading leaves it
+            run_tower = type(model.vision_tower).__call__
+            monkeypatch.setattr(type(model.vision_tower), "__call__", lambda *args, **kw: not own and calls.append("tower") or (
+                mx.concatenate([out := run_tower(*args, **kw), mx.zeros_like(out)], axis=-2)))
+        model = FastMLXModel.get_peft_model(model, r=4, lora_alpha=8, max_seq_length=1024, finetune_vision_layers=tower != "frozen")
+        if tower == "frozen-lora":
+            model.vision_tower.freeze()
+        assert any(key.startswith("vision_tower") for key, _ in tree_flatten(model.trainable_parameters())) is (tower == "trained")
+        trainer = mlx_trainer.MLXGRPOTrainer(model, processor, data, processor=processor, args=mlx_trainer.MLXGRPOConfig(  # noqa: E501
+            output_dir=str(tmp_path / "out"), max_steps=2, per_device_train_batch_size=2, num_generations=2, num_iterations=2, gradient_accumulation_steps=2, max_completion_length=8,  # noqa: E501
+            max_seq_length=1024, logging_steps=1, loss_type="dapo", beta=beta, compile=False, shuffle_dataset=False, prefix_grouper=prefix), reward_funcs=lambda completion_ids, **_: [float(len(c)) for c in completion_ids])  # noqa: E501
+        calls.clear()
+        trainer.train()
+        runs.append((calls.count("tower"), "prefix" in calls))
+        return trainer
+    assert _kept_old_logps_match_scored(monkeypatch, train) == [True, True, False, False]
+    assert runs == [(scored_runs, prefix), (kept_runs, prefix)]
+    # The scored run's first pass: its own forward's log-probs.
+    assert len(pairs) == 8 and all(old is not None for _, old, _ in pairs)
+    for new, old, mask in pairs[:2]:
         assert mx.array_equal(mx.where(mask > 0, new, 0), mx.where(mask > 0, old, 0)).item()
+    assert max(gaps) <= 1e-4
 
 
 @metal_only
-def test_compiled_vision_grpo_first_pass_ratio_is_one(tmp_path, monkeypatch):
-    """Old log-probs score an image batch as the compiled step does: with a clip range of 1e-7, any other ratio clips."""
+@pytest.mark.parametrize("refused", [False, True])
+def test_compiled_vision_grpo_first_pass_ratio_is_one(tmp_path, monkeypatch, recwarn, refused):
+    """Old log-probs score an image batch as the compiled step does: with a clip range of 1e-7, any other ratio clips. The
+    frozen tower runs once per generation, ahead of every trace, which read its features as an input."""
     import random, shutil, types, PIL.Image, mlx_vlm.utils, mlx_vlm.models.qwen3_5 as qwen3_5
     from huggingface_hub import snapshot_download
     from unsloth_zoo.mlx import generate as generate_module, trainer as mlx_trainer
+    if refused:
+        monkeypatch.setattr("unsloth_zoo.mlx.grpo._PREFIX_VLM_MODEL_TYPES", ())
     try:  # a tiny random Qwen3.5 from the real config and processor; the weights are never fetched
         source = snapshot_download("mlx-community/Qwen3.5-0.8B-4bit", allow_patterns=["*.json", "*.jinja"], local_files_only=True)
     except Exception:
@@ -2891,13 +2979,27 @@ def test_compiled_vision_grpo_first_pass_ratio_is_one(tmp_path, monkeypatch):
         types.SimpleNamespace(token_ids=[100 + row % 7] * (2 + row % 5), finish_reason="stop") for row in range(len(requests))])
     rng = random.Random(0)
     data = [{"prompt": [{"role": "user", "content": " ".join(rng.choice(("apples", "orchard", "market")) for _ in range(3)) + f" Describe the picture in one sentence. Then say {i}."}], "image": PIL.Image.new("RGB", (224, 224), (rng.randint(0, 255), rng.randint(0, 255), 128))} for i in range(2)]  # noqa: E501
-    model, processor = FastMLXModel.from_pretrained(str(checkpoint), load_in_4bit=False, max_seq_length=1024)
-    trainer = mlx_trainer.MLXGRPOTrainer(FastMLXModel.get_peft_model(model, r=8, lora_alpha=8, lora_dropout=0, max_seq_length=1024), processor, data, processor=processor, args=mlx_trainer.MLXGRPOConfig(  # noqa: E501
-        output_dir=str(tmp_path / "out"), max_steps=1, per_device_train_batch_size=4, gradient_accumulation_steps=2, num_generations=4, num_iterations=2, max_completion_length=8, max_seq_length=1024, loss_type="dapo",  # noqa: E501
-        beta=0.0, logging_steps=1, seed=3, compile=True, gradient_checkpointing=False, epsilon=1e-7, epsilon_high=1e-7),
-        reward_funcs=lambda completion_ids, **_: [float(len(c) + sum(c) % 7) for c in completion_ids])
-    assert trainer.train()["compile_scope"] == "full_step"
-    assert [entry["clip_ratio/region_mean"] for entry in trainer.state.log_history if "clip_ratio/region_mean" in entry] == [0.0]
+    trainers, calls = [], []
+
+    def train():
+        model, processor = FastMLXModel.from_pretrained(str(checkpoint), load_in_4bit=False, max_seq_length=1024)
+        if not trainers:  # the tower as loading leaves it
+            run_tower = type(model.vision_tower).__call__
+            monkeypatch.setattr(type(model.vision_tower), "__call__", lambda *args, **kw: calls.append(1) or run_tower(*args, **kw))
+        trainers.append(mlx_trainer.MLXGRPOTrainer(FastMLXModel.get_peft_model(model, r=8, lora_alpha=8, lora_dropout=0, max_seq_length=1024), processor, data, processor=processor, args=mlx_trainer.MLXGRPOConfig(  # noqa: E501
+            output_dir=str(tmp_path / "out"), max_steps=2, per_device_train_batch_size=4, gradient_accumulation_steps=2, num_generations=4, num_iterations=2, max_completion_length=8, max_seq_length=1024, loss_type="dapo",  # noqa: E501
+            beta=0.0, logging_steps=1, seed=3, compile=True, gradient_checkpointing=False, epsilon=1e-7, epsilon_high=1e-7, prefix_grouper=refused),  # noqa: E501
+            reward_funcs=lambda completion_ids, **_: [float(len(c) + sum(c) % 7) for c in completion_ids]))
+        calls.clear()
+        assert trainers[-1].train()["compile_scope"] == "full_step"
+        assert len(calls) == 1, len(calls)
+        return trainers[-1]
+    # Two runs scored alike already differ by ~1e-6 here, compiled.
+    assert _kept_old_logps_match_scored(monkeypatch, train, rtol=1e-4, atol=1e-6) == [True, True, False, False]
+    # A refused model keeps compiled vision steps under prefix_grouper.
+    assert any("prefix_grouper is off, since model_type" in str(w.message) for w in recwarn) == refused
+    # Each run's first pass, whose old log-probs a compiled forward scored or the compiled step kept.
+    assert [[entry["clip_ratio/region_mean"] for entry in trainer.state.log_history if "clip_ratio/region_mean" in entry][0] for trainer in trainers] == [0.0, 0.0]  # noqa: E501
 
 
 @metal_only
@@ -2941,8 +3043,8 @@ def test_compiled_grpo_scorer_falls_back_to_eager_when_compile_fails(monkeypatch
 
 
 @metal_only
-@pytest.mark.parametrize("beta,lora", [(0.0, True), (0.04, True), (0.04, False)])  # full fine-tune: arrays swap
-def test_compiled_vision_grpo_steps_match_eager(tmp_path, monkeypatch, beta, lora):
+@pytest.mark.parametrize("beta,lora,score_old", [(0.0, True, False), (0.04, True, False), (0.04, True, True), (0.04, False, False)])  # full fine-tune: arrays swap  # noqa: E501
+def test_compiled_vision_grpo_steps_match_eager(tmp_path, monkeypatch, beta, lora, score_old):
     import shutil, types, numpy as np, PIL.Image, mlx_vlm.utils, mlx_vlm.models.qwen2_5_vl as qwen2_5_vl
     from huggingface_hub import snapshot_download
     from unsloth_zoo.mlx import generate as generate_module, grpo, trainer as mlx_trainer
@@ -2977,15 +3079,183 @@ def test_compiled_vision_grpo_steps_match_eager(tmp_path, monkeypatch, beta, lor
             output_dir=str(tmp_path / str(compiled)), max_steps=2 + (beta > 0), per_device_train_batch_size=2, num_generations=2, steps_per_generation=2, gradient_accumulation_steps=2, max_completion_length=8,  # noqa: E501
             max_seq_length=256, logging_steps=1, loss_type="grpo", beta=beta, num_iterations=1 + (beta > 0), max_grad_norm=1.0, compile=compiled, shuffle_dataset=False), reward_funcs=lambda prompts, completion_ids, **_: [float(len(c)) * (str(p).count("picture 1") + str(p).count("picture 3")) for p, c in zip(prompts, completion_ids)])  # noqa: E501
         return trainer, trainer.train()
+    monkeypatch.setenv("UNSLOTH_GRPO_SCORE_OLD_LOGPS", str(int(score_old)))
     (eager, _), (compiled, result) = train(False), train(True)
-    # With a KL term, step 3 scores generation 2's reference against a policy two updates on.
-    assert len(gaps) == (8 if beta else 0) and max(gaps, default=0) <= 1e-5
+    # With a KL term, step 3 scores generation 2's reference two updates on; old log-probs are scored only when asked.
+    assert len(gaps) == ((8 if score_old else 4) if beta else 0) and max(gaps, default=0) <= 1e-5
     assert result["compile_enabled"] and result["compile_scope"] == "full_step" and compiled._compile_shape_guard_report.action in ("exact", "bucket")  # noqa: E501
     eager_generations = [entry["frac_generations_eager"] for entry in compiled.state.log_history if "frac_generations_eager" in entry]  # noqa: E501
     # One generation trains eagerly and one compiled; a KL term keeps zero-advantage rows, so every generation compiles.
     assert {0.0, 1.0} <= set(eager_generations) if not beta else set(eager_generations) == {0.0}
     assert eager._compile_shape_guard_report.reason == "grpo_vision_eager" and min(eager._grad_norm_history) > 0
     assert np.allclose(eager._train_loss_history, compiled._train_loss_history, atol=1e-5) and np.allclose(eager._grad_norm_history, compiled._grad_norm_history, rtol=1e-3)  # noqa: E501
+
+
+@metal_only
+@pytest.mark.parametrize("family,checkpointed,compiled", [("llama", False, True), ("llama", True, False), ("qwen2", True, True), ("qwen3", False, False)])  # noqa: E501
+def test_grpo_shared_prefix_matches_each_row_alone(monkeypatch, family, checkpointed, compiled):
+    # Catches missing or shifted prompt K/V, a prefix past the last prompt token, lost prompt or checkpoint gradients.
+    import importlib
+    from types import SimpleNamespace
+    import numpy as np
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx import grpo as g
+    from unsloth_zoo.mlx.preference import _make_preference_cce_scorer
+    mod, rng, size = importlib.import_module(f"mlx_lm.models.{family}"), np.random.default_rng(5), 3
+    monkeypatch.setattr(g, "_shared_prefix_hidden", lambda *a, f=g._shared_prefix_hidden: forwards.append(1) or f(*a))
+    forwards = []
+    mx.random.seed(3)
+    model = mod.Model(mod.ModelArgs.from_dict(dict(model_type=family, hidden_size=64, num_hidden_layers=2, intermediate_size=96, num_attention_heads=4, num_key_value_heads=2, rms_norm_eps=1e-5, vocab_size=301, rope_theta=10000.0, max_position_embeddings=512, head_dim=16, tie_word_embeddings=family == "qwen2")))  # noqa: E501
+    model.freeze()
+    for layer in model.model.layers:
+        for name in ("q_proj", "k_proj", "v_proj"):
+            setattr(layer.self_attn, name, adapter := LoRALinear.from_base(getattr(layer.self_attn, name), r=4, scale=2.0))
+            adapter.lora_b = mx.random.normal(adapter.lora_b.shape) * 0.05
+    mx.eval(model.parameters())
+    # A 64-token prompt shares 32 tokens: its 64th predicts the first completion token.
+    rows = [prompt + rng.integers(3, 301, n).tolist() for prompt in (rng.integers(3, 301, p).tolist() for p in (64, 77)) for n in rng.integers(5, 40, size)]  # noqa: E501
+    lengths = np.array([[64 if index < size else 77, len(row)] for index, row in enumerate(rows)], dtype=np.int32)
+    packed = np.zeros((len(rows), 128), dtype=np.int32)
+    for index, row in enumerate(rows):
+        packed[index, :len(row)] = row
+    prefix = g.GRPOBatchPlan._prefix_ids(SimpleNamespace(_prefix=True, num_generations=size, _prefix_tokr=1.0, _processor=None), packed, lengths)  # noqa: E501
+    assert prefix.shape == (2, 32)
+    logps, weights = g.grpo_logps(0.7, _make_preference_cce_scorer(model, temperature=0.7)), mx.array(rng.normal(size=(len(rows), 127)).astype(np.float32))  # noqa: E501
+
+    def each_row(model):
+        values = [logps(model, mx.array([row]), mx.array(lengths[index:index + 1]))[0] for index, row in enumerate(rows)]
+        return sum((value * weights[index, :value.shape[0]]).sum() for index, value in enumerate(values)), values
+
+    def shared(model, batch, lengths, indices, prefix, weights):
+        values = logps(model, batch, lengths, indices, prefix)
+        return (values * weights).sum(), values
+
+    mx.eval(alone := nn.value_and_grad(model, each_row)(model))
+    if checkpointed:
+        mlx_utils.apply_gradient_checkpointing(model)
+    try:
+        run = lambda *b: nn.value_and_grad(model, shared)(model, *b)  # noqa: E731
+        run = mx.compile(run, inputs=model.state, outputs=model.state) if compiled else run
+        batch = (mx.array(packed), mx.array(lengths), mx.array(g.grpo_cce_indices(lengths.tolist(), 128, 512)), prefix)
+        mx.eval(together := run(*batch, weights), scored := g._scored_as_step(logps, lambda: compiled)(model, *batch))
+    finally:
+        mlx_utils.remove_gradient_checkpointing(model)
+    (total, values), grads = together
+    # Old log-probs through the step's own (shared) forward, so a first ratio is exactly 1.
+    assert len(forwards) == 2 and mx.array_equal(scored, values).item()
+    assert abs(total.item() - alone[0][0].item()) < 1e-4
+    for index, value in enumerate(alone[0][1]):
+        assert mx.allclose(values[index, :value.shape[0]], value, atol=1e-5).item() and not values[index, value.shape[0]:].any().item()  # noqa: E501
+    for (name, want), (_, got) in zip(tree_flatten(alone[1]), tree_flatten(grads)):
+        assert mx.abs(want).max().item() > 0 and mx.allclose(got, want, atol=1e-5, rtol=1e-4).item(), name
+
+
+def _undo_gated_delta_patches_after(monkeypatch):
+    """Restore the attributes the trainer's gated-delta patches rebind on every loaded mlx-lm / mlx-vlm model module."""
+    import importlib, sys
+    importlib.import_module("mlx_lm.models.gated_delta")
+    for key, module in list(sys.modules.items()):
+        if key.startswith(("mlx_lm.models", "mlx_vlm.models")):
+            for name in ("gated_delta_update", "_unsloth_gated_delta_original", "_unsloth_gated_delta_patched"):
+                absent = name not in vars(module)
+                monkeypatch.setattr(module, name, vars(module).get(name), raising=False)
+                if absent:  # teardown undoes both in reverse, leaving it absent again
+                    monkeypatch.delattr(module, name)
+
+
+_SHRUNK_VLM_STACKS = {
+    "qwen3_5": (dict(hidden_size=64, intermediate_size=128, num_hidden_layers=4, full_attention_interval=2, layer_types=["linear_attention", "full_attention"] * 2, num_attention_heads=2, num_key_value_heads=1, linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=32, linear_value_head_dim=32), dict(depth=1, hidden_size=32, intermediate_size=64, num_heads=2, out_hidden_size=64)),  # noqa: E501
+    # A 24-token window bites on both sides of the prompt; layers 2 and 3 read layers 0 and 1's K/V.
+    "gemma4": (dict(hidden_size=64, intermediate_size=128, num_hidden_layers=4, layer_types=["sliding_attention", "full_attention"] * 2, num_kv_shared_layers=2, num_attention_heads=2, head_dim=32, global_head_dim=64, hidden_size_per_layer_input=16, sliding_window=24), dict(num_hidden_layers=1, hidden_size=32, intermediate_size=64, num_attention_heads=2, num_key_value_heads=2, head_dim=16, global_head_dim=16)),  # noqa: E501
+}
+
+
+@metal_only
+@pytest.mark.parametrize("repo,image,checkpointed", [("mlx-community/Qwen3.5-0.8B-4bit", False, True), ("mlx-community/Qwen3.5-0.8B-4bit", True, False), ("mlx-community/gemma-4-e2b-it-4bit", False, False), ("mlx-community/gemma-4-e2b-it-4bit", True, True)])  # noqa: E501
+def test_vision_grpo_shared_prefix_matches_each_row_alone(monkeypatch, tmp_path, repo, image, checkpointed):
+    # Catches rows missing their prompt's conv window or recurrent state, MRoPE read off the cache, windows or shared
+    # K/V misread across the prompt boundary, and image or prompt gradients that never reach the adapters.
+    import importlib, shutil, numpy as np, PIL.Image, mlx_vlm.utils
+    from types import SimpleNamespace
+    from huggingface_hub import snapshot_download
+    from unsloth_zoo.mlx import grpo as g
+    from unsloth_zoo.mlx.compile import model_has_gated_delta_layers
+    from unsloth_zoo.gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm, patch_gated_delta_vlm_shared
+    from unsloth_zoo.mlx.preference import _make_preference_cce_scorer
+    try:  # the real config and processor, shrunk; the weights are never read
+        source = snapshot_download(repo, allow_patterns=["*.json", "*.jinja", "*.txt"], local_files_only=True)
+    except Exception:
+        pytest.skip(f"{repo}'s processor files are not cached")
+    shutil.copytree(source, checkpoint := tmp_path / "tiny", ignore=shutil.ignore_patterns("*.index.json", "*.safetensors", "README.md"))  # noqa: E501
+    config = {key: value for key, value in json.loads((checkpoint / "config.json").read_text()).items() if key not in ("quantization", "quantization_config", "audio_config")}  # noqa: E501
+    for part, shrunk in zip(("text_config", "vision_config"), _SHRUNK_VLM_STACKS[config["model_type"]]):
+        config[part].update(shrunk)
+    (checkpoint / "config.json").write_text(json.dumps(config))
+    module = importlib.import_module(f"mlx_vlm.models.{config['model_type']}")
+    mx.random.seed(3)
+    tiny = module.Model(mlx_vlm.utils.update_module_configs(module.ModelConfig.from_dict(params := dict(config)), module, params, ["text", "vision"]))  # noqa: E501
+    # A zero-initialized gate or norm would cut the path under test.
+    weights = {name: mx.random.normal(value.shape) * 0.02 if mx.issubdtype(value.dtype, mx.floating) and not value.any().item() else value for name, value in tree_flatten(tiny.parameters())}  # noqa: E501
+    mx.save_safetensors(str(checkpoint / "model.safetensors"), weights, {"format": "mlx"})
+    model, processor = FastMLXModel.from_pretrained(str(checkpoint), load_in_4bit=False, max_seq_length=512)
+    # The trainer's gated-delta kernels: rows given the prompt's state take the ops VJP.
+    _undo_gated_delta_patches_after(monkeypatch)
+    patch_gated_delta_vlm(), patch_gated_delta_vlm_shared(), patch_gated_delta()
+    model = FastMLXModel.get_peft_model(model, r=4, lora_alpha=8, max_seq_length=512, finetune_vision_layers=image, use_gradient_checkpointing=False)  # noqa: E501
+    for _, adapter in mlx_utils.iter_mlx_lora_modules(model):
+        adapter.lora_b = mx.random.normal(adapter.lora_b.shape) * 0.05
+    model.set_dtype(mx.float32)
+    model.train()
+    mx.eval(model.parameters())
+    rng, size, words = np.random.default_rng(5), 3, "the quick brown fox jumps over a lazy dog by the river bank".split()
+    prompts = [
+        (list(encoded[0]), encoded[1:3]) for encoded in (
+            g._encode_grpo_prompt(getattr(processor, "tokenizer", processor), {"prompt": [{"role": "user", "content": " ".join(rng.choice(words, count))}], "image": PIL.Image.new("RGB", (64, 64), (count * 3, 90, 160))}, processor, vision=True)  # noqa: E501
+            for count in (36, 47))
+    ] if image else [(rng.integers(3, 5000, count).tolist(), None) for count in (64, 77)]
+    rows = [prompt + rng.integers(3, 5000, n).tolist() for prompt, _ in prompts for n in rng.integers(5, 40, size)]
+    lengths = np.array([[len(prompts[index // size][0]), len(row)] for index, row in enumerate(rows)], dtype=np.int32)
+    media = [prompts[index // size][1] for index in range(len(rows))] if image else None
+    width = -(-max(map(len, rows)) // 32) * 32
+    packed = np.zeros((len(rows), width), dtype=np.int32)
+    for index, row in enumerate(rows):
+        packed[index, :len(row)] = row
+    vision = lambda batch, lengths, media, features=None: g._grpo_vision_batch(processor, model._config, batch, lengths, media)  # noqa: E731
+    plan = SimpleNamespace(_prefix=True, num_generations=size, _prefix_tokr=1.0, _processor=processor, _model_config=model._config, _inputs=vision)  # noqa: E501
+    prefix = g.GRPOBatchPlan._prefix_ids(plan, packed, lengths, media)
+    assert prefix is not None and prefix["input_ids"].shape[0] == 2 and ("pixel_values" in prefix) == image
+    temperature = 1.0 if config["model_type"] == "gemma4" else 0.7  # a softcapped head scores at temperature 1 only
+    scorer = _make_preference_cce_scorer(model, temperature=temperature)
+    logps, weights = g.grpo_logps(temperature, scorer), mx.array(rng.normal(size=(len(rows), width - 1)).astype(np.float32))  # noqa: E501
+    assert scorer is not None and g.grpo_prefix_problem(model, scorer, 512) is None
+
+    def each_row(model):
+        values = [logps(model, vision(np.array([row], dtype=np.int32), lengths[index:index + 1], media and media[index:index + 1]), mx.array(lengths[index:index + 1]))[0] for index, row in enumerate(rows)]  # noqa: E501
+        return sum((value * weights[index, :value.shape[0]]).sum() for index, value in enumerate(values)), values
+
+    def shared(model, batch, lengths, indices, prefix, weights):
+        values = logps(model, batch, lengths, indices, prefix)
+        return (values * weights).sum(), values
+
+    mx.eval(alone := nn.value_and_grad(model, each_row)(model))
+    if checkpointed:
+        mlx_utils.apply_gradient_checkpointing(model)
+    try:
+        batch = (g.GRPOBatchPlan._inputs(plan, packed, lengths, media, ids_only=True), mx.array(lengths), mx.array(g.grpo_cce_indices(lengths.tolist(), width, 1024)), prefix)  # noqa: E501
+        mx.eval(together := nn.value_and_grad(model, shared)(model, *batch, weights), scored := g._scored_as_step(logps, lambda: False)(model, *batch))  # noqa: E501
+    finally:
+        mlx_utils.remove_gradient_checkpointing(model)
+    (total, values), grads = together
+    assert mx.array_equal(scored, values).item()
+    assert abs(total.item() - alone[0][0].item()) < 1e-4
+    for index, value in enumerate(alone[0][1]):
+        assert mx.allclose(values[index, :value.shape[0]], value, atol=1e-5).item() and not values[index, value.shape[0]:].any().item()  # noqa: E501
+    # Relative to the largest entry (fp32 noise); worst seen 1.0e-4, and 3.2e-4 from the gated-delta kernel vs ops VJPs.
+    moved, bound = {}, 5e-4 if model_has_gated_delta_layers(model) else 3e-4
+    for (name, want), (_, got) in zip(tree_flatten(alone[1]), tree_flatten(grads)):
+        assert mx.abs(got - want).max().item() <= bound * mx.abs(want).max().item() + 1e-5, name
+        moved[name] = mx.abs(want).max().item() > 0
+    assert all(value for name, value in moved.items() if name.startswith("language_model")) and any(value for name, value in moved.items() if "vision" in name) == image  # noqa: E501
 
 
 @metal_only

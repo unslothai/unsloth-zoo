@@ -1522,26 +1522,31 @@ def _length_dependent_ropes(backbone):
     return sorted(name for name in names if ("RoPE" in name or "Rotary" in name) and name not in _POSITION_ONLY_ROPES)
 
 
+def _repeat_prefix(prefix, repeats, interleaved=False):
+    return mx.repeat(prefix, repeats, axis=0) if interleaved else mx.concatenate([prefix] * repeats)
+
+
 class _PrefixKVSlot:
     """A layer's cache for a shared-prompt forward. Built without a prefix, it records the prompt's post-RoPE K/V; built
     from them, it puts the prompt batch, repeated repeats times as a preference batch holds every chosen row before any
-    rejected one, ahead of its rows' own K/V at offset = prompt length, so attention applies RoPE there and a
-    bottom-right causal mask. Re-runnable under mx.checkpoint."""
+    rejected one (interleaved: each prompt repeats times in turn, as GRPO holds a group's rows), ahead of its rows' own
+    K/V at offset = prompt length, so attention applies RoPE there and a bottom-right causal mask. Re-runnable under
+    mx.checkpoint."""
 
-    __slots__ = ("keys", "values", "offset", "repeats", "recording")
+    __slots__ = ("keys", "values", "offset", "repeats", "recording", "interleaved")
     borrow, install, recorded = _SharedKVSlot.borrow, _SharedKVSlot.install, _SharedKVSlot.recorded
 
-    def __init__(self, prefix=None, repeats=1):
+    def __init__(self, prefix=None, repeats=1, interleaved=False):
         self.keys, self.values = (None, None) if prefix is None else prefix
         self.offset = 0 if prefix is None else prefix[0].shape[-2]
-        self.repeats, self.recording = repeats, prefix is None
+        self.repeats, self.recording, self.interleaved = repeats, prefix is None, interleaved
 
     def update_and_fetch(self, keys, values):
         if self.recording:
             self.keys, self.values = keys, values
             return keys, values
         return tuple(
-            mx.concatenate([mx.concatenate([prefix] * self.repeats), own], axis=-2)
+            mx.concatenate([_repeat_prefix(prefix, self.repeats, self.interleaved), own], axis=-2)
             for prefix, own in ((self.keys, keys), (self.values, values))
         )
 
@@ -1559,9 +1564,9 @@ class _PrefixStateSlot:
 
     lengths = None
 
-    def __init__(self, prefix=None, repeats=1):
+    def __init__(self, prefix=None, repeats=1, interleaved=False):
         self.cache = [None, None] if prefix is None else list(prefix)
-        self.repeats, self.recording = repeats, prefix is None
+        self.repeats, self.recording, self.interleaved = repeats, prefix is None, interleaved
 
     def borrow(self):
         return None if self.cache[0] is None else tuple(self.cache)
@@ -1575,7 +1580,7 @@ class _PrefixStateSlot:
 
     def __getitem__(self, index):
         state = self.cache[index]
-        return state if self.recording or state is None else mx.concatenate([state] * self.repeats)
+        return state if self.recording or state is None else _repeat_prefix(state, self.repeats, self.interleaved)
 
     def update_window(self, index, source, width, *, lengths=None):
         if self.recording:
@@ -1588,10 +1593,10 @@ class _PrefixStateSlot:
         return output, state
 
 
-def _prefix_cache(backbone, recorded=None, repeats=1):
+def _prefix_cache(backbone, recorded=None, repeats=1, interleaved=False):
     """Recording slots for backbone's layers, or slots extending recorded; None where gemma4 reads another layer's K/V."""
     if recorded is not None:
-        return [None if slot is None else type(slot)(slot.recorded(), repeats) for slot in recorded]
+        return [None if slot is None else type(slot)(slot.recorded(), repeats, interleaved) for slot in recorded]
     sources = getattr(backbone, "previous_kvs", None) or range(len(backbone.layers))
     return [
         None if source != index else _PrefixStateSlot() if getattr(layer, "is_linear", False) else _PrefixKVSlot()
