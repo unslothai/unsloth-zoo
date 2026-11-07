@@ -21,10 +21,13 @@ a weight-bit checksum raises on mismatch."""
 __all__ = [
     "exact_merge_available",
     "ExactFoldTarget",
+    "ExactFoldRefused",
     "exact_fold",
     "exact_unfold",
+    "fixup_report",
 ]
 
+import contextlib
 import os
 import torch
 
@@ -142,6 +145,11 @@ if triton is not None:
 pass
 
 
+class ExactFoldRefused(RuntimeError):
+    """exact_fold refused before changing any weight (fix-up store over max_fixup)."""
+pass
+
+
 class ExactFoldTarget:
     """One weight to fold, W viewed as [E, N, K]: w_view is its strided base view (E=1 for dense); a [E, R, K] and b [E,
     N, R] take any strides; scale is the LoRA scaling."""
@@ -183,12 +191,15 @@ pass
 
 
 def _device_ctx(t):
-    return torch.cuda.device(t.device)
+    # CPU tensors only run under TRITON_INTERPRET=1 (the reconstruction tests).
+    return torch.cuda.device(t.device) if t.device.type == "cuda" else contextlib.nullcontext()
 pass
 
 
-def exact_fold(targets, stream = None):
-    """Fold targets in place and return {"bad": n, "elements": m}; each target's fix-up store (index, original bits) stays in pinned host memory, copied on stream."""
+def exact_fold(targets, stream = None, max_fixup = None):
+    """Fold targets in place and return {"bad": n, "elements": m}; each target's fix-up store (index, original bits) stays in pinned host memory, copied on stream.
+    max_fixup: raise ExactFoldRefused, with no weight changed, when more than this fraction of the elements would need
+    the store (6 B / element with int32 indices: 3x the weight bytes at 1.0); None never refuses."""
     # All Unsloth Zoo code licensed under LGPLv3
     total_bad, total_elements = 0, 0
     for t in targets:
@@ -199,6 +210,14 @@ def exact_fold(targets, stream = None):
             t.checksum = torch.zeros(1, dtype = torch.int64, device = t.w.device)
             t.launch(_COUNT)
     sizes = torch.stack([t.counts.sum(dtype = torch.int64) for t in targets]).tolist()
+    if max_fixup is not None:
+        elements = sum(t.w.numel() for t in targets)
+        if sum(sizes) > max_fixup * elements:
+            for t in targets: t.counts = t.checksum = None
+            raise ExactFoldRefused(
+                f"Unsloth: the exact fold would keep {sum(sizes):,} of {elements:,} weights "
+                f"({100 * sum(sizes) / max(elements, 1):.1f}%) for the restore, over the {100 * max_fixup:.1f}% limit"
+            )
     # Host stores before any weight changes: an allocation failure leaves W untouched.
     _host_buffers(targets, sizes)
     for t, n_bad in zip(targets, sizes):
@@ -217,10 +236,12 @@ pass
 
 def _host_buffers(targets, sizes):
     # Pageable when pinning is disabled, over budget or refused (WSL2): still exact, only synchronous.
-    from .block_swap import _pin_budget
     idx_types = [torch.int32 if t.w.numel() < 2**31 else torch.int64 for t in targets]
     nbytes = sum(n * (d.itemsize + t.w.element_size()) for t, n, d in zip(targets, sizes, idx_types))
-    pin = os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") != "1" and nbytes <= _pin_budget()
+    from .block_swap import _pin_budget
+    pin = (
+        targets[0].w.is_cuda and os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") != "1" and nbytes <= _pin_budget()
+    )
     for t, n, d in zip(targets, sizes, idx_types):
         if pin:
             try:
@@ -261,7 +282,9 @@ def exact_unfold(targets, stream = None):
     # A fold that failed part way: undo only what was folded, from wherever its store is.
     targets = [t for t in targets if t.folded]
     if not targets: return
-    current = torch.cuda.current_stream(targets[0].w.device)
+    if not targets[0].w.is_cuda:
+        stream = None  # TRITON_INTERPRET=1 on CPU tensors: no streams
+    current = torch.cuda.current_stream(targets[0].w.device) if targets[0].w.is_cuda else None
     for ready in {id(t.ready): t.ready for t in targets if t.ready is not None}.values():
         (stream or current).wait_event(ready)
     if stream is not None:
@@ -289,10 +312,16 @@ def exact_unfold(targets, stream = None):
         with _device_ctx(t.w):
             E, N, K = t.w.shape
             flat = t.idx.to(torch.int64)
-            e, rem = flat // (N * K), flat % (N * K)
-            rows, cols = rem // K, rem % K
-            wrong = t.w[e, rows, cols]
-            t.w[e, rows, cols] = t.val
+            if t.w.is_contiguous():
+                # The stored index (e * N + n) * K + k is the flat offset: no per-axis index tensors.
+                w_flat = t.w.view(-1)
+                wrong = w_flat[flat]
+                w_flat[flat] = t.val
+            else:
+                e, rem = flat // (N * K), flat % (N * K)
+                rows, cols = rem // K, rem % K
+                wrong = t.w[e, rows, cols]
+                t.w[e, rows, cols] = t.val
             after = t.checksum - wrong.view(torch.int16).to(torch.int64).sum() + t.val.view(torch.int16).to(torch.int64).sum()
             checks.append(torch.stack([before[0], after[0]]))
     pairs = torch.stack(checks).tolist()
@@ -305,3 +334,34 @@ def exact_unfold(targets, stream = None):
             f"Unsloth: exact LoRA unfold checksum mismatch on {len(bad)} of {len(targets)} weights; "
             "the base weights may be corrupted."
         )
+
+
+def fixup_report(targets, info = None):
+    """Memory of a fold (call between exact_fold and exact_unfold): fix-up fraction, host store bytes (pinned or not)
+    and the peak extra device bytes of the fold (idx + val before the offload) and of one exact_unfold call over these
+    targets (every store uploaded, plus one target's int64 index and displaced values)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    bad = elements = host = 0
+    pinned = True
+    device_fold = scatter = 0
+    for t in targets:
+        n = 0
+        for buf in (t.host_idx, t.host_val):
+            if isinstance(buf, torch.Tensor):
+                host += buf.numel() * buf.element_size()
+                pinned = pinned and buf.is_pinned()
+                n = buf.numel()
+        bad += n
+        elements += t.w.numel()
+        idx_size = t.host_idx.element_size() if isinstance(t.host_idx, torch.Tensor) else 4
+        per = n * (idx_size + t.w.element_size())
+        device_fold += per
+        scatter = max(scatter, n * (8 + t.w.element_size()))
+    if info is not None:
+        bad, elements = info.get("bad", bad), info.get("elements", elements)
+    return {
+        "bad": bad, "elements": elements, "fraction": bad / max(elements, 1),
+        "host_store_bytes": host, "host_store_pinned": pinned if host else None,
+        "device_fold_bytes": device_fold, "device_unfold_peak_bytes": device_fold + scatter,
+    }
+pass
