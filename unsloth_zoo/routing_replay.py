@@ -194,12 +194,19 @@ def _make_key(token_ids, pad_token_id):
     return tuple(t for t in token_ids if t != pad_token_id)
 
 
+# A row two captures disagreed on: natural like -1, but known, so prefix reuse must not fill it.
+_DISPUTED = -2
+
+
 def _agreed(a, b):
-    """Rows of two captures of the same tokens: where their expert sets differ, -1 (natural)."""
+    """Rows of two captures of the same tokens: where their expert sets differ, natural; where both
+    were routed (or either was already disputed), _DISPUTED rather than -1 (unknown)."""
     if a.shape != b.shape:
         return a
     same = (a.sort(dim = -1).values == b.sort(dim = -1).values).all(dim = -1, keepdim = True)
-    return torch.where(same, a, torch.full_like(a, -1))
+    routed = lambda x: ~(x < 0).all(dim = -1, keepdim = True) | (x == _DISPUTED).all(dim = -1, keepdim = True)
+    natural = torch.where(routed(a) & routed(b), _DISPUTED, -1).to(a.dtype).expand_as(a)
+    return torch.where(same, a, natural)
 
 
 def _count_conflicts(a, b):
@@ -231,6 +238,7 @@ def _fill_prefix(rows, full, start, store):
             routed = ~(part < 0).all(dim = -1)
             same = (part.sort(dim = -1).values == merged[:m].sort(dim = -1).values).all(dim = -1)
             conflict[:m] |= routed & seen[:m] & ~same
+            conflict[:m] |= (part == _DISPUTED).all(dim = -1)
             new = routed & ~seen[:m]
             if bool(new.any()):
                 merged[:m] = torch.where(new.unsqueeze(-1), part, merged[:m])
@@ -335,7 +343,7 @@ def _lookup(key, exact = False):
             if rows is not None:
                 found = rows if found is None else _agreed(found, rows)
         if found is not None:
-            return found
+            return found.clamp_min(-1)
     return None
 
 
