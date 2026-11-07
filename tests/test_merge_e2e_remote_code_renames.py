@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A trust_remote_code model whose checkpoint is renamed on load must still merge.
-
-LFM3-Audio-2B ships `lfm.model.layers.N...` on disk and its remote modeling file registers a
-Transformers 5 `WeightRenaming` onto `model.language_model.` under its `model_type`. The class
-lives in `transformers_modules`, not `transformers`, so the merge never found that registry
-entry, matched no LoRA module, and wrote the base weights back as a successful merge.
-"""
+"""A trust_remote_code model whose checkpoint is renamed on load (LFM3-Audio-2B) must still merge."""
 
 from __future__ import annotations
 
@@ -56,8 +50,7 @@ def _require_registry():
 
 @pytest.fixture
 def remote_class():
-    """A model class defined the way trust_remote_code defines one: in a `transformers_modules`
-    module, with its renaming registered under its own model_type."""
+    """A class in a `transformers_modules` module, its renaming registered under its own model_type."""
     _require_registry()
     import transformers as T
     from transformers.conversion_mapping import register_checkpoint_conversion_mapping

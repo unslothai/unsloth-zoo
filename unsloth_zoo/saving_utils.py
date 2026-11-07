@@ -6574,15 +6574,12 @@ def _renamings_to_conversion_mapping(transforms):
 pass
 
 
-# The class each merge is running on, by name: a same-named remote class another loaded model
-# brought into `transformers_modules` must not lend this merge its renames.
+# Class being merged, by name: a same-named remote class from another model must not lend its renames.
 _MERGE_MODEL_CLASSES = {}
 
 
 def _model_classes_named(model_class_name):
-    """The `transformers` class of this name, then any trust_remote_code one. A remote class
-    lives in `transformers_modules`, so a `transformers`-only lookup never sees the model_type
-    its modeling file registered a renaming under, and every LoRA key misses its checkpoint."""
+    """The class being merged, else the `transformers` class of this name, then any in `transformers_modules`."""
     import sys
     exact = _MERGE_MODEL_CLASSES.get(model_class_name)
     if isinstance(exact, type):
@@ -7360,10 +7357,8 @@ pass
 
 def _renamed_lora_counterparts(lora_weights, disk_keys, disk_module_shapes, model_class_name,
                                tie_word_embeddings = False, count_packed_mxfp4 = True):
-    """When no LoRA target is placed at all, those whose weight still sits in this export under
-    another name: the same trailing path (at least the last three components), the same shape, and
-    a prefix naming the same tower (vision, audio, ...). An omitted tower has no such tensor, so it
-    stays exempt as in `_unresolved_lora_targets`."""
+    """If no LoRA target is placed, those whose weight sits here under another prefix (same >= 3-part tail,
+    shape and tower). An omitted tower has no such tensor, so it stays exempt."""
     converted = _convert_lora_keys_to_safetensor_format(
         lora_weights, disk_keys, model_class_name = model_class_name,
     )
@@ -7460,8 +7455,7 @@ def _check_lora_merge_is_complete(save_directory, safetensors_list, lora_weights
         lora_weights, disk_keys, disk_module_shapes, model_class_name,
         tie_word_embeddings = tie_word_embeddings, count_packed_mxfp4 = count_packed_mxfp4,
     ):
-        # A rename the merge cannot see (not a pure prefix deletion) leaves `unresolved` empty too, and the export
-        # would be the base weights reported as a merge.
+        # An unseen rename also leaves `unresolved` empty; the export would be the untouched base.
         message = (
             f"Unsloth: Refusing to write a merged model: none of the {total_lora_modules} LoRA module(s) on "
             f"{model_class_name} matched a weight in this checkpoint (e.g. `{lora_keys[0]}`), so the export would be "
