@@ -2229,11 +2229,20 @@ def _runtime_cce_by_mode(**kwargs):
     return lambda model: training if model.training else loss_only
 
 
-def make_cce_loss_fn(model, label_smoothing=0.0):
+def _reduce_token_losses(loss, ntoks, dft):
+    loss = loss.astype(mx.float32)
+    if dft:
+        # TRL's dft_loss: -p.detach() * log p per token, where p = exp(-loss); masked tokens carry loss 0.
+        loss = loss * mx.stop_gradient(mx.exp(-loss))
+    return loss.sum() / _safe_token_denominator(ntoks)
+
+
+def make_cce_loss_fn(model, label_smoothing=0.0, loss_type="nll"):
     """Chunked cross-entropy loss from hidden states and the LM head weight, avoiding full logit materialization;
     returns (model, batch, lengths, labels=None) -> (loss, ntoks), with targets labels[:,1:] masked by != -100; sets
-    _unsloth_cce_backend for logging."""
+    _unsloth_cce_backend for logging. loss_type="dft" applies only on the runtime-cce backend; fallbacks ignore it."""
     label_smoothing = _normalize_label_smoothing(label_smoothing)
+    dft = loss_type == "dft"
     # Checks topology first (mirrors the VLM factory), then head eligibility, then scale validation, so no positive CCE
     # notice precedes a fallback; backboneless models cannot yield pre-head hidden states, so the full forward is the
     # only faithful loss.
@@ -2356,7 +2365,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             )
             hidden_flat = _rotate_head_input(layer, hidden_flat)
             loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
-            loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            loss = _reduce_token_losses(loss, ntoks, dft)
             return loss, ntoks
     else:
         _skip_weight_grad = not _is_lm_head_trainable(model)
@@ -2400,7 +2409,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
                 hidden_flat, targets_flat, cce_indices,
             )
             loss = rt_cce(model)(hidden_flat, w, targets_flat)
-            loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            loss = _reduce_token_losses(loss, ntoks, dft)
             return loss, ntoks
 
     loss_fn._unsloth_cce_backend = "runtime-cce"
@@ -4315,10 +4324,11 @@ def _vlm_positions_for_compile(batch_dict, config):
     return batch_dict
 
 
-def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
+def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None, loss_type="nll"):
     """CCE loss over pre-lm_head hidden states from get_input_embeddings() merged embeddings, with baseline loss as
     fallback; assistant_token_id > 0 enables completion-only training, masking tokens before its first occurrence;
-    returns (model, batch_dict) -> (loss, ntoks)."""
+    returns (model, batch_dict) -> (loss, ntoks). loss_type="dft" applies only on the runtime-cce backend."""
+    dft = loss_type == "dft"
     def _marked_vlm_baseline():
         loss_fn = make_vlm_baseline_loss_fn(
             model,
@@ -4351,6 +4361,9 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         backbone is not None and _get_backbone_embed_kwarg(backbone) is None
         and _get_encoder_decoder_backbone(model) is None
     )
+    if dft and token_ids_only:
+        # Media batches on this backbone score through the baseline loss, which has no DFT weighting.
+        return _marked_vlm_baseline()
 
     head_desc = describe_output_head(model)
     _ineligible = _cce_head_ineligibility(head_desc)
@@ -4439,7 +4452,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
             hidden_flat = _rotate_head_input(lm_head, hidden_flat)
             loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
-            loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            loss = _reduce_token_losses(loss, ntoks, dft)
             return loss, ntoks
     else:
         if _skip_weight_grad:
@@ -4470,7 +4483,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
                 hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
             loss = rt_cce(model)(hidden_flat, w, targets_flat)
-            loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            loss = _reduce_token_losses(loss, ntoks, dft)
             return loss, ntoks
 
     if token_ids_only:
@@ -4504,13 +4517,17 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
 
 def _get_vlm_image_size(config, processor):
     """Target size for uniform resizing, from vision_config.image_size then processor.image_processor.size, else 512;
-    area-style size dicts (Qwen2.5-VL min/max pixels) are skipped: as dimensions they upsample to 3136x3136 and OOM."""
+    None for a processor that sizes images to its own token budget; area-style size dicts (Qwen2.5-VL min/max pixels)
+    are skipped: as dimensions they upsample to 3136x3136 and OOM."""
     vc = config.get("vision_config") if isinstance(config, dict) else getattr(config, "vision_config", None)
     if vc is not None:
         sz = vc.get("image_size") if isinstance(vc, dict) else getattr(vc, "image_size", None)
         if isinstance(sz, int) and sz > 0:
             return sz
     ip = getattr(processor, "image_processor", None)
+    # Gemma 4 resizes every image to its soft-token budget itself; its `size` (224) is nominal, not an input limit.
+    if getattr(ip, "max_soft_tokens", None) is not None:
+        return None
     if ip is not None:
         sz = getattr(ip, "size", None)
         if isinstance(sz, dict):
@@ -6266,6 +6283,27 @@ class _FiniteVisitMixin:
             int(index) for index in rng.permutation(len(self._schedule))
         )
 
+    # The original cut stays available until the shape planner settles on one, since sorting can add compiled shapes.
+    def install_length_sorted_windows(self, schedule, widths=None):
+        self._window_sort_layouts = {
+            False: (self._schedule, self._widths),
+            True: (
+                tuple(tuple(batch) for batch in schedule),
+                None if widths is None else tuple(int(x) for x in widths),
+            ),
+        }
+        self.use_length_sorted_windows(True)
+
+    @property
+    def has_window_sort_choice(self):
+        return getattr(self, "_window_sort_layouts", None) is not None
+
+    def use_length_sorted_windows(self, enabled):
+        self._schedule, self._widths = self._window_sort_layouts[bool(enabled)]
+
+    def settle_window_sort(self):
+        self._window_sort_layouts = None
+
 
 class FiniteTextBatchPlan(_FiniteVisitMixin):
     """CPU-backed finite text schedule with on-demand MLX materialization."""
@@ -6285,6 +6323,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         "_visit_epoch_cache",
         "_cycle_length",
         "_cce_capacities",
+        "_window_sort_layouts",
     )
 
     def __init__(
@@ -6312,6 +6351,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         self.label_dtype = np.dtype(label_dtype)
         self._shape_plan = None
         self._cce_capacities = {}
+        self._window_sort_layouts = None
         self._visit_policy = str(visit_policy)
         # Seed normalized eagerly so visits never depend on ambient RNG state; a plan rebuilt in a fresh process on resume derives identical visits.
         self._visit_seed = (
@@ -12203,6 +12243,30 @@ def _finite_batch_schedule(
     return tuple(schedule), cycle_length
 
 
+def _length_sorted_windows(schedule, row_length, grad_accum, cycle_length=None):
+    """Re-cut each accumulation window's rows longest first into micro-batches of the original sizes; windows restart
+    at every cycle_length boundary, as the trainer's epoch-final update does, so each optimizer step keeps its rows."""
+    schedule = tuple(tuple(batch) for batch in schedule)
+    accum = max(1, int(grad_accum or 1))
+    if accum == 1:
+        return schedule
+    block = max(1, int(cycle_length or len(schedule) or 1))
+    result = list(schedule)
+    for block_start in range(0, len(schedule), block):
+        block_end = min(block_start + block, len(schedule))
+        for start in range(block_start, block_end, accum):
+            window = schedule[start:min(start + accum, block_end)]
+            rows = sorted(
+                (row for batch in window for row in batch),
+                key=lambda row: (row is None, 0 if row is None else -row_length(row)),
+            )
+            offset = 0
+            for position, batch in enumerate(window):
+                result[start + position] = tuple(rows[offset:offset + len(batch)])
+                offset += len(batch)
+    return tuple(result)
+
+
 def _text_row_length(row):
     if isinstance(row, (tuple, list)) and row and isinstance(row[0], (tuple, list)):
         return len(row[0])
@@ -12263,6 +12327,7 @@ def _create_ordered_text_plan(
     completion_only_loss=None,
     assistant_only_loss=False,
     comm_group=None,
+    length_sorted_windows=False,
 ):
     """Build a text batch plan over an explicit dataset order, mirroring CUDA's sampler stream without changing mlx-lm
     batching; under DDP, comm_group expands to global micro-batches and returns this rank's slice."""
@@ -12383,7 +12448,7 @@ def _create_ordered_text_plan(
             for input_ids in tokenized
         )
     pad_id = getattr(tokenizer, "pad_token_id", None)
-    return FiniteTextBatchPlan(
+    plan = FiniteTextBatchPlan(
         rows,
         schedule,
         cycle_length=cycle_length,
@@ -12391,6 +12456,14 @@ def _create_ordered_text_plan(
         pad_id=0 if pad_id is None else int(pad_id),
         minimum_width=2,
     )
+    if length_sorted_windows:
+        plan.install_length_sorted_windows(_length_sorted_windows(
+            schedule,
+            lambda index: _text_row_length(tokenized[index]),
+            grad_accum,
+            cycle_length,
+        ))
+    return plan
 
 
 def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
