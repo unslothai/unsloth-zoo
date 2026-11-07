@@ -153,6 +153,14 @@ def _gpt_oss_dense_graph_decode(inputs_embeds):
     )
 
 
+def _gpt_oss_dense_decode_mask_ok(attention_mask, n_heads):
+    """Masks the dense one-token attention reads: None, or [B or 1, 1 or H, 1, L]; anything else stays eager."""
+    return attention_mask is None or (
+        isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4
+        and attention_mask.shape[1] in (1, n_heads) and attention_mask.shape[2] == 1
+    )
+
+
 def _gpt_oss_decode_attention(module, query, key, value, attention_mask, scaling):
     """One-token sink attention, grouped over the KV heads instead of repeat_kv copies: the rounding points of
     _eager_attention_rows (logits in the input dtype, fp32 softmax over keys + sink stored back in that dtype,
@@ -171,8 +179,10 @@ def _gpt_oss_decode_attention(module, query, key, value, attention_mask, scaling
     weights = torch.matmul(q, key.transpose(2, 3), out = logits[..., :kv_len])
     weights *= scaling
     if attention_mask is not None:
-        # [B or 1, 1, 1, L]: one row per sequence, the same for every head.
-        weights += attention_mask.reshape(attention_mask.shape[0], 1, 1, kv_len)
+        # [B or 1, 1, 1, L] (one row per sequence, every head) or [B or 1, H, 1, L] (per head, grouped as the
+        # logits are: head h = kv head h // groups, row h % groups).
+        rows = 1 if attention_mask.shape[1] == 1 else kv_heads
+        weights += attention_mask.reshape(attention_mask.shape[0], rows, groups if rows > 1 else 1, kv_len)
     logits[..., -1] = module.sinks.reshape(1, kv_heads, groups)
     logits[:] = torch.nn.functional.softmax(logits, dim = -1, dtype = torch.float32)
     probs = logits[..., :kv_len].to(value.dtype)
@@ -3514,7 +3524,7 @@ def patch_GptOssAttention():
             attn_weights = None
         elif (
             query_states.shape[-2] == 1
-            and (attention_mask is None or isinstance(attention_mask, torch.Tensor))
+            and _gpt_oss_dense_decode_mask_ok(attention_mask, query_states.shape[1])
             and _gpt_oss_dense_graph_decode(hidden_states)
         ):
             # One-token step of a CUDA-graph decode: the dense mask is a graph input, no BlockMask closure.

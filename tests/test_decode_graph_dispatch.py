@@ -237,3 +237,27 @@ def test_flex_graph_contract_refuses_tensor_closures_and_dense_mode(G, monkeypat
         monkeypatch.setenv("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "dense")
         assert not hasattr(_decode_mask(G, monkeypatch, causal_mask_function, torch.tensor(140)),
                            "_unsloth_graph_closure")
+
+
+def test_decode_attention_reads_per_head_masks(G):
+    # A caller-built [B, H, 1, L] mask (different visible keys per head) must match the eager formula,
+    # and shapes the grouped attention cannot read are left to the eager path.
+    g = torch.Generator().manual_seed(7)
+    bsz, heads, kv_heads, kv_len, D = 2, 8, 2, 40, 16
+    q = torch.randn(bsz, heads, 1, D, generator = g, dtype = torch.float64)
+    k = torch.randn(bsz, kv_heads, kv_len, D, generator = g, dtype = torch.float64)
+    v = torch.randn(bsz, kv_heads, kv_len, D, generator = g, dtype = torch.float64)
+    sinks = torch.randn(heads, generator = g, dtype = torch.float64)
+    visible = torch.rand(bsz, heads, 1, kv_len, generator = g) > 0.3
+    visible[..., 0] = True
+    mask = torch.zeros(bsz, heads, 1, kv_len, dtype = torch.float64).masked_fill(~visible, torch.finfo(torch.float64).min)
+    module = _Attn(heads, sinks)
+    want = _reference(module, q, k, v, mask, 0.25, kv_heads)
+    got, _ = G._gpt_oss_decode_attention(module, q, k, v, mask, 0.25)
+    torch.testing.assert_close(got, want, rtol = 1e-12, atol = 1e-12)
+    assert G._gpt_oss_dense_decode_mask_ok(None, heads)
+    assert G._gpt_oss_dense_decode_mask_ok(mask, heads)
+    assert G._gpt_oss_dense_decode_mask_ok(mask[:, :1], heads)
+    assert not G._gpt_oss_dense_decode_mask_ok(mask[:, :2], heads)
+    assert not G._gpt_oss_dense_decode_mask_ok(mask[:, :, 0], heads)
+    assert not G._gpt_oss_dense_decode_mask_ok({"full_attention": mask}, heads)
