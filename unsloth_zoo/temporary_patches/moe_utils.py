@@ -5652,7 +5652,25 @@ def forward_triton_grouped_gemm(
     # dtype.
     gemm_hidden_states = hidden_states if hidden_states.dtype == compute_dtype else hidden_states.to(compute_dtype)
 
-    # Cache model dims and kernel configs on first call.
+    # Configs depend on operand dtypes and device (shared-memory limits): re-select after module.to().
+    configs_key = (
+        gemm_hidden_states.dtype,
+        compute_dtype,
+        getattr(getattr(self, "gate_up_proj", None), "dtype", None),
+        getattr(getattr(self, "down_proj", None), "dtype", None),
+        gemm_hidden_states.device,
+        top_k,
+        hidden_dim,
+    )
+    if self._unsloth_moe_configs is not None:
+        cached_key = getattr(self, "_unsloth_moe_configs_key", None)
+        if cached_key is None:
+            # Caller-preset configs without a key are trusted.
+            self._unsloth_moe_configs_key = configs_key
+        elif cached_key != configs_key and not torch.compiler.is_compiling():
+            # The tuner is compiler-disabled: re-select only eagerly; a traced call keeps the last-good configs.
+            self._unsloth_moe_configs = None
+
     if self._unsloth_moe_configs is None:
         if _experts_are_input_major(self, "gate_up_proj", hidden_dim):
             intermediate_dim = self.gate_up_proj.shape[-1] // 2
@@ -5684,6 +5702,7 @@ def forward_triton_grouped_gemm(
         )
 
         self._unsloth_moe_configs = (intermediate_dim, gemm1_configs, gemm2_configs)
+        self._unsloth_moe_configs_key = configs_key
         torch.cuda.empty_cache()
 
     intermediate_dim, gemm1_configs, gemm2_configs = self._unsloth_moe_configs
