@@ -189,7 +189,10 @@ def _gpt_oss_decode_attention(module, query, key, value, attention_mask, scaling
     logits[..., -1] = module.sinks.reshape(1, kv_heads, groups)
     logits[:] = torch.nn.functional.softmax(logits, dim = -1, dtype = torch.float32)
     probs = logits[..., :kv_len].to(value.dtype)
-    out = torch.matmul(probs, value)
+    # Outside autocast, as the eager path's out=query matmul: the result keeps the activations' dtype and range
+    # (an fp16 autocast would recast bf16 values past 65504 to inf).
+    with torch.autocast(device_type = value.device.type, enabled = False):
+        out = torch.matmul(probs, value)
     return out.reshape(bsz, n_heads, q_len, head_dim).transpose(1, 2).contiguous(), None
 
 

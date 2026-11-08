@@ -309,3 +309,25 @@ def test_flex_graph_contract_names_the_mask_function(G, monkeypatch):
         assert ident(windowed) != ident(lambda b, h, q, kv, window = 16: (kv <= q) & (kv > q - window))
         for fn in (packed, functools.partial(windowed, window = 16)):
             assert not hasattr(_decode_mask(G, monkeypatch, fn, torch.tensor(140)), "_unsloth_graph_closure")
+
+
+@pytest.mark.parametrize("dtype,autocast", [(torch.float32, torch.bfloat16), (torch.bfloat16, torch.float16)])
+def test_decode_attention_keeps_its_dtype_under_autocast(G, dtype, autocast):
+    # The eager path writes the value matmul with out=, which autocast leaves alone: same dtype, same values.
+    g = torch.Generator().manual_seed(3)
+    q = torch.randn(2, 8, 1, 16, generator = g).to(dtype)
+    k = torch.randn(2, 2, 24, 16, generator = g).to(dtype)
+    v = torch.randn(2, 2, 24, 16, generator = g).to(dtype)
+    module = _Attn(8, torch.randn(8, generator = g).to(dtype))
+    want, _ = G._gpt_oss_decode_attention(module, q, k, v, None, 0.25)
+    with torch.autocast("cpu", dtype = autocast):
+        got, _ = G._gpt_oss_decode_attention(module, q, k, v, None, 0.25)
+    assert got.dtype == dtype
+    torch.testing.assert_close(got, want, rtol = 0, atol = 0)
+    if dtype == torch.bfloat16:
+        # Values past fp16's range stay finite (an fp16-autocast matmul would give inf).
+        zq, zk = torch.zeros_like(q), torch.zeros_like(k)
+        big = torch.full_like(v, 70000)
+        with torch.autocast("cpu", dtype = autocast):
+            out, _ = G._gpt_oss_decode_attention(_Attn(8, torch.zeros(8, dtype = dtype)), zq, zk, big, None, 0.25)
+        assert torch.isfinite(out).all()
