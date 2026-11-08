@@ -22,6 +22,7 @@ import inspect
 import os
 import stat
 import threading
+import types
 import weakref
 import torch
 import torch.nn as nn
@@ -220,6 +221,16 @@ def _mask_function_identity(fn, depth = 4):
                 values.append(None)
         values.extend(getattr(f, "__defaults__", None) or ())
         values.extend((getattr(f, "__kwdefaults__", None) or {}).values())
+        # Module-level names the code reads: a scalar is named by its value, a function walked; modules, classes
+        # and builtins are code, not state. Anything else (a tensor, a dict, an object) cannot be keyed.
+        module_globals = getattr(f, "__globals__", None) or {}
+        for name in code.co_names:
+            if name not in module_globals:
+                continue
+            value = module_globals[name]
+            out.append(name)
+            if not isinstance(value, (types.ModuleType, type, types.BuiltinFunctionType)):
+                values.append(value)
         for value in values:
             items = value if type(value) in (list, tuple) else (value,)
             out.append(len(items) if type(value) in (list, tuple) else -1)

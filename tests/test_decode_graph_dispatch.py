@@ -331,3 +331,32 @@ def test_decode_attention_keeps_its_dtype_under_autocast(G, dtype, autocast):
         with torch.autocast("cpu", dtype = autocast):
             out, _ = G._gpt_oss_decode_attention(_Attn(8, torch.zeros(8, dtype = dtype)), zq, zk, big, None, 0.25)
         assert torch.isfinite(out).all()
+
+
+WINDOW = 8
+_MASK_STATE = {"window": 8}
+
+
+def _global_window(b, h, q, kv):
+    return (kv <= q) & (kv > q - WINDOW)
+
+
+def _global_dict(b, h, q, kv):
+    return (kv <= q) & (kv > q - _MASK_STATE["window"])
+
+
+def test_flex_graph_contract_names_module_globals(G, monkeypatch):
+    # A mask_function reading module-level state: a scalar global is part of the identity (changing it changes
+    # the graph key), one holding anything else publishes no contract.
+    monkeypatch.setenv("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "flex")
+    global WINDOW
+    with S.graph_generate():
+        ident = lambda fn: getattr(_decode_mask(G, monkeypatch, fn, torch.tensor(140)), "_unsloth_mask_identity", None)
+        first = ident(_global_window)
+        assert first is not None and first == ident(_global_window)
+        WINDOW = 16
+        try:
+            assert ident(_global_window) not in (None, first)
+        finally:
+            WINDOW = 8
+        assert ident(_global_dict) is None
