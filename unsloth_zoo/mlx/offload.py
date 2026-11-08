@@ -1405,11 +1405,15 @@ def _expert_overhead(inventory):
 def offload_footprint(inventory, ple, experts):
     """Memory the offloadable PLE tables and experts hold with ple / experts offloaded (None for off), working memory included; other weights are unchanged."""
     ple_bytes = inventory["ple_bytes"] if inventory["ple"] is None else 0
-    held = ple_bytes * (1 - (ple or 0)) + (_PLE_OVERHEAD if ple and ple_bytes else 0)
+    held = ple_bytes * (1 - (ple or 0))
+    working = _PLE_OVERHEAD if ple and ple_bytes else 0
     if experts and inventory["expert_bytes"]:
         kept = max(inventory["expert_floor_bytes"], inventory["expert_bytes"] * (1 - experts))
-        return held + kept + _expert_overhead(inventory)
-    return held + inventory["expert_bytes"]
+        working += _expert_overhead(inventory)
+        if ple and ple_bytes:
+            working -= _CACHE_CAP
+        return held + kept + working
+    return held + inventory["expert_bytes"] + working
 
 
 def context_bytes(model_dir, tokens, prefill_step = PREFILL_STEPS[0], dtype_bytes = 2):
@@ -1447,6 +1451,26 @@ def _largest_context(cost, limit, low, high):
     return low + lo * OFFLOAD_CONTEXT_STEP
 
 
+def _offload_room(budget, resident):
+    return min(budget - SAFETY_MARGIN[0], budget / (1 + SAFETY_MARGIN[1])) - resident
+
+
+def prefill_step_limit(*, budget, resident, inventory, context_cost, context, ple, experts):
+    """Largest fitting prefill width at fixed residency; widths beyond the context cannot add prompt rows."""
+    weights = resident + offload_footprint(inventory, ple, experts)
+    room = _offload_room(budget, weights)
+    if context_cost(context, 0) > room:
+        return None
+    low, high = 0, max(context, PREFILL_STEPS[-1])
+    while low < high:
+        middle = (low + high + 1) // 2
+        if context_cost(context, middle) <= room:
+            low = middle
+        else:
+            high = middle - 1
+    return low
+
+
 def plan_offload(
     *,
     budget,
@@ -1467,7 +1491,7 @@ def plan_offload(
     ple_bytes = inventory["ple_bytes"] if inventory["ple"] is None else 0
     expert_bytes, floor = inventory["expert_bytes"], inventory["expert_floor_bytes"]
     per_layer = inventory["experts_per_layer"]
-    room = min(budget - SAFETY_MARGIN[0], budget / (1 + SAFETY_MARGIN[1])) - resident
+    room = _offload_room(budget, resident)
     nothing = {"ple": None, "experts": None, "context": None, "prefill_step": None}
 
     def footprint(ple, experts):
@@ -1484,7 +1508,7 @@ def plan_offload(
         if not expert_auto:
             return None
         ple = ple_choices[-1]
-        keep = weights_room - footprint(ple, None) + expert_bytes - _expert_overhead(inventory)
+        keep = weights_room - footprint(ple, 1.0) + floor
         kept = min(per_layer, int(keep * per_layer // expert_bytes)) if keep > 0 else 0
         if kept * expert_bytes // per_layer < floor:
             return None

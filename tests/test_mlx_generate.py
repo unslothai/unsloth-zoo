@@ -1519,6 +1519,26 @@ def test_an_open_batch_builds_its_cache_with_the_quantization_it_was_given():
         assert session.generator.args[1].tokenizer.stopping_criteria.eos_token_ids == []
 
 
+@pytest.mark.parametrize("limit", [2048, 4096, 8192])
+def test_auto_offload_caps_large_prefill_once_without_changing_defaults(limit):
+    from unsloth_zoo.mlx.generate import _prefill_step_option; model = types.SimpleNamespace(_unsloth_auto_prefill_step=limit); defaults = GenerationDefaults(prefill_step_size=8193)
+    with pytest.warns(UserWarning, match=f"8193 to {limit}"): assert _prefill_step_option(defaults, model=model) == {"prefill_step_size": limit}
+    with warnings.catch_warnings(record=True) as seen:
+        assert _prefill_step_option(defaults, model=model) == {"prefill_step_size": limit} and _prefill_step_option(GenerationDefaults(), model=model) == {} and all(_prefill_step_option(GenerationDefaults(prefill_step_size=n), model=types.SimpleNamespace(_unsloth_auto_prefill_step=limit)) == {"prefill_step_size": n} for n in (limit-1, limit)) and not seen and defaults.prefill_step_size == 8193 and _prefill_step_option(defaults, model=object()) == {"prefill_step_size": 8193}
+
+
+@pytest.mark.parametrize("consumer", ["test_adapter_removes_stop_matches_and_closes_on_failure", "test_audio_fallback_forwards_the_request_to_the_stream", "test_vlm_run_chunk_builds_the_generator_after_embeddings", "test_an_open_batch_builds_its_cache_with_the_quantization_it_was_given", None])
+def test_prefill_consumers_forward_the_loaded_model(monkeypatch, consumer):
+    from unsloth_zoo.mlx import generate
+    class Reached(Exception): pass
+    def check(*a, model=None, **k): assert model is not None; raise Reached
+    monkeypatch.setattr(generate, "_prefill_step_option", check)
+    if consumer is None:
+        adapter = _vlm_adapter(); adapter._prompt_inputs = lambda rows: {"input_ids": __import__("numpy").array([[1, 2]])}
+        session = object.__new__(generate._SpeculativeBatchSession); session.__dict__.update(adapter=adapter, speculative=types.SimpleNamespace(admit=lambda *a, **k: None), tokenizer=adapter.processor.tokenizer, stop_tokens=frozenset(), _next_row=0, _resume=lambda *a: 0, _embedded=lambda n: contextlib.nullcontext())
+    with pytest.raises(Reached): globals()[consumer]() if consumer else session.add(GenerationRequest(prompt="p"))
+
+
 def test_a_model_keeping_state_is_seen_to_keep_it_however_it_says_so():
     """A model may do the assignment in a helper, or spell it as something other than a name."""
     from unsloth_zoo.mlx.generate import _keeps_what_it_prepared
