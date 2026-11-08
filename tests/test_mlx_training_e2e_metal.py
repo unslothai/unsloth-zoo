@@ -2633,16 +2633,17 @@ def test_a_reference_model_scores_through_its_own_cce_kernel(kind):
 
 
 # Gemma 4's 24-token window bites on both sides of the prompt; its layers 2 and 3 read layers 0 and 1's K/V.
-_SHRUNK_VLM_STACKS = {
-    "qwen3_5": ("mlx-community/Qwen3.5-0.8B-4bit", dict(hidden_size=64, intermediate_size=128, num_hidden_layers=4, full_attention_interval=2, layer_types=["linear_attention", "full_attention"] * 2, num_attention_heads=2, num_key_value_heads=1, linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=32, linear_value_head_dim=32), dict(depth=1, hidden_size=32, intermediate_size=64, num_heads=2, out_hidden_size=64)),  # noqa: E501
-    "gemma4": ("mlx-community/gemma-4-e2b-it-4bit", dict(hidden_size=64, intermediate_size=128, num_hidden_layers=4, layer_types=["sliding_attention", "full_attention"] * 2, num_kv_shared_layers=2, num_attention_heads=2, head_dim=32, global_head_dim=64, hidden_size_per_layer_input=16, sliding_window=24), dict(num_hidden_layers=1, hidden_size=32, intermediate_size=64, num_attention_heads=2, num_key_value_heads=2, head_dim=16, global_head_dim=16)),  # noqa: E501
+# The repo whose config and processor each family's preference test shrinks; the sizes are _SHRUNK_VLM_STACKS below.
+_SHRUNK_VLM_REPOS = {
+    "qwen3_5": "mlx-community/Qwen3.5-0.8B-4bit",
+    "gemma4": "mlx-community/gemma-4-e2b-it-4bit",
 }
 
 
 def _shrunk_vlm(path, family, train_tower):
     import importlib, shutil, mlx_vlm.utils
     from huggingface_hub import snapshot_download
-    repo, text, vision = _SHRUNK_VLM_STACKS[family]
+    repo, (text, vision) = _SHRUNK_VLM_REPOS[family], _SHRUNK_VLM_STACKS[family]
     try:
         shutil.copytree(snapshot_download(repo, allow_patterns=["*.json", "*.jinja", "*.txt"], local_files_only=True), path, ignore=shutil.ignore_patterns("*.index.json", "README.md"))  # noqa: E501
     except Exception:
@@ -2671,7 +2672,7 @@ def test_preference_shared_prompt_matches_each_row_alone(tmp_path, monkeypatch, 
     mx.random.seed(11)
     if family == "qwen3_5" and nax.nax_available():
         pytest.skip("Qwen3.5's split term is capped at a fixed 3e-4 of each value, not measured on this device")
-    if family in _SHRUNK_VLM_STACKS:
+    if family in _SHRUNK_VLM_REPOS:
         model, processor = _shrunk_vlm(tmp_path / "tiny", family, train_tower=tower in ("trained", "held"))
         # Each tower other than "frozen" trips exactly one rule against sharing its run, "trained" both.
         if tower == "unfrozen":
@@ -2866,7 +2867,7 @@ def test_grpo_cce_scores_like_the_logits(monkeypatch, head):
     flat = lambda out: [*out[0], *(value for _, value in tree_flatten(out[1]))]
     assert all(mx.allclose(want, got, atol=1e-4, rtol=2e-4).item() for want, got in zip(flat(expected), flat(actual)))
     assert flags == [head == "quantized"] * (head != "softcap")
-    plan = SimpleNamespace(with_reference=False, score_temperature=0.7)
+    plan = SimpleNamespace(with_reference=False, score_temperature=0.7, _prefix=False)
     g.GRPOBatchPlan.bind(plan, model, [], trainer_state=None, scorer=cce._unsloth_grpo_scorer)
     # Old-policy and evaluation scores, taken while the model trains, keep the loss-only kernel.
     mx.eval(plan._logps(model, tokens, batch[1]), g.make_grpo_eval_fn(objective, scorer=cce._unsloth_grpo_scorer)(model, *batch))
@@ -3120,7 +3121,7 @@ def test_grpo_shared_prefix_matches_each_row_alone(monkeypatch, family, checkpoi
         packed[index, :len(row)] = row
     prefix = g.GRPOBatchPlan._prefix_ids(SimpleNamespace(_prefix=True, num_generations=size, _prefix_tokr=1.0, _processor=None), packed, lengths)  # noqa: E501
     assert prefix.shape == (2, 32)
-    logps, weights = g.grpo_logps(0.7, _make_preference_cce_scorer(model, temperature=0.7)), mx.array(rng.normal(size=(len(rows), 127)).astype(np.float32))  # noqa: E501
+    logps, weights = g.grpo_logps(0.7, _make_preference_cce_scorer(model, temperature=0.7), differentiated=True), mx.array(rng.normal(size=(len(rows), 127)).astype(np.float32))  # noqa: E501
 
     def each_row(model):
         values = [logps(model, mx.array([row]), mx.array(lengths[index:index + 1]))[0] for index, row in enumerate(rows)]
@@ -3226,7 +3227,7 @@ def test_vision_grpo_shared_prefix_matches_each_row_alone(monkeypatch, tmp_path,
     assert prefix is not None and prefix["input_ids"].shape[0] == 2 and ("pixel_values" in prefix) == image
     temperature = 1.0 if config["model_type"] == "gemma4" else 0.7  # a softcapped head scores at temperature 1 only
     scorer = _make_preference_cce_scorer(model, temperature=temperature)
-    logps, weights = g.grpo_logps(temperature, scorer), mx.array(rng.normal(size=(len(rows), width - 1)).astype(np.float32))  # noqa: E501
+    logps, weights = g.grpo_logps(temperature, scorer, differentiated=True), mx.array(rng.normal(size=(len(rows), width - 1)).astype(np.float32))  # noqa: E501
     assert scorer is not None and g.grpo_prefix_problem(model, scorer, 512) is None
 
     def each_row(model):
