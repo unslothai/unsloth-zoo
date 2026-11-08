@@ -96,8 +96,9 @@ NF4_MAX_SLOTS = None if NF4_MAX_SLOTS < 0 else NF4_MAX_SLOTS
 NF4_SLOTS_PER_EXPERT = 1.0
 BF16_MAX_SLOTS = _env_int("UNSLOTH_MOE_ROUTED_MAX_SLOTS", 32)
 # Under a CUDA-graph decode step below sm80 the other path (torch._grouped_mm over host-copied offsets) cannot be
-# captured, so the routed kernels serve every row up to this many slots there (16 rows x top_k 8). An explicit
-# UNSLOTH_MOE_ROUTED_MAX_SLOTS stays the cap.
+# captured, so the routed kernels serve every row up to this many slots there (16 rows x top_k 8). Setting
+# UNSLOTH_MOE_ROUTED_MAX_SLOTS keeps main's rule instead, graph steps included (more than one row then takes the
+# other path, so below sm80 such a step is not captured).
 GRAPH_MAX_SLOTS = _env_int("UNSLOTH_MOE_ROUTED_GRAPH_MAX_SLOTS", 128)
 _SLOTS_PINNED = "UNSLOTH_MOE_ROUTED_MAX_SLOTS" in os.environ
 

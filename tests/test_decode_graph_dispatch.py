@@ -261,3 +261,51 @@ def test_decode_attention_reads_per_head_masks(G):
     assert not G._gpt_oss_dense_decode_mask_ok(mask[:, :2], heads)
     assert not G._gpt_oss_dense_decode_mask_ok(mask[:, :, 0], heads)
     assert not G._gpt_oss_dense_decode_mask_ok({"full_attention": mask}, heads)
+
+
+def test_decode_attention_per_head_mask_with_one_kv_head(G):
+    # Multi-query attention: one KV head, a [B, H, 1, L] mask with its own row per query head.
+    g = torch.Generator().manual_seed(11)
+    bsz, heads, kv_heads, kv_len, D = 2, 8, 1, 40, 16
+    q = torch.randn(bsz, heads, 1, D, generator = g, dtype = torch.float64)
+    k = torch.randn(bsz, kv_heads, kv_len, D, generator = g, dtype = torch.float64)
+    v = torch.randn(bsz, kv_heads, kv_len, D, generator = g, dtype = torch.float64)
+    visible = torch.rand(bsz, heads, 1, kv_len, generator = g) > 0.3
+    visible[..., 0] = True
+    for mask in (
+        torch.zeros(bsz, heads, 1, kv_len, dtype = torch.float64).masked_fill(~visible, torch.finfo(torch.float64).min),
+        torch.zeros(bsz, 1, 1, kv_len, dtype = torch.float64).masked_fill(~visible[:, :1], torch.finfo(torch.float64).min),
+    ):
+        module = _Attn(heads, torch.randn(heads, generator = g, dtype = torch.float64))
+        want = _reference(module, q, k, v, mask, 0.25, kv_heads)
+        got, _ = G._gpt_oss_decode_attention(module, q, k, v, mask, 0.25)
+        torch.testing.assert_close(got, want, rtol = 1e-12, atol = 1e-12)
+
+
+def test_flex_graph_contract_names_the_mask_function(G, monkeypatch):
+    # The graph key sees the outer mask_mod's code, the same for every mask_function: the published identity is
+    # what tells two windows (or causal from sliding) apart, and a mask_function holding anything but scalars
+    # and functions (a dict of document ids, a partial, an object) publishes no contract at all.
+    import functools
+    from transformers.masking_utils import causal_mask_function, sliding_window_causal_mask_function
+    monkeypatch.setenv("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "flex")
+    docs = {"doc": torch.zeros(2, 300, dtype = torch.long)}
+
+    def packed(b, h, q, kv):
+        return (kv <= q) & (docs["doc"][b, q] == docs["doc"][b, kv])
+
+    def windowed(b, h, q, kv, window = 8):
+        return (kv <= q) & (kv > q - window)
+
+    with S.graph_generate():
+        ident = lambda fn: getattr(_decode_mask(G, monkeypatch, fn, torch.tensor(140)), "_unsloth_mask_identity", None)
+        causal = ident(causal_mask_function)
+        w8, w8b, w16 = (ident(sliding_window_causal_mask_function(w)) for w in (8, 8, 16))
+        assert causal is not None and w8 is not None
+        assert w8 == w8b and w8 != w16 and w8 != causal
+        assert all(type(x) in (bool, int, float, str) for x in w8)
+        assert ident(packed) is None
+        assert ident(functools.partial(windowed, window = 16)) is None
+        assert ident(windowed) != ident(lambda b, h, q, kv, window = 16: (kv <= q) & (kv > q - window))
+        for fn in (packed, functools.partial(windowed, window = 16)):
+            assert not hasattr(_decode_mask(G, monkeypatch, fn, torch.tensor(140)), "_unsloth_graph_closure")

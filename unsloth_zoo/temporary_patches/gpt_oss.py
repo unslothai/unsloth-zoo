@@ -181,8 +181,11 @@ def _gpt_oss_decode_attention(module, query, key, value, attention_mask, scaling
     if attention_mask is not None:
         # [B or 1, 1, 1, L] (one row per sequence, every head) or [B or 1, H, 1, L] (per head, grouped as the
         # logits are: head h = kv head h // groups, row h % groups).
-        rows = 1 if attention_mask.shape[1] == 1 else kv_heads
-        weights += attention_mask.reshape(attention_mask.shape[0], rows, groups if rows > 1 else 1, kv_len)
+        # Shared vs per head from the mask itself: with one KV head a per-head mask still has `groups` rows.
+        if attention_mask.shape[1] == 1:
+            weights += attention_mask.reshape(attention_mask.shape[0], 1, 1, kv_len)
+        else:
+            weights += attention_mask.reshape(attention_mask.shape[0], kv_heads, groups, kv_len)
     logits[..., -1] = module.sinks.reshape(1, kv_heads, groups)
     logits[:] = torch.nn.functional.softmax(logits, dim = -1, dtype = torch.float32)
     probs = logits[..., :kv_len].to(value.dtype)
@@ -190,25 +193,41 @@ def _gpt_oss_decode_attention(module, query, key, value, attention_mask, scaling
     return out.reshape(bsz, n_heads, q_len, head_dim).transpose(1, 2).contiguous(), None
 
 
-def _closure_holds_tensor(fn, depth = 4):
-    """True when fn (or a function it closes over, nested) captures a tensor: such a mask_mod cannot be rebuilt
-    over refilled graph buffers."""
-    if depth <= 0:
+_MASK_SCALARS = (bool, int, float, str, type(None))
+
+
+def _mask_function_identity(fn, depth = 4):
+    """A flat tuple naming what mask_function computes: every function's code (nested through its closure and
+    defaults) and every scalar it captures. None when it captures anything else (a tensor, a dict, an object, a
+    functools.partial): such a mask cannot be rebuilt over refilled graph buffers, nor told apart by a graph key.
+    Published on the BlockMask, so a graph captured for one mask is never replayed for another (a different window
+    or a different mask_function under the same outer mask_mod)."""
+    out = []
+
+    def walk(f, depth):
+        code = getattr(f, "__code__", None)
+        if depth <= 0 or code is None or not callable(f):
+            return False
+        out.append(f"{code.co_filename}:{code.co_firstlineno}:{code.co_qualname if hasattr(code, 'co_qualname') else code.co_name}")
+        values = []
+        for cell in getattr(f, "__closure__", None) or ():
+            try:
+                values.append(cell.cell_contents)
+            except ValueError:
+                values.append(None)
+        values.extend(getattr(f, "__defaults__", None) or ())
+        values.extend((getattr(f, "__kwdefaults__", None) or {}).values())
+        for value in values:
+            items = value if type(value) in (list, tuple) else (value,)
+            out.append(len(items) if type(value) in (list, tuple) else -1)
+            for item in items:
+                if type(item) in _MASK_SCALARS:
+                    out.append("None" if item is None else item)
+                elif not walk(item, depth - 1):
+                    return False
         return True
-    for cell in getattr(fn, "__closure__", None) or ():
-        try:
-            value = cell.cell_contents
-        except ValueError:
-            continue
-        if isinstance(value, torch.Tensor):
-            return True
-        items = value if isinstance(value, (list, tuple)) else (value,)
-        for item in items:
-            if isinstance(item, torch.Tensor):
-                return True
-            if callable(item) and _closure_holds_tensor(item, depth - 1):
-                return True
-    return False
+
+    return tuple(out) if walk(fn, depth) else None
 
 
 @functools.lru_cache(maxsize = 64)
@@ -294,14 +313,17 @@ def _gpt_oss_flex_mask(
                 seq_lengths = (1, kv_length),
                 **({"compute_q_blocks": torch.is_grad_enabled()} if _HAS_COMPUTE_Q_BLOCKS else {}),
             )
-            if (
-                _gpt_oss_graph_decode_attention() == "flex" and _gpt_oss_in_graph_generate()
-                and not _closure_holds_tensor(mask_function)
-            ):
+            identity = (
+                _mask_function_identity(mask_function)
+                if _gpt_oss_graph_decode_attention() == "flex" and _gpt_oss_in_graph_generate() else None
+            )
+            if identity is not None:
                 # CUDA-graph decode refills these tensors and rebuilds mask_mod over its own copies; every value
-                # mask_mod reads besides them is a constant of mask_function.
+                # mask_mod reads besides them is a constant of mask_function, named by the identity (part of the
+                # graph key as a BlockMask field).
                 tensors = (q_o, kv_o) if pad is None else (q_o, kv_o, pad)
                 block_mask._unsloth_graph_closure = (tensors, lambda ts: make_mask_mod(*ts))
+                block_mask._unsloth_mask_identity = identity
         else:
             block_mask = compiled_create_block_mask(mask_mod, bsz, None, q_length, kv_length, device = device)
         return block_mask
