@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Per-thread scopes Unsloth enters while generate() decodes through CUDA graphs.
-
-graph_generate(): the whole generate() call is planned for graph decode (masks are built outside the
-model forward, so mask selection reads this one). graph_decode_step(): a one-token decode step of such
-a call, eager or captured. Kernels picked under these scopes must be the same for the eager warm-up,
-the capture and every eager step of the call, so the first replay validates bitwise; without them,
-dispatch is exactly as before. Both are plain counters, read only outside torch.compile tracing.
+"""Per-thread scopes for generate() decoding through CUDA graphs. Kernels picked under them must match
+across eager warm-up, capture and eager steps so the first replay validates bitwise.
 """
 
 __all__ = [
@@ -51,12 +46,10 @@ class _Scope:
 
 
 def graph_generate():
-    """Scope of one generate() call planned for CUDA-graph decode."""
     return _Scope("generate")
 
 
 def graph_decode_step():
-    """Scope of one one-token decode step inside graph_generate()."""
     return _Scope("step")
 
 
