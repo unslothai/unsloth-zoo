@@ -195,6 +195,20 @@ def test_keyword_only_defaults_survive_lockdown():
     assert fn([[0]]) == 3
 
 
+def test_signed_number_defaults_survive_lockdown():
+    # -1 is a UnaryOp over a Constant in the AST, so a literal-only check refuses it while accepting 1.
+    fn = create_locked_down_function("def strategy(board, penalty = -1, bonus = +2.5, pair = (0, -1)):\n    return penalty, bonus, pair\n")
+    assert fn([[0]]) == (-1, 2.5, (0, -1))
+    fn = create_locked_down_function("def strategy(board, *, penalty = -0.5):\n    return penalty\n")
+    assert fn([[0]]) == -0.5
+
+
+@pytest.mark.parametrize("default", ["-float(1)", '-"a"', "-None", "-x"])
+def test_non_literal_defaults_are_still_refused(default):
+    with pytest.raises(RuntimeError, match = "literal default"):
+        create_locked_down_function(f"def strategy(board, x = 1, d = {default}):\n    return d\n")
+
+
 def test_full_policy_remains_available():
     fn = create_locked_down_function(
         "def matmul(A, B):\n    import os\n    return os.sep\n",

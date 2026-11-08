@@ -402,6 +402,9 @@ pass
 def _is_safe_literal(node: ast.AST) -> bool:
     if isinstance(node, ast.Constant):
         return True
+    # A signed number parses as UnaryOp, not Constant. Non-numbers (-"a") would raise at definition time.
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        return isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, (int, float, complex))
     if isinstance(node, ast.Tuple):
         return all(_is_safe_literal(e) for e in node.elts)
     return False
