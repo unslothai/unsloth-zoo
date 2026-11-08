@@ -751,6 +751,26 @@ def _open_fd_count():
     return None
 
 
+def test_vlm_plan_padding_free_admits_sparse_shapes_and_keeps_fallbacks_padded(monkeypatch):
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.utils import FiniteVLMBatchPlan, _create_vlm_batch_plan
+
+    def batch(lengths, width):
+        mask = np.arange(width) < np.array(lengths)[:, None]
+        return {"input_ids": mx.array(np.where(mask, 5, 0).astype(np.int32)),
+                "attention_mask": mx.array(mask.astype(np.int32))}
+
+    built = {0: batch((40, 5), 96), 1: batch((64, 60), 64), 2: batch((40, 5), 96)}
+    plan = _create_vlm_batch_plan(dataset=[{"text": str(i)} for i in range(6)], processor=_ContentProcessor(),
+                                  config={"image_size": 16, "image_token_id": 200}, batch_size=2, max_seq_length=8)
+    monkeypatch.setattr(FiniteVLMBatchPlan, "_build_batch", lambda self, index, target_width=None: built[index])
+    assert plan.configure_padding_free() == (1, 2) and set(plan._padding_free_capacities.values()) == {128}
+    assert "_unsloth_padding_free_slots" in plan.prepare_cce_batch(0, built[0])
+    assert plan.prepare_cce_batch(1, built[1]) is built[1]
+    left = {k: v[:, ::-1] for k, v in built[2].items()}  # a left-padded build falls back and stays padded after
+    assert plan.prepare_cce_batch(2, left) is left and plan.prepare_cce_batch(2, built[2]) is built[2]
+
+
 def test_vlm_plan_does_not_pin_one_file_descriptor_per_row(tmp_path):
     """File ownership: PIL.Image.open holds the file open until the raster loads, so the plan must not pin one descriptor per row past macOS's 256 soft limit."""
     Image = pytest.importorskip("PIL.Image")
@@ -1218,15 +1238,21 @@ def _train_stochastic_vlm(monkeypatch, tmp_path, *, resume_step=0,
     )
     trainer._is_vlm = True
 
-    def fake_value_and_grad(model, _loss_fn):
+    def fake_value_and_grad(model, loss_fn):
         params = model.trainable_parameters()
 
-        def wrapped(_model, batch_data, *_rest):
-            consumed.append(batch_data["input_ids"].tolist())
-            return (mx.array(1.0), mx.array(4)), tree_map(mx.zeros_like, params)
+        def wrapped(*args):
+            training.append(True)
+            try:
+                return loss_fn(*args), tree_map(mx.zeros_like, params)
+            finally:
+                training.pop()
 
         return wrapped
 
+    training = []  # a training step's loss, not an evaluation's
+    monkeypatch.setattr(trainer_mod, "make_vlm_baseline_loss_fn", lambda *_a, **_k: lambda _model, batch_data, *_rest: (
+        training and consumed.append(batch_data["input_ids"].tolist())) or (mx.array(1.0), mx.array(4)))
     monkeypatch.setattr(nn, "value_and_grad", fake_value_and_grad)
     monkeypatch.setattr(trainer_mod.nn, "value_and_grad", fake_value_and_grad)
 
@@ -2875,6 +2901,9 @@ def test_gemma4_loss_masks_follow_the_reference_without_a_host_read(monkeypatch)
                 assert arrays(patched(stack("vision", training), h, loss_cache, types)) == want
             traced = mx.compile(lambda h, t: patched(stack("vision"), h, loss_cache, t)[0])
             assert traced(h, types).tolist() == want[0]
+    from unsloth_zoo.mlx.utils import _PaddingFreeLayout, _padding_free_scope
+    with _padding_free_scope(_PaddingFreeLayout(mx.arange(12), 2, 6)):  # a flat stream keeps the row-width overlay
+        assert arrays(patched(stack("vision"), mx.zeros((1, 12, 1)), [None, None], ids))[0] == reference(ids)
     want = arrays(upstream(stack(None), h, [None, None], ids))
     traced = mx.compile(lambda h, t: [
         m for m in patched(stack(None), h, [None, None], t) if isinstance(m, mx.array)])

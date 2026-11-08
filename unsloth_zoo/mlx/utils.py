@@ -497,13 +497,52 @@ def _carry_window_masks(outer, inner):
             _register_window_mask(after, window)
 
 
+class _PaddingFreeLayout(NamedTuple):
+    """Flat stream [1, total] <-> right-padded rows [num_rows, span]; slots[n] is token n's padded position, injective.
+    total >= span, so a backbone that crops a mask to the flat length leaves it whole."""
+    slots: mx.array
+    num_rows: int
+    span: int
+
+    @property
+    def total(self):
+        return self.slots.shape[0]
+
+
+def _padding_free_layout(slots, row_mask):
+    return _PaddingFreeLayout(slots, *row_mask.shape)
+
+
+def _padding_free_capacity(tokens, num_rows, span):
+    """Flat capacity for a (family, width): at least span and rounded to 64; None below an eighth saved, where the
+    per-mixer scatter and gather cost more than the padding."""
+    capacity = -(-max(tokens, span, 1) // 64) * 64
+    return capacity if capacity * 8 <= num_rows * span * 7 else None
+
+
+_PADDING_FREE_LAYOUT = contextvars.ContextVar("unsloth_mlx_padding_free_layout", default=None)
+
+
+@contextlib.contextmanager
+def _padding_free_scope(layout):
+    token = _PADDING_FREE_LAYOUT.set(layout)
+    try:
+        yield
+    finally:
+        _PADDING_FREE_LAYOUT.reset(token)
+
+
 def _wrap_create_causal_mask(original):
     @wraps(original)
     def wrapper(N, offset=0, window_size=None, *args, **kwargs):
+        plain = (isinstance(offset, int) and offset == 0 and not args
+                 and all(v is None for v in kwargs.values()))
+        layout = _PADDING_FREE_LAYOUT.get()
+        if plain and layout is not None and N == layout.total:
+            # Mixers see [num_rows, span] rows; _padding_free_mask refuses any other mask shape.
+            N = layout.span
         mask = original(N, offset, window_size, *args, **kwargs)
-        if (window_size is not None and isinstance(offset, int) and offset == 0 and not args
-                and all(v is None for v in kwargs.values())
-                and mlx_training_patches_active()):
+        if window_size is not None and plain and mlx_training_patches_active():
             _register_window_mask(mask, window_size)
         return mask
 
@@ -543,11 +582,86 @@ def _windowing_pays(q, k, block):
     return skipped >= 2.5 * (heads + 2 * k.shape[1]) * padded * dim
 
 
+# mlx 0.32.4 trains head dims above 256 fused only on NAX; elsewhere its fallback builds all T x S scores at once.
+_FUSED_TRAINING_HEAD_DIM = 256
+_CHUNKED_ATTENTION_QUERIES = 512
+
+
+def _chunking_bounds_scores(q, v, mask):
+    from .attention import _stock_runs_nax
+
+    return (max(q.shape[-1], v.shape[-1]) > _FUSED_TRAINING_HEAD_DIM and q.shape[-2] > _CHUNKED_ATTENTION_QUERIES
+            and v.shape[-2] >= q.shape[-2] and (mask is None or isinstance(mask, mx.array) or mask == "causal") and not _stock_runs_nax())
+
+
+def _query_chunked_attention(sdpa, q, k, v, scale, mask, block):
+    # Peak grows with T rather than T^2; wrapping chunks in mx.checkpoint measured no lower.
+    T, S = q.shape[-2], k.shape[-2]
+    n = -(-T // block)
+    bounds = [T * i // n for i in range(n + 1)]
+    outputs = []
+    for start, stop in zip(bounds, bounds[1:]):
+        # Causal chunks keep keys only through their last row, where mlx's lower-right causal mask aligns.
+        keys = S - T + stop if isinstance(mask, str) else S
+        rows = mask
+        if isinstance(mask, mx.array) and mask.ndim >= 2 and mask.shape[-2] == T:
+            rows = mask[..., start:stop, :]
+        outputs.append(sdpa(q[..., start:stop, :], k[..., :keys, :], v[..., :keys, :], scale=scale, mask=rows))
+    return mx.concatenate(outputs, axis=2)
+
+
 def _as_array_mask(q, k, mask):
     T, S = q.shape[-2], k.shape[-2]
     if mask is None:
         return mx.ones((T, S), dtype=mx.bool_)
     return mx.arange(S)[None] <= mx.arange(S - T, S)[:, None]
+
+
+# mlx 0.32.4's fused SDPA VJP keeps its S/P/dS tiles in the input dtype, so bf16/fp16 gradients lose to an explicit
+# fp32 softmax; given fp32 inputs, the same fused forward and blocked VJP run in fp32.
+# Below 2047 queries (a 2048-token sequence after the label shift) or above D128, the fp32 copies cost more than
+# mlx's unfused path, so those causal calls keep the stock kernels.
+_FP32_CAUSAL_HEAD_DIMS = frozenset((64, 128))
+_FP32_CAUSAL_MIN_QUERIES = 2047
+
+
+def _fp32_runs_stock_kernels():
+    # NAX GPUs run fp32 attention on their NAX kernels only under TF32; otherwise the fp32 forward and VJP GEMMs cost
+    # more than the unfused path at D128, and the forward no longer rounds like the stock one.
+    from .attention import _stock_runs_nax, _tf32_enabled
+
+    return _tf32_enabled() or not _stock_runs_nax()
+
+
+def _fp32_attention_routes(q, k, v, mask, head_dims):
+    D, T = k.shape[-1], q.shape[-2]
+    return (os.environ.get("UNSLOTH_MLX_FP32_TRAIN_ATTENTION", "1") != "0"
+            and q.dtype == k.dtype == v.dtype and q.dtype in (mx.bfloat16, mx.float16) and T > 8
+            and D == v.shape[-1] and D in head_dims
+            and (mask is None or isinstance(mask, str) and mask == "causal" and T <= k.shape[-2])
+            and mx.metal.is_available() and mx.default_device() == mx.gpu)
+
+
+def _fp32_attention(sdpa, q, k, v, scale, mask):
+    out = sdpa(q.astype(mx.float32), k.astype(mx.float32), v.astype(mx.float32), scale=scale, mask=mask)
+    return out.astype(q.dtype)
+
+
+# Vision head dims of the Qwen3-VL family (Qwen3.5 64, Qwen3-VL 72 and 80), all fused by mlx from 9 queries.
+_FP32_VISION_HEAD_DIMS = frozenset((64, 72, 80))
+
+
+def fused_vision_attention(q, k, v, *, scale):
+    """Mask-free fused SDPA for a vision chunk whose fallback is an explicit fp32 softmax: fp32 inputs inside a
+    training step, the stock fused forward outside one. Returns None, so the caller keeps its explicit path, when mlx
+    would not fuse the call, off the GPU, and under UNSLOTH_MLX_FP32_TRAIN_ATTENTION=0."""
+    if not _fp32_attention_routes(q, k, v, None, _FP32_VISION_HEAD_DIMS):
+        return None
+    sdpa = mx.fast.scaled_dot_product_attention
+    sdpa = getattr(sdpa, "_unsloth_original", sdpa)
+    if mlx_training_patches_active():
+        return _fp32_attention(sdpa, q, k, v, scale, None)
+    return sdpa(q, k, v, scale=scale)
 
 
 def _wrap_training_sdpa(original):
@@ -565,6 +679,14 @@ def _wrap_training_sdpa(original):
                 block = max(_TRAINING_ATTENTION_BLOCK, window)
                 if _windowing_pays(q, k, block):
                     return _windowed_attention(original, q, k, v, scale, window, block)
+        # Disjoint by head dim, so each call takes at most one: D64/D128 fp32 route, D > 256 query chunks, else stock.
+        if (all(value is None for value in kwargs.values()) and isinstance(mask, str) and mask == "causal"
+                and T >= _FP32_CAUSAL_MIN_QUERIES and mlx_training_patches_active()
+                and _fp32_attention_routes(q, k, v, mask, _FP32_CAUSAL_HEAD_DIMS) and _fp32_runs_stock_kernels()):
+            return _fp32_attention(original, q, k, v, scale, mask)
+        if (all(value is None for value in kwargs.values()) and mlx_training_patches_active()
+                and _chunking_bounds_scores(q, v, mask)):
+            return _query_chunked_attention(original, q, k, v, scale, mask, _CHUNKED_ATTENTION_QUERIES)
         return original(q, k, v, scale=scale, mask=mask, **kwargs)
 
     wrapper._unsloth_original = original
@@ -587,6 +709,33 @@ def _set_mlx_windowed_attention(enabled: bool) -> None:
             setattr(module, attr, original)
 
 
+def _train_qmm_call(native, routes):
+    from . import matmul
+
+    def call(self, x):
+        routed = matmul.call_train_qmm_route(self, x, routes) if mlx_training_patches_active() else None
+        if routed is None:
+            return native(self, x)
+        return routed + self["bias"] if "bias" in self else routed
+
+    # Outside a training context every call is the native one, so contracts pinning the native still hold.
+    call._unsloth_original = call._unsloth_exact_route_of = native
+    return call
+
+
+def _set_mlx_train_qmm(enabled: bool) -> None:
+    current = nn.QuantizedLinear.__call__
+    original = getattr(current, "_unsloth_original", None)
+    # A __call__ someone else rebound keeps its behaviour: only mlx's own method takes the route.
+    if enabled and original is None and getattr(current, "__module__", "").startswith("mlx.nn."):
+        from . import matmul
+        routes = matmul.available_train_qmm_routes()
+        if routes:
+            nn.QuantizedLinear.__call__ = _train_qmm_call(current, routes)
+    elif not enabled and original is not None:
+        nn.QuantizedLinear.__call__ = original
+
+
 def acquire_mlx_training_patches() -> None:
     """Reference-counted because the mlx.core patches are process-wide while trainer runs are not, so an inner run must not unpatch an outer one."""
     global _MLX_TRAINING_PATCH_DEPTH
@@ -596,6 +745,7 @@ def acquire_mlx_training_patches() -> None:
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             _set_mlx_index_gradient_stop(True)
             _set_mlx_windowed_attention(True)
+            _set_mlx_train_qmm(True)
         _MLX_TRAINING_PATCH_DEPTH += 1
     _MLX_TRAINING_ACTIVE_DEPTH.set(_MLX_TRAINING_ACTIVE_DEPTH.get() + 1)
 
@@ -609,6 +759,7 @@ def release_mlx_training_patches() -> None:
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             _set_mlx_index_gradient_stop(False)
             _set_mlx_windowed_attention(False)
+            _set_mlx_train_qmm(False)
     _MLX_TRAINING_ACTIVE_DEPTH.set(max(0, _MLX_TRAINING_ACTIVE_DEPTH.get() - 1))
 
 
@@ -626,6 +777,7 @@ def pause_mlx_training_patches() -> bool:
         _MLX_TRAINING_PATCH_DEPTH = 0
         _set_mlx_index_gradient_stop(False)
         _set_mlx_windowed_attention(False)
+        _set_mlx_train_qmm(False)
         return True
 
 
@@ -639,6 +791,7 @@ def resume_mlx_training_patches(paused: bool) -> None:
             if _MLX_TRAINING_PATCH_DEPTH == 0:
                 _set_mlx_index_gradient_stop(True)
                 _set_mlx_windowed_attention(True)
+                _set_mlx_train_qmm(True)
             _MLX_TRAINING_PATCH_DEPTH += 1
     stack = _MLX_TRAINING_PAUSE_STACK.get()
     if stack:
@@ -650,9 +803,9 @@ def mlx_training_patches_active() -> bool:
     return _MLX_TRAINING_ACTIVE_DEPTH.get() > 0
 
 
-# Sorted gather_qmm silently corrupts output on neural-accelerator Metal GPUs: unaligned K (mlx issue 3887, open), rows
-# past 32768 (mlx issue 3856, fixed by 3922); dropping sorted_indices is safe only where a probe measures corruption;
-# kill switch UNSLOTH_MLX_GATHER_QMM_GUARD=0.
+# Before mlx 0.32.3, sorted gather_qmm silently corrupts output on neural-accelerator Metal GPUs: unaligned K (mlx issue
+# 3887, fixed by 4009), rows past 32768 (mlx issue 3856, fixed by 3922); dropping sorted_indices is safe only where a
+# probe measures corruption; UNSLOTH_MLX_GATHER_QMM_GUARD=0 or 1 overrides the version gate.
 _MLX_MAX_SORTED_ROWS = 32768
 _MLX_CANARY_ERROR_LIMIT = 1.0
 _MLX_K_REMAINDER = "k_remainder"
@@ -848,7 +1001,8 @@ def is_gather_qmm_nax_guard_applied() -> bool:
 def apply_gather_qmm_nax_guard() -> bool:
     """Idempotent and thread-safe; installed under the index-stop wrapper, which removes itself by inspecting mx and would be stranded by anything on top."""
     global _MLX_GATHER_QMM_ORIGINAL
-    if os.environ.get("UNSLOTH_MLX_GATHER_QMM_GUARD", "1") == "0":
+    setting = os.environ.get("UNSLOTH_MLX_GATHER_QMM_GUARD")
+    if setting == "0" or (setting is None and _Version(mx.__version__) >= _Version("0.32.3")):
         return False
     with _MLX_INDEX_GRADIENT_LOCK:
         if is_gather_qmm_nax_guard_applied():
@@ -956,6 +1110,20 @@ def _tie_to_hidden_state(args, shared_kv):
     return (x, *args[1:]), shared_kv
 
 
+_GC_BYPASS_DEPTH = contextvars.ContextVar("unsloth_mlx_gc_bypass_depth", default=0)
+
+
+@contextlib.contextmanager
+def gradient_checkpointing_bypassed():
+    """Checkpointed layers out of training run their own __call__ inside this context; generation enters it."""
+    depth = _GC_BYPASS_DEPTH.get()
+    _GC_BYPASS_DEPTH.set(depth + 1)
+    try:
+        yield
+    finally:
+        _GC_BYPASS_DEPTH.set(depth)
+
+
 def _patch_layer_class_for_gc(layer_cls):
     if getattr(layer_cls, '_orig_call', None) is not None:
         return  # already patched
@@ -963,7 +1131,13 @@ def _patch_layer_class_for_gc(layer_cls):
     fn = layer_cls.__call__
 
     def checkpointed_fn(self, *args, **kwargs):
-        slot = next((a for a in args if isinstance(a, _SharedKVSlot)), None)
+        if _GC_BYPASS_DEPTH.get() and not self.training:
+            return fn(self, *args, **kwargs)
+        slot = next((a for a in args if isinstance(a, (_SharedKVSlot, _PrefixKVSlot, _PrefixStateSlot))), None)
+        if slot is None and isinstance(kwargs.get("cache"), (_PrefixKVSlot, _PrefixStateSlot)):
+            slot = kwargs["cache"]
+        # The VJP recomputes the layer after the loss returned and cleared the padding-free scope.
+        layout = _PADDING_FREE_LAYOUT.get()
         if slot is None:
             if "shared_kv" in kwargs:
                 args, kwargs["shared_kv"] = _tie_to_hidden_state(
@@ -980,7 +1154,8 @@ def _patch_layer_class_for_gc(layer_cls):
                 args = tuple(_detach_integer_arrays(a) for a in args)
                 kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
                 before = [dict(args[i]) for i in shared]
-                out = fn(self, *args, **kwargs)
+                with _padding_free_scope(layout):
+                    out = fn(self, *args, **kwargs)
                 writes = [_traced_writes(args[i], seen) for i, seen in zip(shared, before)]
                 wrote = any(writes)
                 # Writes go first: mx.checkpoint misaligns cotangents after an output with no gradient (an index).
@@ -1003,13 +1178,19 @@ def _patch_layer_class_for_gc(layer_cls):
             _carry_window_masks(outer, (args, kwargs))
             args = tuple(_detach_integer_arrays(a) for a in args)
             kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
-            out = fn(self, *args, **kwargs)
-            return out, slot.recorded()
+            with _padding_free_scope(layout):
+                out = fn(self, *args, **kwargs)
+            # mx.vjp seeds a repeated output with its first cotangent only: K/V also in out (Gemma 4's) cross once.
+            leaves = {id(leaf): index for index, (_, leaf) in enumerate(mlx.utils.tree_flatten(out))}
+            repeated[:] = [leaves.get(id(state)) for state in slot.recorded()]
+            return out, tuple(None if index is not None else state for state, index in zip(slot.recorded(), repeated))
 
+        repeated = []
         args, borrowed = _tie_to_hidden_state(args, slot.borrow())
         out, recorded = mx.checkpoint(inner_fn)(
             self.trainable_parameters(), borrowed, *args, **kwargs)
-        slot.install(recorded)
+        leaves = [leaf for _, leaf in mlx.utils.tree_flatten(out)]
+        slot.install(tuple(state if index is None else leaves[index] for state, index in zip(recorded, repeated)))
         return out
 
     layer_cls.__call__ = checkpointed_fn
@@ -1043,6 +1224,135 @@ def remove_gradient_checkpointing(model):
     vt_layers = _get_vision_encoder_layers(model)
     if vt_layers is not None and len(vt_layers) > 0:
         _unpatch_layer_class_gc(type(vt_layers[0]))
+
+
+# Families whose decoder layers mix tokens only inside one of these children, with no position-dependent backbone input.
+_PADDING_FREE_MODEL_TYPES = frozenset((
+    "llama", "mistral", "qwen2", "qwen3", "qwen3_moe", "gemma3_text", "qwen3_next"))
+# mlx-vlm families whose embedder output is per token, besides positions and masks that only the mixers read.
+_PADDING_FREE_VLM_MODEL_TYPES = frozenset(("qwen3_5", "qwen3_5_moe", "gemma4"))
+_PADDING_FREE_MIXERS = ("self_attn", "linear_attn")
+
+
+def _padding_free_mask(mask, layout):
+    if not isinstance(mask, mx.array):
+        return mask
+    # Masks built at the flat length come out span-sized (_wrap_create_causal_mask), and crops to it are no-ops.
+    if mask.shape[-2:] != (layout.span, layout.span):
+        raise NotImplementedError(
+            f"Unsloth MLX: padding-free cannot map a {mask.shape} attention mask onto {layout.span}-token rows.")
+    window = _registered_window(mask)
+    return "causal" if window is not None and layout.span <= window else mask
+
+
+def _is_padding_free_mixer_arg(value):
+    """Masks, positions, offsets and borrowed K/V already sit in the per-row layout; a cache would not."""
+    if isinstance(value, (tuple, list)):
+        return all(isinstance(v, mx.array) for v in value)
+    return value is None or isinstance(value, (str, int, mx.array))
+
+
+def _padding_free_mixer_forward(original, module, x, layout, args, kwargs):
+    if not all(_is_padding_free_mixer_arg(v) for v in (*args, *kwargs.values())):
+        raise NotImplementedError("Unsloth MLX: padding-free token mixers run without a cache.")
+    num_rows, span = layout.num_rows, layout.span
+    if args:
+        args = (_padding_free_mask(args[0], layout), *args[1:])
+    if "mask" in kwargs:
+        kwargs = {**kwargs, "mask": _padding_free_mask(kwargs["mask"], layout)}
+    # Right padding: pad slots follow every real token of their row, so causal mixers never read them.
+    padded = mx.zeros((num_rows * span, x.shape[-1]), dtype=x.dtype).at[layout.slots].add(x[0])
+    out = original(module, padded.reshape(num_rows, span, -1), *args, **kwargs)
+    head = out[0] if isinstance(out, tuple) else out
+    if not isinstance(head, mx.array):
+        raise NotImplementedError(
+            f"Unsloth MLX: padding-free cannot map {type(module).__name__}'s {type(head).__name__} output.")
+    head = mx.take(head.reshape(num_rows * span, -1), layout.slots, axis=0)[None]
+    # Gemma 4 hands its K/V to later layers' mixers, which read them in the same per-row layout.
+    return (head, *out[1:]) if isinstance(out, tuple) else head
+
+
+def _patch_padding_free_mixer(mixer_cls):
+    if "_unsloth_padding_free_call" in vars(mixer_cls):
+        return False
+    original = mixer_cls.__call__
+
+    @wraps(original)
+    def padding_free_call(self, x, *args, **kwargs):
+        layout = _PADDING_FREE_LAYOUT.get()
+        if layout is None or getattr(x, "ndim", 0) != 3 or x.shape[:2] != (1, layout.total):
+            return original(self, x, *args, **kwargs)
+        return _padding_free_mixer_forward(original, self, x, layout, args, kwargs)
+
+    padding_free_call._unsloth_padding_free = True
+    mixer_cls._unsloth_padding_free_call = original
+    mixer_cls.__call__ = padding_free_call
+    return True
+
+
+def padding_free_mixer_classes(model):
+    """(token-mixer classes, None) for a model padding-free supports, else (None, the reason it does not)."""
+    config = getattr(model, "_config", None) or getattr(model, "config", None)
+    model_type = _config_get(config, "model_type") if config is not None else None
+    model_type = model_type or getattr(model, "model_type", None)
+    layers = _get_transformer_layers(model)
+    vlm = _is_vlm_model(model)
+    if model_type not in (_PADDING_FREE_VLM_MODEL_TYPES if vlm else _PADDING_FREE_MODEL_TYPES) or not layers:
+        return None, (
+            f"model_type={model_type!r} is not supported; supported text families: "
+            f"{', '.join(sorted(_PADDING_FREE_MODEL_TYPES))}; vision families: "
+            f"{', '.join(sorted(_PADDING_FREE_VLM_MODEL_TYPES))}")
+    if vlm and _shared_kv_slot_count(model):
+        # Cache slots would carry K/V across the flat and padded layouts.
+        return None, "it needs an mlx-vlm that threads Gemma 4 shared K/V itself (0.5.0+)"
+    mixer_classes = []
+    for layer in layers:
+        mixers = [getattr(layer, name) for name in _PADDING_FREE_MIXERS
+                  if isinstance(getattr(layer, name, None), nn.Module)]
+        if len(mixers) != 1:
+            return None, f"it cannot find the token mixer of {type(layer).__name__}"
+        if type(mixers[0]) not in mixer_classes:
+            mixer_classes.append(type(mixers[0]))
+    return mixer_classes, None
+
+
+def install_padding_free(model):
+    """Route each decoder layer's token mixer through per-row padding inside padding-free forwards; returns the patched
+    classes for remove_padding_free. Outside a padding-free batch the patched mixers run unchanged.
+    The patches are process-global and assume one training run at a time; nested and sequential runs are safe."""
+    mixer_classes, reason = padding_free_mixer_classes(model)
+    if reason is not None:
+        raise NotImplementedError(f"Unsloth MLX: padding_free=True: {reason}.")
+    return [cls for cls in mixer_classes if _patch_padding_free_mixer(cls)]
+
+
+def remove_padding_free(mixer_classes):
+    for cls in mixer_classes:
+        original = vars(cls).get("_unsloth_padding_free_call")
+        if original is not None and getattr(vars(cls).get("__call__"), "_unsloth_padding_free", False):
+            cls.__call__ = original
+            del cls._unsloth_padding_free_call
+
+
+def make_padding_free_loss_fn(loss_fn):
+    """Accept padding-free batches besides padded ones: text tuples end with (slots, row_mask), VLM dicts carry
+    slots over their attention_mask's rows."""
+    def padding_free_loss_fn(model, *args, **kwargs):
+        if args and isinstance(args[-1], (tuple, list)):
+            *args, layout = args
+            with _padding_free_scope(_padding_free_layout(*layout)):
+                return loss_fn(model, *args, **kwargs)
+        if args and isinstance(args[0], dict) and "_unsloth_padding_free_slots" in args[0]:
+            batch = args[0]
+            with _padding_free_scope(_padding_free_layout(batch["_unsloth_padding_free_slots"], batch["attention_mask"])):
+                return loss_fn(model, *args, **kwargs)
+        return loss_fn(model, *args, **kwargs)
+
+    padding_free_loss_fn.__dict__.update(vars(loss_fn))
+    compiled = getattr(loss_fn, "_unsloth_compiled_loss_fn", None)
+    if compiled is not None:
+        padding_free_loss_fn._unsloth_compiled_loss_fn = make_padding_free_loss_fn(compiled)
+    return padding_free_loss_fn
 
 
 def _get_text_model(model):
@@ -1196,6 +1506,102 @@ class _SharedKVSlot:
 
     def recorded(self):
         return self.keys, self.values
+
+
+# RoPE class names whose mlx-lm/mlx-vlm implementations rotate by position alone. Others pick their frequencies from the
+# forward's length or the batch's largest offset (dynamic NTK, longrope's short/long switch). A name cannot vouch for an
+# arbitrary model's own class, so callers gate on model type first.
+_POSITION_ONLY_ROPES = frozenset((
+    "RoPE", "EagerRoPE", "Llama3RoPE", "YarnRoPE", "ProportionalRoPE", "MRoPERotaryEmbedding", "Qwen3_5RotaryEmbedding",
+))
+
+
+def _length_dependent_ropes(backbone):
+    """RoPE classes in backbone not known to rotate by position alone."""
+    names = {type(module).__name__ for _, module in backbone.named_modules()}
+    return sorted(name for name in names if ("RoPE" in name or "Rotary" in name) and name not in _POSITION_ONLY_ROPES)
+
+
+def _repeat_prefix(prefix, repeats, interleaved=False):
+    return mx.repeat(prefix, repeats, axis=0) if interleaved else mx.concatenate([prefix] * repeats)
+
+
+class _PrefixKVSlot:
+    """A layer's cache for a shared-prompt forward. Built without a prefix, it records the prompt's post-RoPE K/V; built
+    from them, it puts the prompt batch, repeated repeats times as a preference batch holds every chosen row before any
+    rejected one (interleaved: each prompt repeats times in turn, as GRPO holds a group's rows), ahead of its rows' own
+    K/V at offset = prompt length, so attention applies RoPE there and a bottom-right causal mask. Re-runnable under
+    mx.checkpoint."""
+
+    __slots__ = ("keys", "values", "offset", "repeats", "recording", "interleaved")
+    borrow, install, recorded = _SharedKVSlot.borrow, _SharedKVSlot.install, _SharedKVSlot.recorded
+
+    def __init__(self, prefix=None, repeats=1, interleaved=False):
+        self.keys, self.values = (None, None) if prefix is None else prefix
+        self.offset = 0 if prefix is None else prefix[0].shape[-2]
+        self.repeats, self.recording, self.interleaved = repeats, prefix is None, interleaved
+
+    def update_and_fetch(self, keys, values):
+        if self.recording:
+            self.keys, self.values = keys, values
+            return keys, values
+        return tuple(
+            mx.concatenate([_repeat_prefix(prefix, self.repeats, self.interleaved), own], axis=-2)
+            for prefix, own in ((self.keys, keys), (self.values, values))
+        )
+
+    def make_mask(self, N, return_array=False, window_size=None):
+        if window_size is None and not return_array:
+            return "causal" if N > 1 else None
+        queries, keys = mx.arange(self.offset, self.offset + N)[:, None], mx.arange(self.offset + N)[None]
+        mask = queries >= keys
+        return mask if window_size is None else mask & (queries < keys + window_size)
+
+
+class _PrefixStateSlot:
+    """_PrefixKVSlot for a linear-attention layer (mlx-vlm's ArraysCache protocol): it records the prompt's final conv
+    window and recurrent state, or starts every row from them. Unslotted, since mlx-vlm tags caches with metadata."""
+
+    lengths = None
+
+    def __init__(self, prefix=None, repeats=1, interleaved=False):
+        self.cache = [None, None] if prefix is None else list(prefix)
+        self.repeats, self.recording, self.interleaved = repeats, prefix is None, interleaved
+
+    def borrow(self):
+        return None if self.cache[0] is None else tuple(self.cache)
+
+    def install(self, borrowed):
+        # A checkpoint recompute must not start the prompt's recording pass from the state it recorded.
+        self.cache = [None, None] if borrowed is None else list(borrowed)
+
+    def recorded(self):
+        return tuple(self.cache)
+
+    def __getitem__(self, index):
+        state = self.cache[index]
+        return state if self.recording or state is None else _repeat_prefix(state, self.repeats, self.interleaved)
+
+    def update_window(self, index, source, width, *, lengths=None):
+        if self.recording:
+            self.cache[index] = source[:, source.shape[1] - width:]
+
+    def update_recurrent(self, index, length, update):
+        output, state = update(self[index], None)[:2]
+        if self.recording:
+            self.cache[index] = state
+        return output, state
+
+
+def _prefix_cache(backbone, recorded=None, repeats=1, interleaved=False):
+    """Recording slots for backbone's layers, or slots extending recorded; None where gemma4 reads another layer's K/V."""
+    if recorded is not None:
+        return [None if slot is None else type(slot)(slot.recorded(), repeats, interleaved) for slot in recorded]
+    sources = getattr(backbone, "previous_kvs", None) or range(len(backbone.layers))
+    return [
+        None if source != index else _PrefixStateSlot() if getattr(layer, "is_linear", False) else _PrefixKVSlot()
+        for index, (layer, source) in enumerate(zip(backbone.layers, sources))
+    ]
 
 
 # Language models that scale token embeddings by sqrt(hidden_size) on the ids path only, so multimodal forwards lose the
@@ -2145,11 +2551,20 @@ def _runtime_cce_by_mode(**kwargs):
     return lambda model: training if model.training else loss_only
 
 
-def make_cce_loss_fn(model, label_smoothing=0.0):
+def _reduce_token_losses(loss, ntoks, dft):
+    loss = loss.astype(mx.float32)
+    if dft:
+        # TRL's dft_loss: -p.detach() * log p per token, where p = exp(-loss); masked tokens carry loss 0.
+        loss = loss * mx.stop_gradient(mx.exp(-loss))
+    return loss.sum() / _safe_token_denominator(ntoks)
+
+
+def make_cce_loss_fn(model, label_smoothing=0.0, loss_type="nll"):
     """Chunked cross-entropy loss from hidden states and the LM head weight, avoiding full logit materialization;
     returns (model, batch, lengths, labels=None) -> (loss, ntoks), with targets labels[:,1:] masked by != -100; sets
-    _unsloth_cce_backend for logging."""
+    _unsloth_cce_backend for logging. loss_type="dft" applies only on the runtime-cce backend; fallbacks ignore it."""
     label_smoothing = _normalize_label_smoothing(label_smoothing)
+    dft = loss_type == "dft"
     # Checks topology first (mirrors the VLM factory), then head eligibility, then scale validation, so no positive CCE
     # notice precedes a fallback; backboneless models cannot yield pre-head hidden states, so the full forward is the
     # only faithful loss.
@@ -2272,7 +2687,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             )
             hidden_flat = _rotate_head_input(layer, hidden_flat)
             loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
-            loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            loss = _reduce_token_losses(loss, ntoks, dft)
             return loss, ntoks
     else:
         _skip_weight_grad = not _is_lm_head_trainable(model)
@@ -2316,7 +2731,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
                 hidden_flat, targets_flat, cce_indices,
             )
             loss = rt_cce(model)(hidden_flat, w, targets_flat)
-            loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            loss = _reduce_token_losses(loss, ntoks, dft)
             return loss, ntoks
 
     loss_fn._unsloth_cce_backend = "runtime-cce"
@@ -2352,6 +2767,13 @@ def _masked_correct(logits, targets, mask):
     """Supervised positions whose argmax is the target (eval token accuracy)."""
     hits = mx.logical_and(mx.argmax(logits, axis=-1) == targets, mask.astype(mx.bool_))
     return hits.astype(mx.float32).sum()
+
+
+def _row_contiguous_cross_entropy(logits, targets, **kwargs):
+    # mlx 0.32.4's fused cross-entropy VJP races on non-row-contiguous logits (ml-explore/mlx#4686). A flatten round
+    # trip copies sequence- or vocab-sliced logits and is free for row-contiguous ones; mx.contiguous would also copy a
+    # row-contiguous slice out of its larger buffer.
+    return nn.losses.cross_entropy(logits.reshape(-1).reshape(logits.shape), targets, **kwargs)
 
 
 def make_baseline_loss_fn(label_smoothing=0.0):
@@ -2966,7 +3388,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         safe_targets = mx.where(
             targets == -100, mx.array(0, dtype=targets.dtype), targets,
         )
-        ce = nn.losses.cross_entropy(logits, safe_targets) * mask
+        ce = _row_contiguous_cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
         if return_correct:
@@ -3107,8 +3529,32 @@ def _filter_backbone_kwargs(backbone, kwargs):
     return {k: v for k, v in kwargs.items() if k in allowed}
 
 
-def _vlm_hidden_states(model, batch_dict):
-    """Pre-lm_head hidden states for every position of a collated VLM batch dict."""
+# Backbone inputs the per-row mixers or the mask builders read; they stay padded.
+_PADDING_FREE_VLM_ROW_KWARGS = frozenset(("position_ids", "attention_mask", "token_type_ids", "mm_token_type_ids"))
+
+
+def _padding_free_vlm_inputs(inputs, embeds, kwargs, layout):
+    """Move the merged embeddings, and the other per-token backbone inputs, onto the flat stream."""
+    shape = (layout.num_rows, layout.span)
+    if embeds is None or embeds.shape[:2] != shape or inputs.shape != shape:
+        raise NotImplementedError("Unsloth MLX: padding-free needs one merged embedding per input token.")
+
+    def flat(a):
+        return mx.take(a.reshape(shape[0] * shape[1], *a.shape[2:]), layout.slots, axis=0)[None]
+
+    kwargs = dict(kwargs)
+    if kwargs.get("per_layer_inputs") is not None:
+        kwargs["per_layer_inputs"] = flat(kwargs["per_layer_inputs"])
+    unknown = sorted(k for k, v in kwargs.items()
+                     if v is not None and k != "per_layer_inputs" and k not in _PADDING_FREE_VLM_ROW_KWARGS)
+    if unknown:
+        raise NotImplementedError(f"Unsloth MLX: padding-free cannot place the backbone inputs {unknown}.")
+    return flat(inputs), flat(embeds), kwargs
+
+
+def _vlm_hidden_states(model, batch_dict, cache=None):
+    """Pre-lm_head hidden states for every position of a collated VLM batch dict; inside a padding-free scope, for
+    the flat stream's tokens, with the vision tower and the merge still run on the padded rows."""
     input_ids = batch_dict["input_ids"]
     pixel_values = batch_dict.get("pixel_values")
     attention_mask = batch_dict.get("attention_mask")
@@ -3166,9 +3612,13 @@ def _vlm_hidden_states(model, batch_dict):
     ):
         backbone_kwargs["mm_token_type_ids"] = extra_kwargs["mm_token_type_ids"]
 
-    shared_kv = _build_shared_kv_caches(model)
+    shared_kv = _build_shared_kv_caches(model) if cache is None else cache
     if shared_kv is not None:
         backbone_kwargs["cache"] = shared_kv
+    layout = _PADDING_FREE_LAYOUT.get()
+    if layout is not None:
+        inputs, merged_embeds, backbone_kwargs = _padding_free_vlm_inputs(
+            inputs, merged_embeds, backbone_kwargs, layout)
 
     return _forward_text_hidden_states(
         model,
@@ -3178,13 +3628,79 @@ def _vlm_hidden_states(model, batch_dict):
     )
 
 
+def _qwen35_image_features(model, pixels, inputs):
+    tower = model.vision_tower
+    return tower(pixels.astype(tower.patch_embed.proj.weight.dtype), inputs["image_grid_thw"])[0]
+
+
+def _gemma4_image_features(model, pixels, inputs):
+    return model.embed_vision(model.vision_tower(pixels, inputs.get("image_position_ids")))
+
+
+# Families whose embedder takes cached_image_features in place of exactly what the encoder computes: the encoder, the
+# per-image inputs it reads beside the pixels, and the modules it runs. Qwen3-VL's cached path drops its deepstack.
+_VLM_IMAGE_ENCODERS = {
+    "qwen3_5": (_qwen35_image_features, ("image_grid_thw",), ("vision_tower",)),
+    "qwen3_5_moe": (_qwen35_image_features, ("image_grid_thw",), ("vision_tower",)),
+    "gemma4": (_gemma4_image_features, ("image_position_ids",), ("vision_tower", "embed_vision")),
+}
+
+
+_VLMImageEncoder = collections.namedtuple("_VLMImageEncoder", ("encode", "keys", "modules", "module_ids"))
+
+
+def _vlm_image_encoder(model):
+    entry = _VLM_IMAGE_ENCODERS.get(_mlx_vlm_canonical_model_type(
+        _config_get(getattr(model, "config", None), "model_type")
+    ))
+    if entry is None:
+        return None
+    modules = tuple(getattr(model, name, None) for name in entry[2])
+    if any(module is None for module in modules):
+        return None
+    children = [child for module in modules for _, child in module.named_modules()]
+    if any(
+        # Each copy and pass would draw its own mask.
+        child.training and type(child).__name__.endswith("Dropout") and _get_mlx_dropout_probability(child) > 0
+        for child in children
+    ):
+        return None
+    return _VLMImageEncoder(entry[0], entry[1], modules, frozenset(map(id, children)))
+
+
+def _vlm_image_features(model, batch_dict, copies=1):
+    """Features of a batch whose images repeat ``copies`` times, from one tower run over the first copy, laid out as
+    the embedder lays them; None when the family or batch has no cached path."""
+    encoder = _vlm_image_encoder(model)
+    pixels = batch_dict.get("pixel_values")
+    if encoder is None or pixels is None or batch_dict.get("pixel_values_videos") is not None:
+        return None
+    encode, keys = encoder.encode, encoder.keys
+    inputs = {k: v for k, v in batch_dict.items() if not k.startswith("_unsloth_") and v is not None}
+    _apply_static_vlm_metadata(model, batch_dict, inputs)
+
+    def first(value):
+        size = value.shape[0] if hasattr(value, "shape") else len(value)
+        return None if size % copies else value[:size // copies]
+
+    parts = {key: first(inputs[key]) for key in keys if key in inputs}
+    pixels = first(pixels)
+    if pixels is None or any(part is None for part in parts.values()):
+        return None
+    features = encode(model, pixels, parts)
+    return mx.concatenate([features] * copies, axis=-2) if copies > 1 else features
+
+
 def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
                      assistant_token_id=0):
     """Shared VLM CCE forward: embed -> backbone -> hidden + masked_targets + ntoks."""
     input_ids = batch_dict["input_ids"]
     attention_mask = batch_dict.get("attention_mask")
     labels = batch_dict.get("labels")
-    hidden = _vlm_hidden_states(model, batch_dict)[:, :-1, :]
+    layout = _PADDING_FREE_LAYOUT.get()
+    hidden = _vlm_hidden_states(model, batch_dict)
+    if layout is None:
+        hidden = hidden[:, :-1, :]
 
     if labels is not None:
         # Extra mask keeps externally supplied labels compatible.
@@ -3220,6 +3736,11 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         masked_targets = _mask_prompt_tokens(masked_targets, assistant_token_id)
 
         ntoks = (masked_targets != -100).sum()
+
+    if layout is not None:
+        # Each flat token predicts its row's next token; a row's last token, pad and dummy slots carry -100.
+        masked_targets = mx.pad(masked_targets, ((0, 0), (0, 1)), constant_values=-100)
+        return hidden, mx.take(masked_targets.reshape(-1), layout.slots)[None], ntoks
 
     # Align sequence lengths (vision token injection changes seq len)
     h_seq, t_seq = hidden.shape[1], masked_targets.shape[1]
@@ -4224,10 +4745,11 @@ def _vlm_positions_for_compile(batch_dict, config):
     return batch_dict
 
 
-def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
+def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None, loss_type="nll"):
     """CCE loss over pre-lm_head hidden states from get_input_embeddings() merged embeddings, with baseline loss as
     fallback; assistant_token_id > 0 enables completion-only training, masking tokens before its first occurrence;
-    returns (model, batch_dict) -> (loss, ntoks)."""
+    returns (model, batch_dict) -> (loss, ntoks). loss_type="dft" applies only on the runtime-cce backend."""
+    dft = loss_type == "dft"
     def _marked_vlm_baseline():
         loss_fn = make_vlm_baseline_loss_fn(
             model,
@@ -4260,6 +4782,9 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         backbone is not None and _get_backbone_embed_kwarg(backbone) is None
         and _get_encoder_decoder_backbone(model) is None
     )
+    if dft and token_ids_only:
+        # Media batches on this backbone score through the baseline loss, which has no DFT weighting.
+        return _marked_vlm_baseline()
 
     head_desc = describe_output_head(model)
     _ineligible = _cce_head_ineligibility(head_desc)
@@ -4348,7 +4873,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
             hidden_flat = _rotate_head_input(lm_head, hidden_flat)
             loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
-            loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            loss = _reduce_token_losses(loss, ntoks, dft)
             return loss, ntoks
     else:
         if _skip_weight_grad:
@@ -4379,7 +4904,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
                 hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
             loss = rt_cce(model)(hidden_flat, w, targets_flat)
-            loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+            loss = _reduce_token_losses(loss, ntoks, dft)
             return loss, ntoks
 
     if token_ids_only:
@@ -4413,13 +4938,17 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
 
 def _get_vlm_image_size(config, processor):
     """Target size for uniform resizing, from vision_config.image_size then processor.image_processor.size, else 512;
-    area-style size dicts (Qwen2.5-VL min/max pixels) are skipped: as dimensions they upsample to 3136x3136 and OOM."""
+    None for a processor that sizes images to its own token budget; area-style size dicts (Qwen2.5-VL min/max pixels)
+    are skipped: as dimensions they upsample to 3136x3136 and OOM."""
     vc = config.get("vision_config") if isinstance(config, dict) else getattr(config, "vision_config", None)
     if vc is not None:
         sz = vc.get("image_size") if isinstance(vc, dict) else getattr(vc, "image_size", None)
         if isinstance(sz, int) and sz > 0:
             return sz
     ip = getattr(processor, "image_processor", None)
+    # Gemma 4 resizes every image to its soft-token budget itself; its `size` (224) is nominal, not an input limit.
+    if getattr(ip, "max_soft_tokens", None) is not None:
+        return None
     if ip is not None:
         sz = getattr(ip, "size", None)
         if isinstance(sz, dict):
@@ -6175,6 +6704,27 @@ class _FiniteVisitMixin:
             int(index) for index in rng.permutation(len(self._schedule))
         )
 
+    # The original cut stays available until the shape planner settles on one, since sorting can add compiled shapes.
+    def install_length_sorted_windows(self, schedule, widths=None):
+        self._window_sort_layouts = {
+            False: (self._schedule, self._widths),
+            True: (
+                tuple(tuple(batch) for batch in schedule),
+                None if widths is None else tuple(int(x) for x in widths),
+            ),
+        }
+        self.use_length_sorted_windows(True)
+
+    @property
+    def has_window_sort_choice(self):
+        return getattr(self, "_window_sort_layouts", None) is not None
+
+    def use_length_sorted_windows(self, enabled):
+        self._schedule, self._widths = self._window_sort_layouts[bool(enabled)]
+
+    def settle_window_sort(self):
+        self._window_sort_layouts = None
+
 
 class FiniteTextBatchPlan(_FiniteVisitMixin):
     """CPU-backed finite text schedule with on-demand MLX materialization."""
@@ -6194,6 +6744,8 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         "_visit_epoch_cache",
         "_cycle_length",
         "_cce_capacities",
+        "_padding_free_capacities",
+        "_window_sort_layouts",
     )
 
     def __init__(
@@ -6221,6 +6773,8 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         self.label_dtype = np.dtype(label_dtype)
         self._shape_plan = None
         self._cce_capacities = {}
+        self._padding_free_capacities = {}
+        self._window_sort_layouts = None
         self._visit_policy = str(visit_policy)
         # Seed normalized eagerly so visits never depend on ambient RNG state; a plan rebuilt in a fresh process on resume derives identical visits.
         self._visit_seed = (
@@ -6360,9 +6914,79 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
             if capacity * 2 <= tokens:
                 self._cce_capacities[family, width] = capacity
 
+    def configure_padding_free(self, enabled=True, indices=None):
+        """Fix one flat-token capacity per admitted (family, width), like CCE compaction, so padding-free adds no
+        compiled variants; returns (padding-free shapes, all shapes). `indices` limits it to those batches."""
+        self._padding_free_capacities = {}
+        if not enabled:
+            return 0, 0
+        counts = {}
+        for index in range(len(self._schedule)) if indices is None else indices:
+            batch_indices, family = self._schedule[index], self.batch_family(index)
+            widths = {self.batch_width(index)}
+            if self._shape_plan is not None:
+                widths.add(self._shape_plan.endpoint_for(family, min(widths)))
+            for width in widths:
+                tokens = sum(
+                    min(len(self._rows[row_index].input_ids), self.max_seq_length, width - 1)
+                    for row_index in batch_indices if row_index is not None
+                )
+                counts[family, width] = max(counts.get((family, width), 0), tokens)
+        for (family, width), count in counts.items():
+            capacity = _padding_free_capacity(count, family[1][0][0], width - 1)
+            if capacity is not None:
+                self._padding_free_capacities[family, width] = capacity
+        return len(self._padding_free_capacities), len(counts)
+
+    def _padding_free_batch(self, index, width, capacity, cce_capacity):
+        """Flat [1, capacity + 1] ids and next-token labels for the real tokens, in row order; dummy tail tokens are
+        unsupervised and map to spare pad slots so slots stays injective."""
+        batch_indices = self._schedule[index]
+        span = width - 1
+        ids = np.full(capacity + 1, self.pad_id, dtype=np.int32)
+        labels = np.full(capacity + 1, -100, dtype=self.label_dtype)
+        slots = np.empty(capacity, dtype=np.int32)
+        row_mask = np.zeros((len(batch_indices), span), dtype=np.bool_)
+        total = 0
+        for batch_row, row_index in enumerate(batch_indices):
+            if row_index is None:
+                continue
+            row = self._rows[row_index]
+            end = min(len(row.input_ids), self.max_seq_length, width)
+            count = min(end, span)
+            if count <= 0:
+                continue
+            if total + count > capacity:
+                raise RuntimeError("Unsloth MLX: padding-free batch exceeds its planned capacity.")
+            source = row.input_ids if row.labels is None else row.labels
+            targets = np.array(source[1:end], dtype=self.label_dtype)
+            targets[np.arange(1, end) < row.offset] = -100
+            ids[total:total + count] = row.input_ids[:count]
+            labels[total + 1:total + end] = targets
+            slots[total:total + count] = batch_row * span + np.arange(count)
+            row_mask[batch_row, :count] = True
+            total += count
+        slots[total:] = np.flatnonzero(~row_mask.reshape(-1))[:capacity - total]
+        batch = (
+            mx.array(ids[None]),
+            mx.array([[0, total + 1]], dtype=mx.int32),
+            mx.array(labels[None]),
+        )
+        if cce_capacity is not None:
+            selected = np.flatnonzero(labels[1:] != -100)
+            indices = np.full(cce_capacity, -1, dtype=np.int32)
+            indices[:len(selected)] = selected
+            batch += (mx.array(indices),)
+        return (*batch, (mx.array(slots), mx.array(row_mask)))
+
     def prepare_cce_batch(self, index, batch):
         width = batch[0].shape[1]
         capacity = self._cce_capacities.get((self.batch_family(index), width))
+        flat = self._padding_free_capacities.get((self.batch_family(index), width))
+        if flat is not None:
+            # The head still sees prompt tokens on the flat stream, so any capacity below it pays.
+            return self._padding_free_batch(
+                index, width, flat, capacity if capacity is not None and capacity < flat else None)
         if capacity is None:
             return batch
         selected = []
@@ -10378,24 +11002,60 @@ def _restore_vlm_row_image_handles(item, _depth=0):
     return item
 
 
+def _vlm_cce_indices(selected, tokens, small_capacity_limit):
+    """Fixed-capacity (row, column) CCE indices over tokens target positions, or None when the selection fills more
+    than half of them."""
+    capacity = tokens // 512 * 256
+    if capacity <= 0 or len(selected) > capacity:
+        return None
+    if 256 < capacity <= small_capacity_limit and len(selected) <= 256:
+        capacity = 256
+    indices = np.full((capacity, 2), -1, dtype=np.int32)
+    indices[:len(selected)] = selected
+    return mx.array(indices)
+
+
 def _compact_vlm_cce_batch(batch, small_capacity_limit=0):
     """Attach fixed-capacity CCE indices for a VLM batch's supervised targets; returns None when labels are not 2-D or
     supervised targets fill more than half the target positions."""
     labels = batch.get("labels")
     if labels is None or labels.ndim != 2:
         return None
-    tokens = labels.shape[0] * (labels.shape[1] - 1)
-    capacity = tokens // 512 * 256
-    if capacity <= 0:
-        return None
     selected = np.argwhere(np.asarray(labels)[:, 1:] != -100)
-    if len(selected) > capacity:
+    indices = _vlm_cce_indices(selected, labels.shape[0] * (labels.shape[1] - 1), small_capacity_limit)
+    return None if indices is None else {**batch, "_unsloth_cce_indices": indices}
+
+
+def _real_token_count(batch):
+    # A helper, so the survey keeps no reference to a batch's mask while it builds the next batch.
+    mask = batch.get("attention_mask")
+    return None if mask is None else int(np.asarray(mask).astype(bool).sum())
+
+
+def _padding_free_vlm_batch(batch, capacity, compact, small_capacity_limit=0):
+    """Add the flat-stream slots to a right-padded VLM batch: real tokens in row order, then a dummy tail on spare pad
+    slots; None when a row is left-padded or the batch outgrows capacity."""
+    ids, mask = batch.get("input_ids"), batch.get("attention_mask")
+    if ids is None or mask is None or ids.ndim != 2:
         return None
-    if 256 < capacity <= small_capacity_limit and len(selected) <= 256:
-        capacity = 256
-    indices = np.full((capacity, 2), -1, dtype=np.int32)
-    indices[:len(selected)] = selected
-    return {**batch, "_unsloth_cce_indices": mx.array(indices)}
+    num_rows, width = ids.shape
+    real = np.asarray(mask).astype(bool)
+    lengths = real.sum(axis=-1)
+    total = int(lengths.sum())
+    if real.shape != (num_rows, width) or total > capacity or (real != (np.arange(width) < lengths[:, None])).any():
+        return None
+    slots = np.concatenate([np.flatnonzero(real), np.flatnonzero(~real)[:capacity - total]]).astype(np.int32)
+    flat = {**batch, "_unsloth_padding_free_slots": mx.array(slots)}
+    labels = batch.get("labels")
+    if compact and labels is not None and labels.ndim == 2:
+        targets = np.full((num_rows, width), -100, dtype=np.int64)
+        targets[:, :-1] = np.asarray(labels)[:, 1:]
+        selected = np.flatnonzero(targets.reshape(-1)[slots] != -100)
+        indices = _vlm_cce_indices(
+            np.stack([np.zeros_like(selected), selected], axis=1), capacity, small_capacity_limit)
+        if indices is not None:
+            flat["_unsloth_cce_indices"] = indices
+    return flat
 
 
 class FiniteVLMBatchPlan(_FiniteVisitMixin):
@@ -10429,6 +11089,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         "_cce_compaction",
         "_cce_dense_batches",
         "_cce_small_capacity_limit",
+        "_real_tokens",
+        "_padding_free_capacities",
+        "_padding_free_dense",
     )
 
     def __init__(
@@ -10481,6 +11144,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._cce_compaction = False
         self._cce_dense_batches = set()
         self._cce_small_capacity_limit = 0
+        self._real_tokens = None
+        self._padding_free_capacities = {}
+        self._padding_free_dense = set()
         if self._empty_masks is not None and (
             len(self._empty_masks) != len(self._schedule)
         ):
@@ -10587,7 +11253,40 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._shape_plan = replace(plan, raw_catalog=raw, planned_catalog=planned, report=report)
         return report
 
+    def configure_padding_free(self, enabled=True, indices=None):
+        """Fix one flat-token capacity per (family, width) from the surveyed real-token counts, as FiniteTextBatchPlan
+        does; returns (padding-free shapes, all shapes). `indices` limits it to those batches."""
+        self._padding_free_capacities = {}
+        self._padding_free_dense.clear()
+        if not enabled:
+            return 0, 0
+        self.ensure_descriptors()
+        counts = {}
+        for index in range(len(self._schedule)) if indices is None else indices:
+            batch_rows, family, tokens = self._schedule[index], self.batch_family(index), self._real_tokens[index]
+            widths = {self._widths[index]}
+            if self._shape_plan is not None:
+                widths.add(self._shape_plan.endpoint_for(family, self._planned_widths[index]))
+            for width in widths:
+                if tokens is not None and width is not None:
+                    counts[family, width] = (max(counts.get((family, width), (0,))[0], tokens), len(batch_rows))
+        for (family, width), (tokens, num_rows) in counts.items():
+            capacity = _padding_free_capacity(tokens, num_rows, width)
+            if capacity is not None:
+                self._padding_free_capacities[family, width] = capacity
+        return len(self._padding_free_capacities), len(counts)
+
     def prepare_cce_batch(self, index, batch):
+        ids = batch.get("input_ids")
+        capacity = None
+        if self._padding_free_capacities and index not in self._padding_free_dense and getattr(ids, "ndim", 0) == 2:
+            capacity = self._padding_free_capacities.get((self.batch_family(index), ids.shape[1]))
+        if capacity is not None:
+            flat = _padding_free_vlm_batch(batch, capacity, self._cce_compaction, self._cce_small_capacity_limit)
+            if flat is not None:
+                return flat
+            # Keep left-padded or regrown slots padded on later visits too.
+            self._padding_free_dense.add(index)
         if not self._cce_compaction or index in self._cce_dense_batches:
             return batch
         compacted = _compact_vlm_cce_batch(batch, self._cce_small_capacity_limit)
@@ -10698,9 +11397,11 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         padable_flags = []
         forbidden_sets = []
         audio_flags = []
+        real_tokens = []
         with _preserved_preprocessing_rng():
             for index in range(len(self._schedule)):
                 batch = self._build_batch(index)
+                real_tokens.append(_real_token_count(batch))
                 width, axes, padable, forbidden = _vlm_width_survey(
                     batch,
                     disposable_keys=_vlm_pipeline_disposable_keys(self._config),
@@ -10717,6 +11418,7 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
                 padable_flags.append(bool(padable))
                 forbidden_sets.append(forbidden)
         self._descriptors = tuple(families)
+        self._real_tokens = tuple(real_tokens)
         self._audio_flags = tuple(audio_flags)
         self._widths = tuple(widths)
         self._padable = tuple(padable_flags)
@@ -12112,6 +12814,30 @@ def _finite_batch_schedule(
     return tuple(schedule), cycle_length
 
 
+def _length_sorted_windows(schedule, row_length, grad_accum, cycle_length=None):
+    """Re-cut each accumulation window's rows longest first into micro-batches of the original sizes; windows restart
+    at every cycle_length boundary, as the trainer's epoch-final update does, so each optimizer step keeps its rows."""
+    schedule = tuple(tuple(batch) for batch in schedule)
+    accum = max(1, int(grad_accum or 1))
+    if accum == 1:
+        return schedule
+    block = max(1, int(cycle_length or len(schedule) or 1))
+    result = list(schedule)
+    for block_start in range(0, len(schedule), block):
+        block_end = min(block_start + block, len(schedule))
+        for start in range(block_start, block_end, accum):
+            window = schedule[start:min(start + accum, block_end)]
+            rows = sorted(
+                (row for batch in window for row in batch),
+                key=lambda row: (row is None, 0 if row is None else -row_length(row)),
+            )
+            offset = 0
+            for position, batch in enumerate(window):
+                result[start + position] = tuple(rows[offset:offset + len(batch)])
+                offset += len(batch)
+    return tuple(result)
+
+
 def _text_row_length(row):
     if isinstance(row, (tuple, list)) and row and isinstance(row[0], (tuple, list)):
         return len(row[0])
@@ -12172,6 +12898,7 @@ def _create_ordered_text_plan(
     completion_only_loss=None,
     assistant_only_loss=False,
     comm_group=None,
+    length_sorted_windows=False,
 ):
     """Build a text batch plan over an explicit dataset order, mirroring CUDA's sampler stream without changing mlx-lm
     batching; under DDP, comm_group expands to global micro-batches and returns this rank's slice."""
@@ -12292,7 +13019,7 @@ def _create_ordered_text_plan(
             for input_ids in tokenized
         )
     pad_id = getattr(tokenizer, "pad_token_id", None)
-    return FiniteTextBatchPlan(
+    plan = FiniteTextBatchPlan(
         rows,
         schedule,
         cycle_length=cycle_length,
@@ -12300,6 +13027,14 @@ def _create_ordered_text_plan(
         pad_id=0 if pad_id is None else int(pad_id),
         minimum_width=2,
     )
+    if length_sorted_windows:
+        plan.install_length_sorted_windows(_length_sorted_windows(
+            schedule,
+            lambda index: _text_row_length(tokenized[index]),
+            grad_accum,
+            cycle_length,
+        ))
+    return plan
 
 
 def create_ordered_batches(dataset, tokenizer, batch_size, max_seq_length,
