@@ -59,7 +59,7 @@ def test_activation_target_follows_cgroup_headroom(host):
     from unsloth_zoo import memory_budget as mb
 
     _v2(host, 16 * GiB, 12 * GiB)
-    # 16 GiB limit, 12 GiB charged: 4 GiB left, half of it is the target (was half of the machine's 48 GiB)
+    # 4 GiB left under the limit, half of it is the target
     assert mb._host_target_gb() == 2.0
     assert mb.host_memory_bytes() == (16 * GiB, 4 * GiB)
 
@@ -67,7 +67,7 @@ def test_activation_target_follows_cgroup_headroom(host):
 def test_reclaimable_page_cache_is_not_counted_as_used(host):
     from unsloth_zoo import memory_budget as mb
 
-    # 12 GiB charged of which 6 GiB is file LRU (a load's mmap cache): 10 GiB is allocatable, as MemAvailable would say
+    # 6 of the 12 GiB charged is file LRU
     _v2(host, 16 * GiB, 12 * GiB, file_lru = 6 * GiB)
     assert mb._host_target_gb() == 5.0
     assert mb.host_memory_bytes() == (16 * GiB, 10 * GiB)
@@ -114,7 +114,6 @@ def test_checkpoint_pin_admission_respects_the_cgroup(host):
     from unsloth_zoo import gradient_checkpointing as gc
 
     _v2(host, 16 * GiB, 12 * GiB)
-    # 4 GiB headroom: an 8 GiB pinned block no longer fits (the machine-wide reading admitted it)
     assert not gc._block_fits_host_ram(8 * GiB)
     assert gc._block_fits_host_ram(2 * GiB)
 
@@ -125,7 +124,6 @@ def test_multi_rank_pin_cap_uses_the_cgroup(host, monkeypatch):
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
     monkeypatch.delenv("UNSLOTH_GC_PINNED_MAX_GB", raising = False)
     _v2(host, 32 * GiB, 8 * GiB)
-    # 24 GiB headroom less max(4 GiB, 15% of the 32 GiB limit) reserve, split over 2 ranks
     reserve = max(4 * GiB, int(32 * GiB * 0.15))
     assert gc._compute_pinned_cap(held = 0) == (24 * GiB - reserve) // 2
     monkeypatch.setenv("UNSLOTH_GC_PINNED_MAX_GB", "1")

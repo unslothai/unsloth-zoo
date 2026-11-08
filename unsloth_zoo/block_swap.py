@@ -78,7 +78,7 @@ def _local_world_size():
 
 
 def _host_memory():
-    """(total, available) host RAM, cgroup-capped (memory_budget); psutil's when loaded on its own by path."""
+    """``memory_budget.host_memory_bytes``; plain psutil when this file is loaded on its own."""
     try:
         from unsloth_zoo.memory_budget import host_memory_bytes
     except Exception:

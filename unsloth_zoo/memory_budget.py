@@ -86,15 +86,13 @@ def _host_target_gb():
 pass
 
 
-# psutil reports the machine inside a container: a 16GB cgroup on a 64GB host would size host buffers for 48GB.
-# 0 restores the psutil-only reading.
+# psutil reports the whole machine inside a container; 0 restores that reading.
 HOST_BUDGET_CGROUP_ENV = "UNSLOTH_HOST_BUDGET_CGROUP"
 
 
 def _cgroup_memory_bounds():
-    """(smallest limit, smallest headroom) of the enforcing cgroup memory limits, or (None, None) outside one. Each
-    limit pairs with its own directory's usage, minus that directory's file LRU (reclaimable page cache, which
-    MemAvailable also counts as free), so a load's mmap cache does not read as used."""
+    """(smallest limit, smallest headroom) over the cgroup memory limits, or (None, None). Each limit pairs with its own
+    directory's usage less its file LRU: reclaimable page cache, which MemAvailable also counts as free."""
     if os.environ.get(HOST_BUDGET_CGROUP_ENV, "").strip().lower() in ("0", "off", "false", "no"):
         return None, None
     try:
@@ -140,7 +138,7 @@ pass
 
 
 def host_memory_bytes():
-    """(total, available) host RAM this process may use: psutil's, capped by an enforcing cgroup limit."""
+    """(total, available) host RAM: psutil's, capped by any enforcing cgroup limit."""
     import psutil
     vm = psutil.virtual_memory()
     total, available = getattr(vm, "total", None), vm.available
