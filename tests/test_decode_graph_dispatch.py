@@ -360,3 +360,11 @@ def test_flex_graph_contract_names_module_globals(G, monkeypatch):
         finally:
             WINDOW = 8
         assert ident(_global_dict) is None
+
+
+def test_flex_graph_contract_tells_same_line_lambdas_apart(G, monkeypatch):
+    monkeypatch.setenv("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "flex")
+    a, b = (lambda b, h, q, kv: (kv <= q) & (kv > q - 8)), (lambda b, h, q, kv: (kv <= q) & (kv > q - 16))
+    with S.graph_generate():
+        ident = lambda fn: getattr(_decode_mask(G, monkeypatch, fn, torch.tensor(140)), "_unsloth_mask_identity", None)
+        assert ident(a) is not None and ident(a) == ident(a) and ident(a) != ident(b)

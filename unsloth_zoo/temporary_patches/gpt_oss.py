@@ -18,6 +18,7 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import ast
 import contextlib
 import functools
+import hashlib
 import inspect
 import os
 import stat
@@ -200,6 +201,17 @@ def _gpt_oss_decode_attention(module, query, key, value, attention_mask, scaling
 _MASK_SCALARS = (bool, int, float, str, type(None))
 
 
+@functools.lru_cache(maxsize = 256)
+def _code_digest(code):
+    """Bytecode, constants and names of a code object (nested ones included): two lambdas on one line that
+    differ only in a literal get different digests."""
+    h = hashlib.sha1(code.co_code)
+    for const in code.co_consts:
+        h.update(_code_digest(const).encode() if isinstance(const, types.CodeType) else repr(const).encode())
+    h.update(repr((code.co_names, code.co_varnames, code.co_freevars)).encode())
+    return h.hexdigest()
+
+
 def _mask_function_identity(fn, depth = 4):
     """A flat tuple naming what mask_function computes: every function's code (nested through its closure and
     defaults) and every scalar it captures. None when it captures anything else (a tensor, a dict, an object, a
@@ -212,7 +224,7 @@ def _mask_function_identity(fn, depth = 4):
         code = getattr(f, "__code__", None)
         if depth <= 0 or code is None or not callable(f):
             return False
-        out.append(f"{code.co_filename}:{code.co_firstlineno}:{code.co_qualname if hasattr(code, 'co_qualname') else code.co_name}")
+        out.append(f"{code.co_filename}:{code.co_firstlineno}:{getattr(code, 'co_qualname', code.co_name)}:{_code_digest(code)}")
         values = []
         for cell in getattr(f, "__closure__", None) or ():
             try:
