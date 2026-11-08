@@ -39,9 +39,13 @@ Combines two pieces of test setup:
 from __future__ import annotations
 
 import importlib.util
+import os
 import pathlib
 import sys
 import types
+
+# fp32 bounds assume IEEE fp32 matmuls; mlx reads this once, and its own test suite disables TF32 the same way.
+os.environ["MLX_ENABLE_TF32"] = "0"
 
 
 def _has_real_accelerator() -> bool:
