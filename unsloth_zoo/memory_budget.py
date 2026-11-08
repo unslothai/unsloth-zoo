@@ -18,6 +18,7 @@
 
 import functools
 import math
+import os
 
 import torch
 
@@ -27,6 +28,7 @@ __all__ = [
     "get_max_flat_qlen",
     "_default_target_gb",
     "_host_target_gb",
+    "host_memory_bytes",
 ]
 
 def _max_flat_qlen(
@@ -78,8 +80,74 @@ pass
 
 def _host_target_gb():
     try:
-        import psutil
-        return psutil.virtual_memory().available / 1024 / 1024 / 1024 * 0.5
+        return host_memory_bytes()[1] / 1024 / 1024 / 1024 * 0.5
     except Exception:
         return 4.0
+pass
+
+
+# psutil reports the machine inside a container: a 16GB cgroup on a 64GB host would size host buffers for 48GB.
+# 0 restores the psutil-only reading.
+HOST_BUDGET_CGROUP_ENV = "UNSLOTH_HOST_BUDGET_CGROUP"
+
+
+def _cgroup_memory_bounds():
+    """(smallest limit, smallest headroom) of the enforcing cgroup memory limits, or (None, None) outside one. Each
+    limit pairs with its own directory's usage, minus that directory's file LRU (reclaimable page cache, which
+    MemAvailable also counts as free), so a load's mmap cache does not read as used."""
+    if os.environ.get(HOST_BUDGET_CGROUP_ENV, "").strip().lower() in ("0", "off", "false", "no"):
+        return None, None
+    try:
+        from unsloth_zoo.hf_xet_tuning import (
+            _cgroup_v1_dirs,
+            _cgroup_v2_dirs,
+            _parse_limit,
+            _read_first_line,
+        )
+    except Exception:
+        return None, None
+
+    def _int(raw):
+        try: return int(raw.strip()) if raw else None
+        except ValueError: return None
+
+    def _file_lru(directory, names):
+        try:
+            with open(directory / "memory.stat", "r") as f:
+                stat = dict(line.split()[:2] for line in f if len(line.split()) >= 2)
+        except OSError:
+            return 0
+        return sum(_int(stat.get(name)) or 0 for name in names)
+
+    limits, headroom = [], []
+    dirs = [(d, ("memory.max", "memory.high"), "memory.current", ("active_file", "inactive_file"))
+            for d in _cgroup_v2_dirs()]
+    dirs += [(d, ("memory.limit_in_bytes",), "memory.usage_in_bytes", ("total_active_file", "total_inactive_file"))
+             for d in _cgroup_v1_dirs("memory")]
+    for directory, limit_names, usage_name, lru_names in dirs:
+        found = [_parse_limit(_read_first_line(directory / name)) for name in limit_names]
+        found = [value for value in found if value is not None]
+        if not found:
+            continue
+        limit = min(found)
+        used = _int(_read_first_line(directory / usage_name))
+        limits.append(limit)
+        headroom.append(limit if used is None else limit - max(0, used - _file_lru(directory, lru_names)))
+    if not limits:
+        return None, None
+    return min(limits), max(0, min(headroom))
+pass
+
+
+def host_memory_bytes():
+    """(total, available) host RAM this process may use: psutil's, capped by an enforcing cgroup limit."""
+    import psutil
+    vm = psutil.virtual_memory()
+    total, available = getattr(vm, "total", None), vm.available
+    limit, headroom = _cgroup_memory_bounds()
+    if limit is not None and total is not None:
+        total = min(total, limit)
+    if headroom is not None:
+        available = min(available, headroom)
+    return total, available
 pass

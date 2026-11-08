@@ -77,12 +77,22 @@ def _local_world_size():
         return 1
 
 
+def _host_memory():
+    """(total, available) host RAM, cgroup-capped (memory_budget); psutil's when loaded on its own by path."""
+    try:
+        from unsloth_zoo.memory_budget import host_memory_bytes
+    except Exception:
+        import psutil
+        vm = psutil.virtual_memory()
+        return vm.total, vm.available
+    return host_memory_bytes()
+
+
 def _pin_budget():
     # Each local rank sees the same free RAM, so it may only claim its share.
     try:
-        import psutil
-        vm = psutil.virtual_memory()
-        spare = vm.available - max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
+        total, available = _host_memory()
+        spare = available - max(_PIN_RESERVE_MIN_BYTES, int(total * _PIN_RESERVE_FRACTION))
         return spare // _local_world_size()
     except Exception:
         return 0
