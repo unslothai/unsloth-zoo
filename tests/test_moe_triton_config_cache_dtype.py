@@ -57,6 +57,29 @@ def test_configs_reselected_after_module_dtype_change(monkeypatch, tuner_calls, 
     assert tuner_calls == [first, first, second, second]
 
 
+def test_configs_reselected_when_only_activation_dtype_changes(tuner_calls):
+    # float16 experts fed float16 then float32 activations (float32 is not cast down to float16): new operand widths.
+    experts = _experts().to(torch.float16)
+    _call(experts, torch.float16)
+    _call(experts, torch.float32)
+    _call(experts, torch.float32)
+    assert tuner_calls == [torch.float16, torch.float16, torch.float32, torch.float32]
+
+
+def test_configs_reselected_after_device_change(tuner_calls):
+    experts = _experts()
+    _call(experts, torch.float32)
+    experts.to("meta")
+    with pytest.raises(_Stop):
+        moe_utils.forward_triton_grouped_gemm(
+            experts,
+            torch.zeros(3, 32, device = "meta"),
+            torch.zeros(3, 1, dtype = torch.long, device = "meta"),
+            torch.ones(3, 1, device = "meta"),
+        )
+    assert tuner_calls == [torch.float32, torch.float32] * 2
+
+
 def test_preset_configs_without_key_are_reused(tuner_calls):
     experts = _experts()
     preset = (48, (None, None, None), (None, None, None))
