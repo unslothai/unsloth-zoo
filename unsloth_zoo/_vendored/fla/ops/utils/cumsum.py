@@ -37,12 +37,12 @@ def chunk_local_cumsum_scalar_kernel(
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    REVERSE: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    HEAD_FIRST: tl.constexpr,
+    H: tl.constexpr,  # heads
+    BT: tl.constexpr,  # chunk size along T
+    REVERSE: tl.constexpr,  # reverse cumsum along T
+    HAS_SCALE: tl.constexpr,  # scale given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    HEAD_FIRST: tl.constexpr,  # layout is [B, H, T]
 ):
     i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -93,15 +93,15 @@ def chunk_local_cumsum_vector_kernel(
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
-    S: tl.constexpr,
-    BT: tl.constexpr,
-    BS: tl.constexpr,
-    REVERSE: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    HEAD_FIRST: tl.constexpr,
-    LONG_INDEXING: tl.constexpr = False,
+    H: tl.constexpr,  # heads
+    S: tl.constexpr,  # feature dim
+    BT: tl.constexpr,  # chunk size along T
+    BS: tl.constexpr,  # block along S
+    REVERSE: tl.constexpr,  # reverse cumsum along T
+    HAS_SCALE: tl.constexpr,  # scale given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    HEAD_FIRST: tl.constexpr,  # layout is [B, H, T]
+    LONG_INDEXING: tl.constexpr = False,  # int64 offsets
 ):
     i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -155,12 +155,12 @@ def chunk_global_cumsum_scalar_kernel(
     scale,
     cu_seqlens,
     T,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    REVERSE: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    HEAD_FIRST: tl.constexpr,
+    H: tl.constexpr,  # heads
+    BT: tl.constexpr,  # chunk size along T
+    REVERSE: tl.constexpr,  # reverse cumsum along T
+    HAS_SCALE: tl.constexpr,  # scale given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    HEAD_FIRST: tl.constexpr,  # layout is [B, H, T]
 ):
     i_nh = tl.program_id(0)
     i_n, i_h = i_nh // H, i_nh % H
@@ -216,14 +216,14 @@ def chunk_global_cumsum_vector_kernel(
     scale,
     cu_seqlens,
     T,
-    H: tl.constexpr,
-    S: tl.constexpr,
-    BT: tl.constexpr,
-    BS: tl.constexpr,
-    REVERSE: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    HEAD_FIRST: tl.constexpr,
+    H: tl.constexpr,  # heads
+    S: tl.constexpr,  # feature dim
+    BT: tl.constexpr,  # chunk size along T
+    BS: tl.constexpr,  # block along S
+    REVERSE: tl.constexpr,  # reverse cumsum along T
+    HAS_SCALE: tl.constexpr,  # scale given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    HEAD_FIRST: tl.constexpr,  # layout is [B, H, T]
 ):
     i_s, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
