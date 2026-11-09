@@ -70,6 +70,7 @@ def test_an_artifact_recorded_by_a_compiling_thread_mid_save_is_not_lost(cache, 
     module, directory = cache
     _record("a")
     requeue = module._requeue_every_recorded_artifact
+    workers = []
 
     def requeue_while_another_thread_compiles():
         def compile_b():
@@ -77,12 +78,17 @@ def test_an_artifact_recorded_by_a_compiling_thread_mid_save_is_not_lost(cache, 
                 _record("b")
 
         worker = threading.Thread(target = compile_b)
+        workers.append(worker)
         worker.start()
         worker.join(timeout = 0.5)  # without the lock, "b" lands now and the requeue below drops it
         requeue()
 
     monkeypatch.setattr(module, "_requeue_every_recorded_artifact", requeue_while_another_thread_compiles)
     assert module.megacache_save()
+    # The save released the lock; let the compiling thread record "b" before the next save takes it again.
+    for worker in workers:
+        worker.join(timeout = 30)
+        assert not worker.is_alive()
     monkeypatch.setattr(module, "_requeue_every_recorded_artifact", requeue)
     assert module.megacache_save()
     assert _published_keys(directory) == ["a", "b"]
