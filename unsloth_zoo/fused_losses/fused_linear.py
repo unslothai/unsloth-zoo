@@ -318,7 +318,7 @@ if _HAS_TRITON:
         return tl.maximum(r, 0.0) + _fl_log1p(tl.exp(-tl.abs(r)))
 
     @triton.jit
-    def _fl_transform(x, scale, cap, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr):
+    def _fl_transform(x, scale, cap, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr):  # logit scale / tanh softcap
         d = tl.full(x.shape, 1.0, tl.float32)
         if HAS_SCALE:
             x = x * scale
@@ -331,7 +331,7 @@ if _HAS_TRITON:
 
     @triton.jit
     def _fl_block_others(x_row, bias_ptr, bstart, n_end, tgt, m, inv_t, scale, cap, cols,
-                         HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr):
+                         HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr):  # bias / logit scale / tanh softcap
         # sum_{j != tgt} exp(z_j - m) over the block at bstart: the sweep leaves the target's block out (a scalar choice
         # per block, no per-element mask) and this re-read adds the rest back.
         offs = bstart + cols
@@ -345,7 +345,7 @@ if _HAS_TRITON:
 
     @triton.jit
     def _fl_row_stats(row, valid, zt, m, so, a, exact_ptr, logp_ptr, lse_ptr, ent_ptr, lpt_ptr, inv_t, scale, cap,
-                      HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_EXACT: tl.constexpr, WANT_ENT: tl.constexpr):
+                      HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_EXACT: tl.constexpr, WANT_ENT: tl.constexpr):  # scale / softcap / exact target logit / entropy
         # so excludes the target; lse must match the logits the gradient reads (mixing in the exact target logit biases
         # gradients); lpt = log p_t of those logits, logp unless HAS_EXACT; backward uses 1 - p_t = -expm1(lpt).
         s = so + tl.where(valid, tl.exp(zt - m), 0.0)
@@ -371,9 +371,9 @@ if _HAS_TRITON:
         tgt_ptr, exact_ptr, bias_ptr,
         logp_ptr, lse_ptr, ent_ptr, sum_ptr, lssp_ptr, top1_ptr, lpt_ptr,
         inv_t, scale, cap,
-        HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_EXACT: tl.constexpr,
-        WANT_ENT: tl.constexpr, WANT_SUM: tl.constexpr, WANT_LSSP: tl.constexpr, WANT_TOP1: tl.constexpr,
-        BLOCK: tl.constexpr,
+        HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_EXACT: tl.constexpr,  # bias / scale / softcap / exact target logit
+        WANT_ENT: tl.constexpr, WANT_SUM: tl.constexpr, WANT_LSSP: tl.constexpr, WANT_TOP1: tl.constexpr,  # outputs: entropy / logit sum / log sum p^2 / argmax
+        BLOCK: tl.constexpr,  # vocab cols per loop step
     ):
         row = tl.program_id(0).to(tl.int64)
         x_row = x_ptr + row * x_stride
@@ -439,13 +439,13 @@ if _HAS_TRITON:
             tl.store(top1_ptr + row, (best_i == tgt) & valid)
 
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ("n_rows", "stride_k", "split0",))
     def _fl_partial_kernel(
         x_ptr, x_stride, n_cols, n_rows, split_cols, stride_k, col0, split0, bias_ptr, tgt_ptr, part_ptr,
         inv_t, scale, cap, top_ptr, top_stride,
-        HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr,
-        WANT_ENT: tl.constexpr, WANT_SUM: tl.constexpr, WANT_LSSP: tl.constexpr, WANT_TOP1: tl.constexpr,
-        WANT_TGT: tl.constexpr, WANT_BLOCK_TOP: tl.constexpr, SUB: tl.constexpr, BLOCK: tl.constexpr,
+        HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr,  # bias / logit scale / tanh softcap
+        WANT_ENT: tl.constexpr, WANT_SUM: tl.constexpr, WANT_LSSP: tl.constexpr, WANT_TOP1: tl.constexpr,  # outputs: entropy / logit sum / log sum p^2 / argmax
+        WANT_TGT: tl.constexpr, WANT_BLOCK_TOP: tl.constexpr, SUB: tl.constexpr, BLOCK: tl.constexpr,  # target logit / per-group top2 / top2 group width / cols per step
     ):
         # Split width depends only on the vocabulary, so row statistics do not depend on chunk size; WANT_BLOCK_TOP
         # writes the two largest z of each SUB-aligned column group k to top_ptr[row, 2k + {0, 1}].
@@ -530,15 +530,15 @@ if _HAS_TRITON:
             tl.store(p + 5 * stride_k, best)
             tl.store(p + 6 * stride_k, best_i.to(tl.float32))
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ("n_rows", "stride_k",))
     def _fl_combine_kernel(
         x_ptr, x_stride, n_cols, n_rows, n_splits, stride_k, split_cols, part_ptr,
         tgt_ptr, exact_ptr, bias_ptr,
         logp_ptr, lse_ptr, ent_ptr, sum_ptr, lssp_ptr, top1_ptr, lpt_ptr,
         inv_t, scale, cap,
-        HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_EXACT: tl.constexpr,
-        WANT_ENT: tl.constexpr, WANT_SUM: tl.constexpr, WANT_LSSP: tl.constexpr, WANT_TOP1: tl.constexpr,
-        HAS_TGT: tl.constexpr, SPLITS: tl.constexpr,
+        HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_EXACT: tl.constexpr,  # bias / scale / softcap / exact target logit
+        WANT_ENT: tl.constexpr, WANT_SUM: tl.constexpr, WANT_LSSP: tl.constexpr, WANT_TOP1: tl.constexpr,  # outputs: entropy / logit sum / log sum p^2 / argmax
+        HAS_TGT: tl.constexpr, SPLITS: tl.constexpr,  # has targets / vocab splits pow2
     ):
         row = tl.program_id(0).to(tl.int64)
         k = tl.arange(0, SPLITS)
@@ -587,8 +587,8 @@ if _HAS_TRITON:
         x_ptr, x_stride, dz_ptr, dz_stride, n_cols, col0, n_total,
         tgt_ptr, bias_ptr, lse_ptr, ent_ptr, g_ptr, g_stride, ge_ptr, lpt_ptr,
         inv_t, scale, cap, smooth_keep, smooth_each, top_ptr, top_stride,
-        HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_ENT_GRAD: tl.constexpr,
-        ALIASED: tl.constexpr, HAS_TOP: tl.constexpr, SUB: tl.constexpr, BLOCK: tl.constexpr,
+        HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_ENT_GRAD: tl.constexpr,  # bias / scale / softcap / entropy grad
+        ALIASED: tl.constexpr, HAS_TOP: tl.constexpr, SUB: tl.constexpr, BLOCK: tl.constexpr,  # dz aliases x / top2 fixup / top2 group width / cols
     ):
         # dz = g * (keep * onehot + each - p) - ge * p * (z - lse + H); with HAS_TOP (half x) each SUB group's two
         # largest z take fp32 forward values (ties in half take their mean); target column takes forward log p_t, since
@@ -641,13 +641,13 @@ if _HAS_TRITON:
             tl.store(dz_row + offs, dz.to(dz_ptr.dtype.element_ty), mask = ok)
 
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ("n_rows", "split0", "stride_k",))
     def _fl_flash_p_kernel(
         x_ptr, x_stride, p_ptr, p_stride, n_cols, n_rows, col0, split0, n_splits, stride_k, part_ptr,
         tgt_ptr, bias_ptr, m_ptr, acc_ptr, acc_stride, H,
         inv_t, scale, cap, gscale,
-        HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, SPLITS: tl.constexpr,
-        BLOCK: tl.constexpr, BLOCK_H: tl.constexpr,
+        HAS_BIAS: tl.constexpr, HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, SPLITS: tl.constexpr,  # bias / scale / softcap / vocab splits pow2
+        BLOCK: tl.constexpr, BLOCK_H: tl.constexpr,  # vocab cols per step / hidden cols per step
     ):
         # p overwrites the tile in place (half view of x); target column zeroed, its term is added exactly later.
         row = tl.program_id(0).to(tl.int64)
@@ -682,13 +682,13 @@ if _HAS_TRITON:
         tl.debug_barrier()
         tl.store(m_ptr + row, m_new)
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ("n_rows", "stride_k",))
     def _fl_flash_u_kernel(
         acc_ptr, acc_stride, w_ptr, w_stride, w_stride_h, u_ptr, u_stride, map_ptr, row0, H, n_rows, stride_k, split_cols,
         part_ptr, tgt_ptr, logp_ptr, lse_ptr, m_ptr, g_ptr,
         inv_t, scale, cap, inv_gscale,
-        HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_MAP: tl.constexpr, HAS_G: tl.constexpr,
-        BLOCK_H: tl.constexpr,
+        HAS_SCALE: tl.constexpr, HAS_CAP: tl.constexpr, HAS_MAP: tl.constexpr, HAS_G: tl.constexpr,  # scale / softcap / row map / grad scalar
+        BLOCK_H: tl.constexpr,  # hidden cols per step
     ):
         # u = inv_t d_t (1 - p_t) w_t - sum_{j != t} p_j inv_t d_j w_j; target term in fp32, the rest from acc.
         row = tl.program_id(0).to(tl.int64)
@@ -718,8 +718,10 @@ if _HAS_TRITON:
             a = tl.load(acc_ptr + row * acc_stride + ho, mask = ok, other = 0.0)
             tl.store(u_ptr + out * u_stride + ho, (ct * w - a * r).to(u_ptr.dtype.element_ty), mask = ok)
 
+    # n stays specialised: it masks the contiguous axis, and without the % 16 hint the loads and stores
+    # lose vectorisation (3-4.5x slower on A100 / RTX PRO 6000). At most 2 variants.
     @triton.jit
-    def _fl_scale_kernel(x_ptr, g_ptr, out_ptr, n, cols, PER_ROW: tl.constexpr, BLOCK: tl.constexpr):
+    def _fl_scale_kernel(x_ptr, g_ptr, out_ptr, n, cols, PER_ROW: tl.constexpr, BLOCK: tl.constexpr):  # per-row grad vs scalar / elements per program
         offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         ok = offs < n
         x = tl.load(x_ptr + offs, mask = ok, other = 0.0).to(tl.float32)
@@ -733,7 +735,7 @@ if _HAS_TRITON:
     # GKD generalized JSD over two heads' fp32 logits [R, V]; grid (rows, vocab blocks) fills the card at small R.
     @triton.jit
     def _fl_jsd_load(s_ptr, t_ptr, row, cols, ok, stride, s_scale, s_cap, t_scale, t_cap, inv_t,
-                     S_SCALE: tl.constexpr, S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr):
+                     S_SCALE: tl.constexpr, S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr):  # student scale / cap, teacher scale / cap
         base = row.to(tl.int64) * stride
         s = tl.load(s_ptr + base + cols, mask = ok, other = 0.0).to(tl.float32)
         t = tl.load(t_ptr + base + cols, mask = ok, other = 0.0).to(tl.float32)
@@ -743,8 +745,8 @@ if _HAS_TRITON:
 
     @triton.jit
     def _fl_jsd_stats_kernel(s_ptr, t_ptr, stride, V, stat_ptr, NB, s_scale, s_cap, t_scale, t_cap, inv_t,
-                             S_SCALE: tl.constexpr, S_CAP: tl.constexpr, T_SCALE: tl.constexpr,
-                             T_CAP: tl.constexpr, BLOCK: tl.constexpr):
+                             S_SCALE: tl.constexpr, S_CAP: tl.constexpr, T_SCALE: tl.constexpr,  # student scale / cap, teacher scale
+                             T_CAP: tl.constexpr, BLOCK: tl.constexpr):  # teacher cap / vocab cols per block
         # Per block: maxima, sums of exp(x - max), first student argmax js, and both sums without column js.
         row = tl.program_id(0)
         blk = tl.program_id(1)
@@ -795,8 +797,8 @@ if _HAS_TRITON:
 
     @triton.jit
     def _fl_jsd_pre_kernel(s_ptr, t_ptr, stride, stat_ptr, NB, aux_ptr, beta, log1mb, logb,
-                           s_scale, s_cap, t_scale, t_cap, inv_t, MODE: tl.constexpr, S_SCALE: tl.constexpr,
-                           S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr, BLOCK_NB: tl.constexpr):
+                           s_scale, s_cap, t_scale, t_cap, inv_t, MODE: tl.constexpr, S_SCALE: tl.constexpr,  # JSD beta 0 / 1 / general, student scale
+                           S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr, BLOCK_NB: tl.constexpr):  # student cap, teacher scale / cap, vocab blocks pow2
         # Per row: confident x_j - lse rounds to 0 in fp32, so j's terms use log1p(-mass of the others).
         # aux row: lse_s, lse_t, j, c = d_j, loss term(s) of j, dz_j / (coef inv_t ds).
         row = tl.program_id(0)
@@ -858,8 +860,8 @@ if _HAS_TRITON:
     @triton.jit
     def _fl_jsd_row_kernel(s_ptr, t_ptr, stride, V, aux_ptr, part_ptr, NB, dz_ptr, dz_stride, coef_ptr,
                            beta, log1mb, logb, s_scale, s_cap, t_scale, t_cap, inv_t,
-                           MODE: tl.constexpr, WRITE_DZ: tl.constexpr, S_SCALE: tl.constexpr,
-                           S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr, BLOCK: tl.constexpr):
+                           MODE: tl.constexpr, WRITE_DZ: tl.constexpr, S_SCALE: tl.constexpr,  # JSD beta 0 / 1 / general, write dz, student scale
+                           S_CAP: tl.constexpr, T_SCALE: tl.constexpr, T_CAP: tl.constexpr, BLOCK: tl.constexpr):  # student cap, teacher scale / cap, vocab cols
         # Sums without j (aux has j's terms). MODE 0: beta 0, sum q (lt - ls), dz = p - q. MODE 1: beta 1,
         # sum p (d - c), d = ls - lt. MODE 2: interior, sum q (lt - m), sum p (d - c), d = ls - m.
         row = tl.program_id(0)
@@ -890,8 +892,8 @@ if _HAS_TRITON:
     @triton.jit
     def _fl_jsd_dz_kernel(s_ptr, t_ptr, stride, V, aux_ptr, rs_ptr, dz_ptr, dz_stride, coef_ptr, scale_g,
                           log1mb, logb, s_scale, s_cap, t_scale, t_cap, inv_t,
-                          MODE: tl.constexpr, S_SCALE: tl.constexpr, S_CAP: tl.constexpr, T_SCALE: tl.constexpr,
-                          T_CAP: tl.constexpr, BLOCK: tl.constexpr):
+                          MODE: tl.constexpr, S_SCALE: tl.constexpr, S_CAP: tl.constexpr, T_SCALE: tl.constexpr,  # JSD beta 0 / 1 / general, student / teacher scale, cap
+                          T_CAP: tl.constexpr, BLOCK: tl.constexpr):  # teacher cap / vocab cols per block
         # dz = scale_g * p * (d - sum p d); MODE 1: d = ls - lt, MODE 2: d = ls - m, scale_g = 1 - beta.
         row = tl.program_id(0)
         blk = tl.program_id(1)
@@ -1503,6 +1505,8 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
             # half(coef) per row is a 0.4% bf16 scale error: buffer takes a power of two, fp32 the rest.
             pow2 = torch.exp2(torch.round(torch.log2(coef)))
             ratio, coef = coef / pow2, pow2
+        # Off CUDA _mm_fp32 upcasts both operands: copy the head once, not per chunk (same bits).
+        w_dh = w.float() if need_h and not w.is_cuda and compute_dtype in _HALF and n_chunked > R else w
         with torch.autocast(device.type, enabled = False):
             for a in range(0, n_chunked, R):
                 b = min(a + R, n_keep)
@@ -1521,7 +1525,7 @@ def _ce_impl(hidden, weight, bias, targets, divisor, scaling, ignore_index, mul,
                 )
                 if grad:
                     if need_h:
-                        gh = _dz_w(dz, w)
+                        gh = _dz_w(dz, w_dh)
                         if ratio is not None:
                             gh.mul_(ratio)
                         if n_keep == N:
