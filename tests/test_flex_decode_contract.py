@@ -488,3 +488,28 @@ def test_registration_installs_the_device_transfer(monkeypatch):
     assert mask.to("cpu") == "rebuilt" and rebuilt == [torch.device("cpu")]
     assert BlockMask.to._unsloth_gpt_oss
     assert mask.contiguous() is mask
+
+
+@pytest.mark.parametrize("which", ["sinks", "softcap"])
+def test_reference_fallback_applies_attention_dropout_in_training(which):
+    # Training with sinks / softcap keeps the requested attention dropout (the SDPA fallback forwards it too); an
+    # eval module ignores it, as transformers' own attention does.
+    from unsloth_zoo.flex_attention.decode import _eager_attention, unsloth_flex_decode_attention
+    torch.manual_seed(0)
+    q, k, v = torch.randn(1, 2, 4, 8), torch.randn(1, 2, 4, 8), torch.randn(1, 2, 4, 8)
+    extra = {"s_aux": torch.zeros(2)} if which == "sinks" else {"softcap": 30.0}
+    module = torch.nn.Module()
+    module.is_causal = True
+    module.eval()
+    clean, _ = unsloth_flex_decode_attention(module, q, k, v, None, scaling = 0.5, dropout = 0.0, **extra)
+    again, _ = unsloth_flex_decode_attention(module, q, k, v, None, scaling = 0.5, dropout = 0.5, **extra)
+    module.train()
+    torch.manual_seed(1)
+    dropped, _ = unsloth_flex_decode_attention(module, q, k, v, None, scaling = 0.5, dropout = 0.5, **extra)
+    torch.manual_seed(1)
+    mask = torch.ones(4, 4, dtype = torch.bool).tril()
+    sinks, softcap = extra.get("s_aux"), extra.get("softcap")
+    expected = _eager_attention(q, k, v, mask, 0.5, sinks = sinks, softcap = softcap, dropout = 0.5)
+    torch.testing.assert_close(dropped, expected.transpose(1, 2))
+    assert not torch.allclose(dropped, again)
+    torch.testing.assert_close(clean, again)

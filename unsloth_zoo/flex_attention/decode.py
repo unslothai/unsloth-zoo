@@ -413,9 +413,9 @@ def flex_decode_attention(query, key, value, block_mask, scale = None, *, sinks 
     return torch.where(empty, torch.zeros((), dtype = out.dtype, device = out.device), out)
 
 
-def _eager_attention(query, key, value, mask, scale, sinks = None, softcap = None):
+def _eager_attention(query, key, value, mask, scale, sinks = None, softcap = None, dropout = 0.0):
     """float32 reference / fallback: query [B, Hq, Lq, D], key / value [B, Hkv, S, D], mask bool broadcastable to
-    [B, Hq, Lq, S] (True = visible)."""
+    [B, Hq, Lq, S] (True = visible); `dropout` applies to the attention weights (training only)."""
     groups = query.shape[1] // key.shape[1]
     compute = torch.promote_types(query.dtype, torch.float32)
     k = key.to(compute).repeat_interleave(groups, dim = 1)
@@ -435,6 +435,8 @@ def _eager_attention(query, key, value, mask, scale, sinks = None, softcap = Non
     weights = torch.where(total > 0, weights / total, torch.zeros_like(weights))
     if sinks is not None:
         weights = weights[..., :-1]
+    if dropout:
+        weights = torch.nn.functional.dropout(weights, p = dropout, training = True)
     return torch.matmul(weights, v).to(query.dtype)
 
 
@@ -498,8 +500,10 @@ def unsloth_flex_decode_attention(
     is_block_mask = _BlockMask is not None and isinstance(attention_mask, _BlockMask)
     if scaling is None:
         scaling = 1.0 / math.sqrt(query.shape[-1])
+    if not getattr(module, "training", False):
+        dropout = 0.0
     if (
-        is_block_mask and query.shape[-2] == 1
+        is_block_mask and query.shape[-2] == 1 and not dropout
         and flex_decode_supported(query.shape[-1], query.shape[1], key.shape[1], query.dtype, query.device)
     ):
         try:
@@ -519,7 +523,9 @@ def unsloth_flex_decode_attention(
             # has no such flag, so it builds the same upper-left causal mask SDPA would apply (query i sees keys 0..i;
             # an empty static cache's unwritten tail stays hidden).
             attention_mask = torch.ones(L, S, dtype = torch.bool, device = query.device).tril()
-        out = _eager_attention(query, key, value, attention_mask, scaling, sinks = s_aux, softcap = softcap)
+        out = _eager_attention(
+            query, key, value, attention_mask, scaling, sinks = s_aux, softcap = softcap, dropout = dropout
+        )
         return out.transpose(1, 2).contiguous(), None
     from transformers.integrations.sdpa_attention import sdpa_attention_forward
     return sdpa_attention_forward(module, query, key, value, attention_mask, scaling = scaling, dropout = dropout, **kwargs)
