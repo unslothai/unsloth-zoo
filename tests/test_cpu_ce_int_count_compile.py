@@ -59,3 +59,4 @@ def test_chunked_ce_fullgraph_dynamic_count_matches_eager(kind):
     assert out.item() == 0.0
     assert torch.equal(hidden.grad, torch.zeros_like(hidden.grad))
     assert sum(counters["graph_break"].values()) == 0, dict(counters["graph_break"])
+    assert sum(counters["unimplemented"].values()) == 0, dict(counters["unimplemented"])
