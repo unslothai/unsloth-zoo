@@ -257,8 +257,7 @@ def test_compiled_ce_bounds_runtime_logits(monkeypatch, explicit_chunk):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("train_weight", [False, True])
 def test_compiled_ce_keeps_cpu_autocast(backend, dtype, train_weight):
-    # Compiled graphs run with autocast off; the chunk op must restore the caller's CPU autocast, else a 16-bit
-    # hidden state meets the fp32 head weight unconverted (dtype mismatch).
+    # Without the caller's autocast restored, a 16-bit hidden state meets the fp32 head weight (dtype mismatch).
     from unsloth_zoo.cpu.ops import chunked_linear_cross_entropy
     torch._dynamo.reset()
     torch.manual_seed(0)
