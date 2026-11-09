@@ -387,11 +387,15 @@ def _gpt_oss_flex_mask(
         # so a rolling sliding window (offset + 1 per step) keeps the shape a decode graph keys on. Positions past
         # the 2D mask (unwritten static slots) stay invisible; a tensor offset is never read on the host.
         full = attention_mask.to(dtype = torch.bool)
-        width = full.shape[-1]
-        position = torch.arange(int(kv_length), device = full.device) + (
-            kv_off.to(full.device) if isinstance(kv_off, torch.Tensor) else kv_off
-        )
-        padding = full[:, position.clamp(max = width - 1)] & (position < width)
+        width, kv_len = full.shape[-1], int(kv_length)
+        if isinstance(kv_off, torch.Tensor):
+            position = torch.arange(kv_len, device = full.device) + kv_off.to(full.device)
+            padding = full[:, position.clamp(max = width - 1)] & (position < width)
+        else:
+            # A host offset: the columns are a view, no gather kernels on the eager decode path.
+            padding = full[:, kv_off:kv_off + kv_len]
+            if padding.shape[-1] < kv_len:
+                padding = torch.nn.functional.pad(padding, (0, kv_len - padding.shape[-1]))
     q_length, kv_length = int(q_length), int(kv_length)
     # Per-row blocks even without padding: packed documents make mask_function row dependent.
     bsz = batch_size
