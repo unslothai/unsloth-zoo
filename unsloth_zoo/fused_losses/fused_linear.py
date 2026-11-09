@@ -32,6 +32,7 @@ __all__ = [
 import functools
 import math
 import os
+import threading
 import warnings
 import torch
 from typing import Optional
@@ -1662,6 +1663,11 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
         (lpt if exact_lpt else logps.clone(),)
 
 
+# The reduced-precision switch is process-wide: overlapping backward threads (one per device) must not save / restore
+# over each other, so the switch, the GEMM launch and the restore happen under one lock (launch only, the GEMM is async).
+_REDUCTION_LOCK = threading.Lock()
+
+
 def _mm_into(out, a, b):
     """out = a @ b accumulated in fp32 and rounded once to out's dtype (no reduced-precision split-K reduction)."""
     if out.dtype == torch.float32:
@@ -1671,12 +1677,15 @@ def _mm_into(out, a, b):
         flags = torch.backends.cuda.matmul
         name = "allow_bf16_reduced_precision_reduction" if a.dtype == torch.bfloat16 else \
             "allow_fp16_reduced_precision_reduction"
-        old = getattr(flags, name)
-        setattr(flags, name, False)
-        try:
-            torch.mm(a, b, out = out)
-        finally:
-            setattr(flags, name, old)
+        with _REDUCTION_LOCK:
+            old = getattr(flags, name)
+            # torch >= 2.10: assigning a bool turns split-K back on, so restore the caller's pair as a tuple.
+            split_k = getattr(flags, name + "_split_k", None)
+            setattr(flags, name, False if split_k is None else (False, split_k))
+            try:
+                torch.mm(a, b, out = out)
+            finally:
+                setattr(flags, name, old if split_k is None else (old, split_k))
         return
     out.copy_(_mm_fp32(a, b))
 
