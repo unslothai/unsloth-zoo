@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""``train_on_responses_only`` on a text-only fine-tune of a multimodal model.
-
-Such a run still carries a processor as its ``tokenizer``, so a plain text
-collator trips the vision-collator check and used to raise. Already-tokenized
-rows are not relabelled at collate time, so dataset-level masking is correct
-and the call must go through. CPU-pure and offline: the tokenizer is a stub.
-"""
+"""train_on_responses_only on a text-only fine-tune of a multimodal model must not hit the vision-collator check;
+already-tokenized rows keep dataset-level masking; CPU-only with a stub tokenizer."""
 
 import pytest
 from datasets import Dataset
@@ -35,17 +30,12 @@ ROW = [USER_ID, 10, 11, ASSISTANT_ID, 20, 21]
 
 
 class StubEncoding(dict):
-    """What a real tokenizer returns: a mapping that also has attributes.
-
-    `datasets.map` rejects anything that is not a dict, and the raw-text path
-    feeds tokenizer output straight into it.
-    """
+    """Mimics real tokenizer output, a dict that also allows attribute access; datasets.map rejects non-dict output and the raw-text path passes it straight in."""
     __getattr__ = dict.__getitem__
 
 
 class StubTokenizer:
-    # `**kwargs` because the raw-text path calls with truncation/max_length,
-    # which nothing reached while that path still refused.
+    # Accepts **kwargs because the raw-text path calls with truncation/max_length, which nothing reached while that path still refused.
     def __call__(self, text, add_special_tokens = False, **kwargs):
         if isinstance(text, (list, tuple)):
             ids = [self(t).input_ids for t in text]
@@ -117,21 +107,9 @@ def test_pretokenized_rows_get_dataset_level_masking():
 
 
 def test_raw_text_rows_are_tokenized_and_masked():
-    """Raw text is the COMMON case, not a reason to refuse.
-
-    This asserted a refusal on the theory that a collator handed raw rows may
-    rebuild labels itself and discard ours. Measured on the real path it does
-    not: TRL 0.22.2 gives a plain text SFT on gemma-3-4b-it its own
-    `DataCollatorForVisionLanguageModeling` and leaves the dataset at
-    `["text"]`, and after `_maybe_tokenize_dataset` the columns are
-    `input_ids/attention_mask/labels` with the text column GONE, so there is
-    nothing left for a collator to rebuild from. A real batch came back 12/16
-    masked with the prompt masked at the front.
-
-    Refusing instead cost four shipped notebooks: Gemma3_(4B),
-    Gemma3N_(4B)-Conversational, Gemma3_(27B)_A100-Conversational and
-    Qwen_3_5_27B_A100(80GB).
-    """
+    """Raw text must be tokenized and masked, not refused: with TRL 0.22.2 the text column is gone after
+    _maybe_tokenize_dataset, leaving nothing for a collator to rebuild labels from; refusing would have broken four
+    shipped notebooks."""
     processor = StubProcessor()
     trainer = StubTrainer(TextCollator(processor), _raw_text())
 
@@ -159,8 +137,7 @@ def test_unsloth_vision_collator_is_configured_not_bypassed():
 
 
 def test_iterable_dataset_clears_the_guard():
-    """An IterableDataset has no column_names, so detection peeks a row instead.
-    Only the guard is asserted; the text path it then reaches is out of scope."""
+    """IterableDataset has no column_names, so detection peeks a row instead; only the guard is asserted, not the text path behind it."""
     trainer = StubTrainer(TextCollator(StubProcessor()),
                           _pretokenized().to_iterable_dataset())
 

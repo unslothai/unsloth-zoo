@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A base that exists but ships no safetensors must not be called missing.
-
-`check_hf_model_exists` only returns True when the listing holds a
-`.safetensors`, so a `.bin`-only repo like `unsloth/bge-m3` looks absent and
-the caller blames the name. Diagnosis only: which repos resolve is unchanged.
-"""
+"""A base repo with only .bin weights must not be reported missing: check_hf_model_exists needs a .safetensors file, so
+unsloth/bge-m3 looks absent; diagnosis only, resolution unchanged."""
 
 import os
 import sys
@@ -99,11 +95,7 @@ def test_openvino_subdirectory_bins_do_not_count(fs):
 
 
 def test_caller_raises_the_specific_message():
-    """The bin-only branch must reach the user, not just exist.
-
-    Asserts on the rendered message: implicit concatenation means no phrase a
-    user would read is contiguous in the source.
-    """
+    """The bin-only message must reach the user: assertions run on the rendered string, since implicit concatenation means no phrase is contiguous in the source."""
     import ast, re
     src = Path(su.__file__).read_text(encoding = "utf-8")
     i = src.index("_bin_only = _hub_repo_weights_without_safetensors")

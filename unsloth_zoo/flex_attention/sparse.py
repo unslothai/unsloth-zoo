@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Shared switches and engagement counters for the sparse-attention fast paths
-(DeepSeek-V3.2 / GLM-MoE-DSA / MiniMax-M3 / DeepSeek-V4)."""
+(DeepSeek-V3.2 / GLM-MoE-DSA / MiniMax-M3 / DeepSeek-V4 / GLM-5.3-Flash)."""
 
 import os
 
@@ -25,6 +25,7 @@ __all__ = [
     "SPARSE_ATTN_STATS",
     "sparse_skip_full_enabled",
     "sparse_flex_enabled",
+    "sparse_flex_opted_in",
     "sparse_indexer_chunked_enabled",
     "record_sparse_attn",
     "reset_sparse_attn_stats",
@@ -49,6 +50,11 @@ def sparse_skip_full_enabled():
 def sparse_flex_enabled():
     """UNSLOTH_SPARSE_ATTN_FLEX=0 keeps upstream dense attention above the selection budget."""
     return os.environ.get("UNSLOTH_SPARSE_ATTN_FLEX", "1") != "0"
+
+
+def sparse_flex_opted_in(family):
+    """Opt-in flex paths (slower than dense on the GPUs measured): on only with UNSLOTH_SPARSE_ATTN_FLEX_<FAMILY>=1."""
+    return sparse_flex_enabled() and os.environ.get(f"UNSLOTH_SPARSE_ATTN_FLEX_{family.upper()}", "0") == "1"
 
 
 def sparse_indexer_chunked_enabled():

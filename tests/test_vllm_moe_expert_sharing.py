@@ -13,12 +13,8 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""fast_inference on sparse MoE: the training model must ALIAS vLLM's expert weights.
-
-Loading and generating prove nothing here, because generation runs inside vLLM and never
-reads the HF module. These pin storage identity, the layouts that must be refused instead
-of aliased, the router staying a router, and the Gemma 4 adapter rename.
-"""
+"""fast_inference on sparse MoE: the training model must ALIAS vLLM's expert weights, since generation never reads the
+HF module; tests pin storage identity, refused layouts, the router, and the Gemma 4 adapter rename."""
 import sys, os, types
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 

@@ -28,8 +28,7 @@ def _install_mlx_shim():
 
 
 def _expected_valid_loss(vocab_size: int) -> float:
-    # hidden=ones, weight=ones, vocab=V: each logit is dim, lse=log(V)+dim,
-    # target_logit=dim, so loss = log(V).
+    # With hidden and weight all ones and vocab V, each logit is dim, lse is log(V)+dim and target logit is dim, so loss is log(V)
     return math.log(float(vocab_size))
 
 

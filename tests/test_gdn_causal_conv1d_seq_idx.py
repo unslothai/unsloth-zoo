@@ -265,8 +265,7 @@ def test_hub_wrapper_forwards_seq_idx(monkeypatch):
 
 
 def _fake_kernels_decorator(layer_name):
-    """What `kernels.use_kernel_forward_from_hub` does to a function: a layer instance whose
-    class carries `kernel_layer_name`."""
+    """Mimics kernels.use_kernel_forward_from_hub: wraps a function in a layer instance whose class carries kernel_layer_name."""
     def decorator(fn):
         class Func(torch.nn.Module):
             def forward(self, *args, **kwargs):
@@ -293,8 +292,8 @@ def _check_hub_layer_routing(hub_fn):
 
 
 def test_hub_layer_instance_keeps_its_kernel_metadata():
-    # kernels' decorator returns a layer instance; use_kernelized_func checks `kernel_layer_name`
-    # and kernelize reads it from type(fn), so the GDN routing must not replace it with a function.
+    # kernels returns a layer instance whose kernel_layer_name is read from type(fn) by use_kernelized_func and
+    # kernelize, so GDN routing must keep the instance.
     hub_fn = gcc._hub_gdn_function(_fake_kernels_decorator("causal_conv1d_fn"), _hub_conv)
     assert isinstance(hub_fn, torch.nn.Module)
     assert type(hub_fn).kernel_layer_name == "causal_conv1d_fn"
@@ -377,8 +376,8 @@ def test_seq_idx_on_cpu_with_cuda_activations(monkeypatch):
 
 
 def _random_seq_idx(g, T, W, dtype):
-    """Random document lengths (many shorter than W); IDs gapped, negative, huge, and reused
-    once at least W - 1 tokens away (equal IDs inside one window would join the runs)."""
+    """Random document lengths, many shorter than W; IDs gapped, negative or huge, and reused only once at least W - 1
+    tokens away, since equal IDs in a window would join runs."""
     pool = [-7, -1, 0, 3, 5, 11, 2**31 - 1, 2**32, 2**32 + 3, -2**40]
     pool = [v for v in pool if torch.iinfo(dtype).min <= v <= torch.iinfo(dtype).max]
     n_docs = int(torch.randint(1, min(12, T) + 1, (), generator = g))

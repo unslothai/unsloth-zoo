@@ -12,40 +12,9 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""The compile entry points that do NOT go through `_compile_or_fall_back`.
-
-`_compile_or_fall_back` (the `torch_compile` / `_torch_compile` funnel) learned
-`unwrap_already_compiled`, so the GPT-OSS load path is safe. Three siblings
-reach `torch.compile` without passing through it, and each one is handed a
-caller-supplied callable:
-
-  * `torch_compile_with_fallback` -- a BARE decorator. `compiler.py` writes it
-    into every generated `unsloth_compiled_cache` module and
-    `rl_replacements.py` applies it directly.
-  * `_maybe_compile` -- same, for the generated trainer modules.
-  * `patch_function` -- hand-rolled its own single-hop `.__wrapped__` unwrap.
-
-The failure they share is torch's own, in `torch/_dynamo/eval_frame.py`:
-
-    assert not hasattr(compile_wrapper, "get_compiler_config")
-
-(torch 2.13 spells the same check as an explicit
-`raise AssertionError("compile_wrapper already has a get_compiler_config
-attribute")`.) `compile_wrapper` is built with `functools.wraps(fn)`, which
-copies `fn.__dict__`, so the assert says "the callable you gave me is already a
-compiled one". It is reachable from torch 2.11.0 onwards: up to 2.10 Dynamo's
-`innermost_fn` followed `_torchdynamo_orig_callable` unconditionally and
-unwrapped the copy for us, and 2.11 added an `_torchdynamo_wrapper_id == id(fn)`
-condition that a `functools.wraps` copy cannot satisfy by construction.
-
-`torch_compile_with_fallback` RETURNS such a copy (that is what
-`_fall_back_to_eager_on_recompile_limit` is), so feeding its own output back
-into any of these three is exactly the failing shape.
-
-Most of the tests below assert on WHICH callable reaches `torch.compile` rather
-than on the raise. That holds on every torch from 2.6 up, not only on the ones
-where handing over the wrapper happens to be fatal.
-"""
+"""Funnel _compile_or_fall_back unwraps already-compiled input; torch_compile_with_fallback, _maybe_compile and
+patch_function bypass it; torch 2.11+ asserts on it (functools.wraps copies get_compiler_config); most tests check
+which callable reaches torch.compile; that holds on torch 2.6+."""
 
 import os
 import subprocess
@@ -62,16 +31,7 @@ TORCH_VERSION = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")
 
 
 def _run(*bodies, **extra_env):
-    """Run the bodies in a fresh interpreter with `UNSLOTH_COMPILE_DISABLE` cleared.
-
-    Same reason as `test_compile_already_compiled_callable.py`: `torch_compile`,
-    `_torch_compile` and `_maybe_compile` all read the variable at import time
-    under a module-level `if`, and unsloth's consolidated CI job pins it to 1 for
-    the whole suite, so rebinding it in-process afterwards cannot undo that.
-
-    Each body is dedented on its own so a shared prelude can be written at its
-    own indentation and still line up with the test that uses it.
-    """
+    """Runs bodies in a fresh interpreter with UNSLOTH_COMPILE_DISABLE cleared, since the compile wrappers read it at import; each body is dedented separately."""
     source = "".join(textwrap.dedent(body) for body in bodies)
     env = dict(os.environ)
     env.pop("UNSLOTH_COMPILE_DISABLE", None)
@@ -104,10 +64,7 @@ _CARRIER = """
 # ---- what reaches torch.compile -------------------------------------------
 
 def test_torch_compile_with_fallback_hands_torch_the_eager_function():
-    """The decorator the generated cache modules carry.
-
-    Unfixed it passes the wrapper straight through, which torch 2.11+ refuses.
-    """
+    """The decorator generated cache modules carry: unfixed, it passes the wrapper straight through, which torch 2.11+ refuses."""
     _run(_CARRIER, """
         import torch
         seen = []
@@ -137,12 +94,7 @@ def test_torch_compile_with_fallback_hands_torch_the_eager_function():
 
 
 def test_maybe_compile_hands_torch_the_eager_function():
-    """`_maybe_compile` is emitted into the generated trainer modules.
-
-    Only its non-fullgraph branch reached `torch.compile` bare; the fullgraph
-    branch delegates to `torch_compile_with_fallback`. Both are checked, so a
-    later reshuffle between the two branches cannot lose the unwrap.
-    """
+    """_maybe_compile is emitted into trainer modules; its non-fullgraph branch called torch.compile bare, so both branches are checked to keep the unwrap."""
     _run(_CARRIER, """
         import torch
         seen = []
@@ -169,11 +121,7 @@ def test_maybe_compile_hands_torch_the_eager_function():
 
 
 def test_patch_function_unwraps_all_the_way_down():
-    """`patch_function` hand-rolled a SINGLE `.__wrapped__` hop.
-
-    One hop off a doubly-wrapped callable lands on another carrier, which is
-    still what torch 2.11+ refuses. The shared helper loops.
-    """
+    """patch_function must unwrap the whole __wrapped__ chain: one hop off a doubly wrapped callable lands on another carrier, which torch 2.11+ still refuses."""
     _run(_CARRIER, """
         import functools
         import torch
@@ -211,24 +159,9 @@ def test_patch_function_unwraps_all_the_way_down():
 
 
 def test_patch_function_keeps_a_bound_method_bound():
-    """A bound method's `__wrapped__` is the UNBOUND original.
-
-    Following it drops the receiver and turns the first user argument into
-    `self`. torch's own `innermost_fn` stops on a bound method for that reason,
-    and so does `unwrap_already_compiled`; the hand-rolled hop did not.
-
-    torch 2.11+ then refuses to compile the bound method it was handed, which is
-    what the eager guard is for: the load survives, and what the guard hands on
-    is still bound to its own receiver.
-
-    `can_safely_patch` then declines the patch, because a bound `(x)` cannot
-    stand in for the target's `(self, x)`, and this test asserts only on the
-    receiver, not on the install. Declining is the right answer: installing a
-    bound method as a class attribute would route every instance of the target
-    through the ORIGINAL receiver. Before the fix, one `.__wrapped__` hop
-    reached the unbound original, so the signatures matched, the patch went in
-    and every call raised on the wrong `self`.
-    """
+    """Unwrap must stop at a bound method, whose __wrapped__ is the unbound original; torch 2.11+ refuses to compile it,
+    so the eager guard keeps the load alive; can_safely_patch declines it, since installing it routes every instance
+    through the original receiver"""
     _run("""
         import torch
         from unsloth_zoo.temporary_patches.utils import patch_function
@@ -280,12 +213,8 @@ def test_patch_function_keeps_a_bound_method_bound():
 
 
 def test_patch_function_survives_a_compiler_that_refuses():
-    """A carrier with no `__wrapped__` used to raise `AttributeError` here.
-
-    Now it is handed to torch untouched, and whatever torch makes of it, the
-    model load continues: `patch_function` gets the guard `_compile_or_fall_back`
-    already had.
-    """
+    """A carrier with no __wrapped__ is handed to torch untouched instead of raising AttributeError; the load survives
+    whatever torch does, as _compile_or_fall_back guarantees"""
     _run("""
         import torch
         from unsloth_zoo.temporary_patches.utils import patch_function
@@ -324,12 +253,8 @@ def test_patch_function_survives_a_compiler_that_refuses():
              "assert this reproduces is unreachable",
 )
 def test_the_bare_decorators_do_not_assert():
-    """End to end on torch 2.11+: decorate a carrier again, with each entry point.
-
-    Unfixed, every line here raises `AssertionError` before any tensor exists.
-    Nothing is executed on purpose, so this stays runnable on a CPU-only box
-    with no working inductor backend.
-    """
+    """Each entry point decorating a carrier on torch 2.11+ must not raise AssertionError; nothing executes, so it stays
+    runnable on a CPU-only box with no working inductor backend"""
     _run(_CARRIER, """
         import torch
         for fullgraph in (True, False):
@@ -347,11 +272,7 @@ def test_the_bare_decorators_do_not_assert():
 # ---- the cases that must NOT change ---------------------------------------
 
 def test_a_plain_function_is_still_compiled():
-    """Nothing to unwrap: the unwrap must be a no-op, not a fallback to eager.
-
-    Silently running eager where compile works is a performance regression, not
-    a fix.
-    """
+    """A plain function with nothing to unwrap must stay compiled: the unwrap is a no-op, and silently running eager where compile works is a performance regression"""
     _run("""
         import torch
         from unsloth_zoo.temporary_patches import common as C
@@ -377,12 +298,7 @@ def test_a_plain_function_is_still_compiled():
 
 
 def test_an_nn_module_survives_the_unwrap():
-    """`OptimizedModule` carries `get_compiler_config` and has no `__wrapped__`.
-
-    `unwrap_already_compiled` has to hand it back untouched rather than raise
-    `AttributeError` reaching for one, which is what `patch_function`'s
-    hand-rolled hop did.
-    """
+    """OptimizedModule carries get_compiler_config and has no __wrapped__, so unwrap_already_compiled must return it untouched instead of raising AttributeError"""
     _run("""
         import torch
         import torch.nn as nn
@@ -408,11 +324,7 @@ def test_an_nn_module_survives_the_unwrap():
 
 
 def test_compile_disable_keeps_everything_eager():
-    """`UNSLOTH_COMPILE_DISABLE = 1` must still turn compilation off.
-
-    The unwrap runs before the disable check in one branch and after it in
-    another, so pin the observable outcome: nothing reaches `torch.compile`.
-    """
+    """UNSLOTH_COMPILE_DISABLE = 1 must keep nothing reaching torch.compile; the unwrap runs before the disable check in one branch and after it in another"""
     _run("""
         import torch
         from unsloth_zoo.temporary_patches import common as C

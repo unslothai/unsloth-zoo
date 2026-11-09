@@ -13,12 +13,8 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""sonic-moe zero-copy gate_up (concat_layout=("B",)) layout algebra.
-
-The CPU tests pin the layout facts the zero-copy path depends on, emulating quack's
-`concat_to_interleave(t, 1 - t.leading_dim)` with `as_strided`. The GPU test runs only
-where the kernels-community/sonic-moe build loads (sm90 / sm100 with `kernels`).
-"""
+"""Layout algebra for the sonic-moe zero-copy gate_up path (concat_layout B); CPU tests emulate quack's
+concat_to_interleave with as_strided, GPU test needs kernels-community/sonic-moe on sm90/sm100."""
 import pytest
 import torch
 import torch.nn.functional as F
@@ -27,8 +23,7 @@ from unsloth_zoo.temporary_patches import moe_utils_sonic as S
 
 
 def _quack_concat_view_b(weight_t):
-    """What the kernel reads for B = `weight_t` ([E, K, N]) with "B" in concat_layout:
-    the non-contiguous of (N, K) is split as (2, half) with strides (half * s, s)."""
+    """What the kernel reads for B = weight_t [E, K, N] in concat_layout B: the non-contiguous dim of (N, K) splits as (2, half) with strides (half * s, s)."""
     E, Kdim, N = weight_t.shape
     sE, sK, sN = weight_t.stride()
     if sK == 1:      # K-major: N is the non-contiguous dim -> N interleaved
@@ -231,8 +226,7 @@ def test_eligibility_rejects_non_silu_activations(monkeypatch):
 
 
 def test_eligibility_rejects_unaligned_expert_dims(monkeypatch):
-    """quack needs 16-byte row strides: an unaligned hidden or intermediate size must take
-    the grouped_mm fallback instead of raising inside sonic."""
+    """quack needs 16-byte row strides, so an unaligned hidden or intermediate size must take the grouped_mm fallback rather than raise inside sonic."""
     monkeypatch.setattr(S, "sonic_moe_available", lambda: True)
     monkeypatch.setattr(S, "_device_ok", lambda device: True, raising=False)
 

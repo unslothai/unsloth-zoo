@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A tower fed only token ids with no get_input_embeddings (Dia's text encoder) must still get
-gradients under reentrant checkpointing: its own Embedding output is made to require grad."""
+"""A tower fed only token ids with no get_input_embeddings (Dia's text encoder) must still get gradients under reentrant
+checkpointing: its own Embedding output is made to require grad."""
 
 import torch
 import torch.nn as nn

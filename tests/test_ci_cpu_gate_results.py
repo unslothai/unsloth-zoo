@@ -94,9 +94,8 @@ python() {
     logs = tmp_path / "zoo-cpu-gates"
 
     def hang_reached():
-        # The other lane is done AND the behavioral lane is inside the hanging call. The
-        # log file exists from the redirect onward, before the stub writes its line, so
-        # waiting for the other lane alone kills the step too early on a loaded runner.
+        # Wait for the other lane and for the behavioral lane to reach the hanging call: its log exists before the stub
+        # writes, so the other lane alone is too early.
         log = logs / "behavioral.log"
         return (
             (logs / "cpu-advisory.status").exists()

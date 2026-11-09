@@ -44,8 +44,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1] / "unsloth_zoo"
 
-# Transformers' own patterns, copied not approximated: what matters is exactly
-# what IT matches, not what looks like an import.
+# Transformers' own patterns, copied not approximated: what matters is exactly what transformers itself matches, not what looks like an import.
 RELATIVE_FROM = re.compile(r"^\s*from\s+\.(\S+)\s+import", re.MULTILINE)
 RELATIVE_IMPORT = re.compile(r"^\s*import\s+\.(\S+)\s*$", re.MULTILINE)
 
@@ -71,9 +70,8 @@ def test_every_relative_import_transformers_sees_resolves_to_a_file(path):
 
 
 def test_resolvable_relative_imports_are_left_alone():
-    """The guard is not 'no relative imports': sibling imports resolve to a real
-    file and are the normal spelling, so removing them all would be a far larger
-    change than the bug."""
+    """The guard is not 'no relative imports': sibling imports resolve to a real file and are the normal spelling, so
+    removing them all would be a far larger change than the bug."""
     sources = "\n".join(p.read_text(encoding = "utf-8") for p in _modules())
     assert len(re.findall(r"^\s*from \.\w+ import", sources, re.MULTILINE)) > 100
 
@@ -89,8 +87,7 @@ def test_the_transformers_patterns_are_the_ones_we_copied():
 
 
 def test_transformers_can_walk_the_package_without_raising():
-    """Runs the function that crashed. A regex guard can go green on a rewrite
-    that resolves to a different nonexistent path; this cannot."""
+    """Runs the function that crashed: a regex guard can go green on a rewrite that resolves to a different nonexistent path; this cannot."""
     dynamic = pytest.importorskip("transformers.dynamic_module_utils")
 
     for name in ("__init__.py", "device_type.py", "saving_utils.py", "loss_utils.py"):

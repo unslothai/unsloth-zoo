@@ -153,8 +153,8 @@ _MAX_INSTANCE_CONFIG_NODES = 1024
 
 
 def _instance_attribute_model_types(config) -> list:
-    # to_dict() writes the class model_type, so remote configs naming themselves only on
-    # the instance (Ling-2.6-flash: class "", instance "bailing_hybrid") serialize as ""
+    # to_dict() writes the class model_type, so configs naming themselves only on the instance (Ling-2.6-flash: class
+    # '', instance 'bailing_hybrid') serialize as empty.
     found, seen, stack = [], set(), [config]
     while stack and len(seen) < _MAX_INSTANCE_CONFIG_NODES:
         obj = stack.pop(0)
@@ -348,7 +348,6 @@ def fix_lora_auto_mapping(model):
         }
         if getattr(config, "auto_mapping", None) is None:
             config.auto_mapping = auto_mapping_dict
-    pass
 pass
 
 
@@ -457,4 +456,3 @@ def get_auto_processor(name, **kwargs):
         except:
             raise TypeError(f"Unsloth: Failed loading a AutoProcessor from `{name}`")
     return processor
-pass

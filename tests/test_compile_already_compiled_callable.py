@@ -68,13 +68,7 @@ TORCH_VERSION = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")
 
 
 def _run_with_compile_enabled(body):
-    """Run `body` in a fresh interpreter with UNSLOTH_COMPILE_DISABLE cleared.
-
-    `torch_compile` and `_torch_compile` are bound at import under a module-level
-    `if UNSLOTH_COMPILE_DISABLE:`, so they are already `noop` by the time a test
-    runs in unsloth's consolidated CI job, which pins the variable to 1 for the
-    whole suite. Rebinding the module attribute afterwards cannot undo that.
-    """
+    """Runs body in a fresh interpreter with UNSLOTH_COMPILE_DISABLE cleared, since torch_compile is bound to noop at import and CI pins the variable to 1."""
     env = dict(os.environ)
     env.pop("UNSLOTH_COMPILE_DISABLE", None)
     done = subprocess.run(
@@ -107,11 +101,7 @@ def test_unwrap_already_compiled_returns_the_eager_original():
 
 
 def test_unwrap_already_compiled_survives_a_carrier_with_no_wrapped():
-    """An `OptimizedModule`, say. Bail out rather than raise AttributeError.
-
-    `patch_function`'s hand-rolled version does `new_func.__wrapped__`
-    unguarded; the shared helper cannot, because it sees everything.
-    """
+    """A carrier without __wrapped__ (an OptimizedModule, say) must bail out, not raise AttributeError; patch_function's hand-rolled unwrap is unguarded."""
     from unsloth_zoo.temporary_patches.common import unwrap_already_compiled
 
     def opaque(x): return x
@@ -129,14 +119,7 @@ def test_unwrap_already_compiled_survives_a_carrier_with_no_wrapped():
 
 
 def test_unwrap_already_compiled_keeps_a_bound_method_bound():
-    """`__wrapped__` on a bound method is the UNBOUND original.
-
-    A bound method forwards attribute lookups to `__func__`, so following
-    `__wrapped__` would hand back a function that still wants `self` and turn the
-    receiver into the first user argument. torch's own `innermost_fn` stops on a
-    bound method for the same reason, so stop here too and let the caller's guard
-    take it from there.
-    """
+    """__wrapped__ on a bound method is the unbound original, so unwrapping would make self a user argument; stop there as torch's innermost_fn does."""
     from unsloth_zoo.temporary_patches.common import unwrap_already_compiled
 
     class Model:
@@ -156,12 +139,7 @@ def test_unwrap_already_compiled_keeps_a_bound_method_bound():
 # ---- the funnel ----
 
 def test_torch_compile_hands_torch_the_eager_function():
-    """Version independent: observe WHICH callable reaches `torch.compile`.
-
-    Before the fix the wrapper itself was passed, which torch 2.11 refuses and
-    torch <= 2.10 silently unwrapped for us. Asserting on the argument fails on
-    every torch, not only the one where the refusal is fatal.
-    """
+    """Checks which callable reaches torch.compile: pre-fix the wrapper was passed (refused by torch 2.11, silently unwrapped by 2.10), so it fails on every torch."""
     _run_with_compile_enabled("""
         import functools
         import torch
@@ -204,13 +182,7 @@ def test_torch_compile_hands_torch_the_eager_function():
              "assert this reproduces is unreachable",
 )
 def test_the_gpt_oss_load_sequence_does_not_assert():
-    """The real shape of the failure, end to end, on the torch that has it.
-
-    `torch_compile_with_fallback(fullgraph = True)` first, standing in for the
-    decorator in the generated module, then a bare `torch_compile` on its
-    result, standing in for `patch_GptOssAttention`. Unfixed, torch 2.11 raises
-    `AssertionError` with an empty message here.
-    """
+    """The GPT-OSS load sequence (fullgraph fallback decorator, then bare torch_compile on its result) raised an empty AssertionError on torch 2.11 before the fix."""
     _run_with_compile_enabled("""
         import torch
         from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback
@@ -234,10 +206,8 @@ def test_the_gpt_oss_load_sequence_does_not_assert():
 
 
 def test_a_refused_decoration_falls_back_to_eager_without_fullgraph():
-    """The non-fullgraph branch used to reach `torch.compile` bare, so anything
-    the compiler refused to decorate took the whole model load with it. It is as
-    protected as the fullgraph branch now: eager, warned about, not raised.
-    """
+    """On the non-fullgraph branch a refused torch.compile decoration falls back to eager with a warning, as the
+    fullgraph branch does, rather than failing the model load."""
     out = _run_with_compile_enabled("""
         import logging
         import torch
@@ -270,12 +240,7 @@ def test_a_refused_decoration_falls_back_to_eager_without_fullgraph():
 
 
 def test_the_model_keyword_spelling_compiles_the_function():
-    """`torch.compile(model = fn)` is the signature's own spelling of `(fn)`.
-
-    Left in `kwargs` it is not the positional function, so the funnel handed back
-    the undecorated `decorate` and then, when the caller called that, compiled its
-    first ARGUMENT: `torch_compile(model = fn)(tensor)` returned the tensor.
-    """
+    """torch.compile(model = fn) is the same as (fn); left in kwargs the funnel returned an undecorated decorate that compiled its first argument."""
     _run_with_compile_enabled("""
         import torch
         from unsloth_zoo.temporary_patches import common as C
@@ -296,11 +261,7 @@ def test_the_model_keyword_spelling_compiles_the_function():
 
 
 def test_the_explicit_model_none_decorator_factory_still_compiles():
-    """`torch_compile(model = None, ...)` is the factory spelling of the same
-    signature. Left in `kwargs`, `model = None` collides with the function passed
-    positionally to `torch.compile`, and the eager guard swallows the resulting
-    `TypeError` as "the compiler refused", turning compilation off for good.
-    """
+    """The model = None factory spelling must not stay in kwargs: it collides with the positional function, and the eager guard then disables compile for good."""
     _run_with_compile_enabled("""
         import torch
         from unsloth_zoo.temporary_patches import common as C
@@ -317,9 +278,7 @@ def test_the_explicit_model_none_decorator_factory_still_compiles():
 
 
 def test_a_working_compile_is_still_compiled():
-    """The fallback must engage only on failure. Silently running eager where
-    compile succeeds is a performance regression, not a fix.
-    """
+    """The eager fallback must engage only on failure; running eager where compile succeeds is a performance regression, not a fix."""
     _run_with_compile_enabled("""
         import torch
         from unsloth_zoo.temporary_patches import common as C

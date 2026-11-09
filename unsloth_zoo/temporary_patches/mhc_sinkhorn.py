@@ -93,8 +93,8 @@ def _mhc_projection(hidden_streams, input_norm, fn):
 
 
 def unsloth_mhc_projection(hidden_streams, input_norm, fn):
-    """`F.linear(input_norm(hidden_streams.flatten(2).float()), fn.float())`, saving `hidden_streams`
-    (alive anyway) for backward instead of its FP32 upcast; backward reruns the same math."""
+    """Runs F.linear(input_norm(hidden_streams.flatten(2).float()), fn.float()) and saves hidden_streams (alive anyway),
+    not its FP32 upcast, for backward, which reruns the math."""
     if (
         torch.compiler.is_compiling()
         or not torch.is_grad_enabled()

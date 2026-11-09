@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""float32 merged export (unsloth#5186): a bf16 base merged with
-`output_dtype = torch.float32` writes F32 shards holding fp32(base) + scale*(B@A)
-without rounding back to bf16; `output_dtype = None` still writes the base dtype."""
+"""float32 export (issue 5186): fp32(base)+scale*(B@A) unrounded; output_dtype None keeps base dtype."""
 
 from __future__ import annotations
 
@@ -166,8 +164,7 @@ def test_float32_refuses_before_writing_when_disk_cannot_hold_the_rewrite(tmp_pa
 
 def test_float32_peak_counts_every_16bit_tensor_and_the_rewrite():
     from unsloth_zoo.saving_utils import _float32_merge_peak_bytes
-    # 10 GB of 16-bit shards, largest 4 GB: widened total 20 GB, plus a resized rewrite's
-    # second float32 copy of the largest shard.
+    # Float32 peak: 16-bit tensors widened, plus a resized rewrite's second copy of the largest shard.
     assert _float32_merge_peak_bytes(10, 4) == 28
     # Streamed to the Hub: the 16-bit copies plus the largest shard's float32 copy and temp.
     assert _float32_merge_peak_bytes(10, 4, uploads_as_it_goes = True) == 22

@@ -14,32 +14,9 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Keep a pre-quantized multimodal checkpoint's bitsandbytes quant_state on transformers 5.4/5.5.
-
-transformers 5.4.0 (PR #44300) made `get_model_conversion_mapping` recurse into
-`PreTrainedModel` submodules and merge each submodule's conversions into the parent's mapping.
-A submodule's mapping is written against ITS OWN key space, so the standalone
-`qwen3_5_text` / `gemma3n_text` entry `^model.language_model.` -> `^model.`, which strips a
-prefix their own checkpoints carry, is handed to the COMPOSITE model, whose weights really are
-named `model.language_model....`.
-
-Renamings all run before any `WeightConverter`, so every key loses the `language_model.`
-segment. The packed `weight` is rescued by original key and loads as a bare uint8 parameter,
-while its five sidecars match nothing and are dropped as unexpected. `Bnb4bitDeserialize.convert`
-then takes its `len(input_dict) == 1` early return and hands back the raw packed tensor WITHOUT
-RAISING, so the failure only surfaces at the first forward, as a shape error about a blob.
-
-Upstream fixed it in 5.6.0 (PR #45567) by scoping each transform instead of rewriting its
-patterns; this re-scopes the leaked renaming the same way for 5.4.0 and 5.5.0 through 5.5.4.
-
-It lives here rather than only in `unsloth/import_fixes.py` because this package owns the
-`Linear4bit` patch that reports the failure and is importable without `unsloth`.
-`unsloth`'s copy defers to this one when present.
-
-Neither gate is a version number. The install gate asks whether this transformers has any of
-the shapes upstream has used for per-submodule scoping; the call gate only touches a renaming
-that demonstrably rewrites this model's real parameter names into names it does not have.
-"""
+"""Re-scopes the leaked submodule renamings that transformers 5.4.0 (PR 44300) merges into a composite model, dropping
+bnb quant_state sidecars; applies to 5.4.0 and 5.5.0 through 5.5.4 (upstream fixed it in 5.6.0, PR 45567); neither
+gate is a version check."""
 
 __all__ = [
     "patch_transformers_composite_prefix_renaming",
@@ -60,8 +37,7 @@ from .utils import raise_error
 # unsloth's own wrapper carries this. Either mark means the repair is already live.
 _UNSLOTH_PATCH_FLAG = "_unsloth_patched_composite_prefix_renaming"
 
-# A prefix renaming matches all of a submodule's names or none, so one sample would do; eight
-# also covers a mapping that rewrites only some leaf names.
+# A prefix renaming matches all of a submodule's names or none, so one sample would do; eight also covers a mapping that rewrites only some leaf names.
 _RENAMING_SAMPLE = 8
 
 # Bounded: a chain can end early, and a malformed one must not spin.
@@ -69,19 +45,9 @@ _MAX_WRAPPER_DEPTH = 8
 
 
 def _transformers_rescopes_submodule_prefix_renamings():
-    """Does this transformers scope a submodule's conversion mapping to where the submodule lives?
-
-    Asked of the API, never of a version number. A transformers without `conversion_mapping` at
-    all (4.x) has no recursion to correct, so it answers True as well -- True means "leave
-    transformers alone".
-
-    Upstream has spelled the scoping three ways, so all three count: the `model_prefix` argument
-    of `extract_weight_conversions_for_model`, `PrefixChange.with_submodel_prefix`, and the
-    `scope_prefix` field every transform carries from 5.10 on. Any one of them present means the
-    recursion knows where a submodule's mapping belongs; none of them present is the defect.
-    Anything unrecognisable answers True, because guessing wrong in that direction only leaves
-    transformers as it was.
-    """
+    """Asks the API, not a version: True (leave transformers alone) when any of the model_prefix argument,
+    PrefixChange.with_submodel_prefix or scope_prefix (5.10+) exists, or the build is unrecognised or has no
+    conversion_mapping."""
     try:
         import inspect
         from transformers import conversion_mapping
@@ -90,8 +56,7 @@ def _transformers_rescopes_submodule_prefix_renamings():
         return True
     extract = getattr(conversion_mapping, "extract_weight_conversions_for_model", None)
     if extract is None:
-        # No per-submodule extraction, so no recursion to correct. Also the answer for any
-        # future build whose machinery we cannot recognise.
+        # No per-submodule extraction means no recursion to correct; also the answer for any future build whose machinery is unrecognised.
         return True
     transform = getattr(core_model_loading, "WeightTransform", None)
     if transform is not None and hasattr(transform, "scope_prefix"):
@@ -106,24 +71,15 @@ def _transformers_rescopes_submodule_prefix_renamings():
 
 
 def _patterns(conversion):
-    """A conversion's source and target patterns, unprocessed where the release keeps them.
-
-    5.5.x stores `_original_source_patterns` because `__post_init__` rewrites the live ones;
-    5.4.0 has no such field at all, so fall through to the live patterns rather than assuming
-    an attribute that release never had.
-    """
+    """Unprocessed patterns where the release keeps them: 5.5.x has _original_source_patterns and
+    _original_target_patterns because __post_init__ rewrites the live ones; 5.4.0 lacks them, so use live patterns."""
     source = getattr(conversion, "_original_source_patterns", None) or conversion.source_patterns
     target = getattr(conversion, "_original_target_patterns", None) or conversion.target_patterns
     return list(source), list(target)
 
 
 def _renaming_signature(conversion):
-    """Identity of a renaming by VALUE, because the mapping is handed out as deep copies.
-
-    `get_checkpoint_conversion_mapping` returns `deepcopy(...)`, so the object collected from a
-    submodule here is never the object that ended up in the parent's list, and `is` can never
-    match them. The patterns are what a renaming is, so compare those.
-    """
+    """Compares by value: get_checkpoint_conversion_mapping returns deep copies, so a submodule's renaming is never the same object as the parent's list entry."""
     source, target = _patterns(conversion)
     return (type(conversion).__name__, tuple(source), tuple(target))
 
@@ -146,21 +102,8 @@ def _sample_submodule_keys(submodule, prefix):
 
 
 def _renaming_destroys_keys(conversion, sample_keys, model_keys):
-    """Does this renaming rewrite the model's OWN parameter names into names it does not have?
-
-    This is the whole discriminator, and it is a behaviour, not a name. A renaming exists to map
-    CHECKPOINT keys onto MODEL keys, so one that fires on a key the model really has and
-    produces one it does not is wrong wherever it came from.
-
-    It also separates the two directions the same entry serves. The standalone text model
-    registers `^model.language_model.` -> `^model.` because its checkpoint carries the longer
-    keys and the model carries the shorter ones -- fired against that model's own names it
-    matches nothing, and answers False here. Merged into the composite model, whose names ARE
-    the longer ones, it matches all of them and lands off the map. One rule, both cases.
-
-    A single rename onto a name the model really has is enough to answer False: that is a
-    mapping doing its job, and no amount of other evidence should override it.
-    """
+    """Does this renaming move a real model key onto a name the model lacks? The same entry is inert on its own text
+    model but wrong merged into the composite; one rename onto a real name answers False."""
     destroys = False
     for key in sample_keys:
         try:
@@ -183,24 +126,7 @@ def _prefixed_pattern(pattern, prefix):
 
 
 def _rescoped_renaming(conversion, prefix, sample_keys, model_keys):
-    """The same renaming, scoped to the submodule it came from, or None if that cannot be built.
-
-    This is what upstream's per-submodule scoping produces, spelled for a transformers that has
-    none: `^model.language_model.` -> `^model.` collected from the submodule at
-    `model.language_model` becomes `^model.language_model.model.language_model.` ->
-    `model.language_model.model.`, which can only fire on a genuinely doubled prefix and
-    therefore leaves every real key alone.
-
-    Only a renaming anchored at the start of the key can be scoped this way, which is the same
-    restriction upstream has. An unanchored pattern says "wherever this appears", and pushing a
-    prefix in front of it produces a pattern that means neither thing, so this answers None and
-    lets the caller drop the entry instead of pretending to have placed it. Nothing legitimate
-    is lost -- the caller only reaches here for an entry already shown to rewrite real weight
-    names off the map.
-
-    Returned only after checking that it really is inert on this model's own names. A renaming
-    that still rewrites real keys into nonexistent ones is worse than no renaming at all.
-    """
+    """Renaming re-anchored under its submodule prefix, or None: only ^-anchored patterns can be scoped, and it is returned only if inert on the model's own names."""
     from transformers.core_model_loading import WeightRenaming
 
     source, target = _patterns(conversion)
@@ -214,8 +140,7 @@ def _rescoped_renaming(conversion, prefix, sample_keys, model_keys):
     try:
         rescoped = type(conversion)(**patterns)
     except Exception:
-        # `PrefixChange` takes prefixes, not patterns. Still a WeightRenaming, and a renaming
-        # is all this produces, so fall back to the base class rather than giving up.
+        # PrefixChange takes prefixes, not patterns; fall back to the base class WeightRenaming, since a renaming is all this produces, rather than giving up.
         try:
             rescoped = WeightRenaming(**patterns)
         except Exception:
@@ -231,22 +156,15 @@ def _rescoped_renaming(conversion, prefix, sample_keys, model_keys):
 
 
 def _leaked_submodule_prefix_renamings(model):
-    """Which renamings did the recursion merge into `model`'s mapping where they do not belong?
-
-    Walks the submodules the way `get_model_conversion_mapping` walks them -- same order, same
-    "first model type wins" rule -- so the entries found here are the entries it collected. A
-    renaming that the parent registers for ITSELF is never considered, even if a submodule
-    registers the same one.
-
-    Returns `(signature -> (prefix, sample_keys), model_keys)`, empty when nothing leaked.
-    """
+    """Renamings the submodule recursion merged into the model's mapping where they do not belong; walks submodules in
+    the same order with first model type winning; ignores renamings the parent registers for itself; empty if nothing
+    leaked."""
     from transformers.conversion_mapping import extract_weight_conversions_for_model
     from transformers.core_model_loading import WeightRenaming
     from transformers.modeling_utils import PreTrainedModel
 
     def extract(module, prefix):
-        # Some releases take the submodule's dotted path too. Asked of the function, not a
-        # version.
+        # Some releases also take the submodule's dotted path; try that signature and fall back on TypeError, since the check is on the function, not a version.
         try:
             return extract_weight_conversions_for_model(module, prefix)
         except TypeError:
@@ -323,8 +241,8 @@ def _rescope_conversions(model, conversions):
         fixed += 1
 
     if not fixed and not dropped:
-        # Nothing replaced: return the caller's OWN list, not a copy, so "this patch changed
-        # nothing" stays checkable by identity if the install gate is ever bypassed.
+        # Nothing replaced: return the caller's own list, not a copy, so 'this patch changed nothing' stays checkable by
+        # identity if the install gate is ever bypassed.
         return conversions
 
     if UNSLOTH_ENABLE_LOGGING:
@@ -354,13 +272,8 @@ def _wrapper_chain(function):
 
 
 def _repair_already_installed(function):
-    """Is either package's repair already on this callable, anywhere down the wrapper chain?
-
-    Follows `WRAPPER_INNER_ATTR` as well as `__wrapped__`, because a wrapper that must SURVIVE
-    a rescope install cannot publish `__wrapped__`: the installer below unwraps that attribute
-    to choose what to wrap, so doing so would have the rescope replace it rather than sit on it.
-    `moe_utils_bnb4bit.py` is exactly that case.
-    """
+    """Is either package's repair on this callable or down its wrapper chain? Follows WRAPPER_INNER_ATTR as well as
+    __wrapped__, since a wrapper that must survive rescope cannot publish __wrapped__ (moe_utils_bnb4bit.py)."""
     seen = 0
     while function is not None and seen < _MAX_WRAPPER_DEPTH:
         if getattr(function, RESCOPE_PATCH_FLAG, False):

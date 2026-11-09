@@ -62,8 +62,7 @@ def _warn_on(model, path):
     return [str(w.message) for w in caught]
 
 
-# A wrapper holding its adapters as modules stores them one level down, so the
-# same coverage is spelled `q_proj.lora_a.weight` rather than `q_proj.lora_a`.
+# A wrapper holding adapters as modules stores them one level down, so the same coverage is named q_proj.lora_a.weight rather than q_proj.lora_a.
 @pytest.mark.parametrize("wrapped", [False, True],
                          ids=["adapters as arrays", "adapters as modules"])
 def test_a_checkpoint_covering_every_module_is_silent(tmp_path, wrapped):
@@ -73,7 +72,6 @@ def test_a_checkpoint_covering_every_module_is_silent(tmp_path, wrapped):
 
 
 def test_a_narrower_checkpoint_names_what_it_does_not_cover(tmp_path):
-    # What an adapter written when selection was narrower looks like on resume.
     path = _checkpoint(tmp_path, ["q_proj"])
     said = _warn_on(_model(["q_proj", "in_proj_qkv", "out_proj"]), path)
     assert len(said) == 1

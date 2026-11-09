@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Softmax collapse (arXiv 2610.31642, Section 2): a target leading the other logits by > ~16.6 nats must
-keep a nonzero log p_t and target gradient, both relative-accurate against a float64 oracle."""
+"""Softmax collapse (arXiv 2610.31642): targets ~16.6 nats ahead keep nonzero, accurate logp and grad."""
 
 import pytest
 import torch
@@ -40,8 +39,7 @@ def _oracle(logits, labels):
 
 
 def _problem(vocab, dtype, seed = 0):
-    """Row r targets class r with logit margin MARGINS[r]; the other logits lie in [-1, 0]. hidden column r
-    feeds only the target row of the head, so d logp_r / d hidden[r, r] is the target gradient itself."""
+    """Row r targets class r at margin MARGINS[r], others in [-1, 0]; hidden column r feeds only that row."""
     gen = torch.Generator().manual_seed(seed)
     hidden_size = N_TARGETS + 1
     weight = torch.zeros(vocab, hidden_size, dtype = torch.float64)
@@ -91,8 +89,7 @@ def test_fused_linear_token_logps_margin_sweep(monkeypatch, vocab, dtype, traina
     mask = torch.tensor([[False] + [True] * N_TARGETS])
     full_labels = torch.cat([torch.zeros(1, dtype = torch.long), labels]).unsqueeze(0)
     out = module.fused_linear_token_logps(states, weight, None, full_labels, mask)["per_token_logps"][0, 1:]
-    # fp16 gradients need GradScaler's loss scale; rows whose scaled target gradient is below fp16's
-    # normal range underflow in any fp16 GEMM and are not checked.
+    # fp16 needs a loss scale; rows whose scaled target grad falls below fp16's normal range are skipped.
     scale = 2.0 ** 16 if dtype == torch.float16 else 1.0
     (grad_hidden,) = torch.autograd.grad(out.sum() * scale, [hidden])
     assert bool(calls) == (path == "sliced")

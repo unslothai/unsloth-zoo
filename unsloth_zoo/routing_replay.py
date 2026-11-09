@@ -156,6 +156,8 @@ class _ReplayState:
         self.in_forward = False
         self.record = None
         self.pending = []
+        # Read in compiled regions instead of the list, whose length would become a Dynamo guard.
+        self.has_pending = False
         self.recomputed = False
         self.layer_inputs = {}
         self.stats = dict(
@@ -449,6 +451,7 @@ def _decoder_pre_hook(module, args, kwargs, parent_input_ids = ()):
             _STATE.recomputed = False
         _STATE.record = {}
         _STATE.pending.append(_STATE.record)
+        _STATE.has_pending = True
         if len(_STATE.pending) > _MAX_PENDING:
             del _STATE.pending[:-_MAX_PENDING]
             if not _STATE.warned_evicted:
@@ -504,6 +507,24 @@ def _signature_projection(width, device):
     return projection
 
 
+def _project(x):
+    # Chunked to bound the fp32 upcast.
+    projection = _signature_projection(x.shape[-1], x.device)
+    return torch.cat([
+        x[a : a + _SIGNATURE_CHUNK].float() @ projection
+        for a in range(0, x.shape[0], _SIGNATURE_CHUNK)
+    ])
+
+
+def _signature_impl(x: torch.Tensor) -> torch.Tensor:
+    # Opaque: the seeded Generator is untraceable and the chunk loop would specialise on token count.
+    return _project(x)
+
+
+def _signature_fake(x):
+    return x.new_empty((x.shape[0], 2), dtype = torch.float32)
+
+
 def _input_signature(args, tokens):
     # Per token fp32 random projections of the router input. The recompute feeds the router the
     # same bits as the forward did, so this tells apart forwards whose natural routes are equal.
@@ -514,34 +535,72 @@ def _input_signature(args, tokens):
     # Autocast would run the projection in bf16 / fp16 and merge nearby inputs.
     with torch.no_grad(), torch.autocast(device_type = x.device.type, enabled = False):
         x = x.detach().reshape(tokens, -1)
-        projection = _signature_projection(x.shape[-1], x.device)
-        # Chunked so the fp32 upcast stays bounded for long sequences.
-        return torch.cat([
-            x[a : a + _SIGNATURE_CHUNK].float() @ projection
-            for a in range(0, tokens, _SIGNATURE_CHUNK)
-        ])
+        return _SIGNATURE_OP(x) if torch.compiler.is_compiling() else _project(x)
 
 
 def _recomputed_routes(layer_index, ids2, signature = None, layer_input = None):
     # A router call outside a decoder forward is a checkpoint recompute: pick the recorded forward
     # whose natural routing it reproduces, without a host sync. None when no forward was recorded.
+    if torch.compiler.is_compiling():
+        return _compiled_recomputed_routes(layer_index, ids2, signature, layer_input)
     if not _STATE.pending:
         return None
     _STATE.recomputed = True
+    return _pick_recorded(layer_index, ids2, signature, layer_input)
+
+
+def _compiled_recomputed_routes(layer_index, ids2, signature, layer_input):
+    # Opaque so Dynamo never guards on the pending list's length (recompile per forward count).
+    if not _STATE.has_pending:
+        return None
+    _STATE.recomputed = True
+    return _RECOMPUTE_OP(ids2, signature, layer_input, layer_index)
+
+
+def _recompute_impl(
+    ids2: torch.Tensor, signature: typing.Optional[torch.Tensor],
+    layer_input: typing.Optional[torch.Tensor], layer_index: int,
+) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+    if _STATE.pending:
+        # Run time: a non-reentrant recompute stops early, so a traced assignment would never run.
+        _STATE.recomputed = True
+    picked = _pick_recorded(layer_index, ids2, signature, layer_input) if _STATE.pending else _NATURAL
+    if picked is _NATURAL:
+        return _natural_impl(ids2)
+    forced, valid = picked
+    return forced.long().clone(), valid.reshape(ids2.shape[0], 1).to(ids2.device).clone()
+
+
+def _recompute_fake(ids2, signature, layer_input, layer_index):
+    return _natural_fake(ids2)
+
+
+def _natural_impl(ids2: torch.Tensor) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+    return ids2.long().clone(), torch.zeros(ids2.shape[0], 1, dtype = torch.bool, device = ids2.device)
+
+
+def _natural_fake(ids2):
+    return (
+        ids2.new_empty(ids2.shape, dtype = torch.int64),
+        ids2.new_empty((ids2.shape[0], 1), dtype = torch.bool),
+    )
+
+
+def _pick_recorded(layer_index, ids2, signature, layer_input):
     candidates = [r[layer_index] for r in _STATE.pending if layer_index in r and r[layer_index][1].shape == ids2.shape]
-    if layer_input:
-        # Checkpoint recompute reuses the forward's input tensors (offloaded checkpointing only
-        # rebuilds hidden states), so the forward sharing the most addresses is the one recomputed.
-        shared = [len(c[4] & layer_input) if len(c) > 4 and isinstance(c[4], frozenset) else 0 for c in candidates]
-        best = max(shared, default = 0)
-        if best > 0 and shared.count(best) == 1:
-            candidates = [candidates[shared.index(best)]]
     if not candidates:
         # No forward replayed this layer: recompute it exactly as it ran, with no extra ops
         # (a non-reentrant checkpoint rejects a recompute that saves other tensors).
         return _NATURAL
     fp = _fingerprint(ids2)
     match = (torch.stack([c[0] for c in candidates]) == fp).flatten(1).all(-1)
+    if torch.is_tensor(layer_input):
+        # Recompute reuses the forward's input tensors, so the forward sharing the most addresses
+        # is the one recomputed. A mask, not a narrowed list: in a compiled layer the addresses are only known at run time.
+        recorded = [c[4] if len(c) > 4 and torch.is_tensor(c[4]) else layer_input[:0] for c in candidates]
+        mask = _IDENTITY_MASK_OP(layer_input, recorded) if torch.compiler.is_compiling() \
+            else _identity_mask(layer_input, recorded)
+        match = match & mask.to(match.device, non_blocking = True)
     if signature is not None:
         # Narrow the natural matches to the forwards whose router input was the same too. Only a
         # refinement: when no input matches exactly, the natural matches stand as before.
@@ -670,25 +729,41 @@ def _router_hook(layer_index, compact = None):
         else:
             weights2 = weights.reshape(ids2.shape)
         signature = None
-        if _STATE.pending and (_STATE.record is not None or not _STATE.in_forward):
+        if torch.compiler.is_compiling():
+            # The flag, not the list: its length would become a guard. An open record is pending.
+            wants_signature = _STATE.record is not None or (not _STATE.in_forward and _STATE.has_pending)
+        else:
+            wants_signature = _STATE.pending and (_STATE.record is not None or not _STATE.in_forward)
+        if wants_signature:
             signature = _input_signature(args, ids2.shape[0])
-        # Read once and clear: a compiled layer's traced read then sees None, never a stale call's.
+        # Read once and clear; traced with the pre hook, this is the op's runtime output.
         layer_input = _STATE.layer_inputs.get(layer_index)
         _STATE.layer_inputs[layer_index] = None
-        recomputed = None if _STATE.in_forward else _recomputed_routes(layer_index, ids2, signature, layer_input)
+        if _STATE.in_forward:
+            recomputed = None
+        elif torch.compiler.is_compiling() and _STATE.has_pending \
+                and getattr(module, "_unsloth_replay_formula", None) is None:
+            # No forward replayed this layer: recompute as it ran, without tracing the formula probe.
+            _STATE.recomputed = True
+            recomputed = _NATURAL
+        else:
+            recomputed = _recomputed_routes(layer_index, ids2, signature, layer_input)
         if recomputed is not None:
             _count("router_calls_recomputed")
         if recomputed is _NATURAL:
             _count("router_calls_natural")
             return None
-        if recomputed is None and replay is None:
-            _count("router_calls_natural")
-            return None
-        if recomputed is None and (
-            replay.shape[0] != ids2.shape[0]
+        natural = recomputed is None and (
+            replay is None
+            or replay.shape[0] != ids2.shape[0]
             or row >= replay.shape[1]
             or replay.shape[2] != ids2.shape[-1]
-        ):
+        )
+        # The recompute always reweights via the opaque pick; reweight here too (all rows invalid)
+        # so the non-reentrant checkpoint sees identical saved tensors.
+        mirror = natural and _STATE.record is not None and torch.compiler.is_compiling() \
+            and isinstance(getattr(module, "_unsloth_replay_formula", None), str)
+        if natural and not mirror:
             _count("router_calls_natural")
             return None
 
@@ -721,12 +796,16 @@ def _router_hook(layer_index, compact = None):
             _count("router_calls_natural")
             return None
 
+        if mirror:
+            # Opaque: in-graph constants are rematerialised in backward, so saved tensors would differ.
+            recomputed = _NATURAL_OP(ids2)
         if recomputed is None:
             # Replay rows live on the input ids' device; a device map can put this layer elsewhere.
             forced = replay[:, row, :].to(ids2.device, non_blocking = True)
             valid = (forced >= 0).all(dim = -1, keepdim = True)
             forced = torch.where(valid, forced, ids2.long()).clamp_(0, num_experts - 1)
             if _STATE.record is not None:
+                _STATE.has_pending = True
                 # A copy: the output ids may alias forced, and MoE blocks can reuse them in place.
                 _STATE.record[layer_index] = (
                     _fingerprint(ids2), forced.clone(), valid, signature, layer_input,
@@ -734,6 +813,11 @@ def _router_hook(layer_index, compact = None):
         else:
             forced, valid = recomputed
             forced = torch.where(valid, forced, ids2.long())
+            if mirror:
+                # Recorded too, else an identical replayed forward would donate its forced experts.
+                _STATE.record[layer_index] = (
+                    _fingerprint(ids2), forced.clone(), valid, signature, layer_input,
+                )
         reweight = _formulas()[formula]
         new_weights = reweight(logits2, forced)
         if formula == "probs_renorm":
@@ -760,52 +844,83 @@ def _router_hook(layer_index, compact = None):
     return hook
 
 
-def _tensor_addresses(values):
-    out = set()
-    for value in values:
-        for x in (value if isinstance(value, (tuple, list)) else (value,)):
-            if torch.is_tensor(x) and x.numel() > 0:
-                out.add(x.data_ptr())
-    return out
+def _input_addresses(tensors):
+    # Zero padded to one slot per tensor (static shape); a tensor, not a set, to flow through a graph.
+    out = sorted({x.data_ptr() for x in tensors if x.numel() > 0})
+    return torch.tensor(out + [0] * (len(tensors) - len(out)), dtype = torch.int64)
 
 
-def _record_layer_inputs(layer_index, tensors):
-    _STATE.layer_inputs[layer_index] = frozenset(_tensor_addresses(tensors)) or None
+def _identity_mask(layer_input, recorded):
+    # Forwards sharing the most addresses, or all when not exactly one. Zero is padding.
+    now = set(layer_input.tolist()) - {0}
+    shared = [len(now.intersection(r.tolist())) for r in recorded]
+    best = max(shared, default = 0)
+    unique = best > 0 and shared.count(best) == 1
+    return torch.tensor([not unique or n == best for n in shared], dtype = torch.bool)
+
+
+_CUSTOM_OP_PARAMS = frozenset(inspect.signature(torch.library.custom_op).parameters)
+
+
+def _register_op(name, impl, fake):
+    for i in range(64):
+        full = name + (f"_{i}" if i else "")
+        # A reloaded module copy may own the name; custom_op silently re-registers (torch 2.10 segfaults).
+        if hasattr(torch.ops.unsloth_zoo, full):
+            continue
+        # Opaque host ops: a CUDA graph replay would skip them and reuse the captured CPU output,
+        # so tag them cudagraph unsafe and Inductor keeps the graph out of CUDA graphs.
+        tag = getattr(torch.Tag, "cudagraph_unsafe", None)
+        kwargs = dict(tags = (tag,)) if tag is not None and "tags" in _CUSTOM_OP_PARAMS else {}
+        try:
+            op = torch.library.custom_op(f"unsloth_zoo::{full}", mutates_args = (), **kwargs)(impl)
+        except RuntimeError:
+            continue
+        op.register_fake(fake)
+        return getattr(torch.ops.unsloth_zoo, full).default
+    raise RuntimeError(f"Unsloth: could not register the routing replay op {name}.")
 
 
 _LAYER_INPUTS_OP = None
+_IDENTITY_MASK_OP = None
+_SIGNATURE_OP = None
+_RECOMPUTE_OP = None
+_NATURAL_OP = None
 
 
 def _layer_inputs_op():
-    # data_ptr() is untraceable and a graph break fails fullgraph, so use an opaque op; register eagerly.
-    global _LAYER_INPUTS_OP
-    if _LAYER_INPUTS_OP is not None:
-        return _LAYER_INPUTS_OP
-    for i in range(64):
-        name = "routing_replay_layer_inputs" + (f"_{i}" if i else "")
-        # A reloaded module copy may own the name; custom_op silently re-registers (torch 2.10 segfaults).
-        if hasattr(torch.ops.unsloth_zoo, name):
-            continue
-        try:
-            op = torch.library.custom_op(f"unsloth_zoo::{name}", mutates_args = ())(_layer_inputs_impl)
-        except RuntimeError:
-            continue
-        op.register_fake(_layer_inputs_fake)
-        _LAYER_INPUTS_OP = getattr(torch.ops.unsloth_zoo, name).default
-        if hasattr(torch.fx.node, "has_side_effect"):
-            # No outputs: else DCE may drop it.
-            torch.fx.node.has_side_effect(_LAYER_INPUTS_OP)
-        return _LAYER_INPUTS_OP
-    raise RuntimeError("Unsloth: could not register the routing replay layer input op.")
+    # data_ptr() is untraceable and fullgraph forbids breaks: opaque ops, registered eagerly. Returning
+    # the addresses lets the router hook read them in-graph (not frozen at trace time) and keeps the op
+    # alive. Matching is a second op: no CPU kernels for Inductor to compile inside a GPU graph.
+    global _LAYER_INPUTS_OP, _IDENTITY_MASK_OP, _SIGNATURE_OP, _RECOMPUTE_OP, _NATURAL_OP
+    if _LAYER_INPUTS_OP is None:
+        _LAYER_INPUTS_OP = _register_op("routing_replay_input_addresses", _layer_inputs_impl, _layer_inputs_fake)
+    if _IDENTITY_MASK_OP is None:
+        _IDENTITY_MASK_OP = _register_op("routing_replay_identity_mask", _identity_mask_impl, _identity_mask_fake)
+    if _SIGNATURE_OP is None:
+        _SIGNATURE_OP = _register_op("routing_replay_input_signature", _signature_impl, _signature_fake)
+    if _RECOMPUTE_OP is None:
+        _RECOMPUTE_OP = _register_op("routing_replay_recomputed_routes", _recompute_impl, _recompute_fake)
+    if _NATURAL_OP is None:
+        _NATURAL_OP = _register_op("routing_replay_natural_routes", _natural_impl, _natural_fake)
+    return _LAYER_INPUTS_OP
 
 
 # typing.List, not list[...]: torch < 2.7 infer_schema rejects the builtin generic.
-def _layer_inputs_impl(layer_index: int, tensors: typing.List[torch.Tensor]) -> None:
-    _record_layer_inputs(layer_index, tensors)
+def _layer_inputs_impl(tensors: typing.List[torch.Tensor]) -> torch.Tensor:
+    return _input_addresses(tensors)
 
 
-def _layer_inputs_fake(layer_index, tensors):
-    return None
+def _layer_inputs_fake(tensors):
+    return torch.empty(len(tensors), dtype = torch.int64)
+
+
+def _identity_mask_impl(layer_input: torch.Tensor, recorded: typing.List[torch.Tensor]) -> torch.Tensor:
+    return _identity_mask(layer_input, recorded)
+
+
+def _identity_mask_fake(layer_input, recorded):
+    return torch.empty(len(recorded), dtype = torch.bool)
 
 
 def _layer_pre_hook(layer_index):
@@ -816,10 +931,13 @@ def _layer_pre_hook(layer_index):
             for x in (value if isinstance(value, (tuple, list)) else (value,))
             if torch.is_tensor(x)
         ]
-        if torch.compiler.is_compiling():
-            _LAYER_INPUTS_OP(layer_index, tensors)
+        if not tensors:
+            addresses = None
+        elif torch.compiler.is_compiling():
+            addresses = _LAYER_INPUTS_OP(tensors)
         else:
-            _record_layer_inputs(layer_index, tensors)
+            addresses = _input_addresses(tensors)
+        _STATE.layer_inputs[layer_index] = addresses
         return None
 
     return hook

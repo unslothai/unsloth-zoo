@@ -2,15 +2,9 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Smart GC host slots under interleaved schedules.
-
-A forward that starts after some backward used to rewind CPU_INDEX to 0, so under a 1F1B
-pipeline schedule (F0 F1 B0 F2 B1 F3 B2 B3) the forward of micro batch 3 overwrote the
-offloaded activations of micro batch 2, still waiting for its backward. Slots are now leased
-per checkpoint and returned by its backward. The device side is replaced with no-op streams
-so the host bookkeeping runs on CPU unchanged; grads must match a plain stack bit for bit,
-and the usual one forward, one backward loop must keep its slot map and buffer count.
-"""
+"""Smart GC host slots are leased per checkpoint, so a forward after a backward never rewinds CPU_INDEX (1F1B cannot
+overwrite offloaded activations); grads match a plain stack bit for bit; the usual loop keeps its slot map and buffer
+count."""
 import contextlib
 
 import pytest

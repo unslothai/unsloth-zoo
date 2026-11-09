@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""End-to-end MLX CCE kernel exercises through the simulation shim.
-
-Goes one level deeper than test_mlx_module_exports.py: actually
-constructs inputs and runs the function bodies, one critical CCE
-code path per test.
-"""
+"""End-to-end MLX CCE kernel tests through the simulation shim; each test builds inputs and runs one critical CCE code path."""
 
 from __future__ import annotations
 
@@ -135,8 +130,7 @@ def test_dequantize_affine_roundtrip():
     """Construct a known-good packed weight and verify dequant."""
     from mlx_simulation.mlx_helpers.quant import dequantize_affine
 
-    # 4-bit affine, group_size 8: pack values 0..7 (4 bits each) into one
-    # uint32, element 0 in the lowest bits.
+    # 4-bit affine, group_size 8: values 0..7 are packed 4 bits each into one uint32, element 0 in the lowest bits.
     bits = 4
     group_size = 8
     elements_per_word = 32 // bits
@@ -376,8 +370,8 @@ def test_dead_tie_flag_fails_closed_to_unknown():
         _lm(nn, args_flag=False, head=head(), call_src="calls_lm_head")).status == "untied"
     assert U.describe_output_head(
         _lm(nn, args_flag=True, emb_name="tok_embeddings")).status == "tied"
-    # from_dict does not coerce, so a non-bool tie flag is read by truthiness like
-    # the forward: 1 / "true" are tied, "" stays untied, never a fall-through.
+    # from_dict does not coerce, so a non-bool tie flag is read by truthiness like the forward: 1 and 'true' are tied,
+    # empty string stays untied, never falling through.
     for truthy in (1, "true"):
         assert U.describe_output_head(
             _lm(nn, args_flag=truthy, head=head(), call_src="flag_guarded")).status == "tied"
@@ -392,12 +386,11 @@ def test_is_lm_head_trainable_follows_descriptor_path():
     from unsloth_zoo.mlx import utils as U
 
     nn = U.nn
-    # Alt-named tied embedding (InternLM2 tok_embeddings) trains under full
-    # fine-tuning: name segments used to miss it and drop the head gradient.
+    # Alt-named tied embedding (InternLM2 tok_embeddings) must keep the head trainable under full fine-tuning; name
+    # segments once missed it and dropped the head gradient.
     assert U._is_lm_head_trainable(
         _lm(nn, tied_flag=True, emb_name="tok_embeddings")) is True
-    # Property-backed wrapper: language_model returns self, so the descriptor access
-    # path is not a registered prefix and module identity must find the head instead.
+    # Property-backed wrapper: language_model returns self, so the access path is not a registered prefix and module identity must find the head.
     class _PropWrapped(nn.Module):
         def __init__(self):
             super().__init__()
@@ -414,9 +407,8 @@ def test_is_lm_head_trainable_follows_descriptor_path():
 
 
 def test_backboneless_text_model_selects_baseline_fallback(capsys):
-    # nanochat shape (stack under .transformer, no separable .model): the
-    # biased head would trip the eligibility gate, so seeing ONLY the topology
-    # notice pins topology as decided first, at construction not first use.
+    # nanochat stack under .transformer with no separable .model: biased head would trip the eligibility gate, so
+    # topology is pinned at construction, not first use
     from unsloth_zoo.mlx import utils as U
 
     nn = U.nn
@@ -571,8 +563,7 @@ def test_describe_output_head_evidence_ladder():
         # flag False blocks source evidence; alt head -> candidate
         (_lm(nn, tied_flag=False, alt="output", call_src="as_linear"),
          "unknown", None, "model.output"),
-        # Conflicting flags fail closed; the head surfaces as an exclusion
-        # candidate (identity, not proof of tying)
+        # Conflicting flags fail closed; the head surfaces as an exclusion candidate (identity, not proof of tying)
         (_lm(nn, tied_flag=True, args_flag=False, head=nn.Linear(32, 96, bias=False)),
          "unknown", None, "lm_head"),
         # No flag: unconditional as_linear source evidence -> tied

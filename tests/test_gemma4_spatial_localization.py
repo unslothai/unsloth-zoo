@@ -14,38 +14,17 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests for the Gemma4 multimodal projection patch (issue #6028 follow-up).
-
-These tests are written to FAIL if the patch regresses, which the previous
-shape/dtype-only versions did not:
-
-  - `test_projection_preserves_lora_delta` fails if the patch reads
-    `embedding_projection.weight` instead of calling the module, because a PEFT
-    LoRA adapter on that projector would then contribute nothing and receive no
-    gradient.
-  - `test_projection_matches_fp64_reference` pins the numerics against an fp64
-    reference rather than only checking the output dtype.
-  - `test_upstream_signatures` pins the upstream signature the patch relies on,
-    matching the convention in tests/test_temporary_patches_exhaustive.py.
-"""
+"""Gemma4 projection patch tests for issue 6028: LoRA delta and grad must survive; fp64 numerics"""
 import pytest
 import torch
 
-# Gemma-4 arrived in transformers 5.x, and every test below builds a real
-# Gemma4MultimodalEmbedder. The patch these tests cover says the same thing about the other
-# side of that pin: each of its entry points catches ImportError on the gemma4 module with
-# "transformers < 5.x has no Gemma-4 -> nothing to patch". So on an older transformers there
-# is no patch installed and nothing here to assert, and the seven collected tests were
-# failing with ModuleNotFoundError on the pinned HF=4.57.6 lane rather than skipping.
+# Needs transformers 5.x: patch no-ops on older, so skip instead of ModuleNotFoundError on HF=4.57.6
 pytest.importorskip(
     "transformers.models.gemma4",
     reason = "Gemma-4 needs transformers 5.x; the patch under test no-ops without it",
 )
 
-# Imported at module scope, not from a fixture: applying TEMPORARY_PATCHES
-# installs entries in sys.modules (bitsandbytes.nn among them), and conftest's
-# hygiene guard attributes any sys.modules mutation made during a test to that
-# test. Doing it at collection keeps the guard quiet.
+# Module-scope import: patches mutate sys.modules, and conftest's hygiene guard blames the test.
 import unsloth_zoo.temporary_patches  # noqa: F401,E402
 
 
@@ -68,8 +47,7 @@ def _embedder(mm_dim=64, text_dim=32):
 
 
 def test_config_construction_does_not_raise():
-    """The KV-shared proxy hides `num_kv_shared_layers`; it must hide it from
-    iteration too, or upstream's validate_token_ids raises AttributeError."""
+    """Proxy must hide num_kv_shared_layers from iteration, or validate_token_ids raises AttributeError"""
     _configs()
 
 
@@ -96,10 +74,7 @@ def test_projection_matches_fp64_reference():
 
 
 def test_projection_preserves_lora_delta():
-    """A LoRA adapter on `embedding_projection` must affect the output AND get
-    a gradient. Reading `.weight` instead of calling the module silently drops
-    both, which is what `finetune_vision_layers` / `finetune_audio_layers`
-    attach here."""
+    """LoRA on embedding_projection must change output and get a gradient; .weight reads drop both"""
     peft = pytest.importorskip("peft")
 
     embedder = _embedder()
@@ -118,8 +93,7 @@ def test_projection_preserves_lora_delta():
     proj = inner.embedding_projection
     with torch.no_grad():
         proj.base_layer.weight.copy_(embedder.embedding_projection.weight)
-        # PEFT zero-inits lora_B, so without this the delta is zero and this
-        # test would pass even with the projection bypassed.
+        # PEFT zero-inits lora_B: without this init the delta is zero, so a bypassed projection still passes
         torch.nn.init.normal_(proj.lora_A["default"].weight, std=0.5)
         torch.nn.init.normal_(proj.lora_B["default"].weight, std=0.5)
 
@@ -144,8 +118,7 @@ def test_projection_preserves_lora_delta():
 
 
 def test_upstream_signatures():
-    """Pin the upstream signature the patch replaces (see
-    tests/test_temporary_patches_exhaustive.py for this convention)."""
+    """Pin the upstream signature the patch replaces; see tests/test_temporary_patches_exhaustive.py"""
     import inspect
 
     from transformers.models.gemma4.modeling_gemma4 import Gemma4MultimodalEmbedder
@@ -171,12 +144,7 @@ if __name__ == "__main__":
 
 
 def test_projection_stays_float32_inside_an_autocast_context():
-    """A float32 projector must still compute in float32 inside a bf16 autocast.
-
-    torch autocasts nn.Linear by context, not by the dtypes handed to it, so
-    without disabling autocast the float32 weights buy nothing. Tests that ran
-    outside autocast could not see this.
-    """
+    """Float32 projector must stay fp32 under bf16 autocast (it casts nn.Linear by context, not by dtype)"""
     import torch
 
     from unsloth_zoo.temporary_patches.gemma4 import (
@@ -230,16 +198,14 @@ def test_projection_stays_float32_inside_an_autocast_context():
         out = model(x)
     assert out.dtype == torch.bfloat16      # caller-facing dtype is unchanged
 
-    # Negative control: without disabling autocast the same float32 projection
-    # runs in bfloat16, so the assertion above tests the guard, not the dtypes.
+    # Negative control: without the autocast guard the float32 projection runs in bfloat16
     emb = torch.randn(2, 16, device = device, dtype = torch.float32)
     with torch.autocast(device_type = device, dtype = torch.bfloat16):
         assert model.embedding_projection(emb).dtype == torch.bfloat16
 
 
 def test_projection_autocast_guard_covers_unsupported_backends():
-    """autocast rejects meta and unregistered custom backends, so constructing it
-    from the tensor's device type has to be guarded."""
+    """autocast rejects meta and unregistered custom backends, so device-type construction needs a guard"""
     import contextlib
 
     import torch

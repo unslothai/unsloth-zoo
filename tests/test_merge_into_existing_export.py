@@ -181,8 +181,8 @@ def test_failed_first_hub_fetch_keeps_previous_export(tmp_path, monkeypatch, low
 
 @pytest.mark.parametrize("low_disk", [False, True])
 def test_failed_later_hub_fetch_keeps_unfetched_shards(tmp_path, monkeypatch, low_disk):
-    # Shards are replaced one at a time (no second copy of the checkpoint), so a network
-    # failure part way only loses the shards already refreshed, and says so.
+    # Shards are replaced one at a time with no second copy of the checkpoint, so a network failure part way only loses
+    # the shards already refreshed, and says so.
     base, peft_model = _build(tmp_path, "20KB")
     out = str(tmp_path / "out")
     _fake_hub(monkeypatch, base, fail = False)
@@ -250,8 +250,8 @@ def test_reexport_keeps_no_second_copy_of_the_checkpoint(tmp_path, monkeypatch, 
 
 @pytest.mark.parametrize("source", ["local", "hub_low_disk"])
 def test_reexport_refused_before_touching_when_disk_is_short(tmp_path, monkeypatch, source):
-    # Per-shard refresh needs at most one shard more than the export, which prepare_saving's
-    # free space check already covers, so a short disk is refused before any shard changes.
+    # Per-shard refresh needs at most one shard more than the export, which the prepare_saving free space check covers,
+    # so a short disk is refused before any shard changes.
     from unsloth_zoo import saving_utils as S
 
     base, peft_model = _build(tmp_path, "20KB")
@@ -404,9 +404,8 @@ def test_hub_listing_pins_the_same_commit_as_the_fetches(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("source", ["local", "hub_low_disk"])
 def test_refresh_refused_when_free_space_is_below_the_largest_shard(tmp_path, monkeypatch, source):
-    # A 4bit model with a narrow adapter has an in-memory save size below the largest base
-    # shard, so prepare_saving passes; the refresh itself must refuse before touching anything.
-    # On-disk dtype: a float32 upcast has its own peak check.
+    # A 4bit model with a narrow adapter can have an in-memory save size below the largest base shard, so prepare_saving
+    # passes; the refresh must refuse before touching anything, and a float32 upcast has its own peak check.
     import errno
     from unsloth_zoo import saving_utils as S
 
@@ -461,8 +460,8 @@ def test_refresh_refused_when_free_space_is_below_the_largest_shard(tmp_path, mo
 
 @pytest.mark.parametrize("source", ["local", "hub", "hub_low_disk"])
 def test_dangling_shard_link_out_of_the_output_is_replaced(tmp_path, source):
-    # A shard entry left as a dangling link out of the output (a deleted cache blob) is a stale
-    # entry the refresh replaces with os.replace, which never follows the link: not a refusal.
+    # A dangling shard link outside the output (a deleted cache blob) is a stale entry: the refresh replaces it with
+    # os.replace, which never follows the link, so it is not a refusal.
     monkeypatch = pytest.MonkeyPatch()
     try:
         base, peft_model = _build(tmp_path)

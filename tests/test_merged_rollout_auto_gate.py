@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Decision table for the automatic default of UNSLOTH_VLLM_MERGED_ROLLOUT (CPU only).
-
-Unset / "auto": on for one synchronous 16-bit LoRA text engine on NVIDIA CUDA under Linux with the
-exact Triton fold and vLLM >= 0.11.2. "0" is always off, "1" forces it on every engine as before.
-"""
+"""Decision table for the automatic UNSLOTH_VLLM_MERGED_ROLLOUT default (CPU only): unset or "auto" is on for one
+synchronous 16-bit LoRA text engine on NVIDIA CUDA under Linux with the exact Triton fold and vLLM >= 0.11.2; "0" is
+always off and "1" forces it on every engine."""
 
 import types
 

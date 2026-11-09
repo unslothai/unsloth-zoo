@@ -14,23 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""FlashInfer needs to LINK, not merely compile.
-
-The pre-existing guard checks nvcc and ninja exist. Both do on container images
-that still cannot build FlashInfer, because the link passes `-lcuda` and so
-needs the driver STUB `libcuda.so`, not the runtime `libcuda.so.1` that every
-machine with a driver has.
-
-Observed on Kaggle's GPU image: nvcc present, ninja present, every .cu file
-compiled cleanly for sm_75, and the final step died on
-
-    /usr/bin/ld: cannot find -lcuda
-
-reported as `RuntimeError: Ninja build failed` after minutes of nvcc work. No
-env var avoids it: `VLLM_USE_FLASHINFER_SAMPLER=0` merely moves the build from
-the sampler kernels to the attention kernels, and vLLM exposes no
-prefill-specific opt-out.
-"""
+"""FlashInfer must LINK, not just compile: -lcuda needs the driver stub libcuda.so, not runtime libcuda.so.1, so nvcc
+and ninja present still fail late on Kaggle (RuntimeError: Ninja build failed); VLLM_USE_FLASHINFER_SAMPLER=0 does
+not avoid it."""
 
 import contextlib
 import os
@@ -53,17 +39,8 @@ def _stub(tmp_path, name = "libcuda.so"):
 
 @contextlib.contextmanager
 def _linux_with_no_ambient_cuda():
-    """Everything below asserts LINUX semantics, so pin the platform and
-    neutralise the two HOST-derived sources: the nvcc-inferred CUDA root and
-    the linker's own defaults.
-
-    Both halves are load-bearing, and the platform pin was learned the hard
-    way. On macOS and Windows `_can_link_libcuda` returns before any of this
-    runs, so unpinned these tests silently answered a different question: on a
-    macOS runner the two negative assertions went red (darwin returns True) and
-    the positive ones went green for the wrong reason. A test that passes
-    because the function short-circuited is worse than one that fails.
-    """
+    """Pins sys.platform to linux and neutralises the nvcc-inferred CUDA root and linker default dirs; on macOS or
+    Windows _can_link_libcuda returns early, so unpinned tests answer a different question."""
     with mock.patch.object(vllm_utils.sys, "platform", "linux"), \
          mock.patch.object(vllm_utils, "_cuda_roots_from_nvcc", lambda: ()), \
          mock.patch.object(vllm_utils, "_linker_default_dirs", lambda: ()):
@@ -71,8 +48,8 @@ def _linux_with_no_ambient_cuda():
 
 
 def test_a_runtime_libcuda_without_the_stub_is_not_linkable(tmp_path):
-    """The image that motivated this: libcuda.so.1 present, libcuda.so absent.
-    Every other check passes and the link still cannot."""
+    """A runtime libcuda.so.1 without the libcuda.so stub must count as not linkable; every other check passes on the
+    image that motivated this and the link still fails."""
     (tmp_path / "libcuda.so.1").write_bytes(b"")
     with _linux_with_no_ambient_cuda(), \
          mock.patch.object(vllm_utils, "_FLASHINFER_LINK_DIRS", (str(tmp_path),)), \
@@ -92,9 +69,7 @@ def test_the_stub_beside_the_runtime_is_linkable(tmp_path):
 
 
 def test_a_stub_supplied_through_library_path_counts(tmp_path):
-    """LIBRARY_PATH is what the linker consults beyond its defaults, so a caller
-    who supplied a stub there must not be told FlashInfer is unavailable.
-    Unsloth's own Kaggle GRPO payload does exactly this."""
+    """A libcuda.so stub supplied via LIBRARY_PATH must count, since the linker consults it beyond its defaults; Unsloth's own Kaggle GRPO payload does exactly this."""
     supplied = tmp_path / "shim"
     supplied.mkdir()
     _stub(supplied)
@@ -122,13 +97,7 @@ def test_cuda_home_stubs_count(tmp_path):
 
 
 def test_an_empty_library_path_entry_is_not_a_directory(tmp_path):
-    """`LIBRARY_PATH=""` splits to [""], and os.path.join("", "libcuda.so") is
-    RELATIVE, so it exists whenever THIS process runs in a directory that has
-    one. GCC does treat an empty component as the current directory, but the
-    one that matters is not this one: FlashInfer links via `ninja -C
-    <build_dir>` with `cwd=<build_dir>`, so `c++` resolves a relative -L
-    against its JIT cache directory. Honouring empties would answer a question
-    about the wrong directory."""
+    """An empty LIBRARY_PATH entry must not count: os.path.join gives a relative libcuda.so that tests this process cwd, but FlashInfer links from its JIT build dir."""
     empty = tmp_path / "nothing"
     empty.mkdir()
     cwd = tmp_path / "cwd"
@@ -147,17 +116,13 @@ def test_an_empty_library_path_entry_is_not_a_directory(tmp_path):
 
 
 # ------------------------------------------- false negatives are the bad kind
-# False when the link would have succeeded silently disables FlashInfer on a
-# machine where it works; True when the link then fails merely restores the
-# pre-check behaviour. Below: the two ways the first mistake was reachable.
+# False when a link would have succeeded disables FlashInfer where it works, while True only restores the pre-check
+# behaviour; two tests below cover false-negative paths.
 
 
 def test_a_stub_in_a_default_linker_directory_counts(tmp_path):
-    """`c++ ... -lcuda` searches ld's built-in SEARCH_DIRs with no -L at all,
-    and the NVIDIA driver installer puts the unversioned libcuda.so symlink in
-    one of them (/usr/lib/x86_64-linux-gnu on Debian/Ubuntu). A toolkit with no
-    stubs directory still links there, so False would disable a working
-    FlashInfer."""
+    """A libcuda.so in ld's built-in SEARCH_DIRs counts even with no -L: the NVIDIA installer puts it in
+    /usr/lib/x86_64-linux-gnu on Debian/Ubuntu, so False would disable FlashInfer."""
     default = tmp_path / "usr-lib"
     default.mkdir()
     _stub(default)
@@ -174,10 +139,8 @@ def test_a_stub_in_a_default_linker_directory_counts(tmp_path):
 
 
 def test_the_cuda_root_inferred_from_nvcc_counts(tmp_path):
-    """With neither CUDA_HOME nor CUDA_PATH set, FlashInfer's get_cuda_path()
-    falls back to dirname(dirname(which nvcc)). A toolkit at /opt/cuda or in a
-    conda prefix links against its own lib64/stubs, so checking only
-    /usr/local/cuda would call that machine unlinkable."""
+    """With CUDA_HOME and CUDA_PATH unset, get_cuda_path() infers the root from nvcc, so a toolkit at /opt/cuda or in a
+    conda prefix must count, not just /usr/local/cuda."""
     root = tmp_path / "opt-cuda"
     stubs = root / "lib64" / "stubs"
     stubs.mkdir(parents = True)
@@ -216,8 +179,7 @@ def test_no_nvcc_means_no_inferred_root():
 
 
 def test_linker_defaults_never_come_back_empty():
-    """A parse failure must widen to the fallback list: an empty tuple would
-    silently reintroduce the false negative."""
+    """A linker-defaults parse failure must widen to the fallback list; an empty tuple would silently reintroduce the false negative."""
     vllm_utils._linker_default_dirs.cache_clear()
     try:
         with mock.patch.object(vllm_utils, "re") as fake_re:
@@ -228,9 +190,7 @@ def test_linker_defaults_never_come_back_empty():
 
 
 def test_multiarch_dirs_cover_the_debian_ubuntu_driver_location():
-    """`/usr/lib/x86_64-linux-gnu` is where the NVIDIA driver puts the
-    unversioned `libcuda.so`, and it is in ld's built-in SEARCH_DIRs, so
-    `c++ ... -lcuda` resolves there with no -L at all."""
+    """/usr/lib/x86_64-linux-gnu holds the NVIDIA driver's unversioned libcuda.so and is in ld's built-in SEARCH_DIRs, so -lcuda resolves there with no -L."""
     with mock.patch.object(vllm_utils.sys, "platform", "linux"), \
          mock.patch.object(platform, "machine", lambda: "x86_64"), \
          mock.patch.object(sysconfig, "get_config_var",
@@ -241,8 +201,7 @@ def test_multiarch_dirs_cover_the_debian_ubuntu_driver_location():
 
 
 def test_multiarch_dirs_cover_aarch64_without_a_configured_triplet():
-    """manylinux and conda interpreters have no MULTIARCH; the triplet is then
-    derived from the machine so Jetson / GH200 are still covered."""
+    """manylinux and conda interpreters lack MULTIARCH, so the triplet is derived from the machine, keeping Jetson and GH200 covered."""
     with mock.patch.object(vllm_utils.sys, "platform", "linux"), \
          mock.patch.object(platform, "machine", lambda: "aarch64"), \
          mock.patch.object(sysconfig, "get_config_var", lambda name: None):
@@ -258,13 +217,8 @@ def test_multiarch_dirs_are_empty_off_linux():
 
 
 def test_the_fallback_includes_the_multiarch_dir_when_ld_cannot_be_consulted():
-    """The regression. `ld --verbose` is unavailable whenever the image has no
-    binutils, or whenever `ld` is really lld -- lld carries no built-in linker
-    script and so emits no SEARCH_DIR (llvm/llvm-project#101661). The fallback
-    is then the entire default-directory search, and it used to list only
-    /usr/lib, /lib, /usr/lib64, /lib64, /usr/local/lib, /usr/local/lib64 --
-    none of which is where Debian/Ubuntu keep libcuda.so. On such a host
-    `_can_link_libcuda()` answered False while `c++ -shared -lcuda` links."""
+    """Without ld --verbose (no binutils, or lld with no SEARCH_DIR, llvm/llvm-project#101661) the fallback must include
+    the multiarch dir, else _can_link_libcuda() wrongly answers False."""
     vllm_utils._linker_default_dirs.cache_clear()
     try:
         with mock.patch.object(subprocess, "run",
@@ -277,17 +231,14 @@ def test_the_fallback_includes_the_multiarch_dir_when_ld_cannot_be_consulted():
         pytest.skip("multiarch layout is Linux-only")
     triplet = sysconfig.get_config_var("MULTIARCH") or (platform.machine() + "-linux-gnu")
     assert "/usr/lib/" + triplet in dirs
-    # The pre-existing entries must survive: RHEL/Fedora and the .run installer
-    # use /usr/lib64, which has no triplet.
+    # Pre-existing fallback entries must survive: RHEL/Fedora and the .run installer use /usr/lib64, which has no multiarch triplet.
     for kept in ("/usr/lib", "/lib", "/usr/lib64", "/lib64",
                  "/usr/local/lib", "/usr/local/lib64"):
         assert kept in dirs
 
 
 def test_a_runtime_only_multiarch_dir_is_still_not_linkable(tmp_path):
-    """The Kaggle constraint, restated against the widened fallback: adding
-    /usr/lib/<triplet> must not make a runtime-only image look linkable.
-    `libcuda.so.1` present and `libcuda.so` absent stays False."""
+    """Adding /usr/lib/<triplet> to the fallback must not make a runtime-only image look linkable: libcuda.so.1 without libcuda.so stays False."""
     multiarch = tmp_path / "usr-lib-x86_64-linux-gnu"
     multiarch.mkdir()
     (multiarch / "libcuda.so.1").write_bytes(b"")
@@ -305,9 +256,8 @@ def test_a_runtime_only_multiarch_dir_is_still_not_linkable(tmp_path):
 
 
 def test_windows_looks_for_cuda_lib_not_a_posix_stub(tmp_path):
-    """Windows links `cuda.lib` from the toolkit and searches LIB. Probing for
-    libcuda.so there would find nothing and disable FlashInfer on a platform
-    where it works."""
+    """Windows links cuda.lib from the toolkit and searches LIB; probing for libcuda.so there would find nothing and
+    wrongly disable FlashInfer on a working platform."""
     libdir = tmp_path / "lib" / "x64"
     libdir.mkdir(parents = True)
     (libdir / "cuda.lib").write_bytes(b"")
@@ -327,8 +277,7 @@ def test_windows_without_cuda_lib_is_not_linkable(tmp_path):
 
 
 def test_windows_with_nothing_to_go_on_does_not_claim_failure():
-    """No CUDA_PATH and no LIB is no evidence either way. False would disable
-    FlashInfer on the strength of a missing env var."""
+    """On Windows with no CUDA_PATH and no LIB there is no evidence either way, so the check returns True rather than disabling FlashInfer on a missing env var."""
     with mock.patch.object(vllm_utils.sys, "platform", "win32"), \
          mock.patch.dict(os.environ, {"CUDA_PATH": "", "CUDA_HOME": "",
                                       "LIB": ""}, clear = False):
@@ -342,8 +291,7 @@ def test_macos_never_claims_the_link_will_fail():
 
 
 def test_wsl_is_linux_and_is_checked(tmp_path):
-    """WSL reports sys.platform == "linux" and uses the POSIX toolchain, so it
-    must take the Linux branch, not the Windows one."""
+    """WSL reports sys.platform as linux and uses the POSIX toolchain, so it must take the Linux branch, not the Windows one."""
     (tmp_path / "libcuda.so.1").write_bytes(b"")
     with _linux_with_no_ambient_cuda(), \
          mock.patch.object(vllm_utils.sys, "platform", "linux"), \

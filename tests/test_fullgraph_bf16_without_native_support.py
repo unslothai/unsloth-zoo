@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""bf16 fullgraph calls run eagerly on sm < 80, where torch 2.13+ turns the bf16 SkipFrame into
-"found no compiled frames". CPU only: the skip is faked with a SkipFrame backend."""
+"""bf16 fullgraph on sm < 80 runs eagerly; torch 2.13+ raises 'found no compiled frames' (CPU-faked)."""
 
 import pytest
 import torch

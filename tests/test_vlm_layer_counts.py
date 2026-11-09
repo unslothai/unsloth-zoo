@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""get_model_type returns the vision name, so a branch on the top level one is dead: the
-bound falls back to 32 and Mllama loses its cross-attn gates on text layers 33 and 38.
-"""
+"""get_model_type returns the vision name, so a top-level branch is dead; the bound falls back to 32 and Mllama loses cross-attn gates on text layers 33 and 38."""
 import pytest
 import torch
 

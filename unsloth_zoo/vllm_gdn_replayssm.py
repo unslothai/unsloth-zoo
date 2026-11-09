@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Runtime backport of vllm-project/vllm#48792 (GDN ReplaySSM decode, closed unmerged) to released vLLM.
-
-Every edit is matched against the installed vLLM source first; any mismatch leaves vLLM untouched.
-"""
+"""Backport of vllm-project/vllm PR 48792 (GDN ReplaySSM decode, closed unmerged) to released vLLM; any source mismatch leaves vLLM untouched."""
 
 __all__ = ["GDN_REPLAYSSM_ARCHITECTURES", "patch_vllm_gdn_replayssm"]
 
@@ -82,8 +79,7 @@ _LAYER_SOURCE_EDITS = {
             "):\n",
         ),
         (
-            # Decode rows of a mixed prefill + decode batch must go through the ring
-            # too, or the conventional update would advance a state the ring replays.
+            # Decode rows of a mixed prefill + decode batch must also go through the ring, or the conventional update advances a state the ring replays.
             "if split_non_spec:\n"
             "    query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(\n",
             "if split_non_spec and getattr(self, \"use_replayssm\", False):\n"
@@ -202,8 +198,7 @@ def _make_decode_non_spec(layer_module):
 
 
 def _ring_cursor(builder, m, num_decodes, query_start_loc_cpu):
-    # write_pos = decode steps since the ring's last checkpoint write, mod the buffer length
-    # (vllm-project/vllm#48792, GDNAttentionMetadataBuilder.build).
+    # write_pos is decode steps since the ring's last checkpoint write, mod the buffer length (vllm-project/vllm PR 48792, GDNAttentionMetadataBuilder.build).
     import torch
     decode_base_cpu = m.replayssm_decode_base_cpu
     seq_lens_cpu = m.seq_lens_cpu_upper_bound

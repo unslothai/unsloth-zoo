@@ -14,20 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Audio support in UnslothVisionDataCollator (PRs #723 and follow-ups).
-
-Hermetic CPU tests with stub processors, no model or network needed:
-
-1. ``extract_audio_info``: inline arrays, HF Audio dicts, url/path content
-   parts, payload-less parts raising instead of silently training text-only,
-   and sampling-rate validation.
-2. ``_extract_audio_for_example``: top-level dict / ndarray / flat list /
-   list-of-clips columns, None fallback to inline audio, torch tensor
-   conversion, and the mono-only guard.
-3. ``_truncate_sequence_tensors``: per-token-key allowlist (audio feature
-   tensors must never be sliced even on dimension collisions), left-padding
-   aware slicing, and the audio-span truncation guard.
-"""
+"""Audio in UnslothVisionDataCollator (PRs 723 and follow-ups): audio extraction, mono and list-of-clips handling, and
+truncation that never slices audio feature tensors; CPU-only."""
 
 from __future__ import annotations
 
@@ -536,8 +524,8 @@ def test_real_decoder_decodes_to_float32_at_every_gate(gate):
 
 
 class _UnpatchedFakeAudioDecoder:
-    """An *unpatched* datasets torchcodec AudioDecoder surface: only __getitem__,
-    none of the get/keys/__contains__/__iter__ methods the patch grafts."""
+    """Unpatched datasets torchcodec AudioDecoder surface: only __getitem__, lacking the get/keys/__contains__/__iter__
+    methods that patch_torchcodec_audio_decoder grafts on."""
 
     def __getitem__(self, key):
         if key == "array":

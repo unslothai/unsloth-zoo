@@ -13,8 +13,7 @@ except ImportError:
 try:
     from vllm.adapter_commons.worker_manager import AbstractWorkerManager
 except ImportError:
-    # Create a dummy base class when the import fails
-    # https://github.com/vllm-project/vllm/pull/25045/files
+    # Fallback dummy base class when vLLM's AbstractWorkerManager import fails; see vllm-project/vllm PR 25045.
     class AbstractWorkerManager:
         def __init__(self, device):
             self.device = device
@@ -34,8 +33,7 @@ try:
     from vllm.lora.models import (LoRAModel, LoRAModelManager,
                                 LRUCacheLoRAModelManager, create_lora_manager)
 except ImportError:
-    # Newer vLLM version moved/split lora methods
-    # https://github.com/vllm-project/vllm/pull/30253
+    # Newer vLLM moved/split lora methods; see vllm-project/vllm PR 30253.
     try:
         from vllm.lora.lora_model import LoRAModel
         from vllm.lora.model_manager import LoRAModelManager, LRUCacheLoRAModelManager, create_lora_manager
@@ -66,8 +64,7 @@ import functools
 
 @functools.lru_cache(None)
 def _dummy_lora_has_scaling_factor(create_dummy_lora):
-    # create_dummy_lora(self, lora_id, rank, scaling_factor, embedding_modules)
-    # create_dummy_lora(self, lora_id, rank, embedding_modules)
+    # vLLM's create_dummy_lora has two signatures, with or without scaling_factor; this checks which one is installed.
     keys = inspect.signature(create_dummy_lora).parameters.keys()
     return "scaling_factor" in keys
 pass
@@ -397,7 +394,6 @@ def new_init(
 
 
 if vllm_WorkerLoRAManager is not None:
-    # get the signature and check if vllm_config is in the signature
     vllm_WorkerLoRAManager_signature = inspect.signature(vllm_WorkerLoRAManager.__init__)
     vllm_WorkerLoRAManager_signature_keys = vllm_WorkerLoRAManager_signature.parameters.keys()
     if "vllm_config" in vllm_WorkerLoRAManager_signature_keys:

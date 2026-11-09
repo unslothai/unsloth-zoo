@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Per-arch decode routing: which kernel a T4 (sm75) and sm80+ cards take, with the capability faked.
-
-Measured on Colab T4 fp16 (torch 2.10 and 2.14): from 4 decode tokens up the 16-bit routed MoE kernels are 4-9x
-slower than the grouped_mm path they replace, so sm75 routes one-token decode only (there grouped_mm's host syncs
-cost more end to end); stacked NF4 routing wins or ties at every routed size and keeps its sm80+ limits.
-"""
+"""Per-arch decode routing, capability faked: sm75 (T4) routes 16-bit MoE for one-token decode only (grouped_mm wins
+from 4 tokens up on torch 2.10 and 2.14); stacked NF4 routing wins or ties at every size and keeps its sm80+ limits."""
 
 import os
 
@@ -141,8 +137,7 @@ def test_stacked_nf4_routing_is_kept_on_t4(cap, fake_cap, monkeypatch):
 
 from unsloth_zoo._vendored.vllm import gdn_replayssm_decode as GDN  # noqa: E402
 
-# Upstream (vllm-project/vllm#48792) table, unchanged off T4; T4 measured (Colab T4, torch 2.10 / 2.14, B=1/8/64):
-# (64, 1, 3, 2) 0.24 / 1.46 / 12.3 ms vs (32, 1, 1, 4) 0.11 / 0.11 / 0.52 ms (fla fused_recurrent 0.18 / 0.28 / 1.23).
+# Upstream vllm-project/vllm 48792 table, unchanged off T4; T4 uses (32, 1, 1, 4), measured faster than (64, 1, 3, 2) on Colab T4 with torch 2.10 and 2.14.
 GDN_EXPECTED = {
     (7, 5): (32, 1, 1, 4),
     (8, 0): (64, 1, 3, 2), (8, 6): (64, 1, 3, 2), (8, 9): (64, 1, 3, 2), (9, 0): (64, 1, 3, 2),

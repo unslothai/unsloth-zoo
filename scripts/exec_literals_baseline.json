@@ -15,6 +15,13 @@
     },
     {
       "file": "unsloth_zoo/compiler.py",
+      "sink": "compile",
+      "digest": "8a046bb13379b63d",
+      "count": 1,
+      "reason": "Syntax-checks PEFT's own LoRA forward (inspect.getsource) after this file swaps in two fixed update lines; the result is discarded and never executed. ast.parse cannot replace it because it accepts a stray `continue` that compile rejects."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
       "sink": "eval",
       "digest": "03e6d133b778a53e",
       "count": 1,
@@ -163,13 +170,6 @@
     {
       "file": "unsloth_zoo/compiler.py",
       "sink": "exec",
-      "digest": "aec8dc650544d15a",
-      "count": 1,
-      "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
-    },
-    {
-      "file": "unsloth_zoo/compiler.py",
-      "sink": "exec",
       "digest": "bf2e8c51f0f6c2ed",
       "count": 1,
       "reason": "The compiler's own generated module source and dotted module paths. `model_location` is built from `model_type`, which is validated against `[a-z0-9_]+` before it reaches here."
@@ -303,13 +303,6 @@
     {
       "file": "unsloth_zoo/peft_utils.py",
       "sink": "eval",
-      "digest": "73be47696e5e4b6b",
-      "count": 1,
-      "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
-    },
-    {
-      "file": "unsloth_zoo/peft_utils.py",
-      "sink": "eval",
       "digest": "81cdac2f6f8a2c32",
       "count": 1,
       "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
@@ -318,13 +311,6 @@
       "file": "unsloth_zoo/peft_utils.py",
       "sink": "exec",
       "digest": "45bbd24d7d803e73",
-      "count": 1,
-      "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
-    },
-    {
-      "file": "unsloth_zoo/peft_utils.py",
-      "sink": "exec",
-      "digest": "582f1edab6ecc7d8",
       "count": 1,
       "reason": "Re-imports PEFT internals by name and reads or clears a hook attribute; the names come from this file, not from any input."
     },
@@ -397,6 +383,20 @@
       "digest": "616eaf6a8e66264d",
       "count": 1,
       "reason": "Source is inspect.getsource of the installed transformers GraniteMoeHybridDecoderLayer.forward with three fixed regex substitutions; nothing user supplied reaches it."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/granitemoehybrid.py",
+      "sink": "compile",
+      "digest": "f1af1c5e8f8a6539",
+      "count": 1,
+      "reason": "Source is inspect.getsource of the installed transformers GraniteMoeHybridRMSNorm / RMSNormGated.forward with one fixed literal return-line replacement; nothing user supplied reaches it."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/granitemoehybrid.py",
+      "sink": "exec",
+      "digest": "2b512993290abfda",
+      "count": 1,
+      "reason": "Source is inspect.getsource of the installed transformers GraniteMoeHybridRMSNorm / RMSNormGated.forward with one fixed literal return-line replacement; nothing user supplied reaches it."
     },
     {
       "file": "unsloth_zoo/temporary_patches/granitemoehybrid.py",

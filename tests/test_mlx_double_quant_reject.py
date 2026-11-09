@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""bnb_4bit_use_double_quant is accepted (bool only) while every other
-BitsAndBytesConfig field still fails loud. Pure logic, runs under the torch shim.
-"""
+"""Pins bnb_4bit_use_double_quant as bool-only; other BitsAndBytesConfig fields fail loud; torch shim."""
 
 import pytest
 

@@ -68,15 +68,8 @@ _ENGAGED = [0]           # count of FA2-path invocations (debug)
 _BANDED_ENGAGED = [0]    # count of banded-path invocations (debug)
 _DEFERRED = [0]          # count of sliding calls that fell through (debug)
 
-# Engage only from this multiple of the window upward. Measured on B200 at Muse
-# Glimmer's shapes (32 / 2 heads, head_dim 128, w = 2048, bf16), the banded
-# kernel against the real sdpa_attention_forward, forward plus backward:
-#     S = 1w  0.60x    S = 1.5w 0.43x    S = 2w  0.72x    S = 3w  1.12x
-#     S = 4w  1.43x    S = 6w   2.10x    S = 8w  2.85x    S = 16w 5.74x
-# Below 2w the band already covers nearly the whole causal triangle, so blocking
-# into (w, 2w) tiles costs about 2x the FLOPs of the plain causal kernel and the
-# patch would be a slowdown. 3w is the first length with a clear win, so that is
-# where it turns on, and nothing below it is touched.
+# Below 2w the band covers nearly the whole causal triangle, so blocking costs about 2x the causal FLOPs (a slowdown);
+# engage only from 3w, the first clear win, and leave shorter lengths untouched.
 _MIN_SEQ_MULTIPLE_OF_WINDOW = 3
 
 
@@ -110,14 +103,8 @@ def _force_banded():
 
 
 def _is_muse_glimmer_sliding_module(module):
-    """Strict gate: a Muse Glimmer text attention layer that is actually sliding.
-
-    Name-prefixed rather than isinstance-checked because Unsloth's compiler
-    regenerates MuseGlimmerTextAttention into unsloth_compiled_cache, so the
-    class the model really runs is not the one importable from transformers.
-    The vision tower is a separate MuseGlimmerVisionAttention, so the
-    MuseGlimmerText prefix excludes it by construction.
-    """
+    """Strict gate for sliding Muse Glimmer text attention; matches the class-name prefix, not isinstance, since
+    Unsloth's compiler regenerates the class in unsloth_compiled_cache; vision is excluded."""
     if not getattr(module, "is_local_attention", False): return False
     cls = type(module).__name__
     return cls.startswith("MuseGlimmerText") and cls.endswith("Attention")

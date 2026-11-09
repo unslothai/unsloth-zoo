@@ -14,18 +14,9 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""``_find_common_token_ids`` when the matched core is not found in the component.
-
-The core is the common sublist across probe variants that each carry an appended
-``[0]`` sentinel, so it need not appear in ``original``. On no match the loop fell
-through and sliced at the last index, returning optional tokens that were never
-matched; on an empty tokenization ``j`` was never bound at all.
-
-An unlocated core is also never returned: it can be the bare sentinel (whose first
-id 0 would then mask on every ``<unk>``/``<pad>`` in the corpus) or a real id with
-the sentinel glued on (which masks the whole dataset). Both come back as no core,
-and ``train_on_responses_only`` turns that into a named error.
-"""
+"""_find_common_token_ids returns no core when the core is absent from the component, never the bare [0] sentinel (masks
+every <unk>/<pad>) or a sentinel-glued id (masks the whole dataset); train_on_responses_only raises a named error for
+it."""
 
 import pytest
 
@@ -108,11 +99,7 @@ def test_empty_explicit_marker_raises_named_error():
 
 
 def test_unlocated_core_raises_before_a_masking_function_exists():
-    """The caller-level consequence: a marker whose core was never located must not
-    reach the masking closure. Its core used to come back as the bare [0] sentinel,
-    so A_first == 0 and a sample of [41, 0, 42, 0, 43] was masked to
-    [-100, -100, 42, -100, -100] - token 42 trained on although neither marker was
-    ever recovered. Raising here means no such closure is ever built."""
+    """A marker whose core was never located must raise before a masking closure is built; a bare [0] core masked [41, 0, 42, 0, 43] so token 42 was trained on."""
     tokenizer = StubTokenizer(NO_COMMON_CORE)
 
     with pytest.raises(ValueError, match="instruction_part could not be resolved") as caught:
@@ -129,8 +116,8 @@ def test_unlocated_core_raises_before_a_masking_function_exists():
 
 
 def test_same_marker_with_force_match_still_builds_a_masking_function():
-    """No-regression guard: only the unrecoverable case is rejected. The same marker
-    at force_match=True has a core equal to its own tokenization, so it still works."""
+    """Guards that only the unrecoverable case is rejected: the same marker with force_match=True has a core equal to
+    its tokenization and still builds a masking function."""
     tokenizer = StubTokenizer(NO_COMMON_CORE)
 
     mask_fn = train_on_responses_only(

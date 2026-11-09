@@ -194,9 +194,7 @@ def test_inherited_contract_has_no_model_name_restriction():
     assert type(model) is OtherRecurrentBlock
 
 def test_overlapping_scopes_keep_the_module_fused_until_the_last_exit():
-    # Generation enters this beside fused_moe_gate_up and Studio enters it again per
-    # request, so two scopes own the same module. Without a count the first exit
-    # restores the native class and the still-open scope silently loses the kernel.
+    # Two scopes (generation, Studio) own one module; without a count the first exit loses the kernel.
     model = _model()
     root = nn.Sequential(model)
     root.eval()
@@ -212,10 +210,8 @@ def test_overlapping_scopes_keep_the_module_fused_until_the_last_exit():
     finally:
         inner.__exit__(None, None, None)
     assert type(model) is native.Qwen3_5GatedDeltaNet
-    # Both stores: nn.Module.__setattr__ routes only mx.array/dict/list/tuple into the
-    # mapping and pops the key there for anything else, so the count and the two class
-    # references live in __dict__. Assert the mapping too, so a value that later starts
-    # landing there cannot leak past the exit unnoticed.
+    # Count and both class references live in __dict__ since nn.Module.__setattr__ diverts only
+    # mx.array/dict/list/tuple; also assert the mapping so a value landing there cannot leak past exit
     leftover = [key for key in (*model.__dict__, *dict.keys(model))
                 if key.startswith("_unsloth_decode")]
     assert leftover == []
@@ -293,8 +289,7 @@ def test_prenorm_layers_hand_the_normalized_residual_on_bitwise(vlm, hidden, mon
     launches, fused = [], decode._fused_add_rms_norm
     monkeypatch.setattr(decode, "_fused_add_rms_norm", lambda *args: launches.append(None) or fused(*args))
 
-    # mlx-vlm 0.7.4's Qwen3.5 decode reads memory it never wrote from two rows on, so its batched
-    # output depends on the allocator's state and cannot be a bitwise reference.
+    # mlx-vlm 0.7.4 Qwen3.5 decode reads unwritten memory with 2+ rows; batched output is not bitwise.
     rows = 1 if vlm else 3
 
     def generate():
@@ -693,8 +688,7 @@ def test_verify_attention_matches_mlx_vector_kernel_and_decode_rows_bitwise(gqa,
     queries, keys, values = _attention_block(gqa, rows, 4500, dtype)
     if gqa == 4:   # decode stays unfused there, so the kernel only serves it when asked
         assert decode._verify_attention(queries, keys, values, None, 1.0, "causal", None) is None
-        monkeypatch.setenv("UNSLOTH_MLX_VERIFY_ATTENTION", "1")
-    out = decode._verify_attention(queries, keys, values, None, 1.0, "causal", None)
+    out = decode._verify_attention(queries, keys, values, None, 1.0, "causal", None, gqa == 4)
     _equal(out, decode._decode_attention(queries, keys, values, 1.0))
     if gqa == 8:   # unpaired heads: exactly what each decode step computes
         horizon = lambda i: 4500 - rows + i + 1
@@ -785,6 +779,20 @@ def test_verify_scope_serves_only_marked_global_blocks_and_restores(monkeypatch)
             with decode.verify_block_attention():
                 raise RuntimeError("cancel")
     assert type(full) is gemma4.Attention and not decode._VERIFY_STATE.attention
+
+
+def test_four_query_heads_serve_only_under_their_models_fast_verify(monkeypatch):
+    gemma4, layers = _gemma4_attention(gqa = 4)
+    x = mx.random.normal((1, 3, 64)).astype(mx.bfloat16)
+    launched, kernel = [], decode._vector_attention
+    monkeypatch.setattr(decode, "_vector_attention", lambda *args: launched.append(args) or kernel(*args))
+    for fast_verify in (False, True):
+        launched.clear()
+        decode._hold_fast_verify(layers, fast_verify)
+        with decode.fused_verify_attention(layers), decode.verify_block_attention():
+            _attend(gemma4, layers.layers[1], x)
+        decode._release_fast_verify(layers)
+        assert bool(launched) == fast_verify
 
 
 def test_verify_scope_keeps_native_when_the_first_launch_differs_from_decode(monkeypatch, caplog):
@@ -1230,8 +1238,7 @@ def _qsa_attention():
 
 
 def _speculative_rounds(attention, cache):
-    # Rejections that do and do not cross a pooled-block boundary, and a full acceptance. Each round
-    # brings new rows, as a corrected token replaces a rejected draft.
+    # Rejections on and off a pooled-block boundary, plus full acceptance; each round brings new rows.
     x = mx.random.normal((1, 81, 64), key = mx.random.key(9)).astype(mx.bfloat16)
     steps = [attention(x[:, :61], cache = cache), cache.index_block_keys]
     for start, reject in zip(range(61, 81, 4), (3, 1, 0, 2, 3)):
@@ -1586,7 +1593,7 @@ def test_qwen4_decode_read_matches_mlx_vlm_bitwise(dtype, bits, group_size, lowr
 @_needs_qwen4
 @pytest.mark.parametrize("reason", [
     "switch", "body", "patched", "outside", "differs", "aligned", "quad", "child", "override", "linear",
-    "foreign", "late", "rebound", "lora", "dtype", "verified", "relinear"])
+    "foreign", "late", "rebound", "lora", "dtype", "verified", "relinear", "lane"])
 def test_qwen4_decode_read_steps_aside(reason, monkeypatch, caplog):
     module = _qwen4_read(lowrank = {"aligned": 512, "quad": 128}.get(reason, 160))
     other, forward = _qwen4_read(), qwen4._QWEN4_BATCH_INVARIANT_FORWARD
@@ -1608,10 +1615,12 @@ def test_qwen4_decode_read_steps_aside(reason, monkeypatch, caplog):
             "__call__": lambda self, x: nn.QuantizedLinear.__call__(self, x) * 2})
     elif reason == "linear":
         monkeypatch.setitem(vars(forward), "_linear", lambda linear, h: linear(h) * 2)
+    elif reason == "lane":
+        monkeypatch.setitem(vars(module.input_mix_weight_down), "_unsloth_lane_qmm", True)
     elif reason in ("verified", "relinear"):   # exact_batch_invariant_decode's class already over the forward
         native = type(forward)
         methods = (getattr(native, name, None) for name in decode._VERIFY_METHODS)
-        verified = decode._exact_verify_class(native, "__call__", False, *methods)
+        verified = decode._exact_verify_class(native, "qwen4_exp", *methods)
         if reason == "relinear":   # a class under that one decorating its `_linear`
             sliced = verified._linear
             verified = type("Scaled", (verified,), {
@@ -1642,7 +1651,7 @@ def test_qwen4_decode_read_steps_aside(reason, monkeypatch, caplog):
             _assert_same(forward._hyper_connection(target, x), expected)
     left = vars(forward).pop("_hyper_connection", None) if reason == "late" else vars(forward).get("_hyper_connection")
     assert left is (foreign if reason in ("foreign", "late") else None)
-    assert hooked == (reason in ("outside", "differs", "late", "dtype", "verified"))
+    assert hooked == (reason in ("outside", "differs", "late", "dtype", "verified", "lane"))
     assert len(log) == {"differs": 2, "verified": 4}.get(reason, 0)
     assert ("differs from the version" in caplog.text) == (reason in ("body", "patched", "rebound"))
     assert caplog.text.count("differs from mlx-vlm's") == (reason == "differs")

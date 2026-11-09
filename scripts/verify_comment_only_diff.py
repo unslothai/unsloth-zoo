@@ -11,24 +11,8 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Affero General Public License for more details.
 
-"""Deterministic comment / docstring-only diff verifier.
-
-Reports whether each file's diff between two git refs is strictly comments /
-docstrings, to gate a "comment trim" PR against accidental code drift.
-Per .py: AST-parse both revs, strip docstrings, compare ast.unparse (pure
-comments are dropped by the parser). Per .yml: yaml.safe_load and compare the
-parsed object, also stripping shell comments in ``run: |`` bodies. Exit 0 =
-all OK, 1 = a real (non-comment) diff or error.
-
-Usage:
-    python scripts/verify_comment_only_diff.py [--base REF] [--head REF] path ...
-
-Defaults: --base origin/main, --head HEAD. Paths are repo-relative.
-
-Example:
-    git diff --name-only origin/main..HEAD \\
-      | xargs python scripts/verify_comment_only_diff.py --base origin/main
-"""
+"""Verify a git diff changes only comments and docstrings: .py via ast.unparse after stripping docstrings, .yml via
+yaml.safe_load with run-body shell comments stripped; exit 1 on a real diff or error."""
 from __future__ import annotations
 
 import argparse
@@ -48,8 +32,7 @@ def _git_show(rev: str, path: str) -> str:
 
 
 def _strip_docstrings(tree: ast.AST) -> ast.AST:
-    """Remove docstrings from Module / FunctionDef / AsyncFunctionDef /
-    ClassDef; an emptied body becomes ``pass`` so ast.unparse stays valid."""
+    """Remove docstrings from modules, functions and classes; an emptied body becomes pass so ast.unparse stays valid."""
     for node in ast.walk(tree):
         if isinstance(
             node,
@@ -77,8 +60,7 @@ def _normalize_py(src: str) -> str:
 
 
 def _strip_shell_comments(s: str) -> str:
-    """Strip comment lines + inline trailing comments from a shell snippet and
-    collapse blank runs. Heuristic: leaves lines with an odd quote count alone."""
+    """Strip shell comments and collapse blank runs; a heuristic that leaves lines with an odd quote count untouched."""
     out = []
     for line in s.splitlines():
         stripped = line.lstrip()
@@ -105,8 +87,7 @@ def _strip_shell_comments(s: str) -> str:
 
 
 def _normalize_yaml_run_strings(obj: Any) -> Any:
-    """Return a copy with shell comments stripped from every multi-line string
-    (i.e. ``run: |`` script bodies)."""
+    """Return a copy with shell comments stripped from multi-line strings, i.e. `run: |` script bodies."""
     if isinstance(obj, dict):
         return {k: _normalize_yaml_run_strings(v) for k, v in obj.items()}
     if isinstance(obj, list):

@@ -14,25 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""No test module may switch an import-time global on at module scope and leave it on.
-
-pytest imports every selected module before it runs anything, so a module-scope
-`os.environ["X"] = ...` is not scoped to that file: it is set for the whole xdist worker,
-for every test collected after it, in whatever directory. Those tests then measure a
-configuration nobody chose.
-
-This is not hypothetical. `test_higher_precision_layernorm_scope.py` needed
-`UNSLOTH_ZOO_DISABLE_GPU_INIT=1` for one import and set it with a bare `setdefault` at
-module scope. `__init__.py:179` reads that into `_SKIP_GPU_INIT`, which skips the
-import-time allocator block and pins `DEVICE_TYPE` to "cpu", so
-`test_alloc_conf_platform_matrix.py` reported all three allocator variables unset and
-`test_temporary_patches_imports.py` reported `device_memory` as 0. Both blamed the
-product, neither was about the product, and between them they failed the
-`unsloth_zoo @ main` leg of unsloth's Core workflow on every open pull request.
-
-Setting one of these for an import is fine. Leaving it set is not, so what is required
-here is the restore, not the abstinence.
-"""
+"""A module-scope os.environ write of an import-time global such as UNSLOTH_ZOO_DISABLE_GPU_INIT must be restored after
+the import; otherwise it leaks to the whole xdist worker."""
 
 from __future__ import annotations
 
@@ -41,8 +24,7 @@ from pathlib import Path
 
 TESTS_ROOT = Path(__file__).resolve().parents[1]
 
-# Read once at import and cached for the process, so a later change is not observed and a
-# test that assumes the default silently measures something else.
+# Read once at import and cached for the process, so a later change is not observed and a test assuming the default silently measures something else.
 IMPORT_TIME_GLOBALS = frozenset({
     "UNSLOTH_ZOO_DISABLE_GPU_INIT",
     "UNSLOTH_VLLM_STANDBY",
@@ -73,17 +55,12 @@ def _env_writes(node: ast.AST):
             if child.args and isinstance(child.args[0], ast.Constant):
                 yield child.args[0].value, child.lineno
             else:
-                # `update(a_dict)`: the names are not literals here, so report it as
-                # unknown rather than pass it, and let the author name them.
+                # An update(a_dict) call has no literal names here, so it is reported as unknown rather than passed, letting the author name them.
                 yield None, child.lineno
 
 
 def _module_scope_statements(tree: ast.Module):
-    """Top-level statements only, minus anything inside a `try`.
-
-    A `try`/`finally` at module scope is the shape this file is asking for: set it, do the
-    import, put it back. Descending into one would flag the fix as the bug.
-    """
+    """Scans top-level statements only, skipping try blocks, since a try/finally that restores the variable is the fix and must not be flagged."""
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Try)):
             continue
@@ -153,7 +130,5 @@ def test_the_scan_accepts_a_restored_write(tmp_path):
         for name, _ in _env_writes(node)
         if name in IMPORT_TIME_GLOBALS
     ]
-    # The write is inside the `try`, so the restore covers it however the import ends.
-    # That is the one shape this guard calls clean, and the fix has to read as clean or
-    # the guard bans the working pattern along with the broken one.
+    # A write inside the try is restored however the import ends; that is the one shape this guard calls clean, or the guard would ban the working pattern too.
     assert found == [], found

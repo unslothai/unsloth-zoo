@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A torch module whose standalone compiled copy fails must still be importable from the generated module.
-On transformers 4.x, Qwen3-MoE float16 (FORCE_FLOAT32 patches) failed to copy Qwen3MoeRMSNorm, which was then
-neither defined nor imported, and loading died with NameError in Qwen3MoeAttention.__init__."""
+"""A torch module whose standalone copy fails must stay importable from the generated module; else NameError, as with Qwen3MoeRMSNorm on transformers 4.x."""
 
 import json
 import os

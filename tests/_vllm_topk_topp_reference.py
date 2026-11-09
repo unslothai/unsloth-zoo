@@ -14,14 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""vLLM's PyTorch top-k / top-p sampler masks, copied verbatim so the tests run without vLLM.
-
-From vllm/v1/sample/ops/topk_topp_sampler.py (Apache-2.0, Copyright contributors to the vLLM
-project). `apply_top_k_top_p_pytorch` and `apply_top_k_only` are from v0.32.0; `apply_top_k_top_p_v0_11_2`
-is `apply_top_k_top_p` from v0.11.2 (its `apply_top_k_only` differs from v0.32.0's only in
-formatting and docstring). Do not edit
-the function bodies: they are the reference the trainer's kept set is checked against.
-"""
+"""vLLM's PyTorch top-k/top-p masks copied verbatim so tests run without vLLM (from
+vllm/v1/sample/ops/topk_topp_sampler.py, v0.32.0 and v0.11.2, Apache-2.0); do not edit the bodies, the trainer's kept
+set is checked against them."""
 
 import torch
 
@@ -32,13 +27,7 @@ def apply_top_k_top_p_pytorch(
     p: torch.Tensor | None,
     allow_cpu_sync: bool = False,
 ) -> torch.Tensor:
-    """Apply top-k and top-p masks to the logits.
-
-    If a top-p is used, this function will sort the logits tensor,
-    which can be slow for large batches.
-
-    The logits tensor may be updated in-place.
-    """
+    """Apply top-k and top-p masks to the logits in place; top-p sorts the vocab, which is slow for large batches."""
     if p is None:
         if k is None:
             return logits
@@ -52,7 +41,6 @@ def apply_top_k_top_p_pytorch(
     if k is not None:
         # Apply top-k.
         top_k_mask = logits_sort.size(1) - k.to(torch.long)  # shape: B
-        # Get all the top_k values.
         top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
         top_k_mask = logits_sort < top_k_mask
         logits_sort.masked_fill_(top_k_mask, -float("inf"))
@@ -71,20 +59,12 @@ def apply_top_k_top_p_pytorch(
 
 
 def apply_top_k_only(logits: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-    """Apply top-k mask to the logits.
-
-    This implementation doesn't involve sorting the entire vocab.
-    Note however that it involves a GPU->CPU sync which can be detrimental for
-    async scheduling performance.
-
-    The logits tensor may be updated in-place.
-    """
+    """Apply top-k mask in place without sorting the vocab; it does a GPU->CPU sync, which can hurt async scheduling."""
     no_top_k_mask = k == logits.shape[1]
     # Set non-top-k rows to 1 so that we can gather.
     k = k.masked_fill(no_top_k_mask, 1)
     max_top_k = k.max()
-    # topk.values tensor has shape [batch_size, max_top_k].
-    # Convert top k to 0-based index in range [0, max_top_k).
+    # topk.values has shape [batch_size, max_top_k]; converts top k to a 0-based index in [0, max_top_k).
     k_index = k.sub_(1).unsqueeze(1)
     top_k_mask = logits.topk(max_top_k, dim=1).values.gather(1, k_index.long())
     # Handle non-topk rows.
@@ -97,13 +77,7 @@ def apply_top_k_top_p_v0_11_2(
     k: torch.Tensor | None,
     p: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Apply top-k and top-p masks to the logits.
-
-    If a top-p is used, this function will sort the logits tensor,
-    which can be slow for large batches.
-
-    The logits tensor may be updated in-place.
-    """
+    """Apply top-k and top-p masks to the logits in place; top-p sorts the vocab, which is slow for large batches."""
     if p is None:
         if k is None:
             return logits
@@ -116,7 +90,6 @@ def apply_top_k_top_p_v0_11_2(
     if k is not None:
         # Apply top-k.
         top_k_mask = logits_sort.size(1) - k.to(torch.long)  # shape: B
-        # Get all the top_k values.
         top_k_mask = logits_sort.gather(1, top_k_mask.unsqueeze(dim=1))
         top_k_mask = logits_sort < top_k_mask
         logits_sort.masked_fill_(top_k_mask, -float("inf"))
