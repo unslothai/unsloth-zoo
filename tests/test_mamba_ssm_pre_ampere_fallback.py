@@ -916,6 +916,7 @@ def test_the_forced_reference_refuses_packed_calls(monkeypatch):
     # it on its own reference path, and the forced reference must keep doing so on every version.
     hk = pytest.importorskip("transformers.integrations.hub_kernels")
     if getattr(hk, "use_kernel_func_from_hub_with_fallback", None) is None:
+        # Skip because transformers < 5.15 has no hub factory to patch (is_fast_path_available gates it there).
         pytest.skip("transformers < 5.15 has no use_kernel_func_from_hub_with_fallback")
     integrations = sys.modules["transformers.integrations"]
     monkeypatch.setattr(hk, "use_kernel_func_from_hub_with_fallback", hk.use_kernel_func_from_hub_with_fallback)
