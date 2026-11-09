@@ -279,7 +279,14 @@ def test_unrelated_settings_update_keeps_counting_against_the_cap(monkeypatch, g
     assert fake.held() <= 10 * MIB
 
 
-def test_settings_replaced_before_the_first_read_still_see_the_environment(monkeypatch, gc_module, allocator):
+@pytest.mark.parametrize("env", [
+    {"PYTORCH_ALLOC_CONF": "pinned_max_round_threshold_mb:1"},
+    # torch parses the legacy variable first, so a unified one unsloth_zoo adds later does not hide it.
+    {"PYTORCH_CUDA_ALLOC_CONF": "pinned_max_round_threshold_mb:1", "PYTORCH_ALLOC_CONF": "expandable_segments:True"},
+])
+def test_settings_replaced_before_the_first_read_still_see_the_environment(monkeypatch, gc_module, allocator, env):
     allocator("max_split_size_mb:128", cap_bytes = 10 * MIB)
-    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "pinned_max_round_threshold_mb:1")
+    for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+        monkeypatch.delenv(var, raising = False)
+    for var, value in env.items(): monkeypatch.setenv(var, value)
     assert gc_module._host_alloc_policy() == (MIB, float("inf"))
