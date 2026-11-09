@@ -49,6 +49,9 @@ def _deserializer(monkeypatch, recorded):
     _require_v5_moe_quantization()
     M = pytest.importorskip("unsloth_zoo.temporary_patches.moe_utils_bnb4bit")
     import transformers.quantizers.quantizers_utils as qutils
+    # Import before patching: this module binds get_module_from_name at import time, and
+    # a first import under the fake below would keep it for every later real load.
+    import transformers.integrations.bitsandbytes  # noqa: F401
 
     class _FakeParams4bit:
         @classmethod
