@@ -67,8 +67,6 @@ from .peft_utils import get_lora_layer_modules
 from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
     MHC_SINKHORN_SOURCE,
     MHC_SINKHORN_REPLACEMENT,
-    MHC_PROJECTION_SOURCE,
-    MHC_PROJECTION_REPLACEMENT,
     MHC_PROJECTION_REWRITES,
     mhc_fast_mode,
 )

@@ -55,6 +55,7 @@ def _mixer(model_type, cls_name, config_type):
     modeling = _modeling(model_type)
     cls = getattr(modeling, cls_name, None)
     if cls is None:
+        # Skip because this transformers predates the mixer class (capability check, not a layout check).
         pytest.skip(f"transformers has no {cls_name}")
     config = transformers.AutoConfig.for_model(config_type, hidden_size = 64, hc_mult = 4, hc_sinkhorn_iters = 20)
     torch.manual_seed(0)
@@ -92,6 +93,7 @@ def test_registry_rewrite_applies_and_keeps_the_sinkhorn_rewrite(model_type, cls
     if cls_name not in MODULE_FORWARD_EAGER_REWRITES.get(model_type, {}):
         pytest.fail(f"{cls_name} missing from MODULE_FORWARD_EAGER_REWRITES")
     if getattr(modeling, cls_name, None) is None:
+        # Skip because this transformers predates the mixer class (capability check, not a layout check).
         pytest.skip(f"transformers has no {cls_name}")
     # A transformers layout no rewrite matches must fail here, not skip.
     source = module_forward_eager_rewrites(modeling, model_type).get(cls_name)
