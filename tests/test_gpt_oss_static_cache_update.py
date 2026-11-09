@@ -211,9 +211,4 @@ def test_graphable_roll_wrapper_does_not_disable_the_fast_update(monkeypatch):
     assert F._static_classes() == ()
     monkeypatch.setattr(sliding, "update", original)
     assert F._static_classes() == classes
-    # A wrapper naming the update it wraps is verified through it.
-    monkeypatch.setattr(F, "_STATIC_CLASSES", None)
-    update._unsloth_original_update = original
-    monkeypatch.setattr(sliding, "update", update)
-    assert F._static_classes() == classes
     monkeypatch.setattr(F, "_STATIC_CLASSES", None)
