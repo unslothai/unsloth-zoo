@@ -544,7 +544,6 @@ def fetch_remote_media_to_file(url: str, timeout: int = 30) -> str:
         except OSError: pass
         raise
     return handle.name
-    raise ValueError(f"Unsloth: Too many redirects while fetching `{url}`")
 
 
 def round_by_factor(number: int, factor: int) -> int:

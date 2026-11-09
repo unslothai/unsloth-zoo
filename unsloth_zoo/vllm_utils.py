@@ -103,7 +103,6 @@ class HideLoggingMessage(logging.Filter):
 pass
 
 def _return_nothing(*args, **kwargs): return None
-def _return_self(self, *args, **kwargs): return self
 def _return_self_tokenizer(self, *args, **kwargs): return self.tokenizer
 
 def _current_device_index():
