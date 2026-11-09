@@ -533,3 +533,20 @@ def test_flex_graph_contract_keeps_its_shape_on_a_rolling_window(G, monkeypatch)
                 dst.copy_(src)
             new.mask_mod = static
             assert torch.equal(_visible_through_blocks(new, window), expected(q)), q
+
+
+def test_graph_decode_attention_default_follows_compute_capability(G, monkeypatch):
+    monkeypatch.delenv("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", raising = False)
+    for major, expected in ((7, "dense"), (8, "auto"), (9, "auto"), (12, "auto")):
+        monkeypatch.setattr(G, "_GRAPH_DECODE_DEFAULT", {})
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None, m = major: (m, 0))
+        assert G._gpt_oss_graph_decode_attention() == expected
+        # An explicit setting always wins.
+        monkeypatch.setenv("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "dense")
+        assert G._gpt_oss_graph_decode_attention() == "dense"
+        monkeypatch.delenv("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(G, "_GRAPH_DECODE_DEFAULT", {})
+    assert G._gpt_oss_graph_decode_attention() == "dense"

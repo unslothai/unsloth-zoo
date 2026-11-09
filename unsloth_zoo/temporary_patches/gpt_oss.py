@@ -150,12 +150,34 @@ def _gpt_oss_mask_device(input_embeds, args, kwargs):
     return input_embeds.device
 
 
+_GRAPH_DECODE_DEFAULT = {}
+
+
+def _gpt_oss_default_graph_decode_attention():
+    """"auto" on compute capability 8.0 and newer, where graphed flex_decoding measured as fast as the dense
+    one-token attention or faster (A100: 1.02x at 1k context, 1.23x at 16k); "dense" on older GPUs (T4), where it
+    was slower at batch 4 and 8."""
+    if not torch.cuda.is_available():
+        return "dense"
+    device = torch.cuda.current_device()
+    mode = _GRAPH_DECODE_DEFAULT.get(device)
+    if mode is None:
+        try:
+            major = torch.cuda.get_device_capability(device)[0]
+        except Exception:
+            major = 0
+        mode = _GRAPH_DECODE_DEFAULT[device] = "auto" if major >= 8 else "dense"
+    return mode
+
+
 def _gpt_oss_graph_decode_attention():
     """One-token attention inside a generate() call Unsloth decodes through CUDA graphs:
-    "dense" (default) runs the sink attention over a dense mask, "flex" keeps flex_decoding on a BlockMask
-    whose tensors the graph refills, "auto" flex with the dense fallback (UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION, read
-    per call)."""
-    mode = os.environ.get("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "dense").strip().lower()
+    "dense" runs the sink attention over a dense mask, "flex" keeps flex_decoding on a BlockMask whose tensors the
+    graph refills, "auto" flex with the dense fallback (UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION, read per call;
+    unset: _gpt_oss_default_graph_decode_attention)."""
+    mode = os.environ.get("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "").strip().lower()
+    if not mode:
+        return _gpt_oss_default_graph_decode_attention()
     # "auto": flex where the mask publishes a graph contract, the dense mask otherwise (a custom mask function).
     return mode if mode in ("flex", "auto") else "dense"
 
