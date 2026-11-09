@@ -144,42 +144,82 @@ def test_real_torch_skipped_frame_latches_to_eager():
         compiled(x)
 
 
-def test_skipped_frame_inside_a_checkpoint_ends_the_step():
-    """Non-reentrant checkpoint: torch ran the body (and its pack hooks) before raising, so an eager rerun in the same
-    forward would pack twice. The step ends instead (the label latched), and the retried step runs eager with a
-    backward that matches the plain eager gradient."""
+def _skipping_compile(kernel):
     import torch._dynamo.exc as dynamo_exc
-    from torch.utils.checkpoint import checkpoint
 
-    if U._in_non_reentrant_checkpoint() is None or not hasattr(dynamo_exc, "SkipFrame"):
-        pytest.skip("this torch cannot report checkpoint regions")
+    if not hasattr(dynamo_exc, "SkipFrame"):
+        pytest.skip("torch has no SkipFrame")
 
     def skipping_backend(gm, example_inputs):
         raise dynamo_exc.SkipFrame("test skip")
 
-    def kernel(x):
-        return x.sin() * x
-
-    compiled = torch.compile(kernel, backend = skipping_backend, fullgraph = True)
-    wrapped = U._fall_back_to_eager_on_recompile_limit(compiled, kernel, "test-ckpt-skip")
+    probe = torch.compile(lambda x: x - 1, backend = skipping_backend, fullgraph = True)
     try:
-        compiled(torch.ones(2))
+        probe(torch.ones(2))
     except RuntimeError as e:
         if not U._is_no_compiled_frames_error(e):
             raise
     else:
         pytest.skip("this torch runs a skipped fullgraph frame eagerly without raising")
-    torch._dynamo.reset()
-    compiled = torch.compile(kernel, backend = skipping_backend, fullgraph = True)
-    wrapped = U._fall_back_to_eager_on_recompile_limit(compiled, kernel, "test-ckpt-skip")
+    return torch.compile(kernel, backend = skipping_backend, fullgraph = True)
 
+
+def test_a_skipped_frame_runs_its_body_once():
+    """The skipped body already ran when torch would raise: its result is kept, never rerun, so a stateful forward
+    (BatchNorm running stats, a counter) is applied once per call."""
+    calls = []
+
+    def kernel(x):
+        calls.append(1)
+        return x * 3
+
+    wrapped = U._fall_back_to_eager_on_recompile_limit(_skipping_compile(kernel), kernel, "test-once")
+    x = torch.ones(2)
+    assert torch.equal(wrapped(x), x * 3) and len(calls) == 1
+    assert torch.equal(wrapped(x), x * 3) and len(calls) == 2
+    assert "test-once" in U._LATCHED_EAGER_LABELS
+
+    bn = torch.nn.BatchNorm1d(4).train()
+    stateful = U._fall_back_to_eager_on_recompile_limit(_skipping_compile(bn.forward), bn.forward, "test-bn")
+    stateful(torch.randn(8, 4))
+    assert int(bn.num_batches_tracked) == 1
+
+
+def test_skipped_frame_inside_a_checkpoint_backpropagates():
+    """Non-reentrant checkpoint: the skipped body ran eagerly under the pack hooks, its result is kept, and the
+    latched eager recompute packs the same tensors, so the first step's backward matches plain eager."""
+    from torch.utils.checkpoint import checkpoint
+
+    if U._in_non_reentrant_checkpoint() is None:
+        pytest.skip("this torch cannot report checkpoint regions")
+
+    def kernel(x):
+        return x.sin() * x
+
+    wrapped = U._fall_back_to_eager_on_recompile_limit(_skipping_compile(kernel), kernel, "test-ckpt-skip")
     x = torch.linspace(-1, 1, 5, requires_grad = True)
-    with pytest.raises(RuntimeError, match = "found no compiled frames"):
-        checkpoint(wrapped, x, use_reentrant = False).sum().backward()
-    assert "test-ckpt-skip" in U._LATCHED_EAGER_LABELS
-    assert U._RAISED_INSIDE_CHECKPOINT
-    x.grad = None
     checkpoint(wrapped, x, use_reentrant = False).sum().backward()
+    assert "test-ckpt-skip" in U._LATCHED_EAGER_LABELS
+    assert not U._RAISED_INSIDE_CHECKPOINT
     ref = torch.linspace(-1, 1, 5, requires_grad = True)
     kernel(ref).sum().backward()
     assert torch.allclose(x.grad, ref.grad)
+
+
+def test_skip_after_a_compiled_pack_in_the_step_ends_it(monkeypatch):
+    """A region that already packed compiled in this checkpointed step and is then skipped (a new shape) must end the
+    step: its compiled pack would be recomputed eagerly."""
+    from torch.utils.checkpoint import checkpoint
+
+    if U._in_non_reentrant_checkpoint() is None:
+        pytest.skip("this torch cannot report checkpoint regions")
+
+    def kernel(x):
+        return x.sin() * x
+
+    wrapped = U._fall_back_to_eager_on_recompile_limit(_skipping_compile(kernel), kernel, "test-ckpt-packed")
+    U._COMPILED_OK_LABELS.add("test-ckpt-packed")
+    x = torch.linspace(-1, 1, 5, requires_grad = True)
+    with pytest.raises(RuntimeError, match = "ending the step"):
+        checkpoint(wrapped, x, use_reentrant = False)
+    assert U._RAISED_INSIDE_CHECKPOINT and "test-ckpt-packed" in U._LATCHED_EAGER_LABELS
