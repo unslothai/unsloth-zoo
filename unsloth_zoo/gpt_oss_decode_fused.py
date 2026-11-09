@@ -281,14 +281,24 @@ def _static_classes():
     """(Cache, StaticLayer, StaticSlidingWindowLayer) when their update methods are the verified ones, else ()."""
     global _STATIC_CLASSES
     if _STATIC_CLASSES is None:
-        _STATIC_CLASSES = ()
         try:
             from transformers import cache_utils
             classes = (cache_utils.Cache, cache_utils.StaticLayer, cache_utils.StaticSlidingWindowLayer)
-            if all(_source_digest(c.update) in _VERIFIED_UPDATE[c.__name__] for c in classes):
-                _STATIC_CLASSES = classes
+            updates = []
+            for c in classes:
+                update = c.update
+                if getattr(update, "_unsloth_graphable_roll", False):
+                    # Unsloth's CUDA-graph decode swaps in a graph-safe roll during warm-up and capture: verify the
+                    # update it wraps, or decide on a later call once the original is back (never cache a verdict
+                    # on the temporary wrapper).
+                    update = getattr(update, "_unsloth_original_update", None)
+                    if update is None:
+                        return ()
+                updates.append(update)
+            verified = all(_source_digest(u) in _VERIFIED_UPDATE[c.__name__] for c, u in zip(classes, updates))
+            _STATIC_CLASSES = classes if verified else ()
         except Exception:
-            pass
+            _STATIC_CLASSES = ()
     return _STATIC_CLASSES
 
 

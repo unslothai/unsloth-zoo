@@ -130,6 +130,26 @@ def _gpt_oss_flex_inference(device):
     )
 
 
+def _gpt_oss_mask_device(input_embeds, args, kwargs):
+    """The device masks are built for. transformers 4.x generate passes a CPU torch.empty placeholder as input_embeds
+    (shape only), so a CPU embed defers to the positions, the 2D mask or the cache."""
+    if input_embeds.device.type != "cpu":
+        return input_embeds.device
+    for name in ("cache_position", "position_ids", "attention_mask"):
+        x = kwargs.get(name, None)
+        if isinstance(x, torch.Tensor) and x.device.type != "cpu":
+            return x.device
+    for x in args:
+        if isinstance(x, torch.Tensor) and x.device.type != "cpu":
+            return x.device
+    cache = kwargs.get("past_key_values", None)
+    for layer in getattr(cache, "layers", None) or ():
+        keys = getattr(layer, "keys", None)
+        if isinstance(keys, torch.Tensor) and keys.device.type not in ("cpu", "meta"):
+            return keys.device
+    return input_embeds.device
+
+
 def _gpt_oss_graph_decode_attention():
     """One-token attention inside a generate() call Unsloth decodes through CUDA graphs:
     "dense" (default) runs the sink attention over a dense mask, "flex" keeps flex_decoding on a BlockMask
@@ -308,14 +328,15 @@ def _gpt_oss_flex_mask(
     q_off, kv_off = offset(q_offset), offset(kv_offset)
     padding = None
     if attention_mask is not None and attention_mask.dim() == 2:
-        padding = attention_mask.to(dtype = torch.bool)
-        # Slots past the 2D mask (unwritten static cache slots) stay invisible. transformers passes an int kv_offset;
-        # a tensor one is not read on the host (a sync, and inside a capture an error): kv_offset is at most the
-        # mask's width, so kv_length more columns always cover it.
-        missing = int(kv_length) + (int(kv_off) if not isinstance(kv_off, torch.Tensor) else padding.shape[-1]) \
-            - padding.shape[-1]
-        if missing > 0:
-            padding = torch.nn.functional.pad(padding, (0, missing))
+        # One column per KV slot (slot j holds position kv_offset + j): a fixed [B, kv_length] whatever the offset,
+        # so a rolling sliding window (offset + 1 per step) keeps the shape a decode graph keys on. Positions past
+        # the 2D mask (unwritten static slots) stay invisible; a tensor offset is never read on the host.
+        full = attention_mask.to(dtype = torch.bool)
+        width = full.shape[-1]
+        position = torch.arange(int(kv_length), device = full.device) + (
+            kv_off.to(full.device) if isinstance(kv_off, torch.Tensor) else kv_off
+        )
+        padding = full[:, position.clamp(max = width - 1)] & (position < width)
     q_length, kv_length = int(q_length), int(kv_length)
     # Per-row blocks even without padding: packed documents make mask_function row dependent.
     bsz = batch_size
@@ -323,8 +344,7 @@ def _gpt_oss_flex_mask(
     def make_mask_mod(q_o, kv_o, pad = None):
         if pad is not None:
             def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
-                kv_pos = kv_idx + kv_o
-                return mask_function(batch_idx, head_idx, q_idx + q_o, kv_pos) & pad[batch_idx, kv_pos]
+                return mask_function(batch_idx, head_idx, q_idx + q_o, kv_idx + kv_o) & pad[batch_idx, kv_idx]
         else:
             def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
                 return mask_function(batch_idx, head_idx, q_idx + q_o, kv_idx + kv_o)
@@ -3793,7 +3813,7 @@ def patch_GptOssModel():
                 if (
                     getattr(_config, "model_type", None) == "gpt_oss"
                     and input_embeds is not None
-                    and _gpt_oss_flex_inference(input_embeds.device)
+                    and _gpt_oss_flex_inference(_gpt_oss_mask_device(input_embeds, args, kwargs))
                     and _register_gpt_oss_flex_mask()
                 ):
                     # CUDA-graph decode steps take dense masks (_gpt_oss_dense_graph_decode).

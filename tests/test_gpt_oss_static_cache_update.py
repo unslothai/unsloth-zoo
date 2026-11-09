@@ -191,3 +191,29 @@ def test_static_cache_generation_is_bit_identical(tmp_path):
     assert on["calls"] >= 19 * 2 + 18 * 2, on["calls"]
     assert on["tokens"] == off["tokens"]
     assert on["scores"] == off["scores"]
+
+
+def test_graphable_roll_wrapper_does_not_disable_the_fast_update(monkeypatch):
+    # Unsloth's CUDA-graph decode replaces StaticSlidingWindowLayer.update with a tagged graph-safe roll during its
+    # warm-up, which can be the first one-token step: the check must not cache a refusal from that wrapper.
+    sliding = cache_utils.StaticSlidingWindowLayer
+    classes = (cache_utils.Cache, cache_utils.StaticLayer, sliding)
+    for c in classes:  # verify whatever transformers this is
+        monkeypatch.setitem(F._VERIFIED_UPDATE, c.__name__, (F._source_digest(c.update),))
+    original = sliding.update
+
+    def update(self, *args, **kwargs):
+        return original(self, *args, **kwargs)
+    update._unsloth_graphable_roll = True
+
+    monkeypatch.setattr(F, "_STATIC_CLASSES", None)
+    monkeypatch.setattr(sliding, "update", update)
+    assert F._static_classes() == ()
+    monkeypatch.setattr(sliding, "update", original)
+    assert F._static_classes() == classes
+    # A wrapper naming the update it wraps is verified through it.
+    monkeypatch.setattr(F, "_STATIC_CLASSES", None)
+    update._unsloth_original_update = original
+    monkeypatch.setattr(sliding, "update", update)
+    assert F._static_classes() == classes
+    monkeypatch.setattr(F, "_STATIC_CLASSES", None)

@@ -489,3 +489,47 @@ def test_auto_graph_decode_falls_back_to_the_dense_mask(G, monkeypatch):
         assert not G._gpt_oss_graph_dense_attention(one)
         monkeypatch.setenv("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "dense")
         assert G._gpt_oss_graph_dense_attention(one) and G._gpt_oss_dense_graph_decode(one)
+
+
+def test_flex_graph_contract_keeps_its_shape_on_a_rolling_window(G, monkeypatch):
+    # A rolling sliding layer reports kv_length = the window and kv_offset growing by one per step while the 2D mask
+    # grows too: the closure tensors (part of the graph key, refilled per replay) must keep one shape, and the
+    # refilled mask must see slot j as position kv_offset + j under causal + window + padding.
+    from torch.nn.attention.flex_attention import create_block_mask
+    from transformers.masking_utils import sliding_window_causal_mask_function
+    import unsloth_zoo.flex_attention.utils as U
+    monkeypatch.setattr(U, "compiled_create_block_mask",
+                        lambda m, b, h, M, N, device = "cpu": create_block_mask(m, b, h, M, N, device = device),
+                        raising = False)
+    monkeypatch.setenv("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "flex")
+    window = 128
+    fn = sliding_window_causal_mask_function(window)
+
+    def mask_at(q):
+        padding = torch.ones(2, q + 1, dtype = torch.long)
+        padding[1, :4] = 0
+        return G._gpt_oss_flex_mask(
+            batch_size = 2, q_length = 1, kv_length = window, q_offset = torch.tensor(q), kv_offset = q - window + 1,
+            mask_function = fn, attention_mask = padding, device = "cpu",
+        )
+
+    def expected(q):
+        position = torch.arange(window) + q - window + 1
+        keep = (position <= q) & (position > q - window)
+        pad = torch.ones(2, window, dtype = torch.bool)
+        pad[1] = position >= 4
+        return keep & pad
+
+    with S.graph_generate():
+        first = mask_at(130)
+        tensors, rebuild = first._unsloth_graph_closure
+        closure = tuple(t.clone() for t in tensors)
+        static = rebuild(closure)
+        shapes = [tuple(t.shape) for t in tensors]
+        for q in (130, 131, 132, 200):
+            new = mask_at(q)
+            assert [tuple(t.shape) for t in new._unsloth_graph_closure[0]] == shapes, q
+            for dst, src in zip(closure, new._unsloth_graph_closure[0]):
+                dst.copy_(src)
+            new.mask_mod = static
+            assert torch.equal(_visible_through_blocks(new, window), expected(q)), q
