@@ -717,6 +717,36 @@ def test_an_inline_data_playlist_never_reaches_the_decoder(monkeypatch, no_netwo
 
 
 @pytest.mark.parametrize(
+    "header",
+    [
+        "data:application/vnd.apple.mpegurl;base64;ignored=value",
+        "data:video/mp4;BASE64;charset=utf-8",
+        "data:video/mp4;charset=utf-8;base64;x=y",
+        # FFmpeg compares with av_strncasecmp over the parameter's own length, so a prefix
+        # of "base64", even an empty parameter, also selects base64.
+        "data:video/mp4;bas;x=y",
+        "data:video/mp4;;x=y",
+    ],
+)
+def test_base64_anywhere_in_the_data_uri_parameters_is_decoded(monkeypatch, no_network, header):
+    import base64
+
+    # 52 bytes: padded base64, which FFmpeg needs to stop cleanly before the ".m3u8" suffix.
+    body = b"#EXTM3U\n#EXTINF:2.0,\nfile://attacker/share/seg0.ts\n\n"
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError, match = "playlist"):
+        vision_utils.fetch_video({"video": header + "," + base64.b64encode(body).decode() + ".m3u8"})
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["data:video/mp4;charset=base64x", "data:video/mp4;", "data:video/base64"],
+)
+def test_parameters_ffmpeg_does_not_read_as_base64_stay_percent_decoded(header):
+    assert vision_utils._data_uri_head(header + ",%23EXTM3U%0A").startswith(b"#EXTM3U")
+
+
+@pytest.mark.parametrize(
     "path",
     [
         "\\\\wsl$\\Ubuntu\\home\\u\\clip.mp4",

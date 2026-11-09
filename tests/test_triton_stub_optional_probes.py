@@ -44,9 +44,11 @@ _INJECT = textwrap.dedent(f'''
 
 
 def _run(body):
+    # A host without Triton has no GPU either: on sm90+ the stub would answer Dynamo's TMA probe.
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": ""}
     return subprocess.run(
         [sys.executable, "-c", _INJECT + textwrap.dedent(body)],
-        capture_output = True, text = True, timeout = 600,
+        capture_output = True, text = True, timeout = 600, env = env,
     )
 
 
@@ -74,6 +76,7 @@ def test_absent_modules_raise_import_error(stmt):
 def test_dynamo_and_inductor_import_under_the_stub():
     proc = _run('''
         import torch
+        assert not torch.cuda.is_available()
         import torch._inductor.config
         import torch._dynamo
         assert getattr(torch._inductor.config.triton, "tlx_mode", None) is None
