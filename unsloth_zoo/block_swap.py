@@ -77,12 +77,22 @@ def _local_world_size():
         return 1
 
 
+def _host_memory():
+    """``memory_budget.host_memory_bytes``; plain psutil when this file is loaded on its own."""
+    try:
+        from unsloth_zoo.memory_budget import host_memory_bytes
+    except Exception:
+        import psutil
+        vm = psutil.virtual_memory()
+        return vm.total, vm.available
+    return host_memory_bytes()
+
+
 def _pin_budget():
     # Each local rank sees the same free RAM, so it may only claim its share.
     try:
-        import psutil
-        vm = psutil.virtual_memory()
-        spare = vm.available - max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
+        total, available = _host_memory()
+        spare = available - max(_PIN_RESERVE_MIN_BYTES, int(total * _PIN_RESERVE_FRACTION))
         return spare // _local_world_size()
     except Exception:
         return 0
@@ -147,9 +157,10 @@ def _autograd_keeps_weights():
 
 
 def _swappable(module):
+    kept = {id(p) for m in module.modules() if getattr(m, "_unsloth_host_kept", False) for p in m.parameters()}
     out = []
     for name, p in module.named_parameters(recurse = True):
-        if p.requires_grad or "lora_" in name:
+        if p.requires_grad or "lora_" in name or id(p) in kept:
             continue
         out.append((name, p))
     return out
@@ -695,7 +706,19 @@ def auto_swap_indices(layers, reserve_bytes, prefetch_depth = 2, free_bytes = No
     return sorted(chosen), left
 
 
+def _mark_host_kept(model):
+    names = getattr(model, "_no_placement_params", None)
+    if not names or os.environ.get("UNSLOTH_PLACE_NO_PLACEMENT_PARAMS", "0") == "1":
+        return
+    params = list(model.named_parameters(remove_duplicate = False))
+    # Whole owner module (FP8Embedding's weight_scale sits beside the table), tagged on the module
+    # because a load to host replaces the Parameter.
+    for owner in {n.rsplit(".", 1)[0] for n, _ in params if any(n == x or n.endswith("." + x) for x in names)}:
+        model.get_submodule(owner)._unsloth_host_kept = True
+
+
 def find_decoder_layers(model):
+    _mark_host_kept(model)
     m = model
     for _ in range(6):
         for attr in ("model", "base_model", "transformer", "language_model"):

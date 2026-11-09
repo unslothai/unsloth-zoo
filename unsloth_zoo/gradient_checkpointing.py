@@ -324,25 +324,25 @@ def _compute_pinned_cap(held = None):
         try: return max(0, int(float(env) * (1 << 30)))
         except ValueError: pass
     try:
-        import psutil
         from .block_swap import _PIN_RESERVE_MIN_BYTES, _PIN_RESERVE_FRACTION, _local_world_size
-        vm = psutil.virtual_memory()
+        from .memory_budget import host_memory_bytes
+        total, available = host_memory_bytes()
     except Exception:
         return -1  # unmeasurable: keep the old uncapped behaviour
     if _local_world_size() == 1: return _PIN_PER_BLOCK
-    reserve = max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
+    reserve = max(_PIN_RESERVE_MIN_BYTES, int(total * _PIN_RESERVE_FRACTION))
     # Free RAM already excludes pinned bytes, so add back what is held (ours, or all in counted mode).
-    return max(0, vm.available - reserve) // _local_world_size() + (GC_PINNED_BYTES if held is None else held)
+    return max(0, available - reserve) // _local_world_size() + (GC_PINNED_BYTES if held is None else held)
 
 
 def _block_fits_host_ram(block):
     """One local rank: pin unless the block would leave under min(1 GiB, 10% of RAM) available."""
     try:
-        import psutil
-        vm = psutil.virtual_memory()
+        from .memory_budget import host_memory_bytes
+        total, available = host_memory_bytes()
     except Exception:
         return True
-    return block + min(_PIN_HEADROOM_BYTES, vm.total // 10) <= vm.available
+    return block + min(_PIN_HEADROOM_BYTES, total // 10) <= available
 
 
 def _synchronize_used_devices():

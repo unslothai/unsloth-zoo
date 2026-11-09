@@ -3499,9 +3499,15 @@ def _install_qwen3_family_compile_patches():
         split_indices = _split_points(cu_seqlens)
         splits = [mx.split(tensor, split_indices, axis=2) for tensor in (q, k, v)]
 
+        from .utils import fused_vision_attention
+
         attn_outputs = []
         for q_chunk, k_chunk, v_chunk in zip(*splits):
-            # MLX fused SDPA mismatches value_and_grad for Qwen3-VL vision; use explicit.
+            out = fused_vision_attention(q_chunk, k_chunk, v_chunk, scale=self.scale)
+            if out is not None:
+                attn_outputs.append(out)
+                continue
+            # Not routed (8 or fewer patches, an fp32 tower, another head dim, off the GPU, or the kill switch): fp32 scores.
             scores = (
                 q_chunk.astype(mx.float32)
                 @ mx.swapaxes(k_chunk.astype(mx.float32), -1, -2)
@@ -6079,11 +6085,12 @@ def _install_gemma4_compile_patches():
         text_model_cls, "_apply_blockwise_bidirectional_overlay"
     ):
         return
-    from .utils import _SharedKVSlot
+    from .utils import _PADDING_FREE_LAYOUT, _SharedKVSlot
 
     def patched_make_masks(self, h, cache, mm_token_type_ids=None):
         masks = original_make_masks(self, h, cache, None)
-        n = h.shape[1]
+        layout = _PADDING_FREE_LAYOUT.get()  # a flat stream's mixers still attend over padded rows
+        n = h.shape[1] if layout is None else layout.span
         if (
             getattr(self.config, "use_bidirectional_attention", None) != "vision"
             or mm_token_type_ids is None

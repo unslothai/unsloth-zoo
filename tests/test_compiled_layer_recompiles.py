@@ -77,10 +77,9 @@ def test_weighted_unpermute_is_resolved_at_import():
     assert moe_utils._WEIGHTED_UNPERMUTE is not None
 
 
-output_capturing = pytest.importorskip("transformers.utils.output_capturing")
-
-
 def _collector():
+    # Skip here, not at module level: transformers 4.x lacks output_capturing, and the tests above still apply there.
+    output_capturing = pytest.importorskip("transformers.utils.output_capturing")
     from unsloth_zoo.temporary_patches.misc import patch_output_collector_for_compiled_submodules
     patch_output_collector_for_compiled_submodules()
     return output_capturing._active_collector
