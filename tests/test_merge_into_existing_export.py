@@ -774,3 +774,20 @@ def test_failed_local_refresh_restores_the_previous_tokenizer_model(tmp_path, mo
     assert after["tokenizer.model"] == b"previous tokenizer"
     assert sorted(after) == sorted(before)
     assert [f for f in before if after[f] != before[f]] == []
+
+
+def test_backups_leave_room_for_splitting_the_largest_shard(tmp_path, monkeypatch):
+    # Splitting writes a shard's pieces beside it; with the old shards kept those bytes are not freed.
+    from unsloth_zoo import saving_utils as S
+
+    for name in ("a.safetensors", "b.safetensors"):
+        (tmp_path / name).write_bytes(b"x" * 1000)
+    new_sizes = {"a.safetensors" : 1000, "b.safetensors" : 3000}
+    free = S._REFRESH_DISK_MARGIN + sum(new_sizes.values()) + 1000
+    disk = S.shutil.disk_usage(tmp_path)
+    monkeypatch.setattr(S.shutil, "disk_usage", lambda _: type(disk)(disk.total, disk.total - free, free))
+    files = sorted(new_sizes)
+    kept = S._keep_previous_export_shards(files, str(tmp_path), new_sizes)
+    assert len(kept["shards"]) == 2
+    S._drop_previous_export_shards(kept)
+    assert S._keep_previous_export_shards(files, str(tmp_path), new_sizes, scratch = max(new_sizes.values())) == {}

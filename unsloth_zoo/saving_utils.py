@@ -4331,7 +4331,7 @@ def _export_shard_entries(save_directory):
 pass
 
 
-def _keep_previous_export_shards(filenames, save_directory, new_sizes, metadata = {"files" : {}, "shards" : None}):
+def _keep_previous_export_shards(filenames, save_directory, new_sizes, metadata = {"files" : {}, "shards" : None}, scratch = 0):
     """Hard-link each previous export shard aside so a failed refresh can put it back.
 
     Every writer stages the new shard and renames it over the old entry, so the link keeps
@@ -4340,11 +4340,12 @@ def _keep_previous_export_shards(filenames, save_directory, new_sizes, metadata 
     would still leave a mixed export. The links go in a private directory under numbered
     names, so no shard name can collide with a backup. `metadata` is the snapshot taken
     before the refresh rewrote it, restored with the shards; None (unreadable) keeps nothing.
+    `scratch` is extra space the refresh needs on top (the split pieces of the largest shard).
     """
     if metadata is None:
         return {}
     try:
-        if shutil.disk_usage(save_directory).free < sum(new_sizes.values()) + _REFRESH_DISK_MARGIN:
+        if shutil.disk_usage(save_directory).free < sum(new_sizes.values()) + scratch + _REFRESH_DISK_MARGIN:
             return {}
         backup_dir = tempfile.mkdtemp(prefix = _PREVIOUS_EXPORT_PREFIX, dir = save_directory)
     except OSError:
@@ -5740,6 +5741,8 @@ def merge_and_overwrite_lora(
     # some shards on the base weights and the rest still merged, when the disk can hold both.
     _previous_export = _keep_previous_export_shards(
         sorted(_stale_shards), save_directory, _new_sizes, _previous_metadata,
+        # Splitting writes a shard's pieces beside it before removing it.
+        scratch = max(_new_sizes.values(), default = 0) if needs_splitting else 0,
     ) if _stale_shards and not low_disk_space_usage else {}
     try:
         # Step 4 : Handle retrieval of original 16-bit shards and tokenizer.model file if exists
