@@ -6510,7 +6510,7 @@ class _MergedRolloutState(_MergedRolloutVerdict):
         self.folded = frozenset()  # module names folded; their LoRA tensors never go to vLLM
         self.rest = False        # other LoRA layers exist and are served by vLLM LoRA (attention mode)
         self.exact_targets = None  # exact mode (P is None): the folded targets until the unfold
-        self.fixup = None        # exact mode: {"bad", "elements"} of the last fold
+        self.fixup = None        # exact mode: {"bad", "elements", "store_bytes"} of the last fold
         self.depth = 0
         self.poisoned = None     # set when the restore failed twice
         self.model_ref = weakref.ref(model)
@@ -6665,12 +6665,21 @@ def _lora_is_sharded(model):
         from torch.distributed.tensor import DTensor
     except Exception:
         return False
-    # First adapter decides; avoids walking every parameter on each load_lora.
-    sharded = False
-    for n, p in model.named_parameters():
-        if ".lora_A." in n or ".lora_B." in n:
-            sharded = isinstance(p, DTensor)
-            break
+    # Any adapter decides: one left out of FSDP2 (ignored_params) stays a plain tensor beside sharded ones.
+    # The adapter slots are found once (FSDP2 puts the DTensor in the same slot), so an unsharded DDP
+    # run does not walk every parameter on each load_lora.
+    if not isinstance(model, torch.nn.Module):
+        return any(isinstance(p, DTensor) for n, p in model.named_parameters() if ".lora_A." in n or ".lora_B." in n)
+    slots = model.__dict__.get("_unsloth_lora_slots")
+    if slots is None:
+        slots = []
+        for n, _ in model.named_parameters():
+            if ".lora_A." in n or ".lora_B." in n:
+                owner, _, key = n.rpartition(".")
+                slots.append((model.get_submodule(owner), key))
+        if slots:  # no adapters yet: look again next call
+            model.__dict__["_unsloth_lora_slots"] = slots
+    sharded = any(isinstance(owner._parameters.get(key), DTensor) for owner, key in slots)
     if sharded: model.__dict__["_unsloth_lora_is_sharded"] = True
     return sharded
 pass
@@ -7013,8 +7022,9 @@ def _merged_rollout_exact_fold(state, adapter):
     state.exact_targets = targets
     state.fixup = exact_fold(targets, stream = state.stream)
     _merged_rollout_log_once(
-        f"Unsloth: exact merged rollout keeps {state.fixup['bad']:,} of {state.fixup['elements']:,} weights "
-        f"({100 * state.fixup['bad'] / max(state.fixup['elements'], 1):.2f}%) for the restore."
+        f"Unsloth: exact merged rollout restores {state.fixup['bad']:,} of {state.fixup['elements']:,} weights "
+        f"({100 * state.fixup['bad'] / max(state.fixup['elements'], 1):.2f}%) from a "
+        f"{state.fixup.get('store_bytes', 0) / 2**20:.1f} MB host store."
     )
 pass
 

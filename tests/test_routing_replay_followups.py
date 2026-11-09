@@ -307,3 +307,16 @@ def test_evicting_a_pending_forward_warns(replay, monkeypatch):
     monkeypatch.setattr(rr, "_MAX_PENDING", 4)
     with pytest.warns(UserWarning, match = "checkpointed forwards without a backward"):
         _many_forwards_grad(5, checkpointing = True)
+
+
+def test_host_metadata_stays_on_cpu_under_a_default_device():
+    # The address / identity tensors are read back with tolist(): a default device must not move them.
+    a, b = torch.zeros(3), torch.zeros(2)
+    with torch.device("meta"):
+        addresses = rr._input_addresses([a, b, torch.empty(0, device = "cpu")])
+        mask = rr._identity_mask(addresses, [addresses, rr._input_addresses([b])])
+        fakes = (rr._layer_inputs_fake([a, b]), rr._identity_mask_fake(addresses, [addresses]))
+    assert addresses.device.type == "cpu"
+    assert sorted(addresses.tolist()) == sorted([0, a.data_ptr(), b.data_ptr()])
+    assert mask.device.type == "cpu" and mask.tolist() == [True, False]
+    assert all(t.device.type == "cpu" for t in fakes)
