@@ -515,9 +515,10 @@ def unsloth_flex_decode_attention(
             attention_mask = attention_mask > torch.finfo(attention_mask.dtype).min / 2
         L, S = query.shape[-2], key.shape[-2]
         if attention_mask is None and L > 1 and kwargs.get("is_causal", getattr(module, "is_causal", True)):
-            # The SDPA mask interface elides an unpadded causal mask (SDPA's is_causal covers it); this reference has
-            # no such flag, so causality is built here: query i sees keys up to S - L + i.
-            attention_mask = torch.ones(L, S, dtype = torch.bool, device = query.device).tril(S - L)
+            # The SDPA mask interface elides an unpadded causal mask and SDPA's is_causal covers it; this reference
+            # has no such flag, so it builds the same upper-left causal mask SDPA would apply (query i sees keys 0..i;
+            # an empty static cache's unwritten tail stays hidden).
+            attention_mask = torch.ones(L, S, dtype = torch.bool, device = query.device).tril()
         out = _eager_attention(query, key, value, attention_mask, scaling, sinks = s_aux, softcap = softcap)
         return out.transpose(1, 2).contiguous(), None
     from transformers.integrations.sdpa_attention import sdpa_attention_forward

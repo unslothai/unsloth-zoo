@@ -454,7 +454,7 @@ def test_padding_layout_is_stable_as_the_mask_grows_and_the_window_rolls():
 @pytest.mark.parametrize("which", ["sinks", "softcap"])
 def test_reference_fallback_keeps_an_elided_causal_mask(which):
     # An unpadded causal prefill gets no mask from the SDPA mask interface (SDPA's is_causal covers it); the float32
-    # reference used with sinks / softcap must still be causal, including over a cache prefix.
+    # reference used with sinks / softcap must apply the same upper-left causal mask SDPA would.
     from unsloth_zoo.flex_attention.decode import unsloth_flex_decode_attention
     module = torch.nn.Module()
     module.is_causal = True
@@ -464,11 +464,14 @@ def test_reference_fallback_keeps_an_elided_causal_mask(which):
     extra = {"s_aux": torch.full((1,), -1e4)} if which == "sinks" else {"softcap": 30.0}
     out, _ = unsloth_flex_decode_attention(module, q, k, v, None, scaling = 1.0, **extra)
     torch.testing.assert_close(out[0, :, 0, 0], torch.tensor([0.0, 0.5, 1.0]))
-    # Two new queries over a 4-slot cache: query 0 sees keys 0..2, query 1 sees all 4.
-    k = torch.zeros(1, 1, 4, 4)
-    v = torch.arange(4.0).view(1, 1, 4, 1).expand(1, 1, 4, 4).contiguous()
-    out, _ = unsloth_flex_decode_attention(module, q[:, :, :2], k, v, None, scaling = 1.0, **extra)
-    torch.testing.assert_close(out[0, :, 0, 0], torch.tensor([1.0, 1.5]))
+    # Prefill of an empty 8-slot static cache: the unwritten tail stays hidden, as under SDPA's is_causal.
+    k = torch.zeros(1, 1, 8, 4)
+    v = torch.zeros(1, 1, 8, 4)
+    v[:, :, :3] = torch.arange(3.0).view(1, 1, 3, 1)
+    out, _ = unsloth_flex_decode_attention(module, q, k, v, None, scaling = 1.0, **extra)
+    torch.testing.assert_close(out[0, :, 0, 0], torch.tensor([0.0, 0.5, 1.0]))
+    sdpa = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal = True)
+    torch.testing.assert_close(out.transpose(1, 2), sdpa)
 
 
 def test_registration_installs_the_device_transfer(monkeypatch):
