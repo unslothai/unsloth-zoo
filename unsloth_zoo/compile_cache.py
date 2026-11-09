@@ -395,9 +395,7 @@ pass
 
 
 def _requeue_every_recorded_artifact():
-    """torch's serializer appends one batch per kind on each serialize and its deserialize keeps only the last batch of a
-    kind, so a second save in one process would drop the first save's artifacts; rebuild one batch per kind from every
-    recorded artifact so each save writes the whole set."""
+    """Deserialize keeps only the last batch per kind, so a second save would drop the first's artifacts: re-queue them all."""
     try:
         from torch.compiler._cache import CacheArtifactManager
         recorded = list(CacheArtifactManager._seen_artifacts)
