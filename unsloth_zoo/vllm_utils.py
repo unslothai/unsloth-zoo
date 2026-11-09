@@ -6677,7 +6677,8 @@ def _lora_is_sharded(model):
             if ".lora_A." in n or ".lora_B." in n:
                 owner, _, key = n.rpartition(".")
                 slots.append((model.get_submodule(owner), key))
-        model.__dict__["_unsloth_lora_slots"] = slots
+        if slots:  # no adapters yet: look again next call
+            model.__dict__["_unsloth_lora_slots"] = slots
     sharded = any(isinstance(owner._parameters.get(key), DTensor) for owner, key in slots)
     if sharded: model.__dict__["_unsloth_lora_is_sharded"] = True
     return sharded
