@@ -44,8 +44,7 @@ _INJECT = textwrap.dedent(f'''
 
 
 def _run(body):
-    # The stub stands in for a host without Triton, so hide GPUs too: on sm90+ Dynamo probes TMA support
-    # through Triton, which the stub cannot answer.
+    # A host without Triton has no GPU either: on sm90+ the stub would answer Dynamo's TMA probe.
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "HIP_VISIBLE_DEVICES": ""}
     return subprocess.run(
         [sys.executable, "-c", _INJECT + textwrap.dedent(body)],
