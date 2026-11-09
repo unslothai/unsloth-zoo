@@ -55,7 +55,7 @@ def _package_checkpoint(base_dir):
     Config = getattr(T, "Qwen3ASRConfig", None)
     Model = getattr(T, "Qwen3ASRForConditionalGeneration", None)
     if Config is None or Model is None:
-        pytest.skip("transformers has no Qwen3-ASR")
+        pytest.skip(reason = "this transformers has no Qwen3-ASR classes (absent in 4.57.6, present in 5.17+), so there is no model to build")
     audio = dict(d_model = 32, encoder_layers = 1, encoder_attention_heads = 2, encoder_ffn_dim = 64,
                  output_dim = 32, downsample_hidden_size = 16, num_mel_bins = 128)
     text = dict(hidden_size = 32, intermediate_size = 64, num_hidden_layers = 1, num_attention_heads = 2,
@@ -122,5 +122,5 @@ def test_merge_with_no_placeable_adapter_is_refused(tmp_path, monkeypatch):
     # Without the layout's mapping no adapter has a checkpoint tensor; 0 placed must not pass as 0 expected.
     monkeypatch.setattr(SU, "_LOADER_CHECKPOINT_CONVERSION_MAPPINGS", {}, raising = False)
     monkeypatch.delenv("UNSLOTH_ALLOW_PARTIAL_LORA_MERGE", raising = False)
-    with pytest.raises(SU.PartialLoraMergeError, match = "None of the"):
+    with pytest.raises(SU.PartialLoraMergeError, match = "(?i)none of the"):
         H.run_merge(peft_model, str(base_dir), str(out_dir), save_dtype = torch.float32)
