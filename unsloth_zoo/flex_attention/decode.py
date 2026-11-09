@@ -41,6 +41,7 @@ __all__ = [
     "flex_decode_attention",
     "flex_decode_supported",
     "flex_decode_kernel_options",
+    "FlexDecodeUnavailable",
     "unsloth_flex_decode_mask",
     "unsloth_flex_decode_attention",
     "register_flex_decode",
@@ -316,12 +317,32 @@ def _softcap_score_mod(softcap):
 
 
 def _flex_function(device):
-    # Compiled flex on GPUs (flex_decoding); the eager reference elsewhere (CPU Inductor cannot lower the LSE).
+    """(flex_attention, compiled): compiled flex on GPUs (flex_decoding); the eager reference elsewhere (CPU Inductor
+    cannot lower the LSE)."""
     from .utils import flex_attention
     if device.type == "cuda" and flex_attention is not None:
-        return flex_attention
+        return flex_attention, True
     from torch.nn.attention.flex_attention import flex_attention as eager_flex_attention
-    return eager_flex_attention
+    return eager_flex_attention, False
+
+
+class FlexDecodeUnavailable(RuntimeError):
+    """flex_decoding could not be compiled for this layer shape (for example no kernel config fits shared memory)."""
+
+
+# Layer shapes whose first compiled call failed, and those already compiled once. unsloth_zoo sets Dynamo's
+# suppress_errors, which would turn a failed flex compile into a silent eager flex: unfused (several times slower than
+# SDPA) and not capturable by CUDA graphs. The first call per shape compiles with errors raised instead, and a shape
+# that fails is reported as unavailable so callers keep the dense path.
+_FAILED_SHAPES = set()
+_COMPILED_SHAPES = set()
+
+
+def _shape_key(query, key, kernel_options, softcap):
+    return (
+        query.shape[-1], query.shape[1], key.shape[1], query.dtype, query.device, bool(softcap),
+        tuple(sorted((k, repr(v)) for k, v in kernel_options.items())),
+    )
 
 
 def flex_decode_attention(query, key, value, block_mask, scale = None, *, sinks = None, softcap = None, kernel_options = None):
@@ -342,17 +363,39 @@ def flex_decode_attention(query, key, value, block_mask, scale = None, *, sinks 
         scale = 1.0 / math.sqrt(query.shape[-1])
     if kernel_options is None:
         kernel_options = flex_decode_kernel_options(query.shape[-1], query.device)
-    out, lse = _output_and_lse(_flex_function(query.device)(
-        query,
-        key,
-        value,
-        block_mask = block_mask,
-        score_mod = _softcap_score_mod(softcap) if softcap else None,
-        enable_gqa = query.shape[1] != key.shape[1],
-        scale = scale,
-        kernel_options = kernel_options,
-        **_LSE_KWARGS,
-    ))
+    function, compiled = _flex_function(query.device)
+
+    def call():
+        return _output_and_lse(function(
+            query,
+            key,
+            value,
+            block_mask = block_mask,
+            score_mod = _softcap_score_mod(softcap) if softcap else None,
+            enable_gqa = query.shape[1] != key.shape[1],
+            scale = scale,
+            kernel_options = kernel_options,
+            **_LSE_KWARGS,
+        ))
+    shape = _shape_key(query, key, kernel_options, softcap) if compiled and not torch.compiler.is_compiling() else None
+    if shape is None or shape in _COMPILED_SHAPES:
+        out, lse = call()
+    elif shape in _FAILED_SHAPES:
+        raise FlexDecodeUnavailable("Unsloth: flex_decoding failed to compile for this layer shape.")
+    else:
+        try:
+            with torch._dynamo.config.patch(suppress_errors = False):
+                out, lse = call()
+        except Exception as error:
+            # A failure inside a CUDA graph capture is the caller's (compile before capturing); not a shape verdict.
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise
+            _FAILED_SHAPES.add(shape)
+            raise FlexDecodeUnavailable(
+                f"Unsloth: flex_decoding failed to compile for head_dim {query.shape[-1]}, {query.shape[1]} / "
+                f"{key.shape[1]} heads, {query.dtype}: {str(error)[:200]}"
+            ) from error
+        _COMPILED_SHAPES.add(shape)
     compute = torch.promote_types(out.dtype, torch.float32)
     lse = lse.to(compute)
     empty = torch.isneginf(lse).unsqueeze(-1)
@@ -452,8 +495,11 @@ def unsloth_flex_decode_attention(
         is_block_mask and query.shape[-2] == 1
         and flex_decode_supported(query.shape[-1], query.shape[1], key.shape[1], query.dtype, query.device)
     ):
-        out = flex_decode_attention(query, key, value, attention_mask, scaling, sinks = s_aux, softcap = softcap)
-        return out.transpose(1, 2).contiguous(), None
+        try:
+            out = flex_decode_attention(query, key, value, attention_mask, scaling, sinks = s_aux, softcap = softcap)
+            return out.transpose(1, 2).contiguous(), None
+        except FlexDecodeUnavailable:
+            pass
     if is_block_mask:
         # A layer flex_decoding does not serve (head_dim, GQA, dtype): the same visibility as a dense mask.
         attention_mask = dense_decode_mask(attention_mask, key.shape[-2], query.device)

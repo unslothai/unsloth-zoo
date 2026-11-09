@@ -338,3 +338,92 @@ def test_kv_tile_fits_shared_memory():
         assert options["BLOCK_N"] == 32 and options["num_stages"] == 1
     finally:
         D._device_capability = monkey
+
+
+class _HostTensorSpy(torch.utils._python_dispatch.TorchDispatchMode):
+    """Records every op that reads or makes a CPU tensor. With the work on the meta device, any hit is a tensor built
+    on the host or copied from it: under CUDA graph capture that is a pageable host-to-device copy, which raises."""
+
+    def __init__(self):
+        super().__init__()
+        self.hits = []
+
+    def __torch_dispatch__(self, func, types, args = (), kwargs = None):
+        out = func(*args, **(kwargs or {}))
+        flat, _ = torch.utils._pytree.tree_flatten((args, kwargs, out))
+        if any(isinstance(x, torch.Tensor) and x.device.type == "cpu" for x in flat):
+            self.hits.append(str(func))
+        return out
+
+
+@pytest.mark.parametrize("window", [0, 128])
+def test_per_step_decode_path_never_touches_host_tensors(window, monkeypatch):
+    # Everything a decode step runs besides the flex kernel (mask build, graph refill, dense fallback, eager sinks /
+    # softcap, the LSE epilogue) on the meta device: no op may see a CPU tensor.
+    dev = torch.device("meta")
+    B, Hq, Hkv, d, S_len = 2, 4, 2, 64, 300
+    q = torch.empty(B, Hq, 1, d, device = dev)
+    k, v = torch.empty(B, Hkv, S_len, d, device = dev), torch.empty(B, Hkv, S_len, d, device = dev)
+    sinks = torch.empty(Hq, device = dev)
+    mask_2d = torch.ones(B, S_len, dtype = torch.long, device = dev)
+
+    def fake_compiled_flex(query, key, value, **kwargs):
+        lse = torch.empty(query.shape[:-1], device = query.device)
+        return query.new_empty(query.shape), (types_aux(lse) if "return_aux" in D._LSE_KWARGS else lse)
+
+    class types_aux:
+        def __init__(self, lse):
+            self.lse = lse
+    monkeypatch.setattr(D, "_flex_function", lambda device: (fake_compiled_flex, True))
+    with _HostTensorSpy() as spy:
+        for step in range(3):
+            q_off = torch.full((), S_len - 1 - step, dtype = torch.int64, device = dev)
+            bm = D.decode_block_mask(B, S_len, q_off, attention_mask = mask_2d, window = window, device = dev)
+            tensors, rebuild = bm._unsloth_graph_closure
+            refilled = flex.BlockMask.from_kv_blocks(
+                bm.kv_num_blocks, bm.kv_indices, BLOCK_SIZE = bm.BLOCK_SIZE, mask_mod = rebuild(tensors),
+                seq_lengths = bm.seq_lengths,
+            )
+            dense = D.dense_decode_mask(refilled, S_len, dev)
+            D._eager_attention(q, k, v, dense, d ** -0.5, sinks = sinks, softcap = 30.0)
+            D.flex_decode_attention(q, k, v, bm, d ** -0.5, sinks = sinks, kernel_options = {})
+    assert spy.hits == []
+    # The spy does see a host tensor reaching the device (a pageable copy under capture).
+    with _HostTensorSpy() as spy:
+        torch.tensor(S_len - 1).to(dev)
+    assert spy.hits
+
+
+def test_a_shape_flex_decoding_cannot_compile_falls_back_to_dense_once(monkeypatch):
+    # unsloth_zoo sets suppress_errors, which would make a failed flex compile a silent, unfused, uncapturable eager
+    # flex. The first call compiles with errors raised; a failing shape is served densely from then on.
+    calls = []
+
+    def failing_compiled_flex(*args, **kwargs):
+        calls.append(torch._dynamo.config.suppress_errors)
+        raise RuntimeError("No valid triton configs. OutOfMemoryError: out of resource")
+    monkeypatch.setattr(D, "_flex_function", lambda device: (failing_compiled_flex, True))
+    monkeypatch.setattr(D, "flex_decode_supported", lambda *args: True)
+    monkeypatch.setattr(D, "_FAILED_SHAPES", set())
+    monkeypatch.setattr(D, "_COMPILED_SHAPES", set())
+    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", True)
+    d, S_len = 16, 150
+    g = torch.Generator().manual_seed(3)
+    q = torch.randn(2, 4, 1, d, generator = g, dtype = torch.float64)
+    k = torch.randn(2, 2, S_len, d, generator = g, dtype = torch.float64)
+    v = torch.randn(2, 2, S_len, d, generator = g, dtype = torch.float64)
+    mask_2d = torch.ones(2, S_len, dtype = torch.long)
+    mask_2d[1, :30] = 0
+    bm = D.decode_block_mask(2, S_len, torch.tensor(S_len - 1), attention_mask = mask_2d, device = "cpu")
+
+    class M(torch.nn.Module):
+        num_key_value_groups = 2
+        is_causal = True
+    want = D._eager_attention(q, k, v, D.dense_decode_mask(bm, S_len), d ** -0.5).transpose(1, 2)
+    for _ in range(3):
+        out, _ = D.unsloth_flex_decode_attention(M(), q, k, v, bm, scaling = d ** -0.5)
+        torch.testing.assert_close(out, want, rtol = 1e-10, atol = 1e-12)
+    assert calls == [False]
+    with pytest.raises(D.FlexDecodeUnavailable):
+        D.flex_decode_attention(q, k, v, bm, d ** -0.5)
+    assert calls == [False]
