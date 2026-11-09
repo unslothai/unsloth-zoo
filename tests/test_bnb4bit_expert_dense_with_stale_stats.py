@@ -143,7 +143,9 @@ def test_tiny_gpt_oss_with_stale_expert_stats_loads_exact_experts(tmp_path):
 
     src = "trl-internal-testing/tiny-GptOssForCausalLM"
     ckpt = str(tmp_path / "bf16")
-    ref = AutoModelForCausalLM.from_pretrained(src, dtype = torch.bfloat16)
+    # T4 / pre-Ampere cards have no native bf16: run the same check in fp16 there.
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported(including_emulation = False) else torch.float16
+    ref = AutoModelForCausalLM.from_pretrained(src, dtype = dtype)
     torch.manual_seed(0)
     with torch.no_grad():
         for name, param in ref.named_parameters():
@@ -154,7 +156,7 @@ def test_tiny_gpt_oss_with_stale_expert_stats_loads_exact_experts(tmp_path):
     del ref
     original = load_file(os.path.join(ckpt, "model.safetensors"))
 
-    load = dict(max_seq_length = 64, load_in_4bit = True, dtype = torch.bfloat16)
+    load = dict(max_seq_length = 64, load_in_4bit = True, dtype = dtype)
     model, tokenizer = FastLanguageModel.from_pretrained(ckpt, **load)
     saved = str(tmp_path / "saved_4bit")
     model.save_pretrained(saved)
