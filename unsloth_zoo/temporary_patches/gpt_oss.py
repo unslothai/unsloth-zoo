@@ -254,6 +254,28 @@ def _gpt_oss_decode_attention(module, query, key, value, attention_mask, scaling
 _MASK_SCALARS = (bool, int, float, str, type(None))
 
 
+_MISSING = object()
+# Attribute values that are code, not state: modules, classes, builtins and method descriptors.
+_MASK_CODE_TYPES = (
+    types.ModuleType, type, types.BuiltinFunctionType, types.BuiltinMethodType, types.MethodDescriptorType,
+    types.WrapperDescriptorType, types.MethodWrapperType, torch.dtype, torch.device,
+)
+
+
+def _library_namespace(value):
+    """torch / math / builtins (and their classes): their attributes are library code, never mask state."""
+    name = getattr(value, "__name__", "") if isinstance(value, types.ModuleType) else getattr(value, "__module__", "")
+    return (name or "").split(".")[0] in ("torch", "math", "operator", "builtins", "functools")
+
+
+def _static_attribute(owner, attr):
+    """owner.attr without running descriptors or __getattr__ (a property could compute anything)."""
+    try:
+        return inspect.getattr_static(owner, attr)
+    except AttributeError:
+        return _MISSING
+
+
 @functools.lru_cache(maxsize = 256)
 def _code_digest(code):
     """Bytecode, constants and names of a code object (nested ones included): two lambdas on one line that
@@ -286,15 +308,28 @@ def _mask_function_identity(fn, depth = 4):
                 values.append(None)
         values.extend(getattr(f, "__defaults__", None) or ())
         values.extend((getattr(f, "__kwdefaults__", None) or {}).values())
-        # Module-level names the code reads: a scalar is named by its value, a function walked; modules, classes
-        # and builtins are code, not state. Anything else (a tensor, a dict, an object) cannot be keyed.
+        # Module-level names the code reads: a scalar is named by its value, a function walked, builtins are code.
+        # A module or class is code too, but its attributes are state the mask can read (settings.WINDOW,
+        # Config.WINDOW): each other name the code loads is looked up on it and keyed the same way.
+        # Anything else (a tensor, a dict, an object) cannot be keyed.
         module_globals = getattr(f, "__globals__", None) or {}
         for name in code.co_names:
             if name not in module_globals:
                 continue
             value = module_globals[name]
             out.append(name)
-            if not isinstance(value, (types.ModuleType, type, types.BuiltinFunctionType)):
+            if isinstance(value, (types.ModuleType, type)):
+                if not _library_namespace(value):
+                    for attr in code.co_names:
+                        if attr == name:
+                            continue
+                        found = _static_attribute(value, attr)
+                        if found is _MISSING:
+                            continue
+                        out.append(f"{name}.{attr}")
+                        if not isinstance(found, _MASK_CODE_TYPES):
+                            values.append(found)
+            elif not isinstance(value, types.BuiltinFunctionType):
                 values.append(value)
         for value in values:
             items = value if type(value) in (list, tuple) else (value,)
