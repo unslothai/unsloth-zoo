@@ -170,3 +170,69 @@ def test_retained_rebackward_moves_the_cross_device_fence(G, lease_between):
     assert s1.waits == [s0.events[-1]]
     assert len([e for e in s0.events if e[0] == "cuda:0"]) >= 2
     other.release()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason = "needs 2 CUDA devices (cross-device slot reuse)")
+def test_retained_rebackward_slot_reused_by_another_cuda_device(monkeypatch):
+    # cuda:0's second backward reload is held back on its stream; cuda:1 then offloads into the same host slot.
+    # Without a fence on the second reload, cuda:0 reads cuda:1's activations and its grads change.
+    monkeypatch.setenv("UNSLOTH_DISABLE_DOUBLE_BUFFER", "1")
+    from unsloth_zoo import gradient_checkpointing as G
+    G._double_buffer_disabled.cache_clear()
+    names = ("CPU_BUFFERS", "CPU_INDEX", "GPU_BUFFERS", "GPU_BUFFERS_B", "USE_DOUBLE_BUFFER", "EXTRA_STREAMS",
+             "MAIN_STREAMS", "NEXT_BUFFER_SLOT", "MINIMUM_SIZE", "BACKWARD_PASS", "FIRST_PASS", "LAST_GC_INDEX",
+             "CURRENT_GC_INDEX", "BUFFER_EVENTS_A", "BUFFER_EVENTS_B", "GPU_BUFFER_DTYPE")
+    saved = {n: getattr(G, n, None) for n in names}
+    G.initialize_unsloth_gradient_checkpointing(torch.float32)
+    sleep = [False]
+
+    class Hold(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, h): return h.view_as(h)
+        @staticmethod
+        def backward(ctx, grad):
+            if sleep[0]: torch.cuda._sleep(int(2e9))  # queued before the reloads on cuda:0's compute stream
+            return grad
+
+    def fwd(ws, x):
+        h = x.requires_grad_() * 1.0
+        for w in ws:
+            h = G.UnslothCheckpointFunction.apply((lambda w: lambda h: h + torch.tanh(h @ w))(w), True, h)
+        return Hold.apply(h).square().mean()
+
+    def grads(ws):
+        out = [w.grad.clone() for w in ws]
+        for w in ws: w.grad = None
+        return out
+
+    try:
+        g = torch.Generator().manual_seed(0)
+        wa = [(torch.randn(1024, 1024, generator = g) / 32).to("cuda:0").requires_grad_() for _ in range(4)]
+        wb = [(torch.randn(1024, 1024, generator = g) / 32).to("cuda:1").requires_grad_() for _ in range(2)]
+        xa = torch.randn(2048, 1024, generator = g).to("cuda:0")
+        xb = (1000 * torch.randn(2048, 1024, generator = g)).to("cuda:1")
+        for _ in range(2):
+            fwd(wa, xa.clone()).backward(); grads(wa)
+            fwd(wb, xb.clone()).backward(); grads(wb)
+        torch.cuda.synchronize(0); torch.cuda.synchronize(1)
+        loss = fwd(wa, xa.clone())
+        loss.backward(retain_graph = True)
+        torch.cuda.synchronize(0)
+        first = grads(wa)
+        held = {i for i, ref in G._SLOT_HOLDERS.items() if ref() is not None}
+        assert held
+        sleep[0] = True
+        loss.backward()
+        sleep[0] = False
+        del loss
+        gc.collect()
+        fwd(wb, xb.clone())
+        assert G.CPU_INDEX in held  # cuda:1 really took a slot cuda:0 is still reloading
+        torch.cuda.synchronize(0); torch.cuda.synchronize(1)
+        for a, b in zip(first, grads(wa)):
+            assert torch.equal(a, b)
+    finally:
+        torch.cuda.synchronize(0); torch.cuda.synchronize(1)
+        for n, v in saved.items(): setattr(G, n, v)
+        G._reset_cpu_slots()
+        G._double_buffer_disabled.cache_clear()
