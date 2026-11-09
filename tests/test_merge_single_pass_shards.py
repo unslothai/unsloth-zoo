@@ -184,7 +184,10 @@ def _shard_bytes(tmp_path, tensors):
     return path
 
 
-@pytest.mark.parametrize("kernel_copy", [True, False])
+@pytest.mark.parametrize("kernel_copy", [
+    pytest.param(True, marks = pytest.mark.skipif(not hasattr(os, "copy_file_range"), reason = "os.copy_file_range is Linux only")),
+    False,
+])
 def test_writer_matches_copy_then_overwrite_in_any_write_order(tmp_path, kernel_copy):
     import json
     import mmap
