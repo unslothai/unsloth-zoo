@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""standardize_data_formats stays in process for an in-memory dataset unless a worker count was asked for (an int,
-the env override) or the dataset is backed by cache files; the output is the same either way."""
+"""In-memory datasets map in process unless num_proc or the env override asks for workers; cache-backed ones keep
+the pool. The output is the same either way."""
 
 import pytest
 from datasets import Dataset, load_from_disk
