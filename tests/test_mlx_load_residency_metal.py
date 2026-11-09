@@ -124,8 +124,11 @@ def test_a_deepseek_v41_oq_quant_loads_as_its_model(tmp_path, layout):
     from mlx_vlm.models.deepseek_v41.config import ModelConfig
     from mlx_vlm.utils import load_model
     from unsloth_zoo.mlx.loader import (
-        _ensure_deepseek_v41_omlx_layout, _ensure_native_vlm_weight_names, _global_quant_params, _mlx_vlm_config_override_data,
+        _ensure_deepseek_v41_omlx_layout, _ensure_native_vlm_weight_names, _ensure_omlx_layout, _global_quant_params,
+        _mlx_vlm_config_override_data,
     )
+
+    assert _ensure_deepseek_v41_omlx_layout is _ensure_omlx_layout  # as Unsloth Studio releases install it
 
     text = dict(vocab_size = 512, hidden_size = 256, moe_intermediate_size = 128, num_hidden_layers = 4, num_attention_heads = 4,
                 head_dim = 64, qk_rope_head_dim = 32, q_lora_rank = 128, o_lora_rank = 64, o_groups = 2, n_routed_experts = 8,
@@ -180,7 +183,7 @@ def test_a_deepseek_v41_oq_quant_loads_as_its_model(tmp_path, layout):
     experts = {"group_size": 32, "bits": 4, "mode": "mxfp4"} if mxfp else {"group_size": 64, "bits": 2, "mode": "affine"}
     assert _global_quant_params(config["quantization"]) == experts
     (tmp_path / "config.json").write_text(json.dumps(config))
-    _ensure_deepseek_v41_omlx_layout("deepseek_v41")
+    _ensure_omlx_layout("deepseek_v41")
     _ensure_native_vlm_weight_names("deepseek_v41")
     loaded = dict(tree_flatten(load_model(tmp_path).parameters()))
     assert loaded.keys() == params.keys() | {table + name for name in packed}
@@ -188,6 +191,64 @@ def test_a_deepseek_v41_oq_quant_loads_as_its_model(tmp_path, layout):
         want = packed[key.removeprefix(table)] if key.startswith(table) else floats(key, params[key])
         want = want.astype(mx.float32) if key.endswith(("ffn.gate.weight", "head.weight")) else want
         assert value.dtype == want.dtype and mx.array_equal(value, want), key
+
+
+def test_a_glm5_next_oq_quant_loads_as_its_model(tmp_path, monkeypatch):
+    glm = pytest.importorskip("mlx_vlm.models.glm5_next.glm5_next")
+    from mlx_vlm.models.glm5_next.config import ModelConfig
+    from mlx_vlm.utils import load_model
+    from unsloth_zoo.mlx.loader import _ensure_omlx_layout
+
+    monkeypatch.setattr(glm.Model, "sanitize", glm.Model.sanitize)
+    monkeypatch.delattr(glm.Model, "quantization_path_aliases", raising = False)
+    linear = {"num_heads": 2, "head_dim": 64, "gate_lower_bound": -5.0, "short_conv_kernel_size": 4, "kda_layers": [0, 1, 2], "full_attn_layers": [3]}
+    text = dict(model_type = "glm5_next_text", vocab_size = 512, hidden_size = 256, num_hidden_layers = 4, intermediate_size = 256,
+                moe_intermediate_size = 128, n_routed_experts = 4, num_experts_per_tok = 2, n_shared_experts = 1, first_k_dense_replace = 2,
+                num_attention_heads = 2, num_key_value_heads = 2, q_lora_rank = 128, kv_lora_rank = 128, qk_head_dim = 64,
+                qk_nope_head_dim = 64, qk_rope_head_dim = 0, v_head_dim = 64, index_n_heads = 2, index_head_dim = 64, index_topk = 8,
+                index_kpool = 4, hc_mult = 4, linear_attn_config = linear, layer_types = ["linear_attention"] * 3 + ["deepseek_sparse_attention"],
+                mlp_layer_types = ["dense", "dense", "sparse", "sparse"], tie_word_embeddings = False)
+    vision = dict(model_type = "glm5_next_vision", depth = 1, hidden_size = 64, intermediate_size = 128, num_heads = 1, out_hidden_size = 256)
+    config = {"model_type": "glm5_next", "text_config": text, "vision_config": vision, "tie_word_embeddings": False}
+    model = glm.Model(ModelConfig.from_dict(json.loads(json.dumps(config))))
+    mx.random.seed(0)
+    model.update(tree_map(lambda value: mx.random.normal(value.shape) * 0.05, model.parameters()))
+    eight, experts = {"group_size": 64, "bits": 8, "mode": "affine"}, {"group_size": 64, "bits": 3, "mode": "affine"}
+    quantize = lambda path, module: (hasattr(module, "to_quantized") and model.quant_predicate(path, module) and not path.startswith("vision")
+                                     and not path.endswith("mlp.gate") and (experts if ".switch_mlp." in path else eight))
+    nn.quantize(model, class_predicate = quantize)
+    params = dict(tree_flatten(model.parameters()))
+
+    # The layout omlx writes: the source's unfused projections, its forget gate module and fused convolution, `vision_model`.
+    head, rank = 64, 128
+    unfused = {"qkv_proj": [("q_proj", 128), ("k_proj", 128), ("v_proj", 128)], "gate_up_proj": [("gate_proj", None), ("up_proj", None)],
+               "fbg_a_proj": [("forget_gate.f_a_proj", head), ("b_proj", 2), ("g_a_proj", head)],
+               "qkv_a_proj": [("q_a_proj", rank), ("kv_a_proj_with_mqa", rank)]}
+    stored, modules = {}, {}
+    for key, value in params.items():
+        key = key.replace("vision_tower.", "vision_model.")
+        parent, _, leaf = key.rpartition(".")
+        module, _, fused = parent.rpartition(".")
+        if fused in unfused:
+            parts = unfused[fused]
+            sizes = [size or value.shape[0] // len(parts) for _, size in parts]
+            for (name, _), piece in zip(parts, mx.split(value, list(np.cumsum(sizes)[:-1]), axis = 0)):
+                stored[f"{module}.{name}.{leaf}"] = piece
+                modules[f"{module}.{name}"] = eight
+            continue
+        key = re.sub(r"\.self_attn\.(f_b_proj|A_log|dt_bias)", r".self_attn.forget_gate.\1", key)
+        stored[key.replace(".qkv_conv.conv.", ".conv1d.")] = value
+        if leaf == "scales" and ".switch_mlp." not in key:
+            modules[key.removesuffix(".scales").replace(".qkv_conv.conv", ".conv1d")] = eight
+    stored["language_model.mtp.0.eh_proj.weight"] = mx.zeros((256, 512))
+    modules["language_model.mtp.0.block.mlp.switch_mlp.down_proj"] = {"group_size": 64, "bits": 4, "mode": "affine"}
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), stored)
+    (tmp_path / "config.json").write_text(json.dumps({**config, "quantization": {**experts, **modules}}))
+    _ensure_omlx_layout("glm5_next")
+    loaded = dict(tree_flatten(load_model(tmp_path).parameters()))
+    assert loaded.keys() == params.keys()
+    for key, value in loaded.items():
+        assert value.dtype == params[key].dtype and mx.array_equal(value, params[key]), key
 
 
 def test_lazy_weights_env_leaves_the_load_lazy(tmp_path, monkeypatch):

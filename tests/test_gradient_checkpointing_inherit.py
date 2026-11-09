@@ -86,9 +86,12 @@ class _NoLayers(PreTrainedModel):
         self.post_init()
 
 
+_ENTRY_POINTS = ("gradient_checkpointing_enable", "activation_checkpointing_enable", "_activation_checkpointing_enable")
+
+
 @pytest.fixture
 def patched():
-    saved = PreTrainedModel.gradient_checkpointing_enable
+    saved = {n: vars(PreTrainedModel)[n] for n in _ENTRY_POINTS if n in vars(PreTrainedModel)}
     try:
         from unsloth_zoo.temporary_patches.misc import patch_gradient_checkpointing_enable_inherit
     except ImportError:
@@ -96,16 +99,20 @@ def patched():
     if patch_gradient_checkpointing_enable_inherit is not None:
         patch_gradient_checkpointing_enable_inherit()
     yield
-    PreTrainedModel.gradient_checkpointing_enable = saved
+    for name, function in saved.items():
+        setattr(PreTrainedModel, name, function)
 
 
+@pytest.mark.parametrize("entry", ["gradient_checkpointing_enable", "activation_checkpointing_enable"])
 @pytest.mark.parametrize("which", ["wrapper", "inner"])
-def test_wrapper_and_inner_enable_and_recompute(patched, which):
+def test_wrapper_and_inner_enable_and_recompute(patched, which, entry):
+    if not hasattr(PreTrainedModel, entry):
+        pytest.skip(f"{entry} is new in transformers 5.23")
     torch.manual_seed(0)
     model = _Wrapper(_Cfg())
     target = model if which == "wrapper" else model.language_model
     assert type(target).supports_gradient_checkpointing is False
-    target.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    getattr(target, entry)({"use_reentrant": False})
     assert all(b.gradient_checkpointing for b in model.language_model.layers)
     assert target.is_gradient_checkpointing
     assert type(target).supports_gradient_checkpointing is False
@@ -138,7 +145,7 @@ def test_grads_match_no_checkpointing(patched):
 
 
 def test_model_without_checkpointable_submodule_still_raises(patched):
-    with pytest.raises(ValueError, match="does not support gradient checkpointing"):
+    with pytest.raises(ValueError, match="does not support (gradient|activation) checkpointing"):
         _NoLayers(_Cfg()).gradient_checkpointing_enable()
 
 
@@ -147,7 +154,7 @@ class _ExplicitFalse(_Wrapper):  # native JetMoe / Blip-2 style opt-out
 
 
 def test_explicit_false_still_raises(patched):
-    with pytest.raises(ValueError, match="does not support gradient checkpointing"):
+    with pytest.raises(ValueError, match="does not support (gradient|activation) checkpointing"):
         _ExplicitFalse(_Cfg()).gradient_checkpointing_enable()
 
 

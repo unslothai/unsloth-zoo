@@ -76,7 +76,7 @@ if triton is not None:
     def _route_single_kernel(
         ids_ptr, N, K_COLS: tl.constexpr, stride_row: tl.constexpr, stride_col, E: tl.constexpr,  # top-k, top-k, n_experts
         counts_ptr, offsets_ptr, out_ptr,
-        BLOCK: tl.constexpr, NUM_BINS: tl.constexpr,
+        BLOCK: tl.constexpr, NUM_BINS: tl.constexpr,  # slots per program / histogram bins pow2
     ):
         pos = tl.arange(0, BLOCK)
         key = _load_keys(ids_ptr, pos.to(tl.int64), N, K_COLS, stride_row, stride_col, E)
@@ -92,7 +92,7 @@ if triton is not None:
     def _route_hist_kernel(
         ids_ptr, N, K_COLS: tl.constexpr, stride_row: tl.constexpr, stride_col, E: tl.constexpr,  # top-k, top-k, n_experts
         hist_ptr, below_ptr,
-        BLOCK: tl.constexpr, NUM_BINS: tl.constexpr,
+        BLOCK: tl.constexpr, NUM_BINS: tl.constexpr,  # slots per program / histogram bins pow2
     ):
         # Block-major [NB, E + 1]: hist = rows of each expert in this block; below = rows of smaller experts in this block (block-local run start).
         b = tl.program_id(0)
@@ -107,7 +107,7 @@ if triton is not None:
     @triton.jit(do_not_specialize = ["NB"])
     def _route_scan_kernel(
         hist_ptr, below_ptr, counts_ptr, NB, E: tl.constexpr,  # n_experts
-        EC: tl.constexpr, BB: tl.constexpr,
+        EC: tl.constexpr, BB: tl.constexpr,  # experts per program / blocks per scan step
     ):
         # One program per EC experts carrying over blocks; rewrites below[b, e] in place to (rows of e in earlier
         # blocks) - (rows of experts < e in block b); counts[e] = total.
@@ -125,7 +125,7 @@ if triton is not None:
         tl.store(counts_ptr + e, carry, mask = e < E)
 
     @triton.jit
-    def _route_starts_kernel(counts_ptr, starts_ptr, offsets_ptr, E: tl.constexpr, EP: tl.constexpr):
+    def _route_starts_kernel(counts_ptr, starts_ptr, offsets_ptr, E: tl.constexpr, EP: tl.constexpr):  # num experts / num experts + 1 pow2
         e = tl.arange(0, EP)
         c = tl.load(counts_ptr + e, mask = e < E, other = 0)
         ends = tl.cumsum(c, 0)
@@ -136,7 +136,7 @@ if triton is not None:
     def _route_scatter_kernel(
         ids_ptr, N, K_COLS: tl.constexpr, stride_row: tl.constexpr, stride_col, E: tl.constexpr,  # top-k, top-k, n_experts
         rank_base_ptr, starts_ptr, out_ptr,
-        BLOCK: tl.constexpr,
+        BLOCK: tl.constexpr,  # slots per program
     ):
         b = tl.program_id(0)
         pos = tl.arange(0, BLOCK)

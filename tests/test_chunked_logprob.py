@@ -242,7 +242,7 @@ def test_fp32_output_gemm_only_where_fast(monkeypatch, fp32_out_gemm):
 
 
 def test_default_chunk_budget_shrinks_with_free_memory(monkeypatch):
-    import unsloth_zoo.tiled_mlp as tm
+    import unsloth_zoo.memory_budget as tm
 
     for free, want in ((0.25, 0.25), (64.0, cl._CHUNK_GB)):
         monkeypatch.setattr(tm, "_default_target_gb", lambda device = None, free = free: free)
@@ -252,7 +252,7 @@ def test_default_chunk_budget_shrinks_with_free_memory(monkeypatch):
 
 def test_default_chunk_budget_is_read_per_call(monkeypatch):
     # A first call before the optimizer states exist must not size later chunks for memory that is gone.
-    import unsloth_zoo.tiled_mlp as tm
+    import unsloth_zoo.memory_budget as tm
 
     free = [64.0]
     monkeypatch.setattr(tm, "_default_target_gb", lambda device = None: free[0])
@@ -274,7 +274,7 @@ def test_fp32_projection_reraises_oom(monkeypatch):
 
 
 def test_chunk_budget_reads_the_head_device(monkeypatch):
-    import unsloth_zoo.tiled_mlp as tm
+    import unsloth_zoo.memory_budget as tm
 
     seen = []
     monkeypatch.setattr(tm, "_default_target_gb", lambda device = None: seen.append(device) or 0.25)
@@ -410,9 +410,16 @@ def test_grpo_switches_keep_entropy_policy_and_reference_on_one_scorer(flag):
     from unsloth_zoo.fused_losses import fused_linear as fl
     if torch.cuda.is_available() and not fl._HAS_TRITON:
         pytest.skip("the old scorers compile through Inductor, which needs Triton for GPU code")
+    # Counts fused entry points instead of comparing bits: on CPU a policy scored by the fused kernel drifts by about
+    # 1e-6 from the old reference scorer, less than two old-scorer paths differ on some runners (3e-5, Inductor vs ATen).
     child = (
         "import json, torch\n"
         "from unsloth_zoo import rl_replacements as rr\n"
+        "from unsloth_zoo.fused_losses import chunked_logprob as cl, fused_linear as fl\n"
+        "calls = []\n"
+        "real_fused, real_chunked = fl.fused_linear_logprobs, cl.unsloth_chunked_logprobs\n"
+        "fl.fused_linear_logprobs = lambda *a, **k: (calls.append('fused_linear_logprobs'), real_fused(*a, **k))[1]\n"
+        "cl.unsloth_chunked_logprobs = lambda *a, **k: (calls.append('unsloth_chunked_logprobs'), real_chunked(*a, **k))[1]\n"
         "dev = 'cuda' if torch.cuda.is_available() else 'cpu'\n"
         "g = torch.Generator().manual_seed(0)\n"
         "h = torch.randn(2, 17, 32, generator = g).to(dev, torch.bfloat16 if dev == 'cuda' else torch.float32)\n"
@@ -421,12 +428,13 @@ def test_grpo_switches_keep_entropy_policy_and_reference_on_one_scorer(flag):
         "with torch.no_grad():\n"
         "    ref = rr.chunked_hidden_states_selective_log_softmax(h, w, idx, 4)\n"
         "pol, ent = rr.chunked_hidden_states_selective_log_softmax_recompute(h.clone().requires_grad_(True), w, idx, 4, return_entropy = True)\n"
-        "print('RESULT ' + json.dumps({'equal': bool(torch.equal(pol.detach().reshape(ref.shape), ref)),\n"
-        "    'maxdiff': float((pol.detach().reshape(ref.shape) - ref).abs().max())}))\n"
+        "print('RESULT ' + json.dumps({'calls': calls,\n"
+        "    'maxdiff': float((pol.detach().reshape(ref.shape).float() - ref.float()).abs().max())}))\n"
     )
     env = dict(os.environ, **{flag: "0", "UNSLOTH_IS_PRESENT": "1"})
     p = subprocess.run([sys.executable, "-c", child], env = env, capture_output = True, text = True, timeout = 900)
     line = [x for x in p.stdout.splitlines() if x.startswith("RESULT ")]
     assert line, p.stdout[-2000:] + p.stderr[-2000:]
     r = json.loads(line[-1][7:])
-    assert r["equal"], r
+    assert r["calls"] == [], r
+    assert r["maxdiff"] < 1e-3, r
