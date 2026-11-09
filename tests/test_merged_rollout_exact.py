@@ -143,11 +143,13 @@ def test_fixup_store_is_small_for_small_deltas():
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_store_needs_no_positions(dtype):
     # Trained-size adapter (|d| about 10% of |W|): the old store took 6 B per inexact element; the stream takes a few bits.
+    # The per-weight choice keeps the stream for it on its own.
     W, A, B, scale = _dense(1024, 4096, 16, 1e-1, dtype)
     W0 = W.clone()
     t = _target(W, A, B, scale)
     stats = ex.exact_fold([t])
     report = ex.fixup_report([t], stats)
+    assert not t.store.indexed[t.slot]
     assert stats["bad"] > 0.01 * stats["elements"]
     assert report["host_store_bytes"] == stats["store_bytes"] == t.host_store_bytes()
     assert report["host_store_bytes"] < 0.25 * 6 * stats["bad"]
@@ -162,7 +164,8 @@ def test_store_needs_no_positions(dtype):
     assert torch.equal(_bits(W), _bits(W0))
 
 
-def test_corrupted_fixup_store_is_caught():
+def test_corrupted_fixup_store_is_caught(monkeypatch):
+    monkeypatch.setattr(ex, "_INDEXED_PER_TILE", -1)   # the stream form, whatever the per-weight choice would be
     W, A, B, scale = _dense(256, 1024, 16, 1e-2)
     t = _target(W, A, B, scale)
     stats = ex.exact_fold([t])
@@ -171,6 +174,23 @@ def test_corrupted_fixup_store_is_caught():
     t.host_words[nz[0, 0]] ^= 1 << 2   # flip: a wrong correction must not pass silently
     with pytest.raises(RuntimeError, match = "checksum mismatch"):
         ex.exact_unfold([t])
+
+
+@pytest.mark.parametrize("rel, indexed", [(1e-4, True), (1e-3, True), (1e-1, False)])
+def test_small_adapters_take_the_indexed_form(rel, indexed):
+    # Few inexact elements per coded tile (GRPO-step adapters): the indexed form, cheaper to fold and unfold than the
+    # stream there; trained-size adapters keep the stream. Both restore bit for bit, in one call.
+    W, A, B, scale = _dense(512, 2048, 16, rel, torch.float16)
+    W2, A2, B2, scale2 = _dense(256, 1024, 16, 1e-1, torch.float16, seed = 5)
+    W0, W20 = W.clone(), W2.clone()
+    t, t2 = _target(W, A, B, scale), _target(W2, A2, B2, scale2)
+    stats = ex.exact_fold([t, t2])
+    assert t.store.indexed[t.slot] == indexed and not t2.store.indexed[t2.slot]
+    if indexed:
+        assert t.host_words.numel() == 0 and t.host_idx.numel() == t.bad > 0
+    ex.exact_unfold([t2, t])
+    assert torch.equal(_bits(W), _bits(W0)) and torch.equal(_bits(W2), _bits(W20))
+    assert stats["bad"] == t.bad + t2.bad
 
 
 def test_changed_adapter_between_fold_and_unfold_is_caught():

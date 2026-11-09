@@ -21,6 +21,7 @@ The proof runs the real kernel. On CUDA it runs in this process; without CUDA, t
 file under TRITON_INTERPRET=1 on CPU tensors. Each delta is driven through A, B and scale: rank 1 with A = 1, so
 s * B @ A = fp32(b * s) exactly and a torch emulation knows which elements cannot round-trip."""
 
+import contextlib
 import os
 import subprocess
 import sys
@@ -87,12 +88,25 @@ def _emulate_store(W, d):
 
 # Which code widths / escape kinds the edge cross reached (asserted once the cross has run).
 COVERAGE = {}
+# Store formats: the bit stream everywhere, the indexed form wherever a weight has code words, or the per-weight choice.
+STREAM, INDEXED, CHOSEN = -1, 1 << 40, None
+
+
+@contextlib.contextmanager
+def store_format(per_tile):
+    old = ex._INDEXED_PER_TILE
+    if per_tile is not None: ex._INDEXED_PER_TILE = per_tile
+    try:
+        yield
+    finally:
+        ex._INDEXED_PER_TILE = old
 
 
 def _check_cycle(W, A, B, scale, d = None):
     W0 = W.clone()
     t = ex.ExactFoldTarget(W.unsqueeze(0), A.unsqueeze(0), B.unsqueeze(0), scale)
     stats = ex.exact_fold([t])
+    indexed = t.store.indexed[t.slot]
     store = t.host_idx.to(torch.int64).cpu()
     vals = t.host_val.cpu()
     words = t.host_words.cpu().clone()
@@ -113,6 +127,11 @@ def _check_cycle(W, A, B, scale, d = None):
         kept = kept.view(W0.shape)
         # NaN payloads may be canonicalised by the device conversion; everything else is checked bit for bit.
         assert int(bad[~nan].sum()) <= stats["bad"] <= int(bad[~nan].sum()) + int(nan.sum())
+        if indexed:
+            # Indexed form: every inexact element is kept by position, no stream.
+            assert words.numel() == 0 and torch.equal(kept[~nan], bad[~nan]), "indexed store is not the inexact set"
+            COVERAGE["indexed"] = True
+            return stats
         assert torch.equal(kept[~nan], esc[~nan]), "escapes are not exactly the out-of-code elements"
         assert torch.equal(_bits(folded.cpu())[~nan], _bits(want)[~nan]), "fold differs from fp32(W + d) rounded once"
         assert bool(kept[nan & torch.isnan(W0.cpu()) & ~torch.isnan(want)].all())
@@ -129,35 +148,38 @@ def _check_cycle(W, A, B, scale, d = None):
 
 
 def run_negative(device):
-    """A corrupted bit stream, a corrupted escape and a changed adapter must each raise, never restore silently."""
+    """A corrupted bit stream, a corrupted escape and a changed adapter must each raise, never restore silently (in the
+    stream and in the indexed form)."""
     g = torch.Generator(device = device).manual_seed(3)
-    for dtype in DTYPES:
-        for corrupt in ("word", "escape", "adapter"):
-            W = (torch.randn(64, 1024, device = device, generator = g) * 0.02).to(dtype)
-            W[0, :64] = 2.0**-20   # tiny weights under a large delta: escapes (fp16 subnormal crossings, bf16 ties)
-            A = torch.randn(1, 4, 1024, device = device, generator = g).to(dtype)
-            B = torch.randn(1, 64, 4, device = device, generator = g).to(dtype)
-            scale = 0.05 * 0.02 / (B[0].float() @ A[0].float()).abs().mean().item()
-            t = ex.ExactFoldTarget(W.unsqueeze(0), A, B, scale)
+    cases = [(STREAM, dtype, corrupt) for dtype in DTYPES for corrupt in ("word", "escape", "adapter")]
+    cases += [(INDEXED, dtype, corrupt) for dtype in DTYPES for corrupt in ("escape", "adapter")]
+    for fmt, dtype, corrupt in cases:
+        W = (torch.randn(64, 1024, device = device, generator = g) * 0.02).to(dtype)
+        W[0, :64] = 2.0**-20   # tiny weights under a large delta: escapes (fp16 subnormal crossings, bf16 ties)
+        A = torch.randn(1, 4, 1024, device = device, generator = g).to(dtype)
+        B = torch.randn(1, 64, 4, device = device, generator = g).to(dtype)
+        scale = 0.05 * 0.02 / (B[0].float() @ A[0].float()).abs().mean().item()
+        t = ex.ExactFoldTarget(W.unsqueeze(0), A, B, scale)
+        with store_format(fmt):
             ex.exact_fold([t])
-            if corrupt == "word":
-                nz = (t.host_words != 0).nonzero()
-                if not nz.numel() and device == "cpu" and dtype == torch.bfloat16:
-                    ex.exact_unfold([t]); continue   # truncating interpreter bf16: every inexact element escapes
-                assert nz.numel(), "no coded element to corrupt"
-                t.host_words[nz[0, 0]] ^= 1 << 3
-            elif corrupt == "escape":
-                if t.host_val.numel() == 0:
-                    ex.exact_unfold([t]); continue
-                t.host_val.view(torch.int16)[0] ^= 1
-            else:
-                B.add_(0.5)
-            try:
-                ex.exact_unfold([t])
-            except RuntimeError as error:
-                assert "checksum mismatch" in str(error)
-            else:
-                raise AssertionError(f"corrupted {corrupt} restored without an error ({dtype})")
+        if corrupt == "word":
+            nz = (t.host_words != 0).nonzero()
+            if not nz.numel() and device == "cpu" and dtype == torch.bfloat16:
+                ex.exact_unfold([t]); continue   # truncating interpreter bf16: every inexact element escapes
+            assert nz.numel(), "no coded element to corrupt"
+            t.host_words[nz[0, 0]] ^= 1 << 3
+        elif corrupt == "escape":
+            if t.host_val.numel() == 0:
+                ex.exact_unfold([t]); continue
+            t.host_val.view(torch.int16)[0] ^= 1
+        else:
+            B.add_(0.5)
+        try:
+            ex.exact_unfold([t])
+        except RuntimeError as error:
+            assert "checksum mismatch" in str(error)
+        else:
+            raise AssertionError(f"corrupted {corrupt} restored without an error ({dtype}, format {fmt})")
 
 
 def run_edges(device, scales = None, dtypes = DTYPES, multipliers = MULTIPLIERS):
@@ -211,13 +233,18 @@ def _cuda():
 
 @pytest.mark.skipif(not _cuda(), reason = "needs CUDA + Triton")
 def test_every_bit_pattern_at_every_edge_restores_exactly():
-    run_edges("cuda")
+    COVERAGE.clear()
+    for fmt in (STREAM, INDEXED, CHOSEN):
+        with store_format(fmt):
+            run_edges("cuda")
+    assert COVERAGE.get("indexed")
 
 
 @pytest.mark.skipif(not _cuda(), reason = "needs CUDA + Triton")
 def test_every_code_width_and_escape_kind_is_reached():
     COVERAGE.clear()
-    run_edges("cuda")
+    with store_format(STREAM):
+        run_edges("cuda")
     want = {"code%d" % k for k in range(2, ex._MAX_GAP + 2)} | {"escape_code", "escape_no_code", "escape_nan"}
     assert want <= set(COVERAGE), sorted(want - set(COVERAGE))
 
@@ -229,7 +256,9 @@ def test_corrupted_store_or_changed_adapter_raises():
 
 @pytest.mark.skipif(not _cuda(), reason = "needs CUDA + Triton")
 def test_random_adapters_and_cycles_restore_exactly():
-    run_random("cuda", cycles = 200)
+    for fmt in (CHOSEN, STREAM, INDEXED):
+        with store_format(fmt):
+            run_random("cuda", cycles = 200)
 
 
 @pytest.mark.skipif(_cuda() or ex.triton is None, reason = "CUDA runs the proof directly; this is the CPU interpreter")
@@ -269,7 +298,8 @@ if __name__ == "__main__":
     assert os.environ.get("TRITON_INTERPRET") == "1", "run under TRITON_INTERPRET=1"
     blocks = (ex._BLOCK_N, ex._BLOCK_K)
     ex._BLOCK_N, ex._BLOCK_K = 8, 8192
-    report = run_edges("cpu")
+    with store_format(STREAM):
+        report = run_edges("cpu")
     want = {"code%d" % k for k in range(2, ex._MAX_GAP + 2)} | {"escape_code", "escape_no_code", "escape_nan"}
     assert want <= set(COVERAGE), sorted(want - set(COVERAGE))
     for dtype, fractions in report.items():
@@ -277,7 +307,10 @@ if __name__ == "__main__":
     run_random("cpu", cycles = 20, rows = 32)
     ex._BLOCK_N, ex._BLOCK_K = blocks
     subset = {torch.float16: (2.0**-25, 2.0**-11, 65504.0), torch.bfloat16: (2.0**-134, 2.0**-9, 3.3e38)}
-    run_edges("cpu", scales = subset, multipliers = (1.0, -1.5))
+    for fmt in (STREAM, INDEXED, CHOSEN):
+        with store_format(fmt):
+            run_edges("cpu", scales = subset, multipliers = (1.0, -1.5))
+    assert COVERAGE.get("indexed")
     test_max_fixup_refuses_before_changing_weights()
     run_negative("cpu")
     print("EDGES OK")

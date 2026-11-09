@@ -147,6 +147,88 @@ def run_opcheck(device):
         reset()
 
 
+def _host_ops(fn):
+    # aten calls made by fn outside the kernel launches (the interpreter's own tensor traffic is not counted).
+    from torch.utils._python_dispatch import TorchDispatchMode
+    state = {"ops": 0, "in_kernel": 0}
+
+    class Count(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args = (), kwargs = None):
+            if not state["in_kernel"]: state["ops"] += 1
+            return func(*args, **(kwargs or {}))
+
+    kernel = ex._exact_merge_kernel
+
+    class Launcher:
+        def __getitem__(self, grid):
+            def run(*args, **kwargs):
+                state["in_kernel"] += 1
+                try:
+                    return kernel[grid](*args, **kwargs)
+                finally:
+                    state["in_kernel"] -= 1
+            return run
+
+    ex._exact_merge_kernel = Launcher()
+    try:
+        with Count():
+            fn()
+    finally:
+        ex._exact_merge_kernel = kernel
+    return state["ops"]
+
+
+def run_batched_store(device):
+    # Every weight of one exact_fold call shares one store: one host lease, one copy each way and one readback per
+    # call, so the host work of a fold does not grow with the number of weights (GRPO folds hundreds per rollout).
+    for arena in ex._ARENAS.values():
+        arena.clear()
+    kind = "pageable" if device == "cpu" else "pinned"
+    # Leases other checks left live (opcheck folds on copies it never unfolds) are not this check's.
+    live = ex.host_arena_stats()[kind]["live"]
+    cases = []
+    for i in range(6):
+        dtype = torch.float16 if i % 2 else torch.bfloat16
+        W, A, B = _case(device, 32 * (1 + i % 3), 128 * (1 + i % 2), seed = 40 + i, dtype = dtype)
+        W[0, :8] = 2.0**-20   # tiny weights under a large delta: escapes in some targets, at varying offsets
+        cases.append((W, A, B * (1.0, 1e-4, 1e-5)[i % 3]))
+    before = [W.clone() for W, _, _ in cases]
+
+    def targets_of(cs):
+        return [ex.ExactFoldTarget(W.unsqueeze(0), A.unsqueeze(0), B.unsqueeze(0), 0.5) for W, A, B in cs]
+
+    ops = {}
+    for n in (2, 6):
+        ts = targets_of(cases[:n])
+        ex.exact_fold(ts)   # warm-up
+        ex.exact_unfold(ts)
+        ts = targets_of(cases[:n])
+        ops[n] = _host_ops(lambda: ex.exact_fold(ts))
+        if n == 6:
+            # Both store forms in one call: the small adapters indexed, the large ones on the stream.
+            assert set(ts[0].store.indexed) == {True, False}, ts[0].store.indexed
+            assert ex.host_arena_stats()[kind]["live"] == live + 1, ex.host_arena_stats()
+            assert sum(t.host_idx.numel() for t in ts) > 0 and sum(t.host_words.numel() for t in ts) > 0
+            # Unfold in two parts: the store is shared, so it must stay readable (and leased) until the last target.
+            ex.exact_unfold(ts[2:5])
+            assert ex.host_arena_stats()[kind]["live"] == live + 1
+            for (W, _, _), W0 in zip(cases[2:5], before[2:5]):
+                assert torch.equal(_bits(W), _bits(W0))
+            ex.exact_unfold(ts)
+            assert ex.host_arena_stats()[kind]["live"] == live
+        else:
+            ex.exact_unfold(ts)
+        for (W, _, _), W0 in zip(cases[:n], before[:n]):
+            assert torch.equal(_bits(W), _bits(W0))
+    assert ops[6] == ops[2], ops
+    # Folded targets dropped without an unfold (an aborted rollout) give their shared lease back at once.
+    ts = targets_of([(W.clone(), A, B) for W, A, B in cases[:3]])
+    ex.exact_fold(ts)
+    assert ex.host_arena_stats()[kind]["live"] == live + 1
+    del ts
+    assert ex.host_arena_stats()[kind]["live"] == live
+
+
 def run_empty_tiles(device):
     # Rows 96.. have B = 0 (a fresh LoRA): those tiles hold no code words and take the fast path; the others keep a
     # stream, including small-adapter rows 32..95 where a few elements still cross an exponent boundary.
@@ -171,8 +253,8 @@ def run_empty_tiles(device):
         caches = getattr(ex._exact_merge_kernel, "device_caches", None)
         if caches:
             for kernels in caches.values():
-                # One compiled variant per weight dtype: fp16 and bf16 here, every mode shared.
-                assert len(kernels[0]) <= 2, len(kernels[0])
+                # One compiled variant per pass (count / fold / unfold) and weight dtype: fp16 and bf16 here.
+                assert len(kernels[0]) <= 6, len(kernels[0])
 
 
 def run_all(device):
@@ -181,6 +263,7 @@ def run_all(device):
     run_arena_growth(device)
     run_arena_reuse(device)
     run_opcheck(device)
+    run_batched_store(device)
 
 
 @pytest.mark.skipif(not _cuda(), reason = "needs CUDA + Triton")
