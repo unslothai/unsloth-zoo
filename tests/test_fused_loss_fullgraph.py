@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The fused preference logps and no-grad fused CE scoring compile with fullgraph=True.
-
-The preference scorer used to compact rows with a boolean mask in traced code, a data dependent
-size that graph broke (or failed fullgraph) and recompiled as the valid token count changed. No-grad
-fused CE scoring with a real GradScaler called GradScaler.get_scale() in traced code, which Dynamo
-skips, so fullgraph evaluation failed.
-"""
+"""Fused preference logps and no-grad fused CE scoring compile with fullgraph=True; traced code must avoid boolean-mask
+row compaction (data-dependent size) and GradScaler.get_scale(), which Dynamo skips."""
 
 import os
 
@@ -28,8 +23,7 @@ import pytest
 import torch
 from torch._dynamo.utils import counters
 
-# UNSLOTH_ALLOW_CPU is read once at import, so set it only around the zoo imports and put the
-# previous value back: a module scope write would apply to every test collected after this one.
+# UNSLOTH_ALLOW_CPU is read once at import, so set it only around the zoo imports and restore the old value; a module-scope write leaks into later tests.
 _PREVIOUS_ALLOW_CPU = os.environ.get("UNSLOTH_ALLOW_CPU")
 try:
     os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1")
@@ -110,8 +104,8 @@ def test_preference_logps_explain_zero_breaks():
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("head_grad", [True, False])
 def test_preference_logps_matches_autograd_function_path(dtype, head_grad, monkeypatch):
-    # The custom op wraps the same compaction and chunk loops: bitwise equal to the
-    # autograd.Function path, including the vocab sliced backward of a trainable half head.
+    # The custom op wraps the same compaction and chunk loops and must be bitwise equal to the autograd.Function path,
+    # including the vocab sliced backward of a trainable half head.
     legacy = getattr(preference, "_fused_linear_token_logps_function", None)
     if legacy is None:
         pytest.skip("no custom op path")
@@ -147,9 +141,8 @@ def test_preference_logps_custom_op_opcheck():
 
 @pytest.mark.parametrize("seq_len, valid", [(8, 5), (64, 60)])
 def test_preference_logps_custom_op_opcheck_half_head_hidden_grad(seq_len, valid):
-    # A trainable fp16 head with hidden gradients: (8, 5) keeps the vocab sliced backward, while
-    # (64, 60) selects more than 2 * vocab rows, so the forward switches to the per chunk backward.
-    # The real op must still return the lse metadata at the shape the fake kernel declares.
+    # Trainable fp16 head with hidden grads: (8, 5) keeps the vocab sliced backward, while (64, 60), selecting more than
+    # 2 * vocab rows, switches to the per chunk backward; real op must return lse at the fake shape.
     if not hasattr(torch.library, "opcheck"):
         pytest.skip("torch.library.opcheck unavailable")
     states, weight, labels, mask = _inputs(seq_len, valid, dtype = torch.float16)

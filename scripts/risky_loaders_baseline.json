@@ -242,6 +242,14 @@
       "file": "unsloth_zoo/mlx/speculative.py",
       "rule": "dynamic-import",
       "sink": "import_module",
+      "digest": "1b828f3737f5d751",
+      "count": 1,
+      "reason": "Module name is a value of _MERGED_ASSISTANT_MODULES, a fixed table in this file; the checkpoint config only selects a key."
+    },
+    {
+      "file": "unsloth_zoo/mlx/speculative.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
       "digest": "357660739aa0ab3b",
       "count": 1,
       "reason": "Module name is the output_model_type of mlx-vlm's own MTP splitter class, bounded to the installed mlx_vlm.speculative.drafters package."

@@ -92,8 +92,8 @@ def _patch_post_init(cls):
 
     @functools.wraps(original)
     def __post_init__(self, *args, **kwargs):
-        # TRL resolves bf16=None to "not fp16" before the base class validates it, so normalise both
-        # before (fp16/optim) and after (TRL's resolved bf16) the original runs.
+        # TRL resolves bf16=None to not-fp16 before the base class validates it, so normalize fp16/optim before the
+        # original runs and TRL's resolved bf16 after it.
         normalize_cpu_training_arguments(self)
         result = original(self, *args, **kwargs)
         if getattr(self, "bf16", False) and not cpu_bf16_supported():
@@ -105,9 +105,9 @@ def _patch_post_init(cls):
 
 
 def _patch_cpu_fp16_accelerator(trainer_cls):
-    """accelerate turns fp16 into a silent fp32 run on CPU (no autocast, no scaler). When
-    normalize_cpu_training_arguments kept fp16 (native fp16, no native bf16), enable CPU autocast
-    and a CPU GradScaler before the model and optimizer are prepared."""
+    """accelerate turns fp16 into a silent fp32 run on CPU (no autocast, no scaler); when
+    normalize_cpu_training_arguments kept fp16 (no native bf16), enable CPU autocast and a CPU GradScaler before the
+    model and optimizer are prepared."""
     original = trainer_cls.create_accelerator_and_postprocess
     if getattr(original, "_unsloth_cpu", False):
         return
@@ -195,6 +195,27 @@ _LEGACY_SFT_KWARGS = {
 }
 
 
+def _patch_max_seq_length_alias(config_cls):
+    """TRL >= 0.20 dropped SFTConfig(max_seq_length), which notebooks and Studio pass: map it to max_length."""
+    fields = getattr(config_cls, "__dataclass_fields__", {})
+    if "max_seq_length" in fields or "max_length" not in fields:
+        return
+    original = config_cls.__init__
+    if getattr(original, "_unsloth_cpu", False):
+        return
+
+    @functools.wraps(original)
+    def __init__(self, *args, **kwargs):
+        if "max_seq_length" in kwargs:
+            max_seq_length = kwargs.pop("max_seq_length")
+            if max_seq_length is not None:
+                kwargs["max_length"] = max_seq_length
+        return original(self, *args, **kwargs)
+
+    __init__._unsloth_cpu = True
+    config_cls.__init__ = __init__
+
+
 def _make_cpu_sft_trainer(base):
     if getattr(base, "_unsloth_cpu", False):
         return base
@@ -226,10 +247,32 @@ def _make_cpu_sft_trainer(base):
                 for key, value in legacy.items():
                     setattr(training_args, _LEGACY_SFT_KWARGS[key], value)
                 normalize_cpu_training_arguments(training_args)
-            super().__init__(*args, **kwargs)
+            # Configs write in-process as dataset_num_proc = 1, but datasets >= 4.1 builds a Pool(1) for it
+            # (under spawn its child re-imports an unguarded __main__): stock TRL must see None while it maps.
+            training_args = kwargs.get("args", args[1] if len(args) > 1 else None)
+            num_proc = getattr(training_args, "dataset_num_proc", None)
+            serial = isinstance(num_proc, int) and not isinstance(num_proc, bool) and 0 <= num_proc <= 1
+            if serial:
+                training_args.dataset_num_proc = None
+            try:
+                super().__init__(*args, **kwargs)
+            finally:
+                if serial:
+                    training_args.dataset_num_proc = num_proc
 
-    SFTTrainer.__module__ = base.__module__
+    # Pickled by reference: by value (TRL's tokenize map, dataset_num_proc > 1) fails on torch config modules.
+    SFTTrainer.__module__ = __name__
+    SFTTrainer.__qualname__ = "_CPUSFTTrainer"
     return SFTTrainer
+
+
+def __getattr__(name):
+    # Spawn workers unpickling the CPU class get it, not stock TRL's SFTTrainer.
+    if name == "_CPUSFTTrainer":
+        install_cpu_training_defaults()
+        if name in globals():
+            return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def install_cpu_training_defaults():
@@ -248,10 +291,13 @@ def install_cpu_training_defaults():
         cls = getattr(trl, name, None)
         if cls is not None and "__post_init__" in vars(cls):
             _patch_post_init(cls)
+    if getattr(trl, "SFTConfig", None) is not None:
+        _patch_max_seq_length_alias(trl.SFTConfig)
     _patch_sft_compute_loss(sft_trainer.SFTTrainer)
     from .ops import patch_trl_fused_lm_head
     patch_trl_fused_lm_head()
     trainer = _make_cpu_sft_trainer(sft_trainer.SFTTrainer)
+    globals()["_CPUSFTTrainer"] = trainer
     for module in (sft_trainer, trl, sys.modules.get("trl.trainer")):
         if module is not None:
             setattr(module, "SFTTrainer", trainer)

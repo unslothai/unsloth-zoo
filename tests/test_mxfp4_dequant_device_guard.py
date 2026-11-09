@@ -128,3 +128,57 @@ def test_fp16_split_mm_on_non_current_gpu():
         timeout = 600,
     )
     assert proc.returncode == 0 and "OK" in proc.stdout, proc.stdout[-2000:] + proc.stderr[-4000:]
+
+
+def test_torch_dequant_enters_device_guard(monkeypatch):
+    # mxfp4_dequantize_torch is public and the GEMM probes call it directly, so it guards itself.
+    import unsloth_zoo.utils as zoo_utils
+    from unsloth_zoo.mxfp4_dequant import mxfp4_dequantize_torch
+
+    entered = []
+    real_guard = zoo_utils.device_guard
+
+    def recording_guard(tensor):
+        entered.append(tensor)
+        return real_guard(tensor)
+
+    monkeypatch.setattr(zoo_utils, "device_guard", recording_guard)
+    blocks = torch.full((2, 3, 16), 0x21, dtype = torch.uint8)
+    scales = torch.full((2, 3), 128, dtype = torch.uint8)
+    y = mxfp4_dequantize_torch(blocks, scales, dtype = torch.float32)
+    assert any(t is blocks for t in entered)
+    assert torch.equal(y, torch.tensor([1.0, 2.0]).repeat(96).reshape(2, 96))
+
+
+_TORCH_DEQUANT_RUNNER = textwrap.dedent(
+    """
+    import torch
+    import unsloth_zoo.mxfp4_dequant as mxd
+    import unsloth_zoo.mxfp4_gemm as mg
+
+    torch.cuda.set_device(0)
+    dev = torch.device("cuda", 1)
+    blocks = torch.full((2, 4, 16), 0x11, dtype = torch.uint8, device = dev)
+    scales = torch.full((2, 4), 127, dtype = torch.uint8, device = dev)
+    y = mxd.mxfp4_dequantize_torch(blocks, scales, dtype = torch.float32)
+    assert torch.equal(y.cpu(), torch.full((2, 128), 0.5))
+    assert torch.cuda.current_device() == 0
+    # The availability probes decode through mxfp4_dequantize_torch; a fault there is sticky.
+    mg.mxfp4_gemm_available(dev, torch.bfloat16)
+    torch.cuda.synchronize(0)
+    torch.cuda.synchronize(1)
+    print("OK")
+    """
+)
+
+
+@pytest.mark.skipif(not _two_gpus(), reason = "needs two CUDA devices")
+def test_torch_dequant_and_gemm_probe_on_non_current_gpu():
+    proc = subprocess.run(
+        [sys.executable, "-c", _TORCH_DEQUANT_RUNNER],
+        capture_output = True,
+        text = True,
+        env = dict(os.environ, CUDA_LAUNCH_BLOCKING = "1"),
+        timeout = 600,
+    )
+    assert proc.returncode == 0 and "OK" in proc.stdout, proc.stdout[-2000:] + proc.stderr[-4000:]

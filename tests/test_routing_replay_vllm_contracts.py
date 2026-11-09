@@ -14,12 +14,13 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MoE routing replay against vLLM's output contracts (0.21 split routes, prompt start offset,
-async scheduling), duplicate completions and checkpoint recompute identity. CPU only."""
+"""MoE routing replay against vLLM output contracts (0.21 split routes, prompt start offset, async scheduling),
+duplicate completions and checkpoint recompute identity; CPU only."""
 
 import ast
 import os
 import pathlib
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -261,8 +262,8 @@ class _NoStream:
 
 
 def test_the_cpu_stream_stand_in_covers_every_stream_call():
-    """The offload path calls these on whatever stream it holds; a method the stand-in lacks stops
-    the recompute test below with an AttributeError instead of checking the recompute."""
+    """The offload path calls these on whatever stream it holds; a method the stand-in lacks stops the recompute test
+    with AttributeError instead of checking the recompute."""
     import unsloth_zoo.gradient_checkpointing as gc
 
     tree = ast.parse(pathlib.Path(gc.__file__).read_text(encoding = "utf-8"))
@@ -280,9 +281,8 @@ def test_the_cpu_stream_stand_in_covers_every_stream_call():
 
 @pytest.fixture
 def offloaded_gc(monkeypatch):
-    """Unsloth's offloaded checkpoint (UnslothCheckpointFunction) with its offload branch on, CPU
-    tensors standing in for the device: the first activation is copied to a host buffer in forward
-    and rebuilt in the one reused staging buffer for every recompute, as on a GPU."""
+    """UnslothCheckpointFunction with its offload branch on (CPU tensors stand in for the device): the first activation
+    is copied to host in forward and rebuilt in one reused staging buffer."""
     import contextlib
 
     from unsloth_zoo import gradient_checkpointing as gc
@@ -364,7 +364,25 @@ def runner_env(monkeypatch):
     monkeypatch.setattr(vu, "_UNSLOTH_SET_V1_RUNNER", False)
     versions = {"vllm": "0.32.0"}
     monkeypatch.setattr(importlib.metadata, "version", lambda name: versions[name])
+    # Hermetic: an installed vLLM would override the mocked version.
+    monkeypatch.setitem(sys.modules, "vllm.config.vllm", None)
+    monkeypatch.setattr(vu, "_vllm_disable_envs_cache", lambda: None)
     return vu, versions
+
+
+@pytest.fixture
+def installed_vllm_029(monkeypatch):
+    # vLLM 0.29 installed: vllm.config.vllm exists but has no ROCM_DEFAULT_MRV1_ARCHITECTURES.
+    monkeypatch.setitem(sys.modules, "vllm.config.vllm", SimpleNamespace())
+
+
+def test_mocked_versions_ignore_the_installed_vllm(installed_vllm_029, runner_env, monkeypatch):
+    vu, versions = runner_env
+    versions["vllm"] = "0.31.0"
+    monkeypatch.setattr(vu, "is_hip", lambda: True)
+    args = _replay_args()
+    with pytest.warns(UserWarning, match = "on ROCm vLLM runs"):
+        assert vu._routing_replay_model_runner(args, _rocm_v1_config()) == "replay_off"
 
 
 def _replay_args():
@@ -657,7 +675,6 @@ def test_rocm_v1_default_is_gone_from_vllm_032(runner_env, monkeypatch, version)
     (None, None),
 ])
 def test_rocm_v1_default_follows_the_installed_vllm(runner_env, monkeypatch, defined, expected):
-    import sys
     vu, versions = runner_env
     versions["vllm"] = "0.31.0"
     monkeypatch.setattr(vu, "is_hip", lambda: True)

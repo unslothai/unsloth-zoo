@@ -330,8 +330,8 @@ def test_training_goes_through_the_drafter_forward(tmp_path):
 
 
 def test_default_ddp_reduces_the_loss_only_parameters(tmp_path):
-    """Trainer wraps an nn.Module in DDP(find_unused_parameters=True): norm.weight, used only by the loss,
-    must be in forward()'s output graph or backward raises "mark a variable ready only once"."""
+    """Trainer wraps the module in DDP(find_unused_parameters=True); norm.weight, used only by the loss, must be in
+    forward()'s output graph or backward raises "mark a variable ready only once"."""
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel
     target = _target()

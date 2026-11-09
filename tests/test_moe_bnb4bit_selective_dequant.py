@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_MOE_SELECTIVE_DEQUANT=1 / UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS=N: the bnb 4-bit recompute
-path dequantizes only routed experts (or a few at a time) and matches the full-stack path bit
-for bit in the output, the input / routing-weight grads and the expert LoRA grads."""
+"""UNSLOTH_MOE_SELECTIVE_DEQUANT=1 and UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS=N dequantize only routed experts in bnb 4-bit
+recompute; outputs and grads match the full-stack path bit for bit."""
 import os
 
 import pytest
@@ -163,8 +162,7 @@ def test_plan_declines_unsplittable_or_plain_weights(monkeypatch):
 
 
 def test_chunked_without_selective_skips_empty_chunks(monkeypatch):
-    # UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS alone covers every expert; chunks no token reaches used to
-    # be dequantized and multiplied with zero rows anyway.
+    # UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS alone covers every expert; chunks no token reaches are skipped rather than dequantized and multiplied by zero rows.
     torch.manual_seed(0)
     experts = _Experts(False)
     T = 16

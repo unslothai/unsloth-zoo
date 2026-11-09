@@ -131,9 +131,8 @@ def test_force_compile_skips_prebuilt(monkeypatch, tmp_path):
 
 
 def test_gpu_without_detectable_target_falls_back(monkeypatch, tmp_path):
-    # gpu_support=True with no detectable GPU target does not substitute a CPU
-    # prebuilt: it returns None so the caller compiles a GPU build. (Here no
-    # prebuilt release resolves either, so None is returned regardless.)
+    # gpu_support=True with no detectable GPU target never substitutes a CPU prebuilt: it returns None so the caller
+    # compiles a GPU build; no release resolves here either.
     monkeypatch.delenv("UNSLOTH_LLAMA_FORCE_COMPILE", raising = False)
     _patch_platform(monkeypatch, "Linux", "x86_64")
     monkeypatch.setattr(llama_cpp, "_detect_gpu_target", lambda: None)
@@ -171,8 +170,7 @@ def test_select_gpu_assets_narrowest_coverage_first(monkeypatch):
     _patch_platform(monkeypatch, "Linux", "x86_64")
     monkeypatch.setattr(llama_cpp, "_detect_gpu_target", lambda: ("cuda", 86, "cuda12"))
     names = [n for n, _ in llama_cpp._select_gpu_assets("b9585", FORK_ASSETS, FORK_MANIFEST)]
-    # sm86 fits cuda12-older (range 19) before cuda12-newer (range 34),
-    # then the cuda12 portable, then the other runtime line.
+    # sm86 fits cuda12-older (range 19) before cuda12-newer (range 34), then the cuda12 portable, then the other runtime line.
     assert names[:2] == [
         "app-b9585-linux-x64-cuda12-older.tar.gz",
         "app-b9585-linux-x64-cuda12-portable.tar.gz",
@@ -314,8 +312,7 @@ def test_extract_rejects_symlink_escape(tmp_path):
 @pytest.mark.skipif(not IS_POSIX, reason = "symlink extraction (POSIX)")
 @pytest.mark.parametrize("data_filter", [True, False], ids = ["data_filter", "no_data_filter"])
 def test_extract_rejects_chained_symlink_escape(tmp_path, monkeypatch, data_filter):
-    # Each link resolves inside when checked up front against an empty tree; only
-    # once `sub -> .` exists does `sub/up -> ..` point above the extraction dir.
+    # Each link resolves inside when checked against an empty tree; only once `sub -> .` exists does `sub/up -> ..` escape the extraction dir.
     if data_filter and not hasattr(tarfile, "data_filter"):
         pytest.skip("tarfile has no data filter on this Python")
     if not data_filter:
@@ -393,8 +390,7 @@ def test_extract_rejects_zip_symlink(tmp_path):
 
 @pytest.mark.skipif(not IS_POSIX or os.geteuid() == 0, reason = "read-only dir perms (non-root POSIX)")
 def test_extract_allows_readonly_dir_before_contents(tmp_path):
-    # A read-only dir entry preceding its files must not trip extraction:
-    # extractall defers directory perms until contents are written.
+    # A read-only dir entry preceding its files must not trip extraction, since extractall defers directory perms until contents are written.
     archive = tmp_path / "ro.tar.gz"
     with tarfile.open(archive, "w:gz") as tar:
         d = tarfile.TarInfo("ro")
@@ -449,10 +445,7 @@ def _make_binary_zip(path, tag):
 
 
 def test_extract_and_place_windows_zip(monkeypatch, tmp_path):
-    # The fork/ggml Windows bundle is a .zip; _place_prebuilt_binaries must land
-    # the executables + DLLs under build/bin/Release (where check_llama_cpp looks
-    # on Windows). Exercise the Windows placement on any host by patching
-    # IS_WINDOWS -- nothing is executed, only copied, so no POSIX skip is needed.
+    # _place_prebuilt_binaries must put the Windows .zip's binaries in build/bin/Release, where check_llama_cpp looks; IS_WINDOWS is patched, so nothing runs.
     archive = tmp_path / "llama-b9000-bin-win-cpu-x64.zip"
     _make_binary_zip(str(archive), "b9000")
     extract_dir = tmp_path / "extracted"
@@ -551,8 +544,7 @@ def test_corrupt_archive_falls_back(monkeypatch, tmp_path):
 
 @pytest.mark.skipif(not IS_POSIX, reason = "shell-script fake binaries")
 def test_install_llama_cpp_reuses_prebuilt_without_delete(monkeypatch, tmp_path):
-    # First call installs via the (stubbed) prebuilt path; the second must hit
-    # the existing-install reuse and NOT rmtree the marker-bearing folder.
+    # The second install must reuse the existing install and NOT rmtree the marker-bearing folder; the first installs via the stubbed prebuilt path.
     folder = str(tmp_path / "llama.cpp")
 
     def fake_prebuilt(llama_cpp_folder, **kwargs):
@@ -623,8 +615,7 @@ def test_select_cpu_assets_linux_missing_from_release(monkeypatch):
 # --- converter hydration source resolution (fork "mix" tag fix) ---------------
 
 def _capture_hydrate_url(monkeypatch):
-    """Record the source URL _hydrate_converter_sources resolves, then short-circuit
-    the download so only URL selection is under test."""
+    """Records the source URL _hydrate_converter_sources resolves, then stops the download so only URL selection is tested."""
     seen = {}
     def rec(url, dest_path):
         seen["url"] = url
@@ -646,8 +637,7 @@ def test_hydrate_prefers_fork_source_asset(monkeypatch, tmp_path):
 
 
 def test_hydrate_without_an_asset_map_reads_the_fork_release(monkeypatch, tmp_path):
-    # No asset map: the fork release is read by its tag for the source asset and
-    # its digest. The -mix- suffix is never stripped and ggml-org never asked.
+    # With no asset map the fork release is read by its tag for the source asset and digest; the -mix- suffix is never stripped and ggml-org is never asked.
     seen = _capture_hydrate_url(monkeypatch)
     tag = "b9739-mix-2d6bd50"
     name = f"llama.cpp-source-{tag}.tar.gz"
@@ -676,8 +666,7 @@ def test_hydrate_refuses_a_source_archive_with_no_published_digest(monkeypatch, 
 # --- attempt ORDER across the fork-GPU -> fork-CPU chain ----------------------
 
 def _wire_attempt_recorder(monkeypatch, *, fork_release, ggml_release, manifest = FORK_MANIFEST):
-    """Record (repo, asset_name) for every staged attempt then raise, so the whole
-    attempt chain is walked deterministically without any real download."""
+    """Records (repo, asset_name) for every staged attempt, then raises, so the whole attempt chain is walked deterministically with no download."""
     calls = []
     def fake_resolve(releases_api = None):
         if releases_api == llama_cpp.LLAMA_CPP_PUBLISHED_RELEASES_API:
@@ -692,9 +681,7 @@ def _wire_attempt_recorder(monkeypatch, *, fork_release, ggml_release, manifest 
         folder, tag, asset_name, asset_url, expected_sha256 = None, repo = None,
         source_assets = None, checksums = None,
     ):
-        # The checksum map has to reach here: it is what the source archive
-        # the converter is copied out of gets verified against, and a double
-        # that silently dropped it would let that plumbing rot unnoticed.
+        # The checksum map must reach staging: the source archive the converter is copied from is verified against it; a double dropping it would go unnoticed.
         assert checksums is not None, "the checksum map did not reach staging"
         calls.append((repo, asset_name))
         raise RuntimeError("forced fall-through")
@@ -715,9 +702,7 @@ def test_attempt_order_cpu_only_linux(monkeypatch, tmp_path):
 
 
 def test_attempt_order_gpu_cuda_host(monkeypatch, tmp_path):
-    # gpu_support=True with a CUDA target: ONLY fork GPU bundles are attempted --
-    # no CPU prebuilt and no ggml-org -- so if every GPU prebuilt fails the caller
-    # compiles a GPU build rather than silently landing on a CPU-only prebuilt.
+    # gpu_support=True with a CUDA target attempts ONLY fork GPU bundles (no CPU prebuilt, no ggml-org), so if all fail the caller compiles a GPU build.
     _patch_platform(monkeypatch, "Linux", "x86_64")
     monkeypatch.delenv("UNSLOTH_LLAMA_FORCE_COMPILE", raising = False)
     monkeypatch.setattr(llama_cpp, "_detect_gpu_target", lambda: ("cuda", 100, "cuda13"))
@@ -731,9 +716,7 @@ def test_attempt_order_gpu_cuda_host(monkeypatch, tmp_path):
 
 
 def test_attempt_order_gpu_no_target_compiles(monkeypatch, tmp_path):
-    # gpu_support=True but NO GPU target: no GPU bundle matches and CPU prebuilts
-    # are never substituted for a GPU request, so nothing is attempted and the
-    # caller compiles a GPU build (instead of the old silent CPU fallback).
+    # gpu_support=True with no GPU target attempts nothing: CPU prebuilts are never substituted for a GPU request, so the caller compiles a GPU build.
     _patch_platform(monkeypatch, "Linux", "x86_64")
     monkeypatch.delenv("UNSLOTH_LLAMA_FORCE_COMPILE", raising = False)
     monkeypatch.setattr(llama_cpp, "_detect_gpu_target", lambda: None)
@@ -744,8 +727,7 @@ def test_attempt_order_gpu_no_target_compiles(monkeypatch, tmp_path):
 
 
 def test_attempt_order_darwin_fork_only_no_ggml(monkeypatch, tmp_path):
-    # macOS: only the fork Metal bundle (GPU+CPU selectors dedup to one), and
-    # ggml-org is NEVER consulted (its recent macOS build needs macOS 26+).
+    # macOS tries only the fork Metal bundle (GPU and CPU selectors dedupe to one); ggml-org is never consulted, since its recent macOS build needs macOS 26+.
     _patch_platform(monkeypatch, "Darwin", "arm64")
     monkeypatch.delenv("UNSLOTH_LLAMA_FORCE_COMPILE", raising = False)
     monkeypatch.setattr(llama_cpp, "_detect_gpu_target", lambda: None)
@@ -784,9 +766,8 @@ def test_attempt_order_fork_unreachable_compiles(monkeypatch, tmp_path):
 
 @pytest.mark.skipif(not IS_POSIX, reason = "shell-script fake binaries")
 def test_cpu_fork_full_install_happy_path(monkeypatch, tmp_path):
-    # End-to-end (real _stage_prebuilt_install): gpu_support=False installs the
-    # fork app-*-cpu bundle and hydrates the converter from the fork's OWN source
-    # asset for a "mix" tag -- never the 404-ing ggml-org codeload URL.
+    # End-to-end: gpu_support=False installs the fork app-*-cpu bundle, hydrating the converter from the fork's own
+    # source asset for a mix tag, not the 404-ing ggml-org URL.
     tag = "b9585-mix-abc1234"
     asset = f"app-{tag}-linux-x64-cpu.tar.gz"
     fork_source = f"llama.cpp-source-{tag}.tar.gz"

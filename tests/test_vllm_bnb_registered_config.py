@@ -14,20 +14,15 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The bnb compute-dtype override must reach vLLM's quantization registry.
-
-In-tree vLLM (<= 0.27.1) re-imports `BitsAndBytesConfig` per
-`get_quantization_config` call, so a module attribute swap suffices. A plugin
-registers the CLASS OBJECT in `_CUSTOMIZED_METHOD_TO_QUANT_CONFIG`, merged in
-last, so the swap is invisible and `UNSLOTH_bnb_4bit_compute_dtype` is ignored.
-"""
+"""The bnb compute-dtype override must reach vLLM's quant registry: in-tree vLLM <= 0.27.1 re-imports BitsAndBytesConfig
+per call, so a swap works; a plugin's class object in _CUSTOMIZED_METHOD_TO_QUANT_CONFIG hides it and
+UNSLOTH_bnb_4bit_compute_dtype is ignored."""
 
 import importlib.machinery
 import sys
 import types
 
-# Imported BEFORE any stub lands in sys.modules: unsloth_zoo.vllm_utils runs
-# importlib.util.find_spec("vllm") at import time, which raises on a stub.
+# Import before any stub lands in sys.modules: unsloth_zoo.vllm_utils calls importlib.util.find_spec for vllm at import time, which raises on a stub.
 from unsloth_zoo.vllm_utils import _set_registered_quant_config
 
 
@@ -72,8 +67,7 @@ def test_registered_config_is_swapped_and_restored(monkeypatch):
 
 
 def test_an_unregistered_method_is_left_alone(monkeypatch):
-    # In-tree vLLM registers nothing here; inventing a key would shadow the
-    # call-time import that path relies on.
+    # In-tree vLLM registers nothing here; inventing a registry key would shadow the call-time import that path relies on.
     registry = {}
     set_config = _helper(monkeypatch, registry)
 
@@ -82,12 +76,8 @@ def test_an_unregistered_method_is_left_alone(monkeypatch):
 
 
 def test_the_missing_plugin_error_is_raised_where_4bit_is_decided():
-    """The install hint must sit on a reachable path.
-
-    It used to live only in an `_apply_4bit_weight` defined in the no-bnb
-    branch, which `patch_vllm_bitsandbytes` never installs, so a 4-bit load on
-    vLLM >= 0.28 without the plugin hit vLLM's generic quantization error.
-    """
+    """The missing-plugin install hint must be raised where 4-bit is decided: patch_vllm_bitsandbytes never installs the
+    no-bnb `_apply_4bit_weight`, so vLLM >= 0.28 gave a generic error."""
     import inspect
 
     from unsloth_zoo import vllm_utils

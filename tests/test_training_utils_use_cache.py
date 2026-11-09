@@ -6,13 +6,8 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""CPU-pure behavioural tests for `use_cache` handling in
-`prepare_model_for_training` (unsloth_zoo/training_utils.py).
-
-The prepare step walks `model.config` and every nested transformers config and
-disables the KV cache, which gradient checkpointing makes dead weight. These
-tests pin that contract, including its restore half.
-"""
+"""CPU-pure tests for use_cache in prepare_model_for_training (unsloth_zoo/training_utils.py): it disables the KV cache,
+dead weight under gradient checkpointing, on every nested config; restore undoes it."""
 
 from __future__ import annotations
 
@@ -188,9 +183,8 @@ def test_double_prepare_keeps_first_originals():
     assert model.config.use_cache is True
 
 
-# Configs that never declared use_cache: transformers sub-configs inherit no
-# default, so a forward reading self.config.use_cache raised AttributeError.
-# stepfun-ai/Step-3.7-Flash ships a text config of exactly this shape.
+# Configs that never declare use_cache: transformers sub-configs inherit no default, so a forward reading
+# self.config.use_cache raised AttributeError; stepfun-ai/Step-3.7-Flash ships a text config of this shape.
 
 
 class _NoUseCacheConfig(PreTrainedConfig):
@@ -215,8 +209,7 @@ def test_absent_use_cache_is_set_so_forward_can_read_it():
 
 
 def test_restore_removes_an_invented_use_cache_rather_than_inventing_False():
-    """Without _ABSENT, restore writes False back and disables the KV cache on
-    a config the checkpoint never shipped one for."""
+    """Without _ABSENT, restore writes False back and disables the KV cache on a config the checkpoint never shipped one for."""
     config = _composite_without_use_cache()
     model = _ConfigCarrier(config)
     prepare_model_for_training(
@@ -250,9 +243,8 @@ def test_absent_use_cache_survives_a_disable_restore_cycle():
     ],
 )
 def test_absent_marker_survives_copying_the_model(clone):
-    """The record is copied with the model, so an object() sentinel would lose
-    identity and restore would write the unserializable sentinel into the
-    config. TRL deepcopies a prepared model for its reference model."""
+    """The absent record must survive deepcopy, which TRL applies to a prepared model for its reference model; an
+    object() sentinel loses identity, so restore would write it, unserializable, into the config."""
     config = _composite_without_use_cache()
     model = _ConfigCarrier(config)
     prepare_model_for_training(
@@ -265,8 +257,8 @@ def test_absent_marker_survives_copying_the_model(clone):
     copied.config.text_config.to_json_string()
 
 
-# A config first reached on a LATER disable_use_cache call: recording once
-# meant it was disabled but never recorded, so restore could not undo it.
+# A config first reached on a later disable_use_cache call must be recorded too: recording only on the first pass left
+# it disabled but unrecorded, so restore could not undo it.
 
 _ABSENT_PARAM = object()
 

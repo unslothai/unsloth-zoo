@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A LoRA rank that is not a multiple of 8 (4, 6, ...) must still reach torch._grouped_mm.
-
-torch._grouped_mm needs 16-byte aligned strides. A bf16 rank of 4 gives the (E, in, R)
-factor and the (T, R) intermediate an 8-byte row, so eager fell back to the per-expert
-host-synced loop on every LoRA matmul and torch.compile aborted the trace outright.
-"""
+"""LoRA ranks not a multiple of 8 (4, 6) must still reach torch._grouped_mm, which needs 16-byte aligned strides; else per-expert loops and torch.compile aborts."""
 import pytest
 import torch
 

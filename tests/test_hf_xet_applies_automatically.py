@@ -14,17 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The tuning is only worth anything if it reaches the process that does the downloading.
-
-hf_xet reads its configuration once, natively, the first time the runtime is built. Setting the
-variables after that is a no-op that leaves no trace, so "we set them" and "they took effect" are
-different claims and only the second one matters. These tests make the second claim: import
-unsloth_zoo the way a user does, in a clean environment, and check what the environment actually
-holds afterwards and what a spawned worker inherits.
-
-Importing unsloth_zoo is expensive, so the checks are grouped by the environment they need rather
-than one subprocess per assertion.
-"""
+"""Checks that importing unsloth_zoo tunes hf_xet in a clean subprocess env that spawned workers inherit; hf_xet reads
+env once at runtime build, so late settings are no-ops."""
 
 from __future__ import annotations
 
@@ -39,8 +30,7 @@ import pytest
 
 ZOO_ROOT = str(Path(__file__).resolve().parents[1])
 
-# Built, never inherited: this machine exports HF_XET_HIGH_PERFORMANCE=1, which is exactly the
-# setting one of these tests is about, and inheriting it would make the test pass for free.
+# Built, never inherited: this machine exports HF_XET_HIGH_PERFORMANCE=1, which would make these tests pass for free.
 _BASE_ENV = {
     k: v for k, v in os.environ.items()
     if not k.startswith(("HF_XET_", "HF_HUB_", "UNSLOTH_"))
@@ -49,8 +39,8 @@ _BASE_ENV["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
 
 
 def _run(tmp_path: Path, body: str, extra_env: "dict[str, str] | None" = None) -> dict:
-    """Run *body* as a FILE, not with -c: multiprocessing spawn re-imports __main__ in the child,
-    which a -c script cannot provide, and the failure looks like an unrelated pickling error."""
+    """Run body as a FILE, not with -c: multiprocessing spawn re-imports __main__ in the child, which a -c script cannot
+    provide; the failure looks like an unrelated pickling error."""
     script = tmp_path / "probe.py"
     script.write_text(textwrap.dedent(body))
     env = dict(_BASE_ENV, PYTHONPATH = ZOO_ROOT + os.pathsep + _BASE_ENV.get("PYTHONPATH", ""))
@@ -67,8 +57,7 @@ def _run(tmp_path: Path, body: str, extra_env: "dict[str, str] | None" = None) -
 
 @pytest.mark.timeout(1200)
 def test_importing_unsloth_zoo_tunes_this_process_and_its_workers(tmp_path):
-    """No flag, no call, no documentation to read: the download a user starts next is tuned, and so
-    is the one a spawned worker starts, which is where downloads actually happen."""
+    """No flag or call is needed: the download a user starts next, and the one a spawned worker starts (where downloads happen), are both tuned."""
     result = _run(tmp_path, """
         import json, multiprocessing, os, sys
 
@@ -107,8 +96,7 @@ def test_importing_unsloth_zoo_tunes_this_process_and_its_workers(tmp_path):
 
 @pytest.mark.timeout(1200)
 def test_a_user_who_asked_for_high_performance_still_has_it_after_import(tmp_path):
-    """The end-to-end form of the setdefault rule. Overriding this cost a 192-core host 2.55x of
-    its download throughput the moment it imported us."""
+    """End-to-end form of the setdefault rule: a user's high-performance setting must survive import, as overriding it cut a 192-core host's download throughput."""
     result = _run(tmp_path, """
         import json, os
         import unsloth_zoo  # noqa: F401
@@ -124,14 +112,8 @@ def test_a_user_who_asked_for_high_performance_still_has_it_after_import(tmp_pat
 
 @pytest.mark.timeout(1200)
 def test_a_fresh_vm_with_an_empty_xet_log_dir_does_not_import_into_high_performance(tmp_path):
-    """The 2026.6.7 regression lived in ``__init__``, not in the tuning function, so it can only be
-    caught by importing. That release read hf_xet's logs for a prior 429 and, finding none, set
-    ``HF_XET_HIGH_PERFORMANCE=1`` -- which on a VM created seconds ago is every single time. Colab
-    standard then OOM-killed a 29.5GB download at 11.32GB RSS against 13.61GB of RAM.
-
-    An empty log directory is the exact state under test, so create one and point the cache at it
-    rather than relying on whatever this machine happens to have.
-    """
+    """The 2026.6.7 regression in __init__ set HF_XET_HIGH_PERFORMANCE=1 when no 429 was logged (every fresh VM) and
+    OOM-killed a Colab standard download; only importing catches it; the empty xet log dir is created explicitly."""
     xet_cache = tmp_path / "xet"
     (xet_cache / "logs").mkdir(parents = True)   # exists, and holds no 429 -- the fresh-VM case
     result = _run(tmp_path, """
@@ -144,8 +126,8 @@ def test_a_fresh_vm_with_an_empty_xet_log_dir_does_not_import_into_high_performa
         }))
     """, {"HF_XET_CACHE": str(xet_cache), "HF_HOME": str(tmp_path / "hf")})
 
-    # Judge the flag with the parser the tuning code uses: it strips and lowercases, so a raw
-    # membership test would let "True" or " on " through -- the regression back, respelled.
+    # Judge the flag with the tuning code's _is_true parser: it strips and lowercases, so a raw membership test would
+    # let "True" or " on " reintroduce the regression.
     from unsloth_zoo.hf_xet_tuning import _is_true
 
     assert not _is_true(result["hp"]), (

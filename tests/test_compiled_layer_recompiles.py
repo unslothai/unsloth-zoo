@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""One compiled decoder-layer graph serves every layer and every sequence length.
-
-Each case runs 10 layers (own parameters) at 10 different sequence lengths through one compiled
-function and counts Dynamo frames: at most 2 (the first static compile and its dynamic promotion).
-Before the fixes every layer compiled its own graph: id() of a layer's expert parameter
-(ID_MATCH guard), a lazily assigned module global, and the router_logits list length.
-"""
+"""One compiled decoder-layer graph serves every layer and sequence length, capped at 2 Dynamo frames; per-layer
+recompiles came from an id() guard on expert params, a lazy global, and router_logits length."""
 
 import pytest
 import torch
@@ -187,3 +182,85 @@ def test_scratch_keeps_capture_order_after_a_nested_reset():
                 var.__dict__.pop(k, None)
             else:
                 setattr(var, k, v)
+
+
+@pytest.mark.parametrize("with_owner", [True, False])
+def test_checkpoint_recompute_reuses_the_forward_graph(with_owner):
+    """Gemma-4 E2B vision/audio: the recompute compiled a second graph in backward and raised CheckpointError."""
+    from torch.utils.checkpoint import checkpoint
+    from unsloth_zoo.temporary_patches.misc import output_capture_scratch
+    var = _collector()
+    layers = [_Layer(var) for _ in range(3)]
+    torch._dynamo.reset()
+    cc = CompileCounter()
+    compiled = torch.compile(_Layer.forward, backend = cc, dynamic = None)
+
+    def block(layer, x):
+        with (output_capture_scratch(owner = layer) if with_owner else output_capture_scratch()):
+            return compiled(layer, x)
+
+    x = torch.randn(2, 7, 8, requires_grad = True)
+    collected = {"router_logits": []}
+    token = var.set(collected)
+    try:
+        h = x
+        for layer in layers:
+            h = checkpoint(block, layer, h, use_reentrant = False)
+    finally:
+        var.reset(token)
+    forward_frames = cc.frame_count
+    h.sum().backward()
+    backward_frames = cc.frame_count - forward_frames
+    torch._dynamo.reset()
+    assert len(collected["router_logits"]) == len(layers)
+    assert var.__dict__.get("_unsloth_eager_value") is None
+    if with_owner:
+        assert backward_frames == 0
+    else:
+        assert backward_frames >= 1  # control
+
+
+class _HiddenLayer(_Layer):
+    def __init__(self, var):
+        super().__init__(var)
+
+        def pre_hook(module, args):
+            collected = var.get()
+            if collected is not None and "hidden_states" in collected.keys():
+                collected["hidden_states"].append(args[0])
+
+        self.proj.register_forward_pre_hook(pre_hook)
+
+
+@pytest.mark.parametrize("drop_outputs", [False, True])
+def test_checkpoint_recompute_reuses_the_forward_graph_with_hidden_states(drop_outputs):
+    """The replay must hand back same-metadata tensors for hidden_states, also once they are freed."""
+    from torch.utils.checkpoint import checkpoint
+    from unsloth_zoo.temporary_patches.misc import output_capture_scratch
+    var = _collector()
+    layers = [_HiddenLayer(var) for _ in range(3)]
+    torch._dynamo.reset()
+    cc = CompileCounter()
+    compiled = torch.compile(_HiddenLayer.forward, backend = cc, dynamic = None)
+
+    def block(layer, x):
+        with output_capture_scratch(owner = layer):
+            return compiled(layer, x)
+
+    x = torch.randn(2, 7, 8, requires_grad = True)
+    collected = {"router_logits": [], "hidden_states": [x.detach().clone()]}
+    token = var.set(collected)
+    try:
+        h = x
+        for layer in layers:
+            h = checkpoint(block, layer, h, use_reentrant = False)
+    finally:
+        var.reset(token)
+    forward_frames = cc.frame_count
+    if drop_outputs:
+        collected["hidden_states"].clear()
+    h.sum().backward()
+    backward_frames = cc.frame_count - forward_frames
+    torch._dynamo.reset()
+    assert len(collected["router_logits"]) == len(layers)
+    assert backward_frames == 0

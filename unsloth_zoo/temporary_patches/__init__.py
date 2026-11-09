@@ -39,11 +39,16 @@ from .qwen4_exp import *
 from .glm4_moe import *
 from .deepseek_v3_moe import *
 from .deepseek_v4 import *
+from .sparse_attention import *
+from .deepseek_v4_sparse_flex import *
+from .sparse_attention_flex import *
+from .glm5_next_sparse_flex import *
 from .gemma4_moe import *
 from .lfm2_moe import *
 from .step3p7_moe import *
 from .mixtral_moe import *
 from .llama4_moe import *
+from .moe_lora_factor_swap import *
 from .inkling import *
 from .compiled_model_identity import *
 from .bitsandbytes_large_tensors import *
@@ -63,10 +68,10 @@ from .moe_grouped_modulelist import *
 from .moe_utils_fp8 import *
 from .fp8_uncontained_weights import *
 from .flex_attention_bwd import *
+from .inductor_stride_guard import *
 from .remote_code_vlm import *
-# The eager-fallback recovery hook unsloth calls when a backward dies inside
-# activation checkpointing. Named rather than star-imported: `utils` also
-# exports names this package has never re-exported.
+# Eager-fallback hook unsloth calls when backward dies inside activation checkpointing; imported by name since utils
+# exports names this package never re-exports.
 from .utils import (
     eager_fallback_state,
     force_eager_fallback,

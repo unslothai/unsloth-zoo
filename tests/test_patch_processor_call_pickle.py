@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""A patch_processor_call processor pickles (spawn DataLoader workers, TRL's AsyncGRPO rollout
-worker): the patched subclass shares the stock class's name, so pickle could not look it up."""
+"""Patched processors must pickle for spawn DataLoader workers and TRL AsyncGRPO rollout workers; the patched subclass
+shares the stock class name, so pickle could not look it up."""
 
 import copy
 import os

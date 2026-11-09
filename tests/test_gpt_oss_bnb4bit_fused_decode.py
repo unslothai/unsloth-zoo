@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""One-token decode on fused gpt-oss experts quantized to bnb 4-bit (packed 2D Params4bit)
-must take the module forward, not the dense bmm kernel."""
+"""One-token decode on fused gpt-oss experts quantized to bnb 4-bit (packed 2D Params4bit) must take the module forward, not the dense bmm kernel."""
 
 import os
 

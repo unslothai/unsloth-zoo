@@ -14,14 +14,6 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Hugging Face Hub download helpers that import without ``unsloth_zoo``'s package init.
-
-``unsloth_zoo/__init__`` imports torch, transformers and the temporary patches, which costs
-seconds and hundreds of megabytes that a download-only caller never uses. Every module here
-is stdlib-only at import time, so a backend can take the Xet health verdict, the RAM-derived
-buffer caps and the stall watchdog without that init, and so can the download child it spawns.
-The ``unsloth_zoo.<module>`` names stay importable and resolve to these same module objects.
-Importing from here also skips the init's environment steps (the read-only cache redirect,
-``apply_xet_env``, the offline and stable-download flags, the hf_transfer default), so a
-process that never imports ``unsloth_zoo`` applies the ones it needs itself.
-"""
+"""Stdlib-only Hub download helpers for a backend and its child, importable without unsloth_zoo's init (torch,
+transformers, patches); the init's env steps (cache redirect, apply_xet_env, offline/hf_transfer flags) are skipped;
+callers set those; unsloth_zoo.<module> aliases these modules."""

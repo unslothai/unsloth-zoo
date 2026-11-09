@@ -37,8 +37,8 @@ def _run(hidden, weight, upstream):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_sliced_head_grad_does_not_overflow_fp16(monkeypatch, device):
-    # Two vocab slices double the rows per GEMM; opposite signed upstream grads (chosen vs
-    # rejected) cancel in the sum, but an fp16 GEMM output overflowed first and gave NaNs.
+    # Two vocab slices double the rows per GEMM; opposite signed upstream grads (chosen vs rejected) cancel in the sum,
+    # but an fp16 GEMM output overflowed first and gave NaNs.
     monkeypatch.setattr(module, "_target_chunk_bytes", lambda: 1024 * 1024)
     hidden = torch.full((1, 4, 8), 1.5, device = device, dtype = torch.float16)
     weight = torch.zeros((65536, 8), device = device, dtype = torch.float16)
@@ -68,8 +68,8 @@ def test_sliced_hidden_grad_does_not_overflow_fp16(monkeypatch, device):
     (64, False, True),
 ])
 def test_long_context_keeps_per_chunk_backward(monkeypatch, n_rows, hidden_grad, want_sliced):
-    # Sliced backward's float32 rows x hidden gradient outgrows the per chunk loop's head sized
-    # copies once rows exceed about twice the vocab, so long contexts keep the per chunk loop.
+    # Sliced backward's float32 rows x hidden grad outgrows the per chunk head-sized copies past about twice the vocab,
+    # so long contexts keep the per chunk loop.
     monkeypatch.setattr(module, "_FUSED_LINEAR", False)
     calls = []
     real = module._sliced_backward
@@ -87,8 +87,7 @@ def test_long_context_keeps_per_chunk_backward(monkeypatch, n_rows, hidden_grad,
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_per_chunk_head_grad_does_not_overflow_fp16(monkeypatch, device):
-    # Rows past about twice the vocab take the per chunk loop; its head GEMM must not round each
-    # chunk to fp16 either, or +inf and -inf chunks sum to NaN.
+    # Rows past about twice the vocab take the per chunk loop; its head GEMM must not round each chunk to fp16 either, or +inf and -inf chunks sum to NaN.
     monkeypatch.setattr(module, "_target_chunk_bytes", lambda: 1024)  # 4 rows per chunk
     monkeypatch.setattr(module, "_FUSED_LINEAR", False)
     calls = []
@@ -106,8 +105,8 @@ def test_per_chunk_head_grad_does_not_overflow_fp16(monkeypatch, device):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_per_chunk_bf16_hidden_grad_with_fp16_head_does_not_overflow(monkeypatch, device):
-    # Enough rows for the per chunk backward. Row 0's hidden gradient, about -72000, fits bf16 but
-    # not an fp16 GEMM output, which gave -inf before the cast to the hidden dtype.
+    # Enough rows for the per chunk backward: row 0's hidden grad (about -72000) fits bf16 but not an fp16 GEMM output,
+    # which gave -inf before the cast to the hidden dtype.
     monkeypatch.setattr(module, "_target_chunk_bytes", lambda: 1024 * 1024)
     vocab, hidden_size, n_rows = 129, 2048, 259
     weight = torch.full((vocab, hidden_size), 600.0, device = device)

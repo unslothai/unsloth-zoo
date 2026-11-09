@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Every third-party package a zoo module imports at module level is a declared dependency.
-
-`import unsloth_zoo` imports these modules eagerly, so an undeclared one fails at import time on any
-install that happens not to pull it in transitively. `requests` was exactly that: llama_cpp,
-rl_environments and vision_utils import it at the top, and it only ever arrived through datasets,
-which dropped it in 5.x. The version-compat `latest` lane hit `No module named 'requests'`.
-"""
+"""Every third-party package a zoo module imports at module level must be declared: import unsloth_zoo loads them
+eagerly, and requests arrived only via datasets, which dropped it in 5.x."""
 
 from __future__ import annotations
 
@@ -41,8 +36,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # Import name -> distribution name, where they differ.
 DISTRIBUTION = {"PIL": "pillow"}
 
-# Imported at module level but deliberately not declared, with the declared dependency that
-# guarantees it. Each one is a hard requirement of that dependency, not an accident of a resolve.
+# Imported at module level but deliberately undeclared: each is a hard requirement of the declared dependency that guarantees it, not a resolver accident.
 GUARANTEED_BY = {"safetensors": "transformers"}
 
 

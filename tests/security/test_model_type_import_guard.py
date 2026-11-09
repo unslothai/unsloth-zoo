@@ -1,16 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""`model_type` comes off a downloaded config.json and is interpolated into code.
-
-`unsloth_compile_transformers` imports `transformers.models.{model_type}.modeling_{model_type}`,
-and `create_new_function` names the compiled cache file from the same string, so a config
-carrying `"model_type": "llama'); import os; os.system(...)"` used to reach an `exec`.
-`get_transformers_model_type` is the single choke point every caller goes through.
-
-CPU-only and network-free: a stub whose `to_dict` returns the payload is exactly how a
-trust_remote_code config surfaces an arbitrary model_type.
-"""
+"""model_type from a downloaded config.json is interpolated into imports and cache names, so get_transformers_model_type
+is the single choke point every caller passes through; tests are CPU-only and network-free."""
 
 import re
 
@@ -47,8 +39,7 @@ def test_injected_model_type_rejected(model_type):
 
 
 def test_path_traversal_cannot_survive():
-    """"/" and "." are rewritten to "_" before the guard, so traversal cannot reach
-    either the import path or the compiled-cache filename."""
+    """Slashes and dots are rewritten to underscores before the guard, so traversal cannot reach the import path or the cache filename."""
     for model_type in ("../../../etc/passwd", "a/../../b"):
         result = get_transformers_model_type(_StubConfig(model_type))
         assert all(re.fullmatch(r"[a-z0-9_]+", t) for t in result), result
@@ -57,8 +48,7 @@ def test_path_traversal_cannot_survive():
 # --- no legitimate model_type may be rejected --------------------------------
 
 def test_every_shipped_model_type_accepted():
-    """A false rejection here breaks loading a real model, so pin the whole set
-    transformers ships plus the remote-code types unsloth is known to see."""
+    """A false rejection breaks loading a real model, so the whole transformers set plus known remote-code model types must stay accepted."""
     import transformers.models
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
 
@@ -81,9 +71,7 @@ def test_every_shipped_model_type_accepted():
 
 @pytest.mark.parametrize("name", ["dbrx", "got_ocr2", "qwen3_omni_moe"])
 def test_composite_config_with_empty_nested_sentinels(name):
-    """`PretrainedConfig.model_type` defaults to "", so a nested sub-config that does not
-    override it serialises as an empty string. The recursive walk collects those alongside
-    the real top-level type, and they must not be mistaken for an injected module name."""
+    """PretrainedConfig.model_type defaults to an empty string, so nested sub-configs serialise empty sentinels that must not be read as injected module names."""
     from transformers import AutoConfig
 
     config = AutoConfig.for_model(name)
@@ -91,8 +79,7 @@ def test_composite_config_with_empty_nested_sentinels(name):
 
 
 def test_all_empty_model_types_is_unresolved():
-    """Nothing but sentinels means the architecture is still unknown, which is the
-    existing "cannot determine" case rather than an injection."""
+    """If only empty sentinels remain the architecture is unknown, which is the existing cannot-determine case, not an injection."""
     class OnlySentinels:
         def to_dict(self):
             return {"model_type": "", "text_config": {"model_type": ""}}

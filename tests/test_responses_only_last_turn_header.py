@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Auto-detect must pick a response marker the LAST assistant turn carries (ERNIE-4.5-Thinking),
-and a raise on eval_dataset must leave train_dataset untouched."""
+"""Auto-detect must pick a response marker the LAST assistant turn carries (ERNIE-4.5-Thinking), and a raise on eval_dataset must leave train_dataset untouched."""
 import types
 
 import pytest

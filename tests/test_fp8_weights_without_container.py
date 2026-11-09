@@ -14,6 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """Uncontained FP8 expert stacks (Step-3.7-Flash-FP8) dequantize at load; FP8Linear targets stay packed."""
+import inspect
 import json
 import os
 
@@ -33,6 +34,7 @@ if not hasattr(FineGrainedFP8HfQuantizer, "update_weight_conversions"):
 import unsloth_zoo  # noqa: F401
 from unsloth_zoo.temporary_patches.fp8_uncontained_weights import (
     _dequantized_targets,
+    _fallback_source_patterns,
     patch_fp8_dequantize_weights_without_container,
     _make_op,
     _target_owns_scale,
@@ -143,7 +145,7 @@ def test_save_keeps_a_container_packed_and_requantizes_a_dequantized_weight():
         model.experts.weight.copy_(loaded["experts.weight"])
     model._weight_conversions = [
         WeightConverter(
-            source_patterns = ["weight$", "weight_scale_inv", "activation_scale"],
+            source_patterns = _fallback_source_patterns(_quantizer()),
             target_patterns = "weight",
             operations = [op],
         )
@@ -188,7 +190,7 @@ def test_save_leaves_an_excluded_full_precision_weight_alone():
 
     model._weight_conversions = [
         WeightConverter(
-            source_patterns = ["weight$", "weight_scale_inv", "activation_scale"],
+            source_patterns = _fallback_source_patterns(_quantizer()),
             target_patterns = "weight",
             operations = [op],
         )
@@ -236,7 +238,9 @@ def test_target_owns_scale_predicate():
 def test_fallback_converter_only_for_prequantized_packed_loads(pre_quantized, dequantize, appended):
     from transformers.core_model_loading import WeightConverter
     q = _quantizer(pre_quantized = pre_quantized, dequantize = dequantize)
-    conversions = q.update_weight_conversions([])
+    # transformers 5.21 takes the model too.
+    takes_model = len(inspect.signature(getattr(q.update_weight_conversions, "_unsloth_original", q.update_weight_conversions)).parameters) > 2
+    conversions = q.update_weight_conversions([], _Holder()) if takes_model else q.update_weight_conversions([])
     ours = [
         c for c in conversions
         if isinstance(c, WeightConverter)

@@ -14,14 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""load_vllm's startup banner must report what vLLM was actually given.
-
-Two numbers in it described nothing that reached the engine: the chunked prefill
-budget came from a dead local, and swap space is dropped by the good_keys filter
-on vLLM 0.18.0 and newer. Both now read back from engine_args after that filter.
-On the AST, not on text, so reformatting is free. Source-level because load_vllm
-needs a live GPU, as in test_vllm_utils_xpu_sm_cap.py.
-"""
+"""Checks load_vllm's startup banner reads the chunked prefill budget and swap space from engine_args after the
+good_keys filter, which drops swap space on vLLM >= 0.18.0; AST-based, no GPU."""
 
 import ast
 import pathlib
@@ -80,8 +74,7 @@ def test_banner_reports_the_budget_vllm_receives():
 def test_banner_is_printed_after_the_unsupported_key_filter():
     load_vllm = _load_vllm_node()
     banner = _banner_value(load_vllm)
-    # engine_args is filtered against EngineArgs' signature; printing before that
-    # is how swap space kept being reported after vLLM 0.18.0 stopped taking it.
+    # engine_args is filtered against EngineArgs' signature, so the banner must print after that filter; swap space was reported after vLLM 0.18.0 dropped it.
     deletes = [n.lineno for n in ast.walk(load_vllm)
                if isinstance(n, ast.Delete)
                for t in n.targets
@@ -92,8 +85,8 @@ def test_banner_is_printed_after_the_unsupported_key_filter():
 
 
 def test_budget_is_clamped_when_chunked_prefill_is_off():
-    # vLLM raises when max_num_batched_tokens < max_model_len and it cannot chunk.
-    # Gated, not blanket: a blanket floor would disable chunking for text models.
+    # vLLM raises when max_num_batched_tokens < max_model_len and cannot chunk; the clamp is gated, since a blanket
+    # floor would disable chunking for text models.
     for node in ast.walk(_load_vllm_node()):
         if not isinstance(node, ast.If): continue
         if not (isinstance(node.test, ast.UnaryOp) and isinstance(node.test.op, ast.Not)

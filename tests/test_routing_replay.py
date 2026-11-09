@@ -406,8 +406,8 @@ def test_gradient_checkpointing_recompute_uses_replay(replay):
 
 
 def test_recompute_replays_each_forward_of_a_chunked_loss(replay):
-    # Two equal-shape forwards before one backward, as the padded GRPO chunk loop does: each
-    # checkpoint recompute must replay its own forward's routes, not the last forward's.
+    # Two equal-shape forwards before one backward, as the padded GRPO chunk loop does: each checkpoint recompute
+    # replays its own forward's routes, not the last one.
     sequences = [([5, 6, 7], [30, 31, 32, 33]), ([8, 9, 10], [40, 41, 42, 43])]
     model = _model()
     forced = _forced_rows(model, sequences, shift = 2)
@@ -441,8 +441,7 @@ def _old_weighted_sum_hash(ids):
 
 
 def test_recompute_tells_apart_forwards_whose_routes_hash_alike(replay):
-    # Two different sequences whose first layer natural routes collide under a weighted sum
-    # hash: each checkpoint recompute must still replay its own forward's routes.
+    # Two sequences whose first-layer natural routes collide under a weighted sum hash: each checkpoint recompute must still replay its own forward's routes.
     model = _model()
     batch = torch.randint(1, 64, (256, 7), generator = torch.Generator().manual_seed(749))
     captured = {}
@@ -504,8 +503,8 @@ def test_recompute_keeps_natural_routing_when_forwards_are_ambiguous(replay):
 
 
 def test_recompute_accepts_the_same_expert_set_in_another_order(replay):
-    # Two forwards with identical natural routing whose replays hold the same experts in a
-    # different order: the recompute must still replay them, not fall back to natural routing.
+    # Two forwards with identical natural routing whose replays hold the same experts in another order: recompute must
+    # replay them, not fall back to natural routing.
     model = _model()
     batch = torch.randint(1, 64, (1024, 2), generator = torch.Generator().manual_seed(749))
     captured = {}
@@ -552,8 +551,8 @@ def test_recompute_accepts_the_same_expert_set_in_another_order(replay):
 
 @pytest.mark.parametrize("version, expected", [("0.18.0", False), ("0.20.2", False), ("0.21.0", True), ("0.22.0", True), ("0.31.0", True)])
 def test_engine_args_need_vllm_021_for_hybrid_attention(replay, monkeypatch, version, expected):
-    # vLLM 0.14 to 0.20 index the shared routed experts buffer by slot in a buffer sized for one
-    # KV cache group, so hybrid attention models crash in generate; 0.21 indexes per request.
+    # vLLM 0.14 to 0.20 index the shared routed experts buffer by slot in a buffer sized for one KV cache group, so
+    # hybrid attention crashes in generate; 0.21 indexes per request.
     import importlib.metadata
     monkeypatch.setattr(rr, "_engine_arg_names", lambda: {"enable_return_routed_experts"})
     monkeypatch.setattr(importlib.metadata, "version", lambda name: version)
@@ -774,8 +773,7 @@ def test_generate_without_training_keeps_bounded_routes(replay, monkeypatch):
 
 
 def test_recompute_with_several_same_shape_forwards_keeps_candidate_shapes():
-    # Three recorded forwards of one shape, each routing 5 tokens to 2 experts: the per-candidate
-    # agreement must reduce to one flag per candidate before it meets the per-candidate match.
+    # Three forwards of one shape, each routing 5 tokens to 2 experts: per-candidate agreement must reduce to one flag before the per-candidate match.
     ids2 = torch.randint(0, 8, (5, 2))
     fp = rr._fingerprint(ids2)
     replay = torch.randint(0, 8, (5, 2))

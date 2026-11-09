@@ -23,6 +23,13 @@ import torch
 
 import unsloth_zoo.rl_replacements as _rl
 
+
+@pytest.fixture(autouse = True)
+def _log_prob_route(monkeypatch):
+    # These stub UnslothEfficientGRPO, the log-prob route; test_grpo_fused_route.py covers the forward-gradient one.
+    import unsloth_zoo.fused_losses.fused_grpo as _fused_grpo
+    monkeypatch.setattr(_fused_grpo, "GRPO_FWD_GRAD", False)
+
 HIDDEN, VOCAB = 4, 8
 
 
@@ -50,12 +57,8 @@ TRL_MASK = torch.tensor([[1, 1, 1], [0, 0, 0], [1, 1, 0]])
 
 
 def _forward_arguments(args):
-    """The arguments grpo_accumulated_loss passed to UnslothEfficientGRPO.apply, by name.
-
-    Bound against the real forward rather than spelled out in each stub: a call that no
-    longer matches forward still fails here, but a new trailing parameter (#1399 added
-    upstream_scale) does not break every stub that happened to list the old ones.
-    """
+    """Binds the arguments grpo_accumulated_loss passes to UnslothEfficientGRPO.apply against the real forward: a stale
+    call fails, but a new trailing parameter (unsloth-zoo 1399 added upstream_scale) does not break stubs."""
     return inspect.signature(_REAL_FORWARD).bind(None, *args).arguments
 
 

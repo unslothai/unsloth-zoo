@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Chunked cross entropy (gradient taken per chunk in forward, unlabelled rows skipped) against an fp64 oracle and
-the torch.func fused CE it replaces in unsloth_fused_ce_loss."""
+"""Chunked CE (per-chunk gradient in forward, unlabelled rows skipped) matches an fp64 oracle and the torch.func fused CE it replaces in unsloth_fused_ce_loss."""
 
 import pytest
 import torch

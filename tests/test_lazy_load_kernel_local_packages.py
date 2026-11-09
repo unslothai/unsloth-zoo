@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""transformers >= 5.15 lazy_load_kernel never tries the local mamba_ssm / causal_conv1d packages.
-Real-package tests need CUDA sm_80+; stand-in package tests run anywhere.
-"""
+"""transformers >= 5.15 lazy_load_kernel never tries local mamba_ssm / causal_conv1d packages; real-package tests need
+CUDA sm_80+, stand-in package tests run anywhere."""
 import importlib
 import types
 

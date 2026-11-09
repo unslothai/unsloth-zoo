@@ -1,14 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
 
-"""``train_on_responses_only`` sizes its auto worker count from what this process may use.
-
-It used ``min(cpu_count + 4, 64)`` capped by the HOST's available memory, so a job pinned to two cores (taskset,
-Slurm, a container CPU quota) forked up to 64 tokenizer workers onto them, and a memory-limited cgroup on a large box
-was sized from the box. It now goes through ``unsloth_zoo.dataset_num_proc``, like every other map site.
-
-CPU-pure and offline.
-"""
+"""train_on_responses_only sizes its auto worker count via unsloth_zoo.dataset_num_proc (CPU affinity, cgroup limits),
+not min(cpu_count + 4, 64) capped by host RAM, which forked up to 64 workers onto two pinned cores; CPU-pure and
+offline."""
 
 from __future__ import annotations
 
@@ -88,5 +83,4 @@ def test_single_allowed_cpu_maps_in_process(monkeypatch):
 def test_cgroup_memory_limit_beats_host_memory(monkeypatch):
     # 3 GB free under the cgroup on a 1 TB host: half of it covers one ~1 GB worker, so no pool at all.
     assert _requested_num_proc(monkeypatch, cpus = 32, host_gb = 1024, cgroup_free_gb = 3) == [None]
-    # 8 GB free: four workers.
     assert _requested_num_proc(monkeypatch, cpus = 32, host_gb = 1024, cgroup_free_gb = 8) == [4]

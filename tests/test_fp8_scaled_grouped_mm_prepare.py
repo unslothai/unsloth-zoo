@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The SM90 `_scaled_grouped_mm` FP8 MoE path: rhs must be (E, K, N) column major, and
-`weight_scale_inv` is a dequant multiplier, not a divisor. Checked on meta + CPU (no Hopper needed)."""
+"""SM90 _scaled_grouped_mm FP8 MoE path, checked on meta/CPU (no Hopper needed): rhs must be (E, K, N) column major;
+weight_scale_inv is a dequant multiplier, not a divisor."""
 import pytest
 import torch
 import torch.nn as nn

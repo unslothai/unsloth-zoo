@@ -32,9 +32,7 @@ from .moe_utils import (
 
 
 def _make_mixtral_moe_lora_extractor():
-    """LoRA extractor for the fused MixtralExperts. Same 3D layout as Qwen3MoeExperts /
-    Lfm2MoeExperts (gate_up_proj (E, 2*I, H), down_proj (E, H, I)); io-dims read off
-    hidden_dim / intermediate_dim."""
+    """LoRA extractor for fused MixtralExperts; 3D layout gate_up_proj (E, 2*I, H), down_proj (E, H, I); io-dims read off hidden_dim / intermediate_dim."""
     def _get_mixtral_moe_lora_dims(wrapper):
         if wrapper is None or not hasattr(wrapper, "get_base_layer"):
             return None, None

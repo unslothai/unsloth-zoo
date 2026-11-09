@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Remote-code repairs, on a module copying the failing parts of Nemotron-3-Nano-Omni
-loaded through transformers' dynamic module loader. CPU only."""
+"""Remote-code repairs on a module copying the failing parts of Nemotron-3-Nano-Omni, loaded via transformers' dynamic module loader; CPU only."""
 
 import inspect
 import textwrap

@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Decision table for the automatic default of UNSLOTH_VLLM_MERGED_ROLLOUT (CPU only).
-
-Unset / "auto": on for one synchronous 16-bit LoRA text engine on NVIDIA CUDA under Linux with the
-exact Triton fold and vLLM >= 0.11.2. "0" is always off, "1" forces it on every engine as before.
-"""
+"""Decision table for the automatic UNSLOTH_VLLM_MERGED_ROLLOUT default (CPU only): unset or "auto" is on for one
+synchronous 16-bit LoRA text engine on NVIDIA CUDA under Linux with the exact Triton fold and vLLM >= 0.11.2; "0" is
+always off and "1" forces it on every engine."""
 
 import types
 
@@ -29,7 +27,8 @@ def _fresh_platform_cache():
 def _platform(monkeypatch, *, platform = "linux", release = "6.8.0-generic", hip = None, cuda = True,
               triton = True, vllm = "0.19.1"):
     monkeypatch.setattr(vllm_utils.sys, "platform", platform)
-    monkeypatch.setattr(vllm_utils.os, "uname", lambda: types.SimpleNamespace(release = release))
+    # raising = False: native Windows has no os.uname.
+    monkeypatch.setattr(vllm_utils.os, "uname", lambda: types.SimpleNamespace(release = release), raising = False)
     monkeypatch.setattr(vllm_utils.torch.version, "hip", hip)
     monkeypatch.setattr(vllm_utils.torch.cuda, "is_available", lambda: cuda)
     import unsloth_zoo.merged_rollout_exact as exact

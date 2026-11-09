@@ -81,9 +81,8 @@ def cpu_bf16_supported():
 
 
 def _bf16_autocast_is_fast():
-    """bf16 autocast matmul vs fp32 on this CPU. Native bf16 runs 2-3x faster than fp32 (AVX512-BF16 /
-    AMX / Arm BF16 through oneDNN or ACL); without a native kernel torch falls back to a reference
-    loop 30-200x slower, so a 1.5x threshold separates the two with a wide margin."""
+    """Probes bf16 autocast matmul vs fp32: native bf16 (AVX512-BF16, AMX, Arm BF16 via oneDNN or ACL) runs 2-3x faster,
+    the reference fallback 30-200x slower; a 1.5x threshold separates them."""
     try:
         import time
         import torch
@@ -165,11 +164,8 @@ def cpu_capabilities():
 
 
 def apply_cpu_security_patches():
-    """Install the device-independent security guards from temporary_patches.
-
-    That package also pulls the GPU kernels, so each guard file is loaded on its own with a private
-    TEMPORARY_PATCHES list standing in for `.common`. Idempotent: the guards check their own flags.
-    """
+    """Installs device-independent security guards from temporary_patches; each guard file loads alone, with a private
+    TEMPORARY_PATCHES list standing in for .common, since the package also pulls GPU kernels. Idempotent."""
     import importlib.util
     import sys
     import types

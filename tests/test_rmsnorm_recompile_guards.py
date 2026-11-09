@@ -13,23 +13,16 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""One compiled RMSNorm code object is shared by every norm instance in a model.
-
-gemma-4-E2B has 504 of them, so that frame's Dynamo cache holds the *product* of every
-axis its guards see (width, rank, `self.with_scale`, dtype, grad mode, requires_grad),
-which hit the recompile_limit on a T4 and raised `FailOnRecompileLimitHit`, taking
-activation checkpointing with it. Compiling a pure tensor kernel instead of a bound
-method leaves `self` in eager, dropping the width, rank and with_scale axes. These
-tests pin that: no output bit changes, and a realistic spread of shapes stays in budget.
-"""
+"""Pins the RMSNorm recompile fix: a bound method's Dynamo cache multiplies over width, rank, with_scale, dtype, grad
+mode and requires_grad (gemma-4-E2B hit recompile_limit on a T4); a pure tensor kernel stays in budget with
+bit-identical outputs."""
 
 import pytest
 import torch
 
 
-# Dynamo renamed its cache-limit knobs and its exception in torch 2.7, and
-# `config.patch` raises on a key this torch does not define, so select by what is
-# there. Same approach as tests/test_recompile_limit_fallback.py.
+# Dynamo renamed its cache-limit keys and exception in torch 2.7; config.patch raises on undefined keys, so select by
+# what exists (same as tests/test_recompile_limit_fallback.py).
 _HAS_NEW_NAMES = hasattr(torch._dynamo.config, "recompile_limit")
 _LIMIT_KEY = "recompile_limit" if _HAS_NEW_NAMES else "cache_size_limit"
 _FAIL_KEY = ("fail_on_recompile_limit_hit" if _HAS_NEW_NAMES
@@ -48,8 +41,7 @@ def _limit_patch(limit):
     return {
         _LIMIT_KEY: limit,
         _FAIL_KEY: True,
-        # unsloth_zoo sets this globally, and Dynamo asserts it is never on together
-        # with the fail-on-limit flag.
+        # unsloth_zoo sets this (suppress_errors) globally; Dynamo asserts it is never on together with the fail-on-limit flag.
         "suppress_errors": False,
     }
 
@@ -65,8 +57,7 @@ if _LIMIT_ERROR is None or not hasattr(torch._dynamo.config, _FAIL_KEY):
         pytest.mark.skip(reason = "this torch exposes no hard recompile-limit failure"),
     ]
 
-# The spread a real model produces: several widths, rank 3 residual and rank 4 q/k
-# norms, scaled and unscaled, every dtype. More combinations than the limit below.
+# A real model's spread: several widths, rank 3 residual and rank 4 q/k norms, scaled and unscaled, all dtypes; more combinations than the limit below.
 CASES = [
     ((2, 7, 64),      64,   True),
     ((2, 7, 768),     768,  True),
@@ -123,11 +114,7 @@ def _new(hidden_states, weight, eps, with_scale):
 
 
 def _new_eager(hidden_states, weight, eps, with_scale):
-    """The refactor's data flow without torch.compile.
-
-    Inductor reassociates floats, so comparing eager-old to compiled-new would
-    measure the compiler, not this change.
-    """
+    """Eager data flow of the refactor: Inductor reassociates floats, so comparing eager-old to compiled-new would measure the compiler, not this change."""
     from unsloth_zoo.temporary_patches.common import (
         flatten_for_elementwise_norm,
         unwrap_norm_weight,
@@ -181,9 +168,8 @@ def _run_every_case(fn):
 
 
 def test_the_old_bound_method_exhausts_a_realistic_recompile_budget():
-    # The regression this fix exists for. The low limit stands in for the real one:
-    # the old form's cache grows with the product of the axes, so any fixed budget is
-    # eventually spent on a model with hundreds of norms.
+    # Regression for the fix: the low limit stands in for the real one, since the old form's cache grows with the
+    # product of the axes; hundreds of norms exhaust any fixed budget.
     torch._dynamo.reset()
     with torch._dynamo.config.patch(**_limit_patch(8)):
         compiled = {}
@@ -211,9 +197,8 @@ def test_the_kernels_survive_the_same_budget():
 
 
 def test_a_parameter_view_is_not_itself_a_parameter():
-    # Why the width guard goes away: Dynamo forces a static shape when
-    # `type(t) is torch.nn.Parameter`, even under `dynamic=True`. A view is a plain
-    # Tensor, so it takes dynamic shapes.
+    # Width guard is dropped because Dynamo forces a static shape for type(t) is torch.nn.Parameter even with
+    # dynamic=True; a plain Tensor view takes dynamic shapes.
     from unsloth_zoo.temporary_patches.common import unwrap_norm_weight
 
     weight = torch.nn.Parameter(torch.randn(64))
@@ -237,12 +222,8 @@ def test_flatten_round_trips_every_rank():
 
 
 def test_the_kernels_fall_back_to_eager_instead_of_aborting():
-    """Cache exhaustion must latch to eager, not kill the run.
-
-    `patch_function` wraps whatever it compiles with `fullgraph = True` in
-    `_fall_back_to_eager_on_recompile_limit`; a bare decorator skips it, turning the
-    exact failure this file is about into a hard abort.
-    """
+    """Cache exhaustion must latch to eager, not abort: patch_function wraps compiled kernels with fullgraph = True in
+    _fall_back_to_eager_on_recompile_limit; a bare decorator skips it."""
     from unsloth_zoo.temporary_patches.gemma4_float32 import (
         _gemma4_rms_norm_scaled, _gemma4_rms_norm_unscaled,
     )
@@ -255,36 +236,25 @@ def test_the_kernels_fall_back_to_eager_instead_of_aborting():
                _gemma3_rms_norm_float32, _gemma3_rms_norm_generic,
                _qwen3_moe_rms_norm)
     for kernel in kernels:
-        # The wrapper's own marker. `get_compiler_config` is no signal: the wrapper
-        # re-exposes it on purpose, so callers cannot tell the two apart.
+        # Only the wrapper's own marker _unsloth_fallback_state tells it apart; get_compiler_config is no signal since the wrapper re-exposes it on purpose.
         assert hasattr(kernel, "_unsloth_fallback_state"), (
             f"{kernel.__name__} is a bare compiled function, so cache exhaustion "
             f"under fullgraph raises instead of falling back to eager"
         )
 
-    # The half above holds in any configuration; the half below cannot. These
-    # kernels are built by `compile_with_eager_fallback`, which compiles through
-    # `_raw_torch_compile`, and that name is bound to `noop` at import when
-    # `UNSLOTH_COMPILE_DISABLE` is set. The wrapper is still there, so the marker
-    # assertions above still mean something, but nothing underneath it ever
-    # compiles, so the cache cannot be exhausted and the latch cannot fire. Not
-    # rebindable in process, for the reason set out in
-    # tests/test_generated_fullgraph_fallback.py::_run_in_fresh_interpreter.
+    # Marker checks hold in any config; exhaustion cannot run when UNSLOTH_COMPILE_DISABLE binds _raw_torch_compile to
+    # noop at import (not rebindable in process; see
+    # tests/test_generated_fullgraph_fallback.py::_run_in_fresh_interpreter).
     from unsloth_zoo.temporary_patches import common
     if common.UNSLOTH_COMPILE_DISABLE:
         pytest.skip("compilation is off, so there is no cache left to exhaust")
 
-    # And it really does run. `fail_on_recompile_limit_hit` is deliberately NOT set:
-    # that flag is the user asking for a hard stop and the wrapper re-raises for it,
-    # while real runs leave it off, so limit plus `fullgraph = True` is the case that
-    # matters. Widths cost nothing under `dynamic = True`; dtype and grad mode do.
-    # The latch is module-level, permanent and untouched by reset(), so restore it or
-    # every later test in this worker silently gets the eager kernel.
+    # fail_on_recompile_limit_hit stays unset (it asks for a hard stop; real runs leave it off); limit plus fullgraph =
+    # True is the case that matters; widths cost nothing under dynamic = True, dtype and grad mode do; the latch
+    # survives reset(), so restore it or later tests get eager kernels.
     saved = {k: dict(k._unsloth_fallback_state) for k in kernels}
-    # Exhaustion no longer latches on its own: the wrapper borrows extra budget
-    # and retries compiled, so a limit of 1 becomes 65 and the eight variants
-    # never run out. Deny the loan, which is the state under test: nothing left
-    # to borrow, so eager or abort.
+    # Exhaustion no longer latches on its own: the wrapper borrows budget (a limit of 1 becomes 65), so patching
+    # _bump_recompile_limits to return False denies the loan and forces eager or abort.
     import unsloth_zoo.temporary_patches.utils as _U
     _real_bump = _U._bump_recompile_limits
     _U._bump_recompile_limits = lambda *a, **k: False
@@ -312,11 +282,7 @@ def test_the_kernels_fall_back_to_eager_instead_of_aborting():
 
 
 def test_each_kernel_reports_its_own_fallback_state():
-    """Two wrappers sharing a label hide each other in the public diagnostic.
-
-    `eager_fallback_state()` keys by label, so a later non-latched entry could
-    overwrite a latched one and report the path as still compiled.
-    """
+    """Each kernel must report its own fallback state: eager_fallback_state() keys by label, so a later non-latched entry could overwrite a latched one."""
     from unsloth_zoo.temporary_patches.utils import eager_fallback_state
     from unsloth_zoo.temporary_patches.gemma4_float32 import (
         _gemma4_rms_norm_scaled, _gemma4_rms_norm_unscaled,

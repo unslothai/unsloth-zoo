@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Unsloth FastLanguageModel LoRA steps on a tiny MoE with the router trainable. One arm per
-process (UNSLOTH_MOE_FUSED_ROUTER set by the caller before import). Usage: REPO OUT.json"""
+"""Unsloth FastLanguageModel LoRA steps on a tiny MoE with trainable router; one arm per process, since
+UNSLOTH_MOE_FUSED_ROUTER is set by the caller before import; usage: REPO OUT.json."""
 
 import json
 import os

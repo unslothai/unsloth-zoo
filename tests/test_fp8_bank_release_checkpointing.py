@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The BF16 dequantized FP8 expert banks are released between forward and backward, except when the
-forward is a gradient checkpointing recompute (it runs inside backward, and this layer's backward follows
-at once), where releasing would only re-dequantize the banks for nothing."""
+"""BF16 dequantized FP8 expert banks are released after forward, except in a gradient checkpointing recompute (inside
+backward), where releasing would only re-dequantize them."""
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 

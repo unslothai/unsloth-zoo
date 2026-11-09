@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A torch module looping over `GradientCheckpointingLayer`s must not be compiled.
-
-Under gradient checkpointing each layer call goes through the checkpoint function, which
-Dynamo skips, so a compiled Wav2Vec2FeatureEncoder graph broke once per conv layer plus
-once on its `hidden_states.requires_grad = True`.
-"""
+"""A torch module looping over GradientCheckpointingLayer must not be compiled: Dynamo skips the checkpoint call, so
+Wav2Vec2FeatureEncoder graph-broke per conv layer and on requires_grad."""
 
 import inspect
 import json

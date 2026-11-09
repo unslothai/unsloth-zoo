@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""bf16 full finetuning keeps norm weights in float32, so Qwen3-MoE / Mixtral RMSNorm hands the
-experts float32 hidden states. Autocast casts F.linear (native loop) and forward_native_grouped_mm
-casts explicitly, but the Triton grouped GEMM is a custom op autocast never sees, so its gate_up GEMM
-ran float32 x bf16 (3-10x slower). X now follows _triton_moe_compute_dtype into every GEMM, as plain
-transformers bf16 training does; float16 weights and the FP32 flags keep float32."""
+"""Half-input GEMM dtype: X follows _triton_moe_compute_dtype into every Triton GEMM (autocast cannot see the custom op,
+else gate_up ran float32 x bf16); float16 weights and FP32 flags keep float32."""
 
 import sys
 import types

@@ -14,12 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Ling 3.x GGUF export on transformers 5.20 (unslothai/unsloth#14916).
-
-The built-in bailing_hybrid config saves Ling-3.0-tiny's `norm_topk_prob` as `moe_renormalize` and
-rewrites `head_dim`, so the merged export's config.json no longer carried the keys llama.cpp's
-BailingMoeV3 converter reads, and the converter itself was handed the built-in class's to_dict().
-"""
+"""Ling 3.x GGUF export on transformers 5.20 (unslothai/unsloth 14916): the built-in bailing_hybrid save renames
+norm_topk_prob to moe_renormalize and rewrites head_dim, dropping keys the llama.cpp BailingMoeV3 converter reads;
+and the converter was handed the built-in class's to_dict()."""
 
 from __future__ import annotations
 

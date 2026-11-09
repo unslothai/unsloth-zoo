@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`merged_16bit` must export biases trained via `bias="lora_only"|"all"` or `modules_to_save`.
-
-The shard writers rewrite weights in place from the base checkpoint, so a trained bias was
-written back as the base checkpoint's value. Untrained biases must stay byte-identical.
-"""
+"""merged_16bit must export biases trained via bias=lora_only/all or modules_to_save, not base values; untrained biases must stay byte-identical"""
 
 from __future__ import annotations
 

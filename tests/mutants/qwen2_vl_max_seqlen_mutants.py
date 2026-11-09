@@ -67,9 +67,8 @@ MUTATIONS = (
 
 
 def _build_mutant(old: str, new: str):
-    """Recompile ``VisionAttention.forward`` from source with one substitution
-    and return ``(subclass, mutated_source)``. Compiled against a copy of the
-    upstream module globals, so the real module is never touched."""
+    """Recompile VisionAttention.forward from source with one substitution and return (subclass, mutated_source);
+    compiled against a copy of the module globals so the real module is untouched."""
     from transformers.models.qwen2_vl import modeling_qwen2_vl as module
 
     src = textwrap.dedent(inspect.getsource(module.VisionAttention.forward))

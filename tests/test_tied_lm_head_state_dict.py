@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A tied lm_head is excused from the difference check, but the per-key compare then
-KeyError-ed on it anyway (Idefics3). Excused must not mean values can disagree unseen.
-"""
+"""A tied lm_head is excused from the difference check, yet per-key comparison must not KeyError on it (Idefics3); excusing it must not hide value mismatches."""
 import pytest
 import torch
 

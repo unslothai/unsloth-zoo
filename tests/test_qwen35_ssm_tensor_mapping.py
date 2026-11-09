@@ -23,8 +23,7 @@ def _load_llama_cpp_module():
 llama_cpp = _load_llama_cpp_module()
 
 
-# Mirrors a qwen3next-era checkout: shared linear_attn names already present,
-# Qwen3.5 split projections (in_proj_qkv/z/a/b) missing.
+# Stale TensorNameMap from a qwen3next-era checkout: shared linear_attn names exist, but the Qwen3.5 split in_proj_qkv/z/a/b projections are missing.
 STALE_TENSOR_MAPPING = '''class TensorNameMap:
     mappings_cfg = {
         MODEL_TENSOR.ATTN_QKV: (

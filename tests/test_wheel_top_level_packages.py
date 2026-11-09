@@ -14,17 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The wheel must ship unsloth_zoo, unsloth_zoo_downloads and nothing else at the top level.
-
-setuptools auto-discovery used to package the repo's tests/ and scripts/ trees,
-which land in site-packages as top-level `tests` and `scripts`. Those names are
-shared with other wheels, so the last install wins and any uninstall deletes the
-survivor's files, leaving a RECORD that points at a file nothing recreates.
-Studio's post-update integrity check then reports the tree as damaged and
-refuses to start. These CPU-only tests pin the pyproject config that fixes it.
-unsloth_zoo_downloads is the second top-level package on purpose: the Hub
-download helpers import from there without running unsloth_zoo's package init.
-"""
+"""Wheel ships only unsloth_zoo and unsloth_zoo_downloads at top level; auto-discovery shipped top-level tests and
+scripts, names shared with other wheels, so an uninstall could delete their files; the Hub helpers import
+unsloth_zoo_downloads without unsloth_zoo's package init."""
 import os
 import sys
 
@@ -49,8 +41,7 @@ def _find_config():
 
 
 def _discover(config):
-    # PEP420PackageFinder is what auto-discovery ran, so a directory without
-    # __init__.py (tests/, scripts/) still counts as a package here.
+    # PEP420PackageFinder is what auto-discovery ran, so a directory without __init__.py (tests/, scripts/) still counts as a package here.
     from setuptools.discovery import PEP420PackageFinder
 
     found = PEP420PackageFinder.find(
@@ -74,8 +65,7 @@ def test_config_excludes_the_shared_trees():
 
 
 def test_a_sibling_of_the_package_is_not_discovered(tmp_path):
-    # "unsloth_zoo*" would match unsloth_zoo_cache/ and ship it as its own
-    # top-level package, which is the shape this whole change exists to stop.
+    # An unsloth_zoo* glob would also match unsloth_zoo_cache/ and ship it as its own top-level package, the shape this change exists to stop.
     from setuptools.discovery import PEP420PackageFinder
 
     (tmp_path / "unsloth_zoo").mkdir()

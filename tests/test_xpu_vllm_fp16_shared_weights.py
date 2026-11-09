@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""vLLM refusing bf16 on an Intel Arc A770 must not leave the Hugging Face side on bf16.
-
-load_vllm switches the engine to fp16 there. A released unsloth (no xpu_vllm_refuses_bf16) still
-passes dtype = bf16 to convert_vllm_to_huggingface and post_patch, so both follow the fp16 weights
-vLLM shares instead of building a bf16 model around them.
-"""
+"""vLLM refusing bf16 on an Intel Arc A770 must not leave HF on bf16: load_vllm switches the engine to fp16, but
+released unsloth (no xpu_vllm_refuses_bf16) still passes dtype = bf16 to convert_vllm_to_huggingface and post_patch;
+both must follow the shared fp16 weights."""
 
 import ast
 import inspect

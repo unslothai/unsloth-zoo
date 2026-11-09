@@ -14,19 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Where the GGUF read-back tree may come from.
-
-Post-conversion verification runs on every export by default, and to read a file
-back with the `gguf` that wrote it the parent puts a directory at its own
-sys.path[0] and imports it. That directory is derived from a path string the
-preflight probe CHILD reported, and `python -c` puts the WORKING DIRECTORY at the
-child's sys.path[0], so a `gguf` package anyone can drop in the CWD both wins the
-probe and lands in the training process, which holds the user's token.
-
-Two things are pinned here: the child no longer takes the working directory as a
-search path, and the parent accepts a reported tree only from a root Unsloth
-itself chose. Neither may cost an ordinary export the writer's own gguf-py.
-"""
+"""Pins GGUF read-back provenance: the probe child must not take the working directory as a search path, and the parent
+accepts a reported gguf tree only from a root Unsloth itself chose; a planted CWD gguf would reach the training
+process holding the token."""
 
 from __future__ import annotations
 
@@ -49,17 +39,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.fixture(autouse = True)
 def _no_cached_gguf(monkeypatch):
-    """Drop any `gguf` an earlier test in this worker imported.
-
-    Every assertion here turns on what this process would import, which
-    `_trusted_gguf_tree` asks through `_importing_gguf_tree` -> `find_spec`. That
-    consults `sys.modules` before it ever looks at `sys.path`, so a `gguf` already
-    imported anywhere in the run keeps naming itself and the trees these tests plant
-    are refused no matter where they sit. Run alone the file passes, because nothing
-    has imported one yet; in the full suite it does not. The prepended tree being the
-    one that resolves is the precondition, so state it rather than inherit whichever
-    tests happened to run first.
-    """
+    """Drops cached gguf modules because find_spec checks sys.modules before sys.path, so an earlier import would refuse the planted trees in the full suite."""
     monkeypatch.delitem(sys.modules, "gguf", raising = False)
     for cached in [name for name in sys.modules if name.startswith("gguf.")]:
         monkeypatch.delitem(sys.modules, cached, raising = False)
@@ -77,10 +57,8 @@ def llama_cpp():
 
 
 def _ran(planted_dir):
-    """Whether a package planted by PROBE_PAYLOAD executed. Keyed on the package's
-    own directory: the marker has to land somewhere the payload can reach without
-    knowing the test's layout, and an assertion against a path it never writes is
-    one that cannot fail."""
+    """Whether a PROBE_PAYLOAD-planted package ran: checks the EXECUTED marker in the package's own directory, where the
+    payload can reach; any other path could never fail."""
     return (Path(planted_dir) / "gguf" / "EXECUTED").exists()
 
 
@@ -95,8 +73,7 @@ def _gguf_package(directory, body = "# gguf\n"):
 # --- The parent's sys.path takes trees Unsloth chose, not trees a child names ---
 
 def test_a_tree_outside_every_chosen_root_is_refused(llama_cpp, tmp_path):
-    """The planted package answers every structural check; only provenance separates
-    it from the real one."""
+    """The planted package passes every structural check, so only provenance, meaning the chosen root, separates it from the real gguf tree."""
     planted = _gguf_package(tmp_path / "writable-cwd")
     assert llama_cpp._gguf_tree_of_location(
         os.path.join(planted, "gguf", "__init__.py"),
@@ -107,8 +84,7 @@ def test_a_tree_outside_every_chosen_root_is_refused(llama_cpp, tmp_path):
 
 def test_a_relative_sys_path_entry_does_not_launder_the_working_directory(
         llama_cpp, tmp_path, monkeypatch):
-    """'' and '.' are on sys.path in an interactive parent and resolve to the CWD,
-    which is the entry the rule exists to exclude."""
+    """and '.' sys.path entries resolve to the CWD in an interactive parent, which is the entry the rule exists to exclude."""
     planted = _gguf_package(tmp_path / "cwd")
     monkeypatch.chdir(tmp_path / "cwd")
     monkeypatch.syspath_prepend("")
@@ -121,8 +97,7 @@ def test_a_relative_sys_path_entry_does_not_launder_the_working_directory(
 
 def test_a_shadowed_sys_path_entry_is_not_the_one_we_would_import(
         llama_cpp, tmp_path, monkeypatch):
-    """That branch is allowed only because the swap changes nothing, which holds for
-    the tree that WINS, not one behind it: index 0 is what starts running it."""
+    """That branch is allowed only because the swap changes nothing for the tree that wins, not one behind it: index 0 is what starts running it."""
     winner = _gguf_package(tmp_path / "winner")
     shadowed = _gguf_package(tmp_path / "shadowed")
     monkeypatch.syspath_prepend(shadowed)
@@ -160,9 +135,7 @@ def test_a_tree_inside_a_chosen_root_is_kept(llama_cpp, tmp_path, monkeypatch, r
 
 def test_a_symlinked_converter_trusts_the_directory_it_resolves_to(
         llama_cpp, tmp_path, monkeypatch):
-    """Either directory can hold the writer tree: gguf-py beside the link, or the
-    package beside the resolved script. Trusting one side refuses a tree the
-    conversion really used, and the read-back drops to whatever gguf we happen to have."""
+    """Writer tree may sit beside the link or the resolved script; trusting one side refuses the tree really used and falls back to any gguf."""
     monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "unrelated"))
     monkeypatch.delenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", raising = False)
 
@@ -188,10 +161,7 @@ def test_a_symlinked_converter_trusts_the_directory_it_resolves_to(
 
 
 def test_the_reported_tree_is_never_resolved_twice(llama_cpp, tmp_path, monkeypatch):
-    """Resolving once is a guarantee only if nothing resolves it again. A component
-    of the reported path is the attacker's to swap, so a second realpath can land
-    inside a root the first never saw, and the string handed back still names the
-    outside tree. Driven with a realpath that moves the answer on the second call."""
+    """Resolve the reported tree once: a path component the attacker can swap lets a second realpath land inside a root, returning an outside tree."""
     install = tmp_path / "install"
     inside = _gguf_package(install / "gguf-py")
     outside = _gguf_package(tmp_path / "attacker")
@@ -217,9 +187,7 @@ def test_the_reported_tree_is_never_resolved_twice(llama_cpp, tmp_path, monkeypa
 
 def test_the_checked_path_and_the_returned_path_cannot_diverge(
         llama_cpp, tmp_path, monkeypatch):
-    """The link belongs to the principal being screened, so two resolutions need not
-    agree, and the one that matters is the value handed back to be imported. Driven
-    with a realpath that answers differently the first time: the race, made exact."""
+    """The link belongs to the principal being screened, so the checked and returned paths may resolve differently; the returned one is what gets imported."""
     install = tmp_path / "install"
     inside = _gguf_package(install / "gguf-py")
     outside = _gguf_package(tmp_path / "attacker")
@@ -246,8 +214,7 @@ def test_the_checked_path_and_the_returned_path_cannot_diverge(
 
 
 def test_a_symlink_into_a_chosen_root_is_returned_resolved(llama_cpp, tmp_path, monkeypatch):
-    """Handing back the link is a check that can be undone: the caller imports that
-    string, so a link its owner still controls can be re-pointed in between."""
+    """Returning the link is undone when its owner re-points it before the caller imports that string; the resolved path must be returned."""
     install = tmp_path / "install"
     tree = _gguf_package(install / "gguf-py")
     monkeypatch.setattr(llama_cpp, "LLAMA_CPP_DEFAULT_DIR", str(install))
@@ -267,8 +234,7 @@ def test_a_symlink_into_a_chosen_root_is_returned_resolved(llama_cpp, tmp_path, 
 
 
 def test_the_conversion_screens_the_tree_before_the_verifier_gets_it(llama_cpp):
-    """The rule is worth nothing unless convert_to_gguf applies it. Checked through
-    the AST so a refactor of the call site does not quietly drop it."""
+    """convert_to_gguf must apply the tree screen before the verifier gets the tree; checked via the AST so a refactor cannot silently drop it."""
     import ast
 
     tree = ast.parse(Path(llama_cpp.__file__).read_text(encoding = "utf-8"))
@@ -299,8 +265,7 @@ open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "EXECUTED"), "a").
                     reason = "PYTHONSAFEPATH is honored from 3.11")
 def test_the_probe_does_not_resolve_gguf_from_the_working_directory(
         llama_cpp, tmp_path, monkeypatch):
-    """`python -c` would otherwise put the CWD at the child's sys.path[0], ahead of
-    the converter's own tree and of every installed one."""
+    """`python -c` would put the CWD at sys.path[0] of the probe child, ahead of the converter's own tree and every installed one."""
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     _gguf_package(cwd, body = PROBE_PAYLOAD)
@@ -318,8 +283,7 @@ def test_the_probe_does_not_resolve_gguf_from_the_working_directory(
 
 
 def test_the_probe_still_finds_the_converter_own_gguf_py(llama_cpp, tmp_path):
-    """The whole point of the probe: the tree the converter self-locates must still
-    be the one it reports."""
+    """The probe must still report the tree the converter self-locates to, not a different gguf."""
     install = tmp_path / "install"
     _gguf_package(install / "gguf-py", body = "__version__ = '9.9.9'\n")
     converter = install / "convert_hf_to_gguf.py"
@@ -333,8 +297,7 @@ def test_the_probe_still_finds_the_converter_own_gguf_py(llama_cpp, tmp_path):
 
 
 def test_the_probe_environment_is_not_mutated_for_the_caller(llama_cpp, tmp_path):
-    """The converter child builds its env from the live environment, so the probe
-    may not leave PYTHONSAFEPATH behind in it."""
+    """The probe must not leave PYTHONSAFEPATH in the caller's env: the converter child builds its env from the live environment."""
     env = dict(os.environ)
     env.pop("PYTHONSAFEPATH", None)
     llama_cpp._probe_child_gguf(sys.executable, env, (), None, timeout = 60)
@@ -342,8 +305,7 @@ def test_the_probe_environment_is_not_mutated_for_the_caller(llama_cpp, tmp_path
 
 
 def test_the_probe_models_the_converter_script_directory(llama_cpp, tmp_path):
-    """A script has its directory at sys.path[0], so a `gguf` beside the converter
-    outranks the sibling gguf-py inserted at 1. That is the one the conversion uses."""
+    """A script's directory is sys.path[0], so a gguf beside the converter outranks the sibling gguf-py inserted at index 1; the probe models that."""
     install = tmp_path / "install"
     _gguf_package(install / "gguf-py", body = "__version__ = 'sibling'\n")
     beside = _gguf_package(install, body = "__version__ = 'beside'\n")
@@ -382,9 +344,7 @@ def test_the_probe_models_the_converter_script_directory(llama_cpp, tmp_path):
 
 
 def test_the_probe_models_a_symlinked_converter_from_its_target(llama_cpp, tmp_path):
-    """Through a symlink the slots part company: `__file__` stays the link, while
-    CPython prepends the resolved directory ("if it's a symbolic link, resolve
-    symbolic links", sys.path docs). Each is modelled from its own."""
+    """Through a symlink, __file__ stays the link while CPython prepends the resolved directory; each slot is modelled from its own path."""
     target = tmp_path / "target"
     target.mkdir()
     resolved_gguf = _gguf_package(target, body = "__version__ = 'target'\n")
@@ -410,9 +370,8 @@ def test_the_probe_models_a_symlinked_converter_from_its_target(llama_cpp, tmp_p
         stderr = subprocess.PIPE, encoding = "utf-8", timeout = 60,
     )
     actual = (run.stdout or "").strip().splitlines()[-1] if run.stdout else ""
-    # Which side wins is the platform's business and differs: POSIX resolves the
-    # link for sys.path[0], Windows keeps the link's own directory. Derived from
-    # the run rather than asserted, so the test pins agreement, not a platform.
+    # Platforms differ on the winning side (POSIX resolves the link for sys.path[0], Windows keeps the link's
+    # directory); the test pins agreement, not a platform.
     assert actual.startswith((str(resolved_gguf), str(linkdir))), actual
 
     probe_env = dict(env)
@@ -433,9 +392,7 @@ def test_the_probe_models_a_symlinked_converter_from_its_target(llama_cpp, tmp_p
 @pytest.mark.parametrize("pythonpath", [".", "", "/abs/one:"])
 def test_the_installed_probe_does_not_honour_a_relative_pythonpath(
         llama_cpp, tmp_path, monkeypatch, pythonpath):
-    """That probe asks what is installed, not what the converter will see, so a
-    relative entry buys nothing and costs a child execution in the parent's
-    environment. Empty and trailing elements mean the working directory too."""
+    """The installed-tree probe ignores relative PYTHONPATH entries: it asks what is installed, and empty or trailing elements mean the CWD too."""
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     _gguf_package(cwd, body = PROBE_PAYLOAD)
@@ -449,8 +406,7 @@ def test_the_installed_probe_does_not_honour_a_relative_pythonpath(
 
 
 def test_an_explicit_cwd_on_pythonpath_survives_the_drop(llama_cpp, tmp_path):
-    """Dropping the implicit `-c` slot must not take a caller's own '.' with it: the
-    converter honours PYTHONPATH, so that package is one the conversion really uses."""
+    """Dropping the implicit -c cwd slot must not drop an explicit '.' on PYTHONPATH: the converter honours PYTHONPATH, so it really uses that package."""
     cwd = tmp_path / "cwd"
     _gguf_package(cwd, body = "__version__ = 'from-pythonpath'\n")
     install = tmp_path / "install"
@@ -489,9 +445,7 @@ def test_an_explicit_cwd_on_pythonpath_survives_the_drop(llama_cpp, tmp_path):
 
 def test_the_probe_drops_the_working_directory_without_interpreter_support(
         llama_cpp, tmp_path, monkeypatch):
-    """The 3.9/3.10 case, simulated by withholding the flag as those versions do.
-    Refusing the tree afterwards is too late: the child has already run the planted
-    package with this process's token, so the probe drops the entry itself."""
+    """Without interpreter safe-path support (3.9/3.10) the probe drops the CWD entry itself: refusing the tree later is too late, the child already ran it."""
     cwd = tmp_path / "cwd"
     cwd.mkdir()
     _gguf_package(cwd, body = PROBE_PAYLOAD)
@@ -519,9 +473,7 @@ def test_the_probe_drops_the_working_directory_without_interpreter_support(
 @pytest.mark.parametrize("caller_safe_path", [False, True])
 def test_the_probe_reports_the_tree_the_converter_will_actually_use(
         llama_cpp, tmp_path, caller_safe_path):
-    """Safe-path drops the leading entry from a SCRIPT run too, so a caller exporting
-    PYTHONSAFEPATH gets a converter whose `insert(1, ...)` lands the sibling BEHIND
-    PYTHONPATH. The probe matches the side it measures."""
+    """PYTHONSAFEPATH also drops the leading entry for a script run, so insert(1, ...) lands the sibling behind PYTHONPATH; the probe must model that run."""
     ambient = tmp_path / "ambient"
     _gguf_package(ambient, body = "__version__ = 'ambient'\n")
     install = tmp_path / "install"
@@ -571,14 +523,8 @@ def test_the_probe_reports_the_tree_the_converter_will_actually_use(
 @pytest.mark.skipif(sys.version_info < (3, 11),
                     reason = "PYTHONSAFEPATH is honored from 3.11")
 def test_the_probe_keeps_the_converter_gguf_ahead_of_pythonpath(llama_cpp, tmp_path):
-    """The real run has its script directory at sys.path[0] and the sibling tree at
-    1, so the sibling outranks all of PYTHONPATH. Safe-path mode vacates index 0, so
-    inserting at 1 there would rank the sibling BEHIND the first PYTHONPATH entry and
-    the probe would report a gguf the conversion never uses.
-
-    Run with `-S` rather than through `_probe_child_gguf`: a site-packages .pth that
-    prepends its own entry occupies index 0 anyway and would hide the inversion.
-    """
+    """Sibling tree at index 1 outranks PYTHONPATH; safe-path vacates index 0, so run with -S rather than through
+    _probe_child_gguf: a site .pth would occupy index 0 and hide the inversion."""
     ambient = tmp_path / "ambient"
     _gguf_package(ambient, body = "__version__ = 'ambient'\n")
     install = tmp_path / "install"

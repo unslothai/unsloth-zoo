@@ -61,8 +61,7 @@ def test_qwen3_5_q_norm_also_caught():
 
 
 def test_kv_sharing_dead_tail_falls_through_to_strict_false():
-    # Dead KV-sharing tail (k_proj+v_proj+k_norm, never q_norm) is safe to drop
-    # via the strict=False fallback: the guard must NOT raise (mlx-lm #1242).
+    # Dead KV-sharing tail (k_proj+v_proj+k_norm, never q_norm) is safe to drop via the strict=False fallback; the guard must NOT raise (mlx-lm issue 1242).
     from unsloth_zoo.mlx.loader import (
         _KNOWN_MLX_LM_STRICT_FALLBACKS,
         _message_matches_known_fallback,
@@ -82,8 +81,7 @@ def test_kv_sharing_dead_tail_falls_through_to_strict_false():
 
 
 def test_active_layer_k_norm_and_q_norm_still_raises():
-    # Active-layer q_norm/k_norm without paired k_proj/v_proj = genuine gap:
-    # must raise even though k_norm is present.
+    # Active-layer q_norm/k_norm without paired k_proj/v_proj is a genuine gap and must raise even though k_norm is present.
     from unsloth_zoo.mlx.loader import _raise_if_qk_norm_version_gap
 
     msg = (

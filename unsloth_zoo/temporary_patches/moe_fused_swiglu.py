@@ -187,13 +187,13 @@ def moe_swiglu_backward_reference(grad, gate_up, act = ACT_SILU, interleaved = F
 if triton is not None:
 
     @triton.jit
-    def _rnd(x, ROUND: tl.constexpr, DT: tl.constexpr):
+    def _rnd(x, ROUND: tl.constexpr, DT: tl.constexpr):  # round to out dtype / out dtype
         if ROUND:
             return x.to(DT).to(tl.float32)
         return x
 
     @triton.jit
-    def _load_gate_up(GU, rows, cols, mask, s_m, s_c, N, INTERLEAVED: tl.constexpr):
+    def _load_gate_up(GU, rows, cols, mask, s_m, s_c, N, INTERLEAVED: tl.constexpr):  # gate / up interleaved columns
         base = GU + rows[:, None] * s_m
         if INTERLEAVED:
             g_col = cols.to(tl.int64) * 2
@@ -206,7 +206,7 @@ if triton is not None:
         return g, u, g_col, u_col
 
     @triton.jit
-    def _clamp_gptoss(g, u, LIMIT, ROUND: tl.constexpr, DT: tl.constexpr):
+    def _clamp_gptoss(g, u, LIMIT, ROUND: tl.constexpr, DT: tl.constexpr):  # round to out dtype / out dtype
         gc = _rnd(tl.where(g > LIMIT, LIMIT, g), ROUND, DT)
         uc = _rnd(tl.where(u > LIMIT, LIMIT, tl.where(u < -LIMIT, -LIMIT, u)), ROUND, DT)
         return gc, uc
@@ -224,11 +224,12 @@ if triton is not None:
     def _sigmoid(x):
         return _rcp_rn(1.0 + libdevice.exp(-x))
 
-    @triton.jit
+    # M (routed rows) runtime: BLOCK_M already buckets it; no extra %16 / == 1 variant per token count.
+    @triton.jit(do_not_specialize = ["M"])
     def _swiglu_fwd_kernel(
         GU, OUT, M, N, s_gm, s_gc, s_om, ALPHA, LIMIT,
-        ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,  # 1 gpt-oss clamp, else silu / interleaved / eager rounding
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,  # tile rows / tile intermediate cols
     ):
         rows = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
         cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -247,12 +248,12 @@ if triton is not None:
             y = s * u
         tl.store(OUT + rows[:, None] * s_om + cols[None, :], y.to(DT), mask = mask)
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ["M"])
     def _swiglu_bwd_kernel(
         DY, GU, DGU, M, N, s_dm, s_dc, s_gm, s_gc, s_om, ALPHA, LIMIT,
-        ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,
-        G_MAX_INC: tl.constexpr, U_MAX_INC: tl.constexpr, U_MIN_INC: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,  # 1 gpt-oss clamp, else silu / interleaved / eager rounding
+        G_MAX_INC: tl.constexpr, U_MAX_INC: tl.constexpr, U_MIN_INC: tl.constexpr,  # clamp bounds inclusive: gate max / up max / up min
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,  # tile rows / tile intermediate cols
     ):
         rows = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
         cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -494,10 +495,9 @@ def fused_swiglu_self_check(device, dtype, act, interleaved, alpha = 1.702, limi
     if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
         return False
     ok = False
-    # The first call is often inside a model forward, e.g. a non-reentrant checkpoint region. The probe's
-    # own graph must not reach the saved-tensor hooks there: they would count its tensors against the
-    # checkpoint (CheckpointError at backward) and its grad would trigger a nested recompute. The
-    # innermost hook pair wins, so identity hooks keep the probe self-contained.
+    # First call may sit in a non-reentrant checkpoint region; identity saved_tensors_hooks (innermost wins) keep the
+    # probe self-contained, since outer hooks would count its tensors (CheckpointError) and its grad would trigger a
+    # nested recompute.
     try:
         hooks = torch.autograd.graph.saved_tensors_hooks(_identity, _identity)
         hooks.__enter__()

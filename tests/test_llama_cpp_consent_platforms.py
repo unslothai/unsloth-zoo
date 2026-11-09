@@ -1,28 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Cross-platform and precedence properties of the llama.cpp install consent.
-
-Two things this file exists to rule out.
-
-**Inverted precedence.** "EOF with no terminal means consent" must never
-outrank an explicit `UNSLOTH_AUTO_INSTALL=0`. If it did, the opt-out would be
-useless in exactly the headless context it was written for.
-
-**Platform-shaped stdin.** The consent decision reads `sys.stdin`, which differs
-by platform in ways Linux alone does not exercise:
-
-- Windows `pythonw.exe` runs with no console at all and `sys.stdin is None`.
-  CPython raises `RuntimeError`, not `EOFError`, for that.
-- `os.environ` is case-insensitive on Windows, so a user setting
-  `unsloth_auto_install=0` gets a working opt-out there and not here. The test
-  below pins that we read the canonical spelling, which is what `os.environ`
-  normalises to on Windows.
-- macOS behaves as Linux for all of these; it is covered by the same paths.
-
-Everything here is simulated, so it runs on any host. Real Windows and macOS
-coverage comes from the staging cross-platform CI run, not from this file.
-"""
+"""Install consent: EOF with no terminal (implied consent) must never outrank UNSLOTH_AUTO_INSTALL=0; covers sys.stdin
+None under pythonw.exe and Windows env case; simulated, real Windows/macOS in staging CI."""
 
 from __future__ import annotations
 
@@ -70,8 +50,7 @@ def recorder(monkeypatch):
 
 @pytest.mark.parametrize("falsy", ["0", "no", "off", "false", "", "  "])
 def test_explicit_opt_out_beats_eof_implies_consent(recorder, monkeypatch, falsy):
-    """The decisive precedence test. A headless process hits BOTH conditions at
-    once: stdin raises EOFError, and the user has said no. The user wins."""
+    """Headless run with EOFError on stdin and an explicit opt-out: the user's no wins over implied consent."""
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", falsy)
     monkeypatch.setattr(
         builtins, "input",
@@ -101,8 +80,7 @@ def test_truthy_spellings_keep_the_installer_enabled(recorder, monkeypatch, trut
 
 
 def test_the_opt_out_is_read_at_the_attempt_not_at_import(recorder, monkeypatch):
-    """A user who sees the prompt and sets the variable afterwards must be
-    obeyed without re-importing."""
+    """The opt-out is read at the attempt, so a variable set after the prompt is obeyed without re-importing the module."""
     monkeypatch.setattr(
         builtins, "input",
         lambda prompt = "": (_ for _ in ()).throw(EOFError()),
@@ -121,9 +99,7 @@ def test_the_opt_out_is_read_at_the_attempt_not_at_import(recorder, monkeypatch)
 # ------------------------------------------------------------- platform shapes
 
 def test_windows_pythonw_has_no_stdin_and_is_treated_as_consent(recorder, monkeypatch):
-    """`pythonw.exe` runs without a console: sys.stdin is None and CPython raises
-    RuntimeError rather than EOFError. Nobody is there to answer, so this is the
-    same implicit ENTER the prompt documents."""
+    """pythonw.exe has no console: sys.stdin is None and CPython raises RuntimeError, not EOFError; nobody can answer, so it counts as the implicit ENTER consent."""
     monkeypatch.setattr(llama_cpp.sys, "stdin", None)
     llama_cpp.install_package("cmake", system_type = "debian")
     assert recorder.calls == ["apt-get install cmake -y"]
@@ -138,9 +114,7 @@ def test_windows_pythonw_still_respects_the_opt_out(recorder, monkeypatch):
 
 
 def test_the_canonical_env_spelling_is_what_is_read(monkeypatch):
-    """os.environ is case-insensitive on Windows and normalises to upper case, so
-    reading the upper-case name is what makes a lower-case setting work there.
-    Pinning the spelling keeps that true."""
+    """os.environ is case-insensitive on Windows and upper-cases names, so reading the upper-case UNSLOTH_AUTO_INSTALL keeps lower-case settings working there."""
     import inspect
     source = inspect.getsource(llama_cpp._auto_install_enabled)
     assert '"UNSLOTH_AUTO_INSTALL"' in source
@@ -167,8 +141,7 @@ def test_a_detached_stdin_whose_isatty_raises_is_not_a_terminal(recorder, monkey
 
 @pytest.mark.parametrize("system_type", ["debian", "rpm", "arch"])
 def test_the_opt_out_covers_every_package_manager(monkeypatch, system_type):
-    """The check sits above the platform branch, so it must hold for all of them,
-    not only the apt path the other tests use."""
+    """The opt-out check sits above the platform branch, so it must hold for every package manager, not only the apt path."""
     rec = _Recorder()
     monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
     monkeypatch.setattr(llama_cpp, "IS_COLAB_ENVIRONMENT", False)
@@ -192,12 +165,7 @@ def test_the_opt_out_covers_every_package_manager(monkeypatch, system_type):
 def test_a_stdin_closed_after_startup_is_treated_as_no_one_there(
     recorder, monkeypatch, exc, why,
 ):
-    """input() raises neither EOFError nor RuntimeError when stdin is closed after the
-    interpreter started, which is what daemon and process wrappers do to fd 0.
-
-    Measured on CPython 3.13: sys.stdin.close() gives ValueError, os.close(0) gives
-    OSError(EBADF). Both used to propagate straight through install_package, so a
-    headless export still died on the prompt this branch exists to survive."""
+    """A stdin closed after startup, as daemons do to fd 0: CPython 3.13 input() raises ValueError after sys.stdin.close() and OSError(EBADF) after os.close(0)."""
     monkeypatch.setattr(builtins, "input", lambda prompt = "": (_ for _ in ()).throw(exc))
     # A closed sys.stdin makes isatty() raise; a closed fd 0 makes it return False.
     monkeypatch.setattr(
@@ -227,8 +195,7 @@ def test_a_closed_stdin_still_respects_the_opt_out(recorder, monkeypatch, exc):
     "exc", [ValueError("I/O operation on closed file."), OSError(9, "Bad file descriptor")],
 )
 def test_a_closed_stdin_on_a_terminal_still_cancels(recorder, monkeypatch, exc):
-    """The control that keeps Ctrl-D meaningful. If something claims to be a terminal,
-    a failed read is not evidence that nobody was asked."""
+    """Control for Ctrl-D: when stdin claims to be a terminal, a failed read is not evidence that nobody was asked, so it still cancels."""
     monkeypatch.setattr(builtins, "input", lambda prompt = "": (_ for _ in ()).throw(exc))
     monkeypatch.setattr(
         llama_cpp.sys, "stdin",
@@ -258,8 +225,7 @@ def test_the_real_builtin_raises_ValueError_on_a_closed_stdin():
 # ------------------------------------------------- narrowness of the new arms
 
 def test_an_unrelated_OSError_on_a_live_stdin_is_not_consent(recorder, monkeypatch):
-    """EIO from a serial console is an I/O failure, not an empty answer. Only EBADF
-    establishes that the descriptor is gone."""
+    """EIO from a serial console is an I/O failure, not an empty answer; only EBADF shows the descriptor is gone."""
     exc = OSError(errno.EIO, "Input/output error")
     monkeypatch.setattr(builtins, "input", lambda prompt = "": (_ for _ in ()).throw(exc))
     monkeypatch.setattr(
@@ -289,9 +255,7 @@ def test_a_ValueError_from_a_live_stdin_wrapper_is_not_consent(recorder, monkeyp
 # ------------------------------------------------- the opt-out covers the whole install
 
 def test_the_opt_out_blocks_the_prebuilt_download_and_the_privileged_update(monkeypatch):
-    """install_llama_cpp fetches a prebuilt binary, and probes for elevation by RUNNING
-    `apt-get update`, both before install_package is ever reached. Checking the flag only
-    inside install_package left an explicit refusal installing llama.cpp anyway."""
+    """install_llama_cpp fetches a prebuilt and probes elevation via apt-get update before install_package runs, so the opt-out must be checked there too."""
     calls = []
     monkeypatch.setenv("UNSLOTH_AUTO_INSTALL", "0")
     monkeypatch.setattr(
@@ -323,9 +287,7 @@ def test_an_existing_install_is_unaffected_by_the_opt_out(monkeypatch, tmp_path)
 
 
 def test_a_refusal_does_not_wipe_a_corrupted_folder(monkeypatch, tmp_path):
-    """The corrupted-checkout branch used to rmtree before the opt-out was consulted, so
-    an explicit refusal still destroyed the folder and only then reported the refusal.
-    llama_cpp_folder can be a custom path holding the user's own files."""
+    """A refused install must not rmtree a corrupted llama_cpp_folder first, since a custom path can hold the user's own files."""
     folder = tmp_path / "llama.cpp"
     folder.mkdir()
     # No src/ggml/common and no prebuilt marker, so it reads as corrupted.
@@ -354,8 +316,7 @@ def test_a_corrupted_folder_is_still_wiped_when_installing_is_allowed(monkeypatc
         raise RuntimeError("stop after the wipe")
 
     monkeypatch.setattr(llama_cpp, "_maybe_install_llama_cpp_prebuilt", _stop_here)
-    # tmp_path is neither under ~/.unsloth nor ./llama.cpp, so the real guard would
-    # refuse. That guard is unrelated to this test and is covered on its own.
+    # tmp_path is outside ~/.unsloth and ./llama.cpp, so the real _is_safe_to_delete guard would refuse; it is stubbed here and covered separately.
     monkeypatch.setattr(llama_cpp, "_is_safe_to_delete", lambda _path: True)
 
     with pytest.raises(RuntimeError, match = "stop after the wipe"):
@@ -366,10 +327,7 @@ def test_a_corrupted_folder_is_still_wiped_when_installing_is_allowed(monkeypatc
 
 
 def test_the_converter_repair_honours_the_opt_out(monkeypatch):
-    """An existing working checkout returns out of install_llama_cpp before its gate, so
-    the converter self-heal was the one remaining way a refusal still reached pip. It runs
-    `pip install --upgrade --force-reinstall`, which mutates the environment as much as
-    any install does."""
+    """A working checkout returns before the install gate, so the pip install --upgrade --force-reinstall converter repair must honour the opt-out itself."""
     import inspect as _inspect
     src = _inspect.getsource(llama_cpp)
     call = src.index("_reinstall_converter_deps(command[0]")
@@ -391,10 +349,7 @@ def test_the_repair_still_runs_when_installing_is_allowed(monkeypatch):
 # ------------------------------------------- EBADF must belong to stdin, not to stdout
 
 def test_ebadf_from_a_closed_stdout_is_not_consent(recorder, monkeypatch):
-    """input() writes the prompt before it reads, so a closed fd 1 raises EBADF while fd 0
-    is open, non-tty and holding an unread answer. Reproduced on CPython: `python -u` with
-    fd 1 closed gives OSError(9) with sys.stdin.closed and isatty() both False. Accepting
-    that as an implicit ENTER installs packages while the real answer went unread."""
+    """input() writes the prompt first, so a closed fd 1 raises EBADF (OSError 9) while fd 0 still holds an unread answer; that is not implicit ENTER consent."""
     monkeypatch.setattr(
         builtins, "input",
         lambda prompt = "": (_ for _ in ()).throw(OSError(errno.EBADF, "Bad file descriptor")),

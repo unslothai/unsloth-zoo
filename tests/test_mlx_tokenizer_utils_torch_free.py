@@ -14,12 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Regression: unsloth_zoo.tokenizer_utils must import and run patch_tokenizer
-without torch, so get_chat_template works on a torch-free MLX install. The module
-holds torch-only embedding-fix helpers, but patch_tokenizer itself is torch-free;
-a top-level `import torch` or `@torch.inference_mode` decorator would break the
-MLX tokenizer patch path at import time.
-"""
+"""Regression guard: unsloth_zoo.tokenizer_utils must import and run patch_tokenizer without torch (torch-only embedding
+helpers live there too); a top-level `import torch` or `@torch.inference_mode` would break the MLX tokenizer patch
+path at import."""
 
 import subprocess
 import sys
@@ -27,8 +24,7 @@ import textwrap
 
 
 def test_tokenizer_utils_imports_and_patches_without_torch():
-    # Runs in a subprocess: initialise the package normally, then block torch at
-    # load and re-exec only tokenizer_utils to prove it is import-safe torch-free.
+    # Runs in a subprocess: initialise the package normally, then block torch at load and re-exec only tokenizer_utils to prove it is import-safe torch-free.
     script = textwrap.dedent(
         """
         import importlib, importlib.abc, importlib.machinery, sys
