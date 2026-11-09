@@ -749,3 +749,83 @@ def test_mamba_mixed_dtype_preactivation_stays_in_the_parameter_dtype(xdtype):
         assert torch.isfinite(theirs).all()
         assert torch.isfinite(ours).all()
         assert torch.equal(ours, theirs)
+
+
+_REVERSE_MIXED_SCRIPT = r"""
+import json, sys, torch
+from unsloth_zoo.temporary_patches import gdn_causal_conv1d as gcc
+gcc._conv_launch = lambda name, kernel, grid, ptrs, ints, consts, num_warps, outs: kernel[grid](
+    *(ptrs + ints + consts), num_warps = num_warps,
+)
+out = {"file": gcc.__file__}
+for xdtype in (torch.float32, torch.bfloat16):
+    x = torch.full((1, 8, 64), -30000.0, dtype = xdtype)
+    w = torch.full((64, 4), 3.0, dtype = torch.float16)
+    y = gcc._launch_fwd(x, w, None, "silu")
+    dx, dw, _ = gcc._launch_bwd(x, w, None, torch.ones_like(x), "silu", True, True, False)
+    out[str(xdtype)] = [int(t.isnan().sum() + t.isinf().sum()) for t in (y, dx, dw)]
+print("RESULT " + json.dumps(out))
+"""
+
+
+def test_reverse_mixed_dtype_preactivation_does_not_overflow():
+    # fp16 weights with wider x: rounding the fp32 accumulator to fp16 before SiLU gives -inf, then NaN.
+    pytest.importorskip("triton")
+    import json
+    import subprocess
+    import sys
+    env = dict(os.environ, TRITON_INTERPRET = "1", CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1")
+    proc = subprocess.run([sys.executable, "-c", _REVERSE_MIXED_SCRIPT], env = env, capture_output = True, text = True)
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    line = next(l for l in proc.stdout.splitlines() if l.startswith("RESULT "))
+    result = json.loads(line[len("RESULT "):])
+    assert result.pop("file") == gcc.__file__
+    assert result == {"torch.float32": [0, 0, 0], "torch.bfloat16": [0, 0, 0]}
+    # The torch references the drop-ins fall back to follow the same rule.
+    for xdtype in (torch.float32, torch.bfloat16):
+        x = torch.full((1, 64, 8), -30000.0, dtype = xdtype)
+        w = torch.full((64, 4), 3.0, dtype = torch.float16)
+        seq_idx = torch.zeros(1, 8, dtype = torch.int64)
+        assert torch.isfinite(gcc.causal_conv1d_reference(x, w, None, "silu")).all()
+        ref = gcc._causal_conv1d_reference_seq_idx(x, w, None, "silu", seq_idx, pad_negative = True)
+        assert torch.isfinite(ref).all()
+
+
+def _kernels_func_layer(func):
+    # kernels' use_kernel_forward_from_hub on a function: a Func() module whose class forward
+    # closes over the decorated function and that keeps no __wrapped__ (kernels 0.16 / 0.17).
+    class Func(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            return func(*args, **kwargs)
+
+    return Func()
+
+
+def test_patch_rebinds_a_hub_layer_imported_before_the_patch(hub_kernels, monkeypatch):
+    # Modeling module imported with kernels installed before the patch: its conv is already a hub
+    # layer. Packed calls must still reach the Triton dispatch, not the "install causal_conv1d" error.
+    pytest.importorskip("triton")
+    modeling = _real_gdn_modeling(monkeypatch)
+    monkeypatch.setattr(hub_kernels, "use_kernel_forward_from_hub", lambda name: _kernels_func_layer)
+    decorator = hub_kernels.use_kernel_func_from_hub_with_fallback
+    for attr in ("causal_conv1d_fn", "causal_conv1d_update"):
+        fn = getattr(modeling, attr)
+        # Without kernels the module holds transformers' wrapper; decorate its torch function again as import would.
+        if isinstance(fn, torch.nn.Module):
+            # Skip because with kernels installed the module already holds the real layer (no __wrapped__ to rebuild from).
+            pytest.skip("kernels installed: test_patch_rebinds_the_real_modeling_module covers the real layer")
+        layer = decorator(attr, "causal_conv1d")(fn.__wrapped__)
+        assert isinstance(layer, torch.nn.Module) and not hasattr(layer, "__wrapped__")
+        monkeypatch.setattr(modeling, attr, layer)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.version, "hip", None)
+    gcc.patch_gdn_causal_conv1d()
+    assert gcc._is_marked(modeling.causal_conv1d_fn)
+    assert gcc._is_marked(modeling.causal_conv1d_update)
+    x, w = torch.randn(1, 8, 10), torch.randn(8, 4)
+    seq_idx = torch.tensor([[0, 0, 0, 1, 1, 1, 1, 2, 2, 2]], dtype = torch.int32)
+    y = modeling.causal_conv1d_fn(x, w, None, activation = "silu", seq_idx = seq_idx)
+    expected = torch.cat([
+        gcc.causal_conv1d_reference(x[..., a:b], w, None, "silu") for a, b in ((0, 3), (3, 7), (7, 10))
+    ], dim = -1)
+    torch.testing.assert_close(y, expected)

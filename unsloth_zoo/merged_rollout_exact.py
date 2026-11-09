@@ -124,7 +124,10 @@ if triton is not None:
         return tl.where(b < 0, -b - 32769, b)
 
     @triton.jit
-    def _width(nb, bb, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr):
+    def _width(
+        nb, bb,
+        MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,  # W's dtype: mantissa bits / exponent mask / widest gap
+    ):
         # Code bits from the folded value and back only (unfold knows both): r + 1 for an exponent gap 1 <= r <= MAX_GAP.
         en = tl.maximum((nb >> MANT) & EXPM, 1)
         eb = tl.maximum((bb >> MANT) & EXPM, 1)
@@ -139,9 +142,10 @@ if triton is not None:
         W, A, B, counts, woff, wcnt, words, idx_out, val_out, eoff, checksum, tile0, slot, indexed,
         N, K,
         sWe, sWn, sWk, sAe, sAr, sAk, sBe, sBn, sBr,
-        scale, mode: tl.constexpr,
+        scale,
+        mode: tl.constexpr,  # _COUNT / _FOLD / _UNFOLD: one compiled variant per pass
         R: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  # LoRA rank / tile over out rows / tile over in cols
-        MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,  # mantissa bits / exponent mask of W's dtype
+        MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,  # W's dtype: mantissa bits / exponent mask / widest gap
     ):
         pid_n = tl.program_id(0)
         pid_k = tl.program_id(1)
@@ -175,7 +179,10 @@ if triton is not None:
             )
 
     @triton.jit
-    def _classify(w, d, mask, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr):
+    def _classify(
+        w, d, mask,
+        MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,  # W's dtype: mantissa bits / exponent mask / widest gap
+    ):
         # (folded value, original bits, code width, correction, inexact, escape) of each element.
         new = (w.to(tl.float32) + d).to(w.dtype)
         back = (new.to(tl.float32) - d).to(w.dtype)
@@ -190,7 +197,10 @@ if triton is not None:
         return new, wb, k, tl.where(esc, -half, c), bad, esc
 
     @triton.jit
-    def _count_tile(w, d, mask, g, counts, checksum, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr):
+    def _count_tile(
+        w, d, mask, g, counts, checksum,
+        MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,  # W's dtype: mantissa bits / exponent mask / widest gap
+    ):
         new, wb, k, c, bad, esc = _classify(w, d, mask, MANT, EXPM, MAX_GAP)
         tl.store(counts + g * 3 + 0, tl.sum(tl.sum(bad.to(tl.int32), 1), 0))
         tl.store(counts + g * 3 + 1, tl.sum(tl.sum(k, 1), 0))
@@ -208,7 +218,8 @@ if triton is not None:
     @triton.jit
     def _fold_tile(
         w, d, ptrs, mask, g, e, rn, rk, N, K, counts, woff, wcnt, words, idx_out, val_out, eoff, indexed,
-        BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,
+        BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  # tile over out rows / tile over in cols
+        MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,  # W's dtype: mantissa bits / exponent mask / widest gap
     ):
         new, wb, k, c, bad, esc = _classify(w, d, mask, MANT, EXPM, MAX_GAP)
         # An indexed target keeps every inexact element as an escape (its tiles have no stream words).
@@ -240,7 +251,8 @@ if triton is not None:
     @triton.jit
     def _unfold_tile(
         w, d, ptrs, mask, g, woff, wcnt, words, checksum,
-        BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,
+        BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  # tile over out rows / tile over in cols
+        MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,  # W's dtype: mantissa bits / exponent mask / widest gap
     ):
         # w is the folded value: back = round(w - d), plus the stored correction where the stream has one.
         back = (w.to(tl.float32) - d).to(w.dtype)
@@ -256,7 +268,7 @@ if triton is not None:
     @triton.jit
     def _unfold_stream(
         w, bb, ptrs, mask, g, woff, n_words, words, checksum,
-        MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,
+        MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,  # W's dtype: mantissa bits / exponent mask / widest gap
     ):
         nb = w.to(tl.int16, bitcast = True).to(tl.int32)
         k = tl.where(mask, _width(nb, bb, MANT, EXPM, MAX_GAP), 0)
@@ -281,7 +293,10 @@ if triton is not None:
         tl.atomic_add(checksum, tl.sum(tl.sum(tl.where(mask, out, 0), 1), 0).to(tl.int64))
 
     @triton.jit(do_not_specialize = ["n"])
-    def _escape_kernel(base, table, slots, idx, val, wrong, n, BLOCK: tl.constexpr):
+    def _escape_kernel(
+        base, table, slots, idx, val, wrong, n,
+        BLOCK: tl.constexpr,  # escapes per program
+    ):
         # Every escape of a store in one launch: escape i belongs to target slots[i], whose weight starts table[s, 0]
         # int16 elements from base with strides table[s, 1:4] and shape (N, K) = table[s, 4:6]. The overwritten bits go
         # to wrong (the checksum correction).

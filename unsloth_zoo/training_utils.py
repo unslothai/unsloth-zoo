@@ -578,7 +578,7 @@ def prepare_model_for_training(
     _is_peft_model = hasattr(model, "peft_config")
     # The loop reuses `dtype`.
     _loaded_float16 = dtype == torch.float16
-    _float32_bias_owners = []
+    _float32_bias_param_ids = set()
 
     for name, param in model.named_parameters():
         original_name = name
@@ -605,7 +605,7 @@ def prepare_model_for_training(
                 # Skip ".weight" (T5's relative_attention_bias is a weight).
                 if _loaded_float16 and param.dtype == torch.float16 and not name.endswith(".weight"):
                     upcast = True
-                    _float32_bias_owners.append(name)
+                    _float32_bias_param_ids.add(id(param))
                 else:
                     _keep_param_dtype = True
             else:
@@ -645,9 +645,14 @@ def prepare_model_for_training(
     pass
 
     _owner_names = {}
-    for _name in _float32_bias_owners:
-        _owner, _, _leaf = _name.rpartition(".")
-        _owner_names.setdefault(_owner, set()).add(_leaf)
+    if _float32_bias_param_ids:
+        # named_parameters() above deduplicates tied Parameters. Discover every
+        # owner by identity: their shared storage has already been upcast, so
+        # checking float16 again would miss later aliases (BERT / RoBERTa heads).
+        for _name, _param in model.named_parameters(remove_duplicate=False):
+            if id(_param) in _float32_bias_param_ids:
+                _owner, _, _leaf = _name.rpartition(".")
+                _owner_names.setdefault(_owner, set()).add(_leaf)
     for _owner, _names in _owner_names.items():
         _cast_bias_in_forward(model, _owner, _names)
     if _owner_names:

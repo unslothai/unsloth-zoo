@@ -261,6 +261,9 @@ def test_random_adapters_and_cycles_restore_exactly():
             run_random("cuda", cycles = 200)
 
 
+# The interpreter proof takes about 3 minutes on a quiet 2-CPU box and well past a 300s per-test hang backstop on a
+# shared CI runner, so it carries its own limit; the child's timeout sits under it so a hang reports the child's output.
+@pytest.mark.timeout(900)
 @pytest.mark.skipif(_cuda() or ex.triton is None, reason = "CUDA runs the proof directly; this is the CPU interpreter")
 def test_cpu_interpreter_proof():
     # The same unsloth_zoo tree as this process (a script run puts tests/ first on sys.path, not the repo).
@@ -268,7 +271,7 @@ def test_cpu_interpreter_proof():
     path = os.pathsep.join(p for p in (root, os.environ.get("PYTHONPATH", "")) if p)
     env = dict(os.environ, TRITON_INTERPRET = "1", CUDA_VISIBLE_DEVICES = "", PYTHONPATH = path)
     result = subprocess.run(
-        [sys.executable, __file__], env = env, capture_output = True, text = True, timeout = 1800,
+        [sys.executable, __file__], env = env, capture_output = True, text = True, timeout = 840,
     )
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
     assert "EDGES OK" in result.stdout

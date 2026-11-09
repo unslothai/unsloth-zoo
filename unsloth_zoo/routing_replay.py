@@ -194,12 +194,19 @@ def _make_key(token_ids, pad_token_id):
     return tuple(t for t in token_ids if t != pad_token_id)
 
 
+# A row two captures disagreed on: natural like -1, but known, so prefix reuse must not fill it.
+_DISPUTED = -2
+
+
 def _agreed(a, b):
-    """Rows of two captures of the same tokens: where their expert sets differ, -1 (natural)."""
+    """Rows of two captures of the same tokens: where their expert sets differ, natural; where both
+    were routed (or either was already disputed), _DISPUTED rather than -1 (unknown)."""
     if a.shape != b.shape:
         return a
     same = (a.sort(dim = -1).values == b.sort(dim = -1).values).all(dim = -1, keepdim = True)
-    return torch.where(same, a, torch.full_like(a, -1))
+    routed = lambda x: ~(x < 0).all(dim = -1, keepdim = True) | (x == _DISPUTED).all(dim = -1, keepdim = True)
+    natural = torch.where(routed(a) & routed(b), _DISPUTED, -1).to(a.dtype).expand_as(a)
+    return torch.where(same, a, natural)
 
 
 def _count_conflicts(a, b):
@@ -231,6 +238,7 @@ def _fill_prefix(rows, full, start, store):
             routed = ~(part < 0).all(dim = -1)
             same = (part.sort(dim = -1).values == merged[:m].sort(dim = -1).values).all(dim = -1)
             conflict[:m] |= routed & seen[:m] & ~same
+            conflict[:m] |= (part == _DISPUTED).all(dim = -1)
             new = routed & ~seen[:m]
             if bool(new.any()):
                 merged[:m] = torch.where(new.unsqueeze(-1), part, merged[:m])
@@ -335,7 +343,7 @@ def _lookup(key, exact = False):
             if rows is not None:
                 found = rows if found is None else _agreed(found, rows)
         if found is not None:
-            return found
+            return found.clamp_min(-1)
     return None
 
 
@@ -847,7 +855,8 @@ def _router_hook(layer_index, compact = None):
 def _input_addresses(tensors):
     # Zero padded to one slot per tensor (static shape); a tensor, not a set, to flow through a graph.
     out = sorted({x.data_ptr() for x in tensors if x.numel() > 0})
-    return torch.tensor(out + [0] * (len(tensors) - len(out)), dtype = torch.int64)
+    # Host metadata read back with tolist(): pin to CPU so a default device cannot move it.
+    return torch.tensor(out + [0] * (len(tensors) - len(out)), dtype = torch.int64, device = "cpu")
 
 
 def _identity_mask(layer_input, recorded):
@@ -856,7 +865,7 @@ def _identity_mask(layer_input, recorded):
     shared = [len(now.intersection(r.tolist())) for r in recorded]
     best = max(shared, default = 0)
     unique = best > 0 and shared.count(best) == 1
-    return torch.tensor([not unique or n == best for n in shared], dtype = torch.bool)
+    return torch.tensor([not unique or n == best for n in shared], dtype = torch.bool, device = "cpu")
 
 
 _CUSTOM_OP_PARAMS = frozenset(inspect.signature(torch.library.custom_op).parameters)
@@ -912,7 +921,7 @@ def _layer_inputs_impl(tensors: typing.List[torch.Tensor]) -> torch.Tensor:
 
 
 def _layer_inputs_fake(tensors):
-    return torch.empty(len(tensors), dtype = torch.int64)
+    return torch.empty(len(tensors), dtype = torch.int64, device = "cpu")
 
 
 def _identity_mask_impl(layer_input: torch.Tensor, recorded: typing.List[torch.Tensor]) -> torch.Tensor:
@@ -920,7 +929,7 @@ def _identity_mask_impl(layer_input: torch.Tensor, recorded: typing.List[torch.T
 
 
 def _identity_mask_fake(layer_input, recorded):
-    return torch.empty(len(recorded), dtype = torch.bool)
+    return torch.empty(len(recorded), dtype = torch.bool, device = "cpu")
 
 
 def _layer_pre_hook(layer_index):
