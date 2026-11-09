@@ -311,10 +311,8 @@ def _mask_function_identity(fn, depth = 4):
 
 @functools.lru_cache(maxsize = 64)
 def _gpt_oss_decode_block_starts(n, block, device):
-    """[min, block, 2 * block, ...]: bucketize(d, right = True) counts the starts <= d, so it is clamp(d // block + 1, 1, n)."""
-    starts = torch.arange(n, dtype = torch.int64, device = device) * block
-    starts[0] = torch.iinfo(torch.int64).min
-    return starts
+    from unsloth_zoo.flex_attention.decode import _block_starts
+    return _block_starts(n, block, device)
 
 
 @torch.compiler.disable
@@ -353,12 +351,8 @@ def _gpt_oss_flex_mask(
         # One column per KV slot (slot j holds position kv_offset + j): a fixed [B, kv_length] whatever the offset,
         # so a rolling sliding window (offset + 1 per step) keeps the shape a decode graph keys on. Positions past
         # the 2D mask (unwritten static slots) stay invisible; a tensor offset is never read on the host.
-        full = attention_mask.to(dtype = torch.bool)
-        width = full.shape[-1]
-        position = torch.arange(int(kv_length), device = full.device) + (
-            kv_off.to(full.device) if isinstance(kv_off, torch.Tensor) else kv_off
-        )
-        padding = full[:, position.clamp(max = width - 1)] & (position < width)
+        from unsloth_zoo.flex_attention.decode import decode_padding
+        padding = decode_padding(attention_mask, kv_length, kv_off)
     q_length, kv_length = int(q_length), int(kv_length)
     # Per-row blocks even without padding: packed documents make mask_function row dependent.
     bsz = batch_size
@@ -373,46 +367,24 @@ def _gpt_oss_flex_mask(
         return mask_mod
 
     def build(device):
-        q_o, kv_o = (
-            x.to(device) if isinstance(x, torch.Tensor) else torch.full((), x, dtype = torch.int64, device = device)
-            for x in (q_off, kv_off)
-        )
-        pad = padding.to(device) if padding is not None else None
-        mask_mod = make_mask_mod(q_o, kv_o, pad)
         if q_length == 1:
-            # Decode: blocks are partial and mask_mod decides per key; for causal, only blocks up to the query's own
-            # slot can hold a visible key, so an unwritten static-cache tail is not listed (no host sync).
-            from torch.nn.attention.flex_attention import BlockMask, _DEFAULT_SPARSE_BLOCK_SIZE as BLOCK
-            n = (kv_length + BLOCK - 1) // BLOCK
-            rows = bsz or 1
-            if isinstance(q_off, torch.Tensor) or isinstance(kv_off, torch.Tensor):
-                # One kernel: clamp((q - kv_off) // BLOCK + 1, 1, n) as a bucket count, written contiguous int32.
-                d = q_o if isinstance(kv_off, int) and kv_off == 0 else q_o - kv_o
-                kv_num_blocks = torch.bucketize(d.expand(rows, 1, 1), _gpt_oss_decode_block_starts(n, BLOCK, device),
-                                                out_int32 = True, right = True)
-            else:
-                # Integer offsets (dynamic caches): count on the host, one fill as before.
-                kv_num_blocks = torch.full((rows, 1, 1), min(max((q_off - kv_off) // BLOCK + 1, 1), n),
-                                           dtype = torch.int32, device = device)
-            kv_indices = torch.arange(n, dtype = torch.int32, device = device).view(1, 1, 1, n).expand(rows, 1, 1, n)
-            block_mask = BlockMask.from_kv_blocks(
-                kv_num_blocks, kv_indices.contiguous(), BLOCK_SIZE = BLOCK, mask_mod = mask_mod,
-                seq_lengths = (1, kv_length),
-                **({"compute_q_blocks": torch.is_grad_enabled()} if _HAS_COMPUTE_Q_BLOCKS else {}),
-            )
+            # Decode: the shared one-token BlockMask (unsloth_zoo.flex_attention.decode), with the graph contract when
+            # the graph decode attention is flex / auto and the identity can name mask_function.
+            from unsloth_zoo.flex_attention.decode import build_decode_block_mask
             graph_mode = _gpt_oss_graph_decode_attention() if _gpt_oss_in_graph_generate() else None
             identity = _mask_function_identity(mask_function) if graph_mode in ("flex", "auto") else None
             if graph_mode == "auto" and identity is None:
                 return None
-            if identity is not None:
-                # CUDA-graph decode refills these tensors and rebuilds mask_mod over its own copies; every value
-                # mask_mod reads besides them is a constant of mask_function, named by the identity (part of the
-                # graph key as a BlockMask field).
-                tensors = (q_o, kv_o) if pad is None else (q_o, kv_o, pad)
-                block_mask._unsloth_graph_closure = (tensors, lambda ts: make_mask_mod(*ts))
-                block_mask._unsloth_mask_identity = identity
+            block_mask = build_decode_block_mask(
+                device, bsz, kv_length, q_off, kv_off, padding, mask_function, identity,
+            )
         else:
-            block_mask = compiled_create_block_mask(mask_mod, bsz, None, q_length, kv_length, device = device)
+            q_o, kv_o = (
+                x.to(device) if isinstance(x, torch.Tensor) else torch.full((), x, dtype = torch.int64, device = device)
+                for x in (q_off, kv_off)
+            )
+            pad = padding.to(device) if padding is not None else None
+            block_mask = compiled_create_block_mask(make_mask_mod(q_o, kv_o, pad), bsz, None, q_length, kv_length, device = device)
         return block_mask
 
     # BlockMask.to() does not move mask_mod's captured tensors: rebuild per device. Weakref avoids a cycle.
