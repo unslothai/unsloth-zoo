@@ -109,10 +109,11 @@ def decode_padding(attention_mask, kv_length, kv_offset):
     full = attention_mask.to(dtype = torch.bool)
     width, kv_length = full.shape[-1], int(kv_length)
     if not isinstance(kv_offset, torch.Tensor) and kv_offset >= 0:
-        # A host offset: the columns are a view, no gather kernels on the eager decode path.
-        padding = full[:, kv_offset : kv_offset + kv_length]
-        if padding.shape[-1] < kv_length:
-            padding = torch.nn.functional.pad(padding, (0, kv_length - padding.shape[-1]))
+        # A host offset: a copy of the columns, no gather kernels. Not a view: its row stride would be the 2D mask's
+        # width, which grows every step, and a decode graph keys on strides (re-capture every step).
+        columns = full[:, kv_offset : kv_offset + kv_length]
+        padding = full.new_zeros((full.shape[0], kv_length))
+        padding[:, : columns.shape[-1]].copy_(columns)
         return padding
     position = torch.arange(kv_length, device = full.device) + (
         kv_offset.to(full.device) if isinstance(kv_offset, torch.Tensor) else kv_offset

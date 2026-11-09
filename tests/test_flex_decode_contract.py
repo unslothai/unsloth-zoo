@@ -427,3 +427,25 @@ def test_a_shape_flex_decoding_cannot_compile_falls_back_to_dense_once(monkeypat
     with pytest.raises(D.FlexDecodeUnavailable):
         D.flex_decode_attention(q, k, v, bm, d ** -0.5)
     assert calls == [False]
+
+
+def test_padding_layout_is_stable_as_the_mask_grows_and_the_window_rolls():
+    # generate() widens the 2D mask by one column per step and a sliding window's kv_offset moves with it: the
+    # padding the BlockMask carries must keep its shape, strides and dtype (a decode graph keys on them), and its
+    # values must follow the mask.
+    from unsloth_zoo.flex_attention.decode import decode_padding
+
+    layouts = []
+    for step in range(4):
+        width = 300 + step
+        mask = torch.ones(2, width, dtype = torch.long)
+        mask[1, :5] = 0
+        for offset in (0, width - 128, torch.tensor(width - 128)):
+            padding = decode_padding(mask, 128, offset)
+            layouts.append((tuple(padding.shape), padding.stride(), padding.dtype))
+            start = int(offset)
+            expected = torch.zeros(2, 128, dtype = torch.bool)
+            n = min(128, width - start)
+            expected[:, :n] = mask[:, start : start + n].bool()
+            assert torch.equal(padding, expected)
+    assert len(set(layouts)) == 1, set(layouts)
