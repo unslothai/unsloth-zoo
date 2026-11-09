@@ -612,3 +612,49 @@ def test_grouping_is_cut_at_the_global_batch_not_the_local_one():
     grouped_globally = local_padding(_length_grouped_order(lengths, global_batch, 31))
     grouped_locally = local_padding(_length_grouped_order(lengths, local_batch, 31))
     assert grouped_globally < grouped_locally
+
+
+def _trainer_windows(schedule, grad_accum, cycle_length):
+    # The training loop's update rule: a full window, an epoch's last micro-batch, or the run's last one.
+    window = []
+    for it, batch in enumerate(schedule, start=1):
+        window.append(batch)
+        if len(window) == grad_accum or it % cycle_length == 0 or it == len(schedule):
+            yield window
+            window = []
+
+
+def test_length_sorted_windows_keep_every_steps_rows():
+    from unsloth_zoo.mlx.utils import _length_sorted_windows
+
+    rng = random.Random(3)
+    for _ in range(300):
+        size, accum, cycle = rng.randint(1, 4), rng.randint(2, 5), rng.randint(1, 12)
+        lengths = [rng.randint(2, 300) for _ in range(cycle * size)]
+        schedule = [tuple(rng.sample(range(len(lengths)), size)) for _ in range(rng.randint(1, 3 * cycle))]
+        result = _length_sorted_windows(schedule, lengths.__getitem__, accum, cycle)
+        assert [len(b) for b in result] == [len(b) for b in schedule]
+        for before, after in zip(_trainer_windows(schedule, accum, cycle), _trainer_windows(result, accum, cycle)):
+            assert sorted(i for b in before for i in b) == sorted(i for b in after for i in b)
+            cut = [lengths[i] for b in after for i in b]
+            assert cut == sorted(cut, reverse=True)
+
+
+@pytest.mark.parametrize("config, kwargs, expected", [
+    ({}, {}, True),
+    ({"dpo": {}}, {"preference_kind": "dpo"}, True),
+    ({"length_sorted_microbatches": False}, {}, False),
+    ({"gradient_accumulation_steps": 1}, {}, False),
+    ({}, {"world_size": 2}, False),
+    ({"streaming": True}, {}, False),
+    ({}, {"preference_kind": "kto"}, False),
+    ({}, {"preference_kind": "grpo"}, False),
+    ({"dpo": {"loss_type": "aot"}}, {"preference_kind": "dpo"}, False),
+    ({"dpo": {"loss_type": ["sigmoid", "aot"]}}, {"preference_kind": "dpo"}, False),
+    ({"preserve_dataset_order": True}, {}, False),
+])
+def test_length_sorting_skips_order_dependent_steps(config, kwargs, expected):
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, _should_length_sort_windows
+
+    args = MLXDPOConfig(**config["dpo"]) if "dpo" in config else _args(**config)
+    assert _should_length_sort_windows(args, **kwargs) is expected
