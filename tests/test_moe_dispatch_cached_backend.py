@@ -59,3 +59,33 @@ def test_dispatch_reuses_the_resolved_backend(monkeypatch, resolved):
     assert seen == [experts] * 3
     # Resolved once (at most), not once per forward.
     assert len(lookups) == (0 if resolved else 1)
+
+
+@pytest.mark.parametrize("resolved", [True, False])
+def test_bnb4bit_generic_route_reuses_the_resolved_backend(monkeypatch, resolved):
+    from unsloth_zoo.temporary_patches import moe_utils
+    from unsloth_zoo.temporary_patches import moe_utils_bnb4bit as mb
+
+    seen = []
+
+    def backend(module, hidden_states, top_k_index, top_k_weights):
+        seen.append(module)
+        return hidden_states
+
+    lookups = []
+
+    def resolve():
+        lookups.append(1)
+        monkeypatch.setattr(moe_utils, "_CACHED_FORWARD_MOE_BACKEND", backend)
+        return backend
+
+    monkeypatch.setattr(moe_utils, "_CACHED_FORWARD_MOE_BACKEND", backend if resolved else None)
+    experts = _Experts()
+    hidden = torch.zeros(2, 4)
+    for _ in range(3):
+        out = mb._forward_generic_experts_eagerly(
+            resolve, experts, hidden, torch.zeros(2, 1, dtype = torch.long), torch.ones(2, 1)
+        )
+        assert out is hidden
+    assert seen == [experts] * 3
+    assert len(lookups) == (0 if resolved else 1)
