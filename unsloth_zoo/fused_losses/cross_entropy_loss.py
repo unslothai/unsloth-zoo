@@ -240,9 +240,9 @@ def _free_target_gb(device = None):
     the same bug again, one module over.
     """
 
-    # Absolute import, not `from ..tiled_mlp`: transformers' dynamic_module_utils joins the raw regex capture onto this
-    # directory and looks for fused_losses/.tiled_mlp.py, so remote-code saves walking this graph fail.
-    from unsloth_zoo.tiled_mlp import _default_target_gb  # noqa: PLC0415  (avoids an import cycle)
+    # Absolute import, not `from ..memory_budget`: transformers' dynamic_module_utils joins the raw regex capture onto this
+    # directory and looks for fused_losses/.memory_budget.py, so remote-code saves walking this graph fail.
+    from unsloth_zoo.memory_budget import _default_target_gb  # noqa: PLC0415  (avoids an import cycle)
 
     return min(_default_target_gb(device), _CE_TARGET_GB_CAP)
 

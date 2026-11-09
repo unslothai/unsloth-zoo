@@ -57,7 +57,7 @@ from collections.abc import Mapping
 
 import requests
 from packaging import version
-from typing import Union, Tuple, List, Dict, Sequence
+from typing import Callable, Union, Tuple, List, Dict, Sequence
 from itertools import takewhile
 # torchvision is optional (only the video reader needs it); guard the import so a CPU-only install can still import this module.
 try:
@@ -694,11 +694,19 @@ def smart_nframes(
     return nframes
 
 
-def _read_video_pyav(video_path: str, start: float = 0.0, end: Union[float, None] = None):
+def _read_video_pyav(
+    video_path: str,
+    start: float = 0.0,
+    end: Union[float, None] = None,
+    sample: Union[Callable, None] = None,
+):
     """Frames in [start, end] seconds as a (T, C, H, W) uint8 tensor, plus {"video_fps": fps}.
 
     What torchvision.io.read_video(pts_unit="sec", output_format="TCHW") returns, for PyAV
     builds that torchvision can no longer open.
+
+    With `sample(total_frames, video_fps) -> indices`, only those frames become RGB (decoded frames wait
+    in their native format until the count is known) and info adds "total_frames".
     """
     import av
     import numpy as np
@@ -723,7 +731,15 @@ def _read_video_pyav(video_path: str, start: float = 0.0, end: Union[float, None
                     continue
                 if end is not None and when > end:
                     break
-            frames.append(frame.to_ndarray(format="rgb24"))
+            frames.append(frame if sample is not None else frame.to_ndarray(format="rgb24"))
+        if sample is not None:
+            total_frames = len(frames)
+            info = {"video_fps": video_fps, "total_frames": total_frames}
+            if not frames:
+                return torch.empty((0, 3, 0, 0), dtype=torch.uint8), info
+            frames = [frames[i].to_ndarray(format="rgb24") for i in sample(total_frames, video_fps).tolist()]
+            video = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).contiguous()
+            return video, info
     if not frames:
         return torch.empty((0, 3, 0, 0), dtype=torch.uint8), {"video_fps": video_fps}
     video = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).contiguous()
@@ -757,21 +773,28 @@ def _read_video_torchvision(
         if "metadata_errors" not in str(exc):
             raise
         video, info = _read_video_pyav(
-            video_path, ele.get("video_start", 0.0), ele.get("video_end", None)
+            video_path, ele.get("video_start", 0.0), ele.get("video_end", None),
+            sample=lambda total_frames, video_fps: _sample_frame_indices(ele, total_frames, video_fps),
         )
     try:
         video_fps = info["video_fps"]
     except Exception as e:
         print('error getting video_fps there is probably a path issue', e)
         video_fps = 2.0
-    total_frames, video_fps = video.size(0), video_fps
+    sampled = "total_frames" in info
+    total_frames, video_fps = (info["total_frames"] if sampled else video.size(0)), video_fps
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: torchvision:  {video_path=}, {total_frames=}, {video_fps=}, time={time.time() - st:.3f}s")
     nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
-    idx = torch.linspace(0, total_frames - 1, nframes).round().long()
     sample_fps = nframes / max(total_frames, 1e-6) * video_fps
-    video = video[idx]
+    if not sampled:
+        video = video[_sample_frame_indices(ele, total_frames, video_fps)]
     return video, sample_fps
+
+
+def _sample_frame_indices(ele: dict, total_frames: int, video_fps: float) -> torch.Tensor:
+    nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
+    return torch.linspace(0, total_frames - 1, nframes).round().long()
 
 
 def is_decord_available() -> bool:
@@ -850,7 +873,7 @@ def _read_video_decord(
     nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
     idx = torch.linspace(start_frame, end_frame, nframes).round().long().tolist()
     video = vr.get_batch(idx).asnumpy()
-    video = torch.tensor(video).permute(0, 3, 1, 2)  # Convert to TCHW format
+    video = torch.from_numpy(video).permute(0, 3, 1, 2)  # asnumpy() returns a fresh array
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: decord:  {video_path=}, {total_frames=}, {video_fps=}, time={time.time() - st:.3f}s")
     sample_fps = nframes / max(total_frames, 1e-6) * video_fps
@@ -2643,7 +2666,8 @@ class UnslothVisionDataCollator:
                 c = self._clean_none_keys(c)
                 pc_txt = self._render_chat(prompt_messages=p, completion_messages=c, example=ex)
                 # Some models append common template items, so split prompt and completion at their shared prefix; see trl/data_utils.py.
-                p_txt = "".join(x for x, _ in takewhile(lambda x: x[0] == x[1], zip(p_txt, pc_txt)))
+                if not pc_txt.startswith(p_txt):
+                    p_txt = "".join(x for x, _ in takewhile(lambda x: x[0] == x[1], zip(p_txt, pc_txt)))
                 c_txt = pc_txt[len(p_txt):]
             else:
                 c_txt = str(c)

@@ -31,9 +31,9 @@ def packunpack_sequence_kernel(
     cu_seqlens,
     S,
     D,
-    BD: tl.constexpr,
-    PADDING_SIDE: tl.constexpr,
-    PACK: tl.constexpr,
+    BD: tl.constexpr,  # block along feature dim
+    PADDING_SIDE: tl.constexpr,  # left or right padding
+    PACK: tl.constexpr,  # pack, else unpack
 ):
     i_d, i_s, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     bos, eos = tl.load(cu_seqlens + i_b), tl.load(cu_seqlens + i_b + 1)
