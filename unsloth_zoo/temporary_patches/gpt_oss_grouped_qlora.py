@@ -73,8 +73,8 @@ if triton is not None:
     def _nf4_dequant_stack_kernel(
         W_PTRS, A_PTRS, A2_PTRS, C2_PTRS, OFFSETS, LUT, OUT,
         n_bytes,
-        BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr, BLOCK: tl.constexpr,
-        LONG_INDEXING: tl.constexpr,
+        BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr, BLOCK: tl.constexpr,  # nf4 quant block / nested absmax block / double quant / bytes per program
+        LONG_INDEXING: tl.constexpr,  # int64 offsets past 2**31
     ):
         pid = tl.program_id(0)
         e = tl.program_id(1)

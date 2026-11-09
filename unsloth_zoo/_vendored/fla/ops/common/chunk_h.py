@@ -46,22 +46,22 @@ def chunk_fwd_kernel_h(
     cu_seqlens,
     split_offsets,
     T,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BS: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    USE_G: tl.constexpr,
-    USE_G_GAMMA: tl.constexpr,
-    USE_GK: tl.constexpr,
-    USE_GV: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
-    STORE_FINAL_STATE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    STATE_V_FIRST: tl.constexpr,
-    LONG_INDEXING: tl.constexpr = False,
+    H: tl.constexpr,  # heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BS: tl.constexpr,  # state split size along T
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    USE_G: tl.constexpr,  # scalar gate
+    USE_G_GAMMA: tl.constexpr,  # constant per-head decay
+    USE_GK: tl.constexpr,  # per-key gate
+    USE_GV: tl.constexpr,  # per-value gate
+    USE_INITIAL_STATE: tl.constexpr,  # h0 given
+    STORE_FINAL_STATE: tl.constexpr,  # write ht
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    STATE_V_FIRST: tl.constexpr,  # state layout is [V, K]
+    LONG_INDEXING: tl.constexpr = False,  # int64 offsets
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_h = i_nh // H, i_nh % H
@@ -194,24 +194,24 @@ def chunk_bwd_kernel_dh(
     split_offsets,
     scale,
     T,
-    HQ: tl.constexpr,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BS: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    NG: tl.constexpr,
-    USE_G: tl.constexpr,
-    USE_G_GAMMA: tl.constexpr,
-    USE_GK: tl.constexpr,
-    USE_GV: tl.constexpr,
-    STORE_INITIAL_STATE_GRADIENT: tl.constexpr,
-    USE_FINAL_STATE_GRADIENT: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    STATE_V_FIRST: tl.constexpr,
-    LONG_INDEXING: tl.constexpr = False,
+    HQ: tl.constexpr,  # query heads
+    H: tl.constexpr,  # heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BS: tl.constexpr,  # state split size along T
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    NG: tl.constexpr,  # query heads per key head
+    USE_G: tl.constexpr,  # scalar gate
+    USE_G_GAMMA: tl.constexpr,  # constant per-head decay
+    USE_GK: tl.constexpr,  # per-key gate
+    USE_GV: tl.constexpr,  # per-value gate
+    STORE_INITIAL_STATE_GRADIENT: tl.constexpr,  # write dh0
+    USE_FINAL_STATE_GRADIENT: tl.constexpr,  # dht given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    STATE_V_FIRST: tl.constexpr,  # state layout is [V, K]
+    LONG_INDEXING: tl.constexpr = False,  # int64 offsets
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hq = i_nh // HQ, i_nh % HQ
