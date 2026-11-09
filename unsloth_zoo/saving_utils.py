@@ -6808,6 +6808,20 @@ def _registry_checkpoint_conversion_mapping(model_class_name):
 pass
 
 
+# Checkpoint layouts Unsloth's loader renames itself (a key_mapping Transformers does not register), so a
+# merge rereading the original checkpoint can place adapters. Must match unsloth's
+# _QWEN3_ASR_PACKAGE_KEY_MAPPING: Qwen/Qwen3-ASR-0.6B and -1.7B store weights under thinker.*.
+_LOADER_CHECKPOINT_CONVERSION_MAPPINGS = {
+    "Qwen3ASRForConditionalGeneration": {
+        r"^thinker\.audio_tower\.proj1\.": "model.multi_modal_projector.linear_1.",
+        r"^thinker\.audio_tower\.proj2\.": "model.multi_modal_projector.linear_2.",
+        r"^thinker\.audio_tower\.": "model.audio_tower.",
+        r"^thinker\.model\.": "model.language_model.",
+        r"^thinker\.lm_head\.": "lm_head.",
+    },
+}
+
+
 def _get_checkpoint_conversion_mapping(model_class_name):
     """A model class's _checkpoint_conversion_mapping ({} if absent), falling back to the
     Transformers 5 registry. Without that fallback a composite model with a pre-5 flat
@@ -6816,7 +6830,10 @@ def _get_checkpoint_conversion_mapping(model_class_name):
         mapping = getattr(model_class, '_checkpoint_conversion_mapping', {})
         if mapping:
             return mapping
-    return _registry_checkpoint_conversion_mapping(model_class_name)
+    mapping = _registry_checkpoint_conversion_mapping(model_class_name)
+    if mapping:
+        return mapping
+    return dict(_LOADER_CHECKPOINT_CONVERSION_MAPPINGS.get(model_class_name, {}))
 pass
 
 
