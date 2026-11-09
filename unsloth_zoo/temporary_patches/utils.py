@@ -1146,16 +1146,11 @@ def _is_recompile_limit_unsupported(exc):
             or "recompile_limit reached" in text)
 
 
-# torch >= 2.14 `_TorchDynamoContext.__call__` raises a plain RuntimeError when a fullgraph region ran without one
-# compiled frame: "... found no compiled frames. Skipped frames: ..." on the call where Dynamo or Inductor skipped the
-# frame (e.g. Inductor declining bf16 on sm < 80), then "... found no compiled frames. Compilation was not attempted
-# and no cached compiled code was found." on every later call, since the skip sticks to the code object. Older torch
-# runs the skipped frame eagerly and never raises this.
+# torch >= 2.14 raises this when every frame of a fullgraph region was skipped; the skip sticks to the code object.
 _NO_COMPILED_FRAMES_SIGNATURE = ("fullgraph=True", "found no compiled frames")
 
 
 def _is_no_compiled_frames_error(exc):
-    """Did a fullgraph region run with every frame skipped (torch >= 2.14)?"""
     if not isinstance(exc, RuntimeError):
         return False
     try:
@@ -1165,8 +1160,6 @@ def _is_no_compiled_frames_error(exc):
     return all(part in text for part in _NO_COMPILED_FRAMES_SIGNATURE)
 
 
-# (set_fullgraph_compiled_frame_count, get_skip_reasons, reset_skip_reasons), False on a torch without them; resolved
-# once, as the wrapper runs per layer call.
 _SKIP_HOOKS = None
 
 
@@ -1187,14 +1180,8 @@ def _resolve_skip_hooks():
 
 
 def _call_noting_skipped_frames(fn, args, kwargs):
-    """(result, skipped): call a fullgraph-compiled `fn` once, keeping its result when every frame was skipped.
-
-    torch >= 2.14 checks a fullgraph call's compiled-frame count only when the count was unset (negative) on entry,
-    and raises "found no compiled frames" AFTER the skipped body already ran eagerly, dropping its result. Setting the
-    count first keeps torch's check off for this call, so the body runs once and its result is returned; a skip is then
-    read from Dynamo's own skip reasons. Inside another counting region, or on a torch without these hooks (which
-    never raises), the call is left alone.
-    """
+    # torch >= 2.14 checks the frame count only when unset on entry and raises after the body ran; presetting it
+    # keeps the body's single run (stateful forwards, checkpoint packs must not run twice).
     hooks = _SKIP_HOOKS or _resolve_skip_hooks()
     if hooks is False:
         return fn(*args, **kwargs), False
@@ -1760,10 +1747,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             del e  # same cycle as in _give_up_at_compile_time
 
     def _keep_skipped_result(result, marker_before):
-        """Every frame of this fullgraph call was skipped (torch >= 2.14): its body ran once, eagerly, and `result`
-        is that run's. Latch this label like a compile-time refusal and keep the result; nothing runs twice, so an
-        eager pack inside a checkpoint matches its eager recompute. Only a region that already packed COMPILED in this
-        step must end it (its compiled pack would be recomputed eagerly), as `_give_up_at_compile_time` does."""
+        # A region that packed compiled in this checkpointed step must end it: its pack would be recomputed eagerly.
         global _PACKED_COMPILED_IN_CHECKPOINT, _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
         packed = (
             (_in_non_reentrant_checkpoint() or _PACKED_COMPILED_IN_CHECKPOINT)
@@ -1788,18 +1772,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         return result
 
     def _give_up_on_skipped_frames(e, args, kwargs, marker_before):
-        """torch >= 2.14 found no compiled frames in this fullgraph region.
-
-        The frame was skipped at compile time and the skip sticks to the code
-        object, so every later call raises too: latch this label like any other
-        compile-time refusal. Unlike them, torch already ran the body once,
-        uncompiled, before raising. Outside a checkpoint that result is just
-        dropped and the eager call here runs the body again (harmless for the
-        functional kernels routed through this wrapper). Inside a non-reentrant
-        checkpoint that first run already packed its saved tensors, so a rerun
-        would pack a second set the recompute never matches: end the step
-        instead, and the retry runs eager from the start.
-        """
+        # torch already ran the body once; inside a checkpoint a rerun would pack a second set, so end the step.
         global _PACKED_COMPILED_IN_CHECKPOINT, _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
         warning = (
             f"Unsloth: torch.compile skipped every frame of {label}; "
@@ -1851,7 +1824,6 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             return _EagerFallbackTaken(
                 _give_up_on_backend(e, args, kwargs, marker_before))
         except RuntimeError as e:
-            # Same sibling-except gap for a retry whose frame got skipped.
             if not _is_no_compiled_frames_error(e):
                 raise
             return _EagerFallbackTaken(
@@ -1997,7 +1969,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
                 raise
             return _give_up_on_disabled_hook(e, args, kwargs, marker_before)
         except RuntimeError as e:
-            # Last: Dynamo's typed errors subclass RuntimeError and are classified above.
+            # Must stay last: Dynamo's typed errors subclass RuntimeError.
             if not _is_no_compiled_frames_error(e):
                 raise
             return _give_up_on_skipped_frames(e, args, kwargs, marker_before)

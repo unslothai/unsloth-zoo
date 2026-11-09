@@ -14,10 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""torch >= 2.14 raises a plain RuntimeError when a fullgraph region ran with every frame skipped (for example
-Inductor declining bf16 on a T4): "found no compiled frames. Skipped frames: ..." on the first call, then
-"... Compilation was not attempted and no cached compiled code was found." on every later call. The eager
-fallback must latch on both, and any other RuntimeError must still propagate."""
 
 from __future__ import annotations
 
@@ -67,7 +63,6 @@ def test_no_compiled_frames_falls_back_and_latches(message):
     wrapped = U._fall_back_to_eager_on_recompile_limit(compiled, eager, "test-skipped")
     assert wrapped(21) == 42
     assert wrapped(5) == 10
-    # Latched: the compiled callable is not retried after the first refusal.
     assert calls == {"compiled": 1, "eager": 2}
     assert "test-skipped" in U._LATCHED_EAGER_LABELS
     assert U.eager_fallback_state()["test-skipped"] is True
@@ -83,7 +78,6 @@ def test_an_unrelated_runtime_error_still_raises():
 
 
 def test_compile_with_eager_fallback_end_to_end(monkeypatch):
-    """Through the public entry point, with the raw compiled callable replaced by one that raises like torch 2.14."""
     from unsloth_zoo.temporary_patches import common
 
     state = {"n": 0}
@@ -110,7 +104,6 @@ def test_compile_with_eager_fallback_end_to_end(monkeypatch):
 
 
 def test_real_torch_skipped_frame_latches_to_eager():
-    """Real Dynamo, CPU: a backend that skips the frame reproduces the torch >= 2.14 error without a GPU."""
     import torch._dynamo.exc as dynamo_exc
 
     if not hasattr(dynamo_exc, "SkipFrame"):
@@ -136,7 +129,6 @@ def test_real_torch_skipped_frame_latches_to_eager():
     compiled = torch.compile(kernel, backend = skipping_backend, fullgraph = True)
     wrapped = U._fall_back_to_eager_on_recompile_limit(compiled, kernel, "test-real-skip")
     x = torch.ones(2)
-    # First call: "Skipped frames: ..."; a direct second call would be "Compilation was not attempted ...".
     assert torch.equal(wrapped(x), x * 3)
     assert torch.equal(wrapped(x), x * 3)
     assert "test-real-skip" in U._LATCHED_EAGER_LABELS
@@ -165,8 +157,6 @@ def _skipping_compile(kernel):
 
 
 def test_a_skipped_frame_runs_its_body_once():
-    """The skipped body already ran when torch would raise: its result is kept, never rerun, so a stateful forward
-    (BatchNorm running stats, a counter) is applied once per call."""
     calls = []
 
     def kernel(x):
@@ -186,8 +176,6 @@ def test_a_skipped_frame_runs_its_body_once():
 
 
 def test_skipped_frame_inside_a_checkpoint_backpropagates():
-    """Non-reentrant checkpoint: the skipped body ran eagerly under the pack hooks, its result is kept, and the
-    latched eager recompute packs the same tensors, so the first step's backward matches plain eager."""
     from torch.utils.checkpoint import checkpoint
 
     if U._in_non_reentrant_checkpoint() is None:
@@ -207,8 +195,6 @@ def test_skipped_frame_inside_a_checkpoint_backpropagates():
 
 
 def test_skip_after_a_compiled_pack_in_the_step_ends_it(monkeypatch):
-    """A region that already packed compiled in this checkpointed step and is then skipped (a new shape) must end the
-    step: its compiled pack would be recomputed eagerly."""
     from torch.utils.checkpoint import checkpoint
 
     if U._in_non_reentrant_checkpoint() is None:
