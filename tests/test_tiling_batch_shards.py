@@ -40,6 +40,8 @@ def test_arctic_tiles_stay_within_one_chunk(bsz, qlen):
     mlp = _RecordingMLP(hidden)
     reference = _RecordingMLP.forward
     patch_mlp(mlp, target_arctic = True)
+    # Install runs the MLP once on a single row (the op's unused-parameter probe); count only the call below.
+    mlp.rows_seen.clear()
 
     x = torch.randn(bsz, qlen, hidden)
     out = mlp(x)
