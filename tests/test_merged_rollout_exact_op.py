@@ -226,8 +226,42 @@ def run_batched_store(device):
     ts = targets_of([(W.clone(), A, B) for W, A, B in cases[:3]])
     ex.exact_fold(ts)
     assert ex.host_arena_stats()[kind]["live"] == live + 1
+    if device == "cuda":
+        # Offloaded on a side stream: the dropped lease waits for that copy before its slice can be handed out again.
+        stream = torch.cuda.Stream()
+        ts = targets_of([(W.clone(), A, B) for W, A, B in cases[:3]])
+        ex.exact_fold(ts, stream = stream)
+        store = ts[0].store
+        assert store.lease.pending is store.ready is not None
+        del store
     del ts
     assert ex.host_arena_stats()[kind]["live"] == live
+
+
+def test_dropped_lease_waits_for_its_pending_copy():
+    # A lease handed back before its unfold synchronizes the copy still writing into its slice before the arena can
+    # reuse it, and gives the slice back even when that wait raises.
+    arena = ex._HostArena(False)
+    order = []
+
+    class Event:
+        def __init__(self, fail = False):
+            self.fail = fail
+
+        def synchronize(self):
+            order.append(("sync", arena.live))
+            if self.fail:
+                raise RuntimeError("copy failed")
+
+    lease = arena.take(100)
+    lease.pending = Event()
+    del lease
+    assert order == [("sync", 1)] and arena.live == 0
+    lease = arena.take(100)
+    lease.pending = Event(fail = True)
+    with pytest.raises(RuntimeError):
+        lease.release()
+    assert arena.live == 0 and lease.pending is None
 
 
 def run_list_ops(device):

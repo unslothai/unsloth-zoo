@@ -616,17 +616,24 @@ pass
 
 
 class _Lease:
-    """One fold's slice of a host arena, given back at unfold (or when its target is dropped)."""
-    __slots__ = ("arena", "buffer", "done")
+    """One fold's slice of a host arena, given back at unfold (or when its target is dropped). `pending` is the event of
+    an asynchronous copy into the slice: a lease dropped before its unfold waits for it, so the next fold handed the
+    same slice (possibly on another copy stream) cannot be overwritten by a copy still in flight."""
+    __slots__ = ("arena", "buffer", "done", "pending")
 
     def __init__(self, arena, buffer):
-        self.arena, self.buffer, self.done = arena, buffer, False
+        self.arena, self.buffer, self.done, self.pending = arena, buffer, False, None
 
     def release(self):
         if not self.done:
             self.done = True
-            self.buffer = None
-            self.arena._give()
+            pending, self.pending = self.pending, None
+            try:
+                if pending is not None:
+                    pending.synchronize()
+            finally:
+                self.buffer = None
+                self.arena._give()
 
     def __del__(self):
         try:
@@ -731,6 +738,8 @@ def _offload(targets, stream):
         ready.record(stream)
     for s in stores:
         s.ready = ready
+        if s.lease is not None:
+            s.lease.pending = ready
         s.dev = None
 pass
 
