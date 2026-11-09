@@ -130,6 +130,7 @@ if triton is not None:
         pid_k = tl.program_id(1)
         e = tl.program_id(2)
         pid = (e * tl.num_programs(0) + pid_n) * tl.num_programs(1) + pid_k
+        n_tiles = tl.num_programs(0) * tl.num_programs(1) * tl.num_programs(2)
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         rk = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
         mn = rn < N
@@ -147,12 +148,14 @@ if triton is not None:
         w = tl.load(ptrs, mask = mask, other = 0.0)
         # Each mode lives in its own helper: a runtime branch must not leave differently typed names behind.
         if mode == 2:
-            _unfold_tile(w, d, ptrs, mask, pid, woff, words, checksum, n_words, BLOCK_N, BLOCK_K, MANT, EXPM, MAX_GAP)
+            _unfold_tile(
+                w, d, ptrs, mask, pid, n_tiles, woff, words, checksum, n_words, BLOCK_N, BLOCK_K, MANT, EXPM, MAX_GAP,
+            )
         elif mode == 0:
             _count_tile(w, d, mask, pid, counts, checksum, MANT, EXPM, MAX_GAP)
         else:
             _fold_tile(
-                w, d, ptrs, mask, pid, e, rn, rk, N, K, woff, words, idx_out, val_out, eoff,
+                w, d, ptrs, mask, pid, n_tiles, e, rn, rk, N, K, woff, words, idx_out, val_out, eoff, n_words,
                 BLOCK_N, BLOCK_K, MANT, EXPM, MAX_GAP,
             )
 
@@ -172,6 +175,14 @@ if triton is not None:
         return new, wb, k, tl.where(esc, -half, c), bad, esc
 
     @triton.jit
+    def _tile_words(woff, pid, n_tiles, n_words):
+        # Words of this tile's stream: the next tile's offset (or the stream end) minus its own. Zero when no element of
+        # the tile has a code (every exponent gap is 0): then back = round(new - d) is already the original everywhere.
+        start = tl.load(woff + pid)
+        nxt = tl.load(woff + pid + 1, mask = pid + 1 < n_tiles, other = n_words)
+        return nxt - start
+
+    @triton.jit
     def _count_tile(w, d, mask, pid, counts, checksum, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr):
         new, wb, k, c, bad, esc = _classify(w, d, mask, MANT, EXPM, MAX_GAP)
         tl.store(counts + pid * 3 + 0, tl.sum(tl.sum(bad.to(tl.int32), 1), 0))
@@ -182,44 +193,62 @@ if triton is not None:
 
     @triton.jit
     def _fold_tile(
-        w, d, ptrs, mask, pid, e, rn, rk, N, K, woff, words, idx_out, val_out, eoff,
+        w, d, ptrs, mask, pid, n_tiles, e, rn, rk, N, K, woff, words, idx_out, val_out, eoff, n_words,
         BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,
     ):
         TILE: tl.constexpr = BLOCK_N * BLOCK_K
         new, wb, k, c, bad, esc = _classify(w, d, mask, MANT, EXPM, MAX_GAP)
-        fk = tl.reshape(k, (TILE,))
-        # 32-bit math: a tile's stream is at most 32 * 128 * (MAX_GAP + 1) bits, its codes at most 8 bits wide.
-        code = (tl.reshape(c, (TILE,)) & ((1 << tl.maximum(fk, 1)) - 1)).to(tl.uint32)
-        local = tl.cumsum(fk, 0) - fk
-        base = words + tl.load(woff + pid)
-        word = local >> 5
-        shift = local & 31
-        put = (fk > 0) & (code != 0)
-        lo = (code << shift.to(tl.uint32)).to(tl.int32, bitcast = True)
-        hi = tl.where(shift > 0, code >> ((32 - shift) & 31).to(tl.uint32), 0).to(tl.int32, bitcast = True)
-        tl.atomic_or(base + word, lo, mask = put, sem = "relaxed")
-        tl.atomic_or(base + word + 1, hi, mask = put & (shift + fk > 32), sem = "relaxed")
+        # A tile with no codes (common for small adapters) writes no stream: skip the scan and the atomics.
+        if _tile_words(woff, pid, n_tiles, n_words) > 0:
+            fk = tl.reshape(k, (TILE,))
+            # 32-bit math: a tile's stream is at most 32 * 128 * (MAX_GAP + 1) bits, its codes at most 8 bits wide.
+            code = (tl.reshape(c, (TILE,)) & ((1 << tl.maximum(fk, 1)) - 1)).to(tl.uint32)
+            local = tl.cumsum(fk, 0) - fk
+            base = words + tl.load(woff + pid)
+            word = local >> 5
+            shift = local & 31
+            put = (fk > 0) & (code != 0)
+            lo = (code << shift.to(tl.uint32)).to(tl.int32, bitcast = True)
+            hi = tl.where(shift > 0, code >> ((32 - shift) & 31).to(tl.uint32), 0).to(tl.int32, bitcast = True)
+            tl.atomic_or(base + word, lo, mask = put, sem = "relaxed")
+            tl.atomic_or(base + word + 1, hi, mask = put & (shift + fk > 32), sem = "relaxed")
         flat_esc = tl.reshape(esc.to(tl.int32), (TILE,))
-        pos = tl.load(eoff + pid) + tl.cumsum(flat_esc, 0) - 1
-        flat_idx = tl.reshape(
-            (e.to(tl.int64) * N + rn[:, None].to(tl.int64)) * K + rk[None, :].to(tl.int64),
-            (TILE,),
-        )
-        keep = flat_esc != 0
-        tl.store(idx_out + pos, flat_idx, mask = keep)
-        tl.store(val_out + pos, tl.reshape(w, (TILE,)), mask = keep)
+        # Escapes can sit in a tile without codes (gap 0 or > MAX_GAP), so they are checked on their own.
+        if tl.max(flat_esc, 0) > 0:
+            pos = tl.load(eoff + pid) + tl.cumsum(flat_esc, 0) - 1
+            flat_idx = tl.reshape(
+                (e.to(tl.int64) * N + rn[:, None].to(tl.int64)) * K + rk[None, :].to(tl.int64),
+                (TILE,),
+            )
+            keep = flat_esc != 0
+            tl.store(idx_out + pos, flat_idx, mask = keep)
+            tl.store(val_out + pos, tl.reshape(w, (TILE,)), mask = keep)
         tl.store(ptrs, new, mask = mask)
 
     @triton.jit
     def _unfold_tile(
-        w, d, ptrs, mask, pid, woff, words, checksum, n_words,
+        w, d, ptrs, mask, pid, n_tiles, woff, words, checksum, n_words,
         BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,
     ):
         # w is the folded value: back = round(w - d), plus the stored correction where the stream has one.
-        TILE: tl.constexpr = BLOCK_N * BLOCK_K
         back = (w.to(tl.float32) - d).to(w.dtype)
-        nb = w.to(tl.int16, bitcast = True).to(tl.int32)
         bb = back.to(tl.int16, bitcast = True).to(tl.int32)
+        if _tile_words(woff, pid, n_tiles, n_words) == 0:
+            # No codes in this tile: back is the original everywhere (escapes are applied after the kernel).
+            tl.store(ptrs, back, mask = mask)
+            tl.atomic_add(checksum, tl.sum(tl.sum(tl.where(mask, bb, 0), 1), 0).to(tl.int64))
+        else:
+            _unfold_stream(
+                w, bb, ptrs, mask, pid, woff, words, checksum, n_words, BLOCK_N, BLOCK_K, MANT, EXPM, MAX_GAP,
+            )
+
+    @triton.jit
+    def _unfold_stream(
+        w, bb, ptrs, mask, pid, woff, words, checksum, n_words,
+        BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,
+    ):
+        TILE: tl.constexpr = BLOCK_N * BLOCK_K
+        nb = w.to(tl.int16, bitcast = True).to(tl.int32)
         k = tl.reshape(tl.where(mask, _width(nb, bb, MANT, EXPM, MAX_GAP), 0), (TILE,))
         # 32-bit math (as the fold): bit offsets inside this tile's stream; reads stay inside the stream.
         start = tl.load(woff + pid)

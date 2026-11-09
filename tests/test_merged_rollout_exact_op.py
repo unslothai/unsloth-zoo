@@ -147,7 +147,36 @@ def run_opcheck(device):
         reset()
 
 
+def run_empty_tiles(device):
+    # Rows 96.. have B = 0 (a fresh LoRA): those tiles hold no code words and take the fast path; the others keep a
+    # stream, including small-adapter rows 32..95 where a few elements still cross an exponent boundary.
+    from unsloth_zoo.merged_rollout_exact import ExactFoldTarget, exact_fold, exact_unfold
+    g = torch.Generator().manual_seed(7)
+    for dtype in (torch.float16, torch.bfloat16):
+        W = (torch.randn(160, 512, generator = g) * 0.02).to(dtype).to(device)
+        W[5, :7] = torch.tensor([0.0, -0.0, 6e-8, -6e-8, 1e-3, 60000.0, -1e-6]).to(dtype)
+        A = (torch.randn(4, 512, generator = g) * 0.05).to(device)
+        B = (torch.randn(160, 4, generator = g) * 0.0002).to(device)
+        B[:32] *= 300
+        B[96:] = 0
+        W0 = W.clone()
+        t = ExactFoldTarget(W.unsqueeze(0), A.unsqueeze(0), B.unsqueeze(0), 0.5)
+        exact_fold([t])
+        wcnt = t.host_wcnt.to(torch.int64)
+        assert (wcnt == 0).any() and (wcnt > 0).any(), wcnt
+        assert not torch.equal(_bits(W), _bits(W0))
+        exact_unfold([t])
+        assert torch.equal(_bits(W), _bits(W0)), dtype
+    if device == "cuda":
+        caches = getattr(ex._exact_merge_kernel, "device_caches", None)
+        if caches:
+            for kernels in caches.values():
+                # One compiled variant per weight dtype: fp16 and bf16 here, every mode shared.
+                assert len(kernels[0]) <= 2, len(kernels[0])
+
+
 def run_all(device):
+    run_empty_tiles(device)
     run_compiled(device)
     run_arena_growth(device)
     run_arena_reuse(device)
