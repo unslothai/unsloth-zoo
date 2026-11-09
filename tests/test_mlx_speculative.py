@@ -1,13 +1,4 @@
 # Unsloth Zoo - Utilities for Unsloth
-# Pin MLXTrainer's batch padding to match mlx-lm's iterate_batches:
-# `1 + _PAD_MULTIPLE * ceil(L / _PAD_MULTIPLE)`.
-#
-# mlx-lm (mlx_lm/tuner/trainer.py:158) pads to `1 + 32*ceil(max_len/32)`;
-# default_loss then slices [:, :-1] / [:, 1:]. unsloth_zoo's
-# create_text_batches previously dropped the `+1`, leaving the input one
-# token short after the autoregressive shift, which shifted small fixtures
-# into a different convergence basin (probe 31 = 67% vs probe 33-37 = 40-53%,
-# see danielhanchen/unsloth-staging-2).
 
 import random
 from collections import Counter
@@ -19,9 +10,48 @@ import pytest
 
 pytest.importorskip("mlx.core")
 from unsloth_zoo.mlx.speculative import (
+    SizedTreeBudget,
     TreeBudget,
     DraftController, NgramProposer, RoundPlan, RowPlan, RowState, SpeculativeEngine, _Calibration, _CycleCosts, _Ema, _upper,
 )
+
+
+@pytest.mark.parametrize("entrypoint", ["engine", "batch"])
+def test_quantized_decode_keeps_each_rows_padding_mask(entrypoint, monkeypatch):
+    import mlx.core as mx
+    from mlx_vlm.models import cache as caches
+    from mlx_vlm.models.qwen3_5 import language
+    from unsloth_zoo.mlx import generate, speculative
+
+    # The mask is computed from real mlx-vlm caches; tests/mlx_simulation only stubs these classes.
+    if not all(isinstance(getattr(caches, name, None), type) for name in ("BatchQuantizedKVCache", "BatchKVCache")):
+        pytest.skip("needs real mlx-vlm batch caches; tests/mlx_simulation only stubs them")
+    original = getattr(language, "_create_qwen3_5_attention_mask", None)
+    if original is None:
+        pytest.skip("mlx-vlm has no affected Qwen3.5 mask fast path")
+    while getattr(original, "_unsloth_quantized_padding", False):
+        original = original.__wrapped__
+    monkeypatch.setattr(language, "_create_qwen3_5_attention_mask", original)
+    def install():
+        if entrypoint == "engine":
+            return speculative._language_call("qwen3_5")
+        return generate._resolve_vlm_batch_module()
+    install()
+    wrapped = language._create_qwen3_5_attention_mask
+    install()
+    assert language._create_qwen3_5_attention_mask is wrapped
+
+    quantized = caches.BatchQuantizedKVCache([0, 2])
+    keys = mx.ones((2, 1, 4, 64))
+    quantized.update_and_fetch(keys, keys)
+    hidden = mx.zeros((2, 1, 128))
+    mask = language._create_qwen3_5_attention_mask(hidden, quantized)
+    assert isinstance(mask, mx.array)
+    assert mask.tolist() == [[[[True] * 5]], [[[False, False, True, True, True]]]]
+
+    dense = caches.BatchKVCache([0, 2])
+    dense.update_and_fetch(keys, keys)
+    assert language._create_qwen3_5_attention_mask(hidden, dense) == original(hidden, dense)
 
 
 def test_ngram_prefers_longer_then_newer_match():
@@ -105,7 +135,6 @@ def test_controller_finds_best_depth_including_plain(draft, slope):
         choice = _run(DraftController(max_depth = 4, can_copy = False), machine, [(draft, None)],
                       rounds = 1500, seed = seed, report = (report := {}))
         assert _throughput(choice, draft, machine) >= 0.95 * _throughput(best, draft, machine)
-        # Probes and split rounds included, the second half runs near the optimum.
         assert report["rate"] >= 0.9 * _throughput(best, draft, machine)
 
 
@@ -242,7 +271,6 @@ def test_controller_copies_only_while_copies_hold():
 
 
 def test_controller_prefers_free_copy_over_costlier_drafter():
-    # The drafter accepts slightly more, but its forward makes the round slower.
     machine = _Machine(draft_slope = 0.8)
     choice = _run(DraftController(max_depth = 4, max_copy = 12), machine, [([0.85] * 4, 0.8)], rounds = 1500)
     assert choice != "plain" and choice[0][0] == "copy"
@@ -257,6 +285,104 @@ def test_controller_drafts_alone_but_not_in_a_wide_batch():
     assert _run(fixed := DraftController(max_depth = 3, can_copy = False, fixed_depth = True), machine, [([0.8, 0.6, 0.4], None)] * 8, rounds = 1000, seed = 1, report = (report := {})) == (("draft", 3),) * 8 and "plain" not in report["choices"]
     assert _run(DraftController(max_depth = 3, fixed_depth = True), machine, [([0.8, 0.6, 0.4], 0.95), ([0.8, 0.6, 0.4], None), ([0.8, 0.6, 0.4], 0.1)], rounds = 200) == (("copy", 12), ("draft", 3), ("draft", 3))
     assert [controller.plain_cost[b].value for b in (1, 8)] == pytest.approx([machine.plain(1), machine.plain(8)])
+
+
+def test_folded_replay_is_not_learned_as_a_free_separately_timed_replay():
+    controller = DraftController(max_depth = 2, can_copy = False)
+    plan = RoundPlan("round", rows = (RowPlan("draft", 2),), split = True)
+    state = RowState(controller.new_reply(), catch_up = 2)
+    controller.record_round(plan, [state], [1], seconds = 1.0, draft_seconds = 0.3)
+    assert controller.catch_up_cost.value is None
+    state.catch_up = 12
+    controller.record_round(plan, [state], [1], seconds = 1.0, draft_seconds = 0.3, catch_up_seconds = 0.6)
+    assert controller.catch_up_cost.value == pytest.approx(0.05)
+    state.catch_up = 2
+    controller.record_round(plan, [state], [1], seconds = 1.0, draft_seconds = 0.3)
+    assert controller.catch_up_cost.value == pytest.approx(0.05)
+
+
+def test_folded_replay_does_not_keep_calibrated_drafts_in_split_mode():
+    controller = DraftController(max_depth = 2, can_copy = False, split_every = 1000)
+    states = []
+    _run(controller, _Machine(draft_slope = 0.01, verify_slope = 0.01), [([1.0, 1.0], None)],
+         rounds = 100, states = states)
+    controller._since_split = 0
+    assert controller.plan(states).kind == "round"
+    assert not controller.plan(states).split
+    states[0].catch_up = 2
+    states[0].folded_replay = True
+    assert not controller.plan(states).split
+    assert controller.catch_up_cost.value is None
+    states[0].catch_up = 12
+    states[0].folded_replay = False
+    assert controller.plan(states).split
+
+
+def test_folded_replay_is_included_in_drafting_cost_only_once():
+    controller = DraftController(max_depth = 2, can_copy = False)
+    state = RowState(controller.new_reply(), catch_up = 2)
+    state.folded_replay = True
+    plan = RoundPlan("round", rows = (RowPlan("draft", 2),), split = True)
+    for _ in range(2):
+        controller.record_round(plan, [state], [2], seconds = 1.0, draft_seconds = 0.3)
+    assert controller.round_seconds(plan, [state]) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("backlogs", [(6,), (6, 1)])
+@pytest.mark.parametrize("samples", [((5, 0.012), (5, 0.012)), ((5, 0.012), (2, 0.006)),
+                                    ((2, 0.006), (5, 0.012)), ((2, 0.006), (2, 0.006), (5, 0.012))])
+def test_a_folded_draft_sample_does_not_bill_replay_twice_after_a_backlog(backlogs, samples):
+    controller = DraftController(max_depth = 4, can_copy = False)
+    state = RowState(controller.new_reply(), catch_up = 5, folded_replay = True)
+    controller.catch_up_cost.update_time(0.002, controller.cost_alpha)
+    plan = RoundPlan("round", rows = (RowPlan("draft", 4),), split = True)
+    for pairs, duration in samples:
+        state.catch_up = pairs
+        controller.record_round(plan, [state], [4], seconds = 0.008 + duration, draft_seconds = duration)
+    assert controller.round_seconds(plan, [state]) == pytest.approx(0.010 + 0.002 * state.catch_up)
+    states = [RowState(controller.new_reply(), catch_up = n, folded_replay = n <= 5) for n in backlogs]
+    plan = RoundPlan("round", rows = tuple(RowPlan("draft", 4) for _ in states), split = True)
+    controller.verify_cost[len(states)] = {5: _Ema(0.008 * len(states))}
+    expected = 0.010 * len(states) + 0.002 * sum(backlogs)
+    assert controller.round_seconds(plan, states) == pytest.approx(expected)
+    if len(states) == 1:
+        controller._warmup.clear()
+        controller.plain_cost[1] = _Ema(0.006, 2)
+        controller._credit = 0
+        states[0].stats.draft = [_Ema(1.0, 100) for _ in range(4)]
+        states[0].stats.draft_seen = [True] * 4
+        states[0].stats.probe_at["draft"] = states[0].stats.tokens + 1000
+        assert controller.plan(states).kind == "round"
+
+
+def test_folded_replay_does_not_make_a_profitable_draft_lose_to_plain():
+    controller = DraftController(max_depth = 1, can_copy = False)
+    states = []
+    _run(controller, _Machine(draft_slope = 0.3, verify_slope = 0, overhead = 0.7), [([0.2], None)],
+         rounds = 500, states = states)
+    controller._credit = 0
+    states[0].stats.probe_at["draft"] = states[0].stats.tokens + 1000
+    assert controller.plan(states).kind == "round"
+    states[0].catch_up, states[0].folded_replay = 2, True
+    assert controller.plan(states).kind == "round"
+
+
+@pytest.mark.parametrize("backlogs", [(10,), (10, 2)])
+def test_synchronous_replay_is_not_credited_as_overlapped_drafting(backlogs):
+    controller = DraftController(max_depth = 2, can_copy = False)
+    states = [RowState(controller.new_reply(), catch_up = count) for count in backlogs]
+    for state in states:
+        state.folded_replay = state.catch_up <= controller.max_depth + 1
+    plan = RoundPlan("round", rows = tuple(RowPlan("draft", 2) for _ in states), split = True)
+    replay, drafting = sum(backlogs) * 0.1, len(states) * 0.3
+    seconds = 0.7 + replay + drafting
+    for _ in range(2):
+        controller.record_round(plan, states, [2] * len(states), seconds = seconds,
+                                draft_seconds = drafting, catch_up_seconds = replay)
+    assert controller.round_seconds(plan, states) == pytest.approx(seconds)
+    fused = replace(plan, split = False)
+    controller.record_round(fused, states, [2] * len(states), seconds = seconds, catch_up_seconds = replay)
+    assert controller.round_seconds(fused, states) == pytest.approx(seconds)
 
 
 def test_a_draft_probe_shrinks_to_the_deepest_depth_the_credit_affords():
@@ -315,9 +441,7 @@ def test_timings_resist_one_off_work():
         assert (timing.value, timing.count) == pytest.approx((value, len(samples)))
     controller = DraftController(max_depth = 7, can_copy = False)
     controller.verify_cost[1] = {2: _Ema(1.0, 2), 4: _Ema(1.2, 2), 6: _Ema(9.0), 8: _Ema(1.5)}
-    # A width timed once counts no more than the confirmed widths predict.
     assert [value for _, value in controller._measured(controller.verify_cost[1])] == pytest.approx([1.0, 1.2, 1.4, 1.5])
-    # And a round at it, or drafting a depth timed once, is timed apart again, so its second sample confirms or replaces it.
     controller.draft_cost.update({1: _Ema(0.2, 2), 3: _Ema(0.2), 7: _Ema(0.2, 2)})
     rows = [RowState(controller.new_reply())]
     assert [controller._measured_parts(RoundPlan("round", rows = (RowPlan("draft", depth),)), rows) for depth in (1, 3, 7)] == [True, False, False]
@@ -335,7 +459,6 @@ def test_a_trimmed_round_verifies_the_width_its_drafts_pay_for():
     width = lambda confidence: controller.trim(plan, rows, [confidence]).width
     # A doubtful third draft ends the verify before it, confident drafts all verify, doubtful ones keep one; the fourth is a full round.
     assert [width([0.99, 0.99, 0.2] + [0.99] * 4), width([0.99] * 7), width([0.2] * 7), width([0.2] * 7)] == [3, 8, 1, 8]
-    # When width costs nothing, every draft is worth verifying.
     costs([(w, 1.0) for w in range(1, 9)])
     assert width([0.2] * 7) == 8
     # Accounted, the verified positions calibrate, and the drafting is that of the block drafted, not of the rows verified.
@@ -493,8 +616,9 @@ def test_a_fresh_loads_first_reply_drafts_on_its_own_accepted_rounds():
         state = [RowState(controller.new_reply(), copy_available = copies)]
         for accepted, seconds, drafting in ((3, 1.96 + draft, draft), (1, 1.80, 0.18)):
             controller.record_round(controller.plan(state), state, [accepted], seconds = seconds, draft_seconds = drafting)
-        assert controller.plan(state).kind == "plain"
-        controller.record_plain(state, 8, 8.0, 1.0)
+        for _ in range(2):
+            assert controller.plan(state).kind == "plain"
+            controller.record_plain(state, 4, 4.0, 1.0)
         assert controller.plan(state).rows == (first,)
 
 
@@ -534,7 +658,8 @@ def test_rows_switch_to_drafting_together():
         state.stats.copy.value = 1.0
         state.stats.draft = [_Ema(1.0) for _ in range(4)]
         state.stats.probe_at = {"copy": 1 << 30, "draft": 1 << 30}
-    controller.record_plain(states, 1, 5.0, 5.0)
+    for _ in range(2):
+        controller.record_plain(states, 1, 5.0, 5.0)
     assert [row.source for row in controller.plan(states).rows] == ["draft", "draft"]
     states[1].stats.draft = [_Ema(0.0) for _ in range(4)]
     states[1].copy_available = 0
@@ -655,16 +780,265 @@ def test_a_row_kept_off_the_draft_never_drafts_and_pipelines_as_its_processors_a
     controller = DraftController(max_depth = 1, can_copy = False)
     rows = [_Row(EngineRow(None, 1, [1, 2], processors = [processor], drafts = drafts), controller) for drafts in (True, False)]
     assert [row.speculates for row in rows] == [history_only, False]
-    # Pipelining waits for a processor that reads more than the history, not for a row off the draft.
     queued = []
     step = lambda inputs, ahead = 0: queued.append(ahead) or (mx.array([3, 3]), None, None)
     record = SimpleNamespace(record_plain = lambda *_a: None, interrupts_plain = lambda _s: False)
-    # No stream work happens here; the CPU shim implements none.
     monkeypatch.setattr(mx, "stream", lambda _s: contextlib.nullcontext())
     engine = _bare_engine(SpeculativeEngine, _step = step, _stream = None, controller = record)
     engine._rows, engine._states = rows, lambda: []
     list(engine._plain(3, []))
     assert (1 in queued) == history_only
+
+
+@pytest.mark.parametrize("history_only", [True, False])
+def test_closing_a_plain_stream_preserves_its_completed_cost_sample(history_only, monkeypatch):
+    import contextlib
+    import mlx.core as mx
+    from unsloth_zoo.mlx import speculative
+
+    def processor(tokens, logits):
+        return logits
+    processor.history_only = history_only
+    controller = DraftController(max_depth = 0, can_copy = False)
+    row = speculative._Row(speculative.EngineRow(None, 1, [1, 2], processors = [processor]), controller)
+    recorded = []
+    observer = SimpleNamespace(record_plain = lambda *args: recorded.append(args), interrupts_plain = lambda _s: False)
+    gpu = {"queued": 0, "finished": 0}
+
+    class Tokens:
+        def __getitem__(self, index):
+            return self
+
+        def tolist(self):
+            gpu["finished"] = gpu["queued"]
+            return [3]
+
+    def forward(inputs, ahead = 0):
+        gpu["queued"] += 1
+        return Tokens(), None, None
+
+    monkeypatch.setattr(speculative.time, "perf_counter", lambda: gpu["finished"])
+    monkeypatch.setattr(mx, "stream", lambda _s: contextlib.nullcontext())
+    monkeypatch.setattr(mx, "async_eval", lambda *_args: None)
+    engine = _bare_engine(SpeculativeEngine, _stream = None, controller = observer,
+                         _step = forward)
+    engine._rows, engine._states = [row], lambda: []
+    stream = engine._plain(8, [])
+    for _ in range(3):
+        assert next(stream) == [[3]]
+    stream.close()
+    assert len(recorded) == 1
+    assert recorded[0][1] == 3
+    assert recorded[0][2] > 0 and recorded[0][3] == 1
+    stream.close()
+    assert len(recorded) == 1
+
+
+@pytest.mark.parametrize("settles", [True, False])
+def test_plain_steps_queue_after_settlement_before_yielding_to_the_consumer(settles, monkeypatch):
+    import contextlib
+    import mlx.core as mx
+    from unsloth_zoo.mlx import speculative
+
+    committed, forwards, queued = [], [], []
+    def processor(tokens, logits):
+        return logits
+    if settles:
+        processor.settle = lambda tokens: committed.append(tokens.tolist())
+    controller = DraftController(max_depth = 0, can_copy = False)
+    row = speculative._Row(speculative.EngineRow(None, 1, [1, 2], processors = [processor], max_tokens = 4), controller)
+    observer = SimpleNamespace(record_plain = lambda *a: None, interrupts_plain = lambda s: False)
+
+    def step(inputs, ahead = 0):
+        assert ahead == 0
+        forwards.append((inputs.tolist(), list(committed)))
+        return mx.array([3 + len(forwards)]), None, None
+
+    monkeypatch.setattr(mx, "stream", lambda s: contextlib.nullcontext())
+    monkeypatch.setattr(mx, "async_eval", lambda *a: queued.append(len(forwards)))
+    engine = _bare_engine(SpeculativeEngine, _stream = None, controller = observer, _step = step)
+    engine._rows, engine._states = [row], lambda: []
+    stream = engine._plain(3, [])
+    assert next(stream) == [[4]]
+    assert len(forwards) == (2 if settles else 1)
+    if settles:
+        assert forwards[-1] == ([[4]], [[1, 2, 1], [1, 2, 1, 4]])
+        assert queued == [2]
+    assert list(stream) == [[[5]], [[6]]]
+    assert len(forwards) == 3
+
+
+def test_a_queued_plain_failure_does_not_drop_the_already_committed_token(monkeypatch):
+    import contextlib
+    import mlx.core as mx
+    from unsloth_zoo.mlx import speculative
+
+    def processor(tokens, logits):
+        return logits
+    processor.settle = lambda tokens: None
+    controller = DraftController(max_depth = 0, can_copy = False)
+    row = speculative._Row(speculative.EngineRow(None, 1, [1, 2], processors = [processor]), controller)
+    calls = []
+    failure = ValueError("next token cannot satisfy the grammar")
+
+    def step(inputs, ahead = 0):
+        calls.append(inputs.tolist())
+        if len(calls) > 1:
+            raise failure
+        return mx.array([4]), None, None
+
+    monkeypatch.setattr(mx, "stream", lambda s: contextlib.nullcontext())
+    observer = SimpleNamespace(record_plain = lambda *a: None, interrupts_plain = lambda s: False)
+    engine = _bare_engine(SpeculativeEngine, _stream = None, controller = observer, _step = step)
+    engine._rows, engine._states = [row], lambda: []
+    stream = engine._plain(3, [])
+    assert next(stream) == [[4]]
+    assert calls == [[[1]], [[4]]]
+    with pytest.raises(ValueError) as raised:
+        next(stream)
+    assert raised.value is failure
+
+
+def test_settled_plain_cost_includes_gpu_work_overlapped_with_the_first_consumer(monkeypatch):
+    import contextlib
+    import mlx.core as mx
+    from unsloth_zoo.mlx import speculative
+
+    clock, gpu, samples = [0.0], [0.0], []
+    def processor(tokens, logits):
+        return logits
+    processor.settle = lambda tokens: None
+    controller = DraftController(max_depth = 0, can_copy = False)
+    row = speculative._Row(speculative.EngineRow(None, 1, [1, 2], processors = [processor]), controller)
+
+    class Tokens:
+        def __init__(self, ready):
+            self.ready = ready
+
+        def __getitem__(self, index):
+            return self
+
+        def tolist(self):
+            clock[0] = max(clock[0], self.ready)
+            return [3]
+
+    def step(inputs, ahead = 0):
+        gpu[0] = max(clock[0], gpu[0]) + 0.01
+        return Tokens(gpu[0]), None, None
+
+    monkeypatch.setattr(speculative.time, "perf_counter", lambda: clock[0])
+    monkeypatch.setattr(mx, "stream", lambda s: contextlib.nullcontext())
+    monkeypatch.setattr(mx, "async_eval", lambda *a: None)
+    observer = SimpleNamespace(record_plain = lambda *a: samples.append(a), interrupts_plain = lambda s: False)
+    engine = _bare_engine(SpeculativeEngine, _stream = None, controller = observer, _step = step)
+    engine._rows, engine._states = [row], lambda: []
+    stream = engine._plain(3, [])
+    assert next(stream) == [[3]]
+    clock[0] += 0.01
+    assert list(stream) == [[[3]], [[3]]]
+    assert samples[0][3] == pytest.approx(0.01)
+
+
+def test_a_single_cold_plain_sample_is_confirmed_before_comparing_draft_rates():
+    controller = DraftController(max_depth = 1, can_copy = False)
+    rows = [RowState(controller.new_reply())]
+    draft = RoundPlan("round", rows = (RowPlan("draft", 1),), split = True)
+    for _ in range(2):
+        controller.record_round(draft, rows, [1], seconds = 0.045, draft_seconds = 0.005)
+    controller.record_plain(rows, 3, seconds = 0.105, step_seconds = 0.035)
+    assert controller.plain_cost[1].count == 1
+    assert controller.plan(rows).kind == "plain"
+    controller.record_plain(rows, 3, seconds = 0.03, step_seconds = 0.01)
+    assert controller.plain_cost[1].value == pytest.approx(0.01)
+    assert controller.plan(rows).kind == "plain"
+
+
+@pytest.mark.parametrize("width", [64, 1024, 2048, 2112])
+def test_full_width_draft_projection_uses_the_native_table(width):
+    import mlx.core as mx
+    from unsloth_zoo.mlx.speculative import _ShortlistHead
+
+    if not hasattr(mx.float32, "size"):
+        pytest.skip("CPU simulation lacks MLX dtype metadata")
+
+    class Table:
+        def __contains__(self, name):
+            return name in vars(self)
+
+    table = Table()
+    table.weight = mx.zeros((512, width))
+    model = SimpleNamespace(args = SimpleNamespace(tie_word_embeddings = False), lm_head = table)
+    head = _ShortlistHead.of(model)
+    if width <= 2048:
+        assert head is None
+    else:
+        assert head is not None and head.columns == 2048 and head.nbytes < table.weight.nbytes
+
+
+def test_shortlist_construction_is_not_learned_as_recurring_draft_work(monkeypatch):
+    import importlib
+    import mlx.core as mx
+    from unsloth_zoo.mlx.speculative import _ShortlistHead
+
+    if not hasattr(mx.float32, "size"):
+        monkeypatch.setattr(mx, "quantize", lambda value, *args: (value, value, value))
+    inference = importlib.import_module("unsloth_zoo.mlx.inference")
+    table = SimpleNamespace(weight = mx.zeros((128, 64)))
+    head = _ShortlistHead(table, 64, 0)
+    controller = DraftController(max_depth = 1, can_copy = False)
+    rows = [RowState(controller.new_reply())]
+    plan = RoundPlan("round", rows = (RowPlan("draft", 1),), split = True)
+    before = inference.first_use_work()
+    head.prepare()
+    controller.record_round(plan, rows, [1], seconds = 0.514, draft_seconds = 0.502,
+                            first_use = inference.first_use_work() != before)
+    assert controller.draft_cost[1].value is None and controller.verify_cost == {}
+    assert inference.first_use_work() == before + 1
+    head.prepare()
+    assert inference.first_use_work() == before + 1
+    controller.record_round(plan, rows, [1], seconds = 0.014, draft_seconds = 0.002)
+    assert controller.draft_cost[1].value == pytest.approx(0.002)
+    assert controller.verify_cost[1][2].value == pytest.approx(0.012)
+    table.weight = mx.ones((128, 64))
+    head.prepare()
+    assert inference.first_use_work() == before + 2
+
+
+def test_mtp_defers_prompt_replay_without_losing_ragged_prefixes_or_tail_gaps(monkeypatch):
+    import mlx.core as mx
+    from unsloth_zoo.mlx.speculative import MTPDrafter
+
+    drafter = object.__new__(MTPDrafter)
+    drafter.max_lag = 2
+    prepared, forwards = [], []
+    drafter._shortlist = SimpleNamespace(prepare = lambda: prepared.append(True))
+    monkeypatch.setattr(drafter, "new_cache", list)
+
+    def forward(cache, tokens, hidden, positions):
+        forwards.append((tokens.tolist(), hidden.tolist(), positions.tolist()))
+        return positions.astype(mx.float32)[..., None]
+
+    monkeypatch.setattr(drafter, "_forward", forward)
+    first, _ = drafter.start([1, 2, 3, 4, 5], mx.arange(5)[None, :, None], 6)
+    second, _ = drafter.start([21, 22, 23], mx.arange(3)[None, :, None], 24)
+    assert not prepared and not forwards
+    assert first.ready and second.ready
+    drafter.push(first, list(range(7, 14)), mx.arange(5, 12)[:, None])
+    assert first.pending_pairs == 7 and second.pending_pairs == 3
+    assert drafter.catch_up([], [first, second]) == 10
+    seen = [[], []]
+    for tokens, hidden, positions in forwards:
+        assert max(map(len, tokens)) <= 2
+        for row in range(2):
+            seen[row].extend((token, h[0], position) for token, h, position in zip(tokens[row], hidden[row], positions[row]) if token)
+    assert seen == [
+        [(2, 0, 0), (3, 1, 1), (4, 2, 2), (5, 3, 3), (6, 4, 4), (12, 10, 10), (13, 11, 11)],
+        [(22, 0, 0), (23, 1, 1), (24, 2, 2)],
+    ]
+    assert first.position == 12 and second.position == 3
+    assert first.last.tolist() == [[[11]]] and second.last.tolist() == [[[2]]]
+    assert first.pending_pairs == second.pending_pairs == 0
+    assert not prepared
 
 
 def test_a_context_drafter_drafts_the_next_block_ahead_until_a_push_overtakes_it():
@@ -753,7 +1127,6 @@ def test_drafter_layers_submit_their_output_when_built_in_eval_mode(monkeypatch)
     outputs = [layer(x) for layer in model.layers]
     assert all(mx.array_equal(out, want).item() for out, want in zip(outputs, expected))
     assert len(submitted) == 2 and submitted[0] is outputs[0] and submitted[1] is outputs[2]
-    # Training submits nothing.
     model.layers[0].train()
     model.layers[0](x)
     assert len(submitted) == 2
@@ -822,6 +1195,100 @@ def test_tree_budget_runs_the_widest_tree_until_measured_then_the_best_rate_and_
     assert picks.count(0) == budget.PROBE_EVERY - 1 and picks.count(8) == 1
 
 
+def test_a_sized_tree_budget_verifies_the_rows_its_lattice_pays_for():
+    budget = SizedTreeBudget({3: 1.0, 4: 1.1, 5: 1.2})
+    assert budget.choose() == 5
+    # Confident nodes pay for every row; hopeless ones for none past the narrowest.
+    assert budget.size([(0.9, 1), (0.9, 2), (0.9, 3), (0.9, 4)]) == 5
+    assert budget.size([(0.1, 1), (0.01, 2), (0.01, 3), (0.01, 4)]) == 3
+    # Nodes of a depth that keep failing stop being priced at their promise, those of another depth keep theirs.
+    nodes = [(0.9, 1), (0.6, 2), (0.6, 3), (0.6, 4)]
+    assert budget.size(nodes) == 5
+    for cycle in range(256):
+        budget.size(nodes)
+        budget.observe(5, {1}, float(cycle))
+    assert budget.accepted[1] / budget.promised[1] > 1 and budget.accepted[3] / budget.promised[3] < 0.01
+    assert budget.size(nodes) == 3
+    # Live cycles replace the load's price, a long gap is no cycle, and the rest scale with what replies measure.
+    budget = SizedTreeBudget({3: 1.0, 4: 2.0, 5: 3.0})
+    budget.size(nodes)
+    for end in (0.0, 2.0, 100.0):
+        budget.observe(3, set(), end)
+    assert budget.live[3].value == 2.0 and budget._cost(3) == 2.0 and budget._cost(5) == 6.0
+    # Trees of the narrowest width are the floor, even when no wider one is on offer.
+    assert SizedTreeBudget({3: 1.0}).size([(0.0, 1), (0.0, 2)]) == 3
+    assert SizedTreeBudget({3: 1.0, 4: 1.0}).size([(0.9, 1)]) == 3
+    # Cycles that stay far above the load's price are cycles after all.
+    budget = SizedTreeBudget({3: 1.0})
+    for end in (4.0, 8.0, 12.0, 16.0):
+        budget.observe(3, set(), end)
+    assert budget.live[3].value is None
+    budget.observe(3, set(), 20.0)
+    assert budget.live[3].value == 4.0
+    budget.observe(3, set(), 40.0)
+    assert budget.live[3].value == 4.0 and budget.samples[3] == 1
+    # Every width gets measured, often until each has its samples and rarely after; the rest stay the budget's choice.
+    budget, picks = SizedTreeBudget({3: 1.0, 4: 1.0, 5: 1.0}), []
+    for cycle in range(128):
+        picks.append(budget.size([(0.9, 1), (0.9, 2), (0.9, 3), (0.9, 4)]))
+        budget.observe(picks[-1], {1, 2, 3, 4}, float(cycle))
+    assert [picks[round - 1] for round in range(8, 65, 8)] == [3, 4] * 4 and picks[127] == 3
+    assert {pick for round, pick in enumerate(picks, 1) if round % 8 or round > 64 and round % 64} == {5}
+
+
+def test_a_sized_budget_times_no_cycle_across_replies_of_one_round():
+    budget = SizedTreeBudget({3: 1.0})
+    for at in range(6):
+        reply = object()
+        budget.reply_round(reply)
+        budget.observe(3, set(), 60.0 * at)
+    assert budget.live[3].value is None
+    budget.reply_round(reply)
+    budget.observe(3, set(), 300.5)
+    assert budget.live[3].value == 0.5
+    # A reply's long gaps do not count toward the next reply's.
+    budget, first, second = SizedTreeBudget({3: 1.0}), object(), object()
+    budget.reply_round(first)
+    for at in range(4):
+        budget.observe(3, set(), 60.0 * at)
+    budget.reply_round(second)
+    budget.observe(3, set(), 240.0)
+    budget.observe(3, set(), 300.0)
+    assert budget.live[3].value is None
+
+
+def test_a_sized_budget_hands_the_controller_poor_drafts():
+    controller = DraftController(max_depth = 7)
+    controller.trims = True
+
+    def planned(budget, stats):
+        engine = object.__new__(SpeculativeEngine)
+        draft = SimpleNamespace(tree_rows = None, prefetched_tree = None)
+        engine.drafter = SimpleNamespace(trained_depth = 7, tree_budget = budget)
+        engine.lm = SimpleNamespace(_unsloth_tree_verify = True)
+        engine.controller = controller
+        engine.cache = []
+        engine._rows = [SimpleNamespace(draft = draft, sample = SimpleNamespace(temperature = 0), processors = [])]
+        plan = RoundPlan("round", rows = (RowPlan("draft", 7),), split = True, trim = True)
+        return engine._tree_plan(plan, [RowState(stats)]).tree, draft.tree_rows
+
+    def reply(rate):
+        stats = controller.new_reply()
+        for position in range(7):
+            stats.draft[position].value = rate
+            stats.draft_seen[position] = True
+        return stats
+
+    sized, good, poor = SizedTreeBudget({3: 1.0, 8: 1.0}), reply(0.8), reply(0.3)
+    assert good.expected(RowPlan("draft", 7)) > 2 > poor.expected(RowPlan("draft", 7))
+    assert planned(sized, good) == (8, 8) and planned(sized, poor) == (0, 0)
+    # Only a sized budget, whose rounds would otherwise never reach the controller.
+    assert planned(TreeBudget({8: 1.0}, {8: 1.0}), poor) == (8, 8)
+    # Drafts recovering in a later round win the row back.
+    for position in range(7):
+        poor.draft[position].value = 0.8
+    assert planned(sized, poor) == (8, 8)
+
 
 
 def test_a_controller_capped_below_the_drafters_trained_depth_keeps_its_chain():
@@ -833,6 +1300,7 @@ def test_a_controller_capped_below_the_drafters_trained_depth_keeps_its_chain():
         engine.drafter = SimpleNamespace(trained_depth = 7, tree_budget = SimpleNamespace(choose = lambda: 8))
         engine.lm = SimpleNamespace(_unsloth_tree_verify = True)
         engine.controller = controller
+        engine.cache = []
         engine._rows = [SimpleNamespace(draft = draft, sample = SimpleNamespace(temperature = 0), processors = [])]
         plan = RoundPlan("round", rows = (RowPlan("draft", min(7, controller.max_depth)),))
         return engine._tree_plan(plan, [RowState(controller.new_reply(), remaining = 64)]), draft
