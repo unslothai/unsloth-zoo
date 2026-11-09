@@ -23,6 +23,8 @@ import itertools
 import threading
 
 import pytest
+import types
+
 import torch
 
 from unsloth_zoo import decode_graph_state as S
@@ -360,6 +362,51 @@ def test_flex_graph_contract_names_module_globals(G, monkeypatch):
         finally:
             WINDOW = 8
         assert ident(_global_dict) is None
+
+
+_settings = types.ModuleType("_mask_settings")
+_settings.WINDOW = 8
+_settings.STATE = {"window": 8}
+
+
+class _MaskConfig:
+    WINDOW = 8
+
+
+def _module_attr_window(b, h, q, kv):
+    return (kv <= q) & (kv > q - _settings.WINDOW)
+
+
+def _class_attr_window(b, h, q, kv):
+    return (kv <= q) & (kv > q - _MaskConfig.WINDOW)
+
+
+def _module_attr_dict(b, h, q, kv):
+    return (kv <= q) & (kv > q - _settings.STATE["window"])
+
+
+def _torch_attr_mask(b, h, q, kv):
+    return torch.logical_and(kv <= q, (kv > q - 8).to(torch.bool))
+
+
+def test_flex_graph_contract_keys_module_and_class_attributes(G, monkeypatch):
+    # State read through a module or class global (settings.WINDOW, Config.WINDOW) is part of the identity:
+    # changing the attribute changes the graph key; an attribute holding anything but a scalar publishes no
+    # contract. torch attributes stay library code.
+    monkeypatch.setenv("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "flex")
+    with S.graph_generate():
+        ident = lambda fn: getattr(_decode_mask(G, monkeypatch, fn, torch.tensor(140)), "_unsloth_mask_identity", None)
+        for fn, owner in ((_module_attr_window, _settings), (_class_attr_window, _MaskConfig)):
+            first = ident(fn)
+            assert first is not None and first == ident(fn)
+            owner.WINDOW = 16
+            try:
+                assert ident(fn) not in (None, first)
+            finally:
+                owner.WINDOW = 8
+            assert ident(fn) == first
+        assert ident(_module_attr_dict) is None
+        assert ident(_torch_attr_mask) is not None
 
 
 def test_flex_graph_contract_tells_same_line_lambdas_apart(G, monkeypatch):
