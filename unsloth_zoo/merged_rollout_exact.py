@@ -103,7 +103,10 @@ if triton is not None:
         return tl.where(b < 0, -b - 32769, b)
 
     @triton.jit
-    def _width(nb, bb, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr):
+    def _width(
+        nb, bb,
+        MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,  # W's dtype: mantissa bits / exponent mask / widest gap
+    ):
         # Code bits from the folded value and back only (unfold knows both): r + 1 for an exponent gap 1 <= r <= MAX_GAP.
         en = tl.maximum((nb >> MANT) & EXPM, 1)
         eb = tl.maximum((bb >> MANT) & EXPM, 1)
@@ -151,7 +154,10 @@ if triton is not None:
             )
 
     @triton.jit
-    def _classify(w, d, mask, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr):
+    def _classify(
+        w, d, mask,
+        MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,  # W's dtype: mantissa bits / exponent mask / widest gap
+    ):
         # (folded value, original bits, code width, correction, inexact, escape) of each element.
         new = (w.to(tl.float32) + d).to(w.dtype)
         back = (new.to(tl.float32) - d).to(w.dtype)
@@ -166,7 +172,10 @@ if triton is not None:
         return new, wb, k, tl.where(esc, -half, c), bad, esc
 
     @triton.jit
-    def _count_tile(w, d, mask, pid, counts, checksum, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr):
+    def _count_tile(
+        w, d, mask, pid, counts, checksum,
+        MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,  # W's dtype: mantissa bits / exponent mask / widest gap
+    ):
         new, wb, k, c, bad, esc = _classify(w, d, mask, MANT, EXPM, MAX_GAP)
         tl.store(counts + pid * 3 + 0, tl.sum(tl.sum(bad.to(tl.int32), 1), 0))
         tl.store(counts + pid * 3 + 1, tl.sum(tl.sum(k, 1), 0))
@@ -177,7 +186,8 @@ if triton is not None:
     @triton.jit
     def _fold_tile(
         w, d, ptrs, mask, pid, e, rn, rk, N, K, woff, words, idx_out, val_out, eoff,
-        BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,
+        BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  # tile over out rows / tile over in cols
+        MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,  # W's dtype: mantissa bits / exponent mask / widest gap
     ):
         TILE: tl.constexpr = BLOCK_N * BLOCK_K
         new, wb, k, c, bad, esc = _classify(w, d, mask, MANT, EXPM, MAX_GAP)
@@ -207,7 +217,8 @@ if triton is not None:
     @triton.jit
     def _unfold_tile(
         w, d, ptrs, mask, pid, woff, words, checksum, n_words,
-        BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,
+        BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  # tile over out rows / tile over in cols
+        MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,  # W's dtype: mantissa bits / exponent mask / widest gap
     ):
         # w is the folded value: back = round(w - d), plus the stored correction where the stream has one.
         TILE: tl.constexpr = BLOCK_N * BLOCK_K
