@@ -222,16 +222,24 @@ _HOST_ALLOC_KNOBS = _TORCH_MINOR >= (2, 13)
 _INF = float("inf")
 
 
+def _env_allocator_settings():
+    # The variable torch parsed at startup: the first one set, in c10/core/AllocatorConfig.cpp's order.
+    for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+        value = os.environ.get(var)
+        if value is not None: return value
+    return ""
+
+
 def _host_allocator_settings():
     getter = getattr(torch._C, "_accelerator_getAllocatorSettings", None)
     if getter is not None:
         try: return getter() or ""
         except Exception: pass
-    return os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF") or ""
+    return _env_allocator_settings()
 
 
-def _parse_host_alloc_policy(settings):
-    round_max = cached_max = _INF
+def _parse_host_alloc_policy(settings, prior = (_INF, _INF)):
+    round_max, cached_max = prior
     for item in settings.split(","):
         key, _, value = item.partition(":")
         key = key.strip()
@@ -250,7 +258,11 @@ def _host_alloc_policy():
     settings = _host_allocator_settings()
     policy = _HOST_ALLOC_POLICY
     if settings != policy[0]:
-        policy = _HOST_ALLOC_POLICY = (settings, *_parse_host_alloc_policy(settings))
+        # torch reports only the last settings string, but a call naming other keys (vLLM sets max_split_size_mb and
+        # expandable_segments in process) keeps the pinned thresholds, so fold each string into what is in effect,
+        # starting from the environment torch parsed at startup.
+        prior = policy[1:] if policy[0] is not None else _parse_host_alloc_policy(_env_allocator_settings())
+        policy = _HOST_ALLOC_POLICY = (settings, *_parse_host_alloc_policy(settings, prior))
         if policy[1] != _INF: _warn_short_block_reuse()
     return policy[1], policy[2]
 
