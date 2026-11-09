@@ -29,6 +29,8 @@ def _bf16_order(t):
 def _assert_bf16_within_one_ulp(got, want, msg = None):
     """Per-expert and PEFT's batched LoRA deltas sum in a different fp32 order: on L4 that can flip one bf16 rounding."""
     assert got.shape == want.shape, msg
+    # inf sits one ordered step past the largest finite bf16, and equal NaN patterns are distance 0.
+    assert torch.isfinite(got).all() and torch.isfinite(want).all(), msg
     assert (_bf16_order(got) - _bf16_order(want)).abs().max().item() <= 1, msg
 
 
