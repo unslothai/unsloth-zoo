@@ -51,27 +51,27 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
     write_pos,
     is_flush,
     scale,
-    stride_mixed_qkv_tok: tl.constexpr,
-    stride_a_tok: tl.constexpr,
-    stride_b_tok: tl.constexpr,
-    stride_init_state_token: tl.constexpr,
-    stride_final_state_token: tl.constexpr,
-    stride_indices_seq: tl.constexpr,
-    stride_d_slot: tl.constexpr,
-    stride_k_slot: tl.constexpr,
-    stride_g_slot: tl.constexpr,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    BC: tl.constexpr,
-    NK: tl.constexpr,
-    BKT: tl.constexpr,
-    MAX_CACHE_LEN: tl.constexpr,
-    SOFTPLUS_THRESHOLD: tl.constexpr,
-    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
+    stride_mixed_qkv_tok: tl.constexpr,  # mixed qkv token stride
+    stride_a_tok: tl.constexpr,  # a token stride
+    stride_b_tok: tl.constexpr,  # b token stride
+    stride_init_state_token: tl.constexpr,  # initial state token stride
+    stride_final_state_token: tl.constexpr,  # final state token stride
+    stride_indices_seq: tl.constexpr,  # indices seq stride
+    stride_d_slot: tl.constexpr,  # slot stride
+    stride_k_slot: tl.constexpr,  # k slot stride
+    stride_g_slot: tl.constexpr,  # g slot stride
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    BC: tl.constexpr,  # padded cache slots
+    NK: tl.constexpr,  # blocks along K
+    BKT: tl.constexpr,  # block along cached tokens
+    MAX_CACHE_LEN: tl.constexpr,  # replay cache length
+    SOFTPLUS_THRESHOLD: tl.constexpr,  # softplus linear threshold
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,  # l2norm q and k in kernel
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)

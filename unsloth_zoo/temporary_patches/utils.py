@@ -51,6 +51,7 @@ import contextlib
 import functools
 import inspect
 import threading
+import sys
 import weakref
 import typing as t
 import torch
@@ -1596,7 +1597,11 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             global _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
             _RAISED_INSIDE_CHECKPOINT = True
             _CHECKPOINT_SETTLE_ATTEMPTS = 0
-            raise e
+            try:
+                raise e
+            finally:
+                # e's traceback holds this frame: keeping e here is a cycle that pins the failed call's tensors.
+                del e
         return eager_func(*args, **kwargs)
 
     def _give_up_at_compile_time(e, args, kwargs, marker_before, warning):
@@ -1650,30 +1655,40 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             global _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
             _RAISED_INSIDE_CHECKPOINT = True
             _CHECKPOINT_SETTLE_ATTEMPTS = 0
-            raise e
+            try:
+                raise e
+            finally:
+                # e's traceback holds this frame: keeping e here is a cycle that pins the failed call's tensors.
+                del e
         return eager_func(*args, **kwargs)
 
     def _give_up_on_backend(e, args, kwargs, marker_before):
         """Inductor refused to generate code for this region."""
-        return _give_up_at_compile_time(
-            e, args, kwargs, marker_before,
-            f"Unsloth: torch.compile could not generate code for {label}; "
-            f"running it eagerly from here. Training is unaffected apart from "
-            f"speed. ({type(e).__name__})",
-        )
+        try:
+            return _give_up_at_compile_time(
+                e, args, kwargs, marker_before,
+                f"Unsloth: torch.compile could not generate code for {label}; "
+                f"running it eagerly from here. Training is unaffected apart from "
+                f"speed. ({type(e).__name__})",
+            )
+        finally:
+            del e  # same cycle as in _give_up_at_compile_time
 
     def _give_up_on_disabled_hook(e, args, kwargs, marker_before):
         """Dynamo refused to inline one of our own `torch.compiler.disable`d hooks.
 
         Was a bare eager flip: no checkpoint question, no deferral, no record.
         """
-        return _give_up_at_compile_time(
-            e, args, kwargs, marker_before,
-            f"Unsloth: torch.compile hit one of Unsloth's own "
-            f"`torch.compiler.disable`d gradient-checkpointing hooks inside "
-            f"{label}; running it eagerly from here. Training is unaffected "
-            f"apart from speed.",
-        )
+        try:
+            return _give_up_at_compile_time(
+                e, args, kwargs, marker_before,
+                f"Unsloth: torch.compile hit one of Unsloth's own "
+                f"`torch.compiler.disable`d gradient-checkpointing hooks inside "
+                f"{label}; running it eagerly from here. Training is unaffected "
+                f"apart from speed.",
+            )
+        finally:
+            del e  # same cycle as in _give_up_at_compile_time
 
     def _is_backend_refusal_we_handle(e):
         """The gate the wrapper's own backend arm applies, in one place."""
@@ -1941,6 +1956,16 @@ def _settle_abandoned_checkpoint_generator():
 UNSLOTH_DECODE_COMPILE = [False]
 # [weakref to an eager stance Unsloth installed (True if torch has none), stance it replaced]
 UNSLOTH_EAGER_STANCE_OWNED = []
+# Shared by all generated modules; reset per generate() or decode step 1 skips compile.
+UNSLOTH_INFERENCE_RUNS = [0]
+
+
+def unsloth_reset_inference_runs():
+    UNSLOTH_INFERENCE_RUNS[0] = 0
+    # Older-zoo modules kept by UNSLOTH_COMPILE_OVERWRITE=0 keep their own INFERENCE_RUNS.
+    for name, module in list(sys.modules.items()):
+        if name.startswith("unsloth_compiled_module_") and type(getattr(module, "INFERENCE_RUNS", None)) is int:
+            module.INFERENCE_RUNS = 0
 
 
 def _owned_stance(entry):
@@ -2462,5 +2487,26 @@ def restore_original(
         if UNSLOTH_ENABLE_LOGGING:
             logger.error(f"Unsloth: Failed to restore {attr_name}: {e}")
         return False
+
+
+# Forced float32 patches follow UNSLOTH_FORCE_FLOAT32, which each load resets, on classes shared by
+# every live model of that family. Stash the original only once (patch_function re-stashes whatever
+# is installed, so a second pass would record our own forward) so a later flag "0" load can undo them.
+def patch_forced_float32(target_obj, attr_name, new_func, **kwargs):
+    stashed = _get_unique_storage_name(target_obj, attr_name) in vars(target_obj)
+    return patch_function(target_obj, attr_name, new_func, store_original = not stashed, **kwargs)
+
+
+def undo_forced_float32(target_obj, attr_name):
+    if target_obj is not None and _get_unique_storage_name(target_obj, attr_name) in vars(target_obj):
+        restore_original(target_obj, attr_name)
+
+
+def other_family_load(family_pattern):
+    """A load whose model types (UNSLOTH_MODEL_NAME) are all another family's must not repatch or undo
+    this family's classes under a live model of it."""
+    import os, re
+    name = os.environ.get("UNSLOTH_MODEL_NAME", "").lower().replace("-", "_")
+    return bool(name) and re.search(family_pattern, name) is None
 
 
