@@ -347,11 +347,14 @@ def test_hub_layer_keeps_routing_after_real_model_kernelize():
     hub_kernels = pytest.importorskip("transformers.integrations.hub_kernels")
     with_fallback = getattr(hub_kernels, "use_kernel_func_from_hub_with_fallback", None)
     if with_fallback is None:
+        # Skip because transformers < 5.15 has no hub fallback decorator, so no kernels layer to kernelize.
         pytest.skip("transformers has no use_kernel_func_from_hub_with_fallback")
     # The original decorator, not the one the patch installed; a missing package forces the fallback.
     with_fallback = getattr(with_fallback, "__wrapped__", with_fallback)
     hub_fn = gcc._hub_gdn_function(with_fallback("causal_conv1d_fn", "unsloth_missing_causal_conv1d"), _hub_conv)
     if not isinstance(hub_fn, torch.nn.Module):
+        # Skip because transformers only builds a layer with a kernels release inside its supported range
+        # (or with USE_HUB_KERNELS on); test_hub_layer_keeps_routing_after_kernelize_fallback covers the rest.
         pytest.skip("transformers did not build a kernels layer")
 
     @kernels.use_kernelized_func(hub_fn)
