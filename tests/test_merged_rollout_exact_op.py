@@ -51,6 +51,7 @@ def test_ops_are_registered():
     assert callable(getattr(ex, "fold_weight_", None)) and callable(getattr(ex, "unfold_weight_", None))
     assert hasattr(torch.ops.unsloth_zoo, "exact_fold_weight_v1")
     assert hasattr(torch.ops.unsloth_zoo, "exact_unfold_weight_v1")
+    assert hasattr(torch.ops.unsloth_zoo, "exact_fold_weights_v1") and hasattr(torch.ops.unsloth_zoo, "exact_unfold_weights_v1")
 
 
 def run_compiled(device):
@@ -229,6 +230,52 @@ def run_batched_store(device):
     assert ex.host_arena_stats()[kind]["live"] == live
 
 
+def run_list_ops(device):
+    # fold_weights_ / unfold_weights_: many weights in one op (one count readback, one store), under torch.compile
+    # fullgraph on every backend, restoring every weight bit for bit, schema and fake checked by opcheck.
+    import torch._dynamo
+    from torch._dynamo.utils import counters
+
+    def step(ws, As, Bs):
+        s1 = ex.fold_weights_(ws, As, Bs, [0.5] * len(ws), list(range(len(ws))))
+        y = sum(w.float().sum() for w in ws)
+        s2 = ex.unfold_weights_(ws, As, Bs, [0.5] * len(ws), list(range(len(ws))))
+        return y, s1 + s2
+
+    for backend in ("eager", "aot_eager", "inductor"):
+        torch._dynamo.reset()
+        counters.clear()
+        fn = torch.compile(step, fullgraph = True, backend = backend)
+        cases = [_case(device, 32 * (i + 1), 256, seed = 60 + i) for i in range(3)]
+        ws, As, Bs = [c[0] for c in cases], [c[1] for c in cases], [c[2] * 1e-3 for c in cases]
+        before = [w.clone() for w in ws]
+        folded = sum((w.float() + (b.double() @ a.double() * 0.5).float()).to(w.dtype).float().sum() for w, a, b in zip(ws, As, Bs))
+        y, status = fn(ws, As, Bs)
+        for w, w0 in zip(ws, before):
+            assert torch.equal(_bits(w), _bits(w0)), backend
+        assert status.shape == (3, 2)
+        assert abs(float(y) - float(folded)) <= 1e-2 * max(1.0, abs(float(y))), backend
+        assert not counters["graph_break"], (backend, dict(counters["graph_break"]))
+    ws, As, Bs = [c[0] for c in cases], [c[1] for c in cases], [c[2] for c in cases]
+    before = [w.clone() for w in ws]
+    for test in ("test_schema", "test_faketensor"):
+        args = (ws, As, Bs, [0.5] * 3, [21, 22, 23])
+        torch.library.opcheck(torch.ops.unsloth_zoo.exact_fold_weights_v1.default, args, test_utils = test)
+        ex._OP_LIVE.clear()
+        for w, w0 in zip(ws, before): w.copy_(w0)
+    # Unknown keys raise and leave the folded weights unfoldable.
+    ex.fold_weights_(ws, As, Bs, [0.5] * 3, [31, 32, 33])
+    try:
+        ex.unfold_weights_(ws, As, Bs, [0.5] * 3, [31, 32, 99])
+    except RuntimeError as error:
+        assert "99" in str(error)
+    else:
+        raise AssertionError("an unknown key unfolded")
+    ex.unfold_weights_(ws, As, Bs, [0.5] * 3, [31, 32, 33])
+    for w, w0 in zip(ws, before):
+        assert torch.equal(_bits(w), _bits(w0))
+
+
 def run_empty_tiles(device):
     # Rows 96.. have B = 0 (a fresh LoRA): those tiles hold no code words and take the fast path; the others keep a
     # stream, including small-adapter rows 32..95 where a few elements still cross an exponent boundary.
@@ -264,6 +311,7 @@ def run_all(device):
     run_arena_reuse(device)
     run_opcheck(device)
     run_batched_store(device)
+    run_list_ops(device)
 
 
 @pytest.mark.skipif(not _cuda(), reason = "needs CUDA + Triton")

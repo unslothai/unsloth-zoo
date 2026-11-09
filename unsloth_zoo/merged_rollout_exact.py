@@ -40,12 +40,16 @@ __all__ = [
     "fixup_report",
     "fold_weight_",
     "unfold_weight_",
+    "fold_weights_",
+    "unfold_weights_",
     "host_arena_stats",
 ]
 
 import contextlib
 import os
 import threading
+from typing import List
+
 import torch
 
 try:
@@ -898,37 +902,86 @@ def _as_3d(w, a, b):
 pass
 
 
-def _fold_weight_impl(w: torch.Tensor, a: torch.Tensor, b: torch.Tensor, scale: float, key: int) -> torch.Tensor:
-    slot = (key, tuple(w.shape), w.dtype)
+_OP_STREAMS = {}
+
+
+def _op_stream(device):
+    # A side stream per device for the ops' store copies: the fold returns without waiting for the copy to host, the
+    # unfold waits on its event (CPU tensors: no stream).
+    if device.type != "cuda":
+        return None
+    key = torch.device(device).index if torch.device(device).index is not None else torch.cuda.current_device()
+    if key not in _OP_STREAMS:
+        _OP_STREAMS[key] = torch.cuda.Stream(device = torch.device("cuda", key))
+    return _OP_STREAMS[key]
+pass
+
+
+def _status(rows, device):
+    # The ops' int64 status, copied from pinned memory without a host wait.
+    out = torch.tensor(rows, dtype = torch.int64)
+    if device.type != "cuda":
+        return out
+    return out.pin_memory().to(device, non_blocking = True)
+pass
+
+
+def _fold_weights_impl(
+    ws: List[torch.Tensor], as_: List[torch.Tensor], bs: List[torch.Tensor], scales: List[float], keys: List[int],
+) -> torch.Tensor:
+    if not ws or not (len(ws) == len(as_) == len(bs) == len(scales) == len(keys)):
+        raise ValueError("Unsloth: fold_weights_ needs one adapter, scale and key per weight (at least one weight).")
+    slots = [(int(k), tuple(w.shape), w.dtype) for w, k in zip(ws, keys)]
     with _OP_LOCK:
-        if slot in _OP_LIVE:
-            raise RuntimeError(f"Unsloth: weight key {key} is already folded; unfold it first.")
-        _OP_LIVE[slot] = None
+        busy = [s[0] for s in slots if s in _OP_LIVE]
+        if busy or len(set(slots)) != len(slots):
+            raise RuntimeError(f"Unsloth: weight keys {busy or keys} are already folded or repeated; unfold them first.")
+        for s in slots: _OP_LIVE[s] = None
     try:
-        t = ExactFoldTarget(*_as_3d(w, a, b), scale)
-        info = exact_fold([t])
+        targets = [ExactFoldTarget(*_as_3d(w, a, b), scale) for w, a, b, scale in zip(ws, as_, bs, scales)]
+        exact_fold(targets, stream = _op_stream(ws[0].device))
     except BaseException:
         with _OP_LOCK:
-            _OP_LIVE.pop(slot, None)
+            for s in slots: _OP_LIVE.pop(s, None)
         raise
     with _OP_LOCK:
-        _OP_LIVE[slot] = t
-    return torch.tensor([info["bad"], info["store_bytes"]], dtype = torch.int64).to(w.device)
+        for s, t in zip(slots, targets): _OP_LIVE[s] = t
+    return _status([[t.bad, t.host_store_bytes()] for t in targets], ws[0].device)
+pass
+
+
+def _unfold_weights_impl(
+    ws: List[torch.Tensor], as_: List[torch.Tensor], bs: List[torch.Tensor], scales: List[float], keys: List[int],
+) -> torch.Tensor:
+    if not ws or not (len(ws) == len(as_) == len(bs) == len(scales) == len(keys)):
+        raise ValueError("Unsloth: unfold_weights_ needs one adapter, scale and key per weight (at least one weight).")
+    with _OP_LOCK:
+        found = [_OP_LIVE.pop((int(k), tuple(w.shape), w.dtype), None) for w, k in zip(ws, keys)]
+    missing = [k for k, t in zip(keys, found) if t is None]
+    if missing:
+        # Put back what was found: the caller may retry with the right keys.
+        with _OP_LOCK:
+            for w, k, t in zip(ws, keys, found):
+                if t is not None: _OP_LIVE[(int(k), tuple(w.shape), w.dtype)] = t
+        raise RuntimeError(f"Unsloth: weight keys {missing} were not folded by fold_weight_ / fold_weights_.")
+    for t, w, a, b, scale in zip(found, ws, as_, bs, scales):
+        # The folded bits are read from w as given now (a functionalized call may pass a copy of the folded weight),
+        # and the delta is recomputed from the adapter given here, which must be the one folded.
+        t.w, t.a, t.b = _as_3d(w, a, b)
+        t.scale = float(scale)
+    rows = [[t.bad, 0] for t in found]
+    exact_unfold(found, stream = _op_stream(ws[0].device))
+    return _status(rows, ws[0].device)
+pass
+
+
+def _fold_weight_impl(w: torch.Tensor, a: torch.Tensor, b: torch.Tensor, scale: float, key: int) -> torch.Tensor:
+    return _fold_weights_impl([w], [a], [b], [scale], [key])[0]
 pass
 
 
 def _unfold_weight_impl(w: torch.Tensor, a: torch.Tensor, b: torch.Tensor, scale: float, key: int) -> torch.Tensor:
-    with _OP_LOCK:
-        t = _OP_LIVE.pop((key, tuple(w.shape), w.dtype), None)
-    if t is None:
-        raise RuntimeError(f"Unsloth: weight key {key} was not folded by fold_weight_.")
-    # The folded bits are read from w as given now (a functionalized call may pass a copy of the folded weight), and
-    # the delta is recomputed from the adapter given here, which must be the one folded.
-    t.w, t.a, t.b = _as_3d(w, a, b)
-    t.scale = float(scale)
-    bad = t.bad
-    exact_unfold([t])
-    return torch.tensor([bad, 0], dtype = torch.int64).to(w.device)
+    return _unfold_weights_impl([w], [a], [b], [scale], [key])[0]
 pass
 
 
@@ -937,32 +990,44 @@ def _status_fake(w, a, b, scale, key):
 pass
 
 
+def _statuses_fake(ws, as_, bs, scales, keys):
+    return ws[0].new_empty((len(ws), 2), dtype = torch.int64)
+pass
+
+
 def _register_weight_ops():
     custom_op = getattr(getattr(torch, "library", None), "custom_op", None)
     if custom_op is None:
-        return None, None
+        return None, None, None, None
     import inspect
     params = frozenset(inspect.signature(custom_op).parameters)
     # Host reads inside: keep the ops out of CUDA graphs (reduce-overhead) where the tag exists.
     tag = getattr(torch.Tag, "cudagraph_unsafe", None)
     kwargs = dict(tags = (tag,)) if tag is not None and "tags" in params else {}
     ops = []
-    for name, impl in (("exact_fold_weight_v1", _fold_weight_impl), ("exact_unfold_weight_v1", _unfold_weight_impl)):
+    for name, impl, fake, mutated in (
+        ("exact_fold_weight_v1", _fold_weight_impl, _status_fake, "w"),
+        ("exact_unfold_weight_v1", _unfold_weight_impl, _status_fake, "w"),
+        ("exact_fold_weights_v1", _fold_weights_impl, _statuses_fake, "ws"),
+        ("exact_unfold_weights_v1", _unfold_weights_impl, _statuses_fake, "ws"),
+    ):
         # A reloaded module copy may own the name already; registering twice segfaults on torch 2.10.
         if hasattr(torch.ops.unsloth_zoo, name):
             ops.append(getattr(torch.ops.unsloth_zoo, name).default)
             continue
         try:
-            op = custom_op(f"unsloth_zoo::{name}", mutates_args = ("w",), **kwargs)(impl)
-            op.register_fake(_status_fake)
+            op = custom_op(f"unsloth_zoo::{name}", mutates_args = (mutated,), **kwargs)(impl)
+            op.register_fake(fake)
             ops.append(getattr(torch.ops.unsloth_zoo, name).default)
         except Exception:
-            return None, None
-    return ops[0], ops[1]
+            ops.append(None)
+    if None in ops[:2]:
+        return None, None, None, None
+    return tuple(ops)
 pass
 
 
-_FOLD_OP, _UNFOLD_OP = _register_weight_ops()
+_FOLD_OP, _UNFOLD_OP, _FOLDS_OP, _UNFOLDS_OP = _register_weight_ops()
 
 
 def fold_weight_(w, a, b, scale, key):
@@ -983,4 +1048,27 @@ def unfold_weight_(w, a, b, scale, key):
     if _UNFOLD_OP is None:
         return _unfold_weight_impl(w, a, b, float(scale), int(key))
     return _UNFOLD_OP(w, a, b, float(scale), int(key))
+pass
+
+
+def fold_weights_(ws, as_, bs, scales, keys):
+    """fold_weight_ for many weights in one op: one shared store, one count readback and one copy to host for all of
+    them (a model's layers in one call, instead of a host sync per weight). Lists of equal length; keys unique among
+    weights folded at the same time. Returns an int64 [len(ws), 2] tensor (as fold_weight_, one row per weight)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    scales, keys = [float(x) for x in scales], [int(x) for x in keys]
+    if _FOLDS_OP is None:
+        return _fold_weights_impl(list(ws), list(as_), list(bs), scales, keys)
+    return _FOLDS_OP(list(ws), list(as_), list(bs), scales, keys)
+pass
+
+
+def unfold_weights_(ws, as_, bs, scales, keys):
+    """Undo fold_weight_ / fold_weights_ for many weights in one op (one upload, one checksum readback; raises on a
+    mismatch). Returns an int64 [len(ws), 2] tensor."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    scales, keys = [float(x) for x in scales], [int(x) for x in keys]
+    if _UNFOLDS_OP is None:
+        return _unfold_weights_impl(list(ws), list(as_), list(bs), scales, keys)
+    return _UNFOLDS_OP(list(ws), list(as_), list(bs), scales, keys)
 pass
