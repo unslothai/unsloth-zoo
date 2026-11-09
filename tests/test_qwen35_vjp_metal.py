@@ -526,3 +526,55 @@ def test_backward_checkpoints_block_boundaries_not_steps(T):
     (ckpt_shape, kv_shape), = shapes
     assert ckpt_shape == (B, Hv, max(1, -(-T // TB) - 1), Dv, Dk)
     assert kv_shape == (B, Hv, T, Dv)
+
+
+@metal_only
+@pytest.mark.parametrize("stack", ["mlx_lm", "mlx_vlm"])
+def test_a_training_continuation_from_a_given_state_takes_the_kernel(monkeypatch, stack):
+    """A shared-prompt row continues from its prompt's recorded state, which carries the prompt's gradient: in the
+    training window it takes the fused kernel and matches the route it replaces, d_state included; stateful inference
+    keeps its route."""
+    import importlib
+    import unsloth_zoo.gated_delta_vjp as gdv
+    from unsloth_zoo.mlx.utils import acquire_mlx_training_patches, release_mlx_training_patches
+
+    if stack == "mlx_vlm":
+        import mlx_vlm.models.qwen3_5.gated_delta as gd
+        importlib.reload(gd)
+        gd._unsloth_gated_delta_patched = False
+        gdv.patch_gated_delta_vlm()
+    else:
+        from mlx_lm.models import gated_delta as gd
+        gdv.patch_gated_delta()
+    update, real, calls = gd.gated_delta_update, gdv.gated_delta_kernel_efficient, []
+    monkeypatch.setattr(gdv, "gated_delta_kernel_efficient", lambda *a: (calls.append(1), real(*a))[1])
+    monkeypatch.setattr(gdv, "_kernel_chunk_size", lambda *a: 64)  # the state crosses two chunk seams
+
+    B, T, Hk, Hv, D = 2, 150, 2, 4, 128
+    mx.random.seed(5)
+    q, k, v = (mx.random.normal((B, T, h, D)) * 0.1 for h in (Hk, Hk, Hv))
+    a, b, w = mx.random.normal((B, T, Hv)), mx.random.normal((B, T, Hv)), mx.random.normal((B, T, Hv, D))
+    A_log, dt_bias = mx.random.normal((Hv,)) * 0.5, mx.random.normal((Hv,))
+    state, ws = mx.random.normal((B, Hv, D, D)) * 0.1, mx.random.normal((B, Hv, D, D))
+
+    def grads():
+        def loss(q, k, v, a, b, state):
+            y, s = update(q, k, v, a, b, A_log, dt_bias, state, use_kernel=False)[:2]
+            return (y * w).sum() + (s * ws).sum()
+        out = mx.value_and_grad(loss, argnums=tuple(range(6)))(q, k, v, a, b, state)
+        mx.eval(out)
+        return out
+
+    stock = grads()
+    assert not calls, "a train-mode call outside the training window is not training"
+    acquire_mlx_training_patches()
+    try:
+        mx.eval(update(q, k, v, a, b, A_log, dt_bias, state))
+        assert not calls, "stateful inference took the training VJP"
+        fused = grads()
+    finally:
+        release_mlx_training_patches()
+    assert len(calls) == 1
+    assert abs(fused[0].item() - stock[0].item()) <= 1e-5 * abs(stock[0].item())
+    for name, got, want in zip("q k v a b state".split(), fused[1], stock[1]):
+        assert mx.abs(want).max().item() > 0 and _rel(got, want) < 1e-5, name

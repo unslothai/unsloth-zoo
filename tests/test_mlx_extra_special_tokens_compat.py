@@ -195,6 +195,7 @@ def test_temporary_patch_exposes_original_init_for_probe(
     common.TEMPORARY_PATCHES = []
     common.torch_compile = lambda fn=None, **_: fn if fn is not None else (lambda f: f)
     common._torch_compile = common.torch_compile
+    common.compile_mask_builder = lambda fn: fn  # misc.py imports it since #2383
     utils = types.ModuleType(f"{package_name}.utils")
     for name in (
         "patch_function",
