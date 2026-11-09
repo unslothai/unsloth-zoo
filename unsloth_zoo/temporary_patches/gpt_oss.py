@@ -324,6 +324,8 @@ def _mask_function_identity(fn, depth = 4):
                         found = _static_attribute(value, attr)
                         if found is _MISSING:
                             continue
+                        if isinstance(found, (types.ModuleType, type)) and not _library_namespace(found):
+                            return False  # settings.Config.WINDOW: a nested namespace's state is not keyed
                         out.append(f"{name}.{attr}")
                         if not isinstance(found, _MASK_CODE_TYPES):
                             values.append(found)
