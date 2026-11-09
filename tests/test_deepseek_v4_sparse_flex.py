@@ -634,3 +634,34 @@ def test_flex_forward_failure_latches_eager(monkeypatch):
         out, _ = modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)
     torch.testing.assert_close(out, ORIGINAL(attn, q, kv, kv, mask, 0.125)[0])
     assert len(F4._FAILED) == 1 and F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 0, "eager": 1}
+
+
+def test_flex_failure_does_not_keep_its_tensors_alive(monkeypatch):
+    """A flex failure raised from a frame cycle must not keep its tensors alive until a full gc."""
+    import gc
+    import weakref
+    held = []
+
+    def flex(module, query, key, attention_mask, scaling):
+        workspace = torch.empty(1 << 20)  # stands in for the inputs / buffers a failed compile references
+        held.append(weakref.ref(workspace))
+        try:
+            raise RuntimeError("No valid triton configs")
+        except RuntimeError as inner:
+            error = inner  # frame -> error -> traceback -> frame: a cycle, like Inductor's handlers
+        raise RuntimeError("InductorError") from error
+
+    monkeypatch.setattr(F4, "_flex_applies", lambda *args: True)
+    monkeypatch.setattr(F4, "deepseek_v4_flex_attention", flex)
+    attn, q, kv, mask = _gate_inputs("cpu", dtype = torch.float32)
+    gc.collect()
+    gc.disable()
+    try:
+        with torch.no_grad():
+            out, _ = modeling.eager_attention_forward(attn, q, kv, kv, mask, 0.125)
+        alive = sum(r() is not None for r in held)
+    finally:
+        gc.enable()
+    assert len(held) == 1 and alive == 0
+    assert len(F4._FAILED) == 1 and F4.DEEPSEEK_V4_FLEX_STATS == {"flex": 0, "eager": 1}
+    torch.testing.assert_close(out, ORIGINAL(attn, q, kv, kv, mask, 0.125)[0])

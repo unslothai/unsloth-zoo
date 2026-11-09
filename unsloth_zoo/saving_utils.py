@@ -90,6 +90,7 @@ except:
     pass
 pass
 from transformers.modeling_utils import PushToHubMixin
+from transformers.pytorch_utils import Conv1D
 import json
 import ntpath
 import os
@@ -387,6 +388,21 @@ import os, shutil, re, functools
 _EMPTY_CACHE_BYTES_THRESHOLD = 256 * 1024 * 1024
 
 
+def _torch_save_spool(tensor, path, pickle_module, pickle_protocol):
+    # Skip torch.save's CRC32 (~half the spool cost): only our own mmap load reads it back.
+    # torch < 2.6 has no set_crc32_options, so it keeps the CRC32.
+    get_crc32 = getattr(torch.serialization, "get_crc32_options", None)
+    set_crc32 = getattr(torch.serialization, "set_crc32_options", None)
+    if get_crc32 is None or set_crc32 is None:
+        return torch.save(tensor, path, pickle_module = pickle_module, pickle_protocol = pickle_protocol)
+    previous = get_crc32()
+    set_crc32(False)
+    try:
+        return torch.save(tensor, path, pickle_module = pickle_module, pickle_protocol = pickle_protocol)
+    finally:
+        set_crc32(previous)
+
+
 @functools.lru_cache(maxsize = 1)
 def _active_merge_device():
     """Pick the active accelerator family for LoRA merge math, cached.
@@ -445,6 +461,9 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
             "https://github.com/unslothai/unsloth-zoo/issues with your model name and this "
             "message."
         )
+    # Conv1D (GPT-2) checkpoints store (in, out): merge in (out, in) like PEFT and flip back.
+    flip = getattr(lora_stats, "fan_in_fan_out", False)
+    if flip: W = W.t()
     device = _active_merge_device()
     # Merge onto dequant(W4), not W16, for _DEQUANT_MERGE_BASE_MODEL_TYPES only (no-op elsewhere); the W16 error is
     # negligible for most but swamps Falcon-H1; a live 4bit base is taken as QLoRA, so a 16bit-trained adapter reloaded
@@ -492,7 +511,7 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
         W = (magnitude / weight_norm).unsqueeze(1) * W
     if not torch.isfinite(torch.amax(W)).item():
         raise ValueError('Unsloth: Merge failed as there are infinite elements in ' + name)
-    return W
+    return W.t().contiguous() if flip else W
 pass
 
 
@@ -613,6 +632,12 @@ import inspect
 from tqdm import tqdm as ProgressBar
 from dataclasses import dataclass
 
+def _is_conv1d_layout(module):
+    source = getattr(module, "source_cls", None)
+    return isinstance(module, Conv1D) or (isinstance(source, type) and issubclass(source, Conv1D))
+pass
+
+
 @dataclass
 class LoraStats:
     module : torch.nn.Module
@@ -623,6 +648,7 @@ class LoraStats:
     parameter_name : object = None  # PEFT ParamWrapper target (MoE experts), e.g. "up_proj"
     lora_B_bias : object = None     # PEFT lora_bias=True: lora_B's bias, merged into the base bias
     is_vocab : bool = False         # base layer of the input / output embeddings
+    fan_in_fan_out : bool = False   # checkpoint stores the weight (in, out): Conv1D, incl. bnb-quantized Conv1D
 pass
 
 
@@ -754,6 +780,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
         elif isinstance(module, Linear_LoRA_Layers):
             lora_weights[name].alpha = _get_lora_scaling(module)
             lora_weights[name].parameter_name = getattr(module, "parameter_name", None)
+            lora_weights[name].fan_in_fan_out = bool(getattr(module, "fan_in_fan_out", False))
             scaling_count += 1
             expand_module_keys(name, module, remove_keys)
             if not _has_active_adapter(module): _untargeted_keys.add(name)
@@ -772,6 +799,8 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
 
         elif name.endswith(".base_layer"):
             lora_weights[name[:-len(".base_layer")]].module = module
+            # bnb loads Conv1D as (out, in) Linear4bit/8bitLt and PEFT then drops fan_in_fan_out; the checkpoint stays (in, out).
+            if _is_conv1d_layout(module): lora_weights[name[:-len(".base_layer")]].fan_in_fan_out = True
             module_count += 1
             remove_keys.add(name)
             remove_keys.add(name[:-len(".base_layer")])
@@ -2727,7 +2756,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
             with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as temp_file:
                 temp_filename = temp_file.name
                 # Save the merged tensor to a unique temp file
-                torch.save(W.to(output_dtype), temp_filename, pickle_module=pickle, pickle_protocol=pickle.HIGHEST_PROTOCOL)
+                _torch_save_spool(W.to(output_dtype), temp_filename, pickle, pickle.HIGHEST_PROTOCOL)
                 del W
                 # Load it back as a memory-mapped object. The OS will manage paging this from disk.
                 W = torch.load(temp_filename, map_location="cpu", mmap=True, weights_only=False)
@@ -5735,6 +5764,7 @@ def merge_and_overwrite_lora(
     # Per-shard-invariant: resolve the base model + tie flag once, not per shard.
     _merge_base_model = find_lora_base_model(model)
     _merge_model_class_name = _merge_base_model.__class__.__name__
+    _MERGE_MODEL_CLASSES[_merge_model_class_name] = type(_merge_base_model)
     _merge_tie_word_embeddings = bool(
         getattr(_merge_base_model.config, "tie_word_embeddings", False)
     )
@@ -6450,6 +6480,7 @@ def merge_and_dequantize_lora(
         if type(x) is LoraStats:
             DEQUANTIZED_KEYS.append(name)
             W = dequantize_module_weight(x.module)
+            if x.fan_in_fan_out and not isinstance(x.module, Conv1D): W = W.t()
             W = _merge_lora(W, x, name)
             x = W.to(device = 'cpu', dtype = {str(output_dtype)})
         # Remove memory leak
@@ -6573,6 +6604,36 @@ def _renamings_to_conversion_mapping(transforms):
 pass
 
 
+# Class being merged, by name: a same-named remote class from another model must not lend its renames.
+_MERGE_MODEL_CLASSES = {}
+
+
+def _model_classes_named(model_class_name):
+    """The class being merged, else the `transformers` class of this name, then any in `transformers_modules`."""
+    import sys
+    exact = _MERGE_MODEL_CLASSES.get(model_class_name)
+    if isinstance(exact, type):
+        return [exact]
+    classes = []
+    try:
+        module = __import__("transformers", fromlist = [model_class_name])
+        classes.append(getattr(module, model_class_name))
+    except Exception:
+        pass
+    try:
+        from transformers.utils import TRANSFORMERS_DYNAMIC_MODULE_NAME as dynamic_prefix
+    except Exception:
+        dynamic_prefix = "transformers_modules"
+    for name, module in list(sys.modules.items()):
+        if not name.startswith(dynamic_prefix + "."): continue
+        # vars(), not getattr: no lazy-module import side effects.
+        model_class = vars(module).get(model_class_name) if module is not None else None
+        if isinstance(model_class, type) and model_class not in classes:
+            classes.append(model_class)
+    return classes
+pass
+
+
 def _registry_checkpoint_conversion_mapping(model_class_name):
     """The renaming half of the Transformers 5 conversion registry, keyed by class name with a
     `model_type` fallback. Not version-gated: a missing registry or entry yields `{}`, which is
@@ -6582,14 +6643,10 @@ def _registry_checkpoint_conversion_mapping(model_class_name):
     except Exception:
         return {}
     lookups = [model_class_name]
-    try:
-        module = __import__("transformers", fromlist = [model_class_name])
-        model_class = getattr(module, model_class_name)
+    for model_class in _model_classes_named(model_class_name):
         model_type = getattr(getattr(model_class, "config_class", None), "model_type", None)
-        if isinstance(model_type, str) and model_type:
+        if isinstance(model_type, str) and model_type and model_type not in lookups:
             lookups.append(model_type)
-    except Exception:
-        pass
     for lookup in lookups:
         try:
             transforms = get_checkpoint_conversion_mapping(lookup)
@@ -6606,14 +6663,10 @@ def _get_checkpoint_conversion_mapping(model_class_name):
     """A model class's _checkpoint_conversion_mapping ({} if absent), falling back to the
     Transformers 5 registry. Without that fallback a composite model with a pre-5 flat
     checkpoint loses the bridge to its on-disk weights and fails to merge silently (#5290)."""
-    try:
-        module = __import__('transformers', fromlist=[model_class_name])
-        model_class = getattr(module, model_class_name)
+    for model_class in _model_classes_named(model_class_name):
         mapping = getattr(model_class, '_checkpoint_conversion_mapping', {})
-    except (ImportError, AttributeError):
-        mapping = {}
-    if mapping:
-        return mapping
+        if mapping:
+            return mapping
     return _registry_checkpoint_conversion_mapping(model_class_name)
 pass
 
@@ -7323,6 +7376,55 @@ def _unresolved_lora_targets(lora_weights, disk_keys, disk_module_shapes, model_
 pass
 
 
+_TOWER_WORDS = frozenset((
+    "vision", "visual", "vit", "clip", "siglip", "image", "img", "audio", "speech", "whisper",
+    "encoder", "tower", "projector", "mm", "multimodal", "merger", "patch",
+))
+
+
+def _tower_words(prefix_parts):
+    # Whole name components (`model.vit`, `vision_tower`): a substring test misses `vit` / `clip` towers.
+    tokens = re.split(r"[._]", ".".join(prefix_parts).lower())
+    return frozenset(token for token in tokens if token in _TOWER_WORDS)
+pass
+
+
+def _renamed_lora_counterparts(lora_weights, disk_keys, disk_module_shapes, model_class_name,
+                               tie_word_embeddings = False, count_packed_mxfp4 = True):
+    """If no LoRA target is placed, those whose weight sits here under another prefix (same >= 3-part tail,
+    shape and tower). An omitted tower has no such tensor, so it stays exempt."""
+    converted = _convert_lora_keys_to_safetensor_format(
+        lora_weights, disk_keys, model_class_name = model_class_name,
+    )
+    if _backed_lora_keys(converted, disk_keys, tie_word_embeddings,
+                         count_packed_mxfp4 = count_packed_mxfp4):
+        return {}
+    tails = defaultdict(list)
+    for module, disk_shape in disk_module_shapes.items():
+        parts = module.split(".")
+        for i in range(len(parts) - 2):
+            tails[".".join(parts[i:])].append((module, tuple(disk_shape)))
+    found = {}
+    for key, lora_stats in converted.items():
+        if not isinstance(key, str): continue
+        if getattr(lora_stats, "lora_A", None) is None: continue
+        if getattr(lora_stats, "lora_B", None) is None: continue
+        shape = _lora_target_logical_shape(lora_stats)
+        if shape is None: continue
+        parts = key.split(".")
+        for i in range(len(parts) - 2):
+            towers = _tower_words(parts[:i])
+            match = next((
+                m for m, sh in tails.get(".".join(parts[i:]), ())
+                if sh == shape and _tower_words(m.split(".")[: len(m.split(".")) - len(parts) + i]) == towers
+            ), None)
+            if match is not None:
+                found[key] = match
+                break
+    return found
+pass
+
+
 def _format_partial_merge_error(unresolved, model_class_name, total_lora_modules = 0):
     """The refusal message, naming each unmerged prefix, its share and a worked example."""
     total = sum(len(claimed) for claimed in unresolved.values())
@@ -7372,17 +7474,32 @@ def _check_lora_merge_is_complete(save_directory, safetensors_list, lora_weights
         tie_word_embeddings = tie_word_embeddings,
         count_packed_mxfp4 = count_packed_mxfp4,
     )
-    if not unresolved: return unresolved
-
-    # Every report refuses regardless of size: a size threshold would downgrade a genuine 14-module under-merge on a
-    # text encoder to a notice; the env var is the escape hatch.
-    total_lora_modules = sum(
-        1 for key, stats in lora_weights.items()
+    lora_keys = [
+        key for key, stats in lora_weights.items()
         if isinstance(key, str)
         and getattr(stats, "lora_A", None) is not None
         and getattr(stats, "lora_B", None) is not None
-    )
-    message = _format_partial_merge_error(unresolved, model_class_name, total_lora_modules)
+    ]
+    total_lora_modules = len(lora_keys)
+    if unresolved:
+        # Every report refuses regardless of size: a size threshold would downgrade a genuine 14-module under-merge on a
+        # text encoder to a notice; the env var is the escape hatch.
+        message = _format_partial_merge_error(unresolved, model_class_name, total_lora_modules)
+    elif total_lora_modules and disk_keys and _renamed_lora_counterparts(
+        lora_weights, disk_keys, disk_module_shapes, model_class_name,
+        tie_word_embeddings = tie_word_embeddings, count_packed_mxfp4 = count_packed_mxfp4,
+    ):
+        # An unseen rename also leaves `unresolved` empty; the export would be the untouched base.
+        message = (
+            f"Unsloth: Refusing to write a merged model: none of the {total_lora_modules} LoRA module(s) on "
+            f"{model_class_name} matched a weight in this checkpoint (e.g. `{lora_keys[0]}`), so the export would be "
+            "the untouched base weights. The checkpoint likely names its weights differently from the loaded "
+            "model. Please report it at https://github.com/unslothai/unsloth-zoo/issues with your model name, "
+            "your `transformers` version and this message. UNSLOTH_ALLOW_PARTIAL_LORA_MERGE=1 writes it anyway."
+        )
+        unresolved = {("", ""): dict.fromkeys(lora_keys)}
+    else:
+        return unresolved
     if os.environ.get("UNSLOTH_ALLOW_PARTIAL_LORA_MERGE") == "1":
         print(message)
         return unresolved
@@ -7971,7 +8088,23 @@ def check_local_model_exists(model_path):
         if has_safetensors(path):
             return os.path.abspath(path)  # Return absolute path
 
+    # Offline, the cached snapshot is the only copy: every Hub call on this repo id would raise.
+    snapshot = _offline_cached_snapshot(model_path)
+    # The cache keeps whatever files finished downloading, so a snapshot can be missing shards.
+    if snapshot and has_safetensors(snapshot) and _local_snapshot_is_complete(snapshot):
+        return snapshot
     return None
+pass
+
+def _offline_cached_snapshot(model_name):
+    """The cached `main` snapshot directory of `model_name` under HF_HUB_OFFLINE, else None."""
+    try:
+        from huggingface_hub import constants, try_to_load_from_cache
+        if not constants.HF_HUB_OFFLINE or not _is_hub_repo_id(model_name): return None
+        config_path = try_to_load_from_cache(model_name, "config.json")
+        return os.path.dirname(config_path) if isinstance(config_path, str) else None
+    except Exception:
+        return None
 pass
 
 def _is_fp8_quant_config(quant_config):

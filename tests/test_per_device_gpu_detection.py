@@ -31,7 +31,7 @@ torch = pytest.importorskip("torch")
 from unsloth_zoo import device_type
 from unsloth_zoo import gradient_checkpointing as gc
 from unsloth_zoo import llama_cpp
-from unsloth_zoo import tiled_mlp
+from unsloth_zoo import memory_budget as tiled_mlp
 
 _MISSING = object()
 MIXED = [[(8, 0), (7, 5)], [(7, 5), (8, 0)]]

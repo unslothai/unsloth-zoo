@@ -27,8 +27,8 @@ NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if IS_AMD else [1, 2, 4, 8, 16, 32]
 def softmax_fwd_kernel(
     x,
     p,
-    D: tl.constexpr,
-    B: tl.constexpr,
+    D: tl.constexpr,  # feature dim
+    B: tl.constexpr,  # block along D
 ):
     i_n = tl.program_id(0)
     o_d = tl.arange(0, B)
@@ -55,8 +55,8 @@ def softmax_bwd_kernel(
     p,
     dp,
     ds,
-    D: tl.constexpr,
-    B: tl.constexpr,
+    D: tl.constexpr,  # feature dim
+    B: tl.constexpr,  # block along D
 ):
     i_n = tl.program_id(0)
     o_d = tl.arange(0, B)

@@ -64,20 +64,20 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     cu_seqlens,
     chunk_offsets,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BV: tl.constexpr,
-    USE_G: tl.constexpr,
-    USE_GK: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
-    STORE_FINAL_STATE: tl.constexpr,
-    SAVE_NEW_VALUE: tl.constexpr,
-    STATE_V_FIRST: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    LONG_INDEXING: tl.constexpr = False,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BV: tl.constexpr,  # block along V
+    USE_G: tl.constexpr,  # scalar gate
+    USE_GK: tl.constexpr,  # per-key gate
+    USE_INITIAL_STATE: tl.constexpr,  # h0 given
+    STORE_FINAL_STATE: tl.constexpr,  # write ht
+    SAVE_NEW_VALUE: tl.constexpr,  # write v_new
+    STATE_V_FIRST: tl.constexpr,  # state layout is [V, K]
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    LONG_INDEXING: tl.constexpr = False,  # int64 offsets
 ):
     # Unsloth: backported from fla PR #1077. N*HV on grid axis 1 hit the 65535
     # block cap, so a varlen batch of more than 65535/HV sequences failed to
@@ -387,19 +387,19 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     chunk_offsets,
     scale,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BV: tl.constexpr,
-    USE_G: tl.constexpr,
-    USE_GK: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
-    USE_FINAL_STATE_GRADIENT: tl.constexpr,
-    STATE_V_FIRST: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    LONG_INDEXING: tl.constexpr = False,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BV: tl.constexpr,  # block along V
+    USE_G: tl.constexpr,  # scalar gate
+    USE_GK: tl.constexpr,  # per-key gate
+    USE_INITIAL_STATE: tl.constexpr,  # h0 given
+    USE_FINAL_STATE_GRADIENT: tl.constexpr,  # dht given
+    STATE_V_FIRST: tl.constexpr,  # state layout is [V, K]
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    LONG_INDEXING: tl.constexpr = False,  # int64 offsets
 ):
     # Unsloth: backported from fla PR #1077. N*HV on grid axis 1 hit the 65535
     # block cap, so a varlen batch of more than 65535/HV sequences failed to
