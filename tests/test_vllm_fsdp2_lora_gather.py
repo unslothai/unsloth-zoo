@@ -28,6 +28,15 @@ import pytest
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 
+
+def _fully_shard_takes_ignored_params():
+    import inspect
+    try:
+        from torch.distributed.fsdp import fully_shard
+    except ImportError:
+        return False
+    return "ignored_params" in inspect.signature(fully_shard).parameters
+
 _WORKER = """
 import json, os, sys
 import torch
@@ -105,7 +114,8 @@ def _free_port():
         return s.getsockname()[1]
 
 
-@pytest.mark.parametrize("layout", ["sharded", "mixed"])
+@pytest.mark.parametrize("layout", ["sharded", pytest.param("mixed", marks = pytest.mark.skipif(
+    not _fully_shard_takes_ignored_params(), reason = "fully_shard has no ignored_params before torch 2.7, so no mixed layout"))])
 def test_save_lora_and_load_lora_tensors_gather_fsdp2_shards(tmp_path, layout):
     script = tmp_path / "worker.py"
     script.write_text(textwrap.dedent(_WORKER))
