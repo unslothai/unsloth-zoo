@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-"""Per-call token / row counts of the zoo MoE kernels get no % 16 class (jit_any_alignment keeps == 1, do_not_specialize
-drops both), and the routing
-scratch slices keep a fixed pointer alignment, so a new prefill length or batch size compiles nothing after warm-up
-(w5_recompile G1: these kernels re-specialized with the same constexprs on Kaggle T4)."""
+"""Per-call token / row counts of the combine and MXFP4 grouped GEMM kernels get no % 16 class (jit_any_alignment
+keeps == 1), and the routing scratch slices keep a fixed pointer alignment, so a new prefill length compiles nothing
+after warm-up. The do_not_specialize kernels (router, SwiGLU, NF4 grouped) are pinned by test_triton_runtime_size_args."""
 
 import ast
 import inspect
@@ -59,9 +58,7 @@ def test_helper_falls_back_to_plain_jit(monkeypatch):
 
 
 EXPECTED = {
-    "temporary_patches/moe_fused_swiglu.py": {"_swiglu_fwd_kernel": "M", "_swiglu_bwd_kernel": "M"},
     "temporary_patches/moe_triton_kernels.py": {"_combine_fwd_kernel": "T", "_combine_bwd_dy_kernel": "N"},
-    "temporary_patches/moe_router_triton.py": {"_router_fwd_kernel": "T", "_router_bwd_kernel": "T"},
     "mxfp4_gemm.py": {"_mxfp4_grouped_mm_kernel": "M"},
 }
 
@@ -72,14 +69,11 @@ def test_token_counts_alignment_unspecialized(path):
     found = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name in EXPECTED[path]:
-            names = []
-            for d in node.decorator_list:
-                if not isinstance(d, ast.Call):
-                    continue
-                if getattr(d.func, "id", "").lstrip("_") == "jit_any_alignment":
-                    names += [a.value for a in d.args]
-                elif ast.unparse(d.func) == "triton.jit":
-                    names += [e.value for k in d.keywords if k.arg == "do_not_specialize" for e in k.value.elts]
+            names = [
+                a.value for d in node.decorator_list
+                if isinstance(d, ast.Call) and getattr(d.func, "id", "").lstrip("_") == "jit_any_alignment"
+                for a in d.args
+            ]
             assert len(names) == 1, (node.name, names)
             assert names[0] in [a.arg for a in node.args.args], (node.name, names[0])
             found[node.name] = names[0]
@@ -116,13 +110,3 @@ def test_routing_scratch_slices_stay_aligned(monkeypatch):
             mr._launch(torch.zeros((N // 2, 2), dtype = torch.int64), E)
     assert not misaligned, misaligned[:8]
 
-
-def test_nf4_grouped_row_counts_unspecialized():
-    tree = ast.parse((ROOT / "temporary_patches/moe_nf4_grouped.py").read_text(encoding = "utf-8"))
-    (fn,) = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_nf4_grouped_kernel"]
-    (jit,) = [d for d in fn.decorator_list if isinstance(d, ast.Call) and ast.unparse(d.func) == "triton.jit"]
-    (kw,) = [k for k in jit.keywords if k.arg == "do_not_specialize"]
-    assert [e.value for e in kw.value.elts] == ["M", "M_HINT"]
-    # Unused in the body, so not specializing them cannot change the kernel.
-    body = {n.id for stmt in fn.body for n in ast.walk(stmt) if isinstance(n, ast.Name)}
-    assert not body & {"M", "M_HINT"}
