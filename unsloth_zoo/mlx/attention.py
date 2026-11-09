@@ -22,6 +22,7 @@ import hashlib
 import math
 import os
 import re
+from typing import NamedTuple
 
 import mlx.core as mx
 
@@ -45,7 +46,9 @@ def dequantizing_is_smaller(queries, q_keys, q_values, group_size):
     HKV = q_keys[0].shape[-3]
     scores = HQ * L * dtype.size
     copy = HKV * (_row_bytes(q_keys, group_size, dtype) + _row_bytes(q_values, group_size, dtype))
-    return scores > copy
+    padding = forced_padding_row_bytes(q_keys[1].shape[-1] * group_size, q_values[1].shape[-1] * group_size, HKV,
+                                       dtype.size, q_keys[0].shape[-2])
+    return scores > copy + padding
 
 
 # Shapes of the calls mlx fuses, per ScaledDotProductAttention::has_fused_kernel and use_fallback (mlx 0.32.3);
@@ -69,15 +72,21 @@ def _tf32_enabled():
     return _atoi(os.environ.get("MLX_ENABLE_TF32", "1")) != 0
 
 
-def _full_kernel_exists(queries, q_keys, head_dim, value_dim, dtype, mask):
-    from .nax import nax_available
+def _stock_runs_nax():
+    # mlx picks its NAX kernels from the hardware; `UNSLOTH_MLX_NAX=0` turns off only Unsloth's own routes.
+    from . import nax
 
+    return nax.nax_available() or (os.environ.get("UNSLOTH_MLX_NAX") == "0" and nax._nax_gpu()
+                                   and nax._stock_nax_kernels())
+
+
+def _full_kernel_exists(queries, q_keys, head_dim, value_dim, dtype, mask):
     B, HQ, L = queries.shape[0], queries.shape[-3], queries.shape[-2]
     S = q_keys[0].shape[-2]
     causal = isinstance(mask, str) and mask == "causal"
     if causal and L > S:
         return False
-    split = L >= _SPLIT_MIN_QUERIES and (_tf32_enabled() or dtype != mx.float32) and nax_available()
+    split = L >= _SPLIT_MIN_QUERIES and (_tf32_enabled() or dtype != mx.float32) and _stock_runs_nax()
     if head_dim == value_dim == 256:
         if split and (causal or isinstance(mask, mx.array)):
             return True
@@ -116,6 +125,114 @@ def fused_kernel_exists(queries, q_keys, q_values, group_size, mask=None):
     return _vector_kernel_exists(queries, q_keys, head_dim, value_dim, mask)
 
 
+# mlx builds full `[B, HQ, L, S]` scores for these causal calls; below the floors that is small and faster.
+_FORCED_MIN_QUERIES = 16
+_FORCED_MIN_KEYS = 8192
+
+
+def _forced_widths(head_dim, value_dim):
+    """The (head_dim, value_dim) a forced call runs at, or None. Zero padding leaves the attention exact."""
+    if head_dim == value_dim == 256:
+        return 256, 256
+    if (head_dim, value_dim) == (192, 128):
+        # No 192/128 kernel past 8 queries; NAX runs 256 faster than 192, elsewhere the reverse.
+        return (256, 256) if _stock_runs_nax() else (192, 192)
+    return None
+
+
+def _forces_fused(queries, n_keys, head_dim, value_dim, dtype, mask):
+    return (_forced_widths(head_dim, value_dim) is not None and isinstance(mask, str) and mask == "causal"
+            and _FORCED_MIN_QUERIES <= queries.shape[-2] <= n_keys and n_keys >= _FORCED_MIN_KEYS
+            and dtype != mx.float32 and mx.metal.is_available() and mx.default_device() == mx.gpu)
+
+
+def forced_padding_row_bytes(head_dim, value_dim, kv_heads, dtype_size, n_keys):
+    """Bytes per cached token a forced call over `n_keys` holds in its padded copies of K and V."""
+    widths = _forced_widths(head_dim, value_dim)
+    if widths is None or dtype_size == 4 or n_keys < _FORCED_MIN_KEYS:
+        return 0
+    copied = (widths[0] if widths[0] != head_dim else 0) + (widths[1] if widths[1] != value_dim else 0)
+    return kv_heads * copied * dtype_size
+
+
+def _pad_width(x, width):
+    return x if x.shape[-1] == width else mx.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, width - x.shape[-1])])
+
+
+def _blocks_d512_scores(queries, n_keys, head_dim, value_dim, dtype, mask):
+    # mlx's use_blocked_d512: off NAX these calls hold about 256 queries' scores, not all of them.
+    return (head_dim == value_dim == 512 and isinstance(mask, str) and mask == "causal"
+            and _SPLIT_MIN_QUERIES <= queries.shape[-2] <= n_keys and dtype != mx.float32
+            and not _stock_runs_nax() and mx.metal.is_available() and mx.default_device() == mx.gpu)
+
+
+def runtime_fuses(queries, q_keys, q_values, group_size, mask=None):
+    """Whether a loaded model's call avoids building full scores: mlx's own route or a forced one."""
+    route = (queries, q_keys[0].shape[-2], q_keys[1].shape[-1] * group_size, q_values[1].shape[-1] * group_size,
+             _result_dtype(queries, q_keys, q_values), mask)
+    return (fused_kernel_exists(queries, q_keys, q_values, group_size, mask)
+            or _forces_fused(*route) or _blocks_d512_scores(*route))
+
+
+def fused_sdpa_over(stock):
+    """Wrap `mx.fast.scaled_dot_product_attention`; training keeps mlx's own dispatch."""
+    @functools.wraps(stock)
+    def sdpa(q, k, v, *, scale, mask=None, sinks=None, **kwargs):
+        from .utils import mlx_training_patches_active
+
+        if isinstance(mask, WindowMask):
+            original, window = mask
+            if (native_window_supported(q, k, v) and not kwargs and sinks is None
+                    and not mlx_training_patches_active()):
+                try:
+                    return stock(q, k, v, scale=scale, mask="causal", window_size=window, force_fused=True)
+                except ValueError:   # mlx has no fused windowed backward, so a gradient trace refuses it
+                    pass
+            # The model slices only array masks to the queries it keeps, so a descriptor arrives untrimmed.
+            mask = original
+            if isinstance(mask, mx.array) and mask.shape[-2] != q.shape[-2]:
+                mask = mask[..., -q.shape[-2]:, :]
+        if (sinks is None and not kwargs and q.dtype == k.dtype == v.dtype
+                and _forces_fused(q, k.shape[-2], k.shape[-1], v.shape[-1], q.dtype, mask)
+                and not mlx_training_patches_active()):
+            head_dim, value_dim = _forced_widths(k.shape[-1], v.shape[-1])
+            out = stock(_pad_width(q, head_dim), _pad_width(k, head_dim), _pad_width(v, value_dim), scale=scale,
+                        mask=mask, force_fused=True)
+            return out if value_dim == v.shape[-1] else out[..., :v.shape[-1]]
+        return stock(q, k, v, scale=scale, mask=mask, sinks=sinks, **kwargs)
+    return sdpa
+
+
+class WindowMask(NamedTuple):
+    """An internally built mask retained alongside its native causal-window equivalent."""
+    original: mx.array | str
+    window: int
+
+
+def native_window_available():
+    """Whether this runtime and device can run native-window attention."""
+    return (os.environ.get("UNSLOTH_MLX_NATIVE_WINDOW", "1") != "0"
+            and "window_size" in (mx.fast.scaled_dot_product_attention.__doc__ or "")
+            and mx.metal.is_available() and mx.default_device() == mx.gpu)
+
+
+def native_window_supported(q, k, v):
+    """The large-row, head-dimension256 prefill cases qualified against FP32."""
+    return (native_window_available() and q.dtype == k.dtype == v.dtype
+            and q.dtype in (mx.bfloat16, mx.float16) and q.ndim == k.ndim == v.ndim == 4
+            and _SPLIT_MIN_QUERIES <= q.shape[-2] <= k.shape[-2]
+            and q.shape[-1] == k.shape[-1] == v.shape[-1] == 256)
+
+
+def install_fused_attention():
+    """Route eligible calls of every runtime onto the fused kernel, idempotently."""
+    stock = mx.fast.scaled_dot_product_attention
+    if not getattr(stock, _FUSED_PATCH_FLAG, False):
+        patched = fused_sdpa_over(stock)
+        setattr(patched, _FUSED_PATCH_FLAG, True)
+        mx.fast.scaled_dot_product_attention = patched
+
+
 def dequantized_sdpa(queries, q_keys, q_values, scale, mask=None, group_size=64, bits=8):
     """Fused SDPA over one dequantized copy; an emptied row averages as in the unfused path, since mlx masks with a finite minimum rather than -inf."""
     dtype = _result_dtype(queries, q_keys, q_values)
@@ -131,7 +248,7 @@ def quantized_sdpa_over(unfused):
                        **kwargs):
         # An argument this wrapper predates has no fused equivalent: delegate, never drop it.
         if (not kwargs
-                and fused_kernel_exists(queries, q_keys, q_values, group_size, mask)
+                and runtime_fuses(queries, q_keys, q_values, group_size, mask)
                 and dequantizing_is_smaller(queries, q_keys, q_values, group_size)):
             return dequantized_sdpa(queries, q_keys, q_values, scale, mask,
                                     group_size=group_size, bits=bits)
@@ -141,6 +258,7 @@ def quantized_sdpa_over(unfused):
 
 
 _PATCH_FLAG = "_unsloth_quantized_attention_patch"
+_FUSED_PATCH_FLAG = "_unsloth_fused_attention_patch"
 
 _PATCH_TARGETS = ("mlx_lm.models.base", "mlx_vlm.models.base")
 

@@ -19,12 +19,16 @@
 The tiled forward lives in the instance `forward`; the forward it tiles lives in `module._unsloth_forward`, so other
 patches (the fused LoRA MLP kernel) write their forward there and it runs inside every tile."""
 
+import contextlib
 import functools
 import itertools
 import math
 import os
 import re
+import threading
 import types
+import typing
+import warnings
 import weakref
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatch
@@ -474,8 +478,13 @@ def needs_rng_replay(module, spec):
         return True
     cached = module.__dict__.get("_unsloth_tiled_random")
     if _is_compiling():
-        # Source inspection cannot run while tracing: use the eager verdict (computed at install), else replay.
-        return True if cached is None else cached[2]
+        # Source inspection cannot run while tracing: use the eager verdict (computed at install) while it still
+        # describes this module tree and inner forward, else replay.
+        # No id(module) here: an identity guard per MLP would compile every layer of a class separately.
+        if cached is None or cached[0] != _MODULE_TREE_VERSION[0] or \
+                cached[3] is not module.__dict__.get("_unsloth_forward"):
+            return True
+        return cached[2]
     return _random_verdict(module)[2]
 
 
@@ -501,6 +510,17 @@ class _TileState:
         self.tile_rows = _tile_rows(plan, hidden, intermediate, nbytes, budget_gb) if hidden else None
         self.in_widths = None
         self.model_stats = None
+        self.op_ok = False
+        self.op_owner = None
+        self.op_tensors = None
+
+    def __getstate__(self):
+        # Weakrefs do not pickle; an unpickled copy is not registered, so it takes the per-tile route.
+        state = dict(self.__dict__)
+        state["op_owner"] = None
+        state["op_ok"] = False
+        state["op_tensors"] = None
+        return state
 
 
 def _bind(module, fn):
@@ -589,12 +609,325 @@ def _tiled_forward(self, *args, **kwargs):
         return inner(*args)
     if _is_compiling():
         mode = _sequence_tiling._outside_graph_mode()
+        if mode == "op":
+            params = _op_params(self, state)
+            device = x.device.type
+            # The op's output is allocated like x: an autocast dtype other than x's would change the MLP's
+            # output dtype (and double its bytes), so that case keeps the per-tile route.
+            if params is not None and (
+                not torch.is_autocast_enabled(device) or torch.get_autocast_dtype(device) == x.dtype
+            ):
+                return _run_tiled_op(state, x, params, n_tiles)
+            mode = "compile_tile"
         if mode != "unroll":
             return _run_tiled_outside_graph(self, state, x, n_tiles, mode == "compile_tile")
     return _run_tiled(self, state, x, n_tiles)
 
 
 _run_tiled_outside_graph = torch.compiler.disable(_run_tiled, recursive = True)
+
+
+# Opaque tiled op: inside Unsloth's compiled block the whole tile loop is one graph node, so the block keeps one graph
+# (no break, no resumed half) and Inductor cannot overlap tiles. Forward runs the tiles under no_grad and saves only
+# x; backward recomputes one tile at a time and differentiates it (the arctic recipe). Dense MLPs with a single rows
+# output, no RNG replay, plain (non-DTensor) trainable parameters and output width == input width only. It reads the
+# MLP's weights from the live module when it runs, so the region must not update them in place around the call
+# (Unsloth's decoder blocks never do).
+_OP_MODULES = weakref.WeakSet()
+_OP_BY_PTR = {}
+_OP_VERSION = [0, -1]  # (modules attached, version _OP_BY_PTR was built at)
+_OP_READY = [None]
+# Forward returns a CPU token naming its module; backward resolves the module from it, since saved-tensor hooks
+# (Unsloth's offload, save_on_cpu) may hand back the saved parameters in new storage.
+_OP_TOKENS = {}
+_OP_NEXT_TOKEN = [0]
+
+
+def _op_token(module):
+    token = module.__dict__.get("_unsloth_op_token")
+    if token is None or _OP_TOKENS.get(token, lambda: None)() is not module:
+        token = _OP_NEXT_TOKEN[0]
+        _OP_NEXT_TOKEN[0] += 1
+        _OP_TOKENS[token] = weakref.ref(module)
+        module.__dict__["_unsloth_op_token"] = token
+    return token
+
+
+def _op_params(module, state):
+    if not state.op_ok:
+        return None
+    owner = state.op_owner() if state.op_owner is not None else None
+    if owner is not module:
+        # A deepcopy of an installed module carries the state but was never registered with the op.
+        return None
+    refs = state.op_tensors
+    current = list(itertools.chain(module.parameters(), module.buffers()))
+    if refs is None or len(current) != len(refs) or any(t is not r() for t, r in zip(current, refs)):
+        # A stateless call (torch.func.functional_call) or a reassigned weight put other tensors in place: the op
+        # reads the live module's tensors at run time, after the swap is undone, so keep the per-tile route.
+        return None
+    if needs_rng_replay(module, state.spec):
+        return None
+    params = [p for p in module.parameters() if p.requires_grad]
+    if not params:
+        return None
+    return params
+
+
+def _op_eligible(module, spec, hidden):
+    if spec is None or spec.family != "dense-mlp" or tuple(spec.output_contract) != ("rows",):
+        return False
+    if not hidden or _DTensor is not None and any(isinstance(p, _DTensor) for p in module.parameters()):
+        return False
+    if any(True for _ in module.buffers()):
+        # The op's inputs are x and the trainable parameters: a buffer it reads from the live module has no tensor
+        # dependency in the graph, so an in-place update (QAT observers, scales) could be ordered either side of it.
+        return False
+    # The op's output is shaped like its input; the last projection (last direct child with out_features: down_proj,
+    # fc2, w2) must map back to the input width. Read statically: running the forward here would show in hooks.
+    widths = [m.out_features for m in module.children() if isinstance(getattr(m, "out_features", None), int)]
+    return bool(widths) and widths[-1] == hidden
+
+
+def _op_module(params):
+    """The tiled module whose trainable parameters are `params` (matched by storage: Inductor may pass aliases).
+    Modules sharing all trainable parameters (tied MLPs) are interchangeable only when they are the same class."""
+    key = (params[0].device, params[0].data_ptr())
+    ref = _OP_BY_PTR.get(key)
+    module = ref() if ref is not None else None
+    if module is None or _OP_VERSION[1] != _OP_VERSION[0] or not _op_matches(module, params):
+        _OP_BY_PTR.clear()
+        _OP_VERSION[1] = _OP_VERSION[0]
+        groups = {}
+        for m in list(_OP_MODULES):
+            own = [p for p in m.parameters() if p.requires_grad]
+            if own:
+                k = (own[0].device, own[0].data_ptr())
+                groups.setdefault(k, []).append(m)
+                _OP_BY_PTR.setdefault(k, weakref.ref(m))
+        for k, members in groups.items():
+            # Distinct MLPs sharing trainable parameters are never interchangeable (install keeps them off the op).
+            if len(members) > 1:
+                _OP_BY_PTR.pop(k, None)
+        ref = _OP_BY_PTR.get(key)
+        module = ref() if ref is not None else None
+        if module is None or not _op_matches(module, params):
+            raise RuntimeError(
+                "Unsloth: tiled MLP op could not tell which module owns its parameters (several MLPs share their "
+                "trainable parameters but not their other weights, or the compiled region updated them in place "
+                "before the call); set UNSLOTH_TILED_COMPILE=compile_tile to tile them outside the block graph."
+            )
+    return module
+
+
+def _op_uses_every_parameter(module, hidden):
+    """One-row probe at install: the op returns a gradient tensor for every trainable parameter, so a parameter the
+    forward never reaches would get zeros (still moving Adam's moments and weight decay) instead of None. Such a
+    module keeps the per-tile route. A probe that cannot run declines the op too."""
+    params = [p for p in module.parameters() if p.requires_grad]
+    if not params:
+        return True
+    try:
+        ref = params[0]
+        x = torch.zeros(1, hidden, device = ref.device, dtype = ref.dtype if ref.is_floating_point() else None)
+        with torch.enable_grad():
+            # Fed as the op feeds its tiles (1, rows, hidden): Unsloth's fused LoRA MLP takes 3-D input only.
+            y = _tile_fn(module, True, ("rows",), x)
+            if not torch.is_tensor(y) or not y.requires_grad:
+                return False
+            grads = torch.autograd.grad(y.float().sum(), params, allow_unused = True)
+        return all(g is not None for g in grads)
+    except Exception:
+        return False
+
+
+def _op_matches(module, params):
+    own = [p for p in module.parameters() if p.requires_grad]
+    return len(own) == len(params) and all(
+        a.data_ptr() == b.data_ptr() and a.shape == b.shape for a, b in zip(own, params)
+    )
+
+
+def _op_bounds(rows, n_tiles):
+    chunk = (rows + n_tiles - 1) // n_tiles
+    return [(s, min(chunk, rows - s)) for s in range(0, rows, chunk)]
+
+
+_ENV_OP_TILE = "UNSLOTH_TILED_OP_TILE"
+
+
+def _op_tile_body(module):
+    """The tile body the op runs: eager by default, or one compiled frame per class (UNSLOTH_TILED_OP_TILE=compiled).
+    Eager is the default because compiled tiles were no faster on GPU and sometimes used slightly more memory."""
+    fn = functools.partial(_tile_fn, module, True, ("rows",))
+    if os.environ.get(_ENV_OP_TILE, "eager").strip().lower() != "compiled":
+        return fn
+    return _sequence_tiling._compiled_tile_fn(fn)
+
+
+def _op_autocast(x, amp):
+    # Compiled graphs run with autocast off (casts are baked in); the tile body runs eager, so restore the caller's.
+    # No cast cache: a weight cast cached by the no_grad forward would be reused by the backward's recompute and
+    # cut the graph to the weight (zero gradient), the reason torch's checkpoint recomputes uncached too.
+    if amp is None:
+        return contextlib.nullcontext()
+    return torch.autocast(x.device.type, dtype = amp, cache_enabled = False)
+
+
+def _op_forward_impl(x, params, n_tiles, amp = None):
+    out, _ = _op_forward_with_token(x, params, n_tiles, amp)
+    return out
+
+
+def _op_forward_with_token(x, params, n_tiles, amp = None):
+    module = _op_module(params)
+    body = _op_tile_body(module)
+    out = torch.empty_like(x)
+    with torch.no_grad(), _op_autocast(x, amp), _sequence_tiling._autograd_reenabled(), \
+            _sequence_tiling._tile_gc_scope():
+        for start, length in _op_bounds(x.shape[0], n_tiles):
+            y = body(x.narrow(0, start, length))
+            if y.shape != (length, x.shape[1]) or y.dtype != x.dtype:
+                raise RuntimeError(
+                    f"Unsloth: tiled MLP op expected a {length} x {x.shape[1]} {x.dtype} tile output, got "
+                    f"{tuple(y.shape)} {y.dtype}; set "
+                    f"UNSLOTH_TILED_COMPILE=compile_tile to tile this module outside the block graph."
+                )
+            out.narrow(0, start, length).copy_(y)
+    return out, torch.tensor(_op_token(module), dtype = torch.int64)
+
+
+def _op_proxies(module):
+    """Detached leaves standing in for the trainable parameters during the recompute: hooks registered on the
+    parameters (parameter.register_hook) then run once, on the gradient the op returns, not once per tile."""
+    names = [n for n, p in module.named_parameters() if p.requires_grad]
+    proxies = {n: p.detach().requires_grad_(True) for n, p in module.named_parameters() if p.requires_grad}
+    try:
+        from torch.nn.utils.stateless import _reparametrize_module
+    except Exception:
+        return [p for p in module.parameters() if p.requires_grad], contextlib.nullcontext()
+    return [proxies[n] for n in names], _reparametrize_module(module, proxies)
+
+
+_OP_LOCKS = weakref.WeakKeyDictionary()
+_OP_LOCKS_GUARD = threading.Lock()
+
+
+def _op_lock(module):
+    with _OP_LOCKS_GUARD:
+        lock = _OP_LOCKS.get(module)
+        if lock is None:
+            lock = _OP_LOCKS[module] = threading.Lock()
+    return lock
+
+
+def _op_backward_impl(x, grad, params, n_tiles, amp = None, token = None):
+    ref = _OP_TOKENS.get(int(token)) if token is not None else None
+    module = ref() if ref is not None else None
+    if module is None:
+        module = _op_module(params)
+    # The recompute swaps the module's parameters for proxy leaves: one backward per module at a time.
+    with _op_lock(module):
+        return _op_backward_locked(module, x, grad, n_tiles, amp)
+
+
+def _op_backward_locked(module, x, grad, n_tiles, amp):
+    own, swapped = _op_proxies(module)
+    body = _op_tile_body(module)
+    dx = torch.empty_like(x)
+    dparams = [None] * len(own)
+    with torch.enable_grad(), _op_autocast(x, amp), _sequence_tiling._autograd_reenabled(), \
+            _sequence_tiling._tile_gc_scope(), swapped:
+        for start, length in _op_bounds(x.shape[0], n_tiles):
+            # A fresh leaf per tile: a kernel writing dX into its input (fused LoRA MLP) writes into this copy.
+            xt = x.narrow(0, start, length).detach().clone().requires_grad_(True)
+            out = body(xt)
+            g = grad.narrow(0, start, length)
+            grads = torch.autograd.grad(out, [xt] + own, g.to(out.dtype), allow_unused = True)
+            del out
+            dx.narrow(0, start, length).copy_(grads[0])
+            for k, g in enumerate(grads[1:]):
+                if g is not None:
+                    if dparams[k] is None:
+                        # Laid out like the parameter (the fake kernel's promise): a mm backward can return a
+                        # transposed gradient, which Inductor's stride assert rejects.
+                        dparams[k] = torch.empty_like(own[k]).copy_(g)
+                    else:
+                        dparams[k].add_(g)
+    if any(g is None for g in dparams):
+        # The op must return a tensor per parameter, and a zero gradient still moves Adam's moments and weight
+        # decay: route this module through the per-tile frames from the next trace on (they keep None).
+        state = module.__dict__.get("_unsloth_tiling")
+        if state is not None and state.op_ok:
+            state.op_ok = False
+            warnings.warn(
+                f"Unsloth: tiled {type(module).__name__} has trainable parameters this forward does not use; "
+                "it leaves the tiled op for the per-tile route (this step's unused gradients are zero).",
+                stacklevel = 2,
+            )
+    return [dx] + [torch.zeros_like(p) if g is None else g for g, p in zip(dparams, own)]
+
+
+def _op_ready():
+    if _OP_READY[0] is None:
+        _OP_READY[0] = _register_op()
+    return _OP_READY[0]
+
+
+def _register_op():
+    global _tiled_rows_fwd
+    custom_op = getattr(getattr(torch, "library", None), "custom_op", None)
+    if custom_op is None or not hasattr(torch._C, "_ForceDispatchKeyGuard"):
+        return False
+    try:
+        fwd = custom_op("unsloth_zoo::tiled_rows_fwd", mutates_args = ())(_op_fwd_schema)
+        bwd = custom_op("unsloth_zoo::tiled_rows_bwd", mutates_args = ())(_op_bwd_schema)
+        fwd.register_fake(
+            lambda x, params, n_tiles, amp: (torch.empty_like(x), torch.empty((), dtype = torch.int64, device = "cpu"))
+        )
+        bwd.register_fake(
+            lambda x, grad, params, n_tiles, amp, token: [torch.empty_like(x)] + [torch.empty_like(p) for p in params]
+        )
+
+        def setup_context(ctx, inputs, output):
+            x, params, n_tiles, amp = inputs
+            ctx.n_tiles, ctx.amp = n_tiles, amp
+            ctx.save_for_backward(x, output[1], *params)
+
+        def backward(ctx, grad, _grad_token):
+            x, token, *params = ctx.saved_tensors
+            grads = bwd(x, grad.contiguous(), params, ctx.n_tiles, ctx.amp, token)
+            return grads[0], list(grads[1:]), None, None
+
+        fwd.register_autograd(backward, setup_context = setup_context)
+    except Exception:
+        return False
+    _tiled_rows_fwd = fwd
+    return True
+
+
+def _op_fwd_schema(
+    x: torch.Tensor, params: typing.List[torch.Tensor], n_tiles: int, amp: typing.Optional[torch.dtype],
+) -> typing.Tuple[torch.Tensor, torch.Tensor]:
+    return _op_forward_with_token(x, params, n_tiles, amp)
+
+
+def _op_bwd_schema(
+    x: torch.Tensor, grad: torch.Tensor, params: typing.List[torch.Tensor], n_tiles: int,
+    amp: typing.Optional[torch.dtype], token: torch.Tensor,
+) -> typing.List[torch.Tensor]:
+    return _op_backward_impl(x, grad, params, n_tiles, amp, token)
+
+
+_tiled_rows_fwd = None
+
+
+def _run_tiled_op(state, x, params, n_tiles):
+    lead = x.shape[:-1]
+    device = x.device.type
+    amp = torch.get_autocast_dtype(device) if torch.is_autocast_enabled(device) else None
+    y, _ = _tiled_rows_fwd(x.reshape(-1, x.shape[-1]).contiguous(), params, n_tiles, amp)
+    return y.reshape(*lead, y.shape[-1])
 
 
 AUTO_MIN_SAVING_MIB = 512
@@ -698,10 +1031,29 @@ def _attach(module, spec, plan, budget_cache):
     state = d["_unsloth_tiling"] = _TileState(spec, plan, hidden, _infer_intermediate(module, hidden), nbytes, budget)
     state.in_widths = _input_widths(module)
     _random_verdict(module)
+    state.op_ok = _op_eligible(module, spec, hidden) and _op_ready() and _op_uses_every_parameter(module, hidden)
+    if state.op_ok:
+        own = [p for p in module.parameters() if p.requires_grad]
+        key = (own[0].device, own[0].data_ptr()) if own else None
+        for other in list(_OP_MODULES):
+            mine = [p for p in other.parameters() if p.requires_grad]
+            if mine and other is not module and (mine[0].device, mine[0].data_ptr()) == key:
+                # Distinct MLPs sharing trainable parameters: the op finds its module by those parameters and
+                # could run the other one's forward (other weights, or other settings on shared tensors).
+                state.op_ok = False
+                other.__dict__["_unsloth_tiling"].op_ok = False
+        if state.op_ok:
+            state.op_owner = weakref.ref(module)
+            state.op_tensors = tuple(weakref.ref(t) for t in itertools.chain(module.parameters(), module.buffers()))
+            _OP_MODULES.add(module)
+            _OP_VERSION[0] += 1
 
 
 def _detach(module):
     d = module.__dict__
+    if module in _OP_MODULES:
+        _OP_MODULES.discard(module)
+        _OP_VERSION[0] += 1
     inner = d.pop("_unsloth_forward", None)
     d.pop("_unsloth_tiling", None)
     d.pop("_unsloth_tiled_random", None)

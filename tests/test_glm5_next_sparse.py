@@ -333,7 +333,9 @@ def test_tiny_model_logits_and_grads_match_upstream(monkeypatch, seq, attn):
         torch.testing.assert_close(out * valid, ref_out * valid, atol = 1e-5, rtol = 1e-5)
     assert ref_grads.keys() == grads.keys()
     for name in ref_grads:
-        torch.testing.assert_close(grads[name], ref_grads[name], atol = 1e-5, rtol = 1e-4, msg = name)
+        torch.testing.assert_close(
+            grads[name], ref_grads[name], atol = 1e-5, rtol = 1e-4, msg = lambda report, name = name: f"{name}: {report}"
+        )
     if seq == 60:
         assert _stat("skip_full") == 2 and _stat("flex") == 0
     else:
@@ -517,8 +519,18 @@ def test_flex_grads_match_upstream_on_an_empty_real_selection(monkeypatch, attn)
     valid = mask[..., None]
     torch.testing.assert_close(out * valid, ref_out * valid, atol = 1e-5, rtol = 1e-5)
     assert ref_grads.keys() == grads.keys()
+    # A str msg would replace assert_close's report (mismatch count, greatest differences); keep it, for every parameter.
+    # The summed loss puts these gradients in the hundreds, where fp32 reduction order alone moves an element by up
+    # to ~4e-6 of the parameter's largest gradient (5e-4 absolute over 12 seeds): a fixed atol of 1e-4 sat on that
+    # floor and failed on one element per run on some CI hosts. Scale atol with the parameter instead.
+    mismatched = []
     for name in ref_grads:
-        torch.testing.assert_close(grads[name], ref_grads[name], atol = 1e-4, rtol = 1e-4, msg = name)
+        atol = 2e-5 * max(1.0, ref_grads[name].abs().max().item())
+        try:
+            torch.testing.assert_close(grads[name], ref_grads[name], atol = atol, rtol = 1e-4)
+        except AssertionError as error:
+            mismatched.append(f"{name}: {error}")
+    assert not mismatched, "\n\n".join(mismatched)
     if attn == "sdpa":
         assert _stat("flex") == 3
     else:

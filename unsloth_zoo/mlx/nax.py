@@ -110,6 +110,10 @@ _GAPS = {
     "small_m_qmm_simd": Gap(open_in = ("0.32.3", "0.32.4"), closed_on_main = False),
     # MLX's sorted gather kernel runs 32-row tiles below 64 rows per expert, with two barriers per K step.
     "sorted_gather_qmm": Gap(open_in = ("0.32.3", "0.32.4"), closed_on_main = False),
+    # Without NAX, training-sized qmm runs 32x32 tiles; 64x64 ones (open PR 4826) or a dense GEMM run faster.
+    "dense_train_qmm": Gap(open_in = ("0.32.4",), closed_on_main = False),
+    # On NAX, training-sized qmm_t loads each weight tile only after the last multiplied; staged loads (4682) overlap.
+    "staged_train_qmm": Gap(open_in = ("0.32.4",), closed_on_main = True),
 }
 
 
@@ -1067,7 +1071,7 @@ def _sorted_gather_qmm(x, w, scales, biases, group_size, bits, indices, token_ro
 _SORTED_GATHER_ROWS_BY_GPU = {17: {4: (4, 128), 8: (4, 128)}}
 # Below these rows per expert and per call MLX runs per-row kernels, which round differently.
 _SORTED_GATHER_STOCK_MIN_ROWS, _SORTED_GATHER_STOCK_MIN_CALL = 4, 16
-# Past this the stock reference drops `sorted_indices` (ml-explore/mlx#3856): first-use checks would not cover it.
+# Stock sorted gather_qmm was wrong past this before mlx 0.32.3 (ml-explore/mlx#3856); unmeasured beyond it.
 _SORTED_GATHER_MAX_CALL = 32768
 
 

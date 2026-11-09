@@ -873,7 +873,7 @@ def unsloth_train(trainer):
     # Mixed precision scaling
     _amp_device = DEVICE_TYPE_TORCH if DEVICE_TYPE in ("xpu", "npu") else "cuda"
     torch_version = torch.__version__
-    config_dtype = dtype_from_config(model.config)
+    config_dtype = _get_dtype(dtype_from_config(model.config))
     if config_dtype == torch.float16:
         mixed_precision = "fp16"
         mixed_dtype = torch.float16

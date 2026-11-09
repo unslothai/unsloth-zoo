@@ -15,8 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Sizes hf_xet buffers from cgroup-aware RAM and cores as HF_XET_* env vars with setdefault semantics;
-HF_XET_HIGH_PERFORMANCE raises the cap to 64GB and discards explicit caps; bounding memory needs it off; durations
-need a unit suffix"""
+HF_XET_HIGH_PERFORMANCE raises the cap to 64GB, so bounding memory needs it off; durations need a unit suffix"""
 
 from __future__ import annotations
 
@@ -298,14 +297,16 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
-# Shortened Xet timeouts are safe only in a supervised child; the memory-bound caps are voided by high-performance mode,
-# so applying them anyway shrinks the transfer while xet-core ignores the limit, slower than either clean choice.
+# Dropped under a user's high-performance flag: xet-core >= 1.7 applies env after the preset, so a kept key beats it.
 _CAPS_VOIDED_BY_HIGH_PERFORMANCE = (
     "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT",
     "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE",
     "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE",
     "HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER",
     "HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS",
+    "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY",
+    "HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY",
+    "HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY",
 )
 
 _FAIL_FAST_KEYS = (
@@ -380,7 +381,7 @@ def xet_env_overrides(
         "HF_XET_CLIENT_RETRY_MAX_DURATION": "30s",
         # The chunk cache only pays off when re-fetching known chunks; upstream default is already 0, pinned so a stray value cannot raise it.
         "HF_XET_CHUNK_CACHE_SIZE_BYTES": "0",
-        # Applied AFTER the env in xet-core, so leaving this on would discard every cap above.
+        # The preset raises the buffers to 64GB, voiding the caps above on xet-core <= 1.6.
         "HF_XET_HIGH_PERFORMANCE": "0",
         "HF_XET_HP": "0",
     }
@@ -427,10 +428,8 @@ def apply_xet_env(
 
     ``setdefault`` semantics: a user-set variable is left alone, so a shell's
     ``HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT=16gb`` still wins -- and that now includes
-    ``HF_XET_HIGH_PERFORMANCE``. Enabling it is a deliberate act by someone who knows their machine,
-    and since xet-core applies it AFTER reading the environment it voids the caps rather than
-    competing with them, so the honest response is to stand down: we drop the caps it would have
-    discarded and leave the flag alone. Measured on a 192-core / 1996 GiB box, overriding it cost
+    ``HF_XET_HIGH_PERFORMANCE``, so our sizing (``_CAPS_VOIDED_BY_HIGH_PERFORMANCE``) stands
+    down and the flag is left alone. Measured on a 192-core / 1996 GiB box, overriding it cost
     2.55x download throughput (16684 -> 6553 Mbit/s), to defend RAM that machine was never short of.
     Set ``UNSLOTH_XET_FORCE_CAPS=1`` to get the old behaviour and cap a machine regardless.
 
@@ -455,8 +454,8 @@ def apply_xet_env(
     primary, alias = XET_HIGH_PERFORMANCE_VARS
     user_wants_hp = _is_true(target[primary]) if primary in target else _is_true(target.get(alias))
     forcing_caps = _is_true(os.environ.get("UNSLOTH_XET_FORCE_CAPS"))
-    # Either the user's flag wins and our sizing stands down, or the caps win and the flag must be turned off, since
-    # xet-core reads it last and would void them; overwritable lists the values we may replace when already set.
+    # Either the user's flag wins and our sizing stands down, or the caps win and the flag is turned off (xet-core <= 1.6
+    # would otherwise void them); overwritable lists the values we may replace when already set.
     overwritable: tuple = ()
     if user_wants_hp and not forcing_caps:
         for var in (*XET_HIGH_PERFORMANCE_VARS, *_CAPS_VOIDED_BY_HIGH_PERFORMANCE):
