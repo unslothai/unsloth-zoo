@@ -45,14 +45,14 @@ def layer_norm_gated_fwd_kernel(
     eps,  # epsilon to avoid division by zero
     T,  # number of rows in x
     D: tl.constexpr,  # number of columns in x
-    BT: tl.constexpr,
-    BD: tl.constexpr,
-    ACTIVATION: tl.constexpr,
-    IS_RMS_NORM: tl.constexpr,
-    STORE_RESIDUAL_OUT: tl.constexpr,
-    HAS_RESIDUAL: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
+    BT: tl.constexpr,  # rows per program
+    BD: tl.constexpr,  # block along D
+    ACTIVATION: tl.constexpr,  # activation name
+    IS_RMS_NORM: tl.constexpr,  # rmsnorm, not layernorm
+    STORE_RESIDUAL_OUT: tl.constexpr,  # write residual out
+    HAS_RESIDUAL: tl.constexpr,  # residual given
+    HAS_WEIGHT: tl.constexpr,  # norm weight given
+    HAS_BIAS: tl.constexpr,  # bias given
 ):
     i_t = tl.program_id(0).to(tl.int64)
 
@@ -132,13 +132,13 @@ def layer_norm_gated_fwd_kernel1(
     rstd,  # pointer to the 1/std
     eps,  # epsilon to avoid division by zero
     D: tl.constexpr,  # number of columns in x
-    BD: tl.constexpr,
-    ACTIVATION: tl.constexpr,
-    IS_RMS_NORM: tl.constexpr,
-    STORE_RESIDUAL_OUT: tl.constexpr,
-    HAS_RESIDUAL: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
+    BD: tl.constexpr,  # block along D
+    ACTIVATION: tl.constexpr,  # activation name
+    IS_RMS_NORM: tl.constexpr,  # rmsnorm, not layernorm
+    STORE_RESIDUAL_OUT: tl.constexpr,  # write residual out
+    HAS_RESIDUAL: tl.constexpr,  # residual given
+    HAS_WEIGHT: tl.constexpr,  # norm weight given
+    HAS_BIAS: tl.constexpr,  # bias given
 ):
     i_t = tl.program_id(0)
     x += i_t * D
@@ -218,16 +218,16 @@ def layer_norm_gated_bwd_kernel(
     rstd,
     T,
     BS,
-    D: tl.constexpr,
-    BT: tl.constexpr,
-    BD: tl.constexpr,
-    ACTIVATION: tl.constexpr,
-    IS_RMS_NORM: tl.constexpr,
-    STORE_DRESIDUAL: tl.constexpr,
-    HAS_DRESIDUAL: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    RECOMPUTE_OUTPUT: tl.constexpr,
+    D: tl.constexpr,  # hidden dim
+    BT: tl.constexpr,  # rows per program
+    BD: tl.constexpr,  # block along D
+    ACTIVATION: tl.constexpr,  # activation name
+    IS_RMS_NORM: tl.constexpr,  # rmsnorm, not layernorm
+    STORE_DRESIDUAL: tl.constexpr,  # write residual grad
+    HAS_DRESIDUAL: tl.constexpr,  # residual grad given
+    HAS_WEIGHT: tl.constexpr,  # norm weight given
+    HAS_BIAS: tl.constexpr,  # bias given
+    RECOMPUTE_OUTPUT: tl.constexpr,  # recompute y in backward
 ):
     i_s = tl.program_id(0)
     o_d = tl.arange(0, BD)
@@ -348,15 +348,15 @@ def layer_norm_gated_bwd_kernel1(
     rstd,
     T,
     BS,
-    D: tl.constexpr,
-    BD: tl.constexpr,
-    ACTIVATION: tl.constexpr,
-    IS_RMS_NORM: tl.constexpr,
-    STORE_DRESIDUAL: tl.constexpr,
-    HAS_DRESIDUAL: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    RECOMPUTE_OUTPUT: tl.constexpr,
+    D: tl.constexpr,  # hidden dim
+    BD: tl.constexpr,  # block along D
+    ACTIVATION: tl.constexpr,  # activation name
+    IS_RMS_NORM: tl.constexpr,  # rmsnorm, not layernorm
+    STORE_DRESIDUAL: tl.constexpr,  # write residual grad
+    HAS_DRESIDUAL: tl.constexpr,  # residual grad given
+    HAS_WEIGHT: tl.constexpr,  # norm weight given
+    HAS_BIAS: tl.constexpr,  # bias given
+    RECOMPUTE_OUTPUT: tl.constexpr,  # recompute y in backward
 ):
     i_s = tl.program_id(0)
     o_d = tl.arange(0, BD)
