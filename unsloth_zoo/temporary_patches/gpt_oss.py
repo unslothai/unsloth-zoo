@@ -40,7 +40,7 @@ from .common import (
     logger,
 )
 from importlib.metadata import version as importlib_version
-from unsloth_zoo.utils import Version
+from unsloth_zoo.utils import Version, _class_source
 from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
 try:
     from .moe_router_triton import fused_route_or_none as _fused_route_or_none
@@ -4442,8 +4442,8 @@ try:
             return raise_error("transformers.models.gpt_oss.configuration_gpt_oss", e)
 
         try:
-            current_class = dedent(inspect.getsource(transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig))
-            new_class = dedent(inspect.getsource(Old_GptOssConfig))
+            current_class = dedent(_class_source(transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig))
+            new_class = dedent(_class_source(Old_GptOssConfig))
             new_class = new_class.replace("Old_GptOssConfig", "GptOssConfig")
             if new_class == current_class:
                 logger.info("Unsloth: Updating GPT OSS Config to fix missing `max_position_embeddings`")
