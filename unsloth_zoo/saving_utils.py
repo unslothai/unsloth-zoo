@@ -1067,9 +1067,12 @@ def _merge_and_overwrite_lora(
     biases = None,
     vocab_modules = None,
     fp8_header_cache = None,
+    source_path = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Merges LoRA and overwrites the safetensors file it was merged to
+    # Merges LoRA and overwrites the safetensors file it was merged to.
+    # With source_path the shard is not in the export yet: it is written once, from source_path
+    # (_SinglePassShardWriter), instead of being copied in and then overwritten.
     if base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4":
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("mxfp4 quantized model detected. Using safe rewrite strategy (requires temporary disk space).")
@@ -1117,17 +1120,21 @@ def _merge_and_overwrite_lora(
     length_of_header = 0
 
     try:
-        _ensure_shard_writable(filename_original)
-        # Memory-map for in-place overwrite
-        raw_pointer = open(filename_original, "r+b")
-        mm = mmap.mmap(raw_pointer.fileno(), length = 0, access = mmap.ACCESS_WRITE)
+        if source_path is not None:
+            mm = _SinglePassShardWriter(source_path, filename_original)
+            length_of_header, header_metadata = mm.length_of_header, mm.header_metadata
+        else:
+            _ensure_shard_writable(filename_original)
+            # Memory-map for in-place overwrite
+            raw_pointer = open(filename_original, "r+b")
+            mm = mmap.mmap(raw_pointer.fileno(), length = 0, access = mmap.ACCESS_WRITE)
 
-        # Parse safetensors header
-        length_of_header = int.from_bytes(mm.read(8), "little")
-        header_metadata = json.loads(mm.read(length_of_header))
-        mm.seek(0)
+            # Parse safetensors header
+            length_of_header = int.from_bytes(mm.read(8), "little")
+            header_metadata = json.loads(mm.read(length_of_header))
+            mm.seek(0)
 
-        with safe_open(filename_original, framework = "pt", device = "cpu") as file:
+        with safe_open(filename_original if source_path is None else source_path, framework = "pt", device = "cpu") as file:
             safetensor_keys = list(file.keys())
             safetensor_keys_seen.update(safetensor_keys)
             bias_overrides = _get_bias_overrides(biases, safetensor_keys, model_class_name)
@@ -1397,9 +1404,12 @@ def _merge_and_overwrite_lora(
                     device_empty_cache()
             pass
         pass
-        mm.flush()
-        mm.close()
-        raw_pointer.close()
+        if source_path is not None:
+            mm.commit()
+        else:
+            mm.flush()
+            mm.close()
+            raw_pointer.close()
 
         # Vocab grew -> resized tensors no longer fit their byte slots; rewrite the
         # shard. Stream to a temp file when disk allows, else rewrite in place.
@@ -5593,6 +5603,27 @@ def merge_and_overwrite_lora(
         pass
     pass
 
+    # A plain 16-bit merge writes each output shard once, from its source (_SinglePassShardWriter),
+    # instead of copying the base shard in and rewriting the merged tensors over the copy. The
+    # paths that rewrite, split, widen or dequantize a staged shard, MoE experts, nested names and
+    # a link at the output entry keep the copy. UNSLOTH_MERGE_SINGLE_PASS=0 keeps it everywhere.
+    _single_pass_merge = (
+        save_method == "merged_16bit"
+        and not base_model_is_quantized
+        and not _is_quant_dequant
+        and not _ct_dequant
+        and _ct_packed_format is None
+        and not needs_splitting
+        and not upcast_to_float32
+        and not any(isinstance(k, str) and (".experts" in k or ".moe" in k) for k in lora_weights)
+        and os.environ.get("UNSLOTH_MERGE_SINGLE_PASS", "1") != "0"
+    )
+    _deferred_sources = {}
+    def _defers_copy(filename):
+        if not _single_pass_merge or _has_directory_component(filename): return False
+        output_path = os.path.join(save_directory, filename)
+        return not os.path.islink(output_path) and not os.path.isdir(output_path)
+
     _replaced_shards = []
     try:
         # Step 4 : Handle retrieval of original 16-bit shards and tokenizer.model file if exists
@@ -5608,6 +5639,8 @@ def merge_and_overwrite_lora(
                     token = token,
                     revision = _hub_revision,
                     copied = _copied_from_cache,
+                    defer = _defers_copy,
+                    deferred = _deferred_sources,
                 )
             finally:
                 _replaced_shards.extend(f for f in _copied_from_cache if f in _stale_shards)
@@ -5675,7 +5708,10 @@ def merge_and_overwrite_lora(
             # Only download if we didn't get everything from cache AND this specific file doesn't exist
             # AND we're in low disk space mode
             # For local models, copy the file if needed
-            if _replace_from_local:
+            if _replace_from_local and _defers_copy(filename):
+                # Written from the local base shard by the merge loop below.
+                _deferred_sources[filename] = local_file_path
+            elif _replace_from_local:
                 # A nested name has no parent here yet, so the copy would raise
                 # FileNotFoundError. The name is known to stay inside LEXICALLY, no
                 # stronger: a symlinked component still resolves wherever it points.
@@ -5831,6 +5867,7 @@ def merge_and_overwrite_lora(
         tie_word_embeddings = _merge_tie_word_embeddings,
         count_packed_mxfp4 = _count_packed_mxfp4,
         disk = _disk_view,
+        sources = _deferred_sources,
     )
 
     # FP8 MoE-expert LoRA + merged_16bit: the dense FP8 rewrite cannot fuse per-expert
@@ -5875,6 +5912,7 @@ def merge_and_overwrite_lora(
     _seeded_head_keys = _seed_unbacked_trained_tensors(
         save_directory, final_safetensors_list, lora_weights, _merge_model_class_name,
         output_dtype = output_dtype, tie_word_embeddings = _merge_tie_word_embeddings,
+        sources = _deferred_sources,
     ) if save_method == "merged_16bit" else {}
     if _seeded_head_keys:
         print(f"Unsloth: Writing {len(_seeded_head_keys)} trained tensor(s) absent from the "
@@ -5935,6 +5973,7 @@ def merge_and_overwrite_lora(
             biases = biases,
             vocab_modules = _vocab_modules,
             fp8_header_cache = _fp8_header_cache,
+            source_path = _deferred_sources.pop(filename, None),
         )
         n_saved_modules += merged_count
         safetensor_keys_seen.update(shard_keys)
@@ -6112,9 +6151,13 @@ def _try_copy_all_from_cache(
     token: Optional[str],
     revision: Optional[str] = None,
     copied: Optional[list] = None,
+    defer = None,
+    deferred: Optional[dict] = None,
 ) -> bool:
     """If ALL files exist in the HF cache, copy them into target_dir_str.
     Returns True on success, False otherwise. Names copied so far are appended to `copied`.
+    A name `defer(name)` accepts is not copied: its cached path goes into `deferred` for the
+    single-pass merge to write the output from (cleared again if the copy gives up).
     """
     from huggingface_hub.errors import LocalEntryNotFoundError
 
@@ -6169,8 +6212,18 @@ def _try_copy_all_from_cache(
         return False
 
     all_copied = True
+    _deferred_here = []
     for filename, cached_path in ProgressBar(cached_paths_map.items(), desc = f"Unsloth: Copying {len(filenames_to_check)} files from cache to `{target_dir_str}`"):
         try:
+            if defer is not None and deferred is not None and defer(filename):
+                # The checks the copy would make, so a bad cache entry still falls back here.
+                if not Path(cached_path).is_file():
+                    raise FileNotFoundError(f"Source {cached_path} is not a valid file.")
+                if not os.access(cached_path, os.R_OK):
+                    raise PermissionError(f"No read permission for source file: {cached_path}")
+                deferred[filename] = str(cached_path)
+                _deferred_here.append(filename)
+                continue
             # Pass string target_dir_str to copy helper
             _copy_file_from_source(cached_path, target_dir_str, filename)
             if copied is not None: copied.append(filename)
@@ -6186,6 +6239,7 @@ def _try_copy_all_from_cache(
         print(f"Successfully copied all {len(filenames_to_check)} files from cache to `{target_dir_str}`")
         return True
     else:
+        for filename in _deferred_here: deferred.pop(filename, None)
         print("Failed to copy one or more files from cache. Will proceed with downloading.")
         return False
 pass
@@ -7294,7 +7348,7 @@ def _prefix_deletion_candidates(key):
 pass
 
 
-def _disk_module_shapes(save_directory, safetensors_list):
+def _disk_module_shapes(save_directory, safetensors_list, sources = None):
     """`(every key in the staged shards, {module path : shape} for the `.weight` ones)`.
 
     The raw key set comes back too because the backing test needs names as written: rebuilding
@@ -7303,7 +7357,8 @@ def _disk_module_shapes(save_directory, safetensors_list):
     """
     keys, shapes = set(), {}
     for filename in safetensors_list or ():
-        path = os.path.join(save_directory, filename)
+        # A shard the single-pass merge has not written yet is read at its source.
+        path = (sources or {}).get(filename) or os.path.join(save_directory, filename)
         if not os.path.exists(path): continue
         try:
             with safe_open(path, framework = "pt", device = "cpu") as f:
@@ -7458,14 +7513,14 @@ pass
 
 def _check_lora_merge_is_complete(save_directory, safetensors_list, lora_weights,
                                   model_class_name, tie_word_embeddings = False,
-                                  count_packed_mxfp4 = True, disk = None):
+                                  count_packed_mxfp4 = True, disk = None, sources = None):
     """Refuse a silently partial merge before any staged shard is touched, returning what it
     found (empty means every LoRA-bearing module can be placed).
 
     NOT ahead of everything: on a push, Step 2 has already uploaded config.json and the
     tokenizer, since `final_safetensors_list` is built after that upload.
     """
-    disk_keys, disk_module_shapes = disk or _disk_module_shapes(save_directory, safetensors_list)
+    disk_keys, disk_module_shapes = disk or _disk_module_shapes(save_directory, safetensors_list, sources = sources)
     unresolved = _unresolved_lora_targets(
         lora_weights,
         disk_keys,
@@ -7555,7 +7610,7 @@ pass
 
 def _seed_unbacked_trained_tensors(save_directory, safetensors_list, lora_weights,
                                    model_class_name, output_dtype = None,
-                                   tie_word_embeddings = False):
+                                   tie_word_embeddings = False, sources = None):
     """Append the tensors `_unbacked_trained_tensors` finds into a shard, returning their keys.
 
     Deliberately runs BEFORE the merge loop: once the key is on disk, the in-place rewrite,
@@ -7563,9 +7618,10 @@ def _seed_unbacked_trained_tensors(save_directory, safetensors_list, lora_weight
     downstream stage needs to know a head was added.
     """
     if not safetensors_list: return {}
+    sources = {} if sources is None else sources
     shard_keys, sizes = set(), {}
     for filename in safetensors_list:
-        path = os.path.join(save_directory, filename)
+        path = sources.get(filename) or os.path.join(save_directory, filename)
         if not os.path.exists(path): continue
         with safe_open(path, framework = "pt", device = "cpu") as f:
             shard_keys.update(f.keys())
@@ -7600,16 +7656,19 @@ def _seed_unbacked_trained_tensors(save_directory, safetensors_list, lora_weight
             f"the save directory at a larger volume."
         )
 
-    with open(path, "rb") as f:
+    # A shard not written yet streams from its source, which writes it; the merge then rewrites it in place.
+    source = sources.get(target) or path
+    with open(source, "rb") as f:
         length_of_header = int.from_bytes(f.read(8), "little")
         header_metadata = json.loads(f.read(length_of_header))
     temp_path = path + ".unsloth_seed_tmp"
     try:
-        _stream_rewrite_resized_shard(path, temp_path, header_metadata, length_of_header, tensors)
+        _stream_rewrite_resized_shard(source, temp_path, header_metadata, length_of_header, tensors)
         os.replace(temp_path, path)
     except Exception:
         if os.path.exists(temp_path): os.remove(temp_path)
         raise
+    sources.pop(target, None)
     return {key : target for key in tensors}
 pass
 
@@ -9180,6 +9239,105 @@ def _stream_rewrite_resized_shard_and_replace(filename_original, temp_dir, heade
                 os.remove(tmp_path)
             except OSError:
                 pass
+
+
+class _SinglePassShardWriter:
+    """Writes an output shard in one pass from its source shard, in place of copy-then-mmap-overwrite.
+
+    Copying the base shard in and then rewriting every merged tensor over the copy writes most of
+    the shard twice. This takes the same `mm[a:b] = bytes` writes, copies the untouched source
+    bytes in front of each one (header included, verbatim) and fills the tail on commit, so the
+    file holds exactly the copy-then-overwrite bytes. safetensors orders data by key, as safe_open
+    lists it, so writes arrive in offset order; one behind the cursor lands over bytes already
+    copied, which is still correct. Staged beside the destination and os.replace'd in like the
+    copy was (owner-writable, the source's permission bits), and fsync'd first as mm.flush() did.
+    """
+    _CHUNK = 64 * 1024 * 1024
+
+    def __init__(self, source_path, destination):
+        self.source_path = str(source_path)
+        self.destination = destination
+        self._out = None
+        self._staging = None
+        self._src = open(self.source_path, "rb")
+        try:
+            self.size = os.fstat(self._src.fileno()).st_size
+            self.length_of_header = int.from_bytes(self._src.read(8), "little")
+            self.header_metadata = json.loads(self._src.read(self.length_of_header))
+            _fd, self._staging = tempfile.mkstemp(
+                dir = os.path.dirname(destination) or os.curdir, prefix = ".unsloth-copy-",
+            )
+            self._out = os.fdopen(_fd, "wb")
+        except BaseException:
+            self.close()
+            raise
+        self._cursor = 0
+        self._wrote = False
+        self._kernel_copy = hasattr(os, "copy_file_range")
+
+    def _copy_to(self, end):
+        start = self._cursor
+        if end <= start: return
+        if self._kernel_copy:
+            self._out.flush()
+            try:
+                while start < end:
+                    n = os.copy_file_range(self._src.fileno(), self._out.fileno(), end - start, start, start)
+                    if n <= 0: break
+                    start += n
+            except OSError:
+                self._kernel_copy = False
+        if start < end:
+            self._src.seek(start)
+            self._out.seek(start)
+            remaining = end - start
+            while remaining > 0:
+                chunk = self._src.read(min(self._CHUNK, remaining))
+                if not chunk:
+                    raise RuntimeError(f"Unsloth: unexpected EOF reading {self.source_path}")
+                self._out.write(chunk)
+                remaining -= len(chunk)
+        self._cursor = end
+
+    def __setitem__(self, index, data):
+        if not isinstance(index, slice) or index.step not in (None, 1):
+            raise TypeError("Unsloth: a shard write takes a contiguous slice")
+        start, stop = index.start, index.stop
+        data = memoryview(data).cast("B")
+        if start is None or stop is None or start < 0 or stop > self.size or stop - start != data.nbytes:
+            raise IndexError("Unsloth: shard write does not match the tensor's byte slot")
+        self._copy_to(start)
+        self._out.seek(start)
+        self._out.write(data)
+        self._cursor = max(self._cursor, stop)
+        self._wrote = True
+
+    def commit(self):
+        self._copy_to(self.size)
+        self._out.flush()
+        os.fsync(self._out.fileno())
+        self._out.close()
+        self._src.close()
+        # copy2's metadata, then the mtime bump an overwrite gave the copy.
+        shutil.copystat(self.source_path, self._staging)
+        st = os.stat(self._staging)
+        if self._wrote:
+            os.utime(self._staging, ns = (st.st_atime_ns, time.time_ns()))
+        os.chmod(self._staging, stat.S_IMODE(st.st_mode) | stat.S_IWUSR)
+        os.replace(self._staging, self.destination)
+        self._staging = None
+
+    def close(self):
+        # After commit a no-op; otherwise drops the staged file and leaves the destination as it was.
+        for handle in (self._out, self._src):
+            if handle is not None:
+                try: handle.close()
+                except Exception: pass
+        if self._staging is not None:
+            try: os.remove(self._staging)
+            except OSError: pass
+            self._staging = None
+pass
 
 
 def _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key, tensor, output_dtype):
