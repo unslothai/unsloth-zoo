@@ -249,7 +249,8 @@ def test_compiled_ce_bounds_runtime_logits(monkeypatch, explicit_chunk):
     _check_against_fp64(out, hidden, weight, labels)
     assert shapes, "No runtime logits projection was observed"
     assert max(shape[0] for shape in shapes) <= rows_per_chunk, shapes
-    assert sum(counters["graph_break"].values()) == 0
+    assert sum(counters["graph_break"].values()) == 0, dict(counters["graph_break"])
+    assert sum(counters["unimplemented"].values()) == 0, dict(counters["unimplemented"])
 
 
 @pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
