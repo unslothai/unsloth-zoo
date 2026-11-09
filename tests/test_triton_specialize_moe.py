@@ -6,30 +6,56 @@ scratch slices keep a fixed pointer alignment, so a new prefill length or batch 
 (w5_recompile G1: these kernels re-specialized with the same constexprs on Kaggle T4)."""
 
 import ast
+import inspect
 import pathlib
+import types
 
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1] / "unsloth_zoo"
 
 
-def test_helper_drops_alignment_only():
-    pytest.importorskip("triton")
-    import triton.language as tl
+def test_helper_drops_alignment_only(monkeypatch):
+    from unsloth_zoo import triton_specialize as ts
 
-    from unsloth_zoo.triton_specialize import jit_any_alignment
+    # Under TRITON_INTERPRET=1 triton.jit returns an InterpretedFunction, which keeps no params to inspect.
+    monkeypatch.setenv("TRITON_INTERPRET", "0")
 
-    @jit_any_alignment("T")
-    def kernel(x_ptr, T, N, BLOCK: tl.constexpr):  # BLOCK: elements per program
+    def kernel(x_ptr, T, N):
         pass
 
-    if not hasattr(kernel, "params"):  # TRITON_INTERPRET=1 returns an InterpretedFunction
-        pytest.skip("interpreted Triton function has no params")
-    params = {p.name: p for p in kernel.params}
-    if not hasattr(params["T"], "do_not_specialize_on_alignment"):
-        pytest.skip("this Triton has no do_not_specialize_on_alignment")
-    assert params["T"].do_not_specialize_on_alignment and not params["T"].do_not_specialize
-    assert not params["N"].do_not_specialize_on_alignment
+    built = ts.jit_any_alignment("T")(kernel)
+    if ts.triton is None:  # CPU-only torch wheels ship no Triton: the function comes back unbuilt
+        assert built is kernel
+        return
+    params = {p.name: p for p in built.params}
+    if "do_not_specialize_on_alignment" in inspect.signature(ts.triton.jit).parameters:
+        assert params["T"].do_not_specialize_on_alignment and not params["T"].do_not_specialize
+        assert not params["N"].do_not_specialize_on_alignment
+    else:
+        # A Triton without the option gets plain triton.jit, the behaviour before the helper.
+        assert not any(getattr(p, "do_not_specialize_on_alignment", False) for p in built.params)
+
+
+def test_helper_falls_back_to_plain_jit(monkeypatch):
+    import unsloth_zoo.triton_specialize as ts
+
+    calls = []
+
+    def old_jit(fn, **kwargs):  # a Triton whose jit has no do_not_specialize_on_alignment
+        calls.append(kwargs)
+        if kwargs:
+            raise TypeError("jit() got an unexpected keyword argument 'do_not_specialize_on_alignment'")
+        return ("jitted", fn)
+
+    def kernel():
+        pass
+
+    monkeypatch.setattr(ts, "triton", types.SimpleNamespace(jit = old_jit))
+    assert ts.jit_any_alignment("T")(kernel) == ("jitted", kernel)
+    assert calls == [{"do_not_specialize_on_alignment": ["T"]}, {}]
+    monkeypatch.setattr(ts, "triton", None)  # no Triton at all: the function is returned unbuilt
+    assert ts.jit_any_alignment("T")(kernel) is kernel
 
 
 EXPECTED = {
@@ -60,15 +86,35 @@ def test_token_counts_alignment_unspecialized(path):
     assert found == EXPECTED[path]
 
 
-def test_routing_scratch_slices_stay_aligned():
-    from unsloth_zoo.temporary_patches.moe_routing_triton import _route_scratch
+def test_routing_scratch_slices_stay_aligned(monkeypatch):
+    import torch
 
-    # The real allocation: every slice 16-byte aligned for any token block count and expert count.
-    for NB in range(1, 40):
-        for E in (7, 8, 31, 32, 128, 255):
-            hist, rank_base, starts = _route_scratch(NB, E, "cpu")
-            assert all(t.data_ptr() % 16 == 0 for t in (hist, rank_base, starts)), (NB, E)
-            assert hist.numel() >= NB * (E + 1) and rank_base.numel() >= NB * (E + 1) and starts.numel() == E + 1
+    from unsloth_zoo.temporary_patches import moe_routing_triton as mr
+
+    # Record the pointer alignment of every tensor the routing launch hands its kernels: a slice whose alignment
+    # follows the token count is a new Triton binary per prefill length.
+    misaligned = []
+
+    class _Recorder:
+        def __init__(self, name):
+            self.name = name
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                for i, a in enumerate(args):
+                    if isinstance(a, torch.Tensor) and a.data_ptr() % 16:
+                        misaligned.append((self.name, i, N, E))
+            return launch
+
+    for name in ("_route_single_kernel", "_route_hist_kernel", "_route_scan_kernel", "_route_starts_kernel",
+                 "_route_scatter_kernel"):
+        monkeypatch.setattr(mr, name, _Recorder(name), raising = False)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: None)  # CPU ids: launch on "this" device
+
+    for N in range(mr._SINGLE_BLOCK_MAX + 1, mr._SINGLE_BLOCK_MAX + 16 * mr._MULTI_BLOCK, 97):
+        for E in (7, 8, 32, 128, 255):
+            mr._launch(torch.zeros((N // 2, 2), dtype = torch.int64), E)
+    assert not misaligned, misaligned[:8]
 
 
 def test_nf4_grouped_row_counts_unspecialized():
