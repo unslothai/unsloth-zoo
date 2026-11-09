@@ -4286,14 +4286,10 @@ _PREVIOUS_EXPORT_METADATA_MAX = 64 * 1024 * 1024
 
 
 def _snapshot_previous_export_metadata(save_directory):
-    """Read the previous export's top level metadata before the refresh rewrites it.
+    """Snapshot the previous export's top level metadata (rewritten before any shard is fetched).
 
-    config.json, the index, the tokenizer and generation config are rewritten before any shard
-    is fetched, so a rollback of the shards alone would pair them with the new metadata.
-    Returns {"files": {path: (bytes, mode)}, "shards": set of shard paths}, with a top level
-    link recorded as {path: link target (str)} so the rollback puts the link back instead of
-    removing it. "shards" is every shard entry the previous export held, so the rollback can
-    remove the ones the refresh added. None when a file cannot be read, so no rollback is attempted.
+    {"files": {path: (bytes, mode) or link target}, "shards": previous shard entries}, or None
+    when a file cannot be read (no rollback then).
     """
     # Absolute, as the rollback lists the folder holding the backup, which mkdtemp returns absolute.
     save_directory = os.path.abspath(save_directory)
@@ -4332,15 +4328,10 @@ pass
 
 
 def _keep_previous_export_shards(filenames, save_directory, new_sizes, metadata = {"files" : {}, "shards" : None}, scratch = 0):
-    """Hard-link each previous export shard aside so a failed refresh can put it back.
+    """Hard-link each previous shard into a private dir (numbered names) so a failed refresh can restore it.
 
-    Every writer stages the new shard and renames it over the old entry, so the link keeps
-    the old shard's data and costs nothing until then. Kept only when the disk can hold
-    every new shard beside the old ones, and only for all shards or none: a partial rollback
-    would still leave a mixed export. The links go in a private directory under numbered
-    names, so no shard name can collide with a backup. `metadata` is the snapshot taken
-    before the refresh rewrote it, restored with the shards; None (unreadable) keeps nothing.
-    `scratch` is extra space the refresh needs on top (the split pieces of the largest shard).
+    Writers rename new shards over old entries, so links cost nothing until then. All shards or none
+    (a partial rollback is still mixed), and only when the disk holds every new shard plus `scratch`.
     """
     if metadata is None:
         return {}
