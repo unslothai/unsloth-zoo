@@ -294,9 +294,10 @@ def _mask_function_identity(fn, depth = 4):
     out = []
 
     def walk(f, depth):
-        code = getattr(f, "__code__", None)
-        if depth <= 0 or code is None or not callable(f):
+        # Plain functions only: a bound method's __self__, a partial or a callable object carries state no key sees.
+        if depth <= 0 or type(f) is not types.FunctionType:
             return False
+        code = f.__code__
         out.append(f"{code.co_filename}:{code.co_firstlineno}:{getattr(code, 'co_qualname', code.co_name)}:{_code_digest(code)}")
         values = []
         for cell in getattr(f, "__closure__", None) or ():
