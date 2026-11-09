@@ -211,3 +211,75 @@ def test_fully_ignored_fp16_overflow_stays_finite_in_eager():
     loss.backward()
     assert loss.item() == 0.0
     assert torch.equal(hidden.grad, torch.zeros_like(hidden.grad))
+
+
+@pytest.mark.parametrize("explicit_chunk", [True, False])
+def test_compiled_ce_bounds_runtime_logits(monkeypatch, explicit_chunk):
+    from torch._dynamo.backends.common import aot_autograd
+    from torch._functorch.aot_autograd import make_boxed_func
+    from unsloth_zoo.cpu.ops import chunked_linear_cross_entropy
+
+    torch._dynamo.reset()
+    counters.clear()
+    rows_per_chunk = 4 if explicit_chunk else 16
+    monkeypatch.setenv("UNSLOTH_CPU_CE_CHUNK_ELEMENTS", str(16 * 13))
+    shapes = []
+
+    def compiler(gm, inputs):
+        def execute(*args):
+            # Profile only the runtime callable, including opaque custom-op internals.
+            with torch.profiler.profile(activities = [torch.profiler.ProfilerActivity.CPU],
+                                        record_shapes = True) as prof:
+                result = gm(*args)
+            for event in prof.events():
+                if event.name == "aten::mm" and event.input_shapes[1] == [8, 13]:
+                    shapes.append((event.input_shapes[0][0], 13))
+            return result
+        return make_boxed_func(execute)
+
+    def loss(h, w, y):
+        return chunked_linear_cross_entropy(h, w, y, num_items_in_batch = 8,
+                                            chunk_rows = 4 if explicit_chunk else None)
+
+    compiled = torch.compile(loss, fullgraph = True, dynamic = False,
+                             backend = aot_autograd(fw_compiler = compiler, bw_compiler = compiler))
+    hidden, weight, labels = _inputs(65, masked = True, batch = 1)
+    out = compiled(hidden, weight, labels)
+    out.backward()
+    _check_against_fp64(out, hidden, weight, labels)
+    assert shapes, "No runtime logits projection was observed"
+    assert max(shape[0] for shape in shapes) <= rows_per_chunk, shapes
+    assert sum(counters["graph_break"].values()) == 0, dict(counters["graph_break"])
+    assert sum(counters["unimplemented"].values()) == 0, dict(counters["unimplemented"])
+
+
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("train_weight", [False, True])
+def test_compiled_ce_keeps_cpu_autocast(backend, dtype, train_weight):
+    # Without the caller's autocast restored, a 16-bit hidden state meets the fp32 head weight (dtype mismatch).
+    from unsloth_zoo.cpu.ops import chunked_linear_cross_entropy
+    torch._dynamo.reset()
+    torch.manual_seed(0)
+    h = torch.randn(1, 9, 8).to(dtype).requires_grad_()
+    w = torch.randn(13, 8).requires_grad_(train_weight)
+    y = torch.randint(13, (1, 9))
+
+    def loss(h, w, y):
+        return chunked_linear_cross_entropy(h, w, y, chunk_rows = 4)
+
+    def run(fn):
+        h.grad = None
+        w.grad = None
+        with torch.autocast("cpu", dtype = dtype):
+            out = fn(h, w, y)
+        out.backward()
+        return out.detach(), h.grad.clone(), None if w.grad is None else w.grad.clone()
+
+    want = run(loss)
+    got = run(torch.compile(loss, fullgraph = True, backend = backend))
+    for a, b in zip(got, want):
+        if b is None:
+            assert a is None
+        else:
+            torch.testing.assert_close(a.float(), b.float(), rtol = 1e-2, atol = 1e-2)
