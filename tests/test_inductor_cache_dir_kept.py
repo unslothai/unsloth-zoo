@@ -26,7 +26,10 @@ def test_inductor_resolves_the_kept_directory(monkeypatch, tmp_path):
     chosen = str(tmp_path / "persistent_inductor")
     monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", chosen)
     _run_patch_torch_compile()
-    from torch._inductor.runtime.cache_dir_utils import cache_dir
+    try:
+        from torch._inductor.runtime.cache_dir_utils import cache_dir
+    except ImportError:  # torch < 2.6
+        from torch._inductor.runtime.runtime_utils import cache_dir
     assert os.path.realpath(cache_dir()) == os.path.realpath(chosen)
 
 
