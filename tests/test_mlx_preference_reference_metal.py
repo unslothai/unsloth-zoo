@@ -198,3 +198,138 @@ def test_a_qualified_vision_plan_is_surveyed_and_planned_for_compile():
     Plan.pixel_width = 16
     with pytest.raises(RuntimeError, match="drifted from its surveyed compile family"):
         plan.materialize(1, phase="single")
+    # Global-norm clipping with accumulation compiles through the shared update, so it still plans.
+    args = MLXDPOConfig(max_steps=1, gradient_accumulation_steps=2, max_grad_norm=1.0)
+    plan = Plan(
+        [row(20, False), row(50, True)], [[0], [1]], processor=None, model_config={},
+        normalizers=[(1, 1, 1)] * 2, cycle_length=2, max_seq_length=64, pad_id=0)
+    assert planned(SimpleNamespace(enabled=True))[1:3] == (plan._shape_plan.report, True)
+
+
+def _tiny_gemma4_vlm(seed):
+    from mlx_vlm.models import gemma4
+
+    mx.random.seed(seed)
+    return gemma4.Model(gemma4.ModelConfig(image_token_id=500, vocab_size=512, text_config=gemma4.TextConfig(
+        hidden_size=64, intermediate_size=64, num_hidden_layers=2, num_attention_heads=2, head_dim=32, global_head_dim=64, vocab_size=512,
+        vocab_size_per_layer_input=512, hidden_size_per_layer_input=16, num_kv_shared_layers=0), vision_config=gemma4.VisionConfig(hidden_size=32,
+        intermediate_size=64, num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2, head_dim=16, global_head_dim=16, position_embedding_size=16)))
+
+
+def _tiny_vision_batches(objective):
+    """Two rows of an image pooled to 4 tokens per branch (chosen/rejected, or completion/KL), laid out as _vision_batch does."""
+    ids, pixels = mx.array([[3, *[500] * 4, 7, 8 + row, 9] for row in range(4)]), mx.random.normal((2, 3, 96, 96))
+    if objective == "dpo":
+        return {"input_ids": ids, "pixel_values": mx.concatenate([pixels] * 2), "_unsloth_image_copies": 2}, {}
+    return {"input_ids": ids[:2], "pixel_values": pixels}, {"kl_batch": {"input_ids": ids[2:], "pixel_values": pixels}}
+
+
+@pytest.mark.parametrize("objective", ["dpo", "kto"])
+@pytest.mark.parametrize("tower", ["frozen", "trained", "adapted", "overridden", "neftune", "ref_model"])
+def test_vision_preference_reuses_image_features_exactly(tower, objective, monkeypatch):
+    import types, mlx.nn as nn, mlx.utils
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx import preference, utils
+
+    model = _tiny_gemma4_vlm(0)
+    batch, kl = _tiny_vision_batches(objective)
+    attention = model.language_model.model.layers[0].self_attn
+    text = attention.q_proj = LoRALinear.from_base(attention.q_proj, r=2)
+    vision = model.embed_vision.embedding_projection = LoRALinear.from_base(model.embed_vision.embedding_projection, r=2)
+    for lora in (text, vision):
+        lora.lora_b = mx.full(lora.lora_b.shape, 0.1)
+    model.freeze()
+    model.language_model.model.norm.unfreeze()
+    if tower == "trained":
+        model.vision_tower.unfreeze()
+    # Every reference drops the text adapter, so policy and reference differ from the first step.
+    reference = {
+        "adapted": dict(scales=[(text, 0.0), (vision, 0.0)]),
+        "overridden": dict(scales=[(text, 0.0)], overrides=[(vision, "lora_b", mx.zeros_like(vision.lora_b))]),
+        "neftune": dict(scales=[(text, 0.0)], neftune_modules=[vision]),
+        "ref_model": dict(model=_tiny_gemma4_vlm(1)),
+    }.get(tower, dict(scales=[(text, 0.0)]))
+    policy = preference.ReferencePolicy(**reference)
+    fn = getattr(preference, f"make_{objective}_loss_fn")(preference.resolve_preference_objective(objective, beta=0.1, loss_type=(
+        "kto" if objective == "kto" else "sigmoid")), reference_policy=policy)
+    args = [mx.array(value) for value in ([[6, 8]] * 4, [0, 2, 1], [True, False])][:2 + (objective == "kto")]
+    if objective == "dpo":
+        # One copy's features repeated for both branches, one row per image token.
+        tiled = utils._vlm_image_features(model, batch, 2)
+        assert tiled.shape[-2] == (batch["input_ids"] == 500).sum().item() == 16 and mx.array_equal(tiled[:, :8], tiled[:, 8:]).item()
+    rows, call = [], type(model.vision_tower).__call__
+    monkeypatch.setattr(type(model.vision_tower), "__call__", lambda self, x, *a, **k: rows.append(len(x)) or call(self, x, *a, **k))
+    # A KTO precompute scores the same split dicts, one chunk of two rows.
+    plan = types.SimpleNamespace(rows=[0, 1], pack=lambda chunk: (None, [[6, 8]] * 4), set_reference_logps=lambda table: None,
+                                 _scored_inputs=lambda *_a, **_k: [batch, kl["kl_batch"]])
+
+    def step():
+        rows.clear()
+        loss, grads = nn.value_and_grad(model, lambda: fn(model, batch, *args, **kl)[0])()
+        mx.eval(loss, grads)
+        tower_rows = sum(rows)
+        rows.clear()
+        table = mx.array(preference.precompute_reference_logps(plan, model, policy, batch_size=2)) if kl else None
+        return types.SimpleNamespace(loss=loss, grads=dict(mlx.utils.tree_flatten(grads)), tower_rows=tower_rows,
+                                     precompute_rows=sum(rows), table=table)
+
+    reused = step()
+    monkeypatch.setattr(utils, "_VLM_IMAGE_ENCODERS", {})
+    recomputed = step()
+    assert "cached_image_features" not in {**batch, **kl.get("kl_batch", {})}
+    # Today every forward runs the tower: 4 forwards x 2 images. KTO's KL forwards read their completion's features.
+    assert recomputed.tower_rows == 8 and reused.tower_rows == (2 if tower == "frozen" else 4)
+    if kl:
+        assert recomputed.precompute_rows == 4 and reused.precompute_rows == 2
+        assert mx.allclose(reused.table, recomputed.table, rtol=1e-6, atol=0).item()
+    assert abs(recomputed.loss.item() - (0.6931472 if objective == "dpo" else 0.5)) > 1e-3
+    assert reused.grads.keys() == recomputed.grads.keys()
+    assert mx.allclose(reused.loss, recomputed.loss, rtol=1e-6, atol=0).item() and all(
+        mx.allclose(grad, recomputed.grads[path], rtol=1e-5, atol=1e-7).item() for path, grad in reused.grads.items())
+
+
+def test_vision_image_features_refuse_active_dropout():
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx import utils
+
+    model = _tiny_gemma4_vlm(0)
+    lora = model.embed_vision.embedding_projection = LoRALinear.from_base(model.embed_vision.embedding_projection, r=2, dropout=0.5)
+    batch, _ = _tiny_vision_batches("dpo")
+    # Each copy must draw its own mask, so the batch keeps a tower run per copy.
+    assert utils._vlm_image_encoder(model) is None and utils._vlm_image_features(model, batch, 2) is None
+    model.eval()
+    assert utils._vlm_image_encoder(model) is not None
+    model.train()
+    # Toggled in place, as PreferenceRunContext.restore() does, with no change of mode or frozen keys.
+    lora.dropout._p_1 = 1.0
+    assert utils._vlm_image_encoder(model) is not None
+    lora.dropout._p_1 = 0.5
+    assert utils._vlm_image_encoder(model) is None
+
+
+def test_qwen35_image_features_match_the_tower_over_every_copy():
+    from mlx_vlm.models.qwen3_5 import config, qwen3_5
+    from unsloth_zoo.mlx import utils
+
+    mx.random.seed(0)
+    model = qwen3_5.Model(config.ModelConfig(
+        model_type="qwen3_5", vocab_size=64, image_token_id=60, video_token_id=61, vision_start_token_id=62, vision_end_token_id=63,
+        text_config=config.TextConfig(model_type="qwen3_5", hidden_size=32, intermediate_size=64, linear_num_value_heads=2,
+                                      linear_num_key_heads=2, linear_key_head_dim=16, linear_value_head_dim=16, linear_conv_kernel_dim=4,
+                                      num_hidden_layers=1, num_attention_heads=2, rms_norm_eps=1e-6, vocab_size=64, num_key_value_heads=1,
+                                      max_position_embeddings=128, head_dim=16),
+        vision_config=config.VisionConfig(depth=1, hidden_size=32, intermediate_size=64, out_hidden_size=32, num_heads=2, patch_size=16,
+                                          num_position_embeddings=64)))
+    model.vision_tower.set_dtype(mx.bfloat16)
+    # Per copy, one row of two images of 16 and 32 patches merged 2x2 into 4 + 8 tokens; float32 pixels as the processor returns them.
+    grid, pixels = mx.array([[1, 4, 4], [1, 4, 8]]), mx.random.normal((48, 3 * 2 * 16 * 16))
+    ids = mx.array([[62, *[60] * 4, 63, 62, *[60] * 8, 63, 5, 6]] * 2)
+    batch = {"input_ids": ids, "pixel_values": mx.concatenate([pixels] * 2), "image_grid_thw": mx.concatenate([grid] * 2)}
+    features = utils._vlm_image_features(model, batch, 2)
+    expected = model.vision_tower(batch["pixel_values"].astype(mx.bfloat16), batch["image_grid_thw"])[0]
+    assert features.dtype == expected.dtype == mx.bfloat16 and features.shape == expected.shape == (24, 32)
+    # Through the embedder's cached-features path, as the preference forwards hand them over.
+    fresh = model.get_input_embeddings(ids, batch["pixel_values"], image_grid_thw=batch["image_grid_thw"])
+    cached = model.get_input_embeddings(ids, batch["pixel_values"], image_grid_thw=batch["image_grid_thw"], cached_image_features=features)
+    assert mx.array_equal(features, expected).item() and mx.array_equal(fresh.inputs_embeds, cached.inputs_embeds).item()
+    assert mx.array_equal(fresh.position_ids, cached.position_ids).item()

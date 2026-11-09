@@ -206,12 +206,18 @@ def test_a_user_set_high_performance_flag_is_left_alone():
 
 
 def test_high_performance_also_stands_our_sizing_down():
-    """With HF_XET_HIGH_PERFORMANCE set, our caps must also be dropped: xet-core voids the LIMIT but still honours the
-    smaller per-file and concurrency caps, so the result is worse than either."""
-    env = {"HF_XET_HIGH_PERFORMANCE": "1"}
-    tuning.apply_xet_env(env, profile = _profile(16))
-    for key in tuning._CAPS_VOIDED_BY_HIGH_PERFORMANCE:
-        assert key not in env, key
+    """With HF_XET_HIGH_PERFORMANCE set, our sizing must be dropped: xet-core >= 1.7 applies env after the preset, so a
+    written AC band beat the preset's 124/16/4 (unsloth-zoo#2370)."""
+    for fail_fast in (False, True):
+        env = {"HF_XET_HIGH_PERFORMANCE": "1"}
+        tuning.apply_xet_env(env, profile = _profile(16), fail_fast = fail_fast)
+        for key in (
+            *tuning._CAPS_VOIDED_BY_HIGH_PERFORMANCE,
+            "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY",
+            "HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY",
+            "HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY",
+        ):
+            assert key not in env, key
     assert env["HF_XET_CHUNK_CACHE_SIZE_BYTES"] == "0"
 
 
@@ -655,7 +661,7 @@ def test_a_throttle_asked_for_by_a_logged_429_survives_the_resize(monkeypatch, t
         directory.mkdir()
     _two_volumes(monkeypatch, str(roomy), str(tight))
     # Pin the cores too: on a 1-2 CPU runner the ceiling is already the floor of 4, so halving it would look the same as not halving it.
-    monkeypatch.setattr(_os, "sched_getaffinity", lambda _pid: set(range(16)))
+    monkeypatch.setattr(_os, "sched_getaffinity", lambda _pid: set(range(16)), raising = False)
     monkeypatch.setattr(tuning, "cgroup_cpu_limit", lambda: None)
 
     fake_env = {"HF_HUB_CACHE": str(roomy / "hub")}

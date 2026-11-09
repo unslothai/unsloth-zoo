@@ -32,7 +32,7 @@ _MISSING = object()
 
 @pytest.fixture
 def offload(request, monkeypatch):
-    saved = {name: getattr(gc, name, _MISSING) for name in _STATE + ["FP32_OFFLOAD_EXACT"]}
+    saved = {name: getattr(gc, name, _MISSING) for name in _STATE + ["FP32_OFFLOAD_EXACT", "FP32_OFFLOAD_MODE"]}
     dtype, mode = request.param if isinstance(request.param, tuple) else (request.param, "bf16")
     monkeypatch.setenv("UNSLOTH_OFFLOAD_FP32", mode)
     gc.initialize_unsloth_gradient_checkpointing(dtype)
