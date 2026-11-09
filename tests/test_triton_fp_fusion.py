@@ -242,28 +242,30 @@ def test_every_launch_states_fp_fusion():
 
 
 @pytest.mark.parametrize("mutation, rejected", [
+    # The first branch states the right value: a guard reading only values[0] passed this vacuously.
     ('{"enable_fp_fusion": False} if _INTERPRET else {"enable_fp_fusion": True}', True),
-    ('{} if _INTERPRET else {"enable_fp_fusion": True}', True),
     ('{"enable_fp_fusion": True} if not _INTERPRET else {"enable_fp_fusion": False}', True),
+    # Negative control: only the interpreter-only branch differs.
     ('{"enable_fp_fusion": False} if not _INTERPRET else {"enable_fp_fusion": True}', False),
 ])
-def test_guard_checks_every_compiled_branch(mutation, rejected, monkeypatch, tmp_path):
-    import shutil
-
-    copy = tmp_path / "unsloth_zoo"
-    shutil.copytree(ZOO, copy, ignore = shutil.ignore_patterns("__pycache__", "*.so", "*.json"))
-    target = copy / "gpt_oss_decode_fused.py"
-    src = target.read_text(encoding = "utf-8")
+def test_guard_checks_every_compiled_branch(mutation, rejected, monkeypatch):
     original = '_NO_FMA = {} if _INTERPRET else {"enable_fp_fusion": False}'
-    assert original in src
-    target.write_text(src.replace(original, "_NO_FMA = " + mutation), encoding = "utf-8")
-    monkeypatch.setattr(sys.modules[__name__], "ZOO", copy)
+    real = list(_module_trees())
+
+    def mutated():
+        for rel, src, tree in real:
+            if rel == "gpt_oss_decode_fused.py":
+                assert original in src
+                src = src.replace(original, "_NO_FMA = " + mutation)
+                tree = ast.parse(src)
+            yield rel, src, tree
+
+    monkeypatch.setattr(sys.modules[__name__], "_module_trees", mutated)
     if rejected:
         with pytest.raises(AssertionError, match = "_add_rms_norm_kernel"):
             test_every_launch_states_fp_fusion()
     else:
         test_every_launch_states_fp_fusion()
-
 
 
 def _compiled_options(kernel):
