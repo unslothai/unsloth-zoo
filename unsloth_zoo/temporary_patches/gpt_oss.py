@@ -472,19 +472,9 @@ def _register_gpt_oss_flex_mask():
         return False
     if _GPT_OSS_FLEX_MASK not in ALL_MASK_ATTENTION_FUNCTIONS._global_mapping:
         ALL_MASK_ATTENTION_FUNCTIONS.register(_GPT_OSS_FLEX_MASK, _gpt_oss_flex_mask)
-    if not hasattr(_FlexBlockMask, "contiguous"):
-        # transformers >= 5.21 generate calls .contiguous() on every mask it builds.
-        _FlexBlockMask.contiguous = lambda self, *args, **kwargs: self
-    if not getattr(_FlexBlockMask.to, "_unsloth_gpt_oss", False):
-        # accelerate moves masks with .to(), which leaves captured tensors behind.
-        _block_mask_to = _FlexBlockMask.to
-        def to(self, device, *args, **kwargs):
-            on_device = getattr(self, "_unsloth_on_device", None)
-            if on_device is not None and isinstance(device, (str, int, torch.device)):
-                return on_device(device)
-            return _block_mask_to(self, device, *args, **kwargs)
-        to._unsloth_gpt_oss = True
-        _FlexBlockMask.to = to
+    # accelerate moves masks with .to(), which leaves captured tensors behind; generate calls .contiguous().
+    from unsloth_zoo.flex_attention.decode import install_block_mask_transfer
+    install_block_mask_transfer()
     return True
 
 

@@ -469,3 +469,19 @@ def test_reference_fallback_keeps_an_elided_causal_mask(which):
     v = torch.arange(4.0).view(1, 1, 4, 1).expand(1, 1, 4, 4).contiguous()
     out, _ = unsloth_flex_decode_attention(module, q[:, :, :2], k, v, None, scaling = 1.0, **extra)
     torch.testing.assert_close(out[0, :, 0, 0], torch.tensor([1.0, 1.5]))
+
+
+def test_registration_installs_the_device_transfer(monkeypatch):
+    # accelerate moves a split model's layer arguments with BlockMask.to(device): a decode mask must come back rebuilt
+    # for that device (its mask_mod's offsets / padding with it), whichever registration ran first.
+    from torch.nn.attention.flex_attention import BlockMask
+    import unsloth_zoo.flex_attention.decode as D
+
+    monkeypatch.setattr(BlockMask, "to", BlockMask.to)
+    assert D.install_block_mask_transfer()
+    mask = D.decode_block_mask(1, 16, torch.tensor(3))
+    rebuilt = []
+    mask._unsloth_on_device = lambda device: rebuilt.append(torch.device(device)) or "rebuilt"
+    assert mask.to("cpu") == "rebuilt" and rebuilt == [torch.device("cpu")]
+    assert BlockMask.to._unsloth_gpt_oss
+    assert mask.contiguous() is mask

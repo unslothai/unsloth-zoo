@@ -524,6 +524,29 @@ def unsloth_flex_decode_attention(
     return sdpa_attention_forward(module, query, key, value, attention_mask, scaling = scaling, dropout = dropout, **kwargs)
 
 
+def install_block_mask_transfer():
+    """BlockMask.to(device) rebuilds a decode mask built here on the target device (accelerate moves a split model's
+    layer arguments with .to(), which moves only the tensor fields and leaves mask_mod's captured offsets and
+    padding behind); .contiguous() is a no-op (transformers >= 5.21 generate calls it on every mask). Idempotent."""
+    if _BlockMask is None:
+        return False
+    if not hasattr(_BlockMask, "contiguous"):
+        _BlockMask.contiguous = lambda self, *args, **kwargs: self
+    if not getattr(_BlockMask.to, "_unsloth_on_device_to", False):
+        original = _BlockMask.to
+
+        def to(self, device, *args, **kwargs):
+            on_device = getattr(self, "_unsloth_on_device", None)
+            if on_device is not None and isinstance(device, (str, int, torch.device)):
+                return on_device(device)
+            return original(self, device, *args, **kwargs)
+
+        to._unsloth_on_device_to = True
+        to._unsloth_gpt_oss = True  # the marker gpt-oss's own registration checks
+        _BlockMask.to = to
+    return True
+
+
 _REGISTERED = False
 
 
@@ -540,6 +563,7 @@ def register_flex_decode():
         from transformers.masking_utils import AttentionMaskInterface
     except Exception:
         return False
+    install_block_mask_transfer()
     AttentionInterface.register(FLEX_DECODE_KEY, unsloth_flex_decode_attention)
     AttentionMaskInterface.register(FLEX_DECODE_KEY, unsloth_flex_decode_mask)
     _REGISTERED = True
