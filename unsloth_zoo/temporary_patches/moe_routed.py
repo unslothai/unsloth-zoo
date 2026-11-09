@@ -54,6 +54,7 @@ from typing import List, Optional
 import torch
 import torch.nn.functional as F
 
+from unsloth_zoo.decode_graph_state import in_graph_decode_step as _in_graph_decode_step
 from unsloth_zoo.triton_fast_launch import launch as _fast_launch
 
 try:
@@ -1583,10 +1584,7 @@ def routed_16bit_supported(device):
 
 def _graph_decode_step():
     """True inside a one-token decode step Unsloth plans for CUDA-graph replay (never while tracing)."""
-    if torch.compiler.is_compiling():
-        return False
-    from unsloth_zoo.decode_graph_state import in_graph_decode_step
-    return in_graph_decode_step()
+    return not torch.compiler.is_compiling() and _in_graph_decode_step()
 
 
 def bf16_routes(one_token_only, rows, slots, graph_step = False):

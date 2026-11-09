@@ -27,7 +27,14 @@ __all__ = [
 
 import threading
 
-_TLS = threading.local()
+
+class _State(threading.local):
+    # Class defaults: a thread that never entered a scope reads 0 without a failed attribute lookup (per-layer path).
+    generate = 0
+    step = 0
+
+
+_TLS = _State()
 
 
 class _Scope:
@@ -37,11 +44,11 @@ class _Scope:
         self._name = name
 
     def __enter__(self):
-        setattr(_TLS, self._name, getattr(_TLS, self._name, 0) + 1)
+        setattr(_TLS, self._name, getattr(_TLS, self._name) + 1)
         return self
 
     def __exit__(self, *exc):
-        setattr(_TLS, self._name, getattr(_TLS, self._name, 1) - 1)
+        setattr(_TLS, self._name, getattr(_TLS, self._name) - 1)
         return False
 
 
@@ -54,8 +61,8 @@ def graph_decode_step():
 
 
 def in_graph_generate():
-    return getattr(_TLS, "generate", 0) > 0
+    return _TLS.generate > 0
 
 
 def in_graph_decode_step():
-    return getattr(_TLS, "step", 0) > 0 and getattr(_TLS, "generate", 0) > 0
+    return _TLS.step > 0 and _TLS.generate > 0

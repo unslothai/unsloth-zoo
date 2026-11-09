@@ -42,6 +42,7 @@ from .common import (
     logger,
 )
 from importlib.metadata import version as importlib_version
+from unsloth_zoo.decode_graph_state import in_graph_generate as _in_graph_generate
 from unsloth_zoo.utils import Version, _class_source
 from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
 try:
@@ -183,10 +184,7 @@ def _gpt_oss_graph_decode_attention():
 
 
 def _gpt_oss_in_graph_generate():
-    if torch.compiler.is_compiling():
-        return False
-    from unsloth_zoo.decode_graph_state import in_graph_generate
-    return in_graph_generate()
+    return not torch.compiler.is_compiling() and _in_graph_generate()
 
 
 def _gpt_oss_dense_graph_decode(inputs_embeds):
