@@ -1070,9 +1070,7 @@ def _merge_and_overwrite_lora(
     source_path = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Merges LoRA and overwrites the safetensors file it was merged to.
-    # With source_path the shard is not in the export yet: it is written once, from source_path
-    # (_SinglePassShardWriter), instead of being copied in and then overwritten.
+    # Merges LoRA and overwrites the safetensors file it was merged to; with source_path it is written once from there.
     if base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4":
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("mxfp4 quantized model detected. Using safe rewrite strategy (requires temporary disk space).")
@@ -5603,10 +5601,8 @@ def merge_and_overwrite_lora(
         pass
     pass
 
-    # A plain 16-bit merge writes each output shard once, from its source (_SinglePassShardWriter),
-    # instead of copying the base shard in and rewriting the merged tensors over the copy. The
-    # paths that rewrite, split, widen or dequantize a staged shard, MoE experts, nested names and
-    # a link at the output entry keep the copy. UNSLOTH_MERGE_SINGLE_PASS=0 keeps it everywhere.
+    # Plain 16-bit merges write each shard once from its source; rewrite / split / widen / dequant, MoE,
+    # nested names and output links keep the copy. UNSLOTH_MERGE_SINGLE_PASS=0 keeps it everywhere.
     _single_pass_merge = (
         save_method == "merged_16bit"
         and not base_model_is_quantized
