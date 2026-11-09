@@ -44,6 +44,7 @@ def _isolate(monkeypatch):
     monkeypatch.setattr(U, "_RECENT_EAGER_LABELS", set())
     monkeypatch.setattr(U, "_COMPILED_OK_LABELS", set())
     monkeypatch.setattr(U, "_PACKED_COMPILED_IN_CHECKPOINT", False)
+    monkeypatch.setattr(U, "_RAISED_INSIDE_CHECKPOINT", False)
 
 
 def _pair(message):
@@ -141,3 +142,44 @@ def test_real_torch_skipped_frame_latches_to_eager():
     assert "test-real-skip" in U._LATCHED_EAGER_LABELS
     with pytest.raises(RuntimeError, match = "Compilation was not attempted"):
         compiled(x)
+
+
+def test_skipped_frame_inside_a_checkpoint_ends_the_step():
+    """Non-reentrant checkpoint: torch ran the body (and its pack hooks) before raising, so an eager rerun in the same
+    forward would pack twice. The step ends instead (the label latched), and the retried step runs eager with a
+    backward that matches the plain eager gradient."""
+    import torch._dynamo.exc as dynamo_exc
+    from torch.utils.checkpoint import checkpoint
+
+    if U._in_non_reentrant_checkpoint() is None or not hasattr(dynamo_exc, "SkipFrame"):
+        pytest.skip("this torch cannot report checkpoint regions")
+
+    def skipping_backend(gm, example_inputs):
+        raise dynamo_exc.SkipFrame("test skip")
+
+    def kernel(x):
+        return x.sin() * x
+
+    compiled = torch.compile(kernel, backend = skipping_backend, fullgraph = True)
+    wrapped = U._fall_back_to_eager_on_recompile_limit(compiled, kernel, "test-ckpt-skip")
+    try:
+        compiled(torch.ones(2))
+    except RuntimeError as e:
+        if not U._is_no_compiled_frames_error(e):
+            raise
+    else:
+        pytest.skip("this torch runs a skipped fullgraph frame eagerly without raising")
+    torch._dynamo.reset()
+    compiled = torch.compile(kernel, backend = skipping_backend, fullgraph = True)
+    wrapped = U._fall_back_to_eager_on_recompile_limit(compiled, kernel, "test-ckpt-skip")
+
+    x = torch.linspace(-1, 1, 5, requires_grad = True)
+    with pytest.raises(RuntimeError, match = "found no compiled frames"):
+        checkpoint(wrapped, x, use_reentrant = False).sum().backward()
+    assert "test-ckpt-skip" in U._LATCHED_EAGER_LABELS
+    assert U._RAISED_INSIDE_CHECKPOINT
+    x.grad = None
+    checkpoint(wrapped, x, use_reentrant = False).sum().backward()
+    ref = torch.linspace(-1, 1, 5, requires_grad = True)
+    kernel(ref).sum().backward()
+    assert torch.allclose(x.grad, ref.grad)

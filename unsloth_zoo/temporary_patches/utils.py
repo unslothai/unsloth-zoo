@@ -1714,19 +1714,32 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         """torch >= 2.14 found no compiled frames in this fullgraph region.
 
         The frame was skipped at compile time and the skip sticks to the code
-        object, so every later call raises too; latch this label like any other
-        compile-time refusal. torch already ran the body once, uncompiled,
-        before raising and dropped its result, so the eager call here runs it a
-        second time: harmless for the functional kernels routed through this
-        wrapper, and the alternative was aborting the run.
+        object, so every later call raises too: latch this label like any other
+        compile-time refusal. Unlike them, torch already ran the body once,
+        uncompiled, before raising. Outside a checkpoint that result is just
+        dropped and the eager call here runs the body again (harmless for the
+        functional kernels routed through this wrapper). Inside a non-reentrant
+        checkpoint that first run already packed its saved tensors, so a rerun
+        would pack a second set the recompute never matches: end the step
+        instead, and the retry runs eager from the start.
         """
+        global _PACKED_COMPILED_IN_CHECKPOINT, _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
+        warning = (
+            f"Unsloth: torch.compile skipped every frame of {label}; "
+            f"running it eagerly from here. Training is unaffected apart "
+            f"from speed."
+        )
         try:
-            return _give_up_at_compile_time(
-                e, args, kwargs, marker_before,
-                f"Unsloth: torch.compile skipped every frame of {label}; "
-                f"running it eagerly from here. Training is unaffected apart "
-                f"from speed.",
-            )
+            if not _in_non_reentrant_checkpoint():
+                return _give_up_at_compile_time(e, args, kwargs, marker_before, warning)
+            _PACKED_COMPILED_IN_CHECKPOINT = marker_before
+            state["eager"] = True
+            _LATCHED_EAGER_LABELS.add(label)
+            _RECENT_EAGER_LABELS.add(label)
+            _warn(warning)
+            _RAISED_INSIDE_CHECKPOINT = True
+            _CHECKPOINT_SETTLE_ATTEMPTS = 0
+            raise e
         finally:
             del e  # same cycle as in _give_up_at_compile_time
 
