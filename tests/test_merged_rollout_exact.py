@@ -215,13 +215,26 @@ def test_failed_self_check_disables_exact(monkeypatch):
     assert ex.exact_merge_failure(torch.device("cuda"), torch.bfloat16) == "unfold is not bit exact"
 
 
+def _store_buffers(t):
+    # The non-empty host buffers of a target's store (the stream or the indexed form).
+    out = [b for b in (t.host_words, t.host_wcnt, t.host_idx, t.host_val) if b.numel()]
+    assert out and (t.host_words.numel() or t.host_idx.numel())
+    return out
+
+
+def _fresh_arenas(monkeypatch):
+    # Empty host arenas: a store must come from a new allocation, whatever earlier tests left in the shared ones.
+    monkeypatch.setattr(ex, "_ARENAS", {True: ex._HostArena(True), False: ex._HostArena(False)})
+
+
 def test_disable_pinned_memory_uses_pageable_stores(monkeypatch):
     monkeypatch.setenv("UNSLOTH_DISABLE_PINNED_MEMORY", "1")
+    _fresh_arenas(monkeypatch)
     W, A, B, scale = _dense(256, 1024, 16, 1e-2)
     W0 = W.clone()
     t = _target(W, A, B, scale)
     ex.exact_fold([t], stream = torch.cuda.Stream())
-    assert t.host_words.numel() > 0 and not t.host_words.is_pinned() and not t.host_wcnt.is_pinned()
+    assert not any(b.is_pinned() for b in _store_buffers(t))
     ex.exact_unfold([t], stream = torch.cuda.Stream())
     assert torch.equal(_bits(W), _bits(W0))
 
@@ -233,11 +246,12 @@ def test_pinning_failure_falls_back_to_pageable(monkeypatch):
         if pin_memory: raise RuntimeError("CUDA error: out of memory")
         return real_empty(*args, **kwargs)
     monkeypatch.setattr(torch, "empty", empty)
+    _fresh_arenas(monkeypatch)
     W, A, B, scale = _dense(256, 1024, 16, 1e-2)
     W0 = W.clone()
     t = _target(W, A, B, scale)
     ex.exact_fold([t], stream = torch.cuda.Stream())
-    assert not t.host_words.is_pinned()
+    assert not any(b.is_pinned() for b in _store_buffers(t))
     ex.exact_unfold([t], stream = torch.cuda.Stream())
     assert torch.equal(_bits(W), _bits(W0))
 

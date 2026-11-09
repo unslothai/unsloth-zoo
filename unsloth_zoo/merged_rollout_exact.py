@@ -388,14 +388,17 @@ class _Store:
         counts = torch.empty(n_tiles, 3, dtype = torch.int32, device = self.device)
         for t in self.targets:
             if self.tiles[t.slot]: _launch(t, _COUNT, counts = counts)
-        # Per tile: inexact elements, code words (at most 32 * 128 * 8 / 32 = 1024), escapes, and whether it has words.
-        x = counts.to(torch.int64)
-        x[:, 1] = (x[:, 1] + 31) // 32
-        x = torch.cat([x, (x[:, 1:2] > 0).to(torch.int64)], 1)
+        # One row per count, one column per tile: inexact elements, code words (at most 32 * 128 * 8 / 32 = 1024),
+        # escapes, and whether the tile has words. Rows, so every scan is over one contiguous vector (a cumsum along
+        # the outer dimension of [tiles, 4] runs 4 serial scans: 100 ms for a 1B model on a T4).
+        x = counts.to(torch.int64).t().contiguous()
+        x[1] = (x[1] + 31) // 32
+        x = torch.cat([x, (x[1:2] > 0).to(torch.int64)])
         self.counts = x
-        # Inclusive sums at every target boundary (a zero row first): one row per target plus one.
-        cs0 = torch.cat([torch.zeros(1, 4, dtype = torch.int64, device = self.device), torch.cumsum(x, 0)])
-        return cs0[self.tile0 + [n_tiles]]
+        # Inclusive sums at every target boundary (a zero first): one row per target plus one.
+        zero = torch.zeros(1, dtype = torch.int64, device = self.device)
+        cs0 = torch.stack([torch.cat([zero, torch.cumsum(row, 0)]) for row in x])
+        return cs0[:, self.tile0 + [n_tiles]].t()
     pass
 
     def set_sizes(self, bounds):
@@ -425,19 +428,18 @@ class _Store:
             # Indexed targets: no words in any of their tiles, every inexact element an escape.
             flag = torch.repeat_interleave(
                 torch.tensor(self.indexed, device = self.device), torch.tensor(self.tiles, device = self.device),
-                output_size = x.shape[0],
+                output_size = x.shape[1],
             )
-            x[:, 1].masked_fill_(flag, 0)
-            x[:, 2] = torch.where(flag, x[:, 0], x[:, 2])
-        cs = torch.cumsum(x[:, 1:3], 0)
-        woff = cs[:, 0] - x[:, 1]
-        eoff = cs[:, 1] - x[:, 2]
-        n_esc = x[:, 2].contiguous()
+            x[1].masked_fill_(flag, 0)
+            x[2] = torch.where(flag, x[0], x[2])
+        woff = torch.cumsum(x[1], 0) - x[1]
+        eoff = torch.cumsum(x[2], 0) - x[2]
+        n_esc = x[2].clone()
         self.dev = torch.empty(_carve_bytes(self.shapes), dtype = torch.uint8, device = self.device)
         words, wcnt, idx, val = _carve(self.dev, self.shapes)
         words.zero_()
-        wcnt.copy_(x[:, 1])
-        del x, cs
+        wcnt.copy_(x[1])
+        del x
         for t in self.targets:
             # The per-tile escape counts (int64) tell each tile whether it has escapes.
             if self.tiles[t.slot]:
