@@ -147,17 +147,18 @@ def test_store_needs_no_positions(dtype):
     W0 = W.clone()
     t = _target(W, A, B, scale)
     stats = ex.exact_fold([t])
-    report = ex.fixup_report([t], stats)
+    host = sum(b.nbytes for b in (t.host_words, t.host_wcnt, t.host_idx, t.host_val))
+    escapes = t.host_idx.numel()
     assert stats["bad"] > 0.01 * stats["elements"]
-    assert report["host_store_bytes"] == stats["store_bytes"] == t.host_store_bytes()
-    assert report["host_store_bytes"] < 0.25 * 6 * stats["bad"]
+    assert host == stats["store_bytes"]
+    assert host < 0.25 * 6 * stats["bad"]
     # Escapes are what no code can name from (new, d): exponent-gap-0 ties (|c| = 1 while r = 0, so unfold cannot tell
     # which of them moved) and gaps over 7 (tiny weights next to a large delta, |c| up to ~2^15). Measured on this
     # adapter: bf16 1.3-1.4% of the inexact elements (bf16's 8-bit mantissa ties far more often), fp16 0.2%.
     # Widening the code to gap 8 or 15 only removes 17% / 31% of the bf16 escapes, so the codes stay at gap 7.
-    assert report["escapes"] < (0.02 if dtype == torch.bfloat16 else 0.005) * stats["bad"]
+    assert escapes < (0.02 if dtype == torch.bfloat16 else 0.005) * stats["bad"]
     # Escapes stay a small part of the store (6 B each against the stream's few bits per inexact element).
-    assert report["escapes"] * 6 < 0.2 * report["host_store_bytes"]
+    assert escapes * 6 < 0.2 * host
     ex.exact_unfold([t])
     assert torch.equal(_bits(W), _bits(W0))
 

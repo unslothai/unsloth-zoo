@@ -245,24 +245,6 @@ def test_cpu_interpreter_proof():
     assert "EDGES OK" in result.stdout
 
 
-@pytest.mark.skipif(ex.triton is None, reason = "needs Triton")
-def test_max_fixup_refuses_before_changing_weights():
-    if not _cuda() and os.environ.get("TRITON_INTERPRET") != "1":
-        pytest.skip("kernel needs CUDA or TRITON_INTERPRET=1")
-    device = "cuda" if _cuda() else "cpu"
-    W = (torch.randn(64, 256, device = device) * 0.02).half()
-    W0 = W.clone()
-    A = torch.randn(1, 4, 256, device = device).half()
-    B = torch.randn(1, 64, 4, device = device).half()
-    t = ex.ExactFoldTarget(W.unsqueeze(0), A, B, 10.0)    # |d| >> |W|: nearly every element is inexact
-    with pytest.raises(ex.ExactFoldRefused):
-        ex.exact_fold([t], max_fixup = 0.25)
-    assert torch.equal(_bits(W), _bits(W0)) and not t.folded
-    ex.exact_fold([t], max_fixup = 1.0)
-    ex.exact_unfold([t])
-    assert torch.equal(_bits(W), _bits(W0))
-
-
 if __name__ == "__main__":
     # TRITON_INTERPRET=1 on CPU: the exhaustive cross with large interpreter tiles (the arithmetic is per element, the
     # tiles only change indexing), then the production tiles on a subset, then random adapters and cycles.
@@ -278,6 +260,5 @@ if __name__ == "__main__":
     ex._BLOCK_N, ex._BLOCK_K = blocks
     subset = {torch.float16: (2.0**-25, 2.0**-11, 65504.0), torch.bfloat16: (2.0**-134, 2.0**-9, 3.3e38)}
     run_edges("cpu", scales = subset, multipliers = (1.0, -1.5))
-    test_max_fixup_refuses_before_changing_weights()
     run_negative("cpu")
     print("EDGES OK")

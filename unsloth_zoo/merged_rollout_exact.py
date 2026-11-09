@@ -29,10 +29,8 @@ original bits, applied after the stream decode."""
 __all__ = [
     "exact_merge_available",
     "ExactFoldTarget",
-    "ExactFoldRefused",
     "exact_fold",
     "exact_unfold",
-    "fixup_report",
 ]
 
 import contextlib
@@ -243,11 +241,6 @@ if triton is not None:
 pass
 
 
-class ExactFoldRefused(RuntimeError):
-    """exact_fold refused before changing any weight (inexact fraction over max_fixup)."""
-pass
-
-
 _STORE = ("words", "wcnt", "idx", "val")
 
 
@@ -258,7 +251,7 @@ class ExactFoldTarget:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = (
         "w", "a", "b", "scale", "counts", "checksum", "words", "wcnt", "idx", "val",
-        "host_words", "host_wcnt", "host_idx", "host_val", "folded", "ready", "bad",
+        "host_words", "host_wcnt", "host_idx", "host_val", "folded", "ready",
     )
 
     def __init__(self, w_view, a, b, scale):
@@ -273,20 +266,11 @@ class ExactFoldTarget:
             setattr(self, "host_" + name, None)
         self.folded = False
         self.ready = None
-        self.bad = 0
     pass
 
     def grid(self):
         E, N, K = self.w.shape
         return (triton.cdiv(N, _BLOCK_N), triton.cdiv(K, _BLOCK_K), E)
-    pass
-
-    def host_store_bytes(self):
-        return sum(
-            b.numel() * b.element_size()
-            for b in (getattr(self, "host_" + name) for name in _STORE)
-            if isinstance(b, torch.Tensor)
-        )
     pass
 
     def launch(self, mode, woff = None, words = None, idx = None, val = None, eoff = None):
@@ -333,10 +317,9 @@ def _device_ctx(t):
 pass
 
 
-def exact_fold(targets, stream = None, max_fixup = None):
+def exact_fold(targets, stream = None):
     """Fold targets in place and return {"bad": n, "elements": m, "store_bytes": b}; each target's store stays in
-    pinned host memory, copied on stream. max_fixup: raise ExactFoldRefused, with no weight changed, when more than this
-    fraction of the elements does not round-trip by itself; None never refuses."""
+    pinned host memory, copied on stream."""
     # All Unsloth Zoo code licensed under LGPLv3
     total_bad, total_elements = 0, 0
     for t in targets:
@@ -351,15 +334,6 @@ def exact_fold(targets, stream = None, max_fixup = None):
         torch.stack([t.counts[:, 0].sum(dtype = torch.int64), tw.sum(), t.counts[:, 2].sum(dtype = torch.int64)])
         for t, tw in zip(targets, tile_words)
     ]).tolist()
-    if max_fixup is not None:
-        elements = sum(t.w.numel() for t in targets)
-        n_bad = sum(s[0] for s in sums)
-        if n_bad > max_fixup * elements:
-            for t in targets: t.counts = t.checksum = None
-            raise ExactFoldRefused(
-                f"Unsloth: the exact fold would leave {n_bad:,} of {elements:,} weights "
-                f"({100 * n_bad / max(elements, 1):.1f}%) not round-tripping, over the {100 * max_fixup:.1f}% limit"
-            )
     # Host stores before any weight changes: an allocation failure leaves W untouched.
     sizes = [(n_words, n_esc) for _, n_words, n_esc in sums]
     _host_buffers(targets, sizes)
@@ -376,11 +350,9 @@ def exact_fold(targets, stream = None, max_fixup = None):
             t.launch(_FOLD, woff = woff, words = t.words, idx = t.idx, val = t.val, eoff = eoff)
             del woff, eoff
             t.folded = True
-            t.bad = n_bad
             total_bad += n_bad
             total_elements += t.w.numel()
-    store = sum(n_words * 4 + t.wcnt.numel() * 2 + n_esc * (t.idx.element_size() + 2)
-                for t, (_, n_words, n_esc) in zip(targets, sums))
+    store = sum(getattr(t, "host_" + name).nbytes for t in targets for name in _STORE)
     _offload(targets, stream)
     return {"bad": total_bad, "elements": total_elements, "store_bytes": store}
 pass
@@ -507,35 +479,3 @@ def exact_unfold(targets, stream = None):
             "the base weights may be corrupted."
         )
 
-
-def fixup_report(targets, info = None):
-    """Memory of a fold (call between exact_fold and exact_unfold): inexact fraction, host store bytes (pinned or not)
-    and bytes per weight element, and the peak extra device bytes of the fold (bit stream, tile offsets and escapes
-    before the offload) and of one exact_unfold call over these targets (every store uploaded, plus one target's int64
-    escape index and displaced values)."""
-    # All Unsloth Zoo code licensed under LGPLv3
-    bad = elements = host = escapes = 0
-    pinned = True
-    device_fold = scatter = 0
-    for t in targets:
-        n = t.host_store_bytes()
-        host += n
-        for name in _STORE:
-            buf = getattr(t, "host_" + name)
-            if isinstance(buf, torch.Tensor) and buf.numel():
-                pinned = pinned and buf.is_pinned()
-        n_esc = t.host_idx.numel() if isinstance(t.host_idx, torch.Tensor) else 0
-        escapes += n_esc
-        bad += t.bad
-        elements += t.w.numel()
-        device_fold += n
-        scatter = max(scatter, n_esc * (8 + t.w.element_size()))
-    if info is not None:
-        bad, elements = info.get("bad", bad), info.get("elements", elements)
-    return {
-        "bad": bad, "elements": elements, "fraction": bad / max(elements, 1), "escapes": escapes,
-        "host_store_bytes": host, "host_store_pinned": pinned if host else None,
-        "bytes_per_element": host / max(elements, 1),
-        "device_fold_bytes": device_fold, "device_unfold_peak_bytes": device_fold + scatter,
-    }
-pass
