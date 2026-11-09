@@ -1146,6 +1146,25 @@ def _is_recompile_limit_unsupported(exc):
             or "recompile_limit reached" in text)
 
 
+# torch >= 2.14 `_TorchDynamoContext.__call__` raises a plain RuntimeError when a fullgraph region ran without one
+# compiled frame: "... found no compiled frames. Skipped frames: ..." on the call where Dynamo or Inductor skipped the
+# frame (e.g. Inductor declining bf16 on sm < 80), then "... found no compiled frames. Compilation was not attempted
+# and no cached compiled code was found." on every later call, since the skip sticks to the code object. Older torch
+# runs the skipped frame eagerly and never raises this.
+_NO_COMPILED_FRAMES_SIGNATURE = ("fullgraph=True", "found no compiled frames")
+
+
+def _is_no_compiled_frames_error(exc):
+    """Did a fullgraph region run with every frame skipped (torch >= 2.14)?"""
+    if not isinstance(exc, RuntimeError):
+        return False
+    try:
+        text = str(exc)
+    except Exception:
+        return False
+    return all(part in text for part in _NO_COMPILED_FRAMES_SIGNATURE)
+
+
 # Complete set of Dynamo refusal texts for a disabled callable (only the _torchdynamo_disable branch emits them); torch
 # 2.4-2.6 and 2.7+ wordings both kept since pyproject allows torch>=2.4.
 _DISABLED_HOOK_SIGNATURES = (
@@ -1413,8 +1432,9 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
 
         FailOnRecompileLimitHit: recompile_limit reached with fullgraph=True
 
-    Only cache exhaustion and our own disabled-hook graph break are caught, so
-    any other graph break under fullgraph still raises exactly as before.
+    Only cache exhaustion, our own disabled-hook graph break, Inductor codegen
+    refusals and torch >= 2.14's "found no compiled frames" are caught, so any
+    other graph break under fullgraph still raises exactly as before.
 
     The fallback LATCHES. Do not make it retry per call. Non-reentrant
     activation checkpointing recomputes each packed forward during backward and
@@ -1690,6 +1710,26 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         finally:
             del e  # same cycle as in _give_up_at_compile_time
 
+    def _give_up_on_skipped_frames(e, args, kwargs, marker_before):
+        """torch >= 2.14 found no compiled frames in this fullgraph region.
+
+        The frame was skipped at compile time and the skip sticks to the code
+        object, so every later call raises too; latch this label like any other
+        compile-time refusal. torch already ran the body once, uncompiled,
+        before raising and dropped its result, so the eager call here runs it a
+        second time: harmless for the functional kernels routed through this
+        wrapper, and the alternative was aborting the run.
+        """
+        try:
+            return _give_up_at_compile_time(
+                e, args, kwargs, marker_before,
+                f"Unsloth: torch.compile skipped every frame of {label}; "
+                f"running it eagerly from here. Training is unaffected apart "
+                f"from speed.",
+            )
+        finally:
+            del e  # same cycle as in _give_up_at_compile_time
+
     def _is_backend_refusal_we_handle(e):
         """The gate the wrapper's own backend arm applies, in one place."""
         if _wants_hard_backend_failure():
@@ -1720,6 +1760,12 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
                 raise
             return _EagerFallbackTaken(
                 _give_up_on_backend(e, args, kwargs, marker_before))
+        except RuntimeError as e:
+            # Same sibling-except gap for a retry whose frame got skipped.
+            if not _is_no_compiled_frames_error(e):
+                raise
+            return _EagerFallbackTaken(
+                _give_up_on_skipped_frames(e, args, kwargs, marker_before))
 
     def _note_compiled_ok():
         """Record that this label packed something COMPILED in this step.
@@ -1860,6 +1906,11 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             if not _is_our_own_disabled_hook(e):
                 raise
             return _give_up_on_disabled_hook(e, args, kwargs, marker_before)
+        except RuntimeError as e:
+            # Last: Dynamo's typed errors subclass RuntimeError and are classified above.
+            if not _is_no_compiled_frames_error(e):
+                raise
+            return _give_up_on_skipped_frames(e, args, kwargs, marker_before)
         else:
             # A returned compiled call marks its checkpoint packs compiled; _give_up_on_backend reads this.
             _note_compiled_ok()
