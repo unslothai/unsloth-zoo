@@ -1,3 +1,19 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 import pytest
 import torch
 
@@ -142,3 +158,28 @@ def test_fp32_unaligned_keeps_the_native_kernel(native):
     y = M._grouped_mm_with_backward_fix(inputs, leaf.transpose(-2, -1), offsets)
     y.backward(torch.randn_like(y))
     assert len(native) == 1
+
+
+@pytest.mark.parametrize("layout", ["hf_view", "contiguous"])
+def test_compiled_unaligned_rows_train_without_graph_breaks(native, layout):
+    # Under torch.compile the eager try / except never sees the stride error: the fake kernel raised while tracing.
+    from torch._dynamo.utils import counters
+
+    inputs, leaf, offsets = _case(torch.bfloat16, N = 20)
+    if layout == "contiguous":
+        leaf = leaf.detach().transpose(-2, -1).contiguous().requires_grad_()
+
+    def step(x, w, offs):
+        w = w.transpose(-2, -1) if layout == "hf_view" else w
+        return M._grouped_mm_with_backward_fix(x, w, offs).float().square().sum()
+
+    torch._dynamo.reset()
+    counters.clear()
+    torch.compile(step)(inputs, leaf, offsets).backward()
+    breaks = sum(counters["graph_break"].values()) + sum(counters["unimplemented"].values())
+    dx, dw = inputs.grad, leaf.grad
+    inputs.grad = leaf.grad = None
+    step(inputs, leaf, offsets).backward()
+    assert breaks == 0
+    torch.testing.assert_close(dx, inputs.grad, atol = 3e-2, rtol = 3e-2)
+    torch.testing.assert_close(dw, leaf.grad, atol = 3e-2, rtol = 3e-2)
