@@ -33,10 +33,14 @@ __all__ = [
     "exact_fold",
     "exact_unfold",
     "fixup_report",
+    "fold_weight_",
+    "unfold_weight_",
+    "host_arena_stats",
 ]
 
 import contextlib
 import os
+import threading
 import torch
 
 try:
@@ -258,7 +262,7 @@ class ExactFoldTarget:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = (
         "w", "a", "b", "scale", "counts", "checksum", "words", "wcnt", "idx", "val",
-        "host_words", "host_wcnt", "host_idx", "host_val", "folded", "ready", "bad",
+        "host_words", "host_wcnt", "host_idx", "host_val", "folded", "ready", "bad", "lease",
     )
 
     def __init__(self, w_view, a, b, scale):
@@ -274,6 +278,7 @@ class ExactFoldTarget:
         self.folded = False
         self.ready = None
         self.bad = 0
+        self.lease = None
     pass
 
     def grid(self):
@@ -363,6 +368,26 @@ def exact_fold(targets, stream = None, max_fixup = None):
     # Host stores before any weight changes: an allocation failure leaves W untouched.
     sizes = [(n_words, n_esc) for _, n_words, n_esc in sums]
     _host_buffers(targets, sizes)
+    try:
+        _fold_all(targets, tile_words, sums)
+    except BaseException:
+        # Stores of targets that never folded go back to the arena now; folded ones go back at their unfold.
+        for t in targets:
+            if not t.folded and t.lease is not None:
+                t.lease.release()
+                t.lease = None
+        raise
+    for t in targets:
+        total_bad += t.bad
+        total_elements += t.w.numel()
+    store = sum(n_words * 4 + t.wcnt.numel() * 2 + n_esc * (t.idx.element_size() + 2)
+                for t, (_, n_words, n_esc) in zip(targets, sums))
+    _offload(targets, stream)
+    return {"bad": total_bad, "elements": total_elements, "store_bytes": store}
+pass
+
+
+def _fold_all(targets, tile_words, sums):
     for t, tw, (n_bad, n_words, n_esc) in zip(targets, tile_words, sums):
         with _device_ctx(t.w):
             # At most 32 * 128 * 8 / 32 = 1024 words per tile: int16 counts, the offsets are rebuilt for the unfold.
@@ -377,42 +402,153 @@ def exact_fold(targets, stream = None, max_fixup = None):
             del woff, eoff
             t.folded = True
             t.bad = n_bad
-            total_bad += n_bad
-            total_elements += t.w.numel()
-    store = sum(n_words * 4 + t.wcnt.numel() * 2 + n_esc * (t.idx.element_size() + 2)
-                for t, (_, n_words, n_esc) in zip(targets, sums))
-    _offload(targets, stream)
-    return {"bad": total_bad, "elements": total_elements, "store_bytes": store}
 pass
 
 
 def _host_buffers(targets, sizes):
-    # Pageable when pinning is disabled, over budget or refused (WSL2): still exact, only synchronous.
+    # Pageable when pinning is disabled, over budget or refused (WSL2): still exact, only synchronous. The buffers are
+    # carved from a reused host arena, so a steady fold / unfold loop allocates no host memory after warm-up.
     idx_types = [torch.int32 if t.w.numel() < 2**31 else torch.int64 for t in targets]
     n_tiles = []
     for t in targets:
         n = 1
         for g in t.grid(): n *= g
         n_tiles.append(n)
-    nbytes = sum(
-        n_words * 4 + m * 2 + n_esc * (d.itemsize + t.w.element_size())
+    layouts = [
+        ((n_words, torch.int32), (m, torch.int16), (n_esc, d), (n_esc, t.w.dtype))
         for t, (n_words, n_esc), d, m in zip(targets, sizes, idx_types, n_tiles)
-    )
+    ]
+    nbytes = sum(_carve_bytes(shapes) for shapes in layouts)
     from .block_swap import _pin_budget
-    pin = (
-        targets[0].w.is_cuda and os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") != "1" and nbytes <= _pin_budget()
-    )
-    for t, (n_words, n_esc), d, m in zip(targets, sizes, idx_types, n_tiles):
-        shapes = ((n_words, torch.int32), (m, torch.int16), (n_esc, d), (n_esc, t.w.dtype))
+    pin = targets[0].w.is_cuda and os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") != "1"
+    if pin and nbytes > _ARENAS[True].spare() and nbytes > _pin_budget():
+        pin = False
+    for t, shapes in zip(targets, layouts):
+        lease = None
         if pin:
             try:
-                for name, (n, dt) in zip(_STORE, shapes):
-                    setattr(t, "host_" + name, torch.empty(n, dtype = dt, pin_memory = True))
-                continue
+                lease = _ARENAS[True].take(_carve_bytes(shapes))
             except RuntimeError:
                 pin = False
-        for name, (n, dt) in zip(_STORE, shapes):
-            setattr(t, "host_" + name, torch.empty(n, dtype = dt))
+        if lease is None:
+            lease = _ARENAS[False].take(_carve_bytes(shapes))
+        t.lease = lease
+        for name, buf in zip(_STORE, _carve(lease.buffer, shapes)):
+            setattr(t, "host_" + name, buf)
+pass
+
+
+_ALIGN = 64
+
+
+def _carve_bytes(shapes):
+    return sum((n * dt.itemsize + _ALIGN - 1) // _ALIGN * _ALIGN for n, dt in shapes)
+pass
+
+
+def _carve(buffer, shapes):
+    out, at = [], 0
+    for n, dt in shapes:
+        size = n * dt.itemsize
+        out.append(buffer[at:at + size].view(dt))
+        at += (size + _ALIGN - 1) // _ALIGN * _ALIGN
+    return out
+pass
+
+
+class _Lease:
+    """One fold's slice of a host arena, given back at unfold (or when its target is dropped)."""
+    __slots__ = ("arena", "buffer", "done")
+
+    def __init__(self, arena, buffer):
+        self.arena, self.buffer, self.done = arena, buffer, False
+
+    def release(self):
+        if not self.done:
+            self.done = True
+            self.buffer = None
+            self.arena._give()
+
+    def __del__(self):
+        try:
+            self.release()
+        except Exception:
+            pass
+pass
+
+
+class _HostArena:
+    """Host memory for fold stores, reused across calls. Chunks are carved front to back while folds are live; when the
+    last lease returns, the cursor rewinds and several chunks are merged into one of their combined size, so a workload
+    whose stores stop growing allocates nothing after warm-up. A fold that does not fit adds a chunk of at least half the
+    current capacity (capacity grows by 1.5x or more); live stores never move."""
+
+    def __init__(self, pinned):
+        self.pinned = pinned
+        self.chunks, self.used = [], []
+        self.live = 0
+        self.allocations = 0
+        # Re-entrant: a lease dropped by garbage collection inside take() gives back under the same lock.
+        self.lock = threading.RLock()
+
+    def _new(self, nbytes):
+        self.allocations += 1
+        return torch.empty(nbytes, dtype = torch.uint8, pin_memory = self.pinned)
+
+    def capacity(self):
+        return sum(c.numel() for c in self.chunks)
+
+    def spare(self):
+        return sum(c.numel() - u for c, u in zip(self.chunks, self.used))
+
+    def take(self, nbytes):
+        nbytes = max(_ALIGN, (nbytes + _ALIGN - 1) // _ALIGN * _ALIGN)
+        with self.lock:
+            for i, chunk in enumerate(self.chunks):
+                if self.used[i] + nbytes <= chunk.numel():
+                    buffer = chunk[self.used[i]:self.used[i] + nbytes]
+                    self.used[i] += nbytes
+                    self.live += 1
+                    return _Lease(self, buffer)
+            chunk = self._new(max(nbytes, self.capacity() // 2, _ARENA_MIN_BYTES))
+            self.chunks.append(chunk)
+            self.used.append(nbytes)
+            self.live += 1
+            return _Lease(self, chunk[:nbytes])
+
+    def _give(self):
+        with self.lock:
+            self.live -= 1
+            if self.live:
+                return
+            self.used = [0] * len(self.chunks)
+            if len(self.chunks) > 1:
+                total = self.capacity()
+                self.chunks = []
+                self.chunks = [self._new(total)]
+                self.used = [0]
+
+    def clear(self):
+        # Frees the memory once nothing is live (tests, or a caller done with folding).
+        with self.lock:
+            if not self.live:
+                self.chunks, self.used = [], []
+pass
+
+
+_ARENA_MIN_BYTES = 1 << 20
+_ARENAS = {True: _HostArena(True), False: _HostArena(False)}
+
+
+def host_arena_stats():
+    """Host arena state: allocations so far, capacity and live leases, for pinned and pageable memory."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    return {
+        ("pinned" if pinned else "pageable"): {
+            "allocations": a.allocations, "capacity_bytes": a.capacity(), "live": a.live, "chunks": len(a.chunks),
+        }
+        for pinned, a in _ARENAS.items()
+    }
 pass
 
 
@@ -500,6 +636,10 @@ def exact_unfold(targets, stream = None):
             setattr(t, "host_" + name, None)
         t.counts = t.ready = None
         t.folded = False
+        # The checksum readback above synchronised the device: every copy out of the store has landed.
+        if t.lease is not None:
+            t.lease.release()
+            t.lease = None
     bad = [i for i, (x, y) in enumerate(pairs) if x != y]
     if bad:
         raise RuntimeError(
@@ -538,4 +678,108 @@ def fixup_report(targets, info = None):
         "bytes_per_element": host / max(elements, 1),
         "device_fold_bytes": device_fold, "device_unfold_peak_bytes": device_fold + scatter,
     }
+pass
+
+
+# torch.compile entry points: one custom op per weight, opaque to Dynamo, so a compiled function that folds, runs and
+# unfolds has no graph break. The count readback, the store and the checksum live inside the op (README 13.18); each
+# op returns a small status tensor the caller can thread on (Inductor drops side-effect-only ops, README 13.14). A
+# folded weight's store is kept here under the caller's key until its unfold: not under the weight's address, which
+# functionalization may hand the op as a clone (aot_eager clones a mutated input, then copies back).
+_OP_LIVE = {}
+_OP_LOCK = threading.Lock()
+
+
+def _as_3d(w, a, b):
+    if w.dim() == 2:
+        return w.unsqueeze(0), a.unsqueeze(0), b.unsqueeze(0)
+    return w, a, b
+pass
+
+
+def _fold_weight_impl(w: torch.Tensor, a: torch.Tensor, b: torch.Tensor, scale: float, key: int) -> torch.Tensor:
+    slot = (key, tuple(w.shape), w.dtype)
+    with _OP_LOCK:
+        if slot in _OP_LIVE:
+            raise RuntimeError(f"Unsloth: weight key {key} is already folded; unfold it first.")
+        _OP_LIVE[slot] = None
+    try:
+        t = ExactFoldTarget(*_as_3d(w, a, b), scale)
+        info = exact_fold([t])
+    except BaseException:
+        with _OP_LOCK:
+            _OP_LIVE.pop(slot, None)
+        raise
+    with _OP_LOCK:
+        _OP_LIVE[slot] = t
+    return torch.tensor([info["bad"], info["store_bytes"]], dtype = torch.int64).to(w.device)
+pass
+
+
+def _unfold_weight_impl(w: torch.Tensor, a: torch.Tensor, b: torch.Tensor, scale: float, key: int) -> torch.Tensor:
+    with _OP_LOCK:
+        t = _OP_LIVE.pop((key, tuple(w.shape), w.dtype), None)
+    if t is None:
+        raise RuntimeError(f"Unsloth: weight key {key} was not folded by fold_weight_.")
+    # The folded bits are read from w as given now (a functionalized call may pass a copy of the folded weight), and
+    # the delta is recomputed from the adapter given here, which must be the one folded.
+    t.w, t.a, t.b = _as_3d(w, a, b)
+    t.scale = float(scale)
+    bad = t.bad
+    exact_unfold([t])
+    return torch.tensor([bad, 0], dtype = torch.int64).to(w.device)
+pass
+
+
+def _status_fake(w, a, b, scale, key):
+    return w.new_empty((2,), dtype = torch.int64)
+pass
+
+
+def _register_weight_ops():
+    custom_op = getattr(getattr(torch, "library", None), "custom_op", None)
+    if custom_op is None:
+        return None, None
+    import inspect
+    params = frozenset(inspect.signature(custom_op).parameters)
+    # Host reads inside: keep the ops out of CUDA graphs (reduce-overhead) where the tag exists.
+    tag = getattr(torch.Tag, "cudagraph_unsafe", None)
+    kwargs = dict(tags = (tag,)) if tag is not None and "tags" in params else {}
+    ops = []
+    for name, impl in (("exact_fold_weight_v1", _fold_weight_impl), ("exact_unfold_weight_v1", _unfold_weight_impl)):
+        # A reloaded module copy may own the name already; registering twice segfaults on torch 2.10.
+        if hasattr(torch.ops.unsloth_zoo, name):
+            ops.append(getattr(torch.ops.unsloth_zoo, name).default)
+            continue
+        try:
+            op = custom_op(f"unsloth_zoo::{name}", mutates_args = ("w",), **kwargs)(impl)
+            op.register_fake(_status_fake)
+            ops.append(getattr(torch.ops.unsloth_zoo, name).default)
+        except Exception:
+            return None, None
+    return ops[0], ops[1]
+pass
+
+
+_FOLD_OP, _UNFOLD_OP = _register_weight_ops()
+
+
+def fold_weight_(w, a, b, scale, key):
+    """Fold scale * b @ a into w in place, exactly reversible by unfold_weight_ with the same key and adapter. w is
+    [N, K] (a [R, K], b [N, R]) or [E, N, K]; key is an int naming this weight (a layer index), unique among weights
+    folded at the same time. torch.compile traces it as one opaque op: no graph break, one compiled variant per key
+    set. Returns an int64 [2] tensor (elements that need the store, store bytes)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if _FOLD_OP is None:
+        return _fold_weight_impl(w, a, b, float(scale), int(key))
+    return _FOLD_OP(w, a, b, float(scale), int(key))
+pass
+
+
+def unfold_weight_(w, a, b, scale, key):
+    """Undo fold_weight_ bit for bit (raises on a checksum mismatch). Returns an int64 [2] tensor."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if _UNFOLD_OP is None:
+        return _unfold_weight_impl(w, a, b, float(scale), int(key))
+    return _UNFOLD_OP(w, a, b, float(scale), int(key))
 pass
