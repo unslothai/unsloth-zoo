@@ -42,20 +42,20 @@ def fused_recurrent_fwd_kernel(
     scale,
     B,
     T,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    REVERSE: tl.constexpr,
-    USE_G: tl.constexpr,
-    USE_G_GAMMA: tl.constexpr,
-    USE_GK: tl.constexpr,
-    USE_GV: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
-    STORE_FINAL_STATE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    STATE_V_FIRST: tl.constexpr = False,
+    H: tl.constexpr,  # heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    REVERSE: tl.constexpr,  # reverse cumsum along T
+    USE_G: tl.constexpr,  # scalar gate
+    USE_G_GAMMA: tl.constexpr,  # constant per-head decay
+    USE_GK: tl.constexpr,  # per-key gate
+    USE_GV: tl.constexpr,  # per-value gate
+    USE_INITIAL_STATE: tl.constexpr,  # h0 given
+    STORE_FINAL_STATE: tl.constexpr,  # write ht
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    STATE_V_FIRST: tl.constexpr = False,  # state layout is [V, K]
 ):
     i_v, i_k, i_nh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
     i_n, i_h = i_nh // H, i_nh % H
@@ -183,21 +183,21 @@ def fused_recurrent_bwd_kernel(
     scale,
     B,
     T,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    REVERSE: tl.constexpr,
-    USE_G: tl.constexpr,
-    USE_G_GAMMA: tl.constexpr,
-    USE_GK: tl.constexpr,
-    USE_GV: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
-    STORE_INITIAL_STATE_GRADIENT: tl.constexpr,
-    USE_FINAL_STATE_GRADIENT: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    STATE_V_FIRST: tl.constexpr = False,
+    H: tl.constexpr,  # heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    REVERSE: tl.constexpr,  # reverse cumsum along T
+    USE_G: tl.constexpr,  # scalar gate
+    USE_G_GAMMA: tl.constexpr,  # constant per-head decay
+    USE_GK: tl.constexpr,  # per-key gate
+    USE_GV: tl.constexpr,  # per-value gate
+    USE_INITIAL_STATE: tl.constexpr,  # h0 given
+    STORE_INITIAL_STATE_GRADIENT: tl.constexpr,  # write dh0
+    USE_FINAL_STATE_GRADIENT: tl.constexpr,  # dht given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    STATE_V_FIRST: tl.constexpr = False,  # state layout is [V, K]
 ):
     i_v, i_k, i_nh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
     i_n, i_h = i_nh // H, i_nh % H

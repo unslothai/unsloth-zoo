@@ -26,6 +26,7 @@ __all__ = [
     "logger",
     "torch_compile",
     "_torch_compile",
+    "compile_mask_builder",
     "_raw_torch_compile",
     "unwrap_already_compiled",
     "flatten_for_elementwise_norm",
@@ -149,7 +150,10 @@ def apply_inductor_correctness_workarounds():
             if config is not None and hasattr(config, "cache_key_tag"):
                 tags = [t for t in config.cache_key_tag.split(",") if t]
                 if INDUCTOR_CORRECTNESS_CACHE_TAG not in tags:
-                    config.cache_key_tag = ",".join(tags + [INDUCTOR_CORRECTNESS_CACHE_TAG])
+                    # Every thread: a reentrant checkpoint recompiles on autograd's device thread (torch >= 2.12
+                    # keeps config per thread), where a warm cache would serve rand4x kernels.
+                    from unsloth_zoo.torch_config import set_torch_config
+                    set_torch_config(config, "cache_key_tag", ",".join(tags + [INDUCTOR_CORRECTNESS_CACHE_TAG]))
             active.append("rand4x")
         except Exception as error:
             if UNSLOTH_ENABLE_LOGGING:
@@ -473,6 +477,42 @@ else:
     _torch_compile = functools.partial(
         _compile_or_fall_back,
     )
+
+
+def compile_mask_builder(function):
+    """Compile a mask builder, falling back to eager on Inductor codegen failures (torch 2.10 CPU C++ build error)."""
+    compiled = _torch_compile(function, fullgraph = False, dynamic = True)
+    if compiled is function:
+        return function
+    from .utils import _backend_compile_errors, _is_inductor_codegen_failure, _wants_hard_backend_failure
+    errors = _backend_compile_errors()
+    if not errors:
+        return compiled
+    label = getattr(function, "__name__", None) or repr(function)
+    # Local latch: masks are built outside checkpointed layers, so another region's step-boundary eager switch must not take them along.
+    eager = []
+
+    @functools.wraps(function)
+    def mask_builder(*args, **kwargs):
+        if eager:
+            return function(*args, **kwargs)
+        if torch.compiler.is_compiling():
+            return compiled(*args, **kwargs)
+        try:
+            return compiled(*args, **kwargs)
+        except errors as e:
+            if _wants_hard_backend_failure() or not _is_inductor_codegen_failure(e):
+                raise
+        eager.append(True)
+        logger.warning(
+            f"Unsloth: torch.compile could not generate code for {label}; running it eagerly from here. "
+            f"Only speed is affected."
+        )
+        return function(*args, **kwargs)
+
+    mask_builder._unsloth_compiled_func = compiled
+    return mask_builder
+
 
 def flatten_for_elementwise_norm(hidden_states):
     """``(..., H)`` -> ``((N, H), original_shape)``.

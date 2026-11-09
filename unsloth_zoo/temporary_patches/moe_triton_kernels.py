@@ -100,7 +100,7 @@ def _kernels():
         q_ptr, out_ptr, code_ptr,
         absmax_ptr, code2_ptr, absmax2_ptr, offset_ptr,
         n_bytes,
-        NESTED: tl.constexpr, BLOCKSIZE2: tl.constexpr, BLOCK: tl.constexpr, LONG_INDEXING: tl.constexpr,
+        NESTED: tl.constexpr, BLOCKSIZE2: tl.constexpr, BLOCK: tl.constexpr, LONG_INDEXING: tl.constexpr,  # double quant / nested block / bytes per program / int64 offsets
     ):
         pid = tl.program_id(0)
         if LONG_INDEXING:
@@ -126,8 +126,8 @@ def _kernels():
         tl.store(out_ptr + offs2, w, mask = (offs2 - n_bytes) < n_bytes)
 
     @triton.jit
-    def _combine_fwd_kernel(y_ptr, inv_ptr, w_ptr, out_ptr, T, H: tl.constexpr, TOPK: tl.constexpr,
-                            BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr, ROUND_PRODUCT: tl.constexpr):
+    def _combine_fwd_kernel(y_ptr, inv_ptr, w_ptr, out_ptr, T, H: tl.constexpr, TOPK: tl.constexpr,  # hidden / top-k
+                            BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr, ROUND_PRODUCT: tl.constexpr):  # tokens per tile / hidden per tile / eager product rounding
         pid_t = tl.program_id(0).to(tl.int64)
         hb = tl.program_id(1)
         offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T).to(tl.int64)
@@ -159,8 +159,8 @@ def _kernels():
                  mask = t_mask[:, None] & h_mask[None, :])
 
     @triton.jit
-    def _combine_bwd_dy_kernel(dout_ptr, sorted_ptr, w_ptr, dy_ptr, N, H: tl.constexpr, TOPK: tl.constexpr,
-                               BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr):
+    def _combine_bwd_dy_kernel(dout_ptr, sorted_ptr, w_ptr, dy_ptr, N, H: tl.constexpr, TOPK: tl.constexpr,  # hidden / top-k
+                               BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr):  # tokens per tile / hidden per tile
         pid = tl.program_id(0).to(tl.int64)
         hb = tl.program_id(1)
         offs_i = pid * BLOCK_T + tl.arange(0, BLOCK_T).to(tl.int64)
@@ -174,8 +174,8 @@ def _kernels():
                  mask = i_mask[:, None] & h_mask[None, :])
 
     @triton.jit
-    def _combine_bwd_dw_kernel(y_ptr, dout_ptr, sorted_ptr, dw_ptr, H: tl.constexpr, TOPK: tl.constexpr, BLOCK_H: tl.constexpr,
-                               ROUND_PRODUCT: tl.constexpr):
+    def _combine_bwd_dw_kernel(y_ptr, dout_ptr, sorted_ptr, dw_ptr, H: tl.constexpr, TOPK: tl.constexpr, BLOCK_H: tl.constexpr,  # hidden / top-k / hidden per tile
+                               ROUND_PRODUCT: tl.constexpr):  # eager product rounding
         i = tl.program_id(0).to(tl.int64)
         t = tl.load(sorted_ptr + i).to(tl.int64) // TOPK
         acc = tl.zeros((BLOCK_H,), dtype = tl.float32)

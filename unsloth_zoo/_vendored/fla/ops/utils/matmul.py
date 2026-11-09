@@ -69,16 +69,16 @@ def matmul_kernel(
     stride_bk, stride_bn,             # b: K, N
     stride_cb, stride_cm, stride_cn,  # c: batch, M, N
     # Meta-parameters
-    BM: tl.constexpr,
-    BK: tl.constexpr,
-    BN: tl.constexpr,
-    G: tl.constexpr,
-    ACTIVATION: tl.constexpr,
-    HAS_INPUT: tl.constexpr,
-    HAS_ALPHA: tl.constexpr,
-    HAS_BETA: tl.constexpr,
-    ALLOW_TF32: tl.constexpr,
-    X_DIM: tl.constexpr = 1,
+    BM: tl.constexpr,  # block along M
+    BK: tl.constexpr,  # block along K
+    BN: tl.constexpr,  # block along N
+    G: tl.constexpr,  # group size along M
+    ACTIVATION: tl.constexpr,  # activation name
+    HAS_INPUT: tl.constexpr,  # input added to output
+    HAS_ALPHA: tl.constexpr,  # alpha scale given
+    HAS_BETA: tl.constexpr,  # beta given
+    ALLOW_TF32: tl.constexpr,  # tf32 dots allowed
+    X_DIM: tl.constexpr = 1,  # rank of input
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)

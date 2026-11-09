@@ -20,6 +20,7 @@
 
 import functools
 import inspect
+import linecache
 import re
 import textwrap
 
@@ -97,3 +98,68 @@ def patch_GraniteMoeHybridDecoderLayer_float16():
     forward._unsloth_granite_float16 = True
     layer_class.forward = forward
 TEMPORARY_PATCHES.append(patch_GraniteMoeHybridDecoderLayer_float16)
+
+
+# Unsloth keeps Granite-4 hybrid norm weights in float32 (UNSLOTH_HIGH_PRECISION_LAYERNORM). The stock norms return
+# `self.weight * x.to(input_dtype)`, so a float32 weight promotes the output to float32 and, without autocast, the next
+# 16-bit Linear (mamba in_proj / out_proj) raises "float != BFloat16". Cast back only in that case. The rewrite is
+# installed with its source in linecache so the zoo compiler copies the patched body, not the stock one.
+_NORM_RETURN = "return self.weight * hidden_states.to(input_dtype)"
+_NORM_RETURN_CAST = (
+    "output = self.weight * hidden_states.to(input_dtype)\n"
+    "{indent}if (\n"
+    "{indent}    self.weight.dtype == torch.float32\n"
+    "{indent}    and input_dtype in (torch.float16, torch.bfloat16)\n"
+    "{indent}    and not torch.is_autocast_enabled(output.device.type)\n"
+    "{indent}):\n"
+    "{indent}    output = output.to(input_dtype)\n"
+    "{indent}return output"
+)
+
+
+def _rewrite_norm_source(source):
+    source = textwrap.dedent(source)
+    source = source[source.index("def forward"):]
+    if source.count(_NORM_RETURN) != 1: return None
+    line = next(x for x in source.splitlines() if _NORM_RETURN in x)
+    indent = line[:len(line) - len(line.lstrip())]
+    return source.replace(_NORM_RETURN, _NORM_RETURN_CAST.format(indent = indent))
+
+
+def _build_norm_forward(module, norm_class, original_forward):
+    source = _rewrite_norm_source(inspect.getsource(original_forward))
+    if source is None: return None
+    filename = f"<unsloth granitemoehybrid {norm_class.__name__}.forward>"
+    linecache.cache[filename] = (len(source), None, source.splitlines(keepends = True), filename)
+    namespace = {}
+    exec(compile(source, filename, "exec"), module.__dict__, namespace)
+    forward = namespace["forward"]
+    forward.__qualname__ = f"{norm_class.__qualname__}.forward"
+    forward.__module__ = module.__name__
+    return forward
+
+
+def patch_GraniteMoeHybridRMSNorm_dtype():
+    try:
+        import transformers.models.granitemoehybrid.modeling_granitemoehybrid as module
+    except ImportError:
+        return
+    except Exception as e:
+        return raise_error("GraniteMoeHybridRMSNorm.forward", e)
+    for name in ("GraniteMoeHybridRMSNorm", "GraniteMoeHybridRMSNormGated"):
+        norm_class = getattr(module, name, None)
+        if norm_class is None: continue
+        original_forward = norm_class.forward
+        if getattr(original_forward, "_unsloth_granite_norm_dtype", False): continue
+        try:
+            forward = _build_norm_forward(module, norm_class, original_forward)
+        except Exception as e:
+            raise_error(f"{name}.forward", e)
+            continue
+        if forward is None:
+            raise_error(f"{name}.forward", "source layout changed")
+            continue
+        forward._unsloth_granite_norm_dtype = True
+        forward._unsloth_original_forward = original_forward
+        norm_class.forward = forward
+TEMPORARY_PATCHES.append(patch_GraniteMoeHybridRMSNorm_dtype)
