@@ -36,11 +36,8 @@ if not D._HAS_SEQ_LENGTHS:
 warnings.filterwarnings("ignore", message = ".*flex_attention.*")
 
 
-# Official gpt-oss attention, verbatim apart from the dtype of the mask constant: openai/gpt-oss,
-# gpt_oss/torch/model.py `sdpa` (learned sink logit per head appended to the softmax, then dropped; sliding window
-# masks keys more than sliding_window - 1 tokens back, so W keys including the query).
+# Official gpt-oss attention (openai/gpt-oss gpt_oss/torch/model.py `sdpa`), verbatim apart from the mask dtype.
 def official_gpt_oss_sdpa(Q, K, V, S, sm_scale, sliding_window = 0):
-    # sliding_window == 0 means no sliding window
     n_tokens, n_heads, q_mult, d_head = Q.shape
     assert K.shape == (n_tokens, n_heads, d_head)
     assert V.shape == (n_tokens, n_heads, d_head)
@@ -84,7 +81,6 @@ def effective_mask(block_mask, rows, kv_length):
 
 @pytest.mark.parametrize("window", [0, 128])
 def test_mask_follows_the_visibility_rule_across_blocks_padding_and_unwritten_slots(window):
-    # Full layer: a 512-slot static cache (slots past the query are unwritten); sliding layer: 128 slots rolling.
     pads = [0, 37, 170]
     rows = len(pads)
     for q in [0, 5, 127, 128, 129, 200, 255, 256, 300, 400]:
@@ -131,7 +127,6 @@ def _decode_inputs(n_tokens, n_kv, q_mult, d, seed, sink_scale = 1.0):
 @pytest.mark.parametrize("window", [0, 16])
 @pytest.mark.parametrize("sink_scale", [1.0, 30.0])
 def test_sinks_match_the_official_gpt_oss_attention(window, sink_scale):
-    # Decode the last token of a 40-token sequence with flex + sinks; compare with the official full computation.
     n_tokens, n_kv, q_mult, d = 40, 2, 4, 16
     Q, K, V, S = _decode_inputs(n_tokens, n_kv, q_mult, d, seed = 3 + window, sink_scale = sink_scale)
     scale = d ** -0.5
@@ -157,7 +152,6 @@ def test_an_all_masked_row_returns_exact_zeros_with_and_without_sinks():
         out = D.flex_decode_attention(q, k, v, bm, d ** -0.5, sinks = sinks)
         assert torch.isfinite(out).all()
         assert torch.equal(out[1], torch.zeros_like(out[1]))
-        # The official attention gives a fully masked query all weight on the sink, i.e. zeros.
         ref = D._eager_attention(q, k, v, mask_2d.bool().view(2, 1, 1, S_len), d ** -0.5, sinks = sinks)
         torch.testing.assert_close(out, ref, rtol = 1e-10, atol = 1e-12)
 
@@ -192,7 +186,6 @@ def test_softcap_never_leaks_through_masked_keys():
     mask_2d[:, :50] = 0
     bm = D.decode_block_mask(1, S_len, torch.tensor(S_len - 1), attention_mask = mask_2d, device = "cpu")
     out = D.flex_decode_attention(q, k, v, bm, d ** -0.5, softcap = cap)
-    # Independent reference: only the 46 real keys, capped scores, plain softmax.
     scores = (q @ k[..., 50:, :].transpose(-1, -2)) * d ** -0.5
     want = torch.softmax(cap * torch.tanh(scores / cap), dim = -1) @ v[..., 50:, :]
     torch.testing.assert_close(out, want, rtol = 1e-10, atol = 1e-12)
@@ -252,7 +245,6 @@ def test_graph_identity_follows_window_and_captured_scalars():
     assert ident(window = 128) != ident(window = 64)
     assert ident() != ident(window = 128)
     table = torch.ones(4, dtype = torch.bool)
-    # A mask_function reading a tensor cannot be refilled by the graph: no contract.
     bm = D.decode_block_mask(1, 256, torch.tensor(100), mask_function = lambda b, h, q, kv: table[b] & (kv <= q), device = "cpu")
     assert getattr(bm, "_unsloth_mask_identity", None) is None
     assert getattr(bm, "_unsloth_graph_closure", None) is None
@@ -261,7 +253,6 @@ def test_graph_identity_follows_window_and_captured_scalars():
 
 
 def test_the_offsets_are_copies_of_a_live_cache_counter():
-    # StaticLayer bumps cumulative_length in place before attention reads the mask.
     counter = torch.tensor(99)
     bm = D.decode_block_mask(1, 256, counter, device = "cpu")
     before = effective_mask(bm, 1, 256).clone()
@@ -270,7 +261,6 @@ def test_the_offsets_are_copies_of_a_live_cache_counter():
 
 
 def test_attention_interface_falls_back_to_the_same_visibility_without_flex_decoding():
-    # On CPU flex_decoding is unsupported: the interface evaluates the BlockMask densely and runs SDPA.
     d, S_len = 16, 150
     g = torch.Generator().manual_seed(2)
     q = torch.randn(2, 4, 1, d, generator = g, dtype = torch.float64)
@@ -314,7 +304,6 @@ def test_registration_adds_a_custom_key_that_needs_no_flex_support_flag():
     from transformers.masking_utils import AttentionMaskInterface
     assert AttentionInterface._global_mapping[D.FLEX_DECODE_KEY] is D.unsloth_flex_decode_attention
     assert AttentionMaskInterface._global_mapping[D.FLEX_DECODE_KEY] is D.unsloth_flex_decode_mask
-    # Not a one-token GPU step: the SDPA mask (CPU here).
     from transformers.masking_utils import causal_mask_function
     mask = D.unsloth_flex_decode_mask(
         batch_size = 1, cache_position = torch.arange(4), kv_length = 4, q_length = 4, q_offset = 0, kv_offset = 0,
@@ -325,11 +314,9 @@ def test_registration_adds_a_custom_key_that_needs_no_flex_support_flag():
 
 
 def test_kv_tile_fits_shared_memory():
-    # T4 (sm75, 64 KB): the default 64-row tile has no valid flex_decoding config at head_dim 256; 512 has none at
-    # any tile there, so it is not supported (SDPA).
+    # T4: head_dim 256 needs 32 rows; 512 is unsupported.
     assert D._kv_tile(64, (7, 5)) is None and D._kv_tile(128, (7, 5)) is None and D._kv_tile(256, (7, 5)) == 32
     assert D._flex_decode_hd_limit((7, 5)) == 256 and D._flex_decode_hd_limit((8, 0)) == 512
-    # sm80+: defaults up to 256; 32 rows for 512 (measured faster on A100 and L4).
     assert D._kv_tile(256, (8, 0)) is None and D._kv_tile(512, (8, 0)) == 32 and D._kv_tile(512, (8, 9)) == 32
     monkey = D._device_capability
     try:
@@ -358,8 +345,7 @@ class _HostTensorSpy(torch.utils._python_dispatch.TorchDispatchMode):
 
 @pytest.mark.parametrize("window", [0, 128])
 def test_per_step_decode_path_never_touches_host_tensors(window, monkeypatch):
-    # Everything a decode step runs besides the flex kernel (mask build, graph refill, dense fallback, eager sinks /
-    # softcap, the LSE epilogue) on the meta device: no op may see a CPU tensor.
+    # Every non-kernel op of a decode step on the meta device: no op may see a CPU tensor.
     dev = torch.device("meta")
     B, Hq, Hkv, d, S_len = 2, 4, 2, 64, 300
     q = torch.empty(B, Hq, 1, d, device = dev)
@@ -388,15 +374,13 @@ def test_per_step_decode_path_never_touches_host_tensors(window, monkeypatch):
             D._eager_attention(q, k, v, dense, d ** -0.5, sinks = sinks, softcap = 30.0)
             D.flex_decode_attention(q, k, v, bm, d ** -0.5, sinks = sinks, kernel_options = {})
     assert spy.hits == []
-    # The spy does see a host tensor reaching the device (a pageable copy under capture).
     with _HostTensorSpy() as spy:
         torch.tensor(S_len - 1).to(dev)
     assert spy.hits
 
 
 def test_a_shape_flex_decoding_cannot_compile_falls_back_to_dense_once(monkeypatch):
-    # unsloth_zoo sets suppress_errors, which would make a failed flex compile a silent, unfused, uncapturable eager
-    # flex. The first call compiles with errors raised; a failing shape is served densely from then on.
+    # A failing flex compile must raise once, then the shape is served densely.
     calls = []
 
     def failing_compiled_flex(*args, **kwargs):
@@ -430,9 +414,7 @@ def test_a_shape_flex_decoding_cannot_compile_falls_back_to_dense_once(monkeypat
 
 
 def test_padding_layout_is_stable_as_the_mask_grows_and_the_window_rolls():
-    # generate() widens the 2D mask by one column per step and a sliding window's kv_offset moves with it: the
-    # padding the BlockMask carries must keep its shape, strides and dtype (a decode graph keys on them), and its
-    # values must follow the mask.
+    # The padding must keep shape, strides and dtype (graph key) as the 2D mask widens each step.
     from unsloth_zoo.flex_attention.decode import decode_padding
 
     layouts = []
@@ -453,8 +435,7 @@ def test_padding_layout_is_stable_as_the_mask_grows_and_the_window_rolls():
 
 @pytest.mark.parametrize("which", ["sinks", "softcap"])
 def test_reference_fallback_keeps_an_elided_causal_mask(which):
-    # An unpadded causal prefill gets no mask from the SDPA mask interface (SDPA's is_causal covers it); the float32
-    # reference used with sinks / softcap must apply the same upper-left causal mask SDPA would.
+    # The float32 reference must apply the causal mask SDPA's is_causal implies.
     from unsloth_zoo.flex_attention.decode import unsloth_flex_decode_attention
     module = torch.nn.Module()
     module.is_causal = True
@@ -464,7 +445,6 @@ def test_reference_fallback_keeps_an_elided_causal_mask(which):
     extra = {"s_aux": torch.full((1,), -1e4)} if which == "sinks" else {"softcap": 30.0}
     out, _ = unsloth_flex_decode_attention(module, q, k, v, None, scaling = 1.0, **extra)
     torch.testing.assert_close(out[0, :, 0, 0], torch.tensor([0.0, 0.5, 1.0]))
-    # Prefill of an empty 8-slot static cache: the unwritten tail stays hidden, as under SDPA's is_causal.
     k = torch.zeros(1, 1, 8, 4)
     v = torch.zeros(1, 1, 8, 4)
     v[:, :, :3] = torch.arange(3.0).view(1, 1, 3, 1)
@@ -475,8 +455,7 @@ def test_reference_fallback_keeps_an_elided_causal_mask(which):
 
 
 def test_registration_installs_the_device_transfer(monkeypatch):
-    # accelerate moves a split model's layer arguments with BlockMask.to(device): a decode mask must come back rebuilt
-    # for that device (its mask_mod's offsets / padding with it), whichever registration ran first.
+    # BlockMask.to(device) must rebuild a decode mask for that device.
     from torch.nn.attention.flex_attention import BlockMask
     import unsloth_zoo.flex_attention.decode as D
 
@@ -492,8 +471,7 @@ def test_registration_installs_the_device_transfer(monkeypatch):
 
 @pytest.mark.parametrize("which", ["sinks", "softcap"])
 def test_reference_fallback_applies_attention_dropout_in_training(which):
-    # Training with sinks / softcap keeps the requested attention dropout (the SDPA fallback forwards it too); an
-    # eval module ignores it, as transformers' own attention does.
+    # Training with sinks / softcap keeps attention dropout; eval ignores it.
     from unsloth_zoo.flex_attention.decode import _eager_attention, unsloth_flex_decode_attention
     torch.manual_seed(0)
     q, k, v = torch.randn(1, 2, 4, 8), torch.randn(1, 2, 4, 8), torch.randn(1, 2, 4, 8)

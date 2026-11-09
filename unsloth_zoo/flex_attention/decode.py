@@ -14,22 +14,11 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""One-token flex decoding shared by every model: a BlockMask CUDA-graph decode can refill, and the attention call.
+"""One-token flex decoding: a BlockMask CUDA-graph decode can refill in place, and the attention call.
 
-The decode BlockMask lists, per row, the KV blocks up to the query's own slot (bucketize of a device offset, no host
-read) and leaves every block partial, so mask_mod decides each key. mask_mod reads only 0-d device offsets and a
-fixed [B, kv_length] padding tensor (one column per KV slot, slot j holding position kv_offset + j), so a rolling
-sliding window keeps every shape. The tensors and a rebuild function are published as
-`_unsloth_graph_closure`, and what mask_function computes as `_unsloth_mask_identity`: Unsloth's decode graphs refill
-the tensors in place and key the graph on the identity.
-
-Sliding windows follow transformers and the official gpt-oss implementation: a query at position q sees keys
-q - W < k <= q, W tokens including itself. Attention sinks enter the softmax denominator only:
-out * sigmoid(lse - sink) == sum exp(z) v / (exp(sink) + sum exp(z)), computed in float32. A row with no visible key
-returns exact zeros.
-
-`unsloth_flex_decode` is registered as a transformers attention and mask implementation: one-token steps get this
-BlockMask and flex_decoding, everything else (prefill, a layer flex_decoding cannot run) the SDPA path."""
+mask_mod reads only 0-d device offsets and a fixed [B, kv_length] padding tensor (slot j = position kv_offset + j), published
+as `_unsloth_graph_closure`; `_unsloth_mask_identity` names mask_function and keys the graph. Sliding window: q - W < k <= q.
+Sinks enter the softmax denominator only (float32). A row with no visible key returns zeros."""
 
 __all__ = [
     "FLEX_DECODE_KEY",
@@ -99,18 +88,15 @@ def causal_window_mask_function(window = None):
 
 
 def _offset(x):
-    # A copy: StaticLayer passes its live cumulative_length, bumped in place before attention reads the mask.
     return int(x) if not isinstance(x, torch.Tensor) else x.to(torch.int64).reshape(()).clone()
 
 
 def decode_padding(attention_mask, kv_length, kv_offset):
-    """[B, kv_length] bool: slot j is a real token of row b. Read from the 2D mask at position kv_offset + j; positions
-    past the mask (unwritten static slots) are invisible. A tensor offset is never read on the host."""
+    """[B, kv_length] bool padding (slot j = mask column kv_offset + j); slots past the mask are invisible."""
     full = attention_mask.to(dtype = torch.bool)
     width, kv_length = full.shape[-1], int(kv_length)
     if not isinstance(kv_offset, torch.Tensor) and kv_offset >= 0:
-        # A host offset: a copy of the columns, no gather kernels. Not a view: its row stride would be the 2D mask's
-        # width, which grows every step, and a decode graph keys on strides (re-capture every step).
+        # Copy, not a view: a view's stride grows every step and decode graphs key on strides.
         columns = full[:, kv_offset : kv_offset + kv_length]
         padding = full.new_zeros((full.shape[0], kv_length))
         padding[:, : columns.shape[-1]].copy_(columns)
@@ -139,8 +125,7 @@ def _make_mask_mod(mask_function, q_o, kv_o, pad = None):
 
 
 def build_decode_block_mask(device, batch_size, kv_length, q_off, kv_off, padding, mask_function, identity = None):
-    """The one-token BlockMask on `device` (offsets: python ints or 0-d int64 tensors; padding: [B, kv_length] bool or
-    None). With an identity, publishes the graph contract. gpt-oss's mask builder calls this for its decode steps."""
+    """The one-token BlockMask on `device`; with an identity, publishes the graph contract. Used by gpt-oss too."""
     from torch.nn.attention.flex_attention import BlockMask, _DEFAULT_SPARSE_BLOCK_SIZE as BLOCK
     q_o, kv_o = (
         x.to(device) if isinstance(x, torch.Tensor) else torch.full((), x, dtype = torch.int64, device = device)
@@ -148,17 +133,14 @@ def build_decode_block_mask(device, batch_size, kv_length, q_off, kv_off, paddin
     )
     pad = padding.to(device) if padding is not None else None
     mask_mod = _make_mask_mod(mask_function, q_o, kv_o, pad)
-    # Blocks are partial and mask_mod decides per key; for causal, only blocks up to the query's own slot can hold a
-    # visible key, so an unwritten static-cache tail is not listed (no host sync).
+    # Only blocks up to the query's slot are listed (no host sync); mask_mod decides per key.
     n = (kv_length + BLOCK - 1) // BLOCK
     rows = batch_size or 1
     if isinstance(q_off, torch.Tensor) or isinstance(kv_off, torch.Tensor):
-        # One kernel: clamp((q - kv_off) // BLOCK + 1, 1, n) as a bucket count, written contiguous int32.
         d = q_o if isinstance(kv_off, int) and kv_off == 0 else q_o - kv_o
         kv_num_blocks = torch.bucketize(d.expand(rows, 1, 1), _block_starts(n, BLOCK, device),
                                         out_int32 = True, right = True)
     else:
-        # Integer offsets (dynamic caches): count on the host, one fill.
         kv_num_blocks = torch.full((rows, 1, 1), min(max((q_off - kv_off) // BLOCK + 1, 1), n),
                                    dtype = torch.int32, device = device)
     kv_indices = torch.arange(n, dtype = torch.int32, device = device).view(1, 1, 1, n).expand(rows, 1, 1, n)
@@ -168,9 +150,7 @@ def build_decode_block_mask(device, batch_size, kv_length, q_off, kv_off, paddin
         **({"compute_q_blocks": torch.is_grad_enabled()} if _HAS_COMPUTE_Q_BLOCKS else {}),
     )
     if identity is not None:
-        # CUDA-graph decode refills these tensors and rebuilds mask_mod over its own copies; every value mask_mod
-        # reads besides them is a constant of mask_function, named by the identity (part of the graph key as a
-        # BlockMask field).
+        # Graph decode refills these; everything else mask_mod reads is named by the identity (the graph key).
         tensors = (q_o, kv_o) if pad is None else (q_o, kv_o, pad)
         block_mask._unsloth_graph_closure = (tensors, lambda ts: _make_mask_mod(mask_function, *ts))
         block_mask._unsloth_mask_identity = identity
@@ -195,10 +175,8 @@ def decode_block_mask(
     device = None,
     graph_contract = True,
 ):
-    """BlockMask for a one-token decode step over `kv_length` KV slots (slot j holds position kv_offset + j; the query
-    is at q_offset). mask_function defaults to causal (sliding when `window`); a 2D attention_mask adds per-slot
-    padding. With graph_contract, a mask_function the identity can name publishes the refill contract; one it cannot
-    name (a captured tensor, dict or object) gets a plain BlockMask (no `_unsloth_mask_identity`)."""
+    """One-token decode BlockMask over `kv_length` slots. A mask_function the identity cannot name gets a plain
+    BlockMask (no `_unsloth_mask_identity`)."""
     if mask_function is None:
         mask_function = causal_window_mask_function(window)
     elif window:
@@ -234,8 +212,7 @@ def decode_block_mask(
 
 
 def dense_decode_mask(block_mask, kv_length = None, device = None):
-    """[B, 1, 1, kv_length] bool from a decode BlockMask's mask_mod (every slot evaluated, no block skipping): for a
-    layer that cannot run flex_decoding. Fixed shapes, no host reads."""
+    """[B, 1, 1, kv_length] bool from a decode BlockMask's mask_mod, for layers flex_decoding cannot run."""
     mask_mod = block_mask.mask_mod
     rows = block_mask.kv_num_blocks.shape[0]
     kv_length = int(kv_length if kv_length is not None else block_mask.seq_lengths[1])
@@ -255,8 +232,7 @@ def _device_capability(index):
 
 
 def _flex_decode_hd_limit(capability):
-    # flex_decoding keeps a [BLOCK_N, head_dim] K and V tile per stage in shared memory: head_dim 512 needs the larger
-    # shared memory of compute capability 8.0+ (on a T4 no tile size compiles at 512).
+    # head_dim 512 needs sm80+ shared memory (no tile size compiles on a T4).
     return 512 if capability >= (8, 0) else 256
 
 
@@ -267,8 +243,7 @@ def _supported(head_dim, n_q, n_kv, dtype, device_type, index):
     if n_kv <= 0 or n_q % n_kv != 0:
         return False
     groups = n_q // n_kv
-    # flex_decoding packs the GQA group into BLOCK_M: a group size that is not a power of two silently falls back to
-    # the main flex kernel (torch/_inductor/kernel/flex/flex_decoding.py).
+    # Non power-of-two GQA groups silently fall back to the main flex kernel (torch/_inductor/kernel/flex/flex_decoding.py).
     if groups & (groups - 1):
         return False
     capability = _device_capability(index)
@@ -289,17 +264,15 @@ def flex_decode_supported(head_dim, n_q, n_kv, dtype, device):
 
 
 def _kv_tile(head_dim, capability):
-    """BLOCK_N for one-stage flex_decoding: the K and V tiles ([BLOCK_N, head_dim] each) plus the query tile must fit
-    shared memory. Below compute capability 8.0 (64 KB, T4) head_dim 256 needs 32 rows (the default 64 has no valid
-    config; 512 has none even at 16 rows, so flex_decode_supported stops at 256 there); on 8.0+ head_dim 512 is faster
-    with 32 rows (A100 and L4 measured 1.6-1.9x)."""
+    """BLOCK_N fitting shared memory: <sm80 head_dim 256 needs 32 (default 64 has no config); sm80+ head_dim 512 is
+    1.6-1.9x faster at 32 (A100, L4)."""
     if capability < (8, 0):
         return 32 if head_dim > 128 else None
     return 32 if head_dim > 256 else None
 
 
 def flex_decode_kernel_options(head_dim, device = None):
-    """Decode kernel options: flex_decoding's defaults, with a smaller one-stage KV tile where shared memory needs it."""
+    """flex_decoding defaults with a smaller KV tile where shared memory needs it."""
     options = dict(decode_kernel_options())
     if options.get("FORCE_USE_FLEX_ATTENTION", False):
         return options
@@ -324,8 +297,7 @@ def _softcap_score_mod(softcap):
 
 
 def _flex_function(device):
-    """(flex_attention, compiled): compiled flex on GPUs (flex_decoding); the eager reference elsewhere (CPU Inductor
-    cannot lower the LSE)."""
+    """(flex_attention, compiled): eager off GPU (CPU Inductor cannot lower the LSE)."""
     from .utils import flex_attention
     if device.type == "cuda" and flex_attention is not None:
         return flex_attention, True
@@ -334,13 +306,11 @@ def _flex_function(device):
 
 
 class FlexDecodeUnavailable(RuntimeError):
-    """flex_decoding could not be compiled for this layer shape (for example no kernel config fits shared memory)."""
+    """flex_decoding could not be compiled for this layer shape."""
 
 
-# Layer shapes whose first compiled call failed, and those already compiled once. unsloth_zoo sets Dynamo's
-# suppress_errors, which would turn a failed flex compile into a silent eager flex: unfused (several times slower than
-# SDPA) and not capturable by CUDA graphs. The first call per shape compiles with errors raised instead, and a shape
-# that fails is reported as unavailable so callers keep the dense path.
+# Dynamo suppress_errors would turn a failed compile into silent slow eager flex: the first call per shape raises
+# instead, and failed shapes are reported unavailable so callers keep the dense path.
 _FAILED_SHAPES = set()
 _COMPILED_SHAPES = set()
 
@@ -353,17 +323,14 @@ def _shape_key(query, key, kernel_options, softcap):
 
 
 def flex_decode_attention(query, key, value, block_mask, scale = None, *, sinks = None, softcap = None, kernel_options = None):
-    """One-token attention: query [B, Hq, 1, D], key / value [B, Hkv, S, D] (GQA when Hq != Hkv) -> [B, Hq, 1, D].
-    sinks: [Hq] learned logits in the denominator only. softcap: tanh capping of the scores before the mask. A row
-    with no visible key returns zeros. Never writes its inputs."""
+    """query [B, Hq, 1, D], key / value [B, Hkv, S, D] -> [B, Hq, 1, D]. Never writes its inputs."""
     q_len, kv_len = block_mask.seq_lengths
     if key.shape[-2] > kv_len:
-        # Static cache slots past the mask.
         key, value = key[:, :, :kv_len], value[:, :, :kv_len]
     elif key.shape[-2] < kv_len:
         block_mask = block_mask._adjust(q_len, key.shape[-2])
     if not torch.compiler.is_compiling():
-        # Inductor picks flex_decoding only for a static batch: a second batch size would make it dynamic.
+        # flex_decoding needs a static batch.
         for x in (query, key, value):
             torch._dynamo.mark_static(x, 0)
     if scale is None:
@@ -407,15 +374,13 @@ def flex_decode_attention(query, key, value, block_mask, scale = None, *, sinks 
     lse = lse.to(compute)
     empty = torch.isneginf(lse).unsqueeze(-1)
     if sinks is not None:
-        # exp(lse) / (exp(lse) + exp(sink)), at least float32; 0 for an empty row.
         scale_rows = torch.sigmoid(lse - sinks.to(compute).view(1, -1, 1)).unsqueeze(-1)
         out = (out.to(compute) * scale_rows).to(out.dtype)
     return torch.where(empty, torch.zeros((), dtype = out.dtype, device = out.device), out)
 
 
 def _eager_attention(query, key, value, mask, scale, sinks = None, softcap = None, dropout = 0.0):
-    """float32 reference / fallback: query [B, Hq, Lq, D], key / value [B, Hkv, S, D], mask bool broadcastable to
-    [B, Hq, Lq, S] (True = visible); `dropout` applies to the attention weights (training only)."""
+    """float32 reference / fallback; mask bool broadcastable to [B, Hq, Lq, S] (True = visible)."""
     groups = query.shape[1] // key.shape[1]
     compute = torch.promote_types(query.dtype, torch.float32)
     k = key.to(compute).repeat_interleave(groups, dim = 1)
@@ -457,8 +422,7 @@ def unsloth_flex_decode_mask(
     cache_position = None,
     **kwargs,
 ):
-    """transformers mask interface (4.57 and 5.x signatures): a decode BlockMask for one-token steps on a GPU, the
-    SDPA mask for everything else."""
+    """transformers mask interface (4.57 and 5.x): decode BlockMask for one-token GPU steps, else the SDPA mask."""
     passed = dict(
         batch_size = batch_size, q_length = q_length, kv_length = kv_length, q_offset = q_offset,
         kv_offset = kv_offset, mask_function = mask_function, attention_mask = attention_mask, device = device,
@@ -494,9 +458,7 @@ def unsloth_flex_decode_attention(
     s_aux = None,
     **kwargs,
 ):
-    """transformers attention interface: query [B, Hq, L, D], key / value [B, Hkv, S, D] -> ([B, L, Hq, D], None).
-    flex_decoding for one-token steps whose mask is a decode BlockMask and whose shape flex_decoding serves; SDPA (or
-    the float32 reference for sinks / softcap) otherwise."""
+    """transformers attention interface: flex_decoding where served, else SDPA (float32 reference for sinks / softcap)."""
     is_block_mask = _BlockMask is not None and isinstance(attention_mask, _BlockMask)
     if scaling is None:
         scaling = 1.0 / math.sqrt(query.shape[-1])
@@ -512,16 +474,13 @@ def unsloth_flex_decode_attention(
         except FlexDecodeUnavailable:
             pass
     if is_block_mask:
-        # A layer flex_decoding does not serve (head_dim, GQA, dtype): the same visibility as a dense mask.
         attention_mask = dense_decode_mask(attention_mask, key.shape[-2], query.device)
     if softcap or s_aux is not None:
         if attention_mask is not None and attention_mask.dtype != torch.bool:
             attention_mask = attention_mask > torch.finfo(attention_mask.dtype).min / 2
         L, S = query.shape[-2], key.shape[-2]
         if attention_mask is None and L > 1 and kwargs.get("is_causal", getattr(module, "is_causal", True)):
-            # The SDPA mask interface elides an unpadded causal mask and SDPA's is_causal covers it; this reference
-            # has no such flag, so it builds the same upper-left causal mask SDPA would apply (query i sees keys 0..i;
-            # an empty static cache's unwritten tail stays hidden).
+            # SDPA elides an unpadded causal mask (is_causal); the reference needs it built explicitly.
             attention_mask = torch.ones(L, S, dtype = torch.bool, device = query.device).tril()
         out = _eager_attention(
             query, key, value, attention_mask, scaling, sinks = s_aux, softcap = softcap, dropout = dropout
@@ -532,9 +491,8 @@ def unsloth_flex_decode_attention(
 
 
 def install_block_mask_transfer():
-    """BlockMask.to(device) rebuilds a decode mask built here on the target device (accelerate moves a split model's
-    layer arguments with .to(), which moves only the tensor fields and leaves mask_mod's captured offsets and
-    padding behind); .contiguous() is a no-op (transformers >= 5.21 generate calls it on every mask). Idempotent."""
+    """BlockMask.to rebuilds our decode masks on the target device (plain .to leaves mask_mod's captures behind);
+    .contiguous() is a no-op (transformers >= 5.21 generate calls it per mask)."""
     if _BlockMask is None:
         return False
     if not hasattr(_BlockMask, "contiguous"):
@@ -558,8 +516,7 @@ _REGISTERED = False
 
 
 def register_flex_decode():
-    """Registers FLEX_DECODE_KEY with transformers' attention and mask interfaces (idempotent). A custom key is not
-    gated by a model's _supports_flex_attn. Returns False when this transformers has no interfaces to register in."""
+    """Registers FLEX_DECODE_KEY (not gated by _supports_flex_attn); False if transformers has no interfaces."""
     global _REGISTERED
     if _REGISTERED:
         return True

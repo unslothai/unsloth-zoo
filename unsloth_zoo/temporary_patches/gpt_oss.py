@@ -404,8 +404,6 @@ def _gpt_oss_flex_mask(
 
     def build(device):
         if q_length == 1:
-            # Decode: the shared one-token BlockMask (unsloth_zoo.flex_attention.decode), with the graph contract when
-            # the graph decode attention is flex / auto and the identity can name mask_function.
             from unsloth_zoo.flex_attention.decode import build_decode_block_mask
             graph_mode = _gpt_oss_graph_decode_attention() if _gpt_oss_in_graph_generate() else None
             identity = _mask_function_identity(mask_function) if graph_mode in ("flex", "auto") else None
@@ -472,7 +470,6 @@ def _register_gpt_oss_flex_mask():
         return False
     if _GPT_OSS_FLEX_MASK not in ALL_MASK_ATTENTION_FUNCTIONS._global_mapping:
         ALL_MASK_ATTENTION_FUNCTIONS.register(_GPT_OSS_FLEX_MASK, _gpt_oss_flex_mask)
-    # accelerate moves masks with .to(), which leaves captured tensors behind; generate calls .contiguous().
     from unsloth_zoo.flex_attention.decode import install_block_mask_transfer
     install_block_mask_transfer()
     return True
