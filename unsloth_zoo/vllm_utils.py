@@ -4798,6 +4798,9 @@ def load_vllm(
                 # Tesla T4 is 280 tok/s vs 330 tok/s
                 if major_version >= 8:
                     os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
+                elif Version(vllm_version) >= Version("0.21.0"):
+                    # vLLM 0.21+ defaults it on where supported; forcing it raises on sm_75 from 0.24.
+                    os.environ.pop("VLLM_USE_FLASHINFER_SAMPLER", None)
                 elif Version(vllm_version) >= Version("0.11.0"):
                     # On 0.11.0, Flashinfer also works!
                     os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "1"
@@ -6705,6 +6708,24 @@ def _lora_is_sharded(model):
 pass
 
 
+def _lora_modules_state_dict(model):
+    """model.state_dict() over the lora_A / lora_B subtrees only: skips each bnb Linear4bit QuantState
+    pack (a GPU sync), keeps LoRA module hooks (stacked MoE LoRA emits per-expert keys there)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not isinstance(model, torch.nn.Module): return model.state_dict()
+    out = OrderedDict()
+    roots = []
+    for name, module in model.named_modules(remove_duplicate = False):
+        if not (".lora_A." in name + "." or ".lora_B." in name + "."):
+            continue
+        if any(name.startswith(r + ".") for r in roots[-1:]):
+            continue
+        roots.append(name)
+        module.state_dict(destination = out, prefix = name + ".")
+    return out
+pass
+
+
 def _lora_state_dict(model):
     """Full lora_A / lora_B tensors. Under FSDP2: gathered (collective on every rank), and taken outside
     inference mode, where FSDP2 state_dict fails with "Cannot set version_counter for inference tensor"."""
@@ -6712,7 +6733,7 @@ def _lora_state_dict(model):
     def lora_items(state_dict):
         return {k: v for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
     if not _lora_is_sharded(model):
-        return lora_items(model.state_dict())
+        return lora_items(_lora_modules_state_dict(model))
     from torch.distributed.tensor import DTensor
     _merged_rollout_log_once(
         "Unsloth: native FSDP2 gathers the LoRA adapters across ranks for save_lora / load_lora, "

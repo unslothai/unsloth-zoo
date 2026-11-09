@@ -155,8 +155,8 @@ if _HAS_TRITON:
         blocks_ptr, scales_ptr, out_ptr, experts_ptr, counts_ptr,
         N, G,
         stride_out_e, stride_out_n, stride_out_k,
-        BLOCK_N: tl.constexpr, BLOCK_G: tl.constexpr, USE_EXPERTS: tl.constexpr, USE_COUNTS: tl.constexpr,
-        BF16_BITS: tl.constexpr, LONG_INDEXING: tl.constexpr, EXACT_ROUND: tl.constexpr,
+        BLOCK_N: tl.constexpr, BLOCK_G: tl.constexpr, USE_EXPERTS: tl.constexpr, USE_COUNTS: tl.constexpr,  # tile rows / tile 32-wide groups / expert id list / skip empty experts
+        BF16_BITS: tl.constexpr, LONG_INDEXING: tl.constexpr, EXACT_ROUND: tl.constexpr,  # bf16 bit decode / int64 offsets / fp32 exact rounding
     ):
         pid_e = tl.program_id(0)
         pid_n = tl.program_id(1)

@@ -187,13 +187,13 @@ def moe_swiglu_backward_reference(grad, gate_up, act = ACT_SILU, interleaved = F
 if triton is not None:
 
     @triton.jit
-    def _rnd(x, ROUND: tl.constexpr, DT: tl.constexpr):
+    def _rnd(x, ROUND: tl.constexpr, DT: tl.constexpr):  # round to out dtype / out dtype
         if ROUND:
             return x.to(DT).to(tl.float32)
         return x
 
     @triton.jit
-    def _load_gate_up(GU, rows, cols, mask, s_m, s_c, N, INTERLEAVED: tl.constexpr):
+    def _load_gate_up(GU, rows, cols, mask, s_m, s_c, N, INTERLEAVED: tl.constexpr):  # gate / up interleaved columns
         base = GU + rows[:, None] * s_m
         if INTERLEAVED:
             g_col = cols.to(tl.int64) * 2
@@ -206,7 +206,7 @@ if triton is not None:
         return g, u, g_col, u_col
 
     @triton.jit
-    def _clamp_gptoss(g, u, LIMIT, ROUND: tl.constexpr, DT: tl.constexpr):
+    def _clamp_gptoss(g, u, LIMIT, ROUND: tl.constexpr, DT: tl.constexpr):  # round to out dtype / out dtype
         gc = _rnd(tl.where(g > LIMIT, LIMIT, g), ROUND, DT)
         uc = _rnd(tl.where(u > LIMIT, LIMIT, tl.where(u < -LIMIT, -LIMIT, u)), ROUND, DT)
         return gc, uc
@@ -224,11 +224,12 @@ if triton is not None:
     def _sigmoid(x):
         return _rcp_rn(1.0 + libdevice.exp(-x))
 
-    @triton.jit
+    # M (routed rows) runtime: BLOCK_M already buckets it; no extra %16 / == 1 variant per token count.
+    @triton.jit(do_not_specialize = ["M"])
     def _swiglu_fwd_kernel(
         GU, OUT, M, N, s_gm, s_gc, s_om, ALPHA, LIMIT,
-        ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,  # 1 gpt-oss clamp, else silu / interleaved / eager rounding
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,  # tile rows / tile intermediate cols
     ):
         rows = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
         cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -247,12 +248,12 @@ if triton is not None:
             y = s * u
         tl.store(OUT + rows[:, None] * s_om + cols[None, :], y.to(DT), mask = mask)
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ["M"])
     def _swiglu_bwd_kernel(
         DY, GU, DGU, M, N, s_dm, s_dc, s_gm, s_gc, s_om, ALPHA, LIMIT,
-        ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,
-        G_MAX_INC: tl.constexpr, U_MAX_INC: tl.constexpr, U_MIN_INC: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,  # 1 gpt-oss clamp, else silu / interleaved / eager rounding
+        G_MAX_INC: tl.constexpr, U_MAX_INC: tl.constexpr, U_MIN_INC: tl.constexpr,  # clamp bounds inclusive: gate max / up max / up min
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,  # tile rows / tile intermediate cols
     ):
         rows = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
         cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)

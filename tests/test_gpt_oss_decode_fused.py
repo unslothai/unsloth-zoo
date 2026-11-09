@@ -26,6 +26,7 @@ import textwrap
 
 import pytest
 import torch
+from _cpu_compiler_skip import skip_without_cpu_inductor
 
 pytest.importorskip("triton")
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -251,6 +252,8 @@ def loop_runs(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("gpt_oss_decode_loop")
     dev = "cuda" if torch.cuda.is_available() and torch.version.hip is None else "cpu"
     dtype = "bfloat16" if dev == "cuda" else "float32"
+    if dev == "cpu":
+        skip_without_cpu_inductor()
     return {
         arm: _run(
             tmp, _LOOP, dev, dtype,
