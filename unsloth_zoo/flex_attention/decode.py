@@ -248,7 +248,7 @@ def _device_capability(index):
 
 def _flex_decode_hd_limit(capability):
     # flex_decoding keeps a [BLOCK_N, head_dim] K and V tile per stage in shared memory: head_dim 512 needs the larger
-    # shared memory of compute capability 8.0+ (Unsloth's scripts README, Gemma 4 global layers).
+    # shared memory of compute capability 8.0+ (on a T4 no tile size compiles at 512).
     return 512 if capability >= (8, 0) else 256
 
 
@@ -280,11 +280,28 @@ def flex_decode_supported(head_dim, n_q, n_kv, dtype, device):
     return _supported(int(head_dim), int(n_q), int(n_kv), dtype, device.type, index)
 
 
+def _kv_tile(head_dim, capability):
+    """BLOCK_N for one-stage flex_decoding: the K and V tiles ([BLOCK_N, head_dim] each) plus the query tile must fit
+    shared memory. Below compute capability 8.0 (64 KB, T4) head_dim 256 needs 32 rows (the default 64 has no valid
+    config; 512 has none even at 16 rows, so flex_decode_supported stops at 256 there); on 8.0+ head_dim 512 is faster
+    with 32 rows (A100 and L4 measured 1.6-1.9x)."""
+    if capability < (8, 0):
+        return 32 if head_dim > 128 else None
+    return 32 if head_dim > 256 else None
+
+
 def flex_decode_kernel_options(head_dim, device = None):
-    """Decode kernel options: flex_decoding's defaults, with a smaller KV tile for head_dim > 256."""
+    """Decode kernel options: flex_decoding's defaults, with a smaller one-stage KV tile where shared memory needs it."""
     options = dict(decode_kernel_options())
-    if head_dim > 256 and not options.get("FORCE_USE_FLEX_ATTENTION", False):
-        options.setdefault("BLOCK_N", 32)
+    if options.get("FORCE_USE_FLEX_ATTENTION", False):
+        return options
+    device = torch.device(device) if device is not None else None
+    capability = (8, 0)
+    if device is not None and device.type == "cuda":
+        capability = _device_capability(device.index if device.index is not None else torch.cuda.current_device())
+    tile = _kv_tile(int(head_dim), capability)
+    if tile is not None:
+        options.setdefault("BLOCK_N", tile)
         options.setdefault("num_stages", 1)
     return options
 

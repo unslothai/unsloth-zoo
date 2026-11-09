@@ -322,3 +322,19 @@ def test_registration_adds_a_custom_key_that_needs_no_flex_support_flag():
         allow_is_causal_skip = False,
     )
     assert not isinstance(mask, flex.BlockMask)
+
+
+def test_kv_tile_fits_shared_memory():
+    # T4 (sm75, 64 KB): the default 64-row tile has no valid flex_decoding config at head_dim 256; 512 has none at
+    # any tile there, so it is not supported (SDPA).
+    assert D._kv_tile(64, (7, 5)) is None and D._kv_tile(128, (7, 5)) is None and D._kv_tile(256, (7, 5)) == 32
+    assert D._flex_decode_hd_limit((7, 5)) == 256 and D._flex_decode_hd_limit((8, 0)) == 512
+    # sm80+: defaults up to 256; 32 rows for 512 (measured faster on A100 and L4).
+    assert D._kv_tile(256, (8, 0)) is None and D._kv_tile(512, (8, 0)) == 32 and D._kv_tile(512, (8, 9)) == 32
+    monkey = D._device_capability
+    try:
+        D._device_capability = lambda index: (7, 5)
+        options = D.flex_decode_kernel_options(256, torch.device("cuda", 0))
+        assert options["BLOCK_N"] == 32 and options["num_stages"] == 1
+    finally:
+        D._device_capability = monkey
