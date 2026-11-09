@@ -3309,12 +3309,18 @@ def sft_prepare_dataset(
         if not completion_only_loss and "completion_mask" in mask_columns:
             mask_columns.remove("completion_mask")
         if mask_columns:
+            def _labels_row(input_ids, masks):
+                # Unrolled for one or two masks: `all(m)` built a list per token. Same truthiness as all().
+                if len(masks) == 1:
+                    return [t if m else -100 for t, m in zip(input_ids, masks[0])]
+                if len(masks) == 2:
+                    return [t if a and b else -100 for t, a, b in zip(input_ids, masks[0], masks[1])]
+                return [t if all(m) else -100 for t, *m in zip(input_ids, *masks)]
             def _build_labels(example):
-                masks = [example[x] for x in mask_columns]
-                return {"labels": [t if all(m) else -100 for t, *m in zip(example["input_ids"], *masks)]}
+                return {"labels": _labels_row(example["input_ids"], [example[x] for x in mask_columns])}
             def _build_labels_batched(batch):
                 return {"labels": [
-                    [t if all(m) else -100 for t, *m in zip(input_ids, *masks)]
+                    _labels_row(input_ids, masks)
                     for input_ids, *masks in zip(batch["input_ids"], *(batch[x] for x in mask_columns))
                 ]}
             label_kwargs = {}
