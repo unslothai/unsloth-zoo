@@ -358,6 +358,36 @@ def _rows_lack_input_ids(train_dataset):
 pass
 
 
+def _count_input_ids_arrow(train_dataset, final_counts):
+    """Counts input_ids straight from Arrow, skipping .map which builds Python lists of every column of every row.
+    Returns False (counting nothing) whenever the result could differ from the .map path; caller then falls back."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if type(train_dataset) is not datasets.Dataset: return False
+    try:
+        import pyarrow as pa
+        import pyarrow.compute as pc
+        dataset_format = train_dataset.format
+        if dataset_format.get("type") == "custom": return False
+        columns = dataset_format.get("columns")
+        if columns is not None and "input_ids" not in columns: return False
+        if "input_ids" not in train_dataset.column_names: return False
+        # with_format("arrow")[:] applies any select / shuffle / filter indices mapping, on input_ids alone
+        column = train_dataset.select_columns(["input_ids"]).with_format("arrow")[:]["input_ids"]
+        if column.null_count != 0: return False
+        if not (pa.types.is_list(column.type) or pa.types.is_large_list(column.type)): return False
+        if not pa.types.is_integer(column.type.value_type): return False
+        flat = pc.list_flatten(column)
+        if flat.null_count != 0: return False
+        ids = flat.to_numpy()
+        if len(ids) != 0 and (int(ids.min()) < 0 or int(ids.max()) >= len(final_counts)): return False
+        counts = np.bincount(ids.astype(np.int64, copy = False), minlength = len(final_counts))
+    except Exception:
+        return False
+    final_counts += counts
+    return True
+pass
+
+
 def _count_input_ids(train_dataset, mapping):
     """Only .map is datasets specific; a plain list of rows gets this far. A row with no
     "input_ids" is skipped, as in the checks above."""
@@ -714,7 +744,8 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         counter = np.fromiter(itertools.chain.from_iterable(input_ids), dtype = np.int32)
         np.add.at(final_counts, counter, 1)
     pass
-    _count_input_ids(train_dataset, mapping)
+    if not _count_input_ids_arrow(train_dataset, final_counts):
+        _count_input_ids(train_dataset, mapping)
 
     sum_embedding = torch.sum(embedding_matrix, dtype = torch.float32, axis = 0)
     sum_lm_head   = torch.sum(lm_head_matrix,   dtype = torch.float32, axis = 0)
