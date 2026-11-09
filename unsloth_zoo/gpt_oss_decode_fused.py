@@ -103,7 +103,7 @@ if HAS_TRITON:
     @triton.jit
     def _add_rms_norm_kernel(
         X, R, W, Y, S, N, stride_x, stride_r, stride_y, stride_s, eps, inv_n,
-        HAS_RES: tl.constexpr, BLOCK: tl.constexpr, EXACT: tl.constexpr,
+        HAS_RES: tl.constexpr, BLOCK: tl.constexpr, EXACT: tl.constexpr,  # residual add / cols per row (pow2 hidden) / libdevice rsqrt
     ):
         row = tl.program_id(0).to(tl.int64)
         cols = tl.arange(0, BLOCK)
@@ -124,15 +124,21 @@ if HAS_TRITON:
         w = tl.load(W + cols, mask = ok, other = 0.0).to(tl.float32)
         tl.store(Y + row * stride_y + cols, (y * w).to(Y.dtype.element_ty), mask = ok)
 
-    @triton.jit
+    # Fully runtime Q was 3-5% slower at decode (T4), so ONE_Q buckets it. sl_q stays specialized: always 1 for contiguous lse.
+    @triton.jit(do_not_specialize = ["Q", "sl_b", "sl_h"])
     def _sink_scale_kernel(
         A, LSE, SINK, OUT, H, Q, D,
         sa_b, sa_h, sa_q, sl_b, sl_h, sl_q, so_b, so_q, so_h,
-        BLOCK_D: tl.constexpr, EXACT: tl.constexpr,
+        BLOCK_D: tl.constexpr, EXACT: tl.constexpr,  # pow2 hd / exact libdevice exp + div_rn
+        ONE_Q: tl.constexpr,  # Q == 1 (decode)
     ):
         pid = tl.program_id(0)
-        q = pid % Q
-        bh = pid // Q
+        if ONE_Q:
+            q = 0
+            bh = pid
+        else:
+            q = pid % Q
+            bh = pid // Q
         h = bh % H
         b = (bh // H).to(tl.int64)
         lse = tl.load(LSE + b * sl_b + h * sl_h + q * sl_q).to(tl.float32)
@@ -152,7 +158,7 @@ if HAS_TRITON:
     def _rope_decode_kernel(
         Q, K, COS, SIN, QO, KO, HQ, HK, HALF,
         sq_b, sq_h, sk_b, sk_h, sc_b, ss_b, sqo_b, sqo_h, sko_b, sko_h,
-        BLOCK: tl.constexpr,
+        BLOCK: tl.constexpr,  # pow2 half hd
     ):
         pid = tl.program_id(0)
         b = (pid // (HQ + HK)).to(tl.int64)
@@ -237,7 +243,7 @@ def sink_scale_output(attn_output, lse, sinks):
                 attn_output.stride(0), attn_output.stride(1), attn_output.stride(2),
                 lse.stride(0), lse.stride(1), lse.stride(2),
                 out.stride(0), out.stride(1), out.stride(2))
-        consts = dict(BLOCK_D = triton.next_power_of_2(D), EXACT = _libdevice is not None)
+        consts = dict(BLOCK_D = triton.next_power_of_2(D), EXACT = _libdevice is not None, ONE_Q = Q == 1)
         if _INTERPRET:
             _sink_scale_kernel[(n,)](*args, **consts, num_warps = 1 if D <= 128 else 4)
         else:

@@ -76,9 +76,9 @@ if triton is not None:
         A, B, C, COUNTS, SCALE, BIAS,
         E, E_LO, E_HI, N, K,
         stride_am, stride_ak, stride_be, stride_bk, stride_bn, stride_cm, stride_bias_e,
-        A_MODE: tl.constexpr, ROW_SCALE: tl.constexpr, HAS_BIAS: tl.constexpr, IEEE: tl.constexpr,
-        E_POW2: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-        ENDS: tl.constexpr, GROUP_M: tl.constexpr = 0, EVEN_K: tl.constexpr = False,
+        A_MODE: tl.constexpr, ROW_SCALE: tl.constexpr, HAS_BIAS: tl.constexpr, IEEE: tl.constexpr,  # x direct / cast / hi-lo split, row scale, bias, ieee fp32
+        E_POW2: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  # num experts pow2 / tile M / N / K
+        ENDS: tl.constexpr, GROUP_M: tl.constexpr = 0, EVEN_K: tl.constexpr = False,  # cumulative ends / L2 row-tile group / K % BLOCK_K == 0
     ):
         # ENDS: COUNTS holds cumulative row ends. GROUP_M > 0: 1D grid, GROUP_M row tiles at a time (L2 reuse).
         if GROUP_M > 0:
@@ -157,8 +157,8 @@ if triton is not None:
         G, X, DW, COUNTS,
         E, N, K,
         stride_gm, stride_xm, stride_de, stride_dn, stride_dk,
-        IEEE: tl.constexpr, E_POW2: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ENDS: tl.constexpr,
+        IEEE: tl.constexpr, E_POW2: tl.constexpr,  # ieee fp32 dot / num experts pow2
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ENDS: tl.constexpr,  # tile M / N / K, cumulative row ends
     ):
         # DW[e, n, k] = sum over the rows m of expert e of G[m, n] * X[m, k]; zero for an empty expert.
         e = tl.program_id(0)
