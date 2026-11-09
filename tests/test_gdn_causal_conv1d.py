@@ -772,6 +772,7 @@ def test_patch_rebinds_a_hub_layer_imported_before_the_patch(hub_kernels, monkey
         fn = getattr(modeling, attr)
         # Without kernels the module holds transformers' wrapper; decorate its torch function again as import would.
         if isinstance(fn, torch.nn.Module):
+            # Skip because with kernels installed the module already holds the real layer (no __wrapped__ to rebuild from).
             pytest.skip("kernels installed: test_patch_rebinds_the_real_modeling_module covers the real layer")
         layer = decorator(attr, "causal_conv1d")(fn.__wrapped__)
         assert isinstance(layer, torch.nn.Module) and not hasattr(layer, "__wrapped__")
