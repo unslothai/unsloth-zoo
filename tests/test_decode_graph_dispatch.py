@@ -368,3 +368,124 @@ def test_flex_graph_contract_tells_same_line_lambdas_apart(G, monkeypatch):
     with S.graph_generate():
         ident = lambda fn: getattr(_decode_mask(G, monkeypatch, fn, torch.tensor(140)), "_unsloth_mask_identity", None)
         assert ident(a) is not None and ident(a) == ident(a) and ident(a) != ident(b)
+
+
+class _NoHostRead(torch.Tensor):
+    # A device offset stand-in: reading it on the host (a sync on CUDA, an error inside a capture) raises.
+    def __int__(self):
+        raise AssertionError("kv_offset read on the host")
+
+    def item(self):
+        raise AssertionError("kv_offset read on the host")
+
+
+def test_flex_mask_never_reads_a_tensor_kv_offset_on_the_host(G, monkeypatch):
+    # transformers passes an int kv_offset today (every cache layer's get_mask_sizes); a tensor one must not be
+    # turned into a host int to size the padding, and the mask must be the int offset's mask.
+    from torch.nn.attention.flex_attention import create_block_mask, create_mask
+    import unsloth_zoo.flex_attention.utils as U
+    from transformers.masking_utils import causal_mask_function
+    monkeypatch.setattr(U, "compiled_create_block_mask",
+                        lambda m, b, h, M, N, device = "cpu": create_block_mask(m, b, h, M, N, device = device),
+                        raising = False)
+    padding = torch.ones(2, 141, dtype = torch.long)
+    padding[1, :4] = 0
+    kw = dict(batch_size = 2, q_length = 1, kv_length = 300, q_offset = torch.tensor(140), mask_function = causal_mask_function,
+              attention_mask = padding, device = "cpu")
+    want = create_mask(G._gpt_oss_flex_mask(kv_offset = 0, **kw).mask_mod, 2, 1, 1, 300, device = "cpu")
+    offset = torch.tensor(0).as_subclass(_NoHostRead)
+    got = create_mask(G._gpt_oss_flex_mask(kv_offset = offset, **kw).mask_mod, 2, 1, 1, 300, device = "cpu")
+    assert torch.equal(got, want)
+
+
+def _visible_through_blocks(block_mask, kv_len):
+    # What flex attends to: keys inside the listed blocks that mask_mod keeps.
+    from torch.nn.attention.flex_attention import create_mask
+    rows = block_mask.kv_num_blocks.shape[0]
+    dense = create_mask(block_mask.mask_mod, rows, 1, 1, kv_len, device = "cpu")[:, 0, 0]
+    block = block_mask.BLOCK_SIZE[1]
+    listed = torch.zeros(rows, kv_len, dtype = torch.bool)
+    for b in range(rows):
+        for i in block_mask.kv_indices[b, 0, 0, : int(block_mask.kv_num_blocks[b, 0, 0])].tolist():
+            listed[b, i * block : (i + 1) * block] = True
+    return dense & listed
+
+
+@pytest.mark.parametrize("window", [None, 200])
+def test_flex_graph_contract_refill_moves_across_blocks(G, monkeypatch, window):
+    # A graph captured at position p replays later steps by refilling the BlockMask's tensor fields (block counts
+    # included) and the closure tensors, as unsloth's generic decode graphs do; the replayed mask must list the new
+    # blocks and match causal + window + padding visibility at p, p + BLOCK and p + 3 * BLOCK.
+    import copy
+    from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE as BLOCK
+    from transformers.masking_utils import causal_mask_function, sliding_window_causal_mask_function
+    monkeypatch.setenv("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "flex")
+    fn = causal_mask_function if window is None else sliding_window_causal_mask_function(window)
+    kv_len, p = 4 * BLOCK + 40, 20
+
+    def mask_at(q):
+        return _decode_mask(G, monkeypatch, fn, torch.tensor(q), kv_len = kv_len)
+
+    def expected(q):
+        j = torch.arange(kv_len)
+        pad = torch.zeros(2, kv_len, dtype = torch.bool)
+        pad[:, : q + 1] = True
+        pad[1, :4] = False
+        keep = (j <= q) & ((j > q - window) if window is not None else True)
+        return pad & keep
+
+    with S.graph_generate():
+        first = mask_at(p)
+        fields = {k: v.clone() for k, v in vars(first).items() if isinstance(v, torch.Tensor)}
+        static = copy.copy(first)
+        for k, v in fields.items():
+            setattr(static, k, v)
+        tensors, rebuild = first._unsloth_graph_closure
+        closure = tuple(t.clone() for t in tensors)
+        static.mask_mod = rebuild(closure)
+        assert "kv_num_blocks" in fields, sorted(fields)
+        assert torch.equal(_visible_through_blocks(static, kv_len), expected(p))
+        counts = []
+        for q in (p + BLOCK, p + 3 * BLOCK):
+            new = mask_at(q)
+            for k, v in fields.items():
+                v.copy_(getattr(new, k))
+            for dst, src in zip(closure, new._unsloth_graph_closure[0]):
+                dst.copy_(src)
+            assert torch.equal(_visible_through_blocks(static, kv_len), expected(q)), q
+            counts.append(int(static.kv_num_blocks.max()))
+        assert counts == [2, 4], counts
+
+
+def test_auto_graph_decode_falls_back_to_the_dense_mask(G, monkeypatch):
+    # "auto": stock masks go flex with a graph contract; a mask function the graph cannot key comes back as the
+    # dense eager mask, which the dense decode attention reads.
+    from transformers.masking_utils import causal_mask_function, eager_mask
+    monkeypatch.setenv("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "auto")
+    holder = {"w": 8}
+
+    def custom(b, h, q, kv):
+        return (kv <= q) & (kv > q - holder["w"])
+
+    one = torch.zeros(2, 1, 8)
+    assert not G._gpt_oss_graph_dense_attention(one)
+    with S.graph_generate():
+        stock = _decode_mask(G, monkeypatch, causal_mask_function, torch.tensor(140))
+        assert hasattr(stock, "_unsloth_graph_closure")
+        dense = _decode_mask(G, monkeypatch, custom, torch.tensor(140))
+        assert isinstance(dense, torch.Tensor) and dense.shape == (2, 1, 1, 300)
+        padding = torch.ones(2, 141, dtype = torch.long)
+        padding[1, :4] = 0
+        common = dict(batch_size = 2, kv_length = 300, kv_offset = 0, mask_function = custom,
+                      attention_mask = padding.bool())
+        if "q_length" in eager_mask.__code__.co_varnames:
+            want = eager_mask(q_length = 1, q_offset = torch.tensor(140), device = "cpu", **common)
+        else:
+            want = eager_mask(cache_position = torch.tensor([140]), **common)
+        assert torch.equal(dense, want)
+        assert G._gpt_oss_dense_decode_mask_ok(dense, 8)
+        assert G._gpt_oss_graph_dense_attention(one) and not G._gpt_oss_dense_graph_decode(one)
+        monkeypatch.setenv("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "flex")
+        assert not G._gpt_oss_graph_dense_attention(one)
+        monkeypatch.setenv("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "dense")
+        assert G._gpt_oss_graph_dense_attention(one) and G._gpt_oss_dense_graph_decode(one)

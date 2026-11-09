@@ -133,9 +133,11 @@ def _gpt_oss_flex_inference(device):
 def _gpt_oss_graph_decode_attention():
     """One-token attention inside a generate() call Unsloth decodes through CUDA graphs:
     "dense" (default) runs the sink attention over a dense mask, "flex" keeps flex_decoding on a BlockMask
-    whose tensors the graph refills (UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION, read per call)."""
+    whose tensors the graph refills, "auto" flex with the dense fallback (UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION, read
+    per call)."""
     mode = os.environ.get("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "dense").strip().lower()
-    return "flex" if mode == "flex" else "dense"
+    # "auto": flex where the mask publishes a graph contract, the dense mask otherwise (a custom mask function).
+    return mode if mode in ("flex", "auto") else "dense"
 
 
 def _gpt_oss_in_graph_generate():
@@ -152,6 +154,15 @@ def _gpt_oss_dense_graph_decode(inputs_embeds):
     return (
         isinstance(inputs_embeds, torch.Tensor) and inputs_embeds.dim() >= 2 and inputs_embeds.shape[1] == 1
         and _gpt_oss_in_graph_generate() and _gpt_oss_graph_decode_attention() == "dense"
+    )
+
+
+def _gpt_oss_graph_dense_attention(hidden_states):
+    """A one-token step of a graph-planned generate() whose mask came back dense: always in "dense" mode, and in
+    "auto" mode when the flex mask could not publish a graph contract."""
+    return (
+        isinstance(hidden_states, torch.Tensor) and hidden_states.dim() >= 2 and hidden_states.shape[1] == 1
+        and _gpt_oss_in_graph_generate() and _gpt_oss_graph_decode_attention() in ("dense", "auto")
     )
 
 
@@ -280,6 +291,11 @@ def _gpt_oss_flex_mask(
     """Mask for transformers' mask interface as a BlockMask (KV slot j is position kv_offset + j); 0-d tensor offsets
     keep the compiled build from specialising on decode."""
     from unsloth_zoo.flex_attention.utils import compiled_create_block_mask
+    passed = dict(
+        batch_size = batch_size, q_length = q_length, kv_length = kv_length, q_offset = q_offset,
+        kv_offset = kv_offset, mask_function = mask_function, attention_mask = attention_mask, device = device,
+        cache_position = cache_position, **kwargs,
+    )
     if q_length is None:
         # transformers 4.x: no q_length / device.
         q_length = cache_position.shape[0]
@@ -293,8 +309,11 @@ def _gpt_oss_flex_mask(
     padding = None
     if attention_mask is not None and attention_mask.dim() == 2:
         padding = attention_mask.to(dtype = torch.bool)
-        # Slots past the 2D mask (unwritten static cache slots) stay invisible.
-        missing = int(kv_length) + int(kv_off) - padding.shape[-1]
+        # Slots past the 2D mask (unwritten static cache slots) stay invisible. transformers passes an int kv_offset;
+        # a tensor one is not read on the host (a sync, and inside a capture an error): kv_offset is at most the
+        # mask's width, so kv_length more columns always cover it.
+        missing = int(kv_length) + (int(kv_off) if not isinstance(kv_off, torch.Tensor) else padding.shape[-1]) \
+            - padding.shape[-1]
         if missing > 0:
             padding = torch.nn.functional.pad(padding, (0, missing))
     q_length, kv_length = int(q_length), int(kv_length)
@@ -339,10 +358,10 @@ def _gpt_oss_flex_mask(
                 seq_lengths = (1, kv_length),
                 **({"compute_q_blocks": torch.is_grad_enabled()} if _HAS_COMPUTE_Q_BLOCKS else {}),
             )
-            identity = (
-                _mask_function_identity(mask_function)
-                if _gpt_oss_graph_decode_attention() == "flex" and _gpt_oss_in_graph_generate() else None
-            )
+            graph_mode = _gpt_oss_graph_decode_attention() if _gpt_oss_in_graph_generate() else None
+            identity = _mask_function_identity(mask_function) if graph_mode in ("flex", "auto") else None
+            if graph_mode == "auto" and identity is None:
+                return None
             if identity is not None:
                 # CUDA-graph decode refills these tensors and rebuilds mask_mod over its own copies; every value
                 # mask_mod reads besides them is a constant of mask_function, named by the identity (part of the
@@ -357,6 +376,19 @@ def _gpt_oss_flex_mask(
     # BlockMask.to() does not move mask_mod's captured tensors: rebuild per device. Weakref avoids a cycle.
     device = torch.device(device)
     block_mask = build(device)
+    if block_mask is None:
+        # "auto" graph decode with a mask function the graph cannot key or refill: the dense mask the dense decode
+        # attention reads, built by transformers' eager interface from the same arguments.
+        from transformers.masking_utils import eager_mask
+        args = {k: v for k, v in passed.items() if v is not None}
+        if attention_mask is not None and attention_mask.dim() == 2:
+            args["attention_mask"] = attention_mask.to(dtype = torch.bool)
+        if "cache_position" not in args and "cache_position" in inspect.signature(eager_mask).parameters:
+            # transformers 4.x eager_mask takes positions; a 5.x-style call carries the query offset instead.
+            args["cache_position"] = torch.arange(q_length, device = device) + (
+                q_off.to(device) if isinstance(q_off, torch.Tensor) else q_off
+            )
+        return eager_mask(**args)
     this, masks = weakref.ref(block_mask), {}
     def on_device(target):
         target = torch.device(target)
@@ -3573,7 +3605,7 @@ def patch_GptOssAttention():
         elif (
             query_states.shape[-2] == 1
             and _gpt_oss_dense_decode_mask_ok(attention_mask, query_states.shape[1])
-            and _gpt_oss_dense_graph_decode(hidden_states)
+            and _gpt_oss_graph_dense_attention(hidden_states)
         ):
             # One-token step of a CUDA-graph decode: the dense mask is a graph input, no BlockMask closure.
             attn_output, attn_weights = _gpt_oss_decode_attention(
