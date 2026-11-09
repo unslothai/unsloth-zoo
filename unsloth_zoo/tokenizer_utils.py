@@ -358,6 +358,9 @@ def _rows_lack_input_ids(train_dataset):
 pass
 
 
+_COUNT_INPUT_IDS_ARROW_BATCH_ROWS = 10_000
+
+
 def _count_input_ids_arrow(train_dataset, final_counts):
     """Counts input_ids straight from Arrow, skipping .map which builds Python lists of every column of every row.
     Returns False (counting nothing) whenever the result could differ from the .map path; caller then falls back."""
@@ -371,16 +374,20 @@ def _count_input_ids_arrow(train_dataset, final_counts):
         columns = dataset_format.get("columns")
         if columns is not None and "input_ids" not in columns: return False
         if "input_ids" not in train_dataset.column_names: return False
-        # with_format("arrow")[:] applies any select / shuffle / filter indices mapping, on input_ids alone
-        column = train_dataset.select_columns(["input_ids"]).with_format("arrow")[:]["input_ids"]
-        if column.null_count != 0: return False
-        if not (pa.types.is_list(column.type) or pa.types.is_large_list(column.type)): return False
-        if not pa.types.is_integer(column.type.value_type): return False
-        flat = pc.list_flatten(column)
-        if flat.null_count != 0: return False
-        ids = flat.to_numpy()
-        if len(ids) != 0 and (int(ids.min()) < 0 or int(ids.max()) >= len(final_counts)): return False
-        counts = np.bincount(ids.astype(np.int64, copy = False), minlength = len(final_counts))
+        counts = np.zeros(len(final_counts), dtype = np.int64)
+        # Bounded Arrow batches over input_ids alone (iter applies any select / shuffle / filter indices mapping)
+        for batch in train_dataset.select_columns(["input_ids"]).with_format("arrow").iter(batch_size = _COUNT_INPUT_IDS_ARROW_BATCH_ROWS):
+            column = batch["input_ids"]
+            if column.null_count != 0: return False
+            if not (pa.types.is_list(column.type) or pa.types.is_large_list(column.type)): return False
+            if not pa.types.is_integer(column.type.value_type): return False
+            flat = pc.list_flatten(column)
+            if flat.null_count != 0: return False
+            ids = flat.to_numpy()
+            if len(ids) == 0: continue
+            if int(ids.min()) < 0 or int(ids.max()) >= len(final_counts): return False
+            counts += np.bincount(ids.astype(np.int64, copy = False), minlength = len(final_counts))
+        pass
     except Exception:
         return False
     final_counts += counts

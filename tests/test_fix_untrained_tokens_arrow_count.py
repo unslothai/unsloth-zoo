@@ -47,8 +47,11 @@ _VARIANTS = {
 }
 
 
+@pytest.mark.parametrize("batch_rows", [10_000, 7])
 @pytest.mark.parametrize("name", list(_VARIANTS))
-def test_arrow_counts_match_the_map_path(name):
+def test_arrow_counts_match_the_map_path(name, batch_rows, monkeypatch):
+    # Small batches: the count is accumulated over bounded Arrow batches, never the whole column at once.
+    monkeypatch.setattr(tokenizer_utils, "_COUNT_INPUT_IDS_ARROW_BATCH_ROWS", batch_rows)
     train_dataset = _VARIANTS[name](_base())
     final_counts = np.zeros(V, dtype = np.int64)
 
@@ -121,3 +124,11 @@ def test_fix_untrained_tokens_skips_the_batched_map_and_matches_it(monkeypatch):
     monkeypatch.setattr(datasets.Dataset, "map", lambda self, *args, **kwargs: calls.append(kwargs.get("desc")))
     tokenizer_utils.fix_untrained_tokens(_Model(), _Tokenizer(), train_dataset)
     assert "Counting untrained tokens" not in calls
+
+
+def test_a_late_out_of_range_batch_leaves_the_counts_untouched(monkeypatch):
+    monkeypatch.setattr(tokenizer_utils, "_COUNT_INPUT_IDS_ARROW_BATCH_ROWS", 2)
+    train_dataset = datasets.Dataset.from_list([{"input_ids" : [1, 2]}] * 5 + [{"input_ids" : [V + 1]}])
+    final_counts = np.zeros(V, dtype = np.int64)
+    assert tokenizer_utils._count_input_ids_arrow(train_dataset, final_counts) is False
+    assert final_counts.tolist() == [0] * V
