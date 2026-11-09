@@ -238,6 +238,34 @@ def run_batched_store(device):
     assert ex.host_arena_stats()[kind]["live"] == live
 
 
+@pytest.mark.skipif(not _cuda(), reason = "needs CUDA + Triton")
+@pytest.mark.parametrize("how", ["refused", "disabled"])
+def test_ops_fold_exactly_without_pinned_memory(monkeypatch, how):
+    # Pinning refused (WSL2) or disabled: the stores and the ops' status tensors fall back to pageable memory, the
+    # fold / unfold still restores bit for bit and nothing stays folded.
+    if how == "disabled":
+        monkeypatch.setenv("UNSLOTH_DISABLE_PINNED_MEMORY", "1")
+    else:
+        def refuse(*args, **kwargs):
+            raise RuntimeError("pinned memory refused")
+
+        monkeypatch.setattr(torch.Tensor, "pin_memory", refuse)
+        monkeypatch.setattr(ex._ARENAS[True], "_new", lambda nbytes: refuse())
+    cases = [_case("cuda", 64 * (i + 1), 256, seed = 90 + i) for i in range(2)]
+    ws, As, Bs = [c[0] for c in cases], [c[1] for c in cases], [c[2] * 1e-3 for c in cases]
+    before = [w.clone() for w in ws]
+    ex.fold_weights_(ws, As, Bs, [0.5, 0.5], [901, 902])
+    ex.unfold_weights_(ws, As, Bs, [0.5, 0.5], [901, 902])
+    torch.cuda.synchronize()
+    for w, w0 in zip(ws, before):
+        assert torch.equal(_bits(w), _bits(w0))
+    w, A, B = _case("cuda", 32, 256, seed = 99)
+    w0 = w.clone()
+    ex.fold_weight_(w, A, B * 1e-3, 0.5, 903)
+    ex.unfold_weight_(w, A, B * 1e-3, 0.5, 903)
+    assert torch.equal(_bits(w), _bits(w0))
+
+
 def test_dropped_lease_waits_for_its_pending_copy():
     # A lease handed back before its unfold synchronizes the copy still writing into its slice before the arena can
     # reuse it, and gives the slice back even when that wait raises.

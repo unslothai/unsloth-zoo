@@ -879,11 +879,17 @@ pass
 
 
 def _status(rows, device):
-    # The ops' int64 status, copied from pinned memory without a host wait.
+    # The ops' int64 status, copied from pinned memory without a host wait; from pageable memory (synchronous) when
+    # pinning is disabled or refused (WSL2), as the stores do. It runs after the fold, so it must not fail.
     out = torch.tensor(rows, dtype = torch.int64)
     if device.type != "cuda":
         return out
-    return out.pin_memory().to(device, non_blocking = True)
+    if os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") != "1":
+        try:
+            return out.pin_memory().to(device, non_blocking = True)
+        except RuntimeError:
+            pass
+    return out.to(device)
 pass
 
 
