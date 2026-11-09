@@ -342,6 +342,13 @@ def run_empty_tiles(device):
     # Rows 96.. have B = 0 (a fresh LoRA): those tiles hold no code words and take the fast path; the others keep a
     # stream, including small-adapter rows 32..95 where a few elements still cross an exponent boundary.
     from unsloth_zoo.merged_rollout_exact import ExactFoldTarget, exact_fold, exact_unfold
+
+    def variants():
+        caches = getattr(ex._exact_merge_kernel, "device_caches", None) or {}
+        return {key: set(kernels[0]) for key, kernels in caches.items()}
+
+    # Other tests in the process may have compiled variants for other shapes already: count only this run's.
+    seen = variants()
     g = torch.Generator().manual_seed(7)
     for dtype in (torch.float16, torch.bfloat16):
         W = (torch.randn(160, 512, generator = g) * 0.02).to(dtype).to(device)
@@ -359,15 +366,45 @@ def run_empty_tiles(device):
         exact_unfold([t])
         assert torch.equal(_bits(W), _bits(W0)), dtype
     if device == "cuda":
-        caches = getattr(ex._exact_merge_kernel, "device_caches", None)
-        if caches:
-            for kernels in caches.values():
-                # One compiled variant per pass (count / fold / unfold) and weight dtype: fp16 and bf16 here.
-                assert len(kernels[0]) <= 6, len(kernels[0])
+        for key, kernels in variants().items():
+            # One compiled variant per pass (count / fold / unfold) and weight dtype: fp16 and bf16 here.
+            new = kernels - seen.get(key, set())
+            assert len(new) <= 6, len(new)
+
+
+def run_fold_failure_rolls_back(device):
+    # fold_weights_ whose fold raises after changing the weights (the store offload fails): the weights come back bit
+    # for bit, no key stays live, and the same keys fold and unfold again afterwards.
+    cases = [_case(device, 32 * (i + 1), 256, seed = 70 + i) for i in range(2)]
+    ws, As, Bs = [c[0] for c in cases], [c[1] for c in cases], [c[2] * 1e-3 for c in cases]
+    before = [w.clone() for w in ws]
+    real = ex._offload
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("offload failed")
+
+    ex._offload = broken
+    try:
+        try:
+            ex.fold_weights_(ws, As, Bs, [0.5, 0.5], [801, 802])
+        except RuntimeError as error:
+            assert "offload failed" in str(error)
+        else:
+            raise AssertionError("the fold should have raised")
+    finally:
+        ex._offload = real
+    for w, w0 in zip(ws, before):
+        assert torch.equal(_bits(w), _bits(w0))
+    assert not any(k[0] in (801, 802) for k in ex._OP_LIVE)
+    ex.fold_weights_(ws, As, Bs, [0.5, 0.5], [801, 802])
+    ex.unfold_weights_(ws, As, Bs, [0.5, 0.5], [801, 802])
+    for w, w0 in zip(ws, before):
+        assert torch.equal(_bits(w), _bits(w0))
 
 
 def run_all(device):
     run_empty_tiles(device)
+    run_fold_failure_rolls_back(device)
     run_compiled(device)
     run_arena_growth(device)
     run_arena_reuse(device)

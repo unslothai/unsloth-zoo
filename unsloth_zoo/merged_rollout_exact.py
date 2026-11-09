@@ -904,12 +904,27 @@ def _fold_weights_impl(
         if busy or len(set(slots)) != len(slots):
             raise RuntimeError(f"Unsloth: weight keys {busy or keys} are already folded or repeated; unfold them first.")
         for s in slots: _OP_LIVE[s] = None
+    targets = []
     try:
         targets = [ExactFoldTarget(*_as_3d(w, a, b), scale) for w, a, b, scale in zip(ws, as_, bs, scales)]
         exact_fold(targets, stream = _op_stream(ws[0].device))
     except BaseException:
+        # A fold that failed after changing weights (say its offload raised) is undone here from its stores, so the
+        # caller gets its weights back; if that undo fails too, the folded keys stay live for an unfold_weight_ call.
+        folded = [t for t in targets if t.folded]
+        restored = True
+        if folded:
+            try:
+                exact_unfold(folded)
+            except Exception:
+                restored = False
         with _OP_LOCK:
-            for s in slots: _OP_LIVE.pop(s, None)
+            for i, s in enumerate(slots):
+                t = targets[i] if i < len(targets) else None
+                if not restored and t is not None and t.folded:
+                    _OP_LIVE[s] = t
+                else:
+                    _OP_LIVE.pop(s, None)
         raise
     with _OP_LOCK:
         for s, t in zip(slots, targets): _OP_LIVE[s] = t
