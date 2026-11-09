@@ -107,8 +107,14 @@ def decode_padding(attention_mask, kv_length, kv_offset):
     """[B, kv_length] bool: slot j is a real token of row b. Read from the 2D mask at position kv_offset + j; positions
     past the mask (unwritten static slots) are invisible. A tensor offset is never read on the host."""
     full = attention_mask.to(dtype = torch.bool)
-    width = full.shape[-1]
-    position = torch.arange(int(kv_length), device = full.device) + (
+    width, kv_length = full.shape[-1], int(kv_length)
+    if not isinstance(kv_offset, torch.Tensor) and kv_offset >= 0:
+        # A host offset: the columns are a view, no gather kernels on the eager decode path.
+        padding = full[:, kv_offset : kv_offset + kv_length]
+        if padding.shape[-1] < kv_length:
+            padding = torch.nn.functional.pad(padding, (0, kv_length - padding.shape[-1]))
+        return padding
+    position = torch.arange(kv_length, device = full.device) + (
         kv_offset.to(full.device) if isinstance(kv_offset, torch.Tensor) else kv_offset
     )
     return full[:, position.clamp(max = width - 1)] & (position < width)

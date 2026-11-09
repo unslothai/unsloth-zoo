@@ -381,6 +381,13 @@ def _class_attr_window(b, h, q, kv):
     return (kv <= q) & (kv > q - _MaskConfig.WINDOW)
 
 
+_settings.Config = _MaskConfig
+
+
+def _nested_attr_window(b, h, q, kv):
+    return (kv <= q) & (kv > q - _settings.Config.WINDOW)
+
+
 def _module_attr_dict(b, h, q, kv):
     return (kv <= q) & (kv > q - _settings.STATE["window"])
 
@@ -406,6 +413,16 @@ def test_flex_graph_contract_keys_module_and_class_attributes(G, monkeypatch):
                 owner.WINDOW = 8
             assert ident(fn) == first
         assert ident(_module_attr_dict) is None
+        assert ident(_nested_attr_window) is None  # settings.Config.WINDOW cannot be keyed
+
+        class _Windowed:
+            def __init__(self, window):
+                self.window = window
+
+            def mask(self, b, h, q, kv):
+                return (kv <= q) & (kv > q - self.window)
+
+        assert ident(_Windowed(8).mask) is None  # a bound method's instance state cannot be keyed
         assert ident(_torch_attr_mask) is not None
 
 

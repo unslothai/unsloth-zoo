@@ -42,6 +42,7 @@ from .common import (
     logger,
 )
 from importlib.metadata import version as importlib_version
+from unsloth_zoo.decode_graph_state import in_graph_generate as _in_graph_generate
 from unsloth_zoo.utils import Version, _class_source
 from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
 try:
@@ -183,10 +184,7 @@ def _gpt_oss_graph_decode_attention():
 
 
 def _gpt_oss_in_graph_generate():
-    if torch.compiler.is_compiling():
-        return False
-    from unsloth_zoo.decode_graph_state import in_graph_generate
-    return in_graph_generate()
+    return not torch.compiler.is_compiling() and _in_graph_generate()
 
 
 def _gpt_oss_dense_graph_decode(inputs_embeds):
@@ -296,9 +294,10 @@ def _mask_function_identity(fn, depth = 4):
     out = []
 
     def walk(f, depth):
-        code = getattr(f, "__code__", None)
-        if depth <= 0 or code is None or not callable(f):
+        # Plain functions only: a bound method's __self__, a partial or a callable object carries state no key sees.
+        if depth <= 0 or type(f) is not types.FunctionType:
             return False
+        code = f.__code__
         out.append(f"{code.co_filename}:{code.co_firstlineno}:{getattr(code, 'co_qualname', code.co_name)}:{_code_digest(code)}")
         values = []
         for cell in getattr(f, "__closure__", None) or ():
@@ -326,6 +325,8 @@ def _mask_function_identity(fn, depth = 4):
                         found = _static_attribute(value, attr)
                         if found is _MISSING:
                             continue
+                        if isinstance(found, (types.ModuleType, type)) and not _library_namespace(found):
+                            return False  # settings.Config.WINDOW: a nested namespace's state is not keyed
                         out.append(f"{name}.{attr}")
                         if not isinstance(found, _MASK_CODE_TYPES):
                             values.append(found)
