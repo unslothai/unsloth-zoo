@@ -46,12 +46,17 @@ __all__ = [
     "clef_training_item",
     "clef_training_network",
     "collate_decisions",
+    "d1_training_item",
+    "d1_training_network",
     "decision_logits",
     "load_decision_model",
     "load_language_model_as_clef",
+    "load_language_model_as_d1",
     "load_trainable_decision_model",
     "save_clef_adapter",
     "save_clef_model",
+    "save_d1_model",
+    "d1_answer",
     "save_decision_model",
 ]
 
@@ -464,11 +469,12 @@ class DecisionPipeline:
     noul_true_first = False
     choice_sorted = False
     reads_images = reads_audio = False
+    null_state = False
     temperatures = {}
 
     def answer(self, state, questions, images = None, audio = None):
         """Answers keyed by question id and the prompt tokens spent; images are refused unless reads_images, and audio (base64 data URLs) unless reads_audio."""
-        if state is None:
+        if state is None and not self.null_state:
             raise DecisionRequestError('"state" must be provided')
         parsed = self._parse_questions(questions)
         urls, clips = _image_urls(state, images), _data_urls(audio, "audio", _MAX_AUDIO)
@@ -572,6 +578,9 @@ def _special_token(config, name):
     return token["content"] if isinstance(token, dict) else token
 
 
+_MARKER_BATCH_TOKENS = 8192
+
+
 class _MarkerModel(DecisionPipeline):
     """Laya and Julia-1: an encoder that scores each option at a mask token placed before it."""
 
@@ -653,16 +662,35 @@ class _MarkerModel(DecisionPipeline):
             ids += option
         return ids + [self.sep_id] + self._encode(_text(state)) + [self.sep_id], markers
 
-    def _score_question(self, state, questions, question):
-        ids, markers = self._prompt(state, question)
-        logits = self.model.logits({
-            "input_ids": np.array([ids]),
-            "attention_mask": np.ones((1, len(ids)), np.int64),
-            "marker_pos": np.array([markers]),
-            "marker_mask": np.ones((1, len(markers)), bool),
-            "qtype": np.array([_TYPES.index(question.type)]),
-        })
-        return [logits[0].tolist()], len(ids)
+    def _score_batch(self, rows):
+        length, options = max(len(ids) for _, ids, _ in rows), max(len(markers) for _, _, markers in rows)
+        batch = {
+            "input_ids": np.zeros((len(rows), length), np.int64),
+            "attention_mask": np.zeros((len(rows), length), np.int64),
+            "marker_pos": np.zeros((len(rows), options), np.int64),
+            "marker_mask": np.zeros((len(rows), options), bool),
+            "qtype": np.array([_TYPES.index(question.type) for question, _, _ in rows]),
+        }
+        for row, (_, ids, markers) in enumerate(rows):
+            batch["input_ids"][row, : len(ids)] = ids
+            batch["attention_mask"][row, : len(ids)] = 1
+            batch["marker_pos"][row, : len(markers)] = markers
+            batch["marker_mask"][row, : len(markers)] = True
+        logits = self.model.logits(batch)
+        return [[logits[row, : len(markers)].tolist()] for row, (_, _, markers) in enumerate(rows)]
+
+    def _scores(self, state, questions):
+        rows = [(question, *self._prompt(state, question)) for question in questions]
+        scores, start = [], 0
+        while start < len(rows):
+            # A batch costs its longest prompt per row, so a long prompt does not pad many short ones past this.
+            end, longest = start + 1, len(rows[start][1])
+            while end < len(rows) and (end - start + 1) * max(longest, len(rows[end][1])) <= _MARKER_BATCH_TOKENS:
+                longest = max(longest, len(rows[end][1]))
+                end += 1
+            scores += self._score_batch(rows[start:end])
+            start = end
+        return scores, sum(len(ids) for _, ids, _ in rows)
 
 
 _UNMERGEABLE = ("use_dora", "use_rslora", "lora_bias", "rank_pattern", "alpha_pattern", "modules_to_save")
@@ -1663,7 +1691,159 @@ class ClefModel(_QwenModel):
         return [[logits[start:end]] for start, end in zip(bounds, bounds[1:])], len(ids)
 
 
-FAMILIES = {"laya": _MarkerModel, "lev": _LevModel, "nimble": _NimbleModel, "openjev": _OpenJevModel, "kev": _KevModel, "clef": ClefModel}
+_D1_PACKAGES = {"lfm2_vl": "d1", "d1_omni": "d1_omni", "lfm3_vl": "d1_lfm3_vl", "lfm3_omni": "d1_lfm3_omni"}
+
+
+class _D1Model(DecisionPipeline):
+    """LiquidAI d1: mlx-vlm's engines read the model and its calibration; requests and answers are this module's."""
+
+    family = "d1"
+    sources = ("LiquidAI/d1-3B", "LiquidAI/d1-omni-600M", "LiquidAI/d1-2B", "LiquidAI/d1-Omni-2B")
+    needs = "its config.json naming a d1 model"
+    null_state = True
+    reads_images = True
+    _experts_apart = False
+
+    @staticmethod
+    def matches(folder):
+        config = _read_json(folder / "config.json") if (folder / "config.json").is_file() else {}
+        automodel = str((config.get("auto_map") or {}).get("AutoModel", ""))
+        return config.get("model_type") == "d1_omni" or "D1Model" in (config.get("architectures") or ()) or automodel.endswith("D1Model")
+
+    def __init__(self, folder, dtype, base_model = None, token = None):
+        from importlib.util import find_spec
+
+        from mlx_vlm.utils import load
+
+        self._backbone, self.source = _read_json(folder / "config.json").get("model_type"), folder
+        package = _D1_PACKAGES.get(self._backbone)
+        if package is None:
+            raise ValueError(f"Unsloth: {folder} is a d1 model on {self._backbone!r}, which this loader does not know.")
+        if find_spec(f"mlx_vlm.models.{package}") is None:
+            from .utils import _installed_mlx_vlm_version
+
+            raise ValueError(f"Unsloth: this d1 model needs a newer mlx-vlm than {_installed_mlx_vlm_version() or 'the installed one'}.")
+        self.model, self.processor = load(str(folder))
+        if dtype is not None:
+            self.model.set_dtype(dtype)
+        if hasattr(self.model, "attach_processor"):
+            self.model.attach_processor(self.processor)
+        self.reads_audio = self._backbone in ("d1_omni", "lfm3_omni")
+        # As llama.cpp orders them; d1-omni reads a noul false first.
+        self.noul_true_first = self._backbone != "d1_omni"
+
+    def _question(self, question):
+        spec = {"type": question.type, "instructions": _compact(question.instructions)}
+        if question.type == "choice":
+            spec["criteria"] = {key: description if description is None else _compact(description) for key, description in question.options}
+        elif question.type == "score":
+            spec["criteria"] = [_compact(description) for _, description in question.options]
+        elif any(description is not None for _, description in question.options):
+            spec["criteria"] = {key: description if description is None else _compact(description) for key, description in question.options}
+        return spec
+
+    def _output_head(self):
+        return None
+
+    def _read(self, state, questions, images, audio):
+        """Each question's probabilities in the order of its options, and the tokens read."""
+        if self._backbone == "d1_omni":
+            if images and audio:
+                raise DecisionUnsupportedError("this model reads images or audio in a request, not both")
+            if len(audio) > 1:
+                raise DecisionUnsupportedError("this model reads one audio clip in a request")
+            return self.model.probabilities(self.processor, [(state, questions, images or None, audio[0] if audio else None)])[0]
+        if self._backbone == "lfm2_vl":
+            from mlx_vlm.models.d1.prompt import as_question
+
+            return self.model.probabilities(self.processor, state, [as_question(question) for question in questions], images)
+        media = [*images, *({"type": "audio", "audio": clip, "sampling_rate": _AUDIO_RATE} for clip in audio)]
+        return self.model.engine.run([(state, [self.model.engine.ask(question) for question in questions], media)])[0]
+
+    def _scores(self, state, questions, images = (), audio = ()):
+        try:
+            probabilities, tokens = self._read(state, [self._question(question) for question in questions], list(images), list(audio))
+        except DecisionRequestError:
+            raise
+        except ValueError as error:
+            raise DecisionRequestError(str(error)) from error
+        # Scores whose softmax is what the engine answered: its calibration has been applied.
+        return [[[math.log(max(float(p), 1e-300)) for p in row]] for row in probabilities], tokens
+
+    def _format_answer(self, question, variants):
+        answer = super()._format_answer(question, variants)
+        if question.type == "noul" or self._backbone not in ("lfm3_vl", "lfm3_omni"):
+            return answer
+        # On LFM3 a score is its median level and a confidence the answer's probability.
+        probs = list(answer["probabilities"].values())
+        answer["confidence"] = max(probs)
+        if question.type == "score":
+            mass = 0.0
+            for level, p in enumerate(probs):
+                mass += p
+                if mass >= 0.5:
+                    break
+            answer["score"] = float(level)
+        return answer
+
+
+_VLM_PREPARED = ("decider2", "laya", "clef")
+
+
+class _VlmModel(DecisionPipeline):
+    """A checkpoint prepared for mlx-vlm's own `predict`: Decider, and Laya or Clef with their metadata in config.json.
+    Their source layouts load through `_MarkerModel` and `ClefModel`, which also train."""
+
+    family = "mlx_vlm"
+    sources = ("nativ-community/decider-2b", "Mapika/decider-2b")
+    needs = "config.json naming a prepared model, or decider_config.json beside a Qwen3.5 decoder"
+    _question = _D1Model._question
+
+    @staticmethod
+    def matches(folder):
+        if (folder / "decider_config.json").is_file():
+            return True
+        return (folder / "config.json").is_file() and _read_json(folder / "config.json").get("model_type") in _VLM_PREPARED
+
+    def __init__(self, folder, dtype, base_model = None, token = None):
+        from mlx_vlm.utils import load
+
+        config = _read_json(folder / "config.json")
+        if config.get("model_type") in _VLM_PREPARED:
+            self.model, self.processor = load(str(folder))
+        else:
+            # The published Decider names its decoder qwen3_5_text and keeps its settings apart.
+            prepared = {**config, "model_type": "decider2", "decision_config": _read_json(folder / "decider_config.json")}
+            with tempfile.TemporaryDirectory() as view:
+                for item in folder.iterdir():
+                    if item.name != "config.json":
+                        os.symlink(item.resolve(), Path(view) / item.name)
+                (Path(view) / "config.json").write_text(json.dumps(prepared), encoding = "utf-8")
+                self.model, self.processor = load(view)
+        if dtype is not None:
+            self.model.set_dtype(dtype)
+        self.reads_images = "images" in getattr(self.model, "decision_media", ())
+
+    def _scores(self, state, questions, images = (), audio = ()):
+        from mlx_vlm.decision import predict
+
+        media = {"images": list(images)} if images else {}
+        named = {question.id: self._question(question) for question in questions}
+        try:
+            result = predict(self.model, self.processor, state, named, **media)
+        except DecisionRequestError:
+            raise
+        except ValueError as error:
+            raise DecisionRequestError(str(error)) from error
+        scores = []
+        for question in questions:
+            answer = result["answers"][question.id]
+            probabilities = answer.get("probabilities") or {"true": answer["probability"], "false": 1 - answer["probability"]}
+            scores.append([[math.log(max(float(probabilities[key]), 1e-300)) for key, _ in question.options]])
+        return scores, result["usage"]["input_tokens"]
+
+
+FAMILIES = {"laya": _MarkerModel, "lev": _LevModel, "nimble": _NimbleModel, "openjev": _OpenJevModel, "kev": _KevModel, "clef": ClefModel, "d1": _D1Model, "mlx_vlm": _VlmModel}
 
 
 def detect_family(folder):
@@ -1732,6 +1912,42 @@ def load_language_model_as_clef(path, compute_dtype = None, *, head_width = None
     if isinstance(compute_dtype, str):
         compute_dtype = getattr(mx, compute_dtype)
     return ClefModel.from_language_model(folder, compute_dtype, token, head_width, head_config, seed, load_in_4bit)
+
+
+# What makes an LFM3 checkpoint a d1, as the released ones record it.
+_D1_TRAINED_CONFIG = {"architectures": ["D1Model"], "d1_attention": "set", "d1_codes": 2, "d1_numbers": True, "d1_set_size": 16}
+_D1_TRAINABLE = ("lfm3_vl", "lfm3_omni")
+
+
+def _as_d1_config(config):
+    return {**config, **_D1_TRAINED_CONFIG}
+
+
+def load_language_model_as_d1(path, compute_dtype = None, *, token = None):
+    """Load an LFM3-VL or LFM3-Omni language model to train as a d1, whose answers are its own output embedding at the
+    answer slots under set attention, so no head is added. A d1 checkpoint loads as it is, to go on training."""
+    folder = Path(path)
+    if not folder.is_dir():
+        from huggingface_hub import snapshot_download
+
+        folder = Path(snapshot_download(str(path), token = token))
+    if isinstance(compute_dtype, str):
+        compute_dtype = getattr(mx, compute_dtype)
+    if _D1Model.matches(folder):
+        pipeline = _D1Model(folder, compute_dtype)
+    else:
+        config = _read_json(folder / "config.json")
+        if config.get("model_type") not in _D1_TRAINABLE:
+            raise ValueError(f"Unsloth: a d1 trains on {' or '.join(_D1_TRAINABLE)}, not {config.get('model_type')!r}; load_language_model_as_clef takes other language models.")
+        with tempfile.TemporaryDirectory() as view:
+            for item in folder.iterdir():
+                if item.name != "config.json":
+                    os.symlink(item.resolve(), Path(view) / item.name)
+            (Path(view) / "config.json").write_text(json.dumps(_as_d1_config(config)), encoding = "utf-8")
+            pipeline = _D1Model(Path(view), compute_dtype)
+            mx.eval(pipeline.model.parameters())
+    pipeline.source = folder
+    return pipeline
 
 
 def _state_name(name):
@@ -1963,17 +2179,9 @@ def _commit_clef(pipeline, staging, folder, source, head, config, copied = ("*",
             item.unlink(missing_ok = True)
 
 
-def save_clef_model(pipeline, folder, source, config = None):
-    """Write a trained Clef pipeline as a Clef checkpoint in `folder`, in the layout of the released models.
-
-    `source` is the checkpoint it was loaded from. LoRA adapters are merged into the source weights, so a decoder
-    quantized on load still saves at the source precision, and a source that is itself MLX-quantized is requantized as
-    it was; a full fine-tune adds what its weights moved by since loading. `config` becomes
-    `unsloth_decision_config.json`; its `head_temperature` is folded into the head when the head can absorb it.
-    """
-    folder, source = _apart(folder, source)
-    config = {"layout": "clef", "temperature": [1.0, 1.0, 1.0], **(config or {}), "fine_tuned": True}
-    deltas, stored, refitted = _clef_decoder_deltas(pipeline.model, source), _stored_tensors(source), {}
+def _write_merged_shards(decoder, source, staging):
+    """The source's weights plus what training added to `decoder`, written to `staging`."""
+    deltas, stored, refitted = _clef_decoder_deltas(decoder, source), _stored_tensors(source), {}
     quantization = _read_json(source / "config.json").get("quantization", {})
 
     def refit(stem, leaf, tensors):
@@ -1995,31 +2203,44 @@ def save_clef_model(pipeline, folder, source, config = None):
         return refitted[stem].pop(leaf)
 
     packed = {name.rpartition(".")[0] for name in deltas if name.rpartition(".")[0] + ".scales" in stored}
+    for shard in sorted(source.glob("model*.safetensors")):
+        tensors, changed = mx.load(str(shard)), {}
+        for name, value in tensors.items():
+            stem, _, leaf = name.rpartition(".")
+            if stem in packed and leaf in ("weight", "scales", "biases"):
+                changed[name] = refit(stem, leaf, tensors)
+            elif name in deltas:
+                # transformers stores convolution kernels channels-first.
+                kernel = value.ndim == 3 and deltas[name][0][1].shape != value.shape
+                terms = [(sign, array.swapaxes(1, 2) if kernel else array) for sign, array in deltas.pop(name)]
+                if terms[0][1].shape != value.shape:
+                    raise ValueError(f"Unsloth: {name} has shape {value.shape} in {source}, not the trained {terms[0][1].shape}.")
+                changed[name] = _add_in_slices(name, value, terms)
+        if not changed:
+            shutil.copyfile(shard, staging / shard.name)
+            continue
+        tensors.update(changed)
+        mx.save_safetensors(str(staging / shard.name), tensors, metadata = {"format": "pt"})
+    if deltas:
+        raise ValueError(f"Unsloth: {source} holds no weights for the trained {sorted(deltas)[:3]}.")
+
+
+def save_clef_model(pipeline, folder, source, config = None):
+    """Write a trained Clef pipeline as a Clef checkpoint in `folder`, in the layout of the released models.
+
+    `source` is the checkpoint it was loaded from. LoRA adapters are merged into the source weights, so a decoder
+    quantized on load still saves at the source precision, and a source that is itself MLX-quantized is requantized as
+    it was; a full fine-tune adds what its weights moved by since loading. `config` becomes
+    `unsloth_decision_config.json`; its `head_temperature` is folded into the head when the head can absorb it.
+    """
+    folder, source = _apart(folder, source)
+    config = {"layout": "clef", "temperature": [1.0, 1.0, 1.0], **(config or {}), "fine_tuned": True}
     head = _clef_head(pipeline, config)
 
     folder.mkdir(parents = True, exist_ok = True)
     staging = Path(tempfile.mkdtemp(dir = folder, prefix = ".saving-"))
     try:
-        for shard in sorted(source.glob("model*.safetensors")):
-            tensors, changed = mx.load(str(shard)), {}
-            for name, value in tensors.items():
-                stem, _, leaf = name.rpartition(".")
-                if stem in packed and leaf in ("weight", "scales", "biases"):
-                    changed[name] = refit(stem, leaf, tensors)
-                elif name in deltas:
-                    # transformers stores convolution kernels channels-first.
-                    kernel = value.ndim == 3 and deltas[name][0][1].shape != value.shape
-                    terms = [(sign, array.swapaxes(1, 2) if kernel else array) for sign, array in deltas.pop(name)]
-                    if terms[0][1].shape != value.shape:
-                        raise ValueError(f"Unsloth: {name} has shape {value.shape} in {source}, not the trained {terms[0][1].shape}.")
-                    changed[name] = _add_in_slices(name, value, terms)
-            if not changed:
-                shutil.copyfile(shard, staging / shard.name)
-                continue
-            tensors.update(changed)
-            mx.save_safetensors(str(staging / shard.name), tensors, metadata = {"format": "pt"})
-        if deltas:
-            raise ValueError(f"Unsloth: {source} holds no weights for the trained {sorted(deltas)[:3]}.")
+        _write_merged_shards(pipeline.model, source, staging)
         _commit_clef(pipeline, staging, folder, source, head, config)
     finally:
         shutil.rmtree(staging, ignore_errors = True)
@@ -2430,6 +2651,14 @@ def clef_training_network(
     """Prepare a loaded Clef for training, returning its ClefNetwork; the float32 head always trains; the decoder trains
     whole under full_finetuning, else via LoRA; a Clef loaded from adapters keeps training them whatever r,
     lora_alpha, target_modules say; origin lets checkpoints be saved as adapters."""
+    _decoder_for_training(pipeline, full_finetuning, r, lora_alpha, target_modules, **lora)
+    pipeline.head.unfreeze()
+    network = ClefNetwork(pipeline, gradient_checkpointing, origin)
+    network.train()
+    return network
+
+
+def _decoder_for_training(pipeline, full_finetuning, r, lora_alpha, target_modules, **lora):
     from .loader import FastMLXModel, _lora_name_matches_target, _mlx_language_layers
     from .utils import _get_text_model, describe_output_head
 
@@ -2473,10 +2702,6 @@ def clef_training_network(
         FastMLXModel.get_peft_model(
             pipeline.model, r = r, lora_alpha = lora_alpha, target_modules = target_modules, use_gradient_checkpointing = False, **lora,
         )
-    pipeline.head.unfreeze()
-    network = ClefNetwork(pipeline, gradient_checkpointing, origin)
-    network.train()
-    return network
 
 
 def _clef_record_loss(network, item, objective = None, ordinal_scale = 0.0, reference = None, kl_weight = 0.0, capture = None):
@@ -2631,7 +2856,124 @@ def _clips(audio):
     return clips
 
 
+class D1Network(nn.Module):
+    """A loaded d1's model as the parameter tree the trainer optimizes; a record trains as `ClefNetwork`'s do."""
+
+    def __init__(self, pipeline, gradient_checkpointing = True):
+        super().__init__()
+        self.encoder = pipeline.model
+        self._pipeline, self._gradient_checkpointing = pipeline, bool(gradient_checkpointing)
+
+    def training_run(self):
+        return _decoder_training(self.encoder, self._gradient_checkpointing)
+
+    def decision_step(self, compiled = False, objective = None, reference = None):
+        return _ClefStep(self, objective, reference)
+
+
+def d1_training_network(pipeline, full_finetuning = False, r = 64, lora_alpha = 64, target_modules = "all-linear", gradient_checkpointing = True, **lora):
+    """Prepare a d1 for training: its decoder trains whole under full_finetuning, else via LoRA."""
+    if pipeline._backbone not in _D1_TRAINABLE:
+        raise ValueError(f"Unsloth: d1 training is for LFM3 checkpoints, not {pipeline._backbone!r}.")
+    # The loss reads uncalibrated scores and a save drops the calibration, so answers during training must too.
+    pipeline.model.engine.calibration = None
+    _decoder_for_training(pipeline, full_finetuning, r, lora_alpha, target_modules, **lora)
+    network = D1Network(pipeline, gradient_checkpointing)
+    network.train()
+    return network
+
+
+def d1_training_item(pipeline, state, questions, images = None, audio = None):
+    """Tokenize one record for a d1, its questions read in one row as `set` attention trained them; the caller adds
+    targets over clef_option_keys. Images are PIL or data URLs, audio clips data URLs or {array, sampling_rate} at 16 kHz mono."""
+    from mlx_vlm.models.d1_lfm3_vl.d1 import pack_set
+    from mlx_vlm.models.d1_lfm3_vl.prompt import prefix_text, question_header, suffix_layout
+
+    parsed, engine = pipeline._parse_questions(questions), pipeline.model.engine
+    if len(parsed) > engine.set_size:
+        raise DecisionRequestError(f"too many questions for one record, the maximum is {engine.set_size}")
+    asked = [engine.ask(pipeline._question(question)) for question in parsed]
+    # Merged with the state's image parts, as a request is served.
+    given = list(images or ())
+    urls = _image_urls(state, [image for image in given if isinstance(image, str)])
+    images, audio = given + urls[sum(isinstance(image, str) for image in given):], list(audio or ())
+    if urls:
+        state = _without_image_parts(state)
+    item ={"images": images, "audio": audio} if images or audio else {}
+    markup, _ = engine.media.encode(_d1_media(item)) if item else ("", [])
+    prefix = prefix_text(engine.tokenizer, state, engine.bos, engine.state_style, engine.system, markup)
+    layouts = [suffix_layout(engine.tokenizer, question, engine.lead) for question in asked]
+    suffixes = [text for text, _ in layouts]
+    first = engine.tokenizer.encode(prefix + suffixes[0], add_special_tokens = False)
+    ids, state_length, groups, ends = pack_set(engine.tokenizer, prefix, suffixes, question_header(engine.tokenizer, state), [offsets for _, offsets in layouts], first)
+    return {
+        **item, "input_ids": ids, "state_length": state_length, "groups": groups, "slots": [end[0] for end in ends], "asked": asked,
+        "option_spans": [[None] * len(question.options) for question in parsed], "types": [_TYPE_IDS.index(question.type) for question in parsed],
+    }
+
+
+def _d1_media(item):
+    from mlx_vlm.models.d1_lfm3_vl.media import media_list
+
+    return media_list([*_pictures(item.get("images", ())), *({"type": "audio", "audio": clip, "sampling_rate": _AUDIO_RATE} for clip in _clips(item.get("audio", ())))])
+
+
+def _d1_logits(pipeline, item):
+    """One logit per option of the record, in question order, as the engine reads them at the answer slots."""
+    from mlx_vlm.models.d1_lfm3_vl.prompt import readout_table
+
+    model, engine = pipeline.model, pipeline.model.engine
+    media = [model.d1_features(part) for part in engine.media.encode(_d1_media(item))[1]] if "images" in item else ()
+    hidden = model.d1_hidden(item["input_ids"], item["state_length"], item["groups"], media)
+    embed = model.language_model.model.embed_tokens
+    rows = []
+    for question, slot in zip(item["asked"], item["slots"]):
+        tokens, forms, _ = readout_table(engine.tokenizer, question)
+        scores = (hidden[slot] @ embed(mx.array(tokens)).T).astype(mx.float32)
+        rows.append(scores[mx.array(forms)].max(axis = -1))
+    return mx.concatenate(rows)
+
+
+def d1_answer(pipeline, question, probabilities):
+    """A question's answer from its probabilities by option key, as a d1 is served."""
+    parsed = pipeline._parse_questions({"question": question})[0]
+    return pipeline._format_answer(parsed, [[math.log(max(float(probabilities[key]), 1e-300)) for key, _ in parsed.options]])
+
+
+def save_d1_model(pipeline, folder, source = None, temperatures = None):
+    """Write a trained d1 as a d1 checkpoint mlx-vlm and `load_decision_model` read. LoRA adapters are merged into the
+    source's weights. A source's calibration describes the model before training, so it is not kept; `temperatures`,
+    fitted after training by question type, are written as its calibration instead."""
+    folder, source = _apart(folder, source or pipeline.source)
+    folder.mkdir(parents = True, exist_ok = True)
+    staging = Path(tempfile.mkdtemp(dir = folder, prefix = ".saving-"))
+    try:
+        _write_merged_shards(pipeline.model, source, staging)
+        for item in source.iterdir():
+            if item.is_file() and not item.name.startswith(".") and item.name not in ("README.md", "calibration.json", "config.json") and not (staging / item.name).exists():
+                shutil.copyfile(item, staging / item.name)
+        if temperatures:
+            # Its calibration names a choice by size and a score by its levels; every score is what is left to the default.
+            buckets = {"noul": temperatures["noul"], **{f"choice:{size}": temperatures["choice"] for size in ("small", "mid", "large", "inventory")}}
+            (staging / "calibration.json").write_text(json.dumps({"temperatures": buckets, "default": temperatures["score"]}), encoding = "utf-8")
+        (staging / "config.json").write_text(json.dumps(_as_d1_config(_read_json(source / "config.json")), indent = 2), encoding = "utf-8")
+        # config.json makes a folder a d1: it is replaced last, so an interrupted save does not read as complete.
+        (folder / "config.json").unlink(missing_ok = True)
+        (folder / "calibration.json").unlink(missing_ok = True)
+        # An earlier save's weights in another layout, or another kind of save, would be read beside these.
+        staged = {item.name for item in staging.iterdir()}
+        for item in [*folder.glob("model*.safetensors"), *(folder / name for name in ("model.safetensors.index.json", "joint_head.safetensors", "joint_head_config.json", "adapter_config.json", "adapter_model.safetensors"))]:
+            if item.name not in staged:
+                item.unlink(missing_ok = True)
+        for item in sorted(staging.iterdir(), key = lambda item: item.name == "config.json"):
+            os.replace(item, folder / item.name)
+    finally:
+        shutil.rmtree(staging, ignore_errors = True)
+
+
 def _item_logits(pipeline, item, output = None):
+    if "slots" in item:
+        return _d1_logits(pipeline, item)
     images, audio = item.get("images") or (), item.get("audio") or ()
     media = pipeline.encode_media(_pictures(images), _clips(audio))[1] if images or audio else None
     return pipeline.logits(item["input_ids"], item["question_spans"], item["option_spans"], item["types"], output, media)

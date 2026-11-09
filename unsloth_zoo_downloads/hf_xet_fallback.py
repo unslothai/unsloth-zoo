@@ -1083,6 +1083,12 @@ def _live_writer_names_for_repo(
     }
 
 
+def _open_files_is_safe(psutil) -> bool:
+    """psutil < 8 on Windows holds the GIL through open_files() and TerminateThread()s stuck handle queries, which
+    can hang the calling process for good (giampaolo/psutil#1967, fixed by #2894)."""
+    return sys.platform != "win32" or tuple(getattr(psutil, "version_info", ())) >= (8,)
+
+
 def _partial_paths_with_a_live_writer() -> Optional[set]:
     """Normalized paths, not basenames, since identical files share etags across repos; None when unanswerable, so the
     caller declines; skipped processes make it a lower bound."""
@@ -1091,6 +1097,8 @@ def _partial_paths_with_a_live_writer() -> Optional[set]:
     try:
         import psutil  # type: ignore
     except ImportError:
+        return None
+    if not _open_files_is_safe(psutil):
         return None
     open_blobs: set = set()
     try:
@@ -1308,12 +1316,13 @@ def _child_rss(pid: int) -> Optional[int]:
 def _child_open_incomplete_blobs(pid: int) -> Optional[set]:
     """Basenames of the .incomplete blobs pid has open, i.e. this child's own partial even when resumed; None if
     undeterminable, empty if the child is not yet writing (connect phase)."""
-    # psutil is cross-platform (Linux / macOS / Windows).
     try:
         import psutil  # type: ignore
     except ImportError:
         psutil = None  # type: ignore
     if psutil is not None:
+        if not _open_files_is_safe(psutil):
+            return None
         try:
             files = psutil.Process(pid).open_files()
         except Exception:

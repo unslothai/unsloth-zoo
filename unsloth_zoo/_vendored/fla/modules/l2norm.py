@@ -29,7 +29,7 @@ def l2norm_fwd_kernel1(
     rstd,
     eps,
     D,
-    BD: tl.constexpr,
+    BD: tl.constexpr,  # block along D
 ):
     i_t = tl.program_id(0)
     x += i_t * D
@@ -58,7 +58,7 @@ def l2norm_bwd_kernel1(
     dx,
     eps,
     D,
-    BD: tl.constexpr,
+    BD: tl.constexpr,  # block along D
 ):
     i_t = tl.program_id(0)
     y += i_t * D
@@ -86,9 +86,9 @@ def l2norm_fwd_kernel(
     rstd,
     eps,
     T,
-    D: tl.constexpr,
-    BD: tl.constexpr,
-    BT: tl.constexpr,
+    D: tl.constexpr,  # hidden dim
+    BD: tl.constexpr,  # block along D
+    BT: tl.constexpr,  # rows per program
 ):
     i_t = tl.program_id(0).to(tl.int64)
     o_t = i_t * BT + tl.arange(0, BT)
@@ -120,9 +120,9 @@ def l2norm_bwd_kernel(
     dx,
     eps,
     T,
-    D: tl.constexpr,
-    BD: tl.constexpr,
-    BT: tl.constexpr,
+    D: tl.constexpr,  # hidden dim
+    BD: tl.constexpr,  # block along D
+    BT: tl.constexpr,  # rows per program
 ):
     i_t = tl.program_id(0).to(tl.int64)
     o_t = i_t * BT + tl.arange(0, BT)
