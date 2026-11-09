@@ -235,8 +235,8 @@ _dispatch_depth = getattr(torch._C, "_len_torch_dispatch_stack", None)
 
 
 def _plain_eager(x):
-    # Raw pointers need real storage: no tracing, tensor subclass, vmap / functorch wrapper or dispatch mode.
-    if torch.compiler.is_compiling() or torch.jit.is_tracing() or type(x) is not torch.Tensor:
+    # Raw pointers need real storage: no tracing, tensor subclass, vmap / functorch wrapper, dispatch mode or neg view.
+    if torch.compiler.is_compiling() or torch.jit.is_tracing() or type(x) is not torch.Tensor or x.is_neg():
         return False
     if _is_wrapped is not None and _is_wrapped(x):
         return False
@@ -276,7 +276,7 @@ def _bnb_4bit_direct(self, x, quant_state):
         return None
     _, _, _, ptrs, _, N, K, blocksize, quant_type, picks, device = plan
     if x.shape[-1] != K or device != x.get_device() or (bias is not None and (
-        bias.dim() != 1 or bias.get_device() != device
+        bias.dim() != 1 or bias.get_device() != device or bias.is_neg()
     )):
         return None
     M = x.numel() // K

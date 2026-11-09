@@ -66,15 +66,15 @@ def recompute_w_u_fwd_kernel(
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    USE_G: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    USE_G: tl.constexpr,  # scalar gate
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // HV, i_bh % HV
@@ -150,15 +150,15 @@ def prepare_wy_repr_bwd_kernel(
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    USE_G: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    USE_G: tl.constexpr,  # scalar gate
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // HV, i_bh % HV

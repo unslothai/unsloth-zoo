@@ -3,11 +3,12 @@
 import json
 import os
 import math
+import sys
 import warnings
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import partial
+from functools import lru_cache, partial
 from pathlib import Path
 
 import mlx.core as mx
@@ -31,6 +32,7 @@ from .utils import (
     _extract_vlm_images,
     _finite_batch_schedule,
     _finite_row_schedule,
+    _length_sorted_windows,
     _finite_text_pad_width,
     _forward_text_hidden_states,
     _get_mlx_dropout_probability,
@@ -45,6 +47,7 @@ from .utils import (
     _preserved_preprocessing_rng,
     _processor_vlm_inputs,
     _render_vlm_messages,
+    _row_contiguous_cross_entropy,
     _row_has_images,
     _to_mx_vlm_batch,
     _torch_randperm_order,
@@ -53,6 +56,8 @@ from .utils import (
     _vlm_family_divergence,
     _vlm_forward_logits,
     _vlm_hidden_states,
+    _vlm_image_encoder,
+    _vlm_image_features,
     _vlm_media_bytes_digest,
     _vlm_pipeline_disposable_keys,
     _vlm_token_aligned_sidecars,
@@ -916,25 +921,18 @@ _VLM_TOKEN_SPAN_KEYS = ("image_bound", "audio_bounds")
 # Their pixels are a [crops, whole images] pair, each batched along its own axis.
 _PIXEL_COMPONENT_MODEL_TYPES = ("deepseekocr", "deepseekocr_2")
 
+# How many times a vision batch's processor outputs repeat, one copy per branch.
+_IMAGE_COPIES = "_unsloth_image_copies"
+
 
 def _vision_batch(
-    processor, model_config, rows, prompt_arrays, ids, lengths, *, same_pixels=False,
+    processor, model_config, rows, prompt_arrays, ids, lengths, *, same_pixels=False, split=False,
 ):
-    """A vision batch dict for packed rows with each branch's rows in turn; prompt_arrays holds each row's prompt arrays per branch."""
+    """A vision batch dict for packed rows with each branch's rows in turn; prompt_arrays holds each row's prompt arrays
+    per branch; split returns one dict per branch, all from one processor call."""
     branches = len(prompt_arrays[0])
-    width = ids.shape[1]
-    inputs = {
-        "input_ids": ids,
-        "attention_mask": (np.arange(width)[None, :] < lengths[:, 1:]).astype(np.int32),
-    }
-    for offset, branch_arrays in enumerate(prompt_arrays):
-        for branch, arrays in enumerate(branch_arrays):
-            output_row = offset + branch * len(rows)
-            for name, values in arrays:
-                if name not in inputs:
-                    inputs[name] = np.zeros(ids.shape, dtype=np.int32)
-                values = values[:width]
-                inputs[name][output_row, :len(values)] = values
+    model_type = _config_get(model_config, "model_type")
+    media = {}
     if any(row.images for row in rows):
         outputs = _processor_vlm_inputs(
             processor, [row.prompt_text for row in rows],
@@ -954,7 +952,6 @@ def _vision_batch(
                 "same size for a row on every read; a random resize or crop "
                 "changes it."
             )
-        model_type = _config_get(model_config, "model_type")
         rebuilt = (
             _VLM_WIDTH_GENERATED_KEYS
             if model_type in _VLM_POSITION_GENERATING_MODEL_TYPES
@@ -978,23 +975,100 @@ def _vision_batch(
                     "preference batching re-lays. This model is not supported "
                     "for preference training on image rows."
                 )
+            media[key] = value
+
+    def build(part):
+        part_ids = ids if len(part) == branches else np.concatenate(
+            [ids[branch * len(rows):(branch + 1) * len(rows)] for branch in part])
+        part_lengths = lengths if len(part) == branches else np.concatenate(
+            [lengths[branch * len(rows):(branch + 1) * len(rows)] for branch in part])
+        width = part_ids.shape[1]
+        inputs = {
+            "input_ids": part_ids,
+            "attention_mask": (np.arange(width)[None, :] < part_lengths[:, 1:]).astype(np.int32),
+        }
+        for offset, branch_arrays in enumerate(prompt_arrays):
+            for slot, branch in enumerate(part):
+                output_row = offset + slot * len(rows)
+                for name, values in branch_arrays[branch]:
+                    if name not in inputs:
+                        inputs[name] = np.zeros(part_ids.shape, dtype=np.int32)
+                    values = values[:width]
+                    inputs[name][output_row, :len(values)] = values
+        for key, value in media.items():
             if (
                 key in ("images", "pixel_values") and isinstance(value, (list, tuple))
                 and model_type in _PIXEL_COMPONENT_MODEL_TYPES
             ):
-                inputs[key] = [_repeated_per_branch(part, branches) for part in value]
+                inputs[key] = [_repeated_per_branch(piece, len(part)) for piece in value]
             else:
-                inputs[key] = _repeated_per_branch(value, branches)
-    batch = _to_mx_vlm_batch(inputs)
-    batch.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
-    batch = _prepare_vlm_batch_for_compile(batch, model_config)
-    if tuple(batch["input_ids"].shape) != tuple(ids.shape):
-        raise NotImplementedError(
-            "Unsloth MLX preference: this model expands its image tokens after "
-            "the processor, which moves the response spans. It is not supported "
-            "for preference training on image rows."
-        )
-    return batch
+                inputs[key] = _repeated_per_branch(value, len(part))
+        batch = _to_mx_vlm_batch(inputs)
+        batch.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+        batch = _prepare_vlm_batch_for_compile(batch, model_config)
+        if tuple(batch["input_ids"].shape) != tuple(part_ids.shape):
+            raise NotImplementedError(
+                "Unsloth MLX preference: this model expands its image tokens after "
+                "the processor, which moves the response spans. It is not supported "
+                "for preference training on image rows."
+            )
+        if len(part) > 1 and "pixel_values" in batch:
+            batch[_IMAGE_COPIES] = len(part)
+        return batch
+
+    if split:
+        return [build((branch,)) for branch in range(branches)]
+    return build(tuple(range(branches)))
+
+
+def _with_image_features(model, batch, *, stop_gradient=False, encode_single_copy=False):
+    """The batch with its image features from one tower run over one copy of its images; in one forward the gradient
+    sums over the tiled copies as over each. A batch of one copy is encoded only when ``stop_gradient`` (features
+    other passes read too) or ``encode_single_copy`` asks for it."""
+    if not isinstance(batch, Mapping) or "cached_image_features" in batch:
+        return batch
+    copies = batch.get(_IMAGE_COPIES, 1)
+    features = _vlm_image_features(model, batch, copies) if copies > 1 or stop_gradient or encode_single_copy else None
+    if features is None:
+        return batch
+    return {**batch, "cached_image_features": mx.stop_gradient(features) if stop_gradient else features}
+
+
+def _with_features_of(source, batch):
+    """``batch`` reading ``source``'s image features without gradient: a split vision batch's dicts hold the same images."""
+    features = source.get("cached_image_features") if isinstance(source, Mapping) else None
+    if features is None or not isinstance(batch, Mapping) or "cached_image_features" in batch:
+        return batch
+    return {**batch, "cached_image_features": mx.stop_gradient(features)}
+
+
+def _shares_image_features(model, batch, reference_policy):
+    """Whether one tower run serves the policy and its reference: a frozen tower the reference scores unchanged."""
+    encoder = isinstance(batch, Mapping) and batch.get("pixel_values") is not None and _vlm_image_encoder(model)
+    return bool(
+        encoder and reference_policy is not None and reference_policy.model is None
+        and not any(mlx.utils.tree_flatten(module.trainable_parameters()) for module in encoder.modules)
+        and reference_policy.leaves_untouched(encoder.module_ids)
+    )
+
+
+def _reference_logps(reference_policy, model, parts):
+    """Reference logps per ``(batch, lengths, response_scorer)`` part; vision parts holding the same images, as a split
+    vision batch's dicts do, read one tower run under the reference's weights."""
+    reference_model = getattr(reference_policy, "model", None)
+    if len(parts) < 2 or not isinstance(parts[0][0], Mapping) or _vlm_image_encoder(
+        model if reference_model is None else reference_model
+    ) is None:
+        return [
+            reference_policy.forward(model, batch, lengths, **({} if scorer is None else {"response_scorer": scorer}))
+            for batch, lengths, scorer in parts
+        ]
+    with reference_policy.activate(model) as reference:
+        first = _with_image_features(reference, parts[0][0], stop_gradient=True)
+        return [
+            mx.stop_gradient((_response_logps if scorer is None else scorer)(reference, _with_features_of(first, batch), lengths))
+            for batch, lengths, scorer in parts
+        ]
 
 
 class FinitePreferenceBatchPlan(_FiniteVisitMixin):
@@ -1004,11 +1078,12 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         "_rows", "_schedule", "_normalizers", "_widths", "_cycle_length",
         "max_seq_length", "pad_id", "_shape_plan", "_visit_policy",
         "_visit_seed", "_visit_epoch_cache", "_cce_capacities", "_cce_kind",
-        "_reference",
+        "_reference", "_shared_prompt_ratio", "_shared_lengths", "_shared_prompt_notices", "_window_sort_layouts",
     )
 
     def __init__(
-        self, rows, schedule, *, normalizers, cycle_length, max_seq_length, pad_id,
+        self, rows, schedule, *, normalizers, cycle_length, max_seq_length, pad_id, shared_prompt_ratio=None,
+        shared_prompt_notices=None,
     ):
         self._rows = tuple(rows)
         self._schedule = tuple(tuple(batch) for batch in schedule)
@@ -1023,6 +1098,9 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         self._visit_seed = None
         self._visit_epoch_cache = None
         self._reference = None
+        self._shared_prompt_ratio, self._shared_lengths = shared_prompt_ratio, {}
+        self._shared_prompt_notices = set() if shared_prompt_notices is None else shared_prompt_notices
+        self._window_sort_layouts = None
         self._widths = tuple(self._raw_width(batch) for batch in self._schedule)
 
     @property
@@ -1097,12 +1175,43 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
 
     def batch_family(self, index):
         pairs = len(self._schedule[index])
-        return (
+        family = (
             "preference_tuple_3",
             ((2 * pairs, "sequence"), "int32"),
             ((2 * pairs, 2), "int32"),
             ((3,), "int32"),
         )
+        shared = self.shared_prompt_length(index)
+        return family + ((("shared_prompt", shared),) if shared else ())
+
+    def use_length_sorted_windows(self, enabled):
+        super().use_length_sorted_windows(enabled)
+        self._shared_lengths.clear()  # keyed by batch position, which the switch reassigns
+
+    def shared_prompt_length(self, index):
+        """Leading tokens both rows of every pair in batch index share and run once, or 0: short of each row's last
+        prompt token, whose hidden state predicts its first response token; a multiple of 32, to bound compiled shapes;
+        and only when it cuts the batch's padded tokens by shared_prompt_ratio."""
+        if self._shared_prompt_ratio is None:
+            return 0
+        if index not in self._shared_lengths:
+            rows = [self._rows[item] for item in self._schedule[index]]
+            common = min(
+                next((i for i, (a, b) in enumerate(zip(row.chosen, row.rejected)) if a != b),
+                     min(len(row.chosen), len(row.rejected)))
+                for row in rows
+            )
+            prompt = min(min(len(row.chosen_prompt_ids), len(row.rejected_prompt_ids)) for row in rows)
+            shared, width = (min(common, prompt) - 1) // 32 * 32, self.batch_width(index)
+            per_row, once = 2 * (width - 1), shared + 2 * (width - 1 - shared)
+            refusal = "its pairs share too short a prompt to cut the padded tokens by shared_prompt_min_token_ratio"
+            if shared > 0 and per_row >= self._shared_prompt_ratio * once:
+                refusal = self._prefix_refusal(rows, shared)
+            if refusal is not None and refusal not in self._shared_prompt_notices:
+                _warn_shared_prompt(f"Unsloth MLX: shared_prompt_forward runs some batches per row, since {refusal}.")
+                self._shared_prompt_notices.add(refusal)
+            self._shared_lengths[index] = 0 if refusal else shared
+        return self._shared_lengths[index]
 
     def set_shape_plan(self, shape_plan):
         if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
@@ -1168,13 +1277,22 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         indices = self._schedule[index]
         rows = [self._rows[item] for item in indices]
         batch, lengths = self.pack(rows, self._materialized_width(index, phase))
+        shared = self.shared_prompt_length(index)
+        # The shared prompt carries a vision batch's images, so the rows' own batch skips the processor.
         materialized = (
-            self._inputs(rows, batch, lengths), mx.array(lengths),
+            mx.array(batch) if shared else self._inputs(rows, batch, lengths), mx.array(lengths),
             mx.array(self._normalizers[index], dtype=mx.int32),
         )
-        if self._reference is None:
-            return materialized
-        return materialized + (None, self._held_reference(indices))
+        reference = None if self._reference is None else self._held_reference(indices)
+        if shared:
+            return materialized + (None, reference, self._prefix_inputs(rows, batch, shared))
+        return materialized if reference is None else materialized + (None, reference)
+
+    def _prefix_refusal(self, rows, shared):
+        return None
+
+    def _prefix_inputs(self, rows, batch, shared):
+        return mx.array(batch[:len(rows), :shared])
 
     def _held_reference(self, indices):
         branches = len(self._branches(self._rows[indices[0]]))
@@ -1190,6 +1308,10 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         """The model input for packed rows; a vision plan returns a batch dict."""
         return mx.array(batch)
 
+    def _scored_inputs(self, rows, batch, lengths, *, reference=False):
+        """The inputs packed rows are scored from, each over its own share of the rows in turn."""
+        return [self._inputs(rows, batch, lengths, reference=reference)]
+
 
 class VisionPreferenceBatches:
     """Vision inputs for a preference plan's batches; a mixin, as those plans declare slots."""
@@ -1204,6 +1326,32 @@ class VisionPreferenceBatches:
 
     def _prompt_arrays(self, row):
         return row.chosen_prompt_arrays, row.rejected_prompt_arrays
+
+    def _prefix_refusal(self, rows, shared):
+        from .generate import _media_token_ids
+
+        # A media token past shared would leave its features without a place in the prompt that runs once.
+        tokens = _media_token_ids(self._model_config)
+        if any(row.images for row in rows) and not tokens:
+            return "the model config names no image tokens to place inside the shared prompt"
+        if any(
+            token < 0 or token in tokens for row in rows for values in (row.chosen, row.rejected)
+            for token in values[shared:]
+        ):
+            return "an image's tokens reach past the shared prompt"
+        if not all(
+            tuple(values[:shared]) == tuple(other[:shared])
+            for row in rows for (_, values), (_, other) in zip(*self._prompt_arrays(row))
+        ):
+            return "a pair's chosen and rejected prompts carry different image inputs within the shared prompt"
+        return None
+
+    def _prefix_inputs(self, rows, batch, shared):
+        return _vision_batch(
+            self._processor, self._model_config, rows, [self._prompt_arrays(row)[:1] for row in rows],
+            batch[:len(rows), :shared], np.full((len(rows), 2), shared, dtype=np.int32),
+            same_pixels=self._reference is not None,
+        )
 
     def _inputs(self, rows, batch, lengths, *, reference=False):
         return _vision_batch(
@@ -1227,8 +1375,9 @@ class VisionPreferenceBatches:
         with _preserved_preprocessing_rng():
             for index, indices in enumerate(self._schedule):
                 rows = [self._rows[item] for item in indices]
-                packed = self.pack(rows, self._widths[index])
-                surveyed.append(self._survey(self._inputs(rows, *packed)))
+                packed, shared = self.pack(rows, self._widths[index]), self.shared_prompt_length(index)
+                inputs = self._prefix_inputs(rows, packed[0], shared) if shared else self._inputs(rows, *packed)
+                surveyed.append(self._survey(inputs))
         forbidden = set().union(*(extents for _family, _padable, extents in surveyed))
         widths = []
         for width, (_family, padable, _extents) in zip(self._widths, surveyed):
@@ -1258,7 +1407,7 @@ class VisionPreferenceBatches:
         materialized = super().materialize(index, phase=phase)
         if planned:
             divergence = _vlm_family_divergence(
-                self._families[index], self._survey(materialized[0])[0],
+                self._families[index], self._survey(materialized[-1 if self.shared_prompt_length(index) else 0])[0],
             )
             if divergence is not None:
                 raise RuntimeError(
@@ -1280,23 +1429,29 @@ class FiniteVisionPreferenceBatchPlan(VisionPreferenceBatches, FinitePreferenceB
 
 
 def precompute_reference_logps(plan, model, reference_policy, *, batch_size, scorer=None):
-    """Precompute reference logps per row of ``plan``; kernels round per chunk shape, so batch like the live forward."""
+    """Precompute reference logps per row of ``plan``; kernels round per chunk shape, so batch like the live forward;
+    ``scorer`` scores the reference's own forward, as a loss's ``_unsloth_cce_reference_scorer`` does."""
     rows = plan.rows
     batch_size = max(1, int(batch_size))
     table = np.zeros((len(rows), 2), dtype=np.float32)
     for start in range(0, len(rows), batch_size):
         chunk = rows[start:start + batch_size]
         batch, lengths = plan.pack(chunk)
-        batch = plan._inputs(chunk, batch, lengths, reference=True)
-        lengths = mx.array(lengths)
-        options = {}
-        # The live forward scores through CCE too; full logits would defeat it.
-        if scorer is not None and reference_policy.model is None:
-            mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)
-            options["response_scorer"] = lambda model, batch, _lengths: -(
-                scorer(model, batch, mask > 0)[0] * mask
-            ).sum(axis=1)
-        logps = reference_policy.forward(model, batch, lengths, **options)
+        parts = plan._scored_inputs(chunk, batch, lengths, reference=True)
+        share = len(lengths) // len(parts)
+        scored = []
+        for offset, inputs in enumerate(parts):
+            part_lengths = mx.array(lengths[offset * share:(offset + 1) * share])
+            response_scorer = None
+            # The live forward scores through CCE too; full logits would defeat it.
+            if scorer is not None:
+                mask = _response_mask(_preference_ids(inputs)[:, 1:], part_lengths)
+                response_scorer = lambda model, batch, _lengths, mask=mask: -(
+                    scorer(model, batch, mask > 0, differentiated=False)[0] * mask
+                ).sum(axis=1)
+            scored.append((inputs, part_lengths, response_scorer))
+        logps = _reference_logps(reference_policy, model, scored)
+        logps = logps[0] if len(logps) == 1 else mx.concatenate(logps)
         mx.eval(logps)
         values = np.asarray(logps.tolist(), dtype=np.float32)
         # A plan whose rows carry one sequence each leaves the second column zero.
@@ -1375,10 +1530,14 @@ def create_preference_batch_plan(
     model_config=None,
     image_size=None,
     images_from=None,
+    shared_prompt_ratio=None,
+    shared_prompt_notices=None,
+    length_sorted_windows=False,
 ):
     """Builds the finite preference plan for every objective; prompt_sink receives each row's rendered prompt text; a
     processor gives a vision plan; image rows re-read images per batch when images_from (default dataset,
-    formatting_func) is a Hugging Face Dataset without formatting_func."""
+    formatting_func) is a Hugging Face Dataset without formatting_func; shared_prompt_ratio runs each
+    pair's prompt once in batches it cuts by that ratio (FinitePreferenceBatchPlan.shared_prompt_length)."""
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
         media_token_ids = frozenset(_image_truncation_token_ids(
@@ -1468,7 +1627,7 @@ def create_preference_batch_plan(
     vision = {} if processor is None else dict(
         processor=processor, model_config=model_config,
     )
-    return (FiniteVisionPreferenceBatchPlan if vision else FinitePreferenceBatchPlan)(
+    plan = (FiniteVisionPreferenceBatchPlan if vision else FinitePreferenceBatchPlan)(
         rows, schedule,
         normalizers=_window_normalizers(
             rows, schedule, cycle_length, grad_accum, length_policy.kind,
@@ -1476,8 +1635,22 @@ def create_preference_batch_plan(
         cycle_length=cycle_length,
         max_seq_length=length_policy.max_seq_length,
         pad_id=0 if pad_id is None else pad_id,
+        shared_prompt_ratio=shared_prompt_ratio,
+        shared_prompt_notices=shared_prompt_notices,
         **vision,
     )
+    if length_sorted_windows:
+        # Normalizers are window totals, so they hold for the re-cut windows unchanged.
+        sorted_schedule = _length_sorted_windows(
+            schedule,
+            lambda index: max(len(rows[index].chosen), len(rows[index].rejected)),
+            grad_accum,
+            cycle_length,
+        )
+        plan.install_length_sorted_windows(
+            sorted_schedule, [plan._raw_width(batch) for batch in sorted_schedule],
+        )
+    return plan
 
 
 @dataclass(frozen=True)
@@ -1867,7 +2040,7 @@ def create_kto_batch_plan(
 
 
 class FiniteKTOBatchPlan(FinitePreferenceBatchPlan):
-    """Batches are (ids, lengths, normalizers, labels[, reference]): completions first, then their KL rows when the loss has a KL term."""
+    """Batches are (ids, lengths, normalizers, labels[, reference]): completions first, then their KL rows when the loss has a KL term; compaction fills the reference slot (None without one), then each half's indices; FiniteVisionKTOBatchPlan lays out its own."""
 
     __slots__ = ("_with_kl",)
 
@@ -1897,33 +2070,87 @@ class FiniteKTOBatchPlan(FinitePreferenceBatchPlan):
             ((rows,), "bool"),
         )
 
+    def _scored_steps(self, rows, width, branch):
+        """Each row's scored positions in its branch, as indices into that branch's flattened next-token grid."""
+        for offset, row in enumerate(rows):
+            values, prompt = self._branches(row)[branch]
+            end = min(len(values), width, self.max_seq_length)
+            yield from (offset * (width - 1) + step - 1 for step in range(max(1, prompt), end))
+
     def configure_cce_compaction(self, enabled=True, *, kind="kto"):
+        """One capacity per branch, completions then KL rows, so each pass gathers only its own rows."""
         self._cce_capacities = {}
+        self._cce_kind = kind
+        if not enabled:
+            return
+        counts = {}
+        for index, row_indices in enumerate(self._schedule):
+            family = self.batch_family(index)
+            rows = [self._rows[row_index] for row_index in row_indices]
+            widths = {self.batch_width(index)}
+            if self._shape_plan is not None:
+                widths.add(self._shape_plan.endpoint_for(family, min(widths)))
+            for width in widths:
+                count = [sum(1 for _ in self._scored_steps(rows, width, branch))
+                         for branch in range(1 + self._with_kl)]
+                held = counts.get((family, width), count)
+                counts[family, width] = [max(a, b) for a, b in zip(held, count)]
+        for (family, width), count in counts.items():
+            _kind, _ids, _lengths, _normalizers, ((rows,), _labels), *_surveyed = family
+            capacities = tuple(max(256, ((value + 255) // 256) * 256) for value in count)
+            if all(capacity < rows * (width - 1) for capacity in capacities):
+                self._cce_capacities[family, width] = capacities
 
     def prepare_cce_batch(self, index, batch):
-        return batch
+        """Fill (reference, completion indices, KL indices) after the labels, keeping any later slot."""
+        width = _preference_ids(batch[0]).shape[1]
+        capacities = self._cce_capacities.get((self.batch_family(index), width))
+        if capacities is None:
+            return batch
+        rows = [self._rows[i] for i in self._schedule[index]]
+        arrays = []
+        for branch, capacity in enumerate(capacities):
+            selected = list(self._scored_steps(rows, width, branch))
+            indices = np.full(capacity, -1, dtype=np.int32)
+            indices[:len(selected)] = selected
+            arrays.append(mx.array(indices))
+        arrays += [None] * (2 - len(arrays))
+        return (*batch[:4], batch[4] if len(batch) > 4 else None, *arrays, *batch[7:])
 
     def materialize(self, index, *, phase=None):
         indices = self._schedule[index]
         rows = [self._rows[item] for item in indices]
         batch, lengths = self.pack(rows, self._materialized_width(index, phase))
+        inputs, *kl = self._scored_inputs(rows, batch, lengths)
         materialized = (
-            self._inputs(rows, batch, lengths), mx.array(lengths),
+            inputs, mx.array(lengths),
             mx.array(self._normalizers[index], dtype=mx.int32),
             mx.array([row.label for row in rows]),
         )
-        if self._reference is None:
-            return materialized
-        return materialized + (self._held_reference(indices),)
+        reference = None if self._reference is None else self._held_reference(indices)
+        if kl:
+            return materialized + (reference, None, None, *kl)
+        return materialized if reference is None else materialized + (reference,)
 
 
 class FiniteVisionKTOBatchPlan(VisionPreferenceBatches, FiniteKTOBatchPlan):
-    """KTO plan whose batches carry the processor's vision inputs."""
+    """KTO plan whose batches carry the processor's vision inputs; the KL rows come as their own dict, after the
+    compaction slots, so the policy scores them in a forward of their own."""
 
     __slots__ = _VISION_PLAN_SLOTS
 
     def _prompt_arrays(self, row):
         return (row.prompt_arrays,) * len(self._branches(row))
+
+    def _scored_inputs(self, rows, batch, lengths, *, reference=False):
+        return _vision_batch(
+            self._processor, self._model_config, rows,
+            [self._prompt_arrays(row) for row in rows], batch, lengths,
+            same_pixels=reference or self._reference is not None, split=True,
+        )
+
+    def _inputs(self, rows, batch, lengths, *, reference=False):
+        return self._scored_inputs(rows, batch, lengths, reference=reference)[0]
 
 
 def warn_kto_weight_balance(labels, desirable_weight, undesirable_weight):
@@ -2005,9 +2232,9 @@ def make_orpo_loss_fn(objective, *, _scorer=None):
     _require_kind(objective, "orpo")
     beta = objective.beta
 
-    def loss_fn(model, batch, lengths, normalizers, cce_indices=None):
+    def loss_fn(model, batch, lengths, normalizers, cce_indices=None, _reference=None, prefix=None):
         nll_sum, _batch_nll_tokens, ratio, stats = _orpo_scores(
-            model, batch, lengths, beta, scorer=_scorer, cce_indices=cce_indices,
+            model, batch, lengths, beta, scorer=_scorer, cce_indices=cce_indices, prefix=prefix,
         )
         nll_tokens, window_pairs, window_microbatches = normalizers
         loss = window_microbatches.astype(mx.float32) * (
@@ -2152,6 +2379,11 @@ class ReferencePolicy:
             for module, enabled in zip(self.neftune_modules, noise):
                 module._neftune_noise_enabled = enabled
 
+    def leaves_untouched(self, module_ids):
+        touched = {id(module) for module, _ in self.scales + self.targets}
+        touched.update(map(id, self.neftune_modules))
+        return touched.isdisjoint(module_ids)
+
     def forward(self, model, batch, lengths, *, response_scorer=None):
         scorer = _response_logps if response_scorer is None else response_scorer
         with self.activate(model) as reference:
@@ -2245,7 +2477,8 @@ def _preference_logits(model, batch):
     """Logits predicting each next token, for every position but the last."""
     if isinstance(batch, Mapping):
         return _next_token_positions(
-            _vlm_forward_logits(model, batch), batch["input_ids"], "logits",
+            _vlm_forward_logits(model, _with_image_features(model, batch)),
+            batch["input_ids"], "logits",
         )
     return _model_logits(model(batch[:, :-1]))
 
@@ -2253,15 +2486,85 @@ def _preference_logits(model, batch):
 def _preference_hidden(model, batch):
     if isinstance(batch, Mapping):
         return _next_token_positions(
-            _vlm_hidden_states(model, batch), batch["input_ids"], "hidden states",
+            _vlm_hidden_states(model, _with_image_features(model, batch)),
+            batch["input_ids"], "hidden states",
         )
     return _forward_text_hidden_states(model, batch[:, :-1])
+
+
+# mlx-lm stacks whose attention applies RoPE at cache.offset and masks through cache.make_mask on every layer.
+_SHARED_PROMPT_MODEL_TYPES = ("llama", "qwen2", "qwen3")
+# mlx-vlm stacks whose caches it covers: qwen3_5's linear-attention state, gemma4's windows and shared K/V.
+_SHARED_PROMPT_VLM_MODEL_TYPES = ("qwen3_5", "gemma4")
+
+
+def _warn_shared_prompt(message):
+    """A UserWarning at the caller's line that a fresh registry keeps the default filter from deduplicating."""
+    f = sys._getframe(1)
+    warnings.warn_explicit(message, UserWarning, f.f_code.co_filename, f.f_lineno, f.f_globals["__name__"], {})
+
+
+def shared_prompt_problem(model, max_seq_length, *, lora_dropout=True):
+    """Why model cannot run a pair's shared prompt once for both rows, or None; lora_dropout=False: dropout is off."""
+    from . import utils
+
+    if _make_preference_cce_scorer(model) is None:
+        return "it scores through the runtime CCE head, which this model's head rules out"
+    backbone = utils._get_text_backbone(model)
+    model_type = getattr(model, "model_type", None) or utils._config_get(getattr(model, "config", None), "model_type")
+    types = _SHARED_PROMPT_VLM_MODEL_TYPES if utils._is_vlm_model(model) else _SHARED_PROMPT_MODEL_TYPES
+    # A text-only VLM's ids path restarts Qwen's MRoPE positions at the suffix.
+    if model_type not in types or backbone is None or getattr(model, "_unsloth_text_only_vlm", False):
+        return (f"model_type={model_type!r} is not one of {', '.join(_SHARED_PROMPT_MODEL_TYPES)}, or "
+                f"{', '.join(_SHARED_PROMPT_VLM_MODEL_TYPES)} as a vision model")
+    if ropes := utils._length_dependent_ropes(backbone):
+        return f"its RoPE ({', '.join(ropes)}) may depend on the forward's length, not only the position"
+    if utils._shared_kv_slot_count(model):
+        return "this mlx-vlm leaves its K/V sharing to Unsloth's own slots, which cannot hold a shared prompt"
+    if any(getattr(layer, "enable_moe", False) for layer in backbone.layers):
+        return "its mixture-of-experts layers are not covered"
+    window = getattr(backbone, "sliding_window", None)
+    if any(getattr(layer, "use_sliding", False) for layer in backbone.layers) and (window or 0) < max_seq_length:
+        return f"its {window}-token sliding window is shorter than max_seq_length={max_seq_length}"
+    if lora_dropout and any(
+        utils._get_mlx_dropout_probability(getattr(module, "dropout", None)) > 0
+        for _, module in utils.iter_mlx_lora_modules(model)
+    ):
+        return "LoRA dropout would draw one mask over each shared prompt instead of one per row"
+    return None
+
+
+def _shared_prompt_hidden(model, batch, prefix):
+    """_preference_hidden's hidden states with each pair's prompt prefix [pairs, shared] (a vision batch for a vision
+    plan) run once: every chosen, then every rejected row continues from its prompt's caches; None without a prefix."""
+    if prefix is None:
+        return None
+    from .utils import _get_text_backbone, _prefix_cache, _vlm_hidden_states
+
+    backbone, ids = _get_text_backbone(model), _preference_ids(batch)
+    pairs, shared = _preference_ids(prefix).shape
+    repeats, recorded = ids.shape[0] // pairs, _prefix_cache(backbone)
+    vision = isinstance(prefix, Mapping)
+    head = (_vlm_hidden_states if vision else _forward_text_hidden_states)(model, prefix, cache=recorded)
+    positions = {}
+    if vision and prefix.get("_unsloth_collated_position_ids"):
+        # The suffix is text, so MRoPE continues past the prompt's largest position on all axes, the image's included.
+        start = mx.concatenate([prefix["position_ids"].max(axis=-1, keepdims=True).max(axis=0, keepdims=True) + 1] * repeats, axis=1)  # noqa: E501
+        steps = start + mx.arange(ids.shape[1] - 1 - shared)
+        positions["position_ids"] = mx.broadcast_to(steps, (prefix["position_ids"].shape[0], *steps.shape[1:]))
+    extended = _prefix_cache(backbone, recorded, repeats)
+    tail = _forward_text_hidden_states(model, ids[:, shared:-1], cache=extended, **positions)
+    return mx.concatenate([mx.concatenate([head] * repeats), tail], axis=1)
+
+
+def _repeated_prompt_span(prefix, pairs):
+    return None if prefix is None else (pairs, _preference_ids(prefix).shape[1])
 
 
 def _token_cross_entropy(logits, targets, mask):
     # An image token may lie past the output head (Mllama's does), so unscored labels are gathered as token 0, as TRL does.
     targets = mx.where(mask > 0, targets, 0)
-    return nn.losses.cross_entropy(
+    return _row_contiguous_cross_entropy(
         logits, targets, reduction="none",
     ).reshape(targets.shape)
 
@@ -2644,11 +2947,13 @@ def _dpo_pair_loss(objective, terms):
 def make_dpo_loss_fn(objective, *, reference_policy=None, _scorer=None):
     _require_kind(objective, "dpo")
     _require_reference(objective, reference_policy)
+    reference_scorer = _reference_scorer(reference_policy, _scorer)
 
-    def loss_fn(model, batch, lengths, normalizers, cce_indices=None, reference=None):
+    def loss_fn(model, batch, lengths, normalizers, cce_indices=None, reference=None, prefix=None):
         terms, stats = _dpo_scores(
             model, batch, lengths, objective, reference_policy=reference_policy,
             scorer=_scorer, cce_indices=cce_indices, reference=reference,
+            reference_scorer=reference_scorer, prefix=prefix,
         )
         pair_loss = _dpo_pair_loss(objective, terms)
         _, window_pairs, window_microbatches = normalizers
@@ -2658,6 +2963,7 @@ def make_dpo_loss_fn(objective, *, reference_policy=None, _scorer=None):
         return loss, mx.array(1, dtype=mx.int32), stats
 
     loss_fn._unsloth_supervised_tokens = _supervised_tokens
+    loss_fn._unsloth_cce_reference_scorer = reference_scorer
     loss_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS["dpo"]
     loss_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS["dpo"]
     loss_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH["dpo"]
@@ -2678,10 +2984,10 @@ def make_cpo_loss_fn(objective, *, _scorer=None):
     """Create a CPO loss with exact logical-window normalization."""
     _require_kind(objective, "cpo")
 
-    def loss_fn(model, batch, lengths, normalizers, cce_indices=None):
+    def loss_fn(model, batch, lengths, normalizers, cce_indices=None, _reference=None, prefix=None):
         nll_sum, _batch_nll_tokens, pair_loss, stats = _cpo_scores(
             model, batch, lengths, objective, scorer=_scorer,
-            cce_indices=cce_indices,
+            cce_indices=cce_indices, prefix=prefix,
         )
         nll_tokens, window_pairs, window_microbatches = normalizers
         loss = window_microbatches.astype(mx.float32) * _cpo_loss(
@@ -2706,13 +3012,13 @@ def _scatter_rows(values, indices, size):
     return mx.zeros((size,), values.dtype).at[mx.maximum(indices, 0)].add(values)
 
 
-def _head_logit_sums(hidden, weight, scales, biases, quantization, softcap):
+def _head_logit_sums(hidden, weight, scales, biases, quantization, softcap, chunk_rows=None):
     """Per-row logit sums over the vocabulary, chunked; uncapped logits are linear in the head, so sums project onto
-    summed weight rows; a softcap needs the logits themselves."""
+    summed weight rows; a softcap needs the logits themselves, chunked as for chunk_rows rows (default hidden's)."""
     vocab = weight.shape[0]
     # Without a softcap a chunk holds weight rows, not a row of logits per token.
     step = _resolve_chunk_size(
-        0, hidden.shape[0] if softcap else hidden.shape[-1], vocab,
+        0, (hidden.shape[0] if chunk_rows is None else chunk_rows) if softcap else hidden.shape[-1], vocab,
     )
     total = 0.0
     for start in range(0, vocab, step):
@@ -2727,6 +3033,17 @@ def _head_logit_sums(hidden, weight, scales, biases, quantization, softcap):
         else:
             total = total + chunk[0].astype(mx.float32).sum(axis=0)
     return total if softcap else hidden.astype(mx.float32) @ total
+
+
+@lru_cache(maxsize=64)
+def _repeated_prompt_layout(rows, width, pairs, length):
+    grid = np.arange(rows * width).reshape(rows, width)
+    source = grid.copy()
+    source[pairs:, :length] = grid[np.arange(pairs, rows) % pairs, :length]
+    unique = np.flatnonzero(source.reshape(-1) == grid.reshape(-1))
+    position = np.zeros(rows * width, dtype=np.int64)
+    position[unique] = np.arange(unique.size)
+    return mx.array(unique.astype(np.int32)), mx.array(position[source.reshape(-1)].astype(np.int32))
 
 
 def _make_preference_cce_scorer(model, *, temperature=1.0):
@@ -2755,15 +3072,20 @@ def _make_preference_cce_scorer(model, *, temperature=1.0):
                             bits=getattr(desc.module, "bits", 4),
                             mode=getattr(desc.module, "mode", "affine"))
     frozen = not utils._is_lm_head_trainable(model)
-    kernel = utils._get_runtime_cce(ignore_index=-100, logit_softcap=softcap,
-                                    quantized=desc.quantized, weight_is_frozen=frozen,
-                                    **quantization)
+    options = dict(ignore_index=-100, logit_softcap=softcap, quantized=desc.quantized,
+                   weight_is_frozen=frozen, **quantization)
+    by_mode, loss_only = utils._runtime_cce_by_mode(**options), utils._get_runtime_cce(**options)
 
-    def score(model, batch, supervised, indices=None, *, every_position=False, logit_sums=True):
+    def score(model, batch, supervised, indices=None, *, every_position=False, logit_sums=True,
+              differentiated, hidden=None, shared=None):
         """Token cross entropy and logit sums per position as float32 grids; cross entropy is zero outside supervised;
-        indices limit the rows, and the sums too unless every_position; without logit_sums the sums are None."""
+        indices limit the rows, and the sums too unless every_position; without logit_sums the sums are None; every call
+        states differentiated, False for a score no gradient reaches, since a training-mode kernel builds the hidden
+        gradient in its forward; hidden replaces the model's hidden states; shared=(pairs, length): rows past pairs
+        repeat those rows' first length positions, whose softcapped logit sums are then computed once."""
+        kernel = by_mode(model) if differentiated else loss_only
         targets = _preference_ids(batch)[:, 1:]
-        hidden = _preference_hidden(model, batch)
+        hidden = _preference_hidden(model, batch) if hidden is None else hidden
         head = utils._resolve_module_path(model, desc.path)
         # Before compaction: the logit sums below may read every row.
         hidden = utils._rotate_head_input(head, hidden.reshape((-1, hidden.shape[-1])))
@@ -2788,7 +3110,12 @@ def _make_preference_cce_scorer(model, *, temperature=1.0):
         if not logit_sums:
             return ce.reshape(targets.shape), None
         summed = hidden if every_position or indices is None else rows
-        sums = _head_logit_sums(summed, weight, scales, biases, quantization, softcap)
+        if softcap and summed is hidden and shared is not None:
+            once, positions = _repeated_prompt_layout(*targets.shape, *shared)
+            sums = _head_logit_sums(mx.take(hidden, once, axis=0), weight, scales, biases, quantization, softcap,
+                                    chunk_rows=hidden.shape[0])[positions]
+        else:
+            sums = _head_logit_sums(summed, weight, scales, biases, quantization, softcap)
         if indices is not None and summed is rows:
             sums = _scatter_rows(sums, indices, targets.size)
         return ce.reshape(targets.shape), mx.stop_gradient(sums.reshape(targets.shape))
@@ -2803,6 +3130,14 @@ def _logit_totals(sums, mask, vocab):
     sums = sums * mask
     return (sums[:pairs].sum(), sums[pairs:].sum(),
             mask[:pairs].sum() * vocab, mask[pairs:].sum() * vocab)
+
+
+def _reference_scorer(reference_policy, scorer, **options):
+    """The reference forward's scorer: the policy's own under adapter overrides, else one built for ref_model, whose
+    head need not match; None without a policy scorer."""
+    if scorer is None or getattr(reference_policy, "model", None) is None:
+        return scorer
+    return _make_preference_cce_scorer(reference_policy.model, **options)
 
 
 def make_dpo_cce_loss_fn(model, objective, *, reference_policy=None):
@@ -2949,7 +3284,7 @@ def _preference_forward(model, batch, supervised):
     return logits, _token_cross_entropy(logits, _preference_ids(batch)[:, 1:], supervised)
 
 
-def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None):
+def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None, differentiated=True, prefix=None):
     """Unreduced: training normalizes over its window, evaluation over the batch."""
     ids = _preference_ids(batch)
     pairs = ids.shape[0] // 2
@@ -2963,7 +3298,9 @@ def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None):
     if scorer is None:
         logits, ce = _preference_forward(model, batch, supervised)
     else:
-        ce, sums = scorer(model, batch, supervised, cce_indices, every_position=True)
+        ce, sums = scorer(model, batch, supervised, cce_indices, every_position=True,
+                          differentiated=differentiated, hidden=_shared_prompt_hidden(model, batch, prefix),
+                          shared=_repeated_prompt_span(prefix, pairs))
         logit_totals = _logit_totals(sums, mx.ones(sums.shape, mx.float32), scorer.vocab)
     response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
         mask.sum(axis=1), mx.array(1.0),
@@ -2983,7 +3320,8 @@ def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None):
     return nll_sum, nll_tokens, ratio, stats
 
 
-def _cpo_scores(model, batch, lengths, objective, *, scorer=None, cce_indices=None):
+def _cpo_scores(model, batch, lengths, objective, *, scorer=None, cce_indices=None, differentiated=True,
+                prefix=None):
     """Unreduced: training normalizes over its window, evaluation over the batch."""
     pairs = lengths.shape[0] // 2
     logits = logit_totals = None
@@ -2991,7 +3329,9 @@ def _cpo_scores(model, batch, lengths, objective, *, scorer=None, cce_indices=No
     if scorer is None:
         logits, ce = _preference_forward(model, batch, mask)
     else:
-        ce, sums = scorer(model, batch, mask > 0, cce_indices, every_position=True)
+        ce, sums = scorer(model, batch, mask > 0, cce_indices, every_position=True,
+                          differentiated=differentiated, hidden=_shared_prompt_hidden(model, batch, prefix),
+                          shared=_repeated_prompt_span(prefix, pairs))
         logit_totals = _logit_totals(sums, mx.ones(sums.shape, mx.float32), scorer.vocab)
     logps = -(ce * mask).sum(axis=1)
     if objective.length_normalized:
@@ -3017,24 +3357,34 @@ def _cpo_scores(model, batch, lengths, objective, *, scorer=None, cce_indices=No
 
 
 def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
-                scorer=None, cce_indices=None, reference=None):
-    """Score one DPO batch; ``reference`` holds precomputed reference log probabilities."""
+                scorer=None, cce_indices=None, reference=None, differentiated=True, reference_scorer=None,
+                prefix=None):
+    """Score one DPO batch; ``reference`` holds precomputed reference log probabilities; ``prefix`` holds each pair's
+    shared prompt tokens, run once for both rows by policy and reference alike."""
+    if reference is None and not objective.reference_free:
+        # Under a prefix the rows are ids only and the images ride in the prefix's vision batch.
+        if _shares_image_features(model, batch, reference_policy):
+            batch = _with_image_features(model, batch, stop_gradient=True)
+        elif _shares_image_features(model, prefix, reference_policy):
+            prefix = _with_image_features(model, prefix, stop_gradient=True)
     pairs = lengths.shape[0] // 2
     logits = logit_totals = None
     mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)
     if scorer is None:
         logits, ce = _preference_forward(model, batch, mask)
     else:
-        ce, sums = scorer(model, batch, mask > 0, cce_indices)
+        ce, sums = scorer(model, batch, mask > 0, cce_indices, differentiated=differentiated,
+                          hidden=_shared_prompt_hidden(model, batch, prefix))
         logit_totals = _logit_totals(sums, mask, scorer.vocab)
     logps = -(ce * mask).sum(axis=1)
     if reference is not None:
         reference = reference.astype(logps.dtype)
     elif objective.reference_free:
         reference = mx.zeros(logps.shape, dtype=logps.dtype)
-    elif scorer is not None and reference_policy.model is None:
+    elif reference_scorer is not None:
         def response_scorer(model, batch, _lengths):
-            return -(scorer(model, batch, mask > 0, cce_indices)[0] * mask).sum(axis=1)
+            return -(reference_scorer(model, batch, mask > 0, cce_indices, differentiated=False,
+                                      hidden=_shared_prompt_hidden(model, batch, prefix))[0] * mask).sum(axis=1)
         reference = reference_policy.forward(model, batch, lengths, response_scorer=response_scorer)
     else:
         reference = reference_policy.forward(model, batch, lengths)
@@ -3073,12 +3423,14 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
     scorer = None if model is None else _make_preference_cce_scorer(model)
     if kind == "kto":
         return _make_kto_eval_fn(objective, reference_policy, scorer)
+    reference_scorer = _reference_scorer(reference_policy, scorer)
 
-    def eval_fn(model, batch, lengths, _normalizers=None, cce_indices=None, reference=None):
+    def eval_fn(model, batch, lengths, _normalizers=None, cce_indices=None, reference=None, prefix=None):
         pairs = lengths.shape[0] // 2
         if kind == "orpo":
             nll_sum, nll_tokens, ratio, stats = _orpo_scores(
                 model, batch, lengths, beta, scorer=scorer, cce_indices=cce_indices,
+                differentiated=False, prefix=prefix,
             )
             loss = (
                 nll_sum / mx.maximum(nll_tokens, mx.array(1.0))
@@ -3087,7 +3439,7 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
         elif kind == "cpo":
             nll_sum, nll_tokens, pair_loss, stats = _cpo_scores(
                 model, batch, lengths, objective, scorer=scorer,
-                cce_indices=cce_indices,
+                cce_indices=cce_indices, differentiated=False, prefix=prefix,
             )
             loss = _cpo_loss(
                 objective, nll_sum, nll_tokens, pair_loss, mx.array(pairs),
@@ -3097,12 +3449,14 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
                 model, batch, lengths, objective,
                 reference_policy=reference_policy,
                 scorer=scorer, cce_indices=cce_indices, reference=reference,
+                differentiated=False, reference_scorer=reference_scorer, prefix=prefix,
             )
             loss = _dpo_pair_loss(objective, terms).mean()
         return loss, mx.array(pairs, dtype=mx.int32), stats
 
     eval_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS[kind]
     eval_fn._unsloth_cce_scorer = scorer
+    eval_fn._unsloth_cce_reference_scorer = reference_scorer
     eval_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS[kind]
     eval_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH[kind]
     eval_fn._unsloth_cce_compaction = scorer is not None and scorer.compaction
@@ -3142,50 +3496,62 @@ def _kto_supervised_tokens(batch_data):
 
 
 def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
-                scorer=None, reference=None, kl_mean=None):
-    """Per-row weighted losses and the batch's metric sums."""
+                scorer=None, reference=None, kl_mean=None, differentiated=True,
+                cce_indices=None, kl_indices=None, kl_batch=None, reference_scorer=None):
+    """Per-row weighted losses and the batch's metric sums; cce_indices and kl_indices compact the completion and KL
+    rows, each over its own grid; a vision batch carries its KL rows as kl_batch."""
     rows = labels.shape[0]
-    # A vision batch's halves share images only the whole dict carries: one forward.
-    whole = isinstance(batch, Mapping)
-    scored, scored_lengths = (batch, lengths) if whole else (batch[:rows], lengths[:rows])
-    targets = _preference_ids(scored)[:, 1:]
-    mask = _response_mask(targets, scored_lengths)
+    vision = isinstance(batch, Mapping)
+    completion, kl_rows = (batch, kl_batch) if vision else (batch[:rows], batch[rows:])
+    if reference is None and _shares_image_features(model, completion, reference_policy):
+        completion = _with_image_features(model, completion, stop_gradient=True)
+    # The policy's KL forward reads the features of its completion forward.
+    policy = _with_image_features(model, completion, encode_single_copy=True) if objective.with_kl else completion
+    policy_kl = _with_features_of(policy, kl_rows)
+    targets = _preference_ids(completion)[:, 1:]
+    mask = _response_mask(targets, lengths[:rows])
     # Real-token positions only; TRL's sum also counts its collator's padding.
     positions = (
-        mx.arange(1, targets.shape[1] + 1) < scored_lengths[:, 1:]
+        mx.arange(1, targets.shape[1] + 1) < lengths[:rows, 1:]
     ).astype(mx.float32)
     if scorer is None:
-        logits, ce = _preference_forward(model, scored, mask)
+        logits, ce = _preference_forward(model, policy, mask)
         logit_sums = (_row_logit_sum(logits) * positions).sum(axis=1)
     else:
-        ce, sums = scorer(model, scored, mask > 0, every_position=True)
+        ce, sums = scorer(model, policy, mask > 0, cce_indices, every_position=True,
+                          differentiated=differentiated)
         logit_sums = (sums * positions).sum(axis=1)
-    scored_logps = -(ce * mask).sum(axis=1)
-    logps, logit_sums = scored_logps[:rows], logit_sums[:rows]
+    logps = -(ce * mask).sum(axis=1)
 
-    def score(model, batch, lengths):
+    def score(model, batch, lengths, indices, scorer=scorer):
         if scorer is None:
             return _response_logps(model, batch, lengths)
         batch_mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)
-        return -(scorer(model, batch, batch_mask > 0)[0] * batch_mask).sum(axis=1)
+        return -(scorer(model, batch, batch_mask > 0, indices, differentiated=False)[0] * batch_mask).sum(axis=1)
 
     if reference is None:
-        reference = reference_policy.forward(
-            model, batch, lengths,
-            response_scorer=(
-                score if scorer is not None and reference_policy.model is None
-                else None
-            ),
-        )
+        if vision:
+            parts = [(completion, lengths[:rows], cce_indices)]
+            parts += [(kl_rows, lengths[rows:], kl_indices)] if objective.with_kl else []
+        else:
+            joined = cce_indices
+            if kl_indices is not None:
+                # One forward over both halves lays the KL rows' grid after the completions'.
+                offset = rows * (_preference_ids(batch).shape[1] - 1)
+                joined = mx.concatenate([cce_indices, mx.where(kl_indices >= 0, kl_indices + offset, -1)])
+            parts = [(batch, lengths, joined)]
+        scored = _reference_logps(reference_policy, model, [
+            (part, part_lengths, None if reference_scorer is None else partial(score, indices=indices, scorer=reference_scorer))
+            for part, part_lengths, indices in parts
+        ])
+        reference = scored[0] if len(scored) == 1 else mx.concatenate(scored)
     reference = reference.astype(mx.float32)
     zero = mx.array(0.0, mx.float32)
     kl = zero
     if objective.with_kl:
         # TRL scores KL rows under no_grad: a separate, undifferentiated forward.
-        policy_kl = mx.stop_gradient(
-            scored_logps[rows:] if whole else score(model, batch[rows:], lengths[rows:])
-        )
-        kl = (policy_kl.astype(mx.float32) - reference[rows:]).mean()
+        kl_logps = mx.stop_gradient(score(model, policy_kl, lengths[rows:], kl_indices))
+        kl = (kl_logps.astype(mx.float32) - reference[rows:]).mean()
         if kl_mean is not None:
             kl = kl_mean(kl)
         kl = mx.stop_gradient(mx.maximum(kl, zero))
@@ -3218,8 +3584,8 @@ def _mark_kto_fn(fn, scorer):
     fn._unsloth_preference_metrics = KTO_METRICS
     fn._unsloth_preference_stats_width = KTO_STATS_WIDTH
     fn._unsloth_preference_report = kto_metric_values
-    # A KTO batch has no chosen/rejected halves to compact.
-    fn._unsloth_cce_compaction = False
+    fn._unsloth_cce_compaction = scorer is not None and scorer.compaction
+    fn._unsloth_cce_kind = "kto"
     fn._unsloth_cce_scorer = scorer
     if scorer is not None:
         fn._unsloth_cce_backend = "runtime-cce"
@@ -3230,12 +3596,14 @@ def make_kto_loss_fn(objective, *, reference_policy, kl_mean=None, _scorer=None)
     """Create a KTO loss normalized over the rows of its logical window; kl_mean averages the KL estimate across processes before it is clamped, as TRL gathers it."""
     _require_kind(objective, "kto")
     _require_reference(objective, reference_policy)
+    reference_scorer = _reference_scorer(reference_policy, _scorer)
 
-    def loss_fn(model, batch, lengths, normalizers, labels, reference=None):
+    def loss_fn(model, batch, lengths, normalizers, labels, reference=None, cce_indices=None, kl_indices=None,
+                kl_batch=None):
         losses, stats = _kto_scores(
             model, batch, lengths, labels, objective,
-            reference_policy=reference_policy, scorer=_scorer,
-            reference=reference, kl_mean=kl_mean,
+            reference_policy=reference_policy, scorer=_scorer, reference=reference, kl_mean=kl_mean,
+            cce_indices=cce_indices, kl_indices=kl_indices, kl_batch=kl_batch, reference_scorer=reference_scorer,
         )
         _, window_rows, window_microbatches = normalizers
         loss = window_microbatches.astype(mx.float32) * losses.sum() / mx.maximum(
@@ -3244,6 +3612,7 @@ def make_kto_loss_fn(objective, *, reference_policy, kl_mean=None, _scorer=None)
         return loss, mx.array(1, dtype=mx.int32), stats
 
     loss_fn._unsloth_supervised_tokens = _kto_supervised_tokens
+    loss_fn._unsloth_cce_reference_scorer = reference_scorer
     return _mark_kto_fn(loss_fn, _scorer)
 
 
@@ -3255,13 +3624,19 @@ def make_kto_cce_loss_fn(model, objective, *, reference_policy, kl_mean=None):
 
 
 def _make_kto_eval_fn(objective, reference_policy, scorer):
-    def eval_fn(model, batch, lengths, _normalizers, labels, reference=None):
+    reference_scorer = _reference_scorer(reference_policy, scorer)
+
+    def eval_fn(model, batch, lengths, _normalizers, labels, reference=None, cce_indices=None, kl_indices=None,
+                kl_batch=None):
         losses, stats = _kto_scores(
             model, batch, lengths, labels, objective,
             reference_policy=reference_policy, scorer=scorer, reference=reference,
+            differentiated=False, cce_indices=cce_indices, kl_indices=kl_indices, kl_batch=kl_batch,
+            reference_scorer=reference_scorer,
         )
         return losses.mean(), mx.array(labels.shape[0], dtype=mx.int32), stats
 
+    eval_fn._unsloth_cce_reference_scorer = reference_scorer
     return _mark_kto_fn(eval_fn, scorer)
 
 
