@@ -57,7 +57,7 @@ from .compile import (
     normalize_mlx_patch_mode,
     trace_compile_application,
 )
-from .attention import install_quantized_attention
+from .attention import install_fused_attention, install_quantized_attention
 from .inference import inference_scopes
 
 _vlm_model_types_cache = None
@@ -865,11 +865,24 @@ def _patch_glm5_next_quantization_aliases(model_type):
         return
 
     def quantization_path_aliases(self, path):
-        path = path[len("language_model."):] if path.startswith("language_model.") else path
         parent, _, name = path.rpartition(".")
-        return [f"{parent}.{_GLM5_NEXT_FUSED[name]}"] if name in _GLM5_NEXT_FUSED else []
+        name = _GLM5_NEXT_FUSED.get(name, name)
+        paths = [f"{parent}.{name}"]
+        if name in ("f_a_proj", "f_b_proj"):  # oQ quants (_omlx_glm5_next_weights)
+            paths.append(f"{parent}.forget_gate.{name}")
+        return [alias for path in paths for alias in (path, path.removeprefix("language_model."))]
 
     model.quantization_path_aliases = quantization_path_aliases
+
+
+def _omlx_glm5_next_weights(weights):
+    """Names of the glm5_next layout omlx vendors (and writes GLM-5.3-Flash oQ quants in) as mlx-vlm's."""
+    renamed = {}
+    for key, value in weights.items():
+        key = re.sub(r"^vision_model\.", "vision_tower.", key).replace(".self_attn.forget_gate.", ".self_attn.")
+        # Already the fused q, k, v short convolution, in MLX's layout.
+        renamed[re.sub(r"\.self_attn\.conv1d\.weight$", ".self_attn.qkv_conv.conv.weight", key)] = value
+    return renamed
 
 
 _DEEPSEEK_REFERENCE_PROJECTIONS = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
@@ -907,12 +920,47 @@ def _omlx_deepseek_v41_quantization(config_data):
     return {**base, **modules}
 
 
-def _ensure_deepseek_v41_omlx_layout(model_type):
-    """Wrap mlx-vlm's deepseek_v41 sanitize to read oQ quants (DSpark stages dropped)."""
-    if model_type != "deepseek_v41":
+def _omlx_deepseek_v41_weights(weights):
+    import mlx.core as mx
+
+    weights = {_omlx_deepseek_v41_name(key): value for key, value in weights.items()}
+    # FP8 Engram table: sanitize packs it only under the source's ``.scale`` name.
+    for key in [key for key in weights if key.endswith(".engram.embed.scales")]:
+        weight = weights.get(key.removesuffix("scales") + "weight")
+        if weight is not None and weight.dtype == mx.uint8:
+            weights[key.removesuffix("s")] = weights.pop(key)
+    return weights
+
+
+def _deepseek_v41_model():
+    from mlx_vlm.models.deepseek_v41.deepseek_v41 import Model
+
+    return Model
+
+
+def _glm5_next_model():
+    from mlx_vlm.models.glm5_next.glm5_next import Model
+
+    return Model
+
+
+# Each family omlx converts: the mlx-vlm Model whose sanitize loads it, and the renames it needs first.
+_OMLX_LAYOUTS = {
+    "deepseek_v41": (_deepseek_v41_model, _omlx_deepseek_v41_weights),
+    "glm5_next": (_glm5_next_model, _omlx_glm5_next_weights),
+}
+
+
+def _ensure_omlx_layout(model_type):
+    """Wrap mlx-vlm's sanitize for ``model_type`` to read omlx's oQ quants. Their ``language_model.mtp.`` tensors
+    (MTP heads, DSpark stages) stay out of the target."""
+    if model_type not in _OMLX_LAYOUTS:
         return
+    # GLM-5.3 oQ quants key their fused layers' bits by module path; loads outside FastMLXModel need the aliases too.
+    _patch_glm5_next_quantization_aliases(model_type)
+    imported, rename = _OMLX_LAYOUTS[model_type]
     try:
-        from mlx_vlm.models.deepseek_v41.deepseek_v41 import Model as model
+        model = imported()
     except Exception:
         return
     if getattr(model.sanitize, "_unsloth_omlx_layout", False):
@@ -920,21 +968,14 @@ def _ensure_deepseek_v41_omlx_layout(model_type):
     original = model.sanitize
 
     def sanitize(self, weights):
-        weights = {
-            _omlx_deepseek_v41_name(key): value for key, value in weights.items()
-            if not key.startswith("language_model.mtp.")
-        }
-        import mlx.core as mx
-
-        # FP8 Engram table: sanitize packs it only under the source's ``.scale`` name.
-        for key in [key for key in weights if key.endswith(".engram.embed.scales")]:
-            weight = weights.get(key.removesuffix("scales") + "weight")
-            if weight is not None and weight.dtype == mx.uint8:
-                weights[key.removesuffix("s")] = weights.pop(key)
-        return original(self, weights)
+        return original(self, rename({key: value for key, value in weights.items() if not key.startswith("language_model.mtp.")}))
 
     sanitize._unsloth_omlx_layout = True
     model.sanitize = sanitize
+
+
+# The name Unsloth Studio releases install the layout by.
+_ensure_deepseek_v41_omlx_layout = _ensure_omlx_layout
 
 
 def _patch_deepseek_ocr_transformers_import_compat(model_type):
@@ -3959,6 +4000,11 @@ _LFM2_PROJECTOR_CALL_TOKEN_SHA256 = (
 _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256 = (
     "27f53c37ff8473cf4c0e1381016ddfaabe5aafcbba13fc24db79bfc2871c1576",
     "ae6c02d68719bee0ce97ab68458eed1f092aa2ab0398f0b903d5a9bf68cfc7ab",
+    "a36cb4f00a865d1d141b6bcfe6fe4f87b40dcb798d2ba00d80f709b1c2d8c10a",
+)
+# mlx-vlm 0.7.12 keeps CanvasRoPE's rope_deltas, which subtract each row's valid length instead of the padded width.
+_MINICPMV4_7_VALID_LENGTH_DELTAS_TOKEN_SHA256 = (
+    "a36cb4f00a865d1d141b6bcfe6fe4f87b40dcb798d2ba00d80f709b1c2d8c10a",
 )
 _MINICPMV4_7_CANVAS_ROPE_TOKEN_SHA256 = (
     "f995c993dd959cc55a43f70f8f87c115d18833179e464426d63153022f4770ec"
@@ -4410,10 +4456,10 @@ def _minicpmv4_7_text_positions_adapter(cls):
 
     original = cls.__dict__.get("get_input_embeddings")
     rope = getattr(sys.modules.get(cls.__module__), "CanvasRoPE", None)
+    source_sha256 = _source_token_sha256(_safe_getsource(original))
     if (
         getattr(original, "_unsloth_minicpmv4_7_text_positions", False)
-        or _source_token_sha256(_safe_getsource(original))
-        not in _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256
+        or source_sha256 not in _MINICPMV4_7_EMBEDDINGS_TOKEN_SHA256
         or _source_token_sha256(_safe_getsource(getattr(rope, "get_rope_index", None)))
         != _MINICPMV4_7_CANVAS_ROPE_TOKEN_SHA256
     ):
@@ -4421,6 +4467,7 @@ def _minicpmv4_7_text_positions_adapter(cls):
     import mlx.core as mx
 
     features_cls = original.__globals__["InputEmbeddingsFeatures"]
+    valid_length_deltas = source_sha256 in _MINICPMV4_7_VALID_LENGTH_DELTAS_TOKEN_SHA256
 
     @wraps(original)
     def patched(self, input_ids, pixel_values=None, **kwargs):
@@ -4443,6 +4490,7 @@ def _minicpmv4_7_text_positions_adapter(cls):
             input_ids, pixel_values=None, **kwargs
         )
         batch, width = input_ids.shape
+        lengths = width
         if mask is None:
             positions = mx.arange(width, dtype=mx.int32)
         else:
@@ -4450,8 +4498,10 @@ def _minicpmv4_7_text_positions_adapter(cls):
             positions = mx.where(
                 valid, mx.cumsum(valid.astype(mx.int32), axis=-1) - 1, 0
             )
+            if valid_length_deltas:
+                lengths = valid.astype(mx.int32).sum(axis=-1)[:, None]
         positions = mx.broadcast_to(positions, (3, batch, width))
-        deltas = positions.max(axis=(0, 2))[:, None] + 1 - width
+        deltas = positions.max(axis=(0, 2))[:, None] + 1 - lengths
         self.language_model._position_ids = positions
         self.language_model._rope_deltas = deltas
         return features_cls(
@@ -7897,6 +7947,7 @@ def _mlx_generate_vlm(self, *args, **kwargs):
 
     int8_prefill = inputs.pop("int8_prefill", None)
     ane_prefill = inputs.pop("ane_prefill", None)
+    fast_verify = inputs.pop("fast_verify", None)
     streamer = inputs.pop("streamer", None)
     max_tokens = inputs.pop("max_tokens", None)
     max_new_tokens = inputs.pop("max_new_tokens", None)
@@ -7962,7 +8013,7 @@ def _mlx_generate_vlm(self, *args, **kwargs):
 
     generated_ids = []
     last_generation_tokens = None
-    with inference_scopes(self, ("vision",), int8_prefill = int8_prefill, ane_prefill = ane_prefill):
+    with inference_scopes(self, ("vision",), int8_prefill = int8_prefill, ane_prefill = ane_prefill, fast_verify = fast_verify):
         for response in stream_generate(
             self,
             processor,
@@ -8039,6 +8090,7 @@ def _mlx_generate(self, *args, **kwargs):
 
     int8_prefill = kwargs.pop("int8_prefill", None)
     ane_prefill = kwargs.pop("ane_prefill", None)
+    fast_verify = kwargs.pop("fast_verify", None)
     streamer = kwargs.pop("streamer", None)
     max_tokens = kwargs.pop("max_tokens", None)
     max_new_tokens = kwargs.pop("max_new_tokens", None)
@@ -8098,7 +8150,7 @@ def _mlx_generate(self, *args, **kwargs):
     generated_ids = []
     eos_restore_state = _mlx_override_tokenizer_eos_ids(tokenizer, eos_token_id)
     try:
-        with inference_scopes(self, (), int8_prefill = int8_prefill, ane_prefill = ane_prefill):
+        with inference_scopes(self, (), int8_prefill = int8_prefill, ane_prefill = ane_prefill, fast_verify = fast_verify):
             # mlx-lm 0.32 refuses max_tokens=0; the reply is then just the prompt.
             for response in () if max_tokens == 0 else stream_generate(
                 self,
@@ -9261,6 +9313,7 @@ def _remove_scratch_dirs_on_error(load):
 def _finish_load(model, tokenizer):
     """The single exit from a load, so the patch installs after the runtimes the load imports."""
     install_quantized_attention()
+    install_fused_attention()
     # Here rather than in get_peft_model: the trainer and callers freeze loaded models too.
     _fix_missing_no_grad(model)
     # A call, not an if: tests/test_mlx_attention_metal.py keeps this body straight-line so the attention patch above can never sit behind a branch.
@@ -10296,7 +10349,7 @@ class FastMLXModel:
             _ensure_minicpmv4_7_text_positions(model_type)
             _ensure_audio_conv_sanitize(model_type)
             _ensure_qwen3_omni_audio_per_clip(model_type)
-            _ensure_deepseek_v41_omlx_layout(model_type)
+            _ensure_omlx_layout(model_type)
             _ensure_native_vlm_weight_names(model_type)
 
             quant_state = _ensure_quantization_compatible(
