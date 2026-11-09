@@ -13,7 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""TiledMLP must replay dropout masks when PEFT adds lora_dropout after patching; a patch-time dropout scan misses it, so recompute drew fresh masks; CPU only."""
+"""Sequence tiling must replay dropout masks when PEFT adds lora_dropout after patching; a patch-time dropout scan misses it, so recompute drew fresh masks; CPU only."""
 import copy
 
 import pytest
@@ -80,7 +80,7 @@ def test_lora_dropout_added_after_patch_gets_matching_grads(target_arctic):
     # Reference: same tiles, same RNG order, ordinary autograd (no recompute).
     torch.manual_seed(3)
     x_ref = x.clone().requires_grad_(True)
-    tiles = [reference.mlp(t.unsqueeze(0)) for t in torch.split(x_ref.view(-1, HIDDEN), HIDDEN, dim = 0)]
+    tiles = [reference.mlp(t.unsqueeze(0)) for t in torch.tensor_split(x_ref.view(-1, HIDDEN), 4, dim = 0)]
     out_ref = torch.cat(tiles, dim = 1).view_as(x)
     out_ref.backward(grad_out)
 
@@ -99,7 +99,7 @@ pass
 
 
 def test_no_dropout_skips_rng_state():
-    from unsloth_zoo.tiled_mlp import _mlp_needs_rng_state
+    from unsloth_zoo.tiling_registry import needs_rng_state as _mlp_needs_rng_state
     mlp = _MLP()
     patch_mlp(mlp, target_arctic = True)
     assert not _mlp_needs_rng_state(mlp)
@@ -113,21 +113,21 @@ pass
 
 
 def test_dropout_cache_survives_layer_slicing():
-    from unsloth_zoo import tiled_mlp
+    from unsloth_zoo import tiling_registry as tiled_mlp
     block = _Block()
     patch_mlp(block.mlp, target_arctic = True, padded_length = HIDDEN)
-    assert not tiled_mlp._mlp_needs_rng_state(block.mlp)
+    assert not tiled_mlp.needs_rng_state(block.mlp)
     cached = block.mlp.__dict__["_unsloth_tiled_dropouts"]
     # transformers runs `for layer in self.layers[:n]` every forward, re-registering each layer.
     layers = torch.nn.ModuleList([block])
     layers[:1]
-    assert not tiled_mlp._mlp_needs_rng_state(block.mlp)
+    assert not tiled_mlp.needs_rng_state(block.mlp)
     assert block.mlp.__dict__["_unsloth_tiled_dropouts"] is cached
 
     # LoRA added after the first forward, on the original and on a deepcopy, is still seen.
     clone = copy.deepcopy(block)
     block = _lora(block, 0.1)
-    assert tiled_mlp._mlp_needs_rng_state(block.mlp)
+    assert tiled_mlp.needs_rng_state(block.mlp)
     clone = _lora(clone, 0.1)
-    assert tiled_mlp._mlp_needs_rng_state(clone.mlp)
+    assert tiled_mlp.needs_rng_state(clone.mlp)
 pass

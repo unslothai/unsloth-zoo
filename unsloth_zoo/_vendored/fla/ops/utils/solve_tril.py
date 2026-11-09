@@ -40,11 +40,11 @@ def solve_tril_16x16_kernel(
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    USE_TMA: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    DOT_PRECISION: tl.constexpr,
+    H: tl.constexpr,  # heads
+    BT: tl.constexpr,  # chunk size along T
+    USE_TMA: tl.constexpr,  # tma loads
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    DOT_PRECISION: tl.constexpr,  # tl.dot input precision
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
@@ -110,11 +110,11 @@ def merge_16x16_to_32x32_inverse_kernel(
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    USE_TMA: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    DOT_PRECISION: tl.constexpr,
+    H: tl.constexpr,  # heads
+    BT: tl.constexpr,  # chunk size along T
+    USE_TMA: tl.constexpr,  # tma loads
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    DOT_PRECISION: tl.constexpr,  # tl.dot input precision
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
@@ -200,11 +200,11 @@ def merge_16x16_to_64x64_inverse_kernel(
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    USE_TMA: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    DOT_PRECISION: tl.constexpr,
+    H: tl.constexpr,  # heads
+    BT: tl.constexpr,  # chunk size along T
+    USE_TMA: tl.constexpr,  # tma loads
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    DOT_PRECISION: tl.constexpr,  # tl.dot input precision
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
