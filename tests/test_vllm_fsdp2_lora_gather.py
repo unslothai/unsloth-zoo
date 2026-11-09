@@ -125,9 +125,14 @@ def test_save_lora_and_load_lora_tensors_gather_fsdp2_shards(tmp_path, layout):
 
 
 _SCAN_WORKER = """
-import json, sys
+import json, os, sys
 import torch
+import torch.distributed as dist
 import unsloth_zoo.vllm_utils as vu
+
+# A process group (DDP, unsharded): the check is live, not the single-process early return.
+os.environ.update(MASTER_ADDR = "127.0.0.1", MASTER_PORT = sys.argv[2])
+dist.init_process_group("gloo", rank = 0, world_size = 1)
 
 class Lora(torch.nn.Module):
     def __init__(self):
@@ -149,24 +154,28 @@ def counting(*args, **kwargs):
         seen.append(item[0])
         yield item
 model.named_parameters = counting
-res = {"sharded": vu._lora_is_sharded(model), "params_walked": len(seen), "params_total": len(list(orig()))}
+# load_lora runs this every generation step.
+answers = {vu._lora_is_sharded(model) for _ in range(10)}
+res = {"sharded": list(answers), "params_walked": len(seen), "params_total": len(list(orig()))}
 json.dump(res, open(sys.argv[1], "w"))
+dist.destroy_process_group()
 """
 
 
-def test_unsharded_check_stops_at_the_first_adapter(tmp_path):
+def test_unsharded_check_does_not_walk_every_parameter_each_call(tmp_path):
     script = tmp_path / "scan.py"
     script.write_text(textwrap.dedent(_SCAN_WORKER))
     out = tmp_path / "scan.json"
     env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_ALLOW_CPU = "1",
                PYTHONPATH = os.pathsep.join([str(_ROOT), os.environ.get("PYTHONPATH", "")]))
-    r = subprocess.run([sys.executable, str(script), str(out)], env = env, capture_output = True, text = True,
-                       timeout = 300, cwd = tmp_path)
+    r = subprocess.run([sys.executable, str(script), str(out), str(_free_port())], env = env, capture_output = True,
+                       text = True, timeout = 300, cwd = tmp_path)
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
     res = json.loads(out.read_text())
-    assert res["sharded"] is False, res
+    assert res["sharded"] == [False], res
     assert res["params_total"] == 1200, res
-    assert res["params_walked"] <= 3, res
+    # At most one full walk over 10 calls (a walk per call would be 12000).
+    assert res["params_walked"] <= res["params_total"] + 10, res
 
 
 def test_a_single_process_never_walks_the_parameters():
