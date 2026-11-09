@@ -316,3 +316,16 @@ def test_cuda_bitwise_against_bitsandbytes(nested, dtype, monkeypatch):
         ref = lin(x)
         monkeypatch.setitem(Z._BNB_DIRECT, "on", True)
         assert torch.equal(lin(x), ref)
+
+
+def test_negative_views_decline(lib):
+    # The kernel reads raw bytes, so a lazy negative view (torch._neg_view) would lose its sign after warm-up.
+    layer, qs = _layer()
+    x = torch.randn(1, 1, 128).to(torch.bfloat16)
+    with torch.no_grad():
+        assert Z._bnb_4bit_direct(layer, x, qs) is not None  # warm: the layout is checked and cached
+        lib.calls.clear()
+        assert Z._bnb_4bit_direct(layer, torch._neg_view(x), qs) is None
+        layer.bias = torch.nn.Parameter(torch._neg_view(layer.bias.detach()), requires_grad = False)
+        assert Z._bnb_4bit_direct(layer, x, qs) is None
+    assert not lib.calls

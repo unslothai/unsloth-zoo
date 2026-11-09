@@ -44,13 +44,13 @@ def chunk_gla_fwd_A_kernel_intra_sub_inter(
     chunk_indices,
     scale,
     T,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-    BK: tl.constexpr,
-    NC: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    H: tl.constexpr,  # heads
+    K: tl.constexpr,  # key hd
+    BT: tl.constexpr,  # chunk size along T
+    BC: tl.constexpr,  # sub-chunk size along T
+    BK: tl.constexpr,  # block along K
+    NC: tl.constexpr,  # sub-chunks per chunk
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     i_t, i_c, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -125,12 +125,12 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra(
     chunk_indices,
     scale,
     T,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-    BK: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    H: tl.constexpr,  # heads
+    K: tl.constexpr,  # key hd
+    BT: tl.constexpr,  # chunk size along T
+    BC: tl.constexpr,  # sub-chunk size along T
+    BK: tl.constexpr,  # block along K
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     i_t, i_i, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -200,14 +200,14 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_split(
     chunk_indices,
     scale,
     T,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-    BK: tl.constexpr,
-    NC: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    B: tl.constexpr,  # batch size
+    H: tl.constexpr,  # heads
+    K: tl.constexpr,  # key hd
+    BT: tl.constexpr,  # chunk size along T
+    BC: tl.constexpr,  # sub-chunk size along T
+    BK: tl.constexpr,  # block along K
+    NC: tl.constexpr,  # sub-chunks per chunk
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     i_k, i_tc, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -278,12 +278,12 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_merge(
     cu_seqlens,
     chunk_indices,
     T,
-    B: tl.constexpr,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-    NK: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    B: tl.constexpr,  # batch size
+    H: tl.constexpr,  # heads
+    BT: tl.constexpr,  # chunk size along T
+    BC: tl.constexpr,  # sub-chunk size along T
+    NK: tl.constexpr,  # K splits to merge
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     i_t, i_c, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -338,15 +338,15 @@ def chunk_gla_fwd_kernel_o(
     chunk_indices,
     scale,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    STATE_V_FIRST: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    STATE_V_FIRST: tl.constexpr,  # state layout is [V, K]
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
     i_b, i_hv = i_bh // HV, i_bh % HV
@@ -378,7 +378,11 @@ def chunk_gla_fwd_kernel_o(
     m_t = o_t < T
     m_v = o_v < V
     m_tv = m_t[:, None] & m_v[None, :]
-    m_A = m_t[:, None] & (o_i[None, :] < BT)
+    # Unsloth: backported from fla PR #1582. Apply the causal mask in the score load
+    # itself instead of a where() after it: on GB200 / Triton 3.6 the 8-warp
+    # BK=BV=64 config otherwise issued misaligned 8-byte score loads (CUDA
+    # "misaligned address"), and the masked load also skips the unused upper half.
+    m_A = m_t[:, None] & m_s
     for i_k in range(tl.cdiv(K, BK)):
         o_k = i_k * BK + tl.arange(0, BK)
         m_k = o_k < K
@@ -411,8 +415,7 @@ def chunk_gla_fwd_kernel_o(
     # [BT, BV]
     b_v = tl.load(p_v, mask=m_tv, other=0.0)
     # [BT, BT]
-    b_A = tl.load(p_A, mask=m_A, other=0.0)
-    b_A = tl.where(m_s, b_A, 0.).to(b_v.dtype)
+    b_A = tl.load(p_A, mask=m_A, other=0.0).to(b_v.dtype)
     b_o += tl.dot(b_A, b_v)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_tv)
 
@@ -440,13 +443,13 @@ def chunk_gla_bwd_kernel_intra(
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-    BK: tl.constexpr,
-    NC: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    H: tl.constexpr,  # heads
+    K: tl.constexpr,  # key hd
+    BT: tl.constexpr,  # chunk size along T
+    BC: tl.constexpr,  # sub-chunk size along T
+    BK: tl.constexpr,  # block along K
+    NC: tl.constexpr,  # sub-chunks per chunk
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     i_kc, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -582,11 +585,11 @@ def chunk_gla_bwd_kernel_dA(
     chunk_indices,
     scale,
     T,
-    H: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BV: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    H: tl.constexpr,  # heads
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BV: tl.constexpr,  # block along V
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -645,14 +648,14 @@ def chunk_gla_bwd_kernel_dv(
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    STATE_V_FIRST: tl.constexpr,
+    H: tl.constexpr,  # heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    STATE_V_FIRST: tl.constexpr,  # state layout is [V, K]
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -744,14 +747,14 @@ def chunk_gla_bwd_kernel_inter(
     chunk_indices,
     scale,
     T,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    STATE_V_FIRST: tl.constexpr,
+    H: tl.constexpr,  # heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    STATE_V_FIRST: tl.constexpr,  # state layout is [V, K]
 ):
     i_k, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H

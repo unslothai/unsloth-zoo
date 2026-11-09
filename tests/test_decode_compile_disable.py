@@ -91,11 +91,11 @@ def test_rewrapping_does_not_nest():
 def _stance_block(calls):
     from unsloth_zoo import compiler
 
-    source = "def run():\n" + compiler.__DYNAMO__RECOMPILING__ + "    return INFERENCE_RUNS\n"
+    source = "def run():\n" + compiler.__DYNAMO__RECOMPILING__ + "    return UNSLOTH_INFERENCE_RUNS[0]\n"
     stance = type("S", (), {"stance": "default", "skip_guard_eval_unsafe": False})()
     namespace = {
         "torch": torch,
-        "INFERENCE_RUNS": 1,
+        "UNSLOTH_INFERENCE_RUNS": [1],
         "UNSLOTH_DECODE_COMPILE": UNSLOTH_DECODE_COMPILE,
         "UNSLOTH_EAGER_STANCE_OWNED": [],
         "unsloth_claim_eager_stance": lambda stance, previous = None: None,

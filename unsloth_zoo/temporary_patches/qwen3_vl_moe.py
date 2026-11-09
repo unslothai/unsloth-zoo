@@ -70,6 +70,26 @@ def _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_wei
     return forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
 
 
+def _native_experts_in_linear_layout(experts_class):
+    """True when transformers' own Qwen3VLMoeTextExperts builds gate_up_proj as (E, 2I, H) (F.linear layout,
+    transformers 5.x), which Unsloth re-lays out to (E, H, 2I) so PEFT factors the stacks over swapped dims;
+    False when transformers already builds (E, H, 2I) (4.x): vanilla PEFT then factors them as Unsloth does and
+    the saved factors must stay as trained. Unknown (the probe raised) keeps the swap."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+    try:
+        from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLMoeTextConfig
+        config = Qwen3VLMoeTextConfig(
+            vocab_size = 8, hidden_size = 3, intermediate_size = 4, moe_intermediate_size = 5,
+            num_hidden_layers = 1, num_attention_heads = 1, num_key_value_heads = 1, head_dim = 4,
+            num_experts = 2, num_experts_per_tok = 1,
+        )
+        with torch.device("meta"):
+            shape = tuple(experts_class(config).gate_up_proj.shape)
+    except Exception:
+        return True
+    return shape != (2, 3, 10)
+
+
 def patch_qwen3_vl_moe():
     # This Unsloth Zoo code section is licensed under AGPL3
 
@@ -214,6 +234,11 @@ def patch_qwen3_vl_moe():
 
         from transformers.activations import ACT2FN
 
+        _experts_class = transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts
+        # Decided once, from transformers' own __init__ before it is replaced below: a re-patch would read ours.
+        if "_unsloth_expert_lora_factors_swapped" not in _experts_class.__dict__:
+            _experts_class._unsloth_expert_lora_factors_swapped = _native_experts_in_linear_layout(_experts_class)
+
         def patched_experts_init(self, config):
             """__init__ creating Qwen3VLMoeTextExperts weights in grouped_mm
             layout (transposed from F.linear) so checkpoint loading and
@@ -254,6 +279,8 @@ def patch_qwen3_vl_moe():
 
         _qwen3_vl_lora_extractor = _make_qwen_moe_lora_extractor()
         transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts._unsloth_lora_extractor_fn = staticmethod(_qwen3_vl_lora_extractor)
+        # The flag (set above, before __init__ was replaced) makes saves rewrite the expert LoRA factors to
+        # vanilla's when the storage above differs from transformers' own layout.
 
 
         backend = select_moe_backend()
