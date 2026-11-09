@@ -173,9 +173,9 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
             )
         else:
             reduction = "sum" if num_items_in_batch is not None else "mean"
-            # F.cross_entropy reads dim 1 of 3-D logits as the classes.
+            # 2-D for F.cross_entropy; float32 as stock ForCausalLMLoss (an fp16 sum overflows past 65504).
             loss = torch_nn_functional_cross_entropy(
-                source.reshape(-1, source.shape[-1]),
+                source.reshape(-1, source.shape[-1]).float(),
                 target.reshape(-1),
                 ignore_index = ignore_index,
                 reduction    = reduction,

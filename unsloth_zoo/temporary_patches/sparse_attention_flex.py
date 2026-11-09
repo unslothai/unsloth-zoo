@@ -23,8 +23,10 @@ __all__ = [
     "patch_dsa_sparse_flex",
 ]
 
+import gc
 import inspect
 import os
+import traceback
 
 import torch
 
@@ -106,7 +108,22 @@ def _flex_or_none(kind, label, fn, query, key, value, *args):
             raise
         _sb.record_failure(kind, query, key, value, error)
         logger.warning(f"Unsloth: {label} sparse flex attention failed, using the dense path: {error}")
+        _release_failure(error)
         return None
+
+
+def _release_failure(error):
+    """Failed flex traceback frames hold CUDA tensors in cycles only a full gc frees (+25% later peak)."""
+    seen, stack = set(), [error]
+    while stack:
+        e = stack.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        traceback.clear_frames(e.__traceback__)  # skips frames still executing (this caller's)
+        stack += [e.__cause__, e.__context__]
+    del error, e, stack
+    gc.collect()
 
 
 # Inside Unsloth's decoder-layer compile, the mask build and flex call run outside the graph (one break per layer, like

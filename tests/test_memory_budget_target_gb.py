@@ -19,7 +19,7 @@ from unittest import mock
 import pytest
 import torch
 
-from unsloth_zoo import tiled_mlp
+from unsloth_zoo import memory_budget as tiled_mlp
 
 
 def _fake_cuda(free_bytes):
