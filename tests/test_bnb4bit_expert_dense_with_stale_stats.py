@@ -40,7 +40,9 @@ LAYER = "model.layers.0.mlp.experts.gate_up_proj"
 def _require_v5_moe_quantization():
     common = pytest.importorskip("unsloth_zoo.temporary_patches.common")
     if not common.is_transformers_v5_moe_quantization_available():
-        pytest.skip("transformers 4.x: the v5 MoE expert deserializer is not registered")
+        # Capability check, not a version pin: transformers 4.x has no WeightConverter
+        # pipeline, so the expert deserializer under test is never registered there.
+        pytest.skip(reason = "transformers lacks the v5 WeightConverter MoE loading API this deserializer plugs into")
 
 
 def _deserializer(monkeypatch, recorded):
@@ -76,6 +78,21 @@ def test_a_dense_expert_beside_stale_stats_stays_dense(monkeypatch):
     assert list(out) == ["gate_up_proj"]
     assert out["gate_up_proj"] is dense, "the dense expert was replaced"
     assert recorded == [], "from_prequantized ran on a floating-point expert"
+
+
+def test_a_dense_expert_beside_stale_stats_gets_the_lone_weight_dtype(monkeypatch):
+    # transformers 5.21+ hands the model dtype to the op for unquantized weights; the
+    # dense expert must come back in that dtype exactly as a stats-free one does.
+    M = pytest.importorskip("unsloth_zoo.temporary_patches.moe_utils_bnb4bit")
+    recorded = []
+    op = _deserializer(monkeypatch, recorded)
+    setattr(op, M._PLAIN_DTYPE_ATTR, torch.float16)
+    dense = torch.randn(4, 8, 64, dtype = torch.bfloat16)
+    out = op.convert(_inputs(dense), model = None, full_layer_name = LAYER)
+    lone = op.convert({"gate_up_proj": [dense]}, model = None, full_layer_name = LAYER)
+    assert recorded == []
+    assert out["gate_up_proj"].dtype == torch.float16
+    torch.testing.assert_close(out["gate_up_proj"], lone["gate_up_proj"][0], rtol = 0, atol = 0)
 
 
 def test_a_packed_expert_still_deserializes(monkeypatch):
@@ -147,8 +164,9 @@ def test_tiny_gpt_oss_with_stale_expert_stats_loads_exact_experts(tmp_path):
 
     tensors = load_file(os.path.join(saved, "model.safetensors"))
     stale = [n for n in tensors if ".experts.gate_up_proj." in n or ".experts.down_proj." in n]
-    if not stale:
-        pytest.skip("this save keeps dense experts, so there are no stats to leave stale")
+    # Without expert stats in the 4-bit save there is nothing to leave stale, so the
+    # checkpoint this test needs cannot be built: fail rather than pass vacuously.
+    assert stale, "the 4-bit save kept dense experts, so no stale expert stats can be built"
     dense = str(tmp_path / "dense_with_stale_stats")
     os.makedirs(dense)
     for f in os.listdir(saved):

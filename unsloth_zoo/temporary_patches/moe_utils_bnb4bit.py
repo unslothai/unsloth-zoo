@@ -1006,7 +1006,7 @@ def _bnb4bit_expert_weight_conversions(hf_quantizer):
                         f"Unsloth: {full_layer_name} is stored dense ({weight.dtype}); "
                         f"ignoring the quantization stats beside it: {sorted(input_dict)}"
                     )
-                return {self.param_name: weight}
+                return _cast_unquantized_passthrough(self, {self.param_name: weight})
             module, _ = get_module_from_name(model, full_layer_name)
             new_value = Params4bit.from_prequantized(
                 data=weight,
