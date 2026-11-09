@@ -402,9 +402,38 @@ def run_fold_failure_rolls_back(device):
         assert torch.equal(_bits(w), _bits(w0))
 
 
+def run_unfold_failure_keeps_keys(device):
+    # unfold_weights_ that raises before restoring (the restore kernel launch fails, as an upload OOM would): the keys
+    # stay live and a retry restores every weight bit for bit.
+    cases = [_case(device, 32 * (i + 1), 256, seed = 75 + i) for i in range(2)]
+    ws, As, Bs = [c[0] for c in cases], [c[1] for c in cases], [c[2] * 1e-3 for c in cases]
+    before = [w.clone() for w in ws]
+    ex.fold_weights_(ws, As, Bs, [0.5, 0.5], [811, 812])
+    real = ex._launch
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("out of memory")
+
+    ex._launch = broken
+    try:
+        try:
+            ex.unfold_weights_(ws, As, Bs, [0.5, 0.5], [811, 812])
+        except RuntimeError as error:
+            assert "out of memory" in str(error)
+        else:
+            raise AssertionError("the unfold should have raised")
+    finally:
+        ex._launch = real
+    assert sum(k[0] in (811, 812) for k in ex._OP_LIVE) == 2
+    ex.unfold_weights_(ws, As, Bs, [0.5, 0.5], [811, 812])
+    for w, w0 in zip(ws, before):
+        assert torch.equal(_bits(w), _bits(w0))
+
+
 def run_all(device):
     run_empty_tiles(device)
     run_fold_failure_rolls_back(device)
+    run_unfold_failure_keeps_keys(device)
     run_compiled(device)
     run_arena_growth(device)
     run_arena_reuse(device)

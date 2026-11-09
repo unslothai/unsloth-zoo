@@ -952,7 +952,15 @@ def _unfold_weights_impl(
         t.w, t.a, t.b = _as_3d(w, a, b)
         t.scale = float(scale)
     rows = [[t.bad, 0] for t in found]
-    exact_unfold(found, stream = _op_stream(ws[0].device))
+    try:
+        exact_unfold(found, stream = _op_stream(ws[0].device))
+    except BaseException:
+        # Raised before restoring (say the store upload ran out of memory): the targets still folded keep their keys,
+        # so a retry can restore them. A checksum mismatch has already unfolded them, nothing is left to keep.
+        with _OP_LOCK:
+            for w, k, t in zip(ws, keys, found):
+                if t.folded: _OP_LIVE[(int(k), tuple(w.shape), w.dtype)] = t
+        raise
     return _status(rows, ws[0].device)
 pass
 
