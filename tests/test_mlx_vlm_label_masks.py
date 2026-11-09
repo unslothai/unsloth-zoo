@@ -788,6 +788,23 @@ def test_vlm_resize_int_downscales_large_images_like_cuda_collator():
     assert resized[0].size == (512, 256)
 
 
+def test_vlm_gemma4_images_reach_the_processor_unshrunk():
+    """Gemma 4's processor resizes to its soft-token budget (about 768 px square); its nominal 224 `size` used to
+    pre-shrink every training image to 224 px before that upsampling."""
+    from types import SimpleNamespace
+
+    processing = pytest.importorskip("mlx_vlm.models.gemma4.processing_gemma4")
+    from unsloth_zoo.mlx.utils import _resize_vlm_images, _resolve_vlm_image_size
+
+    gemma4 = SimpleNamespace(image_processor=processing.Gemma4ImageProcessor())
+    assert gemma4.image_processor.size == {"height": 224, "width": 224}
+    size = _resolve_vlm_image_size(None, {"vision_config": {}}, gemma4)
+    assert size is None
+    assert _resize_vlm_images([Image.new("RGB", (1024, 768))], size)[0].size == (1024, 768)
+    sized = SimpleNamespace(image_processor=SimpleNamespace(size={"height": 448, "width": 448}))
+    assert _resolve_vlm_image_size(None, {"vision_config": {}}, sized) == 448
+
+
 def test_vlm_processor_inputs_retries_duplicate_add_special_tokens():
     from unsloth_zoo.mlx.utils import _processor_vlm_inputs
 
@@ -3825,6 +3842,31 @@ def test_phi4mm_token_ids_fall_back_to_the_mlx_vlm_defaults():
     # Only the missing index falls back when one is present and one absent, so neither explicit value is overwritten by the other's gap.
     assert _phi4mm_token_ids({"image_token_index": -7}) == (-7, expected[1])
     assert _phi4mm_token_ids({"audio_token_index": 11}) == (expected[0], 11)
+
+
+def test_phi4mm_position_resize_matches_the_installed_release():
+    import textwrap
+
+    from unsloth_zoo.mlx import compile as patches
+
+    vision = pytest.importorskip("mlx_vlm.models.phi4mm.vision")
+    patches._install_phi4_multimodal_patches()
+    # The release's own body, rebuilt from source since the class now holds the compile-safe one.
+    namespace = dict(vars(vision))
+    exec(textwrap.dedent(inspect.getsource(vision.VisionEmbeddings)), namespace)
+    native = namespace["VisionEmbeddings"].resize_positional_embeddings
+    patched = vision.VisionEmbeddings.resize_positional_embeddings
+    table = mx.random.normal((8, 8, 4), key=mx.random.key(0)).astype(mx.bfloat16)
+    shapes = [(3, 5), (6, 2)]
+    trains = "training" in inspect.signature(native).parameters
+    for options in ({"training": False}, {"training": True}) if trains else ({},):
+        expected = native(table, mx.array(shapes), 20, **options)
+        assert mx.array_equal(patched(table, shapes, 20, **options), expected).item()
+    if trains:
+        grad = mx.grad(lambda t: patched(t, shapes, 20, training=True).sum())(table.astype(mx.float32))
+        assert float(mx.abs(grad).sum()) > 0
+    else:
+        assert mx.array_equal(patched(table, shapes, 20, training=True), patched(table, shapes, 20)).item()
 
 
 def test_phi4mm_switches_to_its_speech_weights_under_lora_adapters():
