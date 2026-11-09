@@ -3028,7 +3028,10 @@ def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
         # Same normalization finalize uses (wide unsigned ids -> int64 sentinels)
         values = _normalize_numpy_cce_labels(values)
     mask = values == -100
-    if generated and any(inputs.get(key) is not None for key in ("pixel_values", "images")):
+    if generated and any(
+        inputs.get(key) is not None
+        for key in ("pixel_values", "pixel_values_videos", "images")
+    ):
         mask = mask | (values < 0)
     if ignore_token_ids:
         compare = np.asarray(list(ignore_token_ids))
@@ -3208,7 +3211,10 @@ def _apply_vlm_label_masks(batch_dict, labels=None, ignore_token_ids=None,
     if labels is None:
         labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, batch_dict["input_ids"])
     labels = _normalize_cce_label_dtype(labels)
-    if generated and batch_dict.get("pixel_values") is not None:
+    if generated and (
+        batch_dict.get("pixel_values") is not None
+        or batch_dict.get("pixel_values_videos") is not None
+    ):
         # Processor-generated negative image placeholders are not vocabulary targets.
         labels = mx.where(labels < 0, mx.array(ignore_index, dtype=labels.dtype), labels)
     labels = _mask_label_token_ids(labels, ignore_token_ids, ignore_index)
@@ -3830,6 +3836,16 @@ _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
     "muse_glimmer",
     "glm5_next",
 })
+
+
+# Families whose MLX input-embedding path branches on `pixel_values is None` and returns text embeds —
+# `pixel_values_videos` never reaches the tower, so video tokens would train as plain text.
+_VLM_TEXT_ONLY_EMBEDDER_MODEL_TYPES = {
+    "glm4v",
+    "glm4v_moe",
+    "ernie4_5_moe_vl",
+    "paddleocr_vl",
+}
 
 
 # Towers that read these keys on the host (a tracer under mx.compile) get the processor's Python values, set per family
@@ -7286,24 +7302,52 @@ def _vlm_vision_part_state(messages):
         for part in content:
             if not isinstance(part, dict):
                 continue
-            if part.get("type") not in ("image", "image_url", "input_image", "video"):
+            if part.get("type") not in ("image", "image_url", "input_image",
+                                       "video", "video_url", "input_video"):
                 continue
-            if any(key in part for key in ("image", "image_url", "input_image", "video")):
+            if any(key in part for key in ("image", "image_url", "input_image",
+                                           "video", "video_url", "input_video")):
                 has_media_payload = True
             else:
                 bare_placeholder_types.add(part.get("type"))
     return bare_placeholder_types, has_media_payload
 
 
-def _extract_vlm_images(
+def _video_part_payload(part):
+    for key in ("video", "video_url", "input_video"):
+        if part.get(key) is not None:
+            return part[key]
+    return None
+
+
+def _video_element_dict(video):
+    """Build the fetch_video element dict: parts pass through with their
+    fps/nframes/pixel hints; {path, bytes} dicts decode via path; scalars wrap."""
+    if isinstance(video, dict):
+        if "video" in video:
+            return video
+        if isinstance(video.get("path"), str):
+            return {**video, "video": video["path"]}
+        return {"video": video}
+    return {"video": video}
+
+
+def _extract_vlm_media(
     item,
     messages,
     image_size,
     *,
     suppress_process_errors=False,
 ):
+    """Returns (images, videos, video_kwargs). Videos decode through
+    fetch_video/process_vision_info so processors get frame arrays, never paths."""
     images = []
+    videos = []
+    video_kwargs = {}
     top_level_image = []
+    top_level_videos = []
+    has_image_parts = False
+    has_video_parts = False
     bare_placeholder_types, has_media_payload = _vlm_vision_part_state(messages)
     has_only_bare_image_placeholders = bare_placeholder_types == {"image"}
     if isinstance(item, dict):
@@ -7314,21 +7358,41 @@ def _extract_vlm_images(
             image = item.get("image")
             if image is not None:
                 top_level_image = image if isinstance(image, list) else [image]
+        video = item.get("videos")
+        if video is not None:
+            videos = video if isinstance(video, list) else [video]
+        elif "video" in item:
+            video = item.get("video")
+            if video is not None:
+                top_level_videos = video if isinstance(video, list) else [video]
 
-    if not images and isinstance(messages, list):
+    if (not images or not videos) and isinstance(messages, list):
+        collect_images = not images
+        collect_videos = not videos
         for message in messages:
             content = message.get("content", "")
             if not isinstance(content, list):
                 continue
             for part in content:
-                if isinstance(part, dict) and part.get("type") == "image":
-                    image = part.get("image")
-                    if image is not None:
-                        if any(key in part for key in ("resized_height", "resized_width", "min_pixels", "max_pixels")):
-                            from unsloth_zoo.vision_utils import fetch_image
-                            image = _resize_vlm_images([image], None)[0]
-                            image = fetch_image({**part, "image": image})
-                        images.append(image)
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type == "image":
+                    has_image_parts = True
+                    if collect_images:
+                        image = part.get("image")
+                        if image is not None:
+                            if any(key in part for key in ("resized_height", "resized_width", "min_pixels", "max_pixels")):
+                                from unsloth_zoo.vision_utils import fetch_image
+                                image = _resize_vlm_images([image], None)[0]
+                                image = fetch_image({**part, "image": image})
+                            images.append(image)
+                elif part_type in ("video", "video_url", "input_video"):
+                    has_video_parts = True
+                    if collect_videos:
+                        video = _video_part_payload(part)
+                        if video is not None:
+                            videos.append({**part, "video": video})
 
     if (
         not images
@@ -7338,35 +7402,96 @@ def _extract_vlm_images(
     ):
         images = top_level_image
 
-    if not images and isinstance(messages, list):
+    if not videos and top_level_videos and "video" in bare_placeholder_types:
+        videos = top_level_videos
+
+    needs_images = not images and has_image_parts
+    needs_videos = not videos and has_video_parts
+    if (needs_images or needs_videos) and isinstance(messages, list):
         try:
             from unsloth_zoo.vision_utils import process_vision_info
 
             extracted = process_vision_info(messages, return_video_kwargs=True)
-            if isinstance(extracted, tuple) and extracted:
-                maybe_images = extracted[0]
-                if maybe_images is not None:
-                    images = maybe_images if isinstance(maybe_images, list) else [maybe_images]
         except Exception:
             if not suppress_process_errors:
                 raise
+            extracted = None
+        if isinstance(extracted, tuple) and extracted:
+            maybe_images = extracted[0]
+            if not images and maybe_images is not None:
+                images = maybe_images if isinstance(maybe_images, list) else [maybe_images]
+            if len(extracted) > 1:
+                maybe_videos = extracted[1]
+                if not videos and maybe_videos is not None:
+                    videos = maybe_videos if isinstance(maybe_videos, list) else [maybe_videos]
+                    if len(extracted) > 2 and isinstance(extracted[2], dict):
+                        video_kwargs = dict(extracted[2])
 
-    return _resize_vlm_images(images, image_size)
+    if videos and any(isinstance(video, (str, bytes, dict)) for video in videos):
+        try:
+            from unsloth_zoo.vision_utils import fetch_video
+
+            decoded = []
+            sampled_fps = list(video_kwargs.get("fps") or [])
+            for video in videos:
+                if isinstance(video, (str, bytes, dict)):
+                    frames, fps = fetch_video(
+                        _video_element_dict(video),
+                        return_video_sample_fps=True,
+                    )
+                    decoded.append(frames)
+                    sampled_fps.append(fps)
+                else:
+                    decoded.append(video)
+            videos = decoded
+            if len(sampled_fps) == len(videos) and "fps" not in video_kwargs:
+                video_kwargs["fps"] = sampled_fps
+        except Exception:
+            if not suppress_process_errors:
+                raise
+            # Suppressed decode failures must not hand raw payloads to the
+            # processor: keep only what decoded, so a bad clip becomes an
+            # unpaired-placeholder error instead of corrupt video_metadata.
+            videos = [
+                video for video in videos
+                if not isinstance(video, (str, bytes, dict))
+            ]
+
+    return _resize_vlm_images(images, image_size), videos, video_kwargs
 
 
-def _extract_vlm_pc_images(item, prompt_messages, completion_messages, image_size):
-    """Extract VLM PC images with CUDA's embedded-then-top-level preference."""
+def _extract_vlm_images(
+    item,
+    messages,
+    image_size,
+    *,
+    suppress_process_errors=False,
+):
+    images, _, _ = _extract_vlm_media(
+        item, messages, image_size, suppress_process_errors=suppress_process_errors,
+    )
+    return images
+
+
+def _extract_vlm_pc_media(item, prompt_messages, completion_messages, image_size):
+    """Extract VLM PC media with CUDA's embedded-then-top-level preference."""
     messages = (prompt_messages or []) + (completion_messages or [])
     if messages:
-        images = _extract_vlm_images(
-            item if isinstance(item, dict) and item.get("images") is None else {},
-            messages,
-            image_size,
-            suppress_process_errors=True,
+        # When `images` is present the row-level item is hidden from image
+        # extraction (CUDA's embedded-then-top-level preference). Video keys
+        # have no recovery branch below, so they must stay visible or a bare
+        # placeholder would render an unexpanded video token with no clip.
+        if isinstance(item, dict) and item.get("images") is not None:
+            item = {
+                key: value for key, value in item.items()
+                if key in ("video", "videos")
+            }
+        images, videos, video_kwargs = _extract_vlm_media(
+            item, messages, image_size, suppress_process_errors=True,
         )
-        if images:
-            return images
-        return []
+        if images or videos:
+            return images, videos, video_kwargs
+        return [], [], {}
 
     if isinstance(item, dict) and "images" in item:
         try:
@@ -7382,9 +7507,25 @@ def _extract_vlm_pc_images(item, prompt_messages, completion_messages, image_siz
                 images = [images]
         except Exception:
             images = []
-        return _resize_vlm_images(images, image_size)
+        return _resize_vlm_images(images, image_size), [], {}
 
-    return []
+    if isinstance(item, dict) and ("videos" in item or "video" in item):
+        # Messageless rows still own their clips; promote `video` to the strong
+        # key so extraction does not wait on a placeholder that cannot exist.
+        row = dict(item)
+        if "videos" not in row and "video" in row:
+            row["videos"] = row.pop("video")
+        return _extract_vlm_media(row, [], image_size)
+
+    return [], [], {}
+
+
+def _extract_vlm_pc_images(item, prompt_messages, completion_messages, image_size):
+    """Extract VLM PC images with CUDA's embedded-then-top-level preference."""
+    images, _, _ = _extract_vlm_pc_media(
+        item, prompt_messages, completion_messages, image_size,
+    )
+    return images
 
 
 _AUDIO_PART_TYPES = ("audio", "audio_url", "input_audio")
@@ -8097,7 +8238,11 @@ _AUDIO_FEATURE_PAYLOAD_KEYS = (
 
 # Some image processors keep one tensor per image when aspect-ratio preprocessing gives different shapes; the vision
 # tower consumes that ragged list, so collapsing to value[0] silently drops later images.
-_VLM_RAGGED_MEDIA_PAYLOAD_KEYS = (*_AUDIO_FEATURE_PAYLOAD_KEYS, "pixel_values")
+_VLM_RAGGED_MEDIA_PAYLOAD_KEYS = (
+    *_AUDIO_FEATURE_PAYLOAD_KEYS,
+    "pixel_values",
+    "pixel_values_videos",
+)
 
 
 def _assert_audio_features_present(inputs, expected, processor):
@@ -9110,17 +9255,64 @@ def _processor_vlm_inputs(
     padding_side=None,
     all_audio=None,
     image_context_limit=None,
+    all_videos=None,
+    all_video_kwargs=None,
 ):
-    _validate_mlx_image_input(processor, any(all_images))
+    _validate_mlx_image_input(processor, any(all_images) or any(all_videos or ()))
     legacy = legacy_image_inputs(
         processor, texts, all_images, max_seq_length, truncation, image_context_limit,
     )
     if legacy is not None:
+        if any(all_videos or ()):
+            raise ValueError(
+                f"Unsloth MLX: `{type(processor).__name__}` is a legacy image-only "
+                "processor; video rows need a video-capable processor (Qwen-VL family)."
+            )
         return legacy
     tokenizer = _ensure_vlm_pad_token(processor)
     images = _format_vlm_images_for_processor(all_images, processor=processor)
     audio = _format_vlm_audio_for_processor(all_audio, processor=processor)
-    text_only = images is None and audio is None and callable(tokenizer)
+    videos = None
+    video_proc_kwargs = {}
+    if all_videos and any(all_videos):
+        if "videos" not in _drop_unsupported_processor_kwargs(processor, {"videos": True}):
+            raise ValueError(
+                f"Unsloth MLX: `{type(processor).__name__}` does not accept video "
+                "inputs. Video rows need a video-capable processor (Qwen-VL family)."
+            )
+        # These towers' input-embedding patches only look at `pixel_values`; a
+        # video-only batch would silently train the clips' tokens as text.
+        model_type = getattr(processor, "model_type", None) or getattr(
+            getattr(processor, "tokenizer", None), "model_type", None
+        )
+        if model_type in _VLM_TEXT_ONLY_EMBEDDER_MODEL_TYPES:
+            raise ValueError(
+                f"Unsloth MLX: video training is not supported for {model_type} yet; "
+                "its MLX backbone drops `pixel_values_videos` on the floor."
+            )
+        # Same shape the CUDA collator builds: per-row clip lists (empty rows
+        # dropped) plus a flat fps list that only counts when it aligns
+        # clip-for-clip, else the version-aware adapter falls back cleanly.
+        nested = [list(row) for row in all_videos if row]
+        flat_fps = []
+        aligned = True
+        for row, kw in zip(all_videos, all_video_kwargs or []):
+            if not row:
+                continue
+            row_fps = (kw or {}).get("fps") if isinstance(kw, dict) else None
+            if row_fps is None or len(row_fps) != len(row):
+                aligned = False
+                break
+            flat_fps.extend(row_fps)
+        from unsloth_zoo.vision_utils import video_processor_kwargs
+
+        videos, video_proc_kwargs = video_processor_kwargs(
+            processor, nested, flat_fps if aligned else [],
+        )
+        # mlx-vlm iterates each element of `videos` as one clip, so the
+        # per-row grouping comes back out; transformers takes either shape.
+        videos = [video for row in videos for video in row]
+    text_only = images is None and audio is None and videos is None and callable(tokenizer)
     if text_only:
         processor = tokenizer
     base_kwargs = dict(
@@ -9130,6 +9322,11 @@ def _processor_vlm_inputs(
         add_special_tokens=False,
     )
     base_kwargs = _drop_unsupported_processor_kwargs(processor, base_kwargs)
+    if videos is not None:
+        base_kwargs["videos"] = videos
+        base_kwargs.update(
+            _drop_unsupported_processor_kwargs(processor, video_proc_kwargs)
+        )
     audio_kwarg = None
     if audio is not None:
         audio_kwarg = _vlm_processor_audio_kwarg(processor)
@@ -9236,6 +9433,10 @@ def _processor_vlm_inputs(
 
     if audio_kwarg is None:
         inputs = _run_layouts()
+        # Nothing on the mlx side consumes these; as free-form floats/Mapping
+        # objects they only fracture compile families and defeat batch planning.
+        inputs.pop("second_per_grid_ts", None)
+        inputs.pop("video_metadata", None)
         if text_only and "text_pair" in base_kwargs:
             inputs["labels"] = np.where(
                 np.asarray(inputs["token_type_ids"]) == 0, -100,
@@ -9533,6 +9734,8 @@ def _collate_vlm_prompt_completion_batch(
     completion_texts = []
     all_images = []
     all_audio = []
+    all_videos = []
+    all_video_kwargs = []
 
     for item in items:
         prompt_raw = item.get("prompt", "")
@@ -9570,7 +9773,7 @@ def _collate_vlm_prompt_completion_batch(
         if completion_messages is not None:
             combined = prompt_messages + completion_messages
             prompt_completion_text = _render_vlm_messages(processor, combined)
-            images = _extract_vlm_pc_images(
+            images, videos, video_kwargs = _extract_vlm_pc_media(
                 item, prompt_messages, completion_messages, image_size,
             )
             prompt_text = _common_text_prefix(
@@ -9578,7 +9781,7 @@ def _collate_vlm_prompt_completion_batch(
             )
             completion_text = prompt_completion_text[len(prompt_text):]
         else:
-            images = _extract_vlm_pc_images(
+            images, videos, video_kwargs = _extract_vlm_pc_media(
                 item, prompt_messages, completion_messages, image_size,
             )
             completion_text = str(completion)
@@ -9586,6 +9789,8 @@ def _collate_vlm_prompt_completion_batch(
         prompt_texts.append(prompt_text)
         completion_texts.append(completion_text)
         all_images.append(images)
+        all_videos.append(videos)
+        all_video_kwargs.append(video_kwargs)
 
     prompt_inputs = _processor_vlm_inputs(
         processor,
@@ -9595,6 +9800,8 @@ def _collate_vlm_prompt_completion_batch(
         truncation=False,
         padding_side="left",
         all_audio=all_audio,
+        all_videos=all_videos,
+        all_video_kwargs=all_video_kwargs,
     )
     # Untruncated halves: only run presence is checkable until the combine.
     audio_counts = [len(clips) for clips in all_audio]
@@ -9699,7 +9906,7 @@ def _combine_vlm_prompt_completion_inputs(
     input_ids, attention_mask, extras = _truncate_vlm_arrays_by_side(
         input_ids, attention_mask, flush_side, max_seq_length, extras,
     )
-    if any(prompt_inputs.get(key) is not None for key in ("pixel_values", "images")):
+    if any(prompt_inputs.get(key) is not None for key in ("pixel_values", "images", "pixel_values_videos")):
         required = _image_span_expansion_required(
             full_inputs, {"input_ids": input_ids, "attention_mask": attention_mask},
             image_token_ids or ignore_token_ids, max_seq_length, image_context_limit,
@@ -9809,6 +10016,8 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
     all_texts = []
     all_images = []
     all_audio = []
+    all_videos = []
+    all_video_kwargs = []
     all_suffixes = []
 
     for item in formatted_items:
@@ -9828,7 +10037,7 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
                 "Unsloth MLX VLM: no text could be rendered for this dataset row. "
                 "Provide messages/conversations, a text field, or a formatting_func."
             )
-        images = _extract_vlm_images(item, messages, image_size)
+        images, videos, video_kwargs = _extract_vlm_media(item, messages, image_size)
         audio = _extract_vlm_audio(item, messages, processor)
         if raw is not item or isinstance(item, list):
             split, audio = _split_audio_past_the_window(messages, audio, processor)
@@ -9838,6 +10047,8 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
                 text = _render_vlm_messages(processor, split)
         all_texts.append(text)
         all_images.append(images)
+        all_videos.append(videos)
+        all_video_kwargs.append(video_kwargs)
         all_audio.append(audio)
         all_suffixes.append(item.get("suffix") if isinstance(item, dict) else None)
 
@@ -9850,15 +10061,19 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
             padding_side="right",
             all_audio=all_audio,
             image_context_limit=image_context_limit,
+            all_videos=all_videos,
+            all_video_kwargs=all_video_kwargs,
         ),
         processor,
     )
-    if (any(all_images) and max_seq_length
+    if ((any(all_images) or any(all_videos)) and max_seq_length
             and _as_numpy_vlm_field(inputs, "input_ids").shape[1] >= max_seq_length):
         full_inputs = _right_pad_vlm_rows(_processor_vlm_inputs(
             processor, all_texts, all_images, max_seq_length,
             suffixes=all_suffixes, truncation=False, padding_side="right",
             all_audio=all_audio,
+            all_videos=all_videos,
+            all_video_kwargs=all_video_kwargs,
         ), processor)
         required = _image_span_expansion_required(
             full_inputs, inputs,
@@ -9869,6 +10084,7 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
             inputs = _right_pad_vlm_rows(_processor_vlm_inputs(
                 processor, all_texts, all_images, required,
                 suffixes=all_suffixes, padding_side="right", all_audio=all_audio,
+                all_videos=all_videos, all_video_kwargs=all_video_kwargs,
             ), processor)
             inputs["_unsloth_image_context_limit"] = image_context_limit
     audio_counts = [len(clips) for clips in all_audio]
