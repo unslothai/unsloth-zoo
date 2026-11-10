@@ -371,6 +371,16 @@ def run_fold_failure_rolls_back(device):
     _restored(ws, before)
 
 
+def run_status_failure_rolls_back(device):
+    # The status allocation after the fold is inside the rollback too: an OOM there must not strand folded weights.
+    ws, As, Bs, before = _lists(device, 1, seed = 72)
+    with mock.patch.object(ex, "_status", side_effect = torch.OutOfMemoryError("out of memory")):
+        with pytest.raises(torch.OutOfMemoryError):
+            ex.fold_weights_(ws, As, Bs, [0.5], [805])
+    _restored(ws, before)
+    assert not any(k[0] == 805 for k in ex._OP_LIVE)
+
+
 def run_unfold_failure_keeps_keys(device):
     # An unfold that raises before restoring (launch OOM) keeps its keys; a retry restores bit for bit.
     ws, As, Bs, before = _lists(device, 2, seed = 75)
@@ -418,6 +428,7 @@ def run_all(device):
     run_fold_keeps_no_weight_reference(device)
     run_partial_unfold_is_not_retried(device)
     run_fold_failure_rolls_back(device)
+    run_status_failure_rolls_back(device)
     run_unfold_failure_keeps_keys(device)
     run_compiled(device)
     run_arena_growth(device)
