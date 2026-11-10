@@ -108,7 +108,13 @@ def decode_padding(attention_mask, kv_length, kv_offset):
 
 
 def _block_starts(n, block, device):
-    """[min, block, 2 * block, ...]: bucketize(d, right = True) counts the starts <= d, so it is clamp(d // block + 1, 1, n)."""
+    """[min, block, 2 * block, ...]: bucketize(d, right = True) counts the starts <= d, so it is clamp(d // block + 1, 1, n).
+    Cached: a fresh build per mask costs a host-to-device scalar copy every decode step. Never written."""
+    return _cached_block_starts(int(n), int(block), torch.device(device))
+
+
+@functools.lru_cache(maxsize = 64)
+def _cached_block_starts(n, block, device):
     starts = torch.arange(n, dtype = torch.int64, device = device) * block
     starts[0] = torch.iinfo(torch.int64).min
     return starts
@@ -316,8 +322,11 @@ _COMPILED_SHAPES = set()
 
 
 def _shape_key(query, key, kernel_options, softcap):
+    # Every dimension a compile specialises on (batch is static, see below): a later specialisation must still go
+    # through the failure handling below, not the cached-success path.
     return (
-        query.shape[-1], query.shape[1], key.shape[1], query.dtype, query.device, bool(softcap),
+        query.shape[0], key.shape[-2], query.shape[-1], query.shape[1], key.shape[1], query.dtype, query.device,
+        bool(softcap),
         tuple(sorted((k, repr(v)) for k, v in kernel_options.items())),
     )
 

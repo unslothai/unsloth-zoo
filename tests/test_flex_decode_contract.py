@@ -384,3 +384,35 @@ def test_reference_fallback_keeps_an_elided_causal_mask_and_attention_dropout(wh
     torch.testing.assert_close(dropped, expected.transpose(1, 2))
     assert not torch.allclose(dropped, again)
     torch.testing.assert_close(clean, again)
+
+
+def test_a_new_batch_after_a_compiled_one_still_gets_failure_handling(monkeypatch):
+    # A success at one batch size must not send a later specialisation (batch is static) down the unguarded path.
+    calls = []
+
+    def compiled_flex(query, key, value, **kwargs):
+        calls.append(query.shape[0])
+        if query.shape[0] == 2:
+            raise RuntimeError("No valid triton configs")
+        lse = torch.zeros(query.shape[:-1], dtype = torch.float32)
+        return torch.zeros_like(query), lse
+
+    monkeypatch.setattr(D, "_flex_function", lambda device: (compiled_flex, True))
+    monkeypatch.setattr(D, "_FAILED_SHAPES", set())
+    monkeypatch.setattr(D, "_COMPILED_SHAPES", set())
+    monkeypatch.setattr(D, "_output_and_lse", lambda result: result)
+    for batch, fails in ((1, False), (2, True)):
+        _, q, k, v = _qkv(batch, 4, 2, 64, 16, seed = 0)
+        bm = D.decode_block_mask(batch, 64, torch.tensor(63), device = "cpu")
+        if fails:
+            with pytest.raises(D.FlexDecodeUnavailable):
+                D.flex_decode_attention(q, k, v, bm, 0.25)
+        else:
+            D.flex_decode_attention(q, k, v, bm, 0.25)
+    assert calls == [1, 2]
+
+
+def test_block_starts_are_built_once_per_shape():
+    first = D._block_starts(8, 128, "cpu")
+    assert D._block_starts(8, 128, torch.device("cpu")) is first
+    assert first[0] == torch.iinfo(torch.int64).min and first[1:].tolist() == [128 * i for i in range(1, 8)]
