@@ -157,3 +157,54 @@ def test_load_vllm_agrees_before_any_retry_and_after_success():
     i_ok = body.index("_external_launcher_attempt_agreed(failed = False)")
     assert i_count < i_loop < i_before < i_fail < i_ok
     assert i_ok > body.index("if not loaded: _release_failed_vllm_engine(registries_before)")
+
+
+@pytest.mark.parametrize("errors, trials, attempts", [
+    (("CUDA out of memory", "invalid capture configuration"), (0, 0), [1, 1]),  # retry vs raise
+    (("CUDA out of memory", "CUDA out of memory"), (1, 0), [1, 1]),             # unequal retry budgets
+    (("CUDA out of memory", "CUDA out of memory"), (0, 0), [2, 2]),             # both retry, then load
+])
+def test_all_failed_attempt_takes_the_same_next_step_on_every_rank(tmp_path, errors, trials, attempts):
+    """load_vllm's real retry loop with an engine that fails once after vLLM's memory MIN."""
+    r = _torchrun(tmp_path, f"""
+        import ast, contextlib, json, os, sys, time
+        import torch.distributed as dist
+        import unsloth_zoo.vllm_utils as vu
+        rank = int(os.environ["RANK"])
+        vu._init_torchrun_process_group(vu._torchrun_launch_info())
+        tree = ast.parse(open(vu.__file__).read())
+        load = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
+        loop = next(n for n in ast.walk(load) if isinstance(n, ast.While)
+                    and any(isinstance(k, ast.Name) and k.id == "reduces_before" for k in ast.walk(n)))
+        ns = dict(vu.__dict__)
+        calls = []
+        def engine(**kwargs):
+            calls.append(1)
+            vu._all_reduce_int(1, dist.ReduceOp.MIN)  # vLLM's cross-rank memory check
+            ns["_EXTERNAL_LAUNCHER_MEMORY_REDUCES"] += 1
+            if len(calls) == 1:
+                raise RuntimeError({errors!r}[rank])
+            return object()
+        ns.update(LLM = engine, use_async = False, use_engine = False, vllm_local_rank = None,
+                  _scoped_environ = lambda env: contextlib.nullcontext(), engine_args = {{"gpu_memory_utilization": 0.8}},
+                  count_reduces = True, _EXTERNAL_LAUNCHER_MEMORY_REDUCES = 0, trials = {trials!r}[rank], race_trials = 0,
+                  _snapshot_dynamo_engine_registries = lambda: None, _release_failed_vllm_engine = lambda _: None,
+                  unsloth_vllm_standby = False, approx_max_num_seqs = 8, max_num_batched_tokens = 128,
+                  max_seq_length = 128, enable_lora = False, total_gb = 80.0, gpu_memory_utilization = 0.8,
+                  replayssm_set_runner = False)
+        start = time.time()
+        try:
+            exec(compile(ast.Module(body = [loop], type_ignores = []), vu.__file__, "exec"), ns)
+            out = {{"outcome": "ok"}}
+        except BaseException as error:
+            out = {{"outcome": "raise", "msg": str(error)[:500]}}
+        out.update(seconds = time.time() - start, attempts = len(calls))
+        json.dump(out, open(os.path.join(sys.argv[1], "r%d.json" % rank), "w"))
+        sys.stdout.flush()
+        os._exit(0)
+    """)
+    results = _results(tmp_path)
+    assert [o["attempts"] for o in results] == attempts, results
+    want = "ok" if attempts == [2, 2] else "raise"
+    assert [o["outcome"] for o in results] == [want, want], results
+    assert all(o["seconds"] < 20 for o in results), results

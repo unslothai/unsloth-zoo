@@ -2692,8 +2692,16 @@ def standardize_data_formats(
         # multiprocessing's start method while datasets uses multiprocess, and it
         # fell back to num_proc = 1 under memory pressure -- which is a Pool(1)
         # on datasets >= 4.1, the pool this exists to avoid.
-        from .dataset_num_proc import get_dataset_num_proc
-        dataset_map_kwargs['num_proc'] = get_dataset_num_proc(num_proc)
+        from .dataset_num_proc import environment_override, get_dataset_num_proc
+        # Per-row work is tiny, so a pool mostly pickles shards: in-memory defaults stay in process (as Studio's copy does).
+        if (
+            num_proc is None
+            and not getattr(dataset, "cache_files", None)
+            and not environment_override()[0]
+        ):
+            dataset_map_kwargs['num_proc'] = None
+        else:
+            dataset_map_kwargs['num_proc'] = get_dataset_num_proc(num_proc)
         dataset_map_kwargs['desc'] = "Unsloth: Standardizing formats"
 
     return dataset.map(
@@ -2810,7 +2818,7 @@ def sft_prepare_dataset(
     map_kwargs = {}
     use_desc = isinstance(dataset, Dataset)
     # Imported here: this function's source is copied into the compiled trainer module.
-    from unsloth_zoo.dataset_utils import _batched_columns
+    from unsloth_zoo.dataset_utils import _batched_columns, _iterable_batch_size
     is_vlm = hasattr(processing_class, "tokenizer")
     tokenizer = processing_class
     if is_vlm: tokenizer = processing_class.tokenizer
@@ -3309,12 +3317,18 @@ def sft_prepare_dataset(
         if not completion_only_loss and "completion_mask" in mask_columns:
             mask_columns.remove("completion_mask")
         if mask_columns:
+            def _labels_row(input_ids, masks):
+                # Unrolled for one or two masks: `all(m)` built a list per token. Same truthiness as all().
+                if len(masks) == 1:
+                    return [t if m else -100 for t, m in zip(input_ids, masks[0])]
+                if len(masks) == 2:
+                    return [t if a and b else -100 for t, a, b in zip(input_ids, masks[0], masks[1])]
+                return [t if all(m) else -100 for t, *m in zip(input_ids, *masks)]
             def _build_labels(example):
-                masks = [example[x] for x in mask_columns]
-                return {"labels": [t if all(m) else -100 for t, *m in zip(example["input_ids"], *masks)]}
+                return {"labels": _labels_row(example["input_ids"], [example[x] for x in mask_columns])}
             def _build_labels_batched(batch):
                 return {"labels": [
-                    [t if all(m) else -100 for t, *m in zip(input_ids, *masks)]
+                    _labels_row(input_ids, masks)
                     for input_ids, *masks in zip(batch["input_ids"], *(batch[x] for x in mask_columns))
                 ]}
             label_kwargs = {}

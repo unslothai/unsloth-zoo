@@ -119,6 +119,7 @@ def _build_kernels():
         ACTIVATION: tl.constexpr,  # silu activation
         HAS_SEQ_IDX: tl.constexpr,  # packed seq_idx boundaries
         PAD_NEG: tl.constexpr,  # zero padded positions (seq_idx < 0)
+        ROUND: tl.constexpr,  # 0 fp32, 1 weight dtype, 2 x dtype before SiLU
     ):
         i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         o_t = i_t * BT + tl.arange(0, BT)
@@ -147,9 +148,11 @@ def _build_kernels():
         if HAS_BIAS:
             acc += tl.load(bias + o_d, mask = m_d, other = 0).to(tl.float32)[None, :]
         if ACTIVATION:
-            # The torch path stores the conv output in the weight's dtype, then SiLU (an fp32
-            # parameter under autocast keeps it fp32: narrowing to x's fp16 overflows to -inf).
-            acc = acc.to(weight.dtype.element_ty).to(tl.float32)
+            # SiLU on the conv output rounded to the wider of x / weight (see _act_dtype).
+            if ROUND == 1:
+                acc = acc.to(weight.dtype.element_ty).to(tl.float32)
+            elif ROUND == 2:
+                acc = acc.to(y.dtype.element_ty).to(tl.float32)
             acc = acc * tl.sigmoid(acc)
         if PAD_NEG:
             # causal_conv1d's rule: padding (seq_idx < 0) outputs 0; it never feeds a real position.
@@ -197,9 +200,9 @@ def _build_kernels():
             dy + tl.cast(i_b, tl.int64) * stride_dy_b + o_t.to(tl.int64)[:, None] * stride_dy_t + o_d64[None, :] * stride_dy_d,
             mask = m, other = 0,
         ).to(tl.float32)
-        pre = acc.to(weight.dtype.element_ty).to(tl.float32)
+        pre = acc.to(g.dtype.element_ty).to(tl.float32)
         sig = tl.sigmoid(pre)
-        # torch's silu_backward stores the gradient in the conv's (the weight's) dtype.
+        # torch's silu_backward stores the gradient in the conv's dtype (g is allocated in it).
         b_g = b_dy * sig * (1 + pre * (1 - sig))
         p_g = g + tl.cast(i_b, tl.int64) * T * D + o_t.to(tl.int64)[:, None] * D + o_d[None, :]
         tl.store(p_g, b_g.to(g.dtype.element_ty), mask = m)
@@ -281,6 +284,12 @@ _BWD_CONFIG = (32, 64, 2)
 _MAX_GRID_YZ = 65535
 
 
+def _act_dtype(x_dtype, w_dtype):
+    # Never narrower than either operand: fp16 weights with fp32 / bf16 x would overflow to -inf
+    # before SiLU (NaN); fp16 with bf16 promotes to fp32, as causal_conv1d's fp32 SiLU does.
+    return torch.promote_types(x_dtype, w_dtype)
+
+
 def _launch_fwd(x_btd, weight, bias, activation, seq_idx = None, pad_negative = False):
     fwd, _ = _build_kernels()
     _BT, _BD, _NUM_WARPS = _FWD_CONFIG
@@ -290,7 +299,13 @@ def _launch_fwd(x_btd, weight, bias, activation, seq_idx = None, pad_negative = 
     grid = ((D + _BD - 1) // _BD, (T + _BT - 1) // _BT, B)
     ptrs = (x_btd, weight, bias if bias is not None else weight, y, seq_idx if seq_idx is not None else weight)
     ints = (T, D, *x_btd.stride())
-    consts = (W, _BT, _BD, bias is not None, activation is not None, seq_idx is not None, pad_negative and seq_idx is not None)
+    act_dtype = _act_dtype(x_btd.dtype, weight.dtype)
+    # 0: fp32, no rounding; 1: the weight's dtype; 2: x's (and y's) dtype.
+    round_to = 1 if act_dtype == weight.dtype else 2 if act_dtype == x_btd.dtype else 0
+    consts = (
+        W, _BT, _BD, bias is not None, activation is not None, seq_idx is not None,
+        pad_negative and seq_idx is not None, round_to,
+    )
     _conv_launch("fwd", fwd, grid, ptrs, ints, consts, _NUM_WARPS, (y,))
     return y
 
@@ -304,7 +319,7 @@ def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_
     grid = ((D + _BD - 1) // _BD, NT, B)
     seq_ptr = seq_idx if seq_idx is not None else weight
     if activation is not None:
-        g = torch.empty((B, T, D), dtype = weight.dtype, device = x_btd.device)
+        g = torch.empty((B, T, D), dtype = _act_dtype(x_btd.dtype, weight.dtype), device = x_btd.device)
         _conv_launch(
             "bwd_g", bwd_g, grid,
             (x_btd, weight, bias if bias is not None else weight, dy_btd, g, seq_ptr),
@@ -728,8 +743,9 @@ def causal_conv1d_reference(x, weight, bias = None, activation = None):
     """The transformers torch fallback: x (B, D, T), weight (D, W)."""
     import torch.nn.functional as F
     D, T = x.shape[1], x.shape[2]
+    dtype = _act_dtype(x.dtype, weight.dtype)
     out = F.conv1d(
-        x.to(weight.dtype), weight.unsqueeze(1), bias,
+        x.to(dtype), weight.to(dtype).unsqueeze(1), None if bias is None else bias.to(dtype),
         padding = weight.shape[-1] - 1, groups = D,
     )[:, :, :T]
     if activation is not None:
@@ -865,7 +881,7 @@ def _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx, pad_n
         out = out + xp[:, :, j:j + T] * w[:, j].view(1, -1, 1) * same
     if bias is not None:
         out = out + bias.to(acc).view(1, -1, 1)
-    out = out.to(weight.dtype)
+    out = out.to(_act_dtype(x.dtype, weight.dtype))
     if activation is not None:
         out = _act(activation)(out)
     if pad_negative:
@@ -899,16 +915,20 @@ def _hub_gdn_function(decorator, torch_function):
     names = frozenset(inspect.signature(dispatch).parameters)
 
     if isinstance(hub_fn, torch.nn.Module):
-        # Hub yields a layer (kernel_layer_name on its class): wrap its forward so kernelize can swap it.
-        hub_forward = hub_fn.forward
+        # Hub yields a layer (kernel_layer_name on its class). Route on a subclass, not the instance:
+        # kernelize's fallback resets the instance forward to type(layer).forward, and a mapped
+        # kernel still replaces the instance forward.
+        hub_class = type(hub_fn)
 
-        @functools.wraps(hub_forward)
-        def forward(*args, **kwargs):
-            if kwargs.get("seq_idx") is not None:
-                return dispatch(*args, **{k: v for k, v in kwargs.items() if k in names})
-            return hub_forward(*args, **kwargs)
+        class Func(hub_class):
+            def forward(self, *args, **kwargs):
+                if kwargs.get("seq_idx") is not None:
+                    return dispatch(*args, **{k: v for k, v in kwargs.items() if k in names})
+                return super().forward(*args, **kwargs)
 
-        hub_fn.forward = forward
+        Func.__name__, Func.__qualname__ = hub_class.__name__, hub_class.__qualname__
+        Func.__module__ = hub_class.__module__
+        hub_fn.__class__ = Func
         # Signature checks (Unsloth's packing gate looks for `seq_idx`) see the dispatch, not (*args, **kwargs).
         hub_fn.__signature__ = inspect.signature(dispatch)
         setattr(hub_fn, _MARK, True)
@@ -969,6 +989,22 @@ def _legacy_update(module):
     return _make_update_dispatch(torch_function)
 
 
+def _hub_layer_torch_function(current):
+    """The torch fallback inside a kernels hub layer (kernels turns a decorated function into a
+    ``Func()`` module whose class forward closes over the transformers wrapper), else None."""
+    if not isinstance(current, torch.nn.Module):
+        return None
+    for cell in getattr(getattr(type(current), "forward", None), "__closure__", None) or ():
+        try:
+            inner = cell.cell_contents
+        except ValueError:
+            continue
+        torch_function = getattr(inner, "__wrapped__", None) if callable(inner) else None
+        if callable(torch_function):
+            return torch_function
+    return None
+
+
 def _rebind_name(module, name, legacy, patched_decorator):
     current = vars(module)[name]
     if current is None:
@@ -977,7 +1013,8 @@ def _rebind_name(module, name, legacy, patched_decorator):
         return True
     if _is_marked(current):
         return True
-    torch_function = getattr(current, "__wrapped__", None)
+    # A modeling module imported before the patch holds the kernels layer, which has no __wrapped__.
+    torch_function = getattr(current, "__wrapped__", None) or _hub_layer_torch_function(current)
     if torch_function is None or patched_decorator is None:
         return False
     setattr(module, name, patched_decorator(name, "causal_conv1d")(torch_function))

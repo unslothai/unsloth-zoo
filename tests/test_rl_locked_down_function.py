@@ -36,6 +36,9 @@ BLOCKED = [
     ("operator.attrgetter", 'def matmul(A, B):\n    import operator\n    return operator.attrgetter("__class__.__bases__")(1)\n', AttributeError),
     ("operator.methodcaller", 'def matmul(A, B):\n    import operator\n    return operator.methodcaller("__str__")(1)\n', AttributeError),
     ("enum.global_enum", 'def matmul(A, B):\n    import enum\n    return enum.global_enum(enum.IntEnum("Hijack", {"len": 7}, module = "builtins"))\n', AttributeError),
+    # pickle_by_enum_name(member, proto) returns (getattr, ...): the real getattr then walks __self__ to builtins.__import__.
+    ("enum.pickle_by_enum_name", 'def matmul(A, B):\n    import enum, re\n    g = enum.pickle_by_enum_name(re.IGNORECASE, 2)[0]\n    return g(g(g, "__self__"), "__import__")("os").getpid()\n', AttributeError),
+    ("from enum import pickle_by_enum_name", 'def matmul(A, B):\n    from enum import pickle_by_enum_name\n    return pickle_by_enum_name\n', ImportError),
     # Formatter.get_field resolves a dotted string and returns the object, recovering the real __import__; str.format
     # walks attributes too but only returns text, so only this one matters.
     ("string.Formatter", 'def matmul(A, B):\n    import string\n    q = string.Formatter()\n    return q.get_field("0.get_field.__globals__[__builtins__][__import__]", (q,), {})[0]\n', ImportError),

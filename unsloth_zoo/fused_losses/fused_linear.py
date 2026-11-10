@@ -32,6 +32,7 @@ __all__ = [
 import functools
 import math
 import os
+import threading
 import warnings
 import torch
 from typing import Optional
@@ -1103,13 +1104,14 @@ def _logits_into(h, w, out, fp32_logits):
     V8 = _aligned(w.shape[0])
     parts = ((0, V8), (V8, w.shape[0])) if V8 < w.shape[0] else ((0, V8),)
     for a, b in parts:
+        o = out[:, a:b]
         if fp32_logits:
-            _mm_fp32(h, w[a:b].t(), out = out[:, a:b])
-        elif h.is_cuda:
-            torch.mm(h, w[a:b].t(), out = out[:, a:b])
+            _mm_fp32(h, w[a:b].t(), out = o)
+        elif h.is_cuda or o.stride() == (b - a, 1):
+            torch.mm(h, w[a:b].t(), out = o)
         else:
             # CPU fp16 mm with out= into a strided column slice reads stale contents on avx512_fp16 hosts (torch 2.10, oneDNN): NaN or wrong logits.
-            out[:, a:b].copy_(torch.mm(h, w[a:b].t()))
+            o.copy_(torch.mm(h, w[a:b].t()))
     return out
 
 
@@ -1661,6 +1663,11 @@ def _logprobs_impl(hidden, weight, bias, targets, mask, temperature, mul, div, c
         (lpt if exact_lpt else logps.clone(),)
 
 
+# The reduced-precision switch is process-wide: overlapping backward threads (one per device) must not save / restore
+# over each other, so the switch, the GEMM launch and the restore happen under one lock (launch only, the GEMM is async).
+_REDUCTION_LOCK = threading.Lock()
+
+
 def _mm_into(out, a, b):
     """out = a @ b accumulated in fp32 and rounded once to out's dtype (no reduced-precision split-K reduction)."""
     if out.dtype == torch.float32:
@@ -1670,12 +1677,15 @@ def _mm_into(out, a, b):
         flags = torch.backends.cuda.matmul
         name = "allow_bf16_reduced_precision_reduction" if a.dtype == torch.bfloat16 else \
             "allow_fp16_reduced_precision_reduction"
-        old = getattr(flags, name)
-        setattr(flags, name, False)
-        try:
-            torch.mm(a, b, out = out)
-        finally:
-            setattr(flags, name, old)
+        with _REDUCTION_LOCK:
+            old = getattr(flags, name)
+            # torch >= 2.10: assigning a bool turns split-K back on, so restore the caller's pair as a tuple.
+            split_k = getattr(flags, name + "_split_k", None)
+            setattr(flags, name, False if split_k is None else (False, split_k))
+            try:
+                torch.mm(a, b, out = out)
+            finally:
+                setattr(flags, name, old if split_k is None else (old, split_k))
         return
     out.copy_(_mm_fp32(a, b))
 

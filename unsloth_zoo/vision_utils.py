@@ -544,7 +544,6 @@ def fetch_remote_media_to_file(url: str, timeout: int = 30) -> str:
         except OSError: pass
         raise
     return handle.name
-    raise ValueError(f"Unsloth: Too many redirects while fetching `{url}`")
 
 
 def round_by_factor(number: int, factor: int) -> int:
@@ -588,6 +587,16 @@ def smart_resize(
     return h_bar, w_bar
 
 
+def _refuse_network_share_image(path):
+    # Same rule as fetch_video: on Windows even os.path.isfile on a UNC path opens an SMB connection.
+    if isinstance(path, str) and _is_network_share(path) and not _allow_private_url_fetch():
+        raise ValueError(
+            f"Unsloth: Refusing an image path on a network share: `{path}`. "
+            f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to load images from shares you trust."
+        )
+    return path
+
+
 def _decode_image(image) -> Image.Image:
     # datasets Image(decode=False) rows are {"bytes": None, "path": <str>}; the path may be a URL.
     if isinstance(image, dict) and not image.get("bytes") and isinstance(image.get("path"), str):
@@ -601,13 +610,13 @@ def _decode_image(image) -> Image.Image:
         if image.startswith("http://") or image.startswith("https://"):
             image_obj = Image.open(fetch_remote_media_bytes(image))
         elif image.startswith("file://"):
-            image_obj = Image.open(resolve_file_uri_to_path(image))
+            image_obj = Image.open(_refuse_network_share_image(resolve_file_uri_to_path(image)))
         elif image.startswith("data:image"):
             if "base64," in image:
                 _, base64_data = image.split("base64,", 1)
                 data = base64.b64decode(base64_data)
                 image_obj = Image.open(BytesIO(data))
-        elif os.path.isfile(image):
+        elif os.path.isfile(_refuse_network_share_image(image)):
             image_obj = Image.open(image)
         else:
             # Bare base64, as transformers.image_utils.load_image accepts; else surface the missing path.
@@ -621,7 +630,7 @@ def _decode_image(image) -> Image.Image:
         if "bytes" in image and image["bytes"]:
             image_obj = Image.open(BytesIO(image["bytes"]))
         elif "path" in image and image["path"]:
-            image_obj = Image.open(image["path"])
+            image_obj = Image.open(_refuse_network_share_image(image["path"]))
         elif "url" in image and image["url"]:
             image_obj = Image.open(fetch_remote_media_bytes(image["url"]))
 
@@ -1016,7 +1025,11 @@ def _data_uri_head(source: str) -> bytes:
     from urllib.parse import unquote_to_bytes
 
     header, _, payload = source.partition(",")
-    if header.lower().endswith(";base64"):
+    # As FFmpeg's data_uri.c: any parameter that case-insensitively prefixes "base64" selects base64.
+    params = header.split(";")[1:]
+    if params and params[-1] == "":
+        params.pop()  # a trailing ';' ends the loop before an empty parameter
+    if any("base64".startswith(p.lower()) for p in params):
         chunk = re.sub(r"\s", "", payload[:256])
         try:
             return base64.b64decode(chunk[: len(chunk) // 4 * 4], validate = False)
@@ -1054,6 +1067,11 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample
                 f"Unsloth: Refusing a video path on a network share: `{source}`. "
                 f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to load videos from shares you trust."
             )
+        else:
+            # A local playlist makes ffmpeg open its entries itself (file://host/share included), as a downloaded one would.
+            local_path = resolve_file_uri_to_path(source)
+            if os.path.isfile(local_path):
+                _refuse_playlist(local_path, source)
         try:
             try:
                 video, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)
