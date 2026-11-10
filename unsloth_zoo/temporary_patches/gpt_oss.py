@@ -395,10 +395,11 @@ def _gpt_oss_flex_mask(
             position = torch.arange(kv_len, device = full.device) + kv_off.to(full.device)
             padding = full[:, position.clamp(max = width - 1)] & (position < width)
         else:
-            # A host offset: the columns are a view, no gather kernels on the eager decode path.
-            padding = full[:, kv_off:kv_off + kv_len]
-            if padding.shape[-1] < kv_len:
-                padding = torch.nn.functional.pad(padding, (0, kv_len - padding.shape[-1]))
+            # A host offset: a copy of the columns, no gather kernels. Not a view: its row stride would be the 2D
+            # mask's width, which grows every step, and a decode graph keys on strides (re-capture every step).
+            columns = full[:, kv_off:kv_off + kv_len]
+            padding = full.new_zeros((full.shape[0], kv_len))
+            padding[:, :columns.shape[-1]].copy_(columns)
     q_length, kv_length = int(q_length), int(kv_length)
     # Per-row blocks even without padding: packed documents make mask_function row dependent.
     bsz = batch_size
