@@ -1193,10 +1193,10 @@ def _call_noting_skipped_frames(fn, args, kwargs):
     reset_reasons()
     try:
         result = fn(*args, **kwargs)
-        skipped = bool(get_reasons())
     finally:
-        set_count(previous)
-    return result, skipped
+        compiled = set_count(previous)
+    # A skipped outer frame can still have compiled children: only a zero count means the body ran fully eager.
+    return result, compiled == 0 and bool(get_reasons())
 
 
 # Complete set of Dynamo refusal texts for a disabled callable (only the _torchdynamo_disable branch emits them); torch

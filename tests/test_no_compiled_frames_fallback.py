@@ -209,3 +209,40 @@ def test_skip_after_a_compiled_pack_in_the_step_ends_it(monkeypatch):
     with pytest.raises(RuntimeError, match = "ending the step"):
         checkpoint(wrapped, x, use_reentrant = False)
     assert U._RAISED_INSIDE_CHECKPOINT and "test-ckpt-packed" in U._LATCHED_EAGER_LABELS
+
+
+def test_a_skipped_outer_frame_with_a_compiled_child_is_not_eager():
+    # A skipped frame whose nested frame compiled is not "no compiled frames": latching it eager inside a
+    # non-reentrant checkpoint recomputes the region eagerly against the compiled child's saved tensors.
+    if not U._resolve_skip_hooks():
+        pytest.skip("torch without the fullgraph compiled-frame counter")
+    from torch._dynamo.backends.registry import lookup_backend
+    from torch._dynamo.exc import SkipFrame
+    from torch.utils.checkpoint import checkpoint
+
+    torch._dynamo.reset()
+    calls = []
+
+    def backend(gm, args):
+        outer = any(n.op == "call_method" and n.target == "exp" for n in gm.graph.nodes)
+        calls.append("skip" if outer else "compile")
+        if outer:
+            raise SkipFrame("outer frame refused, nested frame compiles")
+        return lookup_backend("aot_eager")(gm, args)
+
+    def inner(t):
+        return t.sigmoid() * t
+
+    def kernel(x):
+        return inner(x.exp())
+
+    wrapped = U._fall_back_to_eager_on_recompile_limit(
+        torch.compile(kernel, backend=backend, fullgraph=True), kernel, "mixed_frames"
+    )
+    x = torch.linspace(-1, 1, 5, requires_grad=True)
+    ref = x.detach().clone().requires_grad_()
+    kernel(ref).sum().backward()
+    checkpoint(wrapped, x, use_reentrant=False).sum().backward()
+    assert calls == ["skip", "compile"], calls
+    assert "mixed_frames" not in U._LATCHED_EAGER_LABELS
+    torch.testing.assert_close(x.grad, ref.grad)
