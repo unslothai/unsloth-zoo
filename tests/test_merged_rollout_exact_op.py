@@ -24,6 +24,7 @@ TRITON_INTERPRET=1 in a subprocess (test_cpu_interpreter_ops)."""
 import os
 import subprocess
 import sys
+from unittest import mock
 
 import pytest
 import torch
@@ -47,14 +48,33 @@ def _case(device, n, k, rank = 4, seed = 0, dtype = torch.float16):
     return W, A, B
 
 
+def _lists(device, count, seed, scale = 1e-3, rows = 32):
+    """ws, As, Bs * scale for `count` weights of rows, 2 * rows, ... rows, plus copies of the weights."""
+    cases = [_case(device, rows * (i + 1), 256, seed = seed + i) for i in range(count)]
+    ws, As, Bs = [c[0] for c in cases], [c[1] for c in cases], [c[2] * scale for c in cases]
+    return ws, As, Bs, [w.clone() for w in ws]
+
+
+def _restored(ws, before):
+    for w, w0 in zip(ws, before):
+        assert torch.equal(_bits(w), _bits(w0))
+
+
+def _fresh_arenas(device):
+    for arena in ex._ARENAS.values():
+        arena.clear()
+    return "pageable" if device == "cpu" else "pinned"
+
+
 def test_ops_are_registered():
     assert callable(getattr(ex, "fold_weight_", None)) and callable(getattr(ex, "unfold_weight_", None))
-    assert hasattr(torch.ops.unsloth_zoo, "exact_fold_weight_v1")
-    assert hasattr(torch.ops.unsloth_zoo, "exact_unfold_weight_v1")
-    assert hasattr(torch.ops.unsloth_zoo, "exact_fold_weights_v1") and hasattr(torch.ops.unsloth_zoo, "exact_unfold_weights_v1")
+    for name in ("exact_fold_weight_v1", "exact_unfold_weight_v1", "exact_fold_weights_v1", "exact_unfold_weights_v1"):
+        assert hasattr(torch.ops.unsloth_zoo, name), name
 
 
 def run_compiled(device):
+    # fold_weight_ / unfold_weight_ and the list ops fold_weights_ / unfold_weights_ (many weights in one op: one count
+    # readback, one store) under torch.compile fullgraph on every backend, restoring every weight bit for bit.
     import torch._dynamo
     from torch._dynamo.testing import CompileCounter
     from torch._dynamo.utils import counters
@@ -65,6 +85,12 @@ def run_compiled(device):
         s1 = ex.fold_weight_(w, a, b, 0.5, 3)
         y = w.float().sum()
         s2 = ex.unfold_weight_(w, a, b, 0.5, 3)
+        return y, s1 + s2
+
+    def step_list(ws, As, Bs):
+        s1 = ex.fold_weights_(ws, As, Bs, [0.5] * len(ws), list(range(len(ws))))
+        y = sum(w.float().sum() for w in ws)
+        s2 = ex.unfold_weights_(ws, As, Bs, [0.5] * len(ws), list(range(len(ws))))
         return y, s1 + s2
 
     for backend in ("count", "aot_eager", "inductor"):
@@ -81,51 +107,50 @@ def run_compiled(device):
             # The traced region saw the folded weight.
             assert abs(float(y) - float(folded.float().sum())) <= 1e-2 * max(1.0, abs(float(y))), (backend, n, k)
             assert int(status[0]) > 0
-        assert not counters["graph_break"], (backend, dict(counters["graph_break"]))
         if backend == "count":
             assert cnt.frame_count <= 2, cnt.frame_count
+        fn = torch.compile(step_list, fullgraph = True, backend = "eager" if backend == "count" else backend)
+        ws, As, Bs, before = _lists(device, 3, seed = 60)
+        folded = sum((w.float() + (b.double() @ a.double() * 0.5).float()).to(w.dtype).float().sum() for w, a, b in zip(ws, As, Bs))
+        y, status = fn(ws, As, Bs)
+        _restored(ws, before)
+        assert status.shape == (3, 2)
+        assert abs(float(y) - float(folded)) <= 1e-2 * max(1.0, abs(float(y))), backend
+        assert not counters["graph_break"], (backend, dict(counters["graph_break"]))
+
+
+def _targets(ws, As, Bs, scale):
+    return [ex.ExactFoldTarget(W.unsqueeze(0), A.unsqueeze(0), B.unsqueeze(0), scale) for W, A, B in zip(ws, As, Bs)]
 
 
 def run_arena_growth(device):
-    for arena in ex._ARENAS.values():
-        arena.clear()
-    old_min = ex._ARENA_MIN_BYTES
-    ex._ARENA_MIN_BYTES = 64
-    try:
+    kind = _fresh_arenas(device)
+    with mock.patch.object(ex, "_ARENA_MIN_BYTES", 64):
         # Growing stores with several live at once: every fold gets room, live stores never move, all restore.
-        cases = [_case(device, 32 * (i + 1), 256, seed = 10 + i) for i in range(4)]
-        before = [W.clone() for W, _, _ in cases]
-        targets = []
-        for W, A, B in cases:
-            t = ex.ExactFoldTarget(W.unsqueeze(0), A.unsqueeze(0), B.unsqueeze(0), 3.0)
+        ws, As, Bs, before = _lists(device, 4, seed = 10, scale = 1)
+        targets = _targets(ws, As, Bs, 3.0)
+        for t in targets:
             ex.exact_fold([t])
-            targets.append(t)
-        stats = ex.host_arena_stats()["pageable" if device == "cpu" else "pinned"]
+        stats = ex.host_arena_stats()[kind]
         assert stats["live"] == 4 and stats["chunks"] >= 2, stats
         ex.exact_unfold(targets)
-        for (W, _, _), W0 in zip(cases, before):
-            assert torch.equal(_bits(W), _bits(W0))
-        stats = ex.host_arena_stats()["pageable" if device == "cpu" else "pinned"]
+        _restored(ws, before)
+        stats = ex.host_arena_stats()[kind]
         # Nothing live: the chunks are merged into one of the combined size.
         assert stats["live"] == 0 and stats["chunks"] == 1, stats
-    finally:
-        ex._ARENA_MIN_BYTES = old_min
 
 
 def run_arena_reuse(device):
-    for arena in ex._ARENAS.values():
-        arena.clear()
-    kind = "pageable" if device == "cpu" else "pinned"
-    cases = [_case(device, 64, 256, seed = 20 + i) for i in range(3)]
-    before = [W.clone() for W, _, _ in cases]
+    kind = _fresh_arenas(device)
+    ws, As, Bs = zip(*(_case(device, 64, 256, seed = 20 + i) for i in range(3)))
+    before = [W.clone() for W in ws]
     allocations = []
     for cycle in range(5):
-        targets = [ex.ExactFoldTarget(W.unsqueeze(0), A.unsqueeze(0), B.unsqueeze(0), 1.0 + cycle) for W, A, B in cases]
+        targets = _targets(ws, As, Bs, 1.0 + cycle)
         ex.exact_fold(targets)
         ex.exact_unfold(targets)
         allocations.append(ex.host_arena_stats()[kind]["allocations"])
-    for (W, _, _), W0 in zip(cases, before):
-        assert torch.equal(_bits(W), _bits(W0))
+    _restored(ws, before)
     # Warm after the first cycle: no host allocation in cycles 2 to 5.
     assert allocations[1:] == [allocations[0]] * 4, allocations
 
@@ -134,17 +159,21 @@ def run_opcheck(device):
     # opcheck may run the op on copies of the arguments, so it checks the schema and the fake only; the restore is
     # checked above. The slot and the weight are reset after every check.
     W, A, B = _case(device, 64, 256, seed = 30)
+    ws, As, Bs, before = _lists(device, 3, seed = 60, scale = 1)
     W0 = W.clone()
 
     def reset():
         ex._OP_LIVE.clear()
-        W.copy_(W0)
+        for w, w0 in zip([W, *ws], [W0, *before]): w.copy_(w0)
 
+    ops = torch.ops.unsloth_zoo
     for test in ("test_schema", "test_faketensor"):
-        torch.library.opcheck(torch.ops.unsloth_zoo.exact_fold_weight_v1.default, (W, A, B, 0.5, 11), test_utils = test)
+        torch.library.opcheck(ops.exact_fold_weight_v1.default, (W, A, B, 0.5, 11), test_utils = test)
         reset()
         ex.fold_weight_(W, A, B, 0.5, 11)
-        torch.library.opcheck(torch.ops.unsloth_zoo.exact_unfold_weight_v1.default, (W, A, B, 0.5, 11), test_utils = test)
+        torch.library.opcheck(ops.exact_unfold_weight_v1.default, (W, A, B, 0.5, 11), test_utils = test)
+        reset()
+        torch.library.opcheck(ops.exact_fold_weights_v1.default, (ws, As, Bs, [0.5] * 3, [21, 22, 23]), test_utils = test)
         reset()
 
 
@@ -182,9 +211,7 @@ def _host_ops(fn):
 def run_batched_store(device):
     # Every weight of one exact_fold call shares one store: one host lease, one copy each way and one readback per
     # call, so the host work of a fold does not grow with the number of weights (GRPO folds hundreds per rollout).
-    for arena in ex._ARENAS.values():
-        arena.clear()
-    kind = "pageable" if device == "cpu" else "pinned"
+    kind = _fresh_arenas(device)
     # Leases other checks left live (opcheck folds on copies it never unfolds) are not this check's.
     live = ex.host_arena_stats()[kind]["live"]
     cases = []
@@ -196,7 +223,7 @@ def run_batched_store(device):
     before = [W.clone() for W, _, _ in cases]
 
     def targets_of(cs):
-        return [ex.ExactFoldTarget(W.unsqueeze(0), A.unsqueeze(0), B.unsqueeze(0), 0.5) for W, A, B in cs]
+        return _targets(*zip(*cs), 0.5)
 
     ops = {}
     for n in (2, 6):
@@ -213,14 +240,11 @@ def run_batched_store(device):
             # Unfold in two parts: the store is shared, so it must stay readable (and leased) until the last target.
             ex.exact_unfold(ts[2:5])
             assert ex.host_arena_stats()[kind]["live"] == live + 1
-            for (W, _, _), W0 in zip(cases[2:5], before[2:5]):
-                assert torch.equal(_bits(W), _bits(W0))
-            ex.exact_unfold(ts)
+            _restored([c[0] for c in cases[2:5]], before[2:5])
+        ex.exact_unfold(ts)
+        if n == 6:
             assert ex.host_arena_stats()[kind]["live"] == live
-        else:
-            ex.exact_unfold(ts)
-        for (W, _, _), W0 in zip(cases[:n], before[:n]):
-            assert torch.equal(_bits(W), _bits(W0))
+        _restored([c[0] for c in cases[:n]], before[:n])
     assert ops[6] == ops[2], ops
     # Folded targets dropped without an unfold (an aborted rollout) give their shared lease back at once.
     ts = targets_of([(W.clone(), A, B) for W, A, B in cases[:3]])
@@ -251,14 +275,11 @@ def test_ops_fold_exactly_without_pinned_memory(monkeypatch, how):
 
         monkeypatch.setattr(torch.Tensor, "pin_memory", refuse)
         monkeypatch.setattr(ex._ARENAS[True], "_new", lambda nbytes: refuse())
-    cases = [_case("cuda", 64 * (i + 1), 256, seed = 90 + i) for i in range(2)]
-    ws, As, Bs = [c[0] for c in cases], [c[1] for c in cases], [c[2] * 1e-3 for c in cases]
-    before = [w.clone() for w in ws]
+    ws, As, Bs, before = _lists("cuda", 2, seed = 90, rows = 64)
     ex.fold_weights_(ws, As, Bs, [0.5, 0.5], [901, 902])
     ex.unfold_weights_(ws, As, Bs, [0.5, 0.5], [901, 902])
     torch.cuda.synchronize()
-    for w, w0 in zip(ws, before):
-        assert torch.equal(_bits(w), _bits(w0))
+    _restored(ws, before)
     w, A, B = _case("cuda", 32, 256, seed = 99)
     w0 = w.clone()
     ex.fold_weight_(w, A, B * 1e-3, 0.5, 903)
@@ -292,57 +313,19 @@ def test_dropped_lease_waits_for_its_pending_copy():
     assert arena.live == 0 and lease.pending is None
 
 
-def run_list_ops(device):
-    # fold_weights_ / unfold_weights_: many weights in one op (one count readback, one store), under torch.compile
-    # fullgraph on every backend, restoring every weight bit for bit, schema and fake checked by opcheck.
-    import torch._dynamo
-    from torch._dynamo.utils import counters
-
-    def step(ws, As, Bs):
-        s1 = ex.fold_weights_(ws, As, Bs, [0.5] * len(ws), list(range(len(ws))))
-        y = sum(w.float().sum() for w in ws)
-        s2 = ex.unfold_weights_(ws, As, Bs, [0.5] * len(ws), list(range(len(ws))))
-        return y, s1 + s2
-
-    for backend in ("eager", "aot_eager", "inductor"):
-        torch._dynamo.reset()
-        counters.clear()
-        fn = torch.compile(step, fullgraph = True, backend = backend)
-        cases = [_case(device, 32 * (i + 1), 256, seed = 60 + i) for i in range(3)]
-        ws, As, Bs = [c[0] for c in cases], [c[1] for c in cases], [c[2] * 1e-3 for c in cases]
-        before = [w.clone() for w in ws]
-        folded = sum((w.float() + (b.double() @ a.double() * 0.5).float()).to(w.dtype).float().sum() for w, a, b in zip(ws, As, Bs))
-        y, status = fn(ws, As, Bs)
-        for w, w0 in zip(ws, before):
-            assert torch.equal(_bits(w), _bits(w0)), backend
-        assert status.shape == (3, 2)
-        assert abs(float(y) - float(folded)) <= 1e-2 * max(1.0, abs(float(y))), backend
-        assert not counters["graph_break"], (backend, dict(counters["graph_break"]))
-    ws, As, Bs = [c[0] for c in cases], [c[1] for c in cases], [c[2] for c in cases]
-    before = [w.clone() for w in ws]
-    for test in ("test_schema", "test_faketensor"):
-        args = (ws, As, Bs, [0.5] * 3, [21, 22, 23])
-        torch.library.opcheck(torch.ops.unsloth_zoo.exact_fold_weights_v1.default, args, test_utils = test)
-        ex._OP_LIVE.clear()
-        for w, w0 in zip(ws, before): w.copy_(w0)
+def run_unknown_keys(device):
     # Unknown keys raise and leave the folded weights unfoldable.
+    ws, As, Bs, before = _lists(device, 3, seed = 60, scale = 1)
     ex.fold_weights_(ws, As, Bs, [0.5] * 3, [31, 32, 33])
-    try:
+    with pytest.raises(RuntimeError, match = "99"):
         ex.unfold_weights_(ws, As, Bs, [0.5] * 3, [31, 32, 99])
-    except RuntimeError as error:
-        assert "99" in str(error)
-    else:
-        raise AssertionError("an unknown key unfolded")
     ex.unfold_weights_(ws, As, Bs, [0.5] * 3, [31, 32, 33])
-    for w, w0 in zip(ws, before):
-        assert torch.equal(_bits(w), _bits(w0))
+    _restored(ws, before)
 
 
 def run_empty_tiles(device):
     # Rows 96.. have B = 0 (a fresh LoRA): those tiles hold no code words and take the fast path; the others keep a
     # stream, including small-adapter rows 32..95 where a few elements still cross an exponent boundary.
-    from unsloth_zoo.merged_rollout_exact import ExactFoldTarget, exact_fold, exact_unfold
-
     def variants():
         caches = getattr(ex._exact_merge_kernel, "device_caches", None) or {}
         return {key: set(kernels[0]) for key, kernels in caches.items()}
@@ -358,12 +341,12 @@ def run_empty_tiles(device):
         B[:32] *= 300
         B[96:] = 0
         W0 = W.clone()
-        t = ExactFoldTarget(W.unsqueeze(0), A.unsqueeze(0), B.unsqueeze(0), 0.5)
-        exact_fold([t])
+        t = ex.ExactFoldTarget(W.unsqueeze(0), A.unsqueeze(0), B.unsqueeze(0), 0.5)
+        ex.exact_fold([t])
         wcnt = t.host_wcnt.to(torch.int64)
         assert (wcnt == 0).any() and (wcnt > 0).any(), wcnt
         assert not torch.equal(_bits(W), _bits(W0))
-        exact_unfold([t])
+        ex.exact_unfold([t])
         assert torch.equal(_bits(W), _bits(W0)), dtype
     if device == "cuda":
         for key, kernels in variants().items():
@@ -375,59 +358,28 @@ def run_empty_tiles(device):
 def run_fold_failure_rolls_back(device):
     # fold_weights_ whose fold raises after changing the weights (the store offload fails): the weights come back bit
     # for bit, no key stays live, and the same keys fold and unfold again afterwards.
-    cases = [_case(device, 32 * (i + 1), 256, seed = 70 + i) for i in range(2)]
-    ws, As, Bs = [c[0] for c in cases], [c[1] for c in cases], [c[2] * 1e-3 for c in cases]
-    before = [w.clone() for w in ws]
-    real = ex._offload
-
-    def broken(*args, **kwargs):
-        raise RuntimeError("offload failed")
-
-    ex._offload = broken
-    try:
-        try:
+    ws, As, Bs, before = _lists(device, 2, seed = 70)
+    with mock.patch.object(ex, "_offload", side_effect = RuntimeError("offload failed")):
+        with pytest.raises(RuntimeError, match = "offload failed"):
             ex.fold_weights_(ws, As, Bs, [0.5, 0.5], [801, 802])
-        except RuntimeError as error:
-            assert "offload failed" in str(error)
-        else:
-            raise AssertionError("the fold should have raised")
-    finally:
-        ex._offload = real
-    for w, w0 in zip(ws, before):
-        assert torch.equal(_bits(w), _bits(w0))
+    _restored(ws, before)
     assert not any(k[0] in (801, 802) for k in ex._OP_LIVE)
     ex.fold_weights_(ws, As, Bs, [0.5, 0.5], [801, 802])
     ex.unfold_weights_(ws, As, Bs, [0.5, 0.5], [801, 802])
-    for w, w0 in zip(ws, before):
-        assert torch.equal(_bits(w), _bits(w0))
+    _restored(ws, before)
 
 
 def run_unfold_failure_keeps_keys(device):
     # unfold_weights_ that raises before restoring (the restore kernel launch fails, as an upload OOM would): the keys
     # stay live and a retry restores every weight bit for bit.
-    cases = [_case(device, 32 * (i + 1), 256, seed = 75 + i) for i in range(2)]
-    ws, As, Bs = [c[0] for c in cases], [c[1] for c in cases], [c[2] * 1e-3 for c in cases]
-    before = [w.clone() for w in ws]
+    ws, As, Bs, before = _lists(device, 2, seed = 75)
     ex.fold_weights_(ws, As, Bs, [0.5, 0.5], [811, 812])
-    real = ex._launch
-
-    def broken(*args, **kwargs):
-        raise RuntimeError("out of memory")
-
-    ex._launch = broken
-    try:
-        try:
+    with mock.patch.object(ex, "_launch", side_effect = RuntimeError("out of memory")):
+        with pytest.raises(RuntimeError, match = "out of memory"):
             ex.unfold_weights_(ws, As, Bs, [0.5, 0.5], [811, 812])
-        except RuntimeError as error:
-            assert "out of memory" in str(error)
-        else:
-            raise AssertionError("the unfold should have raised")
-    finally:
-        ex._launch = real
     assert sum(k[0] in (811, 812) for k in ex._OP_LIVE) == 2
     ex.unfold_weights_(ws, As, Bs, [0.5, 0.5], [811, 812])
-    for w, w0 in zip(ws, before):
-        assert torch.equal(_bits(w), _bits(w0))
+    _restored(ws, before)
 
 
 def run_all(device):
@@ -439,7 +391,7 @@ def run_all(device):
     run_arena_reuse(device)
     run_opcheck(device)
     run_batched_store(device)
-    run_list_ops(device)
+    run_unknown_keys(device)
 
 
 @pytest.mark.skipif(not _cuda(), reason = "needs CUDA + Triton")

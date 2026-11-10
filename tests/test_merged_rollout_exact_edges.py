@@ -25,6 +25,7 @@ import contextlib
 import os
 import subprocess
 import sys
+from unittest import mock
 
 import pytest
 import torch
@@ -92,14 +93,8 @@ COVERAGE = {}
 STREAM, INDEXED, CHOSEN = -1, 1 << 40, None
 
 
-@contextlib.contextmanager
 def store_format(per_tile):
-    old = ex._INDEXED_PER_TILE
-    if per_tile is not None: ex._INDEXED_PER_TILE = per_tile
-    try:
-        yield
-    finally:
-        ex._INDEXED_PER_TILE = old
+    return contextlib.nullcontext() if per_tile is None else mock.patch.object(ex, "_INDEXED_PER_TILE", per_tile)
 
 
 def _check_cycle(W, A, B, scale, d = None):
