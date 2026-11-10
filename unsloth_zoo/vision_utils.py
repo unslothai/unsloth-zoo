@@ -1067,6 +1067,11 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample
                 f"Unsloth: Refusing a video path on a network share: `{source}`. "
                 f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to load videos from shares you trust."
             )
+        else:
+            # A local playlist makes ffmpeg open its entries itself (file://host/share included), as a downloaded one would.
+            local_path = resolve_file_uri_to_path(source)
+            if os.path.isfile(local_path):
+                _refuse_playlist(local_path, source)
         try:
             try:
                 video, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)

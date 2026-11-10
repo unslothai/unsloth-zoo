@@ -825,3 +825,27 @@ def test_decode_image_keeps_local_paths_and_the_share_opt_in(monkeypatch, no_net
     monkeypatch.setenv("UNSLOTH_ALLOW_PRIVATE_URL_FETCH", "1")
     vision_utils._decode_image({"path": "\\\\nas\\images\\a.png"})
     assert opened == ["\\\\wsl$\\Ubuntu\\a.png", "\\\\nas\\images\\a.png"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"#EXTM3U\n#EXTINF:2.0,\nfile://attacker/share/seg0.ts\n",
+        b"ffconcat version 1.0\nfile //attacker/share/a.mp4\n",
+        b'<?xml version="1.0"?>\n<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>',
+    ],
+)
+def test_fetch_video_refuses_a_local_playlist(monkeypatch, no_network, tmp_path, body):
+    # A dataset can ship the playlist itself; ffmpeg would then open its entries outside every check.
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(body)
+    _decoder_must_not_run(monkeypatch)
+    for source in (str(clip), clip.as_uri()):
+        with pytest.raises(ValueError, match = "playlist"):
+            vision_utils.fetch_video({"video": source})
+
+
+def test_fetch_video_still_decodes_a_local_container(monkeypatch, no_network, tmp_path):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
+    _reaches_the_decoder(monkeypatch, str(clip))
