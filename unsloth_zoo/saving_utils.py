@@ -1070,7 +1070,7 @@ def _merge_and_overwrite_lora(
     source_path = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Merges LoRA and overwrites the safetensors file it was merged to; with source_path it is written once from there.
+    # Merges LoRA and overwrites the safetensors file it was merged to (written from source_path when given)
     if base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4":
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("mxfp4 quantized model detected. Using safe rewrite strategy (requires temporary disk space).")
@@ -5846,7 +5846,6 @@ def merge_and_overwrite_lora(
             # AND we're in low disk space mode
             # For local models, copy the file if needed
             if _replace_from_local and _defers_copy(filename):
-                # Written from the local base shard by the merge loop below.
                 _deferred_sources[filename] = local_file_path
             elif _replace_from_local:
                 # A nested name has no parent here yet, so the copy would raise
@@ -6300,9 +6299,8 @@ def _try_copy_all_from_cache(
     deferred: Optional[dict] = None,
 ) -> bool:
     """If ALL files exist in the HF cache, copy them into target_dir_str.
-    Returns True on success, False otherwise. Names copied so far are appended to `copied`.
-    A name `defer(name)` accepts is not copied: its cached path goes into `deferred` for the
-    single-pass merge to write the output from (cleared again if the copy gives up).
+    Returns True on success, False otherwise. Names copied so far are appended to `copied`;
+    names `defer` accepts go into `deferred` (source path) instead of being copied.
     """
     from huggingface_hub.errors import LocalEntryNotFoundError
 
@@ -6361,7 +6359,6 @@ def _try_copy_all_from_cache(
     for filename, cached_path in ProgressBar(cached_paths_map.items(), desc = f"Unsloth: Copying {len(filenames_to_check)} files from cache to `{target_dir_str}`"):
         try:
             if defer is not None and deferred is not None and defer(filename):
-                # The checks the copy would make, so a bad cache entry still falls back here.
                 if not Path(cached_path).is_file():
                     raise FileNotFoundError(f"Source {cached_path} is not a valid file.")
                 if not os.access(cached_path, os.R_OK):
@@ -7519,7 +7516,6 @@ def _disk_module_shapes(save_directory, safetensors_list, sources = None):
     """
     keys, shapes = set(), {}
     for filename in safetensors_list or ():
-        # A shard the single-pass merge has not written yet is read at its source.
         path = (sources or {}).get(filename) or os.path.join(save_directory, filename)
         if not os.path.exists(path): continue
         try:
@@ -7818,7 +7814,6 @@ def _seed_unbacked_trained_tensors(save_directory, safetensors_list, lora_weight
             f"the save directory at a larger volume."
         )
 
-    # A shard not written yet streams from its source, which writes it; the merge then rewrites it in place.
     source = sources.get(target) or path
     with open(source, "rb") as f:
         length_of_header = int.from_bytes(f.read(8), "little")
@@ -9404,16 +9399,8 @@ def _stream_rewrite_resized_shard_and_replace(filename_original, temp_dir, heade
 
 
 class _SinglePassShardWriter:
-    """Writes an output shard in one pass from its source shard, in place of copy-then-mmap-overwrite.
-
-    Copying the base shard in and then rewriting every merged tensor over the copy writes most of
-    the shard twice. This takes the same `mm[a:b] = bytes` writes, copies the untouched source
-    bytes in front of each one (header included, verbatim) and fills the tail on commit, so the
-    file holds exactly the copy-then-overwrite bytes. safetensors orders data by key, as safe_open
-    lists it, so writes arrive in offset order; one behind the cursor lands over bytes already
-    copied, which is still correct. Staged beside the destination and os.replace'd in like the
-    copy was (owner-writable, the source's permission bits), and fsync'd first as mm.flush() did.
-    """
+    """Takes the merge loop's `mm[a:b] = bytes` writes and streams the source shard around them, so the
+    output equals copy-then-overwrite but is written once. A write behind the cursor is still correct."""
     _CHUNK = 64 * 1024 * 1024
 
     def __init__(self, source_path, destination):
@@ -9480,7 +9467,7 @@ class _SinglePassShardWriter:
         os.fsync(self._out.fileno())
         self._out.close()
         self._src.close()
-        # copy2's metadata, then the mtime bump an overwrite gave the copy.
+        # Same metadata as copy2 + overwrite.
         shutil.copystat(self.source_path, self._staging)
         st = os.stat(self._staging)
         if self._wrote:
@@ -9490,7 +9477,6 @@ class _SinglePassShardWriter:
         self._staging = None
 
     def close(self):
-        # After commit a no-op; otherwise drops the staged file and leaves the destination as it was.
         for handle in (self._out, self._src):
             if handle is not None:
                 try: handle.close()
