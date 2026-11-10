@@ -47,10 +47,12 @@ _VARIANTS = {
 }
 
 
+@pytest.mark.parametrize("flush_ids", [1 << 20, 5])
 @pytest.mark.parametrize("batch_rows", [10_000, 7])
 @pytest.mark.parametrize("name", list(_VARIANTS))
-def test_arrow_counts_match_the_map_path(name, batch_rows, monkeypatch):
+def test_arrow_counts_match_the_map_path(name, batch_rows, flush_ids, monkeypatch):
     monkeypatch.setattr(tokenizer_utils, "_COUNT_INPUT_IDS_ARROW_BATCH_ROWS", batch_rows)
+    monkeypatch.setattr(tokenizer_utils, "_COUNT_INPUT_IDS_ARROW_FLUSH_IDS", flush_ids)
     train_dataset = _VARIANTS[name](_base())
     final_counts = np.zeros(V, dtype = np.int64)
 
