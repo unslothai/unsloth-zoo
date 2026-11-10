@@ -80,6 +80,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.mixtral_moe",
     "unsloth_zoo.temporary_patches.moe_experts_interface",
     "unsloth_zoo.temporary_patches.moe_fused_swiglu",
+    "unsloth_zoo.temporary_patches.moe_expert_cache",
     "unsloth_zoo.temporary_patches.moe_grouped_fp16",
     "unsloth_zoo.temporary_patches.moe_grouped_modulelist",
     "unsloth_zoo.temporary_patches.moe_lora_factor_swap",
