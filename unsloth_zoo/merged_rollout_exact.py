@@ -684,9 +684,9 @@ class _HostArena:
             self.used = [0] * len(self.chunks)
             if len(self.chunks) > 1:
                 total = self.capacity()
-                self.chunks = []
-                self.chunks = [self._new(total)]
-                self.used = [0]
+                # Drop the old chunks first (room for the new one); both lists stay consistent if it fails.
+                self.chunks, self.used = [], []
+                self.chunks, self.used = [self._new(total)], [0]
 
     def clear(self):
         with self.lock:

@@ -175,6 +175,22 @@ def run_arena_outlives_inference_mode(device):
     _restored(ws, before)
 
 
+def test_failed_coalesce_leaves_a_consistent_arena():
+    # A refused allocation while merging chunks must not leave stale cursors that hand out the same memory twice.
+    arena = ex._HostArena(False)
+    with mock.patch.object(ex, "_ARENA_MIN_BYTES", 64):
+        leases = [arena.take(64), arena.take(64)]
+        assert len(arena.chunks) == 2
+        with mock.patch.object(arena, "_new", side_effect = RuntimeError("refused")):
+            for lease in leases[:-1]:
+                lease.release()
+            with pytest.raises(RuntimeError, match = "refused"):
+                leases[-1].release()
+        assert len(arena.chunks) == len(arena.used)
+        a, b = arena.take(64), arena.take(64)
+        assert a.buffer.data_ptr() != b.buffer.data_ptr()
+
+
 def run_opcheck(device):
     # opcheck may run the op on argument copies: it checks schema and fake only, restores are checked elsewhere.
     W, A, B = _case(device, 64, 256, seed = 30)
