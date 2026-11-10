@@ -204,7 +204,7 @@ def run_batched_store(device):
         ex.exact_fold(ts)   # warm-up
         ex.exact_unfold(ts)
         ts = targets_of(cases[:n])
-        ops[n] = _host_ops(lambda: ex.exact_fold(ts))
+        ops[n] = _host_ops(lambda ts = ts: ex.exact_fold(ts))
         if n == 6:
             # Both store forms in one call: the small adapters indexed, the large ones on the stream.
             assert set(ts[0].store.indexed) == {True, False}, ts[0].store.indexed
