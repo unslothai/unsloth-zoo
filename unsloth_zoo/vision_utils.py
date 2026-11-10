@@ -587,6 +587,16 @@ def smart_resize(
     return h_bar, w_bar
 
 
+def _refuse_network_share_image(path):
+    # Same rule as fetch_video: on Windows even os.path.isfile on a UNC path opens an SMB connection.
+    if isinstance(path, str) and _is_network_share(path) and not _allow_private_url_fetch():
+        raise ValueError(
+            f"Unsloth: Refusing an image path on a network share: `{path}`. "
+            f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to load images from shares you trust."
+        )
+    return path
+
+
 def _decode_image(image) -> Image.Image:
     # datasets Image(decode=False) rows are {"bytes": None, "path": <str>}; the path may be a URL.
     if isinstance(image, dict) and not image.get("bytes") and isinstance(image.get("path"), str):
@@ -600,13 +610,13 @@ def _decode_image(image) -> Image.Image:
         if image.startswith("http://") or image.startswith("https://"):
             image_obj = Image.open(fetch_remote_media_bytes(image))
         elif image.startswith("file://"):
-            image_obj = Image.open(resolve_file_uri_to_path(image))
+            image_obj = Image.open(_refuse_network_share_image(resolve_file_uri_to_path(image)))
         elif image.startswith("data:image"):
             if "base64," in image:
                 _, base64_data = image.split("base64,", 1)
                 data = base64.b64decode(base64_data)
                 image_obj = Image.open(BytesIO(data))
-        elif os.path.isfile(image):
+        elif os.path.isfile(_refuse_network_share_image(image)):
             image_obj = Image.open(image)
         else:
             # Bare base64, as transformers.image_utils.load_image accepts; else surface the missing path.
@@ -620,7 +630,7 @@ def _decode_image(image) -> Image.Image:
         if "bytes" in image and image["bytes"]:
             image_obj = Image.open(BytesIO(image["bytes"]))
         elif "path" in image and image["path"]:
-            image_obj = Image.open(image["path"])
+            image_obj = Image.open(_refuse_network_share_image(image["path"]))
         elif "url" in image and image["url"]:
             image_obj = Image.open(fetch_remote_media_bytes(image["url"]))
 

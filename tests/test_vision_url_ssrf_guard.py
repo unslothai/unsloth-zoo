@@ -786,3 +786,42 @@ def _reaches_the_decoder(monkeypatch, path):
     with pytest.raises(RuntimeError, match = "stop after"):
         vision_utils.fetch_video({"video": path})
     assert seen and seen[0] == path
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "\\\\attacker\\share\\a.png",
+        "//attacker/share/a.png",
+        "file://attacker/share/a.png",
+        "file:///%5cattacker/share/a.png",
+        "\\\\?\\UNC\\attacker\\share\\a.png",
+        {"bytes": None, "path": "\\\\attacker\\share\\a.png"},
+        {"path": "\\\\attacker\\share\\a.png", "bytes": b""},
+    ],
+)
+def test_decode_image_refuses_network_share_paths(monkeypatch, no_network, image):
+    # Dataset image rows reach the filesystem probe and Pillow: on Windows that is an SMB connection.
+    monkeypatch.setattr(vision_utils, "_WINDOWS", True)
+    touched = []
+    monkeypatch.setattr(vision_utils.os.path, "isfile", lambda p: touched.append(p) or False)
+    monkeypatch.setattr(vision_utils.Image, "open", lambda p, *a, **k: touched.append(p) or 1 / 0)
+    with pytest.raises(ValueError, match = "network share"):
+        vision_utils._decode_image(image)
+    assert touched == []
+
+
+def test_decode_image_keeps_local_paths_and_the_share_opt_in(monkeypatch, no_network, tmp_path):
+    from PIL import Image as PILImage
+
+    monkeypatch.setattr(vision_utils, "_WINDOWS", True)
+    local = tmp_path / "a.png"
+    PILImage.new("RGB", (2, 2)).save(local)
+    assert vision_utils._decode_image(str(local)).size == (2, 2)
+    assert vision_utils._decode_image({"bytes": None, "path": str(local)}).size == (2, 2)
+    opened = []
+    monkeypatch.setattr(vision_utils.Image, "open", lambda p, *a, **k: opened.append(p) or PILImage.new("RGB", (1, 1)))
+    vision_utils._decode_image({"path": "\\\\wsl$\\Ubuntu\\a.png"})
+    monkeypatch.setenv("UNSLOTH_ALLOW_PRIVATE_URL_FETCH", "1")
+    vision_utils._decode_image({"path": "\\\\nas\\images\\a.png"})
+    assert opened == ["\\\\wsl$\\Ubuntu\\a.png", "\\\\nas\\images\\a.png"]
