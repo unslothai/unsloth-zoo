@@ -724,7 +724,7 @@ def _offload(targets, stream):
     stream.wait_stream(torch.cuda.current_stream(stores[0].device))
     with torch.cuda.stream(stream):
         for s in stores:
-            s.host.copy_(s.dev, non_blocking = True)
+            s.host.copy_(s.dev, non_blocking = s.host.is_pinned())
             s.dev.record_stream(stream)
         # The unfold may run on another stream: it waits on this before reading the host stores.
         ready = torch.cuda.Event()
@@ -767,8 +767,9 @@ def _restore_escapes(s, group, idx, val, after):
         E, N, K = t.w.shape
         delta = t.w.data_ptr() - base.data_ptr()
         table.append((delta // 2, t.w.stride(0), t.w.stride(1), t.w.stride(2), N, K))
-    table = torch.tensor(table, dtype = torch.int64).to(s.device, non_blocking = True)
-    counts = torch.tensor([n for _, n in s.escs], dtype = torch.int64).to(s.device, non_blocking = True)
+    # Pinned or synchronous: a non_blocking copy from a pageable temporary can read it after it is freed (ROCm).
+    table = _status(table, s.device)
+    counts = _status([n for _, n in s.escs], s.device)
     slots = torch.repeat_interleave(torch.arange(len(group), device = s.device), counts, output_size = n_esc)
     wrong = torch.empty(n_esc, dtype = torch.int16, device = s.device)
     block = 1024
@@ -797,7 +798,7 @@ def exact_unfold(targets, stream = None):
     if stream is not None and uploads:
         stream.wait_stream(current)
         with torch.cuda.stream(stream):
-            for s in uploads: s.dev = s.host.to(s.device, non_blocking = True)
+            for s in uploads: s.dev = s.host.to(s.device, non_blocking = s.host.is_pinned())
         # The unfold pass reads the uploaded stream: it runs on the current stream after the uploads land.
         current.wait_stream(stream)
         for s in uploads: s.dev.record_stream(current)
