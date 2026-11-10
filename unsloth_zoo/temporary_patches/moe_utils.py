@@ -3095,6 +3095,43 @@ def _dequantize_bnb4bit_full(param):
     return weight
 
 
+def _get_bnb4bit_base_weight(param, target_dtype = None):
+    """The dequantized stack of a packed bnb 4-bit expert param (from the expert cache when it holds it)."""
+    if getattr(param, "quant_state", None) is None:
+        raise RuntimeError(
+            "unsloth: _get_base_weight saw a Params4bit with quant_state=None. "
+            "This usually means the model was used in forward before loading "
+            "completed quantization (meta placeholder still in place), or the "
+            "MoE quantizer patch did not fire for this expert. "
+            f"data.shape={tuple(param.data.shape)}, device={param.device}."
+        )
+    cache = _expert_cache_module()
+    weight = _expert_cache_get(cache, param, target_dtype)
+    if weight is None:
+        try:
+            weight = _dequantize_bnb4bit_full(param)
+        except torch.cuda.OutOfMemoryError:
+            # A cached stack may hold the memory this decode needs: drop the cache once and retry.
+            if cache is None or not cache.EXPERT_CACHE_STATS.get("bytes"):
+                raise
+            cache.clear_expert_cache(oom = True)
+            torch.cuda.empty_cache()
+            weight = _dequantize_bnb4bit_full(param)
+        if cache is not None:
+            # Cached after the cast (fp16 compute over a bf16 state casts every read otherwise); the same values.
+            if target_dtype is not None and weight.dtype != target_dtype:
+                weight = weight.to(target_dtype)
+            cache.expert_cache_offer(param, weight)
+    if target_dtype is not None:
+        weight = weight.to(target_dtype)
+    return weight
+
+
+# UNSLOTH_MOE_EXPERT_CACHE in a traced caller: the cache is host state, so the decode runs eagerly behind one graph
+# break per call (only while the cache is on); its output enters the next graph as an input, never a reusable buffer.
+_get_bnb4bit_base_weight_eager = torch.compiler.disable(_get_bnb4bit_base_weight)
+
+
 def _get_base_weight(param, target_dtype=None, token_counts=None, experts=None):
     """Get base weight from a potentially wrapped parameter or module. target_dtype (recompute
     providers) restores the packed Params4bit to its logical shape and casts. experts (a
@@ -3111,34 +3148,12 @@ def _get_base_weight(param, target_dtype=None, token_counts=None, experts=None):
         return param.dequantize(dtype = target_dtype, token_counts = token_counts)
 
     if HAS_BNB and isinstance(param, Params4bit):
-        if getattr(param, "quant_state", None) is None:
-            raise RuntimeError(
-                "unsloth: _get_base_weight saw a Params4bit with quant_state=None. "
-                "This usually means the model was used in forward before loading "
-                "completed quantization (meta placeholder still in place), or the "
-                "MoE quantizer patch did not fire for this expert. "
-                f"data.shape={tuple(param.data.shape)}, device={param.device}."
-            )
-        cache = _expert_cache_module()
-        weight = _expert_cache_get(cache, param, target_dtype)
-        if weight is None:
-            try:
-                weight = _dequantize_bnb4bit_full(param)
-            except torch.cuda.OutOfMemoryError:
-                # A cached stack may hold the memory this decode needs: drop the cache once and retry.
-                if cache is None or not cache.EXPERT_CACHE_STATS.get("bytes"):
-                    raise
-                cache.clear_expert_cache(oom = True)
-                torch.cuda.empty_cache()
-                weight = _dequantize_bnb4bit_full(param)
-            if cache is not None:
-                # Cached after the cast (fp16 compute over a bf16 state casts every read otherwise); the same values.
-                if target_dtype is not None and weight.dtype != target_dtype:
-                    weight = weight.to(target_dtype)
-                cache.expert_cache_offer(param, weight)
-        if target_dtype is not None:
-            weight = weight.to(target_dtype)
-        return weight
+        if (
+            torch.compiler.is_compiling()
+            and os.environ.get("UNSLOTH_MOE_EXPERT_CACHE", "0") not in ("", "0")
+        ):
+            return _get_bnb4bit_base_weight_eager(param, target_dtype)
+        return _get_bnb4bit_base_weight(param, target_dtype)
 
     if hasattr(param, "get_param"):
         return param.get_param()

@@ -27,7 +27,8 @@ UNSLOTH_MOE_EXPERT_CACHE:
   <float>      the same, capped at that many GiB.
 Safety: before every lookup the device's free + cached-unused memory is checked (rate limited); under the margin the
 least recently used stacks are dropped until it is met again. clear_expert_cache() drops everything; a dequant that hits
-OOM drops the cache and retries once (moe_utils). Eager only: a traced caller never reads or fills the cache.
+OOM drops the cache and retries once (moe_utils). The cache is host state: a traced caller reaches it through a
+compiler-disabled call in moe_utils (one graph break per decode, only while the cache is on).
 """
 
 __all__ = [
