@@ -73,8 +73,7 @@ def test_ops_are_registered():
 
 
 def run_compiled(device):
-    # fold_weight_ / unfold_weight_ and the list ops fold_weights_ / unfold_weights_ (many weights in one op: one count
-    # readback, one store) under torch.compile fullgraph on every backend, restoring every weight bit for bit.
+    # Single and list ops under torch.compile fullgraph on every backend, restoring every weight bit for bit.
     import torch._dynamo
     from torch._dynamo.testing import CompileCounter
     from torch._dynamo.utils import counters
@@ -136,7 +135,6 @@ def run_arena_growth(device):
         ex.exact_unfold(targets)
         _restored(ws, before)
         stats = ex.host_arena_stats()[kind]
-        # Nothing live: the chunks are merged into one of the combined size.
         assert stats["live"] == 0 and stats["chunks"] == 1, stats
 
 
@@ -156,8 +154,7 @@ def run_arena_reuse(device):
 
 
 def run_opcheck(device):
-    # opcheck may run the op on copies of the arguments, so it checks the schema and the fake only; the restore is
-    # checked above. The slot and the weight are reset after every check.
+    # opcheck may run the op on argument copies: it checks schema and fake only, restores are checked elsewhere.
     W, A, B = _case(device, 64, 256, seed = 30)
     ws, As, Bs, before = _lists(device, 3, seed = 60, scale = 1)
     W0 = W.clone()
@@ -209,8 +206,7 @@ def _host_ops(fn):
 
 
 def run_batched_store(device):
-    # Every weight of one exact_fold call shares one store: one host lease, one copy each way and one readback per
-    # call, so the host work of a fold does not grow with the number of weights (GRPO folds hundreds per rollout).
+    # One exact_fold call shares one store: the host work of a fold must not grow with the number of weights.
     kind = _fresh_arenas(device)
     # Leases other checks left live (opcheck folds on copies it never unfolds) are not this check's.
     live = ex.host_arena_stats()[kind]["live"]
@@ -265,8 +261,7 @@ def run_batched_store(device):
 @pytest.mark.skipif(not _cuda(), reason = "needs CUDA + Triton")
 @pytest.mark.parametrize("how", ["refused", "disabled"])
 def test_ops_fold_exactly_without_pinned_memory(monkeypatch, how):
-    # Pinning refused (WSL2) or disabled: the stores and the ops' status tensors fall back to pageable memory, the
-    # fold / unfold still restores bit for bit and nothing stays folded.
+    # Pinning refused (WSL2) or disabled: stores and status tensors fall back to pageable memory, still exact.
     if how == "disabled":
         monkeypatch.setenv("UNSLOTH_DISABLE_PINNED_MEMORY", "1")
     else:
@@ -288,8 +283,7 @@ def test_ops_fold_exactly_without_pinned_memory(monkeypatch, how):
 
 
 def test_dropped_lease_waits_for_its_pending_copy():
-    # A lease handed back before its unfold synchronizes the copy still writing into its slice before the arena can
-    # reuse it, and gives the slice back even when that wait raises.
+    # A lease dropped before its unfold waits for its pending copy, and frees the slice even if that wait raises.
     arena = ex._HostArena(False)
     order = []
 
@@ -356,8 +350,7 @@ def run_empty_tiles(device):
 
 
 def run_fold_failure_rolls_back(device):
-    # fold_weights_ whose fold raises after changing the weights (the store offload fails): the weights come back bit
-    # for bit, no key stays live, and the same keys fold and unfold again afterwards.
+    # A fold that raises after changing the weights (offload fails) rolls back bit for bit and frees its keys.
     ws, As, Bs, before = _lists(device, 2, seed = 70)
     with mock.patch.object(ex, "_offload", side_effect = RuntimeError("offload failed")):
         with pytest.raises(RuntimeError, match = "offload failed"):
@@ -370,8 +363,7 @@ def run_fold_failure_rolls_back(device):
 
 
 def run_unfold_failure_keeps_keys(device):
-    # unfold_weights_ that raises before restoring (the restore kernel launch fails, as an upload OOM would): the keys
-    # stay live and a retry restores every weight bit for bit.
+    # An unfold that raises before restoring (launch OOM) keeps its keys; a retry restores bit for bit.
     ws, As, Bs, before = _lists(device, 2, seed = 75)
     ex.fold_weights_(ws, As, Bs, [0.5, 0.5], [811, 812])
     with mock.patch.object(ex, "_launch", side_effect = RuntimeError("out of memory")):

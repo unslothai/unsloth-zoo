@@ -26,10 +26,8 @@ stores c = ord(W) - ord(back) in r + 1 bits, packed per tile in a bit stream who
 (new, d) alone. Anything else that does not round-trip (ties, |c| out of range, inf / NaN) is an escape: flat index and
 original bits, applied after the stream decode.
 
-The stream costs GPU time in every tile with code words, so each weight picks its form from its own count pass: few
-inexact elements per coded tile (small adapters, GRPO steps) keep every inexact element as an escape instead (the
-indexed form, no stream), many keep the stream. Every weight of one exact_fold call shares one store: one copy each way,
-one readback per fold and per unfold, one launch for all escapes."""
+Each weight picks its form from its own count pass: few inexact elements per coded tile (small adapters) keep them all
+as escapes (the indexed form, no stream). All weights of one exact_fold call share one store."""
 
 __all__ = [
     "exact_merge_available",
@@ -60,11 +58,8 @@ _COUNT, _FOLD, _UNFOLD = 0, 1, 2
 _BLOCK_N, _BLOCK_K = 32, 128
 # 8 warps: 16 elements of each tile tensor per thread; 4 warps spill registers in the fold / unfold passes on sm75.
 _NUM_WARPS = 8
-# Per weight, after the count pass: the bit stream costs GPU time in every tile that has code words (a scan and the
-# packing, about 0.3 us per tile on a T4, both passes), the indexed form (every inexact element kept as flat index +
-# original bits, the pre-stream store) costs about 1 ns per inexact element (copies both ways and the scatter). A weight
-# with at most this many inexact elements per coded tile takes the indexed form: small adapters (GRPO steps) restore at
-# the indexed speed, trained ones (hundreds per tile) keep the small stream. -1 forces the stream everywhere.
+# Indexed form up to this many inexact elements per coded tile: the stream costs about 0.3 us per coded tile on a T4,
+# the indexed form about 1 ns per inexact element. -1 forces the stream everywhere.
 _INDEXED_PER_TILE = 128
 # Widest code: r + 1 bits for an exponent gap r <= 7, so a code spans at most two 32-bit words.
 _MAX_GAP = 7
@@ -134,9 +129,8 @@ if triton is not None:
         r = en - eb
         return tl.where((r >= 1) & (r <= MAX_GAP), r + 1, 0)
 
-    # mode (0 / 1 / 2) is a compile-time constant: each pass gets only its own registers (one variant with every mode
-    # spilled on sm75). Every target of one exact_fold call shares one store: tile0 is this target's first tile in it,
-    # slot its checksum. indexed (fold only): every inexact element is an escape and the target has no stream.
+    # mode is constexpr so each pass keeps only its own registers (one variant for all modes spilled on sm75). tile0 is
+    # this target's first tile in the shared store, slot its checksum; indexed (fold only): all inexact are escapes.
     @triton.jit(do_not_specialize = ["tile0", "slot", "indexed"])
     def _exact_merge_kernel(
         W, A, B, counts, woff, wcnt, words, idx_out, val_out, eoff, checksum, tile0, slot, indexed,
@@ -150,7 +144,6 @@ if triton is not None:
         pid_n = tl.program_id(0)
         pid_k = tl.program_id(1)
         e = tl.program_id(2)
-        # This tile's index in the shared store.
         g = tile0 + (e * tl.num_programs(0) + pid_n) * tl.num_programs(1) + pid_k
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         rk = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -210,8 +203,7 @@ if triton is not None:
 
     @triton.jit
     def _prefix(x):
-        # Exclusive prefix sum of a [BLOCK_N, BLOCK_K] tile in row-major order (the stream order), kept 2D: row offsets
-        # plus a scan along each row, no flattening of the tile.
+        # Exclusive row-major (stream order) prefix sum of a tile, kept 2D.
         rows = tl.sum(x, 1)
         return (tl.cumsum(rows, 0) - rows)[:, None] + tl.cumsum(x, 1) - x
 
@@ -222,11 +214,9 @@ if triton is not None:
         MANT: tl.constexpr, EXPM: tl.constexpr, MAX_GAP: tl.constexpr,  # W's dtype: mantissa bits / exponent mask / widest gap
     ):
         new, wb, k, c, bad, esc = _classify(w, d, mask, MANT, EXPM, MAX_GAP)
-        # An indexed target keeps every inexact element as an escape (its tiles have no stream words).
         esc = tl.where(indexed != 0, bad, esc)
         tl.store(ptrs, new, mask = mask)
-        # A tile with no codes (every exponent gap is 0, common for small adapters) writes no stream: skip the scan and
-        # the atomics.
+        # No codes in this tile (common for small adapters): no stream, skip the scan and the atomics.
         if tl.load(wcnt + g).to(tl.int32) > 0:
             # 32-bit math: a tile's stream is at most 32 * 128 * (MAX_GAP + 1) bits, its codes at most 8 bits wide.
             code = (c & ((1 << tl.maximum(k, 1)) - 1)).to(tl.uint32)
@@ -239,8 +229,7 @@ if triton is not None:
             hi = tl.where(shift > 0, code >> ((32 - shift) & 31).to(tl.uint32), 0).to(tl.int32, bitcast = True)
             tl.atomic_or(base + word, lo, mask = put, sem = "relaxed")
             tl.atomic_or(base + word + 1, hi, mask = put & (shift + k > 32), sem = "relaxed")
-        # Escapes can sit in a tile without codes (gap 0 or > MAX_GAP): the per-tile escape count from the count pass
-        # (counts is that int64 column here) says whether this tile has any, no reduction over the tile needed.
+        # Escapes can sit in a tile without codes; counts is the per-tile escape count here.
         if tl.load(counts + g) > 0:
             pos = tl.load(eoff + g) + _prefix(esc.to(tl.int32))
             flat_idx = (e.to(tl.int64) * N + rn[:, None].to(tl.int64)) * K + rk[None, :].to(tl.int64)
@@ -297,9 +286,8 @@ if triton is not None:
         base, table, slots, idx, val, wrong, n,
         BLOCK: tl.constexpr,  # escapes per program
     ):
-        # Every escape of a store in one launch: escape i belongs to target slots[i], whose weight starts table[s, 0]
-        # int16 elements from base with strides table[s, 1:4] and shape (N, K) = table[s, 4:6]. The overwritten bits go
-        # to wrong (the checksum correction).
+        # Escape i belongs to target s = slots[i]: table[s] = (int16 offset from base, 3 strides, N, K). The overwritten
+        # bits go to wrong (the checksum correction).
         i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         m = i < n
         row = table + tl.load(slots + i, mask = m, other = 0) * 6
@@ -324,9 +312,8 @@ _STORE = ("words", "wcnt", "idx", "val")
 
 class ExactFoldTarget:
     """One weight to fold, W viewed as [E, N, K]: w_view is its strided base view (E=1 for dense); a [E, R, K] and b [E,
-    N, R] take any strides; scale is the LoRA scaling. Between fold and unfold its store is a slice of the store shared
-    by every target of the exact_fold call: host_words (int32 bit stream), host_wcnt (int16 words of each tile),
-    host_idx / host_val (escapes: flat index, original bits)."""
+    N, R] take any strides; scale is the LoRA scaling. Between fold and unfold its slice of the call's shared store is
+    host_words (int32 bit stream), host_wcnt (int16 words per tile), host_idx / host_val (escapes: flat index, bits)."""
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = ("w", "a", "b", "scale", "store", "slot", "folded", "bad")
 
@@ -370,10 +357,9 @@ pass
 
 
 class _Store:
-    """The store of one exact_fold call on one device: every target's bit stream, tile word counts and escapes laid end
-    to end in one buffer (one copy to host at the fold, one back at the unfold), one checksum slot per target and one
-    host lease, given back when the last of its targets is unfolded. Each target launches its own kernels; everything
-    else (offsets, sizes, copies, the checksum readback) runs once per call, not once per weight."""
+    """The store of one exact_fold call on one device: every target's stream, tile word counts and escapes in one buffer
+    (one copy each way), one checksum slot per target and one host lease, given back with its last target. Only the
+    kernels run per target; offsets, sizes, copies and the checksum readback run once per call."""
     __slots__ = ("device", "targets", "tile0", "tiles", "words", "escs", "indexed", "idx_dtype", "shapes", "dev", "host",
                  "lease", "checksum", "counts", "live", "ready")
 
@@ -394,15 +380,13 @@ class _Store:
     pass
 
     def count(self):
-        # Count pass of every target, then this call's tile offsets and per-target sizes, still on the device.
         n_tiles = self.tile0[-1] + self.tiles[-1]
         self.checksum = torch.zeros(len(self.targets), dtype = torch.int64, device = self.device)
         counts = torch.empty(n_tiles, 3, dtype = torch.int32, device = self.device)
         for t in self.targets:
             if self.tiles[t.slot]: _launch(t, _COUNT, counts = counts)
-        # One row per count, one column per tile: inexact elements, code words (at most 32 * 128 * 8 / 32 = 1024),
-        # escapes, and whether the tile has words. Rows, so every scan is over one contiguous vector (a cumsum along
-        # the outer dimension of [tiles, 4] runs 4 serial scans: 100 ms for a 1B model on a T4).
+        # [4, tiles]: inexact elements, code words, escapes, tile has words. Rows keep every scan contiguous (a cumsum
+        # over dim 0 of [tiles, 4] runs 4 serial scans: 100 ms for a 1B model on a T4).
         x = counts.to(torch.int64).t().contiguous()
         x[1] = (x[1] + 31) // 32
         x = torch.cat([x, (x[1:2] > 0).to(torch.int64)])
@@ -414,8 +398,7 @@ class _Store:
     pass
 
     def set_sizes(self, bounds):
-        # bounds: the boundary rows read back ([inexact, words, escapes, coded tiles] summed up to each target's first
-        # tile). Each target picks its format here, from its own counts.
+        # bounds: [inexact, words, escapes, coded tiles] summed up to each target's first tile.
         n = len(self.targets)
         rows = [[bounds[i + 1][j] - bounds[i][j] for j in range(4)] for i in range(n)]
         self.indexed = [_indexed(bad, coded) for bad, _, _, coded in rows]
@@ -437,7 +420,6 @@ class _Store:
         x = self.counts
         self.counts = None
         if any(self.indexed):
-            # Indexed targets: no words in any of their tiles, every inexact element an escape.
             flag = torch.repeat_interleave(
                 torch.tensor(self.indexed, device = self.device), torch.tensor(self.tiles, device = self.device),
                 output_size = x.shape[1],
@@ -453,7 +435,6 @@ class _Store:
         wcnt.copy_(x[1])
         del x
         for t in self.targets:
-            # The per-tile escape counts (int64) tell each tile whether it has escapes.
             if self.tiles[t.slot]:
                 _launch(t, _FOLD, counts = n_esc, woff = woff, wcnt = wcnt, words = words, idx = idx, val = val,
                         eoff = eoff, indexed = int(self.indexed[t.slot]))
@@ -537,7 +518,6 @@ pass
 
 
 def _stores_of(targets):
-    # Each distinct store of these targets once, in order.
     out = {}
     for t in targets:
         if t.store is not None: out.setdefault(id(t.store), t.store)
@@ -583,15 +563,13 @@ def exact_fold(targets, stream = None):
         _offload(targets, stream)
         return {"bad": total_bad, "elements": elements, "store_bytes": store}
     finally:
-        # The store keeps no reference to its targets past the call (targets reference the store), so dropping
-        # every folded target frees its host lease at once instead of at the next cycle collection.
+        # No store -> target cycle: dropping the folded targets frees the host lease at once.
         for s in stores: s.targets = None
 pass
 
 
 def _host_buffers(targets, stores):
-    # Pageable when pinning is disabled, over budget or refused (WSL2): still exact, only synchronous. The buffers are
-    # carved from a reused host arena, so a steady fold / unfold loop allocates no host memory after warm-up.
+    # Pageable when pinning is disabled, over budget or refused (WSL2): still exact, only synchronous.
     nbytes = sum(_carve_bytes(s.shapes) for s in stores)
     from .block_swap import _pin_budget
     pin = targets[0].w.is_cuda and os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") != "1"
@@ -631,9 +609,8 @@ pass
 
 
 class _Lease:
-    """One fold's slice of a host arena, given back at unfold (or when its target is dropped). `pending` is the event of
-    an asynchronous copy into the slice: a lease dropped before its unfold waits for it, so the next fold handed the
-    same slice (possibly on another copy stream) cannot be overwritten by a copy still in flight."""
+    """One fold's slice of a host arena. `pending` is the event of an async copy into it: a lease dropped before its
+    unfold waits for that copy, so it cannot overwrite the next fold handed the slice."""
     __slots__ = ("arena", "buffer", "done", "pending")
 
     def __init__(self, arena, buffer):
@@ -660,9 +637,8 @@ pass
 
 class _HostArena:
     """Host memory for fold stores, reused across calls. Chunks are carved front to back while folds are live; when the
-    last lease returns, the cursor rewinds and several chunks are merged into one of their combined size, so a workload
-    whose stores stop growing allocates nothing after warm-up. A fold that does not fit adds a chunk of at least half the
-    current capacity (capacity grows by 1.5x or more); live stores never move."""
+    last lease returns, the cursor rewinds and the chunks merge into one, so stores that stop growing allocate nothing
+    after warm-up. A fold that does not fit adds a chunk of at least half the capacity; live stores never move."""
 
     def __init__(self, pinned):
         self.pinned = pinned
@@ -710,7 +686,6 @@ class _HostArena:
                 self.used = [0]
 
     def clear(self):
-        # Frees the memory once nothing is live (tests, or a caller done with folding).
         with self.lock:
             if not self.live:
                 self.chunks, self.used = [], []
@@ -765,7 +740,6 @@ def _apply_escapes(t, idx, val, after):
     flat = idx.to(torch.int64)
     val = val.view(t.w.dtype)
     if t.w.is_contiguous():
-        # The stored index (e * N + n) * K + k is the flat offset: no per-axis index tensors.
         w_flat = t.w.view(-1)
         wrong = w_flat[flat]
         w_flat[flat] = val
@@ -779,7 +753,7 @@ pass
 
 
 def _restore_escapes(s, group, idx, val, after):
-    # Every escape of the store at once (all of its targets are being unfolded): one launch, one checksum correction.
+    # All of the store's targets are being unfolded: every escape in one launch.
     n_esc = s.shapes[2][0]
     if not n_esc:
         return
@@ -862,11 +836,9 @@ def exact_unfold(targets, stream = None):
         )
 
 
-# torch.compile entry points: one custom op per weight, opaque to Dynamo, so a compiled function that folds, runs and
-# unfolds has no graph break. The count readback, the store and the checksum live inside the op (README 13.18); each
-# op returns a small status tensor the caller can thread on (Inductor drops side-effect-only ops, README 13.14). A
-# folded weight's store is kept here under the caller's key until its unfold: not under the weight's address, which
-# functionalization may hand the op as a clone (aot_eager clones a mutated input, then copies back).
+# torch.compile entry points: opaque custom ops, so fold, run, unfold compiles without a graph break. Each returns a
+# status tensor to thread on (Inductor drops side-effect-only ops). Stores are kept under the caller's key, not the
+# weight's address: functionalization may hand the op a clone.
 _OP_LIVE = {}
 _OP_LOCK = threading.Lock()
 
@@ -882,8 +854,7 @@ _OP_STREAMS = {}
 
 
 def _op_stream(device):
-    # A side stream per device for the ops' store copies: the fold returns without waiting for the copy to host, the
-    # unfold waits on its event (CPU tensors: no stream).
+    # Per-device side stream for the ops' store copies: the fold does not wait for the copy to host.
     if device.type != "cuda":
         return None
     key = torch.device(device).index if torch.device(device).index is not None else torch.cuda.current_device()
@@ -894,8 +865,7 @@ pass
 
 
 def _status(rows, device):
-    # The ops' int64 status, copied from pinned memory without a host wait; from pageable memory (synchronous) when
-    # pinning is disabled or refused (WSL2), as the stores do. It runs after the fold, so it must not fail.
+    # Pinned (no host wait) unless pinning is disabled or refused. Runs after the fold, so it must not fail.
     out = torch.tensor(rows, dtype = torch.int64)
     if device.type != "cuda":
         return out
@@ -924,8 +894,7 @@ def _fold_weights_impl(
         targets = [ExactFoldTarget(*_as_3d(w, a, b), scale) for w, a, b, scale in zip(ws, as_, bs, scales)]
         exact_fold(targets, stream = _op_stream(ws[0].device))
     except BaseException:
-        # A fold that failed after changing weights (say its offload raised) is undone here from its stores, so the
-        # caller gets its weights back; if that undo fails too, the folded keys stay live for an unfold_weight_ call.
+        # Undo a fold that failed after changing weights; if that undo fails too, the folded keys stay live for unfold.
         folded = [t for t in targets if t.folded]
         restored = True
         if folded:
@@ -956,22 +925,20 @@ def _unfold_weights_impl(
         found = [_OP_LIVE.pop((int(k), tuple(w.shape), w.dtype), None) for w, k in zip(ws, keys)]
     missing = [k for k, t in zip(keys, found) if t is None]
     if missing:
-        # Put back what was found: the caller may retry with the right keys.
+        # Put back what was found so the caller can retry with the right keys.
         with _OP_LOCK:
             for w, k, t in zip(ws, keys, found):
                 if t is not None: _OP_LIVE[(int(k), tuple(w.shape), w.dtype)] = t
         raise RuntimeError(f"Unsloth: weight keys {missing} were not folded by fold_weight_ / fold_weights_.")
     for t, w, a, b, scale in zip(found, ws, as_, bs, scales):
-        # The folded bits are read from w as given now (a functionalized call may pass a copy of the folded weight),
-        # and the delta is recomputed from the adapter given here, which must be the one folded.
+        # Read the folded bits from w as given now (functionalization may pass a copy); the adapter must be the folded one.
         t.w, t.a, t.b = _as_3d(w, a, b)
         t.scale = float(scale)
     rows = [[t.bad, 0] for t in found]
     try:
         exact_unfold(found, stream = _op_stream(ws[0].device))
     except BaseException:
-        # Raised before restoring (say the store upload ran out of memory): the targets still folded keep their keys,
-        # so a retry can restore them. A checksum mismatch has already unfolded them, nothing is left to keep.
+        # Raised before restoring (say an upload OOM): still-folded targets keep their keys for a retry.
         with _OP_LOCK:
             for w, k, t in zip(ws, keys, found):
                 if t.folded: _OP_LIVE[(int(k), tuple(w.shape), w.dtype)] = t
@@ -1057,9 +1024,8 @@ pass
 
 
 def fold_weights_(ws, as_, bs, scales, keys):
-    """fold_weight_ for many weights in one op: one shared store, one count readback and one copy to host for all of
-    them (a model's layers in one call, instead of a host sync per weight). Lists of equal length; keys unique among
-    weights folded at the same time. Returns an int64 [len(ws), 2] tensor (as fold_weight_, one row per weight)."""
+    """fold_weight_ for many weights in one op: one shared store, one count readback and one copy to host for all.
+    Lists of equal length, keys as in fold_weight_. Returns an int64 [len(ws), 2] tensor, one row per weight."""
     # All Unsloth Zoo code licensed under LGPLv3
     scales, keys = [float(x) for x in scales], [int(x) for x in keys]
     if _FOLDS_OP is None:

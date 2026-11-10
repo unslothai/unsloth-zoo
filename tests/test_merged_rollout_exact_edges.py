@@ -123,7 +123,6 @@ def _check_cycle(W, A, B, scale, d = None):
         # NaN payloads may be canonicalised by the device conversion; everything else is checked bit for bit.
         assert int(bad[~nan].sum()) <= stats["bad"] <= int(bad[~nan].sum()) + int(nan.sum())
         if indexed:
-            # Indexed form: every inexact element is kept by position, no stream.
             assert words.numel() == 0 and torch.equal(kept[~nan], bad[~nan]), "indexed store is not the inexact set"
             COVERAGE["indexed"] = True
             return stats

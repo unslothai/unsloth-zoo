@@ -179,8 +179,7 @@ def test_corrupted_fixup_store_is_caught(monkeypatch):
 
 @pytest.mark.parametrize("rel, indexed", [(1e-4, True), (1e-3, True), (1e-1, False)])
 def test_small_adapters_take_the_indexed_form(rel, indexed):
-    # Few inexact elements per coded tile (GRPO-step adapters): the indexed form, cheaper to fold and unfold than the
-    # stream there; trained-size adapters keep the stream. Both restore bit for bit, in one call.
+    # Few inexact elements per coded tile take the indexed form, trained-size adapters the stream; both restore in one call.
     W, A, B, scale = _dense(512, 2048, 16, rel, torch.float16)
     W2, A2, B2, scale2 = _dense(256, 1024, 16, 1e-1, torch.float16, seed = 5)
     W0, W20 = W.clone(), W2.clone()
@@ -217,7 +216,6 @@ def test_failed_self_check_disables_exact(monkeypatch):
 
 
 def _store_buffers(t):
-    # The non-empty host buffers of a target's store (the stream or the indexed form).
     out = [b for b in (t.host_words, t.host_wcnt, t.host_idx, t.host_val) if b.numel()]
     assert out and (t.host_words.numel() or t.host_idx.numel())
     return out
