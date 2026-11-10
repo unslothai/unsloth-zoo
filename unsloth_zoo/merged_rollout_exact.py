@@ -760,6 +760,13 @@ def _restore_escapes(s, group, idx, val, after):
     n_esc = s.shapes[2][0]
     if not n_esc:
         return
+    if torch.version.hip is not None:
+        # The one launch addresses every target from the first one's pointer; ROCm's Triton (buffer ops) cannot
+        # reach other allocations that way, so each target's escapes are restored on their own.
+        for t in group:
+            start, n = s.escs[t.slot]
+            if n: _apply_escapes(t, idx[start:start + n], val[start:start + n], after)
+        return
     group = sorted(group, key = lambda t: t.slot)
     base = group[0].w.view(torch.int16)
     table = []
@@ -767,7 +774,7 @@ def _restore_escapes(s, group, idx, val, after):
         E, N, K = t.w.shape
         delta = t.w.data_ptr() - base.data_ptr()
         table.append((delta // 2, t.w.stride(0), t.w.stride(1), t.w.stride(2), N, K))
-    # Pinned or synchronous: a non_blocking copy from a pageable temporary can read it after it is freed (ROCm).
+    # Pinned (async) or synchronous: never a non_blocking copy from a pageable temporary.
     table = _status(table, s.device)
     counts = _status([n for _, n in s.escs], s.device)
     slots = torch.repeat_interleave(torch.arange(len(group), device = s.device), counts, output_size = n_esc)

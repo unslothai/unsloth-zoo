@@ -191,6 +191,16 @@ def test_failed_coalesce_leaves_a_consistent_arena():
         assert a.buffer.data_ptr() != b.buffer.data_ptr()
 
 
+def run_hip_escapes_per_target(device):
+    # ROCm restores each target's escapes on its own (one launch cannot address other allocations there).
+    ws, As, Bs, before = _lists(device, 3, seed = 95, scale = 1)
+    with mock.patch.object(torch.version, "hip", "7.0"), mock.patch.object(ex, "_apply_escapes", wraps = ex._apply_escapes) as per:
+        ex.fold_weights_(ws, As, Bs, [0.5] * 3, [841, 842, 843])
+        ex.unfold_weights_(ws, As, Bs, [0.5] * 3, [841, 842, 843])
+    _restored(ws, before)
+    assert per.call_count > 0
+
+
 def run_opcheck(device):
     # opcheck may run the op on argument copies: it checks schema and fake only, restores are checked elsewhere.
     W, A, B = _case(device, 64, 256, seed = 30)
@@ -463,6 +473,7 @@ def run_all(device):
     run_arena_growth(device)
     run_arena_reuse(device)
     run_arena_outlives_inference_mode(device)
+    run_hip_escapes_per_target(device)
     run_opcheck(device)
     run_batched_store(device)
     run_unknown_keys(device)
