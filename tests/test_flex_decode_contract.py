@@ -213,6 +213,23 @@ def test_graph_identity_follows_window_and_captured_scalars_and_offsets_are_copi
     assert torch.equal(effective_mask(bm, 1, 256), before)
 
 
+def _suppress_errors(monkeypatch):
+    # Turned on to prove the guard turns it off; builds without the flag have nothing to suppress.
+    if hasattr(torch._dynamo.config, "suppress_errors"):
+        monkeypatch.setattr(torch._dynamo.config, "suppress_errors", True)
+
+
+def test_compiled_flex_runs_on_torch_builds_without_suppress_errors(monkeypatch):
+    # AMD's ROCm torch 2.11 has no such flag: patching it raised, so every compiled call fell back.
+    monkeypatch.delattr(torch._dynamo.config, "suppress_errors")
+    monkeypatch.setattr(D, "_flex_function", lambda device: (lambda q, *a, **k: (torch.zeros_like(q), torch.zeros(q.shape[:-1])), True))
+    monkeypatch.setattr(D, "_FAILED_SHAPES", set())
+    monkeypatch.setattr(D, "_output_and_lse", lambda result: result)
+    _, q, k, v = _qkv(1, 4, 2, 64, 16, seed = 0)
+    D.flex_decode_attention(q, k, v, D.decode_block_mask(1, 64, torch.tensor(63), device = "cpu"), 0.25)
+    assert not D._FAILED_SHAPES
+
+
 @pytest.mark.parametrize("compile_fails", [False, True])
 def test_unsloth_attention_serves_the_same_visibility_densely_when_flex_decoding_cannot(compile_fails, monkeypatch):
     # Unsupported shape, or a failing flex compile that must raise once and then be served densely.
@@ -223,12 +240,12 @@ def test_unsloth_attention_serves_the_same_visibility_densely_when_flex_decoding
     calls = []
     if compile_fails:
         def failing_compiled_flex(*args, **kwargs):
-            calls.append(torch._dynamo.config.suppress_errors)
+            calls.append(getattr(torch._dynamo.config, "suppress_errors", False))
             raise RuntimeError("No valid triton configs. OutOfMemoryError: out of resource")
         monkeypatch.setattr(D, "_flex_function", lambda device: (failing_compiled_flex, True))
         monkeypatch.setattr(D, "flex_decode_supported", lambda *args: True)
         monkeypatch.setattr(D, "_FAILED_SHAPES", set())
-        monkeypatch.setattr(torch._dynamo.config, "suppress_errors", True)
+        _suppress_errors(monkeypatch)
     else:
         assert not D.flex_decode_supported(d, 4, 2, torch.float64, "cpu")
     want = D._eager_attention(q, k, v, visible(mask_2d, window)[:, None, None, :], d ** -0.5)
@@ -393,7 +410,7 @@ def test_a_new_specialisation_after_a_compiled_call_still_gets_failure_handling(
 
     def compiled_flex(query, key, value, **kwargs):
         calls.append((query.shape[0], kwargs["scale"]))
-        assert torch._dynamo.config.suppress_errors is False
+        assert getattr(torch._dynamo.config, "suppress_errors", False) is False
         if query.shape[0] == 2 or kwargs["scale"] == 0.5:
             raise RuntimeError("No valid triton configs")
         lse = torch.zeros(query.shape[:-1], dtype = torch.float32)
@@ -402,7 +419,7 @@ def test_a_new_specialisation_after_a_compiled_call_still_gets_failure_handling(
     monkeypatch.setattr(D, "_flex_function", lambda device: (compiled_flex, True))
     monkeypatch.setattr(D, "_FAILED_SHAPES", set())
     monkeypatch.setattr(D, "_output_and_lse", lambda result: result)
-    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", True)
+    _suppress_errors(monkeypatch)
     second = (2, 0.25) if change == "batch" else (1, 0.5)
     for (batch, scale), fails in (((1, 0.25), False), (second, True)):
         _, q, k, v = _qkv(batch, 4, 2, 64, 16, seed = 0)

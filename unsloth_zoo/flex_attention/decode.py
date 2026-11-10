@@ -36,6 +36,7 @@ __all__ = [
     "register_flex_decode",
 ]
 
+import contextlib
 import functools
 import math
 import os
@@ -320,6 +321,12 @@ class FlexDecodeUnavailable(RuntimeError):
 _FAILED_SHAPES = set()
 
 
+def _strict_compile():
+    # AMD's ROCm torch 2.11 wheels have no suppress_errors: nothing to turn off there.
+    config = torch._dynamo.config
+    return config.patch(suppress_errors = False) if hasattr(config, "suppress_errors") else contextlib.nullcontext()
+
+
 def _shape_key(query, key, kernel_options, softcap):
     # Every dimension a compile specialises on (batch is static, see below): a later specialisation must still go
     # through the failure handling below, not the cached-success path.
@@ -368,7 +375,7 @@ def flex_decode_attention(query, key, value, block_mask, scale = None, *, sinks 
         # Every call keeps the guard: scale, strides or the mask closure can still trigger a new specialisation,
         # and a suppressed failure would silently run eager flex instead of falling back.
         try:
-            with torch._dynamo.config.patch(suppress_errors = False):
+            with _strict_compile():
                 out, lse = call()
         except Exception as error:
             # A failure inside a CUDA graph capture is the caller's (compile before capturing); not a shape verdict.
