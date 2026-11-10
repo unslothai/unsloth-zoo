@@ -34,7 +34,7 @@ import torch
 from . import moe_ready_epoch as _ready_epoch
 # Model-agnostic expert-LoRA helpers, shared with the ModuleList grouped MoE path.
 from .moe_grouped_modulelist import (
-    _STACK_NAME, _lora_delta, _lora_operands, _lora_stacks, _projs_lora, _stack_projs_lora, _stackable_lora,
+    _STACK_NAME, _lora_operands, _lora_stacks, _projs_lora, _stack_projs_lora, _stackable_lora,
 )
 # Read as module attributes in the hot forward (no per-call import machinery; monkeypatches reach them).
 from . import moe_utils as _moe_utils
@@ -517,20 +517,77 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
     dn_w = _StackProvider(dn_tb, dtype, lambda: _bnb_fallback_stack(dn_projs, dtype), dn_refresh)
 
     xg = hidden_states[sorted_tokens]
-    gate_up = mu._base_grouped_mm(xg, offsets, gu_w, recompute).to(acc_dtype)
-    gate_up = gate_up + gu_bias[expert_ids].to(acc_dtype)
-    if lora is not None and lora["gate_up"] is not None:
-        gate_up = gate_up + _lora_delta(xg, offsets, gu_projs, lora["gate_up"], dtype).to(acc_dtype)
-    gated = _gpt_oss().swiglu_torch_forward(gate_up, experts.alpha, experts.limit, dtype = torch.float32).to(dtype)
-    out = mu._base_grouped_mm(gated, offsets, dn_w, recompute).float()
-    out = out + dn_bias[expert_ids].float()
-    if lora is not None and lora["down"] is not None:
-        out = out + _lora_delta(gated, offsets, dn_projs, lora["down"], dtype).float()
+    gu_lora = lora["gate_up"] if lora is not None else None
+    dn_lora = lora["down"] if lora is not None else None
+    gate_up = mu._base_grouped_mm(xg, offsets, gu_w, recompute)
+    # Fused epilogues (gpt_oss_fused_glue): the same roundings in one pass each, else the eager chain below.
+    glue = _fused_glue(gate_up, acc_dtype, experts)
+    # The kernel adds the bias unrounded: equal to eager's bias.to(acc_dtype) only for a bf16 bias or fp32 accumulate.
+    if glue is not None and gu_bias.dtype is not torch.bfloat16 and acc_dtype is not torch.float32:
+        glue = None
+    gated = d_gu = None
+    if gu_lora is not None:
+        d_gu = _lora_unscaled(xg, offsets, gu_projs, gu_lora, dtype)
+    if glue is not None:
+        gated = glue.gate_up_epilogue(gate_up.contiguous(), d_gu, gu_bias.contiguous(), expert_ids,
+                                      gu_lora[1] if gu_lora is not None else 1.0, experts.alpha, experts.limit, acc_dtype)
+    if gated is None:
+        glue = None
+        gate_up = gate_up.to(acc_dtype) + gu_bias[expert_ids].to(acc_dtype)
+        if d_gu is not None:
+            gate_up = gate_up + (d_gu * gu_lora[1]).to(acc_dtype)
+        gated = _gpt_oss().swiglu_torch_forward(gate_up, experts.alpha, experts.limit, dtype = torch.float32).to(dtype)
+    del gate_up
+    out = mu._base_grouped_mm(gated, offsets, dn_w, recompute)
+    d_dn = _lora_unscaled(gated, offsets, dn_projs, dn_lora, dtype) if dn_lora is not None else None
+    y = None
+    if glue is not None:
+        y = glue.down_epilogue(out.contiguous(), d_dn, dn_bias.contiguous(), expert_ids,
+                               dn_lora[1] if dn_lora is not None else 1.0)
+    if y is None:
+        y = out.float() + dn_bias[expert_ids].float()
+        if d_dn is not None:
+            y = y + (d_dn * dn_lora[1]).float()
+    return _combine(y, routing_weights, sorted_tokens, expert_ids, sorted_idx, num_tokens, top_k).view(
+        batch_size, -1, experts.hidden_size)
 
-    weighted = out.to(torch.float32) * routing_weights[sorted_tokens, expert_ids, None].to(torch.float32)
-    # Fixed-order top_k sum (an index_add_ over repeated tokens is atomic, so not reproducible).
-    next_states = mu.combine_permuted_moe_outputs(weighted, sorted_idx, num_tokens, top_k, out_dtype = torch.float32)
-    return next_states.view(batch_size, -1, experts.hidden_size)
+
+def _lora_unscaled(x, offsets, projs, lora, dtype):
+    """_lora_delta before its `* scaling`, which the fused epilogues apply (and round) themselves."""
+    gmm = _moe_utils._grouped_mm_with_backward_fix
+    A, B = _lora_operands(projs, lora[0], dtype, x)
+    return gmm(gmm(x, A, offsets), B, offsets)
+
+
+def _fused_glue(t, acc_dtype, experts):
+    """gpt_oss_fused_glue when its kernels apply here (bf16 GEMM output, CUDA, self-check passed), else None."""
+    if t.dtype is not torch.bfloat16 or os.environ.get("UNSLOTH_GPTOSS_FUSED_GLUE", "1") == "0":
+        return None
+    if acc_dtype not in (torch.bfloat16, torch.float32) or getattr(experts, "limit", None) is None:
+        return None
+    try:
+        from . import gpt_oss_fused_glue as glue
+    except Exception:
+        return None
+    return glue if glue.usable(t, acc_dtype, float(experts.alpha), float(experts.limit)) else None
+
+
+def _combine(y, routing_weights, sorted_tokens, expert_ids, sorted_idx, num_tokens, top_k):
+    """fp32 sum over each token's top_k of y * routing weight, in a fixed order (an index_add_ over repeated tokens
+    is atomic, so not reproducible); moe_triton_kernels.weighted_unpermute does it in one pass (same bits for y and
+    dY, the routing-weight grad differs only by fp32 summation order), else the eager product + inverse permutation.
+    UNSLOTH_GPTOSS_FUSED_COMBINE=0 (or UNSLOTH_GPTOSS_FUSED_GLUE=0) keeps the eager one."""
+    w = routing_weights[sorted_tokens, expert_ids].to(torch.float32)
+    if (
+        os.environ.get("UNSLOTH_GPTOSS_FUSED_GLUE", "1") != "0"
+        and os.environ.get("UNSLOTH_GPTOSS_FUSED_COMBINE", "1") != "0"
+        and y.is_cuda and torch.version.hip is None
+    ):
+        from .moe_triton_kernels import weighted_unpermute
+        out = weighted_unpermute(y, sorted_idx, w, num_tokens, top_k, out_dtype = torch.float32)
+        if out is not None:
+            return out
+    return _moe_utils.combine_permuted_moe_outputs(y * w[:, None], sorted_idx, num_tokens, top_k, out_dtype = torch.float32)
 
 
 class _Fp16StackProvider:
