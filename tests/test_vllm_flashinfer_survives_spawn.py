@@ -7,12 +7,14 @@ child config, is the option; tests are CPU-only."""
 
 from __future__ import annotations
 
+import ast
 import importlib
 import importlib.util
 import inspect
 import multiprocessing as mp
 import contextlib
 import sys
+import textwrap
 import types
 
 import pytest
@@ -229,12 +231,24 @@ def test_the_unblock_is_the_first_thing_delete_vllm_does():
     ), "the teardown runs before the restore"
 
 
+def _load_vllm_failure_arm():
+    """The except BaseException arm of the try that wraps load_vllm's whole engine build. Inner retry loops have their
+    own except BaseException arms, so the first one in the text is not necessarily this one."""
+    source = textwrap.dedent(inspect.getsource(vllm_utils.load_vllm))
+    fn = ast.parse(source).body[0]
+    arms = [
+        handler
+        for node in fn.body if isinstance(node, ast.Try)
+        for handler in node.handlers
+        if isinstance(handler.type, ast.Name) and handler.type.id == "BaseException"
+    ]
+    assert len(arms) == 1, "no restore arm on load_vllm's failure path"
+    return ast.get_source_segment(source, arms[0])
+
+
 def test_a_failed_load_vllm_restores_flashinfer():
     """A failed load_vllm must restore flashinfer on the except BaseException path: a startup error leaves no engine, so keeping the block buys nothing."""
-    source = inspect.getsource(vllm_utils.load_vllm)
-    assert "except BaseException:" in source, "no restore arm on the failure path"
-    restore = source.index("except BaseException:")
-    tail = source[restore:restore + 1200]
+    tail = _load_vllm_failure_arm()
     assert "_unblock_flashinfer_import()" in tail
     assert "_UNSLOTH_FLASHINFER_UNUSABLE = False" in tail
     assert "raise" in tail, "the original error must still propagate"
@@ -362,9 +376,7 @@ def test_a_second_failed_load_keeps_a_live_engine_s_block(monkeypatch):
     # One engine is alive and owns the block.
     monkeypatch.setattr(vllm_utils, "_UNSLOTH_FLASHINFER_BLOCK_OWNERS", 1, raising = False)
 
-    source = inspect.getsource(vllm_utils.load_vllm)
-    arm = source.index("except BaseException:")
-    window = source[arm:arm + 900]
+    window = _load_vllm_failure_arm()
     guard = window.index("_UNSLOTH_FLASHINFER_BLOCK_OWNERS == 0")
     assert guard < window.index("_unblock_flashinfer_import()"), (
         "the failure arm unblocks without checking for a live owner"
