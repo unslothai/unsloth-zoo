@@ -780,7 +780,9 @@ def _restore_escapes(s, group, idx, val, after):
     slots = torch.repeat_interleave(torch.arange(len(group), device = s.device), counts, output_size = n_esc)
     wrong = torch.empty(n_esc, dtype = torch.int16, device = s.device)
     block = 1024
-    _escape_kernel[(triton.cdiv(n_esc, block),)](base, table, slots, idx, val, wrong, n_esc, BLOCK = block, num_warps = 4)
+    _escape_kernel[(triton.cdiv(n_esc, block),)](
+        base, table, slots, idx, val, wrong, n_esc, BLOCK = block, num_warps = 4, enable_fp_fusion = True,
+    )
     after.index_add_(0, slots, val.to(torch.int64) - wrong.to(torch.int64))
 pass
 
