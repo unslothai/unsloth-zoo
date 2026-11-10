@@ -916,9 +916,14 @@ def _fold_weights_impl(
                 else:
                     _OP_LIVE.pop(s, None)
         raise
+    status = _status([[t.bad, t.host_store_bytes()] for t in targets], ws[0].device)
+    for t in targets:
+        # Under compile w may be a functionalization clone: keeping it through the rollout would hold a second copy
+        # of every folded weight. Unfold rebinds w / a / b from its own arguments.
+        t.w, t.a, t.b = t.w.new_empty(0), None, None
     with _OP_LOCK:
         for s, t in zip(slots, targets): _OP_LIVE[s] = t
-    return _status([[t.bad, t.host_store_bytes()] for t in targets], ws[0].device)
+    return status
 pass
 
 

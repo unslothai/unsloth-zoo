@@ -398,8 +398,24 @@ def run_partial_unfold_is_not_retried(device):
     assert all(torch.equal(_bits(w), a) for w, a in zip(ws, after))
 
 
+def run_fold_keeps_no_weight_reference(device):
+    # The live store must not pin the folded tensors (a functionalization clone under compile would stay alive).
+    import weakref
+
+    ws, As, Bs, before = _lists(device, 1, seed = 85)
+    clone = ws[0].clone()
+    alive = weakref.ref(clone)
+    ex.fold_weights_([clone], As, Bs, [0.5], [831])
+    ws[0].copy_(clone)
+    del clone
+    assert alive() is None
+    ex.unfold_weights_(ws, As, Bs, [0.5], [831])
+    _restored(ws, before)
+
+
 def run_all(device):
     run_empty_tiles(device)
+    run_fold_keeps_no_weight_reference(device)
     run_partial_unfold_is_not_retried(device)
     run_fold_failure_rolls_back(device)
     run_unfold_failure_keeps_keys(device)
