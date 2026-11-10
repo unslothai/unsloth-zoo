@@ -3284,6 +3284,7 @@ from huggingface_hub import (
     get_torch_storage_size,
     get_torch_storage_id,
 )
+from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
 def get_torch_storage_size_new(x, element_size):
     if isinstance(x, LoraStats):
@@ -3301,8 +3302,11 @@ def get_torch_storage_size_new(x, element_size):
         # Fallback for Linear-like modules
         shape = (mod.in_features, mod.out_features)
         return int(np.prod(shape)) * element_size
-    else:
-        return get_torch_storage_size(x)
+    # A view's own bytes: Block Swap keeps a whole layer's weights in one arena, whose storage size
+    # would be counted once per view. Wrapper subclasses (DTensor, ...) keep the hub's sizing.
+    if isinstance(x, torch.Tensor) and not is_traceable_wrapper_subclass(x):
+        return x.nelement() * x.element_size()
+    return get_torch_storage_size(x)
 pass
 
 
