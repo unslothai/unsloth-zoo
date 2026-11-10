@@ -720,6 +720,7 @@ def test_row_invariant_lane_projections_are_opt_in_run_decode_and_verify_and_res
         z = next(m.weight.shape[0] for name, m in model.language_model.named_modules() if name.endswith("in_proj_z"))
         supported = matmul.lane_qmm_supported
         monkeypatch.setattr(matmul, "lane_qmm_supported", lambda N, *args: N != z and supported(N, *args))
+    monkeypatch.setattr(inference, "_LANE_LOW_ROWS", 0)
     monkeypatch.delenv("UNSLOTH_MLX_FAST_VERIFY", raising = False)
     with generation_mode(model):
         assert "_unsloth_lane_verify_native" not in vars(type(verifier)) and not inference.fast_verify_enabled(model)   # off unless asked for
@@ -778,23 +779,28 @@ def test_row_invariant_lane_projections_are_opt_in_run_decode_and_verify_and_res
     assert not any(type(m).__name__.startswith("_Lane") for _, m in model.named_modules())
 
 
-def test_row_invariant_lane_projections_verify_rows_equal_one_token_decoding(qwen_4bit, monkeypatch):
-    from unsloth_zoo.mlx import matmul
+@pytest.mark.parametrize("low", [0, 4])
+def test_row_invariant_lane_projections_verify_rows_equal_one_token_decoding(qwen_4bit, monkeypatch, low):
+    from unsloth_zoo.mlx import inference, matmul
     from unsloth_zoo.mlx.generate import generation_mode
     if not matmul.lane_qmm_available():
         pytest.skip("the lane kernel needs an Apple GPU")
     (model, ids, cache), heads, kernel = qwen_4bit, [], matmul.lane_qmm
     lm = model.language_model
     monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: (args[1].shape[0] == lm.args.vocab_size and heads.append(len(args[0]))) or kernel(*args, **kwargs))
+    rows, qmv_rows = [], matmul.qmv_rows
+    monkeypatch.setattr(matmul, "qmv_rows", lambda x, *args, **kwargs: rows.append(len(x)) or qmv_rows(x, *args, **kwargs))
+    monkeypatch.setattr(inference, "_LANE_LOW_ROWS", low)
     monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", "1")
     with generation_mode(model, call = ("batch", "speculative")):
-        for width in (1, 3, 8, 12):   # the tied head read once per block, not once per row
-            block, run, step, heads[:] = mx.array([ids[0][24:24 + width]]), _clone(cache), _clone(cache), []
+        for width in (1, 3, 4, 5, 12):   # the tied head read once per block, not once per row
+            block, run, step, heads[:], rows[:] = mx.array([ids[0][24:24 + width]]), _clone(cache), _clone(cache), [], []
             out = lm(block, cache = run, speculative_verify = True, capture_layer_ids = [])
             out.gdn_states.abort()
-            assert heads == [width], width
-            decoded = mx.concatenate([lm(block[:, i:i + 1], cache = step).logits for i in range(width)], axis = 1)
-            assert mx.array_equal(out.logits.view(mx.uint16), decoded.view(mx.uint16)).item(), width
+            assert heads == ([width] if width > low else []) and bool(rows) == (1 < width <= low), width
+            if not low or width <= low:
+                decoded = mx.concatenate([lm(block[:, i:i + 1], cache = step).logits for i in range(width)], axis = 1)
+                assert mx.array_equal(out.logits.view(mx.uint16), decoded.view(mx.uint16)).item(), width
 
 
 @pytest.mark.parametrize("opt_in", ["1", "0"])
@@ -808,6 +814,7 @@ def test_verify_rows_equal_one_token_decoding_where_decode_attention_changes_ker
     lm = model.language_model
     batched = lambda: [ArraysCache(size = 2) if layer.is_linear else BatchKVCache([0]) for layer in lm.model.layers]
     monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", opt_in)
+    monkeypatch.setattr(inference, "_LANE_LOW_ROWS", 0)
     invariant, kernel, widths = opt_in == "1" and attention.invariant_attention_available(), attention.invariant_attention, []
     monkeypatch.setattr(attention, "invariant_attention", lambda q, *a: widths.append(q.shape[2]) or kernel(q, *a))
     with generation_mode(model, call = ("batch", "speculative")):
@@ -892,11 +899,12 @@ def _tree_block(parents):
 
 
 def _tree_mode(model, monkeypatch):
-    from unsloth_zoo.mlx import attention, matmul
+    from unsloth_zoo.mlx import attention, inference, matmul
     from unsloth_zoo.mlx.generate import generation_mode
     if not (matmul.lane_qmm_available() and attention.invariant_attention_available()):
         pytest.skip("tree verify needs the row-invariant kernels")
     monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", "1")
+    monkeypatch.setattr(inference, "_LANE_LOW_ROWS", 0)
     return generation_mode(model, call = ("batch", "speculative"))
 
 
@@ -1871,13 +1879,15 @@ def test_qwen4_decode_steps_read_disk_ple_rows_after_the_forward_bit_for_bit(qwe
             offload._replace_module(model, path, module)
 
 
-@pytest.mark.parametrize("flag, prompt, batch", [("0", 40, False), ("0", 1200, False), ("1", 1200, False), ("0", 2100, False),
-                                                 ("0", 2100, True)])
+@pytest.mark.parametrize("flag, prompt, batch", [("0", 40, False), ("0", 1200, False), ("1", 1200, False), ("low", 1200, False),
+                                                 ("0", 2100, False), ("0", 2100, True)])
 def test_a_qwen4_verify_block_attends_and_projects_as_its_decode_steps(qwen4, flag, prompt, batch, monkeypatch):
     from mlx_vlm.models.cache import make_prompt_cache
     from unsloth_zoo.mlx import inference, matmul
-    if flag == "1" and not matmul.lane_qmm_available():
+    if flag != "0" and not matmul.lane_qmm_available():
         pytest.skip("the row-invariant mode needs the lane kernel")
+    low, flag = flag == "low", "1" if flag == "low" else flag
+    monkeypatch.setattr(inference, "_LANE_LOW_ROWS", 6 if low else 0)
     monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", flag)
     (model, _), served, lanes, lane_qmm = qwen4, _serving(monkeypatch), [], matmul.lane_qmm
     monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: lanes.append(args[0].shape[0]) or lane_qmm(*args, **kwargs))
@@ -1906,7 +1916,7 @@ def test_a_qwen4_verify_block_attends_and_projects_as_its_decode_steps(qwen4, fl
     # A batch cache keeps mlx-vlm's pairs.
     assert any(key[0] == "qsa_block" and verdict for key, verdict in inference._VERIFY_VERDICTS.items()) == (prompt > 2048 and not batch)
     assert set(sparse) == (set() if prompt < 2048 else {2} if batch else {6})
-    assert (max(lanes, default = 0) == 6) == (flag == "1")
+    assert (max(lanes, default = 0) == 6) == (flag == "1" and not low)
 
 
 def test_a_qwen4_mask_is_causal_only_while_no_row_passes_the_indexer_top_k(qwen4):
@@ -2859,6 +2869,19 @@ def test_sparse_draft_selection_preserves_canonical_ties_and_call_ownership():
         assert mx.array_equal(ascending(), first) and mx.array_equal(selector.__dict__.pop("_unsloth_confidence"), confidence)
         del selector.__dict__["_unsloth_wants_confidence"]
         assert confidence.shape == (2, 3) and bool(mx.all((confidence > 0) & (confidence <= 1)))
+
+
+def test_a_drafter_head_built_inside_fast_verify_keeps_low_rows_on_the_lane_kernel():
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    (head := nn.QuantizedLinear(256, 64, bias = False)).eval().set_dtype(mx.bfloat16)
+    head._unsloth_lane_verify_scopes = 1
+    drafter = nn.Module()
+    drafter.lm_head = head
+    assert inference.lane_drafter_head(drafter, head) and drafter.lm_head is not head
+    assert not inference._lane_low(drafter.lm_head, 1) and inference._lane_low(head, 1)
 
 
 def test_a_quantized_drafter_projects_on_the_lane_kernel_unless_switched_off(qwen, monkeypatch):

@@ -1901,3 +1901,126 @@ def test_qwen4_decode_scope_stays_native_when_a_pinned_name_is_gone(removed, mon
     with decode.fused_qwen4_decode(module):
         assert "_hyper_connection" not in vars(forward)
         assert "_unsloth_qwen4_decode_plan" not in vars(module)
+
+
+@_needs_qwen4
+@_needs_stream
+@pytest.mark.parametrize("combine,fold,rows", [(True, False, 3), (True, True, 4), (True, True, 9), (False, False, 1)])
+def test_fast_qwen4_hc_rows_fold_and_final_mix(combine, fold, rows, monkeypatch):
+    mx.random.seed(308); module = _stream_read(combine = combine, lowrank = 320)
+    x = mx.random.normal((1, rows, 10240)).astype(mx.bfloat16)
+    branch, weights = [mx.random.normal((1, rows, width)).astype(x.dtype) for width in (2560, 4)]
+    monkeypatch.setattr(decode, "_QWEN4_FAST_HC_VERDICTS", {})
+    with decode.fused_qwen4_decode(module, _modules = [("mlp_hyper_connection", module)]):
+        plan = decode._qwen4_fast_hc_plan(module); assert plan is not None
+        folded = (branch, weights, x) if fold else None
+        got = plan(x, folded)
+        expected_hidden = qwen4.Qwen4ExpBatchInvariantForward._inject(branch, x, weights) if fold else x
+        singles = [plan(x[:, i:i + 1], tuple(t[:, i:i + 1] for t in folded) if fold else None) for i in range(rows)]
+        if combine:
+            _equal(got[1], expected_hidden)
+            normed = decode._qwen4_hc_norm(expected_hidden, module.hc_norm.weight, 2560, module.hc_norm.eps)
+            fp32 = lambda p, x: mx.quantized_matmul(x.astype(mx.float32), p.weight, p.scales.astype(mx.float32), p.biases.astype(mx.float32), transpose = True, group_size = 32, bits = 4)
+            projected = fp32(module.block_inject_weight, normed)
+            activation = nn.silu(fp32(module.input_mix_weight_down, normed) / 4).astype(x.dtype)
+            gates = mx.sigmoid(fp32(module.input_mix_weight_up, activation))
+            mixed = (gates * normed.astype(mx.float32)).reshape(1, rows, 4, 2560).mean(axis = 2)
+            assert bool(mx.allclose(got[0].astype(mx.float32), mixed, atol = 0.01, rtol = 0.02).item())
+            assert bool(mx.allclose(got[2].astype(mx.float32), 2 * mx.sigmoid(projected / 4), atol = 0.008, rtol = 0.008).item())
+            for part in range(3): _equal(got[part], mx.concatenate([value[part] for value in singles], axis = 1))
+            assert bool(mx.all((got[2] >= 0) & (got[2] <= 2)).item())
+        else:
+            _equal(got, mx.concatenate(singles, axis = 1))
+        assert bool(mx.all(mx.isfinite(got[0] if combine else got)).item())
+        if rows > 1:
+            assert not bool(mx.array_equal(got[0][:, 0], got[0][:, -1]).item())
+
+
+@_needs_qwen4
+@_needs_stream
+@pytest.mark.parametrize("batch,rows,streams", [(1, 1, 4), (1, 3, 4), (1, 3, 2), (4, 1, 2)])
+def test_fast_qwen4_hc_scope_owns_only_lane_calls(monkeypatch, batch, rows, streams):
+    module = _stream_read(lowrank = 320); forward = qwen4._QWEN4_BATCH_INVARIANT_FORWARD
+    x = mx.random.normal((batch, rows, 10240)).astype(mx.bfloat16)
+    monkeypatch.setattr(decode, "_fast_verify_held", lambda model: True)
+    monkeypatch.setattr(decode._VERIFY_STATE, "lane", False, raising = False)
+    second, outsider = [_stream_read(lowrank = 320) for _ in range(2)]
+    for owner in (module, second): owner.input_mix_weight_down._unsloth_lane_verify_scopes = 1
+    modules = [("other", nn.Linear(2, 2)), ("mlp_hyper_connection", module), ("second_hc", second), ("duplicate", module)]
+    with decode.fused_qwen4_decode(module, _modules = modules):
+        held = forward._hyper_connection
+        expected = held(module, x)
+        monkeypatch.setattr(decode, "_fast_verify_held", lambda model: False)
+        with decode.fast_qwen4_hc(module, _modules = modules):
+            assert forward._hyper_connection is held
+        monkeypatch.setattr(decode, "_fast_verify_held", lambda model: True)
+        with decode.fast_qwen4_hc(module, _modules = modules):
+            assert forward._hyper_connection.func is decode._qwen4_fast_hc_read
+            with decode.fused_qwen4_decode(outsider, _modules = [("other_hc", outsider)]):
+                assert "_unsloth_qwen4_decode_plan" in vars(outsider)
+                _assert_same(forward._hyper_connection(outsider, x), outsider._unsloth_qwen4_decode_plan.bounded(outsider, x, None))
+            for name in ("_inject", "_hyper_connection"):
+                with monkeypatch.context() as patch:
+                    patch.setattr(forward, name, lambda *args: None)
+                    with decode.fused_qwen4_decode(outsider, _modules = [("other_hc", outsider)]):
+                        assert "_unsloth_qwen4_decode_plan" not in vars(outsider)
+            _assert_same(forward._hyper_connection(module, x), expected)
+            monkeypatch.delattr(decode._VERIFY_STATE, "lane")
+            _assert_same(forward._hyper_connection(module, x), expected)
+            monkeypatch.setattr(decode._VERIFY_STATE, "lane", True, raising = False)
+            _assert_same(forward._hyper_connection(module, x), module._unsloth_qwen4_fast_hc_plan(x, None))
+            branch, weights = mx.ones((batch, rows, 10240 // streams), x.dtype), mx.full((batch, rows, streams), 0.5, x.dtype)
+            injected = forward._inject(branch, x, weights)
+            base_plan = module._unsloth_qwen4_fast_hc_plan
+            def checked(value, folded):
+                assert folded is None or folded[1].shape[-1] == module.hc_count
+                return base_plan(value, folded)
+            vars(module)["_unsloth_qwen4_fast_hc_plan"] = checked
+            _assert_same(forward._hyper_connection(module, injected), base_plan(injected, (branch, weights, x) if streams == 4 else None))
+            vars(module)["_unsloth_qwen4_fast_hc_plan"] = base_plan
+            with decode.fast_qwen4_hc(module, _modules = modules):
+                assert module._unsloth_qwen4_fast_hc_scopes == 2
+                actual = forward._hyper_connection(module, x)
+                _assert_same(actual, module._unsloth_qwen4_fast_hc_plan(x, None))
+            assert module._unsloth_qwen4_fast_hc_scopes == 1
+        assert forward._hyper_connection is held
+        assert "_unsloth_qwen4_fast_hc_plan" not in vars(module)
+        _assert_same(held(module, x), expected)
+
+
+@_needs_qwen4
+@_needs_stream
+def test_fast_qwen4_hc_failed_probe_keeps_fallback(monkeypatch):
+    module = _stream_read(lowrank = 320); x = mx.zeros((1, 3, 10240), mx.bfloat16)
+    monkeypatch.setattr(decode, "_QWEN4_FAST_HC_VERDICTS", {})
+    with decode.fused_qwen4_decode(module, _modules = [("mlp_hyper_connection", module)]):
+        failed = lambda **kw: [mx.full(shape, float("nan"), dtype) for shape, dtype in zip(kw["output_shapes"], kw["output_dtypes"])]
+        monkeypatch.setattr(decode, "_qwen4_fast_hc_kernel", lambda: failed)
+        plan = decode._qwen4_fast_hc_plan(module)
+        assert plan(x, None) is None and plan(x, None) is None
+        assert list(decode._QWEN4_FAST_HC_VERDICTS.values()) == [False]
+
+
+@_needs_qwen4
+@_needs_stream
+@pytest.mark.parametrize("kind", ["training", "dtype", "layout", "quant", "scope"])
+def test_fast_qwen4_hc_rejects_unsupported_plans(monkeypatch, kind):
+    module = _stream_read(lowrank = 320); modules = [("hc", module)]
+    with decode.fused_qwen4_decode(module, _modules = modules):
+        if kind == "training": module.train()
+        if kind == "dtype": vars(module)["_unsloth_qwen4_decode_plan"] = module._unsloth_qwen4_decode_plan._replace(dtype = mx.float16)
+        if kind == "layout": module.hidden_size = 1280
+        if kind == "quant": module.input_mix_weight_up.group_size = 64
+        if kind == "scope": vars(module).pop("_unsloth_qwen4_decode_plan")
+        assert decode._qwen4_fast_hc_plan(module) is None
+
+
+@_needs_qwen4
+@_needs_stream
+@pytest.mark.parametrize("shape,dtype", [((1, 0, 10240), mx.bfloat16), ((1, 10, 10240), mx.bfloat16), ((1, 1, 5120), mx.bfloat16), ((1, 10240), mx.bfloat16), ((1, 1, 10240), mx.float16)])
+def test_fast_qwen4_hc_unexpected_inputs_keep_native(monkeypatch, shape, dtype):
+    down = SimpleNamespace(_unsloth_lane_verify_scopes = 1)
+    module = SimpleNamespace(training = False, input_mix_weight_down = down, _unsloth_qwen4_fast_hc_plan = lambda *a: pytest.fail("unexpected fast read"))
+    forward = SimpleNamespace(_unsloth_qwen4_fast_hc_native = lambda *a: "native")
+    monkeypatch.setattr(decode._VERIFY_STATE, "lane", True, raising = False)
+    assert decode._qwen4_fast_hc_read(forward, module, mx.zeros(shape, dtype)) == "native"

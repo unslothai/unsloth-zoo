@@ -1891,27 +1891,22 @@ _QWEN4_STREAM_VERDICTS = {}
 
 
 @functools.cache
-def _qwen4_stream_kernels():
-    if (mx.__version__ != "0.32.4" or not mx.metal.is_available()
-            or mx.device_info().get("architecture") != "applegpu_g15s"):
-        return None
-    try:
-        seen = set()
-        _inline("mlx/backend/metal/kernels/utils.h", seen)
-        quantized = _inline("mlx/backend/metal/kernels/quantized.h", seen, "get_pack_factor", "dequantize")
-        signature = "template <typename T, typename U, int values_per_thread, int bits>\ninline U "
-        start = quantized.index(signature + "load_vector(")
-        stop = quantized.index(signature + "load_vector_safe(")
-        load = quantized[start:stop].replace("load_vector(const device T* x", "load_vector_tg(const threadgroup T* x")
-        end = quantized.index("\n}", stop) + 2
-        safe = quantized[stop:end].replace("load_vector_safe(const device T* x", "load_vector_safe_tg(const threadgroup T* x")
-        header = quantized + load + safe
-        pragma = "#pragma clang fp contract(off) reassociate(off)\n"
-        down = mx.fast.metal_kernel(
-            name = "unsloth_qwen4_stream_norm_down",
-            input_names = ["x", "branch", "weights", "w", "inv_n", "eps", "wd", "sd", "bd", "wi", "si", "bi"],
-            output_names = ["normed", "parts", "hidden"], header = header, compile_options = _QWEN4_SAFE_MATH,
-            source = pragma + """
+def _qwen4_stream_header():
+    seen = set()
+    _inline("mlx/backend/metal/kernels/utils.h", seen)
+    quantized = _inline("mlx/backend/metal/kernels/quantized.h", seen, "get_pack_factor", "dequantize")
+    signature = "template <typename T, typename U, int values_per_thread, int bits>\ninline U "
+    start = quantized.index(signature + "load_vector(")
+    stop = quantized.index(signature + "load_vector_safe(")
+    load = quantized[start:stop].replace("load_vector(const device T* x", "load_vector_tg(const threadgroup T* x")
+    end = quantized.index("\n}", stop) + 2
+    safe = quantized[stop:end].replace("load_vector_safe(const device T* x", "load_vector_safe_tg(const threadgroup T* x")
+    header = quantized + load + safe
+    return header
+
+
+def _qwen4_stream_down_source(reuse = 1):
+    source = """
     const uint row = threadgroup_position_in_grid.z;
     const uint stream = threadgroup_position_in_grid.y % STREAMS;
     const uint tile = threadgroup_position_in_grid.y / STREAMS;
@@ -1980,7 +1975,41 @@ def _qwen4_stream_kernels():
         normed[row * K + stream * G + k] = xs[k];
         if (FOLD) hidden[row * K + stream * G + k] = T(x[k] + T(branch[row * G + k] * weights[row * STREAMS + stream]));
     }
-""")
+"""
+    if reuse == 1:
+        return source
+    source = source.replace("i += 256", "i += THREADS").replace("c += 8", "c += NSG").replace("k += 256", "k += THREADS")
+    source = source.replace("const int n = tile * 8 + sg;", "const int n = tile * (NSG * ROWS) + sg * ROWS;")
+    source = source.replace("tile < LR / 8", "tile < LR / (NSG * ROWS)")
+    start = source.index("        float result = 0.0f;")
+    end = source.index("    } else if (INJECT", start)
+    projection = source[start:end].replace("float result = 0.0f;", "float result[ROWS] = {0};")
+    begin = projection.index("            const device uint8_t* wp =")
+    stop = projection.index("        }\n        result = simd_sum", begin)
+    rows = projection[begin:stop].replace("n * K", "(n + r) * K").replace("n * (K / GS)", "(n + r) * (K / GS)")
+    rows = rows.replace("result +=", "result[r] +=")
+    projection = projection[:begin] + "            for (int r = 0; r < ROWS; ++r) {\n" + rows + "            }\n" + projection[stop:]
+    projection = projection.replace("        result = simd_sum(result);\n        if (lane == 0) parts[(row * STREAMS + stream) * PR + n] = result;",
+                                    "        for (int r = 0; r < ROWS; ++r) {\n            result[r] = simd_sum(result[r]);\n"
+                                    "            if (lane == 0) parts[(row * STREAMS + stream) * PR + n + r] = result[r];\n        }")
+    source = source[:start] + projection + source[end:]
+    return source.replace("    const uint k = tile * 256 + t;\n    if (k < G) {",
+                          "    for (uint k = tile * THREADS + t; k < G; k += (LR / (NSG * ROWS) + INJECT) * THREADS) {")
+
+
+@functools.cache
+def _qwen4_stream_kernels():
+    if (mx.__version__ != "0.32.4" or not mx.metal.is_available()
+            or mx.device_info().get("architecture") != "applegpu_g15s"):
+        return None
+    try:
+        header = _qwen4_stream_header()
+        pragma = "#pragma clang fp contract(off) reassociate(off)\n"
+        down = mx.fast.metal_kernel(
+            name = "unsloth_qwen4_stream_norm_down",
+            input_names = ["x", "branch", "weights", "w", "inv_n", "eps", "wd", "sd", "bd", "wi", "si", "bi"],
+            output_names = ["normed", "parts", "hidden"], header = header, compile_options = _QWEN4_SAFE_MATH,
+            source = pragma + _qwen4_stream_down_source())
         up = mx.fast.metal_kernel(
             name = "unsloth_qwen4_stream_up_mix",
             input_names = ["parts", "normed", "wu", "su", "bu", "sigmoid", "inv_n", "activate", "gate"],
@@ -2272,7 +2301,8 @@ def _qwen4_decode_read(forward, module, x):
     plan = module.__dict__.get("_unsloth_qwen4_decode_plan")
     # Projections Fast Verify holds keep its arithmetic, which verify rows share.
     rows = x.size // x.shape[-1] if x.ndim == 3 and x.shape[-1] else 0
-    if (plan is None or module.input_mix_weight_down.__dict__.get("_unsloth_lane_qmm")
+    down = module.input_mix_weight_down
+    if (plan is None or (down.__dict__.get("_unsloth_lane_qmm") and not _lane_low(down, rows))
             or not 0 < rows < _QWEN4_PREFILL_MIN_ROWS or x.dtype != plan.dtype or x.shape[-1] != plan.width):
         return native(forward, module, x)
     fold = plan.fold or (getattr(offload.STAGED_FILLS, "plain_step", True)
@@ -2325,7 +2355,7 @@ def fused_qwen4_decode(model, *, _modules = None):
                                                                      ("_inject", _qwen4_decode_inject))
                      ] if target is not None else ()
             if (target is not None and os.environ.get("UNSLOTH_MLX_QWEN4_DECODE", "1") != "0"
-                    and all(hook is None or getattr(hook, "func", None) is fn for hook, fn in hooks)
+                    and all(_qwen4_decode_hook(target, hook, fn) for hook, fn in hooks)
                     and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
                     and mx.default_device() == mx.gpu and _qwen4_decode_kernels() is not None):
                 if _QWEN4_DECODE_BINDINGS[0] is None or not _bindings_intact(_QWEN4_DECODE_BINDINGS[0]):
@@ -2373,6 +2403,242 @@ def fused_qwen4_decode(model, *, _modules = None):
                     for name, fn in (("_hyper_connection", _qwen4_decode_read), ("_inject", _qwen4_decode_inject)):
                         if owner is forward and getattr(owner.__dict__.get(name), "func", None) is fn:
                             del owner.__dict__[name]
+
+
+@functools.cache
+def _qwen4_fast_hc_down(reuse):
+    if _qwen4_stream_kernels() is None:
+        return None
+    try:
+        return mx.fast.metal_kernel(
+            name = f"unsloth_qwen4_fast_hc_down_{reuse}",
+            input_names = ["x", "branch", "weights", "w", "inv_n", "eps", "wd", "sd", "bd", "wi", "si", "bi"],
+            output_names = ["normed", "parts", "hidden"], header = _qwen4_stream_header(),
+            compile_options = _QWEN4_SAFE_MATH,
+            source = "#pragma clang fp contract(off) reassociate(off)\n" + _qwen4_stream_down_source(reuse))
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        _unless_failed_buffer(error)
+        return None
+
+
+_QWEN4_FAST_HC_VERDICTS = {}
+
+
+@functools.cache
+def _qwen4_fast_hc_kernel():
+    if _qwen4_stream_kernels() is None:
+        return None
+    try:
+        return mx.fast.metal_kernel(
+            name = "unsloth_qwen4_fast_hc_mix", input_names = ["parts", "normed", "w", "s", "b"],
+            output_names = ["out", "inj"], header = _qwen4_stream_header(), source = """
+    const uint token = threadgroup_position_in_grid.y;
+    const uint tile = threadgroup_position_in_grid.x;
+    const uint worker = thread_position_in_threadgroup.x;
+    constexpr int PACK = 32 / BITS;
+    constexpr int STEP = PACK * 2;
+    constexpr int PIECES = LR / STEP;
+    constexpr int FEATURES = OUT / STREAMS;
+    constexpr int STRIDE = OUT + 1;
+    constexpr int PR = LR + STREAMS;
+    threadgroup T activated[LR];
+    threadgroup float sums[PIECES * STRIDE];
+    threadgroup float gated[OUT];
+    parts += token * STREAMS * PR;
+    normed += token * STREAMS * G;
+    for (uint j = worker; j < LR; j += THREADS) {
+        float value = 0.0f;
+        for (int h = 0; h < STREAMS; ++h) value += parts[h * PR + j];
+        value *= 1.0f / STREAMS;
+        activated[j] = T(value / (1.0f + fast::exp(-value)));
+    }
+    if (INJECT && tile == 0 && worker < STREAMS) {
+        float value = 0.0f;
+        for (int h = 0; h < STREAMS; ++h) value += parts[h * PR + LR + worker];
+        value *= 1.0f / STREAMS;
+        inj[token * STREAMS + worker] = T(2.0f / (1.0f + fast::exp(-value)));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint job = worker; job < OUT * PIECES; job += THREADS) {
+        const int local = job / PIECES;
+        const int piece = job % PIECES;
+        const int feature = tile * FEATURES + local / STREAMS;
+        const int stream = local % STREAMS;
+        const int row = stream * G + feature;
+        const int k = piece * STEP;
+        float values[STEP];
+        const float total = load_vector_tg<T, float, STEP, BITS>(activated + k, values);
+        const device uint8_t* codes = (const device uint8_t*)w + row * LR * BITS / 8 + k * BITS / 8;
+        const int group = row * (LR / GS) + k / GS;
+        sums[piece * STRIDE + local] = qdot<float, STEP, BITS>(codes, values, float(s[group]), float(b[group]), total);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (worker < OUT) {
+        float value = 0.0f;
+        for (int piece = 0; piece < PIECES; ++piece) value += sums[piece * STRIDE + worker];
+        const int feature = tile * FEATURES + worker / STREAMS;
+        const int stream = worker % STREAMS;
+        gated[worker] = float(normed[stream * G + feature]) / (1.0f + fast::exp(-value));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (worker < FEATURES) {
+        const float left = gated[worker * STREAMS] + gated[worker * STREAMS + 1];
+        const float right = gated[worker * STREAMS + 2] + gated[worker * STREAMS + 3];
+        out[token * G + tile * FEATURES + worker] = T((left + right) * (1.0f / STREAMS));
+    }
+""")
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        _unless_failed_buffer(error)
+        return None
+
+
+def _qwen4_fast_hc_plan(module):
+    exact = vars(module).get("_unsloth_qwen4_decode_plan")
+    down, up = module.input_mix_weight_down, module.input_mix_weight_up
+    inject = "block_inject_weight" in module
+    projection = module.block_inject_weight if inject else None
+    if (exact is None or exact.bounded is None or module.training or exact.dtype != mx.bfloat16
+            or (module.hidden_size, module.hc_count, down.weight.shape[0]) != (2560, 4, 320)
+            or (down.bits, down.group_size, up.bits, up.group_size) != (4, 32, 4, 32)
+            or inject and not _qwen4_inject_qmv(projection, 4, 10240, mx.bfloat16)
+            or _qwen4_fast_hc_kernel() is None):
+        return None
+    unused = mx.zeros((8,), mx.bfloat16)
+    constants = [_qwen4_scalar(1.0 / 2560, mx.float32), _qwen4_scalar(module.hc_norm.eps, mx.float32)]
+    template = [("T", mx.bfloat16), ("G", 2560), ("STREAMS", 4), ("LR", 320), ("BITS", 4),
+                ("GS", 32), ("INJECT", inject)]
+    key = (inject, projection.bits if inject else 4, projection.group_size if inject else 32)
+
+    kernels = _qwen4_stream_kernels()
+    mix = _qwen4_fast_hc_kernel()
+    norm_down = {1: kernels[0], 2: _qwen4_fast_hc_down(2), 4: _qwen4_fast_hc_down(4)}
+    if any(kernel is None for kernel in norm_down.values()):
+        return None
+    down_template = [*template, ("IBITS", key[1]), ("IGS", key[2])]
+    up_template = [*template, ("OUT", 64), ("THREADS", 320)]
+
+    def launch(x, folded):
+        rows = x.size // x.shape[-1]
+        verdict_key = (*key, rows, folded is not None)
+        if _QWEN4_FAST_HC_VERDICTS.get(verdict_key) is False:
+            return None
+        n, d, u = module.hc_norm, module.input_mix_weight_down, module.input_mix_weight_up
+        branch, weights, hidden = folded or (unused, unused, x)
+        reuse = 1 if rows < 3 else 2 if rows <= 4 else 4
+        row_template = [] if reuse == 1 else [("NSG", 8), ("THREADS", 256), ("ROWS", reuse)]
+        normed, parts, h = norm_down[reuse](
+            inputs = [hidden, branch, weights, n.weight, *constants, d.weight, d.scales, d.biases,
+                      *((projection.weight, projection.scales, projection.biases) if inject else (unused,) * 3)],
+            template = [*down_template, *row_template, ("FOLD", folded is not None)],
+            grid = (256, 4 * (320 // (8 * reuse) + inject), rows), threadgroup = (256, 1, 1),
+            output_shapes = [x.shape, (rows, 4, 324), x.shape if folded else (1,)],
+            output_dtypes = [x.dtype, mx.float32, x.dtype])
+        mixed, injection = mix(
+            inputs = [parts, normed, u.weight, u.scales, u.biases],
+            template = up_template, grid = (320 * 160, rows, 1),
+            threadgroup = (320, 1, 1), output_shapes = [(*x.shape[:-1], 2560),
+                                                       (*x.shape[:-1], 4) if inject else (1,)],
+            output_dtypes = [x.dtype] * 2)
+        output = (mixed, h if folded else x, injection) if inject else mixed
+        if verdict_key not in _QWEN4_FAST_HC_VERDICTS:
+            _staged_ready()
+            try:
+                leaves = output if inject else (output,)
+                good = _settled(all(bool(mx.all(mx.isfinite(value)).item()) for value in leaves))
+            except (RuntimeError, ValueError) as error:
+                _unless_failed_buffer(error)
+                return None
+            _QWEN4_FAST_HC_VERDICTS[verdict_key] = good
+            if not good:
+                return None
+        return output
+
+    return launch
+
+
+def _qwen4_fast_hc_read(forward, module, x):
+    fallback = forward._unsloth_qwen4_fast_hc_native
+    plan = vars(module).get("_unsloth_qwen4_fast_hc_plan")
+    rows = x.size // x.shape[-1] if x.ndim == 3 and x.shape[-1] == 10240 else 0
+    if (plan is None or not getattr(_VERIFY_STATE, "lane", False) or module.training
+            or not module.input_mix_weight_down.__dict__.get("_unsloth_lane_verify_scopes")
+            or not 0 < rows <= 9 or x.dtype != mx.bfloat16):
+        return fallback(module, x)
+    exact = module._unsloth_qwen4_decode_plan
+    pending = _qwen4_pending_inject(x) if exact.fold else None
+    folded = ((pending[0], pending[2], pending[1])
+              if pending is not None and pending[2].shape[-1] == exact.streams else None)
+    try:
+        output = plan(x, folded)
+    except (RuntimeError, ValueError) as error:
+        _unless_failed_buffer(error)
+        return fallback(module, x)
+    if output is None:
+        return fallback(module, x)
+    _QWEN4_LAST_INJECT.slot = None
+    return output
+
+
+@contextmanager
+def fast_qwen4_hc(model, *, _modules = None):
+    """Fast Verify's Qwen4-Exp read: short FP32 chunks and one rounded stream mix.
+
+    Only the speculative lane scope owns these plans. Eligibility is settled on entry, as in fused_qwen4_decode;
+    the target's per-call lane marker keeps concurrent plain and exact calls on their original route.
+    """
+    changed, forward = [], None
+    try:
+        with _QWEN4_DECODE_LOCK:
+            language = sys.modules.get("mlx_vlm.models.qwen4_exp.language")
+            target = getattr(language, "_QWEN4_BATCH_INVARIANT_FORWARD", None)
+            hook = vars(target).get("_hyper_connection") if target is not None else None
+            if (target is not None and _fast_verify_held(model)
+                    and getattr(hook, "func", None) in (_qwen4_decode_read, _qwen4_fast_hc_read)
+                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                    and mx.default_device() == mx.gpu):
+                seen = set()
+                for _, module in _fusion_modules(model, _modules):
+                    if (not isinstance(module, language.Qwen4ExpGatedResidual) or id(module) in seen
+                            or not module.input_mix_weight_down.__dict__.get("_unsloth_lane_verify_scopes")):
+                        continue
+                    scopes = vars(module).get("_unsloth_qwen4_fast_hc_scopes", 0)
+                    if not scopes:
+                        plan = _qwen4_fast_hc_plan(module)
+                        if plan is None:
+                            continue
+                        vars(module)["_unsloth_qwen4_fast_hc_plan"] = plan
+                    module._unsloth_qwen4_fast_hc_scopes = scopes + 1
+                    changed.append(module)
+                    seen.add(id(module))
+                if changed:
+                    depth = vars(target).get("_unsloth_qwen4_fast_hc_scopes", 0)
+                    if not depth:
+                        target._unsloth_qwen4_fast_hc_native = target._hyper_connection
+                        target._hyper_connection = functools.partial(_qwen4_fast_hc_read, target)
+                    target._unsloth_qwen4_fast_hc_scopes = depth + 1
+                    forward = target
+        yield model
+    finally:
+        with _QWEN4_DECODE_LOCK:
+            for owner in changed + ([forward] if forward is not None else []):
+                owner._unsloth_qwen4_fast_hc_scopes -= 1
+                if not owner._unsloth_qwen4_fast_hc_scopes:
+                    owner.__dict__.pop("_unsloth_qwen4_fast_hc_scopes", None)
+                    owner.__dict__.pop("_unsloth_qwen4_fast_hc_plan", None)
+                    if owner is forward:
+                        held = owner.__dict__.pop("_unsloth_qwen4_fast_hc_native")
+                        if getattr(vars(owner).get("_hyper_connection"), "func", None) is _qwen4_fast_hc_read:
+                            owner._hyper_connection = held
+
+
+def _qwen4_decode_hook(target, hook, native):
+    if hook is None or getattr(hook, "func", None) is native:
+        return True
+    if native is not _qwen4_decode_read:
+        return False
+    return (getattr(hook, "func", None) is _qwen4_fast_hc_read
+            and vars(target).get("_unsloth_qwen4_fast_hc_scopes", 0) > 0
+            and getattr(vars(target).get("_unsloth_qwen4_fast_hc_native"), "func", None) is native)
 
 
 def _single_row(x):
@@ -4983,8 +5249,8 @@ def _plain_moe_plan(block, experts, rows = 1):
                    common.gate_proj, common.up_proj, common.down_proj)
     dense = (*projections[3:], block.shared_expert_gate, block.gate)
     if (any(type(p) is not experts.projection_type for p in projections[:3])
-            or any(not isinstance(p, nn.QuantizedLinear) or (type(p).__call__ is not nn.QuantizedLinear.__call__
-                   and type(p).__call__ not in _ONE_ROW_STOCK_CALLS) for p in dense)):
+            or any(not isinstance(p, nn.QuantizedLinear) or (_stock_call(p, rows) is not nn.QuantizedLinear.__call__
+                   and _stock_call(p, rows) not in _ONE_ROW_STOCK_CALLS) for p in dense)):
         return None
     if any(p.training or getattr(p, "bits", None) != 4 or p.group_size != 32 or p.mode != "affine" or "bias" in p
            or len(_projection_tensors(p)) != 3 or p.scales.dtype != mx.bfloat16 or p.biases.dtype != mx.bfloat16 for p in projections):
@@ -5064,6 +5330,9 @@ class _RoutedExperts:
         if rows not in self.verify_plans:
             try:
                 existing = next((plan for plan in self.verify_plans.values() if plan is not None), None)
+                if existing is not None and any(_stock_call(p, rows) is not _stock_call(p, existing.shape[1])
+                                                for p in existing.projections):
+                    existing = None   # Fast Verify's lane kernel holds this width's projections
                 self.verify_plans[rows] = (existing.for_rows(rows) if existing is not None else
                                            _plain_moe_plan(block, self, rows))
             except (RuntimeError, ValueError, TypeError) as error:
@@ -5123,7 +5392,8 @@ class _RoutedExperts:
         projections = (expert.gate_proj, expert.up_proj, expert.down_proj)
         mlp = self.mlp
         quant = (mlp.gate_proj.group_size, mlp.gate_proj.bits, mlp.gate_proj.mode)
-        if (quant[1] != 4 or quant[2] != "affine" or any(not isinstance(p, nn.QuantizedLinear) or hasattr(type(p), "_unsloth_lane_native") or "bias" in p for p in projections)):
+        if (quant[1] != 4 or quant[2] != "affine" or any(not isinstance(p, nn.QuantizedLinear) or "bias" in p or (
+                hasattr(type(p), "_unsloth_lane_native") and not _lane_low(p, x.size // x.shape[-1])) for p in projections)):
             return None
         common = tuple(map(_projection_tensors, projections))
         if not all(_rows_packed(t) for group in common for t in group):
@@ -7747,7 +8017,7 @@ def _qmv_rows_kernel(p):
     arrays, settled = (p.get("weight"), p.get("scales"), p.get("biases")), p.__dict__.get("_unsloth_qmv_rows")
     # The kernel bypasses the layer's call, so it must be one whose one-row result is the stock one; zoo's own
     # wrappers count as stock, so a projection settled at load keeps its verdict when generation installs them.
-    call, linear = type(p).__call__, nn.QuantizedLinear.__call__
+    call, linear = _stock_call(p, 1), nn.QuantizedLinear.__call__
     stock = isinstance(p, nn.QuantizedLinear) and (call is linear or call in _ONE_ROW_STOCK_CALLS)
     quantized = (stock, linear, *(getattr(p, name, None) for name in ("group_size", "bits", "mode")))
     if settled is not None and all(a is b for a, b in zip(settled[0], arrays)) and settled[1] == quantized:
@@ -7931,7 +8201,7 @@ def _native_causal_attention(queries, keys, values, scale, cache, mask, per_row)
     rows_kernel = blocks is not None and _exact_attention_kernels() is not None
     one_pass = lambda: _exact_attention_rows(queries, keys, values, scale, blocks)
     fits = length <= getattr(_VERIFY_STATE, "causal_rows", _NATIVE_CAUSAL_ROWS)
-    if getattr(_VERIFY_STATE, "lane", False):
+    if getattr(_VERIFY_STATE, "lane", False) and not getattr(_VERIFY_STATE, "lane_low", False):
         if not rows_kernel:
             return chunked() if fits else None
         key = (queries.shape[:3], "causal attention", keys.shape[1], queries.dtype, dim, blocks)
@@ -8940,9 +9210,24 @@ def native_lane_projections():
         _LANE_STATE.native = outer
 
 
+# Fast Verify leaves small affine projections on the exact routes; its fused family kernels have their own bounds.
+_LANE_LOW_ROWS = int(os.environ.get("UNSLOTH_MLX_FAST_VERIFY_LOW_ROWS", "4"))
+
+
+def _lane_low(module, rows):
+    return rows <= _LANE_LOW_ROWS and bool(module.__dict__.get("_unsloth_lane_verify_scopes"))
+
+
+def _stock_call(p, rows):
+    """`type(p).__call__`, or the stock call Fast Verify's lane wrapper keeps for calls of `rows` rows."""
+    native = vars(type(p)).get("_unsloth_lane_native")
+    return native.__call__ if native is not None and _lane_low(p, rows) else type(p).__call__
+
+
 def _lane_rows(module, x, bindings):
     """`module`'s projection of x on the lane kernel where `row_invariant_lane_projections` covers it, or None."""
-    if not module.__dict__.get("_unsloth_lane_qmm") or getattr(_LANE_STATE, "native", False):
+    if (not module.__dict__.get("_unsloth_lane_qmm") or getattr(_LANE_STATE, "native", False)
+            or (isinstance(x, mx.array) and x.ndim and x.shape[-1] and _lane_low(module, x.size // x.shape[-1]))):
         return None
     most = matmul.LANE_QMM_MAX_ROWS
     if isinstance(x, mx.array) and x.ndim > 2 and x.size // x.shape[-1] > most >= x.shape[-2]:
@@ -9016,14 +9301,19 @@ def _lane_verify_class(base):
 
     def verify(self, language_model, *args, **kwargs):
         outer = getattr(_VERIFY_STATE, "lane", False)
+        inputs, outer_low = args[0] if args else kwargs.get("inputs"), getattr(_VERIFY_STATE, "lane_low", False)
         _VERIFY_STATE.lane = bool(getattr(language_model, "_unsloth_lane_verify_scopes", 0)) and not language_model.training
+        _VERIFY_STATE.lane_low = (_VERIFY_STATE.lane and isinstance(inputs, mx.array) and inputs.ndim == 2
+                                  and _lane_low(language_model, inputs.size))
         try:
             return getattr(base, entry)(self, language_model, *args, **kwargs)
         finally:
-            _VERIFY_STATE.lane = outer
+            _VERIFY_STATE.lane, _VERIFY_STATE.lane_low = outer, outer_low
 
     def linear(self, p, x):
         y = _verify_lane(p, x, self._unsloth_lane_bindings)
+        if y is None and isinstance(p, _TargetHeadFP32) and _lane_low(p.base_head, x.size // x.shape[-1]):
+            p = p.base_head
         return base._linear(self, p, x) if y is None else y
 
     def linears(self, ps, x):
@@ -9038,16 +9328,19 @@ def _lane_verify_class(base):
         return base._embedding_as_linear(self, embedding, x) if y is None else y
 
     # mlx-vlm's fused heads read a covered head's codes themselves; declining them leaves its call to the module.
+    def lane_head(linear):
+        return linear.__dict__.get("_unsloth_lane_qmm") and not getattr(_VERIFY_STATE, "lane_low", False)
+
     def quantized_linear(self, linear, x):
-        return None if linear.__dict__.get("_unsloth_lane_qmm") else base.quantized_linear(self, linear, x)
+        return None if lane_head(linear) else base.quantized_linear(self, linear, x)
 
     def quantized_argmax(self, linear, x, token_mask = None):
-        if linear.__dict__.get("_unsloth_lane_qmm"):
+        if lane_head(linear):
             return None
         return base.quantized_argmax(self, linear, x, token_mask = token_mask)
 
     def can_quantized_head(self, linear):
-        return not linear.__dict__.get("_unsloth_lane_qmm") and base.can_quantized_head(self, linear)
+        return not lane_head(linear) and base.can_quantized_head(self, linear)
 
     return _moe_verifier_class(type(f"_LaneVerify{base.__name__}", (base,), {
         entry: verify, "_linear": linear, "_linears": linears, "_embedding_as_linear": embedding_as_linear,
@@ -9220,14 +9513,12 @@ def _lane_coverage(model, modules):
 
 @contextmanager
 def row_invariant_lane_projections(model, *, _modules = None):
-    """Fast Verify, in speculative calls: greedy output that does not depend on how many rows a forward carries, so a
-    speculative generation returns the one-token greedy output of its own arithmetic. Every affine 2- to 8-bit
-    projection called with 1 to 32 rows, in decode steps, heads and verify blocks alike, runs on the `matmul.lane_qmm`
-    kernel, whose rows do not depend on the call; the exact verifier reproduces one-token decoding for the rest.
-
-    Not stock's bits, so not default decoding's output: a row is within fp32 reordering of stock's products. Each shape
-    is checked against stock on first use and a subprocess probe gates the kernel; `UNSLOTH_MLX_LANE_QMM=0` turns the
-    mode off with it, and other, training and distributed models keep their methods.
+    """Fast Verify, in speculative calls: every affine 2- to 8-bit projection called with more than `_LANE_LOW_ROWS`
+    and up to 32 rows, in decode steps, heads and verify blocks alike, runs on the `matmul.lane_qmm` kernel, whose rows
+    do not depend on the call; fewer rows keep stock's arithmetic on the exact verifier's routes. Output is not default
+    decoding's and may depend on row counts. Each shape is checked against stock on first use and a subprocess probe
+    gates the kernel; `UNSLOTH_MLX_LANE_QMM=0` turns the mode off with it, `UNSLOTH_MLX_FAST_VERIFY_LOW_ROWS=0` puts
+    every row count on the kernel, and other, training and distributed models keep their methods.
     """
     owners, verifier = [], None
     try:
@@ -9426,7 +9717,8 @@ class _TargetHeadFP32(nn.Module):
                 or type(p) is not self._head_type or type(p).__call__ is not self._head_call
                 or not _bindings_intact(self._bindings) or not isinstance(x, mx.array) or x.ndim < 2
                 or not x.shape[-1] or not x.size or x.dtype not in (mx.bfloat16, mx.float16)
-                or self._layout != (p.group_size, p.bits, p.mode) or not p.__dict__.get("_unsloth_lane_qmm")):
+                or self._layout != (p.group_size, p.bits, p.mode) or not p.__dict__.get("_unsloth_lane_qmm")
+                or _lane_low(p, x.size // x.shape[-1])):
             return p(x)
         most = matmul.LANE_QMM_MAX_ROWS
         if x.size // x.shape[-1] <= most:
@@ -9511,6 +9803,7 @@ def lane_drafter_head(model, head) -> bool:
     if model.get("lm_head") is not head or not isinstance(head, nn.QuantizedLinear):
         return False
     own = copy.copy(head)
+    own.__dict__.pop("_unsloth_lane_verify_scopes", None)   # the target's Fast Verify scope, which a drafter's head is not in
     if "_unsloth_lane_native" in vars(type(own)):
         own.__class__ = type(own)._unsloth_lane_native
     if not lane_drafter_projections(own):
@@ -11118,6 +11411,7 @@ INFERENCE_SCOPES = [
     InferenceScope(row_invariant_attention, speculative = True, fast_verify = True),
     InferenceScope(row_invariant_tree_verify, speculative = True, fast_verify = True),
     InferenceScope(target_head_precision, speculative = True, fast_verify = True),
+    InferenceScope(fast_qwen4_hc, speculative = True, fast_verify = True),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),
     InferenceScope(fused_decode_attention),
     InferenceScope(exact_ple_row_reads),
@@ -11136,7 +11430,7 @@ def inference_scopes(model, call = None, *, int8_prefill = None, ane_prefill = N
     given: then `on_error(name, error)` runs and, if it returns, the generation continues without that scope.
 
     `fast_verify=True`, or `UNSLOTH_MLX_FAST_VERIFY=1` when it is None, runs every speculative speedup that changes
-    decode bits, in a call naming "speculative": its greedy output is within fp32 reordering of stock's, not equal to it.
+    decode bits, in a call naming "speculative": projections and reductions may round differently from stock.
     A plain generation stays stock whatever this says. The outermost scope decides,
     and a model with a drafter keeps what `companion_drafter(fast_verify = ...)` pinned, refusing the opposite request.
     `fast_verify_available(model)` says whether it takes effect here.

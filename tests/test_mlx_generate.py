@@ -2397,6 +2397,11 @@ def test_target_head_runs_more_rows_than_one_lane_launch_in_fp32_launches(monkey
     del head.__dict__["_unsloth_lane_qmm_ready"][(1, 8, 64)]
     launches.clear()
     assert fp32(x).dtype == mx.bfloat16 and launches == [32]
+    head.__dict__["_unsloth_lane_qmm_ready"][(1, 4, 64)], head._unsloth_lane_verify_scopes = (None, signature), 1
+    for low in (3, 4):
+        monkeypatch.setattr(inference, "_LANE_LOW_ROWS", low)
+        launches.clear()
+        assert (fp32(x[:1, :4]).dtype, launches) == ((mx.float32, [4]) if low < 4 else (mx.bfloat16, []))
 
 
 def test_stop_string_trims_device_logprobs_with_the_tokens():

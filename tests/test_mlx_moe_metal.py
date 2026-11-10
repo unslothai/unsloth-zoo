@@ -401,6 +401,24 @@ def test_plain_moe_qwen4_leaves_speculative_calls_native():
         assert not routed.plain_built
 
 
+@pytest.mark.parametrize("low", [0, 4])
+def test_verify_moe_qwen4_takes_fast_verify_blocks_unless_lanes_hold_them(low, monkeypatch):
+    block = _plain_qwen4(256)
+    inputs = {rows: mx.ones((1, rows, 512), mx.bfloat16) for rows in (3, 5)}
+    references = {rows: mx.concatenate([block(x[:, i:i + 1]) for i in range(rows)], axis = 1) for rows, x in inputs.items()}
+    mx.eval(references)
+    monkeypatch.setattr(fusion, "_LANE_LOW_ROWS", low)
+    with fusion.inference_scopes(block):
+        for p in (block.shared_expert.gate_proj, block.shared_expert.up_proj, block.shared_expert.down_proj):
+            p._unsloth_lane_verify_scopes = 1
+            p.__class__ = fusion._lane_module_class(type(p))
+        experts = block._unsloth_moe_routed
+        assert (fusion._plain_moe_plan(block, experts, 3) is not None) == bool(low)
+        for rows in (3, 5):   # a plan admitted within the threshold is not reused past it
+            _equal(experts.verify(block, inputs[rows], lambda: references[rows]), references[rows])
+        assert [experts.verify_plans[rows] is not None for rows in (3, 5)] == [bool(low), False]
+
+
 @pytest.mark.parametrize("width", [64, 128])
 def test_plain_moe_qwen4_keeps_native_quad_shared_projection(width):
     block, x = _plain_qwen4(width), mx.ones((1, 1, 512), mx.bfloat16)
