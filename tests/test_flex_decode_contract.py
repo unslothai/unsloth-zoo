@@ -59,12 +59,35 @@ def official_gpt_oss_sdpa(Q, K, V, S, sm_scale, sliding_window = 0):
     return attn.reshape(n_tokens, -1)
 
 
-def visible(q_pos, kv_pos, window, real):
-    """The rule every decode mask must follow: causal, within W tokens including the query, a real token."""
-    ok = (kv_pos <= q_pos) and real
-    if window:
-        ok = ok and kv_pos > q_pos - window
-    return ok
+def visible(mask_2d, window, kv_offset = 0, kv_length = None):
+    """[B, kv_length] the rule every decode mask must follow for the query at mask_2d's last column: causal, within W
+    tokens including the query, a real (written, unpadded) token."""
+    q = mask_2d.shape[1] - 1
+    kv = kv_offset + torch.arange(kv_length or q + 1)
+    ok = (kv <= q) & torch.nn.functional.pad(mask_2d.bool(), (0, max(0, int(kv[-1]) - q)))[:, kv]
+    return ok & (kv > q - window) if window else ok
+
+
+def _pads(S_len, *pads):
+    mask_2d = torch.ones(len(pads), S_len, dtype = torch.long)
+    for b, p in enumerate(pads):
+        mask_2d[b, :p] = 0
+    return mask_2d
+
+
+def _qkv(B, Hq, Hkv, S_len, d, seed):
+    g = torch.Generator().manual_seed(seed)
+    rand = lambda *shape: torch.randn(*shape, generator = g, dtype = torch.float64)
+    return rand, rand(B, Hq, 1, d), rand(B, Hkv, S_len, d), rand(B, Hkv, S_len, d)
+
+
+class _Attn(torch.nn.Module):
+    num_key_value_groups = 2
+    is_causal = True
+
+
+def _close(got, want):
+    torch.testing.assert_close(got, want, rtol = 1e-10, atol = 1e-12)
 
 
 def effective_mask(block_mask, rows, kv_length):
@@ -80,135 +103,69 @@ def effective_mask(block_mask, rows, kv_length):
 
 
 @pytest.mark.parametrize("window", [0, 128])
-def test_mask_follows_the_visibility_rule_across_blocks_padding_and_unwritten_slots(window):
+def test_mask_follows_the_visibility_rule_and_matches_transformers_mask_functions(window):
+    from transformers.masking_utils import sliding_window_causal_mask_function, causal_mask_function
+    fn = sliding_window_causal_mask_function(window) if window else causal_mask_function
     pads = [0, 37, 170]
     rows = len(pads)
     for q in [0, 5, 127, 128, 129, 200, 255, 256, 300, 400]:
-        if window:
-            kv_length, kv_offset = window, max(0, q - window + 1)
-        else:
-            kv_length, kv_offset = 512, 0
-        width = q + 1
-        mask_2d = torch.ones(rows, width, dtype = torch.long)
-        for b, p in enumerate(pads):
-            mask_2d[b, :min(p, width)] = 0
+        kv_length, kv_offset = (window, max(0, q - window + 1)) if window else (512, 0)
+        mask_2d = _pads(q + 1, *pads)
         bm = D.decode_block_mask(
             rows, kv_length, torch.tensor(q), torch.tensor(kv_offset), attention_mask = mask_2d, window = window,
             device = "cpu",
         )
-        got = effective_mask(bm, rows, kv_length)
-        want = torch.tensor([
-            [visible(q, kv_offset + j, window, (kv_offset + j) < width and bool(mask_2d[b, kv_offset + j]))
-             for j in range(kv_length)]
-            for b in range(rows)
-        ])
-        assert torch.equal(got, want), (q, window)
-
-
-def test_mask_matches_transformers_mask_functions():
-    from transformers.masking_utils import sliding_window_causal_mask_function, causal_mask_function
-    for window, fn in ((0, causal_mask_function), (128, sliding_window_causal_mask_function(128))):
-        for q in [3, 127, 128, 333]:
-            kv_length, kv_offset = (128, max(0, q - 127)) if window else (384, 0)
-            ours = D.decode_block_mask(2, kv_length, torch.tensor(q), torch.tensor(kv_offset), window = window, device = "cpu")
-            theirs = D.decode_block_mask(2, kv_length, torch.tensor(q), torch.tensor(kv_offset), mask_function = fn, device = "cpu")
-            assert torch.equal(effective_mask(ours, 2, kv_length), effective_mask(theirs, 2, kv_length))
-
-
-def _decode_inputs(n_tokens, n_kv, q_mult, d, seed, sink_scale = 1.0):
-    g = torch.Generator().manual_seed(seed)
-    Q = torch.randn(n_tokens, n_kv, q_mult, d, generator = g, dtype = torch.float64)
-    K = torch.randn(n_tokens, n_kv, d, generator = g, dtype = torch.float64)
-    V = torch.randn(n_tokens, n_kv, d, generator = g, dtype = torch.float64)
-    S = torch.randn(n_kv * q_mult, generator = g, dtype = torch.float64) * sink_scale
-    return Q, K, V, S
+        want = visible(mask_2d, window, kv_offset, kv_length)
+        assert torch.equal(effective_mask(bm, rows, kv_length), want), (q, window)
+        theirs = D.decode_block_mask(rows, kv_length, torch.tensor(q), torch.tensor(kv_offset), mask_function = fn, device = "cpu")
+        assert torch.equal(effective_mask(theirs, rows, kv_length), want[:1].expand(rows, -1)), (q, window)
 
 
 @pytest.mark.parametrize("window", [0, 16])
 @pytest.mark.parametrize("sink_scale", [1.0, 30.0])
 def test_sinks_match_the_official_gpt_oss_attention(window, sink_scale):
     n_tokens, n_kv, q_mult, d = 40, 2, 4, 16
-    Q, K, V, S = _decode_inputs(n_tokens, n_kv, q_mult, d, seed = 3 + window, sink_scale = sink_scale)
-    scale = d ** -0.5
-    want = official_gpt_oss_sdpa(Q, K, V, S, scale, window)[-1].view(n_kv * q_mult, d)
-    q = Q[-1].reshape(1, n_kv * q_mult, 1, d)
-    k = K.permute(1, 0, 2).unsqueeze(0)
-    v = V.permute(1, 0, 2).unsqueeze(0)
+    g = torch.Generator().manual_seed(3 + window)
+    Q, K, V = (torch.randn(n_tokens, n_kv, *s, d, generator = g, dtype = torch.float64) for s in ((q_mult,), (), ()))
+    S = torch.randn(n_kv * q_mult, generator = g, dtype = torch.float64) * sink_scale
+    want = official_gpt_oss_sdpa(Q, K, V, S, d ** -0.5, window)[-1].view(n_kv * q_mult, d)
     bm = D.decode_block_mask(1, n_tokens, torch.tensor(n_tokens - 1), window = window, device = "cpu")
-    got = D.flex_decode_attention(q, k, v, bm, scale, sinks = S)[0, :, 0, :]
-    torch.testing.assert_close(got, want, rtol = 1e-10, atol = 1e-12)
+    got = D.flex_decode_attention(Q[-1].reshape(1, -1, 1, d), K.permute(1, 0, 2)[None], V.permute(1, 0, 2)[None], bm, d ** -0.5, sinks = S)
+    _close(got[0, :, 0, :], want)
 
 
-def test_an_all_masked_row_returns_exact_zeros_with_and_without_sinks():
-    d, n_kv, q_mult, S_len = 16, 2, 2, 64
-    g = torch.Generator().manual_seed(0)
-    q = torch.randn(2, n_kv * q_mult, 1, d, generator = g, dtype = torch.float64)
-    k = torch.randn(2, n_kv, S_len, d, generator = g, dtype = torch.float64)
-    v = torch.randn(2, n_kv, S_len, d, generator = g, dtype = torch.float64)
-    mask_2d = torch.ones(2, S_len, dtype = torch.long)
-    mask_2d[1] = 0  # row 1 is all padding
-    bm = D.decode_block_mask(2, S_len, torch.tensor(S_len - 1), attention_mask = mask_2d, device = "cpu")
-    for sinks in (None, torch.randn(n_kv * q_mult, generator = g, dtype = torch.float64)):
+@pytest.mark.parametrize("window", [0, 128])
+def test_sinks_unequal_heads_left_padding_and_an_all_masked_row_match_the_reference(window):
+    d, S_len = 32, 200
+    _, q, k, v = _qkv(4, 8, 2, S_len, d, seed = 7)
+    k = k * 3
+    mask_2d = _pads(S_len, 0, 90, 199, S_len)  # row 3 is all padding
+    bm = D.decode_block_mask(4, S_len, torch.tensor(S_len - 1), attention_mask = mask_2d, window = window, device = "cpu")
+    for sinks in (None, torch.linspace(-20, 20, 8, dtype = torch.float64)):
         out = D.flex_decode_attention(q, k, v, bm, d ** -0.5, sinks = sinks)
         assert torch.isfinite(out).all()
-        assert torch.equal(out[1], torch.zeros_like(out[1]))
-        ref = D._eager_attention(q, k, v, mask_2d.bool().view(2, 1, 1, S_len), d ** -0.5, sinks = sinks)
-        torch.testing.assert_close(out, ref, rtol = 1e-10, atol = 1e-12)
-
-
-def test_sinks_with_unequal_heads_and_left_padding_match_the_reference():
-    d, n_kv, q_mult, S_len = 32, 2, 4, 200
-    g = torch.Generator().manual_seed(7)
-    q = torch.randn(3, n_kv * q_mult, 1, d, generator = g, dtype = torch.float64)
-    k = torch.randn(3, n_kv, S_len, d, generator = g, dtype = torch.float64) * 3
-    v = torch.randn(3, n_kv, S_len, d, generator = g, dtype = torch.float64)
-    sinks = torch.linspace(-20, 20, n_kv * q_mult, dtype = torch.float64)
-    mask_2d = torch.ones(3, S_len, dtype = torch.long)
-    mask_2d[1, :90] = 0
-    mask_2d[2, :199] = 0
-    for window in (0, 128):
-        bm = D.decode_block_mask(3, S_len, torch.tensor(S_len - 1), attention_mask = mask_2d, window = window, device = "cpu")
-        dense = torch.tensor([[visible(S_len - 1, j, window, bool(mask_2d[b, j])) for j in range(S_len)] for b in range(3)])
-        ref = D._eager_attention(q, k, v, dense.view(3, 1, 1, S_len), d ** -0.5, sinks = sinks)
-        out = D.flex_decode_attention(q, k, v, bm, d ** -0.5, sinks = sinks)
-        torch.testing.assert_close(out, ref, rtol = 1e-10, atol = 1e-12)
+        assert torch.equal(out[3], torch.zeros_like(out[3]))
+        _close(out, D._eager_attention(q, k, v, visible(mask_2d, window)[:, None, None, :], d ** -0.5, sinks = sinks))
 
 
 def test_softcap_never_leaks_through_masked_keys():
     # Masked keys get enormous scores: capping them must not make them visible (cap first, then mask).
     d, S_len, cap = 16, 96, 30.0
-    g = torch.Generator().manual_seed(11)
-    q = torch.randn(1, 4, 1, d, generator = g, dtype = torch.float64)
-    k = torch.randn(1, 4, S_len, d, generator = g, dtype = torch.float64)
-    v = torch.randn(1, 4, S_len, d, generator = g, dtype = torch.float64)
+    _, q, k, v = _qkv(1, 4, 4, S_len, d, seed = 11)
     k[:, :, :50] = q[:, :, :1] * 1e4  # left padding with dominant scores
-    mask_2d = torch.ones(1, S_len, dtype = torch.long)
-    mask_2d[:, :50] = 0
-    bm = D.decode_block_mask(1, S_len, torch.tensor(S_len - 1), attention_mask = mask_2d, device = "cpu")
+    bm = D.decode_block_mask(1, S_len, torch.tensor(S_len - 1), attention_mask = _pads(S_len, 50), device = "cpu")
     out = D.flex_decode_attention(q, k, v, bm, d ** -0.5, softcap = cap)
     scores = (q @ k[..., 50:, :].transpose(-1, -2)) * d ** -0.5
     want = torch.softmax(cap * torch.tanh(scores / cap), dim = -1) @ v[..., 50:, :]
-    torch.testing.assert_close(out, want, rtol = 1e-10, atol = 1e-12)
-
-
-def _refill(static, fresh):
-    """What CUDA-graph decode does each step: copy the new mask's tensors into the captured mask's buffers."""
-    for a, b in zip(static["fields"], (fresh.kv_num_blocks, fresh.kv_indices)):
-        a.copy_(b)
-    for a, b in zip(static["closure"], fresh._unsloth_graph_closure[0]):
-        a.copy_(b)
+    _close(out, want)
 
 
 @pytest.mark.parametrize("window", [0, 128])
 def test_one_block_mask_refilled_for_300_steps_equals_a_fresh_mask_each_step(window):
-    from torch.nn.attention.flex_attention import BlockMask
     rows, d, start = 2, 16, 20
     kv_length = window or 512
-    g = torch.Generator().manual_seed(5)
-    k = torch.randn(rows, 2, kv_length, d, generator = g, dtype = torch.float64)
-    v = torch.randn(rows, 2, kv_length, d, generator = g, dtype = torch.float64)
-    mask_2d = torch.ones(rows, start + 300, dtype = torch.long)
-    mask_2d[1, :13] = 0
+    rand, _, k, v = _qkv(rows, 4, 2, kv_length, d, seed = 5)
+    mask_2d = _pads(start + 300, 0, 13)
 
     def fresh_at(t):
         q = start + t
@@ -218,27 +175,25 @@ def test_one_block_mask_refilled_for_300_steps_equals_a_fresh_mask_each_step(win
 
     first = fresh_at(0)
     tensors, rebuild = first._unsloth_graph_closure
-    static = {
-        "fields": (first.kv_num_blocks.clone(), first.kv_indices.clone()),
-        "closure": tuple(t.clone() for t in tensors),
-    }
-    captured = BlockMask.from_kv_blocks(
-        static["fields"][0], static["fields"][1], BLOCK_SIZE = first.BLOCK_SIZE, mask_mod = rebuild(static["closure"]),
-        seq_lengths = first.seq_lengths,
+    fields = (first.kv_num_blocks.clone(), first.kv_indices.clone())
+    closure = tuple(t.clone() for t in tensors)
+    captured = flex.BlockMask.from_kv_blocks(
+        *fields, BLOCK_SIZE = first.BLOCK_SIZE, mask_mod = rebuild(closure), seq_lengths = first.seq_lengths,
     )
     for t in range(300):
         fresh = fresh_at(t)
         assert fresh._unsloth_mask_identity == first._unsloth_mask_identity
-        _refill(static, fresh)
-        q = torch.randn(rows, 4, 1, d, generator = g, dtype = torch.float64)
+        # What CUDA-graph decode does each step: copy the new mask's tensors into the captured mask's buffers.
+        for a, b in zip(fields + closure, (fresh.kv_num_blocks, fresh.kv_indices, *fresh._unsloth_graph_closure[0])):
+            a.copy_(b)
+        q = rand(rows, 4, 1, d)
         torch.testing.assert_close(
-            D.flex_decode_attention(q, k, v, captured, d ** -0.5),
-            D.flex_decode_attention(q, k, v, fresh, d ** -0.5),
+            D.flex_decode_attention(q, k, v, captured, d ** -0.5), D.flex_decode_attention(q, k, v, fresh, d ** -0.5),
             rtol = 0, atol = 0,
         )
 
 
-def test_graph_identity_follows_window_and_captured_scalars():
+def test_graph_identity_follows_window_and_captured_scalars_and_offsets_are_copied():
     ident = lambda **kw: getattr(D.decode_block_mask(1, 256, torch.tensor(100), device = "cpu", **kw), "_unsloth_mask_identity", None)
     assert ident(window = 128) is not None
     assert ident(window = 128) == ident(window = 128)
@@ -250,9 +205,7 @@ def test_graph_identity_follows_window_and_captured_scalars():
     assert getattr(bm, "_unsloth_graph_closure", None) is None
     plain = D.decode_block_mask(1, 256, torch.tensor(100), window = 128, device = "cpu", graph_contract = False)
     assert getattr(plain, "_unsloth_graph_closure", None) is None
-
-
-def test_the_offsets_are_copies_of_a_live_cache_counter():
+    # The offsets are copies of a live cache counter.
     counter = torch.tensor(99)
     bm = D.decode_block_mask(1, 256, counter, device = "cpu")
     before = effective_mask(bm, 1, 256).clone()
@@ -260,28 +213,38 @@ def test_the_offsets_are_copies_of_a_live_cache_counter():
     assert torch.equal(effective_mask(bm, 1, 256), before)
 
 
-def test_attention_interface_falls_back_to_the_same_visibility_without_flex_decoding():
-    d, S_len = 16, 150
-    g = torch.Generator().manual_seed(2)
-    q = torch.randn(2, 4, 1, d, generator = g, dtype = torch.float64)
-    k = torch.randn(2, 2, S_len, d, generator = g, dtype = torch.float64)
-    v = torch.randn(2, 2, S_len, d, generator = g, dtype = torch.float64)
-    mask_2d = torch.ones(2, S_len, dtype = torch.long)
-    mask_2d[0, :40] = 0
-    bm = D.decode_block_mask(2, S_len, torch.tensor(S_len - 1), attention_mask = mask_2d, window = 128, device = "cpu")
-    assert not D.flex_decode_supported(d, 4, 2, torch.float64, "cpu")
+@pytest.mark.parametrize("compile_fails", [False, True])
+def test_unsloth_attention_serves_the_same_visibility_densely_when_flex_decoding_cannot(compile_fails, monkeypatch):
+    # Unsupported shape, or a failing flex compile that must raise once and then be served densely.
+    d, S_len, window = 16, 150, (0 if compile_fails else 128)
+    _, q, k, v = _qkv(2, 4, 2, S_len, d, seed = 3 if compile_fails else 2)
+    mask_2d = _pads(S_len, 0, 30) if compile_fails else _pads(S_len, 40, 0)
+    bm = D.decode_block_mask(2, S_len, torch.tensor(S_len - 1), attention_mask = mask_2d, window = window, device = "cpu")
+    calls = []
+    if compile_fails:
+        def failing_compiled_flex(*args, **kwargs):
+            calls.append(torch._dynamo.config.suppress_errors)
+            raise RuntimeError("No valid triton configs. OutOfMemoryError: out of resource")
+        monkeypatch.setattr(D, "_flex_function", lambda device: (failing_compiled_flex, True))
+        monkeypatch.setattr(D, "flex_decode_supported", lambda *args: True)
+        monkeypatch.setattr(D, "_FAILED_SHAPES", set())
+        monkeypatch.setattr(D, "_COMPILED_SHAPES", set())
+        monkeypatch.setattr(torch._dynamo.config, "suppress_errors", True)
+    else:
+        assert not D.flex_decode_supported(d, 4, 2, torch.float64, "cpu")
+    want = D._eager_attention(q, k, v, visible(mask_2d, window)[:, None, None, :], d ** -0.5)
+    module = _Attn()
+    for _ in range(3 if compile_fails else 1):
+        out, _ = D.unsloth_flex_decode_attention(module, q, k, v, bm, scaling = d ** -0.5)
+        _close(out, want.transpose(1, 2))
+    if compile_fails:
+        assert calls == [False]
+        with pytest.raises(D.FlexDecodeUnavailable):
+            D.flex_decode_attention(q, k, v, bm, d ** -0.5)
+        assert calls == [False]
 
-    class M(torch.nn.Module):
-        num_key_value_groups = 2
-        is_causal = True
 
-    out, _ = D.unsloth_flex_decode_attention(M(), q, k, v, bm, scaling = d ** -0.5)
-    dense = torch.tensor([[visible(S_len - 1, j, 128, bool(mask_2d[b, j])) for j in range(S_len)] for b in range(2)])
-    want = D._eager_attention(q, k, v, dense.view(2, 1, 1, S_len), d ** -0.5)
-    torch.testing.assert_close(out, want.transpose(1, 2), rtol = 1e-10, atol = 1e-12)
-
-
-def test_flex_decode_support_rules(monkeypatch):
+def test_flex_decode_support_rules_and_kv_tile_fits_shared_memory(monkeypatch):
     monkeypatch.setattr(D, "_device_capability", lambda index: (7, 5))
     D._supported.cache_clear()
     try:
@@ -296,44 +259,45 @@ def test_flex_decode_support_rules(monkeypatch):
         assert D._supported(512, 16, 2, torch.bfloat16, "cuda", 0)
     finally:
         D._supported.cache_clear()
+    # T4: head_dim 256 needs 32 rows; 512 is unsupported.
+    assert D._kv_tile(64, (7, 5)) is None and D._kv_tile(128, (7, 5)) is None and D._kv_tile(256, (7, 5)) == 32
+    assert D._flex_decode_hd_limit((7, 5)) == 256 and D._flex_decode_hd_limit((8, 0)) == 512
+    assert D._kv_tile(256, (8, 0)) is None and D._kv_tile(512, (8, 0)) == 32 and D._kv_tile(512, (8, 9)) == 32
+    monkeypatch.setattr(D, "_device_capability", lambda index: (7, 5))
+    options = D.flex_decode_kernel_options(256, torch.device("cuda", 0))
+    assert options["BLOCK_N"] == 32 and options["num_stages"] == 1
 
 
-def test_registration_adds_a_custom_key_that_needs_no_flex_support_flag():
-    assert D.register_flex_decode()
+def test_registration_adds_a_custom_key_and_installs_the_device_transfer(monkeypatch):
     from transformers.modeling_utils import AttentionInterface
-    from transformers.masking_utils import AttentionMaskInterface
+    from transformers.masking_utils import AttentionMaskInterface, causal_mask_function
+    assert D.register_flex_decode()
     assert AttentionInterface._global_mapping[D.FLEX_DECODE_KEY] is D.unsloth_flex_decode_attention
     assert AttentionMaskInterface._global_mapping[D.FLEX_DECODE_KEY] is D.unsloth_flex_decode_mask
-    from transformers.masking_utils import causal_mask_function
     mask = D.unsloth_flex_decode_mask(
         batch_size = 1, cache_position = torch.arange(4), kv_length = 4, q_length = 4, q_offset = 0, kv_offset = 0,
         mask_function = causal_mask_function, attention_mask = None, device = torch.device("cpu"),
         allow_is_causal_skip = False,
     )
     assert not isinstance(mask, flex.BlockMask)
-
-
-def test_kv_tile_fits_shared_memory():
-    # T4: head_dim 256 needs 32 rows; 512 is unsupported.
-    assert D._kv_tile(64, (7, 5)) is None and D._kv_tile(128, (7, 5)) is None and D._kv_tile(256, (7, 5)) == 32
-    assert D._flex_decode_hd_limit((7, 5)) == 256 and D._flex_decode_hd_limit((8, 0)) == 512
-    assert D._kv_tile(256, (8, 0)) is None and D._kv_tile(512, (8, 0)) == 32 and D._kv_tile(512, (8, 9)) == 32
-    monkey = D._device_capability
-    try:
-        D._device_capability = lambda index: (7, 5)
-        options = D.flex_decode_kernel_options(256, torch.device("cuda", 0))
-        assert options["BLOCK_N"] == 32 and options["num_stages"] == 1
-    finally:
-        D._device_capability = monkey
+    # BlockMask.to(device) must rebuild a decode mask for that device.
+    monkeypatch.setattr(flex.BlockMask, "to", flex.BlockMask.to)
+    assert D.install_block_mask_transfer()
+    mask = D.decode_block_mask(1, 16, torch.tensor(3))
+    rebuilt = []
+    mask._unsloth_on_device = lambda device: rebuilt.append(torch.device(device)) or "rebuilt"
+    assert mask.to("cpu") == "rebuilt" and rebuilt == [torch.device("cpu")]
+    assert flex.BlockMask.to._unsloth_gpt_oss
+    assert mask.contiguous() is mask
 
 
 class _HostTensorSpy(torch.utils._python_dispatch.TorchDispatchMode):
     """Records every op that reads or makes a CPU tensor. With the work on the meta device, any hit is a tensor built
     on the host or copied from it: under CUDA graph capture that is a pageable host-to-device copy, which raises."""
 
-    def __init__(self):
-        super().__init__()
+    def __enter__(self):
         self.hits = []
+        return super().__enter__()
 
     def __torch_dispatch__(self, func, types, args = (), kwargs = None):
         out = func(*args, **(kwargs or {}))
@@ -346,20 +310,16 @@ class _HostTensorSpy(torch.utils._python_dispatch.TorchDispatchMode):
 @pytest.mark.parametrize("window", [0, 128])
 def test_per_step_decode_path_never_touches_host_tensors(window, monkeypatch):
     # Every non-kernel op of a decode step on the meta device: no op may see a CPU tensor.
+    from types import SimpleNamespace
     dev = torch.device("meta")
     B, Hq, Hkv, d, S_len = 2, 4, 2, 64, 300
-    q = torch.empty(B, Hq, 1, d, device = dev)
+    q, sinks = torch.empty(B, Hq, 1, d, device = dev), torch.empty(Hq, device = dev)
     k, v = torch.empty(B, Hkv, S_len, d, device = dev), torch.empty(B, Hkv, S_len, d, device = dev)
-    sinks = torch.empty(Hq, device = dev)
     mask_2d = torch.ones(B, S_len, dtype = torch.long, device = dev)
 
     def fake_compiled_flex(query, key, value, **kwargs):
         lse = torch.empty(query.shape[:-1], device = query.device)
-        return query.new_empty(query.shape), (types_aux(lse) if "return_aux" in D._LSE_KWARGS else lse)
-
-    class types_aux:
-        def __init__(self, lse):
-            self.lse = lse
+        return query.new_empty(query.shape), (SimpleNamespace(lse = lse) if "return_aux" in D._LSE_KWARGS else lse)
     monkeypatch.setattr(D, "_flex_function", lambda device: (fake_compiled_flex, True))
     with _HostTensorSpy() as spy:
         for step in range(3):
@@ -379,115 +339,48 @@ def test_per_step_decode_path_never_touches_host_tensors(window, monkeypatch):
     assert spy.hits
 
 
-def test_a_shape_flex_decoding_cannot_compile_falls_back_to_dense_once(monkeypatch):
-    # A failing flex compile must raise once, then the shape is served densely.
-    calls = []
-
-    def failing_compiled_flex(*args, **kwargs):
-        calls.append(torch._dynamo.config.suppress_errors)
-        raise RuntimeError("No valid triton configs. OutOfMemoryError: out of resource")
-    monkeypatch.setattr(D, "_flex_function", lambda device: (failing_compiled_flex, True))
-    monkeypatch.setattr(D, "flex_decode_supported", lambda *args: True)
-    monkeypatch.setattr(D, "_FAILED_SHAPES", set())
-    monkeypatch.setattr(D, "_COMPILED_SHAPES", set())
-    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", True)
-    d, S_len = 16, 150
-    g = torch.Generator().manual_seed(3)
-    q = torch.randn(2, 4, 1, d, generator = g, dtype = torch.float64)
-    k = torch.randn(2, 2, S_len, d, generator = g, dtype = torch.float64)
-    v = torch.randn(2, 2, S_len, d, generator = g, dtype = torch.float64)
-    mask_2d = torch.ones(2, S_len, dtype = torch.long)
-    mask_2d[1, :30] = 0
-    bm = D.decode_block_mask(2, S_len, torch.tensor(S_len - 1), attention_mask = mask_2d, device = "cpu")
-
-    class M(torch.nn.Module):
-        num_key_value_groups = 2
-        is_causal = True
-    want = D._eager_attention(q, k, v, D.dense_decode_mask(bm, S_len), d ** -0.5).transpose(1, 2)
-    for _ in range(3):
-        out, _ = D.unsloth_flex_decode_attention(M(), q, k, v, bm, scaling = d ** -0.5)
-        torch.testing.assert_close(out, want, rtol = 1e-10, atol = 1e-12)
-    assert calls == [False]
-    with pytest.raises(D.FlexDecodeUnavailable):
-        D.flex_decode_attention(q, k, v, bm, d ** -0.5)
-    assert calls == [False]
-
-
 def test_padding_layout_is_stable_as_the_mask_grows_and_the_window_rolls():
     # The padding must keep shape, strides and dtype (graph key) as the 2D mask widens each step.
-    from unsloth_zoo.flex_attention.decode import decode_padding
-
     layouts = []
     for step in range(4):
         width = 300 + step
-        mask = torch.ones(2, width, dtype = torch.long)
-        mask[1, :5] = 0
+        mask = _pads(width, 0, 5)
         for offset in (0, width - 128, torch.tensor(width - 128)):
-            padding = decode_padding(mask, 128, offset)
+            padding = D.decode_padding(mask, 128, offset)
             layouts.append((tuple(padding.shape), padding.stride(), padding.dtype))
-            start = int(offset)
-            expected = torch.zeros(2, 128, dtype = torch.bool)
-            n = min(128, width - start)
-            expected[:, :n] = mask[:, start : start + n].bool()
+            expected = torch.nn.functional.pad(mask.bool(), (0, 128))[:, int(offset) : int(offset) + 128]
             assert torch.equal(padding, expected)
     assert len(set(layouts)) == 1, set(layouts)
 
 
 @pytest.mark.parametrize("which", ["sinks", "softcap"])
-def test_reference_fallback_keeps_an_elided_causal_mask(which):
+def test_reference_fallback_keeps_an_elided_causal_mask_and_attention_dropout(which):
     # The float32 reference must apply the causal mask SDPA's is_causal implies.
-    from unsloth_zoo.flex_attention.decode import unsloth_flex_decode_attention
-    module = torch.nn.Module()
-    module.is_causal = True
-    q = torch.zeros(1, 1, 3, 4)
-    k = torch.zeros(1, 1, 3, 4)
-    v = torch.arange(3.0).view(1, 1, 3, 1).expand(1, 1, 3, 4).contiguous()
+    module = _Attn()
     extra = {"s_aux": torch.full((1,), -1e4)} if which == "sinks" else {"softcap": 30.0}
-    out, _ = unsloth_flex_decode_attention(module, q, k, v, None, scaling = 1.0, **extra)
+    q = k = torch.zeros(1, 1, 3, 4)
+    v = torch.arange(3.0).view(1, 1, 3, 1).expand(1, 1, 3, 4).contiguous()
+    out, _ = D.unsloth_flex_decode_attention(module, q, k, v, None, scaling = 1.0, **extra)
     torch.testing.assert_close(out[0, :, 0, 0], torch.tensor([0.0, 0.5, 1.0]))
-    k = torch.zeros(1, 1, 8, 4)
-    v = torch.zeros(1, 1, 8, 4)
+    k, v = torch.zeros(1, 1, 8, 4), torch.zeros(1, 1, 8, 4)
     v[:, :, :3] = torch.arange(3.0).view(1, 1, 3, 1)
-    out, _ = unsloth_flex_decode_attention(module, q, k, v, None, scaling = 1.0, **extra)
+    out, _ = D.unsloth_flex_decode_attention(module, q, k, v, None, scaling = 1.0, **extra)
     torch.testing.assert_close(out[0, :, 0, 0], torch.tensor([0.0, 0.5, 1.0]))
-    sdpa = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal = True)
-    torch.testing.assert_close(out.transpose(1, 2), sdpa)
+    torch.testing.assert_close(out.transpose(1, 2), torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal = True))
 
-
-def test_registration_installs_the_device_transfer(monkeypatch):
-    # BlockMask.to(device) must rebuild a decode mask for that device.
-    from torch.nn.attention.flex_attention import BlockMask
-    import unsloth_zoo.flex_attention.decode as D
-
-    monkeypatch.setattr(BlockMask, "to", BlockMask.to)
-    assert D.install_block_mask_transfer()
-    mask = D.decode_block_mask(1, 16, torch.tensor(3))
-    rebuilt = []
-    mask._unsloth_on_device = lambda device: rebuilt.append(torch.device(device)) or "rebuilt"
-    assert mask.to("cpu") == "rebuilt" and rebuilt == [torch.device("cpu")]
-    assert BlockMask.to._unsloth_gpt_oss
-    assert mask.contiguous() is mask
-
-
-@pytest.mark.parametrize("which", ["sinks", "softcap"])
-def test_reference_fallback_applies_attention_dropout_in_training(which):
     # Training with sinks / softcap keeps attention dropout; eval ignores it.
-    from unsloth_zoo.flex_attention.decode import _eager_attention, unsloth_flex_decode_attention
     torch.manual_seed(0)
     q, k, v = torch.randn(1, 2, 4, 8), torch.randn(1, 2, 4, 8), torch.randn(1, 2, 4, 8)
-    extra = {"s_aux": torch.zeros(2)} if which == "sinks" else {"softcap": 30.0}
-    module = torch.nn.Module()
-    module.is_causal = True
+    extra = {"s_aux": torch.zeros(2)} if which == "sinks" else extra
     module.eval()
-    clean, _ = unsloth_flex_decode_attention(module, q, k, v, None, scaling = 0.5, dropout = 0.0, **extra)
-    again, _ = unsloth_flex_decode_attention(module, q, k, v, None, scaling = 0.5, dropout = 0.5, **extra)
+    attend = lambda p: D.unsloth_flex_decode_attention(module, q, k, v, None, scaling = 0.5, dropout = p, **extra)[0]
+    clean, again = attend(0.0), attend(0.5)
     module.train()
     torch.manual_seed(1)
-    dropped, _ = unsloth_flex_decode_attention(module, q, k, v, None, scaling = 0.5, dropout = 0.5, **extra)
+    dropped = attend(0.5)
     torch.manual_seed(1)
     mask = torch.ones(4, 4, dtype = torch.bool).tril()
-    sinks, softcap = extra.get("s_aux"), extra.get("softcap")
-    expected = _eager_attention(q, k, v, mask, 0.5, sinks = sinks, softcap = softcap, dropout = 0.5)
+    expected = D._eager_attention(q, k, v, mask, 0.5, sinks = extra.get("s_aux"), softcap = extra.get("softcap"), dropout = 0.5)
     torch.testing.assert_close(dropped, expected.transpose(1, 2))
     assert not torch.allclose(dropped, again)
     torch.testing.assert_close(clean, again)
