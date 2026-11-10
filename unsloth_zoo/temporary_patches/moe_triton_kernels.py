@@ -79,7 +79,9 @@ def _autograd_control_flow_errors():
 def _disable(where, exc):
     global _DISABLED_REASON
     # Checkpoint early stop raises from our save_for_backward; swallowing it trips early_stop's assertion.
-    if isinstance(exc, _autograd_control_flow_errors()):
+    # An out-of-memory allocation is not a kernel fault: disabling would leave every later call on the slower,
+    # hungrier bitsandbytes / eager path, so the caller sees the OOM (and may free memory and retry).
+    if isinstance(exc, _autograd_control_flow_errors() + (torch.cuda.OutOfMemoryError,)):
         try:
             raise exc
         finally:

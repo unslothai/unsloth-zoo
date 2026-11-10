@@ -17,9 +17,11 @@
 
 Decode matches dequantize_4bit bitwise (same fp32 rounding order); backward is dX only via swapped
 strides on the packed tensors, so no dense expert stack is ever allocated.
-UNSLOTH_MOE_NF4_FUSED=1 (CUDA sm80+, not ROCm), =auto (sm80+, at most UNSLOTH_MOE_NF4_AUTO_MAX_ROWS,
-default 128, rows per expert: slower than dequant from 256 on L4), =force (any CUDA; sm75 is 60x+
-slower). UNSLOTH_MOE_NF4_AUTOTUNE=1 tunes tiles per shape (bits then follow the pick)."""
+UNSLOTH_MOE_NF4_FUSED=1 (CUDA sm80+, not ROCm), =auto (sm80+, at most UNSLOTH_MOE_NF4_AUTO_MAX_ROWS rows per
+expert, default 32 on sm80 and 128 elsewhere: slower than dequant from 64 on A100, 256 on L4), =force (any CUDA;
+sm75 is 60x+ slower). auto decides inside one opaque op on the runtime row count, so crossing the cap never
+recompiles (UNSLOTH_MOE_NF4_AUTO_IN_OP=0 restores the Python-side choice). UNSLOTH_MOE_NF4_AUTOTUNE=1 tunes tiles
+per shape (bits then follow the pick)."""
 
 __all__ = [
     "NF4_FUSED_STATS",
@@ -68,16 +70,31 @@ def nf4_fused_mode() -> str:
 AUTO_MAX_ROWS = 128
 
 
-def nf4_auto_max_rows() -> int:
-    try:
-        return int(os.environ.get("UNSLOTH_MOE_NF4_AUTO_MAX_ROWS", AUTO_MAX_ROWS))
-    except ValueError:
-        return AUTO_MAX_ROWS
+# Per compute capability, from fused vs dequant + grouped GEMM forward + dX at Qwen3.6 / gemma-4 expert shapes:
+# A100 (sm80) layer-level fused wins 1.15-1.45x at 16-32 rows per expert, but a whole Qwen3.6-shaped QLoRA step at 64
+# was 3% slower, so the cap is 32; L4 (sm89) wins to 128 (1.2-1.9x) and loses at 256. Other GPUs keep 128.
+AUTO_MAX_ROWS_BY_CAPABILITY = {(8, 0): 32}
 
 
-def nf4_auto_fused(rows, num_experts) -> bool:
+def nf4_auto_max_rows(device = None) -> int:
+    raw = os.environ.get("UNSLOTH_MOE_NF4_AUTO_MAX_ROWS")
+    if raw is not None:
+        try:
+            return int(raw)
+        except ValueError:
+            return AUTO_MAX_ROWS
+    if device is not None and getattr(device, "type", None) == "cuda" and AUTO_MAX_ROWS_BY_CAPABILITY:
+        try:
+            cap = tuple(torch.cuda.get_device_capability(device))
+        except Exception:
+            return AUTO_MAX_ROWS
+        return AUTO_MAX_ROWS_BY_CAPABILITY.get(cap, AUTO_MAX_ROWS)
+    return AUTO_MAX_ROWS
+
+
+def nf4_auto_fused(rows, num_experts, device = None) -> bool:
     """Shapes only (no host sync); under torch.compile this guards on the row count."""
-    return rows <= nf4_auto_max_rows() * num_experts
+    return rows <= nf4_auto_max_rows(device) * num_experts
 
 
 if triton is not None:
@@ -411,7 +428,115 @@ def _register_ops():
     return torch.ops.unsloth_zoo.nf4_grouped_mm.default
 
 
+def _dequant_flat(packed, absmax, code2, absmax2, offset, code, numel, blocksize, blocksize2, nested, w_dtype):
+    """The whole stack decoded flat [numel] in w_dtype by the zoo NF4 dequant kernel (bitsandbytes bits), else torch."""
+    if blocksize == 64 and code.numel() == 16:
+        try:
+            from bitsandbytes.functional import QuantState
+            from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
+            state2 = QuantState(absmax = absmax2, code = code2, blocksize = blocksize2, dtype = torch.float32) if nested else None
+            qs = QuantState(absmax = absmax, shape = torch.Size((numel,)), code = code, blocksize = blocksize,
+                            quant_type = "nf4", dtype = w_dtype, offset = offset if nested else None, state2 = state2)
+            out = nf4_dequant_triton(packed, qs, (numel,))
+            if out is not None:
+                return out
+        except Exception:
+            pass
+    return _decode_torch(packed, absmax, code2, absmax2, offset, code, numel, blocksize, blocksize2, nested, w_dtype)
+
+
+def _dequant_grouped_mm(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer, s_i, s_j,
+                        blocksize, blocksize2, nested, w_dtype):
+    """What the dequant path computes: decode the stack, then the policy grouped GEMM on its [E, inner, outer] view
+    (the same strides preprocess_weight gives, so the same kernel and rounding)."""
+    from unsloth_zoo.temporary_patches.moe_utils import _grouped_mm_with_backward_fix
+    E = ends.shape[0]
+    flat = _dequant_flat(packed, absmax, code2, absmax2, offset, code, E * inner * outer,
+                         blocksize, blocksize2, nested, w_dtype)
+    w = flat.as_strided((E, inner, outer), (inner * outer, s_i, s_j))
+    if w.dtype != a.dtype:
+        w = w.to(a.dtype)
+    with torch.no_grad():
+        return _grouped_mm_with_backward_fix(a, w, ends)
+
+
+AUTO_STATS = {"fused": 0, "dequant": 0}
+
+
+def _auto_launch(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer, s_i, s_j,
+                 blocksize, blocksize2, nested, w_dtype, max_rows):
+    """Runtime choice inside the op: fused while rows <= max_rows * E, else dequant + grouped GEMM."""
+    if max_rows > 0 and a.shape[0] > max_rows * ends.shape[0]:
+        AUTO_STATS["dequant"] += 1
+        return _dequant_grouped_mm(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer, s_i, s_j,
+                                   blocksize, blocksize2, nested, w_dtype)
+    AUTO_STATS["fused"] += 1
+    return _launch(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer, s_i, s_j,
+                   blocksize, blocksize2, nested, w_dtype)
+
+
+def _register_auto_ops():
+    """unsloth_zoo::nf4_grouped_mm_auto: one opaque node whatever the row count, so crossing the cap never recompiles."""
+    if not hasattr(torch, "library") or not hasattr(torch.library, "custom_op"):
+        return None
+    try:
+        return torch.ops.unsloth_zoo.nf4_grouped_mm_auto.default
+    except (AttributeError, RuntimeError):
+        pass
+
+    @torch.library.custom_op(f"{_OP_NS}::nf4_grouped_mm_auto", mutates_args = ())
+    def nf4_grouped_mm_auto_op(
+        x: torch.Tensor, packed: torch.Tensor, absmax: torch.Tensor, code: torch.Tensor,
+        absmax2: torch.Tensor, code2: torch.Tensor, offset: torch.Tensor, offsets: torch.Tensor,
+        K: int, N: int, kn_layout: bool, blocksize: int, blocksize2: int, nested: bool, w_dtype: int, max_rows: int,
+    ) -> torch.Tensor:
+        s_i, s_j = _strides(kn_layout, K, N)
+        return _auto_launch(x.contiguous(), packed, absmax, code2, absmax2, offset, code, offsets,
+                            K, N, s_i, s_j, blocksize, blocksize2, nested, _W_DTYPE_CODE[w_dtype], max_rows)
+
+    @nf4_grouped_mm_auto_op.register_fake
+    def _(x, packed, absmax, code, absmax2, code2, offset, offsets, K, N, kn_layout, blocksize, blocksize2, nested,
+          w_dtype, max_rows):
+        return x.new_empty((x.shape[0], N))
+
+    @torch.library.custom_op(f"{_OP_NS}::nf4_grouped_mm_auto_dx", mutates_args = ())
+    def nf4_grouped_mm_auto_dx_op(
+        dy: torch.Tensor, packed: torch.Tensor, absmax: torch.Tensor, code: torch.Tensor,
+        absmax2: torch.Tensor, code2: torch.Tensor, offset: torch.Tensor, offsets: torch.Tensor,
+        K: int, N: int, kn_layout: bool, blocksize: int, blocksize2: int, nested: bool, w_dtype: int, max_rows: int,
+    ) -> torch.Tensor:
+        s_k, s_n = _strides(kn_layout, K, N)
+        return _auto_launch(dy.contiguous(), packed, absmax, code2, absmax2, offset, code, offsets,
+                            N, K, s_n, s_k, blocksize, blocksize2, nested, _W_DTYPE_CODE[w_dtype], max_rows)
+
+    @nf4_grouped_mm_auto_dx_op.register_fake
+    def _(dy, packed, absmax, code, absmax2, code2, offset, offsets, K, N, kn_layout, blocksize, blocksize2, nested,
+          w_dtype, max_rows):
+        return dy.new_empty((dy.shape[0], K))
+
+    def _setup_context(ctx, inputs, output):
+        x, packed, absmax, code, absmax2, code2, offset, offsets = inputs[:8]
+        ctx.save_for_backward(packed, absmax, code, absmax2, code2, offset, offsets)
+        ctx.meta = tuple(inputs[8:])
+
+    def _backward(ctx, grad):
+        dx = None
+        if ctx.needs_input_grad[0]:
+            dx = torch.ops.unsloth_zoo.nf4_grouped_mm_auto_dx(grad, *ctx.saved_tensors, *ctx.meta)
+        return (dx,) + (None,) * 15
+
+    nf4_grouped_mm_auto_op.register_autograd(_backward, setup_context = _setup_context)
+    return torch.ops.unsloth_zoo.nf4_grouped_mm_auto.default
+
+
 _OP = _register_ops() if triton is not None else None
+_AUTO_OP = _register_auto_ops() if triton is not None else None
+
+
+def nf4_auto_in_op() -> bool:
+    """UNSLOTH_MOE_NF4_AUTO_IN_OP (default 1): 'auto' decides fused vs dequant inside one op on the runtime rows;
+    0 restores the Python-side choice (a Dynamo guard on rows, one recompile when crossing the cap)."""
+    return os.environ.get("UNSLOTH_MOE_NF4_AUTO_IN_OP", "1") != "0"
 
 
 def nf4_grouped_mm(x, offsets, spec):
@@ -520,7 +645,8 @@ def nf4_grouped_spec(param, preprocess, compute_dtype, mode = None):
 
 def maybe_nf4_grouped_mm(inputs, offsets, source, preprocess):
     """Fused NF4 base GEMM for a frozen 4-bit expert stack, or None to keep the current path."""
-    if nf4_fused_mode() == "auto" and not nf4_auto_fused(inputs.shape[0], offsets.shape[0]):
+    in_op = nf4_fused_mode() == "auto" and nf4_auto_in_op() and _AUTO_OP is not None
+    if nf4_fused_mode() == "auto" and not in_op and not nf4_auto_fused(inputs.shape[0], offsets.shape[0], inputs.device):
         return None
     try:
         spec = nf4_grouped_spec(source, preprocess, inputs.dtype)
@@ -541,7 +667,14 @@ def maybe_nf4_grouped_mm(inputs, offsets, source, preprocess):
         if (K, N, s_k, s_n) in FAILED_SHAPES or (N, K, s_n, s_k) in FAILED_SHAPES:
             return None
     offsets = offsets if offsets.dtype == torch.int32 else offsets.to(torch.int32)
-    out = nf4_grouped_mm(inputs, offsets, spec)
+    if in_op:
+        out = _AUTO_OP(
+            inputs, spec["packed"], spec["absmax"], spec["code"], spec["absmax2"], spec["code2"], spec["offset"],
+            offsets, spec["K"], spec["N"], spec["kn_layout"], spec["blocksize"], spec["blocksize2"],
+            spec["nested"], spec["w_dtype"], nf4_auto_max_rows(inputs.device),
+        )
+    else:
+        out = nf4_grouped_mm(inputs, offsets, spec)
     if not torch.compiler.is_compiling():
         NF4_FUSED_STATS["calls"] += 1
     return out

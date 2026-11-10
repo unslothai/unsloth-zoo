@@ -1230,6 +1230,13 @@ def _nf4_fused_base_mm(inputs, offsets, source, proj_type, hidden_dim, model_typ
     """UNSLOTH_MOE_NF4_FUSED grouped GEMM on a frozen NF4 stack; None keeps the dequant path."""
     if os.environ.get("UNSLOTH_MOE_NF4_FUSED", "0") in ("", "0") or not _base_is_recomputable(source):
         return None
+    cache = _expert_cache_module()
+    if cache is not None:
+        param = source
+        while hasattr(param, "base_layer"):
+            param = param.base_layer
+        if cache.expert_cache_lookup(param) is not None:
+            return None   # a cached 16-bit stack makes the dequant path's decode free
     try:
         from unsloth_zoo.temporary_patches.moe_nf4_grouped import maybe_nf4_grouped_mm
     except ImportError:
@@ -1293,6 +1300,11 @@ def _dequantize_bnb4bit_experts(param, experts, target_dtype = None):
 
     while hasattr(param, "base_layer"):
         param = param.base_layer
+    cache = _expert_cache_module()
+    cached = _expert_cache_get(cache, param, target_dtype)
+    if cached is not None:
+        out = cached[experts] if isinstance(experts, slice) else cached.index_select(0, experts)
+        return out.to(target_dtype) if target_dtype is not None else out
     E, inner = _bnb4bit_expert_split(param)
     qs = param.quant_state
     blocks = inner[0] * inner[1] // qs.blocksize
@@ -3031,6 +3043,58 @@ def _get_dequantize_4bit_in_slices():
     return _DEQUANTIZE_4BIT_IN_SLICES
 
 
+_EXPERT_CACHE_MOD = None
+
+
+def _expert_cache_module():
+    """moe_expert_cache when UNSLOTH_MOE_EXPERT_CACHE is on and the caller is eager, else None (no traced work)."""
+    global _EXPERT_CACHE_MOD
+    if os.environ.get("UNSLOTH_MOE_EXPERT_CACHE", "0") in ("", "0") or torch.compiler.is_compiling():
+        return None
+    if _EXPERT_CACHE_MOD is None:
+        try:
+            from unsloth_zoo.temporary_patches import moe_expert_cache
+            _EXPERT_CACHE_MOD = moe_expert_cache
+        except ImportError:
+            _EXPERT_CACHE_MOD = False
+    return _EXPERT_CACHE_MOD or None
+
+
+def _expert_cache_get(cache, param, target_dtype):
+    """The cached stack when it is in the dtype this caller ends with (target_dtype, else the state's), else None."""
+    if cache is None:
+        return None
+    weight = cache.expert_cache_lookup(param)
+    want = target_dtype or getattr(getattr(param, "quant_state", None), "dtype", None)
+    if weight is not None and weight.dtype != want:
+        return None
+    return weight
+
+
+def _dequantize_bnb4bit_full(param):
+    """The whole packed 4-bit stack in quant_state.dtype, at its logical shape."""
+    # Absolute import: this file is also copied into unsloth_compiled_cache and imported top-level.
+    weight = None
+    try:
+        from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
+    except ImportError:
+        nf4_dequant_triton = None
+    if nf4_dequant_triton is not None:
+        weight = nf4_dequant_triton(
+            param.data, param.quant_state, getattr(param, "_original_shape", None),
+        )
+    if weight is None:
+        # >= 2**31-element stacks abort in bitsandbytes dequantize (csrc/ops.cu:93); slice like the load does.
+        slicer = _get_dequantize_4bit_in_slices()
+        weight = slicer(param) if slicer is not None else None
+    if weight is None:
+        weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
+    original_shape = getattr(param, "_original_shape", None)
+    if original_shape is not None and weight.shape != original_shape:
+        weight = weight.reshape(original_shape)
+    return weight
+
+
 def _get_base_weight(param, target_dtype=None, token_counts=None, experts=None):
     """Get base weight from a potentially wrapped parameter or module. target_dtype (recompute
     providers) restores the packed Params4bit to its logical shape and casts. experts (a
@@ -3055,25 +3119,23 @@ def _get_base_weight(param, target_dtype=None, token_counts=None, experts=None):
                 "MoE quantizer patch did not fire for this expert. "
                 f"data.shape={tuple(param.data.shape)}, device={param.device}."
             )
-        # Absolute import: this file is also copied into unsloth_compiled_cache and imported top-level.
-        weight = None
-        try:
-            from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
-        except ImportError:
-            nf4_dequant_triton = None
-        if nf4_dequant_triton is not None:
-            weight = nf4_dequant_triton(
-                param.data, param.quant_state, getattr(param, "_original_shape", None),
-            )
+        cache = _expert_cache_module()
+        weight = _expert_cache_get(cache, param, target_dtype)
         if weight is None:
-            # >= 2**31-element stacks abort in bitsandbytes dequantize (csrc/ops.cu:93); slice like the load does.
-            slicer = _get_dequantize_4bit_in_slices()
-            weight = slicer(param) if slicer is not None else None
-        if weight is None:
-            weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
-        original_shape = getattr(param, "_original_shape", None)
-        if original_shape is not None and weight.shape != original_shape:
-            weight = weight.reshape(original_shape)
+            try:
+                weight = _dequantize_bnb4bit_full(param)
+            except torch.cuda.OutOfMemoryError:
+                # A cached stack may hold the memory this decode needs: drop the cache once and retry.
+                if cache is None or not cache.EXPERT_CACHE_STATS.get("bytes"):
+                    raise
+                cache.clear_expert_cache(oom = True)
+                torch.cuda.empty_cache()
+                weight = _dequantize_bnb4bit_full(param)
+            if cache is not None:
+                # Cached after the cast (fp16 compute over a bf16 state casts every read otherwise); the same values.
+                if target_dtype is not None and weight.dtype != target_dtype:
+                    weight = weight.to(target_dtype)
+                cache.expert_cache_offer(param, weight)
         if target_dtype is not None:
             weight = weight.to(target_dtype)
         return weight
