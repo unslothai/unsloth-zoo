@@ -3127,8 +3127,9 @@ def _get_bnb4bit_base_weight(param, target_dtype = None):
     return weight
 
 
-# UNSLOTH_MOE_EXPERT_CACHE in a traced caller: the cache is host state, so the decode runs eagerly behind one graph
-# break per call (only while the cache is on); its output enters the next graph as an input, never a reusable buffer.
+# UNSLOTH_MOE_EXPERT_CACHE_TRACED=1 (with the cache on): a traced caller decodes eagerly behind one graph break per call
+# so it can use the cache; the output enters the next graph as an input, never a reusable buffer. Off by default: the
+# breaks repartition the compiled graphs (eval loss drifts ~1e-6) and cost host time (A100 Qwen3.6 step +10%; L4 -18%).
 _get_bnb4bit_base_weight_eager = torch.compiler.disable(_get_bnb4bit_base_weight)
 
 
@@ -3151,6 +3152,7 @@ def _get_base_weight(param, target_dtype=None, token_counts=None, experts=None):
         if (
             torch.compiler.is_compiling()
             and os.environ.get("UNSLOTH_MOE_EXPERT_CACHE", "0") not in ("", "0")
+            and os.environ.get("UNSLOTH_MOE_EXPERT_CACHE_TRACED", "0") == "1"
         ):
             return _get_bnb4bit_base_weight_eager(param, target_dtype)
         return _get_bnb4bit_base_weight(param, target_dtype)
