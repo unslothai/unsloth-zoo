@@ -7887,7 +7887,7 @@ def add_llama_cpp_system_message(messages, tools, inplace = False):
     # See https://github.com/ggml-org/llama.cpp/issues/18323
     # See https://docs.unsloth.ai/basics/inference-and-deployment/llama-server-and-openai-endpoint#llama-server-quirks
     extra = _check_llama_cpp_appended_system_message()
-    if len(messages) == 0 or messages is None:
+    if messages is None or len(messages) == 0:
         return messages
     if tools is None or len(tools) == 0:
         # Does not affect non tools
@@ -7898,7 +7898,7 @@ def add_llama_cpp_system_message(messages, tools, inplace = False):
         if inplace:
             messages[0]["content"] = messages[0]["content"] + "\n\n" + extra
         else:
-            messages = [{"role" : "system", "content" : messages[0]["content"]}] + messages[1:]
+            messages = [{"role" : "system", "content" : messages[0]["content"] + "\n\n" + extra}] + messages[1:]
     else:
         if inplace:
             messages.insert(0, {"role" : "system", "content" : extra})
