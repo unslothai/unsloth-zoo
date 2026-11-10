@@ -416,3 +416,19 @@ def test_block_starts_are_built_once_per_shape():
     first = D._block_starts(8, 128, "cpu")
     assert D._block_starts(8, 128, torch.device("cpu")) is first
     assert first[0] == torch.iinfo(torch.int64).min and first[1:].tolist() == [128 * i for i in range(1, 8)]
+
+
+@pytest.mark.parametrize("which", ["sinks", "softcap"])
+def test_reference_fallback_keeps_finite_additive_mask_penalties(which):
+    # A custom float mask reaches the fallback as given: a finite -1e9 must still hide its key.
+    module = torch.nn.Module().eval()
+    q = torch.zeros(1, 1, 1, 4)
+    k = torch.zeros(1, 1, 2, 4)
+    v = torch.tensor([0.0, 10.0]).view(1, 1, 2, 1).expand(1, 1, 2, 4).contiguous()
+    mask = torch.tensor([0.0, -1e9]).view(1, 1, 1, 2)
+    extra = {"s_aux": torch.full((1,), -1e4)} if which == "sinks" else {"softcap": 30.0}
+    out, _ = D.unsloth_flex_decode_attention(module, q, k, v, mask, scaling = 1.0, **extra)
+    torch.testing.assert_close(out[0, 0, 0], torch.zeros(4))
+    full = torch.full((1, 1, 1, 2), torch.finfo(torch.float32).min)
+    out, _ = D.unsloth_flex_decode_attention(module, q, k, v, full, scaling = 1.0, **extra)
+    torch.testing.assert_close(out[0, 0, 0], torch.zeros(4))

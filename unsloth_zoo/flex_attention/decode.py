@@ -389,7 +389,7 @@ def flex_decode_attention(query, key, value, block_mask, scale = None, *, sinks 
 
 
 def _eager_attention(query, key, value, mask, scale, sinks = None, softcap = None, dropout = 0.0):
-    """float32 reference / fallback; mask bool broadcastable to [B, Hq, Lq, S] (True = visible)."""
+    """float32 reference / fallback; mask broadcastable to [B, Hq, Lq, S]: bool (True = visible) or additive float."""
     groups = query.shape[1] // key.shape[1]
     compute = torch.promote_types(query.dtype, torch.float32)
     k = key.to(compute).repeat_interleave(groups, dim = 1)
@@ -398,7 +398,7 @@ def _eager_attention(query, key, value, mask, scale, sinks = None, softcap = Non
     if softcap:
         scores = softcap * torch.tanh(scores / softcap)
     if mask is not None:
-        scores = scores.masked_fill(~mask, float("-inf"))
+        scores = scores.masked_fill(~mask, float("-inf")) if mask.dtype == torch.bool else scores + mask.to(scores.dtype)
     if sinks is not None:
         sink = sinks.to(compute).view(1, -1, 1, 1).expand(scores.shape[0], -1, scores.shape[2], 1)
         scores = torch.cat([scores, sink], dim = -1)
@@ -486,7 +486,9 @@ def unsloth_flex_decode_attention(
         attention_mask = dense_decode_mask(attention_mask, key.shape[-2], query.device)
     if softcap or s_aux is not None:
         if attention_mask is not None and attention_mask.dtype != torch.bool:
-            attention_mask = attention_mask > torch.finfo(attention_mask.dtype).min / 2
+            # Additive mask: keep finite penalties, the dtype-min fill means masked (-inf, so an empty row is zeros).
+            hidden = attention_mask <= torch.finfo(attention_mask.dtype).min / 2
+            attention_mask = attention_mask.float().masked_fill(hidden, float("-inf"))
         L, S = query.shape[-2], key.shape[-2]
         if attention_mask is None and L > 1 and kwargs.get("is_causal", getattr(module, "is_causal", True)):
             # SDPA elides an unpadded causal mask (is_causal); the reference needs it built explicitly.
