@@ -67,8 +67,7 @@ from .peft_utils import get_lora_layer_modules
 from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
     MHC_SINKHORN_SOURCE,
     MHC_SINKHORN_REPLACEMENT,
-    MHC_PROJECTION_SOURCE,
-    MHC_PROJECTION_REPLACEMENT,
+    MHC_PROJECTION_REWRITES,
     mhc_fast_mode,
 )
 from importlib.metadata import version as importlib_version
@@ -77,6 +76,26 @@ from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
 from unsloth_zoo.temporary_patches.common import get_torch_compile_options, combo_kernels_supported
 from .hf_utils import get_transformers_model_type
+
+from .utils import _class_source
+
+def _def_prefix_checker(full_source):
+    # f(name) == bool(re.search(r"\bdef[\s]{1,}" + re.escape(name), full_source)), reading def names once.
+    names = None
+
+    def defined(function):
+        nonlocal names
+        if re.fullmatch(r"\w+", function):
+            if names is None:
+                names = re.findall(r"(?=\bdef\s+(\w+))", full_source)
+            return any(name.startswith(function) for name in names)
+        return (
+            re.search(r"\bdef[\s]{1,}" + re.escape(function), full_source, flags=re.DOTALL)
+            is not None
+        )
+
+    return defined
+
 
 try:
     ScriptFunction = torch.jit.torch.jit.ScriptFunction
@@ -287,25 +306,27 @@ MODULE_FORWARD_SOURCE_REWRITES = {
 }
 
 
-# {model_type: {class: (old, new)}}: forward rewrites applied whether or not the class compiles; the eager mixer saves
-# its FP32 upcast for backward, compiled blocks do not; the helper keeps stock math under torch.compile.
+# {model_type: {class: ((old, new), ...)}}: forward rewrites applied whether or not the class compiles; the eager mixer
+# saves its FP32 upcast for backward, compiled blocks do not; the helper keeps stock math under torch.compile.
+# One (old, new) pair per transformers layout; the first that occurs exactly once is applied.
 MODULE_FORWARD_EAGER_REWRITES = {
-    "deepseek_v4": {"DeepseekV4HyperConnection": (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT)},
-    "deepseek_v41": {"DeepseekV41HyperConnection": (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT)},
-    "glm5_next": {"Glm5NextTextHyperConnection": (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT)},
+    "deepseek_v4": {"DeepseekV4HyperConnection": MHC_PROJECTION_REWRITES},
+    "deepseek_v41": {"DeepseekV41HyperConnection": MHC_PROJECTION_REWRITES},
+    "glm5_next": {"Glm5NextTextHyperConnection": MHC_PROJECTION_REWRITES},
 }
 
 
 def module_forward_eager_rewrites(modeling_file, model_type):
     """{class: rewritten forward source} for MODULE_FORWARD_EAGER_REWRITES that match exactly once."""
     applicable = {}
-    for name, (old, new) in MODULE_FORWARD_EAGER_REWRITES.get(model_type, {}).items():
+    for name, alternatives in MODULE_FORWARD_EAGER_REWRITES.get(model_type, {}).items():
         try:
             cls = getattr(modeling_file, name)
             source = inspect.getsource(_unwrap_undecorated_method(cls.forward, cls.__qualname__))
         except Exception:
             continue
-        if source.count(old) == 1:
+        old, new = next(((o, n) for o, n in alternatives if source.count(o) == 1), (None, None))
+        if old is not None:
             applicable[name] = source.replace(old, new)
             if "unsloth_mhc_projection" in new:
                 # Same reason as unsloth_sinkhorn_knopp below: block compile rebinds the forward
@@ -3076,7 +3097,7 @@ def create_standalone_class(
     """
     # All Unsloth Zoo code licensed under LGPLv3
     f = eval(f"{model_location}.{module}")
-    full_class = inspect.getsource(f)
+    full_class = _class_source(f)
     # A decorator that returns a bare closure (no `functools.wraps`) hides the
     # real method behind the wrapper, so read the source and the signature off
     # the undecorated function instead of off the class attribute.
@@ -5474,7 +5495,7 @@ def patch_gradient_accumulation(modeling_file, module):
     else:
         return None
 
-    source = inspect.getsource(module).replace(inspect.getsource(forward), source)
+    source = _class_source(module).replace(inspect.getsource(forward), source)
     return source
 
 
@@ -6681,7 +6702,7 @@ def unsloth_compile_transformers(
     for module in torch_modules:
         source = eval(f"modeling_file.{module}")
         try:
-            source = inspect.getsource(source)
+            source = _class_source(source)
         except:
             continue
         if "_gradient_checkpointing_func" in source:
@@ -6768,15 +6789,13 @@ def unsloth_compile_transformers(
 
     # Get functions which are called
     called_functions = []
+    function_is_defined = _def_prefix_checker(full_source)
     for function in functions:
         # `called` needs `<function>(` and both must match; one match of each is enough.
         if function + "(" not in full_source:
             continue
         # Start of text
-        defined = re.search(
-            r"\bdef[\s]{1,}" + re.escape(function), full_source, flags=re.DOTALL
-        )
-        if defined is None:
+        if not function_is_defined(function):
             continue
         # Disable self.
         called = re.search(

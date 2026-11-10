@@ -785,37 +785,24 @@ def align_logprobs_with_mask(
     attention_mask: torch.Tensor,
     pad_value: float = 0.0
 ) -> torch.Tensor:
-    """Align a log probability tensor with a given attention mask."""
+    """Align a log probability tensor with a given attention mask.
+
+    Row b starts at its first nonzero mask column (0 if none); other columns hold pad_value. A gather, not boolean
+    selections, so no host sync."""
 
     device = logprob_tensor.device
-    batch_size, logprob_seq_len = logprob_tensor.shape
+    logprob_seq_len = logprob_tensor.shape[1]
     mask_seq_len = attention_mask.shape[1]
 
-    padded_logprobs = torch.full(
-        attention_mask.shape,
-        fill_value=pad_value,
-        dtype=logprob_tensor.dtype,
-        device=device
-    )
+    if logprob_seq_len == 0:
+        return torch.full(attention_mask.shape, fill_value=pad_value, dtype=logprob_tensor.dtype, device=device)
 
     left_pad_counts = torch.argmax(attention_mask, dim=1)
 
-    cols = torch.arange(logprob_seq_len, device=device)
-
-
-    dest_indices = left_pad_counts.unsqueeze(1) + cols
-
-    # Destination row indices, shape [batch_size, logprob_seq_len].
-    row_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(dest_indices)
-
-    # Keep only in-bounds destinations, then scatter via advanced indexing.
-    valid_mask = dest_indices < mask_seq_len
-    valid_rows = row_indices[valid_mask]
-    valid_cols = dest_indices[valid_mask]
-    valid_vals = logprob_tensor[valid_mask]
-    padded_logprobs[valid_rows, valid_cols] = valid_vals
-
-    return padded_logprobs
+    src = torch.arange(mask_seq_len, device=device).unsqueeze(0) - left_pad_counts.unsqueeze(1)
+    valid = (src >= 0) & (src < logprob_seq_len)
+    aligned = logprob_tensor.gather(1, src.clamp(0, logprob_seq_len - 1))
+    return aligned.masked_fill(~valid, pad_value)
 
 RL_REPLACEMENTS["align_logprobs_with_mask"] = align_logprobs_with_mask
 
@@ -1466,7 +1453,8 @@ def grpo_entropy_bonus_weights(completion_mask, entropy_mask, entropy_coef, loss
 
     TRL >= 1.10: the mean entropy over the tokens the policy term acts on, divided by the
     accumulation steps (1 in eval) for every loss_type. TRL 1.8 and 1.9 instead divided cispo /
-    dapo / vespo by the policy term's own global token normalizer, without the mean.
+    dapo / vespo by the policy term's own global token normalizer, without the mean; from 1.9.1
+    that normalizer is rescaled to one accumulation window (trl#6024).
     """
     weights = completion_mask.to(torch.float32)
     if entropy_mask is not None:
@@ -1484,21 +1472,22 @@ def grpo_entropy_bonus_weights(completion_mask, entropy_mask, entropy_coef, loss
     from packaging.version import Version
     loss_type = loss_kwargs.get("loss_type", "grpo")
     if Version(trl_version) < Version("1.10.0") and loss_type in ("cispo", "dapo", "vespo"):
+        # TRL 1.9.1 / 1.9.2 (trl#6024) rescale the normalizer to one accumulation window; steps_per_generation is None in eval.
+        window = 1.0
+        spg = loss_kwargs.get("steps_per_generation", None)
+        if spg and Version(trl_version) >= Version("1.9.1"):
+            window = loss_kwargs.get("current_gradient_accumulation_steps", 1) / spg
         if sample_weight is not None:
-            # sample_weight is 1 / kept tokens of the generation batch, the kept-only num_items_in_batch,
-            # so excluded rows do not dilute the bonus. Like the branch below (TRL 1.8 / 1.9), no
-            # accumulation / steps_per_generation rescale: with every row kept the two are equal.
-            normalizer = 1.0 / loss_kwargs.get("num_processes", 1)
+            # sample_weight is 1 / kept tokens of the generation batch, so excluded rows do not dilute the bonus.
+            normalizer = window / loss_kwargs.get("num_processes", 1)
             row_weight = sample_weight.to(device = weights.device, dtype = weights.dtype).unsqueeze(-1)
             return weights * row_weight * (-entropy_coef / normalizer)
-        # TRL 1.8 / 1.9 used num_items_in_batch / num_processes as is, before 1.10 rescaled it to
-        # one accumulation window (grpo_compute_loss always rescales the policy term).
         num_items_in_batch = loss_kwargs.get("num_items_in_batch", None)
         if torch.is_tensor(num_items_in_batch):
             normalizer = num_items_in_batch.clamp(min = 1.0) / loss_kwargs.get("num_processes", 1)
         else:
             normalizer = max(float(num_items_in_batch), 1.0) / loss_kwargs.get("num_processes", 1)
-        return weights * (-entropy_coef / normalizer)
+        return weights * (-entropy_coef / (normalizer * window))
     # Unsloth before #11337 passes the training window's accumulation steps into eval too.
     accumulation_steps = loss_kwargs.get("current_gradient_accumulation_steps", 1) if training else 1
     return weights * (-entropy_coef / weights.sum().clamp(min = 1.0) / accumulation_steps)
@@ -2871,8 +2860,9 @@ def grpo_accumulated_loss(
     # input and grpo_compute_loss returns None (not empty) delta/flat_is_ratio.
     # Set by unsloth when UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1 skipped the old-policy forward.
     _rollout_logps_as_old = bool(kwargs.pop("rollout_logps_as_old", False))
+    # TRL defaults the correction flag to True without vLLM too, but only applies the ratio with use_vllm.
     _sampling_logps_used = (
-        getattr(trainer, "vllm_importance_sampling_correction", False)
+        (getattr(trainer, "use_vllm", False) and getattr(trainer, "vllm_importance_sampling_correction", False))
         or getattr(trainer.args, "off_policy_mask_threshold", None) is not None
         or _rollout_logps_as_old
     )

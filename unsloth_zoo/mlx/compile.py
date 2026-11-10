@@ -1936,6 +1936,7 @@ def _install_safe_fused_sdpa_mask_patches():
 
     # why: no @mx.compile — already reached from inside step_fn; nesting
     # mx.compile around **kwargs corrupts VLM gradients.
+    @wraps(original_fast_sdpa)
     def safe_scaled_dot_product_attention(q, k, v, scale=1.0, mask=None, **kwargs):
         row_all_masked = None
         if mask is not None and hasattr(mask, "dtype") and mx.issubdtype(mask.dtype, mx.floating):
@@ -1961,6 +1962,8 @@ def _install_safe_fused_sdpa_mask_patches():
             )
         return out
 
+    # wraps copies the training wrapper's teardown marker, whose release would drop this wrapper.
+    safe_scaled_dot_product_attention.__dict__.pop("_unsloth_original", None)
     fast_ns.scaled_dot_product_attention = safe_scaled_dot_product_attention
     fast_ns._unsloth_safe_sdpa_mask_patch = True
 
@@ -2847,15 +2850,16 @@ def _qwen3_mixed_prompt_batch_adapter(original):
         return original
 
     @wraps(original)
-    def patched(self, sequences):
+    def patched(self, sequences, *args, **kwargs):
         prompt_rows = [sequence[3] for sequence in sequences]
         padded_rows = _pad_qwen3_prompt_rows(prompt_rows)
         if padded_rows is not prompt_rows:
             sequences = [
-                (*sequence[:3], kwargs, *sequence[4:])
-                for sequence, kwargs in zip(sequences, padded_rows)
+                (*sequence[:3], row_kwargs, *sequence[4:])
+                for sequence, row_kwargs in zip(sequences, padded_rows)
             ]
-        batch = original(self, sequences)
+        # mlx-vlm 0.7.12 also passes `picks=`.
+        batch = original(self, sequences, *args, **kwargs)
         prompt_kwargs = getattr(batch, "_prompt_kwargs", None)
         if prompt_kwargs is not None:
             visual_mask = prompt_kwargs.get("visual_pos_masks")
@@ -3495,9 +3499,15 @@ def _install_qwen3_family_compile_patches():
         split_indices = _split_points(cu_seqlens)
         splits = [mx.split(tensor, split_indices, axis=2) for tensor in (q, k, v)]
 
+        from .utils import fused_vision_attention
+
         attn_outputs = []
         for q_chunk, k_chunk, v_chunk in zip(*splits):
-            # MLX fused SDPA mismatches value_and_grad for Qwen3-VL vision; use explicit.
+            out = fused_vision_attention(q_chunk, k_chunk, v_chunk, scale=self.scale)
+            if out is not None:
+                attn_outputs.append(out)
+                continue
+            # Not routed (8 or fewer patches, an fp32 tower, another head dim, off the GPU, or the kill switch): fp32 scores.
             scores = (
                 q_chunk.astype(mx.float32)
                 @ mx.swapaxes(k_chunk.astype(mx.float32), -1, -2)
@@ -6075,11 +6085,12 @@ def _install_gemma4_compile_patches():
         text_model_cls, "_apply_blockwise_bidirectional_overlay"
     ):
         return
-    from .utils import _SharedKVSlot
+    from .utils import _PADDING_FREE_LAYOUT, _SharedKVSlot
 
     def patched_make_masks(self, h, cache, mm_token_type_ids=None):
         masks = original_make_masks(self, h, cache, None)
-        n = h.shape[1]
+        layout = _PADDING_FREE_LAYOUT.get()  # a flat stream's mixers still attend over padded rows
+        n = h.shape[1] if layout is None else layout.span
         if (
             getattr(self.config, "use_bidirectional_attention", None) != "vision"
             or mm_token_type_ids is None
@@ -6763,21 +6774,36 @@ def _install_phi4_multimodal_patches():
 
     def patch_siglip_resize(module):
         interpolate_module = importlib.import_module("mlx_vlm.models.interpolate")
+        # mlx-vlm 0.7.12 resizes channels-last with PyTorch's triangle filter, through differentiable ops when training.
+        resize_nhwc = vars(module).get("resize_bilinear_nhwc")
+        takes_training = resize_nhwc is not None and "training" in inspect.signature(resize_nhwc).parameters
 
-        def patched_resize_positional_embeddings(positional_embeddings, spatial_shapes, max_length):
+        def patched_resize_positional_embeddings(positional_embeddings, spatial_shapes, max_length, *, training=False):
             spatial_shapes = _size_pairs_to_tuple(spatial_shapes)
             embed_dim = positional_embeddings.shape[-1]
             source_dtype = positional_embeddings.dtype
-            pos_emb = positional_embeddings.transpose(2, 0, 1)[None, :]
+            if resize_nhwc is None:
+                pos_emb = positional_embeddings.transpose(2, 0, 1)[None, :]
+            else:
+                pos_emb = positional_embeddings[None].astype(mx.float32)
             outputs = []
             for height, width in spatial_shapes:
-                resized = interpolate_module.resize_bilinear(
-                    pos_emb,
-                    (height, width),
-                    align_corners=False,
-                    antialias=True,
-                )
-                resized = resized.reshape(embed_dim, height * width).transpose(1, 0)
+                if resize_nhwc is not None:
+                    resized = resize_nhwc(
+                        pos_emb,
+                        (height, width),
+                        align_corners=False,
+                        antialias=True,
+                        **({"training": training} if takes_training else {}),
+                    ).reshape(height * width, embed_dim)
+                else:
+                    resized = interpolate_module.resize_bilinear(
+                        pos_emb,
+                        (height, width),
+                        align_corners=False,
+                        antialias=True,
+                    )
+                    resized = resized.reshape(embed_dim, height * width).transpose(1, 0)
                 if height * width < max_length:
                     padding = mx.broadcast_to(
                         resized[0:1],

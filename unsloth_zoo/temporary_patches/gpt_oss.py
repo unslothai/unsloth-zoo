@@ -18,10 +18,12 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import ast
 import contextlib
 import functools
+import hashlib
 import inspect
 import os
 import stat
 import threading
+import types
 import weakref
 import torch
 import torch.nn as nn
@@ -40,7 +42,8 @@ from .common import (
     logger,
 )
 from importlib.metadata import version as importlib_version
-from unsloth_zoo.utils import Version
+from unsloth_zoo.decode_graph_state import in_graph_generate as _in_graph_generate
+from unsloth_zoo.utils import Version, _class_source
 from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
 try:
     from .moe_router_triton import fused_route_or_none as _fused_route_or_none
@@ -128,12 +131,224 @@ def _gpt_oss_flex_inference(device):
     )
 
 
+def _gpt_oss_mask_device(input_embeds, args, kwargs):
+    """The device masks are built for. transformers 4.x generate passes a CPU torch.empty placeholder as input_embeds
+    (shape only), so a CPU embed defers to the positions, the 2D mask or the cache."""
+    if input_embeds.device.type != "cpu":
+        return input_embeds.device
+    for name in ("cache_position", "position_ids", "attention_mask"):
+        x = kwargs.get(name, None)
+        if isinstance(x, torch.Tensor) and x.device.type != "cpu":
+            return x.device
+    for x in args:
+        if isinstance(x, torch.Tensor) and x.device.type != "cpu":
+            return x.device
+    cache = kwargs.get("past_key_values", None)
+    for layer in getattr(cache, "layers", None) or ():
+        keys = getattr(layer, "keys", None)
+        if isinstance(keys, torch.Tensor) and keys.device.type not in ("cpu", "meta"):
+            return keys.device
+    return input_embeds.device
+
+
+_GRAPH_DECODE_DEFAULT = {}
+
+
+def _gpt_oss_default_graph_decode_attention():
+    """"auto" on compute capability 8.0 and newer, where graphed flex_decoding measured as fast as the dense
+    one-token attention or faster (A100: 1.02x at 1k context, 1.23x at 16k); "dense" on older GPUs (T4), where it
+    was slower at batch 4 and 8."""
+    if not torch.cuda.is_available():
+        return "dense"
+    device = torch.cuda.current_device()
+    mode = _GRAPH_DECODE_DEFAULT.get(device)
+    if mode is None:
+        try:
+            major = torch.cuda.get_device_capability(device)[0]
+        except Exception:
+            major = 0
+        mode = _GRAPH_DECODE_DEFAULT[device] = "auto" if major >= 8 else "dense"
+    return mode
+
+
+def _gpt_oss_graph_decode_attention():
+    """One-token attention inside a generate() call Unsloth decodes through CUDA graphs:
+    "dense" runs the sink attention over a dense mask, "flex" keeps flex_decoding on a BlockMask whose tensors the
+    graph refills, "auto" flex with the dense fallback (UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION, read per call;
+    unset: _gpt_oss_default_graph_decode_attention)."""
+    mode = os.environ.get("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "").strip().lower()
+    if not mode:
+        return _gpt_oss_default_graph_decode_attention()
+    # "auto": flex where the mask publishes a graph contract, the dense mask otherwise (a custom mask function).
+    return mode if mode in ("flex", "auto") else "dense"
+
+
+def _gpt_oss_in_graph_generate():
+    return not torch.compiler.is_compiling() and _in_graph_generate()
+
+
+def _gpt_oss_dense_graph_decode(inputs_embeds):
+    """A one-token step of a graph-planned generate() with dense decode attention: its masks are built dense.
+    A full sliding window rolls by one slot per step and moves the mask offset, which a dense mask of fixed shape
+    carries as values while a BlockMask closure would bake it in."""
+    return (
+        isinstance(inputs_embeds, torch.Tensor) and inputs_embeds.dim() >= 2 and inputs_embeds.shape[1] == 1
+        and _gpt_oss_in_graph_generate() and _gpt_oss_graph_decode_attention() == "dense"
+    )
+
+
+def _gpt_oss_graph_dense_attention(hidden_states):
+    """A one-token step of a graph-planned generate() whose mask came back dense: always in "dense" mode, and in
+    "auto" mode when the flex mask could not publish a graph contract."""
+    return (
+        isinstance(hidden_states, torch.Tensor) and hidden_states.dim() >= 2 and hidden_states.shape[1] == 1
+        and _gpt_oss_in_graph_generate() and _gpt_oss_graph_decode_attention() in ("dense", "auto")
+    )
+
+
+def _gpt_oss_dense_decode_mask_ok(attention_mask, n_heads):
+    """Masks the dense one-token attention reads: None, or [B or 1, 1 or H, 1, L]; anything else stays eager."""
+    return attention_mask is None or (
+        isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4
+        and attention_mask.shape[1] in (1, n_heads) and attention_mask.shape[2] == 1
+    )
+
+
+def _gpt_oss_decode_attention(module, query, key, value, attention_mask, scaling):
+    """One-token sink attention, grouped over the KV heads instead of repeat_kv copies: the rounding points of
+    _eager_attention_rows (logits in the input dtype, fp32 softmax over keys + sink stored back in that dtype,
+    probabilities cast to the value dtype). query [B, H, 1, D], key / value [B, KVH, L, D]; returns [B, 1, H, D]."""
+    bsz, n_heads, q_len, head_dim = query.shape
+    kv_heads = key.shape[1]
+    groups = n_heads // kv_heads
+    kv_len = key.shape[-2]
+    if attention_mask is not None:
+        kv_len = min(kv_len, attention_mask.shape[-1])
+        key, value = key[:, :, :kv_len], value[:, :, :kv_len]
+        attention_mask = attention_mask[..., :kv_len]
+    out_dtype = torch.promote_types(query.dtype, key.dtype)
+    logits = key.new_empty((bsz, kv_heads, groups * q_len, kv_len + 1), dtype = out_dtype)
+    q = query.reshape(bsz, kv_heads, groups * q_len, head_dim)
+    weights = torch.matmul(q, key.transpose(2, 3), out = logits[..., :kv_len])
+    weights *= scaling
+    if attention_mask is not None:
+        # [B or 1, 1, 1, L] (one row per sequence, every head) or [B or 1, H, 1, L] (per head, grouped as the
+        # logits are: head h = kv head h // groups, row h % groups).
+        # Shared vs per head from the mask itself: with one KV head a per-head mask still has `groups` rows.
+        if attention_mask.shape[1] == 1:
+            weights += attention_mask.reshape(attention_mask.shape[0], 1, 1, kv_len)
+        else:
+            weights += attention_mask.reshape(attention_mask.shape[0], kv_heads, groups, kv_len)
+    logits[..., -1] = module.sinks.reshape(1, kv_heads, groups)
+    logits[:] = torch.nn.functional.softmax(logits, dim = -1, dtype = torch.float32)
+    probs = logits[..., :kv_len].to(value.dtype)
+    # Outside autocast, as the eager path's out=query matmul: the result keeps the activations' dtype and range
+    # (an fp16 autocast would recast bf16 values past 65504 to inf).
+    with torch.autocast(device_type = value.device.type, enabled = False):
+        out = torch.matmul(probs, value)
+    return out.reshape(bsz, n_heads, q_len, head_dim).transpose(1, 2).contiguous(), None
+
+
+_MASK_SCALARS = (bool, int, float, str, type(None))
+
+
+_MISSING = object()
+# Attribute values that are code, not state: modules, classes, builtins and method descriptors.
+_MASK_CODE_TYPES = (
+    types.ModuleType, type, types.BuiltinFunctionType, types.BuiltinMethodType, types.MethodDescriptorType,
+    types.WrapperDescriptorType, types.MethodWrapperType, torch.dtype, torch.device,
+)
+
+
+def _library_namespace(value):
+    """torch / math / builtins (and their classes): their attributes are library code, never mask state."""
+    name = getattr(value, "__name__", "") if isinstance(value, types.ModuleType) else getattr(value, "__module__", "")
+    return (name or "").split(".")[0] in ("torch", "math", "operator", "builtins", "functools")
+
+
+def _static_attribute(owner, attr):
+    """owner.attr without running descriptors or __getattr__ (a property could compute anything)."""
+    try:
+        return inspect.getattr_static(owner, attr)
+    except AttributeError:
+        return _MISSING
+
+
+@functools.lru_cache(maxsize = 256)
+def _code_digest(code):
+    """Bytecode, constants and names of a code object (nested ones included): two lambdas on one line that
+    differ only in a literal get different digests."""
+    h = hashlib.sha1(code.co_code)
+    for const in code.co_consts:
+        h.update(_code_digest(const).encode() if isinstance(const, types.CodeType) else repr(const).encode())
+    h.update(repr((code.co_names, code.co_varnames, code.co_freevars)).encode())
+    return h.hexdigest()
+
+
+def _mask_function_identity(fn, depth = 4):
+    """A flat tuple naming what mask_function computes: every function's code (nested through its closure and
+    defaults) and every scalar it captures. None when it captures anything else (a tensor, a dict, an object, a
+    functools.partial): such a mask cannot be rebuilt over refilled graph buffers, nor told apart by a graph key.
+    Published on the BlockMask, so a graph captured for one mask is never replayed for another (a different window
+    or a different mask_function under the same outer mask_mod)."""
+    out = []
+
+    def walk(f, depth):
+        # Plain functions only: a bound method's __self__, a partial or a callable object carries state no key sees.
+        if depth <= 0 or type(f) is not types.FunctionType:
+            return False
+        code = f.__code__
+        out.append(f"{code.co_filename}:{code.co_firstlineno}:{getattr(code, 'co_qualname', code.co_name)}:{_code_digest(code)}")
+        values = []
+        for cell in getattr(f, "__closure__", None) or ():
+            try:
+                values.append(cell.cell_contents)
+            except ValueError:
+                values.append(None)
+        values.extend(getattr(f, "__defaults__", None) or ())
+        values.extend((getattr(f, "__kwdefaults__", None) or {}).values())
+        # Module-level names the code reads: a scalar is named by its value, a function walked, builtins are code.
+        # A module or class is code too, but its attributes are state the mask can read (settings.WINDOW,
+        # Config.WINDOW): each other name the code loads is looked up on it and keyed the same way.
+        # Anything else (a tensor, a dict, an object) cannot be keyed.
+        module_globals = getattr(f, "__globals__", None) or {}
+        for name in code.co_names:
+            if name not in module_globals:
+                continue
+            value = module_globals[name]
+            out.append(name)
+            if isinstance(value, (types.ModuleType, type)):
+                if not _library_namespace(value):
+                    for attr in code.co_names:
+                        if attr == name:
+                            continue
+                        found = _static_attribute(value, attr)
+                        if found is _MISSING:
+                            continue
+                        if isinstance(found, (types.ModuleType, type)) and not _library_namespace(found):
+                            return False  # settings.Config.WINDOW: a nested namespace's state is not keyed
+                        out.append(f"{name}.{attr}")
+                        if not isinstance(found, _MASK_CODE_TYPES):
+                            values.append(found)
+            elif not isinstance(value, types.BuiltinFunctionType):
+                values.append(value)
+        for value in values:
+            items = value if type(value) in (list, tuple) else (value,)
+            out.append(len(items) if type(value) in (list, tuple) else -1)
+            for item in items:
+                if type(item) in _MASK_SCALARS:
+                    out.append("None" if item is None else item)
+                elif not walk(item, depth - 1):
+                    return False
+        return True
+
+    return tuple(out) if walk(fn, depth) else None
+
+
 @functools.lru_cache(maxsize = 64)
 def _gpt_oss_decode_block_starts(n, block, device):
-    """[min, block, 2 * block, ...]: bucketize(d, right = True) counts the starts <= d, so it is clamp(d // block + 1, 1, n)."""
-    starts = torch.arange(n, dtype = torch.int64, device = device) * block
-    starts[0] = torch.iinfo(torch.int64).min
-    return starts
+    from unsloth_zoo.flex_attention.decode import _block_starts
+    return _block_starts(n, block, device)
 
 
 @torch.compiler.disable
@@ -152,6 +367,11 @@ def _gpt_oss_flex_mask(
     """Mask for transformers' mask interface as a BlockMask (KV slot j is position kv_offset + j); 0-d tensor offsets
     keep the compiled build from specialising on decode."""
     from unsloth_zoo.flex_attention.utils import compiled_create_block_mask
+    passed = dict(
+        batch_size = batch_size, q_length = q_length, kv_length = kv_length, q_offset = q_offset,
+        kv_offset = kv_offset, mask_function = mask_function, attention_mask = attention_mask, device = device,
+        cache_position = cache_position, **kwargs,
+    )
     if q_length is None:
         # transformers 4.x: no q_length / device.
         q_length = cache_position.shape[0]
@@ -164,56 +384,59 @@ def _gpt_oss_flex_mask(
     q_off, kv_off = offset(q_offset), offset(kv_offset)
     padding = None
     if attention_mask is not None and attention_mask.dim() == 2:
-        padding = attention_mask.to(dtype = torch.bool)
-        # Slots past the 2D mask (unwritten static cache slots) stay invisible.
-        missing = int(kv_length) + int(kv_off) - padding.shape[-1]
-        if missing > 0:
-            padding = torch.nn.functional.pad(padding, (0, missing))
+        # One column per KV slot (slot j holds position kv_offset + j): a fixed [B, kv_length] whatever the offset,
+        # so a rolling sliding window (offset + 1 per step) keeps the shape a decode graph keys on. Positions past
+        # the 2D mask (unwritten static slots) stay invisible; a tensor offset is never read on the host.
+        from unsloth_zoo.flex_attention.decode import decode_padding
+        padding = decode_padding(attention_mask, kv_length, kv_off)
     q_length, kv_length = int(q_length), int(kv_length)
     # Per-row blocks even without padding: packed documents make mask_function row dependent.
     bsz = batch_size
 
-    def build(device):
-        q_o, kv_o = (
-            x.to(device) if isinstance(x, torch.Tensor) else torch.full((), x, dtype = torch.int64, device = device)
-            for x in (q_off, kv_off)
-        )
-        if padding is not None:
-            pad = padding.to(device)
+    def make_mask_mod(q_o, kv_o, pad = None):
+        if pad is not None:
             def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
-                kv_pos = kv_idx + kv_o
-                return mask_function(batch_idx, head_idx, q_idx + q_o, kv_pos) & pad[batch_idx, kv_pos]
+                return mask_function(batch_idx, head_idx, q_idx + q_o, kv_idx + kv_o) & pad[batch_idx, kv_idx]
         else:
             def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
                 return mask_function(batch_idx, head_idx, q_idx + q_o, kv_idx + kv_o)
+        return mask_mod
+
+    def build(device):
         if q_length == 1:
-            # Decode: blocks are partial and mask_mod decides per key; for causal, only blocks up to the query's own
-            # slot can hold a visible key, so an unwritten static-cache tail is not listed (no host sync).
-            from torch.nn.attention.flex_attention import BlockMask, _DEFAULT_SPARSE_BLOCK_SIZE as BLOCK
-            n = (kv_length + BLOCK - 1) // BLOCK
-            rows = bsz or 1
-            if isinstance(q_off, torch.Tensor) or isinstance(kv_off, torch.Tensor):
-                # One kernel: clamp((q - kv_off) // BLOCK + 1, 1, n) as a bucket count, written contiguous int32.
-                d = q_o if isinstance(kv_off, int) and kv_off == 0 else q_o - kv_o
-                kv_num_blocks = torch.bucketize(d.expand(rows, 1, 1), _gpt_oss_decode_block_starts(n, BLOCK, device),
-                                                out_int32 = True, right = True)
-            else:
-                # Integer offsets (dynamic caches): count on the host, one fill as before.
-                kv_num_blocks = torch.full((rows, 1, 1), min(max((q_off - kv_off) // BLOCK + 1, 1), n),
-                                           dtype = torch.int32, device = device)
-            kv_indices = torch.arange(n, dtype = torch.int32, device = device).view(1, 1, 1, n).expand(rows, 1, 1, n)
-            block_mask = BlockMask.from_kv_blocks(
-                kv_num_blocks, kv_indices.contiguous(), BLOCK_SIZE = BLOCK, mask_mod = mask_mod,
-                seq_lengths = (1, kv_length),
-                **({"compute_q_blocks": torch.is_grad_enabled()} if _HAS_COMPUTE_Q_BLOCKS else {}),
+            from unsloth_zoo.flex_attention.decode import build_decode_block_mask
+            graph_mode = _gpt_oss_graph_decode_attention() if _gpt_oss_in_graph_generate() else None
+            identity = _mask_function_identity(mask_function) if graph_mode in ("flex", "auto") else None
+            if graph_mode == "auto" and identity is None:
+                return None
+            block_mask = build_decode_block_mask(
+                device, bsz, kv_length, q_off, kv_off, padding, mask_function, identity,
             )
         else:
-            block_mask = compiled_create_block_mask(mask_mod, bsz, None, q_length, kv_length, device = device)
+            q_o, kv_o = (
+                x.to(device) if isinstance(x, torch.Tensor) else torch.full((), x, dtype = torch.int64, device = device)
+                for x in (q_off, kv_off)
+            )
+            pad = padding.to(device) if padding is not None else None
+            block_mask = compiled_create_block_mask(make_mask_mod(q_o, kv_o, pad), bsz, None, q_length, kv_length, device = device)
         return block_mask
 
     # BlockMask.to() does not move mask_mod's captured tensors: rebuild per device. Weakref avoids a cycle.
     device = torch.device(device)
     block_mask = build(device)
+    if block_mask is None:
+        # "auto" graph decode with a mask function the graph cannot key or refill: the dense mask the dense decode
+        # attention reads, built by transformers' eager interface from the same arguments.
+        from transformers.masking_utils import eager_mask
+        args = {k: v for k, v in passed.items() if v is not None}
+        if attention_mask is not None and attention_mask.dim() == 2:
+            args["attention_mask"] = attention_mask.to(dtype = torch.bool)
+        if "cache_position" not in args and "cache_position" in inspect.signature(eager_mask).parameters:
+            # transformers 4.x eager_mask takes positions; a 5.x-style call carries the query offset instead.
+            args["cache_position"] = torch.arange(q_length, device = device) + (
+                q_off.to(device) if isinstance(q_off, torch.Tensor) else q_off
+            )
+        return eager_mask(**args)
     this, masks = weakref.ref(block_mask), {}
     def on_device(target):
         target = torch.device(target)
@@ -247,19 +470,8 @@ def _register_gpt_oss_flex_mask():
         return False
     if _GPT_OSS_FLEX_MASK not in ALL_MASK_ATTENTION_FUNCTIONS._global_mapping:
         ALL_MASK_ATTENTION_FUNCTIONS.register(_GPT_OSS_FLEX_MASK, _gpt_oss_flex_mask)
-    if not hasattr(_FlexBlockMask, "contiguous"):
-        # transformers >= 5.21 generate calls .contiguous() on every mask it builds.
-        _FlexBlockMask.contiguous = lambda self, *args, **kwargs: self
-    if not getattr(_FlexBlockMask.to, "_unsloth_gpt_oss", False):
-        # accelerate moves masks with .to(), which leaves captured tensors behind.
-        _block_mask_to = _FlexBlockMask.to
-        def to(self, device, *args, **kwargs):
-            on_device = getattr(self, "_unsloth_on_device", None)
-            if on_device is not None and isinstance(device, (str, int, torch.device)):
-                return on_device(device)
-            return _block_mask_to(self, device, *args, **kwargs)
-        to._unsloth_gpt_oss = True
-        _FlexBlockMask.to = to
+    from unsloth_zoo.flex_attention.decode import install_block_mask_transfer
+    install_block_mask_transfer()
     return True
 
 
@@ -3360,6 +3572,34 @@ def patch_GptOssAttention():
 
     pass
 
+    def autograd_eager_attention_forward(
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        scaling: float,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        # Out-of-place twin of the in-place path, used when an eval forward carries a graph.
+        key_states = repeat_kv(key, module.num_key_value_groups)
+        value_states = repeat_kv(value, module.num_key_value_groups)
+        key_states, value_states, attention_mask = _align_kv_to_mask(
+            key_states, value_states, attention_mask
+        )
+        attn_weights = matmul(query, key_states.transpose(2, 3)) * scaling
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
+        sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+        combined_logits = torch.cat([attn_weights, sinks.to(attn_weights.dtype)], dim=-1)
+        probs = F_softmax(combined_logits, dim=-1, dtype=torch.float32)
+        attn_weights = F_dropout(probs[..., :-1], p=dropout, training=module.training)
+        attn_output = matmul(attn_weights.to(value_states.dtype), value_states)
+        return attn_output.transpose(1, 2).contiguous(), None
+
+    pass
+
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
     if False:  # Version(torch.__version__) >= Version("2.10.0"):
         eager_attention_forward = torch_compile(eager_attention_forward, dynamic=None, fullgraph=True)
@@ -3427,9 +3667,23 @@ def patch_GptOssAttention():
                 attention_mask,
             )
             attn_weights = None
+        elif (
+            query_states.shape[-2] == 1
+            and _gpt_oss_dense_decode_mask_ok(attention_mask, query_states.shape[1])
+            and _gpt_oss_graph_dense_attention(hidden_states)
+        ):
+            # One-token step of a CUDA-graph decode: the dense mask is a graph input, no BlockMask closure.
+            attn_output, attn_weights = _gpt_oss_decode_attention(
+                self, query_states, key_states, value_states, attention_mask, self.scaling,
+            )
         else:
             # Dense mask: UNSLOTH_GPT_OSS_EAGER_INFERENCE=1, CPU, or a caller-built 4D mask.
-            attn_output, attn_weights = eager_attention_forward(
+            _needs_grad = torch.is_grad_enabled() and (
+                query_states.requires_grad or key_states.requires_grad
+                or value_states.requires_grad or self.sinks.requires_grad
+            )
+            attention = autograd_eager_attention_forward if _needs_grad else eager_attention_forward
+            attn_output, attn_weights = attention(
                 self,
                 query_states,
                 key_states,
@@ -3609,10 +3863,11 @@ def patch_GptOssModel():
                 if (
                     getattr(_config, "model_type", None) == "gpt_oss"
                     and input_embeds is not None
-                    and _gpt_oss_flex_inference(input_embeds.device)
+                    and _gpt_oss_flex_inference(_gpt_oss_mask_device(input_embeds, args, kwargs))
                     and _register_gpt_oss_flex_mask()
                 ):
-                    target = _GPT_OSS_FLEX_MASK
+                    # CUDA-graph decode steps take dense masks (_gpt_oss_dense_graph_decode).
+                    target = "eager" if _gpt_oss_dense_graph_decode(input_embeds) else _GPT_OSS_FLEX_MASK
                 elif _is_flex:
                     target = "eager"
                 if target is not None and target != _config._attn_implementation:
@@ -3821,9 +4076,13 @@ def patch_GptOssModel():
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
+        # Match stock: an omitted use_cache follows the config, else a manual prefill loses its cache.
+        if use_cache is None and not self.training:
+            use_cache = getattr(self.config, "use_cache", False)
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
+        embeds_from_ids = inputs_embeds is None
         if inputs_embeds is None:
             # Account for CPU offloaded embed_tokens
             embed_device = self.embed_tokens.weight.device
@@ -3843,7 +4102,7 @@ def patch_GptOssModel():
                 inputs_embeds = self.embed_tokens(
                     input_ids.to(embed_device, non_blocking = embed_device.type != "cpu")
                 ).to(input_ids.device)
-        if not self.training and inputs_embeds.requires_grad:
+        if not self.training and embeds_from_ids and inputs_embeds.requires_grad:
             # detach, not requires_grad_(False): the embeddings are a non-leaf when an input
             # requires-grad hook or an offloaded copy produced them, and that raises.
             inputs_embeds = inputs_embeds.detach()
@@ -3875,7 +4134,7 @@ def patch_GptOssModel():
             _swap_target = None
             if not self.training:
                 if _gpt_oss_flex_inference(inputs_embeds.device) and _register_gpt_oss_flex_mask():
-                    _swap_target = _GPT_OSS_FLEX_MASK
+                    _swap_target = "eager" if _gpt_oss_dense_graph_decode(inputs_embeds) else _GPT_OSS_FLEX_MASK
                 elif _orig_attn_impl == "flex_attention":
                     _swap_target = "eager"
             _swap_attn_impl = _swap_target is not None and _swap_target != _orig_attn_impl
@@ -3909,7 +4168,12 @@ def patch_GptOssModel():
         _cross_card = getattr(block_swap, "spans_devices", False) or (
             _swap_device is not None and hidden_states.device != _swap_device
         ) or _gpt_oss_layers_span_devices(self.layers, hidden_states.device)
-        if not self.training and qlen == 1 and isinstance(attention_mask, dict) and not _cross_card:
+        # The in-place decode fast path has no backward, so grad-bearing embeddings skip it.
+        _needs_grad = torch.is_grad_enabled() and hidden_states.requires_grad
+        if (
+            not self.training and qlen == 1 and isinstance(attention_mask, dict)
+            and not _cross_card and not _needs_grad
+        ):
             # Add hack since residuals need to clone outside of the torch.compile region??
             # This forces it to free past residuals
             if not torch.compiler.is_compiling():
@@ -4442,8 +4706,8 @@ try:
             return raise_error("transformers.models.gpt_oss.configuration_gpt_oss", e)
 
         try:
-            current_class = dedent(inspect.getsource(transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig))
-            new_class = dedent(inspect.getsource(Old_GptOssConfig))
+            current_class = dedent(_class_source(transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig))
+            new_class = dedent(_class_source(Old_GptOssConfig))
             new_class = new_class.replace("Old_GptOssConfig", "GptOssConfig")
             if new_class == current_class:
                 logger.info("Unsloth: Updating GPT OSS Config to fix missing `max_position_embeddings`")

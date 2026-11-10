@@ -25,6 +25,7 @@ __all__ = [
 
 from typing import Union, Callable, Optional, List, Dict
 import itertools as _itertools
+from bisect import bisect_left as _bisect_left
 import torch
 
 def _iterable_batch_size(dataset, default = 1000):
@@ -178,7 +179,7 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
 pass
 
 
-_MARKER_EDGE_PROBES = ("\\", "{", "a", "A", "1", "(", ".", "<", "}", ">")
+_MARKER_EDGE_PROBES = ("\\", "{", "a", "A", "1", "(", ".", "<", "}", ">", "\n")
 
 
 def _stable_marker_edges(component, original, tokenizer):
@@ -919,6 +920,7 @@ def train_on_responses_only(
     if bos_token_id is not None: boundary_first.add(bos_token_id)
     if eos_token_id is not None: boundary_first.add(eos_token_id)
     if message_start: boundary_first.add(message_start[0])
+    inner_stop_ids = tuple(boundary_first | {Q_first})
 
     torch_Tensor = torch.Tensor
     torch_int64  = torch.int64
@@ -979,9 +981,15 @@ def train_on_responses_only(
                 assert(n == len(old_labels))
             n_minus_1 = n - 1
             j = 0
+            # Plain lists jump with list.index to the only ids a step acts on; other row types step.
+            is_list = type(input_ids) is list
+            stops = None
 
             spans = []
             while j < n:
+                if is_list:
+                    try: j = input_ids.index(A_first, j)
+                    except ValueError: break
                 if (input_ids[j] == A_first) and \
                     (input_ids[j : (k := j + len_A_must)] == A_must):
 
@@ -999,8 +1007,23 @@ def train_on_responses_only(
                     assistant_k = k
 
                     j = assistant_k
+                    if is_list and stops is None:
+                        # j can step back, so bisect, not a cursor.
+                        stops = []
+                        for stop_id in inner_stop_ids:
+                            i = -1
+                            while True:
+                                try: i = input_ids.index(stop_id, i + 1)
+                                except ValueError: break
+                                stops.append(i)
+                        stops.sort()
+                        n_stops = len(stops)
                     # Keep the assistant's EOS, but never span another message/sample.
                     while j < n:
+                        if is_list:
+                            # Between stops a step only does j += 1; the last token always acts.
+                            s = _bisect_left(stops, j)
+                            j = stops[s] if s < n_stops else n_minus_1
                         token = input_ids[j]
                         if token in boundary_first:
                             if token == eos_token_id:
@@ -2669,8 +2692,16 @@ def standardize_data_formats(
         # multiprocessing's start method while datasets uses multiprocess, and it
         # fell back to num_proc = 1 under memory pressure -- which is a Pool(1)
         # on datasets >= 4.1, the pool this exists to avoid.
-        from .dataset_num_proc import get_dataset_num_proc
-        dataset_map_kwargs['num_proc'] = get_dataset_num_proc(num_proc)
+        from .dataset_num_proc import environment_override, get_dataset_num_proc
+        # Per-row work is tiny, so a pool mostly pickles shards: in-memory defaults stay in process (as Studio's copy does).
+        if (
+            num_proc is None
+            and not getattr(dataset, "cache_files", None)
+            and not environment_override()[0]
+        ):
+            dataset_map_kwargs['num_proc'] = None
+        else:
+            dataset_map_kwargs['num_proc'] = get_dataset_num_proc(num_proc)
         dataset_map_kwargs['desc'] = "Unsloth: Standardizing formats"
 
     return dataset.map(
@@ -2787,7 +2818,7 @@ def sft_prepare_dataset(
     map_kwargs = {}
     use_desc = isinstance(dataset, Dataset)
     # Imported here: this function's source is copied into the compiled trainer module.
-    from unsloth_zoo.dataset_utils import _batched_columns
+    from unsloth_zoo.dataset_utils import _batched_columns, _iterable_batch_size
     is_vlm = hasattr(processing_class, "tokenizer")
     tokenizer = processing_class
     if is_vlm: tokenizer = processing_class.tokenizer
@@ -3286,12 +3317,18 @@ def sft_prepare_dataset(
         if not completion_only_loss and "completion_mask" in mask_columns:
             mask_columns.remove("completion_mask")
         if mask_columns:
+            def _labels_row(input_ids, masks):
+                # Unrolled for one or two masks: `all(m)` built a list per token. Same truthiness as all().
+                if len(masks) == 1:
+                    return [t if m else -100 for t, m in zip(input_ids, masks[0])]
+                if len(masks) == 2:
+                    return [t if a and b else -100 for t, a, b in zip(input_ids, masks[0], masks[1])]
+                return [t if all(m) else -100 for t, *m in zip(input_ids, *masks)]
             def _build_labels(example):
-                masks = [example[x] for x in mask_columns]
-                return {"labels": [t if all(m) else -100 for t, *m in zip(example["input_ids"], *masks)]}
+                return {"labels": _labels_row(example["input_ids"], [example[x] for x in mask_columns])}
             def _build_labels_batched(batch):
                 return {"labels": [
-                    [t if all(m) else -100 for t, *m in zip(input_ids, *masks)]
+                    _labels_row(input_ids, masks)
                     for input_ids, *masks in zip(batch["input_ids"], *(batch[x] for x in mask_columns))
                 ]}
             label_kwargs = {}

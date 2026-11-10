@@ -1672,11 +1672,24 @@ def _bind_mamba_ssm_to_torch_reference():
     if _original is None:
         return  # transformers < 5.15: gated by is_fast_path_available instead
 
+    def _refuse_packed_calls(torch_function, func_name):
+        # The reference cannot keep packed sequences apart (seq_idx is ignored): refuse them, as transformers 5.22+ does.
+        @functools.wraps(torch_function)
+        def reference(*args, **kwargs):
+            if kwargs.get("cu_seqlens") is not None or kwargs.get("seq_idx") is not None:
+                raise ValueError(
+                    f"Unsloth: `{func_name}` runs its PyTorch reference here (mamba_ssm's kernels cannot run "
+                    f"on this GPU), which can't keep packed sequences apart. Turn off packing / padding-free."
+                )
+            return torch_function(*args, **kwargs)
+        return reference
+
     if not _hub_func_factory_patched(_original, "_unsloth_mamba_ssm_torch"):
         def use_kernel_func_from_hub_with_fallback(func_name, package, internal_path = None):
             if package != "mamba_ssm":
                 return _original(func_name, package, internal_path)
             def decorator(torch_function):
+                torch_function = _refuse_packed_calls(torch_function, func_name)
                 try:
                     return _hk.use_kernel_forward_from_hub(func_name)(torch_function)
                 except Exception:
@@ -1712,7 +1725,7 @@ def _bind_mamba_ssm_to_torch_reference():
                     _reference = _reference.__wrapped__
                 if _reference is _fn or str(getattr(_reference, "__module__", "")).startswith("mamba_ssm"):
                     continue
-                setattr(_module, _name, _reference)
+                setattr(_module, _name, _refuse_packed_calls(_reference, _name))
             except Exception:
                 pass
 pass
@@ -2263,7 +2276,12 @@ def patch_gradient_checkpointing_enable_inherit():
         from transformers import PreTrainedModel
     except Exception as e:
         return raise_error("transformers.PreTrainedModel", e)
-    original = PreTrainedModel.gradient_checkpointing_enable
+    # transformers >= 5.23: the Trainer's activation_checkpointing_enable skips a class-level patch of the old name.
+    name = next(
+        (n for n in ("_activation_checkpointing_enable", "activation_checkpointing_enable") if hasattr(PreTrainedModel, n)),
+        "gradient_checkpointing_enable",
+    )
+    original = getattr(PreTrainedModel, name)
     if getattr(original, "_unsloth_gc_inherit", False):
         return
 
@@ -2280,7 +2298,7 @@ def patch_gradient_checkpointing_enable_inherit():
         return original(self, *args, **kwargs)
     gradient_checkpointing_enable._unsloth_gc_inherit = True
     gradient_checkpointing_enable._unsloth_original = original
-    PreTrainedModel.gradient_checkpointing_enable = gradient_checkpointing_enable
+    setattr(PreTrainedModel, name, gradient_checkpointing_enable)
 pass
 TEMPORARY_PATCHES.append(patch_gradient_checkpointing_enable_inherit)
 
@@ -2805,17 +2823,22 @@ def patch_trl_push_to_hub_token():
 
     TRL 0.22.x-0.27.1 bare-pop "push_to_hub_token" in SFTTrainer /
     IterativeSFTTrainer __init__, but transformers 5.0+ drops it from
-    to_dict(), so the pop raises KeyError.
+    to_dict(), so the pop raises KeyError. TRL 0.27.2+ pops it only below
+    transformers 5 and SFTConfig rejects the key, so skip the patch there.
     """
     try:
         from unsloth_zoo.utils import Version
+        import importlib.metadata
         import transformers
         if Version(transformers.__version__) < Version("5.0.0"):
             return  # Not needed pre-5.0, to_dict() already includes it
+        if Version(importlib.metadata.version("trl")) >= Version("0.27.2"):
+            return
         from transformers import TrainingArguments
         _original_to_dict = TrainingArguments.to_dict
         if getattr(_original_to_dict, "_unsloth_patched", False):
             return
+        @functools.wraps(_original_to_dict)
         def _patched_to_dict(self):
             d = _original_to_dict(self)
             if "push_to_hub_token" not in d:
