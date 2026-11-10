@@ -483,6 +483,10 @@ def unsloth_flex_decode_attention(
         except FlexDecodeUnavailable:
             pass
     if is_block_mask:
+        kv_len = attention_mask.seq_lengths[1]
+        if key.shape[-2] > kv_len:
+            # As the flex path: slots past the mask's KV length are not part of this step.
+            key, value = key[:, :, :kv_len], value[:, :, :kv_len]
         attention_mask = dense_decode_mask(attention_mask, key.shape[-2], query.device)
     if softcap or s_aux is not None:
         if attention_mask is not None and attention_mask.dtype != torch.bool:

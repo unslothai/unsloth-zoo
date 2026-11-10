@@ -432,3 +432,15 @@ def test_reference_fallback_keeps_finite_additive_mask_penalties(which):
     full = torch.full((1, 1, 1, 2), torch.finfo(torch.float32).min)
     out, _ = D.unsloth_flex_decode_attention(module, q, k, v, full, scaling = 1.0, **extra)
     torch.testing.assert_close(out[0, 0, 0], torch.zeros(4))
+
+
+def test_dense_fallback_aligns_longer_key_value_to_the_mask(monkeypatch):
+    # Key / value longer than the BlockMask's KV length: the fallback must slice them as the flex path does.
+    monkeypatch.setattr(D, "flex_decode_supported", lambda *args: False)
+    _, q, k, v = _qkv(2, 4, 2, 8, 16, seed = 5)
+    bm = D.decode_block_mask(2, 4, torch.tensor(3), attention_mask = _pads(4, 0, 1), device = "cpu")
+    out, _ = D.unsloth_flex_decode_attention(_Attn(), q, k, v, bm, scaling = 0.25)
+    want, _ = D.unsloth_flex_decode_attention(
+        _Attn(), q, k[:, :, :4], v[:, :, :4], bm, scaling = 0.25
+    )
+    torch.testing.assert_close(out, want)
