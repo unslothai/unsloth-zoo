@@ -133,3 +133,18 @@ def test_a_late_out_of_range_batch_leaves_the_counts_untouched(monkeypatch):
     final_counts = np.zeros(V, dtype = np.int64)
     assert tokenizer_utils._count_input_ids_arrow(train_dataset, final_counts) is False
     assert final_counts.tolist() == [0] * V
+
+
+def test_one_large_chunk_is_flushed_in_bounded_slices(monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+    monkeypatch.setattr(tokenizer_utils, "_COUNT_INPUT_IDS_ARROW_FLUSH_IDS", 7)
+    ids = np.arange(60, dtype = np.int32) % V
+    column = pa.ListArray.from_arrays(pa.array(np.arange(0, 61, 6, dtype = np.int32)), pa.array(ids))
+    train_dataset = datasets.Dataset(pa.table({"input_ids" : column}))
+    assert train_dataset.data["input_ids"].num_chunks == 1
+    sizes, bincount = [], np.bincount
+    monkeypatch.setattr(np, "bincount", lambda x, **kwargs: (sizes.append(len(x)), bincount(x, **kwargs))[1])
+    final_counts = np.zeros(V, dtype = np.int64)
+    assert tokenizer_utils._count_input_ids_arrow(train_dataset, final_counts) is True
+    assert max(sizes) <= 7 and sum(sizes) == 60
+    assert final_counts.tolist() == bincount(ids, minlength = V).tolist()

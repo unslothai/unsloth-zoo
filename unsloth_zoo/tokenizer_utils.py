@@ -393,12 +393,17 @@ def _count_input_ids_arrow(train_dataset, final_counts):
             for chunk in column.chunks:
                 flat = pc.list_flatten(chunk)
                 if flat.null_count != 0: return False
-                if len(flat) == 0: continue
-                pending.append(flat.to_numpy())
-                n_pending += len(flat)
-                if n_pending >= _COUNT_INPUT_IDS_ARROW_FLUSH_IDS:
-                    if not flush(): return False
-                    n_pending = 0
+                # Sliced to the flush capacity: one in-memory chunk can hold the whole batch.
+                start = 0
+                while start < len(flat):
+                    take = min(len(flat) - start, _COUNT_INPUT_IDS_ARROW_FLUSH_IDS - n_pending)
+                    pending.append(flat.slice(start, take).to_numpy())
+                    n_pending += take
+                    start += take
+                    if n_pending >= _COUNT_INPUT_IDS_ARROW_FLUSH_IDS:
+                        if not flush(): return False
+                        n_pending = 0
+                pass
             pass
         pass
         if pending and not flush(): return False
