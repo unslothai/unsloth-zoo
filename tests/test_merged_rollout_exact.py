@@ -140,12 +140,36 @@ def test_fixup_store_is_small_for_small_deltas():
     assert stats["bad"] / stats["elements"] < 0.01
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_store_needs_no_positions(dtype):
+    # Trained-size adapter (|d| about 10% of |W|): the old store took 6 B per inexact element; the stream takes a few bits.
+    W, A, B, scale = _dense(1024, 4096, 16, 1e-1, dtype)
+    W0 = W.clone()
+    t = _target(W, A, B, scale)
+    stats = ex.exact_fold([t])
+    host = sum(b.nbytes for b in (t.host_words, t.host_wcnt, t.host_idx, t.host_val))
+    escapes = t.host_idx.numel()
+    assert stats["bad"] > 0.01 * stats["elements"]
+    assert host == stats["store_bytes"]
+    assert host < 0.25 * 6 * stats["bad"]
+    # Escapes are what no code can name from (new, d): exponent-gap-0 ties (|c| = 1 while r = 0, so unfold cannot tell
+    # which of them moved) and gaps over 7 (tiny weights next to a large delta, |c| up to ~2^15). Measured on this
+    # adapter: bf16 1.3-1.4% of the inexact elements (bf16's 8-bit mantissa ties far more often), fp16 0.2%.
+    # Widening the code to gap 8 or 15 only removes 17% / 31% of the bf16 escapes, so the codes stay at gap 7.
+    assert escapes < (0.02 if dtype == torch.bfloat16 else 0.005) * stats["bad"]
+    # Escapes stay a small part of the store (6 B each against the stream's few bits per inexact element).
+    assert escapes * 6 < 0.2 * host
+    ex.exact_unfold([t])
+    assert torch.equal(_bits(W), _bits(W0))
+
+
 def test_corrupted_fixup_store_is_caught():
     W, A, B, scale = _dense(256, 1024, 16, 1e-2)
     t = _target(W, A, B, scale)
     stats = ex.exact_fold([t])
     assert stats["bad"] > 0
-    t.host_val[0] = t.host_val[0] + 1   # flip: a wrong original value must not pass silently
+    nz = (t.host_words != 0).nonzero()
+    t.host_words[nz[0, 0]] ^= 1 << 2   # flip: a wrong correction must not pass silently
     with pytest.raises(RuntimeError, match = "checksum mismatch"):
         ex.exact_unfold([t])
 
@@ -178,7 +202,7 @@ def test_disable_pinned_memory_uses_pageable_stores(monkeypatch):
     W0 = W.clone()
     t = _target(W, A, B, scale)
     ex.exact_fold([t], stream = torch.cuda.Stream())
-    assert t.host_val.numel() > 0 and not t.host_val.is_pinned() and not t.host_idx.is_pinned()
+    assert t.host_words.numel() > 0 and not t.host_words.is_pinned() and not t.host_wcnt.is_pinned()
     ex.exact_unfold([t], stream = torch.cuda.Stream())
     assert torch.equal(_bits(W), _bits(W0))
 
@@ -194,7 +218,7 @@ def test_pinning_failure_falls_back_to_pageable(monkeypatch):
     W0 = W.clone()
     t = _target(W, A, B, scale)
     ex.exact_fold([t], stream = torch.cuda.Stream())
-    assert not t.host_val.is_pinned()
+    assert not t.host_words.is_pinned()
     ex.exact_unfold([t], stream = torch.cuda.Stream())
     assert torch.equal(_bits(W), _bits(W0))
 

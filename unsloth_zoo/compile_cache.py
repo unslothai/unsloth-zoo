@@ -394,6 +394,41 @@ def _merge_recorded_artifacts(data):
 pass
 
 
+@contextlib.contextmanager
+def _compile_lock(timeout = 30.0):
+    """Dynamo's compile lock, so artifacts recorded mid-compile cannot fall between the requeue and serialize.
+    Bounded: at exit a daemon thread may hold it forever, and then the save runs unlocked as before."""
+    try:
+        from torch._dynamo.convert_frame import compile_lock
+    except Exception:
+        compile_lock = None
+    locked = compile_lock is not None and compile_lock.acquire(timeout = timeout)
+    try:
+        yield
+    finally:
+        if locked:
+            compile_lock.release()
+pass
+
+
+def _requeue_every_recorded_artifact():
+    """Deserialize keeps only the last batch per kind, so a second save would drop the first's artifacts: re-queue them all."""
+    try:
+        from torch.compiler._cache import CacheArtifactManager
+        recorded = list(CacheArtifactManager._seen_artifacts)
+        grouped = {}
+        for artifact in recorded:
+            grouped.setdefault(artifact.type(), []).append(artifact)
+        CacheArtifactManager._serializer.clear()
+        CacheArtifactManager._cache_info.clear()
+        CacheArtifactManager._new_cache_artifacts.clear()
+        for artifact_type, items in grouped.items():
+            CacheArtifactManager._new_cache_artifacts[artifact_type] = items
+    except Exception as error:
+        _log(f"artifact requeue skipped ({error})")
+pass
+
+
 def _recorded_identities():
     """Identities torch's artifact manager holds now, or None."""
     try:
@@ -593,9 +628,11 @@ def _save_locked(torch, key, directory, manifest_path):
     """Body of ``megacache_save`` run under the per-key lock."""
     # Fold the on-disk bundle into the manager before serializing so a partial run cannot narrow it (union semantics; see _merge_recorded_artifacts).
     _, existing = _read_disk_bundle(directory, manifest_path)
-    disk_ids = _merge_recorded_artifacts(existing) if existing is not None else None
-    # Always serialize: it also records deferred Dynamo precompile entries.
-    result = torch.compiler.save_cache_artifacts()
+    with _compile_lock():
+        disk_ids = _merge_recorded_artifacts(existing) if existing is not None else None
+        _requeue_every_recorded_artifact()
+        # Always serialize: it also records deferred Dynamo precompile entries.
+        result = torch.compiler.save_cache_artifacts()
     if not result or not result[0]:
         _log("nothing to save (no compile artifacts recorded)")
         return False

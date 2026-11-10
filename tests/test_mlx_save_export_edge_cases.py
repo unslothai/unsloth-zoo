@@ -1716,6 +1716,23 @@ def test_push_to_hub_gguf_keeps_the_folder_upload_for_a_save_reporting_nothing(
     assert uploaded == ["EdgeModel.Q8_0.gguf"]
 
 
+def test_push_to_hub_gguf_refuses_an_empty_manifest(monkeypatch, tmp_path):
+    mutils, _ = _gguf_export_scaffold(monkeypatch, tmp_path)
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "OtherPrivateModel.Q4_K_M.gguf").write_bytes(b"GGUF-earlier-export")
+    monkeypatch.setattr(mutils, "save_pretrained_gguf", lambda *a, **k: {"gguf_files": []})
+    uploaded = _capture_gguf_uploads(monkeypatch, mutils)
+    with pytest.raises(RuntimeError, match="reported no files"):
+        mutils.push_to_hub_gguf(
+            types.SimpleNamespace(_hf_repo="org/EdgeModel"),
+            tokenizer=object(),
+            save_directory=out,
+            repo_id="org/EdgeModel",
+        )
+    assert uploaded == []
+
+
 # --- Group 12: concurrency over the patcher env mutation ---
 
 
