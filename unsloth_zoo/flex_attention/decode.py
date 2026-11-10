@@ -318,7 +318,6 @@ class FlexDecodeUnavailable(RuntimeError):
 # Dynamo suppress_errors would turn a failed compile into silent slow eager flex: the first call per shape raises
 # instead, and failed shapes are reported unavailable so callers keep the dense path.
 _FAILED_SHAPES = set()
-_COMPILED_SHAPES = set()
 
 
 def _shape_key(query, key, kernel_options, softcap):
@@ -361,11 +360,13 @@ def flex_decode_attention(query, key, value, block_mask, scale = None, *, sinks 
             **_LSE_KWARGS,
         ))
     shape = _shape_key(query, key, kernel_options, softcap) if compiled and not torch.compiler.is_compiling() else None
-    if shape is None or shape in _COMPILED_SHAPES:
+    if shape is None:
         out, lse = call()
     elif shape in _FAILED_SHAPES:
         raise FlexDecodeUnavailable("Unsloth: flex_decoding failed to compile for this layer shape.")
     else:
+        # Every call keeps the guard: scale, strides or the mask closure can still trigger a new specialisation,
+        # and a suppressed failure would silently run eager flex instead of falling back.
         try:
             with torch._dynamo.config.patch(suppress_errors = False):
                 out, lse = call()
@@ -378,7 +379,6 @@ def flex_decode_attention(query, key, value, block_mask, scale = None, *, sinks 
                 f"Unsloth: flex_decoding failed to compile for head_dim {query.shape[-1]}, {query.shape[1]} / "
                 f"{key.shape[1]} heads, {query.dtype}: {str(error)[:200]}"
             ) from error
-        _COMPILED_SHAPES.add(shape)
     compute = torch.promote_types(out.dtype, torch.float32)
     lse = lse.to(compute)
     empty = torch.isneginf(lse).unsqueeze(-1)

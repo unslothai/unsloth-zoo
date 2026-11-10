@@ -228,7 +228,6 @@ def test_unsloth_attention_serves_the_same_visibility_densely_when_flex_decoding
         monkeypatch.setattr(D, "_flex_function", lambda device: (failing_compiled_flex, True))
         monkeypatch.setattr(D, "flex_decode_supported", lambda *args: True)
         monkeypatch.setattr(D, "_FAILED_SHAPES", set())
-        monkeypatch.setattr(D, "_COMPILED_SHAPES", set())
         monkeypatch.setattr(torch._dynamo.config, "suppress_errors", True)
     else:
         assert not D.flex_decode_supported(d, 4, 2, torch.float64, "cpu")
@@ -386,30 +385,34 @@ def test_reference_fallback_keeps_an_elided_causal_mask_and_attention_dropout(wh
     torch.testing.assert_close(clean, again)
 
 
-def test_a_new_batch_after_a_compiled_one_still_gets_failure_handling(monkeypatch):
-    # A success at one batch size must not send a later specialisation (batch is static) down the unguarded path.
+@pytest.mark.parametrize("change", ["batch", "scale"])
+def test_a_new_specialisation_after_a_compiled_call_still_gets_failure_handling(monkeypatch, change):
+    # A success must not send a later specialisation (batch is static; scale, strides, the mask closure) down an
+    # unguarded path where a suppressed compile failure would silently run eager flex.
     calls = []
 
     def compiled_flex(query, key, value, **kwargs):
-        calls.append(query.shape[0])
-        if query.shape[0] == 2:
+        calls.append((query.shape[0], kwargs["scale"]))
+        assert torch._dynamo.config.suppress_errors is False
+        if query.shape[0] == 2 or kwargs["scale"] == 0.5:
             raise RuntimeError("No valid triton configs")
         lse = torch.zeros(query.shape[:-1], dtype = torch.float32)
         return torch.zeros_like(query), lse
 
     monkeypatch.setattr(D, "_flex_function", lambda device: (compiled_flex, True))
     monkeypatch.setattr(D, "_FAILED_SHAPES", set())
-    monkeypatch.setattr(D, "_COMPILED_SHAPES", set())
     monkeypatch.setattr(D, "_output_and_lse", lambda result: result)
-    for batch, fails in ((1, False), (2, True)):
+    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", True)
+    second = (2, 0.25) if change == "batch" else (1, 0.5)
+    for (batch, scale), fails in (((1, 0.25), False), (second, True)):
         _, q, k, v = _qkv(batch, 4, 2, 64, 16, seed = 0)
         bm = D.decode_block_mask(batch, 64, torch.tensor(63), device = "cpu")
         if fails:
             with pytest.raises(D.FlexDecodeUnavailable):
-                D.flex_decode_attention(q, k, v, bm, 0.25)
+                D.flex_decode_attention(q, k, v, bm, scale)
         else:
-            D.flex_decode_attention(q, k, v, bm, 0.25)
-    assert calls == [1, 2]
+            D.flex_decode_attention(q, k, v, bm, scale)
+    assert calls == [(1, 0.25), second]
 
 
 def test_block_starts_are_built_once_per_shape():
