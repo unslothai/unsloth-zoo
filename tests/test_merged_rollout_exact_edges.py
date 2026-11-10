@@ -284,11 +284,15 @@ if __name__ == "__main__":
     for dtype, fractions in report.items():
         print(dtype, " ".join(f"{s:g}:{100 * f:.1f}%" for s, f in fractions))
     run_random("cpu", cycles = 20, rows = 32)
-    ex._BLOCK_N, ex._BLOCK_K = blocks
     subset = {torch.float16: (2.0**-25, 2.0**-11, 65504.0), torch.bfloat16: (2.0**-134, 2.0**-9, 3.3e38)}
-    for fmt in (STREAM, INDEXED, CHOSEN):
+    # The store formats only change how corrections are encoded, so the indexed and chosen forms run on the large
+    # interpreter tiles; the production tiles (about 2 minutes per format under the interpreter) run once.
+    for fmt in (INDEXED, CHOSEN):
         with store_format(fmt):
             run_edges("cpu", scales = subset, multipliers = (1.0, -1.5))
+    ex._BLOCK_N, ex._BLOCK_K = blocks
+    with store_format(STREAM):
+        run_edges("cpu", scales = subset, multipliers = (1.0, -1.5))
     assert COVERAGE.get("indexed")
     run_negative("cpu")
     print("EDGES OK")
