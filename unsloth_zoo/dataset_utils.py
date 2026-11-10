@@ -2818,7 +2818,7 @@ def sft_prepare_dataset(
     map_kwargs = {}
     use_desc = isinstance(dataset, Dataset)
     # Imported here: this function's source is copied into the compiled trainer module.
-    from unsloth_zoo.dataset_utils import _batched_columns
+    from unsloth_zoo.dataset_utils import _batched_columns, _iterable_batch_size
     is_vlm = hasattr(processing_class, "tokenizer")
     tokenizer = processing_class
     if is_vlm: tokenizer = processing_class.tokenizer
