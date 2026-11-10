@@ -265,8 +265,11 @@ def test_launch_failure_falls_back_per_shape(monkeypatch):
     assert nf.maybe_nf4_grouped_mm(x, offsets, p, pre) is None   # that stack now keeps the dequant path
 
 
-def test_auto_switch_boundary(monkeypatch):
-    # auto: fused at or below the rows-per-expert limit (from shapes), the dequant path above it.
+@pytest.mark.parametrize("in_op", ["0", "1"])
+def test_auto_switch_boundary(monkeypatch, in_op):
+    # auto: fused at or below the rows-per-expert limit, the dequant path above it: decided in Python (in_op 0,
+    # None returned) or inside the op on the runtime rows (in_op 1, the dequant + grouped GEMM result returned).
+    monkeypatch.setenv("UNSLOTH_MOE_NF4_AUTO_IN_OP", in_op)
     torch.manual_seed(9)
     E, K, N = 8, 128, 192
     dt = torch.bfloat16 if HAS_BF16 else torch.float16
@@ -284,7 +287,14 @@ def test_auto_switch_boundary(monkeypatch):
         x = torch.randn(M, K, device = DEVICE, dtype = dt)
         before = nf.NF4_FUSED_STATS["launches"]
         y = nf.maybe_nf4_grouped_mm(x, offsets, p, pre)
-        assert (y is not None) == fused and (nf.NF4_FUSED_STATS["launches"] > before) == fused
+        assert (nf.NF4_FUSED_STATS["launches"] > before) == fused
+        if in_op == "0":
+            assert (y is not None) == fused
+        else:
+            assert y is not None
+            if not fused:
+                from unsloth_zoo.temporary_patches.moe_utils import _grouped_mm_with_backward_fix
+                assert torch.equal(y, _grouped_mm_with_backward_fix(x, w.to(dt), offsets))
         if fused:
             y64, yd = _oracle(x, w, offsets)
             assert _err(y, y64)[1] <= 2 * _err(yd, y64)[1] + 1e-6
@@ -327,6 +337,54 @@ def test_auto_branch_fullgraph(monkeypatch):
     assert sum(counters["graph_break"].values()) == 0
     # One graph per side of the row guard: the boundary costs exactly one recompile.
     assert counters["stats"]["unique_graphs"] == 2
+
+
+def test_auto_in_op_fullgraph_one_graph(monkeypatch):
+    """The in-op choice: no graph break and one graph across the cap (the Python-side choice above needs two)."""
+    import torch._dynamo
+    from torch._dynamo.utils import counters
+
+    if not HAS_BF16 or nf._AUTO_OP is None:
+        pytest.skip("auto needs sm80+")
+    torch.manual_seed(10)
+    E, K, N = 8, 128, 192
+    p = _stack((E, N, K), torch.bfloat16, True)
+    spec = _spec(p, False, torch.bfloat16)
+    w = _logical(_dequant(p), False).contiguous()
+
+    def fn(h, offsets):
+        y = nf._AUTO_OP(h, spec["packed"], spec["absmax"], spec["code"], spec["absmax2"], spec["code2"], spec["offset"],
+                        offsets, spec["K"], spec["N"], spec["kn_layout"], spec["blocksize"], spec["blocksize2"],
+                        spec["nested"], spec["w_dtype"], 4)
+        return y.float().square().sum()
+
+    torch._dynamo.reset()
+    counters.clear()
+    compiled = torch.compile(fn, fullgraph = True)
+    for M in (16, 24, 32, 40, 64, 48):
+        h = torch.randn(M, K, device = DEVICE, dtype = torch.bfloat16, requires_grad = True)
+        torch._dynamo.mark_dynamic(h, 0)
+        offsets = _routing(E, [M // E] * E)
+        loss = compiled(h, offsets)
+        (g,) = torch.autograd.grad(loss, h)
+        h2 = h.detach().clone().requires_grad_()
+        (g_ref,) = torch.autograd.grad(_oracle_loss(h2, torch.eye(K, device = DEVICE, dtype = torch.bfloat16), w, offsets), h2)
+        assert _err(g, g_ref.double())[1] < 2e-2
+    assert sum(counters["graph_break"].values()) == 0
+    assert counters["stats"]["unique_graphs"] == 1
+
+
+def test_opcheck_auto():
+    if nf._AUTO_OP is None:
+        pytest.skip("custom_op unavailable")
+    torch.manual_seed(3)
+    p = _stack((5, 96, 64), torch.float16, True)
+    spec = _spec(p, False, torch.float16)
+    offsets = _routing(5, [4, 0, 6, 0, 3])
+    for cap in (0, 1):   # 0: always fused; 1: 13 rows > 5, the dequant path
+        x = torch.randn(13, 64, device = DEVICE, dtype = torch.float16, requires_grad = True)
+        args = (x,) + _saved(spec, offsets)[:7] + _saved(spec, offsets)[7:] + (cap,)
+        torch.library.opcheck(torch.ops.unsloth_zoo.nf4_grouped_mm_auto.default, args)
 
 
 def test_opcheck():
