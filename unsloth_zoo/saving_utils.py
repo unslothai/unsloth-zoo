@@ -4315,7 +4315,8 @@ def _snapshot_previous_export_metadata(save_directory):
             if os.path.getsize(path) > _PREVIOUS_EXPORT_METADATA_MAX:
                 return None
             with open(path, "rb") as f:
-                files[path] = (f.read(), stat.S_IMODE(os.stat(path).st_mode))
+                # Permission bits only: a restored file is recreated as ours, so a planted setuid/setgid bit would become ours.
+                files[path] = (f.read(), os.stat(path).st_mode & 0o777)
         shards = set(_export_shard_entries(save_directory))
     except OSError:
         return None
@@ -4451,7 +4452,8 @@ def _ensure_shard_writable(file_path):
     A hard-linked shard gets a private copy first so the write never mutates the cache blob.
     """
     st = os.stat(file_path)
-    mode = stat.S_IMODE(st.st_mode) | stat.S_IWUSR
+    # Permission bits only: the private copy below is created as ours, so never carry a setuid/setgid bit onto it.
+    mode = (st.st_mode & 0o777) | stat.S_IWUSR
     if st.st_nlink > 1:
         _fd, staging = tempfile.mkstemp(
             dir = os.path.dirname(file_path) or os.curdir, prefix = ".unsloth-private-",
