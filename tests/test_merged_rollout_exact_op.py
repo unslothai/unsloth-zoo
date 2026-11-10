@@ -162,6 +162,19 @@ def run_arena_reuse(device):
     assert allocations[1:] == [allocations[0]] * 4, allocations
 
 
+def run_arena_outlives_inference_mode(device):
+    # A first cycle under inference_mode must not leave inference tensors in the arena for later cycles.
+    _fresh_arenas(device)
+    ws, As, Bs = zip(*(_case(device, 64, 256, seed = 25 + i) for i in range(2)))
+    before = [W.clone() for W in ws]
+    for mode in (True, False):
+        with torch.inference_mode(mode):
+            targets = _targets(ws, As, Bs, 2.0)
+            ex.exact_fold(targets)
+            ex.exact_unfold(targets)
+    _restored(ws, before)
+
+
 def run_opcheck(device):
     # opcheck may run the op on argument copies: it checks schema and fake only, restores are checked elsewhere.
     W, A, B = _case(device, 64, 256, seed = 30)
@@ -433,6 +446,7 @@ def run_all(device):
     run_compiled(device)
     run_arena_growth(device)
     run_arena_reuse(device)
+    run_arena_outlives_inference_mode(device)
     run_opcheck(device)
     run_batched_store(device)
     run_unknown_keys(device)

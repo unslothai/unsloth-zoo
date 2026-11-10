@@ -651,7 +651,9 @@ class _HostArena:
 
     def _new(self, nbytes):
         self.allocations += 1
-        return torch.empty(nbytes, dtype = torch.uint8, pin_memory = self.pinned)
+        # Reused across calls: an inference tensor (first call under inference_mode) could not be written later.
+        with torch.inference_mode(False):
+            return torch.empty(nbytes, dtype = torch.uint8, pin_memory = self.pinned)
 
     def capacity(self):
         return sum(c.numel() for c in self.chunks)
@@ -661,7 +663,7 @@ class _HostArena:
 
     def take(self, nbytes):
         nbytes = max(_ALIGN, (nbytes + _ALIGN - 1) // _ALIGN * _ALIGN)
-        with self.lock:
+        with self.lock, torch.inference_mode(False):
             for i, chunk in enumerate(self.chunks):
                 if self.used[i] + nbytes <= chunk.numel():
                     buffer = chunk[self.used[i]:self.used[i] + nbytes]
