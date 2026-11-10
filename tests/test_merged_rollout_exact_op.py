@@ -72,6 +72,15 @@ def test_ops_are_registered():
         assert hasattr(torch.ops.unsloth_zoo, name), name
 
 
+def test_list_ops_stay_eager_where_tensor_lists_cannot_be_functionalized(monkeypatch):
+    # torch 2.4 cannot functionalize a mutated Tensor[]: compiling the list ops failed there.
+    import torch._higher_order_ops.auto_functionalize as af
+
+    monkeypatch.setattr(af, "can_auto_functionalize", lambda op: "weights" not in str(op))
+    fold, unfold, folds, unfolds = ex._register_weight_ops()
+    assert fold is not None and unfold is not None and folds is None and unfolds is None
+
+
 def run_compiled(device):
     # Single and list ops under torch.compile fullgraph on every backend, restoring every weight bit for bit.
     import torch._dynamo
@@ -374,8 +383,24 @@ def run_unfold_failure_keeps_keys(device):
     _restored(ws, before)
 
 
+def run_partial_unfold_is_not_retried(device):
+    # An unfold that raises after its inverse kernels ran (escape restore OOM) must drop its keys: a retry would
+    # subtract the adapter a second time.
+    ws, As, Bs, before = _lists(device, 2, seed = 80)
+    ex.fold_weights_(ws, As, Bs, [0.5, 0.5], [821, 822])
+    with mock.patch.object(ex, "_restore_escapes", side_effect = torch.OutOfMemoryError("out of memory")):
+        with pytest.raises(torch.OutOfMemoryError):
+            ex.unfold_weights_(ws, As, Bs, [0.5, 0.5], [821, 822])
+    after = [_bits(w).clone() for w in ws]
+    assert not any(k[0] in (821, 822) for k in ex._OP_LIVE)
+    with pytest.raises(RuntimeError, match = "were not folded"):
+        ex.unfold_weights_(ws, As, Bs, [0.5, 0.5], [821, 822])
+    assert all(torch.equal(_bits(w), a) for w, a in zip(ws, after))
+
+
 def run_all(device):
     run_empty_tiles(device)
+    run_partial_unfold_is_not_retried(device)
     run_fold_failure_rolls_back(device)
     run_unfold_failure_keeps_keys(device)
     run_compiled(device)

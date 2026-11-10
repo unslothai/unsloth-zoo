@@ -315,7 +315,7 @@ class ExactFoldTarget:
     N, R] take any strides; scale is the LoRA scaling. Between fold and unfold its slice of the call's shared store is
     host_words (int32 bit stream), host_wcnt (int16 words per tile), host_idx / host_val (escapes: flat index, bits)."""
     # All Unsloth Zoo code licensed under LGPLv3
-    __slots__ = ("w", "a", "b", "scale", "store", "slot", "folded", "bad")
+    __slots__ = ("w", "a", "b", "scale", "store", "slot", "folded", "bad", "restoring")
 
     def __init__(self, w_view, a, b, scale):
         assert w_view.dim() == 3 and a.dim() == 3 and b.dim() == 3
@@ -327,6 +327,7 @@ class ExactFoldTarget:
         self.slot = 0
         self.folded = False
         self.bad = 0
+        self.restoring = False
     pass
 
     def grid(self):
@@ -780,6 +781,9 @@ def exact_unfold(targets, stream = None):
     # A fold that failed part way: undo only what was folded, from wherever its store is.
     targets = [t for t in targets if t.folded]
     if not targets: return
+    if any(t.restoring for t in targets):
+        # Its inverse already ran once: a second pass would subtract the adapter twice.
+        raise RuntimeError("Unsloth: exact LoRA unfold was interrupted after it started restoring; cannot retry.")
     if not targets[0].w.is_cuda:
         stream = None  # TRITON_INTERPRET=1 on CPU tensors: no streams
     current = torch.cuda.current_stream(targets[0].w.device) if targets[0].w.is_cuda else None
@@ -808,6 +812,7 @@ def exact_unfold(targets, stream = None):
             after = torch.zeros_like(s.checksum)
             for t in members[id(s)]:
                 if s.tiles[t.slot]: _launch(t, _UNFOLD, woff = woff, wcnt = wcnt, words = words, checksum = after)
+                t.restoring = True
             group = members[id(s)]
             if len(group) == len(s.tiles) and len(group) > 1:
                 _restore_escapes(s, group, idx, val, after)
@@ -825,6 +830,7 @@ def exact_unfold(targets, stream = None):
         for t in members[id(s)]:
             if p[t.slot][0] != p[t.slot][1]: bad.append(t)
             t.folded = False
+            t.restoring = False
             t.store = None
             s.live -= 1
         # The checksum readback above synchronised the device: every copy out of the store has landed.
@@ -938,10 +944,10 @@ def _unfold_weights_impl(
     try:
         exact_unfold(found, stream = _op_stream(ws[0].device))
     except BaseException:
-        # Raised before restoring (say an upload OOM): still-folded targets keep their keys for a retry.
+        # Raised before restoring (say an upload OOM): untouched folded targets keep their keys for a retry.
         with _OP_LOCK:
             for w, k, t in zip(ws, keys, found):
-                if t.folded: _OP_LIVE[(int(k), tuple(w.shape), w.dtype)] = t
+                if t.folded and not t.restoring: _OP_LIVE[(int(k), tuple(w.shape), w.dtype)] = t
         raise
     return _status(rows, ws[0].device)
 pass
@@ -995,6 +1001,13 @@ def _register_weight_ops():
             ops.append(None)
     if None in ops[:2]:
         return None, None, None, None
+    # torch 2.4 cannot functionalize a mutated Tensor[] (compiling the list ops fails): eager impls there.
+    try:
+        from torch._higher_order_ops.auto_functionalize import can_auto_functionalize
+        if not all(op is not None and can_auto_functionalize(op) for op in ops[2:]):
+            ops[2:] = [None, None]
+    except Exception:
+        ops[2:] = [None, None]
     return tuple(ops)
 pass
 
