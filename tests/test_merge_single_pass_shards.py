@@ -36,7 +36,7 @@ def _build(tmp_path, shard_size = "5GB", tied = False):
 
     H.set_offline_cpu_env()
     if not H.family_available("llama"):
-        pytest.skip("llama unavailable")
+        pytest.skip(reason = "installed transformers has no LlamaForCausalLM")
     base = str(tmp_path / "base")
     config = H.make_spec("llama").config
     config.tie_word_embeddings = tied
