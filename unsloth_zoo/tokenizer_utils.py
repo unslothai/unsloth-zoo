@@ -384,8 +384,7 @@ def _count_input_ids_arrow(train_dataset, final_counts):
             if int(ids.min()) < 0 or int(ids.max()) >= len(final_counts): return False
             counts[:] += np.bincount(ids.astype(np.int64, copy = False), minlength = len(final_counts))
             return True
-        # Bounded Arrow batches over input_ids alone (iter applies any select / shuffle / filter indices mapping).
-        # Flattened per chunk: a whole-batch to_numpy concatenates every chunk into one copy of the batch.
+        # iter honours select / shuffle / filter indices; flatten per chunk, a whole-batch to_numpy copies the batch.
         for batch in train_dataset.select_columns(["input_ids"]).with_format("arrow").iter(batch_size = _COUNT_INPUT_IDS_ARROW_BATCH_ROWS):
             column = batch["input_ids"]
             if column.null_count != 0: return False
