@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""unsloth copies sft_prepare_dataset's source into the compiled UnslothSFTTrainer module, where
-dataset_utils' own module globals do not exist, so every helper it calls must be imported inside it.
-CPU-only."""
+"""sft_prepare_dataset's source is copied into the compiled trainer, so it must import its own helpers."""
 
 import ast
 import builtins
@@ -45,7 +43,7 @@ def test_every_dataset_utils_helper_it_calls_is_imported_inside():
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             bound.update((a.asname or a.name).split(".")[0] for a in node.names)
     loaded = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
-    # Dataset / IterableDataset / typing names are also imported by the compiled trainer module itself.
+    # Also imported by the compiled trainer module itself.
     provided = {"Dataset", "IterableDataset", "Any", "Callable", "Optional", "Union", "ConstantLengthDataset"}
     helpers = {
         name for name, value in vars(dataset_utils).items()
