@@ -120,7 +120,9 @@ _AUTO = {
     (8, 0): {"lora": -1, "many": 2048, "few": 512, "dw": 128, "dw_few": 128},
     (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 256, "dw_few": 64},
     (12, 1): {"lora": -1, "many": 2048, "few": 256, "dw": 64, "dw_few": 64},
-    (8, 9): {"lora": -1, "many": 32, "few": 32, "dw": 0, "dw_few": 0},
+    (8, 9): {"lora": -1, "many": 1024, "few": 32, "dw": 0, "dw_few": 0},
+    (8, 6): {"lora": -1, "many": 1024, "few": 32, "dw": 0, "dw_few": 0},
+    (7, 5): {"lora": 64, "many": 0, "few": 0, "dw": 0, "dw_few": 0},
 }
 
 
@@ -131,7 +133,7 @@ def test_gate_table(monkeypatch, cap, kind):
         pytest.skip("gate is off without Triton / custom_op / on HIP")
     _mock_cap(cap)
     auto = _AUTO.get(cap, {}).get(kind, 0)
-    forced = -1 if cap >= (8, 0) else 0
+    forced = -1 if cap >= (8, 0) or (cap == (7, 5) and kind == "lora") else 0
     assert MU._triton_grouped_mm_max_rows(0, kind) == auto
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "auto")
     assert MU._triton_grouped_mm_max_rows(0, kind) == auto
@@ -225,8 +227,21 @@ def test_gate_rows_threshold_and_operands(monkeypatch):
     lora = torch.empty(E, 40, 16, device = "cuda", dtype = torch.bfloat16)
     assert at(100000 * E, weight = lora)                          # LoRA class: no row limit
     _mock_cap((8, 9), index)
+    assert at(32 * E) and not at(32 * E + 1)                     # "few"
+    assert at(1024 * 64, weight = many) and not at(1024 * 64 + 1, weight = many)
+    assert at(100000 * E, weight = lora)
+    _mock_cap((8, 6), index)                                      # unmeasured: sm89's limits (shared tile table)
     assert at(32 * E) and not at(32 * E + 1)
     assert at(100000 * E, weight = lora)
+    _mock_cap((7, 5), index)                                      # T4: LoRA only, rows counted at rank 16
+    assert not at(1) and not at(1, weight = many)
+    assert at(64 * E, weight = lora) and not at(64 * E + 1, weight = lora)
+    lora8 = torch.empty(E, 40, 8, device = "cuda", dtype = torch.bfloat16)
+    assert at(64 * E, weight = lora8) and not at(64 * E + 1, weight = lora8)
+    lora32 = torch.empty(E, 40, 32, device = "cuda", dtype = torch.bfloat16)
+    assert at(32 * E, weight = lora32) and not at(32 * E + 1, weight = lora32)
+    lora32_b = torch.empty(E, 32, 48, device = "cuda", dtype = torch.bfloat16)   # LoRA B: K is the rank
+    assert at(32 * E, weight = lora32_b) and not at(32 * E + 1, weight = lora32_b)
     _mock_cap((9, 0), index)
     assert not at(1)
     _mock_cap((8, 0), index)
@@ -700,3 +715,20 @@ def test_double_backward_matches_torch(monkeypatch, twin):
     ref = second(lambda a, b, o: torch._grouped_mm(a, b, offs = o))
     for a, b in zip(ours, ref):
         assert torch.isfinite(a).all() and (a - b).norm() <= 2e-2 * b.norm()
+
+
+def test_gate_lora_rank_scaling(monkeypatch):
+    """CPU-checkable: a positive LoRA limit counts rows at rank 16; wider ranks count r / 16; -1 stays unlimited."""
+    dev = torch.device("cuda", 0)
+    limits = {}
+    monkeypatch.setattr(MU, "_triton_grouped_mm_max_rows", lambda index, kind = "lora": limits[kind])
+    limits.update(lora = 64, many = 0, few = 0)
+    E = 8
+    assert MU._triton_grouped_mm_rows_ok(dev, 64 * E, E, 2048, 16)
+    assert not MU._triton_grouped_mm_rows_ok(dev, 64 * E + 1, E, 2048, 16)
+    assert MU._triton_grouped_mm_rows_ok(dev, 64 * E, E, 2048, 4)             # below 16 counts as 16
+    assert MU._triton_grouped_mm_rows_ok(dev, 32 * E, E, 32, 1536)            # LoRA B, rank 32
+    assert not MU._triton_grouped_mm_rows_ok(dev, 32 * E + 1, E, 32, 1536)
+    assert not MU._triton_grouped_mm_rows_ok(dev, 1, E, 2048, 1536)           # base GEMM off
+    limits.update(lora = -1)
+    assert MU._triton_grouped_mm_rows_ok(dev, 10 ** 7, E, 2048, 32)
