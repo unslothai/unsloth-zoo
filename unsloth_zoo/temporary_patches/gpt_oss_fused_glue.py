@@ -61,7 +61,10 @@ if triton is not None:
         return x.to(tl.bfloat16).to(tl.float32)
 
     @triton.jit
-    def _gu_sum(GU, B, D, rows, eb, col, mask, s_gu, s_d, s_b, SCALING, ACC_FP32: tl.constexpr, HAS_D: tl.constexpr):
+    def _gu_sum(
+        GU, B, D, rows, eb, col, mask, s_gu, s_d, s_b, SCALING,
+        ACC_FP32: tl.constexpr, HAS_D: tl.constexpr,  # fp32 accumulate / LoRA term
+    ):
         # gate_up.to(acc) + bias[e].to(acc), then + (lora * scaling).to(acc): bf16 adds round, fp32 adds do not.
         v = tl.load(GU + rows[:, None] * s_gu + col, mask = mask, other = 0.0).to(tl.float32)
         b = tl.load(B + eb[:, None] * s_b + col, mask = mask, other = 0.0).to(tl.float32)
