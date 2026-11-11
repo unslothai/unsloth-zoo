@@ -46,8 +46,8 @@ def _clean_env(monkeypatch):
 
 
 def _skip_unless_forcing_engages():
-    # UNSLOTH_MOE_GROUPED_TRITON=1 is a no-op below sm80 by design (_triton_grouped_mm_policy, test_gate_table): T4
-    # keeps torch._grouped_mm, so forced-engagement tests skip there.
+    # For base-sized GEMMs UNSLOTH_MOE_GROUPED_TRITON=1 is a no-op below sm80 by design (_triton_grouped_mm_policy,
+    # test_gate_table): T4 keeps torch._grouped_mm there; only LoRA GEMMs take Triton on sm75.
     if torch.cuda.get_device_capability() < (8, 0):
         pytest.skip("forcing the Triton grouped GEMM is off below sm80 by design")
 
@@ -121,7 +121,7 @@ _AUTO = {
     (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 256, "dw_few": 64},
     (12, 1): {"lora": -1, "many": 2048, "few": 256, "dw": 64, "dw_few": 64},
     (8, 9): {"lora": -1, "many": 1024, "few": 32, "dw": 0, "dw_few": 0},
-    (8, 6): {"lora": -1, "many": 1024, "few": 32, "dw": 0, "dw_few": 0},
+    (8, 6): {"lora": -1, "many": 32, "few": 32, "dw": 0, "dw_few": 0},
     (7, 5): {"lora": 64, "many": 0, "few": 0, "dw": 0, "dw_few": 0},
 }
 
@@ -133,7 +133,7 @@ def test_gate_table(monkeypatch, cap, kind):
         pytest.skip("gate is off without Triton / custom_op / on HIP")
     _mock_cap(cap)
     auto = _AUTO.get(cap, {}).get(kind, 0)
-    forced = -1 if cap >= (8, 0) or (cap == (7, 5) and kind == "lora") else 0
+    forced = -1 if cap >= (8, 0) or (cap >= (7, 5) and kind == "lora") else 0
     assert MU._triton_grouped_mm_max_rows(0, kind) == auto
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "auto")
     assert MU._triton_grouped_mm_max_rows(0, kind) == auto
@@ -230,8 +230,9 @@ def test_gate_rows_threshold_and_operands(monkeypatch):
     assert at(32 * E) and not at(32 * E + 1)                     # "few"
     assert at(1024 * 64, weight = many) and not at(1024 * 64 + 1, weight = many)
     assert at(100000 * E, weight = lora)
-    _mock_cap((8, 6), index)                                      # unmeasured: sm89's limits (shared tile table)
+    _mock_cap((8, 6), index)                                      # unmeasured: sm89's former 32-row limits
     assert at(32 * E) and not at(32 * E + 1)
+    assert at(32 * 64, weight = many) and not at(32 * 64 + 1, weight = many)
     assert at(100000 * E, weight = lora)
     _mock_cap((7, 5), index)                                      # T4: LoRA only, rows counted at rank 16
     assert not at(1) and not at(1, weight = many)
@@ -366,7 +367,7 @@ def test_engagement_counter_and_modulelist(monkeypatch):
     y_mu = MU._grouped_mm_with_backward_fix(x, param.transpose(-2, -1), offs)
     after = _calls()
     if torch.cuda.get_device_capability() < (8, 0):
-        # forcing declines below sm80: both entry points stay on torch, never touching the kernel
+        # forcing declines base-sized GEMMs below sm80 (K, N > 32 here): both entry points stay on torch
         assert after == before
     else:
         assert after["gemm"] - before["gemm"] == 2 and after["fallback"] == before["fallback"]
@@ -730,5 +731,22 @@ def test_gate_lora_rank_scaling(monkeypatch):
     assert MU._triton_grouped_mm_rows_ok(dev, 32 * E, E, 32, 1536)            # LoRA B, rank 32
     assert not MU._triton_grouped_mm_rows_ok(dev, 32 * E + 1, E, 32, 1536)
     assert not MU._triton_grouped_mm_rows_ok(dev, 1, E, 2048, 1536)           # base GEMM off
+    assert not MU._triton_grouped_mm_rows_ok(dev, 482, 8, 2048, 17)          # 482 * 17 / 16 = 512.125: over budget
+    assert MU._triton_grouped_mm_rows_ok(dev, 481, 8, 2048, 17)
+    monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS", "48")        # an explicit limit is not rank-scaled
+    assert MU._triton_grouped_mm_rows_ok(dev, 64 * E, E, 2048, 32)
+    monkeypatch.delenv("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS")
     limits.update(lora = -1)
     assert MU._triton_grouped_mm_rows_ok(dev, 10 ** 7, E, 2048, 32)
+
+
+def test_lora_pad_checks_both_gemms(monkeypatch):
+    """Rank between in and out dims: LoRA A and B fall in different row budgets; skipping the pad needs both on Triton."""
+    from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
+    monkeypatch.setattr(MU, "_triton_grouped_mm_wanted", lambda inputs, weight: True)
+    monkeypatch.setattr(mg, "triton_grouped_available", lambda device: True)
+    monkeypatch.setattr(MU, "_triton_grouped_mm_rows_ok", lambda device, M, E, K, N: min(K, N) <= 16)
+    x = torch.empty(256, 16)
+    A, B = torch.empty(4, 16, 20), torch.empty(4, 20, 32)
+    assert not MU._lora_rank_pad_needed(x, A)
+    assert MU._lora_rank_pad_needed(x, A, B)
