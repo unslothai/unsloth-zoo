@@ -222,3 +222,54 @@ def test_probe_forward_inside_trial_does_not_store():
     torch.testing.assert_close(g_exp, ref_exp)
     assert MOE_GC_ROUTING_STATS["stored"] == 1 and MOE_GC_ROUTING_STATS["reused"] == 1
     assert MOE_GC_ROUTING_STATS["unmatched"] == 0
+
+
+def _frames_alive():
+    import gc as _gc
+    _gc.collect()
+    return [o for o in _gc.get_objects() if type(o) is gcm.CheckpointRoutingFrame]
+
+
+@pytest.mark.parametrize("checkpointer", [Unsloth_Gradient_Checkpointer, Unsloth_Offloaded_Gradient_Checkpointer])
+def test_no_backward_leaves_no_frame(checkpointer):
+    """Eval, no_grad generate, a forward never backpropagated, or one that raised: nothing stays active or alive."""
+    torch.manual_seed(0)
+    x = torch.randn(T, H, requires_grad = True)
+    layer = ToyMoE(0)
+    before = len(_frames_alive())
+    with torch.no_grad():                          # no_grad generate / reference pass
+        checkpointer.apply(layer, x)
+    layer.eval()
+    checkpointer.apply(layer, x)                   # eval: nothing stored
+    layer.train()
+    out = checkpointer.apply(layer, x)             # trained forward, never backpropagated
+    del out
+
+    def boom(h):
+        layer(h)
+        raise ValueError("boom")
+    with pytest.raises(ValueError):
+        checkpointer.apply(boom, x)
+    assert getattr(gcm._GC_ROUTING_TLS, "frame", None) is None
+    assert len(_frames_alive()) == before
+    # The next real step routes and replays as usual: no stale entry was applied.
+    MOE_GC_ROUTING_STATS.clear()
+    _, g_exp, _ = _run(layer, x, checkpointer)
+    _, ref_exp, _ = _reference(0, x)
+    torch.testing.assert_close(g_exp, ref_exp)
+    assert MOE_GC_ROUTING_STATS["stored"] == 1 and MOE_GC_ROUTING_STATS["reused"] == 1
+    assert MOE_GC_ROUTING_STATS["mismatch"] == 0 and MOE_GC_ROUTING_STATS["unmatched"] == 0
+
+
+def test_first_pass_never_reads():
+    """Calls in a first pass (no grad, or a grad-mode trial) only store; only the replay reads."""
+    layer = ToyMoE(0)
+    frame = gcm.CheckpointRoutingFrame()
+    frame.entries.append((torch.zeros(T, K, dtype = torch.long), torch.ones(T, K)))
+    idx, w = torch.ones(T, K, dtype = torch.long), torch.full((T, K), 0.5)
+    with gcm._checkpoint_routing_scope(frame, False):
+        for grad in (False, True):
+            with torch.set_grad_enabled(grad):
+                a, b = moe_checkpoint_routing(layer, idx, w)
+            assert a is idx and b is w
+    assert MOE_GC_ROUTING_STATS["reused"] == 0 and len(frame.entries) == 2
