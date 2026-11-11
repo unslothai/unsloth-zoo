@@ -21,6 +21,7 @@ from contextlib import contextmanager, nullcontext
 import os
 import functools
 import inspect
+import sys
 import warnings
 import gc
 import collections
@@ -755,6 +756,164 @@ def _gradient_checkpoint_recompute_marker():
         _GC_RECOMPUTE_TLS.active = previous
 
 
+# ---------------------------------------------------------------------------
+# Same MoE routing in the checkpoint replay as in the forward that made the loss
+# ---------------------------------------------------------------------------
+# A checkpointed block runs its first pass without grad and its backward replay with grad.
+# Under block compile those are two different compiled graphs, which round differently: the
+# router input differs by a bf16 ulp and some tokens pick other top-k experts in the replay,
+# so backward differentiated a routing the loss never used. Each checkpointed call that will
+# run backward gets a small routing frame: the first pass appends every MoE call's (top-k ids,
+# routing weights) to it, the replay takes them back in order (then the frame is cleared).
+# The frame is read at run time only, by eager code or the body of an opaque custom op, never
+# by traced code, so no graph guards on it. UNSLOTH_MOE_GC_SAME_ROUTING=0 turns it off.
+_GC_ROUTING_TLS = threading.local()
+MOE_GC_ROUTING_STATS = collections.Counter()   # stored / reused / mismatch / unmatched
+
+
+class CheckpointRoutingFrame:
+    __slots__ = ("entries", "replaying", "__weakref__")
+
+    def __init__(self):
+        self.entries = collections.deque()
+        self.replaying = False
+
+
+def _new_checkpoint_routing_frame(tensors):
+    """A frame only when the checkpoint will run backward (some input requires grad)."""
+    if os.environ.get("UNSLOTH_MOE_GC_SAME_ROUTING", "1") == "0":
+        return None
+    for t in tensors:
+        if isinstance(t, torch.Tensor) and t.requires_grad:
+            return CheckpointRoutingFrame()
+    return None
+
+
+@contextmanager
+def _checkpoint_routing_scope(frame, replay):
+    previous = getattr(_GC_ROUTING_TLS, "frame", None)
+    if frame is not None:
+        frame.replaying = replay
+    _GC_ROUTING_TLS.frame = frame
+    try:
+        yield
+    finally:
+        _GC_ROUTING_TLS.frame = previous
+        if frame is not None and replay:
+            if frame.entries:
+                MOE_GC_ROUTING_STATS["unmatched"] += len(frame.entries)
+            frame.entries.clear()
+
+
+@contextmanager
+def suspended_checkpoint_routing():
+    """No routing frame inside: for throwaway probe forwards that are not the call making the loss."""
+    previous = getattr(_GC_ROUTING_TLS, "frame", None)
+    _GC_ROUTING_TLS.frame = None
+    try:
+        yield
+    finally:
+        _GC_ROUTING_TLS.frame = previous
+
+
+def _checkpoint_route_eager(top_k_index, top_k_weights, grad_mode):
+    """(ids, weights) the experts must use: the first pass's in a replay, else the given ones."""
+    frame = getattr(_GC_ROUTING_TLS, "frame", None)
+    if frame is None:
+        return None
+    if not frame.replaying:
+        # The first pass runs without grad; a grad-mode call inside it (block compile's trial run)
+        # is not the forward that makes the loss.
+        if not grad_mode:
+            frame.entries.append((top_k_index.detach().clone(), top_k_weights.detach().clone()))
+            MOE_GC_ROUTING_STATS["stored"] += 1
+        return None
+    if not grad_mode or not frame.entries:
+        return None
+    index, weights = frame.entries.popleft()
+    if (
+        index.shape != top_k_index.shape or index.dtype != top_k_index.dtype or index.device != top_k_index.device
+        or weights.shape != top_k_weights.shape or weights.dtype != top_k_weights.dtype
+        or weights.device != top_k_weights.device
+    ):
+        # Not the same call (a layer that routes differently in its replay): keep the replay's routing.
+        MOE_GC_ROUTING_STATS["mismatch"] += 1
+        frame.entries.clear()
+        return None
+    MOE_GC_ROUTING_STATS["reused"] += 1
+    return index, weights
+
+
+def _moe_checkpoint_route_impl(
+    top_k_index: torch.Tensor, top_k_weights: torch.Tensor, grad_mode: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Resolved at call time: a reloaded copy of this module keeps the op registered by the first.
+    found = sys.modules[__name__]._checkpoint_route_eager(top_k_index, top_k_weights, grad_mode)
+    if found is None:
+        return top_k_index.clone(), top_k_weights.clone()
+    return found
+
+
+def _moe_checkpoint_route_fake(top_k_index, top_k_weights, grad_mode):
+    return torch.empty_like(top_k_index), torch.empty_like(top_k_weights)
+
+
+def _register_moe_checkpoint_route_op():
+    name = "unsloth_zoo::moe_checkpoint_route"
+    existing = getattr(getattr(torch.ops, "unsloth_zoo", None), "moe_checkpoint_route", None)
+    if existing is not None:   # a reloaded copy of this module
+        return existing.default
+    # Host-side state: a CUDA graph replay would skip the body, so keep the op out of CUDA graphs.
+    kwargs = {}
+    tag = getattr(getattr(torch, "Tag", None), "cudagraph_unsafe", None)
+    if tag is not None and "tags" in inspect.signature(torch.library.custom_op).parameters:
+        kwargs["tags"] = (tag,)
+    op = torch.library.custom_op(name, mutates_args = (), **kwargs)(_moe_checkpoint_route_impl)
+    op.register_fake(_moe_checkpoint_route_fake)
+    return op
+
+
+_moe_checkpoint_route_op = _register_moe_checkpoint_route_op()
+
+
+def _blend_checkpoint_routing(top_k_index, top_k_weights, index, weights):
+    """Routing weights with the first pass's values and the replay's gradient.
+
+    ``weights`` (first pass, no grad) give the values. The gradient flows through the replay's
+    weight of the same expert: aligned [T, k] weights are matched slot by slot (a slot whose expert
+    the replay did not pick keeps the stored value and takes no router gradient); dense [T, E]
+    weights line up already. When nothing changed (``index`` equals ``top_k_index``) the values are
+    bitwise ``top_k_weights`` and so is the gradient."""
+    if top_k_weights.shape == top_k_index.shape:
+        match = index.unsqueeze(-1) == top_k_index.unsqueeze(-2)          # [T, k, k]
+        aligned = (match.to(top_k_weights.dtype) * top_k_weights.unsqueeze(-2)).sum(-1)
+        delta = aligned - aligned.detach()
+        return weights + torch.where(match.any(-1), delta, torch.zeros_like(delta))
+    return weights + (top_k_weights - top_k_weights.detach())
+
+
+def moe_checkpoint_routing(module, top_k_index, top_k_weights):
+    """The (top-k ids, routing weights) an MoE experts call must use.
+
+    Inside an Unsloth gradient-checkpoint replay these are the ids the first (no-grad) pass used,
+    so backward differentiates the routing that produced the loss. Everywhere else they are the
+    given tensors (eager: the same objects). Training mode only."""
+    if not isinstance(top_k_index, torch.Tensor) or not isinstance(top_k_weights, torch.Tensor) \
+            or not getattr(module, "training", False):
+        return top_k_index, top_k_weights
+    grad_mode = torch.is_grad_enabled()
+    if not torch.compiler.is_compiling():
+        found = _checkpoint_route_eager(top_k_index, top_k_weights, grad_mode)
+        if found is None:
+            return top_k_index, top_k_weights
+        index, weights = found
+    else:
+        index, weights = _moe_checkpoint_route_op(top_k_index, top_k_weights.detach(), grad_mode)
+    if not grad_mode:
+        return index, weights
+    return index, _blend_checkpoint_routing(top_k_index, top_k_weights, index, weights)
+
+
 def _detach_checkpoint_args(args):
     """Detach the differentiable tensors in ``args`` for a reentrant recompute.
 
@@ -802,7 +961,8 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
     def forward(ctx, forward_function, hidden_states, *args):
         ctx.device = hidden_states.device
         saved_hidden_states = hidden_states.to("cpu", non_blocking = True)
-        with torch.no_grad():
+        ctx._routing_frame = _new_checkpoint_routing_frame((hidden_states, *args))
+        with torch.no_grad(), _checkpoint_routing_scope(ctx._routing_frame, False):
             output = forward_function(hidden_states, *args)
         ctx.save_for_backward(saved_hidden_states)
         ctx.forward_function = forward_function
@@ -817,7 +977,8 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
         hidden_states = hidden_states.to(ctx.device, non_blocking = True).detach()
         hidden_states.requires_grad_(True)
         recompute_args, grad_holders = _detach_checkpoint_args(ctx.args)
-        with torch.enable_grad(), _gradient_checkpoint_recompute_marker():
+        with torch.enable_grad(), _gradient_checkpoint_recompute_marker(), \
+                _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True):
             output = ctx.forward_function(hidden_states, *recompute_args)
         # Layers that return a 1-tuple keep unpacking exactly as before. Layers
         # that return the tensor itself (Qwen2-VL's vision block, and every
@@ -843,7 +1004,8 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
     @staticmethod
     @torch_amp_custom_fwd
     def forward(ctx, forward_function, hidden_states, *args):
-        with torch.no_grad():
+        ctx._routing_frame = _new_checkpoint_routing_frame((hidden_states, *args))
+        with torch.no_grad(), _checkpoint_routing_scope(ctx._routing_frame, False):
             output = forward_function(hidden_states, *args)
         ctx.save_for_backward(hidden_states)
         ctx.forward_function = forward_function
@@ -858,7 +1020,8 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
         hidden_states = hidden_states.detach()
         hidden_states.requires_grad_(True)
         recompute_args, grad_holders = _detach_checkpoint_args(ctx.args)
-        with torch.enable_grad(), _gradient_checkpoint_recompute_marker():
+        with torch.enable_grad(), _gradient_checkpoint_recompute_marker(), \
+                _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True):
             output = ctx.forward_function(hidden_states, *recompute_args)
         # A layer may return the tensor itself (every transformers block since the tuple
         # returns were retired), a 1-tuple, or several tensors: patch_gradient_checkpointing()
@@ -1794,7 +1957,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         pass
         if ctx._requires_gradient: ctx.save_for_backward(*tensor_inputs)
 
-        with torch.no_grad():
+        ctx._routing_frame = _new_checkpoint_routing_frame(args) if ctx._requires_gradient else None
+        with torch.no_grad(), _checkpoint_routing_scope(ctx._routing_frame, False):
             outputs = run_function(*args)
 
         if use_gpu_buffer: MAIN_STREAM.wait_stream(EXTRA_STREAM)
@@ -1927,7 +2091,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 detached_inputs[0] = x
             pass
 
-            with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs), _gradient_checkpoint_recompute_marker():  # type: ignore[attr-defined]
+            with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs), _gradient_checkpoint_recompute_marker(), \
+                    _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True):  # type: ignore[attr-defined]
                 outputs = ctx.run_function(*detached_inputs)
             pass
         pass
