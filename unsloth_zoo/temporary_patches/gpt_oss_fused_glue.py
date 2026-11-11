@@ -17,10 +17,11 @@
 
 gate_up_epilogue: gate_up + bias[e] (+ lora * scaling) then the clamped SwiGLU, one pass; saves only the summed
 gate_up. down_epilogue: fp32 down + bias[e] (+ lora * scaling). Each rounds where the eager chain does (bf16 adds and
-the LoRA scale round to bf16, the SwiGLU computes in fp32 and rounds once), so they reproduce that chain's bits; the
-shipped SwiGLU is Inductor-compiled, whose fp32 sigmoid can differ by an fp32 ulp before the bf16 rounding.
+the LoRA scale round to bf16, the SwiGLU computes in fp32 and rounds once), so they are bit-exact against the eager
+(uncompiled) chain, which the per-device self-check verifies. They are not bit-exact against the shipped default:
+its SwiGLU is Inductor-compiled, whose fp32 sigmoid can differ by an fp32 ulp before the bf16 rounding.
 UNSLOTH_GPTOSS_FUSED_GLUE=0 keeps the eager chain. CUDA only (inline PTX rcp.rn); a failed launch or self-check
-falls back to the eager chain."""
+falls back to the eager chain, as do inputs outside the kernels' contract and create_graph=True backward."""
 
 __all__ = ["fused_glue_enabled", "gate_up_epilogue", "down_epilogue", "FUSED_GLUE_CALLS"]
 
@@ -216,22 +217,52 @@ def _launch_gate_up_bwd(dy, t2, scaling, alpha, limit, has_d):
     return dgu, dd
 
 
+def _swiglu_eager(x, alpha, limit):
+    a = x[..., ::2].to(torch.float32).clamp(max = limit)
+    b = x[..., 1::2].to(torch.float32).clamp(min = -limit, max = limit)
+    return ((a * torch.sigmoid(alpha * a)) * (b + 1)).to(torch.bfloat16)
+
+
 class _GateUpEpilogue(torch.autograd.Function):
+    """Returns (gated, gate_up sum). The sum is a differentiable output saved for backward, so a create_graph=True
+    backward replays the eager SwiGLU on it and its second derivative reaches gu / d through this node."""
+
     @staticmethod
     def forward(ctx, gu, d, bias, eid, scaling, alpha, limit, acc_dtype):
         out, t2 = _launch_gate_up(gu, bias, eid, d, scaling, alpha, limit, acc_dtype, True)
         ctx.save_for_backward(t2)
         ctx.cfg = (scaling, alpha, limit, d is not None)
+        ctx.set_materialize_grads(False)
         FUSED_GLUE_CALLS["gate_up"] += 1
-        return out
+        return out, t2
 
     @staticmethod
-    def backward(ctx, dy):
+    def backward(ctx, dy, dt2):
         (t2,) = ctx.saved_tensors
         scaling, alpha, limit, has_d = ctx.cfg
-        dgu, dd = _launch_gate_up_bwd(dy, t2, scaling, alpha, limit, has_d)
-        FUSED_GLUE_CALLS["gate_up_bwd"] += 1
-        return dgu, dd, None, None, None, None, None, None
+        create = torch.is_grad_enabled()
+        if dy is not None and dt2 is None and not create and not _STATE["failed"]:
+            try:
+                dgu, dd = _launch_gate_up_bwd(dy, t2, scaling, alpha, limit, has_d)
+                FUSED_GLUE_CALLS["gate_up_bwd"] += 1
+                return dgu, dd, None, None, None, None, None, None
+            except Exception as err:
+                if not _failed(err):
+                    raise
+        # Eager autograd of the same chain: the fallback, and the differentiable replay under create_graph=True.
+        dx = None
+        if dy is not None:
+            with torch.enable_grad():
+                x = t2 if create and t2.requires_grad else t2.detach().requires_grad_()
+                (dx,) = torch.autograd.grad(_swiglu_eager(x, alpha, limit), x, dy, create_graph = create)
+        if dt2 is not None:
+            dx = dt2 if dx is None else dx + dt2
+        if dx is None:
+            return None, None, None, None, None, None, None, None
+        # gu.to(acc) and (d * scaling).to(acc) backward: round to bf16, then the bf16 grad times scaling. Separate casts,
+        # as eager has, so a double backward sums the two branches in the accumulate dtype.
+        dd = dx.to(torch.bfloat16) * scaling if has_d else None
+        return dx.to(torch.bfloat16), dd, None, None, None, None, None, None
 
 
 class _DownEpilogue(torch.autograd.Function):
@@ -265,9 +296,7 @@ def _eager_gate_up(gu, d, bias, eid, scaling, alpha, limit, acc_dtype):
     x = gu.to(acc_dtype) + bias[eid].to(acc_dtype)
     if d is not None:
         x = x + (d * scaling).to(acc_dtype)
-    a = x[..., ::2].to(torch.float32).clamp(max = limit)
-    b = x[..., 1::2].to(torch.float32).clamp(min = -limit, max = limit)
-    return ((a * torch.sigmoid(alpha * a)) * (b + 1)).to(torch.bfloat16)
+    return _swiglu_eager(x, alpha, limit)
 
 
 def _eager_down(y, d, bias, eid, scaling):
@@ -288,12 +317,19 @@ def _self_check(device, acc_dtype, alpha, limit) -> bool:
     hit = _CHECKED.get(key)
     if hit is not None:
         return hit
-    if torch.cuda.is_current_stream_capturing():
+    # Temporary contexts decline without caching: the next eager call probes again.
+    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
         return False
-    ok = False
     try:
-        hooks = torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t)   # stay out of checkpoint frames
-        with hooks, torch.inference_mode(False), torch.enable_grad(), torch.cuda.device(device):
+        # Identity hooks keep the probe out of an enclosing checkpoint frame (innermost wins).
+        hooks = torch.autograd.graph.saved_tensors_hooks(_identity, _identity)
+        hooks.__enter__()
+    except Exception:
+        return False  # hooks disabled here (e.g. a functorch transform)
+    ok = False
+    calls = dict(FUSED_GLUE_CALLS)
+    try:
+        with torch.inference_mode(False), torch.enable_grad(), torch.cuda.device(device):
             gen = torch.Generator(device = device).manual_seed(1234)
             E, M, N, H = 3, 37, 96, 64
             eid = torch.randint(0, E, (M,), device = device, generator = gen).sort().values
@@ -308,7 +344,7 @@ def _self_check(device, acc_dtype, alpha, limit) -> bool:
             ref = _eager_gate_up(leaves[0], leaves[1], bias, eid, 0.5, alpha, limit, acc_dtype)
             r_grads = torch.autograd.grad(ref, leaves, dy)
             mine = [gu.clone().requires_grad_(), d.clone().requires_grad_()]
-            out = _GateUpEpilogue.apply(mine[0], mine[1], bias, eid, 0.5, alpha, limit, acc_dtype)
+            out = _GateUpEpilogue.apply(mine[0], mine[1], bias, eid, 0.5, alpha, limit, acc_dtype)[0]
             m_grads = torch.autograd.grad(out, mine, dy)
             ok = _bits(out, ref) and all(_bits(a, b) for a, b in zip(m_grads, r_grads))
             y = torch.randn(M, H, device = device, generator = gen).to(torch.bfloat16).requires_grad_()
@@ -319,22 +355,38 @@ def _self_check(device, acc_dtype, alpha, limit) -> bool:
             mine2 = _DownEpilogue.apply(y, d2, b2, eid, 0.5)
             ok = ok and _bits(mine2, ref2) and all(
                 _bits(a, b) for a, b in zip(torch.autograd.grad(mine2, (y, d2), g2), torch.autograd.grad(ref2, (y, d2), g2)))
-        FUSED_GLUE_CALLS["gate_up"] -= 1
-        FUSED_GLUE_CALLS["gate_up_bwd"] -= 1
-        FUSED_GLUE_CALLS["down"] -= 1
+        ok = ok and not _STATE["failed"]  # a backward launch that failed fell back to eager inside the probe
         if not ok:
             warnings.warn("Unsloth: fused gpt-oss MoE glue does not reproduce this torch's eager bits; keeping the eager chain.")
     except Exception as err:
-        if isinstance(err, torch.cuda.OutOfMemoryError):
+        if _passthrough(err):
             raise
         ok = False
+        warnings.warn(f"Unsloth: fused gpt-oss MoE glue self-check failed ({type(err).__name__}: {err}); "
+                      "keeping the eager chain.")
+    finally:
+        hooks.__exit__(None, None, None)
+        FUSED_GLUE_CALLS.update(calls)  # the probe's own launches are not real calls
     _CHECKED[key] = ok
     return ok
 
 
+def _identity(t):
+    return t
+
+
+def _passthrough(err):
+    """OOM, Dynamo and checkpoint control flow (_StopRecomputationError, CheckpointError) are not kernel faults:
+    re-raise them; swallowing one disables the kernels process-wide or trips checkpoint's early-stop assertion."""
+    from .moe_triton_kernels import _autograd_control_flow_errors
+    return (
+        isinstance(err, (torch.cuda.OutOfMemoryError,) + _autograd_control_flow_errors())
+        or type(err).__module__.startswith("torch._dynamo")
+    )
+
+
 def _failed(err):
-    # Never swallow OOM / Dynamo errors: that would disable the kernels process-wide.
-    if isinstance(err, torch.cuda.OutOfMemoryError) or type(err).__module__.startswith("torch._dynamo"):
+    if _passthrough(err):
         return False
     if not _STATE["failed"]:
         _STATE["failed"] = True
@@ -343,14 +395,46 @@ def _failed(err):
 
 
 def usable(t, acc_dtype, alpha, limit) -> bool:
-    return fused_glue_enabled(t) and _self_check(t.device, acc_dtype, alpha, limit)
+    return (acc_dtype in (torch.bfloat16, torch.float32) and fused_glue_enabled(t)
+            and _self_check(t.device, acc_dtype, alpha, limit))
+
+
+def _row_major(t):
+    # The kernels index rows by stride(0) and assume unit column / element stride.
+    return t if t.stride(-1) == 1 else t.contiguous()
+
+
+def _contract(x, d, bias, eid, width):
+    """Normalized (x, d, bias, eid) when the kernels apply, else None (the eager chain handles the rest)."""
+    tensors = [x, bias, eid] + ([d] if d is not None else [])
+    if any(type(t) is not torch.Tensor or t.device != x.device for t in tensors):
+        return None
+    M = x.shape[0] if x.dim() == 2 else -1
+    if (
+        x.dim() != 2 or x.dtype is not torch.bfloat16 or x.shape[1] != width
+        or (d is not None and (d.dtype is not torch.bfloat16 or d.shape != x.shape))
+        or bias.dim() != 2 or bias.shape[1] != width or bias.dtype not in (torch.bfloat16, torch.float32)
+        or eid.dim() != 1 or eid.shape[0] != M or eid.dtype.is_floating_point or eid.dtype is torch.bool
+        # A trainable bias would get no gradient from the kernels.
+        or (bias.requires_grad and torch.is_grad_enabled())
+    ):
+        return None
+    return _row_major(x), (None if d is None else _row_major(d)), _row_major(bias), eid.contiguous()
 
 
 def gate_up_epilogue(gu, d, bias, eid, scaling, alpha, limit, acc_dtype):
     """bf16 gated [M, I] = clamped SwiGLU of gu.to(acc) + bias[eid] (+ (d * scaling).to(acc)); None: use eager."""
+    width = gu.shape[-1] if gu.dim() == 2 and gu.shape[-1] % 2 == 0 else -1  # odd widths: eager
+    # The kernel adds the bias unrounded: eager's bias.to(acc) only matches for a bf16 bias or fp32 accumulate.
+    ok_acc = acc_dtype is torch.float32 or (acc_dtype is torch.bfloat16 and bias.dtype is torch.bfloat16)
+    args = _contract(gu, d, bias, eid, width) if ok_acc else None
+    if args is None:
+        FUSED_GLUE_CALLS["fallback"] += 1
+        return None
+    gu, d, bias, eid = args
     try:
         if torch.is_grad_enabled() and (gu.requires_grad or (d is not None and d.requires_grad)):
-            return _GateUpEpilogue.apply(gu, d, bias, eid, scaling, alpha, limit, acc_dtype)
+            return _GateUpEpilogue.apply(gu, d, bias, eid, scaling, alpha, limit, acc_dtype)[0]
         out, _ = _launch_gate_up(gu, bias, eid, d, scaling, alpha, limit, acc_dtype, False)
         FUSED_GLUE_CALLS["gate_up"] += 1
         return out
@@ -363,6 +447,11 @@ def gate_up_epilogue(gu, d, bias, eid, scaling, alpha, limit, acc_dtype):
 
 def down_epilogue(y, d, bias, eid, scaling):
     """fp32 [M, H] = y.float() + bias[eid].float() (+ (d * scaling).float()); None: use eager."""
+    args = _contract(y, d, bias, eid, y.shape[-1] if y.dim() == 2 else -1)
+    if args is None:
+        FUSED_GLUE_CALLS["fallback"] += 1
+        return None
+    y, d, bias, eid = args
     try:
         return _DownEpilogue.apply(y, d, bias, eid, scaling)
     except Exception as err:

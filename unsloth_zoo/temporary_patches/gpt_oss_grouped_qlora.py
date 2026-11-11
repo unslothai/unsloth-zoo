@@ -521,10 +521,11 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
     dn_lora = lora["down"] if lora is not None else None
     gate_up = mu._base_grouped_mm(xg, offsets, gu_w, recompute)
     # Fused epilogues (gpt_oss_fused_glue): the same roundings in one pass each, else the eager chain below.
-    glue = _fused_glue(gate_up, acc_dtype, experts)
-    # The kernel adds the bias unrounded: equal to eager's bias.to(acc_dtype) only for a bf16 bias or fp32 accumulate.
-    if glue is not None and gu_bias.dtype is not torch.bfloat16 and acc_dtype is not torch.float32:
-        glue = None
+    # The kernel adds the bias unrounded: equal to eager's bias.to(acc_dtype) only for a bf16 bias or fp32 accumulate
+    # (checked before _fused_glue, whose first call runs the self-check).
+    glue = None
+    if gu_bias.dtype is torch.bfloat16 or acc_dtype is torch.float32:
+        glue = _fused_glue(gate_up, acc_dtype, experts)
     gated = d_gu = None
     if gu_lora is not None:
         d_gu = _lora_unscaled(xg, offsets, gu_projs, gu_lora, dtype)
@@ -537,7 +538,7 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
         if d_gu is not None:
             gate_up = gate_up + (d_gu * gu_lora[1]).to(acc_dtype)
         gated = _gpt_oss().swiglu_torch_forward(gate_up, experts.alpha, experts.limit, dtype = torch.float32).to(dtype)
-    del gate_up
+    del gate_up, d_gu
     out = mu._base_grouped_mm(gated, offsets, dn_w, recompute)
     d_dn = _lora_unscaled(gated, offsets, dn_projs, dn_lora, dtype) if dn_lora is not None else None
     y = None
@@ -548,6 +549,7 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
         y = out.float() + dn_bias[expert_ids].float()
         if d_dn is not None:
             y = y + (d_dn * dn_lora[1]).float()
+    del out, d_dn
     return _combine(y, routing_weights, sorted_tokens, expert_ids, sorted_idx, num_tokens, top_k).view(
         batch_size, -1, experts.hidden_size)
 
@@ -582,6 +584,8 @@ def _combine(y, routing_weights, sorted_tokens, expert_ids, sorted_idx, num_toke
         os.environ.get("UNSLOTH_GPTOSS_FUSED_GLUE", "1") != "0"
         and os.environ.get("UNSLOTH_GPTOSS_FUSED_COMBINE", "1") != "0"
         and y.is_cuda and torch.version.hip is None
+        # FakeTensor / subclass probes must not reach the kernel: a failure there disables it process-wide.
+        and type(y) is torch.Tensor and type(w) is torch.Tensor and type(sorted_idx) is torch.Tensor
     ):
         from .moe_triton_kernels import weighted_unpermute
         out = weighted_unpermute(y, sorted_idx, w, num_tokens, top_k, out_dtype = torch.float32)
