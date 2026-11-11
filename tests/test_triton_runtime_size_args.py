@@ -20,7 +20,8 @@ CASES = {
         "_fl_flash_p_kernel": ("n_rows", "split0", "stride_k"),
         "_fl_flash_u_kernel": ("n_rows", "stride_k"),
     },
-    "merged_rollout_exact.py": {"_exact_merge_kernel": ("mode",)},
+    # mode is a constexpr by design (three small per-pass variants); the per-call offsets and counts stay runtime.
+    "merged_rollout_exact.py": {"_exact_merge_kernel": ("tile0", "slot"), "_escape_kernel": ("n",)},
     "temporary_patches/gdn_causal_conv1d.py": {
         "_causal_conv1d_fwd_kernel": ("T",),
         "_causal_conv1d_bwd_g_kernel": ("T",),

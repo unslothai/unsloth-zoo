@@ -358,6 +358,62 @@ def _rows_lack_input_ids(train_dataset):
 pass
 
 
+_COUNT_INPUT_IDS_ARROW_BATCH_ROWS = 10_000
+# Ids gathered per bincount: bounds the copy of a batch split over many chunks (a shuffle is one chunk per row)
+_COUNT_INPUT_IDS_ARROW_FLUSH_IDS = 1 << 20
+
+
+def _count_input_ids_arrow(train_dataset, final_counts):
+    """Counts input_ids straight from Arrow, skipping .map which builds Python lists of every column of every row.
+    Returns False (counting nothing) whenever the result could differ from the .map path; caller then falls back."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if type(train_dataset) is not datasets.Dataset: return False
+    try:
+        import pyarrow as pa
+        import pyarrow.compute as pc
+        dataset_format = train_dataset.format
+        if dataset_format.get("type") == "custom": return False
+        columns = dataset_format.get("columns")
+        if columns is not None and "input_ids" not in columns: return False
+        if "input_ids" not in train_dataset.column_names: return False
+        counts = np.zeros(len(final_counts), dtype = np.int64)
+        pending, n_pending = [], 0
+        def flush():
+            ids = pending[0] if len(pending) == 1 else np.concatenate(pending)
+            pending.clear()
+            if int(ids.min()) < 0 or int(ids.max()) >= len(final_counts): return False
+            counts[:] += np.bincount(ids.astype(np.int64, copy = False), minlength = len(final_counts))
+            return True
+        # iter honours select / shuffle / filter indices; flatten per chunk, a whole-batch to_numpy copies the batch.
+        for batch in train_dataset.select_columns(["input_ids"]).with_format("arrow").iter(batch_size = _COUNT_INPUT_IDS_ARROW_BATCH_ROWS):
+            column = batch["input_ids"]
+            if column.null_count != 0: return False
+            if not (pa.types.is_list(column.type) or pa.types.is_large_list(column.type)): return False
+            if not pa.types.is_integer(column.type.value_type): return False
+            for chunk in column.chunks:
+                flat = pc.list_flatten(chunk)
+                if flat.null_count != 0: return False
+                # Sliced to the flush capacity: one in-memory chunk can hold the whole batch.
+                start = 0
+                while start < len(flat):
+                    take = min(len(flat) - start, _COUNT_INPUT_IDS_ARROW_FLUSH_IDS - n_pending)
+                    pending.append(flat.slice(start, take).to_numpy())
+                    n_pending += take
+                    start += take
+                    if n_pending >= _COUNT_INPUT_IDS_ARROW_FLUSH_IDS:
+                        if not flush(): return False
+                        n_pending = 0
+                pass
+            pass
+        pass
+        if pending and not flush(): return False
+    except Exception:
+        return False
+    final_counts += counts
+    return True
+pass
+
+
 def _count_input_ids(train_dataset, mapping):
     """Only .map is datasets specific; a plain list of rows gets this far. A row with no
     "input_ids" is skipped, as in the checks above."""
@@ -714,7 +770,8 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         counter = np.fromiter(itertools.chain.from_iterable(input_ids), dtype = np.int32)
         np.add.at(final_counts, counter, 1)
     pass
-    _count_input_ids(train_dataset, mapping)
+    if not _count_input_ids_arrow(train_dataset, final_counts):
+        _count_input_ids(train_dataset, mapping)
 
     sum_embedding = torch.sum(embedding_matrix, dtype = torch.float32, axis = 0)
     sum_lm_head   = torch.sum(lm_head_matrix,   dtype = torch.float32, axis = 0)

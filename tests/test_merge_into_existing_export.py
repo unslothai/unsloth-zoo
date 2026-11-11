@@ -709,6 +709,38 @@ def test_rollback_never_writes_through_a_link_named_like_a_restore_file(tmp_path
     assert sorted(os.listdir(out)) == ["config.json", "config.json.unsloth-restore", "model.safetensors"]
 
 
+def test_rollback_and_private_shard_copy_never_carry_setuid(tmp_path):
+    # Both recreate a file as the running account from a file found in the output folder, so a planted
+    # setuid/setgid bit would turn into a setuid executable owned by that account.
+    import stat
+    from unsloth_zoo import saving_utils as S
+
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "model.safetensors").write_bytes(b"previous shard")
+    (out / "run.sh").write_bytes(b"#!/bin/sh\n")
+    os.chmod(out / "run.sh", 0o6755)
+    if not os.stat(out / "run.sh").st_mode & stat.S_ISUID:
+        pytest.skip("filesystem drops setuid")
+
+    metadata = S._snapshot_previous_export_metadata(str(out))
+    kept = S._keep_previous_export_shards(
+        ["model.safetensors"], str(out), {"model.safetensors" : 1}, metadata)
+    assert kept
+    (out / "run.sh").write_bytes(b"new")
+    S._restore_previous_export_shards(kept)
+    assert (out / "run.sh").read_bytes() == b"#!/bin/sh\n"
+    assert stat.S_IMODE(os.stat(out / "run.sh").st_mode) == 0o755
+
+    shard = out / "linked.safetensors"
+    shard.write_bytes(b"shard")
+    os.chmod(shard, 0o6555)
+    os.link(shard, tmp_path / "second-link")
+    S._ensure_shard_writable(str(shard))
+    assert os.stat(shard).st_nlink == 1
+    assert stat.S_IMODE(os.stat(shard).st_mode) == 0o755
+
+
 @pytest.mark.parametrize("relative", [False, True])
 def test_rollback_removes_shards_the_refresh_added(tmp_path, monkeypatch, relative):
     # A shard name the previous export did not hold, fetched or split before a later step
