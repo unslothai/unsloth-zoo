@@ -41,6 +41,11 @@ import torch
 logger = logging.getLogger(__name__)
 
 try:
+    from unsloth_zoo.temporary_patches.moe_expert_cache import parse_expert_cache_mode as _parse_expert_cache_mode
+except ImportError:  # pragma: no cover
+    _parse_expert_cache_mode = None
+
+try:
     import triton
     import triton.language as tl
 except Exception:  # pragma: no cover
@@ -265,6 +270,17 @@ if triton is not None:
     _TL_DTYPES = {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16, torch.float32: tl.float32}
 
 
+def _passthrough_errors():
+    """Not kernel faults, so never a reason to fall back or blacklist a shape: OOM (the caller may free memory and
+    retry) and checkpoint control flow (the shared moe_triton_kernels policy)."""
+    try:
+        from unsloth_zoo.temporary_patches.moe_triton_kernels import _autograd_control_flow_errors
+        flow = _autograd_control_flow_errors()
+    except ImportError:
+        flow = ()
+    return flow + (torch.cuda.OutOfMemoryError,)
+
+
 def _launch(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer, s_i, s_j, blocksize, blocksize2, nested, w_dtype):
     M = a.shape[0]
     out = a.new_empty((M, outer))
@@ -288,8 +304,13 @@ def _launch(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer,
         _run_kernel(a, out, grid, packed, absmax, code2, absmax2, offset, code, ends, M, m_hint, E,
                     inner, outer, s_i, s_j, pair, blocksize, blocksize2, nested, w_dtype)
     except Exception as exc:
-        # A Triton build or launch failure: decode in torch for this call; the stack takes the dequant path after.
         NF4_FUSED_STATS["launches"] -= 1
+        if isinstance(exc, _passthrough_errors()):
+            try:
+                raise exc
+            finally:
+                del exc   # its traceback holds this frame: keeping it pins the failed call's tensors
+        # A Triton build or launch failure: decode in torch for this call; the stack takes the dequant path after.
         FAILED_SHAPES[key] = f"{type(exc).__name__}: {exc}"[:800]
         logger.warning(f"Unsloth: the NF4 fused grouped GEMM failed for {key}, using the dequant path: {FAILED_SHAPES[key]}")
         return _launch_eager(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer, s_i, s_j,
@@ -430,18 +451,27 @@ def _register_ops():
 
 def _dequant_flat(packed, absmax, code2, absmax2, offset, code, numel, blocksize, blocksize2, nested, w_dtype):
     """The whole stack decoded flat [numel] in w_dtype by the zoo NF4 dequant kernel (bitsandbytes bits), else torch."""
-    if blocksize == 64 and code.numel() == 16:
+    if code.numel() == 16:
         try:
-            from bitsandbytes.functional import QuantState
-            from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
+            from bitsandbytes.functional import QuantState, dequantize_4bit
             state2 = QuantState(absmax = absmax2, code = code2, blocksize = blocksize2, dtype = torch.float32) if nested else None
             qs = QuantState(absmax = absmax, shape = torch.Size((numel,)), code = code, blocksize = blocksize,
                             quant_type = "nf4", dtype = w_dtype, offset = offset if nested else None, state2 = state2)
-            out = nf4_dequant_triton(packed, qs, (numel,))
+            out = None
+            if blocksize == 64:
+                from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
+                out = nf4_dequant_triton(packed, qs, (numel,))
+            if out is None and numel < 2**31:
+                # bitsandbytes' own decode (the same bits) before the torch one, which peaks at ~10x the stack.
+                out = dequantize_4bit(packed.reshape(-1, 1), qs).reshape(-1)
             if out is not None:
                 return out
-        except Exception:
-            pass
+        except Exception as exc:
+            if isinstance(exc, _passthrough_errors()):
+                try:
+                    raise exc
+                finally:
+                    del exc
     return _decode_torch(packed, absmax, code2, absmax2, offset, code, numel, blocksize, blocksize2, nested, w_dtype)
 
 
@@ -456,7 +486,9 @@ def _dequant_grouped_mm(a, packed, absmax, code2, absmax2, offset, code, ends, i
     w = flat.as_strided((E, inner, outer), (inner * outer, s_i, s_j))
     if w.dtype != a.dtype:
         w = w.to(a.dtype)
-    with torch.no_grad():
+    # Autocast stays on inside a custom op: without this an fp16 input under bf16 autocast returns bf16 above the cap
+    # while the fused branch and the fake impl return fp16.
+    with torch.no_grad(), torch.autocast(device_type = a.device.type, enabled = False):
         return _grouped_mm_with_backward_fix(a, w, ends)
 
 
@@ -465,8 +497,9 @@ AUTO_STATS = {"fused": 0, "dequant": 0}
 
 def _auto_launch(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer, s_i, s_j,
                  blocksize, blocksize2, nested, w_dtype, max_rows):
-    """Runtime choice inside the op: fused while rows <= max_rows * E, else dequant + grouped GEMM."""
-    if max_rows > 0 and a.shape[0] > max_rows * ends.shape[0]:
+    """Runtime choice inside the op: fused while rows <= max_rows * E, else dequant + grouped GEMM (the same rule as
+    nf4_auto_fused, so a cap <= 0 never fuses a nonempty input)."""
+    if a.shape[0] > max_rows * ends.shape[0]:
         AUTO_STATS["dequant"] += 1
         return _dequant_grouped_mm(a, packed, absmax, code2, absmax2, offset, code, ends, inner, outer, s_i, s_j,
                                    blocksize, blocksize2, nested, w_dtype)
@@ -484,7 +517,15 @@ def _register_auto_ops():
     except (AttributeError, RuntimeError):
         pass
 
-    @torch.library.custom_op(f"{_OP_NS}::nf4_grouped_mm_auto", mutates_args = ())
+    # Above the cap the dequant path's grouped GEMM may read group bounds on the host (a sync), and a failed launch
+    # falls back to a per-expert loop that does: a CUDA graph must not capture either op (as manual_grouped_mm).
+    tags = {}
+    if hasattr(torch, "Tag") and hasattr(torch.Tag, "cudagraph_unsafe"):
+        import inspect
+        if "tags" in inspect.signature(torch.library.custom_op).parameters:
+            tags = {"tags": (torch.Tag.cudagraph_unsafe,)}
+
+    @torch.library.custom_op(f"{_OP_NS}::nf4_grouped_mm_auto", mutates_args = (), **tags)
     def nf4_grouped_mm_auto_op(
         x: torch.Tensor, packed: torch.Tensor, absmax: torch.Tensor, code: torch.Tensor,
         absmax2: torch.Tensor, code2: torch.Tensor, offset: torch.Tensor, offsets: torch.Tensor,
@@ -499,7 +540,7 @@ def _register_auto_ops():
           w_dtype, max_rows):
         return x.new_empty((x.shape[0], N))
 
-    @torch.library.custom_op(f"{_OP_NS}::nf4_grouped_mm_auto_dx", mutates_args = ())
+    @torch.library.custom_op(f"{_OP_NS}::nf4_grouped_mm_auto_dx", mutates_args = (), **tags)
     def nf4_grouped_mm_auto_dx_op(
         dy: torch.Tensor, packed: torch.Tensor, absmax: torch.Tensor, code: torch.Tensor,
         absmax2: torch.Tensor, code2: torch.Tensor, offset: torch.Tensor, offsets: torch.Tensor,
@@ -535,8 +576,20 @@ _AUTO_OP = _register_auto_ops() if triton is not None else None
 
 def nf4_auto_in_op() -> bool:
     """UNSLOTH_MOE_NF4_AUTO_IN_OP (default 1): 'auto' decides fused vs dequant inside one op on the runtime rows;
-    0 restores the Python-side choice (a Dynamo guard on rows, one recompile when crossing the cap)."""
-    return os.environ.get("UNSLOTH_MOE_NF4_AUTO_IN_OP", "1") != "0"
+    0 restores the Python-side choice (a Dynamo guard on rows, one recompile when crossing the cap).
+    The in-op dequant branch decodes the whole stack, so it also steps aside (Python-side choice, whose dequant path is
+    the regular one) when an explicit memory / reuse policy owns that path: UNSLOTH_MOE_SELECTIVE_DEQUANT=1,
+    UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS > 0 or UNSLOTH_MOE_EXPERT_CACHE on (its stacks are admitted from that path)."""
+    if os.environ.get("UNSLOTH_MOE_NF4_AUTO_IN_OP", "1") == "0":
+        return False
+    if os.environ.get("UNSLOTH_MOE_SELECTIVE_DEQUANT", "auto") == "1":
+        return False
+    chunk = os.environ.get("UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS", "0").strip()
+    if chunk.isdigit() and int(chunk) > 0:
+        return False
+    if _parse_expert_cache_mode is None:
+        return True
+    return _parse_expert_cache_mode(os.environ.get("UNSLOTH_MOE_EXPERT_CACHE", "0")) is None
 
 
 def nf4_grouped_mm(x, offsets, spec):

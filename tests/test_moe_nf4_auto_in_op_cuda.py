@@ -18,8 +18,12 @@ forward and dX, and one compiled frame across the cap (two with the Python-side 
 import pytest
 import torch
 
-if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8:
-    pytest.skip("NF4 fused auto needs sm80+", allow_module_level = True)
+if (
+    not torch.cuda.is_available()
+    or getattr(torch.version, "hip", None) is not None
+    or torch.cuda.get_device_capability()[0] < 8
+):
+    pytest.skip("NF4 fused auto needs NVIDIA sm80+ (not ROCm)", allow_module_level = True)
 bnb = pytest.importorskip("bitsandbytes")
 from bitsandbytes.nn import Params4bit  # noqa: E402
 

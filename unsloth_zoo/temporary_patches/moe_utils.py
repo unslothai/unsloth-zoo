@@ -1232,10 +1232,13 @@ def _nf4_fused_base_mm(inputs, offsets, source, proj_type, hidden_dim, model_typ
         return None
     cache = _expert_cache_module()
     if cache is not None:
+        # The param the dequant path decodes (_get_base_weight unwrapping), in the dtype it will ask for.
         param = source
         while hasattr(param, "base_layer"):
             param = param.base_layer
-        if cache.expert_cache_lookup(param) is not None:
+        if not isinstance(param, torch.Tensor) and hasattr(param, "weight"):
+            param = param.weight
+        if _expert_cache_get(cache, param, inputs.dtype, count = False) is not None:
             return None   # a cached 16-bit stack makes the dequant path's decode free
     try:
         from unsloth_zoo.temporary_patches.moe_nf4_grouped import maybe_nf4_grouped_mm
@@ -1296,6 +1299,14 @@ def _dequantize_bnb4bit_experts(param, experts, target_dtype = None):
     """Dequantize only `experts` of a packed 4-bit stack: a slice reads views of the packed bytes
     and absmax blocks, an int64 id tensor gathers them in a few pieces. Each piece is a smaller
     QuantState decoded by the same kernels, so every element matches the full-stack read."""
+    cache = _expert_cache_module()
+    if cache is None:
+        return _dequantize_bnb4bit_experts_once(param, experts, target_dtype)
+    # The cache may hold the memory this read needs (gather, decode or cast): drop it once and retry.
+    return cache.with_expert_cache_oom_retry(lambda: _dequantize_bnb4bit_experts_once(param, experts, target_dtype))
+
+
+def _dequantize_bnb4bit_experts_once(param, experts, target_dtype = None):
     from bitsandbytes.functional import QuantState
 
     while hasattr(param, "base_layer"):
@@ -3044,12 +3055,17 @@ def _get_dequantize_4bit_in_slices():
 
 
 _EXPERT_CACHE_MOD = None
+try:
+    # Absolute: this file is also copied into unsloth_compiled_cache and imported top-level.
+    from unsloth_zoo.temporary_patches.moe_expert_cache import parse_expert_cache_mode as _parse_expert_cache_mode
+except ImportError:
+    _parse_expert_cache_mode = None
 
 
 def _expert_cache_module():
     """moe_expert_cache when UNSLOTH_MOE_EXPERT_CACHE is on and the caller is eager, else None (no traced work)."""
     global _EXPERT_CACHE_MOD
-    if os.environ.get("UNSLOTH_MOE_EXPERT_CACHE", "0") in ("", "0") or torch.compiler.is_compiling():
+    if not _expert_cache_env_on() or torch.compiler.is_compiling():
         return None
     if _EXPERT_CACHE_MOD is None:
         try:
@@ -3060,11 +3076,18 @@ def _expert_cache_module():
     return _EXPERT_CACHE_MOD or None
 
 
-def _expert_cache_get(cache, param, target_dtype):
+def _expert_cache_env_on():
+    """UNSLOTH_MOE_EXPERT_CACHE through the cache's own parser ("0", "off", "false", "no", "0.0", ... are off)."""
+    if _parse_expert_cache_mode is None:
+        return False
+    return _parse_expert_cache_mode(os.environ.get("UNSLOTH_MOE_EXPERT_CACHE", "0")) is not None
+
+
+def _expert_cache_get(cache, param, target_dtype, count = True):
     """The cached stack when it is in the dtype this caller ends with (target_dtype, else the state's), else None."""
     if cache is None:
         return None
-    weight = cache.expert_cache_lookup(param)
+    weight = cache.expert_cache_lookup(param, count = count)
     want = target_dtype or getattr(getattr(param, "quant_state", None), "dtype", None)
     if weight is not None and weight.dtype != want:
         return None
@@ -3108,19 +3131,17 @@ def _get_bnb4bit_base_weight(param, target_dtype = None):
     cache = _expert_cache_module()
     weight = _expert_cache_get(cache, param, target_dtype)
     if weight is None:
-        try:
+        if cache is None:
             weight = _dequantize_bnb4bit_full(param)
-        except torch.cuda.OutOfMemoryError:
-            # A cached stack may hold the memory this decode needs: drop the cache once and retry.
-            if cache is None or not cache.EXPERT_CACHE_STATS.get("bytes"):
-                raise
-            cache.clear_expert_cache(oom = True)
-            torch.cuda.empty_cache()
-            weight = _dequantize_bnb4bit_full(param)
-        if cache is not None:
-            # Cached after the cast (fp16 compute over a bf16 state casts every read otherwise); the same values.
-            if target_dtype is not None and weight.dtype != target_dtype:
-                weight = weight.to(target_dtype)
+        else:
+            def decode():
+                w = _dequantize_bnb4bit_full(param)
+                # Cached after the cast (fp16 compute over a bf16 state casts every read otherwise); the same values.
+                if target_dtype is not None and w.dtype != target_dtype:
+                    w = w.to(target_dtype)
+                return w
+            # A cached stack may hold the memory this decode or cast needs: drop the cache once and retry.
+            weight = cache.with_expert_cache_oom_retry(decode)
             cache.expert_cache_offer(param, weight)
     if target_dtype is not None:
         weight = weight.to(target_dtype)
@@ -3151,8 +3172,8 @@ def _get_base_weight(param, target_dtype=None, token_counts=None, experts=None):
     if HAS_BNB and isinstance(param, Params4bit):
         if (
             torch.compiler.is_compiling()
-            and os.environ.get("UNSLOTH_MOE_EXPERT_CACHE", "0") not in ("", "0")
             and os.environ.get("UNSLOTH_MOE_EXPERT_CACHE_TRACED", "0") == "1"
+            and _expert_cache_env_on()
         ):
             return _get_bnb4bit_base_weight_eager(param, target_dtype)
         return _get_bnb4bit_base_weight(param, target_dtype)

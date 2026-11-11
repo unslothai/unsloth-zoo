@@ -381,7 +381,7 @@ def test_opcheck_auto():
     p = _stack((5, 96, 64), torch.float16, True)
     spec = _spec(p, False, torch.float16)
     offsets = _routing(5, [4, 0, 6, 0, 3])
-    for cap in (0, 1):   # 0: always fused; 1: 13 rows > 5, the dequant path
+    for cap in (4, 1):   # 4: 13 rows <= 20, fused; 1: 13 rows > 5, the dequant path
         x = torch.randn(13, 64, device = DEVICE, dtype = torch.float16, requires_grad = True)
         args = (x,) + _saved(spec, offsets)[:7] + _saved(spec, offsets)[7:] + (cap,)
         torch.library.opcheck(torch.ops.unsloth_zoo.nf4_grouped_mm_auto.default, args)
