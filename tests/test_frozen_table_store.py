@@ -186,6 +186,21 @@ def test_module_has_no_tensors_and_memoizes_under_checkpoint(bf16_table):
     assert proj.weight.grad is not None and x.grad is not None
 
 
+def test_memo_never_serves_stale_rows_and_runs_under_inference_mode(bf16_table):
+    index, names, full = bf16_table
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk"))
+    ref = full.float()
+    ids = torch.tensor([0, 3])
+    assert torch.equal(emb(ids), F.embedding(ids, ref))
+    ids.fill_(5)  # updated in place: the cached rows belong to the old values
+    assert torch.equal(emb(ids), F.embedding(ids, ref))
+    with torch.inference_mode():
+        inf_ids = torch.tensor([[1, 2], [7, 7]])
+        assert torch.equal(emb(inf_ids), F.embedding(inf_ids, ref))
+        assert torch.equal(emb(inf_ids), F.embedding(inf_ids, ref))
+
+
 def test_bind_errors_are_loud(bf16_table, tmp_path):
     index, names, full = bf16_table
     model = torch.nn.Module()

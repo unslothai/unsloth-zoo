@@ -683,22 +683,27 @@ class UnslothFrozenTableEmbedding(nn.Module):
                 "unsloth_zoo.frozen_table_store.bind_frozen_tables(model, checkpoint) after loading, "
                 "or set UNSLOTH_FROZEN_TABLE=gpu to load it as a normal embedding."
             )
-        memo = self._memo
+        if ids.is_inference():
+            # Inference tensors carry no version counter, and there is no checkpoint recompute to serve.
+            with torch.no_grad():
+                return store.gather(ids, dtype=self.table_dtype)
         step = _STEP[0]
+        key = (ids.data_ptr(), ids._version, tuple(ids.shape), tuple(ids.stride()), ids.device, step, self.table_dtype)
+        memo = self._memo
         if memo is not None:
-            m_ids, m_key, m_rows = memo
-            key = (ids.data_ptr(), ids._version, tuple(ids.shape), tuple(ids.stride()), ids.device, step, self.table_dtype)
+            m_ids, m_snapshot, m_key, m_rows = memo
             if m_key == key or (
                 m_key[2] == key[2] and m_key[4] == key[4] and m_key[5] == step and m_key[6] == key[6]
-                and m_ids.dtype == ids.dtype and torch.equal(m_ids, ids)
+                and m_snapshot.dtype == ids.dtype and torch.equal(m_snapshot, ids)
             ):
                 _bump(memo_hits=1)
                 return m_rows
         with torch.no_grad():
             rows = store.gather(ids, dtype=self.table_dtype)
-        key = (ids.data_ptr(), ids._version, tuple(ids.shape), tuple(ids.stride()), ids.device, step, self.table_dtype)
-        # Keep a reference to ids: while held, no other tensor can take its address.
-        self._memo = (ids, key, rows)
+            snapshot = ids.detach().clone()
+        # Hold ids (no other tensor can take its address while the key names it) and a snapshot of its values
+        # (an in-place update of ids must not make the equality check compare the tensor with itself).
+        self._memo = (ids, snapshot, key, rows)
         return rows
 
 
