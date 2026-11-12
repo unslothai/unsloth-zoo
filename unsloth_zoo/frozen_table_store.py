@@ -278,13 +278,11 @@ class _MappedFile:
         return self._whole
 
     def close(self):
+        # Never unmap explicitly: tensors made with torch.frombuffer (shard views, an exported state_dict) keep the
+        # mmap object alive but not mapped, so an explicit close under them would leave dangling pointers. Dropping
+        # our reference lets the last tensor's release unmap it.
         self._whole = None
-        if self.mm is not None:
-            try:
-                self.mm.close()
-            except BufferError:
-                pass  # a view is still alive somewhere; the GC unmaps it
-            self.mm = None
+        self.mm = None
         if self.fd is not None:
             try:
                 os.close(self.fd)

@@ -502,3 +502,15 @@ def test_lookup_op_is_tagged_cudagraph_unsafe():
     if tag is None or fts._LOOKUP_OP is None:
         pytest.skip("torch without the cudagraph_unsafe tag or custom_op")
     assert tag in torch.ops.unsloth_zoo.frozen_table_lookup.default.tags
+
+
+def test_exported_tensors_outlive_the_store(bf16_table):
+    import gc
+    index, names, full = bf16_table
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk"))
+    emb.checkpoint_suffixes = {"weight": [f"shard_{i}.weight" for i in range(len(names))]}
+    sd = emb.state_dict()
+    del emb
+    gc.collect()
+    assert torch.equal(torch.cat([t.clone() for t in sd.values()]), full)   # still mapped, no dangling pointer
