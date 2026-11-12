@@ -415,10 +415,9 @@ def patch_CsmForConditionalGeneration_forward():
                 depth_decoder_labels = labels[train_mask]
 
                 depth_decoder_kwargs = kwargs.copy()
+                # Trainer counts depth targets per GA window (loss_utils); direct callers assume every frame.
                 if depth_num_items_in_batch is not None:
                     depth_decoder_kwargs["num_items_in_batch"] = depth_num_items_in_batch
-                # Direct callers do not carry Trainer's accumulation-window depth
-                # count. Preserve the full-depth behavior they had before.
                 elif "num_items_in_batch" in depth_decoder_kwargs:
                     depth_decoder_kwargs["num_items_in_batch"] *= self.config.num_codebooks - 1
 

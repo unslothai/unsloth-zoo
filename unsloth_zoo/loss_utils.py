@@ -554,7 +554,8 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
         # Removes PeftModelForCausalLM and gets internal model
         m = m.get_base_model()
     model_name = m.__class__.__name__
-    csm_depth_num_items_in_batch = 0 if model_name == "CsmForConditionalGeneration" else None
+    is_csm = model_name == "CsmForConditionalGeneration"
+    csm_depth_num_items_in_batch = 0 if is_csm else None
 
     # Read off the top level model, before the walk below reassigns m: unsloth patches
     # LlamaModel.forward class-wide, so LlamaForSequenceClassification descends into
@@ -679,17 +680,12 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     shift_labels = x.get("shift_labels"),
                 )
                 if csm_depth_num_items_in_batch is not None:
+                    # CsmProcessor: -101 frames train the backbone only. Same frames as the forward's train_mask.
                     if labels.ndim != 2:
                         csm_depth_num_items_in_batch = None
                     else:
-                        # The CSM processor uses -101 for frames trained by the
-                        # backbone but excluded from the depth decoder.
-                        depth_labels = labels.masked_fill(labels == -101, -100)
-                        depth_count = count_batch_items(
-                            depth_labels, attention_mask, input_ids,
-                            x.get("packed_seq_lengths"),
-                        )[0]
-                        csm_depth_num_items_in_batch += depth_count * (top_model.config.num_codebooks - 1)
+                        csm_depth_num_items_in_batch += ((labels != -100) & (labels != -101)).sum() \
+                            * (top_model.config.num_codebooks - 1)
                 if not short: all_short = False
                 if bad: degenerate = True
                 token_counts.append(count)
@@ -708,19 +704,21 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     # Fill kernels, not torch.tensor(..., device = cuda): that is a blocking H2D copy.
                     flags = [torch.full((), int(flag), dtype = torch.int64, device = count.device)
                              for flag in (degenerate, all_short)]
+                    # CSM's depth count rides along as a 4th column on every rank (same model everywhere).
+                    if is_csm:
+                        flags.append(torch.zeros_like(count) if csm_depth_num_items_in_batch is None
+                                     else csm_depth_num_items_in_batch.reshape(()).to(count))
                     packed = torch.stack([count, *flags])
-                    packed = self.accelerator.gather(packed).reshape(-1, 3)
+                    packed = self.accelerator.gather(packed).reshape(-1, packed.numel())
                     num_items_in_batch = packed[:, 0].sum()
+                    if csm_depth_num_items_in_batch is not None:
+                        csm_depth_num_items_in_batch = packed[:, 3].sum()
                     # One D2H read for both flags, not one per bool().
                     degenerate, all_short = (
                         bool(flag) for flag in torch.stack([packed[:, 1].any(), packed[:, 2].all()]).tolist()
                     )
                 else:
                     num_items_in_batch = self.accelerator.gather(num_items_in_batch).sum()
-                if csm_depth_num_items_in_batch is not None:
-                    csm_depth_num_items_in_batch = self.accelerator.gather(
-                        csm_depth_num_items_in_batch
-                    ).sum()
             if torch.is_tensor(num_items_in_batch):
                 if device is not None:
                     num_items_in_batch = num_items_in_batch.to(device)
