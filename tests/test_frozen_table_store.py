@@ -495,3 +495,10 @@ def test_deepcopy_registers_its_own_lookup(bf16_table):
     del emb
     gc.collect()
     assert torch.equal(twin(ids), full[ids].double())
+
+
+def test_lookup_op_is_tagged_cudagraph_unsafe():
+    tag = getattr(torch._C.Tag, "cudagraph_unsafe", None)
+    if tag is None or fts._LOOKUP_OP is None:
+        pytest.skip("torch without the cudagraph_unsafe tag or custom_op")
+    assert tag in torch.ops.unsloth_zoo.frozen_table_lookup.default.tags

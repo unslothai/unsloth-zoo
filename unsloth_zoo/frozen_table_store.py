@@ -848,20 +848,28 @@ def _make_lookup_op():
     custom_op = getattr(getattr(torch, "library", None), "custom_op", None)
     if custom_op is None:
         return None
-    try:
-        @custom_op("unsloth_zoo::frozen_table_lookup", mutates_args=())
-        def frozen_table_lookup(ids: torch.Tensor, handle: int) -> torch.Tensor:
-            # A fresh tensor: a custom op's output must not be one it handed out before (the memo's rows).
-            return _module_for(handle)._lookup(ids).clone()
 
-        @frozen_table_lookup.register_fake
-        def _(ids, handle):
-            m = _module_for(handle)
-            return ids.new_empty((*ids.shape, *m.row_shape), dtype=m.table_dtype)
+    def lookup(ids: torch.Tensor, handle: int) -> torch.Tensor:
+        # A fresh tensor: a custom op's output must not be one it handed out before (the memo's rows).
+        return _module_for(handle)._lookup(ids).clone()
 
-        return frozen_table_lookup
-    except Exception:
-        return None
+    def fake(ids, handle):
+        m = _module_for(handle)
+        return ids.new_empty((*ids.shape, *m.row_shape), dtype=m.table_dtype)
+
+    # cudagraph_unsafe: the lookup reads ids on the host (unique, device to host copy), which cannot run inside a
+    # captured CUDA graph, so Inductor keeps it outside (reduce-overhead mode). torch before 2.8 has no `tags`.
+    tag = getattr(torch._C.Tag, "cudagraph_unsafe", None)
+    for kwargs in ([dict(tags=(tag,))] if tag is not None else []) + [dict()]:
+        try:
+            op = custom_op("unsloth_zoo::frozen_table_lookup", mutates_args=(), **kwargs)(lookup)
+            op.register_fake(fake)
+            return op
+        except TypeError:
+            continue
+        except Exception:
+            return None
+    return None
 
 
 _LOOKUP_OP = _make_lookup_op()
