@@ -44,6 +44,7 @@ __all__ = [
     "resolve_frozen_table_mode",
     "frozen_table_next_step",
     "decode_bf16_rows",
+    "make_view_decode",
     "make_fp8_block_decode",
     "reset_frozen_table_stats",
     "bind_frozen_tables",
@@ -295,6 +296,19 @@ def decode_bf16_rows(planes: Dict[str, torch.Tensor], dtype: Optional[torch.dtyp
     return rows if dtype is None or dtype == rows.dtype else rows.to(dtype)
 
 
+def make_view_decode(st_dtype: str):
+    """Single plane of rows stored as safetensors dtype ``st_dtype`` (BF16 / F16 / F32 ...), cast on request."""
+    torch_dtype = _ST_DTYPES[st_dtype][0]
+
+    def decode(planes: Dict[str, torch.Tensor], dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        (raw,) = planes.values()
+        rows = raw.view(torch_dtype)
+        return rows if dtype is None or dtype == rows.dtype else rows.to(dtype)
+
+    decode.st_dtype = st_dtype
+    return decode
+
+
 def make_fp8_block_decode(block_size: int = 32, weight_plane: str = "weight", scale_plane: str = "scale"):
     """fp8 e4m3 rows times per-block e8m0 scales, exactly DeepseekV41EngramEmbedding.forward:
     ``values.float().unflatten(-1, (-1, block)) * scales.float().unsqueeze(-1)`` (float32 result)."""
@@ -412,7 +426,15 @@ class FrozenTableStore:
         self.num_rows = rows.pop()
         self.row_bytes = sum(p.row_bytes for p in self.planes.values())
         self.nbytes = self.num_rows * self.row_bytes
-        self.decode = decode or decode_bf16_rows
+        if decode is None:
+            # One plane: view it in the checkpoint's own dtype (an fp16 or fp32 table must not be read as bf16).
+            if len(self.planes) != 1:
+                raise ValueError(f"Unsloth: frozen table {name} has {len(self.planes)} planes and needs a decoder.")
+            (only,) = self.planes.values()
+            if only.st_dtype not in _ST_DTYPES:
+                raise ValueError(f"Unsloth: frozen table {name} has unsupported dtype {only.st_dtype}.")
+            decode = make_view_decode(only.st_dtype)
+        self.decode = decode
         self.mode = resolve_frozen_table_mode(self.nbytes, device, mode)
         self.reader = (reader or os.environ.get("UNSLOTH_FROZEN_TABLE_READER", "mmap")).strip().lower()
         if self.reader not in ("mmap", "pread"):
@@ -660,6 +682,23 @@ class UnslothFrozenTableEmbedding(nn.Module):
         self._memo = None
         return self
 
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        # The checkpoint tensors as zero-copy views of the mapped files, under their checkpoint names: a full save
+        # (save_pretrained) streams them from the page cache into the new checkpoint, which loads back either way.
+        store = self.frozen_table_store
+        if store is None:
+            return
+        for plane in store.planes.values():
+            torch_dtype = _ST_DTYPES[plane.st_dtype][0]
+            for shard, suffix in zip(plane.shards, getattr(self, "checkpoint_suffixes", {}).get(plane.name, ())):
+                if shard.view is not None:
+                    destination[prefix + suffix] = shard.view.view(torch_dtype).view(shard.rows, *plane.cols)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
+                              error_msgs):
+        # Frozen, and read from its own checkpoint files: the exported views are accepted and not copied anywhere.
+        pass
+
     def _apply(self, fn, recurse=True):
         # Track dtype casts (model.to(torch.float32), .half()) without owning any tensor.
         try:
@@ -777,7 +816,8 @@ def _match_plane(module_name: str, keys: List[str], alternatives: Sequence[str])
         idx = [i for i, _ in items]
         if len(items) > 1 and idx != list(range(len(items))):
             raise RuntimeError(f"Unsloth: frozen table {module_name} shards are not contiguous: {idx[:8]}...")
-        return [k for _, k in items]
+        prefix = scored[0][1]
+        return [(k, k[len(prefix) + 1:]) for _, k in items]
     return []
 
 
@@ -803,7 +843,7 @@ def bind_frozen_tables(
     bound = {}
     for name, module in modules:
         spec = getattr(module, "checkpoint_planes", None) or DEFAULT_CHECKPOINT_PLANES
-        planes = {}
+        planes, suffixes = {}, {}
         for plane, alternatives in spec.items():
             found = _match_plane(name, keys, alternatives)
             if not found:
@@ -813,7 +853,8 @@ def bind_frozen_tables(
                     f"Unsloth: could not find frozen table {name} (plane {plane!r}) in the checkpoint. "
                     "Refusing to load it into memory; set UNSLOTH_FROZEN_TABLE=gpu for a normal load."
                 )
-            planes[plane] = found
+            planes[plane] = [k for k, _ in found]
+            suffixes[plane] = [x for _, x in found]
         else:
             store = FrozenTableStore.from_checkpoint(
                 source, planes,
@@ -832,6 +873,7 @@ def bind_frozen_tables(
                     f"(checkpoint {first.st_dtype} {first.cols})."
                 )
             module.bind(store)
+            module.checkpoint_suffixes = suffixes
             bound[name] = store
     return bound
 

@@ -326,16 +326,19 @@ def test_tiny_qwen4_disk_load_matches_normal_load(tiny_qwen4, monkeypatch, dtype
     assert log and not [k for k in log if "ngram_embedding" in k and "shard_" in k], sorted(set(log))[:5]
     assert not [n for n, _ in model.named_parameters() if "ngram_embedding" in n]
     assert not [n for n, _ in model.named_buffers() if "ngram_embedding.weight" in n]
-    assert not [k for k in model.state_dict() if "ngram_embedding" in k]
-    assert set(ref.state_dict()) - set(model.state_dict()) == {
-        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight"
-    }
+    # state_dict carries the checkpoint's own shard tensors (zero-copy views of the mapped files), not one table.
+    sd = model.state_dict()
+    assert sorted(k for k in sd if "ngram_embedding" in k) == shard_keys
+    table_key = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.weight"
+    assert set(ref.state_dict()) - set(sd) == {table_key}
+    assert torch.equal(torch.cat([sd[k] for k in shard_keys]).to(dtype), ref.state_dict()[table_key])
     # Nothing left for the no-placement / block-swap machinery to keep on the host.
     from unsloth_zoo.device_map_planner import drop_no_placement_modules
     assert drop_no_placement_modules(model) == []
     assert model.model.language_model.layers[1].ple.ple_embedding.ngram_embedding is emb
     for k, v in model.state_dict().items():
-        assert torch.equal(v, ref.state_dict()[k]), k
+        if k not in shard_keys:
+            assert torch.equal(v, ref.state_dict()[k]), k
 
     torch.manual_seed(1)
     ids = torch.randint(3, 1000, (2, 24))
@@ -362,6 +365,36 @@ def test_tiny_qwen4_disk_load_matches_normal_load(tiny_qwen4, monkeypatch, dtype
     assert FROZEN_TABLE_STATS["gathers"] == 1
     assert FROZEN_TABLE_STATS["memo_hits"] >= 1
     assert FROZEN_TABLE_STATS["unique_rows"] <= 2 * 24 * 16
+
+
+@needs_qwen4
+def test_tiny_qwen4_disk_model_saves_and_reloads(tiny_qwen4, monkeypatch, tmp_path):
+    path, shard_keys = tiny_qwen4
+    model = _load(path, "disk", monkeypatch, torch.bfloat16)
+    model.load_state_dict(model.state_dict())  # the exported shard views load back without unexpected keys
+    out = tmp_path / "saved"
+    model.save_pretrained(str(out), max_shard_size="40KB")
+    saved = json.loads((out / "model.safetensors.index.json").read_text())["weight_map"]
+    assert sorted(k for k in saved if "ngram_embedding" in k) == shard_keys
+    ids = torch.randint(3, 1000, (1, 16))
+    with torch.no_grad():
+        want = _load(path, "gpu", monkeypatch, torch.bfloat16)(input_ids=ids).logits
+        for mode in ("gpu", "disk"):
+            got = _load(str(out), mode, monkeypatch, torch.bfloat16)(input_ids=ids).logits
+            assert torch.equal(got, want), mode
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_table_is_read_in_its_checkpoint_dtype(tmp_path, dtype):
+    torch.manual_seed(0)
+    shards = [torch.randn(n, 6).to(dtype) for n in (5, 9)]
+    index, names = _write_sharded(tmp_path, shards)
+    full = torch.cat(shards)
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk")
+    ids = torch.tensor([0, 4, 5, 13, 4])
+    assert torch.equal(store.gather(ids), full[ids])
+    assert torch.equal(store.gather(ids, dtype=torch.float64), full[ids].double())
+    store.close()
 
 
 @needs_qwen4
