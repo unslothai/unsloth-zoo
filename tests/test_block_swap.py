@@ -1137,10 +1137,19 @@ def test_grow_pool_ignores_the_load_time_peak(monkeypatch):
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a, **k: now + (64 << 30))
     monkeypatch.setattr(_mod, "_WORKSPACE_MIN_BYTES", 0)
     monkeypatch.setattr(_mod, "_WORKSPACE_FRACTION", 0.0)
+    resets = []
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda dv = None: resets.append(dv))
     sw = BlockSwap(blocks, 6, prefetch_depth = "auto", device = "cuda")
+    # Install opened a fresh peak window: the allocator's peak now starts at what is allocated.
+    assert resets and sw._hwm_fresh
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a, **k: torch.cuda.memory_allocated())
     monkeypatch.setattr(_mod, "_free_device_bytes", lambda dv: 1 << 30)
     assert sw._grow_pool()
     sw._last_peak = {torch.device("cuda").index or 0: now + (2 << 30)}
+    assert not sw._grow_pool()
+    # A temporary inside a layer that no hook saw still shows in the fresh window's peak.
+    sw._last_peak = {}
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a, **k: torch.cuda.memory_allocated() + (2 << 30))
     assert not sw._grow_pool()
     sw.remove()
 
