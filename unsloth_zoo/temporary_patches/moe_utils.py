@@ -508,13 +508,17 @@ _GROUPED_MM_FP16_OP = _register_grouped_mm_fp16_op()
 
 
 # Max avg rows per expert for Triton grouped-MM, per arch; off sm90/sm100 torch._grouped_mm is a per-expert cuBLAS loop
-# that Triton beats for small experts; sm75 has no Triton MMA, sm86 is unmeasured, sm121 follows sm120 (unsloth-zoo
-# issue 1661) except for dw.
+# that Triton beats for small experts; sm121 follows sm120 (unsloth-zoo issue 1661) except for dw. sm89 (L4, E 64-256,
+# rows 8-1024 per expert) wins on every base GEMM with its retuned tiles. sm86 is unmeasured: it shares sm89's tile
+# table (moe_grouped_fp16._generic_family) but keeps sm89's former 32-row limits until it is timed. sm75 has no Triton MMA, so only small LoRA
+# GEMMs go there (one launch instead of one per expert); a LoRA limit counts rows at rank 16, a wider rank r as r / 16.
 _TRITON_GROUPED_MM_AUTO_ROWS = {
     (8, 0):  {"lora": -1, "many": 2048, "few": 512, "dw": 128, "dw_few": 128},
     (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 256, "dw_few": 64},
     (12, 1): {"lora": -1, "many": 2048, "few": 256, "dw": 64,  "dw_few": 64},
-    (8, 9):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0,   "dw_few": 0},
+    (8, 9):  {"lora": -1, "many": 1024, "few": 32,  "dw": 0,   "dw_few": 0},
+    (8, 6):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0,   "dw_few": 0},
+    (7, 5):  {"lora": 64, "many": 0,    "few": 0,   "dw": 0,   "dw_few": 0},
 }
 _TRITON_GROUPED_MM_CAPABILITY = {}
 _TRITON_GROUPED_MM_POLICY = {}
@@ -543,6 +547,12 @@ def _triton_grouped_mm_max_rows(index, kind = "lora"):
     return limit
 
 
+@_assume_constant_result
+def _triton_grouped_mm_lora_rank_scaled():
+    """Auto LoRA limits count rows at rank 16; an explicit UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS is taken as given."""
+    return not os.environ.get("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS")
+
+
 def _triton_grouped_mm_policy(index, kind, mode, disabled, override):
     mode = (mode or "auto").strip().lower()
     if mode in ("0", "false", "off") or disabled == "1":
@@ -557,7 +567,8 @@ def _triton_grouped_mm_policy(index, kind, mode, disabled, override):
     except Exception:
         return 0
     if mode in ("1", "true", "on"):
-        limit = -1 if cap >= (8, 0) else 0
+        # Below sm80 Triton has no MMA: forcing it on still keeps base-sized GEMMs on cuBLAS.
+        limit = -1 if cap >= (8, 0) or (cap >= (7, 5) and kind == "lora") else 0
     else:
         limit = _TRITON_GROUPED_MM_AUTO_ROWS.get(cap, {}).get(kind, 0)
     if limit != 0 and override:
@@ -600,7 +611,11 @@ def _triton_grouped_mm_wanted(inputs, weight) -> bool:
 
 
 def _triton_grouped_mm_rows_ok(device, M, E, K, N):
-    limit = _triton_grouped_mm_max_rows(device.index, _triton_grouped_mm_kind(K, N, E))
+    kind = _triton_grouped_mm_kind(K, N, E)
+    limit = _triton_grouped_mm_max_rows(device.index, kind)
+    if kind == "lora" and limit > 0 and _triton_grouped_mm_lora_rank_scaled():
+        # Triton's LoRA cost grows with the rank, the per-expert loop's does not; ceil so no row is over budget.
+        M = (M * max(min(K, N), 16) + 15) // 16
     return _rows_within(limit, M, E)
 
 
@@ -3116,7 +3131,7 @@ def native_moe_grouped_mm(
     return _grouped_mm_with_backward_fix(inputs, weight, offsets)
 
 
-def _lora_rank_pad_needed(inputs, first_weight) -> bool:
+def _lora_rank_pad_needed(inputs, first_weight, second_weight = None) -> bool:
     """False when both LoRA GEMMs take Triton (it masks any K or N, so no 16-byte stride rule); rank <= 32 keeps both in
     the same lora row class; UNSLOTH_MOE_LORA_PAD_ALWAYS=1 forces True."""
     if inputs is None or first_weight.shape[-1] > 32:
@@ -3125,6 +3140,11 @@ def _lora_rank_pad_needed(inputs, first_weight) -> bool:
         return True
     if not _triton_grouped_mm_wanted(inputs, first_weight):
         return True
+    if second_weight is not None and second_weight.dim() == 3:
+        # The second GEMM can fall in another row budget (rank between in and out dims): it must take Triton too.
+        E, K, N = second_weight.shape
+        if not _triton_grouped_mm_rows_ok(inputs.device, inputs.shape[0], E, K, N):
+            return True
     # A failed self-check falls back to torch._grouped_mm, which needs the pad.
     from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
     if torch.compiler.is_compiling():
@@ -3139,7 +3159,7 @@ def _pad_lora_rank_for_grouped_mm(first_weight, second_weight, inputs = None):
     align = max(8, 16 // first_weight.element_size())
     rank = first_weight.shape[-1]
     pad = (-rank) % align
-    if pad == 0 or not _lora_rank_pad_needed(inputs, first_weight):
+    if pad == 0 or not _lora_rank_pad_needed(inputs, first_weight, second_weight):
         return first_weight, second_weight
     first_weight = F.pad(first_weight, (0, pad))
     second_weight = F.pad(second_weight, (0, 0, 0, pad))
