@@ -2197,3 +2197,31 @@ def test_registered_arena_is_not_prefilled_under_deterministic_algorithms(monkey
     finally:
         torch.use_deterministic_algorithms(prev)
     assert seen == [False] and det.fill_uninitialized_memory is True
+
+
+def test_shared_cpu_storage_is_credited_once():
+    shared = nn.Linear(64, 64, bias = False)            # already on CPU, shared by layers 0 and 1
+    layers = nn.ModuleList([nn.Sequential(shared, nn.Linear(8, 8, bias = False)) for _ in range(2)])
+    state = _mod._HostLoad([0, 1], "tail")
+    state.layers, state.indices = layers, [0, 1]
+    state.shape_bytes = {0: 64 * 64 * 4 + 256, 1: 256}
+    state.owned_names = {0: {"0.weight", "1.weight"}, 1: {"1.weight"}}
+    state._layers_to_come(256, 1)                      # layer 1 finished loading first
+    assert state.cpu_to_come == 256                    # layer 0's own weight only: the shared one is layer 1's credit
+
+
+def test_an_in_flight_wait_only_sample_is_kept():
+    class Ev:
+        def __init__(self, t, done): self.t, self.done = t, done
+        def query(self): return self.done
+        def elapsed_time(self, other): return other.t - self.t
+    fake = types.SimpleNamespace(_tot = {"stall_ms": 0.0, "compute_ms": 0.0, "layers": 0})
+    block = types.SimpleNamespace(marks = (Ev(0.0, True), Ev(2.0, False), Ev(0.0, False)), mark_open = 3)
+    fake.blocks = [block]
+    fake._harvest_copy = lambda b: None
+    fake._harvest_marks = lambda b: _mod.BlockSwap._harvest_marks(fake, b)
+    _mod.BlockSwap._harvest(fake)
+    assert block.mark_open == 3 and fake._tot["stall_ms"] == 0.0   # not dropped while in flight
+    block.marks[1].done = True
+    _mod.BlockSwap._harvest(fake)
+    assert block.mark_open == 0 and fake._tot["stall_ms"] == 2.0

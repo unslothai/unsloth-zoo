@@ -774,7 +774,11 @@ class BlockSwap:
             marks = getattr(b, "marks", None)
             # A sample still in flight (backward recompute queued behind its forward) is kept for _harvest,
             # not overwritten: recording into the same events would lose it.
-            if marks is not None and not (b.mark_open == 2 and not marks[2].query()):
+            # mark_open: 1 = waiting sample open, 2 = full sample recorded, 3 = wait-only sample closed (the forward
+            # hook never ran: a recompute that stopped early) but its events may still be in flight.
+            in_flight = marks is not None and (
+                (b.mark_open == 2 and not marks[2].query()) or (b.mark_open in (1, 3) and not marks[1].query()))
+            if marks is not None and not in_flight:
                 self._harvest_marks(b)
                 stream = torch.cuda.current_stream(b.home)
                 marks[0].record(stream)
@@ -782,6 +786,8 @@ class BlockSwap:
                 marks[1].record(stream)
                 b.mark_open = 1
             else:
+                if marks is not None and b.mark_open == 1:
+                    b.mark_open = 3   # keep it for _harvest; this layer call records no sample of its own
                 b.wait()
             # Weights kept for backward = recompute sweep, which walks layers in reverse.
             nxt = i - self.depth if _autograd_keeps_weights() else i + self.depth
@@ -996,7 +1002,7 @@ class BlockSwap:
             self._tot["stall_ms"] += max(0.0, b.marks[0].elapsed_time(b.marks[1]))
             self._tot["compute_ms"] += max(0.0, b.marks[1].elapsed_time(b.marks[2]))
             self._tot["layers"] += 1
-        elif b.mark_open == 1 and b.marks[1].query():
+        elif b.mark_open in (1, 3) and b.marks[1].query():
             # The forward hook never ran (a checkpoint recompute that stopped early): the wait still happened.
             self._tot["stall_ms"] += max(0.0, b.marks[0].elapsed_time(b.marks[1]))
         b.mark_open = 0
@@ -1005,7 +1011,8 @@ class BlockSwap:
         for b in self.blocks:
             if getattr(b, "copy_open", False) or getattr(b, "copy_pending", None):
                 self._harvest_copy(b)
-            if getattr(b, "mark_open", 0) == 2 and b.marks[2].query():
+            if (getattr(b, "mark_open", 0) == 2 and b.marks[2].query()) or (
+                    getattr(b, "mark_open", 0) == 3 and b.marks[1].query()):
                 self._harvest_marks(b)
 
     def _since(self, seen):
@@ -1598,6 +1605,11 @@ class _HostLoad:
         `size` bytes loaded), since layers can be quantized differently (skip modules) and each later eviction
         re-checks with real sizes."""
         left = [j for j in self.indices if j not in self.done]
+        # The layer being moved first: a storage it shares with a later-loaded selected layer is its own (credited
+        # by the caller), never also counted in cpu_to_come for the other layer.
+        if ref in left:
+            left.remove(ref)
+            left.insert(0, ref)
         base = self.shape_bytes.get(ref, 0)
         ratios = list(self.ratios.values()) + ([size / base] if base else [])
         ratio = min(ratios) if ratios else None
