@@ -68,7 +68,7 @@ jobs:
       HF_HOME: ${{ github.workspace }}/hf-cache
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: audit
 
@@ -95,7 +95,7 @@ jobs:
         # alone. torch first: pyproject gates it off on darwin+arm64, zoo still imports it.
         run: |
           python -m pip install --upgrade pip
-          pip install "torch>=2.4.0,<2.15.0"
+          pip install "torch>=2.4.0,<2.16.0"
           pip install -e .[mlx] "mlx-vlm==${{ matrix.mlx_vlm }}" "transformers==5.5.0"
           python -c "
           import mlx_vlm, transformers

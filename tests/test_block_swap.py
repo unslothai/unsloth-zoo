@@ -329,6 +329,67 @@ def test_state_dict_substitutes_host_copies_for_evicted_blocks():
     sw.remove()
 
 
+def test_shaped_gives_evicted_expert_weights_their_shape_without_memory():
+    if not torch.cuda.is_available():
+        print("[SKIP] CUDA not available")
+        return
+
+    class Experts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = nn.Parameter(torch.randn(4, 16, 8), requires_grad = False)
+
+    layers = nn.ModuleList([Experts() for _ in range(3)]).to("cuda")
+    sw = BlockSwap(layers, 3, prefetch_depth = 1)
+    for b in sw.blocks:
+        sw._release(b)
+    w = layers[0].gate_up_proj
+    assert w.numel() == 0
+    with sw.shaped():
+        assert w.shape == (4, 16, 8) and w.device.type == "cuda"
+        assert w.untyped_storage().nbytes() == w.element_size()
+        try:
+            from peft.tuners.lora.layer import ParamWrapper
+        except ImportError:
+            ParamWrapper = None
+        if ParamWrapper is not None:
+            import inspect
+            kwargs = {}
+            if "config" in inspect.signature(ParamWrapper.__init__).parameters:
+                from peft import LoraConfig
+                kwargs["config"] = LoraConfig(r = 2, lora_alpha = 2)
+            pw = ParamWrapper(layers[0], "default", parameter_name = "gate_up_proj", r = 2, lora_alpha = 2, **kwargs)
+            assert pw.num_experts == 4
+    assert w.numel() == 0
+    sw.remove()
+    assert w.shape == (4, 16, 8)
+
+
+def test_shaped_restores_placeholders_set_before_a_failure():
+    import types, pytest
+
+    class FailingSignature:
+        def __getitem__(self, index):
+            raise RuntimeError("shape lookup failed")
+
+    a, b = nn.Parameter(torch.empty(0), requires_grad = False), nn.Parameter(torch.empty(0), requires_grad = False)
+    blk = types.SimpleNamespace(resident = False, params = [a, b], empties = [a.data, b.data],
+                                sig = [((4, 16, 8),), FailingSignature()])
+    with pytest.raises(RuntimeError, match = "shape lookup failed"):
+        with BlockSwap.shaped(types.SimpleNamespace(blocks = [blk])):
+            pass
+    assert a.shape == (0,) and b.shape == (0,)
+
+
+def test_shaped_leaves_a_block_fetched_inside_the_context():
+    import types
+    w = nn.Parameter(torch.empty(0), requires_grad = False)
+    blk = types.SimpleNamespace(resident = False, params = [w], empties = [w.data], sig = [((4, 8),)])
+    with BlockSwap.shaped(types.SimpleNamespace(blocks = [blk])):
+        w.data, blk.resident = torch.ones(4, 8), True
+    assert w.shape == (4, 8) and w.sum() == 32
+
+
 def test_state_dict_follows_weights_renamed_after_install():
     # from_pretrained(offload_layers = N) installs before PEFT wraps each Linear in a base_layer.
     if not torch.cuda.is_available():
@@ -908,3 +969,76 @@ def test_pin_budget_is_split_across_the_ranks_on_this_host(monkeypatch):
     for bad in ("0", "-2", "x"):
         monkeypatch.setenv("LOCAL_WORLD_SIZE", bad)
         assert _mod._pin_budget() == spare
+
+
+class _Ple(nn.Module):
+
+    def __init__(self, table):
+        super().__init__()
+        self.mlp = nn.Linear(64, 64, bias = False)
+        if table:
+            self.ple = nn.Module()
+            self.ple.ple_embedding = nn.Module()
+            self.ple.ple_embedding.ngram_embedding = nn.Embedding(4096, 64)
+
+
+class _PleModel(nn.Module):
+    _no_placement_params = ["ple.ple_embedding.ngram_embedding.weight"]
+
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([_Ple(i == 1) for i in range(3)]).requires_grad_(False)
+
+
+def _cpu_block(layer, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "Event", lambda *a, **k: object())
+    cpu = torch.device("cpu")
+    return _mod._Block(layer, {cpu: None}, cpu)
+
+
+def test_no_placement_table_is_never_packed_into_a_slot(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_PLACE_NO_PLACEMENT_PARAMS", raising = False)
+    model = _PleModel()
+    layers = find_decoder_layers(model)
+    table = model.layers[1].ple.ple_embedding.ngram_embedding.weight
+    assert [n for n, _ in _mod._swappable(layers[1])] == ["mlp.weight"]
+    block = _cpu_block(layers[1], monkeypatch)
+    assert all(p is not table for p in block.params)
+    assert block.nbytes() == 64 * 64 * 4
+    assert _mod._layer_signature(_mod._swappable(layers[1])) == _mod._layer_signature(_mod._swappable(layers[0]))
+
+
+def test_no_placement_table_stays_out_after_the_load_replaces_its_parameter(monkeypatch):
+    # A load to host replaces each Parameter after find_decoder_layers ran.
+    monkeypatch.delenv("UNSLOTH_PLACE_NO_PLACEMENT_PARAMS", raising = False)
+    model = _PleModel()
+    layers = find_decoder_layers(model)
+    emb = model.layers[1].ple.ple_embedding.ngram_embedding
+    emb.weight = nn.Parameter(torch.zeros_like(emb.weight), requires_grad = False)
+    assert [n for n, _ in _mod._swappable(layers[1])] == ["mlp.weight"]
+
+
+def test_placing_no_placement_params_makes_them_swappable_again(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_PLACE_NO_PLACEMENT_PARAMS", "1")
+    layers = find_decoder_layers(_PleModel())
+    assert len(_mod._swappable(layers[1])) == 2
+
+
+def test_auto_swap_indices_does_not_count_a_host_kept_table():
+    if not torch.cuda.is_available():
+        return
+
+    class Model(_PleModel):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.layers = nn.ModuleList([_Ple(i == 7) for i in range(8)]).requires_grad_(False)
+
+    model = Model()
+    model.layers.cuda()
+    model.layers[7].ple.cpu()
+    layers = find_decoder_layers(model)
+    dev = layers[0].mlp.weight.device
+    layer = 64 * 64 * 4
+    # Same signature as its neighbours, so it shares their pool.
+    idx, left = auto_swap_indices(layers, 2 * layer, 1, free_bytes = {dev: 0})
+    assert idx == [1, 3, 5, 7] and left == 0

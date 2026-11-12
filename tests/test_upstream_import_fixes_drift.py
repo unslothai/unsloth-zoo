@@ -279,6 +279,14 @@ def test_triton_compiled_kernel_has_num_ctas_and_cluster_dims():
     tc = pytest.importorskip("triton.compiler.compiler")
 
     ck_cls = tc.CompiledKernel
+    # torch 2.10+ Inductor guards the unpack itself (hasattr on metadata.cluster_dims), so nothing to patch.
+    try:
+        import inspect
+        import torch._inductor.runtime.triton_heuristics as heuristics
+        if 'hasattr(binary.metadata, "cluster_dims")' in inspect.getsource(heuristics):
+            return
+    except Exception:
+        pass
     # Healthy if the pre-3.6 class attr exists, or unsloth wrapped __init__ to install num_ctas and cluster_dims per instance.
     if hasattr(ck_cls, "num_ctas"):
         return

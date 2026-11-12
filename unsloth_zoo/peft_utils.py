@@ -362,8 +362,14 @@ def get_peft_regex(
     if regex_model_parts != "":
         check = any(re.fullmatch(regex_matcher, name, flags = re.DOTALL) for name in linear_modules)
         if not check:
+            # A part switched off stays out: GIT's decoder has no language tag, so this would re-add its vision tower.
+            disabled_tags = []
+            if not finetune_vision_layers:   disabled_tags += vision_tags
+            if not finetune_language_layers: disabled_tags += language_tags
+            disabled_parts = r"(?!.*(?:" + "|".join(disabled_tags) + r"))" if disabled_tags else ""
             # Frozen audio codecs (CSM / Kyutai Mimi) run under no_grad, so LoRA there never trains.
             regex_matcher = \
+                disabled_parts + \
                 r"(?!(?:.*\.)?(?:codec_model|audio_tokenizer|acoustic_tokenizer|semantic_tokenizer)\.)" + \
                 r".*?(?:" + regex_components + \
                 r").*?\." + match_linear_modules
@@ -603,28 +609,14 @@ def requires_grad_for_gradient_checkpointing(model):
     # Enables requires_grad to make gradient checkpointing work on
     # non language models that don't just use .embed_tokens
     def register_other_hooks(name1, name2, module, _hooks):
-        old_hooks = eval(f"module.{_hooks}")
-        # Hooks with with_kwargs = True (Unsloth's inputs_embeds pre-hook) take (module, args, kwargs); re-register them
-        # the same way, or the next forward calls them with two arguments.
-        with_kwargs = set(getattr(module, f"{_hooks}_with_kwargs", None) or ())
-        other_hooks = []
-        for key, value in old_hooks.items():
+        # Delete in place: kept hooks keep their ids, flags and RemovableHandles.
+        hooks = getattr(module, _hooks)
+        for key, value in list(hooks.items()):
             qualname = getattr(value, "__qualname__", "")
-            name     = getattr(value, "__name__", "")
-            if name1 in qualname or name2 in qualname: pass
-            elif name2 in name or name2 in name: pass
-            else: other_hooks.append((value, key in with_kwargs))
-        pass
-        # Keep none input requires grad hooks
-        exec(f"module.{_hooks} = OrderedDict()")
-        if hasattr(module, f"{_hooks}_with_kwargs"):
-            getattr(module, f"{_hooks}_with_kwargs").clear()
-        register = getattr(module, f"register{_hooks[:-1]}")
-        for hook, kwargs_hook in other_hooks:
-            if kwargs_hook:
-                register(hook, with_kwargs = True)
-            else:
-                register(hook)
+            if name1 in qualname or name2 in qualname or name2 in getattr(value, "__name__", ""):
+                del hooks[key]
+                for flags in (f"{_hooks}_with_kwargs", f"{_hooks}_always_called"):
+                    getattr(module, flags, {}).pop(key, None)
     pass
 
     # Remove all previous forward hooks for gradient checkpointing

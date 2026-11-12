@@ -516,6 +516,52 @@ def test_for_training_switches_gradient_checkpointing_only_when_asked():
     assert not model.is_gradient_checkpointing
 
 
+def test_for_training_and_get_peft_model_keep_every_n_layers():
+    import inspect
+    from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedModel
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    if "every_n_layers" not in inspect.signature(PreTrainedModel.gradient_checkpointing_enable).parameters:
+        pytest.skip("every_n_layers is a gradient_checkpointing_enable argument from transformers 5.17")
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(LlamaConfig(vocab_size = 64, hidden_size = 32, intermediate_size = 64,
+                                         num_hidden_layers = 4, num_attention_heads = 4, num_key_value_heads = 4,
+                                         max_position_embeddings = 32))
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False}, every_n_layers = 2)
+    flags = lambda: [layer.gradient_checkpointing for layer in model.model.layers]  # noqa: E731
+    assert flags() == [True, False, True, False]
+    FastCPUModel.for_training(model, use_gradient_checkpointing = True)
+    assert flags() == [True, False, True, False]
+    FastCPUModel._prepare(model, "unsloth")
+    assert flags() == [True, False, True, False]
+    FastCPUModel.for_training(model, use_gradient_checkpointing = False)
+    assert not model.is_gradient_checkpointing
+    FastCPUModel.for_training(model, use_gradient_checkpointing = True)
+    assert flags() == [True, True, True, True]
+
+
+def test_for_training_and_get_peft_model_switch_reentrant_checkpointing():
+    # transformers < 5 defaults to reentrant, which fails backward when LoRA inputs do not require grad.
+    from transformers import LlamaConfig, LlamaForCausalLM
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    def reentrant():
+        return [
+            m._gradient_checkpointing_func.keywords.get("use_reentrant")
+            for m in model.modules() if "_gradient_checkpointing_func" in m.__dict__
+        ]
+    for step in ("for_training", "prepare"):
+        torch.manual_seed(0)
+        model = LlamaForCausalLM(LlamaConfig(vocab_size = 64, hidden_size = 32, intermediate_size = 64,
+                                             num_hidden_layers = 2, num_attention_heads = 4, num_key_value_heads = 4,
+                                             max_position_embeddings = 32))
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": True})
+        assert set(reentrant()) == {True}
+        if step == "for_training":
+            FastCPUModel.for_training(model, use_gradient_checkpointing = True)
+        else:
+            FastCPUModel._prepare(model, "unsloth")
+        assert set(reentrant()) == {False}, step
+
+
 def test_zero_item_batch_gives_zero_gradients_not_nan():
     from unsloth_zoo.cpu.ops import chunked_linear_cross_entropy
     hidden = torch.randn(2, 4, 8, requires_grad = True)
@@ -1006,6 +1052,71 @@ def test_trl_fused_lm_head_routes_cpu_tensors_to_torch(monkeypatch):
     # TRL before the fused head: nothing to route.
     monkeypatch.delattr(trl_utils, "_ChunkedLogProbFunction")
     assert ops.patch_trl_fused_lm_head() is False
+
+
+def test_trl_fused_lm_head_dispatch_takes_the_kept_set_contract(monkeypatch):
+    from trl.trainer import utils as trl_utils
+    from unsloth_zoo.cpu import ops
+    calls = []
+
+    class Kernel117:
+        @staticmethod
+        def forward(ctx, hidden, weight, bias, targets, temperature, chunk_size, final_logit_softcapping = None,
+                    logit_scale = 1.0, outputs = (), support_ids = None, score_ids = None):
+            raise AssertionError
+
+        @staticmethod
+        def apply(hidden, *a, **k):
+            calls.append((a, k))
+            return ("kernel",) * 6
+
+    monkeypatch.setattr(trl_utils, "_ChunkedLogProbFunction", Kernel117, raising = False)
+    assert ops.patch_trl_fused_lm_head() is True
+    dispatch = trl_utils._ChunkedLogProbFunction
+    torch.manual_seed(0)
+    hidden, weight, targets = torch.randn(9, 8), torch.randn(23, 8), torch.randint(0, 23, (9,))
+    got = dispatch.apply(hidden, weight, None, targets, 0.7, 64, None, 1.0, ("entropy",), None, None)
+    assert len(got) == 6 and got[5] is None and got[2] is None and calls == []
+    logp = torch.log_softmax((hidden.double() @ weight.double().t()) / 0.7, -1)
+    torch.testing.assert_close(got[0].double(), logp.gather(-1, targets[:, None]).squeeze(-1), rtol = 1e-5, atol = 1e-5)
+    ids = torch.zeros(9, 2, dtype = torch.long)
+    assert dispatch.apply(hidden, weight, None, targets, 0.7, 64, None, 1.0, ("entropy",), ids, None)[0] == "kernel"
+    assert dispatch.apply(hidden, weight, None, targets, 0.7, 64, None, 1.0, (), score_ids = ids)[0] == "kernel"
+    assert len(calls) == 2 and calls[1][1]["score_ids"] is ids
+
+
+def test_trl_fused_forward_on_cpu_matches_trl_kernel(monkeypatch):
+    from trl.trainer import utils as trl_utils
+    from unsloth_zoo.cpu import ops
+    kernel = getattr(trl_utils, "_ChunkedLogProbFunction", None)
+    kernel = getattr(kernel, "_kernel", kernel)
+    if kernel is None or not hasattr(trl_utils, "add_fused_lm_head"):
+        pytest.skip("this TRL has no fused lm_head kernel")
+    from transformers import LlamaConfig, LlamaForCausalLM
+    torch.manual_seed(0)
+    model = LlamaForCausalLM(LlamaConfig(
+        vocab_size = 37, hidden_size = 16, intermediate_size = 32, num_hidden_layers = 1,
+        num_attention_heads = 2, num_key_value_heads = 2, max_position_embeddings = 32,
+    )).float()
+    input_ids = torch.randint(0, 37, (2, 9))
+    labels = input_ids.clone()
+    labels[0, :3] = -100
+    trl_utils.add_fused_lm_head(model, temperature = 0.7, outputs = ("log_probs", "entropy"))
+    monkeypatch.setattr(trl_utils, "_ChunkedLogProbFunction", kernel)
+    assert ops.patch_trl_fused_lm_head() is True
+    ours = model(input_ids = input_ids, labels = labels, fused_lm_head = True)
+    ours.loss.backward()
+    ours_grad = model.model.norm.weight.grad.clone()
+    monkeypatch.setattr(trl_utils, "_ChunkedLogProbFunction", kernel)
+    model.zero_grad()
+    try:
+        ref = model(input_ids = input_ids, labels = labels, fused_lm_head = True)
+        ref.loss.backward()
+    except Exception as exc:  # TRL < 1.17's kernel is Triton only.
+        pytest.skip(f"TRL's kernel does not run on CPU here ({type(exc).__name__})")
+    torch.testing.assert_close(ours.log_probs, ref.log_probs, rtol = 1e-5, atol = 1e-5)
+    torch.testing.assert_close(ours.entropy, ref.entropy, rtol = 1e-5, atol = 1e-5)
+    torch.testing.assert_close(ours_grad, model.model.norm.weight.grad, rtol = 1e-4, atol = 1e-5)
 
 
 def test_cpu_fused_lm_head_with_every_label_masked():

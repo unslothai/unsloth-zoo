@@ -20,6 +20,8 @@ __all__ = [
     "_flex_attention",
     "flex_attention",
     "PREFILL_KERNEL_OPTIONS",
+    "decode_kernel_options",
+    "decode_kernel_kwargs",
     "create_block_mask_cached",
     "create_block_mask",
     "compiled_create_block_mask",
@@ -424,3 +426,192 @@ except:
     FLEX_LSE_KWARGS = {"return_lse": True}
     flex_output_and_lse = None
 pass
+
+
+def _triton_block_ptr_removed():
+    # Triton 3.9 (and triton-windows 3.9) turned tl.make_block_ptr into a NotImplementedError. Generated kernels call the
+    # public triton.language name, so a shim that restores only that one counts as present. Only Triton's own @builtin
+    # wrapper is unwrapped: a working shim made with functools.wraps(old) also points __wrapped__ at the removed stub.
+    try:
+        import inspect
+        import triton.language as _tl
+        import triton.language.core as _core
+    except Exception:
+        return False
+    fn = getattr(_tl, "make_block_ptr", None)
+    if fn is None:
+        return True
+    core_file = os.path.abspath(getattr(_core, "__file__", "") or "")
+    for _ in range(8):
+        code = getattr(fn, "__code__", None)
+        if code is None:
+            return False
+        if (code.co_name == "wrapper" and os.path.abspath(code.co_filename) == core_file
+                and getattr(fn, "__wrapped__", None) is not None):
+            fn = fn.__wrapped__
+            continue
+        try:
+            return _raises_removed_error(inspect.getsource(code))
+        except Exception:
+            return False
+    return False
+
+
+def _raises_removed_error(source):
+    # Triton 3.9's make_block_ptr is a docstring plus one `raise NotImplementedError("... have been removed ...")`. Only
+    # that statement counts: a working shim may mention the removal in a comment or docstring.
+    import ast
+    import textwrap
+    tree = ast.parse(textwrap.dedent(source))
+    fn = next(n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    body = fn.body[1:] if ast.get_docstring(fn) is not None else fn.body
+    if len(body) != 1 or not isinstance(body[0], ast.Raise) or body[0].exc is None:
+        return False
+    return "have been removed" in ast.unparse(body[0].exc)
+
+
+def _torch_template_uses_block_ptr(*candidates):
+    # First candidate group present in the installed torch decides; read the files, no import. True / False once every
+    # file of that group was read, None when the answer is unknown (no group found, a member missing or unreadable).
+    import importlib.util
+    try:
+        spec = importlib.util.find_spec("torch")
+        roots = list(spec.submodule_search_locations or []) if spec is not None else []
+    except Exception:
+        return None
+    for root in roots:
+        for group in candidates:
+            paths = [os.path.join(root, *rel.split("/")) for rel in group]
+            if not os.path.exists(paths[0]):
+                continue
+            uses = False
+            for path in paths:
+                try:
+                    with open(path, encoding = "utf-8") as f:
+                        if "make_block_ptr" in f.read():
+                            uses = True
+                except Exception:
+                    return None
+            return uses
+    return None
+
+
+def _flex_decode_template_uses_block_ptr():
+    # torch 2.6 - 2.12's flex_decoding template builds block pointers; 2.13+ does not.
+    return _torch_template_uses_block_ptr(
+        ("_inductor/kernel/flex/templates/flex_decode.py.jinja",),
+        ("_inductor/kernel/flex_decoding.py",),
+    )
+
+
+def _flex_main_template_uses_block_ptr():
+    # The main flex kernel, forward and backward: block pointers up to torch 2.8 (non-TMA path), tensor descriptors from
+    # 2.9. Every file of the 2.9+ group must be read before it counts as free of block pointers.
+    return _torch_template_uses_block_ptr(
+        (
+            "_inductor/kernel/flex/templates/flex_attention.py.jinja",
+            "_inductor/kernel/flex/templates/common.py.jinja",
+            "_inductor/kernel/flex/templates/flex_backwards.py.jinja",
+            "_inductor/kernel/flex/templates/utilities.py.jinja",
+        ),
+        ("_inductor/kernel/flex_attention.py",),
+    )
+
+
+def _kernel_options_position():
+    # flex_attention(query, key, value, score_mod, block_mask, scale, enable_gqa, return_lse, kernel_options, *, ...)
+    try:
+        import inspect
+        from torch.nn.attention.flex_attention import flex_attention as _torch_flex_attention
+        return list(inspect.signature(_torch_flex_attention).parameters).index("kernel_options")
+    except Exception:
+        return 8
+
+
+def _main_kernel_options(requested, forced_options):
+    """kernel_options that keep a short query off flex_decoding. An explicit dict replaces the presets (partial tile
+    overrides must not mix with preset tiles) and only gains FORCE_USE_FLEX_ATTENTION. torch 2.9 has no BACKEND and
+    2.10+ rejects BACKEND with the legacy knob, so AUTO / TRITON become the legacy knob; other backends are kept."""
+    if requested is None:
+        return dict(forced_options)
+    requested = dict(requested)
+    backend = requested.get("BACKEND")
+    if backend in ("AUTO", "TRITON"):
+        del requested["BACKEND"]
+        if backend == "TRITON":
+            requested["FORCE_USE_FLEX_ATTENTION"] = True
+    if "BACKEND" in requested:
+        return requested
+    return {"FORCE_USE_FLEX_ATTENTION": True, **requested}
+
+
+def _main_kernel_for_short_queries(flex_attention_fn, forced_options):
+    """flex_attention_fn with the main kernel for short queries. No functools.wraps: copying the compiled function's
+    __dict__ would hand Dynamo its original callable and skip these options."""
+    forced_options = dict(forced_options)
+    position = _kernel_options_position()
+    def flex_attention(*args, **kwargs):
+        if len(args) > position:
+            if "kernel_options" in kwargs:
+                return flex_attention_fn(*args, **kwargs)  # both given: flex_attention raises its own TypeError
+            kwargs["kernel_options"] = args[position]
+            args = args[:position] + args[position + 1:]
+        kwargs["kernel_options"] = _main_kernel_options(kwargs.get("kernel_options"), forced_options)
+        return flex_attention_fn(*args, **kwargs)
+    return flex_attention
+
+
+def _flex_decoding_unavailable(block_ptr_removed, decode_uses_block_ptr, main_uses_block_ptr):
+    # An unknown (None) template answer never turns the workaround on.
+    return bool(block_ptr_removed) and decode_uses_block_ptr is True and main_uses_block_ptr is False
+
+
+# Decided at import (no file reads inside traced code). A failed flex_decoding compile makes Dynamo skip flex_attention
+# for the whole process, so every later prefill builds the full score matrix; short queries take the main kernel instead
+# when it is known to be free of block pointers (torch 2.9+).
+_TRITON_BLOCK_PTR_REMOVED = bool(HAS_FLEX_ATTENTION) and _triton_block_ptr_removed()
+_DECODE_USES_BLOCK_PTR = _flex_decode_template_uses_block_ptr() if _TRITON_BLOCK_PTR_REMOVED else None
+_MAIN_USES_BLOCK_PTR = _flex_main_template_uses_block_ptr() if _TRITON_BLOCK_PTR_REMOVED else None
+FLEX_DECODING_UNAVAILABLE = _flex_decoding_unavailable(_TRITON_BLOCK_PTR_REMOVED, _DECODE_USES_BLOCK_PTR, _MAIN_USES_BLOCK_PTR)
+if _TRITON_BLOCK_PTR_REMOVED and (_DECODE_USES_BLOCK_PTR is True or _MAIN_USES_BLOCK_PTR is True):
+    import triton
+    from unsloth_zoo.log import logger
+    if FLEX_DECODING_UNAVAILABLE:
+        logger.warning(
+            f"Unsloth: Triton {triton.__version__} has no block pointers, which torch {torch.__version__}'s "
+            "flex_decoding needs; short queries use the main flex kernel instead. Install the Triton your torch pins "
+            "to get flex_decoding back."
+        )
+    elif _MAIN_USES_BLOCK_PTR is True:
+        logger.warning(
+            f"Unsloth: Triton {triton.__version__} has no block pointers, which torch {torch.__version__}'s flex "
+            "attention kernels need, so flex attention cannot compile and runs eagerly with much more memory. "
+            "Install the Triton your torch pins."
+        )
+    else:
+        logger.warning(
+            f"Unsloth: Triton {triton.__version__} has no block pointers, which torch {torch.__version__}'s "
+            "flex_decoding needs, and its main flex kernel could not be checked, so flex attention may run eagerly "
+            "with much more memory. Install the Triton your torch pins."
+        )
+def _guarded_exports(compiled_flex_attention, raw_flex_attention, forced_options):
+    """Both exported callables with the main kernel for short queries."""
+    return (
+        _main_kernel_for_short_queries(compiled_flex_attention, forced_options),
+        _main_kernel_for_short_queries(raw_flex_attention, forced_options),
+    )
+
+
+if FLEX_DECODING_UNAVAILABLE and flex_attention is not None:
+    flex_attention, _flex_attention = _guarded_exports(flex_attention, _flex_attention, PREFILL_KERNEL_OPTIONS)
+
+
+def decode_kernel_options():
+    """kernel_options for a one-token query: AUTO (flex_decoding) unless it cannot compile here."""
+    return dict(PREFILL_KERNEL_OPTIONS) if FLEX_DECODING_UNAVAILABLE else {}
+
+
+def decode_kernel_kwargs():
+    """Extra flex_attention kwargs for a query AUTO may send to flex_decoding: none (the compiled flex_attention keeps
+    its own tile options) unless flex_decoding cannot compile here."""
+    return {"kernel_options": dict(PREFILL_KERNEL_OPTIONS)} if FLEX_DECODING_UNAVAILABLE else {}

@@ -104,3 +104,26 @@ def test_fully_masked_rows_are_dropped_by_a_batched_filter(monkeypatch):
     # Rows whose 40-word prompt fills the 32 tokens lose every assistant token and are dropped, in order.
     assert len(out) == 8
     assert all(any(m) for m in out["assistant_masks"])
+
+
+@pytest.mark.parametrize("batched", [True, False])
+@pytest.mark.parametrize("mask_values", ["int", "bool", "nullable"])
+def test_one_and_two_mask_labels_match_all(monkeypatch, batched, mask_values):
+    # The one- and two-mask fast paths must keep all()'s truthiness for every value an Arrow mask column can hold.
+    monkeypatch.setattr(dataset_utils, "trl_collator_applies_masks", lambda: False)
+    monkeypatch.setattr(dataset_utils, "trl_collator_ignores_labels", lambda collator = None: False)
+    convert = {"int": int, "bool": bool, "nullable": lambda x: x or None}[mask_values]
+    rows = [
+        {"input_ids": r["input_ids"],
+         "assistant_masks": [convert(x) for x in r["assistant_masks"]],
+         "completion_mask": [convert(x) for x in r["completion_mask"]]}
+        for r in ROWS
+    ]
+    for completion_only_loss in (False, True):
+        masks = ["assistant_masks", "completion_mask"] if completion_only_loss else ["assistant_masks"]
+        expected = [[t if all([r[m][i] for m in masks]) else -100 for i, t in enumerate(r["input_ids"])] for r in rows]
+        dataset = Dataset.from_list(rows)
+        if not batched:
+            dataset = dataset.to_iterable_dataset()
+        out = _prepare(dataset, completion_only_loss)
+        assert [row["labels"] for row in out] == expected

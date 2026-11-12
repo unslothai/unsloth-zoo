@@ -36,6 +36,9 @@ BLOCKED = [
     ("operator.attrgetter", 'def matmul(A, B):\n    import operator\n    return operator.attrgetter("__class__.__bases__")(1)\n', AttributeError),
     ("operator.methodcaller", 'def matmul(A, B):\n    import operator\n    return operator.methodcaller("__str__")(1)\n', AttributeError),
     ("enum.global_enum", 'def matmul(A, B):\n    import enum\n    return enum.global_enum(enum.IntEnum("Hijack", {"len": 7}, module = "builtins"))\n', AttributeError),
+    # pickle_by_enum_name(member, proto) returns (getattr, ...): the real getattr then walks __self__ to builtins.__import__.
+    ("enum.pickle_by_enum_name", 'def matmul(A, B):\n    import enum, re\n    g = enum.pickle_by_enum_name(re.IGNORECASE, 2)[0]\n    return g(g(g, "__self__"), "__import__")("os").getpid()\n', AttributeError),
+    ("from enum import pickle_by_enum_name", 'def matmul(A, B):\n    from enum import pickle_by_enum_name\n    return pickle_by_enum_name\n', ImportError),
     # Formatter.get_field resolves a dotted string and returns the object, recovering the real __import__; str.format
     # walks attributes too but only returns text, so only this one matters.
     ("string.Formatter", 'def matmul(A, B):\n    import string\n    q = string.Formatter()\n    return q.get_field("0.get_field.__globals__[__builtins__][__import__]", (q,), {})[0]\n', ImportError),
@@ -193,6 +196,19 @@ def test_keyword_only_defaults_survive_lockdown():
     fn = create_locked_down_function("def strategy(board, *, depth = 3):\n    return depth\n")
     assert fn.__kwdefaults__ == {"depth": 3}
     assert fn([[0]]) == 3
+
+
+def test_signed_number_defaults_survive_lockdown():
+    fn = create_locked_down_function("def strategy(board, penalty = -1, bonus = +2.5, pair = (0, -1)):\n    return penalty, bonus, pair\n")
+    assert fn([[0]]) == (-1, 2.5, (0, -1))
+    fn = create_locked_down_function("def strategy(board, *, penalty = -0.5):\n    return penalty\n")
+    assert fn([[0]]) == -0.5
+
+
+@pytest.mark.parametrize("default", ["-float(1)", '-"a"', "-None", "-x"])
+def test_non_literal_defaults_are_still_refused(default):
+    with pytest.raises(RuntimeError, match = "literal default"):
+        create_locked_down_function(f"def strategy(board, x = 1, d = {default}):\n    return d\n")
 
 
 def test_full_policy_remains_available():

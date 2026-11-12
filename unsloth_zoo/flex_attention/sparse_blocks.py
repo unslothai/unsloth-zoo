@@ -143,10 +143,11 @@ def _flex(query, key, value, block_mask, scale, score_mod = None):
     key, value = _virtual_kv_heads(query, key, value)
     # Shared dynamic=None compile: the first length keeps a static kernel (much faster than dynamic for fixed-length
     # packed or padded training); varying lengths settle on the dynamic kernel.
-    from unsloth_zoo.flex_attention.utils import flex_attention
+    from unsloth_zoo.flex_attention.utils import flex_attention, decode_kernel_kwargs
+    # Queries under 128 rows can go to flex_decoding, which cannot compile on some torch / Triton pairs.
     return flex_attention(
         query, key, value, score_mod = score_mod, block_mask = block_mask, scale = scale,
-        enable_gqa = query.shape[1] != key.shape[1],
+        enable_gqa = query.shape[1] != key.shape[1], **decode_kernel_kwargs(),
     )
 
 

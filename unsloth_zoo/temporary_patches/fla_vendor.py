@@ -33,7 +33,9 @@ __all__ = [
 ]
 
 import os
+import re
 import sys
+import warnings
 import functools
 import inspect
 import threading
@@ -403,6 +405,18 @@ def _blackwell_import_device(torch_mod):
     return None
 
 
+# Not TRITON_DEFAULT_FP_FUSION: that would also pin fusion for the user's own kernels on Triton 3.10.
+_TRITON_FP_FUSION_DEFAULT_MESSAGE = re.escape(
+    "TRITON_DEFAULT_FP_FUSION is unset: defaulting to FP fusion ENABLED"
+)
+
+
+def _ignore_triton_fp_fusion_default_warning():
+    warnings.filterwarnings(
+        "ignore", message = _TRITON_FP_FUSION_DEFAULT_MESSAGE, category = UserWarning,
+    )
+
+
 def _inject_vendored_fla():
     """Register vendored tree as fla; returns (injected, replaced_real), latter if real fla was purged."""
     vendored_dir = _vendored_fla_dir()
@@ -481,6 +495,7 @@ def _inject_vendored_fla():
         if UNSLOTH_ENABLE_LOGGING:
             logger.warning(f"Unsloth: failed injecting vendored fla ({e}); keeping pure-torch path.")
         return False, False
+    _ignore_triton_fp_fusion_default_warning()
     return True, replaced_real
 
 
