@@ -196,7 +196,6 @@ def test_keyword_only_defaults_survive_lockdown():
 
 
 def test_signed_number_defaults_survive_lockdown():
-    # -1 is a UnaryOp over a Constant in the AST, so a literal-only check refuses it while accepting 1.
     fn = create_locked_down_function("def strategy(board, penalty = -1, bonus = +2.5, pair = (0, -1)):\n    return penalty, bonus, pair\n")
     assert fn([[0]]) == (-1, 2.5, (0, -1))
     fn = create_locked_down_function("def strategy(board, *, penalty = -0.5):\n    return penalty\n")
