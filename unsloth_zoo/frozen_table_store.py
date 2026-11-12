@@ -616,8 +616,11 @@ class FrozenTableStore:
                 self._read_mmap(plane, uniq_cpu, buf)
             out[name] = buf.to(device, non_blocking=True) if pin else (buf if device.type == "cpu" else buf.to(device))
         if pin:
-            ev = torch.cuda.Event()
-            ev.record()
+            # On the destination card's stream, where the non_blocking copies out of the staging buffer were queued:
+            # the current device can be another card (ids on cuda:1 of a device-mapped model).
+            with torch.cuda.device(device):
+                ev = torch.cuda.Event()
+                ev.record(torch.cuda.current_stream(device))
             self._staging_event = ev
         return out
 
