@@ -40,6 +40,9 @@ _NOT_LAUNCHES = {
 _DELIBERATE_FALSE = {
     "merged_rollout_exact.py:_exact_merge_kernel",
     "temporary_patches/gpt_oss_grouped_qlora.py:_nf4_dequant_stack_kernel",
+    "temporary_patches/gpt_oss_fused_glue.py:_gate_up_fwd_kernel",
+    "temporary_patches/gpt_oss_fused_glue.py:_gate_up_bwd_kernel",
+    "temporary_patches/gpt_oss_fused_glue.py:_down_fwd_kernel",
     "temporary_patches/moe_routed.py:_nf4_select_dequant_kernel",
     "temporary_patches/moe_nf4_grouped.py:_nf4_grouped_kernel",
     "temporary_patches/moe_nf4_grouped.py:_nf4_grouped_kernel.fn",

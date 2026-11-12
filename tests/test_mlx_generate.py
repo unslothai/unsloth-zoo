@@ -25,6 +25,25 @@ from unsloth_zoo.mlx.generate import (  # noqa: E402
     _validate_text_requests, generate_batch, generation_mode, stream_batch,
 )
 
+
+@pytest.fixture(autouse = True)
+def _no_simulated_mlx_vlm_model_module_outlives_its_test():
+    """A placeholder mlx_vlm.models.* module left in sys.modules makes every later test here see a fake model
+    package: probes such as getattr(language, "Qwen4ExpQSAIndexer", None) then return shim placeholders that are
+    not classes. Skip the test under the shim, or import through monkeypatch.setitem."""
+    before = set(sys.modules)
+    yield
+    leaked = sorted(
+        name
+        for name in set(sys.modules) - before
+        if name.startswith("mlx_vlm.models.") and "mlx_simulation" in type(sys.modules[name]).__module__ + str(
+            getattr(sys.modules[name], "__file__", "") or getattr(sys.modules[name], "__spec__", "")
+        )
+    )
+    for name in leaked:
+        sys.modules.pop(name, None)
+    assert not leaked, f"left simulated mlx-vlm modules in sys.modules: {leaked}"
+
 class _CharDetokenizer:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
@@ -1587,6 +1606,10 @@ def test_the_causal_launch_probe_fills_staged_rows_before_it_evaluates(monkeypat
 
 
 def test_the_fused_gated_delta_step_refuses_a_cache_overriding_its_updates(monkeypatch):
+    from mlx_simulation import mlx_is_simulated
+
+    if mlx_is_simulated():
+        pytest.skip("needs real mlx-vlm: the shim's ArraysCache is a placeholder, not a cache")
     inference = pytest.importorskip("unsloth_zoo.mlx.inference")
     mx = pytest.importorskip("mlx.core")
     ArraysCache = pytest.importorskip("mlx_vlm.models.cache").ArraysCache
@@ -1602,6 +1625,12 @@ def test_the_fused_gated_delta_step_refuses_a_cache_overriding_its_updates(monke
 
 
 def test_a_qwen4_moe_block_without_norm_topk_prob_reaches_the_plan(monkeypatch):
+    from mlx_simulation import mlx_is_simulated
+
+    # Under the shim the import below would succeed with a placeholder module that stays in sys.modules, and every
+    # later test here would then find a fake Qwen4-Exp language module (see the fixture at the top of this file).
+    if mlx_is_simulated():
+        pytest.skip("needs real mlx-vlm's qwen4_exp.language")
     inference = pytest.importorskip("unsloth_zoo.mlx.inference")
     pytest.importorskip("mlx_vlm.models.qwen4_exp.language")
     reached = []
