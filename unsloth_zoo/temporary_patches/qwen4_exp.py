@@ -15,9 +15,10 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Qwen4Exp (Qwen3.8-Flash-Next) patches: MoE uses the Qwen3.5-MoE grouped-GEMM backend; QSA indexer skips its per-query
-nonzero/topk loop when kv_length < budget + compress_ratio; UNSLOTH_QWEN4_EXP_FAST_QSA=0 disables."""
+nonzero/topk loop when kv_length < budget + compress_ratio; UNSLOTH_QWEN4_EXP_FAST_QSA=0 disables. The ~102 GB PLE
+n-gram table is streamed from the checkpoint by ``unsloth_zoo.frozen_table_store`` unless UNSLOTH_FROZEN_TABLE=gpu."""
 
-__all__ = ["patch_qwen4_exp"]
+__all__ = ["patch_qwen4_exp", "patch_qwen4_exp_frozen_table"]
 
 import os
 
@@ -90,12 +91,94 @@ def _make_fast_indexer_forward(original_forward):
     return qwen4_exp_qsa_indexer_forward
 
 
+_NGRAM_UNEXPECTED = r"ple_embedding\.ngram_embedding\.(shard_\d+\.)?weight"
+
+
+def _ngram_table_wanted(num_embeddings, embedding_dim, dtype):
+    from unsloth_zoo.frozen_table_store import resolve_frozen_table_mode
+    nbytes = int(num_embeddings) * int(embedding_dim) * torch.empty((), dtype=dtype).element_size()
+    mode = os.environ.get("UNSLOTH_FROZEN_TABLE", "auto").strip().lower()
+    if os.environ.get("UNSLOTH_ENABLE_FULL_FINETUNING", "0") == "1":
+        # Full finetuning trains every weight: auto keeps the table a real parameter. An explicit disk / ram
+        # request still wins, but the table then stays frozen, so say so.
+        if mode not in ("disk", "ram"):
+            return False
+        logger.warning(f"Unsloth: UNSLOTH_FROZEN_TABLE={mode} keeps the Qwen4Exp n-gram table frozen during full "
+                       "finetuning; set UNSLOTH_FROZEN_TABLE=gpu to train it.")
+    return resolve_frozen_table_mode(nbytes) != "gpu"
+
+
+def patch_qwen4_exp_frozen_table(modeling=None):
+    """Build the PLE n-gram table as a parameter-free UnslothFrozenTableEmbedding, so the load never reads
+    (or concatenates on CPU) the 128 ``ngram_embedding.shard_*`` tensors; they are bound from the checkpoint
+    files right after the load. UNSLOTH_FROZEN_TABLE=gpu (or auto on a small table) keeps the upstream path."""
+    if modeling is None:
+        import transformers.models.qwen4_exp.modeling_qwen4_exp as modeling
+    from unsloth_zoo.frozen_table_store import UnslothFrozenTableEmbedding, install_frozen_table_load_hook
+
+    ngram_cls = getattr(modeling, "Qwen4ExpTextNGramEmbedding", None)
+    if ngram_cls is None:
+        return False
+    # The load hook first: a constructor patch without it would leave tables nothing binds.
+    if not install_frozen_table_load_hook():
+        raise RuntimeError("Unsloth: could not install the frozen table load hook for Qwen4Exp.")
+    if not getattr(ngram_cls.__init__, "_unsloth_frozen_table", False):
+        original_init = ngram_cls.__init__
+
+        def __init__(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            emb = getattr(self, "ngram_embedding", None)
+            # Only a checkpoint load (meta init); from_config keeps a real, trainable-shaped table.
+            if type(emb) is torch.nn.Embedding and emb.weight.is_meta and _ngram_table_wanted(
+                emb.num_embeddings, emb.embedding_dim, emb.weight.dtype
+            ):
+                self.ngram_embedding = UnslothFrozenTableEmbedding(
+                    emb.num_embeddings, emb.embedding_dim, dtype=emb.weight.dtype,
+                    table_name=f"qwen4_exp ple layer {getattr(self, 'layer_idx', '?')}",
+                )
+
+        __init__._unsloth_frozen_table = True
+        __init__.__wrapped__ = original_init
+        ngram_cls.__init__ = __init__
+
+    # The shard keys now match no parameter: transformers files them as unexpected without reading them.
+    from transformers.modeling_utils import PreTrainedModel
+    for obj in vars(modeling).values():
+        if isinstance(obj, type) and issubclass(obj, PreTrainedModel) and (
+            "_keys_to_ignore_on_load_unexpected" in obj.__dict__ or obj.__name__ == "Qwen4ExpPreTrainedModel"
+        ):
+            current = list(obj.__dict__.get("_keys_to_ignore_on_load_unexpected") or [])
+            if _NGRAM_UNEXPECTED not in current:
+                obj._keys_to_ignore_on_load_unexpected = current + [_NGRAM_UNEXPECTED]
+    return True
+
+
 def patch_qwen4_exp():
     try:
         import transformers.models.qwen4_exp.modeling_qwen4_exp as modeling
     except Exception:
         return
 
+    table_mode = os.environ.get("UNSLOTH_FROZEN_TABLE", "auto").strip().lower()
+    table_error = None
+    if table_mode != "gpu":
+        try:
+            patch_qwen4_exp_frozen_table(modeling)
+        except Exception as e:
+            table_error = e
+            logger.warning(f"Unsloth: Qwen4Exp frozen n-gram table patch failed ({e}); the table will load into RAM.")
+    try:
+        _patch_qwen4_exp_rest(modeling)
+    finally:
+        # Without the patch the 102 GB table is concatenated in host RAM: an explicit disk / ram request must not
+        # silently become that. Raised after the other Qwen4Exp patches are in.
+        if table_error is not None and table_mode in ("disk", "ram"):
+            raise RuntimeError(
+                f"Unsloth: UNSLOTH_FROZEN_TABLE={table_mode} but the Qwen4Exp n-gram table patch failed: {table_error}"
+            ) from table_error
+
+
+def _patch_qwen4_exp_rest(modeling):
     indexer_cls = getattr(modeling, "Qwen4ExpTextQSAIndexer", None)
     if (
         indexer_cls is not None
