@@ -311,6 +311,28 @@ def test_higher_precision_sqrt_mean_two_line_sqrt_runs_in_float32(sqrt_line):
     assert result.tolist() == [[100.0] * 8]
 
 
+def test_higher_precision_sqrt_mean_gemma3n_altup_renorm_float16():
+    """Gemma3n altup shape: X * target_magnitude (1000 * 6000) overflows float16, so the rescale must run in float32."""
+    torch = pytest.importorskip("torch")
+    src = (
+        "def renorm(current_hidden_state, target_magnitude, epsilon_tensor):\n"
+        "    new_magnitude = torch.mean(current_hidden_state**2, dim=-1, keepdim=True)\n"
+        "    new_magnitude = torch.sqrt(torch.maximum(new_magnitude, epsilon_tensor.to(target_magnitude.device)))\n"
+        "    current_hidden_state = current_hidden_state * target_magnitude / new_magnitude\n"
+        "    return current_hidden_state\n"
+    )
+    out = compiler.higher_precision_sqrt_mean(src)
+    namespace = {"torch": torch}
+    exec(out, namespace)
+    hidden = torch.full((1, 8), 1000.0, dtype = torch.float16)
+    target = torch.full((1, 1), 6000.0, dtype = torch.float16)
+    result = namespace["renorm"](hidden, target, torch.tensor(1e-5))
+    assert result.dtype == torch.float16
+    assert result.tolist() == [[6000.0] * 8]
+    compiled = torch.compile(namespace["renorm"], fullgraph = True, backend = "eager")
+    assert compiled(hidden, target, torch.tensor(1e-5)).tolist() == [[6000.0] * 8]
+
+
 def test_fix_rotary_embedding_dtype_passthrough(gemma3_full_source):
     """Without UNSLOTH_FORCE_CUSTOM_DTYPE the rewriter is a no-op, so the source must come back unchanged."""
     out = compiler.fix_rotary_embedding_dtype(gemma3_full_source)

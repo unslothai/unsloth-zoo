@@ -1319,22 +1319,29 @@ def higher_precision_sqrt_mean(source):
         r"(torch.sqrt)"
         r"\("
         r"(.*?)\1"
-        r"(.*?)\)\n",
+        r"(.*?)\)\n"
+        r"(?:([ ]{1,})\3[ ]{0,}\=[ ]{0,}\3[ ]{0,}\*[ ]{0,}([a-zA-Z0-9\_]{1,})[ ]{0,}/[ ]{0,}\1\n)?",
         source,
     )
     for item in sqrt_mean_objects:
         full_match, matches = item.group(0), item.groups()
-        new_variable, mean, variable, _, power, rest, spaces, sqrt, inner, ending = (
-            matches
-        )
+        (new_variable, mean, variable, _, power, rest, spaces, sqrt, inner, ending,
+         indent, target) = matches
         if "\n" in ending:
             continue
         new = (
             f"{new_variable} = {mean}(({variable}).to(torch.float32)**{power}{rest})"
             f"{spaces}"
-            f"{new_variable} = {sqrt}({inner}({new_variable}).to(torch.float32)"
-            f"{ending}).to(({variable}).dtype)\n"
+            f"{new_variable} = {sqrt}({inner}({new_variable}).to(torch.float32){ending})"
         )
+        # Gemma3n altup renorm: X * target overflows float16 before the divide, so rescale in float32 and cast once.
+        if target is not None:
+            new += (
+                f"\n{indent}{variable} = (({variable}).to(torch.float32) * {target} / {new_variable})"
+                f".to(({variable}).dtype)\n"
+            )
+        else:
+            new += f".to(({variable}).dtype)\n"
         source = source.replace(full_match, new)
     return source
 
