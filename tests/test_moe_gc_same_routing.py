@@ -273,3 +273,37 @@ def test_first_pass_never_reads():
                 a, b = moe_checkpoint_routing(layer, idx, w)
             assert a is idx and b is w
     assert MOE_GC_ROUTING_STATS["reused"] == 0 and len(frame.entries) == 2
+
+
+@pytest.mark.parametrize("checkpointer", [Unsloth_Gradient_Checkpointer, Unsloth_Offloaded_Gradient_Checkpointer])
+def test_second_backward_with_retained_graph_replays_the_same_routing(checkpointer):
+    torch.manual_seed(0)
+    x = torch.randn(T, H)
+    layer = ToyMoE(0)
+    xin = x.detach().clone().requires_grad_(True)
+    loss = (checkpointer.apply(layer, xin).float() ** 2).sum()
+    loss.backward(retain_graph = True)
+    first = layer.experts.grad.clone()
+    layer.zero_grad(set_to_none = True)
+    loss.backward()
+    second = layer.experts.grad.clone()
+    _, ref_experts, _ = _reference(0, x)
+    torch.testing.assert_close(first, ref_experts)
+    torch.testing.assert_close(second, ref_experts)
+    assert MOE_GC_ROUTING_STATS["reused"] == 2
+
+
+def test_active_gpt_oss_bnb4bit_forward_applies_the_replay_routing():
+    # GptOssExpertsBnb4bit.forward is rebound to the module-level torch_native_forward: the hook must live there.
+    import ast
+    import inspect
+    import textwrap
+
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(gpt_oss.torch_native_forward)))
+    calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_checkpoint_routing"
+    ]
+    assert len(calls) == 1

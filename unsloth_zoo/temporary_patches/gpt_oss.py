@@ -3229,6 +3229,8 @@ def torch_native_forward(
     routing_weights = None
 ) -> torch.Tensor:
 
+    # The active GptOssExpertsBnb4bit forward (rebound below): the checkpoint replay must use the first pass's routing.
+    router_indices, routing_weights = _checkpoint_routing(self, router_indices, routing_weights)
     batch_size = hidden_states.shape[0]
     hidden_states = hidden_states.reshape(-1, self.hidden_size)
     num_tokens = hidden_states.shape[0]

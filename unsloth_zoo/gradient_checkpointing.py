@@ -772,10 +772,13 @@ MOE_GC_ROUTING_STATS = collections.Counter()   # stored / reused / mismatch / un
 
 
 class CheckpointRoutingFrame:
-    __slots__ = ("entries", "replaying", "__weakref__")
+    """First-pass routing in call order. Kept for the checkpoint context's lifetime and read through a cursor reset
+    at each replay, so a second backward (retain_graph) replays the same routing."""
+    __slots__ = ("entries", "cursor", "replaying", "__weakref__")
 
     def __init__(self):
-        self.entries = collections.deque()
+        self.entries = []
+        self.cursor = 0
         self.replaying = False
 
 
@@ -794,15 +797,14 @@ def _checkpoint_routing_scope(frame, replay):
     previous = getattr(_GC_ROUTING_TLS, "frame", None)
     if frame is not None:
         frame.replaying = replay
+        frame.cursor = 0
     _GC_ROUTING_TLS.frame = frame
     try:
         yield
     finally:
         _GC_ROUTING_TLS.frame = previous
-        if frame is not None and replay:
-            if frame.entries:
-                MOE_GC_ROUTING_STATS["unmatched"] += len(frame.entries)
-            frame.entries.clear()
+        if frame is not None and replay and frame.cursor < len(frame.entries):
+            MOE_GC_ROUTING_STATS["unmatched"] += len(frame.entries) - frame.cursor
 
 
 @contextmanager
@@ -828,9 +830,10 @@ def _checkpoint_route_eager(top_k_index, top_k_weights, grad_mode):
             frame.entries.append((top_k_index.detach().clone(), top_k_weights.detach().clone()))
             MOE_GC_ROUTING_STATS["stored"] += 1
         return None
-    if not grad_mode or not frame.entries:
+    if not grad_mode or frame.cursor >= len(frame.entries):
         return None
-    index, weights = frame.entries.popleft()
+    index, weights = frame.entries[frame.cursor]
+    frame.cursor += 1
     if (
         index.shape != top_k_index.shape or index.dtype != top_k_index.dtype or index.device != top_k_index.device
         or weights.shape != top_k_weights.shape or weights.dtype != top_k_weights.dtype
@@ -838,7 +841,7 @@ def _checkpoint_route_eager(top_k_index, top_k_weights, grad_mode):
     ):
         # Not the same call (a layer that routes differently in its replay): keep the replay's routing.
         MOE_GC_ROUTING_STATS["mismatch"] += 1
-        frame.entries.clear()
+        frame.cursor = len(frame.entries)
         return None
     MOE_GC_ROUTING_STATS["reused"] += 1
     return index, weights
