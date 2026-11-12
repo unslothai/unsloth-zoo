@@ -381,3 +381,36 @@ def test_active_gpt_oss_bnb4bit_forward_applies_the_replay_routing():
         if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "_checkpoint_routing"
     ]
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("backend", ["grouped_mm", "native_torch"])
+def test_gpt_oss_v5_lora_forward_applies_the_replay_routing_once(monkeypatch, backend):
+    """Non-4-bit GPT-OSS LoRA on transformers v5 assigns a native backend straight onto GptOssExperts.forward; that
+    forward must route through the checkpoint hook exactly once per experts call."""
+    import sys
+    import types
+
+    from unsloth_zoo.temporary_patches import gpt_oss
+
+    class GptOssExperts(torch.nn.Module):
+        def forward(self, hidden_states, router_indices = None, routing_weights = None):
+            raise AssertionError("not patched")
+
+    fake = types.ModuleType("transformers.models.gpt_oss.modeling_gpt_oss")
+    fake.GptOssExperts = GptOssExperts
+    monkeypatch.setitem(sys.modules, "transformers.models.gpt_oss.modeling_gpt_oss", fake)
+    monkeypatch.setattr(sys.modules["transformers.models.gpt_oss"], "modeling_gpt_oss", fake, raising = False)
+    monkeypatch.setattr(gpt_oss, "_normalized_unsloth_model_name", lambda: "gpt_oss")
+    monkeypatch.setattr(gpt_oss, "_is_gpt_oss_4bit_load", lambda: False)
+    monkeypatch.setattr(gpt_oss, "_should_use_gpt_oss_bnb4bit", lambda: False)
+    monkeypatch.setattr(gpt_oss, "_is_transformers_v5", lambda: True)
+    monkeypatch.setattr(gpt_oss, "patch_param_wrapper_for_moe", lambda: None)
+    monkeypatch.setattr(gpt_oss, "select_moe_backend_for_interleaved_gate_up", lambda: backend)
+    seen = []
+    monkeypatch.setattr(gpt_oss, "forward_native_grouped_mm", lambda self, h, i, w: ("grouped_mm", i, w))
+    monkeypatch.setattr(gpt_oss, "forward_native_moe_loop", lambda self, h, i, w: ("native_torch", i, w))
+    monkeypatch.setattr(gpt_oss, "_checkpoint_routing", lambda m, i, w: (seen.append(1), (i + 1, w * 2))[1])
+    gpt_oss.patch_gpt_oss_moe_for_lora()
+    which, i, w = GptOssExperts().forward(torch.zeros(2, 4), torch.tensor([[0, 1]]), torch.tensor([[0.5, 0.5]]))
+    assert which == backend and len(seen) == 1
+    assert torch.equal(i, torch.tensor([[1, 2]])) and torch.equal(w, torch.tensor([[1.0, 1.0]]))

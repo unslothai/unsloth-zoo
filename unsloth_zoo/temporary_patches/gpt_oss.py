@@ -2709,6 +2709,16 @@ def patch_gpt_oss_moe_for_lora():
         # activation, biases, and the separated LoRA stash.
         forward = forward_native_moe_loop
 
+    backend_forward = forward
+
+    def forward(self, hidden_states, router_indices = None, routing_weights = None):
+        # These backends are also reached from forward_moe_backend, which applies the routing hook itself, so the
+        # hook goes here (once per experts call) and not inside them: a checkpoint replay must use the first
+        # pass's routing.
+        router_indices, routing_weights = _checkpoint_routing(self, router_indices, routing_weights)
+        return backend_forward(self, hidden_states, router_indices, routing_weights)
+
+    forward.__wrapped__ = backend_forward
     # Store original forward and patch - but DON'T replace the class!
     GptOssExpertsClass._original_forward = GptOssExpertsClass.forward
     GptOssExpertsClass.forward = forward
