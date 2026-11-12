@@ -609,23 +609,14 @@ def requires_grad_for_gradient_checkpointing(model):
     # Enables requires_grad to make gradient checkpointing work on
     # non language models that don't just use .embed_tokens
     def register_other_hooks(name1, name2, module, _hooks):
-        # Re-register kept hooks with their with_kwargs / always_call flags (#1881).
-        with_kwargs = set(getattr(module, f"{_hooks}_with_kwargs", None) or ())
-        always_call = set(getattr(module, f"{_hooks}_always_called", None) or ())
-        other_hooks = []
-        for key, value in getattr(module, _hooks).items():
+        # Delete in place: kept hooks keep their ids, flags and RemovableHandles.
+        hooks = getattr(module, _hooks)
+        for key, value in list(hooks.items()):
             qualname = getattr(value, "__qualname__", "")
-            if name1 in qualname or name2 in qualname or name2 in getattr(value, "__name__", ""): continue
-            other_hooks.append((value, key in with_kwargs, key in always_call))
-        setattr(module, _hooks, OrderedDict())
-        for flags in (f"{_hooks}_with_kwargs", f"{_hooks}_always_called"):
-            if hasattr(module, flags): getattr(module, flags).clear()
-        register = getattr(module, f"register{_hooks[:-1]}")
-        for hook, kwargs_hook, always_hook in other_hooks:
-            options = {}
-            if kwargs_hook: options["with_kwargs"] = True
-            if always_hook: options["always_call"] = True
-            register(hook, **options)
+            if name1 in qualname or name2 in qualname or name2 in getattr(value, "__name__", ""):
+                del hooks[key]
+                for flags in (f"{_hooks}_with_kwargs", f"{_hooks}_always_called"):
+                    getattr(module, flags, {}).pop(key, None)
     pass
 
     # Remove all previous forward hooks for gradient checkpointing

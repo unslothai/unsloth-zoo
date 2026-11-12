@@ -1519,6 +1519,117 @@ def test_an_open_batch_builds_its_cache_with_the_quantization_it_was_given():
         assert session.generator.args[1].tokenizer.stopping_criteria.eos_token_ids == []
 
 
+@pytest.mark.parametrize("limit", [2048, 4096, 8192])
+def test_auto_offload_caps_large_prefill_once_without_changing_defaults(limit):
+    from unsloth_zoo.mlx.generate import _prefill_step_option; model = types.SimpleNamespace(_unsloth_auto_prefill_step=limit); defaults = GenerationDefaults(prefill_step_size=8193)
+    with pytest.warns(UserWarning, match=f"8193 to {limit}"): assert _prefill_step_option(defaults, model=model) == {"prefill_step_size": limit}
+    with warnings.catch_warnings(record=True) as seen:
+        assert _prefill_step_option(defaults, model=model) == {"prefill_step_size": limit} and _prefill_step_option(GenerationDefaults(), model=model) == {} and all(_prefill_step_option(GenerationDefaults(prefill_step_size=n), model=types.SimpleNamespace(_unsloth_auto_prefill_step=limit)) == {"prefill_step_size": n} for n in (limit-1, limit)) and not seen and defaults.prefill_step_size == 8193 and _prefill_step_option(defaults, model=object()) == {"prefill_step_size": 8193}
+
+
+@pytest.mark.parametrize("consumer", ["test_adapter_removes_stop_matches_and_closes_on_failure", "test_audio_fallback_forwards_the_request_to_the_stream", "test_vlm_run_chunk_builds_the_generator_after_embeddings", "test_an_open_batch_builds_its_cache_with_the_quantization_it_was_given", None])
+def test_prefill_consumers_forward_the_loaded_model(monkeypatch, consumer):
+    from unsloth_zoo.mlx import generate
+    class Reached(Exception): pass
+    def check(*a, model=None, **k): assert model is not None; raise Reached
+    monkeypatch.setattr(generate, "_prefill_step_option", check)
+    if consumer is None:
+        adapter = _vlm_adapter(); adapter._prompt_inputs = lambda rows: {"input_ids": __import__("numpy").array([[1, 2]])}
+        session = object.__new__(generate._SpeculativeBatchSession); session.__dict__.update(adapter=adapter, speculative=types.SimpleNamespace(admit=lambda *a, **k: None), tokenizer=adapter.processor.tokenizer, stop_tokens=frozenset(), _next_row=0, _resume=lambda *a: 0, _embedded=lambda n: contextlib.nullcontext())
+    with pytest.raises(Reached): globals()[consumer]() if consumer else session.add(GenerationRequest(prompt="p"))
+
+
+@pytest.mark.parametrize("vlm", [False, True])
+def test_public_generate_caps_prefill_to_the_auto_offload_plan(monkeypatch, vlm):
+    import unsloth_zoo.mlx.loader as loader
+    seen = []
+
+    def stream_generate(*args, prefill_step_size = None, **kwargs):
+        seen.append(prefill_step_size)
+        yield types.SimpleNamespace(token = 2, finish_reason = "stop")
+
+    monkeypatch.setattr(importlib.import_module("mlx_vlm" if vlm else "mlx_lm"), "stream_generate", stream_generate)
+    tokenizer = types.SimpleNamespace(bos_token = None, eos_token_ids = {2})
+    model = types.SimpleNamespace(_tokenizer = tokenizer, _is_vlm_model = vlm, _unsloth_auto_prefill_step = 2048,
+                                  _processor = types.SimpleNamespace(tokenizer = tokenizer), config = None)
+    call = loader._mlx_generate_vlm if vlm else loader._mlx_generate
+    with pytest.warns(UserWarning, match = "8192 to 2048"):
+        call(model, input_ids = [[1, 3]], max_new_tokens = 1, prefill_step_size = 8192)
+    call(model, input_ids = [[1, 3]], max_new_tokens = 1, prefill_step_size = 512)
+    assert seen == [2048, 512]
+
+
+def test_a_failed_range_read_returns_only_after_every_worker_left_its_views(monkeypatch):
+    offload = pytest.importorskip("unsloth_zoo.mlx.offload")
+    done, release = [], threading.Event()
+
+    def read_all(fd, view, offset):
+        if offset == 0:
+            raise OSError("EIO")
+        release.wait(5)
+        done.append(offset)
+
+    monkeypatch.setattr(offload, "_read_all", read_all)
+    jobs = [(0, offset, None) for offset in range(offload._SERIAL_READS + 8)]
+    threading.Timer(0.2, release.set).start()
+    with pytest.raises(OSError, match = "EIO"):
+        offload.read_ranges(jobs)
+    assert sorted(done) == list(range(1, len(jobs)))
+
+
+def test_the_causal_launch_probe_fills_staged_rows_before_it_evaluates(monkeypatch):
+    inference = pytest.importorskip("unsloth_zoo.mlx.inference")
+    mx = pytest.importorskip("mlx.core")
+    order = []
+    monkeypatch.setattr(inference, "_staged_ready", lambda: order.append("fill"))
+    monkeypatch.setattr(inference, "_exact_attention_rows", lambda *a: (order.append("build"), mx.zeros((1,)))[1])
+    assert inference._launched_rows(None, None, None, 1.0, None) is not None and order == ["fill", "build"]
+
+
+def test_the_fused_gated_delta_step_refuses_a_cache_overriding_its_updates(monkeypatch):
+    inference = pytest.importorskip("unsloth_zoo.mlx.inference")
+    mx = pytest.importorskip("mlx.core")
+    ArraysCache = pytest.importorskip("mlx_vlm.models.cache").ArraysCache
+    monkeypatch.setattr(inference, "_gdn_block_fits", lambda *a: True)
+    layer, inputs = types.SimpleNamespace(conv_kernel_size = 4, conv_dim = 8), mx.zeros((1, 1, 8))
+    cache = ArraysCache(2)
+    cache[0], cache[1] = mx.zeros((1, 3, 8)), mx.zeros((1, 2))
+    assert inference._decode_gdn_fits(layer, inputs, None, cache)
+    for name in ("update_window", "update_recurrent"):
+        setattr(cache, name, getattr(cache, name))
+        assert not inference._decode_gdn_fits(layer, inputs, None, cache)
+        delattr(cache, name)
+
+
+def test_a_qwen4_moe_block_without_norm_topk_prob_reaches_the_plan(monkeypatch):
+    inference = pytest.importorskip("unsloth_zoo.mlx.inference")
+    pytest.importorskip("mlx_vlm.models.qwen4_exp.language")
+    reached = []
+    monkeypatch.setattr(inference, "_plain_moe_kernels", lambda: object())
+    monkeypatch.setattr(inference, "_moe_router_class", lambda native: reached.append(native))
+    Block = type("Qwen4ExpSparseMoeBlock", (), {"__module__": "mlx_vlm.models.qwen4_exp.language"})
+    block = Block()  # mlx-vlm < 0.7.8 sets no norm_topk_prob and always normalizes
+    block.top_k, block.num_experts, block.shared_expert = 10, 512, object()
+    assert inference._plain_moe_plan(block, None) is None and reached == [Block]
+    block.norm_topk_prob = False
+    assert inference._plain_moe_plan(block, None) is None and reached == [Block]
+
+
+def test_an_unplanned_verify_block_leaves_the_routed_path_to_its_caller():
+    inference = pytest.importorskip("unsloth_zoo.mlx.inference")
+    mx = pytest.importorskip("mlx.core")
+    experts, called = object.__new__(inference._RoutedExperts), []
+    experts.verify_plans = {3: None}
+    block = types.SimpleNamespace(training = False)
+    assert experts.verify(block, mx.zeros((1, 3, 8)), lambda: called.append(1)) is None and called == []
+
+
+def test_verifier_code_names_hold_without_co_qualname():
+    inference = pytest.importorskip("unsloth_zoo.mlx.inference")
+    assert inference._code_name(types.SimpleNamespace(co_name = "f")) == "f"
+    assert inference._code_name(test_verifier_code_names_hold_without_co_qualname.__code__).endswith("co_qualname")
+
+
 def test_a_model_keeping_state_is_seen_to_keep_it_however_it_says_so():
     """A model may do the assignment in a helper, or spell it as something other than a name."""
     from unsloth_zoo.mlx.generate import _keeps_what_it_prepared
@@ -2377,6 +2488,11 @@ def test_target_head_runs_more_rows_than_one_lane_launch_in_fp32_launches(monkey
     del head.__dict__["_unsloth_lane_qmm_ready"][(1, 8, 64)]
     launches.clear()
     assert fp32(x).dtype == mx.bfloat16 and launches == [32]
+    head.__dict__["_unsloth_lane_qmm_ready"][(1, 4, 64)], head._unsloth_lane_verify_scopes = (None, signature), 1
+    for low in (3, 4):
+        monkeypatch.setattr(inference, "_LANE_LOW_ROWS", low)
+        launches.clear()
+        assert (fp32(x[:1, :4]).dtype, launches) == ((mx.float32, [4]) if low < 4 else (mx.bfloat16, []))
 
 
 def test_stop_string_trims_device_logprobs_with_the_tokens():

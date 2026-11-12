@@ -1699,10 +1699,11 @@ class SpeculativeEngine:
             out = self.lm(inputs, cache = self.cache, speculative_verify = True, **{"capture_layer_ids": [], **self._kwargs()})
             return out.logits, self._hidden(out), out.gdn_states
         if self._invariant:
+            from .inference import _verify_with_lazy_replay
             if self._mrope:
                 # As a decode step's call would, so the verifier positions each row by its own delta.
                 self.lm._rope_deltas = self._position_kwargs()["rope_deltas"]
-            hidden, _, transaction, logits = self.lm.speculative_verify_logits(inputs, self.cache, lambda logits: logits)
+            hidden, _, transaction, logits = _verify_with_lazy_replay(self.lm, inputs, self.cache, lambda logits: logits)
             return logits, self._hidden(SimpleNamespace(hidden_states = [hidden])), _rows_trimmed(transaction)
         from .inference import verify_block_attention
         with verify_block_attention():
@@ -1881,11 +1882,19 @@ class SpeculativeEngine:
                 self.drafter.settle(self.draft_cache, draft_rows, depth - 1, [0] * len(rows))
             self.round_refusal = f"{type(self.lm).__name__} replaced its cache objects during a verify forward"
             return None
+        early = None
         try:
             with mx.stream(self._stream):
                 drawn = []
                 for i, (row, length) in enumerate(zip(rows, lengths)):
                     drawn.append(row.draw(row.logprobs(logits[i, : length + 1], inputs[i, 1:]), row.emitted))
+            prepare = getattr(self.drafter, "prepare_replay", None)
+            if prepare is not None and depth and len(rows) == 1 and draft_rows[0] is not None and hidden is not None:
+                with mx.stream(self._stream):
+                    count = mx.cumprod((inputs[0, 1 : lengths[0] + 1] == drawn[0][0][:lengths[0]]).astype(mx.int32)).sum()
+                mx.async_eval([array for pair in drawn for array in pair if array is not None] + [count])
+                with mx.stream(self._stream):
+                    early = prepare(draft_rows[0], hidden[0, : lengths[0] + 1], drawn[0][0], count)
             ahead = []
             if depth and getattr(self.drafter, "predraft_rows", 0):
                 with mx.stream(self._stream):
@@ -1898,7 +1907,7 @@ class SpeculativeEngine:
                 with mx.stream(self._stream):
                     ahead = [(i, count) for i, count in ahead if self.drafter.predraft(draft_rows[i], hidden[i], count, drawn[i][0][count])]
             mx.eval([array for pair in drawn for array in pair if array is not None] + ([] if drafts is None else [drafts])
-                    + [count for _, count in ahead])
+                    + [count for _, count in ahead] + ([] if early is None else [early.count]))
             targets = [target.tolist() for target, _ in drawn]
             scores = [None if score is None else score.tolist() for _, score in drawn]
             if depth:
@@ -1929,6 +1938,8 @@ class SpeculativeEngine:
                     # A head that kept its accepted draft entries already holds those pairs; record the rest.
                     self.drafter.push(row.draft, taken[kept[i] :], hidden[i, kept[i] : len(taken)])
                 emitted.append(taken)
+            if early is not None and not rows[0].finished:
+                early(accepted[0])
             if hasattr(self.drafter, "prefetch"):
                 with mx.stream(self._stream):
                     # The next round's drafts run on the GPU while the host commits this one; a copying row is likely to copy again.
@@ -1950,6 +1961,8 @@ class SpeculativeEngine:
                     if isinstance(padding, mx.array) and not hasattr(entry, "metadata_revision"):
                         entry.left_padding = padding + 0
         except BaseException:
+            if early is not None:
+                early(None)
             transaction.abort()
             raise
         # A pending replay fold is evaluated by its next verifier.
@@ -2244,12 +2257,21 @@ class _ShortlistHead:
         from .inference import _FIRST_USE_WORK
         _FIRST_USE_WORK[0] += 1
 
-    def __call__(self, hidden: mx.array) -> mx.array:
+    def _candidates(self, hidden: mx.array) -> tuple[mx.array, mx.array]:
         coarse = mx.quantized_matmul(hidden[..., :self.columns], *self._scan, True, _SHORTLIST_GROUP, _SHORTLIST_BITS)
         best = mx.argpartition(-coarse, _SHORTLIST_KEEP, axis = -1)[..., :_SHORTLIST_KEEP]
         rows = self._rows(best.reshape(-1)).reshape(*best.shape, -1)
-        exact = (rows @ hidden[..., None].astype(rows.dtype)).squeeze(-1)
+        return best, (rows @ hidden[..., None].astype(rows.dtype)).squeeze(-1)
+
+    def __call__(self, hidden: mx.array) -> mx.array:
+        best, exact = self._candidates(hidden)
         return mx.take_along_axis(best, mx.argmax(exact, axis = -1, keepdims = True), axis = -1).squeeze(-1)
+
+    def logits(self, hidden: mx.array) -> mx.array:
+        """The table's logits at the candidates and -inf elsewhere, for a head that takes the argmax of its vocabulary head."""
+        best, exact = self._candidates(hidden)
+        dense = mx.full((*best.shape[:-1], self.table.weight.shape[0]), -mx.inf, exact.dtype)
+        return mx.put_along_axis(dense, best, exact, axis = -1)
 
 
 class MTPDrafter:
@@ -2495,17 +2517,27 @@ class HeadDrafter:
     ``accept_verified_tokens`` replays (token, target hidden) pairs and, with nothing accepted, undoes a
     draft. Heads keep that state on the module, so each reply drafts with its own shallow copy."""
 
+    # Greedy heads may take their tokens from the target table's shortlist (`_ShortlistHead`) instead of a full pass.
+    shortlist_head = False
+
     def __init__(self, model: nn.Module, target: nn.Module, max_lag: int = 128, prompt_tail: int | None = None):
         self.model = model
         self.target = target
         self.max_lag, self.prompt_tail = max_lag, prompt_tail or max_lag
+        self._shortlist = _ShortlistHead.of(getattr(target, "language_model", target)) if self.shortlist_head else None
 
     def new_cache(self) -> list:
         return []
 
+    def _reset(self, head: nn.Module) -> None:
+        head.reset(self.target)
+        if self._shortlist is not None:
+            self._shortlist.prepare()
+            head._lm_head_fn = self._shortlist.logits
+
     def start(self, prompt: Sequence[int], hidden: mx.array | None, pending: int) -> tuple[HeadRow, list]:
         head = copy.copy(self.model)
-        head.reset(self.target)
+        self._reset(head)
         row = HeadRow(head)
         if hidden is not None:
             count = min(int(hidden.shape[1]), len(prompt))
@@ -2568,6 +2600,156 @@ class HeadDrafter:
                     entry.keys, entry.values, entry.meta_state = keys, values, meta
                 row.saved = []
         return [0] * len(rows)
+
+
+_HEAD_REPLAY_CONTRACT = {"mlx_vlm.speculative.drafters.mtp_base": {
+    "AutoregressiveMTPDraftModel.accept_verified_tokens": "c030ed38f8f3254c"},
+    "mlx_vlm.models.qwen4_exp.language": {"QSAKVCache.clear_index_blocks": "9beee61ae16211c8"},
+    "mlx_vlm.speculative.drafters.qwen4_exp_mtp.qwen4_exp_mtp": {
+        "Qwen4ExpMTPDraftModel._forward_hidden": "cef4894d36046e68", "Qwen4ExpMTPDraftModel.fuse_inputs": "37eced1c4e52a595"},
+    "mlx_vlm.models.cache": {"KVCache.trim": "8c4d89141d5ceded"}}
+
+
+def _head_replay_matches(row, replay):
+    if (replay is None or replay[0] != tuple(row.tokens) or len(replay[1]) != len(row.hidden)
+            or any(a is not b for a, b in zip(replay[1], row.hidden))):
+        return False
+    if len(replay) == 3:
+        return True
+    from .inference import _bindings_intact
+
+    original, cache, generation, bindings, native = replay[3]
+    return (row.head is original and original._cache is cache and original._draft_round == generation
+            and _bindings_intact(bindings) and getattr(original.accept_verified_tokens, "__func__", None) is native)
+
+
+class _Qwen4HeadDrafter(HeadDrafter):
+    shortlist_head = True
+
+    def prepare_replay(self, row, hidden, tokens, count):
+        """Queue a private native replay; resolve with host acceptance, or None to discard it."""
+        from .inference import _ast_fingerprint, _bindings_intact, _resolved_bindings, _QSA_TRIM_HELD
+        from mlx_vlm.speculative.drafters.mtp_base import AutoregressiveMTPDraftModel
+        from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+
+        bindings = getattr(self, "_replay_bindings", None)
+        if bindings is None or not _bindings_intact(bindings):
+            bindings = _resolved_bindings(_HEAD_REPLAY_CONTRACT)
+            trim, kept = QSAKVCache.trim, []
+            native_trim = trim
+            for cls, native_trim_fn, route in _QSA_TRIM_HELD[1] if _QSA_TRIM_HELD else ():
+                if cls is QSAKVCache and trim is route:
+                    native_trim = native_trim_fn
+                    kept = inspect.getclosurevars(route).nonlocals["bindings"]
+                    break
+            try:
+                pinned = not hasattr(native_trim, "__wrapped__") and _ast_fingerprint(native_trim) == "408373696f053090"
+            except (OSError, TypeError, SyntaxError, AttributeError):
+                pinned = False
+            if bindings is not None and pinned:
+                bindings += [(vars(QSAKVCache), "trim", trim), *kept]
+            else:
+                bindings = None
+            self._replay_bindings, self._replay_verdicts = bindings, {}
+        native = AutoregressiveMTPDraftModel.accept_verified_tokens
+        original, width = row.head, tokens.size
+        if (os.environ.get("UNSLOTH_MLX_EARLY_REPLAY") == "0" or bindings is None or row.tokens or row.hidden
+                or row.drafted is None or original.training or not 1 < width <= 4 or width >= self.max_lag
+                or hidden.ndim not in (2, 3) or hidden.shape[0] != width or tokens.ndim != 1 or count.size != 1
+                or not isinstance(original._next_position, int) or not original._cache
+                or any(type(entry) is not QSAKVCache for entry in original._cache)
+                or getattr(original.accept_verified_tokens, "__func__", None) is not native):
+            return None
+        cache, generation = original._cache, original._draft_round
+        head = copy.copy(original)
+        head._cache = copy.deepcopy(cache)
+        head.accept_verified_tokens(hidden[None], row.drafted, 0, [], None, greedy = True)
+        streams = head.fc_hidden
+
+        def kept_streams(x):
+            # 4 tokens' hc_count stream rows take another matmul kernel than 2 or 3 do: the rows a partial acceptance keeps get their own call.
+            full = streams(x)
+            return mx.where(count == width - 1, full, mx.concatenate([streams(x[:, : width - 1]), full[:, width - 1 :]], axis = 1))
+
+        if width > 2:
+            head.fc_hidden = kept_streams
+        try:
+            logits, replayed = head._forward_tokens(tokens[None].astype(mx.int32), mx.concatenate([hidden])[None], mx.int32)
+        finally:
+            head.fc_hidden = streams
+        head._set_seed_from_hidden(mx.take(logits, count.reshape(1), axis = 1), None, True)
+        head._seed_hidden = mx.take(replayed, count.reshape(1), axis = 1)
+        mx.async_eval(head.draft_eval_state())
+        published = None
+
+        def resolve(accepted):
+            nonlocal published
+            if accepted is None:
+                if published is not None and getattr(row, "replay", None) is published:
+                    row.replay = None
+                return False
+            if (count.item() != accepted or len(row.tokens) != accepted + 1
+                    or row.head is not original or original._cache is not cache or original._draft_round != generation
+                    or not _bindings_intact(bindings) or getattr(original.accept_verified_tokens, "__func__", None) is not native):
+                return False
+            if excess := width - 1 - accepted:
+                # A single pair replays natively as a one-row decode step, on other kernels and indexer paths.
+                if not accepted:
+                    return False
+                for entry in head._cache:
+                    entry.trim(excess)
+                head._next_position -= excess
+                if not self._replay_exact(row, head, (width, accepted)):
+                    return False
+            published = row.replay = tuple(row.tokens), tuple(row.hidden), head, (original, cache, generation, bindings, native)
+            return True
+
+        resolve.count = count
+        return resolve
+
+    def _replay_exact(self, row, head, key):
+        verdicts = self._replay_verdicts
+        if key not in verdicts:
+            native = HeadRow(copy.copy(row.head))
+            native.head._cache = copy.deepcopy(row.head._cache)
+            native.tokens, native.hidden = list(row.tokens), list(row.hidden)
+            super().catch_up([], [native])
+            leaves = lambda h: [h._next_position, *(x for _, x in tree_flatten(h.draft_eval_state()))]
+            verdicts[key] = all(type(x) is type(y) and (x == y if not isinstance(x, mx.array) else x.dtype == y.dtype and x.shape == y.shape
+                                                        and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item())
+                                for x, y in zip(leaves(native.head), leaves(head)))
+        return verdicts[key]
+
+    def prefetch(self, rows: Sequence[HeadRow | None]) -> None:
+        for row in rows:
+            if row is None or not row.tokens:
+                continue
+            replay = getattr(row, "replay", None)
+            if replay is not None and len(replay) == 4 and _head_replay_matches(row, replay):
+                continue
+            head = copy.copy(row.head)
+            head._cache = copy.deepcopy(row.head._cache)
+            ahead = HeadRow(head)
+            tokens, hidden = tuple(row.tokens), tuple(row.hidden)
+            ahead.tokens, ahead.hidden = list(tokens), list(hidden)
+            super().catch_up([], [ahead])
+            row.replay = tokens, hidden, ahead.head
+
+    def catch_up(self, cache: list, rows: Sequence[HeadRow | None]) -> int:
+        replayed = 0
+        for row in rows:
+            if row is None:
+                continue
+            replay = getattr(row, "replay", None)
+            row.replay = None
+            # A copy/plain round may append pairs: preserve the native replay's original batch and dispatch.
+            if _head_replay_matches(row, replay):
+                row.head = replay[2]
+                replayed += len(row.tokens)
+                row.tokens, row.hidden = [], []
+            else:
+                replayed += super().catch_up(cache, [row])
+        return replayed
 
 
 class Eagle3Drafter(HeadDrafter):
@@ -2996,6 +3178,7 @@ def _head_drafter(model: nn.Module, target: nn.Module, **kwargs) -> MTPDrafter |
     if type(model) is getattr(sys.modules.get("mlx_vlm.speculative.drafters.qwen4_exp_mtp"), "Qwen4ExpMTPDraftModel", None):
         # On a long prompt, qwen4_exp's head accepts more from the same tail as Qwen3.5's head.
         kwargs.setdefault("prompt_tail", MTPDrafter.prompt_tail)
+        return _built(_Qwen4HeadDrafter, model, target, **kwargs)
     return _built(HeadDrafter, model, target, **kwargs)
 
 

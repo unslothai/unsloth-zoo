@@ -27,6 +27,9 @@ CASES = {
         "_causal_conv1d_bwd_g_kernel": ("T",),
         "_causal_conv1d_bwd_dxdw_kernel": ("T", "NT"),
     },
+    "temporary_patches/gpt_oss_fused_glue.py": {
+        "_gate_up_fwd_kernel": ("M",), "_gate_up_bwd_kernel": ("M",), "_down_fwd_kernel": ("M",),
+    },
     "temporary_patches/moe_fused_swiglu.py": {"_swiglu_fwd_kernel": ("M",), "_swiglu_bwd_kernel": ("M",)},
     "temporary_patches/moe_nf4_grouped.py": {"_nf4_grouped_kernel": ("M", "M_HINT")},
     "gpt_oss_decode_fused.py": {"_sink_scale_kernel": ("Q", "sl_b", "sl_h")},
