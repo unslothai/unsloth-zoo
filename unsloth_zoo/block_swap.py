@@ -27,6 +27,7 @@ from contextlib import contextmanager, nullcontext
 import functools
 import gc
 import importlib
+import tempfile
 import weakref
 
 __all__ = [
@@ -120,6 +121,73 @@ def _pin_budget():
         return 0
 
 
+# Host RAM sessions (a load into host RAM, a BlockSwap install): local ranks run the same sequence of them.
+_HOST_SESSION = 0
+
+
+def _rank_ledger():
+    """(directory shared by this launch's local ranks, local rank, local world size), or None outside a multi-rank
+    launch. Each rank publishes there the host bytes it still has to allocate in its current session."""
+    world = _local_world_size()
+    rank = os.environ.get("LOCAL_RANK")
+    job = os.environ.get("TORCHELASTIC_RUN_ID") or os.environ.get("MASTER_PORT")
+    if world <= 1 or rank is None or not job:
+        return None
+    try:
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+        # The launcher is every local rank's parent: a later launch on the same port gets a fresh directory.
+        path = os.path.join(tempfile.gettempdir(), f"unsloth_block_swap_{uid}_{job}_{os.getppid()}")
+        os.makedirs(path, exist_ok = True)
+        return path, int(rank), world
+    except (OSError, ValueError):
+        return None
+
+
+def _publish_host_pending(nbytes):
+    ledger = _rank_ledger()
+    if ledger is None:
+        return
+    path, rank, _ = ledger
+    try:
+        tmp = os.path.join(path, f"{rank}.{os.getpid()}.tmp")
+        with open(tmp, "w") as f:
+            f.write(f"{_HOST_SESSION} {max(0, int(nbytes))}")
+        os.replace(tmp, os.path.join(path, str(rank)))
+    except OSError:
+        pass
+
+
+def _others_host_pending(own):
+    """Host bytes the other local ranks still have to allocate, or None outside a multi-rank launch. A rank that
+    has not reached this session yet is assumed to need `own` (every rank loads the same model); one that is done
+    with it published 0, since what it allocated is already gone from available RAM."""
+    ledger = _rank_ledger()
+    if ledger is None:
+        return None
+    path, rank, world = ledger
+    total = 0
+    for r in range(world):
+        if r == rank:
+            continue
+        try:
+            with open(os.path.join(path, str(r))) as f:
+                session, nbytes = (int(x) for x in f.read().split())
+        except (OSError, ValueError):
+            session, nbytes = -1, 0
+        total += own if session < _HOST_SESSION else nbytes
+    return total
+
+
+def _begin_host_session():
+    global _HOST_SESSION
+    _HOST_SESSION += 1
+
+
+def _end_host_session():
+    # Everything this session allocated is in host RAM now: available RAM already shows it.
+    _publish_host_pending(0)
+
+
 def _check_host_fit(sizes, on_host = 0, slack = 0):
     """Refuse an offload whose layers (`sizes`, bytes each) would not fit in free host RAM: running it out
     freezes the machine. `on_host` bytes of them already sit in host RAM and are counted as available;
@@ -129,9 +197,16 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
     except Exception:
         return
     need = sum(sizes) + slack
-    # Every local rank reads the same free RAM, so each may only plan for its share, like _pin_budget.
-    avail = free // _local_world_size() + on_host
+    own = max(0, need - on_host)
+    others = _others_host_pending(own)
+    if others is None:
+        # No shared ledger: every local rank reads the same free RAM, so each may only plan for its share.
+        avail = free // _local_world_size() + on_host
+    else:
+        # Ranks that finished already took their bytes out of `free`; only the others' remaining bytes are held back.
+        avail = free - others + on_host
     if need <= avail:
+        _publish_host_pending(own)
         return
     fit, used = 0, slack
     # Smallest first: the most layers that could fit.
@@ -384,6 +459,7 @@ class BlockSwap:
     _last_peak = None
     _optimizer_reserve = {}
     _hwm_base = {}
+    _peak_devs = ()
 
     def __init__(self, layers, n, prefetch_depth = 2, device = None, placement = "tail", model = None):
         self.blocks, self.handles = [], []
@@ -427,6 +503,11 @@ class BlockSwap:
         shared = {pid for pid, o in owners.items() if len(o) > 1}
         self.blocks = [_Block(layer, self.streams, self.device, shared) for layer in swapped]
         sizes = [b.nbytes() for b in self.blocks]
+        # Every card a block's frozen weights land on gets slots: its peaks are sampled and its growth judged too,
+        # not only the block's home card.
+        self._peak_devs = sorted({torch.device(dv) for b in self.blocks for dv in (*b.sizes, b.home) if dv is not None
+                                  and torch.device(dv).type == "cuda"}, key = lambda d: d.index or 0)
+        _begin_host_session()
         # Weights already in host RAM are released as their block is packed. On Linux the registered arena is
         # pageable and fills block by block, so only a couple of blocks are ever held twice (Flash-Next: 79.5 GiB
         # of host layers packed with 34.5 GiB still free); Windows commits that arena up front, so no credit there.
@@ -451,8 +532,12 @@ class BlockSwap:
                                                      default = 0)))
             on_host = max(0, host_loaded - chunk - max(sizes, default = 0))
         # The chunked fallback rounds chunks up to powers of two: up to twice the packed bytes.
-        _check_host_fit(sizes, on_host = on_host,
-                        slack = 0 if _can_register() else _chunked_bytes([b.sizes for b in self.blocks]) - sum(sizes))
+        try:
+            _check_host_fit(sizes, on_host = on_host,
+                            slack = 0 if _can_register() else _chunked_bytes([b.sizes for b in self.blocks]) - sum(sizes))
+        except Exception:
+            _end_host_session()
+            raise
         homes = {b.home for b in self.blocks if b.home is not None}
         for li, layer in enumerate(layers):
             if li not in self.pos:
@@ -485,8 +570,7 @@ class BlockSwap:
                         reserve[k] = reserve.get(k, 0) + q.numel() * 12
                 self._optimizer_reserve = reserve
                 # Allocator high-water mark at install (load and the pre-swap model): only a rise past it is training.
-                self._hwm_base = {k: torch.cuda.max_memory_allocated(k) for k in
-                                  {_cuda_index(b.home) for b in self.blocks if b.home is not None}}
+                self._hwm_base = {_cuda_index(dv): torch.cuda.max_memory_allocated(dv) for dv in self._peak_devs}
             if self._auto and owner is not None:
                 # Logits and loss run after the last layer, so only the model's output sees the step's peak.
                 self.handles.append(owner.register_forward_hook(_opaque(self._output_peak)))
@@ -519,6 +603,8 @@ class BlockSwap:
         except Exception:
             self.remove()
             raise
+        finally:
+            _end_host_session()
 
     def _pack(self):
         # Block by block, releasing each original as soon as it is packed: never two host copies of the tail.
@@ -625,7 +711,7 @@ class BlockSwap:
             b = self.blocks[i]
             self.current = self.indices[i]
             if self._auto and not self._settled:
-                self._note_peak(b.home)
+                self._note_block_peak(b)
             self._fetch(b, steal = True)
             marks = getattr(b, "marks", None)
             # A sample still in flight (backward recompute queued behind its forward) is kept for _harvest,
@@ -693,7 +779,7 @@ class BlockSwap:
     def _bwd(self, i):
         def hook(grad):
             if self._auto and not self._settled:
-                self._note_peak(self.blocks[i].home)
+                self._note_block_peak(self.blocks[i])
             self._release(self.blocks[i])
             # The output's grad hook already queued the step end from the outer graph (see _output_peak).
             if i == 0 and not self._step_queued:
@@ -714,7 +800,7 @@ class BlockSwap:
                 self._step_queued = False
         if self._auto and not self._settled:
             # Grads accumulated in the layers below the first swapped one are still allocated here.
-            for dv in {b.home for b in self.blocks if b.home is not None}:
+            for dv in self._peak_devs:
                 self._note_peak(dv)
         self._last_peak, self._step_peak = self._step_peak or {}, {}
         self._steps += 1
@@ -729,7 +815,7 @@ class BlockSwap:
     def _plain_peak(self, module, args, kwargs):
         if not self._auto or self._settled or not torch.is_grad_enabled():
             return
-        homes = {b.home for b in self.blocks if b.home is not None}
+        homes = self._peak_devs
         for dv in homes:
             self._note_peak(dv)
         x = next((a for a in args if isinstance(a, torch.Tensor)), None)
@@ -898,7 +984,7 @@ class BlockSwap:
         if not self._auto or self._settled:
             return
         self._step_queued = False
-        homes = {b.home for b in self.blocks if b.home is not None}
+        homes = self._peak_devs
         for dv in homes:
             self._note_peak(dv)
         out = _output_logits(output)
@@ -928,6 +1014,10 @@ class BlockSwap:
             register = getattr(node, "register_prehook", None) or node.register_hook
             register(_opaque(grad_peak))
 
+    def _note_block_peak(self, b):
+        for dv in b.sizes or (b.home,):
+            self._note_peak(dv)
+
     def _note_peak(self, dv, extra = 0):
         # Our own per-step high-water mark: torch's peak counter still holds the load and the pre-swap model.
         if dv is None:   # a block with nothing swappable (all trainable, or only shared weights) has no home card
@@ -942,7 +1032,9 @@ class BlockSwap:
         sigs = [b.sig for b in self.blocks]
         want = [s for s in self.free if sigs.count(s) > self.depth + 1]
         if not want:
-            return False
+            # Every block already has a slot of its own (signatures alternating A/B/A/B): a deeper lookahead
+            # allocates nothing and only starts each copy earlier, up to one block short of the whole sweep.
+            return self.depth + 1 < len(self.blocks)
         need = {}
         for s in want:
             size = {}
@@ -1261,6 +1353,16 @@ def build_host_layers(make_layer, first_idx, count, tensors, device, compute_dty
     if any(".quant_state." in k for k in tensors):
         quantize_4bit = False
     # Refuse before copying anything when the layers cannot fit in host RAM (sized on meta, no tensor read).
+    _begin_host_session()
+    try:
+        return _build_host_layers(make_layer, first_idx, count, tensors, device, compute_dtype, quantize_4bit,
+                                  skip_modules, prefix, bnb)
+    finally:
+        _end_host_session()
+
+
+def _build_host_layers(make_layer, first_idx, count, tensors, device, compute_dtype, quantize_4bit, skip_modules,
+                       prefix, bnb):
     _check_host_fit([_host_layer_bytes(make_layer, idx, tensors, compute_dtype, quantize_4bit, skip_modules, prefix)
                      for idx in range(first_idx, first_idx + count)])
     out = []
@@ -1474,6 +1576,7 @@ def load_layers_to_host(n, placement = "spread", embeddings = False):
     Install `BlockSwap` on the yielded `.layers` / `.indices` afterwards; `embeddings` also streams
     `extra_input_embeddings` (`.embeddings`, the caller hooks their lookups)."""
     state = _HostLoad(n, placement, embeddings)
+    _begin_host_session()
     patched = []
     try:
         core = importlib.import_module("transformers.core_model_loading")
@@ -1524,6 +1627,7 @@ def load_layers_to_host(n, placement = "spread", embeddings = False):
     try:
         yield state
     finally:
+        _end_host_session()
         for module, attr, fn in patched:
             setattr(module, attr, fn)
         if old_env is None:

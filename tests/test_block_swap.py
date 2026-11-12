@@ -1199,6 +1199,64 @@ def test_host_fit_splits_free_ram_between_local_ranks(monkeypatch):
         _mod._check_host_fit([_GiB // 2] * 20)
 
 
+def test_host_fit_does_not_hold_back_ram_for_a_rank_that_already_loaded(monkeypatch, tmp_path):
+    import sys, pytest
+    # Two local ranks need 8 GiB each. Before either allocates, 16 GiB spare holds both; once rank 1 has loaded,
+    # available RAM already shows its 8 GiB and rank 0 may take the remaining 8 GiB in full.
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setattr(_mod.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    monkeypatch.setenv("MASTER_PORT", "29511")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(_mod, "_HOST_SESSION", 0)
+    _mod._begin_host_session()
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(8 * _GiB))
+    monkeypatch.setattr(_mod, "_host_memory", lambda: (64 * _GiB, 8 * _GiB))
+    # Rank 1 has not reached this load: it is assumed to need as much as this rank.
+    with pytest.raises(ValueError):
+        _mod._check_host_fit([_GiB] * 8)
+    ledger = _mod._rank_ledger()
+    assert ledger is not None and ledger[1:] == (0, 2)
+    (tmp_path / os.path.basename(ledger[0]) / "1").write_text(f"{_mod._HOST_SESSION} 0")
+    _mod._check_host_fit([_GiB] * 8)
+    # Rank 1 still has 4 GiB to go: that much stays held back.
+    (tmp_path / os.path.basename(ledger[0]) / "1").write_text(f"{_mod._HOST_SESSION} {4 * _GiB}")
+    with pytest.raises(ValueError):
+        _mod._check_host_fit([_GiB] * 8)
+    _mod._check_host_fit([_GiB] * 4)
+    # A rank still on the previous load is assumed to need this rank's bytes, whatever it published then.
+    (tmp_path / os.path.basename(ledger[0]) / "1").write_text(f"{_mod._HOST_SESSION - 1} 0")
+    monkeypatch.setattr(_mod, "_host_memory", lambda: (64 * _GiB, 12 * _GiB))
+    with pytest.raises(ValueError):
+        _mod._check_host_fit([_GiB] * 8)
+    _mod._check_host_fit([_GiB] * 6)
+    # This rank published what it still needs, and 0 once the session ends.
+    mine = tmp_path / os.path.basename(ledger[0]) / "0"
+    assert mine.read_text().split() == [str(_mod._HOST_SESSION), str(6 * _GiB)]
+    _mod._end_host_session()
+    assert mine.read_text().split() == [str(_mod._HOST_SESSION), "0"]
+
+
+def test_auto_depth_deepens_when_every_block_already_has_a_slot():
+    # Signatures A/B/A/B at depth 1: both pools already hold both of their blocks, so depth 2 needs no new slot.
+    blocks = [types.SimpleNamespace(sig = s) for s in "ABAB"]
+    fake = types.SimpleNamespace(blocks = blocks, free = {"A": [object()], "B": [object()]}, depth = 1)
+    assert _mod.BlockSwap._grow_pool(fake) is True
+    fake.depth = 3
+    assert _mod.BlockSwap._grow_pool(fake) is False
+
+
+def test_peaks_are_sampled_on_every_card_a_block_uses(monkeypatch):
+    seen = []
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda dv: seen.append(torch.device(dv).index) or 100)
+    fake = types.SimpleNamespace(_step_peak = None)
+    fake._note_peak = lambda dv, extra = 0: _mod.BlockSwap._note_peak(fake, dv, extra)
+    block = types.SimpleNamespace(sizes = {torch.device("cuda", 0): 1, torch.device("cuda", 1): 1},
+                                  home = torch.device("cuda", 0))
+    _mod.BlockSwap._note_block_peak(fake, block)
+    assert sorted(seen) == [0, 1] and set(fake._step_peak) == {0, 1}
+
+
 def test_host_fit_counts_the_most_layers_that_fit(monkeypatch):
     import sys, pytest
     monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(4 * _GiB))
