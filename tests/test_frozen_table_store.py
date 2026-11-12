@@ -468,3 +468,30 @@ def test_full_finetuning_keeps_the_ngram_table_trainable_in_auto_mode(monkeypatc
     assert not _ngram_table_wanted(1000, 16, torch.bfloat16)
     monkeypatch.setenv("UNSLOTH_FROZEN_TABLE", "disk")
     assert _ngram_table_wanted(1000, 16, torch.bfloat16)
+
+
+def test_exported_shards_do_not_share_a_storage(bf16_table):
+    index, names, full = bf16_table
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk")
+    emb.bind(store)
+    emb.checkpoint_suffixes = {"weight": [f"shard_{i}.weight" for i in range(len(names))]}
+    sd = emb.state_dict()
+    ptrs = [t.untyped_storage().data_ptr() for t in sd.values()]
+    assert len(set(ptrs)) == len(ptrs)   # a save must not see tied views and clone them into RAM
+    assert torch.equal(torch.cat(list(sd.values())), full)
+
+
+def test_deepcopy_registers_its_own_lookup(bf16_table):
+    import copy, gc
+    index, names, full = bf16_table
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk"))
+    twin = copy.deepcopy(emb)
+    assert twin._handle != emb._handle and twin.frozen_table_store is emb.frozen_table_store
+    twin.to(torch.float64)
+    ids = torch.tensor([0, 5, 99])
+    assert emb(ids).dtype == torch.float32 and twin(ids).dtype == torch.float64
+    del emb
+    gc.collect()
+    assert torch.equal(twin(ids), full[ids].double())

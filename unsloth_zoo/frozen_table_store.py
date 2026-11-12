@@ -52,6 +52,7 @@ __all__ = [
     "iter_frozen_table_modules",
 ]
 
+import copy
 import json
 import mmap
 import os
@@ -261,6 +262,13 @@ class _MappedFile:
             raise
         self.refs = 0
         self._whole = None
+
+    def region(self, offset: int, nbytes: int) -> torch.Tensor:
+        """Zero-copy uint8 view of [offset, offset + nbytes) with a storage of its own: two shards of one file are
+        not views of one shared storage (a save would treat them as tied and clone them)."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)  # read-only buffer: we never write to it
+            return torch.frombuffer(self.mm, dtype=torch.uint8, count=nbytes, offset=offset)
 
     def whole(self) -> torch.Tensor:
         if self._whole is None:
@@ -497,7 +505,7 @@ class FrozenTableStore:
                     files.append(f)
                     if loc.offset + loc.nbytes > f.size:
                         raise ValueError(f"Unsloth: {loc.name} extends past the end of {loc.path}.")
-                    view = f.whole()[loc.offset: loc.offset + loc.nbytes].view(loc.shape[0], plane.row_bytes) if loc.shape[0] else None
+                    view = f.region(loc.offset, loc.nbytes).view(loc.shape[0], plane.row_bytes) if loc.shape[0] else None
                     plane.shards.append(_Shard(f, loc.offset, loc.shape[0], row, view))
                     starts.append(row)
                     row += loc.shape[0]
@@ -734,6 +742,15 @@ class UnslothFrozenTableEmbedding(nn.Module):
         self.frozen_table_store = store
         self._memo = None
         return self
+
+    def __deepcopy__(self, memo):
+        # A copy is its own module for the lookup op (its own dtype, its own lifetime); the read-only store is shared.
+        new = type(self).__new__(type(self))
+        memo[id(self)] = new
+        for k, v in self.__dict__.items():
+            new.__dict__[k] = None if k == "_memo" else copy.deepcopy(v, memo)
+        new._handle = _register_module(new)
+        return new
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         # The checkpoint tensors as zero-copy views of the mapped files, under their checkpoint names: a full save
