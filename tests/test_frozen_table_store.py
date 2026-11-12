@@ -444,6 +444,7 @@ def test_direct_bind_checks_the_row_shape(bf16_table):
         emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows refuses to replace a file that is mapped, so a stale mapping cannot arise")
 def test_a_file_replaced_at_the_same_path_is_mapped_again(tmp_path):
     shards = [torch.full((3, 4), 1.0, dtype=torch.bfloat16)]
     index, names = _write_sharded(tmp_path, shards, files=1)
