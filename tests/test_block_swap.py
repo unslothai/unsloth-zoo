@@ -2004,3 +2004,35 @@ def test_layers_to_come_uses_real_bytes_and_the_smallest_ratio():
     out = state._layers_to_come(meta // 4, 1)
     # Layer 1 and 2 (meta) take the smallest ratio seen, layer 3 is materialized: its own bytes.
     assert out == [meta // 4, meta // 4, meta]
+
+
+def test_layers_to_come_counts_a_shared_materialized_weight_once():
+    shared = nn.Linear(64, 64, bias = False)
+    layers = nn.ModuleList([nn.Sequential(shared, nn.Linear(64, 64, bias = False)) for _ in range(4)])
+    state = _mod._HostLoad([0, 1, 2, 3], "tail")
+    state.layers, state.indices = layers, [0, 1, 2, 3]
+    state.shape_bytes = {i: 2 * 64 * 64 * 4 for i in range(4)}
+    one = 64 * 64 * 4
+    assert state._layers_to_come(2 * one, 0) == [2 * one, one, one, one]
+    # Already moved with an earlier layer: not counted again.
+    state.moved_storages = {shared.weight.untyped_storage().data_ptr()}
+    assert state._layers_to_come(2 * one, 0) == [one] * 4
+
+
+def test_build_host_layers_publishes_what_is_left_after_each_layer(monkeypatch):
+    import sys, types as _t
+    published = []
+    monkeypatch.setattr(_mod, "_publish_host_pending", lambda n: published.append(n))
+    monkeypatch.setattr(_mod, "_check_host_fit", lambda sizes, **k: published.append(("check", sum(sizes))))
+    monkeypatch.setattr(_mod, "_host_layer_bytes", lambda make_layer, idx, *a: 100 * (idx + 1))
+    monkeypatch.setitem(sys.modules, "bitsandbytes", _t.SimpleNamespace(nn = None))
+    _mod.build_host_layers(lambda idx: nn.Identity(), 0, 3, {}, "cpu", torch.float32)
+    assert published == [("check", 600), 500, 300, 0]
+
+
+def test_pool_growth_reads_the_optimizer_reserve_of_adapters_added_after_install():
+    fake = types.SimpleNamespace(_reserve_owner = None, _reserve_layers = nn.ModuleList([nn.Linear(4, 4)]))
+    assert _mod.BlockSwap._optimizer_bytes(fake) == {}   # nothing trainable on a card yet
+    if torch.cuda.is_available():
+        fake._reserve_layers.append(nn.Linear(8, 8, bias = False).cuda())
+        assert _mod.BlockSwap._optimizer_bytes(fake) == {torch.cuda.current_device(): 64 * 12}

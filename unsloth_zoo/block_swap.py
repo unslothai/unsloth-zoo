@@ -458,6 +458,9 @@ class BlockSwap:
     _step_peak = None
     _last_peak = None
     _optimizer_reserve = {}
+    _reserve_owner = None
+    _reserve_layers = ()
+    _hwm_fresh = False
     _hwm_base = {}
     _peak_devs = ()
 
@@ -571,15 +574,9 @@ class BlockSwap:
                     owner = None
                 owner = owner() if owner is not None else None
             if self._auto:
-                # AdamW's two fp32 moments + the foreach temporary per trainable param (12 bytes), per card.
-                reserve, seen = {}, set()
-                params = owner.parameters() if owner is not None else (q for layer in layers for q in layer.parameters())
-                for q in params:
-                    if q.requires_grad and q.is_cuda and id(q) not in seen:
-                        seen.add(id(q))
-                        k = _cuda_index(q.device)
-                        reserve[k] = reserve.get(k, 0) + q.numel() * 12
-                self._optimizer_reserve = reserve
+                self._reserve_owner = weakref.ref(owner) if owner is not None else None
+                self._reserve_layers = layers
+                self._optimizer_reserve = self._optimizer_bytes()
                 # Allocator high-water mark at install (load and the pre-swap model): only a rise past it is training.
                 self._hwm_base = {_cuda_index(dv): torch.cuda.max_memory_allocated(dv) for dv in self._peak_devs}
             if self._auto and owner is not None:
@@ -611,6 +608,16 @@ class BlockSwap:
                 self.free[sig] = [self._new_slot(sig) for _ in range(min(self.depth + 1, sigs.count(sig)))]
 
             self._arm(forward = True)
+            if self._auto:
+                # A fresh allocator peak window from here on: the load's own peak would hide every training peak
+                # below it, and temporaries inside a layer (dequantized expert stacks) never reach a hook sample.
+                # Before training starts, so a caller measuring the training peak from here reads the same number.
+                try:
+                    for dv in self._peak_devs:
+                        torch.cuda.reset_peak_memory_stats(dv)
+                    self._hwm_fresh = True
+                except Exception:
+                    self._hwm_fresh = False
         except Exception:
             self.remove()
             raise
@@ -1038,6 +1045,20 @@ class BlockSwap:
         k = torch.device(dv).index
         self._step_peak[k] = max(self._step_peak.get(k, 0), torch.cuda.memory_allocated(dv) + extra)
 
+    def _optimizer_bytes(self):
+        """AdamW's two fp32 moments + the foreach temporary per trainable param (12 bytes), per card. Read from the
+        current params: adapters attached after install (PEFT on a swapped base) count too."""
+        owner = self._reserve_owner() if self._reserve_owner is not None else None
+        params = owner.parameters() if owner is not None else \
+            (q for layer in self._reserve_layers for q in layer.parameters())
+        reserve, seen = {}, set()
+        for q in params:
+            if q.requires_grad and q.is_cuda and id(q) not in seen:
+                seen.add(id(q))
+                k = _cuda_index(q.device)
+                reserve[k] = reserve.get(k, 0) + q.numel() * 12
+        return reserve
+
     def _grow_pool(self):
         """One more slot for every pool that can use one, if each card still has room for it."""
         sigs = [b.sig for b in self.blocks]
@@ -1054,6 +1075,8 @@ class BlockSwap:
                 size[dv] = max(size.get(dv, 0), off + -(-n // _ALIGN) * _ALIGN)
             for dv, n in size.items():
                 need[dv] = need.get(dv, 0) + n
+        fresh = self._optimizer_bytes() if (self._reserve_owner is not None or self._reserve_layers) else {}
+        reserve = {k: max(fresh.get(k, 0), self._optimizer_reserve.get(k, 0)) for k in {*fresh, *self._optimizer_reserve}}
         for dv, n in need.items():
             # Between steps the activations are gone; keep room for the next step's peak.
             k = _cuda_index(dv)
@@ -1061,14 +1084,14 @@ class BlockSwap:
             # Hook samples miss temporaries made and freed inside a layer or the loss: once the allocator's
             # high-water mark has risen past where it stood at install, that mark is a real training peak.
             hwm = torch.cuda.max_memory_allocated(dv)
-            if hwm > self._hwm_base.get(k, hwm):
+            if self._hwm_fresh or hwm > self._hwm_base.get(k, hwm):
                 peak = max(peak, hwm)
             transient = max(0, peak - torch.cuda.memory_allocated(dv))
             # Still keep a workspace margin for intra-op temporaries the samples cannot see.
             transient += max(_WORKSPACE_MIN_BYTES, int(torch.cuda.get_device_properties(dv).total_memory * _WORKSPACE_FRACTION))
             # optimizer.step() runs after every peak sample: keep room for AdamW's two moments (lazily allocated on
             # the first step) and the foreach temporary, as plan_block_swap budgets them.
-            transient += self._optimizer_reserve.get(_cuda_index(dv), 0)
+            transient += reserve.get(_cuda_index(dv), 0)
             if _free_device_bytes(dv) - transient < 2 * n:
                 return False
         for s in want:
@@ -1374,10 +1397,16 @@ def build_host_layers(make_layer, first_idx, count, tensors, device, compute_dty
 
 def _build_host_layers(make_layer, first_idx, count, tensors, device, compute_dtype, quantize_4bit, skip_modules,
                        prefix, bnb):
-    _check_host_fit([_host_layer_bytes(make_layer, idx, tensors, compute_dtype, quantize_4bit, skip_modules, prefix)
-                     for idx in range(first_idx, first_idx + count)])
+    sizes = [_host_layer_bytes(make_layer, idx, tensors, compute_dtype, quantize_4bit, skip_modules, prefix)
+             for idx in range(first_idx, first_idx + count)]
+    _check_host_fit(sizes)
     out = []
+    pending = sum(sizes)
     for idx in range(first_idx, first_idx + count):
+        if out:
+            # The layers built so far are in available RAM already: other local ranks hold back only the rest.
+            pending -= sizes[len(out) - 1]
+            _publish_host_pending(pending)
         with torch.device("meta"):
             layer = make_layer(idx)
         base = f"{prefix}{idx}."
@@ -1509,10 +1538,14 @@ class _HostLoad:
         ratios = list(self.ratios.values()) + ([size / base] if base else [])
         ratio = min(ratios) if ratios else None
         out = []
+        # Per storage, as evict() moves them: a weight shared by several selected layers (or already moved) once.
+        seen = set(self.moved_storages)
         for j in left:
             params = _counted_params(self.layers[j])
             if params and all(p.device.type != "meta" for p in params):
-                out.append(sum(p.nbytes for p in params))
+                ptrs = [p.untyped_storage().data_ptr() for p in params]
+                out.append(sum(p.nbytes for p, ptr in zip(params, ptrs) if ptr not in seen))
+                seen.update(ptrs)
             elif ratio is None:
                 out.append(size)
             else:
