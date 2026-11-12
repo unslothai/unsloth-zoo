@@ -207,7 +207,7 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
         avail = free - others + on_host
     if need <= avail:
         _publish_host_pending(own)
-        return
+        return own
     fit, used = 0, slack
     # Smallest first: the most layers that could fit.
     for size in sorted(sizes):
@@ -1564,22 +1564,32 @@ class _HostLoad:
         return [m.weight.nbytes for m in self.embedding_prefixes.values()
                 if m not in self.embeddings and m is not skip and getattr(m, "weight", None) is not None]
 
+    def _pending_embedding_cpu_bytes(self, skip = None):
+        # Streamed tables still to come that already sit in host RAM (host-kept, or a CPU shard): moving them copies nothing.
+        return sum(m.weight.nbytes for m in self.embedding_prefixes.values()
+                   if m not in self.embeddings and m is not skip and getattr(m, "weight", None) is not None
+                   and m.weight.device.type == "cpu")
+
     def evict_embedding(self, module):
         weight = getattr(module, "weight", None)
         if module in self.embeddings or weight is None or weight.device.type == "meta":
             return
         size = self.done_bytes[-1] if self.done_bytes else 0
         to_come = self._layers_to_come(size, self.last_done)
-        _check_host_fit(self.done_bytes + self.embedding_bytes + [weight.nbytes] + self._pending_embedding_bytes(skip = module)
-                        + to_come,
-                        sum(self.done_bytes) + sum(self.embedding_bytes) + (weight.nbytes if weight.device.type == "cpu" else 0)
-                        + self.cpu_to_come)
+        copied = 0 if weight.device.type == "cpu" else weight.nbytes
+        own = _check_host_fit(self.done_bytes + self.embedding_bytes + [weight.nbytes]
+                              + self._pending_embedding_bytes(skip = module) + to_come,
+                              sum(self.done_bytes) + sum(self.embedding_bytes) + (weight.nbytes - copied)
+                              + self.cpu_to_come + self._pending_embedding_cpu_bytes(skip = module))
         with torch.no_grad():
             weight.requires_grad_(False)
             if weight.device.type != "cpu":
                 weight.data = weight.data.to("cpu")
         self.embeddings.append(module)
         self.embedding_bytes.append(weight.nbytes)
+        if own is not None:
+            # Now in host RAM, so out of what other local ranks must hold back for this one.
+            _publish_host_pending(max(0, own - copied))
 
     def evict(self, i, force = False):
         if i in self.done:
@@ -1594,9 +1604,11 @@ class _HostLoad:
         # Layers still to come are scaled from this one by their meta sizes; the first check runs before any moved.
         size = sum(p.nbytes for p in params if p.device.type != "meta" and id(p) in counted)
         to_come = self._layers_to_come(size, i)
-        _check_host_fit(self.done_bytes + self.embedding_bytes + self._pending_embedding_bytes() + to_come,
-                        sum(self.done_bytes) + sum(self.embedding_bytes)
-                        + sum(p.nbytes for p in params if p.device.type == "cpu" and id(p) in counted) + self.cpu_to_come)
+        copied = sum(p.nbytes for p in params if p.device.type not in ("cpu", "meta") and id(p) in counted)
+        own = _check_host_fit(self.done_bytes + self.embedding_bytes + self._pending_embedding_bytes() + to_come,
+                              sum(self.done_bytes) + sum(self.embedding_bytes)
+                              + sum(p.nbytes for p in params if p.device.type == "cpu" and id(p) in counted)
+                              + self.cpu_to_come + self._pending_embedding_cpu_bytes())
         with torch.no_grad():
             for p in params:
                 if p.is_floating_point():
@@ -1610,6 +1622,9 @@ class _HostLoad:
         if self.shape_bytes.get(i):
             self.ratios[i] = size / self.shape_bytes[i]
         self.last_done = i
+        if own is not None:
+            # Now in host RAM, so out of what other local ranks must hold back for this one.
+            _publish_host_pending(max(0, own - copied))
 
     def on_param(self, model, target_name):
         self.bind(model)

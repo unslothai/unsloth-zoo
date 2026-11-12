@@ -2072,3 +2072,32 @@ def test_layers_already_on_cpu_are_credited_by_the_streaming_guard(monkeypatch):
     for i in range(4):
         state.evict(i)
     assert state.done == {0, 1, 2, 3}
+
+
+def test_streaming_guard_updates_the_rank_ledger_after_each_eviction(monkeypatch):
+    import sys
+    published = []
+    monkeypatch.setattr(_mod, "_publish_host_pending", lambda n: published.append(n))
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(20 * _GiB, 64 * _GiB))
+    state, layers = _host_load(4, 3, meta = True)
+    state.shape_bytes = {i: 64 * 64 * 4 for i in state.indices}
+    one = 64 * 64 * 4
+    for i in state.indices:
+        _land(layers[i])
+        state.evict(i)
+    # Layers that landed on CPU copy nothing; what each check published is the rest still to allocate.
+    assert published and all(n >= 0 for n in published) and published[-1] == 0
+
+
+def test_embedding_table_already_on_cpu_is_credited(monkeypatch):
+    import sys
+    one = 64 * 64 * 4
+    state, layers = _host_load(4, 3, meta = True)
+    state.shape_bytes = {i: one for i in state.indices}
+    state.embedding_prefixes = {"emb.": nn.Embedding(1 << 16, 64)}   # 16 MiB, already on CPU
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setattr(_mod, "_host_memory", lambda: (64 * _GiB, 4 * one))
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    _land(layers[1])
+    state.evict(1)
+    assert state.done == {1}
