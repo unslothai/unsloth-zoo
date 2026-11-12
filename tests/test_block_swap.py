@@ -2179,3 +2179,21 @@ def test_an_early_stopped_recompute_keeps_its_wait_sample():
     block = types.SimpleNamespace(marks = (Ev(0.0), Ev(3.0), Ev(9.0)), mark_open = 1)
     _mod.BlockSwap._harvest_marks(fake, block)
     assert fake._tot["stall_ms"] == 3.0 and block.mark_open == 0
+
+
+def test_registered_arena_is_not_prefilled_under_deterministic_algorithms(monkeypatch):
+    import torch.utils.deterministic as det
+    seen = []
+    real_empty = torch.empty
+
+    def spy(*a, **k):
+        seen.append(det.fill_uninitialized_memory)
+        return real_empty(*a, **k)
+    prev = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        monkeypatch.setattr(torch, "empty", spy)
+        _mod._lazy_host_empty(1 << 20)
+    finally:
+        torch.use_deterministic_algorithms(prev)
+    assert seen == [False] and det.fill_uninitialized_memory is True

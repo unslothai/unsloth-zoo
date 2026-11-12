@@ -238,6 +238,20 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
     )
 
 
+def _lazy_host_empty(nbytes):
+    """Pageable host bytes whose pages are committed only as packing writes them, which the host guard credits.
+    torch.use_deterministic_algorithms(True) would otherwise fill (commit) the whole arena up front; every byte is
+    overwritten by packing, so skipping that fill never exposes uninitialized memory."""
+    det = getattr(getattr(torch.utils, "deterministic", None), "fill_uninitialized_memory", None)
+    if det is None or not det:
+        return torch.empty(nbytes, dtype = torch.uint8)
+    torch.utils.deterministic.fill_uninitialized_memory = False
+    try:
+        return torch.empty(nbytes, dtype = torch.uint8)
+    finally:
+        torch.utils.deterministic.fill_uninitialized_memory = det
+
+
 class _Registered:
     """Page-locks the first `nbytes` of pageable `buf` in place (exact size, no allocator rounding)."""
 
@@ -677,7 +691,7 @@ class BlockSwap:
         if not _can_register():
             return False
         total = sum(b.nbytes() for b in self.blocks)
-        arena = torch.empty(total, dtype = torch.uint8)
+        arena = _lazy_host_empty(total)
         used, ends = 0, []
         for b in self.blocks:
             regions = {}
