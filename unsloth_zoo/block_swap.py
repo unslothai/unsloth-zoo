@@ -379,6 +379,7 @@ class BlockSwap:
     _adapt_seen = None
     _step_peak = None
     _last_peak = None
+    _optimizer_reserve = {}
 
     def __init__(self, layers, n, prefetch_depth = 2, device = None, placement = "tail", model = None):
         self.blocks, self.handles = [], []
@@ -427,7 +428,14 @@ class BlockSwap:
         # of host layers packed with 34.5 GiB still free); Windows commits that arena up front, so no credit there.
         # The chunked fallback allocates one chunk at a time and releases each block's original right after
         # packing it, so on top of the originals it holds at most one chunk and the block being packed.
-        host_loaded = sum(p.data.nbytes for layer in swapped for _, p in _swappable(layer) if p.device.type == "cpu")
+        # Per storage: a CPU tensor shared by several selected layers is released (and credited) once.
+        host_storages = {}
+        for layer in swapped:
+            for _, p in _swappable(layer):
+                if p.device.type == "cpu":
+                    st = p.data.untyped_storage()
+                    host_storages[st.data_ptr()] = st.nbytes()
+        host_loaded = sum(host_storages.values())
         on_host = 0
         if _can_register():
             if os.name != "nt":
@@ -460,6 +468,16 @@ class BlockSwap:
                 except TypeError:  # a plain list of layers
                     owner = None
                 owner = owner() if owner is not None else None
+            if self._auto:
+                # AdamW's two fp32 moments + the foreach temporary per trainable param (12 bytes), per card.
+                reserve, seen = {}, set()
+                params = owner.parameters() if owner is not None else (q for layer in layers for q in layer.parameters())
+                for q in params:
+                    if q.requires_grad and q.is_cuda and id(q) not in seen:
+                        seen.add(id(q))
+                        k = _cuda_index(q.device)
+                        reserve[k] = reserve.get(k, 0) + q.numel() * 12
+                self._optimizer_reserve = reserve
             if self._auto and owner is not None:
                 # Logits and loss run after the last layer, so only the model's output sees the step's peak.
                 self.handles.append(owner.register_forward_hook(_opaque(self._output_peak)))
@@ -891,7 +909,8 @@ class BlockSwap:
             def grad_peak(*_):
                 if self._auto and not self._settled:
                     for dv in homes:
-                        self._note_peak(dv, extra = 2 * size if dev is not None and torch.device(dv) == dev else 0)
+                        self._note_peak(dv, extra = 2 * size if dev is not None and _cuda_index(dv) == _cuda_index(dev)
+                                        else 0)
                     # Queued from the outer graph, so it runs after the whole backward: a reentrant checkpoint's
                     # inner backward per layer, layers below the first swapped one and a frozen first block included.
                     if not self._step_queued:
@@ -927,6 +946,9 @@ class BlockSwap:
             # Between steps the activations are gone; keep room for the next step's peak.
             peak = (self._last_peak or {}).get(torch.device(dv).index, 0)
             transient = max(0, peak - torch.cuda.memory_allocated(dv))
+            # optimizer.step() runs after every peak sample: keep room for AdamW's two moments (lazily allocated on
+            # the first step) and the foreach temporary, as plan_block_swap budgets them.
+            transient += self._optimizer_reserve.get(_cuda_index(dv), 0)
             if _free_device_bytes(dv) - transient < 2 * n:
                 return False
         for s in want:
@@ -1052,6 +1074,14 @@ def _free_device_bytes(device):
 
 def _layer_signature(params):
     return tuple((tuple(p.shape), p.dtype) for _, p in params)
+
+
+def _cuda_index(dv):
+    """The card index of a CUDA device (a bare "cuda" is the current card); None for anything else."""
+    d = torch.device(dv)
+    if d.type != "cuda":
+        return None
+    return d.index if d.index is not None else torch.cuda.current_device()
 
 
 def _resolved_depth(prefetch_depth):

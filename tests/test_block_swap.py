@@ -1827,3 +1827,25 @@ def test_unindexed_cuda_device_is_canonical():
     sw = BlockSwap(blocks, [1], device = "cuda")
     assert sw.device.index == torch.cuda.current_device() and not sw.spans_devices
     sw.remove()
+
+
+def test_pool_growth_keeps_the_optimizer_reserve():
+    import pytest
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
+    sw = BlockSwap(blocks, 6, prefetch_depth = "auto", device = "cuda")
+    k = torch.cuda.current_device()
+    # Each block's trainable lora (256 x 256 fp32) is reserved for AdamW: 12 bytes per param, all 8 blocks.
+    assert sw._optimizer_reserve.get(k) == 8 * 256 * 256 * 12
+    free = _mod._free_device_bytes(torch.device("cuda", k))
+    sw._optimizer_reserve = {k: free}
+    sw._last_peak = {}
+    assert sw._grow_pool() is False
+    sw.remove()
+
+
+def test_cuda_index_of_cpu_and_bare_devices():
+    assert _mod._cuda_index("cpu") is None
+    if torch.cuda.is_available():
+        assert _mod._cuda_index("cuda") == torch.cuda.current_device() == _mod._cuda_index(torch.device("cuda", torch.cuda.current_device()))
