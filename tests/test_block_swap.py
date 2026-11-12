@@ -620,7 +620,7 @@ def _xrun(blocks, mode, swap, idx = None):
 
 def test_cross_fed_tensor_grads_are_bitwise_with_swap():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     torch.manual_seed(0)
     blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
     for mode in ("reentrant", "non_reentrant", "none"):
@@ -634,7 +634,7 @@ def test_cross_fed_tensor_grads_are_bitwise_with_swap():
 
 def test_block_without_grad_input_is_released_after_backward():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     torch.manual_seed(0)
     blocks = nn.ModuleList([_XBlock(256) for _ in range(4)]).cuda()
     sw = BlockSwap(blocks, 4, prefetch_depth = 1, device = "cuda")
@@ -653,7 +653,7 @@ def test_block_without_grad_input_is_released_after_backward():
 
 def test_shared_parameter_stays_on_the_card():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     shared = nn.Linear(64, 64, bias = False).cuda().requires_grad_(False)
     layers = nn.ModuleList([nn.Sequential(nn.Linear(64, 64, bias = False), shared) for _ in range(3)])
     layers = layers.cuda().requires_grad_(False)
@@ -704,7 +704,7 @@ def test_pool_bytes_gives_equal_size_blocks_of_different_shapes_a_pool_each():
 
 def test_auto_swap_indices_takes_only_the_shortfall():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     layers = nn.ModuleList([nn.Linear(256, 256, bias = False) for _ in range(12)]).cuda().requires_grad_(False)
     layer = 256 * 256 * 4
     dev = layers[0].weight.device
@@ -729,7 +729,7 @@ class _SharedBlock(nn.Module):
 
 def test_auto_swap_indices_counts_no_savings_for_shared_weights():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     shared = nn.Linear(256, 2048, bias = False)
     layers = nn.ModuleList([_SharedBlock(shared) for _ in range(12)]).cuda().requires_grad_(False)
     own = 256 * 256 * 4
@@ -757,7 +757,7 @@ def test_block_on_another_card_gets_its_inputs_moved():
 
 def test_one_card_swap_keeps_fast_decode():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     blocks = nn.ModuleList([_XBlock(64) for _ in range(4)]).cuda().requires_grad_(False)
     sw = BlockSwap(blocks, [1, 3], prefetch_depth = 1)
     assert not sw.spans_devices
@@ -777,7 +777,7 @@ def test_hooks_are_opaque_to_torch_compile():
 
 def test_compiled_layers_match_eager_with_swap():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     from torch import _dynamo
     torch.manual_seed(0)
     blocks = nn.ModuleList([_XBlock(64) for _ in range(4)]).cuda()
@@ -850,7 +850,7 @@ def test_load_layers_to_host_restores_what_it_patched():
 
 def test_load_layers_to_host_matches_a_normal_load(tmp_path):
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     from transformers import LlamaConfig, LlamaForCausalLM
     torch.manual_seed(0)
     cfg = LlamaConfig(hidden_size = 64, intermediate_size = 128, num_hidden_layers = 6, num_attention_heads = 4,
@@ -958,7 +958,7 @@ def test_harvest_copy_keeps_samples_still_in_flight():
 
 def test_stats_reports_placement_and_timings_after_a_step():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     import torch.utils.checkpoint as cp
     torch.manual_seed(0)
     blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
@@ -986,7 +986,7 @@ def test_stats_reports_placement_and_timings_after_a_step():
 
 def test_pre_keeps_an_in_flight_timing_sample_for_harvest():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
 
     class Ev:
         done, recorded = False, 0
@@ -1082,7 +1082,7 @@ def test_auto_depth_stops_when_the_card_has_no_room_for_a_slot():
 
 def test_auto_depth_starts_at_one_and_settles_with_its_pool():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
     sw = BlockSwap(blocks, 6, prefetch_depth = "auto", device = "cuda")
     assert sw.depth == 1 and sw._auto and not sw._settled
@@ -1092,7 +1092,7 @@ def test_auto_depth_starts_at_one_and_settles_with_its_pool():
 
 def test_grow_pool_adds_a_slot_only_with_room_for_the_next_step(monkeypatch):
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
     sw = BlockSwap(blocks, 6, prefetch_depth = "auto", device = "cuda")
     slots = lambda: sum(len(v) for v in sw.free.values()) + sum(b.slot is not None for b in sw.blocks)
@@ -1105,7 +1105,7 @@ def test_grow_pool_adds_a_slot_only_with_room_for_the_next_step(monkeypatch):
 
 def test_grow_pool_ignores_the_load_time_peak(monkeypatch):
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     # The process peak still holds the model load; only the swap's own last step counts as headroom.
     blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
     sw = BlockSwap(blocks, 6, prefetch_depth = "auto", device = "cuda")
@@ -1160,7 +1160,7 @@ def test_host_fit_counts_weights_already_in_host_ram_as_available(monkeypatch):
 def test_block_swap_refuses_host_loaded_layers_without_room_to_pack(monkeypatch):
     import sys, pytest
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     # The chunked fallback copies host-loaded layers before their originals go: both are resident at once.
     monkeypatch.setenv("UNSLOTH_DISABLE_PINNED_MEMORY", "1")
     blocks = nn.ModuleList([_XBlock(256) for _ in range(8)])
@@ -1175,7 +1175,7 @@ def test_block_swap_refuses_host_loaded_layers_without_room_to_pack(monkeypatch)
 def test_block_swap_credits_host_loaded_layers_when_the_arena_registers_in_place(monkeypatch):
     import sys, os
     if not torch.cuda.is_available() or os.name == "nt" or not _mod._can_register():
-        return
+        __import__("pytest").skip("needs CUDA")
     # Registered in place, block by block: only about two blocks are ever held twice.
     blocks = nn.ModuleList([_XBlock(256) for _ in range(8)])
     blocks[:2].cuda(); blocks[2:].cpu()
@@ -1285,7 +1285,7 @@ def test_host_load_counts_streamed_embeddings_still_to_come(monkeypatch):
 
 def test_host_load_refuses_an_embedding_that_does_not_fit(monkeypatch):
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     import sys
     import pytest
     total = 64 * _GiB
@@ -1310,7 +1310,7 @@ def test_host_load_is_unguarded_without_psutil(monkeypatch):
 
 def test_block_swap_refuses_before_moving_anything(monkeypatch):
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     import sys
     import pytest
     monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(0))
@@ -1395,7 +1395,7 @@ class _HeadModel(nn.Module):
 
 def test_auto_depth_peak_includes_the_model_output():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     torch.manual_seed(0)
     model = _HeadModel(256, 8, 1 << 15).cuda()
     # Swapped layers end early (explicit indices), so no swapped layer's hook runs while the head output is alive.
@@ -1427,7 +1427,7 @@ class _OwnedLayers(nn.Module):
 
 def test_auto_depth_peak_includes_unswapped_layers_backward():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
 
     class Head(nn.Module):
         # Trainable and unswapped: its 256 MiB weight grad lands after the first swapped layer's backward hook.
@@ -1457,7 +1457,7 @@ def test_auto_depth_peak_includes_unswapped_layers_backward():
 
 def test_auto_depth_counts_steps_when_the_first_swapped_block_gets_no_grad():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     torch.manual_seed(0)
     # Frozen prefix: layers 0 and 1 see no grad-requiring input, only layer 2 onward trains (its bias).
     layers = nn.ModuleList([nn.Linear(256, 256) for _ in range(4)]).cuda()
@@ -1476,7 +1476,7 @@ def test_auto_depth_counts_steps_when_the_first_swapped_block_gets_no_grad():
 def test_auto_depth_ends_the_step_from_the_loss_when_logits_are_not_in_the_graph():
     import types
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     torch.manual_seed(0)
 
     class FusedCE(nn.Module):
@@ -1503,7 +1503,7 @@ def test_auto_depth_ends_the_step_from_the_loss_when_logits_are_not_in_the_graph
 
 def test_auto_depth_counts_one_step_per_backward_under_reentrant_checkpointing():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     torch.manual_seed(0)
     # Unsloth checkpoints with use_reentrant = True: each layer's backward is its own inner graph.
     layers = nn.ModuleList([nn.Linear(256, 256) for _ in range(4)]).cuda()
@@ -1575,7 +1575,7 @@ def test_host_load_reads_layer_sizes_before_the_first_weight_lands(monkeypatch):
 
 def test_auto_depth_peak_with_a_layer_list_passed_directly():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     model = _HeadModel(256, 4, 1 << 12).cuda()
     layers = nn.ModuleList(list(model.model.layers))  # not from find_decoder_layers
     without = BlockSwap(layers, [0], prefetch_depth = "auto", device = "cuda")
@@ -1589,7 +1589,7 @@ def test_auto_depth_peak_with_a_layer_list_passed_directly():
 def test_host_load_embedding_check_counts_the_other_tables_to_come(monkeypatch):
     import sys, pytest
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     total = 64 * _GiB
     reserve = int(total * _mod._PIN_RESERVE_FRACTION)
     # Room for one 1 MiB table, not two: refuse at the first, before anything moved.
@@ -1656,7 +1656,7 @@ def test_placing_no_placement_params_makes_them_swappable_again(monkeypatch):
 
 def test_auto_swap_indices_does_not_count_a_host_kept_table():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
 
     class Model(_PleModel):
         def __init__(self):
@@ -1736,3 +1736,94 @@ def test_chunked_pack_credits_host_loaded_originals(monkeypatch):
     # Room for the chunk + one block + allocator rounding, far less than a second copy of all six.
     monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(4 * block))
     BlockSwap(blocks, 6, device = "cuda").remove()
+
+
+def _bhl_layer(idx):
+    return nn.Sequential(nn.Linear(64, 64), nn.LayerNorm(64))
+
+
+def _bhl_tensors(n, reads):
+    def t(key, shape):
+        def load():
+            reads.append(key)
+            return torch.randn(*shape)
+        return load
+    out = {}
+    for i in range(n):
+        out[f"model.layers.{i}.0.weight"] = t(f"{i}.w", (64, 64))
+        out[f"model.layers.{i}.0.bias"] = t(f"{i}.b", (64,))
+        out[f"model.layers.{i}.1.weight"] = t(f"{i}.ln", (64,))
+        out[f"model.layers.{i}.1.bias"] = t(f"{i}.lnb", (64,))
+    return out
+
+
+def test_build_host_layers_refuses_before_reading_anything(monkeypatch):
+    import sys, pytest
+    pytest.importorskip("bitsandbytes")
+    reads = []
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    # Each layer is 64*64*4 + 3*64*4 bytes in fp32: room for 2 of the 4.
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(2 * (64 * 64 * 4 + 3 * 64 * 4) + 100))
+    with pytest.raises(ValueError, match = "At most 2 layers"):
+        _mod.build_host_layers(_bhl_layer, 0, 4, _bhl_tensors(4, reads), "cpu", torch.float32)
+    assert reads == []
+
+
+def test_build_host_layers_builds_when_it_fits(monkeypatch):
+    import sys, pytest
+    pytest.importorskip("bitsandbytes")
+    reads = []
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(1 << 30))
+    out = _mod.build_host_layers(_bhl_layer, 0, 2, _bhl_tensors(2, reads), "cpu", torch.float32)
+    assert len(out) == 2 and out[0][0].weight.device.type == "cpu" and len(reads) == 8
+
+
+def test_pool_bytes_accepts_auto_like_the_constructor(monkeypatch):
+    monkeypatch.setattr(_mod, "_TIMING", True)
+    assert _mod._pool_bytes([10, 10, 10], "auto") == _mod._pool_bytes([10, 10, 10], 1)
+    monkeypatch.setattr(_mod, "_TIMING", False)
+    assert _mod._pool_bytes([10, 10, 10], "auto") == _mod._pool_bytes([10, 10, 10], 2)
+
+
+def test_host_reserve_is_at_most_a_quarter_of_a_small_host():
+    assert _mod._host_reserve(2 * _GiB) == _GiB // 2
+    assert _mod._host_reserve(32 * _GiB) == int(32 * _GiB * 0.15)
+    assert _mod._host_reserve(16 * _GiB) == 4 * _GiB
+
+
+def test_host_load_skips_host_kept_tables_and_tables_inside_selected_layers():
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(8, 8, bias = False)
+            self.table = nn.Embedding(1 << 20, 64)   # 256 MiB: an extra embedding by size
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.embed_tokens = nn.Embedding(16, 8)
+            self.model.layers = nn.ModuleList([Layer() for _ in range(2)])
+            self._no_placement_params = ["table.weight"]
+
+        def get_input_embeddings(self):
+            return self.model.embed_tokens
+
+    with torch.device("meta"):
+        m = Model()
+    state = _mod._HostLoad([0, 1], "tail", embeddings = True)
+    state.bind(m)
+    # The tables live in selected layers (charged with them, not again as streamed tables) and are host-kept.
+    assert state.embedding_prefixes == {}
+    assert state.shape_bytes == {0: 8 * 8 * 4, 1: 8 * 8 * 4}
+
+
+def test_unindexed_cuda_device_is_canonical():
+    import pytest
+    if not torch.cuda.is_available():
+        pytest.skip("BlockSwap needs a CUDA device")
+    blocks = nn.ModuleList([_XBlock(16) for _ in range(3)]).cuda()
+    sw = BlockSwap(blocks, [1], device = "cuda")
+    assert sw.device.index == torch.cuda.current_device() and not sw.spans_devices
+    sw.remove()

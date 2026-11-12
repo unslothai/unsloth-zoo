@@ -80,7 +80,8 @@ def _pow2_ceil(n):
 
 
 def _host_reserve(total):
-    return max(_PIN_RESERVE_MIN_BYTES, int(total * _PIN_RESERVE_FRACTION))
+    # max(4 GiB, 15%), but never more than a quarter of a small host or container (a 2 GiB one keeps 0.5 GiB).
+    return max(min(_PIN_RESERVE_MIN_BYTES, total // 4), int(total * _PIN_RESERVE_FRACTION))
 
 
 def _host_free():
@@ -181,7 +182,7 @@ def _host_chunk(nbytes, budget):
 
 def _can_register():
     return (_PINNED_MEMORY_AVAILABLE and os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") != "1"
-            and hasattr(torch.cuda.cudart(), "cudaHostRegister"))
+            and torch.cuda.is_available() and hasattr(torch.cuda.cudart(), "cudaHostRegister"))
 
 
 def _chunked_bytes(block_sizes):
@@ -386,7 +387,7 @@ class BlockSwap:
         self._auto = auto and _TIMING
         self._settled = not self._auto
         self._step_queued = False
-        self.depth = 1 if self._auto else 2 if auto else max(1, int(prefetch_depth))
+        self.depth = _resolved_depth(prefetch_depth)
         self.total = len(layers)
         self._tot = dict.fromkeys(_STAT_KEYS, 0.0)
         self._seen = dict(self._tot)
@@ -409,6 +410,9 @@ class BlockSwap:
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
         self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            # One canonical key: params report cuda:N, so a bare "cuda" would split peaks and homes in two.
+            self.device = torch.device("cuda", torch.cuda.current_device())
         swapped = [layers[i] for i in self.indices]
         # A param shared by two layers stays on the card: evicting it under one empties it for the other.
         owners = {}
@@ -458,7 +462,7 @@ class BlockSwap:
                 owner = owner() if owner is not None else None
             if self._auto and owner is not None:
                 # Logits and loss run after the last layer, so only the model's output sees the step's peak.
-                self.handles.append(owner.register_forward_hook(self._output_peak))
+                self.handles.append(owner.register_forward_hook(_opaque(self._output_peak)))
             for i, layer in enumerate(swapped):
                 self.handles.append(layer.register_forward_pre_hook(self._pre(i), with_kwargs = True))
                 self.handles.append(layer.register_forward_hook(self._post(i)))
@@ -1050,9 +1054,16 @@ def _layer_signature(params):
     return tuple((tuple(p.shape), p.dtype) for _, p in params)
 
 
+def _resolved_depth(prefetch_depth):
+    """The depth BlockSwap starts at: "auto" starts at 1 (2 when timing is off, the fixed default)."""
+    if prefetch_depth == "auto":
+        return 1 if _TIMING else 2
+    return max(1, int(prefetch_depth))
+
+
 def _pool_bytes(sizes, depth, sigs = None):
     # One pool per shape signature (as BlockSwap keys them), depth + 1 slots each, fewer if fewer blocks share it.
-    depth = max(1, depth)  # as BlockSwap
+    depth = _resolved_depth(depth)  # as BlockSwap
     counts = {}
     for i, b in enumerate(sizes):
         key = sigs[i] if sigs is not None else b
@@ -1150,6 +1161,31 @@ def _find_decoder_layers(model):
     raise RuntimeError("could not locate decoder layers")
 
 
+def _host_layer_bytes(make_layer, idx, tensors, compute_dtype, quantize_4bit, skip_modules, prefix):
+    """Host bytes build_host_layers will copy for layer `idx`: packed 4-bit Linear weights (prequantized or
+    quantized here) take half a byte per element, everything else the compute dtype."""
+    with torch.device("meta"):
+        layer = make_layer(idx)
+    width = torch.empty(0, dtype = compute_dtype).element_size()
+    base, total, done = f"{prefix}{idx}.", 0, set()
+    for mname, mod in layer.named_modules():
+        if not isinstance(mod, torch.nn.Linear):
+            continue
+        key = base + mname + ".weight"
+        packed = any(k.startswith(key + ".") for k in tensors) or (
+            quantize_4bit and not any(s in mname.split(".") for s in skip_modules))
+        n = mod.weight.numel()
+        total += (n + 1) // 2 if packed else n * width
+        done.add(id(mod.weight))
+        if mod.bias is not None:
+            total += mod.bias.numel() * width
+            done.add(id(mod.bias))
+    for p in layer.parameters():
+        if id(p) not in done:
+            total += p.numel() * (width if p.is_floating_point() else p.element_size())
+    return total
+
+
 def build_host_layers(make_layer, first_idx, count, tensors, device, compute_dtype,
                       quantize_4bit = False, skip_modules = (), prefix = "model.layers."):
     """Build layers [first_idx, first_idx + count) with frozen weights in pinned host RAM; quant_state stays on `device`."""
@@ -1157,6 +1193,9 @@ def build_host_layers(make_layer, first_idx, count, tensors, device, compute_dty
     device = torch.device(device)
     if any(".quant_state." in k for k in tensors):
         quantize_4bit = False
+    # Refuse before copying anything when the layers cannot fit in host RAM (sized on meta, no tensor read).
+    _check_host_fit([_host_layer_bytes(make_layer, idx, tensors, compute_dtype, quantize_4bit, skip_modules, prefix)
+                     for idx in range(first_idx, first_idx + count)])
     out = []
     for idx in range(first_idx, first_idx + count):
         with torch.device("meta"):
@@ -1234,6 +1273,16 @@ def extra_input_embeddings(model):
     return out
 
 
+def _counted_params(module):
+    """Params a host move costs: a host-kept table (`_no_placement_params`, tagged by _mark_host_kept) is already
+    in host RAM before any layer moves, so it is neither charged again nor credited."""
+    kept = set()
+    for m in module.modules():
+        if getattr(m, "_unsloth_host_kept", False):
+            kept.update(id(p) for p in m.parameters())
+    return [p for p in module.parameters() if id(p) not in kept]
+
+
 class _HostLoad:
     """What `load_layers_to_host` moved: the layer list and the indices living in host RAM."""
 
@@ -1255,9 +1304,12 @@ class _HostLoad:
             else sorted({int(i) % len(layers) for i in self.n})
         if name is not None:
             self.prefixes = {f"{name}.{i}.": i for i in self.indices}
-        self.shape_bytes = {i: sum(p.nbytes for p in layers[i].parameters()) for i in self.indices}
+        self.shape_bytes = {i: sum(p.nbytes for p in _counted_params(layers[i])) for i in self.indices}
         if self.want_embeddings:
-            self.embedding_prefixes = {f"{n}.": m for n, m in extra_input_embeddings(model)}
+            # A table inside a selected layer moves (and is charged) with that layer, not a second time here.
+            inside = tuple(self.prefixes)
+            self.embedding_prefixes = {f"{n}.": m for n, m in extra_input_embeddings(model)
+                                       if not (inside and f"{n}.".startswith(inside))}
 
     def _layers_to_come(self, size, ref):
         """Bytes of the selected layers not moved yet, scaled from layer `ref`, which takes `size` bytes loaded."""
@@ -1294,10 +1346,12 @@ class _HostLoad:
         params = list(layer.parameters())
         if not force and any(p.device.type == "meta" for p in params):
             return
+        counted = {id(p) for p in _counted_params(layer)}
         # Layers still to come are scaled from this one by their meta sizes; the first check runs before any moved.
-        size = sum(p.nbytes for p in params if p.device.type != "meta")
+        size = sum(p.nbytes for p in params if p.device.type != "meta" and id(p) in counted)
         _check_host_fit(self.done_bytes + self.embedding_bytes + self._pending_embedding_bytes() + self._layers_to_come(size, i),
-                        sum(self.done_bytes) + sum(self.embedding_bytes) + sum(p.nbytes for p in params if p.device.type == "cpu"))
+                        sum(self.done_bytes) + sum(self.embedding_bytes)
+                        + sum(p.nbytes for p in params if p.device.type == "cpu" and id(p) in counted))
         with torch.no_grad():
             for p in params:
                 if p.is_floating_point():
