@@ -239,6 +239,13 @@
     },
     {
       "file": "unsloth_zoo/mlx/inference.py",
+      "sink": "compile",
+      "digest": "cbaaff9d3b95fc3f",
+      "count": 1,
+      "reason": "Compiles the source file of an already imported mlx / mlx-vlm / stdlib module (sys.modules[module].__file__) only to collect its code objects; the result is never executed. A verifier helper whose __code__ is not among them was replaced at runtime, so the fused MoE route refuses it and stays native. No caller input, network data or file the import machinery did not already load reaches the compiled text."
+    },
+    {
+      "file": "unsloth_zoo/mlx/inference.py",
       "sink": "exec",
       "digest": "ae8d4def96cf1884",
       "count": 1,

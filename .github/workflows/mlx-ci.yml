@@ -195,6 +195,10 @@ jobs:
         # experts from the checkpoint, bit-exact against the stock modules.
         run: python -m pytest tests/test_mlx_load_residency_metal.py -v -rs
 
+      - name: tests/test_mlx_speculative_metal.py (qwen4_exp)
+        # Only the random qwen4_exp cases: the rest load bf16 checkpoints this runner cannot hold.
+        run: python -m pytest tests/test_mlx_speculative_metal.py -k qwen4 -v -rs
+
       - name: tests/test_mlx_generate_metal.py
         # Batched generation on real models: batched-vs-sequential greedy
         # equivalence with aligned sampled-token logprobs, memory-limit
