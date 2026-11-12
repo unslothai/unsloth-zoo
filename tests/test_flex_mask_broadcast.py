@@ -149,6 +149,42 @@ def test_padded_prefill_mask_keeps_batch_only(builds):
 
 @cuda
 @pytest.mark.parametrize("sliding_window", [None, 128])
+def test_padded_training_bool_mask_matches_integer(builds, sliding_window):
+    attn = _attn(sliding_window)
+    mask = torch.ones(2, 384, dtype = torch.bool, device = "cuda")
+    mask[0, :17] = False
+    got = _step(attn, attention_mask = mask)
+    ref = _step(attn, attention_mask = mask.to(torch.int64))
+    assert builds == [(2, None), (2, None)]
+    for a, b in zip(got, ref):
+        assert torch.equal(a, b)
+
+
+@cuda
+@pytest.mark.parametrize("sliding_window", [None, 128])
+def test_padded_training_row_matches_unpadded(sliding_window):
+    _, sink = _mods()
+    pad = 64
+    attn = _attn(sliding_window)
+    q, k, v = _qkv()
+    mask = torch.ones(2, 384, dtype = torch.long, device = "cuda")
+    mask[0, :pad] = 0
+    out = sink.flex_attention_with_sink(attn, q, k, v, attention_mask = mask)
+    out.float().square().sum().backward()
+    ref_q, ref_k, ref_v = [x.detach()[:1, :, pad:].clone().requires_grad_() for x in (q, k, v)]
+    ref = sink.flex_attention_with_sink(attn, ref_q, ref_k, ref_v)
+    ref.float().square().sum().backward()
+    tol = dict(atol = 2e-2, rtol = 2e-2)
+    torch.testing.assert_close(out[0, pad:], ref[0], **tol)
+    assert torch.equal(out[0, :pad], torch.zeros_like(out[0, :pad]))
+    for x, r in ((q, ref_q), (k, ref_k), (v, ref_v)):
+        assert torch.isfinite(x.grad).all()
+        torch.testing.assert_close(x.grad[:1, :, pad:], r.grad, **tol)
+        assert not x.grad[0, :, :pad].any()
+
+
+@cuda
+@pytest.mark.parametrize("sliding_window", [None, 128])
 def test_broadcast_mask_equals_full_mask(sliding_window):
     utils, _ = _mods()
     mm = utils.generate_sliding_window_mask(sliding_window) if sliding_window else utils.causal_mask
