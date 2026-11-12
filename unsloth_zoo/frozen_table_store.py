@@ -146,6 +146,9 @@ def _checkpoint_files(source: Union[str, Sequence[str]]) -> Tuple[Optional[dict]
     Returns (weight_map or None, files)."""
     if isinstance(source, (list, tuple)):
         files = [str(x) for x in source]
+        indexes = [f for f in files if f.endswith(".json")]
+        if len(indexes) == 1 and len(files) == 1:
+            return _checkpoint_files(indexes[0])
         return None, [f for f in files if f.endswith(".safetensors")]
     source = str(source)
     if os.path.isdir(source):
@@ -191,7 +194,18 @@ def resolve_tensor_locations(
                 continue
             if not ((wanted is not None and name in wanted) or (predicate is not None and predicate(name))):
                 continue
-            begin, end = meta["data_offsets"]
+            begin, end = (int(x) for x in meta["data_offsets"])
+            if meta.get("dtype") not in _ST_DTYPES or not 0 <= begin <= end:
+                raise ValueError(f"Unsloth: {path} has an invalid safetensors entry for {name}: {meta}.")
+            shape = [int(x) for x in meta["shape"]]
+            numel = 1
+            for x in shape:
+                if x < 0:
+                    raise ValueError(f"Unsloth: {path} has a negative dimension for {name}.")
+                numel *= x
+            if numel * _ST_DTYPES[meta["dtype"]][1] != end - begin:
+                raise ValueError(f"Unsloth: {path}: {name} spans {end - begin} bytes, its shape and dtype need "
+                                 f"{numel * _ST_DTYPES[meta['dtype']][1]}.")
             out[name] = TensorLocation(
                 path=os.path.realpath(path),
                 name=name,
@@ -237,8 +251,14 @@ class _MappedFile:
     def __init__(self, path: str):
         self.path = path
         self.fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-        self.size = os.fstat(self.fd).st_size
-        self.mm = mmap.mmap(self.fd, self.size, access=mmap.ACCESS_READ) if self.size else None
+        try:
+            st = os.fstat(self.fd)
+            self.size = st.st_size
+            self.identity = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+            self.mm = mmap.mmap(self.fd, self.size, access=mmap.ACCESS_READ) if self.size else None
+        except BaseException:
+            os.close(self.fd)
+            raise
         self.refs = 0
         self._whole = None
 
@@ -265,24 +285,29 @@ class _MappedFile:
             self.fd = None
 
 
+def _file_identity(path: str):
+    st = os.stat(path)
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
 def _acquire_file(path: str) -> _MappedFile:
     with _FILES_LOCK:
         f = _FILES.get(path)
-        if f is None or f.mm is None:
+        # Keyed by path, but a file replaced at that path (a new save) is a new mapping: never the old inode.
+        if f is None or f.mm is None or f.identity != _file_identity(path):
             f = _FILES[path] = _MappedFile(path)
         f.refs += 1
         return f
 
 
-def _release_files(paths: List[str]):
+def _release_files(files: List["_MappedFile"]):
+    # The mappings themselves, not their paths: a file replaced at the same path is a different mapping.
     with _FILES_LOCK:
-        for p in paths:
-            f = _FILES.get(p)
-            if f is None:
-                continue
+        for f in files:
             f.refs -= 1
             if f.refs <= 0:
-                _FILES.pop(p, None)
+                if _FILES.get(f.path) is f:
+                    _FILES.pop(f.path, None)
                 f.close()
 
 
@@ -312,6 +337,9 @@ def make_view_decode(st_dtype: str):
 def make_fp8_block_decode(block_size: int = 32, weight_plane: str = "weight", scale_plane: str = "scale"):
     """fp8 e4m3 rows times per-block e8m0 scales, exactly DeepseekV41EngramEmbedding.forward:
     ``values.float().unflatten(-1, (-1, block)) * scales.float().unsqueeze(-1)`` (float32 result)."""
+
+    if not (hasattr(torch, "float8_e4m3fn") and hasattr(torch, "float8_e8m0fnu")):
+        raise RuntimeError("Unsloth: this torch has no float8_e4m3fn / float8_e8m0fnu, needed to decode an fp8 table.")
 
     def decode(planes: Dict[str, torch.Tensor], dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         values = planes[weight_plane].view(torch.float8_e4m3fn)
@@ -350,15 +378,21 @@ def _available_host_bytes() -> int:
         return 0
 
 
+_SMALL_TABLE_BYTES = 256 << 20
+
+
 def resolve_frozen_table_mode(table_bytes: int, device: Optional[torch.device] = None, mode: Optional[str] = None) -> str:
     mode = (mode or os.environ.get("UNSLOTH_FROZEN_TABLE", "auto")).strip().lower()
     if mode not in _MODES:
         raise ValueError(f"Unsloth: UNSLOTH_FROZEN_TABLE must be one of {_MODES}, got {mode!r}.")
     if mode != "auto":
         return mode
+    # A small table is an ordinary embedding on any backend (tiny and test models).
+    if table_bytes <= _SMALL_TABLE_BYTES:
+        return "gpu"
     try:
-        if torch.cuda.is_available():
-            dev = device if device is not None and getattr(device, "type", None) == "cuda" else None
+        if torch.cuda.is_available() and (device is None or getattr(device, "type", None) == "cuda"):
+            dev = device
             free, _ = torch.cuda.mem_get_info(dev)
             if table_bytes < 0.05 * free:
                 return "gpu"
@@ -397,7 +431,11 @@ class _Plane:
             if loc.shape[0] and loc.nbytes % loc.shape[0]:
                 raise ValueError(f"Unsloth: {loc.name} size is not a whole number of rows.")
         self.cols = cols
-        self.row_bytes = locations[0].nbytes // max(locations[0].shape[0], 1)
+        width = 1
+        for x in cols:
+            width *= int(x)
+        self.row_bytes = width * _ST_DTYPES[self.st_dtype][1] if self.st_dtype in _ST_DTYPES else \
+            next((loc.nbytes // loc.shape[0] for loc in locations if loc.shape[0]), 0)
         self.locations = list(locations)
         self.shards: List[_Shard] = []
         self.num_rows = sum(loc.shape[0] for loc in locations)
@@ -448,7 +486,7 @@ class FrozenTableStore:
         self._device_planes: Dict[str, torch.Tensor] = {}
         self.madvise_calls: List[Tuple[str, int, int, int]] = []
 
-        paths = []
+        paths, files = [], []
         try:
             for plane in self.planes.values():
                 row = 0
@@ -456,6 +494,7 @@ class FrozenTableStore:
                 for loc in plane.locations:
                     f = _acquire_file(loc.path)
                     paths.append(loc.path)
+                    files.append(f)
                     if loc.offset + loc.nbytes > f.size:
                         raise ValueError(f"Unsloth: {loc.name} extends past the end of {loc.path}.")
                     view = f.whole()[loc.offset: loc.offset + loc.nbytes].view(loc.shape[0], plane.row_bytes) if loc.shape[0] else None
@@ -464,13 +503,17 @@ class FrozenTableStore:
                     row += loc.shape[0]
                 plane.starts = torch.tensor(starts, dtype=torch.int64)
         except Exception:
-            _release_files(paths)
+            _release_files(files)
             raise
         self._paths = paths
-        self._finalizer = weakref.finalize(self, _release_files, list(paths))
-        self._advise()
-        if self.mode == "gpu":
-            self._materialize(device)
+        self._finalizer = weakref.finalize(self, _release_files, list(files))
+        try:
+            self._advise()
+            if self.mode == "gpu":
+                self._materialize(device)
+        except Exception:
+            self.close()
+            raise
 
     # -- construction helpers ------------------------------------------------------------------
     @classmethod
@@ -492,7 +535,7 @@ class FrozenTableStore:
         self._device_planes.clear()
         self._staging.clear()
         if self._pool is not None:
-            self._pool.shutdown(wait=False)
+            self._pool.shutdown(wait=True)   # no worker may still read a descriptor released below
             self._pool = None
         self._finalizer()
 
@@ -664,6 +707,7 @@ class UnslothFrozenTableEmbedding(nn.Module):
         self.table_name = table_name
         self.frozen_table_store: Optional[FrozenTableStore] = None
         self._memo = None
+        self._handle = _register_module(self)
 
     # Upstream forwards read ``self.<table>.weight.device`` to pick where to run the lookup; a
     # meta tensor tells them "not placed", so they leave the ids where they are.
@@ -680,6 +724,12 @@ class UnslothFrozenTableEmbedding(nn.Module):
             raise ValueError(
                 f"Unsloth: frozen table {self.table_name or ''} expects {self.num_embeddings} rows, "
                 f"the checkpoint has {store.num_rows}."
+            )
+        dec = store.decode({k: torch.zeros((1, p.row_bytes), dtype=torch.uint8) for k, p in store.planes.items()}, None)
+        if tuple(dec.shape[1:]) != tuple(self.row_shape):
+            raise ValueError(
+                f"Unsloth: frozen table {self.table_name or ''} rows decode to {tuple(dec.shape[1:])}, "
+                f"expected {tuple(self.row_shape)}."
             )
         self.frozen_table_store = store
         self._memo = None
@@ -718,6 +768,13 @@ class UnslothFrozenTableEmbedding(nn.Module):
         return f"{self.num_embeddings}, {self.embedding_dim}, dtype={self.table_dtype}, store={self.frozen_table_store!r}"
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        # One opaque op: torch.compile (and block compile) sees a lookup of known shape and dtype, not the host-side
+        # unique / page-in / copy, so the caller's graph neither breaks nor recompiles on it.
+        if _LOOKUP_OP is not None:
+            return _LOOKUP_OP(ids, self._handle)
+        return self._lookup(ids)
+
+    def _lookup(self, ids: torch.Tensor) -> torch.Tensor:
         store = self.frozen_table_store
         if store is None:
             raise RuntimeError(
@@ -730,13 +787,14 @@ class UnslothFrozenTableEmbedding(nn.Module):
             with torch.no_grad():
                 return store.gather(ids, dtype=self.table_dtype)
         step = _STEP[0]
-        key = (ids.data_ptr(), ids._version, tuple(ids.shape), tuple(ids.stride()), ids.device, step, self.table_dtype)
+        key = (ids.data_ptr(), ids._version, tuple(ids.shape), tuple(ids.stride()), ids.device, step, self.table_dtype,
+               ids.dtype)
         memo = self._memo
         if memo is not None:
             m_ids, m_snapshot, m_key, m_rows = memo
             if m_key == key or (
                 m_key[2] == key[2] and m_key[4] == key[4] and m_key[5] == step and m_key[6] == key[6]
-                and m_snapshot.dtype == ids.dtype and torch.equal(m_snapshot, ids)
+                and m_key[7] == key[7] and torch.equal(m_snapshot, ids)
             ):
                 _bump(memo_hits=1)
                 return m_rows
@@ -747,6 +805,49 @@ class UnslothFrozenTableEmbedding(nn.Module):
         # (an in-place update of ids must not make the equality check compare the tensor with itself).
         self._memo = (ids, snapshot, key, rows)
         return rows
+
+
+_MODULES: Dict[int, "weakref.ref"] = {}
+_NEXT_HANDLE = [0]
+
+
+def _register_module(module) -> int:
+    with _STATS_LOCK:
+        _NEXT_HANDLE[0] += 1
+        handle = _NEXT_HANDLE[0]
+    _MODULES[handle] = weakref.ref(module, lambda _, h=handle: _MODULES.pop(h, None))
+    return handle
+
+
+def _module_for(handle: int) -> UnslothFrozenTableEmbedding:
+    ref = _MODULES.get(int(handle))
+    module = ref() if ref is not None else None
+    if module is None:
+        raise RuntimeError(f"Unsloth: frozen table handle {handle} has no live module.")
+    return module
+
+
+def _make_lookup_op():
+    custom_op = getattr(getattr(torch, "library", None), "custom_op", None)
+    if custom_op is None:
+        return None
+    try:
+        @custom_op("unsloth_zoo::frozen_table_lookup", mutates_args=())
+        def frozen_table_lookup(ids: torch.Tensor, handle: int) -> torch.Tensor:
+            # A fresh tensor: a custom op's output must not be one it handed out before (the memo's rows).
+            return _module_for(handle)._lookup(ids).clone()
+
+        @frozen_table_lookup.register_fake
+        def _(ids, handle):
+            m = _module_for(handle)
+            return ids.new_empty((*ids.shape, *m.row_shape), dtype=m.table_dtype)
+
+        return frozen_table_lookup
+    except Exception:
+        return None
+
+
+_LOOKUP_OP = _make_lookup_op()
 
 
 def iter_frozen_table_modules(model: nn.Module):
@@ -817,7 +918,7 @@ def _match_plane(module_name: str, keys: List[str], alternatives: Sequence[str])
             )
         items = sorted(scored[0][2])
         idx = [i for i, _ in items]
-        if len(items) > 1 and idx != list(range(len(items))):
+        if rx.groups >= 2 and idx != list(range(len(items))):
             raise RuntimeError(f"Unsloth: frozen table {module_name} shards are not contiguous: {idx[:8]}...")
         prefix = scored[0][1]
         return [(k, k[len(prefix) + 1:]) for _, k in items]
@@ -916,5 +1017,39 @@ def install_frozen_table_load_hook() -> bool:
     _load_pretrained_model._unsloth_frozen_table_hook = True
     _load_pretrained_model.__wrapped__ = original_fn
     PreTrainedModel._load_pretrained_model = staticmethod(_load_pretrained_model)
+    _install_save_guard(PreTrainedModel)
     _LOAD_HOOK_INSTALLED[0] = True
     return True
+
+
+def _check_save_target(model, save_directory):
+    """A full save streams the table from the checkpoint files it was loaded from: writing into that directory
+    would replace those files while they are being read."""
+    sources = {p for _, m in iter_frozen_table_modules(model) if m.frozen_table_store is not None
+               for p in m.frozen_table_store._paths}
+    if not sources or not save_directory or not os.path.isdir(save_directory):
+        return
+    target = os.path.realpath(save_directory)
+    clash = [p for p in sources if os.path.dirname(p) == target]
+    clash += [os.path.join(save_directory, f) for f in os.listdir(save_directory)
+              if os.path.realpath(os.path.join(save_directory, f)) in sources]
+    if clash:
+        raise ValueError(
+            f"Unsloth: {save_directory} holds the checkpoint files this model's frozen table is read from "
+            f"(e.g. {clash[0]}). Save to a different directory."
+        )
+
+
+def _install_save_guard(PreTrainedModel):
+    original = PreTrainedModel.save_pretrained
+    if getattr(original, "_unsloth_frozen_table_guard", False):
+        return
+
+    def save_pretrained(self, save_directory, *args, **kwargs):
+        _check_save_target(self, save_directory)
+        return original(self, save_directory, *args, **kwargs)
+
+    save_pretrained._unsloth_frozen_table_guard = True
+    save_pretrained.__wrapped__ = original
+    save_pretrained.__doc__ = original.__doc__
+    PreTrainedModel.save_pretrained = save_pretrained

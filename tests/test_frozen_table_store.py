@@ -374,6 +374,8 @@ def test_tiny_qwen4_disk_model_saves_and_reloads(tiny_qwen4, monkeypatch, tmp_pa
     model.load_state_dict(model.state_dict())  # the exported shard views load back without unexpected keys
     out = tmp_path / "saved"
     model.save_pretrained(str(out), max_shard_size="40KB")
+    with pytest.raises(ValueError, match="Save to a different directory"):
+        model.save_pretrained(path)   # would overwrite the files the table streams from
     saved = json.loads((out / "model.safetensors.index.json").read_text())["weight_map"]
     assert sorted(k for k in saved if "ngram_embedding" in k) == shard_keys
     ids = torch.randint(3, 1000, (1, 16))
@@ -422,3 +424,47 @@ def test_tiny_qwen4_missing_table_is_loud(tiny_qwen4, monkeypatch, tmp_path):
     monkeypatch.setenv("UNSLOTH_FROZEN_TABLE", "disk")
     with pytest.raises(RuntimeError, match="could not find frozen table"):
         modeling.Qwen4ExpForConditionalGeneration.from_pretrained(str(tmp_path))
+
+
+def test_lookup_compiles_fullgraph_without_recompiles(bf16_table):
+    index, names, full = bf16_table
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk"))
+    torch._dynamo.reset()
+    fn = torch.compile(lambda ids, x: emb(ids) * x, fullgraph=True, backend="aot_eager", dynamic=True)
+    for n in (5, 9, 17):
+        ids = torch.randint(0, full.shape[0], (2, n))
+        assert torch.equal(fn(ids, torch.ones(2, n, 20)), F.embedding(ids, full.float()))
+
+
+def test_direct_bind_checks_the_row_shape(bf16_table):
+    index, names, full = bf16_table
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 7, dtype=torch.float32)
+    with pytest.raises(ValueError, match="rows decode to"):
+        emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk"))
+
+
+def test_a_file_replaced_at_the_same_path_is_mapped_again(tmp_path):
+    shards = [torch.full((3, 4), 1.0, dtype=torch.bfloat16)]
+    index, names = _write_sharded(tmp_path, shards, files=1)
+    first = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk")
+    import os as _os, time as _t
+    _t.sleep(0.01)
+    _write_sharded(tmp_path, [torch.full((3, 4), 7.0, dtype=torch.bfloat16)], files=1)
+    second = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk")
+    assert second.gather(torch.tensor([0])).float().unique().tolist() == [7.0]
+    first.close(), second.close()
+
+
+def test_full_finetuning_keeps_the_ngram_table_trainable_in_auto_mode(monkeypatch):
+    from unsloth_zoo.temporary_patches.qwen4_exp import _ngram_table_wanted
+    monkeypatch.setattr(fts, "_SMALL_TABLE_BYTES", 0)
+    monkeypatch.setattr(fts, "_available_host_bytes", lambda: 1 << 40)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setenv("UNSLOTH_FROZEN_TABLE", "auto")
+    monkeypatch.setenv("UNSLOTH_ENABLE_FULL_FINETUNING", "0")
+    assert _ngram_table_wanted(1000, 16, torch.bfloat16)
+    monkeypatch.setenv("UNSLOTH_ENABLE_FULL_FINETUNING", "1")
+    assert not _ngram_table_wanted(1000, 16, torch.bfloat16)
+    monkeypatch.setenv("UNSLOTH_FROZEN_TABLE", "disk")
+    assert _ngram_table_wanted(1000, 16, torch.bfloat16)
