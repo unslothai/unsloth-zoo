@@ -2263,3 +2263,16 @@ def test_a_rank_with_nothing_to_swap_publishes_a_zero_reservation(monkeypatch):
     monkeypatch.setattr(_mod, "_HOST_SESSION", 0)
     BlockSwap(nn.ModuleList([nn.Linear(4, 4) for _ in range(3)]), 0, device = "cpu")
     assert published == [(1, 0)]
+
+
+def test_a_peer_still_loading_keeps_its_published_reservation(monkeypatch, tmp_path):
+    monkeypatch.setattr(_mod.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    monkeypatch.setenv("MASTER_PORT", "29513")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(_mod, "_HOST_SESSION", 2)
+    ledger = _mod._rank_ledger()
+    (tmp_path / os.path.basename(ledger[0]) / "1").write_text(f"1 {12 * _GiB}")   # peer: still loading, 12 GiB to go
+    assert _mod._others_host_pending(4 * _GiB) == 12 * _GiB
+    (tmp_path / os.path.basename(ledger[0]) / "1").write_text("1 0")              # peer done with that session
+    assert _mod._others_host_pending(4 * _GiB) == 4 * _GiB

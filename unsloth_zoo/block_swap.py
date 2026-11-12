@@ -178,7 +178,9 @@ def _others_host_pending(own):
                 session, nbytes = (int(x) for x in f.read().split())
         except (OSError, ValueError):
             session, nbytes = -1, 0
-        total += own if session < _HOST_SESSION else nbytes
+        # A peer still in an earlier session (loading while this rank already installs) keeps what it published:
+        # its remaining load is still to come, and it will need about as much as this rank for this session too.
+        total += max(own, nbytes) if session < _HOST_SESSION else nbytes
     return total
 
 
@@ -893,7 +895,10 @@ class BlockSwap:
         self._last_peak, self._step_peak = self._step_peak or {}, {}
         self._steps += 1
         if self._steps == 1 and self._tot is not None:
-            # Step 1 includes copies armed at install and warmup: windows start after it.
+            # Step 1 includes copies armed at install and warmup: windows start after it. Wait for its events once,
+            # so none of its samples is still pending (and later counted in the first window) when the baseline is set.
+            for dv in {d for d in self.streams if isinstance(d, torch.device) and d.type == "cuda"} | set(self._peak_devs):
+                torch.cuda.synchronize(dv)
             self._harvest()
             self._seen, self._adapt_seen = dict(self._tot), dict(self._tot)
         elif not self._settled:
