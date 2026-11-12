@@ -439,7 +439,9 @@ class BlockSwap:
                 if p.device.type == "cpu":
                     st = p.data.untyped_storage()
                     host_storages[st.data_ptr()] = st.nbytes()
-        host_loaded = sum(host_storages.values())
+        # A file-backed (mmap) storage is page cache that available RAM already counts: no extra headroom.
+        file_backed = _file_backed_ranges()
+        host_loaded = sum(n for ptr, n in host_storages.items() if not _in_ranges(ptr, file_backed))
         on_host = 0
         if _can_register():
             if os.name != "nt":
@@ -1091,6 +1093,26 @@ def _layer_signature(params):
     return tuple((tuple(p.shape), p.dtype) for _, p in params)
 
 
+def _file_backed_ranges():
+    """[(start, end)] of this process's file-backed mappings (Linux /proc/self/maps); [] elsewhere."""
+    out = []
+    try:
+        with open("/proc/self/maps", "r", encoding = "utf-8", errors = "replace") as f:
+            for line in f:
+                fields = line.split(maxsplit = 5)
+                if len(fields) < 6 or not fields[5].strip().startswith("/") or fields[4] == "0":
+                    continue   # anonymous, [heap], [stack] or a pseudo file (inode 0)
+                lo, hi = (int(x, 16) for x in fields[0].split("-"))
+                out.append((lo, hi))
+    except OSError:
+        return []
+    return out
+
+
+def _in_ranges(ptr, ranges):
+    return any(lo <= ptr < hi for lo, hi in ranges)
+
+
 def _cuda_index(dv):
     """The card index of a CUDA device (a bare "cuda" is the current card); None for anything else."""
     d = torch.device(dv)
@@ -1336,6 +1358,7 @@ class _HostLoad:
         self.layers, self.indices, self.prefixes = None, [], {}
         self.done, self.done_bytes = set(), []
         self.moved_storages = set()
+        self.ratios = {}   # loaded bytes / declared meta bytes, per moved layer
         self.embedding_prefixes, self.embeddings, self.embedding_bytes = {}, [], []
         # Each selected layer's bytes as declared on meta, to scale a loaded layer's size to the others'.
         self.shape_bytes, self.last_done = {}, None
@@ -1364,12 +1387,24 @@ class _HostLoad:
                                        if not (inside and f"{n}.".startswith(inside))}
 
     def _layers_to_come(self, size, ref):
-        """Bytes of the selected layers not moved yet, scaled from layer `ref`, which takes `size` bytes loaded."""
+        """Bytes of the selected layers not moved yet. A layer already materialized counts its own bytes; one still
+        on meta is scaled from its declared size by the smallest storage ratio seen so far (layer `ref` takes
+        `size` bytes loaded), since layers can be quantized differently (skip modules) and each later eviction
+        re-checks with real sizes."""
         left = [j for j in self.indices if j not in self.done]
         base = self.shape_bytes.get(ref, 0)
-        if not base:
-            return [size] * len(left)
-        return [size * self.shape_bytes.get(j, base) // base for j in left]
+        ratios = list(self.ratios.values()) + ([size / base] if base else [])
+        ratio = min(ratios) if ratios else None
+        out = []
+        for j in left:
+            params = _counted_params(self.layers[j])
+            if params and all(p.device.type != "meta" for p in params):
+                out.append(sum(p.nbytes for p in params))
+            elif ratio is None:
+                out.append(size)
+            else:
+                out.append(int(self.shape_bytes.get(j, base) * ratio))
+        return out
 
     def _pending_embedding_bytes(self, skip = None):
         # Streamed tables still to come; a meta weight already knows its size.
@@ -1416,6 +1451,8 @@ class _HostLoad:
                                    if p.device.type != "meta" and id(p) in counted)
         self.done.add(i)
         self.done_bytes.append(size)
+        if self.shape_bytes.get(i):
+            self.ratios[i] = size / self.shape_bytes[i]
         self.last_done = i
 
     def on_param(self, model, target_name):

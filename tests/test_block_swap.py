@@ -1891,3 +1891,34 @@ def test_pool_growth_counts_the_allocator_high_water_mark(monkeypatch):
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda dv = None: total)
     assert sw._grow_pool() is False
     sw.remove()
+
+
+def test_file_backed_cpu_storage_is_not_credited(tmp_path):
+    import sys, pytest
+    if not sys.platform.startswith("linux"):
+        pytest.skip("/proc/self/maps is Linux only")
+    path = tmp_path / "w.bin"
+    path.write_bytes(b"\0" * (1 << 20))
+    mapped = torch.from_file(str(path), shared = True, size = 1 << 20, dtype = torch.uint8)
+    ranges = _mod._file_backed_ranges()
+    assert _mod._in_ranges(mapped.untyped_storage().data_ptr(), ranges)
+    anon = torch.empty(1 << 20, dtype = torch.uint8)
+    assert not _mod._in_ranges(anon.untyped_storage().data_ptr(), ranges)
+
+
+def test_layers_to_come_uses_real_bytes_and_the_smallest_ratio():
+    class Layer(nn.Module):
+        def __init__(self, device):
+            super().__init__()
+            self.w = nn.Linear(64, 64, bias = False, device = device)
+
+    meta = 64 * 64 * 4
+    state = _mod._HostLoad([0, 1, 2, 3], "tail")
+    state.layers = nn.ModuleList([Layer("cpu"), Layer("meta"), Layer("meta"), Layer("cpu")])
+    state.indices = [0, 1, 2, 3]
+    state.shape_bytes = {i: meta for i in range(4)}
+    # Layer 0 moved at full size (a skip module kept it 16-bit); the layer being loaded now is 4-bit (1/4).
+    state.done, state.ratios = {0}, {0: 1.0}
+    out = state._layers_to_come(meta // 4, 1)
+    # Layer 1 and 2 (meta) take the smallest ratio seen, layer 3 is materialized: its own bytes.
+    assert out == [meta // 4, meta // 4, meta]
