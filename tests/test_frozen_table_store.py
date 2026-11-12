@@ -515,3 +515,40 @@ def test_exported_tensors_outlive_the_store(bf16_table):
     del emb
     gc.collect()
     assert torch.equal(torch.cat([t.clone() for t in sd.values()]), full)   # still mapped, no dangling pointer
+
+
+def test_pinned_staging_is_owned_by_one_gather_at_a_time(bf16_table, monkeypatch):
+    import threading
+    index, names, full = bf16_table
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk")
+    inside, overlap = [0], [False]
+    real = store._gather_raw_unique
+
+    def spy(*a, **k):
+        inside[0] += 1
+        overlap[0] |= inside[0] > 1
+        try:
+            __import__("time").sleep(0.01)
+            return real(*a, **k)
+        finally:
+            inside[0] -= 1
+    monkeypatch.setattr(store, "_gather_raw_unique", spy)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(store, "_staging_buffer", lambda plane, rows, pin: torch.empty((rows, plane.row_bytes), dtype=torch.uint8))
+    dev = torch.device("cuda", 0)
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, *a, **k: self)
+
+    class _Dev:
+        def __init__(self, d): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    class _Ev:
+        def record(self, *a): pass
+    monkeypatch.setattr(torch.cuda, "device", _Dev)
+    monkeypatch.setattr(torch.cuda, "Event", _Ev)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda d=None: None)
+    threads = [threading.Thread(target=store.gather_raw_unique, args=(torch.tensor([1, 2, 3]), dev)) for _ in range(4)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert not overlap[0]

@@ -489,6 +489,7 @@ class FrozenTableStore:
         self._pool = None
         self._staging: Dict[Tuple[str, torch.device], torch.Tensor] = {}
         self._staging_event = None
+        self._staging_lock = threading.Lock()
         self._device_planes: Dict[str, torch.Tensor] = {}
         self.madvise_calls: List[Tuple[str, int, int, int]] = []
 
@@ -652,6 +653,14 @@ class FrozenTableStore:
     def gather_raw_unique(self, uniq_cpu: torch.Tensor, device: torch.device) -> Dict[str, torch.Tensor]:
         """Raw uint8 rows for sorted unique int64 CPU ids, on ``device``."""
         pin = device.type == "cuda" and torch.cuda.is_available()
+        if not pin:
+            return self._gather_raw_unique(uniq_cpu, device, False)
+        # The pinned staging buffers are shared by every caller of this store (threads, deep copies): one gather owns
+        # them from acquisition until the event fencing its copies out of them is recorded.
+        with self._staging_lock:
+            return self._gather_raw_unique(uniq_cpu, device, True)
+
+    def _gather_raw_unique(self, uniq_cpu: torch.Tensor, device: torch.device, pin: bool) -> Dict[str, torch.Tensor]:
         out = {}
         for name, plane in self.planes.items():
             if name in self._device_planes:
