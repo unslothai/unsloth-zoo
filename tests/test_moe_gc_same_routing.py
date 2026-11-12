@@ -151,27 +151,85 @@ def test_mismatched_entry_falls_back():
 
 
 def test_dense_weights_straight_through():
-    """GPT-OSS hands dense [T, E] scores: values from the first pass, gradient through the replay's scores."""
+    """GPT-OSS hands dense [T, E] scores: values from the first pass; the gradient goes through the replay's scores
+    only for a token whose replay picked the same expert set."""
     idx0 = torch.tensor([[0, 1], [2, 3]])
     w0 = torch.tensor([[0.6, 0.4, 0.0, 0.0], [0.0, 0.0, 0.7, 0.3]])
-    idx1 = torch.tensor([[0, 2], [2, 3]])
+    idx1 = torch.tensor([[0, 2], [3, 2]])  # token 0 changed set, token 1 same set in another order
     w1 = torch.tensor([[0.5, 0.0, 0.5, 0.0], [0.0, 0.0, 0.6, 0.4]], requires_grad = True)
     out = gcm._blend_checkpoint_routing(idx1, w1, idx0, w0)
     assert torch.equal(out.detach(), w0)
     out.sum().backward()
-    assert torch.equal(w1.grad, torch.ones_like(w1))
+    assert torch.equal(w1.grad, torch.tensor([[0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0]]))
 
 
 def test_aligned_weights_slot_matching():
-    idx0 = torch.tensor([[3, 1]])
-    w0 = torch.tensor([[0.7, 0.3]])
-    idx1 = torch.tensor([[1, 5]])         # expert 1 kept (other slot), expert 3 dropped
-    w1 = torch.tensor([[0.4, 0.6]], requires_grad = True)
+    idx0 = torch.tensor([[3, 1], [3, 1]])
+    w0 = torch.tensor([[0.7, 0.3], [0.7, 0.3]])
+    # Token 0: same set, slots swapped. Token 1: expert 3 dropped, expert 5 replay-only.
+    idx1 = torch.tensor([[1, 3], [1, 5]])
+    w1 = torch.tensor([[0.4, 0.6], [0.4, 0.6]], requires_grad = True)
     out = gcm._blend_checkpoint_routing(idx1, w1, idx0, w0)
     assert torch.equal(out.detach(), w0)
-    (out * torch.tensor([[10.0, 1.0]])).sum().backward()
-    # Slot of expert 1 (stored slot 1, multiplier 1) maps to replay slot 0; expert 5 takes nothing.
-    assert torch.equal(w1.grad, torch.tensor([[1.0, 0.0]]))
+    (out * torch.tensor([[10.0, 1.0], [10.0, 1.0]])).sum().backward()
+    # Token 0: expert 3 (stored slot 0, x10) is replay slot 1, expert 1 (x1) is replay slot 0. Token 1: no gradient.
+    assert torch.equal(w1.grad, torch.tensor([[1.0, 10.0], [0.0, 0.0]]))
+
+
+def _softmax_topk_renorm(logits, k, index = None):
+    """Qwen3-MoE routing: softmax over experts, top-k (or the given ids), renormalized over the chosen set."""
+    probs = torch.softmax(logits, dim = -1)
+    if index is None:
+        _, index = torch.topk(probs, k, dim = -1)
+    picked = probs.gather(-1, index)
+    return index, picked / picked.sum(-1, keepdim = True)
+
+
+def test_same_set_gradient_matches_the_fixed_expert_oracle_fp64():
+    """Same expert set in another slot order: the blended weights' router gradient equals the oracle that
+    renormalizes the replay's probabilities over the first pass's ids."""
+    torch.manual_seed(0)
+    logits = torch.randn(5, 6, dtype = torch.float64)
+    idx0, w0 = _softmax_topk_renorm(logits, 3)
+    out_w = torch.randn(5, 3, dtype = torch.float64)
+    replay = logits.clone().requires_grad_(True)
+    idx1, w1 = _softmax_topk_renorm(replay, 3)
+    idx1, w1 = idx1.flip(-1), w1.flip(-1)                     # same set, other slot order
+    (gcm._blend_checkpoint_routing(idx1, w1, idx0, w0) * out_w).sum().backward()
+    oracle = logits.clone().requires_grad_(True)
+    (_softmax_topk_renorm(oracle, 3, idx0)[1] * out_w).sum().backward()
+    torch.testing.assert_close(replay.grad, oracle.grad, rtol = 0, atol = 1e-12)
+
+
+def test_changed_set_sends_no_gradient_to_a_replay_only_expert_fp64():
+    """Review repro: forward picks experts [0, 1], a 2e-7 nudge makes the replay pick [0, 2]. The replay's weights are
+    normalized over expert 2, which the loss never used, so no router gradient may come from them."""
+    logits = torch.tensor([[1.0, 0.5, 0.5 - 1e-7]], dtype = torch.float64)
+    idx0, w0 = _softmax_topk_renorm(logits, 2)
+    assert idx0.tolist() == [[0, 1]]
+    replay = (logits + torch.tensor([[0.0, 0.0, 2e-7]], dtype = torch.float64)).requires_grad_(True)
+    idx1, w1 = _softmax_topk_renorm(replay, 2)
+    assert idx1.tolist() == [[0, 2]]
+    out = gcm._blend_checkpoint_routing(idx1, w1, idx0, w0)
+    assert torch.equal(out.detach(), w0)
+    (out * torch.tensor([[2.0, 5.0]], dtype = torch.float64)).sum().backward()
+    assert torch.equal(replay.grad, torch.zeros_like(replay.grad))
+
+
+def test_constant_expert_outputs_give_zero_input_gradient_fp64():
+    """Review oracle: every expert outputs 1, so the routed mixture is identically 1 and its gradient through the
+    routing must be 0 whatever the replay picks."""
+    torch.manual_seed(0)
+    x = torch.randn(64, H, dtype = torch.float64)
+    router = torch.randn(H, E, dtype = torch.float64)
+    swing = torch.randn(E, dtype = torch.float64) * 3.0
+    idx0, w0 = _softmax_topk_renorm(x @ router, K)
+    xr = x.clone().requires_grad_(True)
+    idx1, w1 = _softmax_topk_renorm(xr @ router + swing, K)
+    assert not torch.equal(idx0.sort(-1).values, idx1.sort(-1).values)   # some tokens changed set
+    out = gcm._blend_checkpoint_routing(idx1, w1, idx0, w0)
+    out.sum().backward()
+    assert xr.grad.abs().max().item() < 1e-12
 
 
 @pytest.mark.parametrize("backend", ["aot_eager", "inductor"])

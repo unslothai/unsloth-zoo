@@ -880,19 +880,25 @@ _moe_checkpoint_route_op = _register_moe_checkpoint_route_op()
 
 
 def _blend_checkpoint_routing(top_k_index, top_k_weights, index, weights):
-    """Routing weights with the first pass's values and the replay's gradient.
+    """Routing weights with the first pass's values and, where it is exact, the replay's gradient.
 
-    ``weights`` (first pass, no grad) give the values. The gradient flows through the replay's
-    weight of the same expert: aligned [T, k] weights are matched slot by slot (a slot whose expert
-    the replay did not pick keeps the stored value and takes no router gradient); dense [T, E]
-    weights line up already. When nothing changed (``index`` equals ``top_k_index``) the values are
-    bitwise ``top_k_weights`` and so is the gradient."""
+    ``weights`` (first pass, no grad) give the values. A token whose replay picked the same expert set
+    (in any slot order) takes the replay's gradient, matched slot by slot: the same set under the same
+    normalization is the same differentiable function, so the gradient is exact. A token whose replay
+    picked a different set takes no router gradient: the replay's weights are normalized over experts
+    the loss never used, so their gradient would reach an expert the first pass did not select, and the
+    first pass's set has no differentiable weights here. Aligned [T, k] weights are matched per slot;
+    dense [T, E] weights line up already. When nothing changed (``index`` equals ``top_k_index``) the
+    values are bitwise ``top_k_weights`` and so is the gradient."""
     if top_k_weights.shape == top_k_index.shape:
         match = index.unsqueeze(-1) == top_k_index.unsqueeze(-2)          # [T, k, k]
+        same_set = match.any(-1).all(-1, keepdim = True)                   # [T, 1]
         aligned = (match.to(top_k_weights.dtype) * top_k_weights.unsqueeze(-2)).sum(-1)
         delta = aligned - aligned.detach()
-        return weights + torch.where(match.any(-1), delta, torch.zeros_like(delta))
-    return weights + (top_k_weights - top_k_weights.detach())
+    else:
+        same_set = (index.sort(-1).values == top_k_index.sort(-1).values).all(-1, keepdim = True)
+        delta = top_k_weights - top_k_weights.detach()
+    return weights + torch.where(same_set, delta, torch.zeros_like(delta))
 
 
 def moe_checkpoint_routing(module, top_k_index, top_k_weights):
