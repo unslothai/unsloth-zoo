@@ -2225,3 +2225,33 @@ def test_an_in_flight_wait_only_sample_is_kept():
     block.marks[1].done = True
     _mod.BlockSwap._harvest(fake)
     assert block.mark_open == 0 and fake._tot["stall_ms"] == 2.0
+
+
+def test_block_swap_gives_no_credit_for_a_storage_several_layers_view(monkeypatch):
+    import sys, os, pytest
+    if not torch.cuda.is_available() or os.name == "nt" or not _mod._can_register():
+        pytest.skip("needs CUDA")
+    # Six host layers whose weights are views into one storage: it stays resident until the last is packed.
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)])
+    blocks[:2].cuda()
+    big = torch.zeros(6 * 2 * 256 * 256)
+    for k, b in enumerate(blocks[2:]):
+        for j, lin in enumerate((b.w, b.c)):
+            off = (2 * k + j) * 256 * 256
+            lin.weight = nn.Parameter(big[off:off + 256 * 256].view(256, 256), requires_grad = False)
+        b.lora.data = b.lora.data.cpu()
+    need = sum(p.numel() * p.element_size() for b in blocks[2:] for p in b.parameters())
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(need // 2))
+    with pytest.raises(ValueError, match = "offload_layers asked for 6 layers"):
+        BlockSwap(blocks, 6, device = "cuda")
+
+
+def test_deferred_first_release_re_arms_the_next_forward():
+    armed = []
+    fake = types.SimpleNamespace(_auto = False, _settled = True, blocks = [object()], _step_queued = True)
+    fake._release = lambda b: None
+    fake._arm = lambda forward: armed.append(forward)
+    fake._end_step = lambda: armed.append("end")
+    _mod.BlockSwap._bwd(fake, 0)(None)
+    assert armed == [True]

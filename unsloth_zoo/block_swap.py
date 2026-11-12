@@ -558,12 +558,24 @@ class BlockSwap:
         # The chunked fallback allocates one chunk at a time and releases each block's original right after
         # packing it, so on top of the originals it holds at most one chunk and the block being packed.
         # Per storage: a CPU tensor shared by several selected layers is released (and credited) once.
-        host_storages = {}
-        for layer in swapped:
+        # A storage is freed only once every tensor on it is gone: credit only one that lives in a single swapped
+        # layer's swappable weights (a 10 GiB storage viewed by ten layers stays resident until the last is packed,
+        # and one also viewed from outside the swapped weights is never freed by packing).
+        host_storages, users = {}, {}
+        for li, layer in enumerate(swapped):
             for _, p in _swappable(layer):
                 if p.device.type == "cpu":
                     st = p.data.untyped_storage()
                     host_storages[st.data_ptr()] = st.nbytes()
+                    users.setdefault(st.data_ptr(), set()).add(li)
+        swapped_ids = {id(p) for layer in swapped for _, p in _swappable(layer)}
+        everything = model.parameters() if model is not None else (q for layer in layers for q in layer.parameters())
+        for q in everything:
+            if q.device.type == "cpu" and id(q) not in swapped_ids:
+                ptr = q.data.untyped_storage().data_ptr()
+                if ptr in users:
+                    users[ptr].add(-1)
+        host_storages = {ptr: n for ptr, n in host_storages.items() if len(users[ptr]) == 1}
         # A file-backed (mmap) storage is page cache that available RAM already counts: no extra headroom.
         file_backed = _file_backed_ranges()
         host_loaded = sum(n for ptr, n in host_storages.items() if not _in_ranges(ptr, file_backed))
@@ -848,12 +860,20 @@ class BlockSwap:
             # The output's grad hook already queued the step end from the outer graph (see _output_peak).
             if i == 0 and not self._step_queued:
                 self._end_step()
+            elif i == 0:
+                # A deferred release (a first swapped layer whose input needs no grad) can run after the queued
+                # _end_step armed the next forward while this block was still resident: arm again, no new step.
+                self._arm(forward = True)
         return _opaque(hook)
 
     def _clear_step_queued(self):
         self._step_queued = False
 
     def _end_step(self):
+        # Backward is done: a wait sample whose forward hook never ran (a recompute that stopped early) is complete.
+        for b in self.blocks:
+            if getattr(b, "marks", None) is not None and getattr(b, "mark_open", 0) == 1:
+                b.mark_open = 3
         if self._step_queued:
             # Queued from the output's grad hook: a deferred _bwd(0) release (a first swapped layer whose input
             # needs no grad) runs later in the same backward's final callbacks and must not end the step again.
