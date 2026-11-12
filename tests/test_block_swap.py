@@ -2383,8 +2383,9 @@ def test_install_holds_no_reference_to_a_credited_storage_while_packing(monkeypa
     blocks = nn.ModuleList([_XBlock(256) for _ in range(4)]).cuda()
     big = np.zeros(8 * 256 * 256, dtype = np.float32)       # a larger storage the last block's weight views
     gone = weakref.ref(big)
+    # Both frozen weights view it, so it is the last storage the credit scan looks at.
     blocks[3].w.weight.data = torch.from_numpy(big)[:256 * 256].view(256, 256)
-    blocks[3].c.weight.data = blocks[3].c.weight.data.cpu()
+    blocks[3].c.weight.data = torch.from_numpy(big)[256 * 256:2 * 256 * 256].view(256, 256)
     blocks[3].lora.data = blocks[3].lora.data.cpu()
     del big
     seen = {}
