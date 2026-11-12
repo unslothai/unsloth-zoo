@@ -150,11 +150,17 @@ def patch_qwen4_exp():
     except Exception:
         return
 
-    if os.environ.get("UNSLOTH_FROZEN_TABLE", "auto").strip().lower() != "gpu":
+    table_mode = os.environ.get("UNSLOTH_FROZEN_TABLE", "auto").strip().lower()
+    if table_mode != "gpu":
         try:
             patch_qwen4_exp_frozen_table(modeling)
         except Exception as e:
-            # Loud: without the patch the 102 GB table is concatenated in host RAM.
+            # Without the patch the 102 GB table is concatenated in host RAM: an explicit disk / ram request
+            # must not silently become that.
+            if table_mode in ("disk", "ram"):
+                raise RuntimeError(
+                    f"Unsloth: UNSLOTH_FROZEN_TABLE={table_mode} but the Qwen4Exp n-gram table patch failed: {e}"
+                ) from e
             logger.warning(f"Unsloth: Qwen4Exp frozen n-gram table patch failed ({e}); the table will load into RAM.")
 
     indexer_cls = getattr(modeling, "Qwen4ExpTextQSAIndexer", None)
