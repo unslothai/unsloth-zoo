@@ -419,7 +419,7 @@ def patch_CsmForConditionalGeneration_forward():
                 if depth_num_items_in_batch is not None:
                     depth_decoder_kwargs["num_items_in_batch"] = depth_num_items_in_batch
                 elif "num_items_in_batch" in depth_decoder_kwargs:
-                    depth_decoder_kwargs["num_items_in_batch"] *= self.config.num_codebooks - 1
+                    depth_decoder_kwargs["num_items_in_batch"] = depth_decoder_kwargs["num_items_in_batch"] * (self.config.num_codebooks - 1)
 
                 depth_decoder_kwargs.pop('return_dict', None)
                 # Move output_attentions/output_hidden_states (transformers 4.54 deletes them)

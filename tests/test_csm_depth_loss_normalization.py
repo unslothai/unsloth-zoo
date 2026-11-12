@@ -93,10 +93,13 @@ def test_direct_call_scales_by_num_codebooks():
     model = _tiny_csm()
     w = _windows()[1]
     frames = int((w["labels3d"][..., 1:] != -100).all(-1).sum())
+    shared = torch.tensor(frames)
     with torch.no_grad():
         mean = _depth_losses(model, [w])[0]
-        got = _depth_losses(model, [w], num_items_in_batch = lambda w: torch.tensor(frames))[0]
+        got = _depth_losses(model, [w], num_items_in_batch = lambda w: shared)[0]
     torch.testing.assert_close(got, mean)
+    # Trainer hands every microbatch the same tensor: the backbone divisor must survive.
+    assert int(shared) == frames
 
 
 def test_distributed_depth_count_rides_the_single_gather():
