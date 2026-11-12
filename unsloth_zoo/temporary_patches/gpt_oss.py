@@ -50,6 +50,14 @@ try:
 except Exception:
     def _fused_route_or_none(*args, **kwargs):
         return None
+def _checkpoint_routing(module, router_indices, routing_weights):
+    # Imported at call time (like forward_moe_backend): importing gradient_checkpointing with this module would
+    # fix its autocast device before the caller (a test, or a late device setup) has chosen one.
+    try:
+        from unsloth_zoo.gradient_checkpointing import moe_checkpoint_routing
+    except ImportError:
+        return router_indices, routing_weights
+    return moe_checkpoint_routing(module, router_indices, routing_weights)
 from .gpt_oss_routed import (
     ROUTED_MAX_SLOTS, prepare_routed_experts, routed_decode_epoch, routed_experts_forward, routed_mlp_forward,
 )
@@ -1358,6 +1366,7 @@ def patch_gpt_oss_compiler_exports():
     m.transformers_version = transformers_version
     m.Version = Version
     m._IS_TRANSFORMERS_V5 = _IS_TRANSFORMERS_V5
+    m._checkpoint_routing = _checkpoint_routing
 TEMPORARY_PATCHES.append(patch_gpt_oss_compiler_exports)
 
 
@@ -1453,6 +1462,7 @@ class GptOssExperts(nn.Module):
         self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None
     ) -> torch.Tensor:
         """Forward using grouped_mm or loop fallback with LoRA support."""
+        router_indices, routing_weights = _checkpoint_routing(self, router_indices, routing_weights)
         if _check_torch_grouped_mm_supported():
             return forward_native_grouped_mm(self, hidden_states, router_indices, routing_weights)
         return torch_native_forward(self, hidden_states, router_indices, routing_weights)
@@ -1670,6 +1680,7 @@ class GptOssExpertsBnb4bit(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
+        router_indices, routing_weights = _checkpoint_routing(self, router_indices, routing_weights)
         batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
         num_tokens = hidden_states.shape[0]
@@ -2701,6 +2712,16 @@ def patch_gpt_oss_moe_for_lora():
         # activation, biases, and the separated LoRA stash.
         forward = forward_native_moe_loop
 
+    backend_forward = forward
+
+    def forward(self, hidden_states, router_indices = None, routing_weights = None):
+        # These backends are also reached from forward_moe_backend, which applies the routing hook itself, so the
+        # hook goes here (once per experts call) and not inside them: a checkpoint replay must use the first
+        # pass's routing.
+        router_indices, routing_weights = _checkpoint_routing(self, router_indices, routing_weights)
+        return backend_forward(self, hidden_states, router_indices, routing_weights)
+
+    forward.__wrapped__ = backend_forward
     # Store original forward and patch - but DON'T replace the class!
     GptOssExpertsClass._original_forward = GptOssExpertsClass.forward
     GptOssExpertsClass.forward = forward
@@ -3221,6 +3242,8 @@ def torch_native_forward(
     routing_weights = None
 ) -> torch.Tensor:
 
+    # The active GptOssExpertsBnb4bit forward (rebound below): the checkpoint replay must use the first pass's routing.
+    router_indices, routing_weights = _checkpoint_routing(self, router_indices, routing_weights)
     batch_size = hidden_states.shape[0]
     hidden_states = hidden_states.reshape(-1, self.hidden_size)
     num_tokens = hidden_states.shape[0]

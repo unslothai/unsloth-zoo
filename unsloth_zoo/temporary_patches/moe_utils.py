@@ -2255,6 +2255,17 @@ def forward_moe_backend(
     # helpers don't resolve (only the dispatcher is copied).
     # Keep `except ImportError` around ONLY the import; runtime errors in the
     # bnb4bit/fp8 path must propagate, not fall through to a crashing backend.
+    # Under Unsloth gradient checkpointing the backward replay takes the routing the first
+    # (no-grad) pass used: the two passes run differently compiled graphs that can round a
+    # router input across a top-k boundary.
+    moe_checkpoint_routing = None
+    try:
+        from unsloth_zoo.gradient_checkpointing import moe_checkpoint_routing
+    except ImportError:
+        pass
+    if moe_checkpoint_routing is not None:
+        top_k_index, top_k_weights = moe_checkpoint_routing(self, top_k_index, top_k_weights)
+
     _moe_uses_bnb4bit_expert_weights = forward_moe_backend_bnb4bit = None
     try:
         from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import (
@@ -4108,8 +4119,13 @@ def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, arg
     # routed gpt-oss decode path (sm80+ CUDA): the experts forward would not run and the verdict would read
     # "stash unread" for a forward that reads it.
     _mark_inner_expert_wrappers(wrapper)
+    # A throwaway forward: it must not leave its routing for a gradient checkpoint replay.
     try:
-        with _preserved_rng_for_probe(x), _parametrize_cache_untouched():
+        from unsloth_zoo.gradient_checkpointing import suspended_checkpoint_routing
+    except ImportError:
+        suspended_checkpoint_routing = contextlib.nullcontext
+    try:
+        with _preserved_rng_for_probe(x), _parametrize_cache_untouched(), suspended_checkpoint_routing():
             with torch.no_grad():
                 wrapper.base_layer(x, *args, **kwargs)
     except Exception:
