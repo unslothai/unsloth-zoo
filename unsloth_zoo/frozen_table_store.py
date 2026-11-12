@@ -317,6 +317,12 @@ _MODES = ("auto", "disk", "ram", "gpu")
 
 
 def _available_host_bytes() -> int:
+    # psutil capped by an enforcing cgroup limit (a container's RAM, not the host's); works on Windows and macOS.
+    try:
+        from unsloth_zoo.memory_budget import host_memory_bytes
+        return int(host_memory_bytes()[1])
+    except Exception:
+        pass
     try:
         with open("/proc/meminfo") as f:
             for line in f:
