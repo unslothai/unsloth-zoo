@@ -749,11 +749,12 @@ class BlockSwap:
     def _publish_packed(self, k):
         # Blocks 0..k are packed and their originals released; free RAM already shows what that took. Other local
         # ranks hold back only the rise still to come over this point of the walk install planned, chunk padding
-        # already committed included, not a share of the first estimate.
+        # already committed included, not a share of the first estimate. Not capped at the first estimate either:
+        # releasing a storage larger than its block raises free RAM, and the blocks still to pack need it back.
         own = getattr(self, "_host_own", None)
         walk = getattr(self, "_host_walk", None)
         if own is not None and walk is not None:
-            _publish_host_pending(min(own, walk.pending(k)))
+            _publish_host_pending(walk.pending(k))
 
     def _pack_registered(self):
         # One exact-size pageable arena, page-locked in place up to the budget (cudaHostRegister).

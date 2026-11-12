@@ -2195,6 +2195,24 @@ def test_a_large_storage_released_last_is_not_credited_up_front():
     assert walk.pending(-1) == 11 * _GiB
 
 
+def test_an_oversized_release_raises_the_published_reservation():
+    # A 1 GiB CPU view of a 10 GiB storage packed first, then ten 1 GiB GPU blocks: install plans a 2 GiB peak,
+    # but once that storage is gone free RAM is 9 GiB higher and all ten GPU blocks are still to commit.
+    walk = _mod._HostWalk([(k + 1) * _GiB for k in range(11)], [10 * _GiB] + [0] * 10, _GiB)
+    assert walk.pending(-1) == 2 * _GiB
+    assert walk.pending(0) == 11 * _GiB
+    published = []
+    import types
+    fake = types.SimpleNamespace(_host_own = walk.pending(-1), _host_walk = walk)
+    orig = _mod._publish_host_pending
+    try:
+        _mod._publish_host_pending = published.append
+        _mod.BlockSwap._publish_packed(fake, 0)
+    finally:
+        _mod._publish_host_pending = orig
+    assert published == [11 * _GiB]
+
+
 def test_committed_chunk_padding_is_not_reserved_again():
     # 32 blocks of 3 GiB in 4 GiB chunks: 128 GiB in all. With half packed, 64 GiB is committed (padding
     # included), so 64 GiB is still to come, not 128 - 48.
