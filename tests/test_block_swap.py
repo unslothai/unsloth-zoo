@@ -679,8 +679,9 @@ def test_layer_accelerate_left_on_meta_is_refused_before_anything_is_hooked():
 
 
 def test_shared_weight_left_on_meta_is_not_refused():
+    import pytest
     if not torch.cuda.is_available():
-        return
+        pytest.skip("BlockSwap needs a CUDA device")
     # Block Swap never manages a weight two layers share, so accelerate keeps serving it.
     shared = nn.Linear(8, 8, bias = False, device = "meta")
     layers = nn.ModuleList([nn.Sequential(nn.Linear(8, 8), shared) for _ in range(3)]).requires_grad_(False)
