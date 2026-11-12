@@ -1539,6 +1539,74 @@ def test_prefill_consumers_forward_the_loaded_model(monkeypatch, consumer):
     with pytest.raises(Reached): globals()[consumer]() if consumer else session.add(GenerationRequest(prompt="p"))
 
 
+@pytest.mark.parametrize("vlm", [False, True])
+def test_public_generate_caps_prefill_to_the_auto_offload_plan(monkeypatch, vlm):
+    import unsloth_zoo.mlx.loader as loader
+    seen = []
+
+    def stream_generate(*args, prefill_step_size = None, **kwargs):
+        seen.append(prefill_step_size)
+        yield types.SimpleNamespace(token = 2, finish_reason = "stop")
+
+    monkeypatch.setattr(importlib.import_module("mlx_vlm" if vlm else "mlx_lm"), "stream_generate", stream_generate)
+    tokenizer = types.SimpleNamespace(bos_token = None, eos_token_ids = {2})
+    model = types.SimpleNamespace(_tokenizer = tokenizer, _is_vlm_model = vlm, _unsloth_auto_prefill_step = 2048,
+                                  _processor = types.SimpleNamespace(tokenizer = tokenizer), config = None)
+    call = loader._mlx_generate_vlm if vlm else loader._mlx_generate
+    with pytest.warns(UserWarning, match = "8192 to 2048"):
+        call(model, input_ids = [[1, 3]], max_new_tokens = 1, prefill_step_size = 8192)
+    call(model, input_ids = [[1, 3]], max_new_tokens = 1, prefill_step_size = 512)
+    assert seen == [2048, 512]
+
+
+def test_a_failed_range_read_returns_only_after_every_worker_left_its_views(monkeypatch):
+    offload = pytest.importorskip("unsloth_zoo.mlx.offload")
+    done, release = [], threading.Event()
+
+    def read_all(fd, view, offset):
+        if offset == 0:
+            raise OSError("EIO")
+        release.wait(5)
+        done.append(offset)
+
+    monkeypatch.setattr(offload, "_read_all", read_all)
+    jobs = [(0, offset, None) for offset in range(offload._SERIAL_READS + 8)]
+    threading.Timer(0.2, release.set).start()
+    with pytest.raises(OSError, match = "EIO"):
+        offload.read_ranges(jobs)
+    assert sorted(done) == list(range(1, len(jobs)))
+
+
+def test_the_causal_launch_probe_fills_staged_rows_before_it_evaluates(monkeypatch):
+    inference = pytest.importorskip("unsloth_zoo.mlx.inference")
+    mx = pytest.importorskip("mlx.core")
+    order = []
+    monkeypatch.setattr(inference, "_staged_ready", lambda: order.append("fill"))
+    monkeypatch.setattr(inference, "_exact_attention_rows", lambda *a: (order.append("build"), mx.zeros((1,)))[1])
+    assert inference._launched_rows(None, None, None, 1.0, None) is not None and order == ["fill", "build"]
+
+
+def test_the_fused_gated_delta_step_refuses_a_cache_overriding_its_updates(monkeypatch):
+    inference = pytest.importorskip("unsloth_zoo.mlx.inference")
+    mx = pytest.importorskip("mlx.core")
+    ArraysCache = pytest.importorskip("mlx_vlm.models.cache").ArraysCache
+    monkeypatch.setattr(inference, "_gdn_block_fits", lambda *a: True)
+    layer, inputs = types.SimpleNamespace(conv_kernel_size = 4, conv_dim = 8), mx.zeros((1, 1, 8))
+    cache = ArraysCache(2)
+    cache[0], cache[1] = mx.zeros((1, 3, 8)), mx.zeros((1, 2))
+    assert inference._decode_gdn_fits(layer, inputs, None, cache)
+    for name in ("update_window", "update_recurrent"):
+        setattr(cache, name, getattr(cache, name))
+        assert not inference._decode_gdn_fits(layer, inputs, None, cache)
+        delattr(cache, name)
+
+
+def test_verifier_code_names_hold_without_co_qualname():
+    inference = pytest.importorskip("unsloth_zoo.mlx.inference")
+    assert inference._code_name(types.SimpleNamespace(co_name = "f")) == "f"
+    assert inference._code_name(test_verifier_code_names_hold_without_co_qualname.__code__).endswith("co_qualname")
+
+
 def test_a_model_keeping_state_is_seen_to_keep_it_however_it_says_so():
     """A model may do the assignment in a helper, or spell it as something other than a name."""
     from unsloth_zoo.mlx.generate import _keeps_what_it_prepared

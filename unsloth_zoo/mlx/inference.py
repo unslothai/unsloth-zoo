@@ -4904,13 +4904,17 @@ class _PlainMoEShared:
         return step[2]
 
 
+def _code_name(code):
+    return getattr(code, "co_qualname", code.co_name)  # co_qualname is Python 3.11+
+
+
 @functools.cache
 def _moe_module_codes(module):
     path = sys.modules[module].__file__
     pending, codes = [compile(Path(path).read_text(), path, "exec", dont_inherit = True)], {}
     while pending:
         code = pending.pop()
-        codes.setdefault(code.co_qualname, set()).add(code)
+        codes.setdefault(_code_name(code), set()).add(code)
         pending.extend(c for c in code.co_consts if inspect.iscode(c))
     return codes
 
@@ -4977,7 +4981,7 @@ class _MoEVerifyDispatch:
             if not trusted and module.split(".")[0] not in sys.stdlib_module_names:
                 raise ValueError("the verifier helper is outside the verified runtime")
             if not fn.__code__.co_filename.startswith("<frozen "):
-                if fn.__code__ not in _moe_module_codes(module).get(fn.__code__.co_qualname, ()):
+                if fn.__code__ not in _moe_module_codes(module).get(_code_name(fn.__code__), ()):
                     raise ValueError("the verifier helper differs from its installed body")
             if not trusted:
                 continue
@@ -7674,7 +7678,8 @@ def _decode_gdn_fits(layer, inputs, mask, cache):
     arrays = getattr(arrays, "ArraysCache", None)
     if (inputs.ndim != 3 or inputs.shape[1] != 1 or arrays is None or not isinstance(cache, arrays)
             or getattr(cache, "history_capacity", 0)
-            or any(getattr(type(cache), name) is not getattr(arrays, name) for name in ("update_window", "update_recurrent"))
+            or any(getattr(type(cache), name) is not getattr(arrays, name) or name in vars(cache)
+                   for name in ("update_window", "update_recurrent"))
             or not _gdn_block_fits(layer, inputs, mask, cache)):
         return False
     conv_state = cache[0]
@@ -8158,6 +8163,7 @@ def _causal_rows_blocks(gqa, dim, prefix, length, forced):
 
 def _launched_rows(queries, keys, values, scale, blocks):
     """`_exact_attention_rows`, evaluated, its threadgroup refitted to any limit MLX quotes; None where it cannot launch."""
+    _staged_ready()
     while True:
         try:
             out = _exact_attention_rows(queries, keys, values, scale, blocks)

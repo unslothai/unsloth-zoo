@@ -486,18 +486,22 @@ def _prefill_step_option(defaults: GenerationDefaults, constructor = None, *, mo
         params = inspect.signature(constructor).parameters
         if "prefill_step_size" not in params and not any(p.kind is p.VAR_KEYWORD for p in params.values()):
             return {}
-    step = defaults.prefill_step_size
+    return {"prefill_step_size": capped_prefill_step(model, defaults.prefill_step_size)}
+
+
+def capped_prefill_step(model, step):
+    """``step``, capped to the widest prefill ``model``'s automatic offload plan fits (warned once)."""
     limit = getattr(model, "_unsloth_auto_prefill_step", None)
-    if limit is not None and step > limit:
-        step = limit
-        if not getattr(model, "_unsloth_auto_prefill_warned", False):
-            object.__setattr__(model, "_unsloth_auto_prefill_warned", True)
-            warnings.warn(
-                f"Unsloth: capping requested prefill_step_size={defaults.prefill_step_size} to {limit} "
-                "to stay within this model's automatic offload memory plan.",
-                UserWarning, stacklevel=3,
-            )
-    return {"prefill_step_size": step}
+    if limit is None or step is None or step <= limit:
+        return step
+    if not getattr(model, "_unsloth_auto_prefill_warned", False):
+        object.__setattr__(model, "_unsloth_auto_prefill_warned", True)
+        warnings.warn(
+            f"Unsloth: capping requested prefill_step_size={step} to {limit} "
+            "to stay within this model's automatic offload memory plan.",
+            UserWarning, stacklevel=3,
+        )
+    return limit
 
 
 def _batch_kv_quant_options(defaults: GenerationDefaults) -> dict:

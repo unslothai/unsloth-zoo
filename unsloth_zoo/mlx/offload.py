@@ -31,7 +31,7 @@ import re
 import struct
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -139,7 +139,12 @@ def read_ranges(jobs):
         run(jobs)
         return
     parts = min(_READ_THREADS, len(jobs))
-    list(_reader_pool().map(run, [jobs[i::parts] for i in range(parts)]))
+    pool = _reader_pool()
+    futures = [pool.submit(run, jobs[i::parts]) for i in range(parts)]
+    # Every worker is done with the views before a failure is raised: their caller may then reuse them.
+    wait(futures)
+    for future in futures:
+        future.result()
 
 
 class CheckpointTensors:

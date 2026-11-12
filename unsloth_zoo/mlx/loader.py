@@ -8019,6 +8019,10 @@ def _mlx_generate_vlm(self, *args, **kwargs):
 
     _mlx_put_streamer_tokens(streamer, [prompt_ids])
 
+    if "prefill_step_size" in batch:
+        from .generate import capped_prefill_step
+        batch["prefill_step_size"] = capped_prefill_step(self, batch["prefill_step_size"])
+
     generated_ids = []
     last_generation_tokens = None
     with inference_scopes(self, ("vision",), int8_prefill = int8_prefill, ane_prefill = ane_prefill, fast_verify = fast_verify):
@@ -8151,6 +8155,9 @@ def _mlx_generate(self, *args, **kwargs):
             "prompt_progress_callback", "input_embeddings",
         ),
     )
+    if "prefill_step_size" in stream_kwargs:
+        from .generate import capped_prefill_step
+        stream_kwargs["prefill_step_size"] = capped_prefill_step(self, stream_kwargs["prefill_step_size"])
 
     # HF TextStreamer(skip_prompt=True) expects one prompt callback first.
     _mlx_put_streamer_tokens(streamer, [prompt_ids])
