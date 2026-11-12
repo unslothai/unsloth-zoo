@@ -2101,3 +2101,46 @@ def test_embedding_table_already_on_cpu_is_credited(monkeypatch):
     _land(layers[1])
     state.evict(1)
     assert state.done == {1}
+
+
+def test_layers_to_come_counts_a_partly_loaded_layer_by_what_landed():
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = nn.Linear(64, 64, bias = False, device = "meta")
+            self.b = nn.Linear(64, 64, bias = False, device = "meta")
+
+    one = 64 * 64 * 4
+    layers = nn.ModuleList([Layer(), Layer()])
+    state = _mod._HostLoad([0, 1], "tail")
+    state.layers, state.indices = layers, [0, 1]
+    state.shape_bytes, state.owned_names = {0: 2 * one, 1: 2 * one}, {0: {"a.weight", "b.weight"}, 1: {"a.weight", "b.weight"}}
+    layers[1].a.to_empty(device = "cpu")   # half of layer 1 landed on CPU
+    out = state._layers_to_come(2 * one, 0)
+    assert out[1] == 2 * one and state.cpu_to_come == one   # not charged twice, the landed half is on host
+
+
+def test_storage_ratio_ignores_a_shared_weight_the_layer_loaded_first():
+    shared = nn.Linear(256, 256, bias = False, device = "meta")
+    layers = nn.ModuleList([nn.Sequential(shared, nn.Linear(16, 16, bias = False, device = "meta")) for _ in range(2)])
+    state = _mod._HostLoad([0, 1], "tail")
+    state.layers, state.indices = layers, [0, 1]
+    seen, state.shape_bytes, state.owned_names = set(), {}, {}
+    for i in (0, 1):
+        own = [(n, p) for n, p in _mod._counted_named(layers[i]) if id(p) not in seen]
+        seen.update(id(p) for _, p in own)
+        state.shape_bytes[i], state.owned_names[i] = sum(p.nbytes for _, p in own), {n for n, _ in own}
+    layers[1].to_empty(device = "cpu")    # layer 1 (which does not own the shared weight) finishes first
+    import sys
+    sys.modules.setdefault("psutil", __import__("psutil"))
+    state.evict(1)
+    assert state.ratios[1] == 1.0
+
+
+def test_install_packing_lowers_the_published_reservation_as_it_goes(monkeypatch):
+    published = []
+    monkeypatch.setattr(_mod, "_publish_host_pending", lambda n: published.append(n))
+    fake = types.SimpleNamespace(_host_own = 8 * _GiB)
+    for packed in (_GiB, 4 * _GiB, 8 * _GiB):
+        _mod.BlockSwap._publish_packed(fake, packed, 8 * _GiB)
+    assert published == [7 * _GiB, 4 * _GiB, 0]

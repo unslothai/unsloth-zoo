@@ -547,7 +547,7 @@ class BlockSwap:
             on_host = max(0, host_loaded - chunk - max(sizes, default = 0))
         # The chunked fallback rounds chunks up to powers of two: up to twice the packed bytes.
         try:
-            _check_host_fit(sizes, on_host = on_host,
+            self._host_own = _check_host_fit(sizes, on_host = on_host,
                             slack = 0 if _can_register() else _chunked_bytes([b.sizes for b in self.blocks]) - sum(sizes))
         except Exception:
             _end_host_session()
@@ -632,6 +632,7 @@ class BlockSwap:
         chunk = max(_CHUNK_BYTES, _pow2_ceil(max(max(b.sizes.values(), default = 0) for b in self.blocks)))
         budget = _pin_budget()
         buf, used = None, 0
+        total, packed = left, 0
         for b in self.blocks:
             regions = {}
             for d, need in b.sizes.items():
@@ -645,6 +646,14 @@ class BlockSwap:
                 left -= need
             b.pack(regions)
             self._release(b)
+            packed += b.nbytes()
+            self._publish_packed(packed, total)
+
+    def _publish_packed(self, packed, total):
+        # Packed blocks are in host RAM now: other local ranks hold back only what this install still has to commit.
+        own = getattr(self, "_host_own", None)
+        if own is not None and total > 0:
+            _publish_host_pending(max(0, own - own * packed // total))
 
     def _pack_registered(self):
         # One exact-size pageable arena, page-locked in place up to the budget (cudaHostRegister).
@@ -662,6 +671,7 @@ class BlockSwap:
             b.pack(regions)
             self._release(b)
             ends.append(used)
+            self._publish_packed(used, total)
         # Pin whole blocks only: a copy from half-pinned memory is staged synchronously.
         budget = _pin_budget()
         pin = max([e for e in ends if e <= budget], default = 0)
@@ -1492,6 +1502,11 @@ def _counted_params(module):
     return [p for p in module.parameters() if id(p) not in kept]
 
 
+def _counted_named(module):
+    ids = {id(p) for p in _counted_params(module)}
+    return [(n, p) for n, p in module.named_parameters() if id(p) in ids]
+
+
 class _HostLoad:
     """What `load_layers_to_host` moved: the layer list and the indices living in host RAM."""
 
@@ -1504,6 +1519,7 @@ class _HostLoad:
         self.embedding_prefixes, self.embeddings, self.embedding_bytes = {}, [], []
         # Each selected layer's bytes as declared on meta, to scale a loaded layer's size to the others'.
         self.shape_bytes, self.last_done = {}, None
+        self.owned_names = {}
         self.cpu_to_come = 0
 
     def bind(self, model):
@@ -1518,11 +1534,13 @@ class _HostLoad:
             self.prefixes = {f"{name}.{i}.": i for i in self.indices}
         # A param shared by several selected layers moves once: charge it to the first.
         seen = set()
-        self.shape_bytes = {}
+        self.shape_bytes, self.owned_names = {}, {}
         for i in self.indices:
-            own = [p for p in _counted_params(layers[i]) if id(p) not in seen]
-            seen.update(id(p) for p in own)
-            self.shape_bytes[i] = sum(p.nbytes for p in own)
+            own = [(n, p) for n, p in _counted_named(layers[i]) if id(p) not in seen]
+            seen.update(id(p) for _, p in own)
+            self.shape_bytes[i] = sum(p.nbytes for _, p in own)
+            # By name: loading replaces the meta Parameter objects, the names stay.
+            self.owned_names[i] = {n for n, _ in own}
         if self.want_embeddings:
             # A table inside a selected layer moves (and is charged) with that layer, not a second time here.
             inside = tuple(self.prefixes)
@@ -1545,14 +1563,20 @@ class _HostLoad:
         # Transformers 4 shard the device map put on CPU. Evicting them copies nothing.
         self.cpu_to_come = 0
         for j in left:
-            params = _counted_params(self.layers[j])
-            if params and all(p.device.type != "meta" for p in params):
-                ptrs = [p.untyped_storage().data_ptr() for p in params]
-                fresh = [(p, ptr) for p, ptr in zip(params, ptrs) if ptr not in seen]
-                out.append(sum(p.nbytes for p, _ in fresh))
-                if j != ref:
-                    self.cpu_to_come += sum(p.nbytes for p, _ in fresh if p.device.type == "cpu")
-                seen.update(ptrs)
+            named = _counted_named(self.layers[j])
+            loaded = [p for _, p in named if p.device.type != "meta"]
+            owned = self.owned_names.get(j)
+            still_meta = [p for n, p in named if p.device.type == "meta" and (owned is None or n in owned)]
+            ptrs = [p.untyped_storage().data_ptr() for p in loaded]
+            fresh = [p for p, ptr in zip(loaded, ptrs) if ptr not in seen]
+            seen.update(ptrs)
+            if j != ref:
+                self.cpu_to_come += sum(p.nbytes for p in fresh if p.device.type == "cpu")
+            if loaded and not still_meta:
+                out.append(sum(p.nbytes for p in fresh))
+            elif loaded:
+                # Partly loaded (a shard boundary inside the layer): what landed, plus the rest scaled from meta.
+                out.append(sum(p.nbytes for p in fresh) + int(sum(p.nbytes for p in still_meta) * (ratio or 1.0)))
             elif ratio is None:
                 out.append(size)
             else:
@@ -1603,7 +1627,12 @@ class _HostLoad:
                    if p.device.type == "meta" or p.untyped_storage().data_ptr() not in self.moved_storages}
         # Layers still to come are scaled from this one by their meta sizes; the first check runs before any moved.
         size = sum(p.nbytes for p in params if p.device.type != "meta" and id(p) in counted)
-        to_come = self._layers_to_come(size, i)
+        # The storage ratio compares like with like: the params bind() charged to this layer, loaded vs declared.
+        # A shared weight this layer happens to load first is not in its declared bytes.
+        owned = self.owned_names.get(i)
+        owned_size = size if owned is None else sum(
+            p.nbytes for n, p in _counted_named(layer) if n in owned and p.device.type != "meta")
+        to_come = self._layers_to_come(owned_size, i)
         copied = sum(p.nbytes for p in params if p.device.type not in ("cpu", "meta") and id(p) in counted)
         own = _check_host_fit(self.done_bytes + self.embedding_bytes + self._pending_embedding_bytes() + to_come,
                               sum(self.done_bytes) + sum(self.embedding_bytes)
@@ -1620,7 +1649,7 @@ class _HostLoad:
         self.done.add(i)
         self.done_bytes.append(size)
         if self.shape_bytes.get(i):
-            self.ratios[i] = size / self.shape_bytes[i]
+            self.ratios[i] = owned_size / self.shape_bytes[i]
         self.last_done = i
         if own is not None:
             # Now in host RAM, so out of what other local ranks must hold back for this one.
