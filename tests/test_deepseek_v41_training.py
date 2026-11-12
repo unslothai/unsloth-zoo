@@ -270,3 +270,27 @@ def test_pooled_compressor_lora_is_applied_and_trains():
         adapted = peft_model(input_ids = ids, use_cache = False).logits
         reference = peft_model.merge_and_unload()(input_ids = ids, use_cache = False).logits
     torch.testing.assert_close(adapted, reference, rtol = 1e-4, atol = 1e-4)
+
+
+def test_gradient_checkpointing_keeps_shared_state_grads_under_a_reentrant_shim(monkeypatch):
+    """Unsloth's smart checkpointer replaces torch.utils.checkpoint.checkpoint with a reentrant one: the patched layer
+    still checkpoints non-reentrantly, so the layers reading another layer's shared KV still send it gradient."""
+    _patches()
+    import torch.utils.checkpoint as ckpt
+
+    pristine = ckpt.checkpoint
+    monkeypatch.setattr(ckpt, "_unsloth_pristine_checkpoint", pristine, raising = False)
+    monkeypatch.setattr(ckpt, "checkpoint", lambda fn, *a, use_reentrant = None, **k: pristine(fn, *a, use_reentrant = True, **k))
+    model = _tiny_model()
+    ids = torch.randint(0, 256, (2, 24), generator = torch.Generator().manual_seed(0))
+    loss0, g0 = _grads(model, ids, False)
+    model.zero_grad(set_to_none = True)
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": True})
+    model.train()
+    out = model(input_ids = ids, labels = ids, use_cache = False)
+    out.loss.backward()
+    g1 = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
+    torch.testing.assert_close(loss0, out.loss.detach())
+    assert g0.keys() == g1.keys()
+    for name in g0:
+        torch.testing.assert_close(g0[name], g1[name], rtol = 1e-4, atol = 1e-6, msg = name)

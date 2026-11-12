@@ -132,7 +132,10 @@ def patch_deepseek_v41_gradient_checkpointing():
             with _force_eager(), _compressor_lora(self):
                 return torch.nn.Module.__call__(self, *inner_args, **inner_kwargs)
 
-        out = self._gradient_checkpointing_func(partial(run, **kwargs), *args)
+        # Non-reentrant, always: the source layer's shared KV tensors leave through `replay`, not through the
+        # checkpoint's outputs. A reentrant checkpoint (Unsloth's smart checkpointer forces one) would make them
+        # under no_grad, and the layers that read them would send their source projections no gradient.
+        out = _non_reentrant_checkpoint()(partial(run, **kwargs), *args, use_reentrant = False)
         shared.clear()
         shared.update(replay)
         return out
@@ -148,6 +151,13 @@ def patch_deepseek_v41_gradient_checkpointing():
 pass
 
 TEMPORARY_PATCHES.append(patch_deepseek_v41_gradient_checkpointing)
+
+
+def _non_reentrant_checkpoint():
+    """torch's own checkpoint, also when Unsloth's smart checkpointing replaced torch.utils.checkpoint.checkpoint."""
+    import torch.utils.checkpoint as ckpt
+    return (getattr(ckpt, "_unsloth_pristine_checkpoint", None) or getattr(ckpt, "_old_checkpoint", None)
+            or ckpt.checkpoint)
 
 
 class _StraightThrough(torch.autograd.Function):
