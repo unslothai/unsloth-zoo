@@ -1504,6 +1504,7 @@ class _HostLoad:
         self.embedding_prefixes, self.embeddings, self.embedding_bytes = {}, [], []
         # Each selected layer's bytes as declared on meta, to scale a loaded layer's size to the others'.
         self.shape_bytes, self.last_done = {}, None
+        self.cpu_to_come = 0
 
     def bind(self, model):
         if self.layers is not None:
@@ -1540,11 +1541,17 @@ class _HostLoad:
         out = []
         # Per storage, as evict() moves them: a weight shared by several selected layers (or already moved) once.
         seen = set(self.moved_storages)
+        # Bytes of those layers (other than `ref`, which the caller credits itself) already in host RAM: a
+        # Transformers 4 shard the device map put on CPU. Evicting them copies nothing.
+        self.cpu_to_come = 0
         for j in left:
             params = _counted_params(self.layers[j])
             if params and all(p.device.type != "meta" for p in params):
                 ptrs = [p.untyped_storage().data_ptr() for p in params]
-                out.append(sum(p.nbytes for p, ptr in zip(params, ptrs) if ptr not in seen))
+                fresh = [(p, ptr) for p, ptr in zip(params, ptrs) if ptr not in seen]
+                out.append(sum(p.nbytes for p, _ in fresh))
+                if j != ref:
+                    self.cpu_to_come += sum(p.nbytes for p, _ in fresh if p.device.type == "cpu")
                 seen.update(ptrs)
             elif ratio is None:
                 out.append(size)
@@ -1562,9 +1569,11 @@ class _HostLoad:
         if module in self.embeddings or weight is None or weight.device.type == "meta":
             return
         size = self.done_bytes[-1] if self.done_bytes else 0
+        to_come = self._layers_to_come(size, self.last_done)
         _check_host_fit(self.done_bytes + self.embedding_bytes + [weight.nbytes] + self._pending_embedding_bytes(skip = module)
-                        + self._layers_to_come(size, self.last_done),
-                        sum(self.done_bytes) + sum(self.embedding_bytes) + (weight.nbytes if weight.device.type == "cpu" else 0))
+                        + to_come,
+                        sum(self.done_bytes) + sum(self.embedding_bytes) + (weight.nbytes if weight.device.type == "cpu" else 0)
+                        + self.cpu_to_come)
         with torch.no_grad():
             weight.requires_grad_(False)
             if weight.device.type != "cpu":
@@ -1584,9 +1593,10 @@ class _HostLoad:
                    if p.device.type == "meta" or p.untyped_storage().data_ptr() not in self.moved_storages}
         # Layers still to come are scaled from this one by their meta sizes; the first check runs before any moved.
         size = sum(p.nbytes for p in params if p.device.type != "meta" and id(p) in counted)
-        _check_host_fit(self.done_bytes + self.embedding_bytes + self._pending_embedding_bytes() + self._layers_to_come(size, i),
+        to_come = self._layers_to_come(size, i)
+        _check_host_fit(self.done_bytes + self.embedding_bytes + self._pending_embedding_bytes() + to_come,
                         sum(self.done_bytes) + sum(self.embedding_bytes)
-                        + sum(p.nbytes for p in params if p.device.type == "cpu" and id(p) in counted))
+                        + sum(p.nbytes for p in params if p.device.type == "cpu" and id(p) in counted) + self.cpu_to_come)
         with torch.no_grad():
             for p in params:
                 if p.is_floating_point():

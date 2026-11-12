@@ -1317,11 +1317,17 @@ def test_host_fit_is_skipped_without_psutil(monkeypatch):
     _mod._check_host_fit([_GiB] * 1000)
 
 
-def _host_load(n_layers, n, width = 64):
-    layers = nn.ModuleList([nn.Linear(width, width, bias = False) for _ in range(n_layers)])
+def _host_load(n_layers, n, width = 64, meta = False):
+    # meta = True: layers still to stream are on meta, as during a load; _land(layer) materializes one on CPU.
+    layers = nn.ModuleList([nn.Linear(width, width, bias = False, device = "meta" if meta else None)
+                            for _ in range(n_layers)])
     state = _mod._HostLoad(n, "tail")
     state.layers, state.indices = layers, swap_indices(n_layers, n, "tail")
     return state, layers
+
+
+def _land(layer):
+    layer.to_empty(device = "cpu")
 
 
 def test_host_load_refuses_before_moving_any_layer(monkeypatch):
@@ -1331,7 +1337,9 @@ def test_host_load_refuses_before_moving_any_layer(monkeypatch):
     total = 64 * _GiB
     reserve = int(total * _mod._PIN_RESERVE_FRACTION)
     monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(reserve + 64 * 64 * 4 + 100, total))
-    state, layers = _host_load(4, 3)
+    state, layers = _host_load(4, 3, meta = True)
+    state.shape_bytes = {i: 64 * 64 * 4 for i in state.indices}
+    _land(layers[1])
     with pytest.raises(ValueError) as e:
         state.evict(1)
     assert "3 layers" in str(e.value) and "At most 2 layers" in str(e.value)
@@ -1353,11 +1361,14 @@ def test_host_load_counts_layers_already_moved_as_used(monkeypatch):
     import pytest
     total = 64 * _GiB
     reserve = int(total * _mod._PIN_RESERVE_FRACTION)
-    state, layers = _host_load(4, 3)
+    state, layers = _host_load(4, 3, meta = True)
+    state.shape_bytes = {i: 64 * 64 * 4 for i in state.indices}
     monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(20 * _GiB, total))
+    _land(layers[1])
     state.evict(1)
     # RAM dropped after the first layer landed: the next two no longer fit, and the error counts all three.
     monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(reserve + 100, total))
+    _land(layers[2])
     with pytest.raises(ValueError, match = "3 layers"):
         state.evict(2)
     assert state.done == {1}
@@ -2045,3 +2056,19 @@ def test_pool_growth_reads_the_optimizer_reserve_of_adapters_added_after_install
     if torch.cuda.is_available():
         fake._reserve_layers.append(nn.Linear(8, 8, bias = False).cuda())
         assert _mod.BlockSwap._optimizer_bytes(fake) == {torch.cuda.current_device(): 64 * 12}
+
+
+def test_layers_already_on_cpu_are_credited_by_the_streaming_guard(monkeypatch):
+    import sys
+    # Four 1 GiB-ish layers the device map already put on CPU; little spare RAM: evicting them copies nothing.
+    layers = nn.ModuleList([nn.Linear(256, 256, bias = False) for _ in range(4)])
+    one = 256 * 256 * 4
+    state = _mod._HostLoad([0, 1, 2, 3], "tail")
+    state.layers, state.indices = layers, [0, 1, 2, 3]
+    state.shape_bytes = {i: one for i in range(4)}
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setattr(_mod, "_host_memory", lambda: (64 * _GiB, one // 2))
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    for i in range(4):
+        state.evict(i)
+    assert state.done == {0, 1, 2, 3}
