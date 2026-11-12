@@ -193,10 +193,10 @@ def _settle_offload(offload, conflict, message):
 
 
 def _auto_offload(model, model_dir, offload, max_seq_length, target_dtype):
-    """Resolves auto parts to the least offload fitting weights and max_seq_length context in 0.85 of the GPU's
+    """Resolves auto parts to the least offload fitting weights and max_seq_length context within the GPU's
     recommended working set, warning for each part turned on."""
     import mlx.core as mx
-    from .offload import context_bytes, offload_inventory, offloadable, plan_offload
+    from .offload import PREFILL_STEPS, context_bytes, offload_inventory, offloadable, plan_offload, prefill_step_limit
 
     dtype_bytes = target_dtype.size if target_dtype is not None else 2
     try:
@@ -206,7 +206,7 @@ def _auto_offload(model, model_dir, offload, max_seq_length, target_dtype):
         return {key: None if value == "auto" else value for key, value in offload.items()}
     # The checkpoint's size, and what this model's offload can actually take from it.
     inventory = {**offload_inventory(model_dir, dtype_bytes), **offloadable(model, model_dir, cast_dtype=target_dtype)}
-    budget = int(0.85 * mx.device_info()["max_recommended_working_set_size"])
+    budget = mx.device_info()["max_recommended_working_set_size"]
     plan = plan_offload(
         budget=budget,
         resident=inventory["total_bytes"] - inventory["ple_bytes"] - inventory["expert_bytes"],
@@ -214,6 +214,7 @@ def _auto_offload(model, model_dir, offload, max_seq_length, target_dtype):
         context_cost=lambda tokens, step: context_bytes(model_dir, tokens, step, dtype_bytes),
         ceiling=max_seq_length,
         context=max_seq_length,
+        prefill_step=PREFILL_STEPS[0],
         offload=offload,
     )
     fits = plan["context"] is not None
@@ -224,7 +225,13 @@ def _auto_offload(model, model_dir, offload, max_seq_length, target_dtype):
             stacklevel=4,
         )
     resolved = dict(offload)
-    step = plan["prefill_step"] or 2048
+    step = prefill_step_limit(
+        budget=budget,
+        resident=inventory["total_bytes"] - inventory["ple_bytes"] - inventory["expert_bytes"],
+        inventory=inventory,
+        context_cost=lambda tokens, width: context_bytes(model_dir, tokens, width, dtype_bytes),
+        context=max_seq_length, ple=plan["ple"], experts=plan["experts"],
+    ) if fits else None
     for key, what in (("ple", "per-layer embedding rows"), ("experts", "routed experts")):
         if offload[key] != "auto":
             continue
@@ -234,11 +241,12 @@ def _auto_offload(model, model_dir, offload, max_seq_length, target_dtype):
                 f"Unsloth: offload 'auto' leaves {chosen:.0%} of the {what} on disk, read on demand"
                 + (f", so the weights and max_seq_length={max_seq_length} fit in {budget / 2**30:.1f} GiB. "
                    if fits else ". ")
-                + (f"Prefill with prefill_step_size={step}: each step re-reads the offloaded experts. "
-                   if key == "experts" and step != 2048 else "")
+                + (f"Unsloth generation limits requested prefill_step_size to {step}. "
+                   if fits and (key == "experts" or plan["experts"] is None) else "")
                 + f"Set offload's {key!r} to 'off' to keep them in memory.",
                 stacklevel=4,
             )
+    object.__setattr__(model, "_unsloth_auto_prefill_step", step)
     return resolved
 
 
@@ -8011,6 +8019,10 @@ def _mlx_generate_vlm(self, *args, **kwargs):
 
     _mlx_put_streamer_tokens(streamer, [prompt_ids])
 
+    if "prefill_step_size" in batch:
+        from .generate import capped_prefill_step
+        batch["prefill_step_size"] = capped_prefill_step(self, batch["prefill_step_size"])
+
     generated_ids = []
     last_generation_tokens = None
     with inference_scopes(self, ("vision",), int8_prefill = int8_prefill, ane_prefill = ane_prefill, fast_verify = fast_verify):
@@ -8143,6 +8155,9 @@ def _mlx_generate(self, *args, **kwargs):
             "prompt_progress_callback", "input_embeddings",
         ),
     )
+    if "prefill_step_size" in stream_kwargs:
+        from .generate import capped_prefill_step
+        stream_kwargs["prefill_step_size"] = capped_prefill_step(self, stream_kwargs["prefill_step_size"])
 
     # HF TextStreamer(skip_prompt=True) expects one prompt callback first.
     _mlx_put_streamer_tokens(streamer, [prompt_ids])
@@ -9396,7 +9411,7 @@ class FastMLXModel:
                 share of experts, the rest held in slots experts are read into
                 as tokens route to them (at least ``max(8, top_k)``).
                 ``"auto"`` offloads only what the weights and
-                ``max_seq_length`` need to fit in 0.85 of the GPU's recommended
+                ``max_seq_length`` need to fit within the GPU's recommended
                 working set, PLE tables first, and warns for each offload it
                 turns on; it turns off where offloading cannot apply
                 (adapters, runtime quantization, training, distributed loads)

@@ -70,6 +70,367 @@ def _identical(a, b, nan_payload_may_differ = False):
     _equal(a, b)
 
 
+def _plain_qwen4(width, dtype = mx.bfloat16, quantization = (4, 32), shared_gate = (8, 64), **config):
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpSparseMoeBlock
+    if fusion._plain_moe_kernels() is None:
+        pytest.skip("plain MoE kernels require the supported M3 Metal runtime")
+    mx.random.seed(21)
+    args = SimpleNamespace(hidden_size = 512, moe_intermediate_size = width, shared_expert_intermediate_size = width,
+                           num_experts = 512, num_experts_per_tok = 10, norm_topk_prob = True)
+    vars(args).update(config)
+    block = Qwen4ExpSparseMoeBlock(args)
+    block.set_dtype(dtype)
+    block.gate = block.gate.to_quantized(group_size = 64, bits = 8)
+    block.shared_expert_gate = block.shared_expert_gate.to_quantized(group_size = shared_gate[1], bits = shared_gate[0])
+    nn.quantize(block, group_size = quantization[1], bits = quantization[0],
+                class_predicate = lambda _, m: hasattr(m, "to_quantized") and not isinstance(m, nn.QuantizedLinear))
+    block.eval(); block.freeze(); mx.eval(block.parameters())
+    return block
+
+
+@pytest.mark.parametrize("hidden,width,packed", [(512, 256, True), (1536, 640, True), (512, 256, False)])
+@pytest.mark.parametrize("rows", [1, 2, 3, 7])
+def test_plain_moe_qwen4_matches_stock_without_gather_graph(hidden, width, packed, rows, monkeypatch):
+    block = _plain_qwen4(width, hidden_size = hidden)
+    inputs = [mx.ones((1, rows, hidden), mx.bfloat16),
+              *(mx.random.normal((1, rows, hidden)).astype(mx.bfloat16) * scale for scale in (3, -2)),
+              mx.random.normal((1, rows, hidden * 2)).astype(mx.bfloat16)[..., ::2],
+              mx.random.normal((1, rows * 2, hidden)).astype(mx.bfloat16)[:, ::2]]
+    expected = [mx.concatenate([block(x[:, i:i + 1]) for i in range(rows)], axis = 1) for x in inputs]
+    other = mx.random.normal((1, rows + 1, hidden)).astype(mx.bfloat16)
+    other_expected = mx.concatenate([block(other[:, i:i + 1]) for i in range(rows + 1)], axis = 1)
+    mx.eval(inputs, expected, other, other_expected); assert memoryview(inputs[-2]).strides[-1] == 2 * inputs[-2].itemsize
+    with fusion.inference_scopes(block):
+        if not packed: block.switch_mlp.__class__ = block.switch_mlp._unsloth_moe_gate_up.original_class
+        experts = block._unsloth_moe_routed
+        built, factory = [], fusion._plain_moe_plan
+        monkeypatch.setattr(fusion, "_plain_moe_plan", lambda *a, **k: built.append(1) or factory(*a, **k))
+        call = lambda x, ref: experts.verify(block, x, lambda: ref) if rows > 1 else block(x)
+        _equal(call(inputs[0], expected[0]), expected[0])
+        plan = experts.verify_plans[rows] if rows > 1 else experts.plain_plan
+        assert plan is not None and plan.verdict is True and (plan.router_kernel is None) == (rows == 1)
+        if rows > 1:
+            checked = []
+            _equal(experts.verify(block, other, lambda: checked.append(1) or other_expected), other_expected)
+            assert checked == [1] and built == [1]
+        calls = _counting_gather_qmm(monkeypatch)
+        projected, gate_up = [], plan.gate_up
+        plan.gate_up = lambda *, inputs, **kwargs: projected.append(inputs[1]) or gate_up(inputs = inputs, **kwargs)
+        for x, y in zip(inputs[1:], expected[1:]):
+            _equal(call(x, y), y)
+            _equal(projected.pop(), mx.concatenate([block.gate(x[:, i:i + 1]) for i in range(rows)], axis = 1))
+        assert calls == []
+
+
+def test_verify_moe_qwen4_refuses_strided_native_router():
+    block = _plain_qwen4(256)
+    block.gate.weight = mx.stack([block.gate.weight] * 2, axis = -1)[..., 0]
+    x = mx.ones((1, 3, 512), mx.bfloat16)
+    reference = block(x)
+    with fusion.inference_scopes(block):
+        experts = block._unsloth_moe_routed
+        assert fusion._plain_moe_plan(block, experts, 3) is None
+        assert experts.verify(block, x, lambda: reference) is None  # the caller's routed path takes it
+
+
+@pytest.mark.parametrize("method,where", [(m, w) for m in ("_linear", "_linears", "_switch_glu") for w in ("instance", "class")]
+                         + [("swiglu", "global"), ("_linear", "mro"), ("_linear", "before_instance"), ("_linear", "before_class"), ("_linear", "cached_instance"), ("_linear", "code"), ("_linear", "closure"), ("_linear", "namespace"), ("_linear", "body")])
+def test_verify_moe_qwen4_guards_native_verifier_dispatch(method, where, monkeypatch):
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpBatchInvariantForward as Native
+    block, x, shift = _plain_qwen4(256), mx.ones((1, 3, 512), mx.bfloat16), [0]
+    before = where.startswith("before") or where in ("namespace", "body")
+    if where == "closure": monkeypatch.setenv("UNSLOTH_MLX_VERIFY_QMV_ROWS", "0")
+    with fusion.inference_scopes(block), contextlib.ExitStack() as restore:
+        if where == "namespace":
+            fn = Native._linear.__globals__["_target_verify_linear"]
+            monkeypatch.setitem(Native._linear.__globals__, "_target_verify_linear", FunctionType(fn.__code__, dict(fn.__globals__), closure = fn.__closure__))
+        if where == "body":
+            fn = Native._linear.__globals__["_target_verify_linear"]
+            def unverified(linear, x): return True
+            monkeypatch.setitem(fn.__globals__, "_use_target_verify_dense", FunctionType(unverified.__code__, fn.__globals__))
+        if where == "before_class":
+            linear = Native._linear
+            monkeypatch.setattr(Native, "_linear", lambda self, *a: linear(self, *a) + shift[0])
+        verifier = fusion._exact_verify_class(Native, "qwen4_exp", Native._linear, where)()
+        if where == "mro": restore.callback(setattr, type(verifier), "__bases__", type(verifier).__bases__)
+        monkeypatch.setattr(fusion._VERIFY_STATE, "serving", True, raising = False)
+        monkeypatch.setattr(fusion._VERIFY_STATE, "plain_decode", False, raising = False)
+        original = Native._feed_forward.__globals__[method] if where == "global" else getattr(verifier, method)
+        def changed(*args):
+            result = original(*args)
+            return tuple(v + shift[0] for v in result) if isinstance(result, tuple) else result + shift[0]
+        def replace():
+            if where == "global": monkeypatch.setitem(Native._feed_forward.__globals__, method, changed)
+            elif where == "closure":
+                fn = verifier._linear.__func__
+                cell = dict(zip(fn.__code__.co_freevars, fn.__closure__))["projected"]
+                projected = cell.cell_contents
+                monkeypatch.setattr(cell, "cell_contents", lambda *a: projected(*a) + 16)
+            elif where == "code":
+                def code():
+                    base = eligible = projected = None
+                    def changed(self, p, x):
+                        (base, eligible, projected)
+                        return projected(self, p, x) + 16
+                    return changed.__code__
+                replacement = code()
+                assert replacement.co_freevars == verifier._linear.__func__.__code__.co_freevars
+                monkeypatch.setattr(verifier._linear.__func__, "__code__", replacement)
+            elif where == "mro": type(verifier).__bases__ = (type("Changed", (Native,), {method: lambda self, *a: changed(*a)}),)
+            elif where.endswith("instance"): monkeypatch.setattr(verifier, method, changed)
+            else: monkeypatch.setattr(type(verifier), method, lambda self, *a: changed(*a))
+        if where == "before_instance": replace()
+        _equal(verifier._feed_forward(block, x), Native._feed_forward(verifier, block, x))
+        plan = block._unsloth_moe_routed.verify_plans.get(3)
+        assert plan is None if before else plan.verdict is True
+        if where == "cached_instance":
+            context = fusion._moe_verifier_context(verifier)
+            monkeypatch.setattr(fusion._VERIFY_STATE, "moe_verifier", (verifier, context, True), raising = False)
+        if not before: replace()
+        shift[0] = 16
+        calls, run = [], fusion._PlainMoE.run
+        monkeypatch.setattr(fusion._PlainMoE, "run", lambda self, x: (calls.append(1), run(self, x))[1])
+        _equal(verifier._feed_forward(block, x), Native._feed_forward(verifier, block, x))
+        assert calls == []
+
+
+def test_verify_moe_dispatch_needs_no_unrelated_family(monkeypatch):
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+    monkeypatch.delitem(sys.modules, "mlx_vlm.models.qwen4_exp.language", raising = False)
+    cls = type("OtherFamily", (Qwen3_5BatchInvariantForward,), {})
+    assert fusion._moe_verifier_class(cls) is cls and cls not in fusion._MOE_VERIFY_DISPATCH
+
+
+@pytest.mark.parametrize("change", ["training", "weight", "activation", "top_k", "projection", "quantization", "router_class", "shared_class", "mlp_class", "bias", "combine", "shared_gate", "router_bias", "router_training", "scale_global", "scale_namespace", "scale_shadow", "router_global", "switch_call", "mro_call", "instance_call", "pack_call", "pack_global", "bases",
+    *((path, "__call__") for path in ("", "_unsloth_router_native", "switch_mlp", "shared_expert", "gate", "shared_expert_gate", "switch_mlp.activation",
+                                      *(f"{parent}.{projection}" for parent in ("switch_mlp", "shared_expert") for projection in ("gate_proj", "up_proj", "down_proj"))))])
+@pytest.mark.parametrize("rows", [1, 3])
+def test_plain_moe_qwen4_refuses_changed_plan(change, rows, monkeypatch):
+    block, x = _plain_qwen4(256), mx.ones((1, rows, 512), mx.bfloat16)
+    reference = mx.concatenate([block(x[:, i:i + 1]) for i in range(rows)], axis = 1)
+    if change == "scale_namespace":
+        method = type(block)._shared_expert_scale
+        monkeypatch.setattr(type(block), "_shared_expert_scale", FunctionType(method.__code__, dict(method.__globals__)))
+    with fusion.inference_scopes(block), contextlib.ExitStack() as restore:
+        if change == "bases": restore.callback(setattr, type(block.switch_mlp), "__bases__", type(block.switch_mlp).__bases__)
+        routed = block._unsloth_moe_routed
+        mx.eval(routed.verify(block, x, lambda: reference) if rows > 1 else block(x))
+        plan = routed.verify_plans[rows] if rows > 1 else routed.plain_plan
+        assert plan.verdict is True
+        if change == "training": block.train()
+        elif change == "weight": block.switch_mlp.down_proj.weight = mx.zeros_like(block.switch_mlp.down_proj.weight)
+        elif change == "activation": block.switch_mlp.activation = lambda a, b: a + b
+        elif change == "top_k": block.top_k = 9
+        elif change == "quantization": block.shared_expert.down_proj.group_size = 64
+        elif change == "router_class": block.gate.__class__ = type("ChangedRouter", (type(block.gate),), {})
+        elif change == "shared_class": block.shared_expert.__class__ = type("ChangedShared", (type(block.shared_expert),), {})
+        elif change == "mlp_class": block.switch_mlp.__class__ = type("EqualType", (type,), {"__eq__": lambda *a: True, "__hash__": type.__hash__})("ChangedMLP", (type(block.switch_mlp),), {})
+        elif change == "bias": block.shared_expert.down_proj.bias = mx.ones((512,), mx.bfloat16)
+        elif change == "combine": block.switch_mlp._combine = lambda *args: x
+        elif change == "shared_gate": block.shared_expert_gate = block.gate
+        elif change == "router_bias": block.gate.bias = mx.ones((512,), mx.float32)
+        elif change == "router_training": block.gate.train()
+        elif isinstance(change, tuple):
+            target = fusion._resolve_dotted(block, change[0]) if change[0] else block
+            monkeypatch.setattr(target if isinstance(target, type) else type(target), change[1], lambda *a, **kw: x, raising = False)
+        elif change == "switch_call":
+            call = type(block.switch_mlp).__call__
+            monkeypatch.setattr(type(block.switch_mlp), "__call__", lambda self, *a, **kw: call(self, *a, **kw) + 16)
+        elif change == "mro_call": monkeypatch.setattr(nn.Module, "__call__", lambda *a: x, raising = False)
+        elif change == "instance_call": monkeypatch.setitem(vars(block.switch_mlp), "__call__", lambda *a: x)
+        elif change == "pack_global": monkeypatch.setattr(fusion, "_nax_sorted_gather", lambda *a, **kw: None)
+        elif change == "bases": type(block.switch_mlp).__bases__ = (type("ChangedMRO", type(block.switch_mlp).__bases__, {}),)
+        elif change == "pack_call":
+            project = type(block.switch_mlp._unsloth_moe_gate_up).project
+            monkeypatch.setattr(type(block.switch_mlp._unsloth_moe_gate_up), "project", lambda self, *a, **kw: tuple(y + 16 for y in project(self, *a, **kw)))
+        elif change == "scale_shadow": monkeypatch.setattr(type(block), "_shared_expert_scale", lambda self, a: mx.ones((1, 1, 1)), raising = False)
+        elif change == "router_global": monkeypatch.setitem(nn.QuantizedLinear.__call__.__globals__, "mx", SimpleNamespace(**vars(mx)))
+        elif change in ("scale_global", "scale_namespace"):
+            method = type(block)._shared_expert_scale
+            monkeypatch.setitem(method.__globals__, "_row_invariant_quantized_projection", lambda linear, a: linear(a) + 1)
+        else: block.shared_expert.down_proj = block.shared_expert.gate_proj
+        assert plan(block, x, lambda: None) is None
+        assert change == "training" or (routed.verify if rows > 1 else routed.plain)(block, x, lambda: x) is x
+        if change in ("scale_global", "scale_namespace", "switch_call", "pack_call", "pack_global"): _equal(block(x), type(block)._unsloth_router_native.__call__(block, x))
+
+
+@pytest.mark.parametrize("config", [{"num_experts": 256}, {"num_experts_per_tok": 8},
+                                    {"norm_topk_prob": False}, {"shared_expert_intermediate_size": 128},
+                                    {"hidden_size": 384}, {"hidden_size": 768}, {"training": True}, {"dtype": mx.float16}, {"quantization": (8, 32)},
+                                    {"quantization": (4, 64)}, {"shared_gate": (4, 64)}, {"shared_gate": (8, 32)}, {"router_dtype": mx.float32},
+                                    *({"narrow": (m, p)} for m, p in (("switch_mlp", "up_proj"), ("shared_expert", "up_proj"), ("shared_expert", "down_proj")))])
+@pytest.mark.parametrize("rows", [1, 3])
+def test_plain_moe_qwen4_leaves_other_configs_native(config, rows):
+    config = dict(config)
+    narrow, training, router_dtype = config.pop("narrow", None), config.pop("training", False), config.pop("router_dtype", None)
+    block = _plain_qwen4(256, **config)
+    if router_dtype: block.gate.scales, block.gate.biases = block.gate.scales.astype(router_dtype), block.gate.biases.astype(router_dtype)
+    if narrow:
+        projection = getattr(getattr(block, narrow[0]), narrow[1])
+        for name in ("weight", "scales", "biases"): projection[name] = projection[name][..., :1, :]
+    if training: block.shared_expert.gate_proj.train()
+    mx.eval(block(mx.ones((1, 1, block.gate.weight.shape[1] * 32 // block.gate.bits), block.switch_mlp.gate_proj.scales.dtype)))
+    with fusion.inference_scopes(block):
+        assert fusion._plain_moe_plan(block, block._unsloth_moe_routed, rows) is None
+
+
+@pytest.mark.parametrize("rows", [1, 3])
+@pytest.mark.parametrize("change", ["class", "global", "instance"])
+def test_plain_moe_qwen4_rechecks_shared_bindings_between_steps(change, rows, monkeypatch):
+    from mlx_vlm.models.qwen4_exp.language import LanguageModel, Qwen4ExpBatchInvariantForward
+    owner = LanguageModel.__new__(LanguageModel)
+    nn.Module.__init__(owner)
+    owner.blocks = [_plain_qwen4(256) for _ in range(2)]
+    owner.eval()
+    x, ids = mx.ones((1, rows, 512), mx.bfloat16), mx.ones((1, rows), mx.int32)
+    if rows > 1:
+        monkeypatch.setenv("UNSLOTH_MLX_VERIFY_MOE", "1")
+        owner._unsloth_speculative_call = True
+    entered = fusion._exact_verify_class(type("Steps", (Qwen4ExpBatchInvariantForward,), {"__call__": lambda self, lm, inputs: tuple(self._feed_forward(block, x) for block in lm.blocks)}), "qwen4_exp")()
+    with fusion.inference_scopes(owner):
+        mx.eval(entered(owner, ids))
+        plans = [block._unsloth_moe_routed.plain_plan if rows == 1 else block._unsloth_moe_routed.verify_plans[rows] for block in owner.blocks]
+        shared = plans[0].shared
+        assert all(plan.verdict is True for plan in plans) and shared is plans[1].shared is owner._unsloth_plain_moe_shared and all(a[0] is b[0] for a, b in zip(plans[0].shared_bindings, plans[1].shared_bindings))
+        checks, check = [], fusion._PlainMoEShared.check
+        guards = [entered._unsloth_moe_verify_context[1].shared, shared] if rows > 1 else [shared]
+        monkeypatch.setattr(fusion._PlainMoEShared, "check", lambda self: (checks.append(self), check(self))[1])
+        mx.eval(entered(owner, ids))
+        assert checks == guards
+        if change == "class":
+            call = type(owner.blocks[1].switch_mlp).__call__
+            monkeypatch.setattr(type(owner.blocks[1].switch_mlp), "__call__", lambda self, *a, **kw: call(self, *a, **kw) + 16)
+        elif change == "global": monkeypatch.setattr(nn, "silu", lambda a: a + 1)
+        else: owner.blocks[1].switch_mlp.down_proj.weight = mx.zeros_like(owner.blocks[1].switch_mlp.down_proj.weight)
+        monkeypatch.setattr(fusion._PlainMoE, "run", lambda self, rows, run = fusion._PlainMoE.run: (checks.append(self), run(self, rows))[1])
+        _equal(mx.stack(entered(owner, ids)), mx.stack([Qwen4ExpBatchInvariantForward()._feed_forward(block, x) for block in owner.blocks]))
+        assert checks == guards + guards + ([plans[0]] if change == "instance" else [])
+        assert getattr(fusion._VERIFY_STATE, "plain_moe", None) is None
+    assert "_unsloth_plain_moe_shared" not in vars(owner)
+
+
+@pytest.mark.parametrize("shared_gate", [False, True, "shared", "router", "scale", "scale_helper", "scale_namespace", "switch_call", "router_call", "switch_bases", "pack_call"])
+def test_plain_moe_qwen4_keeps_custom_shared_projections_native(shared_gate, monkeypatch):
+    block, x = _plain_qwen4(256), mx.ones((1, 1, 512), mx.bfloat16)
+    projection = block.switch_mlp if shared_gate in ("switch_call", "switch_bases", "pack_call") else block if shared_gate in ("scale", "scale_helper", "scale_namespace", "router_call") else block.gate if shared_gate == "router" else block.shared_expert if shared_gate == "shared" else block.shared_expert_gate if shared_gate else block.shared_expert.gate_proj
+    name = "_shared_expert_scale" if shared_gate in ("scale", "scale_helper", "scale_namespace") else "__call__"
+    native = getattr(type(projection), name)
+    if shared_gate == "scale":
+        shifted = lambda self, a: native(self, a) + self.shift
+        monkeypatch.setattr(type(projection), name, FunctionType(shifted.__code__, native.__globals__, closure = shifted.__closure__))
+    elif shared_gate == "scale_helper":
+        monkeypatch.setitem(native.__globals__, "_row_invariant_quantized_projection", lambda linear, a: linear(a) + block.shift)
+    elif shared_gate == "scale_namespace":
+        monkeypatch.setattr(type(block), name, FunctionType(native.__code__, {**native.__globals__, "_row_invariant_quantized_projection": lambda linear, a: linear(a) + block.shift}))
+    elif shared_gate == "pack_call":
+        project = fusion._PackedMoEGateUp.project
+        monkeypatch.setattr(fusion._PackedMoEGateUp, "project", lambda self, *a, **kw: tuple(y + block.switch_mlp.shift for y in project(self, *a, **kw)))
+    elif shared_gate not in ("switch_call", "router_call", "switch_bases"):
+        projection.__class__ = type("ShiftedProjection", (type(projection),), {name: lambda self, a: native(self, a) + self.shift})
+    projection.shift = 0
+    with fusion.inference_scopes(block), contextlib.ExitStack() as restore:
+        if shared_gate == "switch_bases": restore.callback(setattr, type(projection), "__bases__", type(projection).__bases__)
+        if shared_gate == "switch_bases": type(projection).__bases__ = (type("ChangedMRO", type(projection).__bases__, {}),)
+        if shared_gate in ("switch_call", "router_call"):
+            native = type(projection).__call__
+            monkeypatch.setattr(type(projection), name, lambda self, *a, **kw: native(self, *a, **kw) + self.shift)
+        mx.eval(block(x))
+        assert getattr(getattr(block, "_unsloth_moe_routed", None), "plain_plan", None) is None
+        projection.shift = 1
+        expected = type(block)._unsloth_router_native.__call__(block, x)
+        _equal(block(x), expected + projection.shift if shared_gate == "router_call" else expected)
+
+
+@pytest.mark.parametrize("target,name", [("shared_expert.__class__", "__call__"), ("_unsloth_router_native", "_shared_expert_scale"), ("QuantizedLinear", "__call__"), ("_unsloth_router_native", "__call__"),
+    ("switch_mlp._unsloth_moe_gate_up.original_class", "__call__"), ("switch_mlp.activation.__class__", "__call__"), ("switch_mlp._unsloth_moe_gate_up.original_class", "_combine"), ("__class__", "__call__"), ("switch_mlp.__class__", "__call__"), ("switch_mlp._unsloth_moe_gate_up.__class__", "project")])
+def test_plain_moe_qwen4_refuses_cached_contract_drift(target, name, monkeypatch):
+    block = _plain_qwen4(256)
+    with fusion.inference_scopes(block):
+        experts = block._unsloth_moe_routed
+        assert (initial := fusion._plain_moe_plan(block, experts)) is not None
+        resolve, contract = fusion._resolved_bindings, {**fusion._PLAIN_MOE_CONTRACT, **fusion._DENSE_QMM_CONTRACT}
+        monkeypatch.setattr(fusion, "_resolved_bindings", lambda query, snapshot = resolve(contract): snapshot if query == contract else resolve(query))
+        holder = fusion._resolve_dotted(nn if target == "QuantizedLinear" else block, target)
+        original, raw, shift = getattr(holder, name), inspect.getattr_static(holder, name), [0]
+        def changed(*args, **kwargs):
+            output = original(*args, **kwargs)
+            return tuple(value + shift[0] for value in output) if isinstance(output, tuple) else output + shift[0]
+        replacement = FunctionType(changed.__code__, original.__globals__, closure = changed.__closure__)
+        monkeypatch.setattr(holder, name, staticmethod(replacement) if isinstance(raw, staticmethod) else replacement)
+        assert fusion._plain_moe_plan(block, experts) is None
+        assert not fusion._PlainMoE(block, experts, initial.shared_bindings).shared.check()
+
+
+@pytest.mark.parametrize("rows", [1, 3])
+@pytest.mark.parametrize("failure", ["bits", "build", "compile", "plan"])
+def test_plain_moe_qwen4_failed_actual_verdict_stays_native(monkeypatch, failure, rows):
+    block, x = _plain_qwen4(256), mx.ones((1, rows, 512), mx.bfloat16)
+    reference = mx.concatenate([block(x[:, i:i + 1]) for i in range(rows)], axis = 1)
+    run, ready, staged = fusion._PlainMoE.run, [], fusion._staged_ready
+    monkeypatch.setattr(fusion, "_staged_ready", lambda: ready.append(True) or staged())
+    def wrong(self, value, *args):
+        assert failure == "plan" or ready
+        if failure in ("build", "plan"): raise ValueError("candidate construction failed")
+        if failure == "compile":
+            kernel = mx.fast.metal_kernel(name = "unsloth_plain_moe_test_failure", input_names = ["x"], output_names = ["y"], source = "invalid_plain_moe_source;")
+            return kernel(inputs = [value], grid = (32, 1, 1), threadgroup = (32, 1, 1), output_shapes = [value.shape], output_dtypes = [value.dtype])[0]
+        return run(self, value) + 1
+    monkeypatch.setattr(fusion._PlainMoE, "__init__" if failure == "plan" else "run", wrong)
+    with fusion.inference_scopes(block):
+        ready.clear()
+        experts = block._unsloth_moe_routed
+        call = lambda: experts.verify(block, x, lambda: reference) if rows > 1 else block(x)
+        def check():  # an unplanned verify block returns None: the caller's routed path takes it
+            out = call()
+            assert out is None if failure == "plan" and rows > 1 else _equal(out, reference) is None
+        check()
+        plan = experts.verify_plans[rows] if rows > 1 else experts.plain_plan
+        assert (plan is None if failure == "plan" else plan.verdict is False)
+        check()
+
+
+def test_plain_moe_keeps_qwen35_on_its_existing_route():
+    block = _expert_block(vlm_qwen, (4, "affine", 32), mx.bfloat16, experts = 512)
+    with fusion.inference_scopes(block):
+        assert not block._unsloth_moe_routed.plain_enabled
+
+
+def test_plain_moe_qwen4_leaves_speculative_calls_native():
+    block = _plain_qwen4(256)
+    with fusion.inference_scopes(block):
+        block.__dict__["_unsloth_speculative_call"] = 1
+        routed = block._unsloth_moe_routed
+        assert routed.plain(block, mx.ones((1, 1, 512), mx.bfloat16), lambda: None) is None
+        assert not routed.plain_built
+
+
+@pytest.mark.parametrize("low", [0, 4])
+def test_verify_moe_qwen4_takes_fast_verify_blocks_unless_lanes_hold_them(low, monkeypatch):
+    block = _plain_qwen4(256)
+    inputs = {rows: mx.ones((1, rows, 512), mx.bfloat16) for rows in (3, 5)}
+    references = {rows: mx.concatenate([block(x[:, i:i + 1]) for i in range(rows)], axis = 1) for rows, x in inputs.items()}
+    mx.eval(references)
+    monkeypatch.setattr(fusion, "_LANE_LOW_ROWS", low)
+    with fusion.inference_scopes(block):
+        for p in (block.shared_expert.gate_proj, block.shared_expert.up_proj, block.shared_expert.down_proj):
+            p._unsloth_lane_verify_scopes = 1
+            p.__class__ = fusion._lane_module_class(type(p))
+        experts = block._unsloth_moe_routed
+        assert (fusion._plain_moe_plan(block, experts, 3) is not None) == bool(low)
+        for rows in (3, 5):   # a plan admitted within the threshold is not reused past it
+            _equal(experts.verify(block, inputs[rows], lambda: references[rows]), references[rows])
+        assert [experts.verify_plans[rows] is not None for rows in (3, 5)] == [bool(low), False]
+
+
+@pytest.mark.parametrize("width", [64, 128])
+def test_plain_moe_qwen4_keeps_native_quad_shared_projection(width):
+    block, x = _plain_qwen4(width), mx.ones((1, 1, 512), mx.bfloat16)
+    expected = block(x)
+    with fusion.inference_scopes(block):
+        _equal(block(x), expected)
+        assert block._unsloth_moe_routed.plain_plan is None
+
+
 def _samples(model, dtype, width, shapes):
     built = []
     for batch, length in shapes:
@@ -573,7 +934,7 @@ def _native_combine(y, inv_order, scores):
 
 
 @pytest.mark.parametrize("dtype", fusion._MOE_COMBINE_DTYPES)
-@pytest.mark.parametrize("top_k, width", [(8, 2048), (3, 96)])
+@pytest.mark.parametrize("top_k, width", [(8, 2048), (3, 96), (10, 2560)])  # past eight routes MLX sums in lanes
 def test_combine_kernel_reproduces_the_native_weighted_sum(dtype, top_k, width):
     for tokens in (1, 300):
         mx.random.seed(tokens + top_k)

@@ -375,6 +375,39 @@ def test_offloaded_table_matches_stock(tmp_path, kind, fraction):
     assert sorted(os.listdir(tmp_path)) == listing  # nothing is written next to the checkpoint
 
 
+@pytest.mark.parametrize("kind", ["dense", "quantized", "sharded_quantized"])
+def test_staged_rows_match_stock_once_filled(tmp_path, kind, monkeypatch):
+    name, module = _table(kind)
+    model = _lazy_copy(lambda: _holder(name, module), str(tmp_path))
+    steps = [mx.array([[7, 401, 7]]), mx.array([[3, 250, 470]])]  # a repeat, then other rows
+    expected = [_site(model, name)(ids) for ids in steps]
+    offload_ple(model, str(tmp_path), 1.0)
+    table, outs, rivals, evaluate = _site(model, name), [], [], mx.eval
+    monkeypatch.setattr(mx, "async_eval", lambda ids, queued = (queued := []): queued.append((ids.dtype, ids.ndim, ids.tolist())))
+    # Another forward asks for the slot while this one waits on the slot's last reader.
+    monkeypatch.setattr(mx, "eval", lambda *arrays: rivals.append(table._staged(steps[0])) or evaluate(*arrays))
+    zoo_offload.STAGED_FILLS.fills = fills = []
+    try:
+        for ids in steps:
+            outs.append(table(ids + 0))
+            assert len(fills) == 1
+            fills.pop()()  # the next lookup reuses these rows: the first result must not read the second's
+            # Another thread stages its own rows, never reading this thread's graph or buffers.
+            other = []
+            thread = threading.Thread(target = lambda: other.append(table._staged(steps[1])))
+            thread.start()
+            thread.join()
+            assert other and other[0] is not None
+            other[0][1].abandon()
+    finally:
+        zoo_offload.STAGED_FILLS.fills = None
+    assert rivals and all(rival is None for rival in rivals)
+    assert len(queued) == 4 and all(a == (mx.int64, 1, b.reshape(-1).tolist()) for a, b in zip(queued, (steps[0], steps[1], steps[1], steps[1])))
+    for actual, reference in zip(outs, expected):
+        assert actual.dtype == reference.dtype and actual.shape == reference.shape
+        np.testing.assert_array_equal(_bits(actual), _bits(reference))
+
+
 def test_offloaded_rows_the_page_cache_dropped_are_read_again(tmp_path, monkeypatch):
     name, module = _table("sharded_quantized")
     model = _lazy_copy(lambda: _holder(name, module), str(tmp_path))
@@ -390,6 +423,10 @@ def test_offloaded_rows_the_page_cache_dropped_are_read_again(tmp_path, monkeypa
             monkeypatch.setattr(zoo_offload, "_in_core", lambda mapped, rows, row_bytes: rows >= 10)
         np.testing.assert_array_equal(_bits(table(ids)), _bits(expected))
     assert reads == [4 * fields, 0, 2 * fields]
+    for resident in (False, True, False):
+        monkeypatch.setattr(zoo_offload, "_in_core", lambda mapped, rows, row_bytes: np.full(rows.size, resident or row_bytes > 8))
+        np.testing.assert_array_equal(_bits(table(mx.array([[143]]))), _bits(module(mx.array([[143]]))))
+        assert reads[-1] == fields * (not resident)
     # More seen rows than the sample: a spread sample of every field checked row by row, or all rows when one was evicted (here late rows of scales and biases).
     table(many)
     for evicted in (False, True):
@@ -405,6 +442,9 @@ def test_offloaded_rows_the_page_cache_dropped_are_read_again(tmp_path, monkeypa
     pages[[2 * mmap.PAGESIZE + 5, 3 * mmap.PAGESIZE, 5 * mmap.PAGESIZE]] = 1
     assert in_core(pages, np.array([0, 2, 3]), mmap.PAGESIZE).tolist() == [False, True, True]
     assert in_core(pages, np.array([0, 1]), 3 * mmap.PAGESIZE).tolist() == [False, False]
+    # One row at a time, as the sample is checked; the last two rows span a resident page and an evicted one.
+    rows = ((0, 1), (2, 1), (1, 2), (2, 1.5), (4, 0.875))
+    assert [in_core(pages, np.array([r]), int(n * mmap.PAGESIZE)).tolist() for r, n in rows] == [[False], [True], [True], [False], [False]]
 
 
 def test_offloaded_rows_are_never_loaded(tmp_path):
@@ -1019,7 +1059,7 @@ def test_offloadable(tmp_path):
 def _inventory(ple = 30, experts = 64, floor = 2, per_layer = 64):
     return {
         "total_bytes": 0, "ple_bytes": ple, "expert_bytes": experts, "expert_floor_bytes": floor,
-        "experts_per_layer": per_layer, "expert_layer_bytes": 0, "ple": None, "experts": None,
+        "experts_per_layer": per_layer, "expert_layer_bytes": 1, "ple": None, "experts": None,
     }
 
 
@@ -1029,7 +1069,7 @@ def units(monkeypatch):
     # 4096 context tokens (16) fit beside them.
     monkeypatch.setattr(zoo_offload, "_OFFLOAD_CONTEXT", 4096)
     monkeypatch.setattr(zoo_offload, "_PLE_OVERHEAD", 1)
-    monkeypatch.setattr(zoo_offload, "_CACHE_CAP", 2)
+    monkeypatch.setattr(zoo_offload, "_CACHE_CAP", 0)
     monkeypatch.setattr(zoo_offload, "SAFETY_MARGIN", (0, 0))
     return monkeypatch
 
@@ -1060,6 +1100,7 @@ def test_offload_inventory(tmp_path):
         "expert_floor_bytes": experts * 8 // 64, "experts_per_layer": 64, "expert_layer_bytes": experts,
         "ple": None, "experts": None,
     }
+    assert offload_footprint(inventory, 1.0, 0.5) == 5 * experts // 2 + (256 << 20) + (1 << 30)
     # Loaded at four bytes an element, floating-point tensors (bf16 here) double; packed weights do not.
     widened = sum(v.size * 4 if mx.issubdtype(v.dtype, mx.floating) else v.nbytes for _, v in tree_flatten(lazy.parameters()))
     inventory = offload_inventory(str(tmp_path), 4)
@@ -1094,6 +1135,7 @@ def test_offload_inventory(tmp_path):
 
 
 def test_plan_offload_rule(units):
+    assert [zoo_offload.prefill_step_limit(budget=b, resident=4, inventory=_inventory(), context_cost=lambda t, s: 16 + s, context=4096, ple=None, experts=None) for b in (4209, 8306, 16498)] == [4095, 8192, 8192]
     plan = lambda ple, experts, context, step: {"ple": ple, "experts": experts, "context": context, "prefill_step": step}
     # 8192 tokens (32 units) is the ceiling; without offloaded experts the step stays 2048.
     assert _plan(200) == plan(None, None, 8192, 2048)
@@ -1140,6 +1182,8 @@ def test_plan_offload_rule(units):
     assert offload_footprint(inventory, 1.0, 0.5) == 1 + 32 + 2
     assert offload_footprint(inventory, 0.5, 1.0) == 15 + 1 + 2 + 2
     assert offload_footprint({**inventory, "ple": "no table", "expert_bytes": 0}, 1.0, 1.0) == 0
+    units.setattr(zoo_offload, "_CACHE_CAP", 2); units.setattr(zoo_offload, "_PLE_OVERHEAD", 3)
+    assert _plan(44, context = 4096, prefill_step = 2048) == plan(1.0, 45 / 64, 4096, 2048)
 
 
 def test_context_bytes(tmp_path):
@@ -1167,11 +1211,11 @@ def test_auto_offload(tmp_path, monkeypatch):
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # nothing to offload, nothing said
         assert _auto_offload(model, str(tmp_path), _parts("auto", "auto"), 4096, mx.bfloat16) == _parts()
-    seen = {}
+    assert model._unsloth_auto_prefill_step == 8192; seen = {}
     monkeypatch.setattr(zoo_offload, "plan_offload", lambda **k: seen.update(k) or {"ple": None, "experts": 0.75, "context": 4096, "prefill_step": 8192})
-    with pytest.warns(UserWarning, match = r"offload 'auto' leaves 75% .*fit in .*prefill_step_size=8192.*'experts' to 'off'"):
+    with pytest.warns(UserWarning, match = r"offload 'auto' leaves 75% .*fit in .*prefill_step_size.*8192.*'experts' to 'off'"):
         assert _auto_offload(model, str(tmp_path), _parts(0.5, "auto"), 4096, mx.float32) == _parts(0.5, 0.75)
-    assert seen["offload"] == _parts(0.5, "auto")
+    assert seen["offload"] == _parts(0.5, "auto") and seen["budget"] == 64 << 30 and seen["prefill_step"] == 2048 and model._unsloth_auto_prefill_step == 8192
     # The checkpoint's size and what this model can offload, at the dtype the load converts to.
     assert seen["inventory"] == {**offload_inventory(str(tmp_path), 4), **offloadable(model, str(tmp_path), cast_dtype = mx.float32)}
     assert seen["inventory"]["expert_bytes"] > offloadable(model, str(tmp_path))["expert_bytes"]
