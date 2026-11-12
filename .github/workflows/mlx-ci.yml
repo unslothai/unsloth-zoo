@@ -34,7 +34,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       contains(github.event.pull_request.labels.*.name, 'mlx')
     runs-on: macos-15   # Apple Silicon (M1) hosted runner
-    timeout-minutes: 30
+    timeout-minutes: 45   # the Metal suite runs ~30 min on the hosted M1 before its last steps
     strategy:
       fail-fast: false
       matrix:
@@ -194,6 +194,10 @@ jobs:
         # A finished load must own its weights; an offloaded one reads PLE rows and
         # experts from the checkpoint, bit-exact against the stock modules.
         run: python -m pytest tests/test_mlx_load_residency_metal.py -v -rs
+
+      - name: tests/test_mlx_speculative_metal.py (qwen4_exp)
+        # Only the random qwen4_exp cases: the rest load bf16 checkpoints this runner cannot hold.
+        run: python -m pytest tests/test_mlx_speculative_metal.py -k qwen4 -v -rs
 
       - name: tests/test_mlx_generate_metal.py
         # Batched generation on real models: batched-vs-sequential greedy
