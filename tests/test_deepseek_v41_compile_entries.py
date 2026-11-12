@@ -42,6 +42,8 @@ _DISABLED = {
     "_tp_grad_group",
     "_validate_attention_tp_divisibility",
     "_quantize_qat",
+    "_fake_quant_fp8_block",
+    "_fake_quant_fp4_block",
 }
 
 

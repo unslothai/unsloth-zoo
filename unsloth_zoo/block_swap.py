@@ -1353,7 +1353,19 @@ def _mark_host_kept(model):
     params = list(model.named_parameters(remove_duplicate = False))
     # Whole owner module (FP8Embedding's weight_scale sits beside the table), tagged on the module
     # because a load to host replaces the Parameter.
-    for owner in {n.rsplit(".", 1)[0] for n, _ in params if any(n == x or n.endswith("." + x) for x in names)}:
+    try:
+        from .device_map_planner import no_placement_matcher
+    except ImportError:  # loaded as a standalone file (tests): same rule, inline
+        def no_placement_matcher(model, names):
+            dotted = [n for n in names if "." in n]
+            bare = {n for n in names if "." not in n}
+            no_split = set(getattr(model, "_no_split_modules", None) or [])
+            roots = {p for p, m in model.named_modules() if type(m).__name__ in no_split} if bare else set()
+            return lambda name: any(name == n or name.endswith("." + n) for n in dotted) or (
+                name.rpartition(".")[2] in bare and name.rpartition(".")[0] in roots
+            )
+    match = no_placement_matcher(model, names)
+    for owner in {n.rsplit(".", 1)[0] for n, _ in params if match(n)}:
         model.get_submodule(owner)._unsloth_host_kept = True
 
 

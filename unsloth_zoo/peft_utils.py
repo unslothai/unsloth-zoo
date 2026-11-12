@@ -41,6 +41,28 @@ MOE_ROUTER_MODULES = frozenset((
 ))
 
 
+# Qwen4Exp (Qwen3.8-Flash-Next): the QSA indexer picks key blocks with an integer top-k, so the LM loss sends its
+# index_qk_proj no gradient (ms-swift also leaves it out of all-linear). Its PLE key_proj / value_proj and the
+# model-level hyper_connection_mixer carry no attention / mlp tag on a text-only load, so they get named branches.
+QWEN4_EXP_MODEL_TYPES = frozenset(("qwen4_exp", "qwen4_exp_text"))
+
+
+def _config_model_types(model):
+    """model_type of the config and of every nested sub-config."""
+    out, seen = set(), set()
+    stack = [getattr(model, "config", None)]
+    while stack:
+        cfg = stack.pop()
+        if cfg is None or id(cfg) in seen:
+            continue
+        seen.add(id(cfg))
+        out.add(str(getattr(cfg, "model_type", "") or "").lower())
+        for value in list(vars(cfg).values()) if hasattr(cfg, "__dict__") else []:
+            if hasattr(value, "model_type") and not isinstance(value, (str, int, float, bool)):
+                stack.append(value)
+    return out
+
+
 def _moe_router_gate_names(model):
     """`gate` Linears beside `experts` or inside a router module (AfMoE's mlp.router.gate)."""
     modules = dict(model.named_modules())
@@ -347,6 +369,22 @@ def get_peft_regex(
         if _scoped(["patch_dense"]):          vision_cores.append(r"\bvision_embedder\.patch_dense")
         if _scoped(["input_proj"]):           vision_cores.append(r"\bvision_tower\.patch_embedder\.input_proj")
         candidate_branches += _linear_aware_branches(vision_cores)
+    _is_qwen4_exp = bool(_config_model_types(model) & QWEN4_EXP_MODEL_TYPES)
+    if _is_qwen4_exp and finetune_language_layers:
+        qwen4_cores = []
+        if finetune_mlp_modules:
+            qwen4_cores += [r"\.ple\." + re.escape(x) for x in _scoped(["key_proj", "value_proj"])]
+        qwen4_cores += [r"\bhyper_connection_mixer\." + re.escape(x)
+                        for x in _scoped(["input_mix_weight_down", "input_mix_weight_up"])]
+        candidate_branches += _linear_aware_branches(qwen4_cores)
+    # DeepSeek-V4.1 (community port): the engram's wkv (layers.N.engram.wkv) has no attention / mlp ancestor; it is the
+    # memory branch's input projection, so it follows the language + mlp flags.
+    _dsv41_engram = [
+        name + ".wkv" for name, module in model.named_modules()
+        if type(module).__name__ == "DeepseekV41Engram"
+    ]
+    if _dsv41_engram and finetune_language_layers and finetune_mlp_modules and _scoped(["wkv"]):
+        candidate_branches.append(r"(?:.*?\.engram\.wkv)")
     # _linear_aware_branches already emits only real Linear matches; this re-filter is for safety and mirrors PEFT's own re.fullmatch matcher exactly.
     extra_branches = [
         branch for branch in candidate_branches
@@ -398,7 +436,41 @@ def get_peft_regex(
             f"Unsloth: leaving {len(router_gates)} MoE router gate(s) out of the LoRA targets, "
             f"e.g. {router_gates[0]}. Add \"gate\" to target_modules to train them."
         )
-    excluded = placeholders + router_gates
+    # Qwen4Exp QSA indexer: integer top-k, no gradient from the LM loss. An explicit target_modules still opts in.
+    indexers = []
+    if _is_qwen4_exp:
+        indexers = [
+            name for name in linear_modules
+            if ".indexer." in name and re.fullmatch(regex_matcher, name, flags = re.DOTALL)
+        ]
+        if indexers and target_modules is None:
+            print(
+                f"Unsloth: leaving {len(indexers)} QSA indexer projection(s) out of the LoRA targets "
+                f"(e.g. {indexers[0]}): its integer top-k gets no gradient, so an adapter there would not train."
+            )
+        elif indexers:
+            logger.warning(
+                f"Unsloth: target_modules selects {len(indexers)} QSA indexer projection(s) such as "
+                f"{indexers[0]}; the integer top-k sends them no gradient, so these adapters will not train."
+            )
+            indexers = []
+    # DeepSeek-V4.1's CSA indexer only picks integer top-k entries: the LM loss never reaches it, so an adapter there
+    # never trains. Only an explicit target_modules list selects it.
+    indexer_prefixes = tuple(
+        name + "." for name, module in model.named_modules()
+        if type(module).__name__ == "DeepseekV41Indexer"
+    ) if target_modules is None else ()
+    indexer_linears = [
+        name for name in linear_modules
+        if indexer_prefixes and name.startswith(indexer_prefixes)
+        and re.fullmatch(regex_matcher, name, flags = re.DOTALL)
+    ]
+    if indexer_linears:
+        logger.info(
+            f"Unsloth: leaving {len(indexer_linears)} DeepSeek-V4.1 sparse indexer projection(s) out of the LoRA "
+            f"targets, e.g. {indexer_linears[0]}: its top-k selection gets no gradient from the LM loss."
+        )
+    excluded = placeholders + router_gates + indexers + indexer_linears
     if excluded:
         regex_matcher = (
             r"(?!(?:" + "|".join(re.escape(x) for x in excluded) + r")$)(?:" + regex_matcher + r")"
