@@ -2375,6 +2375,33 @@ def test_block_swap_gives_no_credit_for_a_storage_the_inferred_owner_still_views
         BlockSwap(blocks, 6, device = "cuda")
 
 
+def test_install_holds_no_reference_to_a_credited_storage_while_packing(monkeypatch):
+    # The credit assumes a CPU original's storage is freed as its block is packed: install must not keep it alive.
+    import os, weakref, numpy as np, pytest
+    if not torch.cuda.is_available() or os.name == "nt" or not _mod._can_register():
+        pytest.skip("needs CUDA")
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(4)]).cuda()
+    big = np.zeros(8 * 256 * 256, dtype = np.float32)       # a larger storage the last block's weight views
+    gone = weakref.ref(big)
+    blocks[3].w.weight.data = torch.from_numpy(big)[:256 * 256].view(256, 256)
+    blocks[3].c.weight.data = blocks[3].c.weight.data.cpu()
+    blocks[3].lora.data = blocks[3].lora.data.cpu()
+    del big
+    seen = {}
+    pack = _mod.BlockSwap._pack
+
+    def spy(self):
+        pack(self)
+        import gc
+        gc.collect()
+        seen["freed"] = gone() is None
+    monkeypatch.setattr(_mod.BlockSwap, "_pack", spy)
+    sw = BlockSwap(blocks, [3], device = "cuda")
+    assert sw._host_credit[0] >= 8 * 256 * 256 * 4
+    assert seen["freed"], "the credited storage was still alive after packing"
+    sw.remove()
+
+
 def test_remove_drops_the_reserve_references():
     fake = types.SimpleNamespace(handles = [], free = {}, blocks = [], _chunks = [], streams = {},
                                  _reserve_layers = nn.ModuleList([nn.Linear(2, 2)]), _reserve_owner = object())

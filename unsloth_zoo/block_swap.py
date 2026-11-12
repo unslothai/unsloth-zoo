@@ -314,6 +314,30 @@ def _chunked_commits(block_sizes):
     return out
 
 
+def _creditable_host_storages(swapped, layers, owner):
+    """{storage ptr: bytes} of the CPU storages packing `swapped` frees, and {ptr: user set}. Pointers and sizes
+    only: a storage reference held past this call would keep the storage alive while packing assumes it is gone."""
+    host_storages, users = {}, {}
+    for li, layer in enumerate(swapped):
+        for _, p in _swappable(layer):
+            if p.device.type == "cpu":
+                st = p.data.untyped_storage()
+                host_storages[st.data_ptr()] = st.nbytes()
+                users.setdefault(st.data_ptr(), set()).add(li)
+    swapped_ids = {id(p) for layer in swapped for _, p in _swappable(layer)}
+    # Buffers too: a registered buffer viewing a weight's storage keeps it alive after the weight is rebound.
+    if owner is not None:
+        everything = itertools.chain(owner.parameters(), owner.buffers())
+    else:
+        everything = (q for layer in layers for q in itertools.chain(layer.parameters(), layer.buffers()))
+    for q in everything:
+        if q.device.type == "cpu" and id(q) not in swapped_ids:
+            ptr = q.data.untyped_storage().data_ptr()
+            if ptr in users:
+                users[ptr].add(-1)
+    return {ptr: n for ptr, n in host_storages.items() if len(users[ptr]) == 1}, users
+
+
 class _HostWalk:
     """Host RAM over install's packing walk. Block k's bytes are committed (`commits`, cumulative) before its
     original's storage (`credits[k]`) is released, so the peak is the largest committed-through-k less
@@ -595,15 +619,6 @@ class BlockSwap:
         # A storage is freed only once every tensor on it is gone: credit only one that lives in a single swapped
         # layer's swappable weights (a 10 GiB storage viewed by ten layers stays resident until the last is packed,
         # and one also viewed from outside the swapped weights is never freed by packing).
-        host_storages, users = {}, {}
-        for li, layer in enumerate(swapped):
-            for _, p in _swappable(layer):
-                if p.device.type == "cpu":
-                    st = p.data.untyped_storage()
-                    host_storages[st.data_ptr()] = st.nbytes()
-                    users.setdefault(st.data_ptr(), set()).add(li)
-        swapped_ids = {id(p) for layer in swapped for _, p in _swappable(layer)}
-        # Buffers too: a registered buffer viewing a weight's storage keeps it alive after the weight is rebound.
         # The whole model when it is known, passed or inferred from find_decoder_layers: an alias outside the
         # decoder list (a tied head, a model-level buffer) keeps the storage alive just the same.
         owner = model
@@ -613,16 +628,7 @@ class BlockSwap:
             except TypeError:  # a plain list of layers
                 owner = None
             owner = owner() if owner is not None else None
-        if owner is not None:
-            everything = itertools.chain(owner.parameters(), owner.buffers())
-        else:
-            everything = (q for layer in layers for q in itertools.chain(layer.parameters(), layer.buffers()))
-        for q in everything:
-            if q.device.type == "cpu" and id(q) not in swapped_ids:
-                ptr = q.data.untyped_storage().data_ptr()
-                if ptr in users:
-                    users[ptr].add(-1)
-        host_storages = {ptr: n for ptr, n in host_storages.items() if len(users[ptr]) == 1}
+        host_storages, users = _creditable_host_storages(swapped, layers, owner)
         # A file-backed (mmap) storage is page cache that available RAM already counts: no extra headroom.
         file_backed = _file_backed_ranges()
         # Per block, the credited bytes its packing gives back: the ledger tracks what is still to come from that.
