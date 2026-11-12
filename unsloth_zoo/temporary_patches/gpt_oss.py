@@ -50,11 +50,14 @@ try:
 except Exception:
     def _fused_route_or_none(*args, **kwargs):
         return None
-try:
-    from unsloth_zoo.gradient_checkpointing import moe_checkpoint_routing as _checkpoint_routing
-except Exception:
-    def _checkpoint_routing(module, router_indices, routing_weights):
+def _checkpoint_routing(module, router_indices, routing_weights):
+    # Imported at call time (like forward_moe_backend): importing gradient_checkpointing with this module would
+    # fix its autocast device before the caller (a test, or a late device setup) has chosen one.
+    try:
+        from unsloth_zoo.gradient_checkpointing import moe_checkpoint_routing
+    except ImportError:
         return router_indices, routing_weights
+    return moe_checkpoint_routing(module, router_indices, routing_weights)
 from .gpt_oss_routed import (
     ROUTED_MAX_SLOTS, prepare_routed_experts, routed_decode_epoch, routed_experts_forward, routed_mlp_forward,
 )
