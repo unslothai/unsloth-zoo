@@ -30,6 +30,40 @@ from .ops import Bf16StoredLinear, patch_causal_conv1d_fallback, patch_chunked_c
 _DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 # unsloth/Qwen3-0.6B-unsloth-bnb-4bit -> unsloth/Qwen3-0.6B
 _PREQUANTIZED_SUFFIX = re.compile(r"(-unsloth)?-bnb-4bit$", re.IGNORECASE)
+# GPU FastLanguageModel / FastModel.from_pretrained keywords: never model kwargs, so never forwarded to
+# AutoModelForCausalLM.from_pretrained (the model's __init__ rejects them).
+# Compile / logging / multimodal knobs with no CPU meaning: dropped.
+_GPU_LOADER_KWARGS_IGNORED = (
+    "load_in_4bit", "load_in_8bit", "quantization_config", "use_exact_model_name",
+    "max_lora_rank", "gpu_memory_utilization", "float8_kv_cache", "random_state",
+    "fix_tokenizer", "unsloth_tiled_mlp", "offload_embedding",
+    "device_map_planner_kwargs", "float32_mixed_precision", "disable_log_stats",
+    "fullgraph", "unsloth_force_compile", "text_only", "whisper_language", "whisper_task",
+)
+# Features the CPU backend cannot run: dropped when off (None / False, the GPU defaults), refused when set,
+# so the run never silently trains without them.
+_GPU_LOADER_KWARGS_REFUSED = {
+    # The GPU route refuses CPU too: float8 GEMMs need fp8 tensor cores (compute capability 8.9+).
+    "float8_training": "float8_training needs an NVIDIA GPU with compute capability 8.9+ (fp8 tensor cores)",
+    "fp8_lora": "fp8 LoRA needs an NVIDIA GPU with compute capability 8.9+ (fp8 tensor cores)",
+    "load_in_fp8": "load_in_fp8 needs an NVIDIA GPU",
+    "qat_scheme": "qat_scheme (quantization aware training) is not supported on the CPU backend",
+    "auto_model": "auto_model is not supported on the CPU backend, which loads AutoModelForCausalLM",
+    "user_config": "user_config is not supported on the CPU backend",
+    "target_parameters": "target_parameters is not supported on the CPU backend",
+}
+
+
+def _pop_gpu_loader_kwargs(kwargs):
+    for key, reason in _GPU_LOADER_KWARGS_REFUSED.items():
+        value = kwargs.pop(key, None)
+        if value not in (None, False):
+            raise NotImplementedError(f"Unsloth (CPU): {reason}; got {key} = {value!r}. Unset it to train on CPU.")
+    for key in _GPU_LOADER_KWARGS_IGNORED:
+        kwargs.pop(key, None)
+    # GPU loaders take rope_scaling = None as "unchanged"; transformers would apply it to the config.
+    if "rope_scaling" in kwargs and kwargs["rope_scaling"] is None:
+        kwargs.pop("rope_scaling")
 
 
 def _dtype_kwarg():
@@ -155,6 +189,14 @@ def _cpu_compile_unavailable():
             pass
 
 
+def _non_reentrant_checkpointing_on(model):
+    # Re-enabling would drop an every_n_layers selection; reentrant or unknown funcs still get switched.
+    if not getattr(model, "is_gradient_checkpointing", False):
+        return False
+    funcs = [m.__dict__["_gradient_checkpointing_func"] for m in model.modules() if "_gradient_checkpointing_func" in m.__dict__]
+    return bool(funcs) and all(isinstance(getattr(f, "keywords", None), dict) and f.keywords.get("use_reentrant", True) is False for f in funcs)
+
+
 def _disable_bnb_cpu_weight_packing(model):
     """bitsandbytes (0.50) repacks a Linear4bit weight in place for its AVX512-BF16 kernel on the first
     eval forward without grad, and never unpacks it: backward through the packed weight is then wrong,
@@ -193,6 +235,10 @@ class FastCPUModel:
 
         if fast_inference:
             raise NotImplementedError("Unsloth (CPU): fast_inference (vLLM) needs a GPU.")
+        # Before anything downloads: a refused GPU-only feature fails fast.
+        _pop_gpu_loader_kwargs(kwargs)
+        # Chunked CE returns logits = None in training steps; return_logits keeps the full-logit loss.
+        return_logits = kwargs.pop("return_logits", False)
         # A separate tokenizer repo, as FastLanguageModel accepts on GPU; never a model kwarg.
         tokenizer_name = kwargs.pop("tokenizer_name", None) or model_name
         if load_in_8bit:
@@ -248,10 +294,6 @@ class FastCPUModel:
                 llm_int8_skip_modules = list(SKIP_QUANTIZATION_MODULES),
             )
         resize_model_vocab = kwargs.pop("resize_model_vocab", None)
-        for key in ("load_in_4bit", "load_in_8bit", "quantization_config", "use_exact_model_name",
-                    "max_lora_rank", "gpu_memory_utilization", "float8_kv_cache", "random_state",
-                    "fix_tokenizer", "unsloth_tiled_mlp", "offload_embedding"):
-            kwargs.pop(key, None)
 
         if quantization_config is not None:
             # Only when set: an explicit None also discards a pre-quantized checkpoint's own config.
@@ -326,7 +368,7 @@ class FastCPUModel:
             for param in model.parameters():
                 param.requires_grad_(True)
             FastCPUModel._prepare(model, use_gradient_checkpointing)
-        chunked = patch_chunked_causal_lm_loss(model)
+        chunked = False if return_logits else patch_chunked_causal_lm_loss(model)
         _print(
             f"{type(model).__name__} on {torch.get_num_threads()} CPU threads. "
             f"dtype = {dtype}, 4-bit = {use_4bit}, chunked CE = {chunked}."
@@ -352,7 +394,7 @@ class FastCPUModel:
 
     @staticmethod
     def _prepare(model, use_gradient_checkpointing):
-        if use_gradient_checkpointing in (True, "unsloth"):
+        if use_gradient_checkpointing in (True, "unsloth") and not _non_reentrant_checkpointing_on(model):
             # "unsloth" offloads activations to host RAM on GPUs; on CPU they already live there,
             # so it is plain recomputation.
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
@@ -449,7 +491,8 @@ class FastCPUModel:
         # None keeps whatever from_pretrained / get_peft_model set up; an explicit value switches it.
         if use_gradient_checkpointing is not None and hasattr(model, "gradient_checkpointing_enable"):
             if use_gradient_checkpointing:
-                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
+                if not _non_reentrant_checkpointing_on(model):
+                    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
             elif getattr(model, "is_gradient_checkpointing", False):
                 model.gradient_checkpointing_disable()
         return model
@@ -480,8 +523,8 @@ _FUSED_PROJECTIONS = {"q_proj": "qkv_proj", "k_proj": "qkv_proj", "v_proj": "qkv
 
 
 def _with_fused_projections(target_modules, leaf_names):
-    """Add the fused projection a requested split name maps to, when the model has it and not the split one,
-    so a Llama-style target list does not silently leave Phi-3's Q/K/V and MLP input projections frozen."""
+    """Add the fused projection a split name maps to when the model has it, so a Llama-style target list does not
+    silently leave Phi-3's Q/K/V and MLP input projections frozen."""
     out = list(target_modules)
     for name in target_modules:
         fused = _FUSED_PROJECTIONS.get(name)
@@ -507,8 +550,7 @@ def _adapter_base_model(model_name, token, revision, **hub_kwargs):
 
 
 def _clamp_to_learned_positions(model, max_seq_length):
-    """GPT-2 / OPT style learned position tables cannot be extended here (RoPE models can run past their
-    trained length), so a longer max_seq_length would index past the table during training."""
+    """GPT-2 / OPT learned position tables cannot be extended, so a longer max_seq_length would index past them; RoPE models can run past their trained length."""
     config = getattr(model, "config", None)
     limit = getattr(config, "max_position_embeddings", None) or getattr(config, "n_positions", None)
     if not isinstance(limit, int) or max_seq_length is None or max_seq_length <= limit:
@@ -636,8 +678,8 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
         )
     os.makedirs(save_directory, exist_ok = True)
     merged_directory = os.path.join(save_directory, "merged_16bit")
-    # Stage the merged weights unrounded: the converter casts once to each requested type, instead of
-    # rounding through fp16 / bf16 first (fp16 on a CPU without native bf16 would also clip bf16's range).
+    # Stage merged weights unrounded: the converter casts once per requested type instead of rounding through fp16/bf16
+    # first; fp16 without native bf16 would also clip bf16's range.
     unrounded = [m for m in methods if m in ("f32", "f16")]
     staged, _ = _merged_copy(self, "merged_32bit")
     staged.save_pretrained(merged_directory)

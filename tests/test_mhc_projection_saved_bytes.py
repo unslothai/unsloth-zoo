@@ -14,16 +14,11 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The eager mHC mixer saves its bf16 input for backward, not the FP32 upcast, bit for bit.
-
-transformers' DeepSeek-V4 / GLM-5.3-Flash mixer runs `input_norm` and the `fn` projection in FP32
-on `hidden_streams.flatten(2).float()`; plain autograd keeps that `[tokens, hc_mult * hidden]`
-FP32 copy (twice the bf16 streams) per mixer site. `MODULE_FORWARD_EAGER_REWRITES` routes the
-two lines through `unsloth_mhc_projection`, which reruns them in backward instead.
-"""
+"""The eager mHC mixer saves its bf16 input for backward, not the FP32 upcast that plain autograd keeps (twice the bf16
+streams per mixer site); MODULE_FORWARD_EAGER_REWRITES routes input_norm and the fn projection through
+unsloth_mhc_projection, which reruns them in backward."""
 
 import importlib
-import inspect
 import textwrap
 
 import pytest
@@ -36,7 +31,6 @@ from unsloth_zoo.compiler import (
     module_forward_source_rewrites,
 )
 from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
-    MHC_PROJECTION_SOURCE,
     MHC_SINKHORN_SOURCE,
     unsloth_mhc_projection,
 )
@@ -60,8 +54,9 @@ def _mixer(model_type, cls_name, config_type):
 
     modeling = _modeling(model_type)
     cls = getattr(modeling, cls_name, None)
-    if cls is None or MHC_PROJECTION_SOURCE not in inspect.getsource(cls.forward):
-        pytest.skip(f"{cls_name} has a different forward in this transformers")
+    if cls is None:
+        # Skip because this transformers predates the mixer class (capability check, not a layout check).
+        pytest.skip(f"transformers has no {cls_name}")
     config = transformers.AutoConfig.for_model(config_type, hidden_size = 64, hc_mult = 4, hc_sinkhorn_iters = 20)
     torch.manual_seed(0)
     mixer = cls(config)
@@ -97,10 +92,12 @@ def test_registry_rewrite_applies_and_keeps_the_sinkhorn_rewrite(model_type, cls
     modeling = _modeling(model_type)
     if cls_name not in MODULE_FORWARD_EAGER_REWRITES.get(model_type, {}):
         pytest.fail(f"{cls_name} missing from MODULE_FORWARD_EAGER_REWRITES")
-    cls = getattr(modeling, cls_name, None)
-    if cls is None or MHC_PROJECTION_SOURCE not in inspect.getsource(cls.forward):
-        pytest.skip(f"{cls_name} has a different forward in this transformers")
-    source = module_forward_eager_rewrites(modeling, model_type)[cls_name]
+    if getattr(modeling, cls_name, None) is None:
+        # Skip because this transformers predates the mixer class (capability check, not a layout check).
+        pytest.skip(f"transformers has no {cls_name}")
+    # A transformers layout no rewrite matches must fail here, not skip.
+    source = module_forward_eager_rewrites(modeling, model_type).get(cls_name)
+    assert source is not None, f"no MHC_PROJECTION_REWRITES layout matches {cls_name}.forward"
     assert "unsloth_mhc_projection(" in source and "self.fn.float()" not in source
     assert source.count(MHC_SINKHORN_SOURCE) == 1
     assert modeling.unsloth_mhc_projection is unsloth_mhc_projection

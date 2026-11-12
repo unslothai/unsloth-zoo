@@ -14,14 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Quantizing an expert stack that bitsandbytes cannot count in 32 bits.
-
-bitsandbytes' 4-bit quantize kernel indexes with a signed 32-bit int, so a
-tensor of 2**31 elements or more aborts the process rather than raising. The
-slicing path has to produce the same weights as a single call would, so the
-tests below lower the threshold and compare the two directly instead of
-allocating a 6.4e9 element stack.
-"""
+"""Expert-stack slicing for bitsandbytes' signed 32-bit element limit (2**31 elements aborts the process); tests lower
+the threshold and compare against one unsliced call."""
 from pathlib import Path
 
 import pytest
@@ -63,8 +57,7 @@ def test_sliced_quantization_matches_one_call(small_threshold):
     a = bnb.functional.dequantize_4bit(sliced.data, sliced.quant_state)
     b = bnb.functional.dequantize_4bit(whole.data, whole.quant_state)
     assert tuple(sliced.quant_state.shape) == tuple(value.shape)
-    # Same block boundaries and the same absmax per block, so this is equality,
-    # not a tolerance.
+    # Same block boundaries and absmax per block as one call, so the result must be exactly equal, not within a tolerance.
     assert torch.equal(a.reshape(value.shape), b.reshape(value.shape))
 
 
@@ -77,14 +70,12 @@ def test_sliced_quantization_round_trips(small_threshold):
         sliced.data, sliced.quant_state
     ).reshape(value.shape).to(value.dtype)
     assert back.shape == value.shape
-    # NF4 on unit-normal data lands around 0.073 mean absolute error whether or
-    # not the call is sliced, so this only catches a mangled layout, not drift.
+    # NF4 on unit-normal data gives about 0.073 mean absolute error sliced or not, so the 0.1 bound only catches a mangled layout, not drift.
     assert (back.float() - value.float()).abs().mean() < 0.1
 
 
 def test_small_stacks_take_the_unsliced_path(small_threshold):
-    """Below the threshold nothing changes, including double quantization,
-    which the sliced path deliberately turns off."""
+    """Below the threshold nothing changes, including double quantization, which the sliced path deliberately turns off."""
     value = _stack(experts=1)
     param = M._make_expert_params4bit(
         value, requires_grad=False, blocksize=64, quant_type="nf4",
@@ -101,8 +92,7 @@ def test_slicing_declines_when_one_expert_is_already_too_large(monkeypatch):
 
 
 def test_slicing_declines_on_a_partial_block(monkeypatch):
-    """An expert that is not a whole number of blocks would put a block astride
-    two slices, where byte concatenation silently rescales the tail."""
+    """An expert that is not a whole number of blocks would put a block across two slices, and byte concatenation silently rescales the tail."""
     monkeypatch.setattr(M, "_BNB_MAX_QUANTIZE_NUMEL", 2)
     value = torch.empty(4, 3, 7, dtype=torch.bfloat16, device="cuda").normal_()
     assert M._quantize_expert_stack_in_slices(
@@ -111,8 +101,7 @@ def test_slicing_declines_on_a_partial_block(monkeypatch):
 
 
 def test_sliced_dequant_matches_one_call(small_threshold):
-    """dequantize_4bit counts in 32 bits too, and unlike quantize it runs on
-    every forward, so the sliced read has to agree exactly."""
+    """dequantize_4bit also counts in 32 bits and runs on every forward unlike quantize, so the sliced read must agree with one call exactly."""
     value = _stack()
     param = M._make_expert_params4bit(
         value, requires_grad=False, blocksize=64, quant_type="nf4",
@@ -159,10 +148,8 @@ def test_ragged_slice_at_the_end(small_threshold):
     "quant_storage", [torch.uint8, torch.float16, torch.bfloat16, torch.float32]
 )
 def test_the_configured_quant_storage_survives_slicing(small_threshold, quant_storage):
-    """FSDP asks for a floating point parameter storage dtype via
-    bnb_4bit_quant_storage. Handing back uint8 silently breaks the wrap it
-    asked for, and the packed tensor is then indexed in bytes while its
-    elements are two or four bytes wide, which reads off the end of it."""
+    """FSDP asks for a floating point bnb_4bit_quant_storage; returning uint8 breaks that wrap, and indexing in bytes
+    when elements are 2 or 4 bytes reads past the end."""
     value = _stack()
     sliced = M._make_expert_params4bit(
         value, requires_grad=False, blocksize=64, quant_type="nf4",
@@ -190,10 +177,8 @@ def test_the_configured_quant_storage_survives_slicing(small_threshold, quant_st
 
 
 def test_the_forward_read_slices_too(small_threshold, monkeypatch):
-    """The recompute and grouped-mm providers read the stack through
-    moe_utils._get_base_weight on every forward, and again on every backward
-    recomputation. That read is a single dequantize call, which aborts on the
-    same element count the load-time one does."""
+    """The recompute and grouped-mm providers read the stack via moe_utils._get_base_weight on every forward and
+    backward recompute; that read is one dequantize call that aborts at the same element count as the load-time one."""
     from unsloth_zoo.temporary_patches import moe_utils as MU
 
     value = _stack()
@@ -245,15 +230,8 @@ def test_get_base_weight_is_unchanged_below_the_threshold(monkeypatch):
 
 
 def test_sliced_dequant_does_not_hold_every_slice_at_once(small_threshold, monkeypatch):
-    """Collecting the slices and calling torch.cat keeps every dense slice live
-    alongside the concatenated result, so the peak is two full stacks. Measured
-    on Inkling-Small's (256, 6144, 4096) projection that is 24.00 GiB against
-    15.98 GiB written into a preallocated output, on every forward and every
-    backward recomputation.
-
-    Asserted on torch.cat not being called, because peak memory at fixture size
-    is dominated by allocator reuse rather than by this.
-    """
+    """Avoids torch.cat, which keeps every dense slice alive beside the result (peak of two full stacks); the test
+    asserts torch.cat is not called, as fixture-size peak memory is allocator-dominated."""
     value = _stack()
     param = M._make_expert_params4bit(
         value, requires_grad=False, blocksize=64, quant_type="nf4",
@@ -282,14 +260,8 @@ def test_sliced_dequant_does_not_hold_every_slice_at_once(small_threshold, monke
 def test_the_forward_read_still_slices_from_the_cached_top_level_module(
     small_threshold, monkeypatch, tmp_path
 ):
-    """compiler.py emits `from moe_utils import ...`, so unsloth_compiled_cache
-    holds moe_utils as a TOP-LEVEL module with no package context. A relative
-    import of a sibling raises there, and because the import is guarded the
-    oversized stack would go quietly back onto the single call that aborts.
-
-    Loaded exactly that way here. With a relative import this made one
-    whole-stack call; the absolute import makes the sliced ones.
-    """
+    """compiler.py emits from moe_utils import, so the cache loads it top-level where a relative import raises; the
+    guard then falls back to one aborting whole-stack call, so it must be absolute."""
     import importlib.util
     import shutil
     import sys
@@ -332,10 +304,8 @@ def test_the_forward_read_still_slices_from_the_cached_top_level_module(
 def test_a_sliced_stack_is_as_movable_and_shardable_as_an_unsliced_one(
     small_threshold, op
 ):
-    """Params4bit.__torch_function__ rebuilds the parameter from its own
-    attributes on torch.chunk and torch.split, reading .module among them, so a
-    manually built stack that never defines it raises AttributeError where the
-    constructor path succeeds."""
+    """Params4bit.__torch_function__ rebuilds the parameter from its attributes on torch.chunk and torch.split, reading
+    .module; a hand-built stack that never sets it raises AttributeError."""
     value = _stack()
     sliced = M._make_expert_params4bit(
         value, requires_grad=False, blocksize=64, quant_type="nf4",

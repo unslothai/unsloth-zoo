@@ -14,22 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Device handling for the GRPO chunked log-softmax.
-
-`chunked_hidden_states_selective_log_softmax` multiplies the hidden states by
-the output head. When a model is dispatched across several GPUs those two can
-live on different devices, and the matmul then fails. These tests pin both
-halves of the contract:
-
-  1. on one device the result is unchanged, bit for bit
-  2. with the head on another device it runs, and agrees with the single-device
-     result, and hands the answer back on the caller's device
-
-It also pins the row cap: `max_rows_per_chunk` splits the loop further without
-moving the answer, its default comes from UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK read
-when the def runs, and the traced body never touches `os.environ` (that is
-unsupported under fullgraph on torch 2.4).
-"""
+"""GRPO chunked log-softmax: a head on another GPU must match the single-device result on the caller's device;
+max_rows_per_chunk (env UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK, read at def time) must not change results; the traced body
+must not read os.environ (fullgraph on torch 2.4 rejects it)."""
 import ast
 import inspect
 import os
@@ -140,12 +127,7 @@ def _function_source():
 
 
 def test_the_body_never_touches_os_environ():
-    """`os.environ` is an unsupported Python op under `fullgraph = True` on
-    torch 2.4: Dynamo raises "const method call bytes.decode" out of
-    `os._Environ.__getitem__`, and the eager fallback only catches
-    recompile-limit and disabled-hook breaks, so the first GRPO log-softmax
-    call dies -- even with the variable unset. The read has to stay in the
-    signature default, which runs when the def runs."""
+    """os.environ in the traced body breaks fullgraph=True on torch 2.4 (bytes.decode), which the eager fallback misses; read it in the signature default."""
     src, node = _function_source()
     body_src = "\n".join(ast.get_source_segment(src, stmt) or "" for stmt in node.body)
     assert "os.environ" not in body_src, (

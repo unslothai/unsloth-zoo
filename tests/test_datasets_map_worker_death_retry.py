@@ -14,18 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests patch_datasets_map_worker_death_retry in temporary_patches/misc.py.
-
-A long-text corpus can have the kernel OOM-kill a `dataset_num_proc` worker,
-which datasets turns into "One of the subprocesses has abruptly died during
-map operation", killing the run inside SFTTrainer.__init__.
-
-The retry must be narrow: a real exception raised by the map function has to
-keep propagating, or this would hide genuine bugs behind a slow rerun.
-
-A fake `datasets` module stands in for the real one, so no dataset is built
-and no worker is forked.
-"""
+"""Tests patch_datasets_map_worker_death_retry (temporary_patches/misc.py): retries only the 'abruptly died during map'
+error from an OOM-killed dataset_num_proc worker; real map errors propagate."""
 
 import ast
 import inspect
@@ -158,10 +148,8 @@ def test_positional_num_proc_is_retried():
 
 
 def test_the_retry_disables_multiprocessing_rather_than_asking_for_one_worker():
-    """datasets >= 4.1.0 gates its pool on `num_proc is not None and
-    num_proc >= 1` (arrow_dataset.py, changed from `> 1` in 4.1.0 and still
-    that way in 4.4.1), so `num_proc = 1` forks one worker and the kernel can
-    kill it again. Only None is genuinely single-process on every version."""
+    """datasets >= 4.1.0 gates its pool on `num_proc is not None and num_proc >= 1` (arrow_dataset.py, changed from > 1
+    in 4.1.0, same in 4.4.1), so a retry at num_proc = 1 forks a killable worker; only None is in-process."""
     calls = []
 
     def original(self, fn, num_proc = None, **kw):
@@ -177,8 +165,7 @@ def test_the_retry_disables_multiprocessing_rather_than_asking_for_one_worker():
 
 
 def test_a_worker_death_at_num_proc_one_is_still_retried():
-    """`dataset_utils.py` picks num_proc = 1 when under 2 GB of RAM is free, so
-    refusing to retry there opts out on the machine the guard exists for."""
+    """dataset_utils.py picks num_proc = 1 when under 2 GB of RAM is free, so refusing to retry at num_proc 1 would skip the low-memory machine the guard is for."""
     calls = []
 
     def original(self, fn, num_proc = None, **kw):

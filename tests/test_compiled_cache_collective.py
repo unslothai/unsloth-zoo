@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""PR #967: the compiled-cache write guard must not be evaluated rank-locally.
-
-distributed_function() broadcasts and barriers, so a rank that decides on its own
-whether to call it can skip a collective the other ranks are inside, desynchronise
-the group and hang the job on the NCCL watchdog. Rank 0 decides for everyone and
-broadcasts both the decision and a digest of the bytes it will import.
-"""
+"""Compiled-cache write guard is decided on rank 0 and broadcast with a digest (PR 967): a rank-local call to
+distributed_function can skip a collective and hang the NCCL group"""
 
 from __future__ import annotations
 
@@ -40,12 +35,8 @@ import time
 
 import pytest
 
-# Importing the compiler installs the bitsandbytes and triton substitutes on every
-# macOS and Windows runner. Do it at collection time, or the bitsandbytes.nn
-# substitute lands inside the first test to use the fixture and conftest's
-# sys.modules leak gate fails its teardown. Must be the submodule: the package
-# alone does not reach bitsandbytes.nn. Guarded so the static source tests below
-# still run where the import cannot succeed.
+# Import unsloth_zoo.compiler's submodule at collection time (the package alone misses bitsandbytes.nn) or its
+# substitutes leak into the first fixture test; guarded so static tests still run
 try:
     import unsloth_zoo.compiler  # noqa: F401
 except Exception:
@@ -408,8 +399,7 @@ def test_direct_recovery_invalidates_temp_folder_bytecode(
     os.utime(temp_source, os_times)
     py_compile.compile(str(temp_source), cfile=str(pyc), doraise=True)
 
-    # Re-enter through the persistent folder, fail that import, then switch back
-    # to temp. Pin the rewritten temp source to the pyc's timestamp and size.
+    # Re-enter through the persistent folder, fail that import, then switch back to temp; the rewritten temp source is pinned to the pyc's timestamp and size
     compiler.UNSLOTH_COMPILE_USE_TEMP = False
     real_fsync = compiler.os.fsync
 
@@ -441,16 +431,8 @@ def test_direct_recovery_invalidates_temp_folder_bytecode(
 def test_undeletable_stale_bytecode_does_not_abandon_the_persistent_cache(
     monkeypatch, compiler, probe, cache_dirs,
 ):
-    """A pyc we cannot unlink but CPython would reject must cost nothing.
-
-    On Windows `os.remove` raises PermissionError whenever any other handle is
-    open on the file, which a virus scanner, a sync client or a second
-    interpreter all do routinely, and the compiled-cache lock excludes none of
-    them. Treating that as fatal moved the whole group onto tempfile recovery
-    on the first occurrence and aborted the job on the second, so an import
-    that had always worked started failing. Here the rewrite changed the source
-    size, so the pyc is already invalid and continuing is safe.
-    """
+    """An undeletable stale pyc may be skipped when the rewrite changed the source size, so CPython rejects it; on
+    Windows os.remove fails with any open handle, so this must not be fatal"""
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
     real_remove = compiler.os.remove
@@ -475,17 +457,8 @@ def test_undeletable_stale_bytecode_does_not_abandon_the_persistent_cache(
 def test_undeletable_usable_bytecode_still_fails_over(
     monkeypatch, compiler, probe, cache_dirs, tmp_path,
 ):
-    """An undeletable pyc raises rather than being tolerated.
-
-    Same size, same timestamp second: importlib accepts the old bytecode, so
-    source-digest verification would pass while this rank executes the previous
-    implementation.
-
-    The refusal no longer reads the pyc's invalidation mode to decide. A header
-    is as attacker-controlled as the body, so a CHECKED_HASH entry can carry the
-    expected source's hash beside foreign code and be accepted. Any pyc that
-    survives the unlink is fatal now, and this case stays covered by that.
-    """
+    """Any pyc surviving the unlink is fatal regardless of invalidation mode: same size and mtime let CPython accept the
+    old bytecode, and a CHECKED_HASH header can be forged"""
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
     name = "pr967_usable_pyc"
@@ -495,8 +468,7 @@ def test_undeletable_usable_bytecode_still_fails_over(
     bytecode = pathlib.Path(importlib.util.cache_from_source(str(source)))
     py_compile.compile(str(source), cfile=str(bytecode), doraise=True)
 
-    # Compiled from this exact source, so the header records its mtime and size
-    # and CPython would load it. No stubbing needed to reach the unsafe shape.
+    # Compiled from this exact source, so the pyc header records its mtime and size and CPython would load it; no stubbing is needed to reach the unsafe shape
     assert compiler._bytecode_would_be_used(str(source), str(bytecode))
 
     monkeypatch.setattr(
@@ -513,25 +485,9 @@ def test_undeletable_usable_bytecode_still_fails_over(
 def test_warm_cache_still_removes_bytecode(
     monkeypatch, compiler, probe, cache_dirs, overwrite,
 ):
-    """An unchanged cache drops its pyc before the import anyway.
-
-    This reverses what PR #967 pinned here, and the reason is that the warm
-    path is exactly where the unchecked-hash pyc lands. The digest covers the
-    .py; CPython can execute a pyc without consulting the source beside it, and
-    a pyc an attacker writes can carry whatever mtime, size or source hash makes
-    CPython accept it. So metadata cannot tell a planted pyc from ours, and the
-    warm path, where the source verifies clean and nothing is rewritten, is the
-    one case the old gate left unprotected.
-
-    The cost #967 measured is real and is now paid deliberately: re-parsing a
-    71 KB generated module costs about 22 ms per import, once per process per
-    module. The Windows concern it raised is handled by
-    _bytecode_would_be_used(), which keeps an unremovable pyc fatal only when
-    CPython would actually load it.
-
-    overwrite=True is parametrised because it is the DEFAULT, used by both
-    unsloth_compile_transformers and patch_lora_forwards.
-    """
+    """Warm caches also drop their pyc (reversing PR 967): CPython can run a pyc without its source and metadata cannot
+    tell a planted pyc from ours; _bytecode_would_be_used() keeps an unremovable pyc fatal only when CPython would
+    load it; overwrite=True is the default path"""
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
     name = f"pr967_warm_no_pyc_churn_{int(overwrite)}"
@@ -559,11 +515,7 @@ def test_warm_cache_still_removes_bytecode(
 def test_rewriting_the_cache_still_removes_stale_bytecode(
     monkeypatch, compiler, probe, cache_dirs,
 ):
-    """The rewrite path drops stale bytecode too.
-
-    Both paths now do, so this pins that the rewrite case did not regress while
-    the warm case was being closed.
-    """
+    """The rewrite path must also drop stale bytecode; this pins that it does not regress while the warm path is being closed"""
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
     name = "pr967_rewrite_drops_pyc"
@@ -642,11 +594,7 @@ def test_import_rechecks_digest_while_holding_lock(
 def test_decision_digests_disk_not_generated_source(
     tmp_path, monkeypatch, compiler,
 ):
-    """UNSLOTH_COMPILE_OVERWRITE=0 keeps a cache file that != write_new_source.
-
-    Digesting write_new_source instead of the bytes on disk would make every rank
-    reject a cache file rank 0 deliberately kept.
-    """
+    """With UNSLOTH_COMPILE_OVERWRITE=0 a kept cache file may differ from write_new_source; the digest must cover the bytes on disk or every rank rejects it"""
     monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
     location = tmp_path / "mod.py"
     location.write_bytes(b"older cached source")
@@ -689,13 +637,8 @@ def test_unknown_rank0_digest_forces_regeneration(
 def test_decision_still_hashes_without_process_group(
     tmp_path, monkeypatch, compiler,
 ):
-    """A process without a group takes the same decision, and still digests it.
-
-    The digest is not only cross-rank agreement: it is what
-    _verified_cache_source() checks the file against just before the
-    import, so a single process needs one too or the bytes on disk are executed
-    unverified. See tests/test_compiled_cache_fail_closed.py.
-    """
+    """Without a process group the decision still digests the file, since _verified_cache_source() checks that digest
+    before import; see tests/test_compiled_cache_fail_closed.py"""
     monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: False)
     location = tmp_path / "mod.py"
     generated = hashlib.sha256(b"src").hexdigest()
@@ -770,13 +713,8 @@ def test_verify_waits_out_filesystem_lag(tmp_path, monkeypatch, compiler):
 def test_write_path_verifies_the_file_on_every_rank(
     tmp_path, monkeypatch, is_rank_zero, compiler, probe,
 ):
-    """A rank-local stale file must be checked even when rank 0 writes.
-
-    Parametrised over the rank, because rank 0 is the only rank that writes: a
-    verification guarded by is_main_process() would leave every other rank --
-    the ones that can actually hold a divergent file -- unchecked, and a
-    single-process test cannot tell the difference.
-    """
+    """Verification must run on every rank, not only the rank 0 that writes; a check guarded by is_main_process() leaves
+    the ranks that can hold a divergent file unchecked"""
     verified = []
     monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
     monkeypatch.setattr(compiler, "is_main_process", lambda: is_rank_zero)
@@ -823,8 +761,7 @@ def test_write_failure_recovers_to_node_local_temp(
         if getattr(function, "__name__", "") == "write_file_outcome" and (
             write_failure == "rank0-only" or args[0] == str(blocked)
         ):
-            # (ok, error, changed): rank 0 claims a clean write that never
-            # reached this rank's disk.
+            # The (ok, error, changed) result: rank 0 claims a clean write that never reached this rank's disk
             return True, "", True
         return real_distributed_function(n, function, *args, **kwargs)
 
@@ -954,12 +891,8 @@ def test_unreadable_rank0_retained_cache_regenerates(
 
 
 def test_write_file_is_never_run_bare_inside_the_collective():
-    """get_lock() raises outside write_file()'s own guard.
-
-    distributed_function() runs the function on rank 0 before broadcasting, so a
-    raise there abandons the broadcast the other ranks are already inside and the
-    group mis-pairs its next collective (gloo aborts on the payload size).
-    """
+    """get_lock() must never raise outside write_file()'s guard: distributed_function runs the function on rank 0 before
+    broadcasting, so a raise mis-pairs the group's next collective (gloo aborts on payload size)"""
     func = _create_new_function_ast()
     for node in ast.walk(func):
         if not isinstance(node, ast.Call):
@@ -975,13 +908,8 @@ def test_write_file_is_never_run_bare_inside_the_collective():
 
 
 def test_verification_never_raises_rank_locally_from_create_new_function():
-    """Every call site must go through the collective wrapper.
-
-    _verify_compiled_cache_file() raises on the rank that sees the mismatch
-    while the others walk into the next collective, which is the very hang the
-    verifier exists to diagnose. The behavioural tests cannot catch a call site
-    reverting to it, because a single process cannot tell the two apart.
-    """
+    """_verify_compiled_cache_file() must go through the collective wrapper: a bare call raises on one rank while the
+    others enter the next collective; single-process tests cannot catch it"""
     func = _create_new_function_ast()
     bare = [
         node for node in ast.walk(func)
@@ -1163,9 +1091,8 @@ def test_temp_recovery_loads_by_path_on_every_rank(
 
     monkeypatch.setattr(compiler, "distributed_function", rank0_collectives)
 
-    # Fire on the import guard: the first collective after write-path
-    # verification where this rank saw no failure. Keyed on that ordering, not
-    # a call count, so changing the write path cannot re-target the injection.
+    # Fire on the import guard, the first collective after write-path verification where this rank saw no failure; keyed
+    # on that ordering so write-path changes cannot re-target it
     write_phase_done = False
     already_fired = False
     real_cache_verification_error = compiler._cache_verification_error
@@ -1194,8 +1121,7 @@ def test_temp_recovery_loads_by_path_on_every_rank(
 
     assert pathlib.Path(module.__file__).parent == temp
     assert module.pr967_temp_reload_fn(21) == 42
-    # Importable by name again, but resolving to what the recovery loaded
-    # rather than the pre-recovery module from the primary folder.
+    # Importable by name again, resolving to what recovery loaded rather than the pre-recovery module from the primary folder
     assert sys.modules[name] is module, (
         "the recovered module is not importable by its plain name, so a "
         "later `import` fails where it succeeds without a recovery."
@@ -1226,12 +1152,8 @@ def test_verify_falls_back_to_existence_when_rank0_digest_unknown(
 
 
 def _patch_dtype_modules_twice(compiler, monkeypatch, tmp_path):
-    """Run _patch_torch_dtype_modules for two model_locations, as a load does.
-
-    unsloth/models/loader.py prepends "siglip" to model_types and
-    _utils.py loops over them, so every vision load patches the global
-    torch.nn classes more than once in one process.
-    """
+    """Runs _patch_torch_dtype_modules for two model_locations as a load does: loader.py prepends siglip so every vision
+    load patches global torch.nn classes more than once"""
     import torch
     import transformers
     import transformers.models.llama.modeling_llama
@@ -1258,19 +1180,11 @@ def _patch_dtype_modules_twice(compiler, monkeypatch, tmp_path):
 def test_repeated_dtype_patching_does_not_stack_the_source_rewrite(
     monkeypatch, compiler, tmp_path,
 ):
-    """A second pass must not rewrite its own rewrite.
-
-    The source-rewrite branch reads inspect.getsource(forward). Left unmarked,
-    a second pass reads back the forward the first pass generated and inserts
-    another dtype prologue, so `original_dtype` binds to the weight dtype
-    instead of the caller's and a bf16 activation returns fp32. Evicting
-    sys.modules before importing is what makes the second rewrite take effect,
-    so this only shows up once the compiled cache is reloaded properly.
-    """
+    """A second dtype patch pass must not rewrite its own output: an unmarked forward gets another dtype prologue, so
+    original_dtype binds to the weight dtype and bf16 returns fp32"""
     import torch
 
-    # It rewrites every name in _patch_functions, and with disable=False also
-    # replaces F.layer_norm. Restoring only Conv2d would leak into later tests.
+    # It rewrites every name in _patch_functions and, with disable=False, also replaces F.layer_norm; restoring only Conv2d would leak into later tests
     patched = {
         module: getattr(torch.nn, module).forward
         for module in compiler._patch_functions
@@ -1317,16 +1231,8 @@ def test_repeated_dtype_patching_does_not_stack_the_source_rewrite(
 def test_a_planted_cache_moe_utils_is_kept_off_the_recovery_search_path(
     monkeypatch, compiler, cache_dirs,
 ):
-    """Returning None from _load_cached_moe_utils_module protects its own callers
-    and nothing else.
-
-    A generated MoE module runs a bare `from moe_utils import ...` wrapped in
-    `except Exception: pass`, and recovery puts the persistent cache directory on
-    sys.path so that import can resolve. That handed the very copy moe_utils had
-    already refused to load straight to the import system, top level and all, with
-    any error swallowed. The directory now goes on the path only when the copy in
-    it is this package's own file.
-    """
+    """Returning None from _load_cached_moe_utils_module protects only its callers: the cache dir goes on sys.path for
+    the bare moe_utils import only if its copy is this package's file"""
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(primary))
@@ -1355,8 +1261,7 @@ def test_a_planted_cache_moe_utils_is_kept_off_the_recovery_search_path(
             ),
             overwrite = True,
         )
-        # The load still succeeds; losing the backend names is what that bare
-        # import is written to survive.
+        # The load still succeeds; losing the backend names is what the bare import in generated modules is written to survive.
         assert getattr(module, f"{name}_fn")(21) == 42
         assert getattr(module, "select_moe_backend", None) != "planted", (
             "the rejected cache copy was importable by the generated module"
@@ -1370,11 +1275,8 @@ def test_a_planted_cache_moe_utils_is_kept_off_the_recovery_search_path(
 
 
 def test_an_extension_module_cannot_shadow_the_verified_source(tmp_path, compiler):
-    """FileFinder tries ExtensionFileLoader before SourceFileLoader, so a planted
-    `<name>.so` beside the digest-checked `<name>.py` is what import_module loads
-    -- and a shared library is run by the dynamic linker with no source for any
-    digest to cover. The directory case was already refused; this is the one that
-    outranks even that."""
+    """FileFinder tries extension loaders before source, so a planted <name>.so beside the digest-checked <name>.py
+    loads instead, outranking even a refused directory"""
     folder = tmp_path / "cache"
     folder.mkdir()
     (folder / "victim.py").write_text("VALUE = 1\n", encoding = "utf-8")
@@ -1400,14 +1302,8 @@ def test_an_extension_module_cannot_shadow_the_verified_source(tmp_path, compile
 
 
 def test_a_planted_pyc_beside_a_verbatim_copy_is_not_importable(tmp_path, compiler):
-    """Matching bytes are necessary and not sufficient.
-
-    A bare `from moe_utils import ...` prefers __pycache__/moe_utils.<tag>.pyc,
-    and an unchecked-hash pyc runs without CPython consulting the source beside
-    it, so an exact copy of the file with a planted pyc next to it would still
-    have executed foreign code. The permission check drops the pyc, and says no
-    when it cannot.
-    """
+    """Matching bytes are not enough: an unchecked-hash pyc in __pycache__ runs without consulting the source, so the
+    permission check drops the pyc and refuses when it cannot"""
     import importlib.util as _util
 
     folder = tmp_path / "cache"
@@ -1431,13 +1327,8 @@ def test_a_planted_pyc_beside_a_verbatim_copy_is_not_importable(tmp_path, compil
 
 
 def test_the_bytes_that_run_are_the_bytes_that_were_verified(tmp_path, compiler):
-    """Verifying one open and executing from a later one leaves a window.
-
-    The cache lock is cooperative, so it binds our own ranks and not whoever
-    planted the file: a replacement landing between the digest read and the
-    loader's own open executed without ever matching. _verified_cache_source
-    hands the caller the bytes it checked, and those are what run.
-    """
+    """Verifying one open and executing from a later one leaves a swap window, since the cooperative cache lock does not
+    bind planted files; _verified_cache_source returns the bytes it checked"""
     location = tmp_path / "swap_probe.py"
     genuine = b"VALUE = 'genuine'\n"
     location.write_bytes(genuine)
@@ -1446,7 +1337,7 @@ def test_the_bytes_that_run_are_the_bytes_that_were_verified(tmp_path, compiler)
     source = compiler._verified_cache_source(str(location), digest)
     assert source == genuine
 
-    # The swap the window used to allow, performed in full.
+    # Performs the swap that the gap between verifying and loading would allow; the verified bytes must still be the ones that run
     location.write_bytes(b"VALUE = 'planted'\n")
     module = compiler._exec_verified_source(source, str(location), "swap_probe")
     try:
@@ -1460,12 +1351,7 @@ def test_the_bytes_that_run_are_the_bytes_that_were_verified(tmp_path, compiler)
 
 
 def test_a_package_shadowing_moe_utils_keeps_the_folder_off_the_path(tmp_path, compiler):
-    """A verbatim moe_utils.py does not settle it: the import resolves BY NAME.
-
-    A planted moe_utils/ package, or a moe_utils extension module, beside the
-    genuine copy is what Python picks, exactly as for a generated module. Same
-    check, one name over.
-    """
+    """A verbatim moe_utils.py is not enough: the import resolves by name, so a planted moe_utils package or extension module beside it is picked instead"""
     import importlib.machinery as _machinery
 
     folder = tmp_path / "cache"
@@ -1491,20 +1377,8 @@ def test_a_package_shadowing_moe_utils_keeps_the_folder_off_the_path(tmp_path, c
 def test_the_normal_path_checks_moe_utils_before_exposing_the_cache(
     monkeypatch, compiler, probe, cache_dirs,
 ):
-    """The recovery path had this check and the ordinary one did not.
-
-    compile_folder goes first on sys.path so the generated module's bare
-    `from moe_utils import ...` resolves, and that import is wrapped in
-    `except Exception: pass`. An installation that could not replace a foreign
-    copy, or a shared-cache writer that changed it afterwards, therefore got its
-    top level executed on the ordinary path with the failure swallowed.
-
-    The prologue is the REAL _license_header, not a hand-written stand-in. This
-    row passed against a stub that omitted it while the code was still broken:
-    the header runs `sys.path.insert(0, UNSLOTH_COMPILE_LOCATION)` above the very
-    import this is about, so the module re-exposes the cache to itself mid-exec
-    and declining to prepend the folder decides nothing.
-    """
+    """The normal path must check moe_utils before exposing the cache, and the prologue must be the real
+    _license_header, which itself inserts the cache dir onto sys.path"""
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(primary))
@@ -1536,8 +1410,7 @@ def test_the_normal_path_checks_moe_utils_before_exposing_the_cache(
             "the planted helper was importable on the normal path"
         )
         assert not marker.exists(), "the planted helper's top level ran"
-        # The prologue's insert must not outlive the call: leaving it there hands
-        # the refused directory to the NEXT generated module's bare import.
+        # The prologue's sys.path insert must not outlive the call, or the refused directory is handed to the next generated module's bare import
         assert str(primary) not in sys.path, (
             "the refused cache directory was left on sys.path"
         )
@@ -1552,13 +1425,7 @@ def test_the_normal_path_checks_moe_utils_before_exposing_the_cache(
 def test_a_refused_cache_already_on_sys_path_is_still_not_importable(
     monkeypatch, compiler, probe, cache_dirs,
 ):
-    """Declining to PREPEND decides nothing once the entry is already there.
-
-    An earlier generated module's _license_header puts UNSLOTH_COMPILE_LOCATION
-    on sys.path and nothing takes it off, so by the time a MoE module compiles,
-    the refused directory is reachable by name whatever this call does to the
-    front of the path.
-    """
+    """Declining to prepend a refused cache dir decides nothing once an earlier _license_header has put it on sys.path, since nothing removes it"""
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(primary))
@@ -1573,8 +1440,7 @@ def test_a_refused_cache_already_on_sys_path_is_still_not_importable(
 
     previous_moe_utils = sys.modules.pop("moe_utils", None)
     entry_path = list(sys.path)
-    # Both spellings of the same directory: the entry is matched by what it
-    # resolves to, not by string equality with compile_folder.
+    # Both spellings of the same directory: the sys.path entry is matched by what it resolves to, not by string equality with compile_folder
     sys.path.insert(0, str(primary))
     sys.path.insert(0, os.path.join(str(primary), ".", ""))
     name = "preexisting_entry_moe_utils_probe"
@@ -1607,14 +1473,8 @@ def test_a_refused_cache_already_on_sys_path_is_still_not_importable(
 
 
 def test_sourceless_bytecode_cannot_shadow_moe_utils(tmp_path, compiler):
-    """A directory holding only moe_utils.pyc is not an empty directory.
-
-    "No moe_utils.py here, so nothing can be imported from here" was the reason
-    such a folder counted as trusted, and it is false: FileFinder's loaders are
-    extension, source, bytecode, so SourcelessFileLoader picks up a legacy
-    moe_utils.pyc sitting directly in the directory and runs marshalled code with
-    no source for any digest to cover.
-    """
+    """A folder holding only a legacy moe_utils.pyc is not empty: SourcelessFileLoader imports it by name and runs
+    marshalled code no digest covers, so it is not trusted"""
     folder = tmp_path / "cache"
     folder.mkdir()
     assert compiler._moe_utils_copy_is_importable(str(folder)) is True
@@ -1634,14 +1494,7 @@ def test_sourceless_bytecode_cannot_shadow_moe_utils(tmp_path, compiler):
 
 
 def _force_by_name_path_to_fail(monkeypatch, compiler, name, once = True):
-    """Make create_new_function fall through to the direct load.
-
-    The seam is _reject_shadowing_import_candidates, which import_module() calls
-    and load_module_directly() does not. It used to be importlib.import_module,
-    but the by-name path no longer calls it: it executes the bytes it verified
-    rather than reopening the path for the loader, so patching that function
-    stopped forcing anything.
-    """
+    """Makes create_new_function fall through to the direct load: _reject_shadowing_import_candidates is called by import_module() but not by load_module_directly()"""
     real = compiler._reject_shadowing_import_candidates
     state = {"failed": False}
 
@@ -1664,28 +1517,13 @@ def _real_moe_utils_path():
 def test_direct_recovery_can_still_import_cache_helpers(
     monkeypatch, compiler, cache_dirs,
 ):
-    """The recovered module must still resolve helpers next to the cache.
-
-    exec_module() does not put the module's directory on sys.path, and
-    import_module() restores sys.path before recovery runs. Generated MoE
-    modules carry a bare `try: from moe_utils import ... except: pass`, so
-    without the search path the direct load reports success while every MoE
-    backend name is silently undefined and the first MoE forward fails instead.
-
-    The cache copy here is the real file, byte for byte, because that is the only
-    copy install_to_cache() ever writes and the only one this search path will
-    now expose. A stub stood in for it before, which the row below shows is a
-    planted file by that definition.
-    """
+    """Recovered modules need the cache on sys.path for the bare moe_utils import, which exec_module() does not add; the copy used must be the real file, not a stub"""
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(primary))
     shutil.copyfile(_real_moe_utils_path(), primary / "moe_utils.py")
 
-    # The generated module does a bare `from moe_utils import ...`, so an entry
-    # left in sys.modules by any earlier test wins over the file just written and
-    # this reports a search-path bug that is not there. Isolate it on the way in
-    # as well as on the way out; tests/conftest.py now fails the leaker directly.
+    # A bare `from moe_utils import` picks up a stale sys.modules entry from an earlier test, so pop it on entry and exit; conftest.py fails leakers.
     previous_moe_utils = sys.modules.pop("moe_utils", None)
 
     name = "pr967_recovery_helper"
@@ -1725,13 +1563,8 @@ def test_direct_recovery_can_still_import_cache_helpers(
 def test_recovered_module_keeps_an_importable_module_identity(
     monkeypatch, compiler, cache_dirs,
 ):
-    """Recovery must not stamp a module name nothing can import later.
-
-    Only <name>.py exists in the cache, so a class carrying
-    __module__ == "unsloth_cache_<name>" pickles into an identity a fresh
-    process cannot resolve, while the same class from the normal import path
-    resolves fine. The two paths have to agree.
-    """
+    """Recovered modules need an importable __module__ identity: unsloth_cache_<name> pickles to a name a fresh process
+    cannot resolve, so both import paths must agree"""
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
 
@@ -1760,13 +1593,8 @@ def test_recovered_module_keeps_an_importable_module_identity(
 def test_recovery_drops_a_successful_import_before_it_can_abort(
     monkeypatch, compiler, cache_dirs,
 ):
-    """A rank pulled into recovery must not keep the module it already had.
-
-    Its own import succeeded, so sys.modules still holds the persistent module
-    while recovery runs. If recovery then fails, disable=True swallows the
-    exception and the group splits into ranks with an importable generated
-    module and ranks without one.
-    """
+    """A rank sent into recovery must drop its successful import first, or a recovery failure with disable=True splits
+    the group into ranks with and without the module"""
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
     monkeypatch.setattr(compiler, "torch_distributed_is_initialized", lambda: True)
@@ -1795,12 +1623,8 @@ def test_recovery_drops_a_successful_import_before_it_can_abort(
 
 
 def test_the_working_directory_is_never_dropped_from_sys_path(compiler, tmp_path):
-    """UNSLOTH_COMPILE_LOCATION="." makes the cache the working directory.
-
-    Filtering by resolved path then deletes "", "." and the absolute cwd, which
-    is the user's import path for every unrelated local module, for a cache they
-    did not choose to put there. A separate directory is still dropped.
-    """
+    """With UNSLOTH_COMPILE_LOCATION set to '.', the cwd entries stay on sys.path, since filtering by resolved path
+    would drop the import path for all local modules; a separate dir is still dropped"""
     entry = list(sys.path)
     try:
         sys.path[:] = ["", ".", os.getcwd(), "/usr/lib/python-not-real"]
@@ -1824,13 +1648,8 @@ def test_the_working_directory_is_never_dropped_from_sys_path(compiler, tmp_path
 
 
 def test_overlapping_guards_do_not_leak_a_blocked_moe_utils(compiler, tmp_path):
-    """Two guards that each save and restore for themselves corrupt the state.
-
-    The inner one saves the outer one's None; the outer exits and REMOVES the
-    entry while the inner is still running, leaving the inner body unprotected;
-    then the inner exit restores that None permanently, so every later
-    legitimate `import moe_utils` in the process dies on it.
-    """
+    """Overlapping moe_utils guards must not each save and restore: the outer removes its block while the inner still
+    runs, and the inner then restores it permanently, killing later imports"""
     folder = tmp_path / "untrusted"
     folder.mkdir()
     (folder / "moe_utils.py").write_text("PLANTED = 1\n", encoding = "utf-8")
@@ -1896,12 +1715,8 @@ def test_nested_guards_restore_only_at_the_outermost_exit(compiler, tmp_path):
 
 
 def test_generated_module_co_filename_is_absolute(compiler, monkeypatch, cache_dirs):
-    """A relative compile folder must not leak into co_filename.
-
-    importlib.import_module handed the loader an absolute path, so leaving it
-    relative downgrades every traceback and inspect.getsource to something
-    resolved against the working directory at read time.
-    """
+    """A relative compile folder must not reach co_filename: import_module passes an absolute path, and a relative one
+    resolves tracebacks against the cwd at read time"""
     primary, temp = cache_dirs
     _stub_compile_folders(monkeypatch, compiler, primary, temp)
     source = "def co_filename_probe_fn(x):\n    return x\n"
@@ -1920,15 +1735,8 @@ def test_generated_module_co_filename_is_absolute(compiler, monkeypatch, cache_d
 
 
 def test_a_zip_archive_cannot_serve_as_the_cache_directory(compiler, tmp_path):
-    """The trust gate asks the filesystem; the import asks the import machinery.
-
-    zipimport is a default sys.path hook, so a ZIP ARCHIVE named
-    unsloth_compiled_cache is a perfectly good sys.path entry -- while isdir()
-    says no directory and isfile(dir/"moe_utils.py") says no file, so every check
-    reported nothing to reject and `from moe_utils import ...` then resolved out
-    of the archive and ran the attacker's top level. One planted file in the
-    working directory, no environment variable needed.
-    """
+    """The trust gate must reject a zip archive named unsloth_compiled_cache too: zipimport makes it a valid sys.path
+    entry while isdir() and isfile() see nothing to reject"""
     import zipfile
 
     archive = tmp_path / "unsloth_compiled_cache"

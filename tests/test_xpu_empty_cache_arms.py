@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
 
-"""On XPU the smart gradient checkpointing buffers and patch_model_and_tokenizer release cached
-memory through torch.xpu, not torch.cuda (a no-op there). CPU only: both empty_cache calls are counted."""
+"""On XPU, smart gradient checkpointing buffers and patch_model_and_tokenizer release cached memory through torch.xpu,
+not torch.cuda (a no-op there); CPU only, both empty_cache calls counted."""
 
 from __future__ import annotations
 

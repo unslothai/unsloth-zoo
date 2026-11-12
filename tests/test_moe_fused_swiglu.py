@@ -335,8 +335,8 @@ ALPHA, LIMIT = 1.702, 7.0
 
 
 def _gptoss_fp64(gate, up, alpha = ALPHA, limit = LIMIT):
-    """Independent fp64 reference (no torch.clamp / autograd): value and analytic d/dgate, d/dup per unit grad.
-    Boundary ties follow the running torch's clamp gradient (inclusive <= 2.13, exclusive on 2.14)."""
+    """Independent fp64 reference with no torch.clamp or autograd, giving value and analytic d/dgate, d/dup per unit
+    grad; boundary ties follow the running torch clamp gradient (inclusive <= 2.13, exclusive on 2.14)"""
     g, u = gate.double(), up.double()
     gc = torch.where(g > limit, torch.full_like(g, limit), g)
     uc = torch.where(u > limit, torch.full_like(u, limit), torch.where(u < -limit, torch.full_like(u, -limit), u))

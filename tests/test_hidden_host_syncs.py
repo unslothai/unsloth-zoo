@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Per-step paths that used to sync the host with the device: the device-side packed boundary mask must drop
-exactly the slots the host filter drops, and an integer n_items divisor must be bitwise torch.tensor's."""
+"""Per-step paths must not sync host with device: the device-side packed boundary mask drops exactly the host filter's
+slots; an integer n_items divisor must match torch.tensor's bitwise."""
 
 import warnings
 

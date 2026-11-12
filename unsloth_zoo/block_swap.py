@@ -79,26 +79,15 @@ def _pow2_ceil(n):
     return 1 << max(0, (int(n) - 1).bit_length())
 
 
-def _host_reserve(vm):
-    return max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
+def _host_reserve(total):
+    return max(_PIN_RESERVE_MIN_BYTES, int(total * _PIN_RESERVE_FRACTION))
 
 
-def _cgroup_free():
-    try:
-        from .dataset_num_proc import _cgroup_free_bytes
-        return _cgroup_free_bytes()
-    except Exception:
-        return None
-
-
-def _host_free(vm):
-    # psutil reports the whole host inside a container; the cgroup limit is what gets the job OOM-killed.
-    free = vm.available - _host_reserve(vm)
-    cgroup = _cgroup_free()
-    if cgroup is None:
-        return free
-    # Other charged allocations (the dataloader, CUDA's host side) share the limit: keep max(1 GiB, 15%) of it.
-    return min(free, cgroup - max(_PIN_RESERVE_MIN_BYTES // 4, int(cgroup * _PIN_RESERVE_FRACTION)))
+def _host_free():
+    """(total, free after the reserve) host RAM. `_host_memory` already caps psutil by an enforcing cgroup limit
+    (psutil reports the whole host inside a container, while the cgroup is what gets the job OOM-killed)."""
+    total, available = _host_memory()
+    return total, available - _host_reserve(total)
 
 
 def _local_world_size():
@@ -108,12 +97,21 @@ def _local_world_size():
         return 1
 
 
+def _host_memory():
+    """``memory_budget.host_memory_bytes``; plain psutil when this file is loaded on its own."""
+    try:
+        from unsloth_zoo.memory_budget import host_memory_bytes
+    except Exception:
+        import psutil
+        vm = psutil.virtual_memory()
+        return vm.total, vm.available
+    return host_memory_bytes()
+
+
 def _pin_budget():
     # Each local rank sees the same free RAM, so it may only claim its share.
     try:
-        import psutil
-        vm = psutil.virtual_memory()
-        return _host_free(vm) // _local_world_size()
+        return _host_free()[1] // _local_world_size()
     except Exception:
         return 0
 
@@ -123,13 +121,12 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
     freezes the machine. `on_host` bytes of them already sit in host RAM and are counted as available;
     `slack` is allocator rounding on top of the packed bytes."""
     try:
-        import psutil
-        vm = psutil.virtual_memory()
+        total, free = _host_free()
     except Exception:
         return
     need = sum(sizes) + slack
     # Every local rank reads the same free RAM, so each may only plan for its share, like _pin_budget.
-    avail = _host_free(vm) // _local_world_size() + on_host
+    avail = free // _local_world_size() + on_host
     if need <= avail:
         return
     fit, used = 0, slack
@@ -141,7 +138,7 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
     raise ValueError(
         f"Unsloth: offload_layers asked for {len(sizes)} layers in host RAM, which needs "
         f"{need / 2**30:.1f} GiB, but only {max(avail, 0) / 2**30:.1f} GiB is available after keeping "
-        f"{_host_reserve(vm) / 2**30:.1f} GiB free for the system. At most {fit} layers would fit; "
+        f"{_host_reserve(total) / 2**30:.1f} GiB free for the system. At most {fit} layers would fit; "
         "lower offload_layers or free host RAM."
     )
 
@@ -226,9 +223,10 @@ def _autograd_keeps_weights():
 
 
 def _swappable(module):
+    kept = {id(p) for m in module.modules() if getattr(m, "_unsloth_host_kept", False) for p in m.parameters()}
     out = []
     for name, p in module.named_parameters(recurse = True):
-        if p.requires_grad or "lora_" in name:
+        if p.requires_grad or "lora_" in name or id(p) in kept:
             continue
         out.append((name, p))
     return out
@@ -543,8 +541,8 @@ class BlockSwap:
     def _acquire(self, block, steal):
         free = self.free[block.sig]
         if not free and steal:
-            # Only after an interrupted step; prefetches never steal (could evict the running block).
-            # A pending block's slot is still read by backward: reusing it corrupts gradients silently.
+            # Only after an interrupted step, since prefetches never steal (could evict the running block); a pending
+            # block's slot is still read by backward, so reuse corrupts gradients silently.
             for b in self.blocks:
                 if b is not block and b.sig == block.sig and b.resident and b.slot is not None and not b.pending:
                     self._release(b)
@@ -748,6 +746,23 @@ class BlockSwap:
         self._chunks = []
         for dev in self.streams:
             torch.cuda.synchronize(dev)
+
+    @contextmanager
+    def shaped(self):
+        """Expose evicted weight shapes to PEFT using zero-stride placeholders."""
+        held = []
+        try:
+            for b in self.blocks:
+                if not b.resident:
+                    for p, e, sig in zip(b.params, b.empties, b.sig):
+                        held.append((b, p, e))
+                        p.data = e.new_zeros(()).expand(sig[0])
+            yield
+        finally:
+            # A block fetched inside the context holds real weights now: leave it.
+            for b, p, e in held:
+                if not b.resident:
+                    p.data = e
 
     def host_bytes(self):
         return sum(b.nbytes() for b in self.blocks)
@@ -1066,11 +1081,23 @@ def auto_swap_indices(layers, reserve_bytes, prefetch_depth = 2, free_bytes = No
     return sorted(chosen), left
 
 
+def _mark_host_kept(model):
+    names = getattr(model, "_no_placement_params", None)
+    if not names or os.environ.get("UNSLOTH_PLACE_NO_PLACEMENT_PARAMS", "0") == "1":
+        return
+    params = list(model.named_parameters(remove_duplicate = False))
+    # Whole owner module (FP8Embedding's weight_scale sits beside the table), tagged on the module
+    # because a load to host replaces the Parameter.
+    for owner in {n.rsplit(".", 1)[0] for n, _ in params if any(n == x or n.endswith("." + x) for x in names)}:
+        model.get_submodule(owner)._unsloth_host_kept = True
+
+
 # Layer list -> the model find_decoder_layers found it in: BlockSwap watches that model's output for the step peak.
 _LAYER_OWNERS = weakref.WeakKeyDictionary()
 
 
 def find_decoder_layers(model):
+    _mark_host_kept(model)
     layers = _find_decoder_layers(model)
     try:
         _LAYER_OWNERS[layers] = weakref.ref(model)

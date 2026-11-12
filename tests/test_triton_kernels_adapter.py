@@ -263,8 +263,8 @@ def fresh(monkeypatch):
     monkeypatch.setattr(tkc, "_import_vllm_vendored", lambda: None)
     before = set(sys.modules)
     yield monkeypatch
-    # monkeypatch restores modules it replaced, not ones a test imported fresh: a fake `vllm`
-    # left behind makes a later importorskip("vllm") on this worker return it instead of skipping.
+    # monkeypatch only restores modules it replaced, not ones imported fresh: a fake vllm left in sys.modules would make
+    # a later importorskip('vllm') return it instead of skipping.
     for key in [k for k in sys.modules if k not in before and k.split(".", 1)[0] in ("vllm", "triton_kernels")]:
         del sys.modules[key]
 

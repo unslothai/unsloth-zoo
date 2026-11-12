@@ -299,12 +299,11 @@ def _clear_compiled(kernel):
             v.clear()
 
 
-# Bounds are Triton's own 16-byte pointer-alignment specializations of the scratch slices: scatter
-# reads two of them, whose alignment follows the block count mod 4 and mod 2.
+# Bounds are Triton's 16-byte pointer-alignment specializations of the scratch slices; scatter reads two, whose alignment follows block count mod 4 and mod 2.
 @pytest.mark.parametrize("name, bound", [("_route_scan_kernel", 2), ("_route_hist_kernel", 2), ("_route_scatter_kernel", 4)])
 def test_kernels_compile_once_across_token_counts(name, bound):
-    # Token counts change every training step (here 9 NB values from 16 to 512 blocks); only
-    # per-model values (top-k, experts) are constexpr, so one compiled kernel serves them all.
+    # Token counts change every training step (9 NB values, 16 to 512 blocks); only per-model top-k and experts are
+    # constexpr, so one compiled kernel serves all.
     kernel = getattr(mrt, name)
     E, k = 64, 8
     _clear_compiled(kernel)

@@ -15,15 +15,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""CPU logits are never written by an fp16 torch.mm(out=) into a strided slice of the padded buffer.
-
-_logits_into splits an odd vocab into a multiple of 8 and a tail and wrote each part with
-torch.mm(..., out = buf[:, a:b]). On avx512_fp16 CPUs (torch 2.10, oneDNN) that matmul reads the
-slice's stale contents: the uninitialised buffer gave NaN logits, so NaN hidden gradients in
-test_fused_preference_head_fp16.py, and a zeroed buffer gave wrong ones. The host ISA decides whether
-the bug shows, so these tests pin the call shape instead, and the result against an fp32 oracle
-from a NaN-filled buffer.
-"""
+"""CPU logits must never be written by fp16 torch.mm(out=) into a strided buffer slice: avx512_fp16 (torch 2.10) reads
+stale data; ISA-dependent, so tests pin the call shape."""
 
 import pytest
 import torch
@@ -58,3 +51,29 @@ def test_cpu_logits_are_not_written_through_a_strided_mm_out(monkeypatch, vocab)
     want = (h.float() @ w.float().t()).half()
     assert out.isfinite().all()
     torch.testing.assert_close(out, want, rtol = 2e-3, atol = 2e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_cpu_logits_write_a_dense_destination_through_mm_out(monkeypatch, dtype):
+    dense, fresh = [], []
+    real = torch.mm
+
+    def mm(*args, **kwargs):
+        out = kwargs.get("out")
+        (fresh if out is None else dense).append(None if out is None else out.data_ptr())
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "mm", mm)
+    gen = torch.Generator().manual_seed(0)
+    h = (torch.randn(4, 64, generator = gen) * 1e-1).to(dtype)
+    w = torch.randn(128, 64, generator = gen).to(dtype)
+    buf = fl._Buffers(4, 128, h.device, False, dtype)
+    buf.buf.fill_(float("nan"))
+    out = fl._logits_into(h, w, buf.logits(4), False)
+    assert dense == [buf.buf.data_ptr()] and not fresh
+    want = (h.float() @ w.float().t()).to(dtype)
+    torch.testing.assert_close(out, want, rtol = 2e-2, atol = 2e-2)
+
+    with torch.profiler.profile(activities = [torch.profiler.ProfilerActivity.CPU], profile_memory = True) as prof:
+        fl._logits_into(h, w, buf.logits(4), False)
+    assert all(e.self_cpu_memory_usage == 0 for e in prof.key_averages() if e.key == "aten::mm")

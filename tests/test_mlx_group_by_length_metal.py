@@ -25,6 +25,9 @@ mx = pytest.importorskip("mlx.core")
 if "mlx_simulation" in str(getattr(mx, "__file__", "")):
     pytest.skip("requires real MLX runtime", allow_module_level=True)
 
+import mlx.nn as nn
+from mlx.utils import tree_flatten
+
 
 class _TinyTokenizer:
 
@@ -147,3 +150,49 @@ def test_labeled_path_end_to_end_matches_the_unlabeled_order():
     assert batches, "labeled length_grouped produced no batches"
     seen = sum(int(batch.shape[0]) for batch, _l, _lb in batches)
     assert seen == 24
+
+
+class _CausalTiny(nn.Module):
+    # A prefix mean mixes positions causally, so trailing padding cannot reach a real token.
+    def __init__(self):
+        super().__init__()
+        mx.random.seed(0)
+        self.embed, self.head = nn.Embedding(1100, 16), nn.Linear(16, 1100)
+
+    def __call__(self, x):
+        steps = mx.arange(1, x.shape[1] + 1, dtype=mx.float32)[None, :, None]
+        return self.head(mx.tanh(mx.cumsum(self.embed(x), axis=1) / steps))
+
+
+def _window_gradients(plan, model, accum):
+    from unsloth_zoo.mlx.utils import make_baseline_loss_fn
+
+    loss_and_grad, windows = nn.value_and_grad(model, make_baseline_loss_fn()), []
+    for start in range(0, len(plan), accum):
+        total, tokens = {}, 0
+        for index in range(start, start + accum):
+            (_loss, toks), grad = loss_and_grad(model, *plan[index])
+            for name, value in tree_flatten(grad):
+                total[name] = total.get(name, 0) + value * toks
+            tokens += toks.item()
+        windows.append({name: value / tokens for name, value in total.items()})
+    return windows
+
+
+def _mixed_length_plan(**kwargs):
+    from unsloth_zoo.mlx.utils import _create_ordered_text_plan
+
+    rows = [{"text": " ".join([str(1000 + i)] + ["10"] * ((i * 5) % 7 + 1))} for i in range(24)]
+    return _create_ordered_text_plan(
+        dataset=rows, tokenizer=_TinyTokenizer(), batch_size=2, max_seq_length=16, seed=7,
+        dataset_order="sequential", num_epochs=1, grad_accum=3, **kwargs,
+    )
+
+
+def test_length_sorted_windows_leave_every_step_gradient_unchanged():
+    unsorted, cut = _mixed_length_plan(), _mixed_length_plan(length_sorted_windows=True)
+    assert sum(map(cut.batch_width, range(len(cut)))) < sum(map(unsorted.batch_width, range(len(unsorted))))
+    model = _CausalTiny()
+    for before, after in zip(_window_gradients(unsorted, model, 3), _window_gradients(cut, model, 3)):
+        for name, value in before.items():
+            assert mx.allclose(value, after[name], rtol=1e-5, atol=1e-7).item(), name

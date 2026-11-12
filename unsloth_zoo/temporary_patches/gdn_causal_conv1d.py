@@ -106,18 +106,20 @@ def _build_kernels():
     import triton
     import triton.language as tl
 
-    @triton.jit
+    # T (sequence length) runtime: no %16 variant per length; varlen vs dense stays the only split.
+    @triton.jit(do_not_specialize = ["T"])
     def _causal_conv1d_fwd_kernel(
         x, weight, bias, y, seq_idx,
         T, D,
         stride_x_b, stride_x_t, stride_x_d,
-        W: tl.constexpr,
-        BT: tl.constexpr,
-        BD: tl.constexpr,
-        HAS_BIAS: tl.constexpr,
-        ACTIVATION: tl.constexpr,
-        HAS_SEQ_IDX: tl.constexpr,
-        PAD_NEG: tl.constexpr,
+        W: tl.constexpr,  # conv kernel width
+        BT: tl.constexpr,  # block size along T
+        BD: tl.constexpr,  # block size along channels
+        HAS_BIAS: tl.constexpr,  # conv bias
+        ACTIVATION: tl.constexpr,  # silu activation
+        HAS_SEQ_IDX: tl.constexpr,  # packed seq_idx boundaries
+        PAD_NEG: tl.constexpr,  # zero padded positions (seq_idx < 0)
+        ROUND: tl.constexpr,  # 0 fp32, 1 weight dtype, 2 x dtype before SiLU
     ):
         i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         o_t = i_t * BT + tl.arange(0, BT)
@@ -146,9 +148,11 @@ def _build_kernels():
         if HAS_BIAS:
             acc += tl.load(bias + o_d, mask = m_d, other = 0).to(tl.float32)[None, :]
         if ACTIVATION:
-            # The torch path stores the conv output in the weight's dtype, then SiLU (an fp32
-            # parameter under autocast keeps it fp32: narrowing to x's fp16 overflows to -inf).
-            acc = acc.to(weight.dtype.element_ty).to(tl.float32)
+            # SiLU on the conv output rounded to the wider of x / weight (see _act_dtype).
+            if ROUND == 1:
+                acc = acc.to(weight.dtype.element_ty).to(tl.float32)
+            elif ROUND == 2:
+                acc = acc.to(y.dtype.element_ty).to(tl.float32)
             acc = acc * tl.sigmoid(acc)
         if PAD_NEG:
             # causal_conv1d's rule: padding (seq_idx < 0) outputs 0; it never feeds a real position.
@@ -156,20 +160,19 @@ def _build_kernels():
         p_y = y + tl.cast(i_b, tl.int64) * T * D + o_t.to(tl.int64)[:, None] * D + o_d[None, :]
         tl.store(p_y, acc.to(y.dtype.element_ty), mask = (o_t < T)[:, None] & m_d[None, :])
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ["T"])
     def _causal_conv1d_bwd_g_kernel(
         x, weight, bias, dy, g, seq_idx,
         T, D,
         stride_x_b, stride_x_t, stride_x_d,
         stride_dy_b, stride_dy_t, stride_dy_d,
-        W: tl.constexpr,
-        BT: tl.constexpr,
-        BD: tl.constexpr,
-        HAS_BIAS: tl.constexpr,
-        HAS_SEQ_IDX: tl.constexpr,
+        W: tl.constexpr,  # conv kernel width
+        BT: tl.constexpr,  # block size along T
+        BD: tl.constexpr,  # block size along channels
+        HAS_BIAS: tl.constexpr,  # conv bias
+        HAS_SEQ_IDX: tl.constexpr,  # packed seq_idx boundaries
     ):
-        # Pass 1: g = d(loss)/d(pre-activation) through SiLU, once per position (the pre-activation
-        # is recomputed exactly as the forward does), stored channel-last in the input dtype.
+        # Pass 1: SiLU grad g per position (pre-act recomputed), stored channel-last in input dtype.
         i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         o_t = i_t * BT + tl.arange(0, BT)
         o_d = i_d * BD + tl.arange(0, BD)
@@ -197,30 +200,29 @@ def _build_kernels():
             dy + tl.cast(i_b, tl.int64) * stride_dy_b + o_t.to(tl.int64)[:, None] * stride_dy_t + o_d64[None, :] * stride_dy_d,
             mask = m, other = 0,
         ).to(tl.float32)
-        pre = acc.to(weight.dtype.element_ty).to(tl.float32)
+        pre = acc.to(g.dtype.element_ty).to(tl.float32)
         sig = tl.sigmoid(pre)
-        # torch's silu_backward stores the gradient in the conv's (the weight's) dtype.
+        # torch's silu_backward stores the gradient in the conv's dtype (g is allocated in it).
         b_g = b_dy * sig * (1 + pre * (1 - sig))
         p_g = g + tl.cast(i_b, tl.int64) * T * D + o_t.to(tl.int64)[:, None] * D + o_d[None, :]
         tl.store(p_g, b_g.to(g.dtype.element_ty), mask = m)
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ["T", "NT"])
     def _causal_conv1d_bwd_dxdw_kernel(
         x, weight, g, dx, dw, db, seq_idx,
         T, D, NT,
         stride_x_b, stride_x_t, stride_x_d,
         stride_g_b, stride_g_t, stride_g_d,
-        W: tl.constexpr,
-        BT: tl.constexpr,
-        BD: tl.constexpr,
-        NEED_DX: tl.constexpr,
-        NEED_DW: tl.constexpr,
-        NEED_DB: tl.constexpr,
-        HAS_SEQ_IDX: tl.constexpr,
-        PAD_NEG: tl.constexpr,
+        W: tl.constexpr,  # conv kernel width
+        BT: tl.constexpr,  # block size along T
+        BD: tl.constexpr,  # block size along channels
+        NEED_DX: tl.constexpr,  # compute dx
+        NEED_DW: tl.constexpr,  # compute dweight
+        NEED_DB: tl.constexpr,  # compute dbias
+        HAS_SEQ_IDX: tl.constexpr,  # packed seq_idx boundaries
+        PAD_NEG: tl.constexpr,  # zero padded positions (seq_idx < 0)
     ):
-        # Pass 2: dx[s] = sum_k w[W - 1 - k] g[s + k]; per-tile dw[j] = sum_t g[t] x[t - (W - 1) + j]
-        # and db = sum_t g[t]; taps never cross a seq_idx boundary.
+        # Pass 2: dx, per-tile dw and db from g; taps never cross a seq_idx boundary.
         i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
         o_t = i_t * BT + tl.arange(0, BT)
         o_d = i_d * BD + tl.arange(0, BD)
@@ -275,12 +277,17 @@ def _build_kernels():
     return _kernels
 
 
-# (BT, BD, num_warps). The backward is two forward-sized passes (g, then dx / dw / db): one
-# W-tap recompute per position instead of W per tap, 2.3-3.3x faster than the single-pass kernel on a T4.
+# (BT, BD, num_warps); backward is two forward-sized passes with one W-tap recompute per position.
 _FWD_CONFIG = (32, 64, 2)
 _BWD_CONFIG = (32, 64, 2)
 # CUDA caps grid dims 1 and 2 at 65535: T tiles ride dim 1, batch rides dim 2.
 _MAX_GRID_YZ = 65535
+
+
+def _act_dtype(x_dtype, w_dtype):
+    # Never narrower than either operand: fp16 weights with fp32 / bf16 x would overflow to -inf
+    # before SiLU (NaN); fp16 with bf16 promotes to fp32, as causal_conv1d's fp32 SiLU does.
+    return torch.promote_types(x_dtype, w_dtype)
 
 
 def _launch_fwd(x_btd, weight, bias, activation, seq_idx = None, pad_negative = False):
@@ -292,7 +299,13 @@ def _launch_fwd(x_btd, weight, bias, activation, seq_idx = None, pad_negative = 
     grid = ((D + _BD - 1) // _BD, (T + _BT - 1) // _BT, B)
     ptrs = (x_btd, weight, bias if bias is not None else weight, y, seq_idx if seq_idx is not None else weight)
     ints = (T, D, *x_btd.stride())
-    consts = (W, _BT, _BD, bias is not None, activation is not None, seq_idx is not None, pad_negative and seq_idx is not None)
+    act_dtype = _act_dtype(x_btd.dtype, weight.dtype)
+    # 0: fp32, no rounding; 1: the weight's dtype; 2: x's (and y's) dtype.
+    round_to = 1 if act_dtype == weight.dtype else 2 if act_dtype == x_btd.dtype else 0
+    consts = (
+        W, _BT, _BD, bias is not None, activation is not None, seq_idx is not None,
+        pad_negative and seq_idx is not None, round_to,
+    )
     _conv_launch("fwd", fwd, grid, ptrs, ints, consts, _NUM_WARPS, (y,))
     return y
 
@@ -306,7 +319,7 @@ def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_
     grid = ((D + _BD - 1) // _BD, NT, B)
     seq_ptr = seq_idx if seq_idx is not None else weight
     if activation is not None:
-        g = torch.empty((B, T, D), dtype = weight.dtype, device = x_btd.device)
+        g = torch.empty((B, T, D), dtype = _act_dtype(x_btd.dtype, weight.dtype), device = x_btd.device)
         _conv_launch(
             "bwd_g", bwd_g, grid,
             (x_btd, weight, bias if bias is not None else weight, dy_btd, g, seq_ptr),
@@ -334,12 +347,7 @@ def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_
     return dx, dw, db
 
 
-# Training and prefill call the conv once per layer per step with the same shapes, so the Triton
-# launch (specialization + argument binding, ~20-30 us of host time) is cached per shape like the
-# decode update below: key -> (grid, compiled kernel). Same gates: Triton 3.6+ launcher convention,
-# a bitwise self-check per kernel on first use, full launches under profiler hooks, for unaligned
-# pointers (Triton specializes on 16-byte alignment) and off the current device.
-# T is in the key: cap it (FIFO) so variable lengths do not grow it unbounded.
+# Triton 3.6+ cached launches, FIFO-capped: bitwise self-check; unaligned/off-device/profiled go full
 _conv_plans = {}
 _CONV_PLANS_MAX = 256
 _conv_fast_ok = {}
@@ -363,8 +371,7 @@ def _conv_fast_launch(plan, ptrs, ints, consts):
 
 
 def _conv_launch(name, kernel, grid, ptrs, ints, consts, num_warps, outs):
-    """One conv kernel launch, through the cached launcher when it is safe. `outs` are the tensors
-    the kernel writes (and only writes), compared bitwise on the first cached launch."""
+    """Launch conv via cached launcher when safe; write-only outs are bitwise-checked on first launch."""
     aligned = not (functools.reduce(lambda acc, t: acc | t.data_ptr(), ptrs, 0) & 15)
     key = (name, grid, ints, consts, tuple(t.dtype for t in ptrs), ptrs[0].get_device())
     plan = _conv_plans.get(key) if aligned else None
@@ -381,8 +388,7 @@ def _conv_launch(name, kernel, grid, ptrs, ints, consts, num_warps, outs):
     if name not in _conv_fast_ok:
         _conv_full_launch(kernel, grid, ptrs, ints, consts, num_warps)
         if torch.cuda.is_current_stream_capturing():
-            # The self-check reads its verdict back on the host, which invalidates a CUDA graph
-            # capture: keep the full launch and leave the check to the next eager call.
+            # Self-check syncs to host, invalidating CUDA graph capture; defer it to the next eager call.
             return
         refs = [t.clone() for t in outs]
         try:
@@ -434,15 +440,14 @@ def _build_update_kernel():
         stride_x_b, stride_x_d, stride_x_t,
         stride_s_b, stride_s_d, stride_s_l,
         stride_y_b, stride_y_d, stride_y_t,
-        L: tl.constexpr,
-        LP: tl.constexpr,
-        W: tl.constexpr,
-        BD: tl.constexpr,
-        HAS_BIAS: tl.constexpr,
-        ACTIVATION: tl.constexpr,
+        L: tl.constexpr,  # conv state length
+        LP: tl.constexpr,  # state length pow2
+        W: tl.constexpr,  # conv kernel width
+        BD: tl.constexpr,  # block size along channels
+        HAS_BIAS: tl.constexpr,  # conv bias
+        ACTIVATION: tl.constexpr,  # silu activation
     ):
-        # Taps index c = [state (L) | x (T)]: output t sees c[L + t - (W - 1) + i_w], the new
-        # state is c[T:T + L]. Same as the torch path's cat + copy_ + conv1d(padding = 0).
+        # Taps index c=[state|x]: out t reads c[L+t-(W-1)+i_w], new state c[T:T+L]; same as torch path.
         i_d, i_b = tl.program_id(0), tl.program_id(1)
         o_d = i_d * BD + tl.arange(0, BD)
         m_d = o_d < D
@@ -514,8 +519,7 @@ def _hook_active(hook):
 
 
 def triton_causal_conv1d_update(x, conv_state, weight, bias = None, activation = None):
-    """x (B, D, T), conv_state (B, D, L) updated in place, weight (D, W) -> (B, D, T) in x's layout.
-    Always the full Triton launch (specialization + argument binding); the decode path caches it."""
+    """x (B,D,T), conv_state (B,D,L) in place, weight (D,W) -> (B,D,T) in x's layout; uncached launch."""
     return _launch_update(x, conv_state, weight, bias, activation)[0]
 
 
@@ -539,8 +543,7 @@ def _launch_update(x, conv_state, weight, bias, activation, y = None):
     return y, (grid, compiled, ints, ints + tail)
 
 
-# key -> (grid, compiled kernel, runtime ints, runtime ints + constexprs) for repeated decode
-# steps; None = ineligible. Batch size and length are in the key: capped (FIFO) like _conv_plans.
+# Decode plan cache: key -> (grid, kernel, ints, constexprs), None = ineligible; FIFO-capped.
 _update_plans = {}
 _UPDATE_PLANS_MAX = 256
 
@@ -549,14 +552,12 @@ def _remember_update_plan(key, plan):
     if key not in _update_plans and len(_update_plans) >= _UPDATE_PLANS_MAX:
         _update_plans.pop(next(iter(_update_plans)), None)
     _update_plans[key] = plan
-# Which argument list the cached launcher takes on this Triton: None = not checked yet,
-# "all" (every parameter, Triton 3.6+), False = full launches only.
+# Launcher arg list on this Triton: None unchecked, 'all' (every param, 3.6+), False = full only.
 _fast_launch_mode = None
 
 
 def _update_key(x, conv_state, weight, bias, activation):
-    # Everything the eligibility check and Triton's specialization read: shapes, strides, dtypes,
-    # devices and the integer values (==1, %16). Pointer alignment is checked by the caller.
+    # Key: shapes, strides, dtypes, devices, int values (==1, %16); caller checks pointer alignment.
     return (
         x.shape, x.stride(), x.dtype, x.get_device(),
         conv_state.shape, conv_state.stride(), conv_state.dtype, conv_state.get_device(),
@@ -609,12 +610,10 @@ def _triton_launcher_verified():
 
 
 def _check_fast_launch(plan, x, conv_state, weight, bias, activation):
-    """Once per process: launch through the cached launcher and compare with a full launch on
-    copies; pick the argument convention this Triton takes, or keep full launches."""
+    """Once per process: pick cached launcher's arg convention by checking copies; else keep full launches"""
     global _fast_launch_mode
     if not _triton_launcher_verified():
-        # A wrong argument list can fault on the device instead of raising, which no fallback
-        # survives, so only the launcher convention checked on real hardware is tried.
+        # Wrong arg list may fault the device (unrecoverable); only hardware-verified conventions tried
         _fast_launch_mode = False
         return _launch_update(x, conv_state, weight, bias, activation)[0]
     if torch.cuda.is_current_stream_capturing():
@@ -639,8 +638,7 @@ def _check_fast_launch(plan, x, conv_state, weight, bias, activation):
 
 
 def _run_update(x, conv_state, weight, bias, activation):
-    """Triton update for repeated decode steps: one dict lookup on the cached plan, then a direct
-    launcher call (no re-specialization or argument binding). None = use the torch fallback."""
+    """Decode-step update via cached plan: dict lookup, direct launcher call; None = torch fallback."""
     try:
         key = _update_key(x, conv_state, weight, bias, activation)
     except (AttributeError, TypeError):
@@ -745,8 +743,9 @@ def causal_conv1d_reference(x, weight, bias = None, activation = None):
     """The transformers torch fallback: x (B, D, T), weight (D, W)."""
     import torch.nn.functional as F
     D, T = x.shape[1], x.shape[2]
+    dtype = _act_dtype(x.dtype, weight.dtype)
     out = F.conv1d(
-        x.to(weight.dtype), weight.unsqueeze(1), bias,
+        x.to(dtype), weight.to(dtype).unsqueeze(1), None if bias is None else bias.to(dtype),
         padding = weight.shape[-1] - 1, groups = D,
     )[:, :, :T]
     if activation is not None:
@@ -798,8 +797,7 @@ def triton_causal_conv1d(x, weight, bias = None, activation = None, seq_idx = No
     """x (B, D, T), weight (D, W), seq_idx (B, T) -> (B, D, T) stored channel-last."""
     if seq_idx is not None:
         seq_idx = _check_seq_idx(x, seq_idx)
-        # Kernels only compare IDs for equality in the loaded dtype: never narrow (0 == 2**32 in
-        # int32); widen the rest (int8/16, uint*) to int64, a bijection for uint64.
+        # IDs compared for equality only: never narrow (0 == 2**32 in int32); widen others to int64.
         if seq_idx.dtype not in (torch.int32, torch.int64):
             seq_idx = seq_idx.to(torch.int64)
         seq_idx = seq_idx.contiguous()
@@ -842,8 +840,7 @@ def _causal_conv1d_any(x, weight, bias = None, activation = None, seq_idx = None
 
 
 def _own_signature(fn):
-    # Else signature follows __wrapped__ (or a __signature__ functools.wraps copied) and the
-    # hub wrapper drops `seq_idx`.
+    # Own signature: else it follows __wrapped__ or copied __signature__, and the hub drops seq_idx.
     fn.__dict__.pop("__signature__", None)
     fn.__signature__ = inspect.signature(fn, follow_wrapped = False)
     return fn
@@ -884,7 +881,7 @@ def _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx, pad_n
         out = out + xp[:, :, j:j + T] * w[:, j].view(1, -1, 1) * same
     if bias is not None:
         out = out + bias.to(acc).view(1, -1, 1)
-    out = out.to(weight.dtype)
+    out = out.to(_act_dtype(x.dtype, weight.dtype))
     if activation is not None:
         out = _act(activation)(out)
     if pad_negative:
@@ -911,28 +908,27 @@ def _is_gdn_function(torch_function):
 
 
 def _hub_gdn_function(decorator, torch_function):
-    """Hub-decorate the GDN dispatch. transformers >= 5.20 refuses `seq_idx` on its torch path
-    when causal-conv1d is missing, but this dispatch keeps packed rows apart, so packed calls
-    go to it directly; everything else still goes through the hub wrapper."""
+    """transformers 5.20+ rejects seq_idx without causal-conv1d; packed calls bypass the hub wrapper."""
     dispatch = _make_hub_dispatch(torch_function)
     hub_fn = decorator(dispatch)
     # The hub wrapper passes only the implementation's named parameters on.
     names = frozenset(inspect.signature(dispatch).parameters)
 
     if isinstance(hub_fn, torch.nn.Module):
-        # With `kernels` installed the hub decorator turns the function into a layer instance whose
-        # class carries `kernel_layer_name`, which `use_kernelized_func` checks and `kernelize` reads
-        # from `type(fn)`. A plain function wrapper loses both, so route on the instance instead:
-        # the layer stays what transformers registered, and `kernelize` can still swap its forward.
-        hub_forward = hub_fn.forward
+        # Hub yields a layer (kernel_layer_name on its class). Route on a subclass, not the instance:
+        # kernelize's fallback resets the instance forward to type(layer).forward, and a mapped
+        # kernel still replaces the instance forward.
+        hub_class = type(hub_fn)
 
-        @functools.wraps(hub_forward)
-        def forward(*args, **kwargs):
-            if kwargs.get("seq_idx") is not None:
-                return dispatch(*args, **{k: v for k, v in kwargs.items() if k in names})
-            return hub_forward(*args, **kwargs)
+        class Func(hub_class):
+            def forward(self, *args, **kwargs):
+                if kwargs.get("seq_idx") is not None:
+                    return dispatch(*args, **{k: v for k, v in kwargs.items() if k in names})
+                return super().forward(*args, **kwargs)
 
-        hub_fn.forward = forward
+        Func.__name__, Func.__qualname__ = hub_class.__name__, hub_class.__qualname__
+        Func.__module__ = hub_class.__module__
+        hub_fn.__class__ = Func
         # Signature checks (Unsloth's packing gate looks for `seq_idx`) see the dispatch, not (*args, **kwargs).
         hub_fn.__signature__ = inspect.signature(dispatch)
         setattr(hub_fn, _MARK, True)
@@ -949,8 +945,7 @@ def _hub_gdn_function(decorator, torch_function):
 
 
 def _hub_gdn_update(decorator, torch_function):
-    """Hub-decorate the GDN update dispatch. With `kernels` installed the result is a layer
-    instance (its class keeps `kernel_layer_name`), which does not inherit the dispatch's mark."""
+    """With kernels installed the hub result is a layer instance that does not inherit the mark."""
     hub_fn = decorator(_make_update_dispatch(torch_function))
     if isinstance(hub_fn, torch.nn.Module):
         setattr(hub_fn, _MARK, True)
@@ -958,8 +953,7 @@ def _hub_gdn_update(decorator, torch_function):
 
 
 def _patch_hub_decorator():
-    """transformers >= 5.15: hook the hub decorator so later-decorated GDN convs
-    (incl. compiled copies) get the Triton dispatch."""
+    """transformers >= 5.15: hook hub decorator so later GDN convs (incl. compiled copies) get Triton."""
     try:
         import transformers.integrations as integrations
         from transformers.integrations import hub_kernels
@@ -995,6 +989,22 @@ def _legacy_update(module):
     return _make_update_dispatch(torch_function)
 
 
+def _hub_layer_torch_function(current):
+    """The torch fallback inside a kernels hub layer (kernels turns a decorated function into a
+    ``Func()`` module whose class forward closes over the transformers wrapper), else None."""
+    if not isinstance(current, torch.nn.Module):
+        return None
+    for cell in getattr(getattr(type(current), "forward", None), "__closure__", None) or ():
+        try:
+            inner = cell.cell_contents
+        except ValueError:
+            continue
+        torch_function = getattr(inner, "__wrapped__", None) if callable(inner) else None
+        if callable(torch_function):
+            return torch_function
+    return None
+
+
 def _rebind_name(module, name, legacy, patched_decorator):
     current = vars(module)[name]
     if current is None:
@@ -1003,7 +1013,8 @@ def _rebind_name(module, name, legacy, patched_decorator):
         return True
     if _is_marked(current):
         return True
-    torch_function = getattr(current, "__wrapped__", None)
+    # A modeling module imported before the patch holds the kernels layer, which has no __wrapped__.
+    torch_function = getattr(current, "__wrapped__", None) or _hub_layer_torch_function(current)
     if torch_function is None or patched_decorator is None:
         return False
     setattr(module, name, patched_decorator(name, "causal_conv1d")(torch_function))
@@ -1011,8 +1022,7 @@ def _rebind_name(module, name, legacy, patched_decorator):
 
 
 def _rebind_module(module, patched_decorator):
-    """Rebind an imported module; True if its conv now dispatches to Triton. Re-decorating
-    also replaces a wrapper that captured a since-disabled package kernel."""
+    """Rebind module's conv to Triton (True if so); re-decorating replaces stale kernel wrappers."""
     names = vars(module)
     if patched_decorator is not None and "use_kernel_func_from_hub_with_fallback" in names:
         module.use_kernel_func_from_hub_with_fallback = patched_decorator
@@ -1046,8 +1056,8 @@ def mamba_causal_conv1d_fwd_function(x, weight, bias, seq_idx, initial_states, f
     w, b = _mamba_conv_operands(x, weight, bias)
     if seq_idx is not None and seq_idx.dtype not in (torch.int32, torch.int64):
         seq_idx = seq_idx.to(torch.int64)
-    # mamba_ssm calls this inside its autograd.Function (grad mode off); a raw launch has no
-    # backward, so anything autograd would track takes the differentiable torch reference.
+    # mamba_ssm calls this inside its autograd.Function (grad mode off); a raw launch has no backward, so tracked inputs
+    # take the differentiable torch reference.
     if _autograd_tracks(x, weight, bias) or not _eligible(x, w, b, activation, seq_idx, mixed_dtypes = True):
         return _causal_conv1d_reference_seq_idx(x, w, b, activation, seq_idx, pad_negative = True)
     GDN_CAUSAL_CONV1D_STATS["mamba_fused_fwd"] += 1

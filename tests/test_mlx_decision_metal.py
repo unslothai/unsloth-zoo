@@ -566,8 +566,7 @@ def test_training_forward_matches_eval_until_dropout_applies(checkpoint):
     dropped = np.array(model(**batch))
     np.testing.assert_allclose(np.array(_without_dropout(model)(**batch)), want, atol = 1e-4)
     if model.head.layers:
-        # Dropout applies when the training scores move, not when every one does: a single
-        # marker score can land within 1e-4 of its eval value by chance.
+        # Dropout applies when the training scores move, not when every one does: a single marker score can land within 1e-4 of its eval value by chance
         moved = np.abs(dropped - want)[np.array(batch["marker_mask"])] > 1e-4
         assert moved.mean() >= 0.5, moved
 
@@ -844,8 +843,8 @@ def test_trainer_follows_the_evaluation_and_logging_schedule_it_is_given(checkpo
     trainer = MLXDecisionTrainer(model, args, _items(), _items(), callbacks = [recorder], label_smoothing = 0.2)
     trainer.train()
     history = trainer.state.log_history
-    # Two steps an epoch: evaluation waits for step 3 and, as transformers 5 does, takes the last step too; the loss
-    # is logged as each epoch ends, the one the run stops in included.
+    # Two steps an epoch: evaluation waits for step 3 and, as transformers 5 does, also takes the last step; the loss is
+    # logged as each epoch ends, the one the run stops in included
     evaluated = [log for log in history if "eval_loss" in log]
     assert [log["step"] for log in evaluated] == [4, 5][: 1 + _default_flow_evaluates_final_step()] and [log["step"] for log in history if "learning_rate" in log] == [2, 4, 5]
     model.eval()
@@ -1444,8 +1443,7 @@ def test_an_omni_family_of_the_trainer_reads_media_as_the_trainer_does(clef, mon
         assert asked == [(["<a><a><a>\n"], [[]], [16000] * 3)] and checked == [[ramp[:900].tolist(), ramp[:800].tolist(), ramp[800:].tolist()]]
     made._hidden([1, 2, 7, 7, 9, 3], media)
     made._hidden([1, 2], None)
-    # The trainer's preparation runs in its two halves: content on the media run, which may grow it (Phi-4 expands
-    # each image placeholder), positions on the whole prompt.
+    # Two phases: content on the media run (may grow it, Phi-4 expands images); positions on the prompt.
     phases, prepare = [], utils._prepare_vlm_batch_for_compile
 
     def grown(batch, config, phase = None):

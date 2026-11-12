@@ -25,6 +25,7 @@ import textwrap
 
 import pytest
 import torch
+from _cpu_compiler_skip import skip_without_cpu_inductor
 
 pytest.importorskip("triton")
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -98,6 +99,7 @@ def kernel_results(tmp_path_factory):
     script = _KERNEL.replace("__REGION__", textwrap.dedent(inspect.getsource(_region)))
     if torch.cuda.is_available() and torch.version.hip is None:
         return _run(tmp, script, "cuda")
+    skip_without_cpu_inductor()
     return _run(tmp, script, "cpu", env_extra = {"TRITON_INTERPRET": "1"})
 
 
@@ -241,6 +243,8 @@ _CERT = textwrap.dedent('''
     import json, sys
     import torch
     from unsloth_zoo import gpt_oss_decode_fused as F
+    # ROCm builds turn the fused decode off at import; the certification logic is checked under the interpreter.
+    F._ENABLED = True
     dev = sys.argv[1]
     REGION = """__REGION__"""
     exec(REGION)
@@ -273,6 +277,7 @@ def test_first_token_cannot_certify_an_eager_region(tmp_path):
     if torch.cuda.is_available() and torch.version.hip is None:
         res = _run(tmp_path, script, "cuda")
     else:
+        skip_without_cpu_inductor()
         res = _run(tmp_path, script, "cpu", env_extra = {"TRITON_INTERPRET": "1"})
     assert res["position0_agrees"] and res["eager_differs_later"], res  # the premise
     assert res["eager_region_declined"] and res["compiled_accepted"] and res["compiled_equal"], res
@@ -324,6 +329,7 @@ _LOOP = textwrap.dedent('''
 
 
 def test_decode_loop_calls_rope_decode(tmp_path):
+    skip_without_cpu_inductor()
     env = {"UNSLOTH_COMPILE_DISABLE": None, "UNSLOTH_ENABLE_FLEX_ATTENTION": None}
     on = _run(tmp_path, _LOOP, "on", env_extra = env)
     off = _run(tmp_path, _LOOP, "off", env_extra = env)

@@ -282,9 +282,7 @@ def test_a_refused_noninteractive_sudo_install_raises_instead_of_continuing(llam
 
 
 def test_install_llama_cpp_does_not_refresh_packages_when_nothing_is_missing(llama_cpp, monkeypatch, tmp_path):
-    """The probe refreshes package lists (under sudo when needed), so it must only run when a
-    package is actually missing. A build that only needed the clone and compile still ran a
-    privileged package-list refresh."""
+    """The probe refreshes package lists under sudo, so it must run only when a package is missing; a clone and compile build must not refresh."""
     probed = []
     monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
     monkeypatch.setattr(llama_cpp, "_auto_install_enabled", lambda: True)

@@ -14,28 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`create_standalone_class` against a forward hidden behind a decorator that
-does not use `functools.wraps`.
-
-transformers decorates `Qwen3_5GatedDeltaNet.forward` with
-`@force_accelerate_hooks("conv1d")`, and
-`transformers/integrations/accelerate.py` returns a bare inner closure with no
-`functools.wraps`. The class attribute is therefore
-`force_accelerate_hooks.<locals>.decorator.<locals>.wrapped`, so
-`inspect.getsource` returned the wrapper (defined in another file, closing over
-free variables that do not exist at module scope) and `inspect.signature`
-returned `(self, *args, **kwargs)`. The compiler emitted the wrapper body at
-module scope and generated
-
-    def forward(self, hidden_states, cache_params=None, attention_mask=None, **kwargs):
-        return wrapped(self, *args, **kwargs)
-
-which is `NameError: name 'args' is not defined` at the first forward.
-
-The fakes below reproduce that decorator shape without needing transformers or
-a GPU. The negative cases pin that every other decorator shape keeps the
-pre-existing behaviour byte for byte.
-"""
+"""A forward behind a bare-closure decorator (no functools.wraps) must be unwrapped, else the emitted wrapper body raises NameError; fakes need no GPU."""
 
 import functools
 import importlib.util
@@ -51,15 +30,11 @@ from unsloth_zoo.temporary_patches.utils import torch_compiler_disable_unless_de
 
 
 def _unwrap_undecorated_method(func, owner_qualname):
-    """Indirection so this module still imports on a build without the fix.
-    A missing helper then fails the tests that exercise it, instead of
-    erroring collection for the whole file and hiding the codegen tests."""
+    """Indirection so the module still imports without the fix: a missing helper fails only the tests that use it, not the whole collection."""
     return compiler._unwrap_undecorated_method(func, owner_qualname)
 
 
-# Mirrors transformers/integrations/accelerate.py force_accelerate_hooks: an
-# inner closure over (child_module_name, forward_func), returned WITHOUT
-# functools.wraps.
+# Mirrors force_accelerate_hooks in transformers/integrations/accelerate.py: an inner closure over (child_module_name, forward_func) with no functools.wraps.
 _FAKE_MODELING_SOURCE = """
     import torch
     from torch import nn
@@ -97,9 +72,7 @@ _FAKE_MODELING_SOURCE = """
 
 
 def _load_fake_modeling_module(tmp_path, monkeypatch, name):
-    """Write the fake modeling file to disk so inspect.getsource can read it,
-    import it, and expose it to the `eval(f"{model_location}.{module}")` lookup
-    inside create_standalone_class."""
+    """Writes the fake modeling file to disk so inspect.getsource can read it and the eval lookup in create_standalone_class finds it."""
     path = tmp_path / f"{name}.py"
     path.write_text(textwrap.dedent(_FAKE_MODELING_SOURCE), encoding = "utf-8")
     spec = importlib.util.spec_from_file_location(name, path)
@@ -117,8 +90,7 @@ def _generate(module_name, class_name, module):
 
 
 def test_bare_closure_decorator_really_hides_the_method(tmp_path, monkeypatch):
-    """The premise: without unwrapping, the class attribute reports the
-    wrapper's name, signature and source, not the method's."""
+    """Without unwrapping, the class attribute reports the wrapper's name, signature and source, not the method's."""
     module = _load_fake_modeling_module(tmp_path, monkeypatch, "fake_bare_closure_premise")
     attribute = module.FakeGatedDeltaNet.forward
 
@@ -146,9 +118,7 @@ def test_decorated_forward_emits_the_real_body_and_no_unbound_name(tmp_path, mon
 
 
 def test_decorated_forward_keeps_the_disable_classification(tmp_path, monkeypatch):
-    """The wrapper's name is `wrapped`, not `forward`, so the renamed-forward
-    heuristic used to classify the method as an Unsloth temporary patch and set
-    `disable = None`, silently dropping the caller's compile decision."""
+    """The wrapper is named `wrapped`, so the renamed-forward heuristic must not treat it as a patch; otherwise disable = None drops the caller's compile decision."""
     module = _load_fake_modeling_module(tmp_path, monkeypatch, "fake_bare_closure_disable")
 
     disabled = _generate("fake_bare_closure_disable", "FakeGatedDeltaNet", module)
@@ -157,16 +127,12 @@ def test_decorated_forward_keeps_the_disable_classification(tmp_path, monkeypatc
     compiled = compiler.create_standalone_class(
         "FakeGatedDeltaNet", "fake_bare_closure_disable", dir(module), disable = False,
     )
-    # A compile decorator, whichever spelling: fullgraph regions are emitted
-    # as `torch_compile_with_fallback` so cache exhaustion cannot hard-fail.
+    # Either compile spelling counts; fullgraph regions are emitted as torch_compile_with_fallback so cache exhaustion cannot hard-fail.
     assert "@torch_compile_with_fallback(" in compiled or "@torch.compile(" in compiled
 
 
 def test_decorated_forward_runs_and_fires_the_decorator_exactly_once(tmp_path, monkeypatch):
-    """`inspect.getsource` on the real method returns the class-body text
-    INCLUDING the decorator line, so the decorator travels onto the standalone
-    function and is dropped from the emitted class method. It must therefore
-    still fire exactly once, and the numerics must match eager."""
+    """getsource includes the decorator line, so the decorator moves onto the standalone function; it must still fire exactly once and match eager numerics."""
     module = _load_fake_modeling_module(tmp_path, monkeypatch, "fake_bare_closure_runtime")
     generated = _generate("fake_bare_closure_runtime", "FakeGatedDeltaNet", module)
 
@@ -219,9 +185,7 @@ def test_unwrap_returns_plain_method_identically():
 
 
 def test_unwrap_leaves_functools_wraps_decorators_alone():
-    """functools.wraps copies __qualname__ (and sets __wrapped__, which
-    inspect.getsource / inspect.signature already follow), so the wrapper is
-    returned unchanged and behaviour is identical to before the fix."""
+    """functools.wraps copies __qualname__ and sets __wrapped__, which inspect already follows, so such wrappers are returned unchanged."""
     def polite(func):
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs):

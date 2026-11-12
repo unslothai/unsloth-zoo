@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Real-runtime check that GGUF staging restores the per-expert HF tensor names a real
-mlx-lm MoE model was built from: llama.cpp cannot map stacked ``switch_mlp``."""
+"""Real-runtime: GGUF staging restores per-expert HF names; llama.cpp cannot map stacked switch_mlp."""
 
 import json
 import os
@@ -39,13 +38,7 @@ CONFIG = dict(
 
 
 def _static_sanitize_family(loader):
-    """An installed mlx-vlm family whose ``sanitize`` is a staticmethod.
-
-    The flavour is what matters here, not the family: a staticmethod sanitize is the
-    second owner this test needs. It is resolved at runtime because llava_onevision
-    only exists from mlx-vlm 0.7.0, and pyproject still admits 0.6.4, so naming it
-    would fail that supported install with ModuleNotFoundError rather than skip.
-    """
+    """Resolved at runtime: llava_onevision exists only from mlx-vlm 0.7.0, yet pyproject admits 0.6.4."""
     import importlib
     import inspect
     import pkgutil
@@ -58,8 +51,7 @@ def _static_sanitize_family(loader):
             importlib.import_module(f"mlx_vlm.models.{name}.{name}")
         except Exception:
             continue
-        # Go through the loader's own resolution, so the class this test patches is
-        # the one _ensure_native_vlm_weight_names would install the descriptor on.
+        # Use loader._resolve_mlx_vlm_model_class, the class _ensure_native_vlm_weight_names installs on.
         resolved = loader._resolve_mlx_vlm_model_class(name)
         if resolved is not None and isinstance(
             inspect.getattr_static(resolved, "sanitize", None), staticmethod
@@ -249,8 +241,7 @@ def test_moe_staging_restores_names_mlx_sanitize_maps_back_bitwise(tmp_path):
     index = json.loads((path / "model.safetensors.index.json").read_text())
     assert set(index["weight_map"]) == set(rewritten)
 
-    # Replaying mlx-lm's own HF -> MLX map must land the rewritten names back on the
-    # tensors the model was saved from.
+    # Replaying mlx-lm's HF-to-MLX map must land rewritten names back on the tensors it was saved from.
     restored = model.sanitize(dict(rewritten))
     for name in stacked_names:
         assert _bytes_identical(restored[name], staged[name]), name
@@ -280,8 +271,7 @@ def test_moe_staging_holds_no_more_shards_open_as_a_checkpoint_is_split(
         monkeypatch.undo()
         return peak - before
 
-    # A slope, not a ceiling: fixed cost cancels, so only retention that scales with
-    # the checkpoint shows. Small checkpoint first, so warm-up lands in the baseline.
+    # Slopes, not ceilings: fixed cost cancels; a small checkpoint first puts warm-up in the baseline.
     assert descriptor_growth(2) >= descriptor_growth(32)
 
 

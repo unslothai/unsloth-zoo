@@ -18,10 +18,12 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import ast
 import contextlib
 import functools
+import hashlib
 import inspect
 import os
 import stat
 import threading
+import types
 import weakref
 import torch
 import torch.nn as nn
@@ -30,6 +32,7 @@ import torch.nn.functional as F
 import functools
 import inspect
 from .common import (
+    compile_mask_builder,
     TEMPORARY_PATCHES,
     torch_compile,
     _torch_compile,
@@ -39,7 +42,8 @@ from .common import (
     logger,
 )
 from importlib.metadata import version as importlib_version
-from unsloth_zoo.utils import Version
+from unsloth_zoo.decode_graph_state import in_graph_generate as _in_graph_generate
+from unsloth_zoo.utils import Version, _class_source
 from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
 try:
     from .moe_router_triton import fused_route_or_none as _fused_route_or_none
@@ -57,6 +61,8 @@ from unsloth_zoo.gpt_oss_decode_fused import (
 )
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
+# Not "5.0.0.dev0": Version() maps it to 5.0.0.1, which excludes the 5.0.0 release.
+_IS_TRANSFORMERS_V5 = transformers_version >= Version("5.0.0")
 from .utils import (
     patch_function,
     patch_function_past_key_values,
@@ -70,8 +76,7 @@ from .utils import (
 from unsloth_zoo.hf_utils import dtype_from_config
 torch_cuda_device = torch.cuda.device
 
-# Set when patch_GptOssAttention installs the forward that routes training through
-# flex_attention_with_sink, which builds its own BlockMask and ignores these masks.
+# Set when patch_GptOssAttention installs the forward routing training through flex_attention_with_sink, which builds its own BlockMask and ignores these masks.
 _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED = False
 # Eval eager attention: above CHECK_BYTES, query chunks of half the free CUDA memory (CHUNK_BYTES overrides).
 _EAGER_ATTENTION_CHUNK_BYTES = None
@@ -126,12 +131,224 @@ def _gpt_oss_flex_inference(device):
     )
 
 
+def _gpt_oss_mask_device(input_embeds, args, kwargs):
+    """The device masks are built for. transformers 4.x generate passes a CPU torch.empty placeholder as input_embeds
+    (shape only), so a CPU embed defers to the positions, the 2D mask or the cache."""
+    if input_embeds.device.type != "cpu":
+        return input_embeds.device
+    for name in ("cache_position", "position_ids", "attention_mask"):
+        x = kwargs.get(name, None)
+        if isinstance(x, torch.Tensor) and x.device.type != "cpu":
+            return x.device
+    for x in args:
+        if isinstance(x, torch.Tensor) and x.device.type != "cpu":
+            return x.device
+    cache = kwargs.get("past_key_values", None)
+    for layer in getattr(cache, "layers", None) or ():
+        keys = getattr(layer, "keys", None)
+        if isinstance(keys, torch.Tensor) and keys.device.type not in ("cpu", "meta"):
+            return keys.device
+    return input_embeds.device
+
+
+_GRAPH_DECODE_DEFAULT = {}
+
+
+def _gpt_oss_default_graph_decode_attention():
+    """"auto" on compute capability 8.0 and newer, where graphed flex_decoding measured as fast as the dense
+    one-token attention or faster (A100: 1.02x at 1k context, 1.23x at 16k); "dense" on older GPUs (T4), where it
+    was slower at batch 4 and 8."""
+    if not torch.cuda.is_available():
+        return "dense"
+    device = torch.cuda.current_device()
+    mode = _GRAPH_DECODE_DEFAULT.get(device)
+    if mode is None:
+        try:
+            major = torch.cuda.get_device_capability(device)[0]
+        except Exception:
+            major = 0
+        mode = _GRAPH_DECODE_DEFAULT[device] = "auto" if major >= 8 else "dense"
+    return mode
+
+
+def _gpt_oss_graph_decode_attention():
+    """One-token attention inside a generate() call Unsloth decodes through CUDA graphs:
+    "dense" runs the sink attention over a dense mask, "flex" keeps flex_decoding on a BlockMask whose tensors the
+    graph refills, "auto" flex with the dense fallback (UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION, read per call;
+    unset: _gpt_oss_default_graph_decode_attention)."""
+    mode = os.environ.get("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "").strip().lower()
+    if not mode:
+        return _gpt_oss_default_graph_decode_attention()
+    # "auto": flex where the mask publishes a graph contract, the dense mask otherwise (a custom mask function).
+    return mode if mode in ("flex", "auto") else "dense"
+
+
+def _gpt_oss_in_graph_generate():
+    return not torch.compiler.is_compiling() and _in_graph_generate()
+
+
+def _gpt_oss_dense_graph_decode(inputs_embeds):
+    """A one-token step of a graph-planned generate() with dense decode attention: its masks are built dense.
+    A full sliding window rolls by one slot per step and moves the mask offset, which a dense mask of fixed shape
+    carries as values while a BlockMask closure would bake it in."""
+    return (
+        isinstance(inputs_embeds, torch.Tensor) and inputs_embeds.dim() >= 2 and inputs_embeds.shape[1] == 1
+        and _gpt_oss_in_graph_generate() and _gpt_oss_graph_decode_attention() == "dense"
+    )
+
+
+def _gpt_oss_graph_dense_attention(hidden_states):
+    """A one-token step of a graph-planned generate() whose mask came back dense: always in "dense" mode, and in
+    "auto" mode when the flex mask could not publish a graph contract."""
+    return (
+        isinstance(hidden_states, torch.Tensor) and hidden_states.dim() >= 2 and hidden_states.shape[1] == 1
+        and _gpt_oss_in_graph_generate() and _gpt_oss_graph_decode_attention() in ("dense", "auto")
+    )
+
+
+def _gpt_oss_dense_decode_mask_ok(attention_mask, n_heads):
+    """Masks the dense one-token attention reads: None, or [B or 1, 1 or H, 1, L]; anything else stays eager."""
+    return attention_mask is None or (
+        isinstance(attention_mask, torch.Tensor) and attention_mask.dim() == 4
+        and attention_mask.shape[1] in (1, n_heads) and attention_mask.shape[2] == 1
+    )
+
+
+def _gpt_oss_decode_attention(module, query, key, value, attention_mask, scaling):
+    """One-token sink attention, grouped over the KV heads instead of repeat_kv copies: the rounding points of
+    _eager_attention_rows (logits in the input dtype, fp32 softmax over keys + sink stored back in that dtype,
+    probabilities cast to the value dtype). query [B, H, 1, D], key / value [B, KVH, L, D]; returns [B, 1, H, D]."""
+    bsz, n_heads, q_len, head_dim = query.shape
+    kv_heads = key.shape[1]
+    groups = n_heads // kv_heads
+    kv_len = key.shape[-2]
+    if attention_mask is not None:
+        kv_len = min(kv_len, attention_mask.shape[-1])
+        key, value = key[:, :, :kv_len], value[:, :, :kv_len]
+        attention_mask = attention_mask[..., :kv_len]
+    out_dtype = torch.promote_types(query.dtype, key.dtype)
+    logits = key.new_empty((bsz, kv_heads, groups * q_len, kv_len + 1), dtype = out_dtype)
+    q = query.reshape(bsz, kv_heads, groups * q_len, head_dim)
+    weights = torch.matmul(q, key.transpose(2, 3), out = logits[..., :kv_len])
+    weights *= scaling
+    if attention_mask is not None:
+        # [B or 1, 1, 1, L] (one row per sequence, every head) or [B or 1, H, 1, L] (per head, grouped as the
+        # logits are: head h = kv head h // groups, row h % groups).
+        # Shared vs per head from the mask itself: with one KV head a per-head mask still has `groups` rows.
+        if attention_mask.shape[1] == 1:
+            weights += attention_mask.reshape(attention_mask.shape[0], 1, 1, kv_len)
+        else:
+            weights += attention_mask.reshape(attention_mask.shape[0], kv_heads, groups, kv_len)
+    logits[..., -1] = module.sinks.reshape(1, kv_heads, groups)
+    logits[:] = torch.nn.functional.softmax(logits, dim = -1, dtype = torch.float32)
+    probs = logits[..., :kv_len].to(value.dtype)
+    # Outside autocast, as the eager path's out=query matmul: the result keeps the activations' dtype and range
+    # (an fp16 autocast would recast bf16 values past 65504 to inf).
+    with torch.autocast(device_type = value.device.type, enabled = False):
+        out = torch.matmul(probs, value)
+    return out.reshape(bsz, n_heads, q_len, head_dim).transpose(1, 2).contiguous(), None
+
+
+_MASK_SCALARS = (bool, int, float, str, type(None))
+
+
+_MISSING = object()
+# Attribute values that are code, not state: modules, classes, builtins and method descriptors.
+_MASK_CODE_TYPES = (
+    types.ModuleType, type, types.BuiltinFunctionType, types.BuiltinMethodType, types.MethodDescriptorType,
+    types.WrapperDescriptorType, types.MethodWrapperType, torch.dtype, torch.device,
+)
+
+
+def _library_namespace(value):
+    """torch / math / builtins (and their classes): their attributes are library code, never mask state."""
+    name = getattr(value, "__name__", "") if isinstance(value, types.ModuleType) else getattr(value, "__module__", "")
+    return (name or "").split(".")[0] in ("torch", "math", "operator", "builtins", "functools")
+
+
+def _static_attribute(owner, attr):
+    """owner.attr without running descriptors or __getattr__ (a property could compute anything)."""
+    try:
+        return inspect.getattr_static(owner, attr)
+    except AttributeError:
+        return _MISSING
+
+
+@functools.lru_cache(maxsize = 256)
+def _code_digest(code):
+    """Bytecode, constants and names of a code object (nested ones included): two lambdas on one line that
+    differ only in a literal get different digests."""
+    h = hashlib.sha1(code.co_code)
+    for const in code.co_consts:
+        h.update(_code_digest(const).encode() if isinstance(const, types.CodeType) else repr(const).encode())
+    h.update(repr((code.co_names, code.co_varnames, code.co_freevars)).encode())
+    return h.hexdigest()
+
+
+def _mask_function_identity(fn, depth = 4):
+    """A flat tuple naming what mask_function computes: every function's code (nested through its closure and
+    defaults) and every scalar it captures. None when it captures anything else (a tensor, a dict, an object, a
+    functools.partial): such a mask cannot be rebuilt over refilled graph buffers, nor told apart by a graph key.
+    Published on the BlockMask, so a graph captured for one mask is never replayed for another (a different window
+    or a different mask_function under the same outer mask_mod)."""
+    out = []
+
+    def walk(f, depth):
+        # Plain functions only: a bound method's __self__, a partial or a callable object carries state no key sees.
+        if depth <= 0 or type(f) is not types.FunctionType:
+            return False
+        code = f.__code__
+        out.append(f"{code.co_filename}:{code.co_firstlineno}:{getattr(code, 'co_qualname', code.co_name)}:{_code_digest(code)}")
+        values = []
+        for cell in getattr(f, "__closure__", None) or ():
+            try:
+                values.append(cell.cell_contents)
+            except ValueError:
+                values.append(None)
+        values.extend(getattr(f, "__defaults__", None) or ())
+        values.extend((getattr(f, "__kwdefaults__", None) or {}).values())
+        # Module-level names the code reads: a scalar is named by its value, a function walked, builtins are code.
+        # A module or class is code too, but its attributes are state the mask can read (settings.WINDOW,
+        # Config.WINDOW): each other name the code loads is looked up on it and keyed the same way.
+        # Anything else (a tensor, a dict, an object) cannot be keyed.
+        module_globals = getattr(f, "__globals__", None) or {}
+        for name in code.co_names:
+            if name not in module_globals:
+                continue
+            value = module_globals[name]
+            out.append(name)
+            if isinstance(value, (types.ModuleType, type)):
+                if not _library_namespace(value):
+                    for attr in code.co_names:
+                        if attr == name:
+                            continue
+                        found = _static_attribute(value, attr)
+                        if found is _MISSING:
+                            continue
+                        if isinstance(found, (types.ModuleType, type)) and not _library_namespace(found):
+                            return False  # settings.Config.WINDOW: a nested namespace's state is not keyed
+                        out.append(f"{name}.{attr}")
+                        if not isinstance(found, _MASK_CODE_TYPES):
+                            values.append(found)
+            elif not isinstance(value, types.BuiltinFunctionType):
+                values.append(value)
+        for value in values:
+            items = value if type(value) in (list, tuple) else (value,)
+            out.append(len(items) if type(value) in (list, tuple) else -1)
+            for item in items:
+                if type(item) in _MASK_SCALARS:
+                    out.append("None" if item is None else item)
+                elif not walk(item, depth - 1):
+                    return False
+        return True
+
+    return tuple(out) if walk(fn, depth) else None
+
+
 @functools.lru_cache(maxsize = 64)
 def _gpt_oss_decode_block_starts(n, block, device):
-    """[min, block, 2 * block, ...]: bucketize(d, right = True) counts the starts <= d, so it is clamp(d // block + 1, 1, n)."""
-    starts = torch.arange(n, dtype = torch.int64, device = device) * block
-    starts[0] = torch.iinfo(torch.int64).min
-    return starts
+    from unsloth_zoo.flex_attention.decode import _block_starts
+    return _block_starts(n, block, device)
 
 
 @torch.compiler.disable
@@ -147,9 +364,14 @@ def _gpt_oss_flex_mask(
     cache_position = None,
     **kwargs,
 ):
-    """transformers' mask interface as a BlockMask (KV slot j is position kv_offset + j). Offsets are 0-d tensors so
-    the compiled build does not specialise on the decode step."""
+    """Mask for transformers' mask interface as a BlockMask (KV slot j is position kv_offset + j); 0-d tensor offsets
+    keep the compiled build from specialising on decode."""
     from unsloth_zoo.flex_attention.utils import compiled_create_block_mask
+    passed = dict(
+        batch_size = batch_size, q_length = q_length, kv_length = kv_length, q_offset = q_offset,
+        kv_offset = kv_offset, mask_function = mask_function, attention_mask = attention_mask, device = device,
+        cache_position = cache_position, **kwargs,
+    )
     if q_length is None:
         # transformers 4.x: no q_length / device.
         q_length = cache_position.shape[0]
@@ -162,56 +384,59 @@ def _gpt_oss_flex_mask(
     q_off, kv_off = offset(q_offset), offset(kv_offset)
     padding = None
     if attention_mask is not None and attention_mask.dim() == 2:
-        padding = attention_mask.to(dtype = torch.bool)
-        # Slots past the 2D mask (unwritten static cache slots) stay invisible.
-        missing = int(kv_length) + int(kv_off) - padding.shape[-1]
-        if missing > 0:
-            padding = torch.nn.functional.pad(padding, (0, missing))
+        # One column per KV slot (slot j holds position kv_offset + j): a fixed [B, kv_length] whatever the offset,
+        # so a rolling sliding window (offset + 1 per step) keeps the shape a decode graph keys on. Positions past
+        # the 2D mask (unwritten static slots) stay invisible; a tensor offset is never read on the host.
+        from unsloth_zoo.flex_attention.decode import decode_padding
+        padding = decode_padding(attention_mask, kv_length, kv_off)
     q_length, kv_length = int(q_length), int(kv_length)
     # Per-row blocks even without padding: packed documents make mask_function row dependent.
     bsz = batch_size
 
-    def build(device):
-        q_o, kv_o = (
-            x.to(device) if isinstance(x, torch.Tensor) else torch.full((), x, dtype = torch.int64, device = device)
-            for x in (q_off, kv_off)
-        )
-        if padding is not None:
-            pad = padding.to(device)
+    def make_mask_mod(q_o, kv_o, pad = None):
+        if pad is not None:
             def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
-                kv_pos = kv_idx + kv_o
-                return mask_function(batch_idx, head_idx, q_idx + q_o, kv_pos) & pad[batch_idx, kv_pos]
+                return mask_function(batch_idx, head_idx, q_idx + q_o, kv_idx + kv_o) & pad[batch_idx, kv_idx]
         else:
             def mask_mod(batch_idx, head_idx, q_idx, kv_idx):
                 return mask_function(batch_idx, head_idx, q_idx + q_o, kv_idx + kv_o)
+        return mask_mod
+
+    def build(device):
         if q_length == 1:
-            # Decode: blocks partial, mask_mod decides per key. Causal: only blocks up to the query's own slot can hold a
-            # visible key, so a static cache's unwritten tail is not listed (counted on device, no host sync).
-            from torch.nn.attention.flex_attention import BlockMask, _DEFAULT_SPARSE_BLOCK_SIZE as BLOCK
-            n = (kv_length + BLOCK - 1) // BLOCK
-            rows = bsz or 1
-            if isinstance(q_off, torch.Tensor) or isinstance(kv_off, torch.Tensor):
-                # One kernel: clamp((q - kv_off) // BLOCK + 1, 1, n) as a bucket count, written contiguous int32.
-                d = q_o if isinstance(kv_off, int) and kv_off == 0 else q_o - kv_o
-                kv_num_blocks = torch.bucketize(d.expand(rows, 1, 1), _gpt_oss_decode_block_starts(n, BLOCK, device),
-                                                out_int32 = True, right = True)
-            else:
-                # Integer offsets (dynamic caches): count on the host, one fill as before.
-                kv_num_blocks = torch.full((rows, 1, 1), min(max((q_off - kv_off) // BLOCK + 1, 1), n),
-                                           dtype = torch.int32, device = device)
-            kv_indices = torch.arange(n, dtype = torch.int32, device = device).view(1, 1, 1, n).expand(rows, 1, 1, n)
-            block_mask = BlockMask.from_kv_blocks(
-                kv_num_blocks, kv_indices.contiguous(), BLOCK_SIZE = BLOCK, mask_mod = mask_mod,
-                seq_lengths = (1, kv_length),
-                **({"compute_q_blocks": torch.is_grad_enabled()} if _HAS_COMPUTE_Q_BLOCKS else {}),
+            from unsloth_zoo.flex_attention.decode import build_decode_block_mask
+            graph_mode = _gpt_oss_graph_decode_attention() if _gpt_oss_in_graph_generate() else None
+            identity = _mask_function_identity(mask_function) if graph_mode in ("flex", "auto") else None
+            if graph_mode == "auto" and identity is None:
+                return None
+            block_mask = build_decode_block_mask(
+                device, bsz, kv_length, q_off, kv_off, padding, mask_function, identity,
             )
         else:
-            block_mask = compiled_create_block_mask(mask_mod, bsz, None, q_length, kv_length, device = device)
+            q_o, kv_o = (
+                x.to(device) if isinstance(x, torch.Tensor) else torch.full((), x, dtype = torch.int64, device = device)
+                for x in (q_off, kv_off)
+            )
+            pad = padding.to(device) if padding is not None else None
+            block_mask = compiled_create_block_mask(make_mask_mod(q_o, kv_o, pad), bsz, None, q_length, kv_length, device = device)
         return block_mask
 
     # BlockMask.to() does not move mask_mod's captured tensors: rebuild per device. Weakref avoids a cycle.
     device = torch.device(device)
     block_mask = build(device)
+    if block_mask is None:
+        # "auto" graph decode with a mask function the graph cannot key or refill: the dense mask the dense decode
+        # attention reads, built by transformers' eager interface from the same arguments.
+        from transformers.masking_utils import eager_mask
+        args = {k: v for k, v in passed.items() if v is not None}
+        if attention_mask is not None and attention_mask.dim() == 2:
+            args["attention_mask"] = attention_mask.to(dtype = torch.bool)
+        if "cache_position" not in args and "cache_position" in inspect.signature(eager_mask).parameters:
+            # transformers 4.x eager_mask takes positions; a 5.x-style call carries the query offset instead.
+            args["cache_position"] = torch.arange(q_length, device = device) + (
+                q_off.to(device) if isinstance(q_off, torch.Tensor) else q_off
+            )
+        return eager_mask(**args)
     this, masks = weakref.ref(block_mask), {}
     def on_device(target):
         target = torch.device(target)
@@ -245,19 +470,8 @@ def _register_gpt_oss_flex_mask():
         return False
     if _GPT_OSS_FLEX_MASK not in ALL_MASK_ATTENTION_FUNCTIONS._global_mapping:
         ALL_MASK_ATTENTION_FUNCTIONS.register(_GPT_OSS_FLEX_MASK, _gpt_oss_flex_mask)
-    if not hasattr(_FlexBlockMask, "contiguous"):
-        # transformers >= 5.21 generate calls .contiguous() on every mask it builds.
-        _FlexBlockMask.contiguous = lambda self, *args, **kwargs: self
-    if not getattr(_FlexBlockMask.to, "_unsloth_gpt_oss", False):
-        # accelerate moves masks with .to(), which leaves captured tensors behind.
-        _block_mask_to = _FlexBlockMask.to
-        def to(self, device, *args, **kwargs):
-            on_device = getattr(self, "_unsloth_on_device", None)
-            if on_device is not None and isinstance(device, (str, int, torch.device)):
-                return on_device(device)
-            return _block_mask_to(self, device, *args, **kwargs)
-        to._unsloth_gpt_oss = True
-        _FlexBlockMask.to = to
+    from unsloth_zoo.flex_attention.decode import install_block_mask_transfer
+    install_block_mask_transfer()
     return True
 
 
@@ -286,8 +500,7 @@ def is_triton_kernels_available():
     return _TRITON_KERNELS_AVAILABLE
 
 
-# Newer triton_kernels returns a layout instance, not (class, kwargs): unpacking blind
-# raises TypeError there.
+# Newer triton_kernels returns a layout instance rather than (class, kwargs), so unpacking blindly raises TypeError there.
 def _mxfp4_layout_selection_is_class_contract(selection):
     return (
         isinstance(selection, tuple)
@@ -378,8 +591,7 @@ _MXFP4_STRIDED_VALUES_WARNED = False
 
 
 def _mxfp4_layout_arguments(layout_module, w):
-    """(layout_arg, ctor_kwargs, strided_arg) for this weight. strided_arg is a class or
-    an instance to match the installed convert_layout, and is reused for the scales."""
+    """Returns (layout_arg, ctor_kwargs, strided_arg) for this weight; strided_arg is a class or instance matching the installed convert_layout, reused for scales."""
     StridedLayout = layout_module.StridedLayout
     dataclass_layouts = "major_dim" in getattr(StridedLayout, "__dataclass_fields__", {})
     # The K axis of the (E, K, N) stack: 3.7+ layouts take it as a negative axis (HopperMXValueLayout asserts it).
@@ -395,8 +607,8 @@ def _mxfp4_layout_arguments(layout_module, w):
         strided_argument = StridedLayout()
 
     if _force_strided_mxfp4_values(value_layout, layout_module, w):
-        # Otherwise generate() dies in matmul_ogs: "Only Hopper swizzling is supported
-        # for values". Unswizzled values pair with the strided scales, still MXFP4.
+        # Otherwise generate() dies in matmul_ogs (only Hopper swizzling is supported for values); unswizzled values
+        # pair with the strided scales and stay MXFP4.
         global _MXFP4_STRIDED_VALUES_WARNED
         value_layout, value_layout_opts = strided_argument, {}
         if not _MXFP4_STRIDED_VALUES_WARNED:
@@ -410,8 +622,7 @@ def _mxfp4_layout_arguments(layout_module, w):
 
 
 def _force_strided_mxfp4_values(value_layout, layout_module, w):
-    """Should this weight skip Blackwell value swizzling? UNSLOTH_MXFP4_VALUE_LAYOUT
-    = auto | strided | default, read per call so it can be set after import."""
+    """Whether this weight skips Blackwell value swizzling; UNSLOTH_MXFP4_VALUE_LAYOUT (auto | strided | default) is read per call, so it can be set after import."""
     override = os.environ.get("UNSLOTH_MXFP4_VALUE_LAYOUT", "auto").strip().lower()
     if override == "default":
         return False
@@ -572,11 +783,9 @@ pass
 
 
 def topk_to_routing_tensors(router_indices, routing_weights, n_expts_tot):
-    """triton_kernels.routing.routing_torch from its sort step on, fed the router's already-softmaxed weights.
-
-    routing_weights is dense (n_tokens, n_experts) or aligned with router_indices (n_tokens, top_k).
-    Returns (gate_scal, expt_hist, combine_indx, dispatch_indx), expert-major.
-    """
+    """Mirrors triton_kernels.routing.routing_torch from its sort step on, fed already-softmaxed router weights;
+    routing_weights is dense (n_tokens, n_experts) or aligned with router_indices (n_tokens, top_k); returns
+    expert-major (gate_scal, expt_hist, combine_indx, dispatch_indx)."""
     n_tokens, top_k = router_indices.shape
     expt_indx = router_indices.to(torch.int64)
     if tuple(routing_weights.shape) == (n_tokens, n_expts_tot):
@@ -615,10 +824,8 @@ pass
 
 
 def expt_data_from_hist(hist, n_expts_tot, n_gates, block_ms):
-    """triton_kernels.routing.compute_expt_data_torch, batched over block_ms and sync-free.
-
-    Returns (token_offs_raw, {block_m: token_offs_pad}, {block_m: block_pid_map}).
-    """
+    """Batched over block_ms and sync-free, mirroring triton_kernels.routing.compute_expt_data_torch; returns
+    (token_offs_raw, {block_m: token_offs_pad}, {block_m: block_pid_map})."""
     device = hist.device
     zero = torch.zeros(1, dtype = torch.int32, device = device)
     token_offs_raw = torch.cat((zero, torch.cumsum(hist, 0, dtype = torch.int32)))
@@ -927,7 +1134,6 @@ def patch_gpt_oss():
                 intermediate_cache3 = intermediate_cache3.reshape(*leading_shape, intermediate_cache3.shape[-1])
             return intermediate_cache3.to(input_dtype)
 
-        pass
 
     patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
 
@@ -1078,11 +1284,8 @@ TEMPORARY_PATCHES.append(patch_gpt_oss)
 
 
 class ParameterModule(nn.Linear):
-    """
-    Wraps a parameter as an nn.Linear for PEFT, managing 3D <-> 2D weight conversion.
-    Unsloth grouped_mm needs 3D weights (gate_up: (E, H, 2I); down: (E, I, H)); PEFT
-    Linear needs 2D (Out, In). Stored 2D for PEFT, reshaped for Unsloth via get_param().
-    """
+    """Wraps a parameter as nn.Linear for PEFT: grouped_mm needs 3D weights (gate_up (E, H, 2I), down (E, I, H)) while
+    PEFT needs 2D (Out, In), reshaped via get_param()."""
 
     def __init__(
         self, in_features, out_features, shape_3d, permute_to_2d, permute_to_3d
@@ -1154,18 +1357,14 @@ def patch_gpt_oss_compiler_exports():
     m.dtype_from_config = dtype_from_config
     m.transformers_version = transformers_version
     m.Version = Version
+    m._IS_TRANSFORMERS_V5 = _IS_TRANSFORMERS_V5
 TEMPORARY_PATCHES.append(patch_gpt_oss_compiler_exports)
 
 
 class GptOssExperts(nn.Module):
-    """
-    GPT OSS MoE Experts layer with 3D stacked parameters; supports grouped_mm with split LoRA.
-    Same structure as transformers GptOssExperts:
-    - gate_up_proj: (num_experts, hidden_size, 2 * expert_dim)
-    - gate_up_proj_bias: (num_experts, 2 * expert_dim)
-    - down_proj: (num_experts, expert_dim, hidden_size)
-    - down_proj_bias: (num_experts, hidden_size)
-    """
+    """Mirrors transformers GptOssExperts with 3D stacked params for grouped_mm and split LoRA: gate_up_proj
+    (num_experts, hidden_size, 2 * expert_dim), gate_up_proj_bias (num_experts, 2 * expert_dim), down_proj
+    (num_experts, expert_dim, hidden_size), down_proj_bias (num_experts, hidden_size)."""
 
     def __init__(self, config):
         super().__init__()
@@ -1223,10 +1422,7 @@ class GptOssExperts(nn.Module):
         unexpected_keys,
         error_msgs,
     ):
-        """
-        Convert checkpoint 3D tensors (gate_up_proj, down_proj nn.Parameter) to the 2D
-        .weight format that ParameterModule (nn.Linear subclass) expects.
-        """
+        """Converts checkpoint 3D gate_up_proj and down_proj tensors to the 2D .weight format that ParameterModule (an nn.Linear subclass) expects."""
         gate_up_key = prefix + "gate_up_proj"
         gate_up_weight_key = prefix + "gate_up_proj.weight"
         if gate_up_key in state_dict and gate_up_weight_key not in state_dict:
@@ -1266,11 +1462,8 @@ pass
 
 
 class _RouterLinearParams(nn.Module):
-    """
-    weight/bias container like nn.Linear but NOT nn.Linear, so BitsAndBytes will NOT quantize it.
-    State dict keys linear.weight/linear.bias match BnB 4-bit checkpoints where the router was
-    saved via an nn.Linear submodule.
-    """
+    """Weight/bias container like nn.Linear but not one, so BitsAndBytes will not quantize it; keys
+    linear.weight/linear.bias match BnB 4-bit checkpoints that saved the router via nn.Linear."""
     def __init__(self, in_features, out_features, dtype):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
@@ -1286,8 +1479,7 @@ class GptOssTopKRouter(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_local_experts
         self.hidden_dim = config.hidden_size
-        # _RouterLinearParams (not nn.Linear) avoids BnB 4-bit quantization; keys
-        # router.linear.weight/bias match the BnB 4-bit checkpoint format.
+        # _RouterLinearParams (not nn.Linear) avoids BnB 4-bit quantization; its keys router.linear.weight/bias match the BnB 4-bit checkpoint format.
         self.linear = _RouterLinearParams(self.hidden_dim, self.num_experts, dtype=dtype_from_config(config))
 
     # transformers' _init_weights expects .weight and .bias
@@ -1317,7 +1509,7 @@ class GptOssTopKRouter(nn.Module):
             router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
             router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
         router_scores = torch.zeros_like(router_logits, dtype=router_logits.dtype).scatter_(1, router_indices, router_top_value)
-        if transformers_version >= Version("5.0.0"):
+        if _IS_TRANSFORMERS_V5:
             return router_logits, router_scores, router_indices
         else:
             return router_scores, router_indices
@@ -1327,10 +1519,7 @@ pass
 
 # BitsAndBytes 4bit compatible classes for loading pre-quantized models
 class GptOssExpertsBnb4bit(nn.Module):
-    """
-    GPT OSS MoE Experts using ModuleLists of nn.Linear (gate_up_projs, down_projs)
-    so BitsAndBytes can quantize them.
-    """
+    """GPT OSS MoE experts as ModuleLists of nn.Linear (gate_up_projs, down_projs) so BitsAndBytes can quantize them."""
 
     # Eval calls above this many (token, expert) rows skip the all-experts dense branch.
     _dense_eval_max_rows = 8192
@@ -1370,20 +1559,15 @@ class GptOssExpertsBnb4bit(nn.Module):
         )
 
     def _grouped_bnb4bit_ready(self):
-        """True when every expert is a bnb Linear4bit with a populated quant_state,
-        either plain or wrapped by one supported PEFT LoRA adapter (see
-        gpt_oss_grouped_qlora.expert_lora_state), so the grouped torch._grouped_mm
-        path applies. Stores the LoRA state on self._unsloth_grouped_lora.
-
-        Self-contained (local imports, no module globals): the compiler can copy
-        this class's source into the standalone compiled cache, whose module
-        namespace lacks this file's globals."""
+        """True when every expert is a bnb Linear4bit with a populated quant_state (plain or one PEFT LoRA), so grouped
+        torch._grouped_mm applies; stores that state on self._unsloth_grouped_lora; keep it self-contained since the
+        compiler copies the source into a cache lacking this file's globals."""
         import os
         if os.environ.get("UNSLOTH_GPTOSS_GROUPED", "1") == "0":
             return False
-        # Not gated on UNSLOTH_COMPILE_DISABLE: grouped_qlora_forward is torch.compiler.disable'd, eager either way.
-        # The full check costs ~0.6 ms per layer; reuse it while ready_signature is unchanged,
-        # and skip even that while no expert state changed (moe_ready_epoch).
+        # Not gated on UNSLOTH_COMPILE_DISABLE since grouped_qlora_forward is torch.compiler.disable'd (eager either
+        # way); reuse the readiness check while ready_signature is unchanged, and skip it while moe_ready_epoch is
+        # unchanged.
         from unsloth_zoo.temporary_patches.gpt_oss_grouped_qlora import (
             cached_ready, ready_record, ready_signature,
         )
@@ -1473,15 +1657,9 @@ class GptOssExpertsBnb4bit(nn.Module):
 
     def _forward_grouped_bnb4bit(self, hidden_states, router_indices, routing_weights,
                                  batch_size, num_tokens, num_experts, top_k):
-        """Grouped equivalent of the per-expert loop (gpt_oss_grouped_qlora): one gather,
-        one stacked NF4 dequant + torch._grouped_mm per projection (rebuilt in backward
-        per _moe_recompute_default), the LoRA adapter as grouped_mm over the stacked
-        per-expert A / B, fp32 index_add combine. fp16 experts (fp32 down under the
-        loader's rule) take Triton grouped GEMMs with the loop's per-projection dtypes.
-        None (the caller keeps the per-expert loop) when no grouped path matches.
-
-        Self-contained (local imports, no module globals) for the standalone
-        compiled cache; see _grouped_bnb4bit_ready."""
+        """Grouped equivalent of the per-expert loop: one NF4 dequant and torch._grouped_mm per projection (rebuilt in
+        backward), fp32 index_add combine; fp16 experts (fp32 down per loader rule) use Triton grouped GEMMs; None
+        keeps the loop; stays self-contained for the compiled cache."""
         from unsloth_zoo.temporary_patches.gpt_oss_grouped_qlora import grouped_qlora_forward
         lora = getattr(self, "_unsloth_grouped_lora", None)
         if hidden_states.dtype not in (torch.bfloat16, torch.float16, torch.float32):
@@ -1504,8 +1682,7 @@ class GptOssExpertsBnb4bit(nn.Module):
             and num_tokens * num_experts > self._dense_eval_max_rows
             and not torch.compiler.is_compiling()
         )
-        # fp16 experts take the grouped path too: it keeps the loop's fp32 swiglu and
-        # fp32 down output (gpt_oss_grouped_qlora.compute_mode decides per call).
+        # fp16 experts take the grouped path too; it keeps the loop's fp32 swiglu and fp32 down output (gpt_oss_grouped_qlora.compute_mode decides per call).
         if (
             (self.training or eval_routed)
             and self._grouped_bnb4bit_ready()
@@ -1555,11 +1732,6 @@ class GptOssExpertsBnb4bit(nn.Module):
 
                 gate_up = self.gate_up_projs[expert_idx](current_state)
                 gated_output = swiglu_torch_forward(gate_up, self.alpha, self.limit)
-                # gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-                # gate = gate.clamp(min=None, max=self.limit)
-                # up = up.clamp(min=-self.limit, max=self.limit)
-                # glu = gate * torch.sigmoid(gate * self.alpha)
-                # gated_output = (up + 1) * glu
                 out = self.down_projs[expert_idx](gated_output)
                 
                 weighted_output = out * routing_weights[token_idx, expert_idx, None].to(torch.float32)
@@ -1574,12 +1746,6 @@ class GptOssExpertsBnb4bit(nn.Module):
             gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
             gate_up = torch.stack(gate_up_list, dim=0)
             fused = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = X_rep.dtype)
-            # gate = gate_up[..., ::2]
-            # up_h = gate_up[..., 1::2]
-            # gate = gate.clamp(max=self.limit)
-            # up_h = up_h.clamp(min=-self.limit, max=self.limit)
-            # glu = gate * torch.sigmoid(gate * self.alpha)
-            # fused = (up_h + 1) * glu
             out_list = [down_l(fused[e]) for e, down_l in enumerate(self.down_projs)]
             outs = torch.stack(out_list, dim=0)
             rw = routing_weights.transpose(0, 1).unsqueeze(-1)
@@ -1590,15 +1756,7 @@ pass
 
 
 def patch_gpt_oss_bnb4bit():
-    """
-    Patch transformers to use BnB 4bit compatible classes for pre-quantized models.
-    Call before loading models saved with BitsAndBytes (linear-based expert structure).
-
-    Usage:
-        from unsloth_zoo.temporary_patches.gpt_oss import patch_gpt_oss_bnb4bit
-        patch_gpt_oss_bnb4bit()  # Call before loading the model
-        model = FastLanguageModel.from_pretrained(...)
-    """
+    """Patch transformers to use BnB 4bit compatible expert classes; call before loading BitsAndBytes-saved models (linear-based expert structure)."""
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
     except Exception as e:
@@ -1633,6 +1791,7 @@ def patch_gpt_oss_bnb4bit():
     m.dtype_from_config    = dtype_from_config
     m.transformers_version = transformers_version
     m.Version              = Version
+    m._IS_TRANSFORMERS_V5  = _IS_TRANSFORMERS_V5
 
     _rebind_gpt_oss_compiled_classes()
     return True
@@ -1648,8 +1807,8 @@ class _AnyRouterClass(type):
 
 
 def _record_gpt_oss_router_logits(router_cls):
-    # The stock forward (UNSLOTH_COMPILE_DISABLE) records by isinstance on the router class the BnB swap
-    # replaced. Widened in place for registries holding the spec; a path match double-captures PEFT routers.
+    # The stock forward (UNSLOTH_COMPILE_DISABLE) records by isinstance on the router class the BnB swap replaced; the
+    # spec is widened in place only for registries holding it (a path match double-captures PEFT routers).
     import transformers.models.gpt_oss.modeling_gpt_oss as modeling
     recorders = getattr(modeling.GptOssPreTrainedModel, "_can_record_outputs", None)
     spec = recorders.get("router_logits") if isinstance(recorders, dict) else None
@@ -1718,10 +1877,7 @@ def _normalized_unsloth_model_name() -> str:
 
 
 def _should_use_gpt_oss_bnb4bit() -> bool:
-    """
-    Use BnB-compatible 4-bit experts (default when load_in_4bit active).
-    UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 forces the BF16 path.
-    """
+    """Use BnB-compatible 4-bit experts by default when load_in_4bit is active; UNSLOTH_GPT_OSS_BNB4BIT_DISABLE=1 forces the BF16 path."""
     if "gpt_oss" not in _normalized_unsloth_model_name():
         return False
     if "_load_in_4bit_" not in _normalized_unsloth_model_name():
@@ -1742,9 +1898,8 @@ _GPT_OSS_FLAVOR_MARKER    = ".unsloth_gpt_oss_compiled_flavor"
 
 
 def _gpt_oss_cache_locations():
-    """Dirs that may hold the compiled gpt_oss module: the configured location and the
-    temp-fallback used when it is not writable. Resolved without the compiler so it never
-    triggers distributed coordination at patch time."""
+    """Dirs that may hold the compiled gpt_oss module: the configured location and the temp fallback used when it is not
+    writable; resolved without the compiler so it never triggers distributed coordination at patch time."""
     locs = []
     loc = os.environ.get("UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache")
     if loc:
@@ -1763,16 +1918,9 @@ def _gpt_oss_cache_locations():
 
 
 def _gpt_oss_cache_location_is_trusted(loc):
-    """Whether this process may write the flavor marker into `loc`.
-
-    Deliberately weaker than `compile_cache._is_trusted_directory`, which gates
-    LOADING executable artifacts and so walks every ancestor and refuses any group
-    write: this only writes a flavor string through an O_NOFOLLOW descriptor, beside
-    a compiled module the library itself writes 0644 into the same directory.
-    Ownership alone is the wrong question, since a shared cache belongs to whoever
-    built it first. The real one is whether everyone who can create an entry here is
-    already trusted by the sharing group: ours, or group-write to a group we are in.
-    """
+    """Whether this process may write the flavor marker into loc; weaker than compile_cache._is_trusted_directory, since
+    it only writes a flavor string via O_NOFOLLOW beside a compiled module written 0644; trusted means everyone who
+    can create entries here is us or a group we are in with group write."""
     try:
         directory_stat = os.lstat(loc)
     except FileNotFoundError:
@@ -1802,13 +1950,8 @@ pass
 
 
 def _gpt_oss_marker_mode(loc):
-    """0664 in a cache shared with our group, 0600 in one only we can reach.
-
-    The marker records a flavor, not a secret, and in a shared cache every member has
-    to be able to read AND rewrite it. Owner-only there means the member who switched
-    flavor deletes the stale module but cannot record the new one, leaving the two
-    disagreeing.
-    """
+    """Mode is 0664 in a group-shared cache where every member must rewrite the marker (its flavor is not a secret),
+    else 0600; owner-only there leaves the two flavors disagreeing."""
     try:
         if os.name != "posix":
             return 0o600
@@ -1819,12 +1962,8 @@ pass
 
 
 def _gpt_oss_replace_marker(marker_path, desired_flavor, mode = 0o600):
-    """Land the marker by replacing the name: mkstemp then os.replace.
-
-    Two things at once. A link sitting at `marker_path` is replaced rather than
-    written through, and the update needs only directory write, so a group member can
-    record a flavor into a marker file owned by whoever built the cache first.
-    """
+    """Lands the marker by replacing the name (mkstemp then os.replace): a link at marker_path is replaced rather than
+    written through, and only directory write is needed, so a group member can update a marker it does not own."""
     import tempfile
     directory = os.path.dirname(marker_path) or "."
     descriptor, temporary_path = tempfile.mkstemp(
@@ -1847,19 +1986,15 @@ pass
 
 
 def _gpt_oss_write_marker(loc, desired_flavor):
-    """Write the flavor marker without following a link out of `loc`.
-
-    Same flags as `compiler._write_bytes_durably`: O_NONBLOCK because a planted FIFO
-    would otherwise block the load forever, S_ISREG because one with a reader
-    attached opens fine and would swallow the marker instead.
-    """
+    """Writes the flavor marker without following links out of loc; same flags as compiler._write_bytes_durably:
+    O_NONBLOCK stops a planted FIFO blocking the load, S_ISREG rejects a FIFO with a reader that would swallow the
+    marker."""
     marker_path = os.path.join(loc, _GPT_OSS_FLAVOR_MARKER)
     mode = _gpt_oss_marker_mode(loc)
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     if not no_follow or mode != 0o600:
-        # Shared: the existing marker belongs to whoever built the cache, so only a
-        # replacement can update it. Also the no-atomic-no-follow-open case, where an
-        # lstat first would be a time of check.
+        # Shared cache: the marker belongs to whoever built it, so only a replacement can update it; also covers the
+        # no-atomic-no-follow-open case, where an lstat first would be a time-of-check gap.
         return _gpt_oss_replace_marker(marker_path, desired_flavor, mode)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     flags |= no_follow
@@ -1878,12 +2013,9 @@ pass
 
 
 def _invalidate_gpt_oss_compiled_module(locations = None):
-    """Drop the cached compiled gpt_oss module (sys.modules + on-disk .py/.pyc) so it is
-    rebuilt against the CURRENT router/experts classes. The single per-model-type file
-    hardcodes the BnB or stock layout, so a stale one survives a 4bit<->16bit switch with the
-    wrong classes. Cleans every candidate location, or only `locations` when given: a
-    location that is stale says nothing about the others, and sweeping them all let one
-    planted candidate delete a perfectly good cache on every load."""
+    """Drops the compiled gpt_oss module (sys.modules, .py, .pyc) so it is rebuilt for current classes; sweeps all
+    locations unless `locations` is given, since a stale location says nothing about the others and a planted
+    candidate must not delete a good cache."""
     try:
         import sys as _sys
         import importlib, importlib.util
@@ -1912,24 +2044,20 @@ def _invalidate_gpt_oss_compiled_module(locations = None):
 
 
 def _sync_gpt_oss_compiled_flavor(desired_flavor):
-    """Invalidate the on-disk compiled gpt_oss module when it was built for a DIFFERENT flavor
-    ("bnb4bit" vs "stock") than this load needs, independently of the in-process flag (unset in
-    a fresh process, so a fresh 16bit load after a 4bit one would import the stale BnB classes
-    and hit "weights not initialized"). A marker file records the built flavor; on a mismatch or
-    missing marker the stale module is dropped for the compiler to regenerate."""
+    """Invalidates the on-disk gpt_oss module built for another flavor (bnb4bit vs stock): the in-process flag is unset
+    in a fresh process, so a 16bit load after 4bit would import stale BnB classes; a marker records the flavor, and a
+    mismatch or missing marker drops the module."""
     try:
         locations = _gpt_oss_cache_locations()
-        # Per location, never global: marking all of them stale because one is lets
-        # anyone who can create the predictable temp candidate delete a valid primary
-        # cache on every load.
+        # Stale is decided per location, never globally: marking all stale because one is lets anyone who can create the
+        # predictable temp candidate delete a valid primary cache on every load.
         stale = []
         for loc in locations:
             module_path = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
             if not os.path.isfile(module_path):
                 continue
             if not _gpt_oss_cache_location_is_trusted(loc):
-                # Any marker here is not ours, and the compiler imports the module
-                # beside it with no such gate, so do not trust what it claims.
+                # A marker here is not ours and the compiler imports the module beside it with no such gate, so do not trust the marker's claim.
                 stale.append(loc)
                 continue
             on_disk = None
@@ -1999,28 +2127,22 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_bnb4bit_auto)
 # Combo kernels uses too much VRAM for low memory GPUs
 from unsloth_zoo.device_type import DEVICE_TYPE
 
-# UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE="cuda" on GPU-less hosts, so guard
-# with is_available() like device_synchronize() does.
+# UNSLOTH_ALLOW_CPU=1 keeps DEVICE_TYPE="cuda" on GPU-less hosts, so guard with is_available() like device_synchronize() does.
 if DEVICE_TYPE == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
-    # Only total capacity is needed. mem_get_info() can create a device context at
-    # import time, leaving otherwise idle processes with persistent device memory.
+    # Only total capacity is needed; mem_get_info() can create a device context at import time, leaving otherwise idle processes with persistent device memory.
     device_memory = torch.xpu.get_device_properties(0).total_memory
 elif DEVICE_TYPE in ("cuda", "hip") and torch.cuda.is_available():
-    # Integrated NVIDIA parts may report only the carve-out, so cuda_total_memory raises it to
-    # the driver total when that is larger. Discrete cards and HIP are unchanged.
+    # Integrated NVIDIA parts may report only the carve-out, so cuda_total_memory raises it to the driver total when
+    # larger; discrete cards and HIP are unchanged.
     from unsloth_zoo.integrated_device import cuda_total_memory
     device_memory = cuda_total_memory(0)
 else:
     device_memory = 0
 use_combo_kernels = False if device_memory/1024/1024/1024 <= 40 else True
 
-# coordinate_descent_tuning used to be driven by use_combo_kernels too, so asking for combo
-# kernels also bought the tuning. Measured apart on T4/L4/A100/B200: combo kernels are free
-# (decode compile 7.36s vs 7.48s off), the tuning costs +28% on A100 and +32% on L4 decode
-# compile for no measurable gain anywhere. Default it off, opt in to re-measure.
-#
-# The 40GB test above is in GiB, so an A100-SXM4-40GB reports 39.49 and falls BELOW it.
-# Left as-is: combo kernels measured as no-effect on both sides of the boundary.
+# Coordinate descent tuning is opt-in via UNSLOTH_COORDINATE_DESCENT_TUNING=1 since it costs decode compile time on
+# A100/L4 with no gain; the 40 threshold is in GiB, so A100-SXM4-40GB (39.49) falls below it and the boundary is kept
+# since combo kernels show no effect on either side.
 use_coordinate_descent = os.environ.get("UNSLOTH_COORDINATE_DESCENT_TUNING", "0") == "1"
 
 fused_torch_compile_options = get_torch_compile_options(
@@ -2326,8 +2448,8 @@ def mxfp4_ogs_moe(
     intermediate = dn_blocks.shape[2] * 32
     w_gu, p_gu = _ogs_weight(gu_blocks, gu_scales, hidden)
     w_dn, p_dn = _ogs_weight(dn_blocks, dn_scales, intermediate)
-    # Top-k + softmax over the top-k, as the router does; only an exact bf16 tie at k can pick another expert.
-    # expt_indx (the router's own indices) is not used: it mis-builds the expert histogram in vLLM 0.30's copy.
+    # Top-k + softmax over the top-k as the router does; only an exact bf16 tie at k can pick another expert; expt_indx
+    # (the router's own indices) is not used: it mis-builds the expert histogram in vLLM 0.30's copy.
     routing_data, gather, scatter = backend.routing(router_logits, top_k)
     act = backend.swiglu_activation(alpha, limit)
     inter = backend.gate_up(x, w_gu, gu_bias, routing_data, gather, p_gu, fused_activation = act)
@@ -2422,14 +2544,12 @@ def moe_forward_inference_bf16(self, hidden_states):
     if out is not None:
         return out
     if _has_active_expert_lora(self.experts):
-        # The fused kernel below reads the unwrapped base expert weights, so it would
-        # silently drop expert LoRA; the module forward applies it.
+        # The fused kernel reads the unwrapped base expert weights and would silently drop expert LoRA; the module forward applies it.
         out = self(hidden_states)
         return out[0] if isinstance(out, tuple) else out
     moe = _unwrap_peft_experts(self.experts)
     if _has_packed_bnb4bit_experts(moe):
-        # Fused experts quantized to bnb 4-bit hold packed 2D storage, which the bmm kernel
-        # below cannot read; the module forward dequantizes them.
+        # Fused experts quantized to bnb 4-bit hold packed 2D storage that the bmm kernel cannot read; the module forward dequantizes them.
         out = self(hidden_states)
         return out[0] if isinstance(out, tuple) else out
     router_scores, router_indices = moe_router_forward(self.router, hidden_states)
@@ -2540,7 +2660,6 @@ from .moe_utils import (
     patch_param_wrapper_for_moe,
     forward_native_grouped_mm,
     forward_native_moe_loop,
-    # torch_native_forward,
 )
 
 
@@ -3072,9 +3191,8 @@ TEMPORARY_PATCHES.append(patch_mxfp4_gpt_oss_for_lora)
 @torch.compiler.disable
 def _try_grouped_bnb4bit(self, hidden_states, router_indices, routing_weights,
                          batch_size, num_tokens, num_experts, top_k):
-    """The grouped bnb-4bit training forward, or None for the per-expert loop. One opaque
-    call, so a compiled decoder layer (and its gradient-checkpoint replay) takes a single
-    graph break here instead of tracing the readiness checks."""
+    """Grouped bnb-4bit training forward, or None for the per-expert loop; one opaque call so a compiled decoder layer
+    takes a single graph break instead of tracing readiness checks."""
     if not self._grouped_bnb4bit_ready():
         return None
     try:
@@ -3109,9 +3227,8 @@ def torch_native_forward(
     num_experts = routing_weights.shape[1]
     top_k = router_indices.shape[1]
 
-    # Grouped bnb-4bit fast path. The class dispatches this module-level
-    # function (forward is rebound below), so the gate must live here too.
-    # fp16 experts keep the loop's fp32 swiglu and fp32 down output there.
+    # Grouped bnb-4bit fast path; the class dispatches this module-level function (forward is rebound below), so the
+    # gate must live here too; fp16 experts keep fp32 swiglu and fp32 down output.
     if (
         self.training
         and hasattr(self, "_grouped_bnb4bit_ready")
@@ -3123,8 +3240,7 @@ def torch_native_forward(
         if grouped is not None:
             return grouped
 
-    # Dense eval is experts x tokens (unsloth#3411). Keep in step with the class-body forward,
-    # which the compiled cache emits standalone.
+    # Dense eval is experts x tokens (unsloth issue 3411); keep in step with the class-body forward, which the compiled cache emits standalone.
     eval_routed = (
         not self.training
         and num_tokens * num_experts > getattr(self, "_dense_eval_max_rows", GptOssExpertsBnb4bit._dense_eval_max_rows)
@@ -3209,17 +3325,9 @@ def torch_native_forward(
         gate_up = torch.stack(gate_up_list, dim=0)
         dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
         fused = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
-        # gate = gate_up[..., ::2]
-        # up_h = gate_up[..., 1::2]
-        # gate = gate.clamp(max=self.limit)
-        # up_h = up_h.clamp(min=-self.limit, max=self.limit)
-        # glu = gate * torch.sigmoid(gate * self.alpha)
-        # fused = (up_h + 1) * glu
 
-        # Autocast off for the down projection only. As above, it is the unquantized
-        # fallback that needs this; on the forced-float32 path a quantized layer gets
-        # float32 from _pre_set_compute_dtype instead. This branch also runs in bfloat16,
-        # where no float32 rule is registered and the layer stays in bfloat16.
+        # Autocast off for the down projection only: the unquantized fallback needs it; forced-float32 quantized layers
+        # get fp32 from _pre_set_compute_dtype, while bfloat16 registers no such rule and the layer stays bfloat16.
         device_type = fused.device.type if isinstance(fused.device.type, str) and fused.device.type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
             out_list = [
@@ -3230,14 +3338,11 @@ def torch_native_forward(
         rw = routing_weights.transpose(0, 1).unsqueeze(-1)
         mixed = (outs.to(dtype) * rw.to(dtype)).sum(dim=0)
         return mixed.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
-    pass
 pass
 
-# torch_native_forward protects the down projection three ways in float16 training: swiglu and
-# gated_output in float32, which is also the dtype Linear4bit restores its output to;
-# _pre_set_compute_dtype (registered by unsloth's loader on the forced-float32 path only) for
-# the quantized compute; and autocast disabled for the unquantized fallback, which ignores
-# compute_dtype. A bfloat16 run registers no float32 rule and keeps the layer in bfloat16.
+# torch_native_forward protects the down projection three ways in float16: fp32 swiglu and gated_output (the dtype
+# Linear4bit restores its output to), _pre_set_compute_dtype (loader rule, forced-float32 path only), and autocast off
+# for the unquantized fallback; bfloat16 registers no float32 rule.
 GptOssExpertsBnb4bit.forward = torch_native_forward
 
 def patch_gpt_oss_linearized():
@@ -3467,6 +3572,34 @@ def patch_GptOssAttention():
 
     pass
 
+    def autograd_eager_attention_forward(
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        scaling: float,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        # Out-of-place twin of the in-place path, used when an eval forward carries a graph.
+        key_states = repeat_kv(key, module.num_key_value_groups)
+        value_states = repeat_kv(value, module.num_key_value_groups)
+        key_states, value_states, attention_mask = _align_kv_to_mask(
+            key_states, value_states, attention_mask
+        )
+        attn_weights = matmul(query, key_states.transpose(2, 3)) * scaling
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask[:, :, :, : key_states.shape[-2]]
+        sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+        combined_logits = torch.cat([attn_weights, sinks.to(attn_weights.dtype)], dim=-1)
+        probs = F_softmax(combined_logits, dim=-1, dtype=torch.float32)
+        attn_weights = F_dropout(probs[..., :-1], p=dropout, training=module.training)
+        attn_output = matmul(attn_weights.to(value_states.dtype), value_states)
+        return attn_output.transpose(1, 2).contiguous(), None
+
+    pass
+
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
     if False:  # Version(torch.__version__) >= Version("2.10.0"):
         eager_attention_forward = torch_compile(eager_attention_forward, dynamic=None, fullgraph=True)
@@ -3534,9 +3667,23 @@ def patch_GptOssAttention():
                 attention_mask,
             )
             attn_weights = None
+        elif (
+            query_states.shape[-2] == 1
+            and _gpt_oss_dense_decode_mask_ok(attention_mask, query_states.shape[1])
+            and _gpt_oss_graph_dense_attention(hidden_states)
+        ):
+            # One-token step of a CUDA-graph decode: the dense mask is a graph input, no BlockMask closure.
+            attn_output, attn_weights = _gpt_oss_decode_attention(
+                self, query_states, key_states, value_states, attention_mask, self.scaling,
+            )
         else:
             # Dense mask: UNSLOTH_GPT_OSS_EAGER_INFERENCE=1, CPU, or a caller-built 4D mask.
-            attn_output, attn_weights = eager_attention_forward(
+            _needs_grad = torch.is_grad_enabled() and (
+                query_states.requires_grad or key_states.requires_grad
+                or value_states.requires_grad or self.sinks.requires_grad
+            )
+            attention = autograd_eager_attention_forward if _needs_grad else eager_attention_forward
+            attn_output, attn_weights = attention(
                 self,
                 query_states,
                 key_states,
@@ -3716,10 +3863,11 @@ def patch_GptOssModel():
                 if (
                     getattr(_config, "model_type", None) == "gpt_oss"
                     and input_embeds is not None
-                    and _gpt_oss_flex_inference(input_embeds.device)
+                    and _gpt_oss_flex_inference(_gpt_oss_mask_device(input_embeds, args, kwargs))
                     and _register_gpt_oss_flex_mask()
                 ):
-                    target = _GPT_OSS_FLEX_MASK
+                    # CUDA-graph decode steps take dense masks (_gpt_oss_dense_graph_decode).
+                    target = "eager" if _gpt_oss_dense_graph_decode(input_embeds) else _GPT_OSS_FLEX_MASK
                 elif _is_flex:
                     target = "eager"
                 if target is not None and target != _config._attn_implementation:
@@ -3730,7 +3878,6 @@ def patch_GptOssModel():
                     finally:
                         _config._attn_implementation = original_impl
                 return f(*args, **kwargs)
-            pass
         return return_attention_mask
     pass
     create_causal_mask = getattr(
@@ -3748,8 +3895,8 @@ def patch_GptOssModel():
     if create_sliding_window_causal_mask is None:
         return raise_error("transformers.masking_utils.create_sliding_window_causal_mask")
     if not hasattr(transformers.masking_utils, "__patched_causal_mask__"):
-        transformers.masking_utils._old_create_causal_mask = _torch_compile(transformers.masking_utils.create_causal_mask, fullgraph = False, dynamic = True)
-        transformers.masking_utils._old_create_sliding_window_causal_mask = _torch_compile(transformers.masking_utils.create_sliding_window_causal_mask, fullgraph = False, dynamic = True)
+        transformers.masking_utils._old_create_causal_mask = compile_mask_builder(transformers.masking_utils.create_causal_mask)
+        transformers.masking_utils._old_create_sliding_window_causal_mask = compile_mask_builder(transformers.masking_utils.create_sliding_window_causal_mask)
         transformers.masking_utils.create_causal_mask = wrap(create_causal_mask)
         transformers.masking_utils.create_sliding_window_causal_mask = wrap(create_sliding_window_causal_mask)
         transformers.models.gpt_oss.modeling_gpt_oss.create_causal_mask = transformers.masking_utils.create_causal_mask
@@ -3929,9 +4076,13 @@ def patch_GptOssModel():
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
+        # Match stock: an omitted use_cache follows the config, else a manual prefill loses its cache.
+        if use_cache is None and not self.training:
+            use_cache = getattr(self.config, "use_cache", False)
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
+        embeds_from_ids = inputs_embeds is None
         if inputs_embeds is None:
             # Account for CPU offloaded embed_tokens
             embed_device = self.embed_tokens.weight.device
@@ -3951,7 +4102,7 @@ def patch_GptOssModel():
                 inputs_embeds = self.embed_tokens(
                     input_ids.to(embed_device, non_blocking = embed_device.type != "cpu")
                 ).to(input_ids.device)
-        if not self.training and inputs_embeds.requires_grad:
+        if not self.training and embeds_from_ids and inputs_embeds.requires_grad:
             # detach, not requires_grad_(False): the embeddings are a non-leaf when an input
             # requires-grad hook or an offloaded copy produced them, and that raises.
             inputs_embeds = inputs_embeds.detach()
@@ -3983,7 +4134,7 @@ def patch_GptOssModel():
             _swap_target = None
             if not self.training:
                 if _gpt_oss_flex_inference(inputs_embeds.device) and _register_gpt_oss_flex_mask():
-                    _swap_target = _GPT_OSS_FLEX_MASK
+                    _swap_target = "eager" if _gpt_oss_dense_graph_decode(inputs_embeds) else _GPT_OSS_FLEX_MASK
                 elif _orig_attn_impl == "flex_attention":
                     _swap_target = "eager"
             _swap_attn_impl = _swap_target is not None and _swap_target != _orig_attn_impl
@@ -4017,7 +4168,12 @@ def patch_GptOssModel():
         _cross_card = getattr(block_swap, "spans_devices", False) or (
             _swap_device is not None and hidden_states.device != _swap_device
         ) or _gpt_oss_layers_span_devices(self.layers, hidden_states.device)
-        if not self.training and qlen == 1 and isinstance(attention_mask, dict) and not _cross_card:
+        # The in-place decode fast path has no backward, so grad-bearing embeddings skip it.
+        _needs_grad = torch.is_grad_enabled() and hidden_states.requires_grad
+        if (
+            not self.training and qlen == 1 and isinstance(attention_mask, dict)
+            and not _cross_card and not _needs_grad
+        ):
             # Add hack since residuals need to clone outside of the torch.compile region??
             # This forces it to free past residuals
             if not torch.compiler.is_compiling():
@@ -4186,9 +4342,7 @@ _HARMONY_SYMBOLS = (
     "ReasoningEffort",
 )
 
-# Best-effort eager import; when openai_harmony is installed after this module was
-# imported, _ensure_harmony rebinds the symbols lazily at call time.
-# See https://github.com/unslothai/unsloth/issues/3361
+# Best-effort eager import; if openai_harmony is installed after this module was imported, _ensure_harmony rebinds the symbols lazily (unsloth issue 3361).
 try:
     from openai_harmony import (
         Author,
@@ -4337,9 +4491,7 @@ def encode_conversations_with_harmony(
 pass
 
 
-# Fix https://github.com/huggingface/transformers/pull/40474
-# RuntimeError: Unsloth: Failed to load model. Both AutoConfig and PeftConfig loading failed.
-# AutoConfig error: 'GptOssConfig' object has no attribute 'max_position_embeddings'
+# Fix for transformers PR 40474: AutoConfig error 'GptOssConfig' object has no attribute 'max_position_embeddings' made model loading fail.
 try:
     from transformers.configuration_utils import layer_type_validation
 
@@ -4430,8 +4582,7 @@ try:
                 self.layer_types = ["sliding_attention" if bool((i + 1) % 2) else "full_attention" for i in range(self.num_hidden_layers)]
             layer_type_validation(self.layer_types)
 
-            # Validate the correctness of rotary position embeddings parameters
-            # BC: if there is a 'type' field, copy it it to 'rope_type'.
+            # Validates rotary position embedding parameters; for BC, copies a 'type' field in rope_scaling to 'rope_type'.
             if self.rope_scaling is not None and "type" in self.rope_scaling:
                 self.rope_scaling["rope_type"] = self.rope_scaling["type"]
             rope_config_validation(self)
@@ -4531,8 +4682,7 @@ try:
             self.output_router_logits = output_router_logits
             self.use_cache = use_cache
 
-            # Validate the correctness of rotary position embeddings parameters
-            # BC: if there is a 'type' field, copy it it to 'rope_type'.
+            # Validates rotary position embedding parameters; for BC, copies a 'type' field in rope_scaling to 'rope_type'.
             if self.rope_scaling is not None and "type" in self.rope_scaling:
                 self.rope_scaling["rope_type"] = self.rope_scaling["type"]
             rope_config_validation(self)
@@ -4556,8 +4706,8 @@ try:
             return raise_error("transformers.models.gpt_oss.configuration_gpt_oss", e)
 
         try:
-            current_class = dedent(inspect.getsource(transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig))
-            new_class = dedent(inspect.getsource(Old_GptOssConfig))
+            current_class = dedent(_class_source(transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig))
+            new_class = dedent(_class_source(Old_GptOssConfig))
             new_class = new_class.replace("Old_GptOssConfig", "GptOssConfig")
             if new_class == current_class:
                 logger.info("Unsloth: Updating GPT OSS Config to fix missing `max_position_embeddings`")

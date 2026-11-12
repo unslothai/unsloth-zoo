@@ -126,8 +126,7 @@ def test_float32_and_half_heads_promote_to_float32():
 
 
 def test_out_of_memory_does_not_disable_float32_gemm(monkeypatch):
-    # A transient OOM in the float32-output GEMM must surface, not silently switch every later
-    # call in the process to half-precision logits.
+    # A transient OOM in the float32-output GEMM must surface, not silently switch every later call in the process to half-precision logits.
     import unsloth_zoo.fused_losses.preference_loss as module
 
     monkeypatch.setattr(module, "_MM_OUT_DTYPE_OK", {})
@@ -174,8 +173,8 @@ def _head_grad_error(dtype, n_rows, chunk_size, vocab = 512, hidden = 64, bias =
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_trainable_head_grad_does_not_degrade_with_many_chunks(dtype):
-    # 512 one row chunks must not round the head gradient 512 times: the error stays within 25% of a
-    # single chunk's (a head dtype accumulator measured 7.5x worse for bf16, 7.8x for fp16).
+    # 512 one-row chunks must not round the head gradient 512 times: error stays within 25% of a single chunk's (a
+    # head-dtype accumulator measured 7.5x worse for bf16, 7.8x for fp16).
     one = _head_grad_error(dtype, 512, 512)
     many = _head_grad_error(dtype, 512, 1)
     assert many["weight"] <= 1.25 * one["weight"]
@@ -197,9 +196,8 @@ def test_trainable_head_grad_over_vocab_slices(monkeypatch, dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_trainable_head_grad_has_no_head_sized_float32_temporaries(monkeypatch, dtype):
-    # A trainable half precision head runs vocab sliced backward: its float32 accumulators are one
-    # slice, so backward creates no head sized tensor in another dtype (a float32 accumulator plus
-    # per chunk head sized GEMM / cast copies used to add GiBs of peak memory).
+    # A trainable half-precision head runs vocab sliced backward: float32 accumulators are one slice, so no head-sized
+    # tensor in another dtype; per chunk head-sized GEMM / cast copies would add GiBs of peak memory.
     from torch.utils._python_dispatch import TorchDispatchMode
     import unsloth_zoo.fused_losses.preference_loss as module
 

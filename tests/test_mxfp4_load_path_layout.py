@@ -14,24 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The mxfp4 LOAD path must hand the model the same layout stock transformers would.
-
-Zoo's `convert_moe_packed_tensors` replacement returns the UN-transposed
-[E, D, G*B*2] layout on purpose, so the live loader hook has to restore GPT-OSS's
-[E, G*B*2, D]:
-
-  * 4.x             -> module level `mxfp4.dequantize`, called by quantizer_mxfp4
-  * 5.0.0 and newer -> `Mxfp4Dequantize` (a ConversionOps) -> `dequantize_convertops`
-
-Zoo only ever patched `dequantize`, so from 5.0.0 the transpose was dropped and
-GPT-OSS loaded with dims 1 and 2 swapped; 5.16.0 deleting the function is what
-finally turned the drift detector red. The existing mxfp4 tests missed it because
-they only exercise the SAVE path, which stayed self-consistent. So assert the
-LOADED layout: patch, then compare against pristine transformers on the same input.
-
-Subprocess because patching mutates `transformers.integrations.mxfp4` process-wide;
-CPU-only because the comparison is pure layout arithmetic.
-"""
+"""Loader hook must restore GPT-OSS [E, G*B*2, D] after zoo's un-transposed convert: it patches dequantize (4.x) and
+dequantize_convertops (5.0+), since patching only dequantize had left 5.0+ with dims 1 and 2 swapped; subprocess as
+patching is process-wide."""
 
 import os
 import subprocess
@@ -41,8 +26,7 @@ import textwrap
 import pytest
 
 
-# Golden is captured BEFORE the patch, same process and input, so this compares zoo
-# against the installed transformers rather than a hardcoded, version-gated shape.
+# Golden is captured before the patch in the same process and input, so it compares zoo to the installed transformers, not a hardcoded version-gated shape.
 _PROBE = textwrap.dedent(
     """
     import inspect
@@ -106,18 +90,11 @@ _PROBE = textwrap.dedent(
 def test_mxfp4_load_path_layout_matches_stock_transformers():
     pytest.importorskip("transformers.integrations.mxfp4")
     env = dict(os.environ)
-    # conftest's GPU-free harness does not reach a subprocess, and importing
-    # unsloth_zoo calls get_device_type() at import time.
+    # The subprocess misses conftest's GPU-free harness, and importing unsloth_zoo calls get_device_type() at import time.
     env["UNSLOTH_ALLOW_CPU"] = "1"
-    # The core-upstream lane installs unsloth with `|| true`, so the checkout is
-    # allowed to fail, and unsloth_zoo/__init__.py raises
-    # ImportError("Please install Unsloth") when find_spec("unsloth") is None.
-    # UNSLOTH_IS_PRESENT does NOT cover that: it guards a separate, later check
-    # that this import never reaches. Without the line below, one transient git
-    # failure turns every 5.x lane red and blames unsloth rather than the layout
-    # this test exists to police. Both variables are needed and neither implies
-    # the other: this one skips the unsloth requirement, UNSLOTH_ALLOW_CPU keeps
-    # get_device_type() from raising on a driverless runner.
+    # UNSLOTH_ZOO_DISABLE_GPU_INIT skips the unsloth requirement (a transient git failure in the core-upstream `|| true`
+    # unsloth install would turn 5.x lanes red); UNSLOTH_IS_PRESENT guards a later check and does not cover it;
+    # UNSLOTH_ALLOW_CPU stops get_device_type() raising on driverless runners.
     env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
     r = subprocess.run(
         [sys.executable, "-c", _PROBE], capture_output=True, text=True, env=env,

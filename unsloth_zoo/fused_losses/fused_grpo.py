@@ -258,6 +258,7 @@ if "grpo_impl" not in _OPS:
         ctx.set_materialize_grads(False)
         ctx.need = inputs[25:28]
         ctx.save_for_backward(grad_h, grad_w, grad_b, inputs[11])
+        ctx.owned = fl._owned_ptrs((grad_h, grad_w, grad_b))
 
     def _grpo_backward(ctx, grad_loss, *_):
         if grad_loss is None:
@@ -266,7 +267,7 @@ if "grpo_impl" not in _OPS:
         acc = torch.float64 if grad_loss.device.type in ("cuda", "cpu") else torch.float32
         s = grad_loss.to(acc) / scaling.to(acc)
         need_h, need_w, need_b = ctx.need
-        scale = fl._stored_grad_scaler(s, (grad_h, grad_w, grad_b))
+        scale = fl._stored_grad_scaler(s, (grad_h, grad_w, grad_b), ctx)
         return (scale(grad_h) if need_h else None, scale(grad_w) if need_w else None,
                 scale(grad_b) if need_b else None) + (None,) * 27
 

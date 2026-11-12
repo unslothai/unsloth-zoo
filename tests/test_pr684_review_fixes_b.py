@@ -1,21 +1,4 @@
-"""Regression pins for PR #684 review-bot fixes (cluster B).
-
-Covers five fixes on the MLX VLM utils / loader surfaces:
-
-1. _run_hidden_stack reads gemma sliding-window settings from the stack
-   config when the stack does not copy them onto the module, so windowed
-   layers still get sliding masks instead of global attention.
-2. _resize_vlm_images downscales tall portrait images (scale on the larger
-   side, not width-only) so a 512x2048 image with a 512 cap shrinks.
-3. _apply_vlm_label_masks preserves wide/unsigned invalid ids instead of
-   narrowing to int32 (so they survive to CCE validation, not -100).
-4. make_vlm_baseline_loss_fn strips every _unsloth_* collator marker so a
-   model that rejects unknown kwargs does not see _unsloth_collated_position_ids.
-5. _nf4_dense_dequantize_weight keeps plain (un-nested) absmax scales by
-   default, matching the accepted BitsAndBytesConfig (no double quant).
-
-Runs on the tests/mlx_simulation torch shim like the rest of the MLX suite.
-"""
+"""Regression pins for review-fix cluster B: VLM sliding masks, tall resize, wide labels, NF4 scales."""
 
 from __future__ import annotations
 
@@ -35,9 +18,7 @@ def _install_mlx_torch_shim():
 
 
 def test_run_hidden_stack_reads_sliding_window_from_config():
-    """Stack stores sliding settings only on .config: windowed layers must
-    still get the sliding (window-limited) token-type mask, not the global one.
-    """
+    """Sliding settings live only on .config, so windowed layers still need the sliding token-type mask."""
     import mlx.core as mx
     import unsloth_zoo.mlx.utils as mutils
 
@@ -81,15 +62,13 @@ def test_run_hidden_stack_reads_sliding_window_from_config():
         attention_mask=mx.array([[1, 1, 1, 1]], dtype=mx.int32),
     )
 
-    # Both layers receive a token-type-derived mask (4x4), not a plain causal
-    # 1D create_attention_mask, proving config fallback fired.
+    # Both layers get a 4x4 token-type mask, not a 1D causal mask, which proves the config fallback ran.
     assert layer_sliding.seen_mask is not None
     assert layer_global.seen_mask is not None
     sliding = layer_sliding.seen_mask[0, 0]
     global_mask = layer_global.seen_mask[0, 0]
-    # The sliding mask is strictly tighter than the global mask: with window=1
-    # the final text query (3) cannot attend to the distant token 0, while the
-    # global layer can. This only differs if config fallback supplied the window.
+    # The sliding mask is strictly tighter than the global one: with window=1 query 3 cannot see token 0, but the global
+    # layer can; this differs only if config fallback set the window.
     assert bool(global_mask[3][0].item()) is True
     assert bool(sliding[3][0].item()) is False
     # The image block stays bidirectional in both masks.
@@ -143,8 +122,7 @@ def test_resize_downscales_tall_portrait_images():
 
     from unsloth_zoo.mlx.utils import _resize_vlm_images
 
-    # Portrait 512x2048 with a 512 cap: width alone is within cap, but the
-    # larger side (2048) is not, so the image must shrink.
+    # 512x2048 portrait with a 512 cap: width fits but the longer side (2048) must still shrink.
     image = Image.new("RGB", (512, 2048))
     resized = _resize_vlm_images([image], 512)
 
@@ -161,8 +139,7 @@ def test_apply_vlm_label_masks_preserves_wide_unsigned_ids():
         _apply_vlm_label_masks,
     )
 
-    # uint32 id near the top of the range would wrap to a small/negative value
-    # if narrowed to int32; it must survive as a wide positive sentinel.
+    # A uint32 id near the top wraps negative as int32, so the label must stay wide (positive sentinel).
     wide_id = (2 ** 32) - 100
     raw = mx.array([[5, wide_id, 7]], dtype=mx.uint32)
     batch = {
@@ -266,8 +243,7 @@ def test_nf4_dense_default_keeps_plain_absmax():
     plain = _nf4_dense_dequantize_weight(weight, group_size=64, use_double_quant=False)
     nested = _nf4_dense_dequantize_weight(weight, group_size=64, use_double_quant=True)
 
-    # Default path must equal the plain (un-nested) path, not the double-quant
-    # simulation. The two differ because nested absmax re-quantizes the scales.
+    # Default equals plain un-nested absmax; nested (double-quant) absmax re-quantizes the scales.
     assert torch.allclose(mx.array(default), mx.array(plain))
     assert not torch.allclose(mx.array(default), mx.array(nested))
 

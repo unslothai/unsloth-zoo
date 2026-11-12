@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""_active_merge_device() dispatch matrix.
-
-Spoofs torch.cuda/xpu/mps availability and torch.version.hip to exercise the
-cascade `cuda (covers ROCm) -> xpu -> mps -> cpu` without real hardware.
-Regression net for the LoRA merge fix in PR #620. Add a row to ``PROFILES``
-to extend coverage; tests parametrize over it automatically.
-"""
+"""Dispatch matrix for _active_merge_device(), spoofing cuda/xpu/mps/hip to test the cuda (covers ROCm) -> xpu -> mps ->
+cpu cascade; guards the LoRA merge fix (PR 620); new PROFILES rows are auto-parametrized."""
 
 from __future__ import annotations
 
@@ -88,10 +83,7 @@ PROFILE_IDS = [p.name for p in PROFILES]
 
 @pytest.fixture
 def spoof_accelerator(monkeypatch):
-    """Apply an AcceleratorProfile to torch in-process and clear the
-    lru_cache(maxsize=1) on _active_merge_device before and after each test so
-    no stale "cpu"/"mps" answer leaks across the session.
-    """
+    """Apply an AcceleratorProfile to torch in-process; clear the _active_merge_device lru_cache(maxsize=1) before and after each test so no stale answer leaks."""
     from unsloth_zoo.saving_utils import _active_merge_device
 
     _active_merge_device.cache_clear()
@@ -135,10 +127,7 @@ def test_active_merge_device_cascade(profile, spoof_accelerator):
 
 
 def test_active_merge_device_takes_no_args(spoof_accelerator):
-    """The helper has no required positional args. The pre-fix
-    _active_merge_device(W) silently dropped MPS and propagated the foreign
-    device.index across families.
-    """
+    """_active_merge_device() takes no args: the pre-fix _active_merge_device(W) silently dropped MPS and propagated a foreign device.index across families."""
     from unsloth_zoo.saving_utils import _active_merge_device
     spoof_accelerator(PROFILES[0])
     _active_merge_device()  # must not raise
@@ -171,9 +160,7 @@ def test_xpu_takes_priority_over_mps(spoof_accelerator):
 
 
 def test_lru_cache_freezes_first_result(spoof_accelerator):
-    """_active_merge_device() is lru_cache(maxsize=1): subsequent calls under
-    different spoofs return the cached value until cache_clear() is invoked.
-    """
+    """_active_merge_device() is lru_cache(maxsize=1), so later calls under different spoofs return the cached value until cache_clear() is called."""
     from unsloth_zoo.saving_utils import _active_merge_device
 
     spoof_accelerator(PROFILES[0])  # nvidia_cuda

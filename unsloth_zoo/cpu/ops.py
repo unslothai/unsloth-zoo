@@ -22,6 +22,7 @@ __all__ = [
 ]
 
 import functools
+import inspect
 import math
 import os
 import types
@@ -38,9 +39,16 @@ def _cpu_fp16_autocast():
         return torch.is_autocast_cpu_enabled() and torch.get_autocast_cpu_dtype() == torch.float16
 
 
+def _cpu_autocast_state():
+    try:
+        return torch.is_autocast_enabled("cpu"), torch.get_autocast_dtype("cpu")
+    except TypeError:
+        return torch.is_autocast_cpu_enabled(), torch.get_autocast_cpu_dtype()
+
+
 def _softmax_without_collapse(z, y, keep_logits = False):
-    """(softmax(z) with the target column zeroed, log p_t, shifted z_t); shifts z in place.
-    Sums the other classes apart from exp(0) = 1, else p_t rounds to 1 past a ~16.6 lead (softmax collapse, arXiv 2610.31642)."""
+    """Returns softmax(z) with target column zeroed, log p_t and shifted z_t, shifting z in place; sums other classes
+    apart from exp(0)=1, else p_t rounds to 1 past a ~16.6 lead (softmax collapse, arXiv 2610.31642)."""
     z.sub_(z.amax(-1, keepdim = True))
     target = z.gather(-1, y)
     p = torch.exp(z) if keep_logits else z.exp_()
@@ -50,51 +58,84 @@ def _softmax_without_collapse(z, y, keep_logits = False):
     return p, log_p_target, target
 
 
-class _ChunkedLinearCrossEntropy(torch.autograd.Function):
-    """sum CE(hidden @ weight.T, labels) / divisor without materialising the (rows, vocab) logits.
+def _chunked_ce_forward_impl(hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor,
+                        chunk_rows: int, ignore_index: int, need_hidden_grad: bool,
+                        need_weight_grad: bool, exact: bool, amp: bool,
+                        amp_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Opaque to Dynamo/AOT: the runtime loop keeps logits bounded without specialising symbolic rows.
+    # Compiled graphs run with autocast off, so the caller's CPU autocast is passed in and restored here.
+    with torch.autocast("cpu", dtype = amp_dtype, enabled = amp):
+        return _chunked_ce_forward_loop(
+            hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad, need_weight_grad, exact,
+        )
 
-    Gradients are formed chunk by chunk inside forward (the loss is a scalar, so backward only
-    rescales them): peak extra memory is one (chunk, vocab) fp32 block instead of the full logits
-    plus their gradient, which for a 150k vocab is the largest tensor of a CPU training step.
-    """
+
+def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad,
+                             need_weight_grad, exact):
+    rows = hidden.shape[0]
+    grad_dtype = torch.float32 if exact else hidden.dtype
+    grad_hidden = torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else torch.empty(0)
+    grad_weight = torch.zeros(weight.shape, dtype = torch.float32) if need_weight_grad else torch.empty(0)
+    total = torch.zeros((), dtype = torch.float32)
+    for start in range(0, rows, chunk_rows):
+        end = min(start + chunk_rows, rows)
+        y = labels[start:end]
+        valid = y != ignore_index
+        # Zero ignored rows first: fp16 can overflow to inf in the projection, and NaN * 0 stays NaN.
+        h = torch.where(valid.unsqueeze(-1), hidden[start:end], hidden.new_zeros(()))
+        logits = (h @ weight.t()).float()
+        safe_y = torch.where(valid, y, torch.zeros_like(y)).unsqueeze(-1)
+        logits, log_p_target, _ = _softmax_without_collapse(logits, safe_y)
+        total -= (log_p_target.squeeze(-1) * valid).sum()
+        if need_hidden_grad or need_weight_grad:
+            # softmax - onehot on valid rows; p_t - 1 = expm1(log p_t).
+            logits.scatter_(-1, safe_y, torch.expm1(log_p_target))
+            logits.mul_(valid.unsqueeze(-1))
+            if need_hidden_grad:
+                if exact:
+                    with torch.autocast("cpu", enabled = False):
+                        grad_hidden[start:end] = logits @ weight.float()
+                else:
+                    grad_hidden[start:end] = logits.to(h.dtype) @ weight
+            if need_weight_grad:
+                grad_weight.addmm_(logits.t(), h.float())
+    return total, grad_hidden, grad_weight
+
+
+_chunked_ce_forward = torch.library.custom_op(
+    "unsloth_zoo::cpu_chunked_ce_forward", _chunked_ce_forward_impl, mutates_args = (),
+)
+
+
+@_chunked_ce_forward.register_fake
+def _chunked_ce_forward_fake(hidden, weight, labels, chunk_rows, ignore_index,
+                             need_hidden_grad, need_weight_grad, exact, amp, amp_dtype):
+    grad_dtype = torch.float32 if exact else hidden.dtype
+    return (
+        torch.empty((), dtype = torch.float32),
+        torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else torch.empty(0),
+        torch.empty(weight.shape, dtype = torch.float32) if need_weight_grad else torch.empty(0),
+    )
+
+
+class _ChunkedLinearCrossEntropy(torch.autograd.Function):
+    """Sums CE(hidden @ weight.T, labels) / divisor; grads are formed per chunk in forward, so peak extra memory
+    is one (chunk, vocab) fp32 block in both eager and compiled calls."""
 
     @staticmethod
     def forward(ctx, hidden, weight, labels, divisor, chunk_rows, ignore_index):
-        rows = hidden.shape[0]
         need_hidden_grad = hidden.requires_grad
         need_weight_grad = weight.requires_grad
         # fp16 cannot hold these gradients before GradScaler multiplies them: keep them fp32 until backward.
         exact = hidden.dtype == torch.float16 or _cpu_fp16_autocast()
-        grad_dtype = torch.float32 if exact else hidden.dtype
-        grad_hidden = torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else None
-        grad_weight = torch.zeros(weight.shape, dtype = torch.float32) if need_weight_grad else None
-        total = torch.zeros((), dtype = torch.float32)
-        for start in range(0, rows, chunk_rows):
-            end = min(start + chunk_rows, rows)
-            y = labels[start:end]
-            valid = y != ignore_index
-            # Zero ignored rows first: fp16 can overflow to inf in the projection, and NaN * 0 stays NaN.
-            h = torch.where(valid.unsqueeze(-1), hidden[start:end], hidden.new_zeros(()))
-            logits = (h @ weight.t()).float()
-            safe_y = torch.where(valid, y, torch.zeros_like(y)).unsqueeze(-1)
-            logits, log_p_target, _ = _softmax_without_collapse(logits, safe_y)
-            total -= (log_p_target.squeeze(-1) * valid).sum()
-            if need_hidden_grad or need_weight_grad:
-                # softmax - onehot on valid rows; p_t - 1 = expm1(log p_t).
-                logits.scatter_(-1, safe_y, torch.expm1(log_p_target))
-                logits.mul_(valid.unsqueeze(-1))
-                if need_hidden_grad:
-                    if exact:
-                        with torch.autocast("cpu", enabled = False):
-                            grad_hidden[start:end] = logits @ weight.float()
-                    else:
-                        grad_hidden[start:end] = logits.to(h.dtype) @ weight
-                if need_weight_grad:
-                    grad_weight.addmm_(logits.t(), h.float())
-        saved = (
-            grad_hidden if grad_hidden is not None else torch.empty(0),
-            grad_weight if grad_weight is not None else torch.empty(0),
+        # The surrounding autograd.Function supplies backward; these are precomputed, non-differentiable buffers.
+        compute = _chunked_ce_forward if torch.compiler.is_compiling() else _chunked_ce_forward_impl
+        amp, amp_dtype = _cpu_autocast_state()
+        total, grad_hidden, grad_weight = compute(
+            hidden.detach(), weight.detach(), labels, chunk_rows, ignore_index,
+            need_hidden_grad, need_weight_grad, exact, amp, amp_dtype,
         )
+        saved = (grad_hidden, grad_weight)
         # num_items_in_batch == 0 (a fully masked accumulation group): a finite 0, as TRL's clamped divisor gives.
         if torch.is_tensor(divisor):
             # Keep tensor counts as tensors: .item() breaks fullgraph tracing.
@@ -114,8 +155,8 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         grad_hidden, grad_weight = ctx.saved_tensors[:2]
-        # Every label ignored: the loss is NaN like F.cross_entropy(mean), but its gradient is zero.
-        # Also num_items_in_batch == 0 (a fully masked accumulation group): stock CE's gradient is zero there.
+        # All labels ignored: loss is NaN like F.cross_entropy(mean) but its gradient is zero; likewise
+        # num_items_in_batch == 0 (fully masked accumulation group), where stock CE's gradient is zero.
         if ctx.divisor is None:
             divisor = ctx.saved_tensors[2]
             empty = torch.isnan(divisor) | (divisor == 0)
@@ -288,10 +329,27 @@ def cpu_chunked_log_probs(hidden, weight, bias, targets, temperature, chunk_size
     return tuple(value if name == "log_probs" or name in outputs else None for name, value in zip(names, result))
 
 
+_TRL_LOGPROB_ARGS = ("hidden", "weight", "bias", "targets", "temperature", "chunk_size",
+                     "final_logit_softcapping", "logit_scale", "outputs")
+# Appended args -> extra outputs (TRL 1.17).
+_TRL_LOGPROB_EXTRA_ARGS = {"support_ids": 0, "score_ids": 1}
+
+
+def _trl_logprob_contract(kernel):
+    """(argument names after ctx, output count, known)."""
+    try:
+        names = tuple(inspect.signature(kernel.forward).parameters)[1:]
+    except (AttributeError, TypeError, ValueError):
+        return _TRL_LOGPROB_ARGS, 5, True  # No kernel (Triton missing) or no readable forward: the 1.x contract.
+    head, extra = names[:len(_TRL_LOGPROB_ARGS)], names[len(_TRL_LOGPROB_ARGS):]
+    known = head == _TRL_LOGPROB_ARGS and all(name in _TRL_LOGPROB_EXTRA_ARGS for name in extra)
+    return names, 5 + sum(_TRL_LOGPROB_EXTRA_ARGS.get(name, 0) for name in extra), known
+
+
 def patch_trl_fused_lm_head():
-    """TRL 1.x SFTTrainer always computes its loss through a fused LM head whose kernel is Triton
-    (CUDA / XPU only) and is None where Triton is missing, so CPU training and evaluate() fail. Keep
-    the kernel on those devices and route every other device to cpu_chunked_log_probs. Idempotent."""
+    """TRL 1.x SFTTrainer always computes loss through a fused LM head whose Triton kernel is None without Triton, so
+    CPU training and evaluate() fail; keep it on CUDA/XPU, route other devices to cpu_chunked_log_probs. Idempotent.
+    TRL 1.17 unpacks six outputs, so the torch path pads; id-set calls or an unknown contract stay on TRL's kernel."""
     try:
         from trl.trainer import utils as trl_utils
     except Exception:
@@ -301,6 +359,7 @@ def patch_trl_fused_lm_head():
     kernel = trl_utils._ChunkedLogProbFunction
     if getattr(kernel, "_unsloth_cpu_dispatch", False):
         return True
+    names, n_outputs, known = _trl_logprob_contract(kernel)
 
     class _DeviceDispatch:
         _unsloth_cpu_dispatch = True
@@ -308,9 +367,17 @@ def patch_trl_fused_lm_head():
 
         @staticmethod
         def apply(hidden, *args, **kwargs):
-            if kernel is not None and hidden.device.type in ("cuda", "xpu"):
+            if kernel is not None and (hidden.device.type in ("cuda", "xpu") or not known):
                 return kernel.apply(hidden, *args, **kwargs)
-            return cpu_chunked_log_probs(hidden, *args, **kwargs)
+            bound = dict(zip(names[1:], args))
+            bound.update(kwargs)
+            if kernel is not None and any(bound.get(name) is not None for name in _TRL_LOGPROB_EXTRA_ARGS):
+                return kernel.apply(hidden, *args, **kwargs)
+            result = cpu_chunked_log_probs(hidden, *args[:len(_TRL_LOGPROB_ARGS) - 1],
+                                           **{k: v for k, v in kwargs.items() if k in _TRL_LOGPROB_ARGS})
+            if isinstance(result, tuple) and len(result) < n_outputs:
+                result = result + (None,) * (n_outputs - len(result))
+            return result
 
     trl_utils._ChunkedLogProbFunction = _DeviceDispatch
     return True
@@ -383,8 +450,7 @@ def cpu_causal_conv1d(hidden_states, weight, bias = None, activation = None, **k
 
 
 def patch_causal_conv1d_fallback(model):
-    """Without oneDNN (macOS wheels), route modeling modules' `causal_conv1d_fn(hidden_states, weight, bias,
-    activation)` to cpu_causal_conv1d when a probe agrees; with oneDNN the grouped conv is faster."""
+    """Without oneDNN (macOS wheels), routes modeling modules' causal_conv1d_fn to cpu_causal_conv1d when a probe agrees; with oneDNN the grouped conv is faster."""
     import inspect
     import sys
     if torch.backends.mkldnn.is_available():
@@ -425,6 +491,9 @@ def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = No
         divisor = torch.where(count == 0, torch.full_like(count, float("nan")), count)
     elif torch.is_tensor(num_items_in_batch):
         divisor = num_items_in_batch.detach().to(device = hidden.device, dtype = torch.float32).reshape(())
+    elif torch.compiler.is_compiling():
+        # A Python count becomes symbolic once it changes between steps; float()/math.isnan on it cannot be traced.
+        divisor = torch.full((), num_items_in_batch, dtype = torch.float32, device = hidden.device)
     else:
         divisor = float(num_items_in_batch)
     # Skip ignored rows' LM head work. Eager only: the sync breaks compile; chunk loop zeroes them anyway.
@@ -439,8 +508,7 @@ def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = No
     return _ChunkedLinearCrossEntropy.apply(hidden, weight, shift_labels, divisor, chunk_rows, ignore_index)
 
 
-# Architectures whose causal-LM loss is plain CE over lm_head(hidden). Others (soft caps, logit scales,
-# z-loss, router losses, ...) keep their own forward.
+# Model types whose causal-LM loss is plain CE over lm_head(hidden); others (soft caps, logit scales, z-loss, router losses) keep their own forward.
 _CHUNKED_CE_MODEL_TYPES = frozenset(("llama", "mistral", "qwen2", "qwen3", "phi3", "gemma", "olmo2", "smollm3"))
 
 
@@ -479,12 +547,8 @@ def _plain_head_weight(head):
 
 
 def patch_chunked_causal_lm_loss(model):
-    """Route training forwards with labels through chunked_linear_cross_entropy.
-
-    Instance-level, so only this model changes. The returned logits are None in that case;
-    unsloth_zoo.cpu.trainer makes TRL skip its logits-only metrics for it.
-    Returns True when installed.
-    """
+    """Routes training forwards with labels through chunked_linear_cross_entropy, per instance; logits come back None,
+    so unsloth_zoo.cpu.trainer makes TRL skip logits-only metrics. Returns True when installed."""
     if os.environ.get("UNSLOTH_CPU_CHUNKED_CE", "1") == "0" or not _plain_lm_head(model):
         return False
     if getattr(model, "_unsloth_cpu_chunked_ce", False):
@@ -492,9 +556,8 @@ def patch_chunked_causal_lm_loss(model):
     from transformers.modeling_outputs import CausalLMOutputWithPast
 
     original_forward = model.forward
-    # Call the class forward on `self`, not the bound method: deepcopy (TRL reference models,
-    # merged copies) rebinds the outer method to the copy, and a bound original would still run
-    # the source model's weights.
+    # Call the class forward on self, not the bound method: deepcopy (TRL reference models, merged copies) rebinds the
+    # outer method, and a bound original would run the source model's weights.
     original_func = original_forward.__func__ if getattr(original_forward, "__self__", None) is model else None
     inner_name = getattr(model, "base_model_prefix", "model")
 

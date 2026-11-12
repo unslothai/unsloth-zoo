@@ -57,8 +57,8 @@ def _padding(total, device):
 @pytest.mark.parametrize("window", [None, 5])
 @pytest.mark.parametrize("q_len,q_offset,kv_offset,kv_len", _CASES)
 def test_mask_positions_cpu(monkeypatch, form, window, q_len, q_offset, kv_offset, kv_len):
-    # Positions only (any host): the BlockMask must equal causal & window & padding at absolute positions, and must
-    # not alias the offset it was given (StaticLayer passes its live cumulative_length, bumped before attention).
+    # Positions only, on any host: the BlockMask must equal causal & window & padding at absolute positions and not
+    # alias the given offset (StaticLayer passes its live cumulative_length, bumped before attention).
     from torch.nn.attention.flex_attention import create_block_mask, create_mask
     from transformers.masking_utils import causal_mask_function, sliding_window_causal_mask_function
     import unsloth_zoo.flex_attention.utils as U
@@ -135,8 +135,8 @@ def _block_layout(block_mask, T):
                                                     (599, 0, 600), (300, 296, 5), (40, 0, 41)])
 @pytest.mark.parametrize("tensor_offset", [True, False])
 def test_decode_lists_only_reachable_blocks_cpu(monkeypatch, window, q_pos, kv_offset, kv_len, tensor_offset):
-    # Decode on a static cache: kv_length is the cache size, but only blocks up to the query's own slot can hold a
-    # visible key. The listed blocks must cover every visible key (mask_mod only runs inside listed blocks).
+    # Decode on a static cache: kv_length is the cache size, but only blocks up to the query's slot can hold visible
+    # keys; listed blocks must cover them all, since mask_mod runs only inside listed blocks.
     from torch.nn.attention.flex_attention import create_mask
     from transformers.masking_utils import causal_mask_function, sliding_window_causal_mask_function
     import unsloth_zoo.flex_attention.utils as U
@@ -230,8 +230,8 @@ def test_inference_matches_fp32_sink_oracle(window, q_len, q_offset, kv_offset, 
 
     assert out.shape == (B, q_len, H, D)
     assert torch.isfinite(out).all()
-    # q_len 1 runs flex_decoding (exact fp32). Longer queries run the forced flex kernel, which rounds fp32 like
-    # TF32 once the mask_mod reads a captured tensor (stock torch.compile too): ~1e-3 on unit-scale values.
+    # q_len 1 runs flex_decoding (exact fp32); longer queries run the forced flex kernel, which rounds fp32 like TF32
+    # once mask_mod reads a captured tensor (~1e-3 on unit-scale values).
     atol = 2e-5 if q_len == 1 else 4e-3
     torch.testing.assert_close(out.double(), ref, atol = atol, rtol = 1e-4)
     empty = ~allowed.any(-1)
@@ -468,3 +468,34 @@ def test_inference_gates_cpu(monkeypatch):
         assert alive() is None and alive_other() is None
     finally:
         gc.enable()
+
+
+def test_decode_padding_layout_is_stable_as_the_window_rolls_cpu(monkeypatch):
+    # One-token steps of a sliding layer past its window: generate() widens the 2D mask by a column per step and the
+    # host kv_offset moves with it. The tensors the BlockMask's graph contract carries must keep their shapes and
+    # strides (a decode graph keys on them), or every step re-captures.
+    from torch.nn.attention.flex_attention import create_block_mask
+    from transformers.masking_utils import sliding_window_causal_mask_function
+    import unsloth_zoo.flex_attention.utils as U
+    monkeypatch.setattr(U, "compiled_create_block_mask",
+                        lambda m, b, h, M, N, device = "cpu": create_block_mask(m, b, h, M, N, device = device),
+                        raising = False)
+    import unsloth_zoo.temporary_patches.gpt_oss as G
+    from unsloth_zoo.temporary_patches.gpt_oss import _gpt_oss_flex_mask
+    # A graph-planned generate() with flex decode: the builder publishes the graph contract.
+    monkeypatch.setattr(G, "_gpt_oss_in_graph_generate", lambda: True)
+    monkeypatch.setattr(G, "_gpt_oss_graph_decode_attention", lambda: "flex")
+    layouts = []
+    for step in range(4):
+        width = 300 + step
+        mask = torch.ones(2, width, dtype = torch.long)
+        mask[1, :5] = 0
+        block_mask = _gpt_oss_flex_mask(
+            batch_size = 2, q_length = 1, kv_length = 128, q_offset = torch.tensor(width - 1),
+            kv_offset = width - 128, mask_function = sliding_window_causal_mask_function(128),
+            attention_mask = mask, device = "cpu",
+        )
+        contract = block_mask.__dict__.get("_unsloth_graph_closure")
+        assert contract is not None
+        layouts.append(tuple((tuple(t.shape), t.stride(), t.dtype) for t in contract[0]))
+    assert len(set(layouts)) == 1, layouts

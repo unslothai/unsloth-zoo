@@ -48,7 +48,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: audit
 
@@ -217,7 +217,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: audit
 
@@ -435,6 +435,8 @@ jobs:
         # test_output_collector_compile: the capture_outputs collector mirror compiles fullgraph and stays per thread / context.
         # test_top_level_imports_are_declared: every package a zoo module imports at module level is a declared dependency.
         # test_custom_op_annotations: torch.library.custom_op functions keep real annotations, which torch 2.4 / 2.6 require.
+        # test_triton_constexpr_comments: every owned tl.constexpr has a comment and no per-call size is a constexpr.
+        # test_triton_specialize_moe: MoE per-call counts keep no % 16 Triton class; routing scratch slices stay 16-byte aligned.
         # test_xpu_device_typed_autocast: nested bnb offset, Gemma3n fp32 regions and unsloth_train autocast follow the accelerator, not "cuda".
         # test_xpu_empty_cache_arms: gradient checkpointing buffers and patch_model_and_tokenizer release cached memory through torch.xpu on XPU.
         # One pytest process per group: MLX export shims replace sys.modules globally,
@@ -455,6 +457,8 @@ jobs:
               tests/test_compile_cache_concurrency.py \
               tests/test_top_level_imports_are_declared.py \
               tests/test_custom_op_annotations.py \
+              tests/test_triton_constexpr_comments.py \
+              tests/test_triton_specialize_moe.py \
               tests/test_training_utils_use_cache.py \
               tests/test_unsloth_train_scheduler_kwargs.py \
               tests/test_xpu_device_typed_autocast.py \
@@ -624,7 +628,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: audit
 
@@ -697,7 +701,7 @@ jobs:
               retry .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-suites/bin/pip install -e .[core] \
-                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.3,<=0.32.2" "mlx-vlm>=0.4.4,<=0.7.9" &&
+                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.3,<=0.32.2" "mlx-vlm>=0.4.4,<=0.7.12" &&
               retry .lanes/venv-suites/bin/pip install --no-deps \
                 "unsloth @ git+https://github.com/unslothai/unsloth@main" &&
               retry .lanes/venv-suites/bin/pip install pytest==9.0.3
@@ -1028,7 +1032,7 @@ jobs:
     steps:
       - name: Harden runner (audit)
         # audit (not block): the cells pull arbitrary transformers/TRL/peft pins.
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: audit
 

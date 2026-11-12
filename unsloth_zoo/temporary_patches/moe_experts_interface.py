@@ -389,8 +389,8 @@ def warm_moe_probes_on_expert_devices(model) -> None:
         return
     try:
         devices = _expert_devices(model)
-        # One accelerator on the whole host: it is the home card. Count every backend, since one CUDA card
-        # plus one XPU card are each a single device of their type yet the XPU is foreign to a CUDA home.
+        # One accelerator on the host is the home card; count every backend, since one CUDA card plus one XPU card are
+        # each a single device of their type, yet the XPU is foreign to a CUDA home.
         if not devices or _accelerator_count() <= 1:
             return
         moe_utils = _moe_utils_module()
@@ -467,8 +467,7 @@ def _patch_transformers_grouped_mm():
 
 
 def _warm_lazy_lookups():
-    # Filled here, eagerly: a first fill inside a compiled MoE layer guards on the key being absent, so
-    # the next call recompiles every compiled layer once.
+    # Filled here, eagerly: a first fill inside a compiled MoE layer guards on the key being absent, so the next call recompiles every compiled layer once.
     _default_apply_gate_or_none()
     _experts_layout_is_standard_or_none()
     if "moe_utils" not in _LAZY and __name__.rsplit(".", 1)[0] + ".moe_utils" in sys.modules:

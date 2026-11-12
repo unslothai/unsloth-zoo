@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU training backend, selected only when torch sees no accelerator (or UNSLOTH_FORCE_CPU=1).
-
-Like unsloth_zoo.mlx it is a separate backend: stock transformers / PEFT / TRL on CPU, with a few
-CPU-specific choices (dtype policy, bitsandbytes CPU QLoRA, chunked cross entropy, optional
-torch.compile). Nothing here is imported on a GPU host.
-"""
+"""CPU training backend, used only when torch sees no accelerator or UNSLOTH_FORCE_CPU=1: stock transformers/PEFT/TRL
+with CPU dtype policy, bitsandbytes CPU QLoRA and chunked CE; not imported on GPU hosts."""
 
 from .runtime import (
     apply_cpu_security_patches,

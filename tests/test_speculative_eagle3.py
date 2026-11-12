@@ -330,8 +330,8 @@ def test_training_goes_through_the_drafter_forward(tmp_path):
 
 
 def test_default_ddp_reduces_the_loss_only_parameters(tmp_path):
-    """Trainer wraps an nn.Module in DDP(find_unused_parameters=True): norm.weight, used only by the loss,
-    must be in forward()'s output graph or backward raises "mark a variable ready only once"."""
+    """Trainer wraps the module in DDP(find_unused_parameters=True); norm.weight, used only by the loss, must be in
+    forward()'s output graph or backward raises "mark a variable ready only once"."""
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel
     target = _target()
@@ -523,3 +523,65 @@ def test_teacher_matches_softcapped_target_logits(tmp_path):
         steps = drafter.forward_train(aux_hidden_states(cap, drafter.aux_layer_ids), ids, None, 3)
         ref, _ = eagle3_loss(steps, teacher, labels[:, 1:] != -100)
     assert torch.allclose(loss, ref, rtol = 1e-4, atol = 1e-5), (float(loss), float(ref))
+
+
+def test_accumulation_window_count_reaches_the_loss(tmp_path, monkeypatch):
+    """GA=2 x bs=1 must step like bs=2: unsloth's batch counter sums the window, even though its
+    Trainer.__init__ wrapper clears the count marker on the model before init."""
+    import copy
+    from transformers import Trainer
+    from unsloth_zoo.loss_utils import NUM_ITEMS_LABELS_ATTR, _unsloth_get_batch_samples
+
+    init = Trainer.__init__
+
+    def unsloth_init(self, *args, model = None, **kwargs):
+        model.__dict__.pop(NUM_ITEMS_LABELS_ATTR, None)
+        init(self, *args, model = model, **kwargs)
+
+    monkeypatch.setattr(Trainer, "__init__", unsloth_init)
+    monkeypatch.setattr(Trainer, "get_batch_samples", _unsloth_get_batch_samples)
+    target = _target()
+    drafter = _drafter(target)
+    gen = torch.Generator().manual_seed(2)
+    ids = [torch.randint(0, VOCAB, (24,), generator = gen).tolist() for _ in range(2)]
+    rows = [{"input_ids": ids[0], "labels": [-100] * 20 + ids[0][20:]},
+            {"input_ids": ids[1], "labels": [-100] * 2 + ids[1][2:]}]
+
+    def step(bs, ga):
+        d = copy.deepcopy(drafter).train()
+        seen = []
+
+        class T(UnslothEagle3Trainer):
+            def compute_loss(self, model, inputs, return_outputs = False, num_items_in_batch = None):
+                seen.append(num_items_in_batch if num_items_in_batch is None else int(num_items_in_batch))
+                return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
+
+        args = Eagle3TrainingArguments(output_dir = str(tmp_path / f"{bs}_{ga}"), per_device_train_batch_size = bs,
+                                       gradient_accumulation_steps = ga, max_steps = 1, learning_rate = 1e-2,
+                                       optim = "sgd", max_grad_norm = 0, report_to = "none", save_strategy = "no",
+                                       use_cpu = True)
+        T(model = d, target_model = target, args = args, train_dataset = Dataset.from_list(rows)).train()
+        return seen, d.fc.weight.detach() - drafter.fc.weight.detach()
+
+    torch.manual_seed(0)
+    seen_full, full = step(2, 1)
+    torch.manual_seed(0)
+    seen_ga, ga = step(1, 2)
+    assert seen_full == [26] and seen_ga == [26, 26]
+    assert torch.allclose(ga, full, rtol = 1e-4, atol = 1e-7)
+
+
+def test_data_parallel_loss_is_the_gathered_token_mean(tmp_path):
+    """Under DataParallel the count arrives once per GPU and the loss is scored once over the gathered
+    batch, so it must equal the single-device loss (Trainer's loss.mean() then leaves it alone)."""
+    target = _target()
+    drafter = _drafter(target)
+    args = Eagle3TrainingArguments(output_dir = str(tmp_path), report_to = "none", use_cpu = True, save_strategy = "no")
+    ids = torch.randint(0, VOCAB, (2, 16))
+    trainer = UnslothEagle3Trainer(model = drafter, target_model = target, args = args,
+                                   train_dataset = Dataset.from_list([{"input_ids": ids[0].tolist()}]))
+    batch = {"input_ids": ids, "labels": ids, "attention_mask": torch.ones_like(ids)}
+    single = trainer.compute_loss(drafter, dict(batch), num_items_in_batch = torch.tensor(30))
+    args._n_gpu = 2
+    dp = trainer.compute_loss(torch.nn.DataParallel(drafter), dict(batch), num_items_in_batch = torch.tensor([30, 30]))
+    assert dp.dim() == 0 and torch.allclose(dp, single)

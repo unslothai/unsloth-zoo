@@ -1,19 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Two boundaries in `rl_environments.py`, both of them load bearing.
-
-`create_locked_down_function` compiles source a model wrote, so the allowlist is
-all that stands between it and `__import__`. `_reject_dunder_access` walks the
-AST, so any construct spelling an attribute as a bare identifier string is
-invisible to it: `case object(__class__=x)` is a getattr with no Attribute node.
-
-`launch_openenv` spawns the server the trainer exchanges observations and rewards
-with. It must bind loopback, and must not accept any process that answers
-`/health` as that server.
-
-CPU-only; the real listeners are on 127.0.0.1, which the suite's blocker allows.
-"""
+"""Covers rl_environments.py: the create_locked_down_function allowlist is the only barrier to __import__;
+_reject_dunder_access misses attributes spelled as bare identifiers, such as match keywords; launch_openenv must bind
+loopback and never adopt a foreign /health server."""
 
 import contextlib
 import http.server
@@ -75,9 +65,7 @@ def test_match_class_pattern_chain_cannot_reach_import():
         create_locked_down_function(source)
 
 
-# Why no rule is needed per binding form, asserted rather than assumed: reading a
-# bound dunder back is an ast.Name, which the Name rule refuses. If that ever
-# stopped holding, one of these fails instead of a hole opening quietly.
+# No rule is needed per binding form: reading a bound dunder back is an ast.Name that the Name rule refuses, and these cases fail if that ever changes.
 BOUND_NAME_READS = [
     ("match capture", "    match A:\n        case [x] as __evil:\n            pass\n    return __evil\n"),
     ("match star", "    match A:\n        case [x, *__evil]:\n            pass\n    return __evil\n"),
@@ -323,11 +311,7 @@ def no_leaked_children():
 
 
 def _owned(child):
-    """A registry entry as launch_openenv writes it: (child, spawning pid).
-
-    The pid is what lets a forked worker tell "not my child to poll" from "dead",
-    so the shape is part of the contract rather than an implementation detail.
-    """
+    """A registry entry is (child, spawning pid); the pid lets a forked worker tell a child it must not poll from a dead one, so the shape is a contract."""
     return (child, os.getpid())
 
 
@@ -476,9 +460,7 @@ def ipv6_listener():
 def test_ipv6_listener_is_probed_over_ipv6(ipv6_listener):
     """AF_INET sent every ::1 probe to 127.0.0.1, so the port read as closed."""
     assert rl_env.is_port_open("::1", ipv6_listener)
-    # Whether `localhost` also covers it is the resolver's call, not ours: this
-    # host's /etc/hosts gives ::1 to ip6-localhost only. Where it is dual stack,
-    # the probe must not stop at the first candidate that refuses.
+    # Whether localhost covers ::1 is the resolver's call (/etc/hosts may map only ip6-localhost); a dual-stack probe must not stop at the first refusal.
     dual_stack = any(
         info[0] == socket.AF_INET6
         for info in socket.getaddrinfo("localhost", ipv6_listener, type = socket.SOCK_STREAM)
@@ -533,8 +515,7 @@ def test_ipv6_wildcard_is_dialled_through_ipv6_loopback(monkeypatch, tmp_path):
 
 
 def test_asyncio_really_makes_an_ipv6_wildcard_listener_v6_only():
-    """The premise above, measured rather than assumed: CPython base_events.create_server
-    calls setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, True) whatever net.ipv6.bindv6only says."""
+    """CPython base_events.create_server always calls setsockopt(IPPROTO_IPV6, IPV6_V6ONLY, True), whatever net.ipv6.bindv6only says."""
     if not socket.has_ipv6: pytest.skip("Python built without IPv6")
     import asyncio
 
@@ -665,12 +646,7 @@ class _SlowPollChild:
 
 @contextlib.contextmanager
 def _registry_guard():
-    """Whatever serialization the module offers, which is what keeps these falsifiable.
-
-    A helper that required the lock would raise inside its own thread on unlocked
-    code, the contended access would never happen, and the test would pass by
-    doing nothing.
-    """
+    """Takes the module's registry lock when one exists rather than requiring it held; requiring it would raise and the test would pass by doing nothing."""
     lock = getattr(rl_env, "_OPENENV_CHILDREN_LOCK", None)
     if lock is None:
         yield
@@ -757,8 +733,7 @@ def test_a_second_thread_cannot_spawn_onto_a_claimed_endpoint(monkeypatch, tmp_p
     ))
     monkeypatch.setattr(rl_env, "time", types.SimpleNamespace(sleep = lambda seconds: None))
 
-    # Thread A has claimed the endpoint and is mid-spawn. A second launch that
-    # picks the same port must step aside rather than spawn a rival onto it.
+    # Thread A has claimed the endpoint mid-spawn, so a second launch picking the same port must step aside rather than spawn a rival onto it.
     assert rl_env._reserve_openenv_endpoint("127.0.0.1", port)
     chosen, client = rl_env.launch_openenv(
         working_directory = str(tmp_path), openenv_class = _DummyClient, host = "127.0.0.1",
@@ -808,8 +783,7 @@ class _AnnouncingChild:
 
 
 def _squatter_launcher(monkeypatch, child, port, real_sleep = False):
-    """FREE at the availability check, OPEN afterwards: a foreign process takes the
-    port in the window between the check and uvicorn's own bind."""
+    """The port reads as free at the availability check but a foreign process can take it before uvicorn's own bind, which this squatter simulates."""
     seen = {"checked": False}
 
     def probe(host, prt):
@@ -827,21 +801,14 @@ def _squatter_launcher(monkeypatch, child, port, real_sleep = False):
     monkeypatch.setattr(rl_env, "requests", types.SimpleNamespace(
         get = lambda url, **kwargs: types.SimpleNamespace(content = b'{"status":"healthy"}'),
     ))
-    # A test about elapsed time needs time to elapse: with sleep stubbed out the
-    # grace expires in microseconds and the fallback fires before the child can
-    # say anything, which makes the race untestable.
+    # Elapsed-time tests need a real sleep: stubbed out, the grace expires in microseconds before the child can announce, making the race untestable.
     monkeypatch.setattr(rl_env, "time", types.SimpleNamespace(
         sleep = (lambda seconds: time.sleep(0.001)) if real_sleep else (lambda seconds: None),
     ))
 
 
 class _LosesTheBindChild:
-    """Alive and silent at first, then reports the bind failure and exits.
-
-    The real squatter timeline: the old check left the readiness loop on the
-    foreign socket during the silent window, while poll() still said alive. stderr
-    is one lazy stream because that is what a pipe is: read once, to EOF.
-    """
+    """Silent while alive, then reports the bind failure and exits; the old check kept readiness on the foreign socket while poll() still said alive."""
     def __init__(self, port, silent_seconds = 0.05):
         self._exited = threading.Event()
 
@@ -862,8 +829,7 @@ def test_a_foreign_listener_is_not_adopted_while_our_child_starts(monkeypatch, t
     """Port open + child alive is not proof the child opened the port."""
     child = _LosesTheBindChild(57000)
     _squatter_launcher(monkeypatch, child, 57000, real_sleep = True)
-    # Grace generous enough that the child's own verdict lands first, which is
-    # the real ordering: uvicorn reports a lost bind in milliseconds.
+    # The grace must be generous enough that the child's own verdict lands first, as uvicorn reports a lost bind within milliseconds.
     monkeypatch.setattr(rl_env, "_UVICORN_BOUND_GRACE_TRIALS", 500)
     with pytest.raises(TimeoutError):
         rl_env.launch_openenv(
@@ -898,12 +864,7 @@ def test_a_child_that_reports_losing_the_bind_is_abandoned(monkeypatch, tmp_path
 
 
 def test_an_unrecognised_startup_log_still_falls_back_to_the_open_port(monkeypatch, tmp_path):
-    """Closing a race must not fail a launch whose uvicorn reworded its log.
-
-    Also the residual, stated rather than hidden: a child that stays alive and
-    never announces is indistinguishable from one that bound, so the open port is
-    accepted. Eliminating the window means uvicorn --fd, which Windows lacks.
-    """
+    """Eliminating the race needs uvicorn --fd, which Windows lacks; an unrecognised startup log must not fail a launch, and a silent live child is accepted."""
     child = _AnnouncingChild(["INFO:     serving, probably, who can say\n"])
     _squatter_launcher(monkeypatch, child, 57003)
     port, client = rl_env.launch_openenv(
@@ -974,10 +935,7 @@ def _reuse_in_fork(endpoint, queue):
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason = "no fork on this platform")
 def test_a_forked_worker_does_not_call_the_parents_server_dead():
-    """poll() in a fork waitpids a non-child, gets ECHILD, and CPython caches
-    returncode 0, so the parent's live server reads as dead and every move of the
-    2048 notebook spawns its own uvicorn on a fresh game.
-    """
+    """poll() in a forked worker gets ECHILD and CPython caches returncode 0, so the parent's live server reads as dead and every move spawns its own uvicorn."""
     # Not spawned here, so poll() is meaningless on it; the sleep outlives the asserts.
     holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     endpoint = ("127.0.0.1", 58000)
@@ -1011,10 +969,7 @@ def test_a_dead_process_is_still_dead_off_process():
 
 
 def test_the_liveness_probe_does_not_kill_what_it_probes():
-    """On Windows CPython maps every signal but CTRL_C_EVENT and CTRL_BREAK_EVENT
-    onto TerminateProcess(handle, sig), so `os.kill(pid, 0)` kills the server it
-    was asked about rather than probing it.
-    """
+    """On Windows os.kill with any signal but CTRL_C_EVENT or CTRL_BREAK_EVENT calls TerminateProcess, so os.kill(pid, 0) kills instead of probing."""
     alive = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
     try:
         assert rl_env._openenv_pid_is_alive(alive.pid)
@@ -1036,10 +991,7 @@ def _touch_registry_in_fork(queue):
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason = "fork only")
 def test_a_lock_held_at_fork_does_not_wedge_the_child():
-    """fork copies the lock, not the thread holding it (CPython bpo-6721), so
-    without the after-fork hook the child blocks on its first registry call until
-    the outer timeout kills the worker.
-    """
+    """fork copies a held lock but not the thread holding it (CPython bpo-6721), so without the after-fork hook the child blocks on its first registry call."""
     holding = threading.Event()
     release = threading.Event()
 
@@ -1068,10 +1020,7 @@ def test_a_lock_held_at_fork_does_not_wedge_the_child():
 
 @pytest.mark.skipif(os.name == "nt", reason = "Windows has no zombie state")
 def test_an_unreaped_process_is_not_alive():
-    """A zombie answers os.kill(pid, 0) while its port is already free for anyone
-    to bind, and a forked worker cannot waitpid the parent's uvicorn (a sibling),
-    so that state lasts as long as the worker does.
-    """
+    """A zombie still answers os.kill(pid, 0) though its port is free to bind, and a forked worker cannot reap the parent's uvicorn, so the state persists."""
     zombie = subprocess.Popen([sys.executable, "-c", "pass"])
     try:
         deadline = time.time() + 10

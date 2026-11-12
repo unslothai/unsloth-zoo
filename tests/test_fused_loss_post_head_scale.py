@@ -7,8 +7,7 @@
 # by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Post-lm_head scales (Falcon-H1, HyperCLOVAX) must reach the fused kernel; dropping
-one trained on 128x-off logits and NaN'd on step 1. CPU-only."""
+"""Post-lm_head scales (Falcon-H1, HyperCLOVAX) must reach the fused kernel; dropping one trained on 128x-off logits and NaN'd on step 1. CPU only."""
 
 from __future__ import annotations
 

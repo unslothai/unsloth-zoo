@@ -29,7 +29,18 @@ from fla.utils import (
 BKV_LIST = [64, 128] if check_shared_mem() else ([32, 64] if check_shared_mem('ada') else [32])
 NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 # Unsloth: fla PR #1399 (issue #1327, triton #10590): Blackwell + Triton < 3.8 dv_local races at 8 warps.
-BLACKWELL_8_WARP_RACE = IS_NVIDIA_BLACKWELL and not TRITON_ABOVE_3_8_0
+# IS_NVIDIA_BLACKWELL reads only the device current at import, while these configs and the autotune
+# cache serve every device in the process: a Blackwell card anywhere keeps 8 warps out.
+def _any_visible_blackwell():
+    if not IS_NVIDIA:
+        return False
+    try:
+        return any(torch.cuda.get_device_capability(i)[0] in (10, 12) for i in range(torch.cuda.device_count()))
+    except Exception:
+        return IS_NVIDIA_BLACKWELL
+
+
+BLACKWELL_8_WARP_RACE = (IS_NVIDIA_BLACKWELL or _any_visible_blackwell()) and not TRITON_ABOVE_3_8_0
 CHUNK_BWD_DV_LOCAL_NUM_WARPS = [2, 4] if BLACKWELL_8_WARP_RACE else NUM_WARPS
 
 
@@ -112,17 +123,17 @@ def chunk_fwd_kernel_o(
     chunk_indices,
     scale,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    USE_G: tl.constexpr,
-    USE_G_GAMMA: tl.constexpr,
-    STATE_V_FIRST: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    USE_G: tl.constexpr,  # scalar gate
+    USE_G_GAMMA: tl.constexpr,  # constant per-head decay
+    STATE_V_FIRST: tl.constexpr,  # state layout is [V, K]
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
     i_b, i_h = i_bh // HV, i_bh % HV
@@ -215,7 +226,7 @@ def chunk_fwd_kernel_o(
     key=['H', 'HV', 'K', 'V', 'BT', 'BK', 'BV', 'USE_G', 'USE_G_GAMMA', 'USE_DW', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['B', 'T'])
 def chunk_bwd_kernel_dqkwg(
     q,
     k,
@@ -233,20 +244,20 @@ def chunk_bwd_kernel_dqkwg(
     cu_seqlens,
     chunk_indices,
     scale,
-    B: tl.constexpr,
+    B,  # Unsloth: runtime (do_not_specialize), was constexpr: one compile per batch size
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    USE_G: tl.constexpr,
-    USE_G_GAMMA: tl.constexpr,
-    USE_DW: tl.constexpr,
-    STATE_V_FIRST: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    USE_G: tl.constexpr,  # scalar gate
+    USE_G_GAMMA: tl.constexpr,  # constant per-head decay
+    USE_DW: tl.constexpr,  # compute dw
+    STATE_V_FIRST: tl.constexpr,  # state layout is [V, K]
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     i_k, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
     i_b, i_h = i_bh // HV, i_bh % HV
@@ -416,17 +427,17 @@ def chunk_bwd_kernel_dv(
     chunk_indices,
     scale,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    USE_G: tl.constexpr,
-    USE_G_GAMMA: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    STATE_V_FIRST: tl.constexpr,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    USE_G: tl.constexpr,  # scalar gate
+    USE_G_GAMMA: tl.constexpr,  # constant per-head decay
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    STATE_V_FIRST: tl.constexpr,  # state layout is [V, K]
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
     i_b, i_h = i_bh // HV, i_bh % HV
@@ -521,17 +532,17 @@ def chunk_bwd_kernel_dv_local(
     chunk_indices,
     scale,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    USE_G: tl.constexpr,
-    USE_G_GAMMA: tl.constexpr,
-    USE_A: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    USE_G: tl.constexpr,  # scalar gate
+    USE_G_GAMMA: tl.constexpr,  # constant per-head decay
+    USE_A: tl.constexpr,  # attention matrix given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // HV, i_bh % HV

@@ -14,20 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The HIP branch of ``initialize_unsloth_gradient_checkpointing`` must ASK.
-
-Hardcoded True pins the offload buffers to bfloat16 on every AMD host, and RDNA
-1/2 have no native bf16: LLVM cannot lower the dot intrinsic Triton picks and
-the process dies with no Python exception (unslothai/unsloth issue 7922).
-
-Inert until unslothai/unsloth#7682 lands, because `is_bf16_supported` returns
-True for `torch.version.hip` BEFORE any architecture check -- so a test proving
-only "float16 now" would prove a regression for every current ROCm user.
-
-Runs on a CPU runner, since no job here has an AMD one and skipping would leave
-the decision unexecuted everywhere. Stubbing `device_count` to 0 is what makes
-that work: no device buffer, no stream and no event, so only the dtype is left.
-"""
+"""HIP branch of initialize_unsloth_gradient_checkpointing must ask a probe, not hardcode bf16 (RDNA 1/2 lack native
+bf16 and die in LLVM, unslothai/unsloth issue 7922); inert until unslothai/unsloth 7682 since is_bf16_supported is
+True for HIP before arch checks; CPU runs stub device_count to 0."""
 import ast
 import inspect
 
@@ -87,13 +76,8 @@ def _globals_the_init_writes():
 
 @pytest.fixture
 def run_init(monkeypatch):
-    """Drive the real function on a CPU box and hand back the buffer dtype.
-
-    `torch.empty` is unwrapped, not reimplemented -- same call minus the pin,
-    which needs a CUDA context -- so the dtype is still the module's own choice.
-    Every global the call writes is restored: the gate runs this file in one
-    process with thirty others, and `USE_UNSLOTH_GC = True` would follow them.
-    """
+    """Runs the real init on CPU, unwrapping torch.empty minus the CUDA pin so the dtype stays the module's choice;
+    restores every global it writes (USE_UNSLOTH_GC would leak)."""
     real_empty = torch.empty
     saved = {name: getattr(gc, name, _MISSING) for name in _globals_the_init_writes()}
 
@@ -151,8 +135,7 @@ def test_a_patched_probe_saying_no_gets_float16(run_init):
 def test_cuda_still_decides_on_compute_capability_not_the_probe(
     run_init, capability, expected
 ):
-    """The probe answers the opposite of the capability in both rows, so a CUDA
-    branch that started consulting it fails."""
+    """The probe answers the opposite of compute capability in both rows, so a CUDA branch that consults the probe fails."""
     got = run_init("cuda", lambda *a, **k: capability[0] < 8, capability = capability)
     assert got is expected, (
         f"CUDA picked {got} on a compute-capability {capability[0]}.x card; the "

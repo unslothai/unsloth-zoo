@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Audio Flamingo 3 / Music Flamingo audio features keep their 30 s length through the collator.
-
-Their encoders add a fixed 1500 positions, so the top-level padding = True that ProcessorMixin
-also hands to the feature extractor (shortest-to-longest clip) made every training step raise.
-"""
+"""Audio Flamingo 3 / Music Flamingo features keep their 30 s length; their encoders take a fixed 1500 positions, so the
+padding=True that ProcessorMixin passes made every training step raise."""
 
 from types import SimpleNamespace
 

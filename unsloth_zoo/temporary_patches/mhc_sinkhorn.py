@@ -41,6 +41,8 @@ __all__ = [
     "MHC_SINKHORN_REPLACEMENT",
     "MHC_PROJECTION_SOURCE",
     "MHC_PROJECTION_REPLACEMENT",
+    "MHC_PROJECTION_SOURCE_VIEW",
+    "MHC_PROJECTION_REWRITES",
 ]
 
 
@@ -86,6 +88,22 @@ MHC_PROJECTION_REPLACEMENT = (
     "        )\n"
 )
 
+# transformers 5.21+ layout of the same projection (view instead of flatten, one statement per step).
+MHC_PROJECTION_SOURCE_VIEW = (
+    "        flattened = hidden_streams.view(batch_size, seq_len, -1).float()\n"
+    "        flattened = self.input_norm(flattened)\n"
+    "        # Mix the streams together to infer the weight coefficients\n"
+    "        flattened = F.linear(flattened, self.fn.float())\n"
+    "        # Split the weight coefficients\n"
+    "        pre_w, post_w, comb_w = flattened.split([hc, hc, hc * hc], dim=-1)\n"
+)
+
+# (old, new) pairs tried in order; the first that occurs exactly once is applied.
+MHC_PROJECTION_REWRITES = (
+    (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT),
+    (MHC_PROJECTION_SOURCE_VIEW, MHC_PROJECTION_REPLACEMENT),
+)
+
 
 def _mhc_projection(hidden_streams, input_norm, fn):
     flat = input_norm(hidden_streams.flatten(start_dim=2).float())
@@ -93,8 +111,8 @@ def _mhc_projection(hidden_streams, input_norm, fn):
 
 
 def unsloth_mhc_projection(hidden_streams, input_norm, fn):
-    """`F.linear(input_norm(hidden_streams.flatten(2).float()), fn.float())`, saving `hidden_streams`
-    (alive anyway) for backward instead of its FP32 upcast; backward reruns the same math."""
+    """Runs F.linear(input_norm(hidden_streams.flatten(2).float()), fn.float()) and saves hidden_streams (alive anyway),
+    not its FP32 upcast, for backward, which reruns the math."""
     if (
         torch.compiler.is_compiling()
         or not torch.is_grad_enabled()

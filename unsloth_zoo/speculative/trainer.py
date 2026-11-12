@@ -83,15 +83,9 @@ def _shift_window(tensor, start, length, fill):
 
 def mtp_step_losses(head, parts, final_hidden, input_ids, attention_mask, data_labels, args, normalizer = None,
                     head_hidden = None):
-    """Weighted MTP loss plus per-step (loss, n_tokens, n_correct).
-
-    normalizer: supervised tokens in the whole accumulated batch (Trainer's num_items_in_batch),
-    so microbatches of different lengths are weighted by tokens, not averaged as means.
-
-    Chain p starts from (final_hidden[p-1], x[p]); step k predicts x[p+k+1], whose
-    teacher distribution is the target's own prediction at p+k, final_hidden[:, p+k].
-    head_hidden: what the head consumes when it is not the post-norm hidden (pre-norm families).
-    """
+    """Weighted MTP loss and per-step (loss, n_tokens, n_correct); normalizer = supervised tokens in the accumulated
+    batch, so microbatches are weighted by tokens, not means; chain p starts from (final_hidden[p-1], x[p]); step k
+    predicts x[p+k+1] with teacher final_hidden[:, p+k]."""
     steps = head(
         final_hidden if head_hidden is None else head_hidden,
         input_ids,
@@ -144,8 +138,8 @@ def mtp_step_losses(head, parts, final_hidden, input_ids, attention_mask, data_l
 
 
 def token_average_scale(trainer, num_items_in_batch):
-    """What Trainer.compute_loss multiplies a loss by when num_items_in_batch is the token count over
-    every rank (DDP's gradient mean then cancels it); compute_loss overrides must do the same."""
+    """Scale Trainer.compute_loss applies to a loss when num_items_in_batch counts tokens across ranks (DDP's gradient
+    mean cancels it); compute_loss overrides must match."""
     args = trainer.args
     if num_items_in_batch is None or not getattr(args, "average_tokens_across_devices", False):
         return 1
@@ -153,10 +147,7 @@ def token_average_scale(trainer, num_items_in_batch):
 
 
 class UnslothMTPTrainer(Trainer):
-    """Trains a draft MTP head against a frozen target, one target pass per batch.
-
-    `model` is the MTP head (the only trainable module); `target_model` stays frozen.
-    """
+    """Trains a draft MTP head against a frozen target, one target pass per batch; model is the only trainable module, target_model stays frozen."""
 
     def __init__(self, model = None, args = None, target_model = None, **kwargs):
         if target_model is None:

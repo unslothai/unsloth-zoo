@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A trainable head must get correct gradients when a chunk would hold one row (49 packed tokens in 16
-chunks: 12 of 4, then 1). Inductor mis-lowered it: illegal memory access, or silently wrong gradients
-with a small vocabulary. One process per case, since the illegal access poisons the CUDA context."""
+"""A trainable head needs correct gradients when a chunk holds one row (49 tokens in 16 chunks: 12 of 4, then 1);
+inductor mis-lowered it to illegal access or wrong grads; one process per case since the CUDA context is poisoned."""
 import json
 import subprocess
 import sys

@@ -76,7 +76,7 @@ if triton is not None:
     def _route_single_kernel(
         ids_ptr, N, K_COLS: tl.constexpr, stride_row: tl.constexpr, stride_col, E: tl.constexpr,  # top-k, top-k, n_experts
         counts_ptr, offsets_ptr, out_ptr,
-        BLOCK: tl.constexpr, NUM_BINS: tl.constexpr,
+        BLOCK: tl.constexpr, NUM_BINS: tl.constexpr,  # slots per program / histogram bins pow2
     ):
         pos = tl.arange(0, BLOCK)
         key = _load_keys(ids_ptr, pos.to(tl.int64), N, K_COLS, stride_row, stride_col, E)
@@ -92,10 +92,9 @@ if triton is not None:
     def _route_hist_kernel(
         ids_ptr, N, K_COLS: tl.constexpr, stride_row: tl.constexpr, stride_col, E: tl.constexpr,  # top-k, top-k, n_experts
         hist_ptr, below_ptr,
-        BLOCK: tl.constexpr, NUM_BINS: tl.constexpr,
+        BLOCK: tl.constexpr, NUM_BINS: tl.constexpr,  # slots per program / histogram bins pow2
     ):
-        # Block-major [NB, E + 1]: hist = rows of each expert in this block, below = rows of
-        # smaller experts in this block (the block-local start of each expert's run).
+        # Block-major [NB, E + 1]: hist = rows of each expert in this block; below = rows of smaller experts in this block (block-local run start).
         b = tl.program_id(0)
         idx = b.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         key = _load_keys(ids_ptr, idx, N, K_COLS, stride_row, stride_col, E)
@@ -108,10 +107,10 @@ if triton is not None:
     @triton.jit(do_not_specialize = ["NB"])
     def _route_scan_kernel(
         hist_ptr, below_ptr, counts_ptr, NB, E: tl.constexpr,  # n_experts
-        EC: tl.constexpr, BB: tl.constexpr,
+        EC: tl.constexpr, BB: tl.constexpr,  # experts per program / blocks per scan step
     ):
-        # One program per EC experts, carry over the blocks. Rewrites below[b, e] in place to
-        # (rows of e in blocks before b) - (rows of experts < e in block b); counts[e] = total.
+        # One program per EC experts carrying over blocks; rewrites below[b, e] in place to (rows of e in earlier
+        # blocks) - (rows of experts < e in block b); counts[e] = total.
         e = tl.program_id(0) * EC + tl.arange(0, EC)
         cols = e[None, :]
         carry = tl.zeros([EC], dtype = tl.int32)
@@ -126,7 +125,7 @@ if triton is not None:
         tl.store(counts_ptr + e, carry, mask = e < E)
 
     @triton.jit
-    def _route_starts_kernel(counts_ptr, starts_ptr, offsets_ptr, E: tl.constexpr, EP: tl.constexpr):
+    def _route_starts_kernel(counts_ptr, starts_ptr, offsets_ptr, E: tl.constexpr, EP: tl.constexpr):  # num experts / num experts + 1 pow2
         e = tl.arange(0, EP)
         c = tl.load(counts_ptr + e, mask = e < E, other = 0)
         ends = tl.cumsum(c, 0)
@@ -137,7 +136,7 @@ if triton is not None:
     def _route_scatter_kernel(
         ids_ptr, N, K_COLS: tl.constexpr, stride_row: tl.constexpr, stride_col, E: tl.constexpr,  # top-k, top-k, n_experts
         rank_base_ptr, starts_ptr, out_ptr,
-        BLOCK: tl.constexpr,
+        BLOCK: tl.constexpr,  # slots per program
     ):
         b = tl.program_id(0)
         pos = tl.arange(0, BLOCK)
@@ -156,6 +155,14 @@ if triton is not None:
 
 def _pow2(n):
     return 1 << max(int(n) - 1, 0).bit_length()
+
+
+def _route_scratch(NB, E, device):
+    """hist, rank_base, starts int32 slices of one buffer, offsets rounded up to 4 int32 (16 bytes): an offset
+    following NB (tokens) changed the pointer alignment class and recompiled four kernels per prefill length."""
+    size = (NB * (E + 1) + 3) // 4 * 4
+    scratch = torch.empty(2 * size + E + 1, dtype = torch.int32, device = device)
+    return scratch[:size], scratch[size: 2 * size], scratch[2 * size:]
 
 
 def _as_2d(top_k_index):
@@ -199,9 +206,7 @@ def _launch(top_k_index, num_experts, single_block_max = None, block = None):
             return counts, out, offsets
         BLOCK = _MULTI_BLOCK if block is None else block
         NB = (N + BLOCK - 1) // BLOCK
-        size = NB * (E + 1)
-        scratch = torch.empty(2 * size + E + 1, dtype = torch.int32, device = device)
-        hist, rank_base, starts = scratch[:size], scratch[size: 2 * size], scratch[2 * size:]
+        hist, rank_base, starts = _route_scratch(NB, E, device)
         _route_hist_kernel[(NB,)](
             ids, N, K_COLS, s_row, s_col, E, hist, rank_base,
             BLOCK = BLOCK, NUM_BINS = _pow2(E + 2), num_warps = _WARPS[0], enable_fp_fusion = True,

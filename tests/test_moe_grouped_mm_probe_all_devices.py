@@ -27,8 +27,7 @@ from unsloth_zoo.temporary_patches import moe_utils
 
 @pytest.fixture(autouse = True)
 def _fresh_dynamo_rules():
-    # Torn down after monkeypatch restores torch: a compile under the mocks caches Dynamo's torch
-    # rule map without the real _grouped_mm, which breaks later compiled MoE tests in this process.
+    # Teardown runs after monkeypatch restores torch: a compile under mocks caches Dynamo's rule map without the real _grouped_mm and breaks later MoE tests
     yield
     import torch._dynamo
     import torch._dynamo.trace_rules as trace_rules
@@ -56,8 +55,8 @@ def spoof(monkeypatch):
         monkeypatch.setattr(moe_utils, "_GROUPED_MM_HOME", None, raising = False)
         monkeypatch.setattr(moe_utils, "_GROUPED_MM_HOMOGENEOUS", False, raising = False)
         monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", None)
-        # A warm-up on the spoofed host selects grouped_mm; restored on teardown so later tests on this
-        # CPU worker do not inherit a backend chosen for cards that do not exist.
+        # A warm-up on the spoofed host selects grouped_mm; restoring _SELECTED_MOE_BACKEND on teardown stops later
+        # tests inheriting that backend for absent cards.
         monkeypatch.setattr(moe_utils, "_SELECTED_MOE_BACKEND", None, raising = False)
         for name in ("_GROUPED_MM_FOREIGN", "_TORCH_GROUPED_MM_SUPPORTED_BY_KIND", "_GROUPED_MM_SURVIVES_BY_KIND",
                      "_TRANSPOSED_VIEW_SAFE_BY_KIND"):
@@ -84,9 +83,8 @@ def spoof(monkeypatch):
         monkeypatch.setattr(torch, "ones", ones)
         monkeypatch.setattr(torch, "tensor", tensor)
         monkeypatch.setattr(torch, "_grouped_mm", grouped_mm, raising = False)
-        # The view probe builds real tensors (torch.Generator / randn on the card): on a GPU host that ran
-        # on the real device and logged extra _grouped_mm calls. Answer from `failing` instead; tests of
-        # the view probe override it.
+        # The view probe builds real tensors on the card, which on a GPU host would run on the real device and log extra
+        # _grouped_mm calls; answer from failing instead (view-probe tests override it)
         monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda d: d is not None and d.index not in failing)
         return probed
     return make
@@ -540,8 +538,8 @@ def test_tracing_a_never_warmed_card_takes_the_conservative_answers(spoof, monke
 
 
 def test_tracing_a_card_of_another_accelerator_type_never_resolves_it(spoof, monkeypatch):
-    # Mixed CUDA/XPU host whose XPU card no eager probe reached: the trace must not reach the
-    # compiler-disabled resolver, and an XPU has no torch-side fallback, so the manual loop and the copy.
+    # Mixed CUDA/XPU host with an XPU card no eager probe reached: tracing must not reach the compiler-disabled
+    # resolver; an XPU has no torch-side fallback, so it needs the manual loop and copy
     _never_warmed(spoof, monkeypatch, count = 2, models = ["H100", "RTX4090"])
     monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_FALLS_BACK", True, raising = False)
     _no_probe_while_tracing(monkeypatch)
@@ -631,8 +629,8 @@ def _split_model(*devices, others = ()):
 
 
 def test_loader_warms_a_foreign_expert_card_before_compile(spoof, monkeypatch):
-    # H100 home + A100 holding later layers: the loader resolves the A100 eagerly, so the compiled
-    # forward's first A100 query traces under fullgraph=True instead of hitting the disabled probe.
+    # H100 home with an A100 holding later layers: the loader resolves the A100 eagerly, so the compiled forward's first
+    # A100 query traces under fullgraph=True, not the disabled probe
     from unsloth_zoo.temporary_patches.moe_grouped_modulelist import auto_enable_grouped_moe
     seen = spoof(3, models = ["H100", "A100", "L4"])
     assert moe_utils._check_torch_grouped_mm_supported() is True
@@ -651,8 +649,7 @@ def test_loader_warm_adds_no_probe_on_one_gpu_or_one_model(spoof, models):
 
 
 def test_loader_warm_skips_cards_holding_only_non_expert_weights(spoof, monkeypatch):
-    # A wrapper exposing num_experts with its LM head on an A100: the experts all sit on the H100 home,
-    # so the A100 must not be probed (nor the L4 that holds nothing).
+    # Wrapper exposing num_experts with its LM head on an A100: experts all sit on the H100 home, so neither the A100 nor the L4 (holding nothing) may be probed
     from unsloth_zoo.temporary_patches.moe_grouped_modulelist import auto_enable_grouped_moe
     from unsloth_zoo.temporary_patches.moe_experts_interface import _expert_devices
     seen = spoof(3, models = ["H100", "A100", "L4"])
@@ -664,8 +661,8 @@ def test_loader_warm_skips_cards_holding_only_non_expert_weights(spoof, monkeypa
 
 
 def test_loader_warms_an_xpu_card_beside_a_single_cuda_home(spoof, monkeypatch):
-    # One CUDA card plus one XPU card: each backend counts 1 device, yet the XPU is foreign to the CUDA
-    # home and its first traced query would reach the compiler-disabled resolver.
+    # One CUDA plus one XPU card: each backend counts 1 device, yet the XPU is foreign to the CUDA home and its first
+    # traced query would hit the compiler-disabled resolver.
     from unsloth_zoo.temporary_patches.moe_grouped_modulelist import auto_enable_grouped_moe
     seen = spoof(1, models = ["H100"])
     real_xpu = getattr(torch, "xpu", None)

@@ -110,8 +110,8 @@ def test_prefill_batch_may_go_dynamic(monkeypatch, S, traced_caller):
 
 
 def test_dynamic_cache_decode_static_batch_no_per_step_recompile(monkeypatch, S):
-    # DynamicCache (the fallback when a static cache does not fit): kv length grows every step. The batch stays
-    # static, the kv length goes dynamic once, and later steps reuse that graph.
+    # DynamicCache (fallback when a static cache does not fit) grows kv length every step: batch stays static, kv length
+    # goes dynamic once, later steps reuse that graph.
     seen = []
     def fake_flex(query, key, value, block_mask = None, **kwargs):
         return query * 1, query.float().sum(-1) + key.float().mean()

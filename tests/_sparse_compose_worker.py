@@ -73,9 +73,8 @@ def logits(seq, dtype = torch.float32):
         return model.to(dtype)(input_ids = ids).logits.float()
 
 
-# The process's first CPU forward can differ from every later one in the last bits (about 6e-5 on MiniMax with 4
-# threads, the CI runner's count, even with no patch installed). Take it here so the bitwise check below compares
-# the skip path with the reference, not the first call with a warm one.
+# The first CPU forward can differ from later ones in the last bits (about 6e-5 on MiniMax with 4 threads, even
+# unpatched); warm it up here so the bitwise check compares the skip path with the reference.
 logits(budget)
 # Within the budget: skip engaged, bitwise equal to the skip-off (upstream indexer) run.
 before = stat("skip_full")

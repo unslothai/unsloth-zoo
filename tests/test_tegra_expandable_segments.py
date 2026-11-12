@@ -1,15 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""The Tegra allocator exclusion: a Tegra board must lose ``expandable_segments`` (and gains
-no ``roundup_power2_divisions``, since unified memory has no VRAM pool to defragment), a
-discrete host must be untouched, and the detection must read FILES: ``get_device_properties``
-flips ``torch.cuda.is_initialized()`` True, so probing at import would create a CUDA context
-before the caller has picked a device.
-
-What ``import unsloth_zoo`` then leaves in the allocator variables is
-``tests/test_alloc_conf_tegra_matrix.py``, which needs a fresh subprocess per case.
-"""
+"""Tegra boards lose expandable_segments and gain no roundup_power2_divisions; discrete hosts are untouched; files are
+read since get_device_properties flips torch.cuda.is_initialized() True; allocator env effects are in
+tests/test_alloc_conf_tegra_matrix.py (fresh subprocess per case)."""
 
 from __future__ import annotations
 
@@ -90,8 +84,7 @@ class TestIsTegraBoard:
         assert integrated_device.is_tegra_board(self.JETSON) is False
 
     def test_dgx_spark_is_excluded_by_name(self, arm):
-        # GB10 is Tegra lineage, but expandable segments is the reported mitigation there
-        # (vllm-project/vllm#55569), so taking it away would be the regression.
+        # GB10 is Tegra lineage, but expandable segments is the reported mitigation there (vllm-project/vllm#55569), so taking it away would be the regression.
         assert integrated_device.is_tegra_board(self.SPARK) is False
 
     def test_gb10_alone_is_excluded(self, arm):
@@ -157,8 +150,7 @@ class TestNoCudaInitialization:
         assert torch.cuda.is_initialized() is False
 
     def test_free_second_opinion_fires_for_a_tegra_part(self, monkeypatch):
-        # A container can hide the board files, so the driver is a second opinion, but only
-        # when a context already exists and reading it is free.
+        # A container can hide the board files, so the driver is a second opinion, consulted only when a CUDA context already exists and reading it is free.
         torch = pytest.importorskip("torch")
         monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
         monkeypatch.setattr(integrated_device, "_any_device_integrated", lambda: True)

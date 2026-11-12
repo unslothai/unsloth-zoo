@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Softmax collapse (arXiv 2610.31642): rows whose target leads the rest by > ~16.6 round p_t to 1 in fp32, so
-1 - p_t and lse - z_t read 0 while the other classes keep their gradient. fp64 oracle written as
-softplus(lse_others - z_t) (plain fp64 log_softmax collapses too past ~36.7), every route."""
+"""Softmax collapse (arXiv 2610.31642): gaps past ~16.6 round p_t to 1 in fp32; fp64 oracle uses softplus because plain fp64 log_softmax collapses past ~36.7."""
 
 import json
 import os
@@ -38,8 +36,8 @@ def _transform(x, cap):
 
 
 def _inputs(V, dtype, T, cap, seed = 0, controls = 4):
-    """Rows whose final logit (after softcap and temperature) leads lse of the rest by GAPS (as far as the softcap
-    allows), plus random control rows. Peaked rows own their target's head row: w_t = beta h / |h|^2."""
+    """Peaked rows: final logit (after softcap and temperature) leads lse of the rest by GAPS, as far as softcap allows;
+    target row w_t = beta h / |h|^2; plus random controls."""
     g = torch.Generator().manual_seed(seed)
     w = torch.randn(V, H, generator = g, dtype = torch.float64) / H**0.5
     n = len(GAPS) * 2 + controls
@@ -106,8 +104,7 @@ def _run(route, h, w, t, T, cap):
     before = dict(fl.CALLS)
     if route.get("ce"):
         out = {}
-        # Per-row losses: one call per row would hide the chunk routes, so take the gradient of the sum and the
-        # loss from the logprob of each row through the CE (sum over rows, divisor 1).
+        # One call per row would hide the chunk routes; per-row losses come from the summed CE, divisor 1.
         S = route.get("scaling")
         loss = fused_linear_cross_entropy(hh, ww, None, t, divisor = 1.0, logit_softcapping = cap,
                                           rows_per_chunk = route["rows"] or None, scaling = S)
@@ -181,8 +178,7 @@ def _dtypes():
     return [torch.float32, torch.float16] + ([torch.bfloat16] if torch.cuda.get_device_capability()[0] >= 8 else [])
 
 
-# Per-row hidden-grad tolerance on rows whose true gradient survives the output dtype: the base reads 1 - p_t as 0
-# (relative error ~1, or ~1e16 where an FMA makes log p_t positive); bf16 / fp16 limits are the half dz buffer.
+# Hidden-grad tolerance: base reads 1-p_t as 0 (error ~1, ~1e16 via FMA); half dz caps bf16/fp16.
 _GH_TOL = {torch.float32: 1e-3, torch.float16: 0.15, torch.bfloat16: 2e-2}
 # Half logits round a peaked row's z_t (30 to 60) by up to 0.125 in bf16 / 0.016 in fp16, which scales e^-gap alike.
 _HALF_TOL = {torch.float16: 0.15, torch.bfloat16: 0.3}

@@ -39,12 +39,15 @@ def _attn(heads_q, heads_kv):
 
 
 @pytest.mark.parametrize("q_len", [70, 100])
-def test_short_query_sink_attention_compiles(q_len, monkeypatch):
+def test_short_query_sink_attention_compiles(q_len, request):
     from unsloth_zoo.flex_attention import flex_attention_with_sink
 
     torch._dynamo.reset()
     # A lowering failure raises here instead of silently falling back for the rest of the process.
-    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False)
+    # config.patch, not monkeypatch: pytest 9.2's undo deletes a ConfigModule key it cannot see in __dict__.
+    strict = torch._dynamo.config.patch(suppress_errors = False)
+    strict.__enter__()
+    request.addfinalizer(lambda: strict.__exit__(None, None, None))
     gen = torch.Generator(device = "cuda").manual_seed(0)
     self_attn = _attn(4, 2)
     q = torch.randn(1, 4, q_len, 64, device = "cuda", dtype = torch.bfloat16, generator = gen)
