@@ -2352,6 +2352,28 @@ def test_block_swap_gives_no_credit_for_a_storage_a_buffer_still_views(monkeypat
         BlockSwap(blocks, 6, device = "cuda")
 
 
+def test_block_swap_gives_no_credit_for_a_storage_the_inferred_owner_still_views(monkeypatch):
+    # The usual call, BlockSwap(find_decoder_layers(model), ...): an alias held by the model outside the decoder
+    # list keeps the storage alive, so it must be found through the remembered owner, not only the layers.
+    import sys, os, weakref, pytest
+    if not torch.cuda.is_available() or os.name == "nt" or not _mod._can_register():
+        pytest.skip("needs CUDA")
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)])
+    blocks[:2].cuda()
+    owner = nn.Module()
+    owner.layers = blocks
+    for i, b in enumerate(blocks[2:]):
+        b.lora.data = b.lora.data.cpu()
+        owner.register_buffer(f"alias_w{i}", b.w.weight.data.view(-1), persistent = False)
+        owner.register_buffer(f"alias_c{i}", b.c.weight.data.view(-1), persistent = False)
+    monkeypatch.setitem(_mod._LAYER_OWNERS, blocks, weakref.ref(owner))
+    need = sum(p.numel() * p.element_size() for b in blocks[2:] for p in b.parameters())
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(need // 2))
+    with pytest.raises(ValueError, match = "offload_layers asked for 6 layers"):
+        BlockSwap(blocks, 6, device = "cuda")
+
+
 def test_remove_drops_the_reserve_references():
     fake = types.SimpleNamespace(handles = [], free = {}, blocks = [], _chunks = [], streams = {},
                                  _reserve_layers = nn.ModuleList([nn.Linear(2, 2)]), _reserve_owner = object())

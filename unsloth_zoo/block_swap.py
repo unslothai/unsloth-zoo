@@ -577,8 +577,17 @@ class BlockSwap:
                     users.setdefault(st.data_ptr(), set()).add(li)
         swapped_ids = {id(p) for layer in swapped for _, p in _swappable(layer)}
         # Buffers too: a registered buffer viewing a weight's storage keeps it alive after the weight is rebound.
-        if model is not None:
-            everything = itertools.chain(model.parameters(), model.buffers())
+        # The whole model when it is known, passed or inferred from find_decoder_layers: an alias outside the
+        # decoder list (a tied head, a model-level buffer) keeps the storage alive just the same.
+        owner = model
+        if owner is None:
+            try:
+                owner = _LAYER_OWNERS.get(layers)
+            except TypeError:  # a plain list of layers
+                owner = None
+            owner = owner() if owner is not None else None
+        if owner is not None:
+            everything = itertools.chain(owner.parameters(), owner.buffers())
         else:
             everything = (q for layer in layers for q in itertools.chain(layer.parameters(), layer.buffers()))
         for q in everything:
@@ -625,13 +634,6 @@ class BlockSwap:
 
         # Evict before building the pool (originals + pool would OOM); roll back on any failure.
         try:
-            owner = model
-            if owner is None:
-                try:
-                    owner = _LAYER_OWNERS.get(layers)
-                except TypeError:  # a plain list of layers
-                    owner = None
-                owner = owner() if owner is not None else None
             if self._auto:
                 self._reserve_owner = weakref.ref(owner) if owner is not None else None
                 self._reserve_layers = layers
