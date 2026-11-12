@@ -1672,3 +1672,67 @@ def test_auto_swap_indices_does_not_count_a_host_kept_table():
     # Same signature as its neighbours, so it shares their pool.
     idx, left = auto_swap_indices(layers, 2 * layer, 1, free_bytes = {dev: 0})
     assert idx == [1, 3, 5, 7] and left == 0
+
+
+class _FrozenInputHead(nn.Module):
+    """First swapped layer gets an input that needs no grad (no checkpointing): its release is deferred to the
+    end of backward, after the output hook already queued the step end."""
+
+    def __init__(self, d, n):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([_XBlock(d) for _ in range(n)])
+
+    def forward(self, x):
+        h = x
+        for layer in self.model.layers:
+            h = layer(h, x)
+        return types.SimpleNamespace(loss = h.square().mean(), logits = h)
+
+
+def test_auto_depth_ends_each_step_once_with_a_deferred_first_release():
+    import pytest
+    if not torch.cuda.is_available():
+        pytest.skip("BlockSwap needs a CUDA device")
+    torch.manual_seed(0)
+    model = _FrozenInputHead(64, 4).cuda()
+    sw = BlockSwap(find_decoder_layers(model), [0, 1], prefetch_depth = "auto", device = "cuda")
+    for step in range(3):
+        x = torch.randn(8, 64, device = "cuda")   # requires_grad = False
+        model(x).loss.backward()
+        assert sw._steps == step + 1, (step, sw._steps)
+    sw.remove()
+
+
+def test_auto_depth_skips_peaks_for_a_block_without_swappable_weights():
+    import pytest
+    if not torch.cuda.is_available():
+        pytest.skip("BlockSwap needs a CUDA device")
+    torch.manual_seed(0)
+    model = _FrozenInputHead(64, 4).cuda()
+    model.model.layers[1].requires_grad_(True)   # entirely trainable: nothing to swap, no home card
+    sw = BlockSwap(find_decoder_layers(model), [0, 1], prefetch_depth = "auto", device = "cuda")
+    assert sw.blocks[1].home is None
+    x = torch.randn(8, 64, device = "cuda", requires_grad = True)
+    model(x).loss.backward()
+    assert sw._steps == 1
+    sw.remove()
+
+
+def test_chunked_pack_credits_host_loaded_originals(monkeypatch):
+    import sys, pytest
+    if not torch.cuda.is_available():
+        pytest.skip("BlockSwap needs a CUDA device")
+    # The chunked fallback releases each original right after packing its block: on top of the host-loaded
+    # originals it holds one chunk and one block, not a second copy of everything.
+    monkeypatch.setenv("UNSLOTH_DISABLE_PINNED_MEMORY", "1")
+    monkeypatch.setattr(_mod, "_can_register", lambda: False)
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)])
+    blocks[:2].cuda(); blocks[2:].cpu()
+    block = sum(p.numel() * p.element_size() for p in blocks[2].parameters() if not p.requires_grad)
+    need = block * 6
+    monkeypatch.setattr(_mod, "_CHUNK_BYTES", block)
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    # Room for the chunk + one block + allocator rounding, far less than a second copy of all six.
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(4 * block))
+    BlockSwap(blocks, 6, device = "cuda").remove()
