@@ -660,10 +660,12 @@ class UnslothEagle3Trainer(Trainer):
                 pad = getattr(tokenizer, "eos_token_id", 0) or 0
             kwargs["data_collator"] = MTPDataCollator(pad)
         kwargs["data_collator"] = _SupervisedRowLabels(kwargs["data_collator"])
-        model._unsloth_num_items_labels = "shifted"
         super().__init__(model = model, args = args, **kwargs)
         # compute_loss normalizes by num_items_in_batch itself, so the Trainer must not also divide by GA.
         self.model_accepts_loss_kwargs = True
+        # After init: unsloth's Trainer.__init__ wrapper clears this marker. Without it the batch counter
+        # does not recognise the drafter and GA averages per-microbatch means.
+        model._unsloth_num_items_labels = "shifted"
         self._eagle3_log = []
 
     def compute_loss(self, model, inputs, return_outputs = False, num_items_in_batch = None):
@@ -684,7 +686,8 @@ class UnslothEagle3Trainer(Trainer):
             loss_mask = loss_mask & attention_mask[:, 1:].bool()
         normalizer = None
         if num_items_in_batch is not None:
-            normalizer = torch.as_tensor(num_items_in_batch, device = loss_mask.device, dtype = torch.float32).clamp(min = 1)
+            # DataParallel hands one copy per GPU.
+            normalizer = torch.as_tensor(num_items_in_batch, device = loss_mask.device, dtype = torch.float32).reshape(-1)[0].clamp(min = 1)
         loss_kwargs = dict(final_hidden = captured["final"][:, 1:], lm_head_weight = self._lm_head_weight,
                            loss_mask = loss_mask, decay = self.args.eagle3_step_decay, normalizer = normalizer,
                            teacher_logit_softcap = self._teacher_logit_softcap)
@@ -694,9 +697,10 @@ class UnslothEagle3Trainer(Trainer):
             loss, stats = eagle3_chunked_loss(drafter, step_hidden, **loss_kwargs)
         else:
             loss, stats = model(aux, input_ids, attention_mask, self.args.eagle3_ttt_steps, loss_kwargs = loss_kwargs)
+            # Not under DataParallel: its loss is already over the gathered batch, with no per-replica mean to undo.
+            loss = loss * token_average_scale(self, num_items_in_batch)
         if model.training:
             self._eagle3_log.append(stats)
-        loss = loss * token_average_scale(self, num_items_in_batch)
         return (loss, None) if return_outputs else loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys = None):
