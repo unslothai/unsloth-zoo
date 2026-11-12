@@ -2144,3 +2144,38 @@ def test_install_packing_lowers_the_published_reservation_as_it_goes(monkeypatch
     for packed in (_GiB, 4 * _GiB, 8 * _GiB):
         _mod.BlockSwap._publish_packed(fake, packed, 8 * _GiB)
     assert published == [7 * _GiB, 4 * _GiB, 0]
+
+
+def test_host_fit_waits_for_a_peer_that_is_mid_copy(monkeypatch, tmp_path):
+    # Rank 1 has copied 4 of its 8 GiB (free RAM already shows it) but has not lowered its reservation yet.
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setattr(_mod.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    monkeypatch.setenv("MASTER_PORT", "29512")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(_mod, "_HOST_SESSION", 0)
+    monkeypatch.setattr(_mod, "_PEER_RETRY_S", 0.0)
+    _mod._begin_host_session()
+    ledger = _mod._rank_ledger()
+    peer = tmp_path / os.path.basename(ledger[0]) / "1"
+    peer.write_text(f"{_mod._HOST_SESSION} {8 * _GiB}")
+    monkeypatch.setattr(_mod, "_host_memory", lambda: (64 * _GiB, 12 * _GiB))
+    sleeps = []
+
+    def progress(_):
+        sleeps.append(1)
+        peer.write_text(f"{_mod._HOST_SESSION} {4 * _GiB}")   # the peer publishes its progress
+    monkeypatch.setattr(_mod.time, "sleep", progress)
+    _mod._check_host_fit([_GiB] * 8)
+    assert sleeps
+
+
+def test_an_early_stopped_recompute_keeps_its_wait_sample():
+    class Ev:
+        def __init__(self, t): self.t = t
+        def query(self): return True
+        def elapsed_time(self, other): return other.t - self.t
+    fake = types.SimpleNamespace(_tot = {"stall_ms": 0.0, "compute_ms": 0.0, "layers": 0})
+    block = types.SimpleNamespace(marks = (Ev(0.0), Ev(3.0), Ev(9.0)), mark_open = 1)
+    _mod.BlockSwap._harvest_marks(fake, block)
+    assert fake._tot["stall_ms"] == 3.0 and block.mark_open == 0

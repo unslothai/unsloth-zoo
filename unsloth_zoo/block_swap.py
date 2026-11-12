@@ -28,6 +28,7 @@ import functools
 import gc
 import importlib
 import tempfile
+import time
 import weakref
 
 __all__ = [
@@ -121,6 +122,9 @@ def _pin_budget():
         return 0
 
 
+# Re-reads of free RAM and the peers' reservations before refusing, while a peer may be mid-copy.
+_PEER_RETRIES = 8
+_PEER_RETRY_S = 0.25
 # Host RAM sessions (a load into host RAM, a BlockSwap install): local ranks run the same sequence of them.
 _HOST_SESSION = 0
 
@@ -205,6 +209,18 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
     else:
         # Ranks that finished already took their bytes out of `free`; only the others' remaining bytes are held back.
         avail = free - others + on_host
+    # A peer that is copying a layer has already taken those bytes out of `free` but lowers its reservation
+    # only once the layer is in: give in-flight peers a moment before refusing.
+    retries = _PEER_RETRIES if others else 0
+    while need > avail and retries > 0:
+        retries -= 1
+        time.sleep(_PEER_RETRY_S)
+        try:
+            total, free = _host_free()
+        except Exception:
+            return None
+        others = _others_host_pending(own)
+        avail = free - (others or 0) + on_host
     if need <= avail:
         _publish_host_pending(own)
         return own
@@ -966,6 +982,9 @@ class BlockSwap:
             self._tot["stall_ms"] += max(0.0, b.marks[0].elapsed_time(b.marks[1]))
             self._tot["compute_ms"] += max(0.0, b.marks[1].elapsed_time(b.marks[2]))
             self._tot["layers"] += 1
+        elif b.mark_open == 1 and b.marks[1].query():
+            # The forward hook never ran (a checkpoint recompute that stopped early): the wait still happened.
+            self._tot["stall_ms"] += max(0.0, b.marks[0].elapsed_time(b.marks[1]))
         b.mark_open = 0
 
     def _harvest(self):
