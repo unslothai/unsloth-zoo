@@ -130,7 +130,7 @@ def test_verify_moe_qwen4_refuses_strided_native_router():
     with fusion.inference_scopes(block):
         experts = block._unsloth_moe_routed
         assert fusion._plain_moe_plan(block, experts, 3) is None
-        _equal(experts.verify(block, x, lambda: reference), reference)
+        assert experts.verify(block, x, lambda: reference) is None  # the caller's routed path takes it
 
 
 @pytest.mark.parametrize("method,where", [(m, w) for m in ("_linear", "_linears", "_switch_glu") for w in ("instance", "class")]
@@ -380,10 +380,13 @@ def test_plain_moe_qwen4_failed_actual_verdict_stays_native(monkeypatch, failure
         ready.clear()
         experts = block._unsloth_moe_routed
         call = lambda: experts.verify(block, x, lambda: reference) if rows > 1 else block(x)
-        _equal(call(), reference)
+        def check():  # an unplanned verify block returns None: the caller's routed path takes it
+            out = call()
+            assert out is None if failure == "plan" and rows > 1 else _equal(out, reference) is None
+        check()
         plan = experts.verify_plans[rows] if rows > 1 else experts.plain_plan
         assert (plan is None if failure == "plan" else plan.verdict is False)
-        _equal(call(), reference)
+        check()
 
 
 def test_plain_moe_keeps_qwen35_on_its_existing_route():

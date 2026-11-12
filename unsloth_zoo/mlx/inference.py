@@ -5111,7 +5111,7 @@ class _PlainMoE:
         self.bindings += tuple(
             (p, name, tensor) for p in self.projections for name, tensor in zip(("weight", "scales", "biases"), _projection_tensors(p)))
         self.bindings += ((self.mlp if "activation" in self.mlp else vars(self.mlp), "activation", self.mlp.activation),)
-        self.bindings += tuple((vars(block), name, getattr(block, name)) for name in ("top_k", "num_experts", "norm_topk_prob"))
+        self.bindings += tuple((vars(block), name, vars(block).get(name)) for name in ("top_k", "num_experts", "norm_topk_prob"))
         self.bindings += tuple((p, "bias", None) for p in (*self.projections, self.router))
         for projection in (*self.projections, self.router):
             self.bindings += tuple((vars(projection), name, getattr(projection, name)) for name in ("bits", "group_size", "mode"))
@@ -5222,7 +5222,7 @@ class _PlainMoE:
 def _plain_moe_plan(block, experts, rows = 1):
     if (os.environ.get("UNSLOTH_MLX_PLAIN_MOE", "1") == "0" or _plain_moe_kernels() is None
             or getattr(type(block), "_unsloth_router_native", type(block)).__module__ != "mlx_vlm.models.qwen4_exp.language"
-            or block.top_k != 10 or block.num_experts != 512 or not block.norm_topk_prob):
+            or block.top_k != 10 or block.num_experts != 512 or not getattr(block, "norm_topk_prob", True)):  # < 0.7.8 always normalizes
         return None
     language = sys.modules["mlx_vlm.models.qwen4_exp.language"]
     native = getattr(type(block), "_unsloth_router_native", type(block))
@@ -5344,7 +5344,7 @@ class _RoutedExperts:
                 self.verify_plans[rows] = None
         plan = self.verify_plans[rows]
         if plan is None:
-            return native()
+            return None  # main's admitted routed path
         output = plan(block, x, native)
         return native() if output is None else output
 

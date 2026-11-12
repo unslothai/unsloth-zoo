@@ -1601,6 +1601,29 @@ def test_the_fused_gated_delta_step_refuses_a_cache_overriding_its_updates(monke
         delattr(cache, name)
 
 
+def test_a_qwen4_moe_block_without_norm_topk_prob_reaches_the_plan(monkeypatch):
+    inference = pytest.importorskip("unsloth_zoo.mlx.inference")
+    pytest.importorskip("mlx_vlm.models.qwen4_exp.language")
+    reached = []
+    monkeypatch.setattr(inference, "_plain_moe_kernels", lambda: object())
+    monkeypatch.setattr(inference, "_moe_router_class", lambda native: reached.append(native))
+    Block = type("Qwen4ExpSparseMoeBlock", (), {"__module__": "mlx_vlm.models.qwen4_exp.language"})
+    block = Block()  # mlx-vlm < 0.7.8 sets no norm_topk_prob and always normalizes
+    block.top_k, block.num_experts, block.shared_expert = 10, 512, object()
+    assert inference._plain_moe_plan(block, None) is None and reached == [Block]
+    block.norm_topk_prob = False
+    assert inference._plain_moe_plan(block, None) is None and reached == [Block]
+
+
+def test_an_unplanned_verify_block_leaves_the_routed_path_to_its_caller():
+    inference = pytest.importorskip("unsloth_zoo.mlx.inference")
+    mx = pytest.importorskip("mlx.core")
+    experts, called = object.__new__(inference._RoutedExperts), []
+    experts.verify_plans = {3: None}
+    block = types.SimpleNamespace(training = False)
+    assert experts.verify(block, mx.zeros((1, 3, 8)), lambda: called.append(1)) is None and called == []
+
+
 def test_verifier_code_names_hold_without_co_qualname():
     inference = pytest.importorskip("unsloth_zoo.mlx.inference")
     assert inference._code_name(types.SimpleNamespace(co_name = "f")) == "f"
