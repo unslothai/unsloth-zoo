@@ -488,12 +488,6 @@ class BlockSwap:
         self.spans_devices, self.layer_device = False, None
         if not self.indices:
             return
-        if device is None:
-            device = torch.device("cuda", torch.cuda.current_device())
-        self.device = torch.device(device)
-        if self.device.type == "cuda" and self.device.index is None:
-            # One canonical key: params report cuda:N, so a bare "cuda" would split peaks and homes in two.
-            self.device = torch.device("cuda", torch.cuda.current_device())
         swapped = [layers[i] for i in self.indices]
         # A param shared by two layers stays on the card: evicting it under one empties it for the other.
         owners = {}
@@ -511,6 +505,13 @@ class BlockSwap:
                     "so the model did not fit on the GPU at load and accelerate offloaded it to CPU or disk. "
                     "Pass offload_layers to from_pretrained instead, so those layers load straight to host memory."
                 )
+        # After the meta check, which must refuse before any CUDA call.
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            # One canonical key: params report cuda:N, so a bare "cuda" would split peaks and homes in two.
+            self.device = torch.device("cuda", torch.cuda.current_device())
         self.blocks = [_Block(layer, self.streams, self.device, shared) for layer in swapped]
         sizes = [b.nbytes() for b in self.blocks]
         # Every card a block's frozen weights land on gets slots: its peaks are sampled and its growth judged too,
