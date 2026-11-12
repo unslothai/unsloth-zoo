@@ -2276,3 +2276,27 @@ def test_a_peer_still_loading_keeps_its_published_reservation(monkeypatch, tmp_p
     assert _mod._others_host_pending(4 * _GiB) == 12 * _GiB
     (tmp_path / os.path.basename(ledger[0]) / "1").write_text("1 0")              # peer done with that session
     assert _mod._others_host_pending(4 * _GiB) == 4 * _GiB
+
+
+def test_block_swap_gives_no_credit_for_a_storage_a_buffer_still_views(monkeypatch):
+    import sys, os, pytest
+    if not torch.cuda.is_available() or os.name == "nt" or not _mod._can_register():
+        pytest.skip("needs CUDA")
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)])
+    blocks[:2].cuda()
+    for b in blocks[2:]:
+        b.lora.data = b.lora.data.cpu()
+        b.register_buffer("alias", b.w.weight.data.view(-1), persistent = False)   # keeps w's storage alive
+        b.register_buffer("alias_c", b.c.weight.data.view(-1), persistent = False)
+    need = sum(p.numel() * p.element_size() for b in blocks[2:] for p in b.parameters())
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(need // 2))
+    with pytest.raises(ValueError, match = "offload_layers asked for 6 layers"):
+        BlockSwap(blocks, 6, device = "cuda")
+
+
+def test_remove_drops_the_reserve_references():
+    fake = types.SimpleNamespace(handles = [], free = {}, blocks = [], _chunks = [], streams = {},
+                                 _reserve_layers = nn.ModuleList([nn.Linear(2, 2)]), _reserve_owner = object())
+    _mod.BlockSwap.remove(fake)
+    assert fake._reserve_layers == () and fake._reserve_owner is None

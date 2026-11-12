@@ -27,6 +27,7 @@ from contextlib import contextmanager, nullcontext
 import functools
 import gc
 import importlib
+import itertools
 import tempfile
 import time
 import weakref
@@ -575,7 +576,11 @@ class BlockSwap:
                     host_storages[st.data_ptr()] = st.nbytes()
                     users.setdefault(st.data_ptr(), set()).add(li)
         swapped_ids = {id(p) for layer in swapped for _, p in _swappable(layer)}
-        everything = model.parameters() if model is not None else (q for layer in layers for q in layer.parameters())
+        # Buffers too: a registered buffer viewing a weight's storage keeps it alive after the weight is rebound.
+        if model is not None:
+            everything = itertools.chain(model.parameters(), model.buffers())
+        else:
+            everything = (q for layer in layers for q in itertools.chain(layer.parameters(), layer.buffers()))
         for q in everything:
             if q.device.type == "cpu" and id(q) not in swapped_ids:
                 ptr = q.data.untyped_storage().data_ptr()
@@ -970,6 +975,8 @@ class BlockSwap:
         # Callers holding this object (the fast decode loop) must see a no-op, not an empty pool.
         self.blocks = []
         self._chunks = []
+        # A removed controller must not keep the model's layers (and their restored GPU weights) alive.
+        self._reserve_layers, self._reserve_owner = (), None
         for dev in self.streams:
             torch.cuda.synchronize(dev)
 
