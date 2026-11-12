@@ -14,9 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""requires_grad_for_gradient_checkpointing must leave the RemovableHandle of every hook it keeps working:
-handle.remove() has to stop the hook, not silently do nothing."""
-
 import torch
 
 from unsloth_zoo.peft_utils import requires_grad_for_gradient_checkpointing
