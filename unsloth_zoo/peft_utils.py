@@ -377,6 +377,14 @@ def get_peft_regex(
         qwen4_cores += [r"\bhyper_connection_mixer\." + re.escape(x)
                         for x in _scoped(["input_mix_weight_down", "input_mix_weight_up"])]
         candidate_branches += _linear_aware_branches(qwen4_cores)
+    # DeepSeek-V4.1 (community port): the engram's wkv (layers.N.engram.wkv) has no attention / mlp ancestor; it is the
+    # memory branch's input projection, so it follows the language + mlp flags.
+    _dsv41_engram = [
+        name + ".wkv" for name, module in model.named_modules()
+        if type(module).__name__ == "DeepseekV41Engram"
+    ]
+    if _dsv41_engram and finetune_language_layers and finetune_mlp_modules and _scoped(["wkv"]):
+        candidate_branches.append(r"(?:.*?\.engram\.wkv)")
     # _linear_aware_branches already emits only real Linear matches; this re-filter is for safety and mirrors PEFT's own re.fullmatch matcher exactly.
     extra_branches = [
         branch for branch in candidate_branches
@@ -446,7 +454,23 @@ def get_peft_regex(
                 f"{indexers[0]}; the integer top-k sends them no gradient, so these adapters will not train."
             )
             indexers = []
-    excluded = placeholders + router_gates + indexers
+    # DeepSeek-V4.1's CSA indexer only picks integer top-k entries: the LM loss never reaches it, so an adapter there
+    # never trains. Only an explicit target_modules list selects it.
+    indexer_prefixes = tuple(
+        name + "." for name, module in model.named_modules()
+        if type(module).__name__ == "DeepseekV41Indexer"
+    ) if target_modules is None else ()
+    indexer_linears = [
+        name for name in linear_modules
+        if indexer_prefixes and name.startswith(indexer_prefixes)
+        and re.fullmatch(regex_matcher, name, flags = re.DOTALL)
+    ]
+    if indexer_linears:
+        logger.info(
+            f"Unsloth: leaving {len(indexer_linears)} DeepSeek-V4.1 sparse indexer projection(s) out of the LoRA "
+            f"targets, e.g. {indexer_linears[0]}: its top-k selection gets no gradient from the LM loss."
+        )
+    excluded = placeholders + router_gates + indexers + indexer_linears
     if excluded:
         regex_matcher = (
             r"(?!(?:" + "|".join(re.escape(x) for x in excluded) + r")$)(?:" + regex_matcher + r")"

@@ -270,6 +270,9 @@ DISABLE_COMPILE_MODEL_FUNCTIONS = {
         "_validate_attention_tp_divisibility",
         # QAT STE autograd.Function: Dynamo raises InternalTorchDynamoError the fallback does not catch.
         "_quantize_qat",
+        # Later port heads: block fake-quant (float8 casts, int32 bit tricks), straight-through in training.
+        "_fake_quant_fp8_block",
+        "_fake_quant_fp4_block",
     ],
 }
 
