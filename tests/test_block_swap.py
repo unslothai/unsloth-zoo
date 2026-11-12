@@ -1606,6 +1606,37 @@ def test_auto_depth_ends_the_step_from_the_loss_when_logits_are_not_in_the_graph
     sw.remove()
 
 
+def test_auto_depth_ends_the_step_from_the_loss_when_the_logits_are_a_side_branch():
+    import types
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    torch.manual_seed(0)
+
+    class ReturnLogits(nn.Module):
+        # Fused cross entropy with UNSLOTH_RETURN_LOGITS=1: the logits carry a grad_fn but are not the loss's
+        # ancestors, so backward from the loss never reaches their node.
+        def __init__(self, layers):
+            super().__init__()
+            self.layers, self.head = layers, nn.Linear(256, 512).cuda()
+
+        def forward(self, h):
+            for layer in self.layers:
+                h = layer(h)
+            return types.SimpleNamespace(loss = h.square().mean(), logits = self.head(h))
+
+    layers = nn.ModuleList([nn.Linear(256, 256) for _ in range(4)]).cuda()
+    for layer in layers:
+        layer.weight.requires_grad_(False)
+    model = ReturnLogits(layers)
+    sw = BlockSwap(layers, [0, 1, 2, 3], prefetch_depth = "auto", device = "cuda", model = model)
+    for _ in range(2):
+        out = model(torch.randn(64, 256, device = "cuda"))
+        assert out.logits.grad_fn is not None
+        out.loss.backward()
+    assert sw._steps == 2, sw._steps
+    sw.remove()
+
+
 def test_auto_depth_counts_one_step_per_backward_under_reentrant_checkpointing():
     if not torch.cuda.is_available():
         __import__("pytest").skip("needs CUDA")
@@ -2140,10 +2171,36 @@ def test_storage_ratio_ignores_a_shared_weight_the_layer_loaded_first():
 def test_install_packing_lowers_the_published_reservation_as_it_goes(monkeypatch):
     published = []
     monkeypatch.setattr(_mod, "_publish_host_pending", lambda n: published.append(n))
-    fake = types.SimpleNamespace(_host_own = 8 * _GiB)
+    fake = types.SimpleNamespace(_host_own = 8 * _GiB, _host_need = 8 * _GiB, _host_on_host = 0)
     for packed in (_GiB, 4 * _GiB, 8 * _GiB):
-        _mod.BlockSwap._publish_packed(fake, packed, 8 * _GiB)
+        _mod.BlockSwap._publish_packed(fake, packed, 0)
     assert published == [7 * _GiB, 4 * _GiB, 0]
+
+
+def test_packing_the_cpu_prefix_first_keeps_the_gpu_blocks_reserved(monkeypatch):
+    # Ten 1 GiB blocks, the first five already on the CPU: 5 GiB loaded, 2 GiB headroom, so 3 GiB of credit and a
+    # 7 GiB reservation. Once the CPU five are packed their credit is spent, and the five GPU blocks still need 5 GiB.
+    published = []
+    monkeypatch.setattr(_mod, "_publish_host_pending", lambda n: published.append(n))
+    fake = types.SimpleNamespace(_host_own = 7 * _GiB, _host_need = 10 * _GiB, _host_on_host = 3 * _GiB,
+                                 _host_credit = [_GiB] * 5 + [0] * 5)
+    fake._credit_of = types.MethodType(_mod.BlockSwap._credit_of, fake)
+    released = 0
+    for k in range(10):
+        released += fake._credit_of(k)
+        _mod.BlockSwap._publish_packed(fake, (k + 1) * _GiB, released)
+    assert published[0] <= 7 * _GiB
+    assert published[4] == 5 * _GiB                  # not 3.5 GiB: the GPU half is all still to come
+    assert published[-1] == 0
+    assert all(a >= b for a, b in zip(published, published[1:]))
+    # GPU blocks first: their 5 GiB come out of the 3 GiB credit the CPU blocks will give back later.
+    published.clear()
+    fake._host_credit = [0] * 5 + [_GiB] * 5
+    released = 0
+    for k in range(10):
+        released += fake._credit_of(k)
+        _mod.BlockSwap._publish_packed(fake, (k + 1) * _GiB, released)
+    assert published[4] == 2 * _GiB and published[-1] == 0
 
 
 def test_host_fit_waits_for_a_peer_that_is_mid_copy(monkeypatch, tmp_path):

@@ -590,6 +590,11 @@ class BlockSwap:
         # A file-backed (mmap) storage is page cache that available RAM already counts: no extra headroom.
         file_backed = _file_backed_ranges()
         host_loaded = sum(n for ptr, n in host_storages.items() if not _in_ranges(ptr, file_backed))
+        # Per block, the credited bytes its packing gives back: the ledger tracks what is still to come from that.
+        self._host_credit = [0] * len(swapped)
+        for ptr, n in host_storages.items():
+            if not _in_ranges(ptr, file_backed):
+                self._host_credit[next(iter(users[ptr]))] += n
         on_host = 0
         if _can_register():
             if os.name != "nt":
@@ -599,9 +604,10 @@ class BlockSwap:
                                                      default = 0)))
             on_host = max(0, host_loaded - chunk - max(sizes, default = 0))
         # The chunked fallback rounds chunks up to powers of two: up to twice the packed bytes.
+        slack = 0 if _can_register() else _chunked_bytes([b.sizes for b in self.blocks]) - sum(sizes)
+        self._host_need, self._host_on_host = sum(sizes) + slack, on_host
         try:
-            self._host_own = _check_host_fit(sizes, on_host = on_host,
-                            slack = 0 if _can_register() else _chunked_bytes([b.sizes for b in self.blocks]) - sum(sizes))
+            self._host_own = _check_host_fit(sizes, on_host = on_host, slack = slack)
         except Exception:
             _end_host_session()
             raise
@@ -685,8 +691,8 @@ class BlockSwap:
         chunk = max(_CHUNK_BYTES, _pow2_ceil(max(max(b.sizes.values(), default = 0) for b in self.blocks)))
         budget = _pin_budget()
         buf, used = None, 0
-        total, packed = left, 0
-        for b in self.blocks:
+        packed, released = 0, 0
+        for k, b in enumerate(self.blocks):
             regions = {}
             for d, need in b.sizes.items():
                 if buf is None or used + need > buf.numel():
@@ -700,13 +706,22 @@ class BlockSwap:
             b.pack(regions)
             self._release(b)
             packed += b.nbytes()
-            self._publish_packed(packed, total)
+            released += self._credit_of(k)
+            self._publish_packed(packed, released)
 
-    def _publish_packed(self, packed, total):
-        # Packed blocks are in host RAM now: other local ranks hold back only what this install still has to commit.
+    def _credit_of(self, k):
+        credit = getattr(self, "_host_credit", None)
+        return credit[k] if credit is not None and k < len(credit) else 0
+
+    def _publish_packed(self, packed, released):
+        # Packed blocks are in host RAM now: other local ranks hold back only what this install still has to commit,
+        # which is the bytes still to pack less the credit still to be released, not a share of the first estimate
+        # (packing the CPU-resident blocks first uses up their credit while every GPU block is still to come).
         own = getattr(self, "_host_own", None)
-        if own is not None and total > 0:
-            _publish_host_pending(max(0, own - own * packed // total))
+        if own is None:
+            return
+        credit_left = max(0, self._host_on_host - released)
+        _publish_host_pending(min(own, max(0, self._host_need - packed - credit_left)))
 
     def _pack_registered(self):
         # One exact-size pageable arena, page-locked in place up to the budget (cudaHostRegister).
@@ -715,8 +730,8 @@ class BlockSwap:
             return False
         total = sum(b.nbytes() for b in self.blocks)
         arena = _lazy_host_empty(total)
-        used, ends = 0, []
-        for b in self.blocks:
+        used, ends, released = 0, [], 0
+        for k, b in enumerate(self.blocks):
             regions = {}
             for d, need in b.sizes.items():
                 regions[d] = arena[used:used + need]
@@ -724,7 +739,8 @@ class BlockSwap:
             b.pack(regions)
             self._release(b)
             ends.append(used)
-            self._publish_packed(used, total)
+            released += self._credit_of(k)
+            self._publish_packed(used, released)
         # Pin whole blocks only: a copy from half-pinned memory is staged synchronously.
         budget = _pin_budget()
         pin = max([e for e in ends if e <= budget], default = 0)
@@ -1096,16 +1112,18 @@ class BlockSwap:
         # When the output's grad lands, the op that consumed the output (the loss) has just held the output,
         # its grad and a temporary of the same size; only the grad is still allocated. A node hook, not a
         # tensor hook: callers keep only the loss, and a tensor hook dies with the dropped output.
-        dev, size = (out.device, out.nbytes) if node is not None else (None, 0)
-        if node is None:
-            # Fused cross entropy (Unsloth's) keeps the logits out of the graph; the loss still opens the backward.
-            loss = getattr(output, "loss", None)
-            if loss is None and isinstance(output, (tuple, list)) and output and isinstance(output[0], torch.Tensor):
-                loss = output[0] if output[0].numel() == 1 else None
-            node = getattr(loss, "grad_fn", None) if isinstance(loss, torch.Tensor) else None
-        if node is not None:
+        hooks = [(node, out.device, out.nbytes)] if node is not None else []
+        # The loss too: fused cross entropy (Unsloth's) computes it from the hidden states, so returned logits
+        # (UNSLOTH_RETURN_LOGITS=1) need not be its ancestors and backward from the loss never reaches them.
+        loss = getattr(output, "loss", None)
+        if loss is None and isinstance(output, (tuple, list)) and output and isinstance(output[0], torch.Tensor):
+            loss = output[0] if output[0].numel() == 1 else None
+        loss_node = getattr(loss, "grad_fn", None) if isinstance(loss, torch.Tensor) else None
+        if loss_node is not None and loss_node is not node:
+            hooks.append((loss_node, None, 0))
+        for node, dev, size in hooks:
 
-            def grad_peak(*_):
+            def grad_peak(*_, dev = dev, size = size):
                 if self._auto and not self._settled:
                     for dv in homes:
                         self._note_peak(dv, extra = 2 * size if dev is not None and _cuda_index(dv) == _cuda_index(dev)
