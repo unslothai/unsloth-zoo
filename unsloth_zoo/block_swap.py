@@ -296,11 +296,12 @@ def _can_register():
             and torch.cuda.is_available() and hasattr(torch.cuda.cudart(), "cudaHostRegister"))
 
 
-def _chunked_bytes(block_sizes):
-    """Host bytes _pack's chunked fallback allocates for blocks with these {device: bytes} sizes (same walk)."""
+def _chunked_commits(block_sizes):
+    """Host bytes _pack's chunked fallback has allocated once each block (of {device: bytes} sizes) is packed,
+    padding included (same walk)."""
     left = sum(sum(s.values()) for s in block_sizes)
     chunk = max(_CHUNK_BYTES, _pow2_ceil(max((max(s.values(), default = 0) for s in block_sizes), default = 0)))
-    total, cap, used = 0, None, 0
+    total, cap, used, out = 0, None, 0, []
     for sizes in block_sizes:
         for need in sizes.values():
             if cap is None or used + need > cap:
@@ -309,7 +310,33 @@ def _chunked_bytes(block_sizes):
                 used = 0
             used += need
             left -= need
-    return total
+        out.append(total)
+    return out
+
+
+class _HostWalk:
+    """Host RAM over install's packing walk. Block k's bytes are committed (`commits`, cumulative) before its
+    original's storage (`credits[k]`) is released, so the peak is the largest committed-through-k less
+    released-before-k, plus `margin` for release lag, and never above committing everything."""
+
+    def __init__(self, commits, credits, margin):
+        self.commits = list(commits)
+        self.released = [0] + list(itertools.accumulate(credits))[:len(self.commits)]
+        self.steps = [c - self.released[k] for k, c in enumerate(self.commits)]
+        self.margin = margin
+
+    def pending(self, k):
+        """Bytes still to come once blocks 0..k are packed and released (k = -1: before the first)."""
+        rest = self.steps[k + 1:]
+        if not rest:
+            return 0
+        now = self.commits[k] - self.released[k + 1] if k >= 0 else 0
+        return max(0, min(self.commits[-1], max(rest) + self.margin) - now)
+
+
+def _chunked_bytes(block_sizes):
+    """Host bytes _pack's chunked fallback allocates for blocks with these {device: bytes} sizes."""
+    return (_chunked_commits(block_sizes) or [0])[-1]
 
 
 _CHECKPOINT_FILE = os.path.join("torch", "utils", "checkpoint.py")
@@ -598,25 +625,30 @@ class BlockSwap:
         host_storages = {ptr: n for ptr, n in host_storages.items() if len(users[ptr]) == 1}
         # A file-backed (mmap) storage is page cache that available RAM already counts: no extra headroom.
         file_backed = _file_backed_ranges()
-        host_loaded = sum(n for ptr, n in host_storages.items() if not _in_ranges(ptr, file_backed))
         # Per block, the credited bytes its packing gives back: the ledger tracks what is still to come from that.
         self._host_credit = [0] * len(swapped)
         for ptr, n in host_storages.items():
             if not _in_ranges(ptr, file_backed):
                 self._host_credit[next(iter(users[ptr]))] += n
-        on_host = 0
-        if _can_register():
-            if os.name != "nt":
-                on_host = max(0, host_loaded - 2 * max(sizes, default = 0))
-        elif host_loaded:
-            chunk = max(_CHUNK_BYTES, _pow2_ceil(max((max(b.sizes.values(), default = 0) for b in self.blocks),
-                                                     default = 0)))
-            on_host = max(0, host_loaded - chunk - max(sizes, default = 0))
-        # The chunked fallback rounds chunks up to powers of two: up to twice the packed bytes.
-        slack = 0 if _can_register() else _chunked_bytes([b.sizes for b in self.blocks]) - sum(sizes)
-        self._host_need, self._host_on_host = sum(sizes) + slack, on_host
+        # Walk the packing order: block k's bytes are committed before its original is released, so the peak is
+        # the largest (committed through k) - (released before k), not the total less every credit (ten GPU blocks
+        # packed ahead of one CPU block whose storage is 10 GiB still commit all ten first).
+        if not _can_register():
+            # The chunked fallback commits whole chunks, rounded up to powers of two (padding included).
+            commits = _chunked_commits([b.sizes for b in self.blocks])
+        elif os.name == "nt":
+            # Windows commits the whole registered arena up front.
+            commits = [sum(sizes)] * len(sizes)
+        else:
+            # The Linux registered arena is pageable and fills block by block as it is written.
+            commits = list(itertools.accumulate(sizes))
+        # A block's worth of margin over the walk, for release lag; never above committing everything.
+        self._host_walk = _HostWalk(commits, self._host_credit, max(sizes, default = 0))
+        need = commits[-1] if commits else 0
+        peak = self._host_walk.pending(-1)
+        slack = need - sum(sizes)
         try:
-            self._host_own = _check_host_fit(sizes, on_host = on_host, slack = slack)
+            self._host_own = _check_host_fit(sizes, on_host = need - peak, slack = slack)
         except Exception:
             _end_host_session()
             raise
@@ -693,7 +725,6 @@ class BlockSwap:
         chunk = max(_CHUNK_BYTES, _pow2_ceil(max(max(b.sizes.values(), default = 0) for b in self.blocks)))
         budget = _pin_budget()
         buf, used = None, 0
-        packed, released = 0, 0
         for k, b in enumerate(self.blocks):
             regions = {}
             for d, need in b.sizes.items():
@@ -707,23 +738,16 @@ class BlockSwap:
                 left -= need
             b.pack(regions)
             self._release(b)
-            packed += b.nbytes()
-            released += self._credit_of(k)
-            self._publish_packed(packed, released)
+            self._publish_packed(k)
 
-    def _credit_of(self, k):
-        credit = getattr(self, "_host_credit", None)
-        return credit[k] if credit is not None and k < len(credit) else 0
-
-    def _publish_packed(self, packed, released):
-        # Packed blocks are in host RAM now: other local ranks hold back only what this install still has to commit,
-        # which is the bytes still to pack less the credit still to be released, not a share of the first estimate
-        # (packing the CPU-resident blocks first uses up their credit while every GPU block is still to come).
+    def _publish_packed(self, k):
+        # Blocks 0..k are packed and their originals released; free RAM already shows what that took. Other local
+        # ranks hold back only the rise still to come over this point of the walk install planned, chunk padding
+        # already committed included, not a share of the first estimate.
         own = getattr(self, "_host_own", None)
-        if own is None:
-            return
-        credit_left = max(0, self._host_on_host - released)
-        _publish_host_pending(min(own, max(0, self._host_need - packed - credit_left)))
+        walk = getattr(self, "_host_walk", None)
+        if own is not None and walk is not None:
+            _publish_host_pending(min(own, walk.pending(k)))
 
     def _pack_registered(self):
         # One exact-size pageable arena, page-locked in place up to the budget (cudaHostRegister).
@@ -732,7 +756,7 @@ class BlockSwap:
             return False
         total = sum(b.nbytes() for b in self.blocks)
         arena = _lazy_host_empty(total)
-        used, ends, released = 0, [], 0
+        used, ends = 0, []
         for k, b in enumerate(self.blocks):
             regions = {}
             for d, need in b.sizes.items():
@@ -741,8 +765,7 @@ class BlockSwap:
             b.pack(regions)
             self._release(b)
             ends.append(used)
-            released += self._credit_of(k)
-            self._publish_packed(used, released)
+            self._publish_packed(k)
         # Pin whole blocks only: a copy from half-pinned memory is staged synchronously.
         budget = _pin_budget()
         pin = max([e for e in ends if e <= budget], default = 0)

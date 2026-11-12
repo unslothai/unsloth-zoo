@@ -2168,39 +2168,40 @@ def test_storage_ratio_ignores_a_shared_weight_the_layer_loaded_first():
     assert state.ratios[1] == 1.0
 
 
-def test_install_packing_lowers_the_published_reservation_as_it_goes(monkeypatch):
-    published = []
-    monkeypatch.setattr(_mod, "_publish_host_pending", lambda n: published.append(n))
-    fake = types.SimpleNamespace(_host_own = 8 * _GiB, _host_need = 8 * _GiB, _host_on_host = 0)
-    for packed in (_GiB, 4 * _GiB, 8 * _GiB):
-        _mod.BlockSwap._publish_packed(fake, packed, 0)
-    assert published == [7 * _GiB, 4 * _GiB, 0]
+def test_install_packing_lowers_the_published_reservation_as_it_goes():
+    # Eight 1 GiB GPU blocks, nothing to release: the reservation falls by what each packed block committed.
+    walk = _mod._HostWalk([(k + 1) * _GiB for k in range(8)], [0] * 8, _GiB)
+    assert walk.pending(-1) == 8 * _GiB
+    assert [walk.pending(k) for k in (0, 3, 7)] == [7 * _GiB, 4 * _GiB, 0]
 
 
-def test_packing_the_cpu_prefix_first_keeps_the_gpu_blocks_reserved(monkeypatch):
-    # Ten 1 GiB blocks, the first five already on the CPU: 5 GiB loaded, 2 GiB headroom, so 3 GiB of credit and a
-    # 7 GiB reservation. Once the CPU five are packed their credit is spent, and the five GPU blocks still need 5 GiB.
-    published = []
-    monkeypatch.setattr(_mod, "_publish_host_pending", lambda n: published.append(n))
-    fake = types.SimpleNamespace(_host_own = 7 * _GiB, _host_need = 10 * _GiB, _host_on_host = 3 * _GiB,
-                                 _host_credit = [_GiB] * 5 + [0] * 5)
-    fake._credit_of = types.MethodType(_mod.BlockSwap._credit_of, fake)
-    released = 0
-    for k in range(10):
-        released += fake._credit_of(k)
-        _mod.BlockSwap._publish_packed(fake, (k + 1) * _GiB, released)
-    assert published[0] <= 7 * _GiB
-    assert published[4] == 5 * _GiB                  # not 3.5 GiB: the GPU half is all still to come
-    assert published[-1] == 0
-    assert all(a >= b for a, b in zip(published, published[1:]))
-    # GPU blocks first: their 5 GiB come out of the 3 GiB credit the CPU blocks will give back later.
-    published.clear()
-    fake._host_credit = [0] * 5 + [_GiB] * 5
-    released = 0
-    for k in range(10):
-        released += fake._credit_of(k)
-        _mod.BlockSwap._publish_packed(fake, (k + 1) * _GiB, released)
-    assert published[4] == 2 * _GiB and published[-1] == 0
+def test_packing_the_cpu_prefix_first_keeps_the_gpu_blocks_reserved():
+    # Ten 1 GiB blocks, the first five already on the CPU. Once the CPU five are packed (and their originals
+    # released), the five GPU blocks still need 5 GiB, not a prorated share of the first estimate.
+    walk = _mod._HostWalk([(k + 1) * _GiB for k in range(10)], [_GiB] * 5 + [0] * 5, _GiB)
+    pend = [walk.pending(k) for k in range(-1, 10)]
+    assert pend[5] == 5 * _GiB + _GiB and pend[-1] == 0     # the five GPU blocks plus one block of margin
+    assert all(a >= b for a, b in zip(pend, pend[1:]))
+    # GPU blocks first: five committed, then each CPU block's copy is held next to its original only until it is
+    # released, so the walk peaks at six blocks (plus the margin).
+    walk = _mod._HostWalk([(k + 1) * _GiB for k in range(10)], [0] * 5 + [_GiB] * 5, _GiB)
+    assert walk.pending(-1) == 7 * _GiB and walk.pending(4) == 2 * _GiB and walk.pending(9) == 0
+
+
+def test_a_large_storage_released_last_is_not_credited_up_front():
+    # Ten 1 GiB GPU blocks then a 1 GiB CPU view of a 10 GiB storage: packing commits 11 GiB before that storage
+    # goes, so the guard must plan for 11 GiB, not 11 - 10 + headroom.
+    walk = _mod._HostWalk([(k + 1) * _GiB for k in range(11)], [0] * 10 + [10 * _GiB], _GiB)
+    assert walk.pending(-1) == 11 * _GiB
+
+
+def test_committed_chunk_padding_is_not_reserved_again():
+    # 32 blocks of 3 GiB in 4 GiB chunks: 128 GiB in all. With half packed, 64 GiB is committed (padding
+    # included), so 64 GiB is still to come, not 128 - 48.
+    commits = _mod._chunked_commits([{"cuda": 3 * _GiB}] * 32)
+    assert commits[-1] == 128 * _GiB and commits[15] == 64 * _GiB
+    walk = _mod._HostWalk(commits, [0] * 32, 3 * _GiB)
+    assert walk.pending(15) == 64 * _GiB and walk.pending(31) == 0
 
 
 def test_host_fit_waits_for_a_peer_that_is_mid_copy(monkeypatch, tmp_path):
