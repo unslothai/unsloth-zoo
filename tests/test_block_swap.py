@@ -1849,3 +1849,42 @@ def test_cuda_index_of_cpu_and_bare_devices():
     assert _mod._cuda_index("cpu") is None
     if torch.cuda.is_available():
         assert _mod._cuda_index("cuda") == torch.cuda.current_device() == _mod._cuda_index(torch.device("cuda", torch.cuda.current_device()))
+
+
+def test_host_load_charges_a_param_shared_by_selected_layers_once():
+    shared = nn.Linear(64, 64, bias = False, device = "meta")
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.own = nn.Linear(8, 8, bias = False)
+            self.shared = shared
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.layers = nn.ModuleList([Layer() for _ in range(4)])
+
+    with torch.device("meta"):
+        m = Model()
+    state = _mod._HostLoad([0, 1, 2, 3], "tail")
+    state.bind(m)
+    own, big = 8 * 8 * 4, 64 * 64 * 4
+    assert state.shape_bytes == {0: own + big, 1: own, 2: own, 3: own}
+
+
+def test_pool_growth_counts_the_allocator_high_water_mark(monkeypatch):
+    import pytest
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
+    sw = BlockSwap(blocks, 6, prefetch_depth = "auto", device = "cuda")
+    k = torch.cuda.current_device()
+    sw._last_peak, sw._optimizer_reserve = {}, {}
+    total = torch.cuda.get_device_properties(k).total_memory
+    # A temporary inside a layer pushed the high-water mark to the whole card: no room left to grow.
+    sw._hwm_base = {k: 0}
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda dv = None: total)
+    assert sw._grow_pool() is False
+    sw.remove()

@@ -69,6 +69,9 @@ _AUTO_STEPS = 12
 # Steps judged per depth: a single step's copy timings are too noisy to decide on.
 _AUTO_SAMPLE = 2
 _AUTO_STALL = 0.02
+# Auto pool growth keeps this much of each card free for temporaries made inside a layer or the loss.
+_WORKSPACE_MIN_BYTES = 512 << 20
+_WORKSPACE_FRACTION = 0.05
 
 
 def _host_copy(t):
@@ -380,6 +383,7 @@ class BlockSwap:
     _step_peak = None
     _last_peak = None
     _optimizer_reserve = {}
+    _hwm_base = {}
 
     def __init__(self, layers, n, prefetch_depth = 2, device = None, placement = "tail", model = None):
         self.blocks, self.handles = [], []
@@ -478,6 +482,9 @@ class BlockSwap:
                         k = _cuda_index(q.device)
                         reserve[k] = reserve.get(k, 0) + q.numel() * 12
                 self._optimizer_reserve = reserve
+                # Allocator high-water mark at install (load and the pre-swap model): only a rise past it is training.
+                self._hwm_base = {k: torch.cuda.max_memory_allocated(k) for k in
+                                  {_cuda_index(b.home) for b in self.blocks if b.home is not None}}
             if self._auto and owner is not None:
                 # Logits and loss run after the last layer, so only the model's output sees the step's peak.
                 self.handles.append(owner.register_forward_hook(_opaque(self._output_peak)))
@@ -944,8 +951,16 @@ class BlockSwap:
                 need[dv] = need.get(dv, 0) + n
         for dv, n in need.items():
             # Between steps the activations are gone; keep room for the next step's peak.
+            k = _cuda_index(dv)
             peak = (self._last_peak or {}).get(torch.device(dv).index, 0)
+            # Hook samples miss temporaries made and freed inside a layer or the loss: once the allocator's
+            # high-water mark has risen past where it stood at install, that mark is a real training peak.
+            hwm = torch.cuda.max_memory_allocated(dv)
+            if hwm > self._hwm_base.get(k, hwm):
+                peak = max(peak, hwm)
             transient = max(0, peak - torch.cuda.memory_allocated(dv))
+            # Still keep a workspace margin for intra-op temporaries the samples cannot see.
+            transient += max(_WORKSPACE_MIN_BYTES, int(torch.cuda.get_device_properties(dv).total_memory * _WORKSPACE_FRACTION))
             # optimizer.step() runs after every peak sample: keep room for AdamW's two moments (lazily allocated on
             # the first step) and the foreach temporary, as plan_block_swap budgets them.
             transient += self._optimizer_reserve.get(_cuda_index(dv), 0)
@@ -1320,6 +1335,7 @@ class _HostLoad:
         self.n, self.placement, self.want_embeddings = n, placement, embeddings
         self.layers, self.indices, self.prefixes = None, [], {}
         self.done, self.done_bytes = set(), []
+        self.moved_storages = set()
         self.embedding_prefixes, self.embeddings, self.embedding_bytes = {}, [], []
         # Each selected layer's bytes as declared on meta, to scale a loaded layer's size to the others'.
         self.shape_bytes, self.last_done = {}, None
@@ -1334,7 +1350,13 @@ class _HostLoad:
             else sorted({int(i) % len(layers) for i in self.n})
         if name is not None:
             self.prefixes = {f"{name}.{i}.": i for i in self.indices}
-        self.shape_bytes = {i: sum(p.nbytes for p in _counted_params(layers[i])) for i in self.indices}
+        # A param shared by several selected layers moves once: charge it to the first.
+        seen = set()
+        self.shape_bytes = {}
+        for i in self.indices:
+            own = [p for p in _counted_params(layers[i]) if id(p) not in seen]
+            seen.update(id(p) for p in own)
+            self.shape_bytes[i] = sum(p.nbytes for p in own)
         if self.want_embeddings:
             # A table inside a selected layer moves (and is charged) with that layer, not a second time here.
             inside = tuple(self.prefixes)
@@ -1376,7 +1398,9 @@ class _HostLoad:
         params = list(layer.parameters())
         if not force and any(p.device.type == "meta" for p in params):
             return
-        counted = {id(p) for p in _counted_params(layer)}
+        # Counted once per storage across layers: a param another selected layer already moved costs nothing more.
+        counted = {id(p) for p in _counted_params(layer)
+                   if p.device.type == "meta" or p.untyped_storage().data_ptr() not in self.moved_storages}
         # Layers still to come are scaled from this one by their meta sizes; the first check runs before any moved.
         size = sum(p.nbytes for p in params if p.device.type != "meta" and id(p) in counted)
         _check_host_fit(self.done_bytes + self.embedding_bytes + self._pending_embedding_bytes() + self._layers_to_come(size, i),
@@ -1388,6 +1412,8 @@ class _HostLoad:
                     p.requires_grad_(False)
                 if p.device.type not in ("cpu", "meta"):
                     p.data = p.data.to("cpu")
+        self.moved_storages.update(p.untyped_storage().data_ptr() for p in params
+                                   if p.device.type != "meta" and id(p) in counted)
         self.done.add(i)
         self.done_bytes.append(size)
         self.last_done = i
