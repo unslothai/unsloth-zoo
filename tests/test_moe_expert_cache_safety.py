@@ -133,9 +133,9 @@ def test_no_lookup_while_capturing(mem, monkeypatch):
     p = _qparam()
     w = _stack()
     _admit(p, w)
-    monkeypatch.setattr(ec, "_capturing", lambda: True)
+    monkeypatch.setattr(ec, "_capturing", lambda *a: True)
     assert ec.expert_cache_lookup(p) is None
-    monkeypatch.setattr(ec, "_capturing", lambda: False)
+    monkeypatch.setattr(ec, "_capturing", lambda *a: False)
     assert ec.expert_cache_lookup(p) is w
 
 
@@ -364,3 +364,31 @@ def test_gpt_oss_decode_oom_keeps_kernels(monkeypatch):
     assert god._ENABLED
     god._disable(RuntimeError("no compiler"))
     assert not god._ENABLED
+
+
+def test_capture_on_the_operands_gpu_is_seen_when_another_gpu_is_current(monkeypatch):
+    """`is_current_stream_capturing` only asks the current device: a capture running on the operand's GPU (1) while
+    GPU 0 is current must still refuse cache lookup and admission."""
+    import contextlib
+    import torch
+    from unsloth_zoo.temporary_patches import moe_expert_cache as mc
+
+    state = {"device": 0}
+
+    @contextlib.contextmanager
+    def _device(d):
+        prev, state["device"] = state["device"], torch.device(d).index
+        try:
+            yield
+        finally:
+            state["device"] = prev
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: state["device"])
+    monkeypatch.setattr(torch.cuda, "device", _device)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: state["device"] == 1)
+    assert mc._capturing(torch.device("cuda", 1))
+    assert not mc._capturing(torch.device("cuda", 0))
+    assert not mc._capturing(None)
+    state["device"] = 1
+    assert mc._capturing(None) and mc._capturing(torch.device("cuda", 0))

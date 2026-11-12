@@ -158,8 +158,19 @@ def _stream_id(t):
     return torch.cuda.current_stream(t.device).cuda_stream
 
 
-def _capturing():
-    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+def _capturing(device = None):
+    """Whether a CUDA graph capture is running on the current device or on `device` (the operand's GPU):
+    `is_current_stream_capturing` only asks the current device, and an operand on another GPU runs on that
+    GPU's current stream."""
+    if not torch.cuda.is_available():
+        return False
+    if torch.cuda.is_current_stream_capturing():
+        return True
+    if isinstance(device, torch.device) and device.type == "cuda" and device.index is not None \
+            and device.index != torch.cuda.current_device():
+        with torch.cuda.device(device):
+            return torch.cuda.is_current_stream_capturing()
+    return False
 
 
 def _forget(key, ref):
@@ -198,7 +209,7 @@ def _enforce_margin(device, force = False):
 
 def expert_cache_lookup(param, count = True):
     """The cached 16-bit stack for a frozen 4-bit param, or None. count = False probes without touching the stats."""
-    if torch.compiler.is_compiling() or _mode() is None or _capturing():
+    if torch.compiler.is_compiling() or _mode() is None or _capturing(getattr(param, "device", None)):
         return None
     with _lock:
         k = _key(param)
@@ -234,7 +245,7 @@ def expert_cache_offer(param, weight):
     if cap is None or torch.compiler.is_compiling() or param.requires_grad:
         return
     # An inference tensor cannot be saved for backward by a later training step.
-    if weight.is_inference() or _capturing():
+    if weight.is_inference() or _capturing(weight.device):
         return
     with _lock:
         k = _key(param)
