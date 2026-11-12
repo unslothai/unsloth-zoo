@@ -302,11 +302,11 @@ def test_backward_survives_a_reduced_precision_grad_output(unsupported):
 
 
 def test_it_is_marked_as_not_compilable():
-    """A data-dependent group loop cannot be traced, so it is marked not compilable: breaking cleanly beats aborting
-    mid-trace, and tensorized rewrites cost more than they save."""
-    assert getattr(M._manual_grouped_mm, "_torchdynamo_disable", False) or \
-        "disable" in type(M._manual_grouped_mm).__name__.lower() or \
-        hasattr(M._manual_grouped_mm, "__wrapped__"), M._manual_grouped_mm
+    """The eager loop is compile-disabled; compiled frames use the opaque op (test_manual_grouped_mm_compile.py)."""
+    eager = M._manual_grouped_mm_eager
+    assert getattr(eager, "_torchdynamo_disable", False) or \
+        "disable" in type(eager).__name__.lower() or \
+        hasattr(eager, "__wrapped__"), eager
 
 
 def test_the_signature_ignores_autocast(unsupported):

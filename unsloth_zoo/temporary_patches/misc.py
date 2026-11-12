@@ -29,7 +29,7 @@ try:
 except (ImportError, ValueError):
     import logging
     logger = logging.getLogger("unsloth_zoo.log")
-from .common import TEMPORARY_PATCHES, torch_compile, _torch_compile
+from .common import TEMPORARY_PATCHES, torch_compile, _torch_compile, compile_mask_builder
 from .utils import (
     patch_function,
     process_output_options,
@@ -1022,12 +1022,8 @@ def patch_transformers_masks():
         compiled_create_causal_mask = original_create_causal_mask
         compiled_create_sliding_window_causal_mask = original_create_sliding_window_causal_mask
     else:
-        compiled_create_causal_mask = _torch_compile(
-            original_create_causal_mask, fullgraph = False, dynamic = True
-        )
-        compiled_create_sliding_window_causal_mask = _torch_compile(
-            original_create_sliding_window_causal_mask, fullgraph = False, dynamic = True
-        )
+        compiled_create_causal_mask = compile_mask_builder(original_create_causal_mask)
+        compiled_create_sliding_window_causal_mask = compile_mask_builder(original_create_sliding_window_causal_mask)
 
     def wrap(f, original, prepared_mask_shortcut = True, maskless_causal = False):
         # `input_embeds` <= 5.1 vs `inputs_embeds` 5.2+ (transformers#43916); `cache_position` gone in 5.9 (#45884): read the signature, not the version.
@@ -1676,11 +1672,24 @@ def _bind_mamba_ssm_to_torch_reference():
     if _original is None:
         return  # transformers < 5.15: gated by is_fast_path_available instead
 
+    def _refuse_packed_calls(torch_function, func_name):
+        # The reference cannot keep packed sequences apart (seq_idx is ignored): refuse them, as transformers 5.22+ does.
+        @functools.wraps(torch_function)
+        def reference(*args, **kwargs):
+            if kwargs.get("cu_seqlens") is not None or kwargs.get("seq_idx") is not None:
+                raise ValueError(
+                    f"Unsloth: `{func_name}` runs its PyTorch reference here (mamba_ssm's kernels cannot run "
+                    f"on this GPU), which can't keep packed sequences apart. Turn off packing / padding-free."
+                )
+            return torch_function(*args, **kwargs)
+        return reference
+
     if not _hub_func_factory_patched(_original, "_unsloth_mamba_ssm_torch"):
         def use_kernel_func_from_hub_with_fallback(func_name, package, internal_path = None):
             if package != "mamba_ssm":
                 return _original(func_name, package, internal_path)
             def decorator(torch_function):
+                torch_function = _refuse_packed_calls(torch_function, func_name)
                 try:
                     return _hk.use_kernel_forward_from_hub(func_name)(torch_function)
                 except Exception:
@@ -1716,7 +1725,7 @@ def _bind_mamba_ssm_to_torch_reference():
                     _reference = _reference.__wrapped__
                 if _reference is _fn or str(getattr(_reference, "__module__", "")).startswith("mamba_ssm"):
                     continue
-                setattr(_module, _name, _reference)
+                setattr(_module, _name, _refuse_packed_calls(_reference, _name))
             except Exception:
                 pass
 pass
@@ -2267,7 +2276,12 @@ def patch_gradient_checkpointing_enable_inherit():
         from transformers import PreTrainedModel
     except Exception as e:
         return raise_error("transformers.PreTrainedModel", e)
-    original = PreTrainedModel.gradient_checkpointing_enable
+    # transformers >= 5.23: the Trainer's activation_checkpointing_enable skips a class-level patch of the old name.
+    name = next(
+        (n for n in ("_activation_checkpointing_enable", "activation_checkpointing_enable") if hasattr(PreTrainedModel, n)),
+        "gradient_checkpointing_enable",
+    )
+    original = getattr(PreTrainedModel, name)
     if getattr(original, "_unsloth_gc_inherit", False):
         return
 
@@ -2284,7 +2298,7 @@ def patch_gradient_checkpointing_enable_inherit():
         return original(self, *args, **kwargs)
     gradient_checkpointing_enable._unsloth_gc_inherit = True
     gradient_checkpointing_enable._unsloth_original = original
-    PreTrainedModel.gradient_checkpointing_enable = gradient_checkpointing_enable
+    setattr(PreTrainedModel, name, gradient_checkpointing_enable)
 pass
 TEMPORARY_PATCHES.append(patch_gradient_checkpointing_enable_inherit)
 
@@ -2809,17 +2823,22 @@ def patch_trl_push_to_hub_token():
 
     TRL 0.22.x-0.27.1 bare-pop "push_to_hub_token" in SFTTrainer /
     IterativeSFTTrainer __init__, but transformers 5.0+ drops it from
-    to_dict(), so the pop raises KeyError.
+    to_dict(), so the pop raises KeyError. TRL 0.27.2+ pops it only below
+    transformers 5 and SFTConfig rejects the key, so skip the patch there.
     """
     try:
         from unsloth_zoo.utils import Version
+        import importlib.metadata
         import transformers
         if Version(transformers.__version__) < Version("5.0.0"):
             return  # Not needed pre-5.0, to_dict() already includes it
+        if Version(importlib.metadata.version("trl")) >= Version("0.27.2"):
+            return
         from transformers import TrainingArguments
         _original_to_dict = TrainingArguments.to_dict
         if getattr(_original_to_dict, "_unsloth_patched", False):
             return
+        @functools.wraps(_original_to_dict)
         def _patched_to_dict(self):
             d = _original_to_dict(self)
             if "push_to_hub_token" not in d:
@@ -3897,35 +3916,131 @@ pass
 TEMPORARY_PATCHES.append(patch_output_collector_for_compiled_submodules)
 
 
+_CAPTURE_SEEN = "_unsloth_capture_seen"
+_CAPTURE_UNSEEN = object()
+
+
+def _in_backward():
+    try:
+        return torch._C._current_graph_task_id() != -1
+    except Exception:
+        return False
+pass
+
+
+class _TensorStandIn:
+    """Held weakly (keeping it would pin every layer's activations); rebuilt with the same metadata if freed."""
+    __slots__ = ("ref", "meta")
+
+    def __init__(self, x):
+        self.ref = weakref.ref(x)
+        self.meta = (tuple(x.shape), tuple(x.stride()), x.dtype, x.device, x.requires_grad)
+
+    def materialize(self):
+        x = self.ref()
+        if x is not None:
+            return x
+        shape, stride, dtype, device, requires_grad = self.meta
+        return torch.empty_strided(shape, stride, dtype = dtype, device = device).requires_grad_(requires_grad)
+pass
+
+
+def _capture_layout(value):
+    return {
+        k: [_TensorStandIn(x) if isinstance(x, torch.Tensor) else x for x in v] if type(v) is list else v
+        for k, v in value.items()
+    }
+pass
+
+
+def _replayed_value(layout):
+    return {
+        k: [x.materialize() if isinstance(x, _TensorStandIn) else x for x in v] if type(v) is list else v
+        for k, v in layout.items()
+    }
+pass
+
+
 @contextlib.contextmanager
-def output_capture_scratch():
+def _replay_capture_state(var, seen):
+    """The recompute runs on the autograd thread after capture_outputs reset, so replay the forward's collector layout."""
+    if seen is _CAPTURE_UNSEEN:
+        yield
+        return
+    state = var.__dict__
+    missing = object()
+    saved = {k: state.get(k, missing) for k in ("_unsloth_eager_value", "_unsloth_eager_single")}
+    tls = state.get("_unsloth_eager_tls")
+    depth = getattr(tls, "depth", missing) if tls is not None else missing
+    if seen is None:
+        var._unsloth_eager_value = None
+    else:
+        layout, seen_depth = seen
+        if tls is None:
+            import threading
+            tls = state.setdefault("_unsloth_eager_tls", threading.local())
+        var._unsloth_eager_value = _replayed_value(layout)
+        var._unsloth_eager_single = True
+        tls.depth = seen_depth
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is missing:
+                state.pop(k, None)
+            else:
+                state[k] = v
+        if tls is not None and seen is not None:
+            if depth is missing:
+                try:
+                    del tls.depth
+                except AttributeError:
+                    pass
+            else:
+                tls.depth = depth
+pass
+
+
+@contextlib.contextmanager
+def output_capture_scratch(owner = None):
     """Eager wrapper around one compiled decoder-layer call: capture hooks append into empty scratch lists.
 
     A capture hook traced inside the compiled layer (router_logits for the MoE aux loss) appends to the
     collector's list, and Dynamo guards on that list's length, which is the layer index: every layer
     recompiled once and deep MoE models ran into the recompile limit. Inside this context the compiled
     code reads a mirror whose lists start empty on every call; their items are moved to the real lists
-    afterwards, in call order. hidden_states keeps the real list (its hook reads the length)."""
+    afterwards, in call order. hidden_states keeps the real list (its hook reads the length).
+    With `owner`, the layout is recorded on it and replayed for a checkpoint recompute."""
     try:
         from transformers.utils import output_capturing
         var = output_capturing._active_collector
     except Exception:
         yield
         return
+    if owner is not None and _in_backward():
+        with _replay_capture_state(var, owner.__dict__.get(_CAPTURE_SEEN, _CAPTURE_UNSEEN)):
+            yield
+        return
     state = getattr(var, "__dict__", {})
     value = state.get("_unsloth_eager_value")
-    if not isinstance(value, dict) or not state.get("_unsloth_eager_single", True) or \
-            getattr(state.get("_unsloth_eager_tls"), "depth", 0) <= 0:
+    depth = getattr(state.get("_unsloth_eager_tls"), "depth", 0)
+    if not isinstance(value, dict) or not state.get("_unsloth_eager_single", True) or depth <= 0:
+        if owner is not None:
+            owner.__dict__[_CAPTURE_SEEN] = None if value is None else _CAPTURE_UNSEEN
         yield
         return
     keys = [k for k, v in value.items() if type(v) is list and k != "hidden_states"]
     if not keys:
+        if owner is not None:
+            owner.__dict__[_CAPTURE_SEEN] = (_capture_layout(value), depth)
         yield
         return
     scratch = dict(value)
     starts = {k: len(value[k]) for k in keys}
     for k in keys:
         scratch[k] = []
+    if owner is not None:
+        owner.__dict__[_CAPTURE_SEEN] = (_capture_layout(scratch), depth)
     var._unsloth_eager_value = scratch
     try:
         yield

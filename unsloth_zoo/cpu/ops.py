@@ -39,6 +39,13 @@ def _cpu_fp16_autocast():
         return torch.is_autocast_cpu_enabled() and torch.get_autocast_cpu_dtype() == torch.float16
 
 
+def _cpu_autocast_state():
+    try:
+        return torch.is_autocast_enabled("cpu"), torch.get_autocast_dtype("cpu")
+    except TypeError:
+        return torch.is_autocast_cpu_enabled(), torch.get_autocast_cpu_dtype()
+
+
 def _softmax_without_collapse(z, y, keep_logits = False):
     """Returns softmax(z) with target column zeroed, log p_t and shifted z_t, shifting z in place; sums other classes
     apart from exp(0)=1, else p_t rounds to 1 past a ~16.6 lead (softmax collapse, arXiv 2610.31642)."""
@@ -51,50 +58,84 @@ def _softmax_without_collapse(z, y, keep_logits = False):
     return p, log_p_target, target
 
 
+def _chunked_ce_forward_impl(hidden: torch.Tensor, weight: torch.Tensor, labels: torch.Tensor,
+                        chunk_rows: int, ignore_index: int, need_hidden_grad: bool,
+                        need_weight_grad: bool, exact: bool, amp: bool,
+                        amp_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Opaque to Dynamo/AOT: the runtime loop keeps logits bounded without specialising symbolic rows.
+    # Compiled graphs run with autocast off, so the caller's CPU autocast is passed in and restored here.
+    with torch.autocast("cpu", dtype = amp_dtype, enabled = amp):
+        return _chunked_ce_forward_loop(
+            hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad, need_weight_grad, exact,
+        )
+
+
+def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad,
+                             need_weight_grad, exact):
+    rows = hidden.shape[0]
+    grad_dtype = torch.float32 if exact else hidden.dtype
+    grad_hidden = torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else torch.empty(0)
+    grad_weight = torch.zeros(weight.shape, dtype = torch.float32) if need_weight_grad else torch.empty(0)
+    total = torch.zeros((), dtype = torch.float32)
+    for start in range(0, rows, chunk_rows):
+        end = min(start + chunk_rows, rows)
+        y = labels[start:end]
+        valid = y != ignore_index
+        # Zero ignored rows first: fp16 can overflow to inf in the projection, and NaN * 0 stays NaN.
+        h = torch.where(valid.unsqueeze(-1), hidden[start:end], hidden.new_zeros(()))
+        logits = (h @ weight.t()).float()
+        safe_y = torch.where(valid, y, torch.zeros_like(y)).unsqueeze(-1)
+        logits, log_p_target, _ = _softmax_without_collapse(logits, safe_y)
+        total -= (log_p_target.squeeze(-1) * valid).sum()
+        if need_hidden_grad or need_weight_grad:
+            # softmax - onehot on valid rows; p_t - 1 = expm1(log p_t).
+            logits.scatter_(-1, safe_y, torch.expm1(log_p_target))
+            logits.mul_(valid.unsqueeze(-1))
+            if need_hidden_grad:
+                if exact:
+                    with torch.autocast("cpu", enabled = False):
+                        grad_hidden[start:end] = logits @ weight.float()
+                else:
+                    grad_hidden[start:end] = logits.to(h.dtype) @ weight
+            if need_weight_grad:
+                grad_weight.addmm_(logits.t(), h.float())
+    return total, grad_hidden, grad_weight
+
+
+_chunked_ce_forward = torch.library.custom_op(
+    "unsloth_zoo::cpu_chunked_ce_forward", _chunked_ce_forward_impl, mutates_args = (),
+)
+
+
+@_chunked_ce_forward.register_fake
+def _chunked_ce_forward_fake(hidden, weight, labels, chunk_rows, ignore_index,
+                             need_hidden_grad, need_weight_grad, exact, amp, amp_dtype):
+    grad_dtype = torch.float32 if exact else hidden.dtype
+    return (
+        torch.empty((), dtype = torch.float32),
+        torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else torch.empty(0),
+        torch.empty(weight.shape, dtype = torch.float32) if need_weight_grad else torch.empty(0),
+    )
+
+
 class _ChunkedLinearCrossEntropy(torch.autograd.Function):
-    """Sums CE(hidden @ weight.T, labels) / divisor; grads are formed per chunk in forward, so eager peak extra memory
-    is one (chunk, vocab) fp32 block (compiled runs use a single chunk over all rows)."""
+    """Sums CE(hidden @ weight.T, labels) / divisor; grads are formed per chunk in forward, so peak extra memory
+    is one (chunk, vocab) fp32 block in both eager and compiled calls."""
 
     @staticmethod
     def forward(ctx, hidden, weight, labels, divisor, chunk_rows, ignore_index):
-        rows = hidden.shape[0]
         need_hidden_grad = hidden.requires_grad
         need_weight_grad = weight.requires_grad
         # fp16 cannot hold these gradients before GradScaler multiplies them: keep them fp32 until backward.
         exact = hidden.dtype == torch.float16 or _cpu_fp16_autocast()
-        grad_dtype = torch.float32 if exact else hidden.dtype
-        grad_hidden = torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else None
-        grad_weight = torch.zeros(weight.shape, dtype = torch.float32) if need_weight_grad else None
-        total = torch.zeros((), dtype = torch.float32)
-        # A Python range over a symbolic row count pins sequence length under torch.compile (one graph per length;
-        # a mark_dynamic length fails), so compiled runs take one chunk over every row: full logits, no chunk saving.
-        bounds = [(0, rows)] if torch.compiler.is_compiling() else \
-            [(start, min(start + chunk_rows, rows)) for start in range(0, rows, chunk_rows)]
-        for start, end in bounds:
-            y = labels[start:end]
-            valid = y != ignore_index
-            # Zero ignored rows first: fp16 can overflow to inf in the projection, and NaN * 0 stays NaN.
-            h = torch.where(valid.unsqueeze(-1), hidden[start:end], hidden.new_zeros(()))
-            logits = (h @ weight.t()).float()
-            safe_y = torch.where(valid, y, torch.zeros_like(y)).unsqueeze(-1)
-            logits, log_p_target, _ = _softmax_without_collapse(logits, safe_y)
-            total -= (log_p_target.squeeze(-1) * valid).sum()
-            if need_hidden_grad or need_weight_grad:
-                # softmax - onehot on valid rows; p_t - 1 = expm1(log p_t).
-                logits.scatter_(-1, safe_y, torch.expm1(log_p_target))
-                logits.mul_(valid.unsqueeze(-1))
-                if need_hidden_grad:
-                    if exact:
-                        with torch.autocast("cpu", enabled = False):
-                            grad_hidden[start:end] = logits @ weight.float()
-                    else:
-                        grad_hidden[start:end] = logits.to(h.dtype) @ weight
-                if need_weight_grad:
-                    grad_weight.addmm_(logits.t(), h.float())
-        saved = (
-            grad_hidden if grad_hidden is not None else torch.empty(0),
-            grad_weight if grad_weight is not None else torch.empty(0),
+        # The surrounding autograd.Function supplies backward; these are precomputed, non-differentiable buffers.
+        compute = _chunked_ce_forward if torch.compiler.is_compiling() else _chunked_ce_forward_impl
+        amp, amp_dtype = _cpu_autocast_state()
+        total, grad_hidden, grad_weight = compute(
+            hidden.detach(), weight.detach(), labels, chunk_rows, ignore_index,
+            need_hidden_grad, need_weight_grad, exact, amp, amp_dtype,
         )
+        saved = (grad_hidden, grad_weight)
         # num_items_in_batch == 0 (a fully masked accumulation group): a finite 0, as TRL's clamped divisor gives.
         if torch.is_tensor(divisor):
             # Keep tensor counts as tensors: .item() breaks fullgraph tracing.
@@ -450,6 +491,9 @@ def chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = No
         divisor = torch.where(count == 0, torch.full_like(count, float("nan")), count)
     elif torch.is_tensor(num_items_in_batch):
         divisor = num_items_in_batch.detach().to(device = hidden.device, dtype = torch.float32).reshape(())
+    elif torch.compiler.is_compiling():
+        # A Python count becomes symbolic once it changes between steps; float()/math.isnan on it cannot be traced.
+        divisor = torch.full((), num_items_in_batch, dtype = torch.float32, device = hidden.device)
     else:
         divisor = float(num_items_in_batch)
     # Skip ignored rows' LM head work. Eager only: the sync breaks compile; chunk loop zeroes them anyway.

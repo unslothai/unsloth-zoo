@@ -222,16 +222,24 @@ _HOST_ALLOC_KNOBS = _TORCH_MINOR >= (2, 13)
 _INF = float("inf")
 
 
+def _env_allocator_settings():
+    # The variable torch parsed at startup: the first one set, in c10/core/AllocatorConfig.cpp's order.
+    for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+        value = os.environ.get(var)
+        if value is not None: return value
+    return ""
+
+
 def _host_allocator_settings():
     getter = getattr(torch._C, "_accelerator_getAllocatorSettings", None)
     if getter is not None:
         try: return getter() or ""
         except Exception: pass
-    return os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF") or ""
+    return _env_allocator_settings()
 
 
-def _parse_host_alloc_policy(settings):
-    round_max = cached_max = _INF
+def _parse_host_alloc_policy(settings, prior = (_INF, _INF)):
+    round_max, cached_max = prior
     for item in settings.split(","):
         key, _, value = item.partition(":")
         key = key.strip()
@@ -250,7 +258,11 @@ def _host_alloc_policy():
     settings = _host_allocator_settings()
     policy = _HOST_ALLOC_POLICY
     if settings != policy[0]:
-        policy = _HOST_ALLOC_POLICY = (settings, *_parse_host_alloc_policy(settings))
+        # torch reports only the last settings string, but a call naming other keys (vLLM sets max_split_size_mb and
+        # expandable_segments in process) keeps the pinned thresholds, so fold each string into what is in effect,
+        # starting from the environment torch parsed at startup.
+        prior = policy[1:] if policy[0] is not None else _parse_host_alloc_policy(_env_allocator_settings())
+        policy = _HOST_ALLOC_POLICY = (settings, *_parse_host_alloc_policy(settings, prior))
         if policy[1] != _INF: _warn_short_block_reuse()
     return policy[1], policy[2]
 
@@ -324,25 +336,25 @@ def _compute_pinned_cap(held = None):
         try: return max(0, int(float(env) * (1 << 30)))
         except ValueError: pass
     try:
-        import psutil
         from .block_swap import _PIN_RESERVE_MIN_BYTES, _PIN_RESERVE_FRACTION, _local_world_size
-        vm = psutil.virtual_memory()
+        from .memory_budget import host_memory_bytes
+        total, available = host_memory_bytes()
     except Exception:
         return -1  # unmeasurable: keep the old uncapped behaviour
     if _local_world_size() == 1: return _PIN_PER_BLOCK
-    reserve = max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
+    reserve = max(_PIN_RESERVE_MIN_BYTES, int(total * _PIN_RESERVE_FRACTION))
     # Free RAM already excludes pinned bytes, so add back what is held (ours, or all in counted mode).
-    return max(0, vm.available - reserve) // _local_world_size() + (GC_PINNED_BYTES if held is None else held)
+    return max(0, available - reserve) // _local_world_size() + (GC_PINNED_BYTES if held is None else held)
 
 
 def _block_fits_host_ram(block):
     """One local rank: pin unless the block would leave under min(1 GiB, 10% of RAM) available."""
     try:
-        import psutil
-        vm = psutil.virtual_memory()
+        from .memory_budget import host_memory_bytes
+        total, available = host_memory_bytes()
     except Exception:
         return True
-    return block + min(_PIN_HEADROOM_BYTES, vm.total // 10) <= vm.available
+    return block + min(_PIN_HEADROOM_BYTES, total // 10) <= available
 
 
 def _synchronize_used_devices():
@@ -578,11 +590,34 @@ def _view_bytes_as(buffer, nbytes, dtype, shape):
     return buffer.view(torch.uint8)[:nbytes].view(dtype).view(shape)
 
 
-# float32 activations (FORCE_FLOAT32 residuals) offload as bfloat16, the same bytes as before, and are
-# cast back to float32 for the recompute. float16 overflows gemma3 residuals (~3e5) and per-row scaled
-# float16 spiked grad norms 20x on a T4 (outlier rows leave small entries subnormal). The dtype restore,
-# not the storage, is what the recompute needs. UNSLOTH_OFFLOAD_FP32=exact keeps the exact float32 bytes.
-FP32_OFFLOAD_EXACT = os.environ.get("UNSLOTH_OFFLOAD_FP32", "bf16").lower() == "exact"
+# float32 activations offloaded while autocast is on for their device (FORCE_FLOAT32 residuals under fp16 /
+# bf16 autocast) are stored as bfloat16, the same bytes as before, and cast back to float32 for the
+# recompute. float16 overflows gemma3 residuals (~3e5) and per-row scaled float16 spiked grad norms 20x on a
+# T4 (outlier rows leave small entries subnormal). Without autocast the model trains in true float32, where
+# bf16 storage drifted LoRA grads ~0.1% (up to 4% on one full finetuning param), so those are stored exactly.
+# UNSLOTH_OFFLOAD_FP32=exact always keeps float32, =bf16 always stores bfloat16, unset / auto picks per tensor.
+def _fp32_offload_mode():
+    mode = os.environ.get("UNSLOTH_OFFLOAD_FP32", "auto").strip().lower()
+    if mode in ("exact", "fp32", "float32"): return "exact"
+    if mode in ("bf16", "bfloat16"): return "bf16"
+    return "auto"
+FP32_OFFLOAD_MODE = _fp32_offload_mode()
+FP32_OFFLOAD_EXACT = FP32_OFFLOAD_MODE == "exact"
+
+
+def _autocast_enabled(device_type):
+    try:
+        return torch.is_autocast_enabled(device_type)
+    except TypeError:  # torch < 2.4 has no device argument
+        return torch.is_autocast_cpu_enabled() if device_type == "cpu" else torch.is_autocast_enabled()
+
+
+def _offload_store_dtype(tensor):
+    """Dtype an offloaded activation is stored in; the recompute always gets tensor.dtype back."""
+    dtype = tensor.dtype
+    if dtype != torch.float32 or FP32_OFFLOAD_EXACT: return dtype
+    if FP32_OFFLOAD_MODE == "bf16" or _autocast_enabled(tensor.device.type): return torch.bfloat16
+    return dtype
 
 
 @contextmanager
@@ -818,21 +853,24 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
 
     @staticmethod
     @torch_amp_custom_bwd
-    def backward(ctx, dY):
+    def backward(ctx, *dY):
         (hidden_states,) = ctx.saved_tensors
         hidden_states = hidden_states.detach()
         hidden_states.requires_grad_(True)
         recompute_args, grad_holders = _detach_checkpoint_args(ctx.args)
         with torch.enable_grad(), _gradient_checkpoint_recompute_marker():
             output = ctx.forward_function(hidden_states, *recompute_args)
-        # Layers that return a 1-tuple keep unpacking exactly as before. Layers
-        # that return the tensor itself (Qwen2-VL's vision block, and every
-        # transformers block since the tuple returns were retired) used to raise
-        # `ValueError: too many values to unpack` here, because forward() stored
-        # whatever the layer returned while backward() insisted on a 1-tuple.
-        if isinstance(output, tuple):
-            (output,) = output
-        torch.autograd.backward(output, dY)
+        # A layer may return the tensor itself (every transformers block since the tuple
+        # returns were retired), a 1-tuple, or several tensors: patch_gradient_checkpointing()
+        # routes every torch checkpoint call here, e.g. a chunked (log-prob, entropy) pair.
+        # Autograd hands one incoming grad per forward output; backprop the outputs that got one.
+        outputs = output if isinstance(output, tuple) else (output,)
+        pairs = [(o, g) for o, g in zip(outputs, dY)
+                 if torch.is_tensor(o) and o.requires_grad and g is not None]
+        if not pairs:
+            # As torch's reentrant checkpoint: nothing to backprop is an error, not a step with no gradients.
+            raise RuntimeError("none of output has requires_grad=True, this checkpoint() is not necessary")
+        torch.autograd.backward([o for o, _ in pairs], [g for _, g in pairs])
         # Gradients for the extra inputs are returned to the engine instead of
         # being left to accumulate as a side effect of the nested backward.
         return (None, hidden_states.grad,) + tuple(
@@ -1399,7 +1437,7 @@ pass
 
 class _CpuSlotLease:
     """One CPU_BUFFERS slot held by an offloaded checkpoint until its backward has read it."""
-    __slots__ = ("index", "epoch", "device", "stream")
+    __slots__ = ("index", "epoch", "device", "stream", "slot")
 
     def __init__(self, device = None, stream = None):
         global _CPU_SLOT_TOP
@@ -1416,6 +1454,7 @@ class _CpuSlotLease:
         if self.index is None:
             self.index = _CPU_SLOT_TOP
             _CPU_SLOT_TOP += 1
+        self.slot = self.index
         self.epoch = _CPU_SLOT_EPOCH
         self.device, self.stream = device, stream
         fence = _SLOT_FENCES.pop(self.index, None)
@@ -1424,6 +1463,11 @@ class _CpuSlotLease:
 
     def release(self, ctx = None):
         index, self.index = self.index, None
+        if index is None and ctx is not None and self.stream is not None and self.epoch == _CPU_SLOT_EPOCH:
+            # A retained graph's next backward reloads the slot again: fence that reload, not the first.
+            holder = _SLOT_HOLDERS.get(self.slot) or _RETAINED_SLOTS.get(self.slot)
+            if holder is not None and holder() is ctx:
+                _SLOT_FENCES[self.slot] = (self.device, self.stream.record_event())
         if index is not None and self.epoch == _CPU_SLOT_EPOCH:
             if self.stream is not None:
                 _SLOT_FENCES[index] = (self.device, self.stream.record_event())
@@ -1443,8 +1487,9 @@ pass
 
 def initialize_unsloth_gradient_checkpointing(dtype = None):
     # All Unsloth Zoo code licensed under LGPLv3
-    global FP32_OFFLOAD_EXACT
-    FP32_OFFLOAD_EXACT = os.environ.get("UNSLOTH_OFFLOAD_FP32", "bf16").lower() == "exact"
+    global FP32_OFFLOAD_EXACT, FP32_OFFLOAD_MODE
+    FP32_OFFLOAD_MODE = _fp32_offload_mode()
+    FP32_OFFLOAD_EXACT = FP32_OFFLOAD_MODE == "exact"
     global GC_PREFETCH
     GC_PREFETCH = os.environ.get("UNSLOTH_GC_PREFETCH", "0") == "1"
     _reset_gc_prefetch_state()
@@ -1608,8 +1653,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                     global CURRENT_GC_INDEX
                     CURRENT_GC_INDEX += 1
 
-                    # The cutoff counts stored bytes, so bf16-stored float32 offloads exactly where it always did.
-                    store_dtype = torch.bfloat16 if (arg.dtype == torch.float32 and not FP32_OFFLOAD_EXACT) else arg.dtype
+                    # The cutoff counts stored bytes: bf16-stored float32 (autocast) offloads exactly where it always
+                    # did; exactly stored float32 (no autocast) counts 4 bytes, so 2-4MB activations now offload too.
+                    store_dtype = _offload_store_dtype(arg)
                     new_size = arg.numel() * store_dtype.itemsize
 
                     global MINIMUM_SIZE
