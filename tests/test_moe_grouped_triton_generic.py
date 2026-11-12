@@ -354,7 +354,8 @@ def test_rows_past_last_offset_are_ignored(monkeypatch):
 @needs_kernel
 def test_engagement_counter_and_modulelist(monkeypatch):
     from unsloth_zoo.temporary_patches import moe_grouped_modulelist as ML
-    x, param, dy, offs, _ = _problem([4, 9, 0, 3], 32, 48, torch.bfloat16)
+    # K, N > 32: a base-sized GEMM (min(K, N) <= 32 is the LoRA class, which forcing does take on sm75).
+    x, param, dy, offs, _ = _problem([4, 9, 0, 3], 48, 64, torch.bfloat16)
     # auto off here (sm90 / sm100 / sm75); the declined path is torch._grouped_mm itself (absent on torch 2.7)
     if MU._triton_grouped_mm_max_rows(torch.cuda.current_device()) == 0 and hasattr(torch, "_grouped_mm"):
         before = _calls()
