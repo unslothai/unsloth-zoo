@@ -520,6 +520,10 @@ class BlockSwap:
         self._input_hooked = [False] * len(self.indices)
         self.spans_devices, self.layer_device = False, None
         if not self.indices:
+            # Still a host session (with nothing pending): other local ranks then read this rank as done with it,
+            # and every rank's session count stays in step.
+            _begin_host_session()
+            _end_host_session()
             return
         swapped = [layers[i] for i in self.indices]
         # A param shared by two layers stays on the card: evicting it under one empties it for the other.

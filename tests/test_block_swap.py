@@ -2255,3 +2255,11 @@ def test_deferred_first_release_re_arms_the_next_forward():
     fake._end_step = lambda: armed.append("end")
     _mod.BlockSwap._bwd(fake, 0)(None)
     assert armed == [True]
+
+
+def test_a_rank_with_nothing_to_swap_publishes_a_zero_reservation(monkeypatch):
+    published = []
+    monkeypatch.setattr(_mod, "_publish_host_pending", lambda n: published.append((_mod._HOST_SESSION, n)))
+    monkeypatch.setattr(_mod, "_HOST_SESSION", 0)
+    BlockSwap(nn.ModuleList([nn.Linear(4, 4) for _ in range(3)]), 0, device = "cpu")
+    assert published == [(1, 0)]
