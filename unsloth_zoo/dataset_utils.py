@@ -3062,10 +3062,14 @@ def sft_prepare_dataset(
                     template_kwargs = dict(example.get("chat_template_kwargs") or {})
                     if training_chat_template is not None:
                         template_kwargs["chat_template"] = training_chat_template
+                    tools = example.get("tools")
+                    if isinstance(tools, str):
+                        import json as _json
+                        tools = _json.loads(tools)
                     prompt_ids = processing_class.apply_chat_template(
                         example["prompt"], tokenize=True,
                         add_generation_prompt=True, return_dict=False,
-                        tools=example.get("tools"),
+                        tools=tools,
                         **template_kwargs,
                     )
                     if prompt_ids and isinstance(prompt_ids[0], list):
@@ -3074,7 +3078,7 @@ def sft_prepare_dataset(
                         example["prompt"] + example["completion"],
                         return_dict=True, tokenize=True,
                         return_assistant_tokens_mask=assistant_only_loss and not marker_masks,
-                        tools=example.get("tools"),
+                        tools=tools,
                         **template_kwargs,
                     )
                     if isinstance(pc_processed.get("input_ids", [None])[0], list):
