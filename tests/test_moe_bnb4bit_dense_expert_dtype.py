@@ -138,6 +138,14 @@ def test_quantized_fused_expert_keeps_fp32_quant_metadata():
     except Exception as e:
         pytest.skip(f"bitsandbytes cannot quantize on this host: {e}")
 
+    from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import patch_bnb4bit_quantizer_param_needs_quantization
+
+    # As a real load leaves it: process_model_before_weight_loading swaps the fused expert for an unquantized
+    # Params4bit placeholder, which the patched param_needs_quantization claims. transformers >= 5.23 asks it
+    # before accepting a packed tensor whose shape differs from the model's.
+    patch_bnb4bit_quantizer_param_needs_quantization()
+    bnb_config = BitsAndBytesConfig(load_in_4bit = True)
+
     class _QModel(torch.nn.Module):
         base_model_prefix = ""
 
@@ -145,11 +153,13 @@ def test_quantized_fused_expert_keeps_fp32_quant_metadata():
             super().__init__()
             self.config = Qwen3MoeConfig(hidden_size = HIDDEN * 8, num_experts = NUM_EXPERTS)
             self.experts = torch.nn.Module()
-            self.experts.gate_up_proj = torch.nn.Parameter(
-                torch.zeros(NUM_EXPERTS, 2 * INTER, HIDDEN * 8, dtype = torch.bfloat16), requires_grad = False,
+            self.experts.gate_up_proj = bnb.nn.Params4bit(
+                torch.zeros(NUM_EXPERTS, 2 * INTER, HIDDEN * 8), requires_grad = False,
+                compress_statistics = bnb_config.bnb_4bit_use_double_quant,
+                quant_type = bnb_config.bnb_4bit_quant_type, quant_storage = bnb_config.bnb_4bit_quant_storage,
             )
 
-    quantizer = Bnb4BitHfQuantizer(BitsAndBytesConfig(load_in_4bit = True), pre_quantized = True)
+    quantizer = Bnb4BitHfQuantizer(bnb_config, pre_quantized = True)
     conv = WeightConverter("experts.gate_up_proj", "experts.gate_up_proj", [Transpose(1, 2)])
     twin = _bnb4bit_per_expert_conversions([conv], quantizer)[0]
     sd = {"experts.gate_up_proj": packed}
