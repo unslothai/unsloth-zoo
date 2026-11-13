@@ -9162,18 +9162,21 @@ def renumber_safetensor_files(file_list, save_directory):
     # Create mapping of old -> new names
     rename_pairs = list(zip(file_list, clean_names))
 
-    # Rename files (handle potential conflicts with temp names)
-    for old_name, new_name in rename_pairs:
+    # Rename files (handle potential conflicts with temp names). Two passes: a clean
+    # name can equal a later input's own filename (a stale or foreign shard in the
+    # list), so no final name may be written until every source is moved aside.
+    pending = []
+    for i, (old_name, new_name) in enumerate(rename_pairs):
         old_path = os.path.join(save_directory, old_name)
-        new_path = os.path.join(save_directory, new_name)
-
         if os.path.exists(old_path) and old_name != new_name:
-            # Use temp name to avoid conflicts
-            temp_path = os.path.join(save_directory, f"renaming_{new_name}")
+            temp_path = os.path.join(save_directory, f"renaming_{i}_{new_name}")
             os.rename(old_path, temp_path)
-            os.rename(temp_path, new_path)
-            if UNSLOTH_ENABLE_LOGGING:
-                logger.info(f"Renamed {old_name} -> {new_name}")
+            pending.append((temp_path, old_name, new_name))
+
+    for temp_path, old_name, new_name in pending:
+        os.rename(temp_path, os.path.join(save_directory, new_name))
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Renamed {old_name} -> {new_name}")
 
     return clean_names
 pass
