@@ -48,6 +48,14 @@ def _apply_granite_patches(monkeypatch):
         if fn.__module__ == patch.__name__: fn()
 
 
+def _norm(cls, hidden_size):
+    # transformers 5.23 normalises the gated norm per group (`group_size` is required); two groups per row make the
+    # rewritten forward match stock only if it keeps the grouping.
+    if "group_size" in inspect.signature(cls.__init__).parameters:
+        return cls(hidden_size, group_size = hidden_size // 2)
+    return cls(hidden_size)
+
+
 def _tiny_model(dtype, float32_norms):
     config = gm.GraniteMoeHybridConfig(
         vocab_size = 64, hidden_size = 32, intermediate_size = 32, shared_intermediate_size = 48,
@@ -87,7 +95,7 @@ def test_16bit_model_float32_norms_lora_backward_without_autocast(dtype, monkeyp
 def test_norm_casts_only_float32_weight_16bit_input_no_autocast(name, monkeypatch):
     _apply_granite_patches(monkeypatch)
     cls = getattr(gm, name)
-    norm = cls(16)
+    norm = _norm(cls, 16)
     stock = _stock(name)
     x = torch.randn(3, 16)
     for weight_dtype, input_dtype in [(torch.float32, torch.float32), (torch.bfloat16, torch.bfloat16),
