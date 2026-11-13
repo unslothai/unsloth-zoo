@@ -51,6 +51,7 @@ __all__ = [
     "patch_deepseek_v41_fake_quant_ste",
     "patch_deepseek_v41_grouped_lora",
     "patch_deepseek_v41_config_aliases",
+    "patch_deepseek_v41_engram_table",
 ]
 
 
@@ -409,3 +410,131 @@ def _pooled_reads_weight(cls):
         except Exception:
             _POOLED_READS_WEIGHT[cls] = False
     return _POOLED_READS_WEIGHT[cls]
+
+
+# ----------------------------------------------------------------------------------------------
+# Engram tables on disk
+# ----------------------------------------------------------------------------------------------
+# Checkpoint keys of an engram table: DeepSeek-native (`layers.<i>.engram.embed.{weight,scale}`, the released
+# files) or the port's own names (`engram_tables.<i>.{weight,weight_scale_inv}`, a transformers save).
+_ENGRAM_UNEXPECTED = (
+    r"(^|\.)engram_tables\.\d+\.(weight|weight_scale_inv|scale)$",
+    r"(^|\.)layers\.\d+\.engram\.embed\.(weight|scale)$",
+)
+
+
+def _engram_table_wanted(nbytes):
+    from unsloth_zoo.frozen_table_store import resolve_frozen_table_mode
+    mode = os.environ.get("UNSLOTH_FROZEN_TABLE", "auto").strip().lower()
+    if os.environ.get("UNSLOTH_ENABLE_FULL_FINETUNING", "0") == "1":
+        if mode not in ("disk", "ram"):
+            return False
+        logger.warning(f"Unsloth: UNSLOTH_FROZEN_TABLE={mode} keeps the DeepSeek-V4.1 engram tables frozen during "
+                       "full finetuning; set UNSLOTH_FROZEN_TABLE=gpu to train them.")
+    return resolve_frozen_table_mode(nbytes) != "gpu"
+
+
+def _fp8_weights_kept(model, quantizer=None):
+    """True when the load kept FP8 weights (no dequantize): the port's engram lookup then returns float32 rows.
+    `quantizer` is the load's (transformers sets model.hf_quantizer only after the weights are in)."""
+    if quantizer is None:
+        quantizer = getattr(model, "hf_quantizer", None)
+    qc = getattr(quantizer, "quantization_config", None)
+    if qc is None:
+        return False
+    method = getattr(qc, "quant_method", None)
+    method = getattr(method, "value", method)
+    return str(method) == "fp8" and not bool(getattr(qc, "dequantize", False))
+
+
+def _frozen_engram(modeling, key, emb):
+    """An UnslothFrozenTableEmbedding standing in for one DeepseekV41EngramEmbedding, bound to the checkpoint
+    after the load: fp8 rows x per-32-channel e8m0 scales (the released files), or plain rows (a bf16 copy)."""
+    from unsloth_zoo.frozen_table_store import UnslothFrozenTableEmbedding, make_fp8_block_decode
+    block = int(getattr(emb, "block_size", 32))
+    table = UnslothFrozenTableEmbedding(
+        emb.num_embeddings, emb.embedding_dim, dtype=emb.weight.dtype,
+        table_name=f"deepseek_v41 engram layer {key}", row_shape=(emb.embedding_dim,),
+    )
+    table.checkpoint_prefixes = (f"layers.{key}.engram.embed", f"model.engram_tables.{key}", f"engram_tables.{key}")
+    table.checkpoint_planes = {"weight": (r"weight",), "scale": (r"scale", r"weight_scale_inv")}
+    table.optional_planes = ("scale",)
+    table.export_suffixes = {"weight": "weight", "scale": "weight_scale_inv"}
+    table.block_size = block
+    # The e8m0 scale goes with fp8 rows only: a bf16 copy (a transformers save) carries an unused weight_scale_inv.
+    table.select_planes = lambda dtypes: ("weight", "scale") if "scale" in dtypes and dtypes["weight"].startswith("F8_") else ("weight",)
+    table.make_decode = lambda planes: make_fp8_block_decode(block_size=block) if "scale" in planes else None
+
+    def after_bind(model, planes, quantizer=None, table=table):
+        # DeepseekV41EngramEmbedding.forward: float32 rows when the fp8 table is kept (dequantize=False); a
+        # dequantized load folded the scales into rows of the model dtype, which the lookup returns as is.
+        if "scale" not in planes:
+            return
+        if _fp8_weights_kept(model, quantizer):
+            table.table_dtype = torch.float32
+        else:
+            # The model holds dequantized rows and drops its quantization config: a save must write those rows,
+            # not fp8 rows + scales that a reload would read as plain rows.
+            table.export_decoded = "weight"
+
+    table.after_bind = after_bind
+    return table
+
+
+def patch_deepseek_v41_engram_table():
+    """Build the two ~98 GB engram tables as parameter-free UnslothFrozenTableEmbedding modules on a checkpoint
+    load, streamed from the checkpoint files (mmap + MADV_RANDOM) instead of loading into host RAM, the same store
+    as Qwen3.8-Flash-Next's n-gram table. UNSLOTH_FROZEN_TABLE=gpu (or auto on a small table) keeps the port's
+    DeepseekV41EngramEmbedding."""
+    modeling = _modeling()
+    if modeling is None:
+        return False
+    mode = os.environ.get("UNSLOTH_FROZEN_TABLE", "auto").strip().lower()
+    if mode == "gpu":
+        return False
+    text_cls = getattr(modeling, "DeepseekV41TextModel", None)
+    emb_cls = getattr(modeling, "DeepseekV41EngramEmbedding", None)
+    if text_cls is None or emb_cls is None:
+        return False
+    try:
+        from unsloth_zoo.frozen_table_store import install_frozen_table_load_hook
+        if not install_frozen_table_load_hook():
+            raise RuntimeError("could not install the frozen table load hook")
+    except Exception as e:
+        if mode in ("disk", "ram"):
+            raise RuntimeError(f"Unsloth: UNSLOTH_FROZEN_TABLE={mode} but the DeepSeek-V4.1 engram patch failed: {e}")
+        logger.warning(f"Unsloth: DeepSeek-V4.1 engram table patch failed ({e}); the tables load into RAM.")
+        return False
+    if not getattr(text_cls.__init__, "_unsloth_frozen_engram", False):
+        original_init = text_cls.__init__
+
+        def __init__(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            tables = getattr(self, "engram_tables", None)
+            if tables is None:
+                return
+            for key in list(tables.keys()):
+                emb = tables[key]
+                if type(emb) is not emb_cls or not emb.weight.is_meta:
+                    continue   # from_config keeps a real table
+                # The released rows are fp8 (one byte each) plus one e8m0 byte per 32 channels.
+                nbytes = emb.num_embeddings * (emb.embedding_dim + emb.embedding_dim // max(1, int(getattr(emb, "block_size", 32))))
+                if _engram_table_wanted(nbytes):
+                    tables[key] = _frozen_engram(modeling, key, emb)
+
+        __init__._unsloth_frozen_engram = True
+        __init__.__wrapped__ = original_init
+        text_cls.__init__ = __init__
+
+    # The table keys now match no parameter: transformers files them as unexpected and never reads them.
+    from transformers.modeling_utils import PreTrainedModel
+    for obj in vars(modeling).values():
+        if isinstance(obj, type) and issubclass(obj, PreTrainedModel) and (
+            "_keys_to_ignore_on_load_unexpected" in obj.__dict__ or obj.__name__ == "DeepseekV41PreTrainedModel"
+        ):
+            current = list(obj.__dict__.get("_keys_to_ignore_on_load_unexpected") or [])
+            obj._keys_to_ignore_on_load_unexpected = current + [p for p in _ENGRAM_UNEXPECTED if p not in current]
+    return True
+
+
+TEMPORARY_PATCHES.append(patch_deepseek_v41_engram_table)

@@ -53,6 +53,7 @@ __all__ = [
     "iter_frozen_table_modules",
 ]
 
+from contextlib import contextmanager
 import copy
 import json
 import mmap
@@ -796,14 +797,36 @@ class UnslothFrozenTableEmbedding(nn.Module):
         store = self.frozen_table_store
         if store is None:
             return
+        decoded = getattr(self, "export_decoded", None)
+        if decoded:
+            # The model holds decoded rows (a dequantized load folded the scales in): the stored planes would reload
+            # as raw rows without the metadata to rescale them. A full save writes the decoded table under `decoded`;
+            # anything else (state_dict for an adapter save) exports nothing rather than 2x the table in RAM.
+            if _FULL_SAVE[0] > 0:
+                destination[prefix + decoded] = self._decode_all()
+            return
+        export = getattr(self, "export_suffixes", None) or {}
         for plane in store.planes.values():
             torch_dtype = _ST_DTYPES[plane.st_dtype][0]
-            for shard, suffix in zip(plane.shards, getattr(self, "checkpoint_suffixes", {}).get(plane.name, ())):
+            names = getattr(self, "checkpoint_suffixes", {}).get(plane.name, ())
+            if plane.name in export and len(plane.shards) == 1:
+                # Under the module's own parameter names (DeepSeek-V4.1: weight / weight_scale_inv), which the
+                # model's save conversion maps back to the checkpoint's.
+                names = (export[plane.name],)
+            for shard, suffix in zip(plane.shards, names):
                 if shard.view is not None:
                     destination[prefix + suffix] = shard.view.view(torch_dtype).view(shard.rows, *plane.cols)
         # The fp8 table's per-tensor scale goes with its rows, so the saved checkpoint decodes the same.
         for suffix, tensor in (getattr(self, "checkpoint_extras", None) or {}).items():
             destination[prefix + suffix] = tensor
+
+    def _decode_all(self, chunk_rows: int = 1 << 20) -> torch.Tensor:
+        store = self.frozen_table_store
+        out = torch.empty((self.num_embeddings, *self.row_shape), dtype=self.table_dtype)
+        for lo in range(0, self.num_embeddings, chunk_rows):
+            ids = torch.arange(lo, min(lo + chunk_rows, self.num_embeddings))
+            out[lo:lo + ids.numel()] = store.gather(ids, dtype=self.table_dtype).cpu()
+        return out
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
                               error_msgs):
@@ -948,8 +971,22 @@ def _common_suffix(a: List[str], b: List[str]) -> int:
     return n
 
 
-def _match_plane(module_name: str, keys: List[str], alternatives: Sequence[str]) -> List[str]:
+def _match_plane(module_name: str, keys: List[str], alternatives: Sequence[str],
+                 prefixes: Optional[Sequence[str]] = None) -> List[str]:
     import re
+    if prefixes:
+        # Exact checkpoint prefixes, tried in order: a table whose checkpoint name differs from its module path
+        # (DeepSeek-V4.1's `layers.<i>.engram.embed` is the model-level `engram_tables.<i>`).
+        keyset = set(keys)
+        for prefix in prefixes:
+            for alt in alternatives:
+                rx = re.compile(r"^" + re.escape(prefix) + r"\.(?:" + alt + r")$")
+                items = [k for k in keyset if rx.match(k)]
+                if len(items) == 1:
+                    return [(items[0], items[0][len(prefix) + 1:])]
+                if len(items) > 1:
+                    raise RuntimeError(f"Unsloth: frozen table {module_name} matches several keys under {prefix}: {sorted(items)[:3]}.")
+        return []
     mod_parts = module_name.split(".")
     # The part from the last "layers.<i>" on must match exactly (never bind layer 1's table to layer 14's).
     need = len(mod_parts)
@@ -997,6 +1034,7 @@ def bind_frozen_tables(
     mode: Optional[str] = None,
     reader: Optional[str] = None,
     strict: bool = True,
+    quantizer=None,
 ) -> Dict[str, FrozenTableStore]:
     """Bind every :class:`UnslothFrozenTableEmbedding` in ``model`` to its rows in ``checkpoint``
     (index json, directory, safetensors file or list of files). Reads safetensors headers only.
@@ -1014,8 +1052,12 @@ def bind_frozen_tables(
     for name, module in modules:
         spec = getattr(module, "checkpoint_planes", None) or DEFAULT_CHECKPOINT_PLANES
         planes, suffixes = {}, {}
+        prefixes = getattr(module, "checkpoint_prefixes", None)
+        optional = set(getattr(module, "optional_planes", ()) or ())
         for plane, alternatives in spec.items():
-            found = _match_plane(name, keys, alternatives)
+            found = _match_plane(name, keys, alternatives, prefixes)
+            if not found and plane in optional:
+                continue
             if not found:
                 if not strict:
                     break
@@ -1026,7 +1068,17 @@ def bind_frozen_tables(
             planes[plane] = [k for k, _ in found]
             suffixes[plane] = [x for _, x in found]
         else:
+            select = getattr(module, "select_planes", None)
+            if select is not None:
+                # Planes picked by the checkpoint dtypes (a bf16 save carries an unused scale next to its rows).
+                dtypes = {p: resolve_tensor_locations(source, names=n[:1])[n[0]].dtype for p, n in planes.items()}
+                keep = set(select(dtypes))
+                planes = {p: v for p, v in planes.items() if p in keep}
+                suffixes = {p: v for p, v in suffixes.items() if p in keep}
             decode = getattr(module, "decode_fn", None)
+            make_decode = getattr(module, "make_decode", None)
+            if decode is None and make_decode is not None:
+                decode = make_decode(set(planes))
             extras = {}
             if decode is None and len(planes) == 1:
                 decode, extras = _scaled_fp8_decode(source, keys, name, planes, suffixes)
@@ -1047,6 +1099,10 @@ def bind_frozen_tables(
             module.bind(store)
             module.checkpoint_suffixes = suffixes
             module.checkpoint_extras = extras
+            after_bind = getattr(module, "after_bind", None)
+            if after_bind is not None:
+                # The load's quantizer: transformers attaches model.hf_quantizer only after the weights are loaded.
+                after_bind(model, set(planes), quantizer if quantizer is not None else getattr(model, "hf_quantizer", None))
             bound[name] = store
     return bound
 
@@ -1088,6 +1144,17 @@ def _scaled_fp8_decode(source, keys, name, planes, suffixes):
 
 
 _LOAD_HOOK_INSTALLED = [False]
+_FULL_SAVE = [0]
+
+
+@contextmanager
+def full_table_export():
+    """Inside a full model save: a table whose model holds decoded rows exports them decoded."""
+    _FULL_SAVE[0] += 1
+    try:
+        yield
+    finally:
+        _FULL_SAVE[0] -= 1
 
 
 def install_frozen_table_load_hook() -> bool:
@@ -1116,7 +1183,7 @@ def install_frozen_table_load_hook() -> bool:
                     f"Unsloth: frozen tables {unbound[:2]} need a safetensors checkpoint to stream from. "
                     "Set UNSLOTH_FROZEN_TABLE=gpu for a normal load."
                 )
-            bind_frozen_tables(model, list(checkpoint_files))
+            bind_frozen_tables(model, list(checkpoint_files), quantizer=getattr(load_config, "hf_quantizer", None))
         return result
 
     _load_pretrained_model._unsloth_frozen_table_hook = True
@@ -1145,6 +1212,26 @@ def _check_save_target(model, save_directory):
         )
 
 
+def _prepare_full_table_save(model, args, kwargs) -> bool:
+    """Whether ``model.save_pretrained(*args, **kwargs)`` must export decoded tables (a model holding decoded rows,
+    for a full-model save). A ``state_dict`` collected before the call (Trainer / FSDP full-state saves) was built
+    outside the export context: the decoded tables it is missing are added to it here."""
+    decoded = [(n, m) for n, m in iter_frozen_table_modules(model) if getattr(m, "export_decoded", None)]
+    # An adapter-only save (transformers' add_adapter / load_adapter integration) filters model.state_dict()
+    # down to the adapters: decoding the tables for it would only allocate them.
+    if not decoded or getattr(model, "_hf_peft_config_loaded", False):
+        return False
+    supplied = kwargs.get("state_dict")
+    if supplied is None and len(args) >= 2 and isinstance(args[1], dict):
+        supplied = args[1]
+    if supplied is not None:
+        for name, module in decoded:
+            key = f"{name}.{module.export_decoded}" if name else module.export_decoded
+            if key not in supplied and module.frozen_table_store is not None:
+                supplied[key] = module._decode_all()
+    return True
+
+
 def _install_save_guard(PreTrainedModel):
     original = PreTrainedModel.save_pretrained
     if getattr(original, "_unsloth_frozen_table_guard", False):
@@ -1152,7 +1239,10 @@ def _install_save_guard(PreTrainedModel):
 
     def save_pretrained(self, save_directory, *args, **kwargs):
         _check_save_target(self, save_directory)
-        return original(self, save_directory, *args, **kwargs)
+        if not _prepare_full_table_save(self, args, kwargs):
+            return original(self, save_directory, *args, **kwargs)
+        with full_table_export():
+            return original(self, save_directory, *args, **kwargs)
 
     save_pretrained._unsloth_frozen_table_guard = True
     save_pretrained.__wrapped__ = original
