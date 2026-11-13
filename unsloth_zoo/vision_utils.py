@@ -2421,28 +2421,24 @@ class UnslothVisionDataCollator:
         return batch
 
     def _extract_images_for_pc(self, example, p_msgs, c_msgs):
-        # PC: top-level images column first, as in the non-PC path; else embedded; else []
+        # PC: top-level images column first, as in the non-PC path; else embedded; else []. Corrupt media raises
+        # like the messages path: returning empty here would emit placeholder tokens with no pixel_values.
         imgs = None
         vids = None
         vids_kwarg = None
-        try:
-            msg_list = (p_msgs or []) + (c_msgs or [])
-            if example.get("images"):
-                imgs = self._load_column_images(example["images"])
-                vids = []
-            elif msg_list:
-                imgs, vids, vids_kwarg = process_vision_info(
-                    msg_list,
-                    size_factor=self.patch_size*2,
-                    return_video_kwargs=True,
-                )
-                if imgs is None: imgs = []
-                if vids is None: vids = []
-        except Exception as e:
-            logger.warning(f"Unsloth: _extract_images_for_pc failed to extract images/videos: {e}")
-            imgs = []
+        msg_list = (p_msgs or []) + (c_msgs or [])
+        if example.get("images"):
+            imgs = self._load_column_images(example["images"])
             vids = []
-        
+        elif msg_list:
+            imgs, vids, vids_kwarg = process_vision_info(
+                msg_list,
+                size_factor=self.patch_size*2,
+                return_video_kwargs=True,
+            )
+            if imgs is None: imgs = []
+            if vids is None: vids = []
+
         return imgs, vids, vids_kwarg
 
     def _resize_images_inplace(self, image):
@@ -2679,6 +2675,11 @@ class UnslothVisionDataCollator:
                 if self.assistant_single_content:
                     self._collapse_assistant_content(p)
                 p = self._clean_none_keys(p)
+                p_txt = self._render_chat(p, add_generation_prompt=True, continue_final_message=False, example=ex)
+            elif is_c_msgs:
+                # A plain-string prompt paired with chat completions still renders through the template: wrap it
+                # as the user turn so prompt_messages stays a list (was str + list -> TypeError).
+                p = [{"role": "user", "content": str(p)}]
                 p_txt = self._render_chat(p, add_generation_prompt=True, continue_final_message=False, example=ex)
             else:
                 p_txt = str(p)
