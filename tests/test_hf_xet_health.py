@@ -411,6 +411,48 @@ def test_a_peer_nodes_failures_do_not_demote_this_one(monkeypatch, tmp_path):
     )
 
 
+def test_a_sub_rtt_cas_budget_does_not_demote(monkeypatch):
+    """A token endpoint answering just inside the 3s budget leaves a 'remaining' of milliseconds: too small for
+    any real RTT, so the CAS HEAD fails on its own timeout and the machine was demoted for 24h on a measurement
+    that never happened. The skip arm used for an exhausted budget is the right outcome here too."""
+    import urllib.error
+    import urllib.request
+
+    _big_machine(monkeypatch)
+    monkeypatch.setattr(health, "_probe_cas_reachable", _UNSTUBBED_PROBE)
+
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+
+    class _Response:
+        status = 200
+
+        def read(self, n = -1):
+            return json.dumps({"casUrl": "https://cas-transfer.example"}).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def _urlopen(request, timeout = None):
+        if "xet-read-token" in getattr(request, "full_url", str(request)):
+            clock["t"] += health.PROBE_TIMEOUT_SECONDS - 0.01
+            return _Response()
+        raise urllib.error.URLError(TimeoutError("timed out"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+
+    verdict = health.xet_health(force = True, probe = True)
+    assert verdict.use_xet is True
+
+    state_path = health.health_state_path()
+    persisted = json.loads(state_path.read_text())["verdict"] if state_path.exists() else None
+    assert persisted != "http", "a sub-RTT CAS budget must not persist a 24h demotion"
+    assert health.xet_health(probe = False).use_xet is True
+
+
 def test_a_peer_nodes_successes_do_not_rescue_a_broken_node(monkeypatch, tmp_path):
     """The mirror failure: a healthy peer's success kept zeroing a broken node's streak."""
     _big_machine(monkeypatch)
