@@ -59,6 +59,26 @@ def test_renumber_safetensor_files_does_not_lose_a_shard_on_name_collision(tmp_p
     ), "a shard's weights were silently overwritten"
 
 
+def test_renumber_safetensor_files_survives_a_staging_named_input(tmp_path):
+    """A crashed earlier run leaves `renaming_<i>_<clean>` files behind, and the local-dir path re-lists every
+    *.safetensors as an input. Staging names drawn from the input namespace clobbered that leftover mid-renumber
+    (then crashed in pass 2); scoped temp names cannot collide with any name fixed before the call."""
+    save_directory = str(tmp_path)
+    leftover, other = "renaming_0_model-00001-of-00002.safetensors", "chunk.safetensors"
+    _write(save_directory, other, b"REAL-SHARD")
+    _write(save_directory, leftover, b"STALE-LOOKING-SHARD")
+
+    returned = renumber_safetensor_files([other, leftover], save_directory)
+
+    on_disk = _read_all(save_directory)
+    assert all(name in on_disk for name in returned), (
+        f"returned names missing on disk: {[n for n in returned if n not in on_disk]}"
+    )
+    assert sorted(on_disk.values()) == sorted([b"REAL-SHARD", b"STALE-LOOKING-SHARD"]), (
+        "a shard's weights were silently overwritten"
+    )
+
+
 def test_renumber_safetensor_files_round_trips_an_ordinary_list(tmp_path):
     """No collision: the temp names must not survive and every file still lands on its clean name."""
     save_directory = str(tmp_path)

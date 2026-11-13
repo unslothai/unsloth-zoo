@@ -9166,11 +9166,15 @@ def renumber_safetensor_files(file_list, save_directory):
     # Rename files (handle potential conflicts with temp names). Two passes: a clean
     # name can equal a later input's own filename (a stale or foreign shard in the
     # list), so no final name may be written until every source is moved aside.
+    # The uuid keeps the staging names outside the input namespace: a leftover
+    # `renaming_*` shard from a crashed run is itself a listable input.
+    import uuid
+    temp_base = str(uuid.uuid4())[:8]
     pending = []
     for i, (old_name, new_name) in enumerate(rename_pairs):
         old_path = os.path.join(save_directory, old_name)
         if os.path.exists(old_path) and old_name != new_name:
-            temp_path = os.path.join(save_directory, f"renaming_{i}_{new_name}")
+            temp_path = os.path.join(save_directory, f"renaming_{temp_base}_{i}_{new_name}")
             os.rename(old_path, temp_path)
             pending.append((temp_path, old_name, new_name))
 
