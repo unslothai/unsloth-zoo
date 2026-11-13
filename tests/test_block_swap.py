@@ -20,6 +20,8 @@ loaded from file since import unsloth_zoo needs unsloth, and conftest stubs torc
 import importlib.util
 import os
 
+import types
+
 import torch
 import torch.nn as nn
 
@@ -618,7 +620,7 @@ def _xrun(blocks, mode, swap, idx = None):
 
 def test_cross_fed_tensor_grads_are_bitwise_with_swap():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     torch.manual_seed(0)
     blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
     for mode in ("reentrant", "non_reentrant", "none"):
@@ -632,7 +634,7 @@ def test_cross_fed_tensor_grads_are_bitwise_with_swap():
 
 def test_block_without_grad_input_is_released_after_backward():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     torch.manual_seed(0)
     blocks = nn.ModuleList([_XBlock(256) for _ in range(4)]).cuda()
     sw = BlockSwap(blocks, 4, prefetch_depth = 1, device = "cuda")
@@ -651,7 +653,7 @@ def test_block_without_grad_input_is_released_after_backward():
 
 def test_shared_parameter_stays_on_the_card():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     shared = nn.Linear(64, 64, bias = False).cuda().requires_grad_(False)
     layers = nn.ModuleList([nn.Sequential(nn.Linear(64, 64, bias = False), shared) for _ in range(3)])
     layers = layers.cuda().requires_grad_(False)
@@ -726,7 +728,7 @@ def test_pool_bytes_gives_equal_size_blocks_of_different_shapes_a_pool_each():
 
 def test_auto_swap_indices_takes_only_the_shortfall():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     layers = nn.ModuleList([nn.Linear(256, 256, bias = False) for _ in range(12)]).cuda().requires_grad_(False)
     layer = 256 * 256 * 4
     dev = layers[0].weight.device
@@ -751,7 +753,7 @@ class _SharedBlock(nn.Module):
 
 def test_auto_swap_indices_counts_no_savings_for_shared_weights():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     shared = nn.Linear(256, 2048, bias = False)
     layers = nn.ModuleList([_SharedBlock(shared) for _ in range(12)]).cuda().requires_grad_(False)
     own = 256 * 256 * 4
@@ -779,7 +781,7 @@ def test_block_on_another_card_gets_its_inputs_moved():
 
 def test_one_card_swap_keeps_fast_decode():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     blocks = nn.ModuleList([_XBlock(64) for _ in range(4)]).cuda().requires_grad_(False)
     sw = BlockSwap(blocks, [1, 3], prefetch_depth = 1)
     assert not sw.spans_devices
@@ -799,7 +801,7 @@ def test_hooks_are_opaque_to_torch_compile():
 
 def test_compiled_layers_match_eager_with_swap():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     from torch import _dynamo
     torch.manual_seed(0)
     blocks = nn.ModuleList([_XBlock(64) for _ in range(4)]).cuda()
@@ -872,7 +874,7 @@ def test_load_layers_to_host_restores_what_it_patched():
 
 def test_load_layers_to_host_matches_a_normal_load(tmp_path):
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
     from transformers import LlamaConfig, LlamaForCausalLM
     torch.manual_seed(0)
     cfg = LlamaConfig(hidden_size = 64, intermediate_size = 128, num_hidden_layers = 6, num_attention_heads = 4,
@@ -956,6 +958,475 @@ def test_host_arena_is_registered_portable(monkeypatch):
     del reg
 
 
+def test_harvest_copy_keeps_samples_still_in_flight():
+    import types
+    # CPU: fake events. A refetch queued before the last copy finished must not lose either sample.
+    class Ev:
+        def __init__(self, done, ms = 0.0):
+            self.done, self.ms = done, ms
+        def query(self):
+            return self.done
+        def elapsed_time(self, end):
+            return end.ms
+
+    old = ({"d": Ev(True)}, {"d": Ev(False, 2.0)})
+    b = types.SimpleNamespace(copy_pending = [old], copy_open = True, t_copy = {"d": Ev(True)},
+                              events = {"d": Ev(True, 3.0)}, nbytes = lambda: 10)
+    sw = types.SimpleNamespace(_tot = {"copy_ms": 0.0, "copies": 0, "copy_bytes": 0})
+    BlockSwap._harvest_copy(sw, b)
+    assert sw._tot == {"copy_ms": 3.0, "copies": 1, "copy_bytes": 10} and b.copy_pending == [old]
+    old[1]["d"].done = True
+    BlockSwap._harvest_copy(sw, b)
+    assert sw._tot == {"copy_ms": 5.0, "copies": 2, "copy_bytes": 20} and b.copy_pending == []
+
+
+def test_stats_reports_placement_and_timings_after_a_step():
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    import torch.utils.checkpoint as cp
+    torch.manual_seed(0)
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
+    sw = BlockSwap(blocks, [1, 3, 5, 7], prefetch_depth = 1, device = "cuda")
+    # Step 1 is warmup and stays out of the window, so run two.
+    for _ in range(2):
+        x = torch.randn(4, 256, device = "cuda", requires_grad = True)
+        enc = torch.randn(4, 256, device = "cuda", requires_grad = True)
+        h = x
+        for b in blocks:
+            h = cp.checkpoint(b, h, enc, use_reentrant = False)
+        h.square().sum().backward()
+    torch.cuda.synchronize()
+    s = sw.stats()
+    assert s["total_layers"] == 8 and s["swapped"] == [1, 3, 5, 7]
+    assert set(s["state"]) == {1, 3, 5, 7} and set(s["state"].values()) <= {"gpu", "host", "copying", "held"}
+    # After backward only the next step's first block is armed.
+    assert list(s["state"].values()).count("host") == 3
+    assert s["copies"] > 0 and s["copy_ms"] > 0 and s["compute_ms"] > 0 and s["layers"] > 0
+    assert s["copy_bytes"] == s["copies"] * sw.blocks[0].nbytes()
+    # The window resets: nothing ran since.
+    assert sw.stats()["copies"] == 0
+    sw.remove()
+
+
+def test_pre_keeps_an_in_flight_timing_sample_for_harvest():
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+
+    class Ev:
+        done, recorded = False, 0
+
+        def record(self, stream):
+            self.recorded += 1
+
+        def query(self):
+            return self.done
+
+        def elapsed_time(self, other):
+            return 1.0
+
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(4)]).cuda()
+    sw = BlockSwap(blocks, [1, 3], prefetch_depth = "auto", device = "cuda")
+    b = sw.blocks[0]
+    marks = [Ev(), Ev(), Ev()]
+    b.marks, b.mark_open = marks, 2
+    # The backward recompute reaches the block before its forward sample finished on the card.
+    sw._pre(0)(blocks[1], (), {})
+    assert b.mark_open == 2 and b.marks is marks and all(m.recorded == 0 for m in marks)
+    marks[2].done = True
+    layers = sw._tot["layers"]
+    sw._harvest()
+    assert sw._tot["layers"] == layers + 1
+    sw.remove()
+
+
+def _auto(n = 8, depth = 1, sample = 1):
+    _mod._AUTO_SAMPLE = sample
+    sw = _scheduler(n, depth = depth)
+    sw._auto, sw._settled, sw._steps, sw._last_stall = True, False, 1, None
+    sw._tot = dict.fromkeys(_mod._STAT_KEYS, 0.0)
+    sw._seen, sw._adapt_seen = dict(sw._tot), dict(sw._tot)
+    sw._harvest = lambda: None
+    sw._grow_pool = lambda: True
+    sw._shrink_pool = lambda: None
+    return sw
+
+
+def _step(sw, copy_ms, compute_ms, stall_ms, layers = 8):
+    for k, v in (("copies", layers), ("copy_ms", copy_ms * layers), ("compute_ms", compute_ms * layers),
+                 ("stall_ms", stall_ms * layers), ("layers", layers)):
+        sw._tot[k] += v
+    sw._steps += 1
+    sw._adapt_depth()
+
+
+def test_auto_depth_deepens_while_each_slot_cuts_the_stall():
+    sw = _auto()
+    _step(sw, 5, 9, 2)
+    assert sw.depth == 2 and not sw._settled
+    _step(sw, 5, 9, 1)
+    assert sw.depth == 3 and not sw._settled
+    _step(sw, 5, 9, 0)
+    assert sw.depth == 3 and sw._settled
+
+
+def test_auto_depth_gives_back_a_slot_that_did_not_help():
+    sw = _auto()
+    shrunk = []
+    sw._shrink_pool = lambda: shrunk.append(sw.depth)
+    _step(sw, 5, 9, 2)
+    _step(sw, 5, 9, 2)
+    assert sw.depth == 1 and sw._settled and shrunk == [2]
+
+
+def test_auto_depth_tries_one_slot_on_a_slow_bus_and_gives_it_back():
+    sw = _auto()
+    shrunk = []
+    sw._shrink_pool = lambda: shrunk.append(sw.depth)
+    _step(sw, 20, 9, 11)
+    _step(sw, 20, 9, 11)
+    # No depth hides a copy longer than a layer's compute, so the stall stays and the slot goes back.
+    assert sw.depth == 1 and sw._settled and shrunk == [2]
+
+
+def test_auto_depth_judges_each_depth_over_several_steps():
+    sw = _auto(sample = 2)
+    _step(sw, 5, 9, 11)  # one step alone decides nothing
+    assert sw.depth == 1 and not sw._settled
+    _step(sw, 1, 9, 0.5)
+    assert sw.depth == 2 and not sw._settled
+    _mod._AUTO_SAMPLE = 2
+
+
+def test_auto_depth_stops_when_the_card_has_no_room_for_a_slot():
+    sw = _auto()
+    sw._grow_pool = lambda: False
+    _step(sw, 5, 9, 2)
+    assert sw.depth == 1 and sw._settled
+
+
+def test_auto_depth_starts_at_one_and_settles_with_its_pool():
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
+    sw = BlockSwap(blocks, 6, prefetch_depth = "auto", device = "cuda")
+    assert sw.depth == 1 and sw._auto and not sw._settled
+    assert sum(len(v) for v in sw.free.values()) + sw.resident_count() == 2
+    sw.remove()
+
+
+def test_grow_pool_adds_a_slot_only_with_room_for_the_next_step(monkeypatch):
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
+    sw = BlockSwap(blocks, 6, prefetch_depth = "auto", device = "cuda")
+    slots = lambda: sum(len(v) for v in sw.free.values()) + sum(b.slot is not None for b in sw.blocks)
+    before = slots()
+    assert sw._grow_pool() and slots() == before + 1
+    monkeypatch.setattr(_mod, "_free_device_bytes", lambda dv: 0)
+    assert not sw._grow_pool() and slots() == before + 1
+    sw.remove()
+
+
+def test_grow_pool_ignores_the_load_time_peak(monkeypatch):
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    # The process peak still holds the model load (already there at install); only the swap's own last step
+    # counts as headroom.
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
+    now = torch.cuda.memory_allocated()
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a, **k: now + (64 << 30))
+    monkeypatch.setattr(_mod, "_WORKSPACE_MIN_BYTES", 0)
+    monkeypatch.setattr(_mod, "_WORKSPACE_FRACTION", 0.0)
+    resets = []
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda dv = None: resets.append(dv))
+    sw = BlockSwap(blocks, 6, prefetch_depth = "auto", device = "cuda")
+    # Install opened a fresh peak window: the allocator's peak now starts at what is allocated.
+    assert resets and sw._hwm_fresh
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a, **k: torch.cuda.memory_allocated())
+    monkeypatch.setattr(_mod, "_free_device_bytes", lambda dv: 1 << 30)
+    assert sw._grow_pool()
+    sw._last_peak = {torch.device("cuda").index or 0: now + (2 << 30)}
+    assert not sw._grow_pool()
+    # A temporary inside a layer that no hook saw still shows in the fresh window's peak.
+    sw._last_peak = {}
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a, **k: torch.cuda.memory_allocated() + (2 << 30))
+    assert not sw._grow_pool()
+    sw.remove()
+
+
+_GiB = 1 << 30
+
+
+@__import__("pytest").fixture(autouse = True)
+def _no_cgroup_cap(monkeypatch):
+    # The host-fit tests fake psutil; keep memory_budget from capping that by this machine's real cgroup.
+    monkeypatch.setenv("UNSLOTH_HOST_BUDGET_CGROUP", "0")
+
+
+def _fake_psutil(available, total = 32 * _GiB):
+    import types
+    vm = types.SimpleNamespace(available = available, total = total)
+    return types.SimpleNamespace(virtual_memory = lambda: vm)
+
+
+def test_host_fit_passes_when_the_layers_fit(monkeypatch):
+    import sys
+    # 32 GiB box: reserve is max(4 GiB, 15%) = 4.8 GiB, so 20 GiB free leaves ~15.2 GiB for layers.
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(20 * _GiB))
+    _mod._check_host_fit([_GiB // 2] * 30)
+
+
+def test_host_fit_refuses_with_the_counts_when_the_layers_do_not_fit(monkeypatch):
+    import sys
+    import pytest
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(20 * _GiB))
+    with pytest.raises(ValueError) as e:
+        _mod._check_host_fit([_GiB // 2] * 63)
+    msg = str(e.value)
+    assert "63 layers" in msg and "31.5 GiB" in msg and "15.2 GiB" in msg and "At most 30 layers" in msg
+
+
+def test_host_fit_counts_weights_already_in_host_ram_as_available(monkeypatch):
+    import sys
+    # The host-load guard's running total: layers it already moved are not copied again.
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(6 * _GiB))
+    _mod._check_host_fit([_GiB // 2] * 20, on_host = 10 * _GiB)
+
+
+def test_block_swap_refuses_host_loaded_layers_without_room_to_pack(monkeypatch):
+    import sys, pytest
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    # The chunked fallback copies host-loaded layers before their originals go: both are resident at once.
+    monkeypatch.setenv("UNSLOTH_DISABLE_PINNED_MEMORY", "1")
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)])
+    blocks[:2].cuda(); blocks[2:].cpu()
+    need = sum(p.numel() * p.element_size() for b in blocks[2:] for p in b.parameters())
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(need // 2))
+    with pytest.raises(ValueError, match = "offload_layers asked for 6 layers"):
+        BlockSwap(blocks, 6, device = "cuda")
+
+
+def test_block_swap_credits_host_loaded_layers_when_the_arena_registers_in_place(monkeypatch):
+    import sys, os
+    if not torch.cuda.is_available() or os.name == "nt" or not _mod._can_register():
+        __import__("pytest").skip("needs CUDA")
+    # Registered in place, block by block: only about two blocks are ever held twice.
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)])
+    blocks[:2].cuda(); blocks[2:].cpu()
+    need = sum(p.numel() * p.element_size() for b in blocks[2:] for p in b.parameters())
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(need // 2))
+    BlockSwap(blocks, 6, device = "cuda").remove()
+
+
+def test_host_fit_splits_free_ram_between_local_ranks(monkeypatch):
+    import sys, pytest
+    # 20 GiB free less a 4.8 GiB reserve is 15.2 GiB: 10 GiB fits one rank, not each of two.
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(20 * _GiB))
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    _mod._check_host_fit([_GiB // 2] * 20)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    with pytest.raises(ValueError, match = "At most 15 layers"):
+        _mod._check_host_fit([_GiB // 2] * 20)
+
+
+def test_host_fit_does_not_hold_back_ram_for_a_rank_that_already_loaded(monkeypatch, tmp_path):
+    import sys, pytest
+    # Two local ranks need 8 GiB each. Before either allocates, 16 GiB spare holds both; once rank 1 has loaded,
+    # available RAM already shows its 8 GiB and rank 0 may take the remaining 8 GiB in full.
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setattr(_mod.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    monkeypatch.setenv("MASTER_PORT", "29511")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(_mod, "_HOST_SESSION", 0)
+    _mod._begin_host_session()
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(8 * _GiB))
+    monkeypatch.setattr(_mod, "_host_memory", lambda: (64 * _GiB, 8 * _GiB))
+    # Rank 1 has not reached this load: it is assumed to need as much as this rank.
+    with pytest.raises(ValueError):
+        _mod._check_host_fit([_GiB] * 8)
+    ledger = _mod._rank_ledger()
+    assert ledger is not None and ledger[1:] == (0, 2)
+    (tmp_path / os.path.basename(ledger[0]) / "1").write_text(f"{_mod._HOST_SESSION} 0")
+    _mod._check_host_fit([_GiB] * 8)
+    # Rank 1 still has 4 GiB to go: that much stays held back.
+    (tmp_path / os.path.basename(ledger[0]) / "1").write_text(f"{_mod._HOST_SESSION} {4 * _GiB}")
+    with pytest.raises(ValueError):
+        _mod._check_host_fit([_GiB] * 8)
+    _mod._check_host_fit([_GiB] * 4)
+    # A rank still on the previous load is assumed to need this rank's bytes, whatever it published then.
+    (tmp_path / os.path.basename(ledger[0]) / "1").write_text(f"{_mod._HOST_SESSION - 1} 0")
+    monkeypatch.setattr(_mod, "_host_memory", lambda: (64 * _GiB, 12 * _GiB))
+    with pytest.raises(ValueError):
+        _mod._check_host_fit([_GiB] * 8)
+    _mod._check_host_fit([_GiB] * 6)
+    # This rank published what it still needs, and 0 once the session ends.
+    mine = tmp_path / os.path.basename(ledger[0]) / "0"
+    assert mine.read_text().split() == [str(_mod._HOST_SESSION), str(6 * _GiB)]
+    _mod._end_host_session()
+    assert mine.read_text().split() == [str(_mod._HOST_SESSION), "0"]
+
+
+def test_auto_depth_deepens_when_every_block_already_has_a_slot():
+    # Signatures A/B/A/B at depth 1: both pools already hold both of their blocks, so depth 2 needs no new slot.
+    blocks = [types.SimpleNamespace(sig = s) for s in "ABAB"]
+    fake = types.SimpleNamespace(blocks = blocks, free = {"A": [object()], "B": [object()]}, depth = 1)
+    assert _mod.BlockSwap._grow_pool(fake) is True
+    fake.depth = 3
+    assert _mod.BlockSwap._grow_pool(fake) is False
+
+
+def test_peaks_are_sampled_on_every_card_a_block_uses(monkeypatch):
+    seen = []
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda dv: seen.append(torch.device(dv).index) or 100)
+    fake = types.SimpleNamespace(_step_peak = None)
+    fake._note_peak = lambda dv, extra = 0: _mod.BlockSwap._note_peak(fake, dv, extra)
+    block = types.SimpleNamespace(sizes = {torch.device("cuda", 0): 1, torch.device("cuda", 1): 1},
+                                  home = torch.device("cuda", 0))
+    _mod.BlockSwap._note_block_peak(fake, block)
+    assert sorted(seen) == [0, 1] and set(fake._step_peak) == {0, 1}
+
+
+def test_host_fit_counts_the_most_layers_that_fit(monkeypatch):
+    import sys, pytest
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(4 * _GiB))
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    with pytest.raises(ValueError, match = "At most 2 layers"):
+        _mod._check_host_fit([5 * _GiB, 3 * _GiB, _GiB])
+
+
+def test_host_fit_uses_the_cgroup_capped_host_memory(monkeypatch):
+    import pytest
+    # memory_budget.host_memory_bytes caps psutil by an enforcing cgroup: a container on a big host reports its
+    # own 16 GiB limit and 8 GiB headroom. Reserve max(4 GiB, 15% of 16 GiB) = 4 GiB leaves 4 GiB for layers.
+    monkeypatch.setattr(_mod, "_host_memory", lambda: (16 * _GiB, 8 * _GiB))
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    with pytest.raises(ValueError, match = "At most 8 layers"):
+        _mod._check_host_fit([_GiB // 2] * 20)
+    assert _mod._pin_budget() == 4 * _GiB
+    _mod._check_host_fit([_GiB // 2] * 8)
+
+
+def test_host_fit_is_skipped_without_psutil(monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    _mod._check_host_fit([_GiB] * 1000)
+
+
+def _host_load(n_layers, n, width = 64, meta = False):
+    # meta = True: layers still to stream are on meta, as during a load; _land(layer) materializes one on CPU.
+    layers = nn.ModuleList([nn.Linear(width, width, bias = False, device = "meta" if meta else None)
+                            for _ in range(n_layers)])
+    state = _mod._HostLoad(n, "tail")
+    state.layers, state.indices = layers, swap_indices(n_layers, n, "tail")
+    return state, layers
+
+
+def _land(layer):
+    layer.to_empty(device = "cpu")
+
+
+def test_host_load_refuses_before_moving_any_layer(monkeypatch):
+    import sys
+    import pytest
+    # Each 64x64 fp32 layer is 16 KiB and the CPU-built one counts as already on host: room for 2 of 3.
+    total = 64 * _GiB
+    reserve = int(total * _mod._PIN_RESERVE_FRACTION)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(reserve + 64 * 64 * 4 + 100, total))
+    state, layers = _host_load(4, 3, meta = True)
+    state.shape_bytes = {i: 64 * 64 * 4 for i in state.indices}
+    _land(layers[1])
+    with pytest.raises(ValueError) as e:
+        state.evict(1)
+    assert "3 layers" in str(e.value) and "At most 2 layers" in str(e.value)
+    assert not state.done and layers[1].weight.requires_grad
+
+
+def test_host_load_moves_layers_that_fit(monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(20 * _GiB))
+    state, layers = _host_load(4, 3)
+    for i in state.indices:
+        state.evict(i)
+    assert state.done == {1, 2, 3} and len(state.done_bytes) == 3
+    assert not layers[1].weight.requires_grad
+
+
+def test_host_load_counts_layers_already_moved_as_used(monkeypatch):
+    import sys
+    import pytest
+    total = 64 * _GiB
+    reserve = int(total * _mod._PIN_RESERVE_FRACTION)
+    state, layers = _host_load(4, 3, meta = True)
+    state.shape_bytes = {i: 64 * 64 * 4 for i in state.indices}
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(20 * _GiB, total))
+    _land(layers[1])
+    state.evict(1)
+    # RAM dropped after the first layer landed: the next two no longer fit, and the error counts all three.
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(reserve + 100, total))
+    _land(layers[2])
+    with pytest.raises(ValueError, match = "3 layers"):
+        state.evict(2)
+    assert state.done == {1}
+
+
+def test_host_load_counts_streamed_embeddings_still_to_come(monkeypatch):
+    import sys
+    import pytest
+    # Three 16 KiB layers fit, but a 64 MiB streamed table still on meta does not: refuse before any layer moves.
+    total = 64 * _GiB
+    reserve = int(total * _mod._PIN_RESERVE_FRACTION)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(reserve + 10 * 64 * 64 * 4, total))
+    state, layers = _host_load(4, 3)
+    state.embedding_prefixes = {"emb.": nn.Embedding(1 << 18, 64, device = "meta")}
+    with pytest.raises(ValueError, match = "At most"):
+        state.evict(1)
+    assert not state.done
+
+
+def test_host_load_refuses_an_embedding_that_does_not_fit(monkeypatch):
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    import sys
+    import pytest
+    total = 64 * _GiB
+    reserve = int(total * _mod._PIN_RESERVE_FRACTION)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(reserve + (1 << 20), total))
+    state, layers = _host_load(4, 0)
+    emb = nn.Embedding(1 << 16, 64, device = "cuda")  # 16 MiB
+    state.embedding_prefixes = {"emb.": emb}
+    with pytest.raises(ValueError, match = "At most"):
+        state.evict_embedding(emb)
+    assert emb.weight.device.type == "cuda" and not state.embeddings
+
+
+def test_host_load_is_unguarded_without_psutil(monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    state, layers = _host_load(4, 3)
+    for i in state.indices:
+        state.evict(i)
+    assert state.done == {1, 2, 3}
+
+
+def test_block_swap_refuses_before_moving_anything(monkeypatch):
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    import sys
+    import pytest
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(0))
+    layers = _linear_tail()
+    ptrs = [l.weight.data_ptr() for l in layers]
+    with pytest.raises(ValueError, match = "At most 0 layers"):
+        BlockSwap(layers, 3, prefetch_depth = 1, device = "cuda")
+    assert [l.weight.data_ptr() for l in layers] == ptrs
+    assert all(l.weight.device.type == "cuda" and not l._forward_pre_hooks for l in layers)
+
+
 def test_pin_budget_is_split_across_the_ranks_on_this_host(monkeypatch):
     import sys
     import types
@@ -971,6 +1442,300 @@ def test_pin_budget_is_split_across_the_ranks_on_this_host(monkeypatch):
         monkeypatch.setenv("LOCAL_WORLD_SIZE", bad)
         assert _mod._pin_budget() == spare
 
+
+def test_chunked_fallback_size_matches_what_pack_allocates(monkeypatch):
+    # The host-fit check charges the chunked fallback's rounding: it must be the bytes _pack really takes.
+    monkeypatch.setenv("UNSLOTH_DISABLE_PINNED_MEMORY", "1")
+    monkeypatch.setattr(torch.cuda, "Event", lambda *a, **k: object())
+    monkeypatch.setattr(_mod, "_CHUNK_BYTES", 1 << 16)
+    cpu = torch.device("cpu")
+    layers = [nn.Linear(n, 96, bias = False).requires_grad_(False) for n in (40, 200, 72, 72, 130)]
+    sw = BlockSwap.__new__(BlockSwap)
+    sw.blocks = [_mod._Block(layer, {cpu: None}, cpu) for layer in layers]
+    sw.free, sw._chunks, sw.pinned_bytes = {}, [], 0
+    expected = _mod._chunked_bytes([b.sizes for b in sw.blocks])
+    sw._pack()
+    assert sum(c.numel() for c in sw._chunks) == expected > sum(b.nbytes() for b in sw.blocks)
+
+
+def test_host_fit_charges_the_chunked_fallback_rounding(monkeypatch):
+    import sys, pytest
+    # One 17 GiB layer packs into a 32 GiB chunk when it cannot be registered in place.
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(21 * _GiB))
+    size = 17 * _GiB
+    slack = _mod._chunked_bytes([{"cuda": size}]) - size
+    assert slack == 15 * _GiB
+    _mod._check_host_fit([size])
+    with pytest.raises(ValueError):
+        _mod._check_host_fit([size], slack = slack)
+
+
+def test_auto_depth_without_timing_is_the_fixed_default(monkeypatch):
+    monkeypatch.setattr(_mod, "_TIMING", False)
+    sw = BlockSwap(nn.ModuleList([nn.Linear(4, 4)]), 0, prefetch_depth = "auto")
+    assert (sw._auto, sw._settled, sw.depth) == (False, True, 2)
+    monkeypatch.setattr(_mod, "_TIMING", True)
+    sw = BlockSwap(nn.ModuleList([nn.Linear(4, 4)]), 0, prefetch_depth = "auto")
+    assert (sw._auto, sw._settled, sw.depth) == (True, False, 1)
+
+
+class _HeadModel(nn.Module):
+    """Swapped layers, then a large head and the loss inside forward, as HF models do: the step's peak comes
+    after the last layer ran, and the logits' grad is gone before any layer's backward."""
+
+    def __init__(self, d, n, vocab):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([_XBlock(d) for _ in range(n)])
+        self.head = nn.Linear(d, vocab, bias = False).requires_grad_(False)
+
+    def forward(self, x):
+        h = x
+        for layer in self.model.layers:
+            h = layer(h, x)
+        logits = self.head(h)
+        return types.SimpleNamespace(loss = logits.logsumexp(-1).mean(), logits = logits)
+
+
+def test_auto_depth_peak_includes_the_model_output():
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    torch.manual_seed(0)
+    model = _HeadModel(256, 8, 1 << 15).cuda()
+    # Swapped layers end early (explicit indices), so no swapped layer's hook runs while the head output is alive.
+    sw = BlockSwap(find_decoder_layers(model), [0, 1], prefetch_depth = "auto", device = "cuda")
+    x = torch.randn(1024, 256, device = "cuda", requires_grad = True)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    model(x).loss.backward()
+    true_peak = torch.cuda.max_memory_allocated()
+    k = torch.device("cuda").index or 0
+    # One step done: its peak is the headroom _grow_pool keeps. Without the output hook it stops at the last
+    # swapped layer, a fifth of the true peak here; hooks see op boundaries, not the loss op's own temporaries.
+    assert sw._steps == 1 and sw._last_peak.get(k, 0) >= 0.75 * true_peak, (sw._last_peak, true_peak)
+    sw.remove()
+
+
+class _OwnedLayers(nn.Module):
+    # A model owning `layers`, so BlockSwap(model = ...) hooks its output like a real one.
+    def __init__(self, layers):
+        super().__init__()
+        self.layers = layers
+
+    def forward(self, h, ckpt = False):
+        from torch.utils.checkpoint import checkpoint
+        for layer in self.layers:
+            h = checkpoint(layer, h, use_reentrant = True) if ckpt else layer(h)
+        return h
+
+
+def test_auto_depth_peak_includes_unswapped_layers_backward():
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+
+    class Head(nn.Module):
+        # Trainable and unswapped: its 256 MiB weight grad lands after the first swapped layer's backward hook.
+        def __init__(self):
+            super().__init__()
+            self.big = nn.Parameter(torch.zeros(1 << 26))
+
+        def forward(self, x):
+            return x + self.big[:1].sum() * 0
+
+    torch.manual_seed(0)
+    layers = nn.ModuleList([Head()] + [nn.Linear(256, 256) for _ in range(3)]).cuda()
+    for layer in layers[1:]:
+        layer.requires_grad_(False)
+    model = _OwnedLayers(layers)
+    sw = BlockSwap(layers, [1, 2, 3], prefetch_depth = "auto", device = "cuda", model = model)
+    x = torch.randn(64, 256, device = "cuda", requires_grad = True)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    model(x).sum().backward()
+    true_peak = torch.cuda.max_memory_allocated()
+    k = torch.device("cuda").index or 0
+    # Judged after the whole backward: the head's grad is in the step's peak, not left for the next step.
+    assert sw._steps == 1 and sw._last_peak.get(k, 0) >= 0.9 * true_peak, (sw._last_peak, true_peak)
+    sw.remove()
+
+
+def test_auto_depth_counts_steps_when_the_first_swapped_block_gets_no_grad():
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    torch.manual_seed(0)
+    # Frozen prefix: layers 0 and 1 see no grad-requiring input, only layer 2 onward trains (its bias).
+    layers = nn.ModuleList([nn.Linear(256, 256) for _ in range(4)]).cuda()
+    for li, layer in enumerate(layers):
+        layer.weight.requires_grad_(False)
+        layer.bias.requires_grad_(li >= 2)
+    model = _OwnedLayers(layers)
+    sw = BlockSwap(layers, [1, 2, 3], prefetch_depth = "auto", device = "cuda", model = model)
+    for _ in range(3):
+        model(torch.randn(64, 256, device = "cuda")).sum().backward()
+    # Each backward counts until auto settles; before the fix not one did (the frozen first block never hooks).
+    assert sw._steps >= 2 and (sw._settled or sw._steps == 3), (sw._steps, sw._settled)
+    sw.remove()
+
+
+def test_auto_depth_ends_the_step_from_the_loss_when_logits_are_not_in_the_graph():
+    import types
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    torch.manual_seed(0)
+
+    class FusedCE(nn.Module):
+        # Unsloth's fused cross entropy: the loss is in the graph, the returned logits are not.
+        def __init__(self, layers):
+            super().__init__()
+            self.layers = layers
+
+        def forward(self, h):
+            for layer in self.layers:
+                h = layer(h)
+            return types.SimpleNamespace(loss = h.square().mean(), logits = torch.empty(0, device = h.device))
+
+    layers = nn.ModuleList([nn.Linear(256, 256) for _ in range(4)]).cuda()
+    for layer in layers:
+        layer.weight.requires_grad_(False)
+    model = FusedCE(layers)
+    sw = BlockSwap(layers, [1, 2, 3], prefetch_depth = "auto", device = "cuda", model = model)
+    for _ in range(2):
+        model(torch.randn(64, 256, device = "cuda", requires_grad = True)).loss.backward()
+    assert sw._steps == 2, sw._steps
+    sw.remove()
+
+
+def test_auto_depth_ends_the_step_from_the_loss_when_the_logits_are_a_side_branch():
+    import types
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    torch.manual_seed(0)
+
+    class ReturnLogits(nn.Module):
+        # Fused cross entropy with UNSLOTH_RETURN_LOGITS=1: the logits carry a grad_fn but are not the loss's
+        # ancestors, so backward from the loss never reaches their node.
+        def __init__(self, layers):
+            super().__init__()
+            self.layers, self.head = layers, nn.Linear(256, 512).cuda()
+
+        def forward(self, h):
+            for layer in self.layers:
+                h = layer(h)
+            return types.SimpleNamespace(loss = h.square().mean(), logits = self.head(h))
+
+    layers = nn.ModuleList([nn.Linear(256, 256) for _ in range(4)]).cuda()
+    for layer in layers:
+        layer.weight.requires_grad_(False)
+    model = ReturnLogits(layers)
+    sw = BlockSwap(layers, [0, 1, 2, 3], prefetch_depth = "auto", device = "cuda", model = model)
+    for _ in range(2):
+        out = model(torch.randn(64, 256, device = "cuda"))
+        assert out.logits.grad_fn is not None
+        out.loss.backward()
+    assert sw._steps == 2, sw._steps
+    sw.remove()
+
+
+def test_auto_depth_counts_one_step_per_backward_under_reentrant_checkpointing():
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    torch.manual_seed(0)
+    # Unsloth checkpoints with use_reentrant = True: each layer's backward is its own inner graph.
+    layers = nn.ModuleList([nn.Linear(256, 256) for _ in range(4)]).cuda()
+    for layer in layers:
+        layer.weight.requires_grad_(False)
+    model = _OwnedLayers(layers)
+    sw = BlockSwap(layers, [1, 2, 3], prefetch_depth = "auto", device = "cuda", model = model)
+    for _ in range(3):
+        x = torch.randn(64, 256, device = "cuda", requires_grad = True)
+        model(x, ckpt = True).sum().backward()
+    assert sw._steps == 3, sw._steps
+    sw.remove()
+
+
+def test_output_peak_reads_the_logits_from_a_tuple_with_the_loss_first():
+    import types
+    logits, loss = torch.zeros(4, 8), torch.zeros(())
+    assert _mod._output_logits((loss, logits)) is logits
+    assert _mod._output_logits((logits,)) is logits
+    assert _mod._output_logits(types.SimpleNamespace(logits = logits)) is logits
+
+
+def test_find_decoder_layers_remembers_the_model_without_holding_it():
+    import gc
+    model = _HeadModel(8, 2, 16)
+    layers = find_decoder_layers(model)
+    assert _mod._LAYER_OWNERS[layers]() is model
+    del model
+    gc.collect()
+    assert _mod._LAYER_OWNERS.get(layers) is None or _mod._LAYER_OWNERS[layers]() is None
+
+
+def test_host_load_sizes_each_layer_still_to_come(monkeypatch):
+    import sys
+    # A 256 KiB layer then two 16 KiB ones: 288 KiB in all, not three times the first.
+    total = 64 * _GiB
+    reserve = int(total * _mod._PIN_RESERVE_FRACTION)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(reserve + 300 * 1024, total))
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Linear(w, w, bias = False).to("meta") for w in (64, 256, 64, 64)])
+    state = _mod._HostLoad(3, "tail")
+    state.bind(model)
+    # Loaded, as each would be when its first weight lands (CUDA, so none counts as already on host).
+    for i in (1, 2, 3):
+        model.layers[i].to_empty(device = "cuda" if torch.cuda.is_available() else "cpu")
+    for i in (1, 2, 3):
+        state.evict(i)
+    assert state.done == {1, 2, 3}
+
+
+def test_host_load_reads_layer_sizes_before_the_first_weight_lands(monkeypatch):
+    # transformers 5: set_param_for_module materializes the weight; bind() must have read the meta sizes first.
+    import sys, types
+    seen = {}
+
+    def set_param_for_module(model, target_name, *a, **k):
+        seen.setdefault("bound", state.shape_bytes.get(1))
+        model.layers[1].to_empty(device = "cpu")
+
+    core = types.ModuleType("transformers.core_model_loading")
+    core.set_param_for_module = set_param_for_module
+    monkeypatch.setitem(sys.modules, "transformers.core_model_loading", core)
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Linear(64, 64, bias = False).to("meta") for _ in range(2)])
+    with _mod.load_layers_to_host(1, placement = "tail") as state:
+        core.set_param_for_module(model, "layers.1.weight")
+    assert seen["bound"] == 64 * 64 * 4
+
+
+def test_auto_depth_peak_with_a_layer_list_passed_directly():
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    model = _HeadModel(256, 4, 1 << 12).cuda()
+    layers = nn.ModuleList(list(model.model.layers))  # not from find_decoder_layers
+    without = BlockSwap(layers, [0], prefetch_depth = "auto", device = "cuda")
+    assert len(without.handles) == 3
+    without.remove()
+    sw = BlockSwap(layers, [0], prefetch_depth = "auto", device = "cuda", model = model)
+    assert len(sw.handles) == 4
+    sw.remove()
+
+
+def test_host_load_embedding_check_counts_the_other_tables_to_come(monkeypatch):
+    import sys, pytest
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    total = 64 * _GiB
+    reserve = int(total * _mod._PIN_RESERVE_FRACTION)
+    # Room for one 1 MiB table, not two: refuse at the first, before anything moved.
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(reserve + 1536 * 1024, total))
+    state = _mod._HostLoad(0, "tail", embeddings = True)
+    a, b = nn.Embedding(1024, 256).cuda(), nn.Embedding(1024, 256).to("meta")
+    state.layers, state.embedding_prefixes = nn.ModuleList(), {"a.": a, "b.": b}
+    with pytest.raises(ValueError):
+        state.evict_embedding(a)
+    assert state.embeddings == []
 
 class _Ple(nn.Module):
 
@@ -1027,7 +1792,7 @@ def test_placing_no_placement_params_makes_them_swappable_again(monkeypatch):
 
 def test_auto_swap_indices_does_not_count_a_host_kept_table():
     if not torch.cuda.is_available():
-        return
+        __import__("pytest").skip("needs CUDA")
 
     class Model(_PleModel):
         def __init__(self):
@@ -1043,3 +1808,715 @@ def test_auto_swap_indices_does_not_count_a_host_kept_table():
     # Same signature as its neighbours, so it shares their pool.
     idx, left = auto_swap_indices(layers, 2 * layer, 1, free_bytes = {dev: 0})
     assert idx == [1, 3, 5, 7] and left == 0
+
+
+class _FrozenInputHead(nn.Module):
+    """First swapped layer gets an input that needs no grad (no checkpointing): its release is deferred to the
+    end of backward, after the output hook already queued the step end."""
+
+    def __init__(self, d, n):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([_XBlock(d) for _ in range(n)])
+
+    def forward(self, x):
+        h = x
+        for layer in self.model.layers:
+            h = layer(h, x)
+        return types.SimpleNamespace(loss = h.square().mean(), logits = h)
+
+
+def test_auto_depth_ends_each_step_once_with_a_deferred_first_release():
+    import pytest
+    if not torch.cuda.is_available():
+        pytest.skip("BlockSwap needs a CUDA device")
+    torch.manual_seed(0)
+    model = _FrozenInputHead(64, 4).cuda()
+    sw = BlockSwap(find_decoder_layers(model), [0, 1], prefetch_depth = "auto", device = "cuda")
+    for step in range(3):
+        x = torch.randn(8, 64, device = "cuda")   # requires_grad = False
+        model(x).loss.backward()
+        assert sw._steps == step + 1, (step, sw._steps)
+    sw.remove()
+
+
+def test_auto_depth_skips_peaks_for_a_block_without_swappable_weights():
+    import pytest
+    if not torch.cuda.is_available():
+        pytest.skip("BlockSwap needs a CUDA device")
+    torch.manual_seed(0)
+    model = _FrozenInputHead(64, 4).cuda()
+    model.model.layers[1].requires_grad_(True)   # entirely trainable: nothing to swap, no home card
+    sw = BlockSwap(find_decoder_layers(model), [0, 1], prefetch_depth = "auto", device = "cuda")
+    assert sw.blocks[1].home is None
+    x = torch.randn(8, 64, device = "cuda", requires_grad = True)
+    model(x).loss.backward()
+    assert sw._steps == 1
+    sw.remove()
+
+
+def test_chunked_pack_credits_host_loaded_originals(monkeypatch):
+    import sys, pytest
+    if not torch.cuda.is_available():
+        pytest.skip("BlockSwap needs a CUDA device")
+    # The chunked fallback releases each original right after packing its block: on top of the host-loaded
+    # originals it holds one chunk and one block, not a second copy of everything.
+    monkeypatch.setenv("UNSLOTH_DISABLE_PINNED_MEMORY", "1")
+    monkeypatch.setattr(_mod, "_can_register", lambda: False)
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)])
+    blocks[:2].cuda(); blocks[2:].cpu()
+    block = sum(p.numel() * p.element_size() for p in blocks[2].parameters() if not p.requires_grad)
+    need = block * 6
+    monkeypatch.setattr(_mod, "_CHUNK_BYTES", block)
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    # Room for the chunk + one block + allocator rounding, far less than a second copy of all six.
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(4 * block))
+    BlockSwap(blocks, 6, device = "cuda").remove()
+
+
+def _bhl_layer(idx):
+    return nn.Sequential(nn.Linear(64, 64), nn.LayerNorm(64))
+
+
+def _bhl_tensors(n, reads):
+    def t(key, shape):
+        def load():
+            reads.append(key)
+            return torch.randn(*shape)
+        return load
+    out = {}
+    for i in range(n):
+        out[f"model.layers.{i}.0.weight"] = t(f"{i}.w", (64, 64))
+        out[f"model.layers.{i}.0.bias"] = t(f"{i}.b", (64,))
+        out[f"model.layers.{i}.1.weight"] = t(f"{i}.ln", (64,))
+        out[f"model.layers.{i}.1.bias"] = t(f"{i}.lnb", (64,))
+    return out
+
+
+def test_build_host_layers_refuses_before_reading_anything(monkeypatch):
+    import sys, pytest
+    pytest.importorskip("bitsandbytes")
+    reads = []
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    # Each layer is 64*64*4 + 3*64*4 bytes in fp32: room for 2 of the 4.
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(2 * (64 * 64 * 4 + 3 * 64 * 4) + 100))
+    with pytest.raises(ValueError, match = "At most 2 layers"):
+        _mod.build_host_layers(_bhl_layer, 0, 4, _bhl_tensors(4, reads), "cpu", torch.float32)
+    assert reads == []
+
+
+def test_build_host_layers_builds_when_it_fits(monkeypatch):
+    import sys, pytest
+    pytest.importorskip("bitsandbytes")
+    reads = []
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(1 << 30))
+    out = _mod.build_host_layers(_bhl_layer, 0, 2, _bhl_tensors(2, reads), "cpu", torch.float32)
+    assert len(out) == 2 and out[0][0].weight.device.type == "cpu" and len(reads) == 8
+
+
+def test_pool_bytes_accepts_auto_like_the_constructor(monkeypatch):
+    monkeypatch.setattr(_mod, "_TIMING", True)
+    assert _mod._pool_bytes([10, 10, 10], "auto") == _mod._pool_bytes([10, 10, 10], 1)
+    monkeypatch.setattr(_mod, "_TIMING", False)
+    assert _mod._pool_bytes([10, 10, 10], "auto") == _mod._pool_bytes([10, 10, 10], 2)
+
+
+def test_host_reserve_is_at_most_a_quarter_of_a_small_host():
+    assert _mod._host_reserve(2 * _GiB) == _GiB // 2
+    assert _mod._host_reserve(32 * _GiB) == int(32 * _GiB * 0.15)
+    assert _mod._host_reserve(16 * _GiB) == 4 * _GiB
+
+
+def test_host_load_skips_host_kept_tables_and_tables_inside_selected_layers():
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(8, 8, bias = False)
+            self.table = nn.Embedding(1 << 20, 64)   # 256 MiB: an extra embedding by size
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.embed_tokens = nn.Embedding(16, 8)
+            self.model.layers = nn.ModuleList([Layer() for _ in range(2)])
+            self._no_placement_params = ["table.weight"]
+
+        def get_input_embeddings(self):
+            return self.model.embed_tokens
+
+    with torch.device("meta"):
+        m = Model()
+    state = _mod._HostLoad([0, 1], "tail", embeddings = True)
+    state.bind(m)
+    # The tables live in selected layers (charged with them, not again as streamed tables) and are host-kept.
+    assert state.embedding_prefixes == {}
+    assert state.shape_bytes == {0: 8 * 8 * 4, 1: 8 * 8 * 4}
+
+
+def test_unindexed_cuda_device_is_canonical():
+    import pytest
+    if not torch.cuda.is_available():
+        pytest.skip("BlockSwap needs a CUDA device")
+    blocks = nn.ModuleList([_XBlock(16) for _ in range(3)]).cuda()
+    sw = BlockSwap(blocks, [1], device = "cuda")
+    assert sw.device.index == torch.cuda.current_device() and not sw.spans_devices
+    sw.remove()
+
+
+def test_pool_growth_keeps_the_optimizer_reserve():
+    import pytest
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
+    sw = BlockSwap(blocks, 6, prefetch_depth = "auto", device = "cuda")
+    k = torch.cuda.current_device()
+    # Each block's trainable lora (256 x 256 fp32) is reserved for AdamW: 12 bytes per param, all 8 blocks.
+    assert sw._optimizer_reserve.get(k) == 8 * 256 * 256 * 12
+    free = _mod._free_device_bytes(torch.device("cuda", k))
+    sw._optimizer_reserve = {k: free}
+    sw._last_peak = {}
+    assert sw._grow_pool() is False
+    sw.remove()
+
+
+def test_cuda_index_of_cpu_and_bare_devices():
+    assert _mod._cuda_index("cpu") is None
+    if torch.cuda.is_available():
+        assert _mod._cuda_index("cuda") == torch.cuda.current_device() == _mod._cuda_index(torch.device("cuda", torch.cuda.current_device()))
+
+
+def test_host_load_charges_a_param_shared_by_selected_layers_once():
+    shared = nn.Linear(64, 64, bias = False, device = "meta")
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.own = nn.Linear(8, 8, bias = False)
+            self.shared = shared
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = nn.Module()
+            self.model.layers = nn.ModuleList([Layer() for _ in range(4)])
+
+    with torch.device("meta"):
+        m = Model()
+    state = _mod._HostLoad([0, 1, 2, 3], "tail")
+    state.bind(m)
+    own, big = 8 * 8 * 4, 64 * 64 * 4
+    assert state.shape_bytes == {0: own + big, 1: own, 2: own, 3: own}
+
+
+def test_pool_growth_counts_the_allocator_high_water_mark(monkeypatch):
+    import pytest
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
+    sw = BlockSwap(blocks, 6, prefetch_depth = "auto", device = "cuda")
+    k = torch.cuda.current_device()
+    sw._last_peak, sw._optimizer_reserve = {}, {}
+    total = torch.cuda.get_device_properties(k).total_memory
+    # A temporary inside a layer pushed the high-water mark to the whole card: no room left to grow.
+    sw._hwm_base = {k: 0}
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda dv = None: total)
+    assert sw._grow_pool() is False
+    sw.remove()
+
+
+def test_file_backed_cpu_storage_is_not_credited(tmp_path):
+    import sys, pytest
+    if not sys.platform.startswith("linux"):
+        pytest.skip("/proc/self/maps is Linux only")
+    path = tmp_path / "w.bin"
+    path.write_bytes(b"\0" * (1 << 20))
+    mapped = torch.from_file(str(path), shared = True, size = 1 << 20, dtype = torch.uint8)
+    ranges = _mod._file_backed_ranges()
+    assert _mod._in_ranges(mapped.untyped_storage().data_ptr(), ranges)
+    anon = torch.empty(1 << 20, dtype = torch.uint8)
+    assert not _mod._in_ranges(anon.untyped_storage().data_ptr(), ranges)
+
+
+def test_layers_to_come_uses_real_bytes_and_the_smallest_ratio():
+    class Layer(nn.Module):
+        def __init__(self, device):
+            super().__init__()
+            self.w = nn.Linear(64, 64, bias = False, device = device)
+
+    meta = 64 * 64 * 4
+    state = _mod._HostLoad([0, 1, 2, 3], "tail")
+    state.layers = nn.ModuleList([Layer("cpu"), Layer("meta"), Layer("meta"), Layer("cpu")])
+    state.indices = [0, 1, 2, 3]
+    state.shape_bytes = {i: meta for i in range(4)}
+    # Layer 0 moved at full size (a skip module kept it 16-bit); the layer being loaded now is 4-bit (1/4).
+    state.done, state.ratios = {0}, {0: 1.0}
+    out = state._layers_to_come(meta // 4, 1)
+    # Layer 1 and 2 (meta) take the smallest ratio seen, layer 3 is materialized: its own bytes.
+    assert out == [meta // 4, meta // 4, meta]
+
+
+def test_layers_to_come_counts_a_shared_materialized_weight_once():
+    shared = nn.Linear(64, 64, bias = False)
+    layers = nn.ModuleList([nn.Sequential(shared, nn.Linear(64, 64, bias = False)) for _ in range(4)])
+    state = _mod._HostLoad([0, 1, 2, 3], "tail")
+    state.layers, state.indices = layers, [0, 1, 2, 3]
+    state.shape_bytes = {i: 2 * 64 * 64 * 4 for i in range(4)}
+    one = 64 * 64 * 4
+    assert state._layers_to_come(2 * one, 0) == [2 * one, one, one, one]
+    # Already moved with an earlier layer: not counted again.
+    state.moved_storages = {shared.weight.untyped_storage().data_ptr()}
+    assert state._layers_to_come(2 * one, 0) == [one] * 4
+
+
+def test_build_host_layers_publishes_what_is_left_after_each_layer(monkeypatch):
+    import sys, types as _t
+    published = []
+    monkeypatch.setattr(_mod, "_publish_host_pending", lambda n: published.append(n))
+    monkeypatch.setattr(_mod, "_check_host_fit", lambda sizes, **k: published.append(("check", sum(sizes))))
+    monkeypatch.setattr(_mod, "_host_layer_bytes", lambda make_layer, idx, *a: 100 * (idx + 1))
+    monkeypatch.setitem(sys.modules, "bitsandbytes", _t.SimpleNamespace(nn = None))
+    _mod.build_host_layers(lambda idx: nn.Identity(), 0, 3, {}, "cpu", torch.float32)
+    assert published == [("check", 600), 500, 300, 0]
+
+
+def test_pool_growth_reads_the_optimizer_reserve_of_adapters_added_after_install():
+    fake = types.SimpleNamespace(_reserve_owner = None, _reserve_layers = nn.ModuleList([nn.Linear(4, 4)]))
+    assert _mod.BlockSwap._optimizer_bytes(fake) == {}   # nothing trainable on a card yet
+    if torch.cuda.is_available():
+        fake._reserve_layers.append(nn.Linear(8, 8, bias = False).cuda())
+        assert _mod.BlockSwap._optimizer_bytes(fake) == {torch.cuda.current_device(): 64 * 12}
+
+
+def test_layers_already_on_cpu_are_credited_by_the_streaming_guard(monkeypatch):
+    import sys
+    # Four 1 GiB-ish layers the device map already put on CPU; little spare RAM: evicting them copies nothing.
+    layers = nn.ModuleList([nn.Linear(256, 256, bias = False) for _ in range(4)])
+    one = 256 * 256 * 4
+    state = _mod._HostLoad([0, 1, 2, 3], "tail")
+    state.layers, state.indices = layers, [0, 1, 2, 3]
+    state.shape_bytes = {i: one for i in range(4)}
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setattr(_mod, "_host_memory", lambda: (64 * _GiB, one // 2))
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    for i in range(4):
+        state.evict(i)
+    assert state.done == {0, 1, 2, 3}
+
+
+def test_streaming_guard_updates_the_rank_ledger_after_each_eviction(monkeypatch):
+    import sys
+    published = []
+    monkeypatch.setattr(_mod, "_publish_host_pending", lambda n: published.append(n))
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(20 * _GiB, 64 * _GiB))
+    state, layers = _host_load(4, 3, meta = True)
+    state.shape_bytes = {i: 64 * 64 * 4 for i in state.indices}
+    one = 64 * 64 * 4
+    for i in state.indices:
+        _land(layers[i])
+        state.evict(i)
+    # Layers that landed on CPU copy nothing; what each check published is the rest still to allocate.
+    assert published and all(n >= 0 for n in published) and published[-1] == 0
+
+
+def test_embedding_table_already_on_cpu_is_credited(monkeypatch):
+    import sys
+    one = 64 * 64 * 4
+    state, layers = _host_load(4, 3, meta = True)
+    state.shape_bytes = {i: one for i in state.indices}
+    state.embedding_prefixes = {"emb.": nn.Embedding(1 << 16, 64)}   # 16 MiB, already on CPU
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setattr(_mod, "_host_memory", lambda: (64 * _GiB, 4 * one))
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    _land(layers[1])
+    state.evict(1)
+    assert state.done == {1}
+
+
+def test_layers_to_come_counts_a_partly_loaded_layer_by_what_landed():
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = nn.Linear(64, 64, bias = False, device = "meta")
+            self.b = nn.Linear(64, 64, bias = False, device = "meta")
+
+    one = 64 * 64 * 4
+    layers = nn.ModuleList([Layer(), Layer()])
+    state = _mod._HostLoad([0, 1], "tail")
+    state.layers, state.indices = layers, [0, 1]
+    state.shape_bytes, state.owned_names = {0: 2 * one, 1: 2 * one}, {0: {"a.weight", "b.weight"}, 1: {"a.weight", "b.weight"}}
+    layers[1].a.to_empty(device = "cpu")   # half of layer 1 landed on CPU
+    out = state._layers_to_come(2 * one, 0)
+    assert out[1] == 2 * one and state.cpu_to_come == one   # not charged twice, the landed half is on host
+
+
+def test_storage_ratio_ignores_a_shared_weight_the_layer_loaded_first():
+    shared = nn.Linear(256, 256, bias = False, device = "meta")
+    layers = nn.ModuleList([nn.Sequential(shared, nn.Linear(16, 16, bias = False, device = "meta")) for _ in range(2)])
+    state = _mod._HostLoad([0, 1], "tail")
+    state.layers, state.indices = layers, [0, 1]
+    seen, state.shape_bytes, state.owned_names = set(), {}, {}
+    for i in (0, 1):
+        own = [(n, p) for n, p in _mod._counted_named(layers[i]) if id(p) not in seen]
+        seen.update(id(p) for _, p in own)
+        state.shape_bytes[i], state.owned_names[i] = sum(p.nbytes for _, p in own), {n for n, _ in own}
+    layers[1].to_empty(device = "cpu")    # layer 1 (which does not own the shared weight) finishes first
+    import sys
+    sys.modules.setdefault("psutil", __import__("psutil"))
+    state.evict(1)
+    assert state.ratios[1] == 1.0
+
+
+def test_install_packing_lowers_the_published_reservation_as_it_goes():
+    # Eight 1 GiB GPU blocks, nothing to release: the reservation falls by what each packed block committed.
+    walk = _mod._HostWalk([(k + 1) * _GiB for k in range(8)], [0] * 8, _GiB)
+    assert walk.pending(-1) == 8 * _GiB
+    assert [walk.pending(k) for k in (0, 3, 7)] == [7 * _GiB, 4 * _GiB, 0]
+
+
+def test_packing_the_cpu_prefix_first_keeps_the_gpu_blocks_reserved():
+    # Ten 1 GiB blocks, the first five already on the CPU. Once the CPU five are packed (and their originals
+    # released), the five GPU blocks still need 5 GiB, not a prorated share of the first estimate.
+    walk = _mod._HostWalk([(k + 1) * _GiB for k in range(10)], [_GiB] * 5 + [0] * 5, _GiB)
+    pend = [walk.pending(k) for k in range(-1, 10)]
+    assert pend[5] == 5 * _GiB + _GiB and pend[-1] == 0     # the five GPU blocks plus one block of margin
+    assert all(a >= b for a, b in zip(pend, pend[1:]))
+    # GPU blocks first: five committed, then each CPU block's copy is held next to its original only until it is
+    # released, so the walk peaks at six blocks (plus the margin).
+    walk = _mod._HostWalk([(k + 1) * _GiB for k in range(10)], [0] * 5 + [_GiB] * 5, _GiB)
+    assert walk.pending(-1) == 7 * _GiB and walk.pending(4) == 2 * _GiB and walk.pending(9) == 0
+
+
+def test_a_large_storage_released_last_is_not_credited_up_front():
+    # Ten 1 GiB GPU blocks then a 1 GiB CPU view of a 10 GiB storage: packing commits 11 GiB before that storage
+    # goes, so the guard must plan for 11 GiB, not 11 - 10 + headroom.
+    walk = _mod._HostWalk([(k + 1) * _GiB for k in range(11)], [0] * 10 + [10 * _GiB], _GiB)
+    assert walk.pending(-1) == 11 * _GiB
+
+
+def test_an_oversized_release_raises_the_published_reservation():
+    # A 1 GiB CPU view of a 10 GiB storage packed first, then ten 1 GiB GPU blocks: install plans a 2 GiB peak,
+    # but once that storage is gone free RAM is 9 GiB higher and all ten GPU blocks are still to commit.
+    walk = _mod._HostWalk([(k + 1) * _GiB for k in range(11)], [10 * _GiB] + [0] * 10, _GiB)
+    assert walk.pending(-1) == 2 * _GiB
+    assert walk.pending(0) == 11 * _GiB
+    published = []
+    import types
+    fake = types.SimpleNamespace(_host_own = walk.pending(-1), _host_walk = walk)
+    orig = _mod._publish_host_pending
+    try:
+        _mod._publish_host_pending = published.append
+        _mod.BlockSwap._publish_packed(fake, 0)
+    finally:
+        _mod._publish_host_pending = orig
+    assert published == [11 * _GiB]
+
+
+def test_committed_chunk_padding_is_not_reserved_again():
+    # 32 blocks of 3 GiB in 4 GiB chunks: 128 GiB in all. With half packed, 64 GiB is committed (padding
+    # included), so 64 GiB is still to come, not 128 - 48.
+    commits = _mod._chunked_commits([{"cuda": 3 * _GiB}] * 32)
+    assert commits[-1] == 128 * _GiB and commits[15] == 64 * _GiB
+    walk = _mod._HostWalk(commits, [0] * 32, 3 * _GiB)
+    assert walk.pending(15) == 64 * _GiB and walk.pending(31) == 0
+
+
+def test_host_fit_waits_for_a_peer_that_is_mid_copy(monkeypatch, tmp_path):
+    # Rank 1 has copied 4 of its 8 GiB (free RAM already shows it) but has not lowered its reservation yet.
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setattr(_mod.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    monkeypatch.setenv("MASTER_PORT", "29512")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(_mod, "_HOST_SESSION", 0)
+    monkeypatch.setattr(_mod, "_PEER_RETRY_S", 0.0)
+    _mod._begin_host_session()
+    ledger = _mod._rank_ledger()
+    peer = tmp_path / os.path.basename(ledger[0]) / "1"
+    peer.write_text(f"{_mod._HOST_SESSION} {8 * _GiB}")
+    monkeypatch.setattr(_mod, "_host_memory", lambda: (64 * _GiB, 12 * _GiB))
+    sleeps = []
+
+    def progress(_):
+        sleeps.append(1)
+        peer.write_text(f"{_mod._HOST_SESSION} {4 * _GiB}")   # the peer publishes its progress
+    monkeypatch.setattr(_mod.time, "sleep", progress)
+    _mod._check_host_fit([_GiB] * 8)
+    assert sleeps
+
+
+def test_an_early_stopped_recompute_keeps_its_wait_sample():
+    class Ev:
+        def __init__(self, t): self.t = t
+        def query(self): return True
+        def elapsed_time(self, other): return other.t - self.t
+    fake = types.SimpleNamespace(_tot = {"stall_ms": 0.0, "compute_ms": 0.0, "layers": 0})
+    block = types.SimpleNamespace(marks = (Ev(0.0), Ev(3.0), Ev(9.0)), mark_open = 1)
+    _mod.BlockSwap._harvest_marks(fake, block)
+    assert fake._tot["stall_ms"] == 3.0 and block.mark_open == 0
+
+
+def test_registered_arena_is_not_prefilled_under_deterministic_algorithms(monkeypatch):
+    import torch.utils.deterministic as det
+    seen = []
+    real_empty = torch.empty
+
+    def spy(*a, **k):
+        seen.append(det.fill_uninitialized_memory)
+        return real_empty(*a, **k)
+    prev = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        monkeypatch.setattr(torch, "empty", spy)
+        _mod._lazy_host_empty(1 << 20)
+    finally:
+        torch.use_deterministic_algorithms(prev)
+    assert seen == [False] and det.fill_uninitialized_memory is True
+
+
+def test_shared_cpu_storage_is_credited_once():
+    shared = nn.Linear(64, 64, bias = False)            # already on CPU, shared by layers 0 and 1
+    layers = nn.ModuleList([nn.Sequential(shared, nn.Linear(8, 8, bias = False)) for _ in range(2)])
+    state = _mod._HostLoad([0, 1], "tail")
+    state.layers, state.indices = layers, [0, 1]
+    state.shape_bytes = {0: 64 * 64 * 4 + 256, 1: 256}
+    state.owned_names = {0: {"0.weight", "1.weight"}, 1: {"1.weight"}}
+    state._layers_to_come(256, 1)                      # layer 1 finished loading first
+    assert state.cpu_to_come == 256                    # layer 0's own weight only: the shared one is layer 1's credit
+
+
+def test_an_in_flight_wait_only_sample_is_kept():
+    class Ev:
+        def __init__(self, t, done): self.t, self.done = t, done
+        def query(self): return self.done
+        def elapsed_time(self, other): return other.t - self.t
+    fake = types.SimpleNamespace(_tot = {"stall_ms": 0.0, "compute_ms": 0.0, "layers": 0})
+    block = types.SimpleNamespace(marks = (Ev(0.0, True), Ev(2.0, False), Ev(0.0, False)), mark_open = 3)
+    fake.blocks = [block]
+    fake._harvest_copy = lambda b: None
+    fake._harvest_marks = lambda b: _mod.BlockSwap._harvest_marks(fake, b)
+    _mod.BlockSwap._harvest(fake)
+    assert block.mark_open == 3 and fake._tot["stall_ms"] == 0.0   # not dropped while in flight
+    block.marks[1].done = True
+    _mod.BlockSwap._harvest(fake)
+    assert block.mark_open == 0 and fake._tot["stall_ms"] == 2.0
+
+
+def test_block_swap_gives_no_credit_for_a_storage_several_layers_view(monkeypatch):
+    import sys, os, pytest
+    if not torch.cuda.is_available() or os.name == "nt" or not _mod._can_register():
+        pytest.skip("needs CUDA")
+    # Six host layers whose weights are views into one storage: it stays resident until the last is packed.
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)])
+    blocks[:2].cuda()
+    big = torch.zeros(6 * 2 * 256 * 256)
+    for k, b in enumerate(blocks[2:]):
+        for j, lin in enumerate((b.w, b.c)):
+            off = (2 * k + j) * 256 * 256
+            lin.weight = nn.Parameter(big[off:off + 256 * 256].view(256, 256), requires_grad = False)
+        b.lora.data = b.lora.data.cpu()
+    need = sum(p.numel() * p.element_size() for b in blocks[2:] for p in b.parameters())
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(need // 2))
+    with pytest.raises(ValueError, match = "offload_layers asked for 6 layers"):
+        BlockSwap(blocks, 6, device = "cuda")
+
+
+def test_deferred_first_release_re_arms_the_next_forward():
+    armed = []
+    fake = types.SimpleNamespace(_auto = False, _settled = True, blocks = [object()], _step_queued = True)
+    fake._release = lambda b: None
+    fake._arm = lambda forward: armed.append(forward)
+    fake._end_step = lambda: armed.append("end")
+    _mod.BlockSwap._bwd(fake, 0)(None)
+    assert armed == [True]
+
+
+def test_a_rank_with_nothing_to_swap_publishes_a_zero_reservation(monkeypatch):
+    published = []
+    monkeypatch.setattr(_mod, "_publish_host_pending", lambda n: published.append((_mod._HOST_SESSION, n)))
+    monkeypatch.setattr(_mod, "_HOST_SESSION", 0)
+    BlockSwap(nn.ModuleList([nn.Linear(4, 4) for _ in range(3)]), 0, device = "cpu")
+    assert published == [(1, 0)]
+
+
+def test_a_peer_still_loading_keeps_its_published_reservation(monkeypatch, tmp_path):
+    monkeypatch.setattr(_mod.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "2")
+    monkeypatch.setenv("MASTER_PORT", "29513")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(_mod, "_HOST_SESSION", 2)
+    ledger = _mod._rank_ledger()
+    (tmp_path / os.path.basename(ledger[0]) / "1").write_text(f"1 {12 * _GiB}")   # peer: still loading, 12 GiB to go
+    assert _mod._others_host_pending(4 * _GiB) == 12 * _GiB
+    (tmp_path / os.path.basename(ledger[0]) / "1").write_text("1 0")              # peer done with that session
+    assert _mod._others_host_pending(4 * _GiB) == 4 * _GiB
+
+
+def test_block_swap_gives_no_credit_for_a_storage_a_buffer_still_views(monkeypatch):
+    import sys, os, pytest
+    if not torch.cuda.is_available() or os.name == "nt" or not _mod._can_register():
+        pytest.skip("needs CUDA")
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)])
+    blocks[:2].cuda()
+    for b in blocks[2:]:
+        b.lora.data = b.lora.data.cpu()
+        b.register_buffer("alias", b.w.weight.data.view(-1), persistent = False)   # keeps w's storage alive
+        b.register_buffer("alias_c", b.c.weight.data.view(-1), persistent = False)
+    need = sum(p.numel() * p.element_size() for b in blocks[2:] for p in b.parameters())
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(need // 2))
+    with pytest.raises(ValueError, match = "offload_layers asked for 6 layers"):
+        BlockSwap(blocks, 6, device = "cuda")
+
+
+def test_block_swap_gives_no_credit_for_a_storage_the_inferred_owner_still_views(monkeypatch):
+    # The usual call, BlockSwap(find_decoder_layers(model), ...): an alias held by the model outside the decoder
+    # list keeps the storage alive, so it must be found through the remembered owner, not only the layers.
+    import sys, os, weakref, pytest
+    if not torch.cuda.is_available() or os.name == "nt" or not _mod._can_register():
+        pytest.skip("needs CUDA")
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)])
+    blocks[:2].cuda()
+    owner = nn.Module()
+    owner.layers = blocks
+    for i, b in enumerate(blocks[2:]):
+        b.lora.data = b.lora.data.cpu()
+        owner.register_buffer(f"alias_w{i}", b.w.weight.data.view(-1), persistent = False)
+        owner.register_buffer(f"alias_c{i}", b.c.weight.data.view(-1), persistent = False)
+    monkeypatch.setitem(_mod._LAYER_OWNERS, blocks, weakref.ref(owner))
+    need = sum(p.numel() * p.element_size() for b in blocks[2:] for p in b.parameters())
+    monkeypatch.setattr(_mod, "_host_reserve", lambda total: 0)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(need // 2))
+    with pytest.raises(ValueError, match = "offload_layers asked for 6 layers"):
+        BlockSwap(blocks, 6, device = "cuda")
+
+
+def test_install_holds_no_reference_to_a_credited_storage_while_packing(monkeypatch):
+    # The credit assumes a CPU original's storage is freed as its block is packed: install must not keep it alive.
+    import os, weakref, numpy as np, pytest
+    if not torch.cuda.is_available() or os.name == "nt" or not _mod._can_register():
+        pytest.skip("needs CUDA")
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(4)]).cuda()
+    big = np.zeros(8 * 256 * 256, dtype = np.float32)       # a larger storage the last block's weight views
+    gone = weakref.ref(big)
+    # Both frozen weights view it, so it is the last storage the credit scan looks at.
+    blocks[3].w.weight.data = torch.from_numpy(big)[:256 * 256].view(256, 256)
+    blocks[3].c.weight.data = torch.from_numpy(big)[256 * 256:2 * 256 * 256].view(256, 256)
+    blocks[3].lora.data = blocks[3].lora.data.cpu()
+    del big
+    seen = {}
+    pack = _mod.BlockSwap._pack
+
+    def spy(self):
+        pack(self)
+        import gc
+        gc.collect()
+        seen["freed"] = gone() is None
+    monkeypatch.setattr(_mod.BlockSwap, "_pack", spy)
+    sw = BlockSwap(blocks, [3], device = "cuda")
+    assert sw._host_credit[0] >= 8 * 256 * 256 * 4
+    assert seen["freed"], "the credited storage was still alive after packing"
+    sw.remove()
+
+
+def test_host_load_projects_quantized_layers_at_their_own_ratio(monkeypatch):
+    # A first selected layer left unquantized (a skip module) loads at full size; the seven 4-bit layers after it
+    # must not be charged at that ratio. 128 KiB + 7 x 32 KiB = 352 KiB really, 1 MiB at one shared ratio.
+    import sys
+
+    class Linear4bit(nn.Module):
+        def __init__(self, d):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(d, d, dtype = torch.bfloat16, device = "meta"), requires_grad = False)
+
+    total = 64 * _GiB
+    reserve = int(total * _mod._PIN_RESERVE_FRACTION)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(reserve + 420 * 1024, total))
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Linear(256, 256, bias = False, dtype = torch.bfloat16, device = "meta")]
+                                 + [Linear4bit(256) for _ in range(7)])
+    state = _mod._HostLoad(list(range(8)), "tail")
+    state.bind(model)
+    model.layers[0].to_empty(device = "cpu")
+    state.evict(0)                      # refused before: 8 x 128 KiB projected against 420 KiB
+    for i in range(1, 8):
+        model.layers[i].weight = nn.Parameter(torch.empty(256 * 256 // 2, 1, dtype = torch.uint8), requires_grad = False)
+        state.evict(i)
+    assert state.done == set(range(8))
+    assert state.decl[1]["weight"][0] == "4bit" and state.decl[0]["weight"][0] == "dense"
+    assert state.kind_ratios["4bit"][1] == 0.25
+
+
+def test_auto_depth_counts_one_step_per_backward_under_non_reentrant_checkpointing_without_an_owner():
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    from torch.utils.checkpoint import checkpoint
+    torch.manual_seed(0)
+    layers = nn.ModuleList([nn.Linear(256, 256) for _ in range(4)]).cuda()
+    for layer in layers:
+        layer.weight.requires_grad_(False)
+    sw = BlockSwap(list(layers), [0, 1, 2, 3], prefetch_depth = "auto", device = "cuda")
+    for _ in range(2):
+        h = torch.randn(64, 256, device = "cuda", requires_grad = True)
+        for layer in layers:
+            h = checkpoint(layer, h, use_reentrant = False)
+        h.sum().backward()
+    assert sw._steps == 2, sw._steps
+    sw.remove()
+
+
+def test_block_swap_gives_no_credit_for_cached_pinned_weights(monkeypatch):
+    import os, pytest
+    if not torch.cuda.is_available() or os.name == "nt" or not _mod._can_register():
+        pytest.skip("needs CUDA")
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(4)]).cuda()
+    for b in blocks[2:]:
+        b.w.weight.data = b.w.weight.data.cpu().pin_memory()
+        b.c.weight.data = b.c.weight.data.cpu()
+    sw = BlockSwap(blocks, [2, 3], device = "cuda")
+    one = 256 * 256 * 4
+    assert sw._host_credit == [one, one], sw._host_credit      # only c: w's pinned block stays in torch's cache
+    sw.remove()
+
+
+def test_heap_sized_storages_are_credited_only_where_the_heap_can_be_trimmed(monkeypatch):
+    # Below glibc's mmap threshold a freed storage stays resident until malloc_trim: without it, no credit.
+    layers = nn.ModuleList([nn.Linear(64, 64, bias = False).requires_grad_(False) for _ in range(2)])
+    monkeypatch.setattr(_mod, "_MALLOC_TRIM", [None])
+    storages, _ = _mod._creditable_host_storages(list(layers), layers, None)
+    assert storages == {}
+    monkeypatch.setattr(_mod, "_MALLOC_TRIM", [lambda n: 1])
+    storages, _ = _mod._creditable_host_storages(list(layers), layers, None)
+    assert sorted(storages.values()) == [64 * 64 * 4] * 2
+
+
+def test_trim_host_heap_runs_malloc_trim_on_linux():
+    import sys
+    if not sys.platform.startswith("linux"):
+        assert _mod._trim_host_heap() in (True, False)
+        return
+    assert _mod._heap_trimmable() and _mod._trim_host_heap()
+
+
+def test_packing_trims_the_heap_after_each_credited_block(monkeypatch):
+    import os, pytest
+    if not torch.cuda.is_available() or os.name == "nt" or not _mod._can_register():
+        pytest.skip("needs CUDA")
+    calls = []
+    monkeypatch.setattr(_mod, "_trim_host_heap", lambda: calls.append(1) or True)
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(4)]).cuda()
+    for b in blocks[2:]:
+        b.w.weight.data = b.w.weight.data.cpu()
+    sw = BlockSwap(blocks, [0, 1, 2, 3], device = "cuda")
+    assert sw._host_credit[2] > 0 and sw._host_credit[0] == 0
+    assert len(calls) == 2, calls                 # blocks 2 and 3 released credited storages; 0 and 1 none
+    sw.remove()
+
+
+def test_remove_drops_the_reserve_references():
+    fake = types.SimpleNamespace(handles = [], free = {}, blocks = [], _chunks = [], streams = {},
+                                 _reserve_layers = nn.ModuleList([nn.Linear(2, 2)]), _reserve_owner = object())
+    _mod.BlockSwap.remove(fake)
+    assert fake._reserve_layers == () and fake._reserve_owner is None
