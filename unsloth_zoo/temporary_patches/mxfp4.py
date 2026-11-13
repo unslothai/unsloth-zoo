@@ -531,8 +531,16 @@ def patch_convert_moe_packed_tensors():
                 if target_device == "cpu" and torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 return torch.nn.Parameter(dequantized.to(target_device))
+        elif _convertops_params == ("blocks", "scales", "dtype"):
+            # 5.23.0 and newer pass the dtype of the parameter the experts load into.
+            def dequantize_convertops(blocks, scales, dtype):
+                if blocks.dtype == torch.uint8 and blocks.dim() == 4 and keep_mxfp4_experts_packed():
+                    return Mxfp4ExpertParam(blocks, mxfp4_scales = scales)
+                convert = functools.partial(convert_moe_packed_tensors, dtype = dtype)
+                dequantized = _dequantize_to_gpt_oss_layout(convert, blocks, scales)
+                return torch.nn.Parameter(dequantized if dtype is None else dequantized.to(dtype))
         else:
-            # 5.1.0 and newer. Upstream leaves placement to its caller here.
+            # 5.1.0 to 5.22. Upstream leaves placement to its caller here.
             def dequantize_convertops(blocks, scales):
                 if blocks.dtype == torch.uint8 and blocks.dim() == 4 and keep_mxfp4_experts_packed():
                     return Mxfp4ExpertParam(blocks, mxfp4_scales = scales)
