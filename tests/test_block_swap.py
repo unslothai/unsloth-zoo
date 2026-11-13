@@ -2481,6 +2481,40 @@ def test_block_swap_gives_no_credit_for_cached_pinned_weights(monkeypatch):
     sw.remove()
 
 
+def test_heap_sized_storages_are_credited_only_where_the_heap_can_be_trimmed(monkeypatch):
+    # Below glibc's mmap threshold a freed storage stays resident until malloc_trim: without it, no credit.
+    layers = nn.ModuleList([nn.Linear(64, 64, bias = False).requires_grad_(False) for _ in range(2)])
+    monkeypatch.setattr(_mod, "_MALLOC_TRIM", [None])
+    storages, _ = _mod._creditable_host_storages(list(layers), layers, None)
+    assert storages == {}
+    monkeypatch.setattr(_mod, "_MALLOC_TRIM", [lambda n: 1])
+    storages, _ = _mod._creditable_host_storages(list(layers), layers, None)
+    assert sorted(storages.values()) == [64 * 64 * 4] * 2
+
+
+def test_trim_host_heap_runs_malloc_trim_on_linux():
+    import sys
+    if not sys.platform.startswith("linux"):
+        assert _mod._trim_host_heap() in (True, False)
+        return
+    assert _mod._heap_trimmable() and _mod._trim_host_heap()
+
+
+def test_packing_trims_the_heap_after_each_credited_block(monkeypatch):
+    import os, pytest
+    if not torch.cuda.is_available() or os.name == "nt" or not _mod._can_register():
+        pytest.skip("needs CUDA")
+    calls = []
+    monkeypatch.setattr(_mod, "_trim_host_heap", lambda: calls.append(1) or True)
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(4)]).cuda()
+    for b in blocks[2:]:
+        b.w.weight.data = b.w.weight.data.cpu()
+    sw = BlockSwap(blocks, [0, 1, 2, 3], device = "cuda")
+    assert sw._host_credit[2] > 0 and sw._host_credit[0] == 0
+    assert len(calls) == 2, calls                 # blocks 2 and 3 released credited storages; 0 and 1 none
+    sw.remove()
+
+
 def test_remove_drops_the_reserve_references():
     fake = types.SimpleNamespace(handles = [], free = {}, blocks = [], _chunks = [], streams = {},
                                  _reserve_layers = nn.ModuleList([nn.Linear(2, 2)]), _reserve_owner = object())

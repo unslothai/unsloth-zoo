@@ -314,10 +314,47 @@ def _chunked_commits(block_sizes):
     return out
 
 
+# glibc serves allocations below its mmap threshold (dynamic, up to 32 MiB on 64-bit) from the heap, and free()
+# keeps those pages resident until malloc_trim. Larger ones are mmapped and go back to the OS on free.
+_HEAP_MAX_BYTES = 32 * 2**20
+_MALLOC_TRIM = []
+
+
+def _malloc_trim_fn():
+    if not _MALLOC_TRIM:
+        fn = None
+        if sys.platform.startswith("linux"):
+            try:
+                import ctypes
+                fn = ctypes.CDLL(None).malloc_trim
+                fn.argtypes, fn.restype = [ctypes.c_size_t], ctypes.c_int
+            except (OSError, AttributeError):
+                fn = None
+        _MALLOC_TRIM.append(fn)
+    return _MALLOC_TRIM[0]
+
+
+def _heap_trimmable():
+    return _malloc_trim_fn() is not None
+
+
+def _trim_host_heap():
+    """Return free heap pages to the OS (glibc malloc_trim, which also madvises free pages inside the heap).
+    True when it ran; False where there is no malloc_trim (not glibc)."""
+    fn = _malloc_trim_fn()
+    if fn is None:
+        return False
+    fn(0)
+    return True
+
+
 def _creditable_host_storages(swapped, layers, owner):
     """{storage ptr: bytes} of the CPU storages packing `swapped` frees, and {ptr: user set}. Pointers and sizes
     only: a storage reference held past this call would keep the storage alive while packing assumes it is gone."""
     host_storages, users = {}, {}
+    # Heap-sized storages give their pages back only through malloc_trim, which packing runs after each credited
+    # block; without it (not glibc) only storages large enough to be mmapped are credited.
+    trimmable = _heap_trimmable()
     for li, layer in enumerate(swapped):
         for _, p in _swappable(layer):
             if p.device.type == "cpu":
@@ -329,8 +366,9 @@ def _creditable_host_storages(swapped, layers, owner):
                 except RuntimeError:
                     pass
                 st = p.data.untyped_storage()
-                host_storages[st.data_ptr()] = st.nbytes()
                 users.setdefault(st.data_ptr(), set()).add(li)
+                if trimmable or st.nbytes() >= _HEAP_MAX_BYTES:
+                    host_storages[st.data_ptr()] = st.nbytes()
     swapped_ids = {id(p) for layer in swapped for _, p in _swappable(layer)}
     # Buffers too: a registered buffer viewing a weight's storage keeps it alive after the weight is rebound.
     if owner is not None:
@@ -758,6 +796,10 @@ class BlockSwap:
         # ranks hold back only the rise still to come over this point of the walk install planned, chunk padding
         # already committed included, not a share of the first estimate. Not capped at the first estimate either:
         # releasing a storage larger than its block raises free RAM, and the blocks still to pack need it back.
+        credit = getattr(self, "_host_credit", None)
+        if credit is not None and k < len(credit) and credit[k] > 0:
+            # The credit assumes the originals' pages are gone now: heap-served ones need an explicit trim.
+            _trim_host_heap()
         own = getattr(self, "_host_own", None)
         walk = getattr(self, "_host_walk", None)
         if own is not None and walk is not None:
