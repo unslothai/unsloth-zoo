@@ -223,10 +223,10 @@ def group_peft_lora_pairs(tensors, cfg=None):
 
     def _m2s_hit(cand):
         for m2s in m2s_paths:
-            if cand.endswith(m2s):
+            if cand == m2s or cand.endswith("." + m2s):
                 return m2s
             for j, ch in enumerate(cand):
-                if ch == "." and cand[:j].endswith(m2s):
+                if ch == "." and (cand[:j] == m2s or cand[:j].endswith("." + m2s)):
                     return m2s
         return None
 
@@ -349,10 +349,10 @@ def group_peft_lora_pairs(tensors, cfg=None):
 
     def _name_credited(name):
         for cand in _m2s_snapshot_paths:
-            if cand.endswith(name):
+            if cand == name or cand.endswith("." + name):
                 return True
             for j, ch in enumerate(cand):
-                if ch == "." and cand[:j].endswith(name):
+                if ch == "." and (cand[:j] == name or cand[:j].endswith("." + name)):
                     return True
         return False
 
