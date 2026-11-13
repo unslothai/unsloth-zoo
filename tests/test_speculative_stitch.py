@@ -83,7 +83,7 @@ def _trained_head(dtype = torch.float32):
     return {n: torch.randn(*s, dtype = dtype) for n, s in HEAD_NAMES.items()}
 
 
-@pytest.mark.parametrize("prefix", ["mtp.", "model.language_model.mtp."])
+@pytest.mark.parametrize("prefix", ["mtp.", "model.language_model.mtp.", "thinker.mtp."])
 def test_replace_touches_only_mtp_shard(tmp_path, prefix):
     ckpt = _checkpoint(tmp_path, prefix = prefix)
     other = ckpt / "model-00001-of-00002.safetensors"
