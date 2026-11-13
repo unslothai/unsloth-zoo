@@ -434,9 +434,12 @@ def _engram_table_wanted(nbytes):
     return resolve_frozen_table_mode(nbytes) != "gpu"
 
 
-def _fp8_weights_kept(model):
-    """True when the load kept FP8 weights (no dequantize): the port's engram lookup then returns float32 rows."""
-    qc = getattr(getattr(model, "hf_quantizer", None), "quantization_config", None)
+def _fp8_weights_kept(model, quantizer=None):
+    """True when the load kept FP8 weights (no dequantize): the port's engram lookup then returns float32 rows.
+    `quantizer` is the load's (transformers sets model.hf_quantizer only after the weights are in)."""
+    if quantizer is None:
+        quantizer = getattr(model, "hf_quantizer", None)
+    qc = getattr(quantizer, "quantization_config", None)
     if qc is None:
         return False
     method = getattr(qc, "quant_method", None)
@@ -462,11 +465,17 @@ def _frozen_engram(modeling, key, emb):
     table.select_planes = lambda dtypes: ("weight", "scale") if "scale" in dtypes and dtypes["weight"].startswith("F8_") else ("weight",)
     table.make_decode = lambda planes: make_fp8_block_decode(block_size=block) if "scale" in planes else None
 
-    def after_bind(model, planes, table=table):
+    def after_bind(model, planes, quantizer=None, table=table):
         # DeepseekV41EngramEmbedding.forward: float32 rows when the fp8 table is kept (dequantize=False); a
         # dequantized load folded the scales into rows of the model dtype, which the lookup returns as is.
-        if "scale" in planes and _fp8_weights_kept(model):
+        if "scale" not in planes:
+            return
+        if _fp8_weights_kept(model, quantizer):
             table.table_dtype = torch.float32
+        else:
+            # The model holds dequantized rows and drops its quantization config: a save must write those rows,
+            # not fp8 rows + scales that a reload would read as plain rows.
+            table.export_decoded = "weight"
 
     table.after_bind = after_bind
     return table

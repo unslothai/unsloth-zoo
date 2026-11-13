@@ -53,6 +53,7 @@ __all__ = [
     "iter_frozen_table_modules",
 ]
 
+from contextlib import contextmanager
 import copy
 import json
 import mmap
@@ -796,6 +797,14 @@ class UnslothFrozenTableEmbedding(nn.Module):
         store = self.frozen_table_store
         if store is None:
             return
+        decoded = getattr(self, "export_decoded", None)
+        if decoded:
+            # The model holds decoded rows (a dequantized load folded the scales in): the stored planes would reload
+            # as raw rows without the metadata to rescale them. A full save writes the decoded table under `decoded`;
+            # anything else (state_dict for an adapter save) exports nothing rather than 2x the table in RAM.
+            if _FULL_SAVE[0] > 0:
+                destination[prefix + decoded] = self._decode_all()
+            return
         export = getattr(self, "export_suffixes", None) or {}
         for plane in store.planes.values():
             torch_dtype = _ST_DTYPES[plane.st_dtype][0]
@@ -810,6 +819,14 @@ class UnslothFrozenTableEmbedding(nn.Module):
         # The fp8 table's per-tensor scale goes with its rows, so the saved checkpoint decodes the same.
         for suffix, tensor in (getattr(self, "checkpoint_extras", None) or {}).items():
             destination[prefix + suffix] = tensor
+
+    def _decode_all(self, chunk_rows: int = 1 << 20) -> torch.Tensor:
+        store = self.frozen_table_store
+        out = torch.empty((self.num_embeddings, *self.row_shape), dtype=self.table_dtype)
+        for lo in range(0, self.num_embeddings, chunk_rows):
+            ids = torch.arange(lo, min(lo + chunk_rows, self.num_embeddings))
+            out[lo:lo + ids.numel()] = store.gather(ids, dtype=self.table_dtype).cpu()
+        return out
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
                               error_msgs):
@@ -1017,6 +1034,7 @@ def bind_frozen_tables(
     mode: Optional[str] = None,
     reader: Optional[str] = None,
     strict: bool = True,
+    quantizer=None,
 ) -> Dict[str, FrozenTableStore]:
     """Bind every :class:`UnslothFrozenTableEmbedding` in ``model`` to its rows in ``checkpoint``
     (index json, directory, safetensors file or list of files). Reads safetensors headers only.
@@ -1083,7 +1101,8 @@ def bind_frozen_tables(
             module.checkpoint_extras = extras
             after_bind = getattr(module, "after_bind", None)
             if after_bind is not None:
-                after_bind(model, set(planes))
+                # The load's quantizer: transformers attaches model.hf_quantizer only after the weights are loaded.
+                after_bind(model, set(planes), quantizer if quantizer is not None else getattr(model, "hf_quantizer", None))
             bound[name] = store
     return bound
 
@@ -1125,6 +1144,17 @@ def _scaled_fp8_decode(source, keys, name, planes, suffixes):
 
 
 _LOAD_HOOK_INSTALLED = [False]
+_FULL_SAVE = [0]
+
+
+@contextmanager
+def full_table_export():
+    """Inside a full model save: a table whose model holds decoded rows exports them decoded."""
+    _FULL_SAVE[0] += 1
+    try:
+        yield
+    finally:
+        _FULL_SAVE[0] -= 1
 
 
 def install_frozen_table_load_hook() -> bool:
@@ -1153,7 +1183,7 @@ def install_frozen_table_load_hook() -> bool:
                     f"Unsloth: frozen tables {unbound[:2]} need a safetensors checkpoint to stream from. "
                     "Set UNSLOTH_FROZEN_TABLE=gpu for a normal load."
                 )
-            bind_frozen_tables(model, list(checkpoint_files))
+            bind_frozen_tables(model, list(checkpoint_files), quantizer=getattr(load_config, "hf_quantizer", None))
         return result
 
     _load_pretrained_model._unsloth_frozen_table_hook = True
@@ -1189,7 +1219,8 @@ def _install_save_guard(PreTrainedModel):
 
     def save_pretrained(self, save_directory, *args, **kwargs):
         _check_save_target(self, save_directory)
-        return original(self, save_directory, *args, **kwargs)
+        with full_table_export():
+            return original(self, save_directory, *args, **kwargs)
 
     save_pretrained._unsloth_frozen_table_guard = True
     save_pretrained.__wrapped__ = original

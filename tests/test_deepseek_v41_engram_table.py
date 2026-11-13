@@ -189,10 +189,20 @@ def test_disk_engram_matches_the_ports_table(tiny_dsv41, monkeypatch, kind):
         assert torch.equal(grads[n], grads_ref[n]), n
     assert grads["model.layers.1.engram.wkv.weight"].abs().sum() > 0
     assert FROZEN_TABLE_STATS["gathers"] == 2
-    # The export: the port's own names, which its save maps back to the checkpoint's.
+    # The export. A bf16 table: zero-copy views under the port's names. An fp8 table on a dequantized load (no GPU
+    # here, so transformers dequantizes): the model holds decoded rows and drops its quantization config, so fp8
+    # rows + scales would reload as raw rows. Outside a full save nothing is exported (an adapter save must not
+    # decode the table); inside one, the decoded rows equal the port's dequantized table.
     sd = model.state_dict()
-    want = {f"{t}.weight" for t in TABLES} | ({f"{t}.weight_scale_inv" for t in TABLES} if kind == "fp8" else set())
-    assert {k for k in sd if "engram_tables" in k} == want
+    if kind == "bf16":
+        assert {k for k in sd if "engram_tables" in k} == {f"{t}.weight" for t in TABLES}
+    else:
+        assert not [k for k in sd if "engram_tables" in k]
+        with fts.full_table_export():
+            sd = model.state_dict()
+        assert {k for k in sd if "engram_tables" in k} == {f"{t}.weight" for t in TABLES}
+        for t in TABLES:
+            assert torch.equal(sd[t + ".weight"], ref.state_dict()[t + ".weight"]), t
 
 
 @needs_fp8
@@ -212,13 +222,21 @@ def test_native_engram_names_bind_and_decode_like_the_port(tmp_path):
     model = torch.nn.Module()
     model.model = torch.nn.Module()
     model.model.engram_tables = torch.nn.ModuleDict({"14": _frozen_engram(modeling, "14", emb)})
-    fts.bind_frozen_tables(model, str(tmp_path / "m.safetensors"), mode="disk")
+    # A dequantize=False load: the quantizer is the load's (model.hf_quantizer is attached only afterwards).
+    import types
+    kept = types.SimpleNamespace(quantization_config=types.SimpleNamespace(quant_method="fp8", dequantize=False))
+    assert getattr(model, "hf_quantizer", None) is None
+    fts.bind_frozen_tables(model, str(tmp_path / "m.safetensors"), mode="disk", quantizer=kept)
     table = model.model.engram_tables["14"]
     ids = torch.tensor([[0, 5, 95, 40]])
     with torch.no_grad():
         want = ref(ids)                       # float32 rows: the port keeps the fp8 table (dequantize=False)
-        table.table_dtype = torch.float32     # what after_bind sets for a model that kept its fp8 weights
-        assert torch.equal(table(ids), want)
+        got = table(ids)
+        assert got.dtype == torch.float32 and torch.equal(got, want)
+    # Kept fp8: the export is the fp8 rows and scales themselves, which reload with the quantization config.
+    sd = model.state_dict()
+    assert torch.equal(sd["model.engram_tables.14.weight"].view(torch.uint8), q.view(torch.uint8))
+    assert torch.equal(sd["model.engram_tables.14.weight_scale_inv"].view(torch.uint8), s.view(torch.uint8))
 
 
 def test_fp8_kept_load_returns_float32_rows():
