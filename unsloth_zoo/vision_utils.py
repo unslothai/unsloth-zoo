@@ -2098,13 +2098,21 @@ class UnslothVisionDataCollator:
         if 'pixel_values_videos' in batch:
             batch = self._cast_pixel_values_dtype_inplace(batch, 'pixel_values_videos')
 
-        # Mask image tokens and pad tokens
+        # Mask media placeholders by id and pad tokens by position: the pad id can alias eos (the usual recipe when a
+        # tokenizer ships no pad token), so masking it by identity would hide real, attended targets.
         labels = batch["input_ids"].clone()
         padding_ids = self._get_padding_token_ids_on_device(labels.device)
+        tok = getattr(self.processor, "tokenizer", self.processor)
+        pad_id = getattr(tok, "pad_token_id", None)
+        if pad_id is not None:
+            padding_ids = padding_ids[padding_ids != pad_id]
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
+        attention_mask = batch.get("attention_mask")
+        if torch.is_tensor(attention_mask) and attention_mask.shape == labels.shape:
+            labels[attention_mask == 0] = self.ignore_index
         # LLaVA IMAGE_TOKEN_INDEX (-200) sentinel is never a target.
         labels[labels < 0] = self.ignore_index
-        self._mask_targets_after_padding(labels, batch.get("attention_mask"))
+        self._mask_targets_after_padding(labels, attention_mask)
         batch["labels"] = labels
         return batch
 
@@ -2811,11 +2819,12 @@ class UnslothVisionDataCollator:
             and untruncated_ids.shape[1] > self.max_seq_length:
             self._raise_if_truncation_cut_media(untruncated_ids, input_ids, pad_id)
 
-        # Labels: mask attention pads + image/pad tokens; completion-only if requested
+        # Labels: mask attention pads + image/pad tokens; completion-only if requested. pad_id's positions are
+        # already masked above; matching it by identity too would hide attended tokens when pad aliases eos.
         labels = input_ids.clone()
         labels[attention_mask == 0] = self.ignore_index
         padding_ids = self._get_padding_token_ids_on_device(labels.device)
-        labels[torch.isin(labels, padding_ids)] = self.ignore_index
+        labels[torch.isin(labels, padding_ids[padding_ids != pad_id])] = self.ignore_index
         labels[labels < 0] = self.ignore_index
         self._mask_targets_after_padding(labels, attention_mask)
         if self.completion_only_loss:
