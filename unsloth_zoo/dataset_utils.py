@@ -2971,8 +2971,19 @@ def sft_prepare_dataset(
         pass
 
         def _tokenize(example):
+            if do_formatting_func:
+                # The probe above calls formatting_func on one example, but batched=True hands a
+                # column dict here: format each row and flatten so batches do not collapse.
+                keys = list(example)
+                texts = [
+                    text
+                    for i in range(len(example[keys[0]]))
+                    for text in formatting_func({k: example[k][i] for k in keys})
+                ]
+            else:
+                texts = example[dataset_text_field]
             return tokenizer(
-                example[dataset_text_field] if not do_formatting_func else formatting_func(example),
+                texts,
                 truncation = do_truncation,
                 max_length = max_seq_length,
                 return_token_type_ids = _needs_token_type_ids,
