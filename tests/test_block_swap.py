@@ -2421,6 +2421,66 @@ def test_install_holds_no_reference_to_a_credited_storage_while_packing(monkeypa
     sw.remove()
 
 
+def test_host_load_projects_quantized_layers_at_their_own_ratio(monkeypatch):
+    # A first selected layer left unquantized (a skip module) loads at full size; the seven 4-bit layers after it
+    # must not be charged at that ratio. 128 KiB + 7 x 32 KiB = 352 KiB really, 1 MiB at one shared ratio.
+    import sys
+
+    class Linear4bit(nn.Module):
+        def __init__(self, d):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(d, d, dtype = torch.bfloat16, device = "meta"), requires_grad = False)
+
+    total = 64 * _GiB
+    reserve = int(total * _mod._PIN_RESERVE_FRACTION)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(reserve + 420 * 1024, total))
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Linear(256, 256, bias = False, dtype = torch.bfloat16, device = "meta")]
+                                 + [Linear4bit(256) for _ in range(7)])
+    state = _mod._HostLoad(list(range(8)), "tail")
+    state.bind(model)
+    model.layers[0].to_empty(device = "cpu")
+    state.evict(0)                      # refused before: 8 x 128 KiB projected against 420 KiB
+    for i in range(1, 8):
+        model.layers[i].weight = nn.Parameter(torch.empty(256 * 256 // 2, 1, dtype = torch.uint8), requires_grad = False)
+        state.evict(i)
+    assert state.done == set(range(8))
+    assert state.decl[1]["weight"][0] == "4bit" and state.decl[0]["weight"][0] == "dense"
+    assert state.kind_ratios["4bit"][1] == 0.25
+
+
+def test_auto_depth_counts_one_step_per_backward_under_non_reentrant_checkpointing_without_an_owner():
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    from torch.utils.checkpoint import checkpoint
+    torch.manual_seed(0)
+    layers = nn.ModuleList([nn.Linear(256, 256) for _ in range(4)]).cuda()
+    for layer in layers:
+        layer.weight.requires_grad_(False)
+    sw = BlockSwap(list(layers), [0, 1, 2, 3], prefetch_depth = "auto", device = "cuda")
+    for _ in range(2):
+        h = torch.randn(64, 256, device = "cuda", requires_grad = True)
+        for layer in layers:
+            h = checkpoint(layer, h, use_reentrant = False)
+        h.sum().backward()
+    assert sw._steps == 2, sw._steps
+    sw.remove()
+
+
+def test_block_swap_gives_no_credit_for_cached_pinned_weights(monkeypatch):
+    import os, pytest
+    if not torch.cuda.is_available() or os.name == "nt" or not _mod._can_register():
+        pytest.skip("needs CUDA")
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(4)]).cuda()
+    for b in blocks[2:]:
+        b.w.weight.data = b.w.weight.data.cpu().pin_memory()
+        b.c.weight.data = b.c.weight.data.cpu()
+    sw = BlockSwap(blocks, [2, 3], device = "cuda")
+    one = 256 * 256 * 4
+    assert sw._host_credit == [one, one], sw._host_credit      # only c: w's pinned block stays in torch's cache
+    sw.remove()
+
+
 def test_remove_drops_the_reserve_references():
     fake = types.SimpleNamespace(handles = [], free = {}, blocks = [], _chunks = [], streams = {},
                                  _reserve_layers = nn.ModuleList([nn.Linear(2, 2)]), _reserve_owner = object())

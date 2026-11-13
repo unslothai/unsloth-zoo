@@ -321,6 +321,13 @@ def _creditable_host_storages(swapped, layers, owner):
     for li, layer in enumerate(swapped):
         for _, p in _swappable(layer):
             if p.device.type == "cpu":
+                # Pinned by torch's caching host allocator: freeing it parks the block in that cache, still pinned,
+                # and nothing returns it to the OS while packing. Never credited.
+                try:
+                    if p.data.is_pinned():
+                        continue
+                except RuntimeError:
+                    pass
                 st = p.data.untyped_storage()
                 host_storages[st.data_ptr()] = st.nbytes()
                 users.setdefault(st.data_ptr(), set()).add(li)
@@ -916,9 +923,15 @@ class BlockSwap:
             if self._auto and not self._settled:
                 self._note_block_peak(self.blocks[i])
             self._release(self.blocks[i])
-            # The output's grad hook already queued the step end from the outer graph (see _output_peak).
+            # The output's grad hook already queued the step end from the outer graph (see _output_peak). Without
+            # one (a bare layer list), queue it here, once: a non-reentrant checkpoint hooks the same input in the
+            # forward and again in the recompute, so this runs twice per backward.
             if i == 0 and not self._step_queued:
-                self._end_step()
+                self._step_queued = True
+                try:
+                    torch.autograd.Variable._execution_engine.queue_callback(self._end_step)
+                except RuntimeError:  # not inside a backward
+                    self._end_step()
             elif i == 0:
                 # A deferred release (a first swapped layer whose input needs no grad) can run after the queued
                 # _end_step armed the next forward while this block was still resident: arm again, no new step.
@@ -1645,6 +1658,27 @@ def _counted_named(module):
     return [(n, p) for n, p in module.named_parameters() if id(p) in ids]
 
 
+# Loaded bytes per declared (meta) byte of a quantized weight before any layer of that kind has loaded:
+# bitsandbytes declares the unquantized shape in the compute dtype (16-bit) and stores 4 or 8 bits per value.
+_QUANT_PRIOR = {"4bit": 0.25, "8bit": 0.5}
+
+
+def _param_kind(layer, name, p):
+    cls = type(p).__name__
+    if cls == "Params4bit":
+        return "4bit"
+    if cls == "Int8Params":
+        return "8bit"
+    if name.endswith("weight"):
+        owner = layer.get_submodule(name.rpartition(".")[0]) if "." in name else layer
+        mcls = type(owner).__name__
+        if "4bit" in mcls:
+            return "4bit"
+        if "8bit" in mcls:
+            return "8bit"
+    return "dense"
+
+
 class _HostLoad:
     """What `load_layers_to_host` moved: the layer list and the indices living in host RAM."""
 
@@ -1658,6 +1692,10 @@ class _HostLoad:
         # Each selected layer's bytes as declared on meta, to scale a loaded layer's size to the others'.
         self.shape_bytes, self.last_done = {}, None
         self.owned_names = {}
+        # Per selected layer, {param name: (kind, declared bytes)}; per kind, {layer: loaded / declared bytes}.
+        # A layer left unquantized (a skip module) loads at full size while the others load at 4 bits: one ratio
+        # for every layer would charge the quantized ones at full size.
+        self.decl, self.kind_ratios = {}, {}
         self.cpu_to_come = 0
 
     def bind(self, model):
@@ -1679,6 +1717,7 @@ class _HostLoad:
             self.shape_bytes[i] = sum(p.nbytes for _, p in own)
             # By name: loading replaces the meta Parameter objects, the names stay.
             self.owned_names[i] = {n for n, _ in own}
+            self.decl[i] = {n: (_param_kind(layers[i], n, p), p.nbytes) for n, p in own}
         if self.want_embeddings:
             # A table inside a selected layer moves (and is charged) with that layer, not a second time here.
             inside = tuple(self.prefixes)
@@ -1699,6 +1738,22 @@ class _HostLoad:
         base = self.shape_bytes.get(ref, 0)
         ratios = list(self.ratios.values()) + ([size / base] if base else [])
         ratio = min(ratios) if ratios else None
+        ref_kinds = self._kind_sample(ref)
+
+        def projected(j, names = None):
+            # Declared bytes scaled per kind: by the smallest ratio seen for that kind, else the kind's prior.
+            decl = self.decl.get(j)
+            if not decl:
+                return None
+            total = 0
+            for n, (kind, nbytes) in decl.items():
+                if names is not None and n not in names:
+                    continue
+                seen = list(self.kind_ratios.get(kind, {}).values())
+                if kind in ref_kinds:
+                    seen.append(ref_kinds[kind])
+                total += nbytes * (min(seen) if seen else _QUANT_PRIOR.get(kind, 1.0))
+            return int(total)
         out = []
         # Per storage, as evict() moves them: a weight shared by several selected layers (or already moved) once.
         seen = set(self.moved_storages)
@@ -1719,12 +1774,31 @@ class _HostLoad:
                 out.append(sum(p.nbytes for p in fresh))
             elif loaded:
                 # Partly loaded (a shard boundary inside the layer): what landed, plus the rest scaled from meta.
-                out.append(sum(p.nbytes for p in fresh) + int(sum(p.nbytes for p in still_meta) * (ratio or 1.0)))
+                rest = projected(j, {n for n, p in named if p.device.type == "meta" and (owned is None or n in owned)})
+                if rest is None:
+                    rest = int(sum(p.nbytes for p in still_meta) * (ratio or 1.0))
+                out.append(sum(p.nbytes for p in fresh) + rest)
+            elif (est := projected(j)) is not None:
+                out.append(est)
             elif ratio is None:
                 out.append(size)
             else:
                 out.append(int(self.shape_bytes.get(j, base) * ratio))
         return out
+
+    def _kind_sample(self, j):
+        """{kind: loaded / declared bytes} over layer j's params of that kind that have landed."""
+        decl = self.decl.get(j)
+        if not decl or self.layers is None:
+            return {}
+        loaded, declared = {}, {}
+        for n, p in _counted_named(self.layers[j]):
+            if n not in decl or p.device.type == "meta":
+                continue
+            kind, nbytes = decl[n]
+            loaded[kind] = loaded.get(kind, 0) + p.nbytes
+            declared[kind] = declared.get(kind, 0) + nbytes
+        return {k: loaded[k] / declared[k] for k in loaded if declared[k]}
 
     def _pending_embedding_bytes(self, skip = None):
         # Streamed tables still to come; a meta weight already knows its size.
@@ -1793,6 +1867,8 @@ class _HostLoad:
         self.done_bytes.append(size)
         if self.shape_bytes.get(i):
             self.ratios[i] = owned_size / self.shape_bytes[i]
+        for kind, r in self._kind_sample(i).items():
+            self.kind_ratios.setdefault(kind, {})[i] = r
         self.last_done = i
         if own is not None:
             # Now in host RAM, so out of what other local ranks must hold back for this one.
