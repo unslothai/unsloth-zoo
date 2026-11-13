@@ -2657,6 +2657,18 @@ def patch_GradientCheckpointingLayer_keyword_inputs():
         return raise_error("transformers.modeling_layers.GradientCheckpointingLayer", e)
     original = GradientCheckpointingLayer.__call__
     if getattr(original, "_unsloth_keyword_inputs", False): return
+    # transformers 5.23+ checkpoints inside `forward` (wrapped per subclass in __init_subclass__), so a layer called
+    # inside the checkpoint below would checkpoint itself a second time: turn its own off for that inner call.
+    checkpoints_in_forward = "__init_subclass__" in GradientCheckpointingLayer.__dict__
+
+    def _call_without_inner_checkpoint(self, *args, **kwargs):
+        previous = self.gradient_checkpointing
+        self.gradient_checkpointing = False
+        try:
+            return nn.Module.__call__(self, *args, **kwargs)
+        finally:
+            self.gradient_checkpointing = previous
+    pass
 
     def __call__(self, *args, **kwargs):
         if not (self.gradient_checkpointing and self.training):
@@ -2679,7 +2691,8 @@ def patch_GradientCheckpointingLayer_keyword_inputs():
         if changed:
             modeling_layers_logger.warning_once(message.rstrip(",") + ".")
         constants = {k: v for k, v in kwargs.items() if k not in keys}
-        function = _KeywordArgumentCall(partial(nn.Module.__call__, self), keys, constants)
+        inner = _call_without_inner_checkpoint if checkpoints_in_forward else nn.Module.__call__
+        function = _KeywordArgumentCall(partial(inner, self), keys, constants)
         return self._gradient_checkpointing_func(function, *args, *(kwargs[k] for k in keys))
     pass
     __call__._unsloth_keyword_inputs = True
