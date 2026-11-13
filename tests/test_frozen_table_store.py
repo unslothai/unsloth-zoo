@@ -552,3 +552,152 @@ def test_pinned_staging_is_owned_by_one_gather_at_a_time(bf16_table, monkeypatch
     [t.start() for t in threads]
     [t.join() for t in threads]
     assert not overlap[0]
+
+
+# ----------------------------------------------------------------------------------------------
+# fp8 rows with one per-tensor weight_scale (Qwen3.8-Flash-Next-FP8's n-gram table)
+# ----------------------------------------------------------------------------------------------
+needs_fp8 = pytest.mark.skipif(not hasattr(torch, "float8_e4m3fn"), reason="torch without float8_e4m3fn")
+
+
+def _fp8_table(rows=64, cols=16, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    full = torch.randn(rows, cols, generator=g) * 0.05
+    scale = torch.tensor([float(full.abs().max()) / 448.0], dtype=torch.bfloat16)
+    q = (full / scale.float()).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return q, scale
+
+
+@needs_fp8
+@pytest.mark.parametrize("mode", ["disk", "ram"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_fp8_tensor_scaled_rows_match_fp8_embedding(tmp_path, mode, dtype):
+    q, scale = _fp8_table()
+    index, names = _write_sharded(tmp_path, list(torch.chunk(q, 4)))
+    decode = fts.make_fp8_tensor_scaled_decode("F8_E4M3", scale)
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, decode=decode, mode=mode)
+    ids = torch.tensor([[0, 15, 16, 17, 63, 63, 31]])
+    # transformers' FP8Embedding: rows.to(weight_scale.dtype) * weight_scale, the scale in the load dtype.
+    want = q[ids].to(dtype) * scale.to(dtype)
+    got = store.gather(ids, dtype=dtype)
+    assert got.dtype == dtype and torch.equal(got, want)
+    store.close()
+
+
+@needs_fp8
+def test_fp8_rows_never_decode_without_their_scale(tmp_path):
+    q, _ = _fp8_table()
+    index, names = _write_sharded(tmp_path, list(torch.chunk(q, 4)))
+    with pytest.raises(ValueError, match="needs its scale"):
+        FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk")
+    with pytest.raises(ValueError, match="per-tensor scaled table"):
+        fts.make_fp8_tensor_scaled_decode("F8_E4M3", torch.ones(4))
+
+
+@needs_fp8
+def test_bind_reads_the_fp8_table_scale_and_refuses_a_missing_one(tmp_path):
+    q, scale = _fp8_table()
+    module = UnslothFrozenTableEmbedding(64, 16, dtype=torch.bfloat16)
+    model = torch.nn.Module()
+    model.tbl = module
+    # Without a weight_scale next to the shards: loud, never the raw fp8 values.
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    index, _ = _write_sharded(bare, list(torch.chunk(q, 4)), prefix="tbl")
+    with pytest.raises(RuntimeError, match="without a per-tensor weight_scale"):
+        fts.bind_frozen_tables(model, index, mode="disk")
+    # With it: rows scaled, and the scale exported again with the shards.
+    scaled = tmp_path / "scaled"
+    scaled.mkdir()
+    index, names = _write_sharded(scaled, list(torch.chunk(q, 4)), prefix="tbl")
+    save_file({"tbl.weight_scale": scale}, str(scaled / "scale.safetensors"))
+    wm = json.loads(open(index).read())
+    wm["weight_map"]["tbl.weight_scale"] = "scale.safetensors"
+    open(index, "w").write(json.dumps(wm))
+    fts.bind_frozen_tables(model, index, mode="disk")
+    ids = torch.tensor([3, 40, 63])
+    with torch.no_grad():
+        assert torch.equal(module(ids), q[ids].to(torch.bfloat16) * scale)
+    sd = model.state_dict()
+    assert torch.equal(sd["tbl.weight_scale"], scale)
+    assert sorted(k for k in sd if k.startswith("tbl.shard_")) == sorted(names)
+
+
+@pytest.fixture(scope="module")
+def tiny_qwen4_fp8(tiny_qwen4, tmp_path_factory):
+    """The tiny Qwen4Exp re-saved as unsloth/Qwen3.8-Flash-Next-FP8 stores its table: F8_E4M3 shards and one
+    BF16 weight_scale, the table in modules_to_convert (as unsloth's FP8 backfill sets it), linears in BF16."""
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch without float8_e4m3fn")
+    try:
+        from transformers.integrations.finegrained_fp8 import FP8Embedding  # noqa: F401
+        import accelerate  # noqa: F401
+    except Exception:
+        pytest.skip("transformers without FP8Embedding, or no accelerate")
+    from safetensors.torch import load_file
+    src, shard_keys = tiny_qwen4
+    out = tmp_path_factory.mktemp("tiny_qwen4_fp8")
+    index = json.loads(open(os.path.join(src, "model.safetensors.index.json")).read())["weight_map"]
+    tables = {}
+    for fn in sorted(set(index.values())):
+        tables.update({k: v for k, v in load_file(os.path.join(src, fn)).items() if k in shard_keys})
+    amax = max(float(v.float().abs().max()) for v in tables.values())
+    scale = torch.tensor([amax / 448.0], dtype=torch.bfloat16)
+    prefix = shard_keys[0].split(".shard_")[0]
+    weight_map, linears = {}, set()
+    for fn in sorted(set(index.values())):
+        sd = load_file(os.path.join(src, fn))
+        new = {}
+        for k, v in sd.items():
+            if k in tables:
+                new[k] = (v.float() / scale.float()).clamp(-448, 448).to(torch.float8_e4m3fn)
+            else:
+                new[k] = v
+                if k.endswith(".weight") and v.dim() == 2:
+                    linears.add(k[: -len(".weight")])
+        if index[shard_keys[0]] == fn:
+            new[prefix + ".weight_scale"] = scale
+        save_file(new, str(out / fn), metadata={"format": "pt"})
+        weight_map.update(dict.fromkeys(new, fn))
+    (out / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}))
+    cfg = json.loads(open(os.path.join(src, "config.json")).read())
+    cfg["quantization_config"] = {
+        "quant_method": "fp8", "activation_scheme": "dynamic", "weight_block_size": [128, 128],
+        "modules_to_not_convert": sorted(linears) + ["lm_head"],
+        "modules_to_convert": [prefix.split("model.language_model.", 1)[-1]],
+    }
+    (out / "config.json").write_text(json.dumps(cfg))
+    return str(out), shard_keys, prefix
+
+
+@needs_qwen4
+def test_tiny_qwen4_fp8_disk_load_matches_fp8_embedding(tiny_qwen4_fp8, monkeypatch, tmp_path):
+    path, shard_keys, prefix = tiny_qwen4_fp8
+    ref = _load(path, "gpu", monkeypatch, torch.bfloat16)
+    ref_emb = ref.model.language_model.layers[1].ple.ple_embedding.ngram_embedding
+    assert type(ref_emb).__name__ == "FP8Embedding"
+    model = _load(path, "disk", monkeypatch, torch.bfloat16)
+    emb = model.model.language_model.layers[1].ple.ple_embedding.ngram_embedding
+    assert isinstance(emb, UnslothFrozenTableEmbedding) and emb.is_bound
+    ids = torch.arange(0, emb.num_embeddings, 97).unsqueeze(0)
+    x = torch.randint(3, 1000, (1, 24))
+    with torch.no_grad():
+        assert torch.equal(emb(ids), ref_emb(ids))   # before the fix: the raw fp8 values, every row off by the scale
+        assert torch.equal(model(input_ids=x).logits, ref(input_ids=x).logits)
+    # The export carries the scale with the fp8 shards (what save_pretrained writes).
+    sd = model.state_dict()
+    assert sorted(k for k in sd if ".shard_" in k and "ngram_embedding" in k) == shard_keys
+    assert torch.equal(sd[prefix + ".weight_scale"], ref.state_dict()[prefix + ".weight_scale"].to(torch.bfloat16))
+    # A full save is checked where transformers can save this model at all: its own FP8Embedding model fails to
+    # save a dequantized (no GPU) FP8 load with "Undefined Operation", so the disk model is held to the same bar.
+    try:
+        ref.save_pretrained(str(tmp_path / "ref_saved"))
+    except ValueError:
+        return
+    out = tmp_path / "saved"
+    model.save_pretrained(str(out))
+    with torch.no_grad():
+        want = ref(input_ids=x).logits
+        for mode in ("gpu", "disk"):
+            got = _load(str(out), mode, monkeypatch, torch.bfloat16)(input_ids=x).logits
+            assert torch.equal(got, want), mode

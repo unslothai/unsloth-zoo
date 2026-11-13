@@ -45,6 +45,7 @@ __all__ = [
     "frozen_table_next_step",
     "decode_bf16_rows",
     "make_view_decode",
+    "make_fp8_tensor_scaled_decode",
     "make_fp8_block_decode",
     "reset_frozen_table_stats",
     "bind_frozen_tables",
@@ -327,8 +328,14 @@ def decode_bf16_rows(planes: Dict[str, torch.Tensor], dtype: Optional[torch.dtyp
     return rows if dtype is None or dtype == rows.dtype else rows.to(dtype)
 
 
+_FP8_ST_DTYPES = ("F8_E4M3", "F8_E5M2", "F8_E8M0")
+
+
 def make_view_decode(st_dtype: str):
     """Single plane of rows stored as safetensors dtype ``st_dtype`` (BF16 / F16 / F32 ...), cast on request."""
+    if st_dtype in _FP8_ST_DTYPES:
+        # Raw fp8 values are not the table: cast as they are, every row is off by the checkpoint's scale.
+        raise ValueError(f"Unsloth: a {st_dtype} table needs its scale to decode; use make_fp8_tensor_scaled_decode.")
     torch_dtype = _ST_DTYPES[st_dtype][0]
 
     def decode(planes: Dict[str, torch.Tensor], dtype: Optional[torch.dtype] = None) -> torch.Tensor:
@@ -337,6 +344,30 @@ def make_view_decode(st_dtype: str):
         return rows if dtype is None or dtype == rows.dtype else rows.to(dtype)
 
     decode.st_dtype = st_dtype
+    return decode
+
+
+def make_fp8_tensor_scaled_decode(st_dtype: str, scale: torch.Tensor):
+    """Single plane of fp8 rows times one per-tensor ``scale``, exactly transformers' ``FP8Embedding.forward``
+    (``rows.to(scale.dtype) * scale``): Qwen3.8-Flash-Next-FP8's n-gram table and its ``weight_scale``."""
+    torch_dtype = _ST_DTYPES[st_dtype][0]
+    if st_dtype not in _FP8_ST_DTYPES or scale.numel() != 1:
+        raise ValueError(f"Unsloth: a per-tensor scaled table needs fp8 rows and one scale, got {st_dtype} and "
+                         f"{tuple(scale.shape)}.")
+    scale = scale.detach().reshape(1).clone()
+    on_device = {}
+
+    def decode(planes: Dict[str, torch.Tensor], dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        # The scale in the lookup's dtype, as transformers casts the model's weight_scale to the load dtype.
+        (raw,) = planes.values()
+        target = dtype or scale.dtype
+        s = on_device.get((raw.device, target))
+        if s is None:
+            s = on_device[(raw.device, target)] = scale.to(device=raw.device, dtype=target)
+        return raw.view(torch_dtype).to(target) * s
+
+    decode.st_dtype = st_dtype
+    decode.scale = scale
     return decode
 
 
@@ -770,6 +801,9 @@ class UnslothFrozenTableEmbedding(nn.Module):
             for shard, suffix in zip(plane.shards, getattr(self, "checkpoint_suffixes", {}).get(plane.name, ())):
                 if shard.view is not None:
                     destination[prefix + suffix] = shard.view.view(torch_dtype).view(shard.rows, *plane.cols)
+        # The fp8 table's per-tensor scale goes with its rows, so the saved checkpoint decodes the same.
+        for suffix, tensor in (getattr(self, "checkpoint_extras", None) or {}).items():
+            destination[prefix + suffix] = tensor
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
                               error_msgs):
@@ -992,10 +1026,12 @@ def bind_frozen_tables(
             planes[plane] = [k for k, _ in found]
             suffixes[plane] = [x for _, x in found]
         else:
+            decode = getattr(module, "decode_fn", None)
+            extras = {}
+            if decode is None and len(planes) == 1:
+                decode, extras = _scaled_fp8_decode(source, keys, name, planes, suffixes)
             store = FrozenTableStore.from_checkpoint(
-                source, planes,
-                decode=getattr(module, "decode_fn", None),
-                mode=mode, reader=reader, device=device, name=name,
+                source, planes, decode=decode, mode=mode, reader=reader, device=device, name=name,
             )
             first = next(iter(store.planes.values()))
             row_shape = getattr(module, "row_shape", None)
@@ -1010,8 +1046,45 @@ def bind_frozen_tables(
                 )
             module.bind(store)
             module.checkpoint_suffixes = suffixes
+            module.checkpoint_extras = extras
             bound[name] = store
     return bound
+
+
+def _read_small_tensor(loc: "TensorLocation") -> torch.Tensor:
+    with open(loc.path, "rb") as f:
+        f.seek(loc.offset)
+        raw = f.read(loc.nbytes)
+    if len(raw) != loc.nbytes:
+        raise ValueError(f"Unsloth: short read of {loc.name} from {loc.path}.")
+    return torch.frombuffer(bytearray(raw), dtype=torch.uint8).view(_ST_DTYPES[loc.dtype][0]).reshape(loc.shape)
+
+
+def _scaled_fp8_decode(source, keys, name, planes, suffixes):
+    """(decode, {suffix: tensor}) for a single fp8 plane: the rows times the table's per-tensor ``weight_scale``
+    (exported again on save). (None, {}) when the plane is not fp8. An fp8 plane without a per-tensor scale
+    raises: decoding the raw values would silently scale every row wrong."""
+    ((plane, names),) = planes.items()
+    locs = resolve_tensor_locations(source, names=names[:1])
+    st_dtype = locs[names[0]].dtype
+    if st_dtype not in _FP8_ST_DTYPES:
+        return None, {}
+    prefix = names[0][: len(names[0]) - len(suffixes[plane][0]) - 1]
+    scale_key = prefix + ".weight_scale"
+    if scale_key not in keys:
+        found = [k for k in keys if k.startswith(prefix + ".") and "scale" in k[len(prefix):]]
+        raise RuntimeError(
+            f"Unsloth: frozen table {name} is stored as {st_dtype} without a per-tensor weight_scale "
+            f"(found {found[:2] or 'no scale'}), which the disk / ram table cannot decode. "
+            "Set UNSLOTH_FROZEN_TABLE=gpu for a normal load."
+        )
+    scale = _read_small_tensor(resolve_tensor_locations(source, names=[scale_key])[scale_key])
+    if scale.numel() != 1:
+        raise RuntimeError(
+            f"Unsloth: frozen table {name} has a {tuple(scale.shape)} weight_scale; only a per-tensor scale is "
+            "supported. Set UNSLOTH_FROZEN_TABLE=gpu for a normal load."
+        )
+    return make_fp8_tensor_scaled_decode(st_dtype, scale), {"weight_scale": scale.reshape(tuple(scale.shape))}
 
 
 _LOAD_HOOK_INSTALLED = [False]
