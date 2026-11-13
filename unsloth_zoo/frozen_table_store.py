@@ -1212,6 +1212,26 @@ def _check_save_target(model, save_directory):
         )
 
 
+def _prepare_full_table_save(model, args, kwargs) -> bool:
+    """Whether ``model.save_pretrained(*args, **kwargs)`` must export decoded tables (a model holding decoded rows,
+    for a full-model save). A ``state_dict`` collected before the call (Trainer / FSDP full-state saves) was built
+    outside the export context: the decoded tables it is missing are added to it here."""
+    decoded = [(n, m) for n, m in iter_frozen_table_modules(model) if getattr(m, "export_decoded", None)]
+    # An adapter-only save (transformers' add_adapter / load_adapter integration) filters model.state_dict()
+    # down to the adapters: decoding the tables for it would only allocate them.
+    if not decoded or getattr(model, "_hf_peft_config_loaded", False):
+        return False
+    supplied = kwargs.get("state_dict")
+    if supplied is None and len(args) >= 2 and isinstance(args[1], dict):
+        supplied = args[1]
+    if supplied is not None:
+        for name, module in decoded:
+            key = f"{name}.{module.export_decoded}" if name else module.export_decoded
+            if key not in supplied and module.frozen_table_store is not None:
+                supplied[key] = module._decode_all()
+    return True
+
+
 def _install_save_guard(PreTrainedModel):
     original = PreTrainedModel.save_pretrained
     if getattr(original, "_unsloth_frozen_table_guard", False):
@@ -1219,6 +1239,8 @@ def _install_save_guard(PreTrainedModel):
 
     def save_pretrained(self, save_directory, *args, **kwargs):
         _check_save_target(self, save_directory)
+        if not _prepare_full_table_save(self, args, kwargs):
+            return original(self, save_directory, *args, **kwargs)
         with full_table_export():
             return original(self, save_directory, *args, **kwargs)
 

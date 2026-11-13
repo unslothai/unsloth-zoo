@@ -203,6 +203,16 @@ def test_disk_engram_matches_the_ports_table(tiny_dsv41, monkeypatch, kind):
         assert {k for k in sd if "engram_tables" in k} == {f"{t}.weight" for t in TABLES}
         for t in TABLES:
             assert torch.equal(sd[t + ".weight"], ref.state_dict()[t + ".weight"]), t
+        # A state_dict collected before save_pretrained (Trainer / FSDP full-state saves) gets the decoded tables.
+        supplied = model.state_dict()
+        assert fts._prepare_full_table_save(model, (), {"state_dict": supplied})
+        for t in TABLES:
+            assert torch.equal(supplied[t + ".weight"], ref.state_dict()[t + ".weight"]), t
+        # An adapter-only save (transformers' PEFT integration) never decodes the tables.
+        calls = []
+        monkeypatch.setattr(UnslothFrozenTableEmbedding, "_decode_all", lambda self, *a, **k: calls.append(1))
+        monkeypatch.setattr(model, "_hf_peft_config_loaded", True, raising=False)
+        assert not fts._prepare_full_table_save(model, (), {"state_dict": {}}) and calls == []
 
 
 @needs_fp8
