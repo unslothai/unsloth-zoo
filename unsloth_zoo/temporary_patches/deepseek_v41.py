@@ -22,8 +22,8 @@
    overwritten it (layer 3 recomputes with layer 4's compressed KV / indexer keys), so the replayed forward differs
    from the original one. Each checkpointed layer call now gets a private copy of `shared` that is reset to the state
    it saw in the first forward before every run (forward and recompute); its writes go back to the real dict once.
-   Checkpointed layers run under torch.compiler.set_stance("force_eager"): a compiled helper could run compiled in the
-   forward and not in the recompute, and the saved tensors then no longer line up.
+   Compiled helpers run compiled in both passes. `prepare_compiled_checkpoint()` specializes floats so a compiled
+   region keeps one graph across the forward and the recompute (see there).
 2. Fake-quant gradients. `_fake_quant_fp8_block` (window KV, QAT) routes the backward through a float8 cast, so the
    gradient itself is rounded to e4m3 and underflows to exactly zero (`kv_proj` / `kv_norm` never learn);
    `_fake_quant_fp4_block` (compressed KV) passes a gradient only through the block amax. Training uses the
@@ -52,6 +52,7 @@ __all__ = [
     "patch_deepseek_v41_grouped_lora",
     "patch_deepseek_v41_config_aliases",
     "patch_deepseek_v41_engram_table",
+    "prepare_compiled_checkpoint",
 ]
 
 
@@ -72,13 +73,21 @@ def _modeling():
 REPLAY_STATS = {"runs": 0, "compressor_lora": 0}
 
 
-def _force_eager():
-    set_stance = getattr(torch.compiler, "set_stance", None)
-    if set_stance is None:
-        import contextlib
+def prepare_compiled_checkpoint():
+    """Let the checkpointed decoder layers run torch.compile'd helpers. Returns True when it applied.
 
-        return contextlib.nullcontext()
-    return set_stance("force_eager")
+    The layers always checkpoint non-reentrant (see `patch_deepseek_v41_gradient_checkpointing`), which checks that
+    the recompute saves the same tensors as the forward. With unspecialized floats (torch's default), a compiled region
+    holding a LoRA forward lifts `scaling` to a 0-dim CPU tensor input, and the recompute saved it and `lora_B` in the
+    opposite order from the forward ("Recomputed values ... have different metadata"). Specialized floats bake the
+    per-adapter constants in, one graph per region in both passes. Set once at load, before anything compiles: Dynamo
+    guards its config, so toggling it per call would recompile.
+    """
+    dynamo_config = getattr(getattr(torch, "_dynamo", None), "config", None)
+    if dynamo_config is None or not hasattr(dynamo_config, "specialize_float"):
+        return False
+    dynamo_config.specialize_float = True
+    return True
 
 
 class _ReplayShared(dict):
@@ -123,14 +132,11 @@ def patch_deepseek_v41_gradient_checkpointing():
                 if kwargs.get(key) is not None:
                     kwargs[key] = None
 
-        # Eager inside the checkpointed layer: Dynamo can run a compiled helper (rope, mHC, LoRA forwards) in the
-        # forward and skip it in the recompute (or pick another graph), and the saved tensors then no longer line up
-        # ("Recomputed values ... have different metadata").
         def run(*inner_args, **inner_kwargs):
             REPLAY_STATS["runs"] += 1
             replay.clear()
             replay.update(replay._snapshot)
-            with _force_eager(), _compressor_lora(self):
+            with _compressor_lora(self):
                 return torch.nn.Module.__call__(self, *inner_args, **inner_kwargs)
 
         # Non-reentrant, always: the source layer's shared KV tensors leave through `replay`, not through the
