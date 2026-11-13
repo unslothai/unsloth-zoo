@@ -3500,8 +3500,9 @@ pass
 MTP_CONFIG_KEY = "mtp_num_hidden_layers"
 
 # Prefix group is repeatable and order free: Qwen3.5 writes
-# `model.language_model.mtp.*`, older Qwen2-VL naming is `language_model.model.mtp.*`.
-_MTP_TENSOR_RE = re.compile(r"^(?:(?:model|language_model)\.)*mtp\.")
+# `model.language_model.mtp.*`, older Qwen2-VL naming is `language_model.model.mtp.*`,
+# and thinker-arch checkpoints (Qwen3-Omni, Qwen3-ASR) keep the head under `thinker.*`.
+_MTP_TENSOR_RE = re.compile(r"^(?:(?:model|language_model|thinker)\.)*mtp\.")
 
 
 def is_mtp_tensor_name(name):
@@ -3553,7 +3554,7 @@ def _checkpoint_tensor_names(folder):
 
 # The other MTP spelling: DeepSeek-V3 / GLM store the head as extra layers.N blocks past num_hidden_layers; detected
 # only so this repair does not fire on such a checkpoint (mlx/utils.py and llama_cpp.py handle those).
-_LAYER_INDEX_RE = re.compile(r"^(?:(?:model|language_model)\.)*layers\.(\d+)\.")
+_LAYER_INDEX_RE = re.compile(r"^(?:(?:model|language_model|thinker)\.)*layers\.(\d+)\.")
 
 
 def _has_layers_past(tensor_names, num_hidden_layers):
