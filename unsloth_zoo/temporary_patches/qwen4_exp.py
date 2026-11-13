@@ -91,7 +91,8 @@ def _make_fast_indexer_forward(original_forward):
     return qwen4_exp_qsa_indexer_forward
 
 
-_NGRAM_UNEXPECTED = r"ple_embedding\.ngram_embedding\.(shard_\d+\.)?weight"
+# The FP8 checkpoint (Qwen3.8-Flash-Next-FP8) adds the table's per-tensor weight_scale, read by the store.
+_NGRAM_UNEXPECTED = r"ple_embedding\.ngram_embedding\.((shard_\d+\.)?weight|weight_scale)"
 
 
 def _ngram_table_wanted(num_embeddings, embedding_dim, dtype):
