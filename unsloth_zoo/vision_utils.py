@@ -2292,8 +2292,10 @@ class UnslothVisionDataCollator:
 
     def _extract_images_videos_for_example(self, example, messages):
         # images=None means no column value: fall back to images embedded in the messages, as the PC path does.
-        if example.get("images") is not None:
-            image = self._load_column_images(example["images"])
+        # A bare list-of-turns row has no columns at all; _select_messages_or_raw allows it.
+        column_images = example.get("images") if isinstance(example, dict) else None
+        if column_images is not None:
+            image = self._load_column_images(column_images)
             video = []
             video_kwarg = None
         else:
@@ -2311,7 +2313,7 @@ class UnslothVisionDataCollator:
             sr for sr in (getattr(sub, "sampling_rate", None) for sub in _audio_sub_processors(self.processor))
             if sr is not None
         ), None)
-        audio_val = example.get("audio")
+        audio_val = example.get("audio") if isinstance(example, dict) else None
         if audio_val is None:
             # No usable top-level audio -> fall back to inline message content
             clips = extract_audio_info(messages, sampling_rate=target_sr)
