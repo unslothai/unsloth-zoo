@@ -4090,10 +4090,11 @@ def _apply_fused_lm_head(forward, module=None):
             )
             .replace(
                 "$LOGITSOFTCAPPING$",
-                r"(?:[\n\s]{0,}(?:if self\.[^\n\s]{1,} is not None:\n)?"
-                r"[\s\n]{0,}logits = logits \/ (self\.[^ \n]{1,})\n"
+                # `getattr(self...` is the space-free form fixup_fused_lm_head gives PaliGemma's softcap.
+                r"(?:[\n\s]{0,}(?:if (?:getattr\()?self\.[^\n\s]{1,} is not None:\n)?"
+                r"[\s\n]{0,}logits = logits \/ ((?:getattr\()?self\.[^ \n]{1,})\n"
                 r"[\s\n]{0,}logits = torch\.tanh\(logits\)\n"
-                r"[\s\n]{0,}logits = logits \* self\.[^ \n]{1,}\n)?",
+                r"[\s\n]{0,}logits = logits \* (?:getattr\()?self\.[^ \n]{1,}\n)?",
             )
             .replace(
                 "$CROSSENTROPYLOSS$",
@@ -5619,6 +5620,24 @@ def fixup_dropped_logit_scale(source, module = None):
 
 # Pre fix up some modules like Gemma3n
 def fixup_fused_lm_head(source):
+    # PaliGemma (transformers 5.23): the softcap is read through getattr, since PaliGemma 1's Gemma text config has
+    # none. Keep the getattr (a plain attribute read raises there) in the space-free form the softcap pattern takes.
+    softcap = 'getattr(self.config.get_text_config(),"final_logit_softcapping",None)'
+    source = re.sub(
+        r'^([ \t]+)final_logit_softcapping = getattr\(self\.config\.get_text_config\(\), "final_logit_softcapping", None\)\n'
+        r"\1if final_logit_softcapping is not None:\n"
+        r"([ \t]+)logits = logits / final_logit_softcapping\n"
+        r"\2logits = torch\.tanh\(logits\)\n"
+        r"\2logits = logits \* final_logit_softcapping$",
+        lambda m: (
+            f"{m.group(1)}if {softcap} is not None:\n"
+            f"{m.group(2)}logits = logits / {softcap}\n"
+            f"{m.group(2)}logits = torch.tanh(logits)\n"
+            f"{m.group(2)}logits = logits * {softcap}"
+        ),
+        source,
+        flags = re.MULTILINE,
+    )
     # Gemma 3N
     source = source.replace(
         "if (final_logit_softcapping := self.config.get_text_config().final_logit_softcapping) is not None:",
