@@ -51,7 +51,7 @@ _INDEX_NAME = "model.safetensors.index.json"
 _MTP_CONFIG_KEY = "mtp_num_hidden_layers"
 
 # Same spelling as `saving_utils._MTP_TENSOR_RE`; kept local so this module stays light to import.
-_MTP_TENSOR_RE = re.compile(r"^(?:(?:model|language_model)\.)*mtp\.")
+_MTP_TENSOR_RE = re.compile(r"^(?:(?:model|language_model|thinker)\.)*mtp\.")
 _MTP_LAYER_RE = re.compile(r"^layers\.(\d+)\.")
 
 _SAFETENSORS_DTYPES = {

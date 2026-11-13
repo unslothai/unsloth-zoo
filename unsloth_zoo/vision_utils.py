@@ -2098,13 +2098,21 @@ class UnslothVisionDataCollator:
         if 'pixel_values_videos' in batch:
             batch = self._cast_pixel_values_dtype_inplace(batch, 'pixel_values_videos')
 
-        # Mask image tokens and pad tokens
+        # Mask media placeholders by id and pad tokens by position: the pad id can alias eos (the usual recipe when a
+        # tokenizer ships no pad token), so masking it by identity would hide real, attended targets.
         labels = batch["input_ids"].clone()
         padding_ids = self._get_padding_token_ids_on_device(labels.device)
+        tok = getattr(self.processor, "tokenizer", self.processor)
+        pad_id = getattr(tok, "pad_token_id", None)
+        if pad_id is not None:
+            padding_ids = padding_ids[padding_ids != pad_id]
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
+        attention_mask = batch.get("attention_mask")
+        if torch.is_tensor(attention_mask) and attention_mask.shape == labels.shape:
+            labels[attention_mask == 0] = self.ignore_index
         # LLaVA IMAGE_TOKEN_INDEX (-200) sentinel is never a target.
         labels[labels < 0] = self.ignore_index
-        self._mask_targets_after_padding(labels, batch.get("attention_mask"))
+        self._mask_targets_after_padding(labels, attention_mask)
         batch["labels"] = labels
         return batch
 
@@ -2284,8 +2292,10 @@ class UnslothVisionDataCollator:
 
     def _extract_images_videos_for_example(self, example, messages):
         # images=None means no column value: fall back to images embedded in the messages, as the PC path does.
-        if example.get("images") is not None:
-            image = self._load_column_images(example["images"])
+        # A bare list-of-turns row has no columns at all; _select_messages_or_raw allows it.
+        column_images = example.get("images") if isinstance(example, dict) else None
+        if column_images is not None:
+            image = self._load_column_images(column_images)
             video = []
             video_kwarg = None
         else:
@@ -2303,7 +2313,7 @@ class UnslothVisionDataCollator:
             sr for sr in (getattr(sub, "sampling_rate", None) for sub in _audio_sub_processors(self.processor))
             if sr is not None
         ), None)
-        audio_val = example.get("audio")
+        audio_val = example.get("audio") if isinstance(example, dict) else None
         if audio_val is None:
             # No usable top-level audio -> fall back to inline message content
             clips = extract_audio_info(messages, sampling_rate=target_sr)
@@ -2411,28 +2421,24 @@ class UnslothVisionDataCollator:
         return batch
 
     def _extract_images_for_pc(self, example, p_msgs, c_msgs):
-        # PC: top-level images column first, as in the non-PC path; else embedded; else []
+        # PC: top-level images column first, as in the non-PC path; else embedded; else []. Corrupt media raises
+        # like the messages path: returning empty here would emit placeholder tokens with no pixel_values.
         imgs = None
         vids = None
         vids_kwarg = None
-        try:
-            msg_list = (p_msgs or []) + (c_msgs or [])
-            if example.get("images"):
-                imgs = self._load_column_images(example["images"])
-                vids = []
-            elif msg_list:
-                imgs, vids, vids_kwarg = process_vision_info(
-                    msg_list,
-                    size_factor=self.patch_size*2,
-                    return_video_kwargs=True,
-                )
-                if imgs is None: imgs = []
-                if vids is None: vids = []
-        except Exception as e:
-            logger.warning(f"Unsloth: _extract_images_for_pc failed to extract images/videos: {e}")
-            imgs = []
+        msg_list = (p_msgs or []) + (c_msgs or [])
+        if example.get("images"):
+            imgs = self._load_column_images(example["images"])
             vids = []
-        
+        elif msg_list:
+            imgs, vids, vids_kwarg = process_vision_info(
+                msg_list,
+                size_factor=self.patch_size*2,
+                return_video_kwargs=True,
+            )
+            if imgs is None: imgs = []
+            if vids is None: vids = []
+
         return imgs, vids, vids_kwarg
 
     def _resize_images_inplace(self, image):
@@ -2670,6 +2676,11 @@ class UnslothVisionDataCollator:
                     self._collapse_assistant_content(p)
                 p = self._clean_none_keys(p)
                 p_txt = self._render_chat(p, add_generation_prompt=True, continue_final_message=False, example=ex)
+            elif is_c_msgs:
+                # A plain-string prompt paired with chat completions still renders through the template: wrap it
+                # as the user turn so prompt_messages stays a list (was str + list -> TypeError).
+                p = [{"role": "user", "content": str(p)}]
+                p_txt = self._render_chat(p, add_generation_prompt=True, continue_final_message=False, example=ex)
             else:
                 p_txt = str(p)
 
@@ -2811,11 +2822,12 @@ class UnslothVisionDataCollator:
             and untruncated_ids.shape[1] > self.max_seq_length:
             self._raise_if_truncation_cut_media(untruncated_ids, input_ids, pad_id)
 
-        # Labels: mask attention pads + image/pad tokens; completion-only if requested
+        # Labels: mask attention pads + image/pad tokens; completion-only if requested. pad_id's positions are
+        # already masked above; matching it by identity too would hide attended tokens when pad aliases eos.
         labels = input_ids.clone()
         labels[attention_mask == 0] = self.ignore_index
         padding_ids = self._get_padding_token_ids_on_device(labels.device)
-        labels[torch.isin(labels, padding_ids)] = self.ignore_index
+        labels[torch.isin(labels, padding_ids[padding_ids != pad_id])] = self.ignore_index
         labels[labels < 0] = self.ignore_index
         self._mask_targets_after_padding(labels, attention_mask)
         if self.completion_only_loss:

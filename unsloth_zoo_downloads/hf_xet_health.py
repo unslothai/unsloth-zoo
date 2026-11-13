@@ -280,7 +280,9 @@ def _probe_cas_reachable_inner() -> "tuple[Optional[bool], str]":
         if not cas:
             return (True, "Xet token issued")
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        # A budget too small for one real RTT would only measure urlopen's own timeout: the HEAD cannot get a
+        # real answer, yet its transport error would demote the machine for 24h.
+        if remaining < 0.5:
             return (True, "Xet token issued (CAS check skipped, out of budget)")
         # A HEAD to the CAS host root: any HTTP status counts as reachable; only a transport error means Xet cannot work here.
         head = urllib.request.Request(cas, method = "HEAD", headers = {"User-Agent": "unsloth-xet-probe"})

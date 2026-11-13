@@ -3500,8 +3500,9 @@ pass
 MTP_CONFIG_KEY = "mtp_num_hidden_layers"
 
 # Prefix group is repeatable and order free: Qwen3.5 writes
-# `model.language_model.mtp.*`, older Qwen2-VL naming is `language_model.model.mtp.*`.
-_MTP_TENSOR_RE = re.compile(r"^(?:(?:model|language_model)\.)*mtp\.")
+# `model.language_model.mtp.*`, older Qwen2-VL naming is `language_model.model.mtp.*`,
+# and thinker-arch checkpoints (Qwen3-Omni, Qwen3-ASR) keep the head under `thinker.*`.
+_MTP_TENSOR_RE = re.compile(r"^(?:(?:model|language_model|thinker)\.)*mtp\.")
 
 
 def is_mtp_tensor_name(name):
@@ -3553,7 +3554,7 @@ def _checkpoint_tensor_names(folder):
 
 # The other MTP spelling: DeepSeek-V3 / GLM store the head as extra layers.N blocks past num_hidden_layers; detected
 # only so this repair does not fire on such a checkpoint (mlx/utils.py and llama_cpp.py handle those).
-_LAYER_INDEX_RE = re.compile(r"^(?:(?:model|language_model)\.)*layers\.(\d+)\.")
+_LAYER_INDEX_RE = re.compile(r"^(?:(?:model|language_model|thinker)\.)*layers\.(\d+)\.")
 
 
 def _has_layers_past(tensor_names, num_hidden_layers):
@@ -9162,18 +9163,25 @@ def renumber_safetensor_files(file_list, save_directory):
     # Create mapping of old -> new names
     rename_pairs = list(zip(file_list, clean_names))
 
-    # Rename files (handle potential conflicts with temp names)
-    for old_name, new_name in rename_pairs:
+    # Rename files (handle potential conflicts with temp names). Two passes: a clean
+    # name can equal a later input's own filename (a stale or foreign shard in the
+    # list), so no final name may be written until every source is moved aside.
+    # The uuid keeps the staging names outside the input namespace: a leftover
+    # `renaming_*` shard from a crashed run is itself a listable input.
+    import uuid
+    temp_base = str(uuid.uuid4())[:8]
+    pending = []
+    for i, (old_name, new_name) in enumerate(rename_pairs):
         old_path = os.path.join(save_directory, old_name)
-        new_path = os.path.join(save_directory, new_name)
-
         if os.path.exists(old_path) and old_name != new_name:
-            # Use temp name to avoid conflicts
-            temp_path = os.path.join(save_directory, f"renaming_{new_name}")
+            temp_path = os.path.join(save_directory, f"renaming_{temp_base}_{i}_{new_name}")
             os.rename(old_path, temp_path)
-            os.rename(temp_path, new_path)
-            if UNSLOTH_ENABLE_LOGGING:
-                logger.info(f"Renamed {old_name} -> {new_name}")
+            pending.append((temp_path, old_name, new_name))
+
+    for temp_path, old_name, new_name in pending:
+        os.rename(temp_path, os.path.join(save_directory, new_name))
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Renamed {old_name} -> {new_name}")
 
     return clean_names
 pass

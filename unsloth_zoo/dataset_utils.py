@@ -1058,6 +1058,9 @@ def train_on_responses_only(
                             if user_j != n_minus_1:
                                 # Outer j += 1 lands on k, so an empty user turn cannot hide the next marker.
                                 j = k - 1
+                            elif input_ids[j : j + len_Q_must] == Q_must:
+                                # A real marker sits at the last index: end the span on it, not past it.
+                                user_j = j
                             else:
                                 user_j = n
                                 k = n
@@ -2971,8 +2974,19 @@ def sft_prepare_dataset(
         pass
 
         def _tokenize(example):
+            if do_formatting_func:
+                # The probe above calls formatting_func on one example, but batched=True hands a
+                # column dict here: format each row and flatten so batches do not collapse.
+                keys = list(example)
+                texts = [
+                    text
+                    for i in range(len(example[keys[0]]))
+                    for text in formatting_func({k: example[k][i] for k in keys})
+                ]
+            else:
+                texts = example[dataset_text_field]
             return tokenizer(
-                example[dataset_text_field] if not do_formatting_func else formatting_func(example),
+                texts,
                 truncation = do_truncation,
                 max_length = max_seq_length,
                 return_token_type_ids = _needs_token_type_ids,
@@ -3056,14 +3070,24 @@ def sft_prepare_dataset(
                     result["token_type_ids"] = [0] * len(result["input_ids"])
                 return result
 
+            def _clean_pc_messages(messages):
+                # Arrow fills missing keys with None, which `is defined` template checks then index.
+                return [
+                    {k: v for k, v in message.items() if v is not None}
+                    if isinstance(message, dict) else message
+                    for message in messages
+                ]
+
             def _tokenize_pc(example):
                 pc_masks = None
                 if _is_conv:
                     template_kwargs = dict(example.get("chat_template_kwargs") or {})
                     if training_chat_template is not None:
                         template_kwargs["chat_template"] = training_chat_template
+                    prompt_msgs = _clean_pc_messages(example["prompt"])
+                    completion_msgs = _clean_pc_messages(example["completion"])
                     prompt_ids = processing_class.apply_chat_template(
-                        example["prompt"], tokenize=True,
+                        prompt_msgs, tokenize=True,
                         add_generation_prompt=True, return_dict=False,
                         tools=example.get("tools"),
                         **template_kwargs,
@@ -3071,7 +3095,7 @@ def sft_prepare_dataset(
                     if prompt_ids and isinstance(prompt_ids[0], list):
                         prompt_ids = prompt_ids[0]
                     pc_processed = processing_class.apply_chat_template(
-                        example["prompt"] + example["completion"],
+                        prompt_msgs + completion_msgs,
                         return_dict=True, tokenize=True,
                         return_assistant_tokens_mask=assistant_only_loss and not marker_masks,
                         tools=example.get("tools"),
@@ -3110,12 +3134,12 @@ def sft_prepare_dataset(
                 if batch_rows:
                     if _is_conv:
                         prompt_ids = processing_class.apply_chat_template(
-                            [rows[i]["prompt"] for i in batch_rows], tokenize=True,
+                            [_clean_pc_messages(rows[i]["prompt"]) for i in batch_rows], tokenize=True,
                             add_generation_prompt=True, return_dict=False, tools=None,
                             **_shared_template_kwargs,
                         )
                         pc_processed = processing_class.apply_chat_template(
-                            [rows[i]["prompt"] + rows[i]["completion"] for i in batch_rows],
+                            [_clean_pc_messages(rows[i]["prompt"]) + _clean_pc_messages(rows[i]["completion"]) for i in batch_rows],
                             return_dict=True, tokenize=True,
                             return_assistant_tokens_mask=assistant_only_loss and not marker_masks, tools=None,
                             **_shared_template_kwargs,

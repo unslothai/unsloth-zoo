@@ -106,6 +106,9 @@ def _saved(folder):
     "model.language_model.mtp.fc.weight",
     # The older Qwen2-VL prefix ordering, seen in foreign checkpoints.
     "language_model.model.mtp.fc.weight",
+    # Thinker-arch (Qwen3-Omni, Qwen3-ASR) keeps the head under `thinker.*`.
+    "thinker.mtp.fc.weight",
+    "thinker.model.mtp.fc.weight",
 ])
 def test_mtp_tensor_names_are_recognised(name):
     assert is_mtp_tensor_name(name)
@@ -270,6 +273,26 @@ def test_the_old_prefix_ordering_is_read_as_a_head(tmp_path):
     _write_checkpoint(tmp_path, BODY_NAMES + ("language_model.model.mtp.fc.weight",))
     assert reconcile_mtp_config(tmp_path) == "agrees"
     assert _saved(tmp_path)["text_config"][MTP_CONFIG_KEY] == 1
+
+
+@pytest.mark.parametrize("mtp_name", [
+    "thinker.model.layers.2.mlp.up_proj.weight",   # extra-layer spelling
+    "thinker.mtp.fc.weight",                        # `mtp.*` under the thinker prefix
+])
+def test_a_backed_thinker_declaration_is_kept(tmp_path, mtp_name):
+    """`thinker_config.text_config` is a supported declaring container, so a thinker-prefixed head on disk must
+    keep the declaration; the `model|language_model`-anchored name predicates read it as absent and stripped it."""
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model_type": "qwen3_omni",
+        "thinker_config": {"text_config": {"num_hidden_layers": 2, MTP_CONFIG_KEY: 1}},
+    }), encoding = "utf-8")
+    _write_checkpoint(tmp_path, (
+        "thinker.model.layers.0.mlp.up_proj.weight",
+        "thinker.model.layers.1.mlp.up_proj.weight",
+        mtp_name,
+    ))
+    assert reconcile_mtp_config(tmp_path) == "agrees"
+    assert _saved(tmp_path)["thinker_config"]["text_config"][MTP_CONFIG_KEY] == 1
 
 
 # ---- the shared rule both writers use ------------------------------------

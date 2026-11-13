@@ -186,7 +186,11 @@ class _ChatProcessor(_FakeProcessor):
     def apply_chat_template(self, messages, **kwargs):
         words = []
         for m in messages:
-            for part in m["content"]:
+            content = m["content"]
+            if isinstance(content, str):
+                words.append(content)
+                continue
+            for part in content:
                 words.append("<img>" if part["type"] == "image" else part["text"])
         return " ".join(words)
 
@@ -301,6 +305,38 @@ def test_cut_media_delimiter_alone_passes_when_the_model_names_its_feature_token
         collator(batch)
     collator._feature_token_ids = [IMG_ID]
     assert collator(batch)["input_ids"].tolist() == [[1, IMG_ID]]
+
+
+def test_string_prompt_with_chat_completion_collates_like_the_mirror_mix():
+    """str prompt + chat completion used to die on `str + list` inside _render_chat; the prompt renders as the
+    user turn, so the row produces the same tokens as the supported chat-prompt mix."""
+    collator = make_collator(None)
+    collator.processor = _ChatProcessor()
+    collator.assistant_single_content = False
+    user = [{"role": "user", "content": [{"type": "text", "text": "a"}]}]
+    asst = [{"role": "assistant", "content": [{"type": "text", "text": "x"}]}]
+
+    mixed = collator([{"prompt": "a", "completion": asst}])
+    mirror = collator([{"prompt": user, "completion": "x"}])
+    assert mixed["input_ids"].tolist() == mirror["input_ids"].tolist()
+
+
+def test_corrupt_image_raises_on_the_pc_path_like_the_messages_path():
+    """A corrupt image was swallowed by _extract_images_for_pc's blanket except, emitting placeholder tokens
+    with no pixel_values; the messages path raises immediately and the PC path must match."""
+    Image = pytest.importorskip("PIL.Image")
+    collator = make_collator(None)
+    collator.processor = _ChatProcessor()
+    collator.assistant_single_content = False
+    bad = b"\xff\xd8\xff\xe0" + b"\x00" * 32 + b"NOTAJPEG"
+    messages = [
+        {"role": "user", "content": [{"type": "image", "image": bad}, {"type": "text", "text": "a"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "x"}]},
+    ]
+    with pytest.raises(Image.UnidentifiedImageError):
+        collator([{"messages": messages}])
+    with pytest.raises(Image.UnidentifiedImageError):
+        collator([{"prompt": messages[:1], "completion": messages[1:]}])
 
 
 def test_feature_token_ids_cover_every_config_spelling():
