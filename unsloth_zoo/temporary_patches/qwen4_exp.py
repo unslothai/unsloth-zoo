@@ -32,6 +32,9 @@ def _fast_qsa_enabled():
 
 
 _reference_qsa_forward = None
+# Whether the reference converts its selection back to an additive float mask for a float (eager) attention mask:
+# transformers up to 5.22 does; 5.23 always returns the boolean selection and combines it in the attention layer.
+_qsa_returns_float_mask = True
 
 
 def qwen4_exp_qsa_indexer_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None):
@@ -48,6 +51,9 @@ def qwen4_exp_qsa_indexer_forward(self, hidden_states, position_embeddings, atte
             past_key_values.update_indexer(raw_keys, self.layer_idx)
         if attention_mask.dtype == torch.bool:
             return attention_mask
+        from unsloth_zoo.temporary_patches.qwen4_exp import _qsa_returns_float_mask
+        if not _qsa_returns_float_mask:
+            return attention_mask == 0
         return torch.where(
             attention_mask == 0, attention_mask.new_zeros(()), torch.finfo(attention_mask.dtype).min
         )
@@ -83,11 +89,22 @@ def _is_transformers_indexer_forward(function):
     return "/transformers/models/qwen4_exp/" in filename
 
 
+def _reference_returns_float_mask(function):
+    """True when the reference turns its boolean selection into an additive mask for a float input mask."""
+    import inspect
+    try:
+        source = inspect.getsource(function)
+    except (OSError, TypeError):
+        return True
+    return "is_floating_point()" in source
+
+
 def _make_fast_indexer_forward(original_forward):
     """Test hook: bind `original_forward` as the long-context reference."""
-    global _reference_qsa_forward
+    global _reference_qsa_forward, _qsa_returns_float_mask
     if original_forward is not qwen4_exp_qsa_indexer_forward:
         _reference_qsa_forward = original_forward
+        _qsa_returns_float_mask = _reference_returns_float_mask(original_forward)
     return qwen4_exp_qsa_indexer_forward
 
 
