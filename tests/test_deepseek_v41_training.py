@@ -108,6 +108,36 @@ def test_gradient_checkpointing_replays_group_state():
     assert zero == []
 
 
+def test_checkpointed_layers_keep_the_compile_stance(monkeypatch):
+    # The layers used to run under set_stance("force_eager"); with torch.compile on, a helper that also runs outside
+    # the layers (the final norm, the mHC head) then ran compiled there and was skipped inside, and the recompute
+    # check failed. Both passes now run with whatever stance the caller set.
+    _patches()
+    from torch._dynamo import eval_frame
+    from transformers.models.deepseek_v41 import modeling_deepseek_v41 as modeling
+
+    seen = []
+    original = modeling.DeepseekV41RMSNorm.forward
+
+    def forward(self, *args, **kwargs):
+        seen.append(getattr(eval_frame._stance, "stance", "default"))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(modeling.DeepseekV41RMSNorm, "forward", forward)
+    model = _tiny_model()
+    ids = torch.randint(0, 256, (2, 24), generator = torch.Generator().manual_seed(0))
+    _grads(model, ids, True)
+    assert seen and set(seen) == {"default"}
+
+
+def test_prepare_compiled_checkpoint_specializes_floats(monkeypatch):
+    from unsloth_zoo.temporary_patches.deepseek_v41 import prepare_compiled_checkpoint
+
+    monkeypatch.setattr(torch._dynamo.config, "specialize_float", False)
+    assert prepare_compiled_checkpoint() is True
+    assert torch._dynamo.config.specialize_float is True
+
+
 def test_grouped_lora_matches_merged_weight():
     _patches()
     from peft import LoraConfig, get_peft_model
