@@ -1242,6 +1242,7 @@ def test_mxfp4_dequantize_signature():
 _CONVERTOPS_HANDLED_SIGNATURES = (
     ("blocks", "scales"),
     ("blocks", "scales", "target_device"),
+    ("blocks", "scales", "dtype"),
 )
 
 
