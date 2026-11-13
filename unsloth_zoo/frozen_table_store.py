@@ -796,9 +796,15 @@ class UnslothFrozenTableEmbedding(nn.Module):
         store = self.frozen_table_store
         if store is None:
             return
+        export = getattr(self, "export_suffixes", None) or {}
         for plane in store.planes.values():
             torch_dtype = _ST_DTYPES[plane.st_dtype][0]
-            for shard, suffix in zip(plane.shards, getattr(self, "checkpoint_suffixes", {}).get(plane.name, ())):
+            names = getattr(self, "checkpoint_suffixes", {}).get(plane.name, ())
+            if plane.name in export and len(plane.shards) == 1:
+                # Under the module's own parameter names (DeepSeek-V4.1: weight / weight_scale_inv), which the
+                # model's save conversion maps back to the checkpoint's.
+                names = (export[plane.name],)
+            for shard, suffix in zip(plane.shards, names):
                 if shard.view is not None:
                     destination[prefix + suffix] = shard.view.view(torch_dtype).view(shard.rows, *plane.cols)
         # The fp8 table's per-tensor scale goes with its rows, so the saved checkpoint decodes the same.
@@ -948,8 +954,22 @@ def _common_suffix(a: List[str], b: List[str]) -> int:
     return n
 
 
-def _match_plane(module_name: str, keys: List[str], alternatives: Sequence[str]) -> List[str]:
+def _match_plane(module_name: str, keys: List[str], alternatives: Sequence[str],
+                 prefixes: Optional[Sequence[str]] = None) -> List[str]:
     import re
+    if prefixes:
+        # Exact checkpoint prefixes, tried in order: a table whose checkpoint name differs from its module path
+        # (DeepSeek-V4.1's `layers.<i>.engram.embed` is the model-level `engram_tables.<i>`).
+        keyset = set(keys)
+        for prefix in prefixes:
+            for alt in alternatives:
+                rx = re.compile(r"^" + re.escape(prefix) + r"\.(?:" + alt + r")$")
+                items = [k for k in keyset if rx.match(k)]
+                if len(items) == 1:
+                    return [(items[0], items[0][len(prefix) + 1:])]
+                if len(items) > 1:
+                    raise RuntimeError(f"Unsloth: frozen table {module_name} matches several keys under {prefix}: {sorted(items)[:3]}.")
+        return []
     mod_parts = module_name.split(".")
     # The part from the last "layers.<i>" on must match exactly (never bind layer 1's table to layer 14's).
     need = len(mod_parts)
@@ -1014,8 +1034,12 @@ def bind_frozen_tables(
     for name, module in modules:
         spec = getattr(module, "checkpoint_planes", None) or DEFAULT_CHECKPOINT_PLANES
         planes, suffixes = {}, {}
+        prefixes = getattr(module, "checkpoint_prefixes", None)
+        optional = set(getattr(module, "optional_planes", ()) or ())
         for plane, alternatives in spec.items():
-            found = _match_plane(name, keys, alternatives)
+            found = _match_plane(name, keys, alternatives, prefixes)
+            if not found and plane in optional:
+                continue
             if not found:
                 if not strict:
                     break
@@ -1026,7 +1050,17 @@ def bind_frozen_tables(
             planes[plane] = [k for k, _ in found]
             suffixes[plane] = [x for _, x in found]
         else:
+            select = getattr(module, "select_planes", None)
+            if select is not None:
+                # Planes picked by the checkpoint dtypes (a bf16 save carries an unused scale next to its rows).
+                dtypes = {p: resolve_tensor_locations(source, names=n[:1])[n[0]].dtype for p, n in planes.items()}
+                keep = set(select(dtypes))
+                planes = {p: v for p, v in planes.items() if p in keep}
+                suffixes = {p: v for p, v in suffixes.items() if p in keep}
             decode = getattr(module, "decode_fn", None)
+            make_decode = getattr(module, "make_decode", None)
+            if decode is None and make_decode is not None:
+                decode = make_decode(set(planes))
             extras = {}
             if decode is None and len(planes) == 1:
                 decode, extras = _scaled_fp8_decode(source, keys, name, planes, suffixes)
@@ -1047,6 +1081,9 @@ def bind_frozen_tables(
             module.bind(store)
             module.checkpoint_suffixes = suffixes
             module.checkpoint_extras = extras
+            after_bind = getattr(module, "after_bind", None)
+            if after_bind is not None:
+                after_bind(model, set(planes))
             bound[name] = store
     return bound
 
