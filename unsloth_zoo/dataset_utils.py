@@ -1058,6 +1058,9 @@ def train_on_responses_only(
                             if user_j != n_minus_1:
                                 # Outer j += 1 lands on k, so an empty user turn cannot hide the next marker.
                                 j = k - 1
+                            elif input_ids[j : j + len_Q_must] == Q_must:
+                                # A real marker sits at the last index: end the span on it, not past it.
+                                user_j = j
                             else:
                                 user_j = n
                                 k = n
