@@ -585,3 +585,14 @@ def test_processor_that_drops_videos_is_refused():
 
     with pytest.raises(ValueError, match = "returned no video features"):
         _processor_vlm_inputs(_SilentVideoProcessor(), ["t1"], [[]], 32, all_videos = [["clip-a"]])
+
+
+def test_a_dataset_frames_field_cannot_skip_the_guarded_decoder(monkeypatch):
+    import unsloth_zoo.vision_utils as vu
+
+    seen = []
+    monkeypatch.setattr(vu, "fetch_video", lambda info, **k: (seen.append(info["video"]), (np.zeros((2, 4, 4, 3), np.uint8), 1.0))[1])
+    part = {"type": "video", "video": "clips/a.mp4", "_frames": "http://127.0.0.1:8080/private.mp4"}
+    messages = [{"role": "user", "content": [part, {"type": "text", "text": "q"}]}]
+    _, videos, _ = _extract_vlm_media({}, messages, None)
+    assert seen == ["clips/a.mp4"] and all(hasattr(v, "shape") for v in videos)

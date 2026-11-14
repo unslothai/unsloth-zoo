@@ -7333,6 +7333,10 @@ def _vlm_vision_part_state(messages):
 _VIDEO_PART_TYPES = ("video", "video_url", "input_video")
 
 
+# Internal carrier for already-decoded frames plus their rate; a class, so no dataset field can forge it.
+_DecodedClip = collections.namedtuple("_DecodedClip", ("frames", "fps"))
+
+
 def _is_decoded_clip(video):
     """A frames array/tensor, or a list of them; a list of frame paths still needs fetch_video."""
     if hasattr(video, "shape"):
@@ -7436,7 +7440,7 @@ def _extract_vlm_media(
                             videos.append({**part, "video": video})
                         elif video is not None:
                             # Already-decoded frames: skip the decoder but keep the part's rate.
-                            videos.append({**part, "video": None, "_frames": video})
+                            videos.append(_DecodedClip(video, part.get("fps")))
 
     if (
         not images
@@ -7462,7 +7466,7 @@ def _extract_vlm_media(
         for i, video in enumerate(videos):
             hint = hints[i] if i < len(hints) else {}
             if _is_decoded_clip(video):
-                video = {**hint, "video": None, "_frames": video} if hint else video
+                video = _DecodedClip(video, hint.get("fps")) if hint else video
             elif isinstance(video, (list, tuple)):
                 video = {**hint, "video": list(video)}
             elif hint and isinstance(video, (str, bytes, dict)):
@@ -7492,7 +7496,7 @@ def _extract_vlm_media(
                     if len(extracted) > 2 and isinstance(extracted[2], dict):
                         video_kwargs = dict(extracted[2])
 
-    if videos and any(isinstance(video, (str, bytes, dict)) for video in videos):
+    if videos and any(isinstance(video, (str, bytes, dict, _DecodedClip)) for video in videos):
         # Never suppressed: a dropped clip would leave its placeholder to train as text.
         _require_video_runtime()
         from unsloth_zoo.vision_utils import fetch_video
@@ -7500,10 +7504,10 @@ def _extract_vlm_media(
         decoded = []
         sampled_fps = list(video_kwargs.get("fps") or [])
         for video in videos:
-            if isinstance(video, dict) and "_frames" in video:
-                decoded.append(video["_frames"])
-                if video.get("fps") is not None:
-                    sampled_fps.append(float(video["fps"]))
+            if isinstance(video, _DecodedClip):
+                decoded.append(video.frames)
+                if video.fps is not None:
+                    sampled_fps.append(float(video.fps))
             elif isinstance(video, (str, bytes, dict)):
                 frames, fps = fetch_video(_video_element_dict(video), return_video_sample_fps=True)
                 decoded.append(frames)
