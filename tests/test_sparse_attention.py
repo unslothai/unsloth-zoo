@@ -194,18 +194,22 @@ def _window_cases():
 @pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
 @pytest.mark.parametrize("backend,dtype", _window_cases())
 @pytest.mark.parametrize("s", [40, 300])
-def test_cuda_window_form_matches_concatenated(monkeypatch, backend, dtype, s):
+@pytest.mark.parametrize("k", [32, 0])
+def test_cuda_window_form_matches_concatenated(monkeypatch, backend, dtype, s, k):
     # Forward and backward of the window form (DeepSeek window-only and compressed layers, head_dim 512, 16 heads)
     # on the backend this device dispatches to: gather on sm100+, the Triton kernel elsewhere (T4 / L4 / A100).
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", backend)
     g = torch.Generator().manual_seed(2)
-    b, h, d, nc, k, w = 1, 16, 512, 150, 32, 128
+    from unsloth_zoo import sparse_mqa_kernel as mk
+    b, h, d, nc, w = 1, 16, 512, 150, 128
     q = (torch.randn(b, s, h, d, generator = g) * 0.5).cuda().to(dtype)
     win = (torch.randn(b, s, d, generator = g) * 0.5).cuda().to(dtype)
     comp = (torch.randn(b, nc, d, generator = g) * 0.5).cuda().to(dtype)
     sink = torch.randn(h, generator = g).cuda()
-    cidx = _unique_idxs(b, s, k, nc, 0.2, g).cuda()
+    cidx = _unique_idxs(b, s, k, nc, 0.2, g).cuda() if k else torch.empty(b, s, 0, dtype = torch.int32, device = "cuda")
     go = torch.randn(b, s, h, d, generator = g).cuda().to(dtype)
+    banded = backend == "triton" and mk.sparse_mqa_window_supported(q, win)
+    window_calls = dict(mk.SPARSE_MQA_STATS)
     end = torch.arange(s, device = "cuda").unsqueeze(1)
     widx = (end - w + 1).clamp(0) + torch.arange(min(s, w), device = "cuda")
     widx = torch.where(widx > end, -1, widx).int().unsqueeze(0)
@@ -219,6 +223,9 @@ def test_cuda_window_form_matches_concatenated(monkeypatch, backend, dtype, s):
     before = dict(sa.SPARSE_ATTN_STATS)
     got = run(lambda q, win, comp, sink: sa.sparse_attn_window(q, win, comp, cidx, sink, d ** -0.5, w), q, win, comp, sink)
     assert sa.SPARSE_ATTN_STATS[backend] == before[backend] + 1 and sa.SPARSE_ATTN_STATS["fallback"] == before["fallback"]
+    if banded:   # the banded window kernel ran (forward and backward), not the index path over a concatenation
+        assert mk.SPARSE_MQA_STATS["window_fwd"] == window_calls["window_fwd"] + 1
+        assert mk.SPARSE_MQA_STATS["window_bwd"] == window_calls["window_bwd"] + 1
     ref_fn = lambda q, win, comp, sink: sa.sparse_attn_reference(q, torch.cat([win, comp], 1), sink, full, d ** -0.5)
     ref = run(ref_fn, q.double(), win.double(), comp.double(), sink.double())
     low = run(ref_fn, q, win, comp, sink)
@@ -241,7 +248,7 @@ def test_cuda_triton_kernel_on_a_64kb_shared_memory_tier(monkeypatch, dtype, d):
     q, kv, sink, idxs = _inputs(b, s, h, d, n, min(k, n), dtype, "cuda", empty_rows = [(0, 3)])
     go = torch.randn(b, s, h, d, device = "cuda", dtype = dtype)
     got = _grads(lambda q, kv, sink: sa.sparse_attn(q, kv, sink, idxs, d ** -0.5), q, kv, sink, go)
-    chosen = {key[3]: mk._configs(None, d, key[3])[i] for key, i in mk._CHOSEN.items()}
+    chosen = {key[3]: mk._configs(None, d, key[3])[i] for key, i in mk._CHOSEN.items() if key[0] != "window"}
     if d == 512:
         assert chosen[True][3] == d // 2, chosen   # backward split
     ref = _grads(lambda q, kv, sink: sa.sparse_attn_reference(q, kv, sink, idxs, d ** -0.5),
@@ -549,5 +556,113 @@ def test_deepseek_head_dim_512_below_sm100_takes_the_triton_kernel(monkeypatch, 
     low_w = sa.sparse_attn_reference(q, torch.cat([win, kv], 1), sink, full, d ** -0.5)
     err, base = (out_w.double() - ref_w).abs().max().item(), (low_w.double() - ref_w).abs().max().item()
     assert err <= 2 * base + 4 * torch.finfo(dtype).eps, (name, "window", err, base)
-    chosen = {key[3]: mk._configs(None, d, key[3])[i] for key, i in mk._CHOSEN.items()}
+    chosen = {key[3]: mk._configs(None, d, key[3])[i] for key, i in mk._CHOSEN.items() if key[0] != "window"}
     assert chosen[True][3] == (d // 2 if smem < 96 * 1024 else d), chosen
+
+
+_WINDOW_INTERP = """
+import os, sys
+os.environ["TRITON_INTERPRET"] = "1"
+import torch
+from unsloth_zoo import sparse_attention as sa
+from unsloth_zoo.sparse_mqa_kernel import sparse_mqa_window_attention, sparse_mqa_attention
+torch.manual_seed(0)
+worst = 0.0
+# (b, s, h, d, nc, k, window, sink): heads not a multiple of 16, no compressed slots, window 1, window > s.
+for (b, s, h, d, nc, k, w, sink_on) in ((1, 37, 3, 16, 9, 5, 8, True), (2, 21, 17, 32, 11, 0, 5, False),
+                                        (1, 40, 16, 16, 7, 4, 64, True), (1, 9, 2, 16, 6, 3, 1, True)):
+    q = torch.randn(b, s, h, d, requires_grad = True)
+    win = torch.randn(b, s, d, requires_grad = True)
+    comp = torch.randn(b, nc, d, requires_grad = True)
+    sink = torch.randn(h, requires_grad = True) if sink_on else None
+    if k:
+        cidx = torch.stack([torch.stack([torch.randperm(nc)[:k] for _ in range(s)]) for _ in range(b)])
+        cidx = torch.where(torch.rand(cidx.shape) < 0.3, -1, cidx).int()
+        cidx[0, 2] = -1
+    else:
+        cidx = torch.empty(b, s, 0, dtype = torch.int32)
+    go = torch.randn(b, s, h, d)
+    out = sparse_mqa_window_attention(q, win, comp, cidx, sink, d ** -0.5, w)
+    leaves = [q, win, comp] + ([sink] if sink_on else [])
+    got = [out] + list(torch.autograd.grad(out, leaves, go))
+    ref_leaves = [t.detach().double().requires_grad_() for t in leaves]
+    ref_sink = ref_leaves[3] if sink_on else torch.full((h,), float("-inf"), dtype = torch.float64)
+    full = torch.cat([sa.window_topk_idxs(s, w, b, "cpu"), torch.where(cidx >= 0, cidx + s, -1).int()], -1)
+    ref = sa.sparse_attn_reference(ref_leaves[0], torch.cat(ref_leaves[1:3], 1), ref_sink, full, d ** -0.5)
+    want = [ref] + list(torch.autograd.grad(ref, ref_leaves, go.double()))
+    worst = max(worst, max(float((x.double() - y).abs().max()) for x, y in zip(got, want)))
+# One index row shared by g consecutive batches (the GQA fold) == the repeated rows.
+b, g, s, h, d, n, k = 2, 3, 7, 4, 16, 10, 6
+q = torch.randn(b * g, s, h, d, requires_grad = True)
+kv = torch.randn(b * g, n, d, requires_grad = True)
+idx = torch.stack([torch.stack([torch.randperm(n)[:k] for _ in range(s)]) for _ in range(b)]).int()
+go = torch.randn(b * g, s, h, d)
+shared = sparse_mqa_attention(q, kv, None, idx, d ** -0.5)
+grads = torch.autograd.grad(shared, [q, kv], go)
+rep = sparse_mqa_attention(q, kv, None, idx.repeat_interleave(g, 0), d ** -0.5)
+grads_rep = torch.autograd.grad(rep, [q, kv], go)
+worst = max(worst, float((shared - rep).abs().max()), *(float((x - y).abs().max()) for x, y in zip(grads, grads_rep)))
+print("WINDOW_INTERP_WORST", worst)
+"""
+
+
+def test_window_kernel_and_shared_index_rows_in_the_interpreter():
+    import subprocess, sys
+    from pathlib import Path
+    env = dict(os.environ, PYTHONPATH = str(Path(__file__).resolve().parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+               CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1")
+    proc = subprocess.run([sys.executable, "-c", _WINDOW_INTERP], env = env, capture_output = True, text = True, timeout = 900)
+    line = next((l for l in proc.stdout.splitlines() if l.startswith("WINDOW_INTERP_WORST")), None)
+    assert line is not None, proc.stderr[-3000:]
+    assert float(line.split()[1]) < 1e-5, line
+
+
+@pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
+@pytest.mark.parametrize("smem", [228 * 1024, 99 * 1024, 64 * 1024], ids = ["sm100", "100KB", "64KB"])
+def test_qsa_gqa_dispatch_prefers_flex_where_it_compiles(monkeypatch, smem):
+    # QSA (8 q / 2 kv heads x 256): flex where head_dim 256 flex compiles (> 64 KB), else the [K | V] fold through
+    # the Triton kernel with one shared index row per KV head (no repeat); both match the fp64 reference.
+    from unsloth_zoo import sparse_mqa_kernel as mk
+    monkeypatch.delenv("UNSLOTH_SPARSE_ATTN_BACKEND", raising = False)
+    monkeypatch.setattr(sa, "_shared_memory", lambda device: smem)
+    monkeypatch.setattr(mk, "_shared_memory", lambda device: smem)
+    monkeypatch.setattr(mk, "_CHOSEN", {})
+    monkeypatch.setattr(sa, "_FAILED", {})
+    g = torch.Generator().manual_seed(5)
+    b, hq, hk, s, d, k = 1, 8, 2, 200, 256, 48
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    query = (torch.randn(b, hq, s, d, generator = g) * 0.5).cuda().to(dtype)
+    key = (torch.randn(b, hk, s, d, generator = g) * 0.5).cuda().to(dtype)
+    value = (torch.randn(b, hk, s, d, generator = g) * 0.5).cuda().to(dtype)
+    idxs = _unique_idxs(b, s, k, s, 0.2, g).cuda()
+    go = torch.randn(b, s, hq, d, generator = g).cuda().to(dtype)
+    repeats = []
+    real_repeat = torch.Tensor.repeat_interleave
+    monkeypatch.setattr(torch.Tensor, "repeat_interleave", lambda self, *a, **kw: repeats.append(1) or real_repeat(self, *a, **kw))
+
+    def run(fn, *xs):
+        xs = [x.detach().clone().requires_grad_() for x in xs]
+        out = fn(*xs)
+        return [out, *torch.autograd.grad(out, xs, go.to(out.dtype))]
+
+    before = dict(sa.SPARSE_ATTN_STATS)
+    got = run(lambda q, k_, v: sa.sparse_gqa_attn(q, k_, v, idxs, d ** -0.5), query, key, value)
+    delta = {n: sa.SPARSE_ATTN_STATS[n] - before[n] for n in before}
+    want = "flex" if smem >= 96 * 1024 else "triton"
+    assert delta == {**{n: 0 for n in before}, want: 1}, delta
+    assert not repeats
+
+    def dense(q, k_, v):
+        # -1 slots land in a spare column (a clamp to 0 would race valid writes to key 0).
+        sel = torch.zeros(b, s, s + 1, dtype = torch.bool, device = "cuda")
+        sel.scatter_(2, torch.where(idxs >= 0, idxs, s).long(), True)
+        sel = sel[..., :s]
+        att = torch.einsum("bhsd,bhnd->bhsn", q, k_.repeat_interleave(hq // hk, 1)) * d ** -0.5
+        att = att.masked_fill(~sel.unsqueeze(1), float("-inf")).softmax(-1).nan_to_num()
+        return torch.einsum("bhsn,bhnd->bshd", att, v.repeat_interleave(hq // hk, 1))
+
+    ref = run(dense, query.double(), key.double(), value.double())
+    low = run(dense, query, key, value)
+    for label, x, r, lo in zip(("out", "dq", "dk", "dv"), got, ref, low):
+        err, base = (x.double() - r).abs().max().item(), (lo.double() - r).abs().max().item()
+        assert err <= 2 * base + 4 * torch.finfo(dtype).eps * max(1.0, r.abs().max().item()), (want, label, err, base)

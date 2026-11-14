@@ -116,6 +116,9 @@ _FLEX_MAX_TABLE = 1 << 28
 # head_dim 512 flex (32 x 32 tiles, 1 stage) needs about 160 KB of shared memory per block: T4 (64 KB), L4 / sm86 /
 # sm89 / sm120 consumer parts (~100 KB) cannot launch it, so they take the torch path without a failing compile.
 _FLEX_D512_MIN_SHARED_MEMORY = 160 * 1024
+# head_dim 256 flex failed to compile on T4 (64 KB: "No valid triton configs", 65536 required) and compiled on G4
+# (~100 KB); 129..256 therefore needs more than 64 KB.
+_FLEX_D256_MIN_SHARED_MEMORY = 96 * 1024
 _SHARED_MEMORY = {}
 
 
@@ -137,7 +140,9 @@ def _triton_eligible(q):
 def _flex_eligible(q, kv_len = None):
     if not (q.is_cuda and _HAS_TRITON and q.dtype in (torch.float16, torch.bfloat16)):
         return False
-    if q.shape[-1] == 512 and _shared_memory(q.device) < _FLEX_D512_MIN_SHARED_MEMORY:
+    if q.shape[-1] > 256 and _shared_memory(q.device) < _FLEX_D512_MIN_SHARED_MEMORY:
+        return False
+    if q.shape[-1] > 128 and _shared_memory(q.device) < _FLEX_D256_MIN_SHARED_MEMORY:
         return False
     return kv_len is None or q.shape[0] * q.shape[1] * kv_len <= _FLEX_MAX_TABLE
 
@@ -400,6 +405,21 @@ def sparse_attn_window(q, window_kv, compress_kv, compress_idxs, attn_sink, soft
             return out
         except Exception as error:
             _latch("gather", q, key, error)
+    if forced in (None, "triton") and _HAS_TRITON:
+        from .sparse_mqa_kernel import sparse_mqa_window_attention, sparse_mqa_window_supported
+        key = ("window", compress_idxs.shape[-1])
+        if sparse_mqa_window_supported(q, window_kv) and (forced == "triton" or _failure_key("triton", q, key) not in _FAILED):
+            # Banded window kernel over the contiguous window rows + the index kernel over the compressed slots.
+            if torch.compiler.is_compiling() or forced == "triton":
+                out = sparse_mqa_window_attention(q, window_kv, compress_kv, compress_idxs, attn_sink, softmax_scale, window_size)
+                _count("triton")
+                return out
+            try:
+                out = sparse_mqa_window_attention(q, window_kv, compress_kv, compress_idxs, attn_sink, softmax_scale, window_size)
+                _count("triton")
+                return out
+            except Exception as error:
+                _latch("triton", q, key, error)
     kv = torch.cat([window_kv, compress_kv], dim = 1)
     window = window_topk_idxs(s, int(window_size), b, q.device)
     compressed = torch.where(compress_idxs >= 0, compress_idxs + s, -1).to(torch.int32)
@@ -420,8 +440,11 @@ def sparse_gqa_attn(query, key, value, topk_idxs, softmax_scale, *, backend = No
     forced = backend if backend in _BACKENDS else _forced_backend()
     folded = query.new_empty((1, 1, groups, dk + dv))
     kernel_fold = _gather_eligible(folded) or _triton_eligible(folded)
-    if forced == "flex" or (forced is None and not kernel_fold and _flex_eligible(query.transpose(1, 2), key.shape[2])
-                            and not torch.compiler.is_compiling()):
+    # Flex first where it compiles at the native head dims (QSA's 8 / 2 heads x 256 on G4: 4.1 ms and 0.17 GB vs
+    # 36.2 ms and 0.44 GB for the [K | V] fold through the Triton kernel at 4k), the fold otherwise; flex stays out
+    # of traced regions (it compiles flex_attention itself).
+    if forced == "flex" or (forced is None and _flex_eligible(query.transpose(1, 2), key.shape[2])
+                            and _flex_eligible(value.transpose(1, 2)) and not torch.compiler.is_compiling()):
         key_ = ("gqa_flex", dk, dv)
         if forced == "flex" or _failure_key("flex", query.transpose(1, 2), key_) not in _FAILED:
             try:
@@ -432,13 +455,29 @@ def sparse_gqa_attn(query, key, value, topk_idxs, softmax_scale, *, backend = No
                 if forced == "flex":
                     raise
                 _latch("flex", query.transpose(1, 2), key_, error)
-        if forced is None:
+        if forced is None and not kernel_fold:
             backend = "torch"
     q = query.reshape(b, hk, groups, s, dk).reshape(b * hk, groups, s, dk).transpose(1, 2)
     q = torch.cat([q, q.new_zeros((b * hk, s, groups, dv))], dim = -1)
     kv = torch.cat([key, value], dim = -1).reshape(b * hk, key.shape[2], dk + dv)
-    idxs = topk_idxs.repeat_interleave(hk, dim = 0) if hk > 1 else topk_idxs
     sink = torch.full((groups,), float("-inf"), device = query.device, dtype = torch.float32)
+    if hk > 1 and backend != "torch" and forced in (None, "triton") and _triton_eligible(q) and (
+            forced == "triton" or _failure_key("triton", q, topk_idxs.shape[-1]) not in _FAILED):
+        # The Triton kernel reads one index row per hk folded batches: no [b * hk, s, K] repeated copy kept for
+        # backward (128 MB per layer at 4k tokens with K = 2051, hk = 2).
+        from .sparse_mqa_kernel import sparse_mqa_attention
+        out = None
+        if forced == "triton" or torch.compiler.is_compiling():
+            out = sparse_mqa_attention(q, kv, sink, topk_idxs, softmax_scale)
+        else:
+            try:
+                out = sparse_mqa_attention(q, kv, sink, topk_idxs, softmax_scale)
+            except Exception as error:
+                _latch("triton", q, topk_idxs.shape[-1], error)
+        if out is not None:
+            _count("triton")
+            return out[..., dk:].reshape(b, hk, s, groups, dv).permute(0, 2, 1, 3, 4).reshape(b, s, hq, dv)
+    idxs = topk_idxs.repeat_interleave(hk, dim = 0) if hk > 1 else topk_idxs
     out = sparse_attn(q, kv, sink, idxs, softmax_scale, backend = backend)[..., dk:]    # [b*hk, s, g, dv]
     return out.reshape(b, hk, s, groups, dv).permute(0, 2, 1, 3, 4).reshape(b, s, hq, dv)
 
