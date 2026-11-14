@@ -96,6 +96,21 @@ def _checkpoint_dtype(model_name, **kwargs):
     return None
 
 
+def _checkpoint_quant_method(model_name, **kwargs):
+    """quant_method of a quantization_config the checkpoint ships (root or text_config), else None."""
+    try:
+        from transformers import PretrainedConfig
+
+        config, _ = PretrainedConfig.get_config_dict(model_name, **kwargs)
+    except Exception:
+        return None
+    for holder in (config, config.get("text_config") or {}):
+        quant = holder.get("quantization_config") if isinstance(holder, dict) else None
+        if isinstance(quant, dict) and quant.get("quant_method"):
+            return str(quant["quant_method"]).lower()
+    return None
+
+
 def _resolve_dtype(dtype):
     if isinstance(dtype, str):
         dtype = getattr(torch, dtype.replace("torch.", ""), None)
@@ -282,6 +297,13 @@ class FastCPUModel:
                 on_model_resolved(adapter_name)
             on_model_resolved(model_name)
 
+        if use_4bit:
+            # A checkpoint quantized with another method (fp8, compressed-tensors, mxfp4) keeps its own config, as
+            # on GPU: transformers refuses a BitsAndBytesConfig on top of it.
+            quant_method = _checkpoint_quant_method(model_name, token = token, revision = revision, **hub_kwargs)
+            if quant_method not in (None, "bitsandbytes"):
+                _print(f"{model_name} is already quantized with {quant_method}; loading it as it is, not in 4-bit.")
+                use_4bit = False
         quantization_config = None
         if use_4bit and not _PREQUANTIZED_SUFFIX.search(model_name):
             from unsloth_zoo.peft_utils import SKIP_QUANTIZATION_MODULES
