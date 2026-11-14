@@ -186,11 +186,18 @@ def test_cuda_backend_matches_fp64(monkeypatch, backend, dtype, shape):
     assert got[0][0, 0].abs().max() == 0 and got[0][b - 1, s - 1].abs().max() == 0
 
 
-@pytest.mark.skipif(not _gather_runs(), reason = "gather_attn shared-KV schedule needs capability >= 10")
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def _window_cases():
+    cases = [("triton", dt) for dt in _cuda_dtypes()]
+    return cases + ([("gather", torch.bfloat16)] if _gather_runs() else [])
+
+
+@pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
+@pytest.mark.parametrize("backend,dtype", _window_cases())
 @pytest.mark.parametrize("s", [40, 300])
-def test_cuda_window_form_matches_concatenated(monkeypatch, dtype, s):
-    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "gather")
+def test_cuda_window_form_matches_concatenated(monkeypatch, backend, dtype, s):
+    # Forward and backward of the window form (DeepSeek window-only and compressed layers, head_dim 512, 16 heads)
+    # on the backend this device dispatches to: gather on sm100+, the Triton kernel elsewhere (T4 / L4 / A100).
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", backend)
     g = torch.Generator().manual_seed(2)
     b, h, d, nc, k, w = 1, 16, 512, 150, 32, 128
     q = (torch.randn(b, s, h, d, generator = g) * 0.5).cuda().to(dtype)
@@ -198,15 +205,82 @@ def test_cuda_window_form_matches_concatenated(monkeypatch, dtype, s):
     comp = (torch.randn(b, nc, d, generator = g) * 0.5).cuda().to(dtype)
     sink = torch.randn(h, generator = g).cuda()
     cidx = _unique_idxs(b, s, k, nc, 0.2, g).cuda()
-    out = sa.sparse_attn_window(q, win, comp, cidx, sink, d ** -0.5, w)
+    go = torch.randn(b, s, h, d, generator = g).cuda().to(dtype)
     end = torch.arange(s, device = "cuda").unsqueeze(1)
     widx = (end - w + 1).clamp(0) + torch.arange(min(s, w), device = "cuda")
     widx = torch.where(widx > end, -1, widx).int().unsqueeze(0)
     full = torch.cat([widx, torch.where(cidx >= 0, cidx + s, -1).int()], -1)
-    ref = sa.sparse_attn_reference(q.double(), torch.cat([win, comp], 1).double(), sink.double(), full, d ** -0.5)
-    low = sa.sparse_attn_reference(q, torch.cat([win, comp], 1), sink, full, d ** -0.5)
-    err, base = (out.double() - ref).abs().max().item(), (low.double() - ref).abs().max().item()
-    assert err <= 2 * base + 4 * torch.finfo(dtype).eps
+
+    def run(fn, *xs):
+        xs = [x.detach().clone().requires_grad_() for x in xs]
+        out = fn(*xs)
+        return [out, *torch.autograd.grad(out, xs, go.to(out.dtype))]
+
+    before = dict(sa.SPARSE_ATTN_STATS)
+    got = run(lambda q, win, comp, sink: sa.sparse_attn_window(q, win, comp, cidx, sink, d ** -0.5, w), q, win, comp, sink)
+    assert sa.SPARSE_ATTN_STATS[backend] == before[backend] + 1 and sa.SPARSE_ATTN_STATS["fallback"] == before["fallback"]
+    ref_fn = lambda q, win, comp, sink: sa.sparse_attn_reference(q, torch.cat([win, comp], 1), sink, full, d ** -0.5)
+    ref = run(ref_fn, q.double(), win.double(), comp.double(), sink.double())
+    low = run(ref_fn, q, win, comp, sink)
+    for name, x, r, lo in zip(("out", "dq", "dwin", "dcomp", "dsink"), got, ref, low):
+        err, base = (x.double() - r).abs().max().item(), (lo.double() - r).abs().max().item()
+        bound = 2 * base + 4 * torch.finfo(dtype).eps * max(1.0, r.abs().max().item())
+        assert err <= bound, f"{backend} {name}: err {err:.3e} > bound {bound:.3e} (torch-same-dtype {base:.3e})"
+
+
+@pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
+@pytest.mark.parametrize("dtype", _cuda_dtypes())
+@pytest.mark.parametrize("d", [512, 256])
+def test_cuda_triton_kernel_on_a_64kb_shared_memory_tier(monkeypatch, dtype, d):
+    # The configs a T4 (64 KB per block) gets, run here: head_dim 512 backward splits D in two programs.
+    from unsloth_zoo import sparse_mqa_kernel as mk
+    monkeypatch.setattr(mk, "_shared_memory", lambda device: 64 * 1024)
+    monkeypatch.setattr(mk, "_CHOSEN", {})
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "triton")
+    b, s, h, n, k = 1, 70, 16, 150, 160
+    q, kv, sink, idxs = _inputs(b, s, h, d, n, min(k, n), dtype, "cuda", empty_rows = [(0, 3)])
+    go = torch.randn(b, s, h, d, device = "cuda", dtype = dtype)
+    got = _grads(lambda q, kv, sink: sa.sparse_attn(q, kv, sink, idxs, d ** -0.5), q, kv, sink, go)
+    chosen = {key[3]: mk._configs(None, d, key[3])[i] for key, i in mk._CHOSEN.items()}
+    if d == 512:
+        assert chosen[True][3] == d // 2, chosen   # backward split
+    ref = _grads(lambda q, kv, sink: sa.sparse_attn_reference(q, kv, sink, idxs, d ** -0.5),
+                 q.double(), kv.double(), sink.double(), go.double())
+    low = _grads(lambda q, kv, sink: sa.sparse_attn_reference(q, kv, sink, idxs, d ** -0.5), q, kv, sink, go)
+    for name, x, r, lo in zip(("out", "dq", "dkv", "dsink"), got, ref, low):
+        err, base = (x.double() - r).abs().max().item(), (lo.double() - r).abs().max().item()
+        bound = 2 * base + 4 * torch.finfo(dtype).eps * max(1.0, r.abs().max().item())
+        assert err <= bound, f"{name}: err {err:.3e} > bound {bound:.3e}"
+
+
+@pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
+def test_cuda_refused_kernel_config_steps_down(monkeypatch):
+    # A part whose limit is below what the first config needs: the refusal moves to the next (split) config, the
+    # result is unchanged, and the choice is remembered (one refusal, not one per call).
+    import triton
+    from unsloth_zoo import sparse_mqa_kernel as mk
+    monkeypatch.setattr(mk, "_CHOSEN", {})
+    monkeypatch.setattr(mk, "_shared_memory", lambda device: 228 * 1024)
+    real, refused = mk._sparse_mqa_bwd, []
+
+    class Refusing:
+        def __getitem__(self, grid):
+            def launch(*args, **kw):
+                if kw["SPLIT_D"] == kw["D"]:
+                    refused.append(grid)
+                    raise triton.runtime.errors.OutOfResources(98304, 65536, "shared memory")
+                return real[grid](*args, **kw)
+            return launch
+
+    q, kv, sink, idxs = _inputs(1, 33, 16, 512, 80, 40, torch.float16, "cuda")
+    go = torch.randn(1, 33, 16, 512, device = "cuda", dtype = torch.float16)
+    want = _grads(lambda q, kv, sink: mk.sparse_mqa_attention(q, kv, sink, idxs, 512 ** -0.5), q, kv, sink, go)
+    monkeypatch.setattr(mk, "_sparse_mqa_bwd", Refusing())
+    for _ in range(2):
+        got = _grads(lambda q, kv, sink: mk.sparse_mqa_attention(q, kv, sink, idxs, 512 ** -0.5), q, kv, sink, go)
+        for x, y in zip(got, want):
+            torch.testing.assert_close(x.float(), y.float(), atol = 2e-3, rtol = 2e-2)
+    assert len(refused) == 1
 
 
 def test_gather_eligibility_is_the_shared_schedule_only():
@@ -352,6 +426,23 @@ for (b, s, h, d, n, k, sink_on) in ((1, 7, 3, 16, 9, 5, True), (2, 5, 17, 32, 11
     want = [ref] + list(torch.autograd.grad(ref, ref_leaves, go.double()))
     worst = max(worst, max(float((x.double() - y).abs().max()) for x, y in zip(got, want)))
     assert out[0, 1].abs().max() == 0
+# The D-split backward (64 KB parts at head_dim 512), forced at a small head_dim.
+import unsloth_zoo.sparse_mqa_kernel as mk
+mk._configs = lambda device, d, backward: ((16, 4, 1, d // 4),) if backward else ((16, 4, 1, d),)
+mk._CHOSEN.clear()
+b, s, h, d, n, k = 1, 6, 5, 64, 13, 18
+q = torch.randn(b, s, h, d, requires_grad = True)
+kv = torch.randn(b, n, d, requires_grad = True)
+sink = torch.randn(h, requires_grad = True)
+idx = torch.stack([torch.randperm(n)[:k - 5] for _ in range(s)]).unsqueeze(0)
+idx = torch.cat([idx, torch.full((b, s, 5), -1)], -1).int()
+go = torch.randn(b, s, h, d)
+out = sparse_mqa_attention(q, kv, sink, idx, d ** -0.5)
+got = [out] + list(torch.autograd.grad(out, [q, kv, sink], go))
+ref_leaves = [t.detach().double().requires_grad_() for t in (q, kv, sink)]
+ref = sa.sparse_attn_reference(*ref_leaves, idx, d ** -0.5)
+want = [ref] + list(torch.autograd.grad(ref, ref_leaves, go.double()))
+worst = max(worst, max(float((x.double() - y).abs().max()) for x, y in zip(got, want)))
 print("INTERP_WORST", worst)
 """
 

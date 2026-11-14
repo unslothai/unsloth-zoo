@@ -375,7 +375,7 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, *, backend = None):
         return out
 
 
-def sparse_attn_window(q, window_kv, compress_kv, compress_idxs, attn_sink, softmax_scale, window_size):
+def sparse_attn_window(q, window_kv, compress_kv, compress_idxs, attn_sink, softmax_scale, window_size, *, backend = None):
     """Window of this chunk's KV + selected compressed rows; equal to sparse_attn over their concatenation.
 
     q [b, s, h, d], window_kv [b, s, d] (this chunk, already rotated), compress_kv [b, nc, d],
@@ -384,7 +384,7 @@ def sparse_attn_window(q, window_kv, compress_kv, compress_idxs, attn_sink, soft
     b, s, h, d = q.shape
     if window_kv.shape[:2] != (b, s):
         raise ValueError("sparse_attn_window: window_kv must cover the query chunk [b, s, d]")
-    forced = _forced_backend()
+    forced = backend if backend in _BACKENDS else _forced_backend()
     use_gather = forced == "gather" or (forced is None and _gather_eligible(q, int(window_size)))
     if use_gather:
         key = ("window", int(window_size), compress_idxs.shape[-1])
@@ -400,7 +400,7 @@ def sparse_attn_window(q, window_kv, compress_kv, compress_idxs, attn_sink, soft
     kv = torch.cat([window_kv, compress_kv], dim = 1)
     window = window_topk_idxs(s, int(window_size), b, q.device)
     compressed = torch.where(compress_idxs >= 0, compress_idxs + s, -1).to(torch.int32)
-    return sparse_attn(q, kv, attn_sink, torch.cat([window, compressed], dim = -1), softmax_scale)
+    return sparse_attn(q, kv, attn_sink, torch.cat([window, compressed], dim = -1), softmax_scale, backend = forced)
 
 
 def sparse_gqa_attn(query, key, value, topk_idxs, softmax_scale, *, backend = None):
