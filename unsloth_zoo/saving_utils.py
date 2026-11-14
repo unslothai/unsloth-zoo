@@ -3294,6 +3294,9 @@ def get_torch_storage_size_new(x, element_size):
         if saved_w is None and hasattr(mod, "weight"):
             saved_w = mod.weight
         if saved_w is not None and hasattr(saved_w, "shape"):
+            # Block Swap evicts a host-held layer's weights to empty tensors: size those from the module instead.
+            if saved_w.numel() == 0 and hasattr(mod, "in_features") and hasattr(mod, "out_features"):
+                return mod.in_features * mod.out_features * element_size
             return int(np.prod(saved_w.shape)) * element_size
         # MoE LoRA wrappers with no .base_layer: infer merged shape from lora matrices
         if mod is None and x.lora_A is not None and x.lora_B is not None:
@@ -3320,14 +3323,21 @@ def _tied_tensor_key(x):
 pass
 
 
-def _save_size_in_bytes(state_dict, element_size):
+def _save_size_in_bytes(state_dict, element_size, safe_serialization = True):
+    # torch.save writes each storage whole; for safetensors transformers clones disjoint views (Block Swap's arena) and
+    # drops tied aliases, so each distinct view is written once at its own bytes.
     seen, total = set(), 0
     for x in state_dict.values():
-        key = _tied_tensor_key(x)
+        size = get_torch_storage_size_new(x, element_size)
+        if safe_serialization:
+            key = _tied_tensor_key(x)
+            if key is not None: size = min(size, x.nbytes)
+        else:
+            key = get_torch_storage_id_new(x)
         if key is not None:
             if key in seen: continue
             seen.add(key)
-        total += get_torch_storage_size_new(x, element_size)
+        total += size
     return total
 pass
 
@@ -3352,6 +3362,7 @@ def prepare_saving(
     low_disk_space_usage = False,
     min_size_in_bytes = 100_000_000, # Must be of this size - 100MB default
     use_temp_file = False,
+    safe_serialization = True,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check size
@@ -3393,8 +3404,7 @@ def prepare_saving(
         merge_into_original = merge_into_original,
         return_state_dict = True,
     )
-    # Total save size in bytes
-    save_size = _save_size_in_bytes(state_dict, element_size)
+    save_size = _save_size_in_bytes(state_dict, element_size, safe_serialization)
 
     if not os.path.exists(save_directory):
         try:
@@ -6652,6 +6662,7 @@ def merge_and_dequantize_lora(
         merge_into_original = False,
         min_size_in_bytes = 100_000_000, # 100MB default
         use_temp_file = use_temp_file,
+        safe_serialization = safe_serialization,
     )
 
     import transformers.modeling_utils

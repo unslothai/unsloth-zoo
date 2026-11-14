@@ -16,7 +16,7 @@
 
 import torch
 
-from unsloth_zoo.saving_utils import _save_size_in_bytes, get_torch_storage_size_new
+from unsloth_zoo.saving_utils import _save_size_in_bytes
 
 
 def test_a_tied_embedding_counts_once():
@@ -29,7 +29,7 @@ def test_views_of_one_buffer_each_count():
     arena = torch.zeros(3 * 1024, 1024, dtype = torch.bfloat16)
     q, k, v = arena.chunk(3, 0)
     sd = {"q": q, "k": k, "v": v}
-    assert _save_size_in_bytes(sd, 2) == sum(get_torch_storage_size_new(x, 2) for x in sd.values())
+    assert _save_size_in_bytes(sd, 2) == arena.nbytes
 
 
 def test_meta_tensors_are_never_merged():
