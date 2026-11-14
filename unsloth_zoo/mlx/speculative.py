@@ -2792,6 +2792,8 @@ class ContextRow:
         self.predrafted: list | None = None
         self.requested_depth = 0
         self.empty_context: mx.array | None = None
+        # The head blocks this reply's drafts shortlist from, where the drafter keeps them.
+        self.scan = None
 
     @property
     def ready(self) -> bool:
@@ -2862,10 +2864,14 @@ class ContextDrafter:
         if hidden is None:
             return None, []
         row = ContextRow(self.model.make_cache())
+        if (head_scan := getattr(self._draft, "head_scan", None)) is not None:
+            row.scan = head_scan(prompt)
         self.push(row, [pending], hidden[0])
         return row, []
 
     def push(self, row: ContextRow, tokens: Sequence[int], hidden: mx.array) -> None:
+        if row.scan is not None:
+            row.scan.note(tokens)
         if row.predrafted is not None:
             # The predrafted block read exactly these tokens' rows; they join the context it drafted from.
             for entry in row.predrafted:
@@ -2890,11 +2896,11 @@ class ContextDrafter:
         self._block(row, 1)
         return row.cache
 
-    def _drafted(self, *args) -> tuple[mx.array, mx.array | None]:
+    def _drafted(self, *args, scan = None) -> tuple[mx.array, mx.array | None]:
         if self._selector is not None:
             # A draft whose walk leaves none (a native select) must not read an earlier draft's.
             self._selector.__dict__.pop("_unsloth_confidence", None)
-        block = self._draft(*args, lambda logits: mx.argmax(logits, axis = -1), mx.int32)
+        block = self._draft(*args, lambda logits: mx.argmax(logits, axis = -1), mx.int32, **({} if scan is None else {"scan": scan}))
         return block, None if self._selector is None else self._selector.__dict__.pop("_unsloth_confidence", None)
 
     def _context(self, row: ContextRow) -> mx.array:
@@ -2914,19 +2920,19 @@ class ContextDrafter:
         return row.empty_context
 
     def _block(self, row: ContextRow, depth: int) -> mx.array:
-        block, row.prefetched_confidence = self._drafted(row.pending, self._context(row), row.cache, depth + 1)
+        block, row.prefetched_confidence = self._drafted(row.pending, self._context(row), row.cache, depth + 1, scan = row.scan)
         return block
 
     def tree(self, row: ContextRow, rows: int):
         """The next `DraftTree` of about ``rows`` rows: one already drafted ahead, whichever width it was drafted at."""
         tree, row.prefetched_tree = row.prefetched_tree, None
         row.prefetched = row.prefetched_confidence = None
-        return self._tree(row.pending, self._context(row), row.cache, rows) if tree is None else tree
+        return self._tree(row.pending, self._context(row), row.cache, rows, row.scan) if tree is None else tree
 
-    def _tree(self, anchor, context: mx.array, cache: list, rows: int):
+    def _tree(self, anchor, context: mx.array, cache: list, rows: int, scan = None):
         # Rows within the trained block read its lattice, which accepts a little more than a deeper block's first rows.
         depth = self.trained_depth if rows <= self.trained_depth + 1 else self.extended_depth
-        return self._draft.tree(anchor, context, cache, depth + 1, rows)
+        return self._draft.tree(anchor, context, cache, depth + 1, rows, scan)
 
     def extension_serves(self, row: ContextRow, depth: int) -> bool:
         """Whether a block of ``depth`` drafts for ``row`` now runs on the sparse producer, the only one deeper rounds are
@@ -2944,7 +2950,7 @@ class ContextDrafter:
         ``draft`` reads it unless a ``push`` comes first."""
         for row in rows:
             if row is not None and row.features and row.tree_rows:
-                row.prefetched_tree = self._tree(row.pending, self._context(row), row.cache, row.tree_rows)
+                row.prefetched_tree = self._tree(row.pending, self._context(row), row.cache, row.tree_rows, row.scan)
                 mx.async_eval(row.prefetched_tree.tokens)
             elif row is not None and row.features:
                 depth = self._prepared_depth(row)
@@ -2964,10 +2970,10 @@ class ContextDrafter:
         depth = self._prepared_depth(row)
         row.empty_context = mx.zeros((1, 0, hidden.shape[-1]), hidden.dtype)
         if row.tree_rows:
-            row.prefetched_tree = self._tree(anchor.reshape(1), hidden[None], row.predrafted, row.tree_rows)
+            row.prefetched_tree = self._tree(anchor.reshape(1), hidden[None], row.predrafted, row.tree_rows, row.scan)
             mx.async_eval(row.prefetched_tree.tokens)
             return True
-        block, row.prefetched_confidence = self._drafted(anchor.reshape(1), hidden[None], row.predrafted, depth + 1)
+        block, row.prefetched_confidence = self._drafted(anchor.reshape(1), hidden[None], row.predrafted, depth + 1, scan = row.scan)
         row.prefetched = block.reshape(1, depth)
         mx.async_eval(row.prefetched)
         return True

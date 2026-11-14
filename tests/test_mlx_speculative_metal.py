@@ -1065,7 +1065,7 @@ def _tree_engine(model, monkeypatch, rows = 6):
     engine = S.SpeculativeEngine(model, _script(("draft", 4), ("plain", 3), ("draft", 4), ("copy", 4)), drafter, logprobs = True)
     engine.controller.max_depth = drafter.trained_depth   # a controller capped below it keeps its chain
     reference, commits, commit = [], [], inference.tree_commit
-    drafter._tree = lambda anchor, context, cache, width: _crafted_tree(
+    drafter._tree = lambda anchor, context, cache, width, scan = None: _crafted_tree(
         drafter, anchor, reference[engine._rows[0].emitted:], width, context, cache)
     monkeypatch.setattr(inference, "tree_commit", lambda transaction, cache, path: commits.append(path) or commit(transaction, cache, path))
     drafter.tree_budget = SimpleNamespace(choose = lambda: rows, observe = lambda *args: None)
@@ -1184,7 +1184,7 @@ def test_load_times_the_tree_widths_of_a_target_whose_rows_match_their_paths(qwe
     drafter = _tree_drafter(model)
     drafter.tree_widths, drafts, draft = (8,), [], drafter.draft
     drafter.draft = lambda *args: drafts.append(draft(*args)) or drafts[-1]
-    drafter._tree = lambda anchor, context, cache, width: _crafted_tree(drafter, anchor, list(range(1, 8)), width, context, cache)
+    drafter._tree = lambda anchor, context, cache, width, scan = None: _crafted_tree(drafter, anchor, list(range(1, 8)), width, context, cache)
     with monkeypatch.context() as patch:
         real = inference._tree_attention
         patch.setattr(inference, "_tree_attention", lambda *args: real(*args) * 1.0078125)
@@ -2837,6 +2837,85 @@ def test_radix_shortlist_keeps_the_top_columns_and_the_lowest_tied_ones(dtype):
             order = mx.take_along_axis(by_value, nan_last, axis = -1)[:, :512]
             assert got.dtype == mx.uint32 and got.shape == (7, 512)
             assert mx.array_equal(got, mx.sort(order, axis = -1).astype(mx.uint32))
+
+
+def test_sparse_draft_head_shortlists_from_the_blocks_a_reply_has_seen(monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul
+    monkeypatch.setattr(inference, "_HEAD_SCAN_BLOCK", 1024)
+    monkeypatch.setattr(inference, "_HEAD_SCAN_BASE", 2048)
+    N, K = 8224, 256
+    head = nn.QuantizedLinear(K, N, bias = False, group_size = 64, bits = 4).eval()
+    head.set_dtype(mx.float16)
+    shape = inference._sparse_head_shape(head)
+    weight = mx.dequantize(head.weight, head.scales.astype(mx.float32), head.biases.astype(mx.float32), group_size = 64, bits = 4)
+    hidden = mx.concatenate([mx.random.normal((1, 2, K), key = mx.random.key(3)), weight[mx.array([[5000, 3100]])]], axis = 1).astype(mx.float16)
+    coarse = lambda: matmul.lane_qmm(hidden[0], head.weight, head.scales, head.biases, 64, 4, groups = 2, reader = matmul.lane_shortlist_reader(4, 4))
+    scan = inference._HeadScan(N, [7, 3100])
+    for blocks in ({3, 8}, {3, 4, 8}):   # the last block is always read
+        ids, values = inference._sparse_head_candidates(head, hidden, shape, scan)
+        scanned = mx.array([i for i in range(N) if i < 2048 or i // 1024 in blocks])
+        assert scan.blocks == blocks and mx.array_equal(ids, scanned[matmul.radix_shortlist(coarse()[:, scanned])])
+        assert mx.array_equal(values, matmul._lane_indexed(hidden[0], head.weight, head.scales, head.biases, ids, 64, 4))
+        assert mx.any(ids[2] == 5000).item() == (4 in blocks) and mx.any(ids[3] == 3100).item()
+        scan.note([5000, N + 2000])
+    for name in ("scales", "biases"):   # a replaced array is not read through its old spans
+        head[name] = -head[name]
+        assert mx.array_equal(inference._sparse_head_candidates(head, hidden, shape, scan)[0], scanned[matmul.radix_shortlist(coarse()[:, scanned])])
+    scan.note([5200, 6200])   # past three quarters of the head
+    full = inference._sparse_head_candidates(head, hidden, shape)
+    assert scan.runs(head) is None and mx.array_equal(inference._sparse_head_candidates(head, hidden, shape, scan)[0], full[0])
+    assert mx.array_equal(inference._sparse_head_candidates(head, hidden, shape, inference._HeadScan(N + 8))[0], full[0])
+
+
+def test_context_rows_pass_their_reply_tokens_to_the_head_scan():
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.speculative import ContextDrafter
+    seen, scans = [], []
+    class Scan:
+        def __init__(self, tokens):
+            self.tokens = list(tokens)
+        def note(self, tokens):
+            self.tokens += tokens
+    class Draft:
+        def head_scan(self, tokens):
+            scans.append(Scan(tokens))
+            return scans[-1]
+        def __call__(self, *args, scan = None):
+            seen.append(scan)
+            return mx.zeros((1, 7), mx.int32)
+        def tree(self, *args):
+            seen.append(args[-1])
+            return SimpleNamespace(tokens = mx.zeros(1))
+    class Head(nn.Module):
+        def bind(self, target):
+            pass
+        def draft_block(self, *args):
+            seen.append(args)
+            return mx.zeros((1, 7), mx.int32)
+        def make_cache(self):
+            return []
+    model = Head()
+    model.config = SimpleNamespace(block_size = 8, target_layer_ids = [0])
+    drafter, hidden = ContextDrafter(model, nn.Module()), mx.zeros((1, 2, 4))
+    plain, _ = drafter.start([1, 2], hidden, 3)
+    drafter._block(plain, 7)
+    assert plain.scan is None and len(seen[0]) == 6   # a drafter with no head scan is called as before
+    drafter._draft = Draft()
+    row, _ = drafter.start([1, 2], hidden, 3)
+    drafter.push(row, [4, 5], hidden[0])
+    assert row.scan is scans[0] and row.scan.tokens == [1, 2, 3, 4, 5]
+    drafter._block(row, 7)
+    drafter.push(row, [6], hidden[0, :1])
+    drafter.tree(row, 8)
+    row.tree_rows = 8
+    drafter.push(row, [7], hidden[0, :1])
+    drafter.prefetch([row])
+    drafter.predraft_rows = 8
+    for row.tree_rows in (8, 0):
+        row.prefetched_tree = None
+        assert drafter.predraft(row, hidden[0], mx.array(1), mx.array(5))
+    assert seen[1:] == [row.scan] * 5 and row.scan.tokens == [1, 2, 3, 4, 5, 6, 7]
 
 
 def test_sparse_draft_selection_preserves_canonical_ties_and_call_ownership():

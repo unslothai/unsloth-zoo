@@ -9842,13 +9842,49 @@ def _sparse_head_shape(head):
     return N, K, dtype
 
 
-def _sparse_head_candidates(head, hidden, shape):
+_HEAD_SCAN_BLOCK, _HEAD_SCAN_BASE = 2048, 98304
+
+
+class _HeadScan:
+    """The ids one reply's coarse shortlist reads: those below `_HEAD_SCAN_BASE`, the last block, and each block of
+    `_HEAD_SCAN_BLOCK` ids holding a token the reply has seen. A token of another block is drafted only once the reply
+    holds one of that block: a round's drafts lost once per block, for most of the head spared in most replies."""
+
+    def __init__(self, N, tokens = ()):
+        self.N, self.blocks, self._runs = N, {(N - 1) // _HEAD_SCAN_BLOCK}, None
+        self.note(tokens)
+
+    def note(self, tokens):
+        seen = {int(token) // _HEAD_SCAN_BLOCK for token in tokens if _HEAD_SCAN_BASE <= token < self.N} - self.blocks
+        if seen:
+            self.blocks |= seen
+            self._runs = None
+
+    def runs(self, head):
+        """(each scanned position's id, each scanned span's (weight, scales, biases)); None to read the whole head,
+        as past three quarters of it the spans' launches cost what the skipped rows save."""
+        if 4 * (_HEAD_SCAN_BASE + len(self.blocks) * _HEAD_SCAN_BLOCK) >= 3 * self.N:
+            return None
+        source = head.weight, head.scales, head.biases
+        if self._runs is None or any(a is not b for a, b in zip(self._runs[0], source)):
+            spans = [(0, _HEAD_SCAN_BASE)] + [(block * _HEAD_SCAN_BLOCK, min(self.N, (block + 1) * _HEAD_SCAN_BLOCK))
+                                              for block in sorted(self.blocks)]
+            ids = mx.concatenate([mx.arange(lo, hi, dtype = mx.uint32) for lo, hi in spans])
+            self._runs = source, ids, [tuple(a[lo:hi] for a in source) for lo, hi in spans]
+        return self._runs[1:]
+
+
+def _sparse_head_candidates(head, hidden, shape, scan = None):
     N, K, dtype = shape
     flat = hidden.reshape(-1, K).astype(dtype)
     M, w, scales, biases = flat.shape[0], head.weight, head.scales, head.biases
-    coarse = matmul.lane_qmm(flat, w, scales, biases, head.group_size, head.bits, groups = K // (2 * head.group_size),
-                             reader = matmul.lane_shortlist_reader(M, head.bits))
-    ids = matmul.radix_shortlist(coarse)
+    coarse = functools.partial(matmul.lane_qmm, flat, group_size = head.group_size, bits = head.bits,
+                               groups = K // (2 * head.group_size), reader = matmul.lane_shortlist_reader(M, head.bits))
+    runs = scan.runs(head) if scan is not None and scan.N == N else None
+    if runs is None:
+        ids = matmul.radix_shortlist(coarse(w, scales, biases))
+    else:
+        ids = mx.take(runs[0], matmul.radix_shortlist(mx.concatenate([coarse(*run) for run in runs[1]], axis = 1)))
     values = matmul._lane_indexed(flat, w, scales, biases, ids, head.group_size, head.bits)
     return ids, values
 
@@ -9896,7 +9932,12 @@ class _SparseDrafter:
             return None
         return shape
 
-    def __call__(self, last_bonus, hidden, cache, block_size, sampler, token_dtype = mx.int32):
+    def head_scan(self, tokens):
+        """A reply's `_HeadScan`, started from its prompt; None when the head is not the sparse one."""
+        shape = _sparse_head_shape(self.head)
+        return None if shape is None else _HeadScan(shape[0], tokens)
+
+    def __call__(self, last_bonus, hidden, cache, block_size, sampler, token_dtype = mx.int32, scan = None):
         model, selector, original = self.model, self.selector, self.model.draft_block
         length = int(block_size) - 1
         batch = 1 if isinstance(last_bonus, int) else int(last_bonus.shape[0])
@@ -9910,10 +9951,10 @@ class _SparseDrafter:
         proposed = model._hidden(mx.concatenate([anchor[:, None], masks], axis = 1), hidden, cache)[:, 1:]
         if proposed.shape != (batch, length, shape[1]) or proposed.dtype != shape[2]:
             return selector.select(proposed, model._logits(proposed), anchor, sampler).astype(token_dtype)
-        ids, values = _sparse_head_candidates(head, proposed, shape)
+        ids, values = _sparse_head_candidates(head, proposed, shape, scan)
         return _sparse_candidate_walk(selector, proposed, anchor, ids, values, multiplier, ascending = True).astype(token_dtype)
 
-    def tree(self, last_bonus, hidden, cache, block_size, rows):
+    def tree(self, last_bonus, hidden, cache, block_size, rows, scan = None):
         """This block's best-first `DraftTree` of `rows` rows."""
         model, selector = self.model, self.selector
         length = int(block_size) - 1
@@ -9923,7 +9964,7 @@ class _SparseDrafter:
         anchor = mx.array([last_bonus], mx.int32) if isinstance(last_bonus, int) else last_bonus.reshape(-1).astype(mx.int32)
         masks = mx.full((1, length), int(model.config.mask_token_id), dtype = mx.int32)
         proposed = model._hidden(mx.concatenate([anchor[:, None], masks], axis = 1), hidden, cache)[:, 1:]
-        ids, values = _sparse_head_candidates(self.head, proposed, shape)
+        ids, values = _sparse_head_candidates(self.head, proposed, shape, scan)
         values = values * model.config.output_multiplier
         chosen = mx.argpartition(values, -selector.top_k, axis = -1)[:, -selector.top_k:]
         candidates = mx.take_along_axis(ids, chosen, axis = -1).reshape(*proposed.shape[:-1], selector.top_k)
