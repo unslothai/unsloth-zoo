@@ -51,6 +51,10 @@ modifications =
       The Triton kernel modules need triton >= 3.5 (no Python 3.9 wheels): where
       gather_attn cannot be imported, unsloth_zoo.sparse_attention never selects
       it.
+    - Relative imports whose target is a package or a dotted submodule are
+      spelled absolutely (sparse/__init__.py: gather_attn; gather_attn/api.py:
+      impl; gather_attn/impl/ops.py: triton.backward, triton.forward), because
+      transformers' custom_object_save opens relative-import targets as files.
     - __init__.py, sparse/__init__.py and sparse/gather_attn/__init__.py are
       narrowed to the vendored closure.
 

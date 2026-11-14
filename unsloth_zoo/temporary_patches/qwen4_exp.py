@@ -152,6 +152,16 @@ def qwen4_exp_attention_forward(self, hidden_states, position_embeddings, attent
         return out
     if not torch.compiler.is_compiling():
         QWEN4_EXP_SPARSE_STATS["reference"] += 1
+    # fp32 RoPE tables with half-precision projections (4-bit) would promote Q / K but not V after RoPE. The
+    # compiler's rewrites (RoPE tables cast to the activation dtype, V aligned to Q) never reach this reference,
+    # since the class forward it rewrites is this wrapper; cast the tables like its RoPE rewrite does.
+    if (
+        hidden_states.dtype in (torch.float16, torch.bfloat16)
+        and isinstance(position_embeddings, (tuple, list))
+        and len(position_embeddings) == 2
+        and position_embeddings[0].dtype != hidden_states.dtype
+    ):
+        position_embeddings = tuple(x.to(hidden_states.dtype) for x in position_embeddings)
     return _reference_attention_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values, **kwargs)
 
 
@@ -302,30 +312,6 @@ def patch_qwen4_exp():
             ) from table_error
 
 
-def _dtype_aligned_forward(forward):
-    """transformers' attention forward with the compiler's post-RoPE Q / K / V dtype alignment applied. The
-    compiler rewrites the class forward it finds, which is our wrapper once patched, so the reference the wrapper
-    falls back to (short sequences, decode) must carry the rewrite itself; unchanged when the rewrite is a no-op."""
-    try:
-        import inspect
-        import textwrap
-        from unsloth_zoo.compiler import fix_attention_dtype_consistency
-        source = textwrap.dedent(inspect.getsource(forward))
-        fixed = fix_attention_dtype_consistency(source)
-        if fixed == source:
-            return forward
-        namespace = {}
-        exec(compile(fixed, inspect.getsourcefile(forward) or "<qwen4_exp attention>", "exec"), forward.__globals__, namespace)
-        aligned = namespace[forward.__name__]
-        aligned.__qualname__ = forward.__qualname__
-        aligned.__wrapped_reference__ = forward
-        return aligned
-    except Exception as e:
-        if UNSLOTH_ENABLE_LOGGING:
-            logger.warning(f"Unsloth: Qwen4ExpTextAttention reference keeps its dtype handling ({e})")
-        return forward
-
-
 def _patch_qwen4_exp_rest(modeling):
     indexer_cls = getattr(modeling, "Qwen4ExpTextQSAIndexer", None)
     if (
@@ -352,7 +338,7 @@ def _patch_qwen4_exp_rest(modeling):
         and _attention_forward_mirrored(attention_cls.forward)
     ):
         try:
-            _reference_attention_forward = _dtype_aligned_forward(attention_cls.forward)
+            _reference_attention_forward = attention_cls.forward
             attention_cls.forward = qwen4_exp_attention_forward
         except Exception as e:
             if UNSLOTH_ENABLE_LOGGING:

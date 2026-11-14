@@ -102,8 +102,10 @@ def _gather_attn_fwd_cuda(
                 local_rope=local_rope,
             )
         else:
-            from .triton.backward import _build_index_query_map
-            from .triton.forward import _launch_forward
+            # Modified by Unsloth: absolute import (transformers' custom_object_save opens relative targets as files).
+            from unsloth_zoo._vendored.attn_gym.sparse.gather_attn.impl.triton.backward import _build_index_query_map
+            # Modified by Unsloth: absolute import (transformers' custom_object_save opens relative targets as files).
+            from unsloth_zoo._vendored.attn_gym.sparse.gather_attn.impl.triton.forward import _launch_forward
 
             query = query.contiguous()
             kv_indices = kv_indices.contiguous()
@@ -204,7 +206,8 @@ def _gather_attn_bwd_cuda(
                 sparse_rope=sparse_rope,
                 local_rope=local_rope,
             )
-        from .triton.backward import _launch_backward
+        # Modified by Unsloth: absolute import (transformers' custom_object_save opens relative targets as files).
+        from unsloth_zoo._vendored.attn_gym.sparse.gather_attn.impl.triton.backward import _launch_backward
 
         selected_queries, block_offsets = state
         query = query.contiguous()

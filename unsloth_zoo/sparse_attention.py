@@ -431,7 +431,7 @@ def _latch(backend, q, k, error):
         raise error
     _FAILED[_failure_key(backend, q, k)] = repr(error)[:500]
     _count("fallback")
-    from .temporary_patches.utils import logger
+    from unsloth_zoo.temporary_patches.utils import logger
     logger.warning(f"Unsloth: sparse attention backend '{backend}' failed, falling back: {error}")
 
 

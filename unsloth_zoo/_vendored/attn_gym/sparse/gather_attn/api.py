@@ -13,7 +13,8 @@ from torch import Tensor
 from unsloth_zoo._vendored.attn_gym._cu_seqlens import validate_cu_seqlens_pair
 from unsloth_zoo._vendored.attn_gym.types import AuxRequest, Impl, resolve_impl
 
-from .impl import gather_attn as fused_gather_attn
+# Modified by Unsloth: absolute import (transformers' custom_object_save opens relative targets as files).
+from unsloth_zoo._vendored.attn_gym.sparse.gather_attn.impl import gather_attn as fused_gather_attn
 
 
 class RopePair(NamedTuple):
@@ -424,7 +425,8 @@ def gather_attn(
 
     options = kernel_options or {}
     if selected_impl is Impl.REFERENCE:
-        from .impl import reference
+        # Modified by Unsloth: absolute import (transformers' custom_object_save opens relative targets as files).
+        from unsloth_zoo._vendored.attn_gym.sparse.gather_attn.impl import reference
 
         if attention_sink is None:
             attention_sink = torch.full(

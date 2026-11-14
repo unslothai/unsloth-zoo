@@ -61,7 +61,10 @@ def _sparse_mqa_fwd(
     stride_ob, stride_os, stride_oh,
     stride_lb, stride_ls,
     scale,
-    D: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_K: tl.constexpr, HAS_SINK: tl.constexpr,
+    D: tl.constexpr,  # head dim (power of two, 16..512)
+    BLOCK_H: tl.constexpr,  # query heads per program (16, the tl.dot minimum)
+    BLOCK_K: tl.constexpr,  # index slots per tile
+    HAS_SINK: tl.constexpr,  # add the per-head sink logit to the softmax denominator
 ):
     t = tl.program_id(0).to(tl.int64)
     hb = tl.program_id(1)
@@ -122,7 +125,10 @@ def _sparse_mqa_bwd(
     stride_lb, stride_ls,
     stride_dkb, stride_dkn,
     scale,
-    D: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_D: tl.constexpr,
+    D: tl.constexpr,  # head dim (power of two, 16..512)
+    BLOCK_H: tl.constexpr,  # query heads per program (16, the tl.dot minimum)
+    BLOCK_K: tl.constexpr,  # index slots per tile
+    SPLIT_D: tl.constexpr,  # head-dim slice per program (D, or D // 2 on 64 KB shared-memory parts)
 ):
     # SPLIT_D == D: one program per (token, head block). SPLIT_D < D (64 KB shared-memory parts, e.g. T4 at
     # head_dim 512): D // SPLIT_D programs per (token, head block), each recomputing the full-D logits and dO.V^T
@@ -182,8 +188,12 @@ def _window_fwd(
     stride_kvb, stride_kvn,
     stride_lb, stride_ls,
     scale,
-    D: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr,
-    HAS_PRIOR: tl.constexpr, HAS_SINK: tl.constexpr,
+    D: tl.constexpr,  # head dim (power of two, 16..512)
+    BLOCK_T: tl.constexpr,  # consecutive tokens per program (rows = BLOCK_T * BLOCK_H)
+    BLOCK_H: tl.constexpr,  # query heads per program (16, the tl.dot minimum)
+    BLOCK_N: tl.constexpr,  # window KV rows per tile
+    HAS_PRIOR: tl.constexpr,  # start the softmax from the compressed slots' (out, lse)
+    HAS_SINK: tl.constexpr,  # add the per-head sink logit to the softmax denominator
 ):
     # Query t sees window rows (t - W, t] of KV (one shared head). BLOCK_T consecutive tokens x BLOCK_H heads form
     # the M rows of one program, so each window KV tile is loaded once for all of them. HAS_PRIOR: start the online
@@ -250,7 +260,11 @@ def _window_bwd_dq(
     stride_kvb, stride_kvn,
     stride_lb, stride_ls,
     scale,
-    D: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr, HAS_DQ_IN: tl.constexpr,
+    D: tl.constexpr,  # head dim (power of two, 16..512)
+    BLOCK_T: tl.constexpr,  # consecutive tokens per program (rows = BLOCK_T * BLOCK_H)
+    BLOCK_H: tl.constexpr,  # query heads per program (16, the tl.dot minimum)
+    BLOCK_N: tl.constexpr,  # window KV rows per tile
+    HAS_DQ_IN: tl.constexpr,  # add the index kernel's dq for the compressed slots
 ):
     M: tl.constexpr = BLOCK_T * BLOCK_H
     t0 = tl.program_id(0) * BLOCK_T
@@ -295,7 +309,10 @@ def _window_bwd_dkv(
     stride_kvb, stride_kvn,
     stride_lb, stride_ls,
     scale,
-    D: tl.constexpr, BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr,
+    D: tl.constexpr,  # head dim (power of two, 16..512)
+    BLOCK_T: tl.constexpr,  # consecutive tokens per program (rows = BLOCK_T * BLOCK_H)
+    BLOCK_H: tl.constexpr,  # query heads per program (16, the tl.dot minimum)
+    BLOCK_N: tl.constexpr,  # window KV rows per tile
 ):
     # One program per BLOCK_N window rows: walks every (token, head) that sees them, tokens [n0, n0 + BLOCK_N - 1 + W),
     # and accumulates key + value gradient in registers (no atomics).
