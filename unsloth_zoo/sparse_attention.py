@@ -95,14 +95,17 @@ def _gather_eligible(q, window = 0):
     """gather_attn's shared-KV schedule only: k-tiled tl.dot over the gathered rows, every head sharing one KV
     load. Its other Triton kernels unroll tl.static_range(TOPK) one row at a time (TOPK a compile key; a TOPK of
     515 compiled for over 6 minutes on B200), so those never run here. Mirrors attn-gym's
-    can_use_shared_kv_schedule: capability >= 10 (read from q's device), bf16, head_dim <= 128 or 512, window <= 2048,
-    heads padded up to 16 (at most 128)."""
+    can_use_shared_kv_schedule (capability >= 10, read from q's device; bf16, head_dim <= 128 or 512, window <= 2048,
+    heads padded up to 16, at most 128), narrowed to datacenter Blackwell (capability 10.x / 11.x, the parts it was
+    written and validated for). sm120 (RTX PRO 6000 / G4 / RTX 50xx: mma.sync, no tcgen05, ~100 KB shared memory)
+    and everything below sm100 (T4 / A100 / L4) take the Unsloth Triton kernel instead (sparse_mqa_kernel: one
+    compiled variant per head_dim, configs sized to the part's shared memory), never the torch path."""
     if not (q.is_cuda and _HAS_TRITON and torch.version.hip is None and q.dtype == torch.bfloat16):
         return False
     d, h = q.shape[-1], q.shape[2]
     if d % 16 or not (d <= 128 or d == 512) or h > 128 or window > 2048:
         return False
-    return torch.cuda.get_device_capability(q.device)[0] >= 10
+    return torch.cuda.get_device_capability(q.device)[0] in (10, 11)
 
 
 # The flex fallback reads a [b, s, n] membership table (S x S for QSA); above this many entries the chunked torch

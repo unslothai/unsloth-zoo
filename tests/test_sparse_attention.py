@@ -154,8 +154,8 @@ _FLEX_SHAPES = _GATHER_SHAPES + [(1, 130, 8, 256, 140, 33)]
 
 
 def _gather_runs():
-    # Only the shared-KV schedule is used in production: capability >= 10 and bf16.
-    return _CUDA and torch.cuda.get_device_capability()[0] >= 10
+    # Only the shared-KV schedule is used in production: capability 10.x / 11.x and bf16.
+    return _CUDA and torch.cuda.get_device_capability()[0] in (10, 11)
 
 
 @pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
@@ -506,3 +506,48 @@ def test_out_of_memory_is_not_latched(monkeypatch):
     with pytest.raises(torch.OutOfMemoryError):
         sa.sparse_attn(q, kv, sink, idxs, 0.3)
     assert not sa._FAILED
+
+
+# (name, capability, shared memory per block, dtype): the parts below sm100 plus sm120, as their dispatch sees them.
+_TIERS = [("T4", (7, 5), 64 * 1024, torch.float16), ("A100", (8, 0), 163 * 1024, torch.bfloat16),
+          ("L4", (8, 9), 99 * 1024, torch.bfloat16), ("G4", (12, 0), 99 * 1024, torch.bfloat16)]
+
+
+@pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
+@pytest.mark.parametrize("tier", _TIERS, ids = [t[0] for t in _TIERS])
+def test_deepseek_head_dim_512_below_sm100_takes_the_triton_kernel(monkeypatch, tier):
+    # DeepSeek-V4.1 attention (head_dim 512, 16 heads, window 128 + compressed top-k) with no backend forced, on
+    # each tier's capability and shared memory: dispatch must pick the Triton kernel (not gather, not torch) for both
+    # the plain and the window form, with that tier's launch configs, and match the fp64 reference. Configs run on
+    # this device's codegen; the per-target shared memory of those configs is checked by smem_targets.py.
+    from unsloth_zoo import sparse_mqa_kernel as mk
+    name, cap, smem, dtype = tier
+    monkeypatch.delenv("UNSLOTH_SPARSE_ATTN_BACKEND", raising = False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: cap)
+    monkeypatch.setattr(sa, "_shared_memory", lambda device: smem)
+    monkeypatch.setattr(mk, "_shared_memory", lambda device: smem)
+    monkeypatch.setattr(mk, "_CHOSEN", {})
+    monkeypatch.setattr(sa, "_FAILED", {})
+    b, s, h, d, n, k = 1, 300, 16, 512, 75, 64
+    q, kv, sink, idxs = _inputs(b, s, h, d, n, k, dtype, "cuda", empty_rows = [(0, 1)])
+    assert sa._order(q, k, None, n)[0] == "triton", sa._order(q, k, None, n)
+    go = torch.randn(b, s, h, d, device = "cuda", dtype = dtype)
+    before = dict(sa.SPARSE_ATTN_STATS)
+    got = _grads(lambda q, kv, sink: sa.sparse_attn(q, kv, sink, idxs, d ** -0.5), q, kv, sink, go)
+    win = (torch.randn(b, s, d, device = "cuda") * 0.5).to(dtype)
+    out_w = sa.sparse_attn_window(q, win, kv, idxs, sink, d ** -0.5, 128)
+    delta = {key: sa.SPARSE_ATTN_STATS[key] - before[key] for key in before}
+    assert delta == {**{key: 0 for key in before}, "triton": 2}, delta
+    ref = _grads(lambda q, kv, sink: sa.sparse_attn_reference(q, kv, sink, idxs, d ** -0.5),
+                 q.double(), kv.double(), sink.double(), go.double())
+    low = _grads(lambda q, kv, sink: sa.sparse_attn_reference(q, kv, sink, idxs, d ** -0.5), q, kv, sink, go)
+    for label, x, r, lo in zip(("out", "dq", "dkv", "dsink"), got, ref, low):
+        err, base = (x.double() - r).abs().max().item(), (lo.double() - r).abs().max().item()
+        assert err <= 2 * base + 4 * torch.finfo(dtype).eps * max(1.0, r.abs().max().item()), (name, label, err, base)
+    full = torch.cat([sa.window_topk_idxs(s, 128, b, "cuda"), torch.where(idxs >= 0, idxs + s, -1).int()], -1)
+    ref_w = sa.sparse_attn_reference(q.double(), torch.cat([win, kv], 1).double(), sink.double(), full, d ** -0.5)
+    low_w = sa.sparse_attn_reference(q, torch.cat([win, kv], 1), sink, full, d ** -0.5)
+    err, base = (out_w.double() - ref_w).abs().max().item(), (low_w.double() - ref_w).abs().max().item()
+    assert err <= 2 * base + 4 * torch.finfo(dtype).eps, (name, "window", err, base)
+    chosen = {key[3]: mk._configs(None, d, key[3])[i] for key, i in mk._CHOSEN.items()}
+    assert chosen[True][3] == (d // 2 if smem < 96 * 1024 else d), chosen
