@@ -164,6 +164,9 @@ def _gather_runs():
                          + ([("gather", torch.bfloat16, sh) for sh in _GATHER_SHAPES] if _gather_runs() else []))
 def test_cuda_backend_matches_fp64(monkeypatch, backend, dtype, shape):
     b, s, h, d, n, k = shape
+    if backend == "flex" and not sa._flex_eligible(torch.empty(1, 1, h, d, device = "cuda", dtype = dtype)):
+        pytest.skip(f"flex at head_dim {d} is gated off here: {sa._shared_memory(torch.device('cuda'))} B shared memory "
+                    f"per block < {sa._FLEX_D512_MIN_SHARED_MEMORY} B (test_flex_gate_follows_shared_memory checks the gate)")
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", backend)
     q, kv, sink, idxs = _inputs(b, s, h, d, n, k, dtype, "cuda", empty_rows = [(0, 0), (b - 1, s - 1)])
     scale = d ** -0.5
@@ -364,3 +367,51 @@ def test_triton_kernel_math_in_the_interpreter():
     line = next((l for l in proc.stdout.splitlines() if l.startswith("INTERP_WORST")), None)
     assert line is not None, proc.stderr[-3000:]
     assert float(line.split()[1]) < 1e-5, line
+
+
+@pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
+def test_flex_gate_follows_shared_memory():
+    # head_dim 512 flex needs ~160 KB per block: on smaller parts (T4, L4, sm86 / 89, sm120) it must never be picked.
+    q = torch.empty(1, 4, 16, 512, device = "cuda", dtype = _cuda_dtypes()[-1])
+    big_enough = sa._shared_memory(q.device) >= sa._FLEX_D512_MIN_SHARED_MEMORY
+    assert sa._flex_eligible(q) == big_enough
+    assert ("flex" in sa._order(q, 8)) == big_enough
+    assert sa._flex_eligible(torch.empty(1, 4, 16, 128, device = "cuda", dtype = _cuda_dtypes()[-1]))
+
+
+def test_refused_launch_latches_and_falls_through(monkeypatch):
+    # A backend whose launch is refused (Triton OutOfResources: shared memory over the device limit) is latched off
+    # for that shape class and the next backend runs; later calls skip it; the result is the next backend's.
+    from triton.runtime.errors import OutOfResources
+    q, kv, sink, idxs = _inputs(1, 6, 2, 8, 9, 4, torch.float32, "cpu")
+    monkeypatch.setattr(sa, "_order", lambda q, k, backend = None, kv_len = None: tuple(
+        b for b in ("triton", "torch") if b == "torch" or sa._failure_key(b, q, k) not in sa._FAILED))
+    calls = []
+    original = sa._run
+
+    def refusing(backend, *args):
+        calls.append(backend)
+        if backend == "triton":
+            raise OutOfResources(98304, 65536, "shared memory")
+        return original(backend, *args)
+
+    monkeypatch.setattr(sa, "_run", refusing)
+    monkeypatch.setattr(sa, "_FAILED", {})
+    before = dict(sa.SPARSE_ATTN_STATS)
+    out = sa.sparse_attn(q, kv, sink, idxs, 0.3)
+    torch.testing.assert_close(out, sa.sparse_attn_reference(q, kv, sink, idxs, 0.3), rtol = 0, atol = 0)
+    assert calls == ["triton", "torch"]
+    assert sa.SPARSE_ATTN_STATS["fallback"] == before["fallback"] + 1 and len(sa._FAILED) == 1
+    sa.sparse_attn(q, kv, sink, idxs, 0.3)
+    assert calls == ["triton", "torch", "torch"]  # latched: the refused backend is not retried
+
+
+def test_out_of_memory_is_not_latched(monkeypatch):
+    # A CUDA OOM is not a property of the shape class: it propagates instead of silently switching backends.
+    q, kv, sink, idxs = _inputs(1, 6, 2, 8, 9, 4, torch.float32, "cpu")
+    monkeypatch.setattr(sa, "_order", lambda q, k, backend = None, kv_len = None: ("triton", "torch"))
+    monkeypatch.setattr(sa, "_run", lambda backend, *a: (_ for _ in ()).throw(torch.OutOfMemoryError("oom")))
+    monkeypatch.setattr(sa, "_FAILED", {})
+    with pytest.raises(torch.OutOfMemoryError):
+        sa.sparse_attn(q, kv, sink, idxs, 0.3)
+    assert not sa._FAILED
