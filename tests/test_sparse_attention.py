@@ -253,3 +253,42 @@ def test_chunked_reference_recomputes_in_backward_with_identical_grads(monkeypat
     assert len(calls) == 9
     for x, y in zip(chunked, whole):
         torch.testing.assert_close(x, y, rtol = 1e-12, atol = 1e-12)
+
+
+def _all_pad_inputs(device, dtype, h = 16, d = 128):
+    g = torch.Generator().manual_seed(5)
+    q = (torch.randn(1, 12, h, d, generator = g) * 0.5).to(device, dtype)
+    kv = (torch.randn(1, 20, d, generator = g) * 0.5).to(device, dtype)
+    idxs = _unique_idxs(1, 12, 6, 20, 0.2, g, empty_rows = [(0, 0), (0, 5), (0, 11)]).to(device)
+    return q, kv, idxs
+
+
+@pytest.mark.parametrize("with_sink", [True, False])
+def test_all_pad_rows_are_zero_and_finite_on_the_torch_path(with_sink):
+    q, kv, idxs = _all_pad_inputs("cpu", torch.float32)
+    sink = torch.randn(16) if with_sink else torch.full((16,), float("-inf"))
+    q, kv, sink = q.requires_grad_(), kv.requires_grad_(), sink.requires_grad_(with_sink)
+    out = sa.sparse_attn_reference(q, kv, sink, idxs, 0.2)
+    leaves = [q, kv] + ([sink] if with_sink else [])
+    grads = torch.autograd.grad(out.square().sum(), leaves)
+    assert torch.isfinite(out).all() and all(torch.isfinite(g).all() for g in grads)
+    assert out[0, [0, 5, 11]].abs().max() == 0 and grads[0][0, [0, 5, 11]].abs().max() == 0
+
+
+@pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
+@pytest.mark.parametrize("with_sink", [True, False])
+@pytest.mark.parametrize("backend", ["gather", "flex"])
+def test_cuda_all_pad_rows_are_zero_and_finite(monkeypatch, backend, with_sink):
+    if backend == "gather" and not _gather_runs():
+        pytest.skip("gather_attn shared-KV schedule needs capability >= 10")
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", backend)
+    q, kv, idxs = _all_pad_inputs("cuda", dtype)
+    sink = (torch.randn(16) if with_sink else torch.full((16,), float("-inf"))).cuda()
+    q, kv = q.requires_grad_(), kv.requires_grad_()
+    sink.requires_grad_(with_sink)
+    out = sa.sparse_attn(q, kv, sink, idxs, 0.2)
+    leaves = [q, kv] + ([sink] if with_sink else [])
+    grads = torch.autograd.grad(out.float().square().sum(), leaves)
+    assert torch.isfinite(out).all() and all(torch.isfinite(g).all() for g in grads)
+    assert out[0, [0, 5, 11]].abs().max() == 0 and grads[0][0, [0, 5, 11]].abs().max() == 0

@@ -108,8 +108,26 @@ def _gather_eligible(q, window = 0):
 _FLEX_MAX_TABLE = 1 << 28
 
 
+# head_dim 512 flex (32 x 32 tiles, 1 stage) needs about 160 KB of shared memory per block: T4 (64 KB), L4 / sm86 /
+# sm89 / sm120 consumer parts (~100 KB) cannot launch it, so they take the torch path without a failing compile.
+_FLEX_D512_MIN_SHARED_MEMORY = 160 * 1024
+_SHARED_MEMORY = {}
+
+
+def _shared_memory(device):
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index not in _SHARED_MEMORY:
+        try:
+            _SHARED_MEMORY[index] = getattr(torch.cuda.get_device_properties(index), "shared_memory_per_block_optin", 0)
+        except Exception:
+            _SHARED_MEMORY[index] = 0
+    return _SHARED_MEMORY[index]
+
+
 def _flex_eligible(q, kv_len = None):
     if not (q.is_cuda and _HAS_TRITON and q.dtype in (torch.float16, torch.bfloat16)):
+        return False
+    if q.shape[-1] == 512 and _shared_memory(q.device) < _FLEX_D512_MIN_SHARED_MEMORY:
         return False
     return kv_len is None or q.shape[0] * q.shape[1] * kv_len <= _FLEX_MAX_TABLE
 
