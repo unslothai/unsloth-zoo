@@ -710,7 +710,7 @@ from unsloth_zoo.loss_utils import (
     fused_linear_cross_entropy,
     unsloth_fused_ce_loss,
 )
-from unsloth_zoo.fused_losses.forward_adapter import unsloth_fused_lm_head_loss
+from unsloth_zoo.fused_losses.forward_adapter import lm_head_fake_quantize, unsloth_fused_lm_head_loss
 from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
 from unsloth_zoo.compiler import lm_head_on_old_cuda_arch
 from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs, unsloth_fsdp_unshard
@@ -3634,19 +3634,19 @@ elif labels is None:
         logits = torch.tanh(logits)
         logits = logits * (\\4)
 elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
+    _hidden_states, lm_head_weight = lm_head_fake_quantize(self.lm_head, hidden_states\\1)
     loss = fused_linear_cross_entropy(
-        hidden_states      = hidden_states\\1,
-        lm_weight          = self.lm_head.weight,
+        hidden_states      = _hidden_states,
+        lm_weight          = lm_head_weight,
         labels             = labels.to(self.lm_head.weight.device),
         num_items_in_batch = n_items,
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
 else:
-    lm_head_weight = self.lm_head.weight
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
     # ========= NEW fused =========
-    _hidden_states = hidden_states\\1
+    _hidden_states, lm_head_weight = lm_head_fake_quantize(self.lm_head, hidden_states\\1)
     torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(labels, 1)
     loss = unsloth_fused_ce_loss(
@@ -3735,19 +3735,19 @@ elif labels is None:
         logits = torch.tanh(logits)
         logits = logits * (\\4)
 elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
+    _hidden_states, lm_head_weight = lm_head_fake_quantize(self.lm_head, hidden_states\\1)
     loss = fused_linear_cross_entropy(
-        hidden_states      = hidden_states\\1,
-        lm_weight          = self.lm_head.weight,
+        hidden_states      = _hidden_states,
+        lm_weight          = lm_head_weight,
         labels             = labels.to(self.lm_head.weight.device),
         num_items_in_batch = n_items,
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
 elif _can_fuse_loss(self.loss_function) and labels is not None and NOT_RETURN_LOGITS:
-    lm_head_weight = self.lm_head.weight
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
     # ========= NEW fused =========
-    _hidden_states = hidden_states\\1
+    _hidden_states, lm_head_weight = lm_head_fake_quantize(self.lm_head, hidden_states\\1)
     _labels = labels if explicit_shift_labels is None else explicit_shift_labels
     torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(_labels, _labels.dim() - 1)
@@ -3862,11 +3862,10 @@ elif labels is None:
         logits = torch.tanh(logits)
         logits = logits * (\\4)
 else:
-    lm_head_weight = self.lm_head.weight
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
     # ========= NEW fused =========
-    _hidden_states = hidden_states\\1
+    _hidden_states, lm_head_weight = lm_head_fake_quantize(self.lm_head, hidden_states\\1)
     torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(labels, 1)
     if attention_mask is not None:
