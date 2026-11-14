@@ -7425,7 +7425,11 @@ def _extract_vlm_media(
                     has_video_parts = True
                     if collect_videos:
                         video = _video_part_payload(part)
-                        if isinstance(video, (str, bytes, dict)):
+                        if isinstance(video, (str, bytes, dict)) or (
+                            # A list of frame paths / images goes through fetch_video's per-frame loader.
+                            isinstance(video, (list, tuple)) and video
+                            and not hasattr(video[0], "shape")
+                        ):
                             videos.append({**part, "video": video})
                         elif video is not None:
                             # Already-decoded frames: skip the decoder but keep the part's rate.

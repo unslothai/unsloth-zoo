@@ -536,3 +536,14 @@ def test_video_in_the_completion_half_is_refused():
     }
     with pytest.raises(ValueError, match = "video in the completion half"):
         _collate_vlm_prompt_completion_batch([row], _FakeVideoProcessor(), 64, None)
+
+
+def test_video_part_given_as_frame_paths_is_loaded_per_frame(monkeypatch):
+    import unsloth_zoo.vision_utils as vu
+
+    seen = []
+    monkeypatch.setattr(vu, "fetch_video", lambda info, **k: (seen.append(info["video"]), (np.zeros((2, 4, 4, 3), np.uint8), 2.0))[1])
+    frames = ["clips/f0.jpg", "clips/f1.jpg"]
+    messages = [{"role": "user", "content": [{"type": "video", "video": frames}, {"type": "text", "text": "q"}]}]
+    _, videos, kwargs = _extract_vlm_media({}, messages, None)
+    assert seen == [frames] and len(videos) == 1 and kwargs == {"fps": [2.0]}
