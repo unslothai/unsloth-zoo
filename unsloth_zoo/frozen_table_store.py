@@ -1183,6 +1183,12 @@ def compare_frozen_table_provenance(saved: dict, live: Optional[dict]) -> List[s
         if set(want_t) != set(got_t):
             problems.append(f"{key}: table tensors {sorted(got_t)} differ from the saved {sorted(want_t)}")
             continue
+        for plane in sorted({p for _, p in want_t}):
+            # Shards concatenate in this order into rows: the same shards reordered put other rows at the same ids.
+            if [t["name"] for t in want["tensors"] if t["plane"] == plane] != [
+                t["name"] for t in got["tensors"] if t["plane"] == plane
+            ]:
+                problems.append(f"{key}: {plane} shards are in another row order")
         for ident, t in want_t.items():
             g = got_t[ident]
             for field in ("dtype", "shape", "sample_sha256"):

@@ -1147,3 +1147,13 @@ def test_cuda_resident_out_of_range_ids_raise_index_error_with_the_debug_check(b
     env = dict(os.environ, UNSLOTH_FROZEN_TABLE_CHECK_IDS="1")
     out = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=300)
     assert out.returncode == 0 and "INDEXERROR" in out.stdout and "OK" in out.stdout, (out.stdout, out.stderr[-800:])
+
+
+def test_provenance_compare_keeps_the_row_order_of_shards():
+    """Finding 14: the same shards in another order hold other rows at the same ids."""
+    def t(name):
+        return {"name": name, "plane": "weight", "dtype": "BF16", "shape": [3, 2], "sample_sha256": name}
+
+    saved = {"tables": {"ngram": {"num_rows": 6, "tensors": [t("shard_0"), t("shard_1")]}}}
+    live = {"tables": {"ngram": {"num_rows": 6, "tensors": [t("shard_1"), t("shard_0")]}}}
+    assert fts.compare_frozen_table_provenance(saved, live) == ["ngram: weight shards are in another row order"]
