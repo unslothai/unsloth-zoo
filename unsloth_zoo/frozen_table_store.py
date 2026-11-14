@@ -1128,19 +1128,21 @@ def _hub_identity(path: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-_PEFT_PREFIXES = ("base_model.model.", "base_model.")
+_LEADING_WRAPPERS = ("base_model.model.", "base_model.", "module.", "_orig_mod.")
+_INNER_WRAPPERS = {"_orig_mod", "_fsdp_wrapped_module"}  # torch.compile / FSDP1 wrap submodules too
 
 
 def _table_key(name: str) -> str:
-    """A table's module path without PEFT wrapper prefixes: the same table whether saved from the PEFT model or
-    checked on the base model."""
+    """A table's module path without wrapper prefixes (PEFT, DDP / DataParallel `module.`, torch.compile
+    `_orig_mod.`, FSDP1 `_fsdp_wrapped_module.`): the same table whether saved from a wrapped model or checked on
+    the bare one."""
     changed = True
     while changed:
         changed = False
-        for prefix in _PEFT_PREFIXES:
+        for prefix in _LEADING_WRAPPERS:
             if name.startswith(prefix):
                 name, changed = name[len(prefix):], True
-    return name
+    return ".".join(part for part in name.split(".") if part not in _INNER_WRAPPERS)
 
 
 def frozen_table_provenance(model: nn.Module) -> Optional[dict]:
@@ -1161,7 +1163,7 @@ def compare_frozen_table_provenance(saved: dict, live: Optional[dict]) -> List[s
     """What differs between a saved provenance and the live model's ([] = the same base tables)."""
     if not saved or not saved.get("tables"):
         return []
-    live_tables = (live or {}).get("tables") or {}
+    live_tables = {_table_key(k): v for k, v in ((live or {}).get("tables") or {}).items()}
     problems = []
     for key, want in saved["tables"].items():
         got = live_tables.get(_table_key(key))

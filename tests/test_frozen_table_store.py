@@ -1111,3 +1111,14 @@ def test_memo_serves_steady_state_one_f_one_b_without_evicting_a_waiting_micro_b
     assert fts.frozen_table_step_stats() == {"memo_hits": 4, "memo_misses": 4}
     assert FROZEN_TABLE_STATS["gathers"] == 4
     emb.frozen_table_store.close()
+
+
+def test_provenance_keys_ignore_compile_ddp_fsdp_and_peft_wrappers():
+    """Findings 8 / 10: the same table saved from a wrapped model and checked on a bare one (or the reverse)."""
+    table = {"num_rows": 3, "tensors": [{"name": "t", "plane": "weight", "dtype": "BF16", "shape": [3, 2],
+                                         "sample_sha256": "x"}]}
+    wrapped = "module._orig_mod.base_model.model.model.layers.0._fsdp_wrapped_module.ngram"
+    assert fts._table_key(wrapped) == "model.layers.0.ngram"
+    for saved_key, live_key in ((wrapped, "model.layers.0.ngram"), ("model.layers.0.ngram", wrapped)):
+        saved = {"tables": {saved_key: table}}
+        assert fts.compare_frozen_table_provenance(saved, {"tables": {live_key: table}}) == []
