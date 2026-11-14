@@ -7328,8 +7328,11 @@ def _vlm_vision_part_state(messages):
     return bare_placeholder_types, has_media_payload
 
 
+_VIDEO_PART_TYPES = ("video", "video_url", "input_video")
+
+
 def _video_part_payload(part):
-    for key in ("video", "video_url", "input_video"):
+    for key in _VIDEO_PART_TYPES:
         value = part.get(key)
         if value is not None:
             # OpenAI-style {"url": ...} and HF datasets' Video feature {"path": ...}.
@@ -7420,8 +7423,10 @@ def _extract_vlm_media(
                     has_video_parts = True
                     if collect_videos:
                         video = _video_part_payload(part)
-                        if video is not None:
+                        if isinstance(video, (str, bytes, dict)):
                             videos.append({**part, "video": video})
+                        elif video is not None:
+                            videos.append(video)  # already-decoded frames
 
     if (
         not images
@@ -9773,6 +9778,16 @@ def _collate_vlm_prompt_completion_batch(
             raise ValueError(
                 "Unsloth MLX: audio in the completion half is not supported; "
                 "put the audio in the prompt so it conditions the response."
+            )
+        if any(
+            isinstance(part, dict) and (part.get("type") in _VIDEO_PART_TYPES or any(k in part for k in _VIDEO_PART_TYPES))
+            for message in (completion_messages or []) if isinstance(message, dict)
+            for part in (message.get("content") if isinstance(message.get("content"), list) else ())
+        ):
+            # The completion half is tokenized without media, so its placeholders would never be expanded.
+            raise ValueError(
+                "Unsloth MLX: video in the completion half is not supported; "
+                "put the video in the prompt so it conditions the response."
             )
         audio = _extract_vlm_audio(item, prompt_messages or [], processor)
         if prompt_messages is not None:

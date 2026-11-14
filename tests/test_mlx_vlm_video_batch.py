@@ -510,3 +510,24 @@ def test_video_part_with_a_datasets_path_dict_decodes(monkeypatch):
     messages = [{"role": "user", "content": [{"type": "video", "video": {"path": "clips/a.mp4", "bytes": None}, "nframes": 4}, {"type": "text", "text": "q"}]}]
     _, videos, _ = _extract_vlm_media({}, messages, None)
     assert len(videos) == 1 and seen[0]["video"] == "clips/a.mp4" and seen[0]["nframes"] == 4
+
+
+def test_decoded_frames_in_a_video_part_skip_the_decoder(monkeypatch):
+    import unsloth_zoo.vision_utils as vu
+
+    monkeypatch.setattr(vu, "fetch_video", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not decode")))
+    frames = np.zeros((2, 4, 4, 3), dtype = np.uint8)
+    messages = [{"role": "user", "content": [{"type": "video", "video": frames}, {"type": "text", "text": "q"}]}]
+    _, videos, _ = _extract_vlm_media({}, messages, None)
+    assert len(videos) == 1 and videos[0] is frames
+
+
+def test_video_in_the_completion_half_is_refused():
+    from unsloth_zoo.mlx.utils import _collate_vlm_prompt_completion_batch
+
+    row = {
+        "prompt": [{"role": "user", "content": [{"type": "text", "text": "q"}]}],
+        "completion": [{"role": "assistant", "content": [{"type": "video", "video": "clips/a.mp4"}, {"type": "text", "text": "a"}]}],
+    }
+    with pytest.raises(ValueError, match = "video in the completion half"):
+        _collate_vlm_prompt_completion_batch([row], _FakeVideoProcessor(), 64, None)
