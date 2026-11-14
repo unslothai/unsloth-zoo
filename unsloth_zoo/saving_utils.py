@@ -5364,6 +5364,18 @@ def merge_and_overwrite_lora(
                 _hub_shard_sizes[fname] = x["size"]
                 max_size_in_bytes = max(max_size_in_bytes, x["size"])
                 total_size_in_bytes += x["size"]
+            if not safetensors_list:
+                # No root shard: read the subfolder shards the root index names, as the local branch does.
+                try:
+                    _hub_shard_sizes = _hub_index_subfolder_shards(model_name, file_list, token, _hub_revision)
+                except Exception as e:
+                    raise _hub_unreachable_error(
+                        model_name, e, action = f"listing the shards of `{model_name}`",
+                    ) from e
+                safetensors_list = list(_hub_shard_sizes)
+                if _hub_shard_sizes:
+                    max_size_in_bytes = max(_hub_shard_sizes.values())
+                    total_size_in_bytes = sum(_hub_shard_sizes.values())
 
             # Drop stale/duplicate shard sets the index doesn't reference. Some repos (e.g.
             # granite-3.2-8b-instruct) ship a leftover second shard set next to the real one while
@@ -6368,7 +6380,8 @@ def _try_copy_all_from_cache(
                 deferred[filename] = str(cached_path)
                 _deferred_here.append(filename)
                 continue
-            # Pass string target_dir_str to copy helper
+            # A subfolder shard (Cosmos3 `transformer/...`) has no parent in the target yet.
+            os.makedirs(os.path.dirname(os.path.join(target_dir_str, filename)), exist_ok = True)
             _copy_file_from_source(cached_path, target_dir_str, filename)
             if copied is not None: copied.append(filename)
         except (IOError, PermissionError, FileNotFoundError) as copy_err:
@@ -8149,6 +8162,60 @@ def _hub_unreachable_error(model_name, e, action = None, mistaken_for = "a missi
     )
 pass
 
+def _index_subfolder_shards(weight_map):
+    """Shard names a root index maps into subfolders, or None unless every one is nested and stays inside.
+
+    Cosmos3 publishes no root shard: its root index points into `transformer/` and `vision_encoder/`.
+    """
+    if not isinstance(weight_map, dict) or not weight_map: return None
+    shards = {v.replace("\\", "/") for v in weight_map.values() if isinstance(v, str)}
+    if len(shards) != len(set(weight_map.values())): return None
+    if not all(_shard_name_stays_inside(s) and _has_directory_component(s) for s in shards): return None
+    return sorted(shards)
+
+
+def _hub_index_subfolder_shards(model_name, root_listing, token = None, revision = None):
+    """{shard: size} for a repo with no root safetensors whose root index maps into subfolders, else {}.
+
+    Transport errors propagate for the caller to classify, as the root listing's do.
+    """
+    names = {os.path.basename(x["name"]) for x in root_listing}
+    if any(n.endswith(".safetensors") for n in names) or "model.safetensors.index.json" not in names:
+        return {}
+    # `hf://org/repo` and `org/repo@rev` list fine but are not repo ids to hf_hub_download.
+    repo_id, address_revision = _hub_repo_and_revision(model_name)
+    revision = revision or address_revision
+    index_path = hf_hub_download(
+        repo_id = repo_id, filename = "model.safetensors.index.json", token = token, revision = revision,
+    )
+    try:
+        with open(index_path, "r", encoding = "utf-8") as f:
+            shards = _index_subfolder_shards(json.load(f).get("weight_map"))
+    except (OSError, ValueError, AttributeError):
+        return {}
+    if not shards: return {}
+    fs = HfFileSystem(token = token)
+    sizes = {}
+    for folder in sorted({posixpath.dirname(s) for s in shards}):
+        for x in fs.ls(f"{repo_id}/{folder}", detail = True, revision = revision):
+            name = f"{folder}/{os.path.basename(x['name'])}"
+            if name in shards: sizes[name] = x["size"]
+    # A shard the index names but the repo lacks would fail the merge part way.
+    return sizes if len(sizes) == len(shards) else {}
+
+
+def _local_index_subfolder_shards(directory):
+    """Shards a local root index maps into subfolders, when the root has no safetensors and all of them exist, else []."""
+    try:
+        if any(f.endswith(".safetensors") for f in os.listdir(directory)): return []
+        with open(os.path.join(directory, "model.safetensors.index.json"), "r", encoding = "utf-8") as f:
+            shards = _index_subfolder_shards(json.load(f).get("weight_map"))
+    except (OSError, ValueError, AttributeError):
+        return []
+    if not shards or not all(os.path.isfile(os.path.join(directory, s)) for s in shards): return []
+    return shards
+
+
 def check_hf_model_exists(model_name, token=None):
     """Check if model exists on HuggingFace.
 
@@ -8161,7 +8228,8 @@ def check_hf_model_exists(model_name, token=None):
     if not _is_hub_repo_id(model_name): return False
     try:
         file_list = HfFileSystem(token=token).ls(model_name, detail=True)
-        return any(x["name"].endswith(".safetensors") for x in file_list)
+        if any(x["name"].endswith(".safetensors") for x in file_list): return True
+        return bool(_hub_index_subfolder_shards(model_name, file_list, token))
     except _HUB_ABSENT_ERRORS as e:
         # Still returns False so a local copy wins and gated bases keep working; a gated cause is warned about, since absent is not always the reason.
         gated = _gated_repo_cause(e)
@@ -8215,7 +8283,7 @@ def check_local_model_exists(model_path):
             for file in os.listdir(directory):
                 if file.endswith(".safetensors"):
                     return True
-            return False
+            return bool(_local_index_subfolder_shards(directory))
         except (OSError, PermissionError):
             return False
 
@@ -8668,6 +8736,8 @@ def _local_snapshot_is_complete(local_path):
     An index that cannot be read answers False: completeness is unproven, and the
     unreachable Hub is then the more honest failure.
     """
+    # Every subfolder shard the root index names is on disk (Cosmos3).
+    if _local_index_subfolder_shards(local_path): return True
     indexed = None
     index_path = os.path.join(local_path, "model.safetensors.index.json")
     if os.path.isfile(index_path):
