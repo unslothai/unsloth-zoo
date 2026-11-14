@@ -565,3 +565,13 @@ def test_bare_placeholder_hints_reach_the_row_clip(monkeypatch):
     _, videos, _ = _extract_vlm_media({"videos": "clips/a.mp4"}, messages, None)
     assert len(videos) == 1
     assert seen == [{"video_start": 120, "video_end": 121, "nframes": 8, "video": "clips/a.mp4"}]
+
+
+def test_row_frame_list_clip_keeps_its_placeholder_fps(monkeypatch):
+    import unsloth_zoo.vision_utils as vu
+
+    monkeypatch.setattr(vu, "fetch_video", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not decode")))
+    frames = [np.zeros((4, 4, 3), np.uint8), np.zeros((4, 4, 3), np.uint8)]
+    messages = [{"role": "user", "content": [{"type": "video", "fps": 2.0}, {"type": "text", "text": "q"}]}]
+    _, videos, kwargs = _extract_vlm_media({"videos": [frames]}, messages, None)
+    assert videos == [frames] and kwargs == {"fps": [2.0]}

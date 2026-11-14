@@ -7333,6 +7333,13 @@ def _vlm_vision_part_state(messages):
 _VIDEO_PART_TYPES = ("video", "video_url", "input_video")
 
 
+def _is_decoded_clip(video):
+    """A frames array/tensor, or a list of them; a list of frame paths still needs fetch_video."""
+    if hasattr(video, "shape"):
+        return True
+    return isinstance(video, (list, tuple)) and bool(video) and hasattr(video[0], "shape")
+
+
 def _video_part_payload(part):
     for key in _VIDEO_PART_TYPES:
         value = part.get(key)
@@ -7425,10 +7432,7 @@ def _extract_vlm_media(
                     has_video_parts = True
                     if collect_videos:
                         video = _video_part_payload(part)
-                        if isinstance(video, (str, bytes, dict)) or (
-                            isinstance(video, (list, tuple)) and video
-                            and not hasattr(video[0], "shape")
-                        ):
+                        if video is not None and not _is_decoded_clip(video):
                             videos.append({**part, "video": video})
                         elif video is not None:
                             # Already-decoded frames: skip the decoder but keep the part's rate.
@@ -7457,10 +7461,12 @@ def _extract_vlm_media(
         paired = []
         for i, video in enumerate(videos):
             hint = hints[i] if i < len(hints) else {}
-            if hint and isinstance(video, (str, bytes, dict)):
+            if _is_decoded_clip(video):
+                video = {**hint, "video": None, "_frames": video} if hint else video
+            elif isinstance(video, (list, tuple)):
+                video = {**hint, "video": list(video)}
+            elif hint and isinstance(video, (str, bytes, dict)):
                 video = {**hint, **_video_element_dict(video)}
-            elif hint and hasattr(video, "shape"):
-                video = {**hint, "video": None, "_frames": video}
             paired.append(video)
         videos = paired
 
