@@ -57,6 +57,12 @@ import os
 import torch
 
 SPARSE_ATTN_STATS = {"gather": 0, "triton": 0, "flex": 0, "torch": 0, "hd512": 0, "fallback": 0}
+# QSA selection: query chunks scanned for top-k boundary ties, and rows recomputed the reference's way.
+QSA_TIE_STATS = {"chunks": 0, "tied_rows": 0}
+
+
+def _exact_ties():
+    return os.environ.get("UNSLOTH_QWEN4_EXP_EXACT_TIES", "1") != "0"
 
 _BACKENDS = ("gather", "triton", "flex", "torch")
 _FAILED = {}
@@ -676,7 +682,10 @@ def _repair_boundary_ties(out, b, t0, scores, valid, k, q_rows, block_keys, star
     best = scores.topk(k + 1, dim = -1).values
     kth, nxt = best[:, k - 1], best[:, k]
     tied = torch.isfinite(nxt) & ((kth - nxt).abs() <= 1e-5 * kth.abs().clamp(min = 1.0))
-    for r in tied.nonzero().flatten().tolist():
+    rows = tied.nonzero().flatten().tolist()
+    QSA_TIE_STATS["chunks"] += 1
+    QSA_TIE_STATS["tied_rows"] += len(rows)
+    for r in rows:
         candidates = valid[r].nonzero().flatten()
         row = torch.matmul(q_rows[r].float(), block_keys.index_select(0, candidates).transpose(-1, -2)).transpose(-1, -2)
         row = torch.relu(row).sum(dim = -1) / math.sqrt(dim)
@@ -750,7 +759,7 @@ def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mas
             tokens = starts[top_indices][..., None] + arange_r                               # [c, k, ratio]
             tokens = torch.where(torch.isfinite(top_values)[..., None], tokens, -1)
             out[b, t0:t1, : k * ratio] = tokens.flatten(1).to(torch.int32)
-            if k < starts.numel():
+            if k < starts.numel() and _exact_ties():
                 _repair_boundary_ties(out, b, t0, scores, valid, k, q[b, t0:t1], block_keys, starts, arange_r,
                                       top_blocks, ratio, dim)
     return out
