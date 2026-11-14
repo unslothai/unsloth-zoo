@@ -644,10 +644,12 @@ class FrozenTableStore:
         raise TypeError("Unsloth: FrozenTableStore maps checkpoint files and cannot be pickled; rebind after load.")
 
     def provenance(self) -> dict:
-        """Where this table's rows come from, cheap to compute and to check: per checkpoint file its size and the
-        sha256 of its safetensors header (names, dtypes, shapes, offsets); per table tensor a sha256 over a few
-        evenly spaced 64 KiB samples of its bytes (a different checkpoint with the same shapes differs there);
-        the hub repo id / revision when the files sit in a hub cache snapshot."""
+        """Where this table's rows come from, cheap to compute and to check: per table tensor its name, dtype,
+        shape and a sha256 over a few evenly spaced 64 KiB samples of its bytes (a different checkpoint with the
+        same shapes differs there), in row order, and the fp8 decoder scale; the hub repo id / revision when the
+        files sit in a hub cache snapshot. Per checkpoint file its size and the sha256 of its safetensors header
+        are recorded for information only: other tensors or a repacked file change them while the table's rows
+        stay the same, so compare_frozen_table_provenance does not check them (nor the revision)."""
         cached = getattr(self, "_provenance", None)
         if cached is not None:
             return cached
@@ -1087,8 +1089,10 @@ def _make_lookup_op():
         m = _module_for(handle)
         return ids.new_empty((*ids.shape, *m.row_shape), dtype=m.table_dtype)
 
-    # cudagraph_unsafe: the lookup reads ids on the host (unique, device to host copy), which cannot run inside a
-    # captured CUDA graph, so Inductor keeps it outside (reduce-overhead mode). torch before 2.8 has no `tags`.
+    # cudagraph_unsafe: a host-backed lookup (ram / disk) reads ids on the host (a device to host copy), which
+    # cannot run inside a captured CUDA graph, so Inductor keeps it outside (reduce-overhead mode). A resident
+    # (gpu mode) lookup no longer touches the host, but one op serves both and the memo is Python state, so the
+    # conservative tag stays until a capture-safe resident op is validated. torch before 2.8 has no `tags`.
     tag = getattr(torch._C.Tag, "cudagraph_unsafe", None)
     for kwargs in ([dict(tags=(tag,))] if tag is not None else []) + [dict()]:
         try:
@@ -1162,8 +1166,8 @@ def _table_key(name: str) -> str:
 
 def frozen_table_provenance(model: nn.Module) -> Optional[dict]:
     """{"format", "version", "tables": {module path: FrozenTableStore.provenance()}} for every bound frozen table
-    of `model`, or None when it has none. Saves that leave the tables out (adapters, DCP / Trainer checkpoints)
-    write this next to the adapter, so a reload can check it runs on the same base tables."""
+    of `model`, or None when it has none. A caller saving without the tables (an adapter) can write this next to
+    its save and check it with compare_frozen_table_provenance on reload; nothing here writes it by itself."""
     tables = {}
     for name, module in iter_frozen_table_modules(model):
         describe = getattr(module.frozen_table_store, "provenance", None)
@@ -1175,7 +1179,10 @@ def frozen_table_provenance(model: nn.Module) -> Optional[dict]:
 
 
 def compare_frozen_table_provenance(saved: dict, live: Optional[dict]) -> List[str]:
-    """What differs between a saved provenance and the live model's ([] = the same base tables)."""
+    """What differs between a saved provenance and the live model's ([] = the same base tables): the tables,
+    their row counts, each tensor's name / dtype / shape / sampled contents, the shard order, the fp8 decoder
+    scale and, when both recorded one, the hub repo id. The revision, file sizes and header hashes are
+    informational and not compared (the same rows can sit in another revision or a repacked file)."""
     if not saved or not saved.get("tables"):
         return []
     live_tables = {_table_key(k): v for k, v in ((live or {}).get("tables") or {}).items()}
