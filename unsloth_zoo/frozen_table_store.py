@@ -1449,13 +1449,15 @@ def install_frozen_table_load_hook() -> bool:
     original = PreTrainedModel.__dict__.get("_load_pretrained_model")
     if original is None:
         return False
-    original_fn = original.__func__ if isinstance(original, staticmethod) else original
+    # transformers 5: staticmethod (model, state_dict, checkpoint_files, load_config, ...);
+    # transformers 4.5x: classmethod (cls, model, state_dict, checkpoint_files, ..., hf_quantizer = ...).
+    is_classmethod = isinstance(original, classmethod)
+    original_fn = original.__func__ if isinstance(original, (staticmethod, classmethod)) else original
     if getattr(original_fn, "_unsloth_frozen_table_hook", False):
         _LOAD_HOOK_INSTALLED[0] = True
         return True
 
-    def _load_pretrained_model(model, state_dict, checkpoint_files, load_config, *args, **kwargs):
-        result = original_fn(model, state_dict, checkpoint_files, load_config, *args, **kwargs)
+    def _bind_after_load(model, checkpoint_files, quantizer):
         unbound = [n for n, m in iter_frozen_table_modules(model) if not m.is_bound]
         if unbound:
             if not checkpoint_files or not str(checkpoint_files[0]).endswith(".safetensors"):
@@ -1463,12 +1465,24 @@ def install_frozen_table_load_hook() -> bool:
                     f"Unsloth: frozen tables {unbound[:2]} need a safetensors checkpoint to stream from. "
                     "Set UNSLOTH_FROZEN_TABLE=gpu for a normal load."
                 )
-            bind_frozen_tables(model, list(checkpoint_files), quantizer=getattr(load_config, "hf_quantizer", None))
-        return result
+            bind_frozen_tables(model, list(checkpoint_files), quantizer=quantizer)
+
+    if is_classmethod:
+        def _load_pretrained_model(cls, model, state_dict, checkpoint_files, *args, **kwargs):
+            result = original_fn(cls, model, state_dict, checkpoint_files, *args, **kwargs)
+            _bind_after_load(model, checkpoint_files, kwargs.get("hf_quantizer"))
+            return result
+    else:
+        def _load_pretrained_model(model, state_dict, checkpoint_files, load_config, *args, **kwargs):
+            result = original_fn(model, state_dict, checkpoint_files, load_config, *args, **kwargs)
+            _bind_after_load(model, checkpoint_files, getattr(load_config, "hf_quantizer", None))
+            return result
 
     _load_pretrained_model._unsloth_frozen_table_hook = True
     _load_pretrained_model.__wrapped__ = original_fn
-    PreTrainedModel._load_pretrained_model = staticmethod(_load_pretrained_model)
+    PreTrainedModel._load_pretrained_model = (
+        classmethod(_load_pretrained_model) if is_classmethod else staticmethod(_load_pretrained_model)
+    )
     _install_save_guard(PreTrainedModel)
     _LOAD_HOOK_INSTALLED[0] = True
     return True

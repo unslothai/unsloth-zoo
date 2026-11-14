@@ -54,6 +54,7 @@ __all__ = [
     "patch_deepseek_v41_config_aliases",
     "patch_deepseek_v41_engram_table",
     "prepare_compiled_checkpoint",
+    "make_deepseek_v41_engram_table",
 ]
 
 
@@ -476,7 +477,10 @@ def _frozen_engram(modeling, key, emb):
         emb.num_embeddings, emb.embedding_dim, dtype=emb.weight.dtype,
         table_name=f"deepseek_v41 engram layer {key}", row_shape=(emb.embedding_dim,),
     )
-    table.checkpoint_prefixes = (f"layers.{key}.engram.embed", f"model.engram_tables.{key}", f"engram_tables.{key}")
+    # transformers 5 saves a converted model back under the released names with its base prefix
+    # (model.layers.<i>.engram.embed.*).
+    table.checkpoint_prefixes = (f"layers.{key}.engram.embed", f"model.layers.{key}.engram.embed",
+                                 f"model.engram_tables.{key}", f"engram_tables.{key}")
     table.checkpoint_planes = {"weight": (r"weight",), "scale": (r"scale", r"weight_scale_inv")}
     table.optional_planes = ("scale",)
     table.export_suffixes = {"weight": "weight", "scale": "weight_scale_inv"}
@@ -499,6 +503,21 @@ def _frozen_engram(modeling, key, emb):
 
     table.after_bind = after_bind
     return table
+
+
+def make_deepseek_v41_engram_table(layer_key, num_embeddings, head_dim, block_size = 32, dtype = None):
+    """A parameter-free engram table for Unsloth's native DeepSeek-V4.1 (unsloth/models/deepseek_v41): an
+    UnslothFrozenTableEmbedding holding no Parameter or buffer, so FSDP2 / TP / PP sharding, ``to_empty``, meta-device
+    init, optimizers and DCP never see it. The frozen table load hook binds it to the checkpoint after
+    ``from_pretrained`` in every UNSLOTH_FROZEN_TABLE mode (gpu materializes the rows on the device)."""
+    import types
+    from unsloth_zoo.frozen_table_store import install_frozen_table_load_hook
+    install_frozen_table_load_hook()
+    stand_in = types.SimpleNamespace(
+        num_embeddings = int(num_embeddings), embedding_dim = int(head_dim), block_size = int(block_size),
+        weight = types.SimpleNamespace(dtype = dtype if dtype is not None else torch.get_default_dtype()),
+    )
+    return _frozen_engram(None, str(layer_key), stand_in)
 
 
 def patch_deepseek_v41_engram_table():
