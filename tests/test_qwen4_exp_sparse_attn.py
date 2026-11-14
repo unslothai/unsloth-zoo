@@ -223,3 +223,20 @@ def test_patch_installs_and_counts(monkeypatch):
     before = dict(zoo_qwen4_exp.QWEN4_EXP_SPARSE_STATS)
     attention(hidden, pe, _float(mask))
     assert zoo_qwen4_exp.QWEN4_EXP_SPARSE_STATS["sparse"] == before["sparse"] + 1
+
+
+def test_mask_geometry_is_scanned_once_per_mask_version(monkeypatch):
+    # The interval scan and the block-start lists sync with the host: once per forward, not once per QSA layer.
+    config, attention, rotary = _module()
+    hidden, pe = _inputs(1, 40, rotary)
+    mask = _masks("causal", 1, 40)
+    calls = []
+    original = sa._contiguous_rows
+    monkeypatch.setattr(sa, "_contiguous_rows", lambda v: calls.append(1) or original(v))
+    with torch.no_grad():
+        first = sa.qsa_select_tokens(attention.indexer, hidden, pe, mask, modeling.apply_rotary_pos_emb)
+        second = sa.qsa_select_tokens(attention.indexer, hidden, pe, mask, modeling.apply_rotary_pos_emb)
+        assert len(calls) == 1 and torch.equal(first, second)
+        mask[0, 0, 39, 0] = True  # an in-place edit bumps the version: rescanned
+        sa.qsa_select_tokens(attention.indexer, hidden, pe, mask, modeling.apply_rotary_pos_emb)
+    assert len(calls) == 2

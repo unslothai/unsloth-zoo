@@ -149,10 +149,18 @@ def _grads(fn, q, kv, sink, go):
     return (out, *torch.autograd.grad(out, (q, kv, sink), go))
 
 
+_GATHER_SHAPES = [(2, 64, 16, 512, 96, 24), (1, 40, 4, 128, 300, 64), (1, 130, 8, 128, 140, 33)]
+_FLEX_SHAPES = _GATHER_SHAPES + [(1, 130, 8, 256, 140, 33)]
+
+
+def _gather_runs():
+    # Only the shared-KV schedule is used in production: capability >= 10 and bf16.
+    return _CUDA and torch.cuda.get_device_capability()[0] >= 10
+
+
 @pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
-@pytest.mark.parametrize("backend", ["gather", "flex"])
-@pytest.mark.parametrize("dtype", _cuda_dtypes())
-@pytest.mark.parametrize("shape", [(2, 64, 16, 512, 96, 24), (1, 40, 4, 128, 300, 64), (1, 130, 8, 256, 140, 33)])
+@pytest.mark.parametrize("backend,dtype,shape", [("flex", dt, sh) for dt in _cuda_dtypes() for sh in _FLEX_SHAPES]
+                         + ([("gather", torch.bfloat16, sh) for sh in _GATHER_SHAPES] if _gather_runs() else []))
 def test_cuda_backend_matches_fp64(monkeypatch, backend, dtype, shape):
     b, s, h, d, n, k = shape
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", backend)
@@ -174,8 +182,8 @@ def test_cuda_backend_matches_fp64(monkeypatch, backend, dtype, shape):
     assert got[0][0, 0].abs().max() == 0 and got[0][b - 1, s - 1].abs().max() == 0
 
 
-@pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
-@pytest.mark.parametrize("dtype", _cuda_dtypes())
+@pytest.mark.skipif(not _gather_runs(), reason = "gather_attn shared-KV schedule needs capability >= 10")
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("s", [40, 300])
 def test_cuda_window_form_matches_concatenated(monkeypatch, dtype, s):
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "gather")
@@ -197,12 +205,23 @@ def test_cuda_window_form_matches_concatenated(monkeypatch, dtype, s):
     assert err <= 2 * base + 4 * torch.finfo(dtype).eps
 
 
-@pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
+def test_gather_eligibility_is_the_shared_schedule_only():
+    q = lambda d, h, dt = torch.bfloat16: torch.empty(1, 1, h, d, dtype = dt, device = "meta")
+    # meta tensors are not CUDA: never eligible; the shape rules are checked through a CUDA stand-in below.
+    assert not sa._gather_eligible(q(512, 16))
+    if _gather_runs():
+        cuda = lambda d, h, dt = torch.bfloat16: torch.empty(1, 1, h, d, dtype = dt, device = "cuda")
+        assert sa._gather_eligible(cuda(512, 16)) and sa._gather_eligible(cuda(128, 4))
+        assert not sa._gather_eligible(cuda(256, 16)) and not sa._gather_eligible(cuda(512, 16, torch.float16))
+        assert not sa._gather_eligible(cuda(512, 129)) and not sa._gather_eligible(cuda(512, 16), window = 4096)
+
+
+@pytest.mark.skipif(not _gather_runs(), reason = "gather_attn shared-KV schedule needs capability >= 10")
 def test_cuda_gather_compiles_without_graph_breaks(monkeypatch):
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "gather")
     import torch._dynamo
     from torch._dynamo.utils import counters
-    dtype = _cuda_dtypes()[-1]
+    dtype = torch.bfloat16
     q, kv, sink, idxs = _inputs(1, 32, 8, 128, 48, 16, dtype, "cuda")
     q.requires_grad_(); kv.requires_grad_(); sink.requires_grad_()
     torch._dynamo.reset(); counters.clear()
@@ -212,3 +231,25 @@ def test_cuda_gather_compiles_without_graph_breaks(monkeypatch):
     eager_q = q.grad.clone(); q.grad = None
     sa.sparse_attn(q, kv, sink, idxs, 0.1).float().square().sum().backward()
     torch.testing.assert_close(q.grad, eager_q, rtol = 0, atol = 0)
+
+
+def test_chunked_reference_recomputes_in_backward_with_identical_grads(monkeypatch):
+    # The torch path must not keep every gathered [chunk, k, d] slab for backward: chunks are recomputed.
+    q, kv, sink, idxs = _inputs(1, 33, 2, 8, 20, 6, torch.float64, "cpu", empty_rows = [(0, 5)])
+    sink = sink.double()
+    go = torch.randn(1, 33, 2, 8, dtype = torch.float64)
+
+    def grads():
+        leaves = [t.clone().requires_grad_() for t in (q, kv, sink)]
+        return torch.autograd.grad(sa.sparse_attn_reference(*leaves[:2], leaves[2], idxs, 0.3), leaves, go)
+
+    whole = grads()
+    import torch.utils.checkpoint as ckpt
+    calls = []
+    original = ckpt.checkpoint
+    monkeypatch.setattr(ckpt, "checkpoint", lambda *a, **k: calls.append(1) or original(*a, **k))
+    monkeypatch.setattr(sa, "_TORCH_CHUNK_ELEMS", 6 * 8 * 4)  # 4 query rows per chunk
+    chunked = grads()
+    assert len(calls) == 9
+    for x, y in zip(chunked, whole):
+        torch.testing.assert_close(x, y, rtol = 1e-12, atol = 1e-12)
