@@ -458,7 +458,7 @@ def apply_xet_env(
         for key in _AC_DOWNLOAD_KEYS:
             overrides.pop(key, None)
             if target is os.environ and key in _SEEDED_INTO_ENVIRON and target.get(key) == _SEEDED_INTO_ENVIRON[key]:
-                del target[key]
+                del target[key], _SEEDED_INTO_ENVIRON[key]
 
     # A user's high-performance flag keeps the headroom, so our caps are dropped rather than left alongside it; read it
     # as xet-core does (configuration_utils.rs get_high_performance_flag): HF_XET_HIGH_PERFORMANCE wins if set at all,

@@ -598,6 +598,19 @@ def test_fixed_concurrency_keeps_explicit_primaries_of_a_mapping_we_never_seeded
     assert env["HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY"] == "1"
 
 
+def test_a_primary_set_after_the_seeds_were_cleared_is_kept(monkeypatch):
+    import os
+
+    monkeypatch.setattr(os, "environ", {})
+    monkeypatch.setattr(tuning, "_SEEDED_INTO_ENVIRON", {})
+    tuning.apply_xet_env(profile = _profile(16))
+    os.environ["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] = "128"
+    tuning.apply_xet_env(profile = _profile(16))
+    os.environ["HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY"] = "1"
+    tuning.apply_xet_env(profile = _profile(16))
+    assert os.environ["HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY"] == "1"
+
+
 def test_installed_xet_core_honours_the_fixed_alias_after_sizing():
     import os
     import subprocess
