@@ -3284,6 +3284,7 @@ from huggingface_hub import (
     get_torch_storage_size,
     get_torch_storage_id,
 )
+from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
 def get_torch_storage_size_new(x, element_size):
     if isinstance(x, LoraStats):
@@ -3303,6 +3304,31 @@ def get_torch_storage_size_new(x, element_size):
         return int(np.prod(shape)) * element_size
     else:
         return get_torch_storage_size(x)
+pass
+
+
+def _tied_tensor_key(x):
+    # Tied embeddings are one tensor under two names and written once; views into a shared arena (Block Swap) are
+    # distinct tensors, so this cannot key on storage id like the shard splitter.
+    if not isinstance(x, torch.Tensor) or x.is_meta or is_traceable_wrapper_subclass(x):
+        return None
+    try:
+        ptr = x.data_ptr()
+    except Exception:
+        return None
+    return (str(x.device), ptr, x.dtype, tuple(x.shape), tuple(x.stride())) if ptr else None
+pass
+
+
+def _save_size_in_bytes(state_dict, element_size):
+    seen, total = set(), 0
+    for x in state_dict.values():
+        key = _tied_tensor_key(x)
+        if key is not None:
+            if key in seen: continue
+            seen.add(key)
+        total += get_torch_storage_size_new(x, element_size)
+    return total
 pass
 
 
@@ -3368,7 +3394,7 @@ def prepare_saving(
         return_state_dict = True,
     )
     # Total save size in bytes
-    save_size = sum(get_torch_storage_size_new(x, element_size) for x in state_dict.values())
+    save_size = _save_size_in_bytes(state_dict, element_size)
 
     if not os.path.exists(save_directory):
         try:
