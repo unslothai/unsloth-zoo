@@ -20,6 +20,8 @@ import numpy as np
 import pytest
 
 mx = pytest.importorskip("mlx.core")
+# Video rows decode through vision_utils, which needs torch (the MLX extra does not install it).
+pytest.importorskip("torch")
 if "mlx_simulation" in str(getattr(mx, "__file__", "")):
     pytest.skip("requires real MLX runtime, not the tests/mlx_simulation torch shim", allow_module_level=True)
 
