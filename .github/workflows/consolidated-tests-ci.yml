@@ -931,6 +931,12 @@ jobs:
         # Audio collation, label masking and the family/version gate.
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_vlm_label_masks.py -v -rs
 
+      - name: tests/test_mlx_vlm_video_batch.py
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_vlm_video_batch.py -v -rs
+
+      - name: tests/test_video_reader_backends.py
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_video_reader_backends.py -v -rs
+
       - name: tests/test_mlx_batching_and_decay.py
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_batching_and_decay.py -v -rs
 
