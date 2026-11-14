@@ -131,11 +131,20 @@ def patch_deepseek_v41_gradient_checkpointing():
 
     def __call__(self, *args, **kwargs):
         shared = kwargs.get("shared")
-        if not (self.gradient_checkpointing and self.training) or not isinstance(shared, dict):
+        # The port passes a dict; Unsloth's native module a DeepseekV41GroupState (not a dict, so FSDP2's input
+        # casting cannot rebuild it), which the replay copies the same way.
+        stateful = isinstance(shared, dict) or all(
+            callable(getattr(shared, name, None)) for name in ("copy", "clear", "update", "items")
+        )
+        if not (self.gradient_checkpointing and self.training) or shared is None or not stateful:
             with _compressor_lora(self):
                 return base_call(self, *args, **kwargs)
-        replay = _ReplayShared(shared)
-        replay._snapshot = dict(shared)
+        snapshot = dict(shared.items())
+        if isinstance(shared, dict):
+            replay = _ReplayShared(shared)
+            replay._snapshot = snapshot
+        else:
+            replay = shared.copy()
         kwargs["shared"] = replay
         # Same cache handling as GradientCheckpointingLayer.__call__.
         if kwargs.get("use_cache"):
@@ -148,7 +157,7 @@ def patch_deepseek_v41_gradient_checkpointing():
         def run(*inner_args, **inner_kwargs):
             REPLAY_STATS["runs"] += 1
             replay.clear()
-            replay.update(replay._snapshot)
+            replay.update(snapshot)
             with _compressor_lora(self):
                 return torch.nn.Module.__call__(self, *inner_args, **inner_kwargs)
 
