@@ -7332,9 +7332,11 @@ def _video_part_payload(part):
     for key in ("video", "video_url", "input_video"):
         value = part.get(key)
         if value is not None:
-            # OpenAI-style {"video_url": {"url": ...}}.
-            if isinstance(value, dict) and isinstance(value.get("url"), str):
-                return value["url"]
+            # OpenAI-style {"url": ...} and HF datasets' Video feature {"path": ...}.
+            if isinstance(value, dict):
+                for inner in ("url", "path"):
+                    if isinstance(value.get(inner), str):
+                        return value[inner]
             return value
     return None
 

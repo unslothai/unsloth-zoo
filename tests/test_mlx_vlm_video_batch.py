@@ -498,3 +498,13 @@ def test_video_aliases_are_canonical_before_the_template_renders(part):
     messages = [{"role": "user", "content": [part, {"type": "text", "text": "q"}]}]
     (message,) = _normalize_mlx_messages(messages, is_vlm = True)
     assert message["content"][0] == {"type": "video", "video": "clips/a.mp4"}
+
+
+def test_video_part_with_a_datasets_path_dict_decodes(monkeypatch):
+    import unsloth_zoo.vision_utils as vu
+
+    seen = []
+    monkeypatch.setattr(vu, "fetch_video", lambda info, **k: (seen.append(info), (np.zeros((2, 4, 4, 3), np.uint8), 1.0))[1])
+    messages = [{"role": "user", "content": [{"type": "video", "video": {"path": "clips/a.mp4", "bytes": None}, "nframes": 4}, {"type": "text", "text": "q"}]}]
+    _, videos, _ = _extract_vlm_media({}, messages, None)
+    assert len(videos) == 1 and seen[0]["video"] == "clips/a.mp4" and seen[0]["nframes"] == 4

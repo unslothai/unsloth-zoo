@@ -74,6 +74,8 @@ def backends(monkeypatch):
 
 @pytest.mark.parametrize("present,read_video,expected", [
     (("torchvision", "av", "cv2"), True, "torchvision"),
+    (("torchvision", "cv2"), True, "cv2"),
+    (("torchvision",), True, "torchvision"),
     (("torchvision", "av", "cv2"), False, "pyav"),
     (("cv2",), False, "cv2"),
     (("av",), False, "pyav"),

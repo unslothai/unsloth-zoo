@@ -1037,7 +1037,8 @@ def get_video_reader_backend() -> str:
         video_reader_backend = "decord"
     elif is_torchcodec_available():
         video_reader_backend = "torchcodec"
-    elif _torchvision_read_video() is not None:
+    elif _torchvision_read_video() is not None and (_module_available("av") or not _module_available("cv2")):
+        # read_video decodes through PyAV.
         video_reader_backend = "torchvision"
     elif _module_available("av"):
         video_reader_backend = "pyav"
