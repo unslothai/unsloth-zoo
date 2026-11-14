@@ -814,11 +814,13 @@ class FrozenTableStore:
         # No unique / .cpu() / int(): each of those blocks the host on the device per lookup, which stalls pipeline
         # schedules and every captured or compiled region around the lookup. Row decode is per row, so decoding the
         # rows in id order equals decoding the unique rows and scattering them back.
-        if flat.device.type == "cpu":
+        # On an accelerator index_select bounds-checks on the device instead: an out-of-range id is a device-side
+        # assert, which loses the CUDA context (no Python IndexError). UNSLOTH_FROZEN_TABLE_CHECK_IDS=1 checks on
+        # the host first, one sync per lookup, for a recoverable IndexError while debugging.
+        if flat.device.type == "cpu" or os.environ.get("UNSLOTH_FROZEN_TABLE_CHECK_IDS", "0") == "1":
             lo, hi = int(flat.min()), int(flat.max())
             if lo < 0 or hi >= self.num_rows:
                 raise IndexError(f"Unsloth: frozen table id out of range [{lo}, {hi}] for {self.num_rows} rows.")
-        # On an accelerator index_select bounds-checks on the device (a device-side assert) instead.
         raw = {name: plane.index_select(0, flat) for name, plane in self._device_planes.items()}
         rows = self.decode(raw, dtype)
         _bump(gathers=1, rows=flat.numel(), resident_gathers=1)
@@ -827,7 +829,11 @@ class FrozenTableStore:
     def gather(self, ids: torch.Tensor, dtype: Optional[torch.dtype] = None,
                host_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Rows for ``ids`` (any shape, integer) on ``ids.device``: shape ``ids.shape + row shape``. ``host_ids`` is
-        an optional CPU copy of ``ids`` the caller already made (saves the one device-to-host copy)."""
+        an optional CPU copy of ``ids`` the caller already made (saves the one device-to-host copy).
+
+        Out-of-range ids raise IndexError, except on a table resident on an accelerator (gpu mode), whose lookup
+        never syncs with the host: there they trip a device-side assert, unless UNSLOTH_FROZEN_TABLE_CHECK_IDS=1
+        (one host sync per lookup) turns that into an IndexError."""
         if ids.is_floating_point() or ids.is_complex():
             raise TypeError("Unsloth: frozen table ids must be integers.")
         device = ids.device
