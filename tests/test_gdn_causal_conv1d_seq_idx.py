@@ -26,8 +26,8 @@ os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
 from unsloth_zoo.temporary_patches import gdn_causal_conv1d as gcc  # noqa: E402
 
-_HAS_CUDA = torch.cuda.is_available() and getattr(torch.version, "hip", None) is None
-requires_cuda = pytest.mark.skipif(not _HAS_CUDA, reason = "needs a CUDA GPU")
+_HAS_CUDA = torch.cuda.is_available()
+requires_cuda = pytest.mark.skipif(not _HAS_CUDA, reason = "needs a CUDA or ROCm GPU")
 
 
 def _seq_idx_from_lengths(rows, device = "cpu"):
@@ -314,6 +314,8 @@ def test_hub_layer_instance_keeps_its_kernel_metadata():
 
 def test_hub_layer_passes_real_kernels_validation():
     kernels = pytest.importorskip("kernels")
+    if not hasattr(kernels, "use_kernelized_func"):
+        pytest.skip("kernels release without use_kernelized_func")
     hub_fn = gcc._hub_gdn_function(kernels.use_kernel_forward_from_hub("causal_conv1d_fn"), _hub_conv)
     assert hasattr(hub_fn, "kernel_layer_name")
 
