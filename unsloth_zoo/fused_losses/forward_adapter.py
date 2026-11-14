@@ -26,6 +26,7 @@ from __future__ import annotations
 
 __all__ = [
     "EMPTY_LOGITS",
+    "lm_head_fake_quantize",
     "unsloth_fused_lm_head_loss",
 ]
 
@@ -49,6 +50,20 @@ _KERNEL_KWARGS = frozenset(_ce._FUSED_LINEAR_CE_KWARGS) | frozenset(("n_chunks",
 def lm_head_on_old_cuda_arch(weight):
     """Replaced by unsloth_zoo.compiler.lm_head_on_old_cuda_arch, which owns the pre-Turing card set."""
     return False
+
+
+def lm_head_fake_quantize(lm_head, hidden_states):
+    """(hidden_states, weight) after the TorchAO QAT QDQ that lm_head.forward() applies and fused CE skips."""
+    weight = lm_head.weight
+    if type(lm_head) is torch.nn.Linear:
+        return hidden_states, weight
+    activation_fake_quantizer = getattr(lm_head, "activation_fake_quantizer", None)
+    if activation_fake_quantizer is not None:
+        hidden_states = activation_fake_quantizer(hidden_states)
+    weight_fake_quantizer = getattr(lm_head, "weight_fake_quantizer", None)
+    if weight_fake_quantizer is not None:
+        weight = weight_fake_quantizer(weight)
+    return hidden_states, weight
 
 
 def unsloth_fused_lm_head_loss(
@@ -107,15 +122,7 @@ def unsloth_fused_lm_head_loss(
     # the shard on CPU until then.
     if kwargs.get("torch_compile", True) and lm_head_on_old_cuda_arch(lm_head.weight):
         kwargs["torch_compile"] = False
-    # Fused CE skips lm_head.forward(), where TorchAO QAT applies input and weight QDQ.
-    # Keep these operations in the autograd graph, including when the head is frozen.
-    weight = lm_head.weight
-    activation_fake_quantizer = getattr(lm_head, "activation_fake_quantizer", None)
-    if activation_fake_quantizer is not None:
-        hidden_states = activation_fake_quantizer(hidden_states)
-    weight_fake_quantizer = getattr(lm_head, "weight_fake_quantizer", None)
-    if weight_fake_quantizer is not None:
-        weight = weight_fake_quantizer(weight)
+    hidden_states, weight = lm_head_fake_quantize(lm_head, hidden_states)
     loss = unsloth_fused_ce_loss(
         trainer        = None,
         hidden_states  = hidden_states,
