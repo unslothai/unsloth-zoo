@@ -43,6 +43,11 @@ __all__ = [
     "MHC_PROJECTION_REPLACEMENT",
     "MHC_PROJECTION_SOURCE_VIEW",
     "MHC_PROJECTION_REWRITES",
+    "unsloth_mhc_projection_rsqrt",
+    "MHC_NATIVE_SINKHORN_SOURCE",
+    "MHC_NATIVE_SINKHORN_REPLACEMENT",
+    "MHC_NATIVE_PROJECTION_SOURCE",
+    "MHC_NATIVE_PROJECTION_REPLACEMENT",
 ]
 
 
@@ -103,6 +108,49 @@ MHC_PROJECTION_REWRITES = (
     (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT),
     (MHC_PROJECTION_SOURCE_VIEW, MHC_PROJECTION_REPLACEMENT),
 )
+
+
+# Unsloth's native DeepSeek-V4.1 (unsloth/models/deepseek_v41/modeling.py): the reference order, projection first and
+# the one RMS statistic of the flattened streams applied after it (inference/model.py:953-956), local `eps`.
+MHC_NATIVE_SINKHORN_SOURCE = (
+    "        comb = comb / (comb.sum(dim = -2, keepdim = True) + eps)\n"
+    "        for _ in range(self.sinkhorn_iters - 1):\n"
+    "            comb = comb / (comb.sum(dim = -1, keepdim = True) + eps)\n"
+    "            comb = comb / (comb.sum(dim = -2, keepdim = True) + eps)\n"
+)
+MHC_NATIVE_SINKHORN_REPLACEMENT = (
+    "        comb = unsloth_sinkhorn_knopp(comb, self.sinkhorn_iters, eps)\n"
+)
+MHC_NATIVE_PROJECTION_SOURCE = (
+    "        flat = x.flatten(2).float()\n"
+    "        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim = True) + self.norm_eps)\n"
+    "        mixes = F.linear(flat, self.fn.float()) * rsqrt\n"
+)
+MHC_NATIVE_PROJECTION_REPLACEMENT = (
+    "        mixes = unsloth_mhc_projection_rsqrt(x, self.fn, self.norm_eps)\n"
+)
+
+
+def _mhc_projection_rsqrt(hidden_streams, fn, eps):
+    flat = hidden_streams.flatten(2).float()
+    rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim = True) + eps)
+    return F.linear(flat, fn.float()) * rsqrt
+
+
+def unsloth_mhc_projection_rsqrt(hidden_streams, fn, eps):
+    """MHC_NATIVE_PROJECTION_SOURCE with the same memory saving as unsloth_mhc_projection: backward reruns the FP32
+    upcast instead of keeping it. Bitwise identical."""
+    if (
+        torch.compiler.is_compiling()
+        or not torch.is_grad_enabled()
+        or hidden_streams.dtype == torch.float32
+        or not (hidden_streams.requires_grad or fn.requires_grad)
+    ):
+        return _mhc_projection_rsqrt(hidden_streams, fn, eps)
+    return checkpoint(
+        _mhc_projection_rsqrt, hidden_streams, fn, eps,
+        use_reentrant = False, preserve_rng_state = False,
+    )
 
 
 def _mhc_projection(hidden_streams, input_norm, fn):

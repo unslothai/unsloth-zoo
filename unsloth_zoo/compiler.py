@@ -68,6 +68,10 @@ from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
     MHC_SINKHORN_SOURCE,
     MHC_SINKHORN_REPLACEMENT,
     MHC_PROJECTION_REWRITES,
+    MHC_NATIVE_SINKHORN_SOURCE,
+    MHC_NATIVE_SINKHORN_REPLACEMENT,
+    MHC_NATIVE_PROJECTION_SOURCE,
+    MHC_NATIVE_PROJECTION_REPLACEMENT,
     mhc_fast_mode,
 )
 from importlib.metadata import version as importlib_version
@@ -273,6 +277,19 @@ DISABLE_COMPILE_MODEL_FUNCTIONS = {
         # Later port heads: block fake-quant (float8 casts, int32 bit tricks), straight-through in training.
         "_fake_quant_fp8_block",
         "_fake_quant_fp4_block",
+        # Unsloth's native module (unsloth/models/deepseek_v41): host-side load / layout / registry helpers.
+        "engram_layout",
+        "make_engram_table",
+        "is_parameter_free_table",
+        "_checkpoint_key_names",
+        "has_core_model_loading",
+        "_is_fp8_quant_config",
+        "_released_layout",
+        "_engram_cut_safe",
+        "pipeline_safe_cut_points",
+        "_resolve_sparse_attn",
+        "ensure_sparse_attn",
+        "_drop_engram_tables_outside_full_save",
     ],
 }
 
@@ -300,7 +317,11 @@ MODULE_FORWARD_SOURCE_REWRITES = {
         "DeepseekV4HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
     },
     "deepseek_v41": {
-        "DeepseekV41HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+        # transformers' (or the community port's) mixer, then Unsloth's native one (unsloth/models/deepseek_v41).
+        "DeepseekV41HyperConnection": [
+            (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+            (MHC_NATIVE_SINKHORN_SOURCE, MHC_NATIVE_SINKHORN_REPLACEMENT, mhc_fast_mode),
+        ],
     },
     # GLM-5.3-Flash carries the V4 Sinkhorn chain verbatim (transformers 5.17 - 5.20).
     "glm5_next": {
@@ -314,9 +335,49 @@ MODULE_FORWARD_SOURCE_REWRITES = {
 # One (old, new) pair per transformers layout; the first that occurs exactly once is applied.
 MODULE_FORWARD_EAGER_REWRITES = {
     "deepseek_v4": {"DeepseekV4HyperConnection": MHC_PROJECTION_REWRITES},
-    "deepseek_v41": {"DeepseekV41HyperConnection": MHC_PROJECTION_REWRITES},
+    "deepseek_v41": {
+        "DeepseekV41HyperConnection": MHC_PROJECTION_REWRITES
+        + ((MHC_NATIVE_PROJECTION_SOURCE, MHC_NATIVE_PROJECTION_REPLACEMENT),),
+    },
     "glm5_next": {"Glm5NextTextHyperConnection": MHC_PROJECTION_REWRITES},
 }
+
+
+# Modeling code that lives outside transformers, {model_type: module name}: Unsloth's own implementations
+# (unsloth/models/<model_type>/modeling.py by default) when the installed transformers lacks the model.
+NATIVE_MODELING_MODULES = {}
+
+
+def register_native_modeling(model_type, module_name):
+    """Compile `module_name` (already imported) for `model_type` when transformers has no such model."""
+    NATIVE_MODELING_MODULES[str(model_type)] = str(module_name)
+    from .hf_utils import NATIVE_MODEL_TYPES
+
+    NATIVE_MODEL_TYPES.add(str(model_type))
+
+
+def resolve_modeling_module(model_type):
+    """(dotted location, module) of the modeling code for `model_type`: transformers' own file, else a native module
+    that is ALREADY imported (registered, or at unsloth.models.<model_type>.modeling). Never imports unsloth. The
+    compiler evals `f"{location}.{name}"`, so the location's root package is bound in this module's globals."""
+    location = f"transformers.models.{model_type}.modeling_{model_type}"
+    try:
+        return location, importlib.import_module(location)
+    except ModuleNotFoundError:
+        pass
+    for name in (NATIVE_MODELING_MODULES.get(model_type), f"unsloth.models.{model_type}.modeling"):
+        module = sys.modules.get(name) if name else None
+        root = sys.modules.get(name.split(".")[0]) if module is not None else None
+        if module is None or root is None:
+            continue
+        try:
+            resolved = eval(name, {name.split(".")[0]: root})
+        except Exception:
+            continue
+        if resolved is module:
+            globals().setdefault(name.split(".")[0], root)
+            return name, module
+    return None, None
 
 
 def module_forward_eager_rewrites(modeling_file, model_type):
@@ -334,25 +395,35 @@ def module_forward_eager_rewrites(modeling_file, model_type):
             if "unsloth_mhc_projection" in new:
                 # Same reason as unsloth_sinkhorn_knopp below: block compile rebinds the forward
                 # to the modeling module's globals.
-                from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_mhc_projection
+                from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
+                    unsloth_mhc_projection,
+                    unsloth_mhc_projection_rsqrt,
+                )
 
                 modeling_file.unsloth_mhc_projection = unsloth_mhc_projection
+                modeling_file.unsloth_mhc_projection_rsqrt = unsloth_mhc_projection_rsqrt
     return applicable
 
 
 def module_forward_source_rewrites(modeling_file, model_type):
     applicable = {}
     eager_rewrites = module_forward_eager_rewrites(modeling_file, model_type)
-    for name, (old, new, mode) in MODULE_FORWARD_SOURCE_REWRITES.get(model_type, {}).items():
+    for name, entry in MODULE_FORWARD_SOURCE_REWRITES.get(model_type, {}).items():
+        # One (old, new, mode) triple, or a list of them for several layouts: the first old found once applies.
+        alternatives = entry if isinstance(entry, list) else [entry]
         try:
-            mode = mode()
-            if not mode:
-                continue
             cls = getattr(modeling_file, name)
             source = inspect.getsource(_unwrap_undecorated_method(cls.forward, cls.__qualname__))
         except Exception:
             continue
         source = eager_rewrites.get(name, source)
+        old, new, mode = next((alt for alt in alternatives if source.count(alt[0]) == 1), alternatives[0])
+        try:
+            mode = mode()
+        except Exception:
+            continue
+        if not mode:
+            continue
         if source.count(old) == 1:
             applicable[name] = source if mode == "stock" else source.replace(old, new)
             if mode != "stock" and "unsloth_sinkhorn_knopp" in new:
@@ -6438,10 +6509,8 @@ def unsloth_compile_transformers(
     if not re.fullmatch(r"[a-z0-9_]+", str(model_type)):
         return
 
-    model_location = f"transformers.models.{model_type}.modeling_{model_type}"
-    try:
-        modeling_file = importlib.import_module(model_location)
-    except ModuleNotFoundError:
+    model_location, modeling_file = resolve_modeling_module(model_type)
+    if modeling_file is None:
         return
     # Later `eval(model_location)` calls need `transformers` bound in globals
     exec("import transformers", globals())

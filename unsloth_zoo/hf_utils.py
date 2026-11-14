@@ -181,6 +181,18 @@ def _instance_attribute_model_types(config) -> list:
 pass
 
 
+# Model types implemented by Unsloth itself rather than transformers (see compiler.register_native_modeling).
+NATIVE_MODEL_TYPES = set()
+
+
+def is_native_model_type(model_type):
+    """True for a model type whose modeling code is Unsloth's own and is already imported
+    (unsloth.models.<model_type>.modeling, or registered). Reads sys.modules only; never imports unsloth."""
+    import sys
+    model_type = str(model_type)
+    return model_type in NATIVE_MODEL_TYPES or f"unsloth.models.{model_type}.modeling" in sys.modules
+
+
 def get_transformers_model_type(config, trust_remote_code=False):
     """ Gets model_type from config file - can be PEFT or normal HF """
     if config is None:
@@ -299,7 +311,11 @@ def get_transformers_model_type(config, trust_remote_code=False):
     _REMOTE_CODE_MODEL_TYPES = {"nemotron_h", "nemotronh_nano_vl_v2",}
     found_type = False
     for j, model_type in enumerate(final_model_types):
-        if from_instance_attribute:
+        if is_native_model_type(model_type):
+            # Unsloth's own implementation (unsloth/models/<model_type>): keep the name, never trim it to a
+            # transformers model it merely starts with (deepseek_v41 -> deepseek_v4).
+            found_type = True
+        elif from_instance_attribute:
             # Remote code; trimming would rewrite eg llama_foo to the wrong llama path
             found_type = True
         elif model_type in _REMOTE_CODE_MODEL_TYPES:
@@ -309,7 +325,7 @@ def get_transformers_model_type(config, trust_remote_code=False):
             model_types = list(model_type)
             model_types = ["".join(model_types[:i]) for i in range(len(model_types), 0, -1)]
             for current_model_type in model_types:
-                if current_model_type in all_model_types:
+                if current_model_type in all_model_types or is_native_model_type(current_model_type):
                     final_model_types[j] = current_model_type
                     found_type = True
                     break
