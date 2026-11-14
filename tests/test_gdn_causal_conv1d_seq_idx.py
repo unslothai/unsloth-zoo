@@ -314,6 +314,8 @@ def test_hub_layer_instance_keeps_its_kernel_metadata():
 
 def test_hub_layer_passes_real_kernels_validation():
     kernels = pytest.importorskip("kernels")
+    if not hasattr(kernels, "use_kernelized_func"):
+        pytest.skip("kernels release without use_kernelized_func")
     hub_fn = gcc._hub_gdn_function(kernels.use_kernel_forward_from_hub("causal_conv1d_fn"), _hub_conv)
     assert hasattr(hub_fn, "kernel_layer_name")
 
