@@ -59,6 +59,7 @@ __all__ = [
 
 from contextlib import contextmanager
 import copy
+import functools
 import hashlib
 import json
 import mmap
@@ -1538,6 +1539,8 @@ def _install_save_guard(PreTrainedModel):
     if getattr(original, "_unsloth_frozen_table_guard", False):
         return
 
+    # functools.wraps: keeps __wrapped__ and the markers of patches below (unsloth_zoo's MXFP4 dense save).
+    @functools.wraps(original)
     def save_pretrained(self, save_directory, *args, **kwargs):
         _check_save_target(self, save_directory)
         if not _prepare_full_table_save(self, args, kwargs):
