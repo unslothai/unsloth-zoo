@@ -25,6 +25,7 @@ __all__ = [
 
 from typing import Union, Callable, Optional, List, Dict
 import itertools as _itertools
+import json as _json
 from bisect import bisect_left as _bisect_left
 import torch
 
@@ -2799,6 +2800,11 @@ def _batched_rows(tokenize_row, tokenize_rows):
 pass
 
 
+def _row_tools(example):
+    tools = example.get("tools")
+    return _json.loads(tools) if isinstance(tools, str) else tools
+
+
 # Faster SFTTrainer prepare_dataset
 def sft_prepare_dataset(
     self,
@@ -2818,7 +2824,7 @@ def sft_prepare_dataset(
     map_kwargs = {}
     use_desc = isinstance(dataset, Dataset)
     # Imported here: this function's source is copied into the compiled trainer module.
-    from unsloth_zoo.dataset_utils import _batched_columns, _iterable_batch_size
+    from unsloth_zoo.dataset_utils import _batched_columns, _iterable_batch_size, _row_tools
     is_vlm = hasattr(processing_class, "tokenizer")
     tokenizer = processing_class
     if is_vlm: tokenizer = processing_class.tokenizer
@@ -3062,10 +3068,7 @@ def sft_prepare_dataset(
                     template_kwargs = dict(example.get("chat_template_kwargs") or {})
                     if training_chat_template is not None:
                         template_kwargs["chat_template"] = training_chat_template
-                    tools = example.get("tools")
-                    if isinstance(tools, str):
-                        import json as _json
-                        tools = _json.loads(tools)
+                    tools = _row_tools(example)
                     prompt_ids = processing_class.apply_chat_template(
                         example["prompt"], tokenize=True,
                         add_generation_prompt=True, return_dict=False,
@@ -3221,10 +3224,7 @@ def sft_prepare_dataset(
                 if training_chat_template is not None:
                     template_kwargs["chat_template"] = training_chat_template
                 messages = _clean_messages(example)
-                tools = example.get("tools")
-                if isinstance(tools, str):
-                    import json as _json
-                    tools = _json.loads(tools)
+                tools = _row_tools(example)
                 processed = processing_class.apply_chat_template(
                     messages, tools = tools,
                     tokenize = True, return_dict = True,
