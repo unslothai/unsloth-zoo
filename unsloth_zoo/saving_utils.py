@@ -346,6 +346,20 @@ def create_huggingface_repo(
         private = private,
         exist_ok = True,  # don't error if repo already exists
     )
+    # create_repo(private=True, exist_ok=True) leaves an existing public repo public, so refuse before the first upload
+    # rather than publish a private=True push. Visibility is never changed here.
+    if private:
+        try:
+            _is_private = getattr(api.repo_info(repo_id = repo_id, repo_type = "model"), "private", None)
+        except Exception as exc:
+            _is_private = None
+            print(f"Unsloth: Could not confirm the visibility of {repo_id} ({exc}); continuing.")
+        if _is_private is False:
+            raise RuntimeError(
+                f"Unsloth: private=True was requested but the Hugging Face repo {repo_id!r} already exists and is "
+                "public. Refusing to upload so private weights are not published. Make the repo private on the Hub, "
+                "push to a new repo id, or pass private=False."
+            )
     username = repo_id.split("/")[0]
 
     # If base_model is a local path, resolve it to the original model ID so the card does not reference a local dir (which fails HF validation).
