@@ -1148,6 +1148,34 @@ def test_a_lone_greedy_row_verifies_draft_trees_and_keeps_its_tokens_and_scores(
     assert not commits
 
 
+def test_tree_and_chain_rounds_commit_on_the_engines_stream(qwen_4bit, monkeypatch):
+    from unsloth_zoo.mlx import inference
+    from unsloth_zoo.mlx.generate import SamplingParams
+    model, ids, _ = qwen_4bit
+    with _tree_mode(model, monkeypatch):
+        _warm_tree_widths(model.language_model, _prefill(model.language_model, ids[0], SamplingParams())[0], ids[1][:6])
+        expected = _solo(model, ids[0], 40, SamplingParams())
+        engine, reference, commits = _tree_engine(model, monkeypatch)
+        reference += expected
+        rounds, streams, run, verify, tree_commit = [], [], engine._round, engine._verify, inference.tree_commit
+        with mx.stream(engine._stream):
+            ours = mx.default_stream(mx.default_device())   # the thread's stream behind the engine's thread-local one
+        on_stream = lambda: streams.append((rounds[-1], mx.default_stream(mx.default_device()) == ours))
+        monkeypatch.setattr(inference, "tree_commit", lambda *args: on_stream() or tree_commit(*args))
+
+        def verified(*args):
+            logits, hidden, transaction = verify(*args)
+            commit = transaction.commit
+            transaction.commit = lambda *lengths: on_stream() or commit(*lengths)
+            return logits, hidden, transaction
+        engine._verify = verified
+        engine._round = lambda plan, states: rounds.append(bool(plan.tree)) or run(plan, states)
+        reply, _ = _scored_reply(model, ids, engine, 40)
+    # Tree rounds with a forked path, and chain rounds, committed; every commit was built on the stream the next verify runs on.
+    assert reply == expected and any(path != list(range(len(path))) for path in commits)
+    assert {tree for tree, _ in streams} == {True, False} and all(same for _, same in streams)
+
+
 def test_a_quantized_row_keeps_its_chain_rounds(qwen_4bit, monkeypatch):
     from unsloth_zoo.mlx.generate import SamplingParams
     from unsloth_zoo.mlx.speculative import EngineRow, RoundPlan, RowPlan

@@ -1824,7 +1824,7 @@ class SpeculativeEngine:
                     self.drafter.push(draft, taken, mx.take(hidden[0], mx.array(rows[: len(taken)], mx.int32), axis = 0))
             with mx.stream(self._stream):
                 self.drafter.prefetch([None if row.finished else draft])
-            tree_commit(transaction, self.cache, rows)
+                tree_commit(transaction, self.cache, rows)
         except BaseException:
             transaction.abort()
             raise
@@ -1954,7 +1954,8 @@ class SpeculativeEngine:
                 taken = row.take(proposal[:count] + [target[count]], scores[i])
                 if row.draft is not None and len(taken) > kept[i]:
                     # A head that kept its accepted draft entries already holds those pairs; record the rest.
-                    self.drafter.push(row.draft, taken[kept[i] :], hidden[i, kept[i] : len(taken)])
+                    with mx.stream(self._stream):
+                        self.drafter.push(row.draft, taken[kept[i] :], hidden[i, kept[i] : len(taken)])
                 emitted.append(taken)
             if early is not None and not rows[0].finished:
                 early(accepted[0])
@@ -1962,22 +1963,24 @@ class SpeculativeEngine:
                 with mx.stream(self._stream):
                     # The next round's drafts run on the GPU while the host commits this one; a copying row is likely to copy again.
                     self.drafter.prefetch([None if row.finished else draft for row, draft in zip(rows, draft_rows)])
-            try:
-                transaction.validate([count + 1 for count in accepted])
-            except RuntimeError:
-                if len(rows) > 1:
-                    raise
-                # State the transaction has no record of (Inkling's short convolutions): undo, forward the accepted prefix again.
-                transaction.abort()
-                self.lm(inputs[:, : accepted[0] + 1], cache = self.cache, **self._position_kwargs())
-            else:
-                transaction.commit([count + 1 for count in accepted])
-            if len(set(accepted)) > 1:
-                # A ragged commit grows BatchKVCache.left_padding in place, but qwen3_5 memoizes decode pads by that array's identity.
-                for entry in self.cache:
-                    padding = getattr(entry, "left_padding", None)
-                    if isinstance(padding, mx.array) and not hasattr(entry, "metadata_revision"):
-                        entry.left_padding = padding + 0
+            # On the verify's stream: on another, the next verify would wait on a fence for the commit's writes.
+            with mx.stream(self._stream):
+                try:
+                    transaction.validate([count + 1 for count in accepted])
+                except RuntimeError:
+                    if len(rows) > 1:
+                        raise
+                    # State the transaction has no record of (Inkling's short convolutions): undo, forward the accepted prefix again.
+                    transaction.abort()
+                    self.lm(inputs[:, : accepted[0] + 1], cache = self.cache, **self._position_kwargs())
+                else:
+                    transaction.commit([count + 1 for count in accepted])
+                if len(set(accepted)) > 1:
+                    # A ragged commit grows BatchKVCache.left_padding in place, but qwen3_5 memoizes decode pads by that array's identity.
+                    for entry in self.cache:
+                        padding = getattr(entry, "left_padding", None)
+                        if isinstance(padding, mx.array) and not hasattr(entry, "metadata_revision"):
+                            entry.left_padding = padding + 0
         except BaseException:
             if early is not None:
                 early(None)
