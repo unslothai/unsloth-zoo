@@ -2775,6 +2775,34 @@ def _batched_columns(dataset):
 pass
 
 
+def _prompt_completion_boundary(prompt_ids, pc_ids):
+    """Index in `pc_ids` where the completion starts.
+
+    A prompt that ends in whitespace merges with the completion's first token in
+    byte-level BPE ("Answer: " + "two" tokenizes "Answer:", " two"), so the
+    prompt's own last token never appears in the joined ids and `len(prompt_ids)`
+    points one token past the start of the answer. The completion starts where
+    the two tokenizations diverge, as in TRL's SFTTrainer (huggingface/trl#7463).
+    """
+    n = min(len(prompt_ids), len(pc_ids))
+    if pc_ids[:n] == prompt_ids[:n]: return n
+    shared = 0
+    while shared < n and prompt_ids[shared] == pc_ids[shared]: shared += 1
+    global _PROMPT_COMPLETION_BOUNDARY_WARNED
+    if not _PROMPT_COMPLETION_BOUNDARY_WARNED:
+        _PROMPT_COMPLETION_BOUNDARY_WARNED = True
+        print(
+            "Unsloth: Warning: the tokenized prompt is not a prefix of the tokenized prompt + completion, "
+            "usually because the prompt ends in a space or newline that merges with the completion's first "
+            "token, or because the chat template renders the prompt alone differently. The completion is "
+            "trained from where they diverge, as in TRL. To avoid it, end the prompt on a token boundary "
+            "and start the completion with the whitespace instead (\"Answer:\" + \" two\")."
+        )
+    return shared
+pass
+_PROMPT_COMPLETION_BOUNDARY_WARNED = False
+
+
 def _check_batch_lengths(batch_rows, *columns):
     for column in columns:
         if len(column) != len(batch_rows):
@@ -3025,6 +3053,7 @@ def sft_prepare_dataset(
                 used_column_names.append("assistant_masks")
             from unsloth_zoo.dataset_utils import (
                 _chat_template_batches_like_rows, _is_conversation, _batched_rows, _check_batch_lengths,
+                _prompt_completion_boundary,
             )
             _batch_map = _batched_columns(dataset)
             _batch_chat_template = not is_vlm and _chat_template_batches_like_rows(processing_class)
@@ -3042,7 +3071,7 @@ def sft_prepare_dataset(
                 return _completion
 
             def _pc_result(prompt_ids, pc_ids, pc_masks, labels):
-                n_prompt = min(len(prompt_ids), len(pc_ids))
+                n_prompt = _prompt_completion_boundary(prompt_ids, pc_ids)
                 completion_mask = [0] * n_prompt + [1] * (len(pc_ids) - n_prompt)
                 result = {"input_ids": pc_ids, "completion_mask": completion_mask}
                 if assistant_only_loss:
