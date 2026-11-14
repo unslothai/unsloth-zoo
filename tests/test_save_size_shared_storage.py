@@ -14,6 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import copy
 import functools
 
 import pytest
@@ -42,7 +43,7 @@ def test_sharder_sizes_a_shared_storage_by_what_torch_save_writes():
     assert len(set(split.tensor_to_filename.values())) == 1
 
 
-def _block_swapped_lora_llama(tie, pad):
+def _block_swapped_lora_llama(tie, pad, evict):
     peft = pytest.importorskip("peft")
     from transformers import LlamaConfig, LlamaForCausalLM
 
@@ -64,13 +65,18 @@ def _block_swapped_lora_llama(tie, pad):
 
     for l in layers:
         l._register_state_dict_hook(hook)
-    return model
+    expected = sum(p.nbytes for p in copy.deepcopy(model).merge_and_unload().parameters()) + pad
+    if evict:
+        # BlockSwap.evict(): a non-resident layer's weights become empty tensors, LoRA targets included.
+        for l in layers:
+            l.self_attn.q_proj.base_layer.weight.data = torch.empty(0)
+    return model, expected
 
 
+@pytest.mark.parametrize("evict", [False, True])
 @pytest.mark.parametrize("tie", [False, True])
 @pytest.mark.parametrize("pad", [0, 4096])
-def test_prepare_saving_counts_each_storage_once(tmp_path, tie, pad):
+def test_prepare_saving_counts_each_storage_once(tmp_path, tie, pad, evict):
     # pad: torch.save writes a view's whole storage, so a padded arena must be counted in full.
-    model = _block_swapped_lora_llama(tie, pad)
-    out = prepare_saving(model, save_directory = str(tmp_path), output_dtype = torch.float32)
-    assert out[8] == sum(p.nbytes for p in model.merge_and_unload().parameters()) + pad
+    model, expected = _block_swapped_lora_llama(tie, pad, evict)
+    assert prepare_saving(model, save_directory = str(tmp_path), output_dtype = torch.float32)[8] == expected

@@ -3293,6 +3293,9 @@ def get_torch_storage_size_new(x, element_size):
         if saved_w is None and hasattr(mod, "weight"):
             saved_w = mod.weight
         if saved_w is not None and hasattr(saved_w, "shape"):
+            # Block Swap evicts a host-held layer's weights to empty tensors: size those from the module instead.
+            if saved_w.numel() == 0 and hasattr(mod, "in_features") and hasattr(mod, "out_features"):
+                return mod.in_features * mod.out_features * element_size
             return int(np.prod(saved_w.shape)) * element_size
         # MoE LoRA wrappers with no .base_layer: infer merged shape from lora matrices
         if mod is None and x.lora_A is not None and x.lora_B is not None:
