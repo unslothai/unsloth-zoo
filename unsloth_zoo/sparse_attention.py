@@ -29,6 +29,8 @@ compressed rows `compress_idxs + seq_len`. It lets the gather kernel read the wi
 Backends, first eligible wins (UNSLOTH_SPARSE_ATTN_BACKEND=gather|flex|torch forces one):
   gather  attention-gym gather_attn Triton fwd + bwd (vendored, unsloth_zoo/_vendored/attn_gym), its shared-KV
           schedule only: capability >= 10, bf16, head_dim <= 128 or 512, heads padded to 16 (not ROCm).
+  triton  Unsloth's index-gather kernel (unsloth_zoo/sparse_mqa_kernel.py): every other CUDA part, fp16 / bf16 (bf16 on
+          sm80+), head_dim a power of two up to 512; tiled gather, online softmax, fp32 atomics for dKV.
   flex    torch flex_attention over a membership block mask, sink applied exactly from the logsumexp; eager only,
           and only while the [b, s, n] membership table stays under 2^28 entries. A membership table counts a
           repeated index once, the reference and gather count every listed slot: rows must not repeat an index
@@ -54,9 +56,9 @@ import os
 
 import torch
 
-SPARSE_ATTN_STATS = {"gather": 0, "flex": 0, "torch": 0, "fallback": 0}
+SPARSE_ATTN_STATS = {"gather": 0, "triton": 0, "flex": 0, "torch": 0, "fallback": 0}
 
-_BACKENDS = ("gather", "flex", "torch")
+_BACKENDS = ("gather", "triton", "flex", "torch")
 _FAILED = {}
 _HAS_TRITON = importlib.util.find_spec("triton") is not None
 _GATHER = None
@@ -124,6 +126,11 @@ def _shared_memory(device):
     return _SHARED_MEMORY[index]
 
 
+def _triton_eligible(q):
+    from .sparse_mqa_kernel import sparse_mqa_supported
+    return _HAS_TRITON and sparse_mqa_supported(q, q)
+
+
 def _flex_eligible(q, kv_len = None):
     if not (q.is_cuda and _HAS_TRITON and q.dtype in (torch.float16, torch.bfloat16)):
         return False
@@ -143,6 +150,8 @@ def _order(q, k, backend = None, kv_len = None):
     order = []
     if _gather_eligible(q):
         order.append("gather")
+    if _triton_eligible(q):
+        order.append("triton")
     # Flex is an eager fallback: it compiles flex_attention itself, which does not nest inside a traced region.
     if _flex_eligible(q, kv_len) and not torch.compiler.is_compiling():
         order.append("flex")
@@ -315,6 +324,9 @@ def _sparse_attn_flex(q, kv, attn_sink, topk_idxs, softmax_scale):
 def _run(backend, q, kv, attn_sink, topk_idxs, softmax_scale):
     if backend == "gather":
         return _sparse_attn_gather(q, kv, attn_sink, topk_idxs, softmax_scale)
+    if backend == "triton":
+        from .sparse_mqa_kernel import sparse_mqa_attention
+        return sparse_mqa_attention(q, kv, attn_sink, topk_idxs, softmax_scale)
     if backend == "flex":
         return _sparse_attn_flex(q, kv, attn_sink, topk_idxs, softmax_scale)
     return sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale)
@@ -403,8 +415,9 @@ def sparse_gqa_attn(query, key, value, topk_idxs, softmax_scale, *, backend = No
     hk, dv = key.shape[1], value.shape[-1]
     groups = hq // hk
     forced = backend if backend in _BACKENDS else _forced_backend()
-    folded_gather = _gather_eligible(query.new_empty((1, 1, groups, dk + dv)))
-    if forced == "flex" or (forced is None and not folded_gather and _flex_eligible(query.transpose(1, 2), key.shape[2])
+    folded = query.new_empty((1, 1, groups, dk + dv))
+    kernel_fold = _gather_eligible(folded) or _triton_eligible(folded)
+    if forced == "flex" or (forced is None and not kernel_fold and _flex_eligible(query.transpose(1, 2), key.shape[2])
                             and not torch.compiler.is_compiling()):
         key_ = ("gqa_flex", dk, dv)
         if forced == "flex" or _failure_key("flex", query.transpose(1, 2), key_) not in _FAILED:

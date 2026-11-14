@@ -159,7 +159,8 @@ def _gather_runs():
 
 
 @pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
-@pytest.mark.parametrize("backend,dtype,shape", [("flex", dt, sh) for dt in _cuda_dtypes() for sh in _FLEX_SHAPES]
+@pytest.mark.parametrize("backend,dtype,shape", [(be, dt, sh) for be in ("flex", "triton") for dt in _cuda_dtypes()
+                                                  for sh in _FLEX_SHAPES]
                          + ([("gather", torch.bfloat16, sh) for sh in _GATHER_SHAPES] if _gather_runs() else []))
 def test_cuda_backend_matches_fp64(monkeypatch, backend, dtype, shape):
     b, s, h, d, n, k = shape
@@ -277,7 +278,7 @@ def test_all_pad_rows_are_zero_and_finite_on_the_torch_path(with_sink):
 
 @pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
 @pytest.mark.parametrize("with_sink", [True, False])
-@pytest.mark.parametrize("backend", ["gather", "flex"])
+@pytest.mark.parametrize("backend", ["gather", "triton", "flex"])
 def test_cuda_all_pad_rows_are_zero_and_finite(monkeypatch, backend, with_sink):
     if backend == "gather" and not _gather_runs():
         pytest.skip("gather_attn shared-KV schedule needs capability >= 10")
@@ -292,3 +293,74 @@ def test_cuda_all_pad_rows_are_zero_and_finite(monkeypatch, backend, with_sink):
     grads = torch.autograd.grad(out.float().square().sum(), leaves)
     assert torch.isfinite(out).all() and all(torch.isfinite(g).all() for g in grads)
     assert out[0, [0, 5, 11]].abs().max() == 0 and grads[0][0, [0, 5, 11]].abs().max() == 0
+
+
+@pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
+def test_cuda_triton_kernel_compiles_without_graph_breaks(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "triton")
+    import torch._dynamo
+    from torch._dynamo.utils import counters
+    dtype = _cuda_dtypes()[-1]
+    q, kv, sink, idxs = _inputs(1, 40, 16, 512, 60, 24, dtype, "cuda")
+    q.requires_grad_(); kv.requires_grad_(); sink.requires_grad_()
+    from unsloth_zoo.sparse_mqa_kernel import SPARSE_MQA_STATS
+    torch._dynamo.reset(); counters.clear()
+    before = dict(SPARSE_MQA_STATS)
+    fn = torch.compile(lambda q, kv, sink: sa.sparse_attn(q, kv, sink, idxs, 0.05).float().square().sum())
+    fn(q, kv, sink).backward()
+    assert counters["stats"]["unique_graphs"] >= 1
+    assert sum(counters["graph_break"].values()) == 0, dict(counters["graph_break"])
+    # The kernels ran inside the compiled graph (opaque custom ops, not an eager fallback).
+    assert SPARSE_MQA_STATS["fwd"] > before["fwd"] and SPARSE_MQA_STATS["bwd"] > before["bwd"]
+    compiled = [t.grad.clone() for t in (q, kv, sink)]
+    for t in (q, kv, sink):
+        t.grad = None
+    sa.sparse_attn(q, kv, sink, idxs, 0.05).float().square().sum().backward()
+    # Inductor fuses the loss backward and the dO . O delta around the opaque ops in another order than eager
+    # (1 ulp on a few elements); dkv also uses fp32 atomics. Compare to bf16 rounding.
+    for got, want in zip((q.grad, kv.grad, sink.grad), compiled):
+        torch.testing.assert_close(got.float(), want.float(), rtol = 2e-2, atol = 1e-4)
+
+
+_INTERP = """
+import os, sys
+os.environ["TRITON_INTERPRET"] = "1"
+import torch
+from unsloth_zoo import sparse_attention as sa
+from unsloth_zoo.sparse_mqa_kernel import sparse_mqa_attention
+torch.manual_seed(0)
+worst = 0.0
+for (b, s, h, d, n, k, sink_on) in ((1, 7, 3, 16, 9, 5, True), (2, 5, 17, 32, 11, 21, False)):
+    q = torch.randn(b, s, h, d, requires_grad = True)
+    kv = torch.randn(b, n, d, requires_grad = True)
+    sink = torch.randn(h, requires_grad = True) if sink_on else None
+    idx = torch.stack([torch.stack([torch.randperm(n)[:min(k, n)] for _ in range(s)]) for _ in range(b)])
+    if k > n:
+        idx = torch.cat([idx, torch.full((b, s, k - n), -1)], -1)
+    idx = torch.where(torch.rand(idx.shape) < 0.25, -1, idx).int()
+    idx[0, 1] = -1
+    go = torch.randn(b, s, h, d)
+    out = sparse_mqa_attention(q, kv, sink, idx, d ** -0.5)
+    leaves = [q, kv] + ([sink] if sink_on else [])
+    got = [out] + list(torch.autograd.grad(out, leaves, go))
+    ref_leaves = [t.detach().double().requires_grad_() for t in leaves]
+    ref_sink = ref_leaves[2] if sink_on else torch.full((h,), float("-inf"), dtype = torch.float64)
+    ref = sa.sparse_attn_reference(ref_leaves[0], ref_leaves[1], ref_sink, idx, d ** -0.5)
+    want = [ref] + list(torch.autograd.grad(ref, ref_leaves, go.double()))
+    worst = max(worst, max(float((x.double() - y).abs().max()) for x, y in zip(got, want)))
+    assert out[0, 1].abs().max() == 0
+print("INTERP_WORST", worst)
+"""
+
+
+def test_triton_kernel_math_in_the_interpreter():
+    # The kernel's own arithmetic (tiles, masks, online softmax, atomics, empty rows, heads not a multiple of 16,
+    # more slots than rows) on CPU through TRITON_INTERPRET, against the fp64 reference.
+    import subprocess, sys
+    from pathlib import Path
+    env = dict(os.environ, PYTHONPATH = str(Path(__file__).resolve().parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+               CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1")
+    proc = subprocess.run([sys.executable, "-c", _INTERP], env = env, capture_output = True, text = True, timeout = 600)
+    line = next((l for l in proc.stdout.splitlines() if l.startswith("INTERP_WORST")), None)
+    assert line is not None, proc.stderr[-3000:]
+    assert float(line.split()[1]) < 1e-5, line
