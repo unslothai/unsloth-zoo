@@ -5,6 +5,9 @@ GPU tensor state. Returning the native buffers avoids packing/copying backward w
 no worst-case scratch reservation or CPU bookkeeping output is needed.
 """
 
+
+# Modified by Unsloth: postponed annotations so the PEP 604 unions import on Python 3.9.
+from __future__ import annotations
 # Modified by Unsloth: operator namespace attn_gym:: renamed to unsloth_attn_gym:: so a real
 # attention-gym in the same process does not define the same operators twice.
 import torch

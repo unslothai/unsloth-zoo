@@ -1,5 +1,8 @@
 """Triton primitives shared by gather-attention kernel schedules."""
 
+
+# Modified by Unsloth: postponed annotations so the PEP 604 unions import on Python 3.9.
+from __future__ import annotations
 from collections.abc import Sequence
 from typing import NamedTuple
 

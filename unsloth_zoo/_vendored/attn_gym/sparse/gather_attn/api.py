@@ -3,8 +3,9 @@ from __future__ import annotations
 # Modified by Unsloth: package-absolute imports of the vendored attn_gym, Triton-only
 # _select_backend (see MANIFEST).
 
+import sys
 from dataclasses import dataclass
-from typing import NamedTuple, overload
+from typing import NamedTuple, Tuple, Union, overload
 
 import torch
 from torch import Tensor
@@ -22,7 +23,8 @@ class RopePair(NamedTuple):
     rope: Tensor
 
 
-AttentionInput = Tensor | tuple[Tensor, Tensor]
+# Modified by Unsloth: typing.Union (a runtime alias is evaluated even with postponed annotations; Python 3.9).
+AttentionInput = Union[Tensor, Tuple[Tensor, Tensor]]
 
 
 def _split_input(value: AttentionInput, name: str) -> tuple[Tensor, Tensor | None]:
@@ -37,7 +39,8 @@ def _split_input(value: AttentionInput, name: str) -> tuple[Tensor, Tensor | Non
     return value
 
 
-@dataclass(frozen=True, slots=True)
+# Modified by Unsloth: dataclass(slots=True) is Python 3.10+.
+@dataclass(frozen=True, **({"slots": True} if sys.version_info >= (3, 10) else {}))
 class GatherAttnAux:
     """Auxiliary outputs returned by gather_attn when requested.
 

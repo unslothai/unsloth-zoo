@@ -1,5 +1,8 @@
 """Autograd integration for graph-specialized gather-attention backends."""
 
+
+# Modified by Unsloth: postponed annotations so the PEP 604 unions import on Python 3.9.
+from __future__ import annotations
 import torch
 from torch import Tensor
 

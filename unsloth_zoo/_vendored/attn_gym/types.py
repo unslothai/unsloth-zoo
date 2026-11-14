@@ -1,3 +1,6 @@
+# Modified by Unsloth: postponed annotations so the PEP 604 unions import on Python 3.9.
+from __future__ import annotations
+
 # Copyright (c) 2025 Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
@@ -6,6 +9,7 @@
 
 """Types shared by attention operations."""
 
+import sys
 from dataclasses import dataclass
 from enum import Enum
 
@@ -26,7 +30,8 @@ def resolve_impl(impl: Impl | str) -> Impl:
         raise ValueError(f"unknown impl {impl!r}; expected one of {valid}") from None
 
 
-@dataclass(frozen=True, slots=True)
+# Modified by Unsloth: dataclass(slots=True) is Python 3.10+.
+@dataclass(frozen=True, **({"slots": True} if sys.version_info >= (3, 10) else {}))
 class AuxRequest:
     """Specifies which auxiliary outputs an attention operation returns.
 

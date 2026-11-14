@@ -40,7 +40,17 @@ modifications =
       times the surviving candidates in process with triton.testing.do_bench on
       the first launch per key, restoring mutated outputs through reset, and
       memoizes the winner; UNSLOTH_ATTN_GYM_AUTOTUNE=0 pins the first candidate
-      that launches.
+      that launches. An untimed selection's launch is the call's launch (no second
+      launch on a cold key).
+    - Python 3.9 (unsloth_zoo requires-python >= 3.9): "from __future__ import
+      annotations" added to types.py, _backends/triton/utils.py,
+      sparse/gather_attn/impl/{__init__,ops,reference}.py and
+      impl/triton/{backward,forward,primitives}.py; the runtime aliases
+      AttentionInput (api.py) and Grid (tune.py) use typing.Union; the
+      dataclass(slots=True) in api.py and types.py passes slots only on 3.10+.
+      The Triton kernel modules need triton >= 3.5 (no Python 3.9 wheels): where
+      gather_attn cannot be imported, unsloth_zoo.sparse_attention never selects
+      it.
     - __init__.py, sparse/__init__.py and sparse/gather_attn/__init__.py are
       narrowed to the vendored closure.
 

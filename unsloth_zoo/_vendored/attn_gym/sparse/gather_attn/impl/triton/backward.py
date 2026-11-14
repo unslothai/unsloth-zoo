@@ -1,5 +1,8 @@
 """Backward kernels and launcher for Triton gather attention."""
 
+
+# Modified by Unsloth: postponed annotations so the PEP 604 unions import on Python 3.9.
+from __future__ import annotations
 import warnings
 
 import torch

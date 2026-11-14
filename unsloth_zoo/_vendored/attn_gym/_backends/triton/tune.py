@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 import threading
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, Dict, Tuple, Union
 
 import triton
 from triton.compiler.errors import CompileTimeAssertionFailure
@@ -32,7 +32,8 @@ try:
 except ImportError:  # older Triton
     PTXASError = OutOfResources
 
-Grid = tuple[int, ...] | Callable[[dict[str, Any]], tuple[int, ...]]
+# Modified by Unsloth: typing.Union runtime alias (Python 3.9).
+Grid = Union[Tuple[int, ...], Callable[[Dict[str, Any]], Tuple[int, ...]]]
 
 
 def _autotune_enabled() -> bool:
@@ -100,13 +101,16 @@ class TritonTuner:
                 return
             # The snapshot is taken before any trial, so the final launch sees the caller's state.
             restore = self._reset(grid, args) if self._reset is not None else None
-            winner = self._select(grid, args, restore)
+            winner, already_ran = self._select(grid, args, restore)
             self._winners[key] = winner
-            if restore is not None:
-                restore()
-            self._launch(winner, grid, args)
+            # An untimed selection already ran the winner on the caller's state: launching again would repeat
+            # the work (and be captured twice into a CUDA graph).
+            if not already_ran:
+                if restore is not None:
+                    restore()
+                self._launch(winner, grid, args)
 
-    def _select(self, grid: Grid, args: dict[str, Any], restore) -> triton.Config:
+    def _select(self, grid: Grid, args: dict[str, Any], restore) -> tuple[triton.Config, bool]:
         candidates = self._candidates(args)
         timed = _autotune_enabled() and len(candidates) > 1 and not _capturing()
         best, best_ms, last_error = None, float("inf"), None
@@ -116,7 +120,7 @@ class TritonTuner:
                     restore()
                 if not timed:
                     self._launch(config, grid, args)
-                    return config
+                    return config, True
                 from triton.testing import do_bench
 
                 def trial(config=config):
@@ -132,7 +136,7 @@ class TritonTuner:
                 best, best_ms = config, ms
         if best is None:
             raise RuntimeError("no gather-attention Triton config could launch") from last_error
-        return best
+        return best, False
 
 
 __all__ = ["TritonTuner"]

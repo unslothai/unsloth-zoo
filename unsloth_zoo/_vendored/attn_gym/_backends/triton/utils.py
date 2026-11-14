@@ -1,5 +1,8 @@
 """Small utilities shared by hand-written Triton kernels."""
 
+
+# Modified by Unsloth: postponed annotations so the PEP 604 unions import on Python 3.9.
+from __future__ import annotations
 import inspect
 import math
 from collections.abc import Sequence
