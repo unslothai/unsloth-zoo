@@ -4282,6 +4282,9 @@ _VLM_WIDTH_PADDABLE_KEYS = {
 # Width-derived arrays generated AFTER width finalization (sequence axis last).
 _VLM_WIDTH_GENERATED_KEYS = ("position_ids",)
 # Model types whose position ids the position phase builds and rebuilds after planned padding; elsewhere ids are processor-authored, so the batch declines.
+# As mlx-vlm's get_rope_index for these families (qwen3_5_moe / qwen4_exp reuse qwen3_5's).
+_VLM_QWEN_FRAME_SPLIT_MODEL_TYPES = frozenset({"qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe", "qwen4_exp"})
+
 _VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
     "qwen2_vl",
     "qwen2_5_vl",
@@ -4706,6 +4709,9 @@ def _vlm_positions_for_compile(batch_dict, config):
     video_grid_thw = _normalize_grid_thw(batch_dict.get("video_grid_thw"))
 
     if model_type in _VLM_QWEN_POSITION_MODEL_TYPES:
+        if model_type in _VLM_QWEN_FRAME_SPLIT_MODEL_TYPES and video_grid_thw:
+            # These processors put a timestamp between temporal patches, so each is its own (1, h, w) span.
+            video_grid_thw = tuple((1, h, w) for t, h, w in video_grid_thw for _ in range(t))
         input_ids = batch_dict.get("input_ids")
         if input_ids is not None:
             input_ids_np = np.asarray(input_ids)
@@ -7314,9 +7320,24 @@ def _vlm_vision_part_state(messages):
 
 def _video_part_payload(part):
     for key in ("video", "video_url", "input_video"):
-        if part.get(key) is not None:
-            return part[key]
+        value = part.get(key)
+        if value is not None:
+            # OpenAI-style {"video_url": {"url": ...}}.
+            if isinstance(value, dict) and isinstance(value.get("url"), str):
+                return value["url"]
+            return value
     return None
+
+
+def _require_video_runtime():
+    import importlib.util
+
+    # HF video processors and the frame decoder both build torch tensors; the MLX extra does not install torch.
+    if importlib.util.find_spec("torch") is None:
+        raise ImportError(
+            "Unsloth MLX VLM: video rows need PyTorch and torchvision for frame decoding and the "
+            "processor's video path. Install them with `pip install torch torchvision`."
+        )
 
 
 def _video_element_dict(video):
@@ -7425,6 +7446,7 @@ def _extract_vlm_media(
 
     if videos and any(isinstance(video, (str, bytes, dict)) for video in videos):
         # Never suppressed: a dropped clip would leave its placeholder to train as text.
+        _require_video_runtime()
         from unsloth_zoo.vision_utils import fetch_video
 
         decoded = []
@@ -9285,6 +9307,7 @@ def _processor_vlm_inputs(
                 aligned = False
                 break
             flat_fps.extend(row_fps)
+        _require_video_runtime()
         from unsloth_zoo.vision_utils import video_processor_kwargs
 
         videos, video_proc_kwargs = video_processor_kwargs(

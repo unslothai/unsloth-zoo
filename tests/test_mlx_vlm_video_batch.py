@@ -435,3 +435,52 @@ def test_messageless_pc_row_keeps_videos_beside_an_empty_images_column(monkeypat
     monkeypatch.setattr(vu, "fetch_video", lambda info, **k: (decoded, 1.0))
     got_images, videos, kwargs = _extract_vlm_pc_media({"images": images, "videos": ["clips/a.mp4"]}, None, None, None)
     assert got_images == [] and len(videos) == 1 and kwargs == {"fps": [1.0]}
+
+
+@pytest.mark.parametrize("model_type,module", [("qwen3_vl", "qwen3_vl"), ("qwen3_5", "qwen3_5"), ("qwen2_5_vl", "qwen2_5_vl")])
+def test_video_positions_match_mlx_vlm_rope_index(model_type, module):
+    """Qwen3 processors put a timestamp between temporal patches; positions must equal mlx-vlm's own."""
+    import importlib
+    import types
+    from unsloth_zoo.mlx.utils import _vlm_positions_for_compile
+
+    language = importlib.import_module(f"mlx_vlm.models.{module}.language")
+    start, end, video, image = 90, 91, 92, 93
+    frame = [start] + [video] * 4 + [end]
+    if model_type == "qwen2_5_vl":
+        ids = [1, 2] + [start] + [video] * 8 + [end] + [5, 6]
+    else:
+        ids = [1, 2, 7, 8] + frame + [7, 9] + frame + [5, 6]
+    ids = np.array([ids], dtype = np.int32)
+    mask = np.ones_like(ids)
+    grid = np.array([[2, 4, 4]], dtype = np.int32)
+    config = {"model_type": model_type, "image_token_id": image, "video_token_id": video,
+              "vision_start_token_id": start, "vision_config": {"spatial_merge_size": 2}}
+    ours = _vlm_positions_for_compile(
+        {"input_ids": ids, "attention_mask": mask, "video_grid_thw": grid}, config,
+    )["position_ids"]
+    owner = types.SimpleNamespace(config = types.SimpleNamespace(
+        vision_config = types.SimpleNamespace(spatial_merge_size = 2),
+        image_token_id = image, video_token_id = video, vision_start_token_id = start,
+    ))
+    ref, _ = language.LanguageModel.get_rope_index(owner, mx.array(ids), None, mx.array(grid), mx.array(mask))
+    np.testing.assert_array_equal(np.asarray(ours), np.asarray(ref))
+
+
+def test_openai_style_video_url_is_unwrapped(monkeypatch):
+    import unsloth_zoo.vision_utils as vu
+
+    seen = []
+    monkeypatch.setattr(vu, "fetch_video", lambda info, **k: (seen.append(info["video"]), (np.zeros((2, 4, 4, 3), np.uint8), 1.0))[1])
+    messages = [{"role": "user", "content": [{"type": "video_url", "video_url": {"url": "clips/a.mp4"}}, {"type": "text", "text": "q"}]}]
+    _, videos, _ = _extract_vlm_media({}, messages, None)
+    assert seen == ["clips/a.mp4"] and len(videos) == 1
+
+
+def test_video_rows_without_torch_name_the_install(monkeypatch):
+    import importlib.util
+
+    real = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: None if name == "torch" else real(name, *a))
+    with pytest.raises(ImportError, match = "pip install torch torchvision"):
+        _extract_vlm_media({}, _video_messages("clips/a.mp4"), None)
