@@ -929,3 +929,58 @@ def test_provenance_reads_the_hub_repo_and_revision():
     path = os.path.join("/x", "hub", "models--org--Some-Model", "snapshots", "abc123", "model-00001.safetensors")
     assert fts._hub_identity(path) == ("org/Some-Model", "abc123")
     assert fts._hub_identity("/data/local/model.safetensors") == (None, None)
+
+
+def test_memo_shared_across_threads_never_serves_another_threads_rows(bf16_table):
+    """DataParallel replicas share one module's memo: concurrent lookups may miss, never raise or mix up rows."""
+    import threading
+
+    index, names, full = bf16_table
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="ram")
+    emb = UnslothFrozenTableEmbedding(store.num_rows, 20, dtype=torch.float32).bind(store)
+    emb.memo_slots = 2
+    errors = []
+
+    def worker(seed):
+        g = torch.Generator().manual_seed(seed)
+        try:
+            for _ in range(200):
+                ids = torch.randint(0, full.shape[0], (3, 7), generator=g)
+                for _ in range(2):  # the forward, then its checkpoint recompute
+                    if not torch.equal(emb(ids), F.embedding(ids, full).float()):
+                        errors.append(seed)
+                        return
+        except Exception as e:  # list mutation races surfaced as exceptions before
+            errors.append(repr(e))
+
+    threads = [threading.Thread(target=worker, args=(s,)) for s in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+    assert not errors, errors
+    assert len(emb._memo) <= 2
+    store.close()
+
+
+def test_provenance_of_a_hub_cache_snapshot_names_the_repo_revision_and_files(bf16_table, tmp_path):
+    """Hub cache snapshots are symlinks into content-addressed blobs: provenance must read the snapshot path."""
+    index, names, _ = bf16_table
+    src = os.path.dirname(index)
+    repo = tmp_path / "hub" / "models--org--Some-Model"
+    (repo / "blobs").mkdir(parents=True)
+    snap = repo / "snapshots" / "abc123"
+    snap.mkdir(parents=True)
+    files = sorted(f for f in os.listdir(src) if os.path.isfile(os.path.join(src, f)))
+    for i, f in enumerate(files):
+        blob = repo / "blobs" / f"{i:064x}"
+        with open(os.path.join(src, f), "rb") as r, open(blob, "wb") as w:
+            w.write(r.read())
+        os.symlink(os.path.relpath(blob, snap), snap / f)
+    store = FrozenTableStore.from_checkpoint(str(snap / os.path.basename(index)), {"weight": names}, mode="disk")
+    table = store.provenance()
+    assert (table["repo_id"], table["revision"]) == ("org/Some-Model", "abc123")
+    assert set(table["files"]) <= set(files) and all(t["file"] in files for t in table["tensors"])
+    # rows still come from the blobs
+    assert torch.equal(store.gather(torch.tensor([0, 1])), FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk").gather(torch.tensor([0, 1])))
+    store.close()

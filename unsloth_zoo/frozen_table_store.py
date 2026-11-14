@@ -136,7 +136,7 @@ def set_frozen_table_memo_slots(module: nn.Module, slots: int) -> int:
         if isinstance(m, UnslothFrozenTableEmbedding):
             m.memo_slots = slots
             if m._memo:
-                del m._memo[slots:]
+                m._memo = list(m._memo[:slots])
             n += 1
     return n
 
@@ -193,6 +193,9 @@ class TensorLocation:
     shape: Tuple[int, ...]
     offset: int  # absolute byte offset in the file
     nbytes: int
+    # The path as given (before symlinks resolve): hub cache snapshots link into content-addressed blobs, and only
+    # the snapshot path names the file, the repo and the revision.
+    source_path: Optional[str] = None
 
 
 def _checkpoint_files(source: Union[str, Sequence[str]]) -> Tuple[Optional[dict], List[str]]:
@@ -267,6 +270,7 @@ def resolve_tensor_locations(
                 shape=tuple(int(x) for x in meta["shape"]),
                 offset=data_start + int(begin),
                 nbytes=int(end) - int(begin),
+                source_path=os.path.abspath(path),
             )
     if wanted is not None:
         missing = wanted - set(out)
@@ -646,15 +650,15 @@ class FrozenTableStore:
         files, tensors = {}, []
         for plane_name, plane in self.planes.items():
             for loc in plane.locations:
-                base = os.path.basename(loc.path)
+                base = os.path.basename(loc.source_path or loc.path)
                 if base not in files:
                     files[base] = {"size": os.path.getsize(loc.path), "header_sha256": _header_sha256(loc.path)}
                 tensors.append({
                     "name": loc.name, "plane": plane_name, "file": base, "dtype": loc.dtype,
                     "shape": list(loc.shape), "sample_sha256": _sample_sha256(loc),
                 })
-        first = next(iter(self.planes.values())).locations[0].path
-        repo_id, revision = _hub_identity(first)
+        first = next(iter(self.planes.values())).locations[0]
+        repo_id, revision = _hub_identity(first.source_path or first.path)
         self._provenance = {
             "name": self.name, "num_rows": self.num_rows, "repo_id": repo_id, "revision": revision,
             "files": files, "tensors": tensors,
@@ -982,39 +986,41 @@ class UnslothFrozenTableEmbedding(nn.Module):
         # several micro-batches in flight). The micro-batch's identity is its ids tensor: every entry holds its ids
         # alive, so no other tensor can take that address while the key names it. Rows are only ever served for the
         # same ids tensor or for equal values, so one micro-batch never receives another's rows.
-        entries = self._memo or []
+        # Copy on write: the list is only ever replaced, never mutated in place, so a lookup from another thread
+        # (DataParallel replicas share it) can at worst drop an entry (one extra read), never raise or serve rows
+        # under another entry's key.
+        entries = tuple(self._memo or ())
         # The key alone vouches for the values only through the version counter, which writes through ``.data`` or
         # a numpy view of a reused ids buffer do not bump. On the host the value check is free of syncs, so CPU ids
         # always take it; accelerator ids trust the key (no host copy for a recompute of the same ids tensor).
         if ids.device.type != "cpu":
             for i, entry in enumerate(entries):
                 if entry[2] == key:
-                    return self._memo_hit(entries, i)
+                    return self._memo_hit(entry)
         # The rows are read on the host, so the ids go there once: the value checks and the gather share that copy
         # (one host sync per lookup on an accelerator, none for a recompute that hands back the same tensor).
         host = ids.detach().cpu() if ids.device.type != "cpu" else None
         probe = ids if host is None else host
-        for i, (_, m_snapshot, m_key, _) in enumerate(entries):
+        for entry in entries:
+            _, m_snapshot, m_key, _ = entry
             if (
                 m_key[2] == key[2] and m_key[4] == key[4] and m_key[5] == step and m_key[6] == key[6]
                 and m_key[7] == key[7] and torch.equal(m_snapshot, probe)
             ):
-                return self._memo_hit(entries, i)
+                return self._memo_hit(entry)
         with torch.no_grad():
             rows = store.gather(ids, dtype=self.table_dtype, host_ids=host)
             snapshot = ids.detach().clone() if host is None else host
         _bump(memo_misses=1)
         # Hold ids (no other tensor can take its address while the key names it) and a snapshot of its values
         # (an in-place update of ids must not make the equality check compare the tensor with itself).
-        entries.insert(0, (ids, snapshot, key, rows))
-        del entries[max(1, int(getattr(self, "memo_slots", 1))):]
-        self._memo = entries
+        slots = max(1, int(getattr(self, "memo_slots", 1)))
+        self._memo = [(ids, snapshot, key, rows), *(self._memo or ())][:slots]
         return rows
 
-    def _memo_hit(self, entries, i):
-        entry = entries.pop(i)
-        entries.insert(0, entry)
-        self._memo = entries
+    def _memo_hit(self, entry):
+        # Most recently used first; a new list, so a concurrent reader keeps iterating its own snapshot.
+        self._memo = [entry, *(e for e in (self._memo or ()) if e is not entry)]
         _bump(memo_hits=1)
         return entry[3]
 
