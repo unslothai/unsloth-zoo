@@ -413,7 +413,7 @@ def _index_fwd(q, kv, idx, sink, scale, has_sink):
     q = q if q.stride(-1) == 1 else q.contiguous()
     kv = kv if kv.stride(-1) == 1 else kv.contiguous()
     idx = idx.contiguous()
-    out = torch.empty_like(q)
+    out = q.new_empty(q.shape)
     lse = torch.empty((b, s, h), device = q.device, dtype = torch.float32)
     if s == 0 or b == 0:
         return out, lse
@@ -434,7 +434,7 @@ def _index_fwd(q, kv, idx, sink, scale, has_sink):
 @_fwd_op.register_fake
 def _(q, kv, idx, sink, scale, has_sink):
     b, s, h, d = q.shape
-    return torch.empty_like(q), q.new_empty((b, s, h), dtype = torch.float32)
+    return q.new_empty(q.shape), q.new_empty((b, s, h), dtype = torch.float32)
 
 
 @torch.library.custom_op(f"unsloth_zoo::sparse_mqa_bwd_{_V}", mutates_args = ())
@@ -446,12 +446,12 @@ def _bwd_op(q: torch.Tensor, kv: torch.Tensor, idx: torch.Tensor, grad_out: torc
 def _index_bwd(q, kv, idx, grad_out, lse, delta, scale):
     b, s, h, d = q.shape
     group = b // idx.shape[0] if idx.shape[0] else 1
-    q = q if q.stride(-1) == 1 else q.contiguous()
+    q = q.contiguous()   # dq is written with q's row offsets
     kv = kv if kv.stride(-1) == 1 else kv.contiguous()
     grad_out = grad_out.contiguous()
     idx = idx.contiguous()
     lse, delta = lse.contiguous(), delta.contiguous()
-    dq = torch.empty_like(q)
+    dq = q.new_empty(q.shape)
     dkv = torch.zeros(kv.shape, device = kv.device, dtype = torch.float32)
     if s and b:
         _launch(_sparse_mqa_bwd, lambda split: (s, triton.cdiv(h, _BLOCK_H) * (d // split), b), (
@@ -466,12 +466,12 @@ def _index_bwd(q, kv, idx, grad_out, lse, delta, scale):
                 scale,
             ), q.device, d, True, BLOCK_H = _BLOCK_H, _dtype = q.dtype)
     SPARSE_MQA_STATS["bwd"] += 1
-    return dq, dkv.to(kv.dtype)
+    return dq, dkv.to(kv.dtype).contiguous()
 
 
 @_bwd_op.register_fake
 def _(q, kv, idx, grad_out, lse, delta, scale):
-    return torch.empty_like(q), torch.empty_like(kv)
+    return q.new_empty(q.shape), kv.new_empty(kv.shape)
 
 
 def _setup_context(ctx, inputs, output):
@@ -549,7 +549,7 @@ def _wfwd_op(q: torch.Tensor, wkv: torch.Tensor, ckv: torch.Tensor, idx: torch.T
              scale: float, window: int, has_sink: bool) -> Tuple[torch.Tensor, torch.Tensor]:
     b, s, h, d = q.shape
     q, wkv, ckv = q.contiguous(), wkv.contiguous(), ckv.contiguous()
-    out = torch.empty_like(q)
+    out = q.new_empty(q.shape)
     lse = torch.empty((b, s, h), device = q.device, dtype = torch.float32)
     if s == 0 or b == 0:
         return out, lse
@@ -573,7 +573,7 @@ def _wfwd_op(q: torch.Tensor, wkv: torch.Tensor, ckv: torch.Tensor, idx: torch.T
 @_wfwd_op.register_fake
 def _(q, wkv, ckv, idx, sink, scale, window, has_sink):
     b, s, h, d = q.shape
-    return torch.empty_like(q), q.new_empty((b, s, h), dtype = torch.float32)
+    return q.new_empty(q.shape), q.new_empty((b, s, h), dtype = torch.float32)
 
 
 @torch.library.custom_op(f"unsloth_zoo::sparse_mqa_window_bwd_{_V}", mutates_args = ())
@@ -583,15 +583,15 @@ def _wbwd_op(q: torch.Tensor, wkv: torch.Tensor, ckv: torch.Tensor, idx: torch.T
     b, s, h, d = q.shape
     q, wkv, ckv = q.contiguous(), wkv.contiguous(), ckv.contiguous()
     grad_out, lse, delta = grad_out.contiguous(), lse.contiguous(), delta.contiguous()
-    dq = torch.empty_like(q)
-    dwkv = torch.empty_like(wkv)
+    dq = q.new_empty(q.shape)
+    dwkv = wkv.new_empty(wkv.shape)
     if s == 0 or b == 0:
-        return dq, dwkv.zero_(), torch.zeros_like(ckv)
+        return dq, dwkv.zero_(), ckv.new_zeros(ckv.shape)
     has_prior = idx.shape[-1] > 0 and ckv.shape[1] > 0
     if has_prior:
         dq_c, dckv = _index_bwd(q, ckv, idx, grad_out, lse, delta, scale)
     else:
-        dq_c, dckv = dq, torch.zeros_like(ckv)
+        dq_c, dckv = dq, ckv.new_zeros(ckv.shape)
     args = (s, h, int(window), q.stride(0), q.stride(1), q.stride(2), wkv.stride(0), wkv.stride(1),
             lse.stride(0), lse.stride(1), scale)
     _launch_window(_window_bwd_dq, "dq", lambda bt, bn: (triton.cdiv(s, bt), triton.cdiv(h, _BLOCK_H), b),
@@ -599,12 +599,12 @@ def _wbwd_op(q: torch.Tensor, wkv: torch.Tensor, ckv: torch.Tensor, idx: torch.T
     _launch_window(_window_bwd_dkv, "dkv", lambda bt, bn: (triton.cdiv(s, bn), b),
                    (q, wkv, grad_out, lse, delta, dwkv) + args, q.device, d, q.dtype)
     SPARSE_MQA_STATS["window_bwd"] += 1
-    return dq, dwkv, dckv
+    return dq, dwkv, dckv.contiguous()
 
 
 @_wbwd_op.register_fake
 def _(q, wkv, ckv, idx, grad_out, lse, delta, scale, window):
-    return torch.empty_like(q), torch.empty_like(wkv), torch.empty_like(ckv)
+    return q.new_empty(q.shape), wkv.new_empty(wkv.shape), ckv.new_empty(ckv.shape)
 
 
 def _wsetup_context(ctx, inputs, output):
@@ -662,7 +662,7 @@ def _large_head_module():
     itself; registered under its own name so a later `import unsloth` reuses it. None when absent or its private
     entry points (_fwd_impl / _bwd_impl) differ."""
     global _LH
-    if _LH is None:
+    if _LH is None and not torch.compiler.is_compiling():
         module = sys.modules.get(_LH_NAME)
         if module is None:
             try:
@@ -707,18 +707,18 @@ def _hfwd_op(q: torch.Tensor, kv: torch.Tensor, sink: torch.Tensor, scale: float
     lse = (lse2 * math.log(2.0)).transpose(1, 2)                                  # [b, s, h], natural log
     if has_sink:
         sink_ = sink.float().view(1, 1, h)
-        total = torch.logaddexp(lse, sink_)
-        out = (o.transpose(1, 2).float() * torch.exp(lse - total).unsqueeze(-1)).to(q.dtype)
+        total = torch.logaddexp(lse, sink_).contiguous()   # lse is a [b, h, s] buffer seen as [b, s, h]
+        out = (o.transpose(1, 2).float() * torch.exp(lse - total).unsqueeze(-1)).to(q.dtype).contiguous()
     else:
         total = lse.contiguous()
         out = o.transpose(1, 2).contiguous()
-    return out, total, lse2
+    return out, total, lse2.contiguous()
 
 
 @_hfwd_op.register_fake
 def _(q, kv, sink, scale, window, has_sink):
     b, s, h, d = q.shape
-    return (torch.empty_like(q), q.new_empty((b, s, h), dtype = torch.float32),
+    return (q.new_empty(q.shape), q.new_empty((b, s, h), dtype = torch.float32),
             q.new_empty((b, h, s), dtype = torch.float32))
 
 
@@ -730,13 +730,13 @@ def _hbwd_op(do_eff: torch.Tensor, q: torch.Tensor, kv: torch.Tensor, out: torch
     k = kv.unsqueeze(1)
     dq, dk, dv = _large_head_module()._bwd_impl(do_eff.transpose(1, 2), q.transpose(1, 2), k, k,
                                                 out.transpose(1, 2), lse2, lo, hi, float(scale))
-    dkv = (dk.float() + dv.float()).squeeze(1).to(kv.dtype)
+    dkv = (dk.float() + dv.float()).squeeze(1).to(kv.dtype).contiguous()
     return dq.transpose(1, 2).contiguous(), dkv
 
 
 @_hbwd_op.register_fake
 def _(do_eff, q, kv, out, lse2, scale, window):
-    return torch.empty_like(q), torch.empty_like(kv)
+    return q.new_empty(q.shape), kv.new_empty(kv.shape)
 
 
 def _hsetup_context(ctx, inputs, output):
@@ -769,5 +769,9 @@ def window_hd512_attention(q, window_kv, attn_sink, softmax_scale, window_size):
     has_sink = attn_sink is not None
     sink = attn_sink if has_sink else q.new_full((q.shape[2],), float("-inf"), dtype = torch.float32)
     out, _, _ = _hfwd_op(q.contiguous(), window_kv.contiguous(), sink, float(softmax_scale), int(window_size), has_sink)
-    SPARSE_MQA_STATS["hd512"] += 1
+    if not torch.compiler.is_compiling():
+        SPARSE_MQA_STATS["hd512"] += 1
     return out
+
+
+_large_head_module()   # resolve once at import: traced code then only reads the cached module

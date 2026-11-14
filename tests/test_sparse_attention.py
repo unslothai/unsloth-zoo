@@ -727,3 +727,71 @@ def test_cuda_window_only_layer_with_no_compressed_rows(monkeypatch, backend, wi
     for label, x, r, lo in list(zip(("out", "dq", "dwin", "dsink"), got, ref, low))[:4 if with_sink else 3]:
         err, base = (x.double() - r).abs().max().item(), (lo.double() - r).abs().max().item()
         assert err <= 2 * base + 4 * torch.finfo(dtype).eps * max(1.0, r.abs().max().item()), (backend, label, err, base)
+
+
+def _opcheck_cases():
+    if not _CUDA:
+        return []
+    from unsloth_zoo import sparse_mqa_kernel as mk
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    g = torch.Generator().manual_seed(11)
+    rnd = lambda *shape: (torch.randn(*shape, generator = g) * 0.5).cuda().to(dtype)
+    b, s, h, d, n, k = 1, 40, 4, 64, 30, 12
+    # q as a transposed view ([b, h, s, d] storage): outputs must still match the fake kernels' contiguous layout.
+    q = rnd(b, h, s, d).transpose(1, 2)
+    kv, wkv, ckv = rnd(b, n, d), rnd(b, s, d), rnd(b, n, d)
+    idx = _unique_idxs(b, s, k, n, 0.2, g).cuda()
+    sink = torch.randn(h, generator = g).cuda()
+    out, lse = mk._fwd_op(q, kv, idx, sink, d ** -0.5, True)
+    go, delta = rnd(b, s, h, d), torch.randn(b, s, h, generator = g).cuda()
+    cases = [
+        ("index_fwd", mk._fwd_op, (q, kv, idx, sink, d ** -0.5, True)),
+        ("index_bwd", mk._bwd_op, (q, kv, idx, go, lse, delta, d ** -0.5)),
+        ("window_fwd", mk._wfwd_op, (q, wkv, ckv, idx, sink, d ** -0.5, 8, True)),
+        ("window_bwd", mk._wbwd_op, (q, wkv, ckv, idx, go, lse, delta, d ** -0.5, 8)),
+    ]
+    q5 = rnd(b, h, s, 512).transpose(1, 2)
+    w5 = rnd(b, s, 512)
+    if mk.window_hd512_supported(q5, w5):
+        out5, total5, lse25 = mk._hfwd_op(q5, w5, sink, 512 ** -0.5, 8, True)
+        cases += [("hd512_fwd", mk._hfwd_op, (q5, w5, sink, 512 ** -0.5, 8, True)),
+                  ("hd512_bwd", mk._hbwd_op, (rnd(b, s, h, 512), q5, w5, out5, lse25, 512 ** -0.5, 8))]
+    return cases
+
+
+@pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
+@pytest.mark.parametrize("name,op,args", _opcheck_cases(), ids = [c[0] for c in _opcheck_cases()])
+def test_custom_op_opcheck(name, op, args):
+    # Schema, fake-tensor (shapes, dtypes and strides of the real outputs), autograd registration, AOT dispatch.
+    args = tuple(a.detach().requires_grad_() if isinstance(a, torch.Tensor) and a.is_floating_point() and name.endswith("fwd") else a
+                 for a in args)
+    torch.library.opcheck(op, args)
+
+
+@pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
+@pytest.mark.parametrize("with_sink", [True, False])
+def test_window_only_hd512_compiles_fullgraph(with_sink):
+    # DeepSeek window-only layer (head_dim 512, no compressed set) under torch.compile(fullgraph = True): the hd512
+    # path engages and the compiled forward + backward match eager.
+    from unsloth_zoo import sparse_mqa_kernel as mk
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    g = torch.Generator().manual_seed(12)
+    b, s, h, d, w = 1, 300, 16, 512, 128
+    q = (torch.randn(b, s, h, d, generator = g) * 0.5).cuda().to(dtype)
+    win = (torch.randn(b, s, d, generator = g) * 0.5).cuda().to(dtype)
+    sink = torch.randn(h, generator = g).cuda() if with_sink else torch.full((h,), float("-inf"), device = "cuda")
+    if not mk.window_hd512_supported(q, win):
+        pytest.skip("Unsloth's head_dim 512 kernel is not importable or does not fit here")
+    empty_kv, empty_idx = win.new_zeros(b, 0, d), torch.empty(b, s, 0, dtype = torch.int32, device = "cuda")
+    go = torch.randn(b, s, h, d, generator = g).cuda().to(dtype)
+
+    def layer(q, win, sink):
+        return sa.sparse_attn_window(q, win, empty_kv, empty_idx, sink, d ** -0.5, w)
+
+    torch._dynamo.reset()
+    calls = mk.SPARSE_MQA_STATS["hd512"]
+    eager = _grads(layer, q, win, sink, go)
+    assert mk.SPARSE_MQA_STATS["hd512"] == calls + 1
+    compiled = _grads(torch.compile(layer, fullgraph = True), q, win, sink, go)
+    for x, y in zip(compiled, eager):
+        torch.testing.assert_close(x.float(), y.float(), atol = 1e-2, rtol = 1e-2)
