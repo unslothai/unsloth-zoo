@@ -14,17 +14,28 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4.1 port training patches (temporary_patches/deepseek_v41.py), CPU only. Skipped without the port."""
+"""DeepSeek-V4.1 training patches (temporary_patches/deepseek_v41.py), CPU only, against every implementation on
+the path: the community transformers port and Unsloth's native module (tests/_dsv41_impl.py)."""
 
-import importlib.util
+import os
+import sys
 
 import pytest
 import torch
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _dsv41_impl import available  # noqa: E402
+
+IMPLS = available()
 pytestmark = pytest.mark.skipif(
-    importlib.util.find_spec("transformers.models.deepseek_v41") is None,
-    reason = "needs the DeepSeek-V4.1 transformers port (transformers.models.deepseek_v41)",
+    not IMPLS, reason = "needs a DeepSeek-V4.1 implementation (transformers port, or unsloth's native module)"
 )
+
+
+@pytest.fixture(params = IMPLS or [None], ids = lambda impl: getattr(impl, "name", "none"))
+def impl(request):
+    request.param.register()
+    return request.param
 
 
 def _patches():
@@ -38,9 +49,9 @@ def _patches():
     patch_deepseek_v41_grouped_lora()
 
 
-def _tiny_model(seed = 0):
-    from transformers.models.deepseek_v41.configuration_deepseek_v41 import DeepseekV41TextConfig
-    from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41ForCausalLM
+def _tiny_model(impl, seed = 0):
+    DeepseekV41TextConfig = impl.TextConfig
+    DeepseekV41ForCausalLM = impl.modeling.DeepseekV41ForCausalLM
 
     # Real schedule kinds: sliding-only, ratio-2 KV source, ratio-2 Reindex source, ratio-1 KV + candidate source,
     # ratio-1 index source using the candidates.
@@ -74,9 +85,11 @@ def _grads(model, ids, gradient_checkpointing):
     return out.loss.detach(), {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
 
 
-def test_fake_quant_straight_through():
+def test_fake_quant_straight_through(impl):
+    if impl.name != "port":
+        pytest.skip("the native module has no fake-quant sites (it trains dequantized or bnb weights)")
     _patches()
-    from transformers.models.deepseek_v41 import modeling_deepseek_v41 as modeling
+    modeling = impl.modeling
 
     torch.manual_seed(0)
     x = torch.randn(3, 64, dtype = torch.bfloat16)
@@ -90,12 +103,12 @@ def test_fake_quant_straight_through():
         assert torch.equal(leaf.grad, torch.full_like(leaf.grad, 1e-4))
 
 
-def test_gradient_checkpointing_replays_group_state():
+def test_gradient_checkpointing_replays_group_state(impl):
     _patches()
-    from transformers.models.deepseek_v41 import modeling_deepseek_v41 as modeling
+    modeling = impl.modeling
 
     assert modeling.DeepseekV41PreTrainedModel.supports_gradient_checkpointing
-    model = _tiny_model()
+    model = _tiny_model(impl)
     ids = torch.randint(0, 256, (2, 24), generator = torch.Generator().manual_seed(0))
     loss0, g0 = _grads(model, ids, False)
     loss1, g1 = _grads(model, ids, True)
@@ -108,13 +121,13 @@ def test_gradient_checkpointing_replays_group_state():
     assert zero == []
 
 
-def test_checkpointed_layers_keep_the_compile_stance(monkeypatch):
+def test_checkpointed_layers_keep_the_compile_stance(impl, monkeypatch):
     # The layers used to run under set_stance("force_eager"); with torch.compile on, a helper that also runs outside
     # the layers (the final norm, the mHC head) then ran compiled there and was skipped inside, and the recompute
     # check failed. Both passes now run with whatever stance the caller set.
     _patches()
     from torch._dynamo import eval_frame
-    from transformers.models.deepseek_v41 import modeling_deepseek_v41 as modeling
+    modeling = impl.modeling
 
     seen = []
     original = modeling.DeepseekV41RMSNorm.forward
@@ -124,7 +137,7 @@ def test_checkpointed_layers_keep_the_compile_stance(monkeypatch):
         return original(self, *args, **kwargs)
 
     monkeypatch.setattr(modeling.DeepseekV41RMSNorm, "forward", forward)
-    model = _tiny_model()
+    model = _tiny_model(impl)
     ids = torch.randint(0, 256, (2, 24), generator = torch.Generator().manual_seed(0))
     _grads(model, ids, True)
     assert seen and set(seen) == {"default"}
@@ -138,11 +151,11 @@ def test_prepare_compiled_checkpoint_specializes_floats(monkeypatch):
     assert torch._dynamo.config.specialize_float is True
 
 
-def test_grouped_lora_matches_merged_weight():
+def test_grouped_lora_matches_merged_weight(impl):
     _patches()
     from peft import LoraConfig, get_peft_model
 
-    model = _tiny_model()
+    model = _tiny_model(impl)
     ids = torch.randint(0, 256, (2, 16), generator = torch.Generator().manual_seed(1))
     peft_model = get_peft_model(
         model, LoraConfig(r = 4, lora_alpha = 8, target_modules = ["o_a_proj", "o_b_proj"], init_lora_weights = False)
@@ -166,11 +179,11 @@ def test_patches_are_noops_without_port(monkeypatch):
     patch_module.patch_deepseek_v41_grouped_lora()
 
 
-def test_auto_targets_cover_engram_and_skip_indexer():
+def test_auto_targets_cover_engram_and_skip_indexer(impl):
     import re
 
-    from transformers.models.deepseek_v41.configuration_deepseek_v41 import DeepseekV41TextConfig
-    from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41ForCausalLM
+    DeepseekV41TextConfig = impl.TextConfig
+    DeepseekV41ForCausalLM = impl.modeling.DeepseekV41ForCausalLM
 
     from unsloth_zoo.peft_utils import get_peft_regex
 
@@ -199,9 +212,10 @@ def test_auto_targets_cover_engram_and_skip_indexer():
     assert any(re.fullmatch(explicit, n) for n in linears if ".indexer." in n)
 
 
-def test_num_experts_alias_and_cpu_runtime_loads_the_patch():
-    from unsloth_zoo.temporary_patches.deepseek_v41 import patch_deepseek_v41_config_aliases
-    from transformers.models.deepseek_v41.configuration_deepseek_v41 import DeepseekV41TextConfig
+def test_num_experts_alias_and_cpu_runtime_loads_the_patch(impl):
+    from unsloth_zoo.temporary_patches.deepseek_v41 import TEMPORARY_PATCHES, patch_deepseek_v41_config_aliases
+
+    DeepseekV41TextConfig = impl.TextConfig
 
     patch_deepseek_v41_config_aliases()
     config = DeepseekV41TextConfig(n_routed_experts = 7, num_hidden_layers = 4, num_nextn_predict_layers = 0)
@@ -228,28 +242,30 @@ def test_num_experts_alias_and_cpu_runtime_loads_the_patch():
     finally:
         sys.modules.pop("_dsv41_standalone", None)
         sys.modules.pop("_dsv41_standalone.common", None)
-    assert len(common.TEMPORARY_PATCHES) == 4
+    registered = [f.__name__ for f in TEMPORARY_PATCHES if f.__module__.endswith("temporary_patches.deepseek_v41")]
+    assert [f.__name__ for f in common.TEMPORARY_PATCHES] == registered and len(registered) == 6
 
 
-def test_grouped_lora_defers_to_a_registered_custom_module():
+def test_grouped_lora_defers_to_a_registered_custom_module(impl):
     _patches()
     from peft import LoraConfig, get_peft_model
     from peft.tuners.lora.layer import Linear as LoraLinear
-    from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41GroupedLinear
+
+    DeepseekV41GroupedLinear = impl.modeling.DeepseekV41GroupedLinear
 
     class CallerGroupedLoRA(LoraLinear):
         pass
 
     config = LoraConfig(r = 4, lora_alpha = 8, target_modules = ["o_a_proj"])
     config._register_custom_module({DeepseekV41GroupedLinear: CallerGroupedLoRA})
-    peft_model = get_peft_model(_tiny_model(), config)
+    peft_model = get_peft_model(_tiny_model(impl), config)
     wrapped = [m for n, m in peft_model.named_modules() if n.endswith("self_attn.o_a_proj")]
     assert wrapped and all(type(m) is CallerGroupedLoRA for m in wrapped)
 
 
-def test_no_placement_bare_names_are_relative_to_no_split_modules():
-    from transformers.models.deepseek_v41.configuration_deepseek_v41 import DeepseekV41TextConfig
-    from transformers.models.deepseek_v41.modeling_deepseek_v41 import DeepseekV41ForCausalLM
+def test_no_placement_bare_names_are_relative_to_no_split_modules(impl):
+    DeepseekV41TextConfig = impl.TextConfig
+    DeepseekV41ForCausalLM = impl.modeling.DeepseekV41ForCausalLM
 
     from unsloth_zoo.device_map_planner import drop_no_placement_modules, no_placement_matcher
 
@@ -267,19 +283,24 @@ def test_no_placement_bare_names_are_relative_to_no_split_modules():
     assert model._no_placement_params == ["weight", "weight_scale_inv"]
     match = no_placement_matcher(model)
     hit = sorted(n for n, _ in model.named_parameters() if match(n))
-    # Only the engram table (a no-split DeepseekV41EngramEmbedding); a suffix match took every weight.
-    assert hit == ["model.engram_tables.1.weight", "model.engram_tables.1.weight_scale_inv"]
-    assert drop_no_placement_modules(model) == ["model.engram_tables.1"]
+    if impl.name == "native" and not any(True for _ in model.model.engram_tables["1"].parameters()):
+        # Unsloth's native tables hold no Parameter at all (unsloth_zoo's frozen table): nothing to place, and a
+        # suffix match must still not take every other weight.
+        assert hit == []
+    else:
+        # Only the engram table (a no-split DeepseekV41EngramEmbedding); a suffix match took every weight.
+        assert hit == ["model.engram_tables.1.weight", "model.engram_tables.1.weight_scale_inv"]
+        assert drop_no_placement_modules(model) == ["model.engram_tables.1"]
     # Dotted names (Qwen4Exp) keep the suffix match.
     dotted = no_placement_matcher(model, ["engram_tables.1.weight"])
     assert dotted("model.engram_tables.1.weight") and not dotted("lm_head.weight")
 
 
-def test_pooled_compressor_lora_is_applied_and_trains():
+def test_pooled_compressor_lora_is_applied_and_trains(impl):
     _patches()
     from peft import LoraConfig, get_peft_model
 
-    model = _tiny_model()
+    model = _tiny_model(impl)
     ids = torch.randint(0, 256, (2, 24), generator = torch.Generator().manual_seed(2))
     peft_model = get_peft_model(
         model,
@@ -291,7 +312,10 @@ def test_pooled_compressor_lora_is_applied_and_trains():
     # Layer 2 is the ratio-2 KV source (pooled, fp32 branch that reads `.weight`); before, its adapters got no grad.
     from unsloth_zoo.temporary_patches.deepseek_v41 import REPLAY_STATS
 
-    assert REPLAY_STATS["compressor_lora"] > 0
+    if impl.name == "port":
+        # The port's pooled branch reads `.weight` directly; the patch routes it through the adapters. The native
+        # compressor calls its Linears as modules, so the adapters apply without it.
+        assert REPLAY_STATS["compressor_lora"] > 0
     for name in ("kv_proj", "gate_proj"):
         grads = [p.grad for n, p in peft_model.named_parameters() if f"layers.2.self_attn.compressor.{name}.lora_" in n]
         assert grads and all(g is not None and g.abs().sum() > 0 for g in grads), name
@@ -302,7 +326,7 @@ def test_pooled_compressor_lora_is_applied_and_trains():
     torch.testing.assert_close(adapted, reference, rtol = 1e-4, atol = 1e-4)
 
 
-def test_gradient_checkpointing_keeps_shared_state_grads_under_a_reentrant_shim(monkeypatch):
+def test_gradient_checkpointing_keeps_shared_state_grads_under_a_reentrant_shim(impl, monkeypatch):
     """Unsloth's smart checkpointer replaces torch.utils.checkpoint.checkpoint with a reentrant one: the patched layer
     still checkpoints non-reentrantly, so the layers reading another layer's shared KV still send it gradient."""
     _patches()
@@ -311,7 +335,7 @@ def test_gradient_checkpointing_keeps_shared_state_grads_under_a_reentrant_shim(
     pristine = ckpt.checkpoint
     monkeypatch.setattr(ckpt, "_unsloth_pristine_checkpoint", pristine, raising = False)
     monkeypatch.setattr(ckpt, "checkpoint", lambda fn, *a, use_reentrant = None, **k: pristine(fn, *a, use_reentrant = True, **k))
-    model = _tiny_model()
+    model = _tiny_model(impl)
     ids = torch.randint(0, 256, (2, 24), generator = torch.Generator().manual_seed(0))
     loss0, g0 = _grads(model, ids, False)
     model.zero_grad(set_to_none = True)
