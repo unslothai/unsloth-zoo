@@ -179,14 +179,35 @@ def test_sparse_attention_matches_reference_forward_and_backward(monkeypatch, ki
         torch.testing.assert_close(x, y, **(tol if attn == "eager" else dict(rtol = 1e-9, atol = 1e-10)), msg = name)
 
 
-def test_below_budget_and_cache_and_kill_switch_keep_the_reference(monkeypatch):
+def test_empty_cache_prefill_is_sparse_and_fills_the_cache_like_the_reference(monkeypatch):
+    from transformers import DynamicCache
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")
+    config, attention, rotary = _module("sdpa")
+    hidden, pe = _inputs(1, 40, rotary)
+    mask = _masks("causal", 1, 40)
+    ours_cache, ref_cache = DynamicCache(config = config), DynamicCache(config = config)
+    with torch.no_grad():
+        ours = zoo_qwen4_exp._qwen4_exp_sparse_attention(attention, hidden, pe, mask, ours_cache, {})
+        selected = _selection_mask(sa.qsa_select_tokens(attention.indexer, hidden, pe, mask, modeling.apply_rotary_pos_emb), 40)
+        monkeypatch.setattr(attention.indexer, "forward", lambda h, p, m, c: (c.update_indexer(
+            attention.indexer.index_qk_proj(h)[..., -attention.indexer.index_head_dim:], 3), selected.unsqueeze(1))[1])
+        ref = _reference_forward()(attention, hidden, pe, mask, ref_cache)
+    assert ours is not None
+    torch.testing.assert_close(ours[0], ref[0], rtol = 1e-10, atol = 1e-10)
+    a, b = ours_cache.layers[3], ref_cache.layers[3]
+    for name in ("keys", "values", "indexer_keys"):
+        torch.testing.assert_close(getattr(a, name), getattr(b, name), rtol = 0, atol = 0, msg = name)
+    # A cache that already holds tokens (decode / chunked prefill) keeps the reference.
+    assert zoo_qwen4_exp._qwen4_exp_sparse_attention(attention, hidden, pe, mask, ours_cache, {}) is None
+
+
+def test_below_budget_and_kill_switch_keep_the_reference(monkeypatch):
     config, attention, rotary = _module()
     hidden, pe = _inputs(1, BUDGET + RATIO - 1, rotary)
     mask = _masks("causal", 1, BUDGET + RATIO - 1)
     assert zoo_qwen4_exp._qwen4_exp_sparse_attention(attention, hidden, pe, mask, None, {}) is None
     hidden, pe = _inputs(1, 40, rotary)
     mask = _masks("causal", 1, 40)
-    assert zoo_qwen4_exp._qwen4_exp_sparse_attention(attention, hidden, pe, mask, object(), {}) is None
     monkeypatch.setenv("UNSLOTH_QWEN4_EXP_SPARSE_ATTN", "0")
     assert zoo_qwen4_exp._qwen4_exp_sparse_attention(attention, hidden, pe, mask, None, {}) is None
 

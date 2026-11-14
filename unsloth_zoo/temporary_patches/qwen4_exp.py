@@ -75,8 +75,16 @@ def _sparse_attn_enabled():
 def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, attention_mask, past_key_values, kwargs):
     """transformers' Qwen4ExpTextAttention.forward (5.22 / 5.23) on the selected tokens only, or None to run it."""
     indexer = module.indexer
-    if not _sparse_attn_enabled() or past_key_values is not None or kwargs.get("output_attentions"):
+    if not _sparse_attn_enabled() or kwargs.get("output_attentions"):
         return None
+    # Prefill into an empty cache (transformers builds one during training too when use_cache is on) is the same
+    # attention; decode steps and chunked prefill over cached tokens keep the reference.
+    if past_key_values is not None:
+        try:
+            if past_key_values.get_seq_length(module.layer_idx) != 0:
+                return None
+        except Exception:
+            return None
     if not isinstance(attention_mask, torch.Tensor) or attention_mask.dim() != 4:
         return None
     seq = hidden_states.shape[1]
@@ -89,7 +97,8 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
     rope = sys.modules[type(module).__module__].apply_rotary_pos_emb
     position_embeddings = tuple(position_embeddings)
     with torch.no_grad():
-        selected = qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, rope)
+        selected = qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, rope,
+                                     past_key_values = past_key_values)
     if selected is None:
         return None
 
@@ -102,6 +111,8 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
     key_states = module.k_norm(module.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
     value_states = module.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     query_states, key_states = rope(query_states, key_states, cos, sin)
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(key_states, value_states, module.layer_idx)
     attn_output = sparse_gqa_attn(query_states, key_states, value_states, selected, module.scaling)
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = attn_output * torch.sigmoid(gate)

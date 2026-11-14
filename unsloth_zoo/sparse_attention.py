@@ -103,14 +103,15 @@ def _failure_key(backend, q, k):
     return (backend, q.device.type, q.device.index, q.dtype, q.shape[2], q.shape[3], k)
 
 
-def _order(q, k):
-    forced = _forced_backend()
+def _order(q, k, backend = None):
+    forced = backend if backend in _BACKENDS else _forced_backend()
     if forced is not None:
         return (forced,)
     order = []
     if _gather_eligible(q):
         order.append("gather")
-    if _flex_eligible(q):
+    # Flex is an eager fallback: it compiles flex_attention itself, which does not nest inside a traced region.
+    if _flex_eligible(q) and not torch.compiler.is_compiling():
         order.append("flex")
     order.append("torch")
     if torch.compiler.is_compiling():
@@ -265,14 +266,15 @@ def _check(q, kv, attn_sink, topk_idxs):
         raise ValueError(f"attn_sink must be [{q.shape[2]}], got {tuple(attn_sink.shape)}")
 
 
-def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
-    """q [b, s, h, d], kv [b, n, d], attn_sink [h], topk_idxs [b, s, k] int (-1 = unused) -> [b, s, h, d]."""
+def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, *, backend = None):
+    """q [b, s, h, d], kv [b, n, d], attn_sink [h], topk_idxs [b, s, k] int (-1 = unused) -> [b, s, h, d].
+    `backend` ("gather" / "flex" / "torch") pins one, like UNSLOTH_SPARSE_ATTN_BACKEND."""
     _check(q, kv, attn_sink, topk_idxs)
     k = topk_idxs.shape[-1]
     if k == 0:
         _count("torch")
         return q.new_zeros(q.shape) + 0 * q
-    order = _order(q, k)
+    order = _order(q, k, backend)
     for i, backend in enumerate(order):
         if torch.compiler.is_compiling() or i == len(order) - 1:
             out = _run(backend, q, kv, attn_sink, topk_idxs, softmax_scale)
@@ -313,7 +315,7 @@ def sparse_attn_window(q, window_kv, compress_kv, compress_idxs, attn_sink, soft
     return sparse_attn(q, kv, attn_sink, torch.cat([window, compressed], dim = -1), softmax_scale)
 
 
-def sparse_gqa_attn(query, key, value, topk_idxs, softmax_scale):
+def sparse_gqa_attn(query, key, value, topk_idxs, softmax_scale, *, backend = None):
     """Softmax attention of each query over its listed keys only (no sink), K != V, grouped-query heads.
 
     query [b, hq, s, dk], key [b, hk, n, dk], value [b, hk, n, dv], topk_idxs [b, s, K] shared by every head
@@ -329,7 +331,7 @@ def sparse_gqa_attn(query, key, value, topk_idxs, softmax_scale):
     kv = torch.cat([key, value], dim = -1).reshape(b * hk, key.shape[2], dk + dv)
     idxs = topk_idxs.repeat_interleave(hk, dim = 0) if hk > 1 else topk_idxs
     sink = torch.full((groups,), float("-inf"), device = query.device, dtype = torch.float32)
-    out = sparse_attn(q, kv, sink, idxs, softmax_scale)[..., dk:]                       # [b*hk, s, g, dv]
+    out = sparse_attn(q, kv, sink, idxs, softmax_scale, backend = backend)[..., dk:]    # [b*hk, s, g, dv]
     return out.reshape(b, hk, s, groups, dv).permute(0, 2, 1, 3, 4).reshape(b, s, hq, dv)
 
 
@@ -352,13 +354,15 @@ def _contiguous_rows(visible):
 
 @torch.compiler.disable
 def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, apply_rotary_pos_emb,
-                      query_chunk = 2048):
+                      query_chunk = 2048, past_key_values = None):
     """Vectorised transformers Qwen4ExpTextQSAIndexer selection (no cache): [b, s, K] token indices, -1 padded,
     the same set the reference's per-query loop keeps; None when the mask is not interval-shaped.
 
     Per query: its visible keys split into compress_ratio blocks from its first visible key; complete blocks are
     mean-pooled (fp32), k_layernorm-ed and rotated at their first token; scored by sum over index heads of
     relu(q . k) / sqrt(d); the top budget // ratio blocks plus the incomplete tail are kept.
+    `past_key_values` (an empty cache: prefill) receives the raw index keys as the reference indexer stores them,
+    only once the mask was accepted, so a None return never leaves the cache updated.
     """
     batch, seq, _ = hidden_states.shape
     ratio, top_blocks, dim = indexer.compress_ratio, indexer.block_topk, indexer.index_head_dim
@@ -376,6 +380,8 @@ def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mas
     q = indexer.q_layernorm(q.reshape(batch, seq, -1, dim))
     q = apply_rotary_pos_emb(q, cos = cos, sin = sin, unsqueeze_dim = 2)
     raw_keys = token_k.reshape(batch, seq, -1, dim).squeeze(2)
+    if past_key_values is not None:
+        raw_keys = past_key_values.update_indexer(raw_keys, indexer.layer_idx)
 
     positions = torch.arange(seq, device = hidden_states.device)
     arange_r = torch.arange(ratio, device = hidden_states.device)
