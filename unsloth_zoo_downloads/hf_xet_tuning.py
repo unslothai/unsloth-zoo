@@ -297,6 +297,12 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
+_AC_DOWNLOAD_KEYS = (
+    "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY",
+    "HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY",
+    "HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY",
+)
+
 # Dropped under a user's high-performance flag: xet-core >= 1.7 applies env after the preset, so a kept key beats it.
 _CAPS_VOIDED_BY_HIGH_PERFORMANCE = (
     "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT",
@@ -304,9 +310,7 @@ _CAPS_VOIDED_BY_HIGH_PERFORMANCE = (
     "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE",
     "HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER",
     "HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS",
-    "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY",
-    "HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY",
-    "HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY",
+    *_AC_DOWNLOAD_KEYS,
 )
 
 _FAIL_FAST_KEYS = (
@@ -448,17 +452,13 @@ def apply_xet_env(
         profile, throttled = throttled, fail_fast = fail_fast, cache_dir = cache_dir,
     )
 
-    # Primary AC variables shadow xet-core's fixed-concurrency alias. Stand down even with force=True, and remove
-    # unchanged values we seeded earlier (including those inherited by a child), while keeping explicit primaries.
+    # xet-core reads the fixed alias only for primaries left unset (aliases.rs), so ours stand down, even under force,
+    # and our unchanged seeded copies (also inherited by a child env) go; a user's explicit primary stays.
     if target.get("HF_XET_FIXED_DOWNLOAD_CONCURRENCY"):
-        for key in (
-            "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY",
-            "HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY",
-            "HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY",
-        ):
+        for key in _AC_DOWNLOAD_KEYS:
             overrides.pop(key, None)
             if key in _SEEDED_INTO_ENVIRON and target.get(key) == _SEEDED_INTO_ENVIRON[key]:
-                target.pop(key, None)
+                del target[key]
 
     # A user's high-performance flag keeps the headroom, so our caps are dropped rather than left alongside it; read it
     # as xet-core does (configuration_utils.rs get_high_performance_flag): HF_XET_HIGH_PERFORMANCE wins if set at all,

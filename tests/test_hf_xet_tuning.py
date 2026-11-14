@@ -583,6 +583,22 @@ def test_fixed_concurrency_removes_only_unchanged_seeded_primary_values(monkeypa
     assert env["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] == "128"
 
 
+def test_installed_xet_core_honours_the_fixed_alias_after_sizing(monkeypatch):
+    import os
+
+    hf_xet = pytest.importorskip("hf_xet")
+    if not hasattr(hf_xet, "XetConfig"):
+        pytest.skip("hf_xet without XetConfig")
+    for key in [k for k in os.environ if k.startswith("HF_XET_")]:
+        monkeypatch.delenv(key)
+    env = {"HF_XET_FIXED_DOWNLOAD_CONCURRENCY": "128"}
+    tuning.apply_xet_env(env, profile = _profile(16), force = True)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    config = hf_xet.XetConfig()
+    assert [config.get(f"client.ac_{b}_download_concurrency") for b in ("initial", "min", "max")] == [128] * 3
+
+
 def test_the_flag_is_read_the_way_xet_core_reads_it():
     """xet-core reads HF_XET_HP only when HF_XET_HIGH_PERFORMANCE is unset (configuration_utils.rs
     get_high_performance_flag), so an explicit 0 masks it; standing down over it leaves stock constants."""
