@@ -1135,7 +1135,8 @@ def _sample_sha256(f: "_MappedFile", loc: "TensorLocation") -> str:
 
 def _hub_identity(path: str) -> Tuple[Optional[str], Optional[str]]:
     """(repo id, revision) of a file inside a hub cache snapshot (.../models--org--name/snapshots/<rev>/...)."""
-    parts = os.path.abspath(path).split(os.sep)
+    # Both separators, whatever this host uses: a Windows path read on POSIX names the same snapshot.
+    parts = os.path.abspath(path).replace("\\", "/").split("/")
     for i, seg in enumerate(parts[:-2]):
         if seg.startswith("models--") and parts[i + 1] == "snapshots":
             return seg[len("models--"):].replace("--", "/"), parts[i + 2]

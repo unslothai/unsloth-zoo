@@ -1206,3 +1206,9 @@ def test_host_backed_gather_never_casts_ids_on_their_device(bf16_table):
         out = store.gather(ids.to("meta"), host_ids=ids)
     assert out.shape == (2, 2, 20) and casts == [], casts
     store.close()
+
+
+def test_provenance_reads_the_hub_repo_and_revision_from_a_windows_path():
+    """Finding 22: a provenance written on Windows (or a Windows path read on POSIX) names the same snapshot."""
+    path = r"C:\Users\me\.cache\huggingface\hub\models--org--Some-Model\snapshots\abc123\model-00001.safetensors"
+    assert fts._hub_identity(path) == ("org/Some-Model", "abc123")
