@@ -386,7 +386,7 @@ def test_messageless_pc_row_keeps_top_level_videos(monkeypatch):
     assert videos == [decoded]
 
 
-@pytest.mark.parametrize("model_type", ["glm4v", "ernie4_5_moe_vl"])
+@pytest.mark.parametrize("model_type", ["glm4v", "GLM4V", "ernie4_5_moe_vl"])
 def test_video_refused_for_families_whose_embedder_drops_videos(model_type):
     processor = _FakeVideoProcessor()
     processor._unsloth_model_type = model_type

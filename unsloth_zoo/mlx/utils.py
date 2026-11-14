@@ -9342,6 +9342,7 @@ def _processor_vlm_inputs(
         model_type = getattr(processor, "_unsloth_model_type", None) or getattr(
             processor, "model_type", None
         )
+        model_type = _mlx_vlm_canonical_model_type(model_type)
         if model_type in _VLM_TEXT_ONLY_EMBEDDER_MODEL_TYPES:
             raise ValueError(
                 f"Unsloth MLX: video training is not supported for {model_type} yet; "
