@@ -439,7 +439,9 @@ def test_messageless_pc_row_keeps_videos_beside_an_empty_images_column(monkeypat
     assert got_images == [] and len(videos) == 1 and kwargs == {"fps": [1.0]}
 
 
-@pytest.mark.parametrize("model_type,module", [("qwen3_vl", "qwen3_vl"), ("qwen3_5", "qwen3_5"), ("qwen2_5_vl", "qwen2_5_vl")])
+@pytest.mark.parametrize("model_type,module", [
+    ("qwen3_vl", "qwen3_vl"), ("qwen3_5", "qwen3_5"), ("prism_hadamard_qwen35", "qwen3_5"), ("qwen2_5_vl", "qwen2_5_vl"),
+])
 def test_video_positions_match_mlx_vlm_rope_index(model_type, module):
     """Qwen3 processors put a timestamp between temporal patches; positions must equal mlx-vlm's own."""
     import importlib
@@ -518,8 +520,11 @@ def test_decoded_frames_in_a_video_part_skip_the_decoder(monkeypatch):
     monkeypatch.setattr(vu, "fetch_video", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not decode")))
     frames = np.zeros((2, 4, 4, 3), dtype = np.uint8)
     messages = [{"role": "user", "content": [{"type": "video", "video": frames}, {"type": "text", "text": "q"}]}]
-    _, videos, _ = _extract_vlm_media({}, messages, None)
-    assert len(videos) == 1 and videos[0] is frames
+    _, videos, kwargs = _extract_vlm_media({}, messages, None)
+    assert len(videos) == 1 and videos[0] is frames and kwargs == {}
+    messages[0]["content"][0]["fps"] = 1.0
+    _, videos, kwargs = _extract_vlm_media({}, messages, None)
+    assert videos[0] is frames and kwargs == {"fps": [1.0]}
 
 
 def test_video_in_the_completion_half_is_refused():

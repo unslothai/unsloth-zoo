@@ -4282,8 +4282,10 @@ _VLM_WIDTH_PADDABLE_KEYS = {
 # Width-derived arrays generated AFTER width finalization (sequence axis last).
 _VLM_WIDTH_GENERATED_KEYS = ("position_ids",)
 # Model types whose position ids the position phase builds and rebuilds after planned padding; elsewhere ids are processor-authored, so the batch declines.
-# As mlx-vlm's get_rope_index for these families (qwen3_5_moe / qwen4_exp reuse qwen3_5's).
-_VLM_QWEN_FRAME_SPLIT_MODEL_TYPES = frozenset({"qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe", "qwen4_exp"})
+# As mlx-vlm's get_rope_index for these families (qwen3_5_moe / qwen4_exp / prism_hadamard_qwen35 reuse qwen3_5's).
+_VLM_QWEN_FRAME_SPLIT_MODEL_TYPES = frozenset({
+    "qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe", "qwen4_exp", "prism_hadamard_qwen35",
+})
 
 _VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
     "qwen2_vl",
@@ -7426,7 +7428,8 @@ def _extract_vlm_media(
                         if isinstance(video, (str, bytes, dict)):
                             videos.append({**part, "video": video})
                         elif video is not None:
-                            videos.append(video)  # already-decoded frames
+                            # Already-decoded frames: skip the decoder but keep the part's rate.
+                            videos.append({**part, "video": None, "_frames": video})
 
     if (
         not images
@@ -7469,7 +7472,11 @@ def _extract_vlm_media(
         decoded = []
         sampled_fps = list(video_kwargs.get("fps") or [])
         for video in videos:
-            if isinstance(video, (str, bytes, dict)):
+            if isinstance(video, dict) and "_frames" in video:
+                decoded.append(video["_frames"])
+                if video.get("fps") is not None:
+                    sampled_fps.append(float(video["fps"]))
+            elif isinstance(video, (str, bytes, dict)):
                 frames, fps = fetch_video(_video_element_dict(video), return_video_sample_fps=True)
                 decoded.append(frames)
                 sampled_fps.append(fps)
