@@ -161,8 +161,6 @@ def _build_cosmos3_shaped_base(tmp_path):
     from peft import LoraConfig, get_peft_model
 
     H.set_offline_cpu_env()
-    if not H.family_available("llama"):
-        pytest.skip("llama unavailable")
     base = str(tmp_path / "base")
     torch.manual_seed(H.SEED)
     AutoModelForCausalLM.from_config(H.make_spec("llama").config).to(torch.float32).save_pretrained(
