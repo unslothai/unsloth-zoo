@@ -774,7 +774,7 @@ def _read_video_torchvision(
             if "metadata_errors" not in str(exc):
                 raise
     if info is None:
-        # No torchvision, a torchvision without io.read_video (e.g. 0.29), or PyAV 19: same range via PyAV.
+        # No torchvision, no io.read_video (e.g. torchvision 0.29), or PyAV 19.
         video, info = _read_video_pyav(
             video_path, ele.get("video_start", 0.0), ele.get("video_end", None),
             sample=lambda total_frames, video_fps: _sample_frame_indices(ele, total_frames, video_fps),
@@ -936,7 +936,7 @@ def _resize_video(video: torch.Tensor, height: int, width: int) -> torch.Tensor:
         return transforms.functional.resize(
             video, [height, width], interpolation=InterpolationMode.BICUBIC, antialias=True,
         )
-    # torchvision's tensor resize for this case: float bicubic + antialias, then round and clamp back to the dtype.
+    # Bit-identical to torchvision's tensor resize: float bicubic + antialias, round, clamp.
     out = torch.nn.functional.interpolate(
         video.float(), size=(height, width), mode="bicubic", align_corners=False, antialias=True,
     )
@@ -961,11 +961,7 @@ def _module_available(name: str) -> bool:
 def _read_video_cv2(
     ele: dict,
 ) -> tuple[torch.Tensor, float]:
-    """Read video via OpenCV (a hard mlx-vlm dependency, so Apple Silicon always has it).
-
-    `ele` keys: video (path/file), video_start, video_end.
-    Returns a (T, C, H, W) uint8 tensor and the sample fps.
-    """
+    """(T, C, H, W) uint8 frames + sample fps via OpenCV, which mlx-vlm depends on (Apple Silicon has no other decoder)."""
     import cv2
 
     video_path = resolve_file_uri_to_path(ele["video"])

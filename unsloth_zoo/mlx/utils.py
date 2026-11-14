@@ -7320,8 +7320,6 @@ def _video_part_payload(part):
 
 
 def _video_element_dict(video):
-    """Build the fetch_video element dict: parts pass through with their
-    fps/nframes/pixel hints; {path, bytes} dicts decode via path; scalars wrap."""
     if isinstance(video, dict):
         if "video" in video:
             return video
@@ -7338,8 +7336,7 @@ def _extract_vlm_media(
     *,
     suppress_process_errors=False,
 ):
-    """Returns (images, videos, video_kwargs). Videos decode through
-    fetch_video/process_vision_info so processors get frame arrays, never paths."""
+    """Returns (images, videos, video_kwargs); videos are decoded frame arrays, never paths."""
     images = []
     videos = []
     video_kwargs = {}
@@ -7448,9 +7445,7 @@ def _extract_vlm_media(
         except Exception:
             if not suppress_process_errors:
                 raise
-            # Suppressed decode failures must not hand raw payloads to the
-            # processor: keep only what decoded, so a bad clip becomes an
-            # unpaired-placeholder error instead of corrupt video_metadata.
+            # Keep only decoded clips: a bad clip must fail as an unpaired placeholder, not corrupt video_metadata.
             videos = [
                 video for video in videos
                 if not isinstance(video, (str, bytes, dict))
@@ -7476,10 +7471,7 @@ def _extract_vlm_pc_media(item, prompt_messages, completion_messages, image_size
     """Extract VLM PC media with CUDA's embedded-then-top-level preference."""
     messages = (prompt_messages or []) + (completion_messages or [])
     if messages:
-        # When `images` is present the row-level item is hidden from image
-        # extraction (CUDA's embedded-then-top-level preference). Video keys
-        # have no recovery branch below, so they must stay visible or a bare
-        # placeholder would render an unexpanded video token with no clip.
+        # Hide the row's images (embedded-first preference) but not its videos: no branch below recovers those.
         if isinstance(item, dict) and item.get("images") is not None:
             item = {
                 key: value for key, value in item.items()
@@ -7509,8 +7501,7 @@ def _extract_vlm_pc_media(item, prompt_messages, completion_messages, image_size
         return _resize_vlm_images(images, image_size), [], {}
 
     if isinstance(item, dict) and ("videos" in item or "video" in item):
-        # Messageless rows still own their clips; promote `video` to the strong
-        # key so extraction does not wait on a placeholder that cannot exist.
+        # No messages means no placeholder, so the weak `video` key must count as `videos`.
         row = dict(item)
         if "videos" not in row and "video" in row:
             row["videos"] = row.pop("video")
@@ -9288,9 +9279,7 @@ def _processor_vlm_inputs(
                 f"Unsloth MLX: video training is not supported for {model_type} yet; "
                 "its MLX backbone drops `pixel_values_videos` on the floor."
             )
-        # Same shape the CUDA collator builds: per-row clip lists (empty rows
-        # dropped) plus a flat fps list that only counts when it aligns
-        # clip-for-clip, else the version-aware adapter falls back cleanly.
+        # As the CUDA collator: per-row clip lists, fps only when it aligns clip-for-clip.
         nested = [list(row) for row in all_videos if row]
         flat_fps = []
         aligned = True
@@ -9307,8 +9296,7 @@ def _processor_vlm_inputs(
         videos, video_proc_kwargs = video_processor_kwargs(
             processor, nested, flat_fps if aligned else [],
         )
-        # mlx-vlm iterates each element of `videos` as one clip, so the
-        # per-row grouping comes back out; transformers takes either shape.
+        # mlx-vlm treats each element of `videos` as one clip.
         videos = [video for row in videos for video in row]
     text_only = images is None and audio is None and videos is None and callable(tokenizer)
     if text_only:
@@ -9431,8 +9419,7 @@ def _processor_vlm_inputs(
 
     if audio_kwarg is None:
         inputs = _run_layouts()
-        # Nothing on the mlx side consumes these; as free-form floats/Mapping
-        # objects they only fracture compile families and defeat batch planning.
+        # Unused on MLX; as free-form floats/Mappings they fracture compile families.
         inputs.pop("second_per_grid_ts", None)
         inputs.pop("video_metadata", None)
         if text_only and "text_pair" in base_kwargs:
