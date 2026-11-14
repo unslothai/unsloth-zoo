@@ -27,8 +27,8 @@ os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
 from unsloth_zoo.temporary_patches import gdn_causal_conv1d as gcc  # noqa: E402
 
-_HAS_CUDA = torch.cuda.is_available() and getattr(torch.version, "hip", None) is None
-requires_cuda = pytest.mark.skipif(not _HAS_CUDA, reason = "needs a CUDA GPU")
+_HAS_CUDA = torch.cuda.is_available()
+requires_cuda = pytest.mark.skipif(not _HAS_CUDA, reason = "needs a CUDA or ROCm GPU")
 
 
 def _inputs(B, D, T, W, L, dtype, bias, seed = 0):
