@@ -397,3 +397,41 @@ def test_video_accepted_for_qwen_vl_stamp():
     processor._unsloth_model_type = "qwen2_5_vl"
     _processor_vlm_inputs(processor, ["t1"], [[]], 32, all_videos = [["clip-a"]])
     assert processor.seen["videos"] == ["clip-a"]
+
+
+def test_mixed_image_and_video_batch_is_refused():
+    processor = _FakeVideoProcessor()
+    with pytest.raises(ValueError, match = "cannot mix images and videos"):
+        _processor_vlm_inputs(
+            processor, ["t1", "t2"], [["img"], []], 32,
+            all_videos = [[], ["clip-a"]],
+        )
+
+
+def test_pc_video_decode_failure_is_raised_not_trained_as_text(monkeypatch):
+    import unsloth_zoo.vision_utils as vu
+
+    def broken(info, **kwargs):
+        raise FileNotFoundError(info["video"])
+
+    monkeypatch.setattr(vu, "fetch_video", broken)
+    prompt = [{"role": "user", "content": [{"type": "video", "video": "missing.mp4"}, {"type": "text", "text": "q"}]}]
+    completion = [{"role": "assistant", "content": [{"type": "text", "text": "a"}]}]
+    with pytest.raises(FileNotFoundError, match = "missing.mp4"):
+        _extract_vlm_pc_media({}, prompt, completion, None)
+
+
+def test_pc_bare_video_placeholder_without_a_clip_is_refused():
+    prompt = [{"role": "user", "content": [{"type": "video"}, {"type": "text", "text": "q"}]}]
+    with pytest.raises(ValueError, match = "video placeholder but no video"):
+        _extract_vlm_pc_media({}, prompt, [{"role": "assistant", "content": "a"}], None)
+
+
+@pytest.mark.parametrize("images", [None, []])
+def test_messageless_pc_row_keeps_videos_beside_an_empty_images_column(monkeypatch, images):
+    import unsloth_zoo.vision_utils as vu
+
+    decoded = np.zeros((2, 4, 4, 3), dtype = np.uint8)
+    monkeypatch.setattr(vu, "fetch_video", lambda info, **k: (decoded, 1.0))
+    got_images, videos, kwargs = _extract_vlm_pc_media({"images": images, "videos": ["clips/a.mp4"]}, None, None, None)
+    assert got_images == [] and len(videos) == 1 and kwargs == {"fps": [1.0]}

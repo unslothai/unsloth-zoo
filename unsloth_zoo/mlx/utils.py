@@ -7424,32 +7424,27 @@ def _extract_vlm_media(
                         video_kwargs = dict(extracted[2])
 
     if videos and any(isinstance(video, (str, bytes, dict)) for video in videos):
-        try:
-            from unsloth_zoo.vision_utils import fetch_video
+        # Never suppressed: a dropped clip would leave its placeholder to train as text.
+        from unsloth_zoo.vision_utils import fetch_video
 
-            decoded = []
-            sampled_fps = list(video_kwargs.get("fps") or [])
-            for video in videos:
-                if isinstance(video, (str, bytes, dict)):
-                    frames, fps = fetch_video(
-                        _video_element_dict(video),
-                        return_video_sample_fps=True,
-                    )
-                    decoded.append(frames)
-                    sampled_fps.append(fps)
-                else:
-                    decoded.append(video)
-            videos = decoded
-            if len(sampled_fps) == len(videos) and "fps" not in video_kwargs:
-                video_kwargs["fps"] = sampled_fps
-        except Exception:
-            if not suppress_process_errors:
-                raise
-            # Keep only decoded clips: a bad clip must fail as an unpaired placeholder, not corrupt video_metadata.
-            videos = [
-                video for video in videos
-                if not isinstance(video, (str, bytes, dict))
-            ]
+        decoded = []
+        sampled_fps = list(video_kwargs.get("fps") or [])
+        for video in videos:
+            if isinstance(video, (str, bytes, dict)):
+                frames, fps = fetch_video(_video_element_dict(video), return_video_sample_fps=True)
+                decoded.append(frames)
+                sampled_fps.append(fps)
+            else:
+                decoded.append(video)
+        videos = decoded
+        if len(sampled_fps) == len(videos) and "fps" not in video_kwargs:
+            video_kwargs["fps"] = sampled_fps
+
+    if has_video_parts and not videos:
+        raise ValueError(
+            "Unsloth MLX VLM: this row has a video placeholder but no video could be found or decoded. "
+            "Put the clip in the video part or a top-level `videos` column."
+        )
 
     return _resize_vlm_images(images, image_size), videos, video_kwargs
 
@@ -7484,7 +7479,10 @@ def _extract_vlm_pc_media(item, prompt_messages, completion_messages, image_size
             return images, videos, video_kwargs
         return [], [], {}
 
-    if isinstance(item, dict) and "images" in item:
+    if not isinstance(item, dict):
+        return [], [], {}
+    images = []
+    if "images" in item:
         try:
             from unsloth_zoo.vision_utils import process_vision_info
 
@@ -7498,16 +7496,12 @@ def _extract_vlm_pc_media(item, prompt_messages, completion_messages, image_size
                 images = [images]
         except Exception:
             images = []
-        return _resize_vlm_images(images, image_size), [], {}
-
-    if isinstance(item, dict) and ("videos" in item or "video" in item):
-        # No messages means no placeholder, so the weak `video` key must count as `videos`.
-        row = dict(item)
-        if "videos" not in row and "video" in row:
-            row["videos"] = row.pop("video")
-        return _extract_vlm_media(row, [], image_size)
-
-    return [], [], {}
+    videos, video_kwargs = [], {}
+    # No messages means no placeholder, so the weak `video` key counts as `videos`.
+    clips = item.get("videos") if item.get("videos") is not None else item.get("video")
+    if clips is not None:
+        _, videos, video_kwargs = _extract_vlm_media({"videos": clips}, [], image_size)
+    return _resize_vlm_images(images, image_size), videos, video_kwargs
 
 
 def _extract_vlm_pc_images(item, prompt_messages, completion_messages, image_size):
@@ -9298,6 +9292,12 @@ def _processor_vlm_inputs(
         )
         # mlx-vlm treats each element of `videos` as one clip.
         videos = [video for row in videos for video in row]
+        if any(all_images):
+            # The Qwen-VL embedders encode one stream per forward; the other's tokens would train as text.
+            raise ValueError(
+                "Unsloth MLX VLM: a batch cannot mix images and videos yet. Keep image and video rows "
+                "in separate datasets or batches."
+            )
     text_only = images is None and audio is None and videos is None and callable(tokenizer)
     if text_only:
         processor = tokenizer
