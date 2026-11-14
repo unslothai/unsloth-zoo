@@ -76,7 +76,7 @@ def test_matches_reference(B, D, T, W, L, dtype, bias, act):
         assert _rel(ours, ref) < 5e-3
         assert _rel(ours, oracle) <= max(1.25 * _rel(ref, oracle), 1e-3)
         if torch.version.hip is None:
-            # Bitwise agreement with CUDA torch's rounding order; ROCm is judged by the fp64 bounds only (0.69 on gfx1151).
+            # Bitwise agreement with CUDA torch's rounding order; ROCm is judged by the fp64 bounds only.
             assert (ours == ref).float().mean().item() > 0.7
 
 
