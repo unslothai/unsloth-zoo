@@ -556,6 +556,7 @@ jobs:
               tests/test_gemma3n_rmsnorm_with_scale.py \
               tests/test_mlx_gkd_guards.py \
               tests/test_output_collector_compile.py \
+              tests/test_cpu_loader_prequantized_checkpoint.py \
               -v
           }
           other_gates() {
