@@ -666,3 +666,28 @@ def test_qsa_gqa_dispatch_prefers_flex_where_it_compiles(monkeypatch, smem):
     for label, x, r, lo in zip(("out", "dq", "dk", "dv"), got, ref, low):
         err, base = (x.double() - r).abs().max().item(), (lo.double() - r).abs().max().item()
         assert err <= 2 * base + 4 * torch.finfo(dtype).eps * max(1.0, r.abs().max().item()), (want, label, err, base)
+
+
+@pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
+@pytest.mark.parametrize("backend", [None, "triton", "torch"] + (["gather"] if _gather_runs() else []))
+def test_cuda_window_only_layer_with_no_compressed_rows(monkeypatch, backend):
+    # DeepSeek window-only layers (compress_ratio 0) call sparse_attn_window with an empty compressed set:
+    # compress_kv [b, 0, d], compress_idxs [b, s, 0]. Every backend accepts it and matches the reference.
+    monkeypatch.delenv("UNSLOTH_SPARSE_ATTN_BACKEND", raising = False)
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    g = torch.Generator().manual_seed(9)
+    b, s, h, d, w = 1, 300, 16, 512, 128
+    q = (torch.randn(b, s, h, d, generator = g) * 0.5).cuda().to(dtype)
+    win = (torch.randn(b, s, d, generator = g) * 0.5).cuda().to(dtype)
+    sink = torch.randn(h, generator = g).cuda()
+    go = torch.randn(b, s, h, d, generator = g).cuda().to(dtype)
+    empty_kv, empty_idx = win.new_zeros(b, 0, d), torch.empty(b, s, 0, dtype = torch.int32, device = "cuda")
+    widx = sa.window_topk_idxs(s, w, b, "cuda")
+    got = _grads(lambda q, win, sink: sa.sparse_attn_window(q, win, empty_kv, empty_idx, sink, d ** -0.5, w, backend = backend),
+                 q, win, sink, go)
+    ref = _grads(lambda q, win, sink: sa.sparse_attn_reference(q, win, sink, widx, d ** -0.5),
+                 q.double(), win.double(), sink.double(), go.double())
+    low = _grads(lambda q, win, sink: sa.sparse_attn_reference(q, win, sink, widx, d ** -0.5), q, win, sink, go)
+    for label, x, r, lo in zip(("out", "dq", "dwin", "dsink"), got, ref, low):
+        err, base = (x.double() - r).abs().max().item(), (lo.double() - r).abs().max().item()
+        assert err <= 2 * base + 4 * torch.finfo(dtype).eps * max(1.0, r.abs().max().item()), (backend, label, err, base)
