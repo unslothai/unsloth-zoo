@@ -216,8 +216,6 @@ TEMPORARY_PATCHES.append(patch_mxfp4_quantizer_element_size)
 
 
 class _PackedExpertQuantizer:
-    """The load's quantizer, answering param_needs_quantization True: a packed expert stack is quantized."""
-
     def __init__(self, quantizer):
         self._quantizer = quantizer
 
@@ -229,13 +227,8 @@ class _PackedExpertQuantizer:
 
 
 def patch_mxfp4_packed_expert_shape_check():
-    """A kept-packed expert stack holds (E, N, G, 16) bytes where the module declares (E, K, N).
-
-    transformers <= 5.22 skipped set_param_for_module's shape check under any quantizer; 5.23 skips it only when
-    hf_quantizer.param_needs_quantization, which a dequantize=True load answers False for every key. The packed
-    stack then landed in mismatched_keys, the experts were re-initialised and the load raised
-    ("ignore_mismatched_sizes"). Only a stack whose logical shape is exactly the module's goes through.
-    """
+    """transformers 5.23 shape-checks unless param_needs_quantization (False under dequantize=True), so packed
+    (E, N, G, 16) experts hit mismatched_keys; let through only stacks whose logical shape matches the module."""
     try:
         import transformers.core_model_loading as core
     except Exception:

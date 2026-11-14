@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A kept-packed GPT-OSS expert stack must load into its module on transformers 5.23, whose
-set_param_for_module checks shapes unless hf_quantizer.param_needs_quantization says otherwise."""
+"""Kept-packed GPT-OSS experts must load on transformers 5.23's shape-checking set_param_for_module."""
 
 import os
 
@@ -34,7 +33,6 @@ from unsloth_zoo.temporary_patches import mxfp4 as zoo_mxfp4  # noqa: E402
 
 import inspect  # noqa: E402
 
-# 5.23+: the shape check runs under a quantizer unless param_needs_quantization; older ones skip it under any.
 _CHECKS_UNDER_QUANTIZER = "param_needs_quantization" in inspect.getsource(inspect.unwrap(core.set_param_for_module))
 _needs_check = pytest.mark.skipif(not _CHECKS_UNDER_QUANTIZER, reason = "this transformers skips the shape check under a quantizer")
 
@@ -54,8 +52,6 @@ class _Model(nn.Module):
 
 
 class _DequantizeQuantizer:
-    """A dequantize=True MXFP4 load: nothing needs quantization."""
-
     pre_quantized = True
 
     def param_needs_quantization(self, model, param_name, **kwargs):
@@ -83,7 +79,6 @@ def _load(setter, param):
 
 @_needs_check
 def test_the_stock_setter_rejects_a_packed_stack():
-    # Pins the 5.23 behaviour the patch exists for; a release that stops checking makes the patch a no-op.
     _, info = _load(inspect.unwrap(core.set_param_for_module), _packed())
     assert {key for key, *_ in info.mismatched_keys} == {"experts.gate_up_proj"}
 
