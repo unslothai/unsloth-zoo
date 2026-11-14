@@ -1134,15 +1134,15 @@ def test_cuda_resident_out_of_range_ids_raise_index_error_with_the_debug_check(b
 
     index, names, _ = bf16_table
     script = (
-        "import sys, torch\\n"
-        "from unsloth_zoo.frozen_table_store import FrozenTableStore\\n"
-        "dev = torch.device('cuda', 0)\\n"
-        f"store = FrozenTableStore.from_checkpoint({index!r}, {{'weight': {names!r}}}, mode='gpu', device=dev)\\n"
-        "try:\\n"
-        "    store.gather(torch.tensor([0, store.num_rows], device=dev)); torch.cuda.synchronize()\\n"
-        "except IndexError as e:\\n"
-        "    print('INDEXERROR', e)\\n"
-        "print('OK', store.gather(torch.tensor([1], device=dev)).shape)\\n"
+        "import sys, torch\n"
+        "from unsloth_zoo.frozen_table_store import FrozenTableStore\n"
+        "dev = torch.device('cuda', 0)\n"
+        f"store = FrozenTableStore.from_checkpoint({index!r}, {{'weight': {names!r}}}, mode='gpu', device=dev)\n"
+        "try:\n"
+        "    store.gather(torch.tensor([0, store.num_rows], device=dev)); torch.cuda.synchronize()\n"
+        "except IndexError as e:\n"
+        "    print('INDEXERROR', e)\n"
+        "print('OK', store.gather(torch.tensor([1], device=dev)).shape)\n"
     )
     env = dict(os.environ, UNSLOTH_FROZEN_TABLE_CHECK_IDS="1")
     out = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=300)
