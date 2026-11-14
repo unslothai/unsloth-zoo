@@ -3284,6 +3284,7 @@ from huggingface_hub import (
     get_torch_storage_size,
     get_torch_storage_id,
 )
+from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
 def get_torch_storage_size_new(x, element_size):
     if isinstance(x, LoraStats):
@@ -3307,29 +3308,24 @@ pass
 
 
 def _tied_tensor_key(x):
-    # Same memory, shape and strides: one tensor under two names (tied embeddings), written once. Views into a
-    # shared storage (Block Swap's arena) keep distinct keys, so this is not the shard splitter's storage id.
-    from torch.utils._python_dispatch import is_traceable_wrapper_subclass
+    # Tied embeddings are one tensor under two names and written once; views into a shared arena (Block Swap) are
+    # distinct tensors, so this cannot key on storage id like the shard splitter.
     if not isinstance(x, torch.Tensor) or x.is_meta or is_traceable_wrapper_subclass(x):
         return None
     try:
         ptr = x.data_ptr()
     except Exception:
         return None
-    if ptr == 0:
-        return None
-    return (str(x.device), ptr, x.dtype, tuple(x.shape), tuple(x.stride()))
+    return (str(x.device), ptr, x.dtype, tuple(x.shape), tuple(x.stride())) if ptr else None
 pass
 
 
 def _save_size_in_bytes(state_dict, element_size):
-    seen = set()
-    total = 0
+    seen, total = set(), 0
     for x in state_dict.values():
         key = _tied_tensor_key(x)
         if key is not None:
-            if key in seen:
-                continue
+            if key in seen: continue
             seen.add(key)
         total += get_torch_storage_size_new(x, element_size)
     return total
