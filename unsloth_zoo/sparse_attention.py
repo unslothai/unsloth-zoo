@@ -62,7 +62,12 @@ QSA_TIE_STATS = {"chunks": 0, "tied_rows": 0}
 
 
 def _exact_ties():
-    return os.environ.get("UNSLOTH_QWEN4_EXP_EXACT_TIES", "1") != "0"
+    """UNSLOTH_QWEN4_EXP_EXACT_TIES=1: rows whose k-th and (k+1)-th block scores tie are recomputed exactly as
+    transformers' indexer does (its matmul and topk over that row's candidates), so the kept tokens are the
+    reference's. Off by default: it needs a host sync per query chunk and one small topk per tied row (L4, medium
+    Qwen at 4k: ~300 tied rows per step, 756 vs 641 ms per step). Without it a tied row may keep a different,
+    equally-scored block (torch.topk's tie order is unspecified); the score multiset is the reference's."""
+    return os.environ.get("UNSLOTH_QWEN4_EXP_EXACT_TIES", "0") == "1"
 
 _BACKENDS = ("gather", "triton", "flex", "torch")
 _FAILED = {}
@@ -699,7 +704,8 @@ def _repair_boundary_ties(out, b, t0, scores, valid, k, q_rows, block_keys, star
 def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, apply_rotary_pos_emb,
                       query_chunk = 2048, past_key_values = None):
     """Vectorised transformers Qwen4ExpTextQSAIndexer selection (no cache): [b, s, K] token indices, -1 padded,
-    the same set the reference's per-query loop keeps; None when the mask is not interval-shaped.
+    the set the reference's per-query loop keeps (at a k-th / (k+1)-th score tie possibly another equally-scored
+    block, unless UNSLOTH_QWEN4_EXP_EXACT_TIES=1); None when the mask is not interval-shaped.
 
     Per query: its visible keys split into compress_ratio blocks from its first visible key; complete blocks are
     mean-pooled (fp32), k_layernorm-ed and rotated at their first token; scored by sum over index heads of

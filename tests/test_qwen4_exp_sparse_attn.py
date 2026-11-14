@@ -93,10 +93,13 @@ def _zero_index_keys(indexer):
             indexer.index_qk_proj.bias[indexer.index_n_heads * indexer.index_head_dim:] = 0
 
 
+@pytest.mark.parametrize("exact", [True, False], ids = ["exact_ties", "default"])
 @pytest.mark.parametrize("ties", [False, True], ids = ["random", "all_tied"])
 @pytest.mark.parametrize("kind", ["causal", "right_pad", "packed"])
-def test_vectorised_selection_equals_reference_loop(kind, ties):
-    # Token identity, not only scores: the same tokens as transformers' untouched per-query loop, ties included.
+def test_vectorised_selection_equals_reference_loop(monkeypatch, kind, ties, exact):
+    # UNSLOTH_QWEN4_EXP_EXACT_TIES=1: token identity with transformers' untouched per-query loop, ties included.
+    # Default (off): at a k-th / (k+1)-th score tie another, equally-scored block may be kept: same score multiset.
+    monkeypatch.setenv("UNSLOTH_QWEN4_EXP_EXACT_TIES", "1" if exact else "0")
     config, attention, rotary = _module()
     if ties:
         _zero_index_keys(attention.indexer)
@@ -112,7 +115,36 @@ def test_vectorised_selection_equals_reference_loop(kind, ties):
         ours = sa.qsa_select_tokens(attention.indexer, hidden, pe, float_mask, modeling.apply_rotary_pos_emb)
     assert ours is not None
     ours_mask, ref_mask = _selection_mask(ours, s), ref[:, 0] & mask[:, 0]
-    torch.testing.assert_close(ours_mask, ref_mask, rtol = 0, atol = 0)
+    if exact:
+        torch.testing.assert_close(ours_mask, ref_mask, rtol = 0, atol = 0)
+        return
+    for b_i, t in (ours_mask != ref_mask).any(-1).nonzero().tolist():
+        scores = _block_scores(attention.indexer, hidden, pe, mask[b_i, 0, t], b_i, t)
+
+        def picked(m):
+            return sorted(round(v, 9) for start, v in scores.items() if bool(m[b_i, t, start]))
+        assert picked(ours_mask) == picked(ref_mask), (b_i, t)
+        # Tails (the incomplete last block) are always identical.
+        assert ours_mask[b_i, t].sum() == ref_mask[b_i, t].sum()
+
+
+def _block_scores(indexer, hidden, pe, visible_row, b_i, t):
+    """Reference math for one query: {block start: score}."""
+    import math
+    full_cos, full_sin = pe
+    qk = indexer.index_qk_proj(hidden)
+    d = indexer.index_head_dim
+    q, k = torch.split(qk, [indexer.index_n_heads * d, d], dim = -1)
+    q = indexer.q_layernorm(q.reshape(*hidden.shape[:2], -1, d))
+    q = modeling.apply_rotary_pos_emb(q, cos = full_cos, sin = full_sin, unsqueeze_dim = 2)
+    vis = visible_row.nonzero().flatten()
+    nb = vis.numel() // RATIO
+    blocks = vis[: nb * RATIO].view(nb, RATIO)
+    pooled = indexer.k_layernorm(k[b_i].index_select(0, blocks.flatten()).view(nb, RATIO, d).float().mean(1).to(k.dtype))
+    keys = modeling.apply_rotary_pos_emb(pooled.unsqueeze(1), cos = full_cos[b_i, blocks[:, 0]], sin = full_sin[b_i, blocks[:, 0]]).squeeze(1)
+    sc = torch.relu(torch.matmul(q[b_i, t].float(), keys.float().T).T).sum(-1) / math.sqrt(d)
+    return {int(st): float(v) for st, v in zip(blocks[:, 0], sc)}
+
 
 
 def test_sliding_window_mask_is_not_taken():
@@ -127,6 +159,7 @@ def test_sliding_window_mask_is_not_taken():
 @pytest.mark.parametrize("attn", ["eager", "sdpa"])
 def test_sparse_attention_matches_reference_forward_and_backward(monkeypatch, kind, attn):
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")
+    monkeypatch.setenv("UNSLOTH_QWEN4_EXP_EXACT_TIES", "1")   # the untouched reference's own selection, ties included
     config, attention, rotary = _module(attn)
     b, s = 2, 61
     hidden, pe = _inputs(b, s, rotary)
