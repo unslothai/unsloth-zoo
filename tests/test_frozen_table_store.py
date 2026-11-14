@@ -1178,3 +1178,31 @@ def test_memo_keeps_one_entry_unless_asked_for_more(monkeypatch):
     sizes its own with set_frozen_table_memo_slots."""
     monkeypatch.delenv("UNSLOTH_FROZEN_TABLE_MEMO_SLOTS", raising=False)
     assert UnslothFrozenTableEmbedding(4, 2).memo_slots == 1
+
+
+def test_host_backed_gather_never_casts_ids_on_their_device(bf16_table):
+    """Finding 20: with a host copy of the ids (or none yet) the int64 widening happens on the host; an
+    accelerator never allocates an unused int64 copy of the ids ("meta" stands in for one here)."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    index, names, full = bf16_table
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk")
+    casts = []
+
+    class Record(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            src = args[0] if args else None
+            if (
+                isinstance(src, torch.Tensor) and src.device.type == "meta" and src.dtype == torch.int32
+                and kwargs.get("dtype", args[1] if len(args) > 1 and isinstance(args[1], torch.dtype) else None)
+                == torch.int64
+            ):
+                casts.append(func)
+            return func(*args, **kwargs)
+
+    ids = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    with Record():
+        out = store.gather(ids.to("meta"), host_ids=ids)
+    assert out.shape == (2, 2, 20) and casts == [], casts
+    store.close()

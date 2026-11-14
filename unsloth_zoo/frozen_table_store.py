@@ -845,12 +845,12 @@ class FrozenTableStore:
         if ids.is_floating_point() or ids.is_complex():
             raise TypeError("Unsloth: frozen table ids must be integers.")
         device = ids.device
-        flat = ids.reshape(-1).long()
+        flat = ids.reshape(-1)  # widened to int64 where it is used: on the device only for a resident table
         if flat.numel() == 0:
             dec = self.decode({k: torch.empty((0, p.row_bytes), dtype=torch.uint8, device=device) for k, p in self.planes.items()}, dtype)
             return dec.reshape(*ids.shape, *dec.shape[1:])
         if self.resident_on(device):
-            return self._gather_resident(ids, flat, dtype)
+            return self._gather_resident(ids, flat.long(), dtype)
         # Host reads need the ids on the host: one device-to-host copy, then unique / range check run on the CPU
         # (a device unique would block once for its output size and again for the copy of the unique ids).
         if host_ids is not None:
@@ -866,7 +866,7 @@ class FrozenTableStore:
                 )
             host = host_ids.reshape(-1).long()
         else:
-            host = flat.cpu() if flat.device.type != "cpu" else flat
+            host = (flat.cpu() if flat.device.type != "cpu" else flat).long()
         uniq_cpu, inv = torch.unique(host, sorted=True, return_inverse=True)
         lo, hi = int(uniq_cpu[0]), int(uniq_cpu[-1])
         if lo < 0 or hi >= self.num_rows:
