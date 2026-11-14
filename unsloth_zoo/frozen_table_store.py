@@ -840,6 +840,16 @@ class FrozenTableStore:
         # Host reads need the ids on the host: one device-to-host copy, then unique / range check run on the CPU
         # (a device unique would block once for its output size and again for the copy of the unique ids).
         if host_ids is not None:
+            if (
+                not isinstance(host_ids, torch.Tensor) or host_ids.device.type != "cpu"
+                or host_ids.is_floating_point() or host_ids.is_complex() or host_ids.dtype == torch.bool
+                or tuple(host_ids.shape) != tuple(ids.shape)
+            ):
+                raise ValueError(
+                    f"Unsloth: host_ids must be a CPU integer copy of ids {tuple(ids.shape)}, got "
+                    f"{getattr(host_ids, 'dtype', type(host_ids))} {tuple(getattr(host_ids, 'shape', ()))} on "
+                    f"{getattr(host_ids, 'device', '?')}."
+                )
             host = host_ids.reshape(-1).long()
         else:
             host = flat.cpu() if flat.device.type != "cpu" else flat

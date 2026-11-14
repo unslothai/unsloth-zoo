@@ -1069,3 +1069,15 @@ def test_provenance_header_digest_refuses_an_implausible_or_short_header(tmp_pat
                 fts._header_sha256(mapped)
         finally:
             mapped.close()
+
+
+def test_gather_refuses_host_ids_that_are_not_a_cpu_integer_copy_of_ids(bf16_table):
+    """Findings 5 / 9 / 12: host_ids stands in for ids on the host, so anything else would read other rows."""
+    index, names, full = bf16_table
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk")
+    ids = torch.tensor([[1, 2], [3, 4]])
+    assert torch.equal(store.gather(ids, host_ids=ids.clone()), F.embedding(ids, full))
+    for bad in (torch.tensor([1, 2, 3, 4]), torch.tensor([[1, 2, 3, 4]]), ids.float(), ids.to("meta")):
+        with pytest.raises((TypeError, ValueError), match="host_ids"):
+            store.gather(ids, host_ids=bad)
+    store.close()
