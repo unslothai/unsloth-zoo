@@ -75,6 +75,7 @@ FROZEN_TABLE_STATS = {
     "unique_rows": 0,
     "memo_hits": 0,
     "bytes_read_est": 0,
+    "resident_gathers": 0,
 }
 _STATS_LOCK = threading.Lock()
 _STEP = [0]
@@ -714,8 +715,29 @@ class FrozenTableStore:
             self._staging_event = ev
         return out
 
-    def gather(self, ids: torch.Tensor, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        """Rows for ``ids`` (any shape, integer) on ``ids.device``: shape ``ids.shape + row shape``."""
+    def resident_on(self, device: torch.device) -> bool:
+        """Every plane already sits on ``device`` (gpu mode): lookups need neither host ids nor a host round trip."""
+        dev = self._device_planes
+        return len(dev) == len(self.planes) and len(dev) > 0 and all(t.device == device for t in dev.values())
+
+    def _gather_resident(self, ids: torch.Tensor, flat: torch.Tensor, dtype: Optional[torch.dtype]) -> torch.Tensor:
+        # No unique / .cpu() / int(): each of those blocks the host on the device per lookup, which stalls pipeline
+        # schedules and every captured or compiled region around the lookup. Row decode is per row, so decoding the
+        # rows in id order equals decoding the unique rows and scattering them back.
+        if flat.device.type == "cpu":
+            lo, hi = int(flat.min()), int(flat.max())
+            if lo < 0 or hi >= self.num_rows:
+                raise IndexError(f"Unsloth: frozen table id out of range [{lo}, {hi}] for {self.num_rows} rows.")
+        # On an accelerator index_select bounds-checks on the device (a device-side assert) instead.
+        raw = {name: plane.index_select(0, flat) for name, plane in self._device_planes.items()}
+        rows = self.decode(raw, dtype)
+        _bump(gathers=1, rows=flat.numel(), resident_gathers=1)
+        return rows.reshape(*ids.shape, *rows.shape[1:])
+
+    def gather(self, ids: torch.Tensor, dtype: Optional[torch.dtype] = None,
+               host_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Rows for ``ids`` (any shape, integer) on ``ids.device``: shape ``ids.shape + row shape``. ``host_ids`` is
+        an optional CPU copy of ``ids`` the caller already made (saves the one device-to-host copy)."""
         if ids.is_floating_point() or ids.is_complex():
             raise TypeError("Unsloth: frozen table ids must be integers.")
         device = ids.device
@@ -723,14 +745,21 @@ class FrozenTableStore:
         if flat.numel() == 0:
             dec = self.decode({k: torch.empty((0, p.row_bytes), dtype=torch.uint8, device=device) for k, p in self.planes.items()}, dtype)
             return dec.reshape(*ids.shape, *dec.shape[1:])
-        uniq, inv = torch.unique(flat, sorted=True, return_inverse=True)
-        uniq_cpu = uniq.cpu() if uniq.device.type != "cpu" else uniq
+        if self.resident_on(device):
+            return self._gather_resident(ids, flat, dtype)
+        # Host reads need the ids on the host: one device-to-host copy, then unique / range check run on the CPU
+        # (a device unique would block once for its output size and again for the copy of the unique ids).
+        if host_ids is not None:
+            host = host_ids.reshape(-1).long()
+        else:
+            host = flat.cpu() if flat.device.type != "cpu" else flat
+        uniq_cpu, inv = torch.unique(host, sorted=True, return_inverse=True)
         lo, hi = int(uniq_cpu[0]), int(uniq_cpu[-1])
         if lo < 0 or hi >= self.num_rows:
             raise IndexError(f"Unsloth: frozen table id out of range [{lo}, {hi}] for {self.num_rows} rows.")
         raw = self.gather_raw_unique(uniq_cpu, device)
         rows = self.decode(raw, dtype)
-        out = rows.index_select(0, inv.to(rows.device))
+        out = rows.index_select(0, inv.to(rows.device, non_blocking=True))
         _bump(gathers=1, rows=flat.numel(), unique_rows=uniq_cpu.numel(),
               bytes_read_est=0 if self._device_planes else uniq_cpu.numel() * self.row_bytes)
         return out.reshape(*ids.shape, *rows.shape[1:])
@@ -863,25 +892,35 @@ class UnslothFrozenTableEmbedding(nn.Module):
                 "unsloth_zoo.frozen_table_store.bind_frozen_tables(model, checkpoint) after loading, "
                 "or set UNSLOTH_FROZEN_TABLE=gpu to load it as a normal embedding."
             )
-        if ids.is_inference():
-            # Inference tensors carry no version counter, and there is no checkpoint recompute to serve.
+        if ids.is_inference() or store.resident_on(ids.device):
+            # Inference tensors carry no version counter, and there is no checkpoint recompute to serve. A resident
+            # table re-gathers on the device for less than the memo's own equality check (a host sync on CUDA).
             with torch.no_grad():
                 return store.gather(ids, dtype=self.table_dtype)
         step = _STEP[0]
         key = (ids.data_ptr(), ids._version, tuple(ids.shape), tuple(ids.stride()), ids.device, step, self.table_dtype,
                ids.dtype)
         memo = self._memo
+        # The key alone vouches for the values only through the version counter, which writes through ``.data`` or
+        # a numpy view of a reused ids buffer do not bump. On the host the value check is free of syncs, so CPU ids
+        # always take it; accelerator ids trust the key (no host copy for a recompute of the same ids tensor).
+        if memo is not None and memo[2] == key and ids.device.type != "cpu":
+            _bump(memo_hits=1)
+            return memo[3]
+        # The rows are read on the host, so the ids go there once: the memo's value check and the gather share that
+        # copy (one host sync per lookup on an accelerator, none for a recompute that hands back the same tensor).
+        host = ids.detach().cpu() if ids.device.type != "cpu" else None
         if memo is not None:
             m_ids, m_snapshot, m_key, m_rows = memo
-            if m_key == key or (
+            if (
                 m_key[2] == key[2] and m_key[4] == key[4] and m_key[5] == step and m_key[6] == key[6]
-                and m_key[7] == key[7] and torch.equal(m_snapshot, ids)
+                and m_key[7] == key[7] and torch.equal(m_snapshot, ids if host is None else host)
             ):
                 _bump(memo_hits=1)
                 return m_rows
         with torch.no_grad():
-            rows = store.gather(ids, dtype=self.table_dtype)
-            snapshot = ids.detach().clone()
+            rows = store.gather(ids, dtype=self.table_dtype, host_ids=host)
+            snapshot = ids.detach().clone() if host is None else host
         # Hold ids (no other tensor can take its address while the key names it) and a snapshot of its values
         # (an in-place update of ids must not make the equality check compare the tensor with itself).
         self._memo = (ids, snapshot, key, rows)

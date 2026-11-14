@@ -701,3 +701,111 @@ def test_tiny_qwen4_fp8_disk_load_matches_fp8_embedding(tiny_qwen4_fp8, monkeypa
         for mode in ("gpu", "disk"):
             got = _load(str(out), mode, monkeypatch, torch.bfloat16)(input_ids=x).logits
             assert torch.equal(got, want), mode
+
+
+def test_resident_table_gathers_without_unique_or_memo(bf16_table):
+    """gpu mode keeps the planes next to the ids: lookups index them directly (no unique, no host ids) and skip the
+    memo, whose snapshot equality would cost more than the gather it saves."""
+    index, names, full = bf16_table
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="gpu", device=torch.device("cpu"))
+    assert store.resident_on(torch.device("cpu"))
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(store)
+    proj = torch.nn.Linear(20, 3)
+    tokens = torch.randint(0, 50, (2, 7))
+
+    def block(x):
+        return proj(emb((tokens * 3 + 1) % full.shape[0]) * x).sum()
+
+    x = torch.ones(2, 7, 20, requires_grad=True)
+    reset_frozen_table_stats()
+    torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False).backward()
+    ref_rows = F.embedding((tokens * 3 + 1) % full.shape[0], full.float())
+    assert torch.allclose(x.grad, ref_rows * proj.weight.sum(0))
+    assert FROZEN_TABLE_STATS["resident_gathers"] == FROZEN_TABLE_STATS["gathers"] == 2
+    assert FROZEN_TABLE_STATS["memo_hits"] == 0 and emb._memo is None
+    assert FROZEN_TABLE_STATS["unique_rows"] == 0
+    for ids in _ids_with_edges(full):
+        assert torch.equal(store.gather(ids), F.embedding(ids, full))
+    store.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("dtype", [None, torch.float32])
+def test_resident_cuda_lookup_never_syncs_the_host(bf16_table, dtype):
+    index, names, full = bf16_table
+    dev = torch.device("cuda", torch.cuda.current_device())
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="gpu", device=dev)
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(store)
+    ids = torch.randint(0, full.shape[0], (4, 33), device=dev)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        got = store.gather(ids, dtype=dtype)
+        a = emb(ids)
+        b = emb(ids.clone())  # a memo would compare the clone with its snapshot on the host
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+    ref = F.embedding(ids.cpu(), full)
+    assert torch.equal(got.cpu(), ref if dtype is None else ref.to(dtype))
+    assert torch.equal(a.cpu(), ref.float()) and torch.equal(b.cpu(), ref.float())
+    store.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("mode", ["ram", "disk"])
+def test_host_table_cuda_lookup_syncs_once(bf16_table, mode):
+    """Host-read tables need the ids on the host: exactly one copy per lookup (unique, range check and the memo's
+    value check all run on it), and none for a checkpoint recompute that hands back the same ids tensor."""
+    import warnings
+
+    index, names, full = bf16_table
+    dev = torch.device("cuda", torch.cuda.current_device())
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode=mode))
+    ids = torch.randint(0, full.shape[0], (4, 33), device=dev)
+    other = (ids + 1) % full.shape[0]
+    torch.cuda.synchronize()
+
+    def syncs(fn):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            torch.cuda.set_sync_debug_mode("warn")
+            try:
+                out = fn()
+            finally:
+                torch.cuda.set_sync_debug_mode(0)
+        return out, sum("synchroniz" in str(w.message) for w in caught)
+
+    a, n_new = syncs(lambda: emb(ids))
+    _, n_same = syncs(lambda: emb(ids))
+    _, n_clone = syncs(lambda: emb(ids.clone()))
+    b, n_other = syncs(lambda: emb(other))
+    assert (n_new, n_same, n_clone, n_other) == (1, 0, 1, 1)
+    ref = full.float()
+    assert torch.equal(a.cpu(), F.embedding(ids.cpu(), ref)) and torch.equal(b.cpu(), F.embedding(other.cpu(), ref))
+    emb.frozen_table_store.close()
+
+
+def test_memo_sees_a_reused_cpu_ids_buffer_rewritten_without_a_version_bump(bf16_table):
+    """A prefetched ids buffer refilled per micro-batch through numpy or ``.data`` keeps its address, shape and
+    version: the memo must compare values, not trust the key."""
+    index, names, full = bf16_table
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk"))
+    ref = full.float()
+    buf = torch.tensor([[1, 2, 3]])
+    first = emb(buf)
+    assert torch.equal(first, F.embedding(buf, ref))
+    version = buf._version
+    buf.numpy()[:] = [[40, 41, 42]]
+    assert buf._version == version
+    assert torch.equal(emb(buf), F.embedding(buf, ref))
+    buf.data.copy_(torch.tensor([[5, 5, 6]]))
+    assert buf._version == version
+    assert torch.equal(emb(buf), F.embedding(buf, ref))
+    reset_frozen_table_stats()
+    assert torch.equal(emb(buf), F.embedding(buf, ref))  # unchanged values still hit the memo
+    assert FROZEN_TABLE_STATS["memo_hits"] == 1
+    emb.frozen_table_store.close()
