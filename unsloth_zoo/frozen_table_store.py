@@ -1123,9 +1123,9 @@ def frozen_table_provenance(model: nn.Module) -> Optional[dict]:
     write this next to the adapter, so a reload can check it runs on the same base tables."""
     tables = {}
     for name, module in iter_frozen_table_modules(model):
-        store = module.frozen_table_store
-        if store is not None:
-            tables[_table_key(name)] = store.provenance()
+        describe = getattr(module.frozen_table_store, "provenance", None)
+        if callable(describe):  # a table held in memory (built from tensors) has no checkpoint to describe
+            tables[_table_key(name)] = describe()
     if not tables:
         return None
     return {"format": "unsloth_frozen_tables", "version": 1, "tables": tables}

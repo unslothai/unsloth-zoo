@@ -915,8 +915,11 @@ def test_provenance_matches_the_same_table_and_catches_another(bf16_table, tmp_p
     changed = FrozenTableStore.from_checkpoint(str(other / os.path.basename(index)), {"weight": names}, mode="disk")
     problems = fts.compare_frozen_table_provenance(saved, fts.frozen_table_provenance(_model_with(changed)))
     assert problems == [f"ngram: {names[1]} contents differ from the saved base table"], problems
-    # no table bound at all
+    # no table bound at all, or only tables held in memory (no checkpoint behind them)
     assert fts.frozen_table_provenance(torch.nn.Linear(2, 2)) is None
+    in_memory = UnslothFrozenTableEmbedding(4, 20)
+    in_memory.frozen_table_store = object()
+    assert fts.frozen_table_provenance(torch.nn.ModuleDict({"t": in_memory})) is None
     assert fts.compare_frozen_table_provenance(saved, None) == ["ngram: no such frozen table bound in this model"]
     for s in (store, again, changed):
         s.close()
