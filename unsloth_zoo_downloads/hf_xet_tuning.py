@@ -501,9 +501,11 @@ def resize_for_cache_dir(
     call's."""
     if throttled is None:
         throttled = _SEEDED_THROTTLED
-    for key, value in _SEEDED_INTO_ENVIRON.items():
+    for key, value in list(_SEEDED_INTO_ENVIRON.items()):
         if env.get(key) == value:
             env.pop(key, None)
+            if env is os.environ:
+                del _SEEDED_INTO_ENVIRON[key]
     return apply_xet_env(env, fail_fast = fail_fast, cache_dir = cache_dir, throttled = throttled)
 
 

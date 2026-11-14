@@ -611,6 +611,20 @@ def test_a_primary_set_after_the_seeds_were_cleared_is_kept(monkeypatch):
     assert os.environ["HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY"] == "1"
 
 
+def test_a_primary_set_after_a_resize_cleared_the_seeds_is_kept(monkeypatch):
+    import os
+
+    monkeypatch.setattr(os, "environ", {})
+    monkeypatch.setattr(tuning, "_SEEDED_INTO_ENVIRON", {})
+    monkeypatch.setattr(tuning, "system_profile", lambda _cache_dir = None: _profile(16))
+    tuning.apply_xet_env()
+    os.environ["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] = "128"
+    tuning.resize_for_cache_dir(os.environ, None)
+    os.environ["HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY"] = "1"
+    tuning.apply_xet_env()
+    assert os.environ["HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY"] == "1"
+
+
 def test_installed_xet_core_honours_the_fixed_alias_after_sizing():
     import os
     import subprocess
