@@ -91,10 +91,11 @@ _STEP_STATS = {"memo_hits": 0, "memo_misses": 0}
 
 
 def _default_memo_slots() -> int:
+    # One entry, the memory a table always used; pipeline parallel sets its in-flight count itself.
     try:
-        return max(1, int(os.environ.get("UNSLOTH_FROZEN_TABLE_MEMO_SLOTS", "2")))
+        return max(1, int(os.environ.get("UNSLOTH_FROZEN_TABLE_MEMO_SLOTS", "1")))
     except ValueError:
-        return 2
+        return 1
 
 
 def reset_frozen_table_stats():

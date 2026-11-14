@@ -1171,3 +1171,10 @@ def test_resident_on_accepts_strings_and_the_current_accelerator(bf16_table):
         assert store.resident_on("cuda") and store.resident_on(torch.device("cuda")) and store.resident_on(str(dev))
         assert not store.resident_on("cpu")
         store.close()
+
+
+def test_memo_keeps_one_entry_unless_asked_for_more(monkeypatch):
+    """Finding 18: ordinary training keeps one entry per table (the memory it always used); pipeline parallel
+    sizes its own with set_frozen_table_memo_slots."""
+    monkeypatch.delenv("UNSLOTH_FROZEN_TABLE_MEMO_SLOTS", raising=False)
+    assert UnslothFrozenTableEmbedding(4, 2).memo_slots == 1
