@@ -53,7 +53,7 @@ _V = "v3"
 
 @triton.jit(do_not_specialize = ["S", "N", "TOPK", "H", "IDX_GROUP", "stride_ib", "stride_is"])
 def _sparse_mqa_fwd(
-    Q, KV, IDX, SINK, O, LSE,
+    Q, KV, IDX, SINK, OUT, LSE,
     S, N, TOPK, H, IDX_GROUP,
     stride_qb, stride_qs, stride_qh,
     stride_kvb, stride_kvn,
@@ -69,7 +69,7 @@ def _sparse_mqa_fwd(
     offs_h = hb * BLOCK_H + tl.arange(0, BLOCK_H)
     h_ok = offs_h < H
     offs_d = tl.arange(0, D)
-    q = tl.load(Q + b * stride_qb + t * stride_qs + offs_h[:, None] * stride_qh + offs_d[None, :],
+    q = tl.load(Q + b * stride_qb + t * stride_qs + offs_h.to(tl.int64)[:, None] * stride_qh + offs_d[None, :],
                 mask = h_ok[:, None], other = 0.0)
     # Finite floor, not -inf: a tile with no valid slot then rescales by exp(0) instead of exp(nan).
     m_i = tl.full((BLOCK_H,), -1.0e30, tl.float32)
@@ -93,16 +93,21 @@ def _sparse_mqa_fwd(
         acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
         m_i = m_new
     denom = l_i
+    m_j = m_i
     if HAS_SINK:
+        # Joint max with the sink logit: exp(sink - m_i) cannot overflow when the sink dominates.
         sink = tl.load(SINK + offs_h, mask = h_ok, other = float("-inf")).to(tl.float32)
-        denom = l_i + tl.exp(sink - m_i)
+        m_j = tl.maximum(m_i, sink)
+        r = tl.exp(m_i - m_j)
+        denom = l_i * r + tl.exp(sink - m_j)
+        acc = acc * r[:, None]
     # No valid slot: zero output and lse = +inf, so the backward's p = exp(s - lse) and the sink weight are 0.
     nonempty = l_i > 0
     safe = tl.where(nonempty, denom, 1.0)
     out = tl.where(nonempty[:, None], acc / safe[:, None], 0.0)
-    lse = tl.where(nonempty, m_i + tl.log(safe), float("inf"))
-    tl.store(O + b * stride_ob + t * stride_os + offs_h[:, None] * stride_oh + offs_d[None, :],
-             out.to(O.dtype.element_ty), mask = h_ok[:, None])
+    lse = tl.where(nonempty, m_j + tl.log(safe), float("inf"))
+    tl.store(OUT + b * stride_ob + t * stride_os + offs_h.to(tl.int64)[:, None] * stride_oh + offs_d[None, :],
+             out.to(OUT.dtype.element_ty), mask = h_ok[:, None])
     tl.store(LSE + b * stride_lb + t * stride_ls + offs_h, lse, mask = h_ok)
 
 
@@ -131,9 +136,9 @@ def _sparse_mqa_bwd(
     h_ok = offs_h < H
     offs_c = tl.arange(0, SPLIT_D)
     offs_d = dc * SPLIT_D + offs_c
-    q_row = b * stride_qb + t * stride_qs + offs_h[:, None] * stride_qh
+    q_row = b * stride_qb + t * stride_qs + offs_h.to(tl.int64)[:, None] * stride_qh
     q_base = Q + q_row
-    do_base = DO + b * stride_ob + t * stride_os + offs_h[:, None] * stride_oh
+    do_base = DO + b * stride_ob + t * stride_os + offs_h.to(tl.int64)[:, None] * stride_oh
     q = tl.load(q_base + offs_d[None, :], mask = h_ok[:, None], other = 0.0)
     do = tl.load(do_base + offs_d[None, :], mask = h_ok[:, None], other = 0.0)
     lse = tl.load(LSE + b * stride_lb + t * stride_ls + offs_h, mask = h_ok, other = float("inf"))
@@ -171,7 +176,7 @@ def _sparse_mqa_bwd(
 
 @triton.jit(do_not_specialize = ["S", "H", "W"])
 def _window_fwd(
-    Q, KV, OC, LSEC, SINK, O, LSE,
+    Q, KV, OC, LSEC, SINK, OUT, LSE,
     S, H, W,
     stride_qb, stride_qs, stride_qh,
     stride_kvb, stride_kvn,
@@ -192,7 +197,7 @@ def _window_fwd(
     head = hb * BLOCK_H + r % BLOCK_H
     ok = (tok < S) & (head < H)
     offs_d = tl.arange(0, D)
-    row = b * stride_qb + tok.to(tl.int64) * stride_qs + head * stride_qh
+    row = b * stride_qb + tok.to(tl.int64) * stride_qs + head.to(tl.int64) * stride_qh
     q = tl.load(Q + row[:, None] + offs_d[None, :], mask = ok[:, None], other = 0.0)
     lrow = b * stride_lb + tok.to(tl.int64) * stride_ls + head
     if HAS_PRIOR:
@@ -222,14 +227,18 @@ def _window_fwd(
         acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
         m_i = m_new
     denom = l_i
+    m_j = m_i
     if HAS_SINK:
         sink = tl.load(SINK + head, mask = ok, other = float("-inf")).to(tl.float32)
-        denom = l_i + tl.exp(sink - m_i)
+        m_j = tl.maximum(m_i, sink)
+        r = tl.exp(m_i - m_j)
+        denom = l_i * r + tl.exp(sink - m_j)
+        acc = acc * r[:, None]
     nonempty = l_i > 0
     safe = tl.where(nonempty, denom, 1.0)
     out = tl.where(nonempty[:, None], acc / safe[:, None], 0.0)
-    lse = tl.where(nonempty, m_i + tl.log(safe), float("inf"))
-    tl.store(O + row[:, None] + offs_d[None, :], out.to(O.dtype.element_ty), mask = ok[:, None])
+    lse = tl.where(nonempty, m_j + tl.log(safe), float("inf"))
+    tl.store(OUT + row[:, None] + offs_d[None, :], out.to(OUT.dtype.element_ty), mask = ok[:, None])
     tl.store(LSE + lrow, lse, mask = ok)
 
 
@@ -252,7 +261,7 @@ def _window_bwd_dq(
     head = hb * BLOCK_H + r % BLOCK_H
     ok = (tok < S) & (head < H)
     offs_d = tl.arange(0, D)
-    row = b * stride_qb + tok.to(tl.int64) * stride_qs + head * stride_qh
+    row = b * stride_qb + tok.to(tl.int64) * stride_qs + head.to(tl.int64) * stride_qh
     q = tl.load(Q + row[:, None] + offs_d[None, :], mask = ok[:, None], other = 0.0)
     do = tl.load(DO + row[:, None] + offs_d[None, :], mask = ok[:, None], other = 0.0)
     lrow = b * stride_lb + tok.to(tl.int64) * stride_ls + head
@@ -306,7 +315,7 @@ def _window_bwd_dkv(
         for t0 in tl.range(n0, t_hi, BLOCK_T):
             tok = t0 + r // BLOCK_H
             ok = (tok < S) & (head < H)
-            row = b * stride_qb + tok.to(tl.int64) * stride_qs + head * stride_qh
+            row = b * stride_qb + tok.to(tl.int64) * stride_qs + head.to(tl.int64) * stride_qh
             q = tl.load(Q + row[:, None] + offs_d[None, :], mask = ok[:, None], other = 0.0)
             do = tl.load(DO + row[:, None] + offs_d[None, :], mask = ok[:, None], other = 0.0)
             lrow = b * stride_lb + tok.to(tl.int64) * stride_ls + head
@@ -388,8 +397,11 @@ _BLOCK_H = 16
 
 
 def sparse_mqa_supported(q, kv):
-    """CUDA, fp16 / bf16 (bf16 needs sm80+), head_dim a power of two in [16, 512], not ROCm."""
-    if not (q.is_cuda and kv.is_cuda and torch.version.hip is None):
+    """q [b, s, h, d] and kv [b, n, d] on one CUDA device (not ROCm), fp16 / bf16 (bf16 needs sm80+), head_dim a power
+    of two in [16, 512]."""
+    if q.dim() != 4 or kv.dim() != 3 or kv.shape[0] != q.shape[0] or kv.shape[-1] != q.shape[-1]:
+        return False
+    if not (q.is_cuda and kv.is_cuda and q.device == kv.device and torch.version.hip is None):
         return False
     if q.dtype not in (torch.float16, torch.bfloat16) or kv.dtype != q.dtype:
         return False
@@ -413,6 +425,7 @@ def _index_fwd(q, kv, idx, sink, scale, has_sink):
     q = q if q.stride(-1) == 1 else q.contiguous()
     kv = kv if kv.stride(-1) == 1 else kv.contiguous()
     idx = idx.contiguous()
+    sink = sink.contiguous()   # the kernel reads SINK + head
     out = q.new_empty(q.shape)
     lse = torch.empty((b, s, h), device = q.device, dtype = torch.float32)
     if s == 0 or b == 0:
@@ -549,6 +562,7 @@ def _wfwd_op(q: torch.Tensor, wkv: torch.Tensor, ckv: torch.Tensor, idx: torch.T
              scale: float, window: int, has_sink: bool) -> Tuple[torch.Tensor, torch.Tensor]:
     b, s, h, d = q.shape
     q, wkv, ckv = q.contiguous(), wkv.contiguous(), ckv.contiguous()
+    sink = sink.contiguous()   # the kernel reads SINK + head
     out = q.new_empty(q.shape)
     lse = torch.empty((b, s, h), device = q.device, dtype = torch.float32)
     if s == 0 or b == 0:
@@ -667,8 +681,15 @@ def _large_head_module():
         if module is None:
             try:
                 spec = importlib.util.find_spec("unsloth")
-                path = os.path.join(os.path.dirname(spec.origin), "kernels", "large_head_attention.py") if spec and spec.origin else None
-                if path and os.path.isfile(path):
+                # A regular package has an origin; namespace / some editable installs only search locations.
+                roots = []
+                if spec is not None:
+                    if spec.origin:
+                        roots.append(os.path.dirname(spec.origin))
+                    roots.extend(spec.submodule_search_locations or [])
+                path = next((p for p in (os.path.join(r, "kernels", "large_head_attention.py") for r in roots)
+                             if os.path.isfile(p)), None)
+                if path:
                     file_spec = importlib.util.spec_from_file_location(_LH_NAME, path)
                     module = importlib.util.module_from_spec(file_spec)
                     sys.modules[_LH_NAME] = module
@@ -701,6 +722,9 @@ def _intervals(b, s, window, device):
 def _hfwd_op(q: torch.Tensor, kv: torch.Tensor, sink: torch.Tensor, scale: float, window: int,
              has_sink: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     b, s, h, d = q.shape
+    if b == 0 or s == 0:
+        return (q.new_empty(q.shape), q.new_empty((b, s, h), dtype = torch.float32),
+                q.new_empty((b, h, s), dtype = torch.float32))
     lo, hi = _intervals(b, s, window, q.device)
     k = kv.unsqueeze(1)
     o, lse2 = _large_head_module()._fwd_impl(q.transpose(1, 2), k, k, lo, hi, float(scale))
@@ -708,11 +732,18 @@ def _hfwd_op(q: torch.Tensor, kv: torch.Tensor, sink: torch.Tensor, scale: float
     if has_sink:
         sink_ = sink.float().view(1, 1, h)
         total = torch.logaddexp(lse, sink_).contiguous()   # lse is a [b, h, s] buffer seen as [b, s, h]
-        out = (o.transpose(1, 2).float() * torch.exp(lse - total).unsqueeze(-1)).to(q.dtype).contiguous()
+        out = (o.transpose(1, 2).float() * _window_share(lse, total).unsqueeze(-1)).to(q.dtype).contiguous()
     else:
         total = lse.contiguous()
         out = o.transpose(1, 2).contiguous()
+    # An empty interval returns zero; contiguous like the fake (lse is a transposed view, `where` follows it).
+    out = torch.where(torch.isneginf(lse).unsqueeze(-1), 0, out).contiguous()
     return out, total, lse2.contiguous()
+
+
+def _window_share(lse, total):
+    """exp(lse_window - lse_total) = sigmoid(lse_window - sink); 0 where both are -inf (no key, no sink)."""
+    return torch.where(torch.isneginf(total), 0.0, torch.exp(lse - torch.where(torch.isneginf(total), 0.0, total)))
 
 
 @_hfwd_op.register_fake
@@ -726,6 +757,8 @@ def _(q, kv, sink, scale, window, has_sink):
 def _hbwd_op(do_eff: torch.Tensor, q: torch.Tensor, kv: torch.Tensor, out: torch.Tensor, lse2: torch.Tensor,
              scale: float, window: int) -> Tuple[torch.Tensor, torch.Tensor]:
     b, s, h, d = q.shape
+    if b == 0 or s == 0:
+        return q.new_zeros(q.shape), kv.new_zeros(kv.shape)
     lo, hi = _intervals(b, s, window, q.device)
     k = kv.unsqueeze(1)
     dq, dk, dv = _large_head_module()._bwd_impl(do_eff.transpose(1, 2), q.transpose(1, 2), k, k,
@@ -749,7 +782,7 @@ def _hsetup_context(ctx, inputs, output):
 def _hbackward(ctx, grad_out, grad_total, grad_lse2):
     q, kv, sink, out, total, lse2 = ctx.saved_tensors
     if ctx.has_sink:
-        c = torch.exp(lse2.transpose(1, 2) * math.log(2.0) - total)               # sigmoid(lse_window - sink)
+        c = _window_share(lse2.transpose(1, 2) * math.log(2.0), total)           # sigmoid(lse_window - sink)
         do_eff = (grad_out.float() * c.unsqueeze(-1)).to(grad_out.dtype)
     else:
         do_eff = grad_out
@@ -757,7 +790,8 @@ def _hbackward(ctx, grad_out, grad_total, grad_lse2):
     dsink = None
     if ctx.has_sink and ctx.needs_input_grad[2]:
         delta = (grad_out.float() * out.float()).sum(-1)
-        dsink = -(torch.exp(sink.float().view(1, 1, -1) - total) * delta).sum((0, 1)).to(sink.dtype)
+        p_sink = _window_share(sink.float().view(1, 1, -1).expand_as(total), total)
+        dsink = -(p_sink * delta).sum((0, 1)).to(sink.dtype)
     return dq, dkv, dsink, None, None, None
 
 

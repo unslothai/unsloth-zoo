@@ -75,7 +75,11 @@ def _sparse_attn_enabled():
 def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, attention_mask, past_key_values, kwargs):
     """transformers' Qwen4ExpTextAttention.forward (5.22 / 5.23) on the selected tokens only, or None to run it."""
     indexer = module.indexer
-    if not _sparse_attn_enabled() or kwargs.get("output_attentions"):
+    # The configured default counts too (transformers resolves output_attentions from the config).
+    output_attentions = kwargs.get("output_attentions")
+    if output_attentions is None:
+        output_attentions = getattr(module.config, "output_attentions", False)
+    if not _sparse_attn_enabled() or output_attentions:
         return None
     # Prefill into an empty cache (transformers builds one during training too when use_cache is on) is the same
     # attention; decode steps and chunked prefill over cached tokens keep the reference.
@@ -85,7 +89,8 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
                 return None
         except Exception:
             return None
-    if not isinstance(attention_mask, torch.Tensor) or attention_mask.dim() != 4:
+    # One selection is shared by every head: a per-head mask ([b, h > 1, s, n]) keeps the reference.
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.dim() != 4 or attention_mask.shape[1] != 1:
         return None
     seq = hidden_states.shape[1]
     if attention_mask.shape[-1] != seq or seq < indexer.token_budget + indexer.compress_ratio:
@@ -95,11 +100,17 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
     import sys
     from unsloth_zoo.sparse_attention import qsa_select_tokens, sparse_gqa_attn, sparse_gqa_fast_path
     # No kernel for QSA on this device (T4 / sm75: no flex, Triton without tensor cores): transformers' own path.
-    probe_q = hidden_states.new_empty((1, module.config.num_attention_heads, 1, module.head_dim))
-    probe_kv = hidden_states.new_empty((1, module.config.num_key_value_heads, seq, module.head_dim))
+    # Probes have the real [b, h, s, d] shapes (the flex membership-table budget is b * s * s) without allocating.
+    batch = hidden_states.shape[0]
+    point = hidden_states.new_empty(())
+    probe_q = point.expand(batch, module.config.num_attention_heads, seq, module.head_dim)
+    probe_kv = point.expand(batch, module.config.num_key_value_heads, seq, module.head_dim)
     if not sparse_gqa_fast_path(probe_q, probe_kv, probe_kv):
         return None
-    rope = sys.modules[type(module).__module__].apply_rotary_pos_emb
+    rope = getattr(sys.modules.get(type(module).__module__), "apply_rotary_pos_emb", None)
+    if rope is None:   # a subclass defined elsewhere
+        from transformers.models.qwen4_exp import modeling_qwen4_exp
+        rope = modeling_qwen4_exp.apply_rotary_pos_emb
     position_embeddings = tuple(position_embeddings)
     with torch.no_grad():
         selected = qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, rope,
@@ -116,11 +127,16 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
     key_states = module.k_norm(module.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
     value_states = module.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
     query_states, key_states = rope(query_states, key_states, cos, sin)
+    # fp32 RoPE tables promote Q / K (4-bit / fp16 projections): back to the projection dtype, which the kernels
+    # take (the compiler's reference rewrite instead upcasts V; the attention math is the same up to rounding).
+    if query_states.dtype != value_states.dtype:
+        query_states = query_states.to(value_states.dtype)
+        key_states = key_states.to(value_states.dtype)
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, module.layer_idx)
     attn_output = sparse_gqa_attn(query_states, key_states, value_states, selected, module.scaling)
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-    attn_output = attn_output * torch.sigmoid(gate)
+    attn_output = (attn_output * torch.sigmoid(gate)).to(value_states.dtype)
     return module.o_proj(attn_output), None
 
 
@@ -286,6 +302,30 @@ def patch_qwen4_exp():
             ) from table_error
 
 
+def _dtype_aligned_forward(forward):
+    """transformers' attention forward with the compiler's post-RoPE Q / K / V dtype alignment applied. The
+    compiler rewrites the class forward it finds, which is our wrapper once patched, so the reference the wrapper
+    falls back to (short sequences, decode) must carry the rewrite itself; unchanged when the rewrite is a no-op."""
+    try:
+        import inspect
+        import textwrap
+        from unsloth_zoo.compiler import fix_attention_dtype_consistency
+        source = textwrap.dedent(inspect.getsource(forward))
+        fixed = fix_attention_dtype_consistency(source)
+        if fixed == source:
+            return forward
+        namespace = {}
+        exec(compile(fixed, inspect.getsourcefile(forward) or "<qwen4_exp attention>", "exec"), forward.__globals__, namespace)
+        aligned = namespace[forward.__name__]
+        aligned.__qualname__ = forward.__qualname__
+        aligned.__wrapped_reference__ = forward
+        return aligned
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: Qwen4ExpTextAttention reference keeps its dtype handling ({e})")
+        return forward
+
+
 def _patch_qwen4_exp_rest(modeling):
     indexer_cls = getattr(modeling, "Qwen4ExpTextQSAIndexer", None)
     if (
@@ -312,7 +352,7 @@ def _patch_qwen4_exp_rest(modeling):
         and _attention_forward_mirrored(attention_cls.forward)
     ):
         try:
-            _reference_attention_forward = attention_cls.forward
+            _reference_attention_forward = _dtype_aligned_forward(attention_cls.forward)
             attention_cls.forward = qwen4_exp_attention_forward
         except Exception as e:
             if UNSLOTH_ENABLE_LOGGING:

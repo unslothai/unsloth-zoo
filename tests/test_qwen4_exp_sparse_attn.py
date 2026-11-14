@@ -85,9 +85,21 @@ def _selection_mask(selected, s):
     return out[..., :s]
 
 
+def _zero_index_keys(indexer):
+    # Every pooled block key 0 -> every block score exactly 0: each top-k boundary is a tie.
+    with torch.no_grad():
+        indexer.index_qk_proj.weight[indexer.index_n_heads * indexer.index_head_dim:] = 0
+        if getattr(indexer.index_qk_proj, "bias", None) is not None:
+            indexer.index_qk_proj.bias[indexer.index_n_heads * indexer.index_head_dim:] = 0
+
+
+@pytest.mark.parametrize("ties", [False, True], ids = ["random", "all_tied"])
 @pytest.mark.parametrize("kind", ["causal", "right_pad", "packed"])
-def test_vectorised_selection_equals_reference_loop(kind):
+def test_vectorised_selection_equals_reference_loop(kind, ties):
+    # Token identity, not only scores: the same tokens as transformers' untouched per-query loop, ties included.
     config, attention, rotary = _module()
+    if ties:
+        _zero_index_keys(attention.indexer)
     b, s = 2, 61
     hidden, pe = _inputs(b, s, rotary)
     mask = _masks(kind, b, s)
@@ -100,32 +112,7 @@ def test_vectorised_selection_equals_reference_loop(kind):
         ours = sa.qsa_select_tokens(attention.indexer, hidden, pe, float_mask, modeling.apply_rotary_pos_emb)
     assert ours is not None
     ours_mask, ref_mask = _selection_mask(ours, s), ref[:, 0] & mask[:, 0]
-    differ = (ours_mask != ref_mask).any(-1)
-    # Only exact top-k boundary ties may differ (torch.topk's tie order is unspecified): same score multiset.
-    for b_i, t in differ.nonzero().tolist():
-        scores = _block_scores(attention.indexer, hidden, pe, mask[b_i, 0, t], b_i, t)
-        pick = lambda m: sorted(v for start, v in scores.items() if bool(m[b_i, t, start]))
-        assert pick(ours_mask) == pick(ref_mask), (b_i, t)
-    assert differ.sum() <= max(1, differ.numel() // 10)
-
-
-def _block_scores(indexer, hidden, pe, visible_row, b_i, t):
-    """Reference math for one query: {block start: score}."""
-    import math
-    full_cos, full_sin = pe
-    seq = hidden.shape[1]
-    qk = indexer.index_qk_proj(hidden)
-    d = indexer.index_head_dim
-    q, k = torch.split(qk, [indexer.index_n_heads * d, d], dim = -1)
-    q = indexer.q_layernorm(q.reshape(*hidden.shape[:2], -1, d))
-    q = modeling.apply_rotary_pos_emb(q, cos = full_cos, sin = full_sin, unsqueeze_dim = 2)
-    vis = visible_row.nonzero().flatten()
-    nb = vis.numel() // RATIO
-    blocks = vis[: nb * RATIO].view(nb, RATIO)
-    pooled = indexer.k_layernorm(k[b_i].index_select(0, blocks.flatten()).view(nb, RATIO, d).float().mean(1).to(k.dtype))
-    keys = modeling.apply_rotary_pos_emb(pooled.unsqueeze(1), cos = full_cos[b_i, blocks[:, 0]], sin = full_sin[b_i, blocks[:, 0]]).squeeze(1)
-    sc = torch.relu(torch.matmul(q[b_i, t].float(), keys.float().T).T).sum(-1) / math.sqrt(d)
-    return {int(st): float(v) for st, v in zip(blocks[:, 0], sc)}
+    torch.testing.assert_close(ours_mask, ref_mask, rtol = 0, atol = 0)
 
 
 def test_sliding_window_mask_is_not_taken():
@@ -156,15 +143,7 @@ def test_sparse_attention_matches_reference_forward_and_backward(monkeypatch, ki
         return out.detach(), grads
 
     ours_out, ours_g = run(lambda x: zoo_qwen4_exp._qwen4_exp_sparse_attention(attention, x, pe, mask, None, {})[0])
-    # The reference attention on the same selection (tied top-k boundaries may pick other equal-score blocks;
-    # the selection itself is checked above), returned the way transformers' indexer returns it.
-    with torch.no_grad():
-        selected = _selection_mask(sa.qsa_select_tokens(attention.indexer, hidden, pe, mask, modeling.apply_rotary_pos_emb), s)
-    selected = selected.unsqueeze(1)
-    indexer_reference = getattr(zoo_qwen4_exp, "_reference_qsa_forward", None) or modeling.Qwen4ExpTextQSAIndexer.forward
-    if mask.is_floating_point() and zoo_qwen4_exp._reference_returns_float_mask(indexer_reference):
-        selected = _float(selected)
-    monkeypatch.setattr(attention.indexer, "forward", lambda *args, **kwargs: selected)
+    # The untouched reference: transformers' attention with its own indexer selection.
     ref_out, ref_g = run(lambda x: _reference_forward()(attention, x, pe, mask, None)[0])
     # Rows that see no key at all (padded queries) are undefined in the reference's SDPA; compare real rows.
     rows = _masks(kind, b, s)[:, 0].any(-1) if kind != "right_pad" else torch.ones(b, s, dtype = torch.bool)

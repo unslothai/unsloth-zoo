@@ -226,7 +226,8 @@ def test_cuda_window_form_matches_concatenated(monkeypatch, backend, dtype, s, k
     if banded:   # the banded window kernel ran (forward and backward), not the index path over a concatenation
         assert mk.SPARSE_MQA_STATS["window_fwd"] == window_calls["window_fwd"] + 1
         assert mk.SPARSE_MQA_STATS["window_bwd"] == window_calls["window_bwd"] + 1
-    ref_fn = lambda q, win, comp, sink: sa.sparse_attn_reference(q, torch.cat([win, comp], 1), sink, full, d ** -0.5)
+    def ref_fn(q, win, comp, sink):
+        return sa.sparse_attn_reference(q, torch.cat([win, comp], 1), sink, full, d ** -0.5)
     ref = run(ref_fn, q.double(), win.double(), comp.double(), sink.double())
     low = run(ref_fn, q, win, comp, sink)
     for name, x, r, lo in zip(("out", "dq", "dwin", "dcomp", "dsink"), got, ref, low):
@@ -292,11 +293,13 @@ def test_cuda_refused_kernel_config_steps_down(monkeypatch):
 
 
 def test_gather_eligibility_is_the_shared_schedule_only():
-    q = lambda d, h, dt = torch.bfloat16: torch.empty(1, 1, h, d, dtype = dt, device = "meta")
+    def q(d, h, dt = torch.bfloat16):
+        return torch.empty(1, 1, h, d, dtype = dt, device = "meta")
     # meta tensors are not CUDA: never eligible; the shape rules are checked through a CUDA stand-in below.
     assert not sa._gather_eligible(q(512, 16))
     if _gather_runs():
-        cuda = lambda d, h, dt = torch.bfloat16: torch.empty(1, 1, h, d, dtype = dt, device = "cuda")
+        def cuda(d, h, dt = torch.bfloat16):
+            return torch.empty(1, 1, h, d, dtype = dt, device = "cuda")
         assert sa._gather_eligible(cuda(512, 16)) and sa._gather_eligible(cuda(128, 4))
         assert not sa._gather_eligible(cuda(256, 16)) and not sa._gather_eligible(cuda(512, 16, torch.float16))
         assert not sa._gather_eligible(cuda(512, 129)) and not sa._gather_eligible(cuda(512, 16), window = 4096)
@@ -463,7 +466,7 @@ def test_triton_kernel_math_in_the_interpreter():
     env = dict(os.environ, PYTHONPATH = str(Path(__file__).resolve().parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", ""),
                CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1")
     proc = subprocess.run([sys.executable, "-c", _INTERP], env = env, capture_output = True, text = True, timeout = 600)
-    line = next((l for l in proc.stdout.splitlines() if l.startswith("INTERP_WORST")), None)
+    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("INTERP_WORST")), None)
     assert line is not None, proc.stderr[-3000:]
     assert float(line.split()[1]) < 1e-5, line
 
@@ -629,7 +632,7 @@ def test_window_kernel_and_shared_index_rows_in_the_interpreter():
     env = dict(os.environ, PYTHONPATH = str(Path(__file__).resolve().parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", ""),
                CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1")
     proc = subprocess.run([sys.executable, "-c", _WINDOW_INTERP], env = env, capture_output = True, text = True, timeout = 900)
-    line = next((l for l in proc.stdout.splitlines() if l.startswith("WINDOW_INTERP_WORST")), None)
+    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("WINDOW_INTERP_WORST")), None)
     assert line is not None, proc.stderr[-3000:]
     assert float(line.split()[1]) < 1e-5, line
 
@@ -735,7 +738,8 @@ def _opcheck_cases():
     from unsloth_zoo import sparse_mqa_kernel as mk
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
     g = torch.Generator().manual_seed(11)
-    rnd = lambda *shape: (torch.randn(*shape, generator = g) * 0.5).cuda().to(dtype)
+    def rnd(*shape):
+        return (torch.randn(*shape, generator = g) * 0.5).cuda().to(dtype)
     b, s, h, d, n, k = 1, 40, 4, 64, 30, 12
     # q as a transposed view ([b, h, s, d] storage): outputs must still match the fake kernels' contiguous layout.
     q = rnd(b, h, s, d).transpose(1, 2)

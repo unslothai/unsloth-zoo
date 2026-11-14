@@ -78,17 +78,29 @@ def _count(key):
         SPARSE_ATTN_STATS[key] += 1
 
 
-def _forced_backend():
+def _forced_backend(window = False):
+    """UNSLOTH_SPARSE_ATTN_BACKEND; "hd512" only where it exists (the window-only form)."""
     value = os.environ.get("UNSLOTH_SPARSE_ATTN_BACKEND", "").strip().lower()
-    return value if value in _BACKENDS else None
+    return value if value in (_BACKENDS + ("hd512",) if window else _BACKENDS) else None
 
 
 def _gather_fn():
     global _GATHER
-    if _GATHER is None:
+    if not _GATHER:   # None (not tried) or False (failed: re-raise the real import error for a forced call)
         from unsloth_zoo._vendored.attn_gym.sparse.gather_attn import gather_attn
         _GATHER = gather_attn
     return _GATHER
+
+
+def _gather_importable():
+    """The vendored kernels need triton >= 3.5 (triton.constexpr_function); never select gather without them."""
+    global _GATHER
+    if _GATHER is None and not torch.compiler.is_compiling():
+        try:
+            _gather_fn()
+        except Exception:
+            _GATHER = False
+    return bool(_GATHER)
 
 
 def _gather_eligible(q, window = 0):
@@ -105,7 +117,7 @@ def _gather_eligible(q, window = 0):
     d, h = q.shape[-1], q.shape[2]
     if d % 16 or not (d <= 128 or d == 512) or h > 128 or window > 2048:
         return False
-    return torch.cuda.get_device_capability(q.device)[0] in (10, 11)
+    return torch.cuda.get_device_capability(q.device)[0] in (10, 11) and _gather_importable()
 
 
 # The flex fallback reads a [b, s, n] membership table (S x S for QSA); above this many entries the chunked torch
@@ -123,6 +135,8 @@ _SHARED_MEMORY = {}
 
 
 def _shared_memory(device):
+    if device.type != "cuda":
+        return 0
     index = device.index if device.index is not None else torch.cuda.current_device()
     if index not in _SHARED_MEMORY:
         try:
@@ -140,9 +154,12 @@ def _tensor_core_triton(q):
     return q.is_cuda and torch.cuda.get_device_capability(q.device)[0] >= 8
 
 
-def _triton_eligible(q, forced = False):
+def _triton_eligible(q, forced = False, kv = None):
+    if not (_HAS_TRITON and q.is_cuda and q.dim() == 4):
+        return False
     from .sparse_mqa_kernel import sparse_mqa_supported
-    return _HAS_TRITON and sparse_mqa_supported(q, q) and (forced or _tensor_core_triton(q))
+    kv = q.new_empty((q.shape[0], 0, q.shape[-1])) if kv is None else kv
+    return sparse_mqa_supported(q, kv) and (forced or _tensor_core_triton(q))
 
 
 def _flex_eligible(q, kv_len = None):
@@ -157,6 +174,25 @@ def _flex_eligible(q, kv_len = None):
     if q.shape[-1] > 128 and _shared_memory(q.device) < _FLEX_D256_MIN_SHARED_MEMORY:
         return False
     return kv_len is None or q.shape[0] * q.shape[1] * kv_len <= _FLEX_MAX_TABLE
+
+
+# The sink is applied through flex's log-sum-exp (out * sigmoid(lse - sink)); its gradients need flex to propagate
+# LSE gradients. Numerically verified on torch 2.14 (B200 oracle, Colab T4 / L4 / G4); CPU flex has no backward,
+# so older releases could not be checked here and keep the reference for differentiable calls with a sink.
+_FLEX_SINK_VERIFIED_TORCH = (2, 14)
+
+
+def _torch_version():
+    try:
+        return tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+    except Exception:
+        return (0, 0)
+
+
+def _flex_sink_ok(q, kv, attn_sink):
+    if attn_sink is None or _torch_version() >= _FLEX_SINK_VERIFIED_TORCH:
+        return True
+    return not (torch.is_grad_enabled() and any(t.requires_grad for t in (q, kv, attn_sink)))
 
 
 def _failure_key(backend, q, k):
@@ -190,15 +226,27 @@ def window_topk_idxs(seq_len, window_size, batch, device):
     return idxs.to(torch.int32).unsqueeze(0).expand(batch, -1, -1)
 
 
+def _connected_zeros(q, *others):
+    """Zero output that stays in every input's autograd graph (zero gradients, not None): empty-slice sums connect
+    without reading values (a disabled -inf sink would make `x * 0` NaN)."""
+    out = q.new_zeros(q.shape)
+    for t in (q,) + others:
+        if t is not None and t.is_floating_point():
+            out = out + t.reshape(-1)[:0].sum().to(out.dtype)
+    return out
+
+
 def sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale):
     """Gather + fp32 (fp64 for fp64 inputs) softmax with sink; differentiable; chunked over queries."""
     b, s, h, d = q.shape
     k = topk_idxs.shape[-1]
     acc = torch.promote_types(q.dtype, torch.float32)
-    sink = attn_sink.to(acc).view(1, 1, h)
-    out = q.new_zeros((b, s, h, d)) if k == 0 else None
-    if out is not None:
-        return out
+    if attn_sink is None:
+        sink = torch.full((1, 1, h), float("-inf"), dtype = acc, device = q.device)
+    else:
+        sink = attn_sink.to(acc).view(1, 1, h)
+    if k == 0:
+        return _connected_zeros(q, kv, attn_sink)
     n = kv.shape[1]
     # A zero sentinel row keeps -1 / out-of-range slots indexable.
     kv_pad = torch.cat([kv, kv.new_zeros((b, 1, d))], dim = 1)
@@ -220,7 +268,7 @@ def sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale):
         return torch.einsum("bchk,bckd->bchd", probs, slots).to(q.dtype)
 
     # Under autograd each chunk is recomputed in backward, so only one gathered slab is ever live.
-    recompute = torch.is_grad_enabled() and any(t.requires_grad for t in (q, kv, attn_sink)) and s > chunk
+    recompute = torch.is_grad_enabled() and any(t.requires_grad for t in (q, kv, attn_sink) if t is not None) and s > chunk
     outs = []
     for start in range(0, s, chunk):
         stop = min(s, start + chunk)
@@ -236,21 +284,29 @@ def sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale):
 _MIN_SHARED_HEADS = 16
 
 
+def _single_kv_head(kv):
+    return None if kv is None else kv.unsqueeze(1)
+
+
 def _gather_call(q, local_kv, sparse_kv, idxs, attn_sink, softmax_scale, window):
     """q [b, s, h, d]; KV [b, n, d] expanded over heads with stride 0 (the shared schedule's layout); fewer than 16
     heads are padded with zero queries and a -inf sink (their outputs are dropped, their gradients are zero)."""
     b, s, h, d = q.shape
-    sink = attn_sink.float()
+    if attn_sink is None:
+        sink = torch.full((h,), float("-inf"), device = q.device, dtype = torch.float32)
+    else:
+        sink = attn_sink.float()
     heads = max(h, _MIN_SHARED_HEADS)
     if heads != h:
         q = torch.cat([q, q.new_zeros((b, s, heads - h, d))], dim = 2)
         sink = torch.cat([sink, sink.new_full((heads - h,), float("-inf"))])
-    expand = lambda kv: None if kv is None else kv.unsqueeze(1).expand(b, heads, kv.shape[1], d)
+    # One KV head ([b, 1, n, d]): gather_attn records share_kv = True, so the backward keeps the shared schedule
+    # (a pre-expanded [b, heads, n, d] view is treated as per-head KV and allocates per-head gradients).
     out = _gather_fn()(
-        q.transpose(1, 2), expand(local_kv), expand(sparse_kv), idxs, sink,
+        q.transpose(1, 2), _single_kv_head(local_kv), _single_kv_head(sparse_kv), idxs, sink,
         sliding_window_size = int(window), scale = float(softmax_scale),
     )
-    return out.transpose(1, 2)[:, :, :h]
+    return out.transpose(1, 2)[:, :, :h].contiguous()
 
 
 def _sparse_attn_gather(q, kv, attn_sink, topk_idxs, softmax_scale):
@@ -335,10 +391,14 @@ def _sparse_attn_flex(q, kv, attn_sink, topk_idxs, softmax_scale):
         kernel_options = _flex_kernel_options(q), **FLEX_LSE_KWARGS,
     ))
     # softmax over keys + sink = flex softmax * exp(lse) / (exp(lse) + exp(sink)); empty rows: lse = -inf -> 0.
-    sink = attn_sink.float().view(1, h, 1)
-    sink_scale = torch.where(torch.isneginf(sink), 1.0, torch.sigmoid(lse.float() - sink))
-    out = (out.float() * sink_scale.unsqueeze(-1)).to(q.dtype)
-    return out.transpose(1, 2)
+    # Infinities are replaced before the subtraction: -inf - (-inf) would make the sink gradient NaN.
+    if attn_sink is not None:
+        sink = attn_sink.float().view(1, h, 1)
+        no_sink, empty = torch.isneginf(sink), torch.isneginf(lse)
+        diff = torch.where(empty, 0.0, lse.float()) - torch.where(no_sink, 0.0, sink)
+        sink_scale = torch.where(no_sink, 1.0, torch.where(empty, 0.0, torch.sigmoid(diff)))
+        out = (out.float() * sink_scale.unsqueeze(-1)).to(q.dtype)
+    return out.transpose(1, 2).contiguous()
 
 
 def _run(backend, q, kv, attn_sink, topk_idxs, softmax_scale):
@@ -369,7 +429,7 @@ def _check(q, kv, attn_sink, topk_idxs):
         raise ValueError("sparse_attn expects q [b, s, h, d], kv [b, n, d], topk_idxs [b, s, k]")
     if kv.shape[0] != q.shape[0] or kv.shape[-1] != q.shape[-1] or topk_idxs.shape[:2] != q.shape[:2]:
         raise ValueError(f"sparse_attn shape mismatch: q {tuple(q.shape)}, kv {tuple(kv.shape)}, idxs {tuple(topk_idxs.shape)}")
-    if attn_sink.shape != (q.shape[2],):
+    if attn_sink is not None and tuple(attn_sink.shape) != (q.shape[2],):
         raise ValueError(f"attn_sink must be [{q.shape[2]}], got {tuple(attn_sink.shape)}")
 
 
@@ -380,8 +440,10 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, *, backend = None):
     k = topk_idxs.shape[-1]
     if k == 0:
         _count("torch")
-        return q.new_zeros(q.shape) + 0 * q
+        return _connected_zeros(q, kv, attn_sink)
     order = _order(q, k, backend, kv.shape[1])
+    if "flex" in order and not _flex_sink_ok(q, kv, attn_sink):
+        order = tuple(b for b in order if b != "flex") or ("torch",)
     for i, backend in enumerate(order):
         if torch.compiler.is_compiling() or i == len(order) - 1:
             out = _run(backend, q, kv, attn_sink, topk_idxs, softmax_scale)
@@ -401,10 +463,13 @@ def sparse_attn_window(q, window_kv, compress_kv, compress_idxs, attn_sink, soft
     q [b, s, h, d], window_kv [b, s, d] (this chunk, already rotated), compress_kv [b, nc, d],
     compress_idxs [b, s, k] into compress_kv (-1 = unused, no offset), window_size > 0.
     """
+    _check(q, compress_kv, attn_sink, compress_idxs)
     b, s, h, d = q.shape
-    if window_kv.shape[:2] != (b, s):
-        raise ValueError("sparse_attn_window: window_kv must cover the query chunk [b, s, d]")
-    forced = backend if backend in _BACKENDS + ("hd512",) else _forced_backend()
+    if window_kv.dim() != 3 or tuple(window_kv.shape) != (b, s, d):
+        raise ValueError(f"sparse_attn_window: window_kv must be [b, s, d] = {(b, s, d)}, got {tuple(window_kv.shape)}")
+    if int(window_size) <= 0:
+        raise ValueError(f"sparse_attn_window: window_size must be positive, got {window_size}")
+    forced = backend if backend in _BACKENDS + ("hd512",) else _forced_backend(window = True)
     # Window-only (DeepSeek compress_ratio 0 layers, or no compressed slot): Unsloth's head_dim 512 flash kernel over
     # the window intervals with the sink applied exactly (L4: 4.8 / 9.9 ms at 4k / 8k vs 9.5 / 19.5 for the window
     # kernel, half the peak memory).
@@ -424,12 +489,14 @@ def sparse_attn_window(q, window_kv, compress_kv, compress_idxs, attn_sink, soft
                 _latch("hd512", q, key, error)
         if forced == "hd512":
             forced = None
-    use_gather = forced == "gather" or (forced is None and _gather_eligible(q, int(window_size)))
+    key = ("window", int(window_size), compress_idxs.shape[-1])
+    use_gather = forced == "gather" or (
+        forced is None and _gather_eligible(q, int(window_size)) and _failure_key("gather", q, key) not in _FAILED)
     if use_gather:
-        key = ("window", int(window_size), compress_idxs.shape[-1])
-        if torch.compiler.is_compiling():
+        if torch.compiler.is_compiling() or forced == "gather":
+            out = _sparse_attn_window_gather(q, window_kv, compress_kv, compress_idxs, attn_sink, softmax_scale, window_size)
             _count("gather")
-            return _sparse_attn_window_gather(q, window_kv, compress_kv, compress_idxs, attn_sink, softmax_scale, window_size)
+            return out
         try:
             out = _sparse_attn_window_gather(q, window_kv, compress_kv, compress_idxs, attn_sink, softmax_scale, window_size)
             _count("gather")
@@ -466,8 +533,17 @@ def sparse_gqa_attn(query, key, value, topk_idxs, softmax_scale, *, backend = No
     The shared-KV kernels take one tensor as both key and value, so this runs them on [K | V] with the query
     zero-padded over V: the logits are exactly q.K and the second half of the output is the V-weighted sum.
     """
+    if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
+        raise ValueError("sparse_gqa_attn expects query [b, hq, s, dk], key [b, hk, n, dk], value [b, hk, n, dv]")
     b, hq, s, dk = query.shape
     hk, dv = key.shape[1], value.shape[-1]
+    if hk <= 0 or hq % hk:
+        raise ValueError(f"sparse_gqa_attn: {hq} query heads are not a multiple of {hk} KV heads")
+    if key.shape[0] != b or value.shape[:3] != key.shape[:3] or key.shape[-1] != dk:
+        raise ValueError(f"sparse_gqa_attn shape mismatch: query {tuple(query.shape)}, key {tuple(key.shape)}, "
+                         f"value {tuple(value.shape)}")
+    if topk_idxs.dim() != 3 or tuple(topk_idxs.shape[:2]) != (b, s):
+        raise ValueError(f"sparse_gqa_attn: topk_idxs must be [b, s, K] = [{b}, {s}, K], got {tuple(topk_idxs.shape)}")
     groups = hq // hk
     forced = backend if backend in _BACKENDS else _forced_backend()
     folded = query.new_empty((1, 1, groups, dk + dv))
@@ -520,11 +596,13 @@ def sparse_gqa_fast_path(query, key, value):
     model's own dense attention there: callers keep their upstream path."""
     if _forced_backend() is not None:
         return True
-    hk, groups = key.shape[1], query.shape[1] // key.shape[1]
+    groups = query.shape[1] // key.shape[1]
     folded = query.new_empty((1, 1, groups, key.shape[-1] + value.shape[-1]))
     if _gather_eligible(folded) or _triton_eligible(folded):
         return True
-    return _flex_eligible(query.transpose(1, 2), key.shape[2]) and _flex_eligible(value.transpose(1, 2))
+    # Same policy as sparse_gqa_attn: flex only outside traced regions.
+    return (not torch.compiler.is_compiling() and _flex_eligible(query.transpose(1, 2), key.shape[2])
+            and _flex_eligible(value.transpose(1, 2)))
 
 
 def _sparse_gqa_flex(query, key, value, topk_idxs, softmax_scale):
@@ -544,7 +622,10 @@ def _contiguous_rows(visible):
     hi = n - 1 - visible.flip(-1).to(torch.int8).argmax(-1)
     ok = (count > 0) & (count == hi - lo + 1)
     if n == s:
-        ok = ok & (lo.gather(1, lo) == lo) & (lo.gather(1, hi) == lo)
+        # Every key inside [lo, hi] must start at the same first key, not only the endpoints: rows with equal lo
+        # must form one run (segment id equal at both ends of the interval).
+        seg = torch.cat([lo.new_zeros(b, 1), (lo[:, 1:] != lo[:, :-1]).long()], 1).cumsum(1)
+        ok = ok & (lo.gather(1, lo) == lo) & (seg.gather(1, lo) == seg.gather(1, hi))
     else:
         ok = ok & (lo == 0)
     if not bool(ok.all()):
@@ -556,8 +637,12 @@ def _qsa_geometry(attention_mask, ratio):
     """(lo, hi, block starts per batch row) for an interval-shaped mask, else None. The scan and the start lists
     need host syncs, so the result is cached on the mask tensor (every QSA layer of a forward, and its gradient
     checkpoint recompute, gets the same mask object), keyed by its version; inference tensors are rescanned."""
+    # One shared selection per batch row: per-head masks ([b, h > 1, s, n]) cannot be represented.
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.dim() != 4 or attention_mask.shape[1] != 1:
+        return None
+    # Inference tensors have no version counter: never read it (or cache on them).
     use_cache = not attention_mask.is_inference()
-    key = (tuple(attention_mask.shape), attention_mask._version, ratio)
+    key = (tuple(attention_mask.shape), attention_mask._version, ratio) if use_cache else None
     cached = getattr(attention_mask, "_unsloth_qsa_geometry", None) if use_cache else None
     if cached is not None and cached[0] == key:
         return cached[1]
@@ -582,6 +667,25 @@ def _qsa_geometry(attention_mask, ratio):
     return result
 
 
+def _repair_boundary_ties(out, b, t0, scores, valid, k, q_rows, block_keys, starts, arange_r, top_blocks, ratio, dim):
+    """torch.topk leaves the order of equal scores unspecified (relu makes exact-zero block scores common), so a
+    query whose k-th and (k+1)-th best blocks tie (or nearly tie: the batched scores can differ from the
+    reference's in the last bits) is recomputed exactly as transformers' indexer does it: the same matmul over this
+    query's candidate blocks only, then the same topk call, so the kept tokens are the reference's. One host sync
+    per query chunk; a loop over the tied rows only."""
+    best = scores.topk(k + 1, dim = -1).values
+    kth, nxt = best[:, k - 1], best[:, k]
+    tied = torch.isfinite(nxt) & ((kth - nxt).abs() <= 1e-5 * kth.abs().clamp(min = 1.0))
+    for r in tied.nonzero().flatten().tolist():
+        candidates = valid[r].nonzero().flatten()
+        row = torch.matmul(q_rows[r].float(), block_keys.index_select(0, candidates).transpose(-1, -2)).transpose(-1, -2)
+        row = torch.relu(row).sum(dim = -1) / math.sqrt(dim)
+        chosen = row.topk(min(top_blocks, candidates.numel()), dim = 0).indices
+        tokens = (starts[candidates[chosen]][:, None] + arange_r).flatten().to(torch.int32)
+        out[b, t0 + r, : top_blocks * ratio] = -1
+        out[b, t0 + r, : tokens.numel()] = tokens
+
+
 @torch.compiler.disable
 def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, apply_rotary_pos_emb,
                       query_chunk = 2048, past_key_values = None):
@@ -596,7 +700,8 @@ def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mas
     """
     batch, seq, _ = hidden_states.shape
     ratio, top_blocks, dim = indexer.compress_ratio, indexer.block_topk, indexer.index_head_dim
-    if attention_mask.shape[-1] != seq:
+    if (not isinstance(attention_mask, torch.Tensor) or attention_mask.dim() != 4 or attention_mask.shape[1] != 1
+            or attention_mask.shape[-1] != seq):
         return None
     geometry = _qsa_geometry(attention_mask, ratio)
     if geometry is None:
@@ -612,7 +717,6 @@ def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mas
     if past_key_values is not None:
         raw_keys = past_key_values.update_indexer(raw_keys, indexer.layer_idx)
 
-    positions = torch.arange(seq, device = hidden_states.device)
     arange_r = torch.arange(ratio, device = hidden_states.device)
     width = top_blocks * ratio + ratio - 1
     out = torch.full((batch, seq, width), -1, dtype = torch.int32, device = hidden_states.device)
@@ -641,13 +745,12 @@ def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mas
             valid = (starts[None, :] >= lo_b[t0:t1, None]) & (starts[None, :] + ratio - 1 <= hi_b[t0:t1, None])
             scores = scores.masked_fill(~valid, float("-inf"))
             k = min(top_blocks, starts.numel())
-            # torch.topk leaves the order of equal scores unspecified (relu makes exact-zero ties common), so
-            # ties are broken deterministically: a stable descending sort over the blocks reversed keeps the
-            # later block, which is what the reference's CPU topk was observed to do.
-            order = scores.flip(-1).sort(dim = -1, descending = True, stable = True)
-            top_values = order.values[..., :k]
-            top_indices = scores.shape[-1] - 1 - order.indices[..., :k]
+            order = scores.topk(k, dim = -1)
+            top_values, top_indices = order.values, order.indices
             tokens = starts[top_indices][..., None] + arange_r                               # [c, k, ratio]
             tokens = torch.where(torch.isfinite(top_values)[..., None], tokens, -1)
             out[b, t0:t1, : k * ratio] = tokens.flatten(1).to(torch.int32)
+            if k < starts.numel():
+                _repair_boundary_ties(out, b, t0, scores, valid, k, q[b, t0:t1], block_keys, starts, arange_r,
+                                      top_blocks, ratio, dim)
     return out
