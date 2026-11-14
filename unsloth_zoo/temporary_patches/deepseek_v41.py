@@ -310,6 +310,7 @@ def patch_deepseek_v41_grouped_lora():
         return original(lora_config, adapter_name, target, **kwargs)
 
     _create_new_module._unsloth_dsv41_grouped = True
+    _create_new_module.__wrapped__ = original
     LoraModel._create_new_module = staticmethod(_create_new_module)
     if UNSLOTH_ENABLE_LOGGING:
         logger.info("Unsloth: DeepSeek-V4.1 grouped LoRA for DeepseekV41GroupedLinear (o_a_proj).")
