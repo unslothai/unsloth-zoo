@@ -448,7 +448,11 @@ def test_video_positions_match_mlx_vlm_rope_index(model_type, module):
     import types
     from unsloth_zoo.mlx.utils import _vlm_positions_for_compile
 
+    import inspect
+
     language = importlib.import_module(f"mlx_vlm.models.{module}.language")
+    if model_type != "qwen2_5_vl" and "rows.extend" not in inspect.getsource(language.LanguageModel.get_rope_index):
+        pytest.skip("this mlx-vlm predates the per-frame video grid split that HF's Qwen3-VL get_rope_index does")
     start, end, video, image = 90, 91, 92, 93
     frame = [start] + [video] * 4 + [end]
     if model_type == "qwen2_5_vl":
