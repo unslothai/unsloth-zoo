@@ -80,8 +80,11 @@ _NO_FMA = {} if _INTERPRET else {"enable_fp_fusion": False}
 
 def _disable(error):
     """A Triton build that cannot compile or launch these kernels: eager ops from now on (the launch
-    failed before writing anything, so the caller's eager path still sees the original inputs)."""
+    failed before writing anything, so the caller's eager path still sees the original inputs). An out-of-memory
+    allocation is not a build fault: this call goes eager, the kernels stay on."""
     global _ENABLED
+    if isinstance(error, torch.cuda.OutOfMemoryError):
+        return None
     if _ENABLED:
         _ENABLED = False
         logger.warning(f"Unsloth: gpt-oss fused decode kernels disabled, using the eager ops ({type(error).__name__}: {error})")

@@ -26,8 +26,8 @@ os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
 from unsloth_zoo.temporary_patches import gdn_causal_conv1d as gcc  # noqa: E402
 
-_HAS_CUDA = torch.cuda.is_available() and getattr(torch.version, "hip", None) is None
-requires_cuda = pytest.mark.skipif(not _HAS_CUDA, reason = "needs a CUDA GPU")
+_HAS_CUDA = torch.cuda.is_available()
+requires_cuda = pytest.mark.skipif(not _HAS_CUDA, reason = "needs a CUDA or ROCm GPU")
 
 
 def _inputs(B, D, T, W, dtype, bias, channel_last, seed = 0):
@@ -285,11 +285,12 @@ def test_hub_decorator_wraps_only_gdn_fallbacks(hub_kernels):
     assert legacy.causal_conv1d_fn is gcc._legacy_causal_conv1d_fn
 
 
-def test_patch_rebinds_the_real_modeling_module(hub_kernels, monkeypatch):
+@pytest.mark.parametrize("hip", [None, "7.0"])
+def test_patch_rebinds_the_real_modeling_module(hub_kernels, monkeypatch, hip):
     pytest.importorskip("triton")
     modeling = _real_gdn_modeling(monkeypatch)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.version, "hip", hip)
     assert not gcc._is_marked(modeling.causal_conv1d_fn)
 
     monkeypatch.setenv(gcc._KILL_SWITCH, "1")

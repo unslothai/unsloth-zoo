@@ -172,7 +172,8 @@ def apply_cpu_security_patches():
 
     root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "temporary_patches")
     applied = []
-    for name in ("datasets_folder_metadata",):
+    # deepseek_v41: device-independent training fixes for the DeepSeek-V4.1 port (no-ops without it).
+    for name in ("datasets_folder_metadata", "deepseek_v41"):
         module_name = f"{__package__}._guard_{name}"
         module = sys.modules.get(module_name)
         if module is None:

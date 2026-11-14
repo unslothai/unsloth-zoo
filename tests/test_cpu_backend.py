@@ -279,9 +279,12 @@ def test_moe_models_keep_their_own_loss():
 def test_cpu_backend_installs_the_datasets_path_guard():
     folder = pytest.importorskip("datasets.packaged_modules.folder_based_builder.folder_based_builder")
     from unsloth_zoo.cpu.runtime import apply_cpu_security_patches
-    assert apply_cpu_security_patches() == ["patch_datasets_folder_metadata_file_name"]
+    applied = apply_cpu_security_patches()
+    # The datasets guard runs first; other device-independent guards (deepseek_v41) follow it.
+    assert applied[0] == "patch_datasets_folder_metadata_file_name", applied
+    assert len(applied) == len(set(applied)), applied
     assert getattr(folder.FolderBasedBuilder._read_metadata, "_unsloth_file_name_guard", False)
-    apply_cpu_security_patches()  # idempotent
+    assert apply_cpu_security_patches() == applied  # idempotent
 
 
 def test_generate_accepts_a_batch_encoding_as_input_ids():

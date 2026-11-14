@@ -127,3 +127,23 @@ def test_a_failing_row_raises_the_row_by_row_error():
     with pytest.raises(expected.type) as raised:
         _prepare(tokenizer, rows)
     assert str(raised.value) == str(expected.value)
+
+
+def test_prompt_completion_rows_decode_json_string_tools():
+    tokenizer = _tokenizer()
+    rows = [{
+        "prompt": _conversation(i)[:1], "completion": _conversation(i)[1:],
+        "tools": json.dumps(TOOLS) if i % 2 else None,
+    } for i in range(6)]
+    out = _prepare(tokenizer, rows)
+    assert len(out) == len(rows)
+    for row, ids, mask in zip(rows, out["input_ids"], out["completion_mask"]):
+        tools = json.loads(row["tools"]) if row["tools"] else None
+        full = tokenizer.apply_chat_template(
+            row["prompt"] + row["completion"], tools = tools, tokenize = True, return_dict = True,
+        )["input_ids"]
+        prompt = tokenizer.apply_chat_template(
+            row["prompt"], tools = tools, tokenize = True, add_generation_prompt = True, return_dict = False,
+        )
+        assert ids == list(full)
+        assert mask == [0] * len(prompt) + [1] * (len(full) - len(prompt))

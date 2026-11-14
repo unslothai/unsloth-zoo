@@ -107,10 +107,19 @@ def unsloth_fused_lm_head_loss(
     # the shard on CPU until then.
     if kwargs.get("torch_compile", True) and lm_head_on_old_cuda_arch(lm_head.weight):
         kwargs["torch_compile"] = False
+    # Fused CE skips lm_head.forward(), where TorchAO QAT applies input and weight QDQ.
+    # Keep these operations in the autograd graph, including when the head is frozen.
+    weight = lm_head.weight
+    activation_fake_quantizer = getattr(lm_head, "activation_fake_quantizer", None)
+    if activation_fake_quantizer is not None:
+        hidden_states = activation_fake_quantizer(hidden_states)
+    weight_fake_quantizer = getattr(lm_head, "weight_fake_quantizer", None)
+    if weight_fake_quantizer is not None:
+        weight = weight_fake_quantizer(weight)
     loss = unsloth_fused_ce_loss(
         trainer        = None,
         hidden_states  = hidden_states,
-        lm_head_weight = lm_head.weight,
+        lm_head_weight = weight,
         lm_head_bias   = getattr(lm_head, "bias", None),
         labels         = target,
         n_items        = n_items,

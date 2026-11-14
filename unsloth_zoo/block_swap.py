@@ -18,7 +18,7 @@
 
 Host copy is authoritative (frozen under LoRA), so eviction never copies back.
 The recompute sweep runs in reverse, so prefetch direction follows grad mode.
-Slots come from a fixed depth + 1 pool: per-fetch allocation leaves the peak unchanged.
+Slots come from a depth + 1 pool, not per-fetch allocation; prefetch_depth = "auto" grows or shrinks it.
 """
 import os
 import sys
@@ -27,6 +27,10 @@ from contextlib import contextmanager, nullcontext
 import functools
 import gc
 import importlib
+import itertools
+import tempfile
+import time
+import weakref
 
 __all__ = [
     "BlockSwap",
@@ -60,6 +64,17 @@ _CHUNK_BYTES = 256 << 20
 # Pin only while this much host RAM stays free: max(4 GiB, 15%); the rest stays pageable.
 _PIN_RESERVE_MIN_BYTES = 4 << 30
 _PIN_RESERVE_FRACTION = 0.15
+# Copy, stall and compute timings for stats(); UNSLOTH_OFFLOAD_STATS=0 skips the timing events.
+_TIMING = os.environ.get("UNSLOTH_OFFLOAD_STATS", "1") != "0"
+# prefetch_depth = "auto": deepest pool it grows to, and the steps it watches before settling.
+_AUTO_MAX_DEPTH = 4
+_AUTO_STEPS = 12
+# Steps judged per depth: a single step's copy timings are too noisy to decide on.
+_AUTO_SAMPLE = 2
+_AUTO_STALL = 0.02
+# Auto pool growth keeps this much of each card free for temporaries made inside a layer or the loss.
+_WORKSPACE_MIN_BYTES = 512 << 20
+_WORKSPACE_FRACTION = 0.05
 
 
 def _host_copy(t):
@@ -68,6 +83,18 @@ def _host_copy(t):
 
 def _pow2_ceil(n):
     return 1 << max(0, (int(n) - 1).bit_length())
+
+
+def _host_reserve(total):
+    # max(4 GiB, 15%), but never more than a quarter of a small host or container (a 2 GiB one keeps 0.5 GiB).
+    return max(min(_PIN_RESERVE_MIN_BYTES, total // 4), int(total * _PIN_RESERVE_FRACTION))
+
+
+def _host_free():
+    """(total, free after the reserve) host RAM. `_host_memory` already caps psutil by an enforcing cgroup limit
+    (psutil reports the whole host inside a container, while the cgroup is what gets the job OOM-killed)."""
+    total, available = _host_memory()
+    return total, available - _host_reserve(total)
 
 
 def _local_world_size():
@@ -91,11 +118,141 @@ def _host_memory():
 def _pin_budget():
     # Each local rank sees the same free RAM, so it may only claim its share.
     try:
-        total, available = _host_memory()
-        spare = available - max(_PIN_RESERVE_MIN_BYTES, int(total * _PIN_RESERVE_FRACTION))
-        return spare // _local_world_size()
+        return _host_free()[1] // _local_world_size()
     except Exception:
         return 0
+
+
+# Re-reads of free RAM and the peers' reservations before refusing, while a peer may be mid-copy.
+_PEER_RETRIES = 8
+_PEER_RETRY_S = 0.25
+# Host RAM sessions (a load into host RAM, a BlockSwap install): local ranks run the same sequence of them.
+_HOST_SESSION = 0
+
+
+def _rank_ledger():
+    """(directory shared by this launch's local ranks, local rank, local world size), or None outside a multi-rank
+    launch. Each rank publishes there the host bytes it still has to allocate in its current session."""
+    world = _local_world_size()
+    rank = os.environ.get("LOCAL_RANK")
+    job = os.environ.get("TORCHELASTIC_RUN_ID") or os.environ.get("MASTER_PORT")
+    if world <= 1 or rank is None or not job:
+        return None
+    try:
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+        # The launcher is every local rank's parent: a later launch on the same port gets a fresh directory.
+        path = os.path.join(tempfile.gettempdir(), f"unsloth_block_swap_{uid}_{job}_{os.getppid()}")
+        os.makedirs(path, exist_ok = True)
+        return path, int(rank), world
+    except (OSError, ValueError):
+        return None
+
+
+def _publish_host_pending(nbytes):
+    ledger = _rank_ledger()
+    if ledger is None:
+        return
+    path, rank, _ = ledger
+    try:
+        tmp = os.path.join(path, f"{rank}.{os.getpid()}.tmp")
+        with open(tmp, "w") as f:
+            f.write(f"{_HOST_SESSION} {max(0, int(nbytes))}")
+        os.replace(tmp, os.path.join(path, str(rank)))
+    except OSError:
+        pass
+
+
+def _others_host_pending(own):
+    """Host bytes the other local ranks still have to allocate, or None outside a multi-rank launch. A rank that
+    has not reached this session yet is assumed to need `own` (every rank loads the same model); one that is done
+    with it published 0, since what it allocated is already gone from available RAM."""
+    ledger = _rank_ledger()
+    if ledger is None:
+        return None
+    path, rank, world = ledger
+    total = 0
+    for r in range(world):
+        if r == rank:
+            continue
+        try:
+            with open(os.path.join(path, str(r))) as f:
+                session, nbytes = (int(x) for x in f.read().split())
+        except (OSError, ValueError):
+            session, nbytes = -1, 0
+        # A peer still in an earlier session (loading while this rank already installs) keeps what it published:
+        # its remaining load is still to come, and it will need about as much as this rank for this session too.
+        total += max(own, nbytes) if session < _HOST_SESSION else nbytes
+    return total
+
+
+def _begin_host_session():
+    global _HOST_SESSION
+    _HOST_SESSION += 1
+
+
+def _end_host_session():
+    # Everything this session allocated is in host RAM now: available RAM already shows it.
+    _publish_host_pending(0)
+
+
+def _check_host_fit(sizes, on_host = 0, slack = 0):
+    """Refuse an offload whose layers (`sizes`, bytes each) would not fit in free host RAM: running it out
+    freezes the machine. `on_host` bytes of them already sit in host RAM and are counted as available;
+    `slack` is allocator rounding on top of the packed bytes."""
+    try:
+        total, free = _host_free()
+    except Exception:
+        return
+    need = sum(sizes) + slack
+    own = max(0, need - on_host)
+    others = _others_host_pending(own)
+    if others is None:
+        # No shared ledger: every local rank reads the same free RAM, so each may only plan for its share.
+        avail = free // _local_world_size() + on_host
+    else:
+        # Ranks that finished already took their bytes out of `free`; only the others' remaining bytes are held back.
+        avail = free - others + on_host
+    # A peer that is copying a layer has already taken those bytes out of `free` but lowers its reservation
+    # only once the layer is in: give in-flight peers a moment before refusing.
+    retries = _PEER_RETRIES if others else 0
+    while need > avail and retries > 0:
+        retries -= 1
+        time.sleep(_PEER_RETRY_S)
+        try:
+            total, free = _host_free()
+        except Exception:
+            return None
+        others = _others_host_pending(own)
+        avail = free - (others or 0) + on_host
+    if need <= avail:
+        _publish_host_pending(own)
+        return own
+    fit, used = 0, slack
+    # Smallest first: the most layers that could fit.
+    for size in sorted(sizes):
+        if used + size > avail:
+            break
+        used, fit = used + size, fit + 1
+    raise ValueError(
+        f"Unsloth: offload_layers asked for {len(sizes)} layers in host RAM, which needs "
+        f"{need / 2**30:.1f} GiB, but only {max(avail, 0) / 2**30:.1f} GiB is available after keeping "
+        f"{_host_reserve(total) / 2**30:.1f} GiB free for the system. At most {fit} layers would fit; "
+        "lower offload_layers or free host RAM."
+    )
+
+
+def _lazy_host_empty(nbytes):
+    """Pageable host bytes whose pages are committed only as packing writes them, which the host guard credits.
+    torch.use_deterministic_algorithms(True) would otherwise fill (commit) the whole arena up front; every byte is
+    overwritten by packing, so skipping that fill never exposes uninitialized memory."""
+    det = getattr(getattr(torch.utils, "deterministic", None), "fill_uninitialized_memory", None)
+    if det is None or not det:
+        return torch.empty(nbytes, dtype = torch.uint8)
+    torch.utils.deterministic.fill_uninitialized_memory = False
+    try:
+        return torch.empty(nbytes, dtype = torch.uint8)
+    finally:
+        torch.utils.deterministic.fill_uninitialized_memory = det
 
 
 class _Registered:
@@ -134,6 +291,123 @@ def _host_chunk(nbytes, budget):
     return torch.empty(nbytes, dtype = torch.uint8), 0
 
 
+def _can_register():
+    return (_PINNED_MEMORY_AVAILABLE and os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") != "1"
+            and torch.cuda.is_available() and hasattr(torch.cuda.cudart(), "cudaHostRegister"))
+
+
+def _chunked_commits(block_sizes):
+    """Host bytes _pack's chunked fallback has allocated once each block (of {device: bytes} sizes) is packed,
+    padding included (same walk)."""
+    left = sum(sum(s.values()) for s in block_sizes)
+    chunk = max(_CHUNK_BYTES, _pow2_ceil(max((max(s.values(), default = 0) for s in block_sizes), default = 0)))
+    total, cap, used, out = 0, None, 0, []
+    for sizes in block_sizes:
+        for need in sizes.values():
+            if cap is None or used + need > cap:
+                cap = chunk if left >= chunk else _pow2_ceil(left)
+                total += cap
+                used = 0
+            used += need
+            left -= need
+        out.append(total)
+    return out
+
+
+# glibc serves allocations below its mmap threshold (dynamic, up to 32 MiB on 64-bit) from the heap, and free()
+# keeps those pages resident until malloc_trim. Larger ones are mmapped and go back to the OS on free.
+_HEAP_MAX_BYTES = 32 * 2**20
+_MALLOC_TRIM = []
+
+
+def _malloc_trim_fn():
+    if not _MALLOC_TRIM:
+        fn = None
+        if sys.platform.startswith("linux"):
+            try:
+                import ctypes
+                fn = ctypes.CDLL(None).malloc_trim
+                fn.argtypes, fn.restype = [ctypes.c_size_t], ctypes.c_int
+            except (OSError, AttributeError):
+                fn = None
+        _MALLOC_TRIM.append(fn)
+    return _MALLOC_TRIM[0]
+
+
+def _heap_trimmable():
+    return _malloc_trim_fn() is not None
+
+
+def _trim_host_heap():
+    """Return free heap pages to the OS (glibc malloc_trim, which also madvises free pages inside the heap).
+    True when it ran; False where there is no malloc_trim (not glibc)."""
+    fn = _malloc_trim_fn()
+    if fn is None:
+        return False
+    fn(0)
+    return True
+
+
+def _creditable_host_storages(swapped, layers, owner):
+    """{storage ptr: bytes} of the CPU storages packing `swapped` frees, and {ptr: user set}. Pointers and sizes
+    only: a storage reference held past this call would keep the storage alive while packing assumes it is gone."""
+    host_storages, users = {}, {}
+    # Heap-sized storages give their pages back only through malloc_trim, which packing runs after each credited
+    # block; without it (not glibc) only storages large enough to be mmapped are credited.
+    trimmable = _heap_trimmable()
+    for li, layer in enumerate(swapped):
+        for _, p in _swappable(layer):
+            if p.device.type == "cpu":
+                # Pinned by torch's caching host allocator: freeing it parks the block in that cache, still pinned,
+                # and nothing returns it to the OS while packing. Never credited.
+                try:
+                    if p.data.is_pinned():
+                        continue
+                except RuntimeError:
+                    pass
+                st = p.data.untyped_storage()
+                users.setdefault(st.data_ptr(), set()).add(li)
+                if trimmable or st.nbytes() >= _HEAP_MAX_BYTES:
+                    host_storages[st.data_ptr()] = st.nbytes()
+    swapped_ids = {id(p) for layer in swapped for _, p in _swappable(layer)}
+    # Buffers too: a registered buffer viewing a weight's storage keeps it alive after the weight is rebound.
+    if owner is not None:
+        everything = itertools.chain(owner.parameters(), owner.buffers())
+    else:
+        everything = (q for layer in layers for q in itertools.chain(layer.parameters(), layer.buffers()))
+    for q in everything:
+        if q.device.type == "cpu" and id(q) not in swapped_ids:
+            ptr = q.data.untyped_storage().data_ptr()
+            if ptr in users:
+                users[ptr].add(-1)
+    return {ptr: n for ptr, n in host_storages.items() if len(users[ptr]) == 1}, users
+
+
+class _HostWalk:
+    """Host RAM over install's packing walk. Block k's bytes are committed (`commits`, cumulative) before its
+    original's storage (`credits[k]`) is released, so the peak is the largest committed-through-k less
+    released-before-k, plus `margin` for release lag, and never above committing everything."""
+
+    def __init__(self, commits, credits, margin):
+        self.commits = list(commits)
+        self.released = [0] + list(itertools.accumulate(credits))[:len(self.commits)]
+        self.steps = [c - self.released[k] for k, c in enumerate(self.commits)]
+        self.margin = margin
+
+    def pending(self, k):
+        """Bytes still to come once blocks 0..k are packed and released (k = -1: before the first)."""
+        rest = self.steps[k + 1:]
+        if not rest:
+            return 0
+        now = self.commits[k] - self.released[k + 1] if k >= 0 else 0
+        return max(0, min(self.commits[-1], max(rest) + self.margin) - now)
+
+
+def _chunked_bytes(block_sizes):
+    """Host bytes _pack's chunked fallback allocates for blocks with these {device: bytes} sizes."""
+    return (_chunked_commits(block_sizes) or [0])[-1]
+
+
 _CHECKPOINT_FILE = os.path.join("torch", "utils", "checkpoint.py")
 
 
@@ -168,7 +442,8 @@ def _swappable(module):
 
 class _Block:
     __slots__ = ("params", "host", "devices", "index", "streams", "events", "resident", "slot", "sig",
-                 "pending", "layout", "sizes", "src", "empties", "host_buf", "home")
+                 "pending", "layout", "sizes", "src", "empties", "host_buf", "home",
+                 "t_copy", "copy_open", "copy_pending", "marks", "mark_open")
 
     def __init__(self, layer, streams, device, shared = ()):
         self.params, self.host, self.devices = [], [], []
@@ -190,7 +465,13 @@ class _Block:
             if d not in streams:
                 streams[d] = torch.cuda.Stream(device = d)
         self.streams = streams
-        self.events = {d: torch.cuda.Event() for d in self.sizes}
+        self.events = {d: torch.cuda.Event(enable_timing = _TIMING) for d in self.sizes}
+        self.t_copy = {d: torch.cuda.Event(enable_timing = True) for d in self.sizes} if _TIMING else None
+        self.copy_open = False
+        self.copy_pending = []
+        # Compute-stream marks: before the wait, after it, after the layer ran.
+        self.marks = tuple(torch.cuda.Event(enable_timing = True) for _ in range(3)) if _TIMING else None
+        self.mark_open = 0
         self.empties = [torch.empty(0, device = d, dtype = p.dtype) for p, d in zip(self.params, self.devices)]
         self.resident = True
         self.slot = None
@@ -226,12 +507,20 @@ class _Block:
         if self.resident:
             return
         bufs, views = slot
+        if self.copy_open:
+            # The last copy is still in flight: keep its events for _harvest_copy, record this one on new ones.
+            self.copy_pending.append((self.t_copy, self.events))
+            self.t_copy = {d: torch.cuda.Event(enable_timing = True) for d in self.sizes}
+            self.events = {d: torch.cuda.Event(enable_timing = True) for d in self.sizes}
         for d, event in self.events.items():
             stream = self.streams[d]
             stream.wait_stream(torch.cuda.current_stream(d))
             with torch.cuda.stream(stream):
+                if self.t_copy is not None:
+                    self.t_copy[d].record(stream)
                 bufs[d].copy_(self.host_buf[d], non_blocking = True)
                 event.record(stream)
+        self.copy_open = self.t_copy is not None
         for p, v in zip(self.params, views):
             p.data = v
         self.slot = slot
@@ -259,6 +548,17 @@ def _opaque(hook):
     return disable(hook) if disable is not None else hook
 
 
+def _output_logits(output):
+    out = getattr(output, "logits", None)
+    if isinstance(out, torch.Tensor):
+        return out
+    if isinstance(output, (tuple, list)):
+        # return_dict = False with labels puts the scalar loss first and the logits second.
+        tensors = [t for t in output[:2] if isinstance(t, torch.Tensor)]
+        return max(tensors, key = lambda t: t.numel(), default = None)
+    return output
+
+
 def swap_indices(total, n, placement = "spread"):
     """"spread": evenly spaced, ending at the last layer (each copy hides behind total / n layers); "tail": last n."""
     n = max(0, min(int(n), total))
@@ -268,11 +568,43 @@ def swap_indices(total, n, placement = "spread"):
 
 
 class BlockSwap:
-    """Install on a layer list; layers at `n` (a count or explicit indices) live on the host."""
+    """Install on a layer list; layers at `n` (a count or explicit indices) live on the host.
+    `prefetch_depth = "auto"` starts at 1 and deepens while copies stall a step that could hide them; `model`
+    (found automatically for lists from `find_decoder_layers`) lets it see the step peak after the last layer."""
 
-    def __init__(self, layers, n, prefetch_depth = 2, device = None, placement = "tail"):
+    # Defaults for instances built without __init__ (the scheduler tests).
+    total = 0
+    current = None
+    _auto = False
+    _settled = True
+    _step_queued = False
+    _steps = 0
+    _last_stall = None
+    _sampled = 0
+    _tot = None
+    _seen = None
+    _adapt_seen = None
+    _step_peak = None
+    _last_peak = None
+    _optimizer_reserve = {}
+    _reserve_owner = None
+    _reserve_layers = ()
+    _hwm_fresh = False
+    _hwm_base = {}
+    _peak_devs = ()
+
+    def __init__(self, layers, n, prefetch_depth = 2, device = None, placement = "tail", model = None):
         self.blocks, self.handles = [], []
-        self.depth = max(1, prefetch_depth)
+        auto = prefetch_depth == "auto"
+        # Auto tunes from the timing events; with UNSLOTH_OFFLOAD_STATS=0 it is the fixed default.
+        self._auto = auto and _TIMING
+        self._settled = not self._auto
+        self._step_queued = False
+        self.depth = _resolved_depth(prefetch_depth)
+        self.total = len(layers)
+        self._tot = dict.fromkeys(_STAT_KEYS, 0.0)
+        self._seen = dict(self._tot)
+        self._adapt_seen = dict(self._tot)
         self.streams = {}
         self.free = {}
         self._grew = False
@@ -287,10 +619,11 @@ class BlockSwap:
         self._input_hooked = [False] * len(self.indices)
         self.spans_devices, self.layer_device = False, None
         if not self.indices:
+            # Still a host session (with nothing pending): other local ranks then read this rank as done with it,
+            # and every rank's session count stays in step.
+            _begin_host_session()
+            _end_host_session()
             return
-        if device is None:
-            device = torch.device("cuda", torch.cuda.current_device())
-        self.device = torch.device(device)
         swapped = [layers[i] for i in self.indices]
         # A param shared by two layers stays on the card: evicting it under one empties it for the other.
         owners = {}
@@ -298,7 +631,78 @@ class BlockSwap:
             for _, p in _swappable(layer):
                 owners.setdefault(id(p), set()).add(li)
         shared = {pid for pid, o in owners.items() if len(o) > 1}
+        # Accelerate leaves layers that did not fit at load on `meta`, with the real weights behind its hooks.
+        for li in self.indices:
+            name = next((n for n, p in _swappable(layers[li])
+                         if p.device.type == "meta" and id(p) not in shared), None)
+            if name is not None:
+                raise ValueError(
+                    f"Unsloth: offload_layers cannot swap layer {li}: its weight {name} is on the meta device, "
+                    "so the model did not fit on the GPU at load and accelerate offloaded it to CPU or disk. "
+                    "Pass offload_layers to from_pretrained instead, so those layers load straight to host memory."
+                )
+        # After the meta check, which must refuse before any CUDA call.
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            # One canonical key: params report cuda:N, so a bare "cuda" would split peaks and homes in two.
+            self.device = torch.device("cuda", torch.cuda.current_device())
         self.blocks = [_Block(layer, self.streams, self.device, shared) for layer in swapped]
+        sizes = [b.nbytes() for b in self.blocks]
+        # Every card a block's frozen weights land on gets slots: its peaks are sampled and its growth judged too,
+        # not only the block's home card.
+        self._peak_devs = sorted({torch.device(dv) for b in self.blocks for dv in (*b.sizes, b.home) if dv is not None
+                                  and torch.device(dv).type == "cuda"}, key = lambda d: d.index or 0)
+        _begin_host_session()
+        # Weights already in host RAM are released as their block is packed. On Linux the registered arena is
+        # pageable and fills block by block, so only a couple of blocks are ever held twice (Flash-Next: 79.5 GiB
+        # of host layers packed with 34.5 GiB still free); Windows commits that arena up front, so no credit there.
+        # The chunked fallback allocates one chunk at a time and releases each block's original right after
+        # packing it, so on top of the originals it holds at most one chunk and the block being packed.
+        # Per storage: a CPU tensor shared by several selected layers is released (and credited) once.
+        # A storage is freed only once every tensor on it is gone: credit only one that lives in a single swapped
+        # layer's swappable weights (a 10 GiB storage viewed by ten layers stays resident until the last is packed,
+        # and one also viewed from outside the swapped weights is never freed by packing).
+        # The whole model when it is known, passed or inferred from find_decoder_layers: an alias outside the
+        # decoder list (a tied head, a model-level buffer) keeps the storage alive just the same.
+        owner = model
+        if owner is None:
+            try:
+                owner = _LAYER_OWNERS.get(layers)
+            except TypeError:  # a plain list of layers
+                owner = None
+            owner = owner() if owner is not None else None
+        host_storages, users = _creditable_host_storages(swapped, layers, owner)
+        # A file-backed (mmap) storage is page cache that available RAM already counts: no extra headroom.
+        file_backed = _file_backed_ranges()
+        # Per block, the credited bytes its packing gives back: the ledger tracks what is still to come from that.
+        self._host_credit = [0] * len(swapped)
+        for ptr, n in host_storages.items():
+            if not _in_ranges(ptr, file_backed):
+                self._host_credit[next(iter(users[ptr]))] += n
+        # Walk the packing order: block k's bytes are committed before its original is released, so the peak is
+        # the largest (committed through k) - (released before k), not the total less every credit (ten GPU blocks
+        # packed ahead of one CPU block whose storage is 10 GiB still commit all ten first).
+        if not _can_register():
+            # The chunked fallback commits whole chunks, rounded up to powers of two (padding included).
+            commits = _chunked_commits([b.sizes for b in self.blocks])
+        elif os.name == "nt":
+            # Windows commits the whole registered arena up front.
+            commits = [sum(sizes)] * len(sizes)
+        else:
+            # The Linux registered arena is pageable and fills block by block as it is written.
+            commits = list(itertools.accumulate(sizes))
+        # A block's worth of margin over the walk, for release lag; never above committing everything.
+        self._host_walk = _HostWalk(commits, self._host_credit, max(sizes, default = 0))
+        need = commits[-1] if commits else 0
+        peak = self._host_walk.pending(-1)
+        slack = need - sum(sizes)
+        try:
+            self._host_own = _check_host_fit(sizes, on_host = need - peak, slack = slack)
+        except Exception:
+            _end_host_session()
+            raise
         homes = {b.home for b in self.blocks if b.home is not None}
         for li, layer in enumerate(layers):
             if li not in self.pos:
@@ -313,11 +717,27 @@ class BlockSwap:
 
         # Evict before building the pool (originals + pool would OOM); roll back on any failure.
         try:
+            if self._auto:
+                self._reserve_owner = weakref.ref(owner) if owner is not None else None
+                self._reserve_layers = layers
+                self._optimizer_reserve = self._optimizer_bytes()
+                # Allocator high-water mark at install (load and the pre-swap model): only a rise past it is training.
+                self._hwm_base = {_cuda_index(dv): torch.cuda.max_memory_allocated(dv) for dv in self._peak_devs}
+            if self._auto and owner is not None:
+                # Logits and loss run after the last layer, so only the model's output sees the step's peak.
+                self.handles.append(owner.register_forward_hook(_opaque(self._output_peak)))
             for i, layer in enumerate(swapped):
                 self.handles.append(layer.register_forward_pre_hook(self._pre(i), with_kwargs = True))
                 self.handles.append(layer.register_forward_hook(self._post(i)))
                 # Evicted weights are empty: state_dict must read the host copy.
                 self.handles.append(layer._register_state_dict_hook(self._state_dict(i)))
+            if self._auto:
+                # Unswapped layers below the first swapped one run their backward after its hook: sample them too.
+                first = min(self.pos, default = 0)
+                for li, layer in enumerate(layers[:first]):
+                    if li not in self.pos:
+                        self.handles.append(
+                            layer.register_forward_pre_hook(_opaque(self._plain_peak), with_kwargs = True))
 
             self._pack()
             total = self.host_bytes()
@@ -332,9 +752,21 @@ class BlockSwap:
                 self.free[sig] = [self._new_slot(sig) for _ in range(min(self.depth + 1, sigs.count(sig)))]
 
             self._arm(forward = True)
+            if self._auto:
+                # A fresh allocator peak window from here on: the load's own peak would hide every training peak
+                # below it, and temporaries inside a layer (dequantized expert stacks) never reach a hook sample.
+                # Before training starts, so a caller measuring the training peak from here reads the same number.
+                try:
+                    for dv in self._peak_devs:
+                        torch.cuda.reset_peak_memory_stats(dv)
+                    self._hwm_fresh = True
+                except Exception:
+                    self._hwm_fresh = False
         except Exception:
             self.remove()
             raise
+        finally:
+            _end_host_session()
 
     def _pack(self):
         # Block by block, releasing each original as soon as it is packed: never two host copies of the tail.
@@ -344,7 +776,7 @@ class BlockSwap:
         chunk = max(_CHUNK_BYTES, _pow2_ceil(max(max(b.sizes.values(), default = 0) for b in self.blocks)))
         budget = _pin_budget()
         buf, used = None, 0
-        for b in self.blocks:
+        for k, b in enumerate(self.blocks):
             regions = {}
             for d, need in b.sizes.items():
                 if buf is None or used + need > buf.numel():
@@ -357,17 +789,31 @@ class BlockSwap:
                 left -= need
             b.pack(regions)
             self._release(b)
+            self._publish_packed(k)
+
+    def _publish_packed(self, k):
+        # Blocks 0..k are packed and their originals released; free RAM already shows what that took. Other local
+        # ranks hold back only the rise still to come over this point of the walk install planned, chunk padding
+        # already committed included, not a share of the first estimate. Not capped at the first estimate either:
+        # releasing a storage larger than its block raises free RAM, and the blocks still to pack need it back.
+        credit = getattr(self, "_host_credit", None)
+        if credit is not None and k < len(credit) and credit[k] > 0:
+            # The credit assumes the originals' pages are gone now: heap-served ones need an explicit trim.
+            _trim_host_heap()
+        own = getattr(self, "_host_own", None)
+        walk = getattr(self, "_host_walk", None)
+        if own is not None and walk is not None:
+            _publish_host_pending(walk.pending(k))
 
     def _pack_registered(self):
         # One exact-size pageable arena, page-locked in place up to the budget (cudaHostRegister).
         global _PINNED_MEMORY_AVAILABLE
-        if (not _PINNED_MEMORY_AVAILABLE or os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") == "1"
-                or not hasattr(torch.cuda.cudart(), "cudaHostRegister")):
+        if not _can_register():
             return False
         total = sum(b.nbytes() for b in self.blocks)
-        arena = torch.empty(total, dtype = torch.uint8)
+        arena = _lazy_host_empty(total)
         used, ends = 0, []
-        for b in self.blocks:
+        for k, b in enumerate(self.blocks):
             regions = {}
             for d, need in b.sizes.items():
                 regions[d] = arena[used:used + need]
@@ -375,6 +821,7 @@ class BlockSwap:
             b.pack(regions)
             self._release(b)
             ends.append(used)
+            self._publish_packed(k)
         # Pin whole blocks only: a copy from half-pinned memory is staged synchronously.
         budget = _pin_budget()
         pin = max([e for e in ends if e <= budget], default = 0)
@@ -424,6 +871,8 @@ class BlockSwap:
     def _fetch(self, block, steal = False):
         if block.resident:
             return
+        if getattr(block, "copy_open", False) or getattr(block, "copy_pending", None):
+            self._harvest_copy(block)
         slot = self._acquire(block, steal)
         if slot is not None:
             block.prefetch(slot)
@@ -438,8 +887,28 @@ class BlockSwap:
     def _pre(self, i):
         def hook(module, args, kwargs):
             b = self.blocks[i]
+            self.current = self.indices[i]
+            if self._auto and not self._settled:
+                self._note_block_peak(b)
             self._fetch(b, steal = True)
-            b.wait()
+            marks = getattr(b, "marks", None)
+            # A sample still in flight (backward recompute queued behind its forward) is kept for _harvest,
+            # not overwritten: recording into the same events would lose it.
+            # mark_open: 1 = waiting sample open, 2 = full sample recorded, 3 = wait-only sample closed (the forward
+            # hook never ran: a recompute that stopped early) but its events may still be in flight.
+            in_flight = marks is not None and (
+                (b.mark_open == 2 and not marks[2].query()) or (b.mark_open in (1, 3) and not marks[1].query()))
+            if marks is not None and not in_flight:
+                self._harvest_marks(b)
+                stream = torch.cuda.current_stream(b.home)
+                marks[0].record(stream)
+                b.wait()
+                marks[1].record(stream)
+                b.mark_open = 1
+            else:
+                if marks is not None and b.mark_open == 1:
+                    b.mark_open = 3   # keep it for _harvest; this layer call records no sample of its own
+                b.wait()
             # Weights kept for backward = recompute sweep, which walks layers in reverse.
             nxt = i - self.depth if _autograd_keeps_weights() else i + self.depth
             if 0 <= nxt < len(self.blocks):
@@ -465,6 +934,10 @@ class BlockSwap:
 
     def _post(self, i):
         def hook(module, args, output):
+            b = self.blocks[i]
+            if getattr(b, "mark_open", 0) == 1:
+                b.marks[2].record(torch.cuda.current_stream(b.home))
+                b.mark_open = 2
             training = getattr(module, "training", False)
             if not _autograd_keeps_weights():
                 # A training forward's last blocks are the first ones recompute needs: keep them.
@@ -489,10 +962,72 @@ class BlockSwap:
 
     def _bwd(self, i):
         def hook(grad):
+            if self._auto and not self._settled:
+                self._note_block_peak(self.blocks[i])
             self._release(self.blocks[i])
-            if i == 0:
+            # The output's grad hook already queued the step end from the outer graph (see _output_peak). Without
+            # one (a bare layer list), queue it here, once: a non-reentrant checkpoint hooks the same input in the
+            # forward and again in the recompute, so this runs twice per backward.
+            if i == 0 and not self._step_queued:
+                self._step_queued = True
+                try:
+                    torch.autograd.Variable._execution_engine.queue_callback(self._end_step)
+                except RuntimeError:  # not inside a backward
+                    self._end_step()
+            elif i == 0:
+                # A deferred release (a first swapped layer whose input needs no grad) can run after the queued
+                # _end_step armed the next forward while this block was still resident: arm again, no new step.
                 self._arm(forward = True)
         return _opaque(hook)
+
+    def _clear_step_queued(self):
+        self._step_queued = False
+
+    def _end_step(self):
+        # Backward is done: a wait sample whose forward hook never ran (a recompute that stopped early) is complete.
+        for b in self.blocks:
+            if getattr(b, "marks", None) is not None and getattr(b, "mark_open", 0) == 1:
+                b.mark_open = 3
+        if self._step_queued:
+            # Queued from the output's grad hook: a deferred _bwd(0) release (a first swapped layer whose input
+            # needs no grad) runs later in the same backward's final callbacks and must not end the step again.
+            # Clear the mark after those, by queuing the clear behind them.
+            try:
+                torch.autograd.Variable._execution_engine.queue_callback(self._clear_step_queued)
+            except RuntimeError:
+                self._step_queued = False
+        if self._auto and not self._settled:
+            # Grads accumulated in the layers below the first swapped one are still allocated here.
+            for dv in self._peak_devs:
+                self._note_peak(dv)
+        self._last_peak, self._step_peak = self._step_peak or {}, {}
+        self._steps += 1
+        if self._steps == 1 and self._tot is not None:
+            # Step 1 includes copies armed at install and warmup: windows start after it. Wait for its events once,
+            # so none of its samples is still pending (and later counted in the first window) when the baseline is set.
+            for dv in {d for d in self.streams if isinstance(d, torch.device) and d.type == "cuda"} | set(self._peak_devs):
+                torch.cuda.synchronize(dv)
+            self._harvest()
+            self._seen, self._adapt_seen = dict(self._tot), dict(self._tot)
+        elif not self._settled:
+            self._adapt_depth()
+        self._arm(forward = True)
+
+    def _plain_peak(self, module, args, kwargs):
+        if not self._auto or self._settled or not torch.is_grad_enabled():
+            return
+        homes = self._peak_devs
+        for dv in homes:
+            self._note_peak(dv)
+        x = next((a for a in args if isinstance(a, torch.Tensor)), None)
+        if x is None:
+            x = kwargs.get("hidden_states")
+        if isinstance(x, torch.Tensor) and x.requires_grad:
+            def peak(grad):
+                if self._auto and not self._settled:
+                    for dv in homes:
+                        self._note_peak(dv)
+            x.register_hook(_opaque(peak))
 
     def _state_dict(self, i):
         def hook(module, state_dict, prefix, local_metadata):
@@ -543,6 +1078,8 @@ class BlockSwap:
         # Callers holding this object (the fast decode loop) must see a no-op, not an empty pool.
         self.blocks = []
         self._chunks = []
+        # A removed controller must not keep the model's layers (and their restored GPU weights) alive.
+        self._reserve_layers, self._reserve_owner = (), None
         for dev in self.streams:
             torch.cuda.synchronize(dev)
 
@@ -576,6 +1113,222 @@ class BlockSwap:
 
     def resident_count(self):
         return sum(b.resident for b in self.blocks)
+
+    def _harvest_copy(self, b):
+        # Only finished copies are read: query() never blocks the host.
+        def done(events):
+            return all(e.query() for e in events.values())
+
+        def add(starts, ends):
+            # max(0, ...): HIP can order timestamps of events recorded while a stream sat idle backwards.
+            self._tot["copy_ms"] += sum(max(0.0, starts[d].elapsed_time(e)) for d, e in ends.items())
+            self._tot["copies"] += 1
+            self._tot["copy_bytes"] += b.nbytes()
+
+        keep = []
+        for starts, ends in getattr(b, "copy_pending", []):
+            if done(ends):
+                add(starts, ends)
+            else:
+                keep.append((starts, ends))
+        b.copy_pending = keep
+        if b.copy_open and done(b.events):
+            add(b.t_copy, b.events)
+            b.copy_open = False
+
+    def _harvest_marks(self, b):
+        if b.mark_open == 2 and b.marks[2].query():
+            self._tot["stall_ms"] += max(0.0, b.marks[0].elapsed_time(b.marks[1]))
+            self._tot["compute_ms"] += max(0.0, b.marks[1].elapsed_time(b.marks[2]))
+            self._tot["layers"] += 1
+        elif b.mark_open in (1, 3) and b.marks[1].query():
+            # The forward hook never ran (a checkpoint recompute that stopped early): the wait still happened.
+            self._tot["stall_ms"] += max(0.0, b.marks[0].elapsed_time(b.marks[1]))
+        b.mark_open = 0
+
+    def _harvest(self):
+        for b in self.blocks:
+            if getattr(b, "copy_open", False) or getattr(b, "copy_pending", None):
+                self._harvest_copy(b)
+            if (getattr(b, "mark_open", 0) == 2 and b.marks[2].query()) or (
+                    getattr(b, "mark_open", 0) == 3 and b.marks[1].query()):
+                self._harvest_marks(b)
+
+    def _since(self, seen):
+        return {k: self._tot[k] - seen[k] for k in _STAT_KEYS}
+
+    def _adapt_depth(self):
+        # Between steps only: the "keep the last depth blocks" rule in _post must not change mid-sweep.
+        self._harvest()
+        d = self._since(self._adapt_seen)
+        if d["layers"] == 0 or d["copies"] == 0:
+            return
+        self._sampled += 1
+        if self._sampled < _AUTO_SAMPLE and self._steps < _AUTO_STEPS:
+            return
+        self._sampled = 0
+        self._adapt_seen = dict(self._tot)
+        busy = d["compute_ms"] + d["stall_ms"]
+        stall = d["stall_ms"] / busy if busy > 0 else 0.0
+        # Measured, not predicted: a slot that does not cut the stall (a bus slower than compute, or noise)
+        # is given back, so a slow bus costs one slot for a couple of steps.
+        if self._last_stall is not None and stall > 0.75 * self._last_stall:
+            self._shrink_pool()
+            self.depth -= 1
+            self._settled = True
+        elif stall > _AUTO_STALL and self.depth < _AUTO_MAX_DEPTH and self._grow_pool():
+            self.depth += 1
+            self._last_stall = stall
+        else:
+            self._settled = True
+        if self._steps >= _AUTO_STEPS:
+            self._settled = True
+        if self._settled:
+            print(f"Unsloth: offload_layers prefetch_depth = 'auto' settled on {self.depth} "
+                  f"(copies stalled {100 * stall:.1f}% of the swapped layers' time).")
+
+    def _output_peak(self, module, args, output):
+        if not self._auto or self._settled:
+            return
+        self._step_queued = False
+        homes = self._peak_devs
+        for dv in homes:
+            self._note_peak(dv)
+        out = _output_logits(output)
+        node = getattr(out, "grad_fn", None) if isinstance(out, torch.Tensor) else None
+        # When the output's grad lands, the op that consumed the output (the loss) has just held the output,
+        # its grad and a temporary of the same size; only the grad is still allocated. A node hook, not a
+        # tensor hook: callers keep only the loss, and a tensor hook dies with the dropped output.
+        hooks = [(node, out.device, out.nbytes)] if node is not None else []
+        # The loss too: fused cross entropy (Unsloth's) computes it from the hidden states, so returned logits
+        # (UNSLOTH_RETURN_LOGITS=1) need not be its ancestors and backward from the loss never reaches them.
+        loss = getattr(output, "loss", None)
+        if loss is None and isinstance(output, (tuple, list)) and output and isinstance(output[0], torch.Tensor):
+            loss = output[0] if output[0].numel() == 1 else None
+        loss_node = getattr(loss, "grad_fn", None) if isinstance(loss, torch.Tensor) else None
+        if loss_node is not None and loss_node is not node:
+            hooks.append((loss_node, None, 0))
+        for node, dev, size in hooks:
+
+            def grad_peak(*_, dev = dev, size = size):
+                if self._auto and not self._settled:
+                    for dv in homes:
+                        self._note_peak(dv, extra = 2 * size if dev is not None and _cuda_index(dv) == _cuda_index(dev)
+                                        else 0)
+                    # Queued from the outer graph, so it runs after the whole backward: a reentrant checkpoint's
+                    # inner backward per layer, layers below the first swapped one and a frozen first block included.
+                    if not self._step_queued:
+                        self._step_queued = True
+                        torch.autograd.Variable._execution_engine.queue_callback(self._end_step)
+            register = getattr(node, "register_prehook", None) or node.register_hook
+            register(_opaque(grad_peak))
+
+    def _note_block_peak(self, b):
+        for dv in b.sizes or (b.home,):
+            self._note_peak(dv)
+
+    def _note_peak(self, dv, extra = 0):
+        # Our own per-step high-water mark: torch's peak counter still holds the load and the pre-swap model.
+        if dv is None:   # a block with nothing swappable (all trainable, or only shared weights) has no home card
+            return
+        if self._step_peak is None:
+            self._step_peak = {}
+        k = torch.device(dv).index
+        self._step_peak[k] = max(self._step_peak.get(k, 0), torch.cuda.memory_allocated(dv) + extra)
+
+    def _optimizer_bytes(self):
+        """AdamW's two fp32 moments + the foreach temporary per trainable param (12 bytes), per card. Read from the
+        current params: adapters attached after install (PEFT on a swapped base) count too."""
+        owner = self._reserve_owner() if self._reserve_owner is not None else None
+        params = owner.parameters() if owner is not None else \
+            (q for layer in self._reserve_layers for q in layer.parameters())
+        reserve, seen = {}, set()
+        for q in params:
+            if q.requires_grad and q.is_cuda and id(q) not in seen:
+                seen.add(id(q))
+                k = _cuda_index(q.device)
+                reserve[k] = reserve.get(k, 0) + q.numel() * 12
+        return reserve
+
+    def _grow_pool(self):
+        """One more slot for every pool that can use one, if each card still has room for it."""
+        sigs = [b.sig for b in self.blocks]
+        want = [s for s in self.free if sigs.count(s) > self.depth + 1]
+        if not want:
+            # Every block already has a slot of its own (signatures alternating A/B/A/B): a deeper lookahead
+            # allocates nothing and only starts each copy earlier, up to one block short of the whole sweep.
+            return self.depth + 1 < len(self.blocks)
+        need = {}
+        for s in want:
+            size = {}
+            for shape, dt, dv, off in s:
+                n = torch.Size(shape).numel() * torch.empty(0, dtype = dt).element_size()
+                size[dv] = max(size.get(dv, 0), off + -(-n // _ALIGN) * _ALIGN)
+            for dv, n in size.items():
+                need[dv] = need.get(dv, 0) + n
+        fresh = self._optimizer_bytes() if (self._reserve_owner is not None or self._reserve_layers) else {}
+        reserve = {k: max(fresh.get(k, 0), self._optimizer_reserve.get(k, 0)) for k in {*fresh, *self._optimizer_reserve}}
+        for dv, n in need.items():
+            # Between steps the activations are gone; keep room for the next step's peak.
+            k = _cuda_index(dv)
+            peak = (self._last_peak or {}).get(torch.device(dv).index, 0)
+            # Hook samples miss temporaries made and freed inside a layer or the loss: once the allocator's
+            # high-water mark has risen past where it stood at install, that mark is a real training peak.
+            hwm = torch.cuda.max_memory_allocated(dv)
+            if self._hwm_fresh or hwm > self._hwm_base.get(k, hwm):
+                peak = max(peak, hwm)
+            transient = max(0, peak - torch.cuda.memory_allocated(dv))
+            # Still keep a workspace margin for intra-op temporaries the samples cannot see.
+            transient += max(_WORKSPACE_MIN_BYTES, int(torch.cuda.get_device_properties(dv).total_memory * _WORKSPACE_FRACTION))
+            # optimizer.step() runs after every peak sample: keep room for AdamW's two moments (lazily allocated on
+            # the first step) and the foreach temporary, as plan_block_swap budgets them.
+            transient += reserve.get(_cuda_index(dv), 0)
+            if _free_device_bytes(dv) - transient < 2 * n:
+                return False
+        for s in want:
+            self.free[s].append(self._new_slot(s))
+        return True
+
+    def _shrink_pool(self):
+        sigs = [b.sig for b in self.blocks]
+        for s, free in self.free.items():
+            held = sum(b.sig == s and b.slot is not None for b in self.blocks)
+            if free and held + len(free) > min(self.depth, sigs.count(s)):
+                free.pop()
+
+    def stats(self, reset = True):
+        """Where each swapped layer is, plus copy / stall / compute totals since the last call."""
+        self._harvest()
+        window = self._since(self._seen)
+        if reset:
+            self._seen = dict(self._tot)
+        state = {}
+        for li, b in zip(self.indices, self.blocks):
+            if not b.resident:
+                state[li] = "host"
+            elif b.pending:
+                state[li] = "held"
+            elif not all(e.query() for e in b.events.values()):
+                state[li] = "copying"
+            else:
+                state[li] = "gpu"
+        return {
+            "total_layers": self.total,
+            "swapped": list(self.indices),
+            "state": state,
+            "current": self.current,
+            "prefetch_depth": self.depth,
+            "auto_depth": self._auto,
+            "depth_settled": self._settled,
+            "host_bytes": self.host_bytes(),
+            "pinned_bytes": self.pinned_bytes,
+            "pool_bytes": self.pool_bytes(),
+            "timing": _TIMING,
+            **window,
+        }
+
+
+_STAT_KEYS = ("copies", "copy_ms", "copy_bytes", "stall_ms", "compute_ms", "layers")
 
 
 def _text_config(config):
@@ -657,9 +1410,44 @@ def _layer_signature(params):
     return tuple((tuple(p.shape), p.dtype) for _, p in params)
 
 
+def _file_backed_ranges():
+    """[(start, end)] of this process's file-backed mappings (Linux /proc/self/maps); [] elsewhere."""
+    out = []
+    try:
+        with open("/proc/self/maps", "r", encoding = "utf-8", errors = "replace") as f:
+            for line in f:
+                fields = line.split(maxsplit = 5)
+                if len(fields) < 6 or not fields[5].strip().startswith("/") or fields[4] == "0":
+                    continue   # anonymous, [heap], [stack] or a pseudo file (inode 0)
+                lo, hi = (int(x, 16) for x in fields[0].split("-"))
+                out.append((lo, hi))
+    except OSError:
+        return []
+    return out
+
+
+def _in_ranges(ptr, ranges):
+    return any(lo <= ptr < hi for lo, hi in ranges)
+
+
+def _cuda_index(dv):
+    """The card index of a CUDA device (a bare "cuda" is the current card); None for anything else."""
+    d = torch.device(dv)
+    if d.type != "cuda":
+        return None
+    return d.index if d.index is not None else torch.cuda.current_device()
+
+
+def _resolved_depth(prefetch_depth):
+    """The depth BlockSwap starts at: "auto" starts at 1 (2 when timing is off, the fixed default)."""
+    if prefetch_depth == "auto":
+        return 1 if _TIMING else 2
+    return max(1, int(prefetch_depth))
+
+
 def _pool_bytes(sizes, depth, sigs = None):
     # One pool per shape signature (as BlockSwap keys them), depth + 1 slots each, fewer if fewer blocks share it.
-    depth = max(1, depth)  # as BlockSwap
+    depth = _resolved_depth(depth)  # as BlockSwap
     counts = {}
     for i, b in enumerate(sizes):
         key = sigs[i] if sigs is not None else b
@@ -713,12 +1501,37 @@ def _mark_host_kept(model):
     params = list(model.named_parameters(remove_duplicate = False))
     # Whole owner module (FP8Embedding's weight_scale sits beside the table), tagged on the module
     # because a load to host replaces the Parameter.
-    for owner in {n.rsplit(".", 1)[0] for n, _ in params if any(n == x or n.endswith("." + x) for x in names)}:
+    try:
+        from .device_map_planner import no_placement_matcher
+    except ImportError:  # loaded as a standalone file (tests): same rule, inline
+        def no_placement_matcher(model, names):
+            dotted = [n for n in names if "." in n]
+            bare = {n for n in names if "." not in n}
+            no_split = set(getattr(model, "_no_split_modules", None) or [])
+            roots = {p for p, m in model.named_modules() if type(m).__name__ in no_split} if bare else set()
+            return lambda name: any(name == n or name.endswith("." + n) for n in dotted) or (
+                name.rpartition(".")[2] in bare and name.rpartition(".")[0] in roots
+            )
+    match = no_placement_matcher(model, names)
+    for owner in {n.rsplit(".", 1)[0] for n, _ in params if match(n)}:
         model.get_submodule(owner)._unsloth_host_kept = True
+
+
+# Layer list -> the model find_decoder_layers found it in: BlockSwap watches that model's output for the step peak.
+_LAYER_OWNERS = weakref.WeakKeyDictionary()
 
 
 def find_decoder_layers(model):
     _mark_host_kept(model)
+    layers = _find_decoder_layers(model)
+    try:
+        _LAYER_OWNERS[layers] = weakref.ref(model)
+    except TypeError:
+        pass
+    return layers
+
+
+def _find_decoder_layers(model):
     m = model
     for _ in range(6):
         for attr in ("model", "base_model", "transformer", "language_model"):
@@ -744,6 +1557,31 @@ def find_decoder_layers(model):
     raise RuntimeError("could not locate decoder layers")
 
 
+def _host_layer_bytes(make_layer, idx, tensors, compute_dtype, quantize_4bit, skip_modules, prefix):
+    """Host bytes build_host_layers will copy for layer `idx`: packed 4-bit Linear weights (prequantized or
+    quantized here) take half a byte per element, everything else the compute dtype."""
+    with torch.device("meta"):
+        layer = make_layer(idx)
+    width = torch.empty(0, dtype = compute_dtype).element_size()
+    base, total, done = f"{prefix}{idx}.", 0, set()
+    for mname, mod in layer.named_modules():
+        if not isinstance(mod, torch.nn.Linear):
+            continue
+        key = base + mname + ".weight"
+        packed = any(k.startswith(key + ".") for k in tensors) or (
+            quantize_4bit and not any(s in mname.split(".") for s in skip_modules))
+        n = mod.weight.numel()
+        total += (n + 1) // 2 if packed else n * width
+        done.add(id(mod.weight))
+        if mod.bias is not None:
+            total += mod.bias.numel() * width
+            done.add(id(mod.bias))
+    for p in layer.parameters():
+        if id(p) not in done:
+            total += p.numel() * (width if p.is_floating_point() else p.element_size())
+    return total
+
+
 def build_host_layers(make_layer, first_idx, count, tensors, device, compute_dtype,
                       quantize_4bit = False, skip_modules = (), prefix = "model.layers."):
     """Build layers [first_idx, first_idx + count) with frozen weights in pinned host RAM; quant_state stays on `device`."""
@@ -751,8 +1589,27 @@ def build_host_layers(make_layer, first_idx, count, tensors, device, compute_dty
     device = torch.device(device)
     if any(".quant_state." in k for k in tensors):
         quantize_4bit = False
+    # Refuse before copying anything when the layers cannot fit in host RAM (sized on meta, no tensor read).
+    _begin_host_session()
+    try:
+        return _build_host_layers(make_layer, first_idx, count, tensors, device, compute_dtype, quantize_4bit,
+                                  skip_modules, prefix, bnb)
+    finally:
+        _end_host_session()
+
+
+def _build_host_layers(make_layer, first_idx, count, tensors, device, compute_dtype, quantize_4bit, skip_modules,
+                       prefix, bnb):
+    sizes = [_host_layer_bytes(make_layer, idx, tensors, compute_dtype, quantize_4bit, skip_modules, prefix)
+             for idx in range(first_idx, first_idx + count)]
+    _check_host_fit(sizes)
     out = []
+    pending = sum(sizes)
     for idx in range(first_idx, first_idx + count):
+        if out:
+            # The layers built so far are in available RAM already: other local ranks hold back only the rest.
+            pending -= sizes[len(out) - 1]
+            _publish_host_pending(pending)
         with torch.device("meta"):
             layer = make_layer(idx)
         base = f"{prefix}{idx}."
@@ -828,14 +1685,60 @@ def extra_input_embeddings(model):
     return out
 
 
+def _counted_params(module):
+    """Params a host move costs: a host-kept table (`_no_placement_params`, tagged by _mark_host_kept) is already
+    in host RAM before any layer moves, so it is neither charged again nor credited."""
+    kept = set()
+    for m in module.modules():
+        if getattr(m, "_unsloth_host_kept", False):
+            kept.update(id(p) for p in m.parameters())
+    return [p for p in module.parameters() if id(p) not in kept]
+
+
+def _counted_named(module):
+    ids = {id(p) for p in _counted_params(module)}
+    return [(n, p) for n, p in module.named_parameters() if id(p) in ids]
+
+
+# Loaded bytes per declared (meta) byte of a quantized weight before any layer of that kind has loaded:
+# bitsandbytes declares the unquantized shape in the compute dtype (16-bit) and stores 4 or 8 bits per value.
+_QUANT_PRIOR = {"4bit": 0.25, "8bit": 0.5}
+
+
+def _param_kind(layer, name, p):
+    cls = type(p).__name__
+    if cls == "Params4bit":
+        return "4bit"
+    if cls == "Int8Params":
+        return "8bit"
+    if name.endswith("weight"):
+        owner = layer.get_submodule(name.rpartition(".")[0]) if "." in name else layer
+        mcls = type(owner).__name__
+        if "4bit" in mcls:
+            return "4bit"
+        if "8bit" in mcls:
+            return "8bit"
+    return "dense"
+
+
 class _HostLoad:
     """What `load_layers_to_host` moved: the layer list and the indices living in host RAM."""
 
     def __init__(self, n, placement, embeddings = False):
         self.n, self.placement, self.want_embeddings = n, placement, embeddings
         self.layers, self.indices, self.prefixes = None, [], {}
-        self.done = set()
-        self.embedding_prefixes, self.embeddings = {}, []
+        self.done, self.done_bytes = set(), []
+        self.moved_storages = set()
+        self.ratios = {}   # loaded bytes / declared meta bytes, per moved layer
+        self.embedding_prefixes, self.embeddings, self.embedding_bytes = {}, [], []
+        # Each selected layer's bytes as declared on meta, to scale a loaded layer's size to the others'.
+        self.shape_bytes, self.last_done = {}, None
+        self.owned_names = {}
+        # Per selected layer, {param name: (kind, declared bytes)}; per kind, {layer: loaded / declared bytes}.
+        # A layer left unquantized (a skip module) loads at full size while the others load at 4 bits: one ratio
+        # for every layer would charge the quantized ones at full size.
+        self.decl, self.kind_ratios = {}, {}
+        self.cpu_to_come = 0
 
     def bind(self, model):
         if self.layers is not None:
@@ -847,18 +1750,129 @@ class _HostLoad:
             else sorted({int(i) % len(layers) for i in self.n})
         if name is not None:
             self.prefixes = {f"{name}.{i}.": i for i in self.indices}
+        # A param shared by several selected layers moves once: charge it to the first.
+        seen = set()
+        self.shape_bytes, self.owned_names = {}, {}
+        for i in self.indices:
+            own = [(n, p) for n, p in _counted_named(layers[i]) if id(p) not in seen]
+            seen.update(id(p) for _, p in own)
+            self.shape_bytes[i] = sum(p.nbytes for _, p in own)
+            # By name: loading replaces the meta Parameter objects, the names stay.
+            self.owned_names[i] = {n for n, _ in own}
+            self.decl[i] = {n: (_param_kind(layers[i], n, p), p.nbytes) for n, p in own}
         if self.want_embeddings:
-            self.embedding_prefixes = {f"{n}.": m for n, m in extra_input_embeddings(model)}
+            # A table inside a selected layer moves (and is charged) with that layer, not a second time here.
+            inside = tuple(self.prefixes)
+            self.embedding_prefixes = {f"{n}.": m for n, m in extra_input_embeddings(model)
+                                       if not (inside and f"{n}.".startswith(inside))}
+
+    def _layers_to_come(self, size, ref):
+        """Bytes of the selected layers not moved yet. A layer already materialized counts its own bytes; one still
+        on meta is scaled from its declared size by the smallest storage ratio seen so far (layer `ref` takes
+        `size` bytes loaded), since layers can be quantized differently (skip modules) and each later eviction
+        re-checks with real sizes."""
+        left = [j for j in self.indices if j not in self.done]
+        # The layer being moved first: a storage it shares with a later-loaded selected layer is its own (credited
+        # by the caller), never also counted in cpu_to_come for the other layer.
+        if ref in left:
+            left.remove(ref)
+            left.insert(0, ref)
+        base = self.shape_bytes.get(ref, 0)
+        ratios = list(self.ratios.values()) + ([size / base] if base else [])
+        ratio = min(ratios) if ratios else None
+        ref_kinds = self._kind_sample(ref)
+
+        def projected(j, names = None):
+            # Declared bytes scaled per kind: by the smallest ratio seen for that kind, else the kind's prior.
+            decl = self.decl.get(j)
+            if not decl:
+                return None
+            total = 0
+            for n, (kind, nbytes) in decl.items():
+                if names is not None and n not in names:
+                    continue
+                seen = list(self.kind_ratios.get(kind, {}).values())
+                if kind in ref_kinds:
+                    seen.append(ref_kinds[kind])
+                total += nbytes * (min(seen) if seen else _QUANT_PRIOR.get(kind, 1.0))
+            return int(total)
+        out = []
+        # Per storage, as evict() moves them: a weight shared by several selected layers (or already moved) once.
+        seen = set(self.moved_storages)
+        # Bytes of those layers (other than `ref`, which the caller credits itself) already in host RAM: a
+        # Transformers 4 shard the device map put on CPU. Evicting them copies nothing.
+        self.cpu_to_come = 0
+        for j in left:
+            named = _counted_named(self.layers[j])
+            loaded = [p for _, p in named if p.device.type != "meta"]
+            owned = self.owned_names.get(j)
+            still_meta = [p for n, p in named if p.device.type == "meta" and (owned is None or n in owned)]
+            ptrs = [p.untyped_storage().data_ptr() for p in loaded]
+            fresh = [p for p, ptr in zip(loaded, ptrs) if ptr not in seen]
+            seen.update(ptrs)
+            if j != ref:
+                self.cpu_to_come += sum(p.nbytes for p in fresh if p.device.type == "cpu")
+            if loaded and not still_meta:
+                out.append(sum(p.nbytes for p in fresh))
+            elif loaded:
+                # Partly loaded (a shard boundary inside the layer): what landed, plus the rest scaled from meta.
+                rest = projected(j, {n for n, p in named if p.device.type == "meta" and (owned is None or n in owned)})
+                if rest is None:
+                    rest = int(sum(p.nbytes for p in still_meta) * (ratio or 1.0))
+                out.append(sum(p.nbytes for p in fresh) + rest)
+            elif (est := projected(j)) is not None:
+                out.append(est)
+            elif ratio is None:
+                out.append(size)
+            else:
+                out.append(int(self.shape_bytes.get(j, base) * ratio))
+        return out
+
+    def _kind_sample(self, j):
+        """{kind: loaded / declared bytes} over layer j's params of that kind that have landed."""
+        decl = self.decl.get(j)
+        if not decl or self.layers is None:
+            return {}
+        loaded, declared = {}, {}
+        for n, p in _counted_named(self.layers[j]):
+            if n not in decl or p.device.type == "meta":
+                continue
+            kind, nbytes = decl[n]
+            loaded[kind] = loaded.get(kind, 0) + p.nbytes
+            declared[kind] = declared.get(kind, 0) + nbytes
+        return {k: loaded[k] / declared[k] for k in loaded if declared[k]}
+
+    def _pending_embedding_bytes(self, skip = None):
+        # Streamed tables still to come; a meta weight already knows its size.
+        return [m.weight.nbytes for m in self.embedding_prefixes.values()
+                if m not in self.embeddings and m is not skip and getattr(m, "weight", None) is not None]
+
+    def _pending_embedding_cpu_bytes(self, skip = None):
+        # Streamed tables still to come that already sit in host RAM (host-kept, or a CPU shard): moving them copies nothing.
+        return sum(m.weight.nbytes for m in self.embedding_prefixes.values()
+                   if m not in self.embeddings and m is not skip and getattr(m, "weight", None) is not None
+                   and m.weight.device.type == "cpu")
 
     def evict_embedding(self, module):
         weight = getattr(module, "weight", None)
         if module in self.embeddings or weight is None or weight.device.type == "meta":
             return
+        size = self.done_bytes[-1] if self.done_bytes else 0
+        to_come = self._layers_to_come(size, self.last_done)
+        copied = 0 if weight.device.type == "cpu" else weight.nbytes
+        own = _check_host_fit(self.done_bytes + self.embedding_bytes + [weight.nbytes]
+                              + self._pending_embedding_bytes(skip = module) + to_come,
+                              sum(self.done_bytes) + sum(self.embedding_bytes) + (weight.nbytes - copied)
+                              + self.cpu_to_come + self._pending_embedding_cpu_bytes(skip = module))
         with torch.no_grad():
             weight.requires_grad_(False)
             if weight.device.type != "cpu":
                 weight.data = weight.data.to("cpu")
         self.embeddings.append(module)
+        self.embedding_bytes.append(weight.nbytes)
+        if own is not None:
+            # Now in host RAM, so out of what other local ranks must hold back for this one.
+            _publish_host_pending(max(0, own - copied))
 
     def evict(self, i, force = False):
         if i in self.done:
@@ -867,13 +1881,40 @@ class _HostLoad:
         params = list(layer.parameters())
         if not force and any(p.device.type == "meta" for p in params):
             return
+        # Counted once per storage across layers: a param another selected layer already moved costs nothing more.
+        counted = {id(p) for p in _counted_params(layer)
+                   if p.device.type == "meta" or p.untyped_storage().data_ptr() not in self.moved_storages}
+        # Layers still to come are scaled from this one by their meta sizes; the first check runs before any moved.
+        size = sum(p.nbytes for p in params if p.device.type != "meta" and id(p) in counted)
+        # The storage ratio compares like with like: the params bind() charged to this layer, loaded vs declared.
+        # A shared weight this layer happens to load first is not in its declared bytes.
+        owned = self.owned_names.get(i)
+        owned_size = size if owned is None else sum(
+            p.nbytes for n, p in _counted_named(layer) if n in owned and p.device.type != "meta")
+        to_come = self._layers_to_come(owned_size, i)
+        copied = sum(p.nbytes for p in params if p.device.type not in ("cpu", "meta") and id(p) in counted)
+        own = _check_host_fit(self.done_bytes + self.embedding_bytes + self._pending_embedding_bytes() + to_come,
+                              sum(self.done_bytes) + sum(self.embedding_bytes)
+                              + sum(p.nbytes for p in params if p.device.type == "cpu" and id(p) in counted)
+                              + self.cpu_to_come + self._pending_embedding_cpu_bytes())
         with torch.no_grad():
             for p in params:
                 if p.is_floating_point():
                     p.requires_grad_(False)
                 if p.device.type not in ("cpu", "meta"):
                     p.data = p.data.to("cpu")
+        self.moved_storages.update(p.untyped_storage().data_ptr() for p in params
+                                   if p.device.type != "meta" and id(p) in counted)
         self.done.add(i)
+        self.done_bytes.append(size)
+        if self.shape_bytes.get(i):
+            self.ratios[i] = owned_size / self.shape_bytes[i]
+        for kind, r in self._kind_sample(i).items():
+            self.kind_ratios.setdefault(kind, {})[i] = r
+        self.last_done = i
+        if own is not None:
+            # Now in host RAM, so out of what other local ranks must hold back for this one.
+            _publish_host_pending(max(0, own - copied))
 
     def on_param(self, model, target_name):
         self.bind(model)
@@ -894,6 +1935,7 @@ def load_layers_to_host(n, placement = "spread", embeddings = False):
     Install `BlockSwap` on the yielded `.layers` / `.indices` afterwards; `embeddings` also streams
     `extra_input_embeddings` (`.embeddings`, the caller hooks their lookups)."""
     state = _HostLoad(n, placement, embeddings)
+    _begin_host_session()
     patched = []
     try:
         core = importlib.import_module("transformers.core_model_loading")
@@ -904,9 +1946,12 @@ def load_layers_to_host(n, placement = "spread", embeddings = False):
         # transformers 5: the one sink every loaded parameter goes through.
         @functools.wraps(original)
         def set_param_for_module(*args, **kwargs):
-            out = original(*args, **kwargs)
             model = kwargs.get("model", args[0] if args else None)
             name = kwargs.get("target_name", args[1] if len(args) > 1 else None)
+            if model is not None:
+                # Before the first weight lands, so bind() reads every layer's size on meta.
+                state.bind(model)
+            out = original(*args, **kwargs)
             if model is not None and isinstance(name, str):
                 state.on_param(model, name)
             return out
@@ -919,8 +1964,8 @@ def load_layers_to_host(n, placement = "spread", embeddings = False):
 
         @functools.wraps(original)
         def _load_state_dict_into_meta_model(model, *args, **kwargs):
-            out = original(model, *args, **kwargs)
             state.bind(model)
+            out = original(model, *args, **kwargs)
             for i in state.indices:
                 state.evict(i)
             # The plan counted streamed tables off the card during the load, so they leave per shard too.
@@ -941,6 +1986,7 @@ def load_layers_to_host(n, placement = "spread", embeddings = False):
     try:
         yield state
     finally:
+        _end_host_session()
         for module, attr, fn in patched:
             setattr(module, attr, fn)
         if old_env is None:

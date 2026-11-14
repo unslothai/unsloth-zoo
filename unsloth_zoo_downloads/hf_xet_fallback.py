@@ -2019,6 +2019,7 @@ def _run_download_attempt(
     if disable_xet:
         child_env["HF_HUB_DISABLE_XET"] = "1"
         child_env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    removed: list = []
     with _SPAWN_ENV_LOCK:
         if not disable_xet:
             # hf_xet reads its buffer caps natively at import, so they must be in the environment before the child
@@ -2029,7 +2030,10 @@ def _run_download_attempt(
                 # Resize, not apply, against a copy of the real env so explicit user settings such as
                 # HF_XET_HIGH_PERFORMANCE stand; UNSLOTH_XET_FORCE_CAPS=1 still caps; disk clamp redone for cache_dir,
                 # which overrides HF_HUB_CACHE; under the lock so a concurrent overlay is not read as user settings
-                child_env.update(resize_for_cache_dir(dict(os.environ), params.get("cache_dir")))
+                sized_env = dict(os.environ)
+                child_env.update(resize_for_cache_dir(sized_env, params.get("cache_dir")))
+                # Seeds the resize dropped without rewriting (an AC band under the fixed alias) must leave the child too
+                removed = [k for k in os.environ if k not in sized_env and k not in child_env]
             except Exception as e:
                 logger.debug("Could not compute Xet tuning env: %s", e)
         # Import huggingface_hub.constants in the parent before the child-only HF_HUB_DISABLE_XET=1 is set, else a
@@ -2038,7 +2042,7 @@ def _run_download_attempt(
             import huggingface_hub.constants  # noqa: F401
         except Exception:
             pass
-        saved_env = {k: os.environ.get(k) for k in child_env}
+        saved_env = {k: os.environ.get(k) for k in (*child_env, *removed)}
         # spawn rebuilds __main__ from __main__.__file__: pseudo-paths such as <stdin> or a notebook fail, and an
         # unguarded script would re-run its top level as __mp_main__, so __main__ is pointed at this module
         main_module = sys.modules.get("__main__")
@@ -2052,6 +2056,8 @@ def _run_download_attempt(
             main_module.__spec__ = None
         try:
             os.environ.update(child_env)
+            for k in removed:
+                os.environ.pop(k, None)
             proc.start()
         except BaseException:
             # proc.start() can raise OSError under fd or thread exhaustion before the lifecycle finally runs, so the

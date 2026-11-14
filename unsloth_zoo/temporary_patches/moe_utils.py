@@ -508,13 +508,17 @@ _GROUPED_MM_FP16_OP = _register_grouped_mm_fp16_op()
 
 
 # Max avg rows per expert for Triton grouped-MM, per arch; off sm90/sm100 torch._grouped_mm is a per-expert cuBLAS loop
-# that Triton beats for small experts; sm75 has no Triton MMA, sm86 is unmeasured, sm121 follows sm120 (unsloth-zoo
-# issue 1661) except for dw.
+# that Triton beats for small experts; sm121 follows sm120 (unsloth-zoo issue 1661) except for dw. sm89 (L4, E 64-256,
+# rows 8-1024 per expert) wins on every base GEMM with its retuned tiles. sm86 is unmeasured: it shares sm89's tile
+# table (moe_grouped_fp16._generic_family) but keeps sm89's former 32-row limits until it is timed. sm75 has no Triton MMA, so only small LoRA
+# GEMMs go there (one launch instead of one per expert); a LoRA limit counts rows at rank 16, a wider rank r as r / 16.
 _TRITON_GROUPED_MM_AUTO_ROWS = {
     (8, 0):  {"lora": -1, "many": 2048, "few": 512, "dw": 128, "dw_few": 128},
     (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 256, "dw_few": 64},
     (12, 1): {"lora": -1, "many": 2048, "few": 256, "dw": 64,  "dw_few": 64},
-    (8, 9):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0,   "dw_few": 0},
+    (8, 9):  {"lora": -1, "many": 1024, "few": 32,  "dw": 0,   "dw_few": 0},
+    (8, 6):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0,   "dw_few": 0},
+    (7, 5):  {"lora": 64, "many": 0,    "few": 0,   "dw": 0,   "dw_few": 0},
 }
 _TRITON_GROUPED_MM_CAPABILITY = {}
 _TRITON_GROUPED_MM_POLICY = {}
@@ -543,6 +547,12 @@ def _triton_grouped_mm_max_rows(index, kind = "lora"):
     return limit
 
 
+@_assume_constant_result
+def _triton_grouped_mm_lora_rank_scaled():
+    """Auto LoRA limits count rows at rank 16; an explicit UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS is taken as given."""
+    return not os.environ.get("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS")
+
+
 def _triton_grouped_mm_policy(index, kind, mode, disabled, override):
     mode = (mode or "auto").strip().lower()
     if mode in ("0", "false", "off") or disabled == "1":
@@ -557,7 +567,8 @@ def _triton_grouped_mm_policy(index, kind, mode, disabled, override):
     except Exception:
         return 0
     if mode in ("1", "true", "on"):
-        limit = -1 if cap >= (8, 0) else 0
+        # Below sm80 Triton has no MMA: forcing it on still keeps base-sized GEMMs on cuBLAS.
+        limit = -1 if cap >= (8, 0) or (cap >= (7, 5) and kind == "lora") else 0
     else:
         limit = _TRITON_GROUPED_MM_AUTO_ROWS.get(cap, {}).get(kind, 0)
     if limit != 0 and override:
@@ -600,7 +611,11 @@ def _triton_grouped_mm_wanted(inputs, weight) -> bool:
 
 
 def _triton_grouped_mm_rows_ok(device, M, E, K, N):
-    limit = _triton_grouped_mm_max_rows(device.index, _triton_grouped_mm_kind(K, N, E))
+    kind = _triton_grouped_mm_kind(K, N, E)
+    limit = _triton_grouped_mm_max_rows(device.index, kind)
+    if kind == "lora" and limit > 0 and _triton_grouped_mm_lora_rank_scaled():
+        # Triton's LoRA cost grows with the rank, the per-expert loop's does not; ceil so no row is over budget.
+        M = (M * max(min(K, N), 16) + 15) // 16
     return _rows_within(limit, M, E)
 
 
@@ -1230,6 +1245,16 @@ def _nf4_fused_base_mm(inputs, offsets, source, proj_type, hidden_dim, model_typ
     """UNSLOTH_MOE_NF4_FUSED grouped GEMM on a frozen NF4 stack; None keeps the dequant path."""
     if os.environ.get("UNSLOTH_MOE_NF4_FUSED", "0") in ("", "0") or not _base_is_recomputable(source):
         return None
+    cache = _expert_cache_module()
+    if cache is not None:
+        # The param the dequant path decodes (_get_base_weight unwrapping), in the dtype it will ask for.
+        param = source
+        while hasattr(param, "base_layer"):
+            param = param.base_layer
+        if not isinstance(param, torch.Tensor) and hasattr(param, "weight"):
+            param = param.weight
+        if _expert_cache_get(cache, param, inputs.dtype, count = False) is not None:
+            return None   # a cached 16-bit stack makes the dequant path's decode free
     try:
         from unsloth_zoo.temporary_patches.moe_nf4_grouped import maybe_nf4_grouped_mm
     except ImportError:
@@ -1289,10 +1314,23 @@ def _dequantize_bnb4bit_experts(param, experts, target_dtype = None):
     """Dequantize only `experts` of a packed 4-bit stack: a slice reads views of the packed bytes
     and absmax blocks, an int64 id tensor gathers them in a few pieces. Each piece is a smaller
     QuantState decoded by the same kernels, so every element matches the full-stack read."""
+    cache = _expert_cache_module()
+    if cache is None:
+        return _dequantize_bnb4bit_experts_once(param, experts, target_dtype)
+    # The cache may hold the memory this read needs (gather, decode or cast): drop it once and retry.
+    return cache.with_expert_cache_oom_retry(lambda: _dequantize_bnb4bit_experts_once(param, experts, target_dtype))
+
+
+def _dequantize_bnb4bit_experts_once(param, experts, target_dtype = None):
     from bitsandbytes.functional import QuantState
 
     while hasattr(param, "base_layer"):
         param = param.base_layer
+    cache = _expert_cache_module()
+    cached = _expert_cache_get(cache, param, target_dtype)
+    if cached is not None:
+        out = cached[experts] if isinstance(experts, slice) else cached.index_select(0, experts)
+        return out.to(target_dtype) if target_dtype is not None else out
     E, inner = _bnb4bit_expert_split(param)
     qs = param.quant_state
     blocks = inner[0] * inner[1] // qs.blocksize
@@ -2217,6 +2255,17 @@ def forward_moe_backend(
     # helpers don't resolve (only the dispatcher is copied).
     # Keep `except ImportError` around ONLY the import; runtime errors in the
     # bnb4bit/fp8 path must propagate, not fall through to a crashing backend.
+    # Under Unsloth gradient checkpointing the backward replay takes the routing the first
+    # (no-grad) pass used: the two passes run differently compiled graphs that can round a
+    # router input across a top-k boundary.
+    moe_checkpoint_routing = None
+    try:
+        from unsloth_zoo.gradient_checkpointing import moe_checkpoint_routing
+    except ImportError:
+        pass
+    if moe_checkpoint_routing is not None:
+        top_k_index, top_k_weights = moe_checkpoint_routing(self, top_k_index, top_k_weights)
+
     _moe_uses_bnb4bit_expert_weights = forward_moe_backend_bnb4bit = None
     try:
         from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import (
@@ -3031,6 +3080,106 @@ def _get_dequantize_4bit_in_slices():
     return _DEQUANTIZE_4BIT_IN_SLICES
 
 
+_EXPERT_CACHE_MOD = None
+try:
+    # Absolute: this file is also copied into unsloth_compiled_cache and imported top-level.
+    from unsloth_zoo.temporary_patches.moe_expert_cache import parse_expert_cache_mode as _parse_expert_cache_mode
+except ImportError:
+    _parse_expert_cache_mode = None
+
+
+def _expert_cache_module():
+    """moe_expert_cache when UNSLOTH_MOE_EXPERT_CACHE is on and the caller is eager, else None (no traced work)."""
+    global _EXPERT_CACHE_MOD
+    if not _expert_cache_env_on() or torch.compiler.is_compiling():
+        return None
+    if _EXPERT_CACHE_MOD is None:
+        try:
+            from unsloth_zoo.temporary_patches import moe_expert_cache
+            _EXPERT_CACHE_MOD = moe_expert_cache
+        except ImportError:
+            _EXPERT_CACHE_MOD = False
+    return _EXPERT_CACHE_MOD or None
+
+
+def _expert_cache_env_on():
+    """UNSLOTH_MOE_EXPERT_CACHE through the cache's own parser ("0", "off", "false", "no", "0.0", ... are off)."""
+    if _parse_expert_cache_mode is None:
+        return False
+    return _parse_expert_cache_mode(os.environ.get("UNSLOTH_MOE_EXPERT_CACHE", "0")) is not None
+
+
+def _expert_cache_get(cache, param, target_dtype, count = True):
+    """The cached stack when it is in the dtype this caller ends with (target_dtype, else the state's), else None."""
+    if cache is None:
+        return None
+    weight = cache.expert_cache_lookup(param, count = count)
+    want = target_dtype or getattr(getattr(param, "quant_state", None), "dtype", None)
+    if weight is not None and weight.dtype != want:
+        return None
+    return weight
+
+
+def _dequantize_bnb4bit_full(param):
+    """The whole packed 4-bit stack in quant_state.dtype, at its logical shape."""
+    # Absolute import: this file is also copied into unsloth_compiled_cache and imported top-level.
+    weight = None
+    try:
+        from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
+    except ImportError:
+        nf4_dequant_triton = None
+    if nf4_dequant_triton is not None:
+        weight = nf4_dequant_triton(
+            param.data, param.quant_state, getattr(param, "_original_shape", None),
+        )
+    if weight is None:
+        # >= 2**31-element stacks abort in bitsandbytes dequantize (csrc/ops.cu:93); slice like the load does.
+        slicer = _get_dequantize_4bit_in_slices()
+        weight = slicer(param) if slicer is not None else None
+    if weight is None:
+        weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
+    original_shape = getattr(param, "_original_shape", None)
+    if original_shape is not None and weight.shape != original_shape:
+        weight = weight.reshape(original_shape)
+    return weight
+
+
+def _get_bnb4bit_base_weight(param, target_dtype = None):
+    """The dequantized stack of a packed bnb 4-bit expert param (from the expert cache when it holds it)."""
+    if getattr(param, "quant_state", None) is None:
+        raise RuntimeError(
+            "unsloth: _get_base_weight saw a Params4bit with quant_state=None. "
+            "This usually means the model was used in forward before loading "
+            "completed quantization (meta placeholder still in place), or the "
+            "MoE quantizer patch did not fire for this expert. "
+            f"data.shape={tuple(param.data.shape)}, device={param.device}."
+        )
+    cache = _expert_cache_module()
+    weight = _expert_cache_get(cache, param, target_dtype)
+    if weight is None:
+        if cache is None:
+            weight = _dequantize_bnb4bit_full(param)
+        else:
+            def decode():
+                w = _dequantize_bnb4bit_full(param)
+                # Cached after the cast (fp16 compute over a bf16 state casts every read otherwise); the same values.
+                if target_dtype is not None and w.dtype != target_dtype:
+                    w = w.to(target_dtype)
+                return w
+            # A cached stack may hold the memory this decode or cast needs: drop the cache once and retry.
+            weight = cache.with_expert_cache_oom_retry(decode)
+            cache.expert_cache_offer(param, weight)
+    if target_dtype is not None:
+        weight = weight.to(target_dtype)
+    return weight
+
+
+# UNSLOTH_MOE_EXPERT_CACHE_TRACED=1 (with the cache on): a traced caller decodes eagerly behind one graph break per call
+# so it can use the cache; the output enters the next graph as an input, never a reusable buffer. Off by default: the
+# breaks repartition the compiled graphs (eval loss drifts ~1e-6) and cost host time (A100 Qwen3.6 step +10%; L4 -18%).
+_get_bnb4bit_base_weight_eager = torch.compiler.disable(_get_bnb4bit_base_weight)
+
+
 def _get_base_weight(param, target_dtype=None, token_counts=None, experts=None):
     """Get base weight from a potentially wrapped parameter or module. target_dtype (recompute
     providers) restores the packed Params4bit to its logical shape and casts. experts (a
@@ -3047,36 +3196,13 @@ def _get_base_weight(param, target_dtype=None, token_counts=None, experts=None):
         return param.dequantize(dtype = target_dtype, token_counts = token_counts)
 
     if HAS_BNB and isinstance(param, Params4bit):
-        if getattr(param, "quant_state", None) is None:
-            raise RuntimeError(
-                "unsloth: _get_base_weight saw a Params4bit with quant_state=None. "
-                "This usually means the model was used in forward before loading "
-                "completed quantization (meta placeholder still in place), or the "
-                "MoE quantizer patch did not fire for this expert. "
-                f"data.shape={tuple(param.data.shape)}, device={param.device}."
-            )
-        # Absolute import: this file is also copied into unsloth_compiled_cache and imported top-level.
-        weight = None
-        try:
-            from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
-        except ImportError:
-            nf4_dequant_triton = None
-        if nf4_dequant_triton is not None:
-            weight = nf4_dequant_triton(
-                param.data, param.quant_state, getattr(param, "_original_shape", None),
-            )
-        if weight is None:
-            # >= 2**31-element stacks abort in bitsandbytes dequantize (csrc/ops.cu:93); slice like the load does.
-            slicer = _get_dequantize_4bit_in_slices()
-            weight = slicer(param) if slicer is not None else None
-        if weight is None:
-            weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
-        original_shape = getattr(param, "_original_shape", None)
-        if original_shape is not None and weight.shape != original_shape:
-            weight = weight.reshape(original_shape)
-        if target_dtype is not None:
-            weight = weight.to(target_dtype)
-        return weight
+        if (
+            torch.compiler.is_compiling()
+            and os.environ.get("UNSLOTH_MOE_EXPERT_CACHE_TRACED", "0") == "1"
+            and _expert_cache_env_on()
+        ):
+            return _get_bnb4bit_base_weight_eager(param, target_dtype)
+        return _get_bnb4bit_base_weight(param, target_dtype)
 
     if hasattr(param, "get_param"):
         return param.get_param()
@@ -3116,7 +3242,7 @@ def native_moe_grouped_mm(
     return _grouped_mm_with_backward_fix(inputs, weight, offsets)
 
 
-def _lora_rank_pad_needed(inputs, first_weight) -> bool:
+def _lora_rank_pad_needed(inputs, first_weight, second_weight = None) -> bool:
     """False when both LoRA GEMMs take Triton (it masks any K or N, so no 16-byte stride rule); rank <= 32 keeps both in
     the same lora row class; UNSLOTH_MOE_LORA_PAD_ALWAYS=1 forces True."""
     if inputs is None or first_weight.shape[-1] > 32:
@@ -3125,6 +3251,11 @@ def _lora_rank_pad_needed(inputs, first_weight) -> bool:
         return True
     if not _triton_grouped_mm_wanted(inputs, first_weight):
         return True
+    if second_weight is not None and second_weight.dim() == 3:
+        # The second GEMM can fall in another row budget (rank between in and out dims): it must take Triton too.
+        E, K, N = second_weight.shape
+        if not _triton_grouped_mm_rows_ok(inputs.device, inputs.shape[0], E, K, N):
+            return True
     # A failed self-check falls back to torch._grouped_mm, which needs the pad.
     from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
     if torch.compiler.is_compiling():
@@ -3139,7 +3270,7 @@ def _pad_lora_rank_for_grouped_mm(first_weight, second_weight, inputs = None):
     align = max(8, 16 // first_weight.element_size())
     rank = first_weight.shape[-1]
     pad = (-rank) % align
-    if pad == 0 or not _lora_rank_pad_needed(inputs, first_weight):
+    if pad == 0 or not _lora_rank_pad_needed(inputs, first_weight, second_weight):
         return first_weight, second_weight
     first_weight = F.pad(first_weight, (0, pad))
     second_weight = F.pad(second_weight, (0, 0, 0, pad))
@@ -3988,8 +4119,13 @@ def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, arg
     # routed gpt-oss decode path (sm80+ CUDA): the experts forward would not run and the verdict would read
     # "stash unread" for a forward that reads it.
     _mark_inner_expert_wrappers(wrapper)
+    # A throwaway forward: it must not leave its routing for a gradient checkpoint replay.
     try:
-        with _preserved_rng_for_probe(x), _parametrize_cache_untouched():
+        from unsloth_zoo.gradient_checkpointing import suspended_checkpoint_routing
+    except ImportError:
+        suspended_checkpoint_routing = contextlib.nullcontext
+    try:
+        with _preserved_rng_for_probe(x), _parametrize_cache_untouched(), suspended_checkpoint_routing():
             with torch.no_grad():
                 wrapper.base_layer(x, *args, **kwargs)
     except Exception:

@@ -270,6 +270,9 @@ DISABLE_COMPILE_MODEL_FUNCTIONS = {
         "_validate_attention_tp_divisibility",
         # QAT STE autograd.Function: Dynamo raises InternalTorchDynamoError the fallback does not catch.
         "_quantize_qat",
+        # Later port heads: block fake-quant (float8 casts, int32 bit tricks), straight-through in training.
+        "_fake_quant_fp8_block",
+        "_fake_quant_fp4_block",
     ],
 }
 
@@ -1320,22 +1323,29 @@ def higher_precision_sqrt_mean(source):
         r"(torch.sqrt)"
         r"\("
         r"(.*?)\1"
-        r"(.*?)\)\n",
+        r"(.*?)\)\n"
+        r"(?:([ ]{1,})\3[ ]{0,}\=[ ]{0,}\3[ ]{0,}\*[ ]{0,}([a-zA-Z0-9\_]{1,})[ ]{0,}/[ ]{0,}\1\n)?",
         source,
     )
     for item in sqrt_mean_objects:
         full_match, matches = item.group(0), item.groups()
-        new_variable, mean, variable, _, power, rest, spaces, sqrt, inner, ending = (
-            matches
-        )
+        (new_variable, mean, variable, _, power, rest, spaces, sqrt, inner, ending,
+         indent, target) = matches
         if "\n" in ending:
             continue
         new = (
             f"{new_variable} = {mean}(({variable}).to(torch.float32)**{power}{rest})"
             f"{spaces}"
-            f"{new_variable} = {sqrt}({inner}({new_variable}).to(torch.float32)"
-            f"{ending}.to(({variable}).dtype))\n"
+            f"{new_variable} = {sqrt}({inner}({new_variable}).to(torch.float32){ending})"
         )
+        # Gemma3n altup renorm: X * target overflows float16 before the divide, so rescale in float32 and cast once.
+        if target is not None:
+            new += (
+                f"\n{indent}{variable} = (({variable}).to(torch.float32) * {target} / {new_variable})"
+                f".to(({variable}).dtype)\n"
+            )
+        else:
+            new += f".to(({variable}).dtype)\n"
         source = source.replace(full_match, new)
     return source
 
@@ -4080,10 +4090,11 @@ def _apply_fused_lm_head(forward, module=None):
             )
             .replace(
                 "$LOGITSOFTCAPPING$",
-                r"(?:[\n\s]{0,}(?:if self\.[^\n\s]{1,} is not None:\n)?"
-                r"[\s\n]{0,}logits = logits \/ (self\.[^ \n]{1,})\n"
+                # `getattr(self...` is the space-free form fixup_fused_lm_head gives PaliGemma's softcap.
+                r"(?:[\n\s]{0,}(?:if (?:getattr\()?self\.[^\n\s]{1,} is not None:\n)?"
+                r"[\s\n]{0,}logits = logits \/ ((?:getattr\()?self\.[^ \n]{1,})\n"
                 r"[\s\n]{0,}logits = torch\.tanh\(logits\)\n"
-                r"[\s\n]{0,}logits = logits \* self\.[^ \n]{1,}\n)?",
+                r"[\s\n]{0,}logits = logits \* (?:getattr\()?self\.[^ \n]{1,}\n)?",
             )
             .replace(
                 "$CROSSENTROPYLOSS$",
@@ -5609,6 +5620,24 @@ def fixup_dropped_logit_scale(source, module = None):
 
 # Pre fix up some modules like Gemma3n
 def fixup_fused_lm_head(source):
+    # PaliGemma (transformers 5.23): the softcap is read through getattr, since PaliGemma 1's Gemma text config has
+    # none. Keep the getattr (a plain attribute read raises there) in the space-free form the softcap pattern takes.
+    softcap = 'getattr(self.config.get_text_config(),"final_logit_softcapping",None)'
+    source = re.sub(
+        r'^([ \t]+)final_logit_softcapping = getattr\(self\.config\.get_text_config\(\), "final_logit_softcapping", None\)\n'
+        r"\1if final_logit_softcapping is not None:\n"
+        r"([ \t]+)logits = logits / final_logit_softcapping\n"
+        r"\2logits = torch\.tanh\(logits\)\n"
+        r"\2logits = logits \* final_logit_softcapping$",
+        lambda m: (
+            f"{m.group(1)}if {softcap} is not None:\n"
+            f"{m.group(2)}logits = logits / {softcap}\n"
+            f"{m.group(2)}logits = torch.tanh(logits)\n"
+            f"{m.group(2)}logits = logits * {softcap}"
+        ),
+        source,
+        flags = re.MULTILINE,
+    )
     # Gemma 3N
     source = source.replace(
         "if (final_logit_softcapping := self.config.get_text_config().final_logit_softcapping) is not None:",
