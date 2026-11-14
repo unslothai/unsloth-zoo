@@ -806,7 +806,14 @@ class FrozenTableStore:
         return out
 
     def resident_on(self, device: torch.device) -> bool:
-        """Every plane already sits on ``device`` (gpu mode): lookups need neither host ids nor a host round trip."""
+        """Every plane already sits on ``device`` (gpu mode): lookups need neither host ids nor a host round trip.
+        ``device`` may be a string; an accelerator without an index means its current device."""
+        device = torch.device(device)
+        if device.index is None and device.type != "cpu":
+            backend = getattr(torch, device.type, None)
+            current = getattr(backend, "current_device", None)
+            if callable(current) and getattr(backend, "is_available", lambda: False)():
+                device = torch.device(device.type, current())
         dev = self._device_planes
         return len(dev) == len(self.planes) and len(dev) > 0 and all(t.device == device for t in dev.values())
 

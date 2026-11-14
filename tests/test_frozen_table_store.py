@@ -1157,3 +1157,17 @@ def test_provenance_compare_keeps_the_row_order_of_shards():
     saved = {"tables": {"ngram": {"num_rows": 6, "tensors": [t("shard_0"), t("shard_1")]}}}
     live = {"tables": {"ngram": {"num_rows": 6, "tensors": [t("shard_1"), t("shard_0")]}}}
     assert fts.compare_frozen_table_provenance(saved, live) == ["ngram: weight shards are in another row order"]
+
+
+def test_resident_on_accepts_strings_and_the_current_accelerator(bf16_table):
+    """Finding 16: "cpu" is torch.device("cpu"), and "cuda" is the current CUDA device."""
+    index, names, _ = bf16_table
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="gpu", device=torch.device("cpu"))
+    assert store.resident_on("cpu") and store.resident_on(torch.device("cpu"))
+    store.close()
+    if torch.cuda.is_available():
+        dev = torch.device("cuda", torch.cuda.current_device())
+        store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="gpu", device=dev)
+        assert store.resident_on("cuda") and store.resident_on(torch.device("cuda")) and store.resident_on(str(dev))
+        assert not store.resident_on("cpu")
+        store.close()
