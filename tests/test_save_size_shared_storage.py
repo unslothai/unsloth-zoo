@@ -20,25 +20,16 @@ import pytest
 import torch
 from huggingface_hub import split_state_dict_into_shards_factory
 
-from unsloth_zoo.saving_utils import get_torch_storage_id_new, get_torch_storage_size_new
+from unsloth_zoo.saving_utils import get_torch_storage_id_new, get_torch_storage_size_new, prepare_saving
 
 
-def _arena_views(n = 8, numel = 1024):
-    # Block Swap layout: every offloaded weight is a view into one host arena.
-    arena = torch.zeros(n * numel * 4, dtype = torch.uint8)
+def _arena_views(n = 8, numel = 1024, pad = 0):
+    # Block Swap layout: every offloaded weight is a view into one host arena (chunked packing leaves a padded tail).
+    arena = torch.zeros(n * numel * 4 + pad, dtype = torch.uint8)
     return arena, {f"layers.{i}.weight": arena[i * numel * 4:(i + 1) * numel * 4].view(torch.float32) for i in range(n)}
 
 
-def test_disk_estimate_counts_each_view_once():
-    arena, sd = _arena_views()
-    assert sum(get_torch_storage_size_new(v, 2, own_bytes = True) for v in sd.values()) == arena.nbytes
-    t = torch.zeros(3, 5, dtype = torch.bfloat16)
-    assert get_torch_storage_size_new(t, 2, own_bytes = True) == 30
-    assert get_torch_storage_size_new(torch.nn.Parameter(t), 2, own_bytes = True) == 30
-
-
 def test_sharder_sizes_a_shared_storage_by_what_torch_save_writes():
-    # torch.save writes a view's whole storage, so the views stay grouped and the shard is sized by the arena.
     arena, sd = _arena_views()
     split = split_state_dict_into_shards_factory(
         sd,
@@ -51,17 +42,16 @@ def test_sharder_sizes_a_shared_storage_by_what_torch_save_writes():
     assert len(set(split.tensor_to_filename.values())) == 1
 
 
-def test_prepare_saving_estimate_with_block_swap_host_views(tmp_path):
+def _block_swapped_lora_llama(tie, pad):
     peft = pytest.importorskip("peft")
     from transformers import LlamaConfig, LlamaForCausalLM
-    from unsloth_zoo.saving_utils import prepare_saving
 
     cfg = LlamaConfig(vocab_size = 128, hidden_size = 64, intermediate_size = 128, num_hidden_layers = 4,
-                      num_attention_heads = 4, num_key_value_heads = 2, tie_word_embeddings = False)
+                      num_attention_heads = 4, num_key_value_heads = 2, tie_word_embeddings = tie)
     model = peft.get_peft_model(LlamaForCausalLM(cfg), peft.LoraConfig(r = 4, target_modules = ["q_proj"]))
     layers = model.base_model.model.model.layers
     params = [p for l in layers for n, p in l.named_parameters() if "lora_" not in n and "base_layer" not in n]
-    arena = torch.empty(sum(p.nbytes for p in params), dtype = torch.uint8)
+    arena = torch.empty(sum(p.nbytes for p in params) + pad, dtype = torch.uint8)
     host, used = {}, 0
     for p in params:
         host[id(p)] = arena[used:used + p.nbytes].view(p.dtype).view(p.shape).copy_(p.data)
@@ -74,5 +64,13 @@ def test_prepare_saving_estimate_with_block_swap_host_views(tmp_path):
 
     for l in layers:
         l._register_state_dict_hook(hook)
+    return model
+
+
+@pytest.mark.parametrize("tie", [False, True])
+@pytest.mark.parametrize("pad", [0, 4096])
+def test_prepare_saving_counts_each_storage_once(tmp_path, tie, pad):
+    # pad: torch.save writes a view's whole storage, so a padded arena must be counted in full.
+    model = _block_swapped_lora_llama(tie, pad)
     out = prepare_saving(model, save_directory = str(tmp_path), output_dtype = torch.float32)
-    assert out[8] == sum(p.nbytes for p in model.merge_and_unload().parameters())
+    assert out[8] == sum(p.nbytes for p in model.merge_and_unload().parameters()) + pad

@@ -3284,9 +3284,8 @@ from huggingface_hub import (
     get_torch_storage_size,
     get_torch_storage_id,
 )
-from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
-def get_torch_storage_size_new(x, element_size, own_bytes = False):
+def get_torch_storage_size_new(x, element_size):
     if isinstance(x, LoraStats):
         mod = x.module
         # modules_to_save: use the saved weight shape directly
@@ -3302,11 +3301,8 @@ def get_torch_storage_size_new(x, element_size, own_bytes = False):
         # Fallback for Linear-like modules
         shape = (mod.in_features, mod.out_features)
         return int(np.prod(shape)) * element_size
-    # own_bytes: Block Swap's host weights are views into one arena, so the disk estimate sums each view. The sharder
-    # keeps the storage size: torch.save writes a view's whole storage, and the hub groups same-storage views.
-    if own_bytes and isinstance(x, torch.Tensor) and not is_traceable_wrapper_subclass(x):
-        return x.nelement() * x.element_size()
-    return get_torch_storage_size(x)
+    else:
+        return get_torch_storage_size(x)
 pass
 
 
@@ -3371,8 +3367,14 @@ def prepare_saving(
         merge_into_original = merge_into_original,
         return_state_dict = True,
     )
-    # Total save size in bytes
-    save_size = sum(get_torch_storage_size_new(x, element_size, own_bytes = True) for x in state_dict.values())
+    # Total save size in bytes, one count per storage like the sharder: Block Swap's host weights are views into one arena.
+    save_size, seen = 0, set()
+    for x in state_dict.values():
+        storage_id = get_torch_storage_id_new(x)
+        if storage_id is not None:
+            if storage_id in seen: continue
+            seen.add(storage_id)
+        save_size += get_torch_storage_size_new(x, element_size)
 
     if not os.path.exists(save_directory):
         try:
