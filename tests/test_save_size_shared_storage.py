@@ -51,7 +51,9 @@ def _block_swapped_lora_llama(tie, pad, evict):
                       num_attention_heads = 4, num_key_value_heads = 2, tie_word_embeddings = tie)
     model = peft.get_peft_model(LlamaForCausalLM(cfg), peft.LoraConfig(r = 4, target_modules = ["q_proj"]))
     layers = model.base_model.model.model.layers
-    params = [p for l in layers for n, p in l.named_parameters() if "lora_" not in n and "base_layer" not in n]
+    # BlockSwap packs every frozen weight, LoRA base weights included, but state_dict only exposes the non-LoRA ones.
+    params = [p for l in layers for n, p in l.named_parameters() if "lora_" not in n]
+    lora_base = sum(p.nbytes for l in layers for n, p in l.named_parameters() if "base_layer" in n)
     arena = torch.empty(sum(p.nbytes for p in params) + pad, dtype = torch.uint8)
     host, used = {}, 0
     for p in params:
@@ -60,23 +62,26 @@ def _block_swapped_lora_llama(tie, pad, evict):
 
     def hook(module, sd, prefix, meta):
         for n, p in module.named_parameters(remove_duplicate = False):
-            if id(p) in host and prefix + n in sd:
+            if id(p) in host and prefix + n in sd and "base_layer" not in n:
                 sd[prefix + n] = host[id(p)]
 
     for l in layers:
         l._register_state_dict_hook(hook)
-    expected = sum(p.nbytes for p in copy.deepcopy(model).merge_and_unload().parameters()) + pad
+    expected = sum(p.nbytes for p in copy.deepcopy(model).merge_and_unload().parameters())
     if evict:
         # BlockSwap.evict(): a non-resident layer's weights become empty tensors, LoRA targets included.
         for l in layers:
             l.self_attn.q_proj.base_layer.weight.data = torch.empty(0)
-    return model, expected
+    return model, expected, pad + lora_base
 
 
+@pytest.mark.parametrize("safe", [True, False])
 @pytest.mark.parametrize("evict", [False, True])
 @pytest.mark.parametrize("tie", [False, True])
 @pytest.mark.parametrize("pad", [0, 4096])
-def test_prepare_saving_counts_each_storage_once(tmp_path, tie, pad, evict):
-    # pad: torch.save writes a view's whole storage, so a padded arena must be counted in full.
-    model, expected = _block_swapped_lora_llama(tie, pad, evict)
-    assert prepare_saving(model, save_directory = str(tmp_path), output_dtype = torch.float32)[8] == expected
+def test_prepare_saving_counts_what_the_writer_writes(tmp_path, tie, pad, evict, safe):
+    # torch.save writes a view's whole storage (the arena, padding and LoRA base weights included); safetensors
+    # writes each view once.
+    model, expected, arena_extra = _block_swapped_lora_llama(tie, pad, evict)
+    out = prepare_saving(model, save_directory = str(tmp_path), output_dtype = torch.float32, safe_serialization = safe)
+    assert out[8] == expected + (0 if safe else arena_extra)

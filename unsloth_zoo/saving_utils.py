@@ -3284,6 +3284,7 @@ from huggingface_hub import (
     get_torch_storage_size,
     get_torch_storage_id,
 )
+from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
 def get_torch_storage_size_new(x, element_size):
     if isinstance(x, LoraStats):
@@ -3329,6 +3330,7 @@ def prepare_saving(
     low_disk_space_usage = False,
     min_size_in_bytes = 100_000_000, # Must be of this size - 100MB default
     use_temp_file = False,
+    safe_serialization = True,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check size
@@ -3370,14 +3372,18 @@ def prepare_saving(
         merge_into_original = merge_into_original,
         return_state_dict = True,
     )
-    # Total save size in bytes, one count per storage like the sharder: Block Swap's host weights are views into one arena.
+    # Block Swap's host weights are views into one arena. torch.save writes each storage whole; for safetensors
+    # transformers clones disjoint views and drops tied aliases, so each distinct view is written once.
     save_size, seen = 0, set()
     for x in state_dict.values():
-        storage_id = get_torch_storage_id_new(x)
+        storage_id, size = get_torch_storage_id_new(x), get_torch_storage_size_new(x, element_size)
+        if (safe_serialization and isinstance(x, torch.Tensor) and not is_traceable_wrapper_subclass(x)
+                and x.device.type != "meta"):
+            storage_id, size = (x.device, x.data_ptr(), x.nbytes), min(size, x.nbytes)
         if storage_id is not None:
             if storage_id in seen: continue
             seen.add(storage_id)
-        save_size += get_torch_storage_size_new(x, element_size)
+        save_size += size
 
     if not os.path.exists(save_directory):
         try:
@@ -6622,6 +6628,7 @@ def merge_and_dequantize_lora(
         merge_into_original = False,
         min_size_in_bytes = 100_000_000, # 100MB default
         use_temp_file = use_temp_file,
+        safe_serialization = safe_serialization,
     )
 
     import transformers.modeling_utils
