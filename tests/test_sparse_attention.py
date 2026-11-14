@@ -470,12 +470,14 @@ def test_triton_kernel_math_in_the_interpreter():
 
 @pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
 def test_flex_gate_follows_shared_memory():
-    # head_dim 512 flex needs ~160 KB per block: on smaller parts (T4, L4, sm86 / 89, sm120) it must never be picked.
+    # head_dim 512 flex needs ~160 KB per block: on smaller parts (T4, L4, sm86 / 89, sm120) it must never be picked;
+    # sm75 never gets flex at any head_dim (it failed to compile there).
     q = torch.empty(1, 4, 16, 512, device = "cuda", dtype = _cuda_dtypes()[-1])
-    big_enough = sa._shared_memory(q.device) >= sa._FLEX_D512_MIN_SHARED_MEMORY
+    sm80 = torch.cuda.get_device_capability()[0] >= 8
+    big_enough = sm80 and sa._shared_memory(q.device) >= sa._FLEX_D512_MIN_SHARED_MEMORY
     assert sa._flex_eligible(q) == big_enough
     assert ("flex" in sa._order(q, 8)) == big_enough
-    assert sa._flex_eligible(torch.empty(1, 4, 16, 128, device = "cuda", dtype = _cuda_dtypes()[-1]))
+    assert sa._flex_eligible(torch.empty(1, 4, 16, 128, device = "cuda", dtype = _cuda_dtypes()[-1])) == sm80
 
 
 def test_refused_launch_latches_and_falls_through(monkeypatch):
@@ -716,7 +718,8 @@ def test_cuda_window_only_layer_with_no_compressed_rows(monkeypatch, backend, wi
     got = _grads(lambda q, win, sink: sa.sparse_attn_window(q, win, empty_kv, empty_idx, sink, d ** -0.5, w, backend = backend),
                  q, win, sink, go)
     ran = {n: sa.SPARSE_ATTN_STATS[n] - before[n] for n in before if sa.SPARSE_ATTN_STATS[n] != before[n]}
-    want = backend or ("hd512" if hd512 else ("gather" if sa._gather_eligible(q, w) else "triton"))
+    want = backend or ("hd512" if hd512 else ("gather" if sa._gather_eligible(q, w) else
+                                              ("triton" if sa._triton_eligible(q) else "torch")))
     assert ran == {want: 1}, ran
     ref = _grads(lambda q, win, sink: sa.sparse_attn_reference(q, win, sink, widx, d ** -0.5),
                  q.double(), win.double(), sink.double(), go.double())
