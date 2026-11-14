@@ -7443,8 +7443,27 @@ def _extract_vlm_media(
     ):
         images = top_level_image
 
+    videos_from_row = bool(videos)
     if not videos and top_level_videos and "video" in bare_placeholder_types:
         videos = top_level_videos
+        videos_from_row = True
+    if videos_from_row and isinstance(messages, list):
+        # A bare placeholder's decode hints (video_start, nframes, fps...) belong to the row clip it stands for.
+        hints = [
+            {k: v for k, v in part.items() if k != "type" and k not in _VIDEO_PART_TYPES}
+            for message in messages if isinstance(message, dict) and isinstance(message.get("content"), list)
+            for part in message["content"]
+            if isinstance(part, dict) and part.get("type") in _VIDEO_PART_TYPES and _video_part_payload(part) is None
+        ]
+        paired = []
+        for i, video in enumerate(videos):
+            hint = hints[i] if i < len(hints) else {}
+            if hint and isinstance(video, (str, bytes, dict)):
+                video = {**hint, **_video_element_dict(video)}
+            elif hint and hasattr(video, "shape"):
+                video = {**hint, "video": None, "_frames": video}
+            paired.append(video)
+        videos = paired
 
     needs_images = not images and has_image_parts
     needs_videos = not videos and has_video_parts

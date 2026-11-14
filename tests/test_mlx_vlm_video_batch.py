@@ -547,3 +547,17 @@ def test_video_part_given_as_frame_paths_is_loaded_per_frame(monkeypatch):
     messages = [{"role": "user", "content": [{"type": "video", "video": frames}, {"type": "text", "text": "q"}]}]
     _, videos, kwargs = _extract_vlm_media({}, messages, None)
     assert seen == [frames] and len(videos) == 1 and kwargs == {"fps": [2.0]}
+
+
+def test_bare_placeholder_hints_reach_the_row_clip(monkeypatch):
+    import unsloth_zoo.vision_utils as vu
+
+    seen = []
+    monkeypatch.setattr(vu, "fetch_video", lambda info, **k: (seen.append(dict(info)), (np.zeros((2, 4, 4, 3), np.uint8), 1.0))[1])
+    messages = [{"role": "user", "content": [
+        {"type": "video", "video_start": 120, "video_end": 121, "nframes": 8},
+        {"type": "text", "text": "q"},
+    ]}]
+    _, videos, _ = _extract_vlm_media({"videos": "clips/a.mp4"}, messages, None)
+    assert len(videos) == 1
+    assert seen == [{"video_start": 120, "video_end": 121, "nframes": 8, "video": "clips/a.mp4"}]
