@@ -996,15 +996,10 @@ class UnslothFrozenTableEmbedding(nn.Module):
         # (DataParallel replicas share it) can at worst drop an entry (one extra read), never raise or serve rows
         # under another entry's key.
         entries = tuple(self._memo or ())
-        # The key alone vouches for the values only through the version counter, which writes through ``.data`` or
-        # a numpy view of a reused ids buffer do not bump. On the host the value check is free of syncs, so CPU ids
-        # always take it; accelerator ids trust the key (no host copy for a recompute of the same ids tensor).
-        if ids.device.type != "cpu":
-            for i, entry in enumerate(entries):
-                if entry[2] == key:
-                    return self._memo_hit(entry)
-        # The rows are read on the host, so the ids go there once: the value checks and the gather share that copy
-        # (one host sync per lookup on an accelerator, none for a recompute that hands back the same tensor).
+        # Every hit compares values: the key vouches for them only through the version counter, which writes
+        # through ``.data`` (or a numpy view of a reused ids buffer) do not bump, so the same tensor with new values
+        # would match its old entry. The rows are read on the host anyway, so the ids go there once and the value
+        # checks and the gather share that copy (one host sync per lookup on an accelerator).
         host = ids.detach().cpu() if ids.device.type != "cpu" else None
         probe = ids if host is None else host
         for entry in entries:

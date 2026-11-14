@@ -782,7 +782,8 @@ def test_host_table_cuda_lookup_syncs_once(bf16_table, mode):
     _, n_same = syncs(lambda: emb(ids))
     _, n_clone = syncs(lambda: emb(ids.clone()))
     b, n_other = syncs(lambda: emb(other))
-    assert (n_new, n_same, n_clone, n_other) == (1, 0, 1, 1)
+    # the same tensor again also copies its values to the host: a write through .data keeps its key (finding 3)
+    assert (n_new, n_same, n_clone, n_other) == (1, 1, 1, 1)
     ref = full.float()
     assert torch.equal(a.cpu(), F.embedding(ids.cpu(), ref)) and torch.equal(b.cpu(), F.embedding(other.cpu(), ref))
     emb.frozen_table_store.close()
@@ -1001,3 +1002,22 @@ def test_provenance_records_and_compares_the_fp8_decoder_scale(tmp_path):
     assert fts.compare_frozen_table_provenance(saved, fts.frozen_table_provenance(model(scale))) == []
     problems = fts.compare_frozen_table_provenance(saved, fts.frozen_table_provenance(model(scale * 2)))
     assert problems == ["ngram: decoder scale differs from the saved base table"], problems
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("mode", ["ram", "disk"])
+def test_cuda_memo_never_serves_rows_for_values_written_through_data(bf16_table, mode):
+    """Finding 3: lookup(A), lookup(B), A.data.copy_(new), lookup(A): A keeps its address, shape and version, so a
+    key-only hit served A's old rows once two entries are kept."""
+    index, names, full = bf16_table
+    dev = torch.device("cuda", torch.cuda.current_device())
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode=mode))
+    fts.set_frozen_table_memo_slots(torch.nn.ModuleDict({"e": emb}), 2)
+    a = torch.tensor([[1, 2, 3]], device=dev)
+    b = torch.tensor([[4, 5, 6]], device=dev)
+    emb(a)
+    emb(b)
+    a.data.copy_(torch.tensor([[40, 41, 42]], device=dev))
+    assert torch.equal(emb(a).cpu(), F.embedding(a.cpu(), full.float()))
+    emb.frozen_table_store.close()
