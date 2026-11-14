@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""create_repo(private=True, exist_ok=True) keeps an existing public repo public, so a private=True push must stop
-before the model card or any weight is uploaded. Mocked HfApi / ModelCard: nothing reaches the Hub."""
+"""A private=True push into an existing public repo stops before any upload (mocked Hub)."""
 
 from types import SimpleNamespace
 

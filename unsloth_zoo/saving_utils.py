@@ -346,8 +346,7 @@ def create_huggingface_repo(
         private = private,
         exist_ok = True,  # don't error if repo already exists
     )
-    # create_repo(private=True, exist_ok=True) leaves an existing public repo public, so refuse before the first upload
-    # rather than publish a private=True push. Visibility is never changed here.
+    # create_repo(private=True, exist_ok=True) keeps an existing public repo public: refuse before the first upload.
     if private:
         try:
             _is_private = getattr(api.repo_info(repo_id = repo_id, repo_type = "model"), "private", None)
