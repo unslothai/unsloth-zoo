@@ -1,3 +1,19 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 from __future__ import annotations
 
 import numpy as np
@@ -5,7 +21,7 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 if "mlx_simulation" in str(getattr(mx, "__file__", "")):
-    pytest.skip("requires real MLX runtime", allow_module_level=True)
+    pytest.skip("requires real MLX runtime, not the tests/mlx_simulation torch shim", allow_module_level=True)
 
 from unsloth_zoo.mlx.utils import (
     _extract_vlm_images,
@@ -31,9 +47,6 @@ class _FakeVideoProcessor:
         self.image_processor = object()
         self.seen = None
         self._accepts_video = accepts_video
-
-    if True:  # keep __call__ signature literal so _drop_unsupported_processor_kwargs sees it
-        pass
 
     def _call(self, text, padding, return_tensors, add_special_tokens, videos = None, fps = None, **kwargs):
         self.seen = {"videos": videos, "fps": fps, **kwargs}
@@ -369,3 +382,18 @@ def test_messageless_pc_row_keeps_top_level_videos(monkeypatch):
     )
     assert images == []
     assert videos == [decoded]
+
+
+@pytest.mark.parametrize("model_type", ["glm4v", "ernie4_5_moe_vl"])
+def test_video_refused_for_families_whose_embedder_drops_videos(model_type):
+    processor = _FakeVideoProcessor()
+    processor._unsloth_model_type = model_type
+    with pytest.raises(ValueError, match = "video training is not supported"):
+        _processor_vlm_inputs(processor, ["t1"], [[]], 32, all_videos = [["clip-a"]])
+
+
+def test_video_accepted_for_qwen_vl_stamp():
+    processor = _FakeVideoProcessor()
+    processor._unsloth_model_type = "qwen2_5_vl"
+    _processor_vlm_inputs(processor, ["t1"], [[]], 32, all_videos = [["clip-a"]])
+    assert processor.seen["videos"] == ["clip-a"]

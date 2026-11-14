@@ -3838,8 +3838,7 @@ _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
 })
 
 
-# Families whose MLX input-embedding path branches on `pixel_values is None` and returns text embeds —
-# `pixel_values_videos` never reaches the tower, so video tokens would train as plain text.
+# mlx-vlm embedders that never read `pixel_values_videos`, so clips would train as plain text.
 _VLM_TEXT_ONLY_EMBEDDER_MODEL_TYPES = {
     "glm4v",
     "glm4v_moe",
@@ -9280,10 +9279,9 @@ def _processor_vlm_inputs(
                 f"Unsloth MLX: `{type(processor).__name__}` does not accept video "
                 "inputs. Video rows need a video-capable processor (Qwen-VL family)."
             )
-        # These towers' input-embedding patches only look at `pixel_values`; a
-        # video-only batch would silently train the clips' tokens as text.
-        model_type = getattr(processor, "model_type", None) or getattr(
-            getattr(processor, "tokenizer", None), "model_type", None
+        # The loader stamps `_unsloth_model_type`; HF processors have no `model_type`.
+        model_type = getattr(processor, "_unsloth_model_type", None) or getattr(
+            processor, "model_type", None
         )
         if model_type in _VLM_TEXT_ONLY_EMBEDDER_MODEL_TYPES:
             raise ValueError(
