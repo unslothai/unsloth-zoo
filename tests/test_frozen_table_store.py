@@ -122,14 +122,18 @@ def test_madvise_page_aligned_and_real(bf16_table, monkeypatch):
         assert any(c[2] == mmap.MADV_WILLNEED and c[0] % mmap.PAGESIZE == 0 for c in calls)
 
 
-def test_fp8_e8m0_planes_match_reference(tmp_path):
+@pytest.mark.parametrize("widened", [False, True])
+def test_fp8_e8m0_planes_match_reference(tmp_path, widened):
+    """``widened``: the scales stored as fp32 (Unsloth's converted DeepSeek-V4.1 checkpoints, for transformers
+    without F8_E8M0); the same powers of two, so the same rows."""
     if not hasattr(torch, "float8_e8m0fnu"):
         pytest.skip("torch without float8_e8m0fnu")
     torch.manual_seed(0)
     n, dim, block = 300, 64, 32
     weight = (torch.randn(n, dim) * 4).to(torch.float8_e4m3fn)
     scale = torch.randint(110, 140, (n, dim // block), dtype=torch.uint8).view(torch.float8_e8m0fnu)
-    save_file({"layers.1.engram.embed.weight": weight, "x": torch.ones(3), "layers.1.engram.embed.scale": scale},
+    stored = scale.float() if widened else scale
+    save_file({"layers.1.engram.embed.weight": weight, "x": torch.ones(3), "layers.1.engram.embed.scale": stored},
               str(tmp_path / "model.safetensors"))
     store = FrozenTableStore.from_checkpoint(
         str(tmp_path), {"weight": ["layers.1.engram.embed.weight"], "scale": ["layers.1.engram.embed.scale"]},

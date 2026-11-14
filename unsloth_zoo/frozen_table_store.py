@@ -440,7 +440,14 @@ def make_fp8_block_decode(block_size: int = 32, weight_plane: str = "weight", sc
 
     def decode(planes: Dict[str, torch.Tensor], dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         values = planes[weight_plane].view(torch.float8_e4m3fn)
-        scales = planes[scale_plane].view(torch.float8_e8m0fnu).float()
+        scales = planes[scale_plane]
+        # e8m0 bytes (the released files), or the same powers of two widened to fp32 (Unsloth's converted
+        # DeepSeek-V4.1 checkpoints, for transformers without F8_E8M0): told apart by the bytes per row.
+        if scales.dtype == torch.uint8 and values.shape[-1] and scales.shape[-1] == 4 * (values.shape[-1] // block_size):
+            scales = scales.view(torch.float32)
+        elif not (scales.is_floating_point() and scales.element_size() > 1):
+            scales = scales.view(torch.float8_e8m0fnu)
+        scales = scales.float()
         out = values.float().unflatten(-1, (-1, block_size)) * scales.unsqueeze(-1)
         out = out.flatten(-2)
         return out if dtype is None or dtype == out.dtype else out.to(dtype)
