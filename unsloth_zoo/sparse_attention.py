@@ -132,9 +132,17 @@ def _shared_memory(device):
     return _SHARED_MEMORY[index]
 
 
-def _triton_eligible(q):
+def _tensor_core_triton(q):
+    """Triton 3.x lowers tl.dot to tensor-core mma.sync only on sm80+; on sm75 (T4) every dot is scalar fp32 FMA
+    (0 mma.sync in the sm75 PTX of these kernels), and the measured T4 step was 2.5-3.6x slower than the torch
+    path. Automatic dispatch therefore skips the Triton kernels there; UNSLOTH_SPARSE_ATTN_BACKEND=triton (or
+    backend = "triton") still forces them."""
+    return q.is_cuda and torch.cuda.get_device_capability(q.device)[0] >= 8
+
+
+def _triton_eligible(q, forced = False):
     from .sparse_mqa_kernel import sparse_mqa_supported
-    return _HAS_TRITON and sparse_mqa_supported(q, q)
+    return _HAS_TRITON and sparse_mqa_supported(q, q) and (forced or _tensor_core_triton(q))
 
 
 def _flex_eligible(q, kv_len = None):
@@ -431,7 +439,8 @@ def sparse_attn_window(q, window_kv, compress_kv, compress_idxs, attn_sink, soft
     if forced in (None, "triton") and _HAS_TRITON:
         from .sparse_mqa_kernel import sparse_mqa_window_attention, sparse_mqa_window_supported
         key = ("window", compress_idxs.shape[-1])
-        if sparse_mqa_window_supported(q, window_kv) and (forced == "triton" or _failure_key("triton", q, key) not in _FAILED):
+        if sparse_mqa_window_supported(q, window_kv) and (forced == "triton" or (
+                _tensor_core_triton(q) and _failure_key("triton", q, key) not in _FAILED)):
             # Banded window kernel over the contiguous window rows + the index kernel over the compressed slots.
             if torch.compiler.is_compiling() or forced == "triton":
                 out = sparse_mqa_window_attention(q, window_kv, compress_kv, compress_idxs, attn_sink, softmax_scale, window_size)
@@ -484,7 +493,7 @@ def sparse_gqa_attn(query, key, value, topk_idxs, softmax_scale, *, backend = No
     q = torch.cat([q, q.new_zeros((b * hk, s, groups, dv))], dim = -1)
     kv = torch.cat([key, value], dim = -1).reshape(b * hk, key.shape[2], dk + dv)
     sink = torch.full((groups,), float("-inf"), device = query.device, dtype = torch.float32)
-    if hk > 1 and backend != "torch" and forced in (None, "triton") and _triton_eligible(q) and (
+    if hk > 1 and backend != "torch" and forced in (None, "triton") and _triton_eligible(q, forced == "triton") and (
             forced == "triton" or _failure_key("triton", q, topk_idxs.shape[-1]) not in _FAILED):
         # The Triton kernel reads one index row per hk folded batches: no [b * hk, s, K] repeated copy kept for
         # backward (128 MB per layer at 4k tokens with K = 2051, hk = 2).
@@ -503,6 +512,19 @@ def sparse_gqa_attn(query, key, value, topk_idxs, softmax_scale, *, backend = No
     idxs = topk_idxs.repeat_interleave(hk, dim = 0) if hk > 1 else topk_idxs
     out = sparse_attn(q, kv, sink, idxs, softmax_scale, backend = backend)[..., dk:]    # [b*hk, s, g, dv]
     return out.reshape(b, hk, s, groups, dv).permute(0, 2, 1, 3, 4).reshape(b, s, hq, dv)
+
+
+def sparse_gqa_fast_path(query, key, value):
+    """True when sparse_gqa_attn has a kernel for these operands (flex, or the [K | V] fold on gather / Triton), or
+    a backend is forced. False (T4 / sm75, CPU) means only the chunked torch path is left, which is slower than the
+    model's own dense attention there: callers keep their upstream path."""
+    if _forced_backend() is not None:
+        return True
+    hk, groups = key.shape[1], query.shape[1] // key.shape[1]
+    folded = query.new_empty((1, 1, groups, key.shape[-1] + value.shape[-1]))
+    if _gather_eligible(folded) or _triton_eligible(folded):
+        return True
+    return _flex_eligible(query.transpose(1, 2), key.shape[2]) and _flex_eligible(value.transpose(1, 2))
 
 
 def _sparse_gqa_flex(query, key, value, topk_idxs, softmax_scale):

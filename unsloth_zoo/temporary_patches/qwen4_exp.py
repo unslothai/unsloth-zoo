@@ -93,7 +93,12 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
     if module.training and module.attention_dropout:
         return None
     import sys
-    from unsloth_zoo.sparse_attention import qsa_select_tokens, sparse_gqa_attn
+    from unsloth_zoo.sparse_attention import qsa_select_tokens, sparse_gqa_attn, sparse_gqa_fast_path
+    # No kernel for QSA on this device (T4 / sm75: no flex, Triton without tensor cores): transformers' own path.
+    probe_q = hidden_states.new_empty((1, module.config.num_attention_heads, 1, module.head_dim))
+    probe_kv = hidden_states.new_empty((1, module.config.num_key_value_heads, seq, module.head_dim))
+    if not sparse_gqa_fast_path(probe_q, probe_kv, probe_kv):
+        return None
     rope = sys.modules[type(module).__module__].apply_rotary_pos_emb
     position_embeddings = tuple(position_embeddings)
     with torch.no_grad():

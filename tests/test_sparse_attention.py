@@ -282,6 +282,7 @@ def test_cuda_refused_kernel_config_steps_down(monkeypatch):
     q, kv, sink, idxs = _inputs(1, 33, 16, 512, 80, 40, torch.float16, "cuda")
     go = torch.randn(1, 33, 16, 512, device = "cuda", dtype = torch.float16)
     want = _grads(lambda q, kv, sink: mk.sparse_mqa_attention(q, kv, sink, idxs, 512 ** -0.5), q, kv, sink, go)
+    mk._CHOSEN.clear()   # a real 64 KB part already stepped down while computing `want`
     monkeypatch.setattr(mk, "_sparse_mqa_bwd", Refusing())
     for _ in range(2):
         got = _grads(lambda q, kv, sink: mk.sparse_mqa_attention(q, kv, sink, idxs, 512 ** -0.5), q, kv, sink, go)
@@ -522,13 +523,18 @@ _TIERS = [("T4", (7, 5), 64 * 1024, torch.float16), ("A100", (8, 0), 163 * 1024,
 
 @pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
 @pytest.mark.parametrize("tier", _TIERS, ids = [t[0] for t in _TIERS])
-def test_deepseek_head_dim_512_below_sm100_takes_the_triton_kernel(monkeypatch, tier):
+def test_deepseek_head_dim_512_dispatch_below_sm100(monkeypatch, tier):
     # DeepSeek-V4.1 attention (head_dim 512, 16 heads, window 128 + compressed top-k) with no backend forced, on
-    # each tier's capability and shared memory: dispatch must pick the Triton kernel (not gather, not torch) for both
-    # the plain and the window form, with that tier's launch configs, and match the fp64 reference. Configs run on
-    # this device's codegen; the per-target shared memory of those configs is checked by smem_targets.py.
+    # each tier's capability and shared memory: sm80+ tiers must pick the Triton kernel (not gather, not torch) for
+    # the plain and the window form; T4 (sm75, where Triton has no tensor-core dot) must pick torch, and the forced
+    # Triton kernel still runs there. All match the fp64 reference. Configs run on this device's codegen (independent
+    # of the real part); their per-target shared memory is checked by smem_targets.py.
     from unsloth_zoo import sparse_mqa_kernel as mk
     name, cap, smem, dtype = tier
+    real_smem = mk._shared_memory(torch.device("cuda"))
+    if dtype == torch.bfloat16 and torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("bf16 tier needs a real sm80+ device")
+    want = "torch" if cap[0] < 8 else "triton"
     monkeypatch.delenv("UNSLOTH_SPARSE_ATTN_BACKEND", raising = False)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: cap)
     monkeypatch.setattr(sa, "_shared_memory", lambda device: smem)
@@ -537,14 +543,19 @@ def test_deepseek_head_dim_512_below_sm100_takes_the_triton_kernel(monkeypatch, 
     monkeypatch.setattr(sa, "_FAILED", {})
     b, s, h, d, n, k = 1, 300, 16, 512, 75, 64
     q, kv, sink, idxs = _inputs(b, s, h, d, n, k, dtype, "cuda", empty_rows = [(0, 1)])
-    assert sa._order(q, k, None, n)[0] == "triton", sa._order(q, k, None, n)
+    assert sa._order(q, k, None, n)[0] == want, sa._order(q, k, None, n)
     go = torch.randn(b, s, h, d, device = "cuda", dtype = dtype)
     before = dict(sa.SPARSE_ATTN_STATS)
     got = _grads(lambda q, kv, sink: sa.sparse_attn(q, kv, sink, idxs, d ** -0.5), q, kv, sink, go)
     win = (torch.randn(b, s, d, device = "cuda") * 0.5).to(dtype)
     out_w = sa.sparse_attn_window(q, win, kv, idxs, sink, d ** -0.5, 128)
     delta = {key: sa.SPARSE_ATTN_STATS[key] - before[key] for key in before}
-    assert delta == {**{key: 0 for key in before}, "triton": 2}, delta
+    assert delta == {**{key: 0 for key in before}, want: 2}, delta
+    if want == "torch":   # opt-in still reaches the kernel
+        forced = _grads(lambda q, kv, sink: sa.sparse_attn(q, kv, sink, idxs, d ** -0.5, backend = "triton"), q, kv, sink, go)
+        assert sa.SPARSE_ATTN_STATS["triton"] == before["triton"] + 1
+        for x, y in zip(forced, got):
+            torch.testing.assert_close(x.float(), y.float(), atol = 2e-2, rtol = 2e-2)
     ref = _grads(lambda q, kv, sink: sa.sparse_attn_reference(q, kv, sink, idxs, d ** -0.5),
                  q.double(), kv.double(), sink.double(), go.double())
     low = _grads(lambda q, kv, sink: sa.sparse_attn_reference(q, kv, sink, idxs, d ** -0.5), q, kv, sink, go)
@@ -557,7 +568,11 @@ def test_deepseek_head_dim_512_below_sm100_takes_the_triton_kernel(monkeypatch, 
     err, base = (out_w.double() - ref_w).abs().max().item(), (low_w.double() - ref_w).abs().max().item()
     assert err <= 2 * base + 4 * torch.finfo(dtype).eps, (name, "window", err, base)
     chosen = {key[3]: mk._configs(None, d, key[3])[i] for key, i in mk._CHOSEN.items() if key[0] != "window"}
-    assert chosen[True][3] == (d // 2 if smem < 96 * 1024 else d), chosen
+    expect_split = smem < 96 * 1024
+    if expect_split or real_smem >= 96 * 1024:   # a real 64 KB part refuses the unsplit config and steps down
+        assert chosen[True][3] == (d // 2 if expect_split else d), chosen
+    else:
+        assert chosen[True] in mk._configs(None, d, True), chosen
 
 
 _WINDOW_INTERP = """
@@ -618,19 +633,26 @@ def test_window_kernel_and_shared_index_rows_in_the_interpreter():
 
 
 @pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
-@pytest.mark.parametrize("smem", [228 * 1024, 99 * 1024, 64 * 1024], ids = ["sm100", "100KB", "64KB"])
-def test_qsa_gqa_dispatch_prefers_flex_where_it_compiles(monkeypatch, smem):
-    # QSA (8 q / 2 kv heads x 256): flex where head_dim 256 flex compiles (> 64 KB), else the [K | V] fold through
-    # the Triton kernel with one shared index row per KV head (no repeat); both match the fp64 reference.
+@pytest.mark.parametrize("cap,smem,want", [((10, 0), 228 * 1024, "flex"), ((8, 9), 99 * 1024, "flex"),
+                                           ((8, 0), 64 * 1024, "triton"), ((7, 5), 64 * 1024, "torch")],
+                         ids = ["sm100", "sm89", "sm80_64KB", "sm75"])
+def test_qsa_gqa_dispatch_prefers_flex_where_it_compiles(monkeypatch, cap, smem, want):
+    # QSA (8 q / 2 kv heads x 256): flex where head_dim 256 flex compiles (sm80+, > 64 KB), else the [K | V] fold
+    # through the Triton kernel with one shared index row per KV head (no repeat), and torch on sm75 (where the
+    # Qwen patch keeps transformers' path: sparse_gqa_fast_path is False); all match the fp64 reference.
     from unsloth_zoo import sparse_mqa_kernel as mk
+    real_cap = torch.cuda.get_device_capability()
+    if want == "flex" and real_cap[0] < 8:
+        pytest.skip("flex needs a real sm80+ device")
     monkeypatch.delenv("UNSLOTH_SPARSE_ATTN_BACKEND", raising = False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: cap)
     monkeypatch.setattr(sa, "_shared_memory", lambda device: smem)
     monkeypatch.setattr(mk, "_shared_memory", lambda device: smem)
     monkeypatch.setattr(mk, "_CHOSEN", {})
     monkeypatch.setattr(sa, "_FAILED", {})
     g = torch.Generator().manual_seed(5)
     b, hq, hk, s, d, k = 1, 8, 2, 200, 256, 48
-    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    dtype = torch.bfloat16 if real_cap[0] >= 8 else torch.float16
     query = (torch.randn(b, hq, s, d, generator = g) * 0.5).cuda().to(dtype)
     key = (torch.randn(b, hk, s, d, generator = g) * 0.5).cuda().to(dtype)
     value = (torch.randn(b, hk, s, d, generator = g) * 0.5).cuda().to(dtype)
@@ -648,9 +670,9 @@ def test_qsa_gqa_dispatch_prefers_flex_where_it_compiles(monkeypatch, smem):
     before = dict(sa.SPARSE_ATTN_STATS)
     got = run(lambda q, k_, v: sa.sparse_gqa_attn(q, k_, v, idxs, d ** -0.5), query, key, value)
     delta = {n: sa.SPARSE_ATTN_STATS[n] - before[n] for n in before}
-    want = "flex" if smem >= 96 * 1024 else "triton"
     assert delta == {**{n: 0 for n in before}, want: 1}, delta
-    assert not repeats
+    assert sa.sparse_gqa_fast_path(query, key, value) == (want != "torch")
+    assert not repeats or want == "torch"
 
     def dense(q, k_, v):
         # -1 slots land in a spare column (a clamp to 0 would race valid writes to key 0).
