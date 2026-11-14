@@ -172,6 +172,9 @@ if hasattr(torch, "float8_e8m0fnu"):
     _ST_DTYPES["F8_E8M0"] = (torch.float8_e8m0fnu, 1)
 
 
+_MAX_HEADER_BYTES = 100 * 1024 * 1024
+
+
 def read_safetensors_header(path: str) -> Tuple[dict, int]:
     """Return (header dict, absolute byte offset of the data section)."""
     with open(path, "rb") as f:
@@ -179,7 +182,7 @@ def read_safetensors_header(path: str) -> Tuple[dict, int]:
         if len(raw) != 8:
             raise ValueError(f"Unsloth: {path} is not a safetensors file (short header).")
         (n,) = struct.unpack("<Q", raw)
-        if n > 100 * 1024 * 1024:
+        if n > _MAX_HEADER_BYTES:
             raise ValueError(f"Unsloth: {path} has an implausible safetensors header length {n}.")
         header = json.loads(f.read(n))
     return header, 8 + n
@@ -649,13 +652,14 @@ class FrozenTableStore:
             return cached
         files, tensors = {}, []
         for plane_name, plane in self.planes.items():
-            for loc in plane.locations:
+            # The mappings this store reads rows from, not whatever the paths name now (a file replaced since).
+            for loc, shard in zip(plane.locations, plane.shards):
                 base = os.path.basename(loc.source_path or loc.path)
                 if base not in files:
-                    files[base] = {"size": os.path.getsize(loc.path), "header_sha256": _header_sha256(loc.path)}
+                    files[base] = {"size": shard.file.size, "header_sha256": _header_sha256(shard.file)}
                 tensors.append({
                     "name": loc.name, "plane": plane_name, "file": base, "dtype": loc.dtype,
-                    "shape": list(loc.shape), "sample_sha256": _sample_sha256(loc),
+                    "shape": list(loc.shape), "sample_sha256": _sample_sha256(shard.file, loc),
                 })
         first = next(iter(self.planes.values())).locations[0]
         repo_id, revision = _hub_identity(first.source_path or first.path)
@@ -1081,22 +1085,27 @@ _SAMPLE_BYTES = 64 << 10
 _SAMPLES = 8
 
 
-def _header_sha256(path: str) -> str:
-    with open(path, "rb") as f:
-        (n,) = struct.unpack("<Q", f.read(8))
-        return hashlib.sha256(f.read(n)).hexdigest()
+def _mapped_bytes(f: "_MappedFile", start: int, n: int) -> bytes:
+    mm = f.mm
+    if mm is None or start < 0 or n < 0 or start + n > f.size:
+        raise ValueError(f"Unsloth: short read of {n} bytes at {start} from {f.path} ({f.size} bytes mapped).")
+    return mm[start:start + n]
 
 
-def _sample_sha256(loc: "TensorLocation") -> str:
+def _header_sha256(f: "_MappedFile") -> str:
+    (n,) = struct.unpack("<Q", _mapped_bytes(f, 0, 8))
+    if n > _MAX_HEADER_BYTES:
+        raise ValueError(f"Unsloth: {f.path} has an implausible safetensors header length {n}.")
+    return hashlib.sha256(_mapped_bytes(f, 8, n)).hexdigest()
+
+
+def _sample_sha256(f: "_MappedFile", loc: "TensorLocation") -> str:
     h = hashlib.sha256()
-    with open(loc.path, "rb") as f:
-        if loc.nbytes <= _SAMPLES * _SAMPLE_BYTES:
-            f.seek(loc.offset)
-            h.update(f.read(loc.nbytes))
-        else:
-            for k in range(_SAMPLES):
-                f.seek(loc.offset + (loc.nbytes - _SAMPLE_BYTES) * k // (_SAMPLES - 1))
-                h.update(f.read(_SAMPLE_BYTES))
+    if loc.nbytes <= _SAMPLES * _SAMPLE_BYTES:
+        h.update(_mapped_bytes(f, loc.offset, loc.nbytes))
+    else:
+        for k in range(_SAMPLES):
+            h.update(_mapped_bytes(f, loc.offset + (loc.nbytes - _SAMPLE_BYTES) * k // (_SAMPLES - 1), _SAMPLE_BYTES))
     return h.hexdigest()
 
 

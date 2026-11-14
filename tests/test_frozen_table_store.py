@@ -1021,3 +1021,51 @@ def test_cuda_memo_never_serves_rows_for_values_written_through_data(bf16_table,
     a.data.copy_(torch.tensor([[40, 41, 42]], device=dev))
     assert torch.equal(emb(a).cpu(), F.embedding(a.cpu(), full.float()))
     emb.frozen_table_store.close()
+
+
+def test_provenance_describes_the_mapping_already_bound(bf16_table, tmp_path):
+    """Findings 4 / 6: a file replaced at the same path after binding must not be what the provenance hashes."""
+    import shutil
+
+    index, names, full = bf16_table
+    copy_dir = tmp_path / "copy"
+    copy_dir.mkdir()
+    src = os.path.dirname(index)
+    for f in os.listdir(src):
+        if os.path.isfile(os.path.join(src, f)):
+            shutil.copy(os.path.join(src, f), copy_dir / f)
+    copy_index = str(copy_dir / os.path.basename(index))
+    store = FrozenTableStore.from_checkpoint(copy_index, {"weight": names}, mode="disk")
+    reference = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk").provenance()
+    # replace every shard file at its path with one holding other rows (a new inode; the mapping keeps the old)
+    other = [torch.randn(n, 20).to(torch.bfloat16) for n in (37, 64, 1, 50)]
+    (tmp_path / "new").mkdir()
+    _write_sharded(tmp_path / "new", other)
+    for f in os.listdir(tmp_path / "new"):
+        if f.endswith(".safetensors"):
+            tmp = copy_dir / (f + ".tmp")
+            shutil.copy(tmp_path / "new" / f, tmp)
+            os.replace(tmp, copy_dir / f)
+    got = store.provenance()
+    assert [t["sample_sha256"] for t in got["tensors"]] == [t["sample_sha256"] for t in reference["tensors"]]
+    assert {k: v["header_sha256"] for k, v in got["files"].items()} == {
+        k: v["header_sha256"] for k, v in reference["files"].items()
+    }
+    store.close()
+
+
+def test_provenance_header_digest_refuses_an_implausible_or_short_header(tmp_path):
+    """Findings 6 / 11: the header length is bounded like read_safetensors_header, and short reads raise."""
+    import struct
+
+    huge = tmp_path / "huge.safetensors"
+    huge.write_bytes(struct.pack("<Q", 1 << 40) + b"{}")
+    short = tmp_path / "short.safetensors"
+    short.write_bytes(struct.pack("<Q", 64) + b"{}")
+    for path, match in ((huge, "implausible"), (short, "short read")):
+        mapped = fts._MappedFile(str(path))
+        try:
+            with pytest.raises(ValueError, match=match):
+                fts._header_sha256(mapped)
+        finally:
+            mapped.close()
