@@ -453,11 +453,11 @@ def apply_xet_env(
     )
 
     # xet-core reads the fixed alias only for primaries left unset (aliases.rs), so ours stand down, even under force,
-    # and our unchanged seeded copies (also inherited by a child env) go; a user's explicit primary stays.
+    # and our unchanged seeds leave os.environ; child envs are cleaned by resize_for_cache_dir, other mappings are not ours.
     if target.get("HF_XET_FIXED_DOWNLOAD_CONCURRENCY"):
         for key in _AC_DOWNLOAD_KEYS:
             overrides.pop(key, None)
-            if key in _SEEDED_INTO_ENVIRON and target.get(key) == _SEEDED_INTO_ENVIRON[key]:
+            if target is os.environ and key in _SEEDED_INTO_ENVIRON and target.get(key) == _SEEDED_INTO_ENVIRON[key]:
                 del target[key]
 
     # A user's high-performance flag keeps the headroom, so our caps are dropped rather than left alongside it; read it
