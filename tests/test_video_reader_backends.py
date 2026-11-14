@@ -189,6 +189,32 @@ def test_cv2_reader_resamples_when_frame_count_understates(monkeypatch, clip):
     assert len(video) == 4 and red[-1] > 8 * (FRAMES - 3)
 
 
+@pytest.mark.parametrize("ele", [{"nframes": 16}, {"video_start": 1.5, "video_end": 2.5, "nframes": 4}])
+def test_cv2_reader_recounts_before_rejecting_against_an_understated_count(monkeypatch, clip, ele):
+    cv2 = pytest.importorskip("cv2")
+    real = cv2.VideoCapture
+
+    class Understated:
+        def __init__(self, path):
+            self._cap = real(path)
+
+        def get(self, prop):
+            return FRAMES // 3 if prop == cv2.CAP_PROP_FRAME_COUNT else self._cap.get(prop)
+
+        def __getattr__(self, name):
+            return getattr(self._cap, name)
+
+    monkeypatch.setattr(cv2, "VideoCapture", Understated)
+    video, _ = vision_utils._read_video_cv2({"video": clip, **ele})
+    assert len(video) == ele["nframes"]
+
+
+def test_cv2_reader_still_rejects_a_truly_invalid_request(clip):
+    pytest.importorskip("cv2")
+    with pytest.raises(ValueError, match = "nframes should in interval"):
+        vision_utils._read_video_cv2({"video": clip, "nframes": FRAMES * 4})
+
+
 def test_fetch_video_through_cv2_only(backends, monkeypatch, clip):
     pytest.importorskip("cv2")
     backends("cv2")

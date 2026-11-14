@@ -987,8 +987,15 @@ def _read_video_cv2(
             if total <= 0:
                 # Streams without an index report 0 (or -1): count by decoding.
                 total = _count_frames()
-            start_frame, end_frame, span = calculate_video_frame_range(ele, total, video_fps)
-            nframes = smart_nframes(ele, total_frames=span, video_fps=video_fps)
+            try:
+                start_frame, end_frame, span = calculate_video_frame_range(ele, total, video_fps)
+                nframes = smart_nframes(ele, total_frames=span, video_fps=video_fps)
+            except ValueError:
+                # The request may only be invalid against the container's estimate: recount once, then judge.
+                counted = _count_frames() if expected_total is None else total
+                if counted == total:
+                    raise
+                return _decode(counted)
             idx = torch.linspace(start_frame, end_frame, nframes).round().long().tolist()
             wanted = {}
             for i in idx:
