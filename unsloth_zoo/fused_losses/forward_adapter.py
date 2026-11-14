@@ -55,6 +55,8 @@ def lm_head_on_old_cuda_arch(weight):
 def lm_head_fake_quantize(lm_head, hidden_states):
     """(hidden_states, weight) after the TorchAO QAT QDQ that lm_head.forward() applies and fused CE skips."""
     weight = lm_head.weight
+    if type(lm_head) is torch.nn.Linear:
+        return hidden_states, weight
     activation_fake_quantizer = getattr(lm_head, "activation_fake_quantizer", None)
     if activation_fake_quantizer is not None:
         hidden_states = activation_fake_quantizer(hidden_states)
