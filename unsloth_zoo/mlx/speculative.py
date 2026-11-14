@@ -851,7 +851,10 @@ class DraftController:
             best = RoundPlan("plain", min(self._window, best.length))
         else:
             self._window = self.min_window
-        self._current = identity
+        held = self._current
+        # A reply's last rounds are only as wide as it has tokens left: they do not unseat the width the next reply starts at.
+        if held is None or held[1] != "round" or any(state.remaining is None or state.remaining >= held[2] for state in rows):
+            self._current = identity
         return best, False
 
     def _worth(self, plan: RoundPlan, rows: Sequence[RowState]) -> float:

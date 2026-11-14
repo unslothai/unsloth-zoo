@@ -543,6 +543,22 @@ def test_short_budgets_never_plan_empty_drafts():
             controller.record_round(plan, states, [0] * len(states), seconds = 1.0, draft_seconds = 0.1)
 
 
+def test_a_reply_running_out_of_tokens_keeps_the_width_the_next_one_starts_at():
+    controller, machine, states = DraftController(max_depth = 4, can_copy = False), _Machine(draft_slope = 0.05), []
+    _run(controller, machine, [([0.9, 0.7, 0.4, 0.2], None)], rounds = 800, states = states)
+    held = controller._current
+    assert held[1] == "round" and held[2] > 2
+    for budget in (2, 1):
+        states[0].remaining = budget
+        plan = controller.plan(states)
+        assert plan.width < held[2]
+        if plan.kind == "round":
+            controller.record_round(plan, states, [0], seconds = machine.verify(1, plan.width), draft_seconds = 0.0)
+    assert controller._current == held
+    controller._current, states[0].remaining = (*held[:2], 2), held[2]
+    assert controller.plan(states).width == held[2] and controller._current == held
+
+
 def test_copy_probe_displaces_a_winning_drafter():
     # Two perfect copy tokens tie a perfect depth-2 draft yet skip its forward, but the copy prior scores below the drafter, so only a probe finds that out.
     controller = DraftController(max_depth = 2, max_copy = 12)
