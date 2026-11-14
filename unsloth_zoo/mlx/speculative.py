@@ -1807,14 +1807,17 @@ class SpeculativeEngine:
             with mx.stream(self._stream):
                 self.drafter.predraft(draft, mx.take(hidden[0], path, axis = 0), walked[0], target[walked[1]])
             mx.eval(target, path, walked, tree.rank, tree.tokens, *([] if scores is None else [scores]))
-            tokens, count, last = tree.tokens.tolist(), walked[0].item(), walked[1].item()
+            # Read off the evaluated arrays: indexing one first would be a new op the host then waits on the GPU for.
+            tokens, (count, last) = tree.tokens.tolist(), walked.tolist()
             if tokens[0] != row.pending:
                 raise RuntimeError("a draft tree must start from its row's pending token")
             rows = path.tolist()[: count + 1]
             target = target.tolist()
             row.draft_n += plan.tree - 1
             row.draft_n_accepted += count
-            scores = None if scores is None else [scores[r].item() for r in rows]
+            if scores is not None:
+                scores = scores.tolist()
+                scores = [scores[r] for r in rows]
             taken = row.take([tokens[r] for r in rows[1:]] + [target[last]], scores)
             if taken:
                 with mx.stream(self._stream):
