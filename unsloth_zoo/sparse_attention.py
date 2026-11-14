@@ -29,8 +29,10 @@ compressed rows `compress_idxs + seq_len`. It lets the gather kernel read the wi
 Backends, first eligible wins (UNSLOTH_SPARSE_ATTN_BACKEND=gather|flex|torch forces one):
   gather  attention-gym gather_attn Triton fwd + bwd (vendored, unsloth_zoo/_vendored/attn_gym); CUDA,
           fp16 / bf16 (bf16 needs sm80+), not ROCm.
-  flex    torch flex_attention over a membership block mask, sink applied exactly from the logsumexp.
-  torch   gather + softmax in fp32, chunked over queries; also the CPU path and the oracle.
+  flex    torch flex_attention over a membership block mask, sink applied exactly from the logsumexp; eager only,
+          and only while the [b, s, n] membership table stays under 2^28 entries.
+  torch   gather + softmax in fp32, chunked over queries (one [chunk, k, d] slab live); also the CPU path and the
+          oracle. Not a fast path: it materialises the gathered rows per chunk.
 A backend whose launch fails is latched off for that shape class (eager only) and the next one runs.
 """
 
@@ -95,15 +97,22 @@ def _gather_eligible(q):
     return True
 
 
-def _flex_eligible(q):
-    return q.is_cuda and _HAS_TRITON and q.dtype in (torch.float16, torch.bfloat16)
+# The flex fallback reads a [b, s, n] membership table (S x S for QSA); above this many entries the chunked torch
+# path, which never holds more than one [chunk, k, d] slab, runs instead.
+_FLEX_MAX_TABLE = 1 << 28
+
+
+def _flex_eligible(q, kv_len = None):
+    if not (q.is_cuda and _HAS_TRITON and q.dtype in (torch.float16, torch.bfloat16)):
+        return False
+    return kv_len is None or q.shape[0] * q.shape[1] * kv_len <= _FLEX_MAX_TABLE
 
 
 def _failure_key(backend, q, k):
     return (backend, q.device.type, q.device.index, q.dtype, q.shape[2], q.shape[3], k)
 
 
-def _order(q, k, backend = None):
+def _order(q, k, backend = None, kv_len = None):
     forced = backend if backend in _BACKENDS else _forced_backend()
     if forced is not None:
         return (forced,)
@@ -111,7 +120,7 @@ def _order(q, k, backend = None):
     if _gather_eligible(q):
         order.append("gather")
     # Flex is an eager fallback: it compiles flex_attention itself, which does not nest inside a traced region.
-    if _flex_eligible(q) and not torch.compiler.is_compiling():
+    if _flex_eligible(q, kv_len) and not torch.compiler.is_compiling():
         order.append("flex")
     order.append("torch")
     if torch.compiler.is_compiling():
@@ -274,7 +283,7 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, *, backend = None):
     if k == 0:
         _count("torch")
         return q.new_zeros(q.shape) + 0 * q
-    order = _order(q, k, backend)
+    order = _order(q, k, backend, kv.shape[1])
     for i, backend in enumerate(order):
         if torch.compiler.is_compiling() or i == len(order) - 1:
             out = _run(backend, q, kv, attn_sink, topk_idxs, softmax_scale)
