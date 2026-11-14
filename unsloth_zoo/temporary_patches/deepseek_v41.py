@@ -14,7 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4.1 (community port, transformers.models.deepseek_v41) training fixes. No-ops without the port.
+"""DeepSeek-V4.1 training fixes, for transformers.models.deepseek_v41 or Unsloth's native implementation
+(unsloth/models/deepseek_v41). No-ops without either.
 
 1. Gradient checkpointing. The decoder layers are GradientCheckpointingLayers, but the port leaves
    `supports_gradient_checkpointing` False, and the CSA2 group state is one per-forward `shared` dict that KV / index
@@ -57,16 +58,27 @@ __all__ = [
 
 
 def _modeling():
+    """transformers' deepseek_v41 when it ships one, else Unsloth's native implementation
+    (unsloth/models/deepseek_v41/modeling.py) once loading a deepseek_v41 config imported it. Never imports
+    unsloth from here."""
     try:
-        if importlib.util.find_spec("transformers.models.deepseek_v41") is None:
-            return None
+        if importlib.util.find_spec("transformers.models.deepseek_v41") is not None:
+            from transformers.models.deepseek_v41 import modeling_deepseek_v41
+            return modeling_deepseek_v41
     except Exception:
-        return None
-    try:
-        from transformers.models.deepseek_v41 import modeling_deepseek_v41
-    except Exception:
-        return None
-    return modeling_deepseek_v41
+        pass
+    return _native_modeling()
+
+
+def _native_modeling():
+    import sys
+    module = sys.modules.get("unsloth.models.deepseek_v41.modeling")
+    if module is not None and getattr(module, "DeepseekV41DecoderLayer", None) is not None:
+        return module
+    for name, module in list(sys.modules.items()):
+        if name.endswith("deepseek_v41.modeling") and getattr(module, "DeepseekV41DecoderLayer", None) is not None:
+            return module
+    return None
 
 
 # Checkpointed layer runs (first forward + recompute), for tests and engagement checks.
@@ -305,7 +317,9 @@ def patch_deepseek_v41_config_aliases():
     try:
         from transformers.models.deepseek_v41.configuration_deepseek_v41 import DeepseekV41TextConfig
     except Exception:
-        return
+        DeepseekV41TextConfig = getattr(modeling, "DeepseekV41TextConfig", None)
+        if DeepseekV41TextConfig is None:
+            return
     attribute_map = dict(getattr(DeepseekV41TextConfig, "attribute_map", {}) or {})
     if "num_experts" in attribute_map or "num_experts" in getattr(DeepseekV41TextConfig, "__dataclass_fields__", {}):
         return
