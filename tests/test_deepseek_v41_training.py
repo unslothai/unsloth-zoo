@@ -146,9 +146,15 @@ def test_checkpointed_layers_keep_the_compile_stance(impl, monkeypatch):
 def test_prepare_compiled_checkpoint_specializes_floats(monkeypatch):
     from unsloth_zoo.temporary_patches.deepseek_v41 import prepare_compiled_checkpoint
 
-    monkeypatch.setattr(torch._dynamo.config, "specialize_float", False)
-    assert prepare_compiled_checkpoint() is True
-    assert torch._dynamo.config.specialize_float is True
+    # Not monkeypatch: its undo deletes the attribute from torch._dynamo.config (a ConfigModule), and every later
+    # torch.compile in the session then fails with "specialize_float does not exist".
+    saved = torch._dynamo.config.specialize_float
+    try:
+        torch._dynamo.config.specialize_float = False
+        assert prepare_compiled_checkpoint() is True
+        assert torch._dynamo.config.specialize_float is True
+    finally:
+        torch._dynamo.config.specialize_float = saved
 
 
 def test_grouped_lora_matches_merged_weight(impl):
