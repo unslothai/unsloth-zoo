@@ -723,7 +723,7 @@ def test_resident_table_gathers_without_unique_or_memo(bf16_table):
     ref_rows = F.embedding((tokens * 3 + 1) % full.shape[0], full.float())
     assert torch.allclose(x.grad, ref_rows * proj.weight.sum(0))
     assert FROZEN_TABLE_STATS["resident_gathers"] == FROZEN_TABLE_STATS["gathers"] == 2
-    assert FROZEN_TABLE_STATS["memo_hits"] == 0 and emb._memo is None
+    assert FROZEN_TABLE_STATS["memo_hits"] == 0 and not emb._memo
     assert FROZEN_TABLE_STATS["unique_rows"] == 0
     for ids in _ids_with_edges(full):
         assert torch.equal(store.gather(ids), F.embedding(ids, full))
@@ -809,3 +809,71 @@ def test_memo_sees_a_reused_cpu_ids_buffer_rewritten_without_a_version_bump(bf16
     assert torch.equal(emb(buf), F.embedding(buf, ref))  # unchanged values still hit the memo
     assert FROZEN_TABLE_STATS["memo_hits"] == 1
     emb.frozen_table_store.close()
+
+
+def _one_f_one_b(emb, proj, full, slots):
+    """Two micro-batches forwarded under non-reentrant checkpointing, then backward in order (1F1B warm-up on a
+    first stage): each backward recomputes its micro-batch's lookup."""
+    fts.set_frozen_table_memo_slots(torch.nn.ModuleDict({"emb": emb}), slots)
+    tokens = [torch.randint(0, 50, (2, 7), generator=torch.Generator().manual_seed(s)) for s in (11, 12)]
+
+    def block(x, t):
+        ids = (t * 3 + 1) % full.shape[0]  # fresh ids on every (re)compute, as in Qwen4Exp / DeepSeek-V4.1
+        return proj(emb(ids) * x).sum()
+
+    xs = [torch.ones(2, 7, 20, requires_grad=True) for _ in tokens]
+    fts.frozen_table_next_step()
+    reset_frozen_table_stats()
+    outs = [torch.utils.checkpoint.checkpoint(block, x, t, use_reentrant=False) for x, t in zip(xs, tokens)]
+    for out in outs:
+        out.backward()
+    for x, t in zip(xs, tokens):
+        rows = F.embedding((t * 3 + 1) % full.shape[0], full.float())
+        assert torch.allclose(x.grad, rows * proj.weight.sum(0))  # each micro-batch got its own rows
+    return fts.frozen_table_step_stats(), FROZEN_TABLE_STATS["gathers"]
+
+
+def test_bounded_memo_serves_every_in_flight_micro_batch(bf16_table):
+    index, names, full = bf16_table
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk"))
+    proj = torch.nn.Linear(20, 3)
+    # One slot: each forward / recompute evicts the other micro-batch, so both recomputes read the store again.
+    stats, gathers = _one_f_one_b(emb, proj, full, slots=1)
+    assert stats == {"memo_hits": 0, "memo_misses": 4} and gathers == 4
+    # One slot per in-flight micro-batch: both recomputes are served from memory.
+    stats, gathers = _one_f_one_b(emb, proj, full, slots=2)
+    assert stats == {"memo_hits": 2, "memo_misses": 2} and gathers == 2
+    assert len(emb._memo) == 2
+    fts.frozen_table_next_step()
+    assert fts.frozen_table_step_stats() == {"memo_hits": 0, "memo_misses": 0}
+    assert emb._memo == []  # the previous step's rows are released
+    emb(torch.tensor([1, 2]))
+    emb(torch.tensor([3, 4]))
+    assert len(emb._memo) == 2
+    assert fts.set_frozen_table_memo_slots(torch.nn.ModuleDict({"emb": emb}), 1) == 1 and len(emb._memo) == 1
+    emb._memo = None  # model code resetting the memo the old way still means "empty"
+    emb(torch.tensor([1, 2]))
+    assert len(emb._memo) == 1
+    emb.frozen_table_store.close()
+
+
+def test_bounded_memo_never_hands_one_micro_batch_another_ones_rows(bf16_table, monkeypatch):
+    """Flip: with the value check disabled (every snapshot "equal"), the second micro-batch of the same shape is
+    served the first one's rows, and the gradient check above catches it."""
+    index, names, full = bf16_table
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk"))
+    proj = torch.nn.Linear(20, 3)
+    _one_f_one_b(emb, proj, full, slots=4)
+    monkeypatch.setattr(fts.torch, "equal", lambda a, b: True)
+    with pytest.raises(AssertionError):
+        _one_f_one_b(emb, proj, full, slots=4)
+    emb.frozen_table_store.close()
+
+
+def test_memo_slots_default_from_the_environment(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_FROZEN_TABLE_MEMO_SLOTS", "5")
+    assert UnslothFrozenTableEmbedding(4, 2).memo_slots == 5
+    monkeypatch.setenv("UNSLOTH_FROZEN_TABLE_MEMO_SLOTS", "0")
+    assert UnslothFrozenTableEmbedding(4, 2).memo_slots == 1

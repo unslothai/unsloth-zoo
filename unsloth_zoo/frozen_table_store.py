@@ -36,6 +36,8 @@ Reader (``UNSLOTH_FROZEN_TABLE_READER``): ``mmap`` (default) or ``pread`` (threa
 from __future__ import annotations
 
 __all__ = [
+    "frozen_table_step_stats",
+    "set_frozen_table_memo_slots",
     "FrozenTableStore",
     "UnslothFrozenTableEmbedding",
     "FROZEN_TABLE_STATS",
@@ -74,29 +76,74 @@ FROZEN_TABLE_STATS = {
     "rows": 0,
     "unique_rows": 0,
     "memo_hits": 0,
+    "memo_misses": 0,
     "bytes_read_est": 0,
     "resident_gathers": 0,
 }
 _STATS_LOCK = threading.Lock()
 _STEP = [0]
+# Lookups since the last frozen_table_next_step(): memo hits (a checkpoint recompute served without a re-read) and
+# misses (a gather from the store).
+_STEP_STATS = {"memo_hits": 0, "memo_misses": 0}
+
+
+def _default_memo_slots() -> int:
+    try:
+        return max(1, int(os.environ.get("UNSLOTH_FROZEN_TABLE_MEMO_SLOTS", "2")))
+    except ValueError:
+        return 2
 
 
 def reset_frozen_table_stats():
     with _STATS_LOCK:
         for k in FROZEN_TABLE_STATS:
             FROZEN_TABLE_STATS[k] = 0
+        for k in _STEP_STATS:
+            _STEP_STATS[k] = 0
 
 
 def frozen_table_next_step() -> int:
-    """Invalidate every module memo (call once per optimizer step if ids tensors are reused in place)."""
-    _STEP[0] += 1
+    """Invalidate every module memo (call once per optimizer step if ids tensors are reused in place) and start a
+    new count for frozen_table_step_stats()."""
+    with _STATS_LOCK:
+        _STEP[0] += 1
+        for k in _STEP_STATS:
+            _STEP_STATS[k] = 0
+    # Entries of the previous step can never match again (the step is in their key): free their rows now.
+    for ref in list(_MODULES.values()):
+        module = ref()
+        if module is not None and module._memo:
+            module._memo = []
     return _STEP[0]
+
+
+def frozen_table_step_stats() -> Dict[str, int]:
+    """{"memo_hits", "memo_misses"} of every frozen table lookup since the last frozen_table_next_step()."""
+    with _STATS_LOCK:
+        return dict(_STEP_STATS)
+
+
+def set_frozen_table_memo_slots(module: nn.Module, slots: int) -> int:
+    """Rows each frozen table of `module` keeps for checkpoint recomputes: one entry per lookup still waiting for
+    its backward. A pipeline schedule has that many micro-batches in flight per stage (GPipe: all of them, 1F1B:
+    the stages from this one to the last), each recomputed in its own backward. Returns the number of tables."""
+    slots = max(1, int(slots))
+    n = 0
+    for m in module.modules():
+        if isinstance(m, UnslothFrozenTableEmbedding):
+            m.memo_slots = slots
+            if m._memo:
+                del m._memo[slots:]
+            n += 1
+    return n
 
 
 def _bump(**kw):
     with _STATS_LOCK:
         for k, v in kw.items():
             FROZEN_TABLE_STATS[k] += int(v)
+            if k in _STEP_STATS:
+                _STEP_STATS[k] += int(v)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -782,7 +829,9 @@ class UnslothFrozenTableEmbedding(nn.Module):
         self.table_dtype = dtype if dtype is not None else torch.get_default_dtype()
         self.table_name = table_name
         self.frozen_table_store: Optional[FrozenTableStore] = None
-        self._memo = None
+        # Most recent first: (ids, host snapshot of its values, key, rows), at most memo_slots of them.
+        self._memo: list = []
+        self.memo_slots = _default_memo_slots()
         self._handle = _register_module(self)
 
     # Upstream forwards read ``self.<table>.weight.device`` to pick where to run the lookup; a
@@ -808,7 +857,7 @@ class UnslothFrozenTableEmbedding(nn.Module):
                 f"expected {tuple(self.row_shape)}."
             )
         self.frozen_table_store = store
-        self._memo = None
+        self._memo = []
         return self
 
     def __deepcopy__(self, memo):
@@ -816,7 +865,7 @@ class UnslothFrozenTableEmbedding(nn.Module):
         new = type(self).__new__(type(self))
         memo[id(self)] = new
         for k, v in self.__dict__.items():
-            new.__dict__[k] = None if k == "_memo" else copy.deepcopy(v, memo)
+            new.__dict__[k] = [] if k == "_memo" else copy.deepcopy(v, memo)
         new._handle = _register_module(new)
         return new
 
@@ -868,7 +917,7 @@ class UnslothFrozenTableEmbedding(nn.Module):
             probe = fn(torch.empty(0, dtype=self.table_dtype))
             if isinstance(probe, torch.Tensor) and probe.is_floating_point():
                 if probe.dtype != self.table_dtype:
-                    self._memo = None
+                    self._memo = []
                 self.table_dtype = probe.dtype
         except Exception:
             pass
@@ -900,31 +949,45 @@ class UnslothFrozenTableEmbedding(nn.Module):
         step = _STEP[0]
         key = (ids.data_ptr(), ids._version, tuple(ids.shape), tuple(ids.stride()), ids.device, step, self.table_dtype,
                ids.dtype)
-        memo = self._memo
+        # A bounded cache, one entry per lookup still waiting for its checkpoint recompute (pipeline schedules keep
+        # several micro-batches in flight). The micro-batch's identity is its ids tensor: every entry holds its ids
+        # alive, so no other tensor can take that address while the key names it. Rows are only ever served for the
+        # same ids tensor or for equal values, so one micro-batch never receives another's rows.
+        entries = self._memo or []
         # The key alone vouches for the values only through the version counter, which writes through ``.data`` or
         # a numpy view of a reused ids buffer do not bump. On the host the value check is free of syncs, so CPU ids
         # always take it; accelerator ids trust the key (no host copy for a recompute of the same ids tensor).
-        if memo is not None and memo[2] == key and ids.device.type != "cpu":
-            _bump(memo_hits=1)
-            return memo[3]
-        # The rows are read on the host, so the ids go there once: the memo's value check and the gather share that
-        # copy (one host sync per lookup on an accelerator, none for a recompute that hands back the same tensor).
+        if ids.device.type != "cpu":
+            for i, entry in enumerate(entries):
+                if entry[2] == key:
+                    return self._memo_hit(entries, i)
+        # The rows are read on the host, so the ids go there once: the value checks and the gather share that copy
+        # (one host sync per lookup on an accelerator, none for a recompute that hands back the same tensor).
         host = ids.detach().cpu() if ids.device.type != "cpu" else None
-        if memo is not None:
-            m_ids, m_snapshot, m_key, m_rows = memo
+        probe = ids if host is None else host
+        for i, (_, m_snapshot, m_key, _) in enumerate(entries):
             if (
                 m_key[2] == key[2] and m_key[4] == key[4] and m_key[5] == step and m_key[6] == key[6]
-                and m_key[7] == key[7] and torch.equal(m_snapshot, ids if host is None else host)
+                and m_key[7] == key[7] and torch.equal(m_snapshot, probe)
             ):
-                _bump(memo_hits=1)
-                return m_rows
+                return self._memo_hit(entries, i)
         with torch.no_grad():
             rows = store.gather(ids, dtype=self.table_dtype, host_ids=host)
             snapshot = ids.detach().clone() if host is None else host
+        _bump(memo_misses=1)
         # Hold ids (no other tensor can take its address while the key names it) and a snapshot of its values
         # (an in-place update of ids must not make the equality check compare the tensor with itself).
-        self._memo = (ids, snapshot, key, rows)
+        entries.insert(0, (ids, snapshot, key, rows))
+        del entries[max(1, int(getattr(self, "memo_slots", 1))):]
+        self._memo = entries
         return rows
+
+    def _memo_hit(self, entries, i):
+        entry = entries.pop(i)
+        entries.insert(0, entry)
+        self._memo = entries
+        _bump(memo_hits=1)
+        return entry[3]
 
 
 _MODULES: Dict[int, "weakref.ref"] = {}
