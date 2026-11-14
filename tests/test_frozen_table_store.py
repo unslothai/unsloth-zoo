@@ -984,3 +984,20 @@ def test_provenance_of_a_hub_cache_snapshot_names_the_repo_revision_and_files(bf
     # rows still come from the blobs
     assert torch.equal(store.gather(torch.tensor([0, 1])), FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk").gather(torch.tensor([0, 1])))
     store.close()
+
+
+@needs_fp8
+def test_provenance_records_and_compares_the_fp8_decoder_scale(tmp_path):
+    """Finding 1: the same fp8 rows under another per-tensor scale decode to other rows."""
+    q, scale = _fp8_table()
+    index, names = _write_sharded(tmp_path, list(torch.chunk(q, 4)))
+
+    def model(s):
+        decode = fts.make_fp8_tensor_scaled_decode("F8_E4M3", s)
+        store = FrozenTableStore.from_checkpoint(index, {"weight": names}, decode=decode, mode="disk")
+        return torch.nn.ModuleDict({"ngram": UnslothFrozenTableEmbedding(store.num_rows, 16).bind(store)})
+
+    saved = fts.frozen_table_provenance(model(scale))
+    assert fts.compare_frozen_table_provenance(saved, fts.frozen_table_provenance(model(scale))) == []
+    problems = fts.compare_frozen_table_provenance(saved, fts.frozen_table_provenance(model(scale * 2)))
+    assert problems == ["ngram: decoder scale differs from the saved base table"], problems

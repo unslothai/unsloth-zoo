@@ -663,6 +663,12 @@ class FrozenTableStore:
             "name": self.name, "num_rows": self.num_rows, "repo_id": repo_id, "revision": revision,
             "files": files, "tensors": tensors,
         }
+        scale = getattr(self.decode, "scale", None)
+        if isinstance(scale, torch.Tensor):
+            # A per-tensor fp8 scale read beside the table (weight_scale) scales every decoded row.
+            self._provenance["decode_scale"] = {
+                "dtype": str(scale.dtype).replace("torch.", ""), "values": scale.reshape(-1).double().tolist(),
+            }
         return self._provenance
 
     def __repr__(self):
@@ -1162,6 +1168,8 @@ def compare_frozen_table_provenance(saved: dict, live: Optional[dict]) -> List[s
                     what = "contents" if field == "sample_sha256" else field
                     problems.append(f"{key}: {ident[0]} {what} differ from the saved base table")
                     break
+        if want.get("decode_scale") != got.get("decode_scale"):
+            problems.append(f"{key}: decoder scale differs from the saved base table")
         if want.get("repo_id") and got.get("repo_id") and want["repo_id"] != got["repo_id"]:
             problems.append(f"{key}: from {got['repo_id']}, saved with {want['repo_id']}")
     return problems
