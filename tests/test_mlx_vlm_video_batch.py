@@ -484,3 +484,17 @@ def test_video_rows_without_torch_name_the_install(monkeypatch):
     monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: None if name == "torch" else real(name, *a))
     with pytest.raises(ImportError, match = "pip install torch torchvision"):
         _extract_vlm_media({}, _video_messages("clips/a.mp4"), None)
+
+
+@pytest.mark.parametrize("part", [
+    {"type": "video_url", "video_url": "clips/a.mp4"},
+    {"type": "video_url", "video_url": {"url": "clips/a.mp4"}},
+    {"type": "input_video", "input_video": "clips/a.mp4"},
+    {"video_url": "clips/a.mp4"},
+])
+def test_video_aliases_are_canonical_before_the_template_renders(part):
+    from unsloth_zoo.mlx.utils import _normalize_mlx_messages
+
+    messages = [{"role": "user", "content": [part, {"type": "text", "text": "q"}]}]
+    (message,) = _normalize_mlx_messages(messages, is_vlm = True)
+    assert message["content"][0] == {"type": "video", "video": "clips/a.mp4"}

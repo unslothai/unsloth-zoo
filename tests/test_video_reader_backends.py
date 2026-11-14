@@ -146,6 +146,27 @@ def test_cv2_reader_resamples_when_frame_count_overstates(monkeypatch, clip):
     assert len(video) == 8
 
 
+@pytest.mark.parametrize("reported", [0, -1])
+def test_cv2_reader_counts_frames_when_the_container_has_no_count(monkeypatch, clip, reported):
+    cv2 = pytest.importorskip("cv2")
+    real = cv2.VideoCapture
+
+    class Unindexed:
+        def __init__(self, path):
+            self._cap = real(path)
+
+        def get(self, prop):
+            return reported if prop == cv2.CAP_PROP_FRAME_COUNT else self._cap.get(prop)
+
+        def __getattr__(self, name):
+            return getattr(self._cap, name)
+
+    monkeypatch.setattr(cv2, "VideoCapture", Unindexed)
+    video, _ = vision_utils._read_video_cv2({"video": clip, "nframes": 6})
+    red = video[:, 0].float().mean((1, 2))
+    assert len(video) == 6 and red[-1] > 8 * (FRAMES - 3)
+
+
 def test_fetch_video_through_cv2_only(backends, monkeypatch, clip):
     pytest.importorskip("cv2")
     backends("cv2")

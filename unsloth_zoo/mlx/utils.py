@@ -5315,6 +5315,12 @@ def _normalize_mlx_messages(messages, *, is_vlm=False):
                         for key in ("input_image", "image_url"):
                             if key in clean:
                                 clean.setdefault("image", clean.pop(key))
+                        # Chat templates render a video placeholder only for type/key `video`.
+                        video = _video_part_payload(clean)
+                        for key in ("video_url", "input_video"):
+                            clean.pop(key, None)
+                        if video is not None:
+                            clean["video"] = video
                         # Gemma 3n's template renders a placeholder for 'audio' alone, so a part left under an alias
                         # carries a clip with nothing behind it; an untyped one reaches neither the family gate nor the
                         # extractor.
@@ -5323,10 +5329,14 @@ def _normalize_mlx_messages(messages, *, is_vlm=False):
                                 clean["type"] = "text"
                             elif "image" in clean:
                                 clean["type"] = "image"
+                            elif "video" in clean:
+                                clean["type"] = "video"
                             elif any(alias in clean for alias in _AUDIO_PART_TYPES):
                                 clean["type"] = "audio"
                         elif clean["type"] in ("image_url", "input_image"):
                             clean["type"] = "image"
+                        elif clean["type"] in ("video_url", "input_video"):
+                            clean["type"] = "video"
                         elif clean["type"] in _AUDIO_PART_TYPES:
                             clean["type"] = "audio"
                         parts.append(clean)

@@ -967,6 +967,16 @@ def _read_video_cv2(
     video_path = resolve_file_uri_to_path(ele["video"])
     st = time.time()
 
+    def _count_frames():
+        cap = cv2.VideoCapture(video_path)
+        try:
+            n = 0
+            while cap.grab():
+                n += 1
+            return n
+        finally:
+            cap.release()
+
     def _decode(expected_total):
         cap = cv2.VideoCapture(video_path)
         try:
@@ -974,6 +984,9 @@ def _read_video_cv2(
                 raise ValueError(f"Unsloth: OpenCV could not open video `{video_path}`.")
             video_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
             total = expected_total or int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if total <= 0:
+                # Streams without an index report 0 (or -1): count by decoding.
+                total = _count_frames()
             start_frame, end_frame, span = calculate_video_frame_range(ele, total, video_fps)
             nframes = smart_nframes(ele, total_frames=span, video_fps=video_fps)
             idx = torch.linspace(start_frame, end_frame, nframes).round().long().tolist()
