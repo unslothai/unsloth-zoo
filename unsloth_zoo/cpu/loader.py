@@ -437,7 +437,28 @@ class FastCPUModel:
         if use_gradient_checkpointing is None:
             use_gradient_checkpointing = getattr(model, "_unsloth_cpu_gradient_checkpointing", "unsloth")
         leaf_names = {name.rsplit(".", 1)[-1] for name, _ in model.named_modules()}
-        if target_modules is None:
+        # Models with their own projection names (Unsloth's native DeepSeek-V4.1) translate q/k/v/o/gate/up/down_proj,
+        # "all-linear" and None into their real Linears, exactly as the GPU get_peft_model does.
+        remap = getattr(model, "unsloth_lora_target_modules", None)
+        remapped_targets = False
+        if callable(remap):
+            embeddings = []
+            if target_modules is not None and not isinstance(target_modules, str):
+                embeddings = [m for m in target_modules if m in ("embed_tokens", "lm_head")]
+                target_modules = [m for m in target_modules if m not in embeddings]
+            remapped = remap(
+                target_modules,
+                attention = kwargs.get("finetune_attention_modules", True),
+                mlp = kwargs.get("finetune_mlp_modules", True),
+            )
+            if remapped is not target_modules:
+                target_modules = remapped
+                remapped_targets = True
+                if embeddings:
+                    modules_to_save = list(dict.fromkeys([*(modules_to_save or []), *embeddings]))
+        if remapped_targets:
+            pass
+        elif target_modules is None:
             # Unsloth's usual projections where the model has them, else PEFT's per-architecture default.
             candidates = _with_fused_projections(_DEFAULT_TARGET_MODULES, leaf_names)
             target_modules = [m for m in candidates if m in leaf_names]

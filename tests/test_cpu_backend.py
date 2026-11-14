@@ -432,6 +432,49 @@ def test_kv_cache_is_off_for_training_without_checkpointing():
     assert model.config.use_cache is False
 
 
+@pytest.mark.parametrize("targets, expected, saved", [
+    (None, ["self_attn.wq_a", "self_attn.wo_a", "mlp.up"], None),
+    (["q_proj", "o_proj", "lm_head"], ["self_attn.wq_a", "self_attn.wo_a"], ["lm_head"]),
+    ("all-linear", ["self_attn.wq_a", "self_attn.wo_a", "mlp.up"], None),
+])
+def test_lora_targets_go_through_the_models_own_remap(targets, expected, saved):
+    """A model naming its projections differently (Unsloth's native DeepSeek-V4.1) exposes unsloth_lora_target_modules;
+    the CPU get_peft_model must use it as the GPU path does, else q/k/v/o and None miss its real Linears."""
+    import torch.nn as nn
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    import peft
+    captured = {}
+    real = peft.LoraConfig.__init__
+
+    def spy(self, *args, **kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop")
+
+    calls = []
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.wq_a, self.wo_a, self.up = nn.Linear(8, 8), nn.Linear(8, 8), nn.Linear(8, 8)
+
+        @staticmethod
+        def unsloth_lora_target_modules(target_modules, attention = True, mlp = True):
+            calls.append((target_modules, attention, mlp))
+            table = {"q_proj": ["self_attn.wq_a"], "o_proj": ["self_attn.wo_a"], "up_proj": ["mlp.up"]}
+            wanted = ["q_proj", "o_proj", "up_proj"] if target_modules in (None, "all-linear") else target_modules
+            return [t for name in wanted for t in table.get(name, [name])]
+
+    peft.LoraConfig.__init__ = spy
+    try:
+        with pytest.raises(RuntimeError, match = "stop"):
+            FastCPUModel.get_peft_model(Model(), r = 4, target_modules = targets, use_gradient_checkpointing = False)
+    finally:
+        peft.LoraConfig.__init__ = real
+    assert captured["target_modules"] == expected
+    assert captured["modules_to_save"] == saved
+    assert calls and "lm_head" not in (calls[0][0] or [])
+
+
 def test_partial_llama_style_match_falls_back_to_the_peft_default():
     """MPT-like: Wqkv + out_proj + up_proj/down_proj. up/down alone must not become the target set."""
     import torch.nn as nn
