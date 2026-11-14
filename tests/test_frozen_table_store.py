@@ -877,3 +877,52 @@ def test_memo_slots_default_from_the_environment(monkeypatch):
     assert UnslothFrozenTableEmbedding(4, 2).memo_slots == 5
     monkeypatch.setenv("UNSLOTH_FROZEN_TABLE_MEMO_SLOTS", "0")
     assert UnslothFrozenTableEmbedding(4, 2).memo_slots == 1
+
+
+def _model_with(store):
+    emb = UnslothFrozenTableEmbedding(store.num_rows, 20, dtype=torch.float32).bind(store)
+    return torch.nn.ModuleDict({"base_model": torch.nn.ModuleDict({"model": torch.nn.ModuleDict({"ngram": emb})})})
+
+
+def test_provenance_matches_the_same_table_and_catches_another(bf16_table, tmp_path):
+    import shutil
+
+    index, names, full = bf16_table
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk")
+    saved = fts.frozen_table_provenance(_model_with(store))
+    assert saved["format"] == "unsloth_frozen_tables" and list(saved["tables"]) == ["ngram"]  # PEFT prefix dropped
+    table = saved["tables"]["ngram"]
+    assert table["num_rows"] == full.shape[0] and len(table["tensors"]) == len(names)
+    assert all(len(f["header_sha256"]) == 64 and f["size"] > 0 for f in table["files"].values())
+    assert json.loads(json.dumps(saved)) == saved  # plain JSON
+    # the same files, bound again on a bare model: nothing differs
+    again = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="ram")
+    bare = torch.nn.ModuleDict({"ngram": UnslothFrozenTableEmbedding(again.num_rows, 20).bind(again)})
+    assert fts.compare_frozen_table_provenance(saved, fts.frozen_table_provenance(bare)) == []
+    # a copy of the checkpoint with one table byte changed: same header, different contents
+    other = tmp_path / "other"
+    other.mkdir()
+    src = os.path.dirname(index)
+    for f in os.listdir(src):
+        if os.path.isfile(os.path.join(src, f)):
+            shutil.copy(os.path.join(src, f), other / f)
+    loc = resolve_tensor_locations(str(other / os.path.basename(index)), names=[names[1]])[names[1]]
+    with open(loc.path, "r+b") as f:
+        f.seek(loc.offset + 3)
+        byte = f.read(1)
+        f.seek(loc.offset + 3)
+        f.write(bytes([byte[0] ^ 0xFF]))
+    changed = FrozenTableStore.from_checkpoint(str(other / os.path.basename(index)), {"weight": names}, mode="disk")
+    problems = fts.compare_frozen_table_provenance(saved, fts.frozen_table_provenance(_model_with(changed)))
+    assert problems == [f"ngram: {names[1]} contents differ from the saved base table"], problems
+    # no table bound at all
+    assert fts.frozen_table_provenance(torch.nn.Linear(2, 2)) is None
+    assert fts.compare_frozen_table_provenance(saved, None) == ["ngram: no such frozen table bound in this model"]
+    for s in (store, again, changed):
+        s.close()
+
+
+def test_provenance_reads_the_hub_repo_and_revision():
+    path = os.path.join("/x", "hub", "models--org--Some-Model", "snapshots", "abc123", "model-00001.safetensors")
+    assert fts._hub_identity(path) == ("org/Some-Model", "abc123")
+    assert fts._hub_identity("/data/local/model.safetensors") == (None, None)

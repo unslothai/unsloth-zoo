@@ -37,6 +37,8 @@ from __future__ import annotations
 
 __all__ = [
     "frozen_table_step_stats",
+    "frozen_table_provenance",
+    "compare_frozen_table_provenance",
     "set_frozen_table_memo_slots",
     "FrozenTableStore",
     "UnslothFrozenTableEmbedding",
@@ -57,6 +59,7 @@ __all__ = [
 
 from contextlib import contextmanager
 import copy
+import hashlib
 import json
 import mmap
 import os
@@ -632,6 +635,32 @@ class FrozenTableStore:
     def __reduce__(self):
         raise TypeError("Unsloth: FrozenTableStore maps checkpoint files and cannot be pickled; rebind after load.")
 
+    def provenance(self) -> dict:
+        """Where this table's rows come from, cheap to compute and to check: per checkpoint file its size and the
+        sha256 of its safetensors header (names, dtypes, shapes, offsets); per table tensor a sha256 over a few
+        evenly spaced 64 KiB samples of its bytes (a different checkpoint with the same shapes differs there);
+        the hub repo id / revision when the files sit in a hub cache snapshot."""
+        cached = getattr(self, "_provenance", None)
+        if cached is not None:
+            return cached
+        files, tensors = {}, []
+        for plane_name, plane in self.planes.items():
+            for loc in plane.locations:
+                base = os.path.basename(loc.path)
+                if base not in files:
+                    files[base] = {"size": os.path.getsize(loc.path), "header_sha256": _header_sha256(loc.path)}
+                tensors.append({
+                    "name": loc.name, "plane": plane_name, "file": base, "dtype": loc.dtype,
+                    "shape": list(loc.shape), "sample_sha256": _sample_sha256(loc),
+                })
+        first = next(iter(self.planes.values())).locations[0].path
+        repo_id, revision = _hub_identity(first)
+        self._provenance = {
+            "name": self.name, "num_rows": self.num_rows, "repo_id": repo_id, "revision": revision,
+            "files": files, "tensors": tensors,
+        }
+        return self._provenance
+
     def __repr__(self):
         planes = ", ".join(f"{k}:{p.st_dtype}x{p.row_bytes}B/{len(p.shards)} shards" for k, p in self.planes.items())
         return f"FrozenTableStore({self.name}, rows={self.num_rows}, {planes}, mode={self.mode}, reader={self.reader})"
@@ -1039,6 +1068,97 @@ def _make_lookup_op():
 
 
 _LOOKUP_OP = _make_lookup_op()
+
+
+_SAMPLE_BYTES = 64 << 10
+_SAMPLES = 8
+
+
+def _header_sha256(path: str) -> str:
+    with open(path, "rb") as f:
+        (n,) = struct.unpack("<Q", f.read(8))
+        return hashlib.sha256(f.read(n)).hexdigest()
+
+
+def _sample_sha256(loc: "TensorLocation") -> str:
+    h = hashlib.sha256()
+    with open(loc.path, "rb") as f:
+        if loc.nbytes <= _SAMPLES * _SAMPLE_BYTES:
+            f.seek(loc.offset)
+            h.update(f.read(loc.nbytes))
+        else:
+            for k in range(_SAMPLES):
+                f.seek(loc.offset + (loc.nbytes - _SAMPLE_BYTES) * k // (_SAMPLES - 1))
+                h.update(f.read(_SAMPLE_BYTES))
+    return h.hexdigest()
+
+
+def _hub_identity(path: str) -> Tuple[Optional[str], Optional[str]]:
+    """(repo id, revision) of a file inside a hub cache snapshot (.../models--org--name/snapshots/<rev>/...)."""
+    parts = os.path.abspath(path).split(os.sep)
+    for i, seg in enumerate(parts[:-2]):
+        if seg.startswith("models--") and parts[i + 1] == "snapshots":
+            return seg[len("models--"):].replace("--", "/"), parts[i + 2]
+    return None, None
+
+
+_PEFT_PREFIXES = ("base_model.model.", "base_model.")
+
+
+def _table_key(name: str) -> str:
+    """A table's module path without PEFT wrapper prefixes: the same table whether saved from the PEFT model or
+    checked on the base model."""
+    changed = True
+    while changed:
+        changed = False
+        for prefix in _PEFT_PREFIXES:
+            if name.startswith(prefix):
+                name, changed = name[len(prefix):], True
+    return name
+
+
+def frozen_table_provenance(model: nn.Module) -> Optional[dict]:
+    """{"format", "version", "tables": {module path: FrozenTableStore.provenance()}} for every bound frozen table
+    of `model`, or None when it has none. Saves that leave the tables out (adapters, DCP / Trainer checkpoints)
+    write this next to the adapter, so a reload can check it runs on the same base tables."""
+    tables = {}
+    for name, module in iter_frozen_table_modules(model):
+        store = module.frozen_table_store
+        if store is not None:
+            tables[_table_key(name)] = store.provenance()
+    if not tables:
+        return None
+    return {"format": "unsloth_frozen_tables", "version": 1, "tables": tables}
+
+
+def compare_frozen_table_provenance(saved: dict, live: Optional[dict]) -> List[str]:
+    """What differs between a saved provenance and the live model's ([] = the same base tables)."""
+    if not saved or not saved.get("tables"):
+        return []
+    live_tables = (live or {}).get("tables") or {}
+    problems = []
+    for key, want in saved["tables"].items():
+        got = live_tables.get(_table_key(key))
+        if got is None:
+            problems.append(f"{key}: no such frozen table bound in this model")
+            continue
+        if want.get("num_rows") != got.get("num_rows"):
+            problems.append(f"{key}: {got.get('num_rows')} rows, saved with {want.get('num_rows')}")
+        want_t = {(t["name"], t["plane"]): t for t in want.get("tensors", [])}
+        got_t = {(t["name"], t["plane"]): t for t in got.get("tensors", [])}
+        if set(want_t) != set(got_t):
+            problems.append(f"{key}: table tensors {sorted(got_t)} differ from the saved {sorted(want_t)}")
+            continue
+        for ident, t in want_t.items():
+            g = got_t[ident]
+            for field in ("dtype", "shape", "sample_sha256"):
+                if t.get(field) != g.get(field):
+                    what = "contents" if field == "sample_sha256" else field
+                    problems.append(f"{key}: {ident[0]} {what} differ from the saved base table")
+                    break
+        if want.get("repo_id") and got.get("repo_id") and want["repo_id"] != got["repo_id"]:
+            problems.append(f"{key}: from {got['repo_id']}, saved with {want['repo_id']}")
+    return problems
 
 
 def iter_frozen_table_modules(model: nn.Module):
