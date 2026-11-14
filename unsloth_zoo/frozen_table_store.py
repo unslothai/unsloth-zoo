@@ -1034,8 +1034,8 @@ class UnslothFrozenTableEmbedding(nn.Module):
         return rows
 
     def _memo_hit(self, entry):
-        # Most recently used first; a new list, so a concurrent reader keeps iterating its own snapshot.
-        self._memo = [entry, *(e for e in (self._memo or ()) if e is not entry)]
+        # First in, first out: a hit (a recompute) leaves the order alone. Promoting it would push out the oldest
+        # entry, a micro-batch whose backward is still to come (steady-state 1F1B: F1 F2 B1 F3 evicted F2).
         _bump(memo_hits=1)
         return entry[3]
 

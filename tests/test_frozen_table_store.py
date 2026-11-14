@@ -1081,3 +1081,33 @@ def test_gather_refuses_host_ids_that_are_not_a_cpu_integer_copy_of_ids(bf16_tab
         with pytest.raises((TypeError, ValueError), match="host_ids"):
             store.gather(ids, host_ids=bad)
     store.close()
+
+
+def test_memo_serves_steady_state_one_f_one_b_without_evicting_a_waiting_micro_batch(bf16_table):
+    """Finding 7: F1 F2 B1 F3 B2 F4 B3 B4 with two slots. A hit must not move its entry ahead of a micro-batch that
+    still waits for its backward (MRU promotion evicted it: 2 hits); FIFO serves every recompute (4 hits)."""
+    index, names, full = bf16_table
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk"))
+    proj = torch.nn.Linear(20, 3)
+    fts.set_frozen_table_memo_slots(torch.nn.ModuleDict({"emb": emb}), 2)
+    tokens = {i: torch.randint(0, 50, (2, 7), generator=torch.Generator().manual_seed(20 + i)) for i in range(1, 5)}
+    xs = {i: torch.ones(2, 7, 20, requires_grad=True) for i in tokens}
+
+    def block(x, t):
+        return proj(emb((t * 3 + 1) % full.shape[0]) * x).sum()
+
+    fts.frozen_table_next_step()
+    reset_frozen_table_stats()
+    outs = {}
+    for op in "F1 F2 B1 F3 B2 F4 B3 B4".split():
+        i = int(op[1])
+        if op[0] == "F":
+            outs[i] = torch.utils.checkpoint.checkpoint(block, xs[i], tokens[i], use_reentrant=False)
+        else:
+            outs.pop(i).backward()
+    for i, t in tokens.items():
+        assert torch.allclose(xs[i].grad, F.embedding((t * 3 + 1) % full.shape[0], full.float()) * proj.weight.sum(0))
+    assert fts.frozen_table_step_stats() == {"memo_hits": 4, "memo_misses": 4}
+    assert FROZEN_TABLE_STATS["gathers"] == 4
+    emb.frozen_table_store.close()
