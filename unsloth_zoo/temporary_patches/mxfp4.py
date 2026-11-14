@@ -215,6 +215,53 @@ pass
 TEMPORARY_PATCHES.append(patch_mxfp4_quantizer_element_size)
 
 
+class _PackedExpertQuantizer:
+    """The load's quantizer, answering param_needs_quantization True: a packed expert stack is quantized."""
+
+    def __init__(self, quantizer):
+        self._quantizer = quantizer
+
+    def param_needs_quantization(self, *args, **kwargs):
+        return True
+
+    def __getattr__(self, name):
+        return getattr(self._quantizer, name)
+
+
+def patch_mxfp4_packed_expert_shape_check():
+    """A kept-packed expert stack holds (E, N, G, 16) bytes where the module declares (E, K, N).
+
+    transformers <= 5.22 skipped set_param_for_module's shape check under any quantizer; 5.23 skips it only when
+    hf_quantizer.param_needs_quantization, which a dequantize=True load answers False for every key. The packed
+    stack then landed in mismatched_keys, the experts were re-initialised and the load raised
+    ("ignore_mismatched_sizes"). Only a stack whose logical shape is exactly the module's goes through.
+    """
+    try:
+        import transformers.core_model_loading as core
+    except Exception:
+        return
+    original = getattr(core, "set_param_for_module", None)
+    if original is None or getattr(original, "_unsloth_mxfp4_patched", False):
+        return
+
+    @functools.wraps(original)
+    def set_param_for_module(model, target_name, param_value, loading_info, hf_quantizer, *args, **kwargs):
+        if hf_quantizer is not None and is_mxfp4_expert_param(param_value):
+            module_path, _, param_name = target_name.rpartition(".")
+            try:
+                ref = getattr(model.get_submodule(module_path) if module_path else model, param_name, None)
+            except AttributeError:
+                ref = None
+            if ref is not None and tuple(ref.shape) == tuple(param_value._original_shape):
+                hf_quantizer = _PackedExpertQuantizer(hf_quantizer)
+        return original(model, target_name, param_value, loading_info, hf_quantizer, *args, **kwargs)
+
+    set_param_for_module._unsloth_mxfp4_patched = True
+    core.set_param_for_module = set_param_for_module
+pass
+TEMPORARY_PATCHES.append(patch_mxfp4_packed_expert_shape_check)
+
+
 def _dense_packed_linear(module):
     dense = nn.Linear(module.in_features, module.out_features, bias = False, device = "meta")
     dense.weight = nn.Parameter(module.dequantize_weight().cpu(), requires_grad = False)
