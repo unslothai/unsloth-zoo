@@ -7426,7 +7426,6 @@ def _extract_vlm_media(
                     if collect_videos:
                         video = _video_part_payload(part)
                         if isinstance(video, (str, bytes, dict)) or (
-                            # A list of frame paths / images goes through fetch_video's per-frame loader.
                             isinstance(video, (list, tuple)) and video
                             and not hasattr(video[0], "shape")
                         ):

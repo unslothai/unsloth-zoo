@@ -1021,7 +1021,6 @@ VIDEO_READER_BACKENDS = {
     "decord": _read_video_decord,
     "torchvision": _read_video_torchvision,
     "torchcodec": _read_video_torchcodec,
-    # The torchvision reader decodes through PyAV when torchvision cannot.
     "pyav": _read_video_torchvision,
     "cv2": _read_video_cv2,
 }
