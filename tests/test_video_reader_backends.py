@@ -171,7 +171,7 @@ def test_fetch_video_through_cv2_only(backends, monkeypatch, clip):
     pytest.importorskip("cv2")
     backends("cv2")
     # The Apple Silicon case: no torchvision module at all, so the resize must not touch it either.
-    monkeypatch.delattr(vision_utils, "transforms")
+    monkeypatch.delattr(vision_utils, "transforms", raising = False)
     frames, fps = vision_utils.fetch_video({"video": clip, "nframes": 4}, return_video_sample_fps = True)
     assert frames.shape[0] == 4 and fps > 0
 
