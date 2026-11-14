@@ -443,7 +443,9 @@ def _input_ids(args, kwargs):
     return input_ids
 
 
-def _decoder_pre_hook(module, args, kwargs, parent_input_ids = ()):
+def _decoder_pre_hook(module, args, kwargs, parent_input_ids = (), moe_layers = ()):
+    if moe_layers and not torch.compiler.is_compiling():
+        _wrap_checkpoint_funcs(moe_layers)
     input_ids = _input_ids(args, kwargs)
     if input_ids is None and parent_input_ids:
         parent_ids, embeds = parent_input_ids[-1], kwargs.get("inputs_embeds")
@@ -932,24 +934,62 @@ def _identity_mask_fake(layer_input, recorded):
     return torch.empty(len(recorded), dtype = torch.bool, device = "cpu")
 
 
+def _record_layer_inputs(layer_index, args, kwargs):
+    # Read in compiled layers too: dropping these leaves identical forwards ambiguous.
+    tensors = [
+        x for value in list(args) + list(kwargs.values())
+        for x in (value if isinstance(value, (tuple, list)) else (value,))
+        if torch.is_tensor(x)
+    ]
+    if not tensors:
+        addresses = None
+    elif torch.compiler.is_compiling():
+        addresses = _LAYER_INPUTS_OP(tensors)
+    else:
+        addresses = _input_addresses(tensors)
+    _STATE.layer_inputs[layer_index] = addresses
+
+
 def _layer_pre_hook(layer_index):
     def hook(module, args, kwargs):
-        # Read in compiled layers too: dropping these leaves identical forwards ambiguous.
-        tensors = [
-            x for value in list(args) + list(kwargs.values())
-            for x in (value if isinstance(value, (tuple, list)) else (value,))
-            if torch.is_tensor(x)
-        ]
-        if not tensors:
-            addresses = None
-        elif torch.compiler.is_compiling():
-            addresses = _LAYER_INPUTS_OP(tensors)
-        else:
-            addresses = _input_addresses(tensors)
-        _STATE.layer_inputs[layer_index] = addresses
+        _record_layer_inputs(layer_index, args, kwargs)
         return None
 
     return hook
+
+
+class _RecordingCall(functools.partial):
+    # The checkpointed function, recording the layer inputs each time it runs. transformers >= 5.23
+    # checkpoints `forward` instead of `__call__`, so the recompute in backward skips the layer's
+    # forward pre hook and would otherwise read no inputs (identical forwards become ambiguous).
+    # A partial over the original, so checkpoint functions that unwrap it to find the layer still do.
+    def __call__(self, *args, **kwargs):
+        # Python may flatten a wrapped partial into this one: its bound keywords are ours then.
+        inner = getattr(self.func, "keywords", None)
+        bound = {**(inner if isinstance(inner, dict) else {}), **self.keywords, **kwargs}
+        _record_layer_inputs(self.layer_index, args, bound)
+        return super().__call__(*args, **kwargs)
+
+
+class _RecordingCheckpoint:
+    # A class, not a closure: transformers stores it on the layer, which must still pickle.
+    def __init__(self, checkpoint, layer_index):
+        self._unsloth_replay_checkpoint = checkpoint
+        self.layer_index = layer_index
+
+    def __call__(self, function, *args, **kwargs):
+        call = _RecordingCall(function)
+        call.layer_index = self.layer_index
+        return self._unsloth_replay_checkpoint(call, *args, **kwargs)
+
+
+def _wrap_checkpoint_funcs(layers):
+    # Per call, not once: gradient_checkpointing_enable (or Unsloth's offloaded checkpoint) may set
+    # the function after routing replay is installed.
+    for layer_index, layer in layers:
+        checkpoint = layer.__dict__.get("_gradient_checkpointing_func")
+        if callable(checkpoint) and not hasattr(checkpoint, "_unsloth_replay_checkpoint"):
+            layer._gradient_checkpointing_func = _RecordingCheckpoint(checkpoint, layer_index)
 
 
 def _is_router(module):
@@ -1012,8 +1052,12 @@ def install_routing_replay(model, llm = None, tokenizer = None):
 
         parent.register_forward_pre_hook(parent_pre_hook, with_kwargs = True)
         parent.register_forward_hook(parent_post_hook, always_call = True)
+    checkpointed = tuple(
+        (layer_index, decoder.layers[layer_index]) for layer_index in moe_layers if layer_index < len(decoder.layers)
+    )
     decoder.register_forward_pre_hook(
-        functools.partial(_decoder_pre_hook, parent_input_ids = parent_input_ids), with_kwargs = True,
+        functools.partial(_decoder_pre_hook, parent_input_ids = parent_input_ids, moe_layers = checkpointed),
+        with_kwargs = True,
     )
     decoder.register_forward_hook(_decoder_post_hook, always_call = True)
     model._unsloth_routing_replay_installed = True

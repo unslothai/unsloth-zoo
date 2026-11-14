@@ -262,7 +262,11 @@ def test_dequantize_convertops_keeps_or_dequantizes(monkeypatch):
     mx.patch_convert_moe_packed_tensors()
     blocks, scales = _random_mxfp4(2, 64, 96, device = "cuda" if torch.cuda.is_available() else "cpu")
     params = tuple(__import__("inspect").signature(mxfp4.dequantize_convertops).parameters)
-    extra = ("cpu",) if params == ("blocks", "scales", "target_device") else ()
+    # 5.0.0 passes the target device; 5.23 passes the dtype of the parameter the experts load into.
+    extra = {
+        ("blocks", "scales", "target_device"): ("cpu",),
+        ("blocks", "scales", "dtype"): (torch.bfloat16,),
+    }.get(params, ())
     monkeypatch.setattr(mx, "keep_mxfp4_experts_packed", lambda: False)
     dense = mxfp4.dequantize_convertops(blocks, scales, *extra)
     assert not isinstance(dense, Mxfp4ExpertParam) and dense.dtype == torch.bfloat16
