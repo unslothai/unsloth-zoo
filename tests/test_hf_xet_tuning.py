@@ -454,6 +454,7 @@ XET_CORE_VARS = frozenset({
     "HF_XET_CLIENT_RETRY_MAX_ATTEMPTS",
     "HF_XET_CLIENT_RETRY_MAX_DURATION",
     "HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS",
+    "HF_XET_FIXED_DOWNLOAD_CONCURRENCY",
     "HF_XET_HIGH_PERFORMANCE",
     "HF_XET_HP",
     "HF_XET_LOG_DEST",
@@ -534,6 +535,111 @@ def test_a_small_container_with_many_cores_still_fits_a_third_of_its_ram():
             * int(env["HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE"])
         )
         assert worst <= 2 * GB / 3, f"2GB/{cpus} cores: {worst} in flight"
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_fixed_concurrency_keeps_generated_primary_variables_out(force):
+    env = {"HF_XET_FIXED_DOWNLOAD_CONCURRENCY": "128"}
+    written = tuning.apply_xet_env(env, profile = _profile(16), force = force)
+    for bound in ("MAX", "INITIAL", "MIN"):
+        key = f"HF_XET_CLIENT_AC_{bound}_DOWNLOAD_CONCURRENCY"
+        assert key not in env
+        assert key not in written
+    assert env["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] == "128"
+    assert "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT" in written
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_fixed_concurrency_preserves_explicit_primary_variables(force):
+    env = {"HF_XET_FIXED_DOWNLOAD_CONCURRENCY": "128"}
+    for bound, value in (("MAX", "64"), ("INITIAL", "32"), ("MIN", "2")):
+        env[f"HF_XET_CLIENT_AC_{bound}_DOWNLOAD_CONCURRENCY"] = value
+    original = dict(env)
+    written = tuning.apply_xet_env(env, profile = _profile(16), force = force)
+    for key, value in original.items():
+        assert env[key] == value
+        assert key not in written
+
+
+@pytest.mark.parametrize("child", [False, True])
+def test_fixed_concurrency_removes_only_unchanged_seeded_primary_values(monkeypatch, child):
+    import os
+
+    env = {}
+    monkeypatch.setattr(os, "environ", env)
+    monkeypatch.setattr(tuning, "_SEEDED_INTO_ENVIRON", {})
+    monkeypatch.setattr(tuning, "_SEEDED_THROTTLED", False)
+    tuning.apply_xet_env(profile = _profile(16))
+    if child:
+        env = dict(env)
+    env["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] = "128"
+    env["HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY"] = "2"
+    if child:
+        monkeypatch.setattr(tuning, "system_profile", lambda _cache_dir = None: _profile(16))
+        written = tuning.resize_for_cache_dir(env, None)
+    else:
+        written = tuning.apply_xet_env(env, profile = _profile(16))
+    for bound in ("MAX", "INITIAL"):
+        key = f"HF_XET_CLIENT_AC_{bound}_DOWNLOAD_CONCURRENCY"
+        assert key not in env
+        assert key not in written
+    assert env["HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY"] == "2"
+    assert env["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] == "128"
+
+
+def test_fixed_concurrency_keeps_explicit_primaries_of_a_mapping_we_never_seeded(monkeypatch):
+    import os
+
+    monkeypatch.setattr(os, "environ", {})
+    monkeypatch.setattr(tuning, "_SEEDED_INTO_ENVIRON", {})
+    tuning.apply_xet_env(profile = _profile(16))
+    env = {"HF_XET_FIXED_DOWNLOAD_CONCURRENCY": "128", "HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY": "1"}
+    tuning.apply_xet_env(env, profile = _profile(16))
+    assert env["HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY"] == "1"
+
+
+def test_a_primary_set_after_the_seeds_were_cleared_is_kept(monkeypatch):
+    import os
+
+    monkeypatch.setattr(os, "environ", {})
+    monkeypatch.setattr(tuning, "_SEEDED_INTO_ENVIRON", {})
+    tuning.apply_xet_env(profile = _profile(16))
+    os.environ["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] = "128"
+    tuning.apply_xet_env(profile = _profile(16))
+    os.environ["HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY"] = "1"
+    tuning.apply_xet_env(profile = _profile(16))
+    assert os.environ["HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY"] == "1"
+
+
+def test_a_primary_set_after_a_resize_cleared_the_seeds_is_kept(monkeypatch):
+    import os
+
+    monkeypatch.setattr(os, "environ", {})
+    monkeypatch.setattr(tuning, "_SEEDED_INTO_ENVIRON", {})
+    monkeypatch.setattr(tuning, "system_profile", lambda _cache_dir = None: _profile(16))
+    tuning.apply_xet_env()
+    os.environ["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] = "128"
+    tuning.resize_for_cache_dir(os.environ, None)
+    os.environ["HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY"] = "1"
+    tuning.apply_xet_env()
+    assert os.environ["HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY"] == "1"
+
+
+def test_installed_xet_core_honours_the_fixed_alias_after_sizing():
+    import os
+    import subprocess
+    import sys
+
+    hf_xet = pytest.importorskip("hf_xet")
+    if not hasattr(hf_xet, "XetConfig"):
+        pytest.skip("hf_xet without XetConfig")
+    env = {"HF_XET_FIXED_DOWNLOAD_CONCURRENCY": "128"}
+    tuning.apply_xet_env(env, profile = _profile(16), force = True)
+    # Fresh process: xet-core latches its high-performance flag once per process.
+    child = {k: v for k, v in os.environ.items() if not k.startswith("HF_XET_")} | env
+    probe = "import hf_xet; c = hf_xet.XetConfig(); print([c.get(f'client.ac_{b}_download_concurrency') for b in ('initial', 'min', 'max')])"
+    out = subprocess.run([sys.executable, "-c", probe], env = child, capture_output = True, text = True, check = True)
+    assert out.stdout.strip() == "[128, 128, 128]"
 
 
 def test_the_flag_is_read_the_way_xet_core_reads_it():

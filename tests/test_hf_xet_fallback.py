@@ -5321,6 +5321,32 @@ def test_a_seeded_parent_still_hands_the_child_its_own_disks_numbers(monkeypatch
     assert os.environ[key] == str(64 * GB)  # the parent's own environment is untouched
 
 
+def test_a_fixed_alias_set_after_import_reaches_the_spawned_child(monkeypatch):
+    from unsloth_zoo import hf_xet_tuning as tuning
+
+    clean = {k: v for k, v in os.environ.items() if not k.startswith("HF_XET_") and k != "UNSLOTH_XET_FORCE_CAPS"}
+    monkeypatch.setattr(os, "environ", clean)
+    monkeypatch.setattr(tuning, "_SEEDED_INTO_ENVIRON", {})
+    monkeypatch.setattr(tuning, "system_profile", lambda _cache_dir = None: tuning.SystemProfile(
+        total_ram_bytes = 16 * 2**30, available_ram_bytes = 16 * 2**30, cpu_count = 8,
+        ram_source = "test", cpu_source = "test", disk_source = "unknown",
+    ))
+    tuning.apply_xet_env()
+    seeded = {k: os.environ[k] for k in tuning._AC_DOWNLOAD_KEYS}
+    os.environ["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] = "128"
+
+    rec: dict = {}
+    monkeypatch.setattr(xf, "_CTX", _FakeCtx(rec, {"ok": True, "path": "/cache/x"}))
+    xf._run_download_attempt(
+        DL_REPO, kind = "snapshot", params = {"repo_id": DL_REPO}, token = None,
+        repo_type = "model", disable_xet = False, cancel_event = None,
+        stall_timeout = 0.2, interval = 0.05, grace_period = 0.2, on_status = None,
+    )
+    assert not set(tuning._AC_DOWNLOAD_KEYS) & set(rec["xet"])
+    assert rec["xet"]["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] == "128"
+    assert {k: os.environ[k] for k in tuning._AC_DOWNLOAD_KEYS} == seeded  # parent restored
+
+
 def test_a_concurrent_spawns_overlay_is_not_read_as_the_users_own_settings(monkeypatch, tmp_path):
     """Read env under the spawn lock, or the child's HF_XET_* overlay is taken for user settings."""
     import collections
