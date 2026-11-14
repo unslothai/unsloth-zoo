@@ -1102,10 +1102,11 @@ class TreeBudget:
     Mac's cycle costs measured at load (``{rows: seconds}``, as `warm_speculative_rounds` times them) and the tokens rounds
     actually emitted. A round of the widest tree holds the narrower trees and the chain of its lattice, so each tells what
     they would have emitted on the same text: no calibration of the drafter's probabilities, and until enough such
-    rounds are in, or one in ``PROBE_EVERY`` rounds after, a round runs the widest tree."""
+    rounds are in, or one in ``PROBE_EVERY`` rounds after, a round runs the widest tree: one in ``PROBE_SETTLED_EVERY``
+    while its rate is under ``PROBE_SETTLED_RATE`` of the best tree's, where each such round loses that gap."""
 
     MIN_SAMPLES = 24
-    PROBE_EVERY = 8
+    PROBE_EVERY, PROBE_SETTLED_EVERY, PROBE_SETTLED_RATE = 8, 64, 0.95
     ALPHA = 1 / 32
     # A shallower tree or chain, on the trained block's own lattice, accepts this much more than on a deeper block's.
     TRAINED_BLOCK_GAIN = 1.035
@@ -1136,12 +1137,17 @@ class TreeBudget:
         """The rows of the next tree; 0 for a chain."""
         widest = max(self.tree_costs)
         self._since_wide += 1
-        if self.trees[widest].count < self.MIN_SAMPLES or self._since_wide >= self.PROBE_EVERY:
+        if self.trees[widest].count < self.MIN_SAMPLES:
             self._since_wide = 0
             return widest
-        rows = max(self.tree_costs, key = lambda n: self._rate(self.trees[n], self.tree_costs[n], n))
+        rate = lambda n: self._rate(self.trees[n], self.tree_costs[n], n)
+        rows = max(self.tree_costs, key = rate)
+        settled = rate(widest) < self.PROBE_SETTLED_RATE * rate(rows)
+        if self._since_wide >= (self.PROBE_SETTLED_EVERY if settled else self.PROBE_EVERY):
+            self._since_wide = 0
+            return widest
         chain = max(self._rate(self.chains[w], cost, w) for w, cost in self.chain_costs.items())
-        return rows if self._rate(self.trees[rows], self.tree_costs[rows], rows) >= chain else 0
+        return rows if rate(rows) >= chain else 0
 
 
 class SizedTreeBudget:

@@ -1180,8 +1180,14 @@ def test_tree_budget_runs_the_widest_tree_until_measured_then_the_best_rate_and_
     before = budget.trees[16].value
     budget.observe(8, [1], 1)
     assert budget.trees[16].value == before
-    picks = [budget.choose() for _ in range(2 * budget.PROBE_EVERY)]
-    assert picks.count(16) == 2 and picks.count(8) == 2 * budget.PROBE_EVERY - 2
+    # That far from paying, the widest tree is probed rarely; one near paying, as often as before.
+    picks = [budget.choose() for _ in range(budget.PROBE_SETTLED_EVERY)]
+    assert picks.count(16) == 1 and picks.count(8) == budget.PROBE_SETTLED_EVERY - 1
+    near = TreeBudget({8: 1.0, 16: 1.15}, {8: 1.0}, trained_rows = 8)
+    for _ in range(near.MIN_SAMPLES):
+        near.choose(), near.observe(16, [1, 2, 3, 4, 5, 6, 9], 3)
+    picks = [near.choose() for _ in range(2 * near.PROBE_EVERY)]
+    assert picks.count(16) == 2 and picks.count(8) == 2 * near.PROBE_EVERY - 2
     # Deep paths past rank 8 pay for the rows.
     for _ in range(4 * budget.MIN_SAMPLES):
         budget.observe(16, [1, 2, 9, 10, 11, 12, 13, 14], 2)
