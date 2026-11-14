@@ -1001,6 +1001,12 @@ def _read_video_cv2(
                         break
                     frames.extend([cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)] * wanted[seen])
                 seen += 1
+            if expected_total is None and seen == total and cap.grab():
+                # The container under-reported its length: count the rest so the caller resamples the whole clip.
+                seen += 1
+                while cap.grab():
+                    seen += 1
+                return [], len(idx), seen, span, nframes, video_fps
             return frames, len(idx), seen, span, nframes, video_fps
         finally:
             cap.release()

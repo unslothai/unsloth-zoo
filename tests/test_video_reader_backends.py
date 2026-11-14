@@ -169,6 +169,26 @@ def test_cv2_reader_counts_frames_when_the_container_has_no_count(monkeypatch, c
     assert len(video) == 6 and red[-1] > 8 * (FRAMES - 3)
 
 
+def test_cv2_reader_resamples_when_frame_count_understates(monkeypatch, clip):
+    cv2 = pytest.importorskip("cv2")
+    real = cv2.VideoCapture
+
+    class Understated:
+        def __init__(self, path):
+            self._cap = real(path)
+
+        def get(self, prop):
+            return FRAMES // 3 if prop == cv2.CAP_PROP_FRAME_COUNT else self._cap.get(prop)
+
+        def __getattr__(self, name):
+            return getattr(self._cap, name)
+
+    monkeypatch.setattr(cv2, "VideoCapture", Understated)
+    video, _ = vision_utils._read_video_cv2({"video": clip, "nframes": 4})
+    red = video[:, 0].float().mean((1, 2))
+    assert len(video) == 4 and red[-1] > 8 * (FRAMES - 3)
+
+
 def test_fetch_video_through_cv2_only(backends, monkeypatch, clip):
     pytest.importorskip("cv2")
     backends("cv2")

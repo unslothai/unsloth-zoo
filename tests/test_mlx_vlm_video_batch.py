@@ -575,3 +575,13 @@ def test_row_frame_list_clip_keeps_its_placeholder_fps(monkeypatch):
     messages = [{"role": "user", "content": [{"type": "video", "fps": 2.0}, {"type": "text", "text": "q"}]}]
     _, videos, kwargs = _extract_vlm_media({"videos": [frames]}, messages, None)
     assert videos == [frames] and kwargs == {"fps": [2.0]}
+
+
+def test_processor_that_drops_videos_is_refused():
+    class _SilentVideoProcessor(_FakeVideoProcessor):
+        def _call(self, text, padding, return_tensors, add_special_tokens, videos = None, fps = None, **kwargs):
+            out = super()._call(text, padding, return_tensors, add_special_tokens, None, fps, **kwargs)
+            return {k: v for k, v in out.items() if "video" not in k}
+
+    with pytest.raises(ValueError, match = "returned no video features"):
+        _processor_vlm_inputs(_SilentVideoProcessor(), ["t1"], [[]], 32, all_videos = [["clip-a"]])

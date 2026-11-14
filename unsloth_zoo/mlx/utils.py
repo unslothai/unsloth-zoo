@@ -9492,8 +9492,17 @@ def _processor_vlm_inputs(
                     raise
         raise first_error
 
+    def _require_video_output(inputs):
+        # A processor can take `videos` (or **kwargs) and still emit nothing for them (Unsloth's gemma3 call patch).
+        if videos is not None and not any("video" in key and inputs.get(key) is not None for key in inputs):
+            raise ValueError(
+                f"Unsloth MLX: `{type(processor).__name__}` accepted the video inputs but returned no video "
+                "features, so the clips would train as text. Video rows need a video-capable processor (Qwen-VL family)."
+            )
+        return inputs
+
     if audio_kwarg is None:
-        inputs = _run_layouts()
+        inputs = _require_video_output(_run_layouts())
         # Unused on MLX; as free-form floats/Mappings they fracture compile families.
         inputs.pop("second_per_grid_ts", None)
         inputs.pop("video_metadata", None)
@@ -9514,10 +9523,10 @@ def _processor_vlm_inputs(
         base_kwargs[audio_kwarg] = kwargs[audio_kwarg]
         return _run_audio_layouts()
 
-    return _call_pairing_audio_on_refusal(
+    return _require_video_output(_call_pairing_audio_on_refusal(
         _invoke, {audio_kwarg: audio}, audio_kwarg,
         lambda clips: _audio_payload_as_pairs(clips, processor),
-    )
+    ))
 
 
 def _as_numpy_vlm_field(inputs, key):
