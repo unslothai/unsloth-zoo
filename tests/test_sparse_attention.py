@@ -669,8 +669,9 @@ def test_qsa_gqa_dispatch_prefers_flex_where_it_compiles(monkeypatch, smem):
 
 
 @pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
-@pytest.mark.parametrize("backend", [None, "triton", "torch"] + (["gather"] if _gather_runs() else []))
-def test_cuda_window_only_layer_with_no_compressed_rows(monkeypatch, backend):
+@pytest.mark.parametrize("backend", [None, "hd512", "triton", "torch"] + (["gather"] if _gather_runs() else []))
+@pytest.mark.parametrize("with_sink", [True, False])
+def test_cuda_window_only_layer_with_no_compressed_rows(monkeypatch, backend, with_sink):
     # DeepSeek window-only layers (compress_ratio 0) call sparse_attn_window with an empty compressed set:
     # compress_kv [b, 0, d], compress_idxs [b, s, 0]. Every backend accepts it and matches the reference.
     monkeypatch.delenv("UNSLOTH_SPARSE_ATTN_BACKEND", raising = False)
@@ -680,14 +681,24 @@ def test_cuda_window_only_layer_with_no_compressed_rows(monkeypatch, backend):
     q = (torch.randn(b, s, h, d, generator = g) * 0.5).cuda().to(dtype)
     win = (torch.randn(b, s, d, generator = g) * 0.5).cuda().to(dtype)
     sink = torch.randn(h, generator = g).cuda()
+    if not with_sink:
+        sink = torch.full((h,), float("-inf"), device = "cuda")
     go = torch.randn(b, s, h, d, generator = g).cuda().to(dtype)
+    from unsloth_zoo import sparse_mqa_kernel as mk
+    hd512 = mk.window_hd512_supported(q, win)
+    if backend == "hd512" and not hd512:
+        pytest.skip("Unsloth's head_dim 512 kernel is not importable or does not fit this device's shared memory")
+    before = dict(sa.SPARSE_ATTN_STATS)
     empty_kv, empty_idx = win.new_zeros(b, 0, d), torch.empty(b, s, 0, dtype = torch.int32, device = "cuda")
     widx = sa.window_topk_idxs(s, w, b, "cuda")
     got = _grads(lambda q, win, sink: sa.sparse_attn_window(q, win, empty_kv, empty_idx, sink, d ** -0.5, w, backend = backend),
                  q, win, sink, go)
+    ran = {n: sa.SPARSE_ATTN_STATS[n] - before[n] for n in before if sa.SPARSE_ATTN_STATS[n] != before[n]}
+    want = backend or ("hd512" if hd512 else ("gather" if sa._gather_eligible(q, w) else "triton"))
+    assert ran == {want: 1}, ran
     ref = _grads(lambda q, win, sink: sa.sparse_attn_reference(q, win, sink, widx, d ** -0.5),
                  q.double(), win.double(), sink.double(), go.double())
     low = _grads(lambda q, win, sink: sa.sparse_attn_reference(q, win, sink, widx, d ** -0.5), q, win, sink, go)
-    for label, x, r, lo in zip(("out", "dq", "dwin", "dsink"), got, ref, low):
+    for label, x, r, lo in list(zip(("out", "dq", "dwin", "dsink"), got, ref, low))[:4 if with_sink else 3]:
         err, base = (x.double() - r).abs().max().item(), (lo.double() - r).abs().max().item()
         assert err <= 2 * base + 4 * torch.finfo(dtype).eps * max(1.0, r.abs().max().item()), (backend, label, err, base)

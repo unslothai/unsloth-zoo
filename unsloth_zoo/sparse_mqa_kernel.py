@@ -34,15 +34,20 @@ refused for shared memory steps down to the next config (on 64 KB parts the head
 two programs, each recomputing the full-D logits), and the last refusal propagates.
 """
 
-__all__ = ["sparse_mqa_attention", "sparse_mqa_window_attention", "sparse_mqa_window_supported", "sparse_mqa_supported", "SPARSE_MQA_STATS"]
+__all__ = ["sparse_mqa_attention", "sparse_mqa_window_attention", "sparse_mqa_window_supported",
+           "window_hd512_attention", "window_hd512_supported", "sparse_mqa_supported", "SPARSE_MQA_STATS"]
 
+import importlib.util
+import math
+import os
+import sys
 from typing import Tuple
 
 import torch
 import triton
 import triton.language as tl
 
-SPARSE_MQA_STATS = {"fwd": 0, "bwd": 0, "window_fwd": 0, "window_bwd": 0}
+SPARSE_MQA_STATS = {"fwd": 0, "bwd": 0, "window_fwd": 0, "window_bwd": 0, "hd512": 0}
 _V = "v3"
 
 
@@ -636,4 +641,133 @@ def sparse_mqa_window_attention(q, window_kv, compress_kv, compress_idxs, attn_s
     has_sink = attn_sink is not None
     sink = attn_sink if has_sink else q.new_full((q.shape[2],), float("-inf"), dtype = torch.float32)
     out, _ = _wfwd_op(q, window_kv, compress_kv, compress_idxs, sink, float(softmax_scale), int(window_size), has_sink)
+    return out
+
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Window-only layers (no compressed slots) on Unsloth's head_dim 512 flash kernel (unsloth/kernels/
+# large_head_attention.py: query blocks x KV tiles over per-row intervals [lo, hi], GQA heads read in place), with
+# the sink applied exactly around it. The kernel returns the window-only log-sum-exp; with
+# c = exp(lse_window - lse_total) = sigmoid(lse_window - sink), the output is c * o, and its backward is the
+# kernel's own backward called with dO * c and the final output (P' = c P and delta' = c * rowsum(dO . o) make
+# P (c dP - c^2 rowsum(dO . o)) = P' (dP - delta')). d(sink) = -sum(exp(sink - lse_total) * delta').
+
+_LH_NAME = "unsloth.kernels.large_head_attention"
+_LH = None
+
+
+def _large_head_module():
+    """The installed Unsloth's large_head_attention, loaded without importing (and patching through) unsloth
+    itself; registered under its own name so a later `import unsloth` reuses it. None when absent or its private
+    entry points (_fwd_impl / _bwd_impl) differ."""
+    global _LH
+    if _LH is None:
+        module = sys.modules.get(_LH_NAME)
+        if module is None:
+            try:
+                spec = importlib.util.find_spec("unsloth")
+                path = os.path.join(os.path.dirname(spec.origin), "kernels", "large_head_attention.py") if spec and spec.origin else None
+                if path and os.path.isfile(path):
+                    file_spec = importlib.util.spec_from_file_location(_LH_NAME, path)
+                    module = importlib.util.module_from_spec(file_spec)
+                    sys.modules[_LH_NAME] = module
+                    file_spec.loader.exec_module(module)
+            except Exception:
+                sys.modules.pop(_LH_NAME, None)
+                module = None
+        ok = module is not None and callable(getattr(module, "_fwd_impl", None)) and callable(getattr(module, "_bwd_impl", None))
+        _LH = module if ok else False
+    return _LH or None
+
+
+def window_hd512_supported(q, kv):
+    """head_dim 512, fp16 / bf16 (bf16 on sm80+), CUDA (not ROCm), >= 96 KB shared memory per block (T4 cannot
+    launch it: 196 KB asked), Unsloth's kernel importable."""
+    if not (sparse_mqa_supported(q, kv) and q.shape[-1] == 512):
+        return False
+    if _shared_memory(q.device) < 96 * 1024:
+        return False
+    return _large_head_module() is not None
+
+
+def _intervals(b, s, window, device):
+    t = torch.arange(s, device = device, dtype = torch.int32)
+    lo = (t - int(window) + 1).clamp(min = 0)
+    return lo.expand(b, s).contiguous(), t.expand(b, s).contiguous()
+
+
+@torch.library.custom_op(f"unsloth_zoo::window_hd512_fwd_{_V}", mutates_args = ())
+def _hfwd_op(q: torch.Tensor, kv: torch.Tensor, sink: torch.Tensor, scale: float, window: int,
+             has_sink: bool) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    b, s, h, d = q.shape
+    lo, hi = _intervals(b, s, window, q.device)
+    k = kv.unsqueeze(1)
+    o, lse2 = _large_head_module()._fwd_impl(q.transpose(1, 2), k, k, lo, hi, float(scale))
+    lse = (lse2 * math.log(2.0)).transpose(1, 2)                                  # [b, s, h], natural log
+    if has_sink:
+        sink_ = sink.float().view(1, 1, h)
+        total = torch.logaddexp(lse, sink_)
+        out = (o.transpose(1, 2).float() * torch.exp(lse - total).unsqueeze(-1)).to(q.dtype)
+    else:
+        total = lse.contiguous()
+        out = o.transpose(1, 2).contiguous()
+    return out, total, lse2
+
+
+@_hfwd_op.register_fake
+def _(q, kv, sink, scale, window, has_sink):
+    b, s, h, d = q.shape
+    return (torch.empty_like(q), q.new_empty((b, s, h), dtype = torch.float32),
+            q.new_empty((b, h, s), dtype = torch.float32))
+
+
+@torch.library.custom_op(f"unsloth_zoo::window_hd512_bwd_{_V}", mutates_args = ())
+def _hbwd_op(do_eff: torch.Tensor, q: torch.Tensor, kv: torch.Tensor, out: torch.Tensor, lse2: torch.Tensor,
+             scale: float, window: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    b, s, h, d = q.shape
+    lo, hi = _intervals(b, s, window, q.device)
+    k = kv.unsqueeze(1)
+    dq, dk, dv = _large_head_module()._bwd_impl(do_eff.transpose(1, 2), q.transpose(1, 2), k, k,
+                                                out.transpose(1, 2), lse2, lo, hi, float(scale))
+    dkv = (dk.float() + dv.float()).squeeze(1).to(kv.dtype)
+    return dq.transpose(1, 2).contiguous(), dkv
+
+
+@_hbwd_op.register_fake
+def _(do_eff, q, kv, out, lse2, scale, window):
+    return torch.empty_like(q), torch.empty_like(kv)
+
+
+def _hsetup_context(ctx, inputs, output):
+    q, kv, sink, scale, window, has_sink = inputs
+    out, total, lse2 = output
+    ctx.save_for_backward(q, kv, sink, out, total, lse2)
+    ctx.scale, ctx.window, ctx.has_sink = scale, window, has_sink
+
+
+def _hbackward(ctx, grad_out, grad_total, grad_lse2):
+    q, kv, sink, out, total, lse2 = ctx.saved_tensors
+    if ctx.has_sink:
+        c = torch.exp(lse2.transpose(1, 2) * math.log(2.0) - total)               # sigmoid(lse_window - sink)
+        do_eff = (grad_out.float() * c.unsqueeze(-1)).to(grad_out.dtype)
+    else:
+        do_eff = grad_out
+    dq, dkv = _hbwd_op(do_eff.contiguous(), q, kv, out, lse2, ctx.scale, ctx.window)
+    dsink = None
+    if ctx.has_sink and ctx.needs_input_grad[2]:
+        delta = (grad_out.float() * out.float()).sum(-1)
+        dsink = -(torch.exp(sink.float().view(1, 1, -1) - total) * delta).sum((0, 1)).to(sink.dtype)
+    return dq, dkv, dsink, None, None, None
+
+
+_hfwd_op.register_autograd(_hbackward, setup_context = _hsetup_context)
+
+
+def window_hd512_attention(q, window_kv, attn_sink, softmax_scale, window_size):
+    """q [b, s, h, 512], window_kv [b, s, 512] (query t sees rows (t - window_size, t]), attn_sink [h] or None."""
+    has_sink = attn_sink is not None
+    sink = attn_sink if has_sink else q.new_full((q.shape[2],), float("-inf"), dtype = torch.float32)
+    out, _, _ = _hfwd_op(q.contiguous(), window_kv.contiguous(), sink, float(softmax_scale), int(window_size), has_sink)
+    SPARSE_MQA_STATS["hd512"] += 1
     return out

@@ -56,7 +56,7 @@ import os
 
 import torch
 
-SPARSE_ATTN_STATS = {"gather": 0, "triton": 0, "flex": 0, "torch": 0, "fallback": 0}
+SPARSE_ATTN_STATS = {"gather": 0, "triton": 0, "flex": 0, "torch": 0, "hd512": 0, "fallback": 0}
 
 _BACKENDS = ("gather", "triton", "flex", "torch")
 _FAILED = {}
@@ -139,6 +139,10 @@ def _triton_eligible(q):
 
 def _flex_eligible(q, kv_len = None):
     if not (q.is_cuda and _HAS_TRITON and q.dtype in (torch.float16, torch.bfloat16)):
+        return False
+    # sm75 (T4): flex_attention failed to compile at head_dim 64 and 256 ("No valid triton configs") and the flex
+    # training arm failed; sm80+ only.
+    if torch.cuda.get_device_capability(q.device)[0] < 8:
         return False
     if q.shape[-1] > 256 and _shared_memory(q.device) < _FLEX_D512_MIN_SHARED_MEMORY:
         return False
@@ -392,7 +396,26 @@ def sparse_attn_window(q, window_kv, compress_kv, compress_idxs, attn_sink, soft
     b, s, h, d = q.shape
     if window_kv.shape[:2] != (b, s):
         raise ValueError("sparse_attn_window: window_kv must cover the query chunk [b, s, d]")
-    forced = backend if backend in _BACKENDS else _forced_backend()
+    forced = backend if backend in _BACKENDS + ("hd512",) else _forced_backend()
+    # Window-only (DeepSeek compress_ratio 0 layers, or no compressed slot): Unsloth's head_dim 512 flash kernel over
+    # the window intervals with the sink applied exactly (L4: 4.8 / 9.9 ms at 4k / 8k vs 9.5 / 19.5 for the window
+    # kernel, half the peak memory).
+    if (compress_idxs.shape[-1] == 0 or compress_kv.shape[1] == 0) and forced in (None, "hd512") and _HAS_TRITON:
+        from .sparse_mqa_kernel import window_hd512_attention, window_hd512_supported
+        key = ("hd512_window", int(window_size))
+        if window_hd512_supported(q, window_kv) and (forced == "hd512" or _failure_key("hd512", q, key) not in _FAILED):
+            if torch.compiler.is_compiling() or forced == "hd512":
+                out = window_hd512_attention(q, window_kv, attn_sink, softmax_scale, window_size)
+                _count("hd512")
+                return out
+            try:
+                out = window_hd512_attention(q, window_kv, attn_sink, softmax_scale, window_size)
+                _count("hd512")
+                return out
+            except Exception as error:
+                _latch("hd512", q, key, error)
+        if forced == "hd512":
+            forced = None
     use_gather = forced == "gather" or (forced is None and _gather_eligible(q, int(window_size)))
     if use_gather:
         key = ("window", int(window_size), compress_idxs.shape[-1])
