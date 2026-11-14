@@ -309,6 +309,58 @@ pass
 TEMPORARY_PATCHES.append(patch_deepseek_v41_grouped_lora)
 
 
+# 3b. Routed experts of Unsloth's native module through Unsloth's MoE backend (grouped_mm / Triton / bnb 4-bit /
+#     split LoRA), the same dispatcher the transformers MoE models use. The native experts keep transformers' layout
+#     (gate_up_proj [E, 2I, H], down_proj [E, H, I]) and carry the reference's asymmetric SwiGLU clamps in
+#     `_apply_gate`, which the backend calls for `_unsloth_own_apply_gate` modules. Routers stay frozen (their
+#     correction bias is not a Parameter that trains; the gate weight gets no LoRA by default).
+def patch_deepseek_v41_moe():
+    modeling = _native_modeling()
+    if modeling is None:
+        return
+    experts_cls = getattr(modeling, "DeepseekV41Experts", None)
+    if experts_cls is None or getattr(experts_cls, "_unsloth_already_patched", False):
+        return
+    if os.environ.get("UNSLOTH_DSV41_MOE_BACKEND", "1") == "0":
+        return
+    try:
+        from .moe_utils import (
+            extract_moe_lora_weights_for_grouped_mm,
+            get_forward_moe_backend,
+            patch_param_wrapper_for_moe,
+        )
+        from .utils import patch_function
+    except Exception:
+        return
+    patch_param_wrapper_for_moe()
+
+    def _dsv41_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
+        base = wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
+        name = getattr(wrapper, "parameter_name", None)
+        hidden, inter = getattr(base, "hidden_dim", None), getattr(base, "intermediate_dim", None)
+        dims = {"gate_up_proj": (hidden, None if inter is None else 2 * inter), "down_proj": (inter, hidden)}
+        input_dim, output_dim = dims.get(name, (None, None))
+        return extract_moe_lora_weights_for_grouped_mm(
+            wrapper, weight_A, weight_B, scaling, num_experts,
+            input_dim = input_dim, output_dim = output_dim, model_name = "DeepSeek-V4.1 MoE",
+            enable_logging = UNSLOTH_ENABLE_LOGGING, logger_obj = logger,
+        )
+
+    experts_cls._unsloth_lora_extractor_fn = staticmethod(_dsv41_lora_extractor)
+    experts_cls._unsloth_own_apply_gate = True
+    if not patch_function(experts_cls, "forward", get_forward_moe_backend()):
+        for name in ("_unsloth_lora_extractor_fn", "_unsloth_own_apply_gate"):
+            if name in vars(experts_cls):
+                delattr(experts_cls, name)
+        return
+    experts_cls._unsloth_already_patched = True
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info("Unsloth: DeepSeek-V4.1 native experts on Unsloth's MoE backend.")
+pass
+
+TEMPORARY_PATCHES.append(patch_deepseek_v41_moe)
+
+
 # 4. `num_experts`: the text config names its routed experts `n_routed_experts` (aliased only as `num_local_experts`),
 #    while TRL's MoE load-balancing path (and other MoE helpers) read `config.num_experts`.
 def patch_deepseek_v41_config_aliases():
