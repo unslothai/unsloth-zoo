@@ -1136,7 +1136,7 @@ def patch_gdn_causal_conv1d():
     _refresh_kill_switch()
     if _disabled() or _real_causal_conv1d_available():
         return
-    if not torch.cuda.is_available() or torch.version.hip is not None:
+    if not torch.cuda.is_available():
         return
     try:
         import triton  # noqa: F401
