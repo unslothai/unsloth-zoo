@@ -7391,6 +7391,7 @@ def _extract_vlm_media(
     video_kwargs = {}
     top_level_image = []
     top_level_videos = []
+    videos_from_row = False
     has_image_parts = False
     has_video_parts = False
     bare_placeholder_types, has_media_payload = _vlm_vision_part_state(messages)
@@ -7406,6 +7407,7 @@ def _extract_vlm_media(
         video = item.get("videos")
         if video is not None:
             videos = video if isinstance(video, list) else [video]
+            videos_from_row = True
         elif "video" in item:
             video = item.get("video")
             if video is not None:
@@ -7450,7 +7452,6 @@ def _extract_vlm_media(
     ):
         images = top_level_image
 
-    videos_from_row = bool(videos)
     if not videos and top_level_videos and "video" in bare_placeholder_types:
         videos = top_level_videos
         videos_from_row = True
@@ -7465,7 +7466,9 @@ def _extract_vlm_media(
         paired = []
         for i, video in enumerate(videos):
             hint = hints[i] if i < len(hints) else {}
-            if _is_decoded_clip(video):
+            if isinstance(video, _DecodedClip):
+                pass
+            elif _is_decoded_clip(video):
                 video = _DecodedClip(video, hint.get("fps")) if hint else video
             elif isinstance(video, (list, tuple)):
                 video = {**hint, "video": list(video)}

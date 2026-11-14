@@ -596,3 +596,13 @@ def test_a_dataset_frames_field_cannot_skip_the_guarded_decoder(monkeypatch):
     messages = [{"role": "user", "content": [part, {"type": "text", "text": "q"}]}]
     _, videos, _ = _extract_vlm_media({}, messages, None)
     assert seen == ["clips/a.mp4"] and all(hasattr(v, "shape") for v in videos)
+
+
+def test_embedded_decoded_frame_list_survives_hint_pairing(monkeypatch):
+    import unsloth_zoo.vision_utils as vu
+
+    monkeypatch.setattr(vu, "fetch_video", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not decode")))
+    frames = [np.zeros((4, 4, 3), np.uint8), np.zeros((4, 4, 3), np.uint8)]
+    messages = [{"role": "user", "content": [{"type": "video", "video": frames, "fps": 2.0}, {"type": "text", "text": "q"}]}]
+    _, videos, kwargs = _extract_vlm_media({}, messages, None)
+    assert videos == [frames] and kwargs == {"fps": [2.0]}
