@@ -195,3 +195,17 @@ def test_stacked_experts_on_sm75_see_a_capture_on_the_operand_gpu(gpu, monkeypat
     state["capturing"] = set()
     assert not mse._fused(inputs, param, True)
     assert not mse._fused(inputs, param, False)
+
+
+@pytest.mark.parametrize("version,probed", [("3.0.0", False), ("3.1.0", True), ("3.9.1", True)])
+def test_triton_3_0_never_compiles_the_probe(monkeypatch, version, probed):
+    # Triton 3.0 (torch 2.4) aborts the process inside the probe's compile, so it must never run there.
+    if not mg._HAS_TRITON:
+        pytest.skip("no triton")
+    calls = []
+    monkeypatch.setattr(mg.triton, "__version__", version)
+    monkeypatch.setattr(mg, "_AVAILABLE", {})
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(mg, "_probe", lambda device: calls.append(device) or True)
+    assert mg.mxfp4_grouped_mm_available(torch.device("cuda", 0)) is probed
+    assert bool(calls) is probed
