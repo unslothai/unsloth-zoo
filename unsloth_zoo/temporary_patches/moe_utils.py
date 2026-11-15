@@ -1241,6 +1241,15 @@ def _base_grouped_mm(inputs, offsets, weight_provider, recompute, plan = None):
     return _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
 
 
+def _lora_fold_base_mm(inputs, offsets, weight_provider, recompute, lora, source):
+    """Base grouped GEMM with the separated LoRA folded in (moe_lora_fold), or None to keep the separated path."""
+    try:
+        from unsloth_zoo.temporary_patches.moe_lora_fold import lora_fold_base_mm
+    except ImportError:
+        return None
+    return lora_fold_base_mm(inputs, offsets, weight_provider, recompute, lora, source)
+
+
 def _nf4_fused_base_mm(inputs, offsets, source, proj_type, hidden_dim, model_type, experts_module):
     """UNSLOTH_MOE_NF4_FUSED grouped GEMM on a frozen NF4 stack; None keeps the dequant path."""
     if os.environ.get("UNSLOTH_MOE_NF4_FUSED", "0") in ("", "0") or not _base_is_recomputable(source):
@@ -5414,9 +5423,17 @@ def forward_native_grouped_mm(
                 selective_plan = _selective_dequant_plan(
                     (_gate_up_src, getattr(self, "down_proj", None)), num_tokens_per_expert, permuted_input.shape[0],
                 )
-            mm1_out = _base_grouped_mm(
-                permuted_input, offsets, _gate_up_provider, _recompute, selective_plan,
-            )
+            if gate_up_lora is not None and selective_plan is None:
+                # LoRA folded into the base GEMM (moe_lora_fold); None keeps the separated path below.
+                mm1_out = _lora_fold_base_mm(
+                    permuted_input, offsets, _gate_up_provider, _recompute, gate_up_lora, _gate_up_src,
+                )
+                if mm1_out is not None:
+                    gate_up_lora = None
+            if mm1_out is None:
+                mm1_out = _base_grouped_mm(
+                    permuted_input, offsets, _gate_up_provider, _recompute, selective_plan,
+                )
 
         # Separated LoRA: + ((X @ first) @ second) * scaling.
         if gate_up_lora is not None:
@@ -5598,9 +5615,13 @@ def forward_native_grouped_mm(
             mm2_out = _nf4_fused_base_mm(inter, offsets, _down_src, "down", hidden_dim, model_type, self)
         if _down_layout is None and mm2_out is None:
             _recompute = _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype)
-            mm2_out = _base_grouped_mm(
-                inter, offsets, _down_provider, _recompute, selective_plan if _recompute else None,
-            )
+            _down_plan = selective_plan if _recompute else None
+            if down_lora is not None and _down_plan is None:
+                mm2_out = _lora_fold_base_mm(inter, offsets, _down_provider, _recompute, down_lora, _down_src)
+                if mm2_out is not None:
+                    down_lora = None
+            if mm2_out is None:
+                mm2_out = _base_grouped_mm(inter, offsets, _down_provider, _recompute, _down_plan)
 
         if down_lora is not None:
             first_weight, second_weight, scaling = down_lora
