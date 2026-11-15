@@ -7434,7 +7434,11 @@ def unsloth_compile_transformers(
                 source = eval(f"{model_location}.{module}")
             except AttributeError:
                 continue
-            if "(GradientCheckpointingLayer)" in full_source:
+            # huggingface/transformers#49249 renames the layer base class to ActivationCheckpointingLayer.
+            if (
+                "(GradientCheckpointingLayer)" in full_source
+                or "(ActivationCheckpointingLayer)" in full_source
+            ):
                 if module in FIX_GC_LAYER_CALLER_MODULES:
                     output = patch_gradient_checkpointing_layer_caller(module, source)
                 else:

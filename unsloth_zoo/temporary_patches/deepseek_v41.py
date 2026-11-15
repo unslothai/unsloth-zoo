@@ -181,6 +181,8 @@ def patch_deepseek_v41_gradient_checkpointing():
     __call__._unsloth_patched = True
     layer_cls.__call__ = __call__
     pretrained_cls.supports_gradient_checkpointing = True
+    # transformers#49249 copied the old flag onto each subclass at creation; only the new name still inherits.
+    pretrained_cls.supports_activation_checkpointing = True
     if UNSLOTH_ENABLE_LOGGING:
         logger.info("Unsloth: DeepSeek-V4.1 gradient checkpointing replays each layer with its own CSA2 group state.")
 pass
