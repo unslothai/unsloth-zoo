@@ -3963,6 +3963,9 @@ def _log_moe_lora_stash_unread_once(experts_module, parameter_name: str) -> None
     """One message per experts class and parameter, the first time the stash goes unread."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
+    # Not while tracing: a guard on the set's contents recompiled the caller once it was logged.
+    if torch.compiler.is_compiling():
+        return
     key = (type(experts_module).__name__, parameter_name)
     if key in _MOE_LORA_STASH_UNREAD_LOGGED:
         return
