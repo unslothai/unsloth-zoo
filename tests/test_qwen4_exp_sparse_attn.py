@@ -299,8 +299,17 @@ def _text_model_run(model, ids, use_cache):
         return torch.cat(hidden, dim = 1)
 
 
+@pytest.fixture
+def _few_threads():
+    # A loaded many-core host otherwise spends the fp64 CPU text model on thread contention (minutes, not seconds).
+    threads = torch.get_num_threads()
+    torch.set_num_threads(min(threads, 4))
+    yield
+    torch.set_num_threads(threads)
+
+
 @pytest.mark.parametrize("use_cache", [False, True], ids = ["no_cache", "prefill_then_decode"])
-def test_text_model_forward_matches_the_reference_end_to_end(monkeypatch, use_cache):
+def test_text_model_forward_matches_the_reference_end_to_end(monkeypatch, use_cache, _few_threads):
     # The whole text model builds its own position ids and rotary tables (3-D mRoPE ids; transformers 5.17's rotary
     # takes nothing else) and, with a cache, its own position history: the patched attention through that path equals
     # the untouched attention, and engages on the prefill.
@@ -308,9 +317,19 @@ def test_text_model_forward_matches_the_reference_end_to_end(monkeypatch, use_ca
     monkeypatch.setenv("UNSLOTH_QWEN4_EXP_EXACT_TIES", "1")
     monkeypatch.setenv("UNSLOTH_FROZEN_TABLE", "gpu")
     zoo_qwen4_exp.patch_qwen4_exp()
+    # The model runs on CPU: on a GPU host the kernel-hub wrappers send the linear-attention layers to (vendored)
+    # Triton fla / causal-conv1d kernels, and the MoE backend picks Triton too, neither taking CPU tensors. Torch
+    # originals and each layer's dense shared expert instead: the same in both arms, and not what is tested here.
+    for name in ("torch_chunk_gated_delta_rule", "torch_recurrent_gated_delta_rule", "causal_conv1d_fn",
+                 "causal_conv1d_update"):
+        original = getattr(getattr(modeling, name, None), "__wrapped__", None)
+        if original is not None:
+            monkeypatch.setattr(modeling, name, original)
     config, _, _ = _module("sdpa")
     torch.manual_seed(0)
     model = modeling.Qwen4ExpTextModel(config).double().eval()
+    for layer in model.layers:
+        layer.mlp = layer.mlp.shared_expert
     ids = torch.randint(0, config.vocab_size, (2, 45), generator = torch.Generator().manual_seed(3))
     before = dict(zoo_qwen4_exp.QWEN4_EXP_SPARSE_STATS)
     got = _text_model_run(model, ids, use_cache)
