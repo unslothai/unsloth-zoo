@@ -10704,7 +10704,7 @@ def tree_commit(transaction, caches, path):
     windows = [cache._speculation["records"][0] for cache, *_ in tapes]
     transaction.abort()
     gather = lambda x: mx.take(x, rows, axis = 1)
-    retained = mx.array([len(path)], mx.uint32)
+    retained, taps = mx.array([len(path)], mx.uint32), {}
     for (cache, index, replay, mask, _), (_, source, width) in zip(tapes, windows):
         q, k, v, a, b, A_log, dt_bias, entry = replay.args
         path_replay = functools.partial(replay.func, gather(q), gather(k), gather(v), gather(a), gather(b), A_log, dt_bias, entry,
@@ -10712,8 +10712,9 @@ def tree_commit(transaction, caches, path):
         cache[index] = path_replay(mask = mask)[1]
         cache._unsloth_pending = (cache[index], path_replay, retained)
         cache._unsloth_pending_path = (k, v, a, b, rows)
-        taps = mx.concatenate([mx.arange(width, dtype = mx.int32), rows + width])[-width:]
-        cache[0] = mx.take(source, taps, axis = 1)
+        if width not in taps:   # built on the host, once: as arrays per layer they were most of the commit's GPU ops
+            taps[width] = mx.array([*range(width), *(row + width for row in path)][-width:], mx.int32)
+        cache[0] = mx.take(source, taps[width], axis = 1)
     for entry, block in zip(caches, blocks):
         if block is not None:
             prefix, length = entry.offset, len(path)
