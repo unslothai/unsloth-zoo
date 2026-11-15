@@ -1085,7 +1085,8 @@ def _fp4_experts_as_mxfp4(module):
         if half_k % 16 or tuple(scale.shape) != (E, M, half_k // 16):
             return None
         cache = module.__dict__.setdefault("_unsloth_fp4_mxfp4_views", {})
-        key = (name, weight.data_ptr(), scale.data_ptr(), tuple(weight.shape))
+        # _version: an in-place copy_ / load_state_dict keeps the storage but must drop converted scale codes.
+        key = (name, weight.data_ptr(), scale.data_ptr(), tuple(weight.shape), weight._version, scale._version)
         view = cache.get(key)
         if view is None:
             codes = _ue8m0_codes(scale)

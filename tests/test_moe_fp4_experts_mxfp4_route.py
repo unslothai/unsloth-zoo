@@ -103,3 +103,22 @@ def test_fp4_experts_take_the_mxfp4_grouped_gemm_with_the_dequantized_result(
     torch.testing.assert_close(
         got_dx, want_dx, rtol=2e-2, atol=2e-2 * want_dx.abs().max().item()
     )
+
+
+def test_fp4_views_follow_an_in_place_scale_update():
+    # Float power-of-two scales are converted to codes (a copy), so the cache must notice an in-place update.
+    from unsloth_zoo.temporary_patches import moe_utils_fp8
+
+    module = _fp4_experts()
+    for name in ("gate_up_proj", "down_proj"):
+        s = getattr(module, f"{name}_scale_inv")
+        floats = s.detach().view(torch.uint8).float().sub(127).exp2()
+        setattr(module, f"{name}_scale_inv", torch.nn.Parameter(floats, requires_grad = False))
+    before = moe_utils_fp8._fp4_experts_as_mxfp4(module)
+    if before is None:
+        pytest.skip("these FP4 experts do not map to MXFP4 views here")
+    with torch.no_grad():
+        module.down_proj_scale_inv.mul_(2)
+    after = moe_utils_fp8._fp4_experts_as_mxfp4(module)
+    old_codes, new_codes = (v.mxfp4_scales for v in (before[1], after[1]))
+    assert torch.equal(new_codes.to(torch.int16), old_codes.to(torch.int16) + 1)
