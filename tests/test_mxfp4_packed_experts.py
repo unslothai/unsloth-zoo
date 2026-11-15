@@ -559,6 +559,35 @@ def test_full_save_of_a_loaded_model_writes_experts_under_their_own_names(tmp_pa
     assert experts.gate_up_proj is packed[0] and experts.down_proj is packed[1]
 
 
+@pytest.mark.skipif(not TRANSFORMERS_5, reason = "weight conversions are transformers 5")
+def test_full_save_after_merge_writes_dense_experts_under_their_own_names(tmp_path):
+    """merge_and_unload() leaves dense experts but keeps the load's Mxfp4Dequantize converters; 5.22+ then
+    reversed them and wrote the dense bf16 stacks as "gate_up_proj_blocks" with no scales."""
+    safetensors = pytest.importorskip("safetensors.torch")
+    from transformers.core_model_loading import WeightConverter
+    from transformers.integrations.mxfp4 import Mxfp4Dequantize
+    mx.patch_save_pretrained_mxfp4()
+    model, experts = _tiny_gpt_oss("cpu")
+    dense = {}
+    for name in ("gate_up_proj", "down_proj"):
+        dense[name] = getattr(experts, name).dequantize()
+        setattr(experts, name, nn.Parameter(dense[name].clone(), requires_grad = False))   # what the merge installs
+    conversions = [
+        WeightConverter(
+            source_patterns = [f"{proj}_blocks", f"{proj}_scales"], target_patterns = rf"{proj}$",
+            operations = [Mxfp4Dequantize(None)],
+        )
+        for proj in ("down_proj", "gate_up_proj")
+    ]
+    model._weight_conversions = conversions
+    model.save_pretrained(tmp_path)
+    saved = safetensors.load_file(os.path.join(tmp_path, "model.safetensors"))
+    assert not any(key.endswith(("_blocks", "_scales", "$")) for key in saved), sorted(saved)
+    for name in dense:
+        assert torch.equal(saved[f"model.layers.0.mlp.experts.{name}"], dense[name])
+    assert model._weight_conversions is conversions
+
+
 def test_adapter_save_never_dequantizes(tmp_path, monkeypatch):
     peft = pytest.importorskip("peft")
     mx.patch_peft_param_wrapper_mxfp4()

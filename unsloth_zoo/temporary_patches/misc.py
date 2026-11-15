@@ -2619,9 +2619,13 @@ def patch_MllamaVisionEncoderLayer():
 
         def forward(
             self,
-            hidden_state: torch.Tensor,
+            hidden_state: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
+            hidden_states: Optional[torch.Tensor] = None,
         ):
+            # transformers renamed the argument (MllamaVisionEncoder calls `hidden_states=` since 5.x, `hidden_state=` before).
+            if hidden_state is None:
+                hidden_state = hidden_states
             # Self Attention
             residual = hidden_state
             hidden_state = self.input_layernorm(hidden_state)
