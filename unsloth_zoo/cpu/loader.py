@@ -134,10 +134,25 @@ def _checkpoint_quant_method(model_name, config = None, **kwargs):
     return _quant_method_of(config_dict) if isinstance(config_dict, dict) else None
 
 
+def _has_fp8_dequantize_conversion(model):
+    """True when a load conversion of ``model`` dequantizes FP8 (transformers' Fp8Dequantize operation)."""
+    try:
+        return any(
+            type(op).__name__ == "Fp8Dequantize"
+            for conversion in getattr(model, "_weight_conversions", None) or ()
+            for op in getattr(conversion, "operations", None) or ()
+        )
+    except Exception:
+        return False
+
+
 def _drop_reverse_fp8_conversions(model):
     """A checkpoint transformers dequantized from FP8 on load (no FP8 kernels on CPU) keeps Fp8Dequantize
     conversions, which a merged save reverses into FP8 bytes without FP8 metadata. The GPU loaders drop them;
-    so does this one when Unsloth provides the helper."""
+    so does this one when Unsloth provides the helper. Only a model that carries such a conversion imports it:
+    unsloth.models pulls in the GPU model stack, which the CPU route must not load for an ordinary checkpoint."""
+    if not _has_fp8_dequantize_conversion(model):
+        return 0
     try:
         from unsloth.models.loader_utils import _drop_fp8_dequantize_conversions
     except Exception:

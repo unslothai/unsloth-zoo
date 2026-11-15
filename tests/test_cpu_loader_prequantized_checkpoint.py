@@ -119,6 +119,20 @@ def test_quant_method_is_read_from_language_model_sub_configs(key):
     assert _quant_method_of([]) is None
 
 
+class Fp8Dequantize:  # named like transformers.integrations.finegrained_fp8.Fp8Dequantize
+    pass
+
+
+class _Rename:
+    pass
+
+
+def _with_conversions(*operations):
+    import types
+
+    return types.SimpleNamespace(_weight_conversions = [types.SimpleNamespace(operations = list(operations))])
+
+
 def test_reverse_fp8_conversions_are_dropped_after_load(monkeypatch):
     import sys
     import types
@@ -129,8 +143,36 @@ def test_reverse_fp8_conversions_are_dropped_after_load(monkeypatch):
     fake = types.ModuleType("unsloth.models.loader_utils")
     fake._drop_fp8_dequantize_conversions = lambda model: calls.append(model) or 3
     monkeypatch.setitem(sys.modules, "unsloth.models.loader_utils", fake)
-    model = object()
+    model = _with_conversions(Fp8Dequantize())
     assert loader._drop_reverse_fp8_conversions(model) == 3 and calls == [model]
     # Without Unsloth (or with a helper that fails) the load carries on.
     fake._drop_fp8_dequantize_conversions = lambda model: 1 / 0
     assert loader._drop_reverse_fp8_conversions(model) == 0
+
+
+@pytest.mark.parametrize(
+    "model",
+    [object(), _with_conversions(), _with_conversions(_Rename())],
+    ids = ["no-conversions", "empty", "non-fp8"],
+)
+def test_a_model_without_fp8_dequantize_never_imports_the_gpu_model_stack(monkeypatch, model):
+    # unsloth.models loads the GPU kernels and model stack; the CPU route must not import it for an ordinary model.
+    import sys
+
+    from unsloth_zoo.cpu import loader
+
+    attempted = []
+
+    class _Blocked:
+        # Records the attempt: the loader swallows import errors, so raising here alone would pass silently.
+        def find_spec(self, name, path = None, target = None):
+            if name == "unsloth.models" or name.startswith("unsloth.models."):
+                attempted.append(name)
+                raise ImportError(name)
+            return None
+
+    for name in [m for m in sys.modules if m == "unsloth.models" or m.startswith("unsloth.models.")]:
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setattr(sys, "meta_path", [_Blocked(), *sys.meta_path])
+    assert loader._drop_reverse_fp8_conversions(model) == 0
+    assert attempted == []
