@@ -227,9 +227,23 @@ def get_transformers_model_type(config, trust_remote_code=False):
             model_type = model_type_list[0].group(1)
             model_types = [model_type]
         elif getattr(config, "auto_mapping", None) is not None:
+            # An adapter of one of Unsloth's own implementations: its parent library names the native module
+            # (unsloth.models.<model_type>.modeling, or a registered location).
+            parent = str(config.auto_mapping.get("parent_library", "") or "")
+            native = re.fullmatch(r"unsloth\.models\.([^.]+)\.modeling", parent)
+            if native is not None and is_native_model_type(native.group(1)):
+                model_types = [native.group(1)]
+            else:
+                try:
+                    from .compiler import NATIVE_MODELING_MODULES
+                except Exception:
+                    NATIVE_MODELING_MODULES = {}
+                registered = [t for t, location in NATIVE_MODELING_MODULES.items() if location == parent]
+                if registered:
+                    model_types = registered[:1]
             # e.g. GptOssForCausalLM
             model_type = config.auto_mapping.get("base_model_class", None)
-            if model_type is not None:
+            if model_types is None and model_type is not None:
                 model_type = str(model_type)
                 model_type = model_type.rsplit("For", 1)[0].lower()
                 # Find exact modeling-path name

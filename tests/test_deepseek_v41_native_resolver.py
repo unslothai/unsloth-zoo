@@ -50,3 +50,21 @@ def test_ignores_unrelated_modules_with_the_same_suffix(no_port, monkeypatch):
         monkeypatch.delitem(sys.modules, name)
     monkeypatch.setitem(sys.modules, "other.deepseek_v41.modeling", types.ModuleType("other.deepseek_v41.modeling"))
     assert patches._modeling() is None
+
+
+@pytest.mark.parametrize("registered", [False, True], ids = ["unsloth_path", "registered"])
+def test_adapter_of_a_native_model_resolves_without_the_base_config(monkeypatch, registered):
+    # An adapter saved from Unsloth's native module records its parent library, not a transformers path; the model
+    # type must come from there, not from an AutoConfig download of the base model.
+    import peft
+    import unsloth_zoo.compiler as compiler
+    import unsloth_zoo.hf_utils as hf_utils
+
+    location = "some.registered.deepseek_v41.modeling" if registered else "unsloth.models.deepseek_v41.modeling"
+    monkeypatch.setattr(hf_utils, "NATIVE_MODEL_TYPES", {"deepseek_v41"})
+    monkeypatch.setattr(compiler, "NATIVE_MODELING_MODULES", {"deepseek_v41": location} if registered else {})
+    config = peft.LoraConfig(r = 4, target_modules = ["q_a_proj"])
+    config.base_model_name_or_path = "/nonexistent/unsloth-dsv41-base"
+    config.auto_mapping = {"base_model_class": "DeepseekV41ForCausalLM", "parent_library": location}
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    assert hf_utils.get_transformers_model_type(config) == ["deepseek_v41"]
