@@ -3047,6 +3047,11 @@ def sft_prepare_dataset(
                     _completion = _completion + _eos_token
                 return _completion
 
+            # max_length None is no limit and truncation_mode picks the side, as for messages rows below.
+            truncate_pc = do_truncation and isinstance(max_seq_length, int) and max_seq_length > 0
+            pc_cut = slice(-max_seq_length, None) if truncate_pc and \
+                getattr(args, "truncation_mode", "keep_start") == "keep_end" else slice(None, max_seq_length)
+
             def _pc_result(prompt_ids, pc_ids, pc_masks, labels):
                 n_prompt = min(len(prompt_ids), len(pc_ids))
                 completion_mask = [0] * n_prompt + [1] * (len(pc_ids) - n_prompt)
@@ -3056,8 +3061,8 @@ def sft_prepare_dataset(
                         result["assistant_masks"] = [int(x != -100) for x in labels]
                     else:
                         result["assistant_masks"] = list(pc_masks)
-                if do_truncation and max_seq_length > 0:
-                    result = {k: v[:max_seq_length] for k, v in result.items()}
+                if truncate_pc:
+                    result = {k: v[pc_cut] for k, v in result.items()}
                 if _needs_token_type_ids:
                     result["token_type_ids"] = [0] * len(result["input_ids"])
                 return result
