@@ -493,6 +493,9 @@ def function_defined_elsewhere(modeling_file, name):
     """True if `modeling_file.<name>` is imported from another file (a same-named method can match `def <name>`)."""
     try:
         function = inspect.unwrap(getattr(modeling_file, name))
+        # `import copy` beside a method `def copy(self)`: the name matches a def, but its source is the stdlib file.
+        if inspect.ismodule(function):
+            return True
         if not inspect.isfunction(function):
             return False
         function_file = inspect.getsourcefile(function)
