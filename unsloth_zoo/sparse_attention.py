@@ -308,6 +308,10 @@ def sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale):
         probs = torch.where(empty, 0, probs)
         return torch.einsum("bchk,bckd->bchd", probs, slots).to(q.dtype)
 
+    if s <= _TORCH_CHUNK_ELEMS // max(1, k * d * b):
+        # One chunk: no Python loop over the length, which a compiled call (the T4 / CPU / ROCm path) would
+        # specialise on, recompiling for every new length even under dynamic=True.
+        return block(q, kv_pad, sink, safe, valid)
     # Under autograd each chunk is recomputed in backward, so only one gathered slab is ever live.
     recompute = torch.is_grad_enabled() and any(t.requires_grad for t in (q, kv, attn_sink) if t is not None) and s > chunk
     outs = []

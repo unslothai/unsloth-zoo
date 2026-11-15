@@ -258,3 +258,21 @@ def test_gather_compiles_one_variant_set_per_width_bucket(form):
             assert err <= 2 * base + 4 * torch.finfo(torch.bfloat16).eps * max(1.0, r.abs().max().item()), (width, err, base)
         grown.append(variants() - before)
     assert grown[1:] == [0, 0], grown
+
+
+def test_torch_path_compiles_once_across_lengths():
+    # The torch path is what T4 (no tensor-core Triton), CPU and ROCm run under torch.compile. Its query-chunk loop
+    # ran over the length, so dynamic=True still specialised on it and recompiled for every new length.
+    torch._dynamo.reset()
+    fn = torch.compile(lambda q, kv, sink, idx: sa.sparse_attn(q, kv, sink, idx, 0.1, backend = "torch"),
+                       backend = "eager", fullgraph = True, dynamic = True)
+    from torch._dynamo.utils import counters
+    counters.clear()
+    for s in (40, 52, 77):
+        g = torch.Generator().manual_seed(s)
+        q, kv = torch.randn(1, s, 4, 16, generator = g).requires_grad_(), torch.randn(1, s, 16, generator = g).requires_grad_()
+        sink, idx = torch.randn(4, generator = g).requires_grad_(), torch.randint(-1, s, (1, s, 8), generator = g).int()
+        got = fn(q, kv, sink, idx)
+        torch.testing.assert_close(got, sa.sparse_attn_reference(q, kv, sink, idx, 0.1))
+        got.square().sum().backward()
+    assert counters["stats"]["unique_graphs"] == 1, dict(counters["stats"])
