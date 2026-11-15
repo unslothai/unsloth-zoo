@@ -118,6 +118,16 @@ def _gather_importable():
     return bool(_GATHER)
 
 
+def _resolve_gather():
+    """Once at import: traced dispatch then only reads _GATHER (a cold trace skipped gather: _gather_importable does
+    not import while compiling, so the first compiled step on Blackwell ran the Triton kernel instead)."""
+    global _GATHER
+    try:
+        _gather_fn()
+    except Exception:
+        _GATHER = False
+
+
 def _gather_eligible(q, window = 0):
     """gather_attn's shared-KV schedule only: k-tiled tl.dot over the gathered rows, every head sharing one KV
     load. Its other Triton kernels unroll tl.static_range(TOPK) one row at a time (TOPK a compile key; a TOPK of
@@ -149,15 +159,22 @@ _FLEX_D256_MIN_SHARED_MEMORY = 96 * 1024
 _SHARED_MEMORY = {}
 
 
+def _query_shared_memory(index):
+    try:
+        return getattr(torch.cuda.get_device_properties(index), "shared_memory_per_block_optin", 0)
+    except Exception:
+        return 0
+
+
 def _shared_memory(device):
     if device.type != "cuda":
         return 0
     index = device.index if device.index is not None else torch.cuda.current_device()
+    # Traced code skips the cache: a dict first filled during a trace becomes a guard and recompiles the next call.
+    if torch.compiler.is_compiling():
+        return _query_shared_memory(index)
     if index not in _SHARED_MEMORY:
-        try:
-            _SHARED_MEMORY[index] = getattr(torch.cuda.get_device_properties(index), "shared_memory_per_block_optin", 0)
-        except Exception:
-            _SHARED_MEMORY[index] = 0
+        _SHARED_MEMORY[index] = _query_shared_memory(index)
     return _SHARED_MEMORY[index]
 
 
@@ -773,3 +790,7 @@ def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mas
                 _repair_boundary_ties(out, b, t0, scores, valid, k, q[b, t0:t1], block_keys, starts, arange_r,
                                       top_blocks, ratio, dim)
     return out
+
+
+if _HAS_TRITON:
+    _resolve_gather()

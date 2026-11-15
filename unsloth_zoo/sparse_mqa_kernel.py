@@ -355,6 +355,9 @@ def _shared_memory(device):
     if device.type != "cuda":  # TRITON_INTERPRET=1 tests on CPU
         return 48 * 1024
     index = device.index if device.index is not None else torch.cuda.current_device()
+    # Traced code skips the cache: a dict first filled during a trace becomes a guard and recompiles the next call.
+    if torch.compiler.is_compiling():
+        return getattr(torch.cuda.get_device_properties(index), "shared_memory_per_block_optin", 48 * 1024)
     if index not in _SMEM:
         props = torch.cuda.get_device_properties(index)
         _SMEM[index] = getattr(props, "shared_memory_per_block_optin", 48 * 1024)
