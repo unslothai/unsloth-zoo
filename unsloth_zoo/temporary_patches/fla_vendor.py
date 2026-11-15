@@ -1454,6 +1454,52 @@ def _install_rocm_fp32_torch_path(torch_mod=None):
     return True
 
 
+_FP32_IEEE_MARK = "_unsloth_fp32_ieee_dots"
+
+
+def _make_fp32_ieee_dots(original):
+    """float32 gated delta runs its tl.dot calls in IEEE float32. Triton's default for float32 operands is TF32,
+    which rounds them to 10 mantissa bits inside each dot while the kernels' elementwise terms keep all 23: the decay
+    gradient dg = sum(dq * q) - sum(dk * k) cancels to far below either term, so it came out wrong (B200, tiny
+    Qwen3.8-Flash-Next: dA_log 32x the fp64 value on strongly decaying heads, cos 0.3 in a model), while dq / dk / dv
+    and bfloat16 inputs (exact in every dot) were fine. TRITON_F32_DEFAULT is read when a kernel compiles and is part
+    of Triton's cache key, and float32 kernel specializations only compile here. An explicit TRITON_F32_DEFAULT wins;
+    UNSLOTH_FLA_FP32_TF32=1 keeps TF32."""
+
+    @functools.wraps(original)
+    def wrapped(*args, **kwargs):
+        q = args[0] if args else kwargs.get("q")
+        if (
+            getattr(q, "dtype", None) is not None
+            and str(q.dtype) == "torch.float32"
+            and getattr(q, "is_cuda", False)
+            and os.environ.get("TRITON_F32_DEFAULT") is None
+            and not _flag("UNSLOTH_FLA_FP32_TF32")
+        ):
+            os.environ["TRITON_F32_DEFAULT"] = "ieee"
+            try:
+                return original(*args, **kwargs)
+            finally:
+                os.environ.pop("TRITON_F32_DEFAULT", None)
+        return original(*args, **kwargs)
+
+    setattr(wrapped, _FP32_IEEE_MARK, True)
+    return wrapped
+
+
+def _install_fp32_ieee_dots():
+    """Wrap the live fla's chunk_gated_delta_rule_fwd / _bwd (module globals its autograd Function and unsloth's
+    opaque gated-delta op both call) so float32 inputs take IEEE dots. Idempotent."""
+    chunk_mod = sys.modules.get("fla.ops.gated_delta_rule.chunk")
+    if chunk_mod is None:
+        return False
+    for name in ("chunk_gated_delta_rule_fwd", "chunk_gated_delta_rule_bwd"):
+        fn = getattr(chunk_mod, name, None)
+        if fn is not None and not getattr(fn, _FP32_IEEE_MARK, False):
+            setattr(chunk_mod, name, _make_fp32_ieee_dots(fn))
+    return True
+
+
 _NO_FLA_HUB_MARK = "_unsloth_rdna1_no_fla"
 
 
@@ -1563,6 +1609,10 @@ def patch_vendor_fla(phase=None):
                 _install_rocm_fp32_torch_path()
             except Exception as e:
                 logger.warning(f"Unsloth: could not route float32 gated delta to pure torch on ROCm gfx11: {e}")
+            try:
+                _install_fp32_ieee_dots()
+            except Exception as e:
+                logger.warning(f"Unsloth: could not make float32 gated delta use IEEE float32 dots: {e}")
             try:
                 _install_gdn_backend()
             except Exception as e:
