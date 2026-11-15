@@ -164,12 +164,14 @@ def test_window_support_check_traces_with_symbolic_head_dim():
     torch._dynamo.reset()
     fn = torch.compile(lambda q, kv: q.sum() if sk.sparse_mqa_window_supported(q, kv) else q.sum() * 0,
                        backend = "eager", fullgraph = True, dynamic = True)
-    for d in (64, 128):
+    # Traced, the decision equals the eager one (ROCm declines the window kernel at every head dim); 48 is not a power
+    # of two, so no device takes it.
+    for d in (64, 128, 48):
         q = torch.randn(1, 8, 16, d, device = "cuda", dtype = torch.bfloat16)
         kv = torch.randn(1, 8, d, device = "cuda", dtype = torch.bfloat16)
-        assert fn(q, kv).item() == pytest.approx(q.sum().item(), rel = 1e-2)
-    q = torch.randn(1, 8, 16, 48, device = "cuda", dtype = torch.bfloat16)   # not a power of two
-    assert fn(q, torch.randn(1, 8, 48, device = "cuda", dtype = torch.bfloat16)).item() == 0
+        supported = sk.sparse_mqa_window_supported(q, kv)
+        assert supported == (d != 48 and torch.version.hip is None), (d, supported)
+        assert fn(q, kv).item() == pytest.approx((q.sum() if supported else q.sum() * 0).item(), rel = 1e-2)
 
 
 def test_flex_is_never_eligible_without_flex_attention(monkeypatch):
@@ -210,8 +212,9 @@ def test_a_backend_compile_failure_is_latched_not_raised(monkeypatch):
     assert list(sa._FAILED) == [sa._failure_key("flex", q, 4)]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 11),
-                    reason = "gather runs on datacenter Blackwell only")
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.version.hip is not None
+                    or torch.cuda.get_device_capability()[0] not in (10, 11),
+                    reason = "gather runs on datacenter Blackwell only (never ROCm, whose gfx11 reads as 11.x)")
 @pytest.mark.parametrize("form", ["index", "window"])
 def test_gather_compiles_one_variant_set_per_width_bucket(form):
     # DeepSeek's selection width is min(index_topk, s // ratio): it changes with the length below the cap. The vendored
