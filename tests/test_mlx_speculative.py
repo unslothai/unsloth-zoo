@@ -1227,14 +1227,19 @@ def test_a_sized_tree_budget_verifies_the_rows_its_lattice_pays_for():
     budget.pinned = 4   # while the load times a width, whatever the lattice
     assert budget.size([(0.9, 1), (0.9, 2), (0.9, 3), (0.9, 4)]) == 4 and budget.size([(0.9, 1)]) == 2
     budget.pinned = 0
-    # Nodes of a depth that keep failing stop being priced at their promise, those of another depth keep theirs.
-    nodes = [(0.9, 1), (0.6, 2), (0.6, 3), (0.6, 4)]
+    # At the rate rounds ran at, a poor lattice stops paying for the rows its own best ratio would take.
+    nodes, poor = [(0.9, 1), (0.6, 2), (0.6, 3), (0.6, 4)], [(0.25, depth) for depth in range(1, 5)]
+    budget = SizedTreeBudget({3: 1.0, 5: 1.2})
+    for cycle in range(budget.RATE_ROUNDS):
+        assert budget.size(poor) == (5 if (cycle + 1) % budget.PROBE_EVERY else 3)   # every few rounds measure the other width
+        budget.observe(5, {1, 2, 3}, 1.2 * cycle)
+    assert budget.size(poor) == 3 and budget.size(nodes) == 5
+    assert budget.size([(0.5, 1), (0.5, 2), (0.37, 3), (0.37, 4)]) == 5   # pays at the wide rounds' rate, not at the narrow cycle's
+    budget = SizedTreeBudget({3: 2.0, 5: 4.0})
+    for cycle in range(budget.RATE_ROUNDS):
+        assert budget.size(nodes) == (3 if (cycle + 1) % budget.PROBE_EVERY else 5)
+        budget.observe(3, set(), 2.0 * cycle)
     assert budget.size(nodes) == 5
-    for cycle in range(256):
-        budget.size(nodes)
-        budget.observe(5, {1}, float(cycle))
-    assert budget.accepted[1] / budget.promised[1] > 1 and budget.accepted[3] / budget.promised[3] < 0.01
-    assert budget.size(nodes) == 3
     # Live cycles replace the load's price, a long gap is no cycle, and the rest scale with what replies measure.
     budget = SizedTreeBudget({3: 1.0, 4: 2.0, 5: 3.0})
     budget.size(nodes)

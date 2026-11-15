@@ -1208,15 +1208,13 @@ class TreeCalibration:
 
 class SizedTreeBudget:
     """Each round's rows on a sparse target, where each row brings its own experts: as many of the round's lattice's best
-    nodes as pay for their rows, from each node's path probability, scaled by how often nodes of its depth were accepted,
-    against each width's cycle as replies measure it. The load's costs, scaled to the reply's context, price the rest."""
+    nodes as add more tokens than their seconds yield at the rate rounds run at, from each node's calibrated path
+    probability and each width's cycle as replies measure it. The load's costs, scaled to the reply's context, price the rest."""
 
-    ALPHA = 1 / 32
     COST_ALPHA = 1 / 8
+    RATE_ALPHA, RATE_ROUNDS = 1 / 64, 16   # until this many rounds set the rate, a round sizes by its own best ratio
     # A gap longer than this many cycles is a reply's start or a plain window, not a width's cycle, unless as many follow it.
     GAP_CYCLES = 3
-    # Accepted over promised by depth at the start, as measured: deeper nodes promise more than they keep.
-    DEPTH_ACCEPTANCE = (0.9, 0.8, 0.65, 0.55, 0.5)
     # A width never verified stays priced by the load's noisy timing, so every few rounds verify the least measured one.
     PROBE_EVERY, PROBE_SETTLED_EVERY, PROBE_SAMPLES = 8, 64, 4
     # A round costs about two plain steps.
@@ -1226,10 +1224,8 @@ class SizedTreeBudget:
     def __init__(self, tree_costs: dict[int, float]):
         self.load_costs = dict(tree_costs)
         self.live = {rows: _Ema() for rows in tree_costs}
-        depths = range(1, max(tree_costs))
-        self.accepted = {depth: 0.5 * self.DEPTH_ACCEPTANCE[min(depth, len(self.DEPTH_ACCEPTANCE)) - 1] for depth in depths}
-        self.promised = {depth: 0.5 for depth in depths}
-        self._nodes, self._last, self._gaps, self._rounds, self._reply = (), None, 0, 0, None
+        self._emitted, self._spent = _Ema(), _Ema()
+        self._last, self._gaps, self._rounds, self._reply = None, 0, 0, None
         self.samples = dict.fromkeys(tree_costs, 0)
 
     def choose(self) -> int:
@@ -1250,14 +1246,16 @@ class SizedTreeBudget:
 
     def size(self, nodes: Sequence[tuple[float, int]]) -> int:
         """The rows to verify, from each node after the anchor, best first: its path probability and depth."""
-        self._nodes = nodes
         if self.pinned:
             return min(self.pinned, len(nodes) + 1)
-        tokens, best, best_rate = 1.0, min(self.load_costs), 0.0
-        for rows, (probability, depth) in enumerate(nodes, 2):
-            tokens += self.accepted[depth] / self.promised[depth] * probability
-            if rows in self.live and (rate := tokens / self._cost(rows)) > best_rate:
-                best, best_rate = rows, rate
+        rate = self._emitted.value / self._spent.value if self._emitted.count >= self.RATE_ROUNDS else None
+        tokens, best, most = 1.0, min(self.load_costs), -math.inf
+        for rows, (probability, _) in enumerate(nodes, 2):
+            tokens += probability
+            if rows in self.live:
+                value = tokens / self._cost(rows) if rate is None else tokens - rate * self._cost(rows)
+                if value > most:
+                    best, most = rows, value
         self._rounds += 1
         stale = min(self.samples, key = self.samples.get)
         every = self.PROBE_EVERY if self.samples[stale] < self.PROBE_SAMPLES else self.PROBE_SETTLED_EVERY
@@ -1270,9 +1268,8 @@ class SizedTreeBudget:
 
     def observe(self, rows: int, ranks: Sequence[int], end: float) -> None:
         """A round of the last sized lattice verified ``rows`` rows and walked the nodes taken in the order ``ranks``, by ``end``."""
-        for rank, (probability, depth) in enumerate(self._nodes[: rows - 1], 1):
-            self.accepted[depth] += self.ALPHA * ((rank in ranks) - self.accepted[depth])
-            self.promised[depth] += self.ALPHA * (probability - self.promised[depth])
+        self._emitted.update(1 + len(ranks), self.RATE_ALPHA)
+        self._spent.update(self._cost(rows), self.RATE_ALPHA)
         if self._last is not None:
             if end - self._last < self.GAP_CYCLES * self._cost(rows) or self._gaps >= self.GAP_CYCLES:
                 self.live[rows].update(end - self._last, self.COST_ALPHA)
