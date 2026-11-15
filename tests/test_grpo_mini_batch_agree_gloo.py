@@ -67,7 +67,7 @@ def _worker(rank, port, out):
         dist.destroy_process_group()
 
 
-def test_ranks_agree_on_the_smallest_mini_batch():
+def test_ranks_agree_on_the_largest_chunk_count():
     ctx = multiprocessing.get_context("spawn")
     out = ctx.Queue()
     port = _port()
@@ -77,7 +77,7 @@ def test_ranks_agree_on_the_smallest_mini_batch():
     for p in procs:
         p.join(120)
     assert [p.exitcode for p in procs] == [0, 0]
-    assert dict(out.get(timeout = 5) for _ in range(2)) == {0: (2, True, False, False), 1: (2, True, False, False)}
+    assert dict(out.get(timeout = 5) for _ in range(2)) == {0: (4, True, False, False), 1: (4, True, False, False)}
 
 
 def test_single_process_forwards_are_never_collective():

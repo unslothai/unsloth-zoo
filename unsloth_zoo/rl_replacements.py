@@ -1904,10 +1904,10 @@ pass
 
 
 def grpo_agree_mini_batch(B, device):
-    """The smallest mini batch over the ranks (collective: every rank must call it)."""
+    """The largest chunk count over the ranks, so no rank forwards more rows than it sized for (collective)."""
     import torch.distributed as dist
     value = torch.tensor([int(B)], dtype = torch.int64, device = device)
-    dist.all_reduce(value, op = dist.ReduceOp.MIN)
+    dist.all_reduce(value, op = dist.ReduceOp.MAX)
     return int(value.item())
 pass
 
