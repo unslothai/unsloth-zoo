@@ -68,6 +68,7 @@ from .moe_router_triton import *
 from .moe_grouped_modulelist import *
 from .moe_utils_fp8 import *
 from .fp8_uncontained_weights import *
+from .fp8_partial_block_dequant import *
 from .flex_attention_bwd import *
 from .inductor_stride_guard import *
 from .remote_code_vlm import *
