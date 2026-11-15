@@ -917,8 +917,11 @@ class BlockSwap:
         fn = getattr(module, "_gradient_checkpointing_func", None)
         if not callable(fn):
             return False
-        if getattr(fn, "_unsloth_block_swap", None) is self:
-            return True
+        seen = fn
+        while seen is not None:   # ours may sit under routing replay's _RecordingCheckpoint
+            if getattr(seen, "_unsloth_block_swap", None) is self:
+                return True
+            seen = getattr(seen, "_unsloth_replay_checkpoint", None) or getattr(seen, "__wrapped__", None)
         inner = fn
 
         def run_in_checkpoint(function, *args, **kw):
@@ -929,6 +932,8 @@ class BlockSwap:
 
         run_in_checkpoint._unsloth_block_swap = self
         run_in_checkpoint.__wrapped__ = inner
+        if hasattr(inner, "_unsloth_replay_checkpoint"):   # routing replay then sees it as wrapped, not rewrapping
+            run_in_checkpoint._unsloth_replay_checkpoint = inner._unsloth_replay_checkpoint
         module._gradient_checkpointing_func = run_in_checkpoint
         self.__dict__.setdefault("_ckpt_wrapped", weakref.WeakSet()).add(module)
         return True

@@ -2611,3 +2611,24 @@ def test_checkpoint_wrap_is_restored_on_remove_and_redone_after_reassignment():
             l(torch.ones(2, 4))
     assert not hasattr(layers2[0]._gradient_checkpointing_func, "_unsloth_block_swap")
     assert cp is not None
+
+
+def test_checkpoint_wrap_does_not_stack_under_routing_replay():
+    # Routing replay rewraps _gradient_checkpointing_func on every forward; each wrapper must be applied once.
+    from unsloth_zoo.routing_replay import _wrap_checkpoint_funcs
+    layers, sw = _ckpt_in_forward_model(3, False)
+    for order in range(2):
+        for _ in range(4):
+            if order == 0:
+                _wrap_checkpoint_funcs([(0, layers[0])])
+            layers[0](torch.ones(2, 4, requires_grad = True))
+            if order == 1:
+                _wrap_checkpoint_funcs([(0, layers[0])])
+        fn, swaps, replays = layers[0]._gradient_checkpointing_func, 0, 0
+        while fn is not None:
+            swaps += getattr(fn, "_unsloth_block_swap", None) is sw
+            replays += type(fn).__name__ == "_RecordingCheckpoint"
+            fn = getattr(fn, "__wrapped__", None) or (fn._unsloth_replay_checkpoint if replays and type(fn).__name__ == "_RecordingCheckpoint" else None)
+        assert (swaps, replays) == (1, 1), (order, swaps, replays)
+        sw.remove()
+        layers, sw = _ckpt_in_forward_model(3, False)
