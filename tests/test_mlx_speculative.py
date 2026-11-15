@@ -1207,6 +1207,9 @@ def test_a_sized_tree_budget_verifies_the_rows_its_lattice_pays_for():
     # Confident nodes pay for every row; hopeless ones for none past the narrowest.
     assert budget.size([(0.9, 1), (0.9, 2), (0.9, 3), (0.9, 4)]) == 5
     assert budget.size([(0.1, 1), (0.01, 2), (0.01, 3), (0.01, 4)]) == 3
+    budget.pinned = 4   # while the load times a width, whatever the lattice
+    assert budget.size([(0.9, 1), (0.9, 2), (0.9, 3), (0.9, 4)]) == 4 and budget.size([(0.9, 1)]) == 2
+    budget.pinned = 0
     # Nodes of a depth that keep failing stop being priced at their promise, those of another depth keep theirs.
     nodes = [(0.9, 1), (0.6, 2), (0.6, 3), (0.6, 4)]
     assert budget.size(nodes) == 5

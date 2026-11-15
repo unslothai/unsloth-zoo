@@ -1165,6 +1165,7 @@ class SizedTreeBudget:
     PROBE_EVERY, PROBE_SETTLED_EVERY, PROBE_SAMPLES = 8, 64, 4
     # A round costs about two plain steps.
     MIN_ROUND_TOKENS = 2.0
+    pinned = 0   # while the load times a width, the rows every round verifies
 
     def __init__(self, tree_costs: dict[int, float]):
         self.load_costs = dict(tree_costs)
@@ -1194,6 +1195,8 @@ class SizedTreeBudget:
     def size(self, nodes: Sequence[tuple[float, int]]) -> int:
         """The rows to verify, from each node after the anchor, best first: its path probability and depth."""
         self._nodes = nodes
+        if self.pinned:
+            return min(self.pinned, len(nodes) + 1)
         tokens, best, best_rate = 1.0, min(self.load_costs), 0.0
         for rows, (probability, depth) in enumerate(nodes, 2):
             tokens += self.accepted[depth] / self.promised[depth] * probability
@@ -1780,16 +1783,22 @@ class SpeculativeEngine:
         with mx.stream(self._stream):
             tree = self.drafter.tree(draft, plan.tree)
             budget = self.drafter.tree_budget
-            if isinstance(budget, SizedTreeBudget):
-                mx.eval(tree.rank, tree.score, tree.block.depth)
-                nodes = sorted(zip(tree.rank.tolist(), tree.score.tolist(), tree.block.depth.tolist()))[1:]
-                rows = budget.size([(math.exp(score), depth) for _, score, depth in nodes])
-                if rows != tree.tokens.size:
-                    tree = tree.regrow(rows)
-                plan = replace(plan, tree = rows)
+            sizes, sized = isinstance(budget, SizedTreeBudget), []
+
+            def size():
+                # The verify asks with its first layers submitted, which run while this waits for the lattice.
+                mx.eval(tree.score, tree.block.depth)
+                nodes = zip(tree.score.tolist()[1:], tree.block.depth.tolist()[1:])
+                sized.append(budget.size([(math.exp(score), depth) for score, depth in nodes]))
+                return sized[-1]
             mx.async_eval(tree.tokens)
-        with mx.stream(self._stream), tree_verify(tree.block):
+        with mx.stream(self._stream), tree_verify(tree.block, size if sizes else None):
             logits, hidden, transaction = self._verify(tree.tokens[None])
+        if sizes:
+            if not sized:   # a verify that asked for no size took every row
+                size()
+            tree = tree.first(logits.shape[1])
+            plan = replace(plan, tree = logits.shape[1])
         try:
             with mx.stream(self._stream):
                 target, scores = row.draw(row.logprobs(logits[0]), row.emitted)
@@ -1797,7 +1806,7 @@ class SpeculativeEngine:
             mx.async_eval(target, path, walked, *([] if scores is None else [scores]))
             with mx.stream(self._stream):
                 self.drafter.predraft(draft, mx.take(hidden[0], path, axis = 0), walked[0], target[walked[1]])
-            mx.eval(target, path, walked, tree.rank, *([] if scores is None else [scores]))
+            mx.eval(target, path, walked, tree.rank, tree.tokens, *([] if scores is None else [scores]))
             tokens, count, last = tree.tokens.tolist(), walked[0].item(), walked[1].item()
             if tokens[0] != row.pending:
                 raise RuntimeError("a draft tree must start from its row's pending token")
@@ -2938,7 +2947,8 @@ class ContextDrafter:
     def _tree(self, anchor, context: mx.array, cache: list, rows: int, scan = None):
         # Rows within the trained block read its lattice, which accepts a little more than a deeper block's first rows.
         depth = self.trained_depth if rows <= self.trained_depth + 1 else self.extended_depth
-        return self._draft.tree(anchor, context, cache, depth + 1, rows, scan)
+        # A sized round verifies the first rows of its tree, so its rows go out in the order they were taken.
+        return self._draft.tree(anchor, context, cache, depth + 1, rows, scan, self.sized_trees)
 
     def extension_serves(self, row: ContextRow, depth: int) -> bool:
         """Whether a block of ``depth`` drafts for ``row`` now runs on the sparse producer, the only one deeper rounds are
@@ -3102,15 +3112,25 @@ def _warm_trees(engine: SpeculativeEngine, drafter: ContextDrafter) -> None:
             seconds.append(time.perf_counter() - start)
         return min(seconds[2:])
 
+    plan = lambda n: RoundPlan("round", rows = (RowPlan("draft", n - 1),), tree = n)
+    if drafter.sized_trees:
+        drafter.tree_budget = pinned = SizedTreeBudget(dict.fromkeys(drafter.tree_widths, 1.0))
+
+    def timed(n: int) -> float:
+        if not drafter.sized_trees:
+            return cycles(plan(n))
+        # As a reply's round: the widest tree drafted, its first rows verified.
+        pinned.pinned = n
+        return cycles(plan(max(drafter.tree_widths)))
+
     try:
-        plan = lambda n: RoundPlan("round", rows = (RowPlan("draft", n - 1),), tree = n)
-        trees = {n: cycles(plan(n)) for n in drafter.tree_widths}
-        cycles(plan(drafter.tree_widths[0]))   # A narrower tree folding a wider one's rows is a check of its own.
+        trees = {n: timed(n) for n in drafter.tree_widths}
+        timed(drafter.tree_widths[0])   # A narrower tree folding a wider one's rows is a check of its own.
     except RuntimeError as error:   # A width whose fused verify block was refused has no tree.
         _unless_failed_buffer(error)
         return
     finally:
-        row.draft.tree_rows = 0
+        row.draft.tree_rows, drafter.tree_budget = 0, None
     trained = drafter.trained_depth
     if drafter.sized_trees:
         drafter.tree_budget = SizedTreeBudget(trees)

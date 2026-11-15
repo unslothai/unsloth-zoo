@@ -880,6 +880,8 @@ def test_a_verify_block_row_has_its_one_row_sdpa_bits_where_the_vector_kernel_ch
 
 # Preorder, row 0 the anchor: a depth-5 main path with branches at depths 1 to 3.
 TREE_PARENTS = [-1, 0, 1, 2, 3, 4, 2, 1, 0, 8]
+# The order a best-first tree takes its nodes in: every prefix is a tree, and a child may come long after its parent.
+TAKEN_PARENTS = [-1, 0, 1, 0, 2, 3, 1, 4, 6, 5]
 
 
 def _tree_block(parents):
@@ -888,7 +890,7 @@ def _tree_block(parents):
     paths, fork, back, slots = [], [-1] * len(parents), [-1] * len(parents), {}
     for row, parent in enumerate(parents):
         paths.append((paths[parent] if parent >= 0 else []) + [row])
-        if parents.count(row) > 1:
+        if row in parents[row + 2:]:
             fork[row] = slots[row] = len(slots)
         if parent >= 0 and parent != row - 1:
             back[row] = slots[parent]
@@ -908,10 +910,11 @@ def _tree_mode(model, monkeypatch):
     return generation_mode(model, call = ("batch", "speculative"))
 
 
-def _tree_verified(lm, cache, tokens, block, **kwargs):
+def _tree_verified(lm, cache, tokens, block, size = None, **kwargs):
     from unsloth_zoo.mlx import inference
-    with inference.tree_verify(block):
-        out = lm(mx.array([tokens]), cache = cache, speculative_verify = True, capture_layer_ids = [], **kwargs)
+    with inference.tree_verify(block, size):
+        out = lm(mx.array([tokens]), cache = cache, speculative_verify = True, capture_layer_ids = [0], **kwargs)
+        assert out.hidden_states[0].shape[1] == out.logits.shape[1]
     mx.eval(out.logits)
     return out.logits[0], out.gdn_states
 
@@ -954,28 +957,40 @@ def test_tree_verify_rows_equal_their_paths_one_token_decoding(qwen_4bit, monkey
         transaction.abort()
         for row, path in enumerate(paths):
             assert _bits(logits[row], _stepped(lm, _clone(cache), [tokens[i] for i in path], **rope)[-1]), row
+        # A sized tree: the first layer has verified every row when the size is asked, the rest verify the first rows.
+        block, paths = _tree_block(TAKEN_PARENTS)
+        run, built = _clone(cache), []
+        size = lambda: built.append([bool(entry._speculation["records"]) for entry in run[:2]]) or 6
+        logits, transaction = _tree_verified(lm, run, tokens, block, size, **rope)
+        transaction.abort()
+        assert built == [[True, False]] and logits.shape[0] == 6
+        for row, path in enumerate(paths[:6]):
+            assert _bits(logits[row], _stepped(lm, _clone(cache), [tokens[i] for i in path], **rope)[-1]), row
 
 
-@pytest.mark.parametrize("path", [[0, 1, 2, 3, 4, 5], [0, 1, 7], [0, 8, 9], [0, 1, 2, 6], [0]])
-def test_a_committed_tree_path_continues_as_its_decode_folded_or_replayed(qwen_4bit, monkeypatch, path):
+# The last three size a tree in taking order to `sized` rows: a path past the row before it, a prefix, every row.
+@pytest.mark.parametrize("path, sized", [([0, 1, 2, 3, 4, 5], 0), ([0, 1, 7], 0), ([0, 8, 9], 0), ([0, 1, 2, 6], 0), ([0], 0),
+                                        ([0, 3, 5], 6), ([0, 1], 6), ([0, 1, 2], 3)])
+def test_a_committed_tree_path_continues_as_its_decode_folded_or_replayed(qwen_4bit, monkeypatch, path, sized):
     from unsloth_zoo.mlx import inference
     model, ids, cache = qwen_4bit
     lm, first, second = model.language_model, ids[1][:len(TREE_PARENTS)], ids[1][len(TREE_PARENTS):2 * len(TREE_PARENTS)]
     with _tree_mode(model, monkeypatch):
         _warm_tree_widths(lm, cache, first)
-        block, paths = _tree_block(TREE_PARENTS)
+        block, paths = _tree_block(TAKEN_PARENTS if sized else TREE_PARENTS)
+        size, last = (lambda: sized) if sized else None, paths[sized - 1 if sized else 6]
         decoded = _clone(cache)
         _stepped(lm, decoded, [first[i] for i in path])
         folded, kept = _clone(cache), _clone(cache)
         for run in (folded, kept):
-            _, transaction = _tree_verified(lm, run, first, block)
+            _, transaction = _tree_verified(lm, run, first, block, size)
             inference.tree_commit(transaction, run, path)
         # The next tree folds the retained path in reading its rows in place: each row is that path's continuation.
-        logits, transaction = _tree_verified(lm, folded, second, block)
-        for row, rows in enumerate(paths):
+        logits, transaction = _tree_verified(lm, folded, second, block, size)
+        for row, rows in enumerate(paths[:logits.shape[0]]):
             assert _bits(logits[row], _stepped(lm, _clone(decoded), [second[i] for i in rows])[-1]), row
-        inference.tree_commit(transaction, folded, paths[6])
-        continued = [second[i] for i in paths[6]] + second[:1]
+        inference.tree_commit(transaction, folded, last)
+        continued = [second[i] for i in last] + second[:1]
         assert _bits(_stepped(lm, folded, second[:1])[0], _stepped(lm, _clone(decoded), continued)[-1])
         # A chain block, and a one-token step, read the same state.
         logits = _chain_verified(lm, kept, second[:4])
@@ -1028,9 +1043,21 @@ def test_the_tree_builder_grows_best_first_and_lays_rows_out_in_preorder():
                     assert score[row] + lq[d][j] <= worst + 1e-4
     assert sorted(tree.rank.tolist()) == list(range(16))
     assert mx.allclose(tree.score, mx.array(score), atol = 1e-3).item()
-    # A narrower tree of the same lattice is the nodes taken first.
-    by_rank = sorted(zip(tree.rank.tolist(), tokens))
-    assert sorted(tree.regrow(5).tokens.tolist()) == sorted(token for _, token in by_rank[:5])
+    # In taking order the same nodes go out as taken, so a narrower tree of the lattice is the first rows; a row keeps its
+    # state exactly where a row other than the next continues from it.
+    rank = tree.rank.tolist()
+    order = sorted(range(16), key = rank.__getitem__)
+    taken = inference.draft_tree(_flat_selector(64), mx.zeros((1, L, 32), mx.bfloat16), mx.array([7], mx.int32), ids, unary, 8,
+                                 True)
+    parents, block = taken.parent.tolist(), taken.block
+    assert taken.rank.tolist() == list(range(8)) and taken.tokens.tolist() == [tokens[row] for row in order[:8]]
+    assert parents[1:] == [rank[parent[row]] for row in order[1:8]] and block.depth.tolist() == [depth[row] for row in order[:8]]
+    assert mx.array_equal(taken.first(5).tokens, taken.tokens[:5]).item() and taken.first(5).block.path.shape[0] == 5
+    slots, path, fork, back = [slot for slot in block.fork.tolist() if slot >= 0], *(x.tolist() for x in block[1:])
+    assert sorted(slots) == list(range(len(slots))) and all((fork[row] >= 0) == (row in parents[row + 2:]) for row in range(8))
+    for row in range(1, 8):
+        up, d = parents[row], block.depth[row].item()
+        assert path[row][:d + 1] == path[up][:d] + [row] and back[row] == (fork[up] if up != row - 1 else -1)
     # The walk stays on its branch: a later row with the next token elsewhere is not it.
     other = inference.DraftTree(mx.array([9, 5, 6, 7, 7]), mx.array([-1, 0, 0, 2, 1]), None, None)
     path, walked = inference.draft_tree_accept(other, mx.array([6, 0, 7, 7, 0]))
@@ -1046,7 +1073,7 @@ def _crafted_tree(drafter, anchor, tokens, rows, context, cache):
     unary = mx.array([[[2.0, 1.9] + [-30.0] * (K - 2)] + [[9.5, 10.0] + [-30.0] * (K - 2)] * (length - 1)], mx.bfloat16)
     drafter._drafted(anchor, context, cache, length + 1)
     pending = (anchor if isinstance(anchor, mx.array) else mx.array([anchor])).reshape(-1).astype(mx.int32)
-    return inference.draft_tree(selector, mx.zeros((1, length, 32), mx.bfloat16), pending, ids, unary, rows)
+    return inference.draft_tree(selector, mx.zeros((1, length, 32), mx.bfloat16), pending, ids, unary, rows, drafter.sized_trees)
 
 
 def _tree_drafter(model):
@@ -1159,9 +1186,11 @@ def test_a_tree_round_verifies_the_width_its_budget_sizes_from_its_lattice_and_k
         budget.observe = lambda width, ranks, end: observed.append((width, ranks)) or observe(width, ranks, end)
         replies, reply_round = [], budget.reply_round
         budget.reply_round = lambda reply: replies.append(reply) or reply_round(reply)
-        engine._verify = lambda inputs: rows.append(inputs.shape[1]) or verify(inputs)
+        engine._verify = lambda inputs: [out := verify(inputs), rows.append((inputs.shape[1], out[0].shape[1]))][0]
+        drafted, record = [], engine.controller.record_round
+        engine.controller.record_round = lambda plan, *args, **kwargs: drafted.append(plan.rows[0].length) or record(plan, *args, **kwargs)
         budget.yields_to_controller = lambda *args: False   # the script's stats stop short of the raised depth
-        engine.drafter.tree_budget = budget
+        engine.drafter.tree_budget, engine.drafter.sized_trees = budget, True
         reply, _ = _scored_reply(model, ids, engine, 72)
     assert reply == expected and len(commits) >= 4 and {3, 4, 5, 6} <= set(chosen)
     assert len(replies) == len(observed) and all(reply is replies[0] for reply in replies)
@@ -1169,7 +1198,8 @@ def test_a_tree_round_verifies_the_width_its_budget_sizes_from_its_lattice_and_k
     assert all(len(nodes) == 5 and all(a[0] >= b[0] for a, b in zip(nodes, nodes[1:])) for nodes in seen)
     assert all(0 < probability <= 1 for nodes in seen for probability, _ in nodes)
     verifies = iter(rows)
-    assert all(width in verifies for width in chosen)
+    drafted = iter(drafted)
+    assert all((6, width) in verifies for width in chosen) and all(width - 1 in drafted for width in chosen[:len(observed)])
     # The budget hears each width and the nodes its round walked.
     assert [width for width, _ in observed] == chosen[:len(observed)] and [len(ranks) for _, ranks in observed] == [len(path) - 1 for path in commits]
     # A path holds one node of each depth, which ranks into the lattice's order show and rows of the tree would not.
@@ -1197,13 +1227,23 @@ def test_load_times_the_tree_widths_of_a_target_whose_rows_match_their_paths(qwe
     assert list(budget.tree_costs) == list(budget.chain_costs) == [8] and min(budget.tree_costs[8], budget.chain_costs[8]) > 0
     # A target whose rows bring their own experts sizes each round's tree from the widths timed here.
     drafter.tree_budget, drafter.sized_trees, drafter.tree_widths = None, True, (4, 8)
+    timed, observe = [], S.SizedTreeBudget.observe
+    monkeypatch.setattr(S.SizedTreeBudget, "observe", lambda self, rows, *args: timed.append((self.pinned, rows)) or observe(self, rows, *args))
     S.warm_speculative_rounds(model)
     sized = drafter.tree_budget
     assert isinstance(sized, S.SizedTreeBudget) and list(sized.load_costs) == [4, 8] and min(sized.load_costs.values()) > 0
+    # Each width was timed as a reply's round verifies it: sized down from the widest tree.
+    assert set(timed) == {(4, 4), (8, 8)} and [rows for _, rows in timed[:5]] == [4] * 5
     # Warming again times the widths it asks for: the budget it replaces resizes none of them.
     sized.size = lambda nodes: pytest.fail("an earlier budget resized a timed width")
     S.warm_speculative_rounds(model)
     assert drafter.tree_budget is not sized and list(drafter.tree_budget.load_costs) == [4, 8]
+    # A width that cannot be verified leaves no budget, not the one that pinned the widths being timed.
+    def refused(self, nodes):
+        raise RuntimeError("refused")
+    monkeypatch.setattr(S.SizedTreeBudget, "size", refused)
+    S.warm_speculative_rounds(model)
+    assert drafter.tree_budget is None
 
 
 def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(qwen_4bit, monkeypatch):
@@ -2871,7 +2911,7 @@ def test_sparse_draft_head_shortlists_from_the_blocks_a_reply_has_seen(monkeypat
 def test_context_rows_pass_their_reply_tokens_to_the_head_scan():
     import mlx.nn as nn
     from unsloth_zoo.mlx.speculative import ContextDrafter
-    seen, scans = [], []
+    seen, scans, taken = [], [], []
     class Scan:
         def __init__(self, tokens):
             self.tokens = list(tokens)
@@ -2885,7 +2925,8 @@ def test_context_rows_pass_their_reply_tokens_to_the_head_scan():
             seen.append(scan)
             return mx.zeros((1, 7), mx.int32)
         def tree(self, *args):
-            seen.append(args[-1])
+            seen.append(args[-2])
+            taken.append(args[-1])
             return SimpleNamespace(tokens = mx.zeros(1))
     class Head(nn.Module):
         def bind(self, target):
@@ -2910,12 +2951,13 @@ def test_context_rows_pass_their_reply_tokens_to_the_head_scan():
     drafter.tree(row, 8)
     row.tree_rows = 8
     drafter.push(row, [7], hidden[0, :1])
+    drafter.sized_trees = True   # their trees go out in taking order
     drafter.prefetch([row])
     drafter.predraft_rows = 8
     for row.tree_rows in (8, 0):
         row.prefetched_tree = None
         assert drafter.predraft(row, hidden[0], mx.array(1), mx.array(5))
-    assert seen[1:] == [row.scan] * 5 and row.scan.tokens == [1, 2, 3, 4, 5, 6, 7]
+    assert seen[1:] == [row.scan] * 5 and row.scan.tokens == [1, 2, 3, 4, 5, 6, 7] and taken == [False, True, True]
 
 
 def test_sparse_draft_selection_preserves_canonical_ties_and_call_ownership():
