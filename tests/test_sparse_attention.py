@@ -373,6 +373,10 @@ def test_cuda_all_pad_rows_are_zero_and_finite(monkeypatch, backend, with_sink):
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", backend)
     q, kv, idxs = _all_pad_inputs("cuda", dtype)
+    if backend == "flex" and not sa._flex_eligible(q, kv.shape[1]):
+        # Forcing flex where the dispatch never picks it (sm75; T4's 64 KB shared memory at this head dim) only
+        # measures flex_attention's own limits there.
+        pytest.skip("flex is not eligible on this device")
     sink = (torch.randn(16) if with_sink else torch.full((16,), float("-inf"))).cuda()
     q, kv = q.requires_grad_(), kv.requires_grad_()
     sink.requires_grad_(with_sink)
