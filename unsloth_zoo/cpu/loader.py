@@ -493,6 +493,10 @@ class FastCPUModel:
                 use_4bit = False
                 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
         _drop_reverse_fp8_conversions(model)
+        # The load may import a modeling module for the first time (Unsloth's native DeepSeek-V4.1 is imported
+        # lazily): its device-independent patches (checkpoint replay, config aliases) apply only once it exists.
+        from . import runtime as _runtime
+        _runtime.apply_cpu_security_patches()
         if auto_dtype:
             dtype = model.dtype
             if dtype == torch.float16 and not use_4bit:
@@ -601,10 +605,35 @@ class FastCPUModel:
             # Reloaded LoRA checkpoint: a second get_peft_model would reset the saved adapter weights.
             _print("this model already has LoRA adapters, keeping them.")
             return model
+        # A model built by the caller (not through from_pretrained) may have imported its modeling module since.
+        from . import runtime as _runtime
+        _runtime.apply_cpu_security_patches()
         if use_gradient_checkpointing is None:
             use_gradient_checkpointing = getattr(model, "_unsloth_cpu_gradient_checkpointing", "unsloth")
         leaf_names = {name.rsplit(".", 1)[-1] for name, _ in model.named_modules()}
-        if target_modules is None:
+        # Models with their own projection names (Unsloth's native DeepSeek-V4.1) translate q/k/v/o/gate/up/down_proj,
+        # "all-linear" and None into their real Linears, exactly as the GPU get_peft_model does.
+        remap = getattr(model, "unsloth_lora_target_modules", None)
+        remapped_targets = False
+        if callable(remap) and kwargs.get("finetune_language_layers", True):
+            embeddings = []
+            if target_modules is not None and not isinstance(target_modules, str):
+                embeddings = [m for m in target_modules if m in ("embed_tokens", "lm_head")]
+                target_modules = [m for m in target_modules if m not in embeddings]
+            remapped = remap(
+                target_modules,
+                attention = kwargs.get("finetune_attention_modules", True),
+                mlp = kwargs.get("finetune_mlp_modules", True),
+            )
+            if remapped is not target_modules:
+                target_modules = remapped
+                remapped_targets = True
+            # Trained in full whatever the remapper returned (it may hand back the list it was given).
+            if embeddings:
+                modules_to_save = list(dict.fromkeys([*(modules_to_save or []), *embeddings]))
+        if remapped_targets:
+            pass
+        elif target_modules is None:
             # Unsloth's usual projections where the model has them, else PEFT's per-architecture default.
             candidates = _with_fused_projections(_DEFAULT_TARGET_MODULES, leaf_names)
             target_modules = [m for m in candidates if m in leaf_names]

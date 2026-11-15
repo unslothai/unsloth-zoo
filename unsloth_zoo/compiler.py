@@ -68,6 +68,10 @@ from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
     MHC_SINKHORN_SOURCE,
     MHC_SINKHORN_REPLACEMENT,
     MHC_PROJECTION_REWRITES,
+    MHC_NATIVE_SINKHORN_SOURCE,
+    MHC_NATIVE_SINKHORN_REPLACEMENT,
+    MHC_NATIVE_PROJECTION_SOURCE,
+    MHC_NATIVE_PROJECTION_REPLACEMENT,
     mhc_fast_mode,
 )
 from importlib.metadata import version as importlib_version
@@ -273,6 +277,18 @@ DISABLE_COMPILE_MODEL_FUNCTIONS = {
         # Later port heads: block fake-quant (float8 casts, int32 bit tricks), straight-through in training.
         "_fake_quant_fp8_block",
         "_fake_quant_fp4_block",
+        "engram_layout",
+        "make_engram_table",
+        "is_parameter_free_table",
+        "_checkpoint_key_names",
+        "has_core_model_loading",
+        "_is_fp8_quant_config",
+        "_released_layout",
+        "_engram_cut_safe",
+        "pipeline_safe_cut_points",
+        "_resolve_sparse_attn",
+        "ensure_sparse_attn",
+        "_drop_engram_tables_outside_full_save",
     ],
 }
 
@@ -300,7 +316,10 @@ MODULE_FORWARD_SOURCE_REWRITES = {
         "DeepseekV4HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
     },
     "deepseek_v41": {
-        "DeepseekV41HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+        "DeepseekV41HyperConnection": [
+            (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+            (MHC_NATIVE_SINKHORN_SOURCE, MHC_NATIVE_SINKHORN_REPLACEMENT, mhc_fast_mode),
+        ],
     },
     # GLM-5.3-Flash carries the V4 Sinkhorn chain verbatim (transformers 5.17 - 5.20).
     "glm5_next": {
@@ -314,9 +333,55 @@ MODULE_FORWARD_SOURCE_REWRITES = {
 # One (old, new) pair per transformers layout; the first that occurs exactly once is applied.
 MODULE_FORWARD_EAGER_REWRITES = {
     "deepseek_v4": {"DeepseekV4HyperConnection": MHC_PROJECTION_REWRITES},
-    "deepseek_v41": {"DeepseekV41HyperConnection": MHC_PROJECTION_REWRITES},
+    "deepseek_v41": {
+        "DeepseekV41HyperConnection": MHC_PROJECTION_REWRITES
+        + ((MHC_NATIVE_PROJECTION_SOURCE, MHC_NATIVE_PROJECTION_REPLACEMENT),),
+    },
     "glm5_next": {"Glm5NextTextHyperConnection": MHC_PROJECTION_REWRITES},
 }
+
+
+# Modeling code that lives outside transformers, {model_type: module name}: Unsloth's own implementations
+# (unsloth/models/<model_type>/modeling.py by default) when the installed transformers lacks the model.
+NATIVE_MODELING_MODULES = {}
+
+
+_MHC_INJECTED_HELPERS = ("unsloth_sinkhorn_knopp", "unsloth_mhc_projection", "unsloth_mhc_projection_rsqrt")
+
+
+def register_native_modeling(model_type, module_name):
+    """Compile `module_name` (already imported) for `model_type` when transformers has no such model."""
+    NATIVE_MODELING_MODULES[str(model_type)] = str(module_name)
+    from .hf_utils import NATIVE_MODEL_TYPES
+
+    NATIVE_MODEL_TYPES.add(str(model_type))
+
+
+def resolve_modeling_module(model_type):
+    """(dotted location, module) of the modeling code for `model_type`: transformers' own file, else a native module
+    that is ALREADY imported (registered, or at unsloth.models.<model_type>.modeling). Never imports unsloth. The
+    compiler evals `f"{location}.{name}"`, so the location's root package is bound in this module's globals."""
+    if not re.fullmatch(r"[a-z0-9_]+", str(model_type)):
+        return None, None
+    location = f"transformers.models.{model_type}.modeling_{model_type}"
+    try:
+        return location, importlib.import_module(location)
+    except ImportError:
+        # Not shipped or unimportable here: an already-imported native module can still serve.
+        pass
+    for name in (NATIVE_MODELING_MODULES.get(model_type), f"unsloth.models.{model_type}.modeling"):
+        module = sys.modules.get(name) if name else None
+        root = sys.modules.get(name.split(".")[0]) if module is not None else None
+        if module is None or root is None:
+            continue
+        try:
+            resolved = functools.reduce(getattr, name.split(".")[1:], root)
+        except Exception:
+            continue
+        if resolved is module:
+            globals()[name.split(".")[0]] = root
+            return name, module
+    return None, None
 
 
 def module_forward_eager_rewrites(modeling_file, model_type):
@@ -334,25 +399,35 @@ def module_forward_eager_rewrites(modeling_file, model_type):
             if "unsloth_mhc_projection" in new:
                 # Same reason as unsloth_sinkhorn_knopp below: block compile rebinds the forward
                 # to the modeling module's globals.
-                from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_mhc_projection
+                from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
+                    unsloth_mhc_projection,
+                    unsloth_mhc_projection_rsqrt,
+                )
 
                 modeling_file.unsloth_mhc_projection = unsloth_mhc_projection
+                modeling_file.unsloth_mhc_projection_rsqrt = unsloth_mhc_projection_rsqrt
     return applicable
 
 
 def module_forward_source_rewrites(modeling_file, model_type):
     applicable = {}
     eager_rewrites = module_forward_eager_rewrites(modeling_file, model_type)
-    for name, (old, new, mode) in MODULE_FORWARD_SOURCE_REWRITES.get(model_type, {}).items():
+    for name, entry in MODULE_FORWARD_SOURCE_REWRITES.get(model_type, {}).items():
+        # One (old, new, mode) triple, or a list of them for several layouts: the first old found once applies.
+        alternatives = entry if isinstance(entry, list) else [entry]
         try:
-            mode = mode()
-            if not mode:
-                continue
             cls = getattr(modeling_file, name)
             source = inspect.getsource(_unwrap_undecorated_method(cls.forward, cls.__qualname__))
         except Exception:
             continue
         source = eager_rewrites.get(name, source)
+        old, new, mode = next((alt for alt in alternatives if source.count(alt[0]) == 1), alternatives[0])
+        try:
+            mode = mode()
+        except Exception:
+            continue
+        if not mode:
+            continue
         if source.count(old) == 1:
             applicable[name] = source if mode == "stock" else source.replace(old, new)
             if mode != "stock" and "unsloth_sinkhorn_knopp" in new:
@@ -412,6 +487,9 @@ def function_defined_elsewhere(modeling_file, name):
     """True if `modeling_file.<name>` is imported from another file (a same-named method can match `def <name>`)."""
     try:
         function = inspect.unwrap(getattr(modeling_file, name))
+        # `import copy` beside a method `def copy(self)`: the name matches a def, but its source is the stdlib file.
+        if inspect.ismodule(function):
+            return True
         if not inspect.isfunction(function):
             return False
         function_file = inspect.getsourcefile(function)
@@ -2382,10 +2460,11 @@ def create_new_function(
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"
     if "torch_compiler_disable_unless_decode" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compiler_disable_unless_decode\n"
-    if "unsloth_sinkhorn_knopp" in new_source:
-        imports += "from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp\n"
-    if "unsloth_mhc_projection" in new_source:
-        imports += "from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_mhc_projection\n"
+    # mHC helpers come from the zoo: they are set on the modeling module only at runtime.
+    for helper in _MHC_INJECTED_HELPERS:
+        if re.search(rf"\b{helper}\b", new_source):
+            imports += f"from unsloth_zoo.temporary_patches.mhc_sinkhorn import {helper}\n"
+    items = [item for item in items if item not in _MHC_INJECTED_HELPERS]
     if "torch_compile" in new_source:
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "_maybe_compile" in new_source:
@@ -6351,9 +6430,12 @@ def _compiled_source_key():
     )
 
 
-def _unpatch_modeling_file(modeling_file):
-    """Restore modeling_file originals and rerun pre_compile patches so the next pass regenerates."""
-    originals = _MODELING_FILE_ORIGINALS.get(modeling_file.__name__, {})
+def _unpatch_modeling_file(modeling_file, model_location = None):
+    """Restore modeling_file originals and rerun pre_compile patches so the next pass regenerates. The originals are
+    keyed by the location the compiler resolved (a registered native module's alias can differ from __name__)."""
+    originals = _MODELING_FILE_ORIGINALS.get(model_location or modeling_file.__name__)
+    if originals is None:
+        originals = _MODELING_FILE_ORIGINALS.get(modeling_file.__name__, {})
     for (container, key), value in originals.items():
         try:
             if container is None:
@@ -6438,17 +6520,15 @@ def unsloth_compile_transformers(
     if not re.fullmatch(r"[a-z0-9_]+", str(model_type)):
         return
 
-    model_location = f"transformers.models.{model_type}.modeling_{model_type}"
-    try:
-        modeling_file = importlib.import_module(model_location)
-    except ModuleNotFoundError:
+    model_location, modeling_file = resolve_modeling_module(model_type)
+    if modeling_file is None:
         return
     # Later `eval(model_location)` calls need `transformers` bound in globals
     exec("import transformers", globals())
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__") and _MODELING_FILE_KEYS.get(
         model_location, _compiled_source_key()
     ) != _compiled_source_key():
-        _unpatch_modeling_file(modeling_file)
+        _unpatch_modeling_file(modeling_file, model_location)
     if not hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         _MODELING_FILE_ORIGINALS.pop(model_location, None)
     disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)

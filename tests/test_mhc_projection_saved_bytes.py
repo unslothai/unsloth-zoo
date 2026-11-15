@@ -145,3 +145,19 @@ def test_helper_plain_paths_match():
         assert torch.equal(unsloth_mhc_projection(x, norm, fn), ref)
     assert torch.equal(unsloth_mhc_projection(x.float(), norm, fn), ref)
     assert torch.equal(unsloth_mhc_projection(x, norm, fn), ref)  # nothing requires grad
+
+
+@pytest.mark.parametrize("requires_grad", [False, True])
+def test_native_rsqrt_projection_stays_fp32_under_fp16_autocast(requires_grad):
+    from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_mhc_projection_rsqrt
+
+    x = torch.full((1, 2, 4, 64), 300.0, dtype = torch.bfloat16, requires_grad = requires_grad)
+    fn = torch.ones(24, 256, requires_grad = requires_grad)
+    want = unsloth_mhc_projection_rsqrt(x, fn, 1e-6)
+    with torch.autocast("cpu", dtype = torch.float16):
+        got = unsloth_mhc_projection_rsqrt(x, fn, 1e-6)
+    assert got.dtype == torch.float32 and torch.isfinite(got).all()
+    torch.testing.assert_close(got, want, rtol = 0, atol = 0)
+    if requires_grad:
+        got.sum().backward()
+        assert torch.isfinite(x.grad).all() and torch.isfinite(fn.grad).all()

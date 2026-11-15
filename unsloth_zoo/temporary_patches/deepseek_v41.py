@@ -14,7 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4.1 (community port, transformers.models.deepseek_v41) training fixes. No-ops without the port.
+"""DeepSeek-V4.1 training fixes, for transformers.models.deepseek_v41 or Unsloth's native implementation
+(unsloth/models/deepseek_v41). No-ops without either.
 
 1. Gradient checkpointing. The decoder layers are GradientCheckpointingLayers, but the port leaves
    `supports_gradient_checkpointing` False, and the CSA2 group state is one per-forward `shared` dict that KV / index
@@ -52,21 +53,34 @@ __all__ = [
     "patch_deepseek_v41_grouped_lora",
     "patch_deepseek_v41_config_aliases",
     "patch_deepseek_v41_engram_table",
+    "patch_deepseek_v41_moe",
     "prepare_compiled_checkpoint",
+    "make_deepseek_v41_engram_table",
 ]
 
 
 def _modeling():
+    """transformers' deepseek_v41 when it ships one, else Unsloth's native implementation
+    (unsloth/models/deepseek_v41/modeling.py) once loading a deepseek_v41 config imported it. Never imports
+    unsloth from here."""
     try:
-        if importlib.util.find_spec("transformers.models.deepseek_v41") is None:
-            return None
+        if importlib.util.find_spec("transformers.models.deepseek_v41") is not None:
+            from transformers.models.deepseek_v41 import modeling_deepseek_v41
+            return modeling_deepseek_v41
     except Exception:
-        return None
-    try:
-        from transformers.models.deepseek_v41 import modeling_deepseek_v41
-    except Exception:
-        return None
-    return modeling_deepseek_v41
+        pass
+    return _native_modeling()
+
+
+def _native_modeling():
+    import sys
+    module = sys.modules.get("unsloth.models.deepseek_v41.modeling")
+    if module is not None and getattr(module, "DeepseekV41DecoderLayer", None) is not None:
+        return module
+    for name, module in list(sys.modules.items()):
+        if name.endswith("deepseek_v41.modeling") and getattr(module, "DeepseekV41DecoderLayer", None) is not None:
+            return module
+    return None
 
 
 # Checkpointed layer runs (first forward + recompute), for tests and engagement checks.
@@ -118,11 +132,19 @@ def patch_deepseek_v41_gradient_checkpointing():
 
     def __call__(self, *args, **kwargs):
         shared = kwargs.get("shared")
-        if not (self.gradient_checkpointing and self.training) or not isinstance(shared, dict):
+        # The native module passes a DeepseekV41GroupState (not a dict, so FSDP2 cannot rebuild it); replay copies it alike.
+        stateful = isinstance(shared, dict) or all(
+            callable(getattr(shared, name, None)) for name in ("copy", "clear", "update", "items")
+        )
+        if not (self.gradient_checkpointing and self.training) or shared is None or not stateful:
             with _compressor_lora(self):
                 return base_call(self, *args, **kwargs)
-        replay = _ReplayShared(shared)
-        replay._snapshot = dict(shared)
+        snapshot = dict(shared.items())
+        if isinstance(shared, dict):
+            replay = _ReplayShared(shared)
+            replay._snapshot = snapshot
+        else:
+            replay = shared.copy()
         kwargs["shared"] = replay
         # Same cache handling as GradientCheckpointingLayer.__call__.
         if kwargs.get("use_cache"):
@@ -135,9 +157,15 @@ def patch_deepseek_v41_gradient_checkpointing():
         def run(*inner_args, **inner_kwargs):
             REPLAY_STATS["runs"] += 1
             replay.clear()
-            replay.update(replay._snapshot)
-            with _compressor_lora(self):
-                return torch.nn.Module.__call__(self, *inner_args, **inner_kwargs)
+            replay.update(snapshot)
+            # transformers 5.23+ checkpoints `forward` itself: leaving the flag on would double-checkpoint and lose the group state.
+            previous = self.gradient_checkpointing
+            self.gradient_checkpointing = False
+            try:
+                with _compressor_lora(self):
+                    return torch.nn.Module.__call__(self, *inner_args, **inner_kwargs)
+            finally:
+                self.gradient_checkpointing = previous
 
         # Non-reentrant, always: the source layer's shared KV tensors leave through `replay`, not through the
         # checkpoint's outputs. A reentrant checkpoint (Unsloth's smart checkpointer forces one) would make them
@@ -288,12 +316,76 @@ def patch_deepseek_v41_grouped_lora():
         return original(lora_config, adapter_name, target, **kwargs)
 
     _create_new_module._unsloth_dsv41_grouped = True
+    _create_new_module.__wrapped__ = original
     LoraModel._create_new_module = staticmethod(_create_new_module)
     if UNSLOTH_ENABLE_LOGGING:
         logger.info("Unsloth: DeepSeek-V4.1 grouped LoRA for DeepseekV41GroupedLinear (o_a_proj).")
 pass
 
 TEMPORARY_PATCHES.append(patch_deepseek_v41_grouped_lora)
+
+
+# 3b. Native routed experts through Unsloth's MoE backend. They keep transformers' layout and carry the reference's
+#     asymmetric SwiGLU clamps in `_apply_gate`, which the backend calls for `_unsloth_own_apply_gate` modules.
+def patch_deepseek_v41_moe():
+    modeling = _native_modeling()
+    if modeling is None:
+        return
+    experts_cls = getattr(modeling, "DeepseekV41Experts", None)
+    if experts_cls is None or getattr(experts_cls, "_unsloth_already_patched", False):
+        return
+    if os.environ.get("UNSLOTH_DSV41_MOE_BACKEND", "1") == "0":
+        return
+    if __package__ != "unsloth_zoo.temporary_patches":
+        # The CPU runtime loads this file standalone (no GPU kernels, `.moe_utils` unresolvable): keep the native loop.
+        return
+    try:
+        from unsloth_zoo.temporary_patches.moe_utils import (
+            extract_moe_lora_weights_for_grouped_mm,
+            get_forward_moe_backend,
+            patch_param_wrapper_for_moe,
+        )
+        from unsloth_zoo.temporary_patches.utils import patch_function
+    except Exception:
+        return
+    patch_param_wrapper_for_moe()
+
+    def _dsv41_lora_extractor(wrapper, weight_A, weight_B, scaling, num_experts):
+        base = wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
+        name = getattr(wrapper, "parameter_name", None)
+        hidden, inter = getattr(base, "hidden_dim", None), getattr(base, "intermediate_dim", None)
+        dims = {"gate_up_proj": (hidden, None if inter is None else 2 * inter), "down_proj": (inter, hidden)}
+        input_dim, output_dim = dims.get(name, (None, None))
+        return extract_moe_lora_weights_for_grouped_mm(
+            wrapper, weight_A, weight_B, scaling, num_experts,
+            input_dim = input_dim, output_dim = output_dim, model_name = "DeepSeek-V4.1 MoE",
+            enable_logging = UNSLOTH_ENABLE_LOGGING, logger_obj = logger,
+        )
+
+    backend_forward = get_forward_moe_backend()
+
+    def forward(
+        self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
+    ) -> torch.Tensor:
+        if "gate_up_blocks" in self._parameters:
+            self.finalize_packed()
+        return backend_forward(self, hidden_states, top_k_index, top_k_weights)
+
+    flags = ("_unsloth_lora_extractor_fn", "_unsloth_own_apply_gate", "_unsloth_moe_fp32_reference")
+    experts_cls._unsloth_lora_extractor_fn = staticmethod(_dsv41_lora_extractor)
+    experts_cls._unsloth_own_apply_gate = True
+    experts_cls._unsloth_moe_fp32_reference = True
+    if not patch_function(experts_cls, "forward", forward):
+        for name in flags:
+            if name in vars(experts_cls):
+                delattr(experts_cls, name)
+        return
+    experts_cls._unsloth_already_patched = True
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info("Unsloth: DeepSeek-V4.1 native experts on Unsloth's MoE backend.")
+pass
+
+TEMPORARY_PATCHES.append(patch_deepseek_v41_moe)
 
 
 # 4. `num_experts`: the text config names its routed experts `n_routed_experts` (aliased only as `num_local_experts`),
@@ -305,7 +397,9 @@ def patch_deepseek_v41_config_aliases():
     try:
         from transformers.models.deepseek_v41.configuration_deepseek_v41 import DeepseekV41TextConfig
     except Exception:
-        return
+        DeepseekV41TextConfig = getattr(modeling, "DeepseekV41TextConfig", None)
+        if DeepseekV41TextConfig is None:
+            return
     attribute_map = dict(getattr(DeepseekV41TextConfig, "attribute_map", {}) or {})
     if "num_experts" in attribute_map or "num_experts" in getattr(DeepseekV41TextConfig, "__dataclass_fields__", {}):
         return
@@ -462,7 +556,8 @@ def _frozen_engram(modeling, key, emb):
         emb.num_embeddings, emb.embedding_dim, dtype=emb.weight.dtype,
         table_name=f"deepseek_v41 engram layer {key}", row_shape=(emb.embedding_dim,),
     )
-    table.checkpoint_prefixes = (f"layers.{key}.engram.embed", f"model.engram_tables.{key}", f"engram_tables.{key}")
+    table.checkpoint_prefixes = (f"layers.{key}.engram.embed", f"model.layers.{key}.engram.embed",
+                                 f"model.engram_tables.{key}", f"engram_tables.{key}")
     table.checkpoint_planes = {"weight": (r"weight",), "scale": (r"scale", r"weight_scale_inv")}
     table.optional_planes = ("scale",)
     table.export_suffixes = {"weight": "weight", "scale": "weight_scale_inv"}
@@ -485,6 +580,23 @@ def _frozen_engram(modeling, key, emb):
 
     table.after_bind = after_bind
     return table
+
+
+def make_deepseek_v41_engram_table(layer_key, num_embeddings, head_dim, block_size = 32, dtype = None):
+    """Parameter-free engram table for the native DeepSeek-V4.1, so sharding, meta init, optimizers and DCP never see
+    it. The frozen table load hook binds it to the checkpoint after ``from_pretrained``."""
+    import types
+    from unsloth_zoo.frozen_table_store import install_frozen_table_load_hook
+    if not install_frozen_table_load_hook():
+        raise RuntimeError(
+            "Unsloth: could not install the frozen table load hook, so the DeepSeek-V4.1 engram tables cannot be "
+            "bound to the checkpoint. Set UNSLOTH_DSV41_FROZEN_ENGRAM=0 to load them as normal embeddings."
+        )
+    stand_in = types.SimpleNamespace(
+        num_embeddings = int(num_embeddings), embedding_dim = int(head_dim), block_size = int(block_size),
+        weight = types.SimpleNamespace(dtype = dtype if dtype is not None else torch.get_default_dtype()),
+    )
+    return _frozen_engram(None, str(layer_key), stand_in)
 
 
 def patch_deepseek_v41_engram_table():

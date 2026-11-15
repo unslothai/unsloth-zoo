@@ -85,9 +85,10 @@ def test_every_sinkhorn_mixer_has_the_eager_fallback():
 
 def test_registered_rewrites_share_one_source_and_fallback():
     for model_type, entries in MODULE_FORWARD_SOURCE_REWRITES.items():
-        for name, (old, _new, _mode) in entries.items():
-            if old is MHC_SINKHORN_SOURCE:
-                assert name in DISABLE_COMPILE_MODULES, (model_type, name)
+        for name, entry in entries.items():
+            for old, _new, _mode in entry if isinstance(entry, list) else [entry]:
+                if old is MHC_SINKHORN_SOURCE:
+                    assert name in DISABLE_COMPILE_MODULES, (model_type, name)
     assert "Glm5NextTextHyperConnection" in MODULE_FORWARD_SOURCE_REWRITES["glm5_next"]
     assert (
         MODULE_FORWARD_SOURCE_REWRITES["glm5_next"]["Glm5NextTextHyperConnection"]
