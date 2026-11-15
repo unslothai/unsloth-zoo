@@ -265,6 +265,22 @@ def test_gather_compiles_one_variant_set_per_width_bucket(form):
     assert grown[1:] == [0, 0], grown
 
 
+def test_gather_width_bucketing_does_not_recompile_under_dynamic(monkeypatch):
+    # The bucket pad is eager-only: traced with dynamic=True it guarded on each exact width (one graph per length).
+    monkeypatch.setattr(sa, "_gather_fn", lambda: lambda q, lkv, skv, idx, sink, **kw: q * idx.shape[-1])
+    torch._dynamo.reset()
+    from torch._dynamo.utils import counters
+    counters.clear()
+    fn = torch.compile(lambda q, kv, idx: sa._gather_call(q, None, kv, idx, None, 0.1, 0), backend = "eager",
+                       fullgraph = True, dynamic = True)
+    for width in (40, 50, 61):
+        q, kv = torch.randn(1, 8, 16, 16), torch.randn(1, 8, 16)
+        assert torch.equal(fn(q, kv, torch.zeros(1, 8, width, dtype = torch.int32)), q * width)
+    assert counters["stats"]["unique_graphs"] == 1, dict(counters["stats"])
+    eager = sa._gather_call(q, None, kv, torch.zeros(1, 8, 40, dtype = torch.int32), None, 0.1, 0)
+    assert torch.equal(eager, q * 64)   # eager calls still pad to the bucket
+
+
 def test_torch_path_compiles_once_across_lengths():
     # The torch path is what T4 (no tensor-core Triton), CPU and ROCm run under torch.compile. Its query-chunk loop
     # ran over the length, so dynamic=True still specialised on it and recompiled for every new length.
