@@ -513,7 +513,6 @@ class FastCPUModel:
         # "all-linear" and None into their real Linears, exactly as the GPU get_peft_model does.
         remap = getattr(model, "unsloth_lora_target_modules", None)
         remapped_targets = False
-        # As on GPU, only when the language layers are finetuned at all.
         if callable(remap) and kwargs.get("finetune_language_layers", True):
             embeddings = []
             if target_modules is not None and not isinstance(target_modules, str):

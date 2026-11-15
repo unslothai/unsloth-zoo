@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Unsloth's native DeepSeek-V4.1 experts on Unsloth's MoE backend: the same numbers as the native sorted loop (fp32
-SwiGLU, fp32 routed-output sum), packed MXFP4 expert stacks included, and raw packed blocks finalized at dispatch."""
+"""Native DeepSeek-V4.1 experts on Unsloth's MoE backend match the native sorted loop, MXFP4 stacks included."""
 
 import os
 import sys

@@ -209,7 +209,6 @@ def test_generated_cache_keeps_helpers_eager(impl, tmp_path):
         assert rope_split, out
         assert (out.pop("apply_rotary_pos_emb") or "").startswith("torch_compile_with_fallback("), out
     else:
-        # The compiler found the native module (it used to return quietly) and applied the mHC rewrite.
         assert location == NATIVE_ALIAS + ".modeling", location
         assert mhc, out
     assert any(v is not None for v in out.values()), out

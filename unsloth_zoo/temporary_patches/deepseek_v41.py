@@ -328,11 +328,8 @@ pass
 TEMPORARY_PATCHES.append(patch_deepseek_v41_grouped_lora)
 
 
-# 3b. Routed experts of Unsloth's native module through Unsloth's MoE backend (grouped_mm / Triton / bnb 4-bit /
-#     split LoRA), the same dispatcher the transformers MoE models use. The native experts keep transformers' layout
-#     (gate_up_proj [E, 2I, H], down_proj [E, H, I]) and carry the reference's asymmetric SwiGLU clamps in
-#     `_apply_gate`, which the backend calls for `_unsloth_own_apply_gate` modules. Routers stay frozen (their
-#     correction bias is not a Parameter that trains; the gate weight gets no LoRA by default).
+# 3b. Native routed experts through Unsloth's MoE backend. They keep transformers' layout and carry the reference's
+#     asymmetric SwiGLU clamps in `_apply_gate`, which the backend calls for `_unsloth_own_apply_gate` modules.
 def patch_deepseek_v41_moe():
     modeling = _native_modeling()
     if modeling is None:
@@ -594,10 +591,8 @@ def _frozen_engram(modeling, key, emb):
 
 
 def make_deepseek_v41_engram_table(layer_key, num_embeddings, head_dim, block_size = 32, dtype = None):
-    """A parameter-free engram table for Unsloth's native DeepSeek-V4.1 (unsloth/models/deepseek_v41): an
-    UnslothFrozenTableEmbedding holding no Parameter or buffer, so FSDP2 / TP / PP sharding, ``to_empty``, meta-device
-    init, optimizers and DCP never see it. The frozen table load hook binds it to the checkpoint after
-    ``from_pretrained`` in every UNSLOTH_FROZEN_TABLE mode (gpu materializes the rows on the device)."""
+    """Parameter-free engram table for the native DeepSeek-V4.1, so sharding, meta init, optimizers and DCP never see
+    it. The frozen table load hook binds it to the checkpoint after ``from_pretrained``."""
     import types
     from unsloth_zoo.frozen_table_store import install_frozen_table_load_hook
     if not install_frozen_table_load_hook():

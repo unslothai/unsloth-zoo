@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The DeepSeek-V4.1 implementations the zoo patches serve, for the tests: the community transformers port
-(transformers.models.deepseek_v41) and Unsloth's native module (unsloth/models/deepseek_v41), loaded from the
-unsloth on the path WITHOUT importing the unsloth package (no GPU init, no global patches)."""
+"""DeepSeek-V4.1 implementations for the tests: the transformers port and Unsloth's native module, loaded
+without importing the unsloth package (no GPU init, no global patches)."""
 
 import importlib
 import importlib.util
@@ -44,8 +43,7 @@ def port():
 
 
 def native():
-    """Unsloth's native deepseek_v41, or None (no unsloth on the path, or an unsloth without it). Only used when
-    transformers has no deepseek_v41 of its own: that is when Unsloth registers its native classes."""
+    """Unsloth's native deepseek_v41, or None. Only used when transformers has no deepseek_v41 of its own."""
     if port() is not None:
         return None
     package = sys.modules.get("unsloth.models.deepseek_v41") or sys.modules.get(NATIVE_ALIAS)

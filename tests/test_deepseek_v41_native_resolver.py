@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""With no transformers.models.deepseek_v41, the DeepSeek-V4.1 patches resolve Unsloth's native implementation
-(unsloth/models/deepseek_v41/modeling.py) from sys.modules, and never import unsloth themselves."""
+"""Without transformers.models.deepseek_v41 the patches resolve the native module from sys.modules."""
 
 import sys
 import types
@@ -120,7 +119,6 @@ def test_resolver_rebinds_a_reimported_native_root(monkeypatch):
     monkeypatch.delitem(compiler.__dict__, "fakenativepkg", raising = False)
     assert compiler.resolve_modeling_module("fake_dsv")[1] is modeling
     assert compiler.__dict__["fakenativepkg"] is root
-    # The package is imported again: new root, new module objects.
     root2, modeling2 = _fake_native(monkeypatch)
     assert compiler.resolve_modeling_module("fake_dsv")[1] is modeling2
     assert compiler.__dict__["fakenativepkg"] is root2
