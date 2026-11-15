@@ -255,9 +255,13 @@ def _real_gdn_modeling(monkeypatch, name = "transformers.models.qwen3_5.modeling
         if fn is None:
             continue
         if gcc._is_marked(fn):
-            # Patched at import on a CUDA host: rebuild the unpatched hub function.
-            dispatch = inspect.unwrap(fn, stop = lambda f: getattr(f, gcc._MARK, False))
-            fn = decorator(attr, "causal_conv1d")(dispatch.__wrapped__)
+            # Patched at import on a CUDA host, possibly more than once (earlier tests re-patch a module they never
+            # restore): rebuild the hub function from the first layer that carries no patch. functools.wraps copies
+            # the mark, so rebuilding from a still-patched layer would stay marked.
+            base = fn
+            while gcc._is_marked(base) and getattr(base, "__wrapped__", None) is not None:
+                base = base.__wrapped__
+            fn = decorator(attr, "causal_conv1d")(base)
         monkeypatch.setattr(modeling, attr, fn)
     monkeypatch.setattr(modeling, "use_kernel_func_from_hub_with_fallback", decorator)
     return modeling
