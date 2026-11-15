@@ -152,9 +152,7 @@ def _has_fp8_dequantize_conversion(model):
 
 
 def _drop_fp8_dequantize_conversions(model):
-    """Drop reverse FP8 conversions that would save unmarked FP8 weights as a 16-bit checkpoint.
-    Mirrors unsloth.models.loader_utils._drop_fp8_dequantize_conversions, which the CPU route cannot import:
-    unsloth.models loads the GPU kernels and needs Triton, absent from CPU-only installs."""
+    """Mirror of unsloth.models.loader_utils._drop_fp8_dequantize_conversions (unimportable without Triton)."""
     conversions = getattr(model, "_weight_conversions", None)
     if not conversions:
         return 0
@@ -242,9 +240,7 @@ def _drop_fp8_dequantize_conversions(model):
 
 
 def _drop_reverse_fp8_conversions(model):
-    """A checkpoint transformers dequantized from FP8 on load (no FP8 kernels on CPU) keeps Fp8Dequantize
-    conversions, which a merged save reverses into FP8 bytes without FP8 metadata. Drop them here, without
-    importing unsloth.models (the GPU model stack)."""
+    """Drop kept Fp8Dequantize conversions, which a merged save reverses into FP8 bytes without FP8 metadata."""
     if not _has_fp8_dequantize_conversion(model):
         return 0
     try:

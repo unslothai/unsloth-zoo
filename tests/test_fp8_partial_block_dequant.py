@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""FP8 weights whose last block is partial dequantize with the configured block size (transformers#50603).
-
-The CPU loader dequantizes FP8 checkpoints on load; a 200x200 weight in 128x128 blocks was read as 100x100 blocks."""
+"""FP8 weights with a partial last block dequantize with the configured block size (transformers#50603)."""
 
 import types
 

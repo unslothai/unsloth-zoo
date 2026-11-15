@@ -13,13 +13,10 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Dequantize FP8 weights whose last block along a dimension is partial (e.g. 200 columns in 128-wide blocks).
+"""Fix FP8 dequant of weights with a partial edge block (huggingface/transformers#50603).
 
-transformers' `Fp8Dequantize._dequantize_one` derives the block size from the scale grid (`rows // scale_rows`), so a
-200x200 weight with a 2x2 grid of 128x128 blocks is read as 100x100 blocks and loads wrong values silently
-(huggingface/transformers#50603). When the configured `weight_block_size` explains the grid with a partial edge block,
-expand each scale over its block and truncate the edges instead. Every other case keeps the stock path.
-Device-independent and self-contained: the CPU backend loads this file alone (`cpu.runtime.apply_cpu_security_patches`).
+Stock `_dequantize_one` derives the block from the scale grid, so 200x200 in 128x128 blocks reads as 100x100 blocks.
+Self-contained: the CPU backend loads this file alone.
 """
 import math
 

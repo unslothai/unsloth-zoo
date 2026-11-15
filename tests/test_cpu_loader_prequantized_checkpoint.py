@@ -134,8 +134,7 @@ def _with_conversions(*operations):
 
 
 def _block_unsloth_models(monkeypatch):
-    # unsloth.models loads the GPU kernels and needs Triton, which CPU-only installs lack. Records the attempt:
-    # a loader that swallows the ImportError would otherwise pass silently.
+    # Records the attempt: a loader that swallows the ImportError would otherwise pass silently.
     import sys
 
     attempted = []
@@ -154,8 +153,6 @@ def _block_unsloth_models(monkeypatch):
 
 
 def test_reverse_fp8_conversions_are_dropped_without_the_gpu_model_stack(monkeypatch):
-    # A merged save reverses a kept Fp8Dequantize into FP8 bytes with no FP8 metadata: the cleanup must not
-    # depend on importing unsloth.models.
     from unsloth_zoo.cpu import loader
 
     attempted = _block_unsloth_models(monkeypatch)
