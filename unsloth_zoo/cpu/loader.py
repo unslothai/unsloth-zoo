@@ -96,13 +96,11 @@ def _checkpoint_dtype(model_name, **kwargs):
     return None
 
 
-# Where composite configs keep the language model's config (and so its quantization_config).
 _SUB_CONFIG_KEYS = ("text_config", "language_config", "llm_config", "decoder", "generator")
 
 
 def _quant_method_of(config):
-    """quant_method of the quantization_config in ``config`` (a dict or a PretrainedConfig), at its root or in a
-    language-model sub-config, else None."""
+    """quant_method of ``config``'s quantization_config (root or language-model sub-config), else None."""
     def field(holder, name):
         return holder.get(name) if isinstance(holder, dict) else getattr(holder, name, None)
 
@@ -121,8 +119,7 @@ def _quant_method_of(config):
 
 
 def _checkpoint_quant_method(model_name, config = None, **kwargs):
-    """quant_method of a quantization_config the checkpoint ships, else None. An explicit ``config`` is what the
-    model load uses, so it decides; ``kwargs`` carry the hub arguments (``subfolder`` included)."""
+    """quant_method the checkpoint ships, else None; an explicit ``config`` decides, as in the model load."""
     if config is not None and not isinstance(config, (str, os.PathLike)):
         return _quant_method_of(config)
     try:
@@ -135,9 +132,7 @@ def _checkpoint_quant_method(model_name, config = None, **kwargs):
 
 
 def _drop_reverse_fp8_conversions(model):
-    """A checkpoint transformers dequantized from FP8 on load (no FP8 kernels on CPU) keeps Fp8Dequantize
-    conversions, which a merged save reverses into FP8 bytes without FP8 metadata. The GPU loaders drop them;
-    so does this one when Unsloth provides the helper."""
+    """Drop Fp8Dequantize conversions, which a merged save would reverse into FP8 bytes without metadata."""
     try:
         from unsloth.models.loader_utils import _drop_fp8_dequantize_conversions
     except Exception:
@@ -320,11 +315,10 @@ class FastCPUModel:
             # A subfolder locates the adapter inside its repo, not the base model.
             kwargs.pop("subfolder", None)
             _print(f"{adapter_name} is a LoRA adapter; loading its base {model_name} first.")
-        # The config the model load reads: an explicit config= decides, else the checkpoint's (in its subfolder).
+        # An explicit config= decides, else the checkpoint's (in its subfolder).
         probe_kwargs = dict(hub_kwargs, **({"subfolder": kwargs["subfolder"]} if kwargs.get("subfolder") else {}))
         if use_4bit:
-            # A checkpoint quantized with another method (fp8, compressed-tensors, mxfp4) keeps its own config, as
-            # on GPU: transformers refuses a BitsAndBytesConfig on top of it.
+            # Another quantization method keeps its config: transformers refuses BitsAndBytesConfig on top.
             quant_method = _checkpoint_quant_method(
                 model_name, config = kwargs.get("config"), token = token, revision = revision, **probe_kwargs,
             )

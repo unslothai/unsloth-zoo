@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU loader: a checkpoint quantized with another method (fp8, compressed-tensors) keeps its own config.
-
-load_in_4bit = True is the default; passing a BitsAndBytesConfig on top of an FP8 release made transformers raise
-"The model is quantized with FineGrainedFP8Config but you are passing a BitsAndBytesConfig". The decision reads the
-config the model load itself uses: an explicit config=, the subfolder, and composite configs' language model."""
+"""CPU loader: an fp8 / compressed-tensors checkpoint keeps its own config, not BitsAndBytesConfig."""
 
 import json
 import os
@@ -28,7 +24,6 @@ import pytest
 FP8 = {"quant_method": "fp8", "weight_block_size": [32, 32], "scale_fmt": "ue8m0", "expert_dtype": "fp4"}
 NVFP4 = {"quant_method": "compressed-tensors", "format": "nvfp4-pack-quantized"}
 
-# A tiny, local Qwen3 config: no hub access needed.
 _CONFIG = {
     "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3", "vocab_size": 128, "hidden_size": 16,
     "intermediate_size": 32, "num_hidden_layers": 1, "num_attention_heads": 2, "num_key_value_heads": 1,
@@ -58,7 +53,6 @@ def _load_kwargs(monkeypatch, path, bnb_cpu = True, **load):
     printed = []
 
     def capture(name, *args, **kwargs):
-        # Keyword names and the quantization config type only: the loader also forwards the hub token.
         seen.update({k: type(v).__name__ for k, v in kwargs.items()})
         raise _Captured
 
@@ -84,8 +78,7 @@ def test_a_plain_checkpoint_still_loads_in_4bit(tmp_path, monkeypatch):
 
 
 def test_the_subfolder_the_load_reads_decides(tmp_path, monkeypatch):
-    # An FP8 root with a plain checkpoint in the subfolder still loads the subfolder in 4-bit, and the inverse
-    # layout keeps the subfolder's own FP8 config.
+    # The subfolder's config decides in both directions.
     root = _write(tmp_path / "a", FP8)
     _write(tmp_path / "a" / "child")
     seen, _ = _load_kwargs(monkeypatch, root, subfolder = "child")
@@ -131,6 +124,5 @@ def test_reverse_fp8_conversions_are_dropped_after_load(monkeypatch):
     monkeypatch.setitem(sys.modules, "unsloth.models.loader_utils", fake)
     model = object()
     assert loader._drop_reverse_fp8_conversions(model) == 3 and calls == [model]
-    # Without Unsloth (or with a helper that fails) the load carries on.
     fake._drop_fp8_dequantize_conversions = lambda model: 1 / 0
     assert loader._drop_reverse_fp8_conversions(model) == 0
