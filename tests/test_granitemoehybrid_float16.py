@@ -51,7 +51,9 @@ LEGACY_FORWARD = '''
 
 def _stock_forward():
     forward = gm.GraniteMoeHybridDecoderLayer.forward
-    return getattr(forward, "__wrapped__", forward) if getattr(forward, "_unsloth_granite_float16", False) else forward
+    while getattr(forward, "_unsloth_granite_float16", False):  # transformers >= 5.23: under its checkpoint wrapper
+        forward = forward.__wrapped__
+    return forward
 
 
 def test_rewrite_matches_installed_and_legacy_source():
@@ -145,3 +147,26 @@ def test_float16_forward_helper_is_a_module_global():
     folded = patch._build_float16_decoder_forward(gm, _stock_forward())
     owner = sys.modules[folded.__globals__["__name__"]]
     assert getattr(owner, "_granite_scaled_shared_mlp", None) is patch._granite_scaled_shared_mlp
+
+
+def test_patch_keeps_transformers_layer_checkpointing(monkeypatch):
+    # transformers >= 5.23 checkpoints in a wrapper on the class forward, only while it is type(self).forward.
+    # Wrapping that wrapper hid it: granitehybrid trained without gradient checkpointing (1087 MiB kept vs 0.86).
+    stock = gm.GraniteMoeHybridDecoderLayer.__dict__["forward"]
+    while getattr(stock, "_unsloth_granite_float16", False) or getattr(getattr(stock, "__code__", None), "co_name", "") == "forward_with_checkpointing":
+        stock = stock.__wrapped__
+    monkeypatch.setattr(gm.GraniteMoeHybridDecoderLayer, "forward", stock)
+    from transformers.modeling_layers import GradientCheckpointingLayer
+    if "__init_subclass__" not in GradientCheckpointingLayer.__dict__:
+        pytest.skip("this transformers checkpoints in __call__")
+    GradientCheckpointingLayer.__init_subclass__.__func__(gm.GraniteMoeHybridDecoderLayer)
+    patch.patch_GraniteMoeHybridDecoderLayer_float16()
+    forward = gm.GraniteMoeHybridDecoderLayer.forward
+    assert forward.__code__.co_name == "forward_with_checkpointing" and forward._unsloth_granite_float16
+    model = _tiny_model(0, torch.float32).train()
+    calls = []
+    for layer in model.model.layers:
+        layer.gradient_checkpointing = True
+        layer._gradient_checkpointing_func = lambda fn, *args: (calls.append(1), fn(*args))[1]
+    model(torch.randint(0, 64, (1, 5)), use_cache = False).logits.sum().backward()
+    assert len(calls) == len(model.model.layers)
