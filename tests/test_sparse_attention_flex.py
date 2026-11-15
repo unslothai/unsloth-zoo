@@ -432,17 +432,46 @@ def test_tiny_model_cached_decode_after_flex_prefill(monkeypatch, family):
     assert _rel(got, ref) < 5e-2, _rel(got, ref)
 
 
-@needs_models
-@pytest.mark.parametrize("family", ["deepseek_v32", "glm_moe_dsa", "minimax_m3_vl"])
-@pytest.mark.parametrize("order", ["skip_first", "flex_first"])
-def test_skip_and_flex_compose(order, family):
-    """Both patch sets in either order: exact skip within the budget, chunked / flex above it."""
+_COMPOSE_ORDERS = ("skip_first", "flex_first")
+
+
+@pytest.fixture(scope = "module", autouse = True)
+def _compose_workers(request):
+    """One fresh interpreter per install order (all families each, see the worker), started when this module starts
+    so their cold imports overlap the other tests; only when a compose test is selected."""
+    wanted = any(getattr(item, "originalname", "") == "test_skip_and_flex_compose" for item in request.session.items)
+    if not wanted or needs_models.args[0]:
+        yield None
+        return
     import subprocess
     import sys
     worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_sparse_compose_worker.py")
     env = {k: v for k, v in os.environ.items() if not k.startswith("UNSLOTH_SPARSE_")}
-    proc = subprocess.run([sys.executable, worker, order, family], capture_output = True, text = True, env = env, timeout = 600)
-    assert "COMPOSE_OK" in proc.stdout, proc.stdout[-3000:] + proc.stderr[-3000:]
+    env["HF_HUB_OFFLINE"] = "1"  # tiny random models: nothing to download
+    procs = {order: subprocess.Popen([sys.executable, worker, order], stdout = subprocess.PIPE, stderr = subprocess.PIPE,
+                                     text = True, env = env) for order in _COMPOSE_ORDERS}
+    results = {}
+
+    def result(order):
+        if order not in results:
+            results[order] = procs[order].communicate(timeout = 900)
+        return results[order]
+
+    yield result
+    for proc in procs.values():
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
+
+@needs_models
+@pytest.mark.parametrize("family", ["deepseek_v32", "glm_moe_dsa", "minimax_m3_vl"])
+@pytest.mark.parametrize("order", list(_COMPOSE_ORDERS))
+def test_skip_and_flex_compose(order, family, _compose_workers):
+    """Both patch sets in either order: exact skip within the budget, chunked / flex above it."""
+    stdout, stderr = _compose_workers(order)
+    assert any(line.startswith(f"COMPOSE_OK {order} {family} ") for line in stdout.splitlines()), (
+        stdout[-3000:] + stderr[-3000:])
 
 
 @needs_models
@@ -641,8 +670,8 @@ def test_flex_runs_outside_unsloth_block_compile(monkeypatch, family):
 )
 @pytest.mark.parametrize("family", ["minimax_m3_vl", "deepseek_v32"])
 def test_attention_inside_torch_compile_matches_eager(monkeypatch, family):
-    """Attention under an enclosing fullgraph dynamic torch.compile: BlockMask build plus flex call miscompiled (MiniMax
-    95% off, silently); compiled flex must match compiled upstream, eager stays close."""
+    """Attention under an enclosing fullgraph torch.compile, dynamic in the sequence length: BlockMask build plus flex
+    call miscompiled (MiniMax 95% off, silently); compiled flex must match compiled upstream, eager stays close."""
     import torch._dynamo
     _patched()
     torch.manual_seed(0)
@@ -669,12 +698,19 @@ def test_attention_inside_torch_compile_matches_eager(monkeypatch, family):
         attn.zero_grad(set_to_none = True)
         xx = x.detach().clone().requires_grad_()
 
-        def fn(t):
-            return attn(t, rope, mask, position_ids = pos)[0]
+        def fn(t, cos, sin, mask, pos):
+            return attn(t, (cos, sin), mask, position_ids = pos)[0]
 
+        args = (xx, *rope, mask, pos)
         if compiled:
-            fn = torch.compile(fn, fullgraph = True, dynamic = True)
-        out = fn(xx)
+            # Dynamic in the sequence length only, as a training compile sees it: every input's sequence dims are
+            # symbolic (dynamic = True would also make the hidden / head dims symbolic, 2-3x the trace time).
+            fn = torch.compile(fn, fullgraph = True)
+            args = tuple(t.detach() if t is not xx else t for t in args)
+            for t, dims in zip(args, ((1,), (1,), (1,), (2, 3), (1,))):
+                for dim in dims:
+                    torch._dynamo.mark_dynamic(t, dim)
+        out = fn(*args)
         out.float().square().mean().backward()
         return out.detach().float(), xx.grad.float()
 
