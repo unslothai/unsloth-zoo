@@ -478,6 +478,8 @@ def _interpreter_run():
 
 def _interpreter_worst(proc, tag):
     line = next((ln for ln in proc.stdout.splitlines() if ln.startswith(tag + " ")), None)
+    if line is None and "No module named 'triton'" in proc.stderr:
+        pytest.skip("Triton is not installed (Windows CPU runners)")
     assert line is not None, proc.stderr[-3000:]
     assert float(line.split()[1]) < 1e-5, line
 
