@@ -23,29 +23,46 @@ import types
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
-def _fp4_experts(E = 4, hidden = 128, inter = 64, seed = 0):
+def _fp4_experts(E=4, hidden=128, inter=64, seed=0):
     fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
-    if "expert_dtype" not in fp8.FP8Experts.__init__.__code__.co_varnames or not hasattr(torch, "float8_e8m0fnu"):
+    experts = getattr(fp8, "FP8Experts", None)
+    if (
+        experts is None
+        or "expert_dtype" not in experts.__init__.__code__.co_varnames
+        or not hasattr(torch, "float8_e8m0fnu")
+    ):
         pytest.skip("this transformers' FP8Experts has no FP4 experts")
     config = types.SimpleNamespace(
-        hidden_size = hidden, num_experts = E, moe_intermediate_size = inter, hidden_act = "silu", swiglu_limit = 10.0,
+        hidden_size=hidden,
+        num_experts=E,
+        moe_intermediate_size=inter,
+        hidden_act="silu",
+        swiglu_limit=10.0,
     )
-    module = fp8.FP8Experts(config, scale_fmt = "ue8m0", expert_dtype = "fp4").cuda()
-    g = torch.Generator(device = "cuda").manual_seed(seed)
+    module = fp8.FP8Experts(config, scale_fmt="ue8m0", expert_dtype="fp4").cuda()
+    g = torch.Generator(device="cuda").manual_seed(seed)
     with torch.no_grad():
         for name in ("gate_up_proj", "down_proj"):
             w, s = getattr(module, name), getattr(module, f"{name}_scale_inv")
-            w.copy_(torch.randint(-128, 128, w.shape, dtype = torch.int8, device = "cuda", generator = g))
-            codes = torch.randint(120, 128, s.shape, dtype = torch.uint8, device = "cuda", generator = g)
+            w.copy_(
+                torch.randint(
+                    -128, 128, w.shape, dtype=torch.int8, device="cuda", generator=g
+                )
+            )
+            codes = torch.randint(
+                120, 128, s.shape, dtype=torch.uint8, device="cuda", generator=g
+            )
             s.data = codes.view(torch.float8_e8m0fnu)
     return module
 
 
 @pytest.mark.parametrize("tokens", [16, 400])
-def test_fp4_experts_take_the_mxfp4_grouped_gemm_with_the_dequantized_result(monkeypatch, tokens):
+def test_fp4_experts_take_the_mxfp4_grouped_gemm_with_the_dequantized_result(
+    monkeypatch, tokens
+):
     import unsloth_zoo.mxfp4_gemm as mxfp4_gemm
     from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm_available
     from unsloth_zoo.temporary_patches import moe_utils_fp8
@@ -56,12 +73,16 @@ def test_fp4_experts_take_the_mxfp4_grouped_gemm_with_the_dequantized_result(mon
     monkeypatch.setenv("UNSLOTH_MXFP4_FUSED_GEMM", "1")
     calls = []
     fused = mxfp4_gemm.mxfp4_expert_grouped_mm
-    monkeypatch.setattr(mxfp4_gemm, "mxfp4_expert_grouped_mm", lambda *a, **k: calls.append(1) or fused(*a, **k))
+    monkeypatch.setattr(
+        mxfp4_gemm,
+        "mxfp4_expert_grouped_mm",
+        lambda *a, **k: calls.append(1) or fused(*a, **k),
+    )
     module = _fp4_experts()
-    g = torch.Generator(device = "cuda").manual_seed(1)
-    x = torch.randn(tokens, 128, device = "cuda", dtype = torch.bfloat16, generator = g)
-    index = torch.randint(0, 4, (tokens, 2), device = "cuda", generator = g)
-    weights = torch.rand(tokens, 2, device = "cuda", generator = g)
+    g = torch.Generator(device="cuda").manual_seed(1)
+    x = torch.randn(tokens, 128, device="cuda", dtype=torch.bfloat16, generator=g)
+    index = torch.randint(0, 4, (tokens, 2), device="cuda", generator=g)
+    weights = torch.rand(tokens, 2, device="cuda", generator=g)
 
     def run(route):
         monkeypatch.setenv("UNSLOTH_FP8_EXPERTS_MXFP4", route)
@@ -73,6 +94,12 @@ def test_fp4_experts_take_the_mxfp4_grouped_gemm_with_the_dequantized_result(mon
     want_out, want_dx = run("0")  # every pass dequantizes both stacks
     assert calls == []
     got_out, got_dx = run("1")
-    assert len(calls) >= 2  # gate_up and down, forward (backward reuses the kernel for dX)
-    torch.testing.assert_close(got_out, want_out, rtol = 2e-2, atol = 2e-2 * want_out.abs().max().item())
-    torch.testing.assert_close(got_dx, want_dx, rtol = 2e-2, atol = 2e-2 * want_dx.abs().max().item())
+    assert (
+        len(calls) >= 2
+    )  # gate_up and down, forward (backward reuses the kernel for dX)
+    torch.testing.assert_close(
+        got_out, want_out, rtol=2e-2, atol=2e-2 * want_out.abs().max().item()
+    )
+    torch.testing.assert_close(
+        got_dx, want_dx, rtol=2e-2, atol=2e-2 * want_dx.abs().max().item()
+    )
