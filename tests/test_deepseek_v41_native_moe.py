@@ -80,8 +80,6 @@ def reference_forward():
 
     cls = IMPL.modeling._DeepseekV41Experts
     source_forward = None
-    # The class forward, or (once the MoE patch replaced it) the original it stored; either may be transformers'
-    # use_experts_implementation dispatcher, whose __wrapped__ is the native forward.
     for fn in (cls.__dict__.get("forward"), getattr(cls, _get_unique_storage_name(cls, "forward"), None)):
         while fn is not None and source_forward is None:
             try:
@@ -119,8 +117,6 @@ def test_native_loop_backend_matches_the_native_forward(reference_forward, patch
     hidden, index, weights = _routing(dtype = dtype)
     want = reference_forward(experts, hidden, index, weights)
     got = forward_native_moe_loop(experts, hidden, index, weights)
-    # fp32 SwiGLU (one rounding) and an fp32 sum of the top_k slots, rounded once: the same numbers. With top_k 2 the
-    # two-term sum does not depend on the order the slots are added in.
     assert got.dtype == want.dtype == dtype
     assert torch.equal(got, want), (got.float() - want.float()).abs().max()
 
@@ -130,8 +126,6 @@ def test_native_loop_backend_matches_the_native_forward(reference_forward, patch
     [(torch.float32, torch.bfloat16), (torch.float32, torch.float16), (torch.bfloat16, torch.float32)],
 )
 def test_native_loop_backend_casts_dense_experts_like_the_native_forward(reference_forward, patched, weight_dtype, dtype):
-    # The native forward casts each dense expert slice to the activation dtype (_expert_weight); outside autocast the
-    # backend loop must too, or F.linear raises on the dtype mix.
     from unsloth_zoo.temporary_patches.moe_utils import forward_native_moe_loop
 
     experts = _dense_experts(weight_dtype)
@@ -143,8 +137,6 @@ def test_native_loop_backend_casts_dense_experts_like_the_native_forward(referen
 
 
 def test_native_loop_backend_keeps_a_cancelling_residual(patched):
-    # Two slots that cancel up to a small residual: summed in fp32 the residual survives the final rounding; rounded
-    # to bf16 per slot first it was lost.
     from unsloth_zoo.temporary_patches.moe_utils import forward_native_moe_loop
 
     experts = _dense_experts(torch.bfloat16)
@@ -155,7 +147,6 @@ def test_native_loop_backend_keeps_a_cancelling_residual(patched):
         experts.gate_up_proj[1].copy_(experts.gate_up_proj[0])
         experts.down_proj[1].copy_(experts.down_proj[0])
     got = forward_native_moe_loop(experts, hidden, index, weights).float()
-    # Exactly the second slot's residual 2^-12 * y0 (y0 the shared expert output, in bf16 as the reference keeps it).
     y0 = experts._apply_gate(torch.nn.functional.linear(hidden, experts.gate_up_proj[0]).float()).to(torch.bfloat16)
     y0 = torch.nn.functional.linear(y0, experts.down_proj[0]).float()
     want = (y0 + y0 * (-1.0 + 2 ** -12)).to(torch.bfloat16).float()
@@ -214,7 +205,6 @@ def test_triton_backend_matches_the_native_forward(reference_forward, patched, p
 
 
 def test_cpu_standalone_load_keeps_the_native_loop(monkeypatch):
-    # The CPU runtime loads deepseek_v41.py on its own (package unsloth_zoo.cpu); the MoE patch must stay out there.
     import importlib.util
 
     import unsloth_zoo.temporary_patches.deepseek_v41 as patches

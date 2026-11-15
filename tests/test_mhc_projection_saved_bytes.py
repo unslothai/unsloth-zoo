@@ -149,8 +149,6 @@ def test_helper_plain_paths_match():
 
 @pytest.mark.parametrize("requires_grad", [False, True])
 def test_native_rsqrt_projection_stays_fp32_under_fp16_autocast(requires_grad):
-    # Native DeepSeek-V4.1 mixer (reference fp32, inference/model.py:955): flattened width 256 of entries 300 gives an
-    # unnormalised projection of 76800 (> fp16 max) before the RMS scale; autocast must not run it as an fp16 matmul.
     from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_mhc_projection_rsqrt
 
     x = torch.full((1, 2, 4, 64), 300.0, dtype = torch.bfloat16, requires_grad = requires_grad)

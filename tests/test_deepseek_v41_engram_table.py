@@ -60,7 +60,6 @@ def _config(tok):
     _, compressed = modeling.build_compressed_token_map(tok)
     extra = {}
     if NATIVE:
-        # the native hash addresses the rows its prime layout hands out (no clamp to a configured size)
         primes, offsets = modeling.engram_layout((1, 2), 4, 2, 64)
         extra = dict(engram_num_embeddings=[o[-1] + p[-1][-1] for o, p in zip(offsets, primes)],
                      engram_pad_token_id=8, kv_source_layer_ids=[1, 3], index_source_layer_ids=[1, 2, 3, 4],
@@ -88,7 +87,6 @@ def tiny_dsv41(tmp_path_factory):
     IMPL.register()
     os.environ["UNSLOTH_FROZEN_TABLE"] = "disk"
     try:
-        # the port's tables are swapped by this patch; the native module builds parameter-free tables itself
         assert patch_deepseek_v41_engram_table() or NATIVE
     finally:
         os.environ.pop("UNSLOTH_FROZEN_TABLE", None)
@@ -112,13 +110,9 @@ def tiny_dsv41(tmp_path_factory):
     fp8 = tmp_path_factory.mktemp("dsv41_fp8")
     files = [f for f in os.listdir(bf16) if f.endswith(".safetensors")]
     linears = sorted(n for n, m in model.named_modules() if isinstance(m, torch.nn.Linear))
-    # Table keys as saved: the model's own names, or the released ones (transformers 5 writes a native model back
-    # under them, `model.layers.<i>.engram.embed.{weight,scale}`).
     weights = {t + ".weight": t + ".weight_scale_inv" for t in TABLES}
     weights.update({f"model.layers.{t.rsplit('.', 1)[-1]}.engram.embed.weight":
                      f"model.layers.{t.rsplit('.', 1)[-1]}.engram.embed.scale" for t in TABLES})
-    # transformers without F8_E8M0 in its safetensors reader (4.57) loads the native module's tables with the scales
-    # widened to fp32, as Unsloth's converter writes them.
     e8m0 = True
     if NATIVE:
         import importlib
@@ -233,7 +227,6 @@ def test_disk_engram_matches_the_ports_table(tiny_dsv41, monkeypatch, kind):
     assert grads["model.layers.1.engram.wkv.weight"].abs().sum() > 0
     assert FROZEN_TABLE_STATS["gathers"] >= 2
     if NATIVE:
-        # Native tables never enter a state dict outside the model's own full save, which writes them and reloads.
         assert not [k for k in model.state_dict() if "engram_tables" in k]
         return
     # The export. A bf16 table: zero-copy views under the port's names. An fp8 table on a dequantized load (no GPU
@@ -312,7 +305,6 @@ def test_from_config_and_gpu_mode_keep_the_ports_table(tiny_dsv41, monkeypatch):
     monkeypatch.setenv("UNSLOTH_FROZEN_TABLE", "disk")
     model = modeling.DeepseekV41ForCausalLM(_config(_tokenizer()))
     if NATIVE:
-        # The native module's tables are parameter-free in every mode; gpu mode materializes the rows on the device.
         assert isinstance(model.model.engram_tables["1"], UnslothFrozenTableEmbedding)
         assert not [n for n, _ in model.named_parameters() if "engram_tables" in n]
         ref = _load(tiny_dsv41["bf16"], "gpu", monkeypatch)
@@ -324,7 +316,6 @@ def test_from_config_and_gpu_mode_keep_the_ports_table(tiny_dsv41, monkeypatch):
 
 
 def test_native_engram_constructor_refuses_a_table_it_cannot_bind(monkeypatch):
-    # Without the frozen table load hook the parameter-free table is never bound to the checkpoint: fail at build.
     import unsloth_zoo.frozen_table_store as fts
     from unsloth_zoo.temporary_patches.deepseek_v41 import make_deepseek_v41_engram_table
 

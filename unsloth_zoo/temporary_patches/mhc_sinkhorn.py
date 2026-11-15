@@ -141,7 +141,6 @@ _AUTOCAST_DEVICES = frozenset(
 def _mhc_projection_rsqrt(hidden_streams, fn, eps):
     flat = hidden_streams.flatten(2).float()
     rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim = True) + eps)
-    # fp32 also inside autocast, as the native fp32_linear: the unnormalised projection overflows fp16.
     if flat.device.type not in _AUTOCAST_DEVICES:
         return F.linear(flat, fn.float()) * rsqrt
     with torch.autocast(device_type = flat.device.type, enabled = False):

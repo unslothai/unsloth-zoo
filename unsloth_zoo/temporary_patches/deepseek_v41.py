@@ -132,8 +132,7 @@ def patch_deepseek_v41_gradient_checkpointing():
 
     def __call__(self, *args, **kwargs):
         shared = kwargs.get("shared")
-        # The port passes a dict; Unsloth's native module a DeepseekV41GroupState (not a dict, so FSDP2's input
-        # casting cannot rebuild it), which the replay copies the same way.
+        # The native module passes a DeepseekV41GroupState (not a dict, so FSDP2 cannot rebuild it); replay copies it alike.
         stateful = isinstance(shared, dict) or all(
             callable(getattr(shared, name, None)) for name in ("copy", "clear", "update", "items")
         )
@@ -159,9 +158,7 @@ def patch_deepseek_v41_gradient_checkpointing():
             REPLAY_STATS["runs"] += 1
             replay.clear()
             replay.update(snapshot)
-            # transformers 5.23+ checkpoints `forward` itself (GradientCheckpointingLayer wraps it at subclass time):
-            # with the flag left on, the layer would checkpoint a second time inside this one, and its own replay
-            # would not restore the group state.
+            # transformers 5.23+ checkpoints `forward` itself: leaving the flag on would double-checkpoint and lose the group state.
             previous = self.gradient_checkpointing
             self.gradient_checkpointing = False
             try:
@@ -340,8 +337,7 @@ def patch_deepseek_v41_moe():
     if os.environ.get("UNSLOTH_DSV41_MOE_BACKEND", "1") == "0":
         return
     if __package__ != "unsloth_zoo.temporary_patches":
-        # The CPU runtime loads this file standalone (unsloth_zoo.cpu) to keep the GPU kernels out: there the native
-        # sorted loop stays, and `.moe_utils` would not resolve anyway.
+        # The CPU runtime loads this file standalone (no GPU kernels, `.moe_utils` unresolvable): keep the native loop.
         return
     try:
         from unsloth_zoo.temporary_patches.moe_utils import (
@@ -371,7 +367,6 @@ def patch_deepseek_v41_moe():
     def forward(
         self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
     ) -> torch.Tensor:
-        # Released fp4 experts load as raw MXFP4 blocks; the native forward packs them on first use, so does this.
         if "gate_up_blocks" in self._parameters:
             self.finalize_packed()
         return backend_forward(self, hidden_states, top_k_index, top_k_weights)
@@ -379,7 +374,6 @@ def patch_deepseek_v41_moe():
     flags = ("_unsloth_lora_extractor_fn", "_unsloth_own_apply_gate", "_unsloth_moe_fp32_reference")
     experts_cls._unsloth_lora_extractor_fn = staticmethod(_dsv41_lora_extractor)
     experts_cls._unsloth_own_apply_gate = True
-    # The reference computes the SwiGLU and the routed-output sum in fp32 (native DeepseekV41Experts.forward).
     experts_cls._unsloth_moe_fp32_reference = True
     if not patch_function(experts_cls, "forward", forward):
         for name in flags:
@@ -562,8 +556,6 @@ def _frozen_engram(modeling, key, emb):
         emb.num_embeddings, emb.embedding_dim, dtype=emb.weight.dtype,
         table_name=f"deepseek_v41 engram layer {key}", row_shape=(emb.embedding_dim,),
     )
-    # transformers 5 saves a converted model back under the released names with its base prefix
-    # (model.layers.<i>.engram.embed.*).
     table.checkpoint_prefixes = (f"layers.{key}.engram.embed", f"model.layers.{key}.engram.embed",
                                  f"model.engram_tables.{key}", f"engram_tables.{key}")
     table.checkpoint_planes = {"weight": (r"weight",), "scale": (r"scale", r"weight_scale_inv")}
@@ -596,7 +588,6 @@ def make_deepseek_v41_engram_table(layer_key, num_embeddings, head_dim, block_si
     import types
     from unsloth_zoo.frozen_table_store import install_frozen_table_load_hook
     if not install_frozen_table_load_hook():
-        # Without the hook the table would never be bound to the checkpoint: every lookup would raise later.
         raise RuntimeError(
             "Unsloth: could not install the frozen table load hook, so the DeepSeek-V4.1 engram tables cannot be "
             "bound to the checkpoint. Set UNSLOTH_DSV41_FROZEN_ENGRAM=0 to load them as normal embeddings."

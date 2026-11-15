@@ -23,7 +23,6 @@ import os
 import sys
 import types
 
-# The native package is registered under this name so the zoo resolver (`*deepseek_v41.modeling`) finds it.
 NATIVE_ALIAS = "_unsloth_native_test.deepseek_v41"
 
 

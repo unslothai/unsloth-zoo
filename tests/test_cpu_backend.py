@@ -495,8 +495,6 @@ def _capture_cpu_lora_config(model, **kwargs):
 
 
 def test_lora_remap_that_returns_its_input_keeps_the_embeddings_to_save():
-    # A remapper may hand back the very list it was given (nothing to translate): embed_tokens / lm_head, taken out
-    # before the call, must still be trained in full.
     import torch.nn as nn
 
     class Model(nn.Module):
@@ -1725,8 +1723,6 @@ def test_serial_dataset_num_proc_maps_in_process(requested, seen):
 
 
 def test_cpu_patches_rerun_after_the_model_load_and_before_lora(monkeypatch, tmp_path):
-    # Unsloth's native DeepSeek-V4.1 modeling is imported by the load itself: its patches (checkpoint replay) have to
-    # be applied after it, not only when unsloth_zoo.cpu was imported.
     import torch.nn as nn
     import transformers
     from unsloth_zoo.cpu import loader, runtime

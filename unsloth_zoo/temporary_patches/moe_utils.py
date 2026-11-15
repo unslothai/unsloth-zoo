@@ -5355,8 +5355,7 @@ def _loop_expert_weight(param, expert_idx, dtype):
             transpose = param.mxfp4_transposed,
         )[0]
     weight = param[expert_idx]
-    # A dense 16/32-bit stack in another dtype than the activations (fp32 experts, bf16 hidden states outside autocast)
-    # is cast, as the native DeepSeek-V4.1 _expert_weight does; F.linear would raise on the mix. fp8 / int stay as is.
+    # Cast dense 16/32-bit stacks to the activation dtype like native _expert_weight (F.linear rejects the mix); fp8/int stay.
     if weight.is_floating_point() and weight.element_size() > 1 and weight.dtype != dtype:
         weight = weight.to(dtype)
     return weight
@@ -5698,7 +5697,6 @@ def forward_native_grouped_mm(
         flat_weights = top_k_weights.reshape(-1)
         permuted_weights = flat_weights[sorted_indices]
     if _moe_fp32_reference(self):
-        # fp32 routing weights: the weighted sum then accumulates and rounds once, as the reference does.
         permuted_weights = permuted_weights.float()
 
     final_hidden_states = weighted_unpermute(
@@ -6019,7 +6017,6 @@ def forward_triton_grouped_gemm(
 
     # Apply routing weights and sum across top_k: (num_tokens, top_k, hidden) -> (num_tokens, hidden).
     if _moe_fp32_reference(self):
-        # fp32 weights, products and top_k sum, one rounding at the end (the reference's accumulation).
         final_hidden_states = (
             second_gemm_output.view(num_tokens, top_k, hidden_dim).float()
             * top_k_weights.float()[..., None]

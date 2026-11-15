@@ -277,7 +277,6 @@ DISABLE_COMPILE_MODEL_FUNCTIONS = {
         # Later port heads: block fake-quant (float8 casts, int32 bit tricks), straight-through in training.
         "_fake_quant_fp8_block",
         "_fake_quant_fp4_block",
-        # Unsloth's native module (unsloth/models/deepseek_v41): host-side load / layout / registry helpers.
         "engram_layout",
         "make_engram_table",
         "is_parameter_free_table",
@@ -317,7 +316,6 @@ MODULE_FORWARD_SOURCE_REWRITES = {
         "DeepseekV4HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
     },
     "deepseek_v41": {
-        # transformers' (or the community port's) mixer, then Unsloth's native one (unsloth/models/deepseek_v41).
         "DeepseekV41HyperConnection": [
             (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
             (MHC_NATIVE_SINKHORN_SOURCE, MHC_NATIVE_SINKHORN_REPLACEMENT, mhc_fast_mode),
@@ -348,7 +346,6 @@ MODULE_FORWARD_EAGER_REWRITES = {
 NATIVE_MODELING_MODULES = {}
 
 
-# Helpers the compiler injects into a modeling module (attributes set at runtime, not defined there).
 _MHC_INJECTED_HELPERS = ("unsloth_sinkhorn_knopp", "unsloth_mhc_projection", "unsloth_mhc_projection_rsqrt")
 
 
@@ -370,8 +367,7 @@ def resolve_modeling_module(model_type):
     try:
         return location, importlib.import_module(location)
     except ImportError:
-        # Not shipped, or shipped but unimportable here (ModuleNotFoundError is an ImportError): a native module
-        # that is already imported can still serve.
+        # Not shipped or unimportable here: an already-imported native module can still serve.
         pass
     for name in (NATIVE_MODELING_MODULES.get(model_type), f"unsloth.models.{model_type}.modeling"):
         module = sys.modules.get(name) if name else None
@@ -379,12 +375,10 @@ def resolve_modeling_module(model_type):
         if module is None or root is None:
             continue
         try:
-            # The dotted path the compiler evaluates must reach the same module from its root package.
             resolved = functools.reduce(getattr, name.split(".")[1:], root)
         except Exception:
             continue
         if resolved is module:
-            # The root the compiler's evals use: the one just verified (a reimported package replaces the old root).
             globals()[name.split(".")[0]] = root
             return name, module
     return None, None
@@ -2466,8 +2460,7 @@ def create_new_function(
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"
     if "torch_compiler_disable_unless_decode" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compiler_disable_unless_decode\n"
-    # The mHC helpers come from the zoo, never from the model module: the compiler sets them on the modeling module
-    # at runtime, so a fresh process importing this file would not find them there.
+    # mHC helpers come from the zoo: they are set on the modeling module only at runtime.
     for helper in _MHC_INJECTED_HELPERS:
         if re.search(rf"\b{helper}\b", new_source):
             imports += f"from unsloth_zoo.temporary_patches.mhc_sinkhorn import {helper}\n"

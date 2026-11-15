@@ -146,8 +146,7 @@ def test_checkpointed_layers_keep_the_compile_stance(impl, monkeypatch):
 def test_prepare_compiled_checkpoint_specializes_floats(monkeypatch):
     from unsloth_zoo.temporary_patches.deepseek_v41 import prepare_compiled_checkpoint
 
-    # Not monkeypatch: its undo deletes the attribute from torch._dynamo.config (a ConfigModule), and every later
-    # torch.compile in the session then fails with "specialize_float does not exist".
+    # Not monkeypatch: its undo deletes the ConfigModule attribute and breaks later torch.compile calls.
     saved = torch._dynamo.config.specialize_float
     try:
         torch._dynamo.config.specialize_float = False
@@ -290,11 +289,8 @@ def test_no_placement_bare_names_are_relative_to_no_split_modules(impl):
     match = no_placement_matcher(model)
     hit = sorted(n for n, _ in model.named_parameters() if match(n))
     if impl.name == "native" and not any(True for _ in model.model.engram_tables["1"].parameters()):
-        # Unsloth's native tables hold no Parameter at all (unsloth_zoo's frozen table): nothing to place, and a
-        # suffix match must still not take every other weight.
         assert hit == []
     else:
-        # Only the engram table (a no-split DeepseekV41EngramEmbedding); a suffix match took every weight.
         assert hit == ["model.engram_tables.1.weight", "model.engram_tables.1.weight_scale_inv"]
         assert drop_no_placement_modules(model) == ["model.engram_tables.1"]
     # Dotted names (Qwen4Exp) keep the suffix match.
@@ -319,8 +315,6 @@ def test_pooled_compressor_lora_is_applied_and_trains(impl):
     from unsloth_zoo.temporary_patches.deepseek_v41 import REPLAY_STATS
 
     if impl.name == "port":
-        # The port's pooled branch reads `.weight` directly; the patch routes it through the adapters. The native
-        # compressor calls its Linears as modules, so the adapters apply without it.
         assert REPLAY_STATS["compressor_lora"] > 0
     for name in ("kv_proj", "gate_proj"):
         grads = [p.grad for n, p in peft_model.named_parameters() if f"layers.2.self_attn.compressor.{name}.lora_" in n]

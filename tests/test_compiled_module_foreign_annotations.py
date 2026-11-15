@@ -57,8 +57,6 @@ def test_function_defined_elsewhere():
 
 
 def test_an_imported_module_named_like_a_method_is_defined_elsewhere():
-    # Native DeepSeek-V4.1: `import copy` plus `def copy(self)` on a class made the compiler paste copy.py's source
-    # into the cache (SyntaxError on import).
     module = types.ModuleType("fake_modeling")
     module.__file__ = __file__
     module.copy = __import__("copy")

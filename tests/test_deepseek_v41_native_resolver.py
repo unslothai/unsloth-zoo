@@ -53,8 +53,6 @@ def test_ignores_unrelated_modules_with_the_same_suffix(no_port, monkeypatch):
 
 @pytest.mark.parametrize("registered", [False, True], ids = ["unsloth_path", "registered"])
 def test_adapter_of_a_native_model_resolves_without_the_base_config(monkeypatch, registered):
-    # An adapter saved from Unsloth's native module records its parent library, not a transformers path; the model
-    # type must come from there, not from an AutoConfig download of the base model.
     import peft
     import unsloth_zoo.compiler as compiler
     import unsloth_zoo.hf_utils as hf_utils
@@ -70,8 +68,6 @@ def test_adapter_of_a_native_model_resolves_without_the_base_config(monkeypatch,
 
 
 def test_recompilation_restores_originals_stored_under_the_registered_location(monkeypatch):
-    # A registered native module is compiled under its registration location, which may differ from its __name__;
-    # the originals saved under that key must be the ones put back before the next pass.
     import unsloth_zoo.compiler as compiler
 
     module = types.ModuleType("unsloth.models.fake_native.modeling")

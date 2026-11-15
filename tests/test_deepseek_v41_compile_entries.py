@@ -44,7 +44,6 @@ _DISABLED = {
     "_quantize_qat",
     "_fake_quant_fp8_block",
     "_fake_quant_fp4_block",
-    # Unsloth's native module: host-side load / layout / registry helpers
     "engram_layout",
     "make_engram_table",
     "is_parameter_free_table",
@@ -89,7 +88,6 @@ needs_impl = pytest.mark.skipif(
 )
 impl_param = pytest.mark.parametrize("impl", IMPLS, ids = lambda impl: impl.name)
 
-# Host helpers of the native module (the rest of _DISABLED are the port's names).
 _NATIVE_DISABLED = {
     "build_compressed_token_map", "compute_hash_multipliers", "_is_prime", "engram_layout", "make_engram_table",
     "is_parameter_free_table", "_checkpoint_key_names", "has_core_model_loading", "_is_fp8_quant_config",
@@ -112,7 +110,6 @@ def test_implementation_defines_its_entries_and_the_rewrites_match(impl, monkeyp
     if impl.name == "port":
         assert "apply_rotary_pos_emb" in model_function_source_rewrites(modeling, "deepseek_v41")
     else:
-        # The native mixer's projection and Sinkhorn loop match the native alternatives exactly once.
         monkeypatch.setenv("UNSLOTH_DSV4_MHC_FAST", "unrolled")
         eager = module_forward_eager_rewrites(modeling, "deepseek_v41")
         assert "unsloth_mhc_projection_rsqrt(" in eager["DeepseekV41HyperConnection"]
@@ -157,8 +154,6 @@ out["helpers_missing"] = [
 print("@@@" + json.dumps(out))
 '''
 
-# A fresh process: the generated cache must import on its own (the mHC helpers the compiler injects into the
-# modeling module at runtime are not there yet).
 _FRESH = r'''
 import importlib.util, os, sys
 impl_name, tests_dir, path = sys.argv[1], sys.argv[2], sys.argv[3]

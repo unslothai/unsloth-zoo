@@ -181,7 +181,6 @@ def _instance_attribute_model_types(config) -> list:
 pass
 
 
-# Model types implemented by Unsloth itself rather than transformers (see compiler.register_native_modeling).
 NATIVE_MODEL_TYPES = set()
 
 
@@ -227,8 +226,6 @@ def get_transformers_model_type(config, trust_remote_code=False):
             model_type = model_type_list[0].group(1)
             model_types = [model_type]
         elif getattr(config, "auto_mapping", None) is not None:
-            # An adapter of one of Unsloth's own implementations: its parent library names the native module
-            # (unsloth.models.<model_type>.modeling, or a registered location).
             parent = str(config.auto_mapping.get("parent_library", "") or "")
             native = re.fullmatch(r"unsloth\.models\.([^.]+)\.modeling", parent)
             if native is not None and is_native_model_type(native.group(1)):
@@ -326,8 +323,7 @@ def get_transformers_model_type(config, trust_remote_code=False):
     found_type = False
     for j, model_type in enumerate(final_model_types):
         if is_native_model_type(model_type):
-            # Unsloth's own implementation (unsloth/models/<model_type>): keep the name, never trim it to a
-            # transformers model it merely starts with (deepseek_v41 -> deepseek_v4).
+            # Unsloth's own implementation: never trim to a transformers prefix (deepseek_v41 -> deepseek_v4).
             found_type = True
         elif from_instance_attribute:
             # Remote code; trimming would rewrite eg llama_foo to the wrong llama path
