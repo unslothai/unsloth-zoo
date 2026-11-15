@@ -203,6 +203,11 @@ def test_kernel_fold_matches_fp64(dtype, rank):
     MG.generic_lora_accumulate_(base, t, b, offsets, s)
     ref_acc = before.double() + s * torch.einsum("mr,mrn->mn", t.double(), b.double()[e_of])
     assert _rel(base.double(), ref_acc) <= 1.25 * _rel((before + MU._grouped_mm_eager(t, b, offsets) * s).double(), ref_acc) + 1e-4
+    # From a separate source: the source is untouched and the result equals the in-place one bit for bit.
+    dst = torch.empty_like(before)
+    MG.generic_lora_accumulate_(dst, t, b, offsets, s, base = before)
+    assert torch.equal(dst, base)
+    assert not torch.equal(before, base)
 
 
 @needs_kernel

@@ -77,7 +77,7 @@ if triton is not None:
 
     @triton.jit
     def _grouped_gemm_kernel(
-        A, B, C, COUNTS, SCALE, BIAS, A2, B2,
+        A, B, C, COUNTS, SCALE, BIAS, A2, B2, C_IN,
         E, E_LO, E_HI, N, K, K2, a2_scale,
         stride_am, stride_ak, stride_be, stride_bk, stride_bn, stride_cm, stride_bias_e,
         stride_a2m, stride_a2k, stride_b2e, stride_b2k, stride_b2n,
@@ -88,7 +88,8 @@ if triton is not None:
     ):
         # ENDS: COUNTS holds cumulative row ends. GROUP_M > 0: 1D grid, GROUP_M row tiles at a time (L2 reuse).
         # HAS_A2: a second K segment, C = A @ B + a2_scale * (A2 @ B2[e]) in one fp32 accumulator (K2 <= BLOCK_K2): a
-        # LoRA delta folded into the base GEMM. ACC_IN: the accumulator starts from C (C += ...).
+        # LoRA delta folded into the base GEMM. ACC_IN: the accumulator starts from C_IN (C = C_IN + ...; C_IN may be C,
+        # and has C's row stride).
         if GROUP_M > 0:
             pid = tl.program_id(0)
             num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -125,7 +126,7 @@ if triton is not None:
         if ROW_SCALE:
             s = tl.load(SCALE + offs_m64, mask = mask_m, other = 1.0)
         if ACC_IN:
-            acc = tl.load(C + offs_m64[:, None] * stride_cm + offs_n[None, :],
+            acc = tl.load(C_IN + offs_m64[:, None] * stride_cm + offs_n[None, :],
                           mask = mask_m[:, None] & mask_n[None, :], other = 0.0).to(tl.float32)
         else:
             acc = tl.zeros((BLOCK_M, BLOCK_N), dtype = tl.float32)
@@ -493,14 +494,15 @@ def _cublas_backend(device, backend):
 
 def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num_experts = None,
                  out = None, a_mode = None, row_scale = None, bias = None, config = None, backend = None,
-                 ends = False, lora = None, acc_in = False):
+                 ends = False, lora = None, acc_in = False, acc_src = None):
     """out[m] = a[m] @ (b[e - e_lo].T if b_trans else b[e - e_lo]) for rows of experts in [e_lo, e_hi).
 
     a: [M, K] rows sorted by expert; b: [E', N, K] (b_trans) or [E', K, N]; counts: [E] rows per
     expert on device. Rows outside the window are not written (pass `out` across windows).
     backend: None picks per device (use_cublas), "triton" / "cublas" force one. ends: counts holds
     cumulative row ends (torch._grouped_mm's offs) instead of rows per expert. Triton only: lora = (a2 [M, K2],
-    b2 [E', K2, N], scale) adds scale * a2 @ b2[e] in the same accumulator (K2 <= 128); acc_in adds into `out`."""
+    b2 [E', K2, N], scale) adds scale * a2 @ b2[e] in the same accumulator (K2 <= 128); acc_in adds into `out`, or
+    onto acc_src (same shape and row stride as out) written to `out`."""
     M, K = a.shape
     E = int(num_experts if num_experts is not None else _counts_tensor(counts).numel())
     e_hi = E if e_hi is None else int(e_hi)
@@ -522,7 +524,9 @@ def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num
     if a_mode == A_DIRECT and a.dtype != b.dtype:
         raise TypeError(f"grouped_gemm: {a.dtype} x {b.dtype} needs a_mode cast / split")
     if lora is not None or acc_in:
-        if backend != "triton" or row_scale is not None or a_mode == A_SPLIT or out is None and acc_in:
+        if backend != "triton" or row_scale is not None or a_mode == A_SPLIT or out is None and acc_in or (
+            acc_src is not None and (acc_src.shape != out.shape or acc_src.stride() != out.stride())
+        ):
             raise ValueError("grouped_gemm: lora / acc_in need backend = 'triton', no row_scale / split, and out")
     if _cublas_backend(a.device, backend):
         if ends:
@@ -551,6 +555,7 @@ def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num
     with _on(a.device):
         _grouped_gemm_kernel[grid](
             a, b, out, counts, row_scale if row_scale is not None else a, bias if bias is not None else a, a2, b2,
+            acc_src if acc_src is not None else out,
             E, int(e_lo), e_hi, N, K, a2.shape[1] if lora is not None else 0, float(a2_scale),
             a.stride(0), a.stride(1), b.stride(0), stride_bk, stride_bn, out.stride(0),
             bias.stride(0) if bias is not None else 0,
@@ -797,7 +802,7 @@ def generic_lora_config(M, E, N, K, rank, device, dtype):
     return BM, BN, BK, warps, stages, group_m
 
 
-def generic_grouped_mm_lora(inputs, weight, offsets, lora_in, lora_w, scale, out = None, acc_in = False):
+def generic_grouped_mm_lora(inputs, weight, offsets, lora_in, lora_w, scale, out = None, acc_in = False, acc_src = None):
     """inputs @ weight[e] + scale * lora_in @ lora_w[e] per expert in one accumulator (torch._grouped_mm semantics,
     offsets = cumulative ends on device). weight [E, K, N] and lora_w [E, r, N] may be strided views; acc_in adds
     the result into `out`. inputs may have K = 0 (only the LoRA term)."""
@@ -809,15 +814,15 @@ def generic_grouped_mm_lora(inputs, weight, offsets, lora_in, lora_w, scale, out
     config = generic_lora_config(M, E, N, K, rank, inputs.device, inputs.dtype)
     out = grouped_gemm(inputs, weight, offsets, inputs.dtype if out is None else out.dtype, b_trans = False,
                        num_experts = E, config = config, backend = "triton", ends = True, out = out,
-                       lora = (lora_in, lora_w, scale), acc_in = acc_in)
+                       lora = (lora_in, lora_w, scale), acc_in = acc_in, acc_src = acc_src)
     LORA_CALLS["accumulate" if acc_in else "fold"] += 1
     return out
 
 
-def generic_lora_accumulate_(out, lora_in, lora_w, offsets, scale):
-    """out += scale * lora_in @ lora_w[e] in place, one rounding (the base GEMM ran elsewhere)."""
+def generic_lora_accumulate_(out, lora_in, lora_w, offsets, scale, base = None):
+    """out = (base if given, else out) + scale * lora_in @ lora_w[e], one rounding (the base GEMM ran elsewhere)."""
     return generic_grouped_mm_lora(lora_in[:, :0], lora_w[:, :0, :], offsets, lora_in, lora_w, scale,
-                                   out = out, acc_in = True)
+                                   out = out, acc_in = True, acc_src = base)
 
 
 def generic_grouped_wgrad(inputs, grad, offsets, num_experts):

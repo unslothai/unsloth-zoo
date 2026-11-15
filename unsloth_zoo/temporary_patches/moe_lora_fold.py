@@ -39,6 +39,8 @@ __all__ = [
     "lora_fold_enabled",
     "lora_fold_decline_reason",
     "lora_fold_base_mm",
+    "lora_fold_prepare",
+    "lora_fold_onto_base",
 ]
 
 import collections
@@ -191,17 +193,20 @@ def _weight_t(provider, weight):
 
 class _GroupedLoraFold(torch.autograd.Function):
     """Y = X @ W + s (X @ A) @ B over a frozen W from weight_provider (rebuilt in backward when recompute), or
-    Y = saved_base + s (X @ A) @ B when the base output is given (written into it)."""
+    Y = base + s (X @ A) @ B when base_box = [keep_base, base] hands over an already computed base output (a list, so
+    the tensor is not an autograd input): written into it, or into a new tensor when keep_base."""
 
     @staticmethod
-    def forward(ctx, inputs, first, second, offsets, scaling, weight_provider, recompute, saved_base):
+    def forward(ctx, inputs, first, second, offsets, scaling, weight_provider, recompute, base_box):
         mg = _mg()
         x = inputs.contiguous()
         t = _rank_mm(x, first, offsets)
         with torch.no_grad():
-            if saved_base is not None:
-                ctx.mark_dirty(saved_base)
-                out = mg.generic_lora_accumulate_(saved_base, t, second, offsets, scaling)
+            if base_box is not None:
+                base, keep = base_box.pop(), base_box.pop() if base_box else False
+                # keep: the base is held elsewhere (the checkpoint's kept output), so write a new tensor from it.
+                dst = torch.empty_like(base) if keep else base
+                out = mg.generic_lora_accumulate_(dst, t, second, offsets, scaling, base = base if keep else None)
                 weight = None
                 LORA_FOLD_STATS["accumulate"] += 1
             else:
@@ -290,3 +295,22 @@ def lora_fold_base_mm(inputs, offsets, weight_provider, recompute, lora, source)
     first, second, scaling = prepared
     return _GroupedLoraFold.apply(inputs, first, second, offsets, scaling, weight_provider, recompute, None)
 
+
+
+def lora_fold_prepare(inputs, lora, source):
+    """(first, second, scaling) cast and padded for the fold, or None (the separated path applies)."""
+    first, second, scaling = lora
+    reason = lora_fold_decline_reason(inputs, first, second, source)
+    if reason is not None:
+        return _decline(reason)
+    prepared = _prepare_lora(inputs, lora)
+    if prepared is None:
+        return _decline("scaling")
+    return prepared
+
+
+def lora_fold_onto_base(inputs, offsets, weight_provider, prepared, base, keep_base = False):
+    """base + s (X @ A) @ B (computed earlier, no grad) written into `base`, or into a new tensor when keep_base, with
+    the folded backward: dX through the frozen weight rebuilt from weight_provider plus the LoRA term, dA, dB."""
+    first, second, scaling = prepared
+    return _GroupedLoraFold.apply(inputs, first, second, offsets, scaling, weight_provider, True, [keep_base, base])

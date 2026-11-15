@@ -1250,6 +1250,37 @@ def _lora_fold_base_mm(inputs, offsets, weight_provider, recompute, lora, source
     return lora_fold_base_mm(inputs, offsets, weight_provider, recompute, lora, source)
 
 
+def _gc_keep_base_slot(module):
+    if torch.compiler.is_compiling():
+        return None
+    try:
+        from unsloth_zoo.temporary_patches.moe_gc_keep_base import keep_base_slot
+    except ImportError:
+        return None
+    return keep_base_slot(module)
+
+
+def _moe_base_and_lora(inputs, offsets, weight_provider, recompute, plan, lora, source, keep_slot, proj):
+    """One projection's base grouped GEMM: (output, LoRA still to add). Kept-base replay first, then the LoRA fold,
+    else the plain base GEMM with the LoRA left to the separated path. Traced code never keeps (the checkpoint
+    state would be frozen at trace time); the fold traces through its opaque op."""
+    if keep_slot is not None and plan is None and not torch.compiler.is_compiling():
+        try:
+            from unsloth_zoo.temporary_patches.moe_gc_keep_base import kept_base_mm
+        except ImportError:
+            kept_base_mm = None
+        found = None if kept_base_mm is None else kept_base_mm(
+            inputs, offsets, weight_provider, recompute, lora, source, keep_slot, proj,
+        )
+        if found is not None:
+            return found
+    if lora is not None and plan is None:
+        out = _lora_fold_base_mm(inputs, offsets, weight_provider, recompute, lora, source)
+        if out is not None:
+            return out, None
+    return _base_grouped_mm(inputs, offsets, weight_provider, recompute, plan), lora
+
+
 def _nf4_fused_base_mm(inputs, offsets, source, proj_type, hidden_dim, model_type, experts_module):
     """UNSLOTH_MOE_NF4_FUSED grouped GEMM on a frozen NF4 stack; None keeps the dequant path."""
     if os.environ.get("UNSLOTH_MOE_NF4_FUSED", "0") in ("", "0") or not _base_is_recomputable(source):
@@ -1265,8 +1296,15 @@ def _nf4_fused_base_mm(inputs, offsets, source, proj_type, hidden_dim, model_typ
         if _expert_cache_get(cache, param, inputs.dtype, count = False) is not None:
             return None   # a cached 16-bit stack makes the dequant path's decode free
     try:
-        from unsloth_zoo.temporary_patches.moe_nf4_grouped import maybe_nf4_grouped_mm
+        from unsloth_zoo.temporary_patches.moe_nf4_grouped import maybe_nf4_grouped_mm, nf4_auto_fused, nf4_fused_mode
     except ImportError:
+        return None
+    if (
+        not torch.compiler.is_compiling() and nf4_fused_mode() == "auto"
+        and not nf4_auto_fused(inputs.shape[0], offsets.shape[0], inputs.device)
+    ):
+        # Eager has no recompile to avoid: above the cap take the regular dequant path, where the LoRA fold and the
+        # kept checkpoint base apply (the in-op dequant branch has neither).
         return None
     preprocess = lambda w: preprocess_weight(w, proj_type, hidden_dim, model_type, experts_module = experts_module)
     return maybe_nf4_grouped_mm(inputs, offsets, source, preprocess)
@@ -5382,6 +5420,9 @@ def forward_native_grouped_mm(
     num_tokens_per_expert, sorted_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
     permuted_input = gather_routed_rows(hidden_states, sorted_indices, top_k_index.shape[-1])
 
+    # Inside an Unsloth checkpoint: keep (first pass) or reuse (replay) the frozen base outputs.
+    keep_slot = _gc_keep_base_slot(self)
+
     # Gate + Up projection with optional separated LoRA (default).
     use_separated_lora = _should_use_separated_lora()
     gate_up_lora = None
@@ -5423,17 +5464,12 @@ def forward_native_grouped_mm(
                 selective_plan = _selective_dequant_plan(
                     (_gate_up_src, getattr(self, "down_proj", None)), num_tokens_per_expert, permuted_input.shape[0],
                 )
-            if gate_up_lora is not None and selective_plan is None:
-                # LoRA folded into the base GEMM (moe_lora_fold); None keeps the separated path below.
-                mm1_out = _lora_fold_base_mm(
-                    permuted_input, offsets, _gate_up_provider, _recompute, gate_up_lora, _gate_up_src,
-                )
-                if mm1_out is not None:
-                    gate_up_lora = None
-            if mm1_out is None:
-                mm1_out = _base_grouped_mm(
-                    permuted_input, offsets, _gate_up_provider, _recompute, selective_plan,
-                )
+            # LoRA folded into the base GEMM (moe_lora_fold) and the first pass's base output reused by the checkpoint
+            # replay (moe_gc_keep_base); a LoRA left over is added by the separated path below.
+            mm1_out, gate_up_lora = _moe_base_and_lora(
+                permuted_input, offsets, _gate_up_provider, _recompute, selective_plan, gate_up_lora, _gate_up_src,
+                keep_slot, "gate_up",
+            )
 
         # Separated LoRA: + ((X @ first) @ second) * scaling.
         if gate_up_lora is not None:
@@ -5615,13 +5651,10 @@ def forward_native_grouped_mm(
             mm2_out = _nf4_fused_base_mm(inter, offsets, _down_src, "down", hidden_dim, model_type, self)
         if _down_layout is None and mm2_out is None:
             _recompute = _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype)
-            _down_plan = selective_plan if _recompute else None
-            if down_lora is not None and _down_plan is None:
-                mm2_out = _lora_fold_base_mm(inter, offsets, _down_provider, _recompute, down_lora, _down_src)
-                if mm2_out is not None:
-                    down_lora = None
-            if mm2_out is None:
-                mm2_out = _base_grouped_mm(inter, offsets, _down_provider, _recompute, _down_plan)
+            mm2_out, down_lora = _moe_base_and_lora(
+                inter, offsets, _down_provider, _recompute, selective_plan if _recompute else None, down_lora,
+                _down_src, keep_slot, "down",
+            )
 
         if down_lora is not None:
             first_weight, second_weight, scaling = down_lora
