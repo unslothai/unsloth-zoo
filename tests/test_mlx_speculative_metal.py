@@ -1002,6 +1002,23 @@ def test_a_committed_tree_path_continues_as_its_decode_folded_or_replayed(qwen_4
     assert verdicts and all(verdicts)
 
 
+def test_a_tree_path_off_the_block_prefix_commits_without_copying_a_key_buffer(qwen_4bit, monkeypatch):
+    import numpy as np
+    from unsloth_zoo.mlx import inference
+    model, ids, cache = qwen_4bit
+    lm, tokens = model.language_model, ids[1][:len(TREE_PARENTS)]
+    address = lambda array: np.array(array.view(mx.uint8), copy = False).__array_interface__["data"][0]
+    with _tree_mode(model, monkeypatch):
+        _warm_tree_widths(lm, cache, tokens)
+        run = _clone(cache)
+        _, transaction = _tree_verified(lm, run, tokens, _tree_block(TREE_PARENTS)[0])
+        attended = [entry for entry in run if getattr(entry, "keys", None) is not None]
+        mx.synchronize()
+        buffers = [address(array) for entry in attended for array in (entry.keys, entry.values)]
+        inference.tree_commit(transaction, run, [0, 8, 9])
+        assert buffers and buffers == [address(array) for entry in attended for array in (entry.keys, entry.values)]
+
+
 def _flat_selector(vocabulary):
     weight = type("Codebook", (), {"weight": mx.zeros((vocabulary, 32), mx.bfloat16)})
     return SimpleNamespace(hidden_projection = lambda x: x, predecessor_codebook = weight, successor_codebook = weight)

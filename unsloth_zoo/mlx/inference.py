@@ -7666,6 +7666,21 @@ def _verify_gdn_folded_block(*args, pending, l2 = False, sigmoid = False, tree =
     return _verify_gdn_launch(*args, (k, v, a, b, rows, *(path or [k.shape[1]])), l2, sigmoid, tree)
 
 
+class _TreeRows:
+    """A tree block's attention cache, keeping the keys and values the block appends: `tree_commit` writes a path's rows from
+    them, as reading them back from the cache would have its write copy the buffers whole."""
+
+    def __init__(self, cache):
+        self._cache = cache
+
+    def __getattr__(self, name):
+        return getattr(self._cache, name)
+
+    def update_and_fetch(self, keys, values):
+        self._cache._unsloth_tree_rows = keys, values
+        return self._cache.update_and_fetch(keys, values)
+
+
 def _tree_attention(queries, keys, values, scale, tree):
     return attention.invariant_attention(queries, keys, values, scale, tree.depth, tree.path)
 
@@ -8548,7 +8563,7 @@ def _exact_verify_class(base, name, *cache_key):
             first = mx.full((3, 1, 1), cache.offset, mx.int32) if position_ids is None else position_ids[..., :1]
             position_ids = first + tree.depth
         queries, keys, values, gate, mask = attention._prepare_projected_qkv(
-            q_proj_output, keys, values, cache, position_ids, position_embeddings, mask)
+            q_proj_output, keys, values, cache if tree is None else _TreeRows(cache), position_ids, position_embeddings, mask)
         padded = isinstance(mask, str) and mask == "left_padded_decode"
         if padded:
             mask = None
@@ -10679,8 +10694,9 @@ def _tree_head_rows(hidden, cache):
 
 def tree_commit(transaction, caches, path):
     """Commit block rows `path` (a list from the anchor) of a tree verify: a prefix of the block as any block's, others
-    by moving their keys and values to the front of the block, and leaving each gated delta layer the path's replay, which
+    by writing their keys and values at the front of the block, and leaving each gated delta layer the path's replay, which
     the next tree block folds in reading the rows where they are."""
+    blocks = [vars(entry).pop("_unsloth_tree_rows", None) for entry in caches]
     if path == list(range(len(path))):
         transaction.commit([len(path)])
         return
@@ -10698,11 +10714,11 @@ def tree_commit(transaction, caches, path):
         cache._unsloth_pending_path = (k, v, a, b, rows)
         taps = mx.concatenate([mx.arange(width, dtype = mx.int32), rows + width])[-width:]
         cache[0] = mx.take(source, taps, axis = 1)
-    for entry in caches:
-        if isinstance(getattr(entry, "offset", None), int) and getattr(entry, "keys", None) is not None:
+    for entry, block in zip(caches, blocks):
+        if block is not None:
             prefix, length = entry.offset, len(path)
-            entry.keys[..., prefix : prefix + length, :] = mx.take(entry.keys, prefix + rows, axis = 2)
-            entry.values[..., prefix : prefix + length, :] = mx.take(entry.values, prefix + rows, axis = 2)
+            entry.keys[..., prefix : prefix + length, :] = mx.take(block[0], rows, axis = 2)
+            entry.values[..., prefix : prefix + length, :] = mx.take(block[1], rows, axis = 2)
             entry.offset = prefix + length
 
 
