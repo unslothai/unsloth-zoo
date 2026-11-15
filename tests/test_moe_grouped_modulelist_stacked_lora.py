@@ -381,10 +381,16 @@ def test_compile_fullgraph_no_breaks():
     from torch._dynamo.utils import counters
     counters.clear()
     x, g = _inputs(seed = 2)
-    before = ML.CALLS["grouped_lora"]
-    cs = torch.compile(bs.forward, fullgraph = True)
-    os_, dxs = fwd_bwd(cs, x, g)
-    assert ML.CALLS["grouped_lora"] == before + 1
+    # CALLS counts eager calls only (a traced counter recompiles per call): engagement = no loop call.
+    loop_calls = []
+    orig = bs.__dict__["_orig_moe_forward"]
+    bs._orig_moe_forward = lambda *a, **k: loop_calls.append(1) or orig(*a, **k)
+    try:
+        cs = torch.compile(bs.forward, fullgraph = True)
+        os_, dxs = fwd_bwd(cs, x, g)
+    finally:
+        bs._orig_moe_forward = orig
+    assert not loop_calls, "compiled call fell back to the per-expert loop"
     assert sum(counters["graph_break"].values()) == 0
     ou, dxu = fwd_bwd(bu, x, g)
     assert (os_.float() - ou.float()).abs().max() < 2e-2
