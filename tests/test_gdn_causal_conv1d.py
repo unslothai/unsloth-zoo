@@ -830,3 +830,23 @@ def test_patch_rebinds_a_hub_layer_imported_before_the_patch(hub_kernels, monkey
         gcc.causal_conv1d_reference(x[..., a:b], w, None, "silu") for a, b in ((0, 3), (3, 7), (7, 10))
     ], dim = -1)
     torch.testing.assert_close(y, expected)
+
+
+def test_qwen4_exp_gdn_conv_honours_seq_idx(hub_kernels, monkeypatch):
+    # Qwen3.8-Flash-Next's GatedDeltaNet calls the same hub conv. On the torch fallback seq_idx is dropped, so
+    # Unsloth's hybrid packing gate refuses padding-free rows ("causal_conv1d_fn has no accelerated kernel").
+    pytest.importorskip("triton")
+    modeling = _real_gdn_modeling(monkeypatch, "transformers.models.qwen4_exp.modeling_qwen4_exp")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.version, "hip", None)
+    assert not gcc._is_marked(modeling.causal_conv1d_fn)
+    gcc.patch_gdn_causal_conv1d()
+    assert gcc._is_marked(modeling.causal_conv1d_fn)
+    assert gcc._is_marked(modeling.causal_conv1d_update)
+    g = torch.Generator().manual_seed(0)
+    x, w, b = torch.randn(1, 8, 12, generator = g), torch.randn(8, 4, generator = g), torch.randn(8, generator = g)
+    cuts = ((0, 1), (1, 6), (6, 12))   # a 1-token document, one wider than the kernel, the rest
+    seq_idx = torch.cat([torch.full((e - s,), i, dtype = torch.int32) for i, (s, e) in enumerate(cuts)])[None]
+    y = modeling.causal_conv1d_fn(x, w, b, activation = "silu", seq_idx = seq_idx)
+    expected = torch.cat([gcc.causal_conv1d_reference(x[..., s:e], w, b, "silu") for s, e in cuts], dim = -1)
+    torch.testing.assert_close(y, expected)
