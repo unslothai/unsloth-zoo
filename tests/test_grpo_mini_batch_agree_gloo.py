@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Under FSDP2's sharded layout every forward is collective, so GRPO ranks that ran a different number of
-forwards hung (2xT4, Gemma3 1B GRPO, UNSLOTH_FSDP2_LAYOUT=sharded: one rank all-gathered a block while the other
-was in backward). The mini batch is sized from the rank's own sequence length, so on such a model the ranks
-agree on one (unsloth turns packing / PrefixGrouper off there, whose self-verify forwards are also per rank)."""
+"""Sharded FSDP2 GRPO hung when ranks picked different mini batch sizes (2xT4, Gemma3 1B)."""
 
 from __future__ import annotations
 

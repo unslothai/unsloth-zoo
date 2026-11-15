@@ -1884,11 +1884,7 @@ pass
 
 
 def grpo_forwards_are_collective(model):
-    """True when every forward of `model` all-gathers across ranks: Unsloth's native FSDP2 sharded layout
-    reshards its blocks after each forward. Ranks must then run the same number of forwards, so per-rank
-    choices (the mini batch sized from this rank's sequence length; unsloth turns off sequence packing and
-    PrefixGrouper, whose self-verify forwards run on the rank whose packed length grew) would hang one rank
-    in a block all-gather."""
+    """FSDP2 sharded layout: every forward all-gathers, so ranks must run the same number of forwards."""
     import torch.distributed as dist
     if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
         return False
@@ -1904,7 +1900,6 @@ pass
 
 
 def grpo_agree_mini_batch(B, device):
-    """The largest chunk count over the ranks, so no rank forwards more rows than it sized for (collective)."""
     import torch.distributed as dist
     value = torch.tensor([int(B)], dtype = torch.int64, device = device)
     dist.all_reduce(value, op = dist.ReduceOp.MAX)
