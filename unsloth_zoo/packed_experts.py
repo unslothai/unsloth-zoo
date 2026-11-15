@@ -367,15 +367,20 @@ class _PackedExpertParam(torch.nn.Parameter):
         return total
 
     def to(self, *args, **kwargs):
-        # Only a device move applies to the packed bytes; a dtype cast would destroy them.
+        # Only a device move applies to the packed bytes; a dtype cast would destroy them. _parse_to refuses
+        # copy = (compressed-tensors' offload passes it on the first forward of a compressed checkpoint).
+        copy = bool(kwargs.pop("copy", False))
         device, _, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
-        if device is None or torch.device(device) == self.device:
+        same = device is None or torch.device(device) == self.device
+        if same and not copy:
             return self
+        device = self.device if same else device
+        move = (lambda t: t.clone()) if same else (lambda t: t.to(device, non_blocking = non_blocking))
         kwargs = self._init_kwargs()
-        kwargs["packed_scales"] = self.packed_scales.to(device, non_blocking = non_blocking)
+        kwargs["packed_scales"] = move(self.packed_scales)
         if self.packed_global is not None:
-            kwargs["packed_global"] = self.packed_global.to(device, non_blocking = non_blocking)
-        return type(self)(self.data.to(device, non_blocking = non_blocking), **kwargs)
+            kwargs["packed_global"] = move(self.packed_global)
+        return type(self)(move(self.data), **kwargs)
 
     def copy_(self, src, non_blocking = False):
         if type(src) is not type(self):
