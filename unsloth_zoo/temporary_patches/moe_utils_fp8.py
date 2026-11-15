@@ -1135,6 +1135,9 @@ def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor, block_s
     which is only exact when rows/cols are block multiples.
     """
     rows, cols = W_fp8.shape
+    if scale_inv.dtype == torch.uint8:
+        # MXFP8 (compressed-tensors mxfp8-quantized): e8m0 exponent bytes, scale = 2 ** (byte - 127), one per 32.
+        scale_inv = (scale_inv.to(torch.float32) - 127.0).exp2()
     out_dtype = scale_inv.dtype if scale_inv.dtype.is_floating_point else torch.float32
     W = W_fp8.to(out_dtype)
     if scale_inv.numel() == 1:
