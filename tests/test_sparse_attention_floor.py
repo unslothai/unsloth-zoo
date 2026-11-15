@@ -182,3 +182,27 @@ def test_flex_is_never_eligible_without_flex_attention(monkeypatch):
         assert sa._flex_eligible(q)
         monkeypatch.setattr(sa, "_HAS_FLEX", False)
     assert not sa._flex_eligible(q)
+
+
+def _backend_compiler_failed(inner):
+    from torch._dynamo.exc import BackendCompilerFailed
+    try:
+        return BackendCompilerFailed(lambda *args: None, inner, None)   # torch >= 2.7: + first_useful_frame
+    except TypeError:
+        return BackendCompilerFailed(lambda *args: None, inner)
+
+
+def test_a_backend_compile_failure_is_latched_not_raised(monkeypatch):
+    # Eager QSA tries flex first and compiles it; on torch 2.6 (Colab L4) Inductor could not lower flex at the QSA
+    # shape and raised BackendCompilerFailed, which _latch re-raised as a trace-time error: the eager step crashed
+    # instead of falling back to the kernel fold. Real trace-time and memory failures still propagate.
+    import torch._dynamo.exc
+    monkeypatch.setattr(sa, "_FAILED", {})
+    q = torch.randn(1, 4, 2, 16)
+    sa._latch("flex", q, 4, _backend_compiler_failed(RuntimeError("No valid triton configs")))
+    assert sa._failure_key("flex", q, 4) in sa._FAILED
+    with pytest.raises(torch._dynamo.exc.BackendCompilerFailed):
+        sa._latch("flex", q, 5, _backend_compiler_failed(torch.OutOfMemoryError("out of memory")))
+    with pytest.raises(torch._dynamo.exc.Unsupported):
+        sa._latch("flex", q, 6, torch._dynamo.exc.Unsupported("trace-time"))
+    assert list(sa._FAILED) == [sa._failure_key("flex", q, 4)]

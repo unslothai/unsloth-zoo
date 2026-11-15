@@ -454,8 +454,12 @@ def _run(backend, q, kv, attn_sink, topk_idxs, softmax_scale):
 
 
 def _latch(backend, q, k, error):
-    # Never swallow trace-time, capture or memory failures: the shape class is not at fault.
-    if isinstance(error, torch.OutOfMemoryError) or type(error).__module__.startswith("torch._dynamo"):
+    # Never swallow trace-time, capture or memory failures: the shape class is not at fault. A backend's own compile
+    # failure is (flex compiles flex_attention eagerly; torch 2.6 wraps an Inductor lowering failure for the shape,
+    # e.g. on L4, in BackendCompilerFailed): latch it unless the inner error is a memory failure.
+    from torch._dynamo.exc import BackendCompilerFailed
+    inner = getattr(error, "inner_exception", error) if isinstance(error, BackendCompilerFailed) else error
+    if isinstance(inner, torch.OutOfMemoryError) or (inner is error and type(error).__module__.startswith("torch._dynamo")):
         raise error
     if q.is_cuda and torch.cuda.is_current_stream_capturing():
         raise error
