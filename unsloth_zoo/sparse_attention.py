@@ -61,13 +61,20 @@ SPARSE_ATTN_STATS = {"gather": 0, "triton": 0, "flex": 0, "torch": 0, "hd512": 0
 QSA_TIE_STATS = {"chunks": 0, "tied_rows": 0}
 
 
+@torch.compiler.assume_constant_result
+def _env(name, default):
+    """os.environ lookup that traces on every supported torch: torch 2.4 cannot inline os.environ.get under
+    fullgraph ("Mapping.get" in skipfiles). Traced calls bake the value read at trace time, as 2.6+ already do."""
+    return os.environ.get(name, default)
+
+
 def _exact_ties():
     """UNSLOTH_QWEN4_EXP_EXACT_TIES=1: rows whose k-th and (k+1)-th block scores tie are recomputed exactly as
     transformers' indexer does (its matmul and topk over that row's candidates), so the kept tokens are the
     reference's. Off by default: it needs a host sync per query chunk and one small topk per tied row (L4, medium
     Qwen at 4k: ~300 tied rows per step, 756 vs 641 ms per step). Without it a tied row may keep a different,
     equally-scored block (torch.topk's tie order is unspecified); the score multiset is the reference's."""
-    return os.environ.get("UNSLOTH_QWEN4_EXP_EXACT_TIES", "0") == "1"
+    return _env("UNSLOTH_QWEN4_EXP_EXACT_TIES", "0") == "1"
 
 _BACKENDS = ("gather", "triton", "flex", "torch")
 _FAILED = {}
@@ -91,7 +98,7 @@ def _count(key):
 
 def _forced_backend(window = False):
     """UNSLOTH_SPARSE_ATTN_BACKEND; "hd512" only where it exists (the window-only form)."""
-    value = os.environ.get("UNSLOTH_SPARSE_ATTN_BACKEND", "").strip().lower()
+    value = _env("UNSLOTH_SPARSE_ATTN_BACKEND", "").strip().lower()
     return value if value in (_BACKENDS + ("hd512",) if window else _BACKENDS) else None
 
 

@@ -135,3 +135,20 @@ def test_triton_kernels_compile_once_across_lengths():
     # index fwd: with the sink, and without it for the window's compressed part; window fwd / dq: one with prior.
     assert grown == {"_sparse_mqa_fwd": 2, "_sparse_mqa_bwd": 1, "_window_fwd": 1, "_window_bwd_dq": 1,
                      "_window_bwd_dkv": 1}, grown
+
+
+@pytest.mark.parametrize("form", ["index", "window"])
+def test_dispatch_traces_fullgraph_with_env_reads(monkeypatch, form):
+    # The backend override is an environment variable read during dispatch; torch 2.4 cannot inline os.environ.get
+    # under fullgraph. The CPU path (torch reference) traces the same dispatch code.
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")
+    torch._dynamo.reset()
+    q, kv = torch.randn(1, 9, 2, 16), torch.randn(1, 11, 16)
+    sink, idx = torch.randn(2), torch.randint(-1, 11, (1, 9, 4)).int()
+    wkv = torch.randn(1, 9, 16)
+    if form == "index":
+        fn = lambda q, kv, sink, idx: sa.sparse_attn(q, kv, sink, idx, 0.25)
+    else:
+        fn = lambda q, kv, sink, idx: sa.sparse_attn_window(q, wkv, kv, idx, sink, 0.25, 4)
+    got = torch.compile(fn, backend = "eager", fullgraph = True)(q, kv, sink, idx)
+    torch.testing.assert_close(got, fn(q, kv, sink, idx))
