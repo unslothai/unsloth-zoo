@@ -133,7 +133,12 @@ def test_native_loop_backend_casts_dense_experts_like_the_native_forward(referen
     want = reference_forward(experts, hidden, index, weights)
     got = forward_native_moe_loop(experts, hidden, index, weights)
     assert got.dtype == want.dtype == dtype
-    torch.testing.assert_close(got, want, rtol = 0, atol = 0)
+    if dtype == torch.float32:
+        # An fp32 result keeps the last-bit differences of the CPU's matmul kernel, which varies by runner
+        # (seen: 5.7e-6 abs on some CI hosts); fp32 tolerances still catch a forward that skipped the cast.
+        torch.testing.assert_close(got, want)
+    else:
+        torch.testing.assert_close(got, want, rtol = 0, atol = 0)
 
 
 def test_native_loop_backend_keeps_a_cancelling_residual(patched):
