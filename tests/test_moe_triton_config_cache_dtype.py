@@ -112,7 +112,9 @@ def _selection_prefix():
         calls.append(kwargs["dtype"])
         return (None, None, None)
 
+    # The real module's globals underneath, so a helper the prefix starts calling resolves; the stubs win.
     ns = {
+        **vars(moe_utils),
         "torch": torch,
         "get_or_autotune_moe_kernels": tuner,
         "_triton_grouped_gemm_dims_supported": lambda *a: True,
