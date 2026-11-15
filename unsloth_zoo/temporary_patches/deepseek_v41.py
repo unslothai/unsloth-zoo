@@ -341,13 +341,17 @@ def patch_deepseek_v41_moe():
         return
     if os.environ.get("UNSLOTH_DSV41_MOE_BACKEND", "1") == "0":
         return
+    if __package__ != "unsloth_zoo.temporary_patches":
+        # The CPU runtime loads this file standalone (unsloth_zoo.cpu) to keep the GPU kernels out: there the native
+        # sorted loop stays, and `.moe_utils` would not resolve anyway.
+        return
     try:
-        from .moe_utils import (
+        from unsloth_zoo.temporary_patches.moe_utils import (
             extract_moe_lora_weights_for_grouped_mm,
             get_forward_moe_backend,
             patch_param_wrapper_for_moe,
         )
-        from .utils import patch_function
+        from unsloth_zoo.temporary_patches.utils import patch_function
     except Exception:
         return
     patch_param_wrapper_for_moe()
@@ -364,10 +368,23 @@ def patch_deepseek_v41_moe():
             enable_logging = UNSLOTH_ENABLE_LOGGING, logger_obj = logger,
         )
 
+    backend_forward = get_forward_moe_backend()
+
+    def forward(
+        self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
+    ) -> torch.Tensor:
+        # Released fp4 experts load as raw MXFP4 blocks; the native forward packs them on first use, so does this.
+        if "gate_up_blocks" in self._parameters:
+            self.finalize_packed()
+        return backend_forward(self, hidden_states, top_k_index, top_k_weights)
+
+    flags = ("_unsloth_lora_extractor_fn", "_unsloth_own_apply_gate", "_unsloth_moe_fp32_reference")
     experts_cls._unsloth_lora_extractor_fn = staticmethod(_dsv41_lora_extractor)
     experts_cls._unsloth_own_apply_gate = True
-    if not patch_function(experts_cls, "forward", get_forward_moe_backend()):
-        for name in ("_unsloth_lora_extractor_fn", "_unsloth_own_apply_gate"):
+    # The reference computes the SwiGLU and the routed-output sum in fp32 (native DeepseekV41Experts.forward).
+    experts_cls._unsloth_moe_fp32_reference = True
+    if not patch_function(experts_cls, "forward", forward):
+        for name in flags:
             if name in vars(experts_cls):
                 delattr(experts_cls, name)
         return

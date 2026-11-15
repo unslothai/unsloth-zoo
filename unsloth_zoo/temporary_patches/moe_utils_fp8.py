@@ -846,7 +846,10 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
     hidden_states = hidden_states.view(-1, hidden_dim)
     top_k_index = top_k_index.view(-1, top_k_index.shape[-1])
     top_k_weights = top_k_weights.view(-1, top_k_weights.shape[-1])
-    final_hidden_states = torch.zeros_like(hidden_states)
+    # fp32-reference experts (Unsloth's native DeepSeek-V4.1): gate and routed-output sum in fp32, as their own forward.
+    fp32_reference = bool(getattr(type(self), "_unsloth_moe_fp32_reference", False))
+    accum_dtype = torch.float32 if fp32_reference else input_dtype
+    final_hidden_states = torch.zeros_like(hidden_states, dtype = accum_dtype)
 
     gate_up_weight, _, _ = _get_moe_weight_and_quant_info(self, "gate_up_proj")
     down_weight, _, _ = _get_moe_weight_and_quant_info(self, "down_proj")
@@ -883,7 +886,10 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
             gate_up_out = F.linear(current_state, expert_gate_up, gate_up_bias_expert)
 
         if getattr(self, "_unsloth_own_apply_gate", False):
-            current_hidden_states = self._apply_gate(gate_up_out)
+            if fp32_reference:
+                current_hidden_states = self._apply_gate(gate_up_out.float()).to(gate_up_out.dtype)
+            else:
+                current_hidden_states = self._apply_gate(gate_up_out)
         elif "GptOssExperts" in self.__class__.__name__:
             gate = gate_up_out[..., ::2]
             up = gate_up_out[..., 1::2]
@@ -919,10 +925,13 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
         else:
             current_hidden_states = F.linear(current_hidden_states, expert_down, down_bias_expert)
 
-        current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-        final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(input_dtype))
+        routing_weights = top_k_weights[token_idx, top_k_pos, None]
+        if fp32_reference:
+            current_hidden_states, routing_weights = current_hidden_states.float(), routing_weights.float()
+        current_hidden_states = current_hidden_states * routing_weights
+        final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(accum_dtype))
 
-    return final_hidden_states.view(original_shape)
+    return final_hidden_states.to(input_dtype).view(original_shape)
 
 
 def _release_dequantized_banks_until_backward(output, inputs, banks):
