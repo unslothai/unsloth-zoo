@@ -369,7 +369,9 @@ def resolve_modeling_module(model_type):
     location = f"transformers.models.{model_type}.modeling_{model_type}"
     try:
         return location, importlib.import_module(location)
-    except ModuleNotFoundError:
+    except ImportError:
+        # Not shipped, or shipped but unimportable here (ModuleNotFoundError is an ImportError): a native module
+        # that is already imported can still serve.
         pass
     for name in (NATIVE_MODELING_MODULES.get(model_type), f"unsloth.models.{model_type}.modeling"):
         module = sys.modules.get(name) if name else None
@@ -382,7 +384,8 @@ def resolve_modeling_module(model_type):
         except Exception:
             continue
         if resolved is module:
-            globals().setdefault(name.split(".")[0], root)
+            # The root the compiler's evals use: the one just verified (a reimported package replaces the old root).
+            globals()[name.split(".")[0]] = root
             return name, module
     return None, None
 
@@ -6431,9 +6434,12 @@ def _compiled_source_key():
     )
 
 
-def _unpatch_modeling_file(modeling_file):
-    """Restore modeling_file originals and rerun pre_compile patches so the next pass regenerates."""
-    originals = _MODELING_FILE_ORIGINALS.get(modeling_file.__name__, {})
+def _unpatch_modeling_file(modeling_file, model_location = None):
+    """Restore modeling_file originals and rerun pre_compile patches so the next pass regenerates. The originals are
+    keyed by the location the compiler resolved (a registered native module's alias can differ from __name__)."""
+    originals = _MODELING_FILE_ORIGINALS.get(model_location or modeling_file.__name__)
+    if originals is None:
+        originals = _MODELING_FILE_ORIGINALS.get(modeling_file.__name__, {})
     for (container, key), value in originals.items():
         try:
             if container is None:
@@ -6526,7 +6532,7 @@ def unsloth_compile_transformers(
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__") and _MODELING_FILE_KEYS.get(
         model_location, _compiled_source_key()
     ) != _compiled_source_key():
-        _unpatch_modeling_file(modeling_file)
+        _unpatch_modeling_file(modeling_file, model_location)
     if not hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         _MODELING_FILE_ORIGINALS.pop(model_location, None)
     disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)

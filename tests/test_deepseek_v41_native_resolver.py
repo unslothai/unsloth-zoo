@@ -68,3 +68,60 @@ def test_adapter_of_a_native_model_resolves_without_the_base_config(monkeypatch,
     config.auto_mapping = {"base_model_class": "DeepseekV41ForCausalLM", "parent_library": location}
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     assert hf_utils.get_transformers_model_type(config) == ["deepseek_v41"]
+
+
+def test_recompilation_restores_originals_stored_under_the_registered_location(monkeypatch):
+    # A registered native module is compiled under its registration location, which may differ from its __name__;
+    # the originals saved under that key must be the ones put back before the next pass.
+    import unsloth_zoo.compiler as compiler
+
+    module = types.ModuleType("unsloth.models.fake_native.modeling")
+    original, compiled = object(), object()
+    module.Block = compiled
+    monkeypatch.setattr(compiler, "_MODELING_FILE_ORIGINALS", {"alias.fake_native.modeling": {(None, "Block"): original}})
+    monkeypatch.setattr("unsloth_zoo.temporary_patches.TEMPORARY_PATCHES", [])
+    compiler._unpatch_modeling_file(module, "alias.fake_native.modeling")
+    assert module.Block is original
+
+
+def _fake_native(monkeypatch, root_name = "fakenativepkg"):
+    root = types.ModuleType(root_name)
+    models = types.ModuleType(f"{root_name}.models")
+    package = types.ModuleType(f"{root_name}.models.fake_dsv")
+    modeling = types.ModuleType(f"{root_name}.models.fake_dsv.modeling")
+    root.models, models.fake_dsv, package.modeling = models, package, modeling
+    for module in (root, models, package, modeling):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    return root, modeling
+
+
+def test_resolver_falls_back_to_the_native_module_when_transformers_fails_to_import(monkeypatch):
+    import importlib
+    import unsloth_zoo.compiler as compiler
+
+    root, modeling = _fake_native(monkeypatch)
+    monkeypatch.setitem(compiler.NATIVE_MODELING_MODULES, "fake_dsv", modeling.__name__)
+    real = importlib.import_module
+
+    def broken(name, *args, **kwargs):
+        if name.startswith("transformers.models.fake_dsv"):
+            raise ImportError("cannot import name X from a half-installed transformers")
+        return real(name, *args, **kwargs)
+
+    monkeypatch.setattr(compiler.importlib, "import_module", broken)
+    assert compiler.resolve_modeling_module("fake_dsv") == (modeling.__name__, modeling)
+
+
+def test_resolver_rebinds_a_reimported_native_root(monkeypatch):
+    import unsloth_zoo.compiler as compiler
+
+    root, modeling = _fake_native(monkeypatch)
+    monkeypatch.setitem(compiler.NATIVE_MODELING_MODULES, "fake_dsv", modeling.__name__)
+    monkeypatch.delitem(compiler.__dict__, "fakenativepkg", raising = False)
+    assert compiler.resolve_modeling_module("fake_dsv")[1] is modeling
+    assert compiler.__dict__["fakenativepkg"] is root
+    # The package is imported again: new root, new module objects.
+    root2, modeling2 = _fake_native(monkeypatch)
+    assert compiler.resolve_modeling_module("fake_dsv")[1] is modeling2
+    assert compiler.__dict__["fakenativepkg"] is root2
+    monkeypatch.delitem(compiler.__dict__, "fakenativepkg", raising = False)
