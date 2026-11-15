@@ -123,6 +123,8 @@ def test_wrapper_and_inner_enable_and_recompute(patched, which, entry):
     # 3 blocks x (forward + recompute)
     assert _Block.calls == 6
     assert model.language_model.layers[0].lin.weight.grad is not None
+    getattr(target, entry.replace("enable", "disable"))()
+    assert not any(b.gradient_checkpointing for b in model.language_model.layers)
 
 
 def test_grads_match_no_checkpointing(patched):

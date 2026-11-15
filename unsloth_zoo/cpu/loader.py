@@ -134,11 +134,16 @@ def _checkpoint_quant_method(model_name, config = None, **kwargs):
     return _quant_method_of(config_dict) if isinstance(config_dict, dict) else None
 
 
+def _is_fp8_dequantize(op):
+    # By type name: transformers.integrations.finegrained_fp8.Fp8Dequantize, without importing that module.
+    return type(op).__name__ == "Fp8Dequantize"
+
+
 def _has_fp8_dequantize_conversion(model):
     """True when a load conversion of ``model`` dequantizes FP8 (transformers' Fp8Dequantize operation)."""
     try:
         return any(
-            type(op).__name__ == "Fp8Dequantize"
+            _is_fp8_dequantize(op)
             for conversion in getattr(model, "_weight_conversions", None) or ()
             for op in getattr(conversion, "operations", None) or ()
         )
@@ -146,20 +151,102 @@ def _has_fp8_dequantize_conversion(model):
         return False
 
 
+def _drop_fp8_dequantize_conversions(model):
+    """Mirror of unsloth.models.loader_utils._drop_fp8_dequantize_conversions (unimportable without Triton)."""
+    conversions = getattr(model, "_weight_conversions", None)
+    if not conversions:
+        return 0
+
+    def _strip(pattern):
+        return pattern[:-1] if pattern.endswith("$") else pattern
+
+    def _targets(conversion):
+        return tuple(_strip(p) for p in getattr(conversion, "_original_target_patterns", None) or [])
+
+    def _sources(patterns):
+        patterns = [_strip(p) for p in patterns or []]
+        return tuple(sorted(p for p in patterns if not p.endswith((".weight_scale_inv", ".activation_scale"))))
+
+    def _source_forms(conversion):
+        return {
+            _sources(getattr(conversion, "_original_source_patterns", None)),
+            _sources(getattr(conversion, "source_patterns", None)),
+        }
+
+    def _ops(conversion):
+        operations = getattr(conversion, "operations", None) or []
+        return tuple(type(op).__name__ for op in operations if not _is_fp8_dequantize(op))
+
+    def _signature(conversion):
+        return (
+            type(conversion),
+            getattr(conversion, "scope_prefix", None),
+            min(_source_forms(conversion)),
+            _targets(conversion),
+            _ops(conversion),
+        )
+
+    def _has_dequant(conversion):
+        return any(_is_fp8_dequantize(op) for op in getattr(conversion, "operations", None) or [])
+
+    plain = None
+    kept, changed = [], 0
+    retained = {_signature(c) for c in conversions if not _has_dequant(c)}
+    for conversion in conversions:
+        operations = getattr(conversion, "operations", None) or []
+        if not _has_dequant(conversion):
+            kept.append(conversion)
+            continue
+        if getattr(getattr(model, "config", None), "quantization_config", None) is None:
+            model._unsloth_fp8_dequantized = True
+        if all(_is_fp8_dequantize(op) for op in operations):
+            changed += 1
+            continue
+        if plain is None:
+            try:
+                from transformers.conversion_mapping import get_model_conversion_mapping
+
+                plain = get_model_conversion_mapping(model, None, None)
+            except Exception:
+                plain = []
+        # Dequantization can lose scope_prefix; restore every matching scoped counterpart.
+        scope = getattr(conversion, "scope_prefix", None)
+        sources = _source_forms(conversion)
+        matches = [
+            c
+            for c in plain
+            if type(c) is type(conversion)
+            and _targets(c) == _targets(conversion)
+            and _source_forms(c) & sources
+            and _ops(c) == _ops(conversion)
+            and (scope is None or getattr(c, "scope_prefix", None) == scope)
+        ]
+        if not matches:
+            _print(
+                "an fp8 load conversion has no 16bit counterpart; a merged save may write fp8 weights for "
+                f"{list(_targets(conversion))}."
+            )
+            kept.append(conversion)
+            continue
+        for match in matches:
+            signature = _signature(match)
+            if signature not in retained:
+                retained.add(signature)
+                kept.append(match)
+        changed += 1
+    if changed:
+        model._weight_conversions = kept
+    return changed
+
+
 def _drop_reverse_fp8_conversions(model):
-    """A checkpoint transformers dequantized from FP8 on load (no FP8 kernels on CPU) keeps Fp8Dequantize
-    conversions, which a merged save reverses into FP8 bytes without FP8 metadata. The GPU loaders drop them;
-    so does this one when Unsloth provides the helper. Only a model that carries such a conversion imports it:
-    unsloth.models pulls in the GPU model stack, which the CPU route must not load for an ordinary checkpoint."""
+    """Drop kept Fp8Dequantize conversions, which a merged save reverses into FP8 bytes without FP8 metadata."""
     if not _has_fp8_dequantize_conversion(model):
         return 0
     try:
-        from unsloth.models.loader_utils import _drop_fp8_dequantize_conversions
-    except Exception:
-        return 0
-    try:
-        return _drop_fp8_dequantize_conversions(model) or 0
-    except Exception:
+        return _drop_fp8_dequantize_conversions(model)
+    except Exception as error:
+        _print(f"could not drop the reverse fp8 conversions ({error}); a merged save may write fp8 weights.")
         return 0
 
 
@@ -406,6 +493,10 @@ class FastCPUModel:
                 use_4bit = False
                 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
         _drop_reverse_fp8_conversions(model)
+        # The load may import a modeling module for the first time (Unsloth's native DeepSeek-V4.1 is imported
+        # lazily): its device-independent patches (checkpoint replay, config aliases) apply only once it exists.
+        from . import runtime as _runtime
+        _runtime.apply_cpu_security_patches()
         if auto_dtype:
             dtype = model.dtype
             if dtype == torch.float16 and not use_4bit:
@@ -514,10 +605,35 @@ class FastCPUModel:
             # Reloaded LoRA checkpoint: a second get_peft_model would reset the saved adapter weights.
             _print("this model already has LoRA adapters, keeping them.")
             return model
+        # A model built by the caller (not through from_pretrained) may have imported its modeling module since.
+        from . import runtime as _runtime
+        _runtime.apply_cpu_security_patches()
         if use_gradient_checkpointing is None:
             use_gradient_checkpointing = getattr(model, "_unsloth_cpu_gradient_checkpointing", "unsloth")
         leaf_names = {name.rsplit(".", 1)[-1] for name, _ in model.named_modules()}
-        if target_modules is None:
+        # Models with their own projection names (Unsloth's native DeepSeek-V4.1) translate q/k/v/o/gate/up/down_proj,
+        # "all-linear" and None into their real Linears, exactly as the GPU get_peft_model does.
+        remap = getattr(model, "unsloth_lora_target_modules", None)
+        remapped_targets = False
+        if callable(remap) and kwargs.get("finetune_language_layers", True):
+            embeddings = []
+            if target_modules is not None and not isinstance(target_modules, str):
+                embeddings = [m for m in target_modules if m in ("embed_tokens", "lm_head")]
+                target_modules = [m for m in target_modules if m not in embeddings]
+            remapped = remap(
+                target_modules,
+                attention = kwargs.get("finetune_attention_modules", True),
+                mlp = kwargs.get("finetune_mlp_modules", True),
+            )
+            if remapped is not target_modules:
+                target_modules = remapped
+                remapped_targets = True
+            # Trained in full whatever the remapper returned (it may hand back the list it was given).
+            if embeddings:
+                modules_to_save = list(dict.fromkeys([*(modules_to_save or []), *embeddings]))
+        if remapped_targets:
+            pass
+        elif target_modules is None:
             # Unsloth's usual projections where the model has them, else PEFT's per-architecture default.
             candidates = _with_fused_projections(_DEFAULT_TARGET_MODULES, leaf_names)
             target_modules = [m for m in candidates if m in leaf_names]
