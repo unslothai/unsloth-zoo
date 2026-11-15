@@ -15,9 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""CsmDepthDecoderModel decode steps over a StaticCache capture as one CUDA graph and replay at the next codebook
-position: the positions are computed on the device (transformers 5.x reads the cache length on the host with
-torch.arange(past_seen_tokens, ...) and branches on position_ids[0] == 0). CUDA only."""
+"""transformers 5.x CSM depth decode steps must replay as a CUDA graph (positions on device)."""
 import inspect
 import os
 
@@ -67,12 +65,11 @@ def test_depth_decode_step_replays_at_the_next_position():
         model(input_ids = prefill, backbone_last_hidden_state = torch.randn(1, 32, device = dev),
               past_key_values = cache, use_cache = True, logits_to_keep = 1)
         token = torch.tensor([[7]], device = dev)
-        # generate()'s decode step: one token, its own logits (logits_to_keep = 1)
         step = lambda: model(input_ids = token, past_key_values = cache, use_cache = True, logits_to_keep = 1).logits  # noqa: E731
 
         start = _state(cache)
         eager_1 = step().clone()
-        eager_2 = step().clone()  # the next codebook position, from the advanced device counter
+        eager_2 = step().clone()
         _restore(start)
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())

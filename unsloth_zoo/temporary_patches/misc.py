@@ -323,10 +323,8 @@ TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
 
 
 def patch_CsmDepthDecoderModel_forward():
-    # transformers 5.x builds the depth decoder's positions with torch.arange(past_seen_tokens, ...): a StaticCache's
-    # length is a device tensor, so that reads it on the host, and a decode step without backbone_last_hidden_state
-    # also branches on `position_ids[0] == 0`. Both host syncs make the 31 fixed-length depth steps of every audio
-    # frame impossible to replay as a CUDA graph. Same positions computed on the device; values unchanged.
+    # transformers 5.x syncs to host (arange(past_seen_tokens), position_ids[0] == 0), blocking CUDA graph replay
+    # of the depth steps. Compute the same positions on device.
     try:
         import transformers.models.csm.modeling_csm as modeling_csm
         from transformers.utils.generic import merge_with_config_defaults
@@ -357,7 +355,7 @@ def patch_CsmDepthDecoderModel_forward():
         past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
         inputs_seq_length = inputs_embeds.shape[1] if inputs_embeds is not None else input_ids.shape[1]
         device = inputs_embeds.device if inputs_embeds is not None else input_ids.device
-        # Custom position_ids are ignored, as upstream: the depth decoder positions are the codebook indices.
+        # Custom position_ids ignored, as upstream.
         position_ids = torch.arange(inputs_seq_length, device = device) + past_seen_tokens
 
         if inputs_embeds is None:
