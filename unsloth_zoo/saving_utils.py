@@ -6951,9 +6951,12 @@ def _get_checkpoint_conversion_mapping(model_class_name):
     Transformers 5 registry. Without that fallback a composite model with a pre-5 flat
     checkpoint loses the bridge to its on-disk weights and fails to merge silently (#5290)."""
     for model_class in _model_classes_named(model_class_name):
-        mapping = getattr(model_class, '_checkpoint_conversion_mapping', {})
+        # A model Unsloth ships natively (DeepSeek-V4.1) loads a foreign checkpoint layout through
+        # renames transformers scopes per submodule; it states them here for the merge.
+        mapping = getattr(model_class, '_unsloth_checkpoint_conversion_mapping', None) or \
+            getattr(model_class, '_checkpoint_conversion_mapping', {})
         if mapping:
-            return mapping
+            return dict(mapping)
     mapping = _registry_checkpoint_conversion_mapping(model_class_name)
     if mapping:
         return mapping
@@ -7406,6 +7409,12 @@ def _reverse_renamed_backed_key(key, reverse_mapping, key_set, valid_prefixes, m
                     if candidate in seen: continue
                     if _lora_key_has_backing(candidate, key_set, valid_prefixes = valid_prefixes):
                         return candidate
+                    # A checkpoint without the base-model prefix (DeepSeek-V4.1's `layers.0.attn.wq_a`
+                    # under `model.layers.0.self_attn.q_a_proj`): transformers adds it at load.
+                    head, dot, rest = candidate.partition(".")
+                    if dot and head == "model" and rest and \
+                            _lora_key_has_backing(rest, key_set, valid_prefixes = valid_prefixes):
+                        return rest
                     seen.add(candidate)
                     next_frontier.append(candidate)
         frontier = next_frontier
