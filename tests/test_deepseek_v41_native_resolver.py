@@ -64,6 +64,9 @@ def test_adapter_of_a_native_model_resolves_without_the_base_config(monkeypatch,
     config.base_model_name_or_path = "/nonexistent/unsloth-dsv41-base"
     config.auto_mapping = {"base_model_class": "DeepseekV41ForCausalLM", "parent_library": location}
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    # get_transformers_model_type records the base name in UNSLOTH_MODEL_NAME. setenv (not delenv, which records
+    # nothing for an unset name) makes monkeypatch restore the previous value, or its absence, after the test.
+    monkeypatch.setenv("UNSLOTH_MODEL_NAME", "")
     assert hf_utils.get_transformers_model_type(config) == ["deepseek_v41"]
 
 

@@ -264,16 +264,20 @@ def _isolate_xet_health_state(tmp_path_factory, monkeypatch):
 import os as _os
 
 _HIDDEN_STATES_FLAG = "UNSLOTH_RETURN_HIDDEN_STATES"
+# Library code writes these process-wide (get_transformers_model_type records UNSLOTH_MODEL_NAME), and later tests
+# read them: the Gemma 3 patches skip or repatch by model name, and subprocess tests inherit the environment.
+_RESTORED_ENV = (_HIDDEN_STATES_FLAG, "UNSLOTH_MODEL_NAME")
 
 
 @_pytest.fixture(autouse = True)
 def _restore_hidden_states_flag():
-    before = _os.environ.get(_HIDDEN_STATES_FLAG)
+    before = {name: _os.environ.get(name) for name in _RESTORED_ENV}
     yield
-    if before is None:
-        _os.environ.pop(_HIDDEN_STATES_FLAG, None)
-    else:
-        _os.environ[_HIDDEN_STATES_FLAG] = before
+    for name, value in before.items():
+        if value is None:
+            _os.environ.pop(name, None)
+        else:
+            _os.environ[name] = value
 
 
 # UNSLOTH_COMPILE_DISABLE only stops torch.compile, but since PR/issue 1866 fused losses and maybe_compile honour it
