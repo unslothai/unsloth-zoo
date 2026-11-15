@@ -112,11 +112,16 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
         from transformers.models.qwen4_exp import modeling_qwen4_exp
         rope = modeling_qwen4_exp.apply_rotary_pos_emb
     position_embeddings = tuple(position_embeddings)
-    with torch.no_grad():
-        selected = qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, rope,
-                                     past_key_values = past_key_values)
-    if selected is None:
-        return None
+    # Traced (Unsloth's decoder-layer block compile, or any torch.compile): the selection already leaves the graph,
+    # so the attention leaves with it in one region and keeps the eager dispatch (flex first, latched fallbacks)
+    # instead of the traced one (no flex: the Triton fold, 16x slower on L4 at 4k). Same break count as before.
+    fused = torch.compiler.is_compiling() and past_key_values is None
+    if not fused:
+        with torch.no_grad():
+            selected = qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, rope,
+                                         past_key_values = past_key_values)
+        if selected is None:
+            return None
 
     cos, sin = (x[:, -seq:, :] for x in position_embeddings)
     input_shape = hidden_states.shape[:-1]
@@ -134,10 +139,27 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
         key_states = key_states.to(value_states.dtype)
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, module.layer_idx)
-    attn_output = sparse_gqa_attn(query_states, key_states, value_states, selected, module.scaling)
+    if fused:
+        attn_output = _select_and_attend(indexer, hidden_states, position_embeddings, attention_mask, rope,
+                                         query_states, key_states, value_states, module.scaling)
+        if attn_output is None:   # not interval-shaped: the reference (projections recomputed there)
+            return None
+    else:
+        attn_output = sparse_gqa_attn(query_states, key_states, value_states, selected, module.scaling)
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = (attn_output * torch.sigmoid(gate)).to(value_states.dtype)
     return module.o_proj(attn_output), None
+
+
+@torch.compiler.disable
+def _select_and_attend(indexer, hidden_states, position_embeddings, attention_mask, rope, query, key, value, scaling):
+    """QSA selection + sparse attention outside any trace (eager dispatch); None when the mask is not interval-shaped."""
+    from unsloth_zoo.sparse_attention import qsa_select_tokens, sparse_gqa_attn
+    with torch.no_grad():
+        selected = qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, rope)
+    if selected is None:
+        return None
+    return sparse_gqa_attn(query, key, value, selected, scaling)
 
 
 def qwen4_exp_attention_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kwargs):
