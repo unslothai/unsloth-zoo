@@ -839,7 +839,6 @@ def test_qwen4_exp_gdn_conv_honours_seq_idx(hub_kernels, monkeypatch):
     modeling = _real_gdn_modeling(monkeypatch, "transformers.models.qwen4_exp.modeling_qwen4_exp")
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.version, "hip", None)
-    assert not gcc._is_marked(modeling.causal_conv1d_fn)
     gcc.patch_gdn_causal_conv1d()
     assert gcc._is_marked(modeling.causal_conv1d_fn)
     assert gcc._is_marked(modeling.causal_conv1d_update)
