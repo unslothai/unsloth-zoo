@@ -36,6 +36,10 @@ Reader (``UNSLOTH_FROZEN_TABLE_READER``): ``mmap`` (default) or ``pread`` (threa
 from __future__ import annotations
 
 __all__ = [
+    "frozen_table_step_stats",
+    "frozen_table_provenance",
+    "compare_frozen_table_provenance",
+    "set_frozen_table_memo_slots",
     "FrozenTableStore",
     "UnslothFrozenTableEmbedding",
     "FROZEN_TABLE_STATS",
@@ -55,6 +59,7 @@ __all__ = [
 
 from contextlib import contextmanager
 import copy
+import hashlib
 import json
 import mmap
 import os
@@ -74,28 +79,75 @@ FROZEN_TABLE_STATS = {
     "rows": 0,
     "unique_rows": 0,
     "memo_hits": 0,
+    "memo_misses": 0,
     "bytes_read_est": 0,
+    "resident_gathers": 0,
 }
 _STATS_LOCK = threading.Lock()
 _STEP = [0]
+# Lookups since the last frozen_table_next_step(): memo hits (a checkpoint recompute served without a re-read) and
+# misses (a gather from the store).
+_STEP_STATS = {"memo_hits": 0, "memo_misses": 0}
+
+
+def _default_memo_slots() -> int:
+    # One entry, the memory a table always used; pipeline parallel sets its in-flight count itself.
+    try:
+        return max(1, int(os.environ.get("UNSLOTH_FROZEN_TABLE_MEMO_SLOTS", "1")))
+    except ValueError:
+        return 1
 
 
 def reset_frozen_table_stats():
     with _STATS_LOCK:
         for k in FROZEN_TABLE_STATS:
             FROZEN_TABLE_STATS[k] = 0
+        for k in _STEP_STATS:
+            _STEP_STATS[k] = 0
 
 
 def frozen_table_next_step() -> int:
-    """Invalidate every module memo (call once per optimizer step if ids tensors are reused in place)."""
-    _STEP[0] += 1
+    """Invalidate every module memo (call once per optimizer step if ids tensors are reused in place) and start a
+    new count for frozen_table_step_stats()."""
+    with _STATS_LOCK:
+        _STEP[0] += 1
+        for k in _STEP_STATS:
+            _STEP_STATS[k] = 0
+    # Entries of the previous step can never match again (the step is in their key): free their rows now.
+    for ref in list(_MODULES.values()):
+        module = ref()
+        if module is not None and module._memo:
+            module._memo = []
     return _STEP[0]
+
+
+def frozen_table_step_stats() -> Dict[str, int]:
+    """{"memo_hits", "memo_misses"} of every frozen table lookup since the last frozen_table_next_step()."""
+    with _STATS_LOCK:
+        return dict(_STEP_STATS)
+
+
+def set_frozen_table_memo_slots(module: nn.Module, slots: int) -> int:
+    """Rows each frozen table of `module` keeps for checkpoint recomputes: one entry per lookup still waiting for
+    its backward. A pipeline schedule has that many micro-batches in flight per stage (GPipe: all of them, 1F1B:
+    the stages from this one to the last), each recomputed in its own backward. Returns the number of tables."""
+    slots = max(1, int(slots))
+    n = 0
+    for m in module.modules():
+        if isinstance(m, UnslothFrozenTableEmbedding):
+            m.memo_slots = slots
+            if m._memo:
+                m._memo = list(m._memo[:slots])
+            n += 1
+    return n
 
 
 def _bump(**kw):
     with _STATS_LOCK:
         for k, v in kw.items():
             FROZEN_TABLE_STATS[k] += int(v)
+            if k in _STEP_STATS:
+                _STEP_STATS[k] += int(v)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -121,6 +173,9 @@ if hasattr(torch, "float8_e8m0fnu"):
     _ST_DTYPES["F8_E8M0"] = (torch.float8_e8m0fnu, 1)
 
 
+_MAX_HEADER_BYTES = 100 * 1024 * 1024
+
+
 def read_safetensors_header(path: str) -> Tuple[dict, int]:
     """Return (header dict, absolute byte offset of the data section)."""
     with open(path, "rb") as f:
@@ -128,7 +183,7 @@ def read_safetensors_header(path: str) -> Tuple[dict, int]:
         if len(raw) != 8:
             raise ValueError(f"Unsloth: {path} is not a safetensors file (short header).")
         (n,) = struct.unpack("<Q", raw)
-        if n > 100 * 1024 * 1024:
+        if n > _MAX_HEADER_BYTES:
             raise ValueError(f"Unsloth: {path} has an implausible safetensors header length {n}.")
         header = json.loads(f.read(n))
     return header, 8 + n
@@ -142,6 +197,9 @@ class TensorLocation:
     shape: Tuple[int, ...]
     offset: int  # absolute byte offset in the file
     nbytes: int
+    # The path as given (before symlinks resolve): hub cache snapshots link into content-addressed blobs, and only
+    # the snapshot path names the file, the repo and the revision.
+    source_path: Optional[str] = None
 
 
 def _checkpoint_files(source: Union[str, Sequence[str]]) -> Tuple[Optional[dict], List[str]]:
@@ -216,6 +274,7 @@ def resolve_tensor_locations(
                 shape=tuple(int(x) for x in meta["shape"]),
                 offset=data_start + int(begin),
                 nbytes=int(end) - int(begin),
+                source_path=os.path.abspath(path),
             )
     if wanted is not None:
         missing = wanted - set(out)
@@ -584,6 +643,41 @@ class FrozenTableStore:
     def __reduce__(self):
         raise TypeError("Unsloth: FrozenTableStore maps checkpoint files and cannot be pickled; rebind after load.")
 
+    def provenance(self) -> dict:
+        """Where this table's rows come from, cheap to compute and to check: per table tensor its name, dtype,
+        shape and a sha256 over a few evenly spaced 64 KiB samples of its bytes (a different checkpoint with the
+        same shapes differs there), in row order, and the fp8 decoder scale; the hub repo id / revision when the
+        files sit in a hub cache snapshot. Per checkpoint file its size and the sha256 of its safetensors header
+        are recorded for information only: other tensors or a repacked file change them while the table's rows
+        stay the same, so compare_frozen_table_provenance does not check them (nor the revision)."""
+        cached = getattr(self, "_provenance", None)
+        if cached is not None:
+            return cached
+        files, tensors = {}, []
+        for plane_name, plane in self.planes.items():
+            # The mappings this store reads rows from, not whatever the paths name now (a file replaced since).
+            for loc, shard in zip(plane.locations, plane.shards):
+                base = os.path.basename(loc.source_path or loc.path)
+                if base not in files:
+                    files[base] = {"size": shard.file.size, "header_sha256": _header_sha256(shard.file)}
+                tensors.append({
+                    "name": loc.name, "plane": plane_name, "file": base, "dtype": loc.dtype,
+                    "shape": list(loc.shape), "sample_sha256": _sample_sha256(shard.file, loc),
+                })
+        first = next(iter(self.planes.values())).locations[0]
+        repo_id, revision = _hub_identity(first.source_path or first.path)
+        self._provenance = {
+            "name": self.name, "num_rows": self.num_rows, "repo_id": repo_id, "revision": revision,
+            "files": files, "tensors": tensors,
+        }
+        scale = getattr(self.decode, "scale", None)
+        if isinstance(scale, torch.Tensor):
+            # A per-tensor fp8 scale read beside the table (weight_scale) scales every decoded row.
+            self._provenance["decode_scale"] = {
+                "dtype": str(scale.dtype).replace("torch.", ""), "values": scale.reshape(-1).double().tolist(),
+            }
+        return self._provenance
+
     def __repr__(self):
         planes = ", ".join(f"{k}:{p.st_dtype}x{p.row_bytes}B/{len(p.shards)} shards" for k, p in self.planes.items())
         return f"FrozenTableStore({self.name}, rows={self.num_rows}, {planes}, mode={self.mode}, reader={self.reader})"
@@ -714,23 +808,74 @@ class FrozenTableStore:
             self._staging_event = ev
         return out
 
-    def gather(self, ids: torch.Tensor, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        """Rows for ``ids`` (any shape, integer) on ``ids.device``: shape ``ids.shape + row shape``."""
+    def resident_on(self, device: torch.device) -> bool:
+        """Every plane already sits on ``device`` (gpu mode): lookups need neither host ids nor a host round trip.
+        ``device`` may be a string; an accelerator without an index means its current device."""
+        device = torch.device(device)
+        if device.index is None and device.type != "cpu":
+            backend = getattr(torch, device.type, None)
+            current = getattr(backend, "current_device", None)
+            if callable(current) and getattr(backend, "is_available", lambda: False)():
+                device = torch.device(device.type, current())
+        dev = self._device_planes
+        return len(dev) == len(self.planes) and len(dev) > 0 and all(t.device == device for t in dev.values())
+
+    def _gather_resident(self, ids: torch.Tensor, flat: torch.Tensor, dtype: Optional[torch.dtype]) -> torch.Tensor:
+        # No unique / .cpu() / int(): each of those blocks the host on the device per lookup, which stalls pipeline
+        # schedules and every captured or compiled region around the lookup. Row decode is per row, so decoding the
+        # rows in id order equals decoding the unique rows and scattering them back.
+        # On an accelerator index_select bounds-checks on the device instead: an out-of-range id is a device-side
+        # assert, which loses the CUDA context (no Python IndexError). UNSLOTH_FROZEN_TABLE_CHECK_IDS=1 checks on
+        # the host first, one sync per lookup, for a recoverable IndexError while debugging.
+        if flat.device.type == "cpu" or os.environ.get("UNSLOTH_FROZEN_TABLE_CHECK_IDS", "0") == "1":
+            lo, hi = int(flat.min()), int(flat.max())
+            if lo < 0 or hi >= self.num_rows:
+                raise IndexError(f"Unsloth: frozen table id out of range [{lo}, {hi}] for {self.num_rows} rows.")
+        raw = {name: plane.index_select(0, flat) for name, plane in self._device_planes.items()}
+        rows = self.decode(raw, dtype)
+        _bump(gathers=1, rows=flat.numel(), resident_gathers=1)
+        return rows.reshape(*ids.shape, *rows.shape[1:])
+
+    def gather(self, ids: torch.Tensor, dtype: Optional[torch.dtype] = None,
+               host_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Rows for ``ids`` (any shape, integer) on ``ids.device``: shape ``ids.shape + row shape``. ``host_ids`` is
+        an optional CPU copy of ``ids`` the caller already made (saves the one device-to-host copy).
+
+        Out-of-range ids raise IndexError, except on a table resident on an accelerator (gpu mode), whose lookup
+        never syncs with the host: there they trip a device-side assert, unless UNSLOTH_FROZEN_TABLE_CHECK_IDS=1
+        (one host sync per lookup) turns that into an IndexError."""
         if ids.is_floating_point() or ids.is_complex():
             raise TypeError("Unsloth: frozen table ids must be integers.")
         device = ids.device
-        flat = ids.reshape(-1).long()
+        flat = ids.reshape(-1)  # widened to int64 where it is used: on the device only for a resident table
         if flat.numel() == 0:
             dec = self.decode({k: torch.empty((0, p.row_bytes), dtype=torch.uint8, device=device) for k, p in self.planes.items()}, dtype)
             return dec.reshape(*ids.shape, *dec.shape[1:])
-        uniq, inv = torch.unique(flat, sorted=True, return_inverse=True)
-        uniq_cpu = uniq.cpu() if uniq.device.type != "cpu" else uniq
+        if self.resident_on(device):
+            return self._gather_resident(ids, flat.long(), dtype)
+        # Host reads need the ids on the host: one device-to-host copy, then unique / range check run on the CPU
+        # (a device unique would block once for its output size and again for the copy of the unique ids).
+        if host_ids is not None:
+            if (
+                not isinstance(host_ids, torch.Tensor) or host_ids.device.type != "cpu"
+                or host_ids.is_floating_point() or host_ids.is_complex() or host_ids.dtype == torch.bool
+                or tuple(host_ids.shape) != tuple(ids.shape)
+            ):
+                raise ValueError(
+                    f"Unsloth: host_ids must be a CPU integer copy of ids {tuple(ids.shape)}, got "
+                    f"{getattr(host_ids, 'dtype', type(host_ids))} {tuple(getattr(host_ids, 'shape', ()))} on "
+                    f"{getattr(host_ids, 'device', '?')}."
+                )
+            host = host_ids.reshape(-1).long()
+        else:
+            host = (flat.cpu() if flat.device.type != "cpu" else flat).long()
+        uniq_cpu, inv = torch.unique(host, sorted=True, return_inverse=True)
         lo, hi = int(uniq_cpu[0]), int(uniq_cpu[-1])
         if lo < 0 or hi >= self.num_rows:
             raise IndexError(f"Unsloth: frozen table id out of range [{lo}, {hi}] for {self.num_rows} rows.")
         raw = self.gather_raw_unique(uniq_cpu, device)
         rows = self.decode(raw, dtype)
-        out = rows.index_select(0, inv.to(rows.device))
+        out = rows.index_select(0, inv.to(rows.device, non_blocking=True))
         _bump(gathers=1, rows=flat.numel(), unique_rows=uniq_cpu.numel(),
               bytes_read_est=0 if self._device_planes else uniq_cpu.numel() * self.row_bytes)
         return out.reshape(*ids.shape, *rows.shape[1:])
@@ -753,7 +898,9 @@ class UnslothFrozenTableEmbedding(nn.Module):
         self.table_dtype = dtype if dtype is not None else torch.get_default_dtype()
         self.table_name = table_name
         self.frozen_table_store: Optional[FrozenTableStore] = None
-        self._memo = None
+        # Most recent first: (ids, host snapshot of its values, key, rows), at most memo_slots of them.
+        self._memo: list = []
+        self.memo_slots = _default_memo_slots()
         self._handle = _register_module(self)
 
     # Upstream forwards read ``self.<table>.weight.device`` to pick where to run the lookup; a
@@ -779,7 +926,7 @@ class UnslothFrozenTableEmbedding(nn.Module):
                 f"expected {tuple(self.row_shape)}."
             )
         self.frozen_table_store = store
-        self._memo = None
+        self._memo = []
         return self
 
     def __deepcopy__(self, memo):
@@ -787,7 +934,7 @@ class UnslothFrozenTableEmbedding(nn.Module):
         new = type(self).__new__(type(self))
         memo[id(self)] = new
         for k, v in self.__dict__.items():
-            new.__dict__[k] = None if k == "_memo" else copy.deepcopy(v, memo)
+            new.__dict__[k] = [] if k == "_memo" else copy.deepcopy(v, memo)
         new._handle = _register_module(new)
         return new
 
@@ -839,7 +986,7 @@ class UnslothFrozenTableEmbedding(nn.Module):
             probe = fn(torch.empty(0, dtype=self.table_dtype))
             if isinstance(probe, torch.Tensor) and probe.is_floating_point():
                 if probe.dtype != self.table_dtype:
-                    self._memo = None
+                    self._memo = []
                 self.table_dtype = probe.dtype
         except Exception:
             pass
@@ -863,29 +1010,50 @@ class UnslothFrozenTableEmbedding(nn.Module):
                 "unsloth_zoo.frozen_table_store.bind_frozen_tables(model, checkpoint) after loading, "
                 "or set UNSLOTH_FROZEN_TABLE=gpu to load it as a normal embedding."
             )
-        if ids.is_inference():
-            # Inference tensors carry no version counter, and there is no checkpoint recompute to serve.
+        if ids.is_inference() or store.resident_on(ids.device):
+            # Inference tensors carry no version counter, and there is no checkpoint recompute to serve. A resident
+            # table re-gathers on the device for less than the memo's own equality check (a host sync on CUDA).
             with torch.no_grad():
                 return store.gather(ids, dtype=self.table_dtype)
         step = _STEP[0]
         key = (ids.data_ptr(), ids._version, tuple(ids.shape), tuple(ids.stride()), ids.device, step, self.table_dtype,
                ids.dtype)
-        memo = self._memo
-        if memo is not None:
-            m_ids, m_snapshot, m_key, m_rows = memo
-            if m_key == key or (
+        # A bounded cache, one entry per lookup still waiting for its checkpoint recompute (pipeline schedules keep
+        # several micro-batches in flight). The micro-batch's identity is its ids tensor: every entry holds its ids
+        # alive, so no other tensor can take that address while the key names it. Rows are only ever served for the
+        # same ids tensor or for equal values, so one micro-batch never receives another's rows.
+        # Copy on write: the list is only ever replaced, never mutated in place, so a lookup from another thread
+        # (DataParallel replicas share it) can at worst drop an entry (one extra read), never raise or serve rows
+        # under another entry's key.
+        entries = tuple(self._memo or ())
+        # Every hit compares values: the key vouches for them only through the version counter, which writes
+        # through ``.data`` (or a numpy view of a reused ids buffer) do not bump, so the same tensor with new values
+        # would match its old entry. The rows are read on the host anyway, so the ids go there once and the value
+        # checks and the gather share that copy (one host sync per lookup on an accelerator).
+        host = ids.detach().cpu() if ids.device.type != "cpu" else None
+        probe = ids if host is None else host
+        for entry in entries:
+            _, m_snapshot, m_key, _ = entry
+            if (
                 m_key[2] == key[2] and m_key[4] == key[4] and m_key[5] == step and m_key[6] == key[6]
-                and m_key[7] == key[7] and torch.equal(m_snapshot, ids)
+                and m_key[7] == key[7] and torch.equal(m_snapshot, probe)
             ):
-                _bump(memo_hits=1)
-                return m_rows
+                return self._memo_hit(entry)
         with torch.no_grad():
-            rows = store.gather(ids, dtype=self.table_dtype)
-            snapshot = ids.detach().clone()
+            rows = store.gather(ids, dtype=self.table_dtype, host_ids=host)
+            snapshot = ids.detach().clone() if host is None else host
+        _bump(memo_misses=1)
         # Hold ids (no other tensor can take its address while the key names it) and a snapshot of its values
         # (an in-place update of ids must not make the equality check compare the tensor with itself).
-        self._memo = (ids, snapshot, key, rows)
+        slots = max(1, int(getattr(self, "memo_slots", 1)))
+        self._memo = [(ids, snapshot, key, rows), *(self._memo or ())][:slots]
         return rows
+
+    def _memo_hit(self, entry):
+        # First in, first out: a hit (a recompute) leaves the order alone. Promoting it would push out the oldest
+        # entry, a micro-batch whose backward is still to come (steady-state 1F1B: F1 F2 B1 F3 evicted F2).
+        _bump(memo_hits=1)
+        return entry[3]
 
 
 _MODULES: Dict[int, "weakref.ref"] = {}
@@ -921,8 +1089,10 @@ def _make_lookup_op():
         m = _module_for(handle)
         return ids.new_empty((*ids.shape, *m.row_shape), dtype=m.table_dtype)
 
-    # cudagraph_unsafe: the lookup reads ids on the host (unique, device to host copy), which cannot run inside a
-    # captured CUDA graph, so Inductor keeps it outside (reduce-overhead mode). torch before 2.8 has no `tags`.
+    # cudagraph_unsafe: a host-backed lookup (ram / disk) reads ids on the host (a device to host copy), which
+    # cannot run inside a captured CUDA graph, so Inductor keeps it outside (reduce-overhead mode). A resident
+    # (gpu mode) lookup no longer touches the host, but one op serves both and the memo is Python state, so the
+    # conservative tag stays until a capture-safe resident op is validated. torch before 2.8 has no `tags`.
     tag = getattr(torch._C.Tag, "cudagraph_unsafe", None)
     for kwargs in ([dict(tags=(tag,))] if tag is not None else []) + [dict()]:
         try:
@@ -937,6 +1107,116 @@ def _make_lookup_op():
 
 
 _LOOKUP_OP = _make_lookup_op()
+
+
+_SAMPLE_BYTES = 64 << 10
+_SAMPLES = 8
+
+
+def _mapped_bytes(f: "_MappedFile", start: int, n: int) -> bytes:
+    mm = f.mm
+    if mm is None or start < 0 or n < 0 or start + n > f.size:
+        raise ValueError(f"Unsloth: short read of {n} bytes at {start} from {f.path} ({f.size} bytes mapped).")
+    return mm[start:start + n]
+
+
+def _header_sha256(f: "_MappedFile") -> str:
+    (n,) = struct.unpack("<Q", _mapped_bytes(f, 0, 8))
+    if n > _MAX_HEADER_BYTES:
+        raise ValueError(f"Unsloth: {f.path} has an implausible safetensors header length {n}.")
+    return hashlib.sha256(_mapped_bytes(f, 8, n)).hexdigest()
+
+
+def _sample_sha256(f: "_MappedFile", loc: "TensorLocation") -> str:
+    h = hashlib.sha256()
+    if loc.nbytes <= _SAMPLES * _SAMPLE_BYTES:
+        h.update(_mapped_bytes(f, loc.offset, loc.nbytes))
+    else:
+        for k in range(_SAMPLES):
+            h.update(_mapped_bytes(f, loc.offset + (loc.nbytes - _SAMPLE_BYTES) * k // (_SAMPLES - 1), _SAMPLE_BYTES))
+    return h.hexdigest()
+
+
+def _hub_identity(path: str) -> Tuple[Optional[str], Optional[str]]:
+    """(repo id, revision) of a file inside a hub cache snapshot (.../models--org--name/snapshots/<rev>/...)."""
+    # Both separators, whatever this host uses: a Windows path read on POSIX names the same snapshot.
+    parts = os.path.abspath(path).replace("\\", "/").split("/")
+    for i, seg in enumerate(parts[:-2]):
+        if seg.startswith("models--") and parts[i + 1] == "snapshots":
+            return seg[len("models--"):].replace("--", "/"), parts[i + 2]
+    return None, None
+
+
+_LEADING_WRAPPERS = ("base_model.model.", "base_model.", "module.", "_orig_mod.")
+_INNER_WRAPPERS = {"_orig_mod", "_fsdp_wrapped_module"}  # torch.compile / FSDP1 wrap submodules too
+
+
+def _table_key(name: str) -> str:
+    """A table's module path without wrapper prefixes (PEFT, DDP / DataParallel `module.`, torch.compile
+    `_orig_mod.`, FSDP1 `_fsdp_wrapped_module.`): the same table whether saved from a wrapped model or checked on
+    the bare one."""
+    changed = True
+    while changed:
+        changed = False
+        for prefix in _LEADING_WRAPPERS:
+            if name.startswith(prefix):
+                name, changed = name[len(prefix):], True
+    return ".".join(part for part in name.split(".") if part not in _INNER_WRAPPERS)
+
+
+def frozen_table_provenance(model: nn.Module) -> Optional[dict]:
+    """{"format", "version", "tables": {module path: FrozenTableStore.provenance()}} for every bound frozen table
+    of `model`, or None when it has none. A caller saving without the tables (an adapter) can write this next to
+    its save and check it with compare_frozen_table_provenance on reload; nothing here writes it by itself."""
+    tables = {}
+    for name, module in iter_frozen_table_modules(model):
+        describe = getattr(module.frozen_table_store, "provenance", None)
+        if callable(describe):  # a table held in memory (built from tensors) has no checkpoint to describe
+            tables[_table_key(name)] = describe()
+    if not tables:
+        return None
+    return {"format": "unsloth_frozen_tables", "version": 1, "tables": tables}
+
+
+def compare_frozen_table_provenance(saved: dict, live: Optional[dict]) -> List[str]:
+    """What differs between a saved provenance and the live model's ([] = the same base tables): the tables,
+    their row counts, each tensor's name / dtype / shape / sampled contents, the shard order, the fp8 decoder
+    scale and, when both recorded one, the hub repo id. The revision, file sizes and header hashes are
+    informational and not compared (the same rows can sit in another revision or a repacked file)."""
+    if not saved or not saved.get("tables"):
+        return []
+    live_tables = {_table_key(k): v for k, v in ((live or {}).get("tables") or {}).items()}
+    problems = []
+    for key, want in saved["tables"].items():
+        got = live_tables.get(_table_key(key))
+        if got is None:
+            problems.append(f"{key}: no such frozen table bound in this model")
+            continue
+        if want.get("num_rows") != got.get("num_rows"):
+            problems.append(f"{key}: {got.get('num_rows')} rows, saved with {want.get('num_rows')}")
+        want_t = {(t["name"], t["plane"]): t for t in want.get("tensors", [])}
+        got_t = {(t["name"], t["plane"]): t for t in got.get("tensors", [])}
+        if set(want_t) != set(got_t):
+            problems.append(f"{key}: table tensors {sorted(got_t)} differ from the saved {sorted(want_t)}")
+            continue
+        for plane in sorted({p for _, p in want_t}):
+            # Shards concatenate in this order into rows: the same shards reordered put other rows at the same ids.
+            if [t["name"] for t in want["tensors"] if t["plane"] == plane] != [
+                t["name"] for t in got["tensors"] if t["plane"] == plane
+            ]:
+                problems.append(f"{key}: {plane} shards are in another row order")
+        for ident, t in want_t.items():
+            g = got_t[ident]
+            for field in ("dtype", "shape", "sample_sha256"):
+                if t.get(field) != g.get(field):
+                    what = "contents" if field == "sample_sha256" else field
+                    problems.append(f"{key}: {ident[0]} {what} differ from the saved base table")
+                    break
+        if want.get("decode_scale") != got.get("decode_scale"):
+            problems.append(f"{key}: decoder scale differs from the saved base table")
+        if want.get("repo_id") and got.get("repo_id") and want["repo_id"] != got["repo_id"]:
+            problems.append(f"{key}: from {got['repo_id']}, saved with {want['repo_id']}")
+    return problems
 
 
 def iter_frozen_table_modules(model: nn.Module):

@@ -701,3 +701,514 @@ def test_tiny_qwen4_fp8_disk_load_matches_fp8_embedding(tiny_qwen4_fp8, monkeypa
         for mode in ("gpu", "disk"):
             got = _load(str(out), mode, monkeypatch, torch.bfloat16)(input_ids=x).logits
             assert torch.equal(got, want), mode
+
+
+def test_resident_table_gathers_without_unique_or_memo(bf16_table):
+    """gpu mode keeps the planes next to the ids: lookups index them directly (no unique, no host ids) and skip the
+    memo, whose snapshot equality would cost more than the gather it saves."""
+    index, names, full = bf16_table
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="gpu", device=torch.device("cpu"))
+    assert store.resident_on(torch.device("cpu"))
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(store)
+    proj = torch.nn.Linear(20, 3)
+    tokens = torch.randint(0, 50, (2, 7))
+
+    def block(x):
+        return proj(emb((tokens * 3 + 1) % full.shape[0]) * x).sum()
+
+    x = torch.ones(2, 7, 20, requires_grad=True)
+    reset_frozen_table_stats()
+    torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False).backward()
+    ref_rows = F.embedding((tokens * 3 + 1) % full.shape[0], full.float())
+    assert torch.allclose(x.grad, ref_rows * proj.weight.sum(0))
+    assert FROZEN_TABLE_STATS["resident_gathers"] == FROZEN_TABLE_STATS["gathers"] == 2
+    assert FROZEN_TABLE_STATS["memo_hits"] == 0 and not emb._memo
+    assert FROZEN_TABLE_STATS["unique_rows"] == 0
+    for ids in _ids_with_edges(full):
+        assert torch.equal(store.gather(ids), F.embedding(ids, full))
+    store.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("dtype", [None, torch.float32])
+def test_resident_cuda_lookup_never_syncs_the_host(bf16_table, dtype):
+    index, names, full = bf16_table
+    dev = torch.device("cuda", torch.cuda.current_device())
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="gpu", device=dev)
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(store)
+    ids = torch.randint(0, full.shape[0], (4, 33), device=dev)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        got = store.gather(ids, dtype=dtype)
+        a = emb(ids)
+        b = emb(ids.clone())  # a memo would compare the clone with its snapshot on the host
+    finally:
+        torch.cuda.set_sync_debug_mode(0)
+    ref = F.embedding(ids.cpu(), full)
+    assert torch.equal(got.cpu(), ref if dtype is None else ref.to(dtype))
+    assert torch.equal(a.cpu(), ref.float()) and torch.equal(b.cpu(), ref.float())
+    store.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("mode", ["ram", "disk"])
+def test_host_table_cuda_lookup_syncs_once(bf16_table, mode):
+    """Host-read tables need the ids on the host: exactly one copy per lookup (unique, range check and the memo's
+    value check all run on it), and none for a checkpoint recompute that hands back the same ids tensor."""
+    import warnings
+
+    index, names, full = bf16_table
+    dev = torch.device("cuda", torch.cuda.current_device())
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode=mode))
+    ids = torch.randint(0, full.shape[0], (4, 33), device=dev)
+    other = (ids + 1) % full.shape[0]
+    torch.cuda.synchronize()
+
+    def syncs(fn):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            torch.cuda.set_sync_debug_mode("warn")
+            try:
+                out = fn()
+            finally:
+                torch.cuda.set_sync_debug_mode(0)
+        return out, sum("synchroniz" in str(w.message) for w in caught)
+
+    a, n_new = syncs(lambda: emb(ids))
+    _, n_same = syncs(lambda: emb(ids))
+    _, n_clone = syncs(lambda: emb(ids.clone()))
+    b, n_other = syncs(lambda: emb(other))
+    # the same tensor again also copies its values to the host: a write through .data keeps its key (finding 3)
+    assert (n_new, n_same, n_clone, n_other) == (1, 1, 1, 1)
+    ref = full.float()
+    assert torch.equal(a.cpu(), F.embedding(ids.cpu(), ref)) and torch.equal(b.cpu(), F.embedding(other.cpu(), ref))
+    emb.frozen_table_store.close()
+
+
+def test_memo_sees_a_reused_cpu_ids_buffer_rewritten_without_a_version_bump(bf16_table):
+    """A prefetched ids buffer refilled per micro-batch through numpy or ``.data`` keeps its address, shape and
+    version: the memo must compare values, not trust the key."""
+    index, names, full = bf16_table
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk"))
+    ref = full.float()
+    buf = torch.tensor([[1, 2, 3]])
+    first = emb(buf)
+    assert torch.equal(first, F.embedding(buf, ref))
+    version = buf._version
+    buf.numpy()[:] = [[40, 41, 42]]
+    assert buf._version == version
+    assert torch.equal(emb(buf), F.embedding(buf, ref))
+    buf.data.copy_(torch.tensor([[5, 5, 6]]))
+    assert buf._version == version
+    assert torch.equal(emb(buf), F.embedding(buf, ref))
+    reset_frozen_table_stats()
+    assert torch.equal(emb(buf), F.embedding(buf, ref))  # unchanged values still hit the memo
+    assert FROZEN_TABLE_STATS["memo_hits"] == 1
+    emb.frozen_table_store.close()
+
+
+def _one_f_one_b(emb, proj, full, slots):
+    """Two micro-batches forwarded under non-reentrant checkpointing, then backward in order (1F1B warm-up on a
+    first stage): each backward recomputes its micro-batch's lookup."""
+    fts.set_frozen_table_memo_slots(torch.nn.ModuleDict({"emb": emb}), slots)
+    tokens = [torch.randint(0, 50, (2, 7), generator=torch.Generator().manual_seed(s)) for s in (11, 12)]
+
+    def block(x, t):
+        ids = (t * 3 + 1) % full.shape[0]  # fresh ids on every (re)compute, as in Qwen4Exp / DeepSeek-V4.1
+        return proj(emb(ids) * x).sum()
+
+    xs = [torch.ones(2, 7, 20, requires_grad=True) for _ in tokens]
+    fts.frozen_table_next_step()
+    reset_frozen_table_stats()
+    outs = [torch.utils.checkpoint.checkpoint(block, x, t, use_reentrant=False) for x, t in zip(xs, tokens)]
+    for out in outs:
+        out.backward()
+    for x, t in zip(xs, tokens):
+        rows = F.embedding((t * 3 + 1) % full.shape[0], full.float())
+        assert torch.allclose(x.grad, rows * proj.weight.sum(0))  # each micro-batch got its own rows
+    return fts.frozen_table_step_stats(), FROZEN_TABLE_STATS["gathers"]
+
+
+def test_bounded_memo_serves_every_in_flight_micro_batch(bf16_table):
+    index, names, full = bf16_table
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk"))
+    proj = torch.nn.Linear(20, 3)
+    # One slot: each forward / recompute evicts the other micro-batch, so both recomputes read the store again.
+    stats, gathers = _one_f_one_b(emb, proj, full, slots=1)
+    assert stats == {"memo_hits": 0, "memo_misses": 4} and gathers == 4
+    # One slot per in-flight micro-batch: both recomputes are served from memory.
+    stats, gathers = _one_f_one_b(emb, proj, full, slots=2)
+    assert stats == {"memo_hits": 2, "memo_misses": 2} and gathers == 2
+    assert len(emb._memo) == 2
+    fts.frozen_table_next_step()
+    assert fts.frozen_table_step_stats() == {"memo_hits": 0, "memo_misses": 0}
+    assert emb._memo == []  # the previous step's rows are released
+    emb(torch.tensor([1, 2]))
+    emb(torch.tensor([3, 4]))
+    assert len(emb._memo) == 2
+    assert fts.set_frozen_table_memo_slots(torch.nn.ModuleDict({"emb": emb}), 1) == 1 and len(emb._memo) == 1
+    emb._memo = None  # model code resetting the memo the old way still means "empty"
+    emb(torch.tensor([1, 2]))
+    assert len(emb._memo) == 1
+    emb.frozen_table_store.close()
+
+
+def test_bounded_memo_never_hands_one_micro_batch_another_ones_rows(bf16_table, monkeypatch):
+    """Flip: with the value check disabled (every snapshot "equal"), the second micro-batch of the same shape is
+    served the first one's rows, and the gradient check above catches it."""
+    index, names, full = bf16_table
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk"))
+    proj = torch.nn.Linear(20, 3)
+    _one_f_one_b(emb, proj, full, slots=4)
+    monkeypatch.setattr(fts.torch, "equal", lambda a, b: True)
+    with pytest.raises(AssertionError):
+        _one_f_one_b(emb, proj, full, slots=4)
+    emb.frozen_table_store.close()
+
+
+def test_memo_slots_default_from_the_environment(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_FROZEN_TABLE_MEMO_SLOTS", "5")
+    assert UnslothFrozenTableEmbedding(4, 2).memo_slots == 5
+    monkeypatch.setenv("UNSLOTH_FROZEN_TABLE_MEMO_SLOTS", "0")
+    assert UnslothFrozenTableEmbedding(4, 2).memo_slots == 1
+
+
+def _model_with(store):
+    emb = UnslothFrozenTableEmbedding(store.num_rows, 20, dtype=torch.float32).bind(store)
+    return torch.nn.ModuleDict({"base_model": torch.nn.ModuleDict({"model": torch.nn.ModuleDict({"ngram": emb})})})
+
+
+def test_provenance_matches_the_same_table_and_catches_another(bf16_table, tmp_path):
+    import shutil
+
+    index, names, full = bf16_table
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk")
+    saved = fts.frozen_table_provenance(_model_with(store))
+    assert saved["format"] == "unsloth_frozen_tables" and list(saved["tables"]) == ["ngram"]  # PEFT prefix dropped
+    table = saved["tables"]["ngram"]
+    assert table["num_rows"] == full.shape[0] and len(table["tensors"]) == len(names)
+    assert all(len(f["header_sha256"]) == 64 and f["size"] > 0 for f in table["files"].values())
+    assert json.loads(json.dumps(saved)) == saved  # plain JSON
+    # the same files, bound again on a bare model: nothing differs
+    again = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="ram")
+    bare = torch.nn.ModuleDict({"ngram": UnslothFrozenTableEmbedding(again.num_rows, 20).bind(again)})
+    assert fts.compare_frozen_table_provenance(saved, fts.frozen_table_provenance(bare)) == []
+    # a copy of the checkpoint with one table byte changed: same header, different contents
+    other = tmp_path / "other"
+    other.mkdir()
+    src = os.path.dirname(index)
+    for f in os.listdir(src):
+        if os.path.isfile(os.path.join(src, f)):
+            shutil.copy(os.path.join(src, f), other / f)
+    loc = resolve_tensor_locations(str(other / os.path.basename(index)), names=[names[1]])[names[1]]
+    with open(loc.path, "r+b") as f:
+        f.seek(loc.offset + 3)
+        byte = f.read(1)
+        f.seek(loc.offset + 3)
+        f.write(bytes([byte[0] ^ 0xFF]))
+    changed = FrozenTableStore.from_checkpoint(str(other / os.path.basename(index)), {"weight": names}, mode="disk")
+    problems = fts.compare_frozen_table_provenance(saved, fts.frozen_table_provenance(_model_with(changed)))
+    assert problems == [f"ngram: {names[1]} contents differ from the saved base table"], problems
+    # no table bound at all, or only tables held in memory (no checkpoint behind them)
+    assert fts.frozen_table_provenance(torch.nn.Linear(2, 2)) is None
+    in_memory = UnslothFrozenTableEmbedding(4, 20)
+    in_memory.frozen_table_store = object()
+    assert fts.frozen_table_provenance(torch.nn.ModuleDict({"t": in_memory})) is None
+    assert fts.compare_frozen_table_provenance(saved, None) == ["ngram: no such frozen table bound in this model"]
+    for s in (store, again, changed):
+        s.close()
+
+
+def test_provenance_reads_the_hub_repo_and_revision():
+    path = os.path.join("/x", "hub", "models--org--Some-Model", "snapshots", "abc123", "model-00001.safetensors")
+    assert fts._hub_identity(path) == ("org/Some-Model", "abc123")
+    assert fts._hub_identity("/data/local/model.safetensors") == (None, None)
+
+
+def test_memo_shared_across_threads_never_serves_another_threads_rows(bf16_table):
+    """DataParallel replicas share one module's memo: concurrent lookups may miss, never raise or mix up rows."""
+    import threading
+
+    index, names, full = bf16_table
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="ram")
+    emb = UnslothFrozenTableEmbedding(store.num_rows, 20, dtype=torch.float32).bind(store)
+    emb.memo_slots = 2
+    errors = []
+
+    def worker(seed):
+        g = torch.Generator().manual_seed(seed)
+        try:
+            for _ in range(200):
+                ids = torch.randint(0, full.shape[0], (3, 7), generator=g)
+                for _ in range(2):  # the forward, then its checkpoint recompute
+                    if not torch.equal(emb(ids), F.embedding(ids, full).float()):
+                        errors.append(seed)
+                        return
+        except Exception as e:  # list mutation races surfaced as exceptions before
+            errors.append(repr(e))
+
+    threads = [threading.Thread(target=worker, args=(s,)) for s in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+    assert not errors, errors
+    assert len(emb._memo) <= 2
+    store.close()
+
+
+def test_provenance_of_a_hub_cache_snapshot_names_the_repo_revision_and_files(bf16_table, tmp_path):
+    """Hub cache snapshots are symlinks into content-addressed blobs: provenance must read the snapshot path."""
+    index, names, _ = bf16_table
+    src = os.path.dirname(index)
+    repo = tmp_path / "hub" / "models--org--Some-Model"
+    (repo / "blobs").mkdir(parents=True)
+    snap = repo / "snapshots" / "abc123"
+    snap.mkdir(parents=True)
+    files = sorted(f for f in os.listdir(src) if os.path.isfile(os.path.join(src, f)))
+    for i, f in enumerate(files):
+        blob = repo / "blobs" / f"{i:064x}"
+        with open(os.path.join(src, f), "rb") as r, open(blob, "wb") as w:
+            w.write(r.read())
+        os.symlink(os.path.relpath(blob, snap), snap / f)
+    store = FrozenTableStore.from_checkpoint(str(snap / os.path.basename(index)), {"weight": names}, mode="disk")
+    table = store.provenance()
+    assert (table["repo_id"], table["revision"]) == ("org/Some-Model", "abc123")
+    assert set(table["files"]) <= set(files) and all(t["file"] in files for t in table["tensors"])
+    # rows still come from the blobs
+    assert torch.equal(store.gather(torch.tensor([0, 1])), FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk").gather(torch.tensor([0, 1])))
+    store.close()
+
+
+@needs_fp8
+def test_provenance_records_and_compares_the_fp8_decoder_scale(tmp_path):
+    """Finding 1: the same fp8 rows under another per-tensor scale decode to other rows."""
+    q, scale = _fp8_table()
+    index, names = _write_sharded(tmp_path, list(torch.chunk(q, 4)))
+
+    def model(s):
+        decode = fts.make_fp8_tensor_scaled_decode("F8_E4M3", s)
+        store = FrozenTableStore.from_checkpoint(index, {"weight": names}, decode=decode, mode="disk")
+        return torch.nn.ModuleDict({"ngram": UnslothFrozenTableEmbedding(store.num_rows, 16).bind(store)})
+
+    saved = fts.frozen_table_provenance(model(scale))
+    assert fts.compare_frozen_table_provenance(saved, fts.frozen_table_provenance(model(scale))) == []
+    problems = fts.compare_frozen_table_provenance(saved, fts.frozen_table_provenance(model(scale * 2)))
+    assert problems == ["ngram: decoder scale differs from the saved base table"], problems
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("mode", ["ram", "disk"])
+def test_cuda_memo_never_serves_rows_for_values_written_through_data(bf16_table, mode):
+    """Finding 3: lookup(A), lookup(B), A.data.copy_(new), lookup(A): A keeps its address, shape and version, so a
+    key-only hit served A's old rows once two entries are kept."""
+    index, names, full = bf16_table
+    dev = torch.device("cuda", torch.cuda.current_device())
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode=mode))
+    fts.set_frozen_table_memo_slots(torch.nn.ModuleDict({"e": emb}), 2)
+    a = torch.tensor([[1, 2, 3]], device=dev)
+    b = torch.tensor([[4, 5, 6]], device=dev)
+    emb(a)
+    emb(b)
+    a.data.copy_(torch.tensor([[40, 41, 42]], device=dev))
+    assert torch.equal(emb(a).cpu(), F.embedding(a.cpu(), full.float()))
+    emb.frozen_table_store.close()
+
+
+def test_provenance_describes_the_mapping_already_bound(bf16_table, tmp_path):
+    """Findings 4 / 6: a file replaced at the same path after binding must not be what the provenance hashes."""
+    import shutil
+
+    index, names, full = bf16_table
+    copy_dir = tmp_path / "copy"
+    copy_dir.mkdir()
+    src = os.path.dirname(index)
+    for f in os.listdir(src):
+        if os.path.isfile(os.path.join(src, f)):
+            shutil.copy(os.path.join(src, f), copy_dir / f)
+    copy_index = str(copy_dir / os.path.basename(index))
+    store = FrozenTableStore.from_checkpoint(copy_index, {"weight": names}, mode="disk")
+    reference = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk").provenance()
+    # replace every shard file at its path with one holding other rows (a new inode; the mapping keeps the old)
+    other = [torch.randn(n, 20).to(torch.bfloat16) for n in (37, 64, 1, 50)]
+    (tmp_path / "new").mkdir()
+    _write_sharded(tmp_path / "new", other)
+    for f in os.listdir(tmp_path / "new"):
+        if f.endswith(".safetensors"):
+            tmp = copy_dir / (f + ".tmp")
+            shutil.copy(tmp_path / "new" / f, tmp)
+            os.replace(tmp, copy_dir / f)
+    got = store.provenance()
+    assert [t["sample_sha256"] for t in got["tensors"]] == [t["sample_sha256"] for t in reference["tensors"]]
+    assert {k: v["header_sha256"] for k, v in got["files"].items()} == {
+        k: v["header_sha256"] for k, v in reference["files"].items()
+    }
+    store.close()
+
+
+def test_provenance_header_digest_refuses_an_implausible_or_short_header(tmp_path):
+    """Findings 6 / 11: the header length is bounded like read_safetensors_header, and short reads raise."""
+    import struct
+
+    huge = tmp_path / "huge.safetensors"
+    huge.write_bytes(struct.pack("<Q", 1 << 40) + b"{}")
+    short = tmp_path / "short.safetensors"
+    short.write_bytes(struct.pack("<Q", 64) + b"{}")
+    for path, match in ((huge, "implausible"), (short, "short read")):
+        mapped = fts._MappedFile(str(path))
+        try:
+            with pytest.raises(ValueError, match=match):
+                fts._header_sha256(mapped)
+        finally:
+            mapped.close()
+
+
+def test_gather_refuses_host_ids_that_are_not_a_cpu_integer_copy_of_ids(bf16_table):
+    """Findings 5 / 9 / 12: host_ids stands in for ids on the host, so anything else would read other rows."""
+    index, names, full = bf16_table
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk")
+    ids = torch.tensor([[1, 2], [3, 4]])
+    assert torch.equal(store.gather(ids, host_ids=ids.clone()), F.embedding(ids, full))
+    for bad in (torch.tensor([1, 2, 3, 4]), torch.tensor([[1, 2, 3, 4]]), ids.float(), ids.to("meta")):
+        with pytest.raises((TypeError, ValueError), match="host_ids"):
+            store.gather(ids, host_ids=bad)
+    store.close()
+
+
+def test_memo_serves_steady_state_one_f_one_b_without_evicting_a_waiting_micro_batch(bf16_table):
+    """Finding 7: F1 F2 B1 F3 B2 F4 B3 B4 with two slots. A hit must not move its entry ahead of a micro-batch that
+    still waits for its backward (MRU promotion evicted it: 2 hits); FIFO serves every recompute (4 hits)."""
+    index, names, full = bf16_table
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk"))
+    proj = torch.nn.Linear(20, 3)
+    fts.set_frozen_table_memo_slots(torch.nn.ModuleDict({"emb": emb}), 2)
+    tokens = {i: torch.randint(0, 50, (2, 7), generator=torch.Generator().manual_seed(20 + i)) for i in range(1, 5)}
+    xs = {i: torch.ones(2, 7, 20, requires_grad=True) for i in tokens}
+
+    def block(x, t):
+        return proj(emb((t * 3 + 1) % full.shape[0]) * x).sum()
+
+    fts.frozen_table_next_step()
+    reset_frozen_table_stats()
+    outs = {}
+    for op in "F1 F2 B1 F3 B2 F4 B3 B4".split():
+        i = int(op[1])
+        if op[0] == "F":
+            outs[i] = torch.utils.checkpoint.checkpoint(block, xs[i], tokens[i], use_reentrant=False)
+        else:
+            outs.pop(i).backward()
+    for i, t in tokens.items():
+        assert torch.allclose(xs[i].grad, F.embedding((t * 3 + 1) % full.shape[0], full.float()) * proj.weight.sum(0))
+    assert fts.frozen_table_step_stats() == {"memo_hits": 4, "memo_misses": 4}
+    assert FROZEN_TABLE_STATS["gathers"] == 4
+    emb.frozen_table_store.close()
+
+
+def test_provenance_keys_ignore_compile_ddp_fsdp_and_peft_wrappers():
+    """Findings 8 / 10: the same table saved from a wrapped model and checked on a bare one (or the reverse)."""
+    table = {"num_rows": 3, "tensors": [{"name": "t", "plane": "weight", "dtype": "BF16", "shape": [3, 2],
+                                         "sample_sha256": "x"}]}
+    wrapped = "module._orig_mod.base_model.model.model.layers.0._fsdp_wrapped_module.ngram"
+    assert fts._table_key(wrapped) == "model.layers.0.ngram"
+    for saved_key, live_key in ((wrapped, "model.layers.0.ngram"), ("model.layers.0.ngram", wrapped)):
+        saved = {"tables": {saved_key: table}}
+        assert fts.compare_frozen_table_provenance(saved, {"tables": {live_key: table}}) == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_cuda_resident_out_of_range_ids_raise_index_error_with_the_debug_check(bf16_table):
+    """Finding 13: a CUDA-resident lookup never syncs, so an out-of-range id is a device-side assert (the CUDA
+    context is lost). UNSLOTH_FROZEN_TABLE_CHECK_IDS=1 trades one sync for a recoverable IndexError. In a child
+    process: the unchecked failure would poison this one."""
+    import subprocess
+    import sys
+
+    index, names, _ = bf16_table
+    script = (
+        "import sys, torch\n"
+        "from unsloth_zoo.frozen_table_store import FrozenTableStore\n"
+        "dev = torch.device('cuda', 0)\n"
+        f"store = FrozenTableStore.from_checkpoint({index!r}, {{'weight': {names!r}}}, mode='gpu', device=dev)\n"
+        "try:\n"
+        "    store.gather(torch.tensor([0, store.num_rows], device=dev)); torch.cuda.synchronize()\n"
+        "except IndexError as e:\n"
+        "    print('INDEXERROR', e)\n"
+        "print('OK', store.gather(torch.tensor([1], device=dev)).shape)\n"
+    )
+    env = dict(os.environ, UNSLOTH_FROZEN_TABLE_CHECK_IDS="1")
+    out = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=300)
+    assert out.returncode == 0 and "INDEXERROR" in out.stdout and "OK" in out.stdout, (out.stdout, out.stderr[-800:])
+
+
+def test_provenance_compare_keeps_the_row_order_of_shards():
+    """Finding 14: the same shards in another order hold other rows at the same ids."""
+    def t(name):
+        return {"name": name, "plane": "weight", "dtype": "BF16", "shape": [3, 2], "sample_sha256": name}
+
+    saved = {"tables": {"ngram": {"num_rows": 6, "tensors": [t("shard_0"), t("shard_1")]}}}
+    live = {"tables": {"ngram": {"num_rows": 6, "tensors": [t("shard_1"), t("shard_0")]}}}
+    assert fts.compare_frozen_table_provenance(saved, live) == ["ngram: weight shards are in another row order"]
+
+
+def test_resident_on_accepts_strings_and_the_current_accelerator(bf16_table):
+    """Finding 16: "cpu" is torch.device("cpu"), and "cuda" is the current CUDA device."""
+    index, names, _ = bf16_table
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="gpu", device=torch.device("cpu"))
+    assert store.resident_on("cpu") and store.resident_on(torch.device("cpu"))
+    store.close()
+    if torch.cuda.is_available():
+        dev = torch.device("cuda", torch.cuda.current_device())
+        store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="gpu", device=dev)
+        assert store.resident_on("cuda") and store.resident_on(torch.device("cuda")) and store.resident_on(str(dev))
+        assert not store.resident_on("cpu")
+        store.close()
+
+
+def test_memo_keeps_one_entry_unless_asked_for_more(monkeypatch):
+    """Finding 18: ordinary training keeps one entry per table (the memory it always used); pipeline parallel
+    sizes its own with set_frozen_table_memo_slots."""
+    monkeypatch.delenv("UNSLOTH_FROZEN_TABLE_MEMO_SLOTS", raising=False)
+    assert UnslothFrozenTableEmbedding(4, 2).memo_slots == 1
+
+
+def test_host_backed_gather_never_casts_ids_on_their_device(bf16_table):
+    """Finding 20: with a host copy of the ids (or none yet) the int64 widening happens on the host; an
+    accelerator never allocates an unused int64 copy of the ids ("meta" stands in for one here)."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    index, names, full = bf16_table
+    store = FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk")
+    casts = []
+
+    class Record(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            src = args[0] if args else None
+            if (
+                isinstance(src, torch.Tensor) and src.device.type == "meta" and src.dtype == torch.int32
+                and kwargs.get("dtype", args[1] if len(args) > 1 and isinstance(args[1], torch.dtype) else None)
+                == torch.int64
+            ):
+                casts.append(func)
+            return func(*args, **kwargs)
+
+    ids = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    with Record():
+        out = store.gather(ids.to("meta"), host_ids=ids)
+    assert out.shape == (2, 2, 20) and casts == [], casts
+    store.close()
+
+
+def test_provenance_reads_the_hub_repo_and_revision_from_a_windows_path():
+    """Finding 22: a provenance written on Windows (or a Windows path read on POSIX) names the same snapshot."""
+    path = r"C:\Users\me\.cache\huggingface\hub\models--org--Some-Model\snapshots\abc123\model-00001.safetensors"
+    assert fts._hub_identity(path) == ("org/Some-Model", "abc123")
