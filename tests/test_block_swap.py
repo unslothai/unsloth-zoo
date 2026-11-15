@@ -2564,8 +2564,7 @@ def _ckpt_in_forward_model(n, reentrant):
 
 
 def test_checkpoint_inside_forward_swaps_inside_the_checkpoint():
-    # transformers 5.23 moved checkpointing into `forward`: hooks run grad-on outside it and every block stayed
-    # pending until backward, so the pool grew to hold every layer and offload_layers saved nothing.
+    # Regression: with checkpointing inside `forward`, every block stayed pending until backward.
     for reentrant in (False, True):
         layers, sw = _ckpt_in_forward_model(6, reentrant)
         x = torch.ones(2, 4, requires_grad = True)
@@ -2579,7 +2578,6 @@ def test_checkpoint_inside_forward_swaps_inside_the_checkpoint():
         assert sw._grew is False, reentrant
         assert all(l.calls == 2 for l in layers), reentrant   # forward + recompute
         assert not any(b.pending for b in sw.blocks), reentrant
-        # Same grads as without the swap.
         ref = [l.lin.weight.grad.clone() for l in layers]
         sw.remove()
         for l in layers:

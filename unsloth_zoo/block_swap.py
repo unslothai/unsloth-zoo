@@ -912,8 +912,7 @@ class BlockSwap:
         return None
 
     def _wrap_checkpoint(self, module, i):
-        # transformers >= 5.23 (and Unsloth's block compile) checkpoint inside `forward`, so module hooks run
-        # outside the checkpoint: grad-on, never in the recompute. Run the swap around the checkpointed function.
+        # Checkpoint inside `forward`: module hooks never run in the recompute, so wrap the checkpointed function.
         fn = getattr(module, "_gradient_checkpointing_func", None)
         if not callable(fn):
             return False
@@ -946,8 +945,7 @@ class BlockSwap:
             self._note_block_peak(b)
         self._fetch(b, steal = True)
         marks = getattr(b, "marks", None)
-        # A sample still in flight (backward recompute queued behind its forward) is kept for _harvest,
-        # not overwritten: recording into the same events would lose it.
+        # A sample still in flight is kept for _harvest: re-recording its events would lose it.
         # mark_open: 1 = waiting sample open, 2 = full sample recorded, 3 = wait-only sample closed (the forward
         # hook never ran: a recompute that stopped early) but its events may still be in flight.
         in_flight = marks is not None and (
