@@ -1883,6 +1883,19 @@ def grpo_vllm_sampler_uses_triton(trainer, top_k, top_p):
 pass
 
 
+def _grpo_agree_mini_batch(B, device):
+    """The smallest per-call mini batch over the ranks. It is sized from this rank's sequence length, and
+    under FSDP2's sharded layout (or tensor parallel) every forward is collective, so ranks running a
+    different number of forwards hang (one rank all-gathers a block while another gathers metrics)."""
+    import torch.distributed as dist
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
+        return B
+    value = torch.tensor([int(B)], dtype = torch.int64, device = device)
+    dist.all_reduce(value, op = dist.ReduceOp.MIN)
+    return int(value.item())
+pass
+
+
 _n_chunks_deprecation_warned = False
 
 def _warn_deprecated_n_chunks(n_chunks):
@@ -3111,6 +3124,8 @@ def grpo_accumulated_loss(
                 total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
             )
             B = max(1, total_rows//B)
+            from unsloth_zoo.rl_replacements import _grpo_agree_mini_batch
+            B = _grpo_agree_mini_batch(B, input_ids.device)
         else:
             if trainer.args.unsloth_grpo_mini_batch > total_rows:
                 B = total_rows
