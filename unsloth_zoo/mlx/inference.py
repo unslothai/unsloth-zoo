@@ -4604,15 +4604,19 @@ def _grouped_routed(x, inds, scores, shared, s, tensors, group_size, bits):
 _GROUPED_RACE_CALLS = 9
 # Below this many rows the race's short low-clock calls misjudge grouped tiles.
 _ROUTED_ROWS_WITHOUT_NAX = 8
+# There the race picks by chance on tensor units: whole verifies ran faster on grouped tiles from 5 4-bit rows or 3 8-bit ones.
+_GROUPED_ROW_BITS_WITH_NAX = 20
 
 
-def _grouped_routed_faster(routed, grouped, clock = time.perf_counter):
+def _grouped_routed_faster(routed, grouped, clock = time.perf_counter, race = True):
     _staged_ready()
     try:
         native, candidate = routed(), grouped()
         if native is None or candidate is None or not _settled(
                 native.dtype == candidate.dtype and bool(mx.array_equal(native, candidate, equal_nan = True))):
             return False
+        if not race:
+            return True
         seconds = ([], [])
         for repeat in range(_GROUPED_RACE_CALLS):
             for index in ((0, 1) if repeat % 2 == 0 else (1, 0)):
@@ -5449,15 +5453,16 @@ class _RoutedExperts:
             return _routed_down(activations, inds, scores, shared, s, tensors[2],
                                 down.group_size, down.bits, down.mode)
 
-        if (select and inds.size > inds.shape[-1] and gate.mode == "affine"
-                and (inds.size > _ROUTED_ROWS_WITHOUT_NAX * inds.shape[-1] or nax._nax_gpu())
+        rows = inds.size // inds.shape[-1]
+        raced = rows > _ROUTED_ROWS_WITHOUT_NAX
+        if (select and gate.mode == "affine" and (raced or rows * gate.bits >= _GROUPED_ROW_BITS_WITH_NAX and nax._nax_gpu())
                 and len({(p.group_size, p.bits, p.mode) for p in (gate, up, down)}) == 1):
             key = (self.base, *map(_key, (x, inds, scores, shared, s)),
                    tuple(tuple(map(_key, t)) for t in tensors), gate.group_size, gate.bits)
             grouped = lambda: _grouped_routed(x, inds, scores, shared, s, tensors, gate.group_size, gate.bits)
             if key not in _MOE_GROUPED_CHOICES:
                 try:
-                    _MOE_GROUPED_CHOICES[key] = _grouped_routed_faster(routed, grouped)
+                    _MOE_GROUPED_CHOICES[key] = _grouped_routed_faster(routed, grouped, race = raced)
                 except ValueError:  # inside a function transformation, which cannot evaluate; raced later
                     return routed()
             if _MOE_GROUPED_CHOICES[key]:

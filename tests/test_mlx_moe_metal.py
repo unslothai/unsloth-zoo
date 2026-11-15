@@ -1051,7 +1051,7 @@ def test_grouped_routed_experts_serve_bitwise(quantization, widths, experts, mon
     monkeypatch.setattr(fusion, "_grouped_routed", lambda *a: served.append(out := grouped(*a)) or out)
     monkeypatch.setattr(fusion, "_MOE_ROUTED_VERDICTS", {})
     monkeypatch.setattr(fusion, "_MOE_GROUPED_CHOICES", {})
-    monkeypatch.setattr(fusion, "_grouped_routed_faster", lambda routed, grouped: True)
+    monkeypatch.setattr(fusion, "_grouped_routed_faster", lambda routed, grouped, race: True)
     with _routed(block):   # a plain call keeps its route
         _identical(block(xs[1]), expected[1])
         assert not served
@@ -1060,7 +1060,7 @@ def test_grouped_routed_experts_serve_bitwise(quantization, widths, experts, mon
         for x, out in zip(xs, expected):
             served.clear()
             _identical(block(x), out)
-            assert [out is not None for out in served] == [True] * (x.shape[0] > 1)
+            assert [out is not None for out in served] == [True] * (x.shape[0] * quantization[0] >= fusion._GROUPED_ROW_BITS_WITH_NAX)
     # It serves only what the routed kernels do: routing weights in another dtype are refused.
     mlp = block.switch_mlp
     tensors = tuple(map(fusion._projection_tensors, (mlp.gate_proj, mlp.up_proj, mlp.down_proj)))
@@ -1074,20 +1074,23 @@ def test_grouped_routed_experts_serve_bitwise(quantization, widths, experts, mon
 
 
 
-@pytest.mark.parametrize("tensor_units, rows, raced", [(False, 2, False), (False, 8, False), (False, 9, True), (True, 2, True), (True, 8, True)])
-def test_grouped_tiles_are_raced_only_where_they_can_win(monkeypatch, tensor_units, rows, raced):
+# No call: the routed kernels. On tensor units up to 8 rows the rows and bits decide, and grouped tiles only have to match.
+@pytest.mark.parametrize("tensor_units, bits, rows, raced", [
+    (False, 8, 2, []), (False, 8, 8, []), (False, 8, 9, [True]), (True, 8, 2, []), (True, 8, 3, [False]), (True, 4, 4, []),
+    (True, 4, 5, [False]), (True, 4, 8, [False]), (True, 4, 9, [True])])
+def test_grouped_tiles_are_raced_only_where_they_can_win(monkeypatch, tensor_units, bits, rows, raced):
     monkeypatch.setattr(fusion.nax, "_nax_gpu", lambda: tensor_units)
-    block = _expert_block(vlm_qwen, (8, "affine", 64), mx.bfloat16)
+    block = _expert_block(vlm_qwen, (bits, "affine", 64), mx.bfloat16)
     mlp = block.switch_mlp
     tensors = tuple(map(fusion._projection_tensors, (mlp.gate_proj, mlp.up_proj, mlp.down_proj)))
     races = []
     monkeypatch.setattr(fusion, "_MOE_GROUPED_CHOICES", {})
-    monkeypatch.setattr(fusion, "_grouped_routed_faster", lambda routed, grouped: races.append(True) or False)
+    monkeypatch.setattr(fusion, "_grouped_routed_faster", lambda routed, grouped, race: races.append(race) or False)
     x = mx.random.normal((rows, 1, 512)).astype(mx.bfloat16)
     inds = mx.random.randint(0, 32, (rows, 1, 8)).astype(mx.uint32)
     scores = mx.softmax(mx.random.normal((rows, 1, 8)), axis = -1).astype(mx.bfloat16)
     mx.eval(fusion._moe_routed_experts(block)._run(tensors, x, inds, scores, mx.ones((rows, 1, 1), mx.bfloat16), mx.zeros_like(x), select = True))
-    assert bool(races) is raced
+    assert races == raced
 
 
 @pytest.mark.parametrize("routed_times, grouped_times, faster", [
@@ -1112,6 +1115,9 @@ def test_grouped_selection_checks_equality_then_keeps_the_measured_winner(monkey
     calls.clear()
     assert not fusion._grouped_routed_faster(lambda: run(0), lambda: run(1, True), lambda: pytest.fail("timed before bitwise gate"))
     assert calls == [0, 1]
+    untimed = lambda: pytest.fail("timed where the rows decide")
+    assert fusion._grouped_routed_faster(lambda: run(0), lambda: run(1), untimed, race = False) is True
+    assert fusion._grouped_routed_faster(lambda: run(0), lambda: run(1, True), untimed, race = False) is False
     assert not fusion._grouped_routed_faster(lambda: values, lambda: None)
     def unavailable():
         raise RuntimeError("unsupported grouped kernel")
