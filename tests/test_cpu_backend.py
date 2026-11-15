@@ -475,6 +475,62 @@ def test_lora_targets_go_through_the_models_own_remap(targets, expected, saved):
     assert calls and "lm_head" not in (calls[0][0] or [])
 
 
+def _capture_cpu_lora_config(model, **kwargs):
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    import peft
+    captured = {}
+    real = peft.LoraConfig.__init__
+
+    def spy(self, *args, **config):
+        captured.update(config)
+        raise RuntimeError("stop")
+
+    peft.LoraConfig.__init__ = spy
+    try:
+        with pytest.raises(RuntimeError, match = "stop"):
+            FastCPUModel.get_peft_model(model, r = 4, use_gradient_checkpointing = False, **kwargs)
+    finally:
+        peft.LoraConfig.__init__ = real
+    return captured
+
+
+def test_lora_remap_that_returns_its_input_keeps_the_embeddings_to_save():
+    # A remapper may hand back the very list it was given (nothing to translate): embed_tokens / lm_head, taken out
+    # before the call, must still be trained in full.
+    import torch.nn as nn
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(8, 8)
+
+        @staticmethod
+        def unsloth_lora_target_modules(target_modules, attention = True, mlp = True):
+            return target_modules
+
+    captured = _capture_cpu_lora_config(Model(), target_modules = ["q_proj", "embed_tokens", "lm_head"])
+    assert captured["target_modules"] == ["q_proj"]
+    assert captured["modules_to_save"] == ["embed_tokens", "lm_head"]
+
+
+def test_lora_remap_is_skipped_when_the_language_layers_are_not_finetuned():
+    import torch.nn as nn
+    calls = []
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(8, 8)
+
+        @staticmethod
+        def unsloth_lora_target_modules(target_modules, attention = True, mlp = True):
+            calls.append(target_modules)
+            return ["remapped"]
+
+    captured = _capture_cpu_lora_config(Model(), target_modules = ["q_proj"], finetune_language_layers = False)
+    assert calls == [] and captured["target_modules"] == ["q_proj"]
+
+
 def test_partial_llama_style_match_falls_back_to_the_peft_default():
     """MPT-like: Wqkv + out_proj + up_proj/down_proj. up/down alone must not become the target set."""
     import torch.nn as nn
