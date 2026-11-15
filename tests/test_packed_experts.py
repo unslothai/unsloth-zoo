@@ -251,3 +251,17 @@ def test_compiled_caller_traces_one_opaque_op(fmt):
     out.float().square().sum().backward()
     assert torch.equal(out.detach(), want) and torch.equal(inp.grad, want_dx)
     assert not counters["graph_break"]
+
+
+def test_accelerate_style_rebuild_keeps_the_scales():
+    # accelerate's set_module_tensor_to_device: param_cls(value.to(device), requires_grad = old.requires_grad)
+    for quantize in (quantize_experts_nvfp4, quantize_experts_mxfp8):
+        param = quantize(_rtn_stack(2, 32, 64), torch.bfloat16)
+        rebuilt = type(param)(param.to("cpu"), requires_grad = False)
+        assert type(rebuilt) is type(param) and torch.equal(rebuilt.dequantize(), param.dequantize())
+    accelerate = pytest.importorskip("accelerate.utils")
+    module = torch.nn.Module()
+    module.w = quantize_experts_nvfp4(_rtn_stack(2, 32, 64), torch.bfloat16)
+    want = module.w.dequantize()
+    accelerate.set_module_tensor_to_device(module, "w", "cpu")
+    assert type(module.w) is Nvfp4ExpertParam and torch.equal(module.w.dequantize(), want)

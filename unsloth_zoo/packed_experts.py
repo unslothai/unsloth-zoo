@@ -302,6 +302,12 @@ class _PackedExpertParam(torch.nn.Parameter):
         cls, data, requires_grad = False, packed_scales = None, packed_global = None, packed_transposed = False,
         packed_dtype = torch.bfloat16, packed_global_mode = "divide", **_ignored,
     ):
+        if packed_scales is None and isinstance(data, _PackedExpertParam):
+            # accelerate's set_module_tensor_to_device rebuilds as cls(value.to(device), requires_grad = ...).
+            kwargs = data._init_kwargs()
+            packed_scales, packed_global = kwargs["packed_scales"], kwargs["packed_global"]
+            packed_transposed, packed_dtype = kwargs["packed_transposed"], kwargs["packed_dtype"]
+            packed_global_mode = kwargs["packed_global_mode"]
         if data.dtype != torch.uint8 or data.dim() != 3 or packed_scales is None:
             raise ValueError(f"Unsloth: {cls.__name__} needs uint8 (E, N, *) codes and their block scales")
         param = torch.Tensor._make_subclass(cls, data, False)
@@ -515,7 +521,8 @@ def _out_dim(codes, fmt, transpose_b):
 def _grouped_impl(inputs, codes, scales, glob, counts, fmt, transpose_b, multiply):
     from unsloth_zoo.mxfp4_stacked_experts import _chunked_grouped_mm
     param = _rebuild(fmt, codes, scales, glob, False, multiply)
-    return _chunked_grouped_mm(inputs.contiguous(), param, counts, None, inputs.dtype, transpose_b)
+    # Contiguous like the fake: an unaligned N comes back as a column slice of a padded GEMM output.
+    return _chunked_grouped_mm(inputs.contiguous(), param, counts, None, inputs.dtype, transpose_b).contiguous()
 
 
 def _grouped_fake(inputs, codes, scales, glob, counts, fmt, transpose_b, multiply):
@@ -796,9 +803,6 @@ def quantize_moe_expert_stacks(model, fmt, dtype = None):
         plan = []
         for name, proj in _STACK_NAMES:
             param = experts._parameters[name]
-            if param.requires_grad and getattr(param, "_unsloth_trainable", False):
-                plan = []
-                break
             transposed = stack_rows_are_transposed(experts, name, proj)
             if transposed is None:
                 plan = []
