@@ -1008,6 +1008,7 @@ def _flat_selector(vocabulary):
 
 
 def test_the_tree_builder_grows_best_first_and_lays_rows_out_in_preorder():
+    import math
     from unsloth_zoo.mlx import inference
     if mx.default_device() != mx.gpu:
         pytest.skip("metal")
@@ -1043,6 +1044,7 @@ def test_the_tree_builder_grows_best_first_and_lays_rows_out_in_preorder():
                     assert score[row] + lq[d][j] <= worst + 1e-4
     assert sorted(tree.rank.tolist()) == list(range(16))
     assert mx.allclose(tree.score, mx.array(score), atol = 1e-3).item()
+    assert mx.allclose(tree.logq, mx.array([0.0] + [score[row] - score[parent[row]] for row in range(1, 16)]), atol = 1e-3).item()
     # In taking order the same nodes go out as taken, so a narrower tree of the lattice is the first rows; a row keeps its
     # state exactly where a row other than the next continues from it.
     rank = tree.rank.tolist()
@@ -1058,6 +1060,19 @@ def test_the_tree_builder_grows_best_first_and_lays_rows_out_in_preorder():
     for row in range(1, 8):
         up, d = parents[row], block.depth[row].item()
         assert path[row][:d + 1] == path[up][:d] + [row] and back[row] == (fork[up] if up != row - 1 else -1)
+    # Calibrated, a node gains log sigmoid(alpha + beta * logit q) by its depth, the last fit's past them, as grown here.
+    alpha, beta, nodes, frontier = [-0.5, 0.2, 1.5], [0.5, 0.9, 1.2], [(7, -1, 0, 0.0, 0.0)], []
+    gain = lambda d, logq: -math.log1p(math.exp(-(alpha[min(d, 2)] + beta[min(d, 2)] * math.log(math.exp(logq) / -math.expm1(logq)))))
+    while len(nodes) < 10:
+        d, total = nodes[-1][2], nodes[-1][3]
+        frontier += [(total + gain(d, lq[d][j]), ids[0, d, j].item(), len(nodes) - 1, d + 1, lq[d][j]) for j in range(K)]
+        frontier.remove(best := max(frontier))
+        nodes.append((best[1], best[2], best[3], best[0], best[4]))
+    fitted = inference.draft_tree(_flat_selector(64), mx.zeros((1, L, 32), mx.bfloat16), mx.array([7], mx.int32), ids, unary, 10,
+                                  True, mx.array([alpha, beta], mx.float32))
+    grown = [fitted.tokens, fitted.parent, fitted.block.depth, fitted.score, fitted.logq]
+    assert all(mx.allclose(got, mx.array(want), atol = 1e-3).item() for got, want in zip(grown, zip(*nodes)))
+    assert fitted.tokens.tolist()[:8] != taken.tokens.tolist() and max(fitted.block.depth.tolist()) > 3
     # The walk stays on its branch: a later row with the next token elsewhere is not it.
     other = inference.DraftTree(mx.array([9, 5, 6, 7, 7]), mx.array([-1, 0, 0, 2, 1]), None, None)
     path, walked = inference.draft_tree_accept(other, mx.array([6, 0, 7, 7, 0]))
@@ -1193,6 +1208,7 @@ def test_a_quantized_row_keeps_its_chain_rounds(qwen_4bit, monkeypatch):
 
 
 def test_a_tree_round_verifies_the_width_its_budget_sizes_from_its_lattice_and_keeps_the_tokens(qwen_4bit, monkeypatch):
+    import math
     from unsloth_zoo.mlx.generate import SamplingParams
     from unsloth_zoo.mlx.speculative import SizedTreeBudget
     model, ids, _ = qwen_4bit
@@ -1218,7 +1234,8 @@ def test_a_tree_round_verifies_the_width_its_budget_sizes_from_its_lattice_and_k
         drafted, record = [], engine.controller.record_round
         engine.controller.record_round = lambda plan, *args, **kwargs: drafted.append(plan.rows[0].length) or record(plan, *args, **kwargs)
         budget.yields_to_controller = lambda *args: False   # the script's stats stop short of the raised depth
-        engine.drafter.tree_budget, engine.drafter.sized_trees = budget, True
+        engine.drafter.tree_budget, engine.drafter.sized_trees, fits = budget, True, []
+        engine.drafter.tree_calibration = SimpleNamespace(observe = lambda *args: fits.append(args))
         reply, _ = _scored_reply(model, ids, engine, 72)
     assert reply == expected and len(commits) >= 4 and {3, 4, 5, 6} <= set(chosen)
     assert len(replies) == len(observed) and all(reply is replies[0] for reply in replies)
@@ -1230,6 +1247,11 @@ def test_a_tree_round_verifies_the_width_its_budget_sizes_from_its_lattice_and_k
     assert all((6, width) in verifies for width in chosen) and all(width - 1 in drafted for width in chosen[:len(observed)])
     # The budget hears each width and the nodes its round walked.
     assert [width for width, _ in observed] == chosen[:len(observed)] and [len(ranks) for _, ranks in observed] == [len(path) - 1 for path in commits]
+    # The calibration hears each round's verified rows, as depths, parents and the selector's log q, and the rows walked.
+    assert [len(depths) for depths, *_ in fits] == chosen[:len(fits)] and [path for *_, path in fits] == commits
+    assert all(depths[row] == depths[parents[row]] + 1 for depths, parents, _, _ in fits for row in range(1, len(depths)))
+    assert all(math.isclose(([1.0] + [p for p, _ in nodes])[parents[row]] * math.exp(logq[row]), nodes[row - 1][0], rel_tol = 1e-3)
+               for nodes, (_, parents, logq, _) in zip(seen, fits) for row in range(1, len(logq)))
     # A path holds one node of each depth, which ranks into the lattice's order show and rows of the tree would not.
     assert all(sorted(nodes[rank - 1][1] for rank in ranks) == list(range(1, len(ranks) + 1)) for nodes, (_, ranks) in zip(seen, observed))
 
@@ -1253,6 +1275,9 @@ def test_load_times_the_tree_widths_of_a_target_whose_rows_match_their_paths(qwe
     # A chain round after a block drafted ahead as a tree, as these are, still proposes.
     assert budget and drafts and all(mx.any(block != 0).item() for block in drafts)
     assert list(budget.tree_costs) == list(budget.chain_costs) == [8] and min(budget.tree_costs[8], budget.chain_costs[8]) > 0
+    # The rounds timed here leave the calibration replies start from no records.
+    fit = drafter.tree_calibration
+    assert fit.parameters.shape == (2, 7) and fit._rounds == 0 and not any(fit._seen)
     # A target whose rows bring their own experts sizes each round's tree from the widths timed here.
     drafter.tree_budget, drafter.sized_trees, drafter.tree_widths = None, True, (4, 8)
     timed, observe = [], S.SizedTreeBudget.observe
@@ -2953,8 +2978,8 @@ def test_context_rows_pass_their_reply_tokens_to_the_head_scan():
             seen.append(scan)
             return mx.zeros((1, 7), mx.int32)
         def tree(self, *args):
-            seen.append(args[-2])
-            taken.append(args[-1])
+            seen.append(args[-3])
+            taken.append(args[-2:])
             return SimpleNamespace(tokens = mx.zeros(1))
     class Head(nn.Module):
         def bind(self, target):
@@ -2980,12 +3005,14 @@ def test_context_rows_pass_their_reply_tokens_to_the_head_scan():
     row.tree_rows = 8
     drafter.push(row, [7], hidden[0, :1])
     drafter.sized_trees = True   # their trees go out in taking order
+    drafter.tree_calibration = SimpleNamespace(parameters = "fit")   # and grow by its fit
     drafter.prefetch([row])
     drafter.predraft_rows = 8
     for row.tree_rows in (8, 0):
         row.prefetched_tree = None
         assert drafter.predraft(row, hidden[0], mx.array(1), mx.array(5))
-    assert seen[1:] == [row.scan] * 5 and row.scan.tokens == [1, 2, 3, 4, 5, 6, 7] and taken == [False, True, True]
+    assert seen[1:] == [row.scan] * 5 and row.scan.tokens == [1, 2, 3, 4, 5, 6, 7]
+    assert taken == [(False, None), (True, "fit"), (True, "fit")]
 
 
 def test_sparse_draft_selection_preserves_canonical_ties_and_call_ownership():
