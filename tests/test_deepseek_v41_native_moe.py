@@ -226,8 +226,7 @@ def test_cpu_standalone_load_keeps_the_native_loop(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "the Triton MoE backend needs CUDA")
 def test_triton_backend_under_compile_matches_its_non_reentrant_recompute(patched, monkeypatch):
-    # The Triton backend tuned its configs on the first traced call (a graph break at the disabled tuner) and not on
-    # the checkpoint recompute, so the two passes saved different tensors: CheckpointError on backward.
+    # The tuner ran on the first traced call only, so the recompute saved different tensors (CheckpointError).
     pytest.importorskip("unsloth.kernels.moe.grouped_gemm.interface")
     from unsloth_zoo.temporary_patches.deepseek_v41 import patch_deepseek_v41_gradient_checkpointing
     from unsloth_zoo.temporary_patches.moe_utils import get_forward_moe_backend

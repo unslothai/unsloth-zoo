@@ -1121,8 +1121,7 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
 
     backend = select_moe_backend_without_sonic(hidden_states.device)
 
-    # 0. FP4-packed experts are MXFP4: the grouped_mm backend decodes them inside its GEMM (or dequantizes only the
-    #    experts that got tokens) instead of rebuilding both bf16 stacks every pass and again on the GC replay.
+    # 0. FP4-packed experts are MXFP4: decode inside the grouped GEMM instead of rebuilding both bf16 stacks.
     if backend == "grouped_mm":
         packed = _fp4_experts_as_mxfp4(self)
         if packed is not None:
