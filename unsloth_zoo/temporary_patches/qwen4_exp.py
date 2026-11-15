@@ -60,10 +60,19 @@ def qwen4_exp_qsa_indexer_forward(self, hidden_states, position_embeddings, atte
         return torch.where(
             attention_mask == 0, attention_mask.new_zeros(()), torch.finfo(attention_mask.dtype).min
         )
-    # The reference reads the position table by kv slot, which has one row per token seen so far. A static cache's
-    # mask spans max_cache_len, and a query row that attends to nothing (a left pad) is given every slot by Unsloth's
-    # sdpa_mask fix, unfilled ones included: the reference then indexes past the table (a CUDA device assert in
-    # batched generate). Real tokens never see an unfilled slot, so hiding them changes no row that is read.
+    from unsloth_zoo.temporary_patches.qwen4_exp import qwen4_exp_qsa_indexer_forward_guarded
+    return qwen4_exp_qsa_indexer_forward_guarded(self, hidden_states, position_embeddings, attention_mask, past_key_values)
+
+
+def qwen4_exp_qsa_indexer_forward_guarded(self, hidden_states, position_embeddings, attention_mask,
+                                          past_key_values=None):
+    """transformers' indexer on the filled cache slots only; installed alone under UNSLOTH_QWEN4_EXP_FAST_QSA=0.
+
+    The reference reads the position table by kv slot, which has one row per token seen so far. A static cache's
+    mask spans max_cache_len, and a query row that attends to nothing (a left pad) is given every slot by Unsloth's
+    sdpa_mask fix, unfilled ones included: the reference then indexes past the table (a CUDA device assert in
+    batched generate). Real tokens never see an unfilled slot, so hiding them changes no row that is read."""
+    # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
     if attention_mask is not None and attention_mask.dim() == 4:
         n_positions = position_embeddings[0].shape[-2]
         if attention_mask.shape[-1] > n_positions:
@@ -252,7 +261,7 @@ def _reference_returns_float_mask(function):
 def _make_fast_indexer_forward(original_forward):
     """Test hook: bind `original_forward` as the long-context reference."""
     global _reference_qsa_forward, _qsa_returns_float_mask
-    if original_forward is not qwen4_exp_qsa_indexer_forward:
+    if original_forward not in (qwen4_exp_qsa_indexer_forward, qwen4_exp_qsa_indexer_forward_guarded):
         _reference_qsa_forward = original_forward
         _qsa_returns_float_mask = _reference_returns_float_mask(original_forward)
     return qwen4_exp_qsa_indexer_forward
@@ -348,16 +357,18 @@ def patch_qwen4_exp():
 
 def _patch_qwen4_exp_rest(modeling):
     indexer_cls = getattr(modeling, "Qwen4ExpTextQSAIndexer", None)
-    if (
-        indexer_cls is not None
-        and _fast_qsa_enabled()
-        and indexer_cls.forward is not qwen4_exp_qsa_indexer_forward
-        # Never take the compiler's copy (which calls us) as the reference.
-        and _is_transformers_indexer_forward(indexer_cls.forward)
-    ):
+    if indexer_cls is not None:
+        # The kill switch drops the fast within-budget path but keeps the filled-slot guard.
+        wanted = qwen4_exp_qsa_indexer_forward if _fast_qsa_enabled() else qwen4_exp_qsa_indexer_forward_guarded
+        current = indexer_cls.forward
         try:
-            _make_fast_indexer_forward(indexer_cls.forward)
-            indexer_cls.forward = qwen4_exp_qsa_indexer_forward
+            if current in (qwen4_exp_qsa_indexer_forward, qwen4_exp_qsa_indexer_forward_guarded):
+                if _reference_qsa_forward is not None:
+                    indexer_cls.forward = wanted
+            # Never take the compiler's copy (which calls us) as the reference.
+            elif _is_transformers_indexer_forward(current):
+                _make_fast_indexer_forward(current)
+                indexer_cls.forward = wanted
         except Exception as e:
             if UNSLOTH_ENABLE_LOGGING:
                 logger.warning(f"Unsloth: Could not patch Qwen4ExpTextQSAIndexer.forward: {e}")
