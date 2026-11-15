@@ -121,6 +121,23 @@ def test_native_loop_backend_matches_the_native_forward(reference_forward, patch
     assert torch.equal(got, want), (got.float() - want.float()).abs().max()
 
 
+@pytest.mark.parametrize(
+    "weight_dtype,dtype",
+    [(torch.float32, torch.bfloat16), (torch.float32, torch.float16), (torch.bfloat16, torch.float32)],
+)
+def test_native_loop_backend_casts_dense_experts_like_the_native_forward(reference_forward, patched, weight_dtype, dtype):
+    # The native forward casts each dense expert slice to the activation dtype (_expert_weight); outside autocast the
+    # backend loop must too, or F.linear raises on the dtype mix.
+    from unsloth_zoo.temporary_patches.moe_utils import forward_native_moe_loop
+
+    experts = _dense_experts(weight_dtype)
+    hidden, index, weights = _routing(dtype = dtype)
+    want = reference_forward(experts, hidden, index, weights)
+    got = forward_native_moe_loop(experts, hidden, index, weights)
+    assert got.dtype == want.dtype == dtype
+    torch.testing.assert_close(got, want, rtol = 0, atol = 0)
+
+
 def test_native_loop_backend_keeps_a_cancelling_residual(patched):
     # Two slots that cancel up to a small residual: summed in fp32 the residual survives the final rounding; rounded
     # to bf16 per slot first it was lost.

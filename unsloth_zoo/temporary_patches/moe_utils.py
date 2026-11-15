@@ -5354,7 +5354,12 @@ def _loop_expert_weight(param, expert_idx, dtype):
             dtype = dtype,
             transpose = param.mxfp4_transposed,
         )[0]
-    return param[expert_idx]
+    weight = param[expert_idx]
+    # A dense 16/32-bit stack in another dtype than the activations (fp32 experts, bf16 hidden states outside autocast)
+    # is cast, as the native DeepSeek-V4.1 _expert_weight does; F.linear would raise on the mix. fp8 / int stay as is.
+    if weight.is_floating_point() and weight.element_size() > 1 and weight.dtype != dtype:
+        weight = weight.to(dtype)
+    return weight
 
 
 def forward_native_grouped_mm(
