@@ -1105,8 +1105,8 @@ class TreeBudget:
     Mac's cycle costs measured at load (``{rows: seconds}``, as `warm_speculative_rounds` times them) and the tokens rounds
     actually emitted. A round of the widest tree holds the narrower trees and the chain of its lattice, so each tells what
     they would have emitted on the same text: no calibration of the drafter's probabilities, and until enough such
-    rounds are in, or one in ``PROBE_EVERY`` rounds after, a round runs the widest tree: one in ``PROBE_SETTLED_EVERY``
-    while its rate is under ``PROBE_SETTLED_RATE`` of the best tree's, where each such round loses that gap."""
+    rounds are in a round runs the widest tree. It keeps running unless its rate is under ``PROBE_SETTLED_RATE`` of the
+    best tree's, which then runs, the widest one round in ``PROBE_SETTLED_EVERY``: a nearer tie is within the estimate's noise."""
 
     MIN_SAMPLES = 24
     PROBE_EVERY, PROBE_SETTLED_EVERY, PROBE_SETTLED_RATE = 8, 64, 0.95
@@ -1150,7 +1150,9 @@ class TreeBudget:
             self._since_wide = 0
             return widest
         chain = max(self._rate(self.chains[w], cost, w) for w, cost in self.chain_costs.items())
-        return rows if rate(rows) >= chain else 0
+        if rate(rows) < chain:
+            return 0
+        return rows if settled else widest
 
 
 class TreeCalibration:
