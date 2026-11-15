@@ -34,9 +34,9 @@
       "file": "unsloth_zoo/compiler.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "885dc7a9d18c2d47",
+      "digest": "d327daedda374223",
       "count": 1,
-      "reason": "model_type is checked against [a-z0-9_]+ first, and the import is prefix-bounded to transformers.models.<type>.modeling_<type>."
+      "reason": "model_type is checked against [a-z0-9_]+ first (in resolve_modeling_module itself), and the import is prefix-bounded to transformers.models.<type>.modeling_<type>."
     },
     {
       "file": "unsloth_zoo/compiler.py",

@@ -360,6 +360,8 @@ def resolve_modeling_module(model_type):
     """(dotted location, module) of the modeling code for `model_type`: transformers' own file, else a native module
     that is ALREADY imported (registered, or at unsloth.models.<model_type>.modeling). Never imports unsloth. The
     compiler evals `f"{location}.{name}"`, so the location's root package is bound in this module's globals."""
+    if not re.fullmatch(r"[a-z0-9_]+", str(model_type)):
+        return None, None
     location = f"transformers.models.{model_type}.modeling_{model_type}"
     try:
         return location, importlib.import_module(location)
@@ -371,7 +373,8 @@ def resolve_modeling_module(model_type):
         if module is None or root is None:
             continue
         try:
-            resolved = eval(name, {name.split(".")[0]: root})
+            # The dotted path the compiler evaluates must reach the same module from its root package.
+            resolved = functools.reduce(getattr, name.split(".")[1:], root)
         except Exception:
             continue
         if resolved is module:
