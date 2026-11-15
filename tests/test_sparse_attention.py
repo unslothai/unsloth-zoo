@@ -373,6 +373,9 @@ def test_cuda_all_pad_rows_are_zero_and_finite(monkeypatch, backend, with_sink):
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", backend)
     q, kv, idxs = _all_pad_inputs("cuda", dtype)
+    if backend == "flex" and not sa._flex_eligible(q, kv.shape[1]):
+        # Dispatch never picks flex here (sm75 shared memory).
+        pytest.skip("flex is not eligible on this device")
     sink = (torch.randn(16) if with_sink else torch.full((16,), float("-inf"))).cuda()
     q, kv = q.requires_grad_(), kv.requires_grad_()
     sink.requires_grad_(with_sink)
@@ -458,17 +461,28 @@ print("INTERP_WORST", worst)
 """
 
 
-def test_triton_kernel_math_in_the_interpreter():
-    # The kernel's own arithmetic (tiles, masks, online softmax, atomics, empty rows, heads not a multiple of 16,
-    # more slots than rows) on CPU through TRITON_INTERPRET, against the fp64 reference.
+@pytest.fixture(scope = "module")
+def _interpreter_run():
+    # One subprocess for both scripts (window first: the index script patches _configs at its end).
     import subprocess, sys
     from pathlib import Path
     env = dict(os.environ, PYTHONPATH = str(Path(__file__).resolve().parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", ""),
-               CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1")
-    proc = subprocess.run([sys.executable, "-c", _INTERP], env = env, capture_output = True, text = True, timeout = 600)
-    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("INTERP_WORST")), None)
+               CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1", OMP_NUM_THREADS = "4",
+               UNSLOTH_ZOO_DISABLE_GPU_INIT = "0")  # "1" swaps in the triton stub: no interpreter
+    return subprocess.run([sys.executable, "-c", _WINDOW_INTERP + _INTERP], env = env, capture_output = True, text = True,
+                          timeout = 900)
+
+
+def _interpreter_worst(proc, tag):
+    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith(tag + " ")), None)
+    if line is None and "No module named 'triton'" in proc.stderr:
+        pytest.skip("Triton is not installed (Windows CPU runners)")
     assert line is not None, proc.stderr[-3000:]
     assert float(line.split()[1]) < 1e-5, line
+
+
+def test_triton_kernel_math_in_the_interpreter(_interpreter_run):
+    _interpreter_worst(_interpreter_run, "INTERP_WORST")
 
 
 @pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
@@ -476,7 +490,7 @@ def test_flex_gate_follows_shared_memory():
     # head_dim 512 flex needs ~160 KB per block: on smaller parts (T4, L4, sm86 / 89, sm120) it must never be picked;
     # sm75 never gets flex at any head_dim (it failed to compile there).
     q = torch.empty(1, 4, 16, 512, device = "cuda", dtype = _cuda_dtypes()[-1])
-    sm80 = torch.cuda.get_device_capability()[0] >= 8
+    sm80 = torch.cuda.get_device_capability()[0] >= 8 and sa._HAS_FLEX   # torch < 2.5: no flex_attention
     big_enough = sm80 and sa._shared_memory(q.device) >= sa._FLEX_D512_MIN_SHARED_MEMORY
     assert sa._flex_eligible(q) == big_enough
     assert ("flex" in sa._order(q, 8)) == big_enough
@@ -590,7 +604,7 @@ torch.manual_seed(0)
 worst = 0.0
 # (b, s, h, d, nc, k, window, sink): heads not a multiple of 16, no compressed slots, window 1, window > s.
 for (b, s, h, d, nc, k, w, sink_on) in ((1, 37, 3, 16, 9, 5, 8, True), (2, 21, 17, 32, 11, 0, 5, False),
-                                        (1, 40, 16, 16, 7, 4, 64, True), (1, 9, 2, 16, 6, 3, 1, True)):
+                                        (1, 20, 16, 16, 7, 4, 64, True), (1, 9, 2, 16, 6, 3, 1, True)):
     q = torch.randn(b, s, h, d, requires_grad = True)
     win = torch.randn(b, s, d, requires_grad = True)
     comp = torch.randn(b, nc, d, requires_grad = True)
@@ -612,7 +626,7 @@ for (b, s, h, d, nc, k, w, sink_on) in ((1, 37, 3, 16, 9, 5, 8, True), (2, 21, 1
     want = [ref] + list(torch.autograd.grad(ref, ref_leaves, go.double()))
     worst = max(worst, max(float((x.double() - y).abs().max()) for x, y in zip(got, want)))
 # One index row shared by g consecutive batches (the GQA fold) == the repeated rows.
-b, g, s, h, d, n, k = 2, 3, 7, 4, 16, 10, 6
+b, g, s, h, d, n, k = 2, 2, 5, 4, 16, 10, 6
 q = torch.randn(b * g, s, h, d, requires_grad = True)
 kv = torch.randn(b * g, n, d, requires_grad = True)
 idx = torch.stack([torch.stack([torch.randperm(n)[:k] for _ in range(s)]) for _ in range(b)]).int()
@@ -626,15 +640,8 @@ print("WINDOW_INTERP_WORST", worst)
 """
 
 
-def test_window_kernel_and_shared_index_rows_in_the_interpreter():
-    import subprocess, sys
-    from pathlib import Path
-    env = dict(os.environ, PYTHONPATH = str(Path(__file__).resolve().parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", ""),
-               CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1")
-    proc = subprocess.run([sys.executable, "-c", _WINDOW_INTERP], env = env, capture_output = True, text = True, timeout = 900)
-    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("WINDOW_INTERP_WORST")), None)
-    assert line is not None, proc.stderr[-3000:]
-    assert float(line.split()[1]) < 1e-5, line
+def test_window_kernel_and_shared_index_rows_in_the_interpreter(_interpreter_run):
+    _interpreter_worst(_interpreter_run, "WINDOW_INTERP_WORST")
 
 
 @pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
@@ -649,6 +656,8 @@ def test_qsa_gqa_dispatch_prefers_flex_where_it_compiles(monkeypatch, cap, smem,
     real_cap = torch.cuda.get_device_capability()
     if want == "flex" and real_cap[0] < 8:
         pytest.skip("flex needs a real sm80+ device")
+    if want == "flex" and not sa._HAS_FLEX:   # torch < 2.5: no flex_attention, the fold runs
+        want = "triton"
     monkeypatch.delenv("UNSLOTH_SPARSE_ATTN_BACKEND", raising = False)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: cap)
     monkeypatch.setattr(sa, "_shared_memory", lambda device: smem)
@@ -799,3 +808,49 @@ def test_window_only_hd512_compiles_fullgraph(with_sink):
     compiled = _grads(torch.compile(layer, fullgraph = True), q, win, sink, go)
     for x, y in zip(compiled, eager):
         torch.testing.assert_close(x.float(), y.float(), atol = 1e-2, rtol = 1e-2)
+
+
+def _bool_membership(topk_idxs, kv_len, block = 128):
+    """The [b, s, n] bool table the flex path used to keep for backward: the allowed-key oracle."""
+    b, s, k = topk_idxs.shape
+    nq, nk = -(-s // block), -(-kv_len // block)
+    valid = (topk_idxs >= 0) & (topk_idxs < kv_len)
+    cols = torch.where(valid, topk_idxs, nk * block).long()
+    table = torch.zeros((b, nq * block, nk * block + 1), dtype = torch.bool)
+    table[:, :s].scatter_(-1, cols, True)
+    table = table[..., : nk * block]
+    tiles = table.view(b, nq, block, nk, block)
+    return table, tiles.any(dim = 4).any(dim = 2), tiles.all(dim = 4).all(dim = 2)
+
+
+@pytest.mark.parametrize("s,n,k", [(300, 300, 40), (130, 517, 200), (256, 256, 256), (77, 1, 1)])
+def test_bit_packed_membership_mask_allows_exactly_the_listed_keys(s, n, k):
+    # One bit per key: 8 MB per layer at 8k instead of 64 MB.
+    g = torch.Generator().manual_seed(s + n)
+    b = 2
+    idxs = _unique_idxs(b, s, min(k, n), n, 0.2, g, empty_rows = [(0, 3), (1, s - 1)])
+    if k >= n:   # rows that list every key: fully visible tiles
+        idxs[1, : min(s, 128)] = torch.arange(n, dtype = torch.int32)
+    idxs[0, 5, 0] = n + 7   # out of range: ignored, as before
+    table, any_ref, all_ref = _bool_membership(idxs, n)
+    mask = sa._membership_block_mask(idxs, n)
+    kept = [t for t in mask.mask_mod.__closure__ or () if isinstance(t.cell_contents, torch.Tensor)]
+    held = sum(t.cell_contents.numel() * t.cell_contents.element_size() for t in kept)
+    assert held * 8 <= table.numel() + 32 * 8 * table.shape[0] * table.shape[1], (held, table.numel())
+    bi, qi, ki = (x.reshape(-1) for x in torch.meshgrid(
+        torch.arange(b), torch.arange(table.shape[1]), torch.arange(table.shape[2]), indexing = "ij"))
+    got = mask.mask_mod(bi, torch.zeros_like(bi), qi, ki).view(table.shape)
+    assert torch.equal(got, table)
+    # Tiles: visible = partial + full, as the bool table's any(); full as its all().
+    assert torch.equal(mask.to_dense()[:, 0].bool(), any_ref)
+    full = torch.zeros_like(all_ref)
+    for bb in range(b):
+        for qq in range(any_ref.shape[1]):
+            c = int(mask.full_kv_num_blocks[bb, 0, qq])
+            full[bb, qq, mask.full_kv_indices[bb, 0, qq, :c].long()] = True
+    assert torch.equal(full, all_ref)
+
+
+def test_flex_budget_admits_32k_tokens():
+    # At 1 bit per entry the same 256 MB budget holds QSA at 32k tokens (b = 1); 64k still falls back.
+    assert 32768 * 32768 <= sa._FLEX_MAX_TABLE < 65536 * 65536

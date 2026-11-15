@@ -2909,6 +2909,18 @@ def _is_nvfp4_compressed_tensors_config(quant_config):
     )
 pass
 
+def _is_mxfp8_compressed_tensors_config(quant_config):
+    """compressed-tensors checkpoint with an mxfp8-quantized group: a 16bit merge must decode its e8m0 scales."""
+    if not isinstance(quant_config, dict) or str(quant_config.get("quant_method", "")).lower() != "compressed-tensors":
+        return False
+    if str(quant_config.get("format", "")).lower() == "mxfp8-quantized":
+        return True
+    return any(
+        isinstance(group, dict) and str(group.get("format", "")).lower() == "mxfp8-quantized"
+        for group in (quant_config.get("config_groups") or {}).values()
+    )
+pass
+
 def _nvfp4_bases(keys):
     return {k[: -len(_NVFP4_PACKED_SUFFIX)] for k in keys if isinstance(k, str) and k.endswith(_NVFP4_PACKED_SUFFIX)}
 pass
@@ -8634,6 +8646,10 @@ def check_model_quantization_status(model_name_or_path, token=None, local_ok=Tru
 
         # NVFP4 compressed-tensors takes the same dequantize-on-merge rewrite, which unpacks weight_packed.
         elif _is_nvfp4_compressed_tensors_config(quant_config):
+            return (True, "fp8")
+
+        # MXFP8 compressed-tensors: fp8 weights with e8m0 1x32 scales, decoded by the same FP8 rewrite.
+        elif _is_mxfp8_compressed_tensors_config(quant_config):
             return (True, "fp8")
 
         # Case 1: Fallback to existing logic for bitsandbytes

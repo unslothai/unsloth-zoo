@@ -330,7 +330,7 @@ def test_route_decisions():
     assert not rr.grpo_fused_route_ok(ok, entropy_mask_on = True)
     assert not rr.grpo_fused_route_ok(ok, rollout_logps_as_old = True)
     assert not rr.grpo_fused_route_ok(ok, support_kwargs = {"support_top_k": 5})
-    assert not rr.grpo_fused_route_ok(ok, pixel_values = torch.ones(1))
+    assert rr.grpo_fused_route_ok(ok, pixel_values = torch.ones(1))  # vision batches take it (test_grpo_vision_fused_route)
     assert not rr.grpo_fused_route_ok(ok, zero3_head = (torch.ones(1), None))
     for lt in ("grpo", "bnpo", "dr_grpo", "dapo", "luspo", "cispo", "sapo"):
         assert rr.grpo_fused_route_ok({**ok, "loss_type": lt})

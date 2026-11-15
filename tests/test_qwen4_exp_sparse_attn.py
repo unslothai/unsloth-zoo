@@ -254,3 +254,116 @@ def test_mask_geometry_is_scanned_once_per_mask_version(monkeypatch):
         mask[0, 0, 39, 0] = True  # an in-place edit bumps the version: rescanned
         sa.qsa_select_tokens(attention.indexer, hidden, pe, mask, modeling.apply_rotary_pos_emb)
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize("kind", ["causal", "packed"])
+def test_compiled_attention_keeps_the_eager_dispatch(monkeypatch, kind):
+    # Under torch.compile attention leaves the graph with the selection: eager dispatch, same break count, same result.
+    import torch._dynamo
+    from torch._dynamo.utils import counters
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")
+    config, attention, rotary = _module("sdpa")
+    b, s = 2, 41
+    hidden, pe = _inputs(b, s, rotary)
+    mask = _masks(kind, b, s)
+    params = [p for p in attention.parameters() if p.requires_grad]
+    go = torch.randn(b, s, 64, dtype = torch.float64)
+
+    def fn(x):
+        return zoo_qwen4_exp._qwen4_exp_sparse_attention(attention, x, pe, mask, None, {})[0]
+
+    def run(f):
+        x = hidden.clone().requires_grad_()
+        out = f(x)
+        return out.detach(), torch.autograd.grad(out, [x] + params, go, allow_unused = True)
+
+    ref_out, ref_g = run(fn)
+    torch._dynamo.reset()
+    counters.clear()
+    before = sa.SPARSE_ATTN_STATS["torch"]
+    out, grads = run(torch.compile(fn, backend = "aot_eager"))
+    assert sa.SPARSE_ATTN_STATS["torch"] == before + 1, "the attention was traced, not dispatched eagerly"
+    # One break site, as before the change (there: the selection; here: selection + attention).
+    assert len(counters["graph_break"]) == 1, dict(counters["graph_break"])
+    torch.testing.assert_close(out, ref_out, rtol = 1e-10, atol = 1e-10)
+    for x, y in zip(grads, ref_g):
+        if x is None or y is None:
+            assert x is None and y is None
+            continue
+        torch.testing.assert_close(x, y, rtol = 1e-9, atol = 1e-10)
+    torch._dynamo.reset()
+
+
+def test_static_cache_decode_compiles_fullgraph(monkeypatch):
+    # Decode must be rejected before the cache probe (StaticCache returns a tensor: graph break + host sync).
+    from transformers import StaticCache
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")
+    config, attention, rotary = _module("sdpa")
+    first, first_pe = _inputs(1, 1, rotary, seed = 2)
+    hidden, pe = _inputs(1, 1, rotary)
+    mask = torch.zeros((1, 1, 1, 16), dtype = torch.bool)
+    mask[..., :2] = True
+
+    def warm():
+        cache = StaticCache(config, max_cache_len = 16)
+        with torch.no_grad():
+            _reference_forward()(attention, first, first_pe, mask, cache)
+        return cache
+
+    with torch.no_grad():
+        want = _reference_forward()(attention, hidden, pe, mask, warm())[0]
+        cache = warm()
+        torch._dynamo.reset()
+        got = torch.compile(lambda x: zoo_qwen4_exp.qwen4_exp_attention_forward(attention, x, pe, mask, cache)[0],
+                            backend = "eager", fullgraph = True)(hidden)
+    # fp64 rounding only: transformers 5.23's compiled SDPA dispatch differs from eager in the last bit.
+    torch.testing.assert_close(got, want, rtol = 1e-12, atol = 1e-14)
+
+
+def _text_model_run(model, ids, use_cache):
+    # Prefill, then (with a cache) two decode steps through the model's own cache.
+    with torch.no_grad():
+        if not use_cache:
+            return model(input_ids = ids, use_cache = False).last_hidden_state
+        out = model(input_ids = ids[:, :-2], use_cache = True)
+        hidden, past = [out.last_hidden_state], out.past_key_values
+        for t in (-2, -1):
+            out = model(input_ids = ids[:, t:][:, :1], past_key_values = past, use_cache = True)
+            hidden.append(out.last_hidden_state)
+            past = out.past_key_values
+        return torch.cat(hidden, dim = 1)
+
+
+@pytest.fixture
+def _few_threads():
+    threads = torch.get_num_threads()
+    torch.set_num_threads(min(threads, 4))
+    yield
+    torch.set_num_threads(threads)
+
+
+@pytest.mark.parametrize("use_cache", [False, True], ids = ["no_cache", "prefill_then_decode"])
+def test_text_model_forward_matches_the_reference_end_to_end(monkeypatch, use_cache, _few_threads):
+    # Through the whole text model (own mRoPE ids and cache), patched equals untouched and engages on prefill.
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")
+    monkeypatch.setenv("UNSLOTH_QWEN4_EXP_EXACT_TIES", "1")
+    monkeypatch.setenv("UNSLOTH_FROZEN_TABLE", "gpu")
+    zoo_qwen4_exp.patch_qwen4_exp()
+    # CPU run: use torch linear-attention / MoE paths, since the GPU host's Triton kernels reject CPU tensors.
+    for name in ("torch_chunk_gated_delta_rule", "torch_recurrent_gated_delta_rule", "causal_conv1d_fn",
+                 "causal_conv1d_update"):
+        original = getattr(getattr(modeling, name, None), "__wrapped__", None)
+        if original is not None:
+            monkeypatch.setattr(modeling, name, original)
+    config, _, _ = _module("sdpa")
+    torch.manual_seed(0)
+    model = modeling.Qwen4ExpTextModel(config).double().eval()
+    for layer in model.layers:
+        layer.mlp = layer.mlp.shared_expert
+    ids = torch.randint(0, config.vocab_size, (2, 45), generator = torch.Generator().manual_seed(3))
+    before = dict(zoo_qwen4_exp.QWEN4_EXP_SPARSE_STATS)
+    got = _text_model_run(model, ids, use_cache)
+    assert zoo_qwen4_exp.QWEN4_EXP_SPARSE_STATS["sparse"] > before["sparse"]
+    monkeypatch.setattr(modeling.Qwen4ExpTextAttention, "forward", _reference_forward())
+    want = _text_model_run(model, ids, use_cache)
+    torch.testing.assert_close(got, want, rtol = 1e-10, atol = 1e-12)

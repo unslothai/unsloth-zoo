@@ -57,38 +57,60 @@ _SUB = textwrap.dedent(
 )
 
 
-def test_qwen4_exp_imported_first_gets_vendored_kernels():
+_KILL_SWITCH = textwrap.dedent(
+    """
+    import importlib.util, sys
+    if importlib.util.find_spec("fla") is not None and "unsloth_zoo" not in (importlib.util.find_spec("fla").origin or ""):
+        print("SKIP_REAL_FLA_INSTALLED"); raise SystemExit(0)
+    import unsloth_zoo  # noqa: F401
+    import transformers.models.qwen4_exp.modeling_qwen4_exp as m
+    from unsloth_zoo.temporary_patches.fla_vendor import _resolved_implementation
+    impl = _resolved_implementation(m.torch_chunk_gated_delta_rule)
+    assert getattr(impl, "__module__", "").startswith("transformers."), impl
+    print("KILL_SWITCH_OK")
+    """
+)
+
+
+@pytest.fixture(scope="module")
+def _processes():
+    # Fresh interpreters (import order is the subject), started in parallel.
     pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    base = dict(os.environ)
+    base["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + base.get("PYTHONPATH", "")
+    base["HF_HUB_OFFLINE"] = "1"
     for k in ("UNSLOTH_VENDORED_FLA_NO_AUTORUN", "UNSLOTH_DISABLE_VENDORED_FLA"):
-        env.pop(k, None)
-    proc = subprocess.run([sys.executable, "-c", _SUB], env=env, capture_output=True, text=True)
-    if "SKIP_" in proc.stdout:
-        pytest.skip(proc.stdout.strip())
-    assert "QWEN4_EXP_REPAIRED_OK" in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr[-3000:]}"
+        base.pop(k, None)
+    kill = dict(base, UNSLOTH_DISABLE_VENDORED_FLA="1")
+    procs = {
+        name: subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True)
+        for name, code, env in (("imported_first", _SUB, base), ("kill_switch", _KILL_SWITCH, kill))
+    }
+    results = {}
+
+    def result(name):
+        if name not in results:
+            results[name] = procs[name].communicate(timeout=600)
+        return results[name]
+
+    yield result
+    for proc in procs.values():
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
 
 
-def test_qwen4_exp_kill_switch_keeps_torch():
-    pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
-    env["UNSLOTH_DISABLE_VENDORED_FLA"] = "1"
-    env.pop("UNSLOTH_VENDORED_FLA_NO_AUTORUN", None)
-    code = textwrap.dedent(
-        """
-        import importlib.util, sys
-        if importlib.util.find_spec("fla") is not None and "unsloth_zoo" not in (importlib.util.find_spec("fla").origin or ""):
-            print("SKIP_REAL_FLA_INSTALLED"); raise SystemExit(0)
-        import unsloth_zoo  # noqa: F401
-        import transformers.models.qwen4_exp.modeling_qwen4_exp as m
-        from unsloth_zoo.temporary_patches.fla_vendor import _resolved_implementation
-        impl = _resolved_implementation(m.torch_chunk_gated_delta_rule)
-        assert getattr(impl, "__module__", "").startswith("transformers."), impl
-        print("KILL_SWITCH_OK")
-        """
-    )
-    proc = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
-    if "SKIP_" in proc.stdout:
-        pytest.skip(proc.stdout.strip())
-    assert "KILL_SWITCH_OK" in proc.stdout, f"stdout=\n{proc.stdout}\nstderr=\n{proc.stderr[-3000:]}"
+def _check(result, ok):
+    stdout, stderr = result
+    if "SKIP_" in stdout:
+        pytest.skip(stdout.strip())
+    assert ok in stdout, f"stdout=\n{stdout}\nstderr=\n{stderr[-3000:]}"
+
+
+def test_qwen4_exp_imported_first_gets_vendored_kernels(_processes):
+    _check(_processes("imported_first"), "QWEN4_EXP_REPAIRED_OK")
+
+
+def test_qwen4_exp_kill_switch_keeps_torch(_processes):
+    _check(_processes("kill_switch"), "KILL_SWITCH_OK")
