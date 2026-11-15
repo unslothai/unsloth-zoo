@@ -32,7 +32,7 @@ Backends, first eligible wins (UNSLOTH_SPARSE_ATTN_BACKEND=gather|flex|torch for
   triton  Unsloth's index-gather kernel (unsloth_zoo/sparse_mqa_kernel.py): every other CUDA part, fp16 / bf16 (bf16 on
           sm80+), head_dim a power of two up to 512; tiled gather, online softmax, fp32 atomics for dKV.
   flex    torch flex_attention over a membership block mask, sink applied exactly from the logsumexp; eager only,
-          and only while the [b, s, n] membership table stays under 2^28 entries. A membership table counts a
+          and only while the bit-packed [b, s, n] membership table stays under 2^31 entries. A membership table counts a
           repeated index once, the reference and gather count every listed slot: rows must not repeat an index
           (DeepSeek's top-k and QSA's block lists never do).
   torch   gather + softmax in fp32, chunked over queries, each chunk recomputed in backward (one [chunk, k, d]
@@ -131,9 +131,9 @@ def _gather_eligible(q, window = 0):
     return torch.cuda.get_device_capability(q.device)[0] in (10, 11) and _gather_importable()
 
 
-# The flex fallback reads a [b, s, n] membership table (S x S for QSA); above this many entries the chunked torch
-# path, which never holds more than one [chunk, k, d] slab, runs instead.
-_FLEX_MAX_TABLE = 1 << 28
+# The flex path reads a bit-packed [b, s, n] membership table (S x S for QSA, 256 MB at this cap: s = 46k for b = 1);
+# above this many entries the kernel fold / chunked torch path runs instead.
+_FLEX_MAX_TABLE = 1 << 31
 
 
 # head_dim 512 flex (32 x 32 tiles, 1 stage) needs about 160 KB of shared memory per block: T4 (64 KB), L4 / sm86 /
@@ -363,25 +363,34 @@ def _pack(selected, num_blocks):
 
 
 def _membership_block_mask(topk_idxs, kv_len):
-    """BlockMask whose mask_mod reads a [b, s, n] membership table built from the index lists."""
+    """BlockMask whose mask_mod reads a bit-packed [b, s, n / 32] int32 membership table built from the index lists
+    (one bit per key: 8x less than a bool table, kept for backward: 8 MB instead of 64 MB per layer at 8k)."""
     from torch.nn.attention.flex_attention import BlockMask
 
     b, s, k = topk_idxs.shape
     nq, nk = -(-s // _BLOCK), -(-kv_len // _BLOCK)
+    words = nk * _BLOCK // 32
     valid = (topk_idxs >= 0) & (topk_idxs < kv_len)
-    # Invalid slots scatter into a spare column that is cut off below.
-    cols = torch.where(valid, topk_idxs, nk * _BLOCK).long()
-    table = torch.zeros((b, nq * _BLOCK, nk * _BLOCK + 1), dtype = torch.bool, device = topk_idxs.device)
-    table[:, :s].scatter_(-1, cols, True)
-    table = table[..., : nk * _BLOCK]
-    tiles = table.view(b, nq, _BLOCK, nk, _BLOCK)
-    any_visible = tiles.any(dim = 4).any(dim = 2)
-    all_visible = tiles.all(dim = 4).all(dim = 2)
+    # Invalid slots land in a spare word / tile that is cut off below.
+    safe = torch.where(valid, topk_idxs, nk * _BLOCK).long()
+    rows = (b, nq * _BLOCK)
+    # Rows never repeat an index (see the module docstring), so adding distinct bits is an OR; int32 wraps bit 31.
+    bit = torch.where(valid, torch.ones((), dtype = torch.int32, device = safe.device) << (safe & 31).int(), 0)
+    bits = torch.zeros((*rows, words + 1), dtype = torch.int32, device = safe.device)
+    bits[:, :s].scatter_add_(-1, safe >> 5, bit)
+    bits = bits[..., :words]
+    # Keys per (query row, kv tile): a tile is visible to a query tile if any row sees a key in it, fully visible if
+    # every row sees all of its keys.
+    counts = torch.zeros((*rows, nk + 1), dtype = torch.int32, device = safe.device)
+    counts[:, :s].scatter_add_(-1, safe // _BLOCK, valid.int())
+    tiles = counts[..., :nk].view(b, nq, _BLOCK, nk)
+    any_visible = (tiles > 0).any(dim = 2)
+    all_visible = (tiles == _BLOCK).all(dim = 2)
     partial_count, partial_index = _pack(any_visible & ~all_visible, nk)
     full_count, full_index = _pack(all_visible, nk)
 
     def mask_mod(b_idx, h_idx, q_idx, kv_idx):
-        return table[b_idx, q_idx, kv_idx]
+        return ((bits[b_idx, q_idx, kv_idx >> 5] >> (kv_idx & 31)) & 1) != 0
 
     return BlockMask.from_kv_blocks(
         partial_count, partial_index, full_count, full_index,
