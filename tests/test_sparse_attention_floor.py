@@ -96,3 +96,42 @@ def test_cold_compiled_dispatch_does_not_recompile_across_lengths(case):
     if case == "index_default" and torch.cuda.get_device_capability()[0] in (10, 11):
         # Blackwell picks gather first; a cold trace used to skip it (the import had not run yet) and take Triton.
         assert int(line.split()[1]) == 0, line
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8, reason = "bf16 CUDA kernels")
+def test_triton_kernels_compile_once_across_lengths():
+    # 8 heads (QSA's folded groups): the lse batch stride s * 8 is 16-aligned for even s only, and Triton specializes
+    # integer arguments on % 16; every kernel must keep one compiled variant across even / odd lengths and batch.
+    import triton
+    from unsloth_zoo import sparse_mqa_kernel as sk
+    names = ("_sparse_mqa_fwd", "_sparse_mqa_bwd", "_window_fwd", "_window_bwd_dq", "_window_bwd_dkv")
+
+    def jit(k):
+        while not isinstance(k, triton.runtime.jit.JITFunction):
+            k = k.fn
+        return k
+
+    def caches(n):   # Triton >= 3.3: device_caches {device: (kernels, ...)}; older: cache {device: kernels}
+        k = jit(getattr(sk, n))
+        return k.device_caches if hasattr(k, "device_caches") else k.cache
+
+    def variants():
+        return {n: sum(len(c[0] if isinstance(c, tuple) else c) for c in caches(n).values()) for n in names}
+
+    for n in names:   # earlier tests may have compiled the same signatures
+        caches(n).clear()
+    before = variants()
+    h, d, dt = 8, 64, torch.bfloat16
+    for s, b in ((256, 1), (301, 1), (256, 2), (77, 2)):
+        g = torch.Generator(device = "cuda").manual_seed(s)
+        r = lambda *shape: (torch.randn(*shape, device = "cuda", generator = g) * 0.3).to(dt).requires_grad_()
+        q, kv, wkv, ckv = r(b, s, h, d), r(b, s, d), r(b, s, d), r(b, s // 4 + 3, d)
+        sink = torch.randn(h, device = "cuda", generator = g).requires_grad_()
+        idx = torch.randint(-1, s, (b, s, 40), device = "cuda", dtype = torch.int32, generator = g)
+        cidx = torch.randint(-1, s // 4 + 3, (b, s, 24), device = "cuda", dtype = torch.int32, generator = g)
+        sk.sparse_mqa_attention(q, kv, sink, idx, d ** -0.5).float().square().mean().backward()
+        sk.sparse_mqa_window_attention(q, wkv, ckv, cidx, sink, d ** -0.5, 32).float().square().mean().backward()
+    grown = {n: variants()[n] - before[n] for n in names}
+    # index fwd: with the sink, and without it for the window's compressed part; window fwd / dq: one with prior.
+    assert grown == {"_sparse_mqa_fwd": 2, "_sparse_mqa_bwd": 1, "_window_fwd": 1, "_window_bwd_dq": 1,
+                     "_window_bwd_dkv": 1}, grown
