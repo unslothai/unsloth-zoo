@@ -60,6 +60,18 @@ def qwen4_exp_qsa_indexer_forward(self, hidden_states, position_embeddings, atte
         return torch.where(
             attention_mask == 0, attention_mask.new_zeros(()), torch.finfo(attention_mask.dtype).min
         )
+    # The reference reads the position table by kv slot, which has one row per token seen so far. A static cache's
+    # mask spans max_cache_len, and a query row that attends to nothing (a left pad) is given every slot by Unsloth's
+    # sdpa_mask fix, unfilled ones included: the reference then indexes past the table (a CUDA device assert in
+    # batched generate). Real tokens never see an unfilled slot, so hiding them changes no row that is read.
+    if attention_mask is not None and attention_mask.dim() == 4:
+        n_positions = position_embeddings[0].shape[-2]
+        if attention_mask.shape[-1] > n_positions:
+            filled = torch.arange(attention_mask.shape[-1], device=attention_mask.device) < n_positions
+            if attention_mask.dtype == torch.bool:
+                attention_mask = attention_mask & filled
+            elif attention_mask.is_floating_point():
+                attention_mask = attention_mask.masked_fill(~filled, torch.finfo(attention_mask.dtype).min)
     from unsloth_zoo.temporary_patches.qwen4_exp import _reference_qsa_forward
     return _reference_qsa_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values)
 
