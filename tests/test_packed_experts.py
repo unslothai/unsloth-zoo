@@ -218,7 +218,6 @@ def test_param_contract_device_copy_pickle():
     assert clone.packed_scales.data_ptr() != param.packed_scales.data_ptr()
     back = pickle.loads(pickle.dumps(param))
     assert torch.equal(back.dequantize(), param.dequantize())
-    # accelerate rebuild: cls(data, requires_grad, **__dict__)
     rebuilt = Nvfp4ExpertParam(param.data, requires_grad = False, **param.__dict__)
     assert torch.equal(rebuilt.dequantize(), param.dequantize())
     module = torch.nn.Module()
@@ -269,8 +268,7 @@ def test_compiled_caller_traces_one_opaque_op(fmt):
     want, want_dx = step(x)
     from torch._dynamo.utils import counters
     counters.clear()
-    # Dynamo on torch 2.4 treats the Parameter subclass as a user object (`.data` is not a tensor there), so the
-    # packed op graph-breaks and runs eagerly; fullgraph + zero graph breaks is asserted from torch 2.5 on.
+    # torch 2.4 Dynamo graph-breaks on the Parameter subclass; fullgraph asserted from 2.5.
     fullgraph = tuple(int(v) for v in torch.__version__.split(".")[:2]) >= (2, 5)
     compiled = torch.compile(fwd, fullgraph = fullgraph)
     inp = x.detach().requires_grad_(True)

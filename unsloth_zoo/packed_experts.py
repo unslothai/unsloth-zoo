@@ -14,15 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Frozen routed-expert stacks kept packed for LoRA: NVFP4 (e2m1 codes, e4m3 1x16 block scales, fp32 global scales)
-and MXFP8 (e4m3 codes, e8m0 1x32 block scales).
-
-Codes are stored ``(E, N, K / 2)`` (NVFP4) or ``(E, N, K)`` (MXFP8) with the blocks along the contraction dim K, the
-checkpoint orientation. The logical (module) shape is ``(E, N, K)``, or ``(E, K, N)`` when ``packed_transposed``.
-Forward and dX dequantize a chunk of experts at a time into a 16-bit stack (``_chunked_grouped_mm``); the base is
-frozen, so there is no dW. The decode is one fp32 rounding, the same arithmetic as Unsloth's ``nvfp4_dequantize``
-(``e2m1 * (scale / global)``; ModelOpt's ``weight_scale_2`` multiplies instead) and the MXFP8 scale-grid decode
-(``e4m3 * 2 ** (e8m0 - 127)``), so the packed path is bitwise equal to a grouped GEMM on the dense dequantized stack.
+"""Frozen NVFP4 / MXFP8 routed-expert stacks kept packed for LoRA; codes ``(E, N, K/2)`` / ``(E, N, K)``, blocks along K.
+Decode is one fp32 rounding, matching ``nvfp4_dequantize`` / the MXFP8 scale-grid decode, so it is bitwise equal to dense.
 """
 
 import os
@@ -59,10 +52,9 @@ _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _E2M1_MAX = 6.0
 _E4M3_MAX = 448.0
 
-# Engagement counters (eager calls of the grouped op, chunks dequantized); tests read them.
+# Engagement counters; tests read them.
 PACKED_EXPERT_STATS = {"calls": 0, "chunks": 0}
 
-# Torch reference row chunk: bounds its fp32 temporaries to ~64 MB.
 _TORCH_CHUNK_ELEMS = 1 << 24
 
 
@@ -353,7 +345,6 @@ class _PackedExpertParam(torch.nn.Parameter):
         return self._decode(self.data, scales, glob, dtype or self.packed_dtype, transpose, token_counts, out)
 
     def dequantize_experts(self, start, end, dtype = None, transpose = None, token_counts = None):
-        """Experts ``[start, end)`` only (the chunked grouped GEMM's unit)."""
         scales, glob = self._companions()
         transpose = self.packed_transposed if transpose is None else bool(transpose)
         g = None if glob is None else glob[start:end]
@@ -487,7 +478,6 @@ def is_new_packed_expert_param(param) -> bool:
 
 
 def is_packed_expert_param(param) -> bool:
-    """Any frozen packed expert stack that dequantizes itself: NVFP4, MXFP8 or MXFP4."""
     if isinstance(param, _PackedExpertParam):
         return True
     from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
@@ -506,9 +496,6 @@ def packed_param_dtype(param):
     return getattr(param, "mxfp4_dtype", torch.bfloat16)
 
 
-# ---------------------------------------------------------------------------------------------------------------------
-# Grouped GEMM (forward + dX) through the chunked dequantize of mxfp4_stacked_experts.
-# ---------------------------------------------------------------------------------------------------------------------
 
 def _rebuild(fmt, codes, scales, glob, transposed, multiply):
     if fmt == "nvfp4":
@@ -591,7 +578,6 @@ except Exception:  # pragma: no cover
 
 
 class _PackedGroupedLinear(torch.autograd.Function):
-    # Fallback when torch.library.custom_op is unavailable.
     @staticmethod
     def forward(ctx, inputs, codes, scales, glob, counts, fmt, transpose_b, multiply):
         ctx.save_for_backward(codes, scales, glob, counts)
@@ -629,10 +615,7 @@ def packed_expert_grouped_linear(inputs, param, counts, transpose_b):
     )
 
 
-# ---------------------------------------------------------------------------------------------------------------------
-# Round-to-nearest quantizers for 16-bit expert stacks (load-time, opt-in). Each returns the packed param.
-# Rows are quantized along K, the last dim of the (E, N, K) row layout; pass the stack in that layout.
-# ---------------------------------------------------------------------------------------------------------------------
+# RTN quantizers: rows quantized along K, the last dim of (E, N, K); pass the stack in that layout.
 
 def _round_e2m1(y):
     """Nearest E2M1 code of y (|y| <= 6 after clamping), ties to the even code; returns int codes 0..15."""
@@ -722,9 +705,6 @@ def quantize_experts_mxfp8(rows, dtype = torch.bfloat16, transposed = False, chu
     return Mxfp8ExpertParam(codes, packed_scales = scales, packed_transposed = transposed, packed_dtype = dtype)
 
 
-# ---------------------------------------------------------------------------------------------------------------------
-# Model-level helpers: find fused 3-D expert stacks, quantize them at load (opt-in), or install checkpoint stacks.
-# ---------------------------------------------------------------------------------------------------------------------
 
 EXPERTS_QUANTIZE_ENV = "UNSLOTH_MOE_EXPERTS_QUANTIZE"
 EXPERTS_QUANTIZE_FORMATS = ("nvfp4", "mxfp4", "nf4")
@@ -771,7 +751,6 @@ def stack_rows_are_transposed(experts, name, proj_type, param = None):
 
 
 def iter_dense_expert_stacks(model):
-    """(module name, experts module) for every module holding 3-D 16 / 32-bit gate_up_proj and down_proj stacks."""
     for name, module in model.named_modules():
         params = module._parameters
         stacks = [params.get(n) for n, _ in _STACK_NAMES]
@@ -796,11 +775,7 @@ def _quantize_nf4_stack(value, dtype, module):
 
 
 def quantize_moe_expert_stacks(model, fmt, dtype = None):
-    """Round-to-nearest quantize every frozen 16-bit routed-expert stack in place (opt-in, load time).
-
-    NVFP4 / MXFP4 quantize along each stack's contraction dim (one global scale per expert for NVFP4); NF4 uses the
-    bitsandbytes 4-bit expert path. Returns the number of stacks replaced; layouts that cannot be told are left
-    alone."""
+    """RTN-quantize every frozen 16-bit routed-expert stack in place; returns the count (unknown layouts skipped)."""
     if fmt not in EXPERTS_QUANTIZE_FORMATS:
         raise ValueError(f"Unsloth: unknown expert quantization {fmt!r}")
     replaced = 0
@@ -844,7 +819,6 @@ def quantize_moe_expert_stacks(model, fmt, dtype = None):
 
 
 def packed_expert_memory(model):
-    """{format: bytes} of the packed expert stacks in ``model`` (diagnostics / tests)."""
     out = {}
     for module in model.modules():
         for param in module._parameters.values():
