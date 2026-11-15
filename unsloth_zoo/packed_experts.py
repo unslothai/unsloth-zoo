@@ -571,6 +571,13 @@ def _register_op():
     return op
 
 
+# Registered at import, not on first use: a trace must never be the first caller (global writes break the graph).
+try:
+    _register_op()
+except Exception:  # pragma: no cover
+    _OP = False
+
+
 class _PackedGroupedLinear(torch.autograd.Function):
     # Fallback when torch.library.custom_op is unavailable.
     @staticmethod

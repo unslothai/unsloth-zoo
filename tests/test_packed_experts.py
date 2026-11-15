@@ -222,3 +222,32 @@ def test_bad_shapes_refused():
     c8, s8 = _random_mxfp8(2, 16, 64)
     with pytest.raises(ValueError):
         Mxfp8ExpertParam(c8, packed_scales = s8.view(torch.int8))
+
+
+@needs_cuda
+@pytest.mark.parametrize("fmt", ["nvfp4", "mxfp8"])
+def test_compiled_caller_traces_one_opaque_op(fmt):
+    torch._dynamo.reset()
+    quantize = quantize_experts_nvfp4 if fmt == "nvfp4" else quantize_experts_mxfp8
+    param = quantize(_rtn_stack(4, 64, 96).cuda(), torch.bfloat16)
+    counts = torch.tensor([5, 0, 7, 3], device = "cuda")
+    x = torch.randn((15, 96), device = "cuda", dtype = torch.bfloat16)
+
+    def step(inp):
+        inp = inp.detach().requires_grad_(True)
+        out = packed_expert_grouped_linear(inp, param, counts, True)
+        out.float().square().sum().backward()
+        return out.detach(), inp.grad
+
+    def fwd(inp):
+        return packed_expert_grouped_linear(inp, param, counts, True)
+
+    want, want_dx = step(x)
+    from torch._dynamo.utils import counters
+    counters.clear()
+    compiled = torch.compile(fwd, fullgraph = True)
+    inp = x.detach().requires_grad_(True)
+    out = compiled(inp)
+    out.float().square().sum().backward()
+    assert torch.equal(out.detach(), want) and torch.equal(inp.grad, want_dx)
+    assert not counters["graph_break"]
