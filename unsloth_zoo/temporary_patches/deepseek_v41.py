@@ -53,6 +53,7 @@ __all__ = [
     "patch_deepseek_v41_grouped_lora",
     "patch_deepseek_v41_config_aliases",
     "patch_deepseek_v41_engram_table",
+    "patch_deepseek_v41_moe",
     "prepare_compiled_checkpoint",
     "make_deepseek_v41_engram_table",
 ]
