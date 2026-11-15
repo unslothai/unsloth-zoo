@@ -1127,7 +1127,8 @@ def test_cuda_resident_out_of_range_ids_raise_index_error_with_the_debug_check(b
         "    print('INDEXERROR', e)\n"
         "print('OK', store.gather(torch.tensor([1], device=dev)).shape)\n"
     )
-    env = dict(os.environ, UNSLOTH_FROZEN_TABLE_CHECK_IDS="1")
+    # The store needs only torch: skip unsloth_zoo's GPU init (the patch stack) in the child, it is most of the time.
+    env = dict(os.environ, UNSLOTH_FROZEN_TABLE_CHECK_IDS="1", UNSLOTH_ZOO_DISABLE_GPU_INIT="1")
     out = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=300)
     assert out.returncode == 0 and "INDEXERROR" in out.stdout and "OK" in out.stdout, (out.stdout, out.stderr[-800:])
 
