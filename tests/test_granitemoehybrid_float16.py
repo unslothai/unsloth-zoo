@@ -150,8 +150,7 @@ def test_float16_forward_helper_is_a_module_global():
 
 
 def test_patch_keeps_transformers_layer_checkpointing(monkeypatch):
-    # transformers >= 5.23 checkpoints in a wrapper on the class forward, only while it is type(self).forward.
-    # Wrapping that wrapper hid it: granitehybrid trained without gradient checkpointing (1087 MiB kept vs 0.86).
+    # Wrapping the transformers >= 5.23 checkpoint wrapper silently disabled gradient checkpointing.
     stock = gm.GraniteMoeHybridDecoderLayer.__dict__["forward"]
     while getattr(stock, "_unsloth_granite_float16", False) or getattr(getattr(stock, "__code__", None), "co_name", "") == "forward_with_checkpointing":
         stock = stock.__wrapped__
