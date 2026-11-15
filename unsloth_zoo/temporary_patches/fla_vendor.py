@@ -1327,8 +1327,8 @@ def _rocm_fp32_chunk_gated_delta_rule(
         state_v_first = kwargs.pop("transpose_state_layout")
     if cp_context is not None or kwargs.get("use_gate_in_kernel") or kwargs.get("head_first"):
         raise RuntimeError(
-            "Unsloth: float32 gated delta on ROCm gfx11 runs in pure torch, which does not support "
-            "context parallel, use_gate_in_kernel or head_first. Use bfloat16 or float16."
+            "Unsloth: gated delta runs in pure torch for CPU tensors and for float32 on ROCm gfx11, which does "
+            "not support context parallel, use_gate_in_kernel or head_first. Use bfloat16 / float16 on the GPU."
         )
     reference = _torch_reference_chunk_gated_delta_rule()
     if use_beta_sigmoid_in_kernel:
@@ -1453,6 +1453,91 @@ def _install_rocm_fp32_torch_path(torch_mod=None):
     if UNSLOTH_ENABLE_LOGGING:
         logger.info("Unsloth: float32 gated-delta calls on ROCm gfx11 take the pure-torch path.")
     return True
+
+
+# fla's kernels are Triton: a CPU tensor reaches the launcher and dies with "Pointer argument cannot be accessed
+# from Triton (cpu tensor?)". transformers picks fla over its torch path once per import, not per device, and the
+# vendored fla makes fla importable on every GPU host, so a model kept on the CPU of a GPU host (device_map="cpu",
+# a CPU eval or merge, a test model) sent its CPU tensors into the kernels. CPU calls take transformers' torch
+# reference through the same fla contract adapter as ROCm gfx11 float32; GPU calls go straight to fla.
+_CPU_TORCH_MARK = "_unsloth_cpu_torch_path"
+_cpu_torch_state = {"calls": 0, "logged": False}
+
+
+def _compiling():
+    import torch
+    return torch.compiler.is_compiling()
+
+
+def _on_cpu(args, kwargs):
+    q = kwargs.get("q", args[0] if args else None)
+    return getattr(getattr(q, "device", None), "type", None) == "cpu"
+
+
+def _make_cpu_gated_delta_rule(original, recurrent):
+    """CPU tensors -> transformers' torch reference with fla's contract; anything else -> ``original``.
+    Plain Python so torch.compile traces it: the CPU branch compiles like the stock torch path, the GPU branch
+    meets fla's own compiler-disabled entry exactly as before. ``updated=()`` keeps fla's disable marker in
+    ``__dict__`` from being copied onto this wrapper."""
+    names = [
+        n for n, p in inspect.signature(original).parameters.items()
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ]
+
+    @functools.wraps(original, updated = ())
+    def gated_delta_rule(*args, **kwargs):
+        if not _on_cpu(args, kwargs):
+            return original(*args, **kwargs)
+        a = dict(zip(names, args))
+        a.update(kwargs)
+        extra = {}
+        if recurrent:
+            if a.pop("gk", None) is not None or a.pop("gv", None) is not None or a.get("g") is None:
+                raise RuntimeError(
+                    "Unsloth: fla's fused_recurrent_gated_delta_rule on CPU tensors runs in pure torch, "
+                    "which supports a scalar gate g only (no gk / gv)."
+                )
+            extra["use_gate_in_kernel"] = a.pop("use_gate_in_kernel", False)
+            a.pop("A_log", None)
+            a.pop("dt_bias", None)
+        _cpu_torch_state["calls"] += 1
+        if not _cpu_torch_state["logged"] and not _compiling():
+            _cpu_torch_state["logged"] = True
+            logger.info("Unsloth: gated-delta (linear attention) on CPU tensors runs in pure torch; fla is GPU only.")
+        return _rocm_fp32_chunk_gated_delta_rule(**a, **extra)
+
+    setattr(gated_delta_rule, _CPU_TORCH_MARK, "torch")
+    return gated_delta_rule
+
+
+def _install_cpu_torch_path():
+    """Route the live fla's chunk / fused-recurrent gated delta entry points to pure torch for CPU tensors,
+    including modeling modules that bound them at import. Idempotent; False when no fla is live."""
+    package = sys.modules.get("fla.ops.gated_delta_rule")
+    if package is None:
+        return False
+    installed = False
+    for name, submodule, recurrent in (
+        ("chunk_gated_delta_rule", "fla.ops.gated_delta_rule.chunk", False),
+        ("fused_recurrent_gated_delta_rule", "fla.ops.gated_delta_rule.fused_recurrent", True),
+    ):
+        original = getattr(package, name, None)
+        if original is None:
+            continue
+        if getattr(original, _CPU_TORCH_MARK, None) is not None:
+            installed = True
+            continue
+        wrapped = _make_cpu_gated_delta_rule(original, recurrent)
+        setattr(package, name, wrapped)
+        sub = sys.modules.get(submodule)
+        if sub is not None and getattr(sub, name, None) is original:
+            setattr(sub, name, wrapped)
+        for modname in _l2norm_modules(_GATED_DELTA_MODELING):
+            mod = sys.modules.get(modname)
+            if mod is not None and getattr(mod, name, None) is original:
+                setattr(mod, name, wrapped)
+        installed = True
+    return installed
 
 
 _FP32_IEEE_MARK = "_unsloth_fp32_ieee_dots"
@@ -1627,6 +1712,10 @@ def patch_vendor_fla(phase=None):
                 _install_rocm_fp32_torch_path()
             except Exception as e:
                 logger.warning(f"Unsloth: could not route float32 gated delta to pure torch on ROCm gfx11: {e}")
+            try:
+                _install_cpu_torch_path()
+            except Exception as e:
+                logger.warning(f"Unsloth: could not route CPU gated delta calls to pure torch: {e}")
             try:
                 _install_fp32_ieee_dots()
             except Exception as e:
