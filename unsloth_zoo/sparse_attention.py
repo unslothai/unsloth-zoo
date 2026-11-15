@@ -341,6 +341,14 @@ def _gather_call(q, local_kv, sparse_kv, idxs, attn_sink, softmax_scale, window)
     if heads != h:
         q = torch.cat([q, q.new_zeros((b, s, heads - h, d))], dim = 2)
         sink = torch.cat([sink, sink.new_full((heads - h,), float("-inf"))])
+    # TOPK is a tl.constexpr and a tuner key of the shared-KV kernels (each new width: a new variant set and ~10 s of
+    # tuning on B200). DeepSeek's width follows the length (min(index_topk, s // ratio)): pad it with skipped -1 slots
+    # to the next power of two (at least 16), so a run compiles a handful of buckets. A symbolic width stays as is.
+    k = idxs.shape[-1]
+    if isinstance(k, int) and k:
+        width = max(16, 1 << (k - 1).bit_length())
+        if width != k:
+            idxs = torch.cat([idxs, idxs.new_full((*idxs.shape[:-1], width - k), -1)], dim = -1)
     # One KV head ([b, 1, n, d]): gather_attn records share_kv = True, so the backward keeps the shared schedule
     # (a pre-expanded [b, heads, n, d] view is treated as per-head KV and allocates per-head gradients).
     out = _gather_fn()(

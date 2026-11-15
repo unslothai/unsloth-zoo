@@ -208,3 +208,53 @@ def test_a_backend_compile_failure_is_latched_not_raised(monkeypatch):
     with pytest.raises(torch._dynamo.exc.Unsupported):
         sa._latch("flex", q, 6, torch._dynamo.exc.Unsupported("trace-time"))
     assert list(sa._FAILED) == [sa._failure_key("flex", q, 4)]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 11),
+                    reason = "gather runs on datacenter Blackwell only")
+@pytest.mark.parametrize("form", ["index", "window"])
+def test_gather_compiles_one_variant_set_per_width_bucket(form):
+    # DeepSeek's selection width is min(index_topk, s // ratio): it changes with the length below the cap. The vendored
+    # kernels take TOPK as a constexpr (and a tuner key), so every width compiled and tuned a new variant set.
+    import triton
+    from unsloth_zoo._vendored.attn_gym.sparse.gather_attn.impl.triton import forward
+
+    def variants():
+        k = forward._gather_attn_fwd_shared
+        while not isinstance(k, triton.runtime.jit.JITFunction):
+            k = k.fn
+        caches = k.device_caches if hasattr(k, "device_caches") else k.cache
+        return sum(len(c[0] if isinstance(c, tuple) else c) for c in caches.values())
+
+    h, d, s = 16, 64, 96
+    grown = []
+    for width in (40, 50, 61):   # one power-of-two bucket (64)
+        g = torch.Generator(device = "cuda").manual_seed(width)
+        r = lambda *shape: (torch.randn(*shape, device = "cuda", generator = g) * 0.3).to(torch.bfloat16).requires_grad_()
+        q, kv, ckv = r(1, s, h, d), r(1, s, d), r(1, 70, d)
+        sink = torch.randn(h, device = "cuda", generator = g).requires_grad_()
+        before = variants()
+        if form == "index":
+            idx = torch.randint(-1, s, (1, s, width), device = "cuda", dtype = torch.int32, generator = g)
+            fn = lambda q, kv, ckv, sink: sa.sparse_attn(q, kv, sink, idx, d ** -0.5, backend = "gather")
+            ref = lambda q, kv, ckv, sink: sa.sparse_attn(q, kv, sink, idx, d ** -0.5, backend = "torch")
+        else:
+            idx = torch.randint(-1, 70, (1, s, width), device = "cuda", dtype = torch.int32, generator = g)
+            fn = lambda q, kv, ckv, sink: sa.sparse_attn_window(q, kv, ckv, idx, sink, d ** -0.5, 32, backend = "gather")
+            ref = lambda q, kv, ckv, sink: sa.sparse_attn_window(q, kv, ckv, idx, sink, d ** -0.5, 32, backend = "torch")
+        go = torch.randn(1, s, h, d, device = "cuda", dtype = torch.bfloat16)
+
+        def run(f, *xs):
+            xs = [x.detach().clone().requires_grad_() for x in xs]
+            out = f(*xs)
+            return [out, *torch.autograd.grad(out, (xs[0], xs[1], xs[3]), go.to(out.dtype))]
+
+        got = run(fn, q, kv, ckv, sink)
+        exact = run(ref, q.double(), kv.double(), ckv.double(), sink.double())
+        low = run(ref, q, kv, ckv, sink)
+        # Within twice the same-dtype torch path's error vs fp64, plus 4 bf16 ulp (as test_cuda_backend_matches_fp64).
+        for x, r, lo in zip(got, exact, low):
+            err, base = (x.double() - r).abs().max().item(), (lo.double() - r).abs().max().item()
+            assert err <= 2 * base + 4 * torch.finfo(torch.bfloat16).eps * max(1.0, r.abs().max().item()), (width, err, base)
+        grown.append(variants() - before)
+    assert grown[1:] == [0, 0], grown
