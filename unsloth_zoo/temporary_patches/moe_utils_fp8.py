@@ -1144,6 +1144,9 @@ def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor, block_s
     which is only exact when rows/cols are block multiples.
     """
     rows, cols = W_fp8.shape
+    if scale_inv.dtype == torch.uint8:
+        # MXFP8 (compressed-tensors mxfp8-quantized): e8m0 exponent bytes, scale = 2 ** (byte - 127), one per 32.
+        scale_inv = (scale_inv.to(torch.float32) - 127.0).exp2()
     out_dtype = scale_inv.dtype if scale_inv.dtype.is_floating_point else torch.float32
     W = W_fp8.to(out_dtype)
     if scale_inv.numel() == 1:
@@ -1194,6 +1197,12 @@ def _fp8_requant_blockwise(W: torch.Tensor, block_shape: tuple, scale_dtype: tor
         Wf = Wpad
     W_blocks = Wf.reshape(srows, bm, scols, bn)
     block_max = W_blocks.abs().amax(dim=(1, 3))
+    if scale_dtype == torch.uint8:
+        # MXFP8: power-of-two scales stored as e8m0 bytes, the smallest 2**e with block_max / 2**e <= 448.
+        e = torch.ceil(torch.log2((block_max / _FP8_E4M3_MAX).clamp_min(2.0 ** -127))).clamp(-127, 127)
+        W_scaled = (W_blocks / torch.exp2(e).unsqueeze(-1).unsqueeze(1)).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+        W_fp8 = W_scaled.reshape(srows * bm, scols * bn)[:rows, :cols].to(torch.float8_e4m3fn)
+        return W_fp8, (e + 127).to(torch.uint8)
     scale_inv = (block_max / _FP8_E4M3_MAX).clamp_min(1e-12)
     W_scaled = (
         W_blocks / scale_inv.unsqueeze(-1).unsqueeze(1)
