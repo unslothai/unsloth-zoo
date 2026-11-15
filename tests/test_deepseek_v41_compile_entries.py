@@ -145,7 +145,31 @@ for name in sys.argv[3:]:
 where = generated.find("def apply_rotary_pos_emb(")
 out["rope_split"] = where != -1 and "x.split([x.shape[-1] - rope_dim, rope_dim]" in generated[where:where + 3000]
 out["mhc"] = "unsloth_mhc_projection_rsqrt(" in generated or "unsloth_mhc_projection(" in generated
+import re as _re
+helpers = ("unsloth_sinkhorn_knopp", "unsloth_mhc_projection", "unsloth_mhc_projection_rsqrt")
+model_imports = " ".join(_re.findall(r"from " + _re.escape(location) + r" import \(([^)]*)\)", generated))
+out["helpers_from_model"] = [h for h in helpers if _re.search(rf"\b{h}\b", model_imports)]
+out["helpers_missing"] = [
+    h for h in helpers
+    if _re.search(rf"\b{h}\(", generated)
+    and f"from unsloth_zoo.temporary_patches.mhc_sinkhorn import {h}\n" not in generated
+]
 print("@@@" + json.dumps(out))
+'''
+
+# A fresh process: the generated cache must import on its own (the mHC helpers the compiler injects into the
+# modeling module at runtime are not there yet).
+_FRESH = r'''
+import importlib.util, os, sys
+impl_name, tests_dir, path = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, tests_dir)
+if impl_name == "native":
+    from _dsv41_impl import native
+    native()
+spec = importlib.util.spec_from_file_location("unsloth_compiled_module_deepseek_v41_fresh", path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print("@@@ok")
 '''
 
 
@@ -172,6 +196,14 @@ def test_generated_cache_keeps_helpers_eager(impl, tmp_path):
     location = out.pop("location")
     mhc = out.pop("mhc")
     rope_split = out.pop("rope_split")
+    assert out.pop("helpers_from_model") == [], "injected mHC helpers imported from the model module"
+    assert out.pop("helpers_missing") == [], "an mHC helper used without its zoo import"
+    fresh = subprocess.run(
+        [sys.executable, "-c", _FRESH, impl.name, os.path.dirname(os.path.abspath(__file__)),
+         str(tmp_path / "unsloth_compiled_cache" / "unsloth_compiled_module_deepseek_v41.py")],
+        cwd = str(tmp_path), env = env, capture_output = True, text = True, timeout = 1800,
+    )
+    assert "@@@ok" in fresh.stdout, fresh.stdout[-3000:] + fresh.stderr[-3000:]
     if impl.name == "port":
         assert location.startswith("transformers.models.deepseek_v41"), location
         assert rope_split, out

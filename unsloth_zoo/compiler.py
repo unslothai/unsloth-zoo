@@ -348,6 +348,10 @@ MODULE_FORWARD_EAGER_REWRITES = {
 NATIVE_MODELING_MODULES = {}
 
 
+# Helpers the compiler injects into a modeling module (attributes set at runtime, not defined there).
+_MHC_INJECTED_HELPERS = ("unsloth_sinkhorn_knopp", "unsloth_mhc_projection", "unsloth_mhc_projection_rsqrt")
+
+
 def register_native_modeling(model_type, module_name):
     """Compile `module_name` (already imported) for `model_type` when transformers has no such model."""
     NATIVE_MODELING_MODULES[str(model_type)] = str(module_name)
@@ -2456,10 +2460,12 @@ def create_new_function(
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"
     if "torch_compiler_disable_unless_decode" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compiler_disable_unless_decode\n"
-    if "unsloth_sinkhorn_knopp" in new_source:
-        imports += "from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp\n"
-    if "unsloth_mhc_projection" in new_source:
-        imports += "from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_mhc_projection\n"
+    # The mHC helpers come from the zoo, never from the model module: the compiler sets them on the modeling module
+    # at runtime, so a fresh process importing this file would not find them there.
+    for helper in _MHC_INJECTED_HELPERS:
+        if re.search(rf"\b{helper}\b", new_source):
+            imports += f"from unsloth_zoo.temporary_patches.mhc_sinkhorn import {helper}\n"
+    items = [item for item in items if item not in _MHC_INJECTED_HELPERS]
     if "torch_compile" in new_source:
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "_maybe_compile" in new_source:
