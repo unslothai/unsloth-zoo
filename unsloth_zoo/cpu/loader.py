@@ -96,6 +96,58 @@ def _checkpoint_dtype(model_name, **kwargs):
     return None
 
 
+# Where composite configs keep the language model's config (and so its quantization_config).
+_SUB_CONFIG_KEYS = ("text_config", "language_config", "llm_config", "decoder", "generator")
+
+
+def _quant_method_of(config):
+    """quant_method of the quantization_config in ``config`` (a dict or a PretrainedConfig), at its root or in a
+    language-model sub-config, else None."""
+    def field(holder, name):
+        return holder.get(name) if isinstance(holder, dict) else getattr(holder, name, None)
+
+    if config is None:
+        return None
+    for holder in (config, *(field(config, key) for key in _SUB_CONFIG_KEYS)):
+        if holder is None:
+            continue
+        quant = field(holder, "quantization_config")
+        if quant is not None and not isinstance(quant, dict):
+            quant = quant.to_dict() if hasattr(quant, "to_dict") else {"quant_method": getattr(quant, "quant_method", None)}
+        method = quant.get("quant_method") if isinstance(quant, dict) else None
+        if method:
+            return str(getattr(method, "value", method)).lower()
+    return None
+
+
+def _checkpoint_quant_method(model_name, config = None, **kwargs):
+    """quant_method of a quantization_config the checkpoint ships, else None. An explicit ``config`` is what the
+    model load uses, so it decides; ``kwargs`` carry the hub arguments (``subfolder`` included)."""
+    if config is not None and not isinstance(config, (str, os.PathLike)):
+        return _quant_method_of(config)
+    try:
+        from transformers import PretrainedConfig
+
+        config_dict, _ = PretrainedConfig.get_config_dict(config or model_name, **kwargs)
+    except Exception:
+        return None
+    return _quant_method_of(config_dict) if isinstance(config_dict, dict) else None
+
+
+def _drop_reverse_fp8_conversions(model):
+    """A checkpoint transformers dequantized from FP8 on load (no FP8 kernels on CPU) keeps Fp8Dequantize
+    conversions, which a merged save reverses into FP8 bytes without FP8 metadata. The GPU loaders drop them;
+    so does this one when Unsloth provides the helper."""
+    try:
+        from unsloth.models.loader_utils import _drop_fp8_dequantize_conversions
+    except Exception:
+        return 0
+    try:
+        return _drop_fp8_dequantize_conversions(model) or 0
+    except Exception:
+        return 0
+
+
 def _resolve_dtype(dtype):
     if isinstance(dtype, str):
         dtype = getattr(torch, dtype.replace("torch.", ""), None)
@@ -255,9 +307,6 @@ class FastCPUModel:
 
         # 4-bit only where bitsandbytes' CPU backend really runs; full finetuning never quantizes.
         use_4bit = bool(load_in_4bit) and not load_in_8bit and not load_in_16bit and not full_finetuning
-        if use_4bit and not cpu_bnb_4bit_supported():
-            _print("bitsandbytes 4-bit does not work on this CPU, loading 16-bit weights instead.")
-            use_4bit = False
         # A saved LoRA checkpoint (notebooks reload "lora_model"): load its base, then the adapter on top,
         # trainable, so training resumes and merged exports see a PeftModel.
         adapter_name = adapter_revision = None
@@ -271,6 +320,21 @@ class FastCPUModel:
             # A subfolder locates the adapter inside its repo, not the base model.
             kwargs.pop("subfolder", None)
             _print(f"{adapter_name} is a LoRA adapter; loading its base {model_name} first.")
+        # The config the model load reads: an explicit config= decides, else the checkpoint's (in its subfolder).
+        probe_kwargs = dict(hub_kwargs, **({"subfolder": kwargs["subfolder"]} if kwargs.get("subfolder") else {}))
+        if use_4bit:
+            # A checkpoint quantized with another method (fp8, compressed-tensors, mxfp4) keeps its own config, as
+            # on GPU: transformers refuses a BitsAndBytesConfig on top of it.
+            quant_method = _checkpoint_quant_method(
+                model_name, config = kwargs.get("config"), token = token, revision = revision, **probe_kwargs,
+            )
+            if quant_method not in (None, "bitsandbytes"):
+                _print(f"{model_name} is already quantized with {quant_method}; loading it with that "
+                       f"quantization config instead of bitsandbytes 4-bit.")
+                use_4bit = False
+        if use_4bit and not cpu_bnb_4bit_supported():
+            _print("bitsandbytes 4-bit does not work on this CPU, loading 16-bit weights instead.")
+            use_4bit = False
         if not use_4bit and _PREQUANTIZED_SUFFIX.search(model_name):
             base = _PREQUANTIZED_SUFFIX.sub("", model_name)
             _print(f"{model_name} is pre-quantized; loading {base} for 16-bit training.")
@@ -305,7 +369,7 @@ class FastCPUModel:
             os.environ.get("UNSLOTH_CPU_FROZEN_BF16", "0") == "1" and dtype == torch.float32 and not auto_dtype
             and not use_4bit and not full_finetuning
             and _checkpoint_dtype(model_name, token = token, revision = revision,
-                                  trust_remote_code = trust_remote_code, **hub_kwargs) == torch.bfloat16
+                                  trust_remote_code = trust_remote_code, **probe_kwargs) == torch.bfloat16
         )
         load_kwargs = dict(
             **{_DTYPE_KWARG: "auto" if auto_dtype else (torch.bfloat16 if frozen_bf16 else dtype)},
@@ -326,6 +390,7 @@ class FastCPUModel:
                 kwargs.pop("quantization_config", None)
                 use_4bit = False
                 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
+        _drop_reverse_fp8_conversions(model)
         # The load may import a modeling module for the first time (Unsloth's native DeepSeek-V4.1 is imported
         # lazily): its device-independent patches (checkpoint replay, config aliases) apply only once it exists.
         from . import runtime as _runtime

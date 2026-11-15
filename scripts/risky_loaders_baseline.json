@@ -311,6 +311,14 @@
       "reason": "Reads back a .pt file this function just wrote with torch.save into a temporary location; never a downloaded file."
     },
     {
+      "file": "unsloth_zoo/sparse_mqa_kernel.py",
+      "rule": "dynamic-import",
+      "sink": "spec_from_file_location",
+      "digest": "81a60b8eabc5e5c0",
+      "count": 1,
+      "reason": "Loads the fixed file kernels/large_head_attention.py of the installed unsloth package (found via find_spec(\"unsloth\") without importing it), never a user-supplied path."
+    },
+    {
       "file": "unsloth_zoo/speculative/__init__.py",
       "rule": "dynamic-import",
       "sink": "import_module",

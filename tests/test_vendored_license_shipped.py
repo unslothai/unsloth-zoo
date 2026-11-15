@@ -43,3 +43,11 @@ def test_embedded_vllm_license_is_apache_and_matches():
     assert lic.VLLM_LICENSE.strip() == _read("vllm", "LICENSE").strip()
     assert lic.VLLM_MANIFEST.strip() == _read("vllm", "MANIFEST").strip()
     assert "vllm-project/vllm/pull/48792" in lic.NOTICE
+
+
+def test_embedded_attn_gym_license_is_bsd_and_matches():
+    lic = _load_licenses_module()
+    assert "BSD 3-Clause License" in lic.ATTN_GYM_LICENSE
+    assert lic.ATTN_GYM_LICENSE.strip() == _read("attn_gym", "LICENSE").strip()
+    assert lic.ATTN_GYM_MANIFEST.strip() == _read("attn_gym", "MANIFEST").strip()
+    assert "meta-pytorch/attention-gym" in lic.NOTICE
