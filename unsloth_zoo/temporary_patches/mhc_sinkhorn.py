@@ -124,17 +124,28 @@ MHC_NATIVE_SINKHORN_REPLACEMENT = (
 MHC_NATIVE_PROJECTION_SOURCE = (
     "        flat = x.flatten(2).float()\n"
     "        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim = True) + self.norm_eps)\n"
-    "        mixes = F.linear(flat, self.fn.float()) * rsqrt\n"
+    "        mixes = fp32_linear(flat, self.fn) * rsqrt\n"
 )
 MHC_NATIVE_PROJECTION_REPLACEMENT = (
     "        mixes = unsloth_mhc_projection_rsqrt(x, self.fn, self.norm_eps)\n"
 )
 
 
+_AUTOCAST_DEVICES = frozenset(
+    d
+    for d in ("cuda", "cpu", "xpu", "mps", "hpu")
+    if getattr(torch.amp, "is_autocast_available", lambda _d: _d in ("cuda", "cpu"))(d)
+)
+
+
 def _mhc_projection_rsqrt(hidden_streams, fn, eps):
     flat = hidden_streams.flatten(2).float()
     rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim = True) + eps)
-    return F.linear(flat, fn.float()) * rsqrt
+    # fp32 also inside autocast, as the native fp32_linear: the unnormalised projection overflows fp16.
+    if flat.device.type not in _AUTOCAST_DEVICES:
+        return F.linear(flat, fn.float()) * rsqrt
+    with torch.autocast(device_type = flat.device.type, enabled = False):
+        return F.linear(flat, fn.float()) * rsqrt
 
 
 def unsloth_mhc_projection_rsqrt(hidden_streams, fn, eps):
