@@ -68,6 +68,31 @@ def _random_mxfp8(E, N, K, seed = 0, device = "cpu"):
     return codes.to(device), scales.to(device)
 
 
+def _same_decode(out, want):
+    """bf16 / fp32: bitwise. fp16: bitwise on every non-zero and zero exactly where the reference is zero, sign of
+    zero aside: on gfx1151 (ROCm, Linux and Windows) the fused decode kernels store -0.0 as +0.0 in fp16 only (the
+    multiply and the fp16 conversion fuse into one mixed-precision op); every other fp16 value is bitwise."""
+    want = want.contiguous()
+    if out.dtype == torch.float16:
+        nz = want != 0
+        return torch.equal(out == 0, ~nz) and torch.equal(out[nz].view(torch.int16), want[nz].view(torch.int16))
+    width = torch.int32 if out.dtype == torch.float32 else torch.int16
+    return out.dtype == want.dtype and torch.equal(out.view(width), want.view(width))
+
+
+def test_same_decode_rejects_a_wrong_decode():
+    want = torch.tensor([0.0, -0.0, 6.1e-05, -3.0, 1.5e-07, 448.0]).to(torch.float16)
+    assert _same_decode(want.clone(), want)
+    for i in (2, 3, 4, 5):  # one ulp on a normal / subnormal value, either sign
+        for d in (1, -1):
+            bad = want.clone().view(torch.int16)
+            bad[i] += d
+            assert not _same_decode(bad.view(torch.float16), want)
+    assert not _same_decode(-want, want)  # sign of a non-zero value
+    assert not _same_decode(torch.where(want == 0, torch.tensor(2.0 ** -24, dtype = torch.float16), want), want)
+    assert not _same_decode(torch.zeros_like(want), want)
+
+
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("parts", [1, 2])
@@ -81,8 +106,7 @@ def test_nvfp4_decode_bitwise(device, dtype, parts, multiply):
         out = nvfp4_experts_dequantize(codes, scales, glob, dtype, transpose = transpose, multiply = multiply).cpu()
         want = ref.transpose(-1, -2) if transpose else ref
         assert out.shape == want.shape
-        assert torch.equal(out.view(torch.int16 if dtype != torch.float32 else torch.int32),
-                           want.contiguous().view(torch.int16 if dtype != torch.float32 else torch.int32))
+        assert _same_decode(out, want)
 
 
 @needs_cuda
@@ -104,7 +128,7 @@ def test_mxfp8_decode_bitwise(device, dtype):
     for transpose in (False, True):
         out = mxfp8_experts_dequantize(codes, scales, dtype, transpose = transpose).cpu()
         want = ref.transpose(-1, -2).contiguous() if transpose else ref
-        assert torch.equal(out.view(torch.int16), want.view(torch.int16))
+        assert _same_decode(out, want)
 
 
 @needs_cuda
