@@ -100,10 +100,14 @@ def patched():
     IMPL.register()
     from unsloth_zoo.temporary_patches.deepseek_v41 import patch_deepseek_v41_moe
 
-    patch_deepseek_v41_moe()
+    saved = os.environ.pop("UNSLOTH_DSV41_MOE_BACKEND", None)  # the kill switch must not turn these into skips
+    try:
+        patch_deepseek_v41_moe()
+    finally:
+        if saved is not None:
+            os.environ["UNSLOTH_DSV41_MOE_BACKEND"] = saved
     cls = IMPL.modeling.DeepseekV41Experts
-    if not getattr(cls, "_unsloth_already_patched", False):
-        pytest.skip("the MoE backend patch did not install here")
+    assert getattr(cls, "_unsloth_already_patched", False), "the DeepSeek-V4.1 MoE backend patch did not install"
     return cls
 
 
