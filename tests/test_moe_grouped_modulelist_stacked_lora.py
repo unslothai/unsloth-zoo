@@ -729,6 +729,10 @@ model, tok = FastLanguageModel.from_pretrained(repo,
 model = FastLanguageModel.get_peft_model(model, r = 8, lora_alpha = 16, random_state = 3407,
     target_modules = r".*\.(q_proj|v_proj|gate_proj|up_proj|down_proj)", use_gradient_checkpointing = "unsloth")
 trainable = [n for n, p in model.named_parameters() if p.requires_grad]
+loop = []  # CALLS counts eager calls only, so compiled engagement = the per-expert loop never runs
+blocks = [m for m in model.modules() if "_orig_moe_forward" in m.__dict__]
+for m in blocks:
+    m._orig_moe_forward = (lambda f: lambda *a, **k: loop.append(1) or f(*a, **k))(m._orig_moe_forward)
 opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr = 1e-2, foreach = True)
 g = torch.Generator().manual_seed(0)
 losses = []
@@ -741,7 +745,7 @@ for s in range(4):
     losses.append(loss.item())
 model.save_pretrained(out + "/lora")
 model.save_pretrained_merged(out + "/merged", tok, save_method = "merged_16bit")
-json.dump({"losses": losses, "trainable": len(trainable), "calls": ML.CALLS,
+json.dump({"losses": losses, "trainable": len(trainable), "blocks": len(blocks), "loop": len(loop),
            "stacked": sum(ML._STACK_NAME in n for n in trainable)}, open(out + "/info.json", "w"))
 """
 
@@ -770,7 +774,7 @@ def test_unsloth_fast_language_model_path(tmp_path):
         assert p.returncode == 0, p.stderr[-4000:]
         res[arm] = json.load(open(out / "info.json"))
     s, u = res["1"], res["0"]
-    assert s["calls"]["grouped_lora"] > 0 and u["calls"]["grouped_lora"] > 0
+    assert s["blocks"] > 0 and u["blocks"] > 0 and s["loop"] == 0 and u["loop"] == 0, (s, u)
     assert s["stacked"] == 2 * 3 * 2 and u["stacked"] == 0 and s["trainable"] < u["trainable"]
     if torch.version.hip is not None:
         # ROCm is not run-to-run deterministic (identical runs differ in an attention LoRA grad), so cross-process
