@@ -168,3 +168,17 @@ def test_window_support_check_traces_with_symbolic_head_dim():
         assert fn(q, kv).item() == pytest.approx(q.sum().item(), rel = 1e-2)
     q = torch.randn(1, 8, 16, 48, device = "cuda", dtype = torch.bfloat16)   # not a power of two
     assert fn(q, torch.randn(1, 8, 48, device = "cuda", dtype = torch.bfloat16)).item() == 0
+
+
+def test_flex_is_never_eligible_without_flex_attention(monkeypatch):
+    # torch 2.4 has no torch.nn.attention.flex_attention: QSA tried flex first, failed, warned and latched it per
+    # shape class instead of going straight to the kernel fold.
+    import importlib.util
+    assert sa._HAS_FLEX == (importlib.util.find_spec("torch.nn.attention.flex_attention") is not None)
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("flex eligibility needs sm80+")
+    q = torch.empty(1, 256, 8, 128, device = "cuda", dtype = torch.bfloat16)
+    if sa._HAS_FLEX:
+        assert sa._flex_eligible(q)
+        monkeypatch.setattr(sa, "_HAS_FLEX", False)
+    assert not sa._flex_eligible(q)

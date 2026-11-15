@@ -476,7 +476,7 @@ def test_flex_gate_follows_shared_memory():
     # head_dim 512 flex needs ~160 KB per block: on smaller parts (T4, L4, sm86 / 89, sm120) it must never be picked;
     # sm75 never gets flex at any head_dim (it failed to compile there).
     q = torch.empty(1, 4, 16, 512, device = "cuda", dtype = _cuda_dtypes()[-1])
-    sm80 = torch.cuda.get_device_capability()[0] >= 8
+    sm80 = torch.cuda.get_device_capability()[0] >= 8 and sa._HAS_FLEX   # torch < 2.5: no flex_attention
     big_enough = sm80 and sa._shared_memory(q.device) >= sa._FLEX_D512_MIN_SHARED_MEMORY
     assert sa._flex_eligible(q) == big_enough
     assert ("flex" in sa._order(q, 8)) == big_enough
@@ -649,6 +649,8 @@ def test_qsa_gqa_dispatch_prefers_flex_where_it_compiles(monkeypatch, cap, smem,
     real_cap = torch.cuda.get_device_capability()
     if want == "flex" and real_cap[0] < 8:
         pytest.skip("flex needs a real sm80+ device")
+    if want == "flex" and not sa._HAS_FLEX:   # torch < 2.5: no flex_attention, the fold runs
+        want = "triton"
     monkeypatch.delenv("UNSLOTH_SPARSE_ATTN_BACKEND", raising = False)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: cap)
     monkeypatch.setattr(sa, "_shared_memory", lambda device: smem)

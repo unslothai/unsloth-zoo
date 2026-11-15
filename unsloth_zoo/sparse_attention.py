@@ -79,6 +79,8 @@ def _exact_ties():
 _BACKENDS = ("gather", "triton", "flex", "torch")
 _FAILED = {}
 _HAS_TRITON = importlib.util.find_spec("triton") is not None
+# flex_attention first ships in torch 2.5; without it the flex backend is never eligible (not tried, failed, latched).
+_HAS_FLEX = importlib.util.find_spec("torch.nn.attention.flex_attention") is not None
 _GATHER = None
 _FLEX = None
 _BLOCK = 128
@@ -202,7 +204,7 @@ def _triton_eligible(q, forced = False, kv = None):
 
 
 def _flex_eligible(q, kv_len = None):
-    if not (q.is_cuda and _HAS_TRITON and q.dtype in (torch.float16, torch.bfloat16)):
+    if not (q.is_cuda and _HAS_TRITON and _HAS_FLEX and q.dtype in (torch.float16, torch.bfloat16)):
         return False
     # sm75 (T4): flex_attention failed to compile at head_dim 64 and 256 ("No valid triton configs") and the flex
     # training arm failed; sm80+ only.
