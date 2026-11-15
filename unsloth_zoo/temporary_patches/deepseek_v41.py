@@ -599,7 +599,12 @@ def make_deepseek_v41_engram_table(layer_key, num_embeddings, head_dim, block_si
     ``from_pretrained`` in every UNSLOTH_FROZEN_TABLE mode (gpu materializes the rows on the device)."""
     import types
     from unsloth_zoo.frozen_table_store import install_frozen_table_load_hook
-    install_frozen_table_load_hook()
+    if not install_frozen_table_load_hook():
+        # Without the hook the table would never be bound to the checkpoint: every lookup would raise later.
+        raise RuntimeError(
+            "Unsloth: could not install the frozen table load hook, so the DeepSeek-V4.1 engram tables cannot be "
+            "bound to the checkpoint. Set UNSLOTH_DSV41_FROZEN_ENGRAM=0 to load them as normal embeddings."
+        )
     stand_in = types.SimpleNamespace(
         num_embeddings = int(num_embeddings), embedding_dim = int(head_dim), block_size = int(block_size),
         weight = types.SimpleNamespace(dtype = dtype if dtype is not None else torch.get_default_dtype()),

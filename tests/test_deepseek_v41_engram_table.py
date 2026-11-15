@@ -321,3 +321,16 @@ def test_from_config_and_gpu_mode_keep_the_ports_table(tiny_dsv41, monkeypatch):
     assert type(model.model.engram_tables["1"]) is modeling.DeepseekV41EngramEmbedding
     ref = _load(tiny_dsv41["bf16"], "gpu", monkeypatch)
     assert type(ref.model.engram_tables["2"]) is modeling.DeepseekV41EngramEmbedding
+
+
+def test_native_engram_constructor_refuses_a_table_it_cannot_bind(monkeypatch):
+    # Without the frozen table load hook the parameter-free table is never bound to the checkpoint: fail at build.
+    import unsloth_zoo.frozen_table_store as fts
+    from unsloth_zoo.temporary_patches.deepseek_v41 import make_deepseek_v41_engram_table
+
+    monkeypatch.setattr(fts, "install_frozen_table_load_hook", lambda: False)
+    with pytest.raises(RuntimeError, match = "load hook"):
+        make_deepseek_v41_engram_table("1", 64, 8)
+    monkeypatch.undo()
+    table = make_deepseek_v41_engram_table("1", 64, 8)
+    assert hasattr(table, "frozen_table_store") and not list(table.parameters())
