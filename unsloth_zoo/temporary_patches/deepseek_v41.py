@@ -170,7 +170,7 @@ def patch_deepseek_v41_gradient_checkpointing():
         # Non-reentrant, always: the source layer's shared KV tensors leave through `replay`, not through the
         # checkpoint's outputs. A reentrant checkpoint (Unsloth's smart checkpointer forces one) would make them
         # under no_grad, and the layers that read them would send their source projections no gradient.
-        out = _non_reentrant_checkpoint()(partial(run, **kwargs), *args, use_reentrant = False)
+        out = _non_reentrant_checkpoint(self)(partial(run, **kwargs), *args, use_reentrant = False)
         shared.clear()
         shared.update(replay)
         return out
@@ -190,9 +190,15 @@ pass
 TEMPORARY_PATCHES.append(patch_deepseek_v41_gradient_checkpointing)
 
 
-def _non_reentrant_checkpoint():
-    """torch's own checkpoint, also when Unsloth's smart checkpointing replaced torch.utils.checkpoint.checkpoint."""
+def _non_reentrant_checkpoint(layer = None):
+    """The non-reentrant checkpoint for this layer: Unsloth's wrapper when the model bound one (it offloads the saved
+    inputs for use_gradient_checkpointing = "unsloth" and forces use_reentrant = False), else torch's own, also when
+    Unsloth's smart (reentrant) checkpointing replaced torch.utils.checkpoint.checkpoint."""
     import torch.utils.checkpoint as ckpt
+    bound = getattr(layer, "_gradient_checkpointing_func", None) or ckpt.checkpoint
+    bound = getattr(bound, "func", bound)  # functools.partial(checkpoint, **gradient_checkpointing_kwargs)
+    if hasattr(bound, "_unsloth_offloads"):
+        return bound
     return (getattr(ckpt, "_unsloth_pristine_checkpoint", None) or getattr(ckpt, "_old_checkpoint", None)
             or ckpt.checkpoint)
 
