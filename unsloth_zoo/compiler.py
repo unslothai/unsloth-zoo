@@ -870,6 +870,23 @@ def make_no_update_causal_mask(original):
 
 
 # Patch SDPA
+_SYMBOOL_IS_CAUSAL = re.compile(
+    r"^(?P<pad>[ \t]*)is_causal = (?P<b>bool\()?(?P<mask>[A-Za-z_][A-Za-z0-9_]*) is None and "
+    r"(?P<len>[A-Za-z_][A-Za-z0-9_]*) > 1(?(b)\))[ \t]*$",
+    flags = re.MULTILINE,
+)
+
+
+def sdpa_is_causal_as_bool(source):
+    """`is_causal = mask is None and q_len > 1` (transformers 4.x OLMoE / Nemotron / DBRX / PhiMoE ...) and its
+    `bool(...)` form (StableLM) are a SymBool once the sequence dim is dynamic (Unsloth's block compile marks it;
+    Dynamo keeps bool() of a SymBool symbolic), and SDPA takes only a bool: Dynamo broke the graph at every
+    attention call. The conditional form, as Llama uses, guards on the length instead."""
+    return _SYMBOOL_IS_CAUSAL.sub(
+        lambda m: f"{m['pad']}is_causal = True if {m['mask']} is None and {m['len']} > 1 else False", source
+    )
+
+
 def replace_with_grouped_query_attention(module, source):
     # All Unsloth Zoo code licensed under LGPLv3
     if "enable_gqa" not in torch.nn.functional.scaled_dot_product_attention.__doc__:
@@ -7014,6 +7031,7 @@ def unsloth_compile_transformers(
                 new_source,
                 flags=re.DOTALL | re.MULTILINE,
             )
+            new_source = sdpa_is_causal_as_bool(new_source)
         else:
             if len(re.findall(causal_mask_find, source, flags=re.DOTALL)) == 1:
                 new_source = re.sub(
