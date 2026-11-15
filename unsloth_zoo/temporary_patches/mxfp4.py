@@ -420,18 +420,24 @@ def patch_save_pretrained_mxfp4():
             for name, param in list(module._parameters.items())
             if is_mxfp4_expert_param(param)
         ]
-        if not packed:
-            return original(self, *args, **kwargs)
-        names = {id(param): name for name, param in self.named_parameters(remove_duplicate = False)
-                 if is_mxfp4_expert_param(param)}
-        dense = {}
-        # Reversing the Mxfp4Dequantize converters raises (5.4) or drops layers under "down_proj$" (5.17).
+        # Reversing the Mxfp4Dequantize converters raises (5.4), drops layers under "down_proj$" (5.17) or, from 5.22,
+        # renames dense experts to "gate_up_proj_blocks" with no scales. Strip them even with no packed param left:
+        # merge_and_unload() makes the experts dense but the load's converters stay on the model.
         conversions = self.__dict__.get("_weight_conversions", None)
         if isinstance(conversions, (list, tuple)):
             self._weight_conversions = [
                 conversion for conversion in conversions
                 if not any(type(op).__name__ == "Mxfp4Dequantize" for op in getattr(conversion, "operations", ()) or ())
             ]
+        if not packed:
+            try:
+                return original(self, *args, **kwargs)
+            finally:
+                if isinstance(conversions, (list, tuple)):
+                    self._weight_conversions = conversions
+        names = {id(param): name for name, param in self.named_parameters(remove_duplicate = False)
+                 if is_mxfp4_expert_param(param)}
+        dense = {}
         try:
             for module, name, param in packed:
                 weight = param.dequantize().cpu()
