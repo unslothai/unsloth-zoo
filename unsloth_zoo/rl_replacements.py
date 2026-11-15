@@ -2596,11 +2596,13 @@ def grpo_fused_route_ok(kwargs, entropy_mask_on = False, rollout_logps_as_old = 
     """True when grpo_compute_loss's per-token loss is a closed form of each token's own log-prob, so the GRPO loss can
     take fused_linear_grpo_loss: every token's gradient is known in the forward. Off for GSPO (sequence-level ratio),
     VESPO, the off-policy and top-entropy-quantile masks (all read every token's log-prob or entropy first), rollout_rs,
-    rollout logps as pi_old (clamped log ratio), a truncated support or fp32 head (other scorers), vision inputs and a
-    gathered ZeRO-3 head, a trainable head unless UNSLOTH_GRPO_FUSED_TRAINABLE_HEAD=1, a frozen head without an entropy
+    rollout logps as pi_old (clamped log ratio), a truncated support or fp32 head (other scorers), a gathered ZeRO-3
+    head, a trainable head unless UNSLOTH_GRPO_FUSED_TRAINABLE_HEAD=1, a frozen head without an entropy
     bonus unless UNSLOTH_GRPO_FUSED_WITHOUT_ENTROPY=1 (nothing to save there), and float16 compute without a
     GradScaler: the op stores its gradients in the hidden dtype at the loss's own scale, where GRPO's 1 / tokens weights
     sit in float16's subnormal range (a GradScaler's scale lifts them out of it).
+    Vision inputs take it too: the towers run in the policy forward, so the deferred lm_head rows are the
+    [rows, logits_to_keep] completion grid either way. pixel_values stays in the signature for callers passing it.
     UNSLOTH_FUSED_LINEAR_GRPO_FWD_GRAD=0 turns it off."""
     from unsloth_zoo.fused_losses import fused_grpo as _fused_grpo
     return bool(
@@ -2613,7 +2615,6 @@ def grpo_fused_route_ok(kwargs, entropy_mask_on = False, rollout_logps_as_old = 
         and not entropy_mask_on
         and not rollout_logps_as_old
         and not support_kwargs
-        and pixel_values is None
         and zero3_head is None
         and not fp16_unscaled
         and (lm_head is None or not lm_head.requires_grad or GRPO_FUSED_TRAINABLE_HEAD)
