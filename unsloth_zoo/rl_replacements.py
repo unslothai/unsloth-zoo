@@ -1883,13 +1883,29 @@ def grpo_vllm_sampler_uses_triton(trainer, top_k, top_p):
 pass
 
 
-def _grpo_agree_mini_batch(B, device):
-    """The smallest per-call mini batch over the ranks. It is sized from this rank's sequence length, and
-    under FSDP2's sharded layout (or tensor parallel) every forward is collective, so ranks running a
-    different number of forwards hang (one rank all-gathers a block while another gathers metrics)."""
+def grpo_forwards_are_collective(model):
+    """True when every forward of `model` all-gathers across ranks: Unsloth's native FSDP2 sharded layout
+    reshards its blocks after each forward. Ranks must then run the same number of forwards, so per-rank
+    choices (the mini batch sized from this rank's sequence length; unsloth turns off sequence packing and
+    PrefixGrouper, whose self-verify forwards run on the rank whose packed length grew) would hang one rank
+    in a block all-gather."""
     import torch.distributed as dist
     if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
-        return B
+        return False
+    cached = model.__dict__.get("_unsloth_grpo_collective_forwards", None)
+    if cached is None:
+        cached = any(
+            module.__dict__.get("_unsloth_reshard_after_forward", False) not in (False, None, 0)
+            for module in model.modules()
+        )
+        model.__dict__["_unsloth_grpo_collective_forwards"] = cached
+    return cached
+pass
+
+
+def grpo_agree_mini_batch(B, device):
+    """The smallest mini batch over the ranks (collective: every rank must call it)."""
+    import torch.distributed as dist
     value = torch.tensor([int(B)], dtype = torch.int64, device = device)
     dist.all_reduce(value, op = dist.ReduceOp.MIN)
     return int(value.item())
@@ -3117,6 +3133,9 @@ def grpo_accumulated_loss(
         seq_len = input_ids.shape[1]
         hidden_dim = lm_head.shape[1]
         vocab_dim = lm_head.shape[0]
+        # Imported here: this body is copied into the generated trainer.
+        from unsloth_zoo.rl_replacements import grpo_forwards_are_collective, grpo_agree_mini_batch
+        _collective_forwards = grpo_forwards_are_collective(trainer.model)
 
         if trainer.args.unsloth_grpo_mini_batch is None:
             # Size per call, as unsloth's copy does: caching in args froze the first step's plan.
@@ -3124,8 +3143,8 @@ def grpo_accumulated_loss(
                 total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
             )
             B = max(1, total_rows//B)
-            from unsloth_zoo.rl_replacements import _grpo_agree_mini_batch
-            B = _grpo_agree_mini_batch(B, input_ids.device)
+            if _collective_forwards:
+                B = grpo_agree_mini_batch(B, input_ids.device)
         else:
             if trainer.args.unsloth_grpo_mini_batch > total_rows:
                 B = total_rows
