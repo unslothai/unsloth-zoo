@@ -99,6 +99,10 @@ def _gather_fn():
     global _GATHER
     if not _GATHER:   # None (not tried) or False (failed: re-raise the real import error for a forced call)
         from unsloth_zoo._vendored.attn_gym.sparse.gather_attn import gather_attn
+        # The api loads its Triton kernels only on the first call; import them now so a Triton without
+        # constexpr_function (< 3.5: torch 2.4 - 2.8) is found here, not inside a compiled step.
+        import unsloth_zoo._vendored.attn_gym.sparse.gather_attn.impl.triton.backward  # noqa: F401
+        import unsloth_zoo._vendored.attn_gym.sparse.gather_attn.impl.triton.forward  # noqa: F401
         _GATHER = gather_attn
     return _GATHER
 
