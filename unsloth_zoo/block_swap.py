@@ -973,10 +973,8 @@ class BlockSwap:
         def hook(grad):
             if self._auto and not self._settled:
                 self._note_block_peak(self.blocks[i])
-            # A reentrant checkpoint recomputes the block inside the outer backward and runs its backward as an inner
-            # one. The input's grad can land there before a branch that never reaches the input (one fed by the token
-            # ids only, e.g. Qwen4Exp's per-layer n-gram keys into an adapter) has read its frozen weights: release
-            # once that inner backward is done, not mid-way.
+            # Reentrant checkpoint: the input grad can land before a token-id-only branch (Qwen4Exp n-gram keys)
+            # reads its frozen weights, so release only once the inner backward is done.
             task = _graph_task_id()
             if grad is not None and task != -1 and self._forward_task[i] not in (-1, task):
                 try:

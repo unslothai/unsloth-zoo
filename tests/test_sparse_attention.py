@@ -816,8 +816,7 @@ def _bool_membership(topk_idxs, kv_len, block = 128):
 
 @pytest.mark.parametrize("s,n,k", [(300, 300, 40), (130, 517, 200), (256, 256, 256), (77, 1, 1)])
 def test_bit_packed_membership_mask_allows_exactly_the_listed_keys(s, n, k):
-    # The flex BlockMask reads one bit per key (QSA at 8k: 8 MB per layer kept for backward, not 64 MB as a bool
-    # table, and 32k fits the flex budget instead of falling to the 17x slower Triton fold on L4).
+    # One bit per key: 8 MB per layer at 8k instead of 64 MB.
     g = torch.Generator().manual_seed(s + n)
     b = 2
     idxs = _unique_idxs(b, s, min(k, n), n, 0.2, g, empty_rows = [(0, 3), (1, s - 1)])

@@ -258,9 +258,7 @@ def test_mask_geometry_is_scanned_once_per_mask_version(monkeypatch):
 
 @pytest.mark.parametrize("kind", ["causal", "packed"])
 def test_compiled_attention_keeps_the_eager_dispatch(monkeypatch, kind):
-    # Under torch.compile (Unsloth's block compile traces the decoder layer) the attention leaves the graph together
-    # with the selection: the eager dispatch picks the backend (flex first on GPU; flex is excluded from traced
-    # calls), the eager-side counter moves, the break count stays the selection's one, and results match eager.
+    # Under torch.compile attention leaves the graph with the selection: eager dispatch, same break count, same result.
     import torch._dynamo
     from torch._dynamo.utils import counters
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")

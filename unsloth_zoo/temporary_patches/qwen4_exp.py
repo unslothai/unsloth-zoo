@@ -133,9 +133,7 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
         from transformers.models.qwen4_exp import modeling_qwen4_exp
         rope = modeling_qwen4_exp.apply_rotary_pos_emb
     position_embeddings = tuple(position_embeddings)
-    # Traced (Unsloth's decoder-layer block compile, or any torch.compile): the selection already leaves the graph,
-    # so the attention leaves with it in one region and keeps the eager dispatch (flex first, latched fallbacks)
-    # instead of the traced one (no flex: the Triton fold, 16x slower on L4 at 4k). Same break count as before.
+    # Traced: run attention eagerly with the selection (same break count); the traced path lacks flex and is 16x slower.
     fused = torch.compiler.is_compiling() and past_key_values is None
     if not fused:
         with torch.no_grad():

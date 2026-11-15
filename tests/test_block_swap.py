@@ -652,8 +652,7 @@ class _IdsBranchBlock(nn.Module):
 
 
 def test_reentrant_recompute_keeps_weights_until_the_whole_block_backward_ran():
-    # The input's grad lands before the ids-only branch's backward has read `n`: releasing the block right there left
-    # that backward reading an evicted weight (eager Qwen4Exp + offload_layers: illegal memory access).
+    # Releasing at the input's grad left the ids-only branch reading an evicted `n` (illegal memory access).
     if not torch.cuda.is_available():
         __import__("pytest").skip("needs CUDA")
     import torch.utils.checkpoint as cp

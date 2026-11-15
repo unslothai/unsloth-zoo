@@ -255,9 +255,7 @@ def _real_gdn_modeling(monkeypatch, name = "transformers.models.qwen3_5.modeling
         if fn is None:
             continue
         if gcc._is_marked(fn):
-            # Patched at import on a CUDA host, possibly more than once (earlier tests re-patch a module they never
-            # restore): rebuild the hub function from the first layer that carries no patch. functools.wraps copies
-            # the mark, so rebuilding from a still-patched layer would stay marked.
+            # Rebuild from the first unpatched layer: functools.wraps copies the mark, so a patched one stays marked.
             base = fn
             while gcc._is_marked(base) and getattr(base, "__wrapped__", None) is not None:
                 base = base.__wrapped__
@@ -837,8 +835,7 @@ def test_patch_rebinds_a_hub_layer_imported_before_the_patch(hub_kernels, monkey
 
 
 def test_qwen4_exp_gdn_conv_honours_seq_idx(hub_kernels, monkeypatch):
-    # Qwen3.8-Flash-Next's GatedDeltaNet calls the same hub conv. On the torch fallback seq_idx is dropped, so
-    # Unsloth's hybrid packing gate refuses padding-free rows ("causal_conv1d_fn has no accelerated kernel").
+    # The torch fallback drops seq_idx, so the hybrid packing gate refuses padding-free rows.
     pytest.importorskip("triton")
     if torch.version.hip is not None:
         pytest.skip("the Triton seq_idx conv is CUDA only; ROCm keeps transformers' conv")

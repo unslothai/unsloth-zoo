@@ -1455,11 +1455,8 @@ def _install_rocm_fp32_torch_path(torch_mod=None):
     return True
 
 
-# fla's kernels are Triton: a CPU tensor reaches the launcher and dies with "Pointer argument cannot be accessed
-# from Triton (cpu tensor?)". transformers picks fla over its torch path once per import, not per device, and the
-# vendored fla makes fla importable on every GPU host, so a model kept on the CPU of a GPU host (device_map="cpu",
-# a CPU eval or merge, a test model) sent its CPU tensors into the kernels. CPU calls take transformers' torch
-# reference through the same fla contract adapter as ROCm gfx11 float32; GPU calls go straight to fla.
+# transformers picks fla per import, not per device, so CPU tensors on a GPU host reached fla's Triton kernels
+# and crashed; CPU calls take the torch reference via the ROCm gfx11 contract adapter.
 _CPU_TORCH_MARK = "_unsloth_cpu_torch_path"
 _cpu_torch_state = {"calls": 0, "logged": False}
 
@@ -1660,11 +1657,8 @@ def _force_kernel_hub_fallback(packages=_GATED_DELTA_MODELING + _KDA_MODELING):
 
 
 def _pin_fla_flash_qla_off():
-    """fla >= 0.6 dispatches chunk_gated_delta_rule to its FlashQLA backend by default when flash_qla is installed. On
-    SM120 it takes only grad-free calls, so a no-grad checkpoint forward ran FlashQLA while its recompute (and the
-    opaque op's self-check reference) ran the Triton kernels: forward and replay on different kernels. fla reads
-    FLA_FLASH_QLA at every call, so it is defaulted to 0 for the process; an explicit FLA_FLASH_QLA or
-    UNSLOTH_GDN_BACKEND=flashqla (Unsloth's own FlashQLA routing) is left alone."""
+    """fla >= 0.6 sends only grad-free calls to FlashQLA on SM120, so a checkpoint forward and its recompute ran
+    different kernels; default FLA_FLASH_QLA=0 unless set or UNSLOTH_GDN_BACKEND=flashqla."""
     if "FLA_FLASH_QLA" in os.environ or _gdn_backend() == "flashqla":
         return False
     os.environ["FLA_FLASH_QLA"] = "0"

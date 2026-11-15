@@ -131,8 +131,7 @@ def _gather_eligible(q, window = 0):
     return torch.cuda.get_device_capability(q.device)[0] in (10, 11) and _gather_importable()
 
 
-# The flex path reads a bit-packed [b, s, n] membership table (S x S for QSA, 256 MB at this cap: s = 46k for b = 1);
-# above this many entries the kernel fold / chunked torch path runs instead.
+# Max bit-packed membership entries for flex (256 MB, s = 46k at b = 1); above it the fold / torch path runs.
 _FLEX_MAX_TABLE = 1 << 31
 
 
@@ -363,8 +362,7 @@ def _pack(selected, num_blocks):
 
 
 def _membership_block_mask(topk_idxs, kv_len):
-    """BlockMask whose mask_mod reads a bit-packed [b, s, n / 32] int32 membership table built from the index lists
-    (one bit per key: 8x less than a bool table, kept for backward: 8 MB instead of 64 MB per layer at 8k)."""
+    """BlockMask reading a bit-packed [b, s, n / 32] int32 membership table (8x smaller than bool, kept for backward)."""
     from torch.nn.attention.flex_attention import BlockMask
 
     b, s, k = topk_idxs.shape
@@ -379,8 +377,7 @@ def _membership_block_mask(topk_idxs, kv_len):
     bits = torch.zeros((*rows, words + 1), dtype = torch.int32, device = safe.device)
     bits[:, :s].scatter_add_(-1, safe >> 5, bit)
     bits = bits[..., :words]
-    # Keys per (query row, kv tile): a tile is visible to a query tile if any row sees a key in it, fully visible if
-    # every row sees all of its keys.
+    # Tile visible if any row sees a key in it, full if every row sees all its keys.
     counts = torch.zeros((*rows, nk + 1), dtype = torch.int32, device = safe.device)
     counts[:, :s].scatter_add_(-1, safe // _BLOCK, valid.int())
     tiles = counts[..., :nk].view(b, nq, _BLOCK, nk)
