@@ -280,3 +280,39 @@ def test_static_cache_decode_compiles_fullgraph(monkeypatch):
                             backend = "eager", fullgraph = True)(hidden)
     # fp64 rounding only: transformers 5.23's compiled SDPA dispatch differs from eager in the last bit.
     torch.testing.assert_close(got, want, rtol = 1e-12, atol = 1e-14)
+
+
+def _text_model_run(model, ids, use_cache):
+    # Prefill, then (with a cache) two decode steps through the model's own cache, which keeps the mRoPE position
+    # history (5.17 on the cache object, 5.22+ on the first indexed layer).
+    with torch.no_grad():
+        if not use_cache:
+            return model(input_ids = ids, use_cache = False).last_hidden_state
+        out = model(input_ids = ids[:, :-2], use_cache = True)
+        hidden, past = [out.last_hidden_state], out.past_key_values
+        for t in (-2, -1):
+            out = model(input_ids = ids[:, t:][:, :1], past_key_values = past, use_cache = True)
+            hidden.append(out.last_hidden_state)
+            past = out.past_key_values
+        return torch.cat(hidden, dim = 1)
+
+
+@pytest.mark.parametrize("use_cache", [False, True], ids = ["no_cache", "prefill_then_decode"])
+def test_text_model_forward_matches_the_reference_end_to_end(monkeypatch, use_cache):
+    # The whole text model builds its own position ids and rotary tables (3-D mRoPE ids; transformers 5.17's rotary
+    # takes nothing else) and, with a cache, its own position history: the patched attention through that path equals
+    # the untouched attention, and engages on the prefill.
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")
+    monkeypatch.setenv("UNSLOTH_QWEN4_EXP_EXACT_TIES", "1")
+    monkeypatch.setenv("UNSLOTH_FROZEN_TABLE", "gpu")
+    zoo_qwen4_exp.patch_qwen4_exp()
+    config, _, _ = _module("sdpa")
+    torch.manual_seed(0)
+    model = modeling.Qwen4ExpTextModel(config).double().eval()
+    ids = torch.randint(0, config.vocab_size, (2, 45), generator = torch.Generator().manual_seed(3))
+    before = dict(zoo_qwen4_exp.QWEN4_EXP_SPARSE_STATS)
+    got = _text_model_run(model, ids, use_cache)
+    assert zoo_qwen4_exp.QWEN4_EXP_SPARSE_STATS["sparse"] > before["sparse"]
+    monkeypatch.setattr(modeling.Qwen4ExpTextAttention, "forward", _reference_forward())
+    want = _text_model_run(model, ids, use_cache)
+    torch.testing.assert_close(got, want, rtol = 1e-10, atol = 1e-12)
