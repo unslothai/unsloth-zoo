@@ -133,3 +133,18 @@ def test_float32_decay_gradient_matches_float64():
     da_rel = ((da - da_ref).norm() / da_ref.norm()).item()
     # TF32 dots: o about 1.5e-3, da about 1 to 30 (strong decay); IEEE: o about 1e-6, da about 1e-3.
     assert o_rel < 1e-4 and da_rel < 1e-2, {"o_rel": o_rel, "da_rel": da_rel}
+
+
+def test_fla_flash_qla_dispatch_defaults_off(monkeypatch):
+    # fla >= 0.6 sends grad-free SM120 calls (a no-grad checkpoint forward) to FlashQLA and the recompute to Triton.
+    for key in ("FLA_FLASH_QLA", "UNSLOTH_GDN_BACKEND"):
+        monkeypatch.delenv(key, raising=False)
+    fla_vendor.patch_vendor_fla()
+    assert os.environ.get("FLA_FLASH_QLA") == "0"
+    monkeypatch.setenv("FLA_FLASH_QLA", "1")   # an explicit choice wins
+    fla_vendor.patch_vendor_fla()
+    assert os.environ["FLA_FLASH_QLA"] == "1"
+    monkeypatch.delenv("FLA_FLASH_QLA")
+    monkeypatch.setenv("UNSLOTH_GDN_BACKEND", "flashqla")   # Unsloth's own FlashQLA routing: left alone
+    fla_vendor.patch_vendor_fla()
+    assert "FLA_FLASH_QLA" not in os.environ

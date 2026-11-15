@@ -20,6 +20,7 @@ Env: ``UNSLOTH_DISABLE_VENDORED_FLA=1`` never injects (an installed fla is untou
 an installed fla strictly newer than the snapshot wins unless ``UNSLOTH_FORCE_VENDORED_FLA=1``;
 ``UNSLOTH_DISABLE_HOPPER_FLA_BWD=1`` forces pure torch on Hopper + Triton [3.4.0, 3.7.1) (fla #640);
 ``UNSLOTH_GDN_BACKEND=flashqla`` sends supported chunk_gated_delta_rule calls to FlashQLA (``pip install flash-qla``);
+otherwise fla's own FlashQLA dispatch (fla >= 0.6) is defaulted off with ``FLA_FLASH_QLA=0``;
 on SM120 only with ``UNSLOTH_FLASHQLA_ALLOW_SM120=1`` (QwenLM/FlashQLA#35);
 ``UNSLOTH_KDA_SAFE_GATE=0`` keeps GLM-5.3-Flash's bounded KDA gates off fla's safe_gate path.
 On ROCm gfx11 float32 chunk_gated_delta_rule calls take transformers' pure-torch reference
@@ -1573,11 +1574,28 @@ def _force_kernel_hub_fallback(packages=_GATED_DELTA_MODELING + _KDA_MODELING):
     return tuple(forced)
 
 
+def _pin_fla_flash_qla_off():
+    """fla >= 0.6 dispatches chunk_gated_delta_rule to its FlashQLA backend by default when flash_qla is installed. On
+    SM120 it takes only grad-free calls, so a no-grad checkpoint forward ran FlashQLA while its recompute (and the
+    opaque op's self-check reference) ran the Triton kernels: forward and replay on different kernels. fla reads
+    FLA_FLASH_QLA at every call, so it is defaulted to 0 for the process; an explicit FLA_FLASH_QLA or
+    UNSLOTH_GDN_BACKEND=flashqla (Unsloth's own FlashQLA routing) is left alone."""
+    if "FLA_FLASH_QLA" in os.environ or _gdn_backend() == "flashqla":
+        return False
+    os.environ["FLA_FLASH_QLA"] = "0"
+    return True
+
+
 def patch_vendor_fla(phase=None):
     """Register the bundled fla kernels and advertise availability.
 
     Idempotent; safe to call at import time and again from TEMPORARY_PATCHES.
     """
+    try:
+        _pin_fla_flash_qla_off()
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: could not turn off fla's FlashQLA dispatch: {e}")
     try:
         return _patch_vendor_fla(phase)
     finally:
