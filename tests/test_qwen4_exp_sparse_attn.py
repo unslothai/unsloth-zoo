@@ -256,6 +256,44 @@ def test_mask_geometry_is_scanned_once_per_mask_version(monkeypatch):
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize("kind", ["causal", "packed"])
+def test_compiled_attention_keeps_the_eager_dispatch(monkeypatch, kind):
+    # Under torch.compile attention leaves the graph with the selection: eager dispatch, same break count, same result.
+    import torch._dynamo
+    from torch._dynamo.utils import counters
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")
+    config, attention, rotary = _module("sdpa")
+    b, s = 2, 41
+    hidden, pe = _inputs(b, s, rotary)
+    mask = _masks(kind, b, s)
+    params = [p for p in attention.parameters() if p.requires_grad]
+    go = torch.randn(b, s, 64, dtype = torch.float64)
+
+    def fn(x):
+        return zoo_qwen4_exp._qwen4_exp_sparse_attention(attention, x, pe, mask, None, {})[0]
+
+    def run(f):
+        x = hidden.clone().requires_grad_()
+        out = f(x)
+        return out.detach(), torch.autograd.grad(out, [x] + params, go, allow_unused = True)
+
+    ref_out, ref_g = run(fn)
+    torch._dynamo.reset()
+    counters.clear()
+    before = sa.SPARSE_ATTN_STATS["torch"]
+    out, grads = run(torch.compile(fn, backend = "aot_eager"))
+    assert sa.SPARSE_ATTN_STATS["torch"] == before + 1, "the attention was traced, not dispatched eagerly"
+    # One break site, as before the change (there: the selection; here: selection + attention).
+    assert len(counters["graph_break"]) == 1, dict(counters["graph_break"])
+    torch.testing.assert_close(out, ref_out, rtol = 1e-10, atol = 1e-10)
+    for x, y in zip(grads, ref_g):
+        if x is None or y is None:
+            assert x is None and y is None
+            continue
+        torch.testing.assert_close(x, y, rtol = 1e-9, atol = 1e-10)
+    torch._dynamo.reset()
+
+
 def test_static_cache_decode_compiles_fullgraph(monkeypatch):
     # Decode must be rejected before the cache probe (StaticCache returns a tensor: graph break + host sync).
     from transformers import StaticCache

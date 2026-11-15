@@ -255,9 +255,11 @@ def _real_gdn_modeling(monkeypatch, name = "transformers.models.qwen3_5.modeling
         if fn is None:
             continue
         if gcc._is_marked(fn):
-            # Patched at import on a CUDA host: rebuild the unpatched hub function.
-            dispatch = inspect.unwrap(fn, stop = lambda f: getattr(f, gcc._MARK, False))
-            fn = decorator(attr, "causal_conv1d")(dispatch.__wrapped__)
+            # Rebuild from the first unpatched layer: functools.wraps copies the mark, so a patched one stays marked.
+            base = fn
+            while gcc._is_marked(base) and getattr(base, "__wrapped__", None) is not None:
+                base = base.__wrapped__
+            fn = decorator(attr, "causal_conv1d")(base)
         monkeypatch.setattr(modeling, attr, fn)
     monkeypatch.setattr(modeling, "use_kernel_func_from_hub_with_fallback", decorator)
     return modeling
@@ -829,4 +831,24 @@ def test_patch_rebinds_a_hub_layer_imported_before_the_patch(hub_kernels, monkey
     expected = torch.cat([
         gcc.causal_conv1d_reference(x[..., a:b], w, None, "silu") for a, b in ((0, 3), (3, 7), (7, 10))
     ], dim = -1)
+    torch.testing.assert_close(y, expected)
+
+
+def test_qwen4_exp_gdn_conv_honours_seq_idx(hub_kernels, monkeypatch):
+    # The torch fallback drops seq_idx, so the hybrid packing gate refuses padding-free rows.
+    pytest.importorskip("triton")
+    if torch.version.hip is not None:
+        pytest.skip("the Triton seq_idx conv is CUDA only; ROCm keeps transformers' conv")
+    modeling = _real_gdn_modeling(monkeypatch, "transformers.models.qwen4_exp.modeling_qwen4_exp")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.version, "hip", None)
+    gcc.patch_gdn_causal_conv1d()
+    assert gcc._is_marked(modeling.causal_conv1d_fn)
+    assert gcc._is_marked(modeling.causal_conv1d_update)
+    g = torch.Generator().manual_seed(0)
+    x, w, b = torch.randn(1, 8, 12, generator = g), torch.randn(8, 4, generator = g), torch.randn(8, generator = g)
+    cuts = ((0, 1), (1, 6), (6, 12))   # a 1-token document, one wider than the kernel, the rest
+    seq_idx = torch.cat([torch.full((e - s,), i, dtype = torch.int32) for i, (s, e) in enumerate(cuts)])[None]
+    y = modeling.causal_conv1d_fn(x, w, b, activation = "silu", seq_idx = seq_idx)
+    expected = torch.cat([gcc.causal_conv1d_reference(x[..., s:e], w, b, "silu") for s, e in cuts], dim = -1)
     torch.testing.assert_close(y, expected)

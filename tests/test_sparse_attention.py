@@ -808,3 +808,49 @@ def test_window_only_hd512_compiles_fullgraph(with_sink):
     compiled = _grads(torch.compile(layer, fullgraph = True), q, win, sink, go)
     for x, y in zip(compiled, eager):
         torch.testing.assert_close(x.float(), y.float(), atol = 1e-2, rtol = 1e-2)
+
+
+def _bool_membership(topk_idxs, kv_len, block = 128):
+    """The [b, s, n] bool table the flex path used to keep for backward: the allowed-key oracle."""
+    b, s, k = topk_idxs.shape
+    nq, nk = -(-s // block), -(-kv_len // block)
+    valid = (topk_idxs >= 0) & (topk_idxs < kv_len)
+    cols = torch.where(valid, topk_idxs, nk * block).long()
+    table = torch.zeros((b, nq * block, nk * block + 1), dtype = torch.bool)
+    table[:, :s].scatter_(-1, cols, True)
+    table = table[..., : nk * block]
+    tiles = table.view(b, nq, block, nk, block)
+    return table, tiles.any(dim = 4).any(dim = 2), tiles.all(dim = 4).all(dim = 2)
+
+
+@pytest.mark.parametrize("s,n,k", [(300, 300, 40), (130, 517, 200), (256, 256, 256), (77, 1, 1)])
+def test_bit_packed_membership_mask_allows_exactly_the_listed_keys(s, n, k):
+    # One bit per key: 8 MB per layer at 8k instead of 64 MB.
+    g = torch.Generator().manual_seed(s + n)
+    b = 2
+    idxs = _unique_idxs(b, s, min(k, n), n, 0.2, g, empty_rows = [(0, 3), (1, s - 1)])
+    if k >= n:   # rows that list every key: fully visible tiles
+        idxs[1, : min(s, 128)] = torch.arange(n, dtype = torch.int32)
+    idxs[0, 5, 0] = n + 7   # out of range: ignored, as before
+    table, any_ref, all_ref = _bool_membership(idxs, n)
+    mask = sa._membership_block_mask(idxs, n)
+    kept = [t for t in mask.mask_mod.__closure__ or () if isinstance(t.cell_contents, torch.Tensor)]
+    held = sum(t.cell_contents.numel() * t.cell_contents.element_size() for t in kept)
+    assert held * 8 <= table.numel() + 32 * 8 * table.shape[0] * table.shape[1], (held, table.numel())
+    bi, qi, ki = (x.reshape(-1) for x in torch.meshgrid(
+        torch.arange(b), torch.arange(table.shape[1]), torch.arange(table.shape[2]), indexing = "ij"))
+    got = mask.mask_mod(bi, torch.zeros_like(bi), qi, ki).view(table.shape)
+    assert torch.equal(got, table)
+    # Tiles: visible = partial + full, as the bool table's any(); full as its all().
+    assert torch.equal(mask.to_dense()[:, 0].bool(), any_ref)
+    full = torch.zeros_like(all_ref)
+    for bb in range(b):
+        for qq in range(any_ref.shape[1]):
+            c = int(mask.full_kv_num_blocks[bb, 0, qq])
+            full[bb, qq, mask.full_kv_indices[bb, 0, qq, :c].long()] = True
+    assert torch.equal(full, all_ref)
+
+
+def test_flex_budget_admits_32k_tokens():
+    # At 1 bit per entry the same 256 MB budget holds QSA at 32k tokens (b = 1); 64k still falls back.
+    assert 32768 * 32768 <= sa._FLEX_MAX_TABLE < 65536 * 65536

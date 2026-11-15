@@ -60,6 +60,27 @@ def qwen4_exp_qsa_indexer_forward(self, hidden_states, position_embeddings, atte
         return torch.where(
             attention_mask == 0, attention_mask.new_zeros(()), torch.finfo(attention_mask.dtype).min
         )
+    from unsloth_zoo.temporary_patches.qwen4_exp import qwen4_exp_qsa_indexer_forward_guarded
+    return qwen4_exp_qsa_indexer_forward_guarded(self, hidden_states, position_embeddings, attention_mask, past_key_values)
+
+
+def qwen4_exp_qsa_indexer_forward_guarded(self, hidden_states, position_embeddings, attention_mask,
+                                          past_key_values=None):
+    """transformers' indexer on the filled cache slots only; installed alone under UNSLOTH_QWEN4_EXP_FAST_QSA=0.
+
+    The reference reads the position table by kv slot, which has one row per token seen so far. A static cache's
+    mask spans max_cache_len, and a query row that attends to nothing (a left pad) is given every slot by Unsloth's
+    sdpa_mask fix, unfilled ones included: the reference then indexes past the table (a CUDA device assert in
+    batched generate). Real tokens never see an unfilled slot, so hiding them changes no row that is read."""
+    # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
+    if attention_mask is not None and attention_mask.dim() == 4:
+        n_positions = position_embeddings[0].shape[-2]
+        if attention_mask.shape[-1] > n_positions:
+            filled = torch.arange(attention_mask.shape[-1], device=attention_mask.device) < n_positions
+            if attention_mask.dtype == torch.bool:
+                attention_mask = attention_mask & filled
+            elif attention_mask.is_floating_point():
+                attention_mask = attention_mask.masked_fill(~filled, torch.finfo(attention_mask.dtype).min)
     from unsloth_zoo.temporary_patches.qwen4_exp import _reference_qsa_forward
     return _reference_qsa_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values)
 
@@ -111,11 +132,14 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
         from transformers.models.qwen4_exp import modeling_qwen4_exp
         rope = modeling_qwen4_exp.apply_rotary_pos_emb
     position_embeddings = tuple(position_embeddings)
-    with torch.no_grad():
-        selected = qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, rope,
-                                     past_key_values = past_key_values)
-    if selected is None:
-        return None
+    # Traced: run attention eagerly with the selection (same break count); the traced path lacks flex and is 16x slower.
+    fused = torch.compiler.is_compiling() and past_key_values is None
+    if not fused:
+        with torch.no_grad():
+            selected = qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, rope,
+                                         past_key_values = past_key_values)
+        if selected is None:
+            return None
 
     cos, sin = (x[:, -seq:, :] for x in position_embeddings)
     input_shape = hidden_states.shape[:-1]
@@ -133,10 +157,27 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
         key_states = key_states.to(value_states.dtype)
     if past_key_values is not None:
         key_states, value_states = past_key_values.update(key_states, value_states, module.layer_idx)
-    attn_output = sparse_gqa_attn(query_states, key_states, value_states, selected, module.scaling)
+    if fused:
+        attn_output = _select_and_attend(indexer, hidden_states, position_embeddings, attention_mask, rope,
+                                         query_states, key_states, value_states, module.scaling)
+        if attn_output is None:   # not interval-shaped: the reference (projections recomputed there)
+            return None
+    else:
+        attn_output = sparse_gqa_attn(query_states, key_states, value_states, selected, module.scaling)
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = (attn_output * torch.sigmoid(gate)).to(value_states.dtype)
     return module.o_proj(attn_output), None
+
+
+@torch.compiler.disable
+def _select_and_attend(indexer, hidden_states, position_embeddings, attention_mask, rope, query, key, value, scaling):
+    """QSA selection + sparse attention outside any trace (eager dispatch); None when the mask is not interval-shaped."""
+    from unsloth_zoo.sparse_attention import qsa_select_tokens, sparse_gqa_attn
+    with torch.no_grad():
+        selected = qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, rope)
+    if selected is None:
+        return None
+    return sparse_gqa_attn(query, key, value, selected, scaling)
 
 
 def qwen4_exp_attention_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kwargs):
@@ -217,7 +258,7 @@ def _reference_returns_float_mask(function):
 def _make_fast_indexer_forward(original_forward):
     """Test hook: bind `original_forward` as the long-context reference."""
     global _reference_qsa_forward, _qsa_returns_float_mask
-    if original_forward is not qwen4_exp_qsa_indexer_forward:
+    if original_forward not in (qwen4_exp_qsa_indexer_forward, qwen4_exp_qsa_indexer_forward_guarded):
         _reference_qsa_forward = original_forward
         _qsa_returns_float_mask = _reference_returns_float_mask(original_forward)
     return qwen4_exp_qsa_indexer_forward
@@ -313,16 +354,18 @@ def patch_qwen4_exp():
 
 def _patch_qwen4_exp_rest(modeling):
     indexer_cls = getattr(modeling, "Qwen4ExpTextQSAIndexer", None)
-    if (
-        indexer_cls is not None
-        and _fast_qsa_enabled()
-        and indexer_cls.forward is not qwen4_exp_qsa_indexer_forward
-        # Never take the compiler's copy (which calls us) as the reference.
-        and _is_transformers_indexer_forward(indexer_cls.forward)
-    ):
+    if indexer_cls is not None:
+        # The kill switch drops the fast within-budget path but keeps the filled-slot guard.
+        wanted = qwen4_exp_qsa_indexer_forward if _fast_qsa_enabled() else qwen4_exp_qsa_indexer_forward_guarded
+        current = indexer_cls.forward
         try:
-            _make_fast_indexer_forward(indexer_cls.forward)
-            indexer_cls.forward = qwen4_exp_qsa_indexer_forward
+            if current in (qwen4_exp_qsa_indexer_forward, qwen4_exp_qsa_indexer_forward_guarded):
+                if _reference_qsa_forward is not None:
+                    indexer_cls.forward = wanted
+            # Never take the compiler's copy (which calls us) as the reference.
+            elif _is_transformers_indexer_forward(current):
+                _make_fast_indexer_forward(current)
+                indexer_cls.forward = wanted
         except Exception as e:
             if UNSLOTH_ENABLE_LOGGING:
                 logger.warning(f"Unsloth: Could not patch Qwen4ExpTextQSAIndexer.forward: {e}")

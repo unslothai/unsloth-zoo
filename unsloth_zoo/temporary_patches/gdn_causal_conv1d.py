@@ -16,9 +16,9 @@
 
 """Triton causal depthwise conv (+ SiLU) for GatedDeltaNet and Mamba2 when `causal_conv1d` is missing.
 
-Replaces the transformers `F.conv1d` fallback (Qwen3.5/3.6, Qwen3-Next; on transformers >= 5.15
-also the Mamba2 mixers of Nemotron-H, Falcon-H1, Granite-4.0-H, Bamba, Zamba2), reading and
-writing channel-last directly to skip the transpose copies. Layout follows fla's
+Replaces the transformers `F.conv1d` fallback (Qwen3.5/3.6, Qwen3-Next, Qwen3.8-Flash-Next; on
+transformers >= 5.15 also the Mamba2 mixers of Nemotron-H, Falcon-H1, Granite-4.0-H, Bamba, Zamba2),
+reading and writing channel-last directly to skip the transpose copies. Layout follows fla's
 `causal_conv1d` (fla-org/flash-linear-attention, MIT), without initial state; `seq_idx`
 (B, T) keeps taps inside one packed sequence.
 Numerics match torch: fp32 accumulate, pre-activation and SiLU grad rounded to input dtype.
@@ -51,7 +51,7 @@ _KILL_SWITCH = "UNSLOTH_DISABLE_TRITON_CAUSAL_CONV1D"
 _MARK = "_unsloth_triton_causal_conv1d"
 _HUB_MARK = "_unsloth_triton_causal_conv1d_hub"
 
-_GDN_MODELING = ("qwen3_5", "qwen3_5_moe", "qwen3_next")
+_GDN_MODELING = ("qwen3_5", "qwen3_5_moe", "qwen3_next", "qwen4_exp")
 # Mamba2 mixers call the same depthwise causal conv (x (B, D, T), weight (D, W), SiLU) through the
 # same hub decorator, so they share the dispatch on transformers >= 5.15. Older releases gate the
 # whole Mamba2 fast path on the causal_conv1d package itself, so there is nothing to rebind there.
