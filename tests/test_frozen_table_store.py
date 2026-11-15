@@ -123,18 +123,24 @@ def test_madvise_page_aligned_and_real(bf16_table, monkeypatch):
 
 
 @pytest.mark.parametrize("widened", [False, True])
-def test_fp8_e8m0_planes_match_reference(tmp_path, widened):
+def test_fp8_e8m0_planes_match_reference(tmp_path, monkeypatch, widened):
     """``widened``: the scales stored as fp32 (Unsloth's converted DeepSeek-V4.1 checkpoints, for transformers
-    without F8_E8M0); the same powers of two, so the same rows."""
-    if not hasattr(torch, "float8_e8m0fnu"):
-        pytest.skip("torch without float8_e8m0fnu")
+    without F8_E8M0); the same powers of two, so the same rows. That form must decode without float8_e8m0fnu."""
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch without float8_e4m3fn")
+    if not widened and not hasattr(torch, "float8_e8m0fnu"):
+        pytest.skip("raw e8m0 scales need torch.float8_e8m0fnu")
     torch.manual_seed(0)
     n, dim, block = 300, 64, 32
     weight = (torch.randn(n, dim) * 4).to(torch.float8_e4m3fn)
-    scale = torch.randint(110, 140, (n, dim // block), dtype=torch.uint8).view(torch.float8_e8m0fnu)
-    stored = scale.float() if widened else scale
+    exponents = torch.randint(110, 140, (n, dim // block))
+    scale_values = torch.pow(2.0, (exponents - 127).float())  # what e8m0 bytes 110..139 decode to
+    stored = scale_values if widened else exponents.to(torch.uint8).view(torch.float8_e8m0fnu)
     save_file({"layers.1.engram.embed.weight": weight, "x": torch.ones(3), "layers.1.engram.embed.scale": stored},
               str(tmp_path / "model.safetensors"))
+    if widened:
+        # A torch without float8_e8m0fnu (the case the widened checkpoints exist for).
+        monkeypatch.delattr(torch, "float8_e8m0fnu", raising=False)
     store = FrozenTableStore.from_checkpoint(
         str(tmp_path), {"weight": ["layers.1.engram.embed.weight"], "scale": ["layers.1.engram.embed.scale"]},
         decode=make_fp8_block_decode(block), mode="disk",
@@ -143,7 +149,7 @@ def test_fp8_e8m0_planes_match_reference(tmp_path, widened):
     ids[0, 0, :3] = torch.tensor([0, n - 1, 0])
     # DeepseekV41EngramEmbedding.forward, fp8 branch
     values = F.embedding(ids, weight)
-    scales = F.embedding(ids, scale).float()
+    scales = F.embedding(ids, scale_values)
     ref = (values.float().unflatten(-1, (-1, block)) * scales.unsqueeze(-1)).flatten(-2)
     got = store.gather(ids)
     assert got.dtype == torch.float32

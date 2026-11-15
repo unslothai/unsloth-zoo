@@ -436,8 +436,9 @@ def make_fp8_block_decode(block_size: int = 32, weight_plane: str = "weight", sc
     """fp8 e4m3 rows times per-block e8m0 scales, exactly DeepseekV41EngramEmbedding.forward:
     ``values.float().unflatten(-1, (-1, block)) * scales.float().unsqueeze(-1)`` (float32 result)."""
 
-    if not (hasattr(torch, "float8_e4m3fn") and hasattr(torch, "float8_e8m0fnu")):
-        raise RuntimeError("Unsloth: this torch has no float8_e4m3fn / float8_e8m0fnu, needed to decode an fp8 table.")
+    # e8m0 is needed only for raw e8m0 scales; fp32-widened scales decode on any torch with float8_e4m3fn.
+    if not hasattr(torch, "float8_e4m3fn"):
+        raise RuntimeError("Unsloth: this torch has no float8_e4m3fn, needed to decode an fp8 table.")
 
     def decode(planes: Dict[str, torch.Tensor], dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         values = planes[weight_plane].view(torch.float8_e4m3fn)
@@ -447,6 +448,11 @@ def make_fp8_block_decode(block_size: int = 32, weight_plane: str = "weight", sc
         if scales.dtype == torch.uint8 and values.shape[-1] and scales.shape[-1] == 4 * (values.shape[-1] // block_size):
             scales = scales.view(torch.float32)
         elif not (scales.is_floating_point() and scales.element_size() > 1):
+            if not hasattr(torch, "float8_e8m0fnu"):
+                raise RuntimeError(
+                    "Unsloth: this torch has no float8_e8m0fnu, needed for raw e8m0 table scales; use a checkpoint "
+                    "with fp32-widened scales (Unsloth's converted DeepSeek-V4.1) or a newer torch."
+                )
             scales = scales.view(torch.float8_e8m0fnu)
         scales = scales.float()
         out = values.float().unflatten(-1, (-1, block_size)) * scales.unsqueeze(-1)
