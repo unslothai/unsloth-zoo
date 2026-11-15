@@ -98,6 +98,8 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.moe_utils_fp8",
     "unsloth_zoo.temporary_patches.moe_utils_sonic",
     "unsloth_zoo.temporary_patches.mxfp4",
+    "unsloth_zoo.temporary_patches.moe_gc_keep_base",
+    "unsloth_zoo.temporary_patches.moe_lora_fold",
     "unsloth_zoo.temporary_patches.pixtral",
     "unsloth_zoo.temporary_patches.qwen3_5_moe",
     "unsloth_zoo.temporary_patches.qwen3_moe",
