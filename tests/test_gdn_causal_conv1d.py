@@ -836,6 +836,8 @@ def test_qwen4_exp_gdn_conv_honours_seq_idx(hub_kernels, monkeypatch):
     # Qwen3.8-Flash-Next's GatedDeltaNet calls the same hub conv. On the torch fallback seq_idx is dropped, so
     # Unsloth's hybrid packing gate refuses padding-free rows ("causal_conv1d_fn has no accelerated kernel").
     pytest.importorskip("triton")
+    if torch.version.hip is not None:
+        pytest.skip("the Triton seq_idx conv is CUDA only; ROCm keeps transformers' conv")
     modeling = _real_gdn_modeling(monkeypatch, "transformers.models.qwen4_exp.modeling_qwen4_exp")
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.version, "hip", None)
