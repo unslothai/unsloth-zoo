@@ -35,6 +35,8 @@ def test_gather_needs_its_triton_kernels_not_only_the_api(monkeypatch):
     # torch 2.4 - 2.8 bundle Triton 3.0 - 3.4, which lack triton.constexpr_function: the api and op registrations
     # import there, the kernels (loaded on the first call) do not, so gather must not be selected.
     triton = pytest.importorskip("triton")
+    if triton.__name__ != "triton":
+        pytest.skip("triton is unsloth_zoo's stub (UNSLOTH_ZOO_DISABLE_GPU_INIT=1)")
     monkeypatch.setattr(sa, "_GATHER", None)
     if hasattr(triton, "constexpr_function"):
         assert sa._gather_importable()   # api + ops cached; their op definitions never run twice below

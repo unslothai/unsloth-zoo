@@ -470,7 +470,8 @@ def _interpreter_run():
     from pathlib import Path
     # 4 intra-op threads: the tensors are tiny, and a full-width pool spent ~50 of 58 CPU seconds spinning.
     env = dict(os.environ, PYTHONPATH = str(Path(__file__).resolve().parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", ""),
-               CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1", OMP_NUM_THREADS = "4")
+               CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1", OMP_NUM_THREADS = "4",
+               UNSLOTH_ZOO_DISABLE_GPU_INIT = "0")  # "1" swaps in the triton stub: no interpreter
     return subprocess.run([sys.executable, "-c", _WINDOW_INTERP + _INTERP], env = env, capture_output = True, text = True,
                           timeout = 900)
 
