@@ -61,17 +61,26 @@ SPARSE_ATTN_STATS = {"gather": 0, "triton": 0, "flex": 0, "torch": 0, "hd512": 0
 QSA_TIE_STATS = {"chunks": 0, "tied_rows": 0}
 
 
+@torch.compiler.assume_constant_result
+def _env(name, default):
+    """os.environ lookup that traces on every supported torch: torch 2.4 cannot inline os.environ.get under
+    fullgraph ("Mapping.get" in skipfiles). Traced calls bake the value read at trace time, as 2.6+ already do."""
+    return os.environ.get(name, default)
+
+
 def _exact_ties():
     """UNSLOTH_QWEN4_EXP_EXACT_TIES=1: rows whose k-th and (k+1)-th block scores tie are recomputed exactly as
     transformers' indexer does (its matmul and topk over that row's candidates), so the kept tokens are the
     reference's. Off by default: it needs a host sync per query chunk and one small topk per tied row (L4, medium
     Qwen at 4k: ~300 tied rows per step, 756 vs 641 ms per step). Without it a tied row may keep a different,
     equally-scored block (torch.topk's tie order is unspecified); the score multiset is the reference's."""
-    return os.environ.get("UNSLOTH_QWEN4_EXP_EXACT_TIES", "0") == "1"
+    return _env("UNSLOTH_QWEN4_EXP_EXACT_TIES", "0") == "1"
 
 _BACKENDS = ("gather", "triton", "flex", "torch")
 _FAILED = {}
 _HAS_TRITON = importlib.util.find_spec("triton") is not None
+# flex_attention first ships in torch 2.5; without it the flex backend is never eligible (not tried, failed, latched).
+_HAS_FLEX = importlib.util.find_spec("torch.nn.attention.flex_attention") is not None
 _GATHER = None
 _FLEX = None
 _BLOCK = 128
@@ -91,7 +100,7 @@ def _count(key):
 
 def _forced_backend(window = False):
     """UNSLOTH_SPARSE_ATTN_BACKEND; "hd512" only where it exists (the window-only form)."""
-    value = os.environ.get("UNSLOTH_SPARSE_ATTN_BACKEND", "").strip().lower()
+    value = _env("UNSLOTH_SPARSE_ATTN_BACKEND", "").strip().lower()
     return value if value in (_BACKENDS + ("hd512",) if window else _BACKENDS) else None
 
 
@@ -99,6 +108,9 @@ def _gather_fn():
     global _GATHER
     if not _GATHER:   # None (not tried) or False (failed: re-raise the real import error for a forced call)
         from unsloth_zoo._vendored.attn_gym.sparse.gather_attn import gather_attn
+        # Import kernels now: Triton < 3.5 lacks constexpr_function; fail here, not inside a compiled step.
+        import unsloth_zoo._vendored.attn_gym.sparse.gather_attn.impl.triton.backward  # noqa: F401
+        import unsloth_zoo._vendored.attn_gym.sparse.gather_attn.impl.triton.forward  # noqa: F401
         _GATHER = gather_attn
     return _GATHER
 
@@ -112,6 +124,16 @@ def _gather_importable():
         except Exception:
             _GATHER = False
     return bool(_GATHER)
+
+
+def _resolve_gather():
+    """Once at import: traced dispatch then only reads _GATHER (a cold trace skipped gather: _gather_importable does
+    not import while compiling, so the first compiled step on Blackwell ran the Triton kernel instead)."""
+    global _GATHER
+    try:
+        _gather_fn()
+    except Exception:
+        _GATHER = False
 
 
 def _gather_eligible(q, window = 0):
@@ -145,15 +167,22 @@ _FLEX_D256_MIN_SHARED_MEMORY = 96 * 1024
 _SHARED_MEMORY = {}
 
 
+def _query_shared_memory(index):
+    try:
+        return getattr(torch.cuda.get_device_properties(index), "shared_memory_per_block_optin", 0)
+    except Exception:
+        return 0
+
+
 def _shared_memory(device):
     if device.type != "cuda":
         return 0
     index = device.index if device.index is not None else torch.cuda.current_device()
+    # Traced code skips the cache: a dict first filled during a trace becomes a guard and recompiles the next call.
+    if torch.compiler.is_compiling():
+        return _query_shared_memory(index)
     if index not in _SHARED_MEMORY:
-        try:
-            _SHARED_MEMORY[index] = getattr(torch.cuda.get_device_properties(index), "shared_memory_per_block_optin", 0)
-        except Exception:
-            _SHARED_MEMORY[index] = 0
+        _SHARED_MEMORY[index] = _query_shared_memory(index)
     return _SHARED_MEMORY[index]
 
 
@@ -174,7 +203,7 @@ def _triton_eligible(q, forced = False, kv = None):
 
 
 def _flex_eligible(q, kv_len = None):
-    if not (q.is_cuda and _HAS_TRITON and q.dtype in (torch.float16, torch.bfloat16)):
+    if not (q.is_cuda and _HAS_TRITON and _HAS_FLEX and q.dtype in (torch.float16, torch.bfloat16)):
         return False
     # sm75 (T4): flex_attention failed to compile at head_dim 64 and 256 ("No valid triton configs") and the flex
     # training arm failed; sm80+ only.
@@ -278,6 +307,9 @@ def sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale):
         probs = torch.where(empty, 0, probs)
         return torch.einsum("bchk,bckd->bchd", probs, slots).to(q.dtype)
 
+    if s <= _TORCH_CHUNK_ELEMS // max(1, k * d * b):
+        # One chunk: a Python loop over the length recompiles per length even under dynamic=True.
+        return block(q, kv_pad, sink, safe, valid)
     # Under autograd each chunk is recomputed in backward, so only one gathered slab is ever live.
     recompute = torch.is_grad_enabled() and any(t.requires_grad for t in (q, kv, attn_sink) if t is not None) and s > chunk
     outs = []
@@ -311,6 +343,13 @@ def _gather_call(q, local_kv, sparse_kv, idxs, attn_sink, softmax_scale, window)
     if heads != h:
         q = torch.cat([q, q.new_zeros((b, s, heads - h, d))], dim = 2)
         sink = torch.cat([sink, sink.new_full((heads - h,), float("-inf"))])
+    # TOPK is a constexpr + tuner key and DeepSeek's width varies with length: pad with -1 slots to a power of two
+    # (>= 16). Eager only: traced, bit_length would guard on every exact width.
+    k = idxs.shape[-1]
+    if isinstance(k, int) and k and not torch.compiler.is_compiling():
+        width = max(16, 1 << (k - 1).bit_length())
+        if width != k:
+            idxs = torch.cat([idxs, idxs.new_full((*idxs.shape[:-1], width - k), -1)], dim = -1)
     # One KV head ([b, 1, n, d]): gather_attn records share_kv = True, so the backward keeps the shared schedule
     # (a pre-expanded [b, heads, n, d] view is treated as per-head KV and allocates per-head gradients).
     out = _gather_fn()(
@@ -424,8 +463,11 @@ def _run(backend, q, kv, attn_sink, topk_idxs, softmax_scale):
 
 
 def _latch(backend, q, k, error):
-    # Never swallow trace-time, capture or memory failures: the shape class is not at fault.
-    if isinstance(error, torch.OutOfMemoryError) or type(error).__module__.startswith("torch._dynamo"):
+    # Re-raise trace-time, capture and memory failures; latch a backend's own compile failure (torch 2.6
+    # BackendCompilerFailed) unless its inner error is a memory failure.
+    from torch._dynamo.exc import BackendCompilerFailed
+    inner = getattr(error, "inner_exception", error) if isinstance(error, BackendCompilerFailed) else error
+    if isinstance(inner, torch.OutOfMemoryError) or (inner is error and type(error).__module__.startswith("torch._dynamo")):
         raise error
     if q.is_cuda and torch.cuda.is_current_stream_capturing():
         raise error
@@ -769,3 +811,7 @@ def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mas
                 _repair_boundary_ties(out, b, t0, scores, valid, k, q[b, t0:t1], block_keys, starts, arange_r,
                                       top_blocks, ratio, dim)
     return out
+
+
+if _HAS_TRITON:
+    _resolve_gather()
