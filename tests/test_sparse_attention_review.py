@@ -312,7 +312,8 @@ def _qwen(dtype = torch.float64, seed = 0, attn = "eager"):
 def _qwen_inputs(rotary, s, dtype = torch.float64, pe_dtype = torch.float64):
     g = torch.Generator().manual_seed(1)
     hidden = torch.randn(1, s, 64, generator = g).to(dtype)
-    cos, sin = rotary(hidden.float(), torch.arange(s)[None])
+    # (3, batch, seq) mrope positions: the shape both older and newer Qwen4Exp rotaries accept.
+    cos, sin = rotary(hidden.float(), torch.arange(s).expand(3, 1, -1))
     mask = torch.tril(torch.ones(s, s, dtype = torch.bool)).view(1, 1, s, s)
     return hidden, (cos.to(pe_dtype), sin.to(pe_dtype)), mask
 
