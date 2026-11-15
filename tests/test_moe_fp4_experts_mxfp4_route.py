@@ -122,3 +122,29 @@ def test_fp4_views_follow_an_in_place_scale_update():
     after = moe_utils_fp8._fp4_experts_as_mxfp4(module)
     old_codes, new_codes = (v.mxfp4_scales for v in (before[1], after[1]))
     assert torch.equal(new_codes.to(torch.int16), old_codes.to(torch.int16) + 1)
+
+
+def test_fp4_views_cached_under_inference_mode_still_train(monkeypatch):
+    # generate() runs under inference_mode; training after it reuses the cached views and saves them for backward.
+    from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm_available
+    from unsloth_zoo.temporary_patches import moe_utils_fp8
+
+    if not mxfp4_grouped_mm_available(torch.device("cuda")):
+        pytest.skip("no fused MXFP4 grouped GEMM on this GPU")
+    monkeypatch.setenv("UNSLOTH_MOE_BACKEND", "grouped_mm")
+    monkeypatch.setenv("UNSLOTH_MXFP4_FUSED_GEMM", "1")
+    monkeypatch.setenv("UNSLOTH_FP8_EXPERTS_MXFP4", "1")
+    module = _fp4_experts()
+    for name in ("gate_up_proj", "down_proj"):
+        s = getattr(module, f"{name}_scale_inv")
+        floats = s.detach().view(torch.uint8).float().sub(127).exp2()
+        setattr(module, f"{name}_scale_inv", torch.nn.Parameter(floats, requires_grad = False))
+    g = torch.Generator(device = "cuda").manual_seed(2)
+    x = torch.randn(16, 128, device = "cuda", dtype = torch.bfloat16, generator = g)
+    index = torch.randint(0, 4, (16, 2), device = "cuda", generator = g)
+    weights = torch.rand(16, 2, device = "cuda", generator = g)
+    with torch.inference_mode():
+        moe_utils_fp8.forward_moe_backend_fp8(module, x, index, weights)
+    inputs = x.clone().requires_grad_(True)
+    moe_utils_fp8.forward_moe_backend_fp8(module, inputs, index, weights).float().sum().backward()
+    assert inputs.grad is not None and torch.isfinite(inputs.grad).all()

@@ -1089,15 +1089,17 @@ def _fp4_experts_as_mxfp4(module):
         key = (name, weight.data_ptr(), scale.data_ptr(), tuple(weight.shape), weight._version, scale._version)
         view = cache.get(key)
         if view is None:
-            codes = _ue8m0_codes(scale)
-            if codes is None:
-                return None
-            view = Mxfp4ExpertParam(
-                weight.detach().view(torch.uint8).view(E, M, half_k // 16, 16),
-                mxfp4_scales = codes.contiguous(),
-                mxfp4_transposed = False,
-                mxfp4_dtype = torch.bfloat16,
-            )
+            # Outside inference mode: a view cached by a generate() must still be savable for a later backward.
+            with torch.inference_mode(False):
+                codes = _ue8m0_codes(scale)
+                if codes is None:
+                    return None
+                view = Mxfp4ExpertParam(
+                    weight.detach().view(torch.uint8).view(E, M, half_k // 16, 16),
+                    mxfp4_scales = codes.contiguous(),
+                    mxfp4_transposed = False,
+                    mxfp4_dtype = torch.bfloat16,
+                )
             if len(cache) > 4:  # stale storages (a reload)
                 cache.clear()
             cache[key] = view
