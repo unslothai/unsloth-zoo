@@ -70,7 +70,9 @@ def _masks(kind, b, s):
 def _inputs(b, s, rotary, seed = 1):
     g = torch.Generator().manual_seed(seed)
     hidden = torch.randn(b, s, 64, generator = g, dtype = torch.float64)
-    pos = torch.arange(s).unsqueeze(0).expand(b, -1)
+    # Text positions on all three mrope grids: older transformers' rotary indexes (3, batch, seq) and newer ones
+    # expand to it, so this is the one shape every supported version accepts.
+    pos = torch.arange(s).unsqueeze(0).expand(3, b, -1)
     cos, sin = rotary(hidden.float(), pos)
     return hidden, (cos.double(), sin.double())
 

@@ -59,6 +59,7 @@ __all__ = [
 
 from contextlib import contextmanager
 import copy
+import functools
 import hashlib
 import json
 import mmap
@@ -435,12 +436,25 @@ def make_fp8_block_decode(block_size: int = 32, weight_plane: str = "weight", sc
     """fp8 e4m3 rows times per-block e8m0 scales, exactly DeepseekV41EngramEmbedding.forward:
     ``values.float().unflatten(-1, (-1, block)) * scales.float().unsqueeze(-1)`` (float32 result)."""
 
-    if not (hasattr(torch, "float8_e4m3fn") and hasattr(torch, "float8_e8m0fnu")):
-        raise RuntimeError("Unsloth: this torch has no float8_e4m3fn / float8_e8m0fnu, needed to decode an fp8 table.")
+    # e8m0 is needed only for raw e8m0 scales; fp32-widened scales decode on any torch with float8_e4m3fn.
+    if not hasattr(torch, "float8_e4m3fn"):
+        raise RuntimeError("Unsloth: this torch has no float8_e4m3fn, needed to decode an fp8 table.")
 
     def decode(planes: Dict[str, torch.Tensor], dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         values = planes[weight_plane].view(torch.float8_e4m3fn)
-        scales = planes[scale_plane].view(torch.float8_e8m0fnu).float()
+        scales = planes[scale_plane]
+        # e8m0 bytes (the released files), or the same powers of two widened to fp32 (Unsloth's converted
+        # DeepSeek-V4.1 checkpoints, for transformers without F8_E8M0): told apart by the bytes per row.
+        if scales.dtype == torch.uint8 and values.shape[-1] and scales.shape[-1] == 4 * (values.shape[-1] // block_size):
+            scales = scales.view(torch.float32)
+        elif not (scales.is_floating_point() and scales.element_size() > 1):
+            if not hasattr(torch, "float8_e8m0fnu"):
+                raise RuntimeError(
+                    "Unsloth: this torch has no float8_e8m0fnu, needed for raw e8m0 table scales; use a checkpoint "
+                    "with fp32-widened scales (Unsloth's converted DeepSeek-V4.1) or a newer torch."
+                )
+            scales = scales.view(torch.float8_e8m0fnu)
+        scales = scales.float()
         out = values.float().unflatten(-1, (-1, block_size)) * scales.unsqueeze(-1)
         out = out.flatten(-2)
         return out if dtype is None or dtype == out.dtype else out.to(dtype)
@@ -1449,13 +1463,15 @@ def install_frozen_table_load_hook() -> bool:
     original = PreTrainedModel.__dict__.get("_load_pretrained_model")
     if original is None:
         return False
-    original_fn = original.__func__ if isinstance(original, staticmethod) else original
+    # transformers 5: staticmethod (model, state_dict, checkpoint_files, load_config, ...);
+    # transformers 4.5x: classmethod (cls, model, state_dict, checkpoint_files, ..., hf_quantizer = ...).
+    is_classmethod = isinstance(original, classmethod)
+    original_fn = original.__func__ if isinstance(original, (staticmethod, classmethod)) else original
     if getattr(original_fn, "_unsloth_frozen_table_hook", False):
         _LOAD_HOOK_INSTALLED[0] = True
         return True
 
-    def _load_pretrained_model(model, state_dict, checkpoint_files, load_config, *args, **kwargs):
-        result = original_fn(model, state_dict, checkpoint_files, load_config, *args, **kwargs)
+    def _bind_after_load(model, checkpoint_files, quantizer):
         unbound = [n for n, m in iter_frozen_table_modules(model) if not m.is_bound]
         if unbound:
             if not checkpoint_files or not str(checkpoint_files[0]).endswith(".safetensors"):
@@ -1463,12 +1479,27 @@ def install_frozen_table_load_hook() -> bool:
                     f"Unsloth: frozen tables {unbound[:2]} need a safetensors checkpoint to stream from. "
                     "Set UNSLOTH_FROZEN_TABLE=gpu for a normal load."
                 )
-            bind_frozen_tables(model, list(checkpoint_files), quantizer=getattr(load_config, "hf_quantizer", None))
-        return result
+            bind_frozen_tables(model, list(checkpoint_files), quantizer=quantizer)
+
+    # functools.wraps: keep the markers of patches below this one (and __wrapped__) visible on the wrapper.
+    if is_classmethod:
+        @functools.wraps(original_fn)
+        def _load_pretrained_model(cls, model, state_dict, checkpoint_files, *args, **kwargs):
+            result = original_fn(cls, model, state_dict, checkpoint_files, *args, **kwargs)
+            _bind_after_load(model, checkpoint_files, kwargs.get("hf_quantizer"))
+            return result
+    else:
+        @functools.wraps(original_fn)
+        def _load_pretrained_model(model, state_dict, checkpoint_files, load_config, *args, **kwargs):
+            result = original_fn(model, state_dict, checkpoint_files, load_config, *args, **kwargs)
+            _bind_after_load(model, checkpoint_files, getattr(load_config, "hf_quantizer", None))
+            return result
 
     _load_pretrained_model._unsloth_frozen_table_hook = True
     _load_pretrained_model.__wrapped__ = original_fn
-    PreTrainedModel._load_pretrained_model = staticmethod(_load_pretrained_model)
+    PreTrainedModel._load_pretrained_model = (
+        classmethod(_load_pretrained_model) if is_classmethod else staticmethod(_load_pretrained_model)
+    )
     _install_save_guard(PreTrainedModel)
     _LOAD_HOOK_INSTALLED[0] = True
     return True
@@ -1517,6 +1548,8 @@ def _install_save_guard(PreTrainedModel):
     if getattr(original, "_unsloth_frozen_table_guard", False):
         return
 
+    # functools.wraps: keeps __wrapped__ and the markers of patches below (unsloth_zoo's MXFP4 dense save).
+    @functools.wraps(original)
     def save_pretrained(self, save_directory, *args, **kwargs):
         _check_save_target(self, save_directory)
         if not _prepare_full_table_save(self, args, kwargs):
@@ -1525,6 +1558,4 @@ def _install_save_guard(PreTrainedModel):
             return original(self, save_directory, *args, **kwargs)
 
     save_pretrained._unsloth_frozen_table_guard = True
-    save_pretrained.__wrapped__ = original
-    save_pretrained.__doc__ = original.__doc__
     PreTrainedModel.save_pretrained = save_pretrained

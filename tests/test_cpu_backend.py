@@ -432,6 +432,103 @@ def test_kv_cache_is_off_for_training_without_checkpointing():
     assert model.config.use_cache is False
 
 
+@pytest.mark.parametrize("targets, expected, saved", [
+    (None, ["self_attn.wq_a", "self_attn.wo_a", "mlp.up"], None),
+    (["q_proj", "o_proj", "lm_head"], ["self_attn.wq_a", "self_attn.wo_a"], ["lm_head"]),
+    ("all-linear", ["self_attn.wq_a", "self_attn.wo_a", "mlp.up"], None),
+])
+def test_lora_targets_go_through_the_models_own_remap(targets, expected, saved):
+    """A model naming its projections differently (Unsloth's native DeepSeek-V4.1) exposes unsloth_lora_target_modules;
+    the CPU get_peft_model must use it as the GPU path does, else q/k/v/o and None miss its real Linears."""
+    import torch.nn as nn
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    import peft
+    captured = {}
+    real = peft.LoraConfig.__init__
+
+    def spy(self, *args, **kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop")
+
+    calls = []
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.wq_a, self.wo_a, self.up = nn.Linear(8, 8), nn.Linear(8, 8), nn.Linear(8, 8)
+
+        @staticmethod
+        def unsloth_lora_target_modules(target_modules, attention = True, mlp = True):
+            calls.append((target_modules, attention, mlp))
+            table = {"q_proj": ["self_attn.wq_a"], "o_proj": ["self_attn.wo_a"], "up_proj": ["mlp.up"]}
+            wanted = ["q_proj", "o_proj", "up_proj"] if target_modules in (None, "all-linear") else target_modules
+            return [t for name in wanted for t in table.get(name, [name])]
+
+    peft.LoraConfig.__init__ = spy
+    try:
+        with pytest.raises(RuntimeError, match = "stop"):
+            FastCPUModel.get_peft_model(Model(), r = 4, target_modules = targets, use_gradient_checkpointing = False)
+    finally:
+        peft.LoraConfig.__init__ = real
+    assert captured["target_modules"] == expected
+    assert captured["modules_to_save"] == saved
+    assert calls and "lm_head" not in (calls[0][0] or [])
+
+
+def _capture_cpu_lora_config(model, **kwargs):
+    from unsloth_zoo.cpu.loader import FastCPUModel
+    import peft
+    captured = {}
+    real = peft.LoraConfig.__init__
+
+    def spy(self, *args, **config):
+        captured.update(config)
+        raise RuntimeError("stop")
+
+    peft.LoraConfig.__init__ = spy
+    try:
+        with pytest.raises(RuntimeError, match = "stop"):
+            FastCPUModel.get_peft_model(model, r = 4, use_gradient_checkpointing = False, **kwargs)
+    finally:
+        peft.LoraConfig.__init__ = real
+    return captured
+
+
+def test_lora_remap_that_returns_its_input_keeps_the_embeddings_to_save():
+    import torch.nn as nn
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(8, 8)
+
+        @staticmethod
+        def unsloth_lora_target_modules(target_modules, attention = True, mlp = True):
+            return target_modules
+
+    captured = _capture_cpu_lora_config(Model(), target_modules = ["q_proj", "embed_tokens", "lm_head"])
+    assert captured["target_modules"] == ["q_proj"]
+    assert captured["modules_to_save"] == ["embed_tokens", "lm_head"]
+
+
+def test_lora_remap_is_skipped_when_the_language_layers_are_not_finetuned():
+    import torch.nn as nn
+    calls = []
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(8, 8)
+
+        @staticmethod
+        def unsloth_lora_target_modules(target_modules, attention = True, mlp = True):
+            calls.append(target_modules)
+            return ["remapped"]
+
+    captured = _capture_cpu_lora_config(Model(), target_modules = ["q_proj"], finetune_language_layers = False)
+    assert calls == [] and captured["target_modules"] == ["q_proj"]
+
+
 def test_partial_llama_style_match_falls_back_to_the_peft_default():
     """MPT-like: Wqkv + out_proj + up_proj/down_proj. up/down alone must not become the target set."""
     import torch.nn as nn
@@ -1533,6 +1630,7 @@ def test_cpu_sft_trainer_unpickles_as_the_cpu_class_in_a_fresh_process(monkeypat
     script = "import pickle, sys; c = pickle.load(open(sys.argv[1], 'rb')); print('CPU', getattr(c, '_unsloth_cpu', False))"
     env = dict(os.environ, CUDA_VISIBLE_DEVICES = "")
     env.pop("HF_TOKEN", None)
+    env.pop("UNSLOTH_ALLOW_CPU", None)  # a real driverless host: not conftest's CUDA-shaped spoof (and ~10 s faster)
     done = subprocess.run([sys.executable, "-c", script, str(blob)], capture_output = True, text = True,
                           timeout = 300, env = env, cwd = str(tmp_path))
     assert "CPU True" in done.stdout, (done.stdout[-2000:], done.stderr[-3000:])
@@ -1623,3 +1721,33 @@ def test_serial_dataset_num_proc_maps_in_process(requested, seen):
     with pytest.raises(RuntimeError):
         _make_cpu_sft_trainer(Failing)(None, args)
     assert args.dataset_num_proc == 1
+
+
+def test_cpu_patches_rerun_after_the_model_load_and_before_lora(monkeypatch, tmp_path):
+    import torch.nn as nn
+    import transformers
+    from unsloth_zoo.cpu import loader, runtime
+
+    events = []
+    monkeypatch.setattr(runtime, "apply_cpu_security_patches", lambda: events.append("patches") or [])
+
+    class Stop(Exception):
+        pass
+
+    def load(*args, **kwargs):
+        events.append("load")
+        return nn.Linear(2, 2)
+
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", load)
+    monkeypatch.setattr(loader, "_clamp_to_learned_positions", lambda model, n: (_ for _ in ()).throw(Stop()))
+    with pytest.raises(Stop):
+        transformers.LlamaConfig(
+            vocab_size = 32, hidden_size = 8, intermediate_size = 16, num_hidden_layers = 1,
+            num_attention_heads = 2, num_key_value_heads = 1,
+        ).save_pretrained(tmp_path)
+        loader.FastCPUModel.from_pretrained(str(tmp_path), load_in_4bit = False)
+    assert events[:2] == ["load", "patches"]
+
+    events.clear()
+    captured = _capture_cpu_lora_config(nn.Sequential(nn.Linear(4, 4)), target_modules = ["0"])
+    assert events == ["patches"] and captured["target_modules"] == ["0"]

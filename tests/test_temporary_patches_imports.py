@@ -75,6 +75,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.llama4_moe",
     "unsloth_zoo.temporary_patches.ministral",
     "unsloth_zoo.temporary_patches.amd_aiter",
+    "unsloth_zoo.temporary_patches.fp8_partial_block_dequant",
     "unsloth_zoo.temporary_patches.fp8_uncontained_weights",
     "unsloth_zoo.temporary_patches.mhc_sinkhorn",
     "unsloth_zoo.temporary_patches.misc",

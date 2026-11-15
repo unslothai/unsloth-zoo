@@ -15,8 +15,10 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """DeepSeek-V4.1's engram tables streamed from the checkpoint (the frozen table store) instead of loaded into
-host RAM: a tiny model in the community transformers port, bf16 and fp8 + e8m0 tables, loaded in disk mode
-matches the port's own DeepseekV41EngramEmbedding load bit for bit and never reads a table tensor."""
+host RAM: a tiny model, bf16 and fp8 + e8m0 tables, loaded in disk mode matches the reference load bit for bit and
+never reads a table tensor. Run against every implementation on the path (tests/_dsv41_impl.py): the community
+transformers port (reference: its own DeepseekV41EngramEmbedding, UNSLOTH_FROZEN_TABLE=gpu) and Unsloth's native
+module (parameter-free tables in every mode; reference: the gpu-mode table materialized on the device)."""
 
 import json
 import os
@@ -25,11 +27,17 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-try:
-    from transformers.models.deepseek_v41 import modeling_deepseek_v41 as modeling
-except Exception:  # transformers without the DeepSeek-V4.1 port
-    modeling = None
-pytestmark = pytest.mark.skipif(modeling is None, reason="transformers without deepseek_v41 (community port)")
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _dsv41_impl import available  # noqa: E402
+
+IMPLS = available()
+IMPL = IMPLS[0] if IMPLS else None   # the port when transformers ships one, else the native module
+modeling = IMPL.modeling if IMPL is not None else None
+NATIVE = IMPL is not None and IMPL.name == "native"
+needs_impl = pytest.mark.skipif(
+    IMPL is None, reason="needs a DeepSeek-V4.1 implementation (transformers port, or unsloth's native module)"
+)
 
 from unsloth_zoo import frozen_table_store as fts  # noqa: E402
 from unsloth_zoo.frozen_table_store import FROZEN_TABLE_STATS, UnslothFrozenTableEmbedding, reset_frozen_table_stats  # noqa: E402
@@ -48,17 +56,25 @@ def _tokenizer():
 
 
 def _config(tok):
-    from transformers import DeepseekV41TextConfig
+    DeepseekV41TextConfig = IMPL.TextConfig
     _, compressed = modeling.build_compressed_token_map(tok)
+    extra = {}
+    if NATIVE:
+        primes, offsets = modeling.engram_layout((1, 2), 4, 2, 64)
+        extra = dict(engram_num_embeddings=[o[-1] + p[-1][-1] for o, p in zip(offsets, primes)],
+                     engram_pad_token_id=8, kv_source_layer_ids=[1, 3], index_source_layer_ids=[1, 2, 3, 4],
+                     candidate_source_layer_id=3)
+    else:
+        extra = dict(engram_num_embeddings=[700, 700], engram_pad_id=8)
     return DeepseekV41TextConfig(
         hidden_size=64, num_attention_heads=4, num_key_value_heads=1, num_hidden_layers=5,
         compress_ratios=[0, 2, 2, 1, 1], num_experts_per_tok=2, moe_intermediate_size=64, max_position_embeddings=128,
         vocab_size=len(tok), head_dim=32, qk_rope_head_dim=8, q_lora_rank=32, o_groups=2, o_lora_rank=16,
         n_routed_experts=4, n_shared_experts=1, sliding_window=8, hc_mult=2, index_n_heads=2, index_head_dim=32,
         index_topk=2, candidate_topk_blocks=4, candidate_block_size=4, num_nextn_predict_layers=0,
-        tie_word_embeddings=False, engram_layer_ids=[1, 2], engram_num_embeddings=[700, 700], engram_vocab_size=64,
-        engram_n_heads=2, engram_head_dim=32, engram_max_ngram_size=4, engram_pad_id=8,
-        engram_compressed_vocab_size=compressed, dspark_noise_token_id=len(tok) - 1,
+        tie_word_embeddings=False, engram_layer_ids=[1, 2], engram_vocab_size=64,
+        engram_n_heads=2, engram_head_dim=32, engram_max_ngram_size=4,
+        engram_compressed_vocab_size=compressed, dspark_noise_token_id=len(tok) - 1, **extra,
     )
 
 
@@ -68,18 +84,25 @@ TABLES = ("model.engram_tables.1", "model.engram_tables.2")
 @pytest.fixture(scope="module")
 def tiny_dsv41(tmp_path_factory):
     from unsloth_zoo.temporary_patches.deepseek_v41 import patch_deepseek_v41_engram_table
+    IMPL.register()
     os.environ["UNSLOTH_FROZEN_TABLE"] = "disk"
     try:
-        assert patch_deepseek_v41_engram_table()
+        assert patch_deepseek_v41_engram_table() or NATIVE
     finally:
         os.environ.pop("UNSLOTH_FROZEN_TABLE", None)
     tok = _tokenizer()
     torch.manual_seed(0)
     model = modeling.DeepseekV41ForCausalLM(_config(tok))   # from_config: real tables
-    assert type(model.model.engram_tables["1"]) is modeling.DeepseekV41EngramEmbedding
-    with torch.no_grad():
-        for t in model.model.engram_tables.values():
-            t.weight.normal_(0, 0.5)
+    if NATIVE:
+        assert isinstance(model.model.engram_tables["1"], UnslothFrozenTableEmbedding)
+        text = model.config.get_text_config()
+        for layer, rows in zip(text.engram_layer_ids, text.engram_num_embeddings):
+            model.model.set_engram_table(layer, torch.randn(rows, text.engram_head_dim) * 0.5)
+    else:
+        assert type(model.model.engram_tables["1"]) is modeling.DeepseekV41EngramEmbedding
+        with torch.no_grad():
+            for t in model.model.engram_tables.values():
+                t.weight.normal_(0, 0.5)
     bf16 = tmp_path_factory.mktemp("dsv41_bf16")
     model.to(torch.bfloat16).save_pretrained(str(bf16))
     tok.save_pretrained(str(bf16))
@@ -87,18 +110,25 @@ def tiny_dsv41(tmp_path_factory):
     fp8 = tmp_path_factory.mktemp("dsv41_fp8")
     files = [f for f in os.listdir(bf16) if f.endswith(".safetensors")]
     linears = sorted(n for n, m in model.named_modules() if isinstance(m, torch.nn.Linear))
+    weights = {t + ".weight": t + ".weight_scale_inv" for t in TABLES}
+    weights.update({f"model.layers.{t.rsplit('.', 1)[-1]}.engram.embed.weight":
+                     f"model.layers.{t.rsplit('.', 1)[-1]}.engram.embed.scale" for t in TABLES})
+    e8m0 = True
+    if NATIVE:
+        import importlib
+        e8m0 = not importlib.import_module(IMPL.modeling.__name__.rsplit(".", 1)[0] + ".convert").released_needs_conversion()
     for f in os.listdir(bf16):
         src = os.path.join(bf16, f)
         if f in files:
             sd, new = load_file(src), {}
             for k, v in sd.items():
-                if any(k == t + ".weight_scale_inv" for t in TABLES):
+                if k in weights.values():
                     continue
-                if any(k == t + ".weight" for t in TABLES):
+                if k in weights:
                     blocks = v.float().unflatten(-1, (-1, 32))
                     scale = torch.exp2(torch.ceil(torch.log2(blocks.abs().amax(-1).clamp_min(1e-12) / 448.0)))
                     new[k] = (blocks / scale.unsqueeze(-1)).clamp(-448, 448).to(torch.float8_e4m3fn).flatten(-2)
-                    new[k[: -len("weight")] + "weight_scale_inv"] = scale.to(torch.float8_e8m0fnu)
+                    new[weights[k]] = scale.to(torch.float8_e8m0fnu) if e8m0 else scale
                 else:
                     new[k] = v
             save_file(new, os.path.join(fp8, f), metadata={"format": "pt"})
@@ -149,16 +179,22 @@ def _load(path, mode, monkeypatch, log=None):
         real_open = mu.safe_open
         monkeypatch.setattr(mu, "safe_open", lambda *a, **k: _OpenSpy(real_open(*a, **k), log))
     model = modeling.DeepseekV41ForCausalLM.from_pretrained(path, dtype=torch.bfloat16)
+    if NATIVE:
+        model.bind_tokenizer(_tokenizer())
     if log is not None:
         monkeypatch.setattr(mu, "safe_open", real_open)
     return model
 
 
+@needs_impl
 @pytest.mark.parametrize("kind", ["bf16", pytest.param("fp8", marks=needs_fp8)])
 def test_disk_engram_matches_the_ports_table(tiny_dsv41, monkeypatch, kind):
     path = tiny_dsv41[kind]
     ref = _load(path, "gpu", monkeypatch)
-    assert type(ref.model.engram_tables["1"]) is modeling.DeepseekV41EngramEmbedding
+    if NATIVE:
+        assert {t.frozen_table_store.mode for t in ref.model.engram_tables.values()} == {"gpu"}
+    else:
+        assert type(ref.model.engram_tables["1"]) is modeling.DeepseekV41EngramEmbedding
     log = []
     model = _load(path, "disk", monkeypatch, log=log)
     tables = model.model.engram_tables
@@ -167,7 +203,8 @@ def test_disk_engram_matches_the_ports_table(tiny_dsv41, monkeypatch, kind):
     assert log and not [k for k in log if "engram_tables" in k or "engram.embed" in k], sorted(set(log))[:6]
     assert not [n for n, _ in model.named_parameters() if "engram_tables" in n]
     assert len(tables["1"].frozen_table_store.planes) == (2 if kind == "fp8" else 1)   # a bf16 save's scale is unused
-    ids = torch.arange(0, 700, 7).view(1, 4, 25)
+    rows = min(t.num_embeddings for t in tables.values())
+    ids = (torch.arange(0, 700, 7) % rows).view(1, 4, 25)
     with torch.no_grad():
         for k in tables:
             assert torch.equal(tables[k](ids), ref.model.engram_tables[k](ids)), k
@@ -188,7 +225,10 @@ def test_disk_engram_matches_the_ports_table(tiny_dsv41, monkeypatch, kind):
     for n in grads:
         assert torch.equal(grads[n], grads_ref[n]), n
     assert grads["model.layers.1.engram.wkv.weight"].abs().sum() > 0
-    assert FROZEN_TABLE_STATS["gathers"] == 2
+    assert FROZEN_TABLE_STATS["gathers"] >= 2
+    if NATIVE:
+        assert not [k for k in model.state_dict() if "engram_tables" in k]
+        return
     # The export. A bf16 table: zero-copy views under the port's names. An fp8 table on a dequantized load (no GPU
     # here, so transformers dequantizes): the model holds decoded rows and drops its quantization config, so fp8
     # rows + scales would reload as raw rows. Outside a full save nothing is exported (an adapter save must not
@@ -215,6 +255,7 @@ def test_disk_engram_matches_the_ports_table(tiny_dsv41, monkeypatch, kind):
         assert not fts._prepare_full_table_save(model, (), {"state_dict": {}}) and calls == []
 
 
+@needs_impl
 @needs_fp8
 def test_native_engram_names_bind_and_decode_like_the_port(tmp_path):
     # The released files: `layers.<i>.engram.embed.{weight,scale}`, bound to the model-level engram_tables.<i>.
@@ -259,9 +300,28 @@ def test_fp8_kept_load_returns_float32_rows():
     assert not _fp8_weights_kept(torch.nn.Module())
 
 
+@needs_impl
 def test_from_config_and_gpu_mode_keep_the_ports_table(tiny_dsv41, monkeypatch):
     monkeypatch.setenv("UNSLOTH_FROZEN_TABLE", "disk")
     model = modeling.DeepseekV41ForCausalLM(_config(_tokenizer()))
+    if NATIVE:
+        assert isinstance(model.model.engram_tables["1"], UnslothFrozenTableEmbedding)
+        assert not [n for n, _ in model.named_parameters() if "engram_tables" in n]
+        ref = _load(tiny_dsv41["bf16"], "gpu", monkeypatch)
+        assert {t.frozen_table_store.mode for t in ref.model.engram_tables.values()} == {"gpu"}
+        return
     assert type(model.model.engram_tables["1"]) is modeling.DeepseekV41EngramEmbedding
     ref = _load(tiny_dsv41["bf16"], "gpu", monkeypatch)
     assert type(ref.model.engram_tables["2"]) is modeling.DeepseekV41EngramEmbedding
+
+
+def test_native_engram_constructor_refuses_a_table_it_cannot_bind(monkeypatch):
+    import unsloth_zoo.frozen_table_store as fts
+    from unsloth_zoo.temporary_patches.deepseek_v41 import make_deepseek_v41_engram_table
+
+    monkeypatch.setattr(fts, "install_frozen_table_load_hook", lambda: False)
+    with pytest.raises(RuntimeError, match = "load hook"):
+        make_deepseek_v41_engram_table("1", 64, 8)
+    monkeypatch.undo()
+    table = make_deepseek_v41_engram_table("1", 64, 8)
+    assert hasattr(table, "frozen_table_store") and not list(table.parameters())
