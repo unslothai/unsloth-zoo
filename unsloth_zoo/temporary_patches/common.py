@@ -173,8 +173,7 @@ def _persistent_tma_matmul_ok():
 pass
 
 def _triton_block_ptr_ok():
-    # Triton 3.9 (torch 2.15) dropped block pointers (tl.advance is gone, tl.make_block_ptr raises), so
-    # Inductor ignores triton.use_block_ptr there and raises a FutureWarning at the first codegen.
+    # Triton 3.9 (torch 2.15) dropped block pointers: Inductor then warns at codegen and ignores the flag.
     try:
         from torch.utils._triton import has_triton_block_ptr
         return bool(has_triton_block_ptr())

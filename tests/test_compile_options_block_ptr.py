@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`triton.use_block_ptr` is only requested where Triton still has block pointers (Triton 3.9 / torch 2.15
-removed them; Inductor then ignores the flag and raises a FutureWarning at codegen)."""
+"""`triton.use_block_ptr` is only requested where Triton still has block pointers."""
 
 import sys
 import types
@@ -50,7 +49,6 @@ def test_requested_block_ptr_follows_the_installed_triton():
 
 @pytest.mark.parametrize("has_advance", [True, False])
 def test_probe_without_torch_helper(monkeypatch, has_advance):
-    # torch < 2.15 has no torch.utils._triton.has_triton_block_ptr: probe triton.language directly.
     import torch.utils._triton as torch_triton
     monkeypatch.delattr(torch_triton, "has_triton_block_ptr", raising = False)
     tl = types.SimpleNamespace(make_block_ptr = object())
