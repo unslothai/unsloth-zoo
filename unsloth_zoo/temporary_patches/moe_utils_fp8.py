@@ -1188,6 +1188,12 @@ def _fp8_requant_blockwise(W: torch.Tensor, block_shape: tuple, scale_dtype: tor
         Wf = Wpad
     W_blocks = Wf.reshape(srows, bm, scols, bn)
     block_max = W_blocks.abs().amax(dim=(1, 3))
+    if scale_dtype == torch.uint8:
+        # MXFP8: power-of-two scales stored as e8m0 bytes, the smallest 2**e with block_max / 2**e <= 448.
+        e = torch.ceil(torch.log2((block_max / _FP8_E4M3_MAX).clamp_min(2.0 ** -127))).clamp(-127, 127)
+        W_scaled = (W_blocks / torch.exp2(e).unsqueeze(-1).unsqueeze(1)).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+        W_fp8 = W_scaled.reshape(srows * bm, scols * bn)[:rows, :cols].to(torch.float8_e4m3fn)
+        return W_fp8, (e + 127).to(torch.uint8)
     scale_inv = (block_max / _FP8_E4M3_MAX).clamp_min(1e-12)
     W_scaled = (
         W_blocks / scale_inv.unsqueeze(-1).unsqueeze(1)

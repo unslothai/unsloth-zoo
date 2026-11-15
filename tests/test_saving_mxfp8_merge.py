@@ -49,3 +49,15 @@ def test_merge_rewrite_reads_the_checkpoint_scales(tmp_path):
         W, dropped = _fp8_dequantize_weight(f, header, "a.weight")
     assert dropped == ["a.weight_scale"]
     assert torch.equal(W, w.float() * torch.exp2(s.float() - 127).repeat_interleave(32, dim = 1))
+
+
+def test_mxfp8_requant_writes_e8m0_scales_that_decode_back():
+    from unsloth_zoo.temporary_patches.moe_utils_fp8 import _fp8_requant_blockwise
+    w, s = _mxfp8()
+    dense = _fp8_dequant_blockwise(w, s)
+    q, scale = _fp8_requant_blockwise(dense, (1, 32), torch.uint8)
+    assert scale.dtype == torch.uint8 and tuple(scale.shape) == tuple(s.shape)
+    again = _fp8_dequant_blockwise(q, scale)
+    assert float((again - dense).abs().max() / dense.abs().max()) < 0.07
+    # A value already on the MX grid re-quantizes to itself.
+    assert torch.equal(_fp8_dequant_blockwise(*_fp8_requant_blockwise(again, (1, 32), torch.uint8)), again)
