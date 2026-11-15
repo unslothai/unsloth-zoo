@@ -1722,3 +1722,35 @@ def test_serial_dataset_num_proc_maps_in_process(requested, seen):
     with pytest.raises(RuntimeError):
         _make_cpu_sft_trainer(Failing)(None, args)
     assert args.dataset_num_proc == 1
+
+
+def test_cpu_patches_rerun_after_the_model_load_and_before_lora(monkeypatch, tmp_path):
+    # Unsloth's native DeepSeek-V4.1 modeling is imported by the load itself: its patches (checkpoint replay) have to
+    # be applied after it, not only when unsloth_zoo.cpu was imported.
+    import torch.nn as nn
+    import transformers
+    from unsloth_zoo.cpu import loader, runtime
+
+    events = []
+    monkeypatch.setattr(runtime, "apply_cpu_security_patches", lambda: events.append("patches") or [])
+
+    class Stop(Exception):
+        pass
+
+    def load(*args, **kwargs):
+        events.append("load")
+        return nn.Linear(2, 2)
+
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", load)
+    monkeypatch.setattr(loader, "_clamp_to_learned_positions", lambda model, n: (_ for _ in ()).throw(Stop()))
+    with pytest.raises(Stop):
+        transformers.LlamaConfig(
+            vocab_size = 32, hidden_size = 8, intermediate_size = 16, num_hidden_layers = 1,
+            num_attention_heads = 2, num_key_value_heads = 1,
+        ).save_pretrained(tmp_path)
+        loader.FastCPUModel.from_pretrained(str(tmp_path), load_in_4bit = False)
+    assert events[:2] == ["load", "patches"]
+
+    events.clear()
+    captured = _capture_cpu_lora_config(nn.Sequential(nn.Linear(4, 4)), target_modules = ["0"])
+    assert events == ["patches"] and captured["target_modules"] == ["0"]

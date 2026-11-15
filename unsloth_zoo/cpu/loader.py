@@ -326,6 +326,10 @@ class FastCPUModel:
                 kwargs.pop("quantization_config", None)
                 use_4bit = False
                 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
+        # The load may import a modeling module for the first time (Unsloth's native DeepSeek-V4.1 is imported
+        # lazily): its device-independent patches (checkpoint replay, config aliases) apply only once it exists.
+        from . import runtime as _runtime
+        _runtime.apply_cpu_security_patches()
         if auto_dtype:
             dtype = model.dtype
             if dtype == torch.float16 and not use_4bit:
@@ -434,6 +438,9 @@ class FastCPUModel:
             # Reloaded LoRA checkpoint: a second get_peft_model would reset the saved adapter weights.
             _print("this model already has LoRA adapters, keeping them.")
             return model
+        # A model built by the caller (not through from_pretrained) may have imported its modeling module since.
+        from . import runtime as _runtime
+        _runtime.apply_cpu_security_patches()
         if use_gradient_checkpointing is None:
             use_gradient_checkpointing = getattr(model, "_unsloth_cpu_gradient_checkpointing", "unsloth")
         leaf_names = {name.rsplit(".", 1)[-1] for name, _ in model.named_modules()}
