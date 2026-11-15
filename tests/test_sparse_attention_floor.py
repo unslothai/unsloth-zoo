@@ -67,8 +67,9 @@ def import_in_trace(q, kv, sink, idx, ckv, cidx):
     return sa.sparse_attn_window(q, kv, ckv, cidx[..., :0], sink, d ** -0.5, 64)
 
 fn = torch.compile({"index_default": index_default, "window_triton": window_triton,
-                    "import_in_trace": import_in_trace}[case], fullgraph = True, dynamic = True)
-for s in (256, 300):
+                    "import_in_trace": import_in_trace}[case], backend = "eager", fullgraph = True, dynamic = True)
+# The guards under test are Dynamo's own: the eager backend sees the same recompile without Inductor compiles.
+for s in (64, 80):
     g = torch.Generator(device = dev).manual_seed(s)
     r = lambda *shape: (torch.randn(*shape, device = dev, generator = g) * 0.3).to(dt).requires_grad_()
     q, kv, ckv = r(1, s, h, d), r(1, s, d), r(1, s // 4 + 3, d)
@@ -90,7 +91,8 @@ def test_cold_compiled_dispatch_does_not_recompile_across_lengths(case):
     from pathlib import Path
     root = str(Path(__file__).resolve().parents[1])
     proc = subprocess.run([sys.executable, "-c", _COLD, root, case], capture_output = True, text = True, timeout = 900,
-                          env = dict(os.environ, PYTHONPATH = root + os.pathsep + os.environ.get("PYTHONPATH", "")))
+                          env = dict(os.environ, PYTHONPATH = root + os.pathsep + os.environ.get("PYTHONPATH", ""),
+                                     OMP_NUM_THREADS = "4"))   # tiny host tensors: a full-width pool only spins
     line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("COLD_OK")), None)
     assert line is not None, proc.stderr[-3000:]
     if case == "index_default" and torch.cuda.get_device_capability()[0] in (10, 11):

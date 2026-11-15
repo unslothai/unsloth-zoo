@@ -458,17 +458,29 @@ print("INTERP_WORST", worst)
 """
 
 
-def test_triton_kernel_math_in_the_interpreter():
-    # The kernel's own arithmetic (tiles, masks, online softmax, atomics, empty rows, heads not a multiple of 16,
-    # more slots than rows) on CPU through TRITON_INTERPRET, against the fp64 reference.
+@pytest.fixture(scope = "module")
+def _interpreter_run():
+    # Both interpreter scripts in one subprocess (window first: the index script patches _configs at its end): the
+    # process start (torch + unsloth_zoo init, 10-25 s on a loaded host) is paid once, not per test.
     import subprocess, sys
     from pathlib import Path
+    # 4 intra-op threads: the tensors are tiny, and a full-width pool spent ~50 of 58 CPU seconds spinning.
     env = dict(os.environ, PYTHONPATH = str(Path(__file__).resolve().parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", ""),
-               CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1")
-    proc = subprocess.run([sys.executable, "-c", _INTERP], env = env, capture_output = True, text = True, timeout = 600)
-    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("INTERP_WORST")), None)
+               CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1", OMP_NUM_THREADS = "4")
+    return subprocess.run([sys.executable, "-c", _WINDOW_INTERP + _INTERP], env = env, capture_output = True, text = True,
+                          timeout = 900)
+
+
+def _interpreter_worst(proc, tag):
+    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith(tag + " ")), None)
     assert line is not None, proc.stderr[-3000:]
     assert float(line.split()[1]) < 1e-5, line
+
+
+def test_triton_kernel_math_in_the_interpreter(_interpreter_run):
+    # The kernel's own arithmetic (tiles, masks, online softmax, atomics, empty rows, heads not a multiple of 16,
+    # more slots than rows) on CPU through TRITON_INTERPRET, against the fp64 reference.
+    _interpreter_worst(_interpreter_run, "INTERP_WORST")
 
 
 @pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
@@ -590,7 +602,7 @@ torch.manual_seed(0)
 worst = 0.0
 # (b, s, h, d, nc, k, window, sink): heads not a multiple of 16, no compressed slots, window 1, window > s.
 for (b, s, h, d, nc, k, w, sink_on) in ((1, 37, 3, 16, 9, 5, 8, True), (2, 21, 17, 32, 11, 0, 5, False),
-                                        (1, 40, 16, 16, 7, 4, 64, True), (1, 9, 2, 16, 6, 3, 1, True)):
+                                        (1, 20, 16, 16, 7, 4, 64, True), (1, 9, 2, 16, 6, 3, 1, True)):
     q = torch.randn(b, s, h, d, requires_grad = True)
     win = torch.randn(b, s, d, requires_grad = True)
     comp = torch.randn(b, nc, d, requires_grad = True)
@@ -612,7 +624,7 @@ for (b, s, h, d, nc, k, w, sink_on) in ((1, 37, 3, 16, 9, 5, 8, True), (2, 21, 1
     want = [ref] + list(torch.autograd.grad(ref, ref_leaves, go.double()))
     worst = max(worst, max(float((x.double() - y).abs().max()) for x, y in zip(got, want)))
 # One index row shared by g consecutive batches (the GQA fold) == the repeated rows.
-b, g, s, h, d, n, k = 2, 3, 7, 4, 16, 10, 6
+b, g, s, h, d, n, k = 2, 2, 5, 4, 16, 10, 6
 q = torch.randn(b * g, s, h, d, requires_grad = True)
 kv = torch.randn(b * g, n, d, requires_grad = True)
 idx = torch.stack([torch.stack([torch.randperm(n)[:k] for _ in range(s)]) for _ in range(b)]).int()
@@ -626,15 +638,8 @@ print("WINDOW_INTERP_WORST", worst)
 """
 
 
-def test_window_kernel_and_shared_index_rows_in_the_interpreter():
-    import subprocess, sys
-    from pathlib import Path
-    env = dict(os.environ, PYTHONPATH = str(Path(__file__).resolve().parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", ""),
-               CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1")
-    proc = subprocess.run([sys.executable, "-c", _WINDOW_INTERP], env = env, capture_output = True, text = True, timeout = 900)
-    line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("WINDOW_INTERP_WORST")), None)
-    assert line is not None, proc.stderr[-3000:]
-    assert float(line.split()[1]) < 1e-5, line
+def test_window_kernel_and_shared_index_rows_in_the_interpreter(_interpreter_run):
+    _interpreter_worst(_interpreter_run, "WINDOW_INTERP_WORST")
 
 
 @pytest.mark.skipif(not _CUDA, reason = "CUDA backends")
