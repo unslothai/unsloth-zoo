@@ -430,6 +430,15 @@ def _autograd_keeps_weights():
     return True
 
 
+def _checkpoints_in_forward(module):
+    """True when this call checkpoints inside `forward` (transformers >= 5.23 or Unsloth's block compile wrapper)."""
+    if not (getattr(module, "gradient_checkpointing", False) and module.training):
+        return False
+    fwd = module.__dict__.get("forward")
+    fwd = getattr(fwd, "__func__", fwd) if fwd is not None else type(module).forward
+    return getattr(getattr(fwd, "__code__", None), "co_name", None) == "forward_with_checkpointing"
+
+
 def _graph_task_id():
     """Id of the backward running on this thread, -1 outside one (or on a torch without the query)."""
     get = getattr(torch._C, "_current_graph_task_id", None)
@@ -625,6 +634,7 @@ class BlockSwap:
         self._input_hooked = [False] * len(self.indices)
         # Graph task a grad-on forward of each block ran in (-1: not inside a backward).
         self._forward_task = [-1] * len(self.indices)
+        self._ckpt_wrapped = weakref.WeakSet()
         self.spans_devices, self.layer_device = False, None
         if not self.indices:
             # Still a host session (with nothing pending): other local ranks then read this rank as done with it,
@@ -894,80 +904,128 @@ class BlockSwap:
 
     def _pre(self, i):
         def hook(module, args, kwargs):
-            b = self.blocks[i]
-            self.current = self.indices[i]
-            if self._auto and not self._settled:
-                self._note_block_peak(b)
-            self._fetch(b, steal = True)
-            marks = getattr(b, "marks", None)
-            # A sample still in flight (backward recompute queued behind its forward) is kept for _harvest,
-            # not overwritten: recording into the same events would lose it.
-            # mark_open: 1 = waiting sample open, 2 = full sample recorded, 3 = wait-only sample closed (the forward
-            # hook never ran: a recompute that stopped early) but its events may still be in flight.
-            in_flight = marks is not None and (
-                (b.mark_open == 2 and not marks[2].query()) or (b.mark_open in (1, 3) and not marks[1].query()))
-            if marks is not None and not in_flight:
-                self._harvest_marks(b)
-                stream = torch.cuda.current_stream(b.home)
-                marks[0].record(stream)
-                b.wait()
-                marks[1].record(stream)
-                b.mark_open = 1
-            else:
-                if marks is not None and b.mark_open == 1:
-                    b.mark_open = 3   # keep it for _harvest; this layer call records no sample of its own
-                b.wait()
-            # Weights kept for backward = recompute sweep, which walks layers in reverse.
-            nxt = i - self.depth if _autograd_keeps_weights() else i + self.depth
-            if 0 <= nxt < len(self.blocks):
-                self._fetch(self.blocks[nxt])
-            # Release on the input-grad hook: a full backward hook adds a node that reorders grad sums of shared inputs.
-            x = next((a for a in args if isinstance(a, torch.Tensor)), None)
-            if x is None:
-                x = kwargs.get("hidden_states")
-            moved = None
-            if isinstance(x, torch.Tensor) and b.home is not None and x.device != b.home:
-                # A host-loaded tail fetches onto the head's card, not necessarily where the hidden states are.
-                moved = (_to_device(args, b.home), _to_device(kwargs, b.home))
-                x = next((a for a in moved[0] if isinstance(a, torch.Tensor)), None)
-                if x is None:
-                    x = moved[1].get("hidden_states")
-            hooked = False
-            if torch.is_grad_enabled() and isinstance(x, torch.Tensor) and x.requires_grad:
-                x.register_hook(self._bwd(i))
-                hooked = True
-                self._forward_task[i] = _graph_task_id()
-            self._input_hooked[i] = hooked
-            return moved
+            if _checkpoints_in_forward(module) and self._wrap_checkpoint(module, i):
+                # The swap runs inside the checkpointed function (_wrap_checkpoint); here only the device move.
+                return self._move(i, args, kwargs)
+            return self._enter(i, args, kwargs)
         return _opaque(hook)
+
+    def _move(self, i, args, kwargs):
+        home = self.blocks[i].home
+        x = next((a for a in args if isinstance(a, torch.Tensor)), None)
+        if x is None:
+            x = kwargs.get("hidden_states")
+        if isinstance(x, torch.Tensor) and home is not None and x.device != home:
+            return _to_device(args, home), _to_device(kwargs, home)
+        return None
+
+    def _wrap_checkpoint(self, module, i):
+        # Checkpoint inside `forward`: module hooks never run in the recompute, so wrap the checkpointed function.
+        fn = getattr(module, "_gradient_checkpointing_func", None)
+        if not callable(fn):
+            return False
+        seen = fn
+        while seen is not None:   # ours may sit under routing replay's _RecordingCheckpoint
+            if getattr(seen, "_unsloth_block_swap", None) is self:
+                return True
+            seen = getattr(seen, "_unsloth_replay_checkpoint", None) or getattr(seen, "__wrapped__", None)
+        inner = fn
+
+        def run_in_checkpoint(function, *args, **kw):
+            def run(*a, **k):
+                self._enter(i, a, {**(getattr(function, "keywords", None) or {}), **k})
+                return self._leave(i, module, function(*a, **k))
+            return inner(run, *args, **kw)
+
+        run_in_checkpoint._unsloth_block_swap = self
+        run_in_checkpoint.__wrapped__ = inner
+        if hasattr(inner, "_unsloth_replay_checkpoint"):   # routing replay then sees it as wrapped, not rewrapping
+            run_in_checkpoint._unsloth_replay_checkpoint = inner._unsloth_replay_checkpoint
+        module._gradient_checkpointing_func = run_in_checkpoint
+        self.__dict__.setdefault("_ckpt_wrapped", weakref.WeakSet()).add(module)
+        return True
+
+    @_opaque
+    def _enter(self, i, args, kwargs):
+        b = self.blocks[i]
+        self.current = self.indices[i]
+        if self._auto and not self._settled:
+            self._note_block_peak(b)
+        self._fetch(b, steal = True)
+        marks = getattr(b, "marks", None)
+        # A sample still in flight is kept for _harvest: re-recording its events would lose it.
+        # mark_open: 1 = waiting sample open, 2 = full sample recorded, 3 = wait-only sample closed (the forward
+        # hook never ran: a recompute that stopped early) but its events may still be in flight.
+        in_flight = marks is not None and (
+            (b.mark_open == 2 and not marks[2].query()) or (b.mark_open in (1, 3) and not marks[1].query()))
+        if marks is not None and not in_flight:
+            self._harvest_marks(b)
+            stream = torch.cuda.current_stream(b.home)
+            marks[0].record(stream)
+            b.wait()
+            marks[1].record(stream)
+            b.mark_open = 1
+        else:
+            if marks is not None and b.mark_open == 1:
+                b.mark_open = 3   # keep it for _harvest; this layer call records no sample of its own
+            b.wait()
+        # Weights kept for backward = recompute sweep, which walks layers in reverse.
+        nxt = i - self.depth if _autograd_keeps_weights() else i + self.depth
+        if 0 <= nxt < len(self.blocks):
+            self._fetch(self.blocks[nxt])
+        # Release on the input-grad hook: a full backward hook adds a node that reorders grad sums of shared inputs.
+        x = next((a for a in args if isinstance(a, torch.Tensor)), None)
+        if x is None:
+            x = kwargs.get("hidden_states")
+        moved = None
+        if isinstance(x, torch.Tensor) and b.home is not None and x.device != b.home:
+            # A host-loaded tail fetches onto the head's card, not necessarily where the hidden states are.
+            moved = (_to_device(args, b.home), _to_device(kwargs, b.home))
+            x = next((a for a in moved[0] if isinstance(a, torch.Tensor)), None)
+            if x is None:
+                x = moved[1].get("hidden_states")
+        hooked = False
+        if torch.is_grad_enabled() and isinstance(x, torch.Tensor) and x.requires_grad:
+            x.register_hook(self._bwd(i))
+            hooked = True
+            self._forward_task[i] = _graph_task_id()
+        self._input_hooked[i] = hooked
+        return moved
 
     def _post(self, i):
         def hook(module, args, output):
-            b = self.blocks[i]
-            if getattr(b, "mark_open", 0) == 1:
-                b.marks[2].record(torch.cuda.current_stream(b.home))
-                b.mark_open = 2
-            training = getattr(module, "training", False)
-            if not _autograd_keeps_weights():
-                # A training forward's last blocks are the first ones recompute needs: keep them.
-                if not (training and i >= len(self.blocks) - self.depth):
-                    self._release(self.blocks[i])
-                # Inference: the next forward starts at the first block, so start fetching it now.
-                if not training and i == len(self.blocks) - 1:
-                    self._arm(forward = True)
+            if _checkpoints_in_forward(module) and getattr(
+                    getattr(module, "_gradient_checkpointing_func", None), "_unsloth_block_swap", None) is self:
                 return output
-            out = output[0] if isinstance(output, (tuple, list)) else output
-            if not (isinstance(out, torch.Tensor) and out.requires_grad):
-                self._release(self.blocks[i])
-                return output
-            self.blocks[i].pending = True
-            if not self._input_hooked[i]:
-                # No grad-requiring input to hook: release once the whole backward finishes.
-                release = self._bwd(i)
-                out.register_hook(
-                    lambda g: torch.autograd.Variable._execution_engine.queue_callback(lambda: release(None)))
-            return output
+            return self._leave(i, module, output)
         return _opaque(hook)
+
+    @_opaque
+    def _leave(self, i, module, output):
+        b = self.blocks[i]
+        if getattr(b, "mark_open", 0) == 1:
+            b.marks[2].record(torch.cuda.current_stream(b.home))
+            b.mark_open = 2
+        training = getattr(module, "training", False)
+        if not _autograd_keeps_weights():
+            # A training forward's last blocks are the first ones recompute needs: keep them.
+            if not (training and i >= len(self.blocks) - self.depth):
+                self._release(self.blocks[i])
+            # Inference: the next forward starts at the first block, so start fetching it now.
+            if not training and i == len(self.blocks) - 1:
+                self._arm(forward = True)
+            return output
+        out = output[0] if isinstance(output, (tuple, list)) else output
+        if not (isinstance(out, torch.Tensor) and out.requires_grad):
+            self._release(self.blocks[i])
+            return output
+        self.blocks[i].pending = True
+        if not self._input_hooked[i]:
+            # No grad-requiring input to hook: release once the whole backward finishes.
+            release = self._bwd(i)
+            out.register_hook(
+                lambda g: torch.autograd.Variable._execution_engine.queue_callback(lambda: release(None)))
+        return output
 
     def _bwd(self, i):
         def hook(grad):
@@ -1085,6 +1143,17 @@ class BlockSwap:
         for h in self.handles:
             h.remove()
         self.handles = []
+        for m in list(getattr(self, "_ckpt_wrapped", ())):
+            parent, fn = None, m.__dict__.get("_gradient_checkpointing_func")
+            while fn is not None and getattr(fn, "_unsloth_block_swap", None) is not self:
+                parent, fn = fn, getattr(fn, "_unsloth_replay_checkpoint", None)   # under routing replay
+            if fn is None:
+                continue
+            if parent is None:
+                m._gradient_checkpointing_func = fn.__wrapped__
+            else:
+                parent._unsloth_replay_checkpoint = fn.__wrapped__
+        self._ckpt_wrapped = weakref.WeakSet()
         # Free the pool first, else the restore can OOM.
         self.free = {}
         with _no_inference_mode():

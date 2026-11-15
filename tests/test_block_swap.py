@@ -2569,3 +2569,127 @@ def test_remove_drops_the_reserve_references():
                                  _reserve_layers = nn.ModuleList([nn.Linear(2, 2)]), _reserve_owner = object())
     _mod.BlockSwap.remove(fake)
     assert fake._reserve_layers == () and fake._reserve_owner is None
+
+
+class _CkptInForwardLayer(nn.Module):
+    """transformers >= 5.23 GradientCheckpointingLayer: checkpoints inside `forward`, so module hooks run outside."""
+
+    def __init__(self):
+        super().__init__()
+        self.lin = nn.Linear(4, 4)
+        self.gradient_checkpointing = False
+        self.calls = 0
+
+    def _forward(self, x, scale = 1.0):
+        self.calls += 1
+        return self.lin(x) * scale
+
+    def forward(self, *args, **kwargs):
+        if self.gradient_checkpointing and self.training:
+            import functools
+            return self._gradient_checkpointing_func(functools.partial(type(self)._forward, self, **kwargs), *args)
+        return self._forward(*args, **kwargs)
+
+
+_CkptInForwardLayer.forward.__code__ = _CkptInForwardLayer.forward.__code__.replace(
+    co_name = "forward_with_checkpointing")
+
+
+def _ckpt_in_forward_model(n, reentrant):
+    import functools
+    import torch.utils.checkpoint as cp
+    layers = nn.ModuleList([_CkptInForwardLayer() for _ in range(n)])
+    for layer in layers:
+        layer.gradient_checkpointing = True
+        layer._gradient_checkpointing_func = functools.partial(cp.checkpoint, use_reentrant = reentrant)
+    sw = _scheduler(n, depth = 2)
+    sw.streams = {}
+    for blk in sw.blocks:
+        blk.params, blk.host, blk.devices = [], [], []
+    for i, layer in enumerate(layers):
+        sw.handles.append(layer.register_forward_pre_hook(sw._pre(i), with_kwargs = True))
+        sw.handles.append(layer.register_forward_hook(sw._post(i)))
+    return layers, sw
+
+
+def test_checkpoint_inside_forward_swaps_inside_the_checkpoint():
+    # Regression: with checkpointing inside `forward`, every block stayed pending until backward.
+    for reentrant in (False, True):
+        layers, sw = _ckpt_in_forward_model(6, reentrant)
+        x = torch.ones(2, 4, requires_grad = True)
+        h = x
+        for i, layer in enumerate(layers):
+            h = layer(h, scale = 2.0)
+            assert not sw.blocks[i].pending, (reentrant, i)
+            assert _live(sw) <= sw.depth + 1, (reentrant, i, _live(sw))
+        assert [b.resident for b in sw.blocks[:4]] == [False] * 4, reentrant
+        h.sum().backward()
+        assert sw._grew is False, reentrant
+        assert all(l.calls == 2 for l in layers), reentrant   # forward + recompute
+        assert not any(b.pending for b in sw.blocks), reentrant
+        ref = [l.lin.weight.grad.clone() for l in layers]
+        sw.remove()
+        for l in layers:
+            l.lin.weight.grad = None
+        h = torch.ones(2, 4, requires_grad = True)   # x still carries the swap's input-grad hook
+        for l in layers:
+            h = l(h, scale = 2.0)
+        h.sum().backward()
+        assert all(torch.equal(r, l.lin.weight.grad) for r, l in zip(ref, layers)), reentrant
+
+
+def test_checkpoint_wrap_is_restored_on_remove_and_redone_after_reassignment():
+    import torch.utils.checkpoint as cp
+    layers, sw = _ckpt_in_forward_model(3, False)
+    orig = layers[0]._gradient_checkpointing_func
+    layers[0](torch.ones(2, 4, requires_grad = True))
+    assert layers[0]._gradient_checkpointing_func is not orig
+    # gradient_checkpointing_enable after install reassigns the function: the next call wraps it again.
+    layers[0]._gradient_checkpointing_func = orig
+    layers[0](torch.ones(2, 4, requires_grad = True))
+    assert getattr(layers[0]._gradient_checkpointing_func, "_unsloth_block_swap", None) is sw
+    sw.remove()
+    assert layers[0]._gradient_checkpointing_func is orig
+    # Eval (no checkpoint): the outer hooks swap as before.
+    layers2, sw2 = _ckpt_in_forward_model(3, False)
+    layers2.eval()
+    with torch.no_grad():
+        for l in layers2:
+            l(torch.ones(2, 4))
+    assert not hasattr(layers2[0]._gradient_checkpointing_func, "_unsloth_block_swap")
+    assert cp is not None
+
+
+def test_checkpoint_wrap_does_not_stack_under_routing_replay():
+    # Routing replay rewraps _gradient_checkpointing_func on every forward; each wrapper must be applied once.
+    from unsloth_zoo.routing_replay import _wrap_checkpoint_funcs
+    layers, sw = _ckpt_in_forward_model(3, False)
+    for order in range(2):
+        for _ in range(4):
+            if order == 0:
+                _wrap_checkpoint_funcs([(0, layers[0])])
+            layers[0](torch.ones(2, 4, requires_grad = True))
+            if order == 1:
+                _wrap_checkpoint_funcs([(0, layers[0])])
+        fn, swaps, replays = layers[0]._gradient_checkpointing_func, 0, 0
+        while fn is not None:
+            swaps += getattr(fn, "_unsloth_block_swap", None) is sw
+            replays += type(fn).__name__ == "_RecordingCheckpoint"
+            fn = getattr(fn, "__wrapped__", None) or (fn._unsloth_replay_checkpoint if replays and type(fn).__name__ == "_RecordingCheckpoint" else None)
+        assert (swaps, replays) == (1, 1), (order, swaps, replays)
+        sw.remove()
+        layers, sw = _ckpt_in_forward_model(3, False)
+
+
+def test_remove_unwraps_a_swap_wrapper_under_routing_replay():
+    # remove() must detach the swap wrapper even when routing replay wrapped it, keeping replay's wrapper.
+    from unsloth_zoo.routing_replay import _wrap_checkpoint_funcs
+    layers, sw = _ckpt_in_forward_model(3, False)
+    orig = layers[0]._gradient_checkpointing_func
+    layers[0](torch.ones(2, 4, requires_grad = True))
+    _wrap_checkpoint_funcs([(0, layers[0])])
+    outer = layers[0]._gradient_checkpointing_func
+    assert type(outer).__name__ == "_RecordingCheckpoint"
+    sw.remove()
+    assert layers[0]._gradient_checkpointing_func is outer and outer._unsloth_replay_checkpoint is orig
+    layers[0](torch.ones(2, 4, requires_grad = True)).sum().backward()   # no stale swap controller runs
