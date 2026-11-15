@@ -74,8 +74,7 @@ _KILL_SWITCH = textwrap.dedent(
 
 @pytest.fixture(scope="module")
 def _processes():
-    # Each check needs a fresh interpreter (import order is the subject); the cold torch + transformers import
-    # dominates, so both start at once instead of one after the other. Nothing here downloads.
+    # Fresh interpreters (import order is the subject), started in parallel.
     pytest.importorskip("transformers.models.qwen4_exp.modeling_qwen4_exp")
     base = dict(os.environ)
     base["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + base.get("PYTHONPATH", "")

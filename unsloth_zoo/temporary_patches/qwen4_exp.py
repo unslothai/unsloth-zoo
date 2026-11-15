@@ -89,9 +89,7 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
         return None
     if module.training and module.attention_dropout:
         return None
-    # Prefill into an empty cache (transformers builds one during training too when use_cache is on) is the same
-    # attention; decode steps and chunked prefill over cached tokens keep the reference. Probed after the shape
-    # checks, which already reject decode: a StaticCache answers with a tensor (a data-dependent branch, a host sync).
+    # Only prefill into an empty cache is sparse. Probed after the shape checks: a StaticCache answers with a tensor.
     if past_key_values is not None:
         try:
             if past_key_values.get_seq_length(module.layer_idx) != 0:

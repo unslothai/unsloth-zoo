@@ -257,9 +257,7 @@ def test_mask_geometry_is_scanned_once_per_mask_version(monkeypatch):
 
 
 def test_static_cache_decode_compiles_fullgraph(monkeypatch):
-    # A decode step keeps the reference attention; the shape checks reject it before the cache probe, whose
-    # StaticCache answer is a tensor: comparing it in Python broke fullgraph capture (data-dependent branching) and
-    # cost a host sync per layer per eager decode token.
+    # Decode must be rejected before the cache probe (StaticCache returns a tensor: graph break + host sync).
     from transformers import StaticCache
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")
     config, attention, rotary = _module("sdpa")
@@ -285,8 +283,7 @@ def test_static_cache_decode_compiles_fullgraph(monkeypatch):
 
 
 def _text_model_run(model, ids, use_cache):
-    # Prefill, then (with a cache) two decode steps through the model's own cache, which keeps the mRoPE position
-    # history (5.17 on the cache object, 5.22+ on the first indexed layer).
+    # Prefill, then (with a cache) two decode steps through the model's own cache.
     with torch.no_grad():
         if not use_cache:
             return model(input_ids = ids, use_cache = False).last_hidden_state
@@ -301,7 +298,6 @@ def _text_model_run(model, ids, use_cache):
 
 @pytest.fixture
 def _few_threads():
-    # A loaded many-core host otherwise spends the fp64 CPU text model on thread contention (minutes, not seconds).
     threads = torch.get_num_threads()
     torch.set_num_threads(min(threads, 4))
     yield
@@ -310,16 +306,12 @@ def _few_threads():
 
 @pytest.mark.parametrize("use_cache", [False, True], ids = ["no_cache", "prefill_then_decode"])
 def test_text_model_forward_matches_the_reference_end_to_end(monkeypatch, use_cache, _few_threads):
-    # The whole text model builds its own position ids and rotary tables (3-D mRoPE ids; transformers 5.17's rotary
-    # takes nothing else) and, with a cache, its own position history: the patched attention through that path equals
-    # the untouched attention, and engages on the prefill.
+    # Through the whole text model (own mRoPE ids and cache), patched equals untouched and engages on prefill.
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")
     monkeypatch.setenv("UNSLOTH_QWEN4_EXP_EXACT_TIES", "1")
     monkeypatch.setenv("UNSLOTH_FROZEN_TABLE", "gpu")
     zoo_qwen4_exp.patch_qwen4_exp()
-    # The model runs on CPU: on a GPU host the kernel-hub wrappers send the linear-attention layers to (vendored)
-    # Triton fla / causal-conv1d kernels, and the MoE backend picks Triton too, neither taking CPU tensors. Torch
-    # originals and each layer's dense shared expert instead: the same in both arms, and not what is tested here.
+    # CPU run: use torch linear-attention / MoE paths, since the GPU host's Triton kernels reject CPU tensors.
     for name in ("torch_chunk_gated_delta_rule", "torch_recurrent_gated_delta_rule", "causal_conv1d_fn",
                  "causal_conv1d_update"):
         original = getattr(getattr(modeling, name, None), "__wrapped__", None)

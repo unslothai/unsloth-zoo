@@ -32,8 +32,7 @@ _VENDORED_TRITON = ("unsloth_zoo._vendored.attn_gym._backends.triton",
 
 
 def test_gather_needs_its_triton_kernels_not_only_the_api(monkeypatch):
-    # torch 2.4 - 2.8 bundle Triton 3.0 - 3.4, which lack triton.constexpr_function: the api and op registrations
-    # import there, the kernels (loaded on the first call) do not, so gather must not be selected.
+    # Triton < 3.5 (torch 2.4 - 2.8) lacks constexpr_function: the gather kernels do not import, so never select it.
     triton = pytest.importorskip("triton")
     if triton.__name__ != "triton":
         pytest.skip("triton is unsloth_zoo's stub (UNSLOTH_ZOO_DISABLE_GPU_INIT=1)")
@@ -87,8 +86,7 @@ print("COLD_OK", sk.SPARSE_MQA_STATS["fwd"] + sk.SPARSE_MQA_STATS["window_fwd"])
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8, reason = "bf16 CUDA kernels")
 @pytest.mark.parametrize("case", ["index_default", "window_triton", "import_in_trace"])
 def test_cold_compiled_dispatch_does_not_recompile_across_lengths(case):
-    # A fresh process whose first sparse call is compiled (dynamic shapes, two lengths): dispatch state filled during
-    # the first trace (shared-memory caches, the gather import) must not become a guard that recompiles the second.
+    # Dispatch state filled during the first trace must not become a guard that recompiles the second length.
     import subprocess
     from pathlib import Path
     root = str(Path(__file__).resolve().parents[1])
@@ -104,8 +102,7 @@ def test_cold_compiled_dispatch_does_not_recompile_across_lengths(case):
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8, reason = "bf16 CUDA kernels")
 def test_triton_kernels_compile_once_across_lengths():
-    # 8 heads (QSA's folded groups): the lse batch stride s * 8 is 16-aligned for even s only, and Triton specializes
-    # integer arguments on % 16; every kernel must keep one compiled variant across even / odd lengths and batch.
+    # 8 heads: lse stride s * 8 is 16-aligned only for even s; one kernel variant must cover both.
     import triton
     from unsloth_zoo import sparse_mqa_kernel as sk
     names = ("_sparse_mqa_fwd", "_sparse_mqa_bwd", "_window_fwd", "_window_bwd_dq", "_window_bwd_dkv")
@@ -143,8 +140,7 @@ def test_triton_kernels_compile_once_across_lengths():
 
 @pytest.mark.parametrize("form", ["index", "window"])
 def test_dispatch_traces_fullgraph_with_env_reads(monkeypatch, form):
-    # The backend override is an environment variable read during dispatch; torch 2.4 cannot inline os.environ.get
-    # under fullgraph. The CPU path (torch reference) traces the same dispatch code.
+    # torch 2.4 cannot inline os.environ.get under fullgraph.
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")
     torch._dynamo.reset()
     q, kv = torch.randn(1, 9, 2, 16), torch.randn(1, 11, 16)
@@ -160,14 +156,12 @@ def test_dispatch_traces_fullgraph_with_env_reads(monkeypatch, form):
 
 @pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8, reason = "bf16 CUDA kernels")
 def test_window_support_check_traces_with_symbolic_head_dim():
-    # dynamic=True makes the head dim a SymInt; torch 2.4 SymInts have no bitwise and, so a power-of-two test
-    # written d & (d - 1) failed every compiled window call there (TorchRuntimeError, Colab L4 torch 2.4.0).
+    # torch 2.4 SymInts have no bitwise and: d & (d - 1) failed every compiled window call.
     from unsloth_zoo import sparse_mqa_kernel as sk
     torch._dynamo.reset()
     fn = torch.compile(lambda q, kv: q.sum() if sk.sparse_mqa_window_supported(q, kv) else q.sum() * 0,
                        backend = "eager", fullgraph = True, dynamic = True)
-    # Traced, the decision equals the eager one (ROCm declines the window kernel at every head dim); 48 is not a power
-    # of two, so no device takes it.
+    # 48 is not a power of two: traced and eager both decline.
     for d in (64, 128, 48):
         q = torch.randn(1, 8, 16, d, device = "cuda", dtype = torch.bfloat16)
         kv = torch.randn(1, 8, d, device = "cuda", dtype = torch.bfloat16)
@@ -177,8 +171,7 @@ def test_window_support_check_traces_with_symbolic_head_dim():
 
 
 def test_flex_is_never_eligible_without_flex_attention(monkeypatch):
-    # torch 2.4 has no torch.nn.attention.flex_attention: QSA tried flex first, failed, warned and latched it per
-    # shape class instead of going straight to the kernel fold.
+    # torch 2.4 has no flex_attention: go straight to the kernel fold, no warn-and-latch.
     import importlib.util
     assert sa._HAS_FLEX == (importlib.util.find_spec("torch.nn.attention.flex_attention") is not None)
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8:
@@ -199,9 +192,7 @@ def _backend_compiler_failed(inner):
 
 
 def test_a_backend_compile_failure_is_latched_not_raised(monkeypatch):
-    # Eager QSA tries flex first and compiles it; on torch 2.6 (Colab L4) Inductor could not lower flex at the QSA
-    # shape and raised BackendCompilerFailed, which _latch re-raised as a trace-time error: the eager step crashed
-    # instead of falling back to the kernel fold. Real trace-time and memory failures still propagate.
+    # torch 2.6 BackendCompilerFailed on flex must latch and fall back; real trace-time / memory failures propagate.
     import torch._dynamo.exc
     monkeypatch.setattr(sa, "_FAILED", {})
     q = torch.randn(1, 4, 2, 16)
@@ -219,8 +210,7 @@ def test_a_backend_compile_failure_is_latched_not_raised(monkeypatch):
                     reason = "gather runs on datacenter Blackwell only (never ROCm, whose gfx11 reads as 11.x)")
 @pytest.mark.parametrize("form", ["index", "window"])
 def test_gather_compiles_one_variant_set_per_width_bucket(form):
-    # DeepSeek's selection width is min(index_topk, s // ratio): it changes with the length below the cap. The vendored
-    # kernels take TOPK as a constexpr (and a tuner key), so every width compiled and tuned a new variant set.
+    # Width min(index_topk, s // ratio) varies with length; TOPK is a constexpr, so it must be bucketed.
     import triton
     from unsloth_zoo._vendored.attn_gym.sparse.gather_attn.impl.triton import forward
 
@@ -282,8 +272,7 @@ def test_gather_width_bucketing_does_not_recompile_under_dynamic(monkeypatch):
 
 
 def test_torch_path_compiles_once_across_lengths():
-    # The torch path is what T4 (no tensor-core Triton), CPU and ROCm run under torch.compile. Its query-chunk loop
-    # ran over the length, so dynamic=True still specialised on it and recompiled for every new length.
+    # Torch path (T4 / CPU / ROCm): its chunk loop over the length recompiled per length.
     torch._dynamo.reset()
     fn = torch.compile(lambda q, kv, sink, idx: sa.sparse_attn(q, kv, sink, idx, 0.1, backend = "torch"),
                        backend = "eager", fullgraph = True, dynamic = True)

@@ -49,8 +49,7 @@ for fn in steps + steps:
 cuda = torch.cuda.is_available() and torch.version.hip is None and torch.cuda.get_device_capability() >= (8, 0)
 device = "cuda" if cuda else "cpu"
 if not cuda:
-    # No flex on CPU, so nothing to compile but zoo's mask builder (a cold Inductor C++ build, ~10 s): build masks
-    # eagerly; and two threads (the two order workers run side by side), which the bitwise checks compare within.
+    # CPU: eager masks and two threads (bitwise checks compare within one setting).
     import torch._dynamo
     torch._dynamo.config.disable = True
     torch.set_num_threads(min(torch.get_num_threads(), 2))
@@ -87,8 +86,7 @@ def check(family):
         with torch.no_grad():
             return model.to(dtype)(input_ids = ids).logits.float()
 
-    # The first CPU forward can differ from later ones in the last bits (about 6e-5 on MiniMax with 4 threads, even
-    # unpatched); warm it up here so the bitwise check compares the skip path with the reference.
+    # Warm up: the first CPU forward can differ in the last bits even unpatched.
     logits(budget)
     # Within the budget: skip engaged, bitwise equal to the skip-off (upstream indexer) run.
     before = stat("skip_full")

@@ -374,8 +374,7 @@ def test_cuda_all_pad_rows_are_zero_and_finite(monkeypatch, backend, with_sink):
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", backend)
     q, kv, idxs = _all_pad_inputs("cuda", dtype)
     if backend == "flex" and not sa._flex_eligible(q, kv.shape[1]):
-        # Forcing flex where the dispatch never picks it (sm75; T4's 64 KB shared memory at this head dim) only
-        # measures flex_attention's own limits there.
+        # Dispatch never picks flex here (sm75 shared memory).
         pytest.skip("flex is not eligible on this device")
     sink = (torch.randn(16) if with_sink else torch.full((16,), float("-inf"))).cuda()
     q, kv = q.requires_grad_(), kv.requires_grad_()
@@ -464,11 +463,9 @@ print("INTERP_WORST", worst)
 
 @pytest.fixture(scope = "module")
 def _interpreter_run():
-    # Both interpreter scripts in one subprocess (window first: the index script patches _configs at its end): the
-    # process start (torch + unsloth_zoo init, 10-25 s on a loaded host) is paid once, not per test.
+    # One subprocess for both scripts (window first: the index script patches _configs at its end).
     import subprocess, sys
     from pathlib import Path
-    # 4 intra-op threads: the tensors are tiny, and a full-width pool spent ~50 of 58 CPU seconds spinning.
     env = dict(os.environ, PYTHONPATH = str(Path(__file__).resolve().parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", ""),
                CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1", OMP_NUM_THREADS = "4",
                UNSLOTH_ZOO_DISABLE_GPU_INIT = "0")  # "1" swaps in the triton stub: no interpreter
@@ -485,8 +482,6 @@ def _interpreter_worst(proc, tag):
 
 
 def test_triton_kernel_math_in_the_interpreter(_interpreter_run):
-    # The kernel's own arithmetic (tiles, masks, online softmax, atomics, empty rows, heads not a multiple of 16,
-    # more slots than rows) on CPU through TRITON_INTERPRET, against the fp64 reference.
     _interpreter_worst(_interpreter_run, "INTERP_WORST")
 
 

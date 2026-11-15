@@ -703,8 +703,7 @@ def test_attention_inside_torch_compile_matches_eager(monkeypatch, family):
 
         args = (xx, *rope, mask, pos)
         if compiled:
-            # Dynamic in the sequence length only, as a training compile sees it: every input's sequence dims are
-            # symbolic (dynamic = True would also make the hidden / head dims symbolic, 2-3x the trace time).
+            # Dynamic in sequence length only (dynamic=True also makes head dims symbolic: 2-3x trace time).
             fn = torch.compile(fn, fullgraph = True)
             args = tuple(t.detach() if t is not xx else t for t in args)
             for t, dims in zip(args, ((1,), (1,), (1,), (2, 3), (1,))):

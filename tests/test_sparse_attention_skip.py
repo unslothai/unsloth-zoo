@@ -33,9 +33,7 @@ DEVICES = ["cpu"] + (["cuda"] if _REAL_CUDA else [])
 
 @pytest.fixture(autouse=True, scope="module")
 def _eager_masks_and_few_threads():
-    # Nothing here is about torch.compile: the only compiled code these models reach is zoo's mask builder, whose
-    # cold Inductor build (C++ on CPU) cost ~15 s per process. Build masks eagerly, and cap CPU threads, which an
-    # oversubscribed host otherwise spends on contention (the checks are bitwise within one thread setting).
+    # Eager masks (skip the cold Inductor build) and capped threads; bitwise checks stay within one thread setting.
     import torch._dynamo
     threads = torch.get_num_threads()
     torch.set_num_threads(min(threads, 4))

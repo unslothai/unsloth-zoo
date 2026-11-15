@@ -108,8 +108,7 @@ def _gather_fn():
     global _GATHER
     if not _GATHER:   # None (not tried) or False (failed: re-raise the real import error for a forced call)
         from unsloth_zoo._vendored.attn_gym.sparse.gather_attn import gather_attn
-        # The api loads its Triton kernels only on the first call; import them now so a Triton without
-        # constexpr_function (< 3.5: torch 2.4 - 2.8) is found here, not inside a compiled step.
+        # Import kernels now: Triton < 3.5 lacks constexpr_function; fail here, not inside a compiled step.
         import unsloth_zoo._vendored.attn_gym.sparse.gather_attn.impl.triton.backward  # noqa: F401
         import unsloth_zoo._vendored.attn_gym.sparse.gather_attn.impl.triton.forward  # noqa: F401
         _GATHER = gather_attn
@@ -309,8 +308,7 @@ def sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale):
         return torch.einsum("bchk,bckd->bchd", probs, slots).to(q.dtype)
 
     if s <= _TORCH_CHUNK_ELEMS // max(1, k * d * b):
-        # One chunk: no Python loop over the length, which a compiled call (the T4 / CPU / ROCm path) would
-        # specialise on, recompiling for every new length even under dynamic=True.
+        # One chunk: a Python loop over the length recompiles per length even under dynamic=True.
         return block(q, kv_pad, sink, safe, valid)
     # Under autograd each chunk is recomputed in backward, so only one gathered slab is ever live.
     recompute = torch.is_grad_enabled() and any(t.requires_grad for t in (q, kv, attn_sink) if t is not None) and s > chunk
@@ -345,10 +343,8 @@ def _gather_call(q, local_kv, sparse_kv, idxs, attn_sink, softmax_scale, window)
     if heads != h:
         q = torch.cat([q, q.new_zeros((b, s, heads - h, d))], dim = 2)
         sink = torch.cat([sink, sink.new_full((heads - h,), float("-inf"))])
-    # TOPK is a tl.constexpr and a tuner key of the shared-KV kernels (each new width: a new variant set and ~10 s of
-    # tuning on B200). DeepSeek's width follows the length (min(index_topk, s // ratio)): pad it with skipped -1 slots
-    # to the next power of two (at least 16), so a run compiles a handful of buckets. Not while tracing: Dynamo reads a
-    # symbolic width as an int there, and bit_length would guard on every exact width (a recompile per length).
+    # TOPK is a constexpr + tuner key and DeepSeek's width varies with length: pad with -1 slots to a power of two
+    # (>= 16). Eager only: traced, bit_length would guard on every exact width.
     k = idxs.shape[-1]
     if isinstance(k, int) and k and not torch.compiler.is_compiling():
         width = max(16, 1 << (k - 1).bit_length())
@@ -467,9 +463,8 @@ def _run(backend, q, kv, attn_sink, topk_idxs, softmax_scale):
 
 
 def _latch(backend, q, k, error):
-    # Never swallow trace-time, capture or memory failures: the shape class is not at fault. A backend's own compile
-    # failure is (flex compiles flex_attention eagerly; torch 2.6 wraps an Inductor lowering failure for the shape,
-    # e.g. on L4, in BackendCompilerFailed): latch it unless the inner error is a memory failure.
+    # Re-raise trace-time, capture and memory failures; latch a backend's own compile failure (torch 2.6
+    # BackendCompilerFailed) unless its inner error is a memory failure.
     from torch._dynamo.exc import BackendCompilerFailed
     inner = getattr(error, "inner_exception", error) if isinstance(error, BackendCompilerFailed) else error
     if isinstance(inner, torch.OutOfMemoryError) or (inner is error and type(error).__module__.startswith("torch._dynamo")):
