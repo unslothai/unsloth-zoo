@@ -26,4 +26,7 @@ Currently vendored:
   * fla  -  flash-linear-attention (fla-core) 0.5.1, MIT. The minimal
             gated-delta-rule kernel closure used by the Qwen3.5 / Qwen3.6 /
             Qwen3-Next gated-deltanet models.
+  * attn_gym - attention-gym (meta-pytorch) sparse gather attention, BSD-3.
+            The Triton forward + backward closure of gather_attn used by
+            unsloth_zoo.sparse_attention.
 """

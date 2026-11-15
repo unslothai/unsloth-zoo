@@ -15,8 +15,11 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Qwen4Exp (Qwen3.8-Flash-Next) patches: MoE uses the Qwen3.5-MoE grouped-GEMM backend; QSA indexer skips its per-query
-nonzero/topk loop when kv_length < budget + compress_ratio; UNSLOTH_QWEN4_EXP_FAST_QSA=0 disables. The ~102 GB PLE
-n-gram table is streamed from the checkpoint by ``unsloth_zoo.frozen_table_store`` unless UNSLOTH_FROZEN_TABLE=gpu."""
+nonzero/topk loop when kv_length < budget + compress_ratio; UNSLOTH_QWEN4_EXP_FAST_QSA=0 disables. From the budget up
+(training / prefill without a cache), QSA attention selects its blocks vectorised and attends to the selected tokens
+only (``unsloth_zoo.sparse_attention``), instead of a per-query Python loop plus an O(S^2) masked dense attention;
+UNSLOTH_QWEN4_EXP_SPARSE_ATTN=0 disables. The ~102 GB PLE n-gram table is streamed from the checkpoint by
+``unsloth_zoo.frozen_table_store`` unless UNSLOTH_FROZEN_TABLE=gpu."""
 
 __all__ = ["patch_qwen4_exp", "patch_qwen4_exp_frozen_table"]
 
@@ -59,6 +62,119 @@ def qwen4_exp_qsa_indexer_forward(self, hidden_states, position_embeddings, atte
         )
     from unsloth_zoo.temporary_patches.qwen4_exp import _reference_qsa_forward
     return _reference_qsa_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values)
+
+
+_reference_attention_forward = None
+QWEN4_EXP_SPARSE_STATS = {"sparse": 0, "reference": 0}
+
+
+def _sparse_attn_enabled():
+    return os.environ.get("UNSLOTH_QWEN4_EXP_SPARSE_ATTN", "1") != "0"
+
+
+def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, attention_mask, past_key_values, kwargs):
+    """transformers' Qwen4ExpTextAttention.forward (5.22 / 5.23) on the selected tokens only, or None to run it."""
+    indexer = module.indexer
+    # The configured default counts too (transformers resolves output_attentions from the config).
+    output_attentions = kwargs.get("output_attentions")
+    if output_attentions is None:
+        output_attentions = getattr(module.config, "output_attentions", False)
+    if not _sparse_attn_enabled() or output_attentions:
+        return None
+    # Prefill into an empty cache (transformers builds one during training too when use_cache is on) is the same
+    # attention; decode steps and chunked prefill over cached tokens keep the reference.
+    if past_key_values is not None:
+        try:
+            if past_key_values.get_seq_length(module.layer_idx) != 0:
+                return None
+        except Exception:
+            return None
+    # One selection is shared by every head: a per-head mask ([b, h > 1, s, n]) keeps the reference.
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.dim() != 4 or attention_mask.shape[1] != 1:
+        return None
+    seq = hidden_states.shape[1]
+    if attention_mask.shape[-1] != seq or seq < indexer.token_budget + indexer.compress_ratio:
+        return None
+    if module.training and module.attention_dropout:
+        return None
+    import sys
+    from unsloth_zoo.sparse_attention import qsa_select_tokens, sparse_gqa_attn, sparse_gqa_fast_path
+    # No kernel for QSA on this device (T4 / sm75: no flex, Triton without tensor cores): transformers' own path.
+    # Probes have the real [b, h, s, d] shapes (the flex membership-table budget is b * s * s) without allocating.
+    batch = hidden_states.shape[0]
+    point = hidden_states.new_empty(())
+    probe_q = point.expand(batch, module.config.num_attention_heads, seq, module.head_dim)
+    probe_kv = point.expand(batch, module.config.num_key_value_heads, seq, module.head_dim)
+    if not sparse_gqa_fast_path(probe_q, probe_kv, probe_kv):
+        return None
+    rope = getattr(sys.modules.get(type(module).__module__), "apply_rotary_pos_emb", None)
+    if rope is None:   # a subclass defined elsewhere
+        from transformers.models.qwen4_exp import modeling_qwen4_exp
+        rope = modeling_qwen4_exp.apply_rotary_pos_emb
+    position_embeddings = tuple(position_embeddings)
+    with torch.no_grad():
+        selected = qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, rope,
+                                     past_key_values = past_key_values)
+    if selected is None:
+        return None
+
+    cos, sin = (x[:, -seq:, :] for x in position_embeddings)
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, module.head_dim)
+    query_states, gate = torch.chunk(module.q_proj(hidden_states).view(*input_shape, -1, module.head_dim * 2), 2, dim=-1)
+    gate = gate.reshape(*input_shape, -1)
+    query_states = module.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+    key_states = module.k_norm(module.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    value_states = module.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    query_states, key_states = rope(query_states, key_states, cos, sin)
+    # fp32 RoPE tables promote Q / K (4-bit / fp16 projections): back to the projection dtype, which the kernels
+    # take (the compiler's reference rewrite instead upcasts V; the attention math is the same up to rounding).
+    if query_states.dtype != value_states.dtype:
+        query_states = query_states.to(value_states.dtype)
+        key_states = key_states.to(value_states.dtype)
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(key_states, value_states, module.layer_idx)
+    attn_output = sparse_gqa_attn(query_states, key_states, value_states, selected, module.scaling)
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = (attn_output * torch.sigmoid(gate)).to(value_states.dtype)
+    return module.o_proj(attn_output), None
+
+
+def qwen4_exp_attention_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kwargs):
+    # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
+    from unsloth_zoo.temporary_patches.qwen4_exp import (
+        _qwen4_exp_sparse_attention, _reference_attention_forward, QWEN4_EXP_SPARSE_STATS,
+    )
+    out = _qwen4_exp_sparse_attention(self, hidden_states, position_embeddings, attention_mask, past_key_values, kwargs)
+    if out is not None:
+        if not torch.compiler.is_compiling():
+            QWEN4_EXP_SPARSE_STATS["sparse"] += 1
+        return out
+    if not torch.compiler.is_compiling():
+        QWEN4_EXP_SPARSE_STATS["reference"] += 1
+    # fp32 RoPE tables with half-precision projections (4-bit) would promote Q / K but not V after RoPE. The
+    # compiler's rewrites (RoPE tables cast to the activation dtype, V aligned to Q) never reach this reference,
+    # since the class forward it rewrites is this wrapper; cast the tables like its RoPE rewrite does.
+    if (
+        hidden_states.dtype in (torch.float16, torch.bfloat16)
+        and isinstance(position_embeddings, (tuple, list))
+        and len(position_embeddings) == 2
+        and position_embeddings[0].dtype != hidden_states.dtype
+    ):
+        position_embeddings = tuple(x.to(hidden_states.dtype) for x in position_embeddings)
+    return _reference_attention_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values, **kwargs)
+
+
+def _attention_forward_mirrored(function):
+    """The sparse path re-implements q/k/v/gate/o_proj from transformers 5.22 / 5.23: patch only that code."""
+    import inspect
+    try:
+        source = inspect.getsource(function)
+    except (OSError, TypeError):
+        return False
+    markers = ("self.indexer(", "torch.chunk(", "self.head_dim * 2", "self.q_norm(", "self.k_norm(",
+               "apply_rotary_pos_emb(query_states, key_states, cos, sin)", "torch.sigmoid(gate)", "self.o_proj(")
+    return all(m in source for m in markers)
 
 
 _reference_ple_forward = None
@@ -211,6 +327,22 @@ def _patch_qwen4_exp_rest(modeling):
         except Exception as e:
             if UNSLOTH_ENABLE_LOGGING:
                 logger.warning(f"Unsloth: Could not patch Qwen4ExpTextQSAIndexer.forward: {e}")
+
+    global _reference_attention_forward
+    attention_cls = getattr(modeling, "Qwen4ExpTextAttention", None)
+    if (
+        attention_cls is not None
+        and _sparse_attn_enabled()
+        and attention_cls.forward is not qwen4_exp_attention_forward
+        and _is_transformers_indexer_forward(attention_cls.forward)
+        and _attention_forward_mirrored(attention_cls.forward)
+    ):
+        try:
+            _reference_attention_forward = attention_cls.forward
+            attention_cls.forward = qwen4_exp_attention_forward
+        except Exception as e:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(f"Unsloth: Could not patch Qwen4ExpTextAttention.forward: {e}")
 
     global _reference_ple_forward
     ple_cls = getattr(modeling, "Qwen4ExpTextPLELayer", None)
