@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Modeling files whose layers subclass ActivationCheckpointingLayer (the name huggingface/transformers#49249 gives
-GradientCheckpointingLayer) must take the same gradient checkpointing path as the old name (unsloth-zoo#2398)."""
+"""Layers subclassing ActivationCheckpointingLayer (transformers#49249) take the GradientCheckpointingLayer path (unsloth-zoo#2398)."""
 
 import json
 import os
@@ -28,7 +27,6 @@ pytest.importorskip("transformers.models.vit.modeling_vit")
 pytest.importorskip("transformers.models.whisper.modeling_whisper")
 
 
-# The child rewrites only the marker the compiler reads from the modeling file's source, as the upstream rename does.
 _CHILD = r'''
 import contextlib, importlib, inspect, io, json, os, sys
 os.environ["UNSLOTH_COMPILE_LOCATION"] = "unsloth_compiled_cache"
@@ -91,6 +89,5 @@ def test_checkpointing_layer_marker(tmp_path, marker):
     # ViTLayer checkpoints itself, so ViTModel's layer loop must not be wrapped in a second checkpoint.
     assert "def ViTModel_forward(" not in vit["generated"], vit["log"][-3000:]
     assert "Patched ViTModel by adding gradient checkpointing" not in vit["log"]
-    # WhisperDecoder is in FIX_GC_LAYER_CALLER_MODULES and must keep its caller rewrite.
     assert "def WhisperDecoder_forward(" in whisper["generated"], whisper["log"][-3000:]
     assert "with gradient checkpointing" not in whisper["log"], whisper["log"][-3000:]
