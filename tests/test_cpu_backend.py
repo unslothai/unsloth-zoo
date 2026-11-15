@@ -1630,6 +1630,7 @@ def test_cpu_sft_trainer_unpickles_as_the_cpu_class_in_a_fresh_process(monkeypat
     script = "import pickle, sys; c = pickle.load(open(sys.argv[1], 'rb')); print('CPU', getattr(c, '_unsloth_cpu', False))"
     env = dict(os.environ, CUDA_VISIBLE_DEVICES = "")
     env.pop("HF_TOKEN", None)
+    env.pop("UNSLOTH_ALLOW_CPU", None)  # a real driverless host: not conftest's CUDA-shaped spoof (and ~10 s faster)
     done = subprocess.run([sys.executable, "-c", script, str(blob)], capture_output = True, text = True,
                           timeout = 300, env = env, cwd = str(tmp_path))
     assert "CPU True" in done.stdout, (done.stdout[-2000:], done.stderr[-3000:])
