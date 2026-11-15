@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Qwen4Exp's PLE layer must not recompile per sequence length under torch.compile.
-
-Its dilated depthwise short conv went through Inductor's convolution backward, which specializes the exact
-sequence length: every new length recompiled the whole PLE decoder block (the guard report reads "KeyError on
-self.ple" for the other layer kinds' cache entries, then a size mismatch on this one). The traced conv now runs
-as shifted multiply-adds, which stay dynamic; eager keeps nn.Conv1d."""
+"""Qwen4Exp's PLE short conv must not recompile per sequence length: Inductor's conv backward
+specializes the length, so the traced path uses shifted multiply-adds."""
 
 import os
 
@@ -54,7 +50,6 @@ def _ple(device = "cpu", dtype = torch.float32):
 
 
 def _conv_step(fn, ple, length, device, dtype, seed = 0):
-    """The PLE short conv (pad, dilated depthwise conv, silu) forward and backward at one length."""
     g = torch.Generator().manual_seed(seed + length)
     x = torch.randn(2, length, ple.conv1d.in_channels, generator = g, dtype = torch.float64).to(device, dtype)
     x.requires_grad_(True)
