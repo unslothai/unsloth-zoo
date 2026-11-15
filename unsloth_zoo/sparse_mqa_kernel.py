@@ -427,7 +427,7 @@ def sparse_mqa_supported(q, kv):
     if q.dtype not in (torch.float16, torch.bfloat16) or kv.dtype != q.dtype:
         return False
     d = q.shape[-1]
-    if d < 16 or d > 512 or d & (d - 1):
+    if d not in (16, 32, 64, 128, 256, 512):   # not d & (d - 1): torch 2.4 SymInts (dynamic=True) have no &
         return False
     if q.dtype == torch.bfloat16 and torch.cuda.get_device_capability(q.device)[0] < 8:
         return False

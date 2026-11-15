@@ -152,3 +152,19 @@ def test_dispatch_traces_fullgraph_with_env_reads(monkeypatch, form):
         fn = lambda q, kv, sink, idx: sa.sparse_attn_window(q, wkv, kv, idx, sink, 0.25, 4)
     got = torch.compile(fn, backend = "eager", fullgraph = True)(q, kv, sink, idx)
     torch.testing.assert_close(got, fn(q, kv, sink, idx))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8, reason = "bf16 CUDA kernels")
+def test_window_support_check_traces_with_symbolic_head_dim():
+    # dynamic=True makes the head dim a SymInt; torch 2.4 SymInts have no bitwise and, so a power-of-two test
+    # written d & (d - 1) failed every compiled window call there (TorchRuntimeError, Colab L4 torch 2.4.0).
+    from unsloth_zoo import sparse_mqa_kernel as sk
+    torch._dynamo.reset()
+    fn = torch.compile(lambda q, kv: q.sum() if sk.sparse_mqa_window_supported(q, kv) else q.sum() * 0,
+                       backend = "eager", fullgraph = True, dynamic = True)
+    for d in (64, 128):
+        q = torch.randn(1, 8, 16, d, device = "cuda", dtype = torch.bfloat16)
+        kv = torch.randn(1, 8, d, device = "cuda", dtype = torch.bfloat16)
+        assert fn(q, kv).item() == pytest.approx(q.sum().item(), rel = 1e-2)
+    q = torch.randn(1, 8, 16, 48, device = "cuda", dtype = torch.bfloat16)   # not a power of two
+    assert fn(q, torch.randn(1, 8, 48, device = "cuda", dtype = torch.bfloat16)).item() == 0
