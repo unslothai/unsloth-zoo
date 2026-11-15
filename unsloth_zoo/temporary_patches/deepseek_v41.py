@@ -158,8 +158,16 @@ def patch_deepseek_v41_gradient_checkpointing():
             REPLAY_STATS["runs"] += 1
             replay.clear()
             replay.update(snapshot)
-            with _compressor_lora(self):
-                return torch.nn.Module.__call__(self, *inner_args, **inner_kwargs)
+            # transformers 5.23+ checkpoints `forward` itself (GradientCheckpointingLayer wraps it at subclass time):
+            # with the flag left on, the layer would checkpoint a second time inside this one, and its own replay
+            # would not restore the group state.
+            previous = self.gradient_checkpointing
+            self.gradient_checkpointing = False
+            try:
+                with _compressor_lora(self):
+                    return torch.nn.Module.__call__(self, *inner_args, **inner_kwargs)
+            finally:
+                self.gradient_checkpointing = previous
 
         # Non-reentrant, always: the source layer's shared KV tensors leave through `replay`, not through the
         # checkpoint's outputs. A reentrant checkpoint (Unsloth's smart checkpointer forces one) would make them
