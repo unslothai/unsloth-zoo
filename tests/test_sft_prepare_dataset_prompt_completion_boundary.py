@@ -49,7 +49,7 @@ ROWS = [
     # The prompt's trailing space merges with the answer: " two", " สอง".
     {"prompt": "Question: one plus one? Answer: ", "completion": "two"},
     {"prompt": "คำถาม: หนึ่งบวกหนึ่ง คำตอบ: ", "completion": "สอง"},
-    # Controls: the space already sits on the completion side, so nothing merges.
+    # Controls: the space is on the completion side.
     {"prompt": "Question: one plus one? Answer:", "completion": " two"},
     {"prompt": "คำถาม: หนึ่งบวกหนึ่ง คำตอบ:", "completion": " สอง"},
 ]
@@ -115,7 +115,6 @@ def test_answer_is_trained_when_prompt_ends_in_space(tokenizer, streaming):
     texts = _trained_texts(dataset, tokenizer)
     for row, text in zip(ROWS, texts):
         assert text == " " + row["completion"].strip() + EOS, (row, text)
-        # No prompt text leaks into the trained span.
         assert row["prompt"].strip().split()[-1] not in text
 
 

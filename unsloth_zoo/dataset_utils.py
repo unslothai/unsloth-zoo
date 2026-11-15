@@ -2745,8 +2745,7 @@ pass
 
 
 def _prompt_completion_boundary(prompt_ids, pc_ids):
-    # A trailing prompt space merges into the completion ("Answer: " + "two" -> "Answer:", " two"), so the
-    # completion starts where the tokenizations diverge, as in TRL (huggingface/trl#7463).
+    # "Answer: " + "two" tokenizes "Answer:", " two": start where the tokenizations diverge (huggingface/trl#7463).
     n = min(len(prompt_ids), len(pc_ids))
     if pc_ids[:n] == prompt_ids[:n]: return n
     shared = 0
