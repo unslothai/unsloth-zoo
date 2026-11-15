@@ -2256,7 +2256,11 @@ def _gradient_checkpointing_donor(model):
         GradientCheckpointingLayer = None
     from transformers import PreTrainedModel
     # Only the unset PreTrainedModel default: an explicit False (JetMoe, Blip-2) must keep raising.
-    owner = next((k for k in type(model).__mro__ if "supports_gradient_checkpointing" in vars(k)), None)
+    # transformers#49249 declares supports_activation_checkpointing and copies the old name onto every subclass.
+    flag = "supports_activation_checkpointing"
+    if flag not in vars(PreTrainedModel):
+        flag = "supports_gradient_checkpointing"
+    owner = next((k for k in type(model).__mro__ if flag in vars(k)), None)
     if owner is not PreTrainedModel:
         return None
     for name, module in model.named_modules():
@@ -2295,6 +2299,8 @@ def patch_gradient_checkpointing_enable_inherit():
             if donor is not None:
                 # Instance only: the class and its other instances keep False.
                 self.supports_gradient_checkpointing = True
+                # transformers#49249's disable path reads only the new name.
+                self.supports_activation_checkpointing = True
                 logger.info(
                     f"Unsloth: {type(self).__name__} inherits gradient checkpointing support from {donor}."
                 )
