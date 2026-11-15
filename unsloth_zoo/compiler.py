@@ -5245,8 +5245,14 @@ def _patch_lora_input_cast(source, force_float32 = None):
     if not force_float32:
         if "torch.is_autocast_enabled()" in source:
             return source
+        # Single vanilla adapter stays in result's dtype (fp32 copies cost 1.4x time, 5x memory); variants / multi-adapter keep fp32.
+        variant_only = (
+            " and (active_adapter in getattr(self, 'lora_variant', {}) or len(self.active_adapters) > 1)"
+            if "lora_forward(" in source
+            else ""
+        )
         new = (
-            "if not torch.is_autocast_enabled(): "
+            f"if not torch.is_autocast_enabled(){variant_only}: "
             "result, x = "
             "result.to(lora_A.weight.dtype), "
             "x.to(lora_A.weight.dtype)"
