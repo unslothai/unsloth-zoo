@@ -96,11 +96,13 @@ def _checkpoint_dtype(model_name, **kwargs):
     return None
 
 
+# Where composite configs keep the language model's config (and so its quantization_config).
 _SUB_CONFIG_KEYS = ("text_config", "language_config", "llm_config", "decoder", "generator")
 
 
 def _quant_method_of(config):
-    """quant_method of ``config``'s quantization_config (root or language-model sub-config), else None."""
+    """quant_method of the quantization_config in ``config`` (a dict or a PretrainedConfig), at its root or in a
+    language-model sub-config, else None."""
     def field(holder, name):
         return holder.get(name) if isinstance(holder, dict) else getattr(holder, name, None)
 
@@ -119,7 +121,8 @@ def _quant_method_of(config):
 
 
 def _checkpoint_quant_method(model_name, config = None, **kwargs):
-    """quant_method the checkpoint ships, else None; an explicit ``config`` decides, as in the model load."""
+    """quant_method of a quantization_config the checkpoint ships, else None. An explicit ``config`` is what the
+    model load uses, so it decides; ``kwargs`` carry the hub arguments (``subfolder`` included)."""
     if config is not None and not isinstance(config, (str, os.PathLike)):
         return _quant_method_of(config)
     try:
@@ -131,11 +134,16 @@ def _checkpoint_quant_method(model_name, config = None, **kwargs):
     return _quant_method_of(config_dict) if isinstance(config_dict, dict) else None
 
 
+def _is_fp8_dequantize(op):
+    # By type name: transformers.integrations.finegrained_fp8.Fp8Dequantize, without importing that module.
+    return type(op).__name__ == "Fp8Dequantize"
+
+
 def _has_fp8_dequantize_conversion(model):
     """True when a load conversion of ``model`` dequantizes FP8 (transformers' Fp8Dequantize operation)."""
     try:
         return any(
-            type(op).__name__ == "Fp8Dequantize"
+            _is_fp8_dequantize(op)
             for conversion in getattr(model, "_weight_conversions", None) or ()
             for op in getattr(conversion, "operations", None) or ()
         )
@@ -143,18 +151,102 @@ def _has_fp8_dequantize_conversion(model):
         return False
 
 
+def _drop_fp8_dequantize_conversions(model):
+    """Mirror of unsloth.models.loader_utils._drop_fp8_dequantize_conversions (unimportable without Triton)."""
+    conversions = getattr(model, "_weight_conversions", None)
+    if not conversions:
+        return 0
+
+    def _strip(pattern):
+        return pattern[:-1] if pattern.endswith("$") else pattern
+
+    def _targets(conversion):
+        return tuple(_strip(p) for p in getattr(conversion, "_original_target_patterns", None) or [])
+
+    def _sources(patterns):
+        patterns = [_strip(p) for p in patterns or []]
+        return tuple(sorted(p for p in patterns if not p.endswith((".weight_scale_inv", ".activation_scale"))))
+
+    def _source_forms(conversion):
+        return {
+            _sources(getattr(conversion, "_original_source_patterns", None)),
+            _sources(getattr(conversion, "source_patterns", None)),
+        }
+
+    def _ops(conversion):
+        operations = getattr(conversion, "operations", None) or []
+        return tuple(type(op).__name__ for op in operations if not _is_fp8_dequantize(op))
+
+    def _signature(conversion):
+        return (
+            type(conversion),
+            getattr(conversion, "scope_prefix", None),
+            min(_source_forms(conversion)),
+            _targets(conversion),
+            _ops(conversion),
+        )
+
+    def _has_dequant(conversion):
+        return any(_is_fp8_dequantize(op) for op in getattr(conversion, "operations", None) or [])
+
+    plain = None
+    kept, changed = [], 0
+    retained = {_signature(c) for c in conversions if not _has_dequant(c)}
+    for conversion in conversions:
+        operations = getattr(conversion, "operations", None) or []
+        if not _has_dequant(conversion):
+            kept.append(conversion)
+            continue
+        if getattr(getattr(model, "config", None), "quantization_config", None) is None:
+            model._unsloth_fp8_dequantized = True
+        if all(_is_fp8_dequantize(op) for op in operations):
+            changed += 1
+            continue
+        if plain is None:
+            try:
+                from transformers.conversion_mapping import get_model_conversion_mapping
+
+                plain = get_model_conversion_mapping(model, None, None)
+            except Exception:
+                plain = []
+        # Dequantization can lose scope_prefix; restore every matching scoped counterpart.
+        scope = getattr(conversion, "scope_prefix", None)
+        sources = _source_forms(conversion)
+        matches = [
+            c
+            for c in plain
+            if type(c) is type(conversion)
+            and _targets(c) == _targets(conversion)
+            and _source_forms(c) & sources
+            and _ops(c) == _ops(conversion)
+            and (scope is None or getattr(c, "scope_prefix", None) == scope)
+        ]
+        if not matches:
+            _print(
+                "an fp8 load conversion has no 16bit counterpart; a merged save may write fp8 weights for "
+                f"{list(_targets(conversion))}."
+            )
+            kept.append(conversion)
+            continue
+        for match in matches:
+            signature = _signature(match)
+            if signature not in retained:
+                retained.add(signature)
+                kept.append(match)
+        changed += 1
+    if changed:
+        model._weight_conversions = kept
+    return changed
+
+
 def _drop_reverse_fp8_conversions(model):
-    """Drop Fp8Dequantize conversions, which a merged save would reverse into FP8 bytes without metadata.
-    Only a model carrying one imports the helper: unsloth.models pulls in the GPU stack."""
+    """Drop kept Fp8Dequantize conversions, which a merged save reverses into FP8 bytes without FP8 metadata."""
     if not _has_fp8_dequantize_conversion(model):
         return 0
     try:
-        from unsloth.models.loader_utils import _drop_fp8_dequantize_conversions
-    except Exception:
-        return 0
-    try:
-        return _drop_fp8_dequantize_conversions(model) or 0
-    except Exception:
+        return _drop_fp8_dequantize_conversions(model)
+    except Exception as error:
+        _print(f"could not drop the reverse fp8 conversions ({error}); a merged save may write fp8 weights.")
         return 0
 
 
@@ -330,10 +422,11 @@ class FastCPUModel:
             # A subfolder locates the adapter inside its repo, not the base model.
             kwargs.pop("subfolder", None)
             _print(f"{adapter_name} is a LoRA adapter; loading its base {model_name} first.")
-        # An explicit config= decides, else the checkpoint's (in its subfolder).
+        # The config the model load reads: an explicit config= decides, else the checkpoint's (in its subfolder).
         probe_kwargs = dict(hub_kwargs, **({"subfolder": kwargs["subfolder"]} if kwargs.get("subfolder") else {}))
         if use_4bit:
-            # Another quantization method keeps its config: transformers refuses BitsAndBytesConfig on top.
+            # A checkpoint quantized with another method (fp8, compressed-tensors, mxfp4) keeps its own config, as
+            # on GPU: transformers refuses a BitsAndBytesConfig on top of it.
             quant_method = _checkpoint_quant_method(
                 model_name, config = kwargs.get("config"), token = token, revision = revision, **probe_kwargs,
             )
