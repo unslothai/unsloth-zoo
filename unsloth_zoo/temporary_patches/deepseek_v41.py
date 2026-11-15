@@ -110,6 +110,45 @@ class _ReplayShared(dict):
     __slots__ = ("_snapshot",)
 
 
+def _warm_triton_moe_configs(layer, hidden_states):
+    """Unsloth's Triton MoE backend tunes its kernel configs on an experts module's first forward. Inside a
+    torch.compile region that first call graph-breaks at the (compiler-disabled) tuner and later calls do not, so the
+    non-reentrant checkpoint's recompute traced a different graph than its forward and its saved tensors did not
+    match ("Recomputed values ... have different metadata"). One eager token through the experts before the first
+    checkpointed forward settles the configs, so both passes trace the same graph."""
+    if torch.compiler.is_compiling():
+        return
+    mlp = getattr(layer, "mlp", None)
+    experts = getattr(mlp, "experts", None)
+    while experts is not None and hasattr(experts, "base_layer"):
+        experts = experts.base_layer
+    if (
+        experts is None
+        or not getattr(type(experts), "_unsloth_already_patched", False)
+        or getattr(experts, "_unsloth_moe_configs", None) is not None
+        or getattr(experts, "_unsloth_moe_configs_warmed", False)
+    ):
+        return
+    experts._unsloth_moe_configs_warmed = True
+    try:
+        from unsloth_zoo.temporary_patches.moe_utils import get_forward_moe_backend
+
+        backend = get_forward_moe_backend().__globals__
+        if backend["select_moe_backend"]() != "unsloth_triton":
+            return
+        weight = experts.gate_up_proj
+        top_k = int(getattr(getattr(mlp, "gate", None), "top_k", 1))
+        dtype = hidden_states.dtype if isinstance(hidden_states, torch.Tensor) else weight.dtype
+        x = torch.zeros(1, int(experts.hidden_dim), device = weight.device, dtype = dtype)
+        index = torch.zeros(1, top_k, device = weight.device, dtype = torch.long)
+        with torch.no_grad():
+            backend["forward_triton_grouped_gemm"](experts, x, index, torch.zeros(1, top_k, device = weight.device))
+    except Exception:
+        # Not ours to fail the step over: the first traced call then tunes as before.
+        pass
+pass
+
+
 def patch_deepseek_v41_gradient_checkpointing():
     modeling = _modeling()
     if modeling is None:
@@ -139,6 +178,7 @@ def patch_deepseek_v41_gradient_checkpointing():
         if not (self.gradient_checkpointing and self.training) or shared is None or not stateful:
             with _compressor_lora(self):
                 return base_call(self, *args, **kwargs)
+        _warm_triton_moe_configs(self, args[0] if args else kwargs.get("hidden_states"))
         snapshot = dict(shared.items())
         if isinstance(shared, dict):
             replay = _ReplayShared(shared)
@@ -170,7 +210,7 @@ def patch_deepseek_v41_gradient_checkpointing():
         # Non-reentrant, always: the source layer's shared KV tensors leave through `replay`, not through the
         # checkpoint's outputs. A reentrant checkpoint (Unsloth's smart checkpointer forces one) would make them
         # under no_grad, and the layers that read them would send their source projections no gradient.
-        out = _non_reentrant_checkpoint()(partial(run, **kwargs), *args, use_reentrant = False)
+        out = _non_reentrant_checkpoint(self)(partial(run, **kwargs), *args, use_reentrant = False)
         shared.clear()
         shared.update(replay)
         return out
@@ -190,9 +230,15 @@ pass
 TEMPORARY_PATCHES.append(patch_deepseek_v41_gradient_checkpointing)
 
 
-def _non_reentrant_checkpoint():
-    """torch's own checkpoint, also when Unsloth's smart checkpointing replaced torch.utils.checkpoint.checkpoint."""
+def _non_reentrant_checkpoint(layer = None):
+    """The non-reentrant checkpoint for this layer: Unsloth's wrapper when the model bound one (it offloads the saved
+    inputs for use_gradient_checkpointing = "unsloth" and forces use_reentrant = False), else torch's own, also when
+    Unsloth's smart (reentrant) checkpointing replaced torch.utils.checkpoint.checkpoint."""
     import torch.utils.checkpoint as ckpt
+    bound = getattr(layer, "_gradient_checkpointing_func", None) or ckpt.checkpoint
+    bound = getattr(bound, "func", bound)  # functools.partial(checkpoint, **gradient_checkpointing_kwargs)
+    if hasattr(bound, "_unsloth_offloads"):
+        return bound
     return (getattr(ckpt, "_unsloth_pristine_checkpoint", None) or getattr(ckpt, "_old_checkpoint", None)
             or ckpt.checkpoint)
 
