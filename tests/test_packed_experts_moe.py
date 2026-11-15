@@ -217,3 +217,59 @@ def test_full_save_writes_dense_experts(tmp_path):
         assert torch.equal(weight, param.dequantize())
     assert model.experts.gate_up_proj is gate_up and model.experts.down_proj is down
 
+
+class _GptOssLayoutExperts(_QwenExperts):
+    """(E, K, N) stacks (contraction on dim 1), as gpt-oss stores them."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self._unsloth_grouped_mm_format = True
+
+
+@pytest.mark.parametrize("fmt", ["nvfp4", "mxfp4"])
+@pytest.mark.parametrize("layout", ["qwen", "gpt_oss"])
+def test_load_time_rtn_quantizes_along_the_contraction_dim(grouped_mm_device, fmt, layout):
+    from unsloth_zoo.mxfp4_dequant import Mxfp4ExpertParam
+    E, H, I = 4, 128, 64
+    g = torch.Generator().manual_seed(3)
+    if layout == "qwen":
+        gu = torch.randn(E, 2 * I, H, generator = g) * 0.05
+        dn = torch.randn(E, H, I, generator = g) * 0.05
+        cls = _QwenExperts
+    else:
+        gu = torch.randn(E, H, 2 * I, generator = g) * 0.05
+        dn = torch.randn(E, I, H, generator = g) * 0.05
+        cls = _GptOssLayoutExperts
+    dtype = torch.bfloat16
+    model = _Block(cls(nn.Parameter(gu.to(dtype), requires_grad = False), nn.Parameter(dn.to(dtype), requires_grad = False),
+                       E, H, I)).to(grouped_mm_device)
+    ref = _Block(cls(nn.Parameter(gu.to(dtype), requires_grad = False), nn.Parameter(dn.to(dtype), requires_grad = False),
+                     E, H, I)).to(grouped_mm_device)
+    assert pe.quantize_moe_expert_stacks(model, fmt) == 2
+    for name, dense in (("gate_up_proj", gu), ("down_proj", dn)):
+        param = model.experts._parameters[name]
+        assert isinstance(param, Nvfp4ExpertParam if fmt == "nvfp4" else Mxfp4ExpertParam)
+        assert tuple(param._original_shape) == tuple(dense.shape)
+        transposed = param.packed_transposed if fmt == "nvfp4" else param.mxfp4_transposed
+        assert transposed == (layout == "gpt_oss")
+        back = param.dequantize(torch.float32).cpu()
+        assert float((back - dense).norm() / dense.norm()) < 0.16
+    # Nothing left to quantize, and the quantized model still runs close to the 16-bit one.
+    assert pe.quantize_moe_expert_stacks(model, fmt) == 0
+    x, idx, w = _route(grouped_mm_device, hidden = H)
+    with torch.no_grad():
+        out, want = model(x, idx, w).float(), ref(x, idx, w).float()
+    assert float((out - want).norm() / want.norm()) < 0.25
+
+
+def test_rtn_env_parsing(monkeypatch):
+    monkeypatch.delenv(pe.EXPERTS_QUANTIZE_ENV, raising = False)
+    assert pe.experts_quantize_format() is None
+    for off in ("0", "off", ""):
+        monkeypatch.setenv(pe.EXPERTS_QUANTIZE_ENV, off)
+        assert pe.experts_quantize_format() is None
+    monkeypatch.setenv(pe.EXPERTS_QUANTIZE_ENV, "NVFP4")
+    assert pe.experts_quantize_format() == "nvfp4"
+    monkeypatch.setenv(pe.EXPERTS_QUANTIZE_ENV, "int3")
+    with pytest.raises(ValueError):
+        pe.experts_quantize_format()

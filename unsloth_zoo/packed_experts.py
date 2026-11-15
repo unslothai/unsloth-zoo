@@ -702,3 +702,136 @@ def quantize_experts_mxfp8(rows, dtype = torch.bfloat16, transposed = False, chu
         scales[e0:e1] = (e + 127).to(torch.uint8)
     return Mxfp8ExpertParam(codes, packed_scales = scales, packed_transposed = transposed, packed_dtype = dtype)
 
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Model-level helpers: find fused 3-D expert stacks, quantize them at load (opt-in), or install checkpoint stacks.
+# ---------------------------------------------------------------------------------------------------------------------
+
+EXPERTS_QUANTIZE_ENV = "UNSLOTH_MOE_EXPERTS_QUANTIZE"
+EXPERTS_QUANTIZE_FORMATS = ("nvfp4", "mxfp4", "nf4")
+_STACK_NAMES = (("gate_up_proj", "gate_up"), ("down_proj", "down"))
+
+
+def experts_quantize_format():
+    """UNSLOTH_MOE_EXPERTS_QUANTIZE = nvfp4 | mxfp4 | nf4 (off when unset / 0): RTN of 16-bit routed-expert stacks."""
+    value = os.environ.get(EXPERTS_QUANTIZE_ENV, "").strip().lower()
+    if value in ("", "0", "off", "false", "none", "no"):
+        return None
+    if value not in EXPERTS_QUANTIZE_FORMATS:
+        raise ValueError(
+            f"Unsloth: {EXPERTS_QUANTIZE_ENV}={value!r} is not one of {', '.join(EXPERTS_QUANTIZE_FORMATS)}"
+        )
+    return value
+
+
+def stack_rows_are_transposed(experts, name, proj_type, param = None):
+    """True when the module's stack is (E, K, N) (contraction on dim 1, gpt-oss), False for (E, N, K) (F.linear,
+    Qwen / Mixtral), None when the layout cannot be told."""
+    from unsloth_zoo.temporary_patches.moe_utils import preprocess_weight
+    param = getattr(experts, name, None) if param is None else param
+    shape = tuple(getattr(param, "_original_shape", None) or param.shape)
+    hidden = getattr(experts, "hidden_dim", None) or getattr(experts, "hidden_size", None)
+    if hidden is None:
+        down = getattr(experts, "down_proj", None)
+        dshape = tuple(getattr(down, "_original_shape", None) or down.shape)
+        hidden = dshape[1] if proj_type == "down" else None
+        if hidden is None:
+            return None
+    meta = torch.empty(shape, device = "meta")
+    try:
+        weight = preprocess_weight(meta, proj_type, int(hidden), getattr(experts, "_unsloth_model_type", None),
+                                   experts_module = experts)
+    except Exception:
+        return None
+    if weight is meta or (weight.shape == meta.shape and weight.stride() == meta.stride()):
+        return True
+    flipped = meta.transpose(-2, -1)
+    if weight.shape == flipped.shape and weight.stride() == flipped.stride():
+        return False
+    return None
+
+
+def iter_dense_expert_stacks(model):
+    """(module name, experts module) for every module holding 3-D 16 / 32-bit gate_up_proj and down_proj stacks."""
+    for name, module in model.named_modules():
+        params = module._parameters
+        stacks = [params.get(n) for n, _ in _STACK_NAMES]
+        if any(p is None for p in stacks):
+            continue
+        if all(
+            type(p) is torch.nn.Parameter and p.dim() == 3 and p.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and p.device.type != "meta"
+            for p in stacks
+        ):
+            yield name, module
+
+
+def _quantize_nf4_stack(value, dtype, module):
+    from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import _make_expert_params4bit
+    p = _make_expert_params4bit(
+        value.to(dtype).contiguous(), requires_grad = False, blocksize = 64, quant_type = "nf4",
+        compress_statistics = False, quant_storage = torch.uint8, module = module,
+    )
+    p._original_shape = value.shape
+    return p
+
+
+def quantize_moe_expert_stacks(model, fmt, dtype = None):
+    """Round-to-nearest quantize every frozen 16-bit routed-expert stack in place (opt-in, load time).
+
+    NVFP4 / MXFP4 quantize along each stack's contraction dim (one global scale per expert for NVFP4); NF4 uses the
+    bitsandbytes 4-bit expert path. Returns the number of stacks replaced; layouts that cannot be told are left
+    alone."""
+    if fmt not in EXPERTS_QUANTIZE_FORMATS:
+        raise ValueError(f"Unsloth: unknown expert quantization {fmt!r}")
+    replaced = 0
+    for _, experts in list(iter_dense_expert_stacks(model)):
+        plan = []
+        for name, proj in _STACK_NAMES:
+            param = experts._parameters[name]
+            if param.requires_grad and getattr(param, "_unsloth_trainable", False):
+                plan = []
+                break
+            transposed = stack_rows_are_transposed(experts, name, proj)
+            if transposed is None:
+                plan = []
+                break
+            plan.append((name, param, transposed))
+        if not plan:
+            continue
+        if fmt == "nf4" and not plan[0][1].is_cuda:
+            continue   # bitsandbytes quantizes on the GPU
+        if fmt != "nf4":
+            mult = 16 if fmt == "nvfp4" else 32
+            if any((p.shape[-2] if t else p.shape[-1]) % mult for _, p, t in plan):
+                continue
+        new = {}
+        with torch.no_grad():
+            for name, param, transposed in plan:
+                compute = dtype or param.dtype
+                if fmt == "nf4":
+                    new[name] = _quantize_nf4_stack(param.data, compute, experts)
+                    continue
+                rows = param.data.transpose(-2, -1) if transposed else param.data
+                quantize = quantize_experts_nvfp4 if fmt == "nvfp4" else quantize_experts_mxfp4
+                new[name] = quantize(rows, compute, transposed = transposed)
+        for name, value in new.items():
+            experts._parameters[name] = value
+        if fmt == "nf4":
+            try:
+                from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import _route_generic_bnb4bit_experts_class
+                _route_generic_bnb4bit_experts_class(experts)
+            except Exception:
+                pass
+        replaced += len(new)
+    return replaced
+
+
+def packed_expert_memory(model):
+    """{format: bytes} of the packed expert stacks in ``model`` (diagnostics / tests)."""
+    out = {}
+    for module in model.modules():
+        for param in module._parameters.values():
+            if isinstance(param, _PackedExpertParam):
+                out[param.packed_format] = out.get(param.packed_format, 0) + param.nbytes_packed()
+    return out
