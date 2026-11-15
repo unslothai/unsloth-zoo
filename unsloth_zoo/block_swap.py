@@ -430,6 +430,12 @@ def _autograd_keeps_weights():
     return True
 
 
+def _graph_task_id():
+    """Id of the backward running on this thread, -1 outside one (or on a torch without the query)."""
+    get = getattr(torch._C, "_current_graph_task_id", None)
+    return get() if get is not None else -1
+
+
 def _swappable(module):
     kept = {id(p) for m in module.modules() if getattr(m, "_unsloth_host_kept", False) for p in m.parameters()}
     out = []
@@ -617,6 +623,8 @@ class BlockSwap:
         self.pos = {li: k for k, li in enumerate(self.indices)}
         self.start = self.indices[0] if self.indices else len(layers)
         self._input_hooked = [False] * len(self.indices)
+        # Graph task a grad-on forward of each block ran in (-1: not inside a backward).
+        self._forward_task = [-1] * len(self.indices)
         self.spans_devices, self.layer_device = False, None
         if not self.indices:
             # Still a host session (with nothing pending): other local ranks then read this rank as done with it,
@@ -928,6 +936,7 @@ class BlockSwap:
             if torch.is_grad_enabled() and isinstance(x, torch.Tensor) and x.requires_grad:
                 x.register_hook(self._bwd(i))
                 hooked = True
+                self._forward_task[i] = _graph_task_id()
             self._input_hooked[i] = hooked
             return moved
         return _opaque(hook)
@@ -964,7 +973,18 @@ class BlockSwap:
         def hook(grad):
             if self._auto and not self._settled:
                 self._note_block_peak(self.blocks[i])
-            self._release(self.blocks[i])
+            # A reentrant checkpoint recomputes the block inside the outer backward and runs its backward as an inner
+            # one. The input's grad can land there before a branch that never reaches the input (one fed by the token
+            # ids only, e.g. Qwen4Exp's per-layer n-gram keys into an adapter) has read its frozen weights: release
+            # once that inner backward is done, not mid-way.
+            task = _graph_task_id()
+            if grad is not None and task != -1 and self._forward_task[i] not in (-1, task):
+                try:
+                    torch.autograd.Variable._execution_engine.queue_callback(lambda: self._release(self.blocks[i]))
+                except RuntimeError:
+                    self._release(self.blocks[i])
+            else:
+                self._release(self.blocks[i])
             # The output's grad hook already queued the step end from the outer graph (see _output_peak). Without
             # one (a bare layer list), queue it here, once: a non-reentrant checkpoint hooks the same input in the
             # forward and again in the recompute, so this runs twice per backward.

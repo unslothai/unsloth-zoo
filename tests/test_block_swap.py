@@ -76,6 +76,7 @@ def _scheduler(n, depth = 2, sigs = None, start = 0):
     sw.indices = list(range(start, start + n))
     sw.pos = {li: k for k, li in enumerate(sw.indices)}
     sw._input_hooked = [False] * n
+    sw._forward_task = [-1] * n
     sw._grew = False
     sw._new_slot = lambda sig: object()
     for b in sw.blocks:
@@ -630,6 +631,55 @@ def test_cross_fed_tensor_grads_are_bitwise_with_swap():
             assert all(torch.equal(a, b) for a, b in zip(ref, got)), (mode, idx)
             # Released after backward except the next step's first blocks.
             assert live == 1, (mode, idx, live)
+
+
+class _IdsBranchBlock(nn.Module):
+    """A block with a branch fed only by a no-grad input (per-layer token-id embeddings, as Qwen4Exp's PLE keys or
+    Gemma-3n's per-layer inputs): its backward reads the frozen norm weight `n` (saved as the parameter itself, as an
+    RMSNorm's is) to reach the adapter `lora_k`, never the block input."""
+
+    def __init__(self, d):
+        super().__init__()
+        self.w = nn.Linear(d, d, bias = False).requires_grad_(False)
+        self.k = nn.Linear(d, d, bias = False).requires_grad_(False)
+        self.n = nn.Parameter(torch.rand(d) + 0.5, requires_grad = False)
+        self.lora = nn.Parameter(torch.randn(d, d) * 0.01)
+        self.lora_k = nn.Parameter(torch.randn(d, d) * 0.01)
+
+    def forward(self, x, ids_emb):
+        key = (self.k(ids_emb) + ids_emb @ self.lora_k) * self.n
+        return x + torch.tanh(self.w(x) + x @ self.lora) * torch.sigmoid(key)
+
+
+def test_reentrant_recompute_keeps_weights_until_the_whole_block_backward_ran():
+    # The input's grad lands before the ids-only branch's backward has read `n`: releasing the block right there left
+    # that backward reading an evicted weight (eager Qwen4Exp + offload_layers: illegal memory access).
+    if not torch.cuda.is_available():
+        __import__("pytest").skip("needs CUDA")
+    import torch.utils.checkpoint as cp
+    torch.manual_seed(0)
+    blocks = nn.ModuleList([_IdsBranchBlock(128) for _ in range(4)]).cuda()
+
+    def run(swap):
+        torch.manual_seed(1)
+        x = torch.randn(4, 128, device = "cuda", requires_grad = True)
+        ids_emb = torch.randn(4, 128, device = "cuda")
+        sw = BlockSwap(blocks, [1, 3], prefetch_depth = 1, device = "cuda") if swap else None
+        for b in blocks:
+            b.lora.grad = b.lora_k.grad = None
+        h = x
+        for b in blocks:
+            h = cp.checkpoint(b, h, ids_emb, use_reentrant = True)
+        h.square().sum().backward()
+        torch.cuda.synchronize()
+        out = [x.grad.clone()] + [g.clone() for b in blocks for g in (b.lora.grad, b.lora_k.grad)]
+        if sw is not None:
+            sw.remove()
+        return out
+
+    ref = run(False)
+    got = run(True)
+    assert all(torch.equal(a, b) for a, b in zip(ref, got))
 
 
 def test_block_without_grad_input_is_released_after_backward():
