@@ -1128,9 +1128,15 @@ class BlockSwap:
             h.remove()
         self.handles = []
         for m in list(getattr(self, "_ckpt_wrapped", ())):
-            fn = m.__dict__.get("_gradient_checkpointing_func")
-            if getattr(fn, "_unsloth_block_swap", None) is self:
+            parent, fn = None, m.__dict__.get("_gradient_checkpointing_func")
+            while fn is not None and getattr(fn, "_unsloth_block_swap", None) is not self:
+                parent, fn = fn, getattr(fn, "_unsloth_replay_checkpoint", None)   # under routing replay
+            if fn is None:
+                continue
+            if parent is None:
                 m._gradient_checkpointing_func = fn.__wrapped__
+            else:
+                parent._unsloth_replay_checkpoint = fn.__wrapped__
         self._ckpt_wrapped = weakref.WeakSet()
         # Free the pool first, else the restore can OOM.
         self.free = {}

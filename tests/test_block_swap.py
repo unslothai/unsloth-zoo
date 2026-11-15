@@ -2632,3 +2632,17 @@ def test_checkpoint_wrap_does_not_stack_under_routing_replay():
         assert (swaps, replays) == (1, 1), (order, swaps, replays)
         sw.remove()
         layers, sw = _ckpt_in_forward_model(3, False)
+
+
+def test_remove_unwraps_a_swap_wrapper_under_routing_replay():
+    # remove() must detach the swap wrapper even when routing replay wrapped it, keeping replay's wrapper.
+    from unsloth_zoo.routing_replay import _wrap_checkpoint_funcs
+    layers, sw = _ckpt_in_forward_model(3, False)
+    orig = layers[0]._gradient_checkpointing_func
+    layers[0](torch.ones(2, 4, requires_grad = True))
+    _wrap_checkpoint_funcs([(0, layers[0])])
+    outer = layers[0]._gradient_checkpointing_func
+    assert type(outer).__name__ == "_RecordingCheckpoint"
+    sw.remove()
+    assert layers[0]._gradient_checkpointing_func is outer and outer._unsloth_replay_checkpoint is orig
+    layers[0](torch.ones(2, 4, requires_grad = True)).sum().backward()   # no stale swap controller runs
