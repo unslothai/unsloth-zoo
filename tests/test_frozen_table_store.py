@@ -1222,3 +1222,20 @@ def test_provenance_reads_the_hub_repo_and_revision_from_a_windows_path():
     """Finding 22: a provenance written on Windows (or a Windows path read on POSIX) names the same snapshot."""
     path = r"C:\Users\me\.cache\huggingface\hub\models--org--Some-Model\snapshots\abc123\model-00001.safetensors"
     assert fts._hub_identity(path) == ("org/Some-Model", "abc123")
+
+
+@pytest.mark.parametrize("kind", [classmethod, staticmethod], ids=["classmethod", "staticmethod"])
+def test_load_hook_keeps_the_markers_of_patches_below_it(monkeypatch, kind):
+    from transformers.modeling_utils import PreTrainedModel
+
+    def _load_pretrained_model(*args, **kwargs):
+        return "loaded"
+
+    _load_pretrained_model._some_patch_marker = True
+    monkeypatch.setattr(PreTrainedModel, "_load_pretrained_model", kind(_load_pretrained_model))
+    monkeypatch.setattr(fts, "_LOAD_HOOK_INSTALLED", [False])
+    monkeypatch.setattr(fts, "_install_save_guard", lambda cls: None)
+    assert fts.install_frozen_table_load_hook()
+    hooked = PreTrainedModel.__dict__["_load_pretrained_model"].__func__
+    assert hooked._unsloth_frozen_table_hook and hooked.__wrapped__ is _load_pretrained_model
+    assert getattr(hooked, "_some_patch_marker", False)

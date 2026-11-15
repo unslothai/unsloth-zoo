@@ -1481,12 +1481,15 @@ def install_frozen_table_load_hook() -> bool:
                 )
             bind_frozen_tables(model, list(checkpoint_files), quantizer=quantizer)
 
+    # functools.wraps: keep the markers of patches below this one (and __wrapped__) visible on the wrapper.
     if is_classmethod:
+        @functools.wraps(original_fn)
         def _load_pretrained_model(cls, model, state_dict, checkpoint_files, *args, **kwargs):
             result = original_fn(cls, model, state_dict, checkpoint_files, *args, **kwargs)
             _bind_after_load(model, checkpoint_files, kwargs.get("hf_quantizer"))
             return result
     else:
+        @functools.wraps(original_fn)
         def _load_pretrained_model(model, state_dict, checkpoint_files, load_config, *args, **kwargs):
             result = original_fn(model, state_dict, checkpoint_files, load_config, *args, **kwargs)
             _bind_after_load(model, checkpoint_files, getattr(load_config, "hf_quantizer", None))
@@ -1555,6 +1558,4 @@ def _install_save_guard(PreTrainedModel):
             return original(self, save_directory, *args, **kwargs)
 
     save_pretrained._unsloth_frozen_table_guard = True
-    save_pretrained.__wrapped__ = original
-    save_pretrained.__doc__ = original.__doc__
     PreTrainedModel.save_pretrained = save_pretrained
