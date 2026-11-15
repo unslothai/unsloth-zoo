@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Rewritten PEFT LoRA Linear forward without autocast, bf16 base + fp32 adapters (FastModel 16-bit LoRA):
-vanilla LoRA stays in bf16 (fp32 copies of x / result cost 1.4x step time, 5x memory); DoRA still gets fp32."""
+"""No-autocast rewritten LoRA forward: vanilla LoRA stays bf16, DoRA still gets fp32."""
 
 from __future__ import annotations
 
@@ -36,7 +35,6 @@ def _rewritten_forward():
     source = inspect.getsource(LoraLinear.forward)
     spaces = source.find("def")
     source = "\n".join(line[spaces:] for line in source.split("\n"))
-    # Same order as patch_lora_forwards.
     source = compiler._patch_lora_update(source).replace("def forward", "def unsloth_forward", 1)
     source = compiler._patch_lora_input_cast(source, force_float32 = False)
     source = source.replace("self._check_forward_args(x, *args, **kwargs)", "")
@@ -75,7 +73,7 @@ def test_vanilla_lora_without_autocast_saves_no_fp32_activation():
     assert layer.lora_A["default"].weight.grad.dtype == torch.float32
     assert layer.lora_B["default"].weight.grad.abs().sum() > 0
 
-    # Same numbers as the bf16 LoRA reference (what the autocast path computes).
+    # bf16 reference, as the autocast path computes.
     A = layer.lora_A["default"].weight.to(torch.bfloat16)
     B = layer.lora_B["default"].weight.to(torch.bfloat16)
     base = x.detach() @ layer.base_layer.weight.t()

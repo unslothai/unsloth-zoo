@@ -5245,9 +5245,7 @@ def _patch_lora_input_cast(source, force_float32 = None):
     if not force_float32:
         if "torch.is_autocast_enabled()" in source:
             return source
-        # One vanilla adapter (lora_forward, one addmm rounding) runs in result's dtype, as under autocast:
-        # fp32 copies of result and x cost FastModel's no-autocast loop 1.4x time and 5x memory. Variants
-        # take x directly; several adapters sum in fp32 before the final cast.
+        # Single vanilla adapter stays in result's dtype (fp32 copies cost 1.4x time, 5x memory); variants / multi-adapter keep fp32.
         variant_only = (
             " and (active_adapter in getattr(self, 'lora_variant', {}) or len(self.active_adapters) > 1)"
             if "lora_forward(" in source
