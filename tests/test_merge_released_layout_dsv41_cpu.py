@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""merged_16bit on a DeepSeek-V4.1 released-layout checkpoint (no `model.` prefix, `attn.wq_a`, `ffn.experts.<e>.w1`)
-must place every adapter Unsloth's native model holds (`model.layers.0.self_attn.q_a_proj`, stacked experts). The
-model class states its renames in `_unsloth_checkpoint_conversion_mapping`; without them only the names both
-layouts share were merged and every other delta was dropped silently."""
+"""merged_16bit on a DeepSeek-V4.1 released-layout checkpoint must place every native adapter; before, only names
+both layouts share were merged and other deltas were dropped silently."""
 
 from __future__ import annotations
 

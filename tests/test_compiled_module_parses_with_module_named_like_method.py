@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""End to end: the generated unsloth_compiled_module must parse when the modeling file imports a module whose
-name a forward also calls as a method. DeepSeek-V4.1's native modeling did `import copy` and called
-`state.copy()`; the compiler took `copy` for a local function and pasted the stdlib module's source (its docstring
-first) into the generated file, a SyntaxError on every load (line 1138 / 1149 depending on the tree)."""
+"""The compiled module must parse when modeling does `import copy` and calls `state.copy()`: the compiler
+pasted the stdlib module's source into the generated file (SyntaxError)."""
 
 import ast
 import json
