@@ -2745,14 +2745,8 @@ pass
 
 
 def _prompt_completion_boundary(prompt_ids, pc_ids):
-    """Index in `pc_ids` where the completion starts.
-
-    A prompt that ends in whitespace merges with the completion's first token in
-    byte-level BPE ("Answer: " + "two" tokenizes "Answer:", " two"), so the
-    prompt's own last token never appears in the joined ids and `len(prompt_ids)`
-    points one token past the start of the answer. The completion starts where
-    the two tokenizations diverge, as in TRL's SFTTrainer (huggingface/trl#7463).
-    """
+    # A trailing prompt space merges into the completion ("Answer: " + "two" -> "Answer:", " two"), so the
+    # completion starts where the tokenizations diverge, as in TRL (huggingface/trl#7463).
     n = min(len(prompt_ids), len(pc_ids))
     if pc_ids[:n] == prompt_ids[:n]: return n
     shared = 0

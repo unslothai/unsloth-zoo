@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Prompt/completion rows whose prompt ends in whitespace: byte-level BPE merges that space into the completion's
-first token, so masking `len(tokenize(prompt))` tokens hid the start of the answer (a one-word answer was not
-trained at all). The completion now starts where the two tokenizations diverge, as in TRL's SFTTrainer."""
+"""A prompt ending in whitespace merges into the completion's first token; the completion must start where the tokenizations diverge."""
 
 import pytest
 from datasets import Dataset, IterableDataset
