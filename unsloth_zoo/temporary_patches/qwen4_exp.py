@@ -282,6 +282,68 @@ def _ngram_table_wanted(num_embeddings, embedding_dim, dtype):
     return resolve_frozen_table_mode(nbytes) != "gpu"
 
 
+def _ple_dynamic_conv_enabled():
+    return os.environ.get("UNSLOTH_QWEN4_EXP_PLE_DYNAMIC_CONV", "1") != "0"
+
+
+def dilated_depthwise_conv1d(x, weight, bias, dilation):
+    """Depthwise Conv1d (no padding, stride 1) as shifted multiply-adds, accumulated in at least float32."""
+    dtype = x.dtype
+    if torch.is_autocast_enabled(x.device.type):
+        dtype = torch.get_autocast_dtype(x.device.type)
+    taps = weight.shape[-1]
+    length = x.shape[-1] - (taps - 1) * dilation
+    acc = torch.promote_types(dtype, torch.float32)
+    xf = x.to(dtype).to(acc)
+    w = weight.to(dtype).to(acc)
+    out = xf[:, :, 0:length] * w[:, 0, 0, None]
+    for j in range(1, taps):
+        out = out + xf[:, :, j * dilation : j * dilation + length] * w[:, 0, j, None]
+    if bias is not None:
+        out = out + bias.to(dtype).to(acc)[:, None]
+    return out.to(dtype)
+
+
+class UnslothDilatedDepthwiseConv1d(torch.nn.Conv1d):
+    """Inductor's conv backward pins the sequence length (a recompile per length); traced, use multiply-adds."""
+
+    def forward(self, input):
+        if (
+            torch.compiler.is_compiling()
+            and input.dim() == 3
+            and self.padding_mode == "zeros"
+            and tuple(self.padding) == (0,)
+            and tuple(self.stride) == (1,)
+            and self.groups == self.in_channels == self.out_channels
+            and self.weight.shape[1] == 1
+        ):
+            return dilated_depthwise_conv1d(input, self.weight, self.bias, self.dilation[0])
+        return super().forward(input)
+
+
+def patch_qwen4_exp_ple_dynamic_conv(modeling=None):
+    """Patches __init__, not _short_conv: Unsloth's compiler rebinds methods from its cache but keeps __init__."""
+    if modeling is None:
+        import transformers.models.qwen4_exp.modeling_qwen4_exp as modeling
+    ple_cls = getattr(modeling, "Qwen4ExpTextPLELayer", None)
+    if ple_cls is None:
+        return False
+    if getattr(ple_cls.__init__, "_unsloth_ple_dynamic_conv", False):
+        return True
+    original_init = ple_cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        conv = getattr(self, "conv1d", None)
+        if type(conv) is torch.nn.Conv1d and _ple_dynamic_conv_enabled():
+            conv.__class__ = UnslothDilatedDepthwiseConv1d
+
+    __init__._unsloth_ple_dynamic_conv = True
+    __init__.__wrapped__ = original_init
+    ple_cls.__init__ = __init__
+    return True
+
+
 def patch_qwen4_exp_frozen_table(modeling=None):
     """Build the PLE n-gram table as a parameter-free UnslothFrozenTableEmbedding, so the load never reads
     (or concatenates on CPU) the 128 ``ngram_embedding.shard_*`` tensors; they are bound from the checkpoint
@@ -399,6 +461,11 @@ def _patch_qwen4_exp_rest(modeling):
         except Exception as e:
             if UNSLOTH_ENABLE_LOGGING:
                 logger.warning(f"Unsloth: Could not patch Qwen4ExpTextPLELayer.forward: {e}")
+    try:
+        patch_qwen4_exp_ple_dynamic_conv(modeling)
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: Could not patch Qwen4ExpTextPLELayer's short conv: {e}")
 
     experts_cls = getattr(modeling, "Qwen4ExpTextExperts", None)
     block_cls = getattr(modeling, "Qwen4ExpTextSparseMoeBlock", None)
