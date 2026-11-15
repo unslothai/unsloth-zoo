@@ -27,6 +27,7 @@ from unsloth_zoo.utils import Version, device_guard as _device_guard
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING, logger
 from .utils import patch_function, raise_error
 from unsloth_zoo.mxfp4_dequant import Mxfp4ExpertParam, is_mxfp4_expert_param, mxfp4_dequantize, mxfp4_kernel_available
+from unsloth_zoo.packed_experts import is_packed_expert_param, packed_param_dtype
 from unsloth_zoo import mxfp4_dequant as _mxfp4_dequant
 
 transformers_version = Version(importlib_version("transformers"))
@@ -112,7 +113,7 @@ class _Mxfp4ShapeProxy:
 
     @property
     def dtype(self):
-        return self._param.mxfp4_dtype
+        return packed_param_dtype(self._param)
 
     def __getattr__(self, name):
         return getattr(self._param, name)
@@ -134,7 +135,7 @@ def patch_peft_param_wrapper_mxfp4():
     @functools.wraps(original_get_param)
     def get_param(self):
         param = original_get_param(self)
-        if is_mxfp4_expert_param(param):
+        if is_packed_expert_param(param):   # MXFP4, NVFP4, MXFP8 stacks expose their logical shape
             self.num_experts = param._original_shape[0]
             return _Mxfp4ShapeProxy(param)
         return param
@@ -143,7 +144,7 @@ def patch_peft_param_wrapper_mxfp4():
     def merge(self, safe_merge = False, adapter_names = None):
         base_layer = self.get_base_layer()
         param = getattr(base_layer, self.parameter_name, None)
-        if not is_mxfp4_expert_param(param):
+        if not is_packed_expert_param(param):
             return original_merge(self, safe_merge = safe_merge, adapter_names = adapter_names)
         adapter_names = check_adapters_to_merge(self, adapter_names)
         if not adapter_names:
@@ -418,7 +419,7 @@ def patch_save_pretrained_mxfp4():
             (module, name, param)
             for module in self.modules()
             for name, param in list(module._parameters.items())
-            if is_mxfp4_expert_param(param)
+            if is_packed_expert_param(param)
         ]
         # Reversing the Mxfp4Dequantize converters raises (5.4), drops layers under "down_proj$" (5.17) or, from 5.22,
         # renames dense experts to "gate_up_proj_blocks" with no scales. Strip them even with no packed param left:
@@ -436,7 +437,7 @@ def patch_save_pretrained_mxfp4():
                 if isinstance(conversions, (list, tuple)):
                     self._weight_conversions = conversions
         names = {id(param): name for name, param in self.named_parameters(remove_duplicate = False)
-                 if is_mxfp4_expert_param(param)}
+                 if is_packed_expert_param(param)}
         dense = {}
         try:
             for module, name, param in packed:

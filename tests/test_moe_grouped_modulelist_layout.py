@@ -227,12 +227,18 @@ def test_compile_fullgraph_no_graph_breaks(lora, policy, monkeypatch):
     explain = torch._dynamo.explain(blk.forward)(x)
     assert explain.graph_break_count == 0, explain.break_reasons
     torch._dynamo.reset()
-    before = ML.CALLS["grouped"]
-    compiled = torch.compile(blk.forward, fullgraph = True)
-    xx = x.detach().clone().requires_grad_(True)
-    out = compiled(xx)[0]
-    (out.float() * gout).sum().backward()
-    assert ML.CALLS["grouped"] == before + 1
+    # CALLS counts eager calls only: engagement under compile = the per-expert loop never runs.
+    loop_calls = []
+    orig = blk.__dict__["_orig_moe_forward"]
+    blk._orig_moe_forward = lambda *a, **k: loop_calls.append(1) or orig(*a, **k)
+    try:
+        compiled = torch.compile(blk.forward, fullgraph = True)
+        xx = x.detach().clone().requires_grad_(True)
+        out = compiled(xx)[0]
+        (out.float() * gout).sum().backward()
+    finally:
+        blk._orig_moe_forward = orig
+    assert not loop_calls, "compiled call fell back to the per-expert loop"
     ref = _step(blk, x, gout, ckpt = False)
     assert (out.detach().float() - ref[0].float()).abs().max().item() < 5e-2
 

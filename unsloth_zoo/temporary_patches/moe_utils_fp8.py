@@ -1043,6 +1043,70 @@ def _refuse_fp4_with_an_unapplied_gate(module, gate_up_weight):
     )
 
 
+def _ue8m0_codes(scale):
+    """uint8 e8m0 codes of a ue8m0 / power-of-two scale tensor, else None (a non power of two is not MXFP4)."""
+    scale = scale.detach()  # FP8Experts registers its float8 scales as parameters that require grad
+    if getattr(torch, "float8_e8m0fnu", None) is not None and scale.dtype == torch.float8_e8m0fnu:
+        return scale.view(torch.uint8)
+    if scale.dtype == torch.uint8:
+        return scale
+    if not scale.dtype.is_floating_point:
+        return None
+    s = scale.float()
+    exponent = torch.round(torch.log2(s))
+    if not bool(torch.isfinite(exponent).all()) or not torch.equal(torch.exp2(exponent), s):
+        return None
+    codes = exponent + 127
+    if bool((codes < 0).any()) or bool((codes > 254).any()):
+        return None
+    return codes.to(torch.uint8)
+
+
+def _fp4_experts_as_mxfp4(module):
+    """(gate_up, down) Mxfp4ExpertParam views of FP4-packed experts (transformers' FP8Experts with expert_dtype="fp4":
+    int8 (E, M, K / 2), e2m1 low nibble first, one ue8m0 scale per 32 along K), cached per storage; None when the
+    experts are not that, train their base weights, or UNSLOTH_FP8_EXPERTS_MXFP4=0."""
+    if os.environ.get("UNSLOTH_FP8_EXPERTS_MXFP4", "1") == "0":
+        return None
+    try:
+        from unsloth_zoo.mxfp4_dequant import Mxfp4ExpertParam
+    except Exception:
+        return None
+    views = []
+    for name in ("gate_up_proj", "down_proj"):
+        weight, scale, _ = _get_moe_weight_and_quant_info(module, name)
+        if (
+            not _is_fp4_packed_tensor(weight) or weight.ndim != 3 or weight.requires_grad
+            or not isinstance(scale, torch.Tensor) or scale.ndim != 3
+            or weight.device.type != "cuda" or not weight.is_contiguous()
+        ):
+            return None
+        E, M, half_k = weight.shape
+        if half_k % 16 or tuple(scale.shape) != (E, M, half_k // 16):
+            return None
+        cache = module.__dict__.setdefault("_unsloth_fp4_mxfp4_views", {})
+        # _version: an in-place copy_ / load_state_dict keeps the storage but must drop converted scale codes.
+        key = (name, weight.data_ptr(), scale.data_ptr(), tuple(weight.shape), weight._version, scale._version)
+        view = cache.get(key)
+        if view is None:
+            # Outside inference mode: a view cached by a generate() must still be savable for a later backward.
+            with torch.inference_mode(False):
+                codes = _ue8m0_codes(scale)
+                if codes is None:
+                    return None
+                view = Mxfp4ExpertParam(
+                    weight.detach().view(torch.uint8).view(E, M, half_k // 16, 16),
+                    mxfp4_scales = codes.contiguous(),
+                    mxfp4_transposed = False,
+                    mxfp4_dtype = torch.bfloat16,
+                )
+            if len(cache) > 4:  # stale storages (a reload)
+                cache.clear()
+            cache[key] = view
+        views.append(view)
+    return tuple(views)
+
+
 @torch.compiler.disable
 def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
     from .moe_utils import (
@@ -1059,6 +1123,19 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
         self._unsloth_own_apply_gate = True
 
     backend = select_moe_backend_without_sonic(hidden_states.device)
+
+    # 0. FP4-packed experts are MXFP4: decode inside the grouped GEMM instead of rebuilding both bf16 stacks.
+    if backend == "grouped_mm":
+        packed = _fp4_experts_as_mxfp4(self)
+        if packed is not None:
+            _log_moe_fp8_backend_once(self, "Unsloth: MoE FP4 experts are using the fused MXFP4 grouped GEMM.")
+            output = swap_moe_weights_for_call(
+                self, packed[0], packed[1], forward_native_grouped_mm,
+                hidden_states.to(_get_fp8_dequant_target_dtype(hidden_states)), top_k_index, top_k_weights,
+            )
+            if isinstance(output, torch.Tensor) and output.dtype != hidden_states.dtype:
+                output = output.to(hidden_states.dtype)
+            return output
 
     # 1. _scaled_grouped_mm (fast FP8 path on Hopper/Blackwell)
     if backend == "grouped_mm" and _check_torch_scaled_grouped_mm_supported(hidden_states.device):
@@ -1144,6 +1221,9 @@ def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor, block_s
     which is only exact when rows/cols are block multiples.
     """
     rows, cols = W_fp8.shape
+    if scale_inv.dtype == torch.uint8:
+        # MXFP8 (compressed-tensors mxfp8-quantized): e8m0 exponent bytes, scale = 2 ** (byte - 127), one per 32.
+        scale_inv = (scale_inv.to(torch.float32) - 127.0).exp2()
     out_dtype = scale_inv.dtype if scale_inv.dtype.is_floating_point else torch.float32
     W = W_fp8.to(out_dtype)
     if scale_inv.numel() == 1:
@@ -1194,6 +1274,12 @@ def _fp8_requant_blockwise(W: torch.Tensor, block_shape: tuple, scale_dtype: tor
         Wf = Wpad
     W_blocks = Wf.reshape(srows, bm, scols, bn)
     block_max = W_blocks.abs().amax(dim=(1, 3))
+    if scale_dtype == torch.uint8:
+        # MXFP8: power-of-two scales stored as e8m0 bytes, the smallest 2**e with block_max / 2**e <= 448.
+        e = torch.ceil(torch.log2((block_max / _FP8_E4M3_MAX).clamp_min(2.0 ** -127))).clamp(-127, 127)
+        W_scaled = (W_blocks / torch.exp2(e).unsqueeze(-1).unsqueeze(1)).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+        W_fp8 = W_scaled.reshape(srows * bm, scols * bn)[:rows, :cols].to(torch.float8_e4m3fn)
+        return W_fp8, (e + 127).to(torch.uint8)
     scale_inv = (block_max / _FP8_E4M3_MAX).clamp_min(1e-12)
     W_scaled = (
         W_blocks / scale_inv.unsqueeze(-1).unsqueeze(1)

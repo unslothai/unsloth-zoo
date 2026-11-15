@@ -870,6 +870,23 @@ def make_no_update_causal_mask(original):
 
 
 # Patch SDPA
+_SYMBOOL_IS_CAUSAL = re.compile(
+    r"^(?P<pad>[ \t]*)is_causal = (?P<b>bool\()?(?P<mask>[A-Za-z_][A-Za-z0-9_]*) is None and "
+    r"(?P<len>[A-Za-z_][A-Za-z0-9_]*) > 1(?(b)\))[ \t]*$",
+    flags = re.MULTILINE,
+)
+
+
+def sdpa_is_causal_as_bool(source):
+    """`is_causal = mask is None and q_len > 1` (transformers 4.x OLMoE / Nemotron / DBRX / PhiMoE ...) and its
+    `bool(...)` form (StableLM) are a SymBool once the sequence dim is dynamic (Unsloth's block compile marks it;
+    Dynamo keeps bool() of a SymBool symbolic), and SDPA takes only a bool: Dynamo broke the graph at every
+    attention call. The conditional form, as Llama uses, guards on the length instead."""
+    return _SYMBOOL_IS_CAUSAL.sub(
+        lambda m: f"{m['pad']}is_causal = True if {m['mask']} is None and {m['len']} > 1 else False", source
+    )
+
+
 def replace_with_grouped_query_attention(module, source):
     # All Unsloth Zoo code licensed under LGPLv3
     if "enable_gqa" not in torch.nn.functional.scaled_dot_product_attention.__doc__:
@@ -5245,8 +5262,14 @@ def _patch_lora_input_cast(source, force_float32 = None):
     if not force_float32:
         if "torch.is_autocast_enabled()" in source:
             return source
+        # Single vanilla adapter stays in result's dtype (fp32 copies cost 1.4x time, 5x memory); variants / multi-adapter keep fp32.
+        variant_only = (
+            " and (active_adapter in getattr(self, 'lora_variant', {}) or len(self.active_adapters) > 1)"
+            if "lora_forward(" in source
+            else ""
+        )
         new = (
-            "if not torch.is_autocast_enabled(): "
+            f"if not torch.is_autocast_enabled(){variant_only}: "
             "result, x = "
             "result.to(lora_A.weight.dtype), "
             "x.to(lora_A.weight.dtype)"
@@ -7008,6 +7031,7 @@ def unsloth_compile_transformers(
                 new_source,
                 flags=re.DOTALL | re.MULTILINE,
             )
+            new_source = sdpa_is_causal_as_bool(new_source)
         else:
             if len(re.findall(causal_mask_find, source, flags=re.DOTALL)) == 1:
                 new_source = re.sub(

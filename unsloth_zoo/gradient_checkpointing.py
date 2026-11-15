@@ -774,12 +774,14 @@ MOE_GC_ROUTING_STATS = collections.Counter()   # stored / reused / mismatch / un
 class CheckpointRoutingFrame:
     """First-pass routing in call order. Kept for the checkpoint context's lifetime and read through a cursor reset
     at each replay, so a second backward (retain_graph) replays the same routing."""
-    __slots__ = ("entries", "cursor", "replaying", "__weakref__")
+    __slots__ = ("entries", "cursor", "replaying", "current", "kept", "__weakref__")
 
     def __init__(self):
         self.entries = []
         self.cursor = 0
         self.replaying = False
+        self.current = None   # entry index of the MoE call being routed now (moe_checkpoint_call)
+        self.kept = {}        # first-pass frozen base expert outputs the replay reuses (moe_gc_keep_base)
 
 
 def _new_checkpoint_routing_frame(tensors):
@@ -798,6 +800,7 @@ def _checkpoint_routing_scope(frame, replay):
     if frame is not None:
         frame.replaying = replay
         frame.cursor = 0
+        frame.current = None
     _GC_ROUTING_TLS.frame = frame
     try:
         yield
@@ -823,11 +826,13 @@ def _checkpoint_route_eager(top_k_index, top_k_weights, grad_mode):
     frame = getattr(_GC_ROUTING_TLS, "frame", None)
     if frame is None:
         return None
+    frame.current = None
     if not frame.replaying:
         # The first pass runs without grad; a grad-mode call inside it (block compile's trial run)
         # is not the forward that makes the loss.
         if not grad_mode:
             frame.entries.append((top_k_index.detach().clone(), top_k_weights.detach().clone()))
+            frame.current = len(frame.entries) - 1
             MOE_GC_ROUTING_STATS["stored"] += 1
         return None
     if not grad_mode or frame.cursor >= len(frame.entries):
@@ -843,8 +848,22 @@ def _checkpoint_route_eager(top_k_index, top_k_weights, grad_mode):
         MOE_GC_ROUTING_STATS["mismatch"] += 1
         frame.cursor = len(frame.entries)
         return None
+    frame.current = frame.cursor - 1
     MOE_GC_ROUTING_STATS["reused"] += 1
     return index, weights
+
+
+def moe_checkpoint_call():
+    """(frame, entry index, replaying) for the MoE experts call whose routing was just stored (first pass) or
+    reused (replay), else None; consumed by the read, so a later call without routing gets None. Eager only."""
+    frame = getattr(_GC_ROUTING_TLS, "frame", None)
+    if frame is None:
+        return None
+    current = frame.current
+    frame.current = None
+    if current is None:
+        return None
+    return frame, current, frame.replaying
 
 
 def _moe_checkpoint_route_impl(

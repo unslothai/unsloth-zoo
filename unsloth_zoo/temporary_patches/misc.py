@@ -322,6 +322,85 @@ pass
 TEMPORARY_PATCHES.append(patch_CsmDepthDecoderForCausalLM_forward)
 
 
+def patch_CsmDepthDecoderModel_forward():
+    # transformers 5.x syncs to host (arange(past_seen_tokens), position_ids[0] == 0), blocking CUDA graph replay
+    # of the depth steps. Compute the same positions on device.
+    try:
+        import transformers.models.csm.modeling_csm as modeling_csm
+        from transformers.utils.generic import merge_with_config_defaults
+        from transformers.utils.output_capturing import capture_outputs
+    except Exception as e:
+        return raise_error("CsmDepthDecoderModel.forward", e)
+    target_cls = modeling_csm.CsmDepthDecoderModel
+    if "cache_position" in inspect.signature(target_cls.forward).parameters:
+        return  # transformers 4.x: positions come from generate's cache_position
+    if getattr(target_cls.forward, "_unsloth_device_positions", False):
+        return
+
+    def forward(
+        self,
+        input_ids = None,
+        backbone_last_hidden_state = None,
+        attention_mask = None,
+        position_ids = None,
+        past_key_values = None,
+        inputs_embeds = None,
+        use_cache = None,
+        **kwargs,
+    ):
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds.")
+        if use_cache and past_key_values is None:
+            past_key_values = modeling_csm.DynamicCache(config = self.config)
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        inputs_seq_length = inputs_embeds.shape[1] if inputs_embeds is not None else input_ids.shape[1]
+        device = inputs_embeds.device if inputs_embeds is not None else input_ids.device
+        # Custom position_ids ignored, as upstream.
+        position_ids = torch.arange(inputs_seq_length, device = device) + past_seen_tokens
+
+        if inputs_embeds is None:
+            codebook_idxs = torch.clamp(position_ids - 1, min = 0)
+            offset = codebook_idxs * self.vocab_size
+            inputs_embeds = self.embed_tokens(input_ids + offset)
+            if backbone_last_hidden_state is not None:
+                inputs_embeds[:, 0] = backbone_last_hidden_state
+
+        inputs_embeds = self.inputs_embeds_projector(inputs_embeds)
+        causal_mask = modeling_csm.create_causal_mask(
+            config = self.config,
+            inputs_embeds = inputs_embeds,
+            attention_mask = attention_mask,
+            past_key_values = past_key_values,
+            position_ids = position_ids,
+        )
+        hidden_states = inputs_embeds
+        position_ids = position_ids.unsqueeze(0)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids = position_ids)
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask = causal_mask,
+                position_ids = position_ids,
+                past_key_values = past_key_values,
+                use_cache = use_cache,
+                position_embeddings = position_embeddings,
+                **kwargs,
+            )
+        hidden_states = self.norm(hidden_states)
+        return modeling_csm.BaseModelOutputWithPast(
+            last_hidden_state = hidden_states,
+            past_key_values = past_key_values if use_cache else None,
+        )
+    pass
+
+    forward.__signature__ = inspect.signature(target_cls.forward)
+    forward = merge_with_config_defaults(capture_outputs(forward))
+    forward._unsloth_device_positions = True
+    patch_function(target_cls, "forward", forward, match_level = "relaxed")
+pass
+TEMPORARY_PATCHES.append(patch_CsmDepthDecoderModel_forward)
+
+
 def patch_CsmForConditionalGeneration_forward():
     try:
         import transformers.models.csm.modeling_csm
@@ -2619,9 +2698,13 @@ def patch_MllamaVisionEncoderLayer():
 
         def forward(
             self,
-            hidden_state: torch.Tensor,
+            hidden_state: Optional[torch.Tensor] = None,
             attention_mask: Optional[torch.Tensor] = None,
+            hidden_states: Optional[torch.Tensor] = None,
         ):
+            # transformers renamed the argument (MllamaVisionEncoder calls `hidden_states=` since 5.x, `hidden_state=` before).
+            if hidden_state is None:
+                hidden_state = hidden_states
             # Self Attention
             residual = hidden_state
             hidden_state = self.input_layernorm(hidden_state)

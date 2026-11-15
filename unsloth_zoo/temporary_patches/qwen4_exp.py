@@ -102,14 +102,6 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
         output_attentions = getattr(module.config, "output_attentions", False)
     if not _sparse_attn_enabled() or output_attentions:
         return None
-    # Prefill into an empty cache (transformers builds one during training too when use_cache is on) is the same
-    # attention; decode steps and chunked prefill over cached tokens keep the reference.
-    if past_key_values is not None:
-        try:
-            if past_key_values.get_seq_length(module.layer_idx) != 0:
-                return None
-        except Exception:
-            return None
     # One selection is shared by every head: a per-head mask ([b, h > 1, s, n]) keeps the reference.
     if not isinstance(attention_mask, torch.Tensor) or attention_mask.dim() != 4 or attention_mask.shape[1] != 1:
         return None
@@ -118,6 +110,13 @@ def _qwen4_exp_sparse_attention(module, hidden_states, position_embeddings, atte
         return None
     if module.training and module.attention_dropout:
         return None
+    # Only prefill into an empty cache is sparse. Probed after the shape checks: a StaticCache answers with a tensor.
+    if past_key_values is not None:
+        try:
+            if past_key_values.get_seq_length(module.layer_idx) != 0:
+                return None
+        except Exception:
+            return None
     import sys
     from unsloth_zoo.sparse_attention import qsa_select_tokens, sparse_gqa_attn, sparse_gqa_fast_path
     # No kernel for QSA on this device (T4 / sm75: no flex, Triton without tensor cores): transformers' own path.
