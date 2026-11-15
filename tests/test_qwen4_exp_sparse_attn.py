@@ -252,3 +252,31 @@ def test_mask_geometry_is_scanned_once_per_mask_version(monkeypatch):
         mask[0, 0, 39, 0] = True  # an in-place edit bumps the version: rescanned
         sa.qsa_select_tokens(attention.indexer, hidden, pe, mask, modeling.apply_rotary_pos_emb)
     assert len(calls) == 2
+
+
+def test_static_cache_decode_compiles_fullgraph(monkeypatch):
+    # A decode step keeps the reference attention; the shape checks reject it before the cache probe, whose
+    # StaticCache answer is a tensor: comparing it in Python broke fullgraph capture (data-dependent branching) and
+    # cost a host sync per layer per eager decode token.
+    from transformers import StaticCache
+    monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "torch")
+    config, attention, rotary = _module("sdpa")
+    first, first_pe = _inputs(1, 1, rotary, seed = 2)
+    hidden, pe = _inputs(1, 1, rotary)
+    mask = torch.zeros((1, 1, 1, 16), dtype = torch.bool)
+    mask[..., :2] = True
+
+    def warm():
+        cache = StaticCache(config, max_cache_len = 16)
+        with torch.no_grad():
+            _reference_forward()(attention, first, first_pe, mask, cache)
+        return cache
+
+    with torch.no_grad():
+        want = _reference_forward()(attention, hidden, pe, mask, warm())[0]
+        cache = warm()
+        torch._dynamo.reset()
+        got = torch.compile(lambda x: zoo_qwen4_exp.qwen4_exp_attention_forward(attention, x, pe, mask, cache)[0],
+                            backend = "eager", fullgraph = True)(hidden)
+    # fp64 rounding only: transformers 5.23's compiled SDPA dispatch differs from eager in the last bit.
+    torch.testing.assert_close(got, want, rtol = 1e-12, atol = 1e-14)
