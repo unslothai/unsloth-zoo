@@ -1551,7 +1551,6 @@ def test_engram_reads_read_cold_rows_pages_in_and_gather_stock_bytes(tmp_path, m
     with decode.exact_ple_row_reads(model):
         assert type(table) is not stock
         got = table._read_rows(ids)
-        # Whole pages, each once, covering every byte of every looked-up row.
         assert all(offset % page == 0 for offset, _ in read)
         spans = sorted(read)
         assert all(a + n <= b for (a, n), (b, _) in zip(spans, spans[1:]))

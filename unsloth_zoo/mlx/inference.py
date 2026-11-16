@@ -11075,10 +11075,8 @@ def _ple_read_class(base, bindings, prepare):
     return _PLE_READ_CLASSES[base]
 
 
-# DeepSeek V4.1's Engram tables (mlx-vlm keeps them on disk) gather 24 rows a token per table from memory maps the
-# same way; a prefill's are nearly all cold. Pages only a pread holds leave core under the expert reads around each
-# lookup while pages a gather mapped stay, so cold rows' pages are read in concurrently and the stock gather maps them.
-# Runs of whole pages, not rows. macOS only: Linux's readahead faults beat the reads (0.43 vs 0.63 s a cold prefill).
+# DeepSeek V4.1 Engram rows: their pages are read in concurrently and the stock gather maps them, since pages only a
+# pread holds leave core under the expert reads. macOS only: Linux's readahead faults beat the reads.
 _ENGRAM = "mlx_vlm.models.deepseek_v41.engram"
 _ENGRAM_READ_CONTRACT = {_ENGRAM: {"OffloadedEngramEmbedding._read_rows": "ac9bcec7d02ec47f"}}
 _ENGRAM_RUN_PAGES = 64
@@ -11139,8 +11137,7 @@ def _ple_unwrap_maps(table):
 
 
 def _ple_read_sites():
-    """(module, table class, attribute holding a table, contract, row reads) of each table kind; the reads are looked up
-    per call, since a table class is built once."""
+    """(module, class, attribute, contract, row reads) per table kind; reads resolve per call, the class is built once."""
     sites = [(_PLE_STORAGE, "QuantizedMMapNGramEmbedding", "ngram_embedding", _PLE_READ_CONTRACT,
               lambda table, rows: _ple_pread_rows(table, rows))]
     if sys.platform == "darwin":
