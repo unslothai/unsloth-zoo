@@ -189,7 +189,7 @@ def _over_vector_thread_limit(q, k, v, mask):
         return False
     if isinstance(mask, mx.array) and mask.ndim >= 2 and mask.shape[-2] not in (1, q.shape[-2]):
         return False
-    return 28 < q.shape[-3] // k.shape[-3] * q.shape[-2] <= 32 and _thread_limited_gpu()
+    return 28 < q.shape[-3] // k.shape[-3] * q.shape[-2] <= 32
 
 
 def _one_pass_d512_over_thread_limit(q, k, v, mask):
@@ -200,7 +200,7 @@ def _one_pass_d512_over_thread_limit(q, k, v, mask):
         return False
     S, min_keys = k.shape[-2], _atoi(os.environ.get("MLX_SDPA_D512_MIN_KL", "1024"))
     # At 0 mlx fuses array-masked calls too, so the all-true mask the caller adds would not avoid the kernel.
-    if q.shape[-3] // k.shape[-3] != 8 or not 0 < min_keys <= S < 4096 or not _thread_limited_gpu():
+    if q.shape[-3] // k.shape[-3] != 8 or not 0 < min_keys <= S < 4096:
         return False
     from . import nax
 
@@ -234,11 +234,12 @@ def fused_sdpa_over(stock):
             mask = original
             if isinstance(mask, mx.array) and mask.shape[-2] != q.shape[-2]:
                 mask = mask[..., -q.shape[-2]:, :]
-        if not kwargs and _over_vector_thread_limit(q, k, v, mask):
-            return _split_query_rows(stock, q, k, v, scale, mask, sinks)
-        if not kwargs and _one_pass_d512_over_thread_limit(q, k, v, mask):
-            # mlx has no fused head-dim-512 kernel for an array mask, so an all-true one takes its unfused attention.
-            mask = mx.ones((1, 1, 1, 1), dtype=mx.bool_)
+        if not kwargs and _thread_limited_gpu():
+            if _over_vector_thread_limit(q, k, v, mask):
+                return _split_query_rows(stock, q, k, v, scale, mask, sinks)
+            if _one_pass_d512_over_thread_limit(q, k, v, mask):
+                # mlx has no fused head-dim-512 kernel for an array mask, so an all-true one takes its unfused attention.
+                mask = mx.ones((1, 1, 1, 1), dtype=mx.bool_)
         if (sinks is None and not kwargs and q.dtype == k.dtype == v.dtype
                 and _forces_fused(q, k.shape[-2], k.shape[-1], v.shape[-1], q.dtype, mask)
                 and not mlx_training_patches_active()):

@@ -1159,3 +1159,40 @@ def test_m1_m2_head_dim_512_decode_leaves_the_one_pass_vector_kernel(fused_atten
         fused_attention(q, k, v, scale=512 ** -0.5, mask=mask, force_fused=True)
     want = fused_attention(*(x.astype(mx.float32) for x in (q, k, v)), scale=512 ** -0.5, mask=mask)
     assert mx.abs(out.astype(mx.float32) - want).max().item() <= 2e-3
+
+
+_M1_M2_CASES = {
+    "d256_rows": ("float16", 24, 4, 5, 4096, 256),
+    "d512_decode": ("float16", 16, 2, 1, 2048, 512),
+    "d512_decode_fp32": ("float32", 16, 2, 1, 2048, 512),
+}
+_M1_M2_CALL = """
+import sys, mlx.core as mx
+dtype, HQ, HKV, L, S, D = sys.argv[1], *map(int, sys.argv[2:])
+q = mx.random.normal((1, HQ, L, D), key=mx.random.key(0)).astype(getattr(mx, dtype))
+k, v = (mx.random.normal((1, HKV, S, D), key=mx.random.key(i)).astype(q.dtype) for i in (1, 2))
+if sys.argv[-1] == "zoo":
+    from unsloth_zoo.mlx.attention import install_fused_attention
+    install_fused_attention()
+out = mx.fast.scaled_dot_product_attention(q, k, v, scale=D ** -0.5)
+want = mx.fast.scaled_dot_product_attention(*(x.astype(mx.float32) for x in (q, k, v)), scale=D ** -0.5, mask=mx.ones((1, 1, 1, 1), dtype=mx.bool_))
+print("MAXERR", mx.abs(out.astype(mx.float32) - want).max().item())
+"""
+
+
+@pytest.mark.parametrize("case", sorted(_M1_M2_CASES))
+def test_m1_m2_launches_that_mlx_0_32_4_refuses_run_through_the_wrapper(case):
+    # Real M1/M2 only: stock mlx must refuse the launch here, or the wrapper is untested.
+    import subprocess
+
+    arch = nax._gpu_architecture()
+    if not mx.metal.is_available() or nax._gpu_generation() not in (13, 14):
+        pytest.skip(f"needs an M1/M2 GPU, got {arch!r}")
+    if case.startswith("d512") and arch[-1:] in ("d", "s"):
+        pytest.skip("Max/Ultra route this decode to the two-pass kernel")
+    args = [sys.executable, "-c", _M1_M2_CALL, *map(str, _M1_M2_CASES[case])]
+    stock = subprocess.run([*args, "stock"], capture_output=True, text=True, timeout=600)
+    assert stock.returncode != 0 and "threads per threadgroup" in stock.stderr, (arch, stock.stdout, stock.stderr[-2000:])
+    zoo = subprocess.run([*args, "zoo"], capture_output=True, text=True, timeout=600)
+    assert zoo.returncode == 0, (arch, zoo.stderr[-2000:])
+    assert float(zoo.stdout.split("MAXERR")[-1]) <= (1e-4 if case.endswith("fp32") else 2e-3), zoo.stdout
