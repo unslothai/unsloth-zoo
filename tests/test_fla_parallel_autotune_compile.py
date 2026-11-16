@@ -115,3 +115,90 @@ def test_single_config_round_never_uses_pool(cache_mod, monkeypatch, tmp_path):
     tuner = _make(cache_mod, monkeypatch, seen, blocks = (256,), warps = (4,))
     _launch(tuner, 1000, 1.5)
     assert seen and not any(t.startswith("fla_compile") for t in seen), seen
+
+
+# --- configs pruned before compiling: num_stages twins before sm80, l2norm on head dim <= 128 ---
+
+
+@triton.jit
+def _pipelined_kernel(a, b, c, K, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+    rm = tl.arange(0, BM)
+    rn = tl.arange(0, BN)
+    rk = tl.arange(0, BK)
+    acc = tl.zeros((BM, BN), dtype = tl.float32)
+    for k in range(0, K, BK):
+        x = tl.load(a + rm[:, None] * K + (k + rk)[None, :])
+        y = tl.load(b + (k + rk)[:, None] * BN + rn[None, :])
+        acc += tl.dot(x, y)
+    tl.store(c + rm[:, None] * BN + rn[None, :], acc.to(tl.float16))
+
+
+def _ptx(capability, num_stages):
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+
+    src = ASTSource(
+        fn = _pipelined_kernel,
+        signature = {"a": "*fp16", "b": "*fp16", "c": "*fp16", "K": "i32", "BM": "constexpr", "BN": "constexpr", "BK": "constexpr"},
+        constexprs = {"BM": 64, "BN": 64, "BK": 32},
+        # 16-byte aligned pointers and K, as Triton specializes real launches: lets sm80 use cp.async.
+        attrs = {(i,): [["tt.divisibility", 16]] for i in range(4)},
+    )
+    kernel = triton.compile(src, target = GPUTarget("cuda", capability, 32), options = {"num_warps": 4, "num_stages": num_stages})
+    return kernel.asm["ptx"]
+
+
+def test_num_stages_changes_nothing_before_sm80():
+    # The premise of dropping num_stages twins: identical PTX on sm75, and the control (sm80, where
+    # Triton pipelines the loop with cp.async) shows the comparison tells the kernels apart.
+    assert _ptx(75, 2) == _ptx(75, 3) == _ptx(75, 4)
+    assert len({_ptx(80, 2), _ptx(80, 3), _ptx(80, 4)}) == 3
+    assert "cp.async" in _ptx(80, 3) and "cp.async" not in _ptx(75, 3)
+
+
+def test_stage_twins_dropped_only_before_sm80(cache_mod, monkeypatch):
+    import types
+
+    configs = [triton.Config({"BK": bk}, num_warps = w, num_stages = s) for bk in (32, 64) for w in (2, 4) for s in (2, 3, 4)]
+    x = torch.zeros(1, device = "cuda")
+    tuner = types.SimpleNamespace(nargs = {})
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (7, 5))
+    kept = cache_mod._drop_stage_only_twins(tuner, configs, {"x": x})
+    assert [(c.kwargs["BK"], c.num_warps, c.num_stages) for c in kept] == [(32, 2, 2), (32, 4, 2), (64, 2, 2), (64, 4, 2)]
+    monkeypatch.setenv("UNSLOTH_FLA_FULL_AUTOTUNE", "1")
+    assert cache_mod._drop_stage_only_twins(tuner, configs, {"x": x}) == configs
+    monkeypatch.delenv("UNSLOTH_FLA_FULL_AUTOTUNE")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (8, 9))
+    assert cache_mod._drop_stage_only_twins(tuner, configs, {"x": x}) == configs
+    monkeypatch.setattr(torch.version, "hip", "6.4", raising = False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (7, 5))
+    assert cache_mod._drop_stage_only_twins(tuner, configs, {"x": x}) == configs
+
+
+def test_l2norm_keeps_two_configs_up_to_head_dim_128(monkeypatch):
+    import os
+    import sys
+
+    os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
+    os.environ.setdefault("UNSLOTH_VENDORED_FLA_NO_AUTORUN", "1")
+    fla_vendor = pytest.importorskip("unsloth_zoo.temporary_patches.fla_vendor")
+    if not fla_vendor._vendored_injection_supported():
+        pytest.skip("vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3")
+    injected, _ = fla_vendor._inject_vendored_fla()
+    if not injected:
+        pytest.skip("vendored fla injection failed on this host")
+    L = sys.modules.get("fla.modules.l2norm") or __import__("fla.modules.l2norm", fromlist = ["x"])
+    for tuner in (L.l2norm_fwd_kernel, L.l2norm_bwd_kernel):
+        tuner.nargs = {}  # set by Autotuner.run before it prunes
+        kept = tuner.prune_configs({"D": 128})
+        assert {(c.kwargs["BT"], c.num_warps) for c in kept} == {(16, 4), (32, 4)}
+        assert len(tuner.prune_configs({"D": 256})) == len(tuner.configs) == 25
+        monkeypatch.setenv("UNSLOTH_FLA_FULL_AUTOTUNE", "1")
+        assert len(tuner.prune_configs({"D": 128})) == 25
+        monkeypatch.delenv("UNSLOTH_FLA_FULL_AUTOTUNE")
+    # Still exact through the pruned autotune.
+    x = torch.randn(4096, 128, device = "cuda", dtype = torch.float16)
+    y, rstd = L.l2norm_fwd(x)
+    ref = x.float() / (x.float().square().sum(-1, keepdim = True) + 1e-6).sqrt()
+    torch.testing.assert_close(y.float(), ref, atol = 2e-3, rtol = 2e-3)
+    assert (L.l2norm_fwd_kernel.best_config.kwargs["BT"], L.l2norm_fwd_kernel.best_config.num_warps) in ((16, 4), (32, 4))

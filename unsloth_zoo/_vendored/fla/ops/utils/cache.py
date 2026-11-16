@@ -108,6 +108,39 @@ def _precompile_configs(autotuner, args, kwargs, configs) -> None:
         logger.debug("Parallel autotune compile skipped: %r", exc)
 
 
+def _full_autotune() -> bool:
+    return os.environ.get("UNSLOTH_FLA_FULL_AUTOTUNE", "0") == "1"
+
+
+def _operand_device(autotuner, kwargs):
+    for value in list((getattr(autotuner, "nargs", None) or {}).values()) + list(kwargs.values()):
+        if isinstance(value, torch.Tensor):
+            return value.device
+    return None
+
+
+def _drop_stage_only_twins(autotuner, configs, kwargs):
+    """Unsloth: before sm80 Triton never software-pipelines (its NVIDIA backend runs the pipeline
+    passes, the only readers of num_stages, for capability >= 80 only, Triton 3.3 to 3.9), so
+    configs that differ only in num_stages compile to the same kernel there; T4 compiled and
+    benchmarked each copy. Keep the first of each. UNSLOTH_FLA_FULL_AUTOTUNE=1 keeps all."""
+    if len(configs) < 2 or _full_autotune() or getattr(torch.version, "hip", None):
+        return configs
+    device = _operand_device(autotuner, kwargs)
+    if device is None or device.type != "cuda" or torch.cuda.get_device_capability(device)[0] >= 8:
+        return configs
+    seen, kept = set(), []
+    for config in configs:
+        key = (
+            tuple(sorted((k, repr(v)) for k, v in config.all_kwargs().items() if k != "num_stages")),
+            id(config.pre_hook),
+        )
+        if key not in seen:
+            seen.add(key)
+            kept.append(config)
+    return kept
+
+
 def sanitize_gpu_name(gpu_name: str) -> str:
     sanitized = re.sub(r"[^0-9A-Za-z]+", "_", gpu_name)
     sanitized = sanitized.strip("_")
@@ -426,7 +459,7 @@ class CachedAutotuner(Autotuner):
 
     def prune_configs(self, kwargs, *args, **kw):
         # Unsloth: Autotuner.run prunes once per cold key, right before benchmarking the result.
-        configs = super().prune_configs(kwargs, *args, **kw)
+        configs = _drop_stage_only_twins(self, super().prune_configs(kwargs, *args, **kw), kwargs)
         self._unsloth_to_compile = configs
         return configs
 

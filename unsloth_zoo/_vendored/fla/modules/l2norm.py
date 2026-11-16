@@ -5,6 +5,8 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
+import os
+
 import torch
 import torch.nn as nn
 import triton
@@ -15,6 +17,19 @@ from fla.utils import IS_AMD, autotune_cache_kwargs, input_guard
 
 BT_LIST = [8, 16, 32, 64, 128]
 NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if IS_AMD else [1, 2, 4, 8, 16, 32]
+
+
+def _unsloth_prune_l2norm(configs, named_args, **kwargs):
+    """Unsloth: a cold run compiled all 25 (BT, num_warps) configs of each l2norm kernel, about half
+    of the cold Qwen3.5 / Qwen3.6 GatedDeltaNet compiles, for a memory-bound kernel that is a small
+    share of the step. The 2 kept here were within 1.8% of the fastest of the 25 in every L4 cold
+    run (backward over 65536 rows of D = 128). Head dims up to 128 keep 2 configs; wider rows
+    (unmeasured) autotune over all of them. UNSLOTH_FLA_FULL_AUTOTUNE=1 keeps all."""
+    D = kwargs.get("D", (named_args or {}).get("D"))
+    if not isinstance(D, int) or D > 128 or os.environ.get("UNSLOTH_FLA_FULL_AUTOTUNE", "0") == "1":
+        return configs
+    kept = [c for c in configs if (c.kwargs.get("BT"), c.num_warps) in ((16, 4), (32, 4))]
+    return kept or configs
 
 
 @triton.autotune(
@@ -77,6 +92,7 @@ def l2norm_bwd_kernel1(
 @fla_cache_autotune(
     configs=[triton.Config({"BT": BT}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16] for BT in BT_LIST],
     key=["D"],
+    prune_configs_by={"early_config_prune": _unsloth_prune_l2norm},
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -110,6 +126,7 @@ def l2norm_fwd_kernel(
 @fla_cache_autotune(
     configs=[triton.Config({"BT": BT}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16] for BT in BT_LIST],
     key=["D"],
+    prune_configs_by={"early_config_prune": _unsloth_prune_l2norm},
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
