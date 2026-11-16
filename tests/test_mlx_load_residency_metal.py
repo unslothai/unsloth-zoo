@@ -933,6 +933,16 @@ def test_large_moe_layers_prefill_as_chunked_on_full_tables(tmp_path, monkeypatc
                 assert all(np.array_equal(a, b) for a, b in zip(got, expect, strict = True))
     if family == "deepseek_v41":
         assert not hasattr(cache[0], "unsloth_wide_steps")  # no block's steps outlive the call
+        end = zoo_offload._DeepseekV41Steps.end
+        def failing(steps, start):
+            if steps.layer == 2 and start:
+                raise MemoryError
+            return end(steps, start)
+        monkeypatch.setattr(zoo_offload._DeepseekV41Steps, "end", failing)
+        with pytest.raises(MemoryError):
+            forward(tokens, failed := lm.make_cache())
+        assert not hasattr(failed[0], "unsloth_wide_steps")  # nor a pass that failed partway
+        monkeypatch.setattr(zoo_offload._DeepseekV41Steps, "end", end)
         # A batch cache, even of one row, runs the call whole, as before these blocks stepped.
         batch = lambda: [language.BatchDeepseekV41Cache([language.DeepseekV41Cache(len(lm.layers))])]
         language = pytest.importorskip("mlx_vlm.models.deepseek_v41.language")

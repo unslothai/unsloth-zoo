@@ -685,10 +685,10 @@ class _DeepseekV41Steps:
         self.steps[start] = {name: getattr(self.cache, name) for name in self.cache.HANDOFF}
         return self.steps[start]
 
-    def finish(self):
+    def finish(self, done):
         self.cache.offset = self.offset
-        if self.last:
-            del self.cache.unsloth_wide_steps
+        if self.last or not done:  # a failed pass would otherwise keep its records on the cache
+            self.cache.__dict__.pop("unsloth_wide_steps", None)
 
     @staticmethod
     def _layer_lists(cache):
@@ -1256,7 +1256,7 @@ class _WideLayer:
         given = {name: bound.arguments.get(name) for name in axes}
         capture = getattr(_prefill_capture, "request", None)
         shared = self._wide_steps(self, cache) if self._wide_steps is not None else None
-        outputs = []
+        outputs, done = [], False
         try:
             for start in range(0, hidden.shape[1], _PREFILL_STEP):
                 for name, axis in axes.items():
@@ -1274,9 +1274,10 @@ class _WideLayer:
                         shared.capture(capture[0], capture[1], capture[2])
                     else:
                         capture[2][id(cache)] = capture[1](cache)
+            done = True
         finally:
             if shared is not None:
-                shared.finish()
+                shared.finish(done)
             if table:
                 switch._narrow()
         if isinstance(outputs[0], tuple):  # the token-indexed outputs a layer hands the next
