@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""The CPU loader and plain PEFT wrap DeepSeek-V4.1's o_a_proj with this grouped LoRA; unsloth's tensor parallel
-shards a grouped linear's LoRA only when the layer carries _unsloth_grouped_lora (same layout as unsloth's own
-grouped LoRA). Without it every tensor parallel step raised. CPU."""
+"""DeepSeek-V4.1's grouped o_a_proj LoRA carries _unsloth_grouped_lora, which tensor parallel needs to shard it."""
 
 import pytest
 
