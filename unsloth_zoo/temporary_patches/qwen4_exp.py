@@ -18,7 +18,9 @@
 nonzero/topk loop when kv_length < budget + compress_ratio; UNSLOTH_QWEN4_EXP_FAST_QSA=0 disables. From the budget up
 (training / prefill without a cache), QSA attention selects its blocks vectorised and attends to the selected tokens
 only (``unsloth_zoo.sparse_attention``), instead of a per-query Python loop plus an O(S^2) masked dense attention;
-UNSLOTH_QWEN4_EXP_SPARSE_ATTN=0 disables. The ~102 GB PLE n-gram table is streamed from the checkpoint by
+UNSLOTH_QWEN4_EXP_SPARSE_ATTN=0 disables. Where that path has no kernel (T4 / sm75, CPU) the dense reference
+attention stays, but its indexer builds the selection mask vectorised too (UNSLOTH_QWEN4_EXP_VECTORISED_QSA=0
+keeps transformers' per-query loop). The ~102 GB PLE n-gram table is streamed from the checkpoint by
 ``unsloth_zoo.frozen_table_store`` unless UNSLOTH_FROZEN_TABLE=gpu."""
 
 __all__ = ["patch_qwen4_exp", "patch_qwen4_exp_frozen_table"]
@@ -32,6 +34,13 @@ from .utils import patch_function, logger
 
 def _fast_qsa_enabled():
     return os.environ.get("UNSLOTH_QWEN4_EXP_FAST_QSA", "1") != "0"
+
+
+def _vectorised_qsa_enabled():
+    return os.environ.get("UNSLOTH_QWEN4_EXP_VECTORISED_QSA", "1") != "0"
+
+
+QWEN4_EXP_INDEXER_STATS = {"vectorised": 0}
 
 
 _reference_qsa_forward = None
@@ -60,8 +69,55 @@ def qwen4_exp_qsa_indexer_forward(self, hidden_states, position_embeddings, atte
         return torch.where(
             attention_mask == 0, attention_mask.new_zeros(()), torch.finfo(attention_mask.dtype).min
         )
+    if past_key_values is None:
+        from unsloth_zoo.temporary_patches.qwen4_exp import _qwen4_exp_vectorised_indexer_mask
+        selected_token_mask = _qwen4_exp_vectorised_indexer_mask(self, hidden_states, position_embeddings, attention_mask)
+        if selected_token_mask is not None:
+            return selected_token_mask
     from unsloth_zoo.temporary_patches.qwen4_exp import qwen4_exp_qsa_indexer_forward_guarded
     return qwen4_exp_qsa_indexer_forward_guarded(self, hidden_states, position_embeddings, attention_mask, past_key_values)
+
+
+@torch.compiler.disable
+def _qwen4_exp_vectorised_indexer_mask(indexer, hidden_states, position_embeddings, attention_mask):
+    """transformers' indexer mask (no cache) from the vectorised block selection, or None to run its loop.
+
+    The reference loops over every (batch, query) pair with a host sync each (nonzero, topk): 4k packed tokens are
+    4096 iterations per QSA layer, forward and gradient checkpoint recompute, which dominated a T4 training step.
+    Token identity with the loop, ties included: rows whose k-th and (k+1)-th block scores tie are recomputed the
+    reference's way (``qsa_select_tokens(exact_ties=True)``), unless UNSLOTH_QWEN4_EXP_EXACT_TIES=0."""
+    if not _vectorised_qsa_enabled():
+        return None
+    if (
+        not isinstance(attention_mask, torch.Tensor)
+        or attention_mask.dim() != 4
+        or attention_mask.shape[1] != 1
+        or attention_mask.shape[-1] != hidden_states.shape[1]
+    ):
+        return None
+    import sys
+    from unsloth_zoo.sparse_attention import qsa_select_tokens
+    rope = getattr(sys.modules.get(type(indexer).__module__), "apply_rotary_pos_emb", None)
+    if rope is None:   # a subclass defined elsewhere
+        from transformers.models.qwen4_exp import modeling_qwen4_exp
+        rope = modeling_qwen4_exp.apply_rotary_pos_emb
+    with torch.no_grad():
+        selected = qsa_select_tokens(indexer, hidden_states, tuple(position_embeddings), attention_mask, rope,
+                                     exact_ties=os.environ.get("UNSLOTH_QWEN4_EXP_EXACT_TIES", "1") != "0")
+    if selected is None:
+        return None
+    kv_length = attention_mask.shape[-1]
+    # As the reference: every -1 is scattered to an extra last slot, which is dropped.
+    selected_token_mask = torch.zeros(
+        (*selected.shape[:-1], kv_length + 1), device=attention_mask.device, dtype=torch.bool
+    )
+    scatter_indices = torch.where(selected >= 0, selected.long(), kv_length)
+    selected_token_mask = selected_token_mask.scatter(-1, scatter_indices, True)[..., :kv_length].unsqueeze(1)
+    if not torch.compiler.is_compiling():
+        QWEN4_EXP_INDEXER_STATS["vectorised"] += 1
+    if attention_mask.is_floating_point() and _qsa_returns_float_mask:
+        return torch.where(selected_token_mask, attention_mask.new_zeros(()), torch.finfo(attention_mask.dtype).min)
+    return selected_token_mask
 
 
 def qwen4_exp_qsa_indexer_forward_guarded(self, hidden_states, position_embeddings, attention_mask,
