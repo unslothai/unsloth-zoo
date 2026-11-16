@@ -48,3 +48,14 @@ def test_dtype_pass_keeps_standins_storage_free(forced):
         (model.pinned[0].weight, torch.float32),
     ):
         assert t.dtype == dtype and _storage_free(t) and t.shape[-1] == 64
+
+
+def test_an_expanded_nonzero_scalar_keeps_its_value():
+    import torch
+
+    from unsloth_zoo.patching_utils import _cast_data
+
+    weight = torch.nn.Parameter(torch.ones((), dtype = torch.bfloat16).expand(4), requires_grad = False)
+    _cast_data(weight, torch.float16)
+    assert weight.dtype == torch.float16 and weight.tolist() == [1.0] * 4
+    assert not any(weight.stride())

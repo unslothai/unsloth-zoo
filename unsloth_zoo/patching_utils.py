@@ -522,7 +522,9 @@ def _cast_data(t, dtype):
     if t.dtype == dtype:
         return
     if _storage_free(t) and t.is_floating_point():
-        t.data = torch.zeros((), dtype = dtype, device = t.device).expand(t.shape)
+        # Cast the one stored element and expand it back: same values, still storage-free.
+        scalar = t.data.as_strided((), (), t.data.storage_offset())
+        t.data = scalar.to(dtype).expand(t.shape)
     else:
         t.data = t.data.to(dtype)
 
