@@ -1288,7 +1288,8 @@ def patch_flex_mask_keeps_padding_mask_mod():
         signature = inspect.signature(original)
     except Exception:
         return
-    if not {"attention_mask", "mask_function", "kv_length"} <= signature.parameters.keys():
+    # transformers 5.x mask API (q_length); 4.x is untested here.
+    if not {"attention_mask", "mask_function", "kv_length", "q_length"} <= signature.parameters.keys():
         return
 
     @functools.wraps(original)

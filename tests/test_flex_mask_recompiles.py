@@ -22,6 +22,8 @@ import torch
 from torch._dynamo.testing import CompileCounter
 
 masking_utils = pytest.importorskip("transformers.masking_utils")
+if "q_length" not in __import__("inspect").signature(masking_utils.flex_attention_mask).parameters:
+    pytest.skip("transformers 4.x mask API: the patch is not installed", allow_module_level = True)
 
 
 @pytest.fixture
