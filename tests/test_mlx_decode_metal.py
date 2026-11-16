@@ -1540,32 +1540,43 @@ def _engram_table(path, rows = 900):
     return table, SimpleNamespace(named_modules = lambda: [("engram", SimpleNamespace(embed = table))])
 
 
-def test_engram_reads_read_cold_rows_in_once_a_lookup_and_gather_stock_bytes(tmp_path, monkeypatch):
+def test_engram_reads_read_cold_rows_pages_in_and_gather_stock_bytes(tmp_path, monkeypatch):
     table, model = _engram_table(tmp_path)
     stock = type(table)
     ids = np.array([[[7, 400, 7], [899, 3, 400]], [[3, 3, 11], [12, 7, 650]]])  # repeats, as n-gram hashes give
     expected = table._read_rows(ids)
-    read = _recorded_reads(monkeypatch)
+    read, native, page = [], os.preadv, os.sysconf("SC_PAGESIZE")
+    monkeypatch.setattr(os, "preadv", lambda fd, buffers, offset: read.append((offset, len(buffers[0]))) or native(fd, buffers, offset))
     monkeypatch.setattr(decode, "_ple_resident", lambda parts: 0.0)
     with decode.exact_ple_row_reads(model):
         assert type(table) is not stock
         got = table._read_rows(ids)
-        # Each distinct row read in once per tensor, before the gather maps it.
-        assert sorted(read) == sorted(memmap[row].tobytes() for memmap in table._arrays.values() for row in np.unique(ids))
+        # Whole pages, each once, covering every byte of every looked-up row.
+        assert all(offset % page == 0 for offset, _ in read)
+        spans = sorted(read)
+        assert all(a + n <= b for (a, n), (b, _) in zip(spans, spans[1:]))
+        for memmap in table._arrays.values():
+            for row in np.unique(ids).tolist():
+                start = memmap.offset + row * memmap.strides[0]
+                assert any(a <= start and start + memmap.strides[0] <= a + n for a, n in read)
         del read[:]
         again = table._read_rows(ids[:, :1])  # read in again unless the probe finds the rows in core
-        assert len(read) == 3 * np.unique(ids[:, :1]).size
+        assert read
         del read[:]
         monkeypatch.setattr(decode, "_ple_resident", lambda parts: 1.0)
         cached = table._read_rows(ids)
         assert read == []
     assert type(table) is stock
-    raw = lambda a: np.array(a.view(mx.uint16) if a.dtype == mx.bfloat16 else a)
+
+    def raw(a):
+        return np.array(a.view(mx.uint16) if a.dtype == mx.bfloat16 else a)
+
     for name in expected:
         assert got[name].dtype == again[name].dtype == expected[name].dtype
         for result in (got, cached):
             np.testing.assert_array_equal(raw(result[name]), raw(expected[name]))
         np.testing.assert_array_equal(raw(again[name]), raw(expected[name])[:, :1])
+
 
 def _qwen4_hc(combine = True, streams = 4, lowrank = 32, dtype = mx.bfloat16):
     config = SimpleNamespace(hidden_size = 1280, hc_count = streams, hc_lowrank = lowrank, rms_norm_eps = 1e-6)

@@ -11030,12 +11030,6 @@ def _ple_pread_rows(table, row_ids):
             start, _, arrays = table._shards[index]
             part = np.flatnonzero(shard == index)
             parts.append((list(arrays.values()), missing[part] - start, new[part]))
-    return _ple_preads(parts)
-
-
-def _ple_preads(parts):
-    """{id(map): (rows, values)} of each (wrapped maps, rows, fresh) part, fresh rows read concurrently and the others
-    copied from the map; None when the sampled fresh rows are in core."""
     # A row's scales and biases are read with its weights, so the first map's pages stand for all of them.
     if _ple_resident([(maps[0].memmap, rows[fresh]) for maps, rows, fresh in parts]) >= _PLE_RESIDENT:
         return None
@@ -11082,16 +11076,49 @@ def _ple_read_class(base, bindings, prepare):
 
 
 # DeepSeek V4.1's Engram tables (mlx-vlm keeps them on disk) gather 24 rows a token per table from memory maps the
-# same way; a prefill's are nearly all cold. Pages a pread alone brought in leave core under the expert reads around
-# each lookup, while pages a gather mapped stay, so cold rows are read in concurrently and the stock gather maps them.
+# same way; a prefill's are nearly all cold. Pages only a pread holds leave core under the expert reads around each
+# lookup while pages a gather mapped stay, so cold rows' pages are read in concurrently and the stock gather maps them.
+# Runs of whole pages, not rows. macOS only: Linux's readahead faults beat the reads (0.43 vs 0.63 s a cold prefill).
 _ENGRAM = "mlx_vlm.models.deepseek_v41.engram"
 _ENGRAM_READ_CONTRACT = {_ENGRAM: {"OffloadedEngramEmbedding._read_rows": "ac9bcec7d02ec47f"}}
+_ENGRAM_RUN_PAGES = 64
+
+
+def _engram_read(chunk):
+    buffer = memoryview(bytearray(max(length for _, _, length in chunk)))
+    for descriptor, offset, length in chunk:
+        os.preadv(descriptor, [buffer[:length]], offset)
 
 
 def _engram_pread_rows(table, indices):
-    if not isinstance(indices, slice):
-        rows = np.unique(np.asarray(indices, dtype = np.int64))
-        _ple_preads([([_PreadMap(memmap) for memmap in table._arrays.values()], rows, np.ones(rows.size, dtype = bool))])
+    if isinstance(indices, slice):
+        return
+    rows = np.unique(np.asarray(indices, dtype = np.int64))
+    maps = list(table._arrays.values())
+    if _ple_resident([(maps[0], rows)]) >= _PLE_RESIDENT:
+        return
+    page, files, work = os.sysconf("SC_PAGESIZE"), {}, []
+    for memmap in maps:
+        stride = memmap.strides[0]
+        first = (memmap.offset + rows * stride) // page
+        count = (memmap.offset + (rows + 1) * stride - 1) // page - first + 1
+        files.setdefault(memmap.filename, []).append(np.repeat(first - np.cumsum(count) + count, count) + np.arange(count.sum()))
+    try:
+        for name, pages in files.items():
+            files[name] = descriptor = os.open(name, os.O_RDONLY)
+            pages = np.unique(np.concatenate(pages))  # tensors of one file can share a page
+            run = np.cumsum(np.r_[True, np.diff(pages) != 1])
+            starts = np.flatnonzero(np.r_[True, run[1:] != run[:-1]])
+            split = np.flatnonzero((np.arange(pages.size) - starts[run - 1]) % _ENGRAM_RUN_PAGES == 0)
+            end = os.fstat(descriptor).st_size
+            work += [(descriptor, offset, min(length, end - offset)) for offset, length in
+                     zip((pages[split] * page).tolist(), (np.diff(np.r_[split, pages.size]) * page).tolist())]
+        step = -(-len(work) // _PLE_READ_WORKERS)
+        list(_ple_read_pool().map(_engram_read, [work[i:i + step] for i in range(0, len(work), step)]))
+    finally:
+        for descriptor in files.values():
+            if isinstance(descriptor, int):
+                os.close(descriptor)
 
 
 def _ple_wrap_maps(table):
@@ -11114,11 +11141,12 @@ def _ple_unwrap_maps(table):
 def _ple_read_sites():
     """(module, table class, attribute holding a table, contract, row reads) of each table kind; the reads are looked up
     per call, since a table class is built once."""
-    return (
-        (_PLE_STORAGE, "QuantizedMMapNGramEmbedding", "ngram_embedding", _PLE_READ_CONTRACT,
-         lambda table, rows: _ple_pread_rows(table, rows)),
-        (_ENGRAM, "OffloadedEngramEmbedding", "embed", _ENGRAM_READ_CONTRACT, lambda table, rows: _engram_pread_rows(table, rows)),
-    )
+    sites = [(_PLE_STORAGE, "QuantizedMMapNGramEmbedding", "ngram_embedding", _PLE_READ_CONTRACT,
+              lambda table, rows: _ple_pread_rows(table, rows))]
+    if sys.platform == "darwin":
+        sites.append((_ENGRAM, "OffloadedEngramEmbedding", "embed", _ENGRAM_READ_CONTRACT,
+                      lambda table, rows: _engram_pread_rows(table, rows)))
+    return sites
 
 
 @contextmanager
