@@ -80,12 +80,8 @@ def qwen4_exp_qsa_indexer_forward(self, hidden_states, position_embeddings, atte
 
 @torch.compiler.disable
 def _qwen4_exp_vectorised_indexer_mask(indexer, hidden_states, position_embeddings, attention_mask):
-    """transformers' indexer mask (no cache) from the vectorised block selection, or None to run its loop.
-
-    The reference loops over every (batch, query) pair with a host sync each (nonzero, topk): 4k packed tokens are
-    4096 iterations per QSA layer, forward and gradient checkpoint recompute, which dominated a T4 training step.
-    Token identity with the loop, ties included: rows whose k-th and (k+1)-th block scores tie are recomputed the
-    reference's way (``qsa_select_tokens(exact_ties=True)``), unless UNSLOTH_QWEN4_EXP_EXACT_TIES=0."""
+    """transformers' indexer mask (no cache) without its per-query host-sync loop, or None to run the loop.
+    Ties are resolved the reference's way unless UNSLOTH_QWEN4_EXP_EXACT_TIES=0, so tokens match the loop."""
     if not _vectorised_qsa_enabled():
         return None
     if (

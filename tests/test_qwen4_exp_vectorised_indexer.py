@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Qwen4Exp QSA indexer beyond the budget without a sparse attention kernel (T4 / sm75, CPU): the dense reference
-attention stays, and its selection mask is built vectorised instead of transformers' per-(batch, query) loop.
-Token identity with the loop (ties included), the same losses and gradients through the text model, and a kill
-switch (UNSLOTH_QWEN4_EXP_VECTORISED_QSA=0) that restores the loop."""
+"""Vectorised Qwen4Exp QSA indexer mask (no sparse kernel: T4 / CPU) vs transformers' per-query loop."""
 import os
 
 import pytest
@@ -100,7 +97,7 @@ def test_indexer_mask_equals_the_reference_loop(monkeypatch, kind, ties, floaty)
     assert zoo_qwen4_exp.QWEN4_EXP_INDEXER_STATS["vectorised"] == before + 1
     assert got.dtype == want.dtype and got.shape == want.shape
     assert torch.equal(got, want)
-    # The selection really drops blocks here (otherwise this would only test the within-budget case).
+    # Beyond the budget, so blocks really are dropped.
     visible = mask if mask.dtype == torch.bool else mask == 0
     assert not torch.equal(got if got.dtype == torch.bool else got == 0, visible)
 
@@ -144,10 +141,9 @@ def _loss_and_grads(model, ids, mask):
 
 
 def test_text_model_losses_and_grads_match_the_loop(monkeypatch):
-    # fp32 text model over 2 x 61 tokens, beyond the budget, the reference (dense) attention: the vectorised mask
-    # gives the loop's loss and gradients (the selection is discrete, so they are equal, not only close).
+    # Discrete selection: loss and gradients must be equal to the loop's, not only close.
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "")
-    monkeypatch.setenv("UNSLOTH_QWEN4_EXP_SPARSE_ATTN", "0")  # the T4 / CPU route: dense reference attention
+    monkeypatch.setenv("UNSLOTH_QWEN4_EXP_SPARSE_ATTN", "0")
     monkeypatch.setenv("UNSLOTH_FROZEN_TABLE", "gpu")
     monkeypatch.delenv("UNSLOTH_QWEN4_EXP_EXACT_TIES", raising = False)
     _plain_gdn(monkeypatch)
