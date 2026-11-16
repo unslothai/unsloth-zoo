@@ -522,6 +522,35 @@ def test_offloaded_rows_are_never_loaded(tmp_path):
             site.embed_tokens_per_layer(mx.array([outside]))
 
 
+class _TextOnlyVLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.language_model = nn.Embedding(16, 8)
+        self.vision_tower = nn.Linear(4096, 4096, bias = False)  # 64 MiB of float32
+
+    def get_input_embeddings(self, input_ids = None, pixel_values = None):
+        return self.language_model(input_ids)
+
+    def __call__(self, input_ids):
+        return self.get_input_embeddings(input_ids).cumsum(axis = 1)
+
+
+def test_a_detached_vision_tower_is_never_read(tmp_path):
+    """drop_vision_weights detaches the tower before the load reads its weights, so the peak never holds it."""
+    from unsloth_zoo.mlx.loader import _detach_vision_modules, _settle_detached_vision
+
+    model = _lazy_copy(_TextOnlyVLM, str(tmp_path))
+    mx.synchronize()
+    mx.clear_cache()
+    before = mx.get_active_memory()
+    mx.reset_peak_memory()
+    detached = _detach_vision_modules(model)
+    mx.eval(model.parameters())
+    assert _settle_detached_vision(model, detached) == 4096 * 4096 * 4
+    assert mx.get_peak_memory() - before < 4096 * 4096 * 4 // 16
+    assert "vision_tower" not in model and model._unsloth_supports_images is False
+
+
 @pytest.mark.parametrize("cast", [True, False])
 def test_offloaded_floats_get_the_load_cast(tmp_path, cast):
     def build():
