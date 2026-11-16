@@ -5070,7 +5070,6 @@ def test_grpo_config_resolves_as_cuda_unsloth(overrides, expected, warns):
     ({"num_generations": 1, "per_device_train_batch_size": 1}, "at least 2"),
     ({"temperature": 10.0}, "between 0 and 10"),
     ({"loss_type": "cispo"}, "loss_type='cispo'"),
-    ({"use_vllm": True}, "use_vllm"),
     ({"use_liger_loss": True}, "use_liger_loss"),
     ({"generation_kwargs": {"num_beams": 2}}, r"\['num_beams'\] are not supported"),
     ({"generation_kwargs": {"do_sample": False}}, "do_sample must be True"),
@@ -5085,6 +5084,126 @@ def test_grpo_config_refuses_what_trl_refuses(overrides, match):
 
     with pytest.raises(ValueError, match=match):
         MLXGRPOConfig(**overrides)
+
+
+def test_vllm_rollout_params_let_vllm_sampling_params_override_all_but_what_grpo_config_owns():
+    from unsloth_zoo.mlx.grpo import GRPOSampling, vllm_rollout_params
+
+    class SamplingParams:
+        def __init__(self, temperature=1.0, top_p=1.0, top_k=-1, min_p=0.0, seed=None, max_tokens=16, n=1,
+                     stop=None, include_stop_str_in_output=False):
+            vars(self).update(temperature=temperature, top_p=top_p, top_k=top_k, min_p=min_p, seed=seed,
+                              max_tokens=max_tokens, n=n, stop=stop, include_stop_str_in_output=include_stop_str_in_output)
+
+    sampling = GRPOSampling(max_tokens=8, temperature=0.9, top_p=0.95)
+    base = dict(temperature=0.9, top_p=0.95, top_k=-1, min_p=0.0, repetition_penalty=1.0, stop_token_ids=[5])
+    assert vllm_rollout_params(sampling, 5) == base
+    # A notebook's vllm_sampling_params: top_p=1.0 and top_k=-1 are vLLM's defaults, so the config's stay.
+    user = SamplingParams(temperature=0.1, top_p=1.0, min_p=0.1, seed=3407, max_tokens=99, n=4,
+                          stop=["</s>"], include_stop_str_in_output=True)
+    assert vllm_rollout_params(sampling, 5, user) == {
+        **base, "min_p": 0.1, "stop": ["</s>"], "include_stop_str_in_output": True,
+    }
+    # Unsloth's vLLMSamplingParams records what was passed, so an explicit default still overrides.
+    user._set_kwargs = dict(top_p=1.0, seed=1, bogus=2)
+    assert vllm_rollout_params(sampling, 5, user) == {**base, "top_p": 1.0}
+
+
+def test_grpo_plan_samples_through_the_vllm_engine_with_the_live_adapter(monkeypatch):
+    from unsloth_zoo.mlx import generate as generate_module
+    from unsloth_zoo.mlx import vllm_utils
+    from unsloth_zoo.mlx.grpo import GRPOSampling, create_grpo_batch_plan, vllm_rollout_params
+
+    class SamplingParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    events, request, seen = [], types.SimpleNamespace(lora_int_id=7), {}
+    monkeypatch.setitem(sys.modules, "vllm", types.SimpleNamespace(SamplingParams=SamplingParams))
+    monkeypatch.setattr(generate_module, "generate_batch", lambda *args, **kwargs: pytest.fail("sampled on MLX"))
+    monkeypatch.setattr(vllm_utils, "load_lora", lambda model, load_tensors: events.append(("load", load_tensors)) or request)
+    monkeypatch.setattr(vllm_utils, "release_lora", lambda model, used: events.append(("release", used)))
+    # (finish_reason, stop_reason, token_ids), vLLM keeping the stopping token: EOS (2), the length cap, a stop
+    # string, and a custom stop token, which TRL counts as truncated since no EOS ends it.
+    finishes = [("stop", None, [1, 2]), ("length", None, [1, 1, 1]), ("stop", "\n\n", [1, 1]), ("stop", 77, [1, 77])]
+
+    class Engine:
+        def generate(self, prompts, params, *, lora_request, use_tqdm):
+            events.append(("generate", lora_request))
+            self.prompts, self.params = prompts, params
+            return [types.SimpleNamespace(outputs=[types.SimpleNamespace(token_ids=ids, finish_reason=reason, stop_reason=stop)])
+                    for reason, stop, ids in finishes]
+
+    def reward(completion_ids, **_):
+        seen["ids"] = completion_ids
+        return [0.0] * len(completion_ids)
+
+    model = types.SimpleNamespace(vllm_engine=Engine())
+    plan = create_grpo_batch_plan(
+        [{"prompt": "a"}, {"prompt": "aaaa"}], DecodingTokenizer(), num_generations=2, batch_size=2,
+        steps_per_generation=2, num_iterations=1, grad_accum=2, sampling=GRPOSampling(max_tokens=3),
+        max_seq_length=6, shuffle=False, num_batches=2,
+    )
+    params = vllm_rollout_params(plan.sampling, plan.eos_id)
+    plan.bind(model, [reward], trainer_state=types.SimpleNamespace(num_input_tokens_seen=0), vllm_params=params)
+    plan.materialize(0)
+    assert events == [("load", True), ("generate", request), ("release", request)]
+    assert model.vllm_engine.prompts == [{"prompt_token_ids": list(plan._prompt_ids[row // 2])} for row in range(4)]
+    assert [param.kwargs["max_tokens"] for param in model.vllm_engine.params] == [3, 3, 2, 2]
+    assert len({param.kwargs["seed"] for param in model.vllm_engine.params}) == 4
+    assert all(param.kwargs.items() >= params.items() for param in model.vllm_engine.params)
+    assert seen["ids"] == [[1, 2], [1, 1, 1], [1, 1], [1, 77]]
+    assert plan.pop_metrics()["completions/clipped_ratio"] == 0.75
+
+
+@pytest.mark.parametrize("engine, adapted, use_vllm, outcome", [
+    (False, True, True, "this model has none"),
+    (True, False, True, "needs LoRA adapters"),
+    (True, True, False, True),  # an engine samples GRPO without use_vllm, as on CUDA
+    (True, False, False, False),  # full fine-tuning samples on MLX
+    (False, True, False, False),
+])
+def test_grpo_samples_through_a_vllm_engine_only_with_lora(tmp_path, monkeypatch, engine, adapted, use_vllm, outcome):
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+
+    lora = trainer_module.iter_mlx_lora_modules
+    monkeypatch.setattr(trainer_module, "iter_mlx_lora_modules", lambda model: iter([("q_proj", None)]) if adapted else lora(model))
+    model = _tiny_model()
+    if engine:
+        model.vllm_engine = object()
+
+    def build():
+        return MLXGRPOTrainer(model, DecodingTokenizer(), _grpo_rows(), args=_grpo_config(tmp_path, compile=False, use_vllm=use_vllm),
+                              reward_funcs=lambda completions, **_: [0.0] * len(completions))
+    if isinstance(outcome, str):
+        with pytest.raises(ValueError, match=outcome):
+            build()
+        return
+    trainer = build()
+    assert trainer._grpo_vllm is outcome
+    params = trainer._grpo_vllm_params(types.SimpleNamespace(eos_id=2))
+    assert (params is not None) is outcome and (not params or params["stop_token_ids"] == [2])
+
+
+def test_grpo_trains_and_evaluates_through_the_vllm_engine(tmp_path, monkeypatch):
+    from unsloth_zoo.mlx import grpo as grpo_module
+    from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
+
+    plans = []
+
+    def fake_vllm(self, visit, prompts):
+        plans.append(id(self))
+        return [grpo_module._VLLMRollout(types.SimpleNamespace(token_ids=[1, 2])) for _ in prompts]
+    monkeypatch.setattr(grpo_module.GRPOBatchPlan, "_generate_vllm", fake_vllm)
+    model, calls = _tiny_model(lora=True), []
+    model.vllm_engine = object()
+    trainer = MLXGRPOTrainer(model, DecodingTokenizer(), _grpo_rows(), eval_dataset=_grpo_rows(2),
+                             reward_funcs=lambda completions, **_: [0.0] * len(completions),
+                             args=_grpo_config(tmp_path, max_steps=2, eval_steps=2, per_device_eval_batch_size=4))
+    _run_generation_trainer(trainer, monkeypatch, calls)
+    # Training and evaluation both sample through vLLM; nothing reaches MLX generation.
+    assert calls == [] and len(set(plans)) == 2
 
 
 def _grpo_config(tmp_path, **overrides):

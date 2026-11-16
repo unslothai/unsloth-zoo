@@ -119,6 +119,46 @@ def _is_conversational_prompt(prompt):
     )
 
 
+class _VLLMRollout:
+    """A vLLM completion for cut_completion. vLLM keeps the token it stopped on in token_ids, so nothing is
+    appended and, as TRL reads vLLM's ids, only an EOS ends a completion untruncated."""
+
+    finish_reason = None
+
+    def __init__(self, completion):
+        self.token_ids = list(completion.token_ids)
+
+
+# GRPOConfig owns these, so vllm_sampling_params never overrides them (CUDA Unsloth's rule).
+_VLLM_CONFIG_OWNED = ("seed", "n", "temperature", "max_tokens", "logprobs")
+
+
+def vllm_rollout_params(sampling, eos_id, vllm_sampling_params=None):
+    """SamplingParams kwargs for GRPO rollouts: the config's sampling, then every field vllm_sampling_params sets
+    (its ``_set_kwargs`` from Unsloth's vLLMSamplingParams, else what differs from vLLM's defaults), except those
+    GRPOConfig owns."""
+    import inspect
+
+    params = dict(
+        temperature=sampling.temperature, top_p=sampling.top_p, top_k=sampling.top_k or -1,
+        min_p=sampling.min_p or 0.0, repetition_penalty=sampling.repetition_penalty, stop_token_ids=[eos_id],
+    )
+    if vllm_sampling_params is not None:
+        kind = type(vllm_sampling_params)
+        names = inspect.signature(kind).parameters
+        overrides = getattr(vllm_sampling_params, "_set_kwargs", None)
+        if overrides is None:
+            default = kind()
+            overrides = {
+                name: getattr(vllm_sampling_params, name) for name in names
+                if not name.startswith("_") and hasattr(vllm_sampling_params, name)
+                and getattr(vllm_sampling_params, name) != getattr(default, name, None)
+            }
+        params.update((name, value) for name, value in overrides.items()
+                      if name in names and name not in _VLLM_CONFIG_OWNED)
+    return params
+
+
 def cut_completion(token_ids, finish_reason, *, eos_id, pad_id):
     """TRL's completion runs through the first EOS and reports whether it was truncated; the generation engine leaves the stopping id out of token_ids."""
     ids = [int(token) for token in token_ids]
@@ -925,7 +965,7 @@ class GRPOBatchPlan:
     def bind(
         self, model, reward_funcs, *, trainer_state, reward_weights=None,
         reference_policy=None, rollout_context=None, keep_completions=False, scorer=None,
-        step_compiled=None,
+        step_compiled=None, vllm_params=None,
     ):
         """Attach the policy, rewards and reference; trainer_state reaches reward functions and counts prompt and
         completion tokens as TRL does; keep_completions holds the latest texts; scorer is the loss's runtime CCE, so
@@ -943,6 +983,8 @@ class GRPOBatchPlan:
         self._reference_policy = reference_policy
         self._trainer_state = trainer_state
         self._rollout_context = rollout_context or nullcontext
+        # SamplingParams kwargs for rollouts through the model's vLLM engine; None samples on MLX.
+        self._vllm_params = vllm_params
         self._keep_completions = keep_completions
         self._logps = grpo_logps(self.score_temperature, scorer, differentiated=False)
         self._reference_logps = grpo_logps(self.score_temperature, _reference_scorer(
@@ -1233,6 +1275,8 @@ class GRPOBatchPlan:
         # Read again each generation and held only for it: the plan keeps no pixels.
         encoded = {prompt: self._reencode(prompt, row) for prompt, row in read.items()} if self.vision else {}
         images = any(inputs is not None for *_, inputs in encoded.values())
+        if self._vllm_params is not None and not images:
+            return self._finish_generation(visit, prompts, read, encoded, self._generate_vllm(visit, prompts))
         engine = None if images else generate_module.text_engine_model(self._model)
         text = engine is not None
         requests = [
@@ -1266,6 +1310,32 @@ class GRPOBatchPlan:
                 (getattr(self._processor, "tokenizer", self._processor) if text else self._processor) or self._tokenizer,
                 requests, defaults=defaults,
             )
+        return self._finish_generation(visit, prompts, read, encoded, results)
+
+    def _generate_vllm(self, visit, prompts):
+        """Rollouts from the model's vLLM engine with a snapshot of the live adapter, which it reads from disk."""
+        from vllm import SamplingParams as VLLMSamplingParams
+
+        from .vllm_utils import load_lora, release_lora
+
+        request = load_lora(self._model, load_tensors=True)
+        params = [
+            VLLMSamplingParams(
+                **self._vllm_params, max_tokens=self._max_tokens[prompt],
+                seed=_derived_seed(self.seed, visit, 0, row),
+            )
+            for row, prompt in enumerate(prompts)
+        ]
+        try:
+            outputs = self._model.vllm_engine.generate(
+                [{"prompt_token_ids": list(self._prompt_ids[prompt])} for prompt in prompts],
+                params, lora_request=request, use_tqdm=False,
+            )
+        finally:
+            release_lora(self._model, request)
+        return [_VLLMRollout(output.outputs[0]) for output in outputs]
+
+    def _finish_generation(self, visit, prompts, read, encoded, results):
         cut = [
             cut_completion(result.token_ids, result.finish_reason, eos_id=self.eos_id, pad_id=self.pad_id)
             for result in results
@@ -1974,8 +2044,6 @@ def _resolve_prefix_grouper(config):
 
 def resolve_grpo_config(config):
     """CUDA Unsloth's GRPOConfig rewrites, then TRL 0.24's ``__post_init__``."""
-    if config.use_vllm:
-        raise ValueError("Unsloth MLX GRPO: use_vllm needs vLLM; MLX samples with its own engine.")
     if config.use_liger_loss:
         raise ValueError("Unsloth MLX GRPO: use_liger_loss selects a CUDA kernel.")
     default_loss_type = config.loss_type is None
