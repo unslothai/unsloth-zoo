@@ -216,6 +216,31 @@ def _patch_max_seq_length_alias(config_cls):
     config_cls.__init__ = __init__
 
 
+def _sft_loss_takes_num_items(trainer):
+    """The CPU SFT loss (chunked CE or TRL's fused LM head) divides by num_items_in_batch itself, whatever the
+    model's accepts_loss_kwargs says."""
+    if getattr(trainer, "compute_loss_func", None) is not None or getattr(trainer, "label_smoother", None) is not None:
+        return False
+    loss_type = str(_name(getattr(trainer.args, "loss_type", None) or "nll"))
+    model = trainer.model
+    for candidate in (model, getattr(model, "base_model", None), getattr(getattr(model, "base_model", None), "model", None)):
+        if candidate is not None and vars(candidate).get("_unsloth_cpu_chunked_ce", False) and loss_type == "nll":
+            return True
+    try:
+        import trl.trainer.utils as trl_utils
+    except Exception:
+        return False
+    return hasattr(trl_utils, "add_fused_lm_head") and loss_type in ("nll", "dft")
+
+
+def _count_items_for_sft_loss(trainer):
+    """Without the count each micro-batch loss is its own mean, so accumulation / DDP weight rows wrongly."""
+    if getattr(trainer, "model_accepts_loss_kwargs", True) or not _sft_loss_takes_num_items(trainer):
+        return False
+    trainer.model_accepts_loss_kwargs = True
+    return True
+
+
 def _make_cpu_sft_trainer(base):
     if getattr(base, "_unsloth_cpu", False):
         return base
@@ -259,6 +284,7 @@ def _make_cpu_sft_trainer(base):
             finally:
                 if serial:
                     training_args.dataset_num_proc = num_proc
+            _count_items_for_sft_loss(self)
 
     # Pickled by reference: by value (TRL's tokenize map, dataset_num_proc > 1) fails on torch config modules.
     SFTTrainer.__module__ = __name__
