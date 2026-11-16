@@ -1,0 +1,178 @@
+import importlib.util
+import os
+import sys
+import types
+
+import pytest
+
+if importlib.util.find_spec("mlx") is None:
+    from mlx_simulation import simulate_mlx_on_torch
+    simulate_mlx_on_torch()
+
+from unsloth_zoo.mlx import vllm_utils  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "fast_inference, env, error, installed, expected",
+    [
+        (False, "1", None, True, False),
+        (True, "", None, True, True),
+        (True, "", "not installed", False, False),
+        (True, "", "failed to import", True, False),
+        (True, "0", None, True, False),
+        (True, "1", None, True, True),
+    ],
+)
+def test_use_vllm_prefers_a_working_vllm_metal_and_honours_the_override(
+    monkeypatch, recwarn, fast_inference, env, error, installed, expected,
+):
+    monkeypatch.setenv(vllm_utils.VLLM_ENV, env)
+    monkeypatch.setattr(vllm_utils, "_metal_platform_error", lambda: error)
+    monkeypatch.setattr(vllm_utils, "_installed", lambda: installed)
+    assert vllm_utils.use_vllm(fast_inference) is expected
+    # Only an installation that does not work is worth a warning; a missing one is the default.
+    assert [str(w.message) for w in recwarn] == (["Unsloth MLX: fast_inference keeps MLX generation because failed to import."] if error == "failed to import" else [])
+
+
+def test_use_vllm_refuses_a_forced_engine_that_does_not_work_and_unknown_values(monkeypatch):
+    monkeypatch.setattr(vllm_utils, "_metal_platform_error", lambda: "vLLM failed to import (boom)")
+    monkeypatch.setenv(vllm_utils.VLLM_ENV, "1")
+    with pytest.raises(ImportError, match=r"failed to import \(boom\).*vllm-metal"):
+        vllm_utils.use_vllm(True)
+    monkeypatch.setenv(vllm_utils.VLLM_ENV, "yes")
+    with pytest.raises(ValueError, match="UNSLOTH_MLX_VLLM"):
+        vllm_utils.use_vllm(True)
+
+
+@pytest.mark.parametrize(
+    "installed, platform_module, expected",
+    [
+        (False, "vllm_metal.platform", "not installed"),
+        (True, None, "failed to import"),
+        (True, "no LLM", "failed to import"),
+        (True, "vllm.platforms.cpu", "not vllm-metal"),
+        (True, "vllm_metal.platform", None),
+    ],
+)
+def test_metal_platform_error_needs_vllm_to_import_and_resolve_metal(monkeypatch, installed, platform_module, expected):
+    if platform_module is None:
+        monkeypatch.setitem(sys.modules, "vllm.platforms", None)
+    elif platform_module == "no LLM":
+        # vLLM resolves its platform, but its lazily imported LLM entry point fails.
+        _fake_vllm(monkeypatch, "vllm_metal.platform")
+        monkeypatch.setitem(sys.modules, "vllm", types.SimpleNamespace())
+    else:
+        _fake_vllm(monkeypatch, platform_module)
+    monkeypatch.setattr(vllm_utils, "_installed", lambda: installed)
+    error = vllm_utils._metal_platform_error()
+    assert error is None if expected is None else expected in error
+    assert vllm_utils.vllm_metal_available() is (expected is None)
+
+
+def _fake_vllm(monkeypatch, platform_module):
+    platform = type("MetalPlatform", (), {"__module__": platform_module})()
+    created = []
+
+    class LLM:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.removed = []
+            self.llm_engine = types.SimpleNamespace(remove_lora=self.removed.append)
+            created.append(self)
+
+        def generate(self, *args, **kwargs):
+            return ("generated", args, kwargs)
+
+    class LoRARequest:
+        def __init__(self, lora_name, lora_int_id, lora_path):
+            self.lora_name, self.lora_int_id, self.lora_path = lora_name, lora_int_id, lora_path
+
+    monkeypatch.setitem(sys.modules, "vllm", types.SimpleNamespace(LLM=LLM))
+    monkeypatch.setitem(sys.modules, "vllm.platforms", types.SimpleNamespace(current_platform=platform))
+    monkeypatch.setitem(sys.modules, "vllm.lora", types.SimpleNamespace())
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", types.SimpleNamespace(LoRARequest=LoRARequest))
+    monkeypatch.setattr(vllm_utils, "_installed", lambda: True)
+    return created
+
+
+def test_load_vllm_starts_an_in_process_metal_engine_on_the_loaded_checkpoint(monkeypatch):
+    monkeypatch.delenv("VLLM_ENABLE_V1_MULTIPROCESSING", raising=False)
+    created = _fake_vllm(monkeypatch, "vllm_metal.platform")
+    model = types.SimpleNamespace(_src_path="/snap/qwen", _hf_repo="Qwen/Qwen3-0.6B")
+    engine = vllm_utils.load_vllm(model, max_seq_length=512, gpu_memory_utilization=0.3, max_lora_rank=32, seed=7)
+    assert engine.kwargs == dict(
+        model="/snap/qwen", max_model_len=512, gpu_memory_utilization=0.3, seed=7,
+        enable_lora=True, max_lora_rank=32, max_loras=1,
+    )
+    assert os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] == "0"
+    full = vllm_utils.load_vllm(model, max_seq_length=512, enable_lora=False)
+    assert "enable_lora" not in full.kwargs and len(created) == 2
+    vllm_utils.attach_vllm_engine(model, engine)
+    assert model.vllm_engine is engine and model.fast_generate("hi")[0] == "generated"
+
+
+def test_load_vllm_refuses_a_non_metal_vllm(monkeypatch):
+    _fake_vllm(monkeypatch, "vllm.platforms.cpu")
+    with pytest.raises(ImportError, match="not vllm-metal"):
+        vllm_utils.load_vllm(types.SimpleNamespace(_src_path="/snap"), max_seq_length=64)
+
+
+class _AdapterModel:
+    def __init__(self):
+        self.version = 0
+
+    def save_lora_adapters(self, path, adapter_format):
+        assert adapter_format == "peft" and not os.path.exists(path)
+        os.makedirs(path)
+        self.version += 1
+        for name in ("adapter_model.safetensors", "adapter_config.json"):
+            with open(os.path.join(path, name), "w") as handle:
+                handle.write(str(self.version))
+
+
+def test_save_lora_writes_peft_and_replaces_an_earlier_save(tmp_path):
+    model, target = _AdapterModel(), tmp_path / "grpo_saved_lora"
+    vllm_utils.save_lora(model, target)
+    vllm_utils.save_lora(model, target)
+    assert (target / "adapter_model.safetensors").read_text() == (target / "adapter_config.json").read_text() == "2"
+    assert sorted(os.listdir(tmp_path)) == ["grpo_saved_lora"]
+    mlx_dir = tmp_path / "mlx"
+    mlx_dir.mkdir()
+    (mlx_dir / "adapters.safetensors").write_text("")
+    with pytest.raises(ValueError, match="MLX-format adapter"):
+        vllm_utils.save_lora(model, mlx_dir)
+
+
+def test_load_lora_builds_path_requests_and_releases_live_snapshots(monkeypatch, tmp_path):
+    _fake_vllm(monkeypatch, "vllm_metal.platform")
+    model = _AdapterModel()
+    with pytest.raises(RuntimeError, match="vLLM engine"):
+        vllm_utils.load_lora(model, tmp_path)
+    model.vllm_engine = sys.modules["vllm"].LLM()
+    saved = tmp_path / "grpo_saved_lora"
+    vllm_utils.save_lora(model, saved)
+    other = _AdapterModel()
+    other.vllm_engine = model.vllm_engine
+    first, second = vllm_utils.load_lora(model, saved), vllm_utils.load_lora(other, saved)
+    assert first.lora_path == second.lora_path == str(saved)
+    # vLLM reserves lora_int_id 0 for "no adapter".
+    assert first.lora_int_id >= 1 and second.lora_int_id == first.lora_int_id + 1
+    assert second.lora_name == str(second.lora_int_id)
+    pinned = vllm_utils.load_lora(model, saved, lora_request_id=1000)
+    assert pinned.lora_int_id == 1000
+    assert vllm_utils.load_lora(model, saved).lora_int_id == second.lora_int_id + 2
+    converted = []
+    monkeypatch.setattr(vllm_utils, "convert_mlx_dir_to_peft", lambda src, dst: converted.append(src) or os.makedirs(dst))
+    mlx_dir = tmp_path / "mlx"
+    mlx_dir.mkdir()
+    (mlx_dir / "adapters.safetensors").write_text("")
+    assert vllm_utils.load_lora(model, mlx_dir).lora_path != str(mlx_dir) and converted == [str(mlx_dir)]
+    live = vllm_utils.load_lora(model, load_tensors=True)
+    later = vllm_utils.load_lora(model, load_tensors=True)
+    assert later.lora_path != live.lora_path
+    read = lambda request: open(os.path.join(request.lora_path, "adapter_model.safetensors")).read()
+    assert (read(live), read(later)) == (str(model.version - 1), str(model.version))
+    vllm_utils.release_lora(model, live)
+    assert model.vllm_engine.removed == [live.lora_int_id] and not os.path.exists(live.lora_path)
+    vllm_utils.release_lora(model, first)
+    assert saved.exists()
