@@ -5807,7 +5807,17 @@ def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
         import timm.layers.fast_norm
 
         timm.layers.fast_norm.is_fast_norm = lambda *args, **kwargs: False
+        _timm_rms_norm2d = timm.layers.fast_norm.rms_norm2d
         timm.layers.fast_norm.rms_norm2d = rms_norm2d
+        # timm.layers.norm / norm_act bind rms_norm2d by name at import, so RmsNorm2d and
+        # RmsNormAct2d (Gemma 3N's MobileNetV5) keep timm's version, which returns float32 for a
+        # float16 input against the float32 norm weights Unsloth pins. Without autocast (forced
+        # float32 training on T4) the next float16 conv then raises "expected scalar type Float
+        # but found Half". Rebind every timm module still holding the original.
+        for _name, _module in list(sys.modules.items()):
+            if (_name == "timm" or _name.startswith("timm.")) and _module is not None:
+                if getattr(_module, "rms_norm2d", None) is _timm_rms_norm2d:
+                    _module.rms_norm2d = rms_norm2d
         if UNSLOTH_ENABLE_LOGGING:
             print("Unsloth: Compiled timm.layers.fast_norm")
     except:
