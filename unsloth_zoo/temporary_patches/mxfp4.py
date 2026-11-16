@@ -421,9 +421,8 @@ def patch_save_pretrained_mxfp4():
             for name, param in list(module._parameters.items())
             if is_packed_expert_param(param)
         ]
-        # Reversing the Mxfp4Dequantize converters raises (5.4), drops layers under "down_proj$" (5.17) or, from 5.22,
-        # renames dense experts to "gate_up_proj_blocks" with no scales. Strip them even with no packed param left:
-        # merge_and_unload() makes the experts dense but the load's converters stay on the model.
+        # Reversing Mxfp4Dequantize raises (5.4), drops layers (5.17) or renames dense experts (5.22+). Strip them
+        # even with no packed param left: merge_and_unload() keeps the load's converters on the model.
         conversions = self.__dict__.get("_weight_conversions", None)
         if isinstance(conversions, (list, tuple)):
             self._weight_conversions = [
