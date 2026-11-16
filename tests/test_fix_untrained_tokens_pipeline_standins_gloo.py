@@ -65,9 +65,22 @@ def _standin(t):
 
 
 DATA = [{"input_ids": [1, 5, 2]}, {"input_ids": [6, 9, 3]}]
+MARK = "_unsloth_pp_preload"  # set by the per-stage pipeline loader on every rank's model
+# rank -> (holds the embedding, holds the lm_head): split across ranks, or colocated on rank 0 (tied / pinned).
+LAYOUTS = {"split": ((True, False), (False, True)), "colocated": ((True, True), (False, False))}
+
+
+def _rank_model(layout, rank, marked = True):
+    embed, head = _weights()
+    has_embed, has_head = LAYOUTS[layout][rank]
+    model = _Model(embed if has_embed else _standin(embed), head if has_head else _standin(head))
+    if marked:
+        model.__dict__[MARK] = {"rank": rank}
+    return model
 
 
 def _worker(rank, init_file, out):
+    import datetime
     import torch.distributed as dist
     import tracemalloc
     import importlib.util
@@ -76,23 +89,55 @@ def _worker(rank, init_file, out):
         os.environ.setdefault("UNSLOTH_ZOO_DISABLE_GPU_INIT", "1")
     from unsloth_zoo import tokenizer_utils
 
-    dist.init_process_group("gloo", init_method = "file://" + init_file, rank = rank, world_size = 2)
+    # A rank entering a collective the other skips fails in seconds instead of hanging the suite.
+    dist.init_process_group(
+        "gloo", init_method = "file://" + init_file, rank = rank, world_size = 2,
+        timeout = datetime.timedelta(seconds = 30),
+    )
+    calls = []
+    all_reduce = dist.all_reduce
+
+    def counting_all_reduce(*args, **kwargs):
+        calls.append(1)
+        return all_reduce(*args, **kwargs)
+
+    dist.all_reduce = counting_all_reduce
     try:
-        embed, head = _weights()
-        model = _Model(embed, _standin(head)) if rank == 0 else _Model(_standin(embed), head)
-        tracemalloc.start()
-        try:
+        results = {}
+        # Warm every lazy import (torch.distributed.tensor, numpy paths) before tracing host memory.
+        tokenizer_utils.fix_untrained_tokens(_rank_model("split", rank), _Tokenizer(), DATA)
+        for layout in LAYOUTS:
+            model = _rank_model(layout, rank)
+            del calls[:]
+            tracemalloc.start()
+            try:
+                tokenizer_utils.fix_untrained_tokens(model, _Tokenizer(), DATA)
+                res = {"error": None}
+            except Exception as e:  # asserted in the parent
+                res = {"error": repr(e)}
+            res["host_peak"] = tracemalloc.get_traced_memory()[1]
+            tracemalloc.stop()
+            res["collectives"] = len(calls)
+            res["free"] = [not any(w.stride()) for w in (model.embed_tokens.weight, model.lm_head.weight)]
+            res["embed"] = model.embed_tokens.weight.detach().clone()
+            res["head"] = model.lm_head.weight.detach().clone()
+            results[layout] = res
+        # No per-stage mark (DDP / FSDP2 replicas, one process): never a collective, even in a process group.
+        # Only rank 0 calls it: entering a collective would time out.
+        if rank == 0:
+            del calls[:]
+            embed, head = _weights()
+            model = _Model(embed, head)
             tokenizer_utils.fix_untrained_tokens(model, _Tokenizer(), DATA)
-            res = {"error": None}
-        except Exception as e:  # asserted in the parent
-            res = {"error": repr(e)}
-        res["host_peak"] = tracemalloc.get_traced_memory()[1]
-        tracemalloc.stop()
-        res["free"] = [not any(w.stride()) for w in (model.embed_tokens.weight, model.lm_head.weight)]
-        res["embed"] = model.embed_tokens.weight.detach().clone()
-        res["head"] = model.lm_head.weight.detach().clone()
-        torch.save(res, os.path.join(out, f"rank{rank}.pt"))
+            results["unmarked"] = {"collectives": len(calls), "embed": model.embed_tokens.weight.detach().clone()}
+            del calls[:]
+            model = _rank_model("split", 1, marked = False)
+            tokenizer_utils.fix_untrained_tokens(model, _Tokenizer(), DATA)
+            results["unmarked_standin"] = {"collectives": len(calls), "head": model.lm_head.weight.detach().clone()}
+        dist.barrier()
+        torch.save(results, os.path.join(out, f"rank{rank}.pt"))
     finally:
+        dist.all_reduce = all_reduce
         dist.destroy_process_group()
 
 
@@ -103,7 +148,7 @@ def ranks(tmp_path_factory):
     return [torch.load(os.path.join(out, f"rank{r}.pt")) for r in range(2)]
 
 
-def test_pipeline_ranks_reset_the_rows_one_process_resets(ranks):
+def _one_process():
     import importlib.util
 
     if importlib.util.find_spec("unsloth") is None:
@@ -115,14 +160,37 @@ def test_pipeline_ranks_reset_the_rows_one_process_resets(ranks):
     tokenizer_utils.fix_untrained_tokens(full, _Tokenizer(), DATA)
     full_embed, full_head = full.embed_tokens.weight.detach(), full.lm_head.weight.detach()
     assert not torch.equal(full_embed[5], embed[5]) and torch.equal(full_head[9], head[9])
+    return full_embed, full_head
+
+
+@pytest.mark.parametrize("layout", list(LAYOUTS))
+def test_pipeline_ranks_reset_the_rows_one_process_resets(ranks, layout):
+    full_embed, full_head = _one_process()
     for rank, res in enumerate(ranks):
+        res = res[layout]
         assert res["error"] is None, (rank, res["error"])
-    torch.testing.assert_close(ranks[0]["embed"], full_embed, rtol = 0, atol = 0)
-    torch.testing.assert_close(ranks[1]["head"], full_head, rtol = 0, atol = 0)
-    # The stand-ins stay stand-ins.
-    assert ranks[0]["free"] == [False, True] and ranks[1]["free"] == [True, False]
+        assert res["collectives"] == 2, (rank, res["collectives"])  # every rank, whatever it holds
+        held = LAYOUTS[layout][rank]
+        assert res["free"] == [not held[0], not held[1]], (rank, res["free"])  # stand-ins stay stand-ins
+        if held[0]:
+            torch.testing.assert_close(res["embed"], full_embed, rtol = 0, atol = 0)
+        if held[1]:
+            torch.testing.assert_close(res["head"], full_head, rtol = 0, atol = 0)
+
+
+def test_unmarked_runs_never_enter_a_collective(ranks):
+    full_embed, full_head = _one_process()
+    res = ranks[0]["unmarked"]
+    assert res["collectives"] == 0
+    torch.testing.assert_close(res["embed"], full_embed, rtol = 0, atol = 0)
+    # Holding only the lm_head with no pipeline group to judge the rest: skipped, untouched.
+    _, head = _weights()
+    res = ranks[0]["unmarked_standin"]
+    assert res["collectives"] == 0 and torch.equal(res["head"], head)
 
 
 def test_pipeline_rank_with_the_lm_head_copies_only_candidate_rows(ranks):
     # One float32 copy of the whole lm_head is VOCAB * HIDDEN * 4 = 1 MiB here (4.7 GiB on Qwen3.8-27B).
-    assert ranks[1]["host_peak"] < VOCAB * HIDDEN * 4 // 4, ranks[1]["host_peak"]
+    for rank, layout in ((1, "split"), (0, "colocated")):
+        peak = ranks[rank][layout]["host_peak"]
+        assert peak < VOCAB * HIDDEN * 4 // 4, (rank, layout, peak)

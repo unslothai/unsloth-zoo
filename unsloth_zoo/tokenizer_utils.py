@@ -541,14 +541,26 @@ def _storage_free(t):
     return t.dim() > 0 and t.numel() > 1 and not any(t.stride())
 
 
+# Unsloth's per-stage pipeline loader (pipeline_sharded_loading) marks the loaded model with this on every rank.
+_PER_STAGE_MARK = "_unsloth_pp_preload"
+
+
+def _per_stage_pipeline(model):
+    """Every rank of a per-stage pipeline load: the ranks hold the embedding / lm_head rows between them, so they
+    judge them together. Decided by the loader's mark, which all ranks share, never by this rank's stand-ins
+    (a rank may hold both matrices). Never True without a process group (DDP / FSDP2 / one process never are)."""
+    import torch.distributed as dist
+    if not (dist.is_available() and dist.is_initialized()):
+        return False
+    return any(_PER_STAGE_MARK in module.__dict__ for module in model.modules())
+
+
 def _and_over_ranks(mask, split):
     """Per-stage pipeline loads hold the embedding and the lm_head on different ranks, each judging only the
     rows of the matrix it has (all True for a stand-in): AND over every rank gives the one-process mask."""
     if not split:
         return mask
     import torch.distributed as dist
-    if not (dist.is_available() and dist.is_initialized()):
-        return mask
     backend = str(dist.get_backend()).lower()
     device = torch.device("cuda", torch.cuda.current_device()) if "nccl" in backend else torch.device("cpu")
     out = mask.to(device = device, dtype = torch.uint8)
@@ -615,7 +627,13 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     lm_head_matrix   = lm_head_matrix  [:min_size]
     # Per-stage pipeline load: this rank may hold only one of the two (the other is a storage-free stand-in).
     embedding_free, lm_head_free = _storage_free(embedding_matrix), _storage_free(lm_head_matrix)
-    split = embedding_free or lm_head_free
+    split = _per_stage_pipeline(model)
+    if (embedding_free or lm_head_free) and not split:
+        logger.warning(
+            "Unsloth: Skipping the untrained token fix: this process holds only part of the embedding / "
+            "lm_head and no per-stage pipeline group to judge the rest with."
+        )
+        return
 
     if embedding_free:
         indicator_untrained1 = torch.ones(min_size, dtype = torch.bool, device = embedding_matrix.device)
