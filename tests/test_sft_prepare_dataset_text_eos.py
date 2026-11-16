@@ -63,3 +63,18 @@ def test_chat_formatted_text_is_unchanged(tokenizer):
     assert not chat.endswith(tokenizer.eos_token), "the template ends after the turn marker"
     (ids,) = _ids(tokenizer, [chat])
     assert ids == tokenizer(chat, add_special_tokens = False)["input_ids"]
+
+
+class _AppendsEos:
+    """A tokenizer whose post-processor appends EOS (add_eos_token = True)."""
+    eos_token, eos_token_id, bos_token, chat_template = "</s>", 2, None, None
+
+    def __call__(self, text, add_special_tokens = True, **kwargs):
+        def ids(t):
+            return [3 + (ord(c) % 20) for c in t] + ([2] if add_special_tokens else [])
+        return {"input_ids": [ids(t) for t in text] if isinstance(text, list) else ids(text)}
+
+
+def test_a_tokenizer_that_appends_eos_gets_no_second_one():
+    (ids,) = _ids(_AppendsEos(), ["The sky is blue."])
+    assert ids == _AppendsEos()("The sky is blue.")["input_ids"] and ids.count(2) == 1

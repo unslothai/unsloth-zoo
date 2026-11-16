@@ -3044,6 +3044,14 @@ def sft_prepare_dataset(
             if getattr(t, "special", False) and str(t)
         )
         if _text_eos: _text_ends += (_text_eos,)
+        if _text_eos:
+            # A tokenizer that appends EOS itself (add_eos_token = True) needs none from us.
+            try:
+                _probe = tokenizer("a", add_special_tokens = add_special_tokens)["input_ids"]
+                if _probe and _probe[-1] == getattr(tokenizer, "eos_token_id", None):
+                    _text_eos = None
+            except Exception:
+                pass
 
         def _with_eos(text):
             if not _text_eos or not isinstance(text, str) or text.rstrip().endswith(_text_ends):
