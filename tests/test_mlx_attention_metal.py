@@ -678,6 +678,43 @@ def test_each_width_is_forced_at_the_width_measured_to_help(fused_attention, mon
         assert seen == [(widths[0], widths[0], widths[1], True)]
 
 
+@pytest.mark.parametrize("change", [None, "row_mask", "key_mask", "no_mask", "causal", "bfloat16", "28_simdgroups",
+                                    "newer_gpu"])
+def test_m1_m2_fp16_head_dim_256_rows_stay_under_the_vector_thread_limit(fused_attention, monkeypatch, change):
+    # 24/4 heads over 5 rows send 30 simdgroups; M1/M2 allow 28 in the unmasked and array-masked fp16 builds.
+    from unsloth_zoo.mlx import attention
+
+    HQ, L, dtype = 24, 5, mx.float16
+    if change == "28_simdgroups":
+        HQ, L = 28, 4
+    if change == "bfloat16":
+        dtype = mx.bfloat16
+    monkeypatch.setattr(attention, "_thread_limited_gpu", lambda: change != "newer_gpu")
+    q = mx.random.normal((2, HQ, L, 256), key=mx.random.key(0)).astype(dtype)
+    k, v = (mx.random.normal((2, 4, 2048, 256), key=mx.random.key(i)).astype(dtype) for i in (1, 2))
+    pads = mx.array([0, 9])[:, None, None, None]
+    mask = {"row_mask": mx.arange(2048) >= pads + mx.arange(L)[:, None] * 300, "no_mask": None,
+            "key_mask": mx.arange(2048) >= 9,
+            "causal": "causal"}.get(change, mx.broadcast_to(mx.arange(2048) >= pads, (2, 1, 1, 2048)))
+    launched = []
+
+    def spy(q, k, v, **kw):
+        launched.append(q.shape[-3] // k.shape[-3] * q.shape[-2])
+        return fused_attention(q, k, v, **kw)
+
+    out = attention.fused_sdpa_over(spy)(q, k, v, scale=256 ** -0.5, mask=mask)
+    split = change in (None, "row_mask", "key_mask", "no_mask")
+    assert launched == ([18, 12] if split else [HQ // 4 * L])
+    if split:
+        # One-row calls share the whole call's key partition and launch on M1/M2 too, so the bits must match.
+        rows = isinstance(mask, mx.array) and mask.ndim >= 2 and mask.shape[-2] > 1
+        want = mx.concatenate([fused_attention(q[..., i : i + 1, :], k, v, scale=256 ** -0.5,
+                                               mask=mask[..., i : i + 1, :] if rows else mask) for i in range(L)], axis=-2)
+        assert mx.array_equal(out, want).item()
+    if nax._gpu_generation() not in (13, 14):
+        assert mx.array_equal(out, fused_attention(q, k, v, scale=256 ** -0.5, mask=mask)).item()
+
+
 def test_the_padded_copies_count_against_dequantizing_and_only_where_a_call_is_forced(monkeypatch):
     monkeypatch.setattr(nax, "nax_available", lambda: True)
     assert forced_padding_row_bytes(192, 128, 2, 2, 8191) == 0
@@ -1089,3 +1126,4 @@ def test_invariant_attention_covers_kv_cache_layouts(change):
     v = k.astype(mx.float16) if change == "dtypes" else k[:, :, :-1] if change == "values" else k
     covered = change in (None, "group", "width", "fp16")
     assert invariant_attention_supported(q, k, v) == covered
+
