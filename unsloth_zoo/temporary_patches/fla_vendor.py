@@ -1497,10 +1497,12 @@ def _make_cpu_gated_delta_rule(original, recurrent):
             extra["use_gate_in_kernel"] = a.pop("use_gate_in_kernel", False)
             a.pop("A_log", None)
             a.pop("dt_bias", None)
-        _cpu_torch_state["calls"] += 1
-        if not _cpu_torch_state["logged"] and not _compiling():
-            _cpu_torch_state["logged"] = True
-            logger.info("Unsloth: gated-delta (linear attention) on CPU tensors runs in pure torch; fla is GPU only.")
+        # Host-side bookkeeping only outside tracing: a traced global counter is a guard, recompiling every call.
+        if not _compiling():
+            _cpu_torch_state["calls"] += 1
+            if not _cpu_torch_state["logged"]:
+                _cpu_torch_state["logged"] = True
+                logger.info("Unsloth: gated-delta (linear attention) on CPU tensors runs in pure torch; fla is GPU only.")
         return _rocm_fp32_chunk_gated_delta_rule(**a, **extra)
 
     setattr(gated_delta_rule, _CPU_TORCH_MARK, "torch")

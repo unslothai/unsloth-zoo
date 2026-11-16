@@ -179,3 +179,29 @@ def test_cpu_path_compiles_without_a_graph_break(monkeypatch):
         torch._dynamo.reset()
     torch.testing.assert_close(out, layer(q, k, v, g, beta))
     assert calls == []
+
+
+def test_cpu_path_repeated_compiled_calls_reuse_one_graph(monkeypatch):
+    """A diagnostic call counter bumped inside the traced CPU wrapper is a guarded global: every call recompiled
+    and fullgraph=True hit FailOnRecompileLimitHit on call nine. Same shapes must keep one graph."""
+    from torch._dynamo.testing import CompileCounter
+
+    package, chunk, recurrent, modeling, calls = _install_fake_fla(monkeypatch)
+    _run_patch_vendor_fla(monkeypatch)
+    q, k, v, g, beta = _inputs(1, 8, 2, 2, 8, 8)
+    fn = modeling.chunk_gated_delta_rule
+
+    def layer(q, k, v, g, beta):
+        return fn(q, k, v, g = g, beta = beta, use_qk_l2norm_in_kernel = True)[0] * 2
+
+    counter = CompileCounter()
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(layer, backend = counter, fullgraph = True)
+        for _ in range(12):
+            out = compiled(q, k, v, g, beta)
+    finally:
+        torch._dynamo.reset()
+    torch.testing.assert_close(out, layer(q, k, v, g, beta))
+    assert counter.frame_count == 1
+    assert calls == []
