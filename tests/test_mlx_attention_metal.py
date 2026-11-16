@@ -1127,3 +1127,35 @@ def test_invariant_attention_covers_kv_cache_layouts(change):
     covered = change in (None, "group", "width", "fp16")
     assert invariant_attention_supported(q, k, v) == covered
 
+
+@pytest.mark.parametrize("change", [None, "max_gpu", "4096_keys", "newer_gpu", "bfloat16", "gqa_4", "min_kl_0"])
+def test_m1_m2_head_dim_512_decode_leaves_the_one_pass_vector_kernel(fused_attention, monkeypatch, change):
+    # Gemma 4's global layers: one row, GQA 8, head dim 512; M1/M2 cannot launch mlx's one-pass build of that call.
+    from unsloth_zoo.mlx import attention
+
+    HQ, S, dtype, arch = 16, 2048, mx.float16, "applegpu_g13g"
+    HQ = 8 if change == "gqa_4" else HQ
+    S = 4096 if change == "4096_keys" else S
+    dtype = mx.bfloat16 if change == "bfloat16" else dtype
+    arch = "applegpu_g14s" if change == "max_gpu" else arch
+    if change == "min_kl_0":
+        monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", "0")
+    monkeypatch.setattr(nax, "_gpu_architecture", lambda: arch)
+    monkeypatch.setattr(attention, "_thread_limited_gpu", lambda: change != "newer_gpu")
+    q = mx.random.normal((1, HQ, 1, 512), key=mx.random.key(0)).astype(dtype)
+    k, v = (mx.random.normal((1, 2, S, 512), key=mx.random.key(i)).astype(dtype) for i in (1, 2))
+    masks = []
+
+    def spy(q, k, v, **kw):
+        masks.append(kw.get("mask"))
+        return fused_attention(q, k, v, **kw)
+
+    out = attention.fused_sdpa_over(spy)(q, k, v, scale=512 ** -0.5, mask=None)
+    if change is not None:
+        assert masks == [None]
+        return
+    mask, = masks
+    with pytest.raises(ValueError, match="no fused kernel"):
+        fused_attention(q, k, v, scale=512 ** -0.5, mask=mask, force_fused=True)
+    want = fused_attention(*(x.astype(mx.float32) for x in (q, k, v)), scale=512 ** -0.5, mask=mask)
+    assert mx.abs(out.astype(mx.float32) - want).max().item() <= 2e-3

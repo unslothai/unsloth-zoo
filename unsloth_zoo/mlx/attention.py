@@ -192,6 +192,21 @@ def _over_vector_thread_limit(q, k, v, mask):
     return 28 < q.shape[-3] // k.shape[-3] * q.shape[-2] <= 32 and _thread_limited_gpu()
 
 
+def _one_pass_d512_over_thread_limit(q, k, v, mask):
+    # mlx 0.32.4 runs one-row head-dim-512 decode below 4096 keys (1024 on Max and Ultra) on its one-pass vector
+    # kernel, whose fp16 and fp32 builds allow fewer than the 1024 threads it is sent on M1/M2 (ml-explore/mlx#4708).
+    if not (q.dtype in (mx.float16, mx.float32) and q.ndim == 4 and q.shape[-1] == k.shape[-1] == v.shape[-1] == 512
+            and q.shape[-2] == 1 and k.shape[-3] > 0 and (mask is None or isinstance(mask, str))):
+        return False
+    S, min_keys = k.shape[-2], _atoi(os.environ.get("MLX_SDPA_D512_MIN_KL", "1024"))
+    # At 0 mlx fuses array-masked calls too, so the all-true mask the caller adds would not avoid the kernel.
+    if q.shape[-3] // k.shape[-3] != 8 or not 0 < min_keys <= S < 4096 or not _thread_limited_gpu():
+        return False
+    from . import nax
+
+    return nax._gpu_architecture()[-1:] not in ("d", "s") or S < 1024
+
+
 def _split_query_rows(stock, q, k, v, scale, mask, sinks):
     # Both halves keep the full call's key-partition plan, so every row equals the unsplit result.
     half = (q.shape[-2] + 1) // 2
@@ -221,6 +236,9 @@ def fused_sdpa_over(stock):
                 mask = mask[..., -q.shape[-2]:, :]
         if not kwargs and _over_vector_thread_limit(q, k, v, mask):
             return _split_query_rows(stock, q, k, v, scale, mask, sinks)
+        if not kwargs and _one_pass_d512_over_thread_limit(q, k, v, mask):
+            # mlx has no fused head-dim-512 kernel for an array mask, so an all-true one takes its unfused attention.
+            mask = mx.ones((1, 1, 1, 1), dtype=mx.bool_)
         if (sinks is None and not kwargs and q.dtype == k.dtype == v.dtype
                 and _forces_fused(q, k.shape[-2], k.shape[-1], v.shape[-1], q.dtype, mask)
                 and not mlx_training_patches_active()):
