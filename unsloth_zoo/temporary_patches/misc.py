@@ -1266,6 +1266,64 @@ pass
 TEMPORARY_PATCHES.append(patch_transformers_masks)
 
 
+def patch_flex_mask_keeps_padding_mask_mod():
+    # flex_attention_mask drops the padding mask_mod for an unpadded batch and leaves its length
+    # static; dynamo guards on the BlockMask closures, so compiled blocks recompiled mid-run
+    # (tiny Gemma-3 vision). Training always adds it, length dynamic (same BlockMask values).
+    try:
+        from transformers import masking_utils
+    except Exception:
+        return
+    original = getattr(masking_utils, "flex_attention_mask", None)
+    if original is None or getattr(original, "_unsloth_keeps_padding", False):
+        return
+    needed = ("and_masks", "padding_mask_function", "prepare_padding_mask")
+    if not all(hasattr(masking_utils, name) for name in needed):
+        return
+    try:
+        signature = inspect.signature(original)
+    except Exception:
+        return
+    if not {"attention_mask", "mask_function", "kv_length"} <= signature.parameters.keys():
+        return
+
+    @functools.wraps(original)
+    def flex_attention_mask(*args, **kwargs):
+        try:
+            bound = signature.bind(*args, **kwargs)
+        except TypeError:
+            return original(*args, **kwargs)
+        bound.apply_defaults()
+        arguments = bound.arguments
+        mask = arguments["attention_mask"]
+        if (
+            isinstance(mask, torch.Tensor)
+            and mask.dim() == 2
+            and torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        ):
+            padding = masking_utils.prepare_padding_mask(
+                mask, arguments["kv_length"], arguments.get("kv_offset", 0)
+            )
+            torch._dynamo.maybe_mark_dynamic(padding, 1)
+            arguments["mask_function"] = masking_utils.and_masks(
+                arguments["mask_function"], masking_utils.padding_mask_function(padding)
+            )
+            arguments["attention_mask"] = None
+        return original(*bound.args, **bound.kwargs)
+
+    flex_attention_mask._unsloth_keeps_padding = True
+    masking_utils.flex_attention_mask = flex_attention_mask
+    interface = getattr(masking_utils, "ALL_MASK_ATTENTION_FUNCTIONS", None)
+    if interface is not None:
+        try:
+            interface.register("flex_attention", flex_attention_mask)
+        except Exception:
+            pass
+pass
+TEMPORARY_PATCHES.append(patch_flex_mask_keeps_padding_mask_mod)
+
+
 def patch_sdpa_bool_causal_mask():
     """Fix unslothai/unsloth#4906: inf grad_norm on Qwen3.5 at seq_len > 65536.
 
