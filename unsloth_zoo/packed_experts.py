@@ -93,7 +93,10 @@ if _HAS_TRITON:
         codes_ptr, scale_ptr, global_ptr, out_ptr, counts_ptr,
         N, HALF, SCALE_COLS, ROWS_PER_PART, PARTS,
         s_oe, s_or, s_oc,
-        BLOCK_R: tl.constexpr, BLOCK_C: tl.constexpr, USE_COUNTS: tl.constexpr, MULTIPLY: tl.constexpr,
+        BLOCK_R: tl.constexpr,  # expert rows per program
+        BLOCK_C: tl.constexpr,  # packed code bytes per program (two FP4 values each)
+        USE_COUNTS: tl.constexpr,  # skip experts with no routed tokens
+        MULTIPLY: tl.constexpr,  # global scale multiplies (True) or divides the block scale
     ):
         e = tl.program_id(0).to(tl.int64)
         if USE_COUNTS:
@@ -131,7 +134,9 @@ if _HAS_TRITON:
         codes_ptr, scale_ptr, out_ptr, counts_ptr,
         N, K, SCALE_COLS,
         s_oe, s_or, s_oc,
-        BLOCK_R: tl.constexpr, BLOCK_K: tl.constexpr, USE_COUNTS: tl.constexpr,
+        BLOCK_R: tl.constexpr,  # expert rows per program
+        BLOCK_K: tl.constexpr,  # FP8 codes per program (a multiple of the 32-wide scale block)
+        USE_COUNTS: tl.constexpr,  # skip experts with no routed tokens
     ):
         e = tl.program_id(0).to(tl.int64)
         if USE_COUNTS:

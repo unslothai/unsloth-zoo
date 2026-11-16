@@ -2334,6 +2334,9 @@ def forward_moe_backend(
     if moe_checkpoint_routing is not None:
         top_k_index, top_k_weights = moe_checkpoint_routing(self, top_k_index, top_k_weights)
 
+    # Absolute import as above: the copy in the compiled module has no module globals.
+    from unsloth_zoo.temporary_patches.moe_utils import _moe_uses_new_packed_expert_weights
+
     if _moe_uses_new_packed_expert_weights(self):
         # NVFP4 / MXFP8 stacks dequantize in chunks inside the grouped-GEMM forward; other backends index the weight.
         return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
