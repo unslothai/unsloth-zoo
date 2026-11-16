@@ -117,7 +117,6 @@ def test_mxfp4_merge_folds_paramwrapper_expert_lora(dims):
         pytest.skip(f"peft {peft.__version__} has no target_parameters")
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     path = os.pathsep.join(p for p in (repo, os.environ.get("PYTHONPATH", "")) if p)
-    # This checkout's unsloth_zoo, not an installed copy.
     env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1", PYTHONPATH = path)
     r = subprocess.run([sys.executable, "-c", _RUNNER, *map(str, dims)], capture_output = True, text = True,
                        env = env, timeout = 600, cwd = tempfile.gettempdir())

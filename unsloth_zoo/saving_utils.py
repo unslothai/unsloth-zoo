@@ -2594,9 +2594,8 @@ pass
 
 
 def _paramwrapper_expert_lora(converted_lora_weights, fused_base_name):
-    """LoRA stats of a PEFT ParamWrapper on a fused expert tensor, or None. PEFT keys it on
-    the experts module, nesting one `.base_layer` per further target_parameters entry, and
-    names the wrapped tensor in `parameter_name`."""
+    """PEFT ParamWrapper LoRA on a fused expert tensor, or None. Keyed on the experts module,
+    one `.base_layer` deeper per extra target_parameters entry; tensor in `parameter_name`."""
     _m = re.match(r"^(.*\.experts)\.(gate_up_proj|down_proj)$", fused_base_name)
     if _m is None:
         return None
@@ -2740,8 +2739,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                         logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
                     count += 1; W = _merge_lora(W, lora_stats, output_key)
                 elif (_pw_stats := _paramwrapper_expert_lora(converted_lora_weights, base_name)) is not None:
-                    # PEFT target_parameters LoRA on the fused expert tensor (dequantized here
-                    # to the GPT-OSS (E, in, out) layout), merged like the bf16 fused path.
+                    # Dequantized W is GPT-OSS (E, in, out), hence is_transposed.
                     _merge_fused = (_merge_moe_fused_gate_up_expert if base_name.endswith(".gate_up_proj")
                                     else _merge_moe_fused_down_proj_expert)
                     W = _merge_fused(W, _pw_stats, output_dtype or W.dtype, is_transposed = True)
