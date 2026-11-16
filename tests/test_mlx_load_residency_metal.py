@@ -895,6 +895,18 @@ def test_slot_readers_kept_are_bounded_in_bytes(monkeypatch):
     assert len(slots.readers) == 0
 
 
+@pytest.mark.parametrize("v41", [False, True])
+def test_deepseek_v41_experts_keep_a_longer_routing_history(tmp_path, v41):
+    model = _moe("vlm" if v41 else "lm", v41 = v41)
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), dict(tree_flatten(model.parameters())))
+    offload_experts(model, str(tmp_path), 0.75)
+    slots = zoo_offload._ExpertSlots([], 4, 3, model.layers[0].switch_mlp._slots.decay)
+    # Expert 0 routed 4 times 20 calls ago, expert 1 once now: V4.1 keeps 0, the stock rule keeps 1.
+    for routes in [[0] * 4] + [[2]] * 18 + [[1], [3]]:
+        slots.ensure(np.array(routes), np.unique(routes))
+    assert (slots.slot_of[0] >= 0) == v41 and (slots.slot_of[1] >= 0) != v41
+
+
 def test_concurrent_offloaded_loads_restore_the_cache_limit(monkeypatch):
     # Two loads finishing at once must not both take the cap as the first model's, or the second saves the capped limit as the one to restore.
     import unsloth_zoo.mlx.loader as zoo_loader

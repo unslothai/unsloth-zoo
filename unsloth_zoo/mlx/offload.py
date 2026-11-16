@@ -707,6 +707,8 @@ def _table_reader():
 
 
 _SCORE_DECAY, _SCORE_DECAY_EVERY = 0.7, 4
+# DeepSeek V4.1's decode reuses an expert over a longer span than the stock rule keeps: half-life of 16 calls.
+_SCORE_DECAYS = {"DeepseekV41SwitchGLU": (0.5 ** (1 / 16), 1)}
 # Pending outputs a slot table keeps before evaluating them (decode has evaluated them by then).
 _PENDING_READERS, _PENDING_BYTES = 8, 32 << 20
 
@@ -745,9 +747,10 @@ def _slot_projection(projection, arrays, full_experts):
 
 
 class _ExpertSlots:
-    """One layer's experts in capacity slots; a miss evicts the lowest decayed routing count (+1 per route, x0.7 every 4 calls) among experts the call does not use."""
+    """One layer's experts in capacity slots; a miss evicts the lowest decayed routing count (+1 per route, x``decay[0]``
+    every ``decay[1]`` calls) among experts the call does not use."""
 
-    def __init__(self, fields, experts, capacity):
+    def __init__(self, fields, experts, capacity, decay = (_SCORE_DECAY, _SCORE_DECAY_EVERY)):
         self.fields = fields  # [(projection, name, _Field)]
         self.capacity = capacity
         self.arrays = {
@@ -767,13 +770,14 @@ class _ExpertSlots:
         self.score = np.zeros(experts, dtype = np.float32)
         self.expert_bytes = sum(field.row_bytes for _, _, field in fields)
         self.calls = self.hits = self.misses = 0
+        self.decay = decay
 
     def ensure(self, routes, experts):
         """Make ``experts`` (unique, at most ``capacity``) resident; ``routes`` are the call's routes."""
         np.add.at(self.score, routes, 1.0)
         self.calls += 1
-        if self.calls % _SCORE_DECAY_EVERY == 0:
-            self.score *= _SCORE_DECAY
+        if self.calls % self.decay[1] == 0:
+            self.score *= self.decay[0]
         missing = experts[self.slot_of[experts] < 0]
         self.hits += experts.size - missing.size
         if not missing.size:
@@ -1403,7 +1407,7 @@ def offload_experts(model, model_dir, fraction, *, cast_dtype = None):
         if capacity >= experts:
             report["skipped"].append((path, f"{experts} experts fit in {capacity} slots"))
             continue
-        slots = _ExpertSlots(fields, experts, capacity)
+        slots = _ExpertSlots(fields, experts, capacity, _SCORE_DECAYS.get(type(glu).__name__, (_SCORE_DECAY, _SCORE_DECAY_EVERY)))
         stock = copy.copy(glu)
         for projection in _PROJECTIONS:
             arrays = {name: slots.arrays[p, name] for p, name, _ in fields if p == projection}
