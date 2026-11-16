@@ -11188,14 +11188,14 @@ def _ple_pread_rows(table, row_ids):
     return pending
 
 
-def _ple_read_class(base, bindings):
+def _ple_read_class(base, bindings, prepare):
     if base not in _PLE_READ_CLASSES:  # built on the first resolution, whose bindings it rechecks
 
         def _read_rows(self, row_ids):
             pending = None
             if _bindings_intact(bindings):
                 try:
-                    pending = _ple_pread_rows(self, row_ids)
+                    pending = prepare(self, row_ids)
                 except OSError:
                     pass  # the gather reads the memory maps itself
             _PLE_PENDING.reads = pending
@@ -11208,7 +11208,53 @@ def _ple_read_class(base, bindings):
     return _PLE_READ_CLASSES[base]
 
 
+# DeepSeek V4.1 Engram rows: their pages are read in concurrently and the stock gather maps them, since pages only a
+# pread holds leave core under the expert reads. macOS only: Linux's readahead faults beat the reads.
+_ENGRAM = "mlx_vlm.models.deepseek_v41.engram"
+_ENGRAM_READ_CONTRACT = {_ENGRAM: {"OffloadedEngramEmbedding._read_rows": "ac9bcec7d02ec47f"}}
+_ENGRAM_RUN_PAGES = 64
+
+
+def _engram_read(chunk):
+    buffer = memoryview(bytearray(max(length for _, _, length in chunk)))
+    for descriptor, offset, length in chunk:
+        os.preadv(descriptor, [buffer[:length]], offset)
+
+
+def _engram_pread_rows(table, indices):
+    if isinstance(indices, slice):
+        return
+    rows = np.unique(np.asarray(indices, dtype = np.int64))
+    maps = list(table._arrays.values())
+    if _ple_resident([(maps[0], rows)]) >= _PLE_RESIDENT:
+        return
+    page, files, work = os.sysconf("SC_PAGESIZE"), {}, []
+    for memmap in maps:
+        stride = memmap.strides[0]
+        first = (memmap.offset + rows * stride) // page
+        count = (memmap.offset + (rows + 1) * stride - 1) // page - first + 1
+        files.setdefault(memmap.filename, []).append(np.repeat(first - np.cumsum(count) + count, count) + np.arange(count.sum()))
+    try:
+        for name, pages in files.items():
+            files[name] = descriptor = os.open(name, os.O_RDONLY)
+            pages = np.unique(np.concatenate(pages))  # tensors of one file can share a page
+            run = np.cumsum(np.r_[True, np.diff(pages) != 1])
+            starts = np.flatnonzero(np.r_[True, run[1:] != run[:-1]])
+            split = np.flatnonzero((np.arange(pages.size) - starts[run - 1]) % _ENGRAM_RUN_PAGES == 0)
+            end = os.fstat(descriptor).st_size
+            work += [(descriptor, offset, min(length, end - offset)) for offset, length in
+                     zip((pages[split] * page).tolist(), (np.diff(np.r_[split, pages.size]) * page).tolist())]
+        step = -(-len(work) // _PLE_READ_WORKERS)
+        list(_ple_read_pool().map(_engram_read, [work[i:i + step] for i in range(0, len(work), step)]))
+    finally:
+        for descriptor in files.values():
+            if isinstance(descriptor, int):
+                os.close(descriptor)
+
+
 def _ple_wrap_maps(table):
+    if not hasattr(table, "_shards"):  # Engram's gather is stock
+        return
     table._shards = [(start, end, {name: _PreadMap(memmap) for name, memmap in arrays.items()})
                      for start, end, arrays in table._shards]
     if table._interleaved is not None:
@@ -11216,14 +11262,27 @@ def _ple_wrap_maps(table):
 
 
 def _ple_unwrap_maps(table):
+    if not hasattr(table, "_shards"):
+        return
     table._shards = [(start, end, {name: getattr(wrapped, "memmap", wrapped) for name, wrapped in arrays.items()})
                      for start, end, arrays in table._shards]
     table._interleaved = getattr(table._interleaved, "memmap", table._interleaved)
 
 
+def _ple_read_sites():
+    """(module, class, attribute, contract, row reads) per table kind; reads resolve per call, the class is built once."""
+    sites = [(_PLE_STORAGE, "QuantizedMMapNGramEmbedding", "ngram_embedding", _PLE_READ_CONTRACT,
+              lambda table, rows: _ple_pread_rows(table, rows))]
+    if sys.platform == "darwin":
+        sites.append((_ENGRAM, "OffloadedEngramEmbedding", "embed", _ENGRAM_READ_CONTRACT,
+                      lambda table, rows: _engram_pread_rows(table, rows)))
+    return sites
+
+
 @contextmanager
 def exact_ple_row_reads(model, *, _modules = None):
-    """Read cold SSD-backed Qwen4-Exp PLE rows with concurrent preads, byte for byte the memory map's rows.
+    """Read cold SSD-backed Qwen4-Exp PLE rows and DeepSeek V4.1 Engram rows with concurrent preads, byte for byte the
+    memory map's rows.
 
     mlx-vlm's own gather still assembles every row. Tables return to their own class and memory maps when the
     last scope holding them exits.
@@ -11231,27 +11290,30 @@ def exact_ple_row_reads(model, *, _modules = None):
     changed = []
     try:
         with _PLE_READ_LOCK:
-            base = getattr(sys.modules.get(_PLE_STORAGE), "QuantizedMMapNGramEmbedding", None)
-            if base is not None and hasattr(os, "preadv") and _mincore() is not None:
-                bindings = None
-                for _, module in _fusion_modules(model, _modules):
-                    table = getattr(module, "ngram_embedding", None)
-                    if not isinstance(table, base):
+            if hasattr(os, "preadv") and _mincore() is not None:
+                for module_name, class_name, attribute, contract, prepare in _ple_read_sites():
+                    base = getattr(sys.modules.get(module_name), class_name, None)
+                    if base is None:
                         continue
-                    if table.__dict__.get("_unsloth_ple_scopes"):
-                        table._unsloth_ple_scopes += 1
+                    bindings = None
+                    for _, module in _fusion_modules(model, _modules):
+                        table = getattr(module, attribute, None)
+                        if not isinstance(table, base):
+                            continue
+                        if table.__dict__.get("_unsloth_ple_scopes"):
+                            table._unsloth_ple_scopes += 1
+                            changed.append(table)
+                            continue
+                        if type(table) is not base:
+                            continue
+                        if bindings is None:
+                            bindings = _resolved_bindings(contract) or ()
+                        if not bindings:
+                            break
+                        _ple_wrap_maps(table)
+                        table.__class__ = _ple_read_class(base, bindings, prepare)
+                        table._unsloth_ple_scopes = 1
                         changed.append(table)
-                        continue
-                    if type(table) is not base:
-                        continue
-                    if bindings is None:
-                        bindings = _resolved_bindings(_PLE_READ_CONTRACT) or ()
-                    if not bindings:
-                        break
-                    _ple_wrap_maps(table)
-                    table.__class__ = _ple_read_class(base, bindings)
-                    table._unsloth_ple_scopes = 1
-                    changed.append(table)
         yield model
     finally:
         with _PLE_READ_LOCK:
