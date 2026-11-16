@@ -4604,15 +4604,19 @@ def _grouped_routed(x, inds, scores, shared, s, tensors, group_size, bits):
 _GROUPED_RACE_CALLS = 9
 # Below this many rows the race's short low-clock calls misjudge grouped tiles.
 _ROUTED_ROWS_WITHOUT_NAX = 8
+# There the race picks by chance on tensor units: whole verifies ran faster on grouped tiles from 5 4-bit rows or 3 8-bit ones.
+_GROUPED_ROW_BITS_WITH_NAX = 20
 
 
-def _grouped_routed_faster(routed, grouped, clock = time.perf_counter):
+def _grouped_routed_faster(routed, grouped, clock = time.perf_counter, race = True):
     _staged_ready()
     try:
         native, candidate = routed(), grouped()
         if native is None or candidate is None or not _settled(
                 native.dtype == candidate.dtype and bool(mx.array_equal(native, candidate, equal_nan = True))):
             return False
+        if not race:
+            return True
         seconds = ([], [])
         for repeat in range(_GROUPED_RACE_CALLS):
             for index in ((0, 1) if repeat % 2 == 0 else (1, 0)):
@@ -5449,15 +5453,16 @@ class _RoutedExperts:
             return _routed_down(activations, inds, scores, shared, s, tensors[2],
                                 down.group_size, down.bits, down.mode)
 
-        if (select and inds.size > inds.shape[-1] and gate.mode == "affine"
-                and (inds.size > _ROUTED_ROWS_WITHOUT_NAX * inds.shape[-1] or nax._nax_gpu())
+        rows = inds.size // inds.shape[-1]
+        raced = rows > _ROUTED_ROWS_WITHOUT_NAX
+        if (select and gate.mode == "affine" and (raced or rows * gate.bits >= _GROUPED_ROW_BITS_WITH_NAX and nax._nax_gpu())
                 and len({(p.group_size, p.bits, p.mode) for p in (gate, up, down)}) == 1):
             key = (self.base, *map(_key, (x, inds, scores, shared, s)),
                    tuple(tuple(map(_key, t)) for t in tensors), gate.group_size, gate.bits)
             grouped = lambda: _grouped_routed(x, inds, scores, shared, s, tensors, gate.group_size, gate.bits)
             if key not in _MOE_GROUPED_CHOICES:
                 try:
-                    _MOE_GROUPED_CHOICES[key] = _grouped_routed_faster(routed, grouped)
+                    _MOE_GROUPED_CHOICES[key] = _grouped_routed_faster(routed, grouped, race = raced)
                 except ValueError:  # inside a function transformation, which cannot evaluate; raced later
                     return routed()
             if _MOE_GROUPED_CHOICES[key]:
@@ -7298,14 +7303,14 @@ def _committed_lengths(lengths):
     return [int(value) for value in (lengths.reshape(-1).tolist() if isinstance(lengths, mx.array) else lengths)]
 
 
-def _replay_tapes(tapes, lengths, length):
+def _replay_tapes(tapes, lengths):
     counts = {lengths} if isinstance(lengths, int) else set(lengths)
-    # Retaining all or none, stock committed the final or the entry state itself.
-    if counts == {length} or counts == {0}:
-        return
-    # Otherwise stock selected from a stand-in history; the retained state is the replayed prefix.
     retained = None
     for cache, index, replay, mask, folds in tapes:
+        length = replay.args[0].shape[1]  # its own block's: a sized tree's first layers verify more rows than the rest
+        # Retaining all or none, stock committed the final or the entry state itself; otherwise a stand-in the replay replaces.
+        if counts == {length} or counts == {0}:
+            continue
         rows = [lengths] * replay.args[0].shape[0] if isinstance(lengths, int) else lengths
         cache[index] = replay(mask = _retained_mask(rows, length, mask))[1]
         if folds:  # the next fused block can advance from the replay's own entry instead
@@ -7319,7 +7324,7 @@ def _taped_transaction_class(base):
     def commit(self, lengths):
         lengths = _committed_lengths(lengths)
         base.commit(self, lengths)
-        _replay_tapes(self.__dict__.pop("_unsloth_tapes", ()), lengths, self.length)
+        _replay_tapes(self.__dict__.pop("_unsloth_tapes", ()), lengths)
 
     def abort(self):
         self.__dict__.pop("_unsloth_tapes", None)
@@ -7337,12 +7342,12 @@ _CACHE_TAPE_CONTRACT = {**_VERIFY_TAPE_CONTRACT, "mlx_vlm.models.cache": {
 @functools.cache
 def _taped_cache_class(base):
     def commit_speculation(self, lengths, generation = None):
-        lengths, speculation, length = _committed_lengths(lengths), self._speculation, self.history_capacity
+        lengths, speculation = _committed_lengths(lengths), self._speculation
         base.commit_speculation(self, lengths, generation)
         self.__class__ = base
         taped, tapes = self.__dict__.pop("_unsloth_tapes")
         if taped is speculation:  # not a later block this cache started without committing the taped one
-            _replay_tapes(tapes, lengths, length)
+            _replay_tapes(tapes, lengths)
 
     def abort_speculation(self, generation = None):
         base.abort_speculation(self, generation)
@@ -8352,6 +8357,9 @@ def _exact_verify_class(base, name, *cache_key):
         _VERIFY_STATE.tapes = [] if _VERIFY_STATE.serving and taped is not None and _bindings_intact(tape_bindings) else None
         try:
             output = base.verify(self, language_model, inputs, cache = cache, **kwargs)
+            if getattr(_VERIFY_STATE, "tree_head", None) is not None and output.hidden_states:
+                rows = _VERIFY_STATE.tree.depth.size  # a layer captured before the block narrowed holds every row
+                output.hidden_states = [h if h.shape[1] == rows else h[:, :rows] for h in output.hidden_states]
             if _VERIFY_STATE.tapes:
                 transaction = output.gdn_states
                 transaction.__class__ = _taped_transaction_class(type(transaction))
@@ -8456,8 +8464,8 @@ def _exact_verify_class(base, name, *cache_key):
             project = lambda rows: base._linears(self, linears, rows)
         return _verify_qmv_rows(lambda: _verify_sliced(project, linears, x, eligible), linears, x)
 
-    def submitted_layer(self, *args, **kwargs):
-        hidden = base._layer(self, *args, **kwargs)
+    def submitted_layer(self, layer, hidden, mask, cache, *args):
+        hidden = base._layer(self, layer, _tree_head_rows(hidden, cache), mask, cache, *args)
         if getattr(_VERIFY_STATE, "serving", False):
             try:
                 mx.async_eval(hidden)
@@ -8965,7 +8973,7 @@ def fused_drafter_ops(model) -> int:
 
 
 class TreeBlock(NamedTuple):
-    """A draft tree's rows in preorder, row 0 the anchor: each row's `depth`, its `path` from the anchor (block rows [n, A],
+    """A draft tree's rows, parents first, row 0 the anchor: each row's `depth`, its `path` from the anchor (block rows [n, A],
     itself last, zero padded), the stack slot it keeps its state in for later children (`fork`) and the one it restores its
     parent's state from (`back`), -1 for none."""
     depth: mx.array
@@ -8973,11 +8981,14 @@ class TreeBlock(NamedTuple):
     fork: mx.array
     back: mx.array
 
+    def first(self, rows):
+        return TreeBlock(self.depth[:rows], self.path[:rows], self.fork[:rows], self.back[:rows])
+
 
 # One threadgroup grows the tree best first over the selector's lattice: a node's score is the sum of log q along its
 # path, q the softmax over the TOP candidates of (unary + edge from its parent). A child never scores above its
 # parent, so the first n nodes taken are a tree for every n. They go out in preorder, siblings best first, with the order
-# each was taken in (`tree_rank`): a row's first child is the row after it.
+# each was taken in (`tree_rank`): a row's first child is the row after it. With TAKEN they go out as taken: m rows' tree first.
 _DRAFT_TREE_KERNEL = r"""
     constexpr uint CAP = FRONTIER;
     uint candidate = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
@@ -9039,7 +9050,25 @@ _DRAFT_TREE_KERNEL = r"""
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (thread_index_in_threadgroup == 0) {
+    if (TAKEN && thread_index_in_threadgroup == 0) {
+        // A row whose children are not all the row after it keeps its state for them, in a slot of its own.
+        int slots[CAP], kept = 0;
+        for (uint at = 0; at < CAP; ++at) {
+            const int up = parents[at];
+            tree_tokens[at] = tokens[at];
+            tree_rank[at] = int(at);
+            tree_score[at] = totals[at];
+            tree_depth[at] = depths[at];
+            tree_parent[at] = up;
+            for (int d = 0; d < int(A); ++d) tree_path[at * A + d] = d < depths[at] ? tree_path[uint(up) * A + d] : 0;
+            tree_path[at * A + depths[at]] = int(at);
+            slots[at] = -1;
+            for (uint child = at + 2; child < CAP; ++child) if (uint(parents[child]) == at) slots[at] = kept;
+            kept += slots[at] >= 0;
+            tree_fork[at] = slots[at];
+            tree_back[at] = at != 0 && up != int(at) - 1 ? slots[up] : -1;
+        }
+    } else if (thread_index_in_threadgroup == 0) {
         // Preorder; a node's children are those with its index as parent, in taking order.
         const uint n = CAP;
         int stack[CAP], rank[CAP], slots[CAP];
@@ -9109,29 +9138,36 @@ def _draft_tree_kernels():
 class DraftTree(NamedTuple):
     """A drafter's best-first tree: `tokens` [n], row 0 the anchor, `parent` [n], the verify's `block`, and the order each
     row's node was taken in (`rank`): the rows of rank below m are this lattice's tree of m rows. `score` is each row's
-    log probability along its path, and `regrow(m)` is that tree of m rows."""
+    log probability along its path, and `first(m)` is that tree of m rows where the rows are in taking order."""
     tokens: mx.array
     parent: mx.array
     block: TreeBlock
     rank: mx.array
     score: mx.array = None
-    regrow: Callable = None
+
+    def first(self, rows):
+        return DraftTree(self.tokens[:rows], self.parent[:rows], self.block.first(rows), self.rank[:rows], self.score[:rows])
 
 
-def draft_tree(selector, hidden, anchor, candidates, unary, rows, projected = None):
+_TAKEN_TREE_ROWS = 10  # a gated delta layer keeps eight forked states, and the last two rows fork none
+
+
+def draft_tree(selector, hidden, anchor, candidates, unary, rows, taken = False):
     """The first `rows` nodes of the best-first tree over a block's candidate lattice, for one drafting row."""
-    projected = selector.hidden_projection(hidden) if projected is None else projected
+    if taken and rows > _TAKEN_TREE_ROWS:
+        raise RuntimeError(f"a draft tree in taking order holds at most {_TAKEN_TREE_ROWS} rows")
+    projected = selector.hidden_projection(hidden)
     pred, succ, top = selector.predecessor_codebook.weight, selector.successor_codebook.weight, candidates.shape[-1]
     length, depth = hidden.shape[1], min(rows - 1, candidates.shape[1])
     outputs = _draft_tree_kernels()[0](
         inputs = [pred, projected, succ, unary, candidates, anchor],
-        template = [("TOP", top), ("LENGTH", length), ("RANK", projected.shape[-1]), ("FRONTIER", rows), ("A", depth + 1)],
+        template = [("TOP", top), ("LENGTH", length), ("RANK", projected.shape[-1]), ("FRONTIER", rows), ("A", depth + 1),
+                    ("TAKEN", taken)],
         grid = (32 * top, 1, 1), threadgroup = (32 * top, 1, 1),
         output_shapes = [(rows,), (rows,), (rows,), (rows, depth + 1), (rows,), (rows,), (rows,), (rows,)],
         output_dtypes = [mx.int32] * 7 + [mx.float32])
     tokens, depths, parents, path, fork, back, rank, score = outputs
-    regrow = lambda width: draft_tree(selector, hidden, anchor, candidates, unary, width, projected)
-    return DraftTree(tokens, parents, TreeBlock(depths, path, fork, back), rank, score, regrow)
+    return DraftTree(tokens, parents, TreeBlock(depths, path, fork, back), rank, score)
 
 
 def draft_tree_accept(tree, target):
@@ -9842,13 +9878,49 @@ def _sparse_head_shape(head):
     return N, K, dtype
 
 
-def _sparse_head_candidates(head, hidden, shape):
+_HEAD_SCAN_BLOCK, _HEAD_SCAN_BASE = 2048, 98304
+
+
+class _HeadScan:
+    """The ids one reply's coarse shortlist reads: those below `_HEAD_SCAN_BASE`, the last block, and each block of
+    `_HEAD_SCAN_BLOCK` ids holding a token the reply has seen. A token of another block is drafted only once the reply
+    holds one of that block: a round's drafts lost once per block, for most of the head spared in most replies."""
+
+    def __init__(self, N, tokens = ()):
+        self.N, self.blocks, self._runs = N, {(N - 1) // _HEAD_SCAN_BLOCK}, None
+        self.note(tokens)
+
+    def note(self, tokens):
+        seen = {int(token) // _HEAD_SCAN_BLOCK for token in tokens if _HEAD_SCAN_BASE <= token < self.N} - self.blocks
+        if seen:
+            self.blocks |= seen
+            self._runs = None
+
+    def runs(self, head):
+        """(each scanned position's id, each scanned span's (weight, scales, biases)); None to read the whole head,
+        as past three quarters of it the spans' launches cost what the skipped rows save."""
+        if 4 * (_HEAD_SCAN_BASE + len(self.blocks) * _HEAD_SCAN_BLOCK) >= 3 * self.N:
+            return None
+        source = head.weight, head.scales, head.biases
+        if self._runs is None or any(a is not b for a, b in zip(self._runs[0], source)):
+            spans = [(0, _HEAD_SCAN_BASE)] + [(block * _HEAD_SCAN_BLOCK, min(self.N, (block + 1) * _HEAD_SCAN_BLOCK))
+                                              for block in sorted(self.blocks)]
+            ids = mx.concatenate([mx.arange(lo, hi, dtype = mx.uint32) for lo, hi in spans])
+            self._runs = source, ids, [tuple(a[lo:hi] for a in source) for lo, hi in spans]
+        return self._runs[1:]
+
+
+def _sparse_head_candidates(head, hidden, shape, scan = None):
     N, K, dtype = shape
     flat = hidden.reshape(-1, K).astype(dtype)
     M, w, scales, biases = flat.shape[0], head.weight, head.scales, head.biases
-    coarse = matmul.lane_qmm(flat, w, scales, biases, head.group_size, head.bits, groups = K // (2 * head.group_size),
-                             reader = matmul.lane_shortlist_reader(M, head.bits))
-    ids = matmul.radix_shortlist(coarse)
+    coarse = functools.partial(matmul.lane_qmm, flat, group_size = head.group_size, bits = head.bits,
+                               groups = K // (2 * head.group_size), reader = matmul.lane_shortlist_reader(M, head.bits))
+    runs = scan.runs(head) if scan is not None and scan.N == N else None
+    if runs is None:
+        ids = matmul.radix_shortlist(coarse(w, scales, biases))
+    else:
+        ids = mx.take(runs[0], matmul.radix_shortlist(mx.concatenate([coarse(*run) for run in runs[1]], axis = 1)))
     values = matmul._lane_indexed(flat, w, scales, biases, ids, head.group_size, head.bits)
     return ids, values
 
@@ -9896,7 +9968,12 @@ class _SparseDrafter:
             return None
         return shape
 
-    def __call__(self, last_bonus, hidden, cache, block_size, sampler, token_dtype = mx.int32):
+    def head_scan(self, tokens):
+        """A reply's `_HeadScan`, started from its prompt; None when the head is not the sparse one."""
+        shape = _sparse_head_shape(self.head)
+        return None if shape is None else _HeadScan(shape[0], tokens)
+
+    def __call__(self, last_bonus, hidden, cache, block_size, sampler, token_dtype = mx.int32, scan = None):
         model, selector, original = self.model, self.selector, self.model.draft_block
         length = int(block_size) - 1
         batch = 1 if isinstance(last_bonus, int) else int(last_bonus.shape[0])
@@ -9910,11 +9987,11 @@ class _SparseDrafter:
         proposed = model._hidden(mx.concatenate([anchor[:, None], masks], axis = 1), hidden, cache)[:, 1:]
         if proposed.shape != (batch, length, shape[1]) or proposed.dtype != shape[2]:
             return selector.select(proposed, model._logits(proposed), anchor, sampler).astype(token_dtype)
-        ids, values = _sparse_head_candidates(head, proposed, shape)
+        ids, values = _sparse_head_candidates(head, proposed, shape, scan)
         return _sparse_candidate_walk(selector, proposed, anchor, ids, values, multiplier, ascending = True).astype(token_dtype)
 
-    def tree(self, last_bonus, hidden, cache, block_size, rows):
-        """This block's best-first `DraftTree` of `rows` rows."""
+    def tree(self, last_bonus, hidden, cache, block_size, rows, scan = None, taken = False):
+        """This block's best-first `DraftTree` of `rows` rows, in taking order with `taken`."""
         model, selector = self.model, self.selector
         length = int(block_size) - 1
         shape = self.head_shape(1, length, None, hidden)
@@ -9923,12 +10000,12 @@ class _SparseDrafter:
         anchor = mx.array([last_bonus], mx.int32) if isinstance(last_bonus, int) else last_bonus.reshape(-1).astype(mx.int32)
         masks = mx.full((1, length), int(model.config.mask_token_id), dtype = mx.int32)
         proposed = model._hidden(mx.concatenate([anchor[:, None], masks], axis = 1), hidden, cache)[:, 1:]
-        ids, values = _sparse_head_candidates(self.head, proposed, shape)
+        ids, values = _sparse_head_candidates(self.head, proposed, shape, scan)
         values = values * model.config.output_multiplier
         chosen = mx.argpartition(values, -selector.top_k, axis = -1)[:, -selector.top_k:]
         candidates = mx.take_along_axis(ids, chosen, axis = -1).reshape(*proposed.shape[:-1], selector.top_k)
         unary = mx.take_along_axis(values, chosen, axis = -1).reshape(candidates.shape)
-        return draft_tree(selector, proposed, anchor, candidates, unary, rows)
+        return draft_tree(selector, proposed, anchor, candidates, unary, rows, taken)
 
 
 def sparse_drafter(model, target, original):
@@ -10550,15 +10627,38 @@ def deeper_causal_verify(rows: int):
         _VERIFY_STATE.causal_rows = outer
 
 
+_TREE_HEAD_LAYERS = 1  # layers a sized tree's verify runs over every drafted row while its lattice is read
+
+
 @contextmanager
-def tree_verify(block):
-    """While open, the forward built verifies its block as `block`'s tree: each row is its path's one-token decode."""
-    outer = getattr(_VERIFY_STATE, "tree", None)
-    _VERIFY_STATE.tree = block
+def tree_verify(block, size = None):
+    """While open, the forward built verifies its block as `block`'s tree: each row is its path's one-token decode.
+    Given `size`, of rows in taking order it verifies the first `size()`, asked once its first `_TREE_HEAD_LAYERS` layers
+    are submitted over the whole block: the GPU runs those while `size` waits for the lattice instead of idling."""
+    outer = getattr(_VERIFY_STATE, "tree", None), getattr(_VERIFY_STATE, "tree_head", None)
+    _VERIFY_STATE.tree, _VERIFY_STATE.tree_head = block, None if size is None else [_TREE_HEAD_LAYERS, size]
     try:
         yield
     finally:
-        _VERIFY_STATE.tree = outer
+        _VERIFY_STATE.tree, _VERIFY_STATE.tree_head = outer
+
+
+def _tree_head_rows(hidden, cache):
+    """`hidden` as a verify layer on `cache` takes it: past a sized tree's first layers, the rows its lattice pays for."""
+    head = getattr(_VERIFY_STATE, "tree_head", None)
+    if head is None:
+        return hidden
+    head[0] -= 1
+    if head[0] >= 0:
+        return hidden
+    if head[1] is not None:
+        size, head[1] = head[1], None
+        _VERIFY_STATE.tree = _VERIFY_STATE.tree.first(size())
+    rows = _VERIFY_STATE.tree.depth.size
+    speculation = getattr(cache, "_speculation", None)
+    if speculation is not None:
+        speculation["length"] = rows  # nothing is recorded yet: the cache's window is the narrowed block's
+    return hidden if hidden.shape[1] == rows else hidden[:, :rows]
 
 
 def tree_commit(transaction, caches, path):

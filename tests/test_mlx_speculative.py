@@ -543,6 +543,22 @@ def test_short_budgets_never_plan_empty_drafts():
             controller.record_round(plan, states, [0] * len(states), seconds = 1.0, draft_seconds = 0.1)
 
 
+def test_a_reply_running_out_of_tokens_keeps_the_width_the_next_one_starts_at():
+    controller, machine, states = DraftController(max_depth = 4, can_copy = False), _Machine(draft_slope = 0.05), []
+    _run(controller, machine, [([0.9, 0.7, 0.4, 0.2], None)], rounds = 800, states = states)
+    held = controller._current
+    assert held[1] == "round" and held[2] > 2
+    for budget in (2, 1):
+        states[0].remaining = budget
+        plan = controller.plan(states)
+        assert plan.width < held[2]
+        if plan.kind == "round":
+            controller.record_round(plan, states, [0], seconds = machine.verify(1, plan.width), draft_seconds = 0.0)
+    assert controller._current == held
+    controller._current, states[0].remaining = (*held[:2], 2), held[2]
+    assert controller.plan(states).width == held[2] and controller._current == held
+
+
 def test_copy_probe_displaces_a_winning_drafter():
     # Two perfect copy tokens tie a perfect depth-2 draft yet skip its forward, but the copy prior scores below the drafter, so only a probe finds that out.
     controller = DraftController(max_depth = 2, max_copy = 12)
@@ -1180,8 +1196,14 @@ def test_tree_budget_runs_the_widest_tree_until_measured_then_the_best_rate_and_
     before = budget.trees[16].value
     budget.observe(8, [1], 1)
     assert budget.trees[16].value == before
-    picks = [budget.choose() for _ in range(2 * budget.PROBE_EVERY)]
-    assert picks.count(16) == 2 and picks.count(8) == 2 * budget.PROBE_EVERY - 2
+    # That far from paying, the widest tree is probed rarely; one near paying, as often as before.
+    picks = [budget.choose() for _ in range(budget.PROBE_SETTLED_EVERY)]
+    assert picks.count(16) == 1 and picks.count(8) == budget.PROBE_SETTLED_EVERY - 1
+    near = TreeBudget({8: 1.0, 16: 1.15}, {8: 1.0}, trained_rows = 8)
+    for _ in range(near.MIN_SAMPLES):
+        near.choose(), near.observe(16, [1, 2, 3, 4, 5, 6, 9], 3)
+    picks = [near.choose() for _ in range(2 * near.PROBE_EVERY)]
+    assert picks.count(16) == 2 and picks.count(8) == 2 * near.PROBE_EVERY - 2
     # Deep paths past rank 8 pay for the rows.
     for _ in range(4 * budget.MIN_SAMPLES):
         budget.observe(16, [1, 2, 9, 10, 11, 12, 13, 14], 2)
@@ -1201,6 +1223,9 @@ def test_a_sized_tree_budget_verifies_the_rows_its_lattice_pays_for():
     # Confident nodes pay for every row; hopeless ones for none past the narrowest.
     assert budget.size([(0.9, 1), (0.9, 2), (0.9, 3), (0.9, 4)]) == 5
     assert budget.size([(0.1, 1), (0.01, 2), (0.01, 3), (0.01, 4)]) == 3
+    budget.pinned = 4   # while the load times a width, whatever the lattice
+    assert budget.size([(0.9, 1), (0.9, 2), (0.9, 3), (0.9, 4)]) == 4 and budget.size([(0.9, 1)]) == 2
+    budget.pinned = 0
     # Nodes of a depth that keep failing stop being priced at their promise, those of another depth keep theirs.
     nodes = [(0.9, 1), (0.6, 2), (0.6, 3), (0.6, 4)]
     assert budget.size(nodes) == 5
