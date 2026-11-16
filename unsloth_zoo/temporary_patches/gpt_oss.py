@@ -2774,12 +2774,23 @@ def _ogs_dense_chunks(weight, precision_config, dtype):
             f"Unsloth: unexpected MXFP4 layout {tuple(blocks.shape)} / {tuple(scales.shape)} for {(E, K, N)}"
         )
     step = max(1, min(E, _ogs_chunk_bytes() // (K * N * torch.empty((), dtype = dtype).element_size())))
-    for first in range(0, E, step):
+    first = 0
+    while first < E:
         last = min(E, first + step)
-        yield first, last, mxfp4_dequantize(
-            blocks[first:last].contiguous().view(last - first, N, K // 32, 16),
-            scales[first:last].contiguous(), dtype = dtype, transpose = True,
-        )
+        try:
+            dense = mxfp4_dequantize(
+                blocks[first:last].contiguous().view(last - first, N, K // 32, 16),
+                scales[first:last].contiguous(), dtype = dtype, transpose = True,
+            )
+        except torch.cuda.OutOfMemoryError:
+            # mxfp4_dequantize re-raises OOM so the caller shrinks the chunk (a 2 GiB stack does not fit a T4).
+            if step == 1:
+                raise
+            step = max(1, step // 2)
+            continue
+        yield first, last, dense
+        dense = None
+        first = last
 
 
 def _ogs_expert_offsets(routing_data):
