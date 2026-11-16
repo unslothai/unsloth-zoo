@@ -1168,7 +1168,7 @@ _M1_M2_CASES = {
 }
 _M1_M2_CALL = """
 import sys, mlx.core as mx
-dtype, HQ, HKV, L, S, D = sys.argv[1], *map(int, sys.argv[2:])
+dtype, HQ, HKV, L, S, D = sys.argv[1], *map(int, sys.argv[2:7])
 q = mx.random.normal((1, HQ, L, D), key=mx.random.key(0)).astype(getattr(mx, dtype))
 k, v = (mx.random.normal((1, HKV, S, D), key=mx.random.key(i)).astype(q.dtype) for i in (1, 2))
 if sys.argv[-1] == "zoo":
