@@ -1299,6 +1299,13 @@ def test_tree_calibration_refits_each_depth_from_the_children_of_accepted_rows()
     for _ in range(4 * calibration.REFIT_EVERY):
         calibration.observe([0, 1], [-1, 0], [0.0, math.log(0.5)], [0, 1])
     assert 3.0 < calibration.alpha[0] < 4.2
+    # One confident q, a quarter accepted: undamped Newton steps landed at the bounds and promised acceptance near 1.
+    calibration, logq = TreeCalibration(1), math.log(1 / (1 + math.exp(-4.0)))
+    for round_ in range(4 * calibration.REFIT_EVERY):
+        calibration.observe([0, 1], [-1, 0], [0.0, logq], [0, 1] if round_ % 4 == 0 else [0])
+        if (round_ + 1) % calibration.REFIT_EVERY == 0:
+            promised = 1 / (1 + math.exp(-(calibration.alpha[0] + 4.0 * calibration.beta[0])))
+            assert promised < 0.5 and (round_ < calibration.REFIT_EVERY or abs(promised - 0.25) < 0.03), (round_, promised)
 
 
 def test_a_sized_budget_times_no_cycle_across_replies_of_one_round():

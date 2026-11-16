@@ -1160,7 +1160,7 @@ class TreeCalibration:
     sigmoid(alpha + beta * logit q), which trees grow best first on. Each depth is refit from the verified children of
     accepted rows by Newton steps on a ridge toward ``PRIOR``, within bounds: a free fit of a deep row's few records diverges."""
 
-    RECORDS, MIN_RECORDS, REFIT_EVERY, STEPS = 512, 32, 32, 4
+    RECORDS, MIN_RECORDS, REFIT_EVERY, STEPS, HALVINGS = 512, 32, 32, 4, 12
     ALPHA_BOUND, BETA_BOUNDS = 8.0, (0.1, 4.0)
     # (alpha, beta) about where DFlash2 selectors' fits settle at every depth: a confident q promises more than it keeps.
     PRIOR = (-0.5, 0.65)
@@ -1193,6 +1193,12 @@ class TreeCalibration:
         x, y = self._logits, self._hits
         kept = (np.arange(self.RECORDS) < seen[:, None]).astype(np.float64)
         alpha, beta = self.alpha, self.beta
+
+        def loss(a, b):
+            z = a[:, None] + b[:, None] * x
+            softplus = np.maximum(z, 0.0) + np.log1p(np.exp(-np.abs(z)))   # np.logaddexp is 5x slower
+            return (kept * (softplus - y * z)).sum(1) + 0.5 * ((a - self.PRIOR[0]) ** 2 + (b - self.PRIOR[1]) ** 2)
+
         for _ in range(self.STEPS):
             p = 1.0 / (1.0 + np.exp(-(alpha[:, None] + beta[:, None] * x)))
             weight, residual = kept * p * (1.0 - p), kept * (p - y)
@@ -1200,10 +1206,18 @@ class TreeCalibration:
             h_alpha, h_cross, h_beta = 1.0 + weight.sum(1), (weight * x).sum(1), 1.0 + (weight * x * x).sum(1)
             det = h_alpha * h_beta - h_cross * h_cross
             free = beta - (h_alpha * g_beta - h_cross * g_alpha) / det
-            beta = np.clip(free, *self.BETA_BOUNDS)
+            next_beta = np.clip(free, *self.BETA_BOUNDS)
             # A slope held at a bound leaves the offset its own step, not its share of a step the slope did not take.
-            step = np.where(beta == free, (h_beta * g_alpha - h_cross * g_beta) / det, g_alpha / h_alpha)
-            alpha = np.clip(alpha - step, -self.ALPHA_BOUND, self.ALPHA_BOUND)
+            step = np.where(next_beta == free, (h_beta * g_alpha - h_cross * g_beta) / det, g_alpha / h_alpha)
+            next_alpha = np.clip(alpha - step, -self.ALPHA_BOUND, self.ALPHA_BOUND)
+            # Full Newton steps oscillate between the bounds once records saturate the sigmoid: halve until the loss falls.
+            before, scale = loss(alpha, beta) * (1 + 1e-12), np.ones_like(alpha)   # rounding at the optimum is not a rise
+            for halving in range(self.HALVINGS + 1):
+                worse = loss(alpha + scale * (next_alpha - alpha), beta + scale * (next_beta - beta)) > before
+                if not worse.any():
+                    break
+                scale = np.where(worse, 0.0 if halving == self.HALVINGS else scale / 2, scale)
+            alpha, beta = alpha + scale * (next_alpha - alpha), beta + scale * (next_beta - beta)
         self.alpha, self.beta = np.where(ready, alpha, self.alpha), np.where(ready, beta, self.beta)
         self.parameters = mx.array(np.stack([self.alpha, self.beta]), mx.float32)
 
