@@ -301,6 +301,9 @@ def _grouped_lora_linear_cls():
     from peft.tuners.lora.layer import Linear as LoraLinear
 
     class DeepseekV41GroupedLoraLinear(LoraLinear):
+        # Same layout as unsloth's grouped LoRA (shared lora_A, per-group lora_B): tensor parallel reads the flag.
+        _unsloth_grouped_lora = True
+
         def forward(self, x, *args, **kwargs):
             if (
                 self.disable_adapters
