@@ -62,3 +62,11 @@ def test_last_response_only_keeps_every_documents_last_turn():
     out = masker({"input_ids": [DOC_A + DOC_B], "seq_lengths": [[len(DOC_A), len(DOC_B)]]})
     kept = [t for t in out["labels"][0] if t != -100]
     assert kept == [21, 22, 23, 24]
+
+
+def test_a_packed_row_with_none_labels_masks_from_input_ids():
+    masker = _masker()
+    out = masker(
+        {"input_ids": [DOC_A + DOC_B], "labels": [None], "seq_lengths": [[len(DOC_A), len(DOC_B)]]}
+    )
+    assert out["labels"][0] == _unpacked(masker, [DOC_A, DOC_B])

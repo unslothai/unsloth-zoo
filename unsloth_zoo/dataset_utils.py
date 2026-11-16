@@ -966,7 +966,8 @@ def train_on_responses_only(
             for length in lengths:
                 docs.append(row[start : start + length])
                 if old_ is not None:
-                    doc_labels.append(old_[r][start : start + length])
+                    # A row whose labels are None gets them from input_ids, as _train_on_rows does.
+                    doc_labels.append(None if old_[r] is None else old_[r][start : start + length])
                 start += length
             splits.append(len(lengths))
         batch = {"input_ids": docs}
