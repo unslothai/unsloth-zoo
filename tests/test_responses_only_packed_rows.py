@@ -69,3 +69,18 @@ def test_a_packed_row_with_none_labels_masks_from_input_ids():
         {"input_ids": [DOC_A + DOC_B], "labels": [None], "seq_lengths": [[len(DOC_A), len(DOC_B)]]}
     )
     assert out["labels"][0] == _unpacked(masker, [DOC_A, DOC_B])
+
+
+def test_a_row_with_none_seq_lengths_masks_as_one_document():
+    from datasets import concatenate_datasets
+
+    # concatenate_datasets fills an unpacked dataset's missing seq_lengths with None per row.
+    masker = _masker(last_response_only = True)
+    mixed = concatenate_datasets([
+        Dataset.from_dict({"input_ids": [DOC_A + DOC_B], "seq_lengths": [[len(DOC_A), len(DOC_B)]]}),
+        Dataset.from_dict({"input_ids": [DOC_A]}),
+    ])
+    assert mixed["seq_lengths"][1] is None
+    out = mixed.map(masker, batched = True, load_from_cache_file = False)
+    assert out["labels"][0] == _unpacked(masker, [DOC_A, DOC_B])
+    assert out["labels"][1] == _unpacked(masker, [DOC_A])

@@ -959,6 +959,9 @@ def train_on_responses_only(
             old_ = old_.tolist()
         docs, doc_labels, splits = [], [], []
         for r, (row, lengths) in enumerate(zip(rows_, seq_lengths_)):
+            # None: an unpacked row beside packed ones (concatenate_datasets fills the column).
+            if lengths is None:
+                lengths = [len(row)]
             lengths = [int(x) for x in (lengths.tolist() if hasattr(lengths, "tolist") else lengths)]
             if sum(lengths) != len(row):
                 lengths = [len(row)]
