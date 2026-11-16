@@ -3034,9 +3034,27 @@ def sft_prepare_dataset(
                 print("Unsloth: We found double BOS tokens - we shall remove one automatically.")
         pass
 
+        # Plain text gets an EOS (as TRL does), so the model learns where a document ends and packed documents stay
+        # apart. Rows already ending in EOS or any special token (chat-formatted text, notebooks adding EOS_TOKEN)
+        # are left alone.
+        _text_eos = getattr(tokenizer, "eos_token", None)
+        _text_ends = tuple(t for t in (getattr(tokenizer, "all_special_tokens", None) or []) if isinstance(t, str) and t)
+        _text_ends += tuple(
+            str(t) for t in (getattr(tokenizer, "added_tokens_decoder", None) or {}).values()
+            if getattr(t, "special", False) and str(t)
+        )
+        if _text_eos: _text_ends += (_text_eos,)
+
+        def _with_eos(text):
+            if not _text_eos or not isinstance(text, str) or text.rstrip().endswith(_text_ends):
+                return text
+            return text + _text_eos
+
         def _tokenize(example):
+            texts = example[dataset_text_field] if not do_formatting_func else formatting_func(example)
+            texts = [_with_eos(t) for t in texts] if isinstance(texts, (list, tuple)) else _with_eos(texts)
             return tokenizer(
-                example[dataset_text_field] if not do_formatting_func else formatting_func(example),
+                texts,
                 truncation = do_truncation,
                 max_length = max_seq_length,
                 return_token_type_ids = _needs_token_type_ids,
