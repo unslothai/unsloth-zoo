@@ -1883,6 +1883,30 @@ def grpo_vllm_sampler_uses_triton(trainer, top_k, top_p):
 pass
 
 
+def grpo_forwards_are_collective(model):
+    """FSDP2 sharded layout: every forward all-gathers, so ranks must run the same number of forwards."""
+    import torch.distributed as dist
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
+        return False
+    cached = model.__dict__.get("_unsloth_grpo_collective_forwards", None)
+    if cached is None:
+        cached = any(
+            module.__dict__.get("_unsloth_reshard_after_forward", False) not in (False, None, 0)
+            for module in model.modules()
+        )
+        model.__dict__["_unsloth_grpo_collective_forwards"] = cached
+    return cached
+pass
+
+
+def grpo_agree_mini_batch(B, device):
+    import torch.distributed as dist
+    value = torch.tensor([int(B)], dtype = torch.int64, device = device)
+    dist.all_reduce(value, op = dist.ReduceOp.MAX)
+    return int(value.item())
+pass
+
+
 _n_chunks_deprecation_warned = False
 
 def _warn_deprecated_n_chunks(n_chunks):
@@ -3104,6 +3128,9 @@ def grpo_accumulated_loss(
         seq_len = input_ids.shape[1]
         hidden_dim = lm_head.shape[1]
         vocab_dim = lm_head.shape[0]
+        # Imported here: this body is copied into the generated trainer.
+        from unsloth_zoo.rl_replacements import grpo_forwards_are_collective, grpo_agree_mini_batch
+        _collective_forwards = grpo_forwards_are_collective(trainer.model)
 
         if trainer.args.unsloth_grpo_mini_batch is None:
             # Size per call, as unsloth's copy does: caching in args froze the first step's plan.
@@ -3111,6 +3138,8 @@ def grpo_accumulated_loss(
                 total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
             )
             B = max(1, total_rows//B)
+            if _collective_forwards:
+                B = grpo_agree_mini_batch(B, input_ids.device)
         else:
             if trainer.args.unsloth_grpo_mini_batch > total_rows:
                 B = total_rows
