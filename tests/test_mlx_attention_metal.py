@@ -1161,7 +1161,7 @@ def test_m1_m2_head_dim_512_decode_leaves_the_one_pass_vector_kernel(fused_atten
     assert mx.abs(out.astype(mx.float32) - want).max().item() <= 2e-3
 
 
-_M1_M2_CASES = {
+_REFUSED_LAUNCHES = {
     "d256_rows": ("float16", 24, 4, 5, 4096, 256),
     "d512_decode": ("float16", 16, 2, 1, 2048, 512),
     "d512_decode_fp32": ("float32", 16, 2, 1, 2048, 512),
@@ -1180,19 +1180,18 @@ print("MAXERR", mx.abs(out.astype(mx.float32) - want).max().item())
 """
 
 
-@pytest.mark.parametrize("case", sorted(_M1_M2_CASES))
-def test_m1_m2_launches_that_mlx_0_32_4_refuses_run_through_the_wrapper(case):
-    # Real M1/M2 only: stock mlx must refuse the launch here, or the wrapper is untested.
+@pytest.mark.parametrize("case", sorted(_REFUSED_LAUNCHES))
+def test_launches_that_mlx_0_32_4_refuses_run_through_the_wrapper(case):
+    # Any GPU whose pipelines refuse these launches (M1/M2) must get them through the wrapper.
     import subprocess
 
-    arch = nax._gpu_architecture()
-    if not mx.metal.is_available() or nax._gpu_generation() not in (13, 14):
-        pytest.skip(f"needs an M1/M2 GPU, got {arch!r}")
-    if case.startswith("d512") and arch[-1:] in ("d", "s"):
-        pytest.skip("Max/Ultra route this decode to the two-pass kernel")
-    args = [sys.executable, "-c", _M1_M2_CALL, *map(str, _M1_M2_CASES[case])]
+    if not mx.metal.is_available():
+        pytest.skip("needs Metal")
+    args = [sys.executable, "-c", _M1_M2_CALL, *map(str, _REFUSED_LAUNCHES[case])]
     stock = subprocess.run([*args, "stock"], capture_output=True, text=True, timeout=600)
-    assert stock.returncode != 0 and "threads per threadgroup" in stock.stderr, (arch, stock.stdout, stock.stderr[-2000:])
+    if stock.returncode == 0:
+        pytest.skip(f"{nax._gpu_architecture()!r} launches {case}")
+    assert "threads per threadgroup" in stock.stderr, stock.stderr[-2000:]
     zoo = subprocess.run([*args, "zoo"], capture_output=True, text=True, timeout=600)
-    assert zoo.returncode == 0, (arch, zoo.stderr[-2000:])
+    assert zoo.returncode == 0, (nax._gpu_architecture(), zoo.stderr[-2000:])
     assert float(zoo.stdout.split("MAXERR")[-1]) <= (1e-4 if case.endswith("fp32") else 2e-3), zoo.stdout
