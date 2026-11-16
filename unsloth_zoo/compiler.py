@@ -5807,7 +5807,14 @@ def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
         import timm.layers.fast_norm
 
         timm.layers.fast_norm.is_fast_norm = lambda *args, **kwargs: False
+        _timm_rms_norm2d = timm.layers.fast_norm.rms_norm2d
         timm.layers.fast_norm.rms_norm2d = rms_norm2d
+        # timm.layers.norm / norm_act import rms_norm2d by name; their copy returns float32 against
+        # our float32 norm weights, breaking the next fp16 conv (Gemma 3N on T4). Rebind them all.
+        for _name, _module in list(sys.modules.items()):
+            if (_name == "timm" or _name.startswith("timm.")) and _module is not None:
+                if getattr(_module, "rms_norm2d", None) is _timm_rms_norm2d:
+                    _module.rms_norm2d = rms_norm2d
         if UNSLOTH_ENABLE_LOGGING:
             print("Unsloth: Compiled timm.layers.fast_norm")
     except:
