@@ -707,7 +707,7 @@ def _table_reader():
 
 
 _SCORE_DECAY, _SCORE_DECAY_EVERY = 0.7, 4
-# DeepSeek V4.1's decode reuses an expert over a longer span: halving its counts every 16 calls misses about 5% fewer.
+# DeepSeek V4.1's decode reuses an expert over a longer span than the stock rule keeps: half-life of 16 calls.
 _SCORE_DECAYS = {"DeepseekV41SwitchGLU": (0.5 ** (1 / 16), 1)}
 # Pending outputs a slot table keeps before evaluating them (decode has evaluated them by then).
 _PENDING_READERS, _PENDING_BYTES = 8, 32 << 20
