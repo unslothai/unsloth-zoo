@@ -81,4 +81,5 @@ def test_streaming_text_dataset_tokenizes_from_the_compiled_copy():
     )
     out = namespace["sft_prepare_dataset"](trainer, dataset, _Tokenizer(), args, False, None, "train")
     got = [row["input_ids"] for row in out]
-    assert got == [_Tokenizer()(r["text"])["input_ids"] for r in rows]
+    # Plain text gains the EOS, as in TRL.
+    assert got == [_Tokenizer()(r["text"] + _Tokenizer.eos_token)["input_ids"] for r in rows]
