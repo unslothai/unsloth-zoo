@@ -1543,7 +1543,7 @@ def _engram_table(path, rows = 900):
 def test_engram_reads_read_cold_rows_pages_in_and_gather_stock_bytes(tmp_path, monkeypatch):
     table, model = _engram_table(tmp_path)
     stock = type(table)
-    ids = np.array([[[7, 400, 7], [899, 3, 400]], [[3, 3, 11], [12, 7, 650]]])  # repeats, as n-gram hashes give
+    ids = np.array([[[7, 400, 7], [899, 3, 400]], [[3, 3, 11], [12, 7, 650]]])
     expected = table._read_rows(ids)
     read, native, page = [], os.preadv, os.sysconf("SC_PAGESIZE")
     monkeypatch.setattr(os, "preadv", lambda fd, buffers, offset: read.append((offset, len(buffers[0]))) or native(fd, buffers, offset))
@@ -1559,7 +1559,7 @@ def test_engram_reads_read_cold_rows_pages_in_and_gather_stock_bytes(tmp_path, m
                 start = memmap.offset + row * memmap.strides[0]
                 assert any(a <= start and start + memmap.strides[0] <= a + n for a, n in read)
         del read[:]
-        again = table._read_rows(ids[:, :1])  # read in again unless the probe finds the rows in core
+        again = table._read_rows(ids[:, :1])
         assert read
         del read[:]
         monkeypatch.setattr(decode, "_ple_resident", lambda parts: 1.0)
