@@ -176,9 +176,10 @@ def runtime_fuses(queries, q_keys, q_values, group_size, mask=None):
 
 @functools.cache
 def _thread_limited_gpu():
+    # M1/M2, and paravirtual GPUs (`air64_v*`), which hit the same limits on GitHub's M1 runners.
     from . import nax
 
-    return nax._gpu_generation() in (13, 14)
+    return nax._gpu_generation() in (13, 14) or nax._gpu_architecture().startswith("air64")
 
 
 def _over_vector_thread_limit(q, k, v, mask):

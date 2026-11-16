@@ -1196,3 +1196,16 @@ def test_launches_that_mlx_0_32_4_refuses_run_through_the_wrapper(case):
     zoo = run([*args, "zoo"])
     assert zoo.returncode == 0, (nax._gpu_architecture(), zoo.stderr[-2000:])
     assert float(zoo.stdout.split("MAXERR")[-1]) <= (1e-4 if case.endswith("fp32") else 2e-3), zoo.stdout
+
+
+@pytest.mark.parametrize("arch, limited", [("applegpu_g13g", True), ("applegpu_g14s", True), ("air64_v27", True),
+                                           ("applegpu_g15s", False), ("applegpu_g17p", False), ("", False)])
+def test_thread_limited_gpus_include_paravirtual_ones(monkeypatch, arch, limited):
+    from unsloth_zoo.mlx import attention
+
+    monkeypatch.setattr(nax, "_gpu_architecture", lambda: arch)
+    attention._thread_limited_gpu.cache_clear()
+    try:
+        assert attention._thread_limited_gpu() == limited
+    finally:
+        attention._thread_limited_gpu.cache_clear()
