@@ -19,6 +19,7 @@ the serial results (chosen config valid, outputs exact, failing configs skipped)
 UNSLOTH_FLA_PARALLEL_COMPILE=0 restores one-at-a-time compiles."""
 
 import importlib.util
+import os
 import pathlib
 import threading
 
@@ -27,11 +28,14 @@ from packaging import version
 
 torch = pytest.importorskip("torch")
 triton = pytest.importorskip("triton")
-if version.parse(triton.__version__.split("+")[0]) < version.parse("3.5"):
-    pytest.skip("AsyncCompileMode needs triton>=3.5", allow_module_level = True)
+if version.parse(triton.__version__.split("+")[0]) < version.parse("3.3"):
+    pytest.skip("vendored fla needs triton>=3.3", allow_module_level = True)
 if not torch.cuda.is_available():
     pytest.skip("needs a GPU", allow_module_level = True)
 tl = triton.language
+_IS_HIP = bool(getattr(torch.version, "hip", None))
+os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
+os.environ.setdefault("UNSLOTH_VENDORED_FLA_NO_AUTORUN", "1")
 
 _CACHE_PATH = pathlib.Path(__file__).resolve().parents[1] / "unsloth_zoo/_vendored/fla/ops/utils/cache.py"
 
@@ -61,7 +65,8 @@ def _make(cache_mod, monkeypatch, threads_seen, blocks = (128, 256, 512, 4096), 
 
     def compile(src, *a, **k):
         if getattr(src, "fn", None) is jit_fn:
-            threads_seen.append(threading.current_thread().name)
+            block = src.constants[(jit_fn.arg_names.index("BLOCK"),)]
+            threads_seen.append((threading.current_thread().name, block))
         return original(src, *a, **k)
 
     monkeypatch.setattr(C, "compile", compile)
@@ -78,16 +83,24 @@ def _launch(tuner, n, scale):
     return tuner.best_config
 
 
+def _check_round(seen):
+    """Every config compiled on the pool; the 2 that cannot compile may be retried on the calling
+    thread by the benchmark (Triton 3.6 / 3.9 do not keep a failed compile), never a valid one."""
+    pooled = [b for t, b in seen if t.startswith("fla_compile")]
+    caller = [b for t, b in seen if not t.startswith("fla_compile")]
+    assert sorted(pooled) == sorted([128, 128, 256, 256, 512, 512, 4096, 4096]), seen
+    assert all(b == 4096 for b in caller), seen
+
+
 def test_cold_key_compiles_on_pool_and_matches_serial(cache_mod, monkeypatch, tmp_path):
+    if cache_mod._AsyncCompileMode is None:
+        pytest.skip("needs Triton's AsyncCompileMode with ignore_errors (triton>=3.6)")
     monkeypatch.setenv("TRITON_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(cache_mod, "_parallel_compile_threads", lambda: 4)
     seen = []
     tuner = _make(cache_mod, monkeypatch, seen)
     best = _launch(tuner, 3000, 2.0)
-    pooled = [t for t in seen if t.startswith("fla_compile")]
-    # All 8 configs (2 of them failing) compiled on the pool, none again on the calling thread.
-    assert len(pooled) == 8, seen
-    assert len(seen) == 8, seen
+    _check_round(seen)
     assert best.kwargs["BLOCK"] <= 1024
     # Warm key: no compiles at all.
     seen.clear()
@@ -95,7 +108,7 @@ def test_cold_key_compiles_on_pool_and_matches_serial(cache_mod, monkeypatch, tm
     assert seen == []
     # A new key (another round right after the first) is compiled on the pool again.
     _launch(tuner, 4096, 2.0)  # % 16 == 0: a new specialization, so real compiles
-    assert len([t for t in seen if t.startswith("fla_compile")]) == 8, seen
+    _check_round(seen)
 
 
 def test_kill_switch_compiles_serially(cache_mod, monkeypatch, tmp_path):
@@ -104,7 +117,7 @@ def test_kill_switch_compiles_serially(cache_mod, monkeypatch, tmp_path):
     seen = []
     tuner = _make(cache_mod, monkeypatch, seen)
     best = _launch(tuner, 3000, 3.0)
-    assert seen and not any(t.startswith("fla_compile") for t in seen), seen
+    assert seen and not any(t.startswith("fla_compile") for t, _ in seen), seen
     assert best.kwargs["BLOCK"] <= 1024
 
 
@@ -114,7 +127,7 @@ def test_single_config_round_never_uses_pool(cache_mod, monkeypatch, tmp_path):
     seen = []
     tuner = _make(cache_mod, monkeypatch, seen, blocks = (256,), warps = (4,))
     _launch(tuner, 1000, 1.5)
-    assert seen and not any(t.startswith("fla_compile") for t in seen), seen
+    assert seen and not any(t.startswith("fla_compile") for t, _ in seen), seen
 
 
 # --- configs pruned before compiling: num_stages twins before sm80, l2norm on head dim <= 128 ---
@@ -148,6 +161,7 @@ def _ptx(capability, num_stages):
     return kernel.asm["ptx"]
 
 
+@pytest.mark.skipif(_IS_HIP, reason = "NVIDIA backend premise")
 def test_num_stages_changes_nothing_before_sm80():
     # The premise of dropping num_stages twins: identical PTX on sm75, and the control (sm80, where
     # Triton pipelines the loop with cp.async) shows the comparison tells the kernels apart.
@@ -156,6 +170,7 @@ def test_num_stages_changes_nothing_before_sm80():
     assert "cp.async" in _ptx(80, 3) and "cp.async" not in _ptx(75, 3)
 
 
+@pytest.mark.skipif(_IS_HIP, reason = "pruning is CUDA-only")
 def test_stage_twins_dropped_only_before_sm80(cache_mod, monkeypatch):
     import types
 
@@ -176,11 +191,8 @@ def test_stage_twins_dropped_only_before_sm80(cache_mod, monkeypatch):
 
 
 def test_l2norm_keeps_two_configs_up_to_head_dim_128(monkeypatch):
-    import os
     import sys
 
-    os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
-    os.environ.setdefault("UNSLOTH_VENDORED_FLA_NO_AUTORUN", "1")
     fla_vendor = pytest.importorskip("unsloth_zoo.temporary_patches.fla_vendor")
     if not fla_vendor._vendored_injection_supported():
         pytest.skip("vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3")

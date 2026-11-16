@@ -65,45 +65,64 @@ logger = logging.getLogger(__name__)
 # Unsloth: a cold autotune key compiles every config before benchmarking it, and those compiles
 # ran one at a time: most of a cold first Qwen3.5 / Qwen3.6 training step. Triton releases the
 # GIL while compiling, so the configs are compiled together on a thread pool through Triton's
-# AsyncCompileMode (Triton >= 3.5) and the benchmark then finds them compiled. The configs and
-# the benchmark are unchanged. UNSLOTH_FLA_PARALLEL_COMPILE=0 turns it off.
+# AsyncCompileMode and the benchmark then finds them compiled. The configs and the benchmark are
+# unchanged. Triton >= 3.6 (3.5's AsyncCompileMode re-raises a failed compile on exit);
+# UNSLOTH_FLA_PARALLEL_COMPILE=0 turns it off.
 try:
+    import inspect as _inspect
+
     from triton.runtime._async_compile import AsyncCompileMode as _AsyncCompileMode
+    if "ignore_errors" not in _inspect.signature(_AsyncCompileMode.__init__).parameters:
+        _AsyncCompileMode = None
 except Exception:
     _AsyncCompileMode = None
+
+
+def _cpu_budget() -> int:
+    try:
+        n = len(os.sched_getaffinity(0))
+    except Exception:
+        n = os.cpu_count() or 1
+    try:  # cgroup v2 CPU quota (containers), which affinity does not show
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()[:2]
+        if quota != "max":
+            n = min(n, max(1, -(-int(quota) // int(period))))
+    except Exception:
+        pass
+    return n
 
 
 def _parallel_compile_threads() -> int:
     if _AsyncCompileMode is None or os.environ.get("UNSLOTH_FLA_PARALLEL_COMPILE", "1") == "0":
         return 0
-    try:
-        n = len(os.sched_getaffinity(0))
-    except Exception:
-        n = os.cpu_count() or 1
-    return min(n, 16)
+    return min(_cpu_budget(), 16)
+
+
+def _precompile_run(autotuner, args, kwargs, configs, threads) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(threads, thread_name_prefix = "fla_compile") as pool:
+        with _AsyncCompileMode(pool, ignore_errors = True):
+            for config in configs:
+                current = dict(kwargs, **config.all_kwargs())
+                current["warmup"] = True
+                try:
+                    autotuner.fn.run(*args, **current)
+                except Exception:
+                    pass
 
 
 def _precompile_configs(autotuner, args, kwargs, configs) -> None:
-    """Compile every config autotune is about to benchmark, in parallel; compile errors are left
-    for the benchmark itself to meet, exactly as a serial compile would."""
+    """Compile every config autotune is about to benchmark, in parallel; a config that fails to
+    compile fails again inside the benchmark, which skips it exactly as before."""
     threads = _parallel_compile_threads()
     if threads < 2 or len(configs) < 2:
         return
-    from concurrent.futures import ThreadPoolExecutor
+    import contextvars
     try:
-        with ThreadPoolExecutor(min(threads, len(configs)), thread_name_prefix = "fla_compile") as pool:
-            try:
-                mode = _AsyncCompileMode(pool, ignore_errors = True)
-            except TypeError:  # Triton 3.5: no ignore_errors; a failed config raises on exit, the rest resolve lazily
-                mode = _AsyncCompileMode(pool)
-            with mode:
-                for config in configs:
-                    current = dict(kwargs, **config.all_kwargs())
-                    current["warmup"] = True
-                    try:
-                        autotuner.fn.run(*args, **current)
-                    except Exception:
-                        pass
+        # AsyncCompileMode lives in a ContextVar and is cleared only after its compiles finish:
+        # a copied context keeps an interrupted round from leaving this thread in async mode.
+        contextvars.copy_context().run(_precompile_run, autotuner, args, kwargs, configs, min(threads, len(configs)))
     except Exception as exc:
         logger.debug("Parallel autotune compile skipped: %r", exc)
 
@@ -127,7 +146,8 @@ def _drop_stage_only_twins(autotuner, configs, kwargs):
     if len(configs) < 2 or _full_autotune() or getattr(torch.version, "hip", None):
         return configs
     device = _operand_device(autotuner, kwargs)
-    if device is None or device.type != "cuda" or torch.cuda.get_device_capability(device)[0] >= 8:
+    # Triton compiles for the current device (fla's launchers set it to the operands').
+    if device is None or device.type != "cuda" or torch.cuda.get_device_capability()[0] >= 8:
         return configs
     seen, kept = set(), []
     for config in configs:

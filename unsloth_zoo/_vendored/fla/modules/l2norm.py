@@ -22,9 +22,11 @@ NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if IS_AMD else [1, 2, 4, 8, 16, 32]
 def _unsloth_prune_l2norm(configs, named_args, **kwargs):
     """Unsloth: a cold run compiled all 25 (BT, num_warps) configs of each l2norm kernel, about half
     of the cold Qwen3.5 / Qwen3.6 GatedDeltaNet compiles, for a memory-bound kernel that is a small
-    share of the step. The 2 kept here were within 1.8% of the fastest of the 25 in every L4 cold
-    run (backward over 65536 rows of D = 128). Head dims up to 128 keep 2 configs; wider rows
-    (unmeasured) autotune over all of them. UNSLOTH_FLA_FULL_AUTOTUNE=1 keeps all."""
+    share of the step. Backward over 65536 rows of D = 128 (0.2 ms of a 2.8 s L4 / 10.9 s T4
+    Qwen3.5-2B step), the better of the 2 kept here was within 1.8% of the fastest of the 25 in
+    every cold run on L4 and 5.3% on T4 (some of the 25 were 1.9x to 3x slower). Head dims up to
+    128 keep 2 configs; wider rows (unmeasured) autotune over all of them.
+    UNSLOTH_FLA_FULL_AUTOTUNE=1 keeps all."""
     D = kwargs.get("D", (named_args or {}).get("D"))
     if not isinstance(D, int) or D > 128 or os.environ.get("UNSLOTH_FLA_FULL_AUTOTUNE", "0") == "1":
         return configs
