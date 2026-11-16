@@ -241,7 +241,7 @@ def nvfp4_experts_dequantize(codes, scales, global_scale, dtype = torch.bfloat16
             counts if counts is not None else codes,
             N, half, K // NVFP4_GROUP, N // parts, parts, s_oe, s_or, s_oc,
             BLOCK_R = BLOCK_R, BLOCK_C = BLOCK_C, USE_COUNTS = counts is not None, MULTIPLY = bool(multiply),
-            num_warps = 4,
+            num_warps = 4, enable_fp_fusion = True,
         )
     return buf
 
@@ -285,7 +285,7 @@ def mxfp8_experts_dequantize(codes, scales, dtype = torch.bfloat16, transpose = 
         _mxfp8_experts_kernel[(E, triton.cdiv(N, BLOCK_R), triton.cdiv(K, BLOCK_K))](
             codes.contiguous(), scales.contiguous(), buf, counts if counts is not None else codes,
             N, K, K // MXFP8_GROUP, s_oe, s_or, s_oc,
-            BLOCK_R = BLOCK_R, BLOCK_K = BLOCK_K, USE_COUNTS = counts is not None, num_warps = 4,
+            BLOCK_R = BLOCK_R, BLOCK_K = BLOCK_K, USE_COUNTS = counts is not None, num_warps = 4, enable_fp_fusion = True,
         )
     return buf
 

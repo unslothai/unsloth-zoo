@@ -33,6 +33,8 @@ _NOT_LAUNCHES = {
     "temporary_patches/gpt_oss.py": {"self.gate_up_projs", "self.down_projs"},
     "temporary_patches/moe_grouped_modulelist.py": {"spec"},
     "temporary_patches/moe_utils.py": {"registry"},
+    # forward_moe_backend globals looked up by name, not kernels.
+    "temporary_patches/deepseek_v41.py": {"backend"},
     # Custom ops out of the pinned-op tuple, and a weakref read out of a cache entry.
     "temporary_patches/moe_utils_sonic.py": {"_pinned_ops()", "hit"},
 }
