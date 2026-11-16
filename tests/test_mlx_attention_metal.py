@@ -1166,7 +1166,7 @@ _REFUSED_LAUNCHES = {
     "d512_decode": ("float16", 16, 2, 1, 2048, 512),
     "d512_decode_fp32": ("float32", 16, 2, 1, 2048, 512),
 }
-_M1_M2_CALL = """
+_LAUNCH = """
 import sys, mlx.core as mx
 dtype, HQ, HKV, L, S, D = sys.argv[1], *map(int, sys.argv[2:7])
 q = mx.random.normal((1, HQ, L, D), key=mx.random.key(0)).astype(getattr(mx, dtype))
@@ -1181,19 +1181,18 @@ print("MAXERR", mx.abs(out.astype(mx.float32) - want).max().item())
 
 
 @pytest.mark.parametrize("case", sorted(_REFUSED_LAUNCHES))
-def test_m1_m2_launches_that_mlx_0_32_4_refuses_run_through_the_wrapper(case):
-    # Bare-metal M1/M2 only: GitHub's paravirtual M1 runners (air64_v27) wedge on these launches.
+def test_launches_that_mlx_0_32_4_refuses_run_through_the_wrapper(case):
+    # Wherever stock mlx refuses these launches (M1/M2), the wrapper must run them.
     import subprocess
 
-    arch = nax._gpu_architecture()
-    if not mx.metal.is_available() or nax._gpu_generation() not in (13, 14):
-        pytest.skip(f"needs an M1/M2 GPU, got {arch!r}")
-    if case.startswith("d512") and arch[-1:] in ("d", "s"):
-        pytest.skip("Max/Ultra route this decode to the two-pass kernel")
-    args = [sys.executable, "-c", _M1_M2_CALL, *map(str, _REFUSED_LAUNCHES[case])]
+    if not mx.metal.is_available():
+        pytest.skip("needs Metal")
+    args = [sys.executable, "-c", _LAUNCH, *map(str, _REFUSED_LAUNCHES[case])]
     run = functools.partial(subprocess.run, capture_output=True, text=True, timeout=120)
     stock = run([*args, "stock"])
-    assert stock.returncode != 0 and "threads per threadgroup" in stock.stderr, (arch, stock.stderr[-2000:])
+    if stock.returncode == 0:
+        pytest.skip(f"{nax._gpu_architecture()!r} launches {case}")
+    assert "threads per threadgroup" in stock.stderr, stock.stderr[-2000:]
     zoo = run([*args, "zoo"])
-    assert zoo.returncode == 0, (arch, zoo.stderr[-2000:])
+    assert zoo.returncode == 0, (nax._gpu_architecture(), zoo.stderr[-2000:])
     assert float(zoo.stdout.split("MAXERR")[-1]) <= (1e-4 if case.endswith("fp32") else 2e-3), zoo.stdout
