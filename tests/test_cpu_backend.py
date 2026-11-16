@@ -389,6 +389,52 @@ def test_chunked_sft_step_keeps_token_count():
     assert trainer._total_train_tokens == 10 and trainer._metrics["train"]["num_tokens"] == [10]
 
 
+def _sft_trainer_stub(model, loss_type = "nll", accepts = False, **extra):
+    from types import SimpleNamespace
+    trainer = SimpleNamespace(model = model, args = SimpleNamespace(loss_type = loss_type),
+                              model_accepts_loss_kwargs = accepts, compute_loss_func = None, label_smoother = None)
+    for key, value in extra.items():
+        setattr(trainer, key, value)
+    return trainer
+
+
+def test_sft_loss_counts_items_for_a_mean_loss_model():
+    """Gemma 4 / Qwen-VL declare accepts_loss_kwargs = False (their forward loss is a micro-batch mean), but the CPU
+    SFT loss (chunked CE forward, or TRL's fused head in compute_loss) divides by num_items_in_batch itself: without
+    the count, gradient accumulation and data parallel averaged per micro-batch means (rows weighted unevenly)."""
+    import trl.trainer.utils as trl_utils
+    from unsloth_zoo.cpu.trainer import _count_items_for_sft_loss
+
+    fused_head = hasattr(trl_utils, "add_fused_lm_head")
+    plain = torch.nn.Linear(2, 2)
+    trainer = _sft_trainer_stub(plain)
+    assert _count_items_for_sft_loss(trainer) is fused_head
+    assert trainer.model_accepts_loss_kwargs is fused_head
+
+    chunked = torch.nn.Linear(2, 2)
+    chunked._unsloth_cpu_chunked_ce = True
+    trainer = _sft_trainer_stub(chunked)
+    assert _count_items_for_sft_loss(trainer) is True and trainer.model_accepts_loss_kwargs is True
+
+
+@pytest.mark.parametrize("extra", [
+    {"accepts": True},
+    {"loss_type": "dft", "compute_loss_func": lambda *a, **k: None},
+    {"label_smoother": object()},
+    {"loss_type": "chunked_nll"},
+])
+def test_sft_loss_leaves_other_losses_alone(extra):
+    """A custom compute_loss_func, label smoothing (full logits, the model's own mean) or a loss TRL does not divide
+    by the count keep the model's flag; a model that already takes the count is untouched."""
+    from unsloth_zoo.cpu.trainer import _count_items_for_sft_loss
+    extra = dict(extra)
+    accepts = extra.pop("accepts", False)
+    loss_type = extra.pop("loss_type", "nll")
+    trainer = _sft_trainer_stub(torch.nn.Linear(2, 2), loss_type = loss_type, accepts = accepts, **extra)
+    assert _count_items_for_sft_loss(trainer) is False
+    assert trainer.model_accepts_loss_kwargs is accepts
+
+
 def test_chunked_loss_honours_a_custom_ignore_index():
     from unsloth_zoo.cpu.ops import patch_chunked_causal_lm_loss
     model = _tiny_llama()
