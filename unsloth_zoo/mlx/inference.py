@@ -6060,11 +6060,24 @@ def _nax_int8_prefill_dense(module, x, bindings):
     return None if routed is None else routed.reshape(*x.shape[:-1], N)
 
 
+class _NaxOwner:
+    """Shared by a routed switch projection and the tables copied from it; their routes run while a scope holds it."""
+    __slots__ = ("live", "holders")
+
+    def __init__(self):
+        self.live, self.holders = True, 0
+
+
+def _nax_held(module):
+    token = module.__dict__.get("_unsloth_nax_owner")
+    return token is not None and token.live
+
+
 def _nax_gather_rows(owner, flag, x, w, indices, sorted_indices, bindings, token_rows):
     """The sorted rows of a gathered call that the NAX route `flag` enables on `owner` may take, or 0."""
     if not sorted_indices or not isinstance(x, mx.array) or x.ndim != 3 or x.shape[1] != 1:
         return 0
-    if not getattr(owner, flag, False) or owner.training:
+    if not getattr(owner, flag, False) or owner.training or not _nax_held(owner):
         return 0
     if bindings is not None and not _bindings_intact(bindings):
         return 0
@@ -6218,7 +6231,35 @@ def _nax_switch_classes():
             swapped = _nax_switch_class(base, base.__call__, path)
             if swapped is not None:
                 classes[base] = swapped
+                slot = offload.slot_class(base)
+                classes[slot] = _nax_slot_class(slot, swapped)
     return classes
+
+
+@functools.cache
+def _nax_slot_class(slot, swapped):
+    # Offloaded experts' slot projections: the offload rule for sorted calls applies before the routes see them.
+    return type(f"_NaxGather{slot.__name__}", (offload.slot_class(swapped),), {"_unsloth_nax_qmm_native": slot})
+
+
+def _nax_modules(model, modules):
+    """`_fusion_modules`, plus the expert projections offloaded experts run outside the module tree."""
+    for path, module in _fusion_modules(model, modules):
+        yield path, module
+        if isinstance(module, offload.OffloadSwitchGLU):
+            yield from ((path, projection) for projection in module.projections())
+
+
+def _nax_restore(module):
+    native = getattr(type(module), "_unsloth_nax_qmm_native", None)
+    if native is not None:
+        module.__class__ = native
+    for name in ("_unsloth_nax_qmm_scopes", "_unsloth_nax_qmm_floor", "_unsloth_nax_qmm_ceiling",
+                 "_unsloth_nax_qmm_next", "_unsloth_nax_int8_prefill_rows",
+                 "_unsloth_nax_int8_prefill", "_unsloth_nax_sorted_gather", "_unsloth_nax_qmm_ready",
+                 "_unsloth_nax_owner"):
+        module.__dict__.pop(name, None)
+    module.pop("_unsloth_nax_qmm_rows", None)   # a tuple is stored in the module mapping
 
 
 def _nax_qmm_shape(module, route):
@@ -6298,7 +6339,7 @@ def int8_prefill_available(model):
         return Int8PrefillStatus(False, "distributed", 0)
     classes = _nax_qmm_classes(_NAX_QMM_ROUTE, nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
     switches, packed = _nax_switch_classes(), _nax_int8_prefill_packed(model)
-    modules = {id(module): module for _, module in model.named_modules()} if hasattr(model, "named_modules") else {}
+    modules = {id(module): module for _, module in _nax_modules(model, None)}
     return _int8_prefill_status(sum(bool(_nax_int8_prefill_route(module, classes, switches, packed))
                                     for module in modules.values()))
 
@@ -6374,7 +6415,7 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
     Sorted routed-expert projections run on a NAX gather kernel that reproduces `mx.gather_qmm`
     bit for bit where it is measured faster; `UNSLOTH_MLX_NAX_SORTED_GATHER=0` turns it off.
     """
-    changed, tracked = [], hasattr(model, "__dict__")
+    changed, held, owners, released, tracked = [], {}, [], set(), hasattr(model, "__dict__")
     try:
         with _NAX_QMM_LOCK:
             depth, outer = getattr(model, "__dict__", {}).get("_unsloth_nax_int8_prefill_scope", (0, None))
@@ -6396,13 +6437,19 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                 switches = _nax_switch_classes() if int8_prefill or sorted_gather else {}
                 packed = _nax_int8_prefill_packed(model) if int8_prefill else set()
                 nested, fresh, seen = [], [], set()
-                for _, module in _fusion_modules(model, _modules):
+                for _, module in _nax_modules(model, _modules):
                     if id(module) in seen:   # named_modules() yields a shared module once per path
                         continue
                     seen.add(id(module))
                     base = type(module)
+                    # A routed copy whose owner is gone (outlived its scopes, or copied as they exited) starts afresh.
+                    if base in switches.values() and not _nax_held(module):
+                        _nax_restore(module)
+                        base = type(module)
+                    if base is offload.OffloadSwitchGLU:
+                        owners.append(module)
                     if base in classes.values() or base in switches.values():
-                        if getattr(module, "_unsloth_nax_qmm_scopes", 0):
+                        if getattr(module, "_unsloth_nax_qmm_scopes", 0) or "_unsloth_nax_owner" in vars(module):
                             nested.append(module)
                     elif base in classes:
                         rows = _nax_qmm_row_range(module, route) if small_m else None
@@ -6429,10 +6476,14 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                 tiled = any(rows is not None for _, rows, _, _ in fresh) and _tiled_prefill_enabled()
                 for module, rows, int8_prefill_rows, gather in fresh:
                     if type(module) in switches:
-                        if int8_prefill_rows:
-                            module._unsloth_nax_int8_prefill = True
-                        if gather:
-                            module._unsloth_nax_sorted_gather = True
+                        module._unsloth_nax_owner = _NaxOwner()   # inherited by the tables copied from it
+                        # Cleared as well as set: a table copied mid-swap on another thread may carry stale flags.
+                        for flag, on in (("_unsloth_nax_int8_prefill", int8_prefill_rows),
+                                         ("_unsloth_nax_sorted_gather", gather)):
+                            if on:
+                                module.__dict__[flag] = True
+                            else:
+                                module.__dict__.pop(flag, None)
                         module.__class__ = switches[type(module)]
                         continue
                     module._unsloth_nax_qmm_rows = (0, -1) if rows is None else rows
@@ -6446,6 +6497,11 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                         module._unsloth_nax_int8_prefill_rows = int8_prefill_rows
                     module.__class__ = classes[type(module)]
                 for module in nested + [entry[0] for entry in fresh]:
+                    token = module.__dict__.get("_unsloth_nax_owner")
+                    if token is not None:
+                        token.holders += token not in held
+                        held.setdefault(token, []).append(module)
+                        continue
                     module._unsloth_nax_qmm_scopes = getattr(module, "_unsloth_nax_qmm_scopes", 0) + 1
                     changed.append(module)
         yield model
@@ -6460,14 +6516,18 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                 if scopes > 1:
                     module._unsloth_nax_qmm_scopes = scopes - 1
                     continue
-                native = getattr(type(module), "_unsloth_nax_qmm_native", None)
-                if native is not None:
-                    module.__class__ = native
-                for name in ("_unsloth_nax_qmm_scopes", "_unsloth_nax_qmm_floor", "_unsloth_nax_qmm_ceiling",
-                             "_unsloth_nax_qmm_next", "_unsloth_nax_int8_prefill_rows",
-                             "_unsloth_nax_int8_prefill", "_unsloth_nax_sorted_gather", "_unsloth_nax_qmm_ready"):
-                    module.__dict__.pop(name, None)
-                module.pop("_unsloth_nax_qmm_rows", None)   # a tuple is stored in the module mapping
+                _nax_restore(module)
+            for token, modules in held.items():
+                token.holders -= 1
+                if not token.holders:
+                    token.live = False
+                    released.add(token)
+                    for module in modules:
+                        _nax_restore(module)
+            for owner in owners:
+                for projection in owner.projections():
+                    if projection.__dict__.get("_unsloth_nax_owner") in released:
+                        _nax_restore(projection)
 
 
 _DENSE_QMM_CONTRACT = {"mlx.nn.layers.quantized": {"QuantizedLinear.__call__": "ca5cafb6d038d955"}}
