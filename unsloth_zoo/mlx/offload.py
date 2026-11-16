@@ -661,12 +661,12 @@ def _deepseek_v4_step_mask(layer, arguments):
 
 
 class _DeepseekV41Steps:
-    """DeepSeek V4.1's blocks share one cache, which only the model advances, and each hands the next its step's top-k
-    and pools there: each step sets the offset and replays what the previous block left at that step."""
+    """DeepSeek V4.1 blocks share one cache that only the model advances: each step sets the offset and replays the
+    handoff the previous block left at that step."""
 
     @staticmethod
-    def steps(cache):
-        # A batch cache's offset is its rows'; its calls run whole, as before these blocks stepped.
+    def applies(cache):
+        # A batch cache's offset is its rows': runs whole.
         return type(cache).__name__ == "DeepseekV41Cache"
 
     def __init__(self, layer, cache):
@@ -674,20 +674,20 @@ class _DeepseekV41Steps:
         self.last = self.layer == cache.n_layers - 1
         if self.layer == 0:
             cache.unsloth_wide_steps = {}
-        self.steps = cache.unsloth_wide_steps
+        self.records = cache.unsloth_wide_steps
 
     def begin(self, start):
         self.cache.offset = self.offset + start
-        for name, value in self.steps.get(start, {}).items():
+        for name, value in self.records.get(start, {}).items():
             setattr(self.cache, name, value)
 
     def end(self, start):
-        self.steps[start] = {name: getattr(self.cache, name) for name in self.cache.HANDOFF}
-        return self.steps[start]
+        self.records[start] = {name: getattr(self.cache, name) for name in self.cache.HANDOFF}
+        return self.records[start]
 
     def finish(self, done):
         self.cache.offset = self.offset
-        if self.last or not done:  # a failed pass would otherwise keep its records on the cache
+        if self.last or not done:
             self.cache.__dict__.pop("unsloth_wide_steps", None)
 
     @staticmethod
@@ -704,10 +704,8 @@ class _DeepseekV41Steps:
         return snapshot
 
     def capture(self, rows, copy_cache, captured):
-        """Keeps this block's state after its first rows (a step's end); the last block files a copy of the cache a
-        prefill chunked there holds."""
-        # New arrays: a later step writes the cache's buffers in place.
-        held = self.steps.setdefault("captured", {})
+        # Copies: later steps write the cache's buffers in place. The last block files the chunked-prefill snapshot.
+        held = self.records.setdefault("captured", {})
         held[self.layer] = {name: None if (value := getattr(self.cache, name)[self.layer]) is None else mx.contiguous(value)
                             for name in self._layer_lists(self.cache)}
         mx.eval(list(held[self.layer].values()))
@@ -717,8 +715,7 @@ class _DeepseekV41Steps:
 
     @classmethod
     def capture_whole(cls, layer, cache, rows):
-        """The cache a call of rows run whole leaves, once its last block ran; None before."""
-        if not cls.steps(cache) or layer.layer_idx != cache.n_layers - 1:
+        if not cls.applies(cache) or layer.layer_idx != cache.n_layers - 1:
             return None
         return cls._snapshot(cache, cache.offset + rows, {name: list(getattr(cache, name)) for name in cls._layer_lists(cache)})
 
@@ -1249,7 +1246,7 @@ class _WideLayer:
             built = _cache_mask(cache, hidden.shape[1]) if hasattr(cache, "make_mask") else mask
             step_mask = None
             causal = (mask is None or isinstance(mask, str)) and mask in masks and not isinstance(built, mx.array) and mask == built
-        if cache is None or not causal or self._wide_steps is not None and not self._wide_steps.steps(cache):
+        if cache is None or not causal or self._wide_steps is not None and not self._wide_steps.applies(cache):
             return self._whole(hidden, args, kwargs)
         switch = self._offload_switch
         table = switch is not None and switch._wide(read_next = True)
