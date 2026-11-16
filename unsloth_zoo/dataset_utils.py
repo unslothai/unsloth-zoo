@@ -947,6 +947,43 @@ def train_on_responses_only(
     mask_out_firsts  = frozenset(mask_out_lookup) if len(mask_out_lookup) > 4 else None
 
     def _train_on_responses_only(examples):
+        # Packed rows (TRL's seq_lengths): mask each document alone, as if unpacked.
+        seq_lengths_ = examples.get("seq_lengths") if hasattr(examples, "get") else None
+        if seq_lengths_ is None:
+            return _train_on_rows(examples)
+        input_ids_ = examples["input_ids"]
+        use_tensors = type(input_ids_) is torch_Tensor
+        rows_ = input_ids_.tolist() if hasattr(input_ids_, "tolist") else input_ids_
+        old_ = examples.get("labels")
+        if old_ is not None and hasattr(old_, "tolist"):
+            old_ = old_.tolist()
+        docs, doc_labels, splits = [], [], []
+        for r, (row, lengths) in enumerate(zip(rows_, seq_lengths_)):
+            # None: an unpacked row beside packed ones (concatenate_datasets fills the column).
+            if lengths is None:
+                lengths = [len(row)]
+            lengths = [int(x) for x in (lengths.tolist() if hasattr(lengths, "tolist") else lengths)]
+            if sum(lengths) != len(row):
+                lengths = [len(row)]
+            start = 0
+            for length in lengths:
+                docs.append(row[start : start + length])
+                if old_ is not None:
+                    doc_labels.append(None if old_[r] is None else old_[r][start : start + length])
+                start += length
+            splits.append(len(lengths))
+        batch = {"input_ids": docs}
+        if old_ is not None:
+            batch["labels"] = doc_labels
+        masked = _train_on_rows(batch)["labels"]
+        out, i = [], 0
+        for count in splits:
+            out.append([t for doc in masked[i : i + count] for t in doc])
+            i += count
+        return {"labels": torch.tensor(out, dtype = torch.int64) if use_tensors else out}
+    pass
+
+    def _train_on_rows(examples):
         input_ids_ = examples["input_ids"]
         use_tensors = False
         if type(input_ids_) is torch_Tensor:
