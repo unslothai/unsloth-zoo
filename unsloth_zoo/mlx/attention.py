@@ -183,8 +183,7 @@ def _thread_limited_gpu():
 
 
 def _over_vector_thread_limit(q, k, v, mask):
-    # mlx 0.32.4 sends up to 32 simdgroups to its fp16 head-dim-256 vector kernel, whose unmasked and array-masked
-    # builds allow only 28 on M1/M2 (ml-explore/mlx#4719); its causal build fits.
+    # mlx 0.32.4's non-causal fp16 d256 two-pass kernel allows 28 of its 32 simdgroups on M1/M2 (ml-explore/mlx#4719).
     if not (q.dtype == mx.float16 and q.ndim == 4 and q.shape[-1] == k.shape[-1] == v.shape[-1] == 256
             and 1 < q.shape[-2] <= min(8, k.shape[-2]) and k.shape[-3] > 0 and not isinstance(mask, str)):
         return False
@@ -194,8 +193,7 @@ def _over_vector_thread_limit(q, k, v, mask):
 
 
 def _one_pass_d512_over_thread_limit(q, k, v, mask):
-    # mlx 0.32.4 runs one-row head-dim-512 decode below 4096 keys (1024 on Max and Ultra) on its one-pass vector
-    # kernel, whose fp16 and fp32 builds allow fewer than the 1024 threads it is sent on M1/M2 (ml-explore/mlx#4708).
+    # mlx 0.32.4's one-pass fp16/fp32 d512 kernel, used below 4096 keys, cannot launch 1024 threads on M1/M2 (ml-explore/mlx#4708).
     if not (q.dtype in (mx.float16, mx.float32) and q.ndim == 4 and q.shape[-1] == k.shape[-1] == v.shape[-1] == 512
             and q.shape[-2] == 1 and k.shape[-3] > 0 and (mask is None or isinstance(mask, str))):
         return False

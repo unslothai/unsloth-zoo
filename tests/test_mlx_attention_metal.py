@@ -1182,7 +1182,6 @@ print("MAXERR", mx.abs(out.astype(mx.float32) - want).max().item())
 
 @pytest.mark.parametrize("case", sorted(_REFUSED_LAUNCHES))
 def test_launches_that_mlx_0_32_4_refuses_run_through_the_wrapper(case):
-    # Wherever stock mlx refuses these launches (M1/M2), the wrapper must run them.
     import subprocess
 
     if not mx.metal.is_available():
