@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""compile_timm_models swaps in a dtype-preserving rms_norm2d. timm.layers.norm / norm_act import
-rms_norm2d by name, so RmsNorm2d / RmsNormAct2d (Gemma 3N's MobileNetV5 tower) must see it too:
-with the float32 norm weights Unsloth pins and float16 activations, timm's own version returns
-float32 and the next float16 conv raises "expected scalar type Float but found Half" (T4 training,
-no autocast). Runs in a fresh interpreter since the compiler mutates timm."""
+"""RmsNorm2d / RmsNormAct2d keep the input dtype after compile_timm_models (Gemma 3N fp16 on T4).
+Runs in a fresh interpreter since the compiler mutates timm."""
 
 from __future__ import annotations
 
@@ -80,7 +77,7 @@ def test_timm_rms_norm2d_modules_keep_input_dtype(tmp_path):
     )
     env = dict(os.environ, UNSLOTH_COMPILE_LOCATION = str(tmp_path / "cache"))
     env.setdefault("UNSLOTH_ALLOW_CPU", "1")
-    # Eager forwards: the binding under test is read the same way by a traced forward, and CPU inductor is slow.
+    # Eager: CPU inductor is slow and the binding is read the same way.
     env["TORCHDYNAMO_DISABLE"] = "1"
     proc = subprocess.run([sys.executable, "-c", script], capture_output = True, text = True, timeout = 900, env = env)
     line = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
