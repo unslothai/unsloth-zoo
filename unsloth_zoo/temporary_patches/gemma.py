@@ -323,6 +323,9 @@ def patch_Gemma3Processor():
         elif not isinstance(text, list) and not isinstance(text[0], str):
             raise ValueError("Invalid input text. Please provide a string, or a list of strings")
 
+        # transformers >= 5.18 apply_chat_template asks for these to realign assistant masks past expanded images.
+        return_text_replacement_offsets = output_kwargs["text_kwargs"].pop("return_text_replacement_offsets", False)
+        text_replacement_offsets = [[] for _ in text] if isinstance(text, list) else []
         image_inputs = {}
         if images is not None:
             # batched_images = make_nested_list_of_images(images)
@@ -337,37 +340,56 @@ def patch_Gemma3Processor():
                     f"Received inconsistently sized batches of images ({len(batched_images)}) and text ({len(text)})."
                 )
 
-            # Replace image tokens by the full expanded sequence
+            # Replace each image token by its full expanded sequence (plus Pan-and-Scan crops), in one pass so the
+            # original and expanded char spans can be reported like upstream's get_text_with_replacements.
             batch_num_crops = to_py_obj(image_inputs.pop("num_crops"))
-            text_with_crops = text
+            text_replacement_offsets = [[] for _ in text]
+            boi_pattern = re.escape(self.boi_token)
+            expanded_text = []
             for batch_idx, (prompt, images_for_item, num_crops_for_item) in enumerate(zip(text, batched_images, batch_num_crops)):
-                image_indexes = [m.start() for m in re.finditer(self.boi_token, prompt)]
+                matches = list(re.finditer(boi_pattern, prompt))
 
-                if len(images_for_item) != len(image_indexes):
+                if len(images_for_item) != len(matches):
                     raise ValueError(
-                        f"Prompt contained {len(image_indexes)} image tokens but received {len(images_for_item)} images."
+                        f"Prompt contained {len(matches)} image tokens but received {len(images_for_item)} images."
                     )
 
                 iterable_num_crops = num_crops_for_item
 
                 if isinstance(num_crops_for_item, int):
-                    if len(image_indexes) > 0:
-                        iterable_num_crops = [num_crops_for_item] + [0] * (len(image_indexes) - 1)
+                    if len(matches) > 0:
+                        iterable_num_crops = [num_crops_for_item] + [0] * (len(matches) - 1)
                     else:
                         iterable_num_crops = []
+                iterable_num_crops = list(iterable_num_crops)
 
-                # Insert additional image tokens for Pan-and-Scan crops
-                for num, idx in reversed(list(zip(iterable_num_crops, image_indexes))):
+                pieces, offsets, last, gained = [], [], 0, 0
+                for k, m in enumerate(matches):
+                    num = iterable_num_crops[k] if k < len(iterable_num_crops) else 0
                     if isinstance(num, int) and num > 0:
-                        formatted_image_text = (
-                            f"Here is the original image {self.boi_token} and here are some crops to help you see better "
-                            + " ".join([self.boi_token] * num)
+                        # Pan-and-Scan: the original image followed by its crops
+                        replacement = (
+                            f"Here is the original image {self.full_image_sequence} and here are some crops to help you see better "
+                            + " ".join([self.full_image_sequence] * num)
                         )
-                        prompt = prompt[:idx] + formatted_image_text + prompt[idx + len(self.boi_token) :]
-                        text_with_crops[batch_idx] = prompt
-
-            # Expand placeholder image tokens to the full image token sequence
-            text = [prompt.replace(self.boi_token, self.full_image_sequence) for prompt in text]
+                    else:
+                        replacement = self.full_image_sequence
+                    start, end = m.span()
+                    pieces.append(prompt[last:start])
+                    pieces.append(replacement)
+                    offsets.append({
+                        "type": "image",
+                        "span": (start, end),
+                        "new_span": (start + gained, start + gained + len(replacement)),
+                        "text": m.group(),
+                        "replacement": replacement,
+                    })
+                    gained += len(replacement) - (end - start)
+                    last = end
+                pieces.append(prompt[last:])
+                expanded_text.append("".join(pieces))
+                text_replacement_offsets[batch_idx] = offsets
+            text = expanded_text
 
         return_tensors = output_kwargs["text_kwargs"].pop("return_tensors", None)
         # text_inputs = self.tokenizer(text=text, **output_kwargs["text_kwargs"], return_tensors="np")
@@ -397,7 +419,11 @@ def patch_Gemma3Processor():
             pad_to_multiple_of = output_kwargs["text_kwargs"].get("pad_to_multiple_of", None),
             model_max_length = _mml,
         )
-        return BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
+        out = BatchFeature(data={**text_inputs, **image_inputs}, tensor_type=return_tensors)
+        if return_text_replacement_offsets:
+            # Set after tensor conversion: a list of dicts per row is not a tensor.
+            out["text_replacement_offsets"] = text_replacement_offsets
+        return out
     pass
 
     if has_videos or has_audio:
