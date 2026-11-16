@@ -38,7 +38,7 @@ PYPROJECT = REPO_ROOT / "pyproject.toml"
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 
 # Newest transformers the version matrix was run against.
-TESTED_CEILING = Version("5.17.0")
+TESTED_CEILING = Version("5.18.0")
 
 # Newest torch the matrix was run against, and the exclusive bound that admits it.
 TESTED_TORCH = Version("2.15.0")
