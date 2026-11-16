@@ -979,6 +979,7 @@ def unsloth_train(trainer):
                     else: float16_scaler.scale(loss).backward()
                 pass
 
+                optimizer_was_skipped = False
                 if float16_scaler is None:
                     if max_grad_norm is not None and max_grad_norm > 0:
                         clip_grad_norm_(trainable_parameters, max_grad_norm)
@@ -987,9 +988,13 @@ def unsloth_train(trainer):
                     float16_scaler.unscale_(optimizer)
                     if max_grad_norm is not None and max_grad_norm > 0:
                         clip_grad_norm_(trainable_parameters, max_grad_norm)
+                    scale_before = float16_scaler.get_scale()
                     float16_scaler.step(optimizer)
                     float16_scaler.update()
-                lr_scheduler.step()
+                    # An inf/nan step is skipped and backs the scale off: do not advance the LR schedule, as Trainer.
+                    optimizer_was_skipped = float16_scaler.get_scale() < scale_before
+                if not optimizer_was_skipped:
+                    lr_scheduler.step()
                 optimizer.zero_grad()
 
                 if step % logging_steps == 0:
