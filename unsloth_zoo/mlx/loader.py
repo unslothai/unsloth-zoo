@@ -4066,6 +4066,58 @@ def _freeze_outside_language_model(model) -> None:
             module.freeze(recurse=False)
 
 
+def release_vision_weights(model) -> int:
+    """Free an mlx-vlm model's modules outside its language model for inference that reads no images, and return
+    the bytes freed; 0, with the model untouched, when its text path still needs them. The model can then neither
+    read images nor be saved whole."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from .utils import _get_processor_tokenizer
+
+    language_model = getattr(model, "language_model", None)
+    if not isinstance(model, nn.Module) or language_model is None:
+        return 0
+    shared = {id(module) for module in language_model.modules()}
+    released = {}
+    for name, child in model.children().items():
+        modules = [m for _, m in tree_flatten(child, is_leaf=lambda x: isinstance(x, nn.Module))]
+        if name == "language_model" or not modules or not all(isinstance(m, nn.Module) for m in modules):
+            continue
+        if not any(id(m) in shared for module in modules for m in module.modules()):
+            released[name] = child
+    if not released:
+        return 0
+    freed = sum(
+        value.nbytes
+        for name in released
+        for _, value in tree_flatten(model.parameters().get(name, {}))
+    )
+    for name in released:
+        del model[name]
+    ids = mx.array([list(_PROBE_TOKEN_PAIRS[0][0])])
+    try:
+        embed = getattr(model, "get_input_embeddings", None)
+        if callable(embed):
+            embeds = _call_restoring_module_state(model, lambda: embed(ids))
+            mx.eval(getattr(embeds, "inputs_embeds", embeds))
+        _verify_text_only_wrapper(
+            model, getattr(model, "_unsloth_modality_model_type", ""), check_causality=False
+        )
+    except Exception:
+        for name, child in released.items():
+            model[name] = child
+        return 0
+    gc.collect()
+    mx.clear_cache()
+    processor = getattr(model, "_processor", None)
+    for target in (model, processor, _get_processor_tokenizer(processor) if processor else None):
+        if target is not None:
+            target._unsloth_supports_images = False
+    model._unsloth_vision_released = True
+    return freed
+
+
 def _resolve_mlx_vlm_model_class(model_type):
     """Resolve the mlx_vlm ``Model`` class for a model_type (honoring remaps)."""
     if not model_type:
