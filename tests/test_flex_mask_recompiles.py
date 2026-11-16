@@ -66,3 +66,14 @@ def test_mask_values_unchanged(built, lengths):
     assert torch.equal(ours, stock)
     with torch.no_grad():  # inference keeps transformers' own mask_mod
         _mask_mod(built, rows)
+
+
+def test_older_torch_keeps_transformers_block_padding(monkeypatch):
+    from unsloth_zoo.temporary_patches import misc
+
+    original = masking_utils.flex_attention_mask
+    stock = getattr(original, "__wrapped__", original)
+    monkeypatch.setattr(masking_utils, "flex_attention_mask", stock)
+    monkeypatch.setattr(torch, "__version__", "2.5.1+cu124")
+    misc.patch_flex_mask_keeps_padding_mask_mod()
+    assert masking_utils.flex_attention_mask is stock

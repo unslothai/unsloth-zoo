@@ -1272,7 +1272,11 @@ def patch_flex_mask_keeps_padding_mask_mod():
     # (tiny Gemma-3 vision). Training always adds it, length dynamic (same BlockMask values).
     try:
         from transformers import masking_utils
+        from unsloth_zoo.utils import Version
     except Exception:
+        return
+    # torch < 2.6 builds block masks past kv_length: it needs transformers' own block-size padding.
+    if Version(torch.__version__) < Version("2.6.0"):
         return
     original = getattr(masking_utils, "flex_attention_mask", None)
     if original is None or getattr(original, "_unsloth_keeps_padding", False):
