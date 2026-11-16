@@ -854,3 +854,72 @@ def test_bit_packed_membership_mask_allows_exactly_the_listed_keys(s, n, k):
 def test_flex_budget_admits_32k_tokens():
     # At 1 bit per entry the same 256 MB budget holds QSA at 32k tokens (b = 1); 64k still falls back.
     assert 32768 * 32768 <= sa._FLEX_MAX_TABLE < 65536 * 65536
+
+
+def _compiled_graphs(fn, *args):
+    """Dynamo FX graphs of fn(*args) (backward through aot_eager)."""
+    from torch._dynamo.backends.common import aot_autograd
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        return aot_autograd(fw_compiler = lambda g, _: g.forward, bw_compiler = lambda g, _: g.forward)(gm, example_inputs)
+
+    torch._dynamo.reset()
+    out = torch.compile(fn, backend = backend, dynamic = True, fullgraph = True)(*args)
+    return out, graphs
+
+
+@pytest.mark.parametrize("with_sink", [True, False])
+def test_compiled_chunked_reference_is_one_op_and_matches_fp64(monkeypatch, with_sink):
+    # The torch path (T4 / sm75, CPU) under torch.compile: the chunk loop unrolled into the graph (one checkpoint HOP
+    # and one inductor index simplification per chunk) took minutes per layer to compile; it is one opaque op whose
+    # backward recomputes chunk by chunk.
+    q, kv, sink, idxs = _inputs(1, 24, 2, 8, 20, 6, torch.float64, "cpu", empty_rows = [(0, 5)])
+    sink = sink.double() if with_sink else None
+    go = torch.randn(1, 24, 2, 8, dtype = torch.float64)
+
+    def leaves():
+        return [t.clone().requires_grad_() for t in (q, kv)] + ([sink.clone().requires_grad_()] if with_sink else [])
+
+    def fn(*ts):
+        return sa.sparse_attn_reference(ts[0], ts[1], ts[2] if with_sink else None, idxs, 0.3)
+
+    want = leaves()
+    want_out = fn(*want)
+    want_grads = torch.autograd.grad(want_out, want, go)
+    naive_sink = sink if with_sink else torch.full((2,), float("-inf"), dtype = torch.float64)
+    torch.testing.assert_close(want_out.detach(), _naive(q, kv, naive_sink, idxs, 0.3), rtol = 1e-12, atol = 1e-12)
+
+    for rows in (4, 2):  # 6 and 12 chunks
+        monkeypatch.setattr(sa, "_TORCH_CHUNK_ELEMS", rows * 6 * 8)
+        got = leaves()
+        out, graphs = _compiled_graphs(fn, *got)
+        grads = torch.autograd.grad(out, got, go)
+        torch.testing.assert_close(out, want_out.detach(), rtol = 1e-12, atol = 1e-12)
+        for a, b in zip(grads, want_grads):
+            torch.testing.assert_close(a, b, rtol = 1e-12, atol = 1e-12)
+        assert len(graphs) == 1
+        targets = [str(n.target) for n in graphs[0].graph.nodes if n.op == "call_function"]
+        assert not any("checkpoint" in t for t in targets), targets
+        assert sum("sparse_attn_chunked_fwd" in t for t in targets) == 1, targets
+        assert not any("einsum" in t for t in targets), targets  # no chunk is traced into the graph
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_chunked_reference_op_grads_match_the_checkpointed_chunks(monkeypatch, dtype):
+    q, kv, sink, idxs = _inputs(2, 13, 3, 16, 17, 5, dtype, "cpu", empty_rows = [(1, 0)])
+    monkeypatch.setattr(sa, "_TORCH_CHUNK_ELEMS", 4 * 5 * 16 * 2)  # 4 rows per chunk, a short last chunk
+    sink = sink.float().view(1, 1, 3)
+    go = torch.randn(2, 13, 3, 16).to(dtype)
+    ref = _grads(lambda q, kv, sink: sa.sparse_attn_reference(q, kv, sink.view(3), idxs, 0.25),
+                 q.double(), kv.double(), sink.double(), go.double())
+    eager = _grads(lambda q, kv, sink: sa.sparse_attn_reference(q, kv, sink.view(3), idxs, 0.25), q, kv, sink, go)
+    op = _grads(lambda q, kv, sink: sa._chunked_fwd_op(q, kv, sink, idxs, 0.25), q, kv, sink, go)
+    for name, x, e, r in zip(("out", "dq", "dkv", "dsink"), op, eager, ref):
+        assert x.dtype == e.dtype and x.shape == e.shape, name
+        err = (x.double() - r).abs().max().item()
+        base = (e.double() - r).abs().max().item()
+        bound = 2 * base + 4 * torch.finfo(dtype).eps * max(1.0, r.abs().max().item())
+        assert err <= bound, f"{name}: err {err:.3e} > bound {bound:.3e} (checkpointed chunks {base:.3e})"
+    torch.library.opcheck(sa._chunked_fwd_op, tuple(t.detach().requires_grad_() for t in (q, kv, sink)) + (idxs, 0.25))
