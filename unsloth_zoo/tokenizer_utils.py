@@ -536,6 +536,33 @@ def _gathered_dtensor_weights(model, weights):
 pass
 
 
+def _storage_free(t):
+    # Pipeline stand-in for a matrix another rank holds: one element expanded.
+    return t.dim() > 0 and t.numel() > 1 and not any(t.stride())
+
+
+_PER_STAGE_MARK = "_unsloth_pp_preload"
+
+
+def _per_stage_pipeline(model):
+    # Use the loader's mark (shared by all ranks), never local stand-ins: a rank may hold both matrices.
+    import torch.distributed as dist
+    if not (dist.is_available() and dist.is_initialized()):
+        return False
+    return any(_PER_STAGE_MARK in module.__dict__ for module in model.modules())
+
+
+def _and_over_ranks(mask, split):
+    if not split:
+        return mask
+    import torch.distributed as dist
+    backend = str(dist.get_backend()).lower()
+    device = torch.device("cuda", torch.cuda.current_device()) if "nccl" in backend else torch.device("cpu")
+    out = mask.to(device = device, dtype = torch.uint8)
+    dist.all_reduce(out, op = dist.ReduceOp.MIN)
+    return out.to(device = mask.device, dtype = torch.bool)
+
+
 @_maybe_inference_mode
 def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES = [], eps = 1e-16):
     """
@@ -593,30 +620,46 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     min_size = min(embedding_matrix.shape[0], lm_head_matrix.shape[0])
     embedding_matrix = embedding_matrix[:min_size]
     lm_head_matrix   = lm_head_matrix  [:min_size]
-    
-    indicator_untrained1 = (torch.amax(embedding_matrix, axis = 1) <= eps) & \
-        (torch.amin(embedding_matrix, axis = 1) >= -eps)
+    embedding_free, lm_head_free = _storage_free(embedding_matrix), _storage_free(lm_head_matrix)
+    split = _per_stage_pipeline(model)
+    if (embedding_free or lm_head_free) and not split:
+        logger.warning(
+            "Unsloth: Skipping the untrained token fix: this process holds only part of the embedding / "
+            "lm_head and no per-stage pipeline group to judge the rest with."
+        )
+        return
 
-    # Does NOT work for Llama 3.1!!
-    indicator_untrained2 = (torch.amax(lm_head_matrix, axis = 1) <= eps) & \
-        (torch.amin(lm_head_matrix, axis = 1) >= -eps)
+    if embedding_free:
+        indicator_untrained1 = torch.ones(min_size, dtype = torch.bool, device = embedding_matrix.device)
+    else:
+        indicator_untrained1 = (torch.amax(embedding_matrix, axis = 1) <= eps) & \
+            (torch.amin(embedding_matrix, axis = 1) >= -eps)
+    indicator_untrained1 = _and_over_ranks(indicator_untrained1, split)
 
-    # We instead check for repeated vectors
-    lm_head_where = torch.where(indicator_untrained1)[0]
-    lm_head_bad = lm_head_matrix[lm_head_where.to(lm_head_matrix.device)]
-    lm_head_bad = lm_head_bad.cpu().float().numpy().round(3)
-    from collections import Counter
-    counter = Counter()
-    for row in lm_head_bad: counter[hash(row.data.tobytes())] += 1
-    counter = Counter({k: c for k, c in counter.items() if c >= 2})
+    if lm_head_free:
+        indicator_untrained2 = torch.ones(min_size, dtype = torch.bool, device = lm_head_matrix.device)
+    else:
+        # Does NOT work for Llama 3.1!!
+        indicator_untrained2 = (torch.amax(lm_head_matrix, axis = 1) <= eps) & \
+            (torch.amin(lm_head_matrix, axis = 1) >= -eps)
 
-    lm_head_where = lm_head_where.cpu().numpy()
-    final_bad_lm_head = []
-    for j, row in enumerate(lm_head_bad):
-        if hash(row.data.tobytes()) in counter:
-            final_bad_lm_head.append(lm_head_where[j])
-    indicator_untrained2 = indicator_untrained2 | torch.zeros_like(indicator_untrained2)
-    indicator_untrained2[final_bad_lm_head] = True
+        # We instead check for repeated vectors
+        lm_head_where = torch.where(indicator_untrained1)[0]
+        lm_head_bad = lm_head_matrix[lm_head_where.to(lm_head_matrix.device)]
+        lm_head_bad = lm_head_bad.cpu().float().numpy().round(3)
+        from collections import Counter
+        counter = Counter()
+        for row in lm_head_bad: counter[hash(row.data.tobytes())] += 1
+        counter = Counter({k: c for k, c in counter.items() if c >= 2})
+
+        lm_head_where = lm_head_where.cpu().numpy()
+        final_bad_lm_head = []
+        for j, row in enumerate(lm_head_bad):
+            if hash(row.data.tobytes()) in counter:
+                final_bad_lm_head.append(lm_head_where[j])
+        indicator_untrained2 = indicator_untrained2 | torch.zeros_like(indicator_untrained2)
+        indicator_untrained2[final_bad_lm_head] = True
+    indicator_untrained2 = _and_over_ranks(indicator_untrained2, split)
 
     indicator_untrained = indicator_untrained1.to("cpu") & indicator_untrained2.to("cpu")
 
@@ -795,8 +838,10 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         "Unsloth: Setting embed_tokens & lm_head untrained tokens to "\
         "mean(trained) to counteract NaNs during training."
     )
-    embedding_matrix[where_untrained] = mean_embedding.to(embedding_matrix.dtype)
-    lm_head_matrix  [where_untrained] = mean_lm_head  .to(lm_head_matrix  .dtype)
+    if not embedding_free:
+        embedding_matrix[where_untrained] = mean_embedding.to(embedding_matrix.dtype)
+    if not lm_head_free:
+        lm_head_matrix  [where_untrained] = mean_lm_head  .to(lm_head_matrix  .dtype)
 
     collect_garbage(after = torch.cuda.empty_cache)
     pass

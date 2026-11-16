@@ -512,9 +512,36 @@ def _cast_large_param(param, dtype):
     return _cast_via_host_chunked(param, dtype)
 
 
+def _storage_free(t):
+    # pipeline_sharded_loading stand-in: one element expanded.
+    return t.dim() > 0 and t.numel() > 1 and not any(t.stride())
+
+
+def _cast_data(t, dtype):
+    if t.dtype == dtype:
+        return
+    if _storage_free(t) and t.is_floating_point():
+        scalar = t.data.as_strided((), (), t.data.storage_offset())
+        t.data = scalar.to(dtype).expand(t.shape)
+    else:
+        t.data = t.data.to(dtype)
+
+
+def _cast_storage_free(module, dtype):
+    for t in list(module.parameters()) + list(module.buffers()):
+        if _storage_free(t) and t.is_floating_point():
+            _cast_data(t, dtype)
+
+
+def _module_to(module, dtype):
+    _cast_storage_free(module, dtype)
+    module.to(dtype)
+
+
 def _bounded_cast_module(module, dtype):
     """`module.to(dtype)` without a full extra copy of any large parameter on the device or the host.
     `.to("cpu", dtype=...)` holds both copies on the host: 10.5 GiB for gemma-4 E4B, which OOM-kills a Colab T4 VM."""
+    _cast_storage_free(module, dtype)
     for param in module.parameters(recurse = False):
         if (
             param.dtype.is_floating_point
@@ -640,16 +667,16 @@ def patch_model_and_tokenizer(
         # Convert any remaining bfloat16 parameters
         for name, param in model.named_parameters():
             if hasattr(param, "_pre_set_compute_dtype"):
-                param.data = param.data.to(param._pre_set_compute_dtype)
+                _cast_data(param, param._pre_set_compute_dtype)
             elif param.dtype == torch.bfloat16:
-                param.data = param.data.to(torch.float16)
+                _cast_data(param, torch.float16)
 
         # Also convert buffers (like position embeddings)
         for name, buffer in model.named_buffers():
             if hasattr(buffer, "_pre_set_compute_dtype"):
-                buffer.data = buffer.data.to(buffer._pre_set_compute_dtype)
+                _cast_data(buffer, buffer._pre_set_compute_dtype)
             elif buffer.dtype == torch.bfloat16:
-                buffer.data = buffer.data.to(torch.float16)
+                _cast_data(buffer, torch.float16)
     elif correct_dtype == torch.float16:
         # A pre-quantized checkpoint keeps its skipped layers and biases in the bfloat16 it was saved in. On a GPU without bfloat16 (T4) Inductor skips every graph reading one, so a non-reentrant checkpoint recompute stops matching its forward (unsloth#3459).
         # A module pin covers its whole subtree: the pass below moves it with module.to().
@@ -667,6 +694,9 @@ def patch_model_and_tokenizer(
             # bfloat16 quant storage (FSDP-QLoRA) packs 4-bit weights into a bfloat16 tensor.
             if getattr(param, "quant_state", None) is not None:
                 continue
+            if _storage_free(param):
+                _cast_data(param, torch.float16)
+                continue
             if param.device.type == "cuda":
                 _cast_devices.add(param.device)
                 if param.numel() * param.element_size() >= _FORCED_FLOAT32_STAGE_BYTES:
@@ -681,7 +711,7 @@ def patch_model_and_tokenizer(
     # Upcast ot downcast if explicitly set
     for name, module in model.named_modules():
         if hasattr(module, "_pre_set_compute_dtype"):
-            module.to(module._pre_set_compute_dtype)
+            _module_to(module, module._pre_set_compute_dtype)
     pass
 
     # Correct dtype
