@@ -897,9 +897,10 @@ def test_large_moe_layers_prefill_as_chunked_on_full_tables(tmp_path, monkeypatc
     for start in range(0, tokens.shape[1], 2048):
         expected.append(forward(tokens[:, start:start + 2048], expected_cache))
         mx.eval(expected[-1], [c.state for c in expected_cache])
-        if start in (0, 2048):
+        if start == 0:
+            first = [copy(c) for c in expected_cache]
+        elif start == 2048:
             boundary = [copy(c) for c in expected_cache]
-            first = boundary if start == 0 else first
     report = offload_experts(lm, str(tmp_path), 0.75)
     assert report["layers"], report
     cache = lm.make_cache()
