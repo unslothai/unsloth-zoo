@@ -33,6 +33,8 @@ _NOT_LAUNCHES = {
     "temporary_patches/gpt_oss.py": {"self.gate_up_projs", "self.down_projs"},
     "temporary_patches/moe_grouped_modulelist.py": {"spec"},
     "temporary_patches/moe_utils.py": {"registry"},
+    # forward_moe_backend globals looked up by name, not kernels.
+    "temporary_patches/deepseek_v41.py": {"backend"},
     # Custom ops out of the pinned-op tuple, and a weakref read out of a cache entry.
     "temporary_patches/moe_utils_sonic.py": {"_pinned_ops()", "hit"},
 }
@@ -40,6 +42,9 @@ _NOT_LAUNCHES = {
 _DELIBERATE_FALSE = {
     "merged_rollout_exact.py:_exact_merge_kernel",
     "temporary_patches/gpt_oss_grouped_qlora.py:_nf4_dequant_stack_kernel",
+    "temporary_patches/gpt_oss_fused_glue.py:_gate_up_fwd_kernel",
+    "temporary_patches/gpt_oss_fused_glue.py:_gate_up_bwd_kernel",
+    "temporary_patches/gpt_oss_fused_glue.py:_down_fwd_kernel",
     "temporary_patches/moe_routed.py:_nf4_select_dequant_kernel",
     "temporary_patches/moe_nf4_grouped.py:_nf4_grouped_kernel",
     "temporary_patches/moe_nf4_grouped.py:_nf4_grouped_kernel.fn",

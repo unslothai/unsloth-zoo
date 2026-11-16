@@ -531,6 +531,8 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
         # Removes PeftModelForCausalLM and gets internal model
         m = m.get_base_model()
     model_name = m.__class__.__name__
+    is_csm = model_name == "CsmForConditionalGeneration"
+    csm_depth_num_items_in_batch = 0 if is_csm else None
 
     # Read off the top level model, before the walk below reassigns m: unsloth patches
     # LlamaModel.forward class-wide, so LlamaForSequenceClassification descends into
@@ -654,6 +656,13 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     None if unshifted else x.get("packed_seq_lengths"), unshifted = unshifted,
                     shift_labels = x.get("shift_labels"),
                 )
+                if csm_depth_num_items_in_batch is not None:
+                    # CsmProcessor: -101 frames train the backbone only. Same frames as the forward's train_mask.
+                    if labels.ndim != 2:
+                        csm_depth_num_items_in_batch = None
+                    else:
+                        csm_depth_num_items_in_batch += ((labels != -100) & (labels != -101)).sum() \
+                            * (top_model.config.num_codebooks - 1)
                 if not short: all_short = False
                 if bad: degenerate = True
                 token_counts.append(count)
@@ -672,9 +681,15 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     # Fill kernels, not torch.tensor(..., device = cuda): that is a blocking H2D copy.
                     flags = [torch.full((), int(flag), dtype = torch.int64, device = count.device)
                              for flag in (degenerate, all_short)]
+                    # CSM's depth count rides along as a 4th column on every rank (same model everywhere).
+                    if is_csm:
+                        flags.append(torch.zeros_like(count) if csm_depth_num_items_in_batch is None
+                                     else csm_depth_num_items_in_batch.reshape(()).to(count))
                     packed = torch.stack([count, *flags])
-                    packed = self.accelerator.gather(packed).reshape(-1, 3)
+                    packed = self.accelerator.gather(packed).reshape(-1, packed.numel())
                     num_items_in_batch = packed[:, 0].sum()
+                    if csm_depth_num_items_in_batch is not None:
+                        csm_depth_num_items_in_batch = packed[:, 3].sum()
                     # One D2H read for both flags, not one per bool().
                     degenerate, all_short = (
                         bool(flag) for flag in torch.stack([packed[:, 1].any(), packed[:, 2].all()]).tolist()
@@ -688,6 +703,11 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     # Uses DataParallel scatter gather
                     # So we have to scatter num_items_in_batch to each GPU
                     num_items_in_batch = num_items_in_batch.unsqueeze(0).repeat(self.args.n_gpu)
+            if torch.is_tensor(csm_depth_num_items_in_batch):
+                if device is not None:
+                    csm_depth_num_items_in_batch = csm_depth_num_items_in_batch.to(device)
+                if getattr(self.args, "n_gpu", 1) > 1 and self.args.parallel_mode == ParallelMode.NOT_DISTRIBUTED:
+                    csm_depth_num_items_in_batch = csm_depth_num_items_in_batch.unsqueeze(0).repeat(self.args.n_gpu)
             # Discard a count these labels could not support. Last, so every collective
             # above ran on every rank, and reduced above so no rank drops a divisor its
             # peers keep.
@@ -706,6 +726,10 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             and not getattr(self, "model_accepts_loss_kwargs", True)
             and getattr(self, "compute_loss_func", None) is None):
         num_items_in_batch = None
+
+    if num_items_in_batch is not None and csm_depth_num_items_in_batch is not None:
+        for sample in batch_samples:
+            sample["_unsloth_csm_depth_num_items_in_batch"] = csm_depth_num_items_in_batch
 
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: num_items_in_batch = {num_items_in_batch}")

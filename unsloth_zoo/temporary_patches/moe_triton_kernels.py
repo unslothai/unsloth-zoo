@@ -78,8 +78,9 @@ def _autograd_control_flow_errors():
 
 def _disable(where, exc):
     global _DISABLED_REASON
-    # Checkpoint early stop raises from our save_for_backward; swallowing it trips early_stop's assertion.
-    if isinstance(exc, _autograd_control_flow_errors()):
+    # Checkpoint early stop raises from our save_for_backward; swallowing it trips early_stop's assertion. An OOM is
+    # not a kernel fault either: disabling the kernels for it would only move the OOM to the eager path.
+    if isinstance(exc, _autograd_control_flow_errors() + (torch.cuda.OutOfMemoryError,)):
         try:
             raise exc
         finally:
@@ -327,8 +328,9 @@ class _WeightedUnpermute(torch.autograd.Function):
         (T, H), y_dtype, y_device = ctx.y_meta
         top_k = ctx.top_k
         dout = dout.contiguous()
-        # Backward kernels compile lazily here, outside the forward's fallback.
-        if moe_triton_kernels_available(dout.device):
+        # Backward kernels compile lazily here, outside the forward's fallback. create_graph=True (grad mode on in
+        # backward) needs the differentiable eager replay: the raw kernels' outputs carry no graph.
+        if not torch.is_grad_enabled() and moe_triton_kernels_available(dout.device):
             try:
                 triton, _, _, bwd_dy, bwd_dw = _get_kernels()
                 BLOCK_T, BLOCK_H = 16, 512

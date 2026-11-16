@@ -346,6 +346,19 @@ def create_huggingface_repo(
         private = private,
         exist_ok = True,  # don't error if repo already exists
     )
+    # create_repo(private=True, exist_ok=True) keeps an existing public repo public: refuse before the first upload.
+    if private:
+        try:
+            _is_private = getattr(api.repo_info(repo_id = repo_id, repo_type = "model"), "private", None)
+        except Exception as exc:
+            _is_private = None
+            print(f"Unsloth: Could not confirm the visibility of {repo_id} ({exc}); continuing.")
+        if _is_private is False:
+            raise RuntimeError(
+                f"Unsloth: private=True was requested but the Hugging Face repo {repo_id!r} already exists and is "
+                "public. Refusing to upload so private weights are not published. Make the repo private on the Hub, "
+                "push to a new repo id, or pass private=False."
+            )
     username = repo_id.split("/")[0]
 
     # If base_model is a local path, resolve it to the original model ID so the card does not reference a local dir (which fails HF validation).
@@ -2580,6 +2593,22 @@ def _fold_perexpert_lora_into_fused(W, fused_base_name, converted_lora_weights):
 pass
 
 
+def _paramwrapper_expert_lora(converted_lora_weights, fused_base_name):
+    """PEFT ParamWrapper LoRA on a fused expert tensor, or None. Keyed on the experts module,
+    one `.base_layer` deeper per extra target_parameters entry; tensor in `parameter_name`."""
+    _m = re.match(r"^(.*\.experts)\.(gate_up_proj|down_proj)$", fused_base_name)
+    if _m is None:
+        return None
+    key = _m.group(1)
+    while key in converted_lora_weights:
+        stats = converted_lora_weights[key]
+        if getattr(stats, "parameter_name", None) == _m.group(2) and getattr(stats, "lora_A", None) is not None:
+            return stats
+        key += ".base_layer"
+    return None
+pass
+
+
 @torch.inference_mode
 def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None, biases=None, vocab_modules=None):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -2709,6 +2738,14 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                     if UNSLOTH_ENABLE_LOGGING:
                         logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
                     count += 1; W = _merge_lora(W, lora_stats, output_key)
+                elif (_pw_stats := _paramwrapper_expert_lora(converted_lora_weights, base_name)) is not None:
+                    # Dequantized W is GPT-OSS (E, in, out), hence is_transposed.
+                    _merge_fused = (_merge_moe_fused_gate_up_expert if base_name.endswith(".gate_up_proj")
+                                    else _merge_moe_fused_down_proj_expert)
+                    W = _merge_fused(W, _pw_stats, output_dtype or W.dtype, is_transposed = True)
+                    count += 1
+                    if UNSLOTH_ENABLE_LOGGING:
+                        logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING expert LoRA into Key Group: {base_name}")
                 else:
                     # Per-expert Linear expert LoRA (gpt-oss bnb-4bit): the fused-name
                     # lookup above misses it, so fold each delta into its slice of W.
@@ -2892,6 +2929,18 @@ def _is_nvfp4_compressed_tensors_config(quant_config):
         return True
     return any(
         isinstance(group, dict) and "nvfp4" in str(group.get("format", "")).lower()
+        for group in (quant_config.get("config_groups") or {}).values()
+    )
+pass
+
+def _is_mxfp8_compressed_tensors_config(quant_config):
+    """compressed-tensors checkpoint with an mxfp8-quantized group: a 16bit merge must decode its e8m0 scales."""
+    if not isinstance(quant_config, dict) or str(quant_config.get("quant_method", "")).lower() != "compressed-tensors":
+        return False
+    if str(quant_config.get("format", "")).lower() == "mxfp8-quantized":
+        return True
+    return any(
+        isinstance(group, dict) and str(group.get("format", "")).lower() == "mxfp8-quantized"
         for group in (quant_config.get("config_groups") or {}).values()
     )
 pass
@@ -3284,6 +3333,7 @@ from huggingface_hub import (
     get_torch_storage_size,
     get_torch_storage_id,
 )
+from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
 def get_torch_storage_size_new(x, element_size):
     if isinstance(x, LoraStats):
@@ -3293,6 +3343,9 @@ def get_torch_storage_size_new(x, element_size):
         if saved_w is None and hasattr(mod, "weight"):
             saved_w = mod.weight
         if saved_w is not None and hasattr(saved_w, "shape"):
+            # Block Swap evicts a host-held layer's weights to empty tensors: size those from the module instead.
+            if saved_w.numel() == 0 and hasattr(mod, "in_features") and hasattr(mod, "out_features"):
+                return mod.in_features * mod.out_features * element_size
             return int(np.prod(saved_w.shape)) * element_size
         # MoE LoRA wrappers with no .base_layer: infer merged shape from lora matrices
         if mod is None and x.lora_A is not None and x.lora_B is not None:
@@ -3303,6 +3356,38 @@ def get_torch_storage_size_new(x, element_size):
         return int(np.prod(shape)) * element_size
     else:
         return get_torch_storage_size(x)
+pass
+
+
+def _tied_tensor_key(x):
+    # Tied embeddings are one tensor under two names and written once; views into a shared arena (Block Swap) are
+    # distinct tensors, so this cannot key on storage id like the shard splitter.
+    if not isinstance(x, torch.Tensor) or x.is_meta or is_traceable_wrapper_subclass(x):
+        return None
+    try:
+        ptr = x.data_ptr()
+    except Exception:
+        return None
+    return (str(x.device), ptr, x.dtype, tuple(x.shape), tuple(x.stride())) if ptr else None
+pass
+
+
+def _save_size_in_bytes(state_dict, element_size, safe_serialization = True):
+    # torch.save writes each storage whole; for safetensors transformers clones disjoint views (Block Swap's arena) and
+    # drops tied aliases, so each distinct view is written once at its own bytes.
+    seen, total = set(), 0
+    for x in state_dict.values():
+        size = get_torch_storage_size_new(x, element_size)
+        if safe_serialization:
+            key = _tied_tensor_key(x)
+            if key is not None: size = min(size, x.nbytes)
+        else:
+            key = get_torch_storage_id_new(x)
+        if key is not None:
+            if key in seen: continue
+            seen.add(key)
+        total += size
+    return total
 pass
 
 
@@ -3326,6 +3411,7 @@ def prepare_saving(
     low_disk_space_usage = False,
     min_size_in_bytes = 100_000_000, # Must be of this size - 100MB default
     use_temp_file = False,
+    safe_serialization = True,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check size
@@ -3367,8 +3453,7 @@ def prepare_saving(
         merge_into_original = merge_into_original,
         return_state_dict = True,
     )
-    # Total save size in bytes
-    save_size = sum(get_torch_storage_size_new(x, element_size) for x in state_dict.values())
+    save_size = _save_size_in_bytes(state_dict, element_size, safe_serialization)
 
     if not os.path.exists(save_directory):
         try:
@@ -5364,6 +5449,18 @@ def merge_and_overwrite_lora(
                 _hub_shard_sizes[fname] = x["size"]
                 max_size_in_bytes = max(max_size_in_bytes, x["size"])
                 total_size_in_bytes += x["size"]
+            if not safetensors_list:
+                # No root shard: read the subfolder shards the root index names, as the local branch does.
+                try:
+                    _hub_shard_sizes = _hub_index_subfolder_shards(model_name, file_list, token, _hub_revision)
+                except Exception as e:
+                    raise _hub_unreachable_error(
+                        model_name, e, action = f"listing the shards of `{model_name}`",
+                    ) from e
+                safetensors_list = list(_hub_shard_sizes)
+                if _hub_shard_sizes:
+                    max_size_in_bytes = max(_hub_shard_sizes.values())
+                    total_size_in_bytes = sum(_hub_shard_sizes.values())
 
             # Drop stale/duplicate shard sets the index doesn't reference. Some repos (e.g.
             # granite-3.2-8b-instruct) ship a leftover second shard set next to the real one while
@@ -6368,7 +6465,8 @@ def _try_copy_all_from_cache(
                 deferred[filename] = str(cached_path)
                 _deferred_here.append(filename)
                 continue
-            # Pass string target_dir_str to copy helper
+            # A subfolder shard (Cosmos3 `transformer/...`) has no parent in the target yet.
+            os.makedirs(os.path.dirname(os.path.join(target_dir_str, filename)), exist_ok = True)
             _copy_file_from_source(cached_path, target_dir_str, filename)
             if copied is not None: copied.append(filename)
         except (IOError, PermissionError, FileNotFoundError) as copy_err:
@@ -6613,6 +6711,7 @@ def merge_and_dequantize_lora(
         merge_into_original = False,
         min_size_in_bytes = 100_000_000, # 100MB default
         use_temp_file = use_temp_file,
+        safe_serialization = safe_serialization,
     )
 
     import transformers.modeling_utils
@@ -6876,9 +6975,12 @@ def _get_checkpoint_conversion_mapping(model_class_name):
     Transformers 5 registry. Without that fallback a composite model with a pre-5 flat
     checkpoint loses the bridge to its on-disk weights and fails to merge silently (#5290)."""
     for model_class in _model_classes_named(model_class_name):
-        mapping = getattr(model_class, '_checkpoint_conversion_mapping', {})
+        # A model Unsloth ships natively (DeepSeek-V4.1) loads a foreign checkpoint layout through
+        # renames transformers scopes per submodule; it states them here for the merge.
+        mapping = getattr(model_class, '_unsloth_checkpoint_conversion_mapping', None) or \
+            getattr(model_class, '_checkpoint_conversion_mapping', {})
         if mapping:
-            return mapping
+            return dict(mapping)
     mapping = _registry_checkpoint_conversion_mapping(model_class_name)
     if mapping:
         return mapping
@@ -7331,6 +7433,12 @@ def _reverse_renamed_backed_key(key, reverse_mapping, key_set, valid_prefixes, m
                     if candidate in seen: continue
                     if _lora_key_has_backing(candidate, key_set, valid_prefixes = valid_prefixes):
                         return candidate
+                    # A checkpoint without the base-model prefix (DeepSeek-V4.1's `layers.0.attn.wq_a`
+                    # under `model.layers.0.self_attn.q_a_proj`): transformers adds it at load.
+                    head, dot, rest = candidate.partition(".")
+                    if dot and head == "model" and rest and \
+                            _lora_key_has_backing(rest, key_set, valid_prefixes = valid_prefixes):
+                        return rest
                     seen.add(candidate)
                     next_frontier.append(candidate)
         frontier = next_frontier
@@ -8149,6 +8257,60 @@ def _hub_unreachable_error(model_name, e, action = None, mistaken_for = "a missi
     )
 pass
 
+def _index_subfolder_shards(weight_map):
+    """Shard names a root index maps into subfolders, or None unless every one is nested and stays inside.
+
+    Cosmos3 publishes no root shard: its root index points into `transformer/` and `vision_encoder/`.
+    """
+    if not isinstance(weight_map, dict) or not weight_map: return None
+    shards = {v.replace("\\", "/") for v in weight_map.values() if isinstance(v, str)}
+    if len(shards) != len(set(weight_map.values())): return None
+    if not all(_shard_name_stays_inside(s) and _has_directory_component(s) for s in shards): return None
+    return sorted(shards)
+
+
+def _hub_index_subfolder_shards(model_name, root_listing, token = None, revision = None):
+    """{shard: size} for a repo with no root safetensors whose root index maps into subfolders, else {}.
+
+    Transport errors propagate for the caller to classify, as the root listing's do.
+    """
+    names = {os.path.basename(x["name"]) for x in root_listing}
+    if any(n.endswith(".safetensors") for n in names) or "model.safetensors.index.json" not in names:
+        return {}
+    # `hf://org/repo` and `org/repo@rev` list fine but are not repo ids to hf_hub_download.
+    repo_id, address_revision = _hub_repo_and_revision(model_name)
+    revision = revision or address_revision
+    index_path = hf_hub_download(
+        repo_id = repo_id, filename = "model.safetensors.index.json", token = token, revision = revision,
+    )
+    try:
+        with open(index_path, "r", encoding = "utf-8") as f:
+            shards = _index_subfolder_shards(json.load(f).get("weight_map"))
+    except (OSError, ValueError, AttributeError):
+        return {}
+    if not shards: return {}
+    fs = HfFileSystem(token = token)
+    sizes = {}
+    for folder in sorted({posixpath.dirname(s) for s in shards}):
+        for x in fs.ls(f"{repo_id}/{folder}", detail = True, revision = revision):
+            name = f"{folder}/{os.path.basename(x['name'])}"
+            if name in shards: sizes[name] = x["size"]
+    # A shard the index names but the repo lacks would fail the merge part way.
+    return sizes if len(sizes) == len(shards) else {}
+
+
+def _local_index_subfolder_shards(directory):
+    """Shards a local root index maps into subfolders, when the root has no safetensors and all of them exist, else []."""
+    try:
+        if any(f.endswith(".safetensors") for f in os.listdir(directory)): return []
+        with open(os.path.join(directory, "model.safetensors.index.json"), "r", encoding = "utf-8") as f:
+            shards = _index_subfolder_shards(json.load(f).get("weight_map"))
+    except (OSError, ValueError, AttributeError):
+        return []
+    if not shards or not all(os.path.isfile(os.path.join(directory, s)) for s in shards): return []
+    return shards
+
+
 def check_hf_model_exists(model_name, token=None):
     """Check if model exists on HuggingFace.
 
@@ -8161,7 +8323,8 @@ def check_hf_model_exists(model_name, token=None):
     if not _is_hub_repo_id(model_name): return False
     try:
         file_list = HfFileSystem(token=token).ls(model_name, detail=True)
-        return any(x["name"].endswith(".safetensors") for x in file_list)
+        if any(x["name"].endswith(".safetensors") for x in file_list): return True
+        return bool(_hub_index_subfolder_shards(model_name, file_list, token))
     except _HUB_ABSENT_ERRORS as e:
         # Still returns False so a local copy wins and gated bases keep working; a gated cause is warned about, since absent is not always the reason.
         gated = _gated_repo_cause(e)
@@ -8215,7 +8378,7 @@ def check_local_model_exists(model_path):
             for file in os.listdir(directory):
                 if file.endswith(".safetensors"):
                     return True
-            return False
+            return bool(_local_index_subfolder_shards(directory))
         except (OSError, PermissionError):
             return False
 
@@ -8518,6 +8681,10 @@ def check_model_quantization_status(model_name_or_path, token=None, local_ok=Tru
         elif _is_nvfp4_compressed_tensors_config(quant_config):
             return (True, "fp8")
 
+        # MXFP8 compressed-tensors: fp8 weights with e8m0 1x32 scales, decoded by the same FP8 rewrite.
+        elif _is_mxfp8_compressed_tensors_config(quant_config):
+            return (True, "fp8")
+
         # Case 1: Fallback to existing logic for bitsandbytes
         elif isinstance(quant_config, dict):
             is_quantized = quant_config.get("load_in_4bit", False)
@@ -8668,6 +8835,8 @@ def _local_snapshot_is_complete(local_path):
     An index that cannot be read answers False: completeness is unproven, and the
     unreachable Hub is then the more honest failure.
     """
+    # Every subfolder shard the root index names is on disk (Cosmos3).
+    if _local_index_subfolder_shards(local_path): return True
     indexed = None
     index_path = os.path.join(local_path, "model.safetensors.index.json")
     if os.path.isfile(index_path):

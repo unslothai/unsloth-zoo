@@ -46,6 +46,16 @@ def _expert_bytes(param, dtype):
     return K * N * torch.empty((), dtype = dtype).element_size()
 
 
+def _packed_rows_cols(param):
+    """(N, K) of the packed (E, N, K) rows, whatever the logical orientation."""
+    dims = getattr(param, "packed_dims", None)
+    if dims is not None:
+        _, N, K = dims()
+        return N, K
+    E, A, B = param._original_shape
+    return (B, A) if param.mxfp4_transposed else (A, B)
+
+
 def _experts_per_chunk(param, dtype, budget = None):
     per_expert = _expert_bytes(param, dtype)
     return max(1, min(param._original_shape[0], (_chunk_bytes() if budget is None else budget) // per_expert))
@@ -65,6 +75,14 @@ def _grouped_mm(inputs, weight, offsets):
 
 
 def _dequantize_chunk(param, start, end, dtype, transpose, counts):
+    if hasattr(param, "dequantize_experts"):  # NVFP4 / MXFP8 stacks (packed_experts.py)
+        from unsloth_zoo.packed_experts import PACKED_EXPERT_STATS
+        if not torch.compiler.is_compiling():
+            PACKED_EXPERT_STATS["chunks"] += 1
+        # Rows decode contiguous; the forward multiplies their transposed view, as the 16-bit path multiplies the
+        # module's (E, N, K) stack, so both take the same GEMM layout and agree bitwise.
+        rows = param.dequantize_experts(start, end, dtype, False, counts[start:end])
+        return rows.transpose(-2, -1) if transpose else rows
     scales = param.mxfp4_scales
     if scales.device != param.device:
         scales = param.mxfp4_scales = scales.to(param.device)
@@ -86,9 +104,11 @@ def _chunk_budget(device):
 
 
 def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
-    E = len(ends)
-    out_dim = param._original_shape[-1] if transpose else param._original_shape[-2]
-    out = inputs.new_empty((inputs.shape[0], out_dim))
+    """``ends`` = host cumsum of ``counts``; None derives it only when the experts need more than one chunk."""
+    E = param._original_shape[0] if ends is None else len(ends)
+    rows, cols = _packed_rows_cols(param)
+    out_dim = rows if transpose else cols
+    out = None   # allocated on the first multi-chunk write: the single-chunk path returns the GEMM output itself
     device = inputs.device
     adaptive = device.type == "cuda"
     state = _chunk_budget(device) if adaptive else None
@@ -102,6 +122,24 @@ def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
     first = 0
     while first < E:
         last = min(E, first + step)
+        if ends is None and (first > 0 or last < E):
+            ends = torch.cumsum(counts, 0).tolist()   # several chunks slice rows: one host sync
+        if ends is None:
+            # One chunk covers every expert and every row: no host offsets needed.
+            if inputs.shape[0] == 0:
+                return inputs.new_empty((0, out_dim))
+            ends_device = torch.cumsum(counts, 0, dtype = torch.int32)
+            try:
+                weight = _dequantize_chunk(param, 0, E, dtype, transpose, counts)
+                return _grouped_mm(inputs, weight, ends_device)
+            except torch.cuda.OutOfMemoryError:
+                if not adaptive or E == 1:
+                    raise
+                weight = None
+            step = max(1, E // 2)
+            _CHUNK_BUDGET[device.index] = [step * _expert_bytes(param, dtype), _CHUNK_RETRY_CALLS,
+                                           E * _expert_bytes(param, dtype)]
+            continue
         row_start = ends[first - 1] if first > 0 else 0
         row_end = ends[last - 1]
         if row_end == row_start:
@@ -110,6 +148,8 @@ def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
         if ends_device is None:
             ends_device = torch.cumsum(counts, 0, dtype = torch.int32)
         offsets = ends_device[first:last] - row_start
+        if out is None:
+            out = inputs.new_empty((inputs.shape[0], out_dim))
         try:
             weight = _dequantize_chunk(param, first, last, dtype, transpose, counts)
             out[row_start:row_end] = _grouped_mm(inputs[row_start:row_end], weight, offsets)
@@ -134,7 +174,7 @@ def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
             return mxfp4_grouped_matmul(inputs, param.data, _scales(param), counts, trans = not transpose)
         del weight
         first = last
-    return out
+    return out if out is not None else inputs.new_empty((inputs.shape[0], out_dim))
 
 
 def _fused_fallback_ok(inputs, param):

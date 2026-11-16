@@ -185,7 +185,9 @@ def test_assistant_only_loss_reads_messages_beside_a_text_column():
     input_ids, labels = _prepare(tokenizer, fallback = True, text = text)
     _assert_trajectory_masks(_trained_text(tokenizer, input_ids, labels))
     input_ids, labels = _prepare(tokenizer, assistant_only_loss = False, text = "plain text row")
-    assert tokenizer.decode(input_ids).endswith("plain text row")
+    # Without assistant_only_loss the text column wins; plain-text rows end in one EOS, as in TRL (#2558).
+    assert input_ids[-1] == tokenizer.eos_token_id and input_ids.count(tokenizer.eos_token_id) == 1
+    assert tokenizer.decode(input_ids[:-1]).endswith("plain text row")
 
 
 def test_rows_truncated_before_any_assistant_token_are_dropped(monkeypatch):

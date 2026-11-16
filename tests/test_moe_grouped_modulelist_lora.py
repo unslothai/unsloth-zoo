@@ -399,9 +399,15 @@ def test_compile_fullgraph_with_lora():
     gout = torch.randn(1, T, H, device = DEV, dtype = torch.float32)
     ref_out, ref_grads = oracle(blk, x, gout)
     lo, lg = run(blk, lambda t: loop(blk, t), x, gout)
-    before = ML.CALLS["grouped_lora"]
-    co, cg = run(blk, torch.compile(blk.forward, fullgraph = True), x, gout)
-    assert ML.CALLS["grouped_lora"] == before + 1, "engagement counter must count compiled calls"
+    # CALLS counts eager calls only (a traced counter recompiles per call): engagement = no loop call.
+    loop_calls = []
+    orig = blk.__dict__["_orig_moe_forward"]
+    blk._orig_moe_forward = lambda *a, **k: loop_calls.append(1) or orig(*a, **k)
+    try:
+        co, cg = run(blk, torch.compile(blk.forward, fullgraph = True), x, gout)
+    finally:
+        blk._orig_moe_forward = orig
+    assert not loop_calls, "compiled call fell back to the per-expert loop"
     assert within(errors(blk, lo, lg, ref_out, ref_grads), errors(blk, co, cg, ref_out, ref_grads))
 
 

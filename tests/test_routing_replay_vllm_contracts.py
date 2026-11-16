@@ -238,6 +238,39 @@ def test_recompute_of_identical_inputs_with_different_replays_keeps_gradients(re
         torch.testing.assert_close(grads_gc[name], grads_plain[name], rtol = 1e-4, atol = 1e-6, msg = name)
 
 
+def test_recompute_records_layer_inputs_when_checkpointing_is_enabled_after_install(replay):
+    # Unsloth enables checkpointing after loading: the decoder forward wraps the function set later.
+    import functools
+    import pickle
+    from unsloth_zoo.block_checkpointing import _owner
+
+    m = _moe()
+    m.train()
+    rr.reset_routing_replay()
+    assert rr.install_routing_replay(m, None, SimpleNamespace(pad_token_id = PAD)) == LAYERS
+    m.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
+    m(input_ids = torch.tensor([[5, 6, 7]]))
+    layer = m.model.layers[0]
+    wrapped = layer._gradient_checkpointing_func
+    assert isinstance(wrapped, rr._RecordingCheckpoint)
+    m(input_ids = torch.tensor([[5, 6, 7]]))
+    assert layer._gradient_checkpointing_func is wrapped  # wrapped once, not per forward
+    pickle.loads(pickle.dumps(wrapped))
+
+    # Checkpoint functions keyed on the calling layer (every_n_layers) still find it through the wrapper.
+    seen = []
+
+    def checkpoint(function, *args, **kwargs):
+        seen.append(_owner(function))
+        return function(*args, **kwargs)
+
+    rr._STATE.layer_inputs.clear()
+    x = torch.ones(1, 3, 32)
+    rr._RecordingCheckpoint(checkpoint, 0)(functools.partial(torch.nn.Identity.forward, layer), x)
+    assert seen == [layer]
+    assert rr._STATE.layer_inputs[0].tolist() == [x.data_ptr()]
+
+
 def test_replayssm_yields_to_routing_replay_on_vllm_031():
     # Routed experts capture needs MRV2; the skip must come before use_replayssm is set.
     path = pathlib.Path(rr.__file__).with_name("vllm_utils.py")
@@ -328,7 +361,9 @@ def test_recompute_identity_survives_offloaded_checkpointing(replay, offloaded_g
         rr.reset_routing_replay()
         assert rr.install_routing_replay(m, None, SimpleNamespace(pad_token_id = PAD)) == LAYERS
         recompute_inputs = []
-        m.model.layers[0].register_forward_pre_hook(
+        # The layer's first op, not the layer: transformers >= 5.23 checkpoints `forward`, so the
+        # recompute skips the layer's own hooks but still runs its input norm on the hidden states.
+        m.model.layers[0].input_layernorm.register_forward_pre_hook(
             lambda mod, args: recompute_inputs.append(args[0].data_ptr()) if not rr._STATE.in_forward else None
         )
         losses = []

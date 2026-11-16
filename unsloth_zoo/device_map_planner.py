@@ -2431,16 +2431,39 @@ def _auto_class_for(config: Any, trust_remote_code: bool = False):
     return first_hit if first_hit is not None else AutoModel
 
 
+def no_placement_matcher(model: nn.Module, names = None):
+    """Predicate: is this tensor name one of ``model._no_placement_params``? transformers reads the names relative to a
+    ``_no_split_modules`` module: a bare name ("weight", DeepSeek-V4.1's engram table) matches only a direct tensor of
+    such a module (a suffix match would take every weight in the model); a dotted one (Qwen4Exp's
+    "ple.ple_embedding.ngram_embedding.weight") keeps the suffix match."""
+    names = list(getattr(model, "_no_placement_params", None) or [] if names is None else names)
+    dotted = [n for n in names if "." in n]
+    bare = {n for n in names if "." not in n}
+    roots = set()
+    if bare:
+        no_split = set(getattr(model, "_no_split_modules", None) or [])
+        roots = {path for path, module in model.named_modules() if type(module).__name__ in no_split}
+
+    def match(name):
+        if any(name == n or name.endswith("." + n) for n in dotted):
+            return True
+        owner, _, leaf = name.rpartition(".")
+        return leaf in bare and owner in roots
+
+    return match
+
+
 def drop_no_placement_modules(model: nn.Module) -> list[str]:
     """Drop ``model._no_placement_params`` owners from a META model so the load keeps them on
     CPU (e.g. Qwen4Exp's ~102 GB n-gram table). ``UNSLOTH_PLACE_NO_PLACEMENT_PARAMS=1`` opts out."""
     names = getattr(model, "_no_placement_params", None)
     if not names or os.environ.get("UNSLOTH_PLACE_NO_PLACEMENT_PARAMS", "0") == "1":
         return []
+    match = no_placement_matcher(model, names)
     owners = sorted({
         name.rsplit(".", 1)[0]
         for name, _ in list(model.named_parameters()) + list(model.named_buffers())
-        if any(name == n or name.endswith("." + n) for n in names)
+        if match(name)
     })
     dropped = []
     for path in owners:

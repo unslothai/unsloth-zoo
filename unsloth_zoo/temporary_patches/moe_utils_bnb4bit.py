@@ -27,6 +27,7 @@ import re
 import types
 from typing import Optional, List, Union
 
+import sys
 import torch
 import torch.nn as nn
 
@@ -319,6 +320,17 @@ def _dequantize_bnb4bit_expert_weights(weight, target_dtype: torch.dtype):
     """
     if not _is_bnb4bit_param(weight):
         return None
+    if not torch.compiler.is_compiling():
+        # UNSLOTH_MOE_EXPERT_CACHE stacks may hold the memory this decode needs: drop them once and retry.
+        cache = sys.modules.get("unsloth_zoo.temporary_patches.moe_expert_cache")
+        if cache is not None and cache.EXPERT_CACHE_STATS.get("bytes"):
+            return cache.with_expert_cache_oom_retry(
+                lambda: _dequantize_bnb4bit_expert_weights_once(weight, target_dtype)
+            )
+    return _dequantize_bnb4bit_expert_weights_once(weight, target_dtype)
+
+
+def _dequantize_bnb4bit_expert_weights_once(weight, target_dtype):
     dequant = None
     try:
         from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton

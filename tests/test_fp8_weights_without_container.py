@@ -47,6 +47,16 @@ E4M3 = torch.float8_e4m3fn
 patch_fp8_dequantize_weights_without_container()
 
 
+@pytest.fixture(autouse = True)
+def _stock_fp8_dequantize_convert(monkeypatch):
+    # unsloth wraps Fp8Dequantize.convert process-wide (import_fixes casts every output to the model
+    # parameter's dtype) once any earlier test in the worker runs the FP8 quantizer with unsloth imported.
+    # These tests pin unsloth_zoo's op against stock transformers, so they run on the unwrapped convert.
+    stock = inspect.unwrap(Fp8Dequantize.convert)
+    if stock is not Fp8Dequantize.convert:
+        monkeypatch.setattr(Fp8Dequantize, "convert", stock)
+
+
 def _block_quantize(weight, block):
     rows, cols = weight.shape[-2:]
     br, bc = block

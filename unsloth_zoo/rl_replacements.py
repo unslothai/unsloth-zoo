@@ -1883,6 +1883,30 @@ def grpo_vllm_sampler_uses_triton(trainer, top_k, top_p):
 pass
 
 
+def grpo_forwards_are_collective(model):
+    """FSDP2 sharded layout: every forward all-gathers, so ranks must run the same number of forwards."""
+    import torch.distributed as dist
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
+        return False
+    cached = model.__dict__.get("_unsloth_grpo_collective_forwards", None)
+    if cached is None:
+        cached = any(
+            module.__dict__.get("_unsloth_reshard_after_forward", False) not in (False, None, 0)
+            for module in model.modules()
+        )
+        model.__dict__["_unsloth_grpo_collective_forwards"] = cached
+    return cached
+pass
+
+
+def grpo_agree_mini_batch(B, device):
+    import torch.distributed as dist
+    value = torch.tensor([int(B)], dtype = torch.int64, device = device)
+    dist.all_reduce(value, op = dist.ReduceOp.MAX)
+    return int(value.item())
+pass
+
+
 _n_chunks_deprecation_warned = False
 
 def _warn_deprecated_n_chunks(n_chunks):
@@ -2596,11 +2620,13 @@ def grpo_fused_route_ok(kwargs, entropy_mask_on = False, rollout_logps_as_old = 
     """True when grpo_compute_loss's per-token loss is a closed form of each token's own log-prob, so the GRPO loss can
     take fused_linear_grpo_loss: every token's gradient is known in the forward. Off for GSPO (sequence-level ratio),
     VESPO, the off-policy and top-entropy-quantile masks (all read every token's log-prob or entropy first), rollout_rs,
-    rollout logps as pi_old (clamped log ratio), a truncated support or fp32 head (other scorers), vision inputs and a
-    gathered ZeRO-3 head, a trainable head unless UNSLOTH_GRPO_FUSED_TRAINABLE_HEAD=1, a frozen head without an entropy
+    rollout logps as pi_old (clamped log ratio), a truncated support or fp32 head (other scorers), a gathered ZeRO-3
+    head, a trainable head unless UNSLOTH_GRPO_FUSED_TRAINABLE_HEAD=1, a frozen head without an entropy
     bonus unless UNSLOTH_GRPO_FUSED_WITHOUT_ENTROPY=1 (nothing to save there), and float16 compute without a
     GradScaler: the op stores its gradients in the hidden dtype at the loss's own scale, where GRPO's 1 / tokens weights
     sit in float16's subnormal range (a GradScaler's scale lifts them out of it).
+    Vision inputs take it too: the towers run in the policy forward, so the deferred lm_head rows are the
+    [rows, logits_to_keep] completion grid either way. pixel_values stays in the signature for callers passing it.
     UNSLOTH_FUSED_LINEAR_GRPO_FWD_GRAD=0 turns it off."""
     from unsloth_zoo.fused_losses import fused_grpo as _fused_grpo
     return bool(
@@ -2613,7 +2639,6 @@ def grpo_fused_route_ok(kwargs, entropy_mask_on = False, rollout_logps_as_old = 
         and not entropy_mask_on
         and not rollout_logps_as_old
         and not support_kwargs
-        and pixel_values is None
         and zero3_head is None
         and not fp16_unscaled
         and (lm_head is None or not lm_head.requires_grad or GRPO_FUSED_TRAINABLE_HEAD)
@@ -3103,6 +3128,9 @@ def grpo_accumulated_loss(
         seq_len = input_ids.shape[1]
         hidden_dim = lm_head.shape[1]
         vocab_dim = lm_head.shape[0]
+        # Imported here: this body is copied into the generated trainer.
+        from unsloth_zoo.rl_replacements import grpo_forwards_are_collective, grpo_agree_mini_batch
+        _collective_forwards = grpo_forwards_are_collective(trainer.model)
 
         if trainer.args.unsloth_grpo_mini_batch is None:
             # Size per call, as unsloth's copy does: caching in args froze the first step's plan.
@@ -3110,6 +3138,8 @@ def grpo_accumulated_loss(
                 total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
             )
             B = max(1, total_rows//B)
+            if _collective_forwards:
+                B = grpo_agree_mini_batch(B, input_ids.device)
         else:
             if trainer.args.unsloth_grpo_mini_batch > total_rows:
                 B = total_rows

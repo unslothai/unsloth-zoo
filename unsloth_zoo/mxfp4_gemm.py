@@ -697,9 +697,18 @@ def mxfp4_expert_grouped_mm(x, blocks, scales, counts, transpose_b = True):
 _AVAILABLE = {}
 
 
+def _triton_too_old():
+    # Triton 3.0 (torch 2.4) aborts the whole process compiling these kernels, past any try / except.
+    try:
+        major, minor = (int(v) for v in triton.__version__.split(".")[:2])
+    except Exception:
+        return False
+    return (major, minor) < (3, 1)
+
+
 def mxfp4_grouped_mm_available(device = None) -> bool:
     """Whether the fused kernel compiles on ``device`` and matches dequantize + matmul on a probe."""
-    if not _HAS_TRITON or not torch.cuda.is_available():
+    if not _HAS_TRITON or not torch.cuda.is_available() or _triton_too_old():
         return False
     device = torch.device(device) if device is not None else torch.device("cuda", torch.cuda.current_device())
     if device.type != "cuda":

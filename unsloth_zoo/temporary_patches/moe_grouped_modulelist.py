@@ -905,10 +905,11 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
         if not torch.compiler.is_compiling():
             _decline(lora)
         return self._orig_moe_forward(hidden_states)
-    # Dynamo replays these global-dict updates after each compiled call (no graph break).
-    CALLS["grouped"] += 1
-    if lora["gate"] is not None or lora["up"] is not None or lora["down"] is not None:
-        CALLS["grouped_lora"] += 1
+    # Eager only: a traced `+= 1` guards on the old value, so a compiled block recompiled every call.
+    if not torch.compiler.is_compiling():
+        CALLS["grouped"] += 1
+        if lora["gate"] is not None or lora["up"] is not None or lora["down"] is not None:
+            CALLS["grouped_lora"] += 1
     is_3d = hidden_states.dim() == 3
     if is_3d:
         bsz, seqlen, hidden_dim = hidden_states.shape

@@ -251,8 +251,29 @@ def _gemma3n_shared_kv_stand_in(config, anchor):
     return stand_in
 pass
 
+def _gemma3n_kv_keys(self):
+    """(key a KV-shared layer reads, key a source layer writes) in the shared mapping."""
+    if _GEMMA3N_ATTENTION_FORWARD.get("mode") == "kwarg_type":
+        # transformers 5.23+ keys shared KV by layer type (sliding / full), not by layer index.
+        return self.layer_type, self.layer_type
+    return getattr(self, "kv_shared_layer_index", None), self.layer_idx
+pass
+
+def _gemma3n_kv_leaves(shared, create = False):
+    # 5.23's KVSharingDict.to() moves every value as a tuple of tensors, so the leaves live on the instance there.
+    if _GEMMA3N_ATTENTION_FORWARD.get("mode") == "kwarg_type":
+        leaves = vars(shared).get(_GEMMA3N_KV_LEAVES_KEY)
+        if leaves is None and create:
+            leaves = vars(shared)[_GEMMA3N_KV_LEAVES_KEY] = {}
+        return leaves
+    leaves = shared.get(_GEMMA3N_KV_LEAVES_KEY)
+    if leaves is None and create:
+        leaves = shared[_GEMMA3N_KV_LEAVES_KEY] = {}
+    return leaves
+pass
+
 def _gemma3n_attention_forward_shared_kv(self, *args, **kwargs):
-    if _GEMMA3N_ATTENTION_FORWARD.get("mode") == "kwarg":
+    if _GEMMA3N_ATTENTION_FORWARD.get("mode") in ("kwarg", "kwarg_type"):
         shared = kwargs.get("shared_kv_states")
     else:
         holder = kwargs.get("past_key_values", kwargs.get("past_key_value"))
@@ -267,13 +288,14 @@ def _gemma3n_attention_forward_shared_kv(self, *args, **kwargs):
     # Reentrant checkpointing stores source KV with no graph and recomputes shared layers first; their KV grads go to
     # leaves in the shared mapping (plain dict on 5.6-5.8, UserDict later), indexed only by layer.
     grad_enabled = torch.is_grad_enabled()
-    leaves = shared.get(_GEMMA3N_KV_LEAVES_KEY) if shared is not None else None
+    read_key, write_key = _gemma3n_kv_keys(self)
+    leaves = _gemma3n_kv_leaves(shared) if shared is not None else None
     if self.is_kv_shared_layer and shared is not None and grad_enabled:
-        index = self.kv_shared_layer_index
+        index = read_key
         stored = shared.get(index)
         if stored is not None and not stored[0].requires_grad:
             if leaves is None:
-                leaves = shared[_GEMMA3N_KV_LEAVES_KEY] = {}
+                leaves = _gemma3n_kv_leaves(shared, create = True)
             entry = leaves.get(index)
             if entry is None or entry[0] is not stored[0]:
                 entry = leaves[index] = (stored[0], stored[0].detach().requires_grad_(), stored[1].detach().requires_grad_())
@@ -282,8 +304,8 @@ def _gemma3n_attention_forward_shared_kv(self, *args, **kwargs):
     output = _GEMMA3N_ATTENTION_FORWARD["original"](self, *args, **kwargs)
 
     if self.store_full_length_kv and leaves is not None:
-        entry = leaves.pop(self.layer_idx, None)
-        stored = shared.get(self.layer_idx)
+        entry = leaves.pop(write_key, None)
+        stored = shared.get(write_key)
         if entry is not None and grad_enabled and stored is not None and stored[0].requires_grad:
             grad_key, grad_value = entry[1].grad, entry[2].grad
             if grad_key is not None or grad_value is not None:
@@ -296,7 +318,7 @@ pass
 
 def patch_Gemma3nTextAttention_kv_sharing():
     # transformers <= 5.5 shares KV only through the cache, so uncached training ran KV-shared layers
-    # on their own KV (gemma-3n-E2B loss 10.85 vs 5.94); 5.6+ uses shared_kv_states.
+    # on their own KV (gemma-3n-E2B loss 10.85 vs 5.94); 5.6+ uses shared_kv_states (by layer type from 5.23).
     try:
         import inspect
         import transformers.models.gemma3n.modeling_gemma3n as modeling
@@ -306,6 +328,8 @@ def patch_Gemma3nTextAttention_kv_sharing():
         return raise_error("Gemma3nTextAttention.forward", e)
     if "shared_kv_states[self.kv_shared_layer_index]" in source:
         mode = "kwarg"
+    elif "shared_kv_states[self.layer_type]" in source:
+        mode = "kwarg_type"
     elif "past_key_values.shared_layers[self.kv_shared_layer_index]" in source:
         mode = "cache"
     else:

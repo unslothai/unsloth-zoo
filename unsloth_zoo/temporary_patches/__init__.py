@@ -39,6 +39,7 @@ from .qwen4_exp import *
 from .glm4_moe import *
 from .deepseek_v3_moe import *
 from .deepseek_v4 import *
+from .deepseek_v41 import *
 from .sparse_attention import *
 from .deepseek_v4_sparse_flex import *
 from .sparse_attention_flex import *
@@ -67,6 +68,7 @@ from .moe_router_triton import *
 from .moe_grouped_modulelist import *
 from .moe_utils_fp8 import *
 from .fp8_uncontained_weights import *
+from .fp8_partial_block_dequant import *
 from .flex_attention_bwd import *
 from .inductor_stride_guard import *
 from .remote_code_vlm import *

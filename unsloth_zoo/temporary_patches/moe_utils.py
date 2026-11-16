@@ -33,6 +33,7 @@ from typing import Optional, Tuple
 from torch.autograd import Function
 from unsloth_zoo.mlx import is_mlx_available
 from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
+from unsloth_zoo.packed_experts import is_new_packed_expert_param, is_packed_expert_param, packed_param_transposed
 
 UNSLOTH_COMPILE_LOCATION = os.environ.get(
     "UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache"
@@ -508,13 +509,17 @@ _GROUPED_MM_FP16_OP = _register_grouped_mm_fp16_op()
 
 
 # Max avg rows per expert for Triton grouped-MM, per arch; off sm90/sm100 torch._grouped_mm is a per-expert cuBLAS loop
-# that Triton beats for small experts; sm75 has no Triton MMA, sm86 is unmeasured, sm121 follows sm120 (unsloth-zoo
-# issue 1661) except for dw.
+# that Triton beats for small experts; sm121 follows sm120 (unsloth-zoo issue 1661) except for dw. sm89 (L4, E 64-256,
+# rows 8-1024 per expert) wins on every base GEMM with its retuned tiles. sm86 is unmeasured: it shares sm89's tile
+# table (moe_grouped_fp16._generic_family) but keeps sm89's former 32-row limits until it is timed. sm75 has no Triton MMA, so only small LoRA
+# GEMMs go there (one launch instead of one per expert); a LoRA limit counts rows at rank 16, a wider rank r as r / 16.
 _TRITON_GROUPED_MM_AUTO_ROWS = {
     (8, 0):  {"lora": -1, "many": 2048, "few": 512, "dw": 128, "dw_few": 128},
     (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 256, "dw_few": 64},
     (12, 1): {"lora": -1, "many": 2048, "few": 256, "dw": 64,  "dw_few": 64},
-    (8, 9):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0,   "dw_few": 0},
+    (8, 9):  {"lora": -1, "many": 1024, "few": 32,  "dw": 0,   "dw_few": 0},
+    (8, 6):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0,   "dw_few": 0},
+    (7, 5):  {"lora": 64, "many": 0,    "few": 0,   "dw": 0,   "dw_few": 0},
 }
 _TRITON_GROUPED_MM_CAPABILITY = {}
 _TRITON_GROUPED_MM_POLICY = {}
@@ -543,6 +548,12 @@ def _triton_grouped_mm_max_rows(index, kind = "lora"):
     return limit
 
 
+@_assume_constant_result
+def _triton_grouped_mm_lora_rank_scaled():
+    """Auto LoRA limits count rows at rank 16; an explicit UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS is taken as given."""
+    return not os.environ.get("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS")
+
+
 def _triton_grouped_mm_policy(index, kind, mode, disabled, override):
     mode = (mode or "auto").strip().lower()
     if mode in ("0", "false", "off") or disabled == "1":
@@ -557,7 +568,8 @@ def _triton_grouped_mm_policy(index, kind, mode, disabled, override):
     except Exception:
         return 0
     if mode in ("1", "true", "on"):
-        limit = -1 if cap >= (8, 0) else 0
+        # Below sm80 Triton has no MMA: forcing it on still keeps base-sized GEMMs on cuBLAS.
+        limit = -1 if cap >= (8, 0) or (cap >= (7, 5) and kind == "lora") else 0
     else:
         limit = _TRITON_GROUPED_MM_AUTO_ROWS.get(cap, {}).get(kind, 0)
     if limit != 0 and override:
@@ -600,7 +612,11 @@ def _triton_grouped_mm_wanted(inputs, weight) -> bool:
 
 
 def _triton_grouped_mm_rows_ok(device, M, E, K, N):
-    limit = _triton_grouped_mm_max_rows(device.index, _triton_grouped_mm_kind(K, N, E))
+    kind = _triton_grouped_mm_kind(K, N, E)
+    limit = _triton_grouped_mm_max_rows(device.index, kind)
+    if kind == "lora" and limit > 0 and _triton_grouped_mm_lora_rank_scaled():
+        # Triton's LoRA cost grows with the rank, the per-expert loop's does not; ceil so no row is over budget.
+        M = (M * max(min(K, N), 16) + 15) // 16
     return _rows_within(limit, M, E)
 
 
@@ -965,7 +981,7 @@ def _base_is_recomputable(source) -> bool:
             if getattr(param, "quant_state", None) is None:
                 return False
             return not param.requires_grad
-        if is_mxfp4_expert_param(param):
+        if is_packed_expert_param(param):
             return not param.requires_grad
         if isinstance(param, torch.Tensor):
             return (not param.requires_grad) and param.dtype in (
@@ -1226,13 +1242,70 @@ def _base_grouped_mm(inputs, offsets, weight_provider, recompute, plan = None):
     return _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
 
 
+def _lora_fold_base_mm(inputs, offsets, weight_provider, recompute, lora, source):
+    """Base grouped GEMM with the separated LoRA folded in (moe_lora_fold), or None to keep the separated path."""
+    try:
+        from unsloth_zoo.temporary_patches.moe_lora_fold import lora_fold_base_mm
+    except ImportError:
+        return None
+    return lora_fold_base_mm(inputs, offsets, weight_provider, recompute, lora, source)
+
+
+def _gc_keep_base_slot(module):
+    if torch.compiler.is_compiling():
+        return None
+    try:
+        from unsloth_zoo.temporary_patches.moe_gc_keep_base import keep_base_slot
+    except ImportError:
+        return None
+    return keep_base_slot(module)
+
+
+def _moe_base_and_lora(inputs, offsets, weight_provider, recompute, plan, lora, source, keep_slot, proj):
+    """One projection's base grouped GEMM: (output, LoRA still to add). Kept-base replay first, then the LoRA fold,
+    else the plain base GEMM with the LoRA left to the separated path. Traced code never keeps (the checkpoint
+    state would be frozen at trace time); the fold traces through its opaque op."""
+    if keep_slot is not None and plan is None and not torch.compiler.is_compiling():
+        try:
+            from unsloth_zoo.temporary_patches.moe_gc_keep_base import kept_base_mm
+        except ImportError:
+            kept_base_mm = None
+        found = None if kept_base_mm is None else kept_base_mm(
+            inputs, offsets, weight_provider, recompute, lora, source, keep_slot, proj,
+        )
+        if found is not None:
+            return found
+    if lora is not None and plan is None:
+        out = _lora_fold_base_mm(inputs, offsets, weight_provider, recompute, lora, source)
+        if out is not None:
+            return out, None
+    return _base_grouped_mm(inputs, offsets, weight_provider, recompute, plan), lora
+
+
 def _nf4_fused_base_mm(inputs, offsets, source, proj_type, hidden_dim, model_type, experts_module):
     """UNSLOTH_MOE_NF4_FUSED grouped GEMM on a frozen NF4 stack; None keeps the dequant path."""
     if os.environ.get("UNSLOTH_MOE_NF4_FUSED", "0") in ("", "0") or not _base_is_recomputable(source):
         return None
+    cache = _expert_cache_module()
+    if cache is not None:
+        # The param the dequant path decodes (_get_base_weight unwrapping), in the dtype it will ask for.
+        param = source
+        while hasattr(param, "base_layer"):
+            param = param.base_layer
+        if not isinstance(param, torch.Tensor) and hasattr(param, "weight"):
+            param = param.weight
+        if _expert_cache_get(cache, param, inputs.dtype, count = False) is not None:
+            return None   # a cached 16-bit stack makes the dequant path's decode free
     try:
-        from unsloth_zoo.temporary_patches.moe_nf4_grouped import maybe_nf4_grouped_mm
+        from unsloth_zoo.temporary_patches.moe_nf4_grouped import maybe_nf4_grouped_mm, nf4_auto_fused, nf4_fused_mode
     except ImportError:
+        return None
+    if (
+        not torch.compiler.is_compiling() and nf4_fused_mode() == "auto"
+        and not nf4_auto_fused(inputs.shape[0], offsets.shape[0], inputs.device)
+    ):
+        # Eager has no recompile to avoid: above the cap take the regular dequant path, where the LoRA fold and the
+        # kept checkpoint base apply (the in-op dequant branch has neither).
         return None
     preprocess = lambda w: preprocess_weight(w, proj_type, hidden_dim, model_type, experts_module = experts_module)
     return maybe_nf4_grouped_mm(inputs, offsets, source, preprocess)
@@ -1289,10 +1362,23 @@ def _dequantize_bnb4bit_experts(param, experts, target_dtype = None):
     """Dequantize only `experts` of a packed 4-bit stack: a slice reads views of the packed bytes
     and absmax blocks, an int64 id tensor gathers them in a few pieces. Each piece is a smaller
     QuantState decoded by the same kernels, so every element matches the full-stack read."""
+    cache = _expert_cache_module()
+    if cache is None:
+        return _dequantize_bnb4bit_experts_once(param, experts, target_dtype)
+    # The cache may hold the memory this read needs (gather, decode or cast): drop it once and retry.
+    return cache.with_expert_cache_oom_retry(lambda: _dequantize_bnb4bit_experts_once(param, experts, target_dtype))
+
+
+def _dequantize_bnb4bit_experts_once(param, experts, target_dtype = None):
     from bitsandbytes.functional import QuantState
 
     while hasattr(param, "base_layer"):
         param = param.base_layer
+    cache = _expert_cache_module()
+    cached = _expert_cache_get(cache, param, target_dtype)
+    if cached is not None:
+        out = cached[experts] if isinstance(experts, slice) else cached.index_select(0, experts)
+        return out.to(target_dtype) if target_dtype is not None else out
     E, inner = _bnb4bit_expert_split(param)
     qs = param.quant_state
     blocks = inner[0] * inner[1] // qs.blocksize
@@ -1522,10 +1608,11 @@ def _mxfp4_expert_layout(source, proj_type, hidden_dim, model_type, experts_modu
     param = source
     while hasattr(param, "base_layer"):
         param = param.base_layer
-    if not is_mxfp4_expert_param(param) or param.requires_grad:
+    if not is_packed_expert_param(param) or param.requires_grad:
         return None
+    transposed = packed_param_transposed(param)
     cache = experts_module.__dict__.setdefault("_unsloth_mxfp4_layout", {})
-    key = (proj_type, hidden_dim, model_type, bool(param.mxfp4_transposed), tuple(param._original_shape))
+    key = (proj_type, hidden_dim, model_type, transposed, tuple(param._original_shape), type(param).__name__)
     if key not in cache:
         # preprocess_weight on a meta stand-in: identity or a transpose view, anything else is unsupported.
         meta = torch.empty(tuple(param._original_shape), device = "meta")
@@ -1535,9 +1622,9 @@ def _mxfp4_expert_layout(source, proj_type, hidden_dim, model_type, experts_modu
             weight = None
         flipped = meta.transpose(-2, -1)
         if weight is meta or (weight is not None and weight.shape == meta.shape and weight.stride() == meta.stride()):
-            cache[key] = bool(param.mxfp4_transposed)
+            cache[key] = transposed
         elif weight is not None and weight.shape == flipped.shape and weight.stride() == flipped.stride():
-            cache[key] = not param.mxfp4_transposed
+            cache[key] = not transposed
         else:
             cache[key] = None
     transpose_b = cache[key]
@@ -1563,6 +1650,15 @@ def _mxfp4_fused_enabled(param, dtype, rows = None) -> bool:
 def _mxfp4_base_grouped_mm(inputs, offsets, counts, weight_provider, recompute, layout):
     """Fused decode-in-GEMM, else dequantize with a transposed decode for backward."""
     param, transpose_b = layout
+    if is_new_packed_expert_param(param):
+        # NVFP4 / MXFP8: chunked dequantize + grouped GEMM for forward and dX (packed_experts.py).
+        from unsloth_zoo.packed_experts import packed_expert_grouped_linear
+        if (
+            inputs.dtype == torch.float32 and inputs.device.type == "cuda"
+            and torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") in (torch.bfloat16, torch.float16)
+        ):
+            inputs = inputs.to(torch.get_autocast_dtype("cuda"))
+        return packed_expert_grouped_linear(inputs, param, counts, transpose_b)
     scales = param.mxfp4_scales
     if scales.device != param.device:
         scales = param.mxfp4_scales = scales.to(param.device)
@@ -2203,6 +2299,16 @@ def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_f
                 instance_dict.pop(name, None)
 
 
+def _moe_uses_new_packed_expert_weights(module) -> bool:
+    for name in ("gate_up_proj", "down_proj"):
+        param = getattr(module, name, None)
+        while param is not None and hasattr(param, "base_layer"):
+            param = param.base_layer
+        if is_new_packed_expert_param(param):
+            return True
+    return False
+
+
 def forward_moe_backend(
     self,
     hidden_states: torch.Tensor,
@@ -2217,6 +2323,24 @@ def forward_moe_backend(
     # helpers don't resolve (only the dispatcher is copied).
     # Keep `except ImportError` around ONLY the import; runtime errors in the
     # bnb4bit/fp8 path must propagate, not fall through to a crashing backend.
+    # Under Unsloth gradient checkpointing the backward replay takes the routing the first
+    # (no-grad) pass used: the two passes run differently compiled graphs that can round a
+    # router input across a top-k boundary.
+    moe_checkpoint_routing = None
+    try:
+        from unsloth_zoo.gradient_checkpointing import moe_checkpoint_routing
+    except ImportError:
+        pass
+    if moe_checkpoint_routing is not None:
+        top_k_index, top_k_weights = moe_checkpoint_routing(self, top_k_index, top_k_weights)
+
+    # Absolute import as above: the copy in the compiled module has no module globals.
+    from unsloth_zoo.temporary_patches.moe_utils import _moe_uses_new_packed_expert_weights
+
+    if _moe_uses_new_packed_expert_weights(self):
+        # NVFP4 / MXFP8 stacks dequantize in chunks inside the grouped-GEMM forward; other backends index the weight.
+        return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
+
     _moe_uses_bnb4bit_expert_weights = forward_moe_backend_bnb4bit = None
     try:
         from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import (
@@ -2764,7 +2888,7 @@ def _get_param_shape_from_module(module, parameter_name):
         param = param.get_param()
     elif hasattr(param, "weight"):
         param = param.weight
-    if is_mxfp4_expert_param(param):
+    if is_packed_expert_param(param):
         return tuple(param._original_shape)
     return tuple(param.shape)
 
@@ -3031,6 +3155,106 @@ def _get_dequantize_4bit_in_slices():
     return _DEQUANTIZE_4BIT_IN_SLICES
 
 
+_EXPERT_CACHE_MOD = None
+try:
+    # Absolute: this file is also copied into unsloth_compiled_cache and imported top-level.
+    from unsloth_zoo.temporary_patches.moe_expert_cache import parse_expert_cache_mode as _parse_expert_cache_mode
+except ImportError:
+    _parse_expert_cache_mode = None
+
+
+def _expert_cache_module():
+    """moe_expert_cache when UNSLOTH_MOE_EXPERT_CACHE is on and the caller is eager, else None (no traced work)."""
+    global _EXPERT_CACHE_MOD
+    if not _expert_cache_env_on() or torch.compiler.is_compiling():
+        return None
+    if _EXPERT_CACHE_MOD is None:
+        try:
+            from unsloth_zoo.temporary_patches import moe_expert_cache
+            _EXPERT_CACHE_MOD = moe_expert_cache
+        except ImportError:
+            _EXPERT_CACHE_MOD = False
+    return _EXPERT_CACHE_MOD or None
+
+
+def _expert_cache_env_on():
+    """UNSLOTH_MOE_EXPERT_CACHE through the cache's own parser ("0", "off", "false", "no", "0.0", ... are off)."""
+    if _parse_expert_cache_mode is None:
+        return False
+    return _parse_expert_cache_mode(os.environ.get("UNSLOTH_MOE_EXPERT_CACHE", "0")) is not None
+
+
+def _expert_cache_get(cache, param, target_dtype, count = True):
+    """The cached stack when it is in the dtype this caller ends with (target_dtype, else the state's), else None."""
+    if cache is None:
+        return None
+    weight = cache.expert_cache_lookup(param, count = count)
+    want = target_dtype or getattr(getattr(param, "quant_state", None), "dtype", None)
+    if weight is not None and weight.dtype != want:
+        return None
+    return weight
+
+
+def _dequantize_bnb4bit_full(param):
+    """The whole packed 4-bit stack in quant_state.dtype, at its logical shape."""
+    # Absolute import: this file is also copied into unsloth_compiled_cache and imported top-level.
+    weight = None
+    try:
+        from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
+    except ImportError:
+        nf4_dequant_triton = None
+    if nf4_dequant_triton is not None:
+        weight = nf4_dequant_triton(
+            param.data, param.quant_state, getattr(param, "_original_shape", None),
+        )
+    if weight is None:
+        # >= 2**31-element stacks abort in bitsandbytes dequantize (csrc/ops.cu:93); slice like the load does.
+        slicer = _get_dequantize_4bit_in_slices()
+        weight = slicer(param) if slicer is not None else None
+    if weight is None:
+        weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
+    original_shape = getattr(param, "_original_shape", None)
+    if original_shape is not None and weight.shape != original_shape:
+        weight = weight.reshape(original_shape)
+    return weight
+
+
+def _get_bnb4bit_base_weight(param, target_dtype = None):
+    """The dequantized stack of a packed bnb 4-bit expert param (from the expert cache when it holds it)."""
+    if getattr(param, "quant_state", None) is None:
+        raise RuntimeError(
+            "unsloth: _get_base_weight saw a Params4bit with quant_state=None. "
+            "This usually means the model was used in forward before loading "
+            "completed quantization (meta placeholder still in place), or the "
+            "MoE quantizer patch did not fire for this expert. "
+            f"data.shape={tuple(param.data.shape)}, device={param.device}."
+        )
+    cache = _expert_cache_module()
+    weight = _expert_cache_get(cache, param, target_dtype)
+    if weight is None:
+        if cache is None:
+            weight = _dequantize_bnb4bit_full(param)
+        else:
+            def decode():
+                w = _dequantize_bnb4bit_full(param)
+                # Cached after the cast (fp16 compute over a bf16 state casts every read otherwise); the same values.
+                if target_dtype is not None and w.dtype != target_dtype:
+                    w = w.to(target_dtype)
+                return w
+            # A cached stack may hold the memory this decode or cast needs: drop the cache once and retry.
+            weight = cache.with_expert_cache_oom_retry(decode)
+            cache.expert_cache_offer(param, weight)
+    if target_dtype is not None:
+        weight = weight.to(target_dtype)
+    return weight
+
+
+# UNSLOTH_MOE_EXPERT_CACHE_TRACED=1 (with the cache on): a traced caller decodes eagerly behind one graph break per call
+# so it can use the cache; the output enters the next graph as an input, never a reusable buffer. Off by default: the
+# breaks repartition the compiled graphs (eval loss drifts ~1e-6) and cost host time (A100 Qwen3.6 step +10%; L4 -18%).
+_get_bnb4bit_base_weight_eager = torch.compiler.disable(_get_bnb4bit_base_weight)
+
+
 def _get_base_weight(param, target_dtype=None, token_counts=None, experts=None):
     """Get base weight from a potentially wrapped parameter or module. target_dtype (recompute
     providers) restores the packed Params4bit to its logical shape and casts. experts (a
@@ -3043,40 +3267,17 @@ def _get_base_weight(param, target_dtype=None, token_counts=None, experts=None):
     if experts is not None:
         return _dequantize_bnb4bit_experts(param, experts, target_dtype)
 
-    if is_mxfp4_expert_param(param):
+    if is_packed_expert_param(param):
         return param.dequantize(dtype = target_dtype, token_counts = token_counts)
 
     if HAS_BNB and isinstance(param, Params4bit):
-        if getattr(param, "quant_state", None) is None:
-            raise RuntimeError(
-                "unsloth: _get_base_weight saw a Params4bit with quant_state=None. "
-                "This usually means the model was used in forward before loading "
-                "completed quantization (meta placeholder still in place), or the "
-                "MoE quantizer patch did not fire for this expert. "
-                f"data.shape={tuple(param.data.shape)}, device={param.device}."
-            )
-        # Absolute import: this file is also copied into unsloth_compiled_cache and imported top-level.
-        weight = None
-        try:
-            from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
-        except ImportError:
-            nf4_dequant_triton = None
-        if nf4_dequant_triton is not None:
-            weight = nf4_dequant_triton(
-                param.data, param.quant_state, getattr(param, "_original_shape", None),
-            )
-        if weight is None:
-            # >= 2**31-element stacks abort in bitsandbytes dequantize (csrc/ops.cu:93); slice like the load does.
-            slicer = _get_dequantize_4bit_in_slices()
-            weight = slicer(param) if slicer is not None else None
-        if weight is None:
-            weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
-        original_shape = getattr(param, "_original_shape", None)
-        if original_shape is not None and weight.shape != original_shape:
-            weight = weight.reshape(original_shape)
-        if target_dtype is not None:
-            weight = weight.to(target_dtype)
-        return weight
+        if (
+            torch.compiler.is_compiling()
+            and os.environ.get("UNSLOTH_MOE_EXPERT_CACHE_TRACED", "0") == "1"
+            and _expert_cache_env_on()
+        ):
+            return _get_bnb4bit_base_weight_eager(param, target_dtype)
+        return _get_bnb4bit_base_weight(param, target_dtype)
 
     if hasattr(param, "get_param"):
         return param.get_param()
@@ -3116,7 +3317,7 @@ def native_moe_grouped_mm(
     return _grouped_mm_with_backward_fix(inputs, weight, offsets)
 
 
-def _lora_rank_pad_needed(inputs, first_weight) -> bool:
+def _lora_rank_pad_needed(inputs, first_weight, second_weight = None) -> bool:
     """False when both LoRA GEMMs take Triton (it masks any K or N, so no 16-byte stride rule); rank <= 32 keeps both in
     the same lora row class; UNSLOTH_MOE_LORA_PAD_ALWAYS=1 forces True."""
     if inputs is None or first_weight.shape[-1] > 32:
@@ -3125,6 +3326,11 @@ def _lora_rank_pad_needed(inputs, first_weight) -> bool:
         return True
     if not _triton_grouped_mm_wanted(inputs, first_weight):
         return True
+    if second_weight is not None and second_weight.dim() == 3:
+        # The second GEMM can fall in another row budget (rank between in and out dims): it must take Triton too.
+        E, K, N = second_weight.shape
+        if not _triton_grouped_mm_rows_ok(inputs.device, inputs.shape[0], E, K, N):
+            return True
     # A failed self-check falls back to torch._grouped_mm, which needs the pad.
     from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
     if torch.compiler.is_compiling():
@@ -3139,7 +3345,7 @@ def _pad_lora_rank_for_grouped_mm(first_weight, second_weight, inputs = None):
     align = max(8, 16 // first_weight.element_size())
     rank = first_weight.shape[-1]
     pad = (-rank) % align
-    if pad == 0 or not _lora_rank_pad_needed(inputs, first_weight):
+    if pad == 0 or not _lora_rank_pad_needed(inputs, first_weight, second_weight):
         return first_weight, second_weight
     first_weight = F.pad(first_weight, (0, pad))
     second_weight = F.pad(second_weight, (0, 0, 0, pad))
@@ -3487,7 +3693,7 @@ def _is_moe_experts_module(module) -> bool:
         # 4-bit params are packed into 2D tensors.
         if HAS_BNB and isinstance(param, Params4bit) and param.ndim == 2:
             return True
-        if is_mxfp4_expert_param(param):
+        if is_packed_expert_param(param):
             return True
         # Standard MoE weights are 3D (num_experts, in, out).
         if isinstance(param, (nn.Parameter, torch.Tensor)) and param.ndim in (2, 3):
@@ -3760,6 +3966,9 @@ def _log_moe_lora_stash_unread_once(experts_module, parameter_name: str) -> None
     """One message per experts class and parameter, the first time the stash goes unread."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
+    # Not while tracing: a guard on the set's contents recompiled the caller once it was logged.
+    if torch.compiler.is_compiling():
+        return
     key = (type(experts_module).__name__, parameter_name)
     if key in _MOE_LORA_STASH_UNREAD_LOGGED:
         return
@@ -3988,8 +4197,13 @@ def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, arg
     # routed gpt-oss decode path (sm80+ CUDA): the experts forward would not run and the verdict would read
     # "stash unread" for a forward that reads it.
     _mark_inner_expert_wrappers(wrapper)
+    # A throwaway forward: it must not leave its routing for a gradient checkpoint replay.
     try:
-        with _preserved_rng_for_probe(x), _parametrize_cache_untouched():
+        from unsloth_zoo.gradient_checkpointing import suspended_checkpoint_routing
+    except ImportError:
+        suspended_checkpoint_routing = contextlib.nullcontext
+    try:
+        with _preserved_rng_for_probe(x), _parametrize_cache_untouched(), suspended_checkpoint_routing():
             with torch.no_grad():
                 wrapper.base_layer(x, *args, **kwargs)
     except Exception:
@@ -4135,7 +4349,7 @@ def _can_fold_moe_lora_through_peft(experts_module, parameter_name: str) -> bool
         return False
     if HAS_BNB and Params4bit is not None and isinstance(param, Params4bit):
         return False
-    if is_mxfp4_expert_param(param):
+    if is_packed_expert_param(param):
         return False
     return True
 
@@ -5194,6 +5408,37 @@ def _uses_own_apply_gate(module) -> bool:
     )
 
 
+def _moe_fp32_reference(module) -> bool:
+    """Experts declaring `_unsloth_moe_fp32_reference` (Unsloth's native DeepSeek-V4.1) compute the gate in fp32 and
+    accumulate the routed outputs in fp32, as their own forward (the reference) does."""
+    return bool(_module_flag(module, "_unsloth_moe_fp32_reference", False))
+
+
+def _apply_own_gate(module, gate_up):
+    """module._apply_gate, in fp32 for fp32-reference experts (one rounding back to the activation dtype)."""
+    if _moe_fp32_reference(module):
+        return module._apply_gate(gate_up.float()).to(gate_up.dtype)
+    return module._apply_gate(gate_up)
+
+
+def _loop_expert_weight(param, expert_idx, dtype):
+    """One expert's weight for the per-expert loop: a packed MXFP4 stack decodes only that expert."""
+    if is_mxfp4_expert_param(param):
+        from unsloth_zoo.mxfp4_dequant import mxfp4_dequantize
+
+        return mxfp4_dequantize(
+            param.data[expert_idx : expert_idx + 1],
+            param.mxfp4_scales[expert_idx : expert_idx + 1].to(param.device),
+            dtype = dtype,
+            transpose = param.mxfp4_transposed,
+        )[0]
+    weight = param[expert_idx]
+    # Cast dense 16/32-bit stacks to the activation dtype like native _expert_weight (F.linear rejects the mix); fp8/int stay.
+    if weight.is_floating_point() and weight.element_size() > 1 and weight.dtype != dtype:
+        weight = weight.to(dtype)
+    return weight
+
+
 def forward_native_grouped_mm(
     self,
     hidden_states: torch.Tensor,
@@ -5203,8 +5448,8 @@ def forward_native_grouped_mm(
     """Native PyTorch grouped-GEMM MoE forward via torch._grouped_mm (no Triton; needs runtime support)."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    # Runtime safety check (defense in depth).
-    if not _check_torch_grouped_mm_supported():
+    # Runtime safety check (defense in depth); packed NVFP4 / MXFP8 stacks fall back to a per-group loop instead.
+    if not _check_torch_grouped_mm_supported() and not _moe_uses_new_packed_expert_weights(self):
         # Compute Capability is CUDA-only; on XPU it would mask this message.
         if torch.cuda.is_available():
             major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
@@ -5236,6 +5481,9 @@ def forward_native_grouped_mm(
     flat_top_k = top_k_index.view(-1)
     num_tokens_per_expert, sorted_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
     permuted_input = gather_routed_rows(hidden_states, sorted_indices, top_k_index.shape[-1])
+
+    # Inside an Unsloth checkpoint: keep (first pass) or reuse (replay) the frozen base outputs.
+    keep_slot = _gc_keep_base_slot(self)
 
     # Gate + Up projection with optional separated LoRA (default).
     use_separated_lora = _should_use_separated_lora()
@@ -5278,8 +5526,11 @@ def forward_native_grouped_mm(
                 selective_plan = _selective_dequant_plan(
                     (_gate_up_src, getattr(self, "down_proj", None)), num_tokens_per_expert, permuted_input.shape[0],
                 )
-            mm1_out = _base_grouped_mm(
-                permuted_input, offsets, _gate_up_provider, _recompute, selective_plan,
+            # LoRA folded into the base GEMM (moe_lora_fold) and the first pass's base output reused by the checkpoint
+            # replay (moe_gc_keep_base); a LoRA left over is added by the separated path below.
+            mm1_out, gate_up_lora = _moe_base_and_lora(
+                permuted_input, offsets, _gate_up_provider, _recompute, selective_plan, gate_up_lora, _gate_up_src,
+                keep_slot, "gate_up",
             )
 
         # Separated LoRA: + ((X @ first) @ second) * scaling.
@@ -5390,7 +5641,7 @@ def forward_native_grouped_mm(
 
     # Activation
     if own_gate_up is not None:
-        inter = self._apply_gate(own_gate_up)
+        inter = _apply_own_gate(self, own_gate_up)
     elif fused_inter is not None:
         inter = fused_inter
     elif "GptOssExperts" in self.__class__.__name__:
@@ -5462,8 +5713,9 @@ def forward_native_grouped_mm(
             mm2_out = _nf4_fused_base_mm(inter, offsets, _down_src, "down", hidden_dim, model_type, self)
         if _down_layout is None and mm2_out is None:
             _recompute = _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype)
-            mm2_out = _base_grouped_mm(
-                inter, offsets, _down_provider, _recompute, selective_plan if _recompute else None,
+            mm2_out, down_lora = _moe_base_and_lora(
+                inter, offsets, _down_provider, _recompute, selective_plan if _recompute else None, down_lora,
+                _down_src, keep_slot, "down",
             )
 
         if down_lora is not None:
@@ -5529,6 +5781,8 @@ def forward_native_grouped_mm(
     else:
         flat_weights = top_k_weights.reshape(-1)
         permuted_weights = flat_weights[sorted_indices]
+    if _moe_fp32_reference(self):
+        permuted_weights = permuted_weights.float()
 
     final_hidden_states = weighted_unpermute(
         mm2_out,
@@ -5630,8 +5884,10 @@ def forward_triton_grouped_gemm(
     """Grouped-GEMM MoE forward via Triton kernels (torch.compile-compatible, mode="max-autotune")."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    if not _triton_grouped_gemm_dims_supported(self, hidden_states.shape[-1]):
+    packed = any(is_mxfp4_expert_param(getattr(self, name, None)) for name in ("gate_up_proj", "down_proj"))
+    if packed or not _triton_grouped_gemm_dims_supported(self, hidden_states.shape[-1]):
         # Toy shapes (hidden_size 8): the same routing on grouped_mm, else the eager loop; neither has the tile limit.
+        # Packed MXFP4 expert stacks: the raw Triton GEMM reads dense weights; grouped_mm and the loop decode them.
         if _grouped_mm_supported_on(hidden_states.device):
             return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
         return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
@@ -5776,7 +6032,7 @@ def forward_triton_grouped_gemm(
     if not _uses_own_apply_gate(self):
         fused_intermediate = _fused_moe_activation(self, first_gemm_output, False, allow_gptoss = False)
     if _uses_own_apply_gate(self):
-        intermediate = self._apply_gate(first_gemm_output)
+        intermediate = _apply_own_gate(self, first_gemm_output)
     elif fused_intermediate is not None:
         intermediate = fused_intermediate
     elif hasattr(self, 'act_fn') and callable(self.act_fn):
@@ -5845,12 +6101,18 @@ def forward_triton_grouped_gemm(
             )
 
     # Apply routing weights and sum across top_k: (num_tokens, top_k, hidden) -> (num_tokens, hidden).
-    top_k_weights_casted = top_k_weights.to(hidden_states.dtype)
-    final_hidden_states = (
-        second_gemm_output.view(num_tokens, top_k, hidden_dim)
-        * top_k_weights_casted[..., None]
-    )
-    final_hidden_states = final_hidden_states.sum(dim=1)
+    if _moe_fp32_reference(self):
+        final_hidden_states = (
+            second_gemm_output.view(num_tokens, top_k, hidden_dim).float()
+            * top_k_weights.float()[..., None]
+        ).sum(dim=1).to(hidden_states.dtype)
+    else:
+        top_k_weights_casted = top_k_weights.to(hidden_states.dtype)
+        final_hidden_states = (
+            second_gemm_output.view(num_tokens, top_k, hidden_dim)
+            * top_k_weights_casted[..., None]
+        )
+        final_hidden_states = final_hidden_states.sum(dim=1)
 
     if is_3d:
         final_hidden_states = final_hidden_states.view(batch_size, seq_len, hidden_dim)
@@ -5867,7 +6129,10 @@ def forward_native_moe_loop(
 ) -> torch.Tensor:
     """Loop over experts with routed tokens; torch.compile-disabled to avoid graph breaks on dynamic control flow."""
     # This Unsloth Zoo code section is licensed under AGPL3
-    final_hidden_states = torch.zeros_like(hidden_states)
+    fp32_reference = _moe_fp32_reference(self)
+    final_hidden_states = torch.zeros_like(
+        hidden_states, dtype = torch.float32 if fp32_reference else hidden_states.dtype
+    )
     use_separated_lora = _should_use_separated_lora()
 
     gate_up_lora = take_moe_lora_stash(self, "gate_up_proj")
@@ -5940,7 +6205,7 @@ def forward_native_moe_loop(
 
         # gate_up projection for this expert ('gate_up_proj' or 'w1'/'w3').
         if hasattr(self, "gate_up_proj"):
-            gate_up_weight = self.gate_up_proj[expert_idx]
+            gate_up_weight = _loop_expert_weight(self.gate_up_proj, expert_idx, current_state.dtype)
             if grouped_mm_format or gate_up_weight.shape[-1] != current_state.shape[-1]:
                 gate_up_weight = gate_up_weight.T
             gate_up = F.linear(current_state, gate_up_weight)
@@ -5963,8 +6228,8 @@ def forward_native_moe_loop(
             gate_up = None
 
         if own_apply_gate:
-            current_hidden_states = self._apply_gate(
-                gate_up if gate_up is not None else torch.cat((gate, up), dim=-1)
+            current_hidden_states = _apply_own_gate(
+                self, gate_up if gate_up is not None else torch.cat((gate, up), dim=-1)
             )
         elif is_gpt_oss:
             limit = getattr(self, "limit", 7.0)
@@ -5979,7 +6244,7 @@ def forward_native_moe_loop(
 
         # down projection for this expert.
         if hasattr(self, "down_proj"):
-            down_weight = self.down_proj[expert_idx]
+            down_weight = _loop_expert_weight(self.down_proj, expert_idx, current_hidden_states.dtype)
             # Mirror gate_up: prefer the flag over the shape heuristic (unsafe at square dims).
             if grouped_mm_format or down_weight.shape[-1] != current_hidden_states.shape[-1]:
                 down_weight = down_weight.T
@@ -5996,12 +6261,14 @@ def forward_native_moe_loop(
         else:
             current_hidden_states = F.linear(current_hidden_states, self.w2[expert_idx])
 
-        current_hidden_states = (
-            current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-        )
+        routing_weights = top_k_weights[token_idx, top_k_pos, None]
+        if fp32_reference:
+            current_hidden_states = current_hidden_states.float()
+            routing_weights = routing_weights.float()
+        current_hidden_states = current_hidden_states * routing_weights
 
         final_hidden_states.index_add_(
             0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
         )
 
-    return final_hidden_states
+    return final_hidden_states.to(hidden_states.dtype) if fp32_reference else final_hidden_states

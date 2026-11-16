@@ -42,3 +42,19 @@ vLLM (Gated DeltaNet ReplaySSM decode kernel)
 
   One Triton kernel file (gdn_replayssm_decode.py), with its launch-config lookup
   inlined; see the MANIFEST for the exact change.
+
+--------------------------------------------------------------------------------
+attention-gym (sparse gather attention)
+--------------------------------------------------------------------------------
+  Upstream:  https://github.com/meta-pytorch/attention-gym
+  Commit:    26beb363c6d1328851bfc5c9c8691fa2066bd1fa
+  License:   BSD-3-Clause
+  Copyright: (c) 2023, Driss Guessous; (c) 2025 Meta Platforms, Inc. and affiliates
+  Location:  unsloth_zoo/_vendored/attn_gym/
+  License text + provenance: unsloth_zoo/_vendored/attn_gym/LICENSE and
+                             unsloth_zoo/_vendored/attn_gym/MANIFEST
+                             (also embedded verbatim in the shipped module
+                             unsloth_zoo/_vendored/_licenses.py).
+
+  The Triton closure of gather_attn only (forward + backward, custom ops); the
+  CuTe backend is pruned and the tuner rewritten; see the MANIFEST.

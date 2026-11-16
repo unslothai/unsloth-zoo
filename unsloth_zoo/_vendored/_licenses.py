@@ -97,6 +97,22 @@ vLLM (Gated DeltaNet ReplaySSM decode kernel)
 
   One Triton kernel file (gdn_replayssm_decode.py), with its launch-config lookup
   inlined; see the MANIFEST for the exact change.
+
+--------------------------------------------------------------------------------
+attention-gym (sparse gather attention)
+--------------------------------------------------------------------------------
+  Upstream:  https://github.com/meta-pytorch/attention-gym
+  Commit:    26beb363c6d1328851bfc5c9c8691fa2066bd1fa
+  License:   BSD-3-Clause
+  Copyright: (c) 2023, Driss Guessous; (c) 2025 Meta Platforms, Inc. and affiliates
+  Location:  unsloth_zoo/_vendored/attn_gym/
+  License text + provenance: unsloth_zoo/_vendored/attn_gym/LICENSE and
+                             unsloth_zoo/_vendored/attn_gym/MANIFEST
+                             (also embedded verbatim in the shipped module
+                             unsloth_zoo/_vendored/_licenses.py).
+
+  The Triton closure of gather_attn only (forward + backward, custom ops); the
+  CuTe backend is pruned and the tuner rewritten; see the MANIFEST.
 """
 
 # fla-core snapshot provenance, verbatim from unsloth_zoo/_vendored/fla/MANIFEST.
@@ -626,4 +642,101 @@ file_count = 1 python module + __init__.py + this MANIFEST + LICENSE
 vendored_by = Unsloth (unsloth_zoo/_vendored/vllm)
 """
 
-__all__ = ["FLA_LICENSE", "NOTICE", "FLA_MANIFEST", "VLLM_LICENSE", "VLLM_MANIFEST"]
+# attention-gym upstream license, verbatim from unsloth_zoo/_vendored/attn_gym/LICENSE.
+ATTN_GYM_LICENSE = """BSD 3-Clause License
+
+Copyright (c) 2023, Driss Guessous
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+"""
+
+# attention-gym snapshot provenance, verbatim from unsloth_zoo/_vendored/attn_gym/MANIFEST.
+ATTN_GYM_MANIFEST = """name = attention-gym (attn_gym)
+commit = 26beb363c6d1328851bfc5c9c8691fa2066bd1fa
+upstream = https://github.com/meta-pytorch/attention-gym
+license = BSD-3-Clause
+license_file = LICENSE
+copyright = Copyright (c) 2023, Driss Guessous; Copyright (c) 2025 Meta Platforms, Inc. and affiliates
+
+description =
+    The sparse gather-attention operator of attention-gym (attn_gym/sparse/
+    gather_attn): one softmax over a causal local window plus explicitly indexed
+    KV rows, a single shared KV head, an optional per-head attention sink, Triton
+    forward and backward kernels registered as torch.library custom ops with fake
+    implementations. unsloth_zoo.sparse_attention runs DeepSeek-V4.1 index-gather
+    attention and Qwen3.8-Flash-Next QSA attention on it for training.
+
+exported_api =
+    attn_gym.sparse.gather_attn.gather_attn
+    attn_gym.sparse.gather_attn.RopePair
+    attn_gym.sparse.gather_attn.AuxRequest
+
+modifications =
+    - Only the Triton closure of gather_attn is vendored: types.py, _cu_seqlens.py,
+      _backends/triton/{utils,tune}.py, sparse/gather_attn/{api,impl/__init__,
+      impl/ops,impl/reference,impl/triton/*}.py. Pruned: the CuTe backend
+      (impl/cute.py, impl/packed_kv.py, impl/indices.py, _backends/cute/*; they
+      need cutlass-dsl and tvm_ffi), the lightning indexer and every other
+      attention family. Files keep their upstream text except the changes below,
+      each marked "Modified by Unsloth".
+    - Absolute "attn_gym." imports are package-absolute
+      "unsloth_zoo._vendored.attn_gym." imports, so nothing is injected into
+      sys.modules and a user's own attention-gym install is untouched.
+    - impl/ops.py: the custom-op namespace attn_gym:: is unsloth_attn_gym::, so a
+      real attention-gym imported in the same process cannot define the same
+      operators twice.
+    - sparse/gather_attn/api.py: _select_backend always returns "triton" (CuTe is
+      not vendored).
+    - _backends/triton/tune.py is rewritten: upstream TritonTuner delegates to the
+      CuTe run_tunable machinery (on-disk winner cache, parallel compile). The
+      vendored TritonTuner keeps the interface (configs, key, prune, reset) and
+      times the surviving candidates in process with triton.testing.do_bench on
+      the first launch per key, restoring mutated outputs through reset, and
+      memoizes the winner; UNSLOTH_ATTN_GYM_AUTOTUNE=0 pins the first candidate
+      that launches. An untimed selection's launch is the call's launch (no second
+      launch on a cold key).
+    - Python 3.9 (unsloth_zoo requires-python >= 3.9): "from __future__ import
+      annotations" added to types.py, _backends/triton/utils.py,
+      sparse/gather_attn/impl/{__init__,ops,reference}.py and
+      impl/triton/{backward,forward,primitives}.py; the runtime aliases
+      AttentionInput (api.py) and Grid (tune.py) use typing.Union; the
+      dataclass(slots=True) in api.py and types.py passes slots only on 3.10+.
+      The Triton kernel modules need triton >= 3.5 (no Python 3.9 wheels): where
+      gather_attn cannot be imported, unsloth_zoo.sparse_attention never selects
+      it.
+    - Relative imports whose target is a package or a dotted submodule are
+      spelled absolutely (sparse/__init__.py: gather_attn; gather_attn/api.py:
+      impl; gather_attn/impl/ops.py: triton.backward, triton.forward), because
+      transformers' custom_object_save opens relative-import targets as files.
+    - __init__.py, sparse/__init__.py and sparse/gather_attn/__init__.py are
+      narrowed to the vendored closure.
+
+file_count = 18 python modules + this MANIFEST + LICENSE
+
+vendored_by = Unsloth (unsloth_zoo/_vendored/attn_gym)
+"""
+
+__all__ = ["FLA_LICENSE", "NOTICE", "FLA_MANIFEST", "VLLM_LICENSE", "VLLM_MANIFEST", "ATTN_GYM_LICENSE", "ATTN_GYM_MANIFEST"]
