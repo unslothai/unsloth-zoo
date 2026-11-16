@@ -2,16 +2,16 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
-# You should have received a copy of the GNU Lesser General Public License
+# You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Prompt/completion rows in sft_prepare_dataset cut to max_length like TRL: truncation_mode picks the side and
@@ -87,3 +87,9 @@ def test_no_max_length_keeps_the_whole_row():
     ids, trained = prepare(None)
     assert ids == FULL
     assert trained == COMPLETION_IDS
+
+
+def test_unsloth_truncation_guard_anchor_is_kept():
+    # unsloth's sft_trainer_prepare_dataset _require_replace()s this line; losing it fails every patched SFTTrainer.
+    import inspect
+    assert inspect.getsource(sft_prepare_dataset).count("if do_truncation and max_seq_length > 0:") == 1
