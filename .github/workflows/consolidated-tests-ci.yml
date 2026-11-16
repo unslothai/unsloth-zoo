@@ -809,7 +809,7 @@ jobs:
           # CUDA and on Apple Silicon. On darwin + arm64 it also decides the mlx-vlm the
           # joint resolution lands on, since mlx-vlm 0.6.5 and up require
           # transformers >= 5.14.
-          CEILING = Version("5.17.0")
+          CEILING = Version("5.18.0")
           DARWIN_ARM = {"sys_platform": "darwin", "platform_machine": "arm64"}
           LINUX_X86 = {"sys_platform": "linux", "platform_machine": "x86_64"}
 
