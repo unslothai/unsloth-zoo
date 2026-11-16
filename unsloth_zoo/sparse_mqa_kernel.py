@@ -28,8 +28,9 @@ deterministic). d(sink) is a reduction over the saved log-sum-exp in torch.
 
 Ops are versioned custom ops with fakes and autograd (no graph break under torch.compile; bump _V on any schema or
 formula change: Inductor caches key the op name). Sequence length, slot count and pool length are runtime
-arguments (do_not_specialize); the compile key is (head_dim, tile sizes, has_sink, dtype). Head dims are powers of
-two from 16 to 512. Configs are fixed per shared-memory tier of the operand's device, never autotuned; a launch
+arguments (do_not_specialize), and so is the log-sum-exp batch stride s * h (its % 16 alignment flips with the
+length when h is not a multiple of 16); the compile key is (head_dim, tile sizes, has_sink, dtype). Head dims are
+powers of two from 16 to 512. Configs are fixed per shared-memory tier of the operand's device, never autotuned; a launch
 refused for shared memory steps down to the next config (on 64 KB parts the head_dim 512 backward splits D across
 two programs, each recomputing the full-D logits), and the last refusal propagates.
 """
@@ -51,7 +52,7 @@ SPARSE_MQA_STATS = {"fwd": 0, "bwd": 0, "window_fwd": 0, "window_bwd": 0, "hd512
 _V = "v3"
 
 
-@triton.jit(do_not_specialize = ["S", "N", "TOPK", "H", "IDX_GROUP", "stride_ib", "stride_is"])
+@triton.jit(do_not_specialize = ["S", "N", "TOPK", "H", "IDX_GROUP", "stride_ib", "stride_is", "stride_lb"])
 def _sparse_mqa_fwd(
     Q, KV, IDX, SINK, OUT, LSE,
     S, N, TOPK, H, IDX_GROUP,
@@ -114,7 +115,7 @@ def _sparse_mqa_fwd(
     tl.store(LSE + b * stride_lb + t * stride_ls + offs_h, lse, mask = h_ok)
 
 
-@triton.jit(do_not_specialize = ["S", "N", "TOPK", "H", "IDX_GROUP", "stride_ib", "stride_is"])
+@triton.jit(do_not_specialize = ["S", "N", "TOPK", "H", "IDX_GROUP", "stride_ib", "stride_is", "stride_lb"])
 def _sparse_mqa_bwd(
     Q, KV, IDX, DO, LSE, DELTA, DQ, DKV,
     S, N, TOPK, H, IDX_GROUP,
@@ -180,7 +181,7 @@ def _sparse_mqa_bwd(
     tl.store(DQ + q_row + offs_d[None, :], (dq * scale).to(DQ.dtype.element_ty), mask = h_ok[:, None])
 
 
-@triton.jit(do_not_specialize = ["S", "H", "W"])
+@triton.jit(do_not_specialize = ["S", "H", "W", "stride_lb"])
 def _window_fwd(
     Q, KV, OC, LSEC, SINK, OUT, LSE,
     S, H, W,
@@ -252,7 +253,7 @@ def _window_fwd(
     tl.store(LSE + lrow, lse, mask = ok)
 
 
-@triton.jit(do_not_specialize = ["S", "H", "W"])
+@triton.jit(do_not_specialize = ["S", "H", "W", "stride_lb"])
 def _window_bwd_dq(
     Q, KV, DO, LSE, DELTA, DQ_IN, DQ,
     S, H, W,
@@ -301,7 +302,7 @@ def _window_bwd_dq(
     tl.store(DQ + row[:, None] + offs_d[None, :], dq.to(DQ.dtype.element_ty), mask = ok[:, None])
 
 
-@triton.jit(do_not_specialize = ["S", "H", "W"])
+@triton.jit(do_not_specialize = ["S", "H", "W", "stride_lb"])
 def _window_bwd_dkv(
     Q, KV, DO, LSE, DELTA, DKV,
     S, H, W,
@@ -355,6 +356,9 @@ def _shared_memory(device):
     if device.type != "cuda":  # TRITON_INTERPRET=1 tests on CPU
         return 48 * 1024
     index = device.index if device.index is not None else torch.cuda.current_device()
+    # Traced code skips the cache: a dict first filled during a trace becomes a guard and recompiles the next call.
+    if torch.compiler.is_compiling():
+        return getattr(torch.cuda.get_device_properties(index), "shared_memory_per_block_optin", 48 * 1024)
     if index not in _SMEM:
         props = torch.cuda.get_device_properties(index)
         _SMEM[index] = getattr(props, "shared_memory_per_block_optin", 48 * 1024)
@@ -423,7 +427,7 @@ def sparse_mqa_supported(q, kv):
     if q.dtype not in (torch.float16, torch.bfloat16) or kv.dtype != q.dtype:
         return False
     d = q.shape[-1]
-    if d < 16 or d > 512 or d & (d - 1):
+    if d not in (16, 32, 64, 128, 256, 512):   # not d & (d - 1): torch 2.4 SymInts (dynamic=True) have no &
         return False
     if q.dtype == torch.bfloat16 and torch.cuda.get_device_capability(q.device)[0] < 8:
         return False

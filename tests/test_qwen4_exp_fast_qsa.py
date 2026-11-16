@@ -25,7 +25,7 @@ from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextCo
 def transformers_forward():
     from unsloth_zoo.temporary_patches import qwen4_exp as patch
     fwd = modeling.Qwen4ExpTextQSAIndexer.forward
-    if fwd is patch.qwen4_exp_qsa_indexer_forward:
+    if fwd in (patch.qwen4_exp_qsa_indexer_forward, getattr(patch, "qwen4_exp_qsa_indexer_forward_guarded", None)):
         fwd = patch._reference_qsa_forward
     assert fwd.__module__.startswith("transformers."), fwd
     return fwd
@@ -122,13 +122,15 @@ def test_patch_installed_and_kill_switch(monkeypatch):
     from unsloth_zoo.temporary_patches import qwen4_exp as patch
     cls = modeling.Qwen4ExpTextQSAIndexer
     original = cls.forward
-    if original is patch.qwen4_exp_qsa_indexer_forward:
+    if original in (patch.qwen4_exp_qsa_indexer_forward, patch.qwen4_exp_qsa_indexer_forward_guarded):
         original = patch._reference_qsa_forward
     try:
         cls.forward = original
         monkeypatch.setenv("UNSLOTH_QWEN4_EXP_FAST_QSA", "0")
         patch.patch_qwen4_exp()
-        assert cls.forward is original  # kill switch: untouched
+        # kill switch: no fast path, only the filled-slot guard in front of the reference
+        assert cls.forward is patch.qwen4_exp_qsa_indexer_forward_guarded
+        assert patch._reference_qsa_forward is original
         monkeypatch.delenv("UNSLOTH_QWEN4_EXP_FAST_QSA")
         patch.patch_qwen4_exp()
         assert cls.forward is patch.qwen4_exp_qsa_indexer_forward
@@ -180,3 +182,75 @@ def test_grouped_mm_experts_take_fp32_input_under_autocast():
         with torch.autocast("cuda", dtype=torch.bfloat16):
             out = moe_utils.forward_native_grouped_mm(experts, x, idx, w)
     torch.testing.assert_close(out.float(), ref.float())
+
+
+class StaticIndexerCache:
+    """StaticIndexedLayer's contract: keys written in place, the whole max_cache_len buffer returned."""
+
+    def __init__(self, batch, max_cache_len, dim):
+        self.keys = torch.zeros(batch, max_cache_len, dim)
+        self.length = 0
+
+    def update_indexer(self, raw_keys, layer_idx):
+        n = raw_keys.shape[1]
+        self.keys[:, self.length:self.length + n] = raw_keys
+        self.length += n
+        return self.keys
+
+
+def static_left_pad_inputs(T=40, max_len=56, pad=5):
+    m = torch.zeros(2, 1, T, max_len, dtype=torch.bool)
+    m[..., :T] = torch.ones(T, T, dtype=torch.bool).tril()
+    m[1, :, :, :pad] = False
+    return m | ~m.any(dim=-1, keepdim=True)    # unsloth.import_fixes._unmask_rows_attending_to_nothing
+
+
+def test_static_cache_left_pad_kill_switch_keeps_guard(monkeypatch):
+    """UNSLOTH_QWEN4_EXP_FAST_QSA=0 must not bring the batched static-cache crash back."""
+    from unsloth_zoo.temporary_patches import qwen4_exp as patch
+    cls = modeling.Qwen4ExpTextQSAIndexer
+    saved = cls.forward
+    reference = transformers_forward()
+    try:
+        cls.forward = reference
+        monkeypatch.setenv("UNSLOTH_QWEN4_EXP_FAST_QSA", "0")
+        patch.patch_qwen4_exp()
+        idx = make_indexer()
+        T, max_len = 40, 56
+        m = static_left_pad_inputs(T, max_len)
+        torch.manual_seed(2)
+        h = torch.randn(2, T, 64)
+        with torch.no_grad():
+            got = idx(h, rope(T), m, StaticIndexerCache(2, max_len, 16))
+            want = reference(idx, h, rope(T), m[..., :T], StaticIndexerCache(2, T, 16))
+        assert not bool(got[..., T:].any()) and torch.equal(got[..., :T], want)
+    finally:
+        cls.forward = saved
+
+
+@pytest.mark.parametrize("floaty", [False, True])
+def test_static_cache_left_pad_rows_given_every_slot(floaty):
+    """Batched generate with a static cache: the mask spans max_cache_len, and Unsloth's sdpa_mask fix gives a left-pad
+    query row (which attends to nothing) every slot, unfilled ones included. The reference indexes the position table
+    by kv slot, so it read past it; real rows must select exactly what a mask cut to the filled slots selects."""
+    from unsloth_zoo.temporary_patches.qwen4_exp import _make_fast_indexer_forward
+    idx = make_indexer()
+    reference = transformers_forward()
+    fast = _make_fast_indexer_forward(reference)
+    T, max_len, pad = 40, 56, 5            # > budget + ratio = 20: the reference path; 16 unfilled slots
+    m = torch.zeros(2, 1, T, max_len, dtype=torch.bool)
+    m[..., :T] = torch.ones(T, T, dtype=torch.bool).tril()
+    m[1, :, :, :pad] = False                # row 1 is left padded
+    m = m | ~m.any(dim=-1, keepdim=True)    # unsloth.import_fixes._unmask_rows_attending_to_nothing
+    assert bool(m[1, 0, :pad, T:].all())    # the pad rows now see the unfilled slots
+    torch.manual_seed(2)
+    h = torch.randn(2, T, 64)
+    pe = rope(T)
+    with torch.no_grad():
+        got = fast(idx, h, pe, as_float(m) if floaty else m, StaticIndexerCache(2, max_len, 16))
+        cut = m[..., :T]
+        want = reference(idx, h, pe, as_float(cut) if floaty else cut, StaticIndexerCache(2, T, 16))
+    sel = got if got.dtype == torch.bool else got == 0
+    sel_want = want if want.dtype == torch.bool else want == 0
+    assert sel.shape[-1] == max_len and not bool(sel[..., T:].any())
+    assert torch.equal(sel[..., :T], sel_want)

@@ -2593,6 +2593,22 @@ def _fold_perexpert_lora_into_fused(W, fused_base_name, converted_lora_weights):
 pass
 
 
+def _paramwrapper_expert_lora(converted_lora_weights, fused_base_name):
+    """PEFT ParamWrapper LoRA on a fused expert tensor, or None. Keyed on the experts module,
+    one `.base_layer` deeper per extra target_parameters entry; tensor in `parameter_name`."""
+    _m = re.match(r"^(.*\.experts)\.(gate_up_proj|down_proj)$", fused_base_name)
+    if _m is None:
+        return None
+    key = _m.group(1)
+    while key in converted_lora_weights:
+        stats = converted_lora_weights[key]
+        if getattr(stats, "parameter_name", None) == _m.group(2) and getattr(stats, "lora_A", None) is not None:
+            return stats
+        key += ".base_layer"
+    return None
+pass
+
+
 @torch.inference_mode
 def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None, biases=None, vocab_modules=None):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -2722,6 +2738,14 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                     if UNSLOTH_ENABLE_LOGGING:
                         logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
                     count += 1; W = _merge_lora(W, lora_stats, output_key)
+                elif (_pw_stats := _paramwrapper_expert_lora(converted_lora_weights, base_name)) is not None:
+                    # Dequantized W is GPT-OSS (E, in, out), hence is_transposed.
+                    _merge_fused = (_merge_moe_fused_gate_up_expert if base_name.endswith(".gate_up_proj")
+                                    else _merge_moe_fused_down_proj_expert)
+                    W = _merge_fused(W, _pw_stats, output_dtype or W.dtype, is_transposed = True)
+                    count += 1
+                    if UNSLOTH_ENABLE_LOGGING:
+                        logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING expert LoRA into Key Group: {base_name}")
                 else:
                     # Per-expert Linear expert LoRA (gpt-oss bnb-4bit): the fused-name
                     # lookup above misses it, so fold each delta into its slice of W.
@@ -2905,6 +2929,18 @@ def _is_nvfp4_compressed_tensors_config(quant_config):
         return True
     return any(
         isinstance(group, dict) and "nvfp4" in str(group.get("format", "")).lower()
+        for group in (quant_config.get("config_groups") or {}).values()
+    )
+pass
+
+def _is_mxfp8_compressed_tensors_config(quant_config):
+    """compressed-tensors checkpoint with an mxfp8-quantized group: a 16bit merge must decode its e8m0 scales."""
+    if not isinstance(quant_config, dict) or str(quant_config.get("quant_method", "")).lower() != "compressed-tensors":
+        return False
+    if str(quant_config.get("format", "")).lower() == "mxfp8-quantized":
+        return True
+    return any(
+        isinstance(group, dict) and str(group.get("format", "")).lower() == "mxfp8-quantized"
         for group in (quant_config.get("config_groups") or {}).values()
     )
 pass
@@ -6939,9 +6975,12 @@ def _get_checkpoint_conversion_mapping(model_class_name):
     Transformers 5 registry. Without that fallback a composite model with a pre-5 flat
     checkpoint loses the bridge to its on-disk weights and fails to merge silently (#5290)."""
     for model_class in _model_classes_named(model_class_name):
-        mapping = getattr(model_class, '_checkpoint_conversion_mapping', {})
+        # A model Unsloth ships natively (DeepSeek-V4.1) loads a foreign checkpoint layout through
+        # renames transformers scopes per submodule; it states them here for the merge.
+        mapping = getattr(model_class, '_unsloth_checkpoint_conversion_mapping', None) or \
+            getattr(model_class, '_checkpoint_conversion_mapping', {})
         if mapping:
-            return mapping
+            return dict(mapping)
     mapping = _registry_checkpoint_conversion_mapping(model_class_name)
     if mapping:
         return mapping
@@ -7394,6 +7433,12 @@ def _reverse_renamed_backed_key(key, reverse_mapping, key_set, valid_prefixes, m
                     if candidate in seen: continue
                     if _lora_key_has_backing(candidate, key_set, valid_prefixes = valid_prefixes):
                         return candidate
+                    # A checkpoint without the base-model prefix (DeepSeek-V4.1's `layers.0.attn.wq_a`
+                    # under `model.layers.0.self_attn.q_a_proj`): transformers adds it at load.
+                    head, dot, rest = candidate.partition(".")
+                    if dot and head == "model" and rest and \
+                            _lora_key_has_backing(rest, key_set, valid_prefixes = valid_prefixes):
+                        return rest
                     seen.add(candidate)
                     next_frontier.append(candidate)
         frontier = next_frontier
@@ -8634,6 +8679,10 @@ def check_model_quantization_status(model_name_or_path, token=None, local_ok=Tru
 
         # NVFP4 compressed-tensors takes the same dequantize-on-merge rewrite, which unpacks weight_packed.
         elif _is_nvfp4_compressed_tensors_config(quant_config):
+            return (True, "fp8")
+
+        # MXFP8 compressed-tensors: fp8 weights with e8m0 1x32 scales, decoded by the same FP8 rewrite.
+        elif _is_mxfp8_compressed_tensors_config(quant_config):
             return (True, "fp8")
 
         # Case 1: Fallback to existing logic for bitsandbytes

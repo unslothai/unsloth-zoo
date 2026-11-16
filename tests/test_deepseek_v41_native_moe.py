@@ -133,7 +133,12 @@ def test_native_loop_backend_casts_dense_experts_like_the_native_forward(referen
     want = reference_forward(experts, hidden, index, weights)
     got = forward_native_moe_loop(experts, hidden, index, weights)
     assert got.dtype == want.dtype == dtype
-    torch.testing.assert_close(got, want, rtol = 0, atol = 0)
+    if dtype == torch.float32:
+        # An fp32 result keeps the last-bit differences of the CPU's matmul kernel, which varies by runner
+        # (seen: 5.7e-6 abs on some CI hosts); fp32 tolerances still catch a forward that skipped the cast.
+        torch.testing.assert_close(got, want)
+    else:
+        torch.testing.assert_close(got, want, rtol = 0, atol = 0)
 
 
 def test_native_loop_backend_keeps_a_cancelling_residual(patched):
@@ -222,3 +227,52 @@ def test_cpu_standalone_load_keeps_the_native_loop(monkeypatch):
     forward = IMPL.modeling.DeepseekV41Experts.__dict__.get("forward")
     module.patch_deepseek_v41_moe()  # must not raise, must not touch the class
     assert IMPL.modeling.DeepseekV41Experts.__dict__.get("forward") is forward
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "the Triton MoE backend needs CUDA")
+def test_triton_backend_under_compile_matches_its_non_reentrant_recompute(patched, monkeypatch):
+    # The tuner ran on the first traced call only, so the recompute saved different tensors (CheckpointError).
+    pytest.importorskip("unsloth.kernels.moe.grouped_gemm.interface")
+    from unsloth_zoo.temporary_patches.deepseek_v41 import patch_deepseek_v41_gradient_checkpointing
+    from unsloth_zoo.temporary_patches.moe_utils import get_forward_moe_backend
+
+    patch_deepseek_v41_gradient_checkpointing()
+    backend = get_forward_moe_backend().__globals__
+    monkeypatch.setenv("UNSLOTH_MOE_BACKEND", "unsloth_triton")
+    monkeypatch.setenv("UNSLOTH_MOE_DISABLE_AUTOTUNE", "1")
+    backend["select_moe_backend"].cache_clear()
+    calls = []
+    triton_forward = backend["forward_triton_grouped_gemm"]
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return triton_forward(*args, **kwargs)
+
+    monkeypatch.setitem(backend, "forward_triton_grouped_gemm", counted)
+    block = IMPL.modeling.DeepseekV41SparseMoeBlock
+    # aot_eager keeps what fails (Dynamo graphs + AOT autograd saved tensors) without Inductor codegen.
+    monkeypatch.setattr(block, "forward", torch.compile(block.forward, dynamic = True, backend = "aot_eager"))
+    try:
+        if backend["select_moe_backend"]() != "unsloth_triton":
+            pytest.skip("the Triton MoE backend is not available here")
+        # A ratio-2 and a ratio-1 layer: both KV / index sources (compressors present), the candidates on the second.
+        config = IMPL.TextConfig(
+            vocab_size = 256, hidden_size = H, num_hidden_layers = 2, num_attention_heads = 2, head_dim = 64,
+            qk_rope_head_dim = 16, q_lora_rank = 32, o_groups = 2, o_lora_rank = 16, moe_intermediate_size = I,
+            n_routed_experts = E, num_experts_per_tok = TOP_K, sliding_window = 8, compress_ratios = [2, 1],
+            kv_source_layer_ids = [0, 1], index_source_layer_ids = [0, 1], candidate_source_layer_id = 1,
+            candidate_topk_blocks = 2, candidate_block_size = 2, index_n_heads = 2, index_head_dim = 32, index_topk = 4,
+            hc_mult = 2, hc_sinkhorn_iters = 3, engram_layer_ids = [], num_nextn_predict_layers = 0,
+        )
+        torch.manual_seed(0)
+        model = IMPL.modeling.DeepseekV41ForCausalLM(config).to("cuda", torch.bfloat16)
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
+        model.train()
+        ids = torch.randint(0, 256, (2, 24), device = "cuda")
+        torch._dynamo.reset()
+        model(input_ids = ids, labels = ids).loss.backward()
+        assert calls, "the Triton backend never ran"
+        assert model.lm_head.weight.grad is not None
+    finally:
+        backend["select_moe_backend"].cache_clear()
+        torch._dynamo.reset()

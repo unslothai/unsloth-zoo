@@ -29,6 +29,9 @@ __all__ = [
 ]
 
 _FP8_DTYPES = tuple(getattr(torch, n) for n in ("float8_e4m3fn", "float8_e5m2") if hasattr(torch, n))
+# transformers 5.17 casts a checkpoint's FP8 codes to the parameter dtype before Fp8Dequantize (5.23 keeps FP8);
+# the cast is exact, so widened codes take the same block fix. Packed FP4 codes are integer and stay excluded.
+_CODE_DTYPES = _FP8_DTYPES + (torch.float32, torch.bfloat16, torch.float16)
 
 
 def _configured_block(op):
@@ -45,7 +48,7 @@ def _configured_block(op):
 
 def _partial_block(op, quantized, scales):
     """(block_m, block_n) when the configured blocks tile `quantized` with a partial edge matching `scales`, else None."""
-    if not isinstance(quantized, torch.Tensor) or quantized.dtype not in _FP8_DTYPES or quantized.dim() < 2:
+    if not isinstance(quantized, torch.Tensor) or quantized.dtype not in _CODE_DTYPES or quantized.dim() < 2:
         return None
     if not isinstance(scales, torch.Tensor) or scales.dim() < 2:
         return None

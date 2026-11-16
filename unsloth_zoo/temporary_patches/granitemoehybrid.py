@@ -83,6 +83,12 @@ def patch_GraniteMoeHybridDecoderLayer_float16():
         return raise_error("GraniteMoeHybridDecoderLayer.forward", e)
     original_forward = layer_class.forward
     if getattr(original_forward, "_unsloth_granite_float16", False): return
+    # transformers >= 5.23 checkpoints only while its wrapper is type(self).forward: dispatch inside it.
+    rewrap = (
+        getattr(getattr(original_forward, "__code__", None), "co_name", "") == "forward_with_checkpointing"
+        and callable(getattr(original_forward, "__wrapped__", None))
+    )
+    if rewrap: original_forward = original_forward.__wrapped__
     try:
         float16_forward = _build_float16_decoder_forward(module, original_forward)
     except Exception as e:
@@ -97,6 +103,9 @@ def patch_GraniteMoeHybridDecoderLayer_float16():
         return original_forward(self, hidden_states, *args, **kwargs)
     forward._unsloth_granite_float16 = True
     layer_class.forward = forward
+    if rewrap:
+        from transformers.modeling_layers import GradientCheckpointingLayer
+        GradientCheckpointingLayer.__init_subclass__.__func__(layer_class)
 TEMPORARY_PATCHES.append(patch_GraniteMoeHybridDecoderLayer_float16)
 
 

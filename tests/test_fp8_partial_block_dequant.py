@@ -61,6 +61,14 @@ def test_partial_edge_blocks_use_the_configured_block(rows, cols, lead):
     assert out.shape == ref.shape and torch.equal(out, ref)
 
 
+@pytest.mark.parametrize("code_dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_partial_edge_blocks_with_codes_the_loader_widened(code_dtype):
+    # transformers 5.17 casts the FP8 codes to the parameter dtype before dequantizing.
+    w, s, ref = _case(200, 384, [128, 128])
+    out = _op([128, 128])._dequantize_one(w.to(code_dtype), s, torch.float32)
+    assert out.shape == ref.shape and torch.equal(out, ref)
+
+
 def test_whole_blocks_and_other_grids_keep_the_stock_path():
     original = getattr(fp8.Fp8Dequantize._dequantize_one, "_unsloth_original", fp8.Fp8Dequantize._dequantize_one)
     w, s, ref = _case(256, 384, [128, 128])

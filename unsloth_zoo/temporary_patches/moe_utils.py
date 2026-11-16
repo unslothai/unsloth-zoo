@@ -33,6 +33,7 @@ from typing import Optional, Tuple
 from torch.autograd import Function
 from unsloth_zoo.mlx import is_mlx_available
 from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
+from unsloth_zoo.packed_experts import is_new_packed_expert_param, is_packed_expert_param, packed_param_transposed
 
 UNSLOTH_COMPILE_LOCATION = os.environ.get(
     "UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache"
@@ -980,7 +981,7 @@ def _base_is_recomputable(source) -> bool:
             if getattr(param, "quant_state", None) is None:
                 return False
             return not param.requires_grad
-        if is_mxfp4_expert_param(param):
+        if is_packed_expert_param(param):
             return not param.requires_grad
         if isinstance(param, torch.Tensor):
             return (not param.requires_grad) and param.dtype in (
@@ -1607,10 +1608,11 @@ def _mxfp4_expert_layout(source, proj_type, hidden_dim, model_type, experts_modu
     param = source
     while hasattr(param, "base_layer"):
         param = param.base_layer
-    if not is_mxfp4_expert_param(param) or param.requires_grad:
+    if not is_packed_expert_param(param) or param.requires_grad:
         return None
+    transposed = packed_param_transposed(param)
     cache = experts_module.__dict__.setdefault("_unsloth_mxfp4_layout", {})
-    key = (proj_type, hidden_dim, model_type, bool(param.mxfp4_transposed), tuple(param._original_shape))
+    key = (proj_type, hidden_dim, model_type, transposed, tuple(param._original_shape), type(param).__name__)
     if key not in cache:
         # preprocess_weight on a meta stand-in: identity or a transpose view, anything else is unsupported.
         meta = torch.empty(tuple(param._original_shape), device = "meta")
@@ -1620,9 +1622,9 @@ def _mxfp4_expert_layout(source, proj_type, hidden_dim, model_type, experts_modu
             weight = None
         flipped = meta.transpose(-2, -1)
         if weight is meta or (weight is not None and weight.shape == meta.shape and weight.stride() == meta.stride()):
-            cache[key] = bool(param.mxfp4_transposed)
+            cache[key] = transposed
         elif weight is not None and weight.shape == flipped.shape and weight.stride() == flipped.stride():
-            cache[key] = not param.mxfp4_transposed
+            cache[key] = not transposed
         else:
             cache[key] = None
     transpose_b = cache[key]
@@ -1648,6 +1650,15 @@ def _mxfp4_fused_enabled(param, dtype, rows = None) -> bool:
 def _mxfp4_base_grouped_mm(inputs, offsets, counts, weight_provider, recompute, layout):
     """Fused decode-in-GEMM, else dequantize with a transposed decode for backward."""
     param, transpose_b = layout
+    if is_new_packed_expert_param(param):
+        # NVFP4 / MXFP8: chunked dequantize + grouped GEMM for forward and dX (packed_experts.py).
+        from unsloth_zoo.packed_experts import packed_expert_grouped_linear
+        if (
+            inputs.dtype == torch.float32 and inputs.device.type == "cuda"
+            and torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") in (torch.bfloat16, torch.float16)
+        ):
+            inputs = inputs.to(torch.get_autocast_dtype("cuda"))
+        return packed_expert_grouped_linear(inputs, param, counts, transpose_b)
     scales = param.mxfp4_scales
     if scales.device != param.device:
         scales = param.mxfp4_scales = scales.to(param.device)
@@ -2288,6 +2299,16 @@ def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_f
                 instance_dict.pop(name, None)
 
 
+def _moe_uses_new_packed_expert_weights(module) -> bool:
+    for name in ("gate_up_proj", "down_proj"):
+        param = getattr(module, name, None)
+        while param is not None and hasattr(param, "base_layer"):
+            param = param.base_layer
+        if is_new_packed_expert_param(param):
+            return True
+    return False
+
+
 def forward_moe_backend(
     self,
     hidden_states: torch.Tensor,
@@ -2312,6 +2333,13 @@ def forward_moe_backend(
         pass
     if moe_checkpoint_routing is not None:
         top_k_index, top_k_weights = moe_checkpoint_routing(self, top_k_index, top_k_weights)
+
+    # Absolute import as above: the copy in the compiled module has no module globals.
+    from unsloth_zoo.temporary_patches.moe_utils import _moe_uses_new_packed_expert_weights
+
+    if _moe_uses_new_packed_expert_weights(self):
+        # NVFP4 / MXFP8 stacks dequantize in chunks inside the grouped-GEMM forward; other backends index the weight.
+        return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
 
     _moe_uses_bnb4bit_expert_weights = forward_moe_backend_bnb4bit = None
     try:
@@ -2860,7 +2888,7 @@ def _get_param_shape_from_module(module, parameter_name):
         param = param.get_param()
     elif hasattr(param, "weight"):
         param = param.weight
-    if is_mxfp4_expert_param(param):
+    if is_packed_expert_param(param):
         return tuple(param._original_shape)
     return tuple(param.shape)
 
@@ -3239,7 +3267,7 @@ def _get_base_weight(param, target_dtype=None, token_counts=None, experts=None):
     if experts is not None:
         return _dequantize_bnb4bit_experts(param, experts, target_dtype)
 
-    if is_mxfp4_expert_param(param):
+    if is_packed_expert_param(param):
         return param.dequantize(dtype = target_dtype, token_counts = token_counts)
 
     if HAS_BNB and isinstance(param, Params4bit):
@@ -3665,7 +3693,7 @@ def _is_moe_experts_module(module) -> bool:
         # 4-bit params are packed into 2D tensors.
         if HAS_BNB and isinstance(param, Params4bit) and param.ndim == 2:
             return True
-        if is_mxfp4_expert_param(param):
+        if is_packed_expert_param(param):
             return True
         # Standard MoE weights are 3D (num_experts, in, out).
         if isinstance(param, (nn.Parameter, torch.Tensor)) and param.ndim in (2, 3):
@@ -3938,6 +3966,9 @@ def _log_moe_lora_stash_unread_once(experts_module, parameter_name: str) -> None
     """One message per experts class and parameter, the first time the stash goes unread."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
+    # Not while tracing: a guard on the set's contents recompiled the caller once it was logged.
+    if torch.compiler.is_compiling():
+        return
     key = (type(experts_module).__name__, parameter_name)
     if key in _MOE_LORA_STASH_UNREAD_LOGGED:
         return
@@ -4318,7 +4349,7 @@ def _can_fold_moe_lora_through_peft(experts_module, parameter_name: str) -> bool
         return False
     if HAS_BNB and Params4bit is not None and isinstance(param, Params4bit):
         return False
-    if is_mxfp4_expert_param(param):
+    if is_packed_expert_param(param):
         return False
     return True
 
@@ -5417,8 +5448,8 @@ def forward_native_grouped_mm(
     """Native PyTorch grouped-GEMM MoE forward via torch._grouped_mm (no Triton; needs runtime support)."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    # Runtime safety check (defense in depth).
-    if not _check_torch_grouped_mm_supported():
+    # Runtime safety check (defense in depth); packed NVFP4 / MXFP8 stacks fall back to a per-group loop instead.
+    if not _check_torch_grouped_mm_supported() and not _moe_uses_new_packed_expert_weights(self):
         # Compute Capability is CUDA-only; on XPU it would mask this message.
         if torch.cuda.is_available():
             major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())

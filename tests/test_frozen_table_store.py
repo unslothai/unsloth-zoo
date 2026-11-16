@@ -665,6 +665,10 @@ def tiny_qwen4_fp8(tiny_qwen4, tmp_path_factory):
                 new[k] = v
                 if k.endswith(".weight") and v.dim() == 2:
                     linears.add(k[: -len(".weight")])
+                if ".mlp.experts." in k:
+                    # transformers fuses the per-expert linears into one `experts` module; with a GPU visible it
+                    # keeps FP8 and swaps that module for FP8Experts, reading the unscaled bf16 weights as FP8 (NaN).
+                    linears.add(k.split(".mlp.experts.")[0] + ".mlp.experts")
         if index[shard_keys[0]] == fn:
             new[prefix + ".weight_scale"] = scale
         save_file(new, str(out / fn), metadata={"format": "pt"})

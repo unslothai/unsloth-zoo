@@ -348,3 +348,89 @@ def test_gradient_checkpointing_keeps_shared_state_grads_under_a_reentrant_shim(
     assert g0.keys() == g1.keys()
     for name in g0:
         torch.testing.assert_close(g0[name], g1[name], rtol = 1e-4, atol = 1e-6, msg = name)
+
+
+def test_gradient_checkpointing_uses_the_bound_non_reentrant_wrapper(impl, monkeypatch):
+    """Unsloth binds a non-reentrant wrapper (it offloads the saved inputs for use_gradient_checkpointing="unsloth")
+    as each layer's _gradient_checkpointing_func; the replaying layer must checkpoint through it, not around it."""
+    _patches()
+    import functools
+    import torch.utils.checkpoint as ckpt
+
+    pristine = ckpt.checkpoint
+    calls = []
+
+    def wrapper(function, *args, **kwargs):
+        calls.append(kwargs.get("use_reentrant"))
+        kwargs["use_reentrant"] = False
+        return pristine(function, *args, **kwargs)
+
+    wrapper._unsloth_original = pristine
+    wrapper._unsloth_offloads = True
+    monkeypatch.setattr(ckpt, "_unsloth_pristine_checkpoint", pristine, raising = False)
+    model = _tiny_model(impl)
+    ids = torch.randint(0, 256, (2, 24), generator = torch.Generator().manual_seed(0))
+    loss0, g0 = _grads(model, ids, False)
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
+    for module in model.modules():
+        if getattr(module, "_gradient_checkpointing_func", None) is not None:
+            module._gradient_checkpointing_func = functools.partial(wrapper, use_reentrant = False)
+    model.zero_grad(set_to_none = True)
+    model.train()
+    out = model(input_ids = ids, labels = ids, use_cache = False)
+    out.loss.backward()
+    assert calls == [False] * model.config.num_hidden_layers
+    g1 = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
+    torch.testing.assert_close(loss0, out.loss.detach())
+    assert g0.keys() == g1.keys()
+    for name in g0:
+        torch.testing.assert_close(g0[name], g1[name], rtol = 1e-4, atol = 1e-6, msg = name)
+
+
+@pytest.mark.parametrize("offload", [True, False], ids = ["unsloth", "true"])
+def test_unsloth_gc_offloads_after_the_smart_patch_captured_the_pristine_checkpoint(impl, monkeypatch, offload):
+    """use_gradient_checkpointing="unsloth" at max_seq_length >= 512: Unsloth patches its smart checkpointing first,
+    which captures torch's pristine checkpoint, then forces DeepSeek-V4.1 onto its non-reentrant wrapper (the only
+    entry to the activation-offload hooks). The replaying layer must still offload ("unsloth"), and not for True."""
+    _patches()
+    import functools
+    import torch.utils.checkpoint as ckpt
+    from unsloth_zoo import gradient_checkpointing as gc_module
+
+    monkeypatch.setattr(ckpt, "_unsloth_pristine_checkpoint", None, raising = False)
+    gc_module._capture_pristine_checkpoint_once()  # what patch_unsloth_smart_gradient_checkpointing does first
+    assert ckpt._unsloth_pristine_checkpoint is not None
+    pristine = ckpt.checkpoint
+
+    def nonre_checkpoint(function, *args, **kwargs):  # unsloth/models/vision.py's _nonre_checkpoint
+        kwargs["use_reentrant"] = False
+        if not offload:
+            return pristine(function, *args, **kwargs)
+        with gc_module.non_reentrant_offload_hooks():
+            return pristine(function, *args, **kwargs)
+
+    nonre_checkpoint._unsloth_original = pristine
+    nonre_checkpoint._unsloth_offloads = offload
+    monkeypatch.setattr(ckpt, "checkpoint", nonre_checkpoint)
+    # CPU stands in for the device: count CPU activations as offloadable.
+    monkeypatch.setattr(gc_module.NonReentrantActivationOffloader, "_on_host", lambda self, x: x.numel() == 0)
+    model = _tiny_model(impl)
+    ids = torch.randint(0, 256, (2, 24), generator = torch.Generator().manual_seed(0))
+    loss0, g0 = _grads(model, ids, False)
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
+    for module in model.modules():
+        if getattr(module, "_gradient_checkpointing_func", None) is not None:
+            module._gradient_checkpointing_func = functools.partial(nonre_checkpoint, use_reentrant = False)
+    gc_module.get_activation_offload_stats(reset = True)
+    model.zero_grad(set_to_none = True)
+    model.train()
+    out = model(input_ids = ids, labels = ids, use_cache = False)
+    out.loss.backward()
+    stats = gc_module.get_activation_offload_stats(reset = True)
+    assert (stats["offloaded"] > 0) == offload, stats
+    assert stats["restored"] == stats["offloaded"], stats
+    g1 = {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
+    torch.testing.assert_close(loss0, out.loss.detach())
+    assert g0.keys() == g1.keys()
+    for name in g0:
+        torch.testing.assert_close(g0[name], g1[name], rtol = 1e-4, atol = 1e-6, msg = name)

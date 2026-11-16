@@ -110,6 +110,45 @@ class _ReplayShared(dict):
     __slots__ = ("_snapshot",)
 
 
+def _warm_triton_moe_configs(layer, hidden_states):
+    """Unsloth's Triton MoE backend tunes its kernel configs on an experts module's first forward. Inside a
+    torch.compile region that first call graph-breaks at the (compiler-disabled) tuner and later calls do not, so the
+    non-reentrant checkpoint's recompute traced a different graph than its forward and its saved tensors did not
+    match ("Recomputed values ... have different metadata"). One eager token through the experts before the first
+    checkpointed forward settles the configs, so both passes trace the same graph."""
+    if torch.compiler.is_compiling():
+        return
+    mlp = getattr(layer, "mlp", None)
+    experts = getattr(mlp, "experts", None)
+    while experts is not None and hasattr(experts, "base_layer"):
+        experts = experts.base_layer
+    if (
+        experts is None
+        or not getattr(type(experts), "_unsloth_already_patched", False)
+        or getattr(experts, "_unsloth_moe_configs", None) is not None
+        or getattr(experts, "_unsloth_moe_configs_warmed", False)
+    ):
+        return
+    experts._unsloth_moe_configs_warmed = True
+    try:
+        from unsloth_zoo.temporary_patches.moe_utils import get_forward_moe_backend
+
+        backend = get_forward_moe_backend().__globals__
+        if backend["select_moe_backend"]() != "unsloth_triton":
+            return
+        weight = experts.gate_up_proj
+        top_k = int(getattr(getattr(mlp, "gate", None), "top_k", 1))
+        dtype = hidden_states.dtype if isinstance(hidden_states, torch.Tensor) else weight.dtype
+        x = torch.zeros(1, int(experts.hidden_dim), device = weight.device, dtype = dtype)
+        index = torch.zeros(1, top_k, device = weight.device, dtype = torch.long)
+        with torch.no_grad():
+            backend["forward_triton_grouped_gemm"](experts, x, index, torch.zeros(1, top_k, device = weight.device))
+    except Exception:
+        # Not ours to fail the step over: the first traced call then tunes as before.
+        pass
+pass
+
+
 def patch_deepseek_v41_gradient_checkpointing():
     modeling = _modeling()
     if modeling is None:
@@ -139,6 +178,7 @@ def patch_deepseek_v41_gradient_checkpointing():
         if not (self.gradient_checkpointing and self.training) or shared is None or not stateful:
             with _compressor_lora(self):
                 return base_call(self, *args, **kwargs)
+        _warm_triton_moe_configs(self, args[0] if args else kwargs.get("hidden_states"))
         snapshot = dict(shared.items())
         if isinstance(shared, dict):
             replay = _ReplayShared(shared)
@@ -170,7 +210,7 @@ def patch_deepseek_v41_gradient_checkpointing():
         # Non-reentrant, always: the source layer's shared KV tensors leave through `replay`, not through the
         # checkpoint's outputs. A reentrant checkpoint (Unsloth's smart checkpointer forces one) would make them
         # under no_grad, and the layers that read them would send their source projections no gradient.
-        out = _non_reentrant_checkpoint()(partial(run, **kwargs), *args, use_reentrant = False)
+        out = _non_reentrant_checkpoint(self)(partial(run, **kwargs), *args, use_reentrant = False)
         shared.clear()
         shared.update(replay)
         return out
@@ -190,9 +230,15 @@ pass
 TEMPORARY_PATCHES.append(patch_deepseek_v41_gradient_checkpointing)
 
 
-def _non_reentrant_checkpoint():
-    """torch's own checkpoint, also when Unsloth's smart checkpointing replaced torch.utils.checkpoint.checkpoint."""
+def _non_reentrant_checkpoint(layer = None):
+    """The non-reentrant checkpoint for this layer: Unsloth's wrapper when the model bound one (it offloads the saved
+    inputs for use_gradient_checkpointing = "unsloth" and forces use_reentrant = False), else torch's own, also when
+    Unsloth's smart (reentrant) checkpointing replaced torch.utils.checkpoint.checkpoint."""
     import torch.utils.checkpoint as ckpt
+    bound = getattr(layer, "_gradient_checkpointing_func", None) or ckpt.checkpoint
+    bound = getattr(bound, "func", bound)  # functools.partial(checkpoint, **gradient_checkpointing_kwargs)
+    if hasattr(bound, "_unsloth_offloads"):
+        return bound
     return (getattr(ckpt, "_unsloth_pristine_checkpoint", None) or getattr(ckpt, "_old_checkpoint", None)
             or ckpt.checkpoint)
 
@@ -255,6 +301,9 @@ def _grouped_lora_linear_cls():
     from peft.tuners.lora.layer import Linear as LoraLinear
 
     class DeepseekV41GroupedLoraLinear(LoraLinear):
+        # Same layout as unsloth's grouped LoRA (shared lora_A, per-group lora_B): tensor parallel reads the flag.
+        _unsloth_grouped_lora = True
+
         def forward(self, x, *args, **kwargs):
             if (
                 self.disable_adapters
@@ -514,11 +563,7 @@ def _pooled_reads_weight(cls):
     return _POOLED_READS_WEIGHT[cls]
 
 
-# ----------------------------------------------------------------------------------------------
-# Engram tables on disk
-# ----------------------------------------------------------------------------------------------
-# Checkpoint keys of an engram table: DeepSeek-native (`layers.<i>.engram.embed.{weight,scale}`, the released
-# files) or the port's own names (`engram_tables.<i>.{weight,weight_scale_inv}`, a transformers save).
+# Engram table keys: DeepSeek-native (released files) or the port's own names (a transformers save).
 _ENGRAM_UNEXPECTED = (
     r"(^|\.)engram_tables\.\d+\.(weight|weight_scale_inv|scale)$",
     r"(^|\.)layers\.\d+\.engram\.embed\.(weight|scale)$",
@@ -537,8 +582,7 @@ def _engram_table_wanted(nbytes):
 
 
 def _fp8_weights_kept(model, quantizer=None):
-    """True when the load kept FP8 weights (no dequantize): the port's engram lookup then returns float32 rows.
-    `quantizer` is the load's (transformers sets model.hf_quantizer only after the weights are in)."""
+    """True when the load kept FP8 weights; `quantizer` is passed since model.hf_quantizer is set after loading."""
     if quantizer is None:
         quantizer = getattr(model, "hf_quantizer", None)
     qc = getattr(quantizer, "quantization_config", None)
@@ -550,8 +594,7 @@ def _fp8_weights_kept(model, quantizer=None):
 
 
 def _frozen_engram(modeling, key, emb):
-    """An UnslothFrozenTableEmbedding standing in for one DeepseekV41EngramEmbedding, bound to the checkpoint
-    after the load: fp8 rows x per-32-channel e8m0 scales (the released files), or plain rows (a bf16 copy)."""
+    """Frozen-table replacement for one DeepseekV41EngramEmbedding: fp8 rows x e8m0 scales, or plain bf16 rows."""
     from unsloth_zoo.frozen_table_store import UnslothFrozenTableEmbedding, make_fp8_block_decode
     block = int(getattr(emb, "block_size", 32))
     table = UnslothFrozenTableEmbedding(
@@ -569,15 +612,13 @@ def _frozen_engram(modeling, key, emb):
     table.make_decode = lambda planes: make_fp8_block_decode(block_size=block) if "scale" in planes else None
 
     def after_bind(model, planes, quantizer=None, table=table):
-        # DeepseekV41EngramEmbedding.forward: float32 rows when the fp8 table is kept (dequantize=False); a
-        # dequantized load folded the scales into rows of the model dtype, which the lookup returns as is.
+        # float32 rows when the fp8 table is kept; a dequantized load returns rows in the model dtype.
         if "scale" not in planes:
             return
         if _fp8_weights_kept(model, quantizer):
             table.table_dtype = torch.float32
         else:
-            # The model holds dequantized rows and drops its quantization config: a save must write those rows,
-            # not fp8 rows + scales that a reload would read as plain rows.
+            # Dequantized rows: a save must write them, not fp8 rows + scales a reload would read as plain rows.
             table.export_decoded = "weight"
 
     table.after_bind = after_bind
@@ -602,10 +643,8 @@ def make_deepseek_v41_engram_table(layer_key, num_embeddings, head_dim, block_si
 
 
 def patch_deepseek_v41_engram_table():
-    """Build the two ~98 GB engram tables as parameter-free UnslothFrozenTableEmbedding modules on a checkpoint
-    load, streamed from the checkpoint files (mmap + MADV_RANDOM) instead of loading into host RAM, the same store
-    as Qwen3.8-Flash-Next's n-gram table. UNSLOTH_FROZEN_TABLE=gpu (or auto on a small table) keeps the port's
-    DeepseekV41EngramEmbedding."""
+    """Stream the two ~98 GB engram tables from the checkpoint (mmap) instead of host RAM.
+    UNSLOTH_FROZEN_TABLE=gpu (or auto on a small table) keeps the port's DeepseekV41EngramEmbedding."""
     modeling = _modeling()
     if modeling is None:
         return False

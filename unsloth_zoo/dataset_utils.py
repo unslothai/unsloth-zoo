@@ -947,6 +947,43 @@ def train_on_responses_only(
     mask_out_firsts  = frozenset(mask_out_lookup) if len(mask_out_lookup) > 4 else None
 
     def _train_on_responses_only(examples):
+        # Packed rows (TRL's seq_lengths): mask each document alone, as if unpacked.
+        seq_lengths_ = examples.get("seq_lengths") if hasattr(examples, "get") else None
+        if seq_lengths_ is None:
+            return _train_on_rows(examples)
+        input_ids_ = examples["input_ids"]
+        use_tensors = type(input_ids_) is torch_Tensor
+        rows_ = input_ids_.tolist() if hasattr(input_ids_, "tolist") else input_ids_
+        old_ = examples.get("labels")
+        if old_ is not None and hasattr(old_, "tolist"):
+            old_ = old_.tolist()
+        docs, doc_labels, splits = [], [], []
+        for r, (row, lengths) in enumerate(zip(rows_, seq_lengths_)):
+            # None: an unpacked row beside packed ones (concatenate_datasets fills the column).
+            if lengths is None:
+                lengths = [len(row)]
+            lengths = [int(x) for x in (lengths.tolist() if hasattr(lengths, "tolist") else lengths)]
+            if sum(lengths) != len(row):
+                lengths = [len(row)]
+            start = 0
+            for length in lengths:
+                docs.append(row[start : start + length])
+                if old_ is not None:
+                    doc_labels.append(None if old_[r] is None else old_[r][start : start + length])
+                start += length
+            splits.append(len(lengths))
+        batch = {"input_ids": docs}
+        if old_ is not None:
+            batch["labels"] = doc_labels
+        masked = _train_on_rows(batch)["labels"]
+        out, i = [], 0
+        for count in splits:
+            out.append([t for doc in masked[i : i + count] for t in doc])
+            i += count
+        return {"labels": torch.tensor(out, dtype = torch.int64) if use_tensors else out}
+    pass
+
+    def _train_on_rows(examples):
         input_ids_ = examples["input_ids"]
         use_tensors = False
         if type(input_ids_) is torch_Tensor:
@@ -3069,6 +3106,11 @@ def sft_prepare_dataset(
                     _completion = _completion + _eos_token
                 return _completion
 
+            # max_length None is no limit; truncation_mode picks the kept side, as TRL and messages rows below do.
+            pc_has_limit = isinstance(max_seq_length, int)
+            pc_cut = slice(-max_seq_length, None) if pc_has_limit and max_seq_length > 0 and \
+                getattr(args, "truncation_mode", "keep_start") == "keep_end" else slice(None, max_seq_length)
+
             def _pc_result(prompt_ids, pc_ids, pc_masks, labels):
                 n_prompt = _prompt_completion_boundary(prompt_ids, pc_ids)
                 completion_mask = [0] * n_prompt + [1] * (len(pc_ids) - n_prompt)
@@ -3078,8 +3120,10 @@ def sft_prepare_dataset(
                         result["assistant_masks"] = [int(x != -100) for x in labels]
                     else:
                         result["assistant_masks"] = list(pc_masks)
-                if do_truncation and max_seq_length > 0:
-                    result = {k: v[:max_seq_length] for k, v in result.items()}
+                # unsloth's sft_trainer_prepare_dataset requires this exact guard line: keep it verbatim.
+                if pc_has_limit:
+                    if do_truncation and max_seq_length > 0:
+                        result = {k: v[pc_cut] for k, v in result.items()}
                 if _needs_token_type_ids:
                     result["token_type_ids"] = [0] * len(result["input_ids"])
                 return result
