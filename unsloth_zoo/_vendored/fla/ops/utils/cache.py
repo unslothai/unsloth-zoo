@@ -62,6 +62,51 @@ class FlaCacheMode(enum.Enum):
 FLA_CACHE_MODE: FlaCacheMode = FlaCacheMode.from_env()
 logger = logging.getLogger(__name__)
 
+# Unsloth: a cold autotune key compiles every config before benchmarking it, and those compiles
+# ran one at a time: most of a cold first Qwen3.5 / Qwen3.6 training step. Triton releases the
+# GIL while compiling, so the configs are compiled together on a thread pool through Triton's
+# AsyncCompileMode (Triton >= 3.5) and the benchmark then finds them compiled. The configs and
+# the benchmark are unchanged. UNSLOTH_FLA_PARALLEL_COMPILE=0 turns it off.
+try:
+    from triton.runtime._async_compile import AsyncCompileMode as _AsyncCompileMode
+except Exception:
+    _AsyncCompileMode = None
+
+
+def _parallel_compile_threads() -> int:
+    if _AsyncCompileMode is None or os.environ.get("UNSLOTH_FLA_PARALLEL_COMPILE", "1") == "0":
+        return 0
+    try:
+        n = len(os.sched_getaffinity(0))
+    except Exception:
+        n = os.cpu_count() or 1
+    return min(n, 16)
+
+
+def _precompile_configs(autotuner, args, kwargs, configs) -> None:
+    """Compile every config autotune is about to benchmark, in parallel; compile errors are left
+    for the benchmark itself to meet, exactly as a serial compile would."""
+    threads = _parallel_compile_threads()
+    if threads < 2 or len(configs) < 2:
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    try:
+        with ThreadPoolExecutor(min(threads, len(configs)), thread_name_prefix = "fla_compile") as pool:
+            try:
+                mode = _AsyncCompileMode(pool, ignore_errors = True)
+            except TypeError:  # Triton 3.5: no ignore_errors; a failed config raises on exit, the rest resolve lazily
+                mode = _AsyncCompileMode(pool)
+            with mode:
+                for config in configs:
+                    current = dict(kwargs, **config.all_kwargs())
+                    current["warmup"] = True
+                    try:
+                        autotuner.fn.run(*args, **current)
+                    except Exception:
+                        pass
+    except Exception as exc:
+        logger.debug("Parallel autotune compile skipped: %r", exc)
+
 
 def sanitize_gpu_name(gpu_name: str) -> str:
     sanitized = re.sub(r"[^0-9A-Za-z]+", "_", gpu_name)
@@ -378,6 +423,19 @@ class CachedAutotuner(Autotuner):
             if self.should_check_fla_cache(key):
                 self.maybe_load_cached_config(key)
         return super().run(*args, **kwargs)
+
+    def prune_configs(self, kwargs, *args, **kw):
+        # Unsloth: Autotuner.run prunes once per cold key, right before benchmarking the result.
+        configs = super().prune_configs(kwargs, *args, **kw)
+        self._unsloth_to_compile = configs
+        return configs
+
+    def _bench(self, *args, config, **meta):
+        # Unsloth: the first benchmark of a round compiles all of the round's configs in parallel.
+        configs = self.__dict__.pop("_unsloth_to_compile", None)
+        if configs is not None:
+            _precompile_configs(self, args, meta, configs)
+        return super()._bench(*args, config=config, **meta)
 
     def maybe_load_cached_config(self, key: AutotuneKey):
         best_config = load_cached_config(self.kernel_name, key)
