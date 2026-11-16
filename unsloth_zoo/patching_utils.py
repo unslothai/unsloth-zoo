@@ -513,16 +513,14 @@ def _cast_large_param(param, dtype):
 
 
 def _storage_free(t):
-    # Unsloth's pipeline_sharded_loading stand-in for a weight another rank loads: one element expanded.
+    # pipeline_sharded_loading stand-in: one element expanded.
     return t.dim() > 0 and t.numel() > 1 and not any(t.stride())
 
 
 def _cast_data(t, dtype):
-    """`t.data = t.data.to(dtype)`, keeping a storage-free stand-in storage-free (a cast would materialize it)."""
     if t.dtype == dtype:
         return
     if _storage_free(t) and t.is_floating_point():
-        # Cast the one stored element and expand it back: same values, still storage-free.
         scalar = t.data.as_strided((), (), t.data.storage_offset())
         t.data = scalar.to(dtype).expand(t.shape)
     else:
@@ -536,7 +534,6 @@ def _cast_storage_free(module, dtype):
 
 
 def _module_to(module, dtype):
-    """`module.to(dtype)` that keeps storage-free stand-ins storage-free."""
     _cast_storage_free(module, dtype)
     module.to(dtype)
 

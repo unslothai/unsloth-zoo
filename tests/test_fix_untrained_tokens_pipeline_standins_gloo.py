@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""fix_untrained_tokens on a per-stage pipeline load: pipeline rank 0 holds the embedding and a storage-free
-stand-in for the lm_head, the last rank the reverse. Each rank must reset exactly the rows a one-process run resets
-in the matrix it holds, and judge the lm_head only on the rows the embedding marks: treating the stand-in embedding
-as all-untrained copied the whole lm_head to the host (11 GiB on Qwen3.8-27B) and could flag other rows."""
+"""fix_untrained_tokens on a per-stage pipeline load must match a one-process run on each rank's held matrix,
+without copying the whole lm_head to the host (11 GiB on Qwen3.8-27B)."""
 
 import multiprocessing
 import os
@@ -104,7 +102,7 @@ def _worker(rank, init_file, out):
     dist.all_reduce = counting_all_reduce
     try:
         results = {}
-        # Warm every lazy import (torch.distributed.tensor, numpy paths) before tracing host memory.
+        # Warm lazy imports before tracing host memory.
         tokenizer_utils.fix_untrained_tokens(_rank_model("split", rank), _Tokenizer(), DATA)
         for layout in LAYOUTS:
             model = _rank_model(layout, rank)
@@ -123,7 +121,6 @@ def _worker(rank, init_file, out):
             res["head"] = model.lm_head.weight.detach().clone()
             results[layout] = res
         # No per-stage mark (DDP / FSDP2 replicas, one process): never a collective, even in a process group.
-        # Only rank 0 calls it: entering a collective would time out.
         if rank == 0:
             del calls[:]
             embed, head = _weights()

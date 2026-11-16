@@ -537,18 +537,15 @@ pass
 
 
 def _storage_free(t):
-    # A pipeline rank's stand-in for the embedding / lm_head another rank holds: one element expanded.
+    # Pipeline stand-in for a matrix another rank holds: one element expanded.
     return t.dim() > 0 and t.numel() > 1 and not any(t.stride())
 
 
-# Unsloth's per-stage pipeline loader (pipeline_sharded_loading) marks the loaded model with this on every rank.
 _PER_STAGE_MARK = "_unsloth_pp_preload"
 
 
 def _per_stage_pipeline(model):
-    """Every rank of a per-stage pipeline load: the ranks hold the embedding / lm_head rows between them, so they
-    judge them together. Decided by the loader's mark, which all ranks share, never by this rank's stand-ins
-    (a rank may hold both matrices). Never True without a process group (DDP / FSDP2 / one process never are)."""
+    # Use the loader's mark (shared by all ranks), never local stand-ins: a rank may hold both matrices.
     import torch.distributed as dist
     if not (dist.is_available() and dist.is_initialized()):
         return False
@@ -556,8 +553,6 @@ def _per_stage_pipeline(model):
 
 
 def _and_over_ranks(mask, split):
-    """Per-stage pipeline loads hold the embedding and the lm_head on different ranks, each judging only the
-    rows of the matrix it has (all True for a stand-in): AND over every rank gives the one-process mask."""
     if not split:
         return mask
     import torch.distributed as dist
@@ -625,7 +620,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     min_size = min(embedding_matrix.shape[0], lm_head_matrix.shape[0])
     embedding_matrix = embedding_matrix[:min_size]
     lm_head_matrix   = lm_head_matrix  [:min_size]
-    # Per-stage pipeline load: this rank may hold only one of the two (the other is a storage-free stand-in).
     embedding_free, lm_head_free = _storage_free(embedding_matrix), _storage_free(lm_head_matrix)
     split = _per_stage_pipeline(model)
     if (embedding_free or lm_head_free) and not split:
@@ -844,7 +838,6 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
         "Unsloth: Setting embed_tokens & lm_head untrained tokens to "\
         "mean(trained) to counteract NaNs during training."
     )
-    # Each matrix is reset from its own rows; a rank leaves the stand-in of the one it does not hold.
     if not embedding_free:
         embedding_matrix[where_untrained] = mean_embedding.to(embedding_matrix.dtype)
     if not lm_head_free:
