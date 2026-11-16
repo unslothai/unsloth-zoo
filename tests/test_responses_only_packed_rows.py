@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""train_on_responses_only on packed rows (TRL's seq_lengths column) masks each document as if it
-were unpacked: last_response_only keeps every document's last turn, not only the row's; CPU-only."""
+"""Packed rows (TRL seq_lengths) mask each document as if unpacked, incl. last_response_only."""
 
 from datasets import Dataset
 
