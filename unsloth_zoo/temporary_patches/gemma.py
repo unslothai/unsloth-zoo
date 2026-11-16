@@ -346,7 +346,16 @@ def patch_Gemma3Processor():
             text_replacement_offsets = [[] for _ in text]
             boi_pattern = re.escape(self.boi_token)
             expanded_text = []
-            for batch_idx, (prompt, images_for_item, num_crops_for_item) in enumerate(zip(text, batched_images, batch_num_crops)):
+            # num_crops is per row, or flattened per image when rows hold different image counts: never drop a row.
+            flat_crops = batch_num_crops if isinstance(batch_num_crops, (list, tuple)) else [batch_num_crops]
+            if len(flat_crops) != len(text):
+                row_crops, first = [], 0
+                for images_for_item in batched_images:
+                    row_crops.append(list(flat_crops[first : first + len(images_for_item)]))
+                    first += len(images_for_item)
+                flat_crops = row_crops
+            for batch_idx, (prompt, images_for_item) in enumerate(zip(text, batched_images)):
+                num_crops_for_item = flat_crops[batch_idx] if batch_idx < len(flat_crops) else []
                 matches = list(re.finditer(boi_pattern, prompt))
 
                 if len(images_for_item) != len(matches):
