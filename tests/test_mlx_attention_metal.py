@@ -1188,10 +1188,11 @@ def test_launches_that_mlx_0_32_4_refuses_run_through_the_wrapper(case):
     if not mx.metal.is_available():
         pytest.skip("needs Metal")
     args = [sys.executable, "-c", _M1_M2_CALL, *map(str, _REFUSED_LAUNCHES[case])]
-    stock = subprocess.run([*args, "stock"], capture_output=True, text=True, timeout=600)
+    run = functools.partial(subprocess.run, capture_output=True, text=True, timeout=120)
+    stock = run([*args, "stock"])
     if stock.returncode == 0:
         pytest.skip(f"{nax._gpu_architecture()!r} launches {case}")
     assert "threads per threadgroup" in stock.stderr, stock.stderr[-2000:]
-    zoo = subprocess.run([*args, "zoo"], capture_output=True, text=True, timeout=600)
+    zoo = run([*args, "zoo"])
     assert zoo.returncode == 0, (nax._gpu_architecture(), zoo.stderr[-2000:])
     assert float(zoo.stdout.split("MAXERR")[-1]) <= (1e-4 if case.endswith("fp32") else 2e-3), zoo.stdout
