@@ -908,21 +908,18 @@ def test_large_moe_layers_prefill_as_chunked_on_full_tables(tmp_path, monkeypatc
     with zoo_offload.capture_prefill_rows(4096, copy) as captured:
         hidden = forward(tokens, cache)
         mx.eval(hidden, [c.state for c in cache])
-    # Each layer's cache at a step boundary, as Studio's 2048-grid prefix reuse keeps it (V4.1's one shared cache).
     assert list(captured) == [id(c) for c in cache]
     for got, want in zip(captured.values(), boundary, strict = True):
         assert all(np.array_equal(a, b) for a, b in zip(got, want, strict = True))
-    assert all(glu._slots.misses == 0 for glu in switches)  # full tables, the slots untouched
+    assert all(glu._slots.misses == 0 for glu in switches)
     assert zoo_offload.wide_prefill_step(lm) == 2048
     np.testing.assert_array_equal(_bits(hidden), _bits(mx.concatenate(expected, axis = 1)))
     for (_, got), (_, want) in zip(tree_flatten([c.state for c in cache]), tree_flatten([c.state for c in expected_cache]), strict = True):
         np.testing.assert_array_equal(*(_bits(a) if isinstance(a, mx.array) else a for a in (got, want)))
-    # The cache a wide call leaves decodes on as the chunked prefill's does.
     step = tokens[:, -1:]
     np.testing.assert_array_equal(_bits(forward(step, cache)), _bits(forward(step, expected_cache)))
     assert any(glu._slots.misses for glu in switches)
-    # A call no wider than a step runs whole and fills a request it ends at; then a narrow or wide call on that
-    # reused prefix captures at its own offset.
+    # A step-wide call runs whole and still captures; a narrow or wide call on that prefix captures at its offset.
     for width in (2048, tokens.shape[1] - 2048):
         short_cache = lm.make_cache()
         for want, part in ((first, tokens[:, :2048]), (boundary, tokens[:, 2048:2048 + width])):
@@ -932,7 +929,7 @@ def test_large_moe_layers_prefill_as_chunked_on_full_tables(tmp_path, monkeypatc
             for got, expect in zip(short.values(), want, strict = True):
                 assert all(np.array_equal(a, b) for a, b in zip(got, expect, strict = True))
     if family == "deepseek_v41":
-        assert not hasattr(cache[0], "unsloth_wide_steps")  # no block's steps outlive the call
+        assert not hasattr(cache[0], "unsloth_wide_steps")
         end = zoo_offload._DeepseekV41Steps.end
         def failing(steps, start):
             if steps.layer == 2 and start:
@@ -941,9 +938,9 @@ def test_large_moe_layers_prefill_as_chunked_on_full_tables(tmp_path, monkeypatc
         monkeypatch.setattr(zoo_offload._DeepseekV41Steps, "end", failing)
         with pytest.raises(MemoryError):
             forward(tokens, failed := lm.make_cache())
-        assert not hasattr(failed[0], "unsloth_wide_steps")  # nor a pass that failed partway
+        assert not hasattr(failed[0], "unsloth_wide_steps")
         monkeypatch.setattr(zoo_offload._DeepseekV41Steps, "end", end)
-        # A batch cache, even of one row, runs the call whole, as before these blocks stepped.
+        # A batch cache, even of one row, runs whole.
         batch = lambda: [language.BatchDeepseekV41Cache([language.DeepseekV41Cache(len(lm.layers))])]
         language = pytest.importorskip("mlx_vlm.models.deepseek_v41.language")
         got = forward(tokens, batch())

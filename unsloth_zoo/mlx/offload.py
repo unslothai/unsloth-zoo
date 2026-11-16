@@ -661,8 +661,7 @@ def _deepseek_v4_step_mask(layer, arguments):
 
 
 class _DeepseekV41Steps:
-    """DeepSeek V4.1 blocks share one cache that only the model advances: each step sets the offset and replays the
-    handoff the previous block left at that step."""
+    """V4.1 blocks share one cache only the model advances: each step sets its offset and replays the previous block's handoff."""
 
     @staticmethod
     def applies(cache):
@@ -1277,7 +1276,7 @@ class _WideLayer:
                 shared.finish(done)
             if table:
                 switch._narrow()
-        if isinstance(outputs[0], tuple):  # the token-indexed outputs a layer hands the next
+        if isinstance(outputs[0], tuple):
             return tuple(None if parts[0] is None else mx.concatenate(parts, axis = axes[first]) for parts in zip(*outputs))
         return mx.concatenate(outputs, axis = axes[first])
 
