@@ -1105,8 +1105,8 @@ class TreeBudget:
     Mac's cycle costs measured at load (``{rows: seconds}``, as `warm_speculative_rounds` times them) and the tokens rounds
     actually emitted. A round of the widest tree holds the narrower trees and the chain of its lattice, so each tells what
     they would have emitted on the same text: no calibration of the drafter's probabilities, and until enough such
-    rounds are in, or one in ``PROBE_EVERY`` rounds after, a round runs the widest tree: one in ``PROBE_SETTLED_EVERY``
-    while its rate is under ``PROBE_SETTLED_RATE`` of the best tree's, where each such round loses that gap."""
+    rounds are in a round runs the widest tree. It keeps running unless its rate is under ``PROBE_SETTLED_RATE`` of the
+    best tree's, which then runs, the widest one round in ``PROBE_SETTLED_EVERY``: a nearer tie is within the estimate's noise."""
 
     MIN_SAMPLES = 24
     PROBE_EVERY, PROBE_SETTLED_EVERY, PROBE_SETTLED_RATE = 8, 64, 0.95
@@ -1150,20 +1150,87 @@ class TreeBudget:
             self._since_wide = 0
             return widest
         chain = max(self._rate(self.chains[w], cost, w) for w, cost in self.chain_costs.items())
-        return rows if rate(rows) >= chain else 0
+        if rate(rows) < chain:
+            return 0
+        return rows if settled else widest
+
+
+class TreeCalibration:
+    """How often a draft tree's node is accepted once its parent is, from the selector's q for it and its depth:
+    sigmoid(alpha + beta * logit q), which trees grow best first on. Each depth is refit from the verified children of
+    accepted rows by Newton steps on a ridge toward ``PRIOR``, within bounds: a free fit of a deep row's few records diverges."""
+
+    RECORDS, MIN_RECORDS, REFIT_EVERY, STEPS, HALVINGS = 512, 32, 32, 4, 12
+    ALPHA_BOUND, BETA_BOUNDS = 8.0, (0.1, 4.0)
+    # (alpha, beta) about where DFlash2 selectors' fits settle at every depth: a confident q promises more than it keeps.
+    PRIOR = (-0.5, 0.65)
+
+    def __init__(self, depths: int):
+        self.alpha, self.beta = np.full(depths, self.PRIOR[0]), np.full(depths, self.PRIOR[1])
+        self._logits, self._hits = np.zeros((depths, self.RECORDS)), np.zeros((depths, self.RECORDS))
+        self._seen = [0] * depths
+        self._rounds = 0
+        self.parameters = mx.array(np.stack([self.alpha, self.beta]), mx.float32)
+
+    def observe(self, depths: Sequence[int], parents: Sequence[int], logq: Sequence[float], path: Sequence[int]) -> None:
+        walked = set(path)   # the verified rows the target took, from row 0
+        for row in range(1, len(parents)):
+            if parents[row] in walked:
+                depth = depths[row] - 1
+                at = self._seen[depth] % self.RECORDS
+                q = min(max(math.exp(logq[row]), 1e-6), 1.0 - 1e-6)
+                self._logits[depth, at], self._hits[depth, at] = math.log(q / (1.0 - q)), row in walked
+                self._seen[depth] += 1
+        self._rounds += 1
+        if self._rounds % self.REFIT_EVERY == 0:
+            self._refit()
+
+    def _refit(self) -> None:
+        seen = np.array(self._seen)
+        ready = seen >= self.MIN_RECORDS
+        if not ready.any():
+            return
+        x, y = self._logits, self._hits
+        kept = (np.arange(self.RECORDS) < seen[:, None]).astype(np.float64)
+        alpha, beta = self.alpha, self.beta
+
+        def loss(a, b):
+            z = a[:, None] + b[:, None] * x
+            softplus = np.maximum(z, 0.0) + np.log1p(np.exp(-np.abs(z)))   # np.logaddexp is 5x slower
+            return (kept * (softplus - y * z)).sum(1) + 0.5 * ((a - self.PRIOR[0]) ** 2 + (b - self.PRIOR[1]) ** 2)
+
+        for _ in range(self.STEPS):
+            p = 1.0 / (1.0 + np.exp(-(alpha[:, None] + beta[:, None] * x)))
+            weight, residual = kept * p * (1.0 - p), kept * (p - y)
+            g_alpha, g_beta = alpha - self.PRIOR[0] + residual.sum(1), beta - self.PRIOR[1] + (residual * x).sum(1)
+            h_alpha, h_cross, h_beta = 1.0 + weight.sum(1), (weight * x).sum(1), 1.0 + (weight * x * x).sum(1)
+            det = h_alpha * h_beta - h_cross * h_cross
+            free = beta - (h_alpha * g_beta - h_cross * g_alpha) / det
+            next_beta = np.clip(free, *self.BETA_BOUNDS)
+            # A slope held at a bound leaves the offset its own step, not its share of a step the slope did not take.
+            step = np.where(next_beta == free, (h_beta * g_alpha - h_cross * g_beta) / det, g_alpha / h_alpha)
+            next_alpha = np.clip(alpha - step, -self.ALPHA_BOUND, self.ALPHA_BOUND)
+            # Full Newton steps oscillate between the bounds once records saturate the sigmoid: halve until the loss falls.
+            before, scale = loss(alpha, beta) * (1 + 1e-12), np.ones_like(alpha)   # rounding at the optimum is not a rise
+            for halving in range(self.HALVINGS + 1):
+                worse = loss(alpha + scale * (next_alpha - alpha), beta + scale * (next_beta - beta)) > before
+                if not worse.any():
+                    break
+                scale = np.where(worse, 0.0 if halving == self.HALVINGS else scale / 2, scale)
+            alpha, beta = alpha + scale * (next_alpha - alpha), beta + scale * (next_beta - beta)
+        self.alpha, self.beta = np.where(ready, alpha, self.alpha), np.where(ready, beta, self.beta)
+        self.parameters = mx.array(np.stack([self.alpha, self.beta]), mx.float32)
 
 
 class SizedTreeBudget:
     """Each round's rows on a sparse target, where each row brings its own experts: as many of the round's lattice's best
-    nodes as pay for their rows, from each node's path probability, scaled by how often nodes of its depth were accepted,
-    against each width's cycle as replies measure it. The load's costs, scaled to the reply's context, price the rest."""
+    nodes as add more tokens than their seconds yield at the rate rounds run at, from each node's calibrated path
+    probability and each width's cycle as replies measure it. The load's costs, scaled to the reply's context, price the rest."""
 
-    ALPHA = 1 / 32
     COST_ALPHA = 1 / 8
+    RATE_ALPHA, RATE_ROUNDS = 1 / 64, 16   # until this many rounds set the rate, a round sizes by its own best ratio
     # A gap longer than this many cycles is a reply's start or a plain window, not a width's cycle, unless as many follow it.
     GAP_CYCLES = 3
-    # Accepted over promised by depth at the start, as measured: deeper nodes promise more than they keep.
-    DEPTH_ACCEPTANCE = (0.9, 0.8, 0.65, 0.55, 0.5)
     # A width never verified stays priced by the load's noisy timing, so every few rounds verify the least measured one.
     PROBE_EVERY, PROBE_SETTLED_EVERY, PROBE_SAMPLES = 8, 64, 4
     # A round costs about two plain steps.
@@ -1173,10 +1240,8 @@ class SizedTreeBudget:
     def __init__(self, tree_costs: dict[int, float]):
         self.load_costs = dict(tree_costs)
         self.live = {rows: _Ema() for rows in tree_costs}
-        depths = range(1, max(tree_costs))
-        self.accepted = {depth: 0.5 * self.DEPTH_ACCEPTANCE[min(depth, len(self.DEPTH_ACCEPTANCE)) - 1] for depth in depths}
-        self.promised = {depth: 0.5 for depth in depths}
-        self._nodes, self._last, self._gaps, self._rounds, self._reply = (), None, 0, 0, None
+        self._emitted, self._spent = _Ema(), _Ema()
+        self._last, self._gaps, self._rounds, self._reply = None, 0, 0, None
         self.samples = dict.fromkeys(tree_costs, 0)
 
     def choose(self) -> int:
@@ -1197,14 +1262,16 @@ class SizedTreeBudget:
 
     def size(self, nodes: Sequence[tuple[float, int]]) -> int:
         """The rows to verify, from each node after the anchor, best first: its path probability and depth."""
-        self._nodes = nodes
         if self.pinned:
             return min(self.pinned, len(nodes) + 1)
-        tokens, best, best_rate = 1.0, min(self.load_costs), 0.0
-        for rows, (probability, depth) in enumerate(nodes, 2):
-            tokens += self.accepted[depth] / self.promised[depth] * probability
-            if rows in self.live and (rate := tokens / self._cost(rows)) > best_rate:
-                best, best_rate = rows, rate
+        rate = self._emitted.value / self._spent.value if self._emitted.count >= self.RATE_ROUNDS else None
+        tokens, best, most = 1.0, min(self.load_costs), -math.inf
+        for rows, (probability, _) in enumerate(nodes, 2):
+            tokens += probability
+            if rows in self.live:
+                value = tokens / self._cost(rows) if rate is None else tokens - rate * self._cost(rows)
+                if value > most:
+                    best, most = rows, value
         self._rounds += 1
         stale = min(self.samples, key = self.samples.get)
         every = self.PROBE_EVERY if self.samples[stale] < self.PROBE_SAMPLES else self.PROBE_SETTLED_EVERY
@@ -1217,9 +1284,8 @@ class SizedTreeBudget:
 
     def observe(self, rows: int, ranks: Sequence[int], end: float) -> None:
         """A round of the last sized lattice verified ``rows`` rows and walked the nodes taken in the order ``ranks``, by ``end``."""
-        for rank, (probability, depth) in enumerate(self._nodes[: rows - 1], 1):
-            self.accepted[depth] += self.ALPHA * ((rank in ranks) - self.accepted[depth])
-            self.promised[depth] += self.ALPHA * (probability - self.promised[depth])
+        self._emitted.update(1 + len(ranks), self.RATE_ALPHA)
+        self._spent.update(self._cost(rows), self.RATE_ALPHA)
         if self._last is not None:
             if end - self._last < self.GAP_CYCLES * self._cost(rows) or self._gaps >= self.GAP_CYCLES:
                 self.live[rows].update(end - self._last, self.COST_ALPHA)
@@ -1784,8 +1850,8 @@ class SpeculativeEngine:
         row, draft = self._rows[0], self._rows[0].draft
         start, work = time.perf_counter(), first_use_work()
         with mx.stream(self._stream):
-            tree = self.drafter.tree(draft, plan.tree)
-            budget = self.drafter.tree_budget
+            tree = drafted = self.drafter.tree(draft, plan.tree)
+            budget, calibration = self.drafter.tree_budget, self.drafter.tree_calibration
             sizes, sized = isinstance(budget, SizedTreeBudget), []
 
             def size():
@@ -1840,6 +1906,10 @@ class SpeculativeEngine:
             ranks = tree.rank.tolist()
             first_children = next((i for i in range(1, len(rows)) if rows[i] != rows[i - 1] + 1), len(rows)) - 1
             budget.observe(tree.tokens.size, [ranks[r] for r in rows[1:]], first_children)
+        if calibration is not None:
+            # Off the drafted arrays, whose first rows the verified ones are: a slice would be a new op to wait on.
+            verified = (values.tolist()[: tree.tokens.size] for values in (drafted.block.depth, drafted.parent, drafted.logq))
+            calibration.observe(*verified, rows)
         self.controller.record_round(
             replace(plan, tree = 0, trim = False, split = False, rows = (RowPlan("draft", plan.tree - 1),),
                     controller_depth = self.drafter.trained_depth),
@@ -2871,6 +2941,7 @@ class ContextDrafter:
         self.tree_budget: TreeBudget | SizedTreeBudget | None = None
         self.tree_widths: tuple[int, ...] = ()
         self.sized_trees = False
+        self.tree_calibration: TreeCalibration | None = None
 
     @property
     def config(self):
@@ -2957,7 +3028,9 @@ class ContextDrafter:
         # Rows within the trained block read its lattice, which accepts a little more than a deeper block's first rows.
         depth = self.trained_depth if rows <= self.trained_depth + 1 else self.extended_depth
         # A sized round verifies the first rows of its tree, so its rows go out in the order they were taken.
-        return self._draft.tree(anchor, context, cache, depth + 1, rows, scan, self.sized_trees)
+        calibration = self.tree_calibration
+        return self._draft.tree(anchor, context, cache, depth + 1, rows, scan, self.sized_trees,
+                                None if calibration is None else calibration.parameters)
 
     def extension_serves(self, row: ContextRow, depth: int) -> bool:
         """Whether a block of ``depth`` drafts for ``row`` now runs on the sparse producer, the only one deeper rounds are
@@ -3110,6 +3183,8 @@ def _warm_trees(engine: SpeculativeEngine, drafter: ContextDrafter) -> None:
         return
     row = engine._rows[0]
     drafter.tree_budget = None   # A sized budget from an earlier warm-up would resize the widths timed here.
+    depths = max(drafter.tree_widths) - 1
+    drafter.tree_calibration = TreeCalibration(depths)   # the rounds timed here compile the kernel replies grow trees on
 
     def cycles(plan: RoundPlan) -> float:
         seconds = []
@@ -3140,7 +3215,7 @@ def _warm_trees(engine: SpeculativeEngine, drafter: ContextDrafter) -> None:
         return
     finally:
         row.draft.tree_rows, drafter.tree_budget = 0, None
-    trained = drafter.trained_depth
+    trained, drafter.tree_calibration = drafter.trained_depth, TreeCalibration(depths)
     if drafter.sized_trees:
         drafter.tree_budget = SizedTreeBudget(trees)
         return

@@ -7666,6 +7666,21 @@ def _verify_gdn_folded_block(*args, pending, l2 = False, sigmoid = False, tree =
     return _verify_gdn_launch(*args, (k, v, a, b, rows, *(path or [k.shape[1]])), l2, sigmoid, tree)
 
 
+class _TreeRows:
+    """A tree block's attention cache, keeping the keys and values the block appends: `tree_commit` writes a path's rows from
+    them, as reading them back from the cache would have its write copy the buffers whole."""
+
+    def __init__(self, cache):
+        self._cache = cache
+
+    def __getattr__(self, name):
+        return getattr(self._cache, name)
+
+    def update_and_fetch(self, keys, values):
+        self._cache._unsloth_tree_rows = keys, values
+        return self._cache.update_and_fetch(keys, values)
+
+
 def _tree_attention(queries, keys, values, scale, tree):
     return attention.invariant_attention(queries, keys, values, scale, tree.depth, tree.path)
 
@@ -8548,7 +8563,7 @@ def _exact_verify_class(base, name, *cache_key):
             first = mx.full((3, 1, 1), cache.offset, mx.int32) if position_ids is None else position_ids[..., :1]
             position_ids = first + tree.depth
         queries, keys, values, gate, mask = attention._prepare_projected_qkv(
-            q_proj_output, keys, values, cache, position_ids, position_embeddings, mask)
+            q_proj_output, keys, values, cache if tree is None else _TreeRows(cache), position_ids, position_embeddings, mask)
         padded = isinstance(mask, str) and mask == "left_padded_decode"
         if padded:
             mask = None
@@ -8985,8 +9000,9 @@ class TreeBlock(NamedTuple):
         return TreeBlock(self.depth[:rows], self.path[:rows], self.fork[:rows], self.back[:rows])
 
 
-# One threadgroup grows the tree best first over the selector's lattice: a node's score is the sum of log q along its
-# path, q the softmax over the TOP candidates of (unary + edge from its parent). A child never scores above its
+# One threadgroup grows the tree best first over the selector's lattice: a node's score is the sum of log p along its
+# path, p = sigmoid(alpha + beta * logit q) by `calibration`'s [alpha, beta] rows at the node's depth (the last one's past
+# them), q the softmax over the TOP candidates of (unary + edge from its parent). A child never scores above its
 # parent, so the first n nodes taken are a tree for every n. They go out in preorder, siblings best first, with the order
 # each was taken in (`tree_rank`): a row's first child is the row after it. With TAKEN they go out as taken: m rows' tree first.
 _DRAFT_TREE_KERNEL = r"""
@@ -8996,7 +9012,7 @@ _DRAFT_TREE_KERNEL = r"""
     threadgroup float frontier[CAP * TOP];
     threadgroup uint entries[CAP * TOP];
     threadgroup int parents[CAP], tokens[CAP], depths[CAP];
-    threadgroup float totals[CAP];
+    threadgroup float totals[CAP], logqs[CAP], frontier_logq[CAP * TOP];
     threadgroup uint frontier_size, taken, expand;
     if (thread_index_in_threadgroup == 0) {
         frontier_size = 0;
@@ -9006,6 +9022,7 @@ _DRAFT_TREE_KERNEL = r"""
         tokens[0] = anchor[0];
         depths[0] = 0;
         totals[0] = 0.0f;
+        logqs[0] = 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint step = 0; step + 1 < CAP; ++step) {
@@ -9030,8 +9047,13 @@ _DRAFT_TREE_KERNEL = r"""
                 float denominator = 0.0f;
                 for (uint j = 0; j < TOP; ++j) denominator += exp(scores[j] - top);
                 const float log_denominator = log(denominator);
+                const uint depth = min(uint(position), uint(DEPTHS) - 1u);
                 for (uint j = 0; j < TOP; ++j) {
-                    frontier[frontier_size] = totals[node] + scores[j] - top - log_denominator;
+                    const float logq = scores[j] - top - log_denominator;
+                    const float q = clamp(exp(logq), 1e-6f, 1.0f - 1e-6f);
+                    const float z = calibration[depth] + calibration[DEPTHS + depth] * log(q / (1.0f - q));
+                    frontier[frontier_size] = totals[node] - log(1.0f + exp(-z));
+                    frontier_logq[frontier_size] = logq;
                     entries[frontier_size] = node | (j << 8) | (uint(position) << 16);
                     ++frontier_size;
                 }
@@ -9046,6 +9068,7 @@ _DRAFT_TREE_KERNEL = r"""
             tokens[row] = int(ids[p * TOP + j]);
             depths[row] = depths[from] + 1;
             totals[row] = best;
+            logqs[row] = frontier_logq[at];
             expand = row;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -9058,6 +9081,7 @@ _DRAFT_TREE_KERNEL = r"""
             tree_tokens[at] = tokens[at];
             tree_rank[at] = int(at);
             tree_score[at] = totals[at];
+            tree_logq[at] = logqs[at];
             tree_depth[at] = depths[at];
             tree_parent[at] = up;
             for (int d = 0; d < int(A); ++d) tree_path[at * A + d] = d < depths[at] ? tree_path[uint(up) * A + d] : 0;
@@ -9082,6 +9106,7 @@ _DRAFT_TREE_KERNEL = r"""
             tree_tokens[out] = tokens[at];
             tree_rank[out] = int(at);
             tree_score[out] = totals[at];
+            tree_logq[out] = logqs[at];
             tree_depth[out] = depths[at];
             tree_parent[out] = at == 0 ? -1 : rank[parents[at]];
             for (uint d = 0; d < A; ++d) tree_path[out * A + d] = 0;
@@ -9128,8 +9153,9 @@ _DRAFT_TREE_ACCEPT = r"""
 @functools.cache
 def _draft_tree_kernels():
     return (mx.fast.metal_kernel(
-        name = "unsloth_draft_tree", input_names = ["pred", "hidden", "succ", "unary", "ids", "anchor"],
-        output_names = ["tree_tokens", "tree_depth", "tree_parent", "tree_path", "tree_fork", "tree_back", "tree_rank", "tree_score"],
+        name = "unsloth_draft_tree", input_names = ["pred", "hidden", "succ", "unary", "ids", "anchor", "calibration"],
+        output_names = ["tree_tokens", "tree_depth", "tree_parent", "tree_path", "tree_fork", "tree_back", "tree_rank", "tree_score",
+                        "tree_logq"],
         compile_options = {"math_mode": "safe"}, source = _DRAFT_TREE_KERNEL),
         mx.fast.metal_kernel(name = "unsloth_draft_tree_accept", input_names = ["tokens", "parent", "target", "L"],
                              output_names = ["path", "accepted"], source = _DRAFT_TREE_ACCEPT))
@@ -9138,36 +9164,41 @@ def _draft_tree_kernels():
 class DraftTree(NamedTuple):
     """A drafter's best-first tree: `tokens` [n], row 0 the anchor, `parent` [n], the verify's `block`, and the order each
     row's node was taken in (`rank`): the rows of rank below m are this lattice's tree of m rows. `score` is each row's
-    log probability along its path, and `first(m)` is that tree of m rows where the rows are in taking order."""
+    log probability along its path, `logq` the selector's for its last edge, `first(m)` that tree of m rows in taking order."""
     tokens: mx.array
     parent: mx.array
     block: TreeBlock
     rank: mx.array
     score: mx.array = None
+    logq: mx.array = None
 
     def first(self, rows):
-        return DraftTree(self.tokens[:rows], self.parent[:rows], self.block.first(rows), self.rank[:rows], self.score[:rows])
+        return DraftTree(self.tokens[:rows], self.parent[:rows], self.block.first(rows), self.rank[:rows], self.score[:rows],
+                         self.logq[:rows])
 
 
 _TAKEN_TREE_ROWS = 10  # a gated delta layer keeps eight forked states, and the last two rows fork none
 
 
-def draft_tree(selector, hidden, anchor, candidates, unary, rows, taken = False):
-    """The first `rows` nodes of the best-first tree over a block's candidate lattice, for one drafting row."""
+def draft_tree(selector, hidden, anchor, candidates, unary, rows, taken = False, calibration = None):
+    """The first `rows` nodes of the best-first tree over a block's candidate lattice, for one drafting row: best by the
+    selector's own probabilities, or by those `calibration`'s float32 [2, depths] rows of alpha and beta map them to."""
     if taken and rows > _TAKEN_TREE_ROWS:
         raise RuntimeError(f"a draft tree in taking order holds at most {_TAKEN_TREE_ROWS} rows")
     projected = selector.hidden_projection(hidden)
     pred, succ, top = selector.predecessor_codebook.weight, selector.successor_codebook.weight, candidates.shape[-1]
     length, depth = hidden.shape[1], min(rows - 1, candidates.shape[1])
+    if calibration is None:
+        calibration = mx.array([[0.0], [1.0]])
     outputs = _draft_tree_kernels()[0](
-        inputs = [pred, projected, succ, unary, candidates, anchor],
+        inputs = [pred, projected, succ, unary, candidates, anchor, calibration],
         template = [("TOP", top), ("LENGTH", length), ("RANK", projected.shape[-1]), ("FRONTIER", rows), ("A", depth + 1),
-                    ("TAKEN", taken)],
+                    ("TAKEN", taken), ("DEPTHS", calibration.shape[1])],
         grid = (32 * top, 1, 1), threadgroup = (32 * top, 1, 1),
-        output_shapes = [(rows,), (rows,), (rows,), (rows, depth + 1), (rows,), (rows,), (rows,), (rows,)],
-        output_dtypes = [mx.int32] * 7 + [mx.float32])
-    tokens, depths, parents, path, fork, back, rank, score = outputs
-    return DraftTree(tokens, parents, TreeBlock(depths, path, fork, back), rank, score)
+        output_shapes = [(rows,), (rows,), (rows,), (rows, depth + 1), (rows,), (rows,), (rows,), (rows,), (rows,)],
+        output_dtypes = [mx.int32] * 7 + [mx.float32] * 2)
+    tokens, depths, parents, path, fork, back, rank, score, logq = outputs
+    return DraftTree(tokens, parents, TreeBlock(depths, path, fork, back), rank, score, logq)
 
 
 def draft_tree_accept(tree, target):
@@ -9990,7 +10021,7 @@ class _SparseDrafter:
         ids, values = _sparse_head_candidates(head, proposed, shape, scan)
         return _sparse_candidate_walk(selector, proposed, anchor, ids, values, multiplier, ascending = True).astype(token_dtype)
 
-    def tree(self, last_bonus, hidden, cache, block_size, rows, scan = None, taken = False):
+    def tree(self, last_bonus, hidden, cache, block_size, rows, scan = None, taken = False, calibration = None):
         """This block's best-first `DraftTree` of `rows` rows, in taking order with `taken`."""
         model, selector = self.model, self.selector
         length = int(block_size) - 1
@@ -10005,7 +10036,7 @@ class _SparseDrafter:
         chosen = mx.argpartition(values, -selector.top_k, axis = -1)[:, -selector.top_k:]
         candidates = mx.take_along_axis(ids, chosen, axis = -1).reshape(*proposed.shape[:-1], selector.top_k)
         unary = mx.take_along_axis(values, chosen, axis = -1).reshape(candidates.shape)
-        return draft_tree(selector, proposed, anchor, candidates, unary, rows, taken)
+        return draft_tree(selector, proposed, anchor, candidates, unary, rows, taken, calibration)
 
 
 def sparse_drafter(model, target, original):
@@ -10663,8 +10694,9 @@ def _tree_head_rows(hidden, cache):
 
 def tree_commit(transaction, caches, path):
     """Commit block rows `path` (a list from the anchor) of a tree verify: a prefix of the block as any block's, others
-    by moving their keys and values to the front of the block, and leaving each gated delta layer the path's replay, which
+    by writing their keys and values at the front of the block, and leaving each gated delta layer the path's replay, which
     the next tree block folds in reading the rows where they are."""
+    blocks = [vars(entry).pop("_unsloth_tree_rows", None) for entry in caches]
     if path == list(range(len(path))):
         transaction.commit([len(path)])
         return
@@ -10672,7 +10704,7 @@ def tree_commit(transaction, caches, path):
     windows = [cache._speculation["records"][0] for cache, *_ in tapes]
     transaction.abort()
     gather = lambda x: mx.take(x, rows, axis = 1)
-    retained = mx.array([len(path)], mx.uint32)
+    retained, taps = mx.array([len(path)], mx.uint32), {}
     for (cache, index, replay, mask, _), (_, source, width) in zip(tapes, windows):
         q, k, v, a, b, A_log, dt_bias, entry = replay.args
         path_replay = functools.partial(replay.func, gather(q), gather(k), gather(v), gather(a), gather(b), A_log, dt_bias, entry,
@@ -10680,13 +10712,14 @@ def tree_commit(transaction, caches, path):
         cache[index] = path_replay(mask = mask)[1]
         cache._unsloth_pending = (cache[index], path_replay, retained)
         cache._unsloth_pending_path = (k, v, a, b, rows)
-        taps = mx.concatenate([mx.arange(width, dtype = mx.int32), rows + width])[-width:]
-        cache[0] = mx.take(source, taps, axis = 1)
-    for entry in caches:
-        if isinstance(getattr(entry, "offset", None), int) and getattr(entry, "keys", None) is not None:
+        if width not in taps:   # built on the host, once: as arrays per layer they were most of the commit's GPU ops
+            taps[width] = mx.array([*range(width), *(row + width for row in path)][-width:], mx.int32)
+        cache[0] = mx.take(source, taps[width], axis = 1)
+    for entry, block in zip(caches, blocks):
+        if block is not None:
             prefix, length = entry.offset, len(path)
-            entry.keys[..., prefix : prefix + length, :] = mx.take(entry.keys, prefix + rows, axis = 2)
-            entry.values[..., prefix : prefix + length, :] = mx.take(entry.values, prefix + rows, axis = 2)
+            entry.keys[..., prefix : prefix + length, :] = mx.take(block[0], rows, axis = 2)
+            entry.values[..., prefix : prefix + length, :] = mx.take(block[1], rows, axis = 2)
             entry.offset = prefix + length
 
 

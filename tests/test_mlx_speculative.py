@@ -12,6 +12,7 @@ pytest.importorskip("mlx.core")
 from unsloth_zoo.mlx.speculative import (
     SizedTreeBudget,
     TreeBudget,
+    TreeCalibration,
     DraftController, NgramProposer, RoundPlan, RowPlan, RowState, SpeculativeEngine, _Calibration, _CycleCosts, _Ema, _upper,
 )
 
@@ -1196,14 +1197,14 @@ def test_tree_budget_runs_the_widest_tree_until_measured_then_the_best_rate_and_
     before = budget.trees[16].value
     budget.observe(8, [1], 1)
     assert budget.trees[16].value == before
-    # That far from paying, the widest tree is probed rarely; one near paying, as often as before.
+    # That far from paying, the widest tree is probed rarely; one near paying runs every round, while the best tree beats the chain.
     picks = [budget.choose() for _ in range(budget.PROBE_SETTLED_EVERY)]
     assert picks.count(16) == 1 and picks.count(8) == budget.PROBE_SETTLED_EVERY - 1
-    near = TreeBudget({8: 1.0, 16: 1.15}, {8: 1.0}, trained_rows = 8)
+    near = TreeBudget({8: 1.0, 16: 1.15}, {8: 0.58}, trained_rows = 8)
     for _ in range(near.MIN_SAMPLES):
         near.choose(), near.observe(16, [1, 2, 3, 4, 5, 6, 9], 3)
-    picks = [near.choose() for _ in range(2 * near.PROBE_EVERY)]
-    assert picks.count(16) == 2 and picks.count(8) == 2 * near.PROBE_EVERY - 2
+    assert near._rate(near.trees[8], 1.0, 8) > near._rate(near.chains[8], 0.58, 8) > near._rate(near.trees[16], 1.15, 16)
+    assert {near.choose() for _ in range(2 * near.PROBE_EVERY)} == {16}
     # Deep paths past rank 8 pay for the rows.
     for _ in range(4 * budget.MIN_SAMPLES):
         budget.observe(16, [1, 2, 9, 10, 11, 12, 13, 14], 2)
@@ -1226,14 +1227,19 @@ def test_a_sized_tree_budget_verifies_the_rows_its_lattice_pays_for():
     budget.pinned = 4   # while the load times a width, whatever the lattice
     assert budget.size([(0.9, 1), (0.9, 2), (0.9, 3), (0.9, 4)]) == 4 and budget.size([(0.9, 1)]) == 2
     budget.pinned = 0
-    # Nodes of a depth that keep failing stop being priced at their promise, those of another depth keep theirs.
-    nodes = [(0.9, 1), (0.6, 2), (0.6, 3), (0.6, 4)]
+    # At the rate rounds ran at, a poor lattice stops paying for the rows its own best ratio would take.
+    nodes, poor = [(0.9, 1), (0.6, 2), (0.6, 3), (0.6, 4)], [(0.25, depth) for depth in range(1, 5)]
+    budget = SizedTreeBudget({3: 1.0, 5: 1.2})
+    for cycle in range(budget.RATE_ROUNDS):
+        assert budget.size(poor) == (5 if (cycle + 1) % budget.PROBE_EVERY else 3)   # every few rounds measure the other width
+        budget.observe(5, {1, 2, 3}, 1.2 * cycle)
+    assert budget.size(poor) == 3 and budget.size(nodes) == 5
+    assert budget.size([(0.5, 1), (0.5, 2), (0.37, 3), (0.37, 4)]) == 5   # pays at the wide rounds' rate, not at the narrow cycle's
+    budget = SizedTreeBudget({3: 2.0, 5: 4.0})
+    for cycle in range(budget.RATE_ROUNDS):
+        assert budget.size(nodes) == (3 if (cycle + 1) % budget.PROBE_EVERY else 5)
+        budget.observe(3, set(), 2.0 * cycle)
     assert budget.size(nodes) == 5
-    for cycle in range(256):
-        budget.size(nodes)
-        budget.observe(5, {1}, float(cycle))
-    assert budget.accepted[1] / budget.promised[1] > 1 and budget.accepted[3] / budget.promised[3] < 0.01
-    assert budget.size(nodes) == 3
     # Live cycles replace the load's price, a long gap is no cycle, and the rest scale with what replies measure.
     budget = SizedTreeBudget({3: 1.0, 4: 2.0, 5: 3.0})
     budget.size(nodes)
@@ -1259,6 +1265,47 @@ def test_a_sized_tree_budget_verifies_the_rows_its_lattice_pays_for():
         budget.observe(picks[-1], {1, 2, 3, 4}, float(cycle))
     assert [picks[round - 1] for round in range(8, 65, 8)] == [3, 4] * 4 and picks[127] == 3
     assert {pick for round, pick in enumerate(picks, 1) if round % 8 or round > 64 and round % 64} == {5}
+
+
+def test_tree_calibration_refits_each_depth_from_the_children_of_accepted_rows():
+    import math
+    import mlx.core as mx
+    import numpy as np
+    rng, calibration, truth = random.Random(0), TreeCalibration(3), ((-1.0, 0.5), (1.0, 1.5))
+    prior = calibration.parameters
+    assert np.allclose(prior, [[TreeCalibration.PRIOR[0]] * 3, [TreeCalibration.PRIOR[1]] * 3])
+    for cycle in range(16 * calibration.REFIT_EVERY):
+        # A chain of rows 1, 2 and 4 and row 1's hopeless sibling: a row is accepted at its depth's rate, under an accepted parent.
+        qs = [rng.uniform(0.05, 0.95) for _ in range(3)]
+        rates = [1 / (1 + math.exp(-(a + b * math.log(q / (1 - q))))) for (a, b), q in zip(truth, qs)]
+        path = [0] + ([1, 2][: 1 + (rng.random() < rates[1])] if rng.random() < rates[0] else [])
+        rows = 5 if cycle < 20 else 4   # row 4, at the third depth, in too few rounds to fit
+        calibration.observe([0, 1, 2, 1, 3][:rows], [-1, 0, 1, 0, 2][:rows], [0.0, *map(math.log, qs[:2]), -30.0, -0.1][:rows], path)
+        if cycle + 2 == calibration.REFIT_EVERY:
+            assert calibration.parameters is prior
+    assert abs(calibration.alpha[0] + 1.0) < 0.4 and abs(calibration.beta[0] - 0.5) < 0.2
+    assert abs(calibration.alpha[1] - 1.0) < 0.4 and abs(calibration.beta[1] - 1.5) < 0.4
+    assert (calibration.alpha[2], calibration.beta[2]) == TreeCalibration.PRIOR and calibration._seen[2] < calibration.MIN_RECORDS
+    assert calibration.parameters.shape == (2, 3) and calibration.parameters.dtype == mx.float32
+    assert np.allclose(calibration.parameters, [calibration.alpha, calibration.beta], atol = 1e-6)
+    # Records far from the fit, sure nodes all rejected, where a free Newton step leaves any sane fit and comes back.
+    calibration = TreeCalibration(2)
+    for _ in range(2 * calibration.REFIT_EVERY):
+        calibration.observe([0, 1, 1], [-1, 0, 0], [0.0, 0.0, 0.0], [0])
+    alpha, beta = calibration.alpha[0], calibration.beta[0]
+    assert 1 / (1 + math.exp(-(alpha + beta * 13.8))) < 0.1 and -8 <= alpha < 0 and 0.1 <= beta < 1
+    # Records all one way move a depth off the prior only as far as they outweigh it.
+    calibration = TreeCalibration(1)
+    for _ in range(4 * calibration.REFIT_EVERY):
+        calibration.observe([0, 1], [-1, 0], [0.0, math.log(0.5)], [0, 1])
+    assert 3.0 < calibration.alpha[0] < 4.2
+    # One confident q, a quarter accepted: undamped Newton steps landed at the bounds and promised acceptance near 1.
+    calibration, logq = TreeCalibration(1), math.log(1 / (1 + math.exp(-4.0)))
+    for round_ in range(4 * calibration.REFIT_EVERY):
+        calibration.observe([0, 1], [-1, 0], [0.0, logq], [0, 1] if round_ % 4 == 0 else [0])
+        if (round_ + 1) % calibration.REFIT_EVERY == 0:
+            promised = 1 / (1 + math.exp(-(calibration.alpha[0] + 4.0 * calibration.beta[0])))
+            assert promised < 0.5 and (round_ < calibration.REFIT_EVERY or abs(promised - 0.25) < 0.03), (round_, promised)
 
 
 def test_a_sized_budget_times_no_cycle_across_replies_of_one_round():
