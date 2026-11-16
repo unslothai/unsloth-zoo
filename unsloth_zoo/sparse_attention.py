@@ -858,7 +858,7 @@ def _repair_boundary_ties(out, b, t0, scores, valid, k, q_rows, block_keys, star
 
 @torch.compiler.disable
 def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, apply_rotary_pos_emb,
-                      query_chunk = 2048, past_key_values = None):
+                      query_chunk = 2048, past_key_values = None, exact_ties = None):
     """Vectorised transformers Qwen4ExpTextQSAIndexer selection (no cache): [b, s, K] token indices, -1 padded,
     the set the reference's per-query loop keeps (at a k-th / (k+1)-th score tie possibly another equally-scored
     block, unless UNSLOTH_QWEN4_EXP_EXACT_TIES=1); None when the mask is not interval-shaped.
@@ -868,6 +868,7 @@ def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mas
     relu(q . k) / sqrt(d); the top budget // ratio blocks plus the incomplete tail are kept.
     `past_key_values` (an empty cache: prefill) receives the raw index keys as the reference indexer stores them,
     only once the mask was accepted, so a None return never leaves the cache updated.
+    `exact_ties` overrides UNSLOTH_QWEN4_EXP_EXACT_TIES (None reads it).
     """
     batch, seq, _ = hidden_states.shape
     ratio, top_blocks, dim = indexer.compress_ratio, indexer.block_topk, indexer.index_head_dim
@@ -921,7 +922,7 @@ def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mas
             tokens = starts[top_indices][..., None] + arange_r                               # [c, k, ratio]
             tokens = torch.where(torch.isfinite(top_values)[..., None], tokens, -1)
             out[b, t0:t1, : k * ratio] = tokens.flatten(1).to(torch.int32)
-            if k < starts.numel() and _exact_ties():
+            if k < starts.numel() and (_exact_ties() if exact_ties is None else exact_ties):
                 _repair_boundary_ties(out, b, t0, scores, valid, k, q[b, t0:t1], block_keys, starts, arange_r,
                                       top_blocks, ratio, dim)
     return out
