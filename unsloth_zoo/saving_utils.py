@@ -2593,6 +2593,22 @@ def _fold_perexpert_lora_into_fused(W, fused_base_name, converted_lora_weights):
 pass
 
 
+def _paramwrapper_expert_lora(converted_lora_weights, fused_base_name):
+    """PEFT ParamWrapper LoRA on a fused expert tensor, or None. Keyed on the experts module,
+    one `.base_layer` deeper per extra target_parameters entry; tensor in `parameter_name`."""
+    _m = re.match(r"^(.*\.experts)\.(gate_up_proj|down_proj)$", fused_base_name)
+    if _m is None:
+        return None
+    key = _m.group(1)
+    while key in converted_lora_weights:
+        stats = converted_lora_weights[key]
+        if getattr(stats, "parameter_name", None) == _m.group(2) and getattr(stats, "lora_A", None) is not None:
+            return stats
+        key += ".base_layer"
+    return None
+pass
+
+
 @torch.inference_mode
 def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None, biases=None, vocab_modules=None):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -2722,6 +2738,14 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                     if UNSLOTH_ENABLE_LOGGING:
                         logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
                     count += 1; W = _merge_lora(W, lora_stats, output_key)
+                elif (_pw_stats := _paramwrapper_expert_lora(converted_lora_weights, base_name)) is not None:
+                    # Dequantized W is GPT-OSS (E, in, out), hence is_transposed.
+                    _merge_fused = (_merge_moe_fused_gate_up_expert if base_name.endswith(".gate_up_proj")
+                                    else _merge_moe_fused_down_proj_expert)
+                    W = _merge_fused(W, _pw_stats, output_dtype or W.dtype, is_transposed = True)
+                    count += 1
+                    if UNSLOTH_ENABLE_LOGGING:
+                        logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING expert LoRA into Key Group: {base_name}")
                 else:
                     # Per-expert Linear expert LoRA (gpt-oss bnb-4bit): the fused-name
                     # lookup above misses it, so fold each delta into its slice of W.
