@@ -404,8 +404,7 @@ def make_view_decode(st_dtype: str):
 
 
 def make_fp8_tensor_scaled_decode(st_dtype: str, scale: torch.Tensor):
-    """Single plane of fp8 rows times one per-tensor ``scale``, exactly transformers' ``FP8Embedding.forward``
-    (``rows.to(scale.dtype) * scale``): Qwen3.8-Flash-Next-FP8's n-gram table and its ``weight_scale``."""
+    """fp8 rows times one per-tensor ``scale``, matching transformers' ``FP8Embedding.forward``."""
     torch_dtype = _ST_DTYPES[st_dtype][0]
     if st_dtype not in _FP8_ST_DTYPES or scale.numel() != 1:
         raise ValueError(f"Unsloth: a per-tensor scaled table needs fp8 rows and one scale, got {st_dtype} and "
@@ -940,9 +939,8 @@ class UnslothFrozenTableEmbedding(nn.Module):
             return
         decoded = getattr(self, "export_decoded", None)
         if decoded:
-            # The model holds decoded rows (a dequantized load folded the scales in): the stored planes would reload
-            # as raw rows without the metadata to rescale them. A full save writes the decoded table under `decoded`;
-            # anything else (state_dict for an adapter save) exports nothing rather than 2x the table in RAM.
+            # Decoded rows: stored planes would reload unscaled, so a full save writes the decoded table; anything
+            # else (adapter save) exports nothing rather than 2x the table in RAM.
             if _FULL_SAVE[0] > 0:
                 destination[prefix + decoded] = self._decode_all()
             return
@@ -951,8 +949,7 @@ class UnslothFrozenTableEmbedding(nn.Module):
             torch_dtype = _ST_DTYPES[plane.st_dtype][0]
             names = getattr(self, "checkpoint_suffixes", {}).get(plane.name, ())
             if plane.name in export and len(plane.shards) == 1:
-                # Under the module's own parameter names (DeepSeek-V4.1: weight / weight_scale_inv), which the
-                # model's save conversion maps back to the checkpoint's.
+                # Module's own parameter names; the model's save conversion maps them back to the checkpoint's.
                 names = (export[plane.name],)
             for shard, suffix in zip(plane.shards, names):
                 if shard.view is not None:
@@ -1231,8 +1228,7 @@ def _match_plane(module_name: str, keys: List[str], alternatives: Sequence[str],
                  prefixes: Optional[Sequence[str]] = None) -> List[str]:
     import re
     if prefixes:
-        # Exact checkpoint prefixes, tried in order: a table whose checkpoint name differs from its module path
-        # (DeepSeek-V4.1's `layers.<i>.engram.embed` is the model-level `engram_tables.<i>`).
+        # Exact checkpoint prefixes, for a table whose checkpoint name differs from its module path.
         keyset = set(keys)
         for prefix in prefixes:
             for alt in alternatives:
@@ -1373,9 +1369,8 @@ def _read_small_tensor(loc: "TensorLocation") -> torch.Tensor:
 
 
 def _scaled_fp8_decode(source, keys, name, planes, suffixes):
-    """(decode, {suffix: tensor}) for a single fp8 plane: the rows times the table's per-tensor ``weight_scale``
-    (exported again on save). (None, {}) when the plane is not fp8. An fp8 plane without a per-tensor scale
-    raises: decoding the raw values would silently scale every row wrong."""
+    """(decode, {suffix: tensor}) for a single fp8 plane with a per-tensor ``weight_scale``; (None, {}) if not fp8.
+    Raises without a scale: decoding raw values would silently scale every row wrong."""
     ((plane, names),) = planes.items()
     locs = resolve_tensor_locations(source, names=names[:1])
     st_dtype = locs[names[0]].dtype
@@ -1486,12 +1481,10 @@ def _check_save_target(model, save_directory):
 
 
 def _prepare_full_table_save(model, args, kwargs) -> bool:
-    """Whether ``model.save_pretrained(*args, **kwargs)`` must export decoded tables (a model holding decoded rows,
-    for a full-model save). A ``state_dict`` collected before the call (Trainer / FSDP full-state saves) was built
-    outside the export context: the decoded tables it is missing are added to it here."""
+    """Whether a full-model save must export decoded tables; a pre-collected ``state_dict`` (Trainer / FSDP)
+    gets the missing decoded tables added here."""
     decoded = [(n, m) for n, m in iter_frozen_table_modules(model) if getattr(m, "export_decoded", None)]
-    # An adapter-only save (transformers' add_adapter / load_adapter integration) filters model.state_dict()
-    # down to the adapters: decoding the tables for it would only allocate them.
+    # An adapter-only save filters state_dict() to the adapters: decoding tables would only allocate them.
     if not decoded or getattr(model, "_hf_peft_config_loaded", False):
         return False
     supplied = kwargs.get("state_dict")

@@ -560,11 +560,7 @@ def _pooled_reads_weight(cls):
     return _POOLED_READS_WEIGHT[cls]
 
 
-# ----------------------------------------------------------------------------------------------
-# Engram tables on disk
-# ----------------------------------------------------------------------------------------------
-# Checkpoint keys of an engram table: DeepSeek-native (`layers.<i>.engram.embed.{weight,scale}`, the released
-# files) or the port's own names (`engram_tables.<i>.{weight,weight_scale_inv}`, a transformers save).
+# Engram table keys: DeepSeek-native (released files) or the port's own names (a transformers save).
 _ENGRAM_UNEXPECTED = (
     r"(^|\.)engram_tables\.\d+\.(weight|weight_scale_inv|scale)$",
     r"(^|\.)layers\.\d+\.engram\.embed\.(weight|scale)$",
@@ -583,8 +579,7 @@ def _engram_table_wanted(nbytes):
 
 
 def _fp8_weights_kept(model, quantizer=None):
-    """True when the load kept FP8 weights (no dequantize): the port's engram lookup then returns float32 rows.
-    `quantizer` is the load's (transformers sets model.hf_quantizer only after the weights are in)."""
+    """True when the load kept FP8 weights; `quantizer` is passed since model.hf_quantizer is set after loading."""
     if quantizer is None:
         quantizer = getattr(model, "hf_quantizer", None)
     qc = getattr(quantizer, "quantization_config", None)
@@ -596,8 +591,7 @@ def _fp8_weights_kept(model, quantizer=None):
 
 
 def _frozen_engram(modeling, key, emb):
-    """An UnslothFrozenTableEmbedding standing in for one DeepseekV41EngramEmbedding, bound to the checkpoint
-    after the load: fp8 rows x per-32-channel e8m0 scales (the released files), or plain rows (a bf16 copy)."""
+    """Frozen-table replacement for one DeepseekV41EngramEmbedding: fp8 rows x e8m0 scales, or plain bf16 rows."""
     from unsloth_zoo.frozen_table_store import UnslothFrozenTableEmbedding, make_fp8_block_decode
     block = int(getattr(emb, "block_size", 32))
     table = UnslothFrozenTableEmbedding(
@@ -615,15 +609,13 @@ def _frozen_engram(modeling, key, emb):
     table.make_decode = lambda planes: make_fp8_block_decode(block_size=block) if "scale" in planes else None
 
     def after_bind(model, planes, quantizer=None, table=table):
-        # DeepseekV41EngramEmbedding.forward: float32 rows when the fp8 table is kept (dequantize=False); a
-        # dequantized load folded the scales into rows of the model dtype, which the lookup returns as is.
+        # float32 rows when the fp8 table is kept; a dequantized load returns rows in the model dtype.
         if "scale" not in planes:
             return
         if _fp8_weights_kept(model, quantizer):
             table.table_dtype = torch.float32
         else:
-            # The model holds dequantized rows and drops its quantization config: a save must write those rows,
-            # not fp8 rows + scales that a reload would read as plain rows.
+            # Dequantized rows: a save must write them, not fp8 rows + scales a reload would read as plain rows.
             table.export_decoded = "weight"
 
     table.after_bind = after_bind
@@ -648,10 +640,8 @@ def make_deepseek_v41_engram_table(layer_key, num_embeddings, head_dim, block_si
 
 
 def patch_deepseek_v41_engram_table():
-    """Build the two ~98 GB engram tables as parameter-free UnslothFrozenTableEmbedding modules on a checkpoint
-    load, streamed from the checkpoint files (mmap + MADV_RANDOM) instead of loading into host RAM, the same store
-    as Qwen3.8-Flash-Next's n-gram table. UNSLOTH_FROZEN_TABLE=gpu (or auto on a small table) keeps the port's
-    DeepseekV41EngramEmbedding."""
+    """Stream the two ~98 GB engram tables from the checkpoint (mmap) instead of host RAM.
+    UNSLOTH_FROZEN_TABLE=gpu (or auto on a small table) keeps the port's DeepseekV41EngramEmbedding."""
     modeling = _modeling()
     if modeling is None:
         return False

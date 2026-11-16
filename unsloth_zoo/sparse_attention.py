@@ -127,8 +127,7 @@ def _gather_importable():
 
 
 def _resolve_gather():
-    """Once at import: traced dispatch then only reads _GATHER (a cold trace skipped gather: _gather_importable does
-    not import while compiling, so the first compiled step on Blackwell ran the Triton kernel instead)."""
+    """Once at import, so traced dispatch only reads _GATHER (a cold trace would skip gather)."""
     global _GATHER
     try:
         _gather_fn()
@@ -469,8 +468,7 @@ def _run(backend, q, kv, attn_sink, topk_idxs, softmax_scale):
 
 
 def _latch(backend, q, k, error):
-    # Re-raise trace-time, capture and memory failures; latch a backend's own compile failure (torch 2.6
-    # BackendCompilerFailed) unless its inner error is a memory failure.
+    # Re-raise trace, capture and memory failures; latch a backend's own compile failure (torch 2.6) otherwise.
     from torch._dynamo.exc import BackendCompilerFailed
     inner = getattr(error, "inner_exception", error) if isinstance(error, BackendCompilerFailed) else error
     if isinstance(inner, torch.OutOfMemoryError) or (inner is error and type(error).__module__.startswith("torch._dynamo")):
