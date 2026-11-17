@@ -2672,7 +2672,7 @@ def _packed_codes(codes, bits):   # MLX's layout: a little-endian bitstream of `
 
 
 @pytest.mark.parametrize("group_size", [32, 64, 128])
-@pytest.mark.parametrize("bits", [3, 4, 5, 6, 8])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
 @nax_only
 def test_nax_int8_prefill_partial_is_exact(bits, group_size):
     import numpy as np
@@ -2683,6 +2683,7 @@ def test_nax_int8_prefill_partial_is_exact(bits, group_size):
     # partial block.
     rng = np.random.default_rng(bits)
     E, N, K, G, span = 3, 320, 17 * group_size, 17, min(group_size, 64)
+    assert nax.int8_qmm_supported(N, K, group_size, bits, "affine") and nax.int8_prefill_expert_min_rows(E, bits)
     peaks = (np.arange(0, K, span)[:, None] + [0, 11, 22]).ravel()
     codes = rng.integers(0, 1 << bits, (E, N, K), dtype = np.uint8)
     s = rng.integers(1, 3, (E, N, G)).astype(np.float32)
@@ -2894,7 +2895,7 @@ def test_nax_int8_prefill_first_use_check_accepts_all_zero_rows():
     w = mx.random.normal((256, 512), key = mx.random.key(0)) * 0.05
     w = mx.where(mx.arange(256)[:, None] % 7 == 0, 0.0, w).astype(mx.bfloat16)
     x = mx.random.normal((200, 512), key = mx.random.key(1)).astype(mx.bfloat16)
-    for bits, group_size in itertools.product((3, 4, 5, 6, 8), (32, 64, 128)):
+    for bits, group_size in itertools.product((2, 3, 4, 5, 6, 8), (32, 64, 128)):
         wq, s, b = mx.quantize(w, group_size = group_size, bits = bits)
         routed = nax.int8_qmm(x, wq, s, b, bits)
         assert inference._nax_int8_qmm_matches_native(x, wq, s, b, group_size, bits, routed, None)
@@ -3163,7 +3164,8 @@ def test_nax_int8_prefill_row_thresholds():
         (dense, (1024, 1024), 17), (dense, (4096, 4096), 17), (dense, (65536, 1024), 17),
         (dense, (8192, 512), 0), (dense, (4096, 1023), 0), (dense, (512, 4096), 0), (dense, (960, 4096), 0),
         (dense, (65600, 1024), 0), (dense, (151936, 2048), 0),
-        (expert, (8, 2, True), 0), (expert, (8, 2), 0), (expert, (8, 3, True), 64), (expert, (8, 3), 256),
+        (expert, (8, 1, True), 0), (expert, (8, 1), 0), (expert, (8, 2, True), 64), (expert, (8, 2), 64),
+        (expert, (8, 3, True), 64), (expert, (8, 3), 256),
         (expert, (8, 4, True), 64), (expert, (8, 4), 64), (expert, (8, 5, True), 64), (expert, (8, 5), 256),
         (expert, (8, 6, True), 64), (expert, (8, 6), 256), (expert, (8, 8, True), 128), (expert, (8, 8), 256),
         (expert, (16, 8), 512), (expert, (16, 4, True), 128))

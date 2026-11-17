@@ -6365,7 +6365,7 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
     small-row kernels of `matmul` under their own row table and the same first-use check;
     `UNSLOTH_MLX_SIMD_QMM=0` turns that route off.
 
-    `int8_prefill=True`, or `UNSLOTH_MLX_INT8_PREFILL=1` when it is None, also runs affine 3- to
+    `int8_prefill=True`, or `UNSLOTH_MLX_INT8_PREFILL=1` when it is None, also runs affine 2- to
     8-bit linears and routed experts with int8 activations: faster, but lossy enough to raise the
     loss of precision-sensitive checkpoints. Linears route from 17 rows, so batched decoding of 17
     or more sequences and wider speculative verification also run int8. The outermost scope
