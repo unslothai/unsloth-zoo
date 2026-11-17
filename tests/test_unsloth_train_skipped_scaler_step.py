@@ -15,11 +15,13 @@ import unsloth_zoo.training_utils as training_utils
 
 
 class _OverflowOnceLM(torch.nn.Module):
-    """float16 model whose first loss overflows the GradScaler's scaled loss to inf."""
+    """float16 model whose first loss is inf; small fixed weights keep later scaled grads finite in fp16."""
 
     def __init__(self):
         super().__init__()
         self.proj = torch.nn.Linear(4, 4)
+        torch.nn.init.constant_(self.proj.weight, 1e-2)
+        torch.nn.init.zeros_(self.proj.bias)
         self.config = SimpleNamespace(torch_dtype = torch.float16, dtype = torch.float16)
         self.forward_calls = 0
 
@@ -28,7 +30,7 @@ class _OverflowOnceLM(torch.nn.Module):
         x = torch.nn.functional.one_hot(input_ids % 4, 4).float()
         loss = self.proj(x).float().pow(2).sum() / n_items
         if self.forward_calls == 1:
-            loss = loss * 1e36  # times the initial scale of 65536, past float32's max
+            loss = loss * float("inf")
         return SimpleNamespace(loss = loss)
 
 
