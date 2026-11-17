@@ -51,6 +51,7 @@ def setup(monkeypatch):
     monkeypatch.setattr(go, "_ogs_native_training_ok", lambda device, backend: False)
     monkeypatch.setattr(go, "torch_cuda_device", lambda device: contextlib.nullcontext())
     monkeypatch.delenv("UNSLOTH_GPT_OSS_MXFP4_FP32_RESIDUAL", raising = False)
+    monkeypatch.setattr(go, "_GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED", True, raising = False)
     gen = torch.Generator().manual_seed(0)
     module = _Experts(gen)
     x = torch.randn(T, H, generator = gen) * 4.0
@@ -109,6 +110,14 @@ def test_kill_switch_keeps_the_fp16_output(setup, monkeypatch):
     out, _ = _forward(module, x, routes, torch.float16)
     assert out.dtype == torch.float16
     assert not torch.isfinite(out).all()  # what main returned: the overflow this change removes
+
+
+def test_stock_attention_keeps_the_fp16_output(setup, monkeypatch):
+    # UNSLOTH_COMPILE_DISABLE=1 / UNSLOTH_ENABLE_FLEX_ATTENTION=0: no attention input cast, so no float32 stream.
+    monkeypatch.setattr(go, "_GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED", False)
+    module, x, experts, weights, routes = setup
+    out, _ = _forward(module, x, routes, torch.float16)
+    assert out.dtype == torch.float16
 
 
 def test_fp32_input_after_the_first_layer_stays_fp32(setup):

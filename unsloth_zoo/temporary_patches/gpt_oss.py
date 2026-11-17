@@ -3136,10 +3136,13 @@ def _mxfp4_experts_out_dtype(module, input_dtype, routed_by_unsloth = True):
     Only for calls routed by Unsloth's mlp_forward (routing objects), which casts the router input
     (_mxfp4_router_logits). A call with (router_indices, routing_weights) tensors comes from an MLP forward that
     feeds the router itself (stock GptOssMLP, transformers 5.x Mxfp4GptOssMLP), whose float16 router would reject
-    a float32 stream, so it keeps the activation dtype.
+    a float32 stream, so it keeps the activation dtype. Also only while Unsloth's attention forward is installed
+    (_gpt_oss_attention_input casts its float32 input for a float16 q / k / v); UNSLOTH_COMPILE_DISABLE=1 or
+    UNSLOTH_ENABLE_FLEX_ATTENTION=0 keep stock attention, so the activation dtype too.
     """
     if (
         routed_by_unsloth
+        and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
         and input_dtype == torch.float16
         and getattr(module, "training", False)
         and os.environ.get("UNSLOTH_GPT_OSS_MXFP4_FP32_RESIDUAL", "1") != "0"
