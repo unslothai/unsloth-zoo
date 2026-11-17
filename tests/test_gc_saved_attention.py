@@ -265,3 +265,13 @@ def test_function_level_with_q_k_v_split_from_one_buffer(monkeypatch):
     saved = _run(params, x, ckpt = True, call = call)
     _close(saved, full)
     assert SA.SAVED_ATTENTION_STATS["reused"] == 2
+
+
+def test_rocm_keeps_the_mode_off(monkeypatch):
+    from unsloth_zoo import saved_attention as sa
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
+    monkeypatch.setattr(torch.version, "hip", "6.4", raising = False)
+    assert sa.save_attention_enabled() is False
+    assert sa.new_saved_attention_frame([torch.zeros(1, requires_grad = True)]) is None
+    monkeypatch.setattr(torch.version, "hip", None, raising = False)
+    assert sa.save_attention_enabled() is True

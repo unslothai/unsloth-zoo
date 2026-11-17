@@ -74,8 +74,20 @@ def _save_attention_setting():
     return os.environ.get("UNSLOTH_GC_SAVE_ATTENTION", "0").strip().lower()
 
 
+_WARNED_HIP = [False]
+
+
 def save_attention_enabled():
-    return _save_attention_setting() in ("1", "true", "yes", "on", "offload")
+    if _save_attention_setting() not in ("1", "true", "yes", "on", "offload"):
+        return False
+    # ROCm (gfx1151) runs SDPA through kernels this mode does not intercept: nothing is kept, and
+    # routing through it only adds graph breaks, so it stays off there.
+    if getattr(torch.version, "hip", None):
+        if not _WARNED_HIP[0]:
+            _WARNED_HIP[0] = True
+            print("Unsloth: UNSLOTH_GC_SAVE_ATTENTION is not supported on ROCm yet and is ignored.")
+        return False
+    return True
 
 
 def save_attention_offload():
