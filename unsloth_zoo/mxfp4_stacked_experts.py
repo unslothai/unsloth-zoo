@@ -25,7 +25,7 @@ from .mxfp4_dequant import Mxfp4ExpertParam, is_mxfp4_expert_param, mxfp4_dequan
 from .mxfp4_gemm import _gemv_rows, mxfp4_gemm_available, mxfp4_grouped_gemv_available, mxfp4_grouped_matmul
 
 try:
-    # Triton combine, bit-identical to the eager one below; returns None (eager path) off CUDA or without Triton.
+    # Bit-identical to the eager combine; returns None off CUDA or without Triton.
     from .temporary_patches.moe_triton_kernels import weighted_unpermute as _weighted_unpermute
 except Exception:
     _weighted_unpermute = None
@@ -382,7 +382,7 @@ class Mxfp4StackedExperts(nn.Module):
         if delta is not None:
             out = out + delta
 
-        # One pass over the routed rows instead of a [T, top_k, H] fp32 product; gradients reach out and topk_weight.
+        # Avoids a [T, top_k, H] fp32 product.
         if _weighted_unpermute is not None and out.is_cuda and num_tokens > 0:
             combined = _weighted_unpermute(
                 out, order, topk_weight.to(torch.float32).reshape(-1)[order], num_tokens, top_k,

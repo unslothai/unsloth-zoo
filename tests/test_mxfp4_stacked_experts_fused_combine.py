@@ -30,7 +30,7 @@ def _count_calls(monkeypatch):
         calls.append(out is not None)
         return out
 
-    # raising = False: on a tree without the fused combine the counter is never called and the caller's check fails.
+    # raising=False: without the fused combine the counter is never called, so the caller fails.
     monkeypatch.setattr(mse, "_weighted_unpermute", counting, raising = False)
     return calls
 
@@ -71,7 +71,6 @@ def test_fused_combine_matches_eager_and_trains_the_router(monkeypatch, weight_d
     assert torch.equal(got_grads[0], want_grads[0])
     for a, b in zip(got_grads[2:], want_grads[2:]):
         assert torch.equal(a, b)
-    # The routing-weight grad is the same fp32 dot product summed in another order.
     assert got_grads[1].dtype == weight_dtype and got_grads[1].abs().sum() > 0
     torch.testing.assert_close(got_grads[1].float(), want_grads[1].float(), rtol = 2e-5, atol = 2e-5)
 
@@ -117,5 +116,5 @@ def test_an_empty_batch_keeps_the_eager_combine(monkeypatch):
     calls = _count_calls(monkeypatch)
     out = module(x[:0], idx[:0], weight[:0])
     assert out.shape == (0, H) and calls == []
-    # A failed launch would disable the kernels process wide; the empty batch never reaches them.
+    # A failed launch would disable the kernels process wide.
     assert K._DISABLED_REASON is None
