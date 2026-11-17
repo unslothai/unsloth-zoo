@@ -464,7 +464,7 @@ def probe_small_m_qmm():
 # fp32 scale sa; codes under 8 bits enter as is, bias unchanged; 8-bit codes centred (q - 128) with bias b + 128 * s,
 # applied as two matmuls so it is never rounded.
 _INT8_QMM_GROUP_SIZES = (32, 64, 128)
-_INT8_QMM_BITS = (3, 4, 5, 6, 8)
+_INT8_QMM_BITS = (2, 3, 4, 5, 6, 8)
 
 
 def _int8_qmm_activation_group(group_size):
@@ -617,7 +617,7 @@ _INT8_QMM_SOURCE = """
         for (int q = 0; q < 4; ++q) {   // columns +0, +8, +16, +24
             const device uint* wr = wlane + ulong((q & 1) * 8 + (q >> 1) * 16) * (G * WORDS) + g * WORDS;
             wv[q] = uint4(0u);
-            if (STREAM) {   // 3-, 5- and 6-bit codes: the words holding the run, realigned to its first bit
+            if (STREAM) {   // 2-, 3-, 5- and 6-bit codes: the words holding the run, realigned to its first bit
                 const device uint* p = wr + (cx * RUN_BITS >> 5);
                 const uint s0 = cx * RUN_BITS & 31;
                 wv[q].x = p[0];
@@ -722,7 +722,8 @@ _INT8_QMM_SOURCE = """
 """
 
 INT8_QMM_PROBE_KEY = "int8_qmm:" + hashlib.sha256(
-    (_INT8_QMM_HEADER + _INT8_ACTIVATION_QUANTIZE_SOURCE + _INT8_QMM_SOURCE).encode()).hexdigest()[:12]
+    (repr(_INT8_QMM_BITS) + _INT8_QMM_HEADER + _INT8_ACTIVATION_QUANTIZE_SOURCE
+     + _INT8_QMM_SOURCE).encode()).hexdigest()[:12]
 
 
 @functools.cache
@@ -774,7 +775,7 @@ def _int8_qmm(x, w, scales, biases, group_size, bits, simdgroups, starts = None,
 
 # (row, column) simdgroups per threadgroup: 32 x 64 tiles under 8 bits, 64 x 64 for 8-bit; expert kernels use 32-row
 # tiles, which waste fewer rows on short segments.
-_INT8_QMM_SIMDGROUPS = {3: (1, 2), 4: (1, 2), 5: (1, 2), 6: (1, 2), 8: (2, 2)}
+_INT8_QMM_SIMDGROUPS = {2: (1, 2), 3: (1, 2), 4: (1, 2), 5: (1, 2), 6: (1, 2), 8: (2, 2)}
 _INT8_GATHER_QMM_SIMDGROUPS = {bits: (1, 2) for bits in _INT8_QMM_BITS}
 
 
@@ -843,8 +844,8 @@ _INT8_PREFILL_MIN_ROWS = _QMM_MAX_ROWS + 1
 _INT8_PREFILL_MIN_N = _INT8_PREFILL_MIN_K = 1024
 _INT8_PREFILL_MAX_N = 65536
 # Rows per routed expert by bits, as (calls quantizing each token once for all its experts, other calls); down
-# projections lose at 12 rows per expert except at 4 bits.
-_INT8_PREFILL_EXPERT_ROWS = {3: (8, 32), 4: (8, 8), 5: (8, 32), 6: (8, 32), 8: (16, 32)}
+# projections lose at 12 rows per expert except at 2 and 4 bits.
+_INT8_PREFILL_EXPERT_ROWS = {2: (8, 8), 3: (8, 32), 4: (8, 8), 5: (8, 32), 6: (8, 32), 8: (16, 32)}
 
 
 def int8_prefill_min_rows(N, K):
