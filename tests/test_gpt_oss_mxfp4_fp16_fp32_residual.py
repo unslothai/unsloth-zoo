@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MXFP4 gpt-oss experts return float32 when training on float16 (T4), like GptOssExpertsBnb4bit, so the experts
-output and the residual adds after it no longer overflow float16's 65504; bfloat16 and eval are unchanged. CPU only:
-the exact dequant path (sm75's) with dense expert stacks and the zoo's own routing tensors."""
+"""fp16 training: MXFP4 gpt-oss experts return float32 so the residual stream does not overflow. CPU only."""
 
 import contextlib
 import types
@@ -34,9 +32,8 @@ class _Experts(torch.nn.Module):
     def __init__(self, gen):
         super().__init__()
         self.num_experts, self.alpha, self.limit = E, 1.702, 7.0
-        # Dense stacks take _ogs_dense_chunks' tensor branch: the same bf16 x fp32-accumulate math as a decoded stack.
         self.gate_up_proj = (torch.randn(E, H, 2 * I, generator = gen) * 0.3).to(torch.bfloat16)
-        # Large down weights: some tokens' expert output lands past float16's range (gpt-oss-20b reaches ~1e5).
+        # Expert outputs past float16's range (gpt-oss-20b reaches ~1e5).
         self.down_proj = (torch.randn(E, I, H, generator = gen) * 600.0).to(torch.bfloat16)
         self.gate_up_proj_bias = torch.nn.Parameter(torch.randn(E, 2 * I, generator = gen) * 0.1)
         self.down_proj_bias = torch.nn.Parameter(torch.randn(E, H, generator = gen) * 0.1)
@@ -78,7 +75,6 @@ def _reference(module, x, experts, weights):
 
 
 def _close(out, ref):
-    # float32 sums of bf16 products: well inside 1e-3 of the output scale.
     err = (out.double() - ref).abs().max() / ref.abs().max()
     assert err < 1e-3, float(err)
 
@@ -93,14 +89,13 @@ def test_fp16_training_returns_finite_fp32_past_the_fp16_range(setup):
     module, x, experts, weights, routes = setup
     out, xin = _forward(module, x, routes, torch.float16)
     ref = _reference(module, xin.detach(), experts, weights)
-    assert ref.abs().max() > 1.5 * FP16_MAX  # the case under test: the expert output itself leaves float16's range
+    assert ref.abs().max() > 1.5 * FP16_MAX
     assert out.dtype == torch.float32
     assert torch.isfinite(out).all()
     _close(out, ref)
-    # The residual add the decoder layer does next stays finite (float16 + float32 promotes).
     residual = torch.full((T, H), 40000.0, dtype = torch.float16)
     assert torch.isfinite(residual + out).all()
-    out.backward(torch.full_like(out, 1e-4))  # a loss-sized upstream gradient
+    out.backward(torch.full_like(out, 1e-4))
     assert xin.grad.dtype == torch.float16 and torch.isfinite(xin.grad).all()
 
 
@@ -156,10 +151,8 @@ def test_attention_input_meets_a_dense_fp16_projection():
     hidden = torch.randn(T, H, dtype = torch.float32)
     fp16 = _types.SimpleNamespace(q_proj = torch.nn.Linear(H, H).to(torch.float16))
     assert go._gpt_oss_attention_input(fp16, hidden).dtype == torch.float16
-    # A LoRA wrapper is looked through to its base layer.
     wrapped = _types.SimpleNamespace(q_proj = _types.SimpleNamespace(base_layer = fp16.q_proj))
     assert go._gpt_oss_attention_input(wrapped, hidden).dtype == torch.float16
-    # bf16 / float32 dense and quantized (uint8) projections, and same-dtype input, pass through.
     for dtype in (torch.bfloat16, torch.float32, torch.uint8):
         proj = _types.SimpleNamespace(q_proj = _types.SimpleNamespace(weight = torch.zeros(1, dtype = dtype)))
         assert go._gpt_oss_attention_input(proj, hidden) is hidden
@@ -169,8 +162,7 @@ def test_attention_input_meets_a_dense_fp16_projection():
 
 @pytest.mark.parametrize("positional", [False, True])
 def test_tensor_routed_call_keeps_fp16(setup, monkeypatch, positional):
-    # Stock GptOssMLP (keywords, transformers 4.x) and transformers 5.x Mxfp4GptOssMLP (positional) pass
-    # (router_indices, routing_weights) and run their own float16 router: a float32 output would reach it next layer.
+    # Stock / transformers 5.x MLPs run their own float16 router: a float32 output would reach it next layer.
     module, x, experts, weights, routes = setup
     monkeypatch.setattr(go, "_mxfp4_routing_from_topk", lambda module, indices, weights: routes)
     module.train()

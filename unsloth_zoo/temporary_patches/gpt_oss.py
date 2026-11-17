@@ -886,8 +886,7 @@ pass
 
 
 def _mxfp4_router_logits(router, hidden_states):
-    """Router logits in the router's dtype: float16 training keeps the residual stream float32 after the first MXFP4
-    experts call (_mxfp4_experts_out_dtype), while the router weight stays float16."""
+    """Router logits in the router's dtype (fp16 training keeps a float32 residual stream)."""
     return nn.functional.linear(hidden_states.to(router.weight.dtype), router.weight, router.bias)
 
 
@@ -2913,8 +2912,7 @@ def _ogs_dequant_gate_up(x, weight, bias, routing_data, gather_idx, precision_co
 
 
 def _ogs_dequant_down(h, gammas, weight, bias, routing_data, scatter_idx, precision_config, out_dtype = None):
-    """matmul_ogs down on bf16 decodes: ``out[dst // k] += gamma * (h @ W[e] + b[e])``, summed without atomics;
-    out_dtype (default: h's) is applied once to the float32 sum."""
+    """matmul_ogs down on bf16 decodes: ``out[dst // k] += gamma * (h @ W[e] + b[e])``, summed without atomics."""
     k = routing_data.n_expts_act
     dst = scatter_idx.dst_indx.long()
     h = h.to(torch.bfloat16)
@@ -3093,8 +3091,7 @@ def _ogs_lora_offsets(routing_data):
 def mxfp4_ogs_experts_forward(
     self, hidden_states, routing_data, gather_idx, scatter_idx, gate_up_lora = None, down_lora = None, out_dtype = None,
 ):
-    """Differentiable native MXFP4 experts: matmul_ogs forward, exact chunked dequant in backward; out_dtype float32
-    keeps the down projection's float32 sum (the dequant path) instead of rounding it to bf16."""
+    """Differentiable native MXFP4 experts: matmul_ogs forward, exact chunked dequant in backward."""
     k = routing_data.n_expts_act
     alpha = getattr(self, "alpha", 1.702)
     limit = getattr(self, "limit", 7.0)
@@ -3125,20 +3122,10 @@ def mxfp4_ogs_experts_forward(
 
 
 def _mxfp4_experts_out_dtype(module, input_dtype, routed_by_unsloth = True):
-    """Output dtype of the MXFP4 experts: float32 when training on float16 activations, else the activation dtype.
+    """float32 when training on float16, else input_dtype: an fp16 residual stream overflows to inf on gpt-oss-20b.
 
-    GptOssExpertsBnb4bit returns float32 in training, so on a float16 GPU (T4) the residual adds after it promote to
-    float32; gpt-oss-20b's residual stream passes float16's 65504 within a few dozen steps. The MXFP4 experts cast back
-    to float16 instead, so the experts output and the residual overflowed to inf and the loss went NaN. Layers after
-    the first then see float32 activations, as on the bnb-4bit path; bfloat16 runs are unchanged.
-    UNSLOTH_GPT_OSS_MXFP4_FP32_RESIDUAL=0 restores the float16 output.
-
-    Only for calls routed by Unsloth's mlp_forward (routing objects), which casts the router input
-    (_mxfp4_router_logits). A call with (router_indices, routing_weights) tensors comes from an MLP forward that
-    feeds the router itself (stock GptOssMLP, transformers 5.x Mxfp4GptOssMLP), whose float16 router would reject
-    a float32 stream, so it keeps the activation dtype. Also only while Unsloth's attention forward is installed
-    (_gpt_oss_attention_input casts its float32 input for a float16 q / k / v); UNSLOTH_COMPILE_DISABLE=1 or
-    UNSLOTH_ENABLE_FLEX_ATTENTION=0 keep stock attention, so the activation dtype too.
+    Only for Unsloth-routed calls (they cast the router input) with Unsloth's attention installed (it casts q/k/v
+    input); stock MLP / attention would reject a float32 stream. UNSLOTH_GPT_OSS_MXFP4_FP32_RESIDUAL=0 disables.
     """
     if (
         routed_by_unsloth
@@ -3183,8 +3170,6 @@ def forward_mxfp4_gpt_oss_with_lora(
             f"LoRA={gate_up_lora is not None or down_lora is not None}, experts={self.num_experts}."
         )
 
-    # The native kernels and mxfp4_ogs_experts_forward return bf16: cast to the activation dtype, or to float32 when
-    # training on float16 (_mxfp4_experts_out_dtype).
     out_dtype = _mxfp4_experts_out_dtype(
         self, hidden_states.dtype, routing_data is not None and not isinstance(routing_data, torch.Tensor),
     )
@@ -3464,12 +3449,7 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 
 def _gpt_oss_attention_input(attention, hidden_states):
-    """float32 activations into a float16 dense q/k/v (outside autocast) are cast to float16, as autocast would.
-
-    float16 MXFP4 training keeps the residual stream float32 after the first experts call (_mxfp4_experts_out_dtype),
-    so input_layernorm returns float32; a plain float16 Linear rejects that (a LoRA layer casts it itself). Quantized
-    (bnb-4bit) and same-dtype projections pass through unchanged.
-    """
+    """Cast a float32 stream to float16 for a float16 dense q/k/v outside autocast, as autocast would."""
     if hidden_states.dtype != torch.float32 or torch.is_autocast_enabled():
         return hidden_states
     proj = getattr(attention.q_proj, "base_layer", attention.q_proj)
