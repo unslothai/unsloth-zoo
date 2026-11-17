@@ -1068,7 +1068,7 @@ def _make_lookup_op():
         # A fresh tensor: a custom op's output must not be one it handed out before (the memo's rows).
         return _module_for(handle)._lookup(ids).to(dtype, copy=True)
 
-    # This module defers annotations (strings); torch 2.4 / 2.6 infer_schema needs the real types.
+    # This module defers annotations (strings); torch 2.4 infer_schema needs the real types.
     lookup.__annotations__ = {"ids": torch.Tensor, "handle": int, "dtype": torch.dtype, "return": torch.Tensor}
 
     def fake(ids, handle, dtype):

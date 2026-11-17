@@ -1247,7 +1247,7 @@ def test_load_hook_keeps_the_markers_of_patches_below_it(monkeypatch, kind):
 
 
 def test_lookup_op_registers_where_schema_inference_needs_real_types(monkeypatch):
-    # torch 2.4 / 2.6 infer_schema rejects string annotations ('torch.Tensor'); the op must still register there
+    # torch 2.4 infer_schema rejects string annotations ('torch.Tensor'); the op must still register there
     import unsloth_zoo.frozen_table_store as fts
 
     seen = []
