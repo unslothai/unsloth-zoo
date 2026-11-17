@@ -492,8 +492,8 @@ def _forward_generic_experts_eagerly(resolve_backend, self, hidden_states, top_k
     """Kept out of compiled regions: traced there, the backend recomputed a different graph under
     gradient checkpointing (CheckpointError). Unsloth's per-layer block compile keeps one graph per
     layer across the recompute, so inside it (UNSLOTH_DECODE_COMPILE set) the backend is traced,
-    resolved ahead of time: the resolver's cache-file checks are not traceable. Eagerly too, once
-    resolved: the resolver re-reads and compares the cached moe_utils.py on every call, per layer."""
+    resolved ahead of time: the resolver's cache-file checks are not traceable. Eager calls reuse it
+    too: the resolver re-reads moe_utils.py per call."""
     backend = _moe_utils._CACHED_FORWARD_MOE_BACKEND
     if backend is None:
         backend = resolve_backend()

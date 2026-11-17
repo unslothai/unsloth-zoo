@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The experts dispatch runs once per MoE layer per forward: it must reuse the resolved backend, since
-get_forward_moe_backend() re-reads and compares the cached moe_utils.py on every call."""
+"""MoE dispatch must reuse the resolved backend instead of re-resolving it per forward."""
 
 import pytest
 import torch
@@ -57,7 +56,6 @@ def test_dispatch_reuses_the_resolved_backend(monkeypatch, resolved):
         out = mei._unsloth_experts_dispatch(experts, hidden, torch.zeros(2, 1, dtype = torch.long), torch.ones(2, 1))
         assert out is hidden
     assert seen == [experts] * 3
-    # Resolved once (at most), not once per forward.
     assert len(lookups) == (0 if resolved else 1)
 
 

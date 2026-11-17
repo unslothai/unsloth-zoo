@@ -293,7 +293,7 @@ def _unsloth_experts_dispatch(
         if fallback is None:
             return type(self).forward.__wrapped__(self, hidden_states, top_k_index, top_k_weights)
         return fallback(self, hidden_states, top_k_index, top_k_weights)
-    # The resolved backend: get_forward_moe_backend() re-reads and compares the cached moe_utils.py on every call.
+    # get_forward_moe_backend() re-reads the cached moe_utils.py on every call.
     moe_utils = _moe_utils_module()
     backend = getattr(moe_utils, "_CACHED_FORWARD_MOE_BACKEND", None) or moe_utils.get_forward_moe_backend()
     return backend(self, hidden_states, top_k_index, top_k_weights)
