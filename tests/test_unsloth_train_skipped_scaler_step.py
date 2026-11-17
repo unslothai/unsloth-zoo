@@ -37,7 +37,9 @@ def _collate(rows):
     return {"input_ids": ids, "labels": ids.clone()}
 
 
-def test_lr_schedule_does_not_advance_on_a_skipped_scaler_step(monkeypatch, tmp_path):
+# Fused AdamW is always called and skips inside its kernel, so only the scale shows the skip.
+@pytest.mark.parametrize("optim", ["adamw_torch", "adamw_torch_fused"])
+def test_lr_schedule_does_not_advance_on_a_skipped_scaler_step(monkeypatch, tmp_path, optim):
     monkeypatch.setattr(training_utils, "DEVICE_TYPE", "xpu")
     monkeypatch.setattr(training_utils, "DEVICE_TYPE_TORCH", "cpu", raising = False)
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self, *a, **k: self)
@@ -63,7 +65,7 @@ def test_lr_schedule_does_not_advance_on_a_skipped_scaler_step(monkeypatch, tmp_
         args = TrainingArguments(
             output_dir = str(tmp_path), report_to = "none", dataloader_pin_memory = False,
             per_device_train_batch_size = 1, logging_steps = 1000, max_steps = 2,
-            learning_rate = 1e-2,
+            learning_rate = 1e-2, optim = optim,
         ),
         model = model,
         train_dataset = [{"input_ids": [1, 2, 3]}] * 2,
@@ -72,5 +74,4 @@ def test_lr_schedule_does_not_advance_on_a_skipped_scaler_step(monkeypatch, tmp_
     training_utils.unsloth_train(trainer)
 
     assert model.forward_calls == 2
-    # Step 1 overflowed and the scaler skipped the optimizer: only step 2 may move the schedule.
     assert len(scheduler_steps) == 1
