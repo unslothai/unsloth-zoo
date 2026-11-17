@@ -441,11 +441,7 @@ _DEQUANT_MERGE_BASE_MODEL_TYPES = frozenset({"falcon_h1"})
 def _model_type_needs_dequant_merge_base(model) -> bool:
     """True iff `model`'s architecture is one whose on-the-fly bnb-4bit merged_16bit
     export must use dequant(W4) as the LoRA merge base instead of the downloaded W16.
-    UNSLOTH_QLORA_MERGE_BASE=dequant forces dequant(W4) for every architecture: the adapter was
-    trained against dequant(W4), and folding it onto W16 instead lost 66-94% of the exact-match
-    accuracy on learned symbol facts (Qwen3-0.6B, Llama-3.2-1B, Gemma-3-1B QLoRA, 2 seeds each),
-    while W16 kept the lower generic held-out NLL. =original forces W16; unset / auto keeps the
-    per-architecture default."""
+    UNSLOTH_QLORA_MERGE_BASE=dequant|original overrides: the adapter trained against dequant(W4)."""
     choice = os.environ.get("UNSLOTH_QLORA_MERGE_BASE", "auto").strip().lower()
     if choice in ("dequant", "dequantized", "4bit"): return True
     if choice in ("original", "16bit"): return False
@@ -467,13 +463,7 @@ def _is_bnb_4bit_base(module):
 pass
 
 
-# Rounding of a merged float32 weight W + s * B @ A into a bf16 / fp16 checkpoint slot.
-# Round to nearest (a plain .to(dtype)) drops every delta element below half a 16-bit ulp of W, so
-# low learning rate runs lose part of their effect once merged: Qwen3-0.6B / 1.7B LoRA SFT keeps
-# 85% of its held-out NLL gain at lr 5e-6 (the GRPO / DPO default) and 66-71% at 2e-6 in bf16.
-# Stochastic rounding picks each neighbour with probability proportional to proximity, so the
-# merged weight equals W + s * B @ A in expectation: 99.5-100% at 5e-6, 98-100% at 2e-6, and within
-# A/A noise of round to nearest at lr 2e-4. UNSLOTH_MERGE_ROUNDING=nearest restores the old bits.
+# Stochastic rounding: round to nearest drops low-lr LoRA deltas below half a 16-bit ulp of W.
 _MERGE_ROUNDING_MODES = ("nearest", "stochastic")
 _MERGE_ROUNDING_DEFAULT = "stochastic"
 _SR_CHUNK = 1 << 24
@@ -495,10 +485,7 @@ pass
 
 
 def _stochastic_round(W, dtype, key):
-    """Round a float32 tensor to bf16 / fp16 choosing between the two neighbours of each element
-    with probability proportional to proximity, so E[out] == W. Elements already representable
-    in `dtype` (an untouched base weight) are returned exactly. The noise comes from a generator
-    on W's device seeded by `key`, so a merge is bit-reproducible on the same device type."""
+    """Unbiased (E[out] == W) rounding, seeded by `key` so a merge is bit-reproducible."""
     if dtype not in (torch.bfloat16, torch.float16) or W.dtype != torch.float32:
         return W.to(dtype)
     import zlib
@@ -509,15 +496,12 @@ def _stochastic_round(W, dtype, key):
     for start in range(0, flat.numel(), _SR_CHUNK):
         x = flat[start : start + _SR_CHUNK]
         if dtype == torch.bfloat16:
-            # bf16 is the top half of a float32: add uniform noise to the 16 dropped bits and
-            # truncate, which rounds up with probability equal to the dropped fraction.
             noise = torch.randint(0, 1 << 16, x.shape, device = x.device, dtype = torch.int32, generator = gen)
             y = ((x.view(torch.int32) + noise) & -65536).view(torch.float32)
             out[start : start + _SR_CHUNK] = torch.where(torch.isfinite(x), y, x).to(dtype)
             continue
         r = x.to(dtype)
         err = x - r.float()
-        # The fp16 neighbour of r on the side of x: one step in sign-magnitude bit space.
         bits = r.view(torch.int16).to(torch.int32) & 0xFFFF
         sign = bits & 0x8000
         mag = bits & 0x7FFF
@@ -535,8 +519,6 @@ pass
 
 
 def _round_merged_weight(W, dtype, key):
-    # Applied to a merged LoRA weight before it is written into a `dtype` slot; float32 slots
-    # (dtype = torch.float32 export) and the default round-to-nearest leave W untouched.
     if dtype in (torch.bfloat16, torch.float16) and W.dtype == torch.float32 \
             and _merge_rounding_mode() == "stochastic":
         return _stochastic_round(W, dtype, key)
@@ -6158,8 +6140,7 @@ def merge_and_overwrite_lora(
         if _merge_weight_block_size is None:
             # A 4bit load holds a bitsandbytes config in memory.
             _merge_weight_block_size = _fp8_disk_block_size
-    # Gated archs (or UNSLOTH_QLORA_MERGE_BASE=dequant) + 16bit merge only: fold each LoRA delta onto
-    # dequant(W4) instead of W16 (see _merge_lora); only a live bnb-4bit base is affected there.
+    # QLoRA merge base: dequant(W4) instead of W16 (see _merge_lora).
     _use_dequant_base = (
         save_method == "merged_16bit"
         and _model_type_needs_dequant_merge_base(_merge_base_model)

@@ -15,9 +15,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Stochastic rounding of merged LoRA weights (default; UNSLOTH_MERGE_ROUNDING=nearest opts out): a delta
-below half a 16-bit ulp of the base weight survives the merge in expectation instead of vanishing,
-deterministically and only for 16-bit slots."""
+"""Stochastic merge rounding keeps sub-ulp LoRA deltas in expectation."""
 
 from __future__ import annotations
 
@@ -35,7 +33,6 @@ DELTA = 2.0 ** -16
 
 
 def _gap_up(r):
-    # Distance from r (positive, normal) to the next representable value above it.
     bits = r.view(torch.int16).to(torch.int32)
     return ((bits + 1).to(torch.int16).view(r.dtype).float() - r.float())
 
@@ -57,7 +54,6 @@ def test_rounds_to_a_neighbour_and_is_unbiased(dtype):
         x = base.float() + frac * ulp
         out = S._stochastic_round(x, dtype, f"unbiased.{frac}").float()
         assert set(out.unique().tolist()) <= {1.0, 1.0 + ulp}
-        # Binomial mean: frac within 6 standard errors.
         se = (frac * (1 - frac) / x.numel()) ** 0.5
         assert abs(float((out - 1.0).mean()) / ulp - frac) < 6 * se
     # Below zero, across a binade edge (the gap below 1.0 is half the gap above).
@@ -104,7 +100,6 @@ def test_mode_switch(monkeypatch):
     monkeypatch.setenv("UNSLOTH_MERGE_ROUNDING", "stochastic")
     out = S._round_merged_weight(x, torch.bfloat16, "k")
     assert out.dtype == torch.bfloat16 and bool((out.float() != 1.0).any())
-    # float32 slots (dtype = torch.float32 exports) are never rounded.
     assert S._round_merged_weight(x, torch.float32, "k") is x
     monkeypatch.setenv("UNSLOTH_MERGE_ROUNDING", "bogus")
     with pytest.warns(UserWarning):
@@ -126,7 +121,6 @@ def _merge_tiny_delta(tmp_path, tag, mode, monkeypatch):
         for name, mod in H._iter_lora_modules(peft_model):
             key = H._module_to_key(name, None)
             A = mod.lora_A["default"].weight; B = mod.lora_B["default"].weight; s = float(mod.scaling["default"])
-            # rank-1 delta s * B @ A == DELTA in every element
             B.zero_(); A.zero_()
             B[:, :1] = 1.0; A[:1, :] = DELTA / s
             deltas[key] = s * (B.float() @ A.float())
@@ -159,15 +153,12 @@ def test_sub_ulp_delta_vanishes_with_nearest_and_survives_by_default(tmp_path, m
         # Round to nearest: the whole delta is lost on those elements.
         assert torch.equal(rtn[key][big], base[key][big])
         got = (sr[key].float() - W)[big]
-        # Stochastic: each element moves by 0 or one ulp in the direction of the delta.
         assert bool(((got == 0) | (got > 0)).all())
         got_sum += float(got.double().sum()); want_sum += float(d[big].double().sum())
-        # Bit-reproducible: a second merge writes the same tensor.
         assert torch.equal(sr[key].view(torch.int16), sr2[key].view(torch.int16))
     assert checked >= 10000, checked
     # The delta survives on average (binomial noise over >= 10k elements is a few percent).
     assert abs(got_sum / want_sum - 1.0) < 0.1, got_sum / want_sum
-    # Untargeted tensors stay byte-identical under both modes.
     for key in base:
         if key not in deltas:
             assert torch.equal(sr[key].view(torch.int16), base[key].view(torch.int16))

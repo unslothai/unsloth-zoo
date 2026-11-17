@@ -15,8 +15,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_QLORA_MERGE_BASE picks the merged_16bit base for a QLoRA adapter: dequant(W4), the weights
-it trained against, or the downloaded W16; unset keeps the per-architecture default."""
+"""UNSLOTH_QLORA_MERGE_BASE picks dequant(W4) or W16 as the QLoRA merge base."""
 
 from types import SimpleNamespace
 
@@ -52,7 +51,6 @@ def test_original_forces_the_downloaded_16bit_base(monkeypatch):
 
 
 def test_every_lora_merge_of_the_16bit_path_forwards_the_choice():
-    # The MoE expert merge must honour UNSLOTH_QLORA_MERGE_BASE too (per-expert adapters on a 4bit base).
     import ast
     import inspect
     import textwrap
