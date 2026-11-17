@@ -584,6 +584,8 @@ def test_offloaded_experts_take_the_nax_expert_routes(tmp_path, monkeypatch, int
         monkeypatch.setattr(nax, "gap_open", lambda name: True)
         monkeypatch.setattr(nax, "sorted_gather_qmm", stand_in)
         monkeypatch.setattr(nax, "int8_gather_qmm", stand_in)
+        # The int8 check compares against int8-rounded activations, which the stock stand-in does not use.
+        monkeypatch.setattr(inference, "_nax_int8_qmm_matches_native", lambda *args: True)
     stock = _lazy_copy(lambda: _moe("lm", hidden = 128), str(tmp_path))
     # Within the slots: too few routes per expert for the full table's sorted kernel, then enough; over the slots.
     calls = [(mx.random.normal((1, n, 512), key = mx.random.key(n)).astype(mx.bfloat16), _routes((1, n), n, among))
