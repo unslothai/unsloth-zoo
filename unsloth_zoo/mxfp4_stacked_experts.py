@@ -23,7 +23,12 @@ import torch.nn.functional as F
 
 from .mxfp4_dequant import Mxfp4ExpertParam, is_mxfp4_expert_param, mxfp4_dequantize
 from .mxfp4_gemm import _gemv_rows, mxfp4_gemm_available, mxfp4_grouped_gemv_available, mxfp4_grouped_matmul
-from .temporary_patches.moe_triton_kernels import weighted_unpermute
+
+try:
+    # Triton combine, bit-identical to the eager one below; returns None (eager path) off CUDA or without Triton.
+    from .temporary_patches.moe_triton_kernels import weighted_unpermute as _weighted_unpermute
+except Exception:
+    _weighted_unpermute = None
 
 __all__ = [
     "Mxfp4StackedExperts",
@@ -377,16 +382,14 @@ class Mxfp4StackedExperts(nn.Module):
         if delta is not None:
             out = out + delta
 
-        combined = weighted_unpermute(
-            out,
-            order,
-            topk_weight.to(torch.float32).reshape(-1)[order],
-            num_tokens,
-            top_k,
-            out_dtype = hidden_states.dtype,
-        )
-        if combined is not None:
-            return combined
+        # One pass over the routed rows instead of a [T, top_k, H] fp32 product; gradients reach out and topk_weight.
+        if _weighted_unpermute is not None and out.is_cuda and num_tokens > 0:
+            combined = _weighted_unpermute(
+                out, order, topk_weight.to(torch.float32).reshape(-1)[order], num_tokens, top_k,
+                out_dtype = hidden_states.dtype,
+            )
+            if combined is not None:
+                return combined
         unsorted = torch.empty_like(out)
         unsorted[order] = out
         weighted = unsorted.view(num_tokens, top_k, out.shape[-1]).to(torch.float32) * topk_weight.to(
