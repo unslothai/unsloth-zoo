@@ -441,6 +441,11 @@ def _patch_gemma4_text_attention(module, prefix):
     # Eager: the mask check syncs to host.
     packed_document_sdpa = torch.compiler.disable(_packed_document_sdpa, recursive = True)
     packed_documents = os.environ.get("UNSLOTH_GEMMA4_PACKED_DOCUMENTS", "1") != "0"
+    # q / k / v and RoPE stay float32, but SDPA only needs float16 operands: its kernels keep QK^T, the softmax
+    # and PV in float32 internally. Without bf16 (T4) the float32 mem-efficient kernel dominates the step
+    # (Gemma-4-E2B 4-bit LoRA on T4, packed 4 x 1024: 578 -> 744 tok/s). Kill switch: UNSLOTH_GEMMA4_FP16_SDPA=0.
+    fp16_sdpa = os.environ.get("UNSLOTH_GEMMA4_FP16_SDPA", "1") != "0"
+    _fp16_min = torch.finfo(torch.float16).min
 
     def forward(
         self,
@@ -556,8 +561,18 @@ def _patch_gemma4_text_attention(module, prefix):
             )  # returns (b, q, h, d), already transposed
         else:
             attn_mask = attention_mask
+            sdpa_dtype = torch.float16 if (
+                fp16_sdpa and query_states.is_cuda and query_states.dtype == torch.float32
+                and not (self.training and self.attention_dropout)
+            ) else torch.float32
             if isinstance(attn_mask, torch.Tensor) and attn_mask.dtype != torch.bool:
                 attn_mask = attn_mask.to(torch.float32)
+                if sdpa_dtype is torch.float16:
+                    attn_mask = attn_mask.clamp(min = _fp16_min).to(torch.float16)
+            if sdpa_dtype is torch.float16:
+                query_states = query_states.to(torch.float16)
+                key_states = key_states.to(torch.float16)
+                value_states = value_states.to(torch.float16)
             is_causal = attn_mask is None and query_states.shape[2] > 1 and getattr(self, "is_causal", True)
             attn_output = None
             if (
