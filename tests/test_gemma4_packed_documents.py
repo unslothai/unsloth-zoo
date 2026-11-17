@@ -184,7 +184,7 @@ _LENGTHS = [
 @pytest.mark.parametrize("w", [None, 4])
 @pytest.mark.parametrize("Hkv", [4, 2])
 @pytest.mark.parametrize("lengths", _LENGTHS)
-def test_equal_length_runs_match_the_loop_bit_for_bit(monkeypatch, lengths, Hkv, w, dtype):
+def test_equal_length_runs_match_the_loop(monkeypatch, lengths, Hkv, w, dtype):
     torch.manual_seed(0)
     T, H, d = sum(lengths), 4, 16
     mask = _block_causal(lengths, w)
@@ -200,8 +200,9 @@ def test_equal_length_runs_match_the_loop_bit_for_bit(monkeypatch, lengths, Hkv,
         out = _packed_document_sdpa(q, k, v, mask, psl, w, 1.0, H // Hkv, batch_equal_lengths=batched)
         results[batched] = (out.detach(), *torch.autograd.grad(out, (q, k, v), g), len(calls))
     loop, batched = results[False], results[True]
+    # CPU SDPA may split a batch of n documents differently from n batch-1 calls, so the bits can differ.
     for a, b in zip(loop[:4], batched[:4]):
-        assert torch.equal(a, b)
+        torch.testing.assert_close(b, a)
     assert loop[4] == len(lengths) and batched[4] == _runs(lengths)
     ref = F.scaled_dot_product_attention(*(x.repeat_interleave(H // x.shape[1], 1) for x in leaves),
                                          attn_mask=mask, scale=1.0)
@@ -220,7 +221,7 @@ def test_equal_length_documents_share_one_call_and_the_kill_switch_restores_the_
     monkeypatch.setenv("UNSLOTH_GEMMA4_PACKED_BATCH", "0")
     loop = _packed_document_sdpa(q, q, q, mask, psl, None, 1.0, 1)
     assert calls == [1] * len(lengths)
-    assert torch.equal(batched, loop)
+    torch.testing.assert_close(batched, loop)  # not bitwise on CPU: see above
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA SDPA kernels")
