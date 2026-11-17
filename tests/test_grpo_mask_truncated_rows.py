@@ -25,6 +25,12 @@ import unsloth_zoo.rl_replacements as _rl
 
 
 @pytest.fixture(autouse = True)
+def _score_every_row(monkeypatch):
+    # These batches carry zero advantages: they test the rows the forward sees, not the zero-advantage skip.
+    monkeypatch.setenv("UNSLOTH_GRPO_SKIP_ZERO_ADVANTAGE", "0")
+
+
+@pytest.fixture(autouse = True)
 def _log_prob_route(monkeypatch):
     # These stub UnslothEfficientGRPO, the log-prob route; test_grpo_fused_route.py covers the forward-gradient one.
     import unsloth_zoo.fused_losses.fused_grpo as _fused_grpo

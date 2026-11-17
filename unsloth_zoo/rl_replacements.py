@@ -963,6 +963,9 @@ def grpo_compute_loss(
     # Per-completion weights from unsloth's generation step (ScaleRL zero-variance exclusion /
     # prompt-level aggregation), normalised over the whole generation batch; replaces the loss_type normaliser.
     sample_weight = kwargs.get("sample_weight", None)
+    # Full micro-batch counts when zero-advantage rows were skipped: normaliser stays the full batch's.
+    full_batch_rows = kwargs.get("full_batch_rows", None)
+    full_batch_tokens = kwargs.get("full_batch_tokens", None)
     # Only direct callers see this fallback; the trainer always forwards an explicit value.
     use_bias_correction_kl = kwargs.get("use_bias_correction_kl", False)
     input_ids = input_ids.unsqueeze(-1)
@@ -1215,14 +1218,17 @@ def grpo_compute_loss(
             normalizer = normalizer * current_gradient_accumulation_steps / steps_per_generation
         loss = (loss_i * mask * sample_weight.to(loss_i.dtype).unsqueeze(-1)).sum() / normalizer
     elif loss_type in ["grpo", "sapo"]:
-        loss = ((loss_i * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
+        loss = (loss_i * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
+        loss = loss.mean() if full_batch_rows is None else loss.sum() / full_batch_rows
         loss = loss / current_gradient_accumulation_steps
     elif loss_type == "bnpo":
         # BNPO uses the local micro-batch token count even when TRL supplies a global count.
-        loss = (loss_i * mask).sum() / mask.sum().clamp(min=1.0)
+        n_tokens = mask.sum() if full_batch_tokens is None else full_batch_tokens
+        loss = (loss_i * mask).sum() / n_tokens.clamp(min=1.0)
         loss = loss / current_gradient_accumulation_steps
     elif loss_type == "dr_grpo":
-        loss = (loss_i * mask).sum() / (loss_i.size(0) * max_completion_length)
+        n_rows = loss_i.size(0) if full_batch_rows is None else full_batch_rows
+        loss = (loss_i * mask).sum() / (n_rows * max_completion_length)
         loss = loss / current_gradient_accumulation_steps
     elif loss_type in ["cispo", "dapo", "vespo"]:
         # Floor at 1 like TRL: a fully masked batch (mask_truncated_completions) is 0/0 = nan otherwise.
@@ -2576,6 +2582,91 @@ pass
 RL_REPLACEMENTS["grpo_rollout_old_fill_unscored"] = grpo_rollout_old_fill_unscored
 
 
+def grpo_old_logps_from_new(new_logps):
+    """pi_old when generation is aligned to the optimizer step (no step since rollout), as TRL does."""
+    return new_logps.detach()
+pass
+RL_REPLACEMENTS["grpo_old_logps_from_new"] = grpo_old_logps_from_new
+
+
+def _grpo_positive_rate(value):
+    if isinstance(value, dict):
+        return any(_grpo_positive_rate(v) for v in value.values())
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+
+def grpo_policy_is_stochastic(model):
+    """True if train-mode forwards are random (dropout, LoHa/LoKr rank/module dropout, router jitter)."""
+    if model is None:
+        return False
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.dropout._DropoutNd) and _grpo_positive_rate(float(getattr(module, "p", 0.0) or 0.0)):
+            return True
+        for name in ("jitter_noise", "rank_dropout", "module_dropout"):
+            if _grpo_positive_rate(getattr(module, name, None)):
+                return True
+    config = getattr(model, "config", None)
+    for cfg in (config, getattr(config, "text_config", None)):
+        if cfg is None:
+            continue
+        values = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(vars(cfg))
+        for key, value in values.items():
+            if (
+                ("dropout" in key or key.endswith("pdrop") or "jitter" in key)
+                and not key.startswith("classifier")
+                and _grpo_positive_rate(value)
+            ):
+                return True
+    return False
+pass
+RL_REPLACEMENTS["grpo_policy_is_stochastic"] = grpo_policy_is_stochastic
+
+
+def grpo_policy_has_experts(model):
+    """MoE policy: dropping rows can leave an expert with a None (not zero) grad, changing AdamW."""
+    config = getattr(model, "config", None)
+    for cfg in (config, getattr(config, "text_config", None)):
+        if cfg is None:
+            continue
+        for name in ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts", "num_experts_per_tok"):
+            value = getattr(cfg, name, None)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return True
+    return False
+pass
+RL_REPLACEMENTS["grpo_policy_has_experts"] = grpo_policy_has_experts
+
+
+def grpo_zero_advantage_keep(advantages, total_rows, group_size = None):
+    """Rows with a nonzero advantage (exact zeros only), or None to score all. group_size drops whole
+    groups (PrefixGrouper). At least one row is kept so every rank still joins DDP's reduction."""
+    if not torch.is_tensor(advantages) or total_rows <= 0 or advantages.shape[0] != total_rows:
+        return None
+    zero = (advantages.detach().reshape(total_rows, -1) == 0).all(dim = 1)
+    if group_size is not None and group_size >= 2 and total_rows % group_size == 0:
+        zero = zero.view(-1, group_size).all(dim = 1, keepdim = True).expand(-1, group_size).reshape(-1)
+    keep = ~zero
+    n_keep = int(keep.sum().item())
+    if n_keep == total_rows:
+        return None
+    if n_keep == 0:
+        keep = torch.zeros_like(keep)
+        keep[0] = True
+    return keep.nonzero().squeeze(1)
+pass
+RL_REPLACEMENTS["grpo_zero_advantage_keep"] = grpo_zero_advantage_keep
+
+
+def grpo_zero_advantage_expand(keep, total_rows, value, fill):
+    """Scatter a per-row tensor of the kept rows back to total_rows rows, filling the dropped ones."""
+    if not torch.is_tensor(value) or value.dim() == 0 or value.shape[0] != keep.numel():
+        return value
+    full = torch.full((total_rows, *value.shape[1:]), fill, dtype = value.dtype, device = value.device)
+    return full.index_copy(0, keep.to(value.device), value)
+pass
+RL_REPLACEMENTS["grpo_zero_advantage_expand"] = grpo_zero_advantage_expand
+
+
 def grpo_rollout_as_old_ratio_metrics(coef_1, mask, log_ratio = None):
     """(|log r|, r) zero-filled outside the mask, r = pi_theta / pi_rollout per token, for the
     sampling_logp_difference / importance_sampling_ratio metrics when pi_old is the rollout policy.
@@ -2885,6 +2976,8 @@ def grpo_accumulated_loss(
     # input and grpo_compute_loss returns None (not empty) delta/flat_is_ratio.
     # Set by unsloth when UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1 skipped the old-policy forward.
     _rollout_logps_as_old = bool(kwargs.pop("rollout_logps_as_old", False))
+    _old_from_new = bool(kwargs.pop("old_logps_from_new", False)) and old_logps is None and not _rollout_logps_as_old
+    _row_keep = None
     # TRL defaults the correction flag to True without vLLM too, but only applies the ratio with use_vllm.
     _sampling_logps_used = (
         (getattr(trainer, "use_vllm", False) and getattr(trainer, "vllm_importance_sampling_correction", False))
@@ -3193,6 +3286,86 @@ def grpo_accumulated_loss(
         if _rollout_logps_as_old:
             old_logps, sampling_per_token_logps = grpo_rollout_logps_as_old(sampling_per_token_logps, old_logps)
 
+        # Skip zero-advantage rows (beta = 0, no entropy). Off for vision, rollout-logps pi_old, DeepSpeed /
+        # FSDP (collective forwards), random forwards (masks shift) and MoE (None grads change AdamW).
+        _row_keep = None
+        _full_rows = total_rows
+        if (
+            pixel_values is None
+            and token_type_ids is None
+            and mm_token_type_ids is None
+            and os.environ.get("UNSLOTH_GRPO_SKIP_ZERO_ADVANTAGE", "1") != "0"
+            and float(getattr(trainer, "beta", 0.0) or 0.0) == 0.0
+            and kwargs.get("loss_type", "grpo") in ("grpo", "bnpo", "dr_grpo", "dapo")
+            and not _need_entropy
+            and not _rollout_logps_as_old
+            and not _rollout_metrics_on
+            and not _collective_forwards
+            and not getattr(trainer, "is_deepspeed_enabled", False)
+            and not getattr(trainer, "is_fsdp_enabled", False)
+        ):
+            _row_policy_ok = getattr(trainer, "_unsloth_zero_advantage_policy_ok", None)
+            if _row_policy_ok is None:
+                from unsloth_zoo.rl_replacements import grpo_policy_is_stochastic, grpo_policy_has_experts
+                _row_policy_ok = not (grpo_policy_is_stochastic(trainer.model) or grpo_policy_has_experts(trainer.model))
+                trainer._unsloth_zero_advantage_policy_ok = _row_policy_ok
+        else:
+            _row_policy_ok = False
+        if _row_policy_ok:
+            from unsloth_zoo.rl_replacements import grpo_zero_advantage_keep as _grpo_zero_advantage_keep
+            # PrefixGrouper (no vLLM) lays rows out as [groups, G]: drop whole groups so its layout survives.
+            _row_group = None
+            if not getattr(trainer, "use_vllm", False) and os.environ.get("UNSLOTH_GRPO_PREFIX_GROUPER", "1").lower() not in ("0", "false", "no", "off"):
+                _row_group = getattr(trainer, "num_generations", None)
+            _row_keep = _grpo_zero_advantage_keep(advantages, total_rows, _row_group)
+            _row_metrics = getattr(trainer, "_metrics", None)
+            if isinstance(_row_metrics, dict):
+                if "train" in _row_metrics:
+                    _row_metrics = _row_metrics["train" if _training else "eval"]
+                _row_metrics.setdefault("unsloth/zero_advantage_rows_skipped", []).append(
+                    0.0 if _row_keep is None else 1.0 - _row_keep.numel() / max(total_rows, 1)
+                )
+        if _row_keep is not None:
+            _row_keep = _row_keep.to(input_ids.device)
+            _full_mask = completion_mask
+            if kept_completion_rows is not None:
+                _full_mask = _full_mask * kept_completion_rows.to(device = _full_mask.device, dtype = _full_mask.dtype)
+            _full = dict(
+                mask = _full_mask, old = old_logps, sampling = sampling_per_token_logps,
+                ids = completion_input_ids, advantages = advantages,
+            )
+            kwargs["full_batch_rows"] = torch.tensor(float(total_rows), dtype = torch.float32, device = completion_mask.device)
+            kwargs["full_batch_tokens"] = _full_mask.to(torch.float32).sum()
+
+            def _rows(x):
+                if torch.is_tensor(x) and x.dim() > 0 and x.shape[0] == _full_rows:
+                    return x.index_select(0, _row_keep.to(x.device))
+                return x
+            input_ids = _rows(input_ids)
+            attention_mask = _rows(attention_mask)
+            completion_input_ids = _rows(completion_input_ids)
+            completion_mask = _rows(completion_mask)
+            advantages = _rows(advantages)
+            old_logps = _rows(old_logps)
+            ref_logps = _rows(ref_logps)
+            sampling_per_token_logps = _rows(sampling_per_token_logps)
+            kept_completion_rows = _rows(kept_completion_rows)
+            if pixel_values is None:
+                left_pad_tokens_per_prompt = _rows(left_pad_tokens_per_prompt)
+            if kwargs.get("sample_weight", None) is not None:
+                kwargs["sample_weight"] = _rows(kwargs["sample_weight"])
+            total_rows = input_ids.shape[0]
+            if trainer.args.unsloth_grpo_mini_batch is None:
+                B, multiplier = autotune_batch_and_chunks(
+                    total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
+                )
+                B = max(1, total_rows//B)
+            else:
+                B = min(B, total_rows)
+            trainer._unsloth_zero_advantage_rows_skipped = (
+                getattr(trainer, "_unsloth_zero_advantage_rows_skipped", 0) + _full_rows - total_rows
+            )
+
         unwrapped_model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False)
 
         for module in unwrapped_model.modules():
@@ -3217,6 +3390,8 @@ def grpo_accumulated_loss(
                 trainer._autocast_dtype == torch.float16 if _autocast_on else lm_head.dtype == torch.float16
             ) and (trainer.accelerator.scaler is None or trainer.accelerator.scaler.get_scale() < 128.0),
         )
+        # The fused op needs pi_old before scoring and weights by scored-row counts: use the log-prob op.
+        _fused_route = _fused_route and not _old_from_new and _row_keep is None
         _fused_W = logits_to_keep + max_left_pad if pixel_values is None else logits_to_keep
         _fused_pad = []
         _fused_pack = _fused_pg = None
@@ -4082,6 +4257,9 @@ def grpo_accumulated_loss(
             if not loss_is_scaled_for_ga:
                 upstream_scale = float(kwargs.get("current_gradient_accumulation_steps", 1))
 
+        if _old_from_new:
+            from unsloth_zoo.rl_replacements import grpo_old_logps_from_new as _grpo_old_logps_from_new
+            old_logps = _grpo_old_logps_from_new(new_logprobs)
         _rollout_unscored = None
         if _rollout_logps_as_old:
             old_logps, _rollout_unscored = grpo_rollout_old_fill_unscored(old_logps, new_logprobs)
@@ -4217,6 +4395,34 @@ def grpo_accumulated_loss(
 
     # Force logits (not hidden states) again or output is gibberish.
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
+
+    if _row_keep is not None:
+        # Metrics cover every row: dropped rows use ratio 1 (never clipped) and nan IS values without pi_old.
+        from unsloth_zoo.rl_replacements import grpo_zero_advantage_expand as _expand
+        _dropped = torch.ones(_full_rows, dtype = torch.bool, device = _row_keep.device)
+        _dropped[_row_keep] = False
+        _dropped = _dropped.nonzero().squeeze(1)
+        _is_metric = (
+            torch.is_tensor(delta) and delta.dim() == 2 and delta.shape[0] == _row_keep.numel()
+            and torch.is_tensor(flat_is_ratio) and flat_is_ratio.shape == delta.shape
+        )
+        if _is_metric:
+            delta = _expand(_row_keep, _full_rows, delta, float("nan"))
+            flat_is_ratio = _expand(_row_keep, _full_rows, flat_is_ratio, float("nan"))
+            if _full["old"] is not None and _full["sampling"] is not None:
+                from unsloth_zoo.rl_replacements import grpo_compute_loss as _grpo_compute_loss_eager
+                _pick = lambda x: x.index_select(0, _dropped.to(x.device))
+                _kw = {k: v for k, v in kwargs.items() if k not in ("full_batch_rows", "full_batch_tokens", "sample_weight")}
+                with torch.no_grad():
+                    _out = _grpo_compute_loss_eager(
+                        None, _pick(_full["old"]), _pick(_full["old"]), _pick(_full["sampling"]),
+                        _pick(_full["ids"]), _pick(_full["mask"]), 0.0, _pick(_full["advantages"]), **_kw,
+                    )
+                delta = delta.index_copy(0, _dropped.to(delta.device), _out[3].to(delta.dtype))
+                flat_is_ratio = flat_is_ratio.index_copy(0, _dropped.to(flat_is_ratio.device), _out[4].to(flat_is_ratio.dtype))
+        coef_1 = _expand(_row_keep, _full_rows, coef_1, 1.0)
+        completion_mask = _full["mask"]
+        completion_length = completion_mask.to(torch.float32).sum(1).mean()
 
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, completion_mask
 pass

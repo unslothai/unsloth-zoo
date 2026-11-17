@@ -25,6 +25,12 @@ from torch.overrides import TorchFunctionMode
 import unsloth_zoo.rl_replacements as _rl
 from unsloth_zoo.temporary_patches.common import UNSLOTH_COMPILE_DISABLE
 
+
+@pytest.fixture(autouse = True)
+def _score_every_row(monkeypatch):
+    # These batches carry zero advantages: they test the rows the forward sees, not the zero-advantage skip.
+    monkeypatch.setenv("UNSLOTH_GRPO_SKIP_ZERO_ADVANTAGE", "0")
+
 HIDDEN, VOCAB, ROWS = 16, 64, 4
 
 
