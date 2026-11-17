@@ -369,6 +369,48 @@ def _qsa_attention_training_over(original):
     return attention
 
 
+def _banded_mask_training_over(original):
+    """Inkling's relative-position mask is a Metal kernel with no VJP; training keeps its output and adds the transpose
+    of the gather that its non-Metal branch spells out: out[b, h, i, j] = (rel @ proj)[b, i, h, i + q_offset - j]."""
+    @functools.wraps(original)
+    def banded_additive_mask(rel, proj, q_offset, S, sliding, rel_extent, left_padding=None, shape_ref=None):
+        from .utils import mlx_training_patches_active
+        if not mlx_training_patches_active():
+            return original(rel, proj, q_offset, S, sliding, rel_extent,
+                            left_padding=left_padding, shape_ref=shape_ref)
+        q_offset, S, sliding, rel_extent = int(q_offset), int(S), int(sliding), int(rel_extent)
+        has_padding, has_ref = left_padding is not None, shape_ref is not None
+
+        def unpack(rest):
+            return (rest[0] if has_padding else None), (rest[-1] if has_ref else None)
+
+        @mx.custom_function
+        def mask(rel, proj, *rest):
+            padding, ref = unpack(rest)
+            return original(rel, proj, q_offset, S, sliding, rel_extent, left_padding=padding, shape_ref=ref)
+
+        @mask.vjp
+        def mask_vjp(primals, cotangent, output):
+            rel, proj, *rest = primals
+            padding, _ = unpack(rest)
+            dist = mx.arange(proj.shape[1])
+            key = mx.arange(rel.shape[1])[:, None] + q_offset - dist
+            read = (key >= 0) & (dist < rel_extent)
+            if sliding > 0:
+                read = read & (dist < sliding)
+            if padding is not None:
+                cotangent = mx.where((mx.arange(S) >= padding[:, None])[:, None, None], cotangent, 0)
+            index = mx.broadcast_to(mx.clip(key, 0, S - 1), (*cotangent.shape[:3], key.shape[-1]))
+            grad = mx.where(read, mx.take_along_axis(cotangent, index, axis=-1), 0)
+            grad = grad.astype(mx.float32).transpose(0, 2, 1, 3)
+            d_rel = grad @ proj.astype(mx.float32).T
+            d_proj = rel.reshape(-1, rel.shape[-1]).astype(mx.float32).T @ grad.reshape(-1, grad.shape[-1])
+            return (d_rel.astype(rel.dtype), d_proj.astype(proj.dtype), *map(mx.zeros_like, rest))
+
+        return mask(rel, proj, *(a for a in (left_padding, shape_ref) if a is not None))
+    return banded_additive_mask
+
+
 def _training_wrapper(original, wrap):
     # The inference routes' source contracts read the marker to see through the wrapper.
     wrapped = wrap(original)
@@ -385,6 +427,8 @@ def install_sparse_attention_training():
          _indexed_attention_training_over),
         ("mlx_vlm.models.qwen4_exp.qsa_kernel", "dispatch_qsa_attention",
          _qsa_attention_training_over),
+        ("mlx_vlm.models.inkling.language", "banded_additive_mask",
+         _banded_mask_training_over),
     )
     for module_path, name, wrap in targets:
         module = sys.modules.get(module_path)
