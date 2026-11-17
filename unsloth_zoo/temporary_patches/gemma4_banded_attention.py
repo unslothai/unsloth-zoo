@@ -219,9 +219,7 @@ def _packed_document_sdpa(query, key, value, mask, packed_seq_lengths, w, scalin
         value = value.repeat_interleave(num_key_value_groups, dim=1)
     outs, start, i, n_docs = [], 0, 0, len(lengths)
     while i < n_docs:
-        # Consecutive documents of one length run as one batched call: batch-1 calls leave most SMs idle in the
-        # mem-efficient backward (Gemma-4-E2B 4-bit LoRA on T4, packed 4 x 1024: 744 -> 824 tok/s). Each document
-        # still attends only to itself, so the result is the per-document loop's.
+        # Batch equal-length consecutive documents (batch-1 idles SMs; T4 744 -> 824 tok/s); still per-document.
         L, j = lengths[i], i + 1
         while batch_equal_lengths and j < n_docs and lengths[j] == L:
             j += 1

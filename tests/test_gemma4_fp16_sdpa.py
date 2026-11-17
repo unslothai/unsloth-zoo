@@ -75,11 +75,7 @@ def _capture(monkeypatch):
     return seen
 
 
-# Head dim 512 is Gemma-4's global layers. Each path is measured against a float64 forward on its own weights.
-# Float16 SDPA operands stay well below the error of the upstream bfloat16 forward on the same inputs (what every
-# bf16 GPU runs; B200: 0.07x to 0.16x for the output and every grad) and within 2x the float32 operands' error
-# (1.1x to 1.6x). A fixed tolerance against the float32 path does not hold at 512: there both paths differ by
-# about the float16 rounding of the output they share.
+# Each path vs a float64 forward: fp16 operands well under the bf16 forward's error, within 2x float32's.
 @pytest.mark.parametrize("head_dim", [32, 512])
 @pytest.mark.parametrize("lengths", [None, [16, 16, 8, 8]])
 @pytest.mark.parametrize("layer", [0, 1])
