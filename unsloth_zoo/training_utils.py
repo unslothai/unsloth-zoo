@@ -595,6 +595,12 @@ def prepare_model_for_training(
                     or ".lora_magnitude_vector" in name):
                 upcast = True
                 requires_grad = True
+            elif ".trainable_tokens_delta." in name and param.requires_grad:
+                # PEFT trainable_token_indices trains these rows; freezing them silently skips the requested tokens.
+                # PEFT casts the delta to the embedding dtype in forward, so a float32 master is safe (like LoRA).
+                # param.requires_grad keeps inactive adapters frozen.
+                upcast = True
+                requires_grad = True
             elif (_is_peft_model and "bias" in name and param.requires_grad
                     and ".modules_to_save." not in name):
                 # Respect PEFT's bias setting (bias="all"/"lora_only" mark biases trainable; ref 2343);
