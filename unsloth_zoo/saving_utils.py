@@ -440,7 +440,15 @@ _DEQUANT_MERGE_BASE_MODEL_TYPES = frozenset({"falcon_h1"})
 
 def _model_type_needs_dequant_merge_base(model) -> bool:
     """True iff `model`'s architecture is one whose on-the-fly bnb-4bit merged_16bit
-    export must use dequant(W4) as the LoRA merge base instead of the downloaded W16."""
+    export must use dequant(W4) as the LoRA merge base instead of the downloaded W16.
+    UNSLOTH_QLORA_MERGE_BASE=dequant forces dequant(W4) for every architecture: the adapter was
+    trained against dequant(W4), and folding it onto W16 instead lost 66-94% of the exact-match
+    accuracy on learned symbol facts (Qwen3-0.6B, Llama-3.2-1B, Gemma-3-1B QLoRA, 2 seeds each),
+    while W16 kept the lower generic held-out NLL. =original forces W16; unset / auto keeps the
+    per-architecture default."""
+    choice = os.environ.get("UNSLOTH_QLORA_MERGE_BASE", "auto").strip().lower()
+    if choice in ("dequant", "dequantized", "4bit"): return True
+    if choice in ("original", "16bit"): return False
     try:
         cfg = getattr(model, "config", None)
         mt = (getattr(cfg, "model_type", "") or "").lower()
@@ -6149,8 +6157,8 @@ def merge_and_overwrite_lora(
         if _merge_weight_block_size is None:
             # A 4bit load holds a bitsandbytes config in memory.
             _merge_weight_block_size = _fp8_disk_block_size
-    # Gated archs + 16bit merge only: fold each LoRA delta onto dequant(W4) instead of W16
-    # (see _merge_lora). Strict no-op for every other model/merge.
+    # Gated archs (or UNSLOTH_QLORA_MERGE_BASE=dequant) + 16bit merge only: fold each LoRA delta onto
+    # dequant(W4) instead of W16 (see _merge_lora); only a live bnb-4bit base is affected there.
     _use_dequant_base = (
         save_method == "merged_16bit"
         and _model_type_needs_dequant_merge_base(_merge_base_model)
