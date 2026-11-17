@@ -879,7 +879,9 @@ def _moe_checkpoint_route_impl(
     found = sys.modules[__name__]._checkpoint_route_eager(top_k_index, top_k_weights, grad_mode)
     if found is None:
         return top_k_index.clone(), top_k_weights.clone()
-    return found
+    # Fresh outputs, as the op contract says: Inductor may compute later ops in place into an op's output, which
+    # would overwrite the frame's stored routing (a retain_graph second backward replays it).
+    return found[0].clone(), found[1].clone()
 
 
 def _moe_checkpoint_route_fake(top_k_index, top_k_weights, grad_mode):

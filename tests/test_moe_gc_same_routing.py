@@ -414,3 +414,30 @@ def test_gpt_oss_v5_lora_forward_applies_the_replay_routing_once(monkeypatch, ba
     which, i, w = GptOssExperts().forward(torch.zeros(2, 4), torch.tensor([[0, 1]]), torch.tensor([[0.5, 0.5]]))
     assert which == backend and len(seen) == 1
     assert torch.equal(i, torch.tensor([[1, 2]])) and torch.equal(w, torch.tensor([[1.0, 1.0]]))
+
+
+def test_compiled_replay_leaves_the_stored_routing_intact():
+    # the op's outputs must not be the frame's stored tensors: Inductor reuses a dead output's buffer in place
+    op = gcm._moe_checkpoint_route_op
+    T, k = 64, 4
+    idx0 = torch.randint(0, 8, (T, k))
+    w0 = torch.rand(T, k)
+
+    def g(i, w):
+        idx, wt = op(i, w.detach(), True)
+        return idx * 2 + 1, wt * 3.0
+
+    from torch import _dynamo
+
+    _dynamo.reset()
+    try:
+        frame = gcm.CheckpointRoutingFrame()
+        frame.entries.append((idx0.clone(), w0.clone()))
+        frame.replaying = True
+        f = torch.compile(g, backend = "inductor", fullgraph = True)
+        with gcm._checkpoint_routing_scope(frame, True):
+            a, s = f(idx0, w0)
+        assert torch.equal(a, idx0 * 2 + 1) and torch.equal(s, w0 * 3.0)
+        assert torch.equal(frame.entries[0][0], idx0) and torch.equal(frame.entries[0][1], w0)
+    finally:
+        _dynamo.reset()
