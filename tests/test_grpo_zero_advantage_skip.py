@@ -439,3 +439,69 @@ def test_old_from_new_without_the_flag_keeps_the_none_path(monkeypatch):
     torch.testing.assert_close(a[0], b[0])
     for name in ga:
         torch.testing.assert_close(ga[name], gb[name])
+
+
+# ---- what the two savings refuse: random forwards, mixture of experts, sharded forwards ----
+
+
+def test_stochastic_policy_detector():
+    plain = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Dropout(0.0))
+    assert not rr.grpo_policy_is_stochastic(plain)
+    assert rr.grpo_policy_is_stochastic(torch.nn.Sequential(torch.nn.Dropout(0.1)))
+    assert rr.grpo_policy_is_stochastic(torch.nn.Sequential(torch.nn.Dropout1d(0.1)))
+    loha = torch.nn.Linear(2, 2)
+    loha.rank_dropout = {"default": 0.0}
+    loha.module_dropout = {"default": 0.0}
+    assert not rr.grpo_policy_is_stochastic(torch.nn.Sequential(loha))
+    loha.module_dropout = {"default": 0.05}
+    assert rr.grpo_policy_is_stochastic(torch.nn.Sequential(loha))
+    moe = torch.nn.Linear(2, 2)
+    moe.jitter_noise = 0.01
+    assert rr.grpo_policy_is_stochastic(torch.nn.Sequential(moe))
+    for config, expected in [
+        (types.SimpleNamespace(attention_dropout = 0.0, classifier_dropout = 0.1), False),
+        (types.SimpleNamespace(attention_dropout = 0.1), True),
+        (types.SimpleNamespace(resid_pdrop = 0.1), True),
+        (types.SimpleNamespace(router_jitter_noise = 0.1), True),
+        (types.SimpleNamespace(router_jitter_noise = 0.0, hidden_dropout = 0), False),
+        (types.SimpleNamespace(text_config = types.SimpleNamespace(attention_dropout = 0.2)), True),
+        (types.SimpleNamespace(use_dropout = True), False),   # a flag, not a rate
+    ]:
+        model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+        model.config = config
+        assert rr.grpo_policy_is_stochastic(model) is expected, config
+
+
+def test_expert_detector():
+    dense = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    dense.config = types.SimpleNamespace(hidden_size = 2)
+    assert not rr.grpo_policy_has_experts(dense)
+    for name in ("num_experts", "num_local_experts", "n_routed_experts"):
+        moe = torch.nn.Sequential(torch.nn.Linear(2, 2))
+        moe.config = types.SimpleNamespace(**{name: 8})
+        assert rr.grpo_policy_has_experts(moe)
+    moe = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    moe.config = types.SimpleNamespace(text_config = types.SimpleNamespace(num_experts = 4))
+    assert rr.grpo_policy_has_experts(moe)
+
+
+@pytest.mark.parametrize("case", ["dropout", "experts", "deepspeed", "fsdp"])
+def test_no_skip_for_random_expert_or_sharded_policies(monkeypatch, case):
+    old = _score_old(_Model())
+    orig_trainer = _trainer
+
+    def patched_trainer(model, **kw):
+        trainer = orig_trainer(model, **kw)
+        if case == "dropout":
+            model.drop = torch.nn.Dropout(0.1)
+        elif case == "experts":
+            model.config = types.SimpleNamespace(num_local_experts = 8)
+        elif case == "deepspeed":
+            trainer.is_deepspeed_enabled = True
+        elif case == "fsdp":
+            trainer.is_fsdp_enabled = True
+        return trainer
+    monkeypatch.setitem(globals(), "_trainer", patched_trainer)
+    _, _, calls, trainer = _run(monkeypatch, _ADV, old = old)
+    assert calls == [6]
+    assert not hasattr(trainer, "_unsloth_zero_advantage_rows_skipped")

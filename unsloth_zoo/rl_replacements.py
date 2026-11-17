@@ -2594,6 +2594,58 @@ pass
 RL_REPLACEMENTS["grpo_old_logps_from_new"] = grpo_old_logps_from_new
 
 
+def _grpo_positive_rate(value):
+    if isinstance(value, dict):
+        return any(_grpo_positive_rate(v) for v in value.values())
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+
+def grpo_policy_is_stochastic(model):
+    """True when the policy forward is random in train mode, so two forwards (or one forward over fewer rows)
+    do not reproduce each other: an nn.Dropout with p > 0 (LoRA dropout included), PEFT LoHa / LoKr
+    rank_dropout / module_dropout, MoE router jitter (Mixtral jitter_noise), or a positive dropout / jitter
+    rate in the model config. Classifier dropout (unused by causal LM heads) does not count."""
+    if model is None:
+        return False
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.dropout._DropoutNd) and _grpo_positive_rate(float(getattr(module, "p", 0.0) or 0.0)):
+            return True
+        for name in ("jitter_noise", "rank_dropout", "module_dropout"):
+            if _grpo_positive_rate(getattr(module, name, None)):
+                return True
+    config = getattr(model, "config", None)
+    for cfg in (config, getattr(config, "text_config", None)):
+        if cfg is None:
+            continue
+        values = cfg.to_dict() if hasattr(cfg, "to_dict") else dict(vars(cfg))
+        for key, value in values.items():
+            if (
+                ("dropout" in key or key.endswith("pdrop") or "jitter" in key)
+                and not key.startswith("classifier")
+                and _grpo_positive_rate(value)
+            ):
+                return True
+    return False
+pass
+RL_REPLACEMENTS["grpo_policy_is_stochastic"] = grpo_policy_is_stochastic
+
+
+def grpo_policy_has_experts(model):
+    """True for a mixture-of-experts policy. Leaving rows out of the forward can leave an expert with no tokens:
+    its gradient is then None instead of zero and AdamW skips its update (weight decay, moment decay)."""
+    config = getattr(model, "config", None)
+    for cfg in (config, getattr(config, "text_config", None)):
+        if cfg is None:
+            continue
+        for name in ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts", "num_experts_per_tok"):
+            value = getattr(cfg, name, None)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return True
+    return False
+pass
+RL_REPLACEMENTS["grpo_policy_has_experts"] = grpo_policy_has_experts
+
+
 def grpo_zero_advantage_keep(advantages, total_rows, group_size = None):
     """Row indices of a GRPO micro-batch whose policy term can be nonzero, or None to score every row.
 
@@ -3256,8 +3308,10 @@ def grpo_accumulated_loss(
         # backward are skipped and grpo_compute_loss divides by this micro-batch's full row / token counts.
         # Only for the loss types whose normaliser is those counts (grpo, bnpo, dr_grpo) or global (dapo).
         # Off for vision (image rows do not slice), the rollout logps as pi_old path and its mismatch
-        # metrics (they average the scored rows), and collective forwards (FSDP / ZeRO-3: every rank must
-        # run the same number of forwards).
+        # metrics (they average the scored rows), DeepSpeed / FSDP (ZeRO-3 and FSDP forwards are collective:
+        # every rank must run the same number of them), a random forward (dropout, router jitter: fewer rows
+        # draw other masks) and mixture-of-experts policies (an expert left without tokens gets no gradient
+        # rather than a zero one, which changes its AdamW update).
         _row_keep = None
         _full_rows = total_rows
         if (
@@ -3271,7 +3325,17 @@ def grpo_accumulated_loss(
             and not _rollout_logps_as_old
             and not _rollout_metrics_on
             and not _collective_forwards
+            and not getattr(trainer, "is_deepspeed_enabled", False)
+            and not getattr(trainer, "is_fsdp_enabled", False)
         ):
+            _row_policy_ok = getattr(trainer, "_unsloth_zero_advantage_policy_ok", None)
+            if _row_policy_ok is None:
+                from unsloth_zoo.rl_replacements import grpo_policy_is_stochastic, grpo_policy_has_experts
+                _row_policy_ok = not (grpo_policy_is_stochastic(trainer.model) or grpo_policy_has_experts(trainer.model))
+                trainer._unsloth_zero_advantage_policy_ok = _row_policy_ok
+        else:
+            _row_policy_ok = False
+        if _row_policy_ok:
             from unsloth_zoo.rl_replacements import grpo_zero_advantage_keep as _grpo_zero_advantage_keep
             # PrefixGrouper (no vLLM) lays rows out as [groups, G]: drop whole groups so its layout survives.
             _row_group = None
