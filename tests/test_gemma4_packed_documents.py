@@ -153,3 +153,92 @@ def test_inference_tensors_are_checked_without_a_version():
         q = torch.randn(1, 2, 10, 8)
         assert _mask_is_block_causal(m, lengths, None)
         assert _packed_document_sdpa(q, q, q, m, torch.tensor(lengths), None, 1.0, 1) is not None
+
+
+def _counting_sdpa(monkeypatch):
+    calls = []
+    sdpa = F.scaled_dot_product_attention
+
+    def counted(q, k, v, **kwargs):
+        calls.append(q.shape[0])
+        return sdpa(q, k, v, **kwargs)
+
+    monkeypatch.setattr(F, "scaled_dot_product_attention", counted)
+    return calls
+
+
+def _runs(lengths):
+    return sum(1 for i, L in enumerate(lengths) if i == 0 or lengths[i - 1] != L)
+
+
+_LENGTHS = [
+    [5, 5, 5, 7, 7, 1, 9],  # runs of equal length, a 1-token document, a lone document
+    [3, 3, 8, 8, 8, 1, 1],
+    [1, 1, 1, 1],           # only 1-token documents
+    [12],                   # a single document
+    [4, 6, 4, 6],           # equal lengths that are not consecutive stay separate
+]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("w", [None, 4])
+@pytest.mark.parametrize("Hkv", [4, 2])
+@pytest.mark.parametrize("lengths", _LENGTHS)
+def test_equal_length_runs_match_the_loop_bit_for_bit(monkeypatch, lengths, Hkv, w, dtype):
+    torch.manual_seed(0)
+    T, H, d = sum(lengths), 4, 16
+    mask = _block_causal(lengths, w)
+    psl = torch.tensor(lengths)
+    leaves = (torch.randn(1, H, T, d, dtype=dtype), torch.randn(1, Hkv, T, d, dtype=dtype),
+              torch.randn(1, Hkv, T, d, dtype=dtype))
+    g = torch.randn(1, H, T, d, dtype=dtype)
+    calls = _counting_sdpa(monkeypatch)
+    results = {}
+    for batched in (False, True):
+        q, k, v = (x.clone().requires_grad_() for x in leaves)
+        calls.clear()
+        out = _packed_document_sdpa(q, k, v, mask, psl, w, 1.0, H // Hkv, batch_equal_lengths=batched)
+        results[batched] = (out.detach(), *torch.autograd.grad(out, (q, k, v), g), len(calls))
+    loop, batched = results[False], results[True]
+    for a, b in zip(loop[:4], batched[:4]):
+        assert torch.equal(a, b)
+    assert loop[4] == len(lengths) and batched[4] == _runs(lengths)
+    ref = F.scaled_dot_product_attention(*(x.repeat_interleave(H // x.shape[1], 1) for x in leaves),
+                                         attn_mask=mask, scale=1.0)
+    torch.testing.assert_close(batched[0], ref)
+
+
+def test_equal_length_documents_share_one_call_and_the_kill_switch_restores_the_loop(monkeypatch):
+    lengths = [6, 6, 6, 6, 2, 9, 9, 1]  # 8 documents, 4 runs, 2 of them batched
+    q = torch.randn(1, 2, sum(lengths), 8)
+    calls = _counting_sdpa(monkeypatch)
+    mask, psl = _block_causal(lengths), torch.tensor(lengths)
+    monkeypatch.delenv("UNSLOTH_GEMMA4_PACKED_BATCH", raising=False)
+    batched = _packed_document_sdpa(q, q, q, mask, psl, None, 1.0, 1)
+    assert sorted(calls) == [1, 1, 2, 4]
+    calls.clear()
+    monkeypatch.setenv("UNSLOTH_GEMMA4_PACKED_BATCH", "0")
+    loop = _packed_document_sdpa(q, q, q, mask, psl, None, 1.0, 1)
+    assert calls == [1] * len(lengths)
+    assert torch.equal(batched, loop)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA SDPA kernels")
+@pytest.mark.parametrize("backend", ["EFFICIENT_ATTENTION", "FLASH_ATTENTION"])
+def test_equal_length_runs_match_the_loop_on_cuda_float16(backend):
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    torch.manual_seed(0)
+    lengths = [64, 64, 64, 32, 32, 1, 128]
+    T, H, d = sum(lengths), 4, 64
+    mask, psl = _block_causal(lengths).cuda(), torch.tensor(lengths)
+    leaves = [torch.randn(1, H, T, d, device="cuda", dtype=torch.float16) for _ in range(3)]
+    g = torch.randn_like(leaves[0])
+    results = []
+    with sdpa_kernel(getattr(SDPBackend, backend)):
+        for batched in (False, True):
+            q, k, v = (x.clone().requires_grad_() for x in leaves)
+            out = _packed_document_sdpa(q, k, v, mask, psl, None, 1.0, 1, batch_equal_lengths=batched)
+            results.append((out.detach(), *torch.autograd.grad(out, (q, k, v), g)))
+    for a, b in zip(*results):
+        assert torch.equal(a, b)

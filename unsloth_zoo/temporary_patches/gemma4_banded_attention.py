@@ -32,6 +32,7 @@
 # this module only exports the block-local kernel and the shared band probe.
 # ============================================================================
 
+import os
 import torch
 import torch.nn.functional as F
 
@@ -202,26 +203,40 @@ def _mask_is_block_causal(mask, lengths, w, _block=1024):
     return ok
 
 
-def _packed_document_sdpa(query, key, value, mask, packed_seq_lengths, w, scaling, num_key_value_groups):
+def _packed_document_sdpa(query, key, value, mask, packed_seq_lengths, w, scaling, num_key_value_groups,
+                          batch_equal_lengths=None):
     """Per-document SDPA for a packed row; None unless `mask` is its block-causal mask."""
     if query.shape[0] != 1 or key.shape[2] != query.shape[2]:
         return None
     lengths = _packed_lengths(packed_seq_lengths)
     if not lengths or not _mask_is_block_causal(mask, lengths, w):
         return None
+    if batch_equal_lengths is None:
+        batch_equal_lengths = os.environ.get("UNSLOTH_GEMMA4_PACKED_BATCH", "1") != "0"
     if num_key_value_groups > 1:
         # enable_gqa would put fp32 on the math kernel.
         key = key.repeat_interleave(num_key_value_groups, dim=1)
         value = value.repeat_interleave(num_key_value_groups, dim=1)
-    outs, start = [], 0
-    for L in lengths:
-        q, k, v = (x[:, :, start : start + L] for x in (query, key, value))
+    outs, start, i, n_docs = [], 0, 0, len(lengths)
+    while i < n_docs:
+        # Batch equal-length consecutive documents (batch-1 idles SMs; T4 744 -> 824 tok/s); still per-document.
+        L, j = lengths[i], i + 1
+        while batch_equal_lengths and j < n_docs and lengths[j] == L:
+            j += 1
+        n = j - i
+        q, k, v = (x[:, :, start : start + n * L] for x in (query, key, value))
+        if n > 1:
+            q, k, v = (x.unflatten(2, (n, L)).transpose(1, 2).flatten(0, 1) for x in (q, k, v))
         if w and L > w:
-            i = torch.arange(L, device=query.device)
-            band = (i[None, :] <= i[:, None]) & (i[None, :] > i[:, None] - w)
-            outs.append(F.scaled_dot_product_attention(q, k, v, attn_mask=band, scale=scaling))
+            r = torch.arange(L, device=query.device)
+            band = (r[None, :] <= r[:, None]) & (r[None, :] > r[:, None] - w)
+            o = F.scaled_dot_product_attention(q, k, v, attn_mask=band, scale=scaling)
         else:
-            outs.append(F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scaling))
-        start += L
+            o = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scaling)
+        if n > 1:
+            o = o.unflatten(0, (1, n)).transpose(1, 2).flatten(2, 3)
+        outs.append(o)
+        start += n * L
+        i = j
     _PACKED_DOC_ENGAGED[0] += 1
-    return torch.cat(outs, dim=2)
+    return outs[0] if len(outs) == 1 else torch.cat(outs, dim=2)

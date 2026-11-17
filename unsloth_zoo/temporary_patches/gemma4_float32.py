@@ -430,6 +430,18 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma4ClippableLinear)
 
 
+def _gemma4_native_bf16():
+    """bfloat16 in hardware (sm80+, ROCm). torch.cuda.is_bf16_supported() also counts T4's emulation."""
+    try:
+        if not torch.cuda.is_available():
+            return False
+        if torch.version.hip:
+            return True
+        return torch.cuda.get_device_capability()[0] >= 8
+    except Exception:
+        return False
+
+
 def _patch_gemma4_text_attention(module, prefix):
     apply_rotary_pos_emb = module.apply_rotary_pos_emb
     ALL_ATTENTION_FUNCTIONS = module.ALL_ATTENTION_FUNCTIONS
@@ -441,6 +453,9 @@ def _patch_gemma4_text_attention(module, prefix):
     # Eager: the mask check syncs to host.
     packed_document_sdpa = torch.compiler.disable(_packed_document_sdpa, recursive = True)
     packed_documents = os.environ.get("UNSLOTH_GEMMA4_PACKED_DOCUMENTS", "1") != "0"
+    # float16 SDPA operands (kernels accumulate in float32): T4 578 -> 744 tok/s. Off: UNSLOTH_GEMMA4_FP16_SDPA=0.
+    # Non-bf16 GPUs only: bf16 cards keep float32 to stay off cuDNN (B200 cuDNN 9.24: NaN dq at hd256 + mask).
+    fp16_sdpa = os.environ.get("UNSLOTH_GEMMA4_FP16_SDPA", "1") != "0" and not _gemma4_native_bf16()
 
     def forward(
         self,
@@ -556,8 +571,19 @@ def _patch_gemma4_text_attention(module, prefix):
             )  # returns (b, q, h, d), already transposed
         else:
             attn_mask = attention_mask
+            sdpa_dtype = torch.float16 if (
+                fp16_sdpa and query_states.is_cuda and query_states.dtype == torch.float32
+                and not (self.training and self.attention_dropout)
+            ) else torch.float32
             if isinstance(attn_mask, torch.Tensor) and attn_mask.dtype != torch.bool:
                 attn_mask = attn_mask.to(torch.float32)
+                if sdpa_dtype is torch.float16:
+                    # No clamp: masked entries must become -inf, else fully masked rows attend instead of returning 0.
+                    attn_mask = attn_mask.to(torch.float16)
+            if sdpa_dtype is torch.float16:
+                query_states = query_states.to(torch.float16)
+                key_states = key_states.to(torch.float16)
+                value_states = value_states.to(torch.float16)
             is_causal = attn_mask is None and query_states.shape[2] > 1 and getattr(self, "is_causal", True)
             attn_output = None
             if (
