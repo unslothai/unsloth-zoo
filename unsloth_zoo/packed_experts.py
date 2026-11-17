@@ -538,7 +538,7 @@ def _register_op():
     if custom_op is None or not hasattr(torch.library, "register_autograd"):
         return None
     try:
-        op = torch.ops.unsloth_zoo.packed_experts_mm.default
+        op = torch.ops.unsloth_zoo.packed_experts_mm_v2.default
     except (AttributeError, RuntimeError):
         op = None
     # Several expert chunks read the routed counts on the host (a sync): a CUDA graph must not capture the op.
@@ -549,7 +549,9 @@ def _register_op():
             tags = {"tags": (torch.Tag.cudagraph_unsafe,)}
     if op is None:
         try:
-            @custom_op("unsloth_zoo::packed_experts_mm", mutates_args = (), **tags)
+            # _v2: the tag is not part of Inductor's FX graph cache key, so a graph compiled against the untagged op
+            # would replay from a warm cache and still capture the host sync into a CUDA graph.
+            @custom_op("unsloth_zoo::packed_experts_mm_v2", mutates_args = (), **tags)
             def packed_experts_mm(
                 inputs: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor, glob: torch.Tensor,
                 counts: torch.Tensor, fmt: str, transpose_b: bool, multiply: bool,
@@ -568,13 +570,13 @@ def _register_op():
 
             def _backward(ctx, grad):
                 codes, scales, glob, counts = ctx.saved_tensors
-                dx = torch.ops.unsloth_zoo.packed_experts_mm(
+                dx = torch.ops.unsloth_zoo.packed_experts_mm_v2(
                     grad.contiguous(), codes, scales, glob, counts, ctx.fmt, not ctx.transpose_b, ctx.multiply,
                 )
                 return dx, None, None, None, None, None, None, None
 
             packed_experts_mm.register_autograd(_backward, setup_context = _setup)
-            op = torch.ops.unsloth_zoo.packed_experts_mm.default
+            op = torch.ops.unsloth_zoo.packed_experts_mm_v2.default
         except Exception:
             return None
     _OP = op
