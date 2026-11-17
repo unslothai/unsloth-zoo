@@ -296,6 +296,18 @@ def _gemma4_skip_or_undo(class_suffix):
 # Per-thread projection dtype without autocast (float32 on full finetuning), set and restored around the text model and
 # each text / vision layer; the RMSNorms inside read it, norms outside (embedders, audio) keep the fp16 output.
 _GEMMA4_BOUNDARY = threading.local()
+# Set on a text decoder layer's norms whose output is added to the float32 residual (see patch_Gemma4RMSNorm).
+_GEMMA4_RESIDUAL_OUT = "_unsloth_gemma4_residual_out"
+_GEMMA4_RESIDUAL_NORMS = ("post_attention_layernorm", "post_feedforward_layernorm", "post_per_layer_input_norm")
+
+
+def _gemma4_mark_residual_norms(layer):
+    if os.environ.get("UNSLOTH_GEMMA4_FP32_POST_NORM", "1") == "0": return
+    for name in _GEMMA4_RESIDUAL_NORMS:
+        norm = getattr(layer, name, None)
+        if isinstance(norm, torch.nn.Module):
+            norm.__dict__[_GEMMA4_RESIDUAL_OUT] = True
+pass
 
 
 def patch_Gemma4TextScaledWordEmbedding():
@@ -374,8 +386,11 @@ def patch_Gemma4RMSNorm():
         # with_scale. `self` is read in eager, so it never reaches the kernel's guards.
         hidden_states_2d, shape = flatten_for_elementwise_norm(hidden_states)
         # Full finetuning keeps float32, else the final norm hands fp16 to a float32 lm_head ("Half != float").
-        to_float32 = getattr(_GEMMA4_BOUNDARY, "dtype", None) == torch.float32 and \
-            not torch.is_autocast_enabled(hidden_states.device.type)
+        # A post-norm feeding the float32 residual add returns float32 too: as float16 it would carry the
+        # residual gradient, the largest in the backward, into float16 and overflow the loss scale.
+        boundary = getattr(_GEMMA4_BOUNDARY, "dtype", None)
+        to_float32 = (boundary == torch.float32 or self.__dict__.get(_GEMMA4_RESIDUAL_OUT, False)) \
+            and not torch.is_autocast_enabled(hidden_states.device.type)
         if self.with_scale:
             kernel = _gemma4_rms_norm_scaled_float32 if to_float32 else _gemma4_rms_norm_scaled
             normed = kernel(hidden_states_2d, unwrap_norm_weight(self.weight), self.eps)
@@ -397,6 +412,7 @@ def patch_Gemma4RMSNorm():
             _gemma4_rms_norm_scaled_float32 = _gemma4_rms_norm_scaled_float32,
             _gemma4_rms_norm_unscaled_float32 = _gemma4_rms_norm_unscaled_float32,
             _GEMMA4_BOUNDARY = _GEMMA4_BOUNDARY,
+            _GEMMA4_RESIDUAL_OUT = _GEMMA4_RESIDUAL_OUT,
         )
         patch_forced_float32(getattr(module, prefix + "RMSNorm"), "forward", forward, match_level = "relaxed")
 pass
@@ -679,7 +695,11 @@ def patch_Gemma4TextDecoderLayerBoundary():
             if getattr(original, "_unsloth_gemma4_boundary", False):
                 continue
 
-            def forward(self, *args, _unsloth_original = original, _unsloth_boundary_of = boundary_of, **kwargs):
+            def forward(self, *args, _unsloth_original = original, _unsloth_boundary_of = boundary_of,
+                        _unsloth_text_layer = suffix == "TextDecoderLayer", **kwargs):
+                if _unsloth_text_layer and "_unsloth_gemma4_marked" not in self.__dict__:
+                    _gemma4_mark_residual_norms(self)
+                    self.__dict__["_unsloth_gemma4_marked"] = True
                 previous = getattr(_GEMMA4_BOUNDARY, "dtype", None)
                 autocast = torch.is_autocast_enabled("cuda") or torch.is_autocast_enabled("cpu")
                 _GEMMA4_BOUNDARY.dtype = None if autocast else _unsloth_boundary_of(self)
