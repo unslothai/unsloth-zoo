@@ -296,7 +296,6 @@ def _gemma4_skip_or_undo(class_suffix):
 # Per-thread projection dtype without autocast (float32 on full finetuning), set and restored around the text model and
 # each text / vision layer; the RMSNorms inside read it, norms outside (embedders, audio) keep the fp16 output.
 _GEMMA4_BOUNDARY = threading.local()
-# Set on a text decoder layer's norms whose output is added to the float32 residual (see patch_Gemma4RMSNorm).
 _GEMMA4_RESIDUAL_OUT = "_unsloth_gemma4_residual_out"
 _GEMMA4_RESIDUAL_NORMS = ("post_attention_layernorm", "post_feedforward_layernorm", "post_per_layer_input_norm")
 
@@ -386,8 +385,7 @@ def patch_Gemma4RMSNorm():
         # with_scale. `self` is read in eager, so it never reaches the kernel's guards.
         hidden_states_2d, shape = flatten_for_elementwise_norm(hidden_states)
         # Full finetuning keeps float32, else the final norm hands fp16 to a float32 lm_head ("Half != float").
-        # A post-norm feeding the float32 residual add returns float32 too: as float16 it would carry the
-        # residual gradient, the largest in the backward, into float16 and overflow the loss scale.
+        # Residual post-norms return float32: their output gradient is the residual gradient, which overflows fp16.
         boundary = getattr(_GEMMA4_BOUNDARY, "dtype", None)
         to_float32 = (boundary == torch.float32 or self.__dict__.get(_GEMMA4_RESIDUAL_OUT, False)) \
             and not torch.is_autocast_enabled(hidden_states.device.type)

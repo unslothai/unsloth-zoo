@@ -14,16 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Forced float32 Gemma-4 (float16 weights, float32 residual): the post-norms whose output is added to the residual
-(post_attention_layernorm, post_feedforward_layernorm, post_per_layer_input_norm) return float32.
-
-As float16 they carried the residual-stream gradient, the largest gradient in the backward, into float16, so the loss
-scaler overflowed there first: Gemma-4 E2B on a T4 skipped steps at the 2**12 scale while every other float16
-gradient stayed 10x or more below the limit. The norm's backward now runs in float32 and hands its sub-layer a
-gradient scaled by weight / rms instead.
-
-CPU subprocesses: the patches gate on UNSLOTH_FORCE_FLOAT32 at patch time.
-"""
+"""Forced float32 Gemma-4: residual post-norms must return float32 so the residual gradient never hits fp16."""
 
 import json
 import os
@@ -132,7 +123,7 @@ def test_gemma4_post_norms_return_float32_and_keep_the_residual_gradient_out_of_
         assert r["finite"], (moe, r)
         assert set(r["dtypes"]) == {"post_attention_layernorm", "post_feedforward_layernorm", "post_per_layer_input_norm"}, r
         assert all(v == ["torch.float32"] for v in r["dtypes"].values()), (moe, r["dtypes"])
-    # A loss scale that puts the residual gradient past float16's max while every float16 gradient stays 4x below it.
+    # Residual gradient past fp16 max, every fp16 gradient 4x below it.
     res_amax = min(r["residual_grad_amax"] for r in probe.values())
     f16_amax = max(r["fp16_grad_amax"] for r in probe.values())
     scale = 2.0 ** int(__import__("math").ceil(__import__("math").log2(2 * fp16_max / res_amax)))
