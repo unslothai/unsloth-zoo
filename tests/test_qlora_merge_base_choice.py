@@ -49,3 +49,17 @@ def test_dequant_forces_the_trained_base_for_every_architecture(value, monkeypat
 def test_original_forces_the_downloaded_16bit_base(monkeypatch):
     monkeypatch.setenv("UNSLOTH_QLORA_MERGE_BASE", "original")
     assert S._model_type_needs_dequant_merge_base(_model("falcon_h1")) is False
+
+
+def test_every_lora_merge_of_the_16bit_path_forwards_the_choice():
+    # The MoE expert merge must honour UNSLOTH_QLORA_MERGE_BASE too (per-expert adapters on a 4bit base).
+    import ast
+    import inspect
+    import textwrap
+
+    for function, callee in ((S._merge_and_overwrite_lora, "_merge_moe_experts_file"), (S._merge_moe_experts_file, "_merge_lora")):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == callee]
+        assert calls, callee
+        for call in calls:
+            assert any(k.arg == "use_dequant_base" for k in call.keywords), (function.__name__, callee)

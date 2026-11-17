@@ -1287,6 +1287,7 @@ def _merge_and_overwrite_lora(
                     counted_lora_modules = counted_lora_modules,
                     processed_mxfp4_keys = processed_mxfp4_keys,
                     weight_block_size = weight_block_size,
+                    use_dequant_base = use_dequant_base,
                 )
 
             for key in safetensor_keys:
@@ -2132,7 +2133,7 @@ def _resolve_moe_num_experts_with_header(prefix, resolution_stats, moe_num_exper
     return num_experts
 
 
-def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, converted_lora_weights, moe_num_experts, output_dtype, counted_lora_modules, processed_mxfp4_keys, weight_block_size = None):
+def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, converted_lora_weights, moe_num_experts, output_dtype, counted_lora_modules, processed_mxfp4_keys, weight_block_size = None, use_dequant_base = False):
     count = 0
     debug_logged = 0
     file_path = getattr(file, "path", None)
@@ -2204,7 +2205,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 if _idx >= _num_experts_disk or _ls.lora_A is None or _ls.lora_B is None:
                     continue
                 _w_lin = _fused_dev[_idx].transpose(0, 1).contiguous()
-                _merged_lin = _merge_lora(_w_lin, _ls, _fused_key + f".{_idx}")
+                _merged_lin = _merge_lora(_w_lin, _ls, _fused_key + f".{_idx}", use_dequant_base = use_dequant_base)
                 _fused_dev[_idx] = _merged_lin.transpose(0, 1)
                 _merged_any = True
                 if _lk not in counted_lora_modules:
