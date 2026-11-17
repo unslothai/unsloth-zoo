@@ -24,7 +24,18 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def _fully_shard_takes_ignored_params():
+    import inspect
+    try:
+        from torch.distributed.fsdp import fully_shard
+    except ImportError:
+        return False
+    return "ignored_params" in inspect.signature(fully_shard).parameters
 
 _WORKER = """
 import json, os, sys
@@ -63,9 +74,11 @@ full = {k: v.detach().clone() for k, v in model.state_dict().items() if ".lora_"
 # Checked before the Trainer shards the model: that False must not stick.
 early_sharded = vu._lora_is_sharded(model) if hasattr(vu, "_lora_is_sharded") else None
 mesh = init_device_mesh("cpu", (2,))
+# "mixed": the first adapter is left out of FSDP2 (ignored_params), so it stays plain beside DTensors.
+kw = {"ignored_params": {model.layers[0].lora_A.default.weight}} if sys.argv[2] == "mixed" else {}
 for layer in model.layers:
-    fully_shard(layer, mesh = mesh)
-fully_shard(model, mesh = mesh)
+    fully_shard(layer, mesh = mesh, **kw)
+fully_shard(model, mesh = mesh, **kw)
 res = {"helper": hasattr(vu, "_lora_state_dict"), "early_sharded": early_sharded}
 try:
     vu.save_lora(model, os.path.join(out_dir, "lora"))
@@ -101,13 +114,15 @@ def _free_port():
         return s.getsockname()[1]
 
 
-def test_save_lora_and_load_lora_tensors_gather_fsdp2_shards(tmp_path):
+@pytest.mark.parametrize("layout", ["sharded", pytest.param("mixed", marks = pytest.mark.skipif(
+    not _fully_shard_takes_ignored_params(), reason = "fully_shard has no ignored_params before torch 2.7, so no mixed layout"))])
+def test_save_lora_and_load_lora_tensors_gather_fsdp2_shards(tmp_path, layout):
     script = tmp_path / "worker.py"
     script.write_text(textwrap.dedent(_WORKER))
     env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_ALLOW_CPU = "1",
                PYTHONPATH = os.pathsep.join([str(_ROOT), os.environ.get("PYTHONPATH", "")]))
     cmd = [sys.executable, "-m", "torch.distributed.run", "--nnodes", "1", "--nproc-per-node", "2",
-           "--master-addr", "127.0.0.1", "--master-port", str(_free_port()), str(script), str(tmp_path)]
+           "--master-addr", "127.0.0.1", "--master-port", str(_free_port()), str(script), str(tmp_path), layout]
     r = subprocess.run(cmd, env = env, capture_output = True, text = True, timeout = 300, cwd = tmp_path)
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
     for rank in range(2):
@@ -120,9 +135,14 @@ def test_save_lora_and_load_lora_tensors_gather_fsdp2_shards(tmp_path):
 
 
 _SCAN_WORKER = """
-import json, sys
+import json, os, sys
 import torch
+import torch.distributed as dist
 import unsloth_zoo.vllm_utils as vu
+
+# A process group (DDP, unsharded): the check is live, not the single-process early return.
+os.environ.update(MASTER_ADDR = "127.0.0.1", MASTER_PORT = sys.argv[2])
+dist.init_process_group("gloo", rank = 0, world_size = 1)
 
 class Lora(torch.nn.Module):
     def __init__(self):
@@ -144,24 +164,28 @@ def counting(*args, **kwargs):
         seen.append(item[0])
         yield item
 model.named_parameters = counting
-res = {"sharded": vu._lora_is_sharded(model), "params_walked": len(seen), "params_total": len(list(orig()))}
+# load_lora runs this every generation step.
+answers = {vu._lora_is_sharded(model) for _ in range(10)}
+res = {"sharded": list(answers), "params_walked": len(seen), "params_total": len(list(orig()))}
 json.dump(res, open(sys.argv[1], "w"))
+dist.destroy_process_group()
 """
 
 
-def test_unsharded_check_stops_at_the_first_adapter(tmp_path):
+def test_unsharded_check_does_not_walk_every_parameter_each_call(tmp_path):
     script = tmp_path / "scan.py"
     script.write_text(textwrap.dedent(_SCAN_WORKER))
     out = tmp_path / "scan.json"
     env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_ALLOW_CPU = "1",
                PYTHONPATH = os.pathsep.join([str(_ROOT), os.environ.get("PYTHONPATH", "")]))
-    r = subprocess.run([sys.executable, str(script), str(out)], env = env, capture_output = True, text = True,
-                       timeout = 300, cwd = tmp_path)
+    r = subprocess.run([sys.executable, str(script), str(out), str(_free_port())], env = env, capture_output = True,
+                       text = True, timeout = 300, cwd = tmp_path)
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
     res = json.loads(out.read_text())
-    assert res["sharded"] is False, res
+    assert res["sharded"] == [False], res
     assert res["params_total"] == 1200, res
-    assert res["params_walked"] <= 3, res
+    # At most one full walk over 10 calls (a walk per call would be 12000).
+    assert res["params_walked"] <= res["params_total"] + 10, res
 
 
 def test_a_single_process_never_walks_the_parameters():

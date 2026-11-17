@@ -39,6 +39,7 @@ from .moe_routed import (
     _bf16_supported,
     _bf16_supported_index,
     _eager_out_of_dynamo,
+    _graph_decode_step,
     _lora_delta,
     routed_bf16_gemm,
     routed_bf16_moe,
@@ -589,7 +590,8 @@ def routed_bf16_eligible(experts, hidden_states):
     # sub_sm80_devices(), whose first call runs torch.cuda.device_count(), which a cold fullgraph trace rejects.
     if hidden_states.numel() == hidden_states.shape[-1] or w.device.index is None:
         return True
-    return _bf16_supported_index(w.device.index)
+    # A CUDA-graph decode step below sm80 routes every row: the grouped fallback cannot be captured there.
+    return _bf16_supported_index(w.device.index) or _graph_decode_step()
 
 
 @_eager_out_of_dynamo

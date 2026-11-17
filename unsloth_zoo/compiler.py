@@ -67,8 +67,11 @@ from .peft_utils import get_lora_layer_modules
 from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
     MHC_SINKHORN_SOURCE,
     MHC_SINKHORN_REPLACEMENT,
-    MHC_PROJECTION_SOURCE,
-    MHC_PROJECTION_REPLACEMENT,
+    MHC_PROJECTION_REWRITES,
+    MHC_NATIVE_SINKHORN_SOURCE,
+    MHC_NATIVE_SINKHORN_REPLACEMENT,
+    MHC_NATIVE_PROJECTION_SOURCE,
+    MHC_NATIVE_PROJECTION_REPLACEMENT,
     mhc_fast_mode,
 )
 from importlib.metadata import version as importlib_version
@@ -271,6 +274,21 @@ DISABLE_COMPILE_MODEL_FUNCTIONS = {
         "_validate_attention_tp_divisibility",
         # QAT STE autograd.Function: Dynamo raises InternalTorchDynamoError the fallback does not catch.
         "_quantize_qat",
+        # Later port heads: block fake-quant (float8 casts, int32 bit tricks), straight-through in training.
+        "_fake_quant_fp8_block",
+        "_fake_quant_fp4_block",
+        "engram_layout",
+        "make_engram_table",
+        "is_parameter_free_table",
+        "_checkpoint_key_names",
+        "has_core_model_loading",
+        "_is_fp8_quant_config",
+        "_released_layout",
+        "_engram_cut_safe",
+        "pipeline_safe_cut_points",
+        "_resolve_sparse_attn",
+        "ensure_sparse_attn",
+        "_drop_engram_tables_outside_full_save",
     ],
 }
 
@@ -298,7 +316,10 @@ MODULE_FORWARD_SOURCE_REWRITES = {
         "DeepseekV4HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
     },
     "deepseek_v41": {
-        "DeepseekV41HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+        "DeepseekV41HyperConnection": [
+            (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+            (MHC_NATIVE_SINKHORN_SOURCE, MHC_NATIVE_SINKHORN_REPLACEMENT, mhc_fast_mode),
+        ],
     },
     # GLM-5.3-Flash carries the V4 Sinkhorn chain verbatim (transformers 5.17 - 5.20).
     "glm5_next": {
@@ -307,48 +328,106 @@ MODULE_FORWARD_SOURCE_REWRITES = {
 }
 
 
-# {model_type: {class: (old, new)}}: forward rewrites applied whether or not the class compiles; the eager mixer saves
-# its FP32 upcast for backward, compiled blocks do not; the helper keeps stock math under torch.compile.
+# {model_type: {class: ((old, new), ...)}}: forward rewrites applied whether or not the class compiles; the eager mixer
+# saves its FP32 upcast for backward, compiled blocks do not; the helper keeps stock math under torch.compile.
+# One (old, new) pair per transformers layout; the first that occurs exactly once is applied.
 MODULE_FORWARD_EAGER_REWRITES = {
-    "deepseek_v4": {"DeepseekV4HyperConnection": (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT)},
-    "deepseek_v41": {"DeepseekV41HyperConnection": (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT)},
-    "glm5_next": {"Glm5NextTextHyperConnection": (MHC_PROJECTION_SOURCE, MHC_PROJECTION_REPLACEMENT)},
+    "deepseek_v4": {"DeepseekV4HyperConnection": MHC_PROJECTION_REWRITES},
+    "deepseek_v41": {
+        "DeepseekV41HyperConnection": MHC_PROJECTION_REWRITES
+        + ((MHC_NATIVE_PROJECTION_SOURCE, MHC_NATIVE_PROJECTION_REPLACEMENT),),
+    },
+    "glm5_next": {"Glm5NextTextHyperConnection": MHC_PROJECTION_REWRITES},
 }
+
+
+# Modeling code that lives outside transformers, {model_type: module name}: Unsloth's own implementations
+# (unsloth/models/<model_type>/modeling.py by default) when the installed transformers lacks the model.
+NATIVE_MODELING_MODULES = {}
+
+
+_MHC_INJECTED_HELPERS = ("unsloth_sinkhorn_knopp", "unsloth_mhc_projection", "unsloth_mhc_projection_rsqrt")
+
+
+def register_native_modeling(model_type, module_name):
+    """Compile `module_name` (already imported) for `model_type` when transformers has no such model."""
+    NATIVE_MODELING_MODULES[str(model_type)] = str(module_name)
+    from .hf_utils import NATIVE_MODEL_TYPES
+
+    NATIVE_MODEL_TYPES.add(str(model_type))
+
+
+def resolve_modeling_module(model_type):
+    """(dotted location, module) of the modeling code for `model_type`: transformers' own file, else a native module
+    that is ALREADY imported (registered, or at unsloth.models.<model_type>.modeling). Never imports unsloth. The
+    compiler evals `f"{location}.{name}"`, so the location's root package is bound in this module's globals."""
+    if not re.fullmatch(r"[a-z0-9_]+", str(model_type)):
+        return None, None
+    location = f"transformers.models.{model_type}.modeling_{model_type}"
+    try:
+        return location, importlib.import_module(location)
+    except ImportError:
+        # Not shipped or unimportable here: an already-imported native module can still serve.
+        pass
+    for name in (NATIVE_MODELING_MODULES.get(model_type), f"unsloth.models.{model_type}.modeling"):
+        module = sys.modules.get(name) if name else None
+        root = sys.modules.get(name.split(".")[0]) if module is not None else None
+        if module is None or root is None:
+            continue
+        try:
+            resolved = functools.reduce(getattr, name.split(".")[1:], root)
+        except Exception:
+            continue
+        if resolved is module:
+            globals()[name.split(".")[0]] = root
+            return name, module
+    return None, None
 
 
 def module_forward_eager_rewrites(modeling_file, model_type):
     """{class: rewritten forward source} for MODULE_FORWARD_EAGER_REWRITES that match exactly once."""
     applicable = {}
-    for name, (old, new) in MODULE_FORWARD_EAGER_REWRITES.get(model_type, {}).items():
+    for name, alternatives in MODULE_FORWARD_EAGER_REWRITES.get(model_type, {}).items():
         try:
             cls = getattr(modeling_file, name)
             source = inspect.getsource(_unwrap_undecorated_method(cls.forward, cls.__qualname__))
         except Exception:
             continue
-        if source.count(old) == 1:
+        old, new = next(((o, n) for o, n in alternatives if source.count(o) == 1), (None, None))
+        if old is not None:
             applicable[name] = source.replace(old, new)
             if "unsloth_mhc_projection" in new:
                 # Same reason as unsloth_sinkhorn_knopp below: block compile rebinds the forward
                 # to the modeling module's globals.
-                from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_mhc_projection
+                from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
+                    unsloth_mhc_projection,
+                    unsloth_mhc_projection_rsqrt,
+                )
 
                 modeling_file.unsloth_mhc_projection = unsloth_mhc_projection
+                modeling_file.unsloth_mhc_projection_rsqrt = unsloth_mhc_projection_rsqrt
     return applicable
 
 
 def module_forward_source_rewrites(modeling_file, model_type):
     applicable = {}
     eager_rewrites = module_forward_eager_rewrites(modeling_file, model_type)
-    for name, (old, new, mode) in MODULE_FORWARD_SOURCE_REWRITES.get(model_type, {}).items():
+    for name, entry in MODULE_FORWARD_SOURCE_REWRITES.get(model_type, {}).items():
+        # One (old, new, mode) triple, or a list of them for several layouts: the first old found once applies.
+        alternatives = entry if isinstance(entry, list) else [entry]
         try:
-            mode = mode()
-            if not mode:
-                continue
             cls = getattr(modeling_file, name)
             source = inspect.getsource(_unwrap_undecorated_method(cls.forward, cls.__qualname__))
         except Exception:
             continue
         source = eager_rewrites.get(name, source)
+        old, new, mode = next((alt for alt in alternatives if source.count(alt[0]) == 1), alternatives[0])
+        try:
+            mode = mode()
+        except Exception:
+            continue
+        if not mode:
+            continue
         if source.count(old) == 1:
             applicable[name] = source if mode == "stock" else source.replace(old, new)
             if mode != "stock" and "unsloth_sinkhorn_knopp" in new:
@@ -408,6 +487,9 @@ def function_defined_elsewhere(modeling_file, name):
     """True if `modeling_file.<name>` is imported from another file (a same-named method can match `def <name>`)."""
     try:
         function = inspect.unwrap(getattr(modeling_file, name))
+        # `import copy` beside a method `def copy(self)`: the name matches a def, but its source is the stdlib file.
+        if inspect.ismodule(function):
+            return True
         if not inspect.isfunction(function):
             return False
         function_file = inspect.getsourcefile(function)
@@ -706,7 +788,7 @@ from unsloth_zoo.loss_utils import (
     fused_linear_cross_entropy,
     unsloth_fused_ce_loss,
 )
-from unsloth_zoo.fused_losses.forward_adapter import unsloth_fused_lm_head_loss
+from unsloth_zoo.fused_losses.forward_adapter import lm_head_fake_quantize, unsloth_fused_lm_head_loss
 from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
 from unsloth_zoo.compiler import lm_head_on_old_cuda_arch
 from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs, unsloth_fsdp_unshard
@@ -788,6 +870,23 @@ def make_no_update_causal_mask(original):
 
 
 # Patch SDPA
+_SYMBOOL_IS_CAUSAL = re.compile(
+    r"^(?P<pad>[ \t]*)is_causal = (?P<b>bool\()?(?P<mask>[A-Za-z_][A-Za-z0-9_]*) is None and "
+    r"(?P<len>[A-Za-z_][A-Za-z0-9_]*) > 1(?(b)\))[ \t]*$",
+    flags = re.MULTILINE,
+)
+
+
+def sdpa_is_causal_as_bool(source):
+    """`is_causal = mask is None and q_len > 1` (transformers 4.x OLMoE / Nemotron / DBRX / PhiMoE ...) and its
+    `bool(...)` form (StableLM) are a SymBool once the sequence dim is dynamic (Unsloth's block compile marks it;
+    Dynamo keeps bool() of a SymBool symbolic), and SDPA takes only a bool: Dynamo broke the graph at every
+    attention call. The conditional form, as Llama uses, guards on the length instead."""
+    return _SYMBOOL_IS_CAUSAL.sub(
+        lambda m: f"{m['pad']}is_causal = True if {m['mask']} is None and {m['len']} > 1 else False", source
+    )
+
+
 def replace_with_grouped_query_attention(module, source):
     # All Unsloth Zoo code licensed under LGPLv3
     if "enable_gqa" not in torch.nn.functional.scaled_dot_product_attention.__doc__:
@@ -1319,22 +1418,29 @@ def higher_precision_sqrt_mean(source):
         r"(torch.sqrt)"
         r"\("
         r"(.*?)\1"
-        r"(.*?)\)\n",
+        r"(.*?)\)\n"
+        r"(?:([ ]{1,})\3[ ]{0,}\=[ ]{0,}\3[ ]{0,}\*[ ]{0,}([a-zA-Z0-9\_]{1,})[ ]{0,}/[ ]{0,}\1\n)?",
         source,
     )
     for item in sqrt_mean_objects:
         full_match, matches = item.group(0), item.groups()
-        new_variable, mean, variable, _, power, rest, spaces, sqrt, inner, ending = (
-            matches
-        )
+        (new_variable, mean, variable, _, power, rest, spaces, sqrt, inner, ending,
+         indent, target) = matches
         if "\n" in ending:
             continue
         new = (
             f"{new_variable} = {mean}(({variable}).to(torch.float32)**{power}{rest})"
             f"{spaces}"
-            f"{new_variable} = {sqrt}({inner}({new_variable}).to(torch.float32)"
-            f"{ending}.to(({variable}).dtype))\n"
+            f"{new_variable} = {sqrt}({inner}({new_variable}).to(torch.float32){ending})"
         )
+        # Gemma3n altup renorm: X * target overflows float16 before the divide, so rescale in float32 and cast once.
+        if target is not None:
+            new += (
+                f"\n{indent}{variable} = (({variable}).to(torch.float32) * {target} / {new_variable})"
+                f".to(({variable}).dtype)\n"
+            )
+        else:
+            new += f".to(({variable}).dtype)\n"
         source = source.replace(full_match, new)
     return source
 
@@ -2371,10 +2477,11 @@ def create_new_function(
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"
     if "torch_compiler_disable_unless_decode" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compiler_disable_unless_decode\n"
-    if "unsloth_sinkhorn_knopp" in new_source:
-        imports += "from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp\n"
-    if "unsloth_mhc_projection" in new_source:
-        imports += "from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_mhc_projection\n"
+    # mHC helpers come from the zoo: they are set on the modeling module only at runtime.
+    for helper in _MHC_INJECTED_HELPERS:
+        if re.search(rf"\b{helper}\b", new_source):
+            imports += f"from unsloth_zoo.temporary_patches.mhc_sinkhorn import {helper}\n"
+    items = [item for item in items if item not in _MHC_INJECTED_HELPERS]
     if "torch_compile" in new_source:
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "_maybe_compile" in new_source:
@@ -3623,19 +3730,19 @@ elif labels is None:
         logits = torch.tanh(logits)
         logits = logits * (\\4)
 elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
+    _hidden_states, lm_head_weight = lm_head_fake_quantize(self.lm_head, hidden_states\\1)
     loss = fused_linear_cross_entropy(
-        hidden_states      = hidden_states\\1,
-        lm_weight          = self.lm_head.weight,
+        hidden_states      = _hidden_states,
+        lm_weight          = lm_head_weight,
         labels             = labels.to(self.lm_head.weight.device),
         num_items_in_batch = n_items,
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
 else:
-    lm_head_weight = self.lm_head.weight
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
     # ========= NEW fused =========
-    _hidden_states = hidden_states\\1
+    _hidden_states, lm_head_weight = lm_head_fake_quantize(self.lm_head, hidden_states\\1)
     torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(labels, 1)
     loss = unsloth_fused_ce_loss(
@@ -3724,19 +3831,19 @@ elif labels is None:
         logits = torch.tanh(logits)
         logits = logits * (\\4)
 elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
+    _hidden_states, lm_head_weight = lm_head_fake_quantize(self.lm_head, hidden_states\\1)
     loss = fused_linear_cross_entropy(
-        hidden_states      = hidden_states\\1,
-        lm_weight          = self.lm_head.weight,
+        hidden_states      = _hidden_states,
+        lm_weight          = lm_head_weight,
         labels             = labels.to(self.lm_head.weight.device),
         num_items_in_batch = n_items,
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
 elif _can_fuse_loss(self.loss_function) and labels is not None and NOT_RETURN_LOGITS:
-    lm_head_weight = self.lm_head.weight
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
     # ========= NEW fused =========
-    _hidden_states = hidden_states\\1
+    _hidden_states, lm_head_weight = lm_head_fake_quantize(self.lm_head, hidden_states\\1)
     _labels = labels if explicit_shift_labels is None else explicit_shift_labels
     torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(_labels, _labels.dim() - 1)
@@ -3851,11 +3958,10 @@ elif labels is None:
         logits = torch.tanh(logits)
         logits = logits * (\\4)
 else:
-    lm_head_weight = self.lm_head.weight
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
     # ========= NEW fused =========
-    _hidden_states = hidden_states\\1
+    _hidden_states, lm_head_weight = lm_head_fake_quantize(self.lm_head, hidden_states\\1)
     torch._dynamo.mark_dynamic(_hidden_states, 1)
     torch._dynamo.mark_dynamic(labels, 1)
     if attention_mask is not None:
@@ -4079,10 +4185,11 @@ def _apply_fused_lm_head(forward, module=None):
             )
             .replace(
                 "$LOGITSOFTCAPPING$",
-                r"(?:[\n\s]{0,}(?:if self\.[^\n\s]{1,} is not None:\n)?"
-                r"[\s\n]{0,}logits = logits \/ (self\.[^ \n]{1,})\n"
+                # `getattr(self...` is the space-free form fixup_fused_lm_head gives PaliGemma's softcap.
+                r"(?:[\n\s]{0,}(?:if (?:getattr\()?self\.[^\n\s]{1,} is not None:\n)?"
+                r"[\s\n]{0,}logits = logits \/ ((?:getattr\()?self\.[^ \n]{1,})\n"
                 r"[\s\n]{0,}logits = torch\.tanh\(logits\)\n"
-                r"[\s\n]{0,}logits = logits \* self\.[^ \n]{1,}\n)?",
+                r"[\s\n]{0,}logits = logits \* (?:getattr\()?self\.[^ \n]{1,}\n)?",
             )
             .replace(
                 "$CROSSENTROPYLOSS$",
@@ -5155,8 +5262,14 @@ def _patch_lora_input_cast(source, force_float32 = None):
     if not force_float32:
         if "torch.is_autocast_enabled()" in source:
             return source
+        # Single vanilla adapter stays in result's dtype (fp32 copies cost 1.4x time, 5x memory); variants / multi-adapter keep fp32.
+        variant_only = (
+            " and (active_adapter in getattr(self, 'lora_variant', {}) or len(self.active_adapters) > 1)"
+            if "lora_forward(" in source
+            else ""
+        )
         new = (
-            "if not torch.is_autocast_enabled(): "
+            f"if not torch.is_autocast_enabled(){variant_only}: "
             "result, x = "
             "result.to(lora_A.weight.dtype), "
             "x.to(lora_A.weight.dtype)"
@@ -5608,6 +5721,24 @@ def fixup_dropped_logit_scale(source, module = None):
 
 # Pre fix up some modules like Gemma3n
 def fixup_fused_lm_head(source):
+    # PaliGemma (transformers 5.23): the softcap is read through getattr, since PaliGemma 1's Gemma text config has
+    # none. Keep the getattr (a plain attribute read raises there) in the space-free form the softcap pattern takes.
+    softcap = 'getattr(self.config.get_text_config(),"final_logit_softcapping",None)'
+    source = re.sub(
+        r'^([ \t]+)final_logit_softcapping = getattr\(self\.config\.get_text_config\(\), "final_logit_softcapping", None\)\n'
+        r"\1if final_logit_softcapping is not None:\n"
+        r"([ \t]+)logits = logits / final_logit_softcapping\n"
+        r"\2logits = torch\.tanh\(logits\)\n"
+        r"\2logits = logits \* final_logit_softcapping$",
+        lambda m: (
+            f"{m.group(1)}if {softcap} is not None:\n"
+            f"{m.group(2)}logits = logits / {softcap}\n"
+            f"{m.group(2)}logits = torch.tanh(logits)\n"
+            f"{m.group(2)}logits = logits * {softcap}"
+        ),
+        source,
+        flags = re.MULTILINE,
+    )
     # Gemma 3N
     source = source.replace(
         "if (final_logit_softcapping := self.config.get_text_config().final_logit_softcapping) is not None:",
@@ -5676,7 +5807,14 @@ def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
         import timm.layers.fast_norm
 
         timm.layers.fast_norm.is_fast_norm = lambda *args, **kwargs: False
+        _timm_rms_norm2d = timm.layers.fast_norm.rms_norm2d
         timm.layers.fast_norm.rms_norm2d = rms_norm2d
+        # timm.layers.norm / norm_act import rms_norm2d by name; their copy returns float32 against
+        # our float32 norm weights, breaking the next fp16 conv (Gemma 3N on T4). Rebind them all.
+        for _name, _module in list(sys.modules.items()):
+            if (_name == "timm" or _name.startswith("timm.")) and _module is not None:
+                if getattr(_module, "rms_norm2d", None) is _timm_rms_norm2d:
+                    _module.rms_norm2d = rms_norm2d
         if UNSLOTH_ENABLE_LOGGING:
             print("Unsloth: Compiled timm.layers.fast_norm")
     except:
@@ -6322,9 +6460,12 @@ def _compiled_source_key():
     )
 
 
-def _unpatch_modeling_file(modeling_file):
-    """Restore modeling_file originals and rerun pre_compile patches so the next pass regenerates."""
-    originals = _MODELING_FILE_ORIGINALS.get(modeling_file.__name__, {})
+def _unpatch_modeling_file(modeling_file, model_location = None):
+    """Restore modeling_file originals and rerun pre_compile patches so the next pass regenerates. The originals are
+    keyed by the location the compiler resolved (a registered native module's alias can differ from __name__)."""
+    originals = _MODELING_FILE_ORIGINALS.get(model_location or modeling_file.__name__)
+    if originals is None:
+        originals = _MODELING_FILE_ORIGINALS.get(modeling_file.__name__, {})
     for (container, key), value in originals.items():
         try:
             if container is None:
@@ -6409,17 +6550,15 @@ def unsloth_compile_transformers(
     if not re.fullmatch(r"[a-z0-9_]+", str(model_type)):
         return
 
-    model_location = f"transformers.models.{model_type}.modeling_{model_type}"
-    try:
-        modeling_file = importlib.import_module(model_location)
-    except ModuleNotFoundError:
+    model_location, modeling_file = resolve_modeling_module(model_type)
+    if modeling_file is None:
         return
     # Later `eval(model_location)` calls need `transformers` bound in globals
     exec("import transformers", globals())
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__") and _MODELING_FILE_KEYS.get(
         model_location, _compiled_source_key()
     ) != _compiled_source_key():
-        _unpatch_modeling_file(modeling_file)
+        _unpatch_modeling_file(modeling_file, model_location)
     if not hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         _MODELING_FILE_ORIGINALS.pop(model_location, None)
     disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)
@@ -6899,6 +7038,7 @@ def unsloth_compile_transformers(
                 new_source,
                 flags=re.DOTALL | re.MULTILINE,
             )
+            new_source = sdpa_is_causal_as_bool(new_source)
         else:
             if len(re.findall(causal_mask_find, source, flags=re.DOTALL)) == 1:
                 new_source = re.sub(
@@ -7325,7 +7465,11 @@ def unsloth_compile_transformers(
                 source = eval(f"{model_location}.{module}")
             except AttributeError:
                 continue
-            if "(GradientCheckpointingLayer)" in full_source:
+            # huggingface/transformers#49249 renames the layer base class to ActivationCheckpointingLayer.
+            if (
+                "(GradientCheckpointingLayer)" in full_source
+                or "(ActivationCheckpointingLayer)" in full_source
+            ):
                 if module in FIX_GC_LAYER_CALLER_MODULES:
                     output = patch_gradient_checkpointing_layer_caller(module, source)
                 else:

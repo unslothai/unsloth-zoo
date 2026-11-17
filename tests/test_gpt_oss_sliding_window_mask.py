@@ -165,3 +165,40 @@ def test_patched_forward_matches_stock_with_sliding_window(attention):
     for key, diff in res["diff"].items():
         assert diff < 1e-5, (key, res)
 
+
+
+# Same CPU stubs as _RUNTIME (unsloth_zoo import on a CUDA-less host).
+_MASK_DEVICE = _RUNTIME.split("from transformers.models.gpt_oss.configuration_gpt_oss")[0] + r"""
+import transformers.masking_utils as MU
+from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
+from unsloth_zoo.temporary_patches import gpt_oss as G
+G.patch_GptOssModel()
+assert getattr(MU, '__patched_causal_mask__', False)
+seen = []
+G._gpt_oss_flex_inference = lambda device: seen.append(str(torch.device(device))) or False
+config = GptOssConfig(hidden_size = 64, num_hidden_layers = 2, num_attention_heads = 4, num_key_value_heads = 2,
+                      head_dim = 16, vocab_size = 128)
+for embeds_device in ('cpu', 'meta'):
+    try:
+        # transformers 4.x generate: a CPU torch.empty((batch, seq)) placeholder, real positions on the model device.
+        MU.create_causal_mask(config = config, input_embeds = torch.empty(2, 1, device = embeds_device),
+                              attention_mask = None, cache_position = torch.arange(1, device = 'meta'),
+                              past_key_values = None)
+    except Exception:
+        pass
+print('RESULT ' + json.dumps(seen))
+"""
+
+
+def test_mask_target_follows_the_positions_not_a_cpu_placeholder():
+    # The flex mask is chosen per device; a CPU placeholder input_embeds (transformers 4.x generate) must not hide a
+    # model device the positions are on.
+    env = dict(os.environ)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
+    proc = subprocess.run([sys.executable, "-c", _MASK_DEVICE], capture_output = True, text = True, timeout = 600,
+                          env = env)
+    lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
+    assert proc.returncode == 0 and lines, f"exit={proc.returncode}\n{proc.stdout[-2000:]}\n{proc.stderr[-4000:]}"
+    import json
+    assert json.loads(lines[-1][len("RESULT "):]) == ["meta", "meta"]

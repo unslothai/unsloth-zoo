@@ -51,6 +51,11 @@ pass
 
 
 def _checkpoint(fn, args, preserve_rng_state):
+    # Inductor's min-cut partitioner on torch 2.14+ fails on a checkpointed one-row tile, static or dynamic
+    # ("Node ... was invalid, but is output"; 2.13 is fine). x is [1, t, H] or [t, H], so this is t <= 1:
+    # tiny activations, so keep the owned copy but skip the checkpoint.
+    if _is_compiling() and args[0].numel() <= args[0].shape[-1]:
+        return _owned(fn, *args)
     body = functools.partial(_owned, fn)
     if _is_compiling():
         # Dynamo matches checkpoint by identity, which a shim may have replaced: call its higher order op directly.

@@ -25,6 +25,7 @@ __all__ = [
 
 from typing import Union, Callable, Optional, List, Dict
 import itertools as _itertools
+import json as _json
 from bisect import bisect_left as _bisect_left
 import torch
 
@@ -946,6 +947,43 @@ def train_on_responses_only(
     mask_out_firsts  = frozenset(mask_out_lookup) if len(mask_out_lookup) > 4 else None
 
     def _train_on_responses_only(examples):
+        # Packed rows (TRL's seq_lengths): mask each document alone, as if unpacked.
+        seq_lengths_ = examples.get("seq_lengths") if hasattr(examples, "get") else None
+        if seq_lengths_ is None:
+            return _train_on_rows(examples)
+        input_ids_ = examples["input_ids"]
+        use_tensors = type(input_ids_) is torch_Tensor
+        rows_ = input_ids_.tolist() if hasattr(input_ids_, "tolist") else input_ids_
+        old_ = examples.get("labels")
+        if old_ is not None and hasattr(old_, "tolist"):
+            old_ = old_.tolist()
+        docs, doc_labels, splits = [], [], []
+        for r, (row, lengths) in enumerate(zip(rows_, seq_lengths_)):
+            # None: an unpacked row beside packed ones (concatenate_datasets fills the column).
+            if lengths is None:
+                lengths = [len(row)]
+            lengths = [int(x) for x in (lengths.tolist() if hasattr(lengths, "tolist") else lengths)]
+            if sum(lengths) != len(row):
+                lengths = [len(row)]
+            start = 0
+            for length in lengths:
+                docs.append(row[start : start + length])
+                if old_ is not None:
+                    doc_labels.append(None if old_[r] is None else old_[r][start : start + length])
+                start += length
+            splits.append(len(lengths))
+        batch = {"input_ids": docs}
+        if old_ is not None:
+            batch["labels"] = doc_labels
+        masked = _train_on_rows(batch)["labels"]
+        out, i = [], 0
+        for count in splits:
+            out.append([t for doc in masked[i : i + count] for t in doc])
+            i += count
+        return {"labels": torch.tensor(out, dtype = torch.int64) if use_tensors else out}
+    pass
+
+    def _train_on_rows(examples):
         input_ids_ = examples["input_ids"]
         use_tensors = False
         if type(input_ids_) is torch_Tensor:
@@ -2692,8 +2730,16 @@ def standardize_data_formats(
         # multiprocessing's start method while datasets uses multiprocess, and it
         # fell back to num_proc = 1 under memory pressure -- which is a Pool(1)
         # on datasets >= 4.1, the pool this exists to avoid.
-        from .dataset_num_proc import get_dataset_num_proc
-        dataset_map_kwargs['num_proc'] = get_dataset_num_proc(num_proc)
+        from .dataset_num_proc import environment_override, get_dataset_num_proc
+        # Per-row work is tiny, so a pool mostly pickles shards: in-memory defaults stay in process (as Studio's copy does).
+        if (
+            num_proc is None
+            and not getattr(dataset, "cache_files", None)
+            and not environment_override()[0]
+        ):
+            dataset_map_kwargs['num_proc'] = None
+        else:
+            dataset_map_kwargs['num_proc'] = get_dataset_num_proc(num_proc)
         dataset_map_kwargs['desc'] = "Unsloth: Standardizing formats"
 
     return dataset.map(
@@ -2767,6 +2813,27 @@ def _batched_columns(dataset):
 pass
 
 
+def _prompt_completion_boundary(prompt_ids, pc_ids):
+    # "Answer: " + "two" tokenizes "Answer:", " two": start where the tokenizations diverge (huggingface/trl#7463).
+    n = min(len(prompt_ids), len(pc_ids))
+    if pc_ids[:n] == prompt_ids[:n]: return n
+    shared = 0
+    while shared < n and prompt_ids[shared] == pc_ids[shared]: shared += 1
+    global _PROMPT_COMPLETION_BOUNDARY_WARNED
+    if not _PROMPT_COMPLETION_BOUNDARY_WARNED:
+        _PROMPT_COMPLETION_BOUNDARY_WARNED = True
+        print(
+            "Unsloth: Warning: the tokenized prompt is not a prefix of the tokenized prompt + completion, "
+            "usually because the prompt ends in a space or newline that merges with the completion's first "
+            "token, or because the chat template renders the prompt alone differently. The completion is "
+            "trained from where they diverge, as in TRL. To avoid it, end the prompt on a token boundary "
+            "and start the completion with the whitespace instead (\"Answer:\" + \" two\")."
+        )
+    return shared
+pass
+_PROMPT_COMPLETION_BOUNDARY_WARNED = False
+
+
 def _check_batch_lengths(batch_rows, *columns):
     for column in columns:
         if len(column) != len(batch_rows):
@@ -2791,6 +2858,11 @@ def _batched_rows(tokenize_row, tokenize_rows):
 pass
 
 
+def _row_tools(example):
+    tools = example.get("tools")
+    return _json.loads(tools) if isinstance(tools, str) else tools
+
+
 # Faster SFTTrainer prepare_dataset
 def sft_prepare_dataset(
     self,
@@ -2810,7 +2882,7 @@ def sft_prepare_dataset(
     map_kwargs = {}
     use_desc = isinstance(dataset, Dataset)
     # Imported here: this function's source is copied into the compiled trainer module.
-    from unsloth_zoo.dataset_utils import _batched_columns
+    from unsloth_zoo.dataset_utils import _batched_columns, _iterable_batch_size, _row_tools
     is_vlm = hasattr(processing_class, "tokenizer")
     tokenizer = processing_class
     if is_vlm: tokenizer = processing_class.tokenizer
@@ -2962,9 +3034,35 @@ def sft_prepare_dataset(
                 print("Unsloth: We found double BOS tokens - we shall remove one automatically.")
         pass
 
+        # Plain text gets an EOS (as TRL does), so the model learns where a document ends and packed documents stay
+        # apart. Rows already ending in EOS or any special token (chat-formatted text, notebooks adding EOS_TOKEN)
+        # are left alone.
+        _text_eos = getattr(tokenizer, "eos_token", None)
+        _text_ends = tuple(t for t in (getattr(tokenizer, "all_special_tokens", None) or []) if isinstance(t, str) and t)
+        _text_ends += tuple(
+            str(t) for t in (getattr(tokenizer, "added_tokens_decoder", None) or {}).values()
+            if getattr(t, "special", False) and str(t)
+        )
+        if _text_eos: _text_ends += (_text_eos,)
+        if _text_eos:
+            # A tokenizer that appends EOS itself (add_eos_token = True) needs none from us.
+            try:
+                _probe = tokenizer("a", add_special_tokens = add_special_tokens)["input_ids"]
+                if _probe and _probe[-1] == getattr(tokenizer, "eos_token_id", None):
+                    _text_eos = None
+            except Exception:
+                pass
+
+        def _with_eos(text):
+            if not _text_eos or not isinstance(text, str) or text.rstrip().endswith(_text_ends):
+                return text
+            return text + _text_eos
+
         def _tokenize(example):
+            texts = example[dataset_text_field] if not do_formatting_func else formatting_func(example)
+            texts = [_with_eos(t) for t in texts] if isinstance(texts, (list, tuple)) else _with_eos(texts)
             return tokenizer(
-                example[dataset_text_field] if not do_formatting_func else formatting_func(example),
+                texts,
                 truncation = do_truncation,
                 max_length = max_seq_length,
                 return_token_type_ids = _needs_token_type_ids,
@@ -3017,6 +3115,7 @@ def sft_prepare_dataset(
                 used_column_names.append("assistant_masks")
             from unsloth_zoo.dataset_utils import (
                 _chat_template_batches_like_rows, _is_conversation, _batched_rows, _check_batch_lengths,
+                _prompt_completion_boundary,
             )
             _batch_map = _batched_columns(dataset)
             _batch_chat_template = not is_vlm and _chat_template_batches_like_rows(processing_class)
@@ -3033,8 +3132,13 @@ def sft_prepare_dataset(
                     _completion = _completion + _eos_token
                 return _completion
 
+            # max_length None is no limit; truncation_mode picks the kept side, as TRL and messages rows below do.
+            pc_has_limit = isinstance(max_seq_length, int)
+            pc_cut = slice(-max_seq_length, None) if pc_has_limit and max_seq_length > 0 and \
+                getattr(args, "truncation_mode", "keep_start") == "keep_end" else slice(None, max_seq_length)
+
             def _pc_result(prompt_ids, pc_ids, pc_masks, labels):
-                n_prompt = min(len(prompt_ids), len(pc_ids))
+                n_prompt = _prompt_completion_boundary(prompt_ids, pc_ids)
                 completion_mask = [0] * n_prompt + [1] * (len(pc_ids) - n_prompt)
                 result = {"input_ids": pc_ids, "completion_mask": completion_mask}
                 if assistant_only_loss:
@@ -3042,8 +3146,10 @@ def sft_prepare_dataset(
                         result["assistant_masks"] = [int(x != -100) for x in labels]
                     else:
                         result["assistant_masks"] = list(pc_masks)
-                if do_truncation and max_seq_length > 0:
-                    result = {k: v[:max_seq_length] for k, v in result.items()}
+                # unsloth's sft_trainer_prepare_dataset requires this exact guard line: keep it verbatim.
+                if pc_has_limit:
+                    if do_truncation and max_seq_length > 0:
+                        result = {k: v[pc_cut] for k, v in result.items()}
                 if _needs_token_type_ids:
                     result["token_type_ids"] = [0] * len(result["input_ids"])
                 return result
@@ -3054,10 +3160,11 @@ def sft_prepare_dataset(
                     template_kwargs = dict(example.get("chat_template_kwargs") or {})
                     if training_chat_template is not None:
                         template_kwargs["chat_template"] = training_chat_template
+                    tools = _row_tools(example)
                     prompt_ids = processing_class.apply_chat_template(
                         example["prompt"], tokenize=True,
                         add_generation_prompt=True, return_dict=False,
-                        tools=example.get("tools"),
+                        tools=tools,
                         **template_kwargs,
                     )
                     if prompt_ids and isinstance(prompt_ids[0], list):
@@ -3066,7 +3173,7 @@ def sft_prepare_dataset(
                         example["prompt"] + example["completion"],
                         return_dict=True, tokenize=True,
                         return_assistant_tokens_mask=assistant_only_loss and not marker_masks,
-                        tools=example.get("tools"),
+                        tools=tools,
                         **template_kwargs,
                     )
                     if isinstance(pc_processed.get("input_ids", [None])[0], list):
@@ -3209,10 +3316,7 @@ def sft_prepare_dataset(
                 if training_chat_template is not None:
                     template_kwargs["chat_template"] = training_chat_template
                 messages = _clean_messages(example)
-                tools = example.get("tools")
-                if isinstance(tools, str):
-                    import json as _json
-                    tools = _json.loads(tools)
+                tools = _row_tools(example)
                 processed = processing_class.apply_chat_template(
                     messages, tools = tools,
                     tokenize = True, return_dict = True,
@@ -3309,12 +3413,18 @@ def sft_prepare_dataset(
         if not completion_only_loss and "completion_mask" in mask_columns:
             mask_columns.remove("completion_mask")
         if mask_columns:
+            def _labels_row(input_ids, masks):
+                # Unrolled for one or two masks: `all(m)` built a list per token. Same truthiness as all().
+                if len(masks) == 1:
+                    return [t if m else -100 for t, m in zip(input_ids, masks[0])]
+                if len(masks) == 2:
+                    return [t if a and b else -100 for t, a, b in zip(input_ids, masks[0], masks[1])]
+                return [t if all(m) else -100 for t, *m in zip(input_ids, *masks)]
             def _build_labels(example):
-                masks = [example[x] for x in mask_columns]
-                return {"labels": [t if all(m) else -100 for t, *m in zip(example["input_ids"], *masks)]}
+                return {"labels": _labels_row(example["input_ids"], [example[x] for x in mask_columns])}
             def _build_labels_batched(batch):
                 return {"labels": [
-                    [t if all(m) else -100 for t, *m in zip(input_ids, *masks)]
+                    _labels_row(input_ids, masks)
                     for input_ids, *masks in zip(batch["input_ids"], *(batch[x] for x in mask_columns))
                 ]}
             label_kwargs = {}

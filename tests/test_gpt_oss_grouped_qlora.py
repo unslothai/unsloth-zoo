@@ -934,3 +934,58 @@ def test_fsdp2_gathered_backward_reads_current_weights(mode, marked, monkeypatch
     out, dx, _ = run(move = True)
     assert torch.equal(out, ref_out)
     assert torch.equal(dx, ref_dx), f"stale table in backward: max |dX - ref| {(dx - ref_dx).abs().max().item()}"
+
+
+def _run_glue(ex, x, idx, w, up, monkeypatch, env):
+    for k in ("UNSLOTH_GPTOSS_FUSED_GLUE", "UNSLOTH_GPTOSS_FUSED_COMBINE"):
+        monkeypatch.delenv(k, raising = False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    from unsloth_zoo.temporary_patches import gpt_oss_fused_glue as glue
+    for p in ex.parameters():
+        p.grad = None
+    xx = x.detach().clone().requires_grad_(True)
+    ww = w.detach().clone().requires_grad_(True)
+    before = dict(glue.FUSED_GLUE_CALLS)
+    out = ex(xx, idx, ww)
+    out.backward(up.view_as(out).to(out.dtype))
+    grads = {n: p.grad.detach().clone() for n, p in ex.named_parameters() if p.grad is not None}
+    grads["<input>"], grads["<weights>"] = xx.grad.detach().clone(), ww.grad.detach().clone()
+    return out.detach(), grads, {k: glue.FUSED_GLUE_CALLS[k] - before[k] for k in before}
+
+
+@needs_grouped_mm
+@pytest.mark.skipif(torch.version.hip is not None, reason = "fused gpt-oss glue is CUDA only")
+@pytest.mark.parametrize("lora", [True, False])
+@pytest.mark.parametrize("x_dtype", [torch.bfloat16, torch.float32])
+def test_fused_glue_reproduces_the_eager_chain(lora, x_dtype, monkeypatch):
+    """Fused bias + LoRA + clamped SwiGLU and down epilogues equal the eager chain bit for bit (the shipped SwiGLU
+    uncompiled: Inductor's fp32 sigmoid can differ by an ulp); the fused combine changes only the routing-weight grad's
+    fp32 summation order; each kill switch restores the eager path."""
+    import inspect
+    from unsloth_zoo.temporary_patches import gpt_oss
+    monkeypatch.setattr(gpt_oss, "swiglu_torch_forward", inspect.unwrap(gpt_oss.swiglu_torch_forward))
+    monkeypatch.setattr(gq, "_GPT_OSS", gpt_oss)
+    ex = _Experts(True)
+    ex = (_lora_wrap(ex) if lora else ex).train()
+    T = 300
+    g = torch.Generator(device = "cuda").manual_seed(5)
+    x = (torch.randn(1, T, H, device = "cuda", generator = g) * 3).to(x_dtype)
+    up = torch.randn(1, T, H, device = "cuda", generator = g)
+    idx, w = _routing(T)
+    monkeypatch.setenv("UNSLOTH_GPTOSS_GROUPED", "1")
+    ref_out, ref_g, ref_calls = _run_glue(ex, x, idx, w, up, monkeypatch, {"UNSLOTH_GPTOSS_FUSED_GLUE": "0"})
+    assert sum(ref_calls.values()) == 0
+    out, gr, calls = _run_glue(ex, x, idx, w, up, monkeypatch, {"UNSLOTH_GPTOSS_FUSED_COMBINE": "0"})
+    assert calls["gate_up"] == 1 and calls["gate_up_bwd"] == 1 and calls["down"] == 1 and calls["fallback"] == 0
+    assert torch.equal(out, ref_out)
+    assert set(gr) == set(ref_g)
+    for k in ref_g:
+        assert torch.equal(gr[k], ref_g[k]), k
+    out2, gr2, _ = _run_glue(ex, x, idx, w, up, monkeypatch, {})
+    assert torch.equal(out2, ref_out)
+    for k in ref_g:
+        if k == "<weights>":
+            assert _rel(gr2[k].float(), ref_g[k].float()) < 1e-5
+        else:
+            assert torch.equal(gr2[k], ref_g[k]), k

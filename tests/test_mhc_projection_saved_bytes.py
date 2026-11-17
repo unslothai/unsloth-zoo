@@ -19,7 +19,6 @@ streams per mixer site); MODULE_FORWARD_EAGER_REWRITES routes input_norm and the
 unsloth_mhc_projection, which reruns them in backward."""
 
 import importlib
-import inspect
 import textwrap
 
 import pytest
@@ -32,7 +31,6 @@ from unsloth_zoo.compiler import (
     module_forward_source_rewrites,
 )
 from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
-    MHC_PROJECTION_SOURCE,
     MHC_SINKHORN_SOURCE,
     unsloth_mhc_projection,
 )
@@ -56,8 +54,9 @@ def _mixer(model_type, cls_name, config_type):
 
     modeling = _modeling(model_type)
     cls = getattr(modeling, cls_name, None)
-    if cls is None or MHC_PROJECTION_SOURCE not in inspect.getsource(cls.forward):
-        pytest.skip(f"{cls_name} has a different forward in this transformers")
+    if cls is None:
+        # Skip because this transformers predates the mixer class (capability check, not a layout check).
+        pytest.skip(f"transformers has no {cls_name}")
     config = transformers.AutoConfig.for_model(config_type, hidden_size = 64, hc_mult = 4, hc_sinkhorn_iters = 20)
     torch.manual_seed(0)
     mixer = cls(config)
@@ -93,10 +92,12 @@ def test_registry_rewrite_applies_and_keeps_the_sinkhorn_rewrite(model_type, cls
     modeling = _modeling(model_type)
     if cls_name not in MODULE_FORWARD_EAGER_REWRITES.get(model_type, {}):
         pytest.fail(f"{cls_name} missing from MODULE_FORWARD_EAGER_REWRITES")
-    cls = getattr(modeling, cls_name, None)
-    if cls is None or MHC_PROJECTION_SOURCE not in inspect.getsource(cls.forward):
-        pytest.skip(f"{cls_name} has a different forward in this transformers")
-    source = module_forward_eager_rewrites(modeling, model_type)[cls_name]
+    if getattr(modeling, cls_name, None) is None:
+        # Skip because this transformers predates the mixer class (capability check, not a layout check).
+        pytest.skip(f"transformers has no {cls_name}")
+    # A transformers layout no rewrite matches must fail here, not skip.
+    source = module_forward_eager_rewrites(modeling, model_type).get(cls_name)
+    assert source is not None, f"no MHC_PROJECTION_REWRITES layout matches {cls_name}.forward"
     assert "unsloth_mhc_projection(" in source and "self.fn.float()" not in source
     assert source.count(MHC_SINKHORN_SOURCE) == 1
     assert modeling.unsloth_mhc_projection is unsloth_mhc_projection
@@ -144,3 +145,19 @@ def test_helper_plain_paths_match():
         assert torch.equal(unsloth_mhc_projection(x, norm, fn), ref)
     assert torch.equal(unsloth_mhc_projection(x.float(), norm, fn), ref)
     assert torch.equal(unsloth_mhc_projection(x, norm, fn), ref)  # nothing requires grad
+
+
+@pytest.mark.parametrize("requires_grad", [False, True])
+def test_native_rsqrt_projection_stays_fp32_under_fp16_autocast(requires_grad):
+    from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_mhc_projection_rsqrt
+
+    x = torch.full((1, 2, 4, 64), 300.0, dtype = torch.bfloat16, requires_grad = requires_grad)
+    fn = torch.ones(24, 256, requires_grad = requires_grad)
+    want = unsloth_mhc_projection_rsqrt(x, fn, 1e-6)
+    with torch.autocast("cpu", dtype = torch.float16):
+        got = unsloth_mhc_projection_rsqrt(x, fn, 1e-6)
+    assert got.dtype == torch.float32 and torch.isfinite(got).all()
+    torch.testing.assert_close(got, want, rtol = 0, atol = 0)
+    if requires_grad:
+        got.sum().backward()
+        assert torch.isfinite(x.grad).all() and torch.isfinite(fn.grad).all()

@@ -468,3 +468,34 @@ def test_inference_gates_cpu(monkeypatch):
         assert alive() is None and alive_other() is None
     finally:
         gc.enable()
+
+
+def test_decode_padding_layout_is_stable_as_the_window_rolls_cpu(monkeypatch):
+    # One-token steps of a sliding layer past its window: generate() widens the 2D mask by a column per step and the
+    # host kv_offset moves with it. The tensors the BlockMask's graph contract carries must keep their shapes and
+    # strides (a decode graph keys on them), or every step re-captures.
+    from torch.nn.attention.flex_attention import create_block_mask
+    from transformers.masking_utils import sliding_window_causal_mask_function
+    import unsloth_zoo.flex_attention.utils as U
+    monkeypatch.setattr(U, "compiled_create_block_mask",
+                        lambda m, b, h, M, N, device = "cpu": create_block_mask(m, b, h, M, N, device = device),
+                        raising = False)
+    import unsloth_zoo.temporary_patches.gpt_oss as G
+    from unsloth_zoo.temporary_patches.gpt_oss import _gpt_oss_flex_mask
+    # A graph-planned generate() with flex decode: the builder publishes the graph contract.
+    monkeypatch.setattr(G, "_gpt_oss_in_graph_generate", lambda: True)
+    monkeypatch.setattr(G, "_gpt_oss_graph_decode_attention", lambda: "flex")
+    layouts = []
+    for step in range(4):
+        width = 300 + step
+        mask = torch.ones(2, width, dtype = torch.long)
+        mask[1, :5] = 0
+        block_mask = _gpt_oss_flex_mask(
+            batch_size = 2, q_length = 1, kv_length = 128, q_offset = torch.tensor(width - 1),
+            kv_offset = width - 128, mask_function = sliding_window_causal_mask_function(128),
+            attention_mask = mask, device = "cpu",
+        )
+        contract = block_mask.__dict__.get("_unsloth_graph_closure")
+        assert contract is not None
+        layouts.append(tuple((tuple(t.shape), t.stride(), t.dtype) for t in contract[0]))
+    assert len(set(layouts)) == 1, layouts

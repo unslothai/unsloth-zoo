@@ -24,6 +24,7 @@ values per ``r``. Rows of ``x`` are sorted by expert (``counts[e]`` rows each, l
 (no expert schedule), e.g. a packed MXFP4 Linear."""
 
 import torch
+from .triton_specialize import jit_any_alignment as _jit_any_alignment
 
 __all__ = [
     "mxfp4_grouped_mm",
@@ -202,7 +203,8 @@ if _HAS_TRITON:
         hi = tl.reshape(tl.reshape(hi, (ROWS, BYTES // 16, 16)) * f1 * f2, (ROWS, BYTES))
         return lo, hi
 
-    @triton.jit
+    # M: rows per call; == 1 kept, no % 16 binary.
+    @_jit_any_alignment("M")
     def _mxfp4_grouped_mm_kernel(
         x_ptr, blocks_ptr, scales_ptr, out_ptr, counts_ptr, bias_ptr,
         E, R, G, K, N, M,
@@ -695,9 +697,18 @@ def mxfp4_expert_grouped_mm(x, blocks, scales, counts, transpose_b = True):
 _AVAILABLE = {}
 
 
+def _triton_too_old():
+    # Triton 3.0 (torch 2.4) aborts the whole process compiling these kernels, past any try / except.
+    try:
+        major, minor = (int(v) for v in triton.__version__.split(".")[:2])
+    except Exception:
+        return False
+    return (major, minor) < (3, 1)
+
+
 def mxfp4_grouped_mm_available(device = None) -> bool:
     """Whether the fused kernel compiles on ``device`` and matches dequantize + matmul on a probe."""
-    if not _HAS_TRITON or not torch.cuda.is_available():
+    if not _HAS_TRITON or not torch.cuda.is_available() or _triton_too_old():
         return False
     device = torch.device(device) if device is not None else torch.device("cuda", torch.cuda.current_device())
     if device.type != "cuda":

@@ -44,13 +44,13 @@ _PROBE = textwrap.dedent(
     # required positional argument: 'target_device'" while capturing the golden,
     # i.e. it went red before it could measure the corruption it exists to detect.
     # Mirror Mxfp4Dequantize.convert, which passes the blocks' own device.
-    _N_POS = len([
-        p for p in inspect.signature(m.dequantize_convertops).parameters.values()
-        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
-    ])
+    # 5.23 declares (blocks, scales, dtype) and passes the dtype of the parameter the experts load into.
+    _PARAMS = tuple(inspect.signature(m.dequantize_convertops).parameters)
 
     def _call(fn, blocks, scales):
-        if _N_POS >= 3:
+        if _PARAMS == ("blocks", "scales", "dtype"):
+            return fn(blocks, scales, torch.bfloat16)
+        if len(_PARAMS) >= 3:
             return fn(blocks, scales, blocks.device)
         return fn(blocks, scales)
 

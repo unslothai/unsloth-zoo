@@ -27,8 +27,8 @@ os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
 from unsloth_zoo.temporary_patches import gdn_causal_conv1d as gcc  # noqa: E402
 
-_HAS_CUDA = torch.cuda.is_available() and getattr(torch.version, "hip", None) is None
-requires_cuda = pytest.mark.skipif(not _HAS_CUDA, reason = "needs a CUDA GPU")
+_HAS_CUDA = torch.cuda.is_available()
+requires_cuda = pytest.mark.skipif(not _HAS_CUDA, reason = "needs a CUDA or ROCm GPU")
 
 
 def _inputs(B, D, T, W, L, dtype, bias, seed = 0):
@@ -75,7 +75,9 @@ def test_matches_reference(B, D, T, W, L, dtype, bias, act):
         assert _rel(ref, oracle) < 5e-3
         assert _rel(ours, ref) < 5e-3
         assert _rel(ours, oracle) <= max(1.25 * _rel(ref, oracle), 1e-3)
-        assert (ours == ref).float().mean().item() > 0.7
+        if torch.version.hip is None:
+            # Bitwise agreement with CUDA torch's rounding order; ROCm is judged by the fp64 bounds only.
+            assert (ours == ref).float().mean().item() > 0.7
 
 
 @requires_cuda

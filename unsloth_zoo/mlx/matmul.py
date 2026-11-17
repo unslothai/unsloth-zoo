@@ -1372,6 +1372,7 @@ _SHORTLIST_HISTOGRAM = """
     threadgroup atomic_uint bins[256];
     atomic_store_explicit(bins + tid, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint N = values_shape[1];
     for (uint j = tid; j < CHUNK; j += 256) {
         uint col = chunk * CHUNK + j;
         bool valid = col < N;
@@ -1398,13 +1399,13 @@ _SHORTLIST_LOW_COUNT = """
 _SHORTLIST_HISTOGRAM_STORE = """
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    hist[(row * SHARDS + chunk) * 256 + tid] = atomic_load_explicit(bins + tid, memory_order_relaxed);
+    hist[(row * ((N + CHUNK - 1) / CHUNK) + chunk) * 256 + tid] =atomic_load_explicit(bins + tid, memory_order_relaxed);
 """
 
 _SHORTLIST_THRESHOLD = """
     uint row = threadgroup_position_in_grid.x, tid = thread_index_in_threadgroup;
     threadgroup uint bins[256];
-    uint count = 0;
+    uint count = 0, SHARDS = hist_shape[1];
     for (uint c = 0; c < SHARDS; ++c) count += hist[(row * SHARDS + c) * 256 + tid];
     bins[tid] = count;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1421,6 +1422,7 @@ _SHORTLIST_COLLECT = """
     uint chunk = threadgroup_position_in_grid.x, row = threadgroup_position_in_grid.y;
     uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     uint hi = high[row * 2], lo = low[row * 2], cut = (hi << 8) | lo, ties = low[row * 2 + 1];
+    uint N = values_shape[1], SHARDS = high_hist_shape[1];
     threadgroup uint scratch[8];
     uint before = 0, equal_before = 0;
     for (uint c = 0; c < chunk; ++c) {
@@ -1484,7 +1486,8 @@ def radix_shortlist(values):
     at the cut keep the lowest columns, and NaN ranks below every number."""
     M, N = values.shape
     shards = -(-N // _SHORTLIST_CHUNK)
-    template = [("T", values.dtype), ("N", N), ("CHUNK", _SHORTLIST_CHUNK), ("SHARDS", shards), ("K_SELECT", _SHORTLIST_K)]
+    # Sizes come from the arrays' shapes, so one compiled kernel serves every N.
+    template = [("T", values.dtype), ("CHUNK", _SHORTLIST_CHUNK), ("K_SELECT", _SHORTLIST_K)]
     launch = dict(template = template, threadgroup = (256, 1, 1), output_dtypes = [mx.uint32])
     per_chunk, per_row = (256 * shards, M, 1), (256 * M, 1, 1)
     high_hist = _shortlist_histogram(False)(inputs = [values], grid = per_chunk, output_shapes = [(M, shards, 256)], **launch)[0]

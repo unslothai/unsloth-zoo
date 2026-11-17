@@ -34,7 +34,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       contains(github.event.pull_request.labels.*.name, 'mlx')
     runs-on: macos-15   # Apple Silicon (M1) hosted runner
-    timeout-minutes: 30
+    timeout-minutes: 45   # the Metal suite runs ~30 min on the hosted M1 before its last steps
     strategy:
       fail-fast: false
       matrix:
@@ -53,7 +53,7 @@ jobs:
     steps:
       # harden-runner block-mode is Linux-only; stay in audit on macOS for parity.
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: audit
 
@@ -195,6 +195,10 @@ jobs:
         # experts from the checkpoint, bit-exact against the stock modules.
         run: python -m pytest tests/test_mlx_load_residency_metal.py -v -rs
 
+      - name: tests/test_mlx_speculative_metal.py (qwen4_exp)
+        # Only the random qwen4_exp cases: the rest load bf16 checkpoints this runner cannot hold.
+        run: python -m pytest tests/test_mlx_speculative_metal.py -k qwen4 -v -rs
+
       - name: tests/test_mlx_generate_metal.py
         # Batched generation on real models: batched-vs-sequential greedy
         # equivalence with aligned sampled-token logprobs, memory-limit
@@ -252,6 +256,13 @@ jobs:
       - name: tests/test_mlx_vlm_label_masks.py
         # Audio collation, label masking and the family/version gate.
         run: python -m pytest tests/test_mlx_vlm_label_masks.py -v -rs
+
+      - name: tests/test_mlx_vlm_video_batch.py
+        run: python -m pytest tests/test_mlx_vlm_video_batch.py -v -rs
+
+      - name: tests/test_video_reader_backends.py
+        # No torchvision or PyAV here: mlx-vlm's opencv-python is the decoder Apple Silicon users get.
+        run: python -m pytest tests/test_video_reader_backends.py -v -rs
 
       - name: tests/test_mlx_batching_and_decay.py
         # test_compiler_review_guards_are_present is deselected here, not skipped

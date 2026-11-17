@@ -1,0 +1,246 @@
+"""Triton primitives shared by gather-attention kernel schedules."""
+
+
+# Modified by Unsloth: postponed annotations so the PEP 604 unions import on Python 3.9.
+from __future__ import annotations
+from collections.abc import Sequence
+from typing import NamedTuple
+
+import torch
+import triton
+import triton.language as tl
+from triton.tools.tensor_descriptor import TensorDescriptor
+
+# Modified by Unsloth: package-absolute import of the vendored attn_gym.
+from unsloth_zoo._vendored.attn_gym._backends.triton.utils import _document_ids, ptr_offset
+
+
+def can_use_shared_kv_schedule(
+    query: torch.Tensor,
+    sparse_kv: torch.Tensor,
+    local_kv: torch.Tensor | None,
+    sliding_window_size: int,
+    query_rope: torch.Tensor | None = None,
+    sparse_rope: torch.Tensor | None = None,
+    local_rope: torch.Tensor | None = None,
+) -> bool:
+    """Check the shared Blackwell forward/backward schedule's layout and shape limits.
+
+    The latent KV is both key and value. Optional key-only RoPE tensors add a second logit
+    dot; with RoPE, ``sparse_rope`` (and ``local_rope`` under a window) must be given.
+    """
+    _, heads, _, head_dim = query.shape
+    rope_tensors = (sparse_rope, local_rope) if sliding_window_size else (sparse_rope,)
+    rope_ok = query_rope is None or (
+        query_rope.shape[-1] in (16, 32, 64, 128)
+        and query_rope.dtype == torch.bfloat16
+        and all(
+            rope is not None
+            and rope.dtype == torch.bfloat16
+            and rope.shape[-1] == query_rope.shape[-1]
+            and rope.stride(1) == 0
+            for rope in rope_tensors
+        )
+    )
+    return (
+        torch.cuda.get_device_capability(query.device)[0] >= 10
+        and query.dtype == torch.bfloat16
+        and sparse_kv.stride(1) == 0
+        and query.stride(-1) == 1
+        and sparse_kv.stride(-1) == 1
+        # Without a window the kernels never read local KV, so it may be absent.
+        and (sliding_window_size == 0 or (local_kv.stride(1) == 0 and local_kv.stride(-1) == 1))
+        and 16 <= heads <= 128
+        and head_dim % 16 == 0
+        and (head_dim <= 128 or head_dim == 512)
+        and rope_ok
+        and sliding_window_size <= 2048
+    )
+
+
+class TileConfig(NamedTuple):
+    """Launch parameters of a fixed-config (not autotuned) kernel."""
+
+    block_m: int
+    block_n: int
+    num_warps: int
+    num_stages: int
+    # Shared memory in BLOCK_D-wide rows: the largest ``metadata.shared / (BLOCK_D *
+    # element_size)`` measured for SM86 at D in {64, 128, 256} with Triton 3.8.
+    shared_rows: int = 0
+    # Tensor-memory columns: the largest ``metadata.tmem_size`` measured on SM103 (GB300) for
+    # BF16 and FP32 at D in {64, 128, 256} with Triton 3.8. Only 64-row tiles use tcgen05 MMAs.
+    tmem_cols: int = 0
+
+
+# Tensor-memory columns one CTA may allocate on datacenter Blackwell; Triton rejects kernels
+# above it when loading them.
+TENSOR_MEMORY_COLUMNS = 512
+
+
+def select_tiles(
+    candidates: Sequence[TileConfig],
+    block_d: int,
+    element_size: int,
+    device: torch.device,
+) -> TileConfig:
+    """Return the first candidate whose estimated shared and tensor memory fit ``device``.
+
+    Candidates are ordered by preference; the last one is the fallback for tiny budgets.
+    """
+    properties = torch.cuda.get_device_properties(device)
+    shared_budget = properties.shared_memory_per_block_optin
+    # SM10x/SM11x accumulate tcgen05 MMAs in tensor memory; other GPUs have none.
+    tmem_budget = TENSOR_MEMORY_COLUMNS if properties.major in (10, 11) else float("inf")
+    return next(
+        (
+            c
+            for c in candidates
+            if c.shared_rows * block_d * element_size <= shared_budget
+            and c.tmem_cols <= tmem_budget
+        ),
+        candidates[-1],
+    )
+
+
+def optional_strides(tensor: torch.Tensor | None) -> tuple[int, ...] | None:
+    """Strides of an optional kernel operand; None compiles out its constexpr-guarded uses."""
+    return None if tensor is None else tensor.stride()
+
+
+def tuning_key(tensor: str, *names: str):
+    """Key a ``TritonTuner`` by the dtype of argument ``tensor`` and the arguments ``names``.
+
+    Unlike ``triton.autotune``'s implicit dtype key, this also sees through TMA descriptors.
+    """
+
+    def key(args):
+        value = args[tensor]
+        dtype = (value.base if isinstance(value, TensorDescriptor) else value).dtype
+        return (dtype, *(args[name] for name in names))
+
+    return key
+
+
+def prune_wide_backward_configs(configs, args):
+    """Bound full-width D=512 gradient tiles without changing smaller-head tuning."""
+    if args["D"] != 512:
+        return configs
+    return [
+        config
+        for config in configs
+        if config.num_warps == 4
+        and config.num_stages == 1
+        and all(size <= 16 for size in config.kwargs.values())
+    ]
+
+
+@triton.jit
+def offset_strides(strides, USE_INT64_OFFSETS: tl.constexpr):
+    """Select address width before multiplying runtime strides and indices."""
+    result = ()
+    for axis in tl.static_range(len(strides)):
+        result += (tl.cast(strides[axis], tl.int64 if USE_INT64_OFFSETS else tl.int32),)
+    return result
+
+
+@triton.jit
+def load_bhsd(
+    tensor_ptr,
+    strides,
+    batch,
+    head,
+    positions,
+    offsets_d,
+    mask,
+):
+    """Load a tile from gather attention's BHSD tensors."""
+    return tl.load(
+        tensor_ptr
+        + ptr_offset(
+            (batch, head, positions[:, None], offsets_d[None, :]),
+            strides,
+        ),
+        mask=mask,
+        other=0.0,
+    )
+
+
+@triton.jit
+def load_document_bounds(
+    cu_seqlens_ptr,
+    cu_seqlens_k_ptr,
+    positions,
+    num_documents,
+    sequence_length,
+    USE_INT64_OFFSETS: tl.constexpr,
+):
+    """Find query and candidate bounds; inactive queries have no sparse candidates."""
+    document = _document_ids(cu_seqlens_ptr, positions, num_documents, USE_INT64_OFFSETS)
+    offset = document.to(tl.int64) if USE_INT64_OFFSETS else document
+    # The right-sided search skips empty documents and returns N for tail/padded positions.
+    start = tl.load(cu_seqlens_ptr + offset)
+    end = tl.load(
+        cu_seqlens_ptr + offset + 1,
+        mask=document < num_documents,
+        other=sequence_length,
+    )
+    candidate_start = tl.load(cu_seqlens_k_ptr + offset)
+    candidate_end = tl.load(cu_seqlens_k_ptr + tl.minimum(offset + 1, num_documents))
+    return start, end, candidate_start, candidate_end
+
+
+@triton.jit
+def store_bhsd(
+    tensor_ptr,
+    value,
+    strides,
+    batch,
+    head,
+    positions,
+    offsets_d,
+    mask,
+):
+    """Store a tile to gather attention's BHSD tensors."""
+    tl.store(
+        tensor_ptr
+        + ptr_offset(
+            (batch, head, positions[:, None], offsets_d[None, :]),
+            strides,
+        ),
+        value,
+        mask=mask,
+    )
+
+
+@triton.jit
+def causal_window_mask(
+    query_positions,
+    key_positions,
+    query_mask,
+    key_mask,
+    window: tl.constexpr,
+):
+    """Mask valid gather-attention pairs to the causal local window."""
+    return (
+        query_mask[:, None]
+        & key_mask[None, :]
+        & (key_positions[None, :] <= query_positions[:, None])
+        & (key_positions[None, :] >= query_positions[:, None] - window + 1)
+    )
+
+
+@triton.jit
+def online_softmax_update(accumulator, running_max, running_sum, logits, values):
+    """Merge one gather-attention tile into FP32 online-softmax state."""
+    tile_max = tl.max(logits, axis=1)
+    new_max = tl.maximum(running_max, tile_max)
+    # An empty prefix with no sink has max=-inf. Keep that state for later tiles,
+    # but avoid -inf - -inf while computing this tile's zero contribution.
+    safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
+    alpha = tl.exp(running_max - safe_max)
+    probabilities = tl.exp(logits - safe_max[:, None])
+    accumulator *= alpha[:, None]
+    accumulator += tl.dot(probabilities.to(values.dtype), values, input_precision="tf32x3")
+    running_sum = running_sum * alpha + tl.sum(probabilities, axis=1)
+    return accumulator, new_max, running_sum

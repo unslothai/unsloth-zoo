@@ -1867,6 +1867,13 @@ def detect_family(folder):
     return name
 
 
+def _refuse_untrusted_model_file():
+    """mlx-lm < 0.32 and mlx-vlm exec a config.json `model_file`; decision loads never opt into repository code."""
+    from .loader import _install_mlx_model_file_guard
+
+    _install_mlx_model_file_guard()
+
+
 def load_decision_model(folder, compute_dtype = None, *, family = None, subfolder = None, base_model = None, token = None, load_in_4bit = False):
     """Load a decision model from its source repo: a local folder, or a Hugging Face repo id that is downloaded.
 
@@ -1876,6 +1883,7 @@ def load_decision_model(folder, compute_dtype = None, *, family = None, subfolde
     quantizes a Clef's decoder as it loads, to train LoRA adapters over: `save_clef_model` merges them into the
     checkpoint's own full-precision weights.
     """
+    _refuse_untrusted_model_file()
     source, folder = folder, Path(folder)
     if not folder.is_dir():
         from huggingface_hub import snapshot_download
@@ -1904,6 +1912,7 @@ def load_language_model_as_clef(path, compute_dtype = None, *, head_width = None
     """Load a plain language model with a new untrained joint head to train as a Clef; the head is 1024 wide for hidden
     size 3072+ (else 512) unless head_width or head_config says otherwise; seed reseeds MLX's random state;
     load_in_4bit quantizes the decoder for LoRA training."""
+    _refuse_untrusted_model_file()
     folder = Path(path)
     if not folder.is_dir():
         from huggingface_hub import snapshot_download
@@ -1926,6 +1935,7 @@ def _as_d1_config(config):
 def load_language_model_as_d1(path, compute_dtype = None, *, token = None):
     """Load an LFM3-VL or LFM3-Omni language model to train as a d1, whose answers are its own output embedding at the
     answer slots under set attention, so no head is added. A d1 checkpoint loads as it is, to go on training."""
+    _refuse_untrusted_model_file()
     folder = Path(path)
     if not folder.is_dir():
         from huggingface_hub import snapshot_download

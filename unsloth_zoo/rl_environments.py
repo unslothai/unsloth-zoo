@@ -402,6 +402,9 @@ pass
 def _is_safe_literal(node: ast.AST) -> bool:
     if isinstance(node, ast.Constant):
         return True
+    # -1 parses as UnaryOp(Constant); -"a" / -None would raise at definition time.
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        return isinstance(node.operand, ast.Constant) and isinstance(node.operand.value, (int, float, complex))
     if isinstance(node, ast.Tuple):
         return all(_is_safe_literal(e) for e in node.elts)
     return False
@@ -497,13 +500,14 @@ _SAFE_IMPORT_MODULES = frozenset({
 
 # Denied per member, module kept: operator.attrgetter walks dunders from a string; functools wraps/update_wrapper copy
 # assigned names like __globals__; get_type_hints and ForwardRef/evaluate_forward_ref run strings (denied on all
-# versions); clock_settime and enum.global_enum mutate host state.
+# versions); clock_settime and enum.global_enum mutate host state; enum.pickle_by_enum_name returns the real getattr.
 _DENIED_MODULE_ATTRS = frozenset({
     "functools.update_wrapper",
     "functools.wraps",
     "time.clock_settime",
     "time.clock_settime_ns",
     "enum.global_enum",
+    "enum.pickle_by_enum_name",
     "operator.attrgetter",
     "operator.methodcaller",
     "typing.ForwardRef",

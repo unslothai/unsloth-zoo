@@ -1344,7 +1344,7 @@ def test_compiler_attn_weights_attention_mask_dict_pattern():
 
 
 def test_compiler_gradient_checkpointing_layer_marker_in_full_source():
-    """compiler.py:3841 branches on the literal (GradientCheckpointingLayer) marker found in full_source."""
+    """compiler.py:3841 branches on the literal (GradientCheckpointingLayer) or (ActivationCheckpointingLayer) marker found in full_source."""
     pytest.importorskip("transformers")
     import importlib
     candidate_modules = [
@@ -1363,11 +1363,11 @@ def test_compiler_gradient_checkpointing_layer_marker_in_full_source():
             src = inspect.getsource(m)
         except OSError:
             continue
-        if "(GradientCheckpointingLayer)" in src:
+        if "(GradientCheckpointingLayer)" in src or "(ActivationCheckpointingLayer)" in src:
             return
     _drift(
         "unsloth_zoo/compiler.py:3841",
-        "(GradientCheckpointingLayer)",
+        "(GradientCheckpointingLayer) or (ActivationCheckpointingLayer)",
         "any of " + ", ".join(candidate_modules),
         "Without this marker, zoo always falls back to "
         "`patch_gradient_checkpointing` which has stricter "

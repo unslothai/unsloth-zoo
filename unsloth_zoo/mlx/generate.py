@@ -478,15 +478,30 @@ def _kv_quant_options(defaults: GenerationDefaults) -> dict:
     }
 
 
-def _prefill_step_option(defaults: GenerationDefaults, constructor = None) -> dict:
-    """``prefill_step_size`` when one was asked for and ``constructor`` (if given) takes it."""
+def _prefill_step_option(defaults: GenerationDefaults, constructor = None, *, model = None) -> dict:
+    """Supported prefill size, bounded by the loaded model's automatic memory plan."""
     if defaults.prefill_step_size is None:
         return {}
     if constructor is not None:
         params = inspect.signature(constructor).parameters
         if "prefill_step_size" not in params and not any(p.kind is p.VAR_KEYWORD for p in params.values()):
             return {}
-    return {"prefill_step_size": defaults.prefill_step_size}
+    return {"prefill_step_size": capped_prefill_step(model, defaults.prefill_step_size)}
+
+
+def capped_prefill_step(model, step):
+    """``step``, capped to the widest prefill ``model``'s automatic offload plan fits (warned once)."""
+    limit = getattr(model, "_unsloth_auto_prefill_step", None)
+    if limit is None or step is None or step <= limit:
+        return step
+    if not getattr(model, "_unsloth_auto_prefill_warned", False):
+        object.__setattr__(model, "_unsloth_auto_prefill_warned", True)
+        warnings.warn(
+            f"Unsloth: capping requested prefill_step_size={step} to {limit} "
+            "to stay within this model's automatic offload memory plan.",
+            UserWarning, stacklevel=3,
+        )
+    return limit
 
 
 def _batch_kv_quant_options(defaults: GenerationDefaults) -> dict:
@@ -2069,7 +2084,7 @@ class _TextBatchSession:
             prefill_batch_size=defaults.prefill_batch_size,
             completion_batch_size=defaults.completion_batch_size,
             max_kv_size=defaults.max_kv_size,
-            **_prefill_step_option(defaults, adapter.batch_generator_type),
+            **_prefill_step_option(defaults, adapter.batch_generator_type, model=adapter.model),
         )
         self._draws = (
             _BatchedDraws(self.generator)
@@ -3650,7 +3665,7 @@ class _VLMBatchAdapter:
             max_tokens=int(request.max_tokens or self.defaults.max_tokens),
             logits_processors=_row_processors(request),
             **_kv_quant_options(self.defaults),
-            **_prefill_step_option(self.defaults),
+            **_prefill_step_option(self.defaults, model=self.model),
             sampler=(
                 _seeded_sampler(self.sample_utils, sampling)
                 if _draws_seeded(sampling)
@@ -3777,7 +3792,7 @@ class _VLMBatchAdapter:
         if "compute_logprobs" in self.constructor_params:
             options["compute_logprobs"] = not defaults.token_ids_only
         options.update(_batch_kv_quant_options(self.defaults))
-        options.update(_prefill_step_option(self.defaults))
+        options.update(_prefill_step_option(self.defaults, model=self.model))
         max_tokens = [
             int(requests[index].max_tokens or self.defaults.max_tokens) for index in indices
         ]
@@ -4412,7 +4427,7 @@ class _VLMBatchSession:
             "sampler": self.sampler,
             "compute_logprobs": True,
             **_batch_kv_quant_options(defaults),
-            **_prefill_step_option(defaults),
+            **_prefill_step_option(defaults, model=adapter.model),
         }
         generator = adapter.generator_type(
             adapter.model.language_model,
@@ -4539,7 +4554,7 @@ class _SpeculativeBatchSession:
         )
         # The engine row keeps the whole prompt, for copies and the drafter; only the forward starts past the prefix.
         with self._embedded(len(pending.prompt) - prefix):
-            admitted, logprob = self.speculative.admit(adapter.model, pending, input_ids[:, prefix:], None if prefix else inputs.get("pixel_values"), mask, **extra, **_prefill_step_option(adapter.defaults))
+            admitted, logprob = self.speculative.admit(adapter.model, pending, input_ids[:, prefix:], None if prefix else inputs.get("pixel_values"), mask, **extra, **_prefill_step_option(adapter.defaults, model=adapter.model))
         finished = admitted.pending in self.stop_tokens or admitted.max_tokens == 1
         retire = getattr(request.prompt_cache_state, "retire", None)
         if not finished:

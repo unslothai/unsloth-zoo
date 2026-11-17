@@ -297,6 +297,12 @@ def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
+_AC_DOWNLOAD_KEYS = (
+    "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY",
+    "HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY",
+    "HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY",
+)
+
 # Dropped under a user's high-performance flag: xet-core >= 1.7 applies env after the preset, so a kept key beats it.
 _CAPS_VOIDED_BY_HIGH_PERFORMANCE = (
     "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT",
@@ -304,9 +310,7 @@ _CAPS_VOIDED_BY_HIGH_PERFORMANCE = (
     "HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_PERFILE_SIZE",
     "HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER",
     "HF_XET_DATA_MAX_CONCURRENT_FILE_DOWNLOADS",
-    "HF_XET_CLIENT_AC_MAX_DOWNLOAD_CONCURRENCY",
-    "HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY",
-    "HF_XET_CLIENT_AC_MIN_DOWNLOAD_CONCURRENCY",
+    *_AC_DOWNLOAD_KEYS,
 )
 
 _FAIL_FAST_KEYS = (
@@ -448,6 +452,14 @@ def apply_xet_env(
         profile, throttled = throttled, fail_fast = fail_fast, cache_dir = cache_dir,
     )
 
+    # xet-core reads the fixed alias only for primaries left unset (aliases.rs), so ours stand down, even under force,
+    # and our unchanged seeds leave os.environ; child envs are cleaned by resize_for_cache_dir, other mappings are not ours.
+    if target.get("HF_XET_FIXED_DOWNLOAD_CONCURRENCY"):
+        for key in _AC_DOWNLOAD_KEYS:
+            overrides.pop(key, None)
+            if target is os.environ and key in _SEEDED_INTO_ENVIRON and target.get(key) == _SEEDED_INTO_ENVIRON[key]:
+                del target[key], _SEEDED_INTO_ENVIRON[key]
+
     # A user's high-performance flag keeps the headroom, so our caps are dropped rather than left alongside it; read it
     # as xet-core does (configuration_utils.rs get_high_performance_flag): HF_XET_HIGH_PERFORMANCE wins if set at all,
     # HF_XET_HP only otherwise.
@@ -489,9 +501,11 @@ def resize_for_cache_dir(
     call's."""
     if throttled is None:
         throttled = _SEEDED_THROTTLED
-    for key, value in _SEEDED_INTO_ENVIRON.items():
+    for key, value in list(_SEEDED_INTO_ENVIRON.items()):
         if env.get(key) == value:
             env.pop(key, None)
+            if env is os.environ:
+                del _SEEDED_INTO_ENVIRON[key]
     return apply_xet_env(env, fail_fast = fail_fast, cache_dir = cache_dir, throttled = throttled)
 
 

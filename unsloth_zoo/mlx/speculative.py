@@ -851,7 +851,10 @@ class DraftController:
             best = RoundPlan("plain", min(self._window, best.length))
         else:
             self._window = self.min_window
-        self._current = identity
+        held = self._current
+        # A reply's last rounds are only as wide as it has tokens left: they do not unseat the width the next reply starts at.
+        if held is None or held[1] != "round" or any(state.remaining is None or state.remaining >= held[2] for state in rows):
+            self._current = identity
         return best, False
 
     def _worth(self, plan: RoundPlan, rows: Sequence[RowState]) -> float:
@@ -1102,10 +1105,11 @@ class TreeBudget:
     Mac's cycle costs measured at load (``{rows: seconds}``, as `warm_speculative_rounds` times them) and the tokens rounds
     actually emitted. A round of the widest tree holds the narrower trees and the chain of its lattice, so each tells what
     they would have emitted on the same text: no calibration of the drafter's probabilities, and until enough such
-    rounds are in, or one in ``PROBE_EVERY`` rounds after, a round runs the widest tree."""
+    rounds are in a round runs the widest tree. It keeps running unless its rate is under ``PROBE_SETTLED_RATE`` of the
+    best tree's, which then runs, the widest one round in ``PROBE_SETTLED_EVERY``: a nearer tie is within the estimate's noise."""
 
     MIN_SAMPLES = 24
-    PROBE_EVERY = 8
+    PROBE_EVERY, PROBE_SETTLED_EVERY, PROBE_SETTLED_RATE = 8, 64, 0.95
     ALPHA = 1 / 32
     # A shallower tree or chain, on the trained block's own lattice, accepts this much more than on a deeper block's.
     TRAINED_BLOCK_GAIN = 1.035
@@ -1136,37 +1140,108 @@ class TreeBudget:
         """The rows of the next tree; 0 for a chain."""
         widest = max(self.tree_costs)
         self._since_wide += 1
-        if self.trees[widest].count < self.MIN_SAMPLES or self._since_wide >= self.PROBE_EVERY:
+        if self.trees[widest].count < self.MIN_SAMPLES:
             self._since_wide = 0
             return widest
-        rows = max(self.tree_costs, key = lambda n: self._rate(self.trees[n], self.tree_costs[n], n))
+        rate = lambda n: self._rate(self.trees[n], self.tree_costs[n], n)
+        rows = max(self.tree_costs, key = rate)
+        settled = rate(widest) < self.PROBE_SETTLED_RATE * rate(rows)
+        if self._since_wide >= (self.PROBE_SETTLED_EVERY if settled else self.PROBE_EVERY):
+            self._since_wide = 0
+            return widest
         chain = max(self._rate(self.chains[w], cost, w) for w, cost in self.chain_costs.items())
-        return rows if self._rate(self.trees[rows], self.tree_costs[rows], rows) >= chain else 0
+        if rate(rows) < chain:
+            return 0
+        return rows if settled else widest
+
+
+class TreeCalibration:
+    """How often a draft tree's node is accepted once its parent is, from the selector's q for it and its depth:
+    sigmoid(alpha + beta * logit q), which trees grow best first on. Each depth is refit from the verified children of
+    accepted rows by Newton steps on a ridge toward ``PRIOR``, within bounds: a free fit of a deep row's few records diverges."""
+
+    RECORDS, MIN_RECORDS, REFIT_EVERY, STEPS, HALVINGS = 512, 32, 32, 4, 12
+    ALPHA_BOUND, BETA_BOUNDS = 8.0, (0.1, 4.0)
+    # (alpha, beta) about where DFlash2 selectors' fits settle at every depth: a confident q promises more than it keeps.
+    PRIOR = (-0.5, 0.65)
+
+    def __init__(self, depths: int):
+        self.alpha, self.beta = np.full(depths, self.PRIOR[0]), np.full(depths, self.PRIOR[1])
+        self._logits, self._hits = np.zeros((depths, self.RECORDS)), np.zeros((depths, self.RECORDS))
+        self._seen = [0] * depths
+        self._rounds = 0
+        self.parameters = mx.array(np.stack([self.alpha, self.beta]), mx.float32)
+
+    def observe(self, depths: Sequence[int], parents: Sequence[int], logq: Sequence[float], path: Sequence[int]) -> None:
+        walked = set(path)   # the verified rows the target took, from row 0
+        for row in range(1, len(parents)):
+            if parents[row] in walked:
+                depth = depths[row] - 1
+                at = self._seen[depth] % self.RECORDS
+                q = min(max(math.exp(logq[row]), 1e-6), 1.0 - 1e-6)
+                self._logits[depth, at], self._hits[depth, at] = math.log(q / (1.0 - q)), row in walked
+                self._seen[depth] += 1
+        self._rounds += 1
+        if self._rounds % self.REFIT_EVERY == 0:
+            self._refit()
+
+    def _refit(self) -> None:
+        seen = np.array(self._seen)
+        ready = seen >= self.MIN_RECORDS
+        if not ready.any():
+            return
+        x, y = self._logits, self._hits
+        kept = (np.arange(self.RECORDS) < seen[:, None]).astype(np.float64)
+        alpha, beta = self.alpha, self.beta
+
+        def loss(a, b):
+            z = a[:, None] + b[:, None] * x
+            softplus = np.maximum(z, 0.0) + np.log1p(np.exp(-np.abs(z)))   # np.logaddexp is 5x slower
+            return (kept * (softplus - y * z)).sum(1) + 0.5 * ((a - self.PRIOR[0]) ** 2 + (b - self.PRIOR[1]) ** 2)
+
+        for _ in range(self.STEPS):
+            p = 1.0 / (1.0 + np.exp(-(alpha[:, None] + beta[:, None] * x)))
+            weight, residual = kept * p * (1.0 - p), kept * (p - y)
+            g_alpha, g_beta = alpha - self.PRIOR[0] + residual.sum(1), beta - self.PRIOR[1] + (residual * x).sum(1)
+            h_alpha, h_cross, h_beta = 1.0 + weight.sum(1), (weight * x).sum(1), 1.0 + (weight * x * x).sum(1)
+            det = h_alpha * h_beta - h_cross * h_cross
+            free = beta - (h_alpha * g_beta - h_cross * g_alpha) / det
+            next_beta = np.clip(free, *self.BETA_BOUNDS)
+            # A slope held at a bound leaves the offset its own step, not its share of a step the slope did not take.
+            step = np.where(next_beta == free, (h_beta * g_alpha - h_cross * g_beta) / det, g_alpha / h_alpha)
+            next_alpha = np.clip(alpha - step, -self.ALPHA_BOUND, self.ALPHA_BOUND)
+            # Full Newton steps oscillate between the bounds once records saturate the sigmoid: halve until the loss falls.
+            before, scale = loss(alpha, beta) * (1 + 1e-12), np.ones_like(alpha)   # rounding at the optimum is not a rise
+            for halving in range(self.HALVINGS + 1):
+                worse = loss(alpha + scale * (next_alpha - alpha), beta + scale * (next_beta - beta)) > before
+                if not worse.any():
+                    break
+                scale = np.where(worse, 0.0 if halving == self.HALVINGS else scale / 2, scale)
+            alpha, beta = alpha + scale * (next_alpha - alpha), beta + scale * (next_beta - beta)
+        self.alpha, self.beta = np.where(ready, alpha, self.alpha), np.where(ready, beta, self.beta)
+        self.parameters = mx.array(np.stack([self.alpha, self.beta]), mx.float32)
 
 
 class SizedTreeBudget:
     """Each round's rows on a sparse target, where each row brings its own experts: as many of the round's lattice's best
-    nodes as pay for their rows, from each node's path probability, scaled by how often nodes of its depth were accepted,
-    against each width's cycle as replies measure it. The load's costs, scaled to the reply's context, price the rest."""
+    nodes as add more tokens than their seconds yield at the rate rounds run at, from each node's calibrated path
+    probability and each width's cycle as replies measure it. The load's costs, scaled to the reply's context, price the rest."""
 
-    ALPHA = 1 / 32
     COST_ALPHA = 1 / 8
+    RATE_ALPHA, RATE_ROUNDS = 1 / 64, 16   # until this many rounds set the rate, a round sizes by its own best ratio
     # A gap longer than this many cycles is a reply's start or a plain window, not a width's cycle, unless as many follow it.
     GAP_CYCLES = 3
-    # Accepted over promised by depth at the start, as measured: deeper nodes promise more than they keep.
-    DEPTH_ACCEPTANCE = (0.9, 0.8, 0.65, 0.55, 0.5)
     # A width never verified stays priced by the load's noisy timing, so every few rounds verify the least measured one.
     PROBE_EVERY, PROBE_SETTLED_EVERY, PROBE_SAMPLES = 8, 64, 4
     # A round costs about two plain steps.
     MIN_ROUND_TOKENS = 2.0
+    pinned = 0   # while the load times a width, the rows every round verifies
 
     def __init__(self, tree_costs: dict[int, float]):
         self.load_costs = dict(tree_costs)
         self.live = {rows: _Ema() for rows in tree_costs}
-        depths = range(1, max(tree_costs))
-        self.accepted = {depth: 0.5 * self.DEPTH_ACCEPTANCE[min(depth, len(self.DEPTH_ACCEPTANCE)) - 1] for depth in depths}
-        self.promised = {depth: 0.5 for depth in depths}
-        self._nodes, self._last, self._gaps, self._rounds, self._reply = (), None, 0, 0, None
+        self._emitted, self._spent = _Ema(), _Ema()
+        self._last, self._gaps, self._rounds, self._reply = None, 0, 0, None
         self.samples = dict.fromkeys(tree_costs, 0)
 
     def choose(self) -> int:
@@ -1187,12 +1262,16 @@ class SizedTreeBudget:
 
     def size(self, nodes: Sequence[tuple[float, int]]) -> int:
         """The rows to verify, from each node after the anchor, best first: its path probability and depth."""
-        self._nodes = nodes
-        tokens, best, best_rate = 1.0, min(self.load_costs), 0.0
-        for rows, (probability, depth) in enumerate(nodes, 2):
-            tokens += self.accepted[depth] / self.promised[depth] * probability
-            if rows in self.live and (rate := tokens / self._cost(rows)) > best_rate:
-                best, best_rate = rows, rate
+        if self.pinned:
+            return min(self.pinned, len(nodes) + 1)
+        rate = self._emitted.value / self._spent.value if self._emitted.count >= self.RATE_ROUNDS else None
+        tokens, best, most = 1.0, min(self.load_costs), -math.inf
+        for rows, (probability, _) in enumerate(nodes, 2):
+            tokens += probability
+            if rows in self.live:
+                value = tokens / self._cost(rows) if rate is None else tokens - rate * self._cost(rows)
+                if value > most:
+                    best, most = rows, value
         self._rounds += 1
         stale = min(self.samples, key = self.samples.get)
         every = self.PROBE_EVERY if self.samples[stale] < self.PROBE_SAMPLES else self.PROBE_SETTLED_EVERY
@@ -1205,9 +1284,8 @@ class SizedTreeBudget:
 
     def observe(self, rows: int, ranks: Sequence[int], end: float) -> None:
         """A round of the last sized lattice verified ``rows`` rows and walked the nodes taken in the order ``ranks``, by ``end``."""
-        for rank, (probability, depth) in enumerate(self._nodes[: rows - 1], 1):
-            self.accepted[depth] += self.ALPHA * ((rank in ranks) - self.accepted[depth])
-            self.promised[depth] += self.ALPHA * (probability - self.promised[depth])
+        self._emitted.update(1 + len(ranks), self.RATE_ALPHA)
+        self._spent.update(self._cost(rows), self.RATE_ALPHA)
         if self._last is not None:
             if end - self._last < self.GAP_CYCLES * self._cost(rows) or self._gaps >= self.GAP_CYCLES:
                 self.live[rows].update(end - self._last, self.COST_ALPHA)
@@ -1699,10 +1777,11 @@ class SpeculativeEngine:
             out = self.lm(inputs, cache = self.cache, speculative_verify = True, **{"capture_layer_ids": [], **self._kwargs()})
             return out.logits, self._hidden(out), out.gdn_states
         if self._invariant:
+            from .inference import _verify_with_lazy_replay
             if self._mrope:
                 # As a decode step's call would, so the verifier positions each row by its own delta.
                 self.lm._rope_deltas = self._position_kwargs()["rope_deltas"]
-            hidden, _, transaction, logits = self.lm.speculative_verify_logits(inputs, self.cache, lambda logits: logits)
+            hidden, _, transaction, logits = _verify_with_lazy_replay(self.lm, inputs, self.cache, lambda logits: logits)
             return logits, self._hidden(SimpleNamespace(hidden_states = [hidden])), _rows_trimmed(transaction)
         from .inference import verify_block_attention
         with verify_block_attention():
@@ -1771,18 +1850,24 @@ class SpeculativeEngine:
         row, draft = self._rows[0], self._rows[0].draft
         start, work = time.perf_counter(), first_use_work()
         with mx.stream(self._stream):
-            tree = self.drafter.tree(draft, plan.tree)
-            budget = self.drafter.tree_budget
-            if isinstance(budget, SizedTreeBudget):
-                mx.eval(tree.rank, tree.score, tree.block.depth)
-                nodes = sorted(zip(tree.rank.tolist(), tree.score.tolist(), tree.block.depth.tolist()))[1:]
-                rows = budget.size([(math.exp(score), depth) for _, score, depth in nodes])
-                if rows != tree.tokens.size:
-                    tree = tree.regrow(rows)
-                plan = replace(plan, tree = rows)
+            tree = drafted = self.drafter.tree(draft, plan.tree)
+            budget, calibration = self.drafter.tree_budget, self.drafter.tree_calibration
+            sizes, sized = isinstance(budget, SizedTreeBudget), []
+
+            def size():
+                # The verify asks with its first layers submitted, which run while this waits for the lattice.
+                mx.eval(tree.score, tree.block.depth)
+                nodes = zip(tree.score.tolist()[1:], tree.block.depth.tolist()[1:])
+                sized.append(budget.size([(math.exp(score), depth) for score, depth in nodes]))
+                return sized[-1]
             mx.async_eval(tree.tokens)
-        with mx.stream(self._stream), tree_verify(tree.block):
+        with mx.stream(self._stream), tree_verify(tree.block, size if sizes else None):
             logits, hidden, transaction = self._verify(tree.tokens[None])
+        if sizes:
+            if not sized:   # a verify that asked for no size took every row
+                size()
+            tree = tree.first(logits.shape[1])
+            plan = replace(plan, tree = logits.shape[1])
         try:
             with mx.stream(self._stream):
                 target, scores = row.draw(row.logprobs(logits[0]), row.emitted)
@@ -1790,22 +1875,25 @@ class SpeculativeEngine:
             mx.async_eval(target, path, walked, *([] if scores is None else [scores]))
             with mx.stream(self._stream):
                 self.drafter.predraft(draft, mx.take(hidden[0], path, axis = 0), walked[0], target[walked[1]])
-            mx.eval(target, path, walked, tree.rank, *([] if scores is None else [scores]))
-            tokens, count, last = tree.tokens.tolist(), walked[0].item(), walked[1].item()
+            mx.eval(target, path, walked, tree.rank, tree.tokens, *([] if scores is None else [scores]))
+            # Read off the evaluated arrays: indexing one first would be a new op the host then waits on the GPU for.
+            tokens, (count, last) = tree.tokens.tolist(), walked.tolist()
             if tokens[0] != row.pending:
                 raise RuntimeError("a draft tree must start from its row's pending token")
             rows = path.tolist()[: count + 1]
             target = target.tolist()
             row.draft_n += plan.tree - 1
             row.draft_n_accepted += count
-            scores = None if scores is None else [scores[r].item() for r in rows]
+            if scores is not None:
+                scores = scores.tolist()
+                scores = [scores[r] for r in rows]
             taken = row.take([tokens[r] for r in rows[1:]] + [target[last]], scores)
             if taken:
                 with mx.stream(self._stream):
                     self.drafter.push(draft, taken, mx.take(hidden[0], mx.array(rows[: len(taken)], mx.int32), axis = 0))
             with mx.stream(self._stream):
                 self.drafter.prefetch([None if row.finished else draft])
-            tree_commit(transaction, self.cache, rows)
+                tree_commit(transaction, self.cache, rows)
         except BaseException:
             transaction.abort()
             raise
@@ -1818,6 +1906,10 @@ class SpeculativeEngine:
             ranks = tree.rank.tolist()
             first_children = next((i for i in range(1, len(rows)) if rows[i] != rows[i - 1] + 1), len(rows)) - 1
             budget.observe(tree.tokens.size, [ranks[r] for r in rows[1:]], first_children)
+        if calibration is not None:
+            # Off the drafted arrays, whose first rows the verified ones are: a slice would be a new op to wait on.
+            verified = (values.tolist()[: tree.tokens.size] for values in (drafted.block.depth, drafted.parent, drafted.logq))
+            calibration.observe(*verified, rows)
         self.controller.record_round(
             replace(plan, tree = 0, trim = False, split = False, rows = (RowPlan("draft", plan.tree - 1),),
                     controller_depth = self.drafter.trained_depth),
@@ -1881,11 +1973,19 @@ class SpeculativeEngine:
                 self.drafter.settle(self.draft_cache, draft_rows, depth - 1, [0] * len(rows))
             self.round_refusal = f"{type(self.lm).__name__} replaced its cache objects during a verify forward"
             return None
+        early = None
         try:
             with mx.stream(self._stream):
                 drawn = []
                 for i, (row, length) in enumerate(zip(rows, lengths)):
                     drawn.append(row.draw(row.logprobs(logits[i, : length + 1], inputs[i, 1:]), row.emitted))
+            prepare = getattr(self.drafter, "prepare_replay", None)
+            if prepare is not None and depth and len(rows) == 1 and draft_rows[0] is not None and hidden is not None:
+                with mx.stream(self._stream):
+                    count = mx.cumprod((inputs[0, 1 : lengths[0] + 1] == drawn[0][0][:lengths[0]]).astype(mx.int32)).sum()
+                mx.async_eval([array for pair in drawn for array in pair if array is not None] + [count])
+                with mx.stream(self._stream):
+                    early = prepare(draft_rows[0], hidden[0, : lengths[0] + 1], drawn[0][0], count)
             ahead = []
             if depth and getattr(self.drafter, "predraft_rows", 0):
                 with mx.stream(self._stream):
@@ -1898,7 +1998,7 @@ class SpeculativeEngine:
                 with mx.stream(self._stream):
                     ahead = [(i, count) for i, count in ahead if self.drafter.predraft(draft_rows[i], hidden[i], count, drawn[i][0][count])]
             mx.eval([array for pair in drawn for array in pair if array is not None] + ([] if drafts is None else [drafts])
-                    + [count for _, count in ahead])
+                    + [count for _, count in ahead] + ([] if early is None else [early.count]))
             targets = [target.tolist() for target, _ in drawn]
             scores = [None if score is None else score.tolist() for _, score in drawn]
             if depth:
@@ -1927,29 +2027,36 @@ class SpeculativeEngine:
                 taken = row.take(proposal[:count] + [target[count]], scores[i])
                 if row.draft is not None and len(taken) > kept[i]:
                     # A head that kept its accepted draft entries already holds those pairs; record the rest.
-                    self.drafter.push(row.draft, taken[kept[i] :], hidden[i, kept[i] : len(taken)])
+                    with mx.stream(self._stream):
+                        self.drafter.push(row.draft, taken[kept[i] :], hidden[i, kept[i] : len(taken)])
                 emitted.append(taken)
+            if early is not None and not rows[0].finished:
+                early(accepted[0])
             if hasattr(self.drafter, "prefetch"):
                 with mx.stream(self._stream):
                     # The next round's drafts run on the GPU while the host commits this one; a copying row is likely to copy again.
                     self.drafter.prefetch([None if row.finished else draft for row, draft in zip(rows, draft_rows)])
-            try:
-                transaction.validate([count + 1 for count in accepted])
-            except RuntimeError:
-                if len(rows) > 1:
-                    raise
-                # State the transaction has no record of (Inkling's short convolutions): undo, forward the accepted prefix again.
-                transaction.abort()
-                self.lm(inputs[:, : accepted[0] + 1], cache = self.cache, **self._position_kwargs())
-            else:
-                transaction.commit([count + 1 for count in accepted])
-            if len(set(accepted)) > 1:
-                # A ragged commit grows BatchKVCache.left_padding in place, but qwen3_5 memoizes decode pads by that array's identity.
-                for entry in self.cache:
-                    padding = getattr(entry, "left_padding", None)
-                    if isinstance(padding, mx.array) and not hasattr(entry, "metadata_revision"):
-                        entry.left_padding = padding + 0
+            # On the verify's stream: on another, the next verify would wait on a fence for the commit's writes.
+            with mx.stream(self._stream):
+                try:
+                    transaction.validate([count + 1 for count in accepted])
+                except RuntimeError:
+                    if len(rows) > 1:
+                        raise
+                    # State the transaction has no record of (Inkling's short convolutions): undo, forward the accepted prefix again.
+                    transaction.abort()
+                    self.lm(inputs[:, : accepted[0] + 1], cache = self.cache, **self._position_kwargs())
+                else:
+                    transaction.commit([count + 1 for count in accepted])
+                if len(set(accepted)) > 1:
+                    # A ragged commit grows BatchKVCache.left_padding in place, but qwen3_5 memoizes decode pads by that array's identity.
+                    for entry in self.cache:
+                        padding = getattr(entry, "left_padding", None)
+                        if isinstance(padding, mx.array) and not hasattr(entry, "metadata_revision"):
+                            entry.left_padding = padding + 0
         except BaseException:
+            if early is not None:
+                early(None)
             transaction.abort()
             raise
         # A pending replay fold is evaluated by its next verifier.
@@ -2244,12 +2351,21 @@ class _ShortlistHead:
         from .inference import _FIRST_USE_WORK
         _FIRST_USE_WORK[0] += 1
 
-    def __call__(self, hidden: mx.array) -> mx.array:
+    def _candidates(self, hidden: mx.array) -> tuple[mx.array, mx.array]:
         coarse = mx.quantized_matmul(hidden[..., :self.columns], *self._scan, True, _SHORTLIST_GROUP, _SHORTLIST_BITS)
         best = mx.argpartition(-coarse, _SHORTLIST_KEEP, axis = -1)[..., :_SHORTLIST_KEEP]
         rows = self._rows(best.reshape(-1)).reshape(*best.shape, -1)
-        exact = (rows @ hidden[..., None].astype(rows.dtype)).squeeze(-1)
+        return best, (rows @ hidden[..., None].astype(rows.dtype)).squeeze(-1)
+
+    def __call__(self, hidden: mx.array) -> mx.array:
+        best, exact = self._candidates(hidden)
         return mx.take_along_axis(best, mx.argmax(exact, axis = -1, keepdims = True), axis = -1).squeeze(-1)
+
+    def logits(self, hidden: mx.array) -> mx.array:
+        """The table's logits at the candidates and -inf elsewhere, for a head that takes the argmax of its vocabulary head."""
+        best, exact = self._candidates(hidden)
+        dense = mx.full((*best.shape[:-1], self.table.weight.shape[0]), -mx.inf, exact.dtype)
+        return mx.put_along_axis(dense, best, exact, axis = -1)
 
 
 class MTPDrafter:
@@ -2495,17 +2611,27 @@ class HeadDrafter:
     ``accept_verified_tokens`` replays (token, target hidden) pairs and, with nothing accepted, undoes a
     draft. Heads keep that state on the module, so each reply drafts with its own shallow copy."""
 
+    # Greedy heads may take their tokens from the target table's shortlist (`_ShortlistHead`) instead of a full pass.
+    shortlist_head = False
+
     def __init__(self, model: nn.Module, target: nn.Module, max_lag: int = 128, prompt_tail: int | None = None):
         self.model = model
         self.target = target
         self.max_lag, self.prompt_tail = max_lag, prompt_tail or max_lag
+        self._shortlist = _ShortlistHead.of(getattr(target, "language_model", target)) if self.shortlist_head else None
 
     def new_cache(self) -> list:
         return []
 
+    def _reset(self, head: nn.Module) -> None:
+        head.reset(self.target)
+        if self._shortlist is not None:
+            self._shortlist.prepare()
+            head._lm_head_fn = self._shortlist.logits
+
     def start(self, prompt: Sequence[int], hidden: mx.array | None, pending: int) -> tuple[HeadRow, list]:
         head = copy.copy(self.model)
-        head.reset(self.target)
+        self._reset(head)
         row = HeadRow(head)
         if hidden is not None:
             count = min(int(hidden.shape[1]), len(prompt))
@@ -2570,6 +2696,156 @@ class HeadDrafter:
         return [0] * len(rows)
 
 
+_HEAD_REPLAY_CONTRACT = {"mlx_vlm.speculative.drafters.mtp_base": {
+    "AutoregressiveMTPDraftModel.accept_verified_tokens": "c030ed38f8f3254c"},
+    "mlx_vlm.models.qwen4_exp.language": {"QSAKVCache.clear_index_blocks": "9beee61ae16211c8"},
+    "mlx_vlm.speculative.drafters.qwen4_exp_mtp.qwen4_exp_mtp": {
+        "Qwen4ExpMTPDraftModel._forward_hidden": "cef4894d36046e68", "Qwen4ExpMTPDraftModel.fuse_inputs": "37eced1c4e52a595"},
+    "mlx_vlm.models.cache": {"KVCache.trim": "8c4d89141d5ceded"}}
+
+
+def _head_replay_matches(row, replay):
+    if (replay is None or replay[0] != tuple(row.tokens) or len(replay[1]) != len(row.hidden)
+            or any(a is not b for a, b in zip(replay[1], row.hidden))):
+        return False
+    if len(replay) == 3:
+        return True
+    from .inference import _bindings_intact
+
+    original, cache, generation, bindings, native = replay[3]
+    return (row.head is original and original._cache is cache and original._draft_round == generation
+            and _bindings_intact(bindings) and getattr(original.accept_verified_tokens, "__func__", None) is native)
+
+
+class _Qwen4HeadDrafter(HeadDrafter):
+    shortlist_head = True
+
+    def prepare_replay(self, row, hidden, tokens, count):
+        """Queue a private native replay; resolve with host acceptance, or None to discard it."""
+        from .inference import _ast_fingerprint, _bindings_intact, _resolved_bindings, _QSA_TRIM_HELD
+        from mlx_vlm.speculative.drafters.mtp_base import AutoregressiveMTPDraftModel
+        from mlx_vlm.models.qwen4_exp.language import QSAKVCache
+
+        bindings = getattr(self, "_replay_bindings", None)
+        if bindings is None or not _bindings_intact(bindings):
+            bindings = _resolved_bindings(_HEAD_REPLAY_CONTRACT)
+            trim, kept = QSAKVCache.trim, []
+            native_trim = trim
+            for cls, native_trim_fn, route in _QSA_TRIM_HELD[1] if _QSA_TRIM_HELD else ():
+                if cls is QSAKVCache and trim is route:
+                    native_trim = native_trim_fn
+                    kept = inspect.getclosurevars(route).nonlocals["bindings"]
+                    break
+            try:
+                pinned = not hasattr(native_trim, "__wrapped__") and _ast_fingerprint(native_trim) == "408373696f053090"
+            except (OSError, TypeError, SyntaxError, AttributeError):
+                pinned = False
+            if bindings is not None and pinned:
+                bindings += [(vars(QSAKVCache), "trim", trim), *kept]
+            else:
+                bindings = None
+            self._replay_bindings, self._replay_verdicts = bindings, {}
+        native = AutoregressiveMTPDraftModel.accept_verified_tokens
+        original, width = row.head, tokens.size
+        if (os.environ.get("UNSLOTH_MLX_EARLY_REPLAY") == "0" or bindings is None or row.tokens or row.hidden
+                or row.drafted is None or original.training or not 1 < width <= 4 or width >= self.max_lag
+                or hidden.ndim not in (2, 3) or hidden.shape[0] != width or tokens.ndim != 1 or count.size != 1
+                or not isinstance(original._next_position, int) or not original._cache
+                or any(type(entry) is not QSAKVCache for entry in original._cache)
+                or getattr(original.accept_verified_tokens, "__func__", None) is not native):
+            return None
+        cache, generation = original._cache, original._draft_round
+        head = copy.copy(original)
+        head._cache = copy.deepcopy(cache)
+        head.accept_verified_tokens(hidden[None], row.drafted, 0, [], None, greedy = True)
+        streams = head.fc_hidden
+
+        def kept_streams(x):
+            # 4 tokens' hc_count stream rows take another matmul kernel than 2 or 3 do: the rows a partial acceptance keeps get their own call.
+            full = streams(x)
+            return mx.where(count == width - 1, full, mx.concatenate([streams(x[:, : width - 1]), full[:, width - 1 :]], axis = 1))
+
+        if width > 2:
+            head.fc_hidden = kept_streams
+        try:
+            logits, replayed = head._forward_tokens(tokens[None].astype(mx.int32), mx.concatenate([hidden])[None], mx.int32)
+        finally:
+            head.fc_hidden = streams
+        head._set_seed_from_hidden(mx.take(logits, count.reshape(1), axis = 1), None, True)
+        head._seed_hidden = mx.take(replayed, count.reshape(1), axis = 1)
+        mx.async_eval(head.draft_eval_state())
+        published = None
+
+        def resolve(accepted):
+            nonlocal published
+            if accepted is None:
+                if published is not None and getattr(row, "replay", None) is published:
+                    row.replay = None
+                return False
+            if (count.item() != accepted or len(row.tokens) != accepted + 1
+                    or row.head is not original or original._cache is not cache or original._draft_round != generation
+                    or not _bindings_intact(bindings) or getattr(original.accept_verified_tokens, "__func__", None) is not native):
+                return False
+            if excess := width - 1 - accepted:
+                # A single pair replays natively as a one-row decode step, on other kernels and indexer paths.
+                if not accepted:
+                    return False
+                for entry in head._cache:
+                    entry.trim(excess)
+                head._next_position -= excess
+                if not self._replay_exact(row, head, (width, accepted)):
+                    return False
+            published = row.replay = tuple(row.tokens), tuple(row.hidden), head, (original, cache, generation, bindings, native)
+            return True
+
+        resolve.count = count
+        return resolve
+
+    def _replay_exact(self, row, head, key):
+        verdicts = self._replay_verdicts
+        if key not in verdicts:
+            native = HeadRow(copy.copy(row.head))
+            native.head._cache = copy.deepcopy(row.head._cache)
+            native.tokens, native.hidden = list(row.tokens), list(row.hidden)
+            super().catch_up([], [native])
+            leaves = lambda h: [h._next_position, *(x for _, x in tree_flatten(h.draft_eval_state()))]
+            verdicts[key] = all(type(x) is type(y) and (x == y if not isinstance(x, mx.array) else x.dtype == y.dtype and x.shape == y.shape
+                                                        and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item())
+                                for x, y in zip(leaves(native.head), leaves(head)))
+        return verdicts[key]
+
+    def prefetch(self, rows: Sequence[HeadRow | None]) -> None:
+        for row in rows:
+            if row is None or not row.tokens:
+                continue
+            replay = getattr(row, "replay", None)
+            if replay is not None and len(replay) == 4 and _head_replay_matches(row, replay):
+                continue
+            head = copy.copy(row.head)
+            head._cache = copy.deepcopy(row.head._cache)
+            ahead = HeadRow(head)
+            tokens, hidden = tuple(row.tokens), tuple(row.hidden)
+            ahead.tokens, ahead.hidden = list(tokens), list(hidden)
+            super().catch_up([], [ahead])
+            row.replay = tokens, hidden, ahead.head
+
+    def catch_up(self, cache: list, rows: Sequence[HeadRow | None]) -> int:
+        replayed = 0
+        for row in rows:
+            if row is None:
+                continue
+            replay = getattr(row, "replay", None)
+            row.replay = None
+            # A copy/plain round may append pairs: preserve the native replay's original batch and dispatch.
+            if _head_replay_matches(row, replay):
+                row.head = replay[2]
+                replayed += len(row.tokens)
+                row.tokens, row.hidden = [], []
+            else:
+                replayed += super().catch_up(cache, [row])
+        return replayed
+
+
 class Eagle3Drafter(HeadDrafter):
     """Drafts with an EAGLE-3 drafter, whose lifecycle is a head's, from the target layers it was trained on."""
 
@@ -2610,6 +2886,8 @@ class ContextRow:
         self.predrafted: list | None = None
         self.requested_depth = 0
         self.empty_context: mx.array | None = None
+        # The head blocks this reply's drafts shortlist from, where the drafter keeps them.
+        self.scan = None
 
     @property
     def ready(self) -> bool:
@@ -2663,6 +2941,7 @@ class ContextDrafter:
         self.tree_budget: TreeBudget | SizedTreeBudget | None = None
         self.tree_widths: tuple[int, ...] = ()
         self.sized_trees = False
+        self.tree_calibration: TreeCalibration | None = None
 
     @property
     def config(self):
@@ -2680,10 +2959,14 @@ class ContextDrafter:
         if hidden is None:
             return None, []
         row = ContextRow(self.model.make_cache())
+        if (head_scan := getattr(self._draft, "head_scan", None)) is not None:
+            row.scan = head_scan(prompt)
         self.push(row, [pending], hidden[0])
         return row, []
 
     def push(self, row: ContextRow, tokens: Sequence[int], hidden: mx.array) -> None:
+        if row.scan is not None:
+            row.scan.note(tokens)
         if row.predrafted is not None:
             # The predrafted block read exactly these tokens' rows; they join the context it drafted from.
             for entry in row.predrafted:
@@ -2708,11 +2991,11 @@ class ContextDrafter:
         self._block(row, 1)
         return row.cache
 
-    def _drafted(self, *args) -> tuple[mx.array, mx.array | None]:
+    def _drafted(self, *args, scan = None) -> tuple[mx.array, mx.array | None]:
         if self._selector is not None:
             # A draft whose walk leaves none (a native select) must not read an earlier draft's.
             self._selector.__dict__.pop("_unsloth_confidence", None)
-        block = self._draft(*args, lambda logits: mx.argmax(logits, axis = -1), mx.int32)
+        block = self._draft(*args, lambda logits: mx.argmax(logits, axis = -1), mx.int32, **({} if scan is None else {"scan": scan}))
         return block, None if self._selector is None else self._selector.__dict__.pop("_unsloth_confidence", None)
 
     def _context(self, row: ContextRow) -> mx.array:
@@ -2732,19 +3015,22 @@ class ContextDrafter:
         return row.empty_context
 
     def _block(self, row: ContextRow, depth: int) -> mx.array:
-        block, row.prefetched_confidence = self._drafted(row.pending, self._context(row), row.cache, depth + 1)
+        block, row.prefetched_confidence = self._drafted(row.pending, self._context(row), row.cache, depth + 1, scan = row.scan)
         return block
 
     def tree(self, row: ContextRow, rows: int):
         """The next `DraftTree` of about ``rows`` rows: one already drafted ahead, whichever width it was drafted at."""
         tree, row.prefetched_tree = row.prefetched_tree, None
         row.prefetched = row.prefetched_confidence = None
-        return self._tree(row.pending, self._context(row), row.cache, rows) if tree is None else tree
+        return self._tree(row.pending, self._context(row), row.cache, rows, row.scan) if tree is None else tree
 
-    def _tree(self, anchor, context: mx.array, cache: list, rows: int):
+    def _tree(self, anchor, context: mx.array, cache: list, rows: int, scan = None):
         # Rows within the trained block read its lattice, which accepts a little more than a deeper block's first rows.
         depth = self.trained_depth if rows <= self.trained_depth + 1 else self.extended_depth
-        return self._draft.tree(anchor, context, cache, depth + 1, rows)
+        # A sized round verifies the first rows of its tree, so its rows go out in the order they were taken.
+        calibration = self.tree_calibration
+        return self._draft.tree(anchor, context, cache, depth + 1, rows, scan, self.sized_trees,
+                                None if calibration is None else calibration.parameters)
 
     def extension_serves(self, row: ContextRow, depth: int) -> bool:
         """Whether a block of ``depth`` drafts for ``row`` now runs on the sparse producer, the only one deeper rounds are
@@ -2762,7 +3048,7 @@ class ContextDrafter:
         ``draft`` reads it unless a ``push`` comes first."""
         for row in rows:
             if row is not None and row.features and row.tree_rows:
-                row.prefetched_tree = self._tree(row.pending, self._context(row), row.cache, row.tree_rows)
+                row.prefetched_tree = self._tree(row.pending, self._context(row), row.cache, row.tree_rows, row.scan)
                 mx.async_eval(row.prefetched_tree.tokens)
             elif row is not None and row.features:
                 depth = self._prepared_depth(row)
@@ -2782,10 +3068,10 @@ class ContextDrafter:
         depth = self._prepared_depth(row)
         row.empty_context = mx.zeros((1, 0, hidden.shape[-1]), hidden.dtype)
         if row.tree_rows:
-            row.prefetched_tree = self._tree(anchor.reshape(1), hidden[None], row.predrafted, row.tree_rows)
+            row.prefetched_tree = self._tree(anchor.reshape(1), hidden[None], row.predrafted, row.tree_rows, row.scan)
             mx.async_eval(row.prefetched_tree.tokens)
             return True
-        block, row.prefetched_confidence = self._drafted(anchor.reshape(1), hidden[None], row.predrafted, depth + 1)
+        block, row.prefetched_confidence = self._drafted(anchor.reshape(1), hidden[None], row.predrafted, depth + 1, scan = row.scan)
         row.prefetched = block.reshape(1, depth)
         mx.async_eval(row.prefetched)
         return True
@@ -2897,6 +3183,8 @@ def _warm_trees(engine: SpeculativeEngine, drafter: ContextDrafter) -> None:
         return
     row = engine._rows[0]
     drafter.tree_budget = None   # A sized budget from an earlier warm-up would resize the widths timed here.
+    depths = max(drafter.tree_widths) - 1
+    drafter.tree_calibration = TreeCalibration(depths)   # the rounds timed here compile the kernel replies grow trees on
 
     def cycles(plan: RoundPlan) -> float:
         seconds = []
@@ -2908,16 +3196,26 @@ def _warm_trees(engine: SpeculativeEngine, drafter: ContextDrafter) -> None:
             seconds.append(time.perf_counter() - start)
         return min(seconds[2:])
 
+    plan = lambda n: RoundPlan("round", rows = (RowPlan("draft", n - 1),), tree = n)
+    if drafter.sized_trees:
+        drafter.tree_budget = pinned = SizedTreeBudget(dict.fromkeys(drafter.tree_widths, 1.0))
+
+    def timed(n: int) -> float:
+        if not drafter.sized_trees:
+            return cycles(plan(n))
+        # As a reply's round: the widest tree drafted, its first rows verified.
+        pinned.pinned = n
+        return cycles(plan(max(drafter.tree_widths)))
+
     try:
-        plan = lambda n: RoundPlan("round", rows = (RowPlan("draft", n - 1),), tree = n)
-        trees = {n: cycles(plan(n)) for n in drafter.tree_widths}
-        cycles(plan(drafter.tree_widths[0]))   # A narrower tree folding a wider one's rows is a check of its own.
+        trees = {n: timed(n) for n in drafter.tree_widths}
+        timed(drafter.tree_widths[0])   # A narrower tree folding a wider one's rows is a check of its own.
     except RuntimeError as error:   # A width whose fused verify block was refused has no tree.
         _unless_failed_buffer(error)
         return
     finally:
-        row.draft.tree_rows = 0
-    trained = drafter.trained_depth
+        row.draft.tree_rows, drafter.tree_budget = 0, None
+    trained, drafter.tree_calibration = drafter.trained_depth, TreeCalibration(depths)
     if drafter.sized_trees:
         drafter.tree_budget = SizedTreeBudget(trees)
         return
@@ -2996,6 +3294,7 @@ def _head_drafter(model: nn.Module, target: nn.Module, **kwargs) -> MTPDrafter |
     if type(model) is getattr(sys.modules.get("mlx_vlm.speculative.drafters.qwen4_exp_mtp"), "Qwen4ExpMTPDraftModel", None):
         # On a long prompt, qwen4_exp's head accepts more from the same tail as Qwen3.5's head.
         kwargs.setdefault("prompt_tail", MTPDrafter.prompt_tail)
+        return _built(_Qwen4HeadDrafter, model, target, **kwargs)
     return _built(HeadDrafter, model, target, **kwargs)
 
 

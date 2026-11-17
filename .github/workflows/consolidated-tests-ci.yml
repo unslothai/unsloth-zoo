@@ -48,7 +48,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: audit
 
@@ -217,7 +217,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: audit
 
@@ -435,6 +435,8 @@ jobs:
         # test_output_collector_compile: the capture_outputs collector mirror compiles fullgraph and stays per thread / context.
         # test_top_level_imports_are_declared: every package a zoo module imports at module level is a declared dependency.
         # test_custom_op_annotations: torch.library.custom_op functions keep real annotations, which torch 2.4 / 2.6 require.
+        # test_triton_constexpr_comments: every owned tl.constexpr has a comment and no per-call size is a constexpr.
+        # test_triton_specialize_moe: MoE per-call counts keep no % 16 Triton class; routing scratch slices stay 16-byte aligned.
         # test_xpu_device_typed_autocast: nested bnb offset, Gemma3n fp32 regions and unsloth_train autocast follow the accelerator, not "cuda".
         # test_xpu_empty_cache_arms: gradient checkpointing buffers and patch_model_and_tokenizer release cached memory through torch.xpu on XPU.
         # One pytest process per group: MLX export shims replace sys.modules globally,
@@ -455,6 +457,8 @@ jobs:
               tests/test_compile_cache_concurrency.py \
               tests/test_top_level_imports_are_declared.py \
               tests/test_custom_op_annotations.py \
+              tests/test_triton_constexpr_comments.py \
+              tests/test_triton_specialize_moe.py \
               tests/test_training_utils_use_cache.py \
               tests/test_unsloth_train_scheduler_kwargs.py \
               tests/test_xpu_device_typed_autocast.py \
@@ -552,6 +556,8 @@ jobs:
               tests/test_gemma3n_rmsnorm_with_scale.py \
               tests/test_mlx_gkd_guards.py \
               tests/test_output_collector_compile.py \
+              tests/test_cpu_loader_prequantized_checkpoint.py \
+              tests/test_fp8_partial_block_dequant.py \
               -v
           }
           other_gates() {
@@ -624,7 +630,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: audit
 
@@ -803,7 +809,7 @@ jobs:
           # CUDA and on Apple Silicon. On darwin + arm64 it also decides the mlx-vlm the
           # joint resolution lands on, since mlx-vlm 0.6.5 and up require
           # transformers >= 5.14.
-          CEILING = Version("5.17.0")
+          CEILING = Version("5.18.0")
           DARWIN_ARM = {"sys_platform": "darwin", "platform_machine": "arm64"}
           LINUX_X86 = {"sys_platform": "linux", "platform_machine": "x86_64"}
 
@@ -927,6 +933,12 @@ jobs:
         # Audio collation, label masking and the family/version gate.
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_vlm_label_masks.py -v -rs
 
+      - name: tests/test_mlx_vlm_video_batch.py
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_vlm_video_batch.py -v -rs
+
+      - name: tests/test_video_reader_backends.py
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_video_reader_backends.py -v -rs
+
       - name: tests/test_mlx_batching_and_decay.py
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_batching_and_decay.py -v -rs
 
@@ -1028,7 +1040,7 @@ jobs:
     steps:
       - name: Harden runner (audit)
         # audit (not block): the cells pull arbitrary transformers/TRL/peft pins.
-        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2  # v2.22.2
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: audit
 

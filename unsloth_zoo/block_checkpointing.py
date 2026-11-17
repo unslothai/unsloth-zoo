@@ -57,9 +57,17 @@ def _stamp_order(model):
 
 
 def _owner(function):
+    # transformers 5.23+ checkpoints `partial(forward, self, **kwargs)`: the plain function is shared by every layer of
+    # a class, so the layer is the partial's first argument.
+    module = None
     while isinstance(function, functools.partial):
+        if module is None and function.args and isinstance(function.args[0], torch.nn.Module):
+            module = function.args[0]
         function = function.func
-    return getattr(function, "__self__", function)
+    owner = getattr(function, "__self__", None)
+    if owner is not None:
+        return owner
+    return module if module is not None else function
 
 
 class _TorchCheckpoint:

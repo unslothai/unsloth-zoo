@@ -717,6 +717,36 @@ def test_an_inline_data_playlist_never_reaches_the_decoder(monkeypatch, no_netwo
 
 
 @pytest.mark.parametrize(
+    "header",
+    [
+        "data:application/vnd.apple.mpegurl;base64;ignored=value",
+        "data:video/mp4;BASE64;charset=utf-8",
+        "data:video/mp4;charset=utf-8;base64;x=y",
+        # FFmpeg compares with av_strncasecmp over the parameter's own length, so a prefix
+        # of "base64", even an empty parameter, also selects base64.
+        "data:video/mp4;bas;x=y",
+        "data:video/mp4;;x=y",
+    ],
+)
+def test_base64_anywhere_in_the_data_uri_parameters_is_decoded(monkeypatch, no_network, header):
+    import base64
+
+    # 52 bytes: padded base64, which FFmpeg needs to stop cleanly before the ".m3u8" suffix.
+    body = b"#EXTM3U\n#EXTINF:2.0,\nfile://attacker/share/seg0.ts\n\n"
+    _decoder_must_not_run(monkeypatch)
+    with pytest.raises(ValueError, match = "playlist"):
+        vision_utils.fetch_video({"video": header + "," + base64.b64encode(body).decode() + ".m3u8"})
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["data:video/mp4;charset=base64x", "data:video/mp4;", "data:video/base64"],
+)
+def test_parameters_ffmpeg_does_not_read_as_base64_stay_percent_decoded(header):
+    assert vision_utils._data_uri_head(header + ",%23EXTM3U%0A").startswith(b"#EXTM3U")
+
+
+@pytest.mark.parametrize(
     "path",
     [
         "\\\\wsl$\\Ubuntu\\home\\u\\clip.mp4",
@@ -756,3 +786,66 @@ def _reaches_the_decoder(monkeypatch, path):
     with pytest.raises(RuntimeError, match = "stop after"):
         vision_utils.fetch_video({"video": path})
     assert seen and seen[0] == path
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "\\\\attacker\\share\\a.png",
+        "//attacker/share/a.png",
+        "file://attacker/share/a.png",
+        "file:///%5cattacker/share/a.png",
+        "\\\\?\\UNC\\attacker\\share\\a.png",
+        {"bytes": None, "path": "\\\\attacker\\share\\a.png"},
+        {"path": "\\\\attacker\\share\\a.png", "bytes": b""},
+    ],
+)
+def test_decode_image_refuses_network_share_paths(monkeypatch, no_network, image):
+    # Dataset image rows reach the filesystem probe and Pillow: on Windows that is an SMB connection.
+    monkeypatch.setattr(vision_utils, "_WINDOWS", True)
+    touched = []
+    monkeypatch.setattr(vision_utils.os.path, "isfile", lambda p: touched.append(p) or False)
+    monkeypatch.setattr(vision_utils.Image, "open", lambda p, *a, **k: touched.append(p) or 1 / 0)
+    with pytest.raises(ValueError, match = "network share"):
+        vision_utils._decode_image(image)
+    assert touched == []
+
+
+def test_decode_image_keeps_local_paths_and_the_share_opt_in(monkeypatch, no_network, tmp_path):
+    from PIL import Image as PILImage
+
+    monkeypatch.setattr(vision_utils, "_WINDOWS", True)
+    local = tmp_path / "a.png"
+    PILImage.new("RGB", (2, 2)).save(local)
+    assert vision_utils._decode_image(str(local)).size == (2, 2)
+    assert vision_utils._decode_image({"bytes": None, "path": str(local)}).size == (2, 2)
+    opened = []
+    monkeypatch.setattr(vision_utils.Image, "open", lambda p, *a, **k: opened.append(p) or PILImage.new("RGB", (1, 1)))
+    vision_utils._decode_image({"path": "\\\\wsl$\\Ubuntu\\a.png"})
+    monkeypatch.setenv("UNSLOTH_ALLOW_PRIVATE_URL_FETCH", "1")
+    vision_utils._decode_image({"path": "\\\\nas\\images\\a.png"})
+    assert opened == ["\\\\wsl$\\Ubuntu\\a.png", "\\\\nas\\images\\a.png"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"#EXTM3U\n#EXTINF:2.0,\nfile://attacker/share/seg0.ts\n",
+        b"ffconcat version 1.0\nfile //attacker/share/a.mp4\n",
+        b'<?xml version="1.0"?>\n<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"></MPD>',
+    ],
+)
+def test_fetch_video_refuses_a_local_playlist(monkeypatch, no_network, tmp_path, body):
+    # A dataset can ship the playlist itself; ffmpeg would then open its entries outside every check.
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(body)
+    _decoder_must_not_run(monkeypatch)
+    for source in (str(clip), clip.as_uri()):
+        with pytest.raises(ValueError, match = "playlist"):
+            vision_utils.fetch_video({"video": source})
+
+
+def test_fetch_video_still_decodes_a_local_container(monkeypatch, no_network, tmp_path):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
+    _reaches_the_decoder(monkeypatch, str(clip))

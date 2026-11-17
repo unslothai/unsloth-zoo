@@ -194,12 +194,19 @@ def _make_key(token_ids, pad_token_id):
     return tuple(t for t in token_ids if t != pad_token_id)
 
 
+# A row two captures disagreed on: natural like -1, but known, so prefix reuse must not fill it.
+_DISPUTED = -2
+
+
 def _agreed(a, b):
-    """Rows of two captures of the same tokens: where their expert sets differ, -1 (natural)."""
+    """Rows of two captures of the same tokens: where their expert sets differ, natural; where both
+    were routed (or either was already disputed), _DISPUTED rather than -1 (unknown)."""
     if a.shape != b.shape:
         return a
     same = (a.sort(dim = -1).values == b.sort(dim = -1).values).all(dim = -1, keepdim = True)
-    return torch.where(same, a, torch.full_like(a, -1))
+    routed = lambda x: ~(x < 0).all(dim = -1, keepdim = True) | (x == _DISPUTED).all(dim = -1, keepdim = True)
+    natural = torch.where(routed(a) & routed(b), _DISPUTED, -1).to(a.dtype).expand_as(a)
+    return torch.where(same, a, natural)
 
 
 def _count_conflicts(a, b):
@@ -231,6 +238,7 @@ def _fill_prefix(rows, full, start, store):
             routed = ~(part < 0).all(dim = -1)
             same = (part.sort(dim = -1).values == merged[:m].sort(dim = -1).values).all(dim = -1)
             conflict[:m] |= routed & seen[:m] & ~same
+            conflict[:m] |= (part == _DISPUTED).all(dim = -1)
             new = routed & ~seen[:m]
             if bool(new.any()):
                 merged[:m] = torch.where(new.unsqueeze(-1), part, merged[:m])
@@ -335,7 +343,7 @@ def _lookup(key, exact = False):
             if rows is not None:
                 found = rows if found is None else _agreed(found, rows)
         if found is not None:
-            return found
+            return found.clamp_min(-1)
     return None
 
 
@@ -435,7 +443,9 @@ def _input_ids(args, kwargs):
     return input_ids
 
 
-def _decoder_pre_hook(module, args, kwargs, parent_input_ids = ()):
+def _decoder_pre_hook(module, args, kwargs, parent_input_ids = (), moe_layers = ()):
+    if moe_layers and not torch.compiler.is_compiling():
+        _wrap_checkpoint_funcs(moe_layers)
     input_ids = _input_ids(args, kwargs)
     if input_ids is None and parent_input_ids:
         parent_ids, embeds = parent_input_ids[-1], kwargs.get("inputs_embeds")
@@ -847,7 +857,8 @@ def _router_hook(layer_index, compact = None):
 def _input_addresses(tensors):
     # Zero padded to one slot per tensor (static shape); a tensor, not a set, to flow through a graph.
     out = sorted({x.data_ptr() for x in tensors if x.numel() > 0})
-    return torch.tensor(out + [0] * (len(tensors) - len(out)), dtype = torch.int64)
+    # Host metadata read back with tolist(): pin to CPU so a default device cannot move it.
+    return torch.tensor(out + [0] * (len(tensors) - len(out)), dtype = torch.int64, device = "cpu")
 
 
 def _identity_mask(layer_input, recorded):
@@ -856,7 +867,7 @@ def _identity_mask(layer_input, recorded):
     shared = [len(now.intersection(r.tolist())) for r in recorded]
     best = max(shared, default = 0)
     unique = best > 0 and shared.count(best) == 1
-    return torch.tensor([not unique or n == best for n in shared], dtype = torch.bool)
+    return torch.tensor([not unique or n == best for n in shared], dtype = torch.bool, device = "cpu")
 
 
 _CUSTOM_OP_PARAMS = frozenset(inspect.signature(torch.library.custom_op).parameters)
@@ -912,7 +923,7 @@ def _layer_inputs_impl(tensors: typing.List[torch.Tensor]) -> torch.Tensor:
 
 
 def _layer_inputs_fake(tensors):
-    return torch.empty(len(tensors), dtype = torch.int64)
+    return torch.empty(len(tensors), dtype = torch.int64, device = "cpu")
 
 
 def _identity_mask_impl(layer_input: torch.Tensor, recorded: typing.List[torch.Tensor]) -> torch.Tensor:
@@ -920,27 +931,65 @@ def _identity_mask_impl(layer_input: torch.Tensor, recorded: typing.List[torch.T
 
 
 def _identity_mask_fake(layer_input, recorded):
-    return torch.empty(len(recorded), dtype = torch.bool)
+    return torch.empty(len(recorded), dtype = torch.bool, device = "cpu")
+
+
+def _record_layer_inputs(layer_index, args, kwargs):
+    # Read in compiled layers too: dropping these leaves identical forwards ambiguous.
+    tensors = [
+        x for value in list(args) + list(kwargs.values())
+        for x in (value if isinstance(value, (tuple, list)) else (value,))
+        if torch.is_tensor(x)
+    ]
+    if not tensors:
+        addresses = None
+    elif torch.compiler.is_compiling():
+        addresses = _LAYER_INPUTS_OP(tensors)
+    else:
+        addresses = _input_addresses(tensors)
+    _STATE.layer_inputs[layer_index] = addresses
 
 
 def _layer_pre_hook(layer_index):
     def hook(module, args, kwargs):
-        # Read in compiled layers too: dropping these leaves identical forwards ambiguous.
-        tensors = [
-            x for value in list(args) + list(kwargs.values())
-            for x in (value if isinstance(value, (tuple, list)) else (value,))
-            if torch.is_tensor(x)
-        ]
-        if not tensors:
-            addresses = None
-        elif torch.compiler.is_compiling():
-            addresses = _LAYER_INPUTS_OP(tensors)
-        else:
-            addresses = _input_addresses(tensors)
-        _STATE.layer_inputs[layer_index] = addresses
+        _record_layer_inputs(layer_index, args, kwargs)
         return None
 
     return hook
+
+
+class _RecordingCall(functools.partial):
+    # The checkpointed function, recording the layer inputs each time it runs. transformers >= 5.23
+    # checkpoints `forward` instead of `__call__`, so the recompute in backward skips the layer's
+    # forward pre hook and would otherwise read no inputs (identical forwards become ambiguous).
+    # A partial over the original, so checkpoint functions that unwrap it to find the layer still do.
+    def __call__(self, *args, **kwargs):
+        # Python may flatten a wrapped partial into this one: its bound keywords are ours then.
+        inner = getattr(self.func, "keywords", None)
+        bound = {**(inner if isinstance(inner, dict) else {}), **self.keywords, **kwargs}
+        _record_layer_inputs(self.layer_index, args, bound)
+        return super().__call__(*args, **kwargs)
+
+
+class _RecordingCheckpoint:
+    # A class, not a closure: transformers stores it on the layer, which must still pickle.
+    def __init__(self, checkpoint, layer_index):
+        self._unsloth_replay_checkpoint = checkpoint
+        self.layer_index = layer_index
+
+    def __call__(self, function, *args, **kwargs):
+        call = _RecordingCall(function)
+        call.layer_index = self.layer_index
+        return self._unsloth_replay_checkpoint(call, *args, **kwargs)
+
+
+def _wrap_checkpoint_funcs(layers):
+    # Per call, not once: gradient_checkpointing_enable (or Unsloth's offloaded checkpoint) may set
+    # the function after routing replay is installed.
+    for layer_index, layer in layers:
+        checkpoint = layer.__dict__.get("_gradient_checkpointing_func")
+        if callable(checkpoint) and not hasattr(checkpoint, "_unsloth_replay_checkpoint"):
+            layer._gradient_checkpointing_func = _RecordingCheckpoint(checkpoint, layer_index)
 
 
 def _is_router(module):
@@ -1003,8 +1052,12 @@ def install_routing_replay(model, llm = None, tokenizer = None):
 
         parent.register_forward_pre_hook(parent_pre_hook, with_kwargs = True)
         parent.register_forward_hook(parent_post_hook, always_call = True)
+    checkpointed = tuple(
+        (layer_index, decoder.layers[layer_index]) for layer_index in moe_layers if layer_index < len(decoder.layers)
+    )
     decoder.register_forward_pre_hook(
-        functools.partial(_decoder_pre_hook, parent_input_ids = parent_input_ids), with_kwargs = True,
+        functools.partial(_decoder_pre_hook, parent_input_ids = parent_input_ids, moe_layers = checkpointed),
+        with_kwargs = True,
     )
     decoder.register_forward_hook(_decoder_post_hook, always_call = True)
     model._unsloth_routing_replay_installed = True

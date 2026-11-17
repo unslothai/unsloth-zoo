@@ -22,6 +22,8 @@ caller keeps its eager path.
 import os
 import logging
 import torch
+# Absolute: this module is also loaded by path, outside the package.
+from unsloth_zoo.triton_specialize import jit_any_alignment as _jit_any_alignment
 
 __all__ = [
     "moe_triton_kernels_available",
@@ -76,8 +78,9 @@ def _autograd_control_flow_errors():
 
 def _disable(where, exc):
     global _DISABLED_REASON
-    # Checkpoint early stop raises from our save_for_backward; swallowing it trips early_stop's assertion.
-    if isinstance(exc, _autograd_control_flow_errors()):
+    # Checkpoint early stop raises from our save_for_backward; swallowing it trips early_stop's assertion. An OOM is
+    # not a kernel fault either: disabling the kernels for it would only move the OOM to the eager path.
+    if isinstance(exc, _autograd_control_flow_errors() + (torch.cuda.OutOfMemoryError,)):
         try:
             raise exc
         finally:
@@ -100,7 +103,7 @@ def _kernels():
         q_ptr, out_ptr, code_ptr,
         absmax_ptr, code2_ptr, absmax2_ptr, offset_ptr,
         n_bytes,
-        NESTED: tl.constexpr, BLOCKSIZE2: tl.constexpr, BLOCK: tl.constexpr, LONG_INDEXING: tl.constexpr,  # double quant / nested block / bytes per program / int64 offsets
+        NESTED: tl.constexpr, BLOCKSIZE2: tl.constexpr, BLOCK: tl.constexpr, LONG_INDEXING: tl.constexpr,  # NESTED: nested absmax; BLOCKSIZE2: its block; BLOCK: 1024 bytes; LONG_INDEXING: int64 offsets
     ):
         pid = tl.program_id(0)
         if LONG_INDEXING:
@@ -125,9 +128,10 @@ def _kernels():
         # Not offs2 < 2 * n_bytes (int32 wraps for 2**31..2**32 weights) nor offs2 // 2 (~15% slower).
         tl.store(out_ptr + offs2, w, mask = (offs2 - n_bytes) < n_bytes)
 
-    @triton.jit
-    def _combine_fwd_kernel(y_ptr, inv_ptr, w_ptr, out_ptr, T, H: tl.constexpr, TOPK: tl.constexpr,  # hidden / top-k
-                            BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr, ROUND_PRODUCT: tl.constexpr):  # tokens per tile / hidden per tile / eager product rounding
+    # T / N: tokens / routed slots per call; == 1 kept, no % 16 binary.
+    @_jit_any_alignment("T")
+    def _combine_fwd_kernel(y_ptr, inv_ptr, w_ptr, out_ptr, T, H: tl.constexpr, TOPK: tl.constexpr,  # H: hidden size; TOPK: experts per token
+                            BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr, ROUND_PRODUCT: tl.constexpr):  # BLOCK_T: 8 tokens; BLOCK_H: 512 cols; ROUND_PRODUCT: round w * y to y dtype
         pid_t = tl.program_id(0).to(tl.int64)
         hb = tl.program_id(1)
         offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T).to(tl.int64)
@@ -158,9 +162,9 @@ def _kernels():
         tl.store(out_ptr + offs_t[:, None] * H + offs_h[None, :], acc.to(out_ptr.dtype.element_ty),
                  mask = t_mask[:, None] & h_mask[None, :])
 
-    @triton.jit
-    def _combine_bwd_dy_kernel(dout_ptr, sorted_ptr, w_ptr, dy_ptr, N, H: tl.constexpr, TOPK: tl.constexpr,  # hidden / top-k
-                               BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr):  # tokens per tile / hidden per tile
+    @_jit_any_alignment("N")
+    def _combine_bwd_dy_kernel(dout_ptr, sorted_ptr, w_ptr, dy_ptr, N, H: tl.constexpr, TOPK: tl.constexpr,  # H: hidden size; TOPK: experts per token
+                               BLOCK_T: tl.constexpr, BLOCK_H: tl.constexpr):  # BLOCK_T: 16 slots; BLOCK_H: 512 cols
         pid = tl.program_id(0).to(tl.int64)
         hb = tl.program_id(1)
         offs_i = pid * BLOCK_T + tl.arange(0, BLOCK_T).to(tl.int64)
@@ -174,8 +178,8 @@ def _kernels():
                  mask = i_mask[:, None] & h_mask[None, :])
 
     @triton.jit
-    def _combine_bwd_dw_kernel(y_ptr, dout_ptr, sorted_ptr, dw_ptr, H: tl.constexpr, TOPK: tl.constexpr, BLOCK_H: tl.constexpr,  # hidden / top-k / hidden per tile
-                               ROUND_PRODUCT: tl.constexpr):  # eager product rounding
+    def _combine_bwd_dw_kernel(y_ptr, dout_ptr, sorted_ptr, dw_ptr, H: tl.constexpr, TOPK: tl.constexpr, BLOCK_H: tl.constexpr,  # H: hidden size; TOPK: experts per token; BLOCK_H: 1024 col chunk
+                               ROUND_PRODUCT: tl.constexpr):  # round y * dout to y dtype, as eager does
         i = tl.program_id(0).to(tl.int64)
         t = tl.load(sorted_ptr + i).to(tl.int64) // TOPK
         acc = tl.zeros((BLOCK_H,), dtype = tl.float32)
@@ -324,8 +328,9 @@ class _WeightedUnpermute(torch.autograd.Function):
         (T, H), y_dtype, y_device = ctx.y_meta
         top_k = ctx.top_k
         dout = dout.contiguous()
-        # Backward kernels compile lazily here, outside the forward's fallback.
-        if moe_triton_kernels_available(dout.device):
+        # Backward kernels compile lazily here, outside the forward's fallback. create_graph=True (grad mode on in
+        # backward) needs the differentiable eager replay: the raw kernels' outputs carry no graph.
+        if not torch.is_grad_enabled() and moe_triton_kernels_available(dout.device):
             try:
                 triton, _, _, bwd_dy, bwd_dw = _get_kernels()
                 BLOCK_T, BLOCK_H = 16, 512

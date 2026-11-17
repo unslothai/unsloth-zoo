@@ -53,7 +53,9 @@ _EFFECTIVE_HEAD_CACHE = weakref.WeakKeyDictionary()
 
 
 def _tensor_key(t):
-    return (t.data_ptr(), t._version, t.dtype, t.device, tuple(t.shape))
+    # Inference tensors have no version counter; outside inference mode they cannot be mutated in place.
+    version = None if t.is_inference() else t._version
+    return (t.data_ptr(), version, t.dtype, t.device, tuple(t.shape))
 
 
 _CHECKED_HEAD_BIAS = weakref.WeakKeyDictionary()

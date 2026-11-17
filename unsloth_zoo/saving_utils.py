@@ -346,6 +346,19 @@ def create_huggingface_repo(
         private = private,
         exist_ok = True,  # don't error if repo already exists
     )
+    # create_repo(private=True, exist_ok=True) keeps an existing public repo public: refuse before the first upload.
+    if private:
+        try:
+            _is_private = getattr(api.repo_info(repo_id = repo_id, repo_type = "model"), "private", None)
+        except Exception as exc:
+            _is_private = None
+            print(f"Unsloth: Could not confirm the visibility of {repo_id} ({exc}); continuing.")
+        if _is_private is False:
+            raise RuntimeError(
+                f"Unsloth: private=True was requested but the Hugging Face repo {repo_id!r} already exists and is "
+                "public. Refusing to upload so private weights are not published. Make the repo private on the Hub, "
+                "push to a new repo id, or pass private=False."
+            )
     username = repo_id.split("/")[0]
 
     # If base_model is a local path, resolve it to the original model ID so the card does not reference a local dir (which fails HF validation).
@@ -1067,9 +1080,10 @@ def _merge_and_overwrite_lora(
     biases = None,
     vocab_modules = None,
     fp8_header_cache = None,
+    source_path = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Merges LoRA and overwrites the safetensors file it was merged to
+    # Merges LoRA and overwrites the safetensors file it was merged to (written from source_path when given)
     if base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4":
         if UNSLOTH_ENABLE_LOGGING:
             logger.info("mxfp4 quantized model detected. Using safe rewrite strategy (requires temporary disk space).")
@@ -1117,17 +1131,21 @@ def _merge_and_overwrite_lora(
     length_of_header = 0
 
     try:
-        _ensure_shard_writable(filename_original)
-        # Memory-map for in-place overwrite
-        raw_pointer = open(filename_original, "r+b")
-        mm = mmap.mmap(raw_pointer.fileno(), length = 0, access = mmap.ACCESS_WRITE)
+        if source_path is not None:
+            mm = _SinglePassShardWriter(source_path, filename_original)
+            length_of_header, header_metadata = mm.length_of_header, mm.header_metadata
+        else:
+            _ensure_shard_writable(filename_original)
+            # Memory-map for in-place overwrite
+            raw_pointer = open(filename_original, "r+b")
+            mm = mmap.mmap(raw_pointer.fileno(), length = 0, access = mmap.ACCESS_WRITE)
 
-        # Parse safetensors header
-        length_of_header = int.from_bytes(mm.read(8), "little")
-        header_metadata = json.loads(mm.read(length_of_header))
-        mm.seek(0)
+            # Parse safetensors header
+            length_of_header = int.from_bytes(mm.read(8), "little")
+            header_metadata = json.loads(mm.read(length_of_header))
+            mm.seek(0)
 
-        with safe_open(filename_original, framework = "pt", device = "cpu") as file:
+        with safe_open(filename_original if source_path is None else source_path, framework = "pt", device = "cpu") as file:
             safetensor_keys = list(file.keys())
             safetensor_keys_seen.update(safetensor_keys)
             bias_overrides = _get_bias_overrides(biases, safetensor_keys, model_class_name)
@@ -1397,9 +1415,12 @@ def _merge_and_overwrite_lora(
                     device_empty_cache()
             pass
         pass
-        mm.flush()
-        mm.close()
-        raw_pointer.close()
+        if source_path is not None:
+            mm.commit()
+        else:
+            mm.flush()
+            mm.close()
+            raw_pointer.close()
 
         # Vocab grew -> resized tensors no longer fit their byte slots; rewrite the
         # shard. Stream to a temp file when disk allows, else rewrite in place.
@@ -2572,6 +2593,22 @@ def _fold_perexpert_lora_into_fused(W, fused_base_name, converted_lora_weights):
 pass
 
 
+def _paramwrapper_expert_lora(converted_lora_weights, fused_base_name):
+    """PEFT ParamWrapper LoRA on a fused expert tensor, or None. Keyed on the experts module,
+    one `.base_layer` deeper per extra target_parameters entry; tensor in `parameter_name`."""
+    _m = re.match(r"^(.*\.experts)\.(gate_up_proj|down_proj)$", fused_base_name)
+    if _m is None:
+        return None
+    key = _m.group(1)
+    while key in converted_lora_weights:
+        stats = converted_lora_weights[key]
+        if getattr(stats, "parameter_name", None) == _m.group(2) and getattr(stats, "lora_A", None) is not None:
+            return stats
+        key += ".base_layer"
+    return None
+pass
+
+
 @torch.inference_mode
 def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None, biases=None, vocab_modules=None):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -2701,6 +2738,14 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                     if UNSLOTH_ENABLE_LOGGING:
                         logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING LoRA into Key Group: {base_name}")
                     count += 1; W = _merge_lora(W, lora_stats, output_key)
+                elif (_pw_stats := _paramwrapper_expert_lora(converted_lora_weights, base_name)) is not None:
+                    # Dequantized W is GPT-OSS (E, in, out), hence is_transposed.
+                    _merge_fused = (_merge_moe_fused_gate_up_expert if base_name.endswith(".gate_up_proj")
+                                    else _merge_moe_fused_down_proj_expert)
+                    W = _merge_fused(W, _pw_stats, output_dtype or W.dtype, is_transposed = True)
+                    count += 1
+                    if UNSLOTH_ENABLE_LOGGING:
+                        logger.info(f"[DEBUG] DEQUANTIZING MXFP4 & MERGING expert LoRA into Key Group: {base_name}")
                 else:
                     # Per-expert Linear expert LoRA (gpt-oss bnb-4bit): the fused-name
                     # lookup above misses it, so fold each delta into its slice of W.
@@ -2884,6 +2929,18 @@ def _is_nvfp4_compressed_tensors_config(quant_config):
         return True
     return any(
         isinstance(group, dict) and "nvfp4" in str(group.get("format", "")).lower()
+        for group in (quant_config.get("config_groups") or {}).values()
+    )
+pass
+
+def _is_mxfp8_compressed_tensors_config(quant_config):
+    """compressed-tensors checkpoint with an mxfp8-quantized group: a 16bit merge must decode its e8m0 scales."""
+    if not isinstance(quant_config, dict) or str(quant_config.get("quant_method", "")).lower() != "compressed-tensors":
+        return False
+    if str(quant_config.get("format", "")).lower() == "mxfp8-quantized":
+        return True
+    return any(
+        isinstance(group, dict) and str(group.get("format", "")).lower() == "mxfp8-quantized"
         for group in (quant_config.get("config_groups") or {}).values()
     )
 pass
@@ -3276,6 +3333,7 @@ from huggingface_hub import (
     get_torch_storage_size,
     get_torch_storage_id,
 )
+from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
 def get_torch_storage_size_new(x, element_size):
     if isinstance(x, LoraStats):
@@ -3285,6 +3343,9 @@ def get_torch_storage_size_new(x, element_size):
         if saved_w is None and hasattr(mod, "weight"):
             saved_w = mod.weight
         if saved_w is not None and hasattr(saved_w, "shape"):
+            # Block Swap evicts a host-held layer's weights to empty tensors: size those from the module instead.
+            if saved_w.numel() == 0 and hasattr(mod, "in_features") and hasattr(mod, "out_features"):
+                return mod.in_features * mod.out_features * element_size
             return int(np.prod(saved_w.shape)) * element_size
         # MoE LoRA wrappers with no .base_layer: infer merged shape from lora matrices
         if mod is None and x.lora_A is not None and x.lora_B is not None:
@@ -3295,6 +3356,38 @@ def get_torch_storage_size_new(x, element_size):
         return int(np.prod(shape)) * element_size
     else:
         return get_torch_storage_size(x)
+pass
+
+
+def _tied_tensor_key(x):
+    # Tied embeddings are one tensor under two names and written once; views into a shared arena (Block Swap) are
+    # distinct tensors, so this cannot key on storage id like the shard splitter.
+    if not isinstance(x, torch.Tensor) or x.is_meta or is_traceable_wrapper_subclass(x):
+        return None
+    try:
+        ptr = x.data_ptr()
+    except Exception:
+        return None
+    return (str(x.device), ptr, x.dtype, tuple(x.shape), tuple(x.stride())) if ptr else None
+pass
+
+
+def _save_size_in_bytes(state_dict, element_size, safe_serialization = True):
+    # torch.save writes each storage whole; for safetensors transformers clones disjoint views (Block Swap's arena) and
+    # drops tied aliases, so each distinct view is written once at its own bytes.
+    seen, total = set(), 0
+    for x in state_dict.values():
+        size = get_torch_storage_size_new(x, element_size)
+        if safe_serialization:
+            key = _tied_tensor_key(x)
+            if key is not None: size = min(size, x.nbytes)
+        else:
+            key = get_torch_storage_id_new(x)
+        if key is not None:
+            if key in seen: continue
+            seen.add(key)
+        total += size
+    return total
 pass
 
 
@@ -3318,6 +3411,7 @@ def prepare_saving(
     low_disk_space_usage = False,
     min_size_in_bytes = 100_000_000, # Must be of this size - 100MB default
     use_temp_file = False,
+    safe_serialization = True,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Check size
@@ -3359,8 +3453,7 @@ def prepare_saving(
         merge_into_original = merge_into_original,
         return_state_dict = True,
     )
-    # Total save size in bytes
-    save_size = sum(get_torch_storage_size_new(x, element_size) for x in state_dict.values())
+    save_size = _save_size_in_bytes(state_dict, element_size, safe_serialization)
 
     if not os.path.exists(save_directory):
         try:
@@ -4281,6 +4374,132 @@ def _check_disk_for_previous_export_refresh(save_directory, new_sizes):
 pass
 
 
+_PREVIOUS_EXPORT_PREFIX = ".unsloth-previous-"
+_PREVIOUS_EXPORT_METADATA_MAX = 64 * 1024 * 1024
+
+
+def _snapshot_previous_export_metadata(save_directory):
+    """Snapshot the previous export's top level metadata (rewritten before any shard is fetched).
+
+    {"files": {path: (bytes, mode) or link target}, "shards": previous shard entries}, or None
+    when a file cannot be read (no rollback then).
+    """
+    # Absolute, as the rollback lists the folder holding the backup, which mkdtemp returns absolute.
+    save_directory = os.path.abspath(save_directory)
+    files = {}
+    try:
+        for name in os.listdir(save_directory):
+            path = os.path.join(save_directory, name)
+            if name.endswith(".safetensors") or name.startswith(_PREVIOUS_EXPORT_PREFIX):
+                continue
+            if os.path.islink(path):
+                files[path] = os.readlink(path)
+                continue
+            if not os.path.isfile(path):
+                continue
+            if os.path.getsize(path) > _PREVIOUS_EXPORT_METADATA_MAX:
+                return None
+            with open(path, "rb") as f:
+                # Permission bits only: a restored file is recreated as ours, so a planted setuid/setgid bit would become ours.
+                files[path] = (f.read(), os.stat(path).st_mode & 0o777)
+        shards = set(_export_shard_entries(save_directory))
+    except OSError:
+        return None
+    return {"files" : files, "shards" : shards}
+pass
+
+
+def _export_shard_entries(save_directory):
+    # Every shard entry (file or link) under the export, nested ones too; never inside a linked
+    # directory or the private backup and staging directories.
+    for root, dirs, names in os.walk(save_directory):
+        dirs[:] = [d for d in dirs if not d.startswith(".unsloth-")]
+        for name in names:
+            path = os.path.join(root, name)
+            if name.endswith(".safetensors") and (os.path.islink(path) or os.path.isfile(path)):
+                yield path
+pass
+
+
+def _keep_previous_export_shards(filenames, save_directory, new_sizes, metadata = {"files" : {}, "shards" : None}, scratch = 0):
+    """Hard-link each previous shard into a private dir (numbered names) so a failed refresh can restore it.
+
+    Writers rename new shards over old entries, so links cost nothing until then. All shards or none
+    (a partial rollback is still mixed), and only when the disk holds every new shard plus `scratch`.
+    """
+    if metadata is None:
+        return {}
+    try:
+        if shutil.disk_usage(save_directory).free < sum(new_sizes.values()) + scratch + _REFRESH_DISK_MARGIN:
+            return {}
+        backup_dir = tempfile.mkdtemp(prefix = _PREVIOUS_EXPORT_PREFIX, dir = save_directory)
+    except OSError:
+        return {}
+    kept = {"dir" : backup_dir, "shards" : {}, "metadata" : metadata}
+    try:
+        for i, filename in enumerate(filenames):
+            file_path = os.path.join(save_directory, filename)
+            if os.path.islink(file_path) or not os.path.isfile(file_path):
+                raise OSError(f"{file_path} is not a regular file")
+            backup_path = os.path.join(backup_dir, str(i))
+            os.link(file_path, backup_path)
+            kept["shards"][file_path] = backup_path
+    except OSError:
+        _drop_previous_export_shards(kept)
+    return kept
+pass
+
+
+def _restore_previous_export_shards(kept):
+    for file_path, backup_path in kept["shards"].items():
+        if not os.path.lexists(backup_path):
+            continue
+        if os.path.lexists(file_path) and os.path.samefile(file_path, backup_path):
+            continue
+        os.replace(backup_path, file_path)
+    backup_dir = kept["dir"]
+    save_directory = os.path.dirname(os.path.abspath(backup_dir))
+    metadata = kept["metadata"]["files"]
+    previous_shards = kept["metadata"].get("shards")
+    if previous_shards is not None:
+        # Shards the refresh added beside the previous export go with it.
+        for path in list(_export_shard_entries(save_directory)):
+            if path not in previous_shards:
+                os.remove(path)
+    for name in os.listdir(save_directory):
+        path = os.path.join(save_directory, name)
+        # Metadata the refresh added beside the previous export goes with it.
+        if path not in metadata and not name.endswith(".safetensors") and \
+                not name.startswith(_PREVIOUS_EXPORT_PREFIX) and \
+                (os.path.islink(path) or os.path.isfile(path)):
+            os.remove(path)
+    for i, (path, payload) in enumerate(metadata.items()):
+        # Staged in the private backup directory and renamed over the entry, so a link the
+        # export holds under any name is replaced, never followed.
+        if isinstance(payload, str):
+            # A link the previous export held: leave it if the refresh kept it, else relink it.
+            if os.path.islink(path) and os.readlink(path) == payload:
+                continue
+            staged = os.path.join(backup_dir, f"link-{i}")
+            os.symlink(payload, staged)
+        else:
+            data, mode = payload
+            fd, staged = tempfile.mkstemp(dir = backup_dir, prefix = "restore-")
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.chmod(staged, mode)
+        os.replace(staged, path)
+    _drop_previous_export_shards(kept)
+pass
+
+
+def _drop_previous_export_shards(kept):
+    if kept:
+        shutil.rmtree(kept["dir"], ignore_errors = True)
+    kept.clear()
+pass
+
+
 def _resolve_hub_commit(repo_id, token):
     # Resolve one commit for every file an export fetches so a mid-export push cannot mix shards from two commits; offline or unreachable gives None (unpinned).
     try:
@@ -4318,7 +4537,8 @@ def _ensure_shard_writable(file_path):
     A hard-linked shard gets a private copy first so the write never mutates the cache blob.
     """
     st = os.stat(file_path)
-    mode = stat.S_IMODE(st.st_mode) | stat.S_IWUSR
+    # Permission bits only: the private copy below is created as ours, so never carry a setuid/setgid bit onto it.
+    mode = (st.st_mode & 0o777) | stat.S_IWUSR
     if st.st_nlink > 1:
         _fd, staging = tempfile.mkstemp(
             dir = os.path.dirname(file_path) or os.curdir, prefix = ".unsloth-private-",
@@ -5115,6 +5335,7 @@ def merge_and_overwrite_lora(
         # Handle case for local model where config._name_or_path is a local os path
         # https://github.com/unslothai/unsloth/issues/2140
         is_local_path = False
+        _local_tokenizer_model = None
         if os.path.exists(model_name) and os.path.isdir(model_name):
             is_local_path = True
             print(f"Detected local model directory: {model_name}")
@@ -5184,10 +5405,8 @@ def merge_and_overwrite_lora(
                     print(f"Warning: Could not process index file: {e}")
             tokenizer_model_path = os.path.join(model_name, "tokenizer.model")
             if os.path.exists(tokenizer_model_path):
-                os.makedirs(save_directory, exist_ok=True)
-                # Copy from local
-                _copy_file_from_source(tokenizer_model_path, save_directory, "tokenizer.model")
-                print(f"Copied tokenizer.model from local model directory")
+                # Copied after the previous export snapshot below, so a rollback restores it too.
+                _local_tokenizer_model = tokenizer_model_path
         else:
             # Original HF repo logic
             # Third Hub round trip on this path, and it had the same bare `except:` as
@@ -5230,6 +5449,18 @@ def merge_and_overwrite_lora(
                 _hub_shard_sizes[fname] = x["size"]
                 max_size_in_bytes = max(max_size_in_bytes, x["size"])
                 total_size_in_bytes += x["size"]
+            if not safetensors_list:
+                # No root shard: read the subfolder shards the root index names, as the local branch does.
+                try:
+                    _hub_shard_sizes = _hub_index_subfolder_shards(model_name, file_list, token, _hub_revision)
+                except Exception as e:
+                    raise _hub_unreachable_error(
+                        model_name, e, action = f"listing the shards of `{model_name}`",
+                    ) from e
+                safetensors_list = list(_hub_shard_sizes)
+                if _hub_shard_sizes:
+                    max_size_in_bytes = max(_hub_shard_sizes.values())
+                    total_size_in_bytes = sum(_hub_shard_sizes.values())
 
             # Drop stale/duplicate shard sets the index doesn't reference. Some repos (e.g.
             # granite-3.2-8b-instruct) ship a leftover second shard set next to the real one while
@@ -5344,6 +5575,8 @@ def merge_and_overwrite_lora(
     pass
 
     _stale_shards = set()
+    _new_sizes = {}
+    _previous_metadata = None
     if save_method not in ("merged_4bit", "forced_merged_4bit"):
         # Before the tokenizer, config and index writes below, so a refused refresh changes nothing.
         # Only shard entries decide it, and none of those writes touches a shard.
@@ -5367,7 +5600,15 @@ def merge_and_overwrite_lora(
                     f : _hub_shard_sizes.get(f, max_size_in_bytes) for f in safetensors_list
                 }
             _check_disk_for_previous_export_refresh(save_directory, _new_sizes)
+            if not low_disk_space_usage:
+                # Before the tokenizer, config and index writes below, which a rollback undoes too.
+                _previous_metadata = _snapshot_previous_export_metadata(save_directory)
         pass
+
+    if _local_tokenizer_model is not None:
+        os.makedirs(save_directory, exist_ok=True)
+        _copy_file_from_source(_local_tokenizer_model, save_directory, "tokenizer.model")
+        print(f"Copied tokenizer.model from local model directory")
 
     # Save config / generation_config via no state_dict and tokenizer
     if tokenizer is not None:
@@ -5593,7 +5834,33 @@ def merge_and_overwrite_lora(
         pass
     pass
 
+    # Plain 16-bit merges write each shard once from its source; rewrite / split / widen / dequant, MoE,
+    # nested names and output links keep the copy. UNSLOTH_MERGE_SINGLE_PASS=0 keeps it everywhere.
+    _single_pass_merge = (
+        save_method == "merged_16bit"
+        and not base_model_is_quantized
+        and not _is_quant_dequant
+        and not _ct_dequant
+        and _ct_packed_format is None
+        and not needs_splitting
+        and not upcast_to_float32
+        and not any(isinstance(k, str) and (".experts" in k or ".moe" in k) for k in lora_weights)
+        and os.environ.get("UNSLOTH_MERGE_SINGLE_PASS", "1") != "0"
+    )
+    _deferred_sources = {}
+    def _defers_copy(filename):
+        if not _single_pass_merge or _has_directory_component(filename): return False
+        output_path = os.path.join(save_directory, filename)
+        return not os.path.islink(output_path) and not os.path.isdir(output_path)
+
     _replaced_shards = []
+    # Outside low disk mode a failed refresh puts the previous export back instead of leaving
+    # some shards on the base weights and the rest still merged, when the disk can hold both.
+    _previous_export = _keep_previous_export_shards(
+        sorted(_stale_shards), save_directory, _new_sizes, _previous_metadata,
+        # Splitting writes a shard's pieces beside it before removing it.
+        scratch = max(_new_sizes.values(), default = 0) if needs_splitting else 0,
+    ) if _stale_shards and not low_disk_space_usage else {}
     try:
         # Step 4 : Handle retrieval of original 16-bit shards and tokenizer.model file if exists
         if not is_local_path and _hf_cache_dir is not None:
@@ -5608,6 +5875,8 @@ def merge_and_overwrite_lora(
                     token = token,
                     revision = _hub_revision,
                     copied = _copied_from_cache,
+                    defer = _defers_copy,
+                    deferred = _deferred_sources,
                 )
             finally:
                 _replaced_shards.extend(f for f in _copied_from_cache if f in _stale_shards)
@@ -5675,7 +5944,9 @@ def merge_and_overwrite_lora(
             # Only download if we didn't get everything from cache AND this specific file doesn't exist
             # AND we're in low disk space mode
             # For local models, copy the file if needed
-            if _replace_from_local:
+            if _replace_from_local and _defers_copy(filename):
+                _deferred_sources[filename] = local_file_path
+            elif _replace_from_local:
                 # A nested name has no parent here yet, so the copy would raise
                 # FileNotFoundError. The name is known to stay inside LEXICALLY, no
                 # stronger: a symlinked component still resolves wherever it points.
@@ -5713,12 +5984,20 @@ def merge_and_overwrite_lora(
             final_safetensors_list.extend(resulting_files)
         pass
     except BaseException:
+        if _previous_export:
+            try:
+                _restore_previous_export_shards(_previous_export)
+                _replaced_shards = []
+                print(f"Unsloth: Warning: the export in {save_directory} failed; the previous export was restored.")
+            except OSError as restore_error:
+                print(f"Unsloth: Warning: could not restore the previous export in {save_directory}: {restore_error}")
         if _replaced_shards:
             print(
                 f"Unsloth: Warning: the export in {save_directory} is incomplete. These shards "
                 f"already hold the base weights: {', '.join(dict.fromkeys(_replaced_shards))}. Re-run the export."
             )
         raise
+    _drop_previous_export_shards(_previous_export)
 
     if low_disk_space_usage and not is_local_path and not copied_all_from_cache:
         tokenizer_model_path = os.path.join(save_directory, "tokenizer.model")
@@ -5831,6 +6110,7 @@ def merge_and_overwrite_lora(
         tie_word_embeddings = _merge_tie_word_embeddings,
         count_packed_mxfp4 = _count_packed_mxfp4,
         disk = _disk_view,
+        sources = _deferred_sources,
     )
 
     # FP8 MoE-expert LoRA + merged_16bit: the dense FP8 rewrite cannot fuse per-expert
@@ -5875,6 +6155,7 @@ def merge_and_overwrite_lora(
     _seeded_head_keys = _seed_unbacked_trained_tensors(
         save_directory, final_safetensors_list, lora_weights, _merge_model_class_name,
         output_dtype = output_dtype, tie_word_embeddings = _merge_tie_word_embeddings,
+        sources = _deferred_sources,
     ) if save_method == "merged_16bit" else {}
     if _seeded_head_keys:
         print(f"Unsloth: Writing {len(_seeded_head_keys)} trained tensor(s) absent from the "
@@ -5935,6 +6216,7 @@ def merge_and_overwrite_lora(
             biases = biases,
             vocab_modules = _vocab_modules,
             fp8_header_cache = _fp8_header_cache,
+            source_path = _deferred_sources.pop(filename, None),
         )
         n_saved_modules += merged_count
         safetensor_keys_seen.update(shard_keys)
@@ -6112,9 +6394,12 @@ def _try_copy_all_from_cache(
     token: Optional[str],
     revision: Optional[str] = None,
     copied: Optional[list] = None,
+    defer = None,
+    deferred: Optional[dict] = None,
 ) -> bool:
     """If ALL files exist in the HF cache, copy them into target_dir_str.
-    Returns True on success, False otherwise. Names copied so far are appended to `copied`.
+    Returns True on success, False otherwise. Names copied so far are appended to `copied`;
+    names `defer` accepts go into `deferred` (source path) instead of being copied.
     """
     from huggingface_hub.errors import LocalEntryNotFoundError
 
@@ -6169,9 +6454,19 @@ def _try_copy_all_from_cache(
         return False
 
     all_copied = True
+    _deferred_here = []
     for filename, cached_path in ProgressBar(cached_paths_map.items(), desc = f"Unsloth: Copying {len(filenames_to_check)} files from cache to `{target_dir_str}`"):
         try:
-            # Pass string target_dir_str to copy helper
+            if defer is not None and deferred is not None and defer(filename):
+                if not Path(cached_path).is_file():
+                    raise FileNotFoundError(f"Source {cached_path} is not a valid file.")
+                if not os.access(cached_path, os.R_OK):
+                    raise PermissionError(f"No read permission for source file: {cached_path}")
+                deferred[filename] = str(cached_path)
+                _deferred_here.append(filename)
+                continue
+            # A subfolder shard (Cosmos3 `transformer/...`) has no parent in the target yet.
+            os.makedirs(os.path.dirname(os.path.join(target_dir_str, filename)), exist_ok = True)
             _copy_file_from_source(cached_path, target_dir_str, filename)
             if copied is not None: copied.append(filename)
         except (IOError, PermissionError, FileNotFoundError) as copy_err:
@@ -6186,6 +6481,7 @@ def _try_copy_all_from_cache(
         print(f"Successfully copied all {len(filenames_to_check)} files from cache to `{target_dir_str}`")
         return True
     else:
+        for filename in _deferred_here: deferred.pop(filename, None)
         print("Failed to copy one or more files from cache. Will proceed with downloading.")
         return False
 pass
@@ -6415,6 +6711,7 @@ def merge_and_dequantize_lora(
         merge_into_original = False,
         min_size_in_bytes = 100_000_000, # 100MB default
         use_temp_file = use_temp_file,
+        safe_serialization = safe_serialization,
     )
 
     import transformers.modeling_utils
@@ -6659,15 +6956,35 @@ def _registry_checkpoint_conversion_mapping(model_class_name):
 pass
 
 
+# Checkpoint layouts Unsloth's loader renames itself (a key_mapping Transformers does not register), so a
+# merge rereading the original checkpoint can place adapters. Must match unsloth's
+# _QWEN3_ASR_PACKAGE_KEY_MAPPING: Qwen/Qwen3-ASR-0.6B and -1.7B store weights under thinker.*.
+_LOADER_CHECKPOINT_CONVERSION_MAPPINGS = {
+    "Qwen3ASRForConditionalGeneration": {
+        r"^thinker\.audio_tower\.proj1\.": "model.multi_modal_projector.linear_1.",
+        r"^thinker\.audio_tower\.proj2\.": "model.multi_modal_projector.linear_2.",
+        r"^thinker\.audio_tower\.": "model.audio_tower.",
+        r"^thinker\.model\.": "model.language_model.",
+        r"^thinker\.lm_head\.": "lm_head.",
+    },
+}
+
+
 def _get_checkpoint_conversion_mapping(model_class_name):
     """A model class's _checkpoint_conversion_mapping ({} if absent), falling back to the
     Transformers 5 registry. Without that fallback a composite model with a pre-5 flat
     checkpoint loses the bridge to its on-disk weights and fails to merge silently (#5290)."""
     for model_class in _model_classes_named(model_class_name):
-        mapping = getattr(model_class, '_checkpoint_conversion_mapping', {})
+        # A model Unsloth ships natively (DeepSeek-V4.1) loads a foreign checkpoint layout through
+        # renames transformers scopes per submodule; it states them here for the merge.
+        mapping = getattr(model_class, '_unsloth_checkpoint_conversion_mapping', None) or \
+            getattr(model_class, '_checkpoint_conversion_mapping', {})
         if mapping:
-            return mapping
-    return _registry_checkpoint_conversion_mapping(model_class_name)
+            return dict(mapping)
+    mapping = _registry_checkpoint_conversion_mapping(model_class_name)
+    if mapping:
+        return mapping
+    return dict(_LOADER_CHECKPOINT_CONVERSION_MAPPINGS.get(model_class_name, {}))
 pass
 
 
@@ -7116,6 +7433,12 @@ def _reverse_renamed_backed_key(key, reverse_mapping, key_set, valid_prefixes, m
                     if candidate in seen: continue
                     if _lora_key_has_backing(candidate, key_set, valid_prefixes = valid_prefixes):
                         return candidate
+                    # A checkpoint without the base-model prefix (DeepSeek-V4.1's `layers.0.attn.wq_a`
+                    # under `model.layers.0.self_attn.q_a_proj`): transformers adds it at load.
+                    head, dot, rest = candidate.partition(".")
+                    if dot and head == "model" and rest and \
+                            _lora_key_has_backing(rest, key_set, valid_prefixes = valid_prefixes):
+                        return rest
                     seen.add(candidate)
                     next_frontier.append(candidate)
         frontier = next_frontier
@@ -7294,7 +7617,7 @@ def _prefix_deletion_candidates(key):
 pass
 
 
-def _disk_module_shapes(save_directory, safetensors_list):
+def _disk_module_shapes(save_directory, safetensors_list, sources = None):
     """`(every key in the staged shards, {module path : shape} for the `.weight` ones)`.
 
     The raw key set comes back too because the backing test needs names as written: rebuilding
@@ -7303,7 +7626,7 @@ def _disk_module_shapes(save_directory, safetensors_list):
     """
     keys, shapes = set(), {}
     for filename in safetensors_list or ():
-        path = os.path.join(save_directory, filename)
+        path = (sources or {}).get(filename) or os.path.join(save_directory, filename)
         if not os.path.exists(path): continue
         try:
             with safe_open(path, framework = "pt", device = "cpu") as f:
@@ -7458,14 +7781,14 @@ pass
 
 def _check_lora_merge_is_complete(save_directory, safetensors_list, lora_weights,
                                   model_class_name, tie_word_embeddings = False,
-                                  count_packed_mxfp4 = True, disk = None):
+                                  count_packed_mxfp4 = True, disk = None, sources = None):
     """Refuse a silently partial merge before any staged shard is touched, returning what it
     found (empty means every LoRA-bearing module can be placed).
 
     NOT ahead of everything: on a push, Step 2 has already uploaded config.json and the
     tokenizer, since `final_safetensors_list` is built after that upload.
     """
-    disk_keys, disk_module_shapes = disk or _disk_module_shapes(save_directory, safetensors_list)
+    disk_keys, disk_module_shapes = disk or _disk_module_shapes(save_directory, safetensors_list, sources = sources)
     unresolved = _unresolved_lora_targets(
         lora_weights,
         disk_keys,
@@ -7555,7 +7878,7 @@ pass
 
 def _seed_unbacked_trained_tensors(save_directory, safetensors_list, lora_weights,
                                    model_class_name, output_dtype = None,
-                                   tie_word_embeddings = False):
+                                   tie_word_embeddings = False, sources = None):
     """Append the tensors `_unbacked_trained_tensors` finds into a shard, returning their keys.
 
     Deliberately runs BEFORE the merge loop: once the key is on disk, the in-place rewrite,
@@ -7563,9 +7886,10 @@ def _seed_unbacked_trained_tensors(save_directory, safetensors_list, lora_weight
     downstream stage needs to know a head was added.
     """
     if not safetensors_list: return {}
+    sources = {} if sources is None else sources
     shard_keys, sizes = set(), {}
     for filename in safetensors_list:
-        path = os.path.join(save_directory, filename)
+        path = sources.get(filename) or os.path.join(save_directory, filename)
         if not os.path.exists(path): continue
         with safe_open(path, framework = "pt", device = "cpu") as f:
             shard_keys.update(f.keys())
@@ -7600,16 +7924,18 @@ def _seed_unbacked_trained_tensors(save_directory, safetensors_list, lora_weight
             f"the save directory at a larger volume."
         )
 
-    with open(path, "rb") as f:
+    source = sources.get(target) or path
+    with open(source, "rb") as f:
         length_of_header = int.from_bytes(f.read(8), "little")
         header_metadata = json.loads(f.read(length_of_header))
     temp_path = path + ".unsloth_seed_tmp"
     try:
-        _stream_rewrite_resized_shard(path, temp_path, header_metadata, length_of_header, tensors)
+        _stream_rewrite_resized_shard(source, temp_path, header_metadata, length_of_header, tensors)
         os.replace(temp_path, path)
     except Exception:
         if os.path.exists(temp_path): os.remove(temp_path)
         raise
+    sources.pop(target, None)
     return {key : target for key in tensors}
 pass
 
@@ -7931,6 +8257,60 @@ def _hub_unreachable_error(model_name, e, action = None, mistaken_for = "a missi
     )
 pass
 
+def _index_subfolder_shards(weight_map):
+    """Shard names a root index maps into subfolders, or None unless every one is nested and stays inside.
+
+    Cosmos3 publishes no root shard: its root index points into `transformer/` and `vision_encoder/`.
+    """
+    if not isinstance(weight_map, dict) or not weight_map: return None
+    shards = {v.replace("\\", "/") for v in weight_map.values() if isinstance(v, str)}
+    if len(shards) != len(set(weight_map.values())): return None
+    if not all(_shard_name_stays_inside(s) and _has_directory_component(s) for s in shards): return None
+    return sorted(shards)
+
+
+def _hub_index_subfolder_shards(model_name, root_listing, token = None, revision = None):
+    """{shard: size} for a repo with no root safetensors whose root index maps into subfolders, else {}.
+
+    Transport errors propagate for the caller to classify, as the root listing's do.
+    """
+    names = {os.path.basename(x["name"]) for x in root_listing}
+    if any(n.endswith(".safetensors") for n in names) or "model.safetensors.index.json" not in names:
+        return {}
+    # `hf://org/repo` and `org/repo@rev` list fine but are not repo ids to hf_hub_download.
+    repo_id, address_revision = _hub_repo_and_revision(model_name)
+    revision = revision or address_revision
+    index_path = hf_hub_download(
+        repo_id = repo_id, filename = "model.safetensors.index.json", token = token, revision = revision,
+    )
+    try:
+        with open(index_path, "r", encoding = "utf-8") as f:
+            shards = _index_subfolder_shards(json.load(f).get("weight_map"))
+    except (OSError, ValueError, AttributeError):
+        return {}
+    if not shards: return {}
+    fs = HfFileSystem(token = token)
+    sizes = {}
+    for folder in sorted({posixpath.dirname(s) for s in shards}):
+        for x in fs.ls(f"{repo_id}/{folder}", detail = True, revision = revision):
+            name = f"{folder}/{os.path.basename(x['name'])}"
+            if name in shards: sizes[name] = x["size"]
+    # A shard the index names but the repo lacks would fail the merge part way.
+    return sizes if len(sizes) == len(shards) else {}
+
+
+def _local_index_subfolder_shards(directory):
+    """Shards a local root index maps into subfolders, when the root has no safetensors and all of them exist, else []."""
+    try:
+        if any(f.endswith(".safetensors") for f in os.listdir(directory)): return []
+        with open(os.path.join(directory, "model.safetensors.index.json"), "r", encoding = "utf-8") as f:
+            shards = _index_subfolder_shards(json.load(f).get("weight_map"))
+    except (OSError, ValueError, AttributeError):
+        return []
+    if not shards or not all(os.path.isfile(os.path.join(directory, s)) for s in shards): return []
+    return shards
+
+
 def check_hf_model_exists(model_name, token=None):
     """Check if model exists on HuggingFace.
 
@@ -7943,7 +8323,8 @@ def check_hf_model_exists(model_name, token=None):
     if not _is_hub_repo_id(model_name): return False
     try:
         file_list = HfFileSystem(token=token).ls(model_name, detail=True)
-        return any(x["name"].endswith(".safetensors") for x in file_list)
+        if any(x["name"].endswith(".safetensors") for x in file_list): return True
+        return bool(_hub_index_subfolder_shards(model_name, file_list, token))
     except _HUB_ABSENT_ERRORS as e:
         # Still returns False so a local copy wins and gated bases keep working; a gated cause is warned about, since absent is not always the reason.
         gated = _gated_repo_cause(e)
@@ -7997,7 +8378,7 @@ def check_local_model_exists(model_path):
             for file in os.listdir(directory):
                 if file.endswith(".safetensors"):
                     return True
-            return False
+            return bool(_local_index_subfolder_shards(directory))
         except (OSError, PermissionError):
             return False
 
@@ -8300,6 +8681,10 @@ def check_model_quantization_status(model_name_or_path, token=None, local_ok=Tru
         elif _is_nvfp4_compressed_tensors_config(quant_config):
             return (True, "fp8")
 
+        # MXFP8 compressed-tensors: fp8 weights with e8m0 1x32 scales, decoded by the same FP8 rewrite.
+        elif _is_mxfp8_compressed_tensors_config(quant_config):
+            return (True, "fp8")
+
         # Case 1: Fallback to existing logic for bitsandbytes
         elif isinstance(quant_config, dict):
             is_quantized = quant_config.get("load_in_4bit", False)
@@ -8450,6 +8835,8 @@ def _local_snapshot_is_complete(local_path):
     An index that cannot be read answers False: completeness is unproven, and the
     unreachable Hub is then the more honest failure.
     """
+    # Every subfolder shard the root index names is on disk (Cosmos3).
+    if _local_index_subfolder_shards(local_path): return True
     indexed = None
     index_path = os.path.join(local_path, "model.safetensors.index.json")
     if os.path.isfile(index_path):
@@ -9180,6 +9567,96 @@ def _stream_rewrite_resized_shard_and_replace(filename_original, temp_dir, heade
                 os.remove(tmp_path)
             except OSError:
                 pass
+
+
+class _SinglePassShardWriter:
+    """Takes the merge loop's `mm[a:b] = bytes` writes and streams the source shard around them, so the
+    output equals copy-then-overwrite but is written once. A write behind the cursor is still correct."""
+    _CHUNK = 64 * 1024 * 1024
+
+    def __init__(self, source_path, destination):
+        self.source_path = str(source_path)
+        self.destination = destination
+        self._out = None
+        self._staging = None
+        self._src = open(self.source_path, "rb")
+        try:
+            self.size = os.fstat(self._src.fileno()).st_size
+            self.length_of_header = int.from_bytes(self._src.read(8), "little")
+            self.header_metadata = json.loads(self._src.read(self.length_of_header))
+            _fd, self._staging = tempfile.mkstemp(
+                dir = os.path.dirname(destination) or os.curdir, prefix = ".unsloth-copy-",
+            )
+            self._out = os.fdopen(_fd, "wb")
+        except BaseException:
+            self.close()
+            raise
+        self._cursor = 0
+        self._wrote = False
+        self._kernel_copy = hasattr(os, "copy_file_range")
+
+    def _copy_to(self, end):
+        start = self._cursor
+        if end <= start: return
+        if self._kernel_copy:
+            self._out.flush()
+            try:
+                while start < end:
+                    n = os.copy_file_range(self._src.fileno(), self._out.fileno(), end - start, start, start)
+                    if n <= 0: break
+                    start += n
+            except OSError:
+                self._kernel_copy = False
+        if start < end:
+            self._src.seek(start)
+            self._out.seek(start)
+            remaining = end - start
+            while remaining > 0:
+                chunk = self._src.read(min(self._CHUNK, remaining))
+                if not chunk:
+                    raise RuntimeError(f"Unsloth: unexpected EOF reading {self.source_path}")
+                self._out.write(chunk)
+                remaining -= len(chunk)
+        self._cursor = end
+
+    def __setitem__(self, index, data):
+        if not isinstance(index, slice) or index.step not in (None, 1):
+            raise TypeError("Unsloth: a shard write takes a contiguous slice")
+        start, stop = index.start, index.stop
+        data = memoryview(data).cast("B")
+        if start is None or stop is None or start < 0 or stop > self.size or stop - start != data.nbytes:
+            raise IndexError("Unsloth: shard write does not match the tensor's byte slot")
+        self._copy_to(start)
+        self._out.seek(start)
+        self._out.write(data)
+        self._cursor = max(self._cursor, stop)
+        self._wrote = True
+
+    def commit(self):
+        self._copy_to(self.size)
+        self._out.flush()
+        os.fsync(self._out.fileno())
+        self._out.close()
+        self._src.close()
+        # Same metadata as copy2 + overwrite.
+        shutil.copystat(self.source_path, self._staging)
+        st = os.stat(self._staging)
+        if self._wrote:
+            os.utime(self._staging, ns = (st.st_atime_ns, time.time_ns()))
+        os.chmod(self._staging, stat.S_IMODE(st.st_mode) | stat.S_IWUSR)
+        os.replace(self._staging, self.destination)
+        self._staging = None
+
+    def close(self):
+        for handle in (self._out, self._src):
+            if handle is not None:
+                try: handle.close()
+                except Exception: pass
+        if self._staging is not None:
+            try: os.remove(self._staging)
+            except OSError: pass
+            self._staging = None
+pass
 
 
 def _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key, tensor, output_dtype):

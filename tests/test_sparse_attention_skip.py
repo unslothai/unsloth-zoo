@@ -31,6 +31,17 @@ _REAL_CUDA = torch.cuda.is_available() and not getattr(torch.cuda, "_unsloth_con
 DEVICES = ["cpu"] + (["cuda"] if _REAL_CUDA else [])
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _eager_masks_and_few_threads():
+    # Eager masks (skip the cold Inductor build) and capped threads; bitwise checks stay within one thread setting.
+    import torch._dynamo
+    threads = torch.get_num_threads()
+    torch.set_num_threads(min(threads, 4))
+    with torch._dynamo.config.patch(disable=True):
+        yield
+    torch.set_num_threads(threads)
+
+
 def _has(model_type):
     return (
         importlib.util.find_spec(f"transformers.models.{model_type}") is not None

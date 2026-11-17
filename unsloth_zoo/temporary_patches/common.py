@@ -172,6 +172,20 @@ def _persistent_tma_matmul_ok():
     return found is not None and (int(found.group(1)), int(found.group(2))) < (2, 12)
 pass
 
+def _triton_block_ptr_ok():
+    # Triton 3.9 (torch 2.15) dropped block pointers: Inductor then warns at codegen and ignores the flag.
+    try:
+        from torch.utils._triton import has_triton_block_ptr
+        return bool(has_triton_block_ptr())
+    except ImportError:
+        pass
+    try:
+        import triton.language as tl
+    except Exception:
+        return False
+    return hasattr(tl, "make_block_ptr") and hasattr(tl, "advance")
+pass
+
 @functools.lru_cache(1)
 def determine_compile_threads():
     # See https://github.com/pytorch/pytorch/blob/ab2294d8289a7757a2fc321cdefac88e2b378edf/torch/_inductor/config.py#L771
@@ -289,7 +303,7 @@ def get_torch_compile_options(
         "verbose_progress"          : logging,
 
         "triton.multi_kernel"       : multi_kernel, # RuntimeError: name 'multi_kernel_0' is not defined
-        "triton.use_block_ptr"      : use_block_ptr,
+        "triton.use_block_ptr"      : bool(use_block_ptr) and _triton_block_ptr_ok(),
         "triton.enable_persistent_tma_matmul" : _persistent_tma_matmul_ok(),
         "triton.autotune_at_compile_time"     : False,
         "triton.cooperative_reductions"       : False,

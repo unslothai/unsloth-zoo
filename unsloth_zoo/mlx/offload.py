@@ -31,7 +31,7 @@ import re
 import struct
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -61,6 +61,48 @@ _DTYPES = {
     "U8": (np.uint8, mx.uint8),
     "I32": (np.int32, mx.int32),
 }
+_TRANSPORT = {np.dtype(np.uint16): mx.uint16, np.dtype(np.float16): mx.float16, np.dtype(np.float32): mx.float32,
+              np.dtype(np.uint32): mx.uint32, np.dtype(np.uint8): mx.uint8, np.dtype(np.int32): mx.int32}
+# A forward that lists its fills here gets a lookup of at most this many rows staged instead of read at once, and
+# lists in `held` the submissions it defers until they are read.
+STAGED_FILLS = threading.local()
+_STAGED_ROWS = 64
+_STAGING = threading.local()
+
+
+def _staged_ids(x):
+    ids = x.astype(mx.int64)
+    ids = ids.reshape(-1)
+    # Evaluate IDs during the forward build; read_staged fills row buffers before submitting their consumers.
+    mx.async_eval(ids)
+    return ids
+
+
+def read_staged():
+    """Read the rows this thread's forward staged, then submit what it held back for them. Anything about to read
+    the forward's arrays on the host calls this first: they could read rows not yet filled."""
+    fills = getattr(STAGED_FILLS, "fills", None)
+    if not fills:
+        return
+    held, STAGED_FILLS.fills, STAGED_FILLS.held = getattr(STAGED_FILLS, "held", None), None, None
+    try:
+        for fill in fills:
+            fill()
+    except BaseException:
+        for fill in fills:
+            fill.abandon()
+        raise
+    # Start PLE while the host encodes the held layers that consume it.
+    if held:
+        ready = []
+        for fill in fills:
+            output = getattr(fill, "ready", None)
+            if output is not None:
+                ready.append(output)
+        if ready:
+            mx.async_eval(*ready)
+    for arrays in held or ():
+        mx.async_eval(*arrays)
 
 _READ_THREADS = 16
 # Below this many reads a pool round trip costs more than it overlaps.
@@ -97,7 +139,12 @@ def read_ranges(jobs):
         run(jobs)
         return
     parts = min(_READ_THREADS, len(jobs))
-    list(_reader_pool().map(run, [jobs[i::parts] for i in range(parts)]))
+    pool = _reader_pool()
+    futures = [pool.submit(run, jobs[i::parts]) for i in range(parts)]
+    # Every worker is done with the views before a failure is raised: their caller may then reuse them.
+    wait(futures)
+    for future in futures:
+        future.result()
 
 
 class CheckpointTensors:
@@ -192,7 +239,13 @@ class _Field:
         return self.fd, self.offset + index * self.row_bytes
 
     def to_mx(self, buffer):
-        array = mx.array(buffer.view(self.transport).reshape(-1, *self.shape))
+        return self._typed(mx.array(buffer.view(self.transport).reshape(-1, *self.shape)))
+
+    def staged(self, rows):
+        """What ``to_mx`` makes of the bytes ``rows`` (one uint8 row per table row) will hold, read lazily."""
+        return self._typed(rows.view(_TRANSPORT[np.dtype(self.transport)]).reshape(-1, *self.shape))
+
+    def _typed(self, array):
         if array.dtype != self.dtype:
             array = array.view(self.dtype)  # bf16 travels as uint16
         return array if self.cast is None else array.astype(self.cast)
@@ -215,6 +268,13 @@ def _in_core(mapped, rows, row_bytes):
             _mincore = False
     if not _mincore or not rows.size:
         return np.ones(rows.size, dtype = bool)
+    if rows.size == 1:  # the sampled rows: numpy's per-call overhead would dominate
+        start = mapped.ctypes.data + int(rows[0]) * row_bytes
+        first = start // mmap.PAGESIZE * mmap.PAGESIZE
+        pages = (ctypes.c_uint8 * ((start + row_bytes - 1 - first) // mmap.PAGESIZE + 1))()
+        if _mincore(first, len(pages) * mmap.PAGESIZE, pages) != 0:
+            return np.ones(1, dtype = bool)
+        return np.array([all(page & 1 for page in pages)])
     start = mapped.ctypes.data + rows * row_bytes
     end = start + row_bytes - 1
     first = int(start.min()) // mmap.PAGESIZE * mmap.PAGESIZE
@@ -260,6 +320,16 @@ class _RowTable:
     def fill(self, local, buffers, at, jobs):
         """Puts rows local (unique, past the held prefix) into buffers at at: rows read earlier and still in the page
         cache are copied now; the rest are queued on jobs and returned."""
+        if local.size == 1:
+            row, position = int(local[0]), int(at[0])
+            seen = (int(self.seen[row >> 3]) >> (row & 7)) & 1
+            if seen and all(_in_core(field.map, local, field.row_bytes)[0] for field in self.fields):
+                for field, buffer in zip(self.fields, buffers):
+                    buffer[position] = field.map[row]
+                return local[:0]
+            for field, buffer in zip(self.fields, buffers):
+                jobs.append((field.fd, field.offset + row * field.row_bytes, memoryview(buffer[position])))
+            return local
         seen = (self.seen[local >> 3] >> (local & 7).astype(np.uint8)) & 1 == 1
         if seen.any():
             # Through the map an evicted row is a page fault taken with the GIL held; a check walks every page its rows
@@ -306,6 +376,10 @@ class DiskEmbedding(nn.Module):
         self.normalize_zero = normalize_zero
 
     def __call__(self, x):
+        fills = getattr(STAGED_FILLS, "fills", None)
+        if fills is not None and (staged := self._staged(x)) is not None:
+            fills.append(staged[1])
+            return staged[0]
         ids = np.asarray(x.astype(mx.int64)).reshape(-1)
         if ids.size and (ids.min() < 0 or ids.max() >= self._offsets[-1]):
             raise IndexError("embedding index is outside the table")
@@ -313,10 +387,61 @@ class DiskEmbedding(nn.Module):
         values = self._lookup(unique)
         if unique.size != ids.size or not np.array_equal(unique, ids):
             values = values[mx.array(inverse.reshape(-1).astype(np.int32))]
+        return self._shaped(values, x)
+
+    def _shaped(self, values, x):
         if self.normalize_zero:
             # The stock sharded embedding scatter-adds rows into zeros, turning -0.0 into +0.0; adding zeros reproduces that bit for bit.
             values = mx.zeros(values.shape, dtype = values.dtype) + values
         return values.reshape(*x.shape, self.dims)
+
+    def _staged(self, x):
+        """``(lookup, fill)``: the lookup of ``x``'s rows as lazy reads of staging memory, and the call that reads ``x``
+        and fills that memory, which must run before anything reading the lookup is evaluated. None for a lookup
+        too large to stage, or one some row of which is held in memory."""
+        tables, offsets = self._tables, self._offsets
+        fields = tables[0].fields
+        if (x.size > _STAGED_ROWS or any(table.resident for table in tables)
+                or any(f.apart is not None for table in tables for f in table.fields)
+                or any([f.row_bytes for f in table.fields] != [f.row_bytes for f in fields] for table in tables)):
+            return None
+        # A thread's own slots: their last reader is a graph on that thread's stream.
+        slots = _STAGING.__dict__.setdefault("slots", {})
+        key = (id(self), x.size, tuple(field.row_bytes for field in fields))
+        slot = slots.get(key)
+        if slot is not None and slot[3]:
+            return None  # its rows await the fill of a lookup built earlier
+        if slot is None:
+            slot = slots[key] = [[mx.zeros((x.size, field.row_bytes), dtype = mx.uint8) for field in fields], None, None, False]
+        slot[3] = True
+        try:
+            if slot[1] is None:
+                mx.eval(slot[0])
+                slot[1] = [np.asarray(array) for array in slot[0]]
+            if slot[2] is not None:
+                mx.eval(slot[2])  # the graph that read these rows last has run before they change
+            # Dequantizing writes its own buffer; a bare table's lookup would alias the rows the next fill overwrites.
+            rows = slot[0] if self.quantization is not None else [array + 0 for array in slot[0]]
+            slot[2] = values = self._dequantized([field.staged(array) for field, array in zip(fields, rows)])
+            staged_ids = _staged_ids(x)
+        except BaseException:
+            slot[3] = False
+            raise
+
+        def fill():
+            ids = np.asarray(staged_ids)
+            if ids.size and (ids.min() < 0 or ids.max() >= offsets[-1]):
+                raise IndexError("embedding index is outside the table")
+            shard = np.searchsorted(offsets, ids, side = "right") - 1
+            jobs = []
+            for position, (index, row) in enumerate(zip(shard.tolist(), (ids - offsets[shard]).tolist())):
+                for field, view in zip(tables[index].fields, slot[1]):
+                    jobs.append((field.fd, field.offset + row * field.row_bytes, memoryview(view[position])))
+            read_ranges(jobs)
+            slot[3] = False
+
+        fill.abandon = lambda: slot.__setitem__(3, False)
+        return self._shaped(values, x), fill
 
     def _lookup(self, unique):
         tables, offsets = self._tables, self._offsets
@@ -346,6 +471,9 @@ class DiskEmbedding(nn.Module):
         if np.any(positions[1:] < positions[:-1]):
             order = mx.array(np.argsort(positions, kind = "stable").astype(np.int32))
             columns = [column[order] for column in columns]
+        return self._dequantized(columns)
+
+    def _dequantized(self, columns):
         if self.quantization is None:
             return columns[0]
         group_size, bits, mode = self.quantization
@@ -532,10 +660,73 @@ def _deepseek_v4_step_mask(layer, arguments):
     return lambda h: create_attention_mask(h[:, :, 0, :], local, window_size = window, return_array = True)
 
 
+class _DeepseekV41Steps:
+    """V4.1 blocks share one cache only the model advances: each step sets its offset and replays the previous block's handoff."""
+
+    @staticmethod
+    def applies(cache):
+        # A batch cache's offset is its rows': runs whole.
+        return type(cache).__name__ == "DeepseekV41Cache"
+
+    def __init__(self, layer, cache):
+        self.cache, self.offset, self.layer = cache, cache.offset, layer.layer_idx
+        self.last = self.layer == cache.n_layers - 1
+        if self.layer == 0:
+            cache.unsloth_wide_steps = {}
+        self.records = cache.unsloth_wide_steps
+
+    def begin(self, start):
+        self.cache.offset = self.offset + start
+        for name, value in self.records.get(start, {}).items():
+            setattr(self.cache, name, value)
+
+    def end(self, start):
+        self.records[start] = {name: getattr(self.cache, name) for name in self.cache.HANDOFF}
+        return self.records[start]
+
+    def finish(self, done):
+        self.cache.offset = self.offset
+        if self.last or not done:
+            self.cache.__dict__.pop("unsloth_wide_steps", None)
+
+    @staticmethod
+    def _layer_lists(cache):
+        return [name for name, value in vars(cache).items() if isinstance(value, list) and len(value) == cache.n_layers]
+
+    @staticmethod
+    def _snapshot(cache, offset, lists):
+        snapshot = copy.copy(cache)
+        snapshot.__dict__.pop("unsloth_wide_steps", None)
+        snapshot.__dict__.update(lists, offset = offset)
+        if cache.engram is not None:  # the model hashes a whole call's tokens before its blocks run
+            snapshot.engram = cache.engram[:, :offset]
+        return snapshot
+
+    def capture(self, rows, copy_cache, captured):
+        # Copies: later steps write the cache's buffers in place. The last block files the chunked-prefill snapshot.
+        held = self.records.setdefault("captured", {})
+        held[self.layer] = {name: None if (value := getattr(self.cache, name)[self.layer]) is None else mx.contiguous(value)
+                            for name in self._layer_lists(self.cache)}
+        mx.eval(list(held[self.layer].values()))
+        if self.last:
+            lists = {name: [held[layer][name] for layer in range(self.cache.n_layers)] for name in held[self.layer]}
+            captured[id(self.cache)] = copy_cache(self._snapshot(self.cache, self.offset + rows, lists))
+
+    @classmethod
+    def capture_whole(cls, layer, cache, rows):
+        if not cls.applies(cache) or layer.layer_idx != cache.n_layers - 1:
+            return None
+        return cls._snapshot(cache, cache.offset + rows, {name: list(getattr(cache, name)) for name in cls._layer_lists(cache)})
+
+
 # Layers with calls wider than a prefill step may run as consecutive steps on their own cache; token axes of
 # token-indexed arguments; either its causal masks or a function (layer, arguments) giving the mask of each step from
-# hidden states (None if not causal); array if a cache asks for arrays.
+# hidden states (None if not causal); array if a cache asks for arrays; a class stepping state the layers share, if any.
 _WIDE_LAYERS = {
+    "mlx_vlm.models.deepseek_v41.language.DeepseekV41Block": (
+        {"h": 1, "pre_mix": 1, "image_mask": 1}, (None,), _DeepseekV41Steps),
+    "mlx_vlm.models.glm5_next.language.DecoderLayer": ({"x": 1, "prev_topk_indices": 1}, (None,)),
+    "mlx_vlm.models.minimax_m3_vl.language.MiniMaxDecoderLayer": ({"x": 1, "position_ids": -1}, ("causal",)),
     "mlx_vlm.models.qwen4_exp.language.Qwen4ExpDecoderLayer": (
         {"hidden_states": 1, "input_ids": 1, "position_ids": -1}, (None, "causal")),
     "mlx_vlm.models.deepseek_v4.language.DeepseekV4Block": ({"h": 1, "input_ids": 1}, _deepseek_v4_step_mask),
@@ -579,6 +770,8 @@ def _table_reader():
 
 
 _SCORE_DECAY, _SCORE_DECAY_EVERY = 0.7, 4
+# DeepSeek V4.1's decode reuses an expert over a longer span than the stock rule keeps: half-life of 16 calls.
+_SCORE_DECAYS = {"DeepseekV41SwitchGLU": (0.5 ** (1 / 16), 1)}
 # Pending outputs a slot table keeps before evaluating them (decode has evaluated them by then).
 _PENDING_READERS, _PENDING_BYTES = 8, 32 << 20
 
@@ -617,9 +810,10 @@ def _slot_projection(projection, arrays, full_experts):
 
 
 class _ExpertSlots:
-    """One layer's experts in capacity slots; a miss evicts the lowest decayed routing count (+1 per route, x0.7 every 4 calls) among experts the call does not use."""
+    """One layer's experts in capacity slots; a miss evicts the lowest decayed routing count (+1 per route, x``decay[0]``
+    every ``decay[1]`` calls) among experts the call does not use."""
 
-    def __init__(self, fields, experts, capacity):
+    def __init__(self, fields, experts, capacity, decay = (_SCORE_DECAY, _SCORE_DECAY_EVERY)):
         self.fields = fields  # [(projection, name, _Field)]
         self.capacity = capacity
         self.arrays = {
@@ -639,13 +833,14 @@ class _ExpertSlots:
         self.score = np.zeros(experts, dtype = np.float32)
         self.expert_bytes = sum(field.row_bytes for _, _, field in fields)
         self.calls = self.hits = self.misses = 0
+        self.decay = decay
 
     def ensure(self, routes, experts):
         """Make ``experts`` (unique, at most ``capacity``) resident; ``routes`` are the call's routes."""
         np.add.at(self.score, routes, 1.0)
         self.calls += 1
-        if self.calls % _SCORE_DECAY_EVERY == 0:
-            self.score *= _SCORE_DECAY
+        if self.calls % self.decay[1] == 0:
+            self.score *= self.decay[0]
         missing = experts[self.slot_of[experts] < 0]
         self.hits += experts.size - missing.size
         if not missing.size:
@@ -741,6 +936,7 @@ class OffloadSwitchGLU(nn.Module):
 
     def _routes(self, indices):
         object.__setattr__(self, "_spare", None)
+        read_staged()
         routes = np.asarray(indices).reshape(-1).astype(np.int64)
         return routes, np.unique(routes)
 
@@ -1053,13 +1249,14 @@ class _WideLayer:
             built = _cache_mask(cache, hidden.shape[1]) if hasattr(cache, "make_mask") else mask
             step_mask = None
             causal = (mask is None or isinstance(mask, str)) and mask in masks and not isinstance(built, mx.array) and mask == built
-        if cache is None or not causal:
+        if cache is None or not causal or self._wide_steps is not None and not self._wide_steps.applies(cache):
             return self._whole(hidden, args, kwargs)
         switch = self._offload_switch
         table = switch is not None and switch._wide(read_next = True)
         given = {name: bound.arguments.get(name) for name in axes}
         capture = getattr(_prefill_capture, "request", None)
-        outputs = []
+        shared = self._wide_steps(self, cache) if self._wide_steps is not None else None
+        outputs, done = [], False
         try:
             for start in range(0, hidden.shape[1], _PREFILL_STEP):
                 for name, axis in axes.items():
@@ -1067,14 +1264,24 @@ class _WideLayer:
                         bound.arguments[name] = _token_slice(given[name], axis, start, start + _PREFILL_STEP)
                 if step_mask is not None:
                     bound.arguments["mask"] = step_mask(bound.arguments[first])
+                if shared is not None:
+                    shared.begin(start)
                 output = super().__call__(*bound.args[1:], **bound.kwargs)
-                mx.eval(output, cache.state)
+                mx.eval(output, cache.state, shared.end(start) if shared is not None else ())
                 outputs.append(output)
                 if capture is not None and min(start + _PREFILL_STEP, hidden.shape[1]) == capture[0]:
-                    capture[2][id(cache)] = capture[1](cache)
+                    if shared is not None:
+                        shared.capture(capture[0], capture[1], capture[2])
+                    else:
+                        capture[2][id(cache)] = capture[1](cache)
+            done = True
         finally:
+            if shared is not None:
+                shared.finish(done)
             if table:
                 switch._narrow()
+        if isinstance(outputs[0], tuple):
+            return tuple(None if parts[0] is None else mx.concatenate(parts, axis = axes[first]) for parts in zip(*outputs))
         return mx.concatenate(outputs, axis = axes[first])
 
     def _whole(self, hidden, args, kwargs):
@@ -1084,7 +1291,10 @@ class _WideLayer:
             cache = self._wide_signature.bind(self, *args, **kwargs).arguments.get("cache")
             if cache is not None:
                 mx.eval(output, cache.state)
-                capture[2][id(cache)] = capture[1](cache)
+                if self._wide_steps is None:
+                    capture[2][id(cache)] = capture[1](cache)
+                elif (snapshot := self._wide_steps.capture_whole(self, cache, hidden.shape[1])) is not None:
+                    capture[2][id(cache)] = capture[1](snapshot)
         return output
 
 
@@ -1133,6 +1343,7 @@ def _widen_layers(model, switches):
         if base not in _WIDE_CLASSES:
             _WIDE_CLASSES[base] = type(base.__name__, (_WideLayer, base), {
                 "_wide_axes": spec[0], "_wide_masks": staticmethod(spec[1]) if callable(spec[1]) else spec[1], "_wide_signature": inspect.signature(base.__call__),
+                "_wide_steps": spec[2] if len(spec) > 2 else None,
             })
         layer.__class__ = _WIDE_CLASSES[base]
         object.__setattr__(layer, "_offload_switch", held[0] if held else None)
@@ -1274,7 +1485,7 @@ def offload_experts(model, model_dir, fraction, *, cast_dtype = None):
         if capacity >= experts:
             report["skipped"].append((path, f"{experts} experts fit in {capacity} slots"))
             continue
-        slots = _ExpertSlots(fields, experts, capacity)
+        slots = _ExpertSlots(fields, experts, capacity, _SCORE_DECAYS.get(type(glu).__name__, (_SCORE_DECAY, _SCORE_DECAY_EVERY)))
         stock = copy.copy(glu)
         for projection in _PROJECTIONS:
             arrays = {name: slots.arrays[p, name] for p, name, _ in fields if p == projection}
@@ -1405,11 +1616,15 @@ def _expert_overhead(inventory):
 def offload_footprint(inventory, ple, experts):
     """Memory the offloadable PLE tables and experts hold with ple / experts offloaded (None for off), working memory included; other weights are unchanged."""
     ple_bytes = inventory["ple_bytes"] if inventory["ple"] is None else 0
-    held = ple_bytes * (1 - (ple or 0)) + (_PLE_OVERHEAD if ple and ple_bytes else 0)
+    held = ple_bytes * (1 - (ple or 0))
+    working = _PLE_OVERHEAD if ple and ple_bytes else 0
     if experts and inventory["expert_bytes"]:
         kept = max(inventory["expert_floor_bytes"], inventory["expert_bytes"] * (1 - experts))
-        return held + kept + _expert_overhead(inventory)
-    return held + inventory["expert_bytes"]
+        working += _expert_overhead(inventory)
+        if ple and ple_bytes:
+            working -= _CACHE_CAP
+        return held + kept + working
+    return held + inventory["expert_bytes"] + working
 
 
 def context_bytes(model_dir, tokens, prefill_step = PREFILL_STEPS[0], dtype_bytes = 2):
@@ -1447,6 +1662,26 @@ def _largest_context(cost, limit, low, high):
     return low + lo * OFFLOAD_CONTEXT_STEP
 
 
+def _offload_room(budget, resident):
+    return min(budget - SAFETY_MARGIN[0], budget / (1 + SAFETY_MARGIN[1])) - resident
+
+
+def prefill_step_limit(*, budget, resident, inventory, context_cost, context, ple, experts):
+    """Largest fitting prefill width at fixed residency; widths beyond the context cannot add prompt rows."""
+    weights = resident + offload_footprint(inventory, ple, experts)
+    room = _offload_room(budget, weights)
+    if context_cost(context, 0) > room:
+        return None
+    low, high = 0, max(context, PREFILL_STEPS[-1])
+    while low < high:
+        middle = (low + high + 1) // 2
+        if context_cost(context, middle) <= room:
+            low = middle
+        else:
+            high = middle - 1
+    return low
+
+
 def plan_offload(
     *,
     budget,
@@ -1467,7 +1702,7 @@ def plan_offload(
     ple_bytes = inventory["ple_bytes"] if inventory["ple"] is None else 0
     expert_bytes, floor = inventory["expert_bytes"], inventory["expert_floor_bytes"]
     per_layer = inventory["experts_per_layer"]
-    room = min(budget - SAFETY_MARGIN[0], budget / (1 + SAFETY_MARGIN[1])) - resident
+    room = _offload_room(budget, resident)
     nothing = {"ple": None, "experts": None, "context": None, "prefill_step": None}
 
     def footprint(ple, experts):
@@ -1484,7 +1719,7 @@ def plan_offload(
         if not expert_auto:
             return None
         ple = ple_choices[-1]
-        keep = weights_room - footprint(ple, None) + expert_bytes - _expert_overhead(inventory)
+        keep = weights_room - footprint(ple, 1.0) + floor
         kept = min(per_layer, int(keep * per_layer // expert_bytes)) if keep > 0 else 0
         if kept * expert_bytes // per_layer < floor:
             return None

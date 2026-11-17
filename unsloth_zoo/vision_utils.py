@@ -544,7 +544,6 @@ def fetch_remote_media_to_file(url: str, timeout: int = 30) -> str:
         except OSError: pass
         raise
     return handle.name
-    raise ValueError(f"Unsloth: Too many redirects while fetching `{url}`")
 
 
 def round_by_factor(number: int, factor: int) -> int:
@@ -588,6 +587,16 @@ def smart_resize(
     return h_bar, w_bar
 
 
+def _refuse_network_share_image(path):
+    # Same rule as fetch_video: on Windows even os.path.isfile on a UNC path opens an SMB connection.
+    if isinstance(path, str) and _is_network_share(path) and not _allow_private_url_fetch():
+        raise ValueError(
+            f"Unsloth: Refusing an image path on a network share: `{path}`. "
+            f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to load images from shares you trust."
+        )
+    return path
+
+
 def _decode_image(image) -> Image.Image:
     # datasets Image(decode=False) rows are {"bytes": None, "path": <str>}; the path may be a URL.
     if isinstance(image, dict) and not image.get("bytes") and isinstance(image.get("path"), str):
@@ -601,13 +610,13 @@ def _decode_image(image) -> Image.Image:
         if image.startswith("http://") or image.startswith("https://"):
             image_obj = Image.open(fetch_remote_media_bytes(image))
         elif image.startswith("file://"):
-            image_obj = Image.open(resolve_file_uri_to_path(image))
+            image_obj = Image.open(_refuse_network_share_image(resolve_file_uri_to_path(image)))
         elif image.startswith("data:image"):
             if "base64," in image:
                 _, base64_data = image.split("base64,", 1)
                 data = base64.b64decode(base64_data)
                 image_obj = Image.open(BytesIO(data))
-        elif os.path.isfile(image):
+        elif os.path.isfile(_refuse_network_share_image(image)):
             image_obj = Image.open(image)
         else:
             # Bare base64, as transformers.image_utils.load_image accepts; else surface the missing path.
@@ -621,7 +630,7 @@ def _decode_image(image) -> Image.Image:
         if "bytes" in image and image["bytes"]:
             image_obj = Image.open(BytesIO(image["bytes"]))
         elif "path" in image and image["path"]:
-            image_obj = Image.open(image["path"])
+            image_obj = Image.open(_refuse_network_share_image(image["path"]))
         elif "url" in image and image["url"]:
             image_obj = Image.open(fetch_remote_media_bytes(image["url"]))
 
@@ -755,23 +764,26 @@ def _read_video_torchvision(
     Returns a (T, C, H, W) tensor and the sample fps.
     """
     video_path = resolve_file_uri_to_path(ele["video"])
-    if version.parse(torchvision.__version__) < version.parse("0.19.0"):
+    if HAS_TORCHVISION and version.parse(torchvision.__version__) < version.parse("0.19.0"):
         if "http://" in video_path or "https://" in video_path:
             warnings.warn("torchvision < 0.19.0 does not support http/https video path, please upgrade to 0.19.0.")
     st = time.time()
-    try:
-        video, audio, info = io.read_video(
-            video_path,
-            start_pts=ele.get("video_start", 0.0),
-            end_pts=ele.get("video_end", None),
-            pts_unit="sec",
-            output_format="TCHW",
-        )
-    except TypeError as exc:
-        # torchvision's read_video passes av.open(..., metadata_errors="ignore"), which PyAV 19
-        # removed, so every read fails before decoding. Decode the same range with PyAV directly.
-        if "metadata_errors" not in str(exc):
-            raise
+    info = None
+    if _torchvision_read_video() is not None:
+        try:
+            video, audio, info = io.read_video(
+                video_path,
+                start_pts=ele.get("video_start", 0.0),
+                end_pts=ele.get("video_end", None),
+                pts_unit="sec",
+                output_format="TCHW",
+            )
+        except TypeError as exc:
+            # PyAV 19 removed av.open(metadata_errors=...), which read_video passes.
+            if "metadata_errors" not in str(exc):
+                raise
+    if info is None:
+        # No torchvision, no io.read_video (e.g. torchvision 0.29), or PyAV 19.
         video, info = _read_video_pyav(
             video_path, ele.get("video_start", 0.0), ele.get("video_end", None),
             sample=lambda total_frames, video_fps: _sample_frame_indices(ele, total_frames, video_fps),
@@ -928,10 +940,111 @@ def _read_video_torchcodec(
     return video, sample_fps
 
 
+def _resize_video(video: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    if HAS_TORCHVISION:
+        return transforms.functional.resize(
+            video, [height, width], interpolation=InterpolationMode.BICUBIC, antialias=True,
+        )
+    # Bit-identical to torchvision's tensor resize: float bicubic + antialias, round, clamp.
+    out = torch.nn.functional.interpolate(
+        video.float(), size=(height, width), mode="bicubic", align_corners=False, antialias=True,
+    )
+    if not video.is_floating_point():
+        out = out.round_().clamp_(torch.iinfo(video.dtype).min, torch.iinfo(video.dtype).max)
+    return out.to(video.dtype)
+
+
+def _torchvision_read_video():
+    return getattr(io, "read_video", None) if HAS_TORCHVISION else None
+
+
+def _module_available(name: str) -> bool:
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _read_video_cv2(
+    ele: dict,
+) -> tuple[torch.Tensor, float]:
+    """(T, C, H, W) uint8 frames + sample fps via OpenCV, which mlx-vlm depends on (Apple Silicon has no other decoder)."""
+    import cv2
+
+    video_path = resolve_file_uri_to_path(ele["video"])
+    st = time.time()
+
+    def _count_frames():
+        cap = cv2.VideoCapture(video_path)
+        try:
+            n = 0
+            while cap.grab():
+                n += 1
+            return n
+        finally:
+            cap.release()
+
+    def _decode(expected_total):
+        cap = cv2.VideoCapture(video_path)
+        try:
+            if not cap.isOpened():
+                raise ValueError(f"Unsloth: OpenCV could not open video `{video_path}`.")
+            video_fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            total = expected_total or int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if total <= 0:
+                # Streams without an index report 0 (or -1): count by decoding.
+                total = _count_frames()
+            try:
+                start_frame, end_frame, span = calculate_video_frame_range(ele, total, video_fps)
+                nframes = smart_nframes(ele, total_frames=span, video_fps=video_fps)
+            except ValueError:
+                # The request may only be invalid against the container's estimate: recount once, then judge.
+                counted = _count_frames() if expected_total is None else total
+                if counted == total:
+                    raise
+                return _decode(counted)
+            idx = torch.linspace(start_frame, end_frame, nframes).round().long().tolist()
+            wanted = {}
+            for i in idx:
+                wanted[i] = wanted.get(i, 0) + 1
+            frames, seen = [], 0
+            while seen <= idx[-1] and cap.grab():
+                if seen in wanted:
+                    ok, frame = cap.retrieve()
+                    if not ok:
+                        break
+                    frames.extend([cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)] * wanted[seen])
+                seen += 1
+            if expected_total is None and seen == total and cap.grab():
+                # The container under-reported its length: count the rest so the caller resamples the whole clip.
+                seen += 1
+                while cap.grab():
+                    seen += 1
+                return [], len(idx), seen, span, nframes, video_fps
+            return frames, len(idx), seen, span, nframes, video_fps
+        finally:
+            cap.release()
+
+    frames, want, seen, span, nframes, video_fps = _decode(None)
+    if len(frames) < want and seen > 0:
+        # CAP_PROP_FRAME_COUNT is a container estimate; resample on the frames that decoded.
+        frames, want, seen, span, nframes, video_fps = _decode(seen)
+    if len(frames) < want:
+        raise ValueError(f"Unsloth: OpenCV decoded {len(frames)} of {want} frames from `{video_path}`.")
+    video = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).contiguous()
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(f"Unsloth: cv2:  {video_path=}, {span=}, {video_fps=}, time={time.time() - st:.3f}s")
+    return video, nframes / max(span, 1e-6) * video_fps
+
+
 VIDEO_READER_BACKENDS = {
     "decord": _read_video_decord,
     "torchvision": _read_video_torchvision,
     "torchcodec": _read_video_torchcodec,
+    "pyav": _read_video_torchvision,
+    "cv2": _read_video_cv2,
 }
 
 FORCE_UNSLOTH_VIDEO_READER = os.getenv("FORCE_UNSLOTH_VIDEO_READER", None)
@@ -945,10 +1058,17 @@ def get_video_reader_backend() -> str:
         video_reader_backend = "decord"
     elif is_torchcodec_available():
         video_reader_backend = "torchcodec"
+    elif _torchvision_read_video() is not None and (_module_available("av") or not _module_available("cv2")):
+        # read_video decodes through PyAV.
+        video_reader_backend = "torchvision"
+    elif _module_available("av"):
+        video_reader_backend = "pyav"
+    elif _module_available("cv2"):
+        video_reader_backend = "cv2"
     elif HAS_TORCHVISION:
         video_reader_backend = "torchvision"
     else:
-        raise ValueError("Unsloth: No video reader backend available, please install decord or torchvision or torchcodec to process video inputs.")
+        raise ValueError("Unsloth: No video reader backend available, please install decord, torchcodec, torchvision, av or opencv-python to process video inputs.")
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: unsloth_zoo/vision_utils using {video_reader_backend} to read video.")
     return video_reader_backend
@@ -1016,7 +1136,11 @@ def _data_uri_head(source: str) -> bytes:
     from urllib.parse import unquote_to_bytes
 
     header, _, payload = source.partition(",")
-    if header.lower().endswith(";base64"):
+    # As FFmpeg's data_uri.c: any parameter that case-insensitively prefixes "base64" selects base64.
+    params = header.split(";")[1:]
+    if params and params[-1] == "":
+        params.pop()  # a trailing ';' ends the loop before an empty parameter
+    if any("base64".startswith(p.lower()) for p in params):
         chunk = re.sub(r"\s", "", payload[:256])
         try:
             return base64.b64decode(chunk[: len(chunk) // 4 * 4], validate = False)
@@ -1054,10 +1178,19 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample
                 f"Unsloth: Refusing a video path on a network share: `{source}`. "
                 f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to load videos from shares you trust."
             )
+        else:
+            # A local playlist makes ffmpeg open its entries itself (file://host/share included), as a downloaded one would.
+            local_path = resolve_file_uri_to_path(source)
+            if os.path.isfile(local_path):
+                _refuse_playlist(local_path, source)
         try:
             try:
                 video, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)
             except Exception as e:
+                if video_reader_backend in ("torchvision", "pyav") or not (
+                    _torchvision_read_video() is not None or _module_available("av")
+                ):
+                    raise
                 if UNSLOTH_ENABLE_LOGGING:
                     logger.warning(f"Unsloth: video_reader_backend {video_reader_backend} error, use torchvision as default, msg: {e}")
                 video, sample_fps = VIDEO_READER_BACKENDS["torchvision"](ele)
@@ -1092,12 +1225,7 @@ def fetch_video(ele: dict, image_factor: int = IMAGE_FACTOR, return_video_sample
                 min_pixels=min_pixels,
                 max_pixels=max_pixels,
             )
-        video = transforms.functional.resize(
-            video,
-            [resized_height, resized_width],
-            interpolation=InterpolationMode.BICUBIC,
-            antialias=True,
-        )
+        video = _resize_video(video, resized_height, resized_width)
         if return_video_sample_fps:
             return video, sample_fps
         return video

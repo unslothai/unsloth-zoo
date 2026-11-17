@@ -33,6 +33,8 @@ _NOT_LAUNCHES = {
     "temporary_patches/gpt_oss.py": {"self.gate_up_projs", "self.down_projs"},
     "temporary_patches/moe_grouped_modulelist.py": {"spec"},
     "temporary_patches/moe_utils.py": {"registry"},
+    # forward_moe_backend globals looked up by name, not kernels.
+    "temporary_patches/deepseek_v41.py": {"backend"},
     # Custom ops out of the pinned-op tuple, and a weakref read out of a cache entry.
     "temporary_patches/moe_utils_sonic.py": {"_pinned_ops()", "hit"},
 }
@@ -40,6 +42,9 @@ _NOT_LAUNCHES = {
 _DELIBERATE_FALSE = {
     "merged_rollout_exact.py:_exact_merge_kernel",
     "temporary_patches/gpt_oss_grouped_qlora.py:_nf4_dequant_stack_kernel",
+    "temporary_patches/gpt_oss_fused_glue.py:_gate_up_fwd_kernel",
+    "temporary_patches/gpt_oss_fused_glue.py:_gate_up_bwd_kernel",
+    "temporary_patches/gpt_oss_fused_glue.py:_down_fwd_kernel",
     "temporary_patches/moe_routed.py:_nf4_select_dequant_kernel",
     "temporary_patches/moe_nf4_grouped.py:_nf4_grouped_kernel",
     "temporary_patches/moe_nf4_grouped.py:_nf4_grouped_kernel.fn",
@@ -79,12 +84,21 @@ def _kwargs_dicts(tree):
             if isinstance(node, ast.Call):
                 splats = [k.value.id for k in node.keywords if k.arg is None and isinstance(k.value, ast.Name)]
                 values = [dicts[n] for n in splats if n in dicts]
-                out[id(node)] = [
-                    branch
-                    for value in values
-                    for branch in ((value.body, value.orelse) if isinstance(value, ast.IfExp) else (value,))
-                ]
+                out[id(node)] = [branch for value in values for branch in _compiled_branches(value)]
     return out
+
+
+def _compiled_branches(value):
+    """`a if cond else b`: both branches, except the one taken only under TRITON_INTERPRET."""
+    if not isinstance(value, ast.IfExp):
+        return (value,)
+    test = value.test
+    negated = isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not)
+    if negated:
+        test = test.operand
+    if isinstance(test, ast.Name) and "INTERPRET" in test.id:
+        return (value.body,) if negated else (value.orelse,)
+    return (value.body, value.orelse)
 
 
 def _fp_fusion_values(node, splatted):
@@ -226,11 +240,37 @@ def test_every_launch_states_fp_fusion():
             missing.append(f"{rel}:{node.lineno}:{name}")
             continue
         want = f"{rel}:{name}" not in _DELIBERATE_FALSE
-        if not (isinstance(values[0], ast.Constant) and values[0].value is want):
+        if not all(isinstance(v, ast.Constant) and v.value is want for v in values):
             wrong.append(f"{rel}:{node.lineno}:{name} expected {want}")
     assert not missing, f"Triton launches without enable_fp_fusion: {missing}"
     assert not wrong, wrong
 
+
+@pytest.mark.parametrize("mutation, rejected", [
+    # The first branch states the right value: a guard reading only values[0] passed this vacuously.
+    ('{"enable_fp_fusion": False} if _INTERPRET else {"enable_fp_fusion": True}', True),
+    ('{"enable_fp_fusion": True} if not _INTERPRET else {"enable_fp_fusion": False}', True),
+    # Negative control: only the interpreter-only branch differs.
+    ('{"enable_fp_fusion": False} if not _INTERPRET else {"enable_fp_fusion": True}', False),
+])
+def test_guard_checks_every_compiled_branch(mutation, rejected, monkeypatch):
+    original = '_NO_FMA = {} if _INTERPRET else {"enable_fp_fusion": False}'
+    real = list(_module_trees())
+
+    def mutated():
+        for rel, src, tree in real:
+            if rel == "gpt_oss_decode_fused.py":
+                assert original in src
+                src = src.replace(original, "_NO_FMA = " + mutation)
+                tree = ast.parse(src)
+            yield rel, src, tree
+
+    monkeypatch.setattr(sys.modules[__name__], "_module_trees", mutated)
+    if rejected:
+        with pytest.raises(AssertionError, match = "_add_rms_norm_kernel"):
+            test_every_launch_states_fp_fusion()
+    else:
+        test_every_launch_states_fp_fusion()
 
 
 def _compiled_options(kernel):

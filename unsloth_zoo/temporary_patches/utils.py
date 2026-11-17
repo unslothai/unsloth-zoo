@@ -1146,6 +1146,59 @@ def _is_recompile_limit_unsupported(exc):
             or "recompile_limit reached" in text)
 
 
+# torch >= 2.14 raises this when every frame of a fullgraph region was skipped; the skip sticks to the code object.
+_NO_COMPILED_FRAMES_SIGNATURE = ("fullgraph=True", "found no compiled frames")
+
+
+def _is_no_compiled_frames_error(exc):
+    if not isinstance(exc, RuntimeError):
+        return False
+    try:
+        text = str(exc)
+    except Exception:
+        return False
+    return all(part in text for part in _NO_COMPILED_FRAMES_SIGNATURE)
+
+
+_SKIP_HOOKS = None
+
+
+def _resolve_skip_hooks():
+    global _SKIP_HOOKS
+    try:
+        from torch._dynamo import eval_frame as eval_frame_py
+        hooks = (
+            getattr(getattr(getattr(torch._C, "_dynamo", None), "eval_frame", None),
+                    "set_fullgraph_compiled_frame_count", None),
+            getattr(eval_frame_py, "get_skip_reasons", None),
+            getattr(eval_frame_py, "reset_skip_reasons", None),
+        )
+    except Exception:
+        hooks = (None,)
+    _SKIP_HOOKS = hooks if all(h is not None for h in hooks) else False
+    return _SKIP_HOOKS
+
+
+def _call_noting_skipped_frames(fn, args, kwargs):
+    # torch >= 2.14 checks the frame count only when unset on entry and raises after the body ran; presetting it
+    # keeps the body's single run (stateful forwards, checkpoint packs must not run twice).
+    hooks = _SKIP_HOOKS or _resolve_skip_hooks()
+    if hooks is False:
+        return fn(*args, **kwargs), False
+    set_count, get_reasons, reset_reasons = hooks
+    previous = set_count(0)
+    if previous >= 0:
+        set_count(previous)
+        return fn(*args, **kwargs), False
+    reset_reasons()
+    try:
+        result = fn(*args, **kwargs)
+    finally:
+        compiled = set_count(previous)
+    # A skipped outer frame can still have compiled children: only a zero count means the body ran fully eager.
+    return result, compiled == 0 and bool(get_reasons())
+
+
 # Complete set of Dynamo refusal texts for a disabled callable (only the _torchdynamo_disable branch emits them); torch
 # 2.4-2.6 and 2.7+ wordings both kept since pyproject allows torch>=2.4.
 _DISABLED_HOOK_SIGNATURES = (
@@ -1413,8 +1466,9 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
 
         FailOnRecompileLimitHit: recompile_limit reached with fullgraph=True
 
-    Only cache exhaustion and our own disabled-hook graph break are caught, so
-    any other graph break under fullgraph still raises exactly as before.
+    Only cache exhaustion, our own disabled-hook graph break, Inductor codegen
+    refusals and torch >= 2.14's "found no compiled frames" are caught, so any
+    other graph break under fullgraph still raises exactly as before.
 
     The fallback LATCHES. Do not make it retry per call. Non-reentrant
     activation checkpointing recomputes each packed forward during backward and
@@ -1508,7 +1562,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         # Declines while any other wrapper still relies on the headroom.
         _restore_recompile_limits_if_idle()
 
-    def _retry_with_more_budget(args, kwargs):
+    def _retry_with_more_budget(args, kwargs, marker_before = None):
         """Finish THIS call the way it started, if we can.
 
         Switching to eager here is what breaks non-reentrant activation
@@ -1525,7 +1579,9 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             return _NO_RESULT
         state["bumps"] += 1
         try:
-            result = compiled_func(*args, **kwargs)
+            result, skipped = _call_noting_skipped_frames(compiled_func, args, kwargs)
+            if skipped:
+                return _EagerFallbackTaken(_keep_skipped_result(result, marker_before))
         except errors:
             # Keep the bump: the caller latches all borrowers to eager, and that hand-back restores the budgets.
             return _NO_RESULT
@@ -1690,6 +1746,53 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         finally:
             del e  # same cycle as in _give_up_at_compile_time
 
+    def _keep_skipped_result(result, marker_before):
+        # A region that packed compiled in this checkpointed step must end it: its pack would be recomputed eagerly.
+        global _PACKED_COMPILED_IN_CHECKPOINT, _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
+        packed = (
+            (_in_non_reentrant_checkpoint() or _PACKED_COMPILED_IN_CHECKPOINT)
+            and label in _COMPILED_OK_LABELS
+        )
+        _PACKED_COMPILED_IN_CHECKPOINT = marker_before if marker_before is not None else _PACKED_COMPILED_IN_CHECKPOINT
+        state["eager"] = True
+        _LATCHED_EAGER_LABELS.add(label)
+        _RECENT_EAGER_LABELS.add(label)
+        _warn(
+            f"Unsloth: torch.compile skipped every frame of {label}; "
+            f"running it eagerly from here. Training is unaffected apart "
+            f"from speed."
+        )
+        if packed:
+            _RAISED_INSIDE_CHECKPOINT = True
+            _CHECKPOINT_SETTLE_ATTEMPTS = 0
+            raise RuntimeError(
+                f"Unsloth: torch.compile skipped every frame of {label} after it ran compiled in this checkpointed "
+                f"step; ending the step so it reruns eagerly."
+            )
+        return result
+
+    def _give_up_on_skipped_frames(e, args, kwargs, marker_before):
+        # torch already ran the body once; inside a checkpoint a rerun would pack a second set, so end the step.
+        global _PACKED_COMPILED_IN_CHECKPOINT, _RAISED_INSIDE_CHECKPOINT, _CHECKPOINT_SETTLE_ATTEMPTS
+        warning = (
+            f"Unsloth: torch.compile skipped every frame of {label}; "
+            f"running it eagerly from here. Training is unaffected apart "
+            f"from speed."
+        )
+        try:
+            if not _in_non_reentrant_checkpoint():
+                return _give_up_at_compile_time(e, args, kwargs, marker_before, warning)
+            _PACKED_COMPILED_IN_CHECKPOINT = marker_before
+            state["eager"] = True
+            _LATCHED_EAGER_LABELS.add(label)
+            _RECENT_EAGER_LABELS.add(label)
+            _warn(warning)
+            _RAISED_INSIDE_CHECKPOINT = True
+            _CHECKPOINT_SETTLE_ATTEMPTS = 0
+            raise e
+        finally:
+            del e  # same cycle as in _give_up_at_compile_time
+
     def _is_backend_refusal_we_handle(e):
         """The gate the wrapper's own backend arm applies, in one place."""
         if _wants_hard_backend_failure():
@@ -1714,12 +1817,17 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         release here.
         """
         try:
-            return _retry_with_more_budget(args, kwargs)
+            return _retry_with_more_budget(args, kwargs, marker_before)
         except backend_errors as e:
             if not _is_backend_refusal_we_handle(e):
                 raise
             return _EagerFallbackTaken(
                 _give_up_on_backend(e, args, kwargs, marker_before))
+        except RuntimeError as e:
+            if not _is_no_compiled_frames_error(e):
+                raise
+            return _EagerFallbackTaken(
+                _give_up_on_skipped_frames(e, args, kwargs, marker_before))
 
     def _note_compiled_ok():
         """Record that this label packed something COMPILED in this step.
@@ -1814,7 +1922,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         marker_before = _PACKED_COMPILED_IN_CHECKPOINT
         try:
             _note_packed_under_checkpoint()
-            result = compiled_func(*args, **kwargs)
+            result, skipped = _call_noting_skipped_frames(compiled_func, args, kwargs)
         except backend_errors as e:
             # Ordered before the recompile-limit clause: the classes are disjoint, but a backend refusal is never a budget problem and must not consume budget.
             if not _is_backend_refusal_we_handle(e):
@@ -1860,7 +1968,14 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             if not _is_our_own_disabled_hook(e):
                 raise
             return _give_up_on_disabled_hook(e, args, kwargs, marker_before)
+        except RuntimeError as e:
+            # Must stay last: Dynamo's typed errors subclass RuntimeError.
+            if not _is_no_compiled_frames_error(e):
+                raise
+            return _give_up_on_skipped_frames(e, args, kwargs, marker_before)
         else:
+            if skipped:
+                return _keep_skipped_result(result, marker_before)
             # A returned compiled call marks its checkpoint packs compiled; _give_up_on_backend reads this.
             _note_compiled_ok()
             return result
