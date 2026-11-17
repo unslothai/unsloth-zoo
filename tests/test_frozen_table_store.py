@@ -447,6 +447,25 @@ def test_lookup_compiles_fullgraph_without_recompiles(bf16_table):
         assert torch.equal(fn(ids, torch.ones(2, n, 20)), F.embedding(ids, full.float()))
 
 
+def test_lookup_cast_after_compile_recompiles_with_the_new_dtype(bf16_table):
+    # The table owns no tensor, so only the op's own arguments can tell a compiled graph its dtype changed.
+    from torch._dynamo.testing import CompileCounterWithBackend
+    index, names, full = bf16_table
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk"))
+    torch._dynamo.reset()
+    counter = CompileCounterWithBackend("inductor")
+    fn = torch.compile(lambda ids: emb(ids) * 1.5, fullgraph=True, backend=counter, dynamic=True)
+    ids = torch.randint(0, full.shape[0], (2, 7))
+    torch.testing.assert_close(fn(ids), F.embedding(ids, full.float()) * 1.5)
+    emb.double()
+    out = fn(ids)
+    assert out.dtype == torch.float64
+    torch.testing.assert_close(out, F.embedding(ids, full.double()) * 1.5)
+    assert counter.frame_count == 2
+    torch._dynamo.reset()
+
+
 def test_direct_bind_checks_the_row_shape(bf16_table):
     index, names, full = bf16_table
     emb = UnslothFrozenTableEmbedding(full.shape[0], 7, dtype=torch.float32)
@@ -512,7 +531,7 @@ def test_lookup_op_is_tagged_cudagraph_unsafe():
     tag = getattr(torch._C.Tag, "cudagraph_unsafe", None)
     if tag is None or fts._LOOKUP_OP is None:
         pytest.skip("torch without the cudagraph_unsafe tag or custom_op")
-    assert tag in torch.ops.unsloth_zoo.frozen_table_lookup.default.tags
+    assert tag in torch.ops.unsloth_zoo.frozen_table_lookup_v2.default.tags
 
 
 def test_exported_tensors_outlive_the_store(bf16_table):
@@ -1225,3 +1244,28 @@ def test_load_hook_keeps_the_markers_of_patches_below_it(monkeypatch, kind):
     hooked = PreTrainedModel.__dict__["_load_pretrained_model"].__func__
     assert hooked._unsloth_frozen_table_hook and hooked.__wrapped__ is _load_pretrained_model
     assert getattr(hooked, "_some_patch_marker", False)
+
+
+def test_lookup_op_registers_where_schema_inference_needs_real_types(monkeypatch):
+    # torch 2.4 infer_schema rejects string annotations ('torch.Tensor'); the op must still register there
+    import unsloth_zoo.frozen_table_store as fts
+
+    seen = []
+
+    def strict_custom_op(name, mutates_args = (), **kwargs):
+        def wrap(fn):
+            if any(isinstance(v, str) for v in fn.__annotations__.values()):
+                raise ValueError(f"Parameter has unsupported type annotation: {fn.__annotations__}")
+            seen.append(fn.__annotations__)
+
+            class _Op:
+                def register_fake(self, fake):
+                    return fake
+
+            return _Op()
+
+        return wrap
+
+    monkeypatch.setattr(torch.library, "custom_op", strict_custom_op)
+    assert fts._make_lookup_op() is not None
+    assert seen and seen[0]["ids"] is torch.Tensor
