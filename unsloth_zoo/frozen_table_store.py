@@ -1079,7 +1079,8 @@ def _make_lookup_op():
     tag = getattr(torch._C.Tag, "cudagraph_unsafe", None)
     for kwargs in ([dict(tags=(tag,))] if tag is not None else []) + [dict()]:
         try:
-            op = custom_op("unsloth_zoo::frozen_table_lookup", mutates_args=(), **kwargs)(lookup)
+            # _v2: the schema gained dtype; a graph cached against the two-argument op must not bind to it
+            op = custom_op("unsloth_zoo::frozen_table_lookup_v2", mutates_args=(), **kwargs)(lookup)
             op.register_fake(fake)
             return op
         except TypeError:

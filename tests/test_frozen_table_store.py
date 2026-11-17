@@ -531,7 +531,7 @@ def test_lookup_op_is_tagged_cudagraph_unsafe():
     tag = getattr(torch._C.Tag, "cudagraph_unsafe", None)
     if tag is None or fts._LOOKUP_OP is None:
         pytest.skip("torch without the cudagraph_unsafe tag or custom_op")
-    assert tag in torch.ops.unsloth_zoo.frozen_table_lookup.default.tags
+    assert tag in torch.ops.unsloth_zoo.frozen_table_lookup_v2.default.tags
 
 
 def test_exported_tensors_outlive_the_store(bf16_table):
