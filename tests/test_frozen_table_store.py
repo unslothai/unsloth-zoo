@@ -447,6 +447,25 @@ def test_lookup_compiles_fullgraph_without_recompiles(bf16_table):
         assert torch.equal(fn(ids, torch.ones(2, n, 20)), F.embedding(ids, full.float()))
 
 
+def test_lookup_cast_after_compile_recompiles_with_the_new_dtype(bf16_table):
+    # The table owns no tensor, so only the op's own arguments can tell a compiled graph its dtype changed.
+    from torch._dynamo.testing import CompileCounterWithBackend
+    index, names, full = bf16_table
+    emb = UnslothFrozenTableEmbedding(full.shape[0], 20, dtype=torch.float32)
+    emb.bind(FrozenTableStore.from_checkpoint(index, {"weight": names}, mode="disk"))
+    torch._dynamo.reset()
+    counter = CompileCounterWithBackend("inductor")
+    fn = torch.compile(lambda ids: emb(ids) * 1.5, fullgraph=True, backend=counter, dynamic=True)
+    ids = torch.randint(0, full.shape[0], (2, 7))
+    torch.testing.assert_close(fn(ids), F.embedding(ids, full.float()) * 1.5)
+    emb.double()
+    out = fn(ids)
+    assert out.dtype == torch.float64
+    torch.testing.assert_close(out, F.embedding(ids, full.double()) * 1.5)
+    assert counter.frame_count == 2
+    torch._dynamo.reset()
+
+
 def test_direct_bind_checks_the_row_shape(bf16_table):
     index, names, full = bf16_table
     emb = UnslothFrozenTableEmbedding(full.shape[0], 7, dtype=torch.float32)

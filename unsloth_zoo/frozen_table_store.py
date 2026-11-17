@@ -990,7 +990,9 @@ class UnslothFrozenTableEmbedding(nn.Module):
         # One opaque op: torch.compile (and block compile) sees a lookup of known shape and dtype, not the host-side
         # unique / page-in / copy, so the caller's graph neither breaks nor recompiles on it.
         if _LOOKUP_OP is not None:
-            return _LOOKUP_OP(ids, self._handle)
+            # The dtype is an argument, not state the fake reads: a cast after compile (.double(), .half()) then
+            # fails the graph's guard and recompiles, instead of a stale graph reading the new rows as the old dtype.
+            return _LOOKUP_OP(ids, self._handle, self.table_dtype)
         return self._lookup(ids)
 
     def _lookup(self, ids: torch.Tensor) -> torch.Tensor:
@@ -1062,16 +1064,16 @@ def _make_lookup_op():
     if custom_op is None:
         return None
 
-    def lookup(ids: torch.Tensor, handle: int) -> torch.Tensor:
+    def lookup(ids: torch.Tensor, handle: int, dtype: torch.dtype) -> torch.Tensor:
         # A fresh tensor: a custom op's output must not be one it handed out before (the memo's rows).
-        return _module_for(handle)._lookup(ids).clone()
+        return _module_for(handle)._lookup(ids).to(dtype, copy=True)
 
     # This module defers annotations (strings); torch 2.4 / 2.6 infer_schema needs the real types.
-    lookup.__annotations__ = {"ids": torch.Tensor, "handle": int, "return": torch.Tensor}
+    lookup.__annotations__ = {"ids": torch.Tensor, "handle": int, "dtype": torch.dtype, "return": torch.Tensor}
 
-    def fake(ids, handle):
+    def fake(ids, handle, dtype):
         m = _module_for(handle)
-        return ids.new_empty((*ids.shape, *m.row_shape), dtype=m.table_dtype)
+        return ids.new_empty((*ids.shape, *m.row_shape), dtype=dtype)
 
     # cudagraph_unsafe: host-backed lookups copy ids to the host, which cannot be captured. torch < 2.8 has no tags.
     tag = getattr(torch._C.Tag, "cudagraph_unsafe", None)
