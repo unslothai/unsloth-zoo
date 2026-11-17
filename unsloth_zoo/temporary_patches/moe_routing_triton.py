@@ -236,9 +236,11 @@ def _disable(exc):
     )
 
 
-def _is_capturing():
+def _is_capturing(device):
+    # Capture state is per device: query the operand's card, not the current one.
     try:
-        return torch.cuda.is_current_stream_capturing()
+        with torch.cuda.device(device):
+            return torch.cuda.is_current_stream_capturing()
     except Exception:
         return False
 
@@ -282,7 +284,7 @@ def _routing_impl(top_k_index, num_experts):
         try:
             if key in _VERIFIED:
                 result = _launch(top_k_index, num_experts)
-            elif _is_capturing():
+            elif _is_capturing(top_k_index.device):
                 result = None   # cannot verify inside a capture: record the torch path this time
             else:
                 result, ref = _verified_launch(top_k_index, num_experts, key)

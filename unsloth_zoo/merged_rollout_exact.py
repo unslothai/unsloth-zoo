@@ -144,6 +144,7 @@ if triton is not None:
         pid_n = tl.program_id(0)
         pid_k = tl.program_id(1)
         e = tl.program_id(2)
+        e64 = e.to(tl.int64)  # e * sWe passes 2**31 on a stacked expert weight of 2**31+ elements
         g = tile0 + (e * tl.num_programs(0) + pid_n) * tl.num_programs(1) + pid_k
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         rk = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -153,12 +154,12 @@ if triton is not None:
 
         acc = tl.zeros((BLOCK_N, BLOCK_K), dtype = tl.float32)
         for j in tl.static_range(R):
-            b = tl.load(B + e * sBe + rn * sBn + j * sBr, mask = mn, other = 0.0).to(tl.float32)
-            a = tl.load(A + e * sAe + j * sAr + rk * sAk, mask = mk, other = 0.0).to(tl.float32)
+            b = tl.load(B + e64 * sBe + rn * sBn + j * sBr, mask = mn, other = 0.0).to(tl.float32)
+            a = tl.load(A + e64 * sAe + j * sAr + rk * sAk, mask = mk, other = 0.0).to(tl.float32)
             acc = tl.fma(b[:, None], a[None, :], acc)
         d = acc * scale
 
-        ptrs = W + e * sWe + rn[:, None] * sWn + rk[None, :] * sWk
+        ptrs = W + e64 * sWe + rn[:, None] * sWn + rk[None, :] * sWk
         w = tl.load(ptrs, mask = mask, other = 0.0)
         # Each mode lives in its own helper: a runtime branch must not leave differently typed names behind.
         if mode == 2:
