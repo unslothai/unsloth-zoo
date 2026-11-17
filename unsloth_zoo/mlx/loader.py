@@ -9517,8 +9517,9 @@ class FastMLXModel:
                 "Install via: pip install unsloth-zoo[mlx]"
             )
 
-        from .utils import apply_gather_qmm_nax_guard
+        from .utils import apply_gather_qmm_nax_guard, apply_gelu_approx_finite_grad
         apply_gather_qmm_nax_guard()
+        apply_gelu_approx_finite_grad()
 
         chat_template = kwargs.pop("chat_template", None)
         patch_mode = normalize_mlx_patch_mode(kwargs.pop("patch_mode", patch_mode))
