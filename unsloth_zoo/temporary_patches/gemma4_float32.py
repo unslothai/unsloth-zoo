@@ -445,7 +445,6 @@ def _patch_gemma4_text_attention(module, prefix):
     # and PV in float32 internally. Without bf16 (T4) the float32 mem-efficient kernel dominates the step
     # (Gemma-4-E2B 4-bit LoRA on T4, packed 4 x 1024: 578 -> 744 tok/s). Kill switch: UNSLOTH_GEMMA4_FP16_SDPA=0.
     fp16_sdpa = os.environ.get("UNSLOTH_GEMMA4_FP16_SDPA", "1") != "0"
-    _fp16_min = torch.finfo(torch.float16).min
 
     def forward(
         self,
@@ -568,7 +567,9 @@ def _patch_gemma4_text_attention(module, prefix):
             if isinstance(attn_mask, torch.Tensor) and attn_mask.dtype != torch.bool:
                 attn_mask = attn_mask.to(torch.float32)
                 if sdpa_dtype is torch.float16:
-                    attn_mask = attn_mask.clamp(min = _fp16_min).to(torch.float16)
+                    # No clamp: masked entries (-inf or float32 min) must stay -inf in float16, else a fully
+                    # masked row turns finite and attends over its masked keys instead of returning zeros.
+                    attn_mask = attn_mask.to(torch.float16)
             if sdpa_dtype is torch.float16:
                 query_states = query_states.to(torch.float16)
                 key_states = key_states.to(torch.float16)

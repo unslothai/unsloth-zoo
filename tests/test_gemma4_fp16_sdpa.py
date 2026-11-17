@@ -103,3 +103,45 @@ def test_bfloat16_attention_is_not_patched(gemma4, monkeypatch):
     attention = _attention(gemma4, 1, torch.bfloat16)
     _run(gemma4, attention, torch.randn(1, S, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True), 1, None)
     assert seen and set(seen) == {torch.bfloat16}
+
+
+_MASKED_ROWS = [0, 5, 30]
+
+
+def _mask_with_empty_rows(kind):
+    allowed = torch.ones(S, S, dtype=torch.bool).tril()
+    allowed[_MASKED_ROWS] = False  # fully masked query rows
+    if kind == "bool":
+        return allowed[None, None].cuda()
+    fill = float("-inf") if kind == "-inf" else torch.finfo(torch.float32).min
+    return torch.zeros(1, 1, S, S).masked_fill(~allowed, fill).cuda()
+
+
+@pytest.mark.parametrize("layer", [0, 1])
+def test_fully_masked_rows_agree_across_mask_types_and_the_float32_path(gemma4, monkeypatch, layer):
+    gemma4, original = gemma4
+    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
+    angles = torch.randn(1, S, HEAD_DIM, generator=torch.Generator().manual_seed(1))
+    position_embeddings = angles.cos().cuda(), angles.sin().cuda()
+    inputs = torch.randn(1, S, HIDDEN, device="cuda", dtype=torch.float16)
+    results = {}
+    for flag in ("0", "1"):
+        monkeypatch.setenv("UNSLOTH_GEMMA4_FP16_SDPA", flag)
+        gemma4.Gemma4TextAttention.forward = original
+        patches.patch_Gemma4TextAttention()
+        attention = _attention(gemma4, layer, torch.float16)
+        params = [p for p in attention.parameters() if p.requires_grad]
+        for kind in ("bool", "-inf", "float32 min"):
+            x = inputs.clone().requires_grad_()
+            out, _ = attention(x, position_embeddings, _mask_with_empty_rows(kind), shared_kv_states={})
+            grads = torch.autograd.grad(out.float().square().mean(), [x] + params)
+            results[flag, kind] = out, grads
+    ref, ref_grads = results["0", "bool"]
+    assert torch.equal(ref[0, _MASKED_ROWS], torch.zeros_like(ref[0, _MASKED_ROWS]))
+    for key, (out, grads) in results.items():
+        assert torch.equal(out[0, _MASKED_ROWS], ref[0, _MASKED_ROWS]), key
+        torch.testing.assert_close(out.float(), ref.float(), rtol=2e-3, atol=2e-3, msg=str(key))
+        for g, r in zip(grads, ref_grads):
+            assert torch.isfinite(g).all(), key
+            torch.testing.assert_close(g.float(), r.float(), rtol=1e-2, atol=1e-2 * r.float().abs().max().item(),
+                                       msg=str(key))
