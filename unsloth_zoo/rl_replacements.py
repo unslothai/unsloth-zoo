@@ -963,8 +963,7 @@ def grpo_compute_loss(
     # Per-completion weights from unsloth's generation step (ScaleRL zero-variance exclusion /
     # prompt-level aggregation), normalised over the whole generation batch; replaces the loss_type normaliser.
     sample_weight = kwargs.get("sample_weight", None)
-    # Set by grpo_accumulated_loss when it scored only the rows with a nonzero advantage (beta = 0): the
-    # micro-batch's own row and token counts as 0-dim tensors, so the normaliser is the full batch's.
+    # Full micro-batch counts when zero-advantage rows were skipped: normaliser stays the full batch's.
     full_batch_rows = kwargs.get("full_batch_rows", None)
     full_batch_tokens = kwargs.get("full_batch_tokens", None)
     # Only direct callers see this fallback; the trainer always forwards an explicit value.
@@ -2584,11 +2583,7 @@ RL_REPLACEMENTS["grpo_rollout_old_fill_unscored"] = grpo_rollout_old_fill_unscor
 
 
 def grpo_old_logps_from_new(new_logps):
-    """pi_old for a batch whose old-policy forward unsloth skipped: generation and optimisation are
-    aligned (gradient_accumulation_steps % (steps_per_generation * num_iterations) == 0, TRL's own test),
-    so no optimizer step ran since the rollout and pi_old is the policy being trained. TRL then sets
-    old_per_token_logps = per_token_logps.detach(); the vLLM importance weight pi_old / pi_vllm becomes
-    this forward's detached logprobs over the sampler's. Detached: the ratio carries no gradient."""
+    """pi_old when generation is aligned to the optimizer step (no step since rollout), as TRL does."""
     return new_logps.detach()
 pass
 RL_REPLACEMENTS["grpo_old_logps_from_new"] = grpo_old_logps_from_new
@@ -2601,10 +2596,7 @@ def _grpo_positive_rate(value):
 
 
 def grpo_policy_is_stochastic(model):
-    """True when the policy forward is random in train mode, so two forwards (or one forward over fewer rows)
-    do not reproduce each other: an nn.Dropout with p > 0 (LoRA dropout included), PEFT LoHa / LoKr
-    rank_dropout / module_dropout, MoE router jitter (Mixtral jitter_noise), or a positive dropout / jitter
-    rate in the model config. Classifier dropout (unused by causal LM heads) does not count."""
+    """True if train-mode forwards are random (dropout, LoHa/LoKr rank/module dropout, router jitter)."""
     if model is None:
         return False
     for module in model.modules():
@@ -2631,8 +2623,7 @@ RL_REPLACEMENTS["grpo_policy_is_stochastic"] = grpo_policy_is_stochastic
 
 
 def grpo_policy_has_experts(model):
-    """True for a mixture-of-experts policy. Leaving rows out of the forward can leave an expert with no tokens:
-    its gradient is then None instead of zero and AdamW skips its update (weight decay, moment decay)."""
+    """MoE policy: dropping rows can leave an expert with a None (not zero) grad, changing AdamW."""
     config = getattr(model, "config", None)
     for cfg in (config, getattr(config, "text_config", None)):
         if cfg is None:
@@ -2647,14 +2638,8 @@ RL_REPLACEMENTS["grpo_policy_has_experts"] = grpo_policy_has_experts
 
 
 def grpo_zero_advantage_keep(advantages, total_rows, group_size = None):
-    """Row indices of a GRPO micro-batch whose policy term can be nonzero, or None to score every row.
-
-    With beta = 0 (no KL) and no entropy term, a completion whose advantage is exactly 0 has
-    loss_i = -min(r * 0, clip(r) * 0) = 0 and a zero gradient for every token, whatever its ratio, so
-    only the loss normaliser still sees it (grpo_compute_loss's full_batch_rows / full_batch_tokens).
-    Exact zeros only: a zero-variance group whose mean rounds is left alone. group_size: drop whole
-    contiguous groups only, so a PrefixGrouper layout over [groups, G] rows survives. At least one row
-    is kept, so the forward and backward still run (and every rank still joins DDP's reduction)."""
+    """Rows with a nonzero advantage (exact zeros only), or None to score all. group_size drops whole
+    groups (PrefixGrouper). At least one row is kept so every rank still joins DDP's reduction."""
     if not torch.is_tensor(advantages) or total_rows <= 0 or advantages.shape[0] != total_rows:
         return None
     zero = (advantages.detach().reshape(total_rows, -1) == 0).all(dim = 1)
@@ -2991,8 +2976,6 @@ def grpo_accumulated_loss(
     # input and grpo_compute_loss returns None (not empty) delta/flat_is_ratio.
     # Set by unsloth when UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1 skipped the old-policy forward.
     _rollout_logps_as_old = bool(kwargs.pop("rollout_logps_as_old", False))
-    # Set by unsloth when it skipped the old-policy forward because generation is aligned to the optimizer
-    # step (pi_old is the current policy): old logps are this forward's own detached logprobs.
     _old_from_new = bool(kwargs.pop("old_logps_from_new", False)) and old_logps is None and not _rollout_logps_as_old
     _row_keep = None
     # TRL defaults the correction flag to True without vLLM too, but only applies the ratio with use_vllm.
@@ -3303,15 +3286,8 @@ def grpo_accumulated_loss(
         if _rollout_logps_as_old:
             old_logps, sampling_per_token_logps = grpo_rollout_logps_as_old(sampling_per_token_logps, old_logps)
 
-        # Zero-advantage rows (UNSLOTH_GRPO_SKIP_ZERO_ADVANTAGE=0 turns it off). At beta = 0 with no entropy
-        # term, a row whose advantage is exactly 0 adds 0 to the loss and its gradient, so its forward and
-        # backward are skipped and grpo_compute_loss divides by this micro-batch's full row / token counts.
-        # Only for the loss types whose normaliser is those counts (grpo, bnpo, dr_grpo) or global (dapo).
-        # Off for vision (image rows do not slice), the rollout logps as pi_old path and its mismatch
-        # metrics (they average the scored rows), DeepSpeed / FSDP (ZeRO-3 and FSDP forwards are collective:
-        # every rank must run the same number of them), a random forward (dropout, router jitter: fewer rows
-        # draw other masks) and mixture-of-experts policies (an expert left without tokens gets no gradient
-        # rather than a zero one, which changes its AdamW update).
+        # Skip zero-advantage rows (beta = 0, no entropy). Off for vision, rollout-logps pi_old, DeepSpeed /
+        # FSDP (collective forwards), random forwards (masks shift) and MoE (None grads change AdamW).
         _row_keep = None
         _full_rows = total_rows
         if (
@@ -3354,7 +3330,6 @@ def grpo_accumulated_loss(
             _full_mask = completion_mask
             if kept_completion_rows is not None:
                 _full_mask = _full_mask * kept_completion_rows.to(device = _full_mask.device, dtype = _full_mask.dtype)
-            # Everything the dropped rows still need for the metrics below.
             _full = dict(
                 mask = _full_mask, old = old_logps, sampling = sampling_per_token_logps,
                 ids = completion_input_ids, advantages = advantages,
@@ -3381,7 +3356,6 @@ def grpo_accumulated_loss(
                 kwargs["sample_weight"] = _rows(kwargs["sample_weight"])
             total_rows = input_ids.shape[0]
             if trainer.args.unsloth_grpo_mini_batch is None:
-                # Size the scored rows, as the sizing above does for the whole micro-batch.
                 B, multiplier = autotune_batch_and_chunks(
                     total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
                 )
@@ -3416,8 +3390,7 @@ def grpo_accumulated_loss(
                 trainer._autocast_dtype == torch.float16 if _autocast_on else lm_head.dtype == torch.float16
             ) and (trainer.accelerator.scaler is None or trainer.accelerator.scaler.get_scale() < 128.0),
         )
-        # The fused op takes pi_old / pi_vllm as an input before it scores the policy, and its token weights
-        # use the scored rows' own counts: the log-prob op below serves both cases.
+        # The fused op needs pi_old before scoring and weights by scored-row counts: use the log-prob op.
         _fused_route = _fused_route and not _old_from_new and _row_keep is None
         _fused_W = logits_to_keep + max_left_pad if pixel_values is None else logits_to_keep
         _fused_pad = []
@@ -4424,9 +4397,7 @@ def grpo_accumulated_loss(
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
 
     if _row_keep is not None:
-        # Report on every row, as without the skip. A dropped row (advantage 0) is never clipped, so ratio 1
-        # changes no clip metric; its vLLM IS values need pi_old only, scored here when the batch has it,
-        # else nan (its pi_old would be the skipped forward), which the metrics leave out like TRL's nan.
+        # Metrics cover every row: dropped rows use ratio 1 (never clipped) and nan IS values without pi_old.
         from unsloth_zoo.rl_replacements import grpo_zero_advantage_expand as _expand
         _dropped = torch.ones(_full_rows, dtype = torch.bool, device = _row_keep.device)
         _dropped[_row_keep] = False

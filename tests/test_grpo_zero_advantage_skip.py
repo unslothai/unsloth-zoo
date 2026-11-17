@@ -2,17 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Two GRPO compute savings against float64 oracles of TRL 1.18 GRPOTrainer._compute_loss.
-
-1. Zero-advantage rows: with beta = 0 and no entropy term, a completion whose advantage is exactly 0 adds
-   nothing to the loss or its gradient, so grpo_accumulated_loss scores only the other rows and
-   grpo_compute_loss divides by the full micro-batch's row / token counts (full_batch_rows /
-   full_batch_tokens). Loss and gradient must equal the whole batch's for grpo, bnpo, dr_grpo, dapo and
-   GSPO (sequence-level ratio), with and without the vLLM importance weight.
-2. Old logps from the policy forward: when generation is aligned to the optimizer step, pi_old is the
-   policy being trained, so old_logps_from_new = True makes pi_old this forward's detached logprobs.
-   The vLLM importance weight pi_old / pi_vllm and the loss must equal TRL's with pi_old = pi_theta.
-"""
+"""GRPO zero-advantage row skip and old_logps_from_new vs float64 oracles of TRL 1.18 _compute_loss."""
 
 import collections
 import math
@@ -141,7 +131,6 @@ def test_scored_rows_match_the_whole_batch(loss_type, level, is_mode, d):
     full_grad = torch.zeros_like(want_grad)
     full_grad[keep] = got_grad
     torch.testing.assert_close(full_grad, want_grad, rtol = 1e-12, atol = 1e-15)
-    # The dropped rows really carried no gradient.
     dropped = torch.ones(adv.shape[0], dtype = torch.bool)
     dropped[keep] = False
     assert torch.count_nonzero(want_grad[dropped]) == 0
@@ -221,8 +210,7 @@ def test_old_from_new_matches_trl_aligned_pi_old(is_mode, level):
 
 
 def test_old_from_new_is_closer_to_the_oracle_than_a_second_forward():
-    """The skipped forward is the same policy, so it can only add rounding: a bf16-noisy second scoring of
-    pi_old moves the float32 loss away from the float64 oracle, the detached forward does not."""
+    """A bf16-noisy second pi_old forward drifts from the float64 oracle; the detached one does not."""
     new, _, sampling, adv, mask, ids = _batch(rows = 16, cols = 33, zero_rows = ())
     want = _trl_loss(new, new, sampling, adv, mask, "dapo", "token", "token_truncate", num_items = mask.sum())
     f = lambda x: x.to(torch.float32)
@@ -403,8 +391,7 @@ def test_no_skip_outside_the_exact_cases(monkeypatch, case):
 
 @pytest.mark.parametrize("is_mode", ["token_truncate", "token_mask", "sequence_truncate", "sequence_mask"])
 def test_accumulated_loss_old_from_new_equals_the_scored_pi_old(monkeypatch, is_mode):
-    """Item 1 end to end: no pi_old forward (old_logps None + old_logps_from_new) gives the loss and grads of
-    the path that scored pi_old with a separate forward of the same weights."""
+    """old_logps_from_new matches a separate pi_old forward of the same weights."""
     adv = torch.tensor([0.5, -0.5, 1.5, -1.5, 0.2, -0.2])
     old = _score_old(_Model())
     base, base_grads, _, _ = _run(monkeypatch, adv, old = old, is_mode = is_mode, skip = False)
