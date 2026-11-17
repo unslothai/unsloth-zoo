@@ -440,7 +440,11 @@ _DEQUANT_MERGE_BASE_MODEL_TYPES = frozenset({"falcon_h1"})
 
 def _model_type_needs_dequant_merge_base(model) -> bool:
     """True iff `model`'s architecture is one whose on-the-fly bnb-4bit merged_16bit
-    export must use dequant(W4) as the LoRA merge base instead of the downloaded W16."""
+    export must use dequant(W4) as the LoRA merge base instead of the downloaded W16.
+    UNSLOTH_QLORA_MERGE_BASE=dequant|original overrides: the adapter trained against dequant(W4)."""
+    choice = os.environ.get("UNSLOTH_QLORA_MERGE_BASE", "auto").strip().lower()
+    if choice in ("dequant", "dequantized", "4bit"): return True
+    if choice in ("original", "16bit"): return False
     try:
         cfg = getattr(model, "config", None)
         mt = (getattr(cfg, "model_type", "") or "").lower()
@@ -456,6 +460,69 @@ def _is_bnb_4bit_base(module):
     if weight is None: return False
     if weight.__class__.__name__ != "Params4bit": return False
     return getattr(weight, "quant_state", None) is not None
+pass
+
+
+# Stochastic rounding: round to nearest drops low-lr LoRA deltas below half a 16-bit ulp of W.
+_MERGE_ROUNDING_MODES = ("nearest", "stochastic")
+_MERGE_ROUNDING_DEFAULT = "stochastic"
+_SR_CHUNK = 1 << 24
+_SR_SEED = 0x2B7E1516
+
+
+def _merge_rounding_mode():
+    mode = os.environ.get("UNSLOTH_MERGE_ROUNDING", _MERGE_ROUNDING_DEFAULT).strip().lower()
+    if mode in ("sr", "stochastic_rounding"): mode = "stochastic"
+    if mode in ("rtn", "round_to_nearest", ""): mode = "nearest"
+    if mode not in _MERGE_ROUNDING_MODES:
+        warnings.warn(
+            f"Unsloth: UNSLOTH_MERGE_ROUNDING={mode!r} is not one of {_MERGE_ROUNDING_MODES}; "
+            "using round to nearest.", stacklevel = 2,
+        )
+        return "nearest"
+    return mode
+pass
+
+
+def _stochastic_round(W, dtype, key):
+    """Unbiased (E[out] == W) rounding, seeded by `key` so a merge is bit-reproducible."""
+    if dtype not in (torch.bfloat16, torch.float16) or W.dtype != torch.float32:
+        return W.to(dtype)
+    import zlib
+    gen = torch.Generator(device = W.device)
+    gen.manual_seed(zlib.crc32(str(key).encode("utf-8")) ^ _SR_SEED)
+    flat = W.reshape(-1)
+    out = torch.empty(flat.shape, dtype = dtype, device = flat.device)
+    for start in range(0, flat.numel(), _SR_CHUNK):
+        x = flat[start : start + _SR_CHUNK]
+        if dtype == torch.bfloat16:
+            noise = torch.randint(0, 1 << 16, x.shape, device = x.device, dtype = torch.int32, generator = gen)
+            y = ((x.view(torch.int32) + noise) & -65536).view(torch.float32)
+            out[start : start + _SR_CHUNK] = torch.where(torch.isfinite(x), y, x).to(dtype)
+            continue
+        r = x.to(dtype)
+        err = x - r.float()
+        bits = r.view(torch.int16).to(torch.int32) & 0xFFFF
+        sign = bits & 0x8000
+        mag = bits & 0x7FFF
+        away_from_zero = (err > 0) ^ (sign != 0)
+        nb_bits = torch.where(away_from_zero, mag + 1, mag - 1) | sign
+        nb_bits = torch.where(mag == 0, torch.where(err < 0, 0x8001, 0x0001), nb_bits)
+        nb_bits = torch.where(nb_bits >= 0x8000, nb_bits - 0x10000, nb_bits)
+        nb = nb_bits.to(torch.int16).view(dtype)
+        p = err.abs() / (nb.float() - r.float()).abs()
+        u = torch.randint(0, 1 << 24, x.shape, device = x.device, dtype = torch.int32, generator = gen)
+        take = u.to(torch.float32) * (1.0 / (1 << 24)) < p
+        out[start : start + _SR_CHUNK] = torch.where(take, nb, r)
+    return out.view(W.shape)
+pass
+
+
+def _round_merged_weight(W, dtype, key):
+    if dtype in (torch.bfloat16, torch.float16) and W.dtype == torch.float32 \
+            and _merge_rounding_mode() == "stochastic":
+        return _stochastic_round(W, dtype, key)
+    return W
 pass
 
 
@@ -1202,6 +1269,7 @@ def _merge_and_overwrite_lora(
                     counted_lora_modules = counted_lora_modules,
                     processed_mxfp4_keys = processed_mxfp4_keys,
                     weight_block_size = weight_block_size,
+                    use_dequant_base = use_dequant_base,
                 )
 
             for key in safetensor_keys:
@@ -1396,6 +1464,7 @@ def _merge_and_overwrite_lora(
                             count += 1
                     elif hasattr(lora_stats, 'lora_A') and lora_stats.lora_A is not None:
                         W = _merge_lora(W, lora_stats, output_key, use_dequant_base = use_dequant_base)
+                        W = _round_merged_weight(W, W_original_dtype, output_key)
                         count += 1
 
                 success = _write_tensor_direct_torch(mm, header_metadata, length_of_header, output_key, W, W_original_dtype)
@@ -2046,7 +2115,7 @@ def _resolve_moe_num_experts_with_header(prefix, resolution_stats, moe_num_exper
     return num_experts
 
 
-def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, converted_lora_weights, moe_num_experts, output_dtype, counted_lora_modules, processed_mxfp4_keys, weight_block_size = None):
+def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, converted_lora_weights, moe_num_experts, output_dtype, counted_lora_modules, processed_mxfp4_keys, weight_block_size = None, use_dequant_base = False):
     count = 0
     debug_logged = 0
     file_path = getattr(file, "path", None)
@@ -2118,7 +2187,7 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
                 if _idx >= _num_experts_disk or _ls.lora_A is None or _ls.lora_B is None:
                     continue
                 _w_lin = _fused_dev[_idx].transpose(0, 1).contiguous()
-                _merged_lin = _merge_lora(_w_lin, _ls, _fused_key + f".{_idx}")
+                _merged_lin = _merge_lora(_w_lin, _ls, _fused_key + f".{_idx}", use_dequant_base = use_dequant_base)
                 _fused_dev[_idx] = _merged_lin.transpose(0, 1)
                 _merged_any = True
                 if _lk not in counted_lora_modules:
@@ -6071,8 +6140,7 @@ def merge_and_overwrite_lora(
         if _merge_weight_block_size is None:
             # A 4bit load holds a bitsandbytes config in memory.
             _merge_weight_block_size = _fp8_disk_block_size
-    # Gated archs + 16bit merge only: fold each LoRA delta onto dequant(W4) instead of W16
-    # (see _merge_lora). Strict no-op for every other model/merge.
+    # QLoRA merge base: dequant(W4) instead of W16 (see _merge_lora).
     _use_dequant_base = (
         save_method == "merged_16bit"
         and _model_type_needs_dequant_merge_base(_merge_base_model)

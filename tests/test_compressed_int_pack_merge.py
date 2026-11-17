@@ -186,6 +186,8 @@ def _lora_of(peft):
 @pytest.mark.parametrize("variant", sorted(VARIANTS))
 def test_merged_export_is_decompress_plus_lora_delta(variant, tmp_path, monkeypatch):
     monkeypatch.setattr(saving_utils, "_active_merge_device", lambda: "cpu")
+    # Bit-exact against a round-to-nearest reference; stochastic merge rounding is tested on its own.
+    monkeypatch.setenv("UNSLOTH_MERGE_ROUNDING", "nearest")
     group = _group(VARIANTS[variant])
     packed_dir, config, decoded = _write_packed_llama(str(tmp_path / "packed"), lambda m: group)
     peft = _peft_on_decoded(config, packed_dir, decoded, torch.bfloat16)
