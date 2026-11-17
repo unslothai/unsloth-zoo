@@ -237,7 +237,7 @@ def _disable(exc):
 
 
 def _is_capturing(device):
-    # The capture query reads the current device's stream: ask it on the operand's card.
+    # Capture state is per device: query the operand's card, not the current one.
     try:
         with torch.cuda.device(device):
             return torch.cuda.is_current_stream_capturing()

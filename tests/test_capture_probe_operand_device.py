@@ -13,9 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Cold self-checks ask whether the operand's card is capturing: torch.cuda.is_current_stream_capturing() reads the
-current device's stream, so with card 0 current and a capture on the operand's card 1 the probe must not run and
-nothing may be cached. CPU: the CUDA device API is faked."""
+"""Card 0 current, card 1 (operand) capturing: self-checks must not probe or cache. CPU, faked CUDA device API."""
 import os
 
 import pytest

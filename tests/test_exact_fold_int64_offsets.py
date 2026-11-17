@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The exact-fold kernel forms the expert offset in int64: ``e * sWe`` in i32 wraps once a stacked expert weight
-passes 2**31 elements. CPU only: the kernel is lowered to TTIR for an sm90 target and no i32 multiply may take an
-expert stride."""
+"""No i32 multiply may take an expert stride (wraps past 2**31 elements). CPU: lowered to sm90 TTIR."""
 
 import os
 import re
@@ -56,7 +54,7 @@ def test_expert_offsets_are_int64(mode):
         elif n in consts:
             sig[n] = "constexpr"
         else:
-            sig[n] = "i32"  # the launcher passes an int below 2**31 as i32, e.g. sWe = N * K
+            sig[n] = "i32"
     src = ASTSource(fn = k, signature = sig, constexprs = {(k.arg_names.index(n),): v for n, v in consts.items()})
     try:
         ttir = triton.compile(

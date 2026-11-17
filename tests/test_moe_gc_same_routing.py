@@ -417,7 +417,6 @@ def test_gpt_oss_v5_lora_forward_applies_the_replay_routing_once(monkeypatch, ba
 
 
 def test_compiled_replay_leaves_the_stored_routing_intact():
-    # the op's outputs must not be the frame's stored tensors: Inductor reuses a dead output's buffer in place
     op = gcm._moe_checkpoint_route_op
     T, k = 64, 4
     idx0 = torch.randint(0, 8, (T, k))

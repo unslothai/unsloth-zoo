@@ -494,7 +494,6 @@ def fused_swiglu_self_check(device, dtype, act, interleaved, alpha = 1.702, limi
         return hit
     if torch.compiler.is_compiling():
         return False
-    # The capture query reads the current device's stream: ask it on the operand's card.
     with torch.cuda.device(device):
         if torch.cuda.is_current_stream_capturing():
             return False

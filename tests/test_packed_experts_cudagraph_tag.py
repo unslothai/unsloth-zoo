@@ -13,8 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""unsloth_zoo::packed_experts_mm_v2 reads the routed counts on the host when the experts need several chunks, so it is
-tagged cudagraph_unsafe (as manual_grouped_mm and nf4_grouped_mm_auto): Inductor keeps it out of CUDA graphs. CPU."""
+"""packed_experts_mm_v2 syncs to host, so it must be tagged cudagraph_unsafe. CPU."""
 import os
 
 import pytest
@@ -32,5 +31,4 @@ def test_packed_experts_mm_is_cudagraph_unsafe():
     op = packed_experts._register_op()
     assert op is not None, "packed_experts_mm did not register"
     assert tag in op.tags
-    # versioned with the tag: Inductor's FX graph cache does not key on tags, so the old name would replay untagged graphs
     assert op is torch.ops.unsloth_zoo.packed_experts_mm_v2.default

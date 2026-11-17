@@ -541,7 +541,7 @@ def _register_op():
         op = torch.ops.unsloth_zoo.packed_experts_mm_v2.default
     except (AttributeError, RuntimeError):
         op = None
-    # Several expert chunks read the routed counts on the host (a sync): a CUDA graph must not capture the op.
+    # Multi-chunk path syncs counts to host: keep out of CUDA graphs.
     tags = {}
     if hasattr(torch, "Tag") and hasattr(torch.Tag, "cudagraph_unsafe"):
         import inspect
@@ -549,8 +549,7 @@ def _register_op():
             tags = {"tags": (torch.Tag.cudagraph_unsafe,)}
     if op is None:
         try:
-            # _v2: the tag is not part of Inductor's FX graph cache key, so a graph compiled against the untagged op
-            # would replay from a warm cache and still capture the host sync into a CUDA graph.
+            # _v2: tags are not in Inductor's FX cache key, so the old name would replay untagged cached graphs.
             @custom_op("unsloth_zoo::packed_experts_mm_v2", mutates_args = (), **tags)
             def packed_experts_mm(
                 inputs: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor, glob: torch.Tensor,

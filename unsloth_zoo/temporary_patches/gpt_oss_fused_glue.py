@@ -323,7 +323,7 @@ def _self_check(device, acc_dtype, alpha, limit) -> bool:
     # Temporary contexts decline without caching: the next eager call probes again.
     if torch.compiler.is_compiling():
         return False
-    # The capture query reads the current device's stream: ask it on the operand's card.
+    # Capture state is per device: query the operand's card.
     with torch.cuda.device(device):
         if torch.cuda.is_current_stream_capturing():
             return False
