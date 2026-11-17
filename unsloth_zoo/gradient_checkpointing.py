@@ -29,6 +29,12 @@ import heapq
 import threading
 import weakref
 from .utils import _get_dtype, Version, is_distributed
+from .saved_attention import (
+    new_saved_attention_frame,
+    saved_attention_scope,
+    save_attention_enabled,
+    patch_transformers_saved_attention,
+)
 # Re-exported under its old name: it lives in integrated_device.py so the import-time
 # allocator block can share the topic without importing torch.
 from .integrated_device import _any_device_integrated
@@ -873,7 +879,8 @@ def _moe_checkpoint_route_impl(
     found = sys.modules[__name__]._checkpoint_route_eager(top_k_index, top_k_weights, grad_mode)
     if found is None:
         return top_k_index.clone(), top_k_weights.clone()
-    return found
+    # Clone: Inductor may write later ops in place into this output, corrupting the stored routing.
+    return found[0].clone(), found[1].clone()
 
 
 def _moe_checkpoint_route_fake(top_k_index, top_k_weights, grad_mode):
@@ -1986,7 +1993,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         if ctx._requires_gradient: ctx.save_for_backward(*tensor_inputs)
 
         ctx._routing_frame = _new_checkpoint_routing_frame(args) if ctx._requires_gradient else None
-        with torch.no_grad(), _checkpoint_routing_scope(ctx._routing_frame, False):
+        ctx._attention_frame = new_saved_attention_frame(args) if ctx._requires_gradient else None
+        with torch.no_grad(), _checkpoint_routing_scope(ctx._routing_frame, False), \
+                saved_attention_scope(ctx._attention_frame, False):
             outputs = run_function(*args)
 
         if use_gpu_buffer: MAIN_STREAM.wait_stream(EXTRA_STREAM)
@@ -2120,7 +2129,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             pass
 
             with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs), _gradient_checkpoint_recompute_marker(), \
-                    _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True):  # type: ignore[attr-defined]
+                    _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True), \
+                    saved_attention_scope(getattr(ctx, "_attention_frame", None), True):  # type: ignore[attr-defined]
                 outputs = ctx.run_function(*detached_inputs)
             pass
         pass
@@ -2753,6 +2763,8 @@ def patch_unsloth_smart_gradient_checkpointing(dtype = None):
     # torch.utils.checkpoint may already be patched while this one is not.
     import transformers.modeling_utils
     transformers.modeling_utils.checkpoint = unsloth_checkpoint
+    if save_attention_enabled():
+        patch_transformers_saved_attention()
 pass
 
 

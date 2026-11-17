@@ -53,6 +53,7 @@ __all__ = [
 import importlib.util
 import math
 import os
+from typing import Tuple
 
 import torch
 
@@ -274,6 +275,127 @@ def _connected_zeros(q, *others):
     return out
 
 
+def _reference_rows(kv, topk_idxs):
+    """kv with a zero sentinel row appended (keeps -1 / out-of-range slots indexable), safe indices, validity."""
+    b, n, d = kv.shape
+    kv_pad = torch.cat([kv, kv.new_zeros((b, 1, d))], dim = 1)
+    valid = (topk_idxs >= 0) & (topk_idxs < n)
+    return kv_pad, torch.where(valid, topk_idxs, n).long(), valid
+
+
+def _reference_block(q_chunk, kv_pad, sink, safe_chunk, valid_chunk, softmax_scale):
+    """Rows q_chunk [b, c, h, d] of the reference; sink [1, 1, h] in the accumulation dtype."""
+    b, c, h, _ = q_chunk.shape
+    acc = sink.dtype
+    batch_index = torch.arange(b, device = q_chunk.device).view(b, 1, 1)
+    slots = kv_pad[batch_index, safe_chunk].to(acc)                                # [b, c, k, d]
+    logits = torch.einsum("bchd,bckd->bchk", q_chunk.to(acc), slots) * softmax_scale
+    row_valid = valid_chunk.unsqueeze(2)                                           # [b, c, 1, k]
+    logits = logits.masked_fill(~row_valid, float("-inf"))
+    # The sink joins the denominator only; a row with no valid slot returns zero.
+    full = torch.cat([logits, sink.expand(b, c, h).unsqueeze(-1)], dim = -1)
+    empty = ~row_valid.any(dim = -1, keepdim = True)
+    probs = torch.softmax(torch.where(empty, 0, full), dim = -1)[..., :-1]
+    probs = torch.where(empty, 0, probs)
+    return torch.einsum("bchk,bckd->bchd", probs, slots).to(q_chunk.dtype)
+
+
+def _reference_chunk_rows(q, k):
+    b, s, _, d = q.shape
+    return max(1, min(s, _TORCH_CHUNK_ELEMS // max(1, k * d * b)))
+
+
+# Compiled regions run the multi-chunk reference as one opaque op: unrolled into the graph, every chunk was a
+# checkpoint HOP plus its own gather / softmax, and inductor's index simplification under dynamic shapes grew with the
+# chunk count (DeepSeek-V4.1 on T4 has ~85 chunks per layer at 1k tokens), so the first step did not finish.
+# Forward keeps no gathered slab; backward recomputes one chunk at a time, as the eager checkpoints do (an op
+# implementation runs below autograd, so its gradient is written out).
+_REF_V = "v1"
+
+
+@torch.library.custom_op(f"unsloth_zoo::sparse_attn_chunked_fwd_{_REF_V}", mutates_args = ())
+def _chunked_fwd_op(q: torch.Tensor, kv: torch.Tensor, sink: torch.Tensor, topk_idxs: torch.Tensor,
+                    softmax_scale: float) -> torch.Tensor:
+    s = q.shape[1]
+    chunk = _reference_chunk_rows(q, topk_idxs.shape[-1])
+    kv_pad, safe, valid = _reference_rows(kv, topk_idxs)
+    return torch.cat([
+        _reference_block(q[:, a:a + chunk], kv_pad, sink, safe[:, a:a + chunk], valid[:, a:a + chunk], softmax_scale)
+        for a in range(0, s, chunk)
+    ], dim = 1)
+
+
+@_chunked_fwd_op.register_fake
+def _(q, kv, sink, topk_idxs, softmax_scale):
+    return q.new_empty(q.shape)
+
+
+def _reference_block_backward(grad_out, q_chunk, kv_pad, sink, safe_chunk, valid_chunk, softmax_scale, dkv_pad):
+    """Gradients of _reference_block (recomputed forward): returns dq_chunk and dsink [h] (accumulation dtype),
+    adds the kv gradient into dkv_pad [b, n + 1, d] (accumulation dtype)."""
+    b, c, h, _ = q_chunk.shape
+    acc = sink.dtype
+    batch_index = torch.arange(b, device = q_chunk.device).view(b, 1, 1).expand_as(safe_chunk)
+    q_acc = q_chunk.to(acc)
+    slots = kv_pad[batch_index, safe_chunk].to(acc)                                # [b, c, k, d]
+    logits = torch.einsum("bchd,bckd->bchk", q_acc, slots) * softmax_scale
+    row_valid = valid_chunk.unsqueeze(2)
+    logits = logits.masked_fill(~row_valid, float("-inf"))
+    full = torch.cat([logits, sink.expand(b, c, h).unsqueeze(-1)], dim = -1)
+    empty = ~row_valid.any(dim = -1, keepdim = True)
+    probs = torch.where(empty, 0, torch.softmax(torch.where(empty, 0, full), dim = -1))
+    p_slots, p_sink = probs[..., :-1], probs[..., -1:]
+    go = grad_out.to(acc)
+    dp = torch.einsum("bchd,bckd->bchk", go, slots)
+    # Softmax backward over [slots | sink]; the sink carries no value, so its dp is 0.
+    delta = (p_slots * dp).sum(dim = -1, keepdim = True)
+    dlogits = p_slots * (dp - delta)
+    dsink = -(p_sink * delta).sum(dim = (0, 1)).squeeze(-1)
+    dq = torch.einsum("bchk,bckd->bchd", dlogits, slots) * softmax_scale
+    dslots = torch.einsum("bchk,bchd->bckd", p_slots, go) + torch.einsum("bchk,bchd->bckd", dlogits, q_acc) * softmax_scale
+    dkv_pad.index_put_((batch_index, safe_chunk), dslots, accumulate = True)
+    return dq.to(q_chunk.dtype), dsink
+
+
+@torch.library.custom_op(f"unsloth_zoo::sparse_attn_chunked_bwd_{_REF_V}", mutates_args = ())
+def _chunked_bwd_op(grad_out: torch.Tensor, q: torch.Tensor, kv: torch.Tensor, sink: torch.Tensor,
+                    topk_idxs: torch.Tensor, softmax_scale: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    s, n = q.shape[1], kv.shape[1]
+    chunk = _reference_chunk_rows(q, topk_idxs.shape[-1])
+    kv_pad, safe, valid = _reference_rows(kv, topk_idxs)
+    dq = q.new_empty(q.shape)
+    dkv_pad = torch.zeros(kv_pad.shape, device = kv.device, dtype = sink.dtype)
+    dsink = torch.zeros(sink.shape[-1], device = sink.device, dtype = sink.dtype)
+    for a in range(0, s, chunk):
+        dq[:, a:a + chunk], dsink_chunk = _reference_block_backward(
+            grad_out[:, a:a + chunk], q[:, a:a + chunk], kv_pad, sink, safe[:, a:a + chunk], valid[:, a:a + chunk],
+            softmax_scale, dkv_pad,
+        )
+        dsink += dsink_chunk
+    return dq, dkv_pad[:, :n].to(kv.dtype).contiguous(), dsink.view(sink.shape)
+
+
+@_chunked_bwd_op.register_fake
+def _(grad_out, q, kv, sink, topk_idxs, softmax_scale):
+    return q.new_empty(q.shape), kv.new_empty(kv.shape), sink.new_empty(sink.shape)
+
+
+def _chunked_setup_context(ctx, inputs, output):
+    q, kv, sink, topk_idxs, softmax_scale = inputs
+    ctx.save_for_backward(q, kv, sink, topk_idxs)
+    ctx.softmax_scale = softmax_scale
+
+
+def _chunked_backward(ctx, grad_out):
+    q, kv, sink, topk_idxs = ctx.saved_tensors
+    dq, dkv, dsink = _chunked_bwd_op(grad_out.contiguous(), q, kv, sink, topk_idxs, ctx.softmax_scale)
+    need = ctx.needs_input_grad
+    return dq if need[0] else None, dkv if need[1] else None, dsink if need[2] else None, None, None
+
+
+_chunked_fwd_op.register_autograd(_chunked_backward, setup_context = _chunked_setup_context)
+
+
 def sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale):
     """Gather + fp32 (fp64 for fp64 inputs) softmax with sink; differentiable; chunked over queries."""
     b, s, h, d = q.shape
@@ -285,31 +407,19 @@ def sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale):
         sink = attn_sink.to(acc).view(1, 1, h)
     if k == 0:
         return _connected_zeros(q, kv, attn_sink)
-    n = kv.shape[1]
-    # A zero sentinel row keeps -1 / out-of-range slots indexable.
-    kv_pad = torch.cat([kv, kv.new_zeros((b, 1, d))], dim = 1)
-    valid = (topk_idxs >= 0) & (topk_idxs < n)
-    safe = torch.where(valid, topk_idxs, n).long()
-    chunk = max(1, min(s, _TORCH_CHUNK_ELEMS // max(1, k * d * b)))
-    batch_index = torch.arange(b, device = q.device).view(b, 1, 1)
+    chunk = _reference_chunk_rows(q, k)
+    if s > chunk and torch.compiler.is_compiling():
+        return _chunked_fwd_op(q, kv, sink, topk_idxs, float(softmax_scale))
+    kv_pad, safe, valid = _reference_rows(kv, topk_idxs)
 
     def block(q_chunk, kv_pad, sink, safe_chunk, valid_chunk):
-        slots = kv_pad[batch_index, safe_chunk].to(acc)                            # [b, c, k, d]
-        logits = torch.einsum("bchd,bckd->bchk", q_chunk.to(acc), slots) * softmax_scale
-        row_valid = valid_chunk.unsqueeze(2)                                       # [b, c, 1, k]
-        logits = logits.masked_fill(~row_valid, float("-inf"))
-        # The sink joins the denominator only; a row with no valid slot returns zero.
-        full = torch.cat([logits, sink.expand(b, q_chunk.shape[1], h).unsqueeze(-1)], dim = -1)
-        empty = ~row_valid.any(dim = -1, keepdim = True)
-        probs = torch.softmax(torch.where(empty, 0, full), dim = -1)[..., :-1]
-        probs = torch.where(empty, 0, probs)
-        return torch.einsum("bchk,bckd->bchd", probs, slots).to(q.dtype)
+        return _reference_block(q_chunk, kv_pad, sink, safe_chunk, valid_chunk, softmax_scale)
 
-    if s <= _TORCH_CHUNK_ELEMS // max(1, k * d * b):
+    if s <= chunk:
         # One chunk: a Python loop over the length recompiles per length even under dynamic=True.
         return block(q, kv_pad, sink, safe, valid)
     # Under autograd each chunk is recomputed in backward, so only one gathered slab is ever live.
-    recompute = torch.is_grad_enabled() and any(t.requires_grad for t in (q, kv, attn_sink) if t is not None) and s > chunk
+    recompute = torch.is_grad_enabled() and any(t.requires_grad for t in (q, kv, attn_sink) if t is not None)
     outs = []
     for start in range(0, s, chunk):
         stop = min(s, start + chunk)
@@ -748,7 +858,7 @@ def _repair_boundary_ties(out, b, t0, scores, valid, k, q_rows, block_keys, star
 
 @torch.compiler.disable
 def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, apply_rotary_pos_emb,
-                      query_chunk = 2048, past_key_values = None):
+                      query_chunk = 2048, past_key_values = None, exact_ties = None):
     """Vectorised transformers Qwen4ExpTextQSAIndexer selection (no cache): [b, s, K] token indices, -1 padded,
     the set the reference's per-query loop keeps (at a k-th / (k+1)-th score tie possibly another equally-scored
     block, unless UNSLOTH_QWEN4_EXP_EXACT_TIES=1); None when the mask is not interval-shaped.
@@ -758,6 +868,7 @@ def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mas
     relu(q . k) / sqrt(d); the top budget // ratio blocks plus the incomplete tail are kept.
     `past_key_values` (an empty cache: prefill) receives the raw index keys as the reference indexer stores them,
     only once the mask was accepted, so a None return never leaves the cache updated.
+    `exact_ties` overrides UNSLOTH_QWEN4_EXP_EXACT_TIES (None reads it).
     """
     batch, seq, _ = hidden_states.shape
     ratio, top_blocks, dim = indexer.compress_ratio, indexer.block_topk, indexer.index_head_dim
@@ -811,7 +922,7 @@ def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mas
             tokens = starts[top_indices][..., None] + arange_r                               # [c, k, ratio]
             tokens = torch.where(torch.isfinite(top_values)[..., None], tokens, -1)
             out[b, t0:t1, : k * ratio] = tokens.flatten(1).to(torch.int32)
-            if k < starts.numel() and _exact_ties():
+            if k < starts.numel() and (_exact_ties() if exact_ties is None else exact_ties):
                 _repair_boundary_ties(out, b, t0, scores, valid, k, q[b, t0:t1], block_keys, starts, arange_r,
                                       top_blocks, ratio, dim)
     return out

@@ -660,10 +660,73 @@ def _deepseek_v4_step_mask(layer, arguments):
     return lambda h: create_attention_mask(h[:, :, 0, :], local, window_size = window, return_array = True)
 
 
+class _DeepseekV41Steps:
+    """V4.1 blocks share one cache only the model advances: each step sets its offset and replays the previous block's handoff."""
+
+    @staticmethod
+    def applies(cache):
+        # A batch cache's offset is its rows': runs whole.
+        return type(cache).__name__ == "DeepseekV41Cache"
+
+    def __init__(self, layer, cache):
+        self.cache, self.offset, self.layer = cache, cache.offset, layer.layer_idx
+        self.last = self.layer == cache.n_layers - 1
+        if self.layer == 0:
+            cache.unsloth_wide_steps = {}
+        self.records = cache.unsloth_wide_steps
+
+    def begin(self, start):
+        self.cache.offset = self.offset + start
+        for name, value in self.records.get(start, {}).items():
+            setattr(self.cache, name, value)
+
+    def end(self, start):
+        self.records[start] = {name: getattr(self.cache, name) for name in self.cache.HANDOFF}
+        return self.records[start]
+
+    def finish(self, done):
+        self.cache.offset = self.offset
+        if self.last or not done:
+            self.cache.__dict__.pop("unsloth_wide_steps", None)
+
+    @staticmethod
+    def _layer_lists(cache):
+        return [name for name, value in vars(cache).items() if isinstance(value, list) and len(value) == cache.n_layers]
+
+    @staticmethod
+    def _snapshot(cache, offset, lists):
+        snapshot = copy.copy(cache)
+        snapshot.__dict__.pop("unsloth_wide_steps", None)
+        snapshot.__dict__.update(lists, offset = offset)
+        if cache.engram is not None:  # the model hashes a whole call's tokens before its blocks run
+            snapshot.engram = cache.engram[:, :offset]
+        return snapshot
+
+    def capture(self, rows, copy_cache, captured):
+        # Copies: later steps write the cache's buffers in place. The last block files the chunked-prefill snapshot.
+        held = self.records.setdefault("captured", {})
+        held[self.layer] = {name: None if (value := getattr(self.cache, name)[self.layer]) is None else mx.contiguous(value)
+                            for name in self._layer_lists(self.cache)}
+        mx.eval(list(held[self.layer].values()))
+        if self.last:
+            lists = {name: [held[layer][name] for layer in range(self.cache.n_layers)] for name in held[self.layer]}
+            captured[id(self.cache)] = copy_cache(self._snapshot(self.cache, self.offset + rows, lists))
+
+    @classmethod
+    def capture_whole(cls, layer, cache, rows):
+        if not cls.applies(cache) or layer.layer_idx != cache.n_layers - 1:
+            return None
+        return cls._snapshot(cache, cache.offset + rows, {name: list(getattr(cache, name)) for name in cls._layer_lists(cache)})
+
+
 # Layers with calls wider than a prefill step may run as consecutive steps on their own cache; token axes of
 # token-indexed arguments; either its causal masks or a function (layer, arguments) giving the mask of each step from
-# hidden states (None if not causal); array if a cache asks for arrays.
+# hidden states (None if not causal); array if a cache asks for arrays; a class stepping state the layers share, if any.
 _WIDE_LAYERS = {
+    "mlx_vlm.models.deepseek_v41.language.DeepseekV41Block": (
+        {"h": 1, "pre_mix": 1, "image_mask": 1}, (None,), _DeepseekV41Steps),
+    "mlx_vlm.models.glm5_next.language.DecoderLayer": ({"x": 1, "prev_topk_indices": 1}, (None,)),
+    "mlx_vlm.models.minimax_m3_vl.language.MiniMaxDecoderLayer": ({"x": 1, "position_ids": -1}, ("causal",)),
     "mlx_vlm.models.qwen4_exp.language.Qwen4ExpDecoderLayer": (
         {"hidden_states": 1, "input_ids": 1, "position_ids": -1}, (None, "causal")),
     "mlx_vlm.models.deepseek_v4.language.DeepseekV4Block": ({"h": 1, "input_ids": 1}, _deepseek_v4_step_mask),
@@ -707,6 +770,8 @@ def _table_reader():
 
 
 _SCORE_DECAY, _SCORE_DECAY_EVERY = 0.7, 4
+# DeepSeek V4.1's decode reuses an expert over a longer span than the stock rule keeps: half-life of 16 calls.
+_SCORE_DECAYS = {"DeepseekV41SwitchGLU": (0.5 ** (1 / 16), 1)}
 # Pending outputs a slot table keeps before evaluating them (decode has evaluated them by then).
 _PENDING_READERS, _PENDING_BYTES = 8, 32 << 20
 
@@ -745,9 +810,10 @@ def _slot_projection(projection, arrays, full_experts):
 
 
 class _ExpertSlots:
-    """One layer's experts in capacity slots; a miss evicts the lowest decayed routing count (+1 per route, x0.7 every 4 calls) among experts the call does not use."""
+    """One layer's experts in capacity slots; a miss evicts the lowest decayed routing count (+1 per route, x``decay[0]``
+    every ``decay[1]`` calls) among experts the call does not use."""
 
-    def __init__(self, fields, experts, capacity):
+    def __init__(self, fields, experts, capacity, decay = (_SCORE_DECAY, _SCORE_DECAY_EVERY)):
         self.fields = fields  # [(projection, name, _Field)]
         self.capacity = capacity
         self.arrays = {
@@ -767,13 +833,14 @@ class _ExpertSlots:
         self.score = np.zeros(experts, dtype = np.float32)
         self.expert_bytes = sum(field.row_bytes for _, _, field in fields)
         self.calls = self.hits = self.misses = 0
+        self.decay = decay
 
     def ensure(self, routes, experts):
         """Make ``experts`` (unique, at most ``capacity``) resident; ``routes`` are the call's routes."""
         np.add.at(self.score, routes, 1.0)
         self.calls += 1
-        if self.calls % _SCORE_DECAY_EVERY == 0:
-            self.score *= _SCORE_DECAY
+        if self.calls % self.decay[1] == 0:
+            self.score *= self.decay[0]
         missing = experts[self.slot_of[experts] < 0]
         self.hits += experts.size - missing.size
         if not missing.size:
@@ -1182,13 +1249,14 @@ class _WideLayer:
             built = _cache_mask(cache, hidden.shape[1]) if hasattr(cache, "make_mask") else mask
             step_mask = None
             causal = (mask is None or isinstance(mask, str)) and mask in masks and not isinstance(built, mx.array) and mask == built
-        if cache is None or not causal:
+        if cache is None or not causal or self._wide_steps is not None and not self._wide_steps.applies(cache):
             return self._whole(hidden, args, kwargs)
         switch = self._offload_switch
         table = switch is not None and switch._wide(read_next = True)
         given = {name: bound.arguments.get(name) for name in axes}
         capture = getattr(_prefill_capture, "request", None)
-        outputs = []
+        shared = self._wide_steps(self, cache) if self._wide_steps is not None else None
+        outputs, done = [], False
         try:
             for start in range(0, hidden.shape[1], _PREFILL_STEP):
                 for name, axis in axes.items():
@@ -1196,14 +1264,24 @@ class _WideLayer:
                         bound.arguments[name] = _token_slice(given[name], axis, start, start + _PREFILL_STEP)
                 if step_mask is not None:
                     bound.arguments["mask"] = step_mask(bound.arguments[first])
+                if shared is not None:
+                    shared.begin(start)
                 output = super().__call__(*bound.args[1:], **bound.kwargs)
-                mx.eval(output, cache.state)
+                mx.eval(output, cache.state, shared.end(start) if shared is not None else ())
                 outputs.append(output)
                 if capture is not None and min(start + _PREFILL_STEP, hidden.shape[1]) == capture[0]:
-                    capture[2][id(cache)] = capture[1](cache)
+                    if shared is not None:
+                        shared.capture(capture[0], capture[1], capture[2])
+                    else:
+                        capture[2][id(cache)] = capture[1](cache)
+            done = True
         finally:
+            if shared is not None:
+                shared.finish(done)
             if table:
                 switch._narrow()
+        if isinstance(outputs[0], tuple):
+            return tuple(None if parts[0] is None else mx.concatenate(parts, axis = axes[first]) for parts in zip(*outputs))
         return mx.concatenate(outputs, axis = axes[first])
 
     def _whole(self, hidden, args, kwargs):
@@ -1213,7 +1291,10 @@ class _WideLayer:
             cache = self._wide_signature.bind(self, *args, **kwargs).arguments.get("cache")
             if cache is not None:
                 mx.eval(output, cache.state)
-                capture[2][id(cache)] = capture[1](cache)
+                if self._wide_steps is None:
+                    capture[2][id(cache)] = capture[1](cache)
+                elif (snapshot := self._wide_steps.capture_whole(self, cache, hidden.shape[1])) is not None:
+                    capture[2][id(cache)] = capture[1](snapshot)
         return output
 
 
@@ -1262,6 +1343,7 @@ def _widen_layers(model, switches):
         if base not in _WIDE_CLASSES:
             _WIDE_CLASSES[base] = type(base.__name__, (_WideLayer, base), {
                 "_wide_axes": spec[0], "_wide_masks": staticmethod(spec[1]) if callable(spec[1]) else spec[1], "_wide_signature": inspect.signature(base.__call__),
+                "_wide_steps": spec[2] if len(spec) > 2 else None,
             })
         layer.__class__ = _WIDE_CLASSES[base]
         object.__setattr__(layer, "_offload_switch", held[0] if held else None)
@@ -1403,7 +1485,7 @@ def offload_experts(model, model_dir, fraction, *, cast_dtype = None):
         if capacity >= experts:
             report["skipped"].append((path, f"{experts} experts fit in {capacity} slots"))
             continue
-        slots = _ExpertSlots(fields, experts, capacity)
+        slots = _ExpertSlots(fields, experts, capacity, _SCORE_DECAYS.get(type(glu).__name__, (_SCORE_DECAY, _SCORE_DECAY_EVERY)))
         stock = copy.copy(glu)
         for projection in _PROJECTIONS:
             arrays = {name: slots.arrays[p, name] for p, name, _ in fields if p == projection}
