@@ -986,6 +986,92 @@ def _ensure_omlx_layout(model_type):
 _ensure_deepseek_v41_omlx_layout = _ensure_omlx_layout
 
 
+def _packed_quantization(path, module, weights):
+    """The quantization a layer's stored tensors were packed with, as mlx-lm's ``infer_quant_config`` reads it."""
+    import mlx.core as mx
+
+    in_dims = module.weight.shape[-1]
+    scales = weights[f"{path}.scales"]
+    group_size, bits = in_dims // scales.shape[-1], weights[f"{path}.weight"].shape[-1] * 32 // in_dims
+    if scales.dtype != mx.uint8:
+        return {"group_size": group_size, "bits": bits, "mode": "affine"}
+    mode = {(4, 16): "nvfp4", (4, 32): "mxfp4", (8, 32): "mxfp8"}.get((bits, group_size))
+    return mode and {"group_size": group_size, "bits": bits, "mode": mode}
+
+
+def _ensure_vlm_checkpoint_quantization():
+    """mlx-vlm quantizes every layer its config does not name with the config's default, and takes an NVFP4
+    ``weight_scale_2`` only on linears. Name each layer packed otherwise (mixed mxfp8/nvfp4 checkpoints) and
+    give scaled embeddings (ModelOpt NVFP4 exports) a module of their own."""
+    try:
+        vlm_utils = importlib.import_module("mlx_vlm.utils")
+    except Exception:
+        return
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    class ScaledQuantizedEmbedding(nn.Module):
+        """As mlx-vlm's ``ScaledQuantizedLinear``. Not a ``QuantizedEmbedding``, so paths that read the packed
+        weight directly cannot drop the scale."""
+
+        def __init__(self, embedding, weight_scale_2):
+            super().__init__()
+            self.weight, self.scales, self.weight_scale_2 = embedding.weight, embedding.scales, weight_scale_2
+            self.group_size, self.bits, self.mode = embedding.group_size, embedding.bits, embedding.mode
+            self.num_embeddings, self.dims = embedding.num_embeddings, embedding.dims
+            self.freeze()
+
+        def __call__(self, x):
+            rows = mx.dequantize(self.weight[x], scales = self.scales[x], group_size = self.group_size,
+                                 bits = self.bits, mode = self.mode, dtype = mx.float32)
+            return (rows * self.weight_scale_2).astype(mx.bfloat16)  # stock nvfp4 rows are bfloat16
+
+        def as_linear(self, x):
+            out = mx.quantized_matmul(x.astype(mx.float32), self.weight, scales = self.scales, transpose = True,
+                                      group_size = self.group_size, bits = self.bits, mode = self.mode)
+            return (out * self.weight_scale_2).astype(x.dtype)
+
+    load_model_weights = getattr(vlm_utils, "load_model_weights", None)
+    replace_scaled = getattr(vlm_utils, "replace_scaled_quantized_linears", None)
+    if load_model_weights is None or getattr(load_model_weights, "_unsloth_packed_quantization", False):
+        return
+    lookup = getattr(vlm_utils, "_quantization_for_module_path", lambda quantization, path, _model: quantization.get(path))
+
+    @wraps(load_model_weights)
+    def patched_load_model_weights(model, config, weights, *args, **kwargs):
+        quantization = config.get("quantization")
+        default = _global_quant_params(quantization)
+        if default is not None:
+            for path, module in model.named_modules():
+                if (
+                    hasattr(module, "to_quantized") and hasattr(module, "weight") and f"{path}.scales" in weights
+                    and f"{path}.weight" in weights and lookup(quantization, path, model) is None
+                ):
+                    packed = _packed_quantization(path, module, weights)
+                    if packed is not None and packed != default:
+                        quantization[path] = packed
+        return load_model_weights(model, config, weights, *args, **kwargs)
+
+    def patched_replace_scaled(model, weights):
+        from mlx.utils import tree_map_with_path
+
+        scaled = set()
+
+        def replace(path, module):
+            if isinstance(module, nn.QuantizedEmbedding) and module.mode == "nvfp4" and f"{path}.weight_scale_2" in weights:
+                scaled.add(f"{path}.weight_scale_2")
+                return ScaledQuantizedEmbedding(module, weights[f"{path}.weight_scale_2"])
+            return module
+
+        model.update_modules(tree_map_with_path(replace, model.leaf_modules(), is_leaf = nn.Module.is_module))
+        return replace_scaled(model, {key: value for key, value in weights.items() if key not in scaled})
+
+    patched_load_model_weights._unsloth_packed_quantization = True
+    vlm_utils.load_model_weights = patched_load_model_weights
+    if replace_scaled is not None:
+        vlm_utils.replace_scaled_quantized_linears = patched_replace_scaled
+
+
 def _patch_deepseek_ocr_transformers_import_compat(model_type):
     """Newer Transformers removed the Llama flash-attention symbol that DeepSeek-OCR's config import still reads; the
     MLX path never instantiates it, so an eager-attention alias is provided for import only."""
@@ -10366,6 +10452,7 @@ class FastMLXModel:
             _ensure_qwen3_omni_audio_per_clip(model_type)
             _ensure_omlx_layout(model_type)
             _ensure_native_vlm_weight_names(model_type)
+            _ensure_vlm_checkpoint_quantization()
 
             quant_state = _ensure_quantization_compatible(
                 config_data, quantization_spec, model_name,
