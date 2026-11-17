@@ -430,6 +430,18 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma4ClippableLinear)
 
 
+def _gemma4_native_bf16():
+    """bfloat16 in hardware (sm80+, ROCm). torch.cuda.is_bf16_supported() also counts T4's emulation."""
+    try:
+        if not torch.cuda.is_available():
+            return False
+        if torch.version.hip:
+            return True
+        return torch.cuda.get_device_capability()[0] >= 8
+    except Exception:
+        return False
+
+
 def _patch_gemma4_text_attention(module, prefix):
     apply_rotary_pos_emb = module.apply_rotary_pos_emb
     ALL_ATTENTION_FUNCTIONS = module.ALL_ATTENTION_FUNCTIONS
@@ -444,7 +456,9 @@ def _patch_gemma4_text_attention(module, prefix):
     # q / k / v and RoPE stay float32, but SDPA only needs float16 operands: its kernels keep QK^T, the softmax
     # and PV in float32 internally. Without bf16 (T4) the float32 mem-efficient kernel dominates the step
     # (Gemma-4-E2B 4-bit LoRA on T4, packed 4 x 1024: 578 -> 744 tok/s). Kill switch: UNSLOTH_GEMMA4_FP16_SDPA=0.
-    fp16_sdpa = os.environ.get("UNSLOTH_GEMMA4_FP16_SDPA", "1") != "0"
+    # Only on GPUs without bfloat16: a float16 request on a bfloat16 card keeps float32 operands, which also keeps
+    # it off cuDNN attention (B200, cuDNN 9.24: NaN dq at head dim 256 with a mask at some short lengths).
+    fp16_sdpa = os.environ.get("UNSLOTH_GEMMA4_FP16_SDPA", "1") != "0" and not _gemma4_native_bf16()
 
     def forward(
         self,

@@ -18,8 +18,11 @@ S, HIDDEN, HEAD_DIM = 48, 64, 32
 def gemma4(monkeypatch):
     module = pytest.importorskip("transformers.models.gemma4.modeling_gemma4")
     monkeypatch.setattr(patch_utils, "UNSLOTH_COMPILE_DISABLE", True)
+    monkeypatch.setattr(patches, "_gemma4_native_bf16", lambda: False, raising=False)  # a T4: the float16 operands engage
     original = module.Gemma4TextAttention.forward
-    monkeypatch.setattr(module.Gemma4TextAttention, "forward", original)
+    for patched_module, prefix in patches._gemma4_text_variants("TextAttention"):  # Unified shares the patch
+        cls = getattr(patched_module, prefix + "TextAttention")
+        monkeypatch.setattr(cls, "forward", cls.forward)
     return module, original
 
 
@@ -113,6 +116,20 @@ def test_forced_float32_attention_runs_float16_sdpa_within_tolerance(gemma4, mon
     assert all(torch.isfinite(x).all() for x in [results["1"][0], *results["1"][1]])
     for i, (a, b, c) in enumerate(zip(e16, e32, ebf16)):
         assert a <= 0.5 * c and a <= 2 * b + 1e-5, (i, a, b, c)
+
+
+def test_float16_request_on_a_bfloat16_gpu_keeps_float32_operands(gemma4, monkeypatch):
+    gemma4, original = gemma4
+    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
+    monkeypatch.delenv("UNSLOTH_GEMMA4_FP16_SDPA", raising=False)
+    monkeypatch.setattr(patches, "_gemma4_native_bf16", lambda: True, raising=False)
+    seen = _capture(monkeypatch)
+    patches.patch_Gemma4TextAttention()
+    for layer in (0, 1):
+        attention = _attention(gemma4, layer, torch.float16)
+        _run(gemma4, attention, torch.randn(1, S, HIDDEN, device="cuda", dtype=torch.float16, requires_grad=True),
+             layer, None)
+    assert seen and set(seen) == {torch.float32}
 
 
 def test_bfloat16_attention_is_not_patched(gemma4, monkeypatch):
