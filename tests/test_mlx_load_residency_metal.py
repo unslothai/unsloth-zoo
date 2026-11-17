@@ -573,7 +573,17 @@ def test_offloaded_experts_take_the_nax_expert_routes(tmp_path, monkeypatch, int
     from unsloth_zoo.mlx import inference, nax
 
     if not nax.nax_available():
-        pytest.skip("requires an Apple GPU with neural accelerators")
+        # Stock gather_qmm stands in for both NAX kernels, so the scope logic also runs before M5.
+        def stand_in(x, w, scales, biases, indices, bits, token_rows = None):
+            rows = x if token_rows is None else x[token_rows]
+            return mx.gather_qmm(rows[:, None], w, scales, biases, rhs_indices = indices, transpose = True,
+                                 group_size = x.shape[-1] // scales.shape[-1], bits = bits,
+                                 sorted_indices = True)[:, 0]
+
+        monkeypatch.setattr(nax, "nax_available", lambda: True)
+        monkeypatch.setattr(nax, "gap_open", lambda name: True)
+        monkeypatch.setattr(nax, "sorted_gather_qmm", stand_in)
+        monkeypatch.setattr(nax, "int8_gather_qmm", stand_in)
     stock = _lazy_copy(lambda: _moe("lm", hidden = 128), str(tmp_path))
     # Within the slots: too few routes per expert for the full table's sorted kernel, then enough; over the slots.
     calls = [(mx.random.normal((1, n, 512), key = mx.random.key(n)).astype(mx.bfloat16), _routes((1, n), n, among))
