@@ -156,3 +156,20 @@ def test_attention_input_meets_a_dense_fp16_projection():
         assert go._gpt_oss_attention_input(proj, hidden) is hidden
     half = hidden.to(torch.float16)
     assert go._gpt_oss_attention_input(fp16, half) is half
+
+
+@pytest.mark.parametrize("positional", [False, True])
+def test_tensor_routed_call_keeps_fp16(setup, monkeypatch, positional):
+    # Stock GptOssMLP (keywords, transformers 4.x) and transformers 5.x Mxfp4GptOssMLP (positional) pass
+    # (router_indices, routing_weights) and run their own float16 router: a float32 output would reach it next layer.
+    module, x, experts, weights, routes = setup
+    monkeypatch.setattr(go, "_mxfp4_routing_from_topk", lambda module, indices, weights: routes)
+    module.train()
+    xin = x.to(torch.float16)
+    if positional:
+        out = go.forward_mxfp4_gpt_oss_with_lora(module, xin, experts, weights)
+    else:
+        out = go.forward_mxfp4_gpt_oss_with_lora(module, xin, router_indices = experts, routing_weights = weights)
+    assert out.dtype == torch.float16
+    router = torch.nn.Linear(H, E).to(torch.float16)
+    router(xin + out)  # the next layer's stock router, no autocast: no dtype error

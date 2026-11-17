@@ -3124,7 +3124,7 @@ def mxfp4_ogs_experts_forward(
     return out
 
 
-def _mxfp4_experts_out_dtype(module, input_dtype):
+def _mxfp4_experts_out_dtype(module, input_dtype, routed_by_unsloth = True):
     """Output dtype of the MXFP4 experts: float32 when training on float16 activations, else the activation dtype.
 
     GptOssExpertsBnb4bit returns float32 in training, so on a float16 GPU (T4) the residual adds after it promote to
@@ -3132,9 +3132,15 @@ def _mxfp4_experts_out_dtype(module, input_dtype):
     to float16 instead, so the experts output and the residual overflowed to inf and the loss went NaN. Layers after
     the first then see float32 activations, as on the bnb-4bit path; bfloat16 runs are unchanged.
     UNSLOTH_GPT_OSS_MXFP4_FP32_RESIDUAL=0 restores the float16 output.
+
+    Only for calls routed by Unsloth's mlp_forward (routing objects), which casts the router input
+    (_mxfp4_router_logits). A call with (router_indices, routing_weights) tensors comes from an MLP forward that
+    feeds the router itself (stock GptOssMLP, transformers 5.x Mxfp4GptOssMLP), whose float16 router would reject
+    a float32 stream, so it keeps the activation dtype.
     """
     if (
-        input_dtype == torch.float16
+        routed_by_unsloth
+        and input_dtype == torch.float16
         and getattr(module, "training", False)
         and os.environ.get("UNSLOTH_GPT_OSS_MXFP4_FP32_RESIDUAL", "1") != "0"
     ):
@@ -3176,7 +3182,9 @@ def forward_mxfp4_gpt_oss_with_lora(
 
     # The native kernels and mxfp4_ogs_experts_forward return bf16: cast to the activation dtype, or to float32 when
     # training on float16 (_mxfp4_experts_out_dtype).
-    out_dtype = _mxfp4_experts_out_dtype(self, hidden_states.dtype)
+    out_dtype = _mxfp4_experts_out_dtype(
+        self, hidden_states.dtype, routing_data is not None and not isinstance(routing_data, torch.Tensor),
+    )
     hidden_states, routing_data, gather_idx, scatter_idx, leading_shape = _mxfp4_experts_routing(
         self, hidden_states, routing_data, gather_idx, scatter_idx, router_indices, routing_weights,
     )
