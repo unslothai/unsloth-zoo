@@ -288,7 +288,13 @@ def _unsloth_experts_dispatch(
         fallback = interface["grouped_mm"] if interface is not None and "grouped_mm" in interface else None
         if fallback is not None:
             # Without torch._grouped_mm support transformers' grouped_mm fails: take the eager forward.
-            if not _moe_utils_module()._check_torch_grouped_mm_supported():
+            # It also casts the input to the stack dtype: packed stacks (DeepSeek-V4.1's MXFP4 uint8
+            # experts) need the module's own forward, which dequantizes them.
+            if not _moe_utils_module()._check_torch_grouped_mm_supported() or any(
+                self._parameters.get(name) is not None
+                and self._parameters[name].dtype not in _DENSE_STACK_DTYPES
+                for name in _EXPERT_STACK_NAMES
+            ):
                 fallback = None
         if fallback is None:
             return type(self).forward.__wrapped__(self, hidden_states, top_k_index, top_k_weights)
