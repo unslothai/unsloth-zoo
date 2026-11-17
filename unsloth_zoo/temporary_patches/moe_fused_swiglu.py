@@ -492,8 +492,12 @@ def fused_swiglu_self_check(device, dtype, act, interleaved, alpha = 1.702, limi
     hit = _CACHE.get(key)
     if hit is not None:
         return hit
-    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+    if torch.compiler.is_compiling():
         return False
+    # The capture query reads the current device's stream: ask it on the operand's card.
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            return False
     ok = False
     # First call may sit in a non-reentrant checkpoint region; identity saved_tensors_hooks (innermost wins) keep the
     # probe self-contained, since outer hooks would count its tensors (CheckpointError) and its grad would trigger a
