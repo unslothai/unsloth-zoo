@@ -159,7 +159,11 @@ def test_decoder_boundary_patch_is_undone_by_a_flag_off_load(monkeypatch):
     monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
     p.patch_Gemma4TextDecoderLayerBoundary()
     p.patch_Gemma4TextDecoderLayerBoundary()  # idempotent: one wrapper
-    assert g.Gemma4TextDecoderLayer.forward.__wrapped__ is original
+    forward = g.Gemma4TextDecoderLayer.forward
+    assert forward._unsloth_gemma4_stock is original
+    # transformers >= 5.23 keeps its checkpoint wrapper outermost, around the one scope.
+    scope = forward.__wrapped__ if forward.__code__.co_name == "forward_with_checkpointing" else forward
+    assert scope.__wrapped__ is p.checkpointed_forward_body(original)
     monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "0")
     p.patch_Gemma4TextDecoderLayerBoundary()
     assert g.Gemma4TextDecoderLayer.forward is original

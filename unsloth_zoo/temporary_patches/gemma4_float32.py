@@ -54,7 +54,9 @@ from .common import (
     publish_to_modeling_module,
 )
 from .utils import (
+    checkpointed_forward_body,
     compile_with_eager_fallback,
+    keep_layer_checkpointing,
     other_family_load,
     patch_forced_float32,
     raise_error,
@@ -683,15 +685,18 @@ def patch_Gemma4TextDecoderLayerBoundary():
             for suffix, _ in scopes:
                 cls = getattr(modeling, prefix + suffix, None)
                 if cls is not None and getattr(cls.forward, "_unsloth_gemma4_boundary", False):
-                    cls.forward = cls.forward.__wrapped__
+                    cls.forward = getattr(cls.forward, "_unsloth_gemma4_stock", None) or cls.forward.__wrapped__
         return
     for suffix, boundary_of in scopes:
         for module, prefix in _gemma4_text_variants():
             cls = getattr(module, prefix + suffix, None)
             if cls is None: continue
-            original = cls.forward
-            if getattr(original, "_unsloth_gemma4_boundary", False):
+            stock = cls.forward
+            if getattr(stock, "_unsloth_gemma4_boundary", False):
                 continue
+            # Wrap the body under transformers >= 5.23's checkpoint wrapper, then wrap the class again: wrapping the
+            # wrapper turned checkpointing off (E2B LoRA kept every activation, 27 GB instead of 10 GB).
+            original = checkpointed_forward_body(stock)
 
             def forward(self, *args, _unsloth_original = original, _unsloth_boundary_of = boundary_of,
                         _unsloth_text_layer = suffix == "TextDecoderLayer", **kwargs):
@@ -707,8 +712,10 @@ def patch_Gemma4TextDecoderLayerBoundary():
                     _GEMMA4_BOUNDARY.dtype = previous
             pass
             forward._unsloth_gemma4_boundary = True
+            forward._unsloth_gemma4_stock = stock
             forward.__wrapped__ = original
             cls.forward = forward
+            keep_layer_checkpointing(cls, "forward", stock)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4TextDecoderLayerBoundary)
 

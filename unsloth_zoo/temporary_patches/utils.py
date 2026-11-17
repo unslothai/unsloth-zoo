@@ -16,6 +16,8 @@
 
 __all__ = [
     "patch_function",
+    "checkpointed_forward_body",
+    "keep_layer_checkpointing",
     "UNSLOTH_DECODE_COMPILE",
     "unsloth_decode_compile",
     "eager_decode_active",
@@ -2439,6 +2441,33 @@ def force_eager_fallback(only_if_already_triggered: bool = True) -> int:
     return max(len(live), len(_LATCHED_EAGER_LABELS))
 
 
+def _is_checkpoint_wrapper(func):
+    return getattr(getattr(func, "__code__", None), "co_name", "") == "forward_with_checkpointing" \
+        and callable(getattr(func, "__wrapped__", None))
+
+
+def checkpointed_forward_body(forward):
+    """The forward that transformers >= 5.23's per-class checkpoint wrapper calls, else `forward` itself."""
+    return forward.__wrapped__ if _is_checkpoint_wrapper(forward) else forward
+
+
+def keep_layer_checkpointing(cls, attr_name, replaced):
+    """transformers >= 5.23 checkpoints a GradientCheckpointingLayer in a `forward_with_checkpointing` wrapper that
+    only checkpoints while it is `type(self).forward`. After `replaced` (that wrapper) is swapped out, wrap the class
+    again, or the layer silently stops checkpointing and keeps every activation."""
+    if attr_name != "forward" or not isinstance(cls, type) or not _is_checkpoint_wrapper(replaced):
+        return
+    if _is_checkpoint_wrapper(cls.__dict__.get("forward")):
+        return
+    try:
+        from transformers.modeling_layers import GradientCheckpointingLayer
+    except Exception:
+        return
+    if issubclass(cls, GradientCheckpointingLayer) and "__init_subclass__" in GradientCheckpointingLayer.__dict__:
+        GradientCheckpointingLayer.__init_subclass__.__func__(cls)
+pass
+
+
 def patch_function(
     target_obj: Any,
     attr_name: str,
@@ -2515,6 +2544,7 @@ def patch_function(
     pass
     try:
         setattr(target_obj, attr_name, new_func)
+        keep_layer_checkpointing(target_obj, attr_name, original_func)
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: Patched {target_obj.__name__}.{attr_name}.")
         return True
