@@ -274,7 +274,7 @@ _MOE_GATE_UP_FUNCTIONS = {
 }
 _MOE_SWITCH_GLU_CALLS = {
     "mlx_lm.models.switch_layers": ("ed00798a68bad37d", "3a412610c5b9c112"),
-    "mlx_vlm.models.switch_layers": ("ed00798a68bad37d", "4e3d80f1396fb265"),
+    "mlx_vlm.models.switch_layers": ("ed00798a68bad37d", "4e3d80f1396fb265", "b3f8c684857eb8fe"),
 }
 
 
@@ -312,6 +312,9 @@ def _moe_gate_up_packable(module, projection_type):
     if gate.trainable_parameters() or up.trainable_parameters():
         return False
     if gate.get("global_scale") is not None or up.get("global_scale") is not None:
+        return False
+    # mlx-vlm 0.8.0 sorts the routes of a rank's share of the experts on its own threshold.
+    if getattr(module, "num_experts", gate.num_experts) != gate.num_experts:
         return False
     if (gate.group_size, gate.bits, gate.mode) != (up.group_size, up.bits, up.mode):
         return False
