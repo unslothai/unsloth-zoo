@@ -26,7 +26,7 @@ from .mxfp4_gemm import _gemv_rows, mxfp4_gemm_available, mxfp4_grouped_gemv_ava
 
 try:
     # Bit-identical to the eager combine; returns None off CUDA or without Triton.
-    from .temporary_patches.moe_triton_kernels import weighted_unpermute as _weighted_unpermute
+    from unsloth_zoo.temporary_patches.moe_triton_kernels import weighted_unpermute as _weighted_unpermute
 except Exception:
     _weighted_unpermute = None
 
