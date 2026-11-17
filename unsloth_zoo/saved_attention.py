@@ -33,7 +33,10 @@ pinned host memory with UNSLOTH_GC_SAVE_ATTENTION=offload (copied out on a side 
 back one layer ahead of the backward). A backend whose kernel is not visible to the
 dispatcher (a pybind-only FlashAttention, xformers' C++ ops, Unsloth's own fused kernels) stores
 nothing and is recomputed as before, and so is any call whose replay does not match the first pass
-(other op, other shapes): the replay then computes the kernel itself.
+(other op, other shapes): the replay then computes the kernel itself. A call that draws from the
+random generator (attention dropout) is recomputed too: skipping its draws in the replay would hand
+later dropout in the same layer (LoRA dropout) other masks than the first pass used.
+FlexAttention's function-level entries are not offloaded: offload mode recomputes them.
 """
 
 import collections
@@ -64,6 +67,8 @@ __all__ = [
 # mismatch: a replay kernel call that did not match the stored one (computed instead).
 # unmatched: stored kernel outputs that no replay call took.
 # too_big: FlexAttention graphs that would keep more than the output + lse (not kept).
+# random: calls that drew from the random generator (dropout), recomputed so the replay draws the same.
+# not_offloaded: FlexAttention calls in offload mode, recomputed (function entries are not offloaded).
 # offloaded_bytes / prefetched: offload mode, bytes copied to the host / frames copied back ahead.
 SAVED_ATTENTION_STATS = collections.Counter()
 
@@ -216,6 +221,18 @@ def _detach(t):
     return t.detach()
 
 
+def _rng_state(tensors):
+    """The generators an attention call can draw from: the CPU one and those of its CUDA devices."""
+    devices = sorted({t.device.index for t in tensors if isinstance(t, torch.Tensor) and t.is_cuda})
+    return [torch.get_rng_state()] + [torch.cuda.get_rng_state(index) for index in devices]
+
+
+def _rng_advanced(before, tensors):
+    # The checkpoint replay starts from the first pass's generator state. A kept output would skip
+    # this call's draws in the replay, so every later random op of the layer would draw other values.
+    return any(not torch.equal(a, b) for a, b in zip(before, _rng_state(tensors)))
+
+
 # ---------------------------------------------------------------------------
 # UNSLOTH_GC_SAVE_ATTENTION=offload: kept kernel outputs in pinned host memory between the passes
 # ---------------------------------------------------------------------------
@@ -331,11 +348,18 @@ class _StoreMode(TorchDispatchMode):
     def __init__(self, entry):
         super().__init__()
         self.entry = entry
+        self.random = False
 
     def __torch_dispatch__(self, func, types, args = (), kwargs = None):
         kwargs = kwargs or {}
+        if not _is_attention_forward(func):
+            return func(*args, **kwargs)
+        flat = tree_flatten((args, kwargs))[0]
+        before = _rng_state(flat)
         out = func(*args, **kwargs)
-        if _is_attention_forward(func):
+        if _rng_advanced(before, flat):
+            self.random = True
+        else:
             self.entry.append((func, _signature(args, kwargs), tree_map_only(torch.Tensor, _detach, out)))
         return out
 
@@ -400,10 +424,15 @@ def saved_attention_call(function, *tensors):
         if torch.is_grad_enabled():
             return function(*tensors)
         entry = []
-        with torch.enable_grad(), _StoreMode(entry):
+        mode = _StoreMode(entry)
+        with torch.enable_grad(), mode:
             out = function(*_first_pass_leaves(tensors))
         out = tree_map_only(torch.Tensor, _detach, out)
-        if entry:
+        if mode.random:
+            # Dropout inside the kernel: the replay recomputes the whole call and draws the same.
+            frame.entries.append(None)
+            SAVED_ATTENTION_STATS["random"] += 1
+        elif entry:
             if frame.offload:
                 _offload_entry(entry)
             frame.entries.append(("kernel", entry))
@@ -446,11 +475,12 @@ def _same_view_of(t, leaf):
 
 
 class _FunctionEntry:
-    __slots__ = ("outputs", "leaves", "replay", "spec", "kept_bytes")
+    __slots__ = ("outputs", "leaves", "layouts", "replay", "spec", "kept_bytes")
 
     def __init__(self):
         self.outputs = None
         self.leaves = None
+        self.layouts = None
         self.replay = None
         self.spec = None
         self.kept_bytes = 0
@@ -482,17 +512,18 @@ class _ReplayFunction(torch.autograd.Function):
         ctx.entry = None
         replay_inputs = ctx.saved_tensors
         replay = []
-        for leaf, x in zip(entry.leaves, replay_inputs):
-            if x.stride() != leaf.stride():
+        for (shape, stride, _, _), x in zip(entry.layouts, replay_inputs):
+            if x.stride() != stride:
                 # The kept graph addresses Q / K / V through the first pass's layout (offsets are
                 # relative to the leaf, so only the strides must agree).
-                y = torch.empty_strided(leaf.shape, leaf.stride(), dtype = x.dtype, device = x.device)
+                y = torch.empty_strided(shape, stride, dtype = x.dtype, device = x.device)
                 y.copy_(x)
                 x = y
             replay.append(x.detach())
         entry.replay = replay
+        differentiable = [leaf is not None and x.requires_grad for leaf, x in zip(entry.leaves, replay_inputs)]
         pairs = [(o, g) for o, g in zip(entry.outputs, grads) if g is not None and o.requires_grad]
-        wanted = [leaf for leaf, x in zip(entry.leaves, replay_inputs) if x.requires_grad]
+        wanted = [leaf for leaf, d in zip(entry.leaves, differentiable) if d]
         if not pairs or not wanted:
             entry.replay = None
             entry.outputs = None
@@ -502,8 +533,9 @@ class _ReplayFunction(torch.autograd.Function):
         )
         entry.replay = None
         entry.outputs = None
+        entry.leaves = None
         found = iter(found)
-        input_grads = tuple(next(found) if x.requires_grad else None for x in replay_inputs)
+        input_grads = tuple(next(found) if d else None for d in differentiable)
         return (None,) + input_grads
 
 
@@ -513,14 +545,21 @@ def saved_function_call(function, n_inputs, *args, **kwargs):
 
     The first pass keeps the function's autograd graph, with ``args[:n_inputs]`` (Q, K, V) replaced
     by placeholders through saved-tensor hooks, so it holds only what the kernel saves beyond its
-    inputs (output + logsumexp). The replay returns the kept outputs, and backward runs the kept
-    graph with the replay's Q / K / V. Used where the kernel is not a dispatcher op (FlexAttention)."""
+    inputs (output + logsumexp); the graph's Q / K / V leaves keep their autograd identity but not
+    their storage. The replay returns the kept outputs, and backward runs the kept graph with the
+    replay's Q / K / V. Used where the kernel is not a dispatcher op (FlexAttention)."""
     frame = getattr(_TLS, "frame", None)
     if frame is None:
         return function(*args, **kwargs)
     inputs = args[:n_inputs]
     if not frame.replaying:
         if torch.is_grad_enabled() or not all(isinstance(x, torch.Tensor) for x in inputs):
+            return function(*args, **kwargs)
+        if frame.offload:
+            # A kept graph cannot move to the host: offload mode recomputes this call as before
+            # rather than holding its output and logsumexp on the device for every layer.
+            frame.entries.append(None)
+            SAVED_ATTENTION_STATS["not_offloaded"] += 1
             return function(*args, **kwargs)
         entry = _FunctionEntry()
         leaves = _first_pass_leaves(inputs)
@@ -540,8 +579,11 @@ def saved_function_call(function, n_inputs, *args, **kwargs):
                 return base.as_strided(shape, stride, base.storage_offset() + offset)
             return p
 
+        flat_args = tree_flatten((args, kwargs))[0]
+        before = _rng_state(flat_args)
         with torch.enable_grad(), torch.autograd.graph.saved_tensors_hooks(pack, unpack):
             out = function(*leaves, *args[n_inputs:], **kwargs)
+        random = _rng_advanced(before, flat_args)
         flat, spec = tree_flatten(out)
         outputs = [o for o in flat if isinstance(o, torch.Tensor)]
         template = [_TENSOR_SLOT if isinstance(o, torch.Tensor) else o for o in flat]
@@ -554,6 +596,11 @@ def saved_function_call(function, n_inputs, *args, **kwargs):
                 seen.add(key)
                 kept_bytes += t.untyped_storage().nbytes()
         detached = tree_map_only(torch.Tensor, _detach, out)
+        if random:
+            # The replay would skip this call's draws: recompute it so later dropout matches.
+            frame.entries.append(None)
+            SAVED_ATTENTION_STATS["random"] += 1
+            return detached
         # Kept beyond the outputs: block mask indices, rng state. A graph holding expanded K / V or
         # score matrices is not worth keeping: recompute that call instead.
         if not outputs or not any(o.requires_grad for o in outputs) or \
@@ -562,6 +609,17 @@ def saved_function_call(function, n_inputs, *args, **kwargs):
             SAVED_ATTENTION_STATS["too_big" if outputs else "no_kernel"] += 1
             return detached
         entry.outputs = outputs
+        entry.layouts = [(x.shape, x.stride(), x.dtype, x.device) for x in inputs]
+        for i, (leaf, x) in enumerate(zip(leaves, inputs)):
+            if leaf is x:
+                # Not differentiable (passed through as is): nothing of it is needed in backward.
+                leaves[i] = None
+            else:
+                # The detached leaf shares the caller's Q / K / V storage, and the kept graph holds
+                # it (AccumulateGrad). Its saved uses are placeholders already, so swap its data for
+                # a one-element stand-in: the leaf keeps its autograd identity, not the storage.
+                leaf.data = torch.empty((), dtype = leaf.dtype, device = leaf.device).expand(leaf.shape)
+        kept.clear()
         entry.leaves = leaves
         entry.spec = (template, spec)
         entry.kept_bytes = kept_bytes
@@ -574,9 +632,9 @@ def saved_function_call(function, n_inputs, *args, **kwargs):
     if not found or found[0] != "function":
         return function(*args, **kwargs)
     entry = found[1]
-    if len(inputs) != len(entry.leaves) or any(
-        not isinstance(x, torch.Tensor) or x.shape != leaf.shape or x.dtype != leaf.dtype or x.device != leaf.device
-        for x, leaf in zip(inputs, entry.leaves)
+    if len(inputs) != len(entry.layouts) or any(
+        not isinstance(x, torch.Tensor) or x.shape != shape or x.dtype != dtype or x.device != device
+        for x, (shape, _, dtype, device) in zip(inputs, entry.layouts)
     ):
         SAVED_ATTENTION_STATS["mismatch"] += 1
         return function(*args, **kwargs)

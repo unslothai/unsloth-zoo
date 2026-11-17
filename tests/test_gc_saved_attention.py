@@ -275,3 +275,196 @@ def test_rocm_keeps_the_mode_off(monkeypatch):
     assert sa.new_saved_attention_frame([torch.zeros(1, requires_grad = True)]) is None
     monkeypatch.setattr(torch.version, "hip", None, raising = False)
     assert sa.save_attention_enabled() is True
+
+
+# ---------------------------------------------------------------------------
+# Random attention kernels: the replay must consume the generator exactly like the first pass
+# ---------------------------------------------------------------------------
+def _math_attention(q, k, v, keep):
+    scores = (q @ k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
+    causal = torch.ones(q.shape[-2], k.shape[-2], dtype = torch.bool, device = q.device).triu(1)
+    p = scores.masked_fill(causal, float("-inf")).softmax(-1)
+    return (p * keep) @ v
+
+
+# A dispatcher-visible attention forward that draws dropout from the generator, like CUDA flash /
+# memory-efficient attention with dropout_p > 0 (the CPU flash kernel refuses dropout). The
+# "flash_attn" namespace prefix makes saved_attention_call recognise it as an attention kernel.
+@torch.library.custom_op("flash_attn_unsloth_test::dropout_attention_fwd", mutates_args = ())
+def _dropout_attention_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dropout_p: float) -> tuple[torch.Tensor, torch.Tensor]:
+    shape = q.shape[:-1] + (k.shape[-2],)
+    keep = (torch.rand(shape, dtype = q.dtype, device = q.device) >= dropout_p).to(q.dtype) / (1 - dropout_p)
+    return _math_attention(q, k, v, keep), keep
+
+
+@_dropout_attention_fwd.register_fake
+def _(q, k, v, dropout_p):
+    return q.new_empty(q.shape), q.new_empty(q.shape[:-1] + (k.shape[-2],))
+
+
+def _dropout_attention_setup(ctx, inputs, output):
+    q, k, v, _ = inputs
+    ctx.save_for_backward(q, k, v, output[1])
+
+
+def _dropout_attention_backward(ctx, grad_out, grad_keep):
+    q, k, v, keep = ctx.saved_tensors
+    with torch.enable_grad():
+        q, k, v = (t.detach().requires_grad_() for t in (q, k, v))
+        out = _math_attention(q, k, v, keep)
+    return (*torch.autograd.grad(out, (q, k, v), grad_out), None)
+
+
+_dropout_attention_fwd.register_autograd(_dropout_attention_backward, setup_context = _dropout_attention_setup)
+
+
+def _random_layer(attention_dropout):
+    """Attention with dropout, then LoRA-style dropout on its output in the same checkpointed layer."""
+    def make(weights, attention, call):
+        wq, wk, wv, wo = weights
+
+        def forward(h):
+            q = (h @ wq).view(B, S, H, D).transpose(1, 2)
+            k = (h @ wk).view(B, S, KV, D).transpose(1, 2)
+            v = (h @ wv).view(B, S, KV, D).transpose(1, 2)
+            a = call(attention_dropout, q, k, v)
+            a = F.dropout(a.transpose(1, 2).reshape(B, S, H * D), p = 0.3, training = True)
+            return h + a @ wo
+        return forward
+    return make
+
+
+def _seeded_run(params, x, **kwargs):
+    torch.manual_seed(1234)
+    return _run(params, x, **kwargs)
+
+
+@pytest.mark.parametrize("level", ["kernel", "function"])
+def test_random_attention_is_recomputed_so_later_dropout_matches(monkeypatch, level):
+    """A kept output would skip the kernel's random draws in the replay, shifting the LoRA dropout mask."""
+    params, x = _make(n_layers = 2)
+    if level == "kernel":
+        attention = lambda q, k, v: _dropout_attention_fwd(q, k, v, 0.2)[0]  # noqa: E731
+        call = None
+    else:
+        attention = lambda q, k, v: F.scaled_dot_product_attention(q, k, v, dropout_p = 0.2, is_causal = True)  # noqa: E731
+        call = lambda fn, q, k, v: SA.saved_function_call(fn, 3, q, k, v)  # noqa: E731
+    monkeypatch.setattr(sys.modules[__name__], "_layer", _random_layer(attention))
+    plain = _seeded_run(params, x, ckpt = False, call = call)
+    full = _seeded_run(params, x, ckpt = True, call = call)
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
+    saved = _seeded_run(params, x, ckpt = True, call = call)
+    _close(full, plain)
+    _close(saved, full)
+    assert SA.SAVED_ATTENTION_STATS["random"] == 2
+    assert SA.SAVED_ATTENTION_STATS["stored"] == 0 and SA.SAVED_ATTENTION_STATS["reused"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Function level: the entry holds the output + logsumexp, never the first pass's Q / K / V
+# ---------------------------------------------------------------------------
+def _entry_storages(entry):
+    """Storage bytes reachable from a function entry: its fields and its kept autograd graph."""
+    from torch.utils._pytree import tree_flatten as flatten
+    found = {}
+
+    def add(t):
+        if isinstance(t, torch.Tensor):
+            storage = t.untyped_storage()
+            found[storage.data_ptr()] = storage.nbytes()
+
+    for name in type(entry).__slots__:
+        for leaf in flatten(getattr(entry, name, None))[0]:
+            add(leaf)
+    stack = [o.grad_fn for o in entry.outputs if o.grad_fn is not None]
+    seen = set()
+    while stack:
+        node = stack.pop()
+        if node is None or node in seen:
+            continue
+        seen.add(node)
+        add(getattr(node, "variable", None))
+        for name in dir(node):
+            if name.startswith("_saved_"):
+                try:
+                    add(getattr(node, name))
+                except Exception:
+                    pass  # a placeholder for Q / K / V: unpacks only during backward
+        stack.extend(fn for fn, _ in node.next_functions)
+    return found
+
+
+def test_function_entry_holds_only_output_and_logsumexp(monkeypatch):
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    params, x = _make(n_layers = 2)
+    entries = []
+    originals = []
+
+    class Recording(SA._FunctionEntry):
+        __slots__ = ()
+
+        def __init__(self):
+            super().__init__()
+            entries.append(self)
+
+    def attention(q, k, v):
+        if not entries or len(originals) < len(entries):
+            originals.append(StorageWeakRef(q.untyped_storage()))
+        return _sdpa(q, k, v)
+
+    call = lambda fn, q, k, v: SA.saved_function_call(fn, 3, q, k, v)  # noqa: E731
+    full = _run(params, x, ckpt = True, attention = attention)
+    entries.clear(); originals.clear()
+    monkeypatch.setattr(SA, "_FunctionEntry", Recording)
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
+    for w in params:
+        for p in w:
+            p.grad = None
+    h = x.clone().requires_grad_()
+    for w in params:
+        h = G.UnslothCheckpointFunction.apply(_layer(w, attention, call), True, h)
+    assert len(entries) == 2 and SA.SAVED_ATTENTION_STATS["stored"] == 2
+    output_bytes = B * H * S * D * 4
+    logsumexp_bytes = B * H * S * 4
+    for entry, original in zip(entries, originals):
+        held = _entry_storages(entry)
+        assert sum(held.values()) <= output_bytes + logsumexp_bytes + 1024, held
+        # The first pass's Q storage (the q projection) is free once the layer's forward returns.
+        assert original.expired()
+    h.float().pow(2).mean().backward()
+    grads = [p.grad.clone() for w in params for p in w]
+    for a, b in zip(grads, full[1]):
+        torch.testing.assert_close(a, b, rtol = 1e-4, atol = 1e-6)
+    assert SA.SAVED_ATTENTION_STATS["reused"] == 2
+
+
+def test_offload_mode_keeps_no_function_entries(monkeypatch):
+    """Function entries are not offloaded: offload mode recomputes them instead of keeping them on the device."""
+    params, x = _make()
+    call = lambda fn, q, k, v: SA.saved_function_call(fn, 3, q, k, v)  # noqa: E731
+    full = _run(params, x, ckpt = True)
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "offload")
+    saved = _run(params, x, ckpt = True, call = call)
+    _close(saved, full)
+    assert saved[2] == 6
+    assert SA.SAVED_ATTENTION_STATS["stored"] == 0 and SA.SAVED_ATTENTION_STATS["reused"] == 0
+    assert SA.SAVED_ATTENTION_STATS["not_offloaded"] == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA (flash / memory-efficient attention with dropout)")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_cuda_dropout_attention_is_recomputed(monkeypatch, dtype):
+    params, x = _make(n_layers = 2)
+    params = [[p.detach().to("cuda", dtype).requires_grad_() for p in w] for w in params]
+    x = x.to("cuda", dtype)
+    attention = lambda q, k, v: F.scaled_dot_product_attention(q, k, v, dropout_p = 0.2, is_causal = True)  # noqa: E731
+    monkeypatch.setattr(sys.modules[__name__], "_layer", _random_layer(attention))
+    full = _seeded_run(params, x, ckpt = True)
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
+    saved = _seeded_run(params, x, ckpt = True)
+    torch.testing.assert_close(saved[0], full[0])
+    for a, b in zip(saved[1], full[1]):
+        torch.testing.assert_close(a, b)
+    assert SA.SAVED_ATTENTION_STATS["random"] == 2, dict(SA.SAVED_ATTENTION_STATS)
+    assert SA.SAVED_ATTENTION_STATS["reused"] == 0
