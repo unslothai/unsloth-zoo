@@ -1225,3 +1225,28 @@ def test_load_hook_keeps_the_markers_of_patches_below_it(monkeypatch, kind):
     hooked = PreTrainedModel.__dict__["_load_pretrained_model"].__func__
     assert hooked._unsloth_frozen_table_hook and hooked.__wrapped__ is _load_pretrained_model
     assert getattr(hooked, "_some_patch_marker", False)
+
+
+def test_lookup_op_registers_where_schema_inference_needs_real_types(monkeypatch):
+    # torch 2.4 / 2.6 infer_schema rejects string annotations ('torch.Tensor'); the op must still register there
+    import unsloth_zoo.frozen_table_store as fts
+
+    seen = []
+
+    def strict_custom_op(name, mutates_args = (), **kwargs):
+        def wrap(fn):
+            if any(isinstance(v, str) for v in fn.__annotations__.values()):
+                raise ValueError(f"Parameter has unsupported type annotation: {fn.__annotations__}")
+            seen.append(fn.__annotations__)
+
+            class _Op:
+                def register_fake(self, fake):
+                    return fake
+
+            return _Op()
+
+        return wrap
+
+    monkeypatch.setattr(torch.library, "custom_op", strict_custom_op)
+    assert fts._make_lookup_op() is not None
+    assert seen and seen[0]["ids"] is torch.Tensor
