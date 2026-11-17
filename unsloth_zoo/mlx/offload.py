@@ -797,12 +797,15 @@ class _FullTableKernels:
 _SLOT_CLASSES = {}
 
 
-def _slot_projection(projection, arrays, full_experts):
-    base = type(projection)
+def slot_class(base):
     if base not in _SLOT_CLASSES:
         _SLOT_CLASSES[base] = type(f"Slot{base.__name__}", (_FullTableKernels, base), {})
+    return _SLOT_CLASSES[base]
+
+
+def _slot_projection(projection, arrays, full_experts):
     slot = copy.copy(projection)
-    slot.__class__ = _SLOT_CLASSES[base]
+    slot.__class__ = slot_class(type(projection))
     for name, array in arrays.items():
         slot[name] = array
     slot.full_experts = full_experts
@@ -1195,6 +1198,12 @@ class OffloadSwitchGLU(nn.Module):
                 row_of_route, routes, self._gather_run(rows, lambda r, s, srt: self._glu_rows(glu, r, s, srt), False)))
         object.__setattr__(self, "_parts", ((x, indices), up, gate, activated, down))
         return up
+
+    def projections(self):
+        """The slot table's expert projections, then any full or read-ahead table's: calls run on them, outside the module tree."""
+        full, ahead = self._full, self._ahead   # each read once: another thread may consume them
+        tables = (self._glu, full, ahead and ahead[1])
+        return [getattr(glu, name) for glu in tables if glu is not None for name in _PROJECTIONS]
 
     def offload_bytes(self):
         """``(on disk, resident)`` bytes of the experts this stands in for."""
