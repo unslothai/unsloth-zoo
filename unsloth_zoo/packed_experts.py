@@ -541,9 +541,15 @@ def _register_op():
         op = torch.ops.unsloth_zoo.packed_experts_mm.default
     except (AttributeError, RuntimeError):
         op = None
+    # Several expert chunks read the routed counts on the host (a sync): a CUDA graph must not capture the op.
+    tags = {}
+    if hasattr(torch, "Tag") and hasattr(torch.Tag, "cudagraph_unsafe"):
+        import inspect
+        if "tags" in inspect.signature(custom_op).parameters:
+            tags = {"tags": (torch.Tag.cudagraph_unsafe,)}
     if op is None:
         try:
-            @custom_op("unsloth_zoo::packed_experts_mm", mutates_args = ())
+            @custom_op("unsloth_zoo::packed_experts_mm", mutates_args = (), **tags)
             def packed_experts_mm(
                 inputs: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor, glob: torch.Tensor,
                 counts: torch.Tensor, fmt: str, transpose_b: bool, multiply: bool,
