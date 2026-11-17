@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Forced float32 patches keep gradient checkpointing: every decoder layer is recomputed in the backward.
-
-transformers >= 5.23 checkpoints inside the per-class `forward_with_checkpointing` wrapper, which only checkpoints
-while it is `type(self).forward`. Replacing or wrapping it (Gemma-4 dtype scope, Qwen3-MoE forced float32 forward)
-turned checkpointing off, so a Gemma-4 E2B LoRA run kept every activation (about 27 GB instead of 10 GB).
-"""
+"""Forced float32 patches must keep transformers >= 5.23's `forward_with_checkpointing` wrapper outermost,
+else checkpointing silently turns off (Gemma-4 E2B LoRA: 27 GB instead of 10 GB)."""
 
 import json
 import os
@@ -118,14 +114,12 @@ def test_gemma4_forced_float32_layers_are_recomputed(tmp_path):
     except Exception:
         pytest.skip("transformers without Gemma-4")
     res = _run(str(tmp_path))
-    assert res["boundary"], res  # the forced-float32 scope is installed
+    assert res["boundary"], res
     for key in ("patched", "patched_twice", "undone"):
         r = res[key]
         assert r["finite"], (key, res)
         assert r["forward"] == r["layers"], (key, res)
-        # Checkpointing recomputes each layer once in the backward.
         assert r["total"] == 2 * r["layers"], (key, res)
     assert res["patched_twice"]["loss"] == res["patched"]["loss"], res
     assert res["undone_is_stock"], res
-    # No patched layer class lost transformers >= 5.23's checkpoint wrapper.
     assert res["lost_checkpointing"] == [], res["lost_checkpointing"]

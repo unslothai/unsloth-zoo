@@ -2452,9 +2452,8 @@ def checkpointed_forward_body(forward):
 
 
 def keep_layer_checkpointing(cls, attr_name, replaced):
-    """transformers >= 5.23 checkpoints a GradientCheckpointingLayer in a `forward_with_checkpointing` wrapper that
-    only checkpoints while it is `type(self).forward`. After `replaced` (that wrapper) is swapped out, wrap the class
-    again, or the layer silently stops checkpointing and keeps every activation."""
+    """transformers >= 5.23's checkpoint wrapper only checkpoints while it is `type(self).forward`: after replacing
+    it, re-wrap the class or the layer silently stops checkpointing."""
     if attr_name != "forward" or not isinstance(cls, type) or not _is_checkpoint_wrapper(replaced):
         return
     if _is_checkpoint_wrapper(cls.__dict__.get("forward")):
