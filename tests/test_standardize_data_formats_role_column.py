@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pick the role column by alias membership, not a cardinality tie, and match aliases
-regardless of case or whitespace (unsloth#1766)."""
+"""Tests the role column pick: chosen by alias membership, not a cardinality tie; aliases match regardless of case or whitespace (unsloth#1766)."""
 
 import pytest
 from datasets import Dataset
@@ -119,8 +118,7 @@ def test_a_non_sharegpt_dataset_is_returned_untouched():
 
 @pytest.mark.parametrize("start_method", ["fork", "spawn"])
 def test_the_resolved_columns_survive_a_multiprocess_map(start_method):
-    """What `_standardize_dataset` closed over has to reach the workers. Windows has no
-    fork, so spawn is what runs there, and spawn is where a closure can fail to arrive."""
+    """Values _standardize_dataset closes over must reach the workers; Windows has no fork, so spawn runs there, and spawn is where a closure can fail to arrive."""
     multiprocess = pytest.importorskip("multiprocess")
 
     previous = multiprocess.get_start_method(allow_none = True)
@@ -137,9 +135,8 @@ def test_the_resolved_columns_survive_a_multiprocess_map(start_method):
         assert [m["role"] for m in out[0]["conversations"]] == ["user", "assistant"]
         assert out[0]["conversations"][0]["content"] == "Braund, Mr. Owen Harris"
     finally:
-        # `previous is None` is the normal state of a fresh process, and leaving the
-        # parametrised method pinned makes every later test order-dependent.
-        # `set_start_method(None, force = True)` clears `_actual_context`, it does not pick.
+        # previous is None in a fresh process, yet leaving the method pinned makes later tests order-dependent;
+        # set_start_method(None, force = True) clears _actual_context, it does not pick.
         multiprocess.set_start_method(previous, force = True)
 
 
@@ -189,8 +186,7 @@ def test_the_memo_never_changes_the_resolved_role():
 
 
 def test_an_unknown_role_beyond_the_sampled_rows_still_raises():
-    """Only the first ten rows decide the column, so a later non-alias role has always
-    blown up inside the map. The memo fast path must not swallow it."""
+    """Only the first ten rows decide the column, so an unknown role in a later row must still raise inside the map; the memo fast path must not swallow it."""
     rows = [{"conversations": [{"from": "human", "value": "hi"},
                                {"from": "gpt", "value": "yo"}]} for _ in range(12)]
     rows.append({"conversations": [{"from": "moderator", "value": "stop"}]})
@@ -199,8 +195,7 @@ def test_an_unknown_role_beyond_the_sampled_rows_still_raises():
 
 
 def test_aliases_that_normalize_into_each_other_are_refused():
-    """"Human" for user and "human" for assistant were distinct keys and both worked; after
-    normalization the later assignment would silently relabel every such message."""
+    """Aliases "Human" and "human" were distinct keys that both worked; after normalization the later assignment would silently relabel every such message."""
     rows = [
         {"conversations": [{"from": "Human", "value": "hi"},
                            {"from": "gpt", "value": "yo"}]},
@@ -243,9 +238,8 @@ def test_the_default_alias_lists_are_disjoint():
 
 
 def test_the_multiprocess_map_test_leaves_the_start_method_as_it_found_it():
-    """Restoring only a non-None `previous` leaves the parametrised method globally pinned,
-    and `test_start_method_probe_matches_the_pool_multiprocess_would_build` then skips,
-    switching a real assertion off."""
+    """Restoring only a non-None previous leaves the parametrised method globally pinned, so
+    test_start_method_probe_matches_the_pool_multiprocess_would_build skips and loses its assertion."""
     multiprocess = pytest.importorskip("multiprocess")
 
     before = multiprocess.get_start_method(allow_none = True)
@@ -261,8 +255,7 @@ def test_the_multiprocess_map_test_leaves_the_start_method_as_it_found_it():
 
 
 _BOTH_ALIAS_CASES = {
-    # CONTENT is a role word, so both columns are alias-only with one unique value and the
-    # cardinality heuristic used to take the second key and swap them.
+    # CONTENT is a role word, so both columns are alias-only with one unique value; the old cardinality heuristic took the second key and swapped them.
     "role_content_one_turn": (
         [{"conversations": [{"role": "user", "content": "assistant"}]}],
         [("user", "assistant")],

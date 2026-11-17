@@ -14,25 +14,15 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""higher_precision_layernorms must read only the norm class it found.
-
-It picks UNSLOTH_HIGH_PRECISION_LAYERNORM from markers like `self.weight.float()` in the
-RMSNorm source. That slice used to run one class too far, so a neighbour's markers decided.
-"""
+"""higher_precision_layernorms reads only the norm class it found when picking UNSLOTH_HIGH_PRECISION_LAYERNORM from
+markers like self.weight.float(); a neighbour's markers must not decide."""
 
 import os
 
 import pytest
 
-# Before the import: CI installs unsloth with `|| true`, and zoo raises without this flag.
-#
-# Put back afterwards, which the plain setdefault did not do. This runs at COLLECTION, and
-# pytest imports every selected module before running any test, so leaving it set handed the
-# flag to the whole xdist worker: `__init__.py:179` reads it into _SKIP_GPU_INIT, which skips
-# the import-time allocator block and pins DEVICE_TYPE to "cpu". The suite then reported
-# test_alloc_conf_platform_matrix.py as "the product wrote no allocator vars" and
-# test_temporary_patches_imports.py as "device_memory is 0", neither of which was true of the
-# product. Only the import needs the flag, and _SKIP_GPU_INIT is read once at zoo import.
+# Zoo raises at import without UNSLOTH_ZOO_DISABLE_GPU_INIT, so set and restore it only around the import: a leaked flag
+# reaches the xdist worker via _SKIP_GPU_INIT and pins DEVICE_TYPE to cpu.
 _GPU_INIT_GATE = "UNSLOTH_ZOO_DISABLE_GPU_INIT"
 _previous_gate = os.environ.get(_GPU_INIT_GATE)
 try:
@@ -99,8 +89,7 @@ def test_marker_in_the_norm_itself_still_upcasts(precision_flag):
 
 
 def test_a_marker_in_the_next_class_can_also_suppress_a_real_upcast(precision_flag):
-    # The ladder is priority ordered, so a float16 marker next door hides a real float32 norm.
-    # Qwen4Exp is the live case, and it was silently losing its upcast.
+    # The ladder is priority ordered, so a float16 marker in the next class hides a real float32 norm; Qwen4Exp was silently losing its upcast.
     float32_norm = FLOAT16_NORM.replace(
         "return output * self.weight", "return output * (1.0 + self.weight.float())"
     )

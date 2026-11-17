@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Prompt-completion collation: token type id routing.
-
-Gemma 3n emits ``token_type_ids``, Gemma 4 ``mm_token_type_ids``; both must
-move in lock-step with ``input_ids`` instead of staying a stale prompt-width
-copy. Hermetic CPU tests with a stub whitespace processor.
-"""
+"""Prompt-completion token type ids: Gemma 3n token_type_ids and Gemma 4 mm_token_type_ids must follow input_ids, not
+stay a stale prompt-width copy; CPU-only stub processor."""
 
 from __future__ import annotations
 
@@ -281,8 +277,7 @@ def _image_collator(max_seq_length):
 
 @pytest.mark.parametrize("marker", ["<img>", "<img-200>", "<patch>"])
 def test_truncation_that_cuts_an_image_placeholder_raises(marker):
-    # <img-200>: negative sentinel in input_ids (Phi-4-reasoning-vision); <patch>: only the
-    # processor declares it, as `image_token_id` (Step-3.7 `<im_patch>`).
+    # <img-200> is a negative sentinel in input_ids (Phi-4-reasoning-vision); <patch> is only declared by the processor as image_token_id (Step-3.7 <im_patch>).
     from PIL import Image
     collator = _image_collator(2)
     collator.processor.image_token_id = VOCAB["<patch>"]

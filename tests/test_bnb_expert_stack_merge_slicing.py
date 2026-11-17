@@ -14,19 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""merge_and_unload() re-quantizes the expert stack, so it overflows too.
-
-Quantizing and dequantizing an oversized stack in slices is not enough on its
-own: ParamWrapper.merge dequantizes, adds the adapter delta and re-quantizes,
-and that re-quantize is a second single bitsandbytes call over the same element
-count. It aborts the process at csrc/ops.cu line 74 exactly like the load-time
-one, after a full fine-tune rather than at load.
-
-The kernel aborts rather than raising, so a test cannot let it run. The
-threshold is lowered instead and every quantize call is recorded, which pins
-the property that matters: no single call is ever handed a stack bitsandbytes
-cannot count.
-"""
+"""Tests that merge_and_unload also slices the oversized expert-stack re-quantize, since a single bitsandbytes call
+aborts at csrc/ops.cu line 74; the cap is lowered and every call recorded."""
 
 from __future__ import annotations
 
@@ -62,8 +51,7 @@ class _ToyExperts(nn.Module):
 
 
 class _ToyMoE(nn.Module):
-    """PEFT refuses an nn.Parameter on the top-level module, and real GPT-OSS
-    holds it at ...mlp.experts.gate_up_proj, so nest it one level."""
+    """PEFT refuses an nn.Parameter on the top-level module and real GPT-OSS holds it at ...mlp.experts.gate_up_proj, so the toy nests it one level."""
 
     num_experts = NUM_EXPERTS
 
@@ -91,9 +79,7 @@ requires_target_parameters = pytest.mark.skipif(
 
 
 def _live_param(peft_model):
-    """The Params4bit as it stands now. PEFT replaces the attribute with a
-    ParamWrapper module, so reading it off the original module returns the
-    wrapper and hides every merge."""
+    """The live Params4bit: PEFT swaps the attribute for a ParamWrapper module, so reading it off the original module returns the wrapper and hides every merge."""
     for _, module in peft_model.named_modules():
         if type(module).__name__ == "ParamWrapper":
             assert getattr(type(module).merge, "_unsloth_4bit_moe_patched", False), (
@@ -159,8 +145,7 @@ def test_merge_never_hands_bitsandbytes_an_uncountable_stack(monkeypatch, quanti
 
 @requires_target_parameters
 def test_merged_weights_are_the_adapter_delta_added_to_the_base(monkeypatch, quantize_spy):
-    """The sliced re-quantize has to be a re-quantize, not a discard: merging a
-    zeroed adapter must leave the stack where it was."""
+    """The sliced re-quantize must actually re-quantize rather than discard the stack: merging a zeroed adapter must leave the stack unchanged."""
     torch.manual_seed(0)
     base = _ToyMoE().cuda()
     value = base.experts.gate_up_proj.data.clone()
@@ -190,8 +175,7 @@ def test_merged_weights_are_the_adapter_delta_added_to_the_base(monkeypatch, qua
 
 
 def test_small_stacks_still_take_the_single_call_merge_path(monkeypatch, quantize_spy):
-    """Below the threshold nothing about the merge path changes, including the
-    double quantization the sliced path has to turn off."""
+    """Below the threshold the merge path is unchanged, including double quantization, which the sliced path has to turn off."""
     torch.manual_seed(0)
     value = torch.empty(NUM_EXPERTS, TWO_INTER, HIDDEN, dtype=torch.bfloat16, device="cuda").normal_()
     monkeypatch.setattr(M, "_BNB_MAX_QUANTIZE_NUMEL", 2 ** 31)

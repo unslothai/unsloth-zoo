@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A head marked `_unsloth_counts_unshifted_labels` (aligned decoder, encoder-decoder) averages every
-non-ignored label, so the GA count must skip the causal labels[..., 1:] shift. CPU only."""
+"""Heads marked _unsloth_counts_unshifted_labels (aligned decoder, encoder-decoder) average every non-ignored label, so
+the GA count skips the labels[..., 1:] shift; CPU only."""
 import os
 import sys
 

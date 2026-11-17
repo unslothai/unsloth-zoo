@@ -1,11 +1,6 @@
-"""Regression tests for the copy-elimination in _grouped_mm_with_backward_fix.
-
-The fix passes the frozen base stack to torch._grouped_mm as a transposed view instead of
-copying it (~805 MB / ~57% of MoE GPU time on Qwen3-30B) every step, gated on the transposed-view
-safety probe. These pin: the view is kept on a probe-safe stack (else a copy is forced), the
-probe gates that choice, the probe leaves global RNG untouched, and view == contiguous
-bit-exactly in forward and backward where torch._grouped_mm runs for real.
-"""
+"""Copy elimination in _grouped_mm_with_backward_fix: the frozen base stack goes to torch._grouped_mm as a transposed
+view when the view-safety probe passes (else a copy); the probe must leave global RNG untouched; view == contiguous
+bit-exactly"""
 import pytest
 import torch
 
@@ -29,8 +24,7 @@ def _grouped_mm_ok():
 
 @pytest.fixture(autouse=True)
 def _pretend_the_kernel_is_supported(monkeypatch):
-    """These pin what happens AT the kernel, so the capability gate in front of
-    it must not answer for a CPU runner and route the call away first."""
+    """Pins behaviour at the kernel itself, so the capability gate in front must be forced true, or a CPU runner would route the call away first"""
     from unsloth_zoo.temporary_patches import moe_utils
     monkeypatch.setattr(moe_utils, "_check_torch_grouped_mm_supported", lambda: True)
 
@@ -150,9 +144,7 @@ if __name__ == "__main__":
 
 
 def test_the_routing_signature_sees_a_same_sum_swap():
-    """A sum ignores WHERE a row's values sit, so `[1, 0]` and `[0, 1]` reduced alike
-    and swapping them across an expert boundary left the signature unchanged: the guard
-    would accept a replay whose gradients belong to a different routing."""
+    """A plain row sum ignores where values sit, so a same-sum swap across an expert boundary passed the signature guard and replayed another routing's gradients"""
     from unsloth_zoo.temporary_patches.moe_utils import _routing_signature
 
     offsets = torch.tensor([2], dtype = torch.int32)
@@ -181,9 +173,8 @@ def test_the_routing_signature_sees_an_arbitrary_permutation():
 
 
 def test_the_routing_signature_does_not_upcast_the_whole_input():
-    """Upcasting on the way in materialised a whole `[routed_tokens, hidden]` transient
-    for one number per row: 512MB at 32K by 4096, on exactly the memory-constrained
-    runs this fallback exists for."""
+    """The routing signature must not upcast the whole input: a [routed_tokens, hidden] transient for one number per row
+    is 512MB at 32K x 4096, on memory-constrained runs"""
     import inspect
 
     from unsloth_zoo.temporary_patches.moe_utils import _routing_signature

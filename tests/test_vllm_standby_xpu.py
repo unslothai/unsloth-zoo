@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Standby (sleep mode) allocator routing per device.
-
-Drives the real `patch_vllm_enable_sleep_mode` against fake
-`vllm.device_allocator.{cumem,xpumem}` modules: XPU must patch vLLM's
-XpuMemAllocator (the one its worker uses) and copy via `_xpu_memcpy_sync`,
-CUDA keeps CuMemAllocator + cudaMemcpy, other devices keep the old CUDA route.
-"""
+"""Standby sleep-mode allocator routing per device: XPU patches vLLM's XpuMemAllocator (the one its worker uses) and
+copies via _xpu_memcpy_sync; CUDA keeps CuMemAllocator and cudaMemcpy; other devices keep the old CUDA route."""
 
 import dataclasses
 import sys
@@ -154,8 +149,7 @@ def test_cuda_keeps_cumem_allocator_and_cudamemcpy(vllm_utils, monkeypatch, devi
 
 
 def test_other_devices_keep_the_cumem_route(vllm_utils, monkeypatch):
-    # Before XPU support every device patched CuMemAllocator; Ascend NPU
-    # (vllm-ascend) with UNSLOTH_VLLM_STANDBY must still load, not raise.
+    # Before XPU support every device patched CuMemAllocator; Ascend NPU (vllm-ascend) with UNSLOTH_VLLM_STANDBY must still load, not raise.
     calls, cumem_cls, xpu_cls = _install_fake_vllm(vllm_utils, monkeypatch, "npu")
     vllm_utils.patch_vllm_enable_sleep_mode()
     assert "sleep" in vars(cumem_cls) and "sleep" not in vars(xpu_cls)

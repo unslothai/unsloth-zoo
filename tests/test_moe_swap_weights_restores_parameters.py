@@ -14,15 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""swap_moe_weights_for_call (the dequantize-then-dispatch path of the bnb 4-bit and FP8 MoE
-backends) must leave the experts module's parameters registered exactly as it found them.
-
-It installs the dense weights with object.__setattr__, which writes the instance __dict__. Writing
-the original Parameter back the same way left it in __dict__, shadowing `_parameters`: FSDP2 swaps
-`_parameters[name]` between the sharded and the all-gathered parameter around every forward, so
-after one call the module kept returning a stale all-gather buffer (`'Params4bit' object has no
-attribute '_local_tensor'` in FSDP2's lazy init, or freed storage in the next forward).
-"""
+"""swap_moe_weights_for_call must leave expert parameters registered as found; restoring via object.__setattr__ left a
+__dict__ shadow that breaks FSDP2's _parameters swaps."""
 
 import torch
 import torch.nn as nn
@@ -77,3 +70,114 @@ def test_swap_restores_plain_instance_attributes_and_raises_through():
         raise AssertionError("expected the forward's error")
     assert experts.__dict__["gate_up_proj"] is plain_gu
     assert experts.__dict__["down_proj"] is plain_dn
+
+
+import pytest
+
+from unsloth_zoo.temporary_patches.moe_utils import _torch_version_tuple
+
+# torch < 2.5 swaps through __dict__ (one graph break) because its Dynamo ignores the `_parameters` swap.
+_FULLGRAPH_SWAP = _torch_version_tuple() >= (2, 5)
+
+
+@pytest.mark.parametrize("backend", ["eager", "aot_eager", "inductor"])
+@pytest.mark.parametrize("fullgraph", [False, True])
+def test_compiled_swap_computes_with_and_backprops_into_the_swapped_weights(backend, fullgraph):
+    # torch 2.4 compiled the `_parameters` swap against the original Parameters: zeros out, no grads.
+    if fullgraph and not _FULLGRAPH_SWAP:
+        pytest.skip("torch < 2.5 swaps through __dict__, which graph-breaks")
+    experts = _Experts()
+    originals = dict(experts._parameters)
+
+    def forward_fn(module, x):
+        return (x @ module.gate_up_proj[0].T).sum() + module.down_proj.sum()
+
+    call = torch.compile(
+        lambda x, gu, dn: swap_moe_weights_for_call(experts, gu, dn, forward_fn, x) * 2,
+        backend = backend,
+        fullgraph = fullgraph,
+    )
+    torch._dynamo.reset()
+    try:
+        x = torch.ones(3, 4)
+        gu = torch.ones(2, 8, 4, requires_grad = True)
+        dn = torch.ones(2, 4, 4, requires_grad = True)
+        out = call(x, gu, dn)
+        assert out.item() == 256.0
+        out.backward()
+        assert gu.grad is not None and gu.grad.sum().item() == 192.0
+        assert dn.grad is not None and dn.grad.sum().item() == 64.0
+        assert all(experts._parameters[n] is p for n, p in originals.items())
+        assert "gate_up_proj" not in experts.__dict__ and "down_proj" not in experts.__dict__
+    finally:
+        torch._dynamo.reset()
+
+
+@pytest.mark.skipif(not _FULLGRAPH_SWAP, reason = "torch < 2.5 swaps through __dict__, which graph-breaks")
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_swap_traces_fullgraph_and_restores_under_compile(backend, dynamic):
+    # fullgraph=True on torch >= 2.5 (2.10 rejected the old `__dict__.pop` restore).
+    from torch._dynamo.utils import counters
+
+    experts = _Experts()
+    original_gu = experts._parameters["gate_up_proj"]
+    original_dn = experts._parameters["down_proj"]
+
+    def forward_fn(module, x):
+        return (x @ module.gate_up_proj[0].T).sum() + module.down_proj.sum()
+
+    @torch.compile(backend = backend, fullgraph = True, dynamic = dynamic)
+    def call(x, gu, dn):
+        return swap_moe_weights_for_call(experts, gu, dn, forward_fn, x) * 2
+
+    torch._dynamo.reset()
+    counters.clear()
+    try:
+        for rows in (3, 5, 9):
+            gu = torch.randn(2, 8, 4, requires_grad = True)
+            dn = torch.randn(2, 4, 4, requires_grad = True)
+            x = torch.randn(rows, 4)
+            out = call(x, gu, dn)
+            torch.testing.assert_close(out, 2 * ((x @ gu[0].T).sum() + dn.sum()))
+            out.backward()
+            assert gu.grad is not None and dn.grad is not None
+            assert "gate_up_proj" not in experts.__dict__
+            assert "down_proj" not in experts.__dict__
+            assert experts._parameters["gate_up_proj"] is original_gu
+            assert experts._parameters["down_proj"] is original_dn
+            assert experts.gate_up_proj is original_gu and experts.down_proj is original_dn
+        breaks = dict(counters["graph_break"])
+    finally:
+        torch._dynamo.reset()
+    assert sum(breaks.values()) == 0, breaks
+
+
+@pytest.mark.parametrize("backend", ["eager", "aot_eager"])
+@pytest.mark.parametrize("fullgraph", [False, True])
+def test_compiled_swap_keeps_parameters_registered(backend, fullgraph):
+    # torch 2.12 replayed a traced `__dict__.pop` as DELETE_ATTR, unregistering both expert Parameters.
+    if fullgraph and not _FULLGRAPH_SWAP:
+        pytest.skip("torch < 2.5 swaps through __dict__, which graph-breaks")
+    experts = _Experts()
+    originals = dict(experts._parameters)
+
+    def forward_fn(module, x):
+        return x * module.gate_up_proj.sum() + module.down_proj.sum()
+
+    call = torch.compile(
+        lambda x: swap_moe_weights_for_call(experts, torch.ones(2, 8, 4), torch.ones(2, 4, 4), forward_fn, x),
+        backend = backend,
+        fullgraph = fullgraph,
+    )
+    torch._dynamo.reset()
+    try:
+        for _ in range(3):
+            out = call(torch.ones(1))
+            assert out.item() == 64 + 32
+            assert list(experts._parameters) == ["gate_up_proj", "down_proj"]
+            assert all(experts._parameters[n] is p for n, p in originals.items())
+            assert set(dict(experts.named_parameters())) == set(originals)
+            assert "gate_up_proj" not in experts.__dict__ and "down_proj" not in experts.__dict__
+    finally:
+        torch._dynamo.reset()

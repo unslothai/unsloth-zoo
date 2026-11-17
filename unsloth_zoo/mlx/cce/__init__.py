@@ -32,8 +32,7 @@ if _MLX_AVAILABLE:
     )
 else:
     def _normalize_label_smoothing(value):
-        # Mirror the MLX implementation's domain check so validation is
-        # consistent whether or not MLX is installed.
+        # Mirror the MLX implementation's domain check so validation is consistent whether or not MLX is installed.
         import math
         import numbers
         if isinstance(value, bool) or not isinstance(value, numbers.Real):
@@ -74,8 +73,7 @@ def _get_runtime_cce(
     weight_is_frozen: bool = False,
     precompute_hidden_gradient: bool = False,
 ):
-    # Normalize BEFORE key lookup: a cached entry must never let an invalid
-    # value (e.g. True -> 1.0) bypass validation.
+    # Normalize BEFORE key lookup: a cached entry must never let an invalid value (e.g. True -> 1.0) bypass validation.
     label_smoothing = _normalize_label_smoothing(label_smoothing)
     key = (ignore_index, logit_softcap, chunk_size, quantized, group_size, bits, mode, label_smoothing, weight_is_frozen, precompute_hidden_gradient)
     runtime_cce = _RUNTIME_CCE_CACHE.get(key)

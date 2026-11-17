@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Tests for the read-only HF cache redirect in ``unsloth_zoo/hf_cache.py``.
-
-The module is loaded directly via importlib so these tests do not import the
-full ``unsloth_zoo`` package (which pulls in torch + GPU init).
-"""
+"""Tests the read-only HF cache redirect in unsloth_zoo/hf_cache.py; loads that module via importlib so the unsloth_zoo package (torch and GPU init) is not imported."""
 
 from __future__ import annotations
 
@@ -87,8 +83,7 @@ def test_readonly_hub_redirects(hf_cache, tmp_path, monkeypatch):
 
 
 def test_home_resolution_failure_redirects(hf_cache, tmp_path, monkeypatch):
-    # Unresolvable home (arbitrary-uid containers) must not crash the import
-    # and must fall through to a writable fallback.
+    # Unresolvable home (arbitrary-uid containers) must not crash the import and must fall through to a writable fallback.
     def _no_home():
         raise RuntimeError("could not determine home directory")
     monkeypatch.setattr(hf_cache.Path, "home", staticmethod(_no_home))
@@ -112,8 +107,7 @@ def test_no_writable_fallback_warns_and_leaves_env(hf_cache, tmp_path, monkeypat
 
 
 def test_empty_env_value_matches_hub_semantics(hf_cache, tmp_path, monkeypatch):
-    # Hub's os.getenv keeps a present-but-empty HF_HOME, yielding relative
-    # cache paths; the probe must target those same locations.
+    # Hub's os.getenv keeps a present-but-empty HF_HOME, yielding relative cache paths; the probe must target those same locations.
     monkeypatch.setenv("HF_HOME", "")
     monkeypatch.chdir(tmp_path)
     assert hf_cache.redirect_hf_cache_if_readonly() is None
@@ -226,8 +220,7 @@ def test_env_vars_in_hub_path_expanded(hf_cache, tmp_path, monkeypatch):
 
 
 def test_xet_env_value_probed_literally(hf_cache, tmp_path, monkeypatch):
-    # Hub does NOT expandvars/expanduser HF_XET_CACHE, so the probe must
-    # target the same literal path Hub will use.
+    # Hub does NOT expandvars/expanduser HF_XET_CACHE, so the probe must target the same literal path Hub will use.
     root = tmp_path / "root"
     monkeypatch.setenv("MY_CACHE_ROOT", str(root))
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hfhome"))
@@ -240,8 +233,7 @@ def test_xet_env_value_probed_literally(hf_cache, tmp_path, monkeypatch):
 
 @pytest.mark.skipif(os.name != "posix", reason = "symlinks need privileges on Windows")
 def test_explicit_symlinked_hub_cache_honored(hf_cache, tmp_path, monkeypatch):
-    # Users symlink caches to large volumes; Hub writes through the link, so
-    # a writable symlinked cache must not be redirected away.
+    # Users symlink caches to large volumes; Hub writes through the link, so a writable symlinked cache must not be redirected away.
     target = tmp_path / "real_hub"
     target.mkdir()
     link = tmp_path / "hub_link"

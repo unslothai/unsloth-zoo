@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""llama.cpp prebuilts and converter sources come only from unslothai/llama.cpp
-releases, never from ggml-org. No network: every GitHub call is stubbed."""
+"""Tests that llama.cpp prebuilts and converter sources come only from unslothai/llama.cpp releases, never ggml-org; every GitHub call is stubbed."""
 
 import hashlib
 import importlib.util
@@ -85,8 +84,7 @@ def _serve_release_list(mod, monkeypatch, pages):
 
 @pytest.mark.parametrize("fork_release", [None, ("b9585-mix-abc", {})])
 def test_a_cpu_install_never_falls_back_to_ggml_org(mod, monkeypatch, tmp_path, fork_release):
-    """Fork unreachable, or a fork release with no bundle for this host: compile
-    from source. Before, both cases went on to download ggml-org's CPU build."""
+    """If the fork is unreachable or has no bundle for this host, compile from source; never download ggml-org's CPU build."""
     monkeypatch.setattr(platform, "system", lambda: "Linux")
     monkeypatch.setattr(platform, "machine", lambda: "x86_64")
     apis = []

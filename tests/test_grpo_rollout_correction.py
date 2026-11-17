@@ -14,14 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""vLLM rollout correction in grpo_compute_loss against float64 oracles.
-
-TRL modes (trl/trainer/grpo_trainer.py, _generate_and_score_completions, TRL 1.15): ratio =
-exp((old - sampling) * mask), summed per row for sequence_*, then clamped (*_truncate) or zeroed
-outside [C_min, C_max] (*_mask). geometric_*: exp of the masked mean log ratio (verl
-rollout_corr seq_mean_k1 statistic). Rejection options follow verl
-compute_rollout_rejection_mask with log_ratio = old - sampling.
-"""
+"""Rollout correction in grpo_compute_loss vs float64 oracles per TRL 1.15 (trl/trainer/grpo_trainer.py): sequence_*
+sums per row, *_truncate clamps, *_mask zeroes outside [C_min, C_max]; geometric_* is exp of the masked mean;
+rejection follows verl."""
 import math
 
 import pytest
@@ -100,8 +95,7 @@ def test_is_modes_match_oracle(mode, clip_min, clip_max, seed):
 
 
 def test_geometric_engages_where_the_product_saturates():
-    # 400 tokens with a mean log ratio of 0.01: the product is e^4 ~ 55 (masked at 3), the
-    # geometric mean e^0.01 stays inside [0.9, 1.1].
+    # 400 tokens at mean log ratio 0.01: the product is e^4 ~ 55 (masked at 3) while the geometric mean e^0.01 stays inside [0.9, 1.1].
     old = torch.zeros(1, 400, dtype = torch.float64)
     sampling = old - 0.01
     mask = torch.ones(1, 400, dtype = torch.long)
@@ -286,8 +280,8 @@ def test_sample_weight_of_one_over_tokens_is_dapo(ga, spg):
 
 @pytest.mark.parametrize("loss_type", ["dapo", "grpo", "cispo", "dr_grpo"])
 def test_sample_weight_prompt_level_matches_scalerl_formula(loss_type):
-    # ScaleRL prompt-level aggregation over 3 groups of 4, group 1 excluded (zero variance):
-    # (1 / kept groups) sum_g (1 / tokens in g) sum_{i in g, t} l_it, summed over the micro-batches.
+    # ScaleRL prompt-level weights, 3 groups of 4 with group 1 excluded for zero variance: (1/kept groups) sum_g
+    # (1/tokens in g) sum_{i in g, t} l_it, summed over micro-batches.
     new, old, _, mask, adv = _data(rows = 12, cols = 9, seed = 6)
     keep = torch.tensor([1.0] * 4 + [0.0] * 4 + [1.0] * 4, dtype = torch.float64)
     tokens = mask.sum(-1).double().view(3, 4).sum(-1).repeat_interleave(4)
@@ -446,8 +440,7 @@ def test_rollout_rs_rejects_non_finite_thresholds(options, thresholds):
 
 @pytest.mark.parametrize("use_vllm, correction", [(False, False), (True, False), (False, True)])
 def test_unknown_trl_is_mode_is_ignored_without_is_correction(monkeypatch, use_vllm, correction):
-    # TRL only reads vllm_importance_sampling_mode inside its vLLM IS correction block, so a value this
-    # version does not know must stay a no-op when that correction is off, as it was before.
+    # TRL reads vllm_importance_sampling_mode only inside its vLLM IS correction block, so an unknown mode must stay a no-op when that correction is off.
     _drive(monkeypatch, correction = correction, use_vllm = use_vllm, args_mode = "some_future_mode")
     with pytest.raises(ValueError, match = "importance sampling mode"):
         _drive(monkeypatch, correction = True, args_mode = "some_future_mode")

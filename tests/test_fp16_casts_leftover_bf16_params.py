@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""A float16 load leaves no bfloat16 parameters behind (unsloth#3459).
-
-A pre-quantized checkpoint keeps its skipped layers and biases in the bfloat16 it was saved in.
-On a T4 Inductor skips every graph reading one, so a non-reentrant checkpoint recompute stopped
-matching its forward and multi-GPU training died at step 0.
-"""
+"""float16 load leaves no bfloat16 params behind (unsloth issue 3459): pre-quantized checkpoints keep skipped layers and
+biases in bf16; on T4 Inductor skips every graph reading one, so non-reentrant checkpoint recompute diverged and
+multi-GPU training died at step 0."""
 
 import pytest
 import torch
@@ -22,8 +19,7 @@ def _model():
     model.norm = torch.nn.LayerNorm(4).to(torch.float32)
     model.pinned = torch.nn.Linear(4, 4).to(torch.bfloat16)
     model.pinned.weight._pre_set_compute_dtype = torch.bfloat16
-    # The repository's usual convention pins the module, not the parameter; a bfloat16 value
-    # past the float16 range must survive.
+    # The repo convention pins the module, not the parameter; a bfloat16 value past the float16 range must survive.
     model.module_pinned = torch.nn.Sequential(torch.nn.Linear(4, 4)).to(torch.bfloat16)
     model.module_pinned._pre_set_compute_dtype = torch.float32
     with torch.no_grad():

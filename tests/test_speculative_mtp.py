@@ -133,7 +133,7 @@ def _swiglu(x, sd, p):
 
 
 def _reference_moe(sd, config, x):
-    """llama.cpp qwen35moe graph_mtp FFN, token by token: softmax router, top-k, renormalised
+    """Token-by-token reference of the llama.cpp qwen35moe graph_mtp FFN: softmax router, top-k with renormalised
     weights, SiLU experts (gate_up_proj = [gate; up] on dim -2), plus sigmoid-gated shared expert."""
     p = "layers.0.mlp."
     n_ff = config.moe_intermediate_size

@@ -1,16 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Regression tests for the offline env cross-sync at import time.
-
-``unsloth_zoo/__init__.py`` cross-syncs three env vars so setting any one
-implies all three: ``HF_HUB_OFFLINE`` (huggingface_hub),
-``TRANSFORMERS_OFFLINE`` (transformers), ``HF_DATASETS_OFFLINE`` (datasets).
-Without ``HF_DATASETS_OFFLINE`` in the sync, ``load_dataset()`` still hits the
-network for metadata and fails with ``ConnectionError`` instead of using cache.
-
-Tests reload ``unsloth_zoo`` with each env-var combination preset.
-"""
+"""Regression tests for the import-time offline env cross-sync: setting any of HF_HUB_OFFLINE, TRANSFORMERS_OFFLINE or
+HF_DATASETS_OFFLINE sets all three; without HF_DATASETS_OFFLINE in the sync, load_dataset() hits the network and
+fails with ConnectionError."""
 
 from __future__ import annotations
 
@@ -21,9 +14,7 @@ import sys
 import pytest
 
 
-# The package the fixture reloads, plus what that reload drags in with it. A
-# prefix match, so submodules (`unsloth_zoo.vision_utils`,
-# `bitsandbytes.functional`) travel with their parent.
+# Packages the reload disturbs; matched by prefix, so submodules like unsloth_zoo.vision_utils and bitsandbytes.functional travel with their parent.
 _RELOAD_DISTURBS = ("unsloth_zoo", "bitsandbytes")
 
 
@@ -36,30 +27,9 @@ def _is_guarded(name: str) -> bool:
 
 @pytest.fixture
 def reload_zoo(monkeypatch):
-    """Strip the three offline env vars, then reload ``unsloth_zoo`` so its
-    import-time cross-sync runs.
-
-    Reloading swaps a fresh, half-initialized ``unsloth_zoo`` object into
-    ``sys.modules`` -- one that lacks submodule attributes (e.g.
-    ``vision_utils``) the package only binds when they are first imported.
-    Snapshot the original ``unsloth_zoo*`` modules and restore them on
-    teardown so the reload does not leak that shell into the rest of the
-    session and break later tests that resolve submodules via string paths
-    (e.g. ``monkeypatch.setattr("unsloth_zoo.vision_utils.<attr>", ...)``).
-
-    ``bitsandbytes*`` is snapshotted for the same reason and was missed the
-    first time: importing ``unsloth_zoo`` pulls bitsandbytes in, so a reload
-    can swap whatever was already in ``sys.modules`` under that name -- a stub
-    an earlier test installed, or the real package -- for the other one. The
-    conftest teardown guard catches exactly this and named this fixture:
-
-        test_unset_stays_unset replaced ['bitsandbytes'] in sys.modules and
-        did not put it back, so every later test in this process imports the
-        substitute
-
-    Restoring means "leave sys.modules as this fixture found it", which is the
-    fixture's contract for unsloth_zoo already; bitsandbytes is not special.
-    """
+    """Strips the offline env vars, then reloads unsloth_zoo; teardown restores unsloth_zoo* and bitsandbytes* in
+    sys.modules, since a reload swaps in a half-initialized package and the conftest guard flags bitsandbytes swaps;
+    the contract is to leave sys.modules as found."""
     for v in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE"):
         monkeypatch.delenv(v, raising = False)
 
@@ -110,9 +80,8 @@ class TestOfflineCrossSync:
         assert os.environ.get("HF_DATASETS_OFFLINE") == "1"
 
     def test_truthy_spellings_trigger_cross_sync_and_normalize(self, monkeypatch, reload_zoo):
-        # Any documented truthy spelling ({"1","true","yes","on"},
-        # case-insensitive) triggers the cross-sync and normalizes all three
-        # vars to the literal "1" (see _OFFLINE_TRUE in unsloth_zoo/__init__.py).
+        # Any documented truthy spelling (1, true, yes, on; case-insensitive) triggers the cross-sync and normalizes all
+        # three vars to the literal 1 (see _OFFLINE_TRUE in unsloth_zoo/__init__.py).
         for spelling in ("true", "yes", "on", "TRUE", "Yes", "On"):
             monkeypatch.setenv("HF_HUB_OFFLINE", spelling)
             reload_zoo()

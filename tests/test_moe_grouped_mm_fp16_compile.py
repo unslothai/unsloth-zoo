@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""float16 grouped GEMM under torch.compile. The eager torch._grouped_mm kernel takes float16, but its fake impl
-rejects it, so a compiled float16 MoE frame failed to trace and (Unsloth sets suppress_errors) silently ran eager.
-_grouped_mm_with_backward_fix now routes compiled float16 calls through an opaque custom op; bf16 is untouched."""
+"""Compiled float16 grouped GEMM: the torch._grouped_mm fake impl rejects fp16, so the frame silently ran eager under
+suppress_errors; compiled fp16 now goes through an opaque custom op, bf16 untouched"""
 
 import json
 import os
@@ -169,8 +168,8 @@ print("RESULT " + json.dumps({"err": err, "grads": grads, "frames": dict(counter
 
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16"])
 def test_compiled_mixtral_expert_lora_traces(tmp_path, dtype_name):
-    """End to end: Mixtral expert LoRA step compiles with suppress_errors off (float16 used to raise in the fake
-    impl of aten._grouped_mm); expert LoRA grads finite and non-zero."""
+    """Mixtral expert LoRA step compiles with suppress_errors off (the fp16 fake impl of aten._grouped_mm rejected
+    float16); expert LoRA grads are finite and non-zero"""
     _supported()
     script = tmp_path / "child.py"
     script.write_text(_CHILD)

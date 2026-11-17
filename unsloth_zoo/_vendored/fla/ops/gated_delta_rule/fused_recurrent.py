@@ -43,25 +43,25 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     cu_seqlens,
     scale,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    USE_G: tl.constexpr,
-    USE_GK: tl.constexpr,
-    USE_GV: tl.constexpr,
-    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
-    IS_BETA_HEADWISE: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
-    STORE_FINAL_STATE: tl.constexpr,
-    STATE_V_FIRST: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    USE_GATE_IN_KERNEL: tl.constexpr,
-    HAS_DT_BIAS: tl.constexpr,
-    APPLY_BETA_SIGMOID: tl.constexpr,
-    ALLOW_NEG_EIGVAL: tl.constexpr,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    USE_G: tl.constexpr,  # scalar gate
+    USE_GK: tl.constexpr,  # per-key gate
+    USE_GV: tl.constexpr,  # per-value gate
+    USE_QK_L2NORM_IN_KERNEL: tl.constexpr,  # l2norm q and k in kernel
+    IS_BETA_HEADWISE: tl.constexpr,  # beta per head and V
+    USE_INITIAL_STATE: tl.constexpr,  # h0 given
+    STORE_FINAL_STATE: tl.constexpr,  # write ht
+    STATE_V_FIRST: tl.constexpr,  # state layout is [V, K]
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    USE_GATE_IN_KERNEL: tl.constexpr,  # gate computed in kernel
+    HAS_DT_BIAS: tl.constexpr,  # dt bias given
+    APPLY_BETA_SIGMOID: tl.constexpr,  # sigmoid applied to beta in kernel
+    ALLOW_NEG_EIGVAL: tl.constexpr,  # beta scaled to (0, 2)
 ):
     # Unsloth: backported from fla PR #1097. Same 65535 grid cap as the state
     # kernels (PR #1077): a decode batch of more than 65535/HV sequences failed

@@ -338,8 +338,8 @@ def test_trainer_evaluates_and_resumes(tmp_path):
 
 
 def test_default_ddp_reduces_the_loss_only_heads(tmp_path):
-    """Trainer wraps an nn.Module in DDP(find_unused_parameters=True): the Markov and confidence heads, used
-    only by the loss, must be in forward()'s output graph or backward raises "mark a variable ready only once"."""
+    """Trainer wraps the module in DDP(find_unused_parameters=True); the Markov and confidence heads, used only by the
+    loss, must be in forward()'s output graph or backward raises "mark a variable ready only once"."""
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel
     target = _target().float()

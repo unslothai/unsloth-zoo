@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""adam_epsilon on the MLX trainer (HF TrainingArguments parity).
-
-Asserts on the kwargs _build_optimizer passes, so it holds under real MLX
-(bound at conftest preload) and under the torch simulation shim.
-"""
+"""adam_epsilon on the MLX trainer (HF TrainingArguments parity); asserts the kwargs _build_optimizer passes, so it
+holds under real MLX and the torch simulation shim."""
 
 from __future__ import annotations
 
@@ -282,8 +279,7 @@ def test_the_epsilon_guard_covers_non_mlx_config_objects():
 
 
 def test_appended_field_stays_an_exact_suffix():
-    """Positional binding needs the copy fields to be a suffix of the positional
-    (non kw_only) fields, preference config subclasses included."""
+    """Positional binding needs the copy fields to be an exact suffix of the positional (non kw_only) fields, including preference config subclasses."""
     from dataclasses import fields as dataclass_fields
     from unsloth_zoo.mlx.trainer import (
         MLXDPOConfig,
@@ -333,7 +329,8 @@ def test_a_pre_pr_positional_config_copy_still_maps(monkeypatch):
         if f.init and not f.kw_only
     ]
     original = MLXTrainingConfig(optim="adam", learning_rate=1.5e-4, run_name="old")
-    pre_pr = [getattr(original, name) for name in names if name != "adam_epsilon"]
+    # A dump from before adam_epsilon holds only the fields declared ahead of it.
+    pre_pr = [getattr(original, name) for name in names[: names.index("adam_epsilon")]]
     copied = MLXTrainingConfig(*pre_pr)
 
     assert copied.optim == "adam"

@@ -1,13 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Regression test: fix_untrained_tokens' IGNORED_TOKENIZER_NAMES guard must match
-case-insensitively.
-
-The production list is exported (via UNSLOTH_IGNORED_TOKENIZER_NAMES) fully
-lowercased, but callers may also provide canonical mixed-case IDs. Both the model
-name and configured entries must therefore be normalized before comparison.
-"""
+"""fix_untrained_tokens' IGNORED_TOKENIZER_NAMES guard matches case-insensitively: UNSLOTH_IGNORED_TOKENIZER_NAMES is
+exported lowercased but callers may pass mixed-case IDs, so both sides are normalized."""
 
 import os
 from pathlib import Path

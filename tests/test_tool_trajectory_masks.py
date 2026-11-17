@@ -14,13 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Label masks for multi-turn tool-calling (agent trajectory) SFT.
-
-Assistant tool calls and answers must be trained; tool results, user and system turns masked.
-Covers ``train_on_responses_only`` on real chat templates and the ``messages`` dataset path of
-``sft_prepare_dataset`` (``assistant_only_loss`` with TRL's training template, and the
-train_on_responses_only fallback used when TRL has no training template for the tokenizer).
-"""
+"""Label masks for multi-turn tool-calling SFT: assistant calls and answers trained, tool results, user and system turns
+masked; sft_prepare_dataset's messages path uses assistant_only_loss with TRL's training template, or
+train_on_responses_only when TRL has none."""
 
 from types import SimpleNamespace
 
@@ -189,7 +185,9 @@ def test_assistant_only_loss_reads_messages_beside_a_text_column():
     input_ids, labels = _prepare(tokenizer, fallback = True, text = text)
     _assert_trajectory_masks(_trained_text(tokenizer, input_ids, labels))
     input_ids, labels = _prepare(tokenizer, assistant_only_loss = False, text = "plain text row")
-    assert tokenizer.decode(input_ids).endswith("plain text row")
+    # Without assistant_only_loss the text column wins; plain-text rows end in one EOS, as in TRL (#2558).
+    assert input_ids[-1] == tokenizer.eos_token_id and input_ids.count(tokenizer.eos_token_id) == 1
+    assert tokenizer.decode(input_ids[:-1]).endswith("plain text row")
 
 
 def test_rows_truncated_before_any_assistant_token_are_dropped(monkeypatch):

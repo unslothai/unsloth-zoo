@@ -14,14 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""fast_inference vLLM -> HF extraction for Qwen3.5, on CPU.
-
-1. vLLM's in-flight bitsandbytes loader packs in_proj_qkvz / in_proj_ba per LOADED shard
-   (HF stores in_proj_qkv + in_proj_z, in_proj_b + in_proj_a), so bnb_quant_state has one
-   entry per checkpoint tensor and bnb_shard_offsets index the packed rows, not output_sizes.
-2. transformers 5 gives Qwen3.5's vision_config model_type "qwen3_5_vision", whose merged
-   vision attn.qkv must be kept whole.
-"""
+"""Qwen3.5 fast_inference vLLM-to-HF extraction on CPU: vLLM packs in_proj_qkvz and in_proj_ba per loaded shard, so
+bnb_shard_offsets index packed rows, not output_sizes; transformers 5 vision model_type qwen3_5_vision must keep
+attn.qkv whole."""
 
 import os
 import sys

@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The GGUF converter child's `gguf` resolution (unsloth#3581): child environment,
-requirement scan, candidate ranking and failure diagnosis. No network, no GPU.
-"""
+"""Tests the GGUF converter child's gguf resolution (unsloth 3581): child environment, requirement scan, candidate ranking and failure diagnosis; no network or GPU."""
 
 from __future__ import annotations
 
@@ -309,8 +307,7 @@ def test_an_unknown_architecture_scopes_to_the_eager_modules_only(mod, tmp_path)
 def test_an_unrelated_missing_architecture_does_not_switch_converters(
     mod, tmp_path, monkeypatch,
 ):
-    """unsloth#3581: a gguf-py behind on an architecture nobody is converting must
-    leave the requested converter and the environment untouched."""
+    """unsloth 3581: a gguf-py that is behind only on an architecture nobody is converting must leave the requested converter and environment untouched."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
     entry = _make_conversion_tree(tmp_path)
     # MODEL_ARCH knows GEMMA3 but not AFMOE, and AFMOE is not in this export's path.
@@ -335,8 +332,7 @@ def test_an_unrelated_missing_architecture_does_not_switch_converters(
 def test_a_missing_architecture_on_this_path_still_switches(
     mod, tmp_path, monkeypatch, capsys,
 ):
-    """When the gguf-py cannot satisfy the architecture being converted, falling
-    back is correct."""
+    """When gguf-py cannot satisfy the architecture being converted, falling back to another converter is correct."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
     monkeypatch.setattr(mod, "_installed_gguf_tree", lambda *args, **kwargs: None)
     entry = _make_conversion_tree(tmp_path)
@@ -501,8 +497,7 @@ def test_resolver_leaves_a_consistent_install_alone(mod, tmp_path, monkeypatch):
 
 
 def test_resolver_falls_back_to_the_co_versioned_converter(mod, tmp_path, monkeypatch, capsys):
-    """A newer downloaded entrypoint, an older sibling gguf-py, and the checkout's
-    own co-versioned converter beside it."""
+    """A newer downloaded entrypoint with an older sibling gguf-py falls back to the checkout's co-versioned converter sitting beside it."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
     monkeypatch.setattr(mod, "_installed_gguf_tree", lambda *args, **kwargs: None)
     _make_gguf_py(tmp_path, symbols=("Metadata",), version="0.17.1")
@@ -555,8 +550,7 @@ def test_resolver_does_not_move_for_an_advisory_miss_only(mod, tmp_path, monkeyp
 def test_the_best_candidate_wins_not_the_first_that_clears_the_certain_bar(
     mod, tmp_path, monkeypatch,
 ):
-    """A candidate can clear every certain name and still fail on an advisory one
-    that runs in practice, so the best candidate must win, not the first."""
+    """A candidate can clear every certain name yet fail on an advisory one that runs in practice, so the best candidate must win, not the first."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
     conversion = tmp_path / "conversion"
     conversion.mkdir()
@@ -634,8 +628,7 @@ def test_unrelated_failures_are_not_diagnosed_as_skew(mod, text):
     assert mod._looks_like_gguf_skew(text) is False
 
 
-# A bare attribute error names the class but not the package, so it is only ours
-# when the class is one the converter asked gguf for.
+# A bare attribute error names the class but not the package, so it counts as gguf skew only when the class is one the converter asked gguf for.
 _ARCH_ATTRIBUTE_ERROR = (
     "AttributeError: type object 'MODEL_ARCH' has no attribute 'GEMMA4'\n"
     "  gguf.MODEL_ARCH.GEMMA4"
@@ -649,8 +642,7 @@ def test_an_attribute_error_on_a_required_gguf_class_is_skew(mod):
 
 
 def test_an_attribute_error_on_a_model_side_class_is_not_skew(mod):
-    """"gguf" appears in every failure's output, so a model-side AttributeError must
-    not be diagnosed as skew."""
+    """`gguf` appears in every failure's output, so a model-side AttributeError must not be diagnosed as gguf version skew."""
     text = (
         "INFO:gguf.gguf_writer:gguf: This GGUF file is for Little Endian only\n"
         "AttributeError: type object 'Gemma3Config' has no attribute 'rope_local'"
@@ -719,8 +711,7 @@ _MODEL = Path(os.environ.get("UNSLOTH_TEST_GGUF_MODEL") or os.devnull)
 
 
 def _staged(root, name):
-    # An unreadable parent raises EACCES, which at module scope would fail
-    # collection of the whole file rather than skip this one test.
+    # An unreadable parent raises EACCES; at module scope that would fail collection of the whole file instead of skipping this one test.
     try:
         return (root / name).is_file()
     except OSError:
@@ -732,8 +723,7 @@ def _staged(root, name):
     reason="set UNSLOTH_TEST_LLAMACPP_DIR and UNSLOTH_TEST_GGUF_MODEL to run this",
 )
 def test_end_to_end_conversion_survives_a_stale_ambient_gguf(mod, tmp_path, monkeypatch):
-    """With the bundle's tree pinned, a stale gguf on PYTHONPATH does not decide
-    the child's import."""
+    """With the bundle's gguf tree pinned, a stale gguf on PYTHONPATH must not decide the child's import."""
     import shutil
 
     scripts = tmp_path / "scripts"
@@ -760,8 +750,7 @@ def test_end_to_end_conversion_survives_a_stale_ambient_gguf(mod, tmp_path, monk
     )
     assert files and Path(files[0]).is_file()
     assert Path(files[0]).stat().st_size > 1024 * 1024
-    # The stale tree is still first on the parent's PYTHONPATH, so success
-    # can only have come from the pin.
+    # The stale tree stays first on the parent's PYTHONPATH, so success can only have come from the pin.
     assert os.environ["PYTHONPATH"] == str(stale / "gguf-py")
 
 
@@ -780,8 +769,7 @@ def test_the_preflight_returns_a_pin_not_a_frozen_environment(mod, tmp_path, mon
 def test_the_installed_gguf_wheel_is_used_when_the_sibling_tree_is_too_old(
     mod, tmp_path, monkeypatch, capsys,
 ):
-    """An installed wheel newer than the sibling tree must be pinned, keeping the
-    newer converter rather than dropping back to an older one."""
+    """An installed gguf wheel newer than the sibling tree must be pinned, keeping the newer converter rather than dropping to an older one."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
     wheel = _make_gguf_py(tmp_path / "site-packages", symbols=("Metadata", "SafetensorsLocal"))
     monkeypatch.setattr(mod, "_installed_gguf_tree", lambda *a, **kw: str(wheel))
@@ -810,8 +798,7 @@ def test_the_installed_wheel_is_not_probed_when_the_request_already_works(
     monkeypatch.setattr(mod, "_installed_gguf_tree", _trap)
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
 
-    # Its own sibling gguf-py, so this does not assert on whatever `gguf` the
-    # developer's venv happens to ship.
+    # Uses its own sibling gguf-py, so the assertion does not depend on whatever `gguf` the developer's venv happens to ship.
     _make_gguf_py(tmp_path, symbols=("GGUFWriter",))
 
     converter = tmp_path / "convert_hf_to_gguf.py"
@@ -823,20 +810,15 @@ def test_the_installed_wheel_is_not_probed_when_the_request_already_works(
 
 
 def test_installed_gguf_tree_reads_the_child_not_the_parent(mod, monkeypatch, tmp_path):
-    """The tree is what the CHILD resolves with the sibling tree suppressed, and only
-    when a real package sits inside it."""
+    """The tree is what the child resolves with the sibling tree suppressed, returned only when a real gguf package sits inside it."""
     captured = {}
     tree = tmp_path / "site-packages"
     (tree / "gguf").mkdir(parents=True)
     (tree / "gguf" / "__init__.py").write_text("# gguf\n")
     # A real one is on sys.path, and only a tree with that provenance is accepted.
     monkeypatch.syspath_prepend(str(tree))
-    # `_importing_gguf_tree` asks `find_spec`, which answers from `sys.modules` before it
-    # ever looks at `sys.path`. So this only prepends a tree for a worker that has not
-    # already imported `gguf`: once any earlier test in the process has, the spec keeps
-    # naming that one, the provenance check refuses this tree and the call returns None.
-    # The tree being on sys.path is the precondition, so say it here rather than inherit
-    # whichever tests happened to run first.
+    # `_importing_gguf_tree` asks `find_spec`, which answers from `sys.modules` before `sys.path`, so cached gguf
+    # modules must be cleared or the call returns None.
     monkeypatch.delitem(sys.modules, "gguf", raising = False)
     for cached in [name for name in sys.modules if name.startswith("gguf.")]:
         monkeypatch.delitem(sys.modules, cached, raising = False)
@@ -859,8 +841,7 @@ def test_installed_gguf_tree_reads_the_child_not_the_parent(mod, monkeypatch, tm
 
 
 def test_signature_expressions_are_certain(mod):
-    """A default, a decorator and an annotation are evaluated while the module is
-    IMPORTED, so they are certain."""
+    """Defaults, decorators and annotations are evaluated while the module is imported, so gguf names in them are certain requirements."""
     source = (
         b"import gguf\n"
         b"@gguf.register\n"
@@ -994,8 +975,7 @@ def _make_older_sibling_converter(tmp_path, *, maps_the_architecture, mmproj_onl
 def test_a_fallback_that_cannot_convert_this_architecture_is_not_taken(
     mod, tmp_path, monkeypatch, capsys,
 ):
-    """A candidate that ranks as missing nothing certain but cannot convert this
-    architecture at all must not be substituted in."""
+    """A candidate that misses nothing certain but cannot convert this architecture at all must not be substituted in."""
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(tmp_path / "absent"))
     monkeypatch.setattr(mod, "_installed_gguf_tree", lambda *args, **kwargs: None)
     _make_gguf_py(tmp_path, symbols = ("Metadata",), version = "0.17.1")
@@ -1042,9 +1022,8 @@ def test_the_architecture_check_only_refuses_on_evidence(mod, tmp_path):
 
 
 def test_a_fallback_that_maps_this_architecture_in_the_wrong_half_is_refused(mod, tmp_path):
-    """The two maps are not interchangeable: presence in EITHER used to approve a
-    fallback. Asserted on the predicate because every sibling candidate reads the
-    SAME conversion package, so two diverging maps cannot be built."""
+    """The text and mmproj maps are not interchangeable: presence in only the other map must not approve a fallback;
+    asserted on the predicate since siblings share one package."""
     _make_older_sibling_converter(
         tmp_path, maps_the_architecture = True, mmproj_only = True
     )
@@ -1081,8 +1060,7 @@ def test_the_required_halves_are_read_off_the_requested_converter(mod, tmp_path)
 # --- the conversion halves this call really runs ---
 
 def _make_dual_mapped_tree(tmp_path):
-    """An architecture named by BOTH maps, whose projector module needs a symbol
-    the text module does not."""
+    """An architecture named by both maps, whose projector module needs a symbol the text module does not."""
     conversion = tmp_path / "conversion"
     conversion.mkdir()
     (conversion / "__init__.py").write_text(textwrap.dedent("""
@@ -1103,8 +1081,7 @@ def _make_dual_mapped_tree(tmp_path):
 
 
 def test_a_text_only_export_does_not_require_the_projector_module(mod, tmp_path):
-    """A text-only conversion never imports the projector module, so a symbol only
-    that module names is not certain."""
+    """A text-only conversion never imports the projector module, so a symbol only that module names is not a certain requirement."""
     entry = _make_dual_mapped_tree(tmp_path)
     arch = "DualForConditionalGeneration"
 

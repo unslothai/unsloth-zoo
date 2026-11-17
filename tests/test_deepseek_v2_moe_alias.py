@@ -1,14 +1,5 @@
-"""Tests for the DeepseekV2MoE compatibility alias (patch_deepseek_v2_moe_alias).
-
-transformers 5.x renamed DeepseekV2MoE -> DeepseekV2Moe; trust_remote_code models
-(e.g. DeepSeek-OCR) still import the old name. The patch aliases it back when only
-the new name exists, and is a no-op otherwise (transformers 4.x, or module absent).
-
-Drives the real function with a fake
-`transformers.models.deepseek_v2.modeling_deepseek_v2` injected into sys.modules,
-so the test never mutates the genuine transformers module and is independent of
-the installed transformers version.
-"""
+"""Tests patch_deepseek_v2_moe_alias: aliases DeepseekV2MoE to DeepseekV2Moe only when just the new name exists
+(transformers 5.x); no-op otherwise; uses a fake sys.modules module."""
 
 from __future__ import annotations
 
@@ -25,8 +16,7 @@ _LEAF = "transformers.models.deepseek_v2.modeling_deepseek_v2"
 
 
 def _inject(monkeypatch, **attrs):
-    """Inject a fake leaf module (and a package parent so dotted import resolves
-    purely from sys.modules) carrying the given attributes."""
+    """Inject a fake leaf module with a package parent, so the dotted import resolves purely from sys.modules, carrying the given attributes."""
     parent = types.ModuleType(_PARENT)
     parent.__path__ = []  # mark as package
     leaf = types.ModuleType(_LEAF)

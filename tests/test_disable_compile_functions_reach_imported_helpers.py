@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Listing a helper in DISABLE_COMPILE_FUNCTIONS must reach its CALLERS too.
-`called_functions` holds only names the modeling file both calls AND defines, so an
-imported-only helper is imported raw for Dynamo to inline, and the CALLER is demoted."""
+"""Listing a helper in DISABLE_COMPILE_FUNCTIONS must reach its callers too: called_functions only holds names the file
+both calls and defines, so an imported-only helper is left raw for Dynamo to inline and its caller is demoted."""
 
 import importlib.util
 import inspect
@@ -36,8 +35,7 @@ from unsloth_zoo.compiler import (
 
 
 def test_bare_calls_are_detected_and_attribute_calls_are_not():
-    """Several VL files define a METHOD of the same name, so matching those would demote
-    modules that never touch the helper."""
+    """Several VL files define a METHOD of the same name, so matching attribute calls would demote modules that never touch the helper."""
     listed = DISABLE_COMPILE_FUNCTIONS[0]
 
     assert calls_disable_compile_function(
@@ -74,9 +72,8 @@ def test_every_fullgraph_emit_site_consults_the_detector():
 
 
 def _run_compiler_child(script, cwd):
-    """Its own interpreter: the rewriter sets `__UNSLOTH_PATCHED__` on the modeling module
-    and swaps the classes it emits back into it, so a compile run is a one-way trip for
-    the process that does it."""
+    """Runs in its own interpreter: the rewriter sets __UNSLOTH_PATCHED__ on the modeling module and swaps the emitted
+    classes into it, so a compile run is one-way for its process."""
     # conftest's GPU-free harness does not reach a subprocess.
     env = dict(os.environ)
     env["UNSLOTH_ALLOW_CPU"] = "1"
@@ -106,8 +103,7 @@ def _run_compiler_child(script, cwd):
 
 
 def _decorator_above(generated, function_name):
-    """The emit sites put the decorator immediately above `def <Class>_forward`, so the
-    text after the last `\\n@` is the one that governs this function."""
+    """Emit sites put the decorator right above def <Class>_forward, so the text after the last line that starts with @ governs this function."""
     where = generated.find(f"def {function_name}(")
     assert where != -1, (
         f"{function_name} is not in the generated cache at all, so its decorator "
@@ -116,12 +112,8 @@ def _decorator_above(generated, function_name):
     return generated[:where].rsplit("\n@", 1)[-1]
 
 
-# The synthetic fixture owns the end-to-end proof, because no shipped model presents the
-# shape any more (see `_upstream_shape_is_shipped`). It writes a real modeling package to
-# disk so inspect.getsource and linecache behave exactly as they do upstream, hangs it off
-# transformers.models.__path__ so the compiler's own
-# `importlib.import_module(f"transformers.models.{mt}.modeling_{mt}")` finds it, and then
-# drives the real `unsloth_compile_transformers`.
+# No shipped model has this shape (see _upstream_shape_is_shipped), so a real modeling package is written to disk, where
+# inspect.getsource and linecache behave as upstream, and put on transformers.models.__path__ for the compiler's import.
 _SYNTHETIC_CHILD = r'''
 import os, sys, json, importlib, io, contextlib, textwrap
 os.environ["UNSLOTH_COMPILE_LOCATION"] = "unsloth_compiled_cache"
@@ -220,12 +212,11 @@ def test_synthetic_imported_helper_demotes_its_caller_and_nothing_else(tmp_path)
     caller = payload["caller"]
     innocent = payload["innocent"]
 
-    # The fixture has to have been the module the compiler actually read, not a
-    # same-named leftover somewhere else on sys.path.
+    # The fixture must be the module the compiler actually read, not a same-named leftover elsewhere on sys.path.
     assert payload["modeling_file"].startswith(str(tmp_path)), payload["modeling_file"]
 
-    # The precondition the whole rule rests on: the helper is imported, never defined
-    # here, so `called_functions` cannot see it and Dynamo inlines the raw upstream body.
+    # Precondition the whole rule rests on: the helper is imported, never defined here, so called_functions cannot see
+    # it and Dynamo inlines the raw upstream body.
     assert f"def {listed}(" not in generated, (
         f"the fixture now defines {listed} itself, which puts it in `called_functions` "
         f"and makes this test prove nothing."
@@ -240,8 +231,7 @@ def test_synthetic_imported_helper_demotes_its_caller_and_nothing_else(tmp_path)
         + payload["log"]
     )
 
-    # Demoting everything is not a fix. A module that calls nothing on the list keeps
-    # fullgraph = True, so this test fails a blanket `fullgraph = False` just as loudly.
+    # Demoting everything is not a fix: a module calling nothing on the list keeps fullgraph = True, so a blanket fullgraph = False also fails this test.
     assert "fullgraph = True" in _decorator_above(generated, f"{innocent}_forward"), (
         f"{innocent}_forward calls nothing in DISABLE_COMPILE_FUNCTIONS, so demoting it "
         f"gives up fullgraph for every leaf module in every model.\n"
@@ -256,14 +246,9 @@ _UPSTREAM_CLASS = "MiniMaxM3VL3DRotaryEmbedding"
 
 
 def _upstream_shape_is_shipped():
-    """transformers 5.17 renamed this class to MiniMaxM3VLVisionRotaryEmbedding and lifted
-    the get_vision_position_ids call out of it into MiniMaxM3VLVisionModel.forward. That is
-    a PreTrainedModel subclass, which is never compiled, so re-pointing at the new name
-    asserts nothing. Across all of transformers 5.17 the only plain nn.Module left calling
-    the helper is paddleocr_vl's encoder, and paddleocr_vl DEFINES the helper itself.
-
-    Read the source text instead of importing: importing a modeling module here would leak
-    a half-patched transformers into every test that runs after this one."""
+    """transformers 5.17 renamed the class and moved the helper call into MiniMaxM3VLVisionModel.forward, a
+    never-compiled PreTrainedModel; paddleocr_vl, which defines the helper, is the only plain nn.Module caller;
+    source is read, not imported, to avoid leaking a half-patched transformers."""
     try:
         import transformers.vision_utils  # noqa: F401
 
@@ -356,8 +341,7 @@ def test_imported_helper_is_not_inlined_into_a_fullgraph_region(tmp_path):
         + decorators[-400:]
     )
 
-    # Bonus check: a bare CI runner may lack a working inductor, and the regression itself
-    # surfaces as a different exception type.
+    # Bonus check: a bare CI runner may lack a working inductor, and the regression itself surfaces as a different exception type.
     if payload.get("error_type") == "BackendCompilerFailed":
         pytest.skip(f"inductor cannot compile here ({payload['error']}); decorator asserted above")
     assert payload["error"] is None, payload["error"]

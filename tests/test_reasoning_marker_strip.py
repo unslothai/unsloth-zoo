@@ -1,35 +1,16 @@
-"""Auto-detect must not bake reasoning-block scaffolding into the response marker.
-
-Reasoning chat templates inject thinking-block scaffolding into the generation prompt
-(and into truncated history turns) that is NOT present, in that exact form, once a real
-assistant turn carries reasoning. Two shapes occur in the wild:
-
-  paired empty tag - "<|im_start|>assistant\\n<think></think>" (Qwen3-Thinking, Nemotron Nano)
-  lone close tag   - "<|assistant|></think>"                   (GLM-4.x)
-
-A real reasoning turn renders "<think>reason</think>answer", so a marker holding the
-scaffold matches only the (empty) history turns and masks the final trained turn -- the
-model never trains on its own reasoning/answer. get_chat_template_parts re-probes with a
-reasoning-filled turn and shortens the marker to the bare assistant header ONLY when the
-scaffold is confirmed generation-only; a template that always emits it keeps it. Dropping
-only shortens to the header, so it can never unmask user content.
-
-Self-contained and hermetic: builds synthetic templates on a tiny tokenizer that is
-already cached locally. Skips (not fails) when no tokenizer can be constructed offline
-or when the `unsloth`/`unsloth_zoo` package is not importable, so a default pytest run
-never reaches the network and never breaks collection.
-"""
+"""Must not bake reasoning scaffolding into the marker (it masks the final trained turn); shortened to bare header only
+when generation-only, never unmasking user content; skips (not fails) if no offline tokenizer or unsloth_zoo is
+unavailable, so pytest never reaches the network or breaks collection."""
 import pytest
 
-# NOTE: unsloth_zoo is imported lazily in _setup(), not at module scope. Importing it
-# runs unsloth_zoo/__init__.py, which raises ImportError when the separate `unsloth`
-# package is absent; at module scope that would break pytest collection before the skip.
+# unsloth_zoo/__init__.py raises ImportError without the separate `unsloth` package, so it is imported lazily in
+# _setup(), not at module scope, to allow the skip.
 
 
 def _tokenizer():
     from transformers import AutoTokenizer
-    # local_files_only keeps this hermetic: an uncached tokenizer raises immediately
-    # (no download / network timeout) and we fall through to the next / to a skip.
+    # local_files_only keeps this hermetic: an uncached tokenizer raises at once instead of downloading or timing out,
+    # so the loop falls through to the next or a skip.
     for repo in ("hf-internal-testing/llama-tokenizer", "Qwen/Qwen2.5-0.5B-Instruct"):
         try:
             tok = AutoTokenizer.from_pretrained(repo, local_files_only=True)
@@ -42,8 +23,7 @@ def _tokenizer():
 
 
 def _setup():
-    """Load an offline tokenizer plus the zoo helpers, skipping (not failing) if either
-    the tokenizer cache or the unsloth_zoo package (needs `unsloth`) is unavailable."""
+    """Load an offline tokenizer and the zoo helpers; skips rather than fails when the tokenizer cache or unsloth_zoo (needs `unsloth`) is unavailable."""
     tok = _tokenizer()
     if tok is None:
         pytest.skip("no tokenizer cached offline")
@@ -54,8 +34,8 @@ def _setup():
     return tok, get_chat_template_parts, train_on_responses_only
 
 
-# History turns carry an empty <think></think>; the final turn keeps real reasoning; the
-# generation prompt also emits the empty tag (Qwen3-Thinking / Nemotron Nano shape).
+# History turns carry an empty <think></think> while the final turn keeps real reasoning; the generation prompt also
+# emits the empty tag (Qwen3-Thinking / Nemotron Nano shape).
 PAIRED = (
     "{%- for m in messages %}"
     "{%- if m['role'] == 'user' %}{{ '<|im_start|>user\n' + m['content'] + '<|im_end|>\n' }}"
@@ -66,8 +46,7 @@ PAIRED = (
     "{%- if add_generation_prompt %}{{ '<|im_start|>assistant\n<think></think>' }}{%- endif %}"
 )
 
-# GLM-4.x shape: empty reasoning renders a LONE closing tag "<|assistant|></think>", a real
-# reasoning turn renders "<|assistant|><think>reason</think>answer".
+# GLM-4.x shape: empty reasoning renders a lone closing tag <|assistant|></think>, while a real reasoning turn renders <|assistant|><think>reason</think>answer.
 GLM = (
     "{%- set ns = namespace(lu=-1) %}"
     "{%- for m in messages %}{%- if m['role'] == 'user' %}{%- set ns.lu = loop.index0 %}{%- endif %}{%- endfor %}"
@@ -81,8 +60,7 @@ GLM = (
     "{%- if add_generation_prompt %}{{ '<|assistant|>' }}{%- endif %}"
 )
 
-# A template that ALWAYS emits the empty tag (even on the trained turn): the strip is
-# verified, not assumed, so the tag must be KEPT.
+# A template that always emits the empty tag, even on the trained turn: the strip is verified rather than assumed, so the tag must be kept.
 ALWAYS = (
     "{%- for m in messages %}"
     "{%- if m['role'] == 'user' %}{{ '<|im_start|>user\n' + m['content'] + '<|im_end|>\n' }}"

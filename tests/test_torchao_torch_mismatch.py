@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A torchao built for a newer torch must give a readable error.
-
-The ImportError lands in the `Unpack` guard in temporary_patches/utils.py, which
-used to fall through to a bare `raise Exception(e)` naming neither package. These
-cover what the new branch must catch, must leave alone, and must not raise on.
-"""
+"""A torchao built for a newer torch must give a readable error from the Unpack guard in temporary_patches/utils.py, not
+a bare Exception naming neither package; the cases pin what the branch must catch, leave alone and never raise on."""
 
 import ast
 from pathlib import Path
@@ -31,9 +27,7 @@ UTILS = (Path(__file__).resolve().parents[1] / "unsloth_zoo"
 
 
 def _load_helpers():
-    """Exec just the two helpers: importing the module would run the very guard
-    under test, which on a broken install raises before any assertion runs.
-    """
+    """Exec just the two helpers: importing the module would run the guard under test, which raises on a broken install before any assertion runs."""
     tree = ast.parse(UTILS.read_text(encoding="utf-8"))
     wanted = {"_torchao_is_newer_than_torch", "_torchao_torch_mismatch_message"}
     ns: dict = {}

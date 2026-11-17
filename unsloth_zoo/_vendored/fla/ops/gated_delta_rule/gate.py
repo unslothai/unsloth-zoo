@@ -68,12 +68,12 @@ def gdn_gate_chunk_cumsum_scalar_kernel(
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    REVERSE: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    H: tl.constexpr,  # heads
+    BT: tl.constexpr,  # chunk size along T
+    REVERSE: tl.constexpr,  # reverse cumsum along T
+    HAS_BIAS: tl.constexpr,  # bias given
+    HAS_SCALE: tl.constexpr,  # scale given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -125,9 +125,9 @@ def gdn_gate_bwd_kernel(
     dg,
     dA,
     T,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
+    H: tl.constexpr,  # heads
+    BT: tl.constexpr,  # chunk size along T
+    HAS_BIAS: tl.constexpr,  # bias given
 ):
     i_t, i_h = tl.program_id(0).to(tl.int64), tl.program_id(1)
 
@@ -244,9 +244,9 @@ def gdn_gate_fwd_kernel(
     dt_bias,
     yg,
     T,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
+    H: tl.constexpr,  # heads
+    BT: tl.constexpr,  # chunk size along T
+    HAS_BIAS: tl.constexpr,  # bias given
 ):
     i_t, i_h = tl.program_id(0).to(tl.int64), tl.program_id(1)
 

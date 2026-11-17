@@ -80,13 +80,8 @@ def _compile_disabled():
 
 
 def _reference(patched, kwargs):
-    """What the unpatched compiled path builds: the original with the skip forced off.
-
-    Compiled, transformers sees is_compiling() and always builds the mask. Under
-    UNSLOTH_COMPILE_DISABLE=1 the wrapper is the stock function, whose own SDPA
-    shortcut returns None for an unpadded causal batch, so the reference reports
-    compiling the same way to get the mask the compiled path would have built.
-    """
+    """Reference mask the compiled path would build: UNSLOTH_SKIP_CAUSAL_MASK forced to 0 and is_compiling() reported
+    True, since under UNSLOTH_COMPILE_DISABLE=1 stock SDPA returns None for unpadded causal batches."""
     import os
     from unittest import mock
     previous = os.environ.get("UNSLOTH_SKIP_CAUSAL_MASK")
@@ -491,6 +486,24 @@ def test_right_padding_skips_the_mask_when_opted_in(patched, monkeypatch):
         assert not reference[row, 0, :n, n:].any()
 
 
+def test_right_padding_skip_is_on_by_default(patched, monkeypatch):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
+    kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
+    before = misc.CAUSAL_MASK_SKIP_STATS["right_padded"]
+    assert patched.create_causal_mask(**kwargs) is None
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before + 1
+
+
+@pytest.mark.parametrize("env", [("UNSLOTH_SKIP_RIGHT_PADDING_MASK", "0"), ("UNSLOTH_SKIP_CAUSAL_MASK", "0")])
+def test_right_padding_kill_switch_keeps_the_mask(patched, monkeypatch, env):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
+    monkeypatch.setenv(*env)
+    kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
+    before = misc.CAUSAL_MASK_SKIP_STATS["right_padded"]
+    assert isinstance(patched.create_causal_mask(**kwargs), torch.Tensor)
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before
+
+
 @pytest.mark.parametrize("attention_mask", [
     torch.tensor([[1, 1, 1, 1], [0, 1, 1, 1]]),
     torch.tensor([[1, 1, 1, 1], [1, 0, 1, 1]]),
@@ -598,8 +611,8 @@ def _flash_rule(capability, torch_2_6):
 @pytest.mark.parametrize("dropout", [0.0, 0.1])
 @pytest.mark.parametrize("grad", [True, False])
 def test_flash_sdpa_check_defers_to_the_dispatcher(monkeypatch, torch_2_6, capability, head_dim, dropout, grad):
-    # Gemma-2B GQA training (head_dim 256, 8:1 heads, dropout 0.1) on sm86 / sm89 must keep the mask:
-    # without it flash refuses and SDPA falls to the quadratic math kernel.
+    # Gemma-2B GQA training (head_dim 256, 8:1 heads, dropout 0.1) on sm86 / sm89 must keep the mask; without it flash
+    # refuses and SDPA falls to the quadratic math kernel.
     import types
     from transformers import GemmaConfig
     monkeypatch.setattr(torch.version, "hip", None)
@@ -639,8 +652,8 @@ def test_flash_sdpa_check_keeps_the_mask_when_the_probe_fails(monkeypatch):
 @pytest.mark.parametrize("efficient", [True, False])
 @pytest.mark.parametrize("efficient_enabled", [True, False])
 def test_mha_rejected_by_flash_runs_maskless_on_the_efficient_kernel(monkeypatch, kv_heads, efficient, efficient_enabled):
-    # sm86 / sm89 / sm120 flash refuses some training shapes. Equal head counts need no enable_gqa,
-    # so mem-efficient SDPA still runs the maskless causal call; GQA would fall to the math kernel.
+    # sm86 / sm89 / sm120 flash refuses some training shapes; equal head counts need no enable_gqa, so mem-efficient
+    # SDPA still runs maskless causal, while GQA would fall to the math kernel.
     import types
     from transformers import LlamaConfig
     monkeypatch.setattr(torch.version, "hip", None)
@@ -737,3 +750,53 @@ def test_flash_probe_without_enable_gqa_argument(monkeypatch):
     assert misc._flash_sdpa_accepts("cuda:0", torch.bfloat16, 8, 8, 128, 0.0, True) is True
     assert misc._flash_sdpa_accepts("cuda:0", torch.bfloat16, 8, 1, 128, 0.0, True) is False
     assert probe.param_counts == [6]
+
+
+class _SplitModel(torch.nn.Module):
+    """Stands in for a decoder whose forward builds the mask; `devices` fakes where its layers live."""
+
+    def __init__(self, devices = None, hf_device_map = None):
+        super().__init__()
+        self.layers = torch.nn.ModuleList(torch.nn.Linear(2, 2) for _ in range(2))
+        self._devices = devices
+        if hf_device_map is not None:
+            self.hf_device_map = hf_device_map
+
+    def parameters(self, recurse = True):
+        if self._devices is None:
+            yield from super().parameters(recurse)
+            return
+        for device in self._devices:
+            yield torch.empty(0, device = device)
+
+    def forward(self, create_causal_mask, kwargs):
+        return create_causal_mask(**kwargs)
+
+
+@pytest.mark.parametrize("model", [
+    lambda: _SplitModel(devices = ["cpu", "meta"]),
+    lambda: _SplitModel(hf_device_map = {"model.embed_tokens": 0, "model.layers.1": 1}),
+], ids = ["layer_devices", "hf_device_map"])
+def test_right_padding_keeps_the_mask_on_a_split_model_by_default(patched, monkeypatch, model):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
+    kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
+    model = model()
+    before = misc.CAUSAL_MASK_SKIP_STATS["right_padded"]
+    assert isinstance(model(patched.create_causal_mask, kwargs), torch.Tensor)
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before
+    # The explicit opt-in keeps skipping on split models.
+    monkeypatch.setenv("UNSLOTH_SKIP_RIGHT_PADDING_MASK", "1")
+    assert model(patched.create_causal_mask, kwargs) is None
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before + 1
+
+
+@pytest.mark.parametrize("hf_device_map", [None, {"": 0}, {"model.embed_tokens": 0, "lm_head": "cuda:0"}])
+def test_right_padding_skips_on_a_single_device_model(patched, monkeypatch, hf_device_map):
+    monkeypatch.setattr(misc, "_flash_sdpa_takes_causal", lambda config, embeds: True)
+    kwargs = _kwargs(patched, batch = 3, length = 8, attention_mask = _right_padded())
+    model = _SplitModel(hf_device_map = hf_device_map)
+    before = misc.CAUSAL_MASK_SKIP_STATS["right_padded"]
+    assert model(patched.create_causal_mask, kwargs) is None
+    assert model(patched.create_causal_mask, kwargs) is None
+    assert misc.CAUSAL_MASK_SKIP_STATS["right_padded"] == before + 2
+    assert misc._MODEL_SPANS_DEVICES[model] is False

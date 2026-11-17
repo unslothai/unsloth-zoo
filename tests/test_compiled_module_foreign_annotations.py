@@ -56,6 +56,13 @@ def test_function_defined_elsewhere():
     assert not function_defined_elsewhere(module, "missing")
 
 
+def test_an_imported_module_named_like_a_method_is_defined_elsewhere():
+    module = types.ModuleType("fake_modeling")
+    module.__file__ = __file__
+    module.copy = __import__("copy")
+    assert function_defined_elsewhere(module, "copy")
+
+
 _CHILD = r'''
 import os, sys, json, importlib, io, contextlib, textwrap, inspect
 os.environ["UNSLOTH_COMPILE_LOCATION"] = "unsloth_compiled_cache"

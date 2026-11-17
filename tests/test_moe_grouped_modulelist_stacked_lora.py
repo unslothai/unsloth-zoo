@@ -1,12 +1,6 @@
-"""Stacked expert LoRA Parameters on the transformers<5 ModuleList grouped MoE path.
-
-enable_grouped_moe turns PEFT's per-expert lora_A / lora_B Parameters of a patched block into one
-[E, r, in] / [E, out, r] Parameter per projection (UNSLOTH_MOE_STACKED_LORA=0 keeps them). The
-stacked model is checked BITWISE against the same model with the kill switch set (forward, dX,
-LoRA grads, torch / bnb optimizer steps, GradScaler + accumulation, compile), and for PEFT /
-Trainer / DDP / Unsloth compatibility: saved adapters keep PEFT's per-expert keys and load in a
-process without Unsloth, merges drop the stacks, resume continues the same loss curve.
-"""
+"""Stacked expert LoRA on the transformers<5 ModuleList grouped MoE path: per-expert lora_A/lora_B become one [E, r, in]
+/ [E, out, r] Parameter per projection (UNSLOTH_MOE_STACKED_LORA=0 disables); bitwise equal to unstacked; saved
+adapters keep per-expert keys; merges drop the stacks."""
 import contextlib
 import copy
 import json
@@ -165,8 +159,7 @@ def test_stacked_subsets_and_autocast(kind, targets):
 
 
 def test_grouped_path_reads_the_stacks():
-    """_lora_operands takes the stacked Parameters: no torch.stack over the experts' views and one
-    AccumulateGrad per stack in the backward graph (the unstacked graph has 6 * E of each)."""
+    """_lora_operands takes the stacked Parameters, so no torch.stack over expert views and one AccumulateGrad per stack (unstacked graph has 6 * E of each)."""
     ms, bs, mu, bu = pair("qwen3", "bf16", 8)
     spec = bs._unsloth_moe_spec
     projs = [getattr(ex, spec[0]) for ex in bs.experts]
@@ -194,8 +187,7 @@ def test_grouped_path_reads_the_stacks():
 
 
 def test_lora_stacks_checks_members_and_order():
-    """A projection list that is not the one the stack was built over (reordered, partial) keeps
-    torch.stack over the per-expert views: same values as the unstacked model."""
+    """A projection list not the one the stack was built over (reordered or partial) keeps torch.stack over per-expert views; values match unstacked."""
     ms, bs, mu, bu = pair("qwen3", "bf16", 8)
     spec = bs._unsloth_moe_spec
     ps = [getattr(ex, spec[2]) for ex in bs.experts][::-1]
@@ -327,8 +319,8 @@ def _bnb_state_per_expert(opt, model):
 
 @pytest.mark.parametrize("optim", ["adamw_foreach", "adamw_8bit"])
 def test_optimizer_steps_bitwise(optim):
-    """3 steps: weights equal bitwise; bnb's 8-bit states too. Every per-expert tensor here is a
-    whole number of 256-element blocks and >= min_8bit_size (4096), as on Qwen3-30B-A3B r >= 8."""
+    """3 optimizer steps keep weights bitwise equal, and bnb's 8-bit states too; per-expert tensors are whole
+    256-element blocks and >= min_8bit_size (4096), as on Qwen3-30B-A3B with r >= 8."""
     if optim == "adamw_8bit":
         bnb = pytest.importorskip("bitsandbytes")
         if not ML.HAS_BNB:
@@ -350,10 +342,8 @@ def test_optimizer_steps_bitwise(optim):
 
 @pytest.mark.parametrize("shape", ["unaligned", "small"])
 def test_bnb_8bit_block_layout_differs_but_stays_close(shape):
-    """Documented, not declined: when a per-expert tensor is not a whole number of 256-element
-    blocks ("unaligned", in-features 264) a quantization block of the stack spans two experts, and
-    under min_8bit_size ("small", r=4 x 256 = 1024) PEFT's per-expert tensors get 32-bit states while
-    the stack gets 8-bit ones. Same optimizer, different block partition: close, not bitwise."""
+    """Documented, not declined: unaligned per-expert tensors (in-features 264) let a bnb 8-bit block span two experts;
+    under min_8bit_size, per-expert states are 32-bit but stack states 8-bit; close, not bitwise."""
     bnb = pytest.importorskip("bitsandbytes")
     if not ML.HAS_BNB:
         pytest.skip("bitsandbytes not usable")
@@ -391,10 +381,16 @@ def test_compile_fullgraph_no_breaks():
     from torch._dynamo.utils import counters
     counters.clear()
     x, g = _inputs(seed = 2)
-    before = ML.CALLS["grouped_lora"]
-    cs = torch.compile(bs.forward, fullgraph = True)
-    os_, dxs = fwd_bwd(cs, x, g)
-    assert ML.CALLS["grouped_lora"] == before + 1
+    # CALLS counts eager calls only (a traced counter recompiles per call): engagement = no loop call.
+    loop_calls = []
+    orig = bs.__dict__["_orig_moe_forward"]
+    bs._orig_moe_forward = lambda *a, **k: loop_calls.append(1) or orig(*a, **k)
+    try:
+        cs = torch.compile(bs.forward, fullgraph = True)
+        os_, dxs = fwd_bwd(cs, x, g)
+    finally:
+        bs._orig_moe_forward = orig
+    assert not loop_calls, "compiled call fell back to the per-expert loop"
     assert sum(counters["graph_break"].values()) == 0
     ou, dxu = fwd_bwd(bu, x, g)
     assert (os_.float() - ou.float()).abs().max() < 2e-2
@@ -476,8 +472,8 @@ def _plain_logits(tiny_dir, adapter_dir, out_path):
 
 
 def test_save_pretrained_keys_values_and_plain_reload(tiny_dir, tmp_path):
-    """(a) The stacked model saves PEFT's per-expert keys / shapes / values, bitwise as unstacked;
-    a fresh plain transformers + peft process loads it to the logits of this model's loop."""
+    """Stacked model saves PEFT's per-expert keys, shapes and values bitwise as unstacked; a fresh plain transformers +
+    peft process reloads it to the logits of this model's loop."""
     from transformers import AutoModelForCausalLM
     base = lambda: AutoModelForCausalLM.from_pretrained(tiny_dir, torch_dtype = torch.bfloat16).to(DEV)
     torch.manual_seed(0)
@@ -505,8 +501,8 @@ def test_save_pretrained_keys_values_and_plain_reload(tiny_dir, tmp_path):
 
 
 def test_load_then_stack(tiny_dir, tmp_path):
-    """(b) PeftModel.from_pretrained of a saved adapter, then enable: stacked values equal the file,
-    and the loaded + stacked model runs bitwise as the loaded + unstacked one."""
+    """PeftModel.from_pretrained of a saved adapter, then enable: stacked values equal the file, and the loaded stacked
+    model runs bitwise as the loaded unstacked one."""
     from transformers import AutoModelForCausalLM
     base = lambda: AutoModelForCausalLM.from_pretrained(tiny_dir, torch_dtype = torch.bfloat16).to(DEV)
     torch.manual_seed(0)
@@ -542,8 +538,7 @@ def _expert_grads(model):
 
 
 def test_load_state_dict_strict_round_trip():
-    """A stacked model's state_dict (per-expert keys) loads strictly into a stacked and an
-    unstacked model; a missing per-expert key is reported under its PEFT name."""
+    """A stacked model's state_dict (per-expert keys) loads strictly into stacked and unstacked models; a missing per-expert key is reported under its PEFT name."""
     torch.manual_seed(0)
     ms = _tiny_peft(True, seed = 3)
     mu = _tiny_peft(False, seed = 4)
@@ -624,8 +619,7 @@ def test_disable_set_and_second_adapter():
 
 
 def test_hf_trainer_resume(tmp_path):
-    """(d) Trainer checkpoint + resume_from_checkpoint continues the uninterrupted loss curve
-    (stacked), and with clipping off the stacked and unstacked curves are equal."""
+    """Trainer checkpoint + resume_from_checkpoint continues the uninterrupted loss curve (stacked); with clipping off, stacked and unstacked curves are equal."""
     from transformers import Trainer, TrainingArguments
 
     class DS(torch.utils.data.Dataset):
@@ -706,8 +700,7 @@ if __name__ == "__main__":
 
 
 def test_ddp_two_gpus_matches_single_process(tmp_path):
-    """(f) DDP (NCCL, 2 GPUs, same batch per rank): the stacked grads all-reduce to the
-    single-process grads."""
+    """DDP over NCCL on 2 GPUs with the same batch per rank: stacked grads all-reduce to the single-process grads."""
     if DEV != "cuda" or torch.cuda.device_count() < 2:
         pytest.skip("needs 2 CUDA devices")
     script = tmp_path / "ddp.py"
@@ -736,6 +729,10 @@ model, tok = FastLanguageModel.from_pretrained(repo,
 model = FastLanguageModel.get_peft_model(model, r = 8, lora_alpha = 16, random_state = 3407,
     target_modules = r".*\.(q_proj|v_proj|gate_proj|up_proj|down_proj)", use_gradient_checkpointing = "unsloth")
 trainable = [n for n, p in model.named_parameters() if p.requires_grad]
+loop = []  # CALLS counts eager calls only, so compiled engagement = the per-expert loop never runs
+blocks = [m for m in model.modules() if "_orig_moe_forward" in m.__dict__]
+for m in blocks:
+    m._orig_moe_forward = (lambda f: lambda *a, **k: loop.append(1) or f(*a, **k))(m._orig_moe_forward)
 opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr = 1e-2, foreach = True)
 g = torch.Generator().manual_seed(0)
 losses = []
@@ -748,15 +745,14 @@ for s in range(4):
     losses.append(loss.item())
 model.save_pretrained(out + "/lora")
 model.save_pretrained_merged(out + "/merged", tok, save_method = "merged_16bit")
-json.dump({"losses": losses, "trainable": len(trainable), "calls": ML.CALLS,
+json.dump({"losses": losses, "trainable": len(trainable), "blocks": len(blocks), "loop": len(loop),
            "stacked": sum(ML._STACK_NAME in n for n in trainable)}, open(out + "/info.json", "w"))
 """
 
 
 def test_unsloth_fast_language_model_path(tmp_path):
-    """(i) FastLanguageModel.from_pretrained + get_peft_model (regex targets incl. the experts):
-    stacked at get_peft_model; training losses, the saved adapter and save_pretrained_merged (16-bit)
-    equal the UNSLOTH_MOE_STACKED_LORA=0 run."""
+    """FastLanguageModel.from_pretrained + get_peft_model with regex targets incl. experts: stacked at get_peft_model;
+    losses, saved adapter and save_pretrained_merged (16-bit) equal the UNSLOTH_MOE_STACKED_LORA=0 run."""
     pytest.importorskip("unsloth")
     if L._hf_block("qwen3") is None:
         pytest.skip("Qwen3-MoE experts are not an nn.ModuleList on this transformers")
@@ -778,11 +774,11 @@ def test_unsloth_fast_language_model_path(tmp_path):
         assert p.returncode == 0, p.stderr[-4000:]
         res[arm] = json.load(open(out / "info.json"))
     s, u = res["1"], res["0"]
-    assert s["calls"]["grouped_lora"] > 0 and u["calls"]["grouped_lora"] > 0
+    assert s["blocks"] > 0 and u["blocks"] > 0 and s["loop"] == 0 and u["loop"] == 0, (s, u)
     assert s["stacked"] == 2 * 3 * 2 and u["stacked"] == 0 and s["trainable"] < u["trainable"]
     if torch.version.hip is not None:
-        # ROCm is not run-to-run deterministic here (identical runs differ in an attention LoRA
-        # grad), so the cross-process bitwise checks below cannot hold; in-process tests cover it.
+        # ROCm is not run-to-run deterministic (identical runs differ in an attention LoRA grad), so cross-process
+        # bitwise checks cannot hold; in-process tests cover it.
         return
     assert s["losses"] == u["losses"], (s["losses"], u["losses"])
     a, b = _st_load(tmp_path / "arm1" / "lora"), _st_load(tmp_path / "arm0" / "lora")
@@ -799,8 +795,7 @@ def test_unsloth_fast_language_model_path(tmp_path):
 
 
 def test_stacking_is_opt_in():
-    """Only the loader entry points (auto_enable_grouped_moe) stack; a plain enable keeps PEFT's
-    per-expert Parameters, so a later call cannot orphan an optimizer's references."""
+    """Only the loader entry point auto_enable_grouped_moe stacks; plain enable keeps per-expert Parameters so a later call cannot orphan optimizer references."""
     model, blk = L.build("qwen3", base = "bf16", r = 8)
     ref = {n: p for n, p in model.named_parameters()}
     assert ML.enable_grouped_moe(model, verbose = False) == 1
@@ -812,9 +807,8 @@ def test_stacking_is_opt_in():
 
 
 def test_no_stacking_once_training_started():
-    """An optimizer built over the per-expert Parameters keeps training them: with grads present
-    (training under way) stack_lora declines, and optimizer.step still moves the weights the
-    forward reads."""
+    """An optimizer built over per-expert Parameters keeps training them: stack_lora declines once grads exist, and
+    optimizer.step still moves the weights the forward reads."""
     model, blk = L.build("qwen3", base = "bf16", r = 8)
     for n, p in model.named_parameters():
         p.requires_grad_("lora_" in n)

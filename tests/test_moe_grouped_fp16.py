@@ -14,17 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""moe_grouped_fp16 Triton grouped GEMMs against an fp64 oracle.
-
-* Forward over ragged expert groups (empty experts, masked tails at 2880 and odd sizes),
-  fp16 / fp32 operands, fp16 / fp32 outputs, the fp32-x cast and hi + lo split modes.
-* An fp32 output keeps sums above 65504 finite; an fp16 output of the same sums does not
-  (negative control). A transposed weight is caught (negative control).
-* Backward dX from an fp32 dY against fp16 weights: per-row power-of-two scaling keeps
-  tiny unscaled gradients that a plain fp16 cast flushes (negative control).
-* Per-expert weight gradients (LoRA ranks 1 / 7 / 16 / 64), expert windows, no host sync.
-* Every test runs on both backends: Triton, and the per-expert cuBLAS path used below sm80.
-"""
+"""moe_grouped_fp16 Triton GEMMs vs fp64 oracle: ragged/empty experts, fp16/fp32 operands and outputs, fp32 output keeps
+sums above 65504 finite, dX from fp32 dY with per-row power-of-two scaling, per-expert wgrad; every test runs on both
+Triton and cuBLAS (default below sm80)"""
 import os
 
 import pytest
@@ -114,10 +106,8 @@ def test_forward_matches_fp64(E, N, K, M, case):
 
 @pytest.mark.parametrize("tf32_flags", [False, True])
 def test_fp32_operands_are_ieee_not_tf32(tf32_flags, backend, monkeypatch):
-    # fp32 x fp32 is the exact-parity mode against the loop's fp32 down: K = 2880 under TF32
-    # (10-bit mantissa) is ~1e-3 off, IEEE fp32 ~1e-6. Triton passes input_precision="ieee", so it
-    # stays IEEE even with TF32 allowed globally; cuBLAS follows torch's flag, as the loop's own
-    # fp32 matmul does (so parity holds either way).
+    # fp32 x fp32 must be IEEE, not TF32 (K=2880: TF32 ~1e-3 off, IEEE ~1e-6); Triton passes input_precision ieee,
+    # cuBLAS follows torch's allow_tf32 flag like the loop's fp32 matmul
     if tf32_flags and backend == "cublas":
         pytest.skip("cuBLAS follows torch.backends.cuda.matmul.allow_tf32, like the per-expert loop")
     E, N, K, M = 8, 512, 2880, 600

@@ -68,25 +68,9 @@ RATE = 16000
 
 results = {}
 
-# How far clear of the platform's own spread the two-tone gap has to land.
-#
-# Measured on macos-14, mlx-vlm 0.6.3, mlx 0.32.0, three separate runs of this
-# probe against mlx-community/gemma-4-e2b-it-4bit:
-#
-#   run   signal (440 vs 1760)   noise (spread of three identical 440s)
-#     1   0.812                  2.27
-#     2   1.30                   0.827
-#     3   0.719                  1.25
-#
-# The spread of three identical inputs exceeds the gap between two different
-# tones. So on Apple Silicon this stage cannot separate connected audio from
-# disconnected audio at any margin, and no choice of this constant rescues it;
-# the honest report there is "could not measure", which is what Inconclusive
-# is for. On Linux the same probe gives noise=0 and signal=0.327, and the
-# stage decides normally.
-#
-# The margin only has to be large enough that jitter cannot masquerade as
-# signal on a platform where the two are separable at all.
+# Margin for the two-tone gap over platform jitter; on macos-14 (mlx-vlm 0.6.3, mlx 0.32.0) the identical-input spread
+# (0.8-2.3) is as large as the tone gap (0.7-1.3), so no margin rescues it and the stage is Inconclusive; Linux gives
+# noise 0, signal 0.327.
 TWO_TONE_MARGIN = 4.0
 
 TWO_TONE_REASONS = {
@@ -99,25 +83,15 @@ TWO_TONE_REASONS = {
 
 
 def two_tone_verdict(repeats, other):
-    """Did the second tone move the loss by more than the platform's jitter?
-
-    `repeats` are losses for one tone run several times, so their spread is
-    what this machine hands you for free with no audio involved; `other` is
-    the second tone. Split out from the stage so it can be tested without a
-    model, a checkpoint or a Mac -- which matters, because the branch that
-    made this necessary only fires on hardware where the model is not
-    reproducible.
-    """
+    """Did the second tone move the loss beyond platform jitter? repeats (one tone, several runs) give the spread, other
+    is the second tone; split out to test without a model or Mac, since the branch only fires where the model is not
+    reproducible."""
     noise = max(repeats) - min(repeats)
-    # The mean, not the first sample: three forwards were paid for, and the
-    # figure printed here is the one a reader will compare against `other`.
+    # Use the mean, not the first sample: the printed figure is what a reader compares against other.
     base = sum(repeats) / len(repeats)
     signal = abs(base - other)
-    # The repeats themselves, not just their spread. Jitter and a monotone
-    # drift across sequential forwards produce the same spread and call for
-    # opposite responses -- one is a platform fact to measure around, the
-    # other is a bug in the forward path -- and this string is the only
-    # artifact the macOS matrix leaves behind.
+    # Print the repeats, not just their spread: jitter and monotone drift give the same spread but need opposite
+    # responses (platform fact vs forward-path bug); this string is the only artifact the macOS matrix leaves.
     detail = (f"440Hz={base:.4f} 1760Hz={other:.4f} "
               f"signal={signal:.3g} noise={noise:.3g} "
               f"repeats=[{', '.join(f'{r:.4f}' for r in repeats)}]")
@@ -129,27 +103,14 @@ def two_tone_verdict(repeats, other):
 
 
 class Inconclusive(Exception):
-    """The stage could not decide, as distinct from deciding against.
-
-    This matrix exists so that a red cell names the mlx-vlm version that
-    breaks Gemma 4 audio. A stage that could not measure anything is not that,
-    and reporting it as a failure would blame a version for a property of the
-    machine it ran on. It still does not qualify the version -- nothing was
-    demonstrated -- so it is not a pass either.
-    """
+    """Stage could not measure (distinct from deciding against); failing it would blame an mlx-vlm version for the
+    machine, and it is not a pass since nothing was demonstrated."""
 
 
 def gating_stages(stages):
-    """The stages whose result decides this version's exit code.
-
-    Stage 0 and its subchecks are diagnostic and never gated. Neither does a
-    stage that could not measure anything: this matrix exists to name the
-    mlx-vlm version that breaks Gemma 4 audio, and on Apple Silicon stage 4
-    cannot answer at all (see TWO_TONE_MARGIN). Failing the job over that
-    would report every version as broken on the one platform the feature
-    ships to. The measured verdict still appears in PROBE_RESULT, and stages
-    1 to 3, which are what actually decide the version boundary, still gate.
-    """
+    """Stages gating the exit code: stage 0 and its subchecks are diagnostic and never gated, and so are inconclusive
+    stages (stage 4 on Apple Silicon, see TWO_TONE_MARGIN); stages 1 to 3 still gate; the verdict still appears in
+    PROBE_RESULT."""
     return {k: v for k, v in stages.items()
             if not k.startswith("0_") and not v.get("inconclusive")}
 
@@ -196,11 +157,8 @@ def resolve(repo):
 
 @stage("0_mlx_vlm_alone_loads")
 def load_upstream(path):
-    """Diagnostic. Reported, never part of the verdict.
-
-    Splits the processor from the weights because they fail for unrelated
-    reasons, and reports both rather than stopping at the first.
-    """
+    """Diagnostic only, never part of the verdict; loads processor and weights separately because they fail for
+    unrelated reasons, reporting both rather than stopping at the first."""
     from mlx_vlm.utils import load_model, load_processor
     notes = []
     for what, fn in (("processor", load_processor), ("weights", load_model)):
@@ -240,20 +198,9 @@ def check_tower(_repo):
 
 @stage("3_placeholders_match_the_audio_tower")
 def check_alignment(_repo):
-    """The invariant the gate exists to protect.
-
-    zoo derives the count from the installed extractor precisely because the
-    framing arithmetic changed in 0.5.0; this checks the derivation still
-    agrees with what the tower emits on this version.
-
-    "What the tower emits" has to come from the tower. Deriving it from
-    `_gemma4_audio_encoder_positions` instead would re-run the arithmetic
-    `_gemma4_audio_placeholder_count` already ran, and assert a number against
-    itself -- green on any release, including one whose subsampling changed
-    underneath it, which is the whole failure this stage exists to catch. So
-    the clip goes through `audio_tower` and the count comes off the mask it
-    returns.
-    """
+    """Checks the placeholder count zoo derives (framing arithmetic changed in 0.5.0) against what audio_tower emits,
+    counted from its returned mask; deriving it from _gemma4_audio_encoder_positions would compare a number with
+    itself."""
     import mlx.core as mx
     import numpy as np
 
@@ -282,9 +229,8 @@ def check_alignment(_repo):
             valid = np.ones(mel.shape[:2], dtype=bool)
         else:
             valid = np.asarray(raw_mask).astype(bool)
-        # The tower takes a PADDING mask, not a validity one: gemma4.py passes
-        # `~input_features_mask` and gets a mask back in the same polarity. So
-        # feed the inverse and count the False positions.
+        # The tower takes a PADDING mask, not a validity one: gemma4.py passes ~input_features_mask and gets one back in
+        # the same polarity, so feed the inverse and count False positions.
         encodings, out_mask = tower(mel, mx.array(~valid))
         mx.eval(encodings, out_mask)
         emitted = int((~np.asarray(out_mask)[0].astype(bool)).sum())
@@ -314,23 +260,9 @@ def check_alignment(_repo):
 
 @stage("4_audio_reaches_the_loss")
 def check_loss(_repo):
-    """Distinct audio must produce distinct losses, by more than the noise.
-
-    A processor that accepts the argument and drops it, or a merge that lands
-    features on the wrong positions, shows up here: the loss stops depending
-    on what the audio actually was.
-
-    "Distinct" only means something where the same input twice gives the same
-    loss, and on Apple Silicon this model does not: two identical uncached
-    forwards of Gemma 4 E2B differ, and a bisect puts the first differing
-    decoder layer at 0, upstream of every KV-shared layer. Against that, a
-    bare `!=` is satisfied by the noise whether or not the audio is connected,
-    so it would pass on a checkpoint whose audio is entirely disconnected.
-
-    So measure the noise first, by running one tone several times, and require
-    the two-tone gap to clear it. On a platform where the model is
-    reproducible the floor is 0 and this is the original test.
-    """
+    """Distinct audio must give losses differing by more than run-to-run noise: identical uncached Gemma 4 E2B forwards
+    differ on Apple Silicon, so a bare != would pass with disconnected audio; measure noise with repeated tones;
+    floor is 0 where reproducible."""
     import numpy as np
 
     from unsloth_zoo.mlx.utils import (
@@ -350,8 +282,7 @@ def check_loss(_repo):
         )
 
         def loss_at(hz):
-            # The decoded-column shape datasets.Audio yields, the only one
-            # collation accepts.
+            # Uses the decoded-column shape datasets.Audio yields, the only shape collation accepts.
             clip = {"array": tone(1.0, hz), "sampling_rate": RATE}
             messages = [{"role": "user", "content": [
                 {"type": "audio", "audio": clip},
@@ -367,10 +298,8 @@ def check_loss(_repo):
                 raise AssertionError(f"loss is not finite at {hz} Hz: {loss}")
             return loss
 
-        # The same tone several times: whatever these disagree by is what the
-        # platform hands you for free, with no audio involved. Three rather
-        # than two because one pair is a single sample of a spread and can
-        # land small by luck, which would put the floor back where it started.
+        # Same tone three times: the disagreement is the platform's free noise floor with no audio involved; three, not
+        # two, since one pair is a single sample that can land small by luck.
         repeats = [loss_at(440.0) for _ in range(3)]
         verdict, detail = two_tone_verdict(repeats, loss_at(1760.0))
         if verdict == "below_noise":
@@ -384,10 +313,8 @@ def check_loss(_repo):
 
 
 def main():
-    # Set here rather than at import: the stage helpers below are worth
-    # importing on their own from a test, and importing a module should not
-    # rewrite the environment of whatever imported it. Both are read by
-    # unsloth_zoo, which is first imported inside the stages that main() runs.
+    # Sets UNSLOTH_ALLOW_CPU and UNSLOTH_IS_PRESENT in main(), not at import, so importing stage helpers leaves the
+    # caller's environment alone; unsloth_zoo reads them when first imported inside the stages.
     os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1")
     os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 

@@ -38,6 +38,11 @@ from .utils import (
     Cache,
     process_return,
 )
+try:
+    from .moe_router_triton import fused_route_or_none as _fused_route_or_none
+except Exception:
+    def _fused_route_or_none(*args, **kwargs):
+        return None
 from .moe_utils import (
     _check_grouped_gemm_available,
     _TORCH_GROUPED_MM_AVAILABLE,
@@ -57,12 +62,32 @@ except ImportError:
 
 
 def _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_weights):
-    """Packed bnb 4-bit experts: dequantize then dispatch. The Triton kernels and the per-expert loop
-    index the stack and cannot read a packed Params4bit; None otherwise."""
+    """Packed bnb 4-bit experts are dequantized then dispatched; Triton kernels and the per-expert loop index the stack
+    and cannot read a packed Params4bit; None otherwise."""
     # This Unsloth Zoo code section is licensed under AGPL3
     if _moe_uses_bnb4bit_expert_weights is None or not _moe_uses_bnb4bit_expert_weights(self):
         return None
     return forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
+
+
+def _native_experts_in_linear_layout(experts_class):
+    """True when transformers' own Qwen3VLMoeTextExperts builds gate_up_proj as (E, 2I, H) (F.linear layout,
+    transformers 5.x), which Unsloth re-lays out to (E, H, 2I) so PEFT factors the stacks over swapped dims;
+    False when transformers already builds (E, H, 2I) (4.x): vanilla PEFT then factors them as Unsloth does and
+    the saved factors must stay as trained. Unknown (the probe raised) keeps the swap."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+    try:
+        from transformers.models.qwen3_vl_moe.configuration_qwen3_vl_moe import Qwen3VLMoeTextConfig
+        config = Qwen3VLMoeTextConfig(
+            vocab_size = 8, hidden_size = 3, intermediate_size = 4, moe_intermediate_size = 5,
+            num_hidden_layers = 1, num_attention_heads = 1, num_key_value_heads = 1, head_dim = 4,
+            num_experts = 2, num_experts_per_tok = 1,
+        )
+        with torch.device("meta"):
+            shape = tuple(experts_class(config).gate_up_proj.shape)
+    except Exception:
+        return True
+    return shape != (2, 3, 10)
 
 
 def patch_qwen3_vl_moe():
@@ -146,14 +171,18 @@ def patch_qwen3_vl_moe():
         def router_forward(self, hidden_states):
             router_logits = self.gate(hidden_states)
 
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
-            routing_weights, selected_experts = torch.topk(
-                routing_weights, self.top_k, dim=-1
-            )
-            if self.norm_topk_prob:
-                routing_weights = routing_weights / routing_weights.sum(
-                    dim=-1, keepdim=True
+            fused = _fused_route_or_none(router_logits, self.top_k, "softmax_topk", bool(self.norm_topk_prob))
+            if fused is not None:   # UNSLOTH_MOE_FUSED_ROUTER=1
+                routing_weights, selected_experts = fused
+            else:
+                routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float32)
+                routing_weights, selected_experts = torch.topk(
+                    routing_weights, self.top_k, dim=-1
                 )
+                if self.norm_topk_prob:
+                    routing_weights = routing_weights / routing_weights.sum(
+                        dim=-1, keepdim=True
+                    )
             routing_weights = routing_weights.to(hidden_states.dtype)
             router_scores = torch.zeros_like(
                 router_logits, dtype=hidden_states.dtype
@@ -205,6 +234,11 @@ def patch_qwen3_vl_moe():
 
         from transformers.activations import ACT2FN
 
+        _experts_class = transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts
+        # Decided once, from transformers' own __init__ before it is replaced below: a re-patch would read ours.
+        if "_unsloth_expert_lora_factors_swapped" not in _experts_class.__dict__:
+            _experts_class._unsloth_expert_lora_factors_swapped = _native_experts_in_linear_layout(_experts_class)
+
         def patched_experts_init(self, config):
             """__init__ creating Qwen3VLMoeTextExperts weights in grouped_mm
             layout (transposed from F.linear) so checkpoint loading and
@@ -245,11 +279,36 @@ def patch_qwen3_vl_moe():
 
         _qwen3_vl_lora_extractor = _make_qwen_moe_lora_extractor()
         transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts._unsloth_lora_extractor_fn = staticmethod(_qwen3_vl_lora_extractor)
+        # The flag (set above, before __init__ was replaced) makes saves rewrite the expert LoRA factors to
+        # vanilla's when the storage above differs from transformers' own layout.
 
 
         backend = select_moe_backend()
 
-        if backend == "grouped_mm":
+        forward_sonic_moe = None
+        if backend == "sonic_moe":
+            try:
+                from .moe_utils_sonic import forward_sonic_moe
+            except ImportError:
+                backend = "grouped_mm"
+
+        if backend == "sonic_moe":
+
+            def forward(
+                self,
+                hidden_states: torch.Tensor,
+                top_k_index: torch.Tensor,
+                top_k_weights: torch.Tensor,
+            ) -> torch.Tensor:
+                """sonic-moe forward; falls back to grouped_mm where sonic does not support the weights."""
+                output = _bnb4bit_experts_forward_or_none(self, hidden_states, top_k_index, top_k_weights)
+                if output is not None:
+                    return output
+                return forward_sonic_moe(
+                    self, hidden_states, top_k_index, top_k_weights
+                )
+
+        elif backend == "grouped_mm":
 
             def forward(
                 self,
@@ -324,14 +383,18 @@ def patch_qwen3_vl_moe():
                     self.gate, "norm_topk_prob", getattr(self, "norm_topk_prob", True)
                 )
 
-                routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-                routing_weights, selected_experts = torch.topk(
-                    routing_weights, top_k, dim=-1
-                )
-                if norm_topk_prob:
-                    routing_weights = routing_weights / routing_weights.sum(
-                        dim=-1, keepdim=True
+                fused = _fused_route_or_none(router_logits, top_k, "softmax_topk", bool(norm_topk_prob))
+                if fused is not None:   # UNSLOTH_MOE_FUSED_ROUTER=1
+                    routing_weights, selected_experts = fused
+                else:
+                    routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+                    routing_weights, selected_experts = torch.topk(
+                        routing_weights, top_k, dim=-1
                     )
+                    if norm_topk_prob:
+                        routing_weights = routing_weights / routing_weights.sum(
+                            dim=-1, keepdim=True
+                        )
                 routing_weights = routing_weights.to(hidden_states.dtype)
             final_hidden_states = self.experts(
                 hidden_states_reshaped, selected_experts, routing_weights

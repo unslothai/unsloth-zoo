@@ -96,8 +96,7 @@ def test_forward_is_bitwise_stock_and_backward_tracks_fp64(kind, device):
 
 
 def test_unrolled_function_gradcheck_fp64_and_matches_stock():
-    # The compiled path's autograd.Function, run eagerly: exact derivative (gradcheck) and the
-    # same values as the stock loop.
+    # Checks the compiled path's autograd.Function run eagerly: exact derivative via gradcheck in fp64, and the same values as the stock loop.
     from unsloth_zoo.temporary_patches.mhc_sinkhorn import _SinkhornKnopp
 
     x = (torch.randn(3, 4, 4, dtype = torch.float64) * 3).softmax(-1) + EPS

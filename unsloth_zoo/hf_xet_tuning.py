@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""``unsloth_zoo.hf_xet_tuning`` is ``unsloth_zoo_downloads.hf_xet_tuning``: one module object under both names,
-and the same names for a loader that executes this file by path."""
+"""Alias: unsloth_zoo.hf_xet_tuning and unsloth_zoo_downloads.hf_xet_tuning are one module object, also when a loader executes this file by path."""
 
 import sys
 

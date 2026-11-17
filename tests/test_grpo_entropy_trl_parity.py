@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""TRL top_entropy_quantile masking and the fixed entropy bonus against TRL's own _compute_loss.
-
-TRL's GRPOTrainer._compute_loss runs unmodified on a stand-in trainer whose logprob pass returns
-fixed tensors. Unsloth's side is grpo_compute_loss through UnslothEfficientGRPO plus
-UnslothGRPOEntropyBonus, the way grpo_accumulated_loss assembles them. Loss values and the
-gradients reaching the logprobs and the entropies must match in float64.
-"""
+"""Unsloth's top_entropy_quantile mask and entropy bonus (grpo_compute_loss, UnslothGRPOEntropyBonus) must match TRL's
+unmodified _compute_loss in float64: losses and grads."""
 import inspect
 from collections import defaultdict
 from types import SimpleNamespace
@@ -175,8 +170,8 @@ def test_entropy_bonus_matches_trl(case, seed):
 
 @pytest.mark.parametrize("loss_type", ["grpo", "dapo", "cispo", "bnpo"])
 def test_bonus_weights_follow_trl_1_8_and_1_9_for_token_sum_losses(loss_type):
-    # TRL 1.8.0 / 1.9.0 GRPOTrainer._compute_loss, transcribed: cispo / dapo / vespo divided the
-    # entropy sum by the policy normalizer; the rest took the masked mean over the GA steps.
+    # TRL 1.8.0 / 1.9.0 _compute_loss transcribed: cispo / dapo / vespo divide the entropy sum by the policy normalizer;
+    # the rest take the masked mean over GA steps.
     gen = torch.Generator().manual_seed(11)
     mask = (torch.rand(4, 6, generator = gen) > 0.3).long()
     entropy_mask = torch.rand(4, 6, generator = gen) > 0.5
@@ -199,6 +194,30 @@ def test_bonus_weights_follow_trl_1_8_and_1_9_for_token_sum_losses(loss_type):
         (weights.double() * entropies).sum(),
         -0.3 * (entropies * effective).sum() / effective.sum().clamp(min = 1.0) / 2,
     )
+
+
+@pytest.mark.parametrize("loss_type", ["dapo", "cispo", "vespo"])
+@pytest.mark.parametrize("ga, spg", [(2, 4), (4, 2), (1, 8)])
+@pytest.mark.parametrize("version", ["1.9.1", "1.9.2"])
+@pytest.mark.parametrize("excluded", [False, True])
+def test_bonus_weights_follow_trl_1_9_1_window_rescale(loss_type, ga, spg, version, excluded):
+    # TRL 1.9.1 / 1.9.2 (trl#6024) _compute_loss transcribed: entropy sum / the window-rescaled policy normalizer.
+    gen = torch.Generator().manual_seed(11)
+    mask = (torch.rand(4, 6, generator = gen) > 0.3).long()
+    entropies = torch.rand(4, 6, generator = gen, dtype = torch.float64)
+    kwargs = dict(
+        loss_type = loss_type, num_items_in_batch = torch.tensor(40.0), num_processes = 2,
+        steps_per_generation = spg, current_gradient_accumulation_steps = ga,
+    )
+    kept = mask.double()
+    if excluded:
+        kwargs["sample_weight"] = torch.tensor([1 / 40.0, 0.0, 1 / 40.0, 1 / 40.0])
+        kept = kept * (kwargs["sample_weight"] > 0).double().unsqueeze(-1)
+    weights = rr.grpo_entropy_bonus_weights(mask, None, 0.3, kwargs, trl_version = version)
+    torch.testing.assert_close((weights.double() * entropies).sum(), -0.3 * (entropies * kept).sum() / (40.0 / 2 * ga / spg))
+    kwargs["steps_per_generation"] = None  # what grpo_accumulated_loss passes outside training
+    weights = rr.grpo_entropy_bonus_weights(mask, None, 0.3, kwargs, trl_version = version, training = False)
+    torch.testing.assert_close((weights.double() * entropies).sum(), -0.3 * (entropies * kept).sum() / (40.0 / 2))
 
 
 def test_bonus_weights_do_not_divide_by_accumulation_in_eval():

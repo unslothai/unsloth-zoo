@@ -33,9 +33,7 @@ _ZIP_DOS_EPOCH = (1980, 1, 1, 0, 0, 0)
 HERE = Path(__file__).resolve().parent
 
 
-# The IOC literal that scan_packages.py must trip on. Keep this in
-# sync with KNOWN_IOC_STRINGS in scripts/scan_npm_packages.py and
-# RE_MAY12_IOC in scripts/scan_packages.py.
+# IOC literal scan_packages.py trips on; sync KNOWN_IOC_STRINGS (scan_npm_packages.py), RE_MAY12_IOC.
 MALICIOUS_SETUP_PY = '''"""Test fixture: do NOT install.
 
 This file embeds the May-12 Mini Shai-Hulud IOC literal so the
@@ -89,17 +87,12 @@ def _write_zip_member(zf: zipfile.ZipFile, name: str, data: bytes) -> None:
 
 
 def _build_wheel(out_path: Path, *, name: str, payload_files: dict[str, bytes]) -> None:
-    """Write a deterministic .whl at `out_path`.
-
-    `payload_files` maps archive-relative paths to their bytes. Standard
-    `.dist-info/METADATA`, `WHEEL`, and `RECORD` are added automatically.
-    """
+    """Write a deterministic .whl at out_path from payload_files (archive path to bytes); dist-info METADATA, WHEEL and RECORD are added automatically."""
     dist_info = f"{name}-0.0.1.dist-info"
     members: dict[str, bytes] = dict(payload_files)
     members[f"{dist_info}/METADATA"] = WHEEL_METADATA.format(name = name).encode()
     members[f"{dist_info}/WHEEL"] = WHEEL_FILE.encode()
-    # RECORD is intentionally minimal; the scanner only inspects file
-    # bodies, not hash integrity.
+    # RECORD is minimal on purpose; the scanner inspects file bodies only, not hash integrity.
     record_lines = []
     for path in sorted(members):
         record_lines.append(f"{path},,")
@@ -115,11 +108,7 @@ def _build_wheel(out_path: Path, *, name: str, payload_files: dict[str, bytes]) 
 
 
 def _build_sdist(out_path: Path, *, name: str, payload_files: dict[str, bytes]) -> None:
-    """Write a deterministic .tar.gz sdist at `out_path`.
-
-    `payload_files` maps archive-relative paths to their bytes; a
-    leading `{name}-0.0.1/` prefix is added automatically.
-    """
+    """Write a deterministic .tar.gz sdist at out_path; payload_files maps archive paths to bytes and a leading {name}-0.0.1/ prefix is added automatically."""
     prefix = f"{name}-0.0.1"
     buf = io.BytesIO()
     # gzip mtime fixed via mtime=0 (gzip member header).

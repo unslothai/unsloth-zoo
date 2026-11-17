@@ -14,16 +14,8 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests for the vendored flash-linear-attention (fla) gated-delta kernels.
-
-Two parts:
-  * CPU-safe checks that the pruned vendored tree is present, correctly narrowed
-    and compiles (no GPU / torch needed).
-  * An import-hygiene check that runs the injection in a fresh interpreter (so it
-    never contaminates the global sys.modules of the test session) and asserts
-    availability + that no heavy / unwanted modules leaked. Skipped when the
-    Triton kernels cannot run (no CUDA / torch<2.7 / triton<3.3).
-"""
+"""Tests for vendored fla gated-delta kernels: CPU-safe tree checks plus fresh-interpreter import-hygiene checks;
+skipped when Triton kernels cannot run (no CUDA, torch<2.7, triton<3.3)."""
 
 import ast
 import os
@@ -34,26 +26,18 @@ import textwrap
 
 import pytest
 
-# torch is intentionally NOT imported at module level: the CPU-safe structural
-# tests (AST / source checks) must still collect on a host without torch. The few
-# tensor tests below import it locally, and unsloth_zoo's own init pulls it in.
+# torch is not imported at module level so AST/source tests still collect without torch; tensor tests import it locally, and unsloth_zoo's init pulls it in.
 
-# Importing unsloth_zoo on a GPU host runs its full init, which asserts Unsloth
-# is present. Set the flag defensively so the test is self-contained.
+# Importing unsloth_zoo on a GPU host runs init, which asserts Unsloth is present; default UNSLOTH_IS_PRESENT so the test stays self-contained.
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
-# The skip gate below imports fla_vendor to read its support check. On a CUDA host
-# that import would otherwise run fla_vendor's import-time patch_vendor_fla() and
-# inject fla into this pytest process, contaminating the in-process tests and the
-# rest of the session. Suppress only that autorun; the subprocess tests set their
-# own env and call patch_vendor_fla() explicitly, so real injection still happens
-# there.
+# Skip gate imports fla_vendor, whose import-time patch_vendor_fla() would inject fla into this pytest process on CUDA;
+# suppress only that autorun via UNSLOTH_VENDORED_FLA_NO_AUTORUN; subprocess tests call patch_vendor_fla() explicitly,
+# so real injection still runs there.
 os.environ.setdefault("UNSLOTH_VENDORED_FLA_NO_AUTORUN", "1")
 
-# In a zoo-only environment (the separate `unsloth` package not installed),
-# unsloth_zoo's init raises on find_spec("unsloth") before any submodule loads,
-# which the flag above does not satisfy. Skip the module cleanly there instead of
-# erroring at collection; the repo CI installs unsloth so these still run.
+# Zoo-only envs (no separate unsloth package) make unsloth_zoo init raise on find_spec('unsloth'), which the flag above
+# does not satisfy; skip the module there, CI installs unsloth.
 try:
     import unsloth_zoo  # noqa: F401
 except ImportError as _e:
@@ -64,9 +48,8 @@ VENDORED = ZOO_ROOT / "unsloth_zoo" / "_vendored" / "fla"
 
 
 def _injection_supported() -> bool:
-    # Mirror the production support gate exactly (Python>=3.10, torch/triton
-    # minimums, CUDA). A looser check would run the subprocess tests on hosts where
-    # the patch intentionally skips injection, so they would fail instead of skip.
+    # Mirror the production gate exactly (Python>=3.10, torch/triton minimums, CUDA); a looser check would run
+    # subprocess tests where injection is skipped and fail instead of skip.
     try:
         from unsloth_zoo.temporary_patches.fla_vendor import (
             _vendored_injection_supported,
@@ -77,10 +60,8 @@ def _injection_supported() -> bool:
 
 
 def _transformers_has_models(*names) -> bool:
-    # The model-binding subprocess tests import real Transformers modeling modules.
-    # Skip cleanly on a supported-but-older Transformers that predates them (e.g.
-    # 4.57.x ships qwen3_next but not qwen3_5 / olmo_hybrid) instead of failing with
-    # ModuleNotFoundError; a newer Transformers that has them still runs the tests.
+    # Model-binding subprocess tests skip on older Transformers that lack the modules (e.g. 4.57.x has qwen3_next but
+    # not qwen3_5 or olmo_hybrid) instead of ModuleNotFoundError.
     import importlib.util
 
     for name in names:
@@ -113,12 +94,8 @@ _NO_AUTORUN_SUBPROCESS = textwrap.dedent(
 
 
 def test_no_autorun_suppresses_import_time_injection():
-    # Runs in a fresh interpreter so it isolates the autorun-suppression invariant.
-    # The in-process pytest session cannot assert this directly: conftest does
-    # `import unsloth`, which legitimately applies TEMPORARY_PATCHES and (when an
-    # installed fla is not newer than the vendored snapshot) correctly injects the
-    # vendored copy. That is real patching, not an autorun leak, so the invariant is
-    # checked in a subprocess that does not import unsloth.
+    # Runs in a fresh interpreter: conftest's import unsloth legitimately injects the vendored fla in-process, so the
+    # no-autorun invariant is checked in a subprocess without unsloth.
     env = dict(os.environ)
     env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     proc = subprocess.run(
@@ -148,8 +125,7 @@ def test_vendored_tree_layout():
     gdr_init = (VENDORED / "ops" / "gated_delta_rule" / "__init__.py").read_text()
     assert "chunk_gated_delta_rule" in gdr_init
     assert "fused_recurrent_gated_delta_rule" in gdr_init
-    # naive reference impl (the only einops dep) is dropped: no import of it in
-    # the code (the "Modified by Unsloth" comment may still mention it by name).
+    # The naive reference impl (the only einops dep) is dropped: no import of it in code; a Modified by Unsloth comment may still name it.
     gdr_code = "\n".join(
         ln for ln in gdr_init.splitlines() if not ln.lstrip().startswith("#")
     )
@@ -177,9 +153,8 @@ def test_all_vendored_python_compiles():
 
 
 def test_backported_blackwell_hopper_fixes_present():
-    """Guard the three post-v0.5.1 correctness backports against a silent drop on
-    re-vendoring (PR #953 Blackwell fwd-h race, #1000 Blackwell bwd hang,
-    #983 Hopper Triton>=3.7.1 guard). Source-level so it needs no GPU."""
+    """Guard the post-v0.5.1 backports (PR 953 Blackwell fwd-h race, PR 1000 Blackwell bwd hang, 983 Hopper
+    Triton>=3.7.1 guard) against silent drop on re-vendor; source-level, no GPU."""
     cdh = (VENDORED / "ops" / "common" / "chunk_delta_h.py").read_text()
     assert "GATED_DELTA_RULE_FWD_H_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4]" in cdh
     assert "for num_warps in GATED_DELTA_RULE_FWD_H_NUM_WARPS" in cdh
@@ -188,8 +163,7 @@ def test_backported_blackwell_hopper_fixes_present():
 
     wy = (VENDORED / "ops" / "gated_delta_rule" / "wy_fast.py").read_text()
     assert "PREPARE_WY_REPR_BWD_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4]" in wy
-    # num_stages is policy-driven (see test_prepare_wy_repr_bwd_num_stages_policy);
-    # the warp pin is the part #1000 actually established, so pin that literally.
+    # num_stages is policy-driven (see test_prepare_wy_repr_bwd_num_stages_policy); the warp pin is the part PR 1000 established, so pin that literally.
     assert "PREPARE_WY_REPR_BWD_NUM_STAGES = _prepare_wy_repr_bwd_num_stages(" in wy
     assert "for num_warps in PREPARE_WY_REPR_BWD_NUM_WARPS" in wy
     # The fwd recompute kernel keeps its wider space.
@@ -198,25 +172,20 @@ def test_backported_blackwell_hopper_fixes_present():
     co = (VENDORED / "ops" / "common" / "chunk_o.py").read_text()
     # Upstream's guard window, kept intact: [3.4.0, 3.7.1) only.
     assert "and TRITON_ABOVE_3_4_0\n        and not TRITON_ABOVE_3_7_1" in co
-    # Hopper is decided per tensor, not from the import-time global. That global is
-    # frozen from device 0 and is wrong in both directions on a mixed host: it misses
-    # a Hopper card at a nonzero index, and it marks a call on an Ada/Blackwell card
-    # as affected when device 0 is the Hopper one. It survives only as the fallback
-    # for when the probe cannot tell, so a probe failure never fails open.
+    # Hopper is decided per tensor: the import-time global is frozen from device 0 and wrong on mixed hosts; it survives
+    # only as the fallback when the probe fails, so a probe failure never fails open.
     assert "_on_hopper = _is_hopper_tensor(k)" in co
     assert "if _on_hopper is None:\n        _on_hopper = IS_NVIDIA_HOPPER" in co
     assert "def _device_is_nvidia_hopper(index):" in co
-    # Capability, not shared memory: check_shared_mem('hopper') is a >=232448-byte
-    # tier test that Blackwell B200 also passes, so it cannot detect Hopper.
+    # Hopper detected by capability: check_shared_mem('hopper') is a >=232448-byte tier test that Blackwell B200 also passes, so it cannot detect Hopper.
     assert "torch.cuda.get_device_capability(index)[0] == 9" in co
-    # fla #640's root cause is BK == 64 on Hopper, so we step the tile down instead
-    # of refusing to run. Pin both halves so a re-vendor cannot silently drop them.
+    # fla 640's root cause is BK == 64 on Hopper, so the tile steps down to 32 rather than refusing to run; pin both halves against re-vendor drops.
     assert "if HOPPER_DQKWG_BROKEN and BK == 64:\n        BK = 32" in co
     assert co.index("BK = 32") < co.index("NK = triton.cdiv(K, BK)"), (
         "the BK override must run before NK / the dg scratch / the grid are derived"
     )
-    # The dead remediation must not come back: the TileLang kernels are pruned and
-    # _inject_vendored_fla force-sets FLA_TILELANG=0, so installing it cannot help.
+    # Do not reintroduce the TileLang remediation: its kernels are pruned and _inject_vendored_fla force-sets
+    # FLA_TILELANG=0, so installing tilelang cannot help.
     assert "install tilelang: `pip install tilelang`" not in co
     assert 'pip install -U "triton>=3.7.1"' in co
 
@@ -227,11 +196,9 @@ def test_backported_blackwell_hopper_fixes_present():
 
 
 def test_prepare_wy_repr_bwd_num_stages_policy():
-    """fla PR #1000 pinned Blackwell to num_warps=2 AND num_stages=4. Only num_warps
-    was implicated by #999, and that report was on triton 3.3.1, so num_stages is
-    allowed to autotune from triton 3.6 onward and the exact upstream pin is kept
-    below it. The warp pin is never relaxed. No GPU: the policy is a pure function of
-    (is_blackwell, triton_above_3_6_0)."""
+    """fla PR 1000 pinned Blackwell num_warps=2 and num_stages=4; only num_warps was implicated (report 999, triton
+    3.3.1), so num_stages may autotune from triton 3.6 on; warp pin never relaxed; policy is pure in (is_blackwell,
+    triton_above_3_6_0)."""
     import importlib.util
 
     src = VENDORED / "ops" / "gated_delta_rule" / "wy_fast.py"
@@ -306,9 +273,8 @@ _HYGIENE_SUBPROCESS = textwrap.dedent(
 
 
 def _rdna1_gpu_visible():
-    """These subprocess tests assert that the vendored fla IS injected. On a host with an
-    RDNA1 GPU visible unsloth routes gated-delta to the pure-torch path on purpose (no dot
-    instructions, see _NO_DOT_INSTRUCTION_GFX), so the assertion is wrong there by design."""
+    """Subprocess tests expect the vendored fla injected, but on RDNA1 (see _NO_DOT_INSTRUCTION_GFX) unsloth routes
+    gated-delta to pure torch by design, so that assertion is wrong there."""
     try:
         from unsloth_zoo.temporary_patches.fla_vendor import _gpu_lacks_dot_instructions
         return _gpu_lacks_dot_instructions()
@@ -342,8 +308,7 @@ def test_import_hygiene_subprocess():
 # The decode-kernel name Transformers resolves but fla does not export.
 
 class _FakeGatedDeltaModule:
-    """Stand-in for fla.ops.gated_delta_rule, so the additivity rules can be
-    checked without injecting anything into this interpreter."""
+    """Stand-in for fla.ops.gated_delta_rule so the additivity rules can be checked without injecting anything into this interpreter."""
 
     def __init__(self, **names):
         self.__all__ = list(names)
@@ -369,9 +334,8 @@ def test_decode_alias_added_when_missing(monkeypatch):
     added = _alias_into(fake, monkeypatch)
 
     assert added == ("recurrent_gated_delta_rule",), added
-    # This is the exact lookup transformers' use_kernel_func_from_hub_with_fallback
-    # performs; before the alias it returns None and the decorator silently keeps
-    # the pure-PyTorch loop.
+    # Exact lookup transformers' use_kernel_func_from_hub_with_fallback performs; without the alias it returns None and
+    # the decorator silently keeps pure PyTorch.
     assert fake.recurrent_gated_delta_rule is fused_recurrent_gated_delta_rule
     assert "recurrent_gated_delta_rule" in fake.__all__
 
@@ -393,8 +357,7 @@ def test_decode_alias_never_overwrites_a_real_export(monkeypatch):
 
 
 def test_decode_alias_noop_on_partial_fla(monkeypatch):
-    """Nothing to alias from binds no name: an AttributeError at decoration time
-    would be worse than the slow path it replaces."""
+    """With nothing to alias from, bind no name: an AttributeError at decoration time would be worse than the slow path it replaces."""
     fake = _FakeGatedDeltaModule(chunk_gated_delta_rule=lambda: "chunk")
     added = _alias_into(fake, monkeypatch)
 
@@ -487,8 +450,7 @@ def test_probe_covers_only_vendor_complete_models():
     assert call_as("transformers.models.qwen3_5.modeling_qwen3_5") is True
     assert call_as("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe") is True
     assert call_as("transformers.models.qwen3_next.modeling_qwen3_next") is True
-    # olmo_hybrid is not validated on the vendored tree: must answer False so its
-    # modeling module keeps the pure torch fallback.
+    # olmo_hybrid is not validated on the vendored tree: it must answer False so its modeling module keeps the pure torch fallback.
     assert call_as("transformers.models.olmo_hybrid.modeling_olmo_hybrid") is False
     # Non-modeling callers see the vendored fla as available.
     assert call_as("unsloth.models.loader") is True
@@ -563,9 +525,8 @@ def test_version_strictly_after():
 
 
 def test_defer_to_installed_fla_only_when_strictly_newer(monkeypatch):
-    # Auto-detection: use a user-installed fla only when it is strictly newer than
-    # the vendored snapshot; an equal or older install is shadowed by the vendored
-    # kernels (which carry post-0.5.1 backports). No env flag required.
+    # Auto-detect: use an installed fla only when strictly newer than the vendored snapshot; an equal or older install
+    # is shadowed by vendored kernels with post-0.5.1 backports; no env flag.
     import types
     from unsloth_zoo.temporary_patches import fla_vendor as fv
 
@@ -594,8 +555,7 @@ def test_defer_to_installed_fla_only_when_strictly_newer(monkeypatch):
 
 
 def test_python_39_skips_injection(monkeypatch):
-    # The snapshot uses runtime PEP 604 annotations, which raise on 3.9; the
-    # support gate must answer False there instead of import-fail + rollback.
+    # The snapshot uses runtime PEP 604 annotations that raise on Python 3.9, so the support gate must answer False there instead of import-fail plus rollback.
     from unsloth_zoo.temporary_patches import fla_vendor
 
     monkeypatch.setattr(fla_vendor.sys, "version_info", (3, 9, 19, "final", 0))
@@ -603,10 +563,9 @@ def test_python_39_skips_injection(monkeypatch):
 
 
 def test_hopper_bad_triton_range_is_suspect_but_still_supported():
-    # Hopper + triton [3.4.0, 3.7.1) is the fla #640 miscompile range. It used to
-    # skip injection entirely; the vendored chunk_bwd_dqkwg now steps around the
-    # bad BK=64 tile, so such a host is flagged *suspect* (prefer our copy over an
-    # installed fla) while remaining *supported* (keep the Triton fast path).
+    # Hopper + triton [3.4.0, 3.7.1) is the upstream fla miscompile tracked as 640; vendored chunk_bwd_dqkwg steps
+    # around the bad BK=64 tile, so such hosts are suspect (prefer our copy over an installed fla) yet still supported
+    # with the Triton fast path.
     import types
 
     from unsloth_zoo.temporary_patches.fla_vendor import _hopper_dqkwg_suspect
@@ -645,9 +604,8 @@ def test_hopper_bad_triton_range_is_suspect_but_still_supported():
 
 
 def test_rocm_major9_device_not_treated_as_hopper():
-    # ROCm/AMD cards can report capability major 9 without being NVIDIA Hopper. On a
-    # HIP build (torch.version.hip set) the bare major==9 signal must not trip the
-    # Hopper guard, or AMD users lose the vendored path on triton [3.4.0, 3.7.1).
+    # ROCm/AMD cards can report capability major 9 without being Hopper; on HIP builds (torch.version.hip set) bare
+    # major==9 must not trip the Hopper guard on triton [3.4.0, 3.7.1), or AMD users lose the vendored path.
     import types
 
     from unsloth_zoo.temporary_patches.fla_vendor import _hopper_dqkwg_suspect
@@ -672,8 +630,8 @@ def test_rocm_major9_device_not_treated_as_hopper():
 
 
 def test_hopper_at_nonzero_device_index_trips_guard():
-    # On a mixed host the model can run on a nonzero Hopper card while cuda:0 is a
-    # different architecture; the guard must scan every visible device, not just 0.
+    # On a mixed host the model can run on a nonzero Hopper card while cuda:0 is another architecture; the guard must
+    # scan every visible device, not just device 0.
     import types
 
     from unsloth_zoo.temporary_patches.fla_vendor import _hopper_dqkwg_suspect
@@ -706,8 +664,7 @@ def test_hopper_at_nonzero_device_index_trips_guard():
 
 
 def test_blackwell_import_device_scans_visible_devices():
-    # fla.utils freezes IS_NVIDIA_BLACKWELL from the current device at import, so
-    # on a mixed host the vendored import must run with a Blackwell device current.
+    # fla.utils freezes IS_NVIDIA_BLACKWELL from the current device at import, so on a mixed host the vendored import must run with a Blackwell device current.
     import types
 
     from unsloth_zoo.temporary_patches.fla_vendor import _blackwell_import_device
@@ -856,9 +813,8 @@ def test_reenabled_intracard_stays_unavailable_subprocess():
 
 
 def test_failed_injection_restores_backend_env(monkeypatch, tmp_path):
-    # A vendored import that fails after FLA_TILELANG / FLA_INTRACARD_CP were
-    # forced off must restore whatever the user had, so a shadowed real fla is
-    # not left with those backends disabled for the rest of the process.
+    # A failed vendored import forces FLA_TILELANG and FLA_INTRACARD_CP off, so it must restore the user's values, or a
+    # shadowed real fla stays without those backends.
     from unsloth_zoo.temporary_patches import fla_vendor
 
     bad = tmp_path / "fla"
@@ -943,8 +899,8 @@ def test_force_rebinds_already_loaded_real_fla_subprocess():
 # Kernel-hub closures frozen by an import that happened before fla was live.
 
 def _has_kernel_hub_fallback() -> bool:
-    # use_kernel_func_from_hub_with_fallback arrived with huggingface/transformers#47630.
-    # On anything older the repair correctly returns () and there is nothing to patch.
+    # use_kernel_func_from_hub_with_fallback arrived in huggingface/transformers, tracked as 47630; on older versions
+    # the repair correctly returns () and nothing is patched.
     try:
         from transformers.integrations.hub_kernels import (  # noqa: F401
             use_kernel_func_from_hub_with_fallback,
@@ -961,8 +917,7 @@ requires_kernel_hub = pytest.mark.skipif(
 
 
 def _fake_wrapper(implementation, original, params=("q", "k")):
-    """A stand-in for what use_kernel_func_from_hub_with_fallback builds: a closure
-    over (applicable_params, implementation) with __wrapped__ set to the original."""
+    """Stand-in for the closure use_kernel_func_from_hub_with_fallback builds: closes over (applicable_params, implementation) with __wrapped__ set to the original."""
     def wrapped(*args, **kwargs):
         return implementation(*args, **kwargs)
     wrapped.__wrapped__ = original
@@ -1041,10 +996,8 @@ def test_late_import_repair_leaves_the_live_kernel_alone(monkeypatch):
 
 @requires_kernel_hub
 def test_late_import_repair_replaces_a_purged_install_kernel(monkeypatch):
-    """The case UNSLOTH_FORCE_VENDORED_FLA and the Hopper #640 switch create: the
-    wrapper closed over a real install's kernel that has since been purged. That is
-    not "already dispatching to a real kernel", it is the miscompiled backward we
-    replaced the install to avoid, so it must be rebound onto the live fla."""
+    """A wrapper over a purged install kernel (UNSLOTH_FORCE_VENDORED_FLA or the Hopper fla 640 switch) is the
+    miscompiled backward to avoid; rebind it onto live fla."""
     from unsloth_zoo.temporary_patches import fla_vendor
 
     def original(): return "torch"
@@ -1069,8 +1022,7 @@ def test_late_import_repair_replaces_a_purged_install_kernel(monkeypatch):
 
 @requires_kernel_hub
 def test_late_import_repair_prefers_torch_over_a_purged_kernel(monkeypatch):
-    """Stale kernel, and nothing live to swap in. Pure torch beats calling into an
-    install that is no longer on sys.modules."""
+    """With a stale kernel and nothing live to swap in, pure torch beats calling into an install no longer on sys.modules."""
     from unsloth_zoo.temporary_patches import fla_vendor
 
     def original(): return "torch"
@@ -1093,8 +1045,7 @@ def test_late_import_repair_prefers_torch_over_a_purged_kernel(monkeypatch):
 
 @requires_kernel_hub
 def test_late_import_repair_keeps_the_wrapper_when_nothing_to_bind(monkeypatch):
-    """If the rebuild still resolves to the fallback, fla genuinely has no kernel:
-    keep what was there rather than swapping in an identical object."""
+    """If the rebuild still resolves to the fallback, fla has no kernel, so keep the existing wrapper rather than swap in an identical object."""
     from unsloth_zoo.temporary_patches import fla_vendor
 
     def original(): return "torch"
@@ -1113,9 +1064,8 @@ def test_late_import_repair_keeps_the_wrapper_when_nothing_to_bind(monkeypatch):
 
 @requires_kernel_hub
 def test_force_fallback_rebinds_the_compiled_copy(monkeypatch):
-    """unsloth runs unsloth_compiled_module_<type>, whose kernel-hub decorator resolves
-    fla on its own. On RDNA1 that copy must be forced to the pure-torch fallback too, or
-    the compiled forward re-enters fla and aborts with FDOT2."""
+    """unsloth runs unsloth_compiled_module_<type>, which resolves fla on its own; on RDNA1 that copy must also be
+    forced to pure torch, or its forward re-enters fla and aborts with FDOT2."""
     from unsloth_zoo.temporary_patches import fla_vendor
 
     def original(): return "torch"
@@ -1147,8 +1097,7 @@ def test_late_import_repair_skips_undecorated_attributes(monkeypatch):
 
 
 def test_late_import_repair_is_scoped_to_vendor_covered_models():
-    """olmo_hybrid imports ShortConvolution, which is not vendored, so its probe must
-    stay False; rebinding vendored kernels into it would contradict that."""
+    """olmo_hybrid imports the unvendored ShortConvolution, so its probe must stay False; rebinding vendored kernels into it would contradict that."""
     from unsloth_zoo.temporary_patches import fla_vendor
     import inspect
 
@@ -1187,11 +1136,9 @@ def test_patch_vendor_fla_survives_a_broken_repair(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# RDNA1 (gfx1010 / gfx1013) has no dot instructions. Triton emits v_dot2 for a
-# 16-bit tl.dot regardless, so every fla chunk kernel aborts the PROCESS in LLVM
-# ("Cannot select: AMDGPUISD::FDOT2"). Found on an RX 5700 XT: Qwen3.5 died at the
-# first kernel compile; routed to transformers' pure-torch gated-delta path it
-# trained 3/3 steps with losses matching an RX 6500 XT on the fla kernels.
+# RDNA1 (gfx1010 / gfx1013) lacks dot instructions but Triton emits v_dot2 for 16-bit tl.dot, aborting in LLVM
+# (AMDGPUISD::FDOT2) on fla chunk kernels; found on RX 5700 XT, pure-torch path trained 3/3 steps with losses matching
+# RX 6500 XT.
 # ---------------------------------------------------------------------------
 
 def _fake_torch(hip, archs, available=True):
@@ -1244,9 +1191,8 @@ def test_dot_instruction_gate_is_rocm_only_and_fails_open():
 
 
 def test_rdna1_takes_the_pure_torch_gated_delta_path(monkeypatch):
-    """On such a GPU patch_vendor_fla must do what the Hopper opt-out does: make the
-    availability probe answer False, unbind any already-imported gated-delta module, say
-    why, and never reach injection (which would compile the kernels and abort)."""
+    """On RDNA1 patch_vendor_fla mirrors the Hopper opt-out: probe answers False, gated-delta module is unbound, reason
+    is reported, and injection (which would compile the kernels and abort) is never reached."""
     from unsloth_zoo.temporary_patches import fla_vendor
 
     calls = []
@@ -1280,8 +1226,7 @@ def test_gpus_with_dot_instructions_do_not_trip_the_rdna1_path(monkeypatch):
     monkeypatch.setattr(fla_vendor, "_FLA_DISABLED_REASON", None)
     marked = []
     monkeypatch.setattr(fla_vendor, "_mark_fla_disabled_no_dot_instructions", lambda: marked.append(1))
-    # Stop before the real injection machinery: the Hopper opt-out is off, so the next
-    # thing _patch_vendor_fla does is consult the source-preference flags.
+    # Stop before the real injection machinery: the Hopper opt-out is off, so the next thing _patch_vendor_fla does is consult the source-preference flags.
     monkeypatch.setattr(fla_vendor, "_flag", lambda name: False)
     monkeypatch.setattr(fla_vendor, "_torch_triton_cuda_supported", lambda: False)
 
@@ -1312,11 +1257,8 @@ def test_fp32_l2norm_matches_fp32_reference_and_keeps_dtype():
 
 
 def test_fp32_l2norm_survives_the_float16_overflow_that_gives_nan_grads():
-    """128 * 300^2 = 1.15e7 overflows float16 (max 65504), so transformers' version stores
-    inv_norm = rsqrt(inf) = 0: a finite forward. fp16 training then backpropagates a
-    loss-scaled gradient; sum(x * grad) overflows to inf in float16 and inf * 0 inside
-    RsqrtBackward is the NaN seen on the RX 5700 XT. The loss itself is float32 in a
-    real trainer, so the scale is applied to a float32 sum here as well."""
+    """128*300^2 overflows float16 (max 65504), so transformers' l2norm gives inv_norm=rsqrt(inf)=0; the loss-scaled
+    fp16 backward overflows sum(x*grad) and inf*0 in RsqrtBackward gives the RX 5700 XT NaN; fp32 avoids it."""
     import torch
     from unsloth_zoo.temporary_patches.fla_vendor import _fp32_l2norm
 
@@ -1367,8 +1309,7 @@ def test_l2norm_patch_rebinds_only_imported_gated_delta_modules(monkeypatch):
 
 
 def test_rdna1_later_kernel_hub_decorations_never_resolve_fla(monkeypatch):
-    # unsloth's compiler re-applies the decorator after the last patch phase; an installed fla
-    # bound there aborts the first forward on RDNA1 (FDOT2).
+    # unsloth's compiler re-applies the decorator after the last patch phase; an installed fla bound there aborts the first forward on RDNA1 (FDOT2).
     hub_kernels = pytest.importorskip("transformers.integrations.hub_kernels")
     import types
     import transformers.integrations as integrations
@@ -1409,9 +1350,8 @@ def test_fp32_l2norm_keeps_float64_precision():
 
 
 def test_every_host_gets_the_float32_l2norm_not_only_rdna1(monkeypatch):
-    """A CPU-only or no-Triton host takes the pure-torch gated delta too. On transformers 5.5
-    its l2norm runs in float16 there, and the T4 path's Qwen3.5 and Qwen3.6 grads came back
-    non-finite in unsloth's Core zoo (HF=default) job."""
+    """CPU-only and no-Triton hosts also take pure-torch gated delta; on transformers 5.5 its float16 l2norm gave
+    non-finite Qwen3.5/3.6 grads on the T4 path, so every host needs fp32 l2norm."""
     import types
 
     from unsloth_zoo.temporary_patches import fla_vendor

@@ -1,6 +1,4 @@
-"""Importable base model for the cross-process pickle tests. Lives in its own
-module so a fresh subprocess can resolve the base class by name (mirrors a real
-transformers model class)."""
+"""Importable base model for cross-process pickle tests; living in its own module lets a fresh subprocess resolve the class by name."""
 import torch.nn as nn
 
 

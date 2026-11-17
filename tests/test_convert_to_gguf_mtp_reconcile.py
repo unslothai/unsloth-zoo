@@ -308,8 +308,7 @@ def test_convert_to_gguf_rejects_malformed_layer_count_before_rewrite(llama_cpp,
     ids = ["none", "not-a-path", "empty", "nul-byte"],
 )
 def test_converter_support_probe_never_raises_on_an_unusable_location(llama_cpp, location):
-    """Anything unreadable is False. Only OSError was caught, so a None
-    location raised TypeError out of convert_to_gguf."""
+    """Any unreadable location must give False: only OSError was caught, so a None location raised TypeError out of convert_to_gguf."""
     assert llama_cpp._converter_supports_no_mtp(location) is False
 
 
@@ -318,8 +317,7 @@ def test_converter_support_probe_reads_a_directory_as_unsupported(llama_cpp, tmp
 
 
 def _write_arch_gated_converter(path: Path) -> Path:
-    """Declares `--no-mtp` but refuses it for this architecture: llama.cpp
-    25558268 added the flag and its allowlist in the same commit."""
+    """Declares --no-mtp but refuses it for this architecture; llama.cpp commit 25558268 added the flag and its allowlist together."""
     converter = path / "arch_gated_convert.py"
     command_log = path / "converter_commands.jsonl"
     converter.write_text(
@@ -355,9 +353,8 @@ def _write_arch_gated_converter(path: Path) -> Path:
 
 
 def test_convert_to_gguf_drops_no_mtp_when_the_architecture_refuses_it(llama_cpp, tmp_path):
-    """`_mtp_declared` reads config.json only, so Qwen3.5 weights republished
-    under `Qwen3ForCausalLM` sent `--no-mtp` to a converter that rejects it,
-    turning a working export into a failure citing a flag nobody passed."""
+    """_mtp_declared reads config.json only, so Qwen3.5 weights republished as Qwen3ForCausalLM got --no-mtp, which the
+    converter rejects, turning a working export into a failure."""
     model_dir = tmp_path / "model"
     model_dir.mkdir()
     (model_dir / "config.json").write_text(
@@ -400,11 +397,7 @@ def test_convert_to_gguf_does_not_retry_an_unrelated_converter_failure(llama_cpp
 
 
 def test_convert_to_gguf_stays_idempotent_across_repeated_exports(llama_cpp, tmp_path):
-    """A retry, or a second export from the same folder, must behave like the first.
-
-    Deleting `mtp_num_hidden_layers` made the next run read no declaration, omit
-    `--no-mtp`, and hit the converter assertion the flag exists to avoid.
-    """
+    """A retry or repeat export must behave like the first; deleting mtp_num_hidden_layers made the next run omit --no-mtp and hit the assertion the flag avoids."""
     model_dir = tmp_path / "model"
     model_dir.mkdir()
     config_path = model_dir / "config.json"
@@ -471,10 +464,7 @@ def test_convert_to_gguf_still_strips_the_declaration_for_legacy_converters(llam
 
 
 def _write_asserting_converter(path: Path) -> Path:
-    """Fails with llama.cpp's MTP assertion until `--no-mtp` is passed.
-
-    Replays the traceback, so it pins the retry wiring, not the upstream condition.
-    """
+    """Replays the MTP assertion traceback, so it pins the retry wiring rather than the upstream condition; it fails until --no-mtp is passed."""
     converter = path / "asserting_convert.py"
     command_log = path / "converter_commands.jsonl"
     converter.write_text(
@@ -611,9 +601,8 @@ def test_add_no_mtp_refuses_to_loop(llama_cpp):
 
 
 def test_convert_to_gguf_refuses_to_retry_when_the_checkpoint_has_mtp_tensors(llama_cpp, tmp_path):
-    """The assertion proves zero *recognised* `mtp.layers.<i>`, not a headless
-    checkpoint. `--no-mtp` discards every `mtp.*`, so a checkpoint that does
-    carry a head must surface the disagreement, not export a reduced GGUF."""
+    """The assertion proves zero recognised mtp.layers.<i>, not a headless checkpoint; --no-mtp drops all mtp.* tensors,
+    so a checkpoint with a head must fail, not export a reduced GGUF."""
     model_dir = tmp_path / "model"
     model_dir.mkdir()
     # No declaration, but the head is there, indexed past the trunk.
@@ -653,8 +642,7 @@ def test_convert_to_gguf_refuses_to_retry_when_the_checkpoint_has_mtp_tensors(ll
 
 
 def test_convert_to_gguf_never_sends_no_mtp_to_the_projector(llama_cpp, tmp_path):
-    """`--no-mtp` was always kept off the mmproj command; the retry must not
-    reintroduce it when the projector pass quotes the assertion."""
+    """--no-mtp is never sent to the mmproj command, so the retry must not add it when the projector pass quotes the assertion."""
     model_dir = tmp_path / "model"
     _write_headless_model(model_dir)
     command_log = tmp_path / "converter_commands.jsonl"
@@ -706,8 +694,7 @@ def test_convert_to_gguf_never_sends_no_mtp_to_the_projector(llama_cpp, tmp_path
 
 
 def test_converter_needs_no_mtp_will_not_straddle_a_line_break(llama_cpp):
-    """A comparison split across the stderr/stdout join is two unrelated
-    fragments, not the assertion."""
+    """A comparison split across a line break, such as the stderr/stdout join, is two unrelated fragments and must not match the assertion."""
     assert llama_cpp._converter_needs_no_mtp(
         "    assert self.opt_num_mtp_layers !=\n 0 tensors were written\n") is False
     assert llama_cpp._converter_needs_no_mtp(
@@ -749,9 +736,7 @@ def test_convert_to_gguf_joins_converter_streams_on_a_newline(llama_cpp, tmp_pat
 
 
 def test_convert_to_gguf_clears_the_failed_attempts_output_before_retrying(llama_cpp, tmp_path):
-    """The converter truncates `--outfile` at header time and, when splitting,
-    writes shards beside it. Callers scan for `*.gguf`, so anything the failed
-    attempt left would be shipped as valid."""
+    """The converter truncates --outfile at header time and writes shards beside it; callers scan for *.gguf, so a failed attempt's leftovers must be cleared first."""
     model_dir = tmp_path / "model"
     _write_headless_model(model_dir)
     output_dir = tmp_path / "out"
@@ -802,8 +787,7 @@ def test_convert_to_gguf_clears_the_failed_attempts_output_before_retrying(llama
 
 
 def test_convert_to_gguf_keeps_the_first_failure_when_the_retry_also_fails(llama_cpp, tmp_path):
-    """A converter with the assertion but not the flag turns the retry into an
-    argparse error. The assertion is the useful half; keep both."""
+    """A converter with the assertion but no --no-mtp flag turns the retry into an argparse error; the first failure must be the one reported."""
     model_dir = tmp_path / "model"
     _write_headless_model(model_dir)
     command_log = tmp_path / "converter_commands.jsonl"

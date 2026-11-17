@@ -49,17 +49,17 @@ def causal_conv1d_fwd_kernel(
     stride_x_n,
     stride_x_t,
     stride_x_d,
-    D: tl.constexpr,
-    W: tl.constexpr,
-    BT: tl.constexpr,
-    BW: tl.constexpr,
-    BD: tl.constexpr,
-    ACTIVATION: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    HAS_RESIDUAL: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    D: tl.constexpr,  # channels
+    W: tl.constexpr,  # conv width
+    BT: tl.constexpr,  # block along T
+    BW: tl.constexpr,  # block along conv width
+    BD: tl.constexpr,  # block along D
+    ACTIVATION: tl.constexpr,  # activation name
+    HAS_WEIGHT: tl.constexpr,  # norm weight given
+    HAS_BIAS: tl.constexpr,  # bias given
+    HAS_RESIDUAL: tl.constexpr,  # residual given
+    USE_INITIAL_STATE: tl.constexpr,  # h0 given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
 
@@ -179,17 +179,17 @@ def causal_conv1d_bwd_kernel(
     stride_dy_n,  # dy batch stride
     stride_dy_t,  # dy time stride
     stride_dy_d,  # dy dim stride
-    D: tl.constexpr,
-    W: tl.constexpr,
-    BT: tl.constexpr,
-    BW: tl.constexpr,
-    BD: tl.constexpr,
-    ACTIVATION: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
-    USE_FINAL_STATE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    D: tl.constexpr,  # channels
+    W: tl.constexpr,  # conv width
+    BT: tl.constexpr,  # block along T
+    BW: tl.constexpr,  # block along conv width
+    BD: tl.constexpr,  # block along D
+    ACTIVATION: tl.constexpr,  # activation name
+    HAS_WEIGHT: tl.constexpr,  # norm weight given
+    HAS_BIAS: tl.constexpr,  # bias given
+    USE_INITIAL_STATE: tl.constexpr,  # h0 given
+    USE_FINAL_STATE: tl.constexpr,  # final state grad given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     i_d, i_t, i_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     if IS_VARLEN:
@@ -362,15 +362,15 @@ def causal_conv1d_update_kernel(
     stride_x_d,  # dim stride
     stride_y_n,  # batch stride
     stride_y_d,  # dim stride
-    D: tl.constexpr,
-    W: tl.constexpr,
-    BD: tl.constexpr,
-    BW: tl.constexpr,
-    ACTIVATION: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    HAS_RESIDUAL: tl.constexpr,
+    D: tl.constexpr,  # channels
+    W: tl.constexpr,  # conv width
+    BD: tl.constexpr,  # block along D
+    BW: tl.constexpr,  # block along conv width
+    ACTIVATION: tl.constexpr,  # activation name
+    USE_INITIAL_STATE: tl.constexpr,  # h0 given
+    HAS_WEIGHT: tl.constexpr,  # norm weight given
+    HAS_BIAS: tl.constexpr,  # bias given
+    HAS_RESIDUAL: tl.constexpr,  # residual given
 ):
     i_d, i_n = tl.program_id(0), tl.program_id(1)
 
@@ -431,11 +431,11 @@ def compute_dh0_kernel(
     stride_dy_n,
     stride_dy_t,
     T,
-    D: tl.constexpr,
-    W: tl.constexpr,
-    BD: tl.constexpr,
-    USE_ACTIVATION: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    D: tl.constexpr,  # channels
+    W: tl.constexpr,  # conv width
+    BD: tl.constexpr,  # block along D
+    USE_ACTIVATION: tl.constexpr,  # activation applied
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     """
     Compute dh0 (gradient w.r.t. initial_state) in a separate kernel.
@@ -510,10 +510,10 @@ def causal_conv1d_states_fwd_kernel(
     stride_x_n,
     stride_x_t,
     stride_x_d,
-    BD: tl.constexpr,
-    BW: tl.constexpr,
-    USE_INITIAL_STATE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    BD: tl.constexpr,  # block along D
+    BW: tl.constexpr,  # block along conv width
+    USE_INITIAL_STATE: tl.constexpr,  # h0 given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     i_d, i_n = tl.program_id(0), tl.program_id(1)
 

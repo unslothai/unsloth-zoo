@@ -1,12 +1,5 @@
-"""Adaptive pin-vs-recompute policy for the grouped MoE base GEMM.
-
-The dequantized bf16 expert stack is either pinned (kept from forward to backward)
-or recomputed in backward. Pinning is fast but memory-heavy; recompute is the
-reverse. The choice is adaptive: pin only inside a gradient-checkpoint recompute
-pass (where the stack is rebuilt right before the layer's own backward, so the pin
-is momentary), otherwise recompute so a non-checkpointed forward does not hold every
-layer's stack across the whole backward. UNSLOTH_MOE_RECOMPUTE overrides it.
-"""
+"""Adaptive pin-vs-recompute policy for the grouped MoE base GEMM: pin the bf16 expert stack only during
+gradient-checkpoint recompute, else recompute; UNSLOTH_MOE_RECOMPUTE overrides."""
 
 import os
 
@@ -41,10 +34,8 @@ def test_marker_idempotent_nesting_and_exception_safe():
 
 
 def test_marker_true_only_during_gc_recompute():
-    # The checkpointer runs the wrapped forward twice: once under no_grad (original
-    # forward, marker False) and once under enable_grad in backward (recompute pass,
-    # marker True). This proves the flag fires exactly during the recompute pass and
-    # is cleared afterwards -- i.e. no other gradient-checkpoint run is disturbed.
+    # Forward runs under no_grad (marker False) and again in backward (marker True); the flag must fire only in that
+    # recompute and clear afterwards; other checkpoint runs stay undisturbed.
     seen = []
 
     def fn(x, *args):
@@ -62,8 +53,7 @@ def test_marker_true_only_during_gc_recompute():
 
 
 def test_recompute_policy_adaptive_and_overrides(monkeypatch):
-    # Isolate the policy layer from the base-recomputable guards (which need CUDA +
-    # torch._grouped_mm support).
+    # Stub _base_is_recomputable to isolate the policy layer, since the real guard needs CUDA and torch._grouped_mm support.
     monkeypatch.setattr(mu, "_base_is_recomputable", lambda src: True)
     src = object()
 

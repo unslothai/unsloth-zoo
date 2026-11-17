@@ -14,13 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The collator swap must not throw away a padding-free batch.
-
-Unsloth auto-enables `padding_free` and wraps `torch_call` to add
-`packed_seq_lengths`; replacing the instance dropped both while
-`args.padding_free` stayed True. Real TRL collator, not a stand-in: a mock
-would assert nothing about its flattening or its use of `labels`.
-"""
+"""Collator swap must keep padding-free batches: replacing the instance dropped Unsloth's torch_call wrapper that adds
+packed_seq_lengths while args.padding_free stayed True; tests the real TRL collator, since a mock would assert
+nothing about flattening or labels."""
 
 import inspect
 import re
@@ -99,8 +95,8 @@ def _rows():
     return Dataset.from_dict({"input_ids": [list(LONG_ROW), list(SHORT_ROW)]})
 
 
-# Across `trl>=0.18.2,!=0.19.0,<=1.13.0` the signature moves: `padding_free`
-# arrives in 0.19.1, `completion_only_loss` is gone by 1.13.0. Build from it.
+# Across trl>=0.18.2,!=0.19.0,<=1.13.0 the signature moves: padding_free arrives in 0.19.1 and completion_only_loss is
+# gone by 1.13.0, so build from the signature.
 _TRL_FIELDS = set(inspect.signature(TRLLanguageModeling.__init__).parameters)
 _PADDING_FREE_SUPPORTED = "padding_free" in _TRL_FIELDS
 
@@ -217,8 +213,7 @@ def test_an_ordinary_subclass_is_exempted_through_its_ancestor():
     assert out.data_collator is collator
 
 
-# The predicate on its own, so a shim can import it instead of re-deriving the
-# MRO walk, and so these cases do not need a trainer to reach it.
+# Tests the predicate directly so a shim can import it instead of re-deriving the MRO walk, and without needing a trainer.
 @needs_padding_free
 def test_the_predicate_accepts_only_trls_padding_free_collator():
     class NotATrlCollator:

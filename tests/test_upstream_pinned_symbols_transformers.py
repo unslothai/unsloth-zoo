@@ -5,22 +5,7 @@
 # under the terms of the GNU Lesser General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or (at
 # your option) any later version.
-"""Pinned-symbol matrix tests for the transformers / peft / datasets
-symbols that ``unsloth_zoo`` reaches into.
-
-Motivating zoo PRs (each test docstring names the precise PR):
-
-  #569 Guard transformers caching_allocator_warmup on low-memory GPUs
-  #549 Fix VRAM regression with transformers 5.2+ gradient checkpointing
-  #491 Patch should_convert_module for transformers 5.x substring matching
-  #488 Fix Gemma3 + Gemma3N on transformers 5.x
-  #618 Fix qwen lora extractor for diff peft versions
-  #572 Fix forward compatibility with transformers 5.x
-  #571 fix gemma3 and csm transformers v5.3 patches
-  #560 fix: support prompt/completion datasets with completion_only_loss
-  #472 Fix tokenizer guard, ModernBERT attention, gpt_oss MoE unwrap
-  #635 Mask for gemma3 attn
-"""
+"""Pinned-symbol matrix for transformers / peft / datasets names unsloth_zoo touches; each test cites its zoo PR (569, 549, 491, 488, 618, 572, 571, 560, 472, 635)."""
 
 from __future__ import annotations
 
@@ -53,8 +38,7 @@ PEFT_TAGS = [
 
 
 def _fetch_text(repo: str, ref: str, path: str) -> str | None:
-    """GET raw.githubusercontent.com/{repo}/{ref}/{path}. Returns None on
-    404; pytest.skip on transient errors."""
+    """GET raw.githubusercontent.com/{repo}/{ref}/{path}; returns None on 404 and pytest.skip on transient errors."""
     url = f"https://raw.githubusercontent.com/{repo}/{ref}/{path}"
     req = urllib.request.Request(url)
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
@@ -99,9 +83,7 @@ def _first_match(repo: str, ref: str, paths: list[str]) -> tuple[str, str] | Non
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
 def test_gemma3_modeling_required_classes(tag: str):
-    """Zoo PR #635 + #488: classes referenced by
-    unsloth_zoo/temporary_patches/gemma.py must remain at
-    transformers.models.gemma3.modeling_gemma3."""
+    """Zoo PRs 635 and 488: classes used by unsloth_zoo/temporary_patches/gemma.py must stay at transformers.models.gemma3.modeling_gemma3."""
     src = _fetch_text(
         "huggingface/transformers",
         tag,
@@ -125,9 +107,8 @@ def test_gemma3_modeling_required_classes(tag: str):
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
 def test_gemma3_apply_rotary_pos_emb_and_attention_funcs(tag: str):
-    """Zoo PR #488 / #571 / #635: gemma.py:399 imports apply_rotary_pos_emb,
-    ALL_ATTENTION_FUNCTIONS, eager_attention_forward from the gemma3
-    module; must stay reachable on that exact path."""
+    """Zoo PRs 488, 571, 635: gemma.py imports apply_rotary_pos_emb, ALL_ATTENTION_FUNCTIONS and eager_attention_forward
+    from the gemma3 module; that path must stay reachable."""
     src = _fetch_text(
         "huggingface/transformers",
         tag,
@@ -148,8 +129,7 @@ def test_gemma3_apply_rotary_pos_emb_and_attention_funcs(tag: str):
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
 def test_ministral_attention_module_present(tag: str):
-    """Zoo PR #571 / #509 / #465: MinistralAttention must remain at
-    transformers.models.ministral.modeling_ministral.MinistralAttention."""
+    """Zoo PRs 571, 509, 465: MinistralAttention must stay at transformers.models.ministral.modeling_ministral.MinistralAttention."""
     src = _fetch_text(
         "huggingface/transformers",
         tag,
@@ -174,8 +154,7 @@ def test_ministral_attention_module_present(tag: str):
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
 def test_gpt_oss_modeling_classes(tag: str):
-    """Zoo PR #525 / #472 / #471: temporary_patches/gpt_oss.py touches all
-    five classes by attribute on the module."""
+    """Zoo PRs 525, 472, 471: temporary_patches/gpt_oss.py touches all five classes by attribute on the module."""
     src = _fetch_text(
         "huggingface/transformers",
         tag,
@@ -199,16 +178,13 @@ def test_gpt_oss_modeling_classes(tag: str):
     )
 
 
-# qwen3_moe MoE patch surface, zoo PR #601 / #605 / #607 / #574 / #618.
-# qwen3_moe.py rebinds Qwen3MoeSparseMoeBlock.forward and
-# Qwen3MoeExperts.forward via attribute assignment.
+# qwen3_moe MoE patch surface (zoo PR 601 / 605 / 607 / 574 / 618); qwen3_moe.py rebinds Qwen3MoeSparseMoeBlock.forward
+# and Qwen3MoeExperts.forward by attribute assignment.
 
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
 def test_qwen3_moe_required_classes(tag: str):
-    """Zoo PR #601 / #605 / #607 / #618: Qwen3MoeSparseMoeBlock (all tags)
-    and Qwen3MoeExperts (5.x only) must exist on
-    transformers.models.qwen3_moe.modeling_qwen3_moe."""
+    """Zoo PRs 601, 605, 607, 618: Qwen3MoeSparseMoeBlock (all tags) and Qwen3MoeExperts (5.x only) must exist in transformers.models.qwen3_moe.modeling_qwen3_moe."""
     src = _fetch_text(
         "huggingface/transformers",
         tag,
@@ -216,8 +192,7 @@ def test_qwen3_moe_required_classes(tag: str):
     )
     if src is None:
         pytest.skip(f"{tag}: modeling_qwen3_moe.py not present")
-    # Qwen3MoeSparseMoeBlock: stable across the support window
-    # (qwen3_moe.py:215 + L337-L340 read it).
+    # Qwen3MoeSparseMoeBlock is stable across the support window; qwen3_moe.py:215 and L337-L340 read it.
     assert _has_def(src, "Qwen3MoeSparseMoeBlock", "class"), (
         f"{tag}: class Qwen3MoeSparseMoeBlock missing; "
         f"unsloth_zoo/temporary_patches/qwen3_moe.py forward / LoRA "
@@ -234,15 +209,13 @@ def test_qwen3_moe_required_classes(tag: str):
     )
 
 
-# Zoo PR #549 patches modeling_utils.checkpoint directly
-# (gradient_checkpointing.py:923); unsloth_zoo/saving_utils.py:76 imports
-# PushToHubMixin and calls ._upload_modified_files / ._get_files_timestamps.
+# Zoo PR 549 patches modeling_utils.checkpoint directly (gradient_checkpointing.py:923); unsloth_zoo/saving_utils.py:76
+# imports PushToHubMixin and calls ._upload_modified_files and ._get_files_timestamps.
 
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
 def test_modeling_utils_checkpoint_and_pushtohubmixin(tag: str):
-    """Zoo PR #549 + saving_utils.py:76: ``transformers.modeling_utils``
-    must bind ``checkpoint`` and reach ``PushToHubMixin``."""
+    """Zoo PR 549 and saving_utils.py: transformers.modeling_utils must bind checkpoint and reach PushToHubMixin."""
     src = _fetch_text(
         "huggingface/transformers",
         tag,
@@ -260,8 +233,7 @@ def test_modeling_utils_checkpoint_and_pushtohubmixin(tag: str):
         f"unsloth_zoo/gradient_checkpointing.py:923 reassignment silently "
         f"no-ops and the PR #549 VRAM regression returns on transformers 5.2+"
     )
-    # PushToHubMixin: class-defined locally (4.x) OR re-imported from
-    # transformers.utils.hub (5.x); either satisfies the zoo import.
+    # PushToHubMixin is either class-defined locally (4.x) or re-imported from transformers.utils.hub (5.x); either satisfies the zoo import.
     has_pushtohub = bool(
         re.search(r"^\s*class\s+PushToHubMixin\b", src, re.MULTILINE)
         or re.search(r"\bPushToHubMixin\b", src)
@@ -274,10 +246,8 @@ def test_modeling_utils_checkpoint_and_pushtohubmixin(tag: str):
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
 def test_quantizers_should_convert_module_present_on_v5(tag: str):
-    """Zoo PR #491 / #488 (patching_utils.py): on transformers 5.x,
-    `should_convert_module` must live at
-    transformers.quantizers.quantizers_utils. 4.x uses
-    `_replace_with_bnb_linear` via a separate zoo path."""
+    """Zoo PRs 491 and 488 (patching_utils.py): on transformers 5.x should_convert_module must live in
+    transformers.quantizers.quantizers_utils; 4.x uses _replace_with_bnb_linear."""
     src = _fetch_text(
         "huggingface/transformers",
         tag,
@@ -295,15 +265,12 @@ def test_quantizers_should_convert_module_present_on_v5(tag: str):
     )
 
 
-# transformers.integrations.bitsandbytes._replace_with_bnb_linear, 4.x
-# companion. unsloth_zoo/patching_utils.py:678 wraps it.
+# transformers.integrations.bitsandbytes._replace_with_bnb_linear is the 4.x companion; unsloth_zoo/patching_utils.py:678 wraps it.
 
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
 def test_integrations_bitsandbytes_legacy_replace_fn(tag: str):
-    """patching_utils.py:678 wraps `_replace_with_bnb_linear`; on 4.x must
-    be present, on 5.x allowed absent (PR #491 path via
-    should_convert_module)."""
+    """patching_utils.py:678 wraps `_replace_with_bnb_linear`: must exist on 4.x, may be absent on 5.x (falls back to should_convert_module, PR 491)."""
     src = _fetch_text(
         "huggingface/transformers",
         tag,
@@ -329,10 +296,9 @@ def test_integrations_bitsandbytes_legacy_replace_fn(tag: str):
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
 def test_caching_allocator_warmup_reachable(tag: str):
-    """Zoo PR #569 wraps modeling_utils.caching_allocator_warmup with a
-    <=24 GiB skip-guard via hasattr(). Removal degrades gracefully; only
-    a rename (function vanished AND a `*warmup*` sibling appeared)
-    silently drops the OOM-before-load guard."""
+    """Zoo PR 569 wraps modeling_utils.caching_allocator_warmup in a <=24 GiB hasattr() skip-guard; plain removal
+    degrades gracefully, but a rename (original vanishes, a *warmup* sibling appears) silently drops the
+    OOM-before-load guard."""
     src = _fetch_text(
         "huggingface/transformers",
         tag,
@@ -354,15 +320,12 @@ def test_caching_allocator_warmup_reachable(tag: str):
     pytest.skip(f"{tag}: caching_allocator_warmup removed (graceful, hasattr-guarded)")
 
 
-# transformers.masking_utils.{create_causal_mask, create_sliding_window_causal_mask},
-# zoo PR #488 / #525; misc.py:382 + gpt_oss.py:2182-2183 rebind these.
+# transformers.masking_utils.{create_causal_mask, create_sliding_window_causal_mask} are rebound by misc.py:382 and gpt_oss.py:2182-2183 (zoo PR 488 / 525).
 
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
 def test_masking_utils_create_causal_mask_names(tag: str):
-    """temporary_patches/misc.py:414 + gpt_oss.py:2182 + ministral.py:144
-    read masking_utils.create_causal_mask /
-    .create_sliding_window_causal_mask."""
+    """temporary_patches/misc.py:414, gpt_oss.py:2182 and ministral.py:144 read masking_utils.create_causal_mask and .create_sliding_window_causal_mask."""
     src = _fetch_text(
         "huggingface/transformers",
         tag,
@@ -383,12 +346,9 @@ def test_masking_utils_create_causal_mask_names(tag: str):
 
 @pytest.mark.parametrize("tag", TRANSFORMERS_TAGS)
 def test_tokenization_auto_symbols_for_mlx_loader(tag: str):
-    """Zoo PR #1170: unsloth_zoo/mlx/loader.py:_load_mlx_tokenizer and
-    _tokenizer_class_for_model_type import get_tokenizer_config,
-    tokenizer_class_from_name and TOKENIZER_MAPPING_NAMES from
-    transformers.models.auto.tokenization_auto. None of the three is public
-    API, and losing one breaks every MLX tokenizer load with an ImportError
-    at call time rather than at import time."""
+    """Zoo PR 1170: _load_mlx_tokenizer and _tokenizer_class_for_model_type in unsloth_zoo/mlx/loader.py import
+    non-public get_tokenizer_config, tokenizer_class_from_name and TOKENIZER_MAPPING_NAMES; a loss breaks MLX
+    tokenizer loads with ImportError at call time, not import time."""
     src = _fetch_text(
         "huggingface/transformers",
         tag,
@@ -413,17 +373,14 @@ def test_tokenization_auto_symbols_for_mlx_loader(tag: str):
     )
 
 
-# Qwen MoE LoRA extractor reads wrapper.get_base_layer() + .parameter_name
-# / .hidden_dim / .intermediate_dim. Pin: peft keeps emitting ParamWrapper
-# (LoraLayer subclass) in peft/tuners/lora/layer.py.
+# Qwen MoE LoRA extractor reads wrapper.get_base_layer(), .parameter_name, .hidden_dim and .intermediate_dim; peft must
+# keep emitting ParamWrapper (a LoraLayer subclass) in peft/tuners/lora/layer.py.
 
 
 @pytest.mark.parametrize("tag", PEFT_TAGS)
 def test_peft_lora_layer_paramwrapper_present(tag: str):
-    """Zoo PR #618: temporary_patches/qwen3_moe.py:46-77 walks
-    wrapper.get_base_layer() / wrapper.parameter_name on peft.tuners.lora
-    .layer.{LoraLayer,ParamWrapper}; missing -> MoE LoRA extractor
-    returns (None, None) and grouped-mm crashes."""
+    """Zoo PR 618: temporary_patches/qwen3_moe.py:46-77 walks wrapper.get_base_layer() and wrapper.parameter_name on
+    peft LoraLayer and ParamWrapper; if missing, the MoE LoRA extractor returns (None, None) and grouped-mm crashes."""
     src = _fetch_text("huggingface/peft", tag, "src/peft/tuners/lora/layer.py")
     if src is None:
         pytest.skip(f"{tag}: peft/tuners/lora/layer.py missing")

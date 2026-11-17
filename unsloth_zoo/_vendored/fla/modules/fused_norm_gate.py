@@ -28,10 +28,10 @@ from fla.utils import autotune_cache_kwargs, get_multiprocessor_count, input_gua
 )
 @triton.autotune(
     configs=[triton.Config({"BT": BT}, num_warps=num_warps) for BT in [16, 32, 64] for num_warps in [4, 8, 16]],
-    key=["D", "NB", "IS_RMS_NORM", "STORE_RESIDUAL_OUT", "HAS_RESIDUAL", "HAS_WEIGHT"],
+    key=["D", "IS_RMS_NORM", "STORE_RESIDUAL_OUT", "HAS_RESIDUAL", "HAS_WEIGHT"],
     **autotune_cache_kwargs,
 )
-@triton.jit
+@triton.jit(do_not_specialize=['T'])
 def layer_norm_gated_fwd_kernel(
     x,  # pointer to the input
     g,  # pointer to the gate
@@ -45,15 +45,14 @@ def layer_norm_gated_fwd_kernel(
     eps,  # epsilon to avoid division by zero
     T,  # number of rows in x
     D: tl.constexpr,  # number of columns in x
-    BT: tl.constexpr,
-    BD: tl.constexpr,
-    NB: tl.constexpr,
-    ACTIVATION: tl.constexpr,
-    IS_RMS_NORM: tl.constexpr,
-    STORE_RESIDUAL_OUT: tl.constexpr,
-    HAS_RESIDUAL: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
+    BT: tl.constexpr,  # rows per program
+    BD: tl.constexpr,  # block along D
+    ACTIVATION: tl.constexpr,  # activation name
+    IS_RMS_NORM: tl.constexpr,  # rmsnorm, not layernorm
+    STORE_RESIDUAL_OUT: tl.constexpr,  # write residual out
+    HAS_RESIDUAL: tl.constexpr,  # residual given
+    HAS_WEIGHT: tl.constexpr,  # norm weight given
+    HAS_BIAS: tl.constexpr,  # bias given
 ):
     i_t = tl.program_id(0).to(tl.int64)
 
@@ -133,13 +132,13 @@ def layer_norm_gated_fwd_kernel1(
     rstd,  # pointer to the 1/std
     eps,  # epsilon to avoid division by zero
     D: tl.constexpr,  # number of columns in x
-    BD: tl.constexpr,
-    ACTIVATION: tl.constexpr,
-    IS_RMS_NORM: tl.constexpr,
-    STORE_RESIDUAL_OUT: tl.constexpr,
-    HAS_RESIDUAL: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
+    BD: tl.constexpr,  # block along D
+    ACTIVATION: tl.constexpr,  # activation name
+    IS_RMS_NORM: tl.constexpr,  # rmsnorm, not layernorm
+    STORE_RESIDUAL_OUT: tl.constexpr,  # write residual out
+    HAS_RESIDUAL: tl.constexpr,  # residual given
+    HAS_WEIGHT: tl.constexpr,  # norm weight given
+    HAS_BIAS: tl.constexpr,  # bias given
 ):
     i_t = tl.program_id(0)
     x += i_t * D
@@ -198,10 +197,10 @@ def layer_norm_gated_fwd_kernel1(
 )
 @triton.autotune(
     configs=[triton.Config({"BT": BT}, num_warps=num_warps) for BT in [16, 32, 64] for num_warps in [4, 8, 16]],
-    key=["D", "NB", "IS_RMS_NORM", "HAS_DRESIDUAL", "HAS_WEIGHT"],
+    key=["D", "IS_RMS_NORM", "HAS_DRESIDUAL", "HAS_WEIGHT"],
     **autotune_cache_kwargs,
 )
-@triton.jit
+@triton.jit(do_not_specialize=['T'])
 def layer_norm_gated_bwd_kernel(
     x,  # pointer to the input
     g,  # pointer to the gate
@@ -219,17 +218,16 @@ def layer_norm_gated_bwd_kernel(
     rstd,
     T,
     BS,
-    D: tl.constexpr,
-    BT: tl.constexpr,
-    BD: tl.constexpr,
-    NB: tl.constexpr,
-    ACTIVATION: tl.constexpr,
-    IS_RMS_NORM: tl.constexpr,
-    STORE_DRESIDUAL: tl.constexpr,
-    HAS_DRESIDUAL: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    RECOMPUTE_OUTPUT: tl.constexpr,
+    D: tl.constexpr,  # hidden dim
+    BT: tl.constexpr,  # rows per program
+    BD: tl.constexpr,  # block along D
+    ACTIVATION: tl.constexpr,  # activation name
+    IS_RMS_NORM: tl.constexpr,  # rmsnorm, not layernorm
+    STORE_DRESIDUAL: tl.constexpr,  # write residual grad
+    HAS_DRESIDUAL: tl.constexpr,  # residual grad given
+    HAS_WEIGHT: tl.constexpr,  # norm weight given
+    HAS_BIAS: tl.constexpr,  # bias given
+    RECOMPUTE_OUTPUT: tl.constexpr,  # recompute y in backward
 ):
     i_s = tl.program_id(0)
     o_d = tl.arange(0, BD)
@@ -332,7 +330,7 @@ def layer_norm_gated_bwd_kernel(
     key=["D", "IS_RMS_NORM", "STORE_DRESIDUAL", "HAS_DRESIDUAL", "HAS_WEIGHT"],
     **autotune_cache_kwargs,
 )
-@triton.jit
+@triton.jit(do_not_specialize=['T'])
 def layer_norm_gated_bwd_kernel1(
     x,  # pointer to the input
     g,  # pointer to the gate
@@ -350,15 +348,15 @@ def layer_norm_gated_bwd_kernel1(
     rstd,
     T,
     BS,
-    D: tl.constexpr,
-    BD: tl.constexpr,
-    ACTIVATION: tl.constexpr,
-    IS_RMS_NORM: tl.constexpr,
-    STORE_DRESIDUAL: tl.constexpr,
-    HAS_DRESIDUAL: tl.constexpr,
-    HAS_WEIGHT: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    RECOMPUTE_OUTPUT: tl.constexpr,
+    D: tl.constexpr,  # hidden dim
+    BD: tl.constexpr,  # block along D
+    ACTIVATION: tl.constexpr,  # activation name
+    IS_RMS_NORM: tl.constexpr,  # rmsnorm, not layernorm
+    STORE_DRESIDUAL: tl.constexpr,  # write residual grad
+    HAS_DRESIDUAL: tl.constexpr,  # residual grad given
+    HAS_WEIGHT: tl.constexpr,  # norm weight given
+    HAS_BIAS: tl.constexpr,  # bias given
+    RECOMPUTE_OUTPUT: tl.constexpr,  # recompute y in backward
 ):
     i_s = tl.program_id(0)
     o_d = tl.arange(0, BD)
@@ -483,10 +481,7 @@ def layer_norm_gated_fwd(
     # heuristics for number of warps
 
     if D <= 512:
-        # NOTE(tylerr): Avoid excessive recompilation and autotuning by tolerating a larger range
-        # of T before recompiling the kernel.
-        # NB = triton.cdiv(T, 2048)
-        NB = triton.cdiv(T, 2048 * 32)
+        # Unsloth: NB dropped (unread), so no recompile per 65536-row bucket.
 
         def grid(meta):
             return (triton.cdiv(T, meta["BT"]),)
@@ -505,7 +500,6 @@ def layer_norm_gated_fwd(
             T=T,
             D=D,
             BD=BD,
-            NB=NB,
             ACTIVATION=activation,
             IS_RMS_NORM=is_rms_norm,
         )
@@ -576,10 +570,7 @@ def layer_norm_gated_bwd(
     grid = (NS,)
 
     if D <= 512:
-        # NOTE(tylerr): Avoid excessive recompilation and autotuning by tolerating a larger range
-        # of T before recompiling the kernel.
-        # NB = triton.cdiv(T, 2048)
-        NB = triton.cdiv(T, 2048 * 32)
+        # Unsloth: NB dropped (unread), so no recompile per 65536-row bucket.
 
         layer_norm_gated_bwd_kernel[grid](
             x=x,
@@ -600,7 +591,6 @@ def layer_norm_gated_bwd(
             D=D,
             BS=BS,
             BD=BD,
-            NB=NB,
             ACTIVATION=activation,
             IS_RMS_NORM=is_rms_norm,
             STORE_DRESIDUAL=dresidual_in is not None,

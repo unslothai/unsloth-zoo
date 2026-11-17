@@ -24,7 +24,8 @@ from transformers import Gemma3nTextConfig
 
 from unsloth_zoo.temporary_patches import gemma3n as zoo_gemma3n
 
-SHARES_THROUGH_CACHE_ONLY = "shared_kv_states[self.kv_shared_layer_index]" not in inspect.getsource(modeling)
+# <= 5.5 shares KV only through the cache; 5.6+ passes shared_kv_states (keyed by layer index, by layer type from 5.23).
+SHARES_THROUGH_CACHE_ONLY = "past_key_values.shared_layers[self.kv_shared_layer_index]" in inspect.getsource(modeling)
 SHARES_THROUGH_USERDICT = "shared_kv_states = UserDict()" in inspect.getsource(modeling)
 
 
@@ -103,8 +104,7 @@ def _max_relative_error(reference, other):
 
 @pytest.mark.skipif(SHARES_THROUGH_CACHE_ONLY, reason = "only transformers >= 5.6 shares KV by itself")
 def test_without_the_patch_reentrant_checkpointing_drops_shared_kv_gradients(pristine):
-    # The first checkpointed forward stores keys and values with no graph, and the shared layers
-    # are recomputed in backward before their source layer.
+    # The first checkpointed forward stores keys and values with no graph; the shared layers are recomputed in backward before their source layer.
     assert _max_relative_error(_grads(None), _grads(True)) > 0.05
 
 

@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The MoE router must not be an automatically chosen LoRA target.
-
-A router leaf is an nn.Linear, so the automatic search counted it as an ordinary
-projection; Llama 4's and PhiMoE's return a tuple, which PEFT cannot adapt, and a
-trained Qwen3-MoE `mlp.gate` overflowed into a merge failure (unsloth#3690).
-"""
+"""MoE router must not be an automatic LoRA target: nn.Linear routers were picked up, Llama 4 and PhiMoE routers return
+tuples PEFT cannot adapt, and a trained Qwen3-MoE mlp.gate overflowed into a merge failure (unsloth issue 3690)."""
 
 from __future__ import annotations
 
@@ -113,8 +109,7 @@ def test_skip_does_not_depend_on_the_model_family(model_type):
 
 
 def _router_class(family):
-    """Matched by shape, not spelling: the class has been both Llama4Router and
-    Llama4TextRouter, and a getattr on one turns a rename into a silent skip."""
+    """Router class is matched by shape, not name: it has been both Llama4Router and Llama4TextRouter, so getattr on one turns a rename into a silent skip."""
     modeling = pytest.importorskip(f"transformers.models.{family}.modeling_{family}")
     found = sorted(
         (name, obj) for name, obj in vars(modeling).items()
@@ -132,8 +127,7 @@ def _router_class(family):
     ("phimoe", "PhimoeConfig"),
 ])
 def test_the_router_returns_a_tuple_so_peft_cannot_adapt_it(family, config_cls_name):
-    """PEFT's lora.Linear.forward does `result.dtype` on the base layer's return,
-    so a tuple cannot be adapted. Asserted on the value, not on the source text."""
+    """PEFT's lora.Linear.forward reads result.dtype from the base layer's return, so a tuple router cannot be adapted; asserted on the value, not the source text."""
     import torch
 
     transformers = pytest.importorskip("transformers")

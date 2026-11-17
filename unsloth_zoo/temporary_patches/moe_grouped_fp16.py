@@ -44,6 +44,8 @@ __all__ = [
     "generic_wgrad_config",
     "grouped_linear",
     "grouped_frozen_linear",
+    "generic_grouped_mm_lora",
+    "generic_lora_accumulate_",
     "fp16_grouped_available",
     "triton_grouped_available",
     "row_pow2_scale",
@@ -64,6 +66,8 @@ _DISABLED_REASON = None
 CALLS = {"gemm": 0, "wgrad": 0}
 # Generic MoE path (moe_utils.grouped_mm_triton): kernel launches, and self-check fallbacks to torch._grouped_mm.
 GENERIC_CALLS = {"gemm": 0, "wgrad": 0, "fallback": 0}
+# Folded LoRA launches (generic_grouped_mm_lora): base + LoRA in one GEMM, and LoRA-only accumulates into an output.
+LORA_CALLS = {"fold": 0, "accumulate": 0}
 
 # A operand handling when x is fp32 and w is fp16 / bf16.
 A_DIRECT, A_CAST, A_SPLIT = 0, 1, 2
@@ -73,14 +77,19 @@ if triton is not None:
 
     @triton.jit
     def _grouped_gemm_kernel(
-        A, B, C, COUNTS, SCALE, BIAS,
-        E, E_LO, E_HI, N, K,
+        A, B, C, COUNTS, SCALE, BIAS, A2, B2, C_IN,
+        E, E_LO, E_HI, N, K, K2, a2_scale,
         stride_am, stride_ak, stride_be, stride_bk, stride_bn, stride_cm, stride_bias_e,
-        A_MODE: tl.constexpr, ROW_SCALE: tl.constexpr, HAS_BIAS: tl.constexpr, IEEE: tl.constexpr,
-        E_POW2: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-        ENDS: tl.constexpr, GROUP_M: tl.constexpr = 0, EVEN_K: tl.constexpr = False,
+        stride_a2m, stride_a2k, stride_b2e, stride_b2k, stride_b2n,
+        A_MODE: tl.constexpr, ROW_SCALE: tl.constexpr, HAS_BIAS: tl.constexpr, IEEE: tl.constexpr,  # x direct / cast / hi-lo split, row scale, bias, ieee fp32
+        E_POW2: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  # num experts pow2 / tile M / N / K
+        ENDS: tl.constexpr, GROUP_M: tl.constexpr = 0, EVEN_K: tl.constexpr = False,  # cumulative ends / L2 row-tile group / K % BLOCK_K == 0
+        HAS_A2: tl.constexpr = False, ACC_IN: tl.constexpr = False, BLOCK_K2: tl.constexpr = 16,  # LoRA K segment / C += / K2 tile
     ):
         # ENDS: COUNTS holds cumulative row ends. GROUP_M > 0: 1D grid, GROUP_M row tiles at a time (L2 reuse).
+        # HAS_A2: a second K segment, C = A @ B + a2_scale * (A2 @ B2[e]) in one fp32 accumulator (K2 <= BLOCK_K2): a
+        # LoRA delta folded into the base GEMM. ACC_IN: the accumulator starts from C_IN (C = C_IN + ...; C_IN may be C,
+        # and has C's row stride).
         if GROUP_M > 0:
             pid = tl.program_id(0)
             num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -116,7 +125,11 @@ if triton is not None:
         b_base = B + (e - E_LO).to(tl.int64) * stride_be
         if ROW_SCALE:
             s = tl.load(SCALE + offs_m64, mask = mask_m, other = 1.0)
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype = tl.float32)
+        if ACC_IN:
+            acc = tl.load(C_IN + offs_m64[:, None] * stride_cm + offs_n[None, :],
+                          mask = mask_m[:, None] & mask_n[None, :], other = 0.0).to(tl.float32)
+        else:
+            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype = tl.float32)
         for k0 in range(0, K, BLOCK_K):
             offs_k = k0 + tl.arange(0, BLOCK_K)
             if EVEN_K:
@@ -146,6 +159,16 @@ if triton is not None:
                 acc = tl.dot(lo, b, acc)
         if ROW_SCALE:
             acc = acc / s[:, None]   # a power of two: exact
+        if HAS_A2:
+            # One tile covers the whole rank: no loop, so no extra pipeline stages in shared memory.
+            offs_k2 = tl.arange(0, BLOCK_K2)
+            mask_k2 = offs_k2 < K2
+            a2 = tl.load(A2 + offs_m64[:, None] * stride_a2m + offs_k2[None, :] * stride_a2k,
+                         mask = mask_m[:, None] & mask_k2[None, :], other = 0.0)
+            b2 = tl.load(B2 + (e - E_LO).to(tl.int64) * stride_b2e + offs_k2[:, None] * stride_b2k
+                         + offs_n[None, :] * stride_b2n, mask = mask_k2[:, None] & mask_n[None, :], other = 0.0)
+            a2 = (a2.to(tl.float32) * a2_scale).to(b2.dtype)
+            acc = tl.dot(a2, b2, acc)
         if HAS_BIAS:
             bias = tl.load(BIAS + e.to(tl.int64) * stride_bias_e + offs_n, mask = mask_n, other = 0.0)
             acc += bias.to(tl.float32)[None, :]
@@ -157,8 +180,8 @@ if triton is not None:
         G, X, DW, COUNTS,
         E, N, K,
         stride_gm, stride_xm, stride_de, stride_dn, stride_dk,
-        IEEE: tl.constexpr, E_POW2: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ENDS: tl.constexpr,
+        IEEE: tl.constexpr, E_POW2: tl.constexpr,  # ieee fp32 dot / num experts pow2
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ENDS: tl.constexpr,  # tile M / N / K, cumulative row ends
     ):
         # DW[e, n, k] = sum over the rows m of expert e of G[m, n] * X[m, k]; zero for an empty expert.
         e = tl.program_id(0)
@@ -225,12 +248,9 @@ def _pow2(n):
     return 1 << max(int(n) - 1, 0).bit_length()
 
 
-# fp32 gpt-oss down GEMM operands per backend when UNSLOTH_GPTOSS_FP16_DOWN_OPERAND=auto.
-# "fp32" is the loop's exact math (IEEE fp32, fp32 dequant stack); "fp16" rounds x / W / dY to fp16
-# (dY per-row power-of-two scaled) with an fp32 accumulate and output. Colab T4 (cuBLAS), 20B layer
-# fwd + bwd vs the loop: fp16 1.9x / 1.7x at 512 / 2048 tokens, fp32 1.33x / 0.97x (no fp32 tensor
-# cores). Triton: fp16 beats fp32 operands on A100 (1.9x / 2.0x at 512 / 2048 tokens), RTX PRO 6000
-# (1.3x / 1.5x), L4 (1.3x / 1.2x); fp16 runs on the tensor cores, IEEE fp32 on CUDA-core FMA.
+# UNSLOTH_GPTOSS_FP16_DOWN_OPERAND=auto: fp16 rounds x, W and dY to fp16 (dY per-row power-of-two scaled) with fp32
+# accumulate and output on tensor cores; fp32 is the exact loop math on CUDA-core FMA; auto picks fp16 for triton and
+# cublas.
 DOWN_OPERAND_AUTO = {"triton": "fp16", "cublas": "fp16"}
 
 
@@ -238,9 +258,8 @@ def use_cublas(device) -> bool:
     mode = os.environ.get("UNSLOTH_GPTOSS_FP16_GEMM", "auto")
     if mode in ("cublas", "triton"):
         return mode == "cublas"
-    # Measured, gpt-oss-20b MoE layer fwd + bwd (Colab, torch 2.11, Triton 3.6): Triton wins on
-    # A100 (sm80) and RTX PRO 6000 (sm120) and B200 (sm100); on L4 (sm89) cuBLAS ties at 512
-    # tokens and is 1.43x faster at 2048; on T4 (sm75) Triton has no MMA at all.
+    # Measured on a gpt-oss-20b MoE layer fwd + bwd with torch 2.11 and Triton 3.6: Triton wins on sm80, sm100 and
+    # sm120; cuBLAS ties or wins on sm89 (L4); Triton has no MMA on sm75 (T4).
     return device.type == "cuda" and (_capability(device) < (8, 0) or _capability(device) == (8, 9))
 
 
@@ -347,8 +366,8 @@ def _gemm_config(M, E, N, K, device, split):
     return BM, max(16, min(BN, _pow2(N))), max(16, min(BK if BM == 128 else 64, _pow2(K))), 4 if BM < 128 else 8, 3
 
 
-# Best-geomean tiles per rows-per-expert bucket, swept on A100 / L4 / RTX PRO 6000 over common MoE expert shapes.
-# Keys: "big" (N, K > 32), "N" (N <= 32), "K" (K <= 32). Rows: (max rows per expert or None, tile).
+# Best-geomean tiles per rows-per-expert bucket, swept on A100 / L4 / RTX PRO 6000; keys "big" (N, K > 32), "N" (N <=
+# 32), "K" (K <= 32); rows are (max rows per expert or None, tile).
 _GENERIC_GEMM = {
     "sm80": {
         "big": ((16, (32, 256, 64, 8, 3, 0)), (128, (64, 256, 64, 8, 3, 0)), (None, (128, 128, 64, 4, 3, 8))),
@@ -356,7 +375,8 @@ _GENERIC_GEMM = {
         "K": ((128, (32, 256, 16, 4, 2, 0)), (None, (64, 256, 16, 8, 2, 0))),
     },
     "sm89": {
-        "big": ((32, (32, 128, 128, 4, 3, 0)), (128, (128, 256, 64, 8, 3, 0)), (None, (128, 256, 64, 8, 3, 8))),
+        # 33-128 rows: (128, 128, 64) grouped beat (128, 256, 64) ungrouped on L4 by 1.15-1.4x (E 128-256).
+        "big": ((32, (32, 128, 128, 4, 3, 0)), (128, (128, 128, 64, 4, 3, 8)), (None, (128, 256, 64, 8, 3, 8))),
         "N": ((None, (32, 16, 256, 4, 4, 0)),),
         "K": ((32, (32, 256, 16, 4, 2, 0)), (64, (128, 128, 16, 4, 2, 0)), (None, (64, 256, 16, 8, 2, 0))),
     },
@@ -474,13 +494,15 @@ def _cublas_backend(device, backend):
 
 def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num_experts = None,
                  out = None, a_mode = None, row_scale = None, bias = None, config = None, backend = None,
-                 ends = False):
+                 ends = False, lora = None, acc_in = False, acc_src = None):
     """out[m] = a[m] @ (b[e - e_lo].T if b_trans else b[e - e_lo]) for rows of experts in [e_lo, e_hi).
 
     a: [M, K] rows sorted by expert; b: [E', N, K] (b_trans) or [E', K, N]; counts: [E] rows per
     expert on device. Rows outside the window are not written (pass `out` across windows).
     backend: None picks per device (use_cublas), "triton" / "cublas" force one. ends: counts holds
-    cumulative row ends (torch._grouped_mm's offs) instead of rows per expert."""
+    cumulative row ends (torch._grouped_mm's offs) instead of rows per expert. Triton only: lora = (a2 [M, K2],
+    b2 [E', K2, N], scale) adds scale * a2 @ b2[e] in the same accumulator (K2 <= 128); acc_in adds into `out`, or
+    onto acc_src (same shape and row stride as out) written to `out`."""
     M, K = a.shape
     E = int(num_experts if num_experts is not None else _counts_tensor(counts).numel())
     e_hi = E if e_hi is None else int(e_hi)
@@ -501,6 +523,11 @@ def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num
     ieee = a.dtype == torch.float32 and b.dtype == torch.float32
     if a_mode == A_DIRECT and a.dtype != b.dtype:
         raise TypeError(f"grouped_gemm: {a.dtype} x {b.dtype} needs a_mode cast / split")
+    if lora is not None or acc_in:
+        if backend != "triton" or row_scale is not None or a_mode == A_SPLIT or out is None and acc_in or (
+            acc_src is not None and (acc_src.shape != out.shape or acc_src.stride() != out.stride())
+        ):
+            raise ValueError("grouped_gemm: lora / acc_in need backend = 'triton', no row_scale / split, and out")
     if _cublas_backend(a.device, backend):
         if ends:
             counts = torch.diff(_counts_tensor(counts), prepend = _counts_tensor(counts).new_zeros(1))
@@ -518,12 +545,23 @@ def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num
         extra = dict(GROUP_M = int(config[5]), EVEN_K = K % BK == 0)
         if config[5]:
             grid = (grid[0] * grid[1],)
+    if lora is not None:
+        a2, b2, a2_scale = lora
+        extra.update(HAS_A2 = True, BLOCK_K2 = max(16, _pow2(a2.shape[1])))
+    else:
+        a2, b2, a2_scale = a, b, 1.0
+    if acc_in:
+        extra["ACC_IN"] = True
     with _on(a.device):
         _grouped_gemm_kernel[grid](
-            a, b, out, counts, row_scale if row_scale is not None else a, bias if bias is not None else a,
-            E, int(e_lo), e_hi, N, K,
+            a, b, out, counts, row_scale if row_scale is not None else a, bias if bias is not None else a, a2, b2,
+            acc_src if acc_src is not None else out,
+            E, int(e_lo), e_hi, N, K, a2.shape[1] if lora is not None else 0, float(a2_scale),
             a.stride(0), a.stride(1), b.stride(0), stride_bk, stride_bn, out.stride(0),
             bias.stride(0) if bias is not None else 0,
+            a2.stride(0) if lora is not None else 0, a2.stride(1) if lora is not None else 0,
+            b2.stride(0) if lora is not None else 0, b2.stride(1) if lora is not None else 0,
+            b2.stride(2) if lora is not None else 0,
             A_MODE = a_mode, ROW_SCALE = row_scale is not None, HAS_BIAS = bias is not None, IEEE = ieee,
             E_POW2 = _pow2(max(E, 2)), BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK, ENDS = bool(ends),
             num_warps = warps, num_stages = stages, **extra,
@@ -749,6 +787,42 @@ def generic_grouped_mm(inputs, weight, offsets, config_rows = None):
                        config = config, backend = "triton", ends = True)
     GENERIC_CALLS["gemm"] += 1
     return out
+
+
+LORA_FOLD_MAX_RANK = 128   # the folded rank is one BLOCK_K2 tile (no loop): wider ranks keep the separate GEMM
+
+
+def generic_lora_config(M, E, N, K, rank, device, dtype):
+    """generic_gemm_config's tiles with the rank tile's shared memory ([BM, K2] + [K2, BN]) taken off the budget."""
+    BM, BN, BK, warps, stages, group_m = generic_gemm_config(M, E, N, max(K, 1), device, dtype)
+    BK2 = max(16, _pow2(rank))
+    elt = dtype.itemsize
+    limit = _smem_limit(device) - (BM + BN) * BK2 * elt
+    BM, BK, stages = _fit_smem(BM, BN, BK, stages, elt, max(limit, 0), False)
+    return BM, BN, BK, warps, stages, group_m
+
+
+def generic_grouped_mm_lora(inputs, weight, offsets, lora_in, lora_w, scale, out = None, acc_in = False, acc_src = None):
+    """inputs @ weight[e] + scale * lora_in @ lora_w[e] per expert in one accumulator (torch._grouped_mm semantics,
+    offsets = cumulative ends on device). weight [E, K, N] and lora_w [E, r, N] may be strided views; acc_in adds
+    the result into `out`. inputs may have K = 0 (only the LoRA term)."""
+    M, K = inputs.shape
+    E, _, N = lora_w.shape
+    rank = lora_in.shape[1]
+    if rank > LORA_FOLD_MAX_RANK:
+        raise ValueError(f"generic_grouped_mm_lora: rank {rank} > {LORA_FOLD_MAX_RANK}")
+    config = generic_lora_config(M, E, N, K, rank, inputs.device, inputs.dtype)
+    out = grouped_gemm(inputs, weight, offsets, inputs.dtype if out is None else out.dtype, b_trans = False,
+                       num_experts = E, config = config, backend = "triton", ends = True, out = out,
+                       lora = (lora_in, lora_w, scale), acc_in = acc_in, acc_src = acc_src)
+    LORA_CALLS["accumulate" if acc_in else "fold"] += 1
+    return out
+
+
+def generic_lora_accumulate_(out, lora_in, lora_w, offsets, scale, base = None):
+    """out = (base if given, else out) + scale * lora_in @ lora_w[e], one rounding (the base GEMM ran elsewhere)."""
+    return generic_grouped_mm_lora(lora_in[:, :0], lora_w[:, :0, :], offsets, lora_in, lora_w, scale,
+                                   out = out, acc_in = True, acc_src = base)
 
 
 def generic_grouped_wgrad(inputs, grad, offsets, num_experts):

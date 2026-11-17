@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests for co-versioned llama.cpp converter source staging.
-
-No network, GPU or llama.cpp toolchain: downloads are monkeypatched to build a real
-tarball on disk.
-"""
+"""Tests co-versioned llama.cpp converter source staging offline: downloads are monkeypatched to serve a real tarball built on disk; no GPU or toolchain needed."""
 
 from __future__ import annotations
 
@@ -181,9 +177,8 @@ _FORK = "unslothai/llama.cpp"
 
 @pytest.fixture
 def staging_env(mod, tmp_path, monkeypatch):
-    """Cache at tmp_path; the fork release metadata and downloads are served from a
-    real tarball whose sha256 the stubbed llama-prebuilt-sha256.json publishes.
-    `downloads` counts downloads, `urls` records what was fetched."""
+    """Cache under tmp_path; release metadata and downloads come from a real tarball whose sha256
+    llama-prebuilt-sha256.json publishes; state counts downloads and records urls."""
     cache = tmp_path / "converter-cache"
     monkeypatch.setattr(mod, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(cache))
     state = {"downloads": 0, "entrypoint": _SHIM_ENTRYPOINT, "conversion": True,
@@ -209,8 +204,7 @@ def staging_env(mod, tmp_path, monkeypatch):
         blob = _blob_for(tag)
         url = f"https://github.com/{_FORK}/releases/download/{tag}/{name}"
         digest = hashlib.sha256(blob.read_bytes()).hexdigest()
-        # The URL carries the blob so a download made under one configuration
-        # serves exactly the bytes whose digest was published for it.
+        # The URL carries the blob path, so a download made under one configuration serves exactly the bytes whose sha256 digest was published for it.
         return {name: url + "#" + str(blob)}, {name: {"sha256": digest}}
 
     def fake_download(url, dest_path):
@@ -449,12 +443,8 @@ def test_each_offline_switch_blocks_staging(mod, staging_env, monkeypatch, var):
 
 
 def test_hf_hub_offline_does_not_block_a_github_download(mod, staging_env, monkeypatch):
-    """HF_HUB_OFFLINE is scoped to the Hugging Face Hub; the converter is on GitHub.
-
-    Honouring it here stopped exports for people who set it for Hub reasons while
-    having GitHub access, and silently disabled staging in any test session that
-    imported tests/_merge_e2e_helpers.py, which sets it process-wide and never
-    unsets it."""
+    """HF_HUB_OFFLINE is scoped to the Hub, so it must not block the GitHub converter download; honouring it stopped
+    exports, and tests/_merge_e2e_helpers.py sets it process-wide, silently disabling staging."""
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     assert mod._converter_network_allowed() is True
     assert mod._stage_converter_sources("b9000") is not None
@@ -736,8 +726,7 @@ def test_a_shim_without_its_package_names_the_problem(mod, tmp_path, monkeypatch
     message = str(excinfo.value)
     assert "conversion/" in message
     assert "same llama.cpp revision" in message
-    # The pin is what selected this directory, and it outranks the tag, so naming
-    # the tag here sends the user to a knob the pin keeps overriding.
+    # The UNSLOTH_LLAMA_CPP_SCRIPTS_DIR pin selected this directory and outranks the tag, so the error must not offer the tag as the remedy.
     assert "UNSLOTH_LLAMA_CPP_SCRIPTS_DIR" in message
     assert str(pinned) in message
     assert "UNSLOTH_LLAMA_CPP_CONVERTER_TAG" not in message.split("outranks")[0], (
@@ -806,11 +795,8 @@ def test_two_staged_revisions_do_not_share_one_patcher_cache_entry(mod, staging_
     assert "b9000" in first and "b9001" in second
 
 
-# --- resolver precedence ------------------------------------------------------
-#
-# UNSLOTH_LLAMA_CPP_SCRIPTS_DIR -> bundle with conversion/ -> installed
-# self-contained monolith -> staged co-versioned sources -> the lone master
-# entrypoint. The first three are offline.
+# Resolver order: UNSLOTH_LLAMA_CPP_SCRIPTS_DIR, then bundle with conversion/, then installed self-contained monolith,
+# then staged co-versioned sources, then the lone master entrypoint; the first three are offline.
 
 def _no_network(mod, monkeypatch, why):
     """Turn every route to the network into a test failure."""
@@ -980,8 +966,7 @@ def test_concurrent_stagers_converge_on_one_entry(mod, staging_env):
 
 
 def test_staging_uses_the_fork_source_asset_when_the_release_carries_one(mod, tmp_path, monkeypatch):
-    """Staging resolves the same URL the prebuilt install would have, and with no
-    asset map it reads the fork release by tag rather than any upstream archive."""
+    """Staging resolves the same URL the prebuilt install would, and with no asset map it reads the fork release by tag, not an upstream archive."""
     monkeypatch.setattr(mod, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(tmp_path / "cache"))
     tag = "b9739-mix-2d6bd50"
     name = f"llama.cpp-source-{tag}.tar.gz"
@@ -1048,10 +1033,7 @@ def test_a_read_only_pinned_checkout_still_resolves(mod, tmp_path, monkeypatch):
             os.chmod(path, 0o755 if path.is_dir() else 0o644)
 
 
-# --- the cost of pinning to the installed tag, made self-serviceable ----------
-#
-# An arch that only exists on master will not convert until a release cuts; the
-# error must name the revision that refused and the knob that moves it.
+# Pinning to the installed tag: an arch only on master will not convert until a release cuts, so the error must name the refusing revision and its knob.
 
 def _staged_tree_at(mod, tag, root):
     """A published stage for `tag` under `root`, without any download."""
@@ -1091,12 +1073,8 @@ def test_an_unsupported_arch_names_the_staged_tag_and_the_escape_hatch(mod, tmp_
 
 
 def test_an_unsupported_arch_on_an_unstaged_converter_still_names_the_escape_hatch(mod, tmp_path):
-    """The remedy does not depend on which row of the ladder answered.
-
-    This ladder newly prefers an installed converter over downloading master, so a
-    model that converted yesterday can stop converting today against a copy that
-    carries no manifest. Withholding the escape hatch from exactly that case leaves
-    the population this change created with no way out."""
+    """The unsupported-arch escape hatch must still be named for an unstaged installed converter, which the ladder now
+    prefers over master and which may lack a manifest."""
     checkout = _write_source_tree(tmp_path / "checkout")
     converter = str(checkout / "convert_hf_to_gguf.py")
     message = mod._unsupported_arch_message("BrandNewForCausalLM", converter)
@@ -1863,8 +1841,7 @@ def test_a_mirror_tightened_recursively_is_restored_throughout(mod, tmp_path, mo
     try:
         mirror = mod._writable_stage(stage, repo = _FORK, tag = "b9000")
         assert mirror is not None
-        # Not the mirror root: a read-only root makes os.access short-circuit the
-        # `or`, so _tree_is_writable is never consulted and this stops testing it.
+        # Chmod the subtrees, not the mirror root: a read-only root makes os.access short-circuit the `or`, so _tree_is_writable is never consulted.
         for relative in ("conversion", os.path.join("gguf-py", "gguf")):
             os.chmod(os.path.join(mirror, relative), 0o555)
         again = mod._writable_stage(stage, repo = _FORK, tag = "b9000")
@@ -2009,10 +1986,8 @@ def test_a_user_checkout_under_the_cache_root_is_not_written_into(mod, tmp_path,
 )
 
 def test_atomic_writes_follow_the_current_umask_without_reading_it(mod, tmp_path, monkeypatch):
-    """The mode must track a umask the application changes, and os.umask must never be called.
-
-    Reading the umask means setting it to 0 and putting it back, which two threads can
-    interleave into leaving the process at 0 forever; caching it instead goes stale."""
+    """Atomic writes must follow the current umask without calling os.umask: reading it sets 0 and restores, which two
+    threads can interleave into leaving 0; caching goes stale."""
     import stat
 
     def _forbidden(*args, **kwargs):
@@ -2143,12 +2118,8 @@ def test_the_converter_cache_env_var_is_read_at_the_call_not_at_import(mod, tmp_
 def test_a_stale_mirror_is_replaced_rather_than_blocking_every_retry(
     mod, tmp_path, monkeypatch, staging_env,
 ):
-    """A mirror written under an older stage schema must not wedge the read-only path.
-
-    UNSLOTH_CONVERTER_STAGE_SCHEMA exists to invalidate entries an older unsloth_zoo
-    wrote, so an unusable mirror is a state a release is expected to create. Skipping
-    publication because the path merely exists left the good copy deleted and every
-    later call returning None."""
+    """A stale mirror from an older UNSLOTH_CONVERTER_STAGE_SCHEMA must be replaced rather than skipped, since skipping
+    left the good copy deleted and every later call returning None."""
     stage = mod._stage_converter_sources("b9000")
     home = tmp_path / "home"
     monkeypatch.setattr(mod, "UNSLOTH_HOME", str(home))
@@ -2192,8 +2163,7 @@ def test_the_incomplete_remedy_names_the_knob_actually_in_force(mod, tmp_path, m
     assert "outranks" in pinned_remedy
     assert str(pinned) in pinned_remedy
 
-    # A pin pointing somewhere else did not select this directory, so the tag is
-    # still the right advice.
+    # A UNSLOTH_LLAMA_CPP_SCRIPTS_DIR pin pointing elsewhere did not select this directory, so UNSLOTH_LLAMA_CPP_CONVERTER_TAG is still the remedy.
     monkeypatch.setenv("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", str(tmp_path / "elsewhere"))
     assert "UNSLOTH_LLAMA_CPP_CONVERTER_TAG" in mod._incomplete_sources_remedy(str(pinned))
 
@@ -2212,11 +2182,8 @@ def test_the_incomplete_remedy_names_the_knob_actually_in_force(mod, tmp_path, m
 def test_a_mirror_published_during_our_repair_is_adopted_not_deleted(
     mod, tmp_path, monkeypatch, staging_env,
 ):
-    """A racing repair must not delete the winner's live, possibly patched tree.
-
-    The usability test and the rename that follows it are not one step, so another
-    process can publish a good mirror in between. Taking it and deleting it would
-    unpatch a directory an export is already using."""
+    """A racing repair must adopt a mirror another process published in between, not delete it: the usability check and
+    rename are not one step, and deleting unpatches a live tree."""
     stage = mod._stage_converter_sources("b9000")
     home = tmp_path / "home"
     monkeypatch.setattr(mod, "UNSLOTH_HOME", str(home))
@@ -2231,13 +2198,11 @@ def test_a_mirror_published_during_our_repair_is_adopted_not_deleted(
         calls = {"n": 0}
 
         def _stale_once(path, *args, **kwargs):
-            # False for the pre-rename check only, so the code proceeds to take a
-            # mirror that is in fact good, which is the race being simulated.
+            # The stub reports the mirror stale only for the pre-rename check, so the code takes a mirror that is in fact good, simulating the race.
             if os.path.abspath(path) == os.path.abspath(mirror):
                 calls["n"] += 1
-                # _writable_stage asks twice before the repair branch: once for the
-                # early reuse return, once for the `elif`. Both must read stale or
-                # the branch under test is never entered at all.
+                # _writable_stage asks twice before the repair branch, once for the early reuse return and once for the
+                # `elif`; both must read stale or it is never entered.
                 if calls["n"] <= 2:
                     return False
             return real_usable(path, *args, **kwargs)

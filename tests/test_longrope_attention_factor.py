@@ -14,18 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A LongRoPE attention_factor that cannot be real must be ignored.
-
-The factor is by construction
-
-    sqrt(1 + log(factor) / log(original_max_position_embeddings))
-
-a number near 1. Two published configs set it equal to `factor` (32.0),
-roughly 27x the real value; nothing raises, the model just predicts badly.
-
-The signature is exact on purpose: attention_factor == factor AND
-factor > 2, so it cannot fire on a config that means what it says.
-"""
+"""Ignores LongRoPE attention_factor == factor when factor > 2: the true value is near 1, and two published configs set
+it to factor (32.0), about 27x too large, with no error."""
 
 import math
 import sys
@@ -54,15 +44,9 @@ def patched():
 
 
 class _Config:
-    """The parts of a config the longrope initializer touches, on 4 and on 5.
-
-    transformers 5 renamed the dict to `rope_parameters`, keeps `rope_scaling`
-    as a read/write alias property (configuration_utils.py), moved `rope_theta`
-    and `original_max_position_embeddings` inside it, and calls
-    `config.standardize_rope_params()` first. A SimpleNamespace has none of
-    that and would `AttributeError` on every transformers 5 in the support
-    envelope.
-    """
+    """Mimics the config longrope touches on transformers 4 and 5: 5 renames the dict to `rope_parameters`
+    (`rope_scaling` is an alias), moves rope_theta and original_max_position_embeddings into it, calls
+    standardize_rope_params() first; a SimpleNamespace raises AttributeError on 5."""
 
     def __init__(self, scaling, original_max, max_pos):
         self.rope_parameters = scaling
@@ -125,8 +109,7 @@ def test_applying_twice_is_stable():
 
 
 def test_the_dict_entry_is_patched_not_just_the_module_attribute():
-    """Models resolve the callable through ROPE_INIT_FUNCTIONS, so patching
-    only the module attribute would be a silent no-op."""
+    """Models resolve the callable through ROPE_INIT_FUNCTIONS, so patching only the module attribute would be a silent no-op."""
     assert R.ROPE_INIT_FUNCTIONS["longrope"] is R._compute_longrope_parameters
     assert getattr(R.ROPE_INIT_FUNCTIONS["longrope"], "_unsloth_patched", False)
 
@@ -147,8 +130,7 @@ def test_a_value_equal_to_a_small_factor_is_preserved():
 
 
 def test_a_large_value_that_differs_from_factor_is_preserved():
-    # Only the exact coincidence is suspicious; a lone odd number is the
-    # author's business, not ours.
+    # Only the exact attention_factor == factor coincidence is suspicious; any other odd value is left alone.
     assert _att(_cfg(attention_factor=8.0, factor=32.0)) == pytest.approx(8.0)
 
 
@@ -162,8 +144,7 @@ def test_a_config_without_rope_scaling_does_not_raise():
     cfg = _cfg(attention_factor=32.0)
     cfg.rope_scaling = None
     with pytest.raises(Exception):
-        # The real function needs the dict; what matters is that OUR guard
-        # is not the thing that raised.
+        # The real function needs the rope dict; this test checks that our guard is not what raises.
         _att(cfg)
 
 
@@ -187,11 +168,7 @@ def test_missing_original_max_still_strips_the_bad_value():
 
 
 def test_device_stays_optional_for_a_transformers_5_original():
-    """transformers 5 gives every parameter but `config` a default, and
-    `PreTrainedModel._init_weights` calls `rope_fn(module.config)` with the
-    config alone (modeling_utils.py, the RotaryEmbedding branch). Naming
-    `device` in the wrapper would make every LongRoPE model fail to load with
-    a missing-argument TypeError before a single weight is read."""
+    """transformers 5 calls rope_fn(module.config) with the config alone, so `device` must stay optional or every LongRoPE model fails with TypeError on load."""
     seen = {}
 
     def original(config, device = None, seq_len = None, layer_type = None):
@@ -209,8 +186,7 @@ def test_device_stays_optional_for_a_transformers_5_original():
 
 
 def test_the_other_arguments_are_forwarded_untouched():
-    """`rope_init_fn(config, device, seq_len = ..., layer_type = ...)` is how
-    transformers 5 reinitializes a rotary embedding."""
+    """transformers 5 reinitializes rotary embeddings via `rope_init_fn(config, device, seq_len = ..., layer_type = ...)`, forwarding extra args untouched."""
     seen = {}
 
     def original(config, device = None, seq_len = None, layer_type = None):

@@ -1,15 +1,8 @@
 # Unsloth Zoo - Utilities for Unsloth
-# Pin MLXTrainer's batch padding to match mlx-lm's iterate_batches:
-# `1 + _PAD_MULTIPLE * ceil(L / _PAD_MULTIPLE)`.
-#
-# mlx-lm (mlx_lm/tuner/trainer.py:158) pads to `1 + 32*ceil(max_len/32)`;
-# default_loss then slices [:, :-1] / [:, 1:]. unsloth_zoo's
-# create_text_batches previously dropped the `+1`, leaving the input one
-# token short after the autoregressive shift, which shifted small fixtures
-# into a different convergence basin (probe 31 = 67% vs probe 33-37 = 40-53%,
-# see danielhanchen/unsloth-staging-2).
 
 import contextlib
+import itertools
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +17,11 @@ MODEL = "mlx-community/Qwen3.5-0.8B-bf16"
 QUANTIZED = "mlx-community/Qwen3.5-0.8B-4bit"
 MTP_MODEL = "Qwen/Qwen3.5-0.8B"
 GEMMA, GEMMA_ASSISTANT = "mlx-community/gemma-4-e4b-it-bf16", "mlx-community/gemma-4-E4B-it-assistant-bf16"
+QWEN4_TEXT = dict(model_type = "qwen4_exp_text", hidden_size = 512, num_hidden_layers = 4, num_attention_heads = 4, num_key_value_heads = 2,
+                  head_dim = 128, linear_num_key_heads = 2, linear_num_value_heads = 6, linear_key_head_dim = 128, linear_value_head_dim = 128,
+                  linear_conv_kernel_dim = 4, num_experts = 64, num_experts_per_tok = 10, moe_intermediate_size = 640,
+                  shared_expert_intermediate_size = 640, hc_lowrank = 320, rms_norm_eps = 1e-6, vocab_size = 1024, max_position_embeddings = 4096,
+                  ple_layer_ids = [2], ngram_vocab_size_base = 4096, split_ngram_parts = 4, eos_token_id = 1)
 CODE = (
     "def merge_sort(values):\n    if len(values) <= 1:\n        return values\n    middle = len(values) // 2\n"
     "    left = merge_sort(values[:middle])\n    right = merge_sort(values[middle:])\n    return merge(left, right)\n"
@@ -100,6 +98,17 @@ def test_a_fast_mlx_model_load_promotes_the_verify_sums(monkeypatch):
     assert repointed
 
 
+@pytest.fixture(autouse = True)
+def _pins_stay_in_their_test(monkeypatch):
+    """Models here outlive a test, and a drafter built for one pins its Fast Verify decision."""
+    from unsloth_zoo.mlx import inference
+    pin, pinned = inference.pin_fast_verify, []
+    monkeypatch.setattr(inference, "pin_fast_verify", lambda model, *args: pinned.append(inference._fast_verify_state(model)) or pin(model, *args))
+    yield
+    for state in pinned:
+        state.pop(inference._FAST_VERIFY_PIN, None)
+
+
 @pytest.fixture(scope = "module")
 def qwen():
     return _load(MODEL)
@@ -121,20 +130,14 @@ def qwen_4bit():
 
 @pytest.fixture(scope = "module")
 def qwen4():
-    """A small random qwen4_exp quantized like the 4-bit releases, so its decode takes the batch-invariant forward, with
-    their expert and hyper-connection widths, which pick the projections' kernels."""
+    """Random quantized qwen4_exp like the 4-bit releases: decode takes the batch-invariant forward, and its expert and hyper-connection widths pick the kernels."""
     import mlx.nn as nn
     from mlx.utils import tree_map
     from mlx_vlm.models import qwen4_exp
     from unsloth_zoo.mlx.loader import _ensure_exact_verify_sums_promoted
     _ensure_exact_verify_sums_promoted()  # as FastMLXModel's VLM load does
-    text = dict(model_type = "qwen4_exp_text", hidden_size = 512, num_hidden_layers = 4, num_attention_heads = 4, num_key_value_heads = 2,
-                head_dim = 128, linear_num_key_heads = 2, linear_num_value_heads = 6, linear_key_head_dim = 128, linear_value_head_dim = 128,
-                linear_conv_kernel_dim = 4, num_experts = 64, num_experts_per_tok = 10, moe_intermediate_size = 640,
-                shared_expert_intermediate_size = 640, hc_lowrank = 320, rms_norm_eps = 1e-6, vocab_size = 1024, max_position_embeddings = 4096,
-                ple_layer_ids = [2], ngram_vocab_size_base = 4096, split_ngram_parts = 4, eos_token_id = 1)
     vision = dict(depth = 1, hidden_size = 64, num_heads = 2, intermediate_size = 128, out_hidden_size = 512)
-    model = qwen4_exp.Model(qwen4_exp.ModelConfig.from_dict(dict(model_type = "qwen4_exp", text_config = text, vision_config = vision)))
+    model = qwen4_exp.Model(qwen4_exp.ModelConfig.from_dict(dict(model_type = "qwen4_exp", text_config = QWEN4_TEXT, vision_config = vision)))
     # Constructors zero gates and residual scales, which would cut the paths under test.
     model.update(tree_map(lambda a: mx.random.normal(a.shape, key = mx.random.key(a.size)) * 0.05
                           if mx.issubdtype(a.dtype, mx.floating) and not mx.any(a).item() else a, model.parameters()))
@@ -177,7 +180,9 @@ def _probe_matches_a_started_row(model, drafter, prompt, held):
     from unsloth_zoo.mlx.speculative import _capture, _features, probe_drafter
     hidden = _features(drafter, (lm := getattr(model, "language_model", model))(mx.array([prompt]), cache = make_prompt_cache(lm), **_capture(drafter)))
     shapes = lambda entries: [(type(entry), getattr(entry, "max_size", None), tuple(a.shape), a.dtype) for entry in entries for a in entry.state if a is not None]
-    return shapes(probe_drafter(model, drafter, len(prompt))) == shapes(held(drafter.start(prompt, hidden, 0))) != []
+    started = drafter.start(prompt, hidden, 0)
+    drafter.catch_up(started[1], [started[0]])
+    return shapes(probe_drafter(model, drafter, len(prompt))) == shapes(held(started)) != []
 
 
 def _prefill(lm, prompt, sampling, processors = (), drafter = None):
@@ -214,10 +219,23 @@ def _presence():
     return penalty
 
 
+def _parity():
+    def favour(tokens, logits):
+        start = favour.__dict__.setdefault("start", tokens.shape[0])
+        if favour.committed:
+            favour.ahead = max(favour.ahead, tokens.shape[0] - start - len(favour.committed[-1]))
+        return logits + 4 * (mx.arange(logits.shape[-1]) % 2 == sum(tokens[start:].tolist()) % 2)
+    favour.committed, favour.ahead = [], 0
+    favour.settle = lambda tokens: favour.committed.append(tokens[favour.start :].tolist())
+    return favour
+
+
 def _head_in_step(engine):
     offset = mx.array(engine.draft_cache[0].offset).reshape(-1).tolist()
     for i, row in enumerate(engine._rows):
-        assert offset[i] == row.draft.position - engine.drafter.dropped.get(id(row.draft), 0)
+        prefix = getattr(row.draft, "prefix", None)
+        pending = len(prefix.tokens) if prefix is not None else 0
+        assert offset[i] == row.draft.position - engine.drafter.dropped.get(id(row.draft), 0) - pending
         assert row.draft.position + len(row.draft.tokens) == len(row.tokens) - 1
 
 
@@ -292,6 +310,118 @@ def test_ragged_rounds_match_each_row_decoded_alone(qwen):
     short = lambda e: setattr(e, "add", lambda row, add = e.add: add(__import__("dataclasses").replace(row, max_tokens = 3) if row.uid else row)) or setattr(e, "step", lambda step = e.step: seen.append(len(e._rows)) or step())
     out, _, _ = _run(model, ids[:2], 12, window, SamplingParams(), patch = short)
     assert seen == [2, 1] and out == [_solo(model, ids[0], 12, SamplingParams()), _solo(model, ids[1], 3, SamplingParams())]
+
+
+def test_quantized_rows_roll_back_row_by_row_and_match_each_decoded_alone(qwen, monkeypatch):
+    from mlx_vlm.models.cache import BatchQuantizedKVCache
+    from unsloth_zoo.mlx import speculative
+    from unsloth_zoo.mlx.generate import SamplingParams
+    model, ids = qwen
+    prefill = _prefill
+    def quantized(lm, *a, **k):
+        cache, first, hidden = prefill(lm, *a, **k)
+        return [entry.to_quantized(group_size = 64, bits = 8) if hasattr(entry, "to_quantized") else entry for entry in cache], first, hidden
+    monkeypatch.setitem(globals(), "_prefill", quantized)
+    join, joined = speculative._join, []
+    monkeypatch.setattr(speculative, "_join", lambda *a: (merged := join(*a), joined.extend(map(type, merged)))[0])
+    prepare, ragged = BatchQuantizedKVCache.prepare, []
+    monkeypatch.setattr(BatchQuantizedKVCache, "prepare", lambda cache, **k: (ragged.append(max(k.get("right_padding", (0,)))), prepare(cache, **k))[1])
+    prompts = [*ids, ids[0][3:]]  # a third row joins through extend
+    rows, drafted, _ = _run(model, prompts, 64, _script(("copy", 8), ("plain", 2)), SamplingParams())
+    assert rows == [_solo(model, prompt, 64, SamplingParams()) for prompt in prompts]
+    assert BatchQuantizedKVCache in joined and max(ragged) > 0 and any(accepted > 0 for _, accepted in drafted.values())
+
+
+def _quantized_prefill(monkeypatch):
+    prefill = _prefill
+    def quantized(lm, *a, **k):
+        cache, first, hidden = prefill(lm, *a, **k)
+        return [entry.to_quantized(group_size = 64, bits = 8) if hasattr(entry, "to_quantized") else entry for entry in cache], first, hidden
+    monkeypatch.setitem(globals(), "_prefill", quantized)
+
+
+def test_a_quantized_row_leaves_with_its_own_cache(qwen, monkeypatch):
+    from unsloth_zoo.mlx import speculative
+    from unsloth_zoo.mlx.generate import SamplingParams, _row_cache
+    model, ids = qwen
+    _quantized_prefill(monkeypatch)
+    alone = [_prefill(model.language_model, prompt, SamplingParams())[0] for prompt in ids]
+    assert speculative._packed_kv(alone[0]) and not speculative._packed_kv([SimpleNamespace(keys = mx.zeros((1, 1, 1, 1)))])
+    assert all(row is entry for row, entry in zip(_row_cache(alone[0], 0), alone[0]) if hasattr(entry, "keys"))
+    merged = speculative._join(speculative._join(None, alone[0], 0), alone[1], 1)
+    assert all(row.offset == entry.offset for row, entry in zip(_row_cache(merged, 1), alone[1]) if hasattr(entry, "keys"))
+
+
+def test_a_quantized_row_copies_without_a_drafter_that_reads_target_keys(qwen, monkeypatch):
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.speculative import AssistantDrafter
+    class Assistant(AssistantDrafter):
+        def __init__(self):
+            pass
+        def start(self, *a):
+            raise AssertionError("a packed row was given a draft")
+    model, ids = qwen
+    prompt, expected = ids[0], _solo(model, ids[0], 32, SamplingParams())
+    _quantized_prefill(monkeypatch)
+    rows, drafted, _ = _run(model, [prompt], 32, _script(("copy", 8), ("plain", 2)), SamplingParams(), drafter = Assistant())
+    assert rows == [expected] and drafted
+
+
+def test_a_quantized_row_is_refused_where_mlx_vlm_cannot_merge_it(monkeypatch):
+    from mlx_vlm.models.cache import QuantizedKVCache
+    from unsloth_zoo.mlx import generate
+    monkeypatch.delattr(QuantizedKVCache, "prefix_cache_merge")
+    state = SimpleNamespace(open = lambda prompt: ([QuantizedKVCache()], None))
+    with pytest.raises(generate.BatchRowRefused, match = "cannot batch"):
+        generate._SpeculativeBatchSession._resume(None, state, [1], None, None, {})
+
+
+def test_a_row_whose_cache_differs_from_the_batch_is_refused_and_the_batch_continues(qwen, monkeypatch):
+    from dataclasses import replace
+    from unsloth_zoo.mlx import generate
+    from unsloth_zoo.mlx.speculative import SpeculativeDraft
+    model, request = qwen[0], generate.GenerationRequest(prompt = "Name three colours.", max_tokens = 6)
+    monkeypatch.setattr(model, "_is_vlm_model", True, raising = False)
+    admit = SpeculativeDraft.admit
+    def quantized(self, *a, **k):
+        row, logprob = admit(self, *a, **k)
+        return replace(row, cache = [entry.to_quantized(group_size = 64, bits = 8) if hasattr(entry, "to_quantized") else entry for entry in row.cache]), logprob
+    with generate.BatchStream(model, None, speculative = SpeculativeDraft(_rounds_only())) as stream:
+        row = stream.add(request)
+        with monkeypatch.context() as patch:
+            patch.setattr(SpeculativeDraft, "admit", quantized)
+            pytest.raises(generate.BatchRowRefused, stream.add, request)
+        session = stream._session
+        assert session.usable and len(session.engine.rows) == 1
+        assert any(event.index == row and event.result is not None for _ in range(12) for event in stream.iter_step())
+
+
+def test_a_batch_row_settles_on_the_history_its_processor_is_shown():
+    from unsloth_zoo.mlx.generate import _sequential_history
+    settled = []
+    processor = lambda tokens, logits: logits
+    processor.settle = lambda tokens: settled.append(tokens.tolist())
+    shown = _sequential_history(processor)
+    shown(mx.array([1, 2, 3]), mx.zeros((1, 4)))
+    shown.settle(mx.array([1, 2, 3, 4]))
+    assert settled == [[3, 4]] and not shown.history_only
+
+
+def test_a_processor_that_settles_speculates_and_is_told_each_committed_history(qwen, monkeypatch):
+    from unsloth_zoo.mlx import speculative
+    from unsloth_zoo.mlx.generate import SamplingParams
+    model, ids = qwen
+    take, lengths = speculative._Row.take, []
+    monkeypatch.setattr(speculative._Row, "take", lambda row, *a: (taken := take(row, *a)) and lengths.append(len(row.tokens) - len(ids[0])) or taken)
+    step, plain_ahead = speculative.SpeculativeEngine._step, []
+    monkeypatch.setattr(speculative.SpeculativeEngine, "_step", lambda engine, inputs, ahead = 0: plain_ahead.append(ahead) or step(engine, inputs, ahead))
+    (out,), drafted, _ = _run(model, ids[:1], 96, _script(("copy", 8), ("plain", 4)), SamplingParams(), processors = {0: [favour := _parity()]})
+    assert out == _solo(model, ids[0], 96, SamplingParams(), [_parity()])
+    assert plain_ahead and not any(plain_ahead)
+    assert drafted[0][1] > 0 and favour.ahead > 1
+    committed = favour.committed
+    assert committed[0] == out[:1] and committed[-1] == out and [len(c) for c in committed] == [1, *lengths]
+    assert all(len(a) < len(b) and b[: len(a)] == a for a, b in zip(committed, committed[1:]))
 
 
 def test_verify_that_replaces_caches_is_refused_and_decoding_continues(qwen):
@@ -389,6 +519,7 @@ def test_wide_verify_blocks_are_cut_into_balanced_slices_within_the_fused_bound(
 @pytest.mark.parametrize("width", [9, 17])
 def test_wide_verify_blocks_in_slices_match_the_native_verifier(qwen_4bit, monkeypatch, width):
     from unsloth_zoo.mlx import inference
+    monkeypatch.setenv("UNSLOTH_MLX_VERIFY_QMV_ROWS", "0")  # slices serve the layouts `matmul.qmv_rows` does not cover
     (model, ids, cache), served = qwen_4bit, _serving(monkeypatch)
     lm, block = model.language_model, mx.array([ids[0][24 : 24 + width]])
     first = -(-width // -(-width // 8))
@@ -403,6 +534,7 @@ def test_wide_verify_blocks_in_slices_match_the_native_verifier(qwen_4bit, monke
 
 def test_a_sliced_verify_block_matches_one_token_decode_steps(qwen_4bit, monkeypatch):
     from unsloth_zoo.mlx import inference
+    monkeypatch.setenv("UNSLOTH_MLX_VERIFY_QMV_ROWS", "0")
     (model, ids, cache), served = qwen_4bit, _serving(monkeypatch)
     lm, block = model.language_model, mx.array([ids[0][24:39]])
     steps, snapshots, decoded = _clone(cache), {0: cache}, []
@@ -417,6 +549,773 @@ def test_a_sliced_verify_block_matches_one_token_decode_steps(qwen_4bit, monkeyp
     assert served
 
 
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_a_verify_block_runs_its_rows_together_and_matches_one_token_decode_steps(monkeypatch, bits):
+    import mlx.nn as nn
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference, matmul, nax
+    model, ids = _load(MODEL)
+    lm = model.language_model
+    nn.quantize(lm, group_size = 64, bits = bits)
+    cache = make_prompt_cache(lm)
+    mx.eval(lm(mx.array([ids[0][:24]]), cache = cache).logits)
+    block, calls = mx.array([ids[0][24:35]]), []
+    kernel = matmul.qmv_rows
+    kind = lambda inputs, staged: "prepared" if inputs is not None else "staged" if staged else "inline"
+    monkeypatch.setattr(matmul, "qmv_rows", lambda x, *args: calls.append((*x.shape, kind(*args[5:]))) or kernel(x, *args))
+    matmul.compile_qmv_rows.cache_clear()
+    # Launches are timed once per kernel; here staged launches are cheapest up to 16 rows, or prepared ones up to 4.
+    timed, cheaper = [], "staged" if bits in (4, 6) else "prepared"
+    costs = _spilling_costs(16, staged = 0.8) if cheaper == "staged" else _spilling_costs(4)
+    monkeypatch.setattr(inference, "_QMV_ROWS_COSTS", {})
+    monkeypatch.setattr(inference, "_QMV_ROWS_LAYOUTS", {})
+    monkeypatch.setattr(matmul, "qmv_rows_launch_costs", lambda *kernel: timed.append(kernel) or costs)
+    steps, snapshots, decoded = _clone(cache), {0: cache}, []
+    for t in range(block.shape[1]):
+        decoded.append(lm(block[:, t : t + 1], cache = steps, **_captured(lm)))
+        if t + 1 in (1, 6, 11):
+            snapshots[t + 1] = _clone(steps)
+    stepped = SimpleNamespace(logits = mx.concatenate([out.logits for out in decoded], axis = 1), hidden_states = [mx.concatenate(parts, axis = 1) for parts in zip(*(out.hidden_states for out in decoded))])
+    projections = [p for _, p in lm.named_modules() if isinstance(p, nn.QuantizedLinear)]
+    model.generate, model._unsloth_speculates = lambda *args, **kwargs: None, True  # marked as building a drafter does
+    # Settled at load, outside any verify scope: every row count built, launches timed once, each layout checked.
+    inference.warm_inference(model)
+    with inference.exact_speculative_verify(model):
+        step = 512 if bits in (4, 5) else 256
+        assert {M for M, K, _ in calls if K == step} == set(range(1, 17)) and timed == [(mx.bfloat16, 64, bits)]
+        supported, support = [], matmul.qmv_rows_supported
+        monkeypatch.setattr(matmul, "qmv_rows_supported", lambda *args: supported.append(args) or support(*args))
+        calls.clear()
+        assert all(_same(_state(stepped, entries), _verified(lm, cache, block, keep)) for keep, entries in snapshots.items())
+        assert {(M, launched) for M, K, launched in calls} == {(M, cheaper) for M in ({11} if cheaper == "staged" else {4, 3})}  # 11 or 4 + 4 + 3
+        _verified(lm, cache, block[:, :5], 0)
+        assert (5 if cheaper == "staged" else 2, lm.args.hidden_size, cheaper) in calls and not supported
+        assert timed == [(mx.bfloat16, 64, bits)]
+        probe, recorded = nax.kernel_probe_passed, matmul.qmv_rows  # replaced scales settle again, natively if these fail
+        fresh = lambda: [setattr(p, "scales", mx.array(p.scales)) for p in projections]
+        for failed in ((nax, "kernel_probe_passed", lambda key, *args: not key.startswith(matmul.QMV_ROWS_PROBE_KEY) and probe(key, *args)),
+                       (matmul, "qmv_rows", lambda x, *args: recorded(x, *args) + (kind(*args[5:]) == "staged"))):
+            with monkeypatch.context() as patch:
+                patch.setattr(inference, "_QMV_ROWS_LAYOUTS", {})
+                patch.setattr(*failed)
+                fresh()
+                inference._warm_qmv_rows(model)
+                calls.clear()
+                _verified(lm, cache, block, 0)
+                assert not calls and all(vars(p)["_unsloth_qmv_rows"][2] is None for p in projections)
+        fresh()  # without a warm-up the first block settles them, unless the kill switch is set
+        count, checked = len(calls), len(supported)
+        monkeypatch.setenv("UNSLOTH_MLX_VERIFY_QMV_ROWS", "0")
+        inference.warm_inference(model)
+        _verified(lm, cache, block, 0)
+        assert len(calls) == count and len(supported) == checked
+        monkeypatch.delenv("UNSLOTH_MLX_VERIFY_QMV_ROWS")
+        _verified(lm, cache, block, 0)
+        assert len(calls) > count
+
+
+def _spilling_costs(most, prepared = 0.9, staged = 1):  # one unit per launch and per row; launches over `most` rows spill
+    per_row = {"inline": 1, "prepared": prepared, "staged": staged}
+    return {(m, kind): 1 + m * per_row[kind] if m <= most else 100 for kind in per_row
+            for m in range(1, 17 if kind == "staged" else 9)}
+
+
+def test_each_verify_rows_kernel_has_its_own_probe_building_only_that_kernel(monkeypatch):
+    import itertools
+    from unsloth_zoo.mlx import matmul
+    probed = []
+    monkeypatch.setattr(matmul, "_probe_qmv_rows", lambda *kernel: probed.append(kernel))
+    kernels = list(itertools.product((mx.bfloat16, mx.float16), (32, 64, 128), (4, 5, 6, 8)))
+    keys = set()
+    for kernel in kernels:
+        key, function = matmul.qmv_rows_probe(*kernel)
+        keys.add(key)
+        getattr(matmul, function)()
+        assert key.startswith(matmul.QMV_ROWS_PROBE_KEY + ":") and probed[-1] == kernel
+    assert len(keys) == len(kernels) == len(probed)
+    for name in ("probe_qmv_rows_bfloat16_64_3", "probe_qmv_rows_float32_64_4", "probe_qmv_rows_float16_48_4"):
+        with pytest.raises(AttributeError):
+            getattr(matmul, name)
+
+
+def test_verify_rows_serve_only_projections_whose_one_row_call_is_stock(monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul
+    monkeypatch.setattr(inference, "_QMV_ROWS_COSTS", {})
+    monkeypatch.setattr(inference, "_QMV_ROWS_LAYOUTS", {})
+    monkeypatch.setattr(matmul, "qmv_rows_launch_costs", lambda *kernel: _spilling_costs(8))
+    supported, support = [], matmul.qmv_rows_supported
+    monkeypatch.setattr(matmul, "qmv_rows_supported", lambda *args: supported.append(args) or support(*args))
+    linear = nn.Linear(512, 64, bias = False)
+    linear.set_dtype(mx.bfloat16)
+    p = nn.QuantizedLinear.from_linear(linear, group_size = 64, bits = 4)
+    assert inference._qmv_rows_kernel(p) == (mx.bfloat16, 64, 4) and len(supported) == 1
+    # A wrapper zoo installs during generation, stock on one row, keeps the verdict settled at load.
+    stock_call = lambda self, x: nn.QuantizedLinear.__call__(self, x)
+    monkeypatch.setattr(inference, "_ONE_ROW_STOCK_CALLS", {stock_call})
+    p.__class__ = type("Wrapped", (nn.QuantizedLinear,), {"__call__": stock_call})
+    assert inference._qmv_rows_kernel(p) == (mx.bfloat16, 64, 4) and len(supported) == 1
+    # A subclass whose call changes the projection is never bypassed.
+    p.__class__ = type("Scaled", (nn.QuantizedLinear,), {"__call__": lambda self, x: nn.QuantizedLinear.__call__(self, x) * 2})
+    assert inference._qmv_rows_kernel(p) is None
+    p.__class__ = nn.QuantizedLinear
+    assert inference._qmv_rows_kernel(p) == (mx.bfloat16, 64, 4)
+    # Nor is the stock call once something rebinds it, until the MLX body is back.
+    linear_call = nn.QuantizedLinear.__call__
+    monkeypatch.setattr(nn.QuantizedLinear, "__call__", lambda self, x: linear_call(self, x) * 2)
+    assert inference._qmv_rows_kernel(p) is None
+    monkeypatch.setattr(nn.QuantizedLinear, "__call__", linear_call)
+    assert inference._qmv_rows_kernel(p) == (mx.bfloat16, 64, 4)
+
+
+def test_verify_rows_launch_the_plan_their_launch_costs_make_cheapest():
+    from unsloth_zoo.mlx import matmul
+    plan = lambda costs, rows: matmul.qmv_rows_plan(tuple(costs.items()), rows)
+    # As few launches as fit under the spill, balanced, with the cheaper inputs.
+    assert plan(_spilling_costs(6), 16) == (6, "prepared") and matmul.qmv_rows_sizes(16, 6) == [6, 5, 5]
+    assert plan(_spilling_costs(8, prepared = 1.1), 16) == (8, "inline")
+    assert plan(_spilling_costs(8, staged = 0.8), 16) == (8, "staged")
+    assert plan(_spilling_costs(16, staged = 0.8), 16) == (16, "staged")
+    assert plan(_spilling_costs(4), 3) in {(3, "prepared"), (4, "prepared")}
+
+
+def test_verify_row_launches_are_costed_by_the_median_of_three_timed_runs(monkeypatch):
+    from unsloth_zoo.mlx import matmul
+    now, spent, runs = [0.0], [0.0], {}
+
+    def clock():
+        now[0], spent[0] = now[0] + spent[0], 0.0
+        return now[0]
+
+    def launch(x, w, scales, biases, group_size, bits, inputs, staged):
+        rows, prepared = x.shape[0], inputs is not None
+        durations = (0, rows, 50, rows + 0.5 * prepared + 0.25 * staged)
+        spent[0] += next(runs.setdefault((rows, prepared, staged), iter([d for d in durations for _ in range(4)])))
+        return x
+    monkeypatch.setattr(matmul, "qmv_rows", launch)
+    monkeypatch.setattr(matmul, "qmv_rows_inputs", lambda x, bits: x)
+    # A warm run, then three timed runs of four launches each, every launch advancing the clock by its own time.
+    costs = matmul.qmv_rows_launch_costs(mx.bfloat16, 64, 4, clock)
+    extra = {"inline": 0, "prepared": 0.5, "staged": 0.25}
+    assert costs == {(m, kind): m + extra[kind] for kind in extra for m in range(1, 17 if kind == "staged" else 9)}
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_row_invariant_lane_projections_are_opt_in_run_decode_and_verify_and_restore(qwen_4bit, monkeypatch, mixed):
+    import copy
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen3_5 import language, speculative_verifier
+    from unsloth_zoo.mlx import attention, inference, matmul
+    from unsloth_zoo.mlx.generate import SamplingParams, generation_mode
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    (model, ids, cache), rows, kernel = qwen_4bit, [], matmul.lane_qmm
+    invariant = lambda: any(type(m).__name__.startswith("_Invariant") for _, m in model.named_modules())
+    held = lambda name: [m for _, m in model.named_modules() if name in vars(m)]
+    quantized = lambda: [m for _, m in model.named_modules() if isinstance(m, (nn.QuantizedLinear, nn.QuantizedEmbedding))]
+    verifier, native = language._EXACT_SPECULATIVE_VERIFIER, speculative_verifier.Qwen3_5BatchInvariantForward
+    unscoped, block = copy.copy(model.language_model), mx.array([ids[0][24:36]])   # shares the projections
+    monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: rows.append((len(args[0]), args[1].shape[0])) or kernel(*args, **kwargs))
+    if mixed:   # projections as wide as `in_proj_z` stay native, so the GDN input group mixes lane and native members
+        z = next(m.weight.shape[0] for name, m in model.language_model.named_modules() if name.endswith("in_proj_z"))
+        supported = matmul.lane_qmm_supported
+        monkeypatch.setattr(matmul, "lane_qmm_supported", lambda N, *args: N != z and supported(N, *args))
+    monkeypatch.setattr(inference, "_LANE_LOW_ROWS", 0)
+    monkeypatch.delenv("UNSLOTH_MLX_FAST_VERIFY", raising = False)
+    with generation_mode(model):
+        assert "_unsloth_lane_verify_native" not in vars(type(verifier)) and not inference.fast_verify_enabled(model)   # off unless asked for
+    with monkeypatch.context() as patch:   # nor when asked for with the kernel switched off
+        [patch.setenv(*switch) for switch in (("UNSLOTH_MLX_FAST_VERIFY", "1"), ("UNSLOTH_MLX_LANE_QMM", "0"))]
+        with generation_mode(model, call = ("batch", "speculative")):
+            assert "_unsloth_lane_verify_native" not in vars(type(verifier)) and not inference.fast_verify_enabled(model)
+            assert not invariant()
+            assert len(held("_unsloth_singleton_scopes")) == len(quantized())   # a batch's decode keeps its one-row arithmetic
+    with monkeypatch.context() as patch:   # as it does when the kernel's probe fails
+        patch.setenv("UNSLOTH_MLX_FAST_VERIFY", "1")
+        patch.setattr(inference.nax, "kernel_probe_passed", lambda *args: False)
+        with generation_mode(model, call = ("batch", "speculative")):
+            assert not held("_unsloth_lane_qmm") and len(held("_unsloth_singleton_scopes")) == len(quantized())
+    with inference.row_invariant_lane_projections(model):   # also without the exact scope under it, which may nest inside
+        assert type(verifier)._unsloth_lane_verify_native is native
+        with inference.exact_speculative_verify(model):
+            assert type(verifier)._unsloth_lane_verify_native._unsloth_verify_native is native
+        assert type(verifier)._unsloth_lane_verify_native is native
+    assert type(verifier) is native
+    with inference.row_invariant_attention(model):   # decode attention moves only with the verifier its blocks take
+        assert invariant() == attention.invariant_attention_available()
+    with monkeypatch.context() as patch:
+        patch.setattr(native, "_linear", lambda self, *args: None)
+        with inference.row_invariant_attention(model):
+            assert not invariant()
+    monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", "1")
+    assert inference.fast_verify_enabled(model) and not inference.fast_verify_enabled(object())
+    with generation_mode(model, call = ("batch", "speculative")):
+        # Every projection decodes a batch row by row: on the kernel, or one row at a time where it stays native.
+        assert held("_unsloth_lane_qmm") and bool(held("_unsloth_singleton_scopes")) == mixed
+        assert all(("_unsloth_lane_qmm" in vars(m)) != ("_unsloth_singleton_scopes" in vars(m)) for m in quantized())
+        # Layered over the exact scope's verifier, which keeps serving what lane does not cover, nested or not.
+        with inference.exact_speculative_verify(model):
+            pass
+        with monkeypatch.context() as patch:   # nor does a scope that ends while a binding has drifted
+            patch.setattr(native, "_linear", lambda self, *args: None)
+            with inference.row_invariant_lane_projections(model):
+                pass
+        assert type(verifier)._unsloth_lane_verify_native._unsloth_verify_native is native
+        head = model.language_model.model.layers[0].mlp.down_proj   # an untied head's stand-in: its fused head is declined
+        assert native.can_quantized_head(verifier, head) and not verifier.can_quantized_head(head)
+        x = mx.ones((1, 1, head.weight.shape[1] * 32 // head.bits), mx.bfloat16)
+        assert verifier.quantized_argmax(head, x) is None and verifier.quantized_linear(head, x) is None
+        _verified(unscoped, cache, block, 0)
+        # A model outside the scope verifies off the kernel; only its one-row calls of the shared modules take it.
+        assert rows and all(m == 1 for m, _ in rows)
+        rows.clear()
+        speculative, drafted, _ = _run(model, [ids[0], ids[1]], 96, _rounds_only(), SamplingParams())
+        assert speculative == [_solo(model, prompt, 96, SamplingParams()) for prompt in ids[:2]]   # the same greedy output
+    assert drafted[0][1] > 0 and {1, 2} <= {m for m, _ in rows}   # one-token steps and accepted copies' blocks
+    # Projections back to the hidden size verify alone, the input groups together: both take the kernel.
+    assert model.language_model.args.hidden_size in {n for _, n in rows} and len({n for _, n in rows}) > 1
+    assert type(verifier) is native
+    assert not any(k.startswith("_unsloth_lane") for _, m in model.named_modules() for k in m.__dict__)
+    assert not any(type(m).__name__.startswith("_Lane") for _, m in model.named_modules())
+
+
+@pytest.mark.parametrize("low", [0, 4])
+def test_row_invariant_lane_projections_verify_rows_equal_one_token_decoding(qwen_4bit, monkeypatch, low):
+    from unsloth_zoo.mlx import inference, matmul
+    from unsloth_zoo.mlx.generate import generation_mode
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    (model, ids, cache), heads, kernel = qwen_4bit, [], matmul.lane_qmm
+    lm = model.language_model
+    monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: (args[1].shape[0] == lm.args.vocab_size and heads.append(len(args[0]))) or kernel(*args, **kwargs))
+    rows, qmv_rows = [], matmul.qmv_rows
+    monkeypatch.setattr(matmul, "qmv_rows", lambda x, *args, **kwargs: rows.append(len(x)) or qmv_rows(x, *args, **kwargs))
+    monkeypatch.setattr(inference, "_LANE_LOW_ROWS", low)
+    monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", "1")
+    with generation_mode(model, call = ("batch", "speculative")):
+        for width in (1, 3, 4, 5, 12):   # the tied head read once per block, not once per row
+            block, run, step, heads[:], rows[:] = mx.array([ids[0][24:24 + width]]), _clone(cache), _clone(cache), [], []
+            out = lm(block, cache = run, speculative_verify = True, capture_layer_ids = [])
+            out.gdn_states.abort()
+            assert heads == ([width] if width > low else []) and bool(rows) == (1 < width <= low), width
+            if not low or width <= low:
+                decoded = mx.concatenate([lm(block[:, i:i + 1], cache = step).logits for i in range(width)], axis = 1)
+                assert mx.array_equal(out.logits.view(mx.uint16), decoded.view(mx.uint16)).item(), width
+
+
+@pytest.mark.parametrize("opt_in", ["1", "0"])
+def test_verify_rows_equal_one_token_decoding_where_decode_attention_changes_kernel(qwen_4bit, opt_in, monkeypatch):
+    from mlx_vlm.models.cache import ArraysCache, BatchKVCache, KVCache, RotatingKVCache, make_prompt_cache
+    from unsloth_zoo.mlx import attention, inference, matmul
+    from unsloth_zoo.mlx.generate import generation_mode
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    (model, _, _), tokens = qwen_4bit, (qwen_4bit[1][0] * 80)[:4100]
+    lm = model.language_model
+    batched = lambda: [ArraysCache(size = 2) if layer.is_linear else BatchKVCache([0]) for layer in lm.model.layers]
+    monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", opt_in)
+    monkeypatch.setattr(inference, "_LANE_LOW_ROWS", 0)
+    invariant, kernel, widths = opt_in == "1" and attention.invariant_attention_available(), attention.invariant_attention, []
+    monkeypatch.setattr(attention, "invariant_attention", lambda q, *a: widths.append(q.shape[2]) or kernel(q, *a))
+    with generation_mode(model, call = ("batch", "speculative")):
+        # Rows on either side of MLX's decode attention kernel changes; a batch cache's blocks carry a mask array.
+        for prefix, make in [(1018, make_prompt_cache)] + [(prefix, make) for prefix in (1022, 4090)
+                                                           for make in (make_prompt_cache, lambda lm: batched())]:
+            cache = make(lm)
+            mx.eval(lm(mx.array([tokens[:prefix]]), cache = cache).logits)
+            for width in (2, 5, 8):
+                block, run, step = mx.array([tokens[prefix:prefix + width]]), _clone(cache), _clone(cache)
+                out = lm(block, cache = run, speculative_verify = True, capture_layer_ids = [])
+                out.gdn_states.abort()
+                decoded = mx.concatenate([lm(block[:, i:i + 1], cache = step).logits for i in range(width)], axis = 1)
+                assert mx.array_equal(out.logits.view(mx.uint16), decoded.view(mx.uint16)).item(), (prefix, width)
+        layers = sum(not layer.is_linear for layer in lm.model.layers)
+        assert sorted(widths) == (sorted(([1] * 75 + [2, 5, 8] * 5) * layers) if invariant else []), widths[:9]
+        if invariant:   # a ragged batch's one-token step: each row attends its own keys, as it decodes alone
+            caches, lengths = [make_prompt_cache(lm) for _ in range(2)], (1018, 1030)
+            for cache, n in zip(caches, lengths):
+                mx.eval(lm(mx.array([tokens[:n]]), cache = cache).logits)
+            alone = mx.concatenate([lm(mx.array([[tokens[n]]]), cache = _clone(c)).logits for c, n in zip(caches, lengths)])
+            both = lm(mx.array([[tokens[n]] for n in lengths]), cache = [type(a).merge([a, b]) for a, b in zip(*caches)]).logits
+            assert mx.array_equal(both.view(mx.uint16), alone.view(mx.uint16)).item()
+        # A pair with a sliding window's 2-D mask keeps mlx-vlm's two-row call, which applies it.
+        exact, routed = inference._exact_attention, []
+        monkeypatch.setattr(inference, "_exact_attention", lambda q, *a, **kw: routed.append(q.shape[2]) or exact(q, *a, **kw))
+        for window in (None, 64):
+            routed[:] = []
+            cache = [ArraysCache(size = 2) if layer.is_linear else RotatingKVCache(window) if window else KVCache()
+                     for layer in lm.model.layers]
+            mx.eval(lm(mx.array([tokens[:80]]), cache = cache).logits)
+            lm(mx.array([tokens[80:82]]), cache = cache, speculative_verify = True, capture_layer_ids = []).gdn_states.abort()
+            assert routed == ([] if window or invariant else [2] * layers), window
+    assert not any(type(m).__name__.startswith("_Invariant") or "_unsloth_invariant_attention" in m.__dict__
+                   for _, m in model.named_modules())
+
+
+@pytest.mark.parametrize("heads, dim", [((24, 4), 256), ((16, 2), 256), ((16, 4), 256), ((16, 2), 128), ((8, 4), 128)])
+def test_a_verify_block_row_has_its_one_row_sdpa_bits_where_the_vector_kernel_changes(heads, dim, monkeypatch):
+    from unsloth_zoo.mlx import inference
+    scale, fused = dim ** -0.5, mx.fast.scaled_dot_product_attention
+    k, v = (mx.random.normal((1, heads[1], 16400, dim), key = mx.random.key(i)).astype(mx.bfloat16) for i in range(2))
+    monkeypatch.setattr(inference._VERIFY_STATE, "serving", True, raising = False)
+    monkeypatch.setattr(inference, "_gpu_class", lambda: "unmodelled")
+    [monkeypatch.setattr(inference, f, __import__("functools").lru_cache(getattr(inference, f).__wrapped__)) for f in ("_causal_chunks", "_causal_rows_blocks")]
+    monkeypatch.setattr(inference, "_VERIFY_VERDICTS", {})
+    one_row = lambda q, last: mx.concatenate([fused(q[:, :, i:i + 1], k[:, :, : last - q.shape[2] + i + 1], v[:, :, : last - q.shape[2] + i + 1], scale = scale) for i in range(q.shape[2])], axis = 2)
+    # Blocks ending around 1024, 4096, 8192 and 16384 keys, where some GPU's vector SDPA launch changes.
+    lasts = (1021, 1023, 1024, 1025, 1030, 2000, 4094, 4097, 5000, 8190, 8193, 8200, 16383, 16386)
+    for last in lasts[::-1] + lasts:   # admissions met in either order
+        for width in (2, 3, 5, 8):
+            q = mx.random.normal((1, heads[0], width, dim), key = mx.random.key(last + width)).astype(mx.bfloat16)
+            out = inference._native_causal_attention(q, k[:, :, :last], v[:, :, :last], scale, None, None, lambda: one_row(q, last))
+            assert mx.array_equal(out.view(mx.uint16), one_row(q, last).view(mx.uint16)).item(), (last, width)
+    # An unmodelled change at a chunk boundary in one block and inside a chunk in the next.
+    monkeypatch.setattr(inference, "_VERIFY_VERDICTS", {})
+    monkeypatch.setattr(inference, "_exact_attention_kernels", lambda: None)
+    for last in (8195, 8196, 8197):
+        q = mx.random.normal((1, heads[0], 8, dim), key = mx.random.key(last)).astype(mx.bfloat16)
+        out = inference._native_causal_attention(q, k[:, :, :last], v[:, :, :last], scale, None, None, lambda: one_row(q, last))
+        assert mx.array_equal(out.view(mx.uint16), one_row(q, last).view(mx.uint16)).item(), last
+
+
+# Preorder, row 0 the anchor: a depth-5 main path with branches at depths 1 to 3.
+TREE_PARENTS = [-1, 0, 1, 2, 3, 4, 2, 1, 0, 8]
+# The order a best-first tree takes its nodes in: every prefix is a tree, and a child may come long after its parent.
+TAKEN_PARENTS = [-1, 0, 1, 0, 2, 3, 1, 4, 6, 5]
+
+
+def _tree_block(parents):
+    """`parents` as a `TreeBlock`, and each row's path from the anchor."""
+    from unsloth_zoo.mlx.inference import TreeBlock
+    paths, fork, back, slots = [], [-1] * len(parents), [-1] * len(parents), {}
+    for row, parent in enumerate(parents):
+        paths.append((paths[parent] if parent >= 0 else []) + [row])
+        if row in parents[row + 2:]:
+            fork[row] = slots[row] = len(slots)
+        if parent >= 0 and parent != row - 1:
+            back[row] = slots[parent]
+    width = max(map(len, paths))
+    return TreeBlock(mx.array([len(path) - 1 for path in paths], mx.int32),
+                     mx.array([path + [0] * (width - len(path)) for path in paths], mx.int32),
+                     mx.array(fork, mx.int32), mx.array(back, mx.int32)), paths
+
+
+def _tree_mode(model, monkeypatch):
+    from unsloth_zoo.mlx import attention, inference, matmul
+    from unsloth_zoo.mlx.generate import generation_mode
+    if not (matmul.lane_qmm_available() and attention.invariant_attention_available()):
+        pytest.skip("tree verify needs the row-invariant kernels")
+    monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", "1")
+    monkeypatch.setattr(inference, "_LANE_LOW_ROWS", 0)
+    return generation_mode(model, call = ("batch", "speculative"))
+
+
+def _tree_verified(lm, cache, tokens, block, size = None, **kwargs):
+    from unsloth_zoo.mlx import inference
+    with inference.tree_verify(block, size):
+        out = lm(mx.array([tokens]), cache = cache, speculative_verify = True, capture_layer_ids = [0], **kwargs)
+        assert out.hidden_states[0].shape[1] == out.logits.shape[1]
+    mx.eval(out.logits)
+    return out.logits[0], out.gdn_states
+
+
+def _stepped(lm, cache, tokens, **kwargs):
+    return [lm(mx.array([[token]]), cache = cache, **kwargs).logits[0, -1] for token in tokens]
+
+
+def _bits(x, y):
+    return x.shape == y.shape and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
+
+
+def _chain_verified(lm, cache, tokens):
+    out = lm(mx.array([tokens]), cache = _clone(cache), speculative_verify = True, capture_layer_ids = [])
+    mx.eval(out.logits)
+    out.gdn_states.abort()
+    return out.logits[0]
+
+
+def _warm_tree_widths(lm, cache, tokens):
+    # A width's fused block runs once its first chain block matched the stock ops.
+    for width in {3, 4, 6, 8, 10, 16} | {len(tokens)}:
+        _chain_verified(lm, cache, (tokens * 4)[:width])
+
+
+@pytest.mark.parametrize("prefix, delta", [(24, 0), (24, 5), (500, 0), (1020, 0)])
+def test_tree_verify_rows_equal_their_paths_one_token_decoding(qwen_4bit, monkeypatch, prefix, delta):
+    from mlx_vlm.models.cache import make_prompt_cache
+    model, ids, cache = qwen_4bit
+    lm, tokens = model.language_model, ids[1][:len(TREE_PARENTS)]
+    rope = dict(rope_deltas = mx.array([[delta]]))
+    with _tree_mode(model, monkeypatch):
+        if prefix != 24:   # rows on both sides of a key split
+            cache = make_prompt_cache(lm)
+            mx.eval(lm(mx.array([(ids[0] * 64)[:prefix]]), cache = cache).logits)
+            mx.eval([entry.state for entry in cache])
+        _warm_tree_widths(lm, cache, tokens)
+        block, paths = _tree_block(TREE_PARENTS)
+        logits, transaction = _tree_verified(lm, _clone(cache), tokens, block, **rope)
+        transaction.abort()
+        for row, path in enumerate(paths):
+            assert _bits(logits[row], _stepped(lm, _clone(cache), [tokens[i] for i in path], **rope)[-1]), row
+        # A sized tree: the first layer has verified every row when the size is asked, the rest verify the first rows.
+        block, paths = _tree_block(TAKEN_PARENTS)
+        run, built = _clone(cache), []
+        size = lambda: built.append([bool(entry._speculation["records"]) for entry in run[:2]]) or 6
+        logits, transaction = _tree_verified(lm, run, tokens, block, size, **rope)
+        transaction.abort()
+        assert built == [[True, False]] and logits.shape[0] == 6
+        for row, path in enumerate(paths[:6]):
+            assert _bits(logits[row], _stepped(lm, _clone(cache), [tokens[i] for i in path], **rope)[-1]), row
+
+
+# The last three size a tree in taking order to `sized` rows: a path past the row before it, a prefix, every row.
+@pytest.mark.parametrize("path, sized", [([0, 1, 2, 3, 4, 5], 0), ([0, 1, 7], 0), ([0, 8, 9], 0), ([0, 1, 2, 6], 0), ([0], 0),
+                                        ([0, 3, 5], 6), ([0, 1], 6), ([0, 1, 2], 3)])
+def test_a_committed_tree_path_continues_as_its_decode_folded_or_replayed(qwen_4bit, monkeypatch, path, sized):
+    from unsloth_zoo.mlx import inference
+    model, ids, cache = qwen_4bit
+    lm, first, second = model.language_model, ids[1][:len(TREE_PARENTS)], ids[1][len(TREE_PARENTS):2 * len(TREE_PARENTS)]
+    with _tree_mode(model, monkeypatch):
+        _warm_tree_widths(lm, cache, first)
+        block, paths = _tree_block(TAKEN_PARENTS if sized else TREE_PARENTS)
+        size, last = (lambda: sized) if sized else None, paths[sized - 1 if sized else 6]
+        decoded = _clone(cache)
+        _stepped(lm, decoded, [first[i] for i in path])
+        folded, kept = _clone(cache), _clone(cache)
+        for run in (folded, kept):
+            _, transaction = _tree_verified(lm, run, first, block, size)
+            inference.tree_commit(transaction, run, path)
+        # The next tree folds the retained path in reading its rows in place: each row is that path's continuation.
+        logits, transaction = _tree_verified(lm, folded, second, block, size)
+        for row, rows in enumerate(paths[:logits.shape[0]]):
+            assert _bits(logits[row], _stepped(lm, _clone(decoded), [second[i] for i in rows])[-1]), row
+        inference.tree_commit(transaction, folded, last)
+        continued = [second[i] for i in last] + second[:1]
+        assert _bits(_stepped(lm, folded, second[:1])[0], _stepped(lm, _clone(decoded), continued)[-1])
+        # A chain block, and a one-token step, read the same state.
+        logits = _chain_verified(lm, kept, second[:4])
+        for row, token in enumerate(_stepped(lm, _clone(decoded), second[:4])):
+            assert _bits(logits[row], token), row
+        assert _bits(_stepped(lm, kept, second[:1])[0], _stepped(lm, decoded, second[:1])[0])
+    # The rows above came from reading the retained rows in place, not the replay falling back.
+    verdicts = [verdict for key, verdict in inference._VERIFY_GDN_FOLDS.items() if key[-1] is True]
+    assert verdicts and all(verdicts)
+
+
+def test_a_tree_path_off_the_block_prefix_commits_without_copying_a_key_buffer(qwen_4bit, monkeypatch):
+    import numpy as np
+    from unsloth_zoo.mlx import inference
+    model, ids, cache = qwen_4bit
+    lm, tokens = model.language_model, ids[1][:len(TREE_PARENTS)]
+    address = lambda array: np.array(array.view(mx.uint8), copy = False).__array_interface__["data"][0]
+    with _tree_mode(model, monkeypatch):
+        _warm_tree_widths(lm, cache, tokens)
+        run = _clone(cache)
+        _, transaction = _tree_verified(lm, run, tokens, _tree_block(TREE_PARENTS)[0])
+        attended = [entry for entry in run if getattr(entry, "keys", None) is not None]
+        mx.synchronize()
+        buffers = [address(array) for entry in attended for array in (entry.keys, entry.values)]
+        inference.tree_commit(transaction, run, [0, 8, 9])
+        assert buffers and buffers == [address(array) for entry in attended for array in (entry.keys, entry.values)]
+
+
+def _flat_selector(vocabulary):
+    weight = type("Codebook", (), {"weight": mx.zeros((vocabulary, 32), mx.bfloat16)})
+    return SimpleNamespace(hidden_projection = lambda x: x, predecessor_codebook = weight, successor_codebook = weight)
+
+
+def test_the_tree_builder_grows_best_first_and_lays_rows_out_in_preorder():
+    import math
+    from unsloth_zoo.mlx import inference
+    if mx.default_device() != mx.gpu:
+        pytest.skip("metal")
+    L, K = 15, 16
+    unary = (mx.random.normal((1, L, K), key = mx.random.key(3)) * 2.5).astype(mx.bfloat16)
+    ids = (mx.arange(L * K).reshape(1, L, K) % 64).astype(mx.uint32)
+    tree = inference.draft_tree(_flat_selector(64), mx.zeros((1, L, 32), mx.bfloat16), mx.array([7], mx.int32), ids, unary, 16)
+    tokens, depth, parent = tree.tokens.tolist(), tree.block.depth.tolist(), tree.parent.tolist()
+    path, fork, back = tree.block.path.tolist(), tree.block.fork.tolist(), tree.block.back.tolist()
+    assert tokens[0] == 7 and parent[0] == -1 and depth[0] == 0
+    lq = (unary[0].astype(mx.float32) - mx.logsumexp(unary[0].astype(mx.float32), axis = -1, keepdims = True)).tolist()
+    score = [0.0] * 16
+    for row in range(1, 16):
+        up = parent[row]
+        assert 0 <= up < row and depth[row] == depth[up] + 1
+        # Preorder: a row follows its parent's subtree so far, its path is its parent's and itself.
+        assert path[row][:depth[row]] == path[up][:depth[up] + 1] and path[row][depth[row]] == row
+        j = ids[0, depth[row] - 1].tolist().index(tokens[row])
+        score[row] = score[up] + lq[depth[row] - 1][j]
+        assert (back[row] >= 0) == (up != row - 1)
+        if up != row - 1:
+            assert back[row] == fork[up]
+    # The taken set is the top 15 of all nodes reachable: no untaken child outranks a taken node.
+    worst = min(score[1:])
+    for row in range(16):
+        d = depth[row]
+        if d < L:
+            siblings = [r for r in range(16) if parent[r] == row]
+            taken = {tokens[r] for r in siblings}
+            assert len(taken) == len(siblings) and all(score[x] >= score[y] for x, y in zip(siblings, siblings[1:]))
+            for j, token in enumerate(ids[0, d].tolist()):
+                if token not in taken:
+                    assert score[row] + lq[d][j] <= worst + 1e-4
+    assert sorted(tree.rank.tolist()) == list(range(16))
+    assert mx.allclose(tree.score, mx.array(score), atol = 1e-3).item()
+    assert mx.allclose(tree.logq, mx.array([0.0] + [score[row] - score[parent[row]] for row in range(1, 16)]), atol = 1e-3).item()
+    # In taking order the same nodes go out as taken, so a narrower tree of the lattice is the first rows; a row keeps its
+    # state exactly where a row other than the next continues from it.
+    rank = tree.rank.tolist()
+    order = sorted(range(16), key = rank.__getitem__)
+    taken = inference.draft_tree(_flat_selector(64), mx.zeros((1, L, 32), mx.bfloat16), mx.array([7], mx.int32), ids, unary, 8,
+                                 True)
+    parents, block = taken.parent.tolist(), taken.block
+    assert taken.rank.tolist() == list(range(8)) and taken.tokens.tolist() == [tokens[row] for row in order[:8]]
+    assert parents[1:] == [rank[parent[row]] for row in order[1:8]] and block.depth.tolist() == [depth[row] for row in order[:8]]
+    assert mx.array_equal(taken.first(5).tokens, taken.tokens[:5]).item() and taken.first(5).block.path.shape[0] == 5
+    slots, path, fork, back = [slot for slot in block.fork.tolist() if slot >= 0], *(x.tolist() for x in block[1:])
+    assert sorted(slots) == list(range(len(slots))) and all((fork[row] >= 0) == (row in parents[row + 2:]) for row in range(8))
+    for row in range(1, 8):
+        up, d = parents[row], block.depth[row].item()
+        assert path[row][:d + 1] == path[up][:d] + [row] and back[row] == (fork[up] if up != row - 1 else -1)
+    # Calibrated, a node gains log sigmoid(alpha + beta * logit q) by its depth, the last fit's past them, as grown here.
+    alpha, beta, nodes, frontier = [-0.5, 0.2, 1.5], [0.5, 0.9, 1.2], [(7, -1, 0, 0.0, 0.0)], []
+    gain = lambda d, logq: -math.log1p(math.exp(-(alpha[min(d, 2)] + beta[min(d, 2)] * math.log(math.exp(logq) / -math.expm1(logq)))))
+    while len(nodes) < 10:
+        d, total = nodes[-1][2], nodes[-1][3]
+        frontier += [(total + gain(d, lq[d][j]), ids[0, d, j].item(), len(nodes) - 1, d + 1, lq[d][j]) for j in range(K)]
+        frontier.remove(best := max(frontier))
+        nodes.append((best[1], best[2], best[3], best[0], best[4]))
+    fitted = inference.draft_tree(_flat_selector(64), mx.zeros((1, L, 32), mx.bfloat16), mx.array([7], mx.int32), ids, unary, 10,
+                                  True, mx.array([alpha, beta], mx.float32))
+    grown = [fitted.tokens, fitted.parent, fitted.block.depth, fitted.score, fitted.logq]
+    assert all(mx.allclose(got, mx.array(want), atol = 1e-3).item() for got, want in zip(grown, zip(*nodes)))
+    assert fitted.tokens.tolist()[:8] != taken.tokens.tolist() and max(fitted.block.depth.tolist()) > 3
+    # The walk stays on its branch: a later row with the next token elsewhere is not it.
+    other = inference.DraftTree(mx.array([9, 5, 6, 7, 7]), mx.array([-1, 0, 0, 2, 1]), None, None)
+    path, walked = inference.draft_tree_accept(other, mx.array([6, 0, 7, 7, 0]))
+    assert path.tolist()[:3] == [0, 2, 3] and walked.tolist() == [2, 3]
+
+
+def _crafted_tree(drafter, anchor, tokens, rows, context, cache):
+    """A best-first tree with the row-after-parent child wrong at the first depth, then right, on `tokens`."""
+    from unsloth_zoo.mlx import inference
+    selector, K, length = _flat_selector(1 << 18), drafter.model.candidate_selector.top_k, 7
+    right = mx.array((tokens + [0] * length)[:length], mx.uint32)[:, None]
+    ids = mx.concatenate([right + 1, right, right + 2 + mx.arange(K - 2, dtype = mx.uint32)[None]], axis = 1)[None]
+    unary = mx.array([[[2.0, 1.9] + [-30.0] * (K - 2)] + [[9.5, 10.0] + [-30.0] * (K - 2)] * (length - 1)], mx.bfloat16)
+    drafter._drafted(anchor, context, cache, length + 1)
+    pending = (anchor if isinstance(anchor, mx.array) else mx.array([anchor])).reshape(-1).astype(mx.int32)
+    return inference.draft_tree(selector, mx.zeros((1, length, 32), mx.bfloat16), pending, ids, unary, rows, drafter.sized_trees)
+
+
+def _tree_drafter(model):
+    from unsloth_zoo.mlx import speculative as S
+    drafter = S._built(S.ContextDrafter, _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2"), model.language_model)
+    # A block after one drafted ahead has an empty context, which MLX's norm on this unfused tiny stack cannot evaluate.
+    norm, drafter.predraft_rows = drafter.model.hidden_norm, 0   # the crafted lattice needs the reply's position
+    drafter.model.hidden_norm = lambda x: norm(x) if x.size else x
+    return drafter
+
+
+def _tree_engine(model, monkeypatch, rows = 6):
+    """A scored engine whose trees hold the target's continuation on a later branch, and the paths it commits."""
+    from unsloth_zoo.mlx import inference, speculative as S
+    drafter = _tree_drafter(model)
+    engine = S.SpeculativeEngine(model, _script(("draft", 4), ("plain", 3), ("draft", 4), ("copy", 4)), drafter, logprobs = True)
+    engine.controller.max_depth = drafter.trained_depth   # a controller capped below it keeps its chain
+    reference, commits, commit = [], [], inference.tree_commit
+    drafter._tree = lambda anchor, context, cache, width, scan = None: _crafted_tree(
+        drafter, anchor, reference[engine._rows[0].emitted:], width, context, cache)
+    monkeypatch.setattr(inference, "tree_commit", lambda transaction, cache, path: commits.append(path) or commit(transaction, cache, path))
+    drafter.tree_budget = SimpleNamespace(choose = lambda: rows, observe = lambda *args: None)
+    return engine, reference, commits
+
+
+def _scored_reply(model, ids, engine, n, join = (0, 0), sampling = None):
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.speculative import EngineRow
+    tokens, scores, steps, sampling = {}, {}, 0, sampling or SamplingParams()
+
+    def add(uid, max_tokens):
+        cache, first, hidden = _prefill(model.language_model, ids[uid], sampling, (), engine.drafter)
+        engine.add(EngineRow(cache = cache, pending = first, prompt = ids[uid], max_tokens = max_tokens, hidden = hidden, uid = uid, sampling = sampling))
+        tokens[uid], scores[uid] = [first], []
+    add(0, n)
+    while 0 in engine.rows:
+        steps += 1
+        if steps == join[0]:
+            add(1, 4 * n)
+        if steps == join[1] and 1 in engine.rows:
+            engine.remove(1)
+        for step in engine.step():
+            tokens[step.uid] += step.tokens
+            scores[step.uid] += step.logprobs or []
+    return tokens[0], scores[0]
+
+
+def test_a_lone_greedy_row_verifies_draft_trees_and_keeps_its_tokens_and_scores(qwen_4bit, monkeypatch):
+    from unsloth_zoo.mlx.generate import SamplingParams
+    model, ids, _ = qwen_4bit
+    with _tree_mode(model, monkeypatch):
+        _warm_tree_widths(model.language_model, _prefill(model.language_model, ids[0], SamplingParams())[0], ids[1][:6])
+        expected = _solo(model, ids[0], 72, SamplingParams())
+        chain, _, _ = _tree_engine(model, monkeypatch)
+        chain.drafter.tree_budget = None
+        engine, reference, commits = _tree_engine(model, monkeypatch)
+        reference += expected
+        drafts, draft = [], engine.drafter.draft
+        engine.drafter.draft = lambda cache, rows, *args: drafts.append([row.tree_rows for row in rows if row]) or draft(cache, rows, *args)
+        replies = [_scored_reply(model, ids, run, 72, join = (6, 12)) for run in (chain, engine)]
+    # With a second row in, a row stops drafting trees ahead.
+    assert any(len(rows) == 2 for rows in drafts) and not any(sum(rows) for rows in drafts if len(rows) == 2)
+    # The tree rounds' tokens and scores are the chain rounds' (and decoding's), across plain windows, copies and a second
+    # row joining and leaving; their accepted paths run down later branches.
+    assert replies[0][0] == expected == replies[1][0] and mx.allclose(mx.array(replies[0][1]), mx.array(replies[1][1])).item()
+    assert len(commits) >= 4 and any(len(path) >= 3 and path != list(range(len(path))) for path in commits)
+    # A sampled row keeps its chain rounds.
+    with _tree_mode(model, monkeypatch):
+        sampled, reference, commits = _tree_engine(model, monkeypatch)
+        reference += expected
+        _scored_reply(model, ids, sampled, 16, sampling = SamplingParams(temperature = 0.5, seed = 3))
+    assert not commits
+
+
+def test_tree_and_chain_rounds_commit_on_the_engines_stream(qwen_4bit, monkeypatch):
+    from unsloth_zoo.mlx import inference
+    from unsloth_zoo.mlx.generate import SamplingParams
+    model, ids, _ = qwen_4bit
+    with _tree_mode(model, monkeypatch):
+        _warm_tree_widths(model.language_model, _prefill(model.language_model, ids[0], SamplingParams())[0], ids[1][:6])
+        expected = _solo(model, ids[0], 40, SamplingParams())
+        engine, reference, commits = _tree_engine(model, monkeypatch)
+        reference += expected
+        rounds, streams, run, verify, tree_commit = [], [], engine._round, engine._verify, inference.tree_commit
+        with mx.stream(engine._stream):
+            ours = mx.default_stream(mx.default_device())   # the thread's stream behind the engine's thread-local one
+        on_stream = lambda: streams.append((rounds[-1], mx.default_stream(mx.default_device()) == ours))
+        monkeypatch.setattr(inference, "tree_commit", lambda *args: on_stream() or tree_commit(*args))
+
+        def verified(*args):
+            logits, hidden, transaction = verify(*args)
+            commit = transaction.commit
+            transaction.commit = lambda *lengths: on_stream() or commit(*lengths)
+            return logits, hidden, transaction
+        engine._verify = verified
+        engine._round = lambda plan, states: rounds.append(bool(plan.tree)) or run(plan, states)
+        reply, _ = _scored_reply(model, ids, engine, 40)
+    # Tree rounds with a forked path, and chain rounds, committed; every commit was built on the stream the next verify runs on.
+    assert reply == expected and any(path != list(range(len(path))) for path in commits)
+    assert {tree for tree, _ in streams} == {True, False} and all(same for _, same in streams)
+
+
+def test_a_quantized_row_keeps_its_chain_rounds(qwen_4bit, monkeypatch):
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.speculative import EngineRow, RoundPlan, RowPlan
+    model, ids, _ = qwen_4bit
+    plan, widths = RoundPlan("round", 4, rows = (RowPlan("draft", 4),)), []
+    monkeypatch.setitem(model.language_model.__dict__, "_unsloth_tree_verify", 1)
+    for _ in range(2):
+        engine, _, _ = _tree_engine(model, monkeypatch)
+        engine.controller.max_depth = engine.drafter.trained_depth
+        cache, first, hidden = _prefill(model.language_model, ids[0], SamplingParams(), (), engine.drafter)
+        engine.add(EngineRow(cache = cache, pending = first, prompt = ids[0], max_tokens = 8, hidden = hidden, uid = 0, sampling = SamplingParams()))
+        widths.append(engine._tree_plan(plan, engine._states()).tree)
+        _quantized_prefill(monkeypatch)
+    assert widths[0] and not widths[1]
+
+
+def test_a_tree_round_verifies_the_width_its_budget_sizes_from_its_lattice_and_keeps_the_tokens(qwen_4bit, monkeypatch):
+    import math
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.speculative import SizedTreeBudget
+    model, ids, _ = qwen_4bit
+    with _tree_mode(model, monkeypatch):
+        _warm_tree_widths(model.language_model, _prefill(model.language_model, ids[0], SamplingParams())[0], ids[1][:6])
+        expected = _solo(model, ids[0], 72, SamplingParams())
+        engine, reference, commits = _tree_engine(model, monkeypatch)
+        reference += expected
+        budget = SizedTreeBudget({3: 1.0, 4: 1.0, 5: 1.0, 6: 1.0})
+        seen, chosen, widths, size, verify, rows = [], [], iter((3, 6, 4, 5) * 40), budget.size, engine._verify, []
+
+        def sized(nodes):
+            size(nodes)
+            seen.append(nodes)
+            chosen.append(next(widths))
+            return chosen[-1]
+        budget.size = sized
+        observed, observe = [], budget.observe
+        budget.observe = lambda width, ranks, end: observed.append((width, ranks)) or observe(width, ranks, end)
+        replies, reply_round = [], budget.reply_round
+        budget.reply_round = lambda reply: replies.append(reply) or reply_round(reply)
+        engine._verify = lambda inputs: [out := verify(inputs), rows.append((inputs.shape[1], out[0].shape[1]))][0]
+        drafted, record = [], engine.controller.record_round
+        engine.controller.record_round = lambda plan, *args, **kwargs: drafted.append(plan.rows[0].length) or record(plan, *args, **kwargs)
+        budget.yields_to_controller = lambda *args: False   # the script's stats stop short of the raised depth
+        engine.drafter.tree_budget, engine.drafter.sized_trees, fits = budget, True, []
+        engine.drafter.tree_calibration = SimpleNamespace(observe = lambda *args: fits.append(args))
+        reply, _ = _scored_reply(model, ids, engine, 72)
+    assert reply == expected and len(commits) >= 4 and {3, 4, 5, 6} <= set(chosen)
+    assert len(replies) == len(observed) and all(reply is replies[0] for reply in replies)
+    # Each lattice offers the drafted width's nodes, best first, as probabilities, and each verify carries the width chosen from it.
+    assert all(len(nodes) == 5 and all(a[0] >= b[0] for a, b in zip(nodes, nodes[1:])) for nodes in seen)
+    assert all(0 < probability <= 1 for nodes in seen for probability, _ in nodes)
+    verifies = iter(rows)
+    drafted = iter(drafted)
+    assert all((6, width) in verifies for width in chosen) and all(width - 1 in drafted for width in chosen[:len(observed)])
+    # The budget hears each width and the nodes its round walked.
+    assert [width for width, _ in observed] == chosen[:len(observed)] and [len(ranks) for _, ranks in observed] == [len(path) - 1 for path in commits]
+    # The calibration hears each round's verified rows, as depths, parents and the selector's log q, and the rows walked.
+    assert [len(depths) for depths, *_ in fits] == chosen[:len(fits)] and [path for *_, path in fits] == commits
+    assert all(depths[row] == depths[parents[row]] + 1 for depths, parents, _, _ in fits for row in range(1, len(depths)))
+    assert all(math.isclose(([1.0] + [p for p, _ in nodes])[parents[row]] * math.exp(logq[row]), nodes[row - 1][0], rel_tol = 1e-3)
+               for nodes, (_, parents, logq, _) in zip(seen, fits) for row in range(1, len(logq)))
+    # A path holds one node of each depth, which ranks into the lattice's order show and rows of the tree would not.
+    assert all(sorted(nodes[rank - 1][1] for rank in ranks) == list(range(1, len(ranks) + 1)) for nodes, (_, ranks) in zip(seen, observed))
+
+
+def test_load_times_the_tree_widths_of_a_target_whose_rows_match_their_paths(qwen_4bit, monkeypatch):
+    from unsloth_zoo.mlx import inference, speculative as S
+    model, _, _ = qwen_4bit
+    monkeypatch.setitem(vars(model.language_model), "_unsloth_warm_drafter", None)
+    _tree_mode(model, monkeypatch)
+    drafter = _tree_drafter(model)
+    drafter.tree_widths, drafts, draft = (8,), [], drafter.draft
+    drafter.draft = lambda *args: drafts.append(draft(*args)) or drafts[-1]
+    drafter._tree = lambda anchor, context, cache, width, scan = None: _crafted_tree(drafter, anchor, list(range(1, 8)), width, context, cache)
+    with monkeypatch.context() as patch:
+        real = inference._tree_attention
+        patch.setattr(inference, "_tree_attention", lambda *args: real(*args) * 1.0078125)
+        S.warm_speculative_rounds(model)
+    assert drafter.tree_budget is None
+    S.warm_speculative_rounds(model)
+    budget = drafter.tree_budget
+    # A chain round after a block drafted ahead as a tree, as these are, still proposes.
+    assert budget and drafts and all(mx.any(block != 0).item() for block in drafts)
+    assert list(budget.tree_costs) == list(budget.chain_costs) == [8] and min(budget.tree_costs[8], budget.chain_costs[8]) > 0
+    # The rounds timed here leave the calibration replies start from no records.
+    fit = drafter.tree_calibration
+    assert fit.parameters.shape == (2, 7) and fit._rounds == 0 and not any(fit._seen)
+    # A target whose rows bring their own experts sizes each round's tree from the widths timed here.
+    drafter.tree_budget, drafter.sized_trees, drafter.tree_widths = None, True, (4, 8)
+    timed, observe = [], S.SizedTreeBudget.observe
+    monkeypatch.setattr(S.SizedTreeBudget, "observe", lambda self, rows, *args: timed.append((self.pinned, rows)) or observe(self, rows, *args))
+    S.warm_speculative_rounds(model)
+    sized = drafter.tree_budget
+    assert isinstance(sized, S.SizedTreeBudget) and list(sized.load_costs) == [4, 8] and min(sized.load_costs.values()) > 0
+    # Each width was timed as a reply's round verifies it: sized down from the widest tree.
+    assert set(timed) == {(4, 4), (8, 8)} and [rows for _, rows in timed[:5]] == [4] * 5
+    # Warming again times the widths it asks for: the budget it replaces resizes none of them.
+    sized.size = lambda nodes: pytest.fail("an earlier budget resized a timed width")
+    S.warm_speculative_rounds(model)
+    assert drafter.tree_budget is not sized and list(drafter.tree_budget.load_costs) == [4, 8]
+    # A width that cannot be verified leaves no budget, not the one that pinned the widths being timed.
+    def refused(self, nodes):
+        raise RuntimeError("refused")
+    monkeypatch.setattr(S.SizedTreeBudget, "size", refused)
+    S.warm_speculative_rounds(model)
+    assert drafter.tree_budget is None
+
+
 def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(qwen_4bit, monkeypatch):
     import copy
     import mlx.nn as nn
@@ -424,6 +1323,7 @@ def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(q
     from mlx_vlm.speculative.ops import linear as linear_ops
     from unsloth_zoo.mlx import inference
     (model, ids, cache), verdicts = qwen_4bit, inference._VERIFY_VERDICTS
+    monkeypatch.setenv("UNSLOTH_MLX_VERIFY_QMV_ROWS", "0")
     lm, verifier, native = model.language_model, language._EXACT_SPECULATIVE_VERIFIER, speculative_verifier.Qwen3_5BatchInvariantForward
     unscoped, block = copy.copy(lm), mx.array([ids[0][24:36]])
     quantized = [module for _, module in lm.named_modules() if isinstance(module, nn.QuantizedLinear)]
@@ -442,7 +1342,7 @@ def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(q
             return norm(x)
         with monkeypatch.context() as patch:
             # An unscoped model's verify call made inside a served one stays native, and the served one goes on.
-            patch.setattr(layer, "input_layernorm", nested)
+            patch.setitem(layer, "input_layernorm", nested)   # pytest >= 9.2 setattr undo drops an mlx Module child
             assert _verified(lm, cache, block, 0) and {key[0][1] for key in verdicts} == {12} and not verdicts.clear()
         # Native: an unscoped model, a block inside mlx-vlm's fused bound, training, thawed projections, a drifted binding.
         _verified(unscoped, cache, block, 0)
@@ -452,7 +1352,7 @@ def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(q
         with monkeypatch.context() as patch:
             patch.setattr(linear_ops, "_target_verify_quantized_linear", lambda linear, x: None)
             _verified(lm, cache, block, 0)
-        assert not verdicts and _verified(lm, cache, block, 0) and verdicts
+        assert {key[0] for key in verdicts} == {"causal chunks"} and not verdicts.clear() and _verified(lm, cache, block, 0) and verdicts
     assert type(verifier) is native and not any("_unsloth_verify_scopes" in vars(owner) for owner in (verifier, lm))
     with monkeypatch.context() as patch:
         patch.setattr(model, "_unsloth_mlx_distributed_parallel_mode", True, raising = False)
@@ -492,11 +1392,15 @@ def test_a_taped_verify_block_commits_what_stock_commits_for_every_row(qwen_4bit
     # A row with no recurrent state yet.
     native_fresh = [_verified(lm, fresh, block[:1], keep) for keep in ([0], [1])]
     monkeypatch.setattr(inference, "_TAPE_VERDICTS", {})
+    monkeypatch.setattr(inference, "_VERIFY_GDN_VERDICTS", {})
+    fused, block_fn = [], inference._verify_gdn_block
+    monkeypatch.setattr(inference, "_verify_gdn_block", lambda *args, **variant: fused.append(args) or block_fn(*args, **variant))
     with inference.exact_speculative_verify(model):
         _verified(lm, cache, block, 0)
         _verified(lm, fresh, block[:1], 0)
+        checked = len(fused)
         run, out = _verify_call(lm, cache, block)
-        assert len(out.gdn_states._unsloth_tapes) == sum(layer.is_linear for layer in lm.model.layers)
+        assert len(out.gdn_states._unsloth_tapes) == sum(layer.is_linear for layer in lm.model.layers) == len(fused) - checked
         # A refused commit keeps the tapes, and the retained lengths may come from any iterable.
         with pytest.raises(ValueError):
             out.gdn_states.commit(width + 1)
@@ -515,8 +1419,10 @@ def test_a_taped_verify_block_commits_what_stock_commits_for_every_row(qwen_4bit
         out.gdn_states.commit(mx.array(keeps[0]))
         assert _same(native[0], _state(out, run))
         assert set(inference._TAPE_VERDICTS.values()) == {True}
-        # A replay that does not reproduce stock keeps that key on stock.
+        assert len(inference._VERIFY_GDN_VERDICTS) == 2 and all(inference._VERIFY_GDN_VERDICTS.values())
+        # A replay that does not reproduce stock keeps that key on stock, fused or not.
         inference._TAPE_VERDICTS.clear()
+        replay_matches = inference._replay_matches
         monkeypatch.setattr(inference, "_replay_matches", lambda *args: False)
         work = inference.first_use_work()
         _verified(lm, cache, block, 0)
@@ -525,12 +1431,236 @@ def test_a_taped_verify_block_commits_what_stock_commits_for_every_row(qwen_4bit
         assert inference.first_use_work() > work
         out.gdn_states.commit(keeps[0])
         assert _same(native[0], _state(out, run))
+        # A fused block that differs from the verifier's ops keeps that key on them.
+        inference._TAPE_VERDICTS.clear()
+        inference._VERIFY_GDN_VERDICTS.clear()
+        monkeypatch.setattr(inference, "_replay_matches", replay_matches)
+        monkeypatch.setattr(inference, "_verify_gdn_block", lambda *args, **variant: (lambda y, *rest: (y + 1, *rest))(*block_fn(*args, **variant)))
+        assert all(_same(native[0], _verified(lm, cache, block, keeps[0])) for _ in range(2))
+        assert set(inference._VERIFY_GDN_VERDICTS.values()) == {False}
+
+
+@pytest.mark.parametrize("field", ["", "_training", "_unsloth_verify_scopes", "speculative_verify_logits", "_speculative_verify", "_bindings_intact"])
+def test_qwen4_prefix_keeps_other_states_and_leaves_replay_lazy(qwen4, monkeypatch, field):
+    from unittest.mock import Mock
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx import inference, speculative
+    lm, arrays = qwen4[0].language_model, [mx.ones((2,)) for _ in range(5)]
+    cache = [SimpleNamespace(state = arrays[:2], _unsloth_pending = (arrays[1],)),
+             SimpleNamespace(state = arrays[2:4], _unsloth_pending = (arrays[2],)), SimpleNamespace(state = arrays[4])]
+    if field != "_unsloth_verify_scopes": monkeypatch.setattr(lm, "_unsloth_verify_scopes", 1, raising = False)
+    native = getattr(lm, field, None)
+    value = (lambda *args, **kw: native(*args, **kw)) if callable(native) else (lambda _: False) if field == "_bindings_intact" else field == "_training"
+    if field and field != "_unsloth_verify_scopes":
+        monkeypatch.setattr(inference if field == "_bindings_intact" else lm, field, value)
+    monkeypatch.setattr(mx, "async_eval", submitted := Mock(side_effect = RuntimeError("prefix roots")))
+    with pytest.raises(RuntimeError, match = "prefix roots"):
+        speculative.SpeculativeEngine._verify(SimpleNamespace(_exact = False, _invariant = True, _mrope = False, lm = lm, cache = cache), mx.array([[2, 3, 4]]))
+    seen, expected = [array for _, array in tree_flatten(submitted.call_args.args)], arrays if field else [arrays[0], arrays[3], arrays[4]]
+    assert len(seen) == len(expected) and all(a is b for a, b in zip(seen, expected))
+
+
+@pytest.mark.parametrize("width", [3, 5, 16])
+def test_a_fused_block_after_a_partly_retained_one_folds_its_replay_and_matches_unfolded(qwen_4bit, monkeypatch, width):
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference
+    from unsloth_zoo.mlx.speculative import _join
+    model, ids, _ = qwen_4bit
+    lm, cache = model.language_model, None
+    for row, prompt in enumerate([ids[0][:24], ids[0][:17], ids[0][:31]]):
+        entries = make_prompt_cache(lm)
+        mx.eval(lm(mx.array([prompt]), cache = entries).logits)
+        cache = _join(cache, entries, row)
+    blocks = [mx.array([ids[0][start : start + width] for start in (24 + s, 30 + s, 36 + s)]) for s in (0, 7, 14)]
+    keeps = [[1, width - 1, 1 + width // 2], [0, width, 2], [2, 1, width - 1]]
+    layers = sum(layer.is_linear for layer in lm.model.layers)
+    for name in ("_TAPE_VERDICTS", "_VERIFY_GDN_VERDICTS", "_VERIFY_GDN_FOLDS"):
+        monkeypatch.setattr(inference, name, {})
+    fused, folded, block_fn, fold_fn = [], [], inference._verify_gdn_block, inference._verify_gdn_folded_block
+    monkeypatch.setattr(inference, "_verify_gdn_block", lambda *args, **variant: fused.append(args) or block_fn(*args, **variant))
+    monkeypatch.setattr(inference, "_verify_gdn_folded_block", lambda *args, **kw: folded.append(args) or fold_fn(*args, **kw))
+
+    def round_after(run, block, keep, poison = False):
+        """`block` on `run`, committed at `keep`, against the same block on a copy that cannot fold."""
+        expected = _verified(lm, run, block, keep)
+        for entry in run:
+            if poison and "_unsloth_pending" in vars(entry):  # a fold reads only the replay's inputs
+                state, replay, rows = entry._unsloth_pending
+                entry[1] = state + float("nan")
+                entry._unsloth_pending = (entry[1], replay, rows)
+        calls = len(fused), len(folded)
+        out = lm(block, cache = run, speculative_verify = True, **_captured(lm))
+        out.gdn_states.commit(keep)
+        assert _same(expected, _state(out, run))
+        return len(fused) - calls[0], len(folded) - calls[1]
+
+    with inference.exact_speculative_verify(model):
+        _verified(lm, cache, blocks[0], 0)
+        run, out = _verify_call(lm, cache, blocks[0])
+        out.gdn_states.commit(keeps[0])
+        assert sum("_unsloth_pending" in vars(entry) for entry in run) == layers
+        retained = [entry._unsloth_pending[2] for entry in run if "_unsloth_pending" in vars(entry)]
+        assert len({id(rows) for rows in retained}) == 1 and retained[0].dtype == mx.uint32
+        # A key's first fold is checked against replaying first; every later one folds alone, over any retained rows.
+        assert round_after(run, blocks[1], keeps[1]) == (1, layers)
+        assert list(inference._VERIFY_GDN_FOLDS.values()) == [True]
+        assert round_after(run, blocks[2], keeps[2], poison = True) == (0, layers)
+        assert round_after(run, blocks[0], keeps[0], poison = True) == (0, layers)
+        # A state replaced since the commit does not fold, and its record goes with the next block.
+        mx.eval(lm(blocks[1][:, :1], cache = run).logits)
+        assert round_after(run, blocks[1], keeps[1]) == (layers, 0)
+        assert round_after(run, blocks[2], keeps[0], poison = True) == (0, layers)
+        # A fold that differs from the replay keeps that key on the replay for good.
+        inference._VERIFY_GDN_FOLDS.clear()
+        monkeypatch.setattr(inference, "_verify_gdn_folded_block",
+                            lambda *args, **kw: folded.append(args) or (lambda y, *rest: (y + 1, *rest))(*fold_fn(*args, **kw)))
+        assert round_after(run, blocks[0], keeps[1]) == (layers, 1)
+        assert list(inference._VERIFY_GDN_FOLDS.values()) == [False]
+        assert round_after(run, blocks[1], keeps[2]) == (layers, 0)
 
 
 def _recurrence(rows, steps, heads = 4, width = 128):
     q, k, v = (mx.random.normal((rows, steps, heads, width), key = mx.random.key(seed)).astype(mx.bfloat16) for seed in range(3))
     a, b = (mx.random.normal((rows, steps, heads), key = mx.random.key(seed)).astype(mx.bfloat16) for seed in (3, 4))
     return q, k, v, a, b, mx.zeros((heads,)), mx.ones((heads,))
+
+
+def test_warm_inference_builds_the_pipeline_a_verify_block_launches(qwen_4bit, qwen4, monkeypatch):
+    from unsloth_zoo.mlx import inference
+    model, ids, cache = qwen_4bit
+    launched, outputs, evaluated, block_fn, evaluate = [], [], [], inference._verify_gdn_block, mx.eval
+
+    def recorded(*args, **variant):
+        # The template arguments a call picks (LMAX and TY are constants): input dtypes, taps, heads, head widths and
+        # the q/k norm and gate variant.
+        launched.append((*(x.dtype for x in args if isinstance(x, mx.array)), args[1].shape[1], args[6].shape[2],
+                         args[-1], args[6].shape[3], args[-2].shape[3], variant.get("l2"), variant.get("sigmoid")))
+        outputs.append(block_fn(*args, **variant))
+        return outputs[-1]
+    monkeypatch.setattr(inference, "_verify_gdn_block", recorded)
+    monkeypatch.setattr(inference, "_native_causal_attention", lambda *args: None)
+    monkeypatch.setattr(inference, "_VERIFY_GDN_VERDICTS", {})
+    monkeypatch.setattr(inference, "_TAPE_VERDICTS", {})
+    monkeypatch.setattr(inference, "_VERIFY_GDN_FOLDS", {})
+    monkeypatch.setattr(model, "generate", lambda *args, **kwargs: None, raising = False)
+    monkeypatch.setattr(model, "_unsloth_speculates", False, raising = False)
+    with monkeypatch.context() as patch:
+        # A launch builds its pipeline only once evaluated.
+        patch.setattr(mx, "eval", lambda *arrays: evaluated.extend(arrays) or evaluate(*arrays))
+        inference.warm_inference(model)
+    assert outputs and all(any(out is x for x in evaluated) for out in outputs)
+    warmed = set(launched)
+    assert not inference._VERIFY_GDN_VERDICTS
+    # For a model a drafter was built for, each block width's checks run there too, so no block pays them.
+    monkeypatch.setattr(model, "_unsloth_speculates", True, raising = False)
+    inference.warm_inference(model)
+    with inference.exact_speculative_verify(model):
+        widths = range(3, inference._VERIFY_GDN_MAX_ROWS + 1)
+        assert sorted(key[0] for key in inference._VERIFY_GDN_VERDICTS) == list(widths)
+        assert all(inference._VERIFY_GDN_VERDICTS.values()) and set(launched) == warmed
+        assert sorted((key[0], key[-2]) for key in inference._VERIFY_GDN_FOLDS) == [(a, b) for a in widths for b in widths]
+        assert not any(key[-1] for key in inference._VERIFY_GDN_FOLDS)
+        assert all(inference._VERIFY_GDN_FOLDS.values())
+        for width in (3, 8):
+            launched.clear()
+            work = inference.first_use_work()
+            _verified(model.language_model, cache, mx.array([ids[0][24 : 24 + width]]), 0)
+            assert inference.first_use_work() == work and set(launched) == warmed
+        run, out = _verify_call(model.language_model, cache, mx.array([ids[0][24:29]]))
+        out.gdn_states.commit(2)
+        work = inference.first_use_work()
+        model.language_model(mx.array([ids[0][26:34]]), cache = run, speculative_verify = True).gdn_states.abort()
+        assert inference.first_use_work() == work
+    assert len(warmed) == 1
+    # A build the runtime rejects leaves warm-up to the native ops: one attempt per shape, no verdicts.
+    builds, errors = [], [RuntimeError("[metal::Device] Unable to build metal library from source")]
+
+    def rejected(*args, **variant):
+        builds.append(args)
+        raise errors[-1]
+    with monkeypatch.context() as patch:
+        patch.setattr(inference, "_verify_gdn_block", rejected)
+        patch.setattr(inference, "_VERIFY_GDN_VERDICTS", {})
+        inference.warm_inference(model)
+        assert len(builds) == 1 and not inference._VERIFY_GDN_VERDICTS
+        # A block evaluated inside a function transformation or under memory pressure is checked on a later call; a rejected build is not retried.
+        block = lambda: _verified(model.language_model, cache, mx.array([ids[0][24 : 27]]), 0)
+        with inference.exact_speculative_verify(model):
+            for later in (ValueError("[eval] Attempting to eval an array during function transformations"),
+                          RuntimeError("[malloc] Unable to allocate 1048576 bytes.")):
+                errors.append(later)
+                tried = len(builds)
+                block()
+                assert len(builds) > tried + 1 and not inference._VERIFY_GDN_VERDICTS  # each layer tried
+                errors.pop()
+            tried = len(builds)
+            block()
+            block()
+        assert len(builds) == tried + 1 and list(inference._VERIFY_GDN_VERDICTS.values()) == [False]
+    # A CPU load verifies on the native ops, so it builds nothing.
+    launched.clear()
+    device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        inference.warm_inference(model)
+    finally:
+        mx.set_default_device(device)
+    assert not launched
+    # A qwen4_exp load builds its L2 q/k norm and sigmoid gate variant only for a drafter, and settles each width through
+    # its own forward.
+    monkeypatch.setattr(qwen4[0], "generate", lambda *args, **kwargs: None, raising = False)
+    monkeypatch.setattr(qwen4[0], "_unsloth_speculates", False, raising = False)
+    inference.warm_inference(qwen4[0])
+    assert not launched
+    monkeypatch.setattr(qwen4[0], "_unsloth_speculates", True, raising = False)
+    inference.warm_inference(qwen4[0])
+    assert {entry[-2:] for entry in launched} == {(True, True)}
+    settled = {key[0]: verdict for key, verdict in inference._VERIFY_GDN_VERDICTS.items() if key[-2]}
+    assert sorted(settled) == list(range(3, inference._VERIFY_GDN_MAX_ROWS + 1)) and all(settled.values())
+
+
+def test_the_fused_verify_block_takes_gpu_blocks_only(qwen_4bit):
+    from unsloth_zoo.mlx.inference import _verify_gdn_fits
+    model, _, _ = qwen_4bit
+    lm = model.language_model
+    layer = next(layer.linear_attn for layer in lm.model.layers if layer.is_linear)
+    cache = type("Window", (), {"history_capacity": 3, "__getitem__": lambda self, index: None})()
+    inputs = mx.zeros((1, 3, lm.args.hidden_size), mx.bfloat16)
+    assert _verify_gdn_fits(layer, inputs, None, cache)
+    device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        assert not _verify_gdn_fits(layer, inputs, None, cache)
+    finally:
+        mx.set_default_device(device)
+
+
+@pytest.mark.parametrize("length", [3, 9])
+@pytest.mark.parametrize("gate", [None, "sigmoid", "silu"])  # Qwen3.5's, or qwen4_exp's L2 q/k norm with either gate
+def test_the_fused_verify_block_matches_the_verifiers_ops_with_grouped_value_heads(length, gate):
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen3_5.gated_delta import gated_delta_update_with_states
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5RMSNormGated
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpBatchInvariantForward, Qwen4ExpRMSNormGated
+    from unsloth_zoo.mlx.inference import _verify_gdn_block
+    rows, Hk, Hv, D, K = 2, 2, 6, 128, 4
+    C = (2 * Hk + Hv) * D
+    rand = lambda seed, *shape: mx.random.normal(shape, key = mx.random.key(seed)).astype(mx.bfloat16)
+    forward = Qwen3_5BatchInvariantForward if gate is None else Qwen4ExpBatchInvariantForward
+    norm = Qwen3_5RMSNormGated(D, eps = 1e-6) if gate is None else Qwen4ExpRMSNormGated(D, eps = 1e-6, activation = gate)
+    conv = nn.Conv1d(C, C, K, groups = C, bias = False)
+    conv.weight, norm.weight = rand(0, C, K, 1), 1 + 0.1 * rand(1, D)
+    conv_input, a, b, z = rand(2, rows, K - 1 + length, C), rand(3, rows, length, Hv), rand(4, rows, length, Hv), rand(5, rows, length, Hv, D)
+    A_log, dt_bias = mx.log(mx.arange(1, Hv + 1, dtype = mx.float32)), 1 + 0.1 * rand(6, Hv)
+    state = 0.05 * mx.random.normal((rows, Hv, D, D), key = mx.random.key(7))
+    q, k, v = [x.reshape(rows, length, h, D) for x, h in zip(mx.split(nn.silu(conv(conv_input)), [Hk * D, 2 * Hk * D], -1), (Hk, Hk, Hv))]
+    q, k = forward._normalize_gated_delta_qk(None, q, k)
+    out, final, _ = gated_delta_update_with_states(q, k, v, a, b, A_log, dt_bias, state, state_steps = 0)
+    got = _verify_gdn_block(conv_input, conv.weight.reshape(C, K), a, b, A_log, dt_bias, z, norm.weight, 1e-6, 1e-6, state, Hk,
+                            l2 = gate is not None, sigmoid = gate == "sigmoid")
+    assert all(x.dtype == y.dtype and x.shape == y.shape and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
+               for x, y in zip(got, (norm(out, z), final, q, k, v)))
 
 
 def test_replay_admission_refuses_a_replay_one_bit_off_or_misreading_retained_lengths():
@@ -607,7 +1737,7 @@ def test_a_served_verify_call_submits_each_layer_as_it_is_built(qwen_4bit, monke
 def test_engine_tokens_and_scores_are_unchanged_by_the_verify_scope_over_wide_ragged_rounds(qwen_4bit, monkeypatch):
     from unsloth_zoo.mlx import inference
     from unsloth_zoo.mlx.generate import SamplingParams
-    (model, ids, _), served = qwen_4bit, _serving(monkeypatch)
+    (model, ids, _), _ = qwen_4bit, _serving(monkeypatch)
     ban = lambda history, logits: logits + mx.where(mx.arange(logits.shape[-1]) == 13, -1e9, 0)
 
     def run():
@@ -621,14 +1751,15 @@ def test_engine_tokens_and_scores_are_unchanged_by_the_verify_scope_over_wide_ra
         return out, scores, drafted, (first_use, verified)
     closed, scores, drafted, _ = run()
     inference._VERIFY_VERDICTS.clear()
+    # Projections earlier tests settled settle again, so the first blocks run their first-use checks.
+    monkeypatch.setattr(inference, "_QMV_ROWS_LAYOUTS", {})
+    for _, module in model.named_modules():
+        vars(module).pop("_unsloth_qmv_rows", None)
     with inference.exact_speculative_verify(model):
         opened = run()
     assert opened[:2] == (closed, scores) and any(scores) and drafted[0][1] > 8 and len({accepted for _, accepted in drafted.values()}) > 1
     # Exactly the rounds whose verify ran a first-use check are flagged, so the controller leaves just those out of its costs.
     assert opened[3][0] == opened[3][1] and any(opened[3][0]) and not all(opened[3][0])
-    wide = [key for key, verdict in inference._VERIFY_VERDICTS.items() if key[0][0] == 3 and key[0][1] > 8 and verdict]
-    # Each admitted key's replacement ran once for the comparison, then again for every later round it served.
-    assert any(served.count(key) > 1 for key in wide)
 
 
 def _decoded(lm, prompt, steps, block):
@@ -643,6 +1774,22 @@ def _decoded(lm, prompt, steps, block):
     return _state(stepped, cache) + _state(SimpleNamespace(logits = logits, hidden_states = [hidden]), run)
 
 
+def test_only_a_speculative_qwen4_batch_runs_narrow_projections_row_by_row(qwen4, monkeypatch):
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference
+    (model, ids), rows, kernel = qwen4, [], inference._verify_rows_alone
+    lm = model.language_model
+    monkeypatch.setattr(inference, "_verify_rows_alone", lambda *a: rows.append(a) or kernel(*a))
+    caches = [make_prompt_cache(lm) for _ in ids[:2]]
+    for cache, prompt in zip(caches, ids):
+        mx.eval(lm(mx.array([prompt[:8]]), cache = cache).logits)
+    for call, served in (((), False), (("speculative",), True)):
+        rows.clear()
+        with inference.inference_scopes(model, call):
+            mx.eval(lm(mx.array([[prompt[8]] for prompt in ids[:2]]), cache = [type(a).merge([a, b]) for a, b in zip(*caches)]).logits)
+        assert bool(rows) == served
+
+
 def test_qwen4_decode_steps_and_verify_blocks_run_the_routed_experts_bit_for_bit(qwen4, monkeypatch):
     from mlx_vlm.models.qwen4_exp import language
     from unsloth_zoo.mlx import inference
@@ -650,19 +1797,256 @@ def test_qwen4_decode_steps_and_verify_blocks_run_the_routed_experts_bit_for_bit
     lm, native = model.language_model, type(language._QWEN4_BATCH_INVARIANT_FORWARD)
     args = (lm, ids[0][:20], ids[0][20:26], ids[0][26:31])
     expected = _decoded(*args)
-    # The scopes a plain, undrafted generation holds.
-    with inference.inference_scopes(model, ()):
+    with inference.inference_scopes(model, ()):   # every generation holds the forward
         assert type(language._QWEN4_BATCH_INVARIANT_FORWARD) is not native
+    with inference.inference_scopes(model, ("speculative",)):
         assert _same(expected, _decoded(*args))
+        assert all(layer.mlp._unsloth_moe_routed.verify_plans.get(5) is None for layer in lm.layers)
     assert type(language._QWEN4_BATCH_INVARIANT_FORWARD) is native and "_unsloth_verify_scopes" not in vars(lm)
-    # The first decode step and the verify block each matched on their first layer, then served every other one.
     admitted = [key for key, verdict in inference._VERIFY_VERDICTS.items() if verdict]
-    assert {key[0] for key in admitted} == {(1, 1), (1, 5)}
-    assert all(served.count(key) == (6 if key[0] == (1, 1) else 1) * len(lm.layers) for key in admitted)
+    assert {key[0] for key in admitted} == {(1, 1), "rows alone", "causal chunks"}
+    assert any(key[0] == "rows alone" and key[2][0] == 1 for key in admitted)
+    assert all(served.count(key) == (6 if key[0] == (1, 1) else 1) * len(lm.layers) for key in admitted if key[0] in ((1, 1), (1, 5)))
+    # A drafted target settles its projections' multi-row kernels at load, through the batch-invariant forward too.
+    projections = [p for _, p in lm.named_modules() if type(p).__name__ == "QuantizedLinear"]
+    for p in projections:
+        p.__dict__.pop("_unsloth_qmv_rows", None)
+    held = []
+    monkeypatch.setattr(model, "generate", lambda *args, **kwargs: held.append("_unsloth_speculative_call" in vars(lm)), raising = False)
+    inference.warm_inference(model)   # a plain load warms what a plain generation runs
+    assert held == [False] and not any(vars(p).get("_unsloth_qmv_rows") for p in projections)
+    monkeypatch.setattr(model, "_unsloth_speculates", True, raising = False)
+    inference.warm_inference(model)
+    assert held == [False, True]
+    tags = [vars(p).get("_unsloth_qmv_rows") for p in projections]
+    assert projections and all(tags) and any(tag[2] for tag in tags)
 
 
-def test_qwen4_rounds_verify_and_commit_ragged_rows_as_their_own_decode_steps(qwen4):
+def test_a_qwen4_verify_block_taped_and_fused_commits_what_stock_commits(qwen4, monkeypatch):
+    from mlx_vlm.models.cache import ArraysCache, make_prompt_cache
+    from unsloth_zoo.mlx import inference
+    (model, ids), width = qwen4, 5
+    lm, cache = model.language_model, make_prompt_cache(model.language_model)
+    lm(mx.array([ids[0][:24]]), cache = cache)
+    block, linear = mx.array([ids[0][24 : 24 + width]]), sum(layer.is_linear for layer in lm.layers)
+
+    def verify():
+        run = _clone(cache)
+        hidden, _, transaction, logits = lm.speculative_verify_logits(block, run, lambda logits: logits)
+        return run, transaction, SimpleNamespace(logits = logits, hidden_states = [hidden])
+
+    def verified(keep):
+        run, transaction, out = verify()
+        transaction.commit([keep]) if keep else transaction.abort()
+        return _state(out, run)
+    keeps = [2, 1, width - 1, width, 0]
+    native = [verified(keep) for keep in keeps]
+    monkeypatch.setattr(inference, "_TAPE_VERDICTS", {})
+    monkeypatch.setattr(inference, "_VERIFY_GDN_VERDICTS", {})
+    fused, block_fn = [], inference._verify_gdn_block
+    monkeypatch.setattr(inference, "_verify_gdn_block", lambda *args, **variant: fused.append(variant) or block_fn(*args, **variant))
+    with inference.exact_batch_invariant_decode(model):
+        assert all(_same(expected, verified(keep)) for keep, expected in zip(keeps, native))
+        assert set(inference._TAPE_VERDICTS.values()) == {True} and len(inference._VERIFY_GDN_VERDICTS) == 1 and all(inference._VERIFY_GDN_VERDICTS.values())
+        checked = len(fused)
+        # Each gated-delta layer's cache holds its tapes until the commit replays them, then is a plain cache again.
+        run, transaction, out = verify()
+        taped = [entry for entry in run if "_unsloth_tapes" in vars(entry)]
+        assert len(taped) == linear == len(fused) - checked and {tuple(sorted(v.items())) for v in fused} == {(("l2", True), ("sigmoid", True), ("tree", None))}
+        transaction.commit([keeps[0]])
+        assert _same(native[0], _state(out, run)) and all(type(entry) is ArraysCache and "_unsloth_tapes" not in vars(entry) for entry in taped)
+        # A cache that started another block before committing the taped one commits that block alone.
+        run, transaction, _ = verify()
+        taped = [entry for entry in run if "_unsloth_tapes" in vars(entry)]
+        entry, held = taped[0], taped[0][1]
+        entry.start_speculation(width)
+        entry.commit_speculation([2])
+        assert entry[1] is held and type(entry) is ArraysCache
+        transaction.abort()
+        assert not any("_unsloth_tapes" in vars(entry) or type(entry) is not ArraysCache for entry in taped)
+        # A rebound cache method the replay relies on leaves blocks untaped.
+        for name in ("update_recurrent", "commit_speculation", "abort_speculation"):
+            with monkeypatch.context() as patch:
+                patch.setattr(ArraysCache, name, (lambda method: lambda self, *args, **kwargs: method(self, *args, **kwargs))(getattr(ArraysCache, name)))
+                run, transaction, _ = verify()
+                assert not any("_unsloth_tapes" in vars(entry) for entry in run), name
+                transaction.abort()
+        # The forward's decode steps are never taped, so they skip the block checks.
+        fits, fit = [], inference._verify_gdn_fits
+        monkeypatch.setattr(inference, "_verify_gdn_fits", lambda *args: fits.append(args) or fit(*args))
+        lm(mx.array([[ids[0][24]]]), cache = _clone(cache))
+        assert not fits and verify() and len(fits) == linear
+
+
+def test_qwen4_decode_steps_run_gated_delta_on_the_fused_block_bit_for_bit(qwen4, monkeypatch, caplog):
     from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference
+    (model, ids), linear = qwen4, sum(layer.is_linear for layer in qwen4[0].language_model.layers)
+    lm, cache = model.language_model, make_prompt_cache(model.language_model)
+    lm(mx.array([ids[0][:24]]), cache = cache)
+    for entry in (entry for entry in cache if type(entry).__name__ == "ArraysCache"):
+        entry.left_padding = mx.array([0])  # a batch's padding bookkeeping, which each step must advance
+
+    def decoded():
+        run = _clone(cache)
+        logits = [lm(mx.array([[token]]), cache = run).logits for token in ids[0][24:28]]
+        return _state(SimpleNamespace(logits = logits, hidden_states = None), run)
+    native, block_fn, steps = decoded(), inference._verify_gdn_block, []
+    monkeypatch.setattr(inference, "_DECODE_GDN_VERDICTS", {})
+    monkeypatch.setattr(inference, "_verify_gdn_block", lambda *args, **variant: steps.append(args[0].shape) or block_fn(*args, **variant))
+    with inference.exact_batch_invariant_decode(model):
+        assert _same(native, decoded())
+    # The first layer checks the fused step against the native one, then every layer of every step runs it.
+    assert list(inference._DECODE_GDN_VERDICTS.values()) == [True] and len(steps) == 4 * linear and steps[0][1] == 4
+    # A fused step that differs keeps the native one for good.
+    monkeypatch.setattr(inference, "_DECODE_GDN_VERDICTS", {})
+    monkeypatch.setattr(inference, "_verify_gdn_block", lambda *args, **variant: (lambda y, *rest: (y + 1, *rest))(*block_fn(*args, **variant)))
+    with caplog.at_level("WARNING"), inference.exact_batch_invariant_decode(model):
+        assert _same(native, decoded())
+    assert list(inference._DECODE_GDN_VERDICTS.values()) == [False] and "fused gated-delta decode step differs" in caplog.text
+
+
+@pytest.mark.parametrize("experts", [False, True])  # experts on disk read their routes on the host mid-forward
+@pytest.mark.parametrize("verify, after", [(0, 0), (0, 40), (3, 0), (3, 40), (5, 40)])
+def test_qwen4_decode_steps_read_disk_ple_rows_after_the_forward_bit_for_bit(qwen4, tmp_path, monkeypatch, experts, verify, after):
+    from mlx.utils import tree_flatten
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference, offload
+    monkeypatch.setattr(inference, "_staged_submit_window", lambda: after)
+    model, ids = qwen4
+    lm, sites = model.language_model, list(offload.ple_sites(model))
+    glus = list(offload.expert_sites(model)) if experts else []
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {f"{path}.{name}": value for path, module in sites + glus
+                                                              for name, value in tree_flatten(module.parameters())})
+    staged, early, pending, stage = [], [], set(), offload.DiskEmbedding._staged
+
+    def tracked_stage(self, x):
+        out = stage(self, x)
+        if out is None:
+            return None
+        held, (rows, fill) = offload.STAGED_FILLS.held, out
+        staged.append(x)
+        pending.add(id(fill))
+
+        def read():
+            assert not after or len(held) <= (1 if verify else after)
+            fill()
+            pending.remove(id(fill))
+            if held and hasattr(read, "ready"): early.append(read.ready)
+        read.abandon = fill.abandon
+        return rows, read
+    monkeypatch.setattr(offload.DiskEmbedding, "_staged", tracked_stage)
+    submits, submit = [], mx.async_eval
+
+    def is_ids(arrays):
+        return len(arrays) == 1 and isinstance(arrays[0], mx.array) and arrays[0].dtype == mx.int64 and arrays[0].ndim == 1
+
+    def submitted(*arrays):
+        if not is_ids(arrays):
+            assert not pending, "layer submitted before its staged rows were read"
+        submits.append(arrays)
+        return submit(*arrays)
+    monkeypatch.setattr(mx, "async_eval", submitted)
+    try:
+        assert offload.offload_ple(model, str(tmp_path), 1.0)["tables"] == len(sites) == 1
+        if experts:
+            assert offload.offload_experts(model, str(tmp_path), 1.0)["layers"] == len(glus) > 1
+        cache = make_prompt_cache(lm)
+        lm(mx.array([ids[0][:24]]), cache = cache)
+
+        def decoded():
+            if verify:
+                return _decoded(lm, ids[0][:24], ids[0][24:30], ids[0][30:30 + verify])
+            run = _clone(cache)
+            logits = [lm(mx.array([[token]]), cache = run).logits for token in ids[0][24:30]]
+            return _state(SimpleNamespace(logits = logits, hidden_states = None), run)
+        native = decoded()
+        with inference.exact_batch_invariant_decode(model), (inference.speculative_call(model) if verify else contextlib.nullcontext()):
+            monkeypatch.setattr(inference, "_STAGED_ROWS_OFF", [True])
+            assert _same(native, decoded())
+            submits.clear()
+            assert _same(native, decoded())  # past first-use work
+            unstaged, submits[:] = list(submits), []
+            staged.clear(); early.clear()
+            monkeypatch.setattr(inference, "_STAGED_ROWS_OFF", [])
+            assert _same(native, decoded())
+            assert (experts or bool(early) == bool(staged)) and all(any(len(a) == 1 and a[0] is r for a in submits) for r in early)
+            roots = [arrays for arrays in submits if not is_ids(arrays) and not any(len(arrays) == 1 and arrays[0] is r for r in early)]
+            ids_submitted = [arrays[0] for arrays in submits if is_ids(arrays)]
+            # One ID submission per staged lookup; every layer root follows its row read, in native order.
+            assert (len(staged) >= 4 if not verify or after else not staged) and not pending
+            assert any(x.shape[1] == verify for x in staged) == (0 < verify <= 4 and bool(after))
+            assert _same(tree_flatten(ids_submitted), tree_flatten([x.astype(mx.int64).reshape(-1) for x in staged]))
+            assert _same(tree_flatten(roots), tree_flatten(unstaged))
+        assert not inference._STAGED_ROWS_OFF
+        # A check settling while rows wait unread may have evaluated them unfilled: staging turns off for good.
+        offload.STAGED_FILLS.fills = [lambda: None]
+        inference._settled(True)
+        assert inference._STAGED_ROWS_OFF
+    finally:
+        offload.STAGED_FILLS.fills = None
+        for path, module in sites + glus:
+            offload._replace_module(model, path, module)
+
+
+@pytest.mark.parametrize("flag, prompt, batch", [("0", 40, False), ("0", 1200, False), ("1", 1200, False), ("low", 1200, False),
+                                                 ("0", 2100, False), ("0", 2100, True)])
+def test_a_qwen4_verify_block_attends_and_projects_as_its_decode_steps(qwen4, flag, prompt, batch, monkeypatch):
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference, matmul
+    if flag != "0" and not matmul.lane_qmm_available():
+        pytest.skip("the row-invariant mode needs the lane kernel")
+    low, flag = flag == "low", "1" if flag == "low" else flag
+    monkeypatch.setattr(inference, "_LANE_LOW_ROWS", 6 if low else 0)
+    monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", flag)
+    (model, _), served, lanes, lane_qmm = qwen4, _serving(monkeypatch), [], matmul.lane_qmm
+    monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: lanes.append(args[0].shape[0]) or lane_qmm(*args, **kwargs))
+    lm, tokens = model.language_model, [(7 * i + 3) % 1000 + 2 for i in range(prompt + 6)]
+    from mlx_vlm.models.qwen4_exp import qsa_kernel
+    sparse, kernel = [], qsa_kernel._qsa_sparse_attention_kernel
+    monkeypatch.setattr(qsa_kernel, "_qsa_sparse_attention_kernel", lambda *args: (lambda launch: lambda **kw: sparse.append(
+        dict(kw["template"])["Q_LEN"]) or launch(**kw))(kernel(*args)))
+
+    def prefilled():
+        cache = make_prompt_cache(lm)
+        mx.eval(lm(mx.array([tokens[:prompt]]), cache = cache).logits)
+        return [type(entry).merge([entry]) for entry in cache] if batch else cache
+    with inference.inference_scopes(model, ("speculative",)):
+        cache = prefilled()
+        steps = mx.concatenate([lm(mx.array([[token]]), cache = cache).logits for token in tokens[prompt:]], axis = 1)
+        for _ in range(2):  # a plan's first block checks it, the next is served
+            cache = prefilled()
+            lanes.clear(), sparse.clear()
+            *_, transaction, logits = lm.speculative_verify_logits(mx.array([tokens[prompt:]]), cache, lambda x: x)
+            transaction.abort()
+            assert _same([("logits", steps)], [("logits", logits)])
+    # Its dense-regime mask is the causal one, so its attention takes the exact route; past the indexer's budget the
+    # block is selected and attended whole, the served block in one sparse call. The opt-in mode's rows take the lanes.
+    assert prompt > 2048 or any("causal" in str(part) for key in served for part in key)
+    # A batch cache keeps mlx-vlm's pairs.
+    assert any(key[0] == "qsa_block" and verdict for key, verdict in inference._VERIFY_VERDICTS.items()) == (prompt > 2048 and not batch)
+    assert set(sparse) == (set() if prompt < 2048 else {2} if batch else {6})
+    assert (max(lanes, default = 0) == 6) == (flag == "1" and not low)
+
+
+def test_a_qwen4_mask_is_causal_only_while_no_row_passes_the_indexer_top_k(qwen4):
+    from mlx_vlm.models.qwen4_exp.language import BatchQSAKVCache, QSAKVCache
+    from unsloth_zoo.mlx import inference
+    attention = next(layer.self_attn for layer in qwen4[0].language_model.layers if not layer.is_linear)
+    ratio, cache = attention.indexer.compress_ratio, QSAKVCache()
+    budget = attention.indexer.block_topk * ratio
+    for offset, rows, causal in ((budget - 5, 5, True), (budget + ratio - 6, 5, True), (budget + ratio - 5, 5, False), (0, 1, True)):
+        cache.offset = offset
+        assert inference._qwen4_causal_mask(attention, cache, rows) is causal, (offset, rows)
+    padded = BatchQSAKVCache([0])
+    padded.offset = 0
+    assert not inference._qwen4_causal_mask(attention, padded, 2)
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+def test_qwen4_rounds_verify_and_commit_ragged_rows_as_their_own_decode_steps(qwen4, scoped):
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference
     from unsloth_zoo.mlx.generate import SamplingParams
     from unsloth_zoo.mlx.speculative import EngineRow, SpeculativeEngine
     (model, ids), greedy = qwen4, SamplingParams()
@@ -680,12 +2064,14 @@ def test_qwen4_rounds_verify_and_commit_ragged_rows_as_their_own_decode_steps(qw
         row.draft = object()  # a drafting row, so verify returns the hidden states an MTP head reads
     assert engine._invariant and engine._batch_rounds
     # Blocks of each row's own stream, kept raggedly, so a rejected tail left in any cache shows in the next block.
-    starts = [0, 0, 0]
+    starts, taped = [0, 0, 0], []
     for keeps in ((5, 2, 3), (1, 5, 2), (4, 3, 1)):
-        logits, hidden, transaction = engine._verify(mx.array([stream[start : start + 5] for stream, start in zip(streams, starts)]))
+        with inference.exact_batch_invariant_decode(model) if scoped else contextlib.nullcontext():
+            logits, hidden, transaction = engine._verify(mx.array([stream[start : start + 5] for stream, start in zip(streams, starts)]))
         assert all(_same([("logits", want_logits[:, start : start + 5]), ("hidden", want_hidden[:, start : start + 5])],
                          [("logits", logits[i : i + 1]), ("hidden", hidden[i : i + 1])])
                    for i, ((want_logits, want_hidden), start) in enumerate(zip(stepped, starts)))
+        taped.append(sum("_unsloth_tapes" in vars(entry) for entry in engine.cache))
         transaction.commit(list(keeps))
         for entry in engine.cache:  # as a round does after a ragged commit
             padding = getattr(entry, "left_padding", None)
@@ -693,6 +2079,8 @@ def test_qwen4_rounds_verify_and_commit_ragged_rows_as_their_own_decode_steps(qw
                 entry.left_padding = padding + 0
         starts = [start + keep for start, keep in zip(starts, keeps)]
     assert not any("keys" in vars(entry) for entry in engine.cache)  # the commit's view of the QSA keys is gone
+    # Served, each round's gated-delta layers committed through their tapes.
+    assert taped == [sum(layer.is_linear for layer in lm.layers) if scoped else 0] * 3
 
 
 @pytest.mark.parametrize("heads", [(24, 4), (16, 2), (8, 2)])
@@ -804,18 +2192,14 @@ def test_long_verify_blocks_read_attention_in_one_pass_and_match_the_native_veri
     from mlx_vlm.models.cache import make_prompt_cache
     from unsloth_zoo.mlx import inference
     model, ids, _ = qwen_4bit
-    lm, block = model.language_model, mx.array([ids[0][24:30]])
+    lm, block = model.language_model, mx.array([ids[0][24:36]])
     cache, prompt = make_prompt_cache(lm), (ids[0] * 64)[:4200]
     lm(mx.array([prompt]), cache = cache, skip_logits = True)
     mx.eval([entry.state for entry in cache])
     native, unscoped = {keep: _verified(lm, cache, block, keep) for keep in (0, 2, 6)}, __import__("copy").copy(lm)
-    attention = lambda: [key for key in served if key[1] == "attention"]
+    attention = lambda: [key for key in served if key[0] == "causal attention"]
     served = _serving(monkeypatch)
     with inference.exact_speculative_verify(model):
-        assert _same(native[0], _verified(lm, cache, block, 0)) and not attention()
-        monkeypatch.setattr(inference, "_EXACT_ATTENTION_MIN_KEYS", 4096)
-        monkeypatch.setattr(inference, "_exact_attention_faster", lambda per_row, fused: True)
-        monkeypatch.setattr(inference, "_EXACT_ATTENTION_TIMED", {})
         # An unscoped copy of the model stays on the one-row calls.
         assert _same(native[0], _verified(unscoped, cache, block, 0)) and not attention()
         assert all(_same(expected, _verified(lm, cache, block, keep)) for keep, expected in native.items())
@@ -837,12 +2221,12 @@ def test_mtp_rounds_match_solo_decoding(qwen_mtp, monkeypatch):
     with exact_speculative_verify(model):
         assert _run(model, ids, 96, _script(("draft", 3), ("copy", 4)), greedy, drafter = _drafter(model))[0] == solo
     assert len(submitted) > 2 * unscoped + len(model.language_model.model.layers)
-    picked, pick = [], _ShortlistHead.__call__
-    monkeypatch.setattr(_ShortlistHead, "__call__", lambda self, hidden: picked.append(self._source is self.table.weight) or pick(self, hidden))
-    (out,), drafted, _ = _run(model, ids[:1], 96, DraftController(max_depth = 4, max_copy = 16), greedy, drafter = _drafter(model))
-    assert out == solo[0] and drafted[0][1] > 0 and picked and all(picked)
     built = _drafter(model)
-    assert built.weight_bytes == sum(a.nbytes for _, a in tree_flatten(built.model.parameters())) + built._shortlist.nbytes
+    assert built._shortlist is None
+    assert built.weight_bytes == sum(a.nbytes for _, a in tree_flatten(built.model.parameters()))
+    monkeypatch.setattr(_ShortlistHead, "prepare", lambda self: pytest.fail("a native head allocated a duplicate table"))
+    (out,), drafted, _ = _run(model, ids[:1], 96, DraftController(max_depth = 4, max_copy = 16), greedy, drafter = built)
+    assert out == solo[0] and drafted[0][1] > 0
 
 
 def test_the_shortlist_head_takes_the_tables_own_best_of_its_coarse_copys_few(monkeypatch):
@@ -862,7 +2246,8 @@ def test_the_shortlist_head_takes_the_tables_own_best_of_its_coarse_copys_few(mo
         few = mx.argsort(-coarse, axis = -1)[..., :8]
         best = mx.take_along_axis(few, mx.argmax(mx.take_along_axis(logits, few, axis = -1), axis = -1, keepdims = True), axis = -1)
         assert head(hidden).tolist() == best.squeeze(-1).tolist() != mx.argmax(coarse, axis = -1).tolist()
-    assert (small := speculative._ShortlistHead.of(lm(nn.Linear(64, 512, bias = False), False))).prepare() is None and small.nbytes == sum(a.nbytes for a in small._scan) and speculative._ShortlistHead.of(lm(packed(dense), False)).nbytes == speculative._ShortlistHead.of(lm(dense, False)).nbytes and all(speculative._ShortlistHead.of(lm(uncovered, False)) is None for uncovered in (nn.Linear(192, 512), narrow, packed(narrow), nn.Linear(192, 8, bias = False), nn.QuantizedLinear(192, 512, bias = False, bits = 2)))
+    assert speculative._ShortlistHead.of(lm(packed(dense), False)).nbytes == speculative._ShortlistHead.of(lm(dense, False)).nbytes
+    assert all(speculative._ShortlistHead.of(lm(uncovered, False)) is None for uncovered in (nn.Linear(64, 512, bias = False), nn.Linear(192, 512), narrow, packed(narrow), nn.Linear(192, 8, bias = False), nn.QuantizedLinear(192, 512, bias = False, bits = 2)))
 
 
 @pytest.mark.parametrize("max_lag", [128, 4])
@@ -885,10 +2270,36 @@ def test_mtp_catches_up_after_plain_windows_and_copies(qwen_mtp, max_lag, monkey
     (out,), _, _ = _run(model, ids[:1], 128, controller, SamplingParams(), drafter = drafter)
     assert out == _solo(model, ids[0], 128, SamplingParams())
     assert any(drafter.dropped.values()) == (max_lag < 8)
-    # Only a plain window leaves more pairs than a round does: its replay is timed apart from drafting.
-    assert apart[:4] == [max_lag >= 8, False] * 2
+    assert apart[:4] == [True, False, max_lag >= 8, False]
     # A head that dropped context past max_lag accepts less; a misaligned catch-up would accept next to nothing.
     assert sum(count for count, _ in accepted) >= (0.6 if max_lag >= 8 else 0.5) * sum(length for _, length in accepted)
+
+
+def test_an_mtp_heads_cache_holds_only_target_hidden_pairs_however_its_drafts_fared(qwen_mtp):
+    from unsloth_zoo.mlx.generate import SamplingParams
+    model, ids = qwen_mtp
+    drafter, chunks, compared = _drafter(model, max_lag = 4096), [[]], []
+    start, push, catch_up, draft = drafter.start, drafter.push, drafter.catch_up, drafter.draft
+    def traced_start(prompt, hidden, pending):
+        result = start(prompt, hidden, pending)
+        if getattr(result[0], "prefix", None) is not None:
+            count = min(hidden.shape[1], len(prompt))
+            chunks[0].insert(0, ([*prompt[len(prompt) - count + 1:], pending], hidden[0, -count:]))
+        return result
+    drafter.start = traced_start
+    drafter.push = lambda row, tokens, hidden: chunks[-1].append((list(tokens), hidden)) or push(row, tokens, hidden)
+    drafter.catch_up = lambda cache, rows: (catch_up(cache, rows), chunks.append([]))[0]
+    def against_replay(cache, rows, depth, target):
+        fresh, position = drafter.new_cache(), 0
+        for chunk in filter(None, chunks):
+            tokens, hidden = sum((t for t, _ in chunk), []), mx.concatenate([h for _, h in chunk])
+            last = drafter._forward(fresh, mx.array([tokens]), hidden[None], mx.arange(position, position + len(tokens))[None])[:, -1:]
+            position += len(tokens)
+        compared.append(mx.array_equal(rows[0].last, last).item() and all(mx.array_equal(a, b).item() for x, y in zip(cache, fresh) for a, b in zip(x.state, y.state)))
+        return draft(cache, rows, depth, target)
+    drafter.draft = against_replay
+    _, drafted, _ = _run(model, ids[:1], 96, _script(("draft", 3), ("draft", 3), ("plain", 6), ("copy", 4), ("draft", 2)), SamplingParams(), drafter = drafter)
+    assert len(compared) > 6 and all(compared) and drafted[0][1] > 0
 
 
 def test_native_mtp_head_is_built_in_memory_from_mtp_tensors_only(qwen_mtp, monkeypatch):
@@ -901,11 +2312,129 @@ def test_native_mtp_head_is_built_in_memory_from_mtp_tensors_only(qwen_mtp, monk
     assert loaded and all(key.startswith("mtp.") for key in loaded)
 
 
+def test_a_head_kept_under_the_language_model_of_an_mlx_conversion_is_built_with_its_per_module_quantization(qwen_mtp, tmp_path):
+    from mlx.utils import tree_flatten
+    from mlx_vlm.speculative.drafters.mtp_split import get_model_path
+    from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import Qwen3_5MTPSplitter
+    from unsloth_zoo.mlx.speculative import MTPDrafter, has_native_mtp_head, native_mtp_drafter
+    source = get_model_path(MTP_MODEL)
+    _, head = Qwen3_5MTPSplitter().prepare(source)
+    quantization, tensors = {"group_size": 64, "bits": 4, "mode": "affine"}, {"language_model.model.norm.weight": mx.ones(8)}
+    for key, value in head.items():
+        module, bits = key.removesuffix(".weight"), 8 if ".self_attn." in key else 4
+        if value.ndim == 2 and key != "fc.weight":
+            tensors.update(zip([f"language_model.mtp.{module}.{part}" for part in ("weight", "scales", "biases")], mx.quantize(value, 64, bits)))
+            if bits == 8:
+                quantization[f"language_model.mtp.{module}"] = {"group_size": 64, "bits": 8, "mode": "affine"}
+        else:
+            tensors[f"language_model.mtp.{key}"] = value
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors, metadata = {"format": "mlx"})
+    (tmp_path / "config.json").write_text(json.dumps({**json.loads((source / "config.json").read_text()), "quantization": quantization}))
+    assert has_native_mtp_head(tmp_path) and not has_native_mtp_head(get_model_path(MODEL))
+    drafter = native_mtp_drafter(tmp_path, qwen_mtp[0])
+    built = dict(tree_flatten(drafter.model.parameters()))
+    assert type(drafter) is MTPDrafter and drafter.model.layers[0].self_attn.q_proj.bits == 8 and drafter.model.layers[0].mlp.up_proj.bits == 4
+    assert built.keys() == {key.removeprefix("language_model.mtp.") for key in tensors if ".mtp." in key}
+    assert all(mx.array_equal(built[key.removeprefix("language_model.mtp.")], value) for key, value in tensors.items() if ".mtp." in key)
+
+
+def test_a_head_whose_overrides_name_its_checkpoint_paths_is_built_at_its_stored_widths(qwen4, tmp_path):
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from mlx_vlm.speculative.drafters import qwen4_exp_mtp
+    from unsloth_zoo.mlx.speculative import native_mtp_drafter
+    default = {"group_size": 64, "bits": 4, "mode": "affine"}
+    wide = {"fc_hidden": {**default, "bits": 8}, "layers.0.self_attn.q_proj": {**default, "bits": 8},
+            "layers.0.mlp.shared_expert.down_proj": {**default, "bits": 8, "group_size": 128}}
+    head = qwen4_exp_mtp.Model(qwen4_exp_mtp.ModelConfig.from_dict({"text_config": QWEN4_TEXT}))
+    nn.quantize(head, class_predicate = lambda name, layer: hasattr(layer, "to_quantized") and not name.endswith("mlp.gate") and wide.get(name, default))
+    tensors = {f"mtp.{key}": value for key, value in tree_flatten(head.parameters())}
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors, metadata = {"format": "mlx"})
+    quantization = {**default, **{f"mtp.{name}": spec for name, spec in wide.items()}}
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen4_exp", "text_config": QWEN4_TEXT, "quantization": quantization}))
+    drafter = native_mtp_drafter(tmp_path, qwen4[0])
+    model, built = drafter.model, dict(tree_flatten(drafter.model.parameters()))
+    layer = model.layers[0]
+    modules = (model.fc_embedding, model.fc_hidden, layer.self_attn.q_proj, layer.self_attn.k_proj, layer.mlp.shared_expert.down_proj, layer.mlp.switch_mlp.up_proj)
+    assert [(module.bits, module.group_size) for module in modules] == [(4, 64), (8, 64), (8, 64), (4, 64), (8, 128), (4, 64)]
+    assert built.keys() == {key.removeprefix("mtp.") for key in tensors}
+    assert all(mx.array_equal(built[key.removeprefix("mtp.")], value) for key, value in tensors.items())
+
+
+GLM5_TEXT = dict(model_type = "glm5_next_text", hidden_size = 256, num_hidden_layers = 4, num_nextn_predict_layers = 1, vocab_size = 512,
+                 num_attention_heads = 2, num_key_value_heads = 2, q_lora_rank = 128, kv_lora_rank = 64, qk_head_dim = 64, qk_nope_head_dim = 64,
+                 qk_rope_head_dim = 0, v_head_dim = 64, head_dim = 0, intermediate_size = 256, moe_intermediate_size = 64, n_routed_experts = 4,
+                 n_shared_experts = 1, num_experts_per_tok = 2, first_k_dense_replace = 1, index_head_dim = 32, index_n_heads = 2, index_topk = 16,
+                 index_kpool = 4, n_group = 1, topk_group = 1, routed_scaling_factor = 2.5, rms_norm_eps = 1e-5, hc_mult = 4, hc_eps = 1e-6,
+                 hc_sinkhorn_iters = 4, swiglu_limit = 10.0, max_position_embeddings = 4096, layer_types = ["linear_attention"] * 3 + ["deepseek_sparse_attention"],
+                 indexer_types = ["full"] * 4, mlp_layer_types = ["dense"] + ["sparse"] * 3,
+                 linear_attn_config = {"num_heads": 2, "gate_lower_bound": -5.0, "head_dim": 64, "short_conv_kernel_size": 4, "kda_layers": [0, 1, 2], "full_attn_layers": [3]})
+
+
+def test_a_nextn_head_omlx_stores_as_mtp_blocks_is_built_as_from_its_source_layout(monkeypatch, tmp_path):
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten, tree_unflatten
+    from mlx_vlm.speculative.drafters import glm5_next_mtp
+    from unsloth_zoo.mlx import speculative
+    head = glm5_next_mtp.Model(glm5_next_mtp.ModelConfig.from_dict({"model_type": "glm5_next_mtp", "text_config": GLM5_TEXT, "block_size": 2}))
+    # Distinct values per tensor, so a mapping that swaps two same-shaped tensors (enorm, hnorm) shows.
+    head.update(tree_unflatten([(key, mx.random.normal(value.shape, key = mx.random.key(i)) * 0.05) for i, (key, value) in enumerate(tree_flatten(head.parameters()))]))
+    default, wide = {"group_size": 64, "bits": 4, "mode": "affine"}, {"group_size": 64, "bits": 8, "mode": "affine"}
+    nn.quantize(head, class_predicate = lambda name, layer: hasattr(layer, "to_quantized") and not name.endswith("mlp.gate")
+                and layer.weight.shape[-1] % 64 == 0 and (wide if ".self_attn." in name or "shared_experts" in name else default))
+    expected = dict(tree_flatten(head.parameters()))
+    # As omlx converts the nextn layer: the decoder layer as the target's own sanitize leaves it, the fusion tensors beside it.
+    stored, split = {}, {"mlp.shared_experts.gate_up_proj": (("gate_proj", "up_proj"), 2), "self_attn.qkv_a_proj": (("q_a_proj", "kv_a_proj_with_mqa"), [GLM5_TEXT["q_lora_rank"]])}
+    for key, value in expected.items():
+        module, leaf = key.rsplit(".", 1)
+        name = f"mtp.0.block.{module.removeprefix('mtp_block.')}" if module.startswith("mtp_block.") else "mtp.0.norm" if module == "shared_head_norm" else f"mtp.0.{module}"
+        fused = next((part for part in split if module.endswith(part)), None)
+        if fused is None:
+            stored[f"language_model.{name}.{leaf}"] = value
+            continue
+        (first, second), at = split[fused]
+        base = name.removesuffix(fused.split(".")[-1])
+        stored.update(zip((f"language_model.{base}{first}.{leaf}", f"language_model.{base}{second}.{leaf}"), mx.split(value, at, axis = 0)))
+    stored["language_model.model.norm.weight"] = mx.ones(8)  # a trunk tensor the head must not take
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), stored, metadata = {"format": "mlx"})
+    overrides = {key.rsplit(".", 1)[0]: wide for key in stored if key.endswith(".scales") and (".self_attn." in key or "shared_experts" in key)}
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "glm5_next", "text_config": GLM5_TEXT, "quantization": {**default, **overrides}}))
+    monkeypatch.setattr(speculative, "_built", lambda wrapper, model, target, **kwargs: model)
+    assert speculative.has_native_mtp_head(tmp_path)
+    built = dict(tree_flatten(speculative.native_mtp_drafter(tmp_path, None).parameters()))
+    assert built.keys() == expected.keys() and all(mx.array_equal(built[key], value) for key, value in expected.items())
+
+
 def test_a_separate_mtp_head_checkpoint_is_wrapped_as_the_built_in_head(qwen_mtp, tmp_path):
     from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_model_path
     from unsloth_zoo.mlx.speculative import MTPDrafter, companion_drafter
-    assert detect_mtp_splitter(source := get_model_path(MTP_MODEL)).split(str(source), str(tmp_path)) and type(companion_drafter(tmp_path, qwen_mtp[0])) is MTPDrafter
+    assert detect_mtp_splitter(source := get_model_path(MTP_MODEL)).split(str(source), str(tmp_path)) and type(companion_drafter(tmp_path, qwen_mtp[0])) is MTPDrafter and qwen_mtp[0]._unsloth_speculates
 
+
+
+def test_an_assistant_merged_into_its_target_checkpoint_is_built_as_its_own_checkpoint_would_be(gemma, tmp_path):
+    from mlx.utils import tree_flatten
+    from mlx_vlm.utils import get_model_path
+    from unsloth_zoo.mlx.speculative import AssistantDrafter, has_native_mtp_head, native_mtp_drafter
+    model, _, companion = gemma
+    assistant, target = get_model_path(GEMMA_ASSISTANT), json.loads((get_model_path(GEMMA) / "config.json").read_text())
+    # As omlx merges it: the assistant's config inside the target's, its weights under language_model.mtp.
+    target["text_config"]["mtp_assistant_config"] = json.loads((assistant / "config.json").read_text())
+    tensors = {f"language_model.mtp.{key}": value for key, value in mx.load(str(assistant / "model.safetensors")).items()}
+    # Beside a target tensor, which the build must leave out.
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {**tensors, "language_model.model.norm.weight": mx.ones(8)}, metadata = {"format": "mlx"})
+    (tmp_path / "config.json").write_text(json.dumps(target))
+    assert has_native_mtp_head(tmp_path) and not has_native_mtp_head(get_model_path(GEMMA))
+    drafter = native_mtp_drafter(tmp_path, model)
+    built, expected = dict(tree_flatten(drafter.model.parameters())), dict(tree_flatten(companion.model.parameters()))
+    assert type(drafter) is AssistantDrafter and built.keys() == expected.keys()
+    # Dtypes too: the stored int64 token ordering is the assistant's int32 only after its own sanitize.
+    assert all(built[key].dtype == value.dtype and mx.array_equal(built[key], value) for key, value in expected.items())
+    # Only a Gemma 4 assistant drafts against its target's KV, so neither another family's nor another Gemma 4 drafter kind is a head.
+    for model_type in ("muse_glimmer_assistant", "gemma4_dflash"):
+        target["text_config"]["mtp_assistant_config"]["model_type"] = model_type
+        (tmp_path / "config.json").write_text(json.dumps(target))
+        assert not has_native_mtp_head(tmp_path)
 
 
 def test_assistant_drafts_from_the_target_kv_alone_and_in_batches(gemma, monkeypatch):
@@ -952,8 +2481,10 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
     assert list(ar.run_speculative_rounds(model, object(), max_tokens = 1)) == [("upstream", None)]
     draft, rounds, started = SpeculativeDraft(_script(("draft", 3)) if native else _script(("copy", 4), ("plain", 3)), _drafter(model, max_lag = 32) if native else None), [], []
     monkeypatch.setattr(draft.controller, "record_round", lambda plan, *args, **kwargs: rounds.append(plan))
+    kept, append = [], ar.SpeculativePrefill.append
+    monkeypatch.setattr(ar.SpeculativePrefill, "append", lambda self, output: append(self, output) or kept.append(sum(int(chunk.shape[1]) for chunk in self.chunks)))
     if native:
-        start = draft.drafter.start
+        draft.drafter.prompt_tail, start = 48, draft.drafter.start
         monkeypatch.setattr(draft.drafter, "start", lambda prompt, hidden, pending: started.append(hidden) or start(prompt, hidden, pending))
     generate = lambda **kwargs: [int(token) for token, _ in ar.generate_step(mx.array([ids[0]]), model, None, None, max_tokens = 96, temperature = 0.0, **kwargs)]
     for prefill_step_size in (16, None):  # unchunked, the final forward returns every prompt position's hidden
@@ -964,20 +2495,50 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
         assert generate(draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = prefill_step_size) == plain
         draft.prepare(ids[0], SamplingParams(), [penalty := _presence()])
         assert generate(draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = prefill_step_size, logits_processors = [penalty]) == penalized != plain
-    assert rounds and [hidden.shape[1] for hidden in started] == ([32] * 4 if native else []) and draft.draft_n >= draft.draft_n_accepted > 0
+        favoured = generate(prefill_step_size = prefill_step_size, logits_processors = [_parity()])
+        draft.prepare(ids[0], SamplingParams(), [favour := _parity()])
+        assert generate(draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = prefill_step_size, logits_processors = [favour]) == favoured != plain
+        assert favour.committed[-1] == favoured
+    assert rounds and [hidden.shape[1] for hidden in started] == ([48] * 6 if native else []) and draft.draft_n >= draft.draft_n_accepted > 0
+    assert not native or (len(ids[0]) > max(kept) == 48 and not any(draft.drafter.dropped.values()))
     # The same positions from six chunks as from one forward: chunking moves them ~0.07 on average, a one-position shift ~3.3.
-    assert not native or (started[0] - started[2]).abs().mean().item() < 0.5
+    assert not native or (started[0] - started[3]).abs().mean().item() < 0.5
     with pytest.raises(RuntimeError, match = "prepare"):
         generate(draft_model = draft, draft_kind = draft.draft_kind)
 
+
+def test_a_copies_only_draft_prefills_in_chunks_on_a_target_naming_no_chunking_policy(qwen, monkeypatch):
+    import importlib
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.speculative import SpeculativeDraft, install_speculative_seam
+    ar, (model, ids), lm = importlib.import_module("mlx_vlm.generate.ar"), qwen, type(qwen[0].language_model)
+    monkeypatch.delattr(lm, "chunked_prefill_policy")  # as mlx-vlm's Qwen3 text model, which then prefills a drafted prompt whole
+    [monkeypatch.setattr(ar, name, getattr(ar, name)) for name in ("run_speculative_rounds", "SpeculativePrefill", "_chunked_prefill_enabled")]
+    install_speculative_seam()
+    widths, forward = [], lm.__call__
+    rows = lambda args, kwargs: next(x.shape[1] for x in (*args, kwargs.get("inputs"), kwargs.get("inputs_embeds")) if getattr(x, "ndim", 0) >= 2)
+    monkeypatch.setattr(lm, "__call__", lambda self, *args, **kwargs: widths.append(rows(args, kwargs)) or forward(self, *args, **kwargs))
+    generate = lambda **kwargs: [int(token) for token, _ in ar.generate_step(
+        mx.array([ids[0]]), model, None, None, max_tokens = 32, temperature = 0.0, prefill_step_size = 16, **kwargs)]
+    plain = generate()
+    widths.clear()
+    (copies := SpeculativeDraft(_script(("copy", 4), ("plain", 3)))).prepare(ids[0], SamplingParams())
+    assert generate(draft_model = copies, draft_kind = copies.draft_kind) == plain and len(ids[0]) > 16 >= max(widths)
+    gate = lambda draft: ar._chunked_prefill_enabled(model, input_ids = mx.array([ids[0]]), draft_model = draft, draft_kind = "mtp")
+    assert gate(copies) and not gate(SpeculativeDraft(_script(("draft", 3)), object()))
+
+
 @pytest.mark.parametrize("companion", [None, "z-lab/Qwen3.5-4B-DFlash"])
 def test_a_lazy_drafter_weighs_its_checkpoint_and_holds_a_started_row_without_allocating(request, companion):
-    from mlx_vlm.utils import get_model_path, load
+    from mlx_vlm.utils import load
     from unsloth_zoo.mlx import speculative
     model = request.getfixturevalue("qwen_mtp")[0] if companion is None else load("mlx-community/Qwen3.5-4B-4bit", lazy = True)[0]
     before, lazy = mx.get_active_memory(), _drafter(model, lazy = True) if companion is None else speculative.companion_drafter(companion, model, lazy = True)
     grown = speculative.probe_drafter(model, lazy, 40) and mx.get_active_memory() - before  # before any eager build below
-    stored = _drafter(model).weight_bytes if companion is None else sum(a.nbytes for a in mx.load(str(get_model_path(companion) / "model.safetensors")).values())
+    mx.reset_peak_memory()
+    held, stored = mx.get_active_memory(), (_drafter(model) if companion is None else speculative.companion_drafter(companion, model)).weight_bytes
+    # An eager build quantizes a bf16 DFlash drafter before evaluating it, so never holds the bf16 weights whole.
+    assert companion is None or mx.get_peak_memory() - held < 2 * stored
     assert grown < lazy.weight_bytes / 100 and lazy.weight_bytes == stored > 0 and (companion or _probe_matches_a_started_row(model, _drafter(model), list(range(1, 41)), lambda started: started[1]))
 
 
@@ -994,12 +2555,13 @@ def test_other_mtp_heads_match_a_head_that_never_drafted_even_in_a_wrapping_wind
     from mlx_vlm.speculative.drafters import deepseek_v4_mtp
     from mlx_vlm.utils import get_model_and_args
     from unsloth_zoo.mlx.generate import SamplingParams
-    from unsloth_zoo.mlx.speculative import HeadDrafter
+    from unsloth_zoo.mlx.speculative import HeadDrafter, _head_drafter
     config = dict(model_type = "deepseek_v4", vocab_size = 256, hidden_size = 64, moe_intermediate_size = 32, num_hidden_layers = 2, compress_ratios = [0, 4],
                   num_attention_heads = 2, head_dim = 16, qk_rope_head_dim = 8, q_lora_rank = 16, o_groups = 1, o_lora_rank = 16, n_routed_experts = 4,
                   num_experts_per_tok = 2, index_n_heads = 1, index_head_dim = 16, num_hash_layers = 0, hc_mult = 2, sliding_window = 16)
     model = (arch := get_model_and_args(dict(config))[0]).Model(arch.ModelConfig.from_dict(config))
     head = deepseek_v4_mtp.Model(deepseek_v4_mtp.ModelConfig.from_dict({"model_type": "deepseek_v4_mtp", "text_config": config}))
+    assert _head_drafter(head, model, max_lag = 4).prompt_tail == 4  # only qwen4_exp's head primes on a longer tail
     drafter, chunks, compared, prompt = HeadDrafter(head, model, max_lag = 4), [[]], [], [(7 * i + 3) % 200 + 1 for i in range(37)]
     start, push, catch_up, draft = drafter.start, drafter.push, drafter.catch_up, drafter.draft
     drafter.start = lambda prompt, hidden, token: start(prompt, hidden[:, -20:], token)  # as after a reused prompt prefix
@@ -1016,8 +2578,122 @@ def test_other_mtp_heads_match_a_head_that_never_drafted_even_in_a_wrapping_wind
     drafter.draft = against_replay
     _run(model, [prompt], 96, _script(("draft", 3), ("draft", 3), ("plain", 12), ("copy", 4), ("draft", 2)), SamplingParams(), drafter = drafter)
     assert len(compared) > 6 and all(compared)
+    assert [len(t) for t, _ in chunks[0]] == [20]  # a head with no tail past max_lag primes in one replay
     assert max(sum(len(t) for t, _ in chunk) for chunk in chunks[1:]) <= 8  # max_lag - 1 pending plus one 5-token round
     assert _probe_matches_a_started_row(model, HeadDrafter(head, model), prompt, lambda started: started[0].head._cache)
+
+
+@pytest.mark.parametrize("accept_all", [False, True])
+def test_a_qwen4_head_primes_a_long_tail_in_max_lag_pieces_and_holds_only_verified_pairs(qwen4, monkeypatch, accept_all):
+    import copy
+    from mlx import nn
+    from mlx.utils import tree_map
+    from mlx_vlm.speculative.drafters.qwen4_exp_mtp.config import Qwen4ExpMTPConfig
+    from mlx_vlm.speculative.drafters.qwen4_exp_mtp.qwen4_exp_mtp import Qwen4ExpMTPDraftModel
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.inference import exact_qsa_trim
+    from unsloth_zoo.mlx.speculative import HeadDrafter, MTPDrafter, SpeculativeDraft, _head_drafter
+    model, ids = qwen4
+    head = Qwen4ExpMTPDraftModel(Qwen4ExpMTPConfig(text_config = model.language_model.args))
+    head.update(tree_map(lambda a: mx.random.normal(a.shape, key = mx.random.key(a.size)) * 0.05 if mx.issubdtype(a.dtype, mx.floating) else a, head.parameters()))
+    head.set_dtype(mx.bfloat16)
+    monkeypatch.setattr(model, "_unsloth_speculates", False, raising = False)
+    if accept_all: monkeypatch.setattr(model.language_model, "lm_head", nn.Linear(512, 1024, bias = False).update({"weight": mx.zeros((1024, 512), mx.bfloat16)}))
+    drafter = _head_drafter(head, model, max_lag = 4)
+    # The prefill keeps the hidden states of SpeculativeDraft.prompt_tail positions.
+    assert SpeculativeDraft(None, drafter).prompt_tail == MTPDrafter.prompt_tail and HeadDrafter(head, model, max_lag = 4).prompt_tail == 4
+    with exact_qsa_trim(head): _assert_head_early_replay(kept := type(drafter)(head, model), ids, accept_all)
+    verdicts = dict(kept._replay_verdicts)
+    _assert_head_early_replay(kept, ids, accept_all)  # the same drafter, now with the native trim, which drops the pooled indexer blocks
+    assert not any(kept._replay_verdicts.values())
+    lane = Qwen4ExpMTPDraftModel(Qwen4ExpMTPConfig(text_config = model.language_model.args)).update(head.parameters())
+    nn.quantize(lane, group_size = 32, bits = 4, class_predicate = lambda path, m: hasattr(m, "to_quantized") and not path.endswith("mlp.gate"))
+    stock = lane.fc_hidden
+    lane.fc_hidden = lambda x: stock(x) + (x.shape[1] == 4) * 0.25  # as a matmul whose kernel changes at 4 tokens' stream rows
+    with exact_qsa_trim(lane):
+        _assert_head_early_replay(lane := _head_drafter(lane, model), ids, accept_all)
+    assert verdicts == lane._replay_verdicts == {(3, 1): True, (4, 1): True, (4, 2): True}
+    chunks, compared, started, start, push, catch_up, draft = [[]], [], [], drafter.start, drafter.push, drafter.catch_up, drafter.draft
+    drafter.start = lambda *args: (start(*args), started.append(len(chunks)))[0]
+    drafter.push = lambda row, tokens, hidden: chunks[-1].append((list(tokens), hidden)) or push(row, tokens, hidden)
+    drafter.catch_up = lambda cache, rows: (catch_up(cache, rows), chunks.append([]))[0]
+    state = lambda h: [h._seed_hidden, *(a for entry in h._cache for a in entry.state if isinstance(a, mx.array))]
+    prefetched, prefetch = [], drafter.prefetch
+    def ahead(rows):
+        prefetch(rows)
+        prefetched.append([(row, row.replay) for row in rows if getattr(row, "replay", None) is not None])
+    drafter.prefetch = ahead
+    def against_replay(cache, rows, depth, target):
+        assert all(row.head is p[2] for row, p in (prefetched[-1] if prefetched else []) if tuple(map(id, p[1])) == tuple(id(h) for _, h in chunks[-2]))
+        (fresh := copy.copy(head)).reset(model)
+        for chunk in filter(None, chunks):
+            tokens, hidden = sum((t for t, _ in chunk), []), mx.concatenate([h for _, h in chunk])[None]
+            fresh.accept_verified_tokens(hidden, mx.array([tokens[:-1]]), len(tokens) - 1, tokens[-1:], None, greedy = True)
+        compared.append(all(a.shape == b.shape and mx.array_equal(a, b).item() for a, b in zip(state(rows[0].head), state(fresh))))
+        return draft(cache, rows, depth, target)
+    drafter.draft = against_replay
+    _run(model, [ids[0]], 64, _script(("draft", 3), ("draft", 3), ("plain", 6), ("copy", 4), ("draft", 2)), SamplingParams(), drafter = drafter)
+    # The prompt went in max_lag pieces, all of it, and every draft started from a cache of verified pairs alone.
+    priming = [len(tokens) for chunk in chunks[: started[0]] for tokens, _ in chunk]
+    assert sum(priming) == len(ids[0]) and max(priming) == 4
+    assert len(compared) > 4 and all(compared) and any(prefetched)
+
+
+def test_a_qwen4_head_drafts_from_the_target_tables_shortlist(qwen4, monkeypatch):
+    from mlx.utils import tree_map
+    from mlx_vlm.speculative.drafters.qwen4_exp_mtp.config import Qwen4ExpMTPConfig
+    from mlx_vlm.speculative.drafters.qwen4_exp_mtp.qwen4_exp_mtp import Qwen4ExpMTPDraftModel
+    from unsloth_zoo.mlx import speculative as S
+    from unsloth_zoo.mlx.generate import SamplingParams
+    [monkeypatch.setattr(S, name, value) for name, value in (("_SHORTLIST_KEEP", 2), ("_SHORTLIST_COLUMNS", 128))]
+    model, ids = qwen4
+    head = Qwen4ExpMTPDraftModel(Qwen4ExpMTPConfig(text_config = model.language_model.args))
+    head.update(tree_map(lambda a: mx.random.normal(a.shape, key = mx.random.key(a.size)) * 0.05 if mx.issubdtype(a.dtype, mx.floating) else a, head.parameters()))
+    head.set_dtype(mx.bfloat16)
+    monkeypatch.setattr(model, "_unsloth_speculates", False, raising = False)
+    drafter, table = S._head_drafter(head, model, max_lag = 4), model.language_model.lm_head
+    assert S.HeadDrafter(head, model)._shortlist is None and drafter._shortlist.table is table
+    (full_head := S._head_drafter(head, model, max_lag = 4))._shortlist = None
+    native = _run(model, ids, 48, _script(("draft", 3), ("copy", 4)), SamplingParams(), drafter = full_head)
+    calls, logits = [], S._ShortlistHead.logits
+    monkeypatch.setattr(S._ShortlistHead, "logits", lambda self, hidden: calls.append((hidden, logits(self, hidden))) or calls[-1][1])
+    out, drafted, _ = _run(model, ids, 48, _script(("draft", 3), ("copy", 4)), SamplingParams(), drafter = drafter)
+    # Verification alone decides the output; only the proposals differ.
+    assert out == native[0] and all(n for n, _ in drafted.values())
+    hidden, sparse = (mx.concatenate([c[i].reshape(-1, c[i].shape[-1]) for c in calls]) for i in (0, 1))
+    full, kept = table(hidden), mx.isfinite(sparse)
+    assert (kept.sum(-1) == 2).all().item() and mx.allclose(mx.where(kept, sparse, 0), mx.where(kept, full, 0), atol = 0.05).item()
+    picks = mx.argmax(sparse, axis = -1)
+    assert mx.array_equal(picks, drafter._shortlist(hidden)).item() and not mx.array_equal(picks, mx.argmax(full, axis = -1)).item()
+
+
+def _assert_head_early_replay(drafter, ids, cancel):
+    import copy
+    from unsloth_zoo.mlx import speculative as S
+    dims = drafter.model.args.hidden_size * drafter.model.args.hc_count
+    for width in (2, 3, 4, 5):
+        for accepted in range(width):
+            row, _ = drafter.start(ids[0][:8], mx.random.normal((1, 8, dims)).astype(mx.bfloat16), ids[0][8])
+            drafter.draft([], [row], width - 1, [])
+            native = copy.copy(row)
+            native.head, native.tokens, native.hidden = copy.copy(row.head), [], []
+            native.head._cache = copy.deepcopy(row.head._cache)
+            hidden, tokens = mx.random.normal((width, dims)).astype(mx.bfloat16), mx.array(ids[0][9:9 + width])
+            early = drafter.prepare_replay(row, hidden, tokens, mx.array(accepted))
+            assert (early is not None) == (width <= 4)
+            for current in (row, native):
+                drafter.settle([], [current], width - 2, [0])
+                drafter.push(current, tokens.tolist()[:accepted + 1], hidden[:accepted + 1])
+            S.HeadDrafter.catch_up(drafter, [], [native])
+            if early is not None:
+                assert early(accepted) == (accepted == width - 1 or accepted > 0 and drafter._replay_verdicts[width, accepted])
+                if cancel:
+                    early(None)
+                    assert getattr(row, "replay", None) is None
+            drafter.catch_up([], [row])
+            state = lambda h: _state(SimpleNamespace(logits = h._seed_token, hidden_states = h._seed_hidden), h._cache)
+            assert row.head._next_position == native.head._next_position and _same(state(row.head), state(native.head))
+            assert mx.array_equal(drafter.draft([], [row], 3, []), drafter.draft([], [native], 3, [])).item()
 
 
 def test_eagle3_narrower_than_its_target_drafts_from_the_concatenated_layers_row_by_row(qwen):
@@ -1036,6 +2712,7 @@ def test_eagle3_narrower_than_its_target_drafts_from_the_concatenated_layers_row
 @pytest.mark.parametrize("companion", [None, "z-lab/Qwen3.5-4B-DFlash"])
 def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, monkeypatch, companion):
     from copy import deepcopy
+    from dataclasses import replace
     from mlx_vlm.models.cache import make_prompt_cache
     from unsloth_zoo.mlx.generate import BatchStream, GenerationRequest, SamplingParams
     from unsloth_zoo.mlx.speculative import ContextDrafter, SpeculativeDraft
@@ -1046,6 +2723,7 @@ def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, 
     banked, size = {}, len(tok.encode(texts[0], add_special_tokens = False))
     state = SimpleNamespace(checkpoint = lambda count, cache: banked.update({count: deepcopy(cache)}))
     state.open = lambda prompt: (deepcopy(banked[max(banked)]) if banked else make_prompt_cache(model.language_model), [size - 9, size - 1])
+    retired, state.retire = [], lambda take: retired.append(take()) or mx.eval([entry.state for entry in retired[-1]])
     resumed = GenerationRequest(prompt = texts[0], max_tokens = 24, prompt_cache_state = state)
     greedy = [GenerationRequest(prompt = texts[0], max_tokens = 40), GenerationRequest(prompt = texts[1], max_tokens = 200)]
     sampled = GenerationRequest(prompt = texts[1], max_tokens = 32, sampling = SamplingParams(temperature = 0.8, top_k = 20, seed = 7))
@@ -1070,7 +2748,8 @@ def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, 
         return results
 
     by_ids = GenerationRequest(prompt_token_ids = tok.encode(texts[0], add_special_tokens = False), max_tokens = 40)
-    batched, alone = run({0: greedy[0], 3: greedy[1], 6: sampled, 7: greedy[2], 8: resumed, 9: by_ids}), run({0: sampled})
+    undrafted = replace(greedy[0], drafts = False)
+    batched, alone = run({0: greedy[0], 3: greedy[1], 6: sampled, 7: greedy[2], 8: resumed, 9: by_ids, 10: undrafted}), run({0: sampled})
     for request, result, expected in zip(greedy, (batched[0], batched[3], batched[7]), upstream):
         n = len(result.token_ids)
         # A stop token ends the reply without joining its text.
@@ -1078,12 +2757,17 @@ def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, 
         assert result.logprobs == pytest.approx([logprobs[token].item() for token, logprobs in expected[:n]], abs = 0.02)
     assert (batched[6].token_ids, batched[6].logprobs) == (alone[0].token_ids, alone[0].logprobs)
     assert batched[9].token_ids == batched[0].token_ids  # a token-id prompt prefills as its rendered twin
+    assert (batched[10].token_ids, batched[10].draft_tokens) == (batched[0].token_ids, 0)
     assert [batched[0].finish_reason, batched[3].finish_reason] == ["length", "stop"]
     assert batched[0].draft_tokens >= batched[0].accepted_draft_tokens > 0
     assert (batched[8].cached_token_count, sorted(banked)) == (0, [size - 9, size - 1])
     del banked[size - 1]
     warm = run({0: resumed})[0]
     assert (warm.cached_token_count, sorted(banked), warm.token_ids) == (size - 9, [size - 9, size - 1], batched[8].token_ids) and warm.draft_tokens > 0
+    run({0: replace(resumed, max_tokens = 1)})
+    kv = [(i, entry) for i, entry in enumerate(banked[size - 9]) if hasattr(entry, "keys")]
+    assert len(retired) == 3 and kv and all(mx.array_equal(getattr(taken[i], name)[..., : size - 9, :], getattr(entry, name)[..., : size - 9, :]).item()
+                                             for taken in retired for i, entry in kv for name in ("keys", "values"))
     # Rows that join mid-flight draft from the features their own prefill captured.
     assert not companion or all(batched[row].draft_tokens > 0 for row in (3, 6))
 
@@ -1114,15 +2798,371 @@ def test_speculative_batch_stream_leaves_no_row_behind_when_admission_fails(qwen
         assert stream.add(replace(request, max_tokens = 12)) is not None and (state := stream._session.engine._rows[0]) and next(events := stream.iter_step()) and (before := state.emitted) and stream.close() is None and (list(events), state.emitted) == ([], before)
 
 
-def _tiny_companion(model, repo):
+def test_speculative_batch_rows_prefill_on_the_batch_step(qwen, monkeypatch):
+    from unsloth_zoo.mlx import generate
+    from unsloth_zoo.mlx.speculative import SpeculativeDraft
+    model, seen, admit = qwen[0], [], SpeculativeDraft.admit
+    monkeypatch.setattr(model, "_is_vlm_model", True, raising = False)
+    monkeypatch.setattr(SpeculativeDraft, "admit", lambda self, *args, **kwargs: (seen.append(kwargs.get("prefill_step_size")), admit(self, *args, **kwargs))[1])
+    for step in (None, 8):
+        with generate.BatchStream(model, None, defaults = generate.GenerationDefaults(max_tokens = 2, prefill_step_size = step), speculative = SpeculativeDraft(_rounds_only())) as stream:
+            stream.add(generate.GenerationRequest(prompt = "Name three colours."))
+    assert seen == [None, 8]
+
+
+def _tiny_companion(model, repo, **overrides):
     from mlx_vlm.speculative.drafters import dflash2, dspark, qwen3_dflash
     from mlx_vlm.utils import load_config
     config, n = load_config(repo), (text := model.language_model.config.text_config).num_hidden_layers
     config.update(hidden_size = text.hidden_size, vocab_size = text.vocab_size, num_hidden_layers = 2, num_attention_heads = 4, num_key_value_heads = 2,
-                  head_dim = 64, intermediate_size = 256, num_target_layers = n, layer_types = config.get("layer_types", [])[:2])
+                  head_dim = 64, intermediate_size = 256, num_target_layers = n, layer_types = config.get("layer_types", [])[:2], **overrides)
     config["dflash_config"].update(target_layer_ids = [1, n // 2, n - 2], num_target_layers = n, selector_rank = 16, markov_rank = 16)
     module = {"DFlash2DraftModel": dflash2, "DSparkDraftModel": dspark}.get(config["architectures"][0], qwen3_dflash)
     return module.Model(module.ModelConfig.from_dict(config))
+
+
+def test_unquantized_companion_mtp_heads_and_dflash_drafters_load_at_4_bits_unless_turned_off(qwen, qwen_mtp, monkeypatch, tmp_path):
+    import shutil
+    import mlx.nn as nn
+    from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_model_path
+    from unsloth_zoo.mlx import speculative
+    detect_mtp_splitter(source := get_model_path(MTP_MODEL)).split(str(source), str(split := tmp_path / "bf16"))
+    shutil.copytree(split, packed := tmp_path / "packed")  # the same head with only its MLP stored at 4 bits
+    for file in split.glob("*.safetensors"):
+        tensors = mx.load(str(file))
+        for key in [key for key in tensors if ".mlp." in key and key.endswith("_proj.weight")]:
+            tensors[key], tensors[key[: -len("weight")] + "scales"], tensors[key[: -len("weight")] + "biases"] = mx.quantize(tensors[key], 64, 4)
+        mx.save_safetensors(str(packed / file.name), tensors, metadata = {"format": "mlx"})
+    (packed / "config.json").write_text(json.dumps({**json.loads((split / "config.json").read_text()), "quantization": {"group_size": 64, "bits": 4, "mode": "affine"}}))
+    def built(bits):
+        monkeypatch.delenv("UNSLOTH_MLX_DRAFTER_BITS", raising = False) if bits is None else monkeypatch.setenv("UNSLOTH_MLX_DRAFTER_BITS", bits)
+        dflash = _tiny_companion(qwen[0], "incoai/Qwen3.8-27B-DFlash2")
+        return speculative.companion_drafter(split, qwen_mtp[0]), speculative._built(speculative.ContextDrafter, dflash, qwen[0].language_model, quantize = True)
+    head, dflash = built(None)
+    # A partly quantized head keeps its full-precision layers; a head read whole from a checkpoint, as its own head or a companion, stays as stored.
+    kept, native, whole = (build(path, qwen_mtp[0]) for build, path in ((speculative.companion_drafter, packed), (speculative.native_mtp_drafter, source), (speculative.companion_drafter, source)))
+    plain_head, plain_dflash = built("0")
+    assert head.model.fc.bits == head.model.layers[0].mlp.up_proj.bits == dflash.model.fc.bits == dflash.model.layers[0].mlp.up_proj.bits == 4
+    assert type(plain_head.model.fc) is type(plain_dflash.model.fc) is nn.Linear and head.weight_bytes < plain_head.weight_bytes
+    assert type(kept.model.fc) is type(native.model.fc) is type(whole.model.fc) is nn.Linear and kept.model.layers[0].mlp.up_proj.bits == 4
+
+
+def test_a_dflash2_drafter_convolves_and_selects_its_drafts_bit_for_bit_in_fewer_kernels(qwen, monkeypatch):
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import CandidateSelector, GroupedDynamicCausalConv
+    from unsloth_zoo.mlx import inference, speculative
+    model, _ = qwen
+    ran, convolve, walk = [], inference._draft_convolution, inference._draft_selector
+    monkeypatch.setattr(inference, "_draft_convolution", lambda *args: ran.append("conv") or convolve(*args))
+    monkeypatch.setattr(inference, "_draft_selector", lambda *args: ran.append("walk") or walk(*args))
+    companion = _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2")
+    companion.set_dtype(mx.bfloat16)
+    drafter = speculative._built(speculative.ContextDrafter, companion, model.language_model, quantize = True)
+    convs = [m for _, m in drafter.model.named_modules() if isinstance(m, GroupedDynamicCausalConv)]
+    selector, size = drafter.model.candidate_selector, companion.config.hidden_size
+    assert convs and {type(m)._unsloth_fused_native for m in convs} == {GroupedDynamicCausalConv}
+    assert type(selector)._unsloth_fused_native is CandidateSelector
+    mx.random.seed(0)
+    conv = convs[-1]
+    conv.base_kernel = (mx.random.normal(conv.base_kernel.shape) * 0.1).astype(mx.bfloat16)   # loaded kernels are not zero
+    # Two rows of five positions, so a result that read the first row or position for all would differ.
+    hidden = mx.random.normal((2, 5, size)).astype(mx.bfloat16)
+    (prepared, dynamic), (native, native_dynamic) = conv.prepare(hidden), GroupedDynamicCausalConv.prepare(conv, hidden)
+    finished, native_finished = conv.finish(hidden, dynamic), GroupedDynamicCausalConv.finish(conv, hidden, native_dynamic)
+    assert mx.array_equal(prepared, native) and mx.array_equal(finished, native_finished)
+    assert prepared.dtype == native.dtype and finished.dtype == native_finished.dtype and ran == ["conv", "conv"]
+    with monkeypatch.context() as patch:   # a call the kernel refuses takes the compiled convolution, which matches too
+        patch.setattr(inference, "_draft_convolution", lambda *args: None)
+        assert mx.array_equal(conv.prepare(hidden)[0], native) and mx.array_equal(conv.finish(hidden, dynamic), native_finished)
+    # Logits on a coarse grid tie often: candidates must come in argpartition's order for the walk to break ties alike.
+    logits = (mx.round(mx.random.normal((2, 5, selector.predecessor_codebook.weight.shape[0])) * 2) / 2).astype(mx.bfloat16)
+    top, expected = inference._top_candidates(logits, selector.top_k), mx.argpartition(logits, -selector.top_k, axis = -1)[..., -selector.top_k:]
+    assert mx.array_equal(top, expected) and top.dtype == expected.dtype
+    greedy, anchors = lambda scores: mx.argmax(scores, axis = -1), mx.array([3, 7])
+    drafts, expected = selector.select(hidden, logits, anchors, greedy), CandidateSelector.select(selector, hidden, logits, anchors, greedy)
+    assert mx.array_equal(drafts, expected) and drafts.dtype == expected.dtype and ran[-1] == "walk"
+    # A k past every chunk keeps the one argpartition.
+    assert mx.array_equal(inference._top_candidates(logits, 600), mx.argpartition(logits, -600, axis = -1)[..., -600:])
+    # On the CPU, whose argpartition does not sort, the native methods run.
+    served = len(ran)
+    mx.set_default_device(mx.cpu)
+    try:
+        mx.eval(selector.select(hidden, logits, anchors, greedy), conv.prepare(hidden)[0])
+    finally:
+        mx.set_default_device(mx.gpu)
+    assert len(ran) == served
+    # Methods rebound upstream are what a fused module then runs.
+    monkeypatch.setattr(GroupedDynamicCausalConv, "prepare", lambda self, hidden: ("native", None))
+    monkeypatch.setattr(CandidateSelector, "select", lambda self, *args: "native")
+    assert conv.prepare(hidden)[0] == "native" and selector.select(hidden, logits, anchors, greedy) == "native"
+
+
+@pytest.mark.parametrize("bits,dtype", [(4, mx.bfloat16), (8, mx.bfloat16), (4, mx.float16), (8, mx.float16)])
+def test_sparse_draft_head_refines_each_shortlisted_row(monkeypatch, bits, dtype):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul
+    readers, lane_qmm = [], matmul.lane_qmm
+    monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: readers.append(kwargs["reader"]) or lane_qmm(*args, **kwargs))
+    for group_size, N in itertools.product((64, 128), (8200, 8224, 16416)):
+        K = 256
+        head = nn.QuantizedLinear(K, N, bias = False, group_size = group_size, bits = bits).eval()
+        head.set_dtype(dtype)
+        weight = mx.dequantize(head.weight, head.scales.astype(mx.float32), head.biases.astype(mx.float32), group_size = group_size, bits = bits)
+        shape = inference._sparse_head_shape(head)
+        hidden = mx.random.normal((2, 3, K), key = mx.random.key(17)).astype(dtype)
+        for sign in (-1, 1):
+            changed = mx.concatenate([hidden[:1], hidden[1:] * sign], axis = 0)
+            ids, values = inference._sparse_head_candidates(head, changed, shape)
+            flat = changed.reshape(-1, K)
+            expected = mx.sum(flat[:, None].astype(mx.float32) * weight[ids].astype(mx.float32), axis = -1)
+            magnitude = mx.sum(mx.abs(flat[:, None].astype(mx.float32) * weight[ids].astype(mx.float32)), axis = -1)
+            assert values.dtype == dtype and mx.all(ids < N)
+            assert mx.all(mx.abs(values.astype(mx.float32) - expected) <= mx.finfo(dtype).eps * mx.abs(expected) + 2e-5 * magnitude)
+            reversed_values = matmul._lane_indexed(flat[::-1], head.weight, head.scales, head.biases, ids[::-1, ::-1], group_size, bits)
+            assert mx.array_equal(reversed_values.view(mx.uint16), values[::-1, ::-1].view(mx.uint16))
+        changed = mx.concatenate([hidden[:1], mx.concatenate([hidden[1:, :, :K // 2], -hidden[1:, :, K // 2:]], axis = -1)])
+        before_ids, before_values = inference._sparse_head_candidates(head, hidden, shape)
+        after_ids, after_values = inference._sparse_head_candidates(head, changed, shape)
+        assert mx.array_equal(before_ids, after_ids) and mx.array_equal(before_values[:3], after_values[:3])
+        assert not mx.array_equal(before_values[3:], after_values[3:])
+    assert set(readers) == {matmul.lane_shortlist_reader(6, bits)}   # chosen by shape
+    assert inference._sparse_head_candidates(head, hidden[:, :1], shape) and readers[-1] == matmul.lane_shortlist_reader(2, bits)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_radix_shortlist_keeps_the_top_columns_and_the_lowest_tied_ones(dtype):
+    from unsloth_zoo.mlx import matmul
+    for N in (520, 8192, 8200, 16400, 70000):
+        base = mx.random.normal((7, N), key = mx.random.key(N)).astype(dtype)
+        signed_zeros = mx.where(mx.arange(N)[None] % 2 == 0, mx.array(0.0, dtype = dtype), mx.array(-0.0, dtype = dtype))
+        rows = [base, mx.round(base * 2) / 2, mx.zeros_like(base), mx.where(mx.arange(N)[None] % 11 == 0, -float("inf"), base),
+                mx.broadcast_to(mx.where(mx.arange(N)[None] < 100, mx.array(1.0, dtype = dtype), signed_zeros), base.shape),
+                mx.where(mx.arange(N)[None] % 5 == 0, mx.array(float("nan"), dtype = dtype), base),
+                mx.where(mx.arange(N)[None] % 7 == 0, mx.array(float("nan"), dtype = dtype),
+                         mx.where(mx.arange(N)[None] % 3 == 0, -float("inf"), base)),
+                mx.where(mx.arange(N)[None] % 10 == 0, base, mx.array(float("nan"), dtype = dtype))]
+        for values in rows:
+            got = matmul.radix_shortlist(values)
+            by_value = mx.argsort(-mx.where(mx.isnan(values), -float("inf"), values).astype(mx.float32), axis = -1)
+            nan_last = mx.argsort(mx.take_along_axis(mx.isnan(values), by_value, axis = -1).astype(mx.int32), axis = -1)
+            order = mx.take_along_axis(by_value, nan_last, axis = -1)[:, :512]
+            assert got.dtype == mx.uint32 and got.shape == (7, 512)
+            assert mx.array_equal(got, mx.sort(order, axis = -1).astype(mx.uint32))
+
+
+def test_sparse_draft_head_shortlists_from_the_blocks_a_reply_has_seen(monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul
+    monkeypatch.setattr(inference, "_HEAD_SCAN_BLOCK", 1024)
+    monkeypatch.setattr(inference, "_HEAD_SCAN_BASE", 2048)
+    N, K = 8224, 256
+    head = nn.QuantizedLinear(K, N, bias = False, group_size = 64, bits = 4).eval()
+    head.set_dtype(mx.float16)
+    shape = inference._sparse_head_shape(head)
+    weight = mx.dequantize(head.weight, head.scales.astype(mx.float32), head.biases.astype(mx.float32), group_size = 64, bits = 4)
+    hidden = mx.concatenate([mx.random.normal((1, 2, K), key = mx.random.key(3)), weight[mx.array([[5000, 3100]])]], axis = 1).astype(mx.float16)
+    coarse = lambda: matmul.lane_qmm(hidden[0], head.weight, head.scales, head.biases, 64, 4, groups = 2, reader = matmul.lane_shortlist_reader(4, 4))
+    scan = inference._HeadScan(N, [7, 3100])
+    for blocks in ({3, 8}, {3, 4, 8}):   # the last block is always read
+        ids, values = inference._sparse_head_candidates(head, hidden, shape, scan)
+        scanned = mx.array([i for i in range(N) if i < 2048 or i // 1024 in blocks])
+        assert scan.blocks == blocks and mx.array_equal(ids, scanned[matmul.radix_shortlist(coarse()[:, scanned])])
+        assert mx.array_equal(values, matmul._lane_indexed(hidden[0], head.weight, head.scales, head.biases, ids, 64, 4))
+        assert mx.any(ids[2] == 5000).item() == (4 in blocks) and mx.any(ids[3] == 3100).item()
+        scan.note([5000, N + 2000])
+    for name in ("scales", "biases"):   # a replaced array is not read through its old spans
+        head[name] = -head[name]
+        assert mx.array_equal(inference._sparse_head_candidates(head, hidden, shape, scan)[0], scanned[matmul.radix_shortlist(coarse()[:, scanned])])
+    scan.note([5200, 6200])   # past three quarters of the head
+    full = inference._sparse_head_candidates(head, hidden, shape)
+    assert scan.runs(head) is None and mx.array_equal(inference._sparse_head_candidates(head, hidden, shape, scan)[0], full[0])
+    assert mx.array_equal(inference._sparse_head_candidates(head, hidden, shape, inference._HeadScan(N + 8))[0], full[0])
+
+
+def test_context_rows_pass_their_reply_tokens_to_the_head_scan():
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.speculative import ContextDrafter
+    seen, scans, taken = [], [], []
+    class Scan:
+        def __init__(self, tokens):
+            self.tokens = list(tokens)
+        def note(self, tokens):
+            self.tokens += tokens
+    class Draft:
+        def head_scan(self, tokens):
+            scans.append(Scan(tokens))
+            return scans[-1]
+        def __call__(self, *args, scan = None):
+            seen.append(scan)
+            return mx.zeros((1, 7), mx.int32)
+        def tree(self, *args):
+            seen.append(args[-3])
+            taken.append(args[-2:])
+            return SimpleNamespace(tokens = mx.zeros(1))
+    class Head(nn.Module):
+        def bind(self, target):
+            pass
+        def draft_block(self, *args):
+            seen.append(args)
+            return mx.zeros((1, 7), mx.int32)
+        def make_cache(self):
+            return []
+    model = Head()
+    model.config = SimpleNamespace(block_size = 8, target_layer_ids = [0])
+    drafter, hidden = ContextDrafter(model, nn.Module()), mx.zeros((1, 2, 4))
+    plain, _ = drafter.start([1, 2], hidden, 3)
+    drafter._block(plain, 7)
+    assert plain.scan is None and len(seen[0]) == 6   # a drafter with no head scan is called as before
+    drafter._draft = Draft()
+    row, _ = drafter.start([1, 2], hidden, 3)
+    drafter.push(row, [4, 5], hidden[0])
+    assert row.scan is scans[0] and row.scan.tokens == [1, 2, 3, 4, 5]
+    drafter._block(row, 7)
+    drafter.push(row, [6], hidden[0, :1])
+    drafter.tree(row, 8)
+    row.tree_rows = 8
+    drafter.push(row, [7], hidden[0, :1])
+    drafter.sized_trees = True   # their trees go out in taking order
+    drafter.tree_calibration = SimpleNamespace(parameters = "fit")   # and grow by its fit
+    drafter.prefetch([row])
+    drafter.predraft_rows = 8
+    for row.tree_rows in (8, 0):
+        row.prefetched_tree = None
+        assert drafter.predraft(row, hidden[0], mx.array(1), mx.array(5))
+    assert seen[1:] == [row.scan] * 5 and row.scan.tokens == [1, 2, 3, 4, 5, 6, 7]
+    assert taken == [(False, None), (True, "fit"), (True, "fit")]
+
+
+def test_sparse_draft_selection_preserves_canonical_ties_and_call_ownership():
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import CandidateSelector
+    from unsloth_zoo.mlx import inference
+    selector = CandidateSelector(SimpleNamespace(vocab_size = 1024, hidden_size = 16, selector_rank = 8, selector_top_k = 8))
+    selector.set_dtype(mx.bfloat16)
+    hidden = mx.random.normal((2, 3, 16), key = mx.random.key(11)).astype(mx.bfloat16)
+    ids = (mx.arange(512)[None] + mx.arange(6)[:, None] * 71) % 1024
+    values = (mx.arange(512)[None] % 7 + mx.arange(6)[:, None] % 3).astype(mx.bfloat16)
+    anchors, greedy = mx.array([3, 7]), lambda logits: mx.argmax(logits, axis = -1)
+    def dense(candidate_ids, scores):
+        logits = mx.put_along_axis(mx.full((6, 1024), -float("inf"), mx.bfloat16), candidate_ids, scores * 1.25, axis = -1)
+        return CandidateSelector.select(selector, hidden, logits.reshape(2, 3, 1024), anchors, greedy)
+    for k in (1, 8, 512):
+        selector.top_k = k
+        first = inference._sparse_candidate_walk(selector, hidden, anchors, ids, values, 1.25)
+        second = inference._sparse_candidate_walk(selector, hidden, anchors, (ids + 17) % 1024, -values, 1.25)
+        reverse = inference._sparse_candidate_walk(selector, hidden, anchors, ids[:, ::-1], values[:, ::-1], 1.25)
+        assert mx.array_equal(first, dense(ids, values)) and mx.array_equal(reverse, first)
+        order = mx.argsort(ids, axis = -1)
+        ascending = lambda: inference._sparse_candidate_walk(selector, hidden, anchors, mx.take_along_axis(ids, order, axis = -1),
+                                                             mx.take_along_axis(values, order, axis = -1), 1.25, ascending = True)
+        assert mx.array_equal(ascending(), first)
+        assert mx.array_equal(second, dense((ids + 17) % 1024, -values))
+        # A budget asking the selector for confidences gets them from the sparse walk too.
+        selector.__dict__["_unsloth_wants_confidence"] = True
+        assert mx.array_equal(inference._sparse_candidate_walk(selector, hidden, anchors, ids, values, 1.25), first)
+        confidence = selector.__dict__.pop("_unsloth_confidence")
+        assert mx.array_equal(ascending(), first) and mx.array_equal(selector.__dict__.pop("_unsloth_confidence"), confidence)
+        del selector.__dict__["_unsloth_wants_confidence"]
+        assert confidence.shape == (2, 3) and bool(mx.all((confidence > 0) & (confidence <= 1)))
+
+
+def test_a_drafter_head_built_inside_fast_verify_keeps_low_rows_on_the_lane_kernel():
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    (head := nn.QuantizedLinear(256, 64, bias = False)).eval().set_dtype(mx.bfloat16)
+    head._unsloth_lane_verify_scopes = 1
+    drafter = nn.Module()
+    drafter.lm_head = head
+    assert inference.lane_drafter_head(drafter, head) and drafter.lm_head is not head
+    assert not inference._lane_low(drafter.lm_head, 1) and inference._lane_low(head, 1)
+
+
+def test_a_quantized_drafter_projects_on_the_lane_kernel_unless_switched_off(qwen, monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import generate, inference, matmul, speculative
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    (model, ids), rows, kernel = qwen, [], matmul.lane_qmm
+    monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: rows.append(len(args[0])) or kernel(*args, **kwargs))
+    for switch in ("0", None):
+        monkeypatch.setenv("UNSLOTH_MLX_LANE_QMM", switch) if switch else monkeypatch.delenv("UNSLOTH_MLX_LANE_QMM", raising = False)
+        rows.clear()
+        companion = _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2")
+        companion.set_dtype(mx.bfloat16)   # as released drafters are
+        nn.quantize(companion, group_size = 64, bits = 4, class_predicate = lambda _, layer: (
+            isinstance(layer, nn.Linear) and layer.weight.shape[-1] % 64 == 0))
+        drafter = speculative._built(speculative.ContextDrafter, companion, model.language_model)
+        quantized = [m for _, m in drafter.model.named_modules() if isinstance(m, nn.QuantizedLinear)]
+        out, drafted, _ = _run(model, ids[:1], 32, _script(("draft", 3), ("draft", 5)), generate.SamplingParams(), drafter = drafter)
+        # Drafts only propose: the output is the target's own whichever kernel drafted them.
+        assert out == [_solo(model, ids[0], 32, generate.SamplingParams())] and all(n for n, _ in drafted.values())
+        on = [m for m in quantized if m.__dict__.get("_unsloth_lane_qmm")]
+        assert (on, rows) == ([], []) if switch else (on == quantized and type(on[0]).__name__.startswith("_Lane") and rows)
+        (head := nn.QuantizedLinear(64, 64, bias = False)).eval().set_dtype(mx.bfloat16)
+        drafter.model.lm_head = head
+        bound = [inference.lane_drafter_head(drafter.model, head) for _ in range(2)]
+        assert (bound, type(drafter.model.lm_head).__name__ != "QuantizedLinear", drafter.model.lm_head.weight is head.weight,
+                type(head)) == ([not switch, False], not switch, True, nn.QuantizedLinear)
+    # The projection returns the kernel's rows, not a native call beside it.
+    x = mx.random.normal((1, 3, on[0].weight.shape[1] * 32 // on[0].bits)).astype(mx.bfloat16)
+    monkeypatch.setattr(matmul, "lane_qmm", lambda *args, **kwargs: kernel(*args, **kwargs) * 2)
+    assert mx.array_equal(on[0](x).reshape(3, -1), kernel(x.reshape(3, -1), on[0].weight, on[0].scales, on[0].biases, on[0].group_size, on[0].bits) * 2)
+    assert not any(k.startswith("_unsloth_lane") for _, m in model.named_modules() for k in m.__dict__)
+
+
+def test_a_predraft_projects_a_layers_queries_keys_and_values_in_two_launches(qwen, monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul, speculative
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    companion = _tiny_companion(qwen[0], "incoai/Qwen3.8-27B-DFlash2")
+    companion.set_dtype(mx.bfloat16)
+    nn.quantize(companion, group_size = 64, bits = 4, class_predicate = lambda _, layer: (
+        isinstance(layer, nn.Linear) and layer.weight.shape[-1] % 64 == 0))
+    drafter = speculative._built(speculative.ContextDrafter, companion, qwen[0].language_model)
+    attention, cache = drafter.model.layers[0].self_attn, drafter.model.make_cache()[0]
+    K, kv = attention.q_proj.weight.shape[1] * 8, (1, attention.n_kv_heads, 5, attention.head_dim)
+    cache.update_and_fetch(*(mx.random.normal(kv, key = mx.random.key(i)).astype(mx.bfloat16) for i in (1, 2)))
+    x, context = (mx.random.normal((1, rows, K), key = mx.random.key(rows)).astype(mx.bfloat16) for rows in (4, 3))
+    predraft = lambda: attention(x, context, drafter.model.rope, inference.PredraftCache(
+        cache, mx.array([True, False, True]), mx.array(cache.offset + 3, mx.int32)))
+    launches, qmms = [], matmul.lane_qmms
+    monkeypatch.setattr(matmul, "lane_qmms", lambda x, ws, *args: launches.append(len(ws)) or qmms(x, ws, *args))
+    with monkeypatch.context() as patch:
+        patch.setattr(inference, "_lane_projections", lambda *args: {})
+        alone = predraft()   # each projection on its own, which also verifies its shapes
+    tensor = matmul.lane_qmms_reader(attention.q_proj.weight.shape[0], K, 64, 4, mx.bfloat16) is not None
+    assert mx.array_equal(predraft(), alone).item() and launches == ([2, 3] if tensor else [])
+    monkeypatch.setenv("UNSLOTH_MLX_LANE_QMM", "0")
+    assert mx.array_equal(predraft(), alone).item() and launches == ([2, 3] if tensor else [])   # no further shared launch
+
+
+def test_a_predraft_reads_its_window_in_place_and_attends_as_stock_does(qwen, monkeypatch):
+    from unsloth_zoo.mlx import attention as kernels, inference, speculative
+    if not kernels.invariant_attention_available():
+        pytest.skip("the draft attention kernel needs an Apple GPU")
+    companion = _tiny_companion(qwen[0], "incoai/Qwen3.8-27B-DFlash2")
+    companion.set_dtype(mx.bfloat16)
+    drafter = speculative._built(speculative.ContextDrafter, companion, qwen[0].language_model)
+    layer, cache = drafter.model.layers[0].self_attn, drafter.model.make_cache()[0]
+    cache.update_and_fetch(*(mx.random.normal((1, layer.n_kv_heads, 300, layer.head_dim), key = mx.random.key(i)).astype(mx.bfloat16) for i in (1, 2)))
+    K = drafter.config.hidden_size
+    x, context = (mx.random.normal((1, rows, K), key = mx.random.key(rows)).astype(mx.bfloat16) for rows in (4, 3))
+    predraft = lambda: layer(x, context, drafter.model.rope, inference.PredraftCache(
+        cache, mx.array([True, False, True]), mx.array(cache.offset + 3, mx.int32)))
+    assert inference._draft_attention_on()
+    read, kernel, concatenate = [], kernels.draft_attention, mx.concatenate
+    monkeypatch.setattr(kernels, "draft_attention", lambda q, k, *args: read.append(k.shape[2]) or kernel(q, k, *args))
+    got = predraft()
+    assert read == [300]
+    joined = []
+    monkeypatch.setattr(mx, "concatenate", lambda arrays, *args, **kwargs: joined.append(sum(a.shape[2] for a in arrays if a.ndim == 4)) or concatenate(arrays, *args, **kwargs))
+    predraft()
+    assert all(rows < 300 for rows in joined)   # no copy of the window
+    monkeypatch.undo()
+    monkeypatch.setattr(inference, "_draft_attention_on", lambda: False)
+    want = predraft()
+    assert mx.abs((got - want).astype(mx.float32)).max().item() <= 0.02 * mx.abs(want.astype(mx.float32)).max().item()
 
 
 @pytest.mark.parametrize("repo", ["z-lab/Qwen3.5-4B-DFlash", "incoai/Qwen3.8-27B-DFlash2", "RadixArk/Qwen3.8-27B-DSpark"])
@@ -1130,11 +3170,23 @@ def test_dflash_family_drafts_from_every_committed_feature_alone_batched_and_thr
     from unsloth_zoo.mlx import generate, speculative
     (model, ids), ar, SamplingParams = qwen, __import__("mlx_vlm.generate.ar", fromlist = ["ar"]), generate.SamplingParams
     drafter, blocks, rows, sequences = speculative.ContextDrafter(_tiny_companion(model, repo), model.language_model, max_lag = 8), [], [], []
+    # Only the lone row mixes in plain windows: batched ones carry ordinary batched numerics.
+    cases = ((ids[:1], (("draft", 3), ("plain", 9), ("copy", 4), ("draft", 5))), (ids[:2], (("draft", 3), ("copy", 4), ("draft", 5))))
+    # Blocks drafted before their round's acceptance is read keep the output exact.
+    ahead, predrafted = speculative.ContextDrafter(drafter.model, model.language_model, max_lag = 8), []
+    predraft = ahead.predraft
+    ahead.predraft = lambda *args: predrafted.append(got := predraft(*args)) or got
+    for prompts, script in cases:
+        predrafted.clear()
+        assert _run(model, prompts, 48, _script(*script), SamplingParams(), drafter = ahead)[0] == [_solo(model, prompt, 48, SamplingParams()) for prompt in prompts]
+        assert any(predrafted)
+    assert drafter.predraft_rows
+    # Those read every verified row's projection, which stock matmul rounds by row count; the checks below are bitwise.
+    drafter.predraft_rows = 0
     block, start = drafter._block, drafter.start
     drafter._block = lambda row, depth: blocks.append((row, row.pending, mx.concatenate(row.features), got := block(row, depth))) or got
     drafter.start = lambda prompt, hidden, pending: rows.append((started := start(prompt, hidden, pending))[0]) or started
-    # Only the lone row mixes in plain windows: batched ones carry ordinary batched numerics.
-    for prompts, script in ((ids[:1], (("draft", 3), ("plain", 9), ("copy", 4), ("draft", 5))), (ids[:2], (("draft", 3), ("copy", 4), ("draft", 5)))):
+    for prompts, script in cases:
         out, drafted, _ = _run(model, prompts, 48, _script(*script), SamplingParams(), drafter = drafter)
         assert out == [_solo(model, prompt, 48, SamplingParams()) for prompt in prompts] and all(n for n, _ in drafted.values())
         sequences += [[*prompt, *tokens] for prompt, tokens in zip(prompts, out)]
@@ -1154,3 +3206,353 @@ def test_dflash_family_drafts_from_every_committed_feature_alone_batched_and_thr
             assert pending == sequence[fed] and (context - reference[fed - len(context) : fed]).abs().mean().item() < 0.5
             assert mx.array_equal(got, drafter.model.draft_block(pending, context[None], fresh, got.shape[-1] + 1, lambda logits: mx.argmax(logits, axis = -1)))
     assert _probe_matches_a_started_row(model, speculative.ContextDrafter(drafter.model, model.language_model, max_lag = 8), ids[0][:40], lambda started: started[0].cache)
+
+
+@pytest.mark.parametrize("initial_rows", [0, 3])
+def test_a_dflash_block_drafted_before_its_acceptance_is_read_drafts_and_caches_as_one_drafted_after(qwen, initial_rows, monkeypatch):
+    import random
+    from unsloth_zoo.mlx import speculative
+    from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow
+    model, _ = qwen
+    from unsloth_zoo.mlx import inference
+    placed, in_place = [], inference._append_in_place
+    monkeypatch.setattr(inference, "_append_in_place", lambda *args: placed.append(got := in_place(*args)) or got)
+    # A short window, so the rows rotate out of the ring within the test; built as loaded, so its projections round
+    # each row alike however many rows they read.
+    drafter = speculative._built(ContextDrafter, _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2", sliding_window = 24), model.language_model, quantize = True)
+    assert drafter.predraft_rows == 23
+    mx.random.seed(0)
+    size, rng, (ahead, after) = len(drafter.config.target_layer_ids) * drafter.config.hidden_size, random.Random(0), (ContextRow(drafter.model.make_cache()) for _ in range(2))
+    if initial_rows:
+        for row in (ahead, after):
+            drafter.push(row, [5], mx.ones((initial_rows, size)))
+        assert not drafter.predraft(ahead, mx.ones((3, size)), mx.array(0), mx.array(7))
+        mx.eval(drafter._block(ahead, 1), drafter._block(after, 1))
+    for width in (0, 24):
+        assert not drafter.predraft(ahead, mx.zeros((width, size)), mx.array(0), mx.array(7))
+    for step in range(40):
+        # The round takes `count + 1` of `width` verified rows; rows past them differ in each step.
+        width = rng.choice([1, 3, 5, 8])
+        count, anchor, hidden = rng.randrange(width), rng.randrange(1000), mx.random.normal((width, size))
+        assert drafter.predraft(ahead, hidden, mx.array(count), mx.array(anchor))
+        prefetched = ahead.prefetched
+        assert not drafter.predraft(ahead, hidden, mx.array(count), mx.array(anchor + 1))
+        assert ahead.prefetched is prefetched
+        if step % 10 == 9:
+            # The host's count disagrees with the device's: the block is drafted again from the rows pushed.
+            drafter.discard(ahead)
+            count = (count + 1) % width
+        drafter.push(ahead, [0] * count + [anchor], hidden[: count + 1])
+        drafter.push(after, [0] * count + [anchor], hidden[: count + 1])
+        assert ahead.pending == after.pending == anchor
+        got, expected = drafter.draft([], [ahead], drafter.max_depth, []), drafter.draft([], [after], drafter.max_depth, [])
+        assert mx.array_equal(got, expected), step
+        for a, b in zip(ahead.cache, after.cache):
+            assert a.offset == b.offset and all(x.shape == y.shape and mx.allclose(x, y, atol = 1e-5).item() for x, y in zip(a.state, b.state))
+    assert ahead.cache[0].offset > 24 and any(placed)
+    from types import SimpleNamespace
+    import sys
+    layer = drafter.model.layers[1]
+    for target, attribute, value in ((layer.self_attn, "is_causal", True), (layer, "self_attn", SimpleNamespace(is_causal = False))):
+        with monkeypatch.context() as patch:
+            (patch.setitem if attribute in target else patch.setattr)(target, attribute, value)
+            assert inference.predraft_attention(drafter.model) == 0
+    with monkeypatch.context() as patch:
+        patch.setattr(drafter.model, "make_cache", lambda: [object()])
+        assert inference.predraft_attention(drafter.model) == 0
+    assert inference.predraft_attention(SimpleNamespace(layers = [])) == 0
+    with monkeypatch.context() as patch:
+        patch.delitem(sys.modules, inference._DFLASH)
+        assert inference.predraft_attention(drafter.model) == 0
+    with monkeypatch.context() as patch:
+        patch.setattr(inference, "_resolved_bindings", lambda contract: None)
+        assert inference.predraft_attention(drafter.model) == 0
+    with monkeypatch.context() as patch:
+        for layer in drafter.model.layers:
+            patch.setattr(layer.self_attn, "is_sliding", False)
+        assert inference.predraft_attention(drafter.model) > 24
+
+
+def test_a_context_block_projects_only_the_rows_its_sliding_layers_keep(qwen, monkeypatch):
+    from unsloth_zoo.mlx import speculative
+    from unsloth_zoo.mlx.speculative import ContextDrafter, ContextRow
+    model, _ = qwen
+    drafter = speculative._built(ContextDrafter, _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2", sliding_window = 24), model.language_model, quantize = True)
+    assert drafter.context_rows == 23
+    with monkeypatch.context() as patch:
+        patch.setattr(drafter.model.layers[1].self_attn, "is_sliding", False)
+        assert ContextDrafter(drafter.model, model.language_model).context_rows is None
+    hidden = mx.random.normal((40, len(drafter.config.target_layer_ids) * drafter.config.hidden_size), key = mx.random.key(0)).astype(mx.bfloat16)
+    projected, fc = [], drafter.model.fc
+    monkeypatch.setattr(drafter.model, "fc", lambda x: projected.append(x.shape[1]) or fc(x))
+    rows = []
+    for context_rows in (23, None):
+        drafter.context_rows, row = context_rows, ContextRow(drafter.model.make_cache())
+        drafter.push(row, [5], hidden)
+        rows.append((row, drafter.draft([], [row], drafter.max_depth, [])))
+    (trimmed, got), (full, expected) = rows
+    assert projected == [23, 40] and mx.array_equal(got, expected).item()
+    for a, b in zip(trimmed.cache, full.cache):
+        assert a.offset == b.offset == 40 and all(mx.allclose(x, y, rtol = 2e-2, atol = 2e-2).item() for x, y in zip(a.state, b.state))
+
+
+def test_predraft_context_rows_append_in_place_and_wrap_once_the_window_fills():
+    from mlx_vlm.models.cache import RotatingKVCache
+    from unsloth_zoo.mlx import inference
+    native, ahead = RotatingKVCache(600), RotatingKVCache(600)
+    steps = [(5, 5), (3, 261), (300, 308), (200, 564), (40, 564), (40, 600), (100, 600), (650, 1249), (7, 600), (590, 600)]
+    for i, (rows, size) in enumerate(steps):
+        keys, values = (mx.random.normal((1, 2, rows, 4), key = mx.random.key(2 * i + j)).astype(mx.bfloat16) for j in range(2))
+        native.update_and_fetch(keys, values)
+        placed = inference._append_in_place(ahead, keys, values)
+        if not placed:   # the first rows, and more rows than the window, take the native update
+            ahead.update_and_fetch(keys, values)
+        assert placed == (0 < i and rows <= 600) and ahead.keys.shape[2] == size and ahead.offset == native.offset
+        held = min(ahead.offset, 600)
+        for got, want in ((ahead.keys, native.keys), (ahead.values, native.values)):
+            assert mx.array_equal(ahead._temporal_order(got)[..., -held:, :], native._temporal_order(want)[..., -held:, :]).item()
+        history = inference.PredraftCache(ahead, mx.zeros((0,), mx.bool_), mx.array(0)).history()[0]
+        assert history.shape[2] == min(ahead.offset, size)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_draft_convolution_reads_strides_and_rounds_before_residual(monkeypatch, dtype):
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import _grouped_dynamic_convolve
+    from unsloth_zoo.mlx import inference
+    hidden = mx.random.normal((4, 9, 128), key = mx.random.key(22)).astype(dtype)[::2, 1::2, ::2]
+    base = mx.random.normal((2, 3, 128), key = mx.random.key(23)).astype(dtype)[1, :, ::2]
+    dynamic = mx.random.normal((4, 9, 2, 3, 8), key = mx.random.key(24)).astype(dtype)[::2, 1::2, 1]
+    residual = mx.random.normal((4, 9, 128), key = mx.random.key(25)).astype(dtype)[::2, 1::2, ::2]
+    for sign in (-1, 1):
+        changed = mx.concatenate([hidden[:1], hidden[1:] * sign])
+        expected = _grouped_dynamic_convolve(changed, dynamic, base, 8)
+        for add in (None, residual):
+            actual = inference._draft_convolution(changed, dynamic, base, 8, add)
+            assert mx.array_equal(actual.view(mx.uint16), (expected if add is None else residual + expected).view(mx.uint16))
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_draft_selector_walks_each_batch_and_position(monkeypatch, dtype):
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import CandidateSelector
+    from unsloth_zoo.mlx import inference
+    selector = CandidateSelector(SimpleNamespace(hidden_size = 64, vocab_size = 97, selector_rank = 256, selector_top_k = 16)).eval()
+    selector.set_dtype(dtype)
+    hidden = mx.random.normal((2, 7, 64), key = mx.random.key(26)).astype(dtype)
+    candidates = (mx.arange(224).reshape(2, 7, 16) * 17 % 97).astype(mx.uint32)
+    unary = mx.random.normal((2, 7, 16), key = mx.random.key(27)).astype(dtype)
+    previous = mx.concatenate([mx.broadcast_to(mx.array([3, 29])[:, None, None], (2, 1, 16)), candidates[:, :-1]], axis = 1)
+    selector.__dict__["_unsloth_wants_confidence"] = True
+    for sign in (-1, 1):
+        changed = mx.concatenate([hidden[:1], hidden[1:] * sign])
+        expected, confidence = inference._candidate_walk(selector.predecessor_codebook(previous), selector.hidden_projection(changed),
+            selector.successor_codebook(candidates), unary, candidates, True)
+        actual = inference._draft_selector(selector, previous, changed, candidates, unary)
+        assert mx.array_equal(actual, expected)
+        assert mx.allclose(selector.__dict__["_unsloth_confidence"], confidence, atol = 2e-6, rtol = 2 * mx.finfo(dtype).eps)
+    selector.predecessor_codebook.weight = mx.zeros_like(selector.predecessor_codebook.weight)
+    assert mx.array_equal(inference._draft_selector(selector, previous, hidden, candidates, mx.zeros_like(unary)), candidates[:, :, 0])
+    assert mx.allclose(selector.__dict__["_unsloth_confidence"], mx.full((2, 7), 1 / 16))
+
+
+def test_draft_layer_folds_convolution_residual_and_keeps_context_cache(monkeypatch):
+    import copy
+    import mlx.nn as nn
+    from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
+    from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
+    from unsloth_zoo.mlx import inference, speculative
+    config = DFlash2Config(hidden_size = 128, intermediate_size = 256, num_hidden_layers = 2,
+        num_attention_heads = 4, num_key_value_heads = 2, head_dim = 32, vocab_size = 1024,
+        block_size = 8, mask_token_id = 0, target_layer_ids = [0], num_target_layers = 2,
+        conv_kernel_size = 3, conv_group_size = 32, selector_rank = 16, selector_top_k = 8)
+    model = DFlash2DraftModel(config).eval()
+    model.set_dtype(mx.bfloat16)
+    for layer in model.layers:
+        for conv in (layer.attention_conv, layer.mlp_conv):
+            conv.base_kernel = mx.random.normal(conv.base_kernel.shape).astype(mx.bfloat16)
+    reference = copy.deepcopy(model)
+    target = nn.Module()
+    target.config, target.rollback_speculative_cache = config, lambda *args: None
+    target.embed_tokens, target.lm_head = nn.Embedding(1024, 128), nn.QuantizedLinear(128, 1024, bias = False)
+    target.eval().set_dtype(mx.bfloat16)
+    speculative._built(speculative.ContextDrafter, model, target)
+    folds, convolution = [], inference._draft_convolution
+    def counted(*args, **kwargs):
+        out = convolution(*args, **kwargs)
+        if len(args) == 5 and out is not None: folds.append(args[-1].shape)
+        return out
+    monkeypatch.setattr(inference, "_draft_convolution", counted)
+    actual_cache, expected_cache = model.make_cache(), reference.make_cache()
+    for rows in (5, 3):
+        hidden = mx.random.normal((1, 7, 128), key = mx.random.key(rows)).astype(mx.bfloat16)
+        context = mx.random.normal((1, rows, 128), key = mx.random.key(rows + 1)).astype(mx.bfloat16)
+        actual, expected = hidden, hidden
+        for a, e, ac, ec in zip(model.layers, reference.layers, actual_cache, expected_cache):
+            actual = a(actual, context, model.rope, ac)
+            expected = e(expected, context, reference.rope, ec)
+            assert mx.array_equal(actual.view(mx.uint16), expected.view(mx.uint16))
+            assert ac.offset == ec.offset and mx.array_equal(ac.keys, ec.keys) and mx.array_equal(ac.values, ec.values)
+    assert folds == [(1, 7, 128)] * 8
+
+
+def test_draft_projections_keep_their_arrays_and_read_as_their_targets_do(monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    model = nn.Module()
+    model.layers = [nn.QuantizedLinear(1024, n, bias = False, bits = 4, group_size = 64) for n in (128, 16384)]
+    model.eval().set_dtype(mx.bfloat16)
+    hidden = mx.random.normal((17, 1024), key = mx.random.key(31)).astype(mx.bfloat16)
+    arrays = [(layer.weight, layer.scales, layer.biases) for layer in model.layers]
+    expected = [[matmul.lane_qmm(hidden[:rows], *weights, 64, 4, reader = "slices") for rows in (1, 7, 17)] for weights in arrays]
+    mx.eval(expected)
+    assert inference.lane_drafter_projections(model) == 2
+    for layer, weights, reference in zip(model.layers, arrays, expected):
+        assert all(layer[name] is a for name, a in zip(("weight", "scales", "biases"), weights))
+        for rows, value in zip((1, 7, 17), reference):
+            assert mx.array_equal(layer(hidden[:rows]).view(mx.uint16), value.view(mx.uint16))
+
+
+def test_a_long_prompts_first_round_reads_its_backlog_flush_and_prices_no_width(qwen_4bit, monkeypatch):
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx import speculative as S
+    model, ids, _ = qwen_4bit
+    reads, colds = [], []
+    draft, wait = S.ContextDrafter.draft, S.SpeculativeEngine._time_cycle
+    monkeypatch.setattr(S.ContextDrafter, "draft", lambda self, cache, rows, *args: reads.append(
+        [getattr(row, "flushed", None) for row in rows]) or draft(self, cache, rows, *args))
+    monkeypatch.setattr(S.SpeculativeEngine, "_time_cycle", lambda self, *args: colds.append(args[-1]) or wait(self, *args))
+    companion = _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2")
+    companion.set_dtype(mx.bfloat16)
+    drafter = S._built(S.ContextDrafter, companion, model.language_model)
+    drafter._selector = companion.candidate_selector
+    drafter._selector.__dict__["_unsloth_wants_confidence"] = True
+    drafter.confidences, drafter.max_lag = True, 16
+    controller = S.DraftController(max_depth = 3, max_copy = 0)
+    controller.plain_cost[1] = S._Ema(0.1, 10)
+    controller.verify_cost[1] = {4: S._Ema(0.1, 10)}
+    assert len(ids[0]) >= drafter.max_lag
+    _run(model, ids[:1], 24, controller, SamplingParams(), drafter = drafter)
+    # The prompt's backlog flush serves the first round, which is cold; later rounds read ordinary prefetched blocks.
+    assert reads[0] == [True] and colds[0] and not any(flags[0] for flags in reads[1:]) and False in colds
+
+
+@pytest.mark.parametrize("lane,moe", [(False, False), (False, True), (True, False), (True, True)])
+def test_confidence_budget_skips_only_the_modes_dense_targets(monkeypatch, lane, moe):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import matmul
+    from unsloth_zoo.mlx.speculative import ContextDrafter
+    if lane and not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", str(int(lane)))
+    class Head(nn.Module):
+        def bind(self, target):
+            pass
+        def draft_block(self, *args):
+            pass
+    model, target = Head(), nn.Module()
+    model.config = SimpleNamespace(block_size = 8, target_layer_ids = [0])
+    model.candidate_selector = nn.Module()
+    if moe:
+        target.switch_mlp = nn.Module()
+    drafter = ContextDrafter(model, target)
+    assert drafter.confidences == (moe or not lane)
+    assert bool(model.candidate_selector.__dict__.get("_unsloth_wants_confidence")) == drafter.confidences
+
+
+def _lanes_held(model):
+    return any("_unsloth_lane_qmm" in module.__dict__ for _, module in model.named_modules())
+
+
+def test_fast_verify_takes_the_argument_then_the_env_and_the_outermost_scope_decides(qwen_4bit, monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul
+    from unsloth_zoo.mlx.generate import generation_mode
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    model = qwen_4bit[0]
+    monkeypatch.delenv("UNSLOTH_MLX_FAST_VERIFY", raising = False)
+    speculative = ("batch", "speculative")
+    with generation_mode(model, call = speculative):
+        assert not _lanes_held(model) and not inference.fast_verify_enabled(model)
+    with generation_mode(model, call = speculative, fast_verify = True):
+        assert _lanes_held(model) and inference.fast_verify_enabled(model) and inference._fast_verify_held(model)
+        with inference.inference_scopes(model, speculative, fast_verify = False):
+            assert _lanes_held(model) and inference._fast_verify_held(model)
+    assert not _lanes_held(model) and not inference._fast_verify_held(model) and not inference.fast_verify_enabled(model)
+    monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", "1")
+    with generation_mode(model, call = speculative, fast_verify = False):
+        assert not _lanes_held(model)
+    with generation_mode(model, call = speculative):
+        assert _lanes_held(model)
+    assert all(scope.speculative for scope in inference.INFERENCE_SCOPES if scope.fast_verify)
+    with generation_mode(model, fast_verify = True):   # a generation with no drafter holds nothing
+        assert not _lanes_held(model)
+    with generation_mode(model, call = ("batch",), fast_verify = True):
+        assert not _lanes_held(model) and inference._fast_verify_held(model)
+        with generation_mode(model, call = speculative):   # but decides what nests in it
+            assert _lanes_held(model)
+    # Another model's decision is its own, singleton decode included.
+    other = nn.Module()
+    other.proj = nn.QuantizedLinear(512, 512, bias = False, group_size = 64, bits = 4)
+    other.eval()
+    with generation_mode(model, call = speculative), inference.inference_scopes(other, speculative, fast_verify = False):
+        assert "_unsloth_singleton_scopes" in vars(other.proj) and not inference._fast_verify_held(other)
+    # A drafter built inside a scope takes that scope's decision over the environment's.
+    with generation_mode(model, fast_verify = False):
+        with pytest.raises(ValueError, match = "open scope"):
+            inference.pin_fast_verify(model, True)
+        assert not inference.pin_fast_verify(model)
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_a_drafter_pins_fast_verify_for_its_target(qwen_4bit, monkeypatch, pinned):
+    from unsloth_zoo.mlx import inference, matmul, speculative
+    from unsloth_zoo.mlx.generate import generation_mode
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    model = qwen_4bit[0]
+    monkeypatch.setenv("UNSLOTH_MLX_FAST_VERIFY", str(int(not pinned)))
+    drafter = speculative._built(speculative.ContextDrafter, _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2"), model, fast_verify = pinned)
+    assert drafter.fast_verify == pinned == inference.fast_verify_enabled(model) and drafter.confidences != pinned
+    with generation_mode(model, call = ("batch", "speculative")):
+        assert _lanes_held(model) == pinned
+    with generation_mode(model, call = ("batch",)):   # stock bits, the decision kept for what nests in it
+        assert not _lanes_held(model) and inference._fast_verify_held(model) == pinned
+    with pytest.raises(ValueError, match = "reload"), generation_mode(model, call = ("batch",), fast_verify = not pinned):
+        pass
+    assert not _lanes_held(model) and not inference._fast_verify_held(model)
+    with pytest.raises(ValueError, match = "reload"):
+        speculative._built(speculative.ContextDrafter, None, model, fast_verify = not pinned)
+
+
+def test_fast_verify_available_reports_what_the_lane_kernel_takes(qwen_4bit, monkeypatch, tmp_path):
+    from unsloth_zoo.mlx import inference, matmul, nax
+    if not matmul.lane_qmm_available():
+        pytest.skip("the lane kernel needs an Apple GPU")
+    model = qwen_4bit[0]
+    status = inference.fast_verify_available(model)
+    assert status and status.reason == "" and status.projections > 0 and not _lanes_held(model)
+    assert inference.fast_verify_available(object()) == (False, "no_eligible_projections", 0)
+
+    def checkpoint(config, tensors):
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        header = json.dumps(tensors).encode()
+        (tmp_path / "model.safetensors").write_bytes(len(header).to_bytes(8, "little") + header)
+        return tuple(inference.fast_verify_checkpoint_available(tmp_path))
+
+    assert tuple(inference.fast_verify_checkpoint_available(tmp_path)) == (False, "not_downloaded", 0)
+    quantization = dict(group_size = 64, bits = 4, mode = "affine")
+    row = lambda n, m: {f"p{n}.weight": dict(shape = [n, m]), f"p{n}.scales": dict(shape = [n, 2]), f"p{n}.biases": dict(shape = [n, 2])}
+    tensors = {**row(136, 16), **row(132, 16), **row(8, 16)}   # 132 outputs are no multiple of 8
+    assert checkpoint(dict(model_type = "qwen3_5_moe", quantization = quantization), tensors) == (True, "", 2)
+    assert checkpoint(dict(model_type = "gemma4", quantization = quantization), tensors) == (False, "no_eligible_projections", 0)
+    with monkeypatch.context() as patch:
+        patch.setattr(nax, "kernel_probe_passed", lambda *args: False)
+        assert inference.fast_verify_available(model) == (False, "probe_failed", status.projections)
+    with monkeypatch.context() as patch:
+        patch.setattr(model, "_unsloth_mlx_distributed_parallel_mode", "pipeline", raising = False)
+        assert inference.fast_verify_available(model) == (False, "distributed", 0)
+    monkeypatch.setenv("UNSLOTH_MLX_LANE_QMM", "0")
+    assert inference.fast_verify_available(model) == (False, "no_lane_kernel", 0)
+    assert tuple(inference.fast_verify_checkpoint_available(tmp_path)) == (False, "no_lane_kernel", 0)

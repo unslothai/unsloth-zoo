@@ -135,9 +135,7 @@ def _wraps(value, target):
 
 def test_release_unwraps_the_torch_compile_backend_wrapper():
     torch = pytest.importorskip("torch")
-    # Every dynamo context registers id(backend) here, including disable() with backend None,
-    # and torch._dynamo.reset() clears the dict. Start from that state, which is what an
-    # earlier test on the same xdist worker leaves, so this compile also adds non-vLLM keys.
+    # dynamo registers id(backend) even for disable() with None; earlier tests on the same xdist worker leave keys, so this compile adds non-vLLM ones too.
     torch._dynamo.reset()
     snapshot = vllm_utils._snapshot_dynamo_engine_registries()
     backend = _FakeVllmBackend()

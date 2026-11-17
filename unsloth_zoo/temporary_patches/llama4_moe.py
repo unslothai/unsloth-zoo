@@ -109,6 +109,9 @@ def patch_llama4_moe():
         # Separated LoRA reads dims from the module; the shared extractor misreads (E, in, out).
         Llama4TextExperts._unsloth_lora_extractor_fn = staticmethod(_llama4_moe_lora_extractor)
         Llama4TextExperts.is_transposed = True
+        # A PEFT that reads is_transposed factors the stacks over swapped dims: saves are rewritten to vanilla's
+        # (moe_lora_factor_swap); one that ignores it (0.18) already matches vanilla.
+        Llama4TextExperts._unsloth_expert_lora_factors_swapped = "is_transposed"
         Llama4TextExperts.is_concatenated = True
         Llama4TextExperts.has_bias = False
         Llama4TextExperts.has_gate = True

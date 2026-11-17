@@ -94,13 +94,13 @@ def kda_gate_fwd_kernel(
     yb,
     lower_bound,
     T,
-    H: tl.constexpr,
-    D: tl.constexpr,
-    BT: tl.constexpr,
-    BD: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    HAS_BETA: tl.constexpr,
-    USE_LOWER_BOUND: tl.constexpr,
+    H: tl.constexpr,  # heads
+    D: tl.constexpr,  # key hd
+    BT: tl.constexpr,  # chunk size along T
+    BD: tl.constexpr,  # block along key hd
+    HAS_BIAS: tl.constexpr,  # bias given
+    HAS_BETA: tl.constexpr,  # beta given
+    USE_LOWER_BOUND: tl.constexpr,  # gate lower bound given
 ):
     i_t, i_h = tl.program_id(0).to(tl.int64), tl.program_id(1)
 
@@ -157,13 +157,13 @@ def kda_gate_bwd_kernel(
     dbeta,
     lower_bound,
     T,
-    H: tl.constexpr,
-    D: tl.constexpr,
-    BT: tl.constexpr,
-    BD: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    HAS_BETA: tl.constexpr,
-    USE_LOWER_BOUND: tl.constexpr,
+    H: tl.constexpr,  # heads
+    D: tl.constexpr,  # key hd
+    BT: tl.constexpr,  # chunk size along T
+    BD: tl.constexpr,  # block along key hd
+    HAS_BIAS: tl.constexpr,  # bias given
+    HAS_BETA: tl.constexpr,  # beta given
+    USE_LOWER_BOUND: tl.constexpr,  # gate lower bound given
 ):
     i_t, i_h = tl.program_id(0).to(tl.int64), tl.program_id(1)
 
@@ -378,16 +378,16 @@ def kda_gate_chunk_cumsum_vector_kernel(
     chunk_indices,
     lower_bound,
     T,
-    H: tl.constexpr,
-    S: tl.constexpr,
-    BT: tl.constexpr,
-    BS: tl.constexpr,
-    REVERSE: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    USE_LOWER_BOUND: tl.constexpr,
-    LONG_INDEXING: tl.constexpr = False,
+    H: tl.constexpr,  # heads
+    S: tl.constexpr,  # feature dim
+    BT: tl.constexpr,  # chunk size along T
+    BS: tl.constexpr,  # block along S
+    REVERSE: tl.constexpr,  # reverse cumsum along T
+    HAS_BIAS: tl.constexpr,  # bias given
+    HAS_SCALE: tl.constexpr,  # scale given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    USE_LOWER_BOUND: tl.constexpr,  # gate lower bound given
+    LONG_INDEXING: tl.constexpr = False,  # int64 offsets
 ):
     i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H

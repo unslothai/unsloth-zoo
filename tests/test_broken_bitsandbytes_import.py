@@ -1,29 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
-"""A bitsandbytes that fails its own import with something other than ImportError
-must not take the whole unsloth_zoo import down with it.
-
-A bitsandbytes wheel built against a different torch raises out of its own module
-scope, and not as an ImportError:
-
-  bitsandbytes/backends/cuda/ops.py:69
-  _get_raw_stream = torch._C._cuda_getCurrentRawStream
-  AttributeError: module 'torch._C' has no attribute '_cuda_getCurrentRawStream'
-
-Two module-scope sites let that through. `patching_utils` reaches bitsandbytes second
-hand: its dynamic-4bit patch imports `transformers.integrations.bitsandbytes`, and that
-transformers module does a bare module-scope `import bitsandbytes as bnb` of its own.
-`vllm_utils` reaches it directly, behind an `importlib.util.find_spec` gate that only
-proves the wheel is on disk. Either one put the AttributeError on the `import unsloth`
-path, breaking 16bit and full finetuning on a host whose only real problem was a 4bit dep.
-
-Both have a no-bnb path already, and that is where a broken wheel now goes. The healthy
-path is pinned here too, so a guard cannot buy the fix by turning 4bit off for everybody.
-
-The dep is faked with a one-line module on `sys.path`, never a real wheel and never the
-network, and every case runs in a fresh interpreter so the poisoned `bitsandbytes` cannot
-leak into the rest of the suite.
-"""
+"""A bitsandbytes that raises AttributeError on import (mismatched torch wheel) must not break import unsloth_zoo;
+patching_utils and vllm_utils take the no-bnb path, healthy bnb still patched; each case runs in a fresh interpreter."""
 
 import os
 import pathlib
@@ -35,17 +13,15 @@ import pytest
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-# The message the mismatched wheel actually dies with, reproduced verbatim so a
-# guard narrowed back to ImportError fails here rather than passing vacuously.
+# Verbatim AttributeError from a mismatched wheel, so a guard narrowed back to ImportError fails here instead of passing vacuously.
 _BREAKAGE = "module 'torch._C' has no attribute '_cuda_getCurrentRawStream'"
 
 _STUB = f'raise AttributeError("{_BREAKAGE}")\n'
 
 
 def _run(code, *, poisoned):
-    """Run `code` in a fresh interpreter, optionally with the broken dep first
-    on the path. The repo root goes on PYTHONPATH so the child imports the tree
-    under test rather than an installed unsloth_zoo."""
+    """Runs code in a fresh interpreter, optionally with the broken dep first on sys.path; repo root goes on PYTHONPATH
+    so the tree under test is imported, not an installed unsloth_zoo."""
     path = [str(_ROOT)]
     if poisoned:
         path.insert(0, str(poisoned))
@@ -71,8 +47,7 @@ def poisoned_bitsandbytes(tmp_path):
 
 
 def test_the_stub_really_breaks_the_import(poisoned_bitsandbytes):
-    """Without this, every other case in the file could pass on a host that
-    simply resolved the real bitsandbytes and never saw the stub at all."""
+    """Without this, other cases could pass on a host that resolved the real bitsandbytes and never saw the stub at all."""
     out = _run(
         "try:\n"
         "    import bitsandbytes\n"
@@ -88,13 +63,11 @@ def test_the_stub_really_breaks_the_import(poisoned_bitsandbytes):
 
 
 def test_patching_utils_imports_when_bitsandbytes_cannot(poisoned_bitsandbytes):
-    """The regression. `patching_utils` is on the path `import unsloth` walks,
-    via `unsloth/models/_utils.py`, so this failing takes the whole import down."""
+    """Regression: patching_utils is on the path import unsloth walks via unsloth/models/_utils.py, so its failure takes the whole import down."""
     out = _run(
         "import sys, importlib\n"
-        # Establish that transformers really does try to load the poisoned dep on
-        # this version. Where it does not, patching_utils was never at risk and
-        # the case has nothing to prove.
+        # Precondition: transformers must really import the poisoned bitsandbytes on this version, or patching_utils was
+        # never at risk and the case proves nothing.
         "try:\n"
         "    importlib.import_module('transformers.integrations.bitsandbytes')\n"
         "except AttributeError:\n"
@@ -116,22 +89,15 @@ def test_patching_utils_imports_when_bitsandbytes_cannot(poisoned_bitsandbytes):
     assert "IMPORT_OK" in out.stdout, out.stdout
     # The AttributeError must not merely be caught somewhere and re-raised later.
     assert _BREAKAGE not in out.stderr, out.stderr[-3000:]
-    # The no-bnb path: the dynamic-4bit patch needs the source of a function it
-    # cannot reach, so it is skipped rather than half-applied.
+    # On the no-bnb path the dynamic-4bit patch needs source of a function it cannot reach, so it is skipped rather than half-applied.
     assert "PATCH_APPLIED False" in out.stdout, out.stdout
     assert "INTEGRATION_LOADED False" in out.stdout, out.stdout
 
 
 def test_vllm_utils_takes_the_no_bnb_path_when_bitsandbytes_cannot_import(poisoned_bitsandbytes):
-    """`vllm_utils` gated its bitsandbytes block on `importlib.util.find_spec`, which only
-    proves the wheel is on disk. A mismatched wheel is on disk, so the gate opened and the
-    module-scope `import bitsandbytes.functional` behind it raised. The `else:` branch of
-    that same gate already defines no-op stand-ins, so there was a no-bnb path to take.
-
-    peft carries an `except ImportError` guard of its own and dies first on a genuinely
-    broken wheel. That is upstream and not what this pins, so the child loads peft while
-    the real wheel is still reachable and only then puts the stub on the path.
-    """
+    """vllm_utils gated bitsandbytes on find_spec, which only proves the wheel is on disk, so a mismatched wheel passed
+    and raised; its else branch no-op stand-ins are the fallback. peft is preloaded before the stub since it dies
+    first on a broken wheel, upstream."""
     out = _run(
         "import importlib, sys\n"
         "import peft\n"
@@ -150,8 +116,7 @@ def test_vllm_utils_takes_the_no_bnb_path_when_bitsandbytes_cannot_import(poison
         "import unsloth_zoo.vllm_utils as v\n"
         "print('IMPORT_OK')\n"
         "print('LINEAR4BIT_DEFINED', hasattr(v, 'Linear4bit'))\n"
-        # The no-op stand-in is a bare `return` and so touches no globals at all; the
-        # real one reassigns bitsandbytes.functional.QuantState.from_dict and Linear4bit.
+        # The no-op stand-in is a bare return touching no globals; the real one reassigns bitsandbytes.functional.QuantState.from_dict and Linear4bit.
         "print('HELPER_TOUCHES_BNB', bool(v.patch_bitsandbytes_quant_state.__code__.co_names))\n"
         "v.patch_bitsandbytes_quant_state()\n"
         "print('HELPER_CALLABLE_OK')\n",
@@ -162,19 +127,15 @@ def test_vllm_utils_takes_the_no_bnb_path_when_bitsandbytes_cannot_import(poison
     assert out.returncode == 0, out.stderr[-3000:]
     assert "IMPORT_OK" in out.stdout, out.stdout
     assert _BREAKAGE not in out.stderr, out.stderr[-3000:]
-    # The gate has to close, not half-open: Linear4bit subclasses a bitsandbytes class
-    # that is not there, and the callers of the patch helpers get the no-op stand-ins.
+    # The gate must close rather than half-open: Linear4bit subclasses a missing bitsandbytes class, so patch helper callers get the no-op stand-ins.
     assert "LINEAR4BIT_DEFINED False" in out.stdout, out.stdout
     assert "HELPER_TOUCHES_BNB False" in out.stdout, out.stdout
-    # The stand-in has to survive being called, which is what callers at vllm_utils.py:803
-    # and :3629 do unconditionally.
+    # The stand-in must survive being called, since callers at vllm_utils.py:803 and :3629 invoke it unconditionally.
     assert "HELPER_CALLABLE_OK" in out.stdout, out.stdout
 
 
 def test_a_healthy_bitsandbytes_still_gets_the_dynamic_4bit_patch():
-    """The guard degrades only when the dep is genuinely unusable. With the real
-    wheel installed the patch still has to land, or the guard has quietly turned
-    dynamic 4bit off for everybody."""
+    """The guard must degrade only when bitsandbytes is genuinely unusable; with a working wheel the dynamic 4bit patch must still land."""
     out = _run(
         "import unsloth_zoo.patching_utils as p\n"
         "import transformers.integrations.bitsandbytes as tib\n"
@@ -186,16 +147,14 @@ def test_a_healthy_bitsandbytes_still_gets_the_dynamic_4bit_patch():
     if out.returncode != 0:
         pytest.skip("no usable bitsandbytes on this host: " + out.stderr[-500:])
     if "HOOKED ABSENT" in out.stdout:
-        # transformers 5.x dropped _replace_with_bnb_linear; the should_convert_module
-        # patch covers that branch instead and is not what this case pins.
+        # transformers 5.x dropped _replace_with_bnb_linear; the should_convert_module patch covers that branch instead, not this case.
         pytest.skip("transformers has no _replace_with_bnb_linear to patch")
     assert "PATCH_APPLIED True" in out.stdout, out.stdout
     assert "HOOKED _unsloth_replace_with_bnb_linear" in out.stdout, out.stdout
 
 
 def test_a_healthy_bitsandbytes_still_opens_the_vllm_utils_gate():
-    """The other half of the same bargain: swapping `find_spec` for a real import probe
-    must not close the gate on a host where bitsandbytes works."""
+    """Replacing find_spec with a real import probe must not close the vllm_utils gate on a host where bitsandbytes works."""
     out = _run(
         "import unsloth_zoo.vllm_utils as v\n"
         "import bitsandbytes.nn.modules\n"

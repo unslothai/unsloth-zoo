@@ -330,8 +330,8 @@ def test_training_goes_through_the_drafter_forward(tmp_path):
 
 
 def test_default_ddp_reduces_the_loss_only_parameters(tmp_path):
-    """Trainer wraps an nn.Module in DDP(find_unused_parameters=True): norm.weight, used only by the loss,
-    must be in forward()'s output graph or backward raises "mark a variable ready only once"."""
+    """Trainer wraps the module in DDP(find_unused_parameters=True); norm.weight, used only by the loss, must be in
+    forward()'s output graph or backward raises "mark a variable ready only once"."""
     import torch.distributed as dist
     from torch.nn.parallel import DistributedDataParallel
     target = _target()
@@ -483,3 +483,105 @@ def test_aux_id_equal_to_the_layer_count_is_refused():
     assert _aux_capture_ids([1, 2], 4) == [0, 1]
     with pytest.raises(ValueError, match = "aux layer id 4"):
         _aux_capture_ids([1, 4], 4)
+
+
+def test_teacher_matches_softcapped_target_logits(tmp_path):
+    """Gemma 4 softcaps its final logits: the trainer's teacher must be the distribution the target samples."""
+    try:
+        from transformers import Gemma4ForCausalLM, Gemma4TextConfig
+    except ImportError:
+        pytest.skip("transformers has no Gemma 4")
+    torch.manual_seed(0)
+    cfg = Gemma4TextConfig(vocab_size = VOCAB, hidden_size = 64, intermediate_size = 128, num_hidden_layers = LAYERS,
+                           num_attention_heads = 4, num_key_value_heads = 2, head_dim = 16, global_head_dim = 16,
+                           max_position_embeddings = 256, final_logit_softcapping = 30.0, hidden_size_per_layer_input = 0,
+                           vocab_size_per_layer_input = VOCAB, layer_types = ["sliding_attention", "full_attention"] * (LAYERS // 2),
+                           sliding_window = 64, num_kv_shared_layers = 0, enable_moe_block = False)
+    cfg._attn_implementation = "eager"
+    target = Gemma4ForCausalLM(cfg).eval()
+    with torch.no_grad():
+        target.lm_head.weight.mul_(40.0)  # raw logits well past the cap
+    gen = torch.Generator().manual_seed(1)
+    d2t, t2d = build_eagle3_vocab_map([torch.randint(0, VOCAB, (2000,), generator = gen).tolist()], VOCAB, DRAFT_VOCAB)
+    drafter = build_eagle3_drafter(target, d2t, t2d).eval()
+
+    class Tok:
+        pad_token_id = 0
+        eos_token_id = 0
+
+    args = Eagle3TrainingArguments(output_dir = str(tmp_path / "out"), report_to = "none", use_cpu = True)
+    trainer = UnslothEagle3Trainer(model = drafter, target_model = target, args = args, processing_class = Tok(),
+                                   train_dataset = Dataset.from_list([{"input_ids": [1, 2]}]))
+    ids = torch.randint(0, VOCAB, (2, 20), generator = gen)
+    labels = ids.clone()
+    labels[:, :5] = -100
+    with torch.no_grad():
+        loss = trainer.compute_loss(drafter, {"input_ids": ids, "labels": labels})
+        teacher = target(ids).logits[:, 1:, t2d]
+        assert float(teacher.abs().max()) < 30.0 < float(target.lm_head(target.model(ids).last_hidden_state).abs().max())
+        cap = run_frozen_target(target, ids, layer_ids = _aux_capture_ids(drafter.aux_layer_ids, LAYERS))
+        steps = drafter.forward_train(aux_hidden_states(cap, drafter.aux_layer_ids), ids, None, 3)
+        ref, _ = eagle3_loss(steps, teacher, labels[:, 1:] != -100)
+    assert torch.allclose(loss, ref, rtol = 1e-4, atol = 1e-5), (float(loss), float(ref))
+
+
+def test_accumulation_window_count_reaches_the_loss(tmp_path, monkeypatch):
+    """GA=2 x bs=1 must step like bs=2: unsloth's batch counter sums the window, even though its
+    Trainer.__init__ wrapper clears the count marker on the model before init."""
+    import copy
+    from transformers import Trainer
+    from unsloth_zoo.loss_utils import NUM_ITEMS_LABELS_ATTR, _unsloth_get_batch_samples
+
+    init = Trainer.__init__
+
+    def unsloth_init(self, *args, model = None, **kwargs):
+        model.__dict__.pop(NUM_ITEMS_LABELS_ATTR, None)
+        init(self, *args, model = model, **kwargs)
+
+    monkeypatch.setattr(Trainer, "__init__", unsloth_init)
+    monkeypatch.setattr(Trainer, "get_batch_samples", _unsloth_get_batch_samples)
+    target = _target()
+    drafter = _drafter(target)
+    gen = torch.Generator().manual_seed(2)
+    ids = [torch.randint(0, VOCAB, (24,), generator = gen).tolist() for _ in range(2)]
+    rows = [{"input_ids": ids[0], "labels": [-100] * 20 + ids[0][20:]},
+            {"input_ids": ids[1], "labels": [-100] * 2 + ids[1][2:]}]
+
+    def step(bs, ga):
+        d = copy.deepcopy(drafter).train()
+        seen = []
+
+        class T(UnslothEagle3Trainer):
+            def compute_loss(self, model, inputs, return_outputs = False, num_items_in_batch = None):
+                seen.append(num_items_in_batch if num_items_in_batch is None else int(num_items_in_batch))
+                return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
+
+        args = Eagle3TrainingArguments(output_dir = str(tmp_path / f"{bs}_{ga}"), per_device_train_batch_size = bs,
+                                       gradient_accumulation_steps = ga, max_steps = 1, learning_rate = 1e-2,
+                                       optim = "sgd", max_grad_norm = 0, report_to = "none", save_strategy = "no",
+                                       use_cpu = True)
+        T(model = d, target_model = target, args = args, train_dataset = Dataset.from_list(rows)).train()
+        return seen, d.fc.weight.detach() - drafter.fc.weight.detach()
+
+    torch.manual_seed(0)
+    seen_full, full = step(2, 1)
+    torch.manual_seed(0)
+    seen_ga, ga = step(1, 2)
+    assert seen_full == [26] and seen_ga == [26, 26]
+    assert torch.allclose(ga, full, rtol = 1e-4, atol = 1e-7)
+
+
+def test_data_parallel_loss_is_the_gathered_token_mean(tmp_path):
+    """Under DataParallel the count arrives once per GPU and the loss is scored once over the gathered
+    batch, so it must equal the single-device loss (Trainer's loss.mean() then leaves it alone)."""
+    target = _target()
+    drafter = _drafter(target)
+    args = Eagle3TrainingArguments(output_dir = str(tmp_path), report_to = "none", use_cpu = True, save_strategy = "no")
+    ids = torch.randint(0, VOCAB, (2, 16))
+    trainer = UnslothEagle3Trainer(model = drafter, target_model = target, args = args,
+                                   train_dataset = Dataset.from_list([{"input_ids": ids[0].tolist()}]))
+    batch = {"input_ids": ids, "labels": ids, "attention_mask": torch.ones_like(ids)}
+    single = trainer.compute_loss(drafter, dict(batch), num_items_in_batch = torch.tensor(30))
+    args._n_gpu = 2
+    dp = trainer.compute_loss(torch.nn.DataParallel(drafter), dict(batch), num_items_in_batch = torch.tensor([30, 30]))
+    assert dp.dim() == 0 and torch.allclose(dp, single)

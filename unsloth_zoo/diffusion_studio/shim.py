@@ -57,8 +57,7 @@ _PLAYER_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "can
 _WANT_ARTIFACT = os.environ.get("DG_ARTIFACT", "") not in ("", "0", "false", "False", "no", "off")
 
 DEFAULT_HOST = "127.0.0.1"
-# 256 tokens per canvas block, so 64 blocks is a 16384-token answer, far above the
-# 2048-token default. See _max_blocks for what this does and does not bound.
+# 64 blocks of 256 tokens is a 16384-token answer, far above the 2048 default; see `_max_blocks` for what this does and does not bound.
 DEFAULT_MAX_BLOCKS = 64
 
 app = FastAPI()
@@ -77,9 +76,8 @@ def _is_local_name(hostname):
         return ipaddress.ip_address(hostname).is_loopback
     except ValueError:
         pass
-    # `127.1` and friends are a user reaching their own machine, and inet_aton is how
-    # the Studio backend's host_policy reads them. A numeric literal cannot be
-    # rebound, so it names loopback or it fails is_loopback below.
+    # Shorthand such as 127.1 is a user reaching their own machine; inet_aton parses it as the Studio host_policy does,
+    # and a numeric literal cannot be rebound, so it is loopback or fails is_loopback.
     try:
         return ipaddress.ip_address(socket.inet_ntoa(socket.inet_aton(hostname))).is_loopback
     except (OSError, ValueError):
@@ -87,10 +85,7 @@ def _is_local_name(hostname):
 
 
 def _hostname_of(value):
-    """The hostname `urlsplit` reads out of an authority or URL, or None when it will
-    not parse (`[oops]` raises, and uncaught that is a 500 rather than a refusal).
-    `user@host` is refused: not Host syntax, and only the part after `@` is compared.
-    """
+    """Hostname urlsplit reads from an authority or URL; None if it will not parse (uncaught that is a 500) or has a user@ part, which is not Host syntax."""
     try:
         split = urlsplit(value)
         return None if "@" in (split.netloc or "") else split.hostname
@@ -107,14 +102,13 @@ async def _bind_to_local_caller(request, call_next):
     (which is what breaks rebinding), and an Origin or Referer, when the caller
     sends one at all, must be local. An ordinary OpenAI client sends neither.
     """
-    # Only when we are loopback-only. A deliberate --host 0.0.0.0 is the operator
-    # publishing this listener, and then the Host is whatever name they reach it by.
+    # The Host check applies only when the server binds loopback; a deliberate --host 0.0.0.0 publishes the listener, so
+    # any Host name it is reached by is accepted.
     if _is_local_name(_STATE.get("host", DEFAULT_HOST)) and \
         not _is_local_name(_hostname_of("//" + (request.headers.get("host") or ""))):
         return JSONResponse({"error": "forbidden host"}, status_code = 403)
     for header in ("origin", "referer"):
-        # Every value, not the first: sent twice, `.get` answers with the local one
-        # while a foreign one rides behind it.
+        # Check every Origin and Referer value, not just the first: a repeated header can put a foreign value behind a local one that .get would return.
         for value in request.headers.getlist(header):
             if value and not _is_local_name(_hostname_of(value)):
                 return JSONResponse({"error": "forbidden origin"}, status_code = 403)
@@ -122,9 +116,7 @@ async def _bind_to_local_caller(request, call_next):
 
 
 def _close_server():
-    """Terminate the visual-server child so a parent exit (e.g. Unsloth's teardown) never leaves an
-    orphaned GPU process. Idempotent. The child is also launched with PR_SET_PDEATHSIG (see
-    visual_engine) so a hard kill of this process still reaps it."""
+    """Terminates the visual-server child so a parent exit never orphans a GPU process; idempotent, and PR_SET_PDEATHSIG covers a hard kill of the parent."""
     srv = _STATE.pop("server", None)
     if srv is not None:
         try:
@@ -155,11 +147,8 @@ _THOUGHT_MARKERS = (
 
 
 def _split_thought_channels(full):
-    """Split raw committed text into ``(reasoning, content)``, dropping the thought markers.
-
-    Handles text with no markers (all content), an unterminated thought (everything after the
-    start marker is reasoning -- e.g. a length-truncated generation), multiple thought blocks,
-    and either marker dialect. Marker text never reaches either channel."""
+    """Splits text into (reasoning, content) with markers removed from both; an unterminated thought, e.g.
+    length-truncated, is all reasoning; either marker dialect works."""
     reasoning, content = [], []
     rest = full
     while True:
@@ -184,8 +173,7 @@ def _split_thought_channels(full):
 
 
 def _marker_holdback(full):
-    """Length of a trailing partial thought marker in *full* to withhold from streaming until the
-    next commit disambiguates it (a block boundary can land mid-marker)."""
+    """Length of a trailing partial thought marker to hold back from streaming, since a block boundary can land mid-marker until the next commit resolves it."""
     longest = 0
     for pair in _THOUGHT_MARKERS:
         for marker in pair:
@@ -256,11 +244,8 @@ def _max_blocks(body):
         mt = int(mt)
     except (TypeError, ValueError):
         mt = 2048
-    # A size bound, not a deadline, and not what stops a long generation: the server
-    # answers anything over its per-turn budget with ERR toolong, and an explicit
-    # --maxtok is already capped at 8192 (32 blocks) by _canvas_maxtok, below this.
-    # So it binds only against an auto-sized budget above 16384. DG_MAX_BLOCKS raises
-    # it, read at the call so Studio can set it after import.
+    # A size bound, not a deadline: explicit maxtok is capped at 8192 by `_canvas_maxtok`, so this binds only on an
+    # auto-sized budget above 16384; `DG_MAX_BLOCKS` raises it and is read per call so Studio can set it after import.
     try:
         ceiling = max(1, int(os.environ.get("DG_MAX_BLOCKS", "").strip()))
     except ValueError:
@@ -270,12 +255,7 @@ def _max_blocks(body):
 
 
 def _finish_reason(capped, max_blocks, stats):
-    """`length` only when the ceiling WE imposed is what ended the generation.
-
-    A request honoured in full, or one that stopped early with blocks to spare,
-    finished naturally and saying `length` there is the same bug reversed. An older
-    server reporting no block count leaves it undecidable, and then `stop` stands.
-    """
+    """Reports length only when our own block ceiling ended generation; a request honoured in full or stopped early is stop, as is a server reporting no block count."""
     if not capped:
         return "stop"
     try:
@@ -307,8 +287,7 @@ def health():
 
 
 def _tools_for_choice(tools, tool_choice):
-    # Honor tool_choice before advertising: "none" hides tools, a forced function
-    # narrows to just that one, anything else forwards all.
+    # Honor tool_choice before advertising tools: 'none' hides them, a forced function narrows to that one, anything else forwards all.
     if isinstance(tool_choice, str) and tool_choice.lower() == "none":
         return None
     if isinstance(tool_choice, dict):

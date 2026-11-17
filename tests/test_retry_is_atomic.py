@@ -14,37 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`_retry_with_more_budget` re-runs the call. That is only safe if it is atomic.
-
-When the recompile cache is exhausted mid-step,
-`_fall_back_to_eager_on_recompile_limit` buys a little budget and runs
-`compiled_func(*args, **kwargs)` AGAIN, from the start. Re-running a call that
-already did something is not a retry, it is a second execution, and inside a
-non-reentrant checkpoint recomputation the price is silent:
-
-`torch.utils.checkpoint._recomputation_hook.pack_hook` reads
-`recomp_idx = target_frame.recomp_counter[gid]` and increments it. Nothing
-resets that counter, so a recomputation that starts over packs its tensors at
-shifted indices. Every holder still receives a handle of the right shape and
-dtype, so torch's own `check_recomputed_tensors_match` sees nothing wrong, and
-the backward returns WRONG GRADIENTS with no error at all. (When the shift
-pushes the counter past the region's tail instead, it surfaces as the louder
-`_internal_assert(holder.handles[gid] in self.recomputed[gid])`.)
-
-The retry is safe today for one reason and one reason only: every production
-caller reaches the wrapper through `compile_with_eager_fallback`, which hands
-it a direct `fullgraph = True` compile of a plain function. Dynamo raises
-`FailOnRecompileLimitHit` at frame entry for that shape, before the body runs a
-single op, so the failed attempt packed nothing and starting over is a genuine
-retry.
-
-Nothing in the code says so, which is what these tests are for. Hand the
-wrapper something whose failure is not atomic -- a callable that runs ops and
-then calls a compiled one -- and the hazard is back, silently. The first test
-pins the shape; the second demonstrates, without any compilation at all, what
-it costs when the shape is violated, so the first test's failure message means
-something.
-"""
+"""Pins that the recompile-limit retry stays atomic: re-running compiled_func is safe only because a direct
+fullgraph=True compile raises at frame entry before any op runs; a non-atomic callable silently gives wrong gradients
+under non-reentrant checkpoint recomputation."""
 
 import inspect
 import sys
@@ -58,13 +30,8 @@ from unsloth_zoo.temporary_patches import utils as U  # noqa: E402
 
 
 def test_the_only_production_entry_point_compiles_the_function_directly():
-    """`compile_with_eager_fallback` must wrap a compile OF the function it was given.
-
-    If it ever wraps something that merely CALLS a compiled callable, the
-    retry stops being atomic. Read from the source rather than by calling it,
-    because the compile itself needs no GPU but a real Dynamo run is a slow and
-    flaky thing to put in a unit test.
-    """
+    """compile_with_eager_fallback must wrap a compile OF the given function, not a caller of one, or the retry stops
+    being atomic; read from source, as a real Dynamo run is slow and flaky."""
     source = inspect.getsource(U.compile_with_eager_fallback)
     assert "_raw_torch_compile(" in source, (
         "compile_with_eager_fallback no longer compiles the function itself"
@@ -77,11 +44,7 @@ def test_the_only_production_entry_point_compiles_the_function_directly():
 
 
 def test_nothing_else_in_the_package_applies_the_fallback():
-    """One production entry point, so one shape to keep atomic.
-
-    A second call site would need its own argument checked, and this test is
-    the thing that notices a second one arriving.
-    """
+    """One production entry point, so one shape to keep atomic: a second call site would need its own check, and this test notices one arriving."""
     package = Path(U.__file__).resolve().parent
     callers = sorted(
         path.relative_to(package).as_posix()
@@ -96,11 +59,8 @@ def test_nothing_else_in_the_package_applies_the_fallback():
 
 
 def _run_region(restart_once, trailing):
-    """A checkpointed region whose inner callable optionally restarts itself.
-
-    No compilation: the point is what RE-RUNNING costs, and a plain exception
-    reproduces that exactly while staying fast and deterministic on CPU.
-    """
+    """A checkpointed region whose inner callable optionally restarts itself; no compilation, as a plain exception
+    reproduces the cost of re-running and stays fast and deterministic."""
     state = {"recomputing": False, "fired": False}
 
     def inner(x):
@@ -131,12 +91,8 @@ def _run_region(restart_once, trailing):
 
 
 def test_restarting_a_call_inside_a_recompute_silently_corrupts_gradients():
-    """The failure this is all guarding against, made visible.
-
-    Same inputs, same region, same seed. The only difference is that one run's
-    inner callable restarts itself once during the recomputation. No exception
-    is raised in either case; the gradients simply disagree.
-    """
+    """Makes the silent corruption visible: same inputs and seed, but one run's inner callable restarts itself once
+    during recomputation; no exception is raised, yet gradients disagree."""
     for trailing in (0, 1, 3, 8):
         clean = _run_region(restart_once = False, trailing = trailing)
         restarted = _run_region(restart_once = True, trailing = trailing)

@@ -79,8 +79,7 @@ def test_garbage_env_ngl_falls_back_to_default():
     assert env["NGL"] == "99"
 
 
-# Paths here are colon-free so the assertions hold regardless of the host's
-# os.pathsep (on Linux it is ":", which would split a "C:\..." path).
+# Paths are colon-free so the assertions hold whatever os.pathsep is; on Linux ':' would split a Windows drive-letter path.
 def test_windows_prepends_torch_lib_to_path_only(monkeypatch):
     monkeypatch.setattr(V, "_bundled_cuda_lib_dirs", lambda: ["/wheel/nvidia/cu13/lib"])
     monkeypatch.setattr(V, "_torch_cuda_lib_dir", lambda: "/py/torch/lib")

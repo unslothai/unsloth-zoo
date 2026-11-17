@@ -20,7 +20,11 @@ Env: ``UNSLOTH_DISABLE_VENDORED_FLA=1`` never injects (an installed fla is untou
 an installed fla strictly newer than the snapshot wins unless ``UNSLOTH_FORCE_VENDORED_FLA=1``;
 ``UNSLOTH_DISABLE_HOPPER_FLA_BWD=1`` forces pure torch on Hopper + Triton [3.4.0, 3.7.1) (fla #640);
 ``UNSLOTH_GDN_BACKEND=flashqla`` sends supported chunk_gated_delta_rule calls to FlashQLA (``pip install flash-qla``);
-on SM120 only with ``UNSLOTH_FLASHQLA_ALLOW_SM120=1`` (QwenLM/FlashQLA#35).
+otherwise fla's own FlashQLA dispatch (fla >= 0.6) is defaulted off with ``FLA_FLASH_QLA=0``;
+on SM120 only with ``UNSLOTH_FLASHQLA_ALLOW_SM120=1`` (QwenLM/FlashQLA#35);
+``UNSLOTH_KDA_SAFE_GATE=0`` keeps GLM-5.3-Flash's bounded KDA gates off fla's safe_gate path.
+On ROCm gfx11 float32 chunk_gated_delta_rule calls take transformers' pure-torch reference
+(fla's float32 chunk kernels fault there); bfloat16 / float16 and CUDA are untouched.
 Injects only with torch >= 2.7, triton >= 3.3 and CUDA.
 """
 
@@ -30,7 +34,9 @@ __all__ = [
 ]
 
 import os
+import re
 import sys
+import warnings
 import functools
 import inspect
 import threading
@@ -59,8 +65,7 @@ _HUB_REPAIR_MODELING = _REPAIR_MODELING + _KDA_MODELING
 # olmo_hybrid is not covered: it has not been validated on the vendored tree.
 _VENDOR_COVERED_MODELS = frozenset(_HUB_REPAIR_MODELING)
 
-# All gated-delta consumers; olmo_hybrid can bind an installed fla's #640 kernel.
-# Kimi Linear absent: remote code on KDA ops, never reaches chunk_bwd_dqkwg.
+# olmo_hybrid can bind installed fla's issue 640 kernel; Kimi Linear never reaches chunk_bwd_dqkwg.
 _GATED_DELTA_MODELING = _REPAIR_MODELING + ("olmo_hybrid",)
 
 _UNCOVERED_GATED_DELTA = tuple(
@@ -112,8 +117,8 @@ def _version_strictly_after(value, threshold):
 
 
 def _hopper_dqkwg_suspect(torch_mod, triton_mod):
-    """Any visible GPU is Hopper with triton in [3.4.0, 3.7.1) (fla #640 miscompile).
-    Probes every device: a mixed host may run the model on a nonzero Hopper card."""
+    """Any visible GPU is Hopper with triton in [3.4.0, 3.7.1) (fla issue 640 miscompile); probes every device, since a
+    mixed host may run the model on a nonzero Hopper card."""
     try:
         from packaging import version
         v = version.parse(str(triton_mod.__version__).split("+")[0])
@@ -299,8 +304,7 @@ _FLA_DISABLED_REASON = None
 
 
 def fla_unavailable_reason():
-    """A user-facing explanation of why Unsloth disabled fla's gated-delta kernels,
-    or ``None`` when they were not disabled. Read by unsloth's model loader."""
+    """User-facing reason Unsloth disabled fla's gated-delta kernels, or None if they were not disabled; read by unsloth's model loader."""
     return _FLA_DISABLED_REASON
 
 
@@ -345,8 +349,7 @@ def _should_defer_to_installed_fla():
 
 
 def _neutralize_tilelang_backend_probe():
-    """Force the pruned TileLang backend unavailable; a broken tilelang can raise a
-    non-ImportError in its probe. Call while ``tilelang`` is shadowed."""
+    """Forces the pruned TileLang backend unavailable, since a broken tilelang can raise a non-ImportError in its probe; call while tilelang is shadowed."""
     try:
         from fla.ops.common.backends.tilelang import TileLangBackend
         TileLangBackend.is_available = classmethod(lambda cls: False)
@@ -375,8 +378,8 @@ def _neutralize_intracard_backend_probe():
 
 
 def _withhold_kda_on_rocm():
-    """ROCm: Triton's AMD pipeline pass fails compiling the KDA kernels (gfx1151, triton 3.6), so
-    fla.ops.kda stays unimportable and the kernel-hub wrappers keep the torch fallback."""
+    """ROCm: Triton's AMD pipeline fails compiling KDA kernels (gfx1151, triton 3.6), so fla.ops.kda stays unimportable
+    and kernel-hub wrappers keep the torch fallback."""
     try:
         import torch
         if getattr(torch.version, "hip", None) is None:
@@ -388,8 +391,7 @@ def _withhold_kda_on_rocm():
 
 
 def _blackwell_import_device(torch_mod):
-    """Blackwell device to make current during import, else None: fla.utils freezes
-    IS_NVIDIA_BLACKWELL from the current device at import."""
+    """Device to make current during import, or None; fla.utils freezes IS_NVIDIA_BLACKWELL from it."""
     try:
         if not torch_mod.cuda.is_available():
             return None
@@ -404,9 +406,20 @@ def _blackwell_import_device(torch_mod):
     return None
 
 
+# Not TRITON_DEFAULT_FP_FUSION: that would also pin fusion for the user's own kernels on Triton 3.10.
+_TRITON_FP_FUSION_DEFAULT_MESSAGE = re.escape(
+    "TRITON_DEFAULT_FP_FUSION is unset: defaulting to FP fusion ENABLED"
+)
+
+
+def _ignore_triton_fp_fusion_default_warning():
+    warnings.filterwarnings(
+        "ignore", message = _TRITON_FP_FUSION_DEFAULT_MESSAGE, category = UserWarning,
+    )
+
+
 def _inject_vendored_fla():
-    """Register the vendored tree as ``fla``. Returns ``(injected, replaced_real)``;
-    ``replaced_real`` means a real fla was purged."""
+    """Register vendored tree as fla; returns (injected, replaced_real), latter if real fla was purged."""
     vendored_dir = _vendored_fla_dir()
     init_path = os.path.join(vendored_dir, "__init__.py")
     if not os.path.isfile(init_path):
@@ -483,6 +496,7 @@ def _inject_vendored_fla():
         if UNSLOTH_ENABLE_LOGGING:
             logger.warning(f"Unsloth: failed injecting vendored fla ({e}); keeping pure-torch path.")
         return False, False
+    _ignore_triton_fp_fusion_default_warning()
     return True, replaced_real
 
 
@@ -537,8 +551,7 @@ def _patch_is_available(probe=None):
 
 
 def _repair_already_imported_modeling(force_rebind=False):
-    """Rebind fla globals on modeling modules imported before injection.
-    ``force_rebind`` also replaces non-None globals pointing at a purged real fla."""
+    """Rebind fla globals in pre-imported modeling modules; force_rebind also replaces purged-fla ones."""
     fused_rms = chunk_fn = fused_recurrent_fn = None
     loaded = False
     for pkg in _REPAIR_MODELING:
@@ -603,8 +616,7 @@ def _disable_already_imported_gated_delta(packages=_GATED_DELTA_MODELING, why="U
 
 _INSTALLED_FLA_PATCH_MARK = "_unsloth_hopper_dqkwg_patched"
 
-# threading.local, not a saved/restored global: autograd runs one backward thread per
-# device and drops the GIL, so a global save/restore interleaves across GPUs.
+# threading.local: autograd runs one backward thread per GPU, so a global save/restore interleaves.
 _installed_fla_tls = threading.local()
 
 
@@ -613,12 +625,7 @@ def _installed_fla_forcing_small_tile():
 
 
 def _patch_installed_fla_dqkwg():
-    """Apply the #640 BK=64 workaround to a user-installed fla in place.
-
-    Sets ``IS_NVIDIA_HOPPER`` False permanently (only the guard reads it) and shims
-    ``check_shared_mem`` to answer False under the thread-local override, giving BK=32.
-    Returns True if patched (idempotent); False leaves fla untouched.
-    """
+    """Apply the fla issue 640 BK=64 workaround (gives BK=32) in place; True if patched, idempotent."""
     try:
         import triton
         import fla.ops.common.chunk_o as chunk_o
@@ -742,8 +749,7 @@ def _mark_fla_disabled_hopper():
 
 
 def _transformers_uses_availability_probe():
-    """Whether transformers still selects kernels via the availability probe (pre-#47630).
-    Must run before ``_patch_is_available``, which creates that attribute."""
+    """Pre-47630 transformers still uses the availability probe; must run before _patch_is_available."""
     try:
         from transformers.integrations import hub_kernels
     except Exception:
@@ -769,8 +775,7 @@ def _warn_hopper_optout_degraded():
     )
 
 
-# transformers#47630 asks fla for recurrent_gated_delta_rule, which fla never exported
-# (it is fused_recurrent_...), so decode silently ran the torch fallback.
+# transformers 47630 wants fla's recurrent_gated_delta_rule, unexported; decode silently ran torch.
 _MISSING_GATED_DELTA_ALIASES = {
     "recurrent_gated_delta_rule": "fused_recurrent_gated_delta_rule",
 }
@@ -806,6 +811,137 @@ def _alias_missing_gated_delta_names():
     return tuple(added)
 
 
+# GLM-5.3-Flash (glm5_next) bounds its KDA forget gate: Glm5NextTextForgetGate returns
+# config.linear_lower_bound * sigmoid(.), in [linear_lower_bound, 0] (-5 in the released config).
+# For such gates fla's chunk_kda(safe_gate=True) computes the 16x16 intra-chunk diagonal blocks on
+# tensor cores instead of token by token (1.2x KDA fwd + bwd on A100 at 64 heads, T = 8192).
+# Kimi-Linear's gate is unbounded (-exp(A_log) * softplus(.)), so only glm5_next is patched: each
+# Glm5NextTextLinearAttention records config.linear_lower_bound at __init__, and while every
+# glm5_next layer built so far shares one bound in fla's accepted [-5, 0), the fla kernel behind
+# glm5_next's kernel-hub chunk_kimi_delta_attention becomes functools.partial(chunk_kda,
+# safe_gate = True, lower_bound = bound). The call path keeps its frames (no new graph breaks).
+# Only on the vendored tree (it carries fla #1242 and #1554, without which the safe_gate dg error
+# is 5e-2 to 2.6e-1), Triton >= 3.6 (bf16x3 backward dots) and SM80+ (T4 is slower with it).
+# UNSLOTH_KDA_SAFE_GATE=0 disables (read when a layer is built).
+_GLM5_NEXT_MODULE = "transformers.models.glm5_next.modeling_glm5_next"
+_KDA_SAFE_GATE_MARK = "_unsloth_kda_safe_gate"
+_KDA_SAFE_GATE_INNER = "_unsloth_kda_inner"
+_KDA_SAFE_GATE_RANGE = (-5.0, 0.0)  # fla chunk_kda only accepts lower_bound in [-5, 0)
+# bound: the engaged lower bound or None; bounds: every glm5_next layer's; layers: engaged builds.
+_kda_safe_gate_state = {"bound": None, "bounds": set(), "layers": 0}
+
+
+def _kda_safe_gate_hardware_ok():
+    """Vendored fla live, Triton >= 3.6, CUDA (not ROCm) and every visible GPU SM80+."""
+    if not _vendored_already_injected():
+        return False
+    try:
+        import torch
+        from fla.utils import TRITON_ABOVE_3_6_0
+        if not TRITON_ABOVE_3_6_0 or getattr(torch.version, "hip", None) is not None:
+            return False
+        n = torch.cuda.device_count()
+        return n > 0 and all(torch.cuda.get_device_capability(i) >= (8, 0) for i in range(n))
+    except Exception:
+        return False
+
+
+def _hub_implementation_cell(wrapper):
+    """The ``implementation`` closure cell of a kernel-hub fallback wrapper, or None."""
+    code = getattr(wrapper, "__code__", None)
+    for name, cell in zip(getattr(code, "co_freevars", ()), getattr(wrapper, "__closure__", None) or ()):
+        if name == "implementation":
+            return cell
+    return None
+
+
+def _glm5_modules():
+    names = [_GLM5_NEXT_MODULE] + sorted(
+        name for name in list(sys.modules)
+        if name.startswith(_UNSLOTH_COMPILED_MODULE_PREFIX) and "glm5_next" in name
+    )
+    return [sys.modules[n] for n in names if sys.modules.get(n) is not None]
+
+
+def _apply_glm5_kda_safe_gate(bound):
+    """Point glm5_next's chunk_kimi_delta_attention at chunk_kda with (bound) or without (None) safe_gate."""
+    applied = 0
+    for module in _glm5_modules():
+        wrapper = getattr(module, "chunk_kimi_delta_attention", None)
+        cell = _hub_implementation_cell(wrapper)
+        if cell is None:
+            continue
+        try:
+            current = cell.cell_contents
+        except ValueError:
+            continue
+        base = getattr(current, _KDA_SAFE_GATE_INNER, current)
+        # Only the fla kernel: the torch fallback (wrapper.__wrapped__) has no safe_gate.
+        if base is getattr(wrapper, "__wrapped__", None) or "safe_gate" not in inspect.signature(base).parameters:
+            continue
+        if bound is None:
+            new = base
+        elif getattr(current, _KDA_SAFE_GATE_MARK, None) == bound:
+            new = current
+        else:
+            new = functools.partial(base, safe_gate = True, lower_bound = bound)
+            setattr(new, _KDA_SAFE_GATE_MARK, bound)
+            setattr(new, _KDA_SAFE_GATE_INNER, base)
+        if new is not current:
+            cell.cell_contents = new
+        applied += 1
+    return applied
+
+
+def _glm5_record_kda_bound(bound):
+    """Called from Glm5NextTextLinearAttention.__init__ with config.linear_lower_bound."""
+    state = _kda_safe_gate_state
+    valid = not isinstance(bound, bool) and isinstance(bound, (int, float))
+    low, high = _KDA_SAFE_GATE_RANGE
+    state["bounds"].add(float(bound) if valid else None)
+    (only,) = state["bounds"] if len(state["bounds"]) == 1 else (None,)
+    enabled = (
+        only is not None and low <= only < high
+        and os.environ.get("UNSLOTH_KDA_SAFE_GATE", "1") != "0"
+        and _kda_safe_gate_hardware_ok()
+    )
+    state["bound"] = only if enabled else None
+    if _apply_glm5_kda_safe_gate(state["bound"]) and enabled:
+        state["layers"] += 1
+        if UNSLOTH_ENABLE_LOGGING and state["layers"] == 1:
+            logger.info(f"Unsloth: GLM-5.3-Flash KDA gates are bounded below by {only}; using fla safe_gate.")
+
+
+def _install_glm5_kda_safe_gate():
+    """Patch Glm5NextTextLinearAttention.__init__ to record its bound, independent of import order."""
+    module = sys.modules.get(_GLM5_NEXT_MODULE)
+    if module is None:
+        if "transformers.modeling_utils" not in sys.modules:
+            return False
+        try:
+            if importlib.util.find_spec("transformers.models.glm5_next") is None:
+                return False
+            module = importlib.import_module(_GLM5_NEXT_MODULE)
+        except Exception:
+            return False
+    cls = getattr(module, "Glm5NextTextLinearAttention", None)
+    if cls is None:
+        return False
+    if not getattr(cls.__init__, _KDA_SAFE_GATE_MARK, False):
+        original_init = cls.__init__
+
+        @functools.wraps(original_init)
+        def __init__(self, config, *args, **kwargs):
+            original_init(self, config, *args, **kwargs)
+            _glm5_record_kda_bound(getattr(config, "linear_lower_bound", None))
+
+        setattr(__init__, _KDA_SAFE_GATE_MARK, True)
+        cls.__init__ = __init__
+    # A repair may have rebuilt the wrapper: re-apply the current choice to it.
+    _apply_glm5_kda_safe_gate(_kda_safe_gate_state["bound"])
+    return True
+
+
 # Kernel-hub decorated wrapper -> (fla module, kernel). causal_conv1d is not vendored.
 _KERNEL_HUB_DECORATED = {
     "torch_chunk_gated_delta_rule": ("fla.ops.gated_delta_rule", "chunk_gated_delta_rule"),
@@ -823,7 +959,8 @@ def _resolved_implementation(wrapper):
         except ValueError:
             continue
         if callable(value):
-            return value
+            # glm5_next's safe_gate partial: report the fla kernel it wraps.
+            return getattr(value, _KDA_SAFE_GATE_INNER, value)
     return None
 
 
@@ -903,8 +1040,7 @@ def _gdn_backend():
 
 
 def _flashqla_version(flash_qla):
-    """Version of the imported flash_qla: the distribution's only if it owns the imported file
-    (a checkout earlier on sys.path can shadow an installed flash-qla)."""
+    """Distribution version only if it owns the imported file; earlier sys.path checkout can shadow it."""
     version = getattr(flash_qla, "__version__", None)
     if version:
         return version
@@ -958,8 +1094,7 @@ def _load_flashqla():
 
 
 def _flashqla_unsupported(q, k, v, g, beta, initial_state, cu_seqlens, cp_context, extra):
-    """Why FlashQLA cannot serve this call, or None. Mirrors fla's own FlashQLA backend
-    verifier (fla/ops/gated_delta_rule/backends/flash_qla.py)."""
+    """Reason FlashQLA cannot serve this call, or None; mirrors fla's FlashQLA backend verifier."""
     import torch
     if not (q.is_cuda and k.is_cuda and v.is_cuda):
         return "not CUDA"
@@ -1104,6 +1239,352 @@ def _install_gdn_backend():
     return True
 
 
+# ROCm gfx11 (RDNA3 / RDNA3.5): fla's chunked gated-delta kernels built for float32 inputs
+# fault on gfx1151 (Radeon 8060S, Triton 3.6 / ROCm 7.13): chunk_gated_delta_rule_fwd_kernel_h_blockdim64
+# hits an illegal memory access and prepare_wy_repr_bwd_kernel hangs, with every config that fits
+# in 64 KB of LDS. The same kernels in bfloat16 / float16 run and match an fp64 reference, so only
+# float32 calls leave fla: they take transformers' pure-torch chunked reference. Never on CUDA.
+_ROCM_FP32_TORCH_PATH_GFX = "gfx11"
+_ROCM_FP32_MARK = "_unsloth_rocm_fp32_torch_path"
+_rocm_fp32_state = {"arch": {}, "reference": None, "calls": 0, "logged": False}
+
+
+def _hip_gfx_arch(torch_mod, index):
+    """gcnArchName of HIP device ``index`` without feature flags ("gfx1151"), or "" if unknown."""
+    try:
+        props = torch_mod.cuda.get_device_properties(index)
+        return str(getattr(props, "gcnArchName", "") or "").split(":", 1)[0].strip().lower()
+    except Exception:
+        return ""
+
+
+def _rocm_has_fp32_faulting_gpu(torch_mod=None):
+    """ROCm and some visible GPU is gfx11; CUDA, CPU or unreadable -> False."""
+    try:
+        if torch_mod is None:
+            import torch as torch_mod
+        if getattr(getattr(torch_mod, "version", None), "hip", None) is None:
+            return False
+        if not torch_mod.cuda.is_available():
+            return False
+        return any(
+            _hip_gfx_arch(torch_mod, i).startswith(_ROCM_FP32_TORCH_PATH_GFX)
+            for i in range(int(torch_mod.cuda.device_count()))
+        )
+    except Exception:
+        return False
+
+
+def _rocm_fp32_on_faulting_gpu(*tensors):
+    """Any float32 tensor among ``tensors`` sits on a ROCm gfx11 device."""
+    import torch
+    if getattr(torch.version, "hip", None) is None:
+        return False
+    for t in tensors:
+        if not isinstance(t, torch.Tensor) or t.dtype != torch.float32 or t.device.type != "cuda":
+            continue
+        index = t.device.index if t.device.index is not None else torch.cuda.current_device()
+        arch = _rocm_fp32_state["arch"].get(index)
+        if arch is None:
+            arch = _rocm_fp32_state["arch"][index] = _hip_gfx_arch(torch, index)
+        if arch.startswith(_ROCM_FP32_TORCH_PATH_GFX):
+            return True
+    return False
+
+
+def _torch_reference_chunk_gated_delta_rule():
+    """transformers' pure-torch ``torch_chunk_gated_delta_rule`` (the kernel-hub fallback), unwrapped."""
+    if _rocm_fp32_state["reference"] is not None:
+        return _rocm_fp32_state["reference"]
+    fn = None
+    try:
+        from transformers.models.qwen3_next.modeling_qwen3_next import torch_chunk_gated_delta_rule as fn
+    except Exception:
+        try:
+            from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule as fn
+        except Exception:
+            try:
+                from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import torch_chunk_gated_delta_rule as fn
+            except Exception:
+                fn = None
+    if fn is not None:
+        _rocm_fp32_state["reference"] = inspect.unwrap(fn)
+        return _rocm_fp32_state["reference"]
+    raise RuntimeError("Unsloth: transformers has no torch_chunk_gated_delta_rule to run float32 gated delta on ROCm gfx11.")
+
+
+def _rocm_fp32_chunk_gated_delta_rule(
+    q, k, v, g, beta, scale = None, initial_state = None, output_final_state = False,
+    use_qk_l2norm_in_kernel = False, use_beta_sigmoid_in_kernel = False, allow_neg_eigval = False,
+    state_v_first = False, cu_seqlens = None, cu_seqlens_cpu = None, cp_context = None, **kwargs,
+):
+    """fla's ``chunk_gated_delta_rule`` contract computed by transformers' torch reference."""
+    import torch
+    if "transpose_state_layout" in kwargs:
+        # fla's deprecated name for state_v_first, with fla's conflict check.
+        if state_v_first:
+            raise ValueError("Cannot pass both `state_v_first` and the deprecated `transpose_state_layout`.")
+        state_v_first = kwargs.pop("transpose_state_layout")
+    if cp_context is not None or kwargs.get("use_gate_in_kernel") or kwargs.get("head_first"):
+        raise RuntimeError(
+            "Unsloth: gated delta runs in pure torch for CPU tensors and for float32 on ROCm gfx11, which does "
+            "not support context parallel, use_gate_in_kernel or head_first. Use bfloat16 / float16 on the GPU."
+        )
+    reference = _torch_reference_chunk_gated_delta_rule()
+    if use_beta_sigmoid_in_kernel:
+        beta = beta.float().sigmoid() * (2.0 if allow_neg_eigval else 1.0)
+    groups = v.shape[2] // q.shape[2]
+    if groups > 1:
+        q = q.repeat_interleave(groups, dim = 2)
+        k = k.repeat_interleave(groups, dim = 2)
+    if use_qk_l2norm_in_kernel:
+        q = _fp32_l2norm(q)
+        k = _fp32_l2norm(k)
+    head_dim = q.shape[-1]
+    if scale is None:
+        scale = head_dim ** -0.5
+    # The reference multiplies q by head_dim ** -0.5 itself.
+    q = q * (scale * head_dim ** 0.5)
+    if initial_state is not None and state_v_first:
+        initial_state = initial_state.transpose(-1, -2)
+
+    def run(qs, ks, vs, gs, bs, h0):
+        return reference(
+            qs, ks, vs, gs, bs, initial_state = h0, output_final_state = output_final_state,
+            use_qk_l2norm_in_kernel = False,
+        )
+
+    if cu_seqlens is None:
+        o, final_state = run(q, k, v, g, beta, initial_state)
+    else:
+        bounds = (cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens).tolist()
+        outs, states = [], []
+        for i, (start, end) in enumerate(zip(bounds[:-1], bounds[1:])):
+            h0 = initial_state[i : i + 1] if initial_state is not None else None
+            if end <= start:
+                states.append(h0.float() if h0 is not None else q.new_zeros(
+                    1, v.shape[2], head_dim, v.shape[-1], dtype = torch.float32))
+                continue
+            o_i, h_i = run(*(t[:, start:end] for t in (q, k, v, g, beta)), h0)
+            outs.append(o_i)
+            states.append(h_i)
+        o = torch.cat(outs, dim = 1) if outs else v.new_zeros(v.shape)
+        final_state = torch.cat(states, dim = 0) if output_final_state else None
+    if final_state is not None and state_v_first:
+        final_state = final_state.transpose(-1, -2).contiguous()
+    return o, final_state
+
+
+def _make_rocm_fp32_chunk_gated_delta_rule(original):
+    """float32 on a ROCm gfx11 GPU -> torch reference; everything else -> ``original``, untouched."""
+    signature = inspect.signature(original)
+
+    @functools.wraps(original)
+    def chunk_gated_delta_rule(*args, **kwargs):
+        try:
+            a = signature.bind(*args, **kwargs).arguments
+        except TypeError:
+            return original(*args, **kwargs)
+        if not _rocm_fp32_on_faulting_gpu(a.get("q"), a.get("k"), a.get("v")):
+            return original(*args, **kwargs)
+        _rocm_fp32_state["calls"] += 1
+        if not _rocm_fp32_state["logged"]:
+            _rocm_fp32_state["logged"] = True
+            logger.info(
+                "Unsloth: float32 gated-delta (linear attention) runs in pure torch on this AMD GPU: "
+                "fla's float32 kernels fault on gfx11. bfloat16 / float16 keep the fast kernels."
+            )
+        extra = dict(a.pop("kwargs", {}))
+        return _rocm_fp32_chunk_gated_delta_rule(**a, **extra)
+
+    setattr(chunk_gated_delta_rule, _ROCM_FP32_MARK, "torch")
+    return chunk_gated_delta_rule
+
+
+def _make_rocm_fp32_guard(original, what):
+    """Refuse float32 on ROCm gfx11 before any kernel launches: a direct caller of fla's internals
+    (unsloth's opaque gated-delta op self-checks through them) gets an exception, not a dead GPU."""
+
+    @functools.wraps(original)
+    def guarded(*args, **kwargs):
+        tensors = list(args[:3]) + [kwargs.get(name) for name in ("q", "k", "v")]
+        if _rocm_fp32_on_faulting_gpu(*tensors):
+            raise RuntimeError(
+                f"Unsloth: fla {what} does not run float32 on ROCm gfx11 (its kernels fault); "
+                f"call fla.ops.gated_delta_rule.chunk_gated_delta_rule, which uses pure torch for float32."
+            )
+        return original(*args, **kwargs)
+
+    setattr(guarded, _ROCM_FP32_MARK, "guard")
+    return guarded
+
+
+def _install_rocm_fp32_torch_path(torch_mod=None):
+    """ROCm with a gfx11 GPU: route the live fla's float32 chunk_gated_delta_rule calls to the
+    torch reference and guard its float32 internals. Anything else: nothing is touched. Idempotent."""
+    if not _rocm_has_fp32_faulting_gpu(torch_mod):
+        return False
+    package = sys.modules.get("fla.ops.gated_delta_rule")
+    chunk_mod = sys.modules.get("fla.ops.gated_delta_rule.chunk")
+    original = getattr(package, "chunk_gated_delta_rule", None) if package is not None else None
+    if original is None:
+        return False
+    if getattr(original, _ROCM_FP32_MARK, None) is not None:
+        return True
+    try:
+        import torch
+        wrapped = torch.compiler.disable(_make_rocm_fp32_chunk_gated_delta_rule(original))
+    except Exception:
+        wrapped = _make_rocm_fp32_chunk_gated_delta_rule(original)
+    setattr(wrapped, _ROCM_FP32_MARK, "torch")
+    package.chunk_gated_delta_rule = wrapped
+    if chunk_mod is not None:
+        if getattr(chunk_mod, "chunk_gated_delta_rule", None) is original:
+            chunk_mod.chunk_gated_delta_rule = wrapped
+        for name in ("chunk_gated_delta_rule_fwd", "chunk_gated_delta_rule_bwd"):
+            fn = getattr(chunk_mod, name, None)
+            if fn is not None and getattr(fn, _ROCM_FP32_MARK, None) is None:
+                setattr(chunk_mod, name, _make_rocm_fp32_guard(fn, name))
+    # Modeling modules (and unsloth's compiled copies) that bound the original at import.
+    for modname in _l2norm_modules(_GATED_DELTA_MODELING):
+        mod = sys.modules.get(modname)
+        if mod is not None and getattr(mod, "chunk_gated_delta_rule", None) is original:
+            setattr(mod, "chunk_gated_delta_rule", wrapped)
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info("Unsloth: float32 gated-delta calls on ROCm gfx11 take the pure-torch path.")
+    return True
+
+
+# transformers picks fla per import, not per device, so CPU tensors on a GPU host reached fla's Triton kernels
+# and crashed; CPU calls take the torch reference via the ROCm gfx11 contract adapter.
+_CPU_TORCH_MARK = "_unsloth_cpu_torch_path"
+_cpu_torch_state = {"calls": 0, "logged": False}
+
+
+def _compiling():
+    import torch
+    return torch.compiler.is_compiling()
+
+
+def _on_cpu(args, kwargs):
+    q = kwargs.get("q", args[0] if args else None)
+    return getattr(getattr(q, "device", None), "type", None) == "cpu"
+
+
+def _make_cpu_gated_delta_rule(original, recurrent):
+    """CPU tensors -> transformers' torch reference with fla's contract; anything else -> ``original``.
+    Plain Python so torch.compile traces it: the CPU branch compiles like the stock torch path, the GPU branch
+    meets fla's own compiler-disabled entry exactly as before. ``updated=()`` keeps fla's disable marker in
+    ``__dict__`` from being copied onto this wrapper."""
+    names = [
+        n for n, p in inspect.signature(original).parameters.items()
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ]
+
+    @functools.wraps(original, updated = ())
+    def gated_delta_rule(*args, **kwargs):
+        if not _on_cpu(args, kwargs):
+            return original(*args, **kwargs)
+        a = dict(zip(names, args))
+        a.update(kwargs)
+        extra = {}
+        if recurrent:
+            if a.pop("gk", None) is not None or a.pop("gv", None) is not None or a.get("g") is None:
+                raise RuntimeError(
+                    "Unsloth: fla's fused_recurrent_gated_delta_rule on CPU tensors runs in pure torch, "
+                    "which supports a scalar gate g only (no gk / gv)."
+                )
+            extra["use_gate_in_kernel"] = a.pop("use_gate_in_kernel", False)
+            a.pop("A_log", None)
+            a.pop("dt_bias", None)
+        # Host-side bookkeeping only outside tracing: a traced global counter is a guard, recompiling every call.
+        if not _compiling():
+            _cpu_torch_state["calls"] += 1
+            if not _cpu_torch_state["logged"]:
+                _cpu_torch_state["logged"] = True
+                logger.info("Unsloth: gated-delta (linear attention) on CPU tensors runs in pure torch; fla is GPU only.")
+        return _rocm_fp32_chunk_gated_delta_rule(**a, **extra)
+
+    setattr(gated_delta_rule, _CPU_TORCH_MARK, "torch")
+    return gated_delta_rule
+
+
+def _install_cpu_torch_path():
+    """Route the live fla's chunk / fused-recurrent gated delta entry points to pure torch for CPU tensors,
+    including modeling modules that bound them at import. Idempotent; False when no fla is live."""
+    package = sys.modules.get("fla.ops.gated_delta_rule")
+    if package is None:
+        return False
+    installed = False
+    for name, submodule, recurrent in (
+        ("chunk_gated_delta_rule", "fla.ops.gated_delta_rule.chunk", False),
+        ("fused_recurrent_gated_delta_rule", "fla.ops.gated_delta_rule.fused_recurrent", True),
+    ):
+        original = getattr(package, name, None)
+        if original is None:
+            continue
+        if getattr(original, _CPU_TORCH_MARK, None) is not None:
+            installed = True
+            continue
+        wrapped = _make_cpu_gated_delta_rule(original, recurrent)
+        setattr(package, name, wrapped)
+        sub = sys.modules.get(submodule)
+        if sub is not None and getattr(sub, name, None) is original:
+            setattr(sub, name, wrapped)
+        for modname in _l2norm_modules(_GATED_DELTA_MODELING):
+            mod = sys.modules.get(modname)
+            if mod is not None and getattr(mod, name, None) is original:
+                setattr(mod, name, wrapped)
+        installed = True
+    return installed
+
+
+_FP32_IEEE_MARK = "_unsloth_fp32_ieee_dots"
+
+
+def _make_fp32_ieee_dots(original):
+    """float32 gated delta runs its tl.dot calls in IEEE float32. Triton's default for float32 operands is TF32,
+    which rounds them to 10 mantissa bits inside each dot while the kernels' elementwise terms keep all 23: the decay
+    gradient dg = sum(dq * q) - sum(dk * k) cancels to far below either term, so it came out wrong (B200, tiny
+    Qwen3.8-Flash-Next: dA_log 32x the fp64 value on strongly decaying heads, cos 0.3 in a model), while dq / dk / dv
+    and bfloat16 inputs (exact in every dot) were fine. TRITON_F32_DEFAULT is read when a kernel compiles and is part
+    of Triton's cache key, and float32 kernel specializations only compile here. An explicit TRITON_F32_DEFAULT wins;
+    UNSLOTH_FLA_FP32_TF32=1 keeps TF32."""
+
+    @functools.wraps(original)
+    def wrapped(*args, **kwargs):
+        q = args[0] if args else kwargs.get("q")
+        if (
+            getattr(q, "dtype", None) is not None
+            and str(q.dtype) == "torch.float32"
+            and getattr(q, "is_cuda", False)
+            and os.environ.get("TRITON_F32_DEFAULT") is None
+            and not _flag("UNSLOTH_FLA_FP32_TF32")
+        ):
+            os.environ["TRITON_F32_DEFAULT"] = "ieee"
+            try:
+                return original(*args, **kwargs)
+            finally:
+                os.environ.pop("TRITON_F32_DEFAULT", None)
+        return original(*args, **kwargs)
+
+    setattr(wrapped, _FP32_IEEE_MARK, True)
+    return wrapped
+
+
+def _install_fp32_ieee_dots():
+    """Wrap the live fla's chunk_gated_delta_rule_fwd / _bwd (module globals its autograd Function and unsloth's
+    opaque gated-delta op both call) so float32 inputs take IEEE dots. Idempotent."""
+    chunk_mod = sys.modules.get("fla.ops.gated_delta_rule.chunk")
+    if chunk_mod is None:
+        return False
+    for name in ("chunk_gated_delta_rule_fwd", "chunk_gated_delta_rule_bwd"):
+        fn = getattr(chunk_mod, name, None)
+        if fn is not None and not getattr(fn, _FP32_IEEE_MARK, False):
+            setattr(chunk_mod, name, _make_fp32_ieee_dots(fn))
+    return True
+
+
 _NO_FLA_HUB_MARK = "_unsloth_rdna1_no_fla"
 
 
@@ -1177,11 +1658,25 @@ def _force_kernel_hub_fallback(packages=_GATED_DELTA_MODELING + _KDA_MODELING):
     return tuple(forced)
 
 
+def _pin_fla_flash_qla_off():
+    """fla >= 0.6 sends only grad-free calls to FlashQLA on SM120, so a checkpoint forward and its recompute ran
+    different kernels; default FLA_FLASH_QLA=0 unless set or UNSLOTH_GDN_BACKEND=flashqla."""
+    if "FLA_FLASH_QLA" in os.environ or _gdn_backend() == "flashqla":
+        return False
+    os.environ["FLA_FLASH_QLA"] = "0"
+    return True
+
+
 def patch_vendor_fla(phase=None):
     """Register the bundled fla kernels and advertise availability.
 
     Idempotent; safe to call at import time and again from TEMPORARY_PATCHES.
     """
+    try:
+        _pin_fla_flash_qla_off()
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: could not turn off fla's FlashQLA dispatch: {e}")
     try:
         return _patch_vendor_fla(phase)
     finally:
@@ -1210,6 +1705,18 @@ def patch_vendor_fla(phase=None):
                 if UNSLOTH_ENABLE_LOGGING:
                     logger.warning(f"Unsloth: could not alias gated-delta decode name: {e}")
             try:
+                _install_rocm_fp32_torch_path()
+            except Exception as e:
+                logger.warning(f"Unsloth: could not route float32 gated delta to pure torch on ROCm gfx11: {e}")
+            try:
+                _install_cpu_torch_path()
+            except Exception as e:
+                logger.warning(f"Unsloth: could not route CPU gated delta calls to pure torch: {e}")
+            try:
+                _install_fp32_ieee_dots()
+            except Exception as e:
+                logger.warning(f"Unsloth: could not make float32 gated delta use IEEE float32 dots: {e}")
+            try:
                 _install_gdn_backend()
             except Exception as e:
                 logger.warning(f"Unsloth: could not enable UNSLOTH_GDN_BACKEND: {e}")
@@ -1218,6 +1725,12 @@ def patch_vendor_fla(phase=None):
             except Exception as e:
                 if UNSLOTH_ENABLE_LOGGING:
                     logger.warning(f"Unsloth: could not re-resolve fla kernel closures: {e}")
+            # After the repair, which may rebuild glm5_next's chunk_kimi_delta_attention.
+            try:
+                _install_glm5_kda_safe_gate()
+            except Exception as e:
+                if UNSLOTH_ENABLE_LOGGING:
+                    logger.warning(f"Unsloth: could not route GLM-5.3-Flash KDA to fla safe_gate: {e}")
 
 
 def _patch_vendor_fla(phase=None):
@@ -1241,8 +1754,7 @@ def _patch_vendor_fla(phase=None):
             _patch_is_available(_unavailable_probe)
             _disable_already_imported_gated_delta()
             return
-        # Post-#47630 pure torch is unreachable; fall through so the resolved fla is
-        # patched or vendored, never an unpatched BK=64 install.
+        # Post transformers 47630 torch is unreachable: fla is patched or vendored, never unpatched BK=64.
         _warn_hopper_optout_degraded()
         optout_degraded = True
 

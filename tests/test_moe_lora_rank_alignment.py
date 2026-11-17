@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A LoRA rank that is not a multiple of 8 (4, 6, ...) must still reach torch._grouped_mm.
-
-torch._grouped_mm needs 16-byte aligned strides. A bf16 rank of 4 gives the (E, in, R)
-factor and the (T, R) intermediate an 8-byte row, so eager fell back to the per-expert
-host-synced loop on every LoRA matmul and torch.compile aborted the trace outright.
-"""
+"""LoRA ranks not a multiple of 8 (4, 6) must still reach torch._grouped_mm, which needs 16-byte aligned strides; else per-expert loops and torch.compile aborts."""
 import pytest
 import torch
 
@@ -112,9 +107,14 @@ def test_pad_skipped_only_when_both_lora_gemms_take_triton(monkeypatch, rank):
     from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
     monkeypatch.delenv("UNSLOTH_MOE_LORA_PAD_ALWAYS", raising=False)
     monkeypatch.setattr(M, "_triton_grouped_mm_wanted", lambda inputs, weight: True)
+    monkeypatch.setattr(M, "_triton_grouped_mm_rows_ok", lambda device, M_, E, K, N: True)
     monkeypatch.setattr(mg, "triton_grouped_available", lambda device: True)
     pf, ps = M._pad_lora_rank_for_grouped_mm(first, second, x)
     assert pf is first and ps is second
+    # The second GEMM over its own row budget falls back to torch._grouped_mm, which needs the pad.
+    monkeypatch.setattr(M, "_triton_grouped_mm_rows_ok", lambda device, M_, E, K, N: False)
+    assert M._pad_lora_rank_for_grouped_mm(first, second, x)[0].shape[-1] == 8
+    monkeypatch.setattr(M, "_triton_grouped_mm_rows_ok", lambda device, M_, E, K, N: True)
     monkeypatch.setattr(mg, "triton_grouped_available", lambda device: False)
     assert M._pad_lora_rank_for_grouped_mm(first, second, x)[0].shape[-1] == 8
     monkeypatch.setattr(mg, "triton_grouped_available", lambda device: True)

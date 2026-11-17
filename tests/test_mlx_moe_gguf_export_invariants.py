@@ -14,10 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Invariants the MoE GGUF staging pass holds whatever it is handed: what it does to a
-directory it cannot help, whether it answers twice alike, and whether what it wrote is
-the checkpoint the model was saved from and not merely something sanitize() accepts.
-Synthetic fixtures on `tests/mlx_simulation/`, so no mlx and no Apple hardware."""
+"""Invariants of the MoE GGUF staging pass: what it does to a directory it cannot help, that it answers twice alike, and
+that what it wrote is the model's own checkpoint, not merely something sanitize() accepts; synthetic fixtures in
+tests/mlx_simulation/ need no mlx or Apple hardware."""
 
 import copy
 import hashlib
@@ -224,8 +223,7 @@ def test_no_stacked_expert_name_survives_the_pass(tmp_path):
 
 
 def test_a_single_expert_checkpoint_is_refused_rather_than_half_recovered(tmp_path):
-    """One expert leaves the stack ambiguous, so the pass declines: the export is then
-    exactly what it is without this pass, which is the contract."""
+    """One expert leaves the stack ambiguous, so the pass declines and the export is exactly what it is without the pass."""
     import unsloth_zoo.mlx.utils as mutils
 
     reg = _regressions()
@@ -242,8 +240,7 @@ def test_a_single_expert_checkpoint_is_refused_rather_than_half_recovered(tmp_pa
 def test_the_recovered_checkpoint_is_the_one_the_model_was_saved_from(
     tmp_path, num_experts, with_bias
 ):
-    """The oracle: any preimage sanitize() accepts is not enough, it has to be *the*
-    preimage, under the per-expert HF names the converter reads."""
+    """The oracle: a preimage sanitize() accepts is not enough; it must be the preimage itself, under the per-expert HF names the converter reads."""
     import unsloth_zoo.mlx.utils as mutils
 
     reg = _regressions()
@@ -266,9 +263,8 @@ def test_the_recovered_checkpoint_is_the_one_the_model_was_saved_from(
 
 
 def test_a_helper_called_from_inside_a_comprehension_is_still_read():
-    """The vocabulary walk must not depend on the interpreter: before PEP 709 (3.12) a
-    comprehension compiles to its own code object, so a helper called from inside one --
-    the ordinary shape for a rename -- is absent from the enclosing `co_names`."""
+    """The vocabulary walk must not depend on the interpreter: before PEP 709 (3.12) a comprehension has its own code
+    object, hiding helpers it calls from the enclosing co_names."""
     import unsloth_zoo.mlx.utils as mutils
 
     class Model:
@@ -291,8 +287,7 @@ def _a_spelling_only_the_helper_holds(name):
 
 
 def test_experts_come_back_in_the_order_the_sanitizer_stacked_them(tmp_path):
-    """Expert 3's weights must be expert 3's, not expert 0's: a permutation replays
-    identically only if the sanitizer's own order is reproduced."""
+    """Expert 3's weights must stay expert 3's: a permutation replays identically only if the sanitizer's own stacking order is reproduced."""
     import unsloth_zoo.mlx.utils as mutils
 
     reg = _regressions()
@@ -311,13 +306,9 @@ def test_experts_come_back_in_the_order_the_sanitizer_stacked_them(tmp_path):
 
 
 def test_a_merge_survives_a_sanitizer_that_offsets_a_norm_in_place(tmp_path):
-    """mlx-vlm's Qwen3.5-VL-MoE splits `experts.gate_up_proj` into two `switch_mlp`
-    tensors and offsets a 1-D norm with `+=` in the same sanitize
-    (mlx_vlm/models/qwen3_5_moe/qwen3_5_moe.py:38-48 and :89), writing through to the
-    caller's array. The merge proof's floor probe shares marker objects with the set it
-    compares, so an uncopied floor sat one offset ahead of every recipe, no merge was
-    ever proved, and the export kept the MLX spelling llama.cpp cannot map.
-    """
+    """mlx_vlm/models/qwen3_5_moe/qwen3_5_moe.py splits experts.gate_up_proj and offsets a norm in place in sanitize();
+    an uncopied merge-proof floor shared marker objects with the compared set, so no merge was ever proved and the
+    export kept the MLX spelling llama.cpp cannot map."""
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx
@@ -361,13 +352,9 @@ def test_a_merge_survives_a_sanitizer_that_offsets_a_norm_in_place(tmp_path):
 def test_a_layout_the_vlm_pass_already_inverted_is_not_inverted_again(
     tmp_path, monkeypatch, shape
 ):
-    """The two passes run back to back over one directory, so the second reads what the
-    first wrote. An adjacent-axis move is its own inverse, so a second inversion replays
-    to exactly what is on disk and the confirmation accepts it: the tensor would ship
-    transposed off the HF layout llama.cpp reads. `depthwise_conv1d.weight` is the shape
-    both passes claim (_vlm_gguf_tensor_candidates transposes (0, 2, 1); (2, 1) is in
-    _MOE_TENSOR_LAYOUTS). The equal-extent shape is the one a shape comparison cannot
-    see: the axes swap, the shape does not."""
+    """VLM and MoE passes both claim depthwise_conv1d.weight (_vlm_gguf_tensor_candidates transposes (0, 2, 1); (2, 1)
+    is in _MOE_TENSOR_LAYOUTS); an adjacent-axis move is its own inverse, so a second pass ships it transposed off
+    the HF layout llama.cpp reads, with an equal shape."""
     import json
 
     import unsloth_zoo.mlx.utils as mutils

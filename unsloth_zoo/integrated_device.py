@@ -47,8 +47,7 @@ _ENV_FALSE = ("0", "false", "no", "off")
 # 1 keeps the old behaviour on an excluded board, 0 forces the exclusion on an unrecognised one.
 FORCE_ENV = "UNSLOTH_FORCE_EXPANDABLE_SEGMENTS"
 
-# Bytes, not text: /proc/device-tree/compatible is a NUL separated list. The DMI pair is here
-# because ARM boards that boot via ACPI have no /proc/device-tree at all.
+# Read as bytes: /proc/device-tree/compatible is NUL separated; the DMI pair is included because ACPI-booted ARM boards have no /proc/device-tree at all.
 BOARD_IDENTITY_FILES = (
     "/etc/nv_tegra_release",
     "/proc/device-tree/model",
@@ -117,8 +116,8 @@ def _cuda_context_exists():
 
 
 def _any_device_integrated():
-    # ANY integrated device makes double buffering pure overhead, and a mixed box is rare.
-    # torch is imported inside the function so this module stays importable before torch is.
+    # Any integrated device makes double buffering pure overhead, and mixed boxes are rare; torch is imported inside so
+    # this module imports before torch is available.
     try:
         import torch
         return any(

@@ -13,20 +13,9 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Grouped QLoRA training for gpt-oss bnb NF4 experts (ModuleList of Linear4bit): one
-bnb-exact Triton dequant of all experts per projection, base via _base_grouped_mm, LoRA via
-torch._grouped_mm over stacked per-expert A / B. No host sync, so an expert routed no tokens
-gets zero LoRA grads (the loop leaves None). Unsupported setups return a reason string and
-the caller keeps the per-expert loop.
-
-float16 (T4): the loader computes the down experts in fp32 (_pre_set_compute_dtype), since
-their outputs overflow fp16. torch._grouped_mm has no fp32 output for fp16 operands, so this
-path runs moe_grouped_fp16's Triton grouped GEMMs: fp16 operands, fp32 accumulate, the
-loop's output dtype per projection (gate_up fp16, down fp32), LoRA in the loop's dtypes.
-
-Stacked LoRA: the loader entry point (stack_expert_lora) gives each projection list one lora_A /
-lora_B Parameter (moe_grouped_modulelist._StackedLoraLinear) when a grouped path trains it; both
-paths read the stacks. UNSLOTH_MOE_STACKED_LORA=0 keeps PEFT's per-expert Parameters."""
+"""Grouped QLoRA for NF4 experts: bnb-exact Triton dequant per projection, LoRA via grouped GEMMs, unrouted experts get
+zero LoRA grads; fp16: moe_grouped_fp16 with fp32 down (fp16 overflows), fp32 accumulate; unsupported setups keep the
+loop; UNSLOTH_MOE_STACKED_LORA=0 keeps PEFT per-expert LoRA."""
 
 __all__ = [
     "nf4_dequant_expert_stack",
@@ -45,7 +34,7 @@ import torch
 from . import moe_ready_epoch as _ready_epoch
 # Model-agnostic expert-LoRA helpers, shared with the ModuleList grouped MoE path.
 from .moe_grouped_modulelist import (
-    _STACK_NAME, _lora_delta, _lora_operands, _lora_stacks, _projs_lora, _stack_projs_lora, _stackable_lora,
+    _STACK_NAME, _lora_operands, _lora_stacks, _projs_lora, _stack_projs_lora, _stackable_lora,
 )
 # Read as module attributes in the hot forward (no per-call import machinery; monkeypatches reach them).
 from . import moe_utils as _moe_utils
@@ -61,8 +50,7 @@ def _gpt_oss():
 
 
 def _base_layer_params(proj):
-    """_parameters of the frozen base (PEFT's base_layer, else proj): getattr through
-    nn.Module.__getattr__ costs ~1 us per read, and these run per expert per call."""
+    """Frozen base's _parameters (PEFT base_layer, else proj); direct access avoids nn.Module.__getattr__ overhead on per-expert calls."""
     return proj._modules.get("base_layer", proj)._parameters
 
 try:
@@ -85,8 +73,8 @@ if triton is not None:
     def _nf4_dequant_stack_kernel(
         W_PTRS, A_PTRS, A2_PTRS, C2_PTRS, OFFSETS, LUT, OUT,
         n_bytes,
-        BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr, BLOCK: tl.constexpr,
-        LONG_INDEXING: tl.constexpr,
+        BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr, BLOCK: tl.constexpr,  # nf4 quant block / nested absmax block / double quant / bytes per program
+        LONG_INDEXING: tl.constexpr,  # int64 offsets past 2**31
     ):
         pid = tl.program_id(0)
         e = tl.program_id(1)
@@ -140,10 +128,8 @@ def stacked_dequant_available(device) -> bool:
 
 @torch.compiler.disable
 def nf4_dequant_expert_stack(tb, dtype, out = None):
-    """All experts of one projection as [E, N, K] in `dtype`, from a gpt_oss_routed pointer table.
-
-    Bit-identical to stacking bitsandbytes.functional.dequantize_4bit of each expert (the
-    quant state dtype must equal `dtype`). None when unsupported, so callers fall back."""
+    """All experts of one projection as [E, N, K] in dtype, bit-identical to stacking
+    bitsandbytes.functional.dequantize_4bit (quant state dtype must equal dtype); None if unsupported."""
     w_ptrs = tb["w"]
     device = w_ptrs.device
     if not stacked_dequant_available(device):
@@ -178,9 +164,8 @@ def nf4_dequant_expert_stack(tb, dtype, out = None):
 
 
 class _StackProvider:
-    """weight_provider for moe_utils._base_grouped_mm: () -> [E, K, N] view; .transposed() -> [E, N, K].
-    `refresh` (FSDP2 all-gathered experts) re-reads the pointer table on every call: the backward
-    recompute runs after FSDP2 re-gathered the weights into storage that may sit elsewhere."""
+    """weight_provider for moe_utils._base_grouped_mm: () -> [E, K, N] view, .transposed() -> [E, N, K]; refresh
+    re-reads the pointer table each call, since backward recompute can follow an FSDP2 re-gather at another address."""
 
     __slots__ = ("tb", "dtype", "fallback", "refresh")
 
@@ -231,8 +216,7 @@ def _proj_signature(proj, out):
                 tuple(proj._forward_pre_hooks))
         for m in mods["lora_dropout"]._modules.values():
             out += (m, m.training, m.__dict__.get("p"))
-        # Readiness reads the adapter weights' dtype / rank: a stack (stacked LoRA) or a
-        # per-expert weight, whose `.data =` / `.to()` keeps the Parameter's identity.
+        # Readiness reads the adapter weights' dtype and rank from a stack or per-expert weight; `.data =` and `.to()` keep the Parameter's identity.
         for lm in (*mods["lora_A"]._modules.values(), *mods["lora_B"]._modules.values()):
             mp = lm._parameters
             lw = mp.get("weight", mp.get(_STACK_NAME))
@@ -241,9 +225,8 @@ def _proj_signature(proj, out):
 
 @torch.compiler.disable
 def ready_signature(experts):
-    """Key for caching _grouped_bnb4bit_ready over every expert of both projections, so a
-    change on any one expert (dropout, adapter switch, merge, reload) re-runs the full check.
-    None when it cannot be built (no caching)."""
+    """Cache key for _grouped_bnb4bit_ready over every expert of both projections, so any expert change (dropout,
+    adapter switch, merge, reload) re-runs the check; None when it cannot be built (no caching)."""
     out = []
     try:
         with torch._C.DisableTorchFunctionSubclass():
@@ -297,8 +280,7 @@ def _spot_signature(experts):
 
 @torch.compiler.disable
 def cached_ready(experts):
-    """(verdict, lora) of the last full _grouped_bnb4bit_ready check while moe_ready_epoch vouches
-    for it (no expert-state change, end experts unchanged), else None."""
+    """Last full _grouped_bnb4bit_ready (verdict, lora) while moe_ready_epoch vouches for the experts (no expert-state change, end experts unchanged); else None."""
     if not _ready_epoch.enabled():
         experts.__dict__.pop(_ready_epoch.VALID, None)
         return None
@@ -380,9 +362,8 @@ def _table_spot(experts):
 
 
 def _tables(experts, dtype):
-    """Pointer tables for both projections, or None for the bnb fallback. While readiness vouches
-    for the experts' storage at the current moe_ready_epoch stamp, the O(E) storage key and the
-    snapshot check are skipped for a spot key over the end experts."""
+    """Pointer tables for both projections, or None for the bnb fallback; while readiness vouches at the current
+    moe_ready_epoch stamp, the O(E) storage key and snapshot check are skipped for a spot key over end experts."""
     gen = _ready_epoch.current_gen(experts) if _ready_epoch.enabled() else None
     spot = None
     if gen is not None:
@@ -423,11 +404,9 @@ def _tables(experts, dtype):
 
 
 def _fsdp2_table_refresh(experts, dtype):
-    """(gate_up, down) refresh callables for FSDP2 all-gathered experts, else (None, None).
-    FSDP2 frees the forward all-gather and re-gathers before backward, possibly at another
-    address, so a backward recompute must re-read the pointer table, not the forward one."""
-    # Any expert of either projection: FSDP2 can wrap a subset of them (a later expert, or only
-    # the down projections), and one stale table is enough for wrong input gradients.
+    """(gate_up, down) refresh callables for FSDP2 all-gathered experts, else (None, None); backward recompute must
+    re-read the pointer table, not the forward one, since FSDP2 may re-gather at another address."""
+    # Checks any expert of either projection, since FSDP2 can wrap only a subset and one stale table gives wrong input gradients.
     if not any(
         getattr(getattr(proj, "base_layer", proj).weight, _ready_epoch.FSDP2_GATHERED, False)
         for projs in (experts.gate_up_projs, experts.down_projs)
@@ -459,9 +438,8 @@ def _is16(kind, dtype):
 
 
 def compute_mode(experts, input_dtype):
-    """("bf16", None) / ("fp16", down_fp32) when a grouped path reproduces the per-expert
-    loop's dtypes, else (None, reason). Read per call: per-projection, so a dtype edit on
-    any one expert sends the layer back to the loop."""
+    """('bf16', None) or ('fp16', down_fp32) when a grouped path matches the loop's dtypes, else (None, reason); read
+    per call per projection, so one dtype edit sends the layer to the loop."""
     gu, dn = _proj_dtypes(experts.gate_up_projs), _proj_dtypes(experts.down_projs)
     if len(gu) != 1 or len(dn) != 1:
         return None, "experts of one projection compute in different dtypes"
@@ -495,9 +473,8 @@ def _decline(reason):
 @torch.compiler.disable
 def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weights,
                           batch_size, num_tokens, num_experts, top_k, lora = None):
-    """Grouped training forward of GptOssExpertsBnb4bit, with or without per-expert LoRA.
-    Returns fp32 [batch, seq, hidden], as the per-expert training loop does, or None when
-    no grouped path matches the experts' dtypes (the caller keeps the loop)."""
+    """Grouped training forward of GptOssExpertsBnb4bit, with or without per-expert LoRA; returns fp32 [batch, seq,
+    hidden] or None when no grouped path matches the dtypes (caller keeps the loop)."""
     mode, why = compute_mode(experts, hidden_states.dtype)
     if mode == "fp16":
         return _grouped_qlora_forward_fp16(
@@ -540,26 +517,86 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
     dn_w = _StackProvider(dn_tb, dtype, lambda: _bnb_fallback_stack(dn_projs, dtype), dn_refresh)
 
     xg = hidden_states[sorted_tokens]
-    gate_up = mu._base_grouped_mm(xg, offsets, gu_w, recompute).to(acc_dtype)
-    gate_up = gate_up + gu_bias[expert_ids].to(acc_dtype)
-    if lora is not None and lora["gate_up"] is not None:
-        gate_up = gate_up + _lora_delta(xg, offsets, gu_projs, lora["gate_up"], dtype).to(acc_dtype)
-    gated = _gpt_oss().swiglu_torch_forward(gate_up, experts.alpha, experts.limit, dtype = torch.float32).to(dtype)
-    out = mu._base_grouped_mm(gated, offsets, dn_w, recompute).float()
-    out = out + dn_bias[expert_ids].float()
-    if lora is not None and lora["down"] is not None:
-        out = out + _lora_delta(gated, offsets, dn_projs, lora["down"], dtype).float()
+    gu_lora = lora["gate_up"] if lora is not None else None
+    dn_lora = lora["down"] if lora is not None else None
+    gate_up = mu._base_grouped_mm(xg, offsets, gu_w, recompute)
+    # Fused epilogues (gpt_oss_fused_glue): the same roundings in one pass each, else the eager chain below.
+    # The kernel adds the bias unrounded: equal to eager's bias.to(acc_dtype) only for a bf16 bias or fp32 accumulate
+    # (checked before _fused_glue, whose first call runs the self-check).
+    glue = None
+    if gu_bias.dtype is torch.bfloat16 or acc_dtype is torch.float32:
+        glue = _fused_glue(gate_up, acc_dtype, experts)
+    gated = d_gu = None
+    if gu_lora is not None:
+        d_gu = _lora_unscaled(xg, offsets, gu_projs, gu_lora, dtype)
+    if glue is not None:
+        gated = glue.gate_up_epilogue(gate_up.contiguous(), d_gu, gu_bias.contiguous(), expert_ids,
+                                      gu_lora[1] if gu_lora is not None else 1.0, experts.alpha, experts.limit, acc_dtype)
+    if gated is None:
+        glue = None
+        gate_up = gate_up.to(acc_dtype) + gu_bias[expert_ids].to(acc_dtype)
+        if d_gu is not None:
+            gate_up = gate_up + (d_gu * gu_lora[1]).to(acc_dtype)
+        gated = _gpt_oss().swiglu_torch_forward(gate_up, experts.alpha, experts.limit, dtype = torch.float32).to(dtype)
+    del gate_up, d_gu
+    out = mu._base_grouped_mm(gated, offsets, dn_w, recompute)
+    d_dn = _lora_unscaled(gated, offsets, dn_projs, dn_lora, dtype) if dn_lora is not None else None
+    y = None
+    if glue is not None:
+        y = glue.down_epilogue(out.contiguous(), d_dn, dn_bias.contiguous(), expert_ids,
+                               dn_lora[1] if dn_lora is not None else 1.0)
+    if y is None:
+        y = out.float() + dn_bias[expert_ids].float()
+        if d_dn is not None:
+            y = y + (d_dn * dn_lora[1]).float()
+    del out, d_dn
+    return _combine(y, routing_weights, sorted_tokens, expert_ids, sorted_idx, num_tokens, top_k).view(
+        batch_size, -1, experts.hidden_size)
 
-    weighted = out.to(torch.float32) * routing_weights[sorted_tokens, expert_ids, None].to(torch.float32)
-    # Fixed-order top_k sum (an index_add_ over repeated tokens is atomic, so not reproducible).
-    next_states = mu.combine_permuted_moe_outputs(weighted, sorted_idx, num_tokens, top_k, out_dtype = torch.float32)
-    return next_states.view(batch_size, -1, experts.hidden_size)
+
+def _lora_unscaled(x, offsets, projs, lora, dtype):
+    """_lora_delta before its `* scaling`, which the fused epilogues apply (and round) themselves."""
+    gmm = _moe_utils._grouped_mm_with_backward_fix
+    A, B = _lora_operands(projs, lora[0], dtype, x)
+    return gmm(gmm(x, A, offsets), B, offsets)
+
+
+def _fused_glue(t, acc_dtype, experts):
+    """gpt_oss_fused_glue when its kernels apply here (bf16 GEMM output, CUDA, self-check passed), else None."""
+    if t.dtype is not torch.bfloat16 or os.environ.get("UNSLOTH_GPTOSS_FUSED_GLUE", "1") == "0":
+        return None
+    if acc_dtype not in (torch.bfloat16, torch.float32) or getattr(experts, "limit", None) is None:
+        return None
+    try:
+        from . import gpt_oss_fused_glue as glue
+    except Exception:
+        return None
+    return glue if glue.usable(t, acc_dtype, float(experts.alpha), float(experts.limit)) else None
+
+
+def _combine(y, routing_weights, sorted_tokens, expert_ids, sorted_idx, num_tokens, top_k):
+    """fp32 sum over each token's top_k of y * routing weight, in a fixed order (an index_add_ over repeated tokens
+    is atomic, so not reproducible); moe_triton_kernels.weighted_unpermute does it in one pass (same bits for y and
+    dY, the routing-weight grad differs only by fp32 summation order), else the eager product + inverse permutation.
+    UNSLOTH_GPTOSS_FUSED_COMBINE=0 (or UNSLOTH_GPTOSS_FUSED_GLUE=0) keeps the eager one."""
+    w = routing_weights[sorted_tokens, expert_ids].to(torch.float32)
+    if (
+        os.environ.get("UNSLOTH_GPTOSS_FUSED_GLUE", "1") != "0"
+        and os.environ.get("UNSLOTH_GPTOSS_FUSED_COMBINE", "1") != "0"
+        and y.is_cuda and torch.version.hip is None
+        # FakeTensor / subclass probes must not reach the kernel: a failure there disables it process-wide.
+        and type(y) is torch.Tensor and type(w) is torch.Tensor and type(sorted_idx) is torch.Tensor
+    ):
+        from .moe_triton_kernels import weighted_unpermute
+        out = weighted_unpermute(y, sorted_idx, w, num_tokens, top_k, out_dtype = torch.float32)
+        if out is not None:
+            return out
+    return _moe_utils.combine_permuted_moe_outputs(y * w[:, None], sorted_idx, num_tokens, top_k, out_dtype = torch.float32)
 
 
 class _Fp16StackProvider:
-    """Frozen NF4 experts of one projection as fp16 [hi - lo, N, K] stacks, from the pointer
-    table (one Triton launch; an fp32 quant state rounds once, fp32 -> fp16) or bitsandbytes.
-    windows() splits the experts when a whole stack does not fit in free memory."""
+    """Frozen NF4 experts of one projection as fp16 [hi - lo, N, K] stacks from the pointer table (an fp32 quant state
+    rounds once to fp16) or bitsandbytes; windows() splits them to fit free memory."""
 
     __slots__ = ("tb", "projs", "N", "K", "num_experts", "dtype", "chunk", "pin", "refresh")
 
@@ -571,8 +608,8 @@ class _Fp16StackProvider:
         self.dtype = dtype
         device = qs.absmax.device
         from unsloth_zoo.temporary_patches.moe_grouped_fp16 import use_cublas
-        # Per-expert cuBLAS GEMMs gain nothing from a whole stack: keep its transient small
-        # (a T4 running 20B sits at ~95% of its memory with a 1 GiB gate_up stack).
+        # Per-expert cuBLAS GEMMs gain nothing from a whole stack, so keep its transient small (a T4 running 20B sits at
+        # ~95% of its memory with a 1 GiB gate_up stack).
         cap = int(os.environ.get("UNSLOTH_GPTOSS_FP16_CUBLAS_STACK_MB", "256")) << 20 if use_cublas(device) else None
         self.chunk = _expert_window(self.num_experts, self.N * self.K * dtype.itemsize, device, cap)
         # Pin (skip the backward rebuild) only when asked to and the whole stack fits.
@@ -604,8 +641,8 @@ class _Fp16StackProvider:
 
 
 def _expert_window(E, bytes_per_expert, device, cap_bytes = None):
-    """Experts per dequant window: all of them unless the stack would take more than half of
-    the free memory (T4: a 20B gate_up stack is 1 GiB) or cap_bytes. UNSLOTH_GPTOSS_FP16_EXPERT_WINDOW pins it."""
+    """Experts per dequant window: all, unless the stack exceeds half the free memory (T4: a 20B gate_up stack is 1 GiB)
+    or cap_bytes; UNSLOTH_GPTOSS_FP16_EXPERT_WINDOW pins it."""
     pinned = os.environ.get("UNSLOTH_GPTOSS_FP16_EXPERT_WINDOW")
     if pinned:
         return max(1, min(E, int(pinned)))
@@ -631,10 +668,9 @@ def _stack_lora(projs, name, which, dtype):
 
 
 def _lora_add_fp16(result, x, counts, projs, lora):
-    """result + scaling * (x.half() @ A.half().T) @ B.T as Unsloth's forced-float32 LoRA forward
-    (compiler.COMPILED_LORA_FORWARD_forced_float32: one addmm in the result's dtype). The second GEMM,
-    the scaling and the add stay fp32 and round once, so an unscaled product past the fp16 range
-    cannot become inf before scaling."""
+    """result + scaling * (x.half() @ A.half().T) @ B.T as in compiler.COMPILED_LORA_FORWARD_forced_float32; the second
+    GEMM, scaling and add stay fp32 and round once, so an unscaled product past the fp16 range cannot become inf
+    before scaling."""
     from unsloth_zoo.temporary_patches.moe_grouped_fp16 import grouped_linear
     name, scaling, _ = lora
     res_dtype = result.dtype
@@ -646,8 +682,7 @@ def _lora_add_fp16(result, x, counts, projs, lora):
 
 
 def down_operand_dtype(device):
-    """Operand dtype of the fp32 down GEMM. UNSLOTH_GPTOSS_FP16_DOWN_OPERAND = fp16 | fp32 | auto;
-    auto picks from the measured speed per backend (see moe_grouped_fp16.DOWN_OPERAND_AUTO)."""
+    """Operand dtype of the fp32 down GEMM from UNSLOTH_GPTOSS_FP16_DOWN_OPERAND (fp16 | fp32 | auto); auto picks per backend via moe_grouped_fp16.DOWN_OPERAND_AUTO."""
     from unsloth_zoo.temporary_patches.moe_grouped_fp16 import DOWN_OPERAND_AUTO, use_cublas
     mode = os.environ.get("UNSLOTH_GPTOSS_FP16_DOWN_OPERAND", "auto")
     if mode not in ("fp16", "fp32"):
@@ -657,9 +692,8 @@ def down_operand_dtype(device):
 
 def _grouped_qlora_forward_fp16(experts, hidden_states, router_indices, routing_weights,
                                 batch_size, num_tokens, num_experts, top_k, lora, down_fp32):
-    """The per-expert loop's dtypes on float16 GPUs: gate_up in fp16 (returned in the input's
-    dtype, as Linear4bit does), swiglu in fp32, down on fp16 operands with an fp32 output
-    and fp32 bias when the loader kept down in fp32 (else fp16 output, as the loop)."""
+    """Matches the per-expert loop's fp16 dtypes: gate_up fp16 (cast back to input dtype), swiglu fp32, down fp16
+    operands with fp32 output and fp32 bias when the loader kept down in fp32, else fp16 output."""
     from unsloth_zoo.temporary_patches.moe_grouped_fp16 import (
         Groups, fp16_grouped_available, grouped_frozen_linear, unavailable_reason,
     )
@@ -676,8 +710,8 @@ def _grouped_qlora_forward_fp16(experts, hidden_states, router_indices, routing_
     dn_out_dtype = torch.float32 if down_fp32 else f16
     x_mode = os.environ.get("UNSLOTH_GPTOSS_FP16_X_MODE", "cast")
     dy_mode = os.environ.get("UNSLOTH_GPTOSS_FP16_DY_MODE", "scale")
-    # fp32 down (loader rule): fp32 operands reproduce the loop's fp32 GEMM (IEEE, no TF32, no
-    # narrowing of x or dY); fp16 operands with an fp32 output are the speed option.
+    # fp32 down (loader rule): fp32 operands reproduce the loop's fp32 GEMM (IEEE, no TF32, no narrowing of x or dY);
+    # fp16 operands with fp32 output are the speed option.
     dn_operand = down_operand_dtype(device) if down_fp32 else f16
     CALLS["forward_fp16"] += 1
     if lora is not None:
@@ -688,8 +722,8 @@ def _grouped_qlora_forward_fp16(experts, hidden_states, router_indices, routing_
         sorted_idx = flat_experts.argsort(stable = True)
         sorted_tokens = token_ids[sorted_idx]
         expert_ids = flat_experts[sorted_idx]
-        # Triton backend: counts stay on device. cuBLAS backend (below sm80): one host read
-        # per layer, shared by every GEMM of its forward and backward (the loop reads once too).
+        # Triton backend keeps counts on device; cuBLAS backend (below sm80) does one host read per layer, shared by its
+        # forward and backward GEMMs (the loop also reads once).
         counts = Groups(count_tokens_per_expert(flat_experts, num_experts, torch.int32))
 
     recompute = _moe_recompute_default()
@@ -719,10 +753,9 @@ def _grouped_qlora_forward_fp16(experts, hidden_states, router_indices, routing_
 
 
 def _grouped_training_applies(experts):
-    """True when a gpt-oss experts module trains on a grouped path: bnb NF4 experts ready for it
-    (_grouped_bnb4bit_ready) whose compute dtype has its backend, torch._grouped_mm for bf16 or
-    moe_grouped_fp16 for fp16. The per-expert loop leaves an unrouted expert's LoRA grad None,
-    a stack would give it zeros (weight decay / momentum still move it), so only these stack."""
+    """True when experts train on a grouped path (_grouped_bnb4bit_ready with bf16 via torch._grouped_mm or fp16 via
+    moe_grouped_fp16); a stack would give unrouted experts zero grads that weight decay or momentum still move, so
+    only these stack."""
     ready = getattr(experts, "_grouped_bnb4bit_ready", None)
     if ready is None or not ready():
         return False
@@ -742,11 +775,9 @@ def _grouped_training_applies(experts):
 
 
 def stack_expert_lora(model, verbose = True):
-    """Stack the expert LoRA of every gpt-oss ModuleList experts module on a grouped training path
-    (one Parameter per projection, see moe_grouped_modulelist._StackedLoraLinear); returns
-    #stacked projection lists. Loader entry point only (auto_enable_grouped_moe): it must run
-    before an optimizer or DDP wrapper holds the per-expert Parameters. Idempotent;
-    UNSLOTH_MOE_STACKED_LORA=0 keeps PEFT's per-expert Parameters."""
+    """Stacks expert LoRA into one Parameter per projection on grouped paths, returning the count; loader entry point
+    (auto_enable_grouped_moe) that must run before optimizer or DDP holds params; idempotent;
+    UNSLOTH_MOE_STACKED_LORA=0 disables."""
     if os.environ.get("UNSLOTH_MOE_STACKED_LORA", "1") == "0":
         return 0
     n = 0

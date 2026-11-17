@@ -27,6 +27,11 @@ TRANSFORMERS_5 = Version(importlib_version("transformers")) >= Version("5.0.0")
 def _exact_packed_decode(monkeypatch):
     # These tests pin the exact packed decode; test_mxfp4_ogs_decode.py covers the matmul_ogs one.
     monkeypatch.setenv("UNSLOTH_MXFP4_OGS", "0")
+    # The offload flag is process-wide and an earlier cpu/disk device_map load (tests/test_cpu_backend.py) sets it, so
+    # this fixture resets _LOAD_OFFLOADS to [False]; a test that wants it set must say so.
+    monkeypatch.setattr(mx, "_LOAD_OFFLOADS", [False])
+
+
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 needs_triton = pytest.mark.skipif(not mxd._HAS_TRITON, reason = "needs Triton")
 
@@ -257,7 +262,11 @@ def test_dequantize_convertops_keeps_or_dequantizes(monkeypatch):
     mx.patch_convert_moe_packed_tensors()
     blocks, scales = _random_mxfp4(2, 64, 96, device = "cuda" if torch.cuda.is_available() else "cpu")
     params = tuple(__import__("inspect").signature(mxfp4.dequantize_convertops).parameters)
-    extra = ("cpu",) if params == ("blocks", "scales", "target_device") else ()
+    # 5.0.0 passes the target device; 5.23 passes the dtype of the parameter the experts load into.
+    extra = {
+        ("blocks", "scales", "target_device"): ("cpu",),
+        ("blocks", "scales", "dtype"): (torch.bfloat16,),
+    }.get(params, ())
     monkeypatch.setattr(mx, "keep_mxfp4_experts_packed", lambda: False)
     dense = mxfp4.dequantize_convertops(blocks, scales, *extra)
     assert not isinstance(dense, Mxfp4ExpertParam) and dense.dtype == torch.bfloat16
@@ -548,6 +557,35 @@ def test_full_save_of_a_loaded_model_writes_experts_under_their_own_names(tmp_pa
     assert "quantization_config" not in open(os.path.join(tmp_path, "config.json")).read()
     assert model._weight_conversions is conversions
     assert experts.gate_up_proj is packed[0] and experts.down_proj is packed[1]
+
+
+@pytest.mark.skipif(not TRANSFORMERS_5, reason = "weight conversions are transformers 5")
+def test_full_save_after_merge_writes_dense_experts_under_their_own_names(tmp_path):
+    """merge_and_unload() leaves dense experts but keeps the load's Mxfp4Dequantize converters; 5.22+ then
+    reversed them and wrote the dense bf16 stacks as "gate_up_proj_blocks" with no scales."""
+    safetensors = pytest.importorskip("safetensors.torch")
+    from transformers.core_model_loading import WeightConverter
+    from transformers.integrations.mxfp4 import Mxfp4Dequantize
+    mx.patch_save_pretrained_mxfp4()
+    model, experts = _tiny_gpt_oss("cpu")
+    dense = {}
+    for name in ("gate_up_proj", "down_proj"):
+        dense[name] = getattr(experts, name).dequantize()
+        setattr(experts, name, nn.Parameter(dense[name].clone(), requires_grad = False))   # what the merge installs
+    conversions = [
+        WeightConverter(
+            source_patterns = [f"{proj}_blocks", f"{proj}_scales"], target_patterns = rf"{proj}$",
+            operations = [Mxfp4Dequantize(None)],
+        )
+        for proj in ("down_proj", "gate_up_proj")
+    ]
+    model._weight_conversions = conversions
+    model.save_pretrained(tmp_path)
+    saved = safetensors.load_file(os.path.join(tmp_path, "model.safetensors"))
+    assert not any(key.endswith(("_blocks", "_scales", "$")) for key in saved), sorted(saved)
+    for name in dense:
+        assert torch.equal(saved[f"model.layers.0.mlp.experts.{name}"], dense[name])
+    assert model._weight_conversions is conversions
 
 
 def test_adapter_save_never_dequantizes(tmp_path, monkeypatch):
@@ -860,5 +898,6 @@ def test_fused_decode_moe_sums_each_tokens_experts_in_a_fixed_order():
     down = mxfp4_grouped_mm_op(inter, dn_blocks, dn_scales, counts, True) + dn_bias[expert]
     rows = torch.empty(down.shape, dtype = torch.float32, device = "cuda")
     rows[order] = (down * weights[token, expert][:, None]).float()
-    want = rows.view(T, k, H).sum(1).to(down.dtype)
+    # In the activation dtype: the float32 biases promote `down`, not the returned MoE output.
+    want = rows.view(T, k, H).sum(1).to(x.dtype)
     assert torch.equal(got.view(T, H), want)

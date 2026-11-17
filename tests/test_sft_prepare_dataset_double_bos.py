@@ -14,16 +14,9 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Double-BOS detection in ``sft_prepare_dataset``.
-
-Detection is ``test_text.startswith(bos_token) or bos_token in chat_template``. Arm B
-needs a literal BOS, which Llama-3 templates never have (they emit ``{{- bos_token }}``),
-so arm A is the only live detector - and it read ``row[field][0]``, the first CHARACTER
-of a string, which no multi-character BOS can match.
-
-Assertions read tokenized output, not stub state: under ``fork`` the map body runs in
-child processes whose recorded state is invisible to the parent.
-"""
+"""Double-BOS detection in sft_prepare_dataset: Llama-3 templates have no literal BOS, so arm A was the only live
+detector, which read row[field][0], one character no multi-char BOS can match; assertions read tokenized output since
+forked children hide state."""
 
 import pytest
 from datasets import Dataset
@@ -42,8 +35,7 @@ LITERAL_BOS_TEMPLATE = "{{ '" + BOS + "' }}{{ messages }}"
 
 
 class BosStubTokenizer:
-    """Encodes the add_special_tokens decision into its output: one leading BOS id if the
-    text starts with BOS, one more if the caller asks for specials. Correct -> one, bug -> two."""
+    """Encodes add_special_tokens into the output: one leading BOS id if the text starts with BOS, another if specials are requested; correct gives one, the bug two."""
 
     def __init__(self, bos_token=BOS, chat_template=JINJA_BOS_TEMPLATE):
         self.bos_token = bos_token
@@ -138,8 +130,7 @@ def test_text_without_bos_still_gets_exactly_one():
 
 
 def test_literal_bos_in_chat_template_still_detected():
-    """Arm B alone. The text carries NO BOS so arm A cannot fire; with BOS-carrying
-    text here the test would pass even with arm B deleted."""
+    """Tests arm B alone: the text carries no BOS so arm A cannot fire; with BOS in the text the test would pass even if arm B were deleted."""
     dataset = Dataset.from_dict({"text": ["hello world", "second row"]})
 
     rows = _prepare(dataset, BosStubTokenizer(chat_template=LITERAL_BOS_TEMPLATE))

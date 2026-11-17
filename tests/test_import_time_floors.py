@@ -14,18 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Two version-skew defects that used to surface as something else.
-
-unsloth #3130: `patch_merge_quantization_configs` builds
-`from transformers.quantizers.auto import (...)` from the names of that module
-that happen to occur in the source it rewrites. On transformers 4.55.0 no name
-did, so it exec'd `from transformers.quantizers.auto import ()`, a SyntaxError,
-outside any try, and `import unsloth` ended there.
-
-unsloth #2491: triton 3.3.0 and 3.3.1 cannot lower cut_cross_entropy's forward
-kernel for compute capability 7.5, so a T4 or a 2080 Ti aborted the process with
-`LLVM ERROR: Unsupported rounding mode for conversion.`
-"""
+"""Guards two version-skew defects: an empty import list from patch_merge_quantization_configs ended import unsloth
+(unsloth issue 3130, transformers 4.55.0); triton 3.3.0/3.3.1 hit LLVM ERROR lowering cut_cross_entropy on compute
+capability 7.5 (unsloth issue 2491)."""
 
 import importlib
 
@@ -45,11 +36,8 @@ def _strip_generated_globals(namespace, before):
 
 
 def test_a_generated_global_is_removed_rather_than_restored():
-    """Why the fixture strips them itself. `monkeypatch.delitem` called after the
-    exec records the generated object as the value to put back, so its undo
-    reinstates the very name the test asked to remove, and the next call's
-    `globals().get("merge_quantization_configs")` reads a stale callable where the
-    rewritten source defined none."""
+    """The test strips generated globals itself: monkeypatch.delitem after the exec would record the generated object to
+    restore, leaving a stale merge_quantization_configs for the next call."""
     namespace = {"kept": 1}
     before = set(namespace)
     namespace[ATTRIBUTE] = lambda *a, **k: None       # as the exec would leave it
@@ -67,14 +55,8 @@ def test_a_generated_global_is_removed_rather_than_restored():
 
 @pytest.fixture
 def unpatched_quantizer(monkeypatch):
-    """transformers.quantizers.auto with nothing of ours applied to it yet.
-
-    The patch fast-returns once it has already run, and anything that imports
-    unsloth in the same interpreter will have run it, so put the pristine
-    classmethod back for the duration of the test and restore both attributes
-    exactly as they were afterwards. A recorder stands in for `patch_function`,
-    so the test never mutates transformers itself.
-    """
+    """Gives the test a pristine classmethod on transformers.quantizers.auto (the patch fast-returns once run), restores
+    both attributes after, and records patch_function."""
     auto = pytest.importorskip("transformers.quantizers.auto")
     from unsloth_zoo.temporary_patches import misc
     from unsloth_zoo.temporary_patches.utils import _get_unique_storage_name
@@ -98,27 +80,16 @@ def unpatched_quantizer(monkeypatch):
     globals_before = set(misc.__dict__)
 
     def set_module_dir(returns):
-        """PEP 562 module __dir__, set by hand rather than with monkeypatch.
-
-        A module inherits a `__dir__` method from the module type, so
-        monkeypatch's undo puts that bound method into the module's own __dict__
-        and every later dir() on it recurses forever. Measured, and it silently
-        poisoned the next test in the file.
-        """
+        """PEP 562 __dir__ must be set by hand: monkeypatch undo would put the inherited module __dir__ into the module
+        dict, and every later dir() on it recurses forever."""
         auto.__dict__["__dir__"] = lambda: list(returns)
 
     try:
         yield auto, misc, recorded, set_module_dir
     finally:
-        # Every name the patch exec'd into the module's globals - the function it
-        # defined, and whatever its generated import pulled in - belongs to this
-        # test alone. `monkeypatch.delitem` cannot do this job: called after the
-        # exec it records the generated object as the value to put back, so
-        # teardown reinstates exactly what it was asked to remove, and the next
-        # test's `globals().get("merge_quantization_configs")` finds a stale
-        # callable where the rewritten source defined none. Remove them outright,
-        # and leave restoring anything that was already here to monkeypatch,
-        # whose undo runs after this fixture's.
+        # Strip every name the patch exec'd into the module globals: monkeypatch.delitem would reinstate the generated
+        # object at teardown, leaving a stale callable for later tests; restoring pre-existing names stays with
+        # monkeypatch.
         _strip_generated_globals(misc.__dict__, globals_before)
         auto.__dict__.pop("__dir__", None)
         for name in names:
@@ -129,20 +100,10 @@ def unpatched_quantizer(monkeypatch):
 
 
 def test_an_empty_name_list_no_longer_ends_the_import(monkeypatch, unpatched_quantizer):
-    """The reported case: nothing in dir() occurs in the source.
-
-    What the fix guarantees is that no `from ... import ()` is ever built, so
-    nothing here can raise. Whether the patch then goes on to apply depends on
-    the transformers under test: a def evaluates its annotations as it runs, so
-    on a release whose signature names a type the (now empty) import would have
-    supplied, the rewritten source cannot be defined and the patch declines
-    instead. That is a decline, not an ending, and the next test pins the
-    applying half on a source that genuinely needs no names -- which this one
-    cannot do, because the real signature changes with the release.
-    """
+    """No empty from-import is built, so nothing raises; if a release's annotations need names that import would supply,
+    the patch declines rather than ending import."""
     auto, misc, recorded, set_module_dir = unpatched_quantizer
-    # PEP 562: a module may define __dir__, which is what transformers 4.55.0
-    # amounted to here, without pinning an old transformers to find out.
+    # PEP 562: a module may define __dir__, which transformers 4.55.0 amounted to here; reproduced without pinning an old transformers.
     set_module_dir([])
     assert dir(auto) == []
 
@@ -167,14 +128,12 @@ def test_an_empty_name_list_no_longer_ends_the_import(monkeypatch, unpatched_qua
 
 
 def merge_quantization_configs(cls, quantization_config, quantization_config_from_args):
-    """Stands in for the real classmethod, with the one property that matters:
-    nothing in its source has to be imported before it can be defined."""
+    """Stands in for the real classmethod; its source needs no imported names before it can be defined, which is the one property that matters."""
     return quantization_config
 
 
 def test_a_rewrite_that_needs_no_names_is_still_applied(monkeypatch, unpatched_quantizer):
-    """The other half of an empty name list: the import was only ever there to
-    supply names the rewritten source needs, so needing none still patches."""
+    """An empty name list still patches when the rewritten source needs no names: the import only supplies names the source uses."""
     auto, misc, recorded, set_module_dir = unpatched_quantizer
     monkeypatch.setattr(auto.AutoHfQuantizer, ATTRIBUTE, merge_quantization_configs)
     set_module_dir([])
@@ -186,19 +145,15 @@ def test_a_rewrite_that_needs_no_names_is_still_applied(monkeypatch, unpatched_q
     assert target is auto.AutoHfQuantizer
     assert attribute == ATTRIBUTE
     assert callable(replacement)
-    # The exec'd copy, not the object this file passed in: reading the patch's
-    # own globals is what the "defined something else" guard depends on.
+    # Asserts on the exec'd copy rather than the object passed in, since the defined-something-else guard reads the patch's own globals.
     assert replacement is not merge_quantization_configs
     assert replacement.__name__ == ATTRIBUTE
 
 
 def test_an_import_that_fails_is_reported_not_raised(monkeypatch, unpatched_quantizer):
-    """A name that occurs in the source but is not importable from the module is a
-    patch failure, not an import failure."""
+    """A name in the source but missing from the module is a patch failure, reported rather than raised as an import failure."""
     auto, misc, recorded, set_module_dir = unpatched_quantizer
-    # A parameter name of merge_quantization_configs, so it passes the
-    # `x in source` filter, and not an attribute of the module, so the generated
-    # import raises ImportError.
+    # A parameter name of merge_quantization_configs passes the `x in source` filter but is not a module attribute, so the generated import raises ImportError.
     unimportable = "quantization_config_from_args"
     assert not hasattr(auto, unimportable)
     set_module_dir([unimportable])
@@ -209,16 +164,14 @@ def test_an_import_that_fails_is_reported_not_raised(monkeypatch, unpatched_quan
 
 
 def _defines_another_name(cls, quantization_config, quantization_config_from_args):
-    """Stands in for AutoHfQuantizer.merge_quantization_configs, with the one
-    property that matters: its source defines a function under a different name."""
+    """Stands in for AutoHfQuantizer.merge_quantization_configs; its source defines a function under a different name, which is the one property that matters."""
     return quantization_config
 
 
 def test_a_rewrite_that_defines_nothing_is_reported_not_a_name_error(
     monkeypatch, unpatched_quantizer
 ):
-    """The name in the issue title: the rewritten source exec'd cleanly but under
-    another name, and the patch then raised NameError out of itself."""
+    """When the rewritten source runs cleanly but defines another name, the patch must report that rather than raise NameError from itself."""
     auto, misc, recorded, _ = unpatched_quantizer
     monkeypatch.setattr(auto.AutoHfQuantizer, ATTRIBUTE, _defines_another_name)
 
@@ -247,11 +200,8 @@ def loss_utils():
         ("3.3.1", True),
         # pytorch-triton nightlies carry a local version; 3.3.x is still 3.3.x.
         ("3.3.1+git1234abcd", True),
-        # Windows gets Triton from the separate `triton-windows` distribution, which
-        # installs as the `triton` package and carries a `.postN` suffix on the same
-        # upstream version. `from triton import __version__` reads it either way, so
-        # the gate has to treat a repackaged 3.3.x as 3.3.x and a repackaged 3.4.x as
-        # 3.4.x, rather than reading the post segment as a different release.
+        # Windows Triton (triton-windows) installs as the triton package with a .postN suffix on the same upstream
+        # version, so a repackaged 3.3.x must read as 3.3.x, not as a new release.
         ("3.3.1.post19", True),
         ("3.3.0.post1", True),
         ("3.4.0", False),
@@ -265,9 +215,7 @@ def loss_utils():
     ],
 )
 def test_only_the_two_broken_triton_releases_are_rejected(loss_utils, version, rejected):
-    """Both ends measured: the real cut_cross_entropy kernel was compiled ahead of
-    time for cuda:75 on every published release from 3.1.0 to 3.8.0, and only
-    3.3.0 and 3.3.1 abort."""
+    """The cut_cross_entropy kernel compiled ahead of time for cuda:75 on every published release from 3.1.0 to 3.8.0, and only 3.3.0 and 3.3.1 abort."""
     assert loss_utils._triton_miscompiles_cce_on_sm75(7, 5, version) is rejected
 
 
@@ -277,8 +225,7 @@ def test_only_the_two_broken_triton_releases_are_rejected(loss_utils, version, r
 def test_every_other_gpu_keeps_cut_cross_entropy_on_the_broken_triton(
     loss_utils, capability
 ):
-    """The sm_80 control compiled cleanly on all of 3.1.0 to 3.8.0, so nothing but
-    7.5 may be gated off."""
+    """The sm_80 control compiled cleanly on all of 3.1.0 to 3.8.0, so only compute capability 7.5 may be gated off."""
     assert loss_utils._triton_miscompiles_cce_on_sm75(*capability, "3.3.1") is False
 
 
@@ -294,10 +241,8 @@ def test_the_gate_reaches_has_cut_cross_entropy(monkeypatch, version, expected):
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (7, 5))
-    # device_count too, since the gate enumerates the visible devices rather than reading
-    # the current one. On a CPU-only runner it answers 0, the enumeration finds nothing to
-    # be affected by, and the version=3.3.1 case would enable CCE and pass for the wrong
-    # reason -- while claiming to have tested the wiring.
+    # device_count must be stubbed too since the gate enumerates visible devices; on a CPU-only runner it answers 0, so
+    # the 3.3.1 case would pass for the wrong reason.
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     monkeypatch.setattr(triton, "__version__", version)
 
@@ -331,17 +276,8 @@ def _causal_lm_templates():
 
 
 def test_the_compiled_branch_consults_has_cut_cross_entropy():
-    """Disabling CCE has to reach the compiled forward, not just the import.
-
-    The sm75 gate above only makes HAS_CUT_CROSS_ENTROPY false and skips
-    `from cut_cross_entropy import linear_cross_entropy`. UNSLOTH_ENABLE_CCE is a separate
-    env flag defaulting to "1" that unsloth_zoo/__init__.py force-disables only for torch
-    >= 2.8 and for HIP -- so on torch 2.7, which pins exactly the triton 3.3.x the kernel
-    miscompiles under, the flag stayed on and the generated branch called
-    fused_linear_cross_entropy, which references the symbol that was never imported and
-    raises NameError. The warning promises "the standard loss is used instead", and the
-    elif below the branch is that standard loss.
-    """
+    """Disabling CCE must reach the compiled forward: unsloth_zoo/__init__.py force-disables UNSLOTH_ENABLE_CCE only for
+    torch >= 2.8 and HIP, so on torch 2.7 the branch must also check HAS_CUT_CROSS_ENTROPY, else it raises NameError."""
     source, branches = _causal_lm_templates()
     assert branches, "the generated causal-LM CCE branch is no longer recognisable"
     for branch in branches:
@@ -353,9 +289,8 @@ def test_the_compiled_branch_consults_has_cut_cross_entropy():
 
 
 def test_fused_linear_cross_entropy_needs_the_symbol_the_gate_skips():
-    """The premise: with the gate false the symbol genuinely is not there, so a branch
-    that ignores the gate cannot work. Guards against the test above passing while the
-    two flags have quietly stopped being independent."""
+    """With the gate false the symbol is really absent, so a branch that ignores the gate cannot work; guards against
+    the two flags quietly ceasing to be independent."""
     import inspect
 
     loss_utils = importlib.import_module("unsloth_zoo.loss_utils")
@@ -377,15 +312,8 @@ def _sm75_warning_text():
 
 
 def test_the_sm75_warning_does_not_recommend_a_torch_that_still_disables_cce():
-    """The remedy has to clear BOTH gates, not just the triton one.
-
-    triton 3.4.0 ships with torch 2.8.0 and compiles the kernel, but unsloth_zoo/__init__.py
-    sets UNSLOTH_ENABLE_CCE=0 for torch >= 2.8 over a separate shared-memory failure, and
-    the generated branches require that flag as well as HAS_CUT_CROSS_ENTROPY. So a user
-    who followed "upgrade to torch 2.8" paid for the upgrade and still got the standard
-    loss. torch 2.6.0 carries triton 3.2.0, which is outside the broken range and below
-    the flag's cutoff, so it is the configuration that actually restores CCE.
-    """
+    """The remedy must clear both gates: torch 2.8 with triton 3.4.0 still sets UNSLOTH_ENABLE_CCE=0 for torch >= 2.8,
+    so torch 2.6.0 (triton 3.2.0) is the version that restores CCE."""
     text = _sm75_warning_text()
     assert "torch 2.6.0" in text
     assert "UNSLOTH_ENABLE_CCE=0" in text, (
@@ -396,9 +324,8 @@ def test_the_sm75_warning_does_not_recommend_a_torch_that_still_disables_cce():
 
 
 def test_the_flag_the_warning_now_names_really_is_set_for_torch_28():
-    """NEGATIVE CONTROL for the sentence above: read the gate rather than trusting the
-    prose. If __init__ ever stops force-disabling CCE on torch 2.8, this fails and the
-    warning can go back to recommending it."""
+    """Negative control: reads the unsloth_zoo __init__ gate rather than the prose; fails if torch 2.8 stops
+    force-disabling CCE, letting the warning go back to recommending it."""
     import inspect
     import re
 
@@ -417,13 +344,11 @@ def test_the_flag_the_warning_now_names_really_is_set_for_torch_28():
 @pytest.mark.parametrize(
     "capabilities, affected_indices",
     [
-        # The heterogeneous host from the report: device 0 is an A100 and the current
-        # device at import, while a device_map can put lm_head on the T4 at index 1.
+        # Heterogeneous host from the report: device 0 is an A100 and the current device at import, but device_map can put lm_head on the T4 at index 1.
         ([(8, 0), (7, 5)], [1]),
         ([(7, 5), (8, 0)], [0]),
         ([(7, 5), (7, 5)], [0, 1]),
-        # NEGATIVE CONTROLS: a homogeneous host that is not sm_75 is untouched, and so is
-        # a host with no devices at all.
+        # Negative controls: a homogeneous host that is not sm_75, and a host with no devices at all, are both left untouched.
         ([(8, 0), (9, 0)], []),
         ([], []),
     ],
@@ -431,9 +356,8 @@ def test_the_flag_the_warning_now_names_really_is_set_for_torch_28():
 def test_every_visible_device_is_asked_not_just_the_current_one(
     monkeypatch, capabilities, affected_indices
 ):
-    """`torch.cuda.get_device_capability()` with no argument describes the CURRENT device,
-    but a supported device_map can place lm_head on another GPU. Guessing wrong is not a
-    slow path: the kernel aborts the process with an LLVM error nothing can catch."""
+    """get_device_capability() with no argument only describes the current device, but device_map can put lm_head on
+    another GPU; guessing wrong aborts the process with an uncatchable LLVM error."""
     import torch
 
     loss_utils = importlib.import_module("unsloth_zoo.loss_utils")
@@ -446,8 +370,7 @@ def test_every_visible_device_is_asked_not_just_the_current_one(
 
 
 def test_a_working_triton_leaves_every_device_alone(monkeypatch):
-    """The other control: sm_75 is only a problem on the two broken triton releases, so a
-    T4 host on triton 3.4.0 must come back empty and keep CCE."""
+    """sm_75 is only a problem on the two broken triton releases, so a T4 host on triton 3.4.0 must report no devices and keep CCE."""
     import torch
 
     loss_utils = importlib.import_module("unsloth_zoo.loss_utils")

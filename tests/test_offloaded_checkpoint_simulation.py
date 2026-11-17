@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Offloaded checkpoint shim, CPU-only so it also runs on macOS and Windows.
-GPU counterpart (real pinned-buffer offload): test_offloaded_checkpoint_rng.py."""
+"""CPU-only offloaded checkpoint shim tests, so they also run on macOS and Windows; the GPU counterpart with real
+pinned-buffer offload is test_offloaded_checkpoint_rng.py."""
 import functools
 import inspect
 
@@ -286,8 +286,7 @@ def test_offloaded_shim_now_agrees_with_unsloth_checkpoint(gc_module):
 
 
 def test_plain_shim_still_ignores_the_flag_as_documented(gc_module):
-    """Unsloth_Gradient_Checkpointer has no such slot, so it redraws the mask.
-    Deliberate per _TORCH_CHECKPOINT_KEYWORDS_LITERAL; now the only shim like that."""
+    """Unsloth_Gradient_Checkpointer has no such slot, so it redraws the mask; deliberate per _TORCH_CHECKPOINT_KEYWORDS_LITERAL and now the only shim like that."""
     reference = _rng_run(pristine())
     actual    = _rng_run(gc_module.unsloth_gradient_checkpoint)
     assert not torch.allclose(actual[1], reference[1]), \
@@ -342,12 +341,9 @@ def test_public_signature_is_unchanged(gc_module):
 
 @pytest.fixture
 def restore_checkpoint_patches(monkeypatch):
-    """The patch rebinds transformers.modeling_utils.checkpoint and sets UNSLOTH_PATCHED too.
-
-    Restoring only torch's left transformers on the offloaded shim for the rest of the worker,
-    so test_gemma4_unified_forced_float32's checkpointed backward went through it on a CPU
-    runner and died allocating pinned host memory.
-    """
+    """Patch rebinds transformers.modeling_utils.checkpoint and sets UNSLOTH_PATCHED; restoring only torch's checkpoint
+    left transformers on the offloaded shim for the whole worker, which made test_gemma4_unified_forced_float32's
+    backward die allocating pinned host memory on CPU runners."""
     import transformers.modeling_utils
 
     monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", torch.utils.checkpoint.checkpoint)
@@ -405,8 +401,7 @@ def test_unpatch_puts_back_a_wrapper_transformers_already_had(
 
 
 def test_popping_a_stacked_patch_keeps_torch_and_transformers_in_step(restore_checkpoint_patches):
-    """Offloaded then plain: unpatching the plain one puts torch back on the offloaded shim via
-    _old_checkpoint, so transformers has to land on the same shim, not on the original."""
+    """Offloaded then plain: unpatching the plain one restores torch to the offloaded shim via _old_checkpoint, so transformers must match it, not the original."""
     import transformers.modeling_utils
     from unsloth_zoo import gradient_checkpointing as module
 

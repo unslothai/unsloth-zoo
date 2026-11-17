@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Step-3.7-Flash reads `moe.gate.weight` directly, so a Linear4bit router fails with
-"mat1 and mat2 shapes cannot be multiplied (512x4096 and 1x589824)"."""
+"""Step-3.7-Flash reads moe.gate.weight directly, so a Linear4bit router fails with a mat1/mat2 shape error (512x4096 and 1x589824)."""
 import pytest
 import torch
 import torch.nn as nn

@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Routers rewritten for the routing-weights cast stay compiled, and the compiler swaps dict entries only
-for the exact class it replaced (a substring match turned Jamba's attention decoder layer into bare attention)."""
+"""Routers rewritten for the routing-weights cast stay compiled; dict entries are swapped only for the exact class
+replaced, since a substring match turned Jamba's attention decoder layer into bare attention."""
 
 import json
 import os
@@ -57,10 +57,8 @@ print("RESULT " + json.dumps(out))
 '''
 
 
-# The router decorator follows the compile mode, so the child states its own rather than
-# inheriting the caller's: unsloth's Core zoo job exports UNSLOTH_COMPILE_DISABLE=1, under which
-# the routers are rightly left out of compile, and the default-mode assertion read that as a
-# regression. Both modes are pinned, so a router that stops following the switch fails too.
+# Router decorator follows its own compile mode, not the caller's; UNSLOTH_COMPILE_DISABLE=1 (exported by the Core zoo
+# job) rightly skips routers; both modes are pinned.
 @pytest.mark.parametrize(
     "compile_disable, expected_prefix",
     [(None, "torch_compile_with_fallback("), ("1", "torch_compiler_disable_unless_decode")],

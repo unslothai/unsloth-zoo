@@ -14,14 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Structural pins for the PR #659 cleanup (not the FP8/bnb4bit kernels):
-
-1. The unused post-load FP8 scale reattach machinery is gone.
-2. _call_with_temporary_moe_weights is unified in moe_utils (removed from
-   moe_utils_fp8 and moe_utils_bnb4bit).
-3. The PEFT bnb4bit MoE merge/unmerge patches live in moe_utils_bnb4bit,
-   not misc.py.
-"""
+"""Structural pins for PR 659 cleanup: unused FP8 scale reattach is gone; _call_with_temporary_moe_weights lives only in
+moe_utils; PEFT bnb4bit MoE patches moved from misc.py to moe_utils_bnb4bit."""
 
 from __future__ import annotations
 
@@ -47,8 +41,7 @@ def test_dead_fp8_reattach_machinery_is_gone():
 
 
 def test_moe_utils_fp8_does_not_open_safetensors_at_load_time():
-    """The deleted reattach path was the only consumer of safetensors /
-    hf_hub_download in moe_utils_fp8; nothing should reopen checkpoint shards."""
+    """moe_utils_fp8 must not open checkpoint shards at load: its only consumer, the deleted reattach path, was the sole user of safetensors and hf_hub_download."""
     from pathlib import Path
     import unsloth_zoo.temporary_patches.moe_utils_fp8 as m
     src = Path(m.__file__).read_text()
@@ -84,26 +77,25 @@ def test_peft_bnb4bit_moe_patches_live_in_moe_utils_bnb4bit():
 
 
 def test_temporary_patches_register_expected_count():
-    """Phase 3 must NOT silently drop a TEMPORARY_PATCHES.append entry.
-    moe_utils_bnb4bit now registers 3 more patches than before."""
+    """Phase 3 must not silently drop a TEMPORARY_PATCHES.append entry: moe_utils_bnb4bit now registers 3 more patches than before."""
     from unsloth_zoo.temporary_patches import moe_utils_bnb4bit
     import inspect
 
     src = inspect.getsource(moe_utils_bnb4bit)
     # Count is sticky to the file; if Phase 3 forgets the .append, we drop one.
     count = src.count("TEMPORARY_PATCHES.append(")
-    assert count == 10, (
-        f"moe_utils_bnb4bit registers {count} patches; expected 10 "
+    assert count == 12, (
+        f"moe_utils_bnb4bit registers {count} patches; expected 12 "
         "(4 original bnb4bit patches + the 2 PEFT MoE patches relocated from misc.py "
         "+ 3 later bnb4bit conversion patches: weight_conversions, "
         "model_conversion_mapping, dequantize_plain_params "
-        "+ keep_fused_experts for fused pre-quantized Llama-4 checkpoints)."
+        "+ keep_fused_experts for fused pre-quantized Llama-4 checkpoints "
+        "+ prequantized_plain_weight_dtype (4-bit and 8-bit) for transformers >= 5.21 plain weights)."
     )
 
 
 def test_transformers_v5_moe_quant_gate_false_without_param_needs_quantization(monkeypatch):
-    """Transformers v4-style Bnb4BitHfQuantizer has no v5 quantization gate.
-    PR #659's v5-only patch set must not register for that API shape."""
+    """A transformers v4-style Bnb4BitHfQuantizer has no v5 quantization gate, so PR 659's v5-only MoE patch set must not register for it."""
     from transformers.quantizers import quantizer_bnb_4bit
     from unsloth_zoo.temporary_patches import common
 
@@ -177,6 +169,7 @@ def test_v5_moe_quant_patches_registered_when_capability_exists():
         moe_utils_bnb4bit.patch_transformers_weight_converter_kwargs,
         moe_utils_bnb4bit.patch_peft_param_wrapper_4bit_expert_shape,
         moe_utils_bnb4bit.patch_peft_param_wrapper_merge_4bit,
+        moe_utils_bnb4bit.patch_bnb8bit_prequantized_plain_weight_dtype,
         moe_utils_fp8.patch_fp8_experts_interface,
         moe_utils_fp8.patch_fp8_validate_quantization_for_training,
     }

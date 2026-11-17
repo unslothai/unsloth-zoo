@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""_Gemma4KVSharedSafeProxy is built inside compiled gemma-4 forwards via
-get_text_config() (26B-A4B / 31B, num_kv_shared_layers == 0): it must trace."""
+"""_Gemma4KVSharedSafeProxy must trace under dynamo; compiled gemma-4 forwards build it via get_text_config() when num_kv_shared_layers == 0 (26B-A4B, 31B)"""
 import copy
 import pickle
 

@@ -34,7 +34,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       contains(github.event.pull_request.labels.*.name, 'mlx')
     runs-on: macos-15   # Apple Silicon (M1) hosted runner
-    timeout-minutes: 30
+    timeout-minutes: 45   # the Metal suite runs ~30 min on the hosted M1 before its last steps
     strategy:
       fail-fast: false
       matrix:
@@ -53,7 +53,7 @@ jobs:
     steps:
       # harden-runner block-mode is Linux-only; stay in audit on macOS for parity.
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
         with:
           egress-policy: audit
 
@@ -61,7 +61,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
 
@@ -86,7 +86,7 @@ jobs:
         # ModuleNotFoundError: No module named 'torch'.
         run: |
           python -m pip install --upgrade pip
-          pip install "torch>=2.4.0,<2.15.0"
+          pip install "torch>=2.4.0,<2.16.0"
           pip install -e .[mlx]
           pip install pytest==9.0.3
           # The vision model used by tests/test_mlx_generate_metal.py loads
@@ -107,7 +107,7 @@ jobs:
         # silently remove the very check that is supposed to tell us whether the
         # next release is safe to adopt.
         #
-        # Also past mlx-vlm's <=0.7.9 ceiling (and transformers with it): non-gating.
+        # Also past mlx-vlm's <=0.7.12 ceiling (and transformers with it): non-gating.
         if: matrix.mlx == 'latest'
         run: |
           pip install --upgrade mlx mlx-lm mlx-vlm
@@ -195,6 +195,10 @@ jobs:
         # experts from the checkpoint, bit-exact against the stock modules.
         run: python -m pytest tests/test_mlx_load_residency_metal.py -v -rs
 
+      - name: tests/test_mlx_speculative_metal.py (qwen4_exp)
+        # Only the random qwen4_exp cases: the rest load bf16 checkpoints this runner cannot hold.
+        run: python -m pytest tests/test_mlx_speculative_metal.py -k qwen4 -v -rs
+
       - name: tests/test_mlx_generate_metal.py
         # Batched generation on real models: batched-vs-sequential greedy
         # equivalence with aligned sampled-token logprobs, memory-limit
@@ -210,6 +214,10 @@ jobs:
       - name: tests/test_mlx_cpt_partition_metal.py
         # CPT partition, target normalization and full-module save routing.
         run: python -m pytest tests/test_mlx_cpt_partition_metal.py -v -rs
+
+      - name: tests/test_mlx_group_by_length_metal.py
+        # group_by_length through the real text plan builder (needs real MLX).
+        run: python -m pytest tests/test_mlx_group_by_length_metal.py -v -rs
 
       - name: tests/test_mlx_pr684_full_validation_metal.py
         # Deep behavior checks: resume determinism, completion-only training,
@@ -249,6 +257,13 @@ jobs:
         # Audio collation, label masking and the family/version gate.
         run: python -m pytest tests/test_mlx_vlm_label_masks.py -v -rs
 
+      - name: tests/test_mlx_vlm_video_batch.py
+        run: python -m pytest tests/test_mlx_vlm_video_batch.py -v -rs
+
+      - name: tests/test_video_reader_backends.py
+        # No torchvision or PyAV here: mlx-vlm's opencv-python is the decoder Apple Silicon users get.
+        run: python -m pytest tests/test_video_reader_backends.py -v -rs
+
       - name: tests/test_mlx_batching_and_decay.py
         # test_compiler_review_guards_are_present is deselected here, not skipped
         # in the file: it only asserts on unsloth_zoo.compiler source text, so
@@ -274,3 +289,6 @@ jobs:
       - name: tests/test_mlx_decision_metal.py
         # Typed-decision model logits against a torch reference of laya's DecisionModel.
         run: python -m pytest tests/test_mlx_decision_metal.py -v -rs
+
+      - name: tests/test_mlx_qat.py
+        run: python -m pytest tests/test_mlx_qat.py -v -rs

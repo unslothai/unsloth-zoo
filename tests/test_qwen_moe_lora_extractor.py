@@ -155,11 +155,7 @@ def test_shared_factory_used_by_qwen3_5_and_next():
 
 
 class _SquareWrapper:
-    """Wrapper for the input_dim == output_dim ambiguity test.
-
-    Sets `_did_swap_in_out_features` to mimic what PEFT 0.19 sets after the
-    swap, so the extractor can disambiguate.
-    """
+    """Wrapper for the input_dim == output_dim ambiguity case; sets `_did_swap_in_out_features` as PEFT 0.19 does after the swap so the extractor can disambiguate."""
     def __init__(self, parameter_name, dim, did_swap):
         self.parameter_name = parameter_name
         self.base_layer = type("_Base", (), {})()
@@ -179,9 +175,7 @@ class _SquareWrapper:
 
 @pytest.mark.parametrize("did_swap", [False, True], ids=["peft018", "peft019_swapped"])
 def test_extractor_disambiguates_square_dims_via_did_swap(did_swap):
-    """When input_dim == output_dim both branch predicates match. The extractor
-    must use `_did_swap_in_out_features` to pick the correct branch.
-    """
+    """When input_dim == output_dim both branch predicates match, so the extractor must use `_did_swap_in_out_features` to pick the correct branch."""
     ext = _make_qwen_moe_lora_extractor()
     E, R, dim = 4, 3, 16
     torch.manual_seed(7)
@@ -206,18 +200,15 @@ def test_extractor_disambiguates_square_dims_via_did_swap(did_swap):
 
 
 def test_extractor_fallback_warns_when_dims_mismatch(caplog):
-    """When neither branch matches, the extractor must warn before falling
-    through to the canonical permutation. Guards against the silent PR #601
-    failure mode resurfacing.
-    """
+    """When neither branch matches, the extractor must warn before falling through to the canonical permutation; guards
+    against the silent PR 601 failure mode resurfacing."""
     import logging
 
     ext = _make_qwen_moe_lora_extractor()
     E, R, in_dim, out_dim = 4, 3, 16, 24
     torch.manual_seed(11)
 
-    # Build a wrapper that reports plausible dims but supplies LoRA factors
-    # whose shapes match neither branch (simulates a future PEFT layout).
+    # Wrapper reports plausible dims but LoRA factors matching neither branch, simulating a future PEFT layout.
     wrapper = _Wrapper("gate_up_proj", (E, 2 * 16, in_dim))
     weird_dim = 99
     wA = torch.randn(E * R, weird_dim)

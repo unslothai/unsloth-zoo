@@ -27,6 +27,8 @@ from unsloth_zoo.utils import Version, device_guard as _device_guard
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING, logger
 from .utils import patch_function, raise_error
 from unsloth_zoo.mxfp4_dequant import Mxfp4ExpertParam, is_mxfp4_expert_param, mxfp4_dequantize, mxfp4_kernel_available
+from unsloth_zoo.packed_experts import is_packed_expert_param, packed_param_dtype
+from unsloth_zoo import mxfp4_dequant as _mxfp4_dequant
 
 transformers_version = Version(importlib_version("transformers"))
 
@@ -111,7 +113,7 @@ class _Mxfp4ShapeProxy:
 
     @property
     def dtype(self):
-        return self._param.mxfp4_dtype
+        return packed_param_dtype(self._param)
 
     def __getattr__(self, name):
         return getattr(self._param, name)
@@ -133,7 +135,7 @@ def patch_peft_param_wrapper_mxfp4():
     @functools.wraps(original_get_param)
     def get_param(self):
         param = original_get_param(self)
-        if is_mxfp4_expert_param(param):
+        if is_packed_expert_param(param):   # MXFP4, NVFP4, MXFP8 stacks expose their logical shape
             self.num_experts = param._original_shape[0]
             return _Mxfp4ShapeProxy(param)
         return param
@@ -142,7 +144,7 @@ def patch_peft_param_wrapper_mxfp4():
     def merge(self, safe_merge = False, adapter_names = None):
         base_layer = self.get_base_layer()
         param = getattr(base_layer, self.parameter_name, None)
-        if not is_mxfp4_expert_param(param):
+        if not is_packed_expert_param(param):
             return original_merge(self, safe_merge = safe_merge, adapter_names = adapter_names)
         adapter_names = check_adapters_to_merge(self, adapter_names)
         if not adapter_names:
@@ -212,6 +214,46 @@ def patch_mxfp4_quantizer_element_size():
     Mxfp4HfQuantizer.param_element_size = param_element_size
 pass
 TEMPORARY_PATCHES.append(patch_mxfp4_quantizer_element_size)
+
+
+class _PackedExpertQuantizer:
+    def __init__(self, quantizer):
+        self._quantizer = quantizer
+
+    def param_needs_quantization(self, *args, **kwargs):
+        return True
+
+    def __getattr__(self, name):
+        return getattr(self._quantizer, name)
+
+
+def patch_mxfp4_packed_expert_shape_check():
+    """transformers 5.23 shape-checks unless param_needs_quantization (False under dequantize=True), so packed
+    (E, N, G, 16) experts hit mismatched_keys; let through only stacks whose logical shape matches the module."""
+    try:
+        import transformers.core_model_loading as core
+    except Exception:
+        return
+    original = getattr(core, "set_param_for_module", None)
+    if original is None or getattr(original, "_unsloth_mxfp4_patched", False):
+        return
+
+    @functools.wraps(original)
+    def set_param_for_module(model, target_name, param_value, loading_info, hf_quantizer, *args, **kwargs):
+        if hf_quantizer is not None and is_mxfp4_expert_param(param_value):
+            module_path, _, param_name = target_name.rpartition(".")
+            try:
+                ref = getattr(model.get_submodule(module_path) if module_path else model, param_name, None)
+            except AttributeError:
+                ref = None
+            if ref is not None and tuple(ref.shape) == tuple(param_value._original_shape):
+                hf_quantizer = _PackedExpertQuantizer(hf_quantizer)
+        return original(model, target_name, param_value, loading_info, hf_quantizer, *args, **kwargs)
+
+    set_param_for_module._unsloth_mxfp4_patched = True
+    core.set_param_for_module = set_param_for_module
+pass
+TEMPORARY_PATCHES.append(patch_mxfp4_packed_expert_shape_check)
 
 
 def _dense_packed_linear(module):
@@ -377,20 +419,25 @@ def patch_save_pretrained_mxfp4():
             (module, name, param)
             for module in self.modules()
             for name, param in list(module._parameters.items())
-            if is_mxfp4_expert_param(param)
+            if is_packed_expert_param(param)
         ]
-        if not packed:
-            return original(self, *args, **kwargs)
-        names = {id(param): name for name, param in self.named_parameters(remove_duplicate = False)
-                 if is_mxfp4_expert_param(param)}
-        dense = {}
-        # Reversing the Mxfp4Dequantize converters raises (5.4) or drops layers under "down_proj$" (5.17).
+        # Reversing Mxfp4Dequantize raises (5.4), drops layers (5.17) or renames dense experts (5.22+). Strip them
+        # even with no packed param left: merge_and_unload() keeps the load's converters on the model.
         conversions = self.__dict__.get("_weight_conversions", None)
         if isinstance(conversions, (list, tuple)):
             self._weight_conversions = [
                 conversion for conversion in conversions
                 if not any(type(op).__name__ == "Mxfp4Dequantize" for op in getattr(conversion, "operations", ()) or ())
             ]
+        if not packed:
+            try:
+                return original(self, *args, **kwargs)
+            finally:
+                if isinstance(conversions, (list, tuple)):
+                    self._weight_conversions = conversions
+        names = {id(param): name for name, param in self.named_parameters(remove_duplicate = False)
+                 if is_packed_expert_param(param)}
+        dense = {}
         try:
             for module, name, param in packed:
                 weight = param.dequantize().cpu()
@@ -439,10 +486,15 @@ def patch_convert_moe_packed_tensors():
         # mxfp4_dequantize needs 16-byte (32-value) blocks; any other block size takes the loop below.
         if blocks.is_cuda and blocks.dtype == torch.uint8 and blocks.shape[-1] == 16 and dtype in (torch.bfloat16, torch.float16):
             return mxfp4_dequantize(blocks, scales, dtype = dtype)
+        assert blocks.shape[:-1] == scales.shape, f"{blocks.shape=} does not match {scales.shape=}"
+        if not _mxfp4_dequant._LDEXP_EXACT and blocks.dtype == torch.uint8:
+            # torch < 2.12 ldexp forms 2^e in the output dtype (fp16 inf, 0 * inf = NaN); decode via fp32.
+            with _device_guard(blocks):
+                return _mxfp4_dequant.mxfp4_dequantize_torch(
+                    blocks, scales, dtype = dtype, max_rows = max(1, rows_per_chunk // blocks.shape[-2]),
+                )
 
         scales = scales.to(torch.int32) - 127
-
-        assert blocks.shape[:-1] == scales.shape, f"{blocks.shape=} does not match {scales.shape=}"
 
         lut = torch.tensor(FP4_VALUES, dtype=dtype, device=blocks.device)
 
@@ -525,8 +577,16 @@ def patch_convert_moe_packed_tensors():
                 if target_device == "cpu" and torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 return torch.nn.Parameter(dequantized.to(target_device))
+        elif _convertops_params == ("blocks", "scales", "dtype"):
+            # 5.23.0 and newer pass the dtype of the parameter the experts load into.
+            def dequantize_convertops(blocks, scales, dtype):
+                if blocks.dtype == torch.uint8 and blocks.dim() == 4 and keep_mxfp4_experts_packed():
+                    return Mxfp4ExpertParam(blocks, mxfp4_scales = scales)
+                convert = functools.partial(convert_moe_packed_tensors, dtype = dtype)
+                dequantized = _dequantize_to_gpt_oss_layout(convert, blocks, scales)
+                return torch.nn.Parameter(dequantized if dtype is None else dequantized.to(dtype))
         else:
-            # 5.1.0 and newer. Upstream leaves placement to its caller here.
+            # 5.1.0 to 5.22. Upstream leaves placement to its caller here.
             def dequantize_convertops(blocks, scales):
                 if blocks.dtype == torch.uint8 and blocks.dim() == 4 and keep_mxfp4_experts_packed():
                     return Mxfp4ExpertParam(blocks, mxfp4_scales = scales)

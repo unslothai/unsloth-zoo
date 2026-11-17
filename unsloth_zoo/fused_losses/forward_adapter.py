@@ -26,15 +26,44 @@ from __future__ import annotations
 
 __all__ = [
     "EMPTY_LOGITS",
+    "lm_head_fake_quantize",
     "unsloth_fused_lm_head_loss",
 ]
 
+import inspect
+
 import torch
 
+from . import cross_entropy_loss as _ce
 from .cross_entropy_loss import unsloth_fsdp_unshard, unsloth_fused_ce_loss
 
 
 EMPTY_LOGITS = torch.empty(0)
+
+# Kwargs the fused CE reads; extras (HF output_attentions / output_hidden_states) make _use_chunked_ce refuse the kernel.
+_KERNEL_KWARGS = frozenset(_ce._FUSED_LINEAR_CE_KWARGS) | frozenset(("n_chunks",)) | frozenset(
+    inspect.signature(_ce.unsloth_fused_ce_loss).parameters
+) - frozenset(("trainer", "hidden_states", "lm_head_weight", "lm_head_bias", "labels", "n_items", "shift_labels",
+               "kwargs"))
+
+
+def lm_head_on_old_cuda_arch(weight):
+    """Replaced by unsloth_zoo.compiler.lm_head_on_old_cuda_arch, which owns the pre-Turing card set."""
+    return False
+
+
+def lm_head_fake_quantize(lm_head, hidden_states):
+    """(hidden_states, weight) after the TorchAO QAT QDQ that lm_head.forward() applies and fused CE skips."""
+    weight = lm_head.weight
+    if type(lm_head) is torch.nn.Linear:
+        return hidden_states, weight
+    activation_fake_quantizer = getattr(lm_head, "activation_fake_quantizer", None)
+    if activation_fake_quantizer is not None:
+        hidden_states = activation_fake_quantizer(hidden_states)
+    weight_fake_quantizer = getattr(lm_head, "weight_fake_quantizer", None)
+    if weight_fake_quantizer is not None:
+        weight = weight_fake_quantizer(weight)
+    return hidden_states, weight
 
 
 def unsloth_fused_lm_head_loss(
@@ -86,11 +115,18 @@ def unsloth_fused_lm_head_loss(
     if kwargs.get("scaling", None) is None and accelerator_scaler is not None:
         kwargs["scaling"] = accelerator_scaler
 
+    kwargs = {k: v for k, v in kwargs.items() if k in _KERNEL_KWARGS}
+
     unsloth_fsdp_unshard(lm_head)
+    # A head on a pre-Turing card skips Inductor. Asked after unshard: FSDP2 CPUOffloadPolicy keeps
+    # the shard on CPU until then.
+    if kwargs.get("torch_compile", True) and lm_head_on_old_cuda_arch(lm_head.weight):
+        kwargs["torch_compile"] = False
+    hidden_states, weight = lm_head_fake_quantize(lm_head, hidden_states)
     loss = unsloth_fused_ce_loss(
         trainer        = None,
         hidden_states  = hidden_states,
-        lm_head_weight = lm_head.weight,
+        lm_head_weight = weight,
         lm_head_bias   = getattr(lm_head, "bias", None),
         labels         = target,
         n_items        = n_items,

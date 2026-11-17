@@ -26,8 +26,8 @@ os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
 from unsloth_zoo.temporary_patches import gdn_causal_conv1d as gcc  # noqa: E402
 
-_HAS_CUDA = torch.cuda.is_available() and getattr(torch.version, "hip", None) is None
-requires_cuda = pytest.mark.skipif(not _HAS_CUDA, reason = "needs a CUDA GPU")
+_HAS_CUDA = torch.cuda.is_available()
+requires_cuda = pytest.mark.skipif(not _HAS_CUDA, reason = "needs a CUDA or ROCm GPU")
 
 
 def _seq_idx_from_lengths(rows, device = "cpu"):
@@ -263,6 +263,114 @@ def test_hub_wrapper_forwards_seq_idx(monkeypatch):
     torch.testing.assert_close(hub_fn(x, w, None, activation = "silu"), causal_conv1d_fn(x, w, None, "silu"))
 
 
+
+def _fake_kernels_decorator(layer_name):
+    """Mimics kernels.use_kernel_forward_from_hub: wraps a function in a layer instance whose class carries kernel_layer_name."""
+    def decorator(fn):
+        class Func(torch.nn.Module):
+            def forward(self, *args, **kwargs):
+                return fn(*args, **kwargs)
+
+        Func.kernel_layer_name = layer_name
+        return Func()
+    return decorator
+
+
+def _hub_conv(hidden_states, weight, bias = None, activation = None, **kwargs):
+    return gcc.causal_conv1d_reference(hidden_states, weight, bias, activation)
+
+
+_hub_conv.__module__ = "transformers.models.qwen3_5.modeling_qwen3_5"
+
+
+def _check_hub_layer_routing(hub_fn):
+    x, w = torch.randn(1, 8, 6, dtype = torch.float64), torch.randn(8, 4, dtype = torch.float64)
+    seq_idx = _seq_idx_from_lengths([[2, 4]])
+    torch.testing.assert_close(hub_fn(x, w, None, activation = "silu", seq_idx = seq_idx),
+                               _per_document(x, w, None, "silu", seq_idx))
+    torch.testing.assert_close(hub_fn(x, w, None, activation = "silu"), _hub_conv(x, w, None, "silu"))
+
+
+def test_hub_layer_instance_keeps_its_kernel_metadata():
+    # kernels returns a layer instance whose kernel_layer_name is read from type(fn) by use_kernelized_func and
+    # kernelize, so GDN routing must keep the instance.
+    hub_fn = gcc._hub_gdn_function(_fake_kernels_decorator("causal_conv1d_fn"), _hub_conv)
+    assert isinstance(hub_fn, torch.nn.Module)
+    assert type(hub_fn).kernel_layer_name == "causal_conv1d_fn"
+    assert gcc._is_marked(hub_fn)
+    assert "seq_idx" in inspect.signature(hub_fn).parameters
+    _check_hub_layer_routing(hub_fn)
+
+    # kernelize swaps the instance forward for the hub kernel's; that must take effect.
+    class Kernel(torch.nn.Module):
+        def forward(self, x, *args, **kwargs):
+            return x * 0 + 7
+
+    from types import MethodType
+    hub_fn.forward = MethodType(Kernel.forward, hub_fn)
+    x, w = torch.randn(1, 8, 6), torch.randn(8, 4)
+    assert torch.equal(hub_fn(x, w), torch.full_like(x, 7))
+
+
+def test_hub_layer_passes_real_kernels_validation():
+    kernels = pytest.importorskip("kernels")
+    if not hasattr(kernels, "use_kernelized_func"):
+        pytest.skip("kernels release without use_kernelized_func")
+    hub_fn = gcc._hub_gdn_function(kernels.use_kernel_forward_from_hub("causal_conv1d_fn"), _hub_conv)
+    assert hasattr(hub_fn, "kernel_layer_name")
+
+    @kernels.use_kernelized_func(hub_fn)
+    class Layer(torch.nn.Module):
+        pass
+
+    assert Layer()._kernel_funcs
+    _check_hub_layer_routing(hub_fn)
+
+
+def test_hub_layer_keeps_routing_after_kernelize_fallback():
+    # kernelize with no matching kernel resets the forward to type(layer).forward.
+    from types import MethodType
+
+    def hub_decorator(fn):
+        # transformers 5.20+ wraps the fallback so it rejects seq_idx without the package.
+        def wrapped(*args, seq_idx = None, **kwargs):
+            if seq_idx is not None:
+                raise ValueError("can't keep packed sequences apart without causal_conv1d")
+            return fn(*args, **kwargs)
+        return _fake_kernels_decorator("causal_conv1d_fn")(wrapped)
+
+    hub_fn = gcc._hub_gdn_function(hub_decorator, _hub_conv)
+    hub_fn.forward = MethodType(type(hub_fn).forward, hub_fn)
+    _check_hub_layer_routing(hub_fn)
+
+
+def test_hub_layer_keeps_routing_after_real_model_kernelize():
+    kernels = pytest.importorskip("kernels")
+    hub_kernels = pytest.importorskip("transformers.integrations.hub_kernels")
+    with_fallback = getattr(hub_kernels, "use_kernel_func_from_hub_with_fallback", None)
+    if with_fallback is None:
+        # Skip because transformers < 5.15 has no hub fallback decorator, so no kernels layer to kernelize.
+        pytest.skip("transformers has no use_kernel_func_from_hub_with_fallback")
+    # The original decorator, not the one the patch installed; a missing package forces the fallback.
+    with_fallback = getattr(with_fallback, "__wrapped__", with_fallback)
+    hub_fn = gcc._hub_gdn_function(with_fallback("causal_conv1d_fn", "unsloth_missing_causal_conv1d"), _hub_conv)
+    if not isinstance(hub_fn, torch.nn.Module):
+        # Skip because transformers only builds a layer with a kernels release inside its supported range
+        # (or with USE_HUB_KERNELS on); test_hub_layer_keeps_routing_after_kernelize_fallback covers the rest.
+        pytest.skip("transformers did not build a kernels layer")
+
+    @kernels.use_kernelized_func(hub_fn)
+    class Layer(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            return hub_fn(*args, **kwargs)
+
+    model = Layer()
+    with kernels.use_kernel_mapping({}):
+        kernels.kernelize(model, mode = kernels.Mode.TRAINING, device = "cpu", use_fallback = True)
+    _check_hub_layer_routing(model)
+    _check_hub_layer_routing(hub_fn)
+
+
 def _wide_ids(lengths, labels, dtype, device):
     return torch.repeat_interleave(
         torch.tensor(labels, dtype = torch.int64), torch.tensor(lengths),
@@ -314,8 +422,8 @@ def test_seq_idx_on_cpu_with_cuda_activations(monkeypatch):
 
 
 def _random_seq_idx(g, T, W, dtype):
-    """Random document lengths (many shorter than W); IDs gapped, negative, huge, and reused
-    once at least W - 1 tokens away (equal IDs inside one window would join the runs)."""
+    """Random document lengths, many shorter than W; IDs gapped, negative or huge, and reused only once at least W - 1
+    tokens away, since equal IDs in a window would join runs."""
     pool = [-7, -1, 0, 3, 5, 11, 2**31 - 1, 2**32, 2**32 + 3, -2**40]
     pool = [v for v in pool if torch.iinfo(dtype).min <= v <= torch.iinfo(dtype).max]
     n_docs = int(torch.randint(1, min(12, T) + 1, (), generator = g))

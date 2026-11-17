@@ -13,24 +13,12 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""The MLX simulation's platform spoof must not reach the build toolchain.
-
-`tests/mlx_simulation` rebinds `platform.system` / `platform.machine` so the
-`_IS_MLX` gate takes the Apple Silicon path. The rebind is process-wide and
-permanent, so before it was scoped every test collected after an MLX module
-inherited it: inductor caches a CPU vector ISA from `platform.machine()`
-(`torch/_inductor/cpu_vec_isa.py`), "arm64" on x86_64 gives an empty list, and
-`torch.compile` then emitted `at::vec::Vectorized` without the vec headers so
-g++ failed. Downstream, the GRPO packed-path verifier swallowed that
-`CppCompileError` and three `test_grpo_packed_verify_raw_logits` tests failed
-only when run after an MLX module.
-"""
+"""The MLX platform spoof must stay scoped to the two gate modules: a process-wide arm64 platform.machine() empties
+inductor's vec ISA list, so later torch.compile builds fail."""
 
 import platform
 
-# `mlx_simulation`, not `tests.mlx_simulation`: conftest puts tests/ on sys.path
-# for exactly this, the rest of the MLX suite imports it that way, and an
-# installed package named `tests` would otherwise win over this directory.
+# Import as mlx_simulation, not tests.mlx_simulation: conftest puts tests/ on sys.path for this, and an installed package named tests would otherwise win.
 from mlx_simulation import _spoof_apple_silicon_platform
 
 
@@ -68,10 +56,7 @@ def test_inductor_observes_the_real_machine(monkeypatch):
     exec("machine = platform.machine()", namespace)
     assert namespace["machine"] == platform._orig_machine_for_mlx_shim()
 
-    # And the ISA list it derives from that. Compared against the same call with
-    # the real value forced, not against non-emptiness: a host that supports none
-    # of this build's ISAs legitimately yields an empty list, and asserting
-    # non-emptiness would fail there for a reason unrelated to the spoof.
+    # Compare the ISA list to the real-machine result, not to non-emptiness: some hosts legitimately support none of the build's ISAs and yield an empty list.
     cpu_vec_isa.valid_vec_isa_list.cache_clear()
     observed = cpu_vec_isa.valid_vec_isa_list()
     monkeypatch.setattr(platform, "machine", platform._orig_machine_for_mlx_shim)
@@ -85,13 +70,8 @@ def test_inductor_observes_the_real_machine(monkeypatch):
 
 
 def test_other_modules_in_the_same_package_still_see_the_real_host():
-    """The allow-list is exact module names, not packages.
-
-    `unsloth_zoo.llama_cpp` reads the host to pick a prebuilt llama.cpp archive,
-    so allow-listing the whole package made a later call on Linux x86_64 select
-    the macOS arm64 build. Only the two modules that implement the MLX gate need
-    the lie; everything else downstream consumes the boolean they cached.
-    """
+    """Allow-list exact module names, not packages: unsloth_zoo.llama_cpp picks its archive from the real host, and a
+    package-wide spoof once selected the macOS build on Linux."""
     _spoof_apple_silicon_platform()
 
     for module in ("unsloth_zoo.llama_cpp", "unsloth_zoo.device_type",

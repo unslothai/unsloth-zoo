@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Vendored fla conv / cumsum kernels must not re-tune or recompile per token bucket or batch size."""
+"""Vendored fla conv / cumsum / l2norm / gated norm kernels must not re-tune or recompile per token bucket or batch size."""
 
 import ast
 import json
@@ -30,6 +30,8 @@ CASES = {
         ),
         "B",
     ),
+    "modules/l2norm.py": (("l2norm_fwd_kernel", "l2norm_bwd_kernel"), "NB"),
+    "modules/fused_norm_gate.py": (("layer_norm_gated_fwd_kernel", "layer_norm_gated_bwd_kernel"), "NB"),
 }
 
 
@@ -72,6 +74,8 @@ _RUNTIME = textwrap.dedent(
     from fla.modules.conv.causal_conv1d import causal_conv1d
     from fla.modules.conv.triton import kernels as ck
     from fla.ops.utils import cumsum as cs
+    from fla.modules import l2norm as l2
+    from fla.modules import fused_norm_gate as ng
 
     def parts(k):
         tuner = None
@@ -86,6 +90,10 @@ _RUNTIME = textwrap.dedent(
         "conv_bwd": ck.causal_conv1d_bwd_kernel,
         "cumsum_local_scalar": cs.chunk_local_cumsum_scalar_kernel,
         "cumsum_global_vector": cs.chunk_global_cumsum_vector_kernel,
+        "l2norm_fwd": l2.l2norm_fwd_kernel,
+        "l2norm_bwd": l2.l2norm_bwd_kernel,
+        "norm_gate_fwd": ng.layer_norm_gated_fwd_kernel,
+        "norm_gate_bwd": ng.layer_norm_gated_bwd_kernel,
     }
     for k in kernels.values():  # one config: the counts measure buckets, not autotuning width
         parts(k)[0].configs = parts(k)[0].configs[:1]
@@ -101,6 +109,13 @@ _RUNTIME = textwrap.dedent(
     for B in (1, 2, 3, 5, 6, 7):  # padded batches of six sizes
         cs.chunk_local_cumsum(torch.randn(B, 200, 4, device = "cuda"), chunk_size = 64)
         cs.chunk_global_cumsum(torch.randn(B, 200, 4, 16, device = "cuda"))
+    nw = torch.randn(D, device = "cuda", dtype = torch.bfloat16, requires_grad = True)
+    # NB = cdiv(rows, 65536) buckets 1..4, plus decode / odd row counts that T specialization would split.
+    for T in (1, 17, 64, 1000, 70000, 140000, 200000):
+        x = torch.randn(T, D, device = "cuda", dtype = torch.bfloat16, requires_grad = True)
+        l2.l2norm(x).backward(torch.randn(T, D, device = "cuda", dtype = torch.bfloat16))
+        g = torch.randn(T, D, device = "cuda", dtype = torch.bfloat16, requires_grad = True)
+        ng.rms_norm_gated(x, g, nw, None).backward(torch.randn(T, D, device = "cuda", dtype = torch.bfloat16))
     torch.cuda.synchronize()
     out = {}
     for n, k in kernels.items():
@@ -126,7 +141,7 @@ def _injection_supported():
 
 
 @pytest.mark.skipif(not _injection_supported(), reason = "needs CUDA and vendored fla injection")
-def test_conv_and_cumsum_tune_and_compile_once_across_buckets():
+def test_fla_kernels_tune_and_compile_once_across_buckets():
     pytest.importorskip("einops")
     env = dict(os.environ, PYTHONPATH = os.pathsep.join([str(ZOO_ROOT), os.environ.get("PYTHONPATH", "")]))
     proc = subprocess.run([sys.executable, "-c", _RUNTIME], capture_output = True, text = True, env = env, timeout = 900)
