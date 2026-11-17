@@ -1992,7 +1992,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         if ctx._requires_gradient: ctx.save_for_backward(*tensor_inputs)
 
         ctx._routing_frame = _new_checkpoint_routing_frame(args) if ctx._requires_gradient else None
-        # UNSLOTH_GC_SAVE_ATTENTION=1: attention kernel outputs kept for the replay (saved_attention.py).
         ctx._attention_frame = new_saved_attention_frame(args) if ctx._requires_gradient else None
         with torch.no_grad(), _checkpoint_routing_scope(ctx._routing_frame, False), \
                 saved_attention_scope(ctx._attention_frame, False):

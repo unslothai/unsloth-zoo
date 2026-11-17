@@ -149,7 +149,6 @@ def test_a_replay_that_differs_recomputes(monkeypatch):
     def attention(q, k, v):
         state["pass"] += 1
         if state["pass"] == 2:
-            # Replay: a different (but equivalent) call shape.
             out = torch.cat([_sdpa(q[:1], k[:1], v[:1]), _sdpa(q[1:], k[1:], v[1:])], 0)
             return out
         return _sdpa(q, k, v)
@@ -277,9 +276,6 @@ def test_rocm_keeps_the_mode_off(monkeypatch):
     assert sa.save_attention_enabled() is True
 
 
-# ---------------------------------------------------------------------------
-# Random attention kernels: the replay must consume the generator exactly like the first pass
-# ---------------------------------------------------------------------------
 def _math_attention(q, k, v, keep):
     scores = (q @ k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
     causal = torch.ones(q.shape[-2], k.shape[-2], dtype = torch.bool, device = q.device).triu(1)
@@ -287,9 +283,7 @@ def _math_attention(q, k, v, keep):
     return (p * keep) @ v
 
 
-# A dispatcher-visible attention forward that draws dropout from the generator, like CUDA flash /
-# memory-efficient attention with dropout_p > 0 (the CPU flash kernel refuses dropout). The
-# "flash_attn" namespace prefix makes saved_attention_call recognise it as an attention kernel.
+# Dispatcher-visible dropout attention; the "flash_attn" namespace marks it as an attention kernel.
 @torch.library.custom_op("flash_attn_unsloth_test::dropout_attention_fwd", mutates_args = ())
 def _dropout_attention_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dropout_p: float) -> tuple[torch.Tensor, torch.Tensor]:
     shape = q.shape[:-1] + (k.shape[-2],)
@@ -360,9 +354,6 @@ def test_random_attention_is_recomputed_so_later_dropout_matches(monkeypatch, le
     assert SA.SAVED_ATTENTION_STATS["stored"] == 0 and SA.SAVED_ATTENTION_STATS["reused"] == 0
 
 
-# ---------------------------------------------------------------------------
-# Function level: the entry holds the output + logsumexp, never the first pass's Q / K / V
-# ---------------------------------------------------------------------------
 def _entry_storages(entry):
     """Storage bytes reachable from a function entry: its fields and its kept autograd graph."""
     from torch.utils._pytree import tree_flatten as flatten

@@ -16,28 +16,10 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-"""Selective gradient checkpointing: keep the attention kernel's output from the first pass.
-
-Unsloth's gradient checkpointing recomputes the whole decoder layer in backward, attention
-included. With UNSLOTH_GC_SAVE_ATTENTION=1, every checkpointed call that will run backward gets a
-SavedAttentionFrame. In the first (no grad) pass each attention call stores the outputs of its
-forward kernel (output, logsumexp, rng state): SDPA's flash / memory-efficient / cuDNN ops,
-FlashAttention 2's torch ops, torch varlen, and FlexAttention through the transformers wrapper.
-The backward replay of that same checkpointed call takes them back in order, so the replay
-recomputes Q / K / V and everything else but not the attention forward. The attention backward
-then runs on the replay's Q / K / V and the kept output and logsumexp.
-
-The cost is one attention output (B * S * H * D) plus its fp32 logsumexp (B * H * S) per layer,
-held from the forward until that layer's backward: on the GPU with UNSLOTH_GC_SAVE_ATTENTION=1, in
-pinned host memory with UNSLOTH_GC_SAVE_ATTENTION=offload (copied out on a side stream, and copied
-back one layer ahead of the backward). A backend whose kernel is not visible to the
-dispatcher (a pybind-only FlashAttention, xformers' C++ ops, Unsloth's own fused kernels) stores
-nothing and is recomputed as before, and so is any call whose replay does not match the first pass
-(other op, other shapes): the replay then computes the kernel itself. A call that draws from the
-random generator (attention dropout) is recomputed too: skipping its draws in the replay would hand
-later dropout in the same layer (LoRA dropout) other masks than the first pass used.
-FlexAttention's function-level entries are not offloaded: offload mode recomputes them.
-"""
+"""Selective gradient checkpointing: with UNSLOTH_GC_SAVE_ATTENTION=1 (GPU) or =offload (pinned
+host), the first pass keeps each attention kernel's outputs (output, logsumexp, rng state) and the
+backward replay of the same checkpointed call reuses them instead of recomputing attention. Kernels
+the dispatcher cannot see, mismatched replays and random (dropout) calls are recomputed as before."""
 
 import collections
 import os
@@ -62,14 +44,6 @@ __all__ = [
     "patch_transformers_saved_attention",
 ]
 
-# stored / reused: kernel outputs kept in a first pass / handed back in a replay.
-# no_kernel: a first-pass call that ran no recognised attention kernel (recomputed as before).
-# mismatch: a replay kernel call that did not match the stored one (computed instead).
-# unmatched: stored kernel outputs that no replay call took.
-# too_big: FlexAttention graphs that would keep more than the output + lse (not kept).
-# random: calls that drew from the random generator (dropout), recomputed so the replay draws the same.
-# not_offloaded: FlexAttention calls in offload mode, recomputed (function entries are not offloaded).
-# offloaded_bytes / prefetched: offload mode, bytes copied to the host / frames copied back ahead.
 SAVED_ATTENTION_STATS = collections.Counter()
 
 _TLS = threading.local()
@@ -85,8 +59,7 @@ _WARNED_HIP = [False]
 def save_attention_enabled():
     if _save_attention_setting() not in ("1", "true", "yes", "on", "offload"):
         return False
-    # ROCm (gfx1151) runs SDPA through kernels this mode does not intercept: nothing is kept, and
-    # routing through it only adds graph breaks, so it stays off there.
+    # ROCm SDPA kernels are not intercepted: nothing is kept, only graph breaks are added.
     if getattr(torch.version, "hip", None):
         if not _WARNED_HIP[0]:
             _WARNED_HIP[0] = True
@@ -96,12 +69,10 @@ def save_attention_enabled():
 
 
 def save_attention_offload():
-    """UNSLOTH_GC_SAVE_ATTENTION=offload: the kept outputs wait in pinned host memory, like the hidden states."""
     return _save_attention_setting() == "offload"
 
 
 class SavedAttentionFrame:
-    """Attention kernel outputs of one checkpointed call, in call order."""
     __slots__ = ("entries", "cursor", "replaying", "offload", "loaded", "__weakref__")
 
     def __init__(self):
@@ -113,7 +84,6 @@ class SavedAttentionFrame:
 
 
 def new_saved_attention_frame(tensors):
-    """A frame only when saving is on and the checkpoint will run backward (some input requires grad)."""
     if not save_attention_enabled():
         return None
     for t in tensors:
@@ -131,7 +101,6 @@ def saved_attention_scope(frame, replay):
         if frame.offload:
             if replay:
                 _reload_frame(frame)
-                # Backward walks the layers in reverse: start copying the next layer's outputs back now.
                 _prefetch_before(frame)
             else:
                 _OFFLOADED_FRAMES.append(weakref.ref(frame))
@@ -144,21 +113,17 @@ def saved_attention_scope(frame, replay):
             left = sum(1 for entry in frame.entries if entry)
             if left:
                 SAVED_ATTENTION_STATS["unmatched"] += left
-            # The kept outputs are large: release them once the replay is done. A second backward
-            # over a retained graph finds no entries and recomputes attention as before.
+            # A second backward over a retained graph finds no entries and recomputes.
             frame.entries.clear()
             if frame.offload:
                 _forget_frame(frame)
 
 
 def saved_attention_active():
-    """True inside a checkpointed call that saves attention. Runtime state: never read it in traced code."""
+    """Runtime state: never read it in traced code."""
     return getattr(_TLS, "frame", None) is not None
 
 
-# ---------------------------------------------------------------------------
-# Kernel level: SDPA / FlashAttention / torch varlen forward ops seen by the dispatcher
-# ---------------------------------------------------------------------------
 _ATEN_ATTENTION_NAMES = (
     "_scaled_dot_product_flash_attention",
     "_scaled_dot_product_efficient_attention",
@@ -197,7 +162,7 @@ def _is_attention_forward(func):
         ) and not ("bwd" in name or "backward" in name)
     if found:
         schema = getattr(func, "_schema", None)
-        # Out= / in-place variants write into a caller's buffer; a cached result cannot.
+        # Out= / in-place variants write into a caller's buffer.
         if schema is not None and getattr(schema, "is_mutable", False):
             found = False
     _IS_ATTENTION[func] = found
@@ -222,22 +187,17 @@ def _detach(t):
 
 
 def _rng_state(tensors):
-    """The generators an attention call can draw from: the CPU one and those of its CUDA devices."""
     devices = sorted({t.device.index for t in tensors if isinstance(t, torch.Tensor) and t.is_cuda})
     return [torch.get_rng_state()] + [torch.cuda.get_rng_state(index) for index in devices]
 
 
 def _rng_advanced(before, tensors):
-    # The checkpoint replay starts from the first pass's generator state. A kept output would skip
-    # this call's draws in the replay, so every later random op of the layer would draw other values.
+    # A kept output skips this call's draws in the replay, shifting every later random op of the layer.
     return any(not torch.equal(a, b) for a, b in zip(before, _rng_state(tensors)))
 
 
-# ---------------------------------------------------------------------------
-# UNSLOTH_GC_SAVE_ATTENTION=offload: kept kernel outputs in pinned host memory between the passes
-# ---------------------------------------------------------------------------
 _OFFLOAD_MIN_BYTES = 1 << 20
-_OFFLOADED_FRAMES = []      # weakrefs, first-pass order
+_OFFLOADED_FRAMES = []  # weakrefs, first-pass order
 _SIDE_STREAMS = {}
 
 
@@ -273,7 +233,6 @@ def _to_host(t):
     host = torch.empty_like(t, device = "cpu", pin_memory = True)
     with torch.cuda.stream(stream):
         host.copy_(t, non_blocking = True)
-    # The device block may be reused only after the copy has read it.
     t.record_stream(stream)
     SAVED_ATTENTION_STATS["offloaded_bytes"] += t.numel() * t.element_size()
     return _OnHost(host, t.device)
@@ -283,7 +242,6 @@ def _to_device(item):
     if not isinstance(item, _OnHost):
         return item
     stream = _side_stream(item.device)
-    # Host writes were queued on the same side stream, so the reload is ordered after them.
     with torch.cuda.stream(stream):
         gpu = torch.empty_like(item.host, device = item.device)
         gpu.copy_(item.host, non_blocking = True)
@@ -382,15 +340,13 @@ class _ReplayMode(TorchDispatchMode):
                 self.cursor += 1
                 SAVED_ATTENTION_STATS["reused"] += 1
                 return tree_map_only(torch.Tensor, _detach, cached)
-            # Not the call that was stored: compute this and every later kernel of the entry.
             self.failed = True
             SAVED_ATTENTION_STATS["mismatch"] += 1
         return func(*args, **kwargs)
 
 
 def _first_pass_leaves(tensors):
-    # The replay runs with grad and LoRA Q / K / V that require it; the first pass must take the same
-    # branches and kernels (memory-efficient attention only computes the logsumexp when grad is needed).
+    # Match the replay's grad branches (memory-efficient attention only returns lse when grad is needed).
     leaves = []
     for t in tensors:
         if isinstance(t, torch.Tensor) and (t.is_floating_point() or t.is_complex()):
@@ -410,17 +366,12 @@ def _take_entry(frame):
 
 @torch.compiler.disable
 def saved_attention_call(function, *tensors):
-    """``function(*tensors)``, keeping its attention kernel outputs for the checkpoint replay.
-
-    ``tensors`` are the attention inputs (Q, K, V, ...); ``function`` runs the attention on them.
-    Outside a saving checkpoint this is exactly ``function(*tensors)``. Compiled callers graph
-    break here, as FlexAttention does under block compile's split mode."""
+    """``function(*tensors)``, keeping its attention kernel outputs for the checkpoint replay."""
     frame = getattr(_TLS, "frame", None)
     if frame is None:
         return function(*tensors)
     if not frame.replaying:
-        # The first pass runs without grad; a grad-mode call inside it is not the forward that
-        # makes the loss (block compile's trial run, or a nested non-checkpointed region).
+        # Grad mode here is not the loss forward (block compile's trial run, nested regions).
         if torch.is_grad_enabled():
             return function(*tensors)
         entry = []
@@ -429,7 +380,7 @@ def saved_attention_call(function, *tensors):
             out = function(*_first_pass_leaves(tensors))
         out = tree_map_only(torch.Tensor, _detach, out)
         if mode.random:
-            # Dropout inside the kernel: the replay recomputes the whole call and draws the same.
+            # Dropout: recompute so the replay draws the same.
             frame.entries.append(None)
             SAVED_ATTENTION_STATS["random"] += 1
         elif entry:
@@ -455,16 +406,12 @@ def saved_attention_call(function, *tensors):
     return out
 
 
-# ---------------------------------------------------------------------------
-# Function level: a whole attention function whose kernel the dispatcher cannot see (FlexAttention)
-# ---------------------------------------------------------------------------
 def _extent(t):
     lo = t.storage_offset()
     return lo, lo + 1 + sum((n - 1) * st for n, st in zip(t.shape, t.stride()) if n > 0)
 
 
 def _same_view_of(t, leaf):
-    """``t`` reads only elements of ``leaf`` (a view, transpose, or ``leaf`` itself)."""
     if t.device != leaf.device or t.dtype != leaf.dtype or t.numel() == 0 or leaf.numel() == 0:
         return False
     if t.untyped_storage().data_ptr() != leaf.untyped_storage().data_ptr():
@@ -487,7 +434,6 @@ class _FunctionEntry:
 
 
 _TENSOR_SLOT = object()
-# Block mask indices and rng state a kept FlexAttention graph may hold beyond its outputs.
 _FUNCTION_SLACK_BYTES = 4 << 20
 
 
@@ -496,14 +442,12 @@ def _bytes(t):
 
 
 class _ReplayFunction(torch.autograd.Function):
-    """Hands back the first pass's outputs; backward runs the kept graph on the replay's Q / K / V."""
-
     @staticmethod
     def forward(ctx, entry, *inputs):
         ctx.set_materialize_grads(False)
         ctx.entry = entry
         ctx.save_for_backward(*inputs)
-        # Not inputs of this node: the kept graph behind them must not join the outer graph.
+        # Detached: the kept graph must not join the outer graph.
         return tuple(o.detach() for o in entry.outputs)
 
     @staticmethod
@@ -514,8 +458,7 @@ class _ReplayFunction(torch.autograd.Function):
         replay = []
         for (shape, stride, _, _), x in zip(entry.layouts, replay_inputs):
             if x.stride() != stride:
-                # The kept graph addresses Q / K / V through the first pass's layout (offsets are
-                # relative to the leaf, so only the strides must agree).
+                # The kept graph addresses Q / K / V through the first pass's strides.
                 y = torch.empty_strided(shape, stride, dtype = x.dtype, device = x.device)
                 y.copy_(x)
                 x = y
@@ -541,13 +484,8 @@ class _ReplayFunction(torch.autograd.Function):
 
 @torch.compiler.disable
 def saved_function_call(function, n_inputs, *args, **kwargs):
-    """``function(*args, **kwargs)`` for an attention function that returns its kernel's outputs.
-
-    The first pass keeps the function's autograd graph, with ``args[:n_inputs]`` (Q, K, V) replaced
-    by placeholders through saved-tensor hooks, so it holds only what the kernel saves beyond its
-    inputs (output + logsumexp); the graph's Q / K / V leaves keep their autograd identity but not
-    their storage. The replay returns the kept outputs, and backward runs the kept graph with the
-    replay's Q / K / V. Used where the kernel is not a dispatcher op (FlexAttention)."""
+    """Keeps the first pass's autograd graph with Q / K / V (``args[:n_inputs]``) as placeholders;
+    backward runs it on the replay's Q / K / V. For kernels the dispatcher cannot see (FlexAttention)."""
     frame = getattr(_TLS, "frame", None)
     if frame is None:
         return function(*args, **kwargs)
@@ -556,8 +494,7 @@ def saved_function_call(function, n_inputs, *args, **kwargs):
         if torch.is_grad_enabled() or not all(isinstance(x, torch.Tensor) for x in inputs):
             return function(*args, **kwargs)
         if frame.offload:
-            # A kept graph cannot move to the host: offload mode recomputes this call as before
-            # rather than holding its output and logsumexp on the device for every layer.
+            # A kept graph cannot move to the host; keeping it would pin every layer's output on the device.
             frame.entries.append(None)
             SAVED_ATTENTION_STATS["not_offloaded"] += 1
             return function(*args, **kwargs)
@@ -597,12 +534,10 @@ def saved_function_call(function, n_inputs, *args, **kwargs):
                 kept_bytes += t.untyped_storage().nbytes()
         detached = tree_map_only(torch.Tensor, _detach, out)
         if random:
-            # The replay would skip this call's draws: recompute it so later dropout matches.
             frame.entries.append(None)
             SAVED_ATTENTION_STATS["random"] += 1
             return detached
-        # Kept beyond the outputs: block mask indices, rng state. A graph holding expanded K / V or
-        # score matrices is not worth keeping: recompute that call instead.
+        # A graph holding expanded K / V or score matrices is not worth keeping.
         if not outputs or not any(o.requires_grad for o in outputs) or \
                 kept_bytes > out_bytes + out_bytes // 4 + _FUNCTION_SLACK_BYTES:
             frame.entries.append(None)
@@ -612,12 +547,10 @@ def saved_function_call(function, n_inputs, *args, **kwargs):
         entry.layouts = [(x.shape, x.stride(), x.dtype, x.device) for x in inputs]
         for i, (leaf, x) in enumerate(zip(leaves, inputs)):
             if leaf is x:
-                # Not differentiable (passed through as is): nothing of it is needed in backward.
                 leaves[i] = None
             else:
-                # The detached leaf shares the caller's Q / K / V storage, and the kept graph holds
-                # it (AccumulateGrad). Its saved uses are placeholders already, so swap its data for
-                # a one-element stand-in: the leaf keeps its autograd identity, not the storage.
+                # The kept graph holds the leaf (AccumulateGrad), which shares Q / K / V storage: swap in
+                # a stand-in so it keeps its autograd identity but not the storage.
                 leaf.data = torch.empty((), dtype = leaf.dtype, device = leaf.device).expand(leaf.shape)
         kept.clear()
         entry.leaves = leaves
@@ -644,9 +577,6 @@ def saved_function_call(function, n_inputs, *args, **kwargs):
     return tree_unflatten(flat, entry.spec[1])
 
 
-# ---------------------------------------------------------------------------
-# transformers attention functions (models outside Unsloth's own attention dispatch)
-# ---------------------------------------------------------------------------
 _PATCHED_MARK = "_unsloth_saved_attention"
 
 
@@ -683,7 +613,6 @@ def _wrap_flex_kernel(fn):
 
 
 def patch_transformers_saved_attention():
-    """Route transformers' sdpa / flash_attention_2 / flex_attention functions through the saving calls."""
     try:
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
     except Exception:
