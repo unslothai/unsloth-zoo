@@ -39,7 +39,7 @@ def _bs(tmp_path, monkeypatch):
 def test_a_planted_writable_dir_is_not_used(tmp_path, monkeypatch):
     bs, path = _bs(tmp_path, monkeypatch)
     os.mkdir(path)
-    os.chmod(path, 0o777)  # stands in for a directory another OS user created first
+    os.chmod(path, 0o777)
     victim = tmp_path / "victim"
     victim.write_text("precious")
     os.symlink(victim, os.path.join(path, f"0.{os.getpid()}.tmp"))

@@ -145,7 +145,7 @@ def _rank_ledger():
         path = os.path.join(tempfile.gettempdir(), f"unsloth_block_swap_{uid}_{job}_{os.getppid()}")
         os.makedirs(path, mode = 0o700, exist_ok = True)
         if not _private_dir(path):
-            # The name is predictable in a shared temp dir: another OS user may have made it (or a link to one).
+            # Predictable name in a shared temp dir: another OS user may have made it.
             return None
         return path, int(rank), world
     except (OSError, ValueError):
@@ -155,7 +155,7 @@ def _rank_ledger():
 def _private_dir(path):
     """True if `path` is a real directory owned by this user that no one else can write to."""
     if os.name == "nt" or not hasattr(os, "getuid"):
-        return True  # The temp dir is per user there.
+        return True
     try:
         st = os.lstat(path)
     except OSError:
