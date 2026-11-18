@@ -4227,8 +4227,7 @@ def grpo_accumulated_loss(
                             _pg_v = getattr(unwrapped_model, "_unsloth_prefix_grouper_grad_verified", None)
                             if not isinstance(_pg_v, dict):
                                 _pg_v = {}
-                            # Envelope rounded up to a power of two: sampled lengths set a new
-                            # maximum on most steps, so an exact max re-verified nearly every step.
+                            # Power-of-two envelope (per signature): an exact max re-verified nearly every step.
                             _pg_vT = 1 << (int(_pg_layout.flat_ids.shape[1]) - 1).bit_length()
                             _pg_vS = 1 << int(_pg_layout.position_ids.max()).bit_length()
                             _pg_old = _pg_v.get(_pg_layout.signature, (0, 0))

@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""PrefixGrouper's grad self-verify trusts a shape inside the verified (T, longest segment) envelope.
-Sampled completion lengths set a new maximum on most steps, so an exact-max envelope re-ran the
-verify forward (packed + shared-prefix) on about half of all steps; it is stored rounded up to a
-power of two instead, so a run re-verifies once per doubling."""
+"""Grad self-verify envelope is stored rounded up to a power of two, so it re-verifies once per doubling."""
 
 import ast
 import re
@@ -66,4 +63,4 @@ def test_envelope_is_rounded_up_to_a_power_of_two():
 
 def test_envelope_covers_the_next_longer_sampled_batch():
     vT, vS = _envelope(4700, 2300)
-    assert 4790 <= vT and 2350 <= vS  # a slightly longer next batch stays trusted
+    assert 4790 <= vT and 2350 <= vS
