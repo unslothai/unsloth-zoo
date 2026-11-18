@@ -15129,30 +15129,33 @@ def _dense_scaled_quantized_modules(model):
     embedding) and would save their packed weights as dense; fold the scale and any AWQ pre_quant_scale in instead."""
     dense = []
     for name, module in model.named_modules():
-        scale_name = next((key for key in ("weight_scale_2", "weight_global_scale") if key in module), None)
-        if scale_name is None or "scales" not in module or getattr(module.get("weight"), "dtype", None) != mx.uint32:
+        scale_name = next((key for key in ("weight_scale_2", "weight_global_scale")
+                           if getattr(module, key, None) is not None), None)
+        packed = getattr(module, "weight", None)
+        if scale_name is None or getattr(module, "scales", None) is None or getattr(packed, "dtype", None) != mx.uint32:
             continue
-        weight = mx.dequantize(module["weight"], module["scales"], module.get("biases"), module.group_size,
+        weight = mx.dequantize(packed, module.scales, getattr(module, "biases", None), module.group_size,
                                module.bits, module.mode, dtype=mx.float32)
-        scale = module[scale_name].astype(mx.float32)
+        scale = getattr(module, scale_name).astype(mx.float32)
         if scale.size > 1:
             scale = scale.reshape(*weight.shape[:-2], -1, 1)
         weight = weight / scale if scale_name == "weight_global_scale" else weight * scale
-        if "pre_quant_scale" in module:
-            pre = module["pre_quant_scale"].astype(mx.float32)
+        pre = getattr(module, "pre_quant_scale", None)
+        if pre is not None:
+            pre = pre.astype(mx.float32)
             weight = weight * (pre.reshape(*pre.shape[:-1], 1, pre.shape[-1]) if pre.ndim > 1 else pre)
         weight = weight.astype(mx.bfloat16)
-        bias = "bias" in module
+        bias = getattr(module, "bias", None)
         if hasattr(module, "num_embeddings"):
             layer = nn.Embedding(*weight.shape)
         elif weight.ndim == 3:
             from mlx_lm.models.switch_layers import SwitchLinear
-            layer = SwitchLinear(weight.shape[2], weight.shape[1], weight.shape[0], bias=bias)
+            layer = SwitchLinear(weight.shape[2], weight.shape[1], weight.shape[0], bias=bias is not None)
         else:
-            layer = nn.Linear(weight.shape[1], weight.shape[0], bias=bias)
+            layer = nn.Linear(weight.shape[1], weight.shape[0], bias=bias is not None)
         layer.weight = weight
-        if bias:
-            layer.bias = module["bias"]
+        if bias is not None:
+            layer.bias = bias
         dense.append((name, layer))
     if dense:
         model.update_modules(mlx.utils.tree_unflatten(dense))
