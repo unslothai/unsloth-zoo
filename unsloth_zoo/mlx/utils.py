@@ -1026,6 +1026,35 @@ def apply_gather_qmm_nax_guard() -> bool:
         return True
 
 
+_MLX_GELU_APPROX_FINITE_GRAD = None
+_MLX_GELU_APPROX_STOCK = None
+
+
+def _gelu_approx_finite_grad(x):
+    # Stock fp16 grad is NaN for |x| >= ~148 (3x**2 overflows, meets sech^2 = 0). tanh is exactly +-1 past |x| = 10,
+    # so the clip keeps the forward bit-identical (u - v == 0). Other dtypes cannot overflow: stock graph, zero cost.
+    if x.dtype != mx.float16:
+        return _MLX_GELU_APPROX_STOCK(x)
+    t = mx.clip(x, -10, 10)
+    u = 1 + mx.tanh(math.sqrt(2 / math.pi) * (t + 0.044715 * t**3))
+    v = mx.stop_gradient(u)
+    return 0.5 * x * v + 0.5 * t * (u - v)
+
+
+def apply_gelu_approx_finite_grad() -> bool:
+    """Idempotent. Must run before a model is first traced: mx.compile'd callers keep the function they traced."""
+    global _MLX_GELU_APPROX_FINITE_GRAD, _MLX_GELU_APPROX_STOCK
+    activations = importlib.import_module("mlx.nn.layers.activations")
+    if _MLX_GELU_APPROX_FINITE_GRAD is None:
+        _MLX_GELU_APPROX_STOCK = activations.gelu_approx
+        _MLX_GELU_APPROX_FINITE_GRAD = mx.compile(_gelu_approx_finite_grad, shapeless=True)
+    if nn.gelu_approx is _MLX_GELU_APPROX_FINITE_GRAD and activations.gelu_approx is _MLX_GELU_APPROX_FINITE_GRAD:
+        return False
+    # nn.GELU resolves the activations module's name, model code resolves nn's.
+    nn.gelu_approx = activations.gelu_approx = _MLX_GELU_APPROX_FINITE_GRAD
+    return True
+
+
 
 def _get_transformer_layers(model):
     pending = collections.deque([getattr(model, "language_model", model)])
