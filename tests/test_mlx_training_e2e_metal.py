@@ -1007,7 +1007,6 @@ def test_gelu_approx_keeps_stock_forward_with_finite_half_gradient(dtype):
     inside = mx.linspace(-9.9, 9.9, 20001).astype(dt)
     grad = lambda f, v, c=1.0: mx.grad(lambda a: (f(a).astype(mx.float32) * c).sum())(v)
     assert mx.array_equal(grad(nn.gelu_approx, inside), grad(stock, inside))
-    # Positive and negative overflow, away from element zero, also under a cotangent large enough that c * x overflows.
     for gelu in (nn.gelu_approx, nn.GELU(approx="precise")):
         for c in (1.0, 1000.0):
             g = grad(gelu, mx.array([1.0, 150.0, -150.0, 300.0, -60000.0], dtype=dt), c)
@@ -1030,7 +1029,7 @@ def test_gemma4_per_layer_input_gate_trains_finite_in_float16():
         hidden_size_per_layer_input=16, vocab_size=512, vocab_size_per_layer_input=512))
     model.set_dtype(mx.float16)
     gate = model.model.layers[1].per_layer_input_gate
-    # Gemma 4 E4B's layer-22 gate reaches |x| ~150 in float16 training; this one reaches a few hundred.
+    # Real Gemma 4 E4B gate inputs reach |x| ~150 in float16.
     gate.weight = (gate.weight * 400).astype(mx.float16)
     ids = mx.random.randint(0, 512, (1, 32))
 

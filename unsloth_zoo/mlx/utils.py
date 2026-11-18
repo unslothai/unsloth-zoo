@@ -1031,10 +1031,8 @@ _MLX_GELU_APPROX_STOCK = None
 
 
 def _gelu_approx_finite_grad(x):
-    # mlx.nn.gelu_approx's float16 gradient is NaN for large |x|: d(x**3), or cotangent * x, overflows to inf and meets
-    # sech^2 = 0. tanh is exactly +-1 for |x| >= 10 in every float dtype, so clipping its argument and routing its
-    # gradient through the clipped t keeps the output bit-identical (u - v is exactly zero) and the gradient finite.
-    # Other dtypes cannot overflow there and keep the stock graph (dtype is static under mx.compile, one trace each).
+    # Stock fp16 grad is NaN for |x| >= ~148 (3x**2 overflows, meets sech^2 = 0). tanh is exactly +-1 past |x| = 10,
+    # so the clip keeps the forward bit-identical (u - v == 0). Other dtypes cannot overflow: stock graph, zero cost.
     if x.dtype != mx.float16:
         return _MLX_GELU_APPROX_STOCK(x)
     t = mx.clip(x, -10, 10)
@@ -1044,8 +1042,7 @@ def _gelu_approx_finite_grad(x):
 
 
 def apply_gelu_approx_finite_grad() -> bool:
-    """Replaces mlx.nn.gelu_approx with a forward-identical version whose float16 gradient stays finite; idempotent.
-    Must run before a model is first traced, since mx.compile'd callers keep the function they traced."""
+    """Idempotent. Must run before a model is first traced: mx.compile'd callers keep the function they traced."""
     global _MLX_GELU_APPROX_FINITE_GRAD, _MLX_GELU_APPROX_STOCK
     activations = importlib.import_module("mlx.nn.layers.activations")
     if _MLX_GELU_APPROX_FINITE_GRAD is None:
@@ -1053,7 +1050,7 @@ def apply_gelu_approx_finite_grad() -> bool:
         _MLX_GELU_APPROX_FINITE_GRAD = mx.compile(_gelu_approx_finite_grad, shapeless=True)
     if nn.gelu_approx is _MLX_GELU_APPROX_FINITE_GRAD and activations.gelu_approx is _MLX_GELU_APPROX_FINITE_GRAD:
         return False
-    # nn.GELU(approx="precise") resolves the activations module's name, model code resolves nn's.
+    # nn.GELU resolves the activations module's name, model code resolves nn's.
     nn.gelu_approx = activations.gelu_approx = _MLX_GELU_APPROX_FINITE_GRAD
     return True
 
