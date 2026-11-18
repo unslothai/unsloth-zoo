@@ -251,11 +251,23 @@ def _qsa_pooled_blocks(n_tokens, start, ratio):
     return torch.div(n_tokens - start, ratio, rounding_mode = "floor").clamp_min(0)
 
 
+_ARANGE = {}
+
+
+def _arange(n, device):
+    """torch.arange(n) as a view of a cached, grown-by-doubling range: no kernel launch per call."""
+    have = _ARANGE.get(device)
+    if have is None or have.shape[0] < n:
+        have = _ARANGE[device] = torch.arange(max(n, 2 * (0 if have is None else have.shape[0]), 4096), device = device)
+    return have[:n]
+
+
 @torch.no_grad()
-def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attention_mask, rope):
+def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attention_mask, rope, rope_dtype):
     """[b, q, budget + ratio - 1] selected cache slots (-1 = unused) of a cached step, as the reference indexer
     keeps them; appends this step's raw index keys to the cache and extends its block-key cache. No host sync.
-    The reference's selection is a boolean mask: nothing here carries a gradient."""
+    The reference's selection is a boolean mask: nothing here carries a gradient. `rope_dtype` (or None): the
+    dtype the reference's RoPE tables are cast to, applied only to the rows read here."""
     import math
     batch, q_len = hidden_states.shape[:2]
     raw_cache = layer.indexer_keys
@@ -264,6 +276,8 @@ def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attent
     ratio, dim, top_blocks = indexer.compress_ratio, indexer.index_head_dim, indexer.block_topk
     device = hidden_states.device
     cos, sin = full_cos[:, -q_len:, :], full_sin[:, -q_len:, :]
+    if rope_dtype is not None:
+        cos, sin = cos.to(rope_dtype), sin.to(rope_dtype)
 
     # Index query and raw key, as the reference indexer.
     qk = indexer.index_qk_proj(hidden_states)
@@ -273,13 +287,12 @@ def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attent
     raw_keys = layer.update_indexer(token_k.reshape(batch, q_len, -1, dim).squeeze(2))
 
     visible = attention_mask[:, 0] if attention_mask.dtype == torch.bool else attention_mask[:, 0] == 0
-    slots = torch.arange(total, device = device)
     state = getattr(layer, "_unsloth_qsa_decode", None)
     # Any cache edit (crop, beam reorder, reset, offload) swaps the raw key tensor: rebuild from the raw keys.
     rebuild = state is None or state["raw"]() is not raw_cache or state["filled"] != filled
     if rebuild:
         # First visible slot per row, from the last query row (a real token, never a pad).
-        start = torch.where(visible[:, -1], slots, total).amin(-1).clamp_max(total - 1)
+        start = torch.where(visible[:, -1], _arange(total, device), total).amin(-1).clamp_max(total - 1)
         blocks = None
     else:
         start, blocks = state["start"], state["blocks"]
@@ -293,47 +306,49 @@ def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attent
     spare = blocks.shape[1] - 1
 
     # Pool the blocks this step completed (every block on a rebuild).
-    done_before = torch.zeros_like(start) if rebuild else _qsa_pooled_blocks(filled, start, ratio)
     done_after = _qsa_pooled_blocks(total, start, ratio)
-    n_new = spare if rebuild else q_len // ratio + 1
-    block_ids = done_before[:, None] + torch.arange(n_new, device = device)              # [b, n_new]
-    complete = block_ids < done_after[:, None]
-    first_slot = start[:, None] + block_ids * ratio
-    token_slots = (first_slot[..., None] + torch.arange(ratio, device = device)).clamp(0, total - 1)
-    groups = raw_keys.gather(1, token_slots.reshape(batch, -1, 1).expand(-1, -1, dim)).view(batch, n_new, ratio, dim)
+    if rebuild:
+        n_new = spare
+        block_ids = _arange(n_new, device).expand(batch, -1)                                     # [b, n_new]
+    else:
+        n_new = q_len // ratio + 1
+        block_ids = _qsa_pooled_blocks(filled, start, ratio)[:, None] + _arange(n_new, device)
+    first_slot = (start[:, None] + block_ids * ratio).clamp_max(total - 1)
+    token_slots = (first_slot[..., None] + _arange(ratio, device)).clamp_max(total - 1)
+    groups = raw_keys.gather(1, token_slots.view(batch, -1, 1).expand(-1, -1, dim)).view(batch, n_new, ratio, dim)
     pooled = indexer.k_layernorm(groups.float().mean(dim = 2).to(raw_keys.dtype))
-    first_slot = first_slot.clamp(0, total - 1)
     block_cos = full_cos.gather(1, first_slot[..., None].expand(-1, -1, full_cos.shape[-1]))
     block_sin = full_sin.gather(1, first_slot[..., None].expand(-1, -1, full_sin.shape[-1]))
-    pooled = rope(pooled.unsqueeze(2), cos = block_cos, sin = block_sin, unsqueeze_dim = 2).squeeze(2).float()
-    write_at = torch.where(complete, block_ids, spare)
-    blocks = blocks.scatter(1, write_at[..., None].expand(-1, -1, dim), pooled)
+    if rope_dtype is not None:
+        block_cos, block_sin = block_cos.to(rope_dtype), block_sin.to(rope_dtype)
+    pooled = rope(pooled.unsqueeze(2), cos = block_cos, sin = block_sin, unsqueeze_dim = 2).squeeze(2)
+    write_at = torch.where(block_ids < done_after[:, None], block_ids, spare)
+    blocks.scatter_(1, write_at[..., None].expand(-1, -1, dim), pooled.float())
     layer._unsloth_qsa_decode = {"raw": weakref.ref(raw_keys), "filled": total, "start": start, "blocks": blocks}
 
     # Score the complete blocks of each query row, as the reference: sum over index heads of relu(q . k) / sqrt(d).
-    rows = filled + torch.arange(q_len, device = device)                                     # slot of each query
-    row_blocks = torch.div(rows[None, :] + 1 - start[:, None], ratio, rounding_mode = "floor").clamp_min(0)  # [b, q]
+    rows = _arange(total, device)[filled:]                                                   # slot of each query
+    row_blocks = torch.div(rows + 1 - start[:, None], ratio, rounding_mode = "floor").clamp_min(0)   # [b, q]
     scores = torch.matmul(index_q.float(), blocks[:, None, :spare].transpose(-1, -2))         # [b, q, h, C]
     scores = torch.relu(scores).sum(dim = 2) / math.sqrt(dim)
-    scores = scores.masked_fill(torch.arange(spare, device = device) >= row_blocks[..., None], float("-inf"))
+    scores = scores.masked_fill(_arange(spare, device) >= row_blocks[..., None], float("-inf"))
     top = scores.topk(min(top_blocks, spare), dim = -1)
-    arange_r = torch.arange(ratio, device = device)
-    chosen = start[:, None, None, None] + top.indices[..., None] * ratio + arange_r            # [b, q, k, ratio]
+    arange_r = _arange(ratio, device)
+    chosen = (start[:, None, None] + top.indices * ratio)[..., None] + arange_r               # [b, q, k, ratio]
     chosen = torch.where(torch.isfinite(top.values)[..., None], chosen, -1).flatten(2)
     tail = (start[:, None] + row_blocks * ratio)[..., None] + arange_r[: ratio - 1]             # [b, q, ratio - 1]
-    tail = torch.where(tail <= rows[None, :, None], tail, -1)
+    tail = torch.where(tail <= rows[:, None], tail, -1)
     selected = torch.cat([chosen, tail], dim = -1)                                             # [b, q, S]
 
-    # The cache assumes each query sees [first visible slot, itself]: count (on the device) steps that do not.
-    expected = (slots >= start[:, None, None]) & (slots <= rows[None, :, None])
-    mismatch = (expected != visible).any().to(torch.int64)
+    # The cache assumes each query sees [first visible slot, itself]: count (on the device) steps that do not, and
+    # never keep a hidden key.
+    slots = _arange(total, device)
+    expected = (slots >= start[:, None, None]) & (slots <= rows[:, None])
     counter = QWEN4_EXP_CACHED_DECODE_MISMATCH.get(device)
     if counter is None:
         counter = QWEN4_EXP_CACHED_DECODE_MISMATCH[device] = torch.zeros((), dtype = torch.int64, device = device)
-    counter.add_(mismatch)
-    keep = (selected >= 0) & visible.gather(-1, selected.clamp_min(0))
-    selected = torch.where(keep, selected, -1)
-    return selected
+    counter.add_((expected != visible).any())
+    return torch.where(visible.gather(-1, selected.clamp_min(0)) & (selected >= 0), selected, -1)
 
 
 def _qwen4_exp_cached_decode(module, hidden_states, position_embeddings, attention_mask, past_key_values, kwargs):
@@ -387,16 +402,20 @@ def _qwen4_exp_cached_decode(module, hidden_states, position_embeddings, attenti
     full_cos, full_sin = position_embeddings
     if full_cos.dim() != 3 or full_cos.shape[-2] != total:
         return None
-    # As qwen4_exp_attention_forward does before the reference: half activations take half RoPE tables.
+    # As qwen4_exp_attention_forward does before the reference: half activations take half RoPE tables (only the
+    # rows read are cast: the tables span every position).
+    rope_dtype = None
     if hidden_states.dtype in (torch.float16, torch.bfloat16) and full_cos.dtype != hidden_states.dtype:
-        full_cos, full_sin = full_cos.to(hidden_states.dtype), full_sin.to(hidden_states.dtype)
+        rope_dtype = hidden_states.dtype
     import sys
     rope = getattr(sys.modules.get(type(module).__module__), "apply_rotary_pos_emb", None)
     if rope is None:   # a subclass defined elsewhere
         from transformers.models.qwen4_exp import modeling_qwen4_exp
         rope = modeling_qwen4_exp.apply_rotary_pos_emb
     cos, sin = full_cos[:, -q_len:, :], full_sin[:, -q_len:, :]
-    selected = _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attention_mask, rope)
+    if rope_dtype is not None:
+        cos, sin = cos.to(rope_dtype), sin.to(rope_dtype)
+    selected = _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attention_mask, rope, rope_dtype)
     if _QSA_DECODE_TRACE is not None:
         _QSA_DECODE_TRACE.append((module.layer_idx, selected))
 
