@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Kept-set GRPO scorer (top_k / top_p / min_p / excluded ids): values and gradients against a float64 oracle
-log p(t) - log p(kept set), equality with the plain chunked helper's support branch, and the memory / compile
-contract: no float32 [rows, vocab] tensor is held for the backward and the fullgraph helper is not entered."""
+"""Kept-set GRPO scorer vs a float64 oracle and the old support branch; no float32 logits saved for backward,
+no fullgraph compile."""
 
 import os
 import sys
@@ -100,7 +99,6 @@ def test_values_and_grads_match_float64_oracle(temperature, top_k, top_p, min_p,
     got = _new(hidden, head, index, temperature, top_k, top_p, min_p, bias = b)
     ref, kept, leaves = _oracle(hidden, head, index, temperature, top_k, top_p, min_p, bias = b)
     torch.testing.assert_close(got.double().cpu(), ref.detach(), atol = 2e-5, rtol = 0)
-    # The kept set really is a strict subset (else this tests the full vocabulary).
     assert (kept.sum(-1) < V).all()
     w = torch.randn(tuple(got.shape), generator = torch.Generator().manual_seed(1)).abs()
     (got * w.to(device)).sum().backward()
@@ -131,8 +129,7 @@ def test_softcap_and_excluded_ids_match_float64_oracle(temperature, top_k, top_p
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("triton_sampler", [False, True])
 def test_matches_the_plain_helper_support_branch(temperature, top_k, top_p, min_p, dtype, triton_sampler):
-    # Same kept set and tie rules as chunked_hidden_states_selective_log_softmax's support branch (main's scorer),
-    # at the half dtypes training runs in: forward equal, gradients equal to rounding.
+    # Same kept set and tie rules as the old support branch: forward equal, gradients equal to rounding.
     hidden, head, index, _ = _inputs(dtype = dtype, seed = 5)
     h1 = hidden.clone().requires_grad_(True)
     w1 = head.clone().requires_grad_(True)
@@ -212,22 +209,19 @@ def _saved_bytes(fn):
 
 @pytest.mark.parametrize("temperature, top_k, top_p, min_p", CASES)
 def test_policy_backward_holds_no_float32_logits(temperature, top_k, top_p, min_p):
-    # Flip test: main's scorer keeps float32 [rows, vocab] tensors per chunk for the backward (4.6-6.5 GB on a T4
-    # in zoo #2084, the L4 OOM at 32 x 256); the recompute scorer keeps hidden, head and a 1-bit kept set.
+    # Flip test: main saves float32 [rows, vocab] per chunk for backward (zoo #2084 T4 / L4 OOM).
     hidden, head, index, _ = _inputs(rows = (4, 64), seed = 13)
     hidden.requires_grad_(True)
     rows = index.numel()
     out, saved = _saved_bytes(lambda: _new(hidden, head, index, temperature, top_k, top_p, min_p))
     inputs = hidden.numel() * hidden.element_size() + head.numel() * head.element_size()
-    # Main: >= rows * V * 4 bytes (one float32 logits copy). Head: inputs + rows * V / 8 bytes + per-row stats.
     assert saved - inputs < rows * V // 2, (saved, inputs, rows * V)
     out.sum().backward()
     assert torch.isfinite(hidden.grad).all()
 
 
 def test_kept_set_does_not_enter_the_fullgraph_helper(monkeypatch):
-    # Flip test: main routes the kept set through the fullgraph-compiled chunk loop (sort / cumsum / scatter per
-    # chunk), which took about 7 minutes to compile on a Colab L4 and fell back to eager (InductorError).
+    # Flip test: main's fullgraph kept-set loop took ~7 min to compile on an L4, then InductorError.
     def refuse(*args, **kwargs):
         raise AssertionError("kept-set scoring entered chunked_hidden_states_selective_log_softmax")
     monkeypatch.setattr(rr, "chunked_hidden_states_selective_log_softmax", refuse)
@@ -261,8 +255,7 @@ def test_full_vocabulary_calls_are_untouched(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA memory check")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_cuda_memory_is_bounded_and_values_match(dtype):
-    # Llama-3.2 vocabulary, 8 x 256 completion rows: retained memory after the forward stays near the 1-bit kept
-    # set, the forward peak near one capped chunk, and values / gradients match the plain helper.
+    # Llama-3.2 vocab, 8 x 256 rows: retained memory ~1-bit kept set, peak ~one capped chunk.
     torch.manual_seed(0)
     Vb, Hb = 128256, 256
     head = (torch.randn(Vb, Hb, device = "cuda") * 0.05).to(dtype)

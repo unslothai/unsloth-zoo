@@ -110,8 +110,7 @@ pass
 # apply_top_k_top_p); scored token always kept so boundary mismatches stay finite; a tied scored token the sort drops
 # swaps in for a kept one, so value and gradient match a kept token.
 def _truncated_support_keep(chunk_logits, chunk_index, top_k, top_p, min_p, triton_sampler = False, excluded_ids = None):
-    # The scored kept set (bool [rows, vocab]) of _truncated_support_logps, target included. Shared with the
-    # recompute scorer below, so the two cannot drift.
+    # Kept set (target included), shared with the recompute scorer so the two cannot drift.
     index = chunk_index.unsqueeze(-1)
     detached = chunk_logits.detach()
     selected_logits = torch.gather(detached, dim = -1, index = index)
@@ -651,9 +650,7 @@ def grpo_kept_set_requested(support_kwargs = None):
 
 
 def _kept_set_rows_per_chunk(vocab_size, max_rows_per_chunk = 0):
-    # The kept-set mask sorts each row (float32 values + int64 order) next to the float32 logits and their
-    # softmax / cumsum, about 30 bytes per logit, so rows are capped near 64M logits per chunk (~2 GB of
-    # transients) whatever the batch. UNSLOTH_GRPO_KEPT_SET_MAX_LOGITS moves the cap.
+    # ~30 bytes of sort / softmax transients per logit: cap chunks near 64M logits (UNSLOTH_GRPO_KEPT_SET_MAX_LOGITS).
     env = os.environ.get("UNSLOTH_GRPO_KEPT_SET_MAX_LOGITS", "").strip()
     budget = int(env) if env.isdigit() and int(env) > 0 else (1 << 26)
     rows = max(1, budget // max(int(vocab_size), 1))
@@ -663,7 +660,7 @@ def _kept_set_rows_per_chunk(vocab_size, max_rows_per_chunk = 0):
 
 
 def _pack_bool_rows(mask):
-    # [rows, V] bool -> [rows, ceil(V / 8)] uint8, little-endian bits: 1 bit per logit for the backward.
+    # 1 bit per logit for the backward (little-endian).
     rows, V = mask.shape
     pad = (-V) % 8
     if pad:
@@ -686,8 +683,7 @@ def _kept_set_logits(chunk_hidden_states, lm_head, lm_head_bias):
 
 
 def _kept_set_transform(logits, scale_multiply, scale_divide, softcapping, temperature):
-    # Same order and dtypes as chunked_hidden_states_selective_log_softmax: scale / softcap in the matmul
-    # dtype, then float32, then the temperature.
+    # Same op order and dtypes as chunked_hidden_states_selective_log_softmax.
     if scale_multiply != 0.0:
         logits = logits * scale_multiply
     if scale_divide != 0.0:
@@ -701,7 +697,6 @@ def _kept_set_transform(logits, scale_multiply, scale_divide, softcapping, tempe
 
 
 def _kept_set_chunk_forward(z, chunk_index, support):
-    # z: float32 [rows, V] scaled logits. Returns the kept-set logp, the kept-set logsumexp and the kept set.
     top_k, top_p, min_p, triton_sampler, excluded_ids = support
     keep = _truncated_support_keep(z, chunk_index, top_k, top_p, min_p, triton_sampler, excluded_ids)
     index = chunk_index.unsqueeze(-1)
@@ -718,9 +713,7 @@ def _kept_set_chunk_forward(z, chunk_index, support):
 
 
 class _KeptSetLogprobs(torch.autograd.Function):
-    # Kept-set log p(token) = z_t - logsumexp_{kept} z, keeping only per-row logp / logsumexp and a 1-bit kept
-    # set for the backward, which recomputes each chunk's logits (as chunked_hidden_states_selective_log_softmax_recompute
-    # does for the full vocabulary). The kept set is constant in the backward (a detached mask, as before).
+    # Saves only per-row stats and a 1-bit kept set; backward recomputes logits. The kept set is a detached mask.
     @staticmethod
     def forward(ctx, hidden_states, lm_head, lm_head_bias, index, bounds, transforms, support):
         device_type = lm_head.device.type
@@ -864,10 +857,8 @@ def grpo_kept_set_logprobs(
     fp32_lm_head: bool = False,
     **unused,
 ) -> torch.Tensor:
-    """Kept-set log-probs, bit-equal in the forward to chunked_hidden_states_selective_log_softmax's support
-    branch, in eager row chunks capped near 64M logits; the backward recomputes each chunk's logits from a 1-bit
-    kept set instead of holding float32 [rows, vocab] tensors, and nothing is handed to torch.compile (the
-    fullgraph compile of the sort / cumsum chunk loop took minutes and could fail in Inductor)."""
+    """Kept-set log-probs, forward bit-equal to the old support branch; no float32 logits saved for backward
+    and no torch.compile (the fullgraph sort / cumsum loop took minutes and could fail in Inductor)."""
     # All Unsloth Zoo code licensed under AGPL3
     flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
     flat_index = index.reshape(-1)
@@ -895,7 +886,6 @@ def grpo_kept_set_logprobs(
                 flat_hidden_states, lm_head, lm_head_bias, flat_index, bounds, transforms, support,
             )
         else:
-            # Scoring only (old / ref logps): no kept set is stored.
             out = []
             with torch.no_grad():
                 for a, b in zip(bounds[:-1], bounds[1:]):
@@ -3539,7 +3529,7 @@ def grpo_accumulated_loss(
             from unsloth_zoo.rl_replacements import _GRPO_TRUNCATED_SUPPORT_STATS as _support_stats
             _support_stats["on"] += 1
             if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
-                # The recompute helper scores the full vocabulary only, so the kept set uses the GRPO dispatcher
+                # The recompute helper is full-vocabulary only; the kept set needs the GRPO dispatcher.
                 from unsloth_zoo.rl_replacements import (
                     grpo_chunked_hidden_states_logprobs as chunked_hidden_states_selective_log_softmax,
                 )
