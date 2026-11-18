@@ -14,7 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A prompt ending in whitespace merges into the completion's first token; the completion must start where the tokenizations diverge."""
+"""A prompt ending in whitespace merges into the completion's first token; the completion must start where the tokenizations diverge.
+GPT-OSS deletes the analysis of tool-calling turns once a final answer follows; those spans are skipped so tool history stays masked."""
 
 import pytest
 from datasets import Dataset, IterableDataset
@@ -138,3 +139,142 @@ def test_conversational_rows_keep_the_answer_and_mask_the_prompt(tokenizer):
     for text in texts:
         assert "Answer.<|im_end|>" in text, text
         assert "Question" not in text and "user" not in text and "<|im_start|>" not in text, text
+
+
+def test_boundary_skips_spans_the_template_deleted_from_the_prompt():
+    # The prompt alone renders [8, 9] that the joined ids drop; the rest of the prompt still follows.
+    assert _prompt_completion_boundary([1, 2, 8, 9, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6, 7, 8]) == 6
+    # Two deleted spans (two tool-calling turns): [8] and [9, 9].
+    assert _prompt_completion_boundary(
+        [1, 2, 8, 3, 4, 5, 6, 9, 9, 10, 11, 12, 13, 14], [1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 20],
+    ) == 11
+    # A deleted span, then the prompt's last token merges with the completion.
+    assert _prompt_completion_boundary([1, 2, 8, 9, 3, 4, 5, 6, 7], [1, 2, 3, 4, 5, 6, 10, 11]) == 6
+
+
+def test_boundary_keeps_the_divergence_for_prompt_only_closing_tokens():
+    # Gemma 4's "<turn|>\n" at the end of the prompt only.
+    assert _prompt_completion_boundary([1, 2, 8, 9], [1, 2, 5, 6]) == 2
+    # A completion starting with the prompt's last token is not a deleted span.
+    assert _prompt_completion_boundary([1, 2, 8, 9], [1, 2, 9, 6]) == 2
+    # DeepSeek-R1: the prompt ends "<think>", "\n", the joined ids drop "<think>"; the completion's "\n" stays trained.
+    assert _prompt_completion_boundary([1, 2, 30, 31, 32, 33, 40, 41], [1, 2, 30, 31, 32, 33, 41, 50, 60]) == 6
+
+
+def test_boundary_falls_back_to_the_prompt_length_when_it_cannot_line_up():
+    # [8, 8] became [9, 9] and the prompt's last ids reappear later: mask len(prompt).
+    assert _prompt_completion_boundary([1, 2, 8, 8, 3, 4, 5, 6], [1, 2, 9, 9, 3, 4, 5, 6, 20]) == 8
+    # Deleted spans too close together to anchor: mask the prompt even if the answer loses its start.
+    assert _prompt_completion_boundary([1, 2, 8, 3, 4, 9, 10, 5, 6, 7, 11], [1, 2, 3, 4, 5, 6, 7, 11, 20, 21]) == 10
+
+
+def test_boundary_warns_once_per_cause(monkeypatch, capsys):
+    monkeypatch.setattr(dataset_utils, "_PROMPT_COMPLETION_BOUNDARY_WARNED", set())
+    for _ in range(2):
+        _prompt_completion_boundary([1, 2, 8, 9, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6, 7, 8])
+        _prompt_completion_boundary([1, 2, 7], [1, 2, 9, 5])
+        _prompt_completion_boundary([1, 2, 8, 8, 3, 4, 5, 6], [1, 2, 9, 9, 3, 4, 5, 6, 20])
+    out = capsys.readouterr().out
+    assert out.count("renders earlier turns of the prompt differently") == 1
+    assert out.count("merges with the completion's first token") == 1
+    assert out.count("could not be lined up") == 1
+
+
+GPT_OSS = ("openai/gpt-oss-20b", "6cee5e81ee83917806bbde320786a8fb61efebee")
+GPT_OSS_ANSWER = "The instrument read 92 degrees Celsius at noon."
+
+
+def _gpt_oss_row(*turns, field = "content"):
+    # chat_template.jinja drops "content" / "thinking" of tool-calling turns before a final answer.
+    prompt = [{"role": "user", "content": "What did the meter read at noon?"}]
+    for text, name, result in turns:
+        call = {"type": "function", "function": {"name": name, "arguments": {}}}
+        # "content": "" renders the same and keeps Arrow from filling None.
+        turn = {"role": "assistant", "content": "", field: text, "tool_calls": [call]}
+        prompt += [turn, {"role": "tool", "content": result}]
+    return {"prompt": prompt, "completion": [{"role": "assistant", "content": GPT_OSS_ANSWER}]}
+
+
+GPT_OSS_ROWS = {
+    # Rebuilt from the row described on unslothai/unsloth-zoo#2402 (its user question was not posted).
+    "one_tool_call": _gpt_oss_row(("Read it.", "read_meter", "METER_RESULT_176208")),
+    "two_tool_calls": _gpt_oss_row(
+        ("Read it.", "read_meter", "METER_RESULT_176208"), ("Check units.", "read_units", "UNITS_RESULT_2"),
+    ),
+    "two_tool_calls_thinking": _gpt_oss_row(
+        ("Read it.", "read_meter", "METER_RESULT_176208"), ("Check units.", "read_units", "UNITS_RESULT_2"),
+        field = "thinking",
+    ),
+}
+
+
+@pytest.fixture(scope = "module")
+def gpt_oss_tokenizer():
+    from transformers import AutoTokenizer
+    try:
+        tok = AutoTokenizer.from_pretrained(GPT_OSS[0], revision = GPT_OSS[1])
+    except Exception as e:
+        pytest.skip(reason = f"offline runner, tokenizer download failed: {e}")
+    if not tok.chat_template:
+        pytest.skip(reason = "gpt-oss chat_template.jinja is not available")
+    return tok
+
+
+def _gpt_oss_trained(tok, example, monkeypatch, streaming = False, columns = "completion_mask", **overrides):
+    if columns == "labels":
+        monkeypatch.setattr(dataset_utils, "trl_collator_applies_masks", lambda: False)
+        monkeypatch.setattr(dataset_utils, "trl_collator_ignores_labels", lambda collator = None: False)
+    dataset = Dataset.from_list([example])
+    if streaming:
+        dataset = IterableDataset.from_generator(lambda: iter([example]))
+
+    class GptOssArgs(Args):
+        max_length = 1024
+    for k, v in overrides.items():
+        setattr(GptOssArgs, k, v)
+
+    row = next(iter(sft_prepare_dataset(
+        DummyTrainer(), dataset, tok, GptOssArgs(), packing = False, formatting_func = None, dataset_name = "train",
+    )))
+    ids = list(row["input_ids"])
+    if columns == "labels":
+        labels = list(row["labels"])
+        assert all(label in (-100, t) for t, label in zip(ids, labels))
+        return ids, [label != -100 for label in labels]
+    return ids, [bool(m) for m in row["completion_mask"]]
+
+
+def _assert_only_the_final_answer_is_trained(tok, ids, trained):
+    assert tok.decode([t for t, m in zip(ids, trained) if m]) == \
+        "<|channel|>final<|message|>" + GPT_OSS_ANSWER + "<|return|>"
+    assert trained[-1] and ids[-1] == tok.convert_tokens_to_ids("<|return|>")
+
+
+@pytest.mark.parametrize("columns", ["completion_mask", "labels"])
+@pytest.mark.parametrize("streaming", [False, True], ids = ["batched", "row_by_row"])
+@pytest.mark.parametrize("name", list(GPT_OSS_ROWS))
+def test_gpt_oss_tool_history_stays_masked(gpt_oss_tokenizer, monkeypatch, name, streaming, columns):
+    tok, example = gpt_oss_tokenizer, GPT_OSS_ROWS[name]
+    ids, trained = _gpt_oss_trained(tok, example, monkeypatch, streaming, columns)
+    _assert_only_the_final_answer_is_trained(tok, ids, trained)
+    # Every token up to the end of the last tool response, each tool call included, is masked.
+    last_result = example["prompt"][-1]["content"]
+    tool_end = next(k for k in range(len(ids) + 1) if f'"{last_result}"<|end|>' in tok.decode(ids[:k]))
+    history = tok.decode(ids[:tool_end])
+    for message in example["prompt"]:
+        for call in message.get("tool_calls", []):
+            assert "to=functions." + call["function"]["name"] in history
+        if message["role"] == "tool":
+            assert message["content"] in history
+    assert not any(trained[:tool_end])
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids = ["batched", "row_by_row"])
+def test_gpt_oss_tool_history_stays_masked_with_keep_end(gpt_oss_tokenizer, monkeypatch, streaming):
+    # The boundary is found on the full row, then keep_end cuts every column alike.
+    tok, example = gpt_oss_tokenizer, GPT_OSS_ROWS["two_tool_calls"]
+    full, _ = _gpt_oss_trained(tok, example, monkeypatch, streaming)
+    ids, trained = _gpt_oss_trained(tok, example, monkeypatch, streaming, max_length = 96, truncation_mode = "keep_end")
+    assert len(full) > 96 and ids == full[-96:]
+    _assert_only_the_final_answer_is_trained(tok, ids, trained)
+    assert "UNITS_RESULT_2" in tok.decode(ids)
