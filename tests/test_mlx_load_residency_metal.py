@@ -254,6 +254,61 @@ def test_a_glm5_next_oq_quant_loads_as_its_model(tmp_path, monkeypatch):
         assert value.dtype == params[key].dtype and mx.array_equal(value, params[key]), key
 
 
+def test_a_mixed_fp_checkpoint_with_a_scaled_embedding_loads_as_packed(tmp_path, monkeypatch):
+    qwen2_vl = pytest.importorskip("mlx_vlm.models.qwen2_vl")
+    import mlx_vlm.utils as vlm_utils
+    from unsloth_zoo.mlx.loader import _ensure_vlm_checkpoint_quantization, _with_packed_quantization
+
+    for name in ("load_model_weights", "replace_scaled_quantized_linears"):
+        monkeypatch.setattr(vlm_utils, name, getattr(vlm_utils, name))
+    text = dict(model_type = "qwen2_vl", hidden_size = 128, num_hidden_layers = 2, intermediate_size = 256, num_attention_heads = 2,
+                num_key_value_heads = 2, rms_norm_eps = 1e-6, vocab_size = 256, tie_word_embeddings = True,
+                rope_scaling = {"type": "mrope", "mrope_section": [8, 12, 12]})
+    config = {**text, "text_config": text, "vision_config": {"depth": 1, "embed_dim": 32, "hidden_size": 128, "num_heads": 2}}
+    model = qwen2_vl.Model(vlm_utils.update_module_configs(
+        qwen2_vl.ModelConfig.from_dict(json.loads(json.dumps(config))), qwen2_vl, config, ["text", "vision"]))
+    mx.random.seed(0)
+    model.update(tree_map(lambda value: mx.random.normal(value.shape) * 0.05, model.parameters()))
+    nvfp4, mxfp8 = {"group_size": 16, "bits": 4, "mode": "nvfp4"}, {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    # Layer 1's MLP and layer 0's attention depart from the default, as Ollama's mixed Gemma4 tags do.
+    packed = {path: mxfp8 if ".layers.1.mlp." in path or ".layers.0.self_attn." in path else nvfp4
+              for path, module in model.named_modules() if path.startswith("language_model") and hasattr(module, "to_quantized")}
+    nn.quantize(model, class_predicate = lambda path, _module: packed.get(path, False))
+    params = dict(tree_flatten(model.parameters()))
+    scale = mx.array(0.25, dtype = mx.float32)
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {**params, "language_model.model.embed_tokens.weight_scale_2": scale})
+    (tmp_path / "config.json").write_text(json.dumps({**config, "quantization": nvfp4}))
+
+    _ensure_vlm_checkpoint_quantization()
+    loaded = vlm_utils.load_model(tmp_path)
+    modules = dict(loaded.named_modules())
+    assert {path: {"group_size": modules[path].group_size, "bits": modules[path].bits, "mode": modules[path].mode}
+            for path in packed} == packed
+    # The saved config names each departing layer, so a stock mlx-vlm reloads the export.
+    saved = _with_packed_quantization(loaded, {"quantization": nvfp4})["quantization"]
+    assert {path: saved[path] for path in packed if packed[path] != nvfp4} == {
+        path: spec for path, spec in packed.items() if spec != nvfp4}
+    embedding, stock = modules["language_model.model.embed_tokens"], model.language_model.model.embed_tokens
+    assert not isinstance(embedding, nn.QuantizedEmbedding)
+    ids, hidden = mx.array([[3, 255, 0, 17]]), mx.random.normal((1, 4, 128)).astype(mx.bfloat16)
+    want_rows = (stock(ids).astype(mx.float32) * scale).astype(mx.bfloat16)
+    want_logits = (stock.as_linear(hidden.astype(mx.float32)) * scale).astype(mx.bfloat16)
+    assert mx.array_equal(embedding(ids), want_rows) and mx.array_equal(embedding.as_linear(hidden), want_logits)
+    for key, value in tree_flatten(loaded.parameters()):
+        assert mx.array_equal(value, scale if key.endswith("weight_scale_2") else params[key]), key
+
+    from unsloth_zoo.mlx.utils import save_merged_model
+
+    # A dense export folds the scale in rather than saving the packed weight.
+    save_merged_model(loaded, type("Tokenizer", (), {"save_pretrained": lambda self, path: None})(), tmp_path / "dense",
+                      dequantize = True)
+    saved = mx.load(str(next((tmp_path / "dense").glob("*.safetensors"))))
+    assert not any(key.endswith(("scales", "weight_scale_2")) for key in saved)
+    dense = (mx.dequantize(stock.weight, stock.scales, group_size = 16, bits = 4, mode = "nvfp4", dtype = mx.float32)
+             * scale).astype(mx.bfloat16)
+    assert mx.array_equal(saved["language_model.model.embed_tokens.weight"], dense)
+
+
 def test_lazy_weights_env_leaves_the_load_lazy(tmp_path, monkeypatch):
     monkeypatch.setenv("UNSLOTH_MLX_LAZY_WEIGHTS", "1")
     model = _lazy_model(tmp_path)

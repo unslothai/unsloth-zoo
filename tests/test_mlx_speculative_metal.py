@@ -3354,16 +3354,45 @@ def test_draft_selector_walks_each_batch_and_position(monkeypatch, dtype):
     assert mx.allclose(selector.__dict__["_unsloth_confidence"], mx.full((2, 7), 1 / 16))
 
 
-def test_draft_layer_folds_convolution_residual_and_keeps_context_cache(monkeypatch):
+def _contract_target():
+    return 1
+
+
+def test_only_a_body_no_accepted_contract_matches_is_reported(monkeypatch, caplog):
+    import sys
+    import types
+    from unsloth_zoo.mlx import inference
+    module = types.ModuleType("unsloth_contract_target")
+    module.body = module.renamed = _contract_target
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(inference, "_CONTRACT_MISSES", set())
+    real = inference._ast_fingerprint(_contract_target)
+    older, newer = {module.__name__: {"body": "0" * 16}}, {module.__name__: {"renamed": real}}
+    with caplog.at_level("WARNING"):
+        assert inference._first_resolved((older, newer)) == inference._resolved_bindings(newer)
+        assert "differs" not in caplog.text
+        assert inference._first_resolved((older, {module.__name__: {"renamed": "0" * 16}})) is None
+    assert "unsloth_contract_target.renamed differs" in caplog.text
+    assert "unsloth_contract_target.body differs" not in caplog.text
+
+
+@pytest.mark.parametrize("no_rope_layers", [None, [1]], ids = ["rope", "no_rope_layer"])
+def test_draft_layer_folds_convolution_residual_and_keeps_context_cache(monkeypatch, no_rope_layers):
     import copy
+    import dataclasses
     import mlx.nn as nn
     from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
     from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
     from unsloth_zoo.mlx import inference, speculative
+    extra = {}
+    if no_rope_layers is not None:
+        if "no_rope_layers" not in {f.name for f in dataclasses.fields(DFlash2Config)}:
+            pytest.skip("this mlx-vlm applies rotary on every draft layer")
+        extra["no_rope_layers"] = no_rope_layers
     config = DFlash2Config(hidden_size = 128, intermediate_size = 256, num_hidden_layers = 2,
         num_attention_heads = 4, num_key_value_heads = 2, head_dim = 32, vocab_size = 1024,
         block_size = 8, mask_token_id = 0, target_layer_ids = [0], num_target_layers = 2,
-        conv_kernel_size = 3, conv_group_size = 32, selector_rank = 16, selector_top_k = 8)
+        conv_kernel_size = 3, conv_group_size = 32, selector_rank = 16, selector_top_k = 8, **extra)
     model = DFlash2DraftModel(config).eval()
     model.set_dtype(mx.bfloat16)
     for layer in model.layers:
