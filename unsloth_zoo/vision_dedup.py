@@ -263,6 +263,16 @@ def _fallback(module, reason):
     logger.warning(f"Unsloth: encoding every image again for {type(module).__name__} ({reason}).")
 
 
+def _collective(module):
+    # Sharded FSDP2 towers all-gather per forward: the self-check's extra forward (only on ranks whose micro-batch
+    # repeats an image) would desynchronize the collectives, so those layouts always encode per row.
+    try:
+        from unsloth_zoo.rl_replacements import grpo_forwards_are_collective
+        return grpo_forwards_are_collective(module)
+    except Exception:
+        return False
+
+
 def _make_wrapper(module, original):
     try:
         signature = inspect.signature(original)
@@ -274,7 +284,12 @@ def _make_wrapper(module, original):
     # mm_encoder_outputs and the forward raises.
     @functools.wraps(original)
     def get_image_features(*args, **kwargs):
-        if signature is None or not image_dedup_enabled() or module.__dict__.get(_DISABLED, False):
+        if (
+            signature is None
+            or not image_dedup_enabled()
+            or module.__dict__.get(_DISABLED, False)
+            or _collective(module)
+        ):
             return original(*args, **kwargs)
         try:
             bound = signature.bind(*args, **kwargs)
@@ -413,7 +428,7 @@ def _image_modules(model):
 
 def install_image_dedup(model):
     """Wrap the innermost ``get_image_features`` of ``model`` once. Returns the number wrapped."""
-    if model is None or not isinstance(model, torch.nn.Module) or not image_dedup_enabled():
+    if model is None or not isinstance(model, torch.nn.Module) or not image_dedup_enabled() or _collective(model):
         return 0
     if model.__dict__.get(_SCANNED, False):
         return 0

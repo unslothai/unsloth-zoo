@@ -214,3 +214,24 @@ def test_kill_switch_skips_install(monkeypatch):
     _, model = _load("qwen2_5_vl")
     assert vision_dedup.install_image_dedup(model) == 0
     assert all(not m.__dict__.get(vision_dedup._INSTALLED, False) for m in vision_dedup._image_modules(model))
+
+
+def test_collective_sharded_forwards_never_dedup(monkeypatch):
+    # FSDP2 towers that reshard after forward all-gather per call; rank-local extra forwards would hang the ranks.
+    import unsloth_zoo.rl_replacements as rr
+    _, model = _load("qwen2_5_vl")
+    monkeypatch.setattr(rr, "grpo_forwards_are_collective", lambda m: True)
+    assert vision_dedup.install_image_dedup(model) == 0
+    monkeypatch.setattr(rr, "grpo_forwards_are_collective", lambda m: False)
+    proc, model = _load("qwen2_5_vl")
+    assert vision_dedup.install_image_dedup(model) > 0
+    inputs = _batch(proc)
+    tower = _tower(model)
+    calls = []
+    hook = tower.register_forward_hook(lambda m, a, o: calls.append(1))
+    monkeypatch.setattr(rr, "grpo_forwards_are_collective", lambda m: True)
+    with torch.no_grad():
+        model(**inputs)
+    hook.remove()
+    assert len(calls) == 1  # one per-row encode, no self-check forward
+    assert not any(m.__dict__.get(vision_dedup._VERIFIED, False) for m in vision_dedup._image_modules(model))
