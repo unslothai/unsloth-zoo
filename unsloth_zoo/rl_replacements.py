@@ -3367,6 +3367,14 @@ def grpo_accumulated_loss(
             )
 
         unwrapped_model = trainer.accelerator.unwrap_model(trainer.model, keep_fp32_wrapper = False)
+        if pixel_values is not None:
+            # Encode each prompt's image once, not num_generations times (idempotent; the
+            # trainer's __init__ already does this on a matching unsloth).
+            try:
+                from unsloth_zoo.vision_dedup import install_image_dedup as _install_image_dedup
+                _install_image_dedup(unwrapped_model)
+            except Exception:
+                pass
 
         for module in unwrapped_model.modules():
             if hasattr(module, "_hf_hook") and hasattr(module._hf_hook, "io_same_decice"):
