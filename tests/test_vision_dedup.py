@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""unsloth_zoo.vision_dedup on tiny VLMs (CPU, fp32): a GRPO-shaped batch (2 prompts x G=4 rows,
-one image per prompt) gives the same per-token logprobs and LoRA gradients with each distinct
-image encoded once as with every row encoded, the tower sees 2 images instead of 8, and the
-kill switch and the dropout gate both put it back to 8."""
+"""vision_dedup on tiny VLMs: dedup matches per-row logprobs/grads; kill switch and dropout gate disable it."""
 
 import pytest
 import torch
@@ -143,7 +140,6 @@ def test_dedup_parity_and_engagement(key, vision_lora, monkeypatch):
           f"grad max|d|/max|g| = {g_diff:.3e}, bitwise = {bitwise}")
     torch.testing.assert_close(lp_head, lp_base, rtol = 1e-5, atol = 1e-5)
     for n in g_base:
-        # fp32: a different tower batch size moves the low bits of the encoder's GEMMs.
         torch.testing.assert_close(g_head[n], g_base[n], rtol = 1e-4, atol = 1e-5, msg = lambda m: f"{n}: {m}")
 
 
@@ -169,8 +165,7 @@ def test_dropout_gate(key, monkeypatch):
 
 @pytest.mark.parametrize("key", list(MODELS))
 def test_single_distinct_image_encodes_two(key, monkeypatch):
-    """One distinct image over G rows is encoded at batch 2, not 1 (compiled towers specialise
-    batch 1 into a numerically different graph), and the logprobs still match the per-row encode."""
+    """One distinct image is encoded at batch 2, not 1, and logprobs still match."""
     proc, model = _load(key)
     model = _peft(model, key, vision_lora = False)
     model.train()

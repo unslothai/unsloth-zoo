@@ -14,21 +14,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Encode each distinct image of a vision forward once.
+"""Encode each distinct image of a vision forward once (GRPO repeats each prompt's images G times).
 
-GRPO repeats every prompt ``num_generations`` times together with its images, so the rollout
-prefill and every policy forward hand the vision tower G identical images per prompt. This wraps
-the innermost ``get_image_features`` of a VLM so that duplicate images (equal pixels, equal grid)
-are encoded once and their features copied back to every row that asked for them.
-
-Exact up to the tower's own batch-size dependence: the tower sees the same image, the copies are
-plain row gathers, and the gradient of a copied feature is the sum of the gradients of its copies
-(summed in a fixed order, so it stays deterministic). Eager towers give the same features at any
-batch size (fp32 CPU: bitwise on Gemma-3, 1e-6 on Qwen2.5-VL); a compiled tower can pick other
-kernels for a smaller batch, which moves its features by a few percent on some cards. Two rows get the same features only if a stochastic layer could not
-have told them apart, so the dedup stands down while any vision-side dropout is active.
-
-``UNSLOTH_GRPO_IMAGE_DEDUP=0`` turns it off (read on every call). ``DEDUP_STATS`` counts calls.
+Copies are row gathers with a deterministic summed backward. Stands down while vision dropout is
+active. ``UNSLOTH_GRPO_IMAGE_DEDUP=0`` disables it (read per call).
 """
 
 __all__ = [
@@ -76,8 +65,7 @@ class _Unmappable(Exception):
 
 
 class _BlockExpand(torch.autograd.Function):
-    """out = src[row_index], with a backward that sums the copies of each source block in a fixed
-    order (index_add's atomics would make a trained tower's gradients run-to-run nondeterministic)."""
+    """src[row_index]; backward sums in fixed order (index_add atomics are nondeterministic)."""
 
     @staticmethod
     def forward(ctx, src, row_index, blocks):
@@ -116,8 +104,7 @@ def _expand(src, seg_sizes, inverse):
 
 
 def _groups(flat, extras):
-    """(reps, inverse) over the rows of ``flat`` [n, D]: rows equal in ``flat`` and in every
-    tensor of ``extras`` (each [n, ...]) share a representative. Two host syncs."""
+    """(reps, inverse): rows equal in ``flat`` and every ``extras`` tensor share a representative."""
     n = flat.shape[0]
     fp = torch.stack(
         [
@@ -189,8 +176,7 @@ def _map_rows(obj, inverse, n_unique):
 
 
 def _map_grid(obj, inverse, rows_u):
-    """Grid layout (Qwen-VL): per-image tuples are reordered, flat tensors are gathered by image
-    segment (patch rows, or merged tokens at a fixed ratio), per-image tensors by image."""
+    """Grid layout (Qwen-VL): map outputs back by image segment."""
     if obj is None or isinstance(obj, (bool, int, float, str)):
         return obj
     n_unique = len(rows_u)
@@ -213,7 +199,6 @@ def _map_grid(obj, inverse, rows_u):
             and all(torch.is_tensor(x) and x.ndim >= 1 for x in obj)
         ):
             sizes = [x.shape[0] for x in obj]
-            # A per-image tuple: element j is image j's own segment, at one ratio for all images.
             if all(r % s == 0 for r, s in zip(rows_u, sizes) if s) and all(sizes) and len(
                 {r // s for r, s in zip(rows_u, sizes)}
             ) == 1:
@@ -239,12 +224,9 @@ def _flat_tensors(obj, out):
 
 
 def _outputs_mismatch(a, b, inverse):
-    """None when the mapped output ``a`` has the layout of the full encode ``b``, else why not.
+    """None if ``a`` has the layout of full encode ``b``, else the reason.
 
-    Values cannot be compared tightly: a compiled tower's numerics depend on its batch size
-    (Gemma-3's SigLIP on an L4: 12% relative between batch 2 and batch 8, while two different
-    images sit about 50% apart). So the check is structural: same tensors and shapes, and every
-    mapped image is nearer to the full encode of its own image than to that of any other.
+    Structural, not tight: compiled towers vary ~12% with batch size, distinct images ~50%.
     """
     ta, tb = _flat_tensors(a, []), _flat_tensors(b, [])
     if len(ta) != len(tb):
@@ -260,11 +242,10 @@ def _outputs_mismatch(a, b, inverse):
             continue
         x, y = x.detach().float(), y.detach().float()
         if x.ndim >= 2 and x.shape[0] == n and len(set(inverse)) > 1:
-            dist = torch.cdist(x.flatten(1), y.flatten(1)).cpu()  # [n mapped, n full]
+            dist = torch.cdist(x.flatten(1), y.flatten(1)).cpu()
             same = groups[:, None] == groups[None, :]
             own = dist.masked_fill(~same, float("inf")).min(1).values
             other = dist.masked_fill(same, float("inf")).min(1).values
-            # <=: two images the tower maps to the same features cannot be told apart, nor need to be.
             if not bool((own <= other).all()):
                 return f"tensor {k} {tuple(x.shape)}: an image is nearer another image's features"
             continue
@@ -360,8 +341,7 @@ def _make_wrapper(module, original):
             return original(*args, **kwargs)
 
         if len(reps) == 1:
-            # Encode the one distinct image twice: torch.compile specialises batch 1, and on a B200
-            # Gemma-3's compiled SigLIP gives batch 1 features 4% off batch 2+, which agree bitwise.
+            # Never encode batch 1: compiled towers specialise it (Gemma-3 SigLIP 4% off on B200).
             reps = reps * 2
             DEDUP_STATS["images_encoded"] += 1
             if rows_u is not None:
@@ -394,8 +374,7 @@ def _make_wrapper(module, original):
             _fallback(module, f"unmappable output: {e}")
             return original(*args, **kwargs)
         if not module.__dict__.get(_VERIFIED, False) and os.environ.get("UNSLOTH_GRPO_IMAGE_DEDUP_VERIFY", "1") != "0":
-            # First use per module: the full encode must agree with the mapped one, or this
-            # model's output layout is not one the mapping understands.
+            # First use per module: self-check the mapping against a full encode.
             with torch.no_grad():
                 full = original(*args, **kwargs)
             reason = _outputs_mismatch(mapped, full, inverse)
@@ -413,8 +392,7 @@ def _make_wrapper(module, original):
 
 
 def _image_modules(model):
-    """Innermost modules carrying ``get_image_features`` (ForConditionalGeneration delegates to its
-    inner model, so wrapping both would fingerprint every batch twice)."""
+    """Innermost ``get_image_features`` owners (wrapping outer + inner would dedup twice)."""
     found = []
     for name, module in model.named_modules():
         if callable(getattr(type(module), "get_image_features", None)):
