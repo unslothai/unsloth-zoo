@@ -109,20 +109,28 @@ pass
 # Mirrors vLLM v1 processed_logprobs (renormalised after min_p, top_k, top_p; sampler.py sample, topk_topp_sampler.py
 # apply_top_k_top_p); scored token always kept so boundary mismatches stay finite; a tied scored token the sort drops
 # swaps in for a kept one, so value and gradient match a kept token.
-def _truncated_support_logps(chunk_logits, chunk_index, top_k, top_p, min_p, triton_sampler = False, excluded_ids = None):
+def _truncated_support_keep(chunk_logits, chunk_index, top_k, top_p, min_p, triton_sampler = False, excluded_ids = None):
+    # The scored kept set (bool [rows, vocab]) of _truncated_support_logps, target included. Shared with the
+    # recompute scorer below, so the two cannot drift.
     index = chunk_index.unsqueeze(-1)
-    selected_logits = torch.gather(chunk_logits, dim = -1, index = index)
     detached = chunk_logits.detach()
+    selected_logits = torch.gather(detached, dim = -1, index = index)
     if excluded_ids is not None:
         # Rows the engine biases to -inf before sampling (suppress_vllm_padded_vocab).
         detached = detached.index_fill(-1, excluded_ids.to(detached.device), float("-inf"))
     keep = _truncated_support_mask(detached, top_k, top_p, min_p, triton_sampler)
     selected_kept = torch.gather(keep, dim = -1, index = index)
     smallest_kept = detached.masked_fill(~keep, float("inf")).amin(dim = -1, keepdim = True)
-    tied = (~selected_kept) & (selected_logits.detach() == smallest_kept)
+    tied = (~selected_kept) & (selected_logits == smallest_kept)
     boundary = (keep & (detached == smallest_kept)).to(torch.int32).argmax(dim = -1, keepdim = True)
     keep = keep.scatter(-1, boundary, torch.gather(keep, dim = -1, index = boundary) & ~tied)
-    keep = keep.scatter(-1, index, torch.ones_like(selected_kept))
+    return keep.scatter(-1, index, torch.ones_like(selected_kept))
+pass
+
+def _truncated_support_logps(chunk_logits, chunk_index, top_k, top_p, min_p, triton_sampler = False, excluded_ids = None):
+    index = chunk_index.unsqueeze(-1)
+    selected_logits = torch.gather(chunk_logits, dim = -1, index = index)
+    keep = _truncated_support_keep(chunk_logits, chunk_index, top_k, top_p, min_p, triton_sampler, excluded_ids)
     # Target excluded from the normaliser (softmax collapse); finfo.min, not -inf, keeps a lone kept target finite.
     others = (chunk_logits - selected_logits).masked_fill(~keep, float("-inf"))
     others = others.scatter(-1, index, torch.full_like(selected_logits, torch.finfo(others.dtype).min))
@@ -631,6 +639,278 @@ def grpo_scorer_keeps_logits(support_kwargs = None, **extra_kwargs):
     )
 
 
+def grpo_kept_set_requested(support_kwargs = None):
+    """True when the support_* kwargs ask for top_k / top_p / min_p / excluded-id kept-set scoring."""
+    support = support_kwargs or {}
+    return bool(
+        support.get("support_top_k", 0)
+        or support.get("support_top_p", 1.0) != 1.0
+        or support.get("support_min_p", 0.0)
+        or support.get("support_excluded_ids") is not None
+    )
+
+
+def _kept_set_rows_per_chunk(vocab_size, max_rows_per_chunk = 0):
+    # The kept-set mask sorts each row (float32 values + int64 order) next to the float32 logits and their
+    # softmax / cumsum, about 30 bytes per logit, so rows are capped near 64M logits per chunk (~2 GB of
+    # transients) whatever the batch. UNSLOTH_GRPO_KEPT_SET_MAX_LOGITS moves the cap.
+    env = os.environ.get("UNSLOTH_GRPO_KEPT_SET_MAX_LOGITS", "").strip()
+    budget = int(env) if env.isdigit() and int(env) > 0 else (1 << 26)
+    rows = max(1, budget // max(int(vocab_size), 1))
+    if max_rows_per_chunk and max_rows_per_chunk > 0:
+        rows = min(rows, int(max_rows_per_chunk))
+    return rows
+
+
+def _pack_bool_rows(mask):
+    # [rows, V] bool -> [rows, ceil(V / 8)] uint8, little-endian bits: 1 bit per logit for the backward.
+    rows, V = mask.shape
+    pad = (-V) % 8
+    if pad:
+        mask = torch.nn.functional.pad(mask, (0, pad))
+    weights = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], dtype = torch.uint8, device = mask.device)
+    return (mask.view(rows, -1, 8).to(torch.uint8) * weights).sum(-1, dtype = torch.uint8)
+
+
+def _unpack_bool_rows(packed, V):
+    shifts = torch.arange(8, dtype = torch.uint8, device = packed.device)
+    bits = (packed.unsqueeze(-1) >> shifts) & 1
+    return bits.view(packed.shape[0], -1)[:, :V].to(torch.bool)
+
+
+def _kept_set_logits(chunk_hidden_states, lm_head, lm_head_bias):
+    chunk_hidden_states = chunk_hidden_states.to(device = lm_head.device, dtype = lm_head.dtype)
+    if lm_head_bias is None:
+        return chunk_hidden_states @ lm_head.t()
+    return torch.nn.functional.linear(chunk_hidden_states, lm_head, lm_head_bias)
+
+
+def _kept_set_transform(logits, scale_multiply, scale_divide, softcapping, temperature):
+    # Same order and dtypes as chunked_hidden_states_selective_log_softmax: scale / softcap in the matmul
+    # dtype, then float32, then the temperature.
+    if scale_multiply != 0.0:
+        logits = logits * scale_multiply
+    if scale_divide != 0.0:
+        logits = logits / scale_divide
+    if softcapping != 0.0:
+        logits = softcapping * torch.tanh(logits / softcapping)
+    logits = logits.to(torch.float32)
+    if temperature != 1.0:
+        logits = logits / temperature
+    return logits
+
+
+def _kept_set_chunk_forward(z, chunk_index, support):
+    # z: float32 [rows, V] scaled logits. Returns the kept-set logp, the kept-set logsumexp and the kept set.
+    top_k, top_p, min_p, triton_sampler, excluded_ids = support
+    keep = _truncated_support_keep(z, chunk_index, top_k, top_p, min_p, triton_sampler, excluded_ids)
+    index = chunk_index.unsqueeze(-1)
+    selected = torch.gather(z, dim = -1, index = index)
+    # Target excluded from the normaliser (softmax collapse), as _truncated_support_logps.
+    others = (z - selected).masked_fill_(~keep, float("-inf"))
+    others.scatter_(-1, index, torch.finfo(others.dtype).min)
+    lse_others = torch.logsumexp(others, dim = -1)
+    del others
+    logp = -torch.nn.functional.softplus(lse_others)
+    # log sum_{kept} exp(z) = z_t + softplus(lse_others): p_j = exp(z_j - lse) on the kept set.
+    lse = selected.squeeze(-1) - logp
+    return logp, lse, keep
+
+
+class _KeptSetLogprobs(torch.autograd.Function):
+    # Kept-set log p(token) = z_t - logsumexp_{kept} z, keeping only per-row logp / logsumexp and a 1-bit kept
+    # set for the backward, which recomputes each chunk's logits (as chunked_hidden_states_selective_log_softmax_recompute
+    # does for the full vocabulary). The kept set is constant in the backward (a detached mask, as before).
+    @staticmethod
+    def forward(ctx, hidden_states, lm_head, lm_head_bias, index, bounds, transforms, support):
+        device_type = lm_head.device.type
+        ctx.autocast_kwargs = dict(
+            device_type = device_type,
+            enabled = torch.is_autocast_enabled(device_type),
+            dtype = torch.get_autocast_dtype(device_type),
+            cache_enabled = torch.is_autocast_cache_enabled(),
+        )
+        logps, lses, packed = [], [], []
+        for a, b in zip(bounds[:-1], bounds[1:]):
+            logits = _kept_set_logits(hidden_states[a:b], lm_head, lm_head_bias)
+            z = _kept_set_transform(logits, *transforms)
+            del logits
+            logp, lse, keep = _kept_set_chunk_forward(z, index[a:b].to(lm_head.device), support)
+            del z
+            logps.append(logp)
+            lses.append(lse)
+            packed.append(_pack_bool_rows(keep))
+            del keep
+        logps = torch.cat(logps)
+        ctx.save_for_backward(hidden_states, lm_head, lm_head_bias, index, torch.cat(lses), logps, torch.cat(packed))
+        ctx.bounds = bounds
+        ctx.transforms = transforms
+        ctx.vocab = lm_head.shape[0]
+        return logps.to(hidden_states.device)
+
+    @staticmethod
+    def backward(ctx, grad_logps):
+        hidden_states, lm_head, lm_head_bias, index, lses, logps, packed = ctx.saved_tensors
+        need_hidden, need_head, need_bias = ctx.needs_input_grad[:3]
+        device = lm_head.device
+        scale_multiply, scale_divide, softcapping, temperature = ctx.transforms
+        grad_logps = grad_logps.to(device = device, dtype = torch.float32)
+        grad_hidden = torch.empty_like(hidden_states) if need_hidden else None
+        grad_head = None
+        grad_bias = torch.zeros(lm_head_bias.shape, dtype = torch.float32, device = device) if need_bias else None
+        head = None
+        mm_out_dtype = hasattr(torch.ops.aten.mm, "dtype") and device.type == "cuda"
+
+        def mm_float32(a, b):
+            nonlocal mm_out_dtype
+            if mm_out_dtype:
+                try:
+                    return torch.mm(a, b, out_dtype = torch.float32)
+                except torch.cuda.OutOfMemoryError:
+                    raise
+                except (TypeError, RuntimeError, NotImplementedError):
+                    mm_out_dtype = False
+            return torch.mm(a.float(), b.float())
+
+        for a, b in zip(ctx.bounds[:-1], ctx.bounds[1:]):
+            chunk_hidden_states = hidden_states[a:b]
+            with torch.no_grad(), torch.autocast(**ctx.autocast_kwargs):
+                logits = _kept_set_logits(chunk_hidden_states, lm_head, lm_head_bias)
+            z = _kept_set_transform(logits, scale_multiply, scale_divide, softcapping, 1.0)
+            if softcapping != 0.0:
+                # The softcap derivative in float32 (autograd took it in the matmul dtype).
+                x = logits.to(torch.promote_types(logits.dtype, torch.float32))
+                if scale_multiply != 0.0:
+                    x = x * scale_multiply
+                if scale_divide != 0.0:
+                    x = x / scale_divide
+                tanh = torch.tanh(x / softcapping)
+                del x
+            logits_dtype = logits.dtype
+            del logits
+            if temperature != 1.0:
+                z = z / temperature
+            keep = _unpack_bool_rows(packed[a:b], ctx.vocab)
+            chunk_index = index[a:b].to(device)
+            # d logp / dz_j = 1[j = t] - p_j over the kept set (0 outside it); the target's 1 - p_t = -expm1(logp).
+            p = torch.exp(z.sub_(lses[a:b].unsqueeze(-1))).masked_fill_(~keep, 0.0)
+            del keep, z
+            g = grad_logps[a:b].unsqueeze(-1)
+            grad_z = p.mul_(-g)
+            del p
+            grad_z.scatter_(-1, chunk_index.unsqueeze(-1), -torch.expm1(logps[a:b]).unsqueeze(-1) * g)
+            if temperature != 1.0:
+                grad_z = grad_z / temperature
+            if softcapping != 0.0:
+                grad_z = grad_z * (1.0 - tanh * tanh)
+                del tanh
+            if scale_divide != 0.0:
+                grad_z = grad_z / scale_divide
+            if scale_multiply != 0.0:
+                grad_z = grad_z * scale_multiply
+            grad_logits = grad_z.to(logits_dtype)
+            del grad_z
+            if head is None:
+                head = lm_head if lm_head.dtype == grad_logits.dtype else lm_head.to(grad_logits.dtype)
+                half_to_float32 = grad_logits.dtype == torch.float16
+            if need_hidden:
+                if half_to_float32 and hidden_states.dtype != torch.float16:
+                    grad_chunk = mm_float32(grad_logits, head)
+                else:
+                    grad_chunk = grad_logits @ head
+                grad_hidden[a:b] = grad_chunk.to(device = hidden_states.device, dtype = hidden_states.dtype)
+                del grad_chunk
+            if need_head:
+                x = chunk_hidden_states.to(device = device, dtype = grad_logits.dtype)
+                if grad_head is None:
+                    same_dtype = lm_head.dtype == grad_logits.dtype and not half_to_float32
+                    grad_head = torch.zeros(
+                        lm_head.shape, device = device,
+                        dtype = grad_logits.dtype if same_dtype else torch.float32,
+                    )
+                if grad_head.dtype == grad_logits.dtype:
+                    grad_head.addmm_(grad_logits.t(), x)
+                elif half_to_float32:
+                    grad_head.add_(mm_float32(grad_logits.t(), x))
+                else:
+                    grad_head.add_(grad_logits.t() @ x)
+            if need_bias:
+                grad_bias.add_(grad_logits.to(torch.float32).sum(0))
+            del grad_logits
+        if need_head:
+            grad_head = grad_head.to(lm_head.dtype)
+        if need_bias:
+            grad_bias = grad_bias.to(lm_head_bias.dtype)
+        return grad_hidden, grad_head, grad_bias, None, None, None, None
+pass
+
+
+def grpo_kept_set_logprobs(
+    hidden_states: torch.Tensor,
+    lm_head: torch.Tensor,
+    index: torch.Tensor,
+    chunks: int = 4,
+    logit_scale_multiply: float = 0.0,
+    logit_scale_divide: float = 0.0,
+    logit_softcapping: float = 0.0,
+    temperature: float = 1.0,
+    max_rows_per_chunk: int = 0,
+    lm_head_bias: Optional[torch.Tensor] = None,
+    support_top_k: int = 0,
+    support_top_p: float = 1.0,
+    support_min_p: float = 0.0,
+    support_triton_sampler: bool = False,
+    support_excluded_ids: Optional[torch.Tensor] = None,
+    fp32_lm_head: bool = False,
+    **unused,
+) -> torch.Tensor:
+    """Kept-set log-probs, bit-equal in the forward to chunked_hidden_states_selective_log_softmax's support
+    branch, in eager row chunks capped near 64M logits; the backward recomputes each chunk's logits from a 1-bit
+    kept set instead of holding float32 [rows, vocab] tensors, and nothing is handed to torch.compile (the
+    fullgraph compile of the sort / cumsum chunk loop took minutes and could fail in Inductor)."""
+    # All Unsloth Zoo code licensed under AGPL3
+    flat_hidden_states = hidden_states.reshape(-1, hidden_states.shape[-1])
+    flat_index = index.reshape(-1)
+    n_rows = flat_hidden_states.shape[0]
+    rows_cap = _kept_set_rows_per_chunk(lm_head.shape[0], max_rows_per_chunk)
+    chunks = max(int(chunks), -(-n_rows // rows_cap), 1)
+    chunks = max(1, min(chunks, n_rows))
+    bounds = tuple((i * n_rows) // chunks for i in range(chunks + 1))
+    transforms = (float(logit_scale_multiply), float(logit_scale_divide), float(logit_softcapping), float(temperature))
+    support = (int(support_top_k), float(support_top_p), float(support_min_p), bool(support_triton_sampler), support_excluded_ids)
+    _GRPO_TRUNCATED_SUPPORT_STATS["kept_set_recompute"] = _GRPO_TRUNCATED_SUPPORT_STATS.get("kept_set_recompute", 0) + 1
+    if fp32_lm_head:
+        lm_head = lm_head.to(torch.float32)
+        if lm_head_bias is not None:
+            lm_head_bias = lm_head_bias.to(torch.float32)
+    autocast_off = torch.autocast(device_type = lm_head.device.type, enabled = False) if fp32_lm_head else None
+    needs_grad = torch.is_grad_enabled() and (
+        flat_hidden_states.requires_grad or lm_head.requires_grad
+        or (lm_head_bias is not None and lm_head_bias.requires_grad)
+    )
+    from contextlib import nullcontext
+    with autocast_off if autocast_off is not None else nullcontext():
+        if needs_grad:
+            logps = _KeptSetLogprobs.apply(
+                flat_hidden_states, lm_head, lm_head_bias, flat_index, bounds, transforms, support,
+            )
+        else:
+            # Scoring only (old / ref logps): no kept set is stored.
+            out = []
+            with torch.no_grad():
+                for a, b in zip(bounds[:-1], bounds[1:]):
+                    logits = _kept_set_logits(flat_hidden_states[a:b], lm_head, lm_head_bias)
+                    z = _kept_set_transform(logits, *transforms)
+                    del logits
+                    logp, _, _ = _kept_set_chunk_forward(z, flat_index[a:b].to(lm_head.device), support)
+                    del z
+                    out.append(logp.to(hidden_states.device))
+            logps = torch.cat(out)
+    return logps.reshape(hidden_states.shape[0], hidden_states.shape[1])
+pass
+RL_REPLACEMENTS["grpo_kept_set_logprobs"] = grpo_kept_set_logprobs
+
+
 def grpo_chunked_hidden_states_logprobs(
     hidden_states: torch.Tensor,
     lm_head: torch.Tensor,
@@ -647,6 +927,21 @@ def grpo_chunked_hidden_states_logprobs(
     # All Unsloth Zoo code licensed under AGPL3
     # No-grad scoring runs the same kernel, so a policy ratio starts at 1.
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
+    if grpo_kept_set_requested(extra_kwargs) and os.environ.get("UNSLOTH_GRPO_KEPT_SET_RECOMPUTE", "1") != "0":
+        # Kept-set scoring: recompute in backward, no float32 logits held, no fullgraph compile.
+        if max_rows_per_chunk is None:
+            env_rows = os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip()
+            max_rows_per_chunk = int(env_rows) if env_rows.isdigit() else 0
+        kwargs = dict(extra_kwargs)
+        kwargs.setdefault(
+            "fp32_lm_head",
+            os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes"),
+        )
+        return grpo_kept_set_logprobs(
+            hidden_states, lm_head, index, chunks,
+            logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
+            max_rows_per_chunk = max_rows_per_chunk, lm_head_bias = lm_head_bias, **kwargs,
+        )
     if grpo_scorer_keeps_logits(extra_kwargs):
         kwargs = dict(extra_kwargs)
         if max_rows_per_chunk is not None:
@@ -3244,8 +3539,10 @@ def grpo_accumulated_loss(
             from unsloth_zoo.rl_replacements import _GRPO_TRUNCATED_SUPPORT_STATS as _support_stats
             _support_stats["on"] += 1
             if os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1":
-                # The recompute helper scores the full vocabulary only, so the kept set uses the plain helper
-                from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax
+                # The recompute helper scores the full vocabulary only, so the kept set uses the GRPO dispatcher
+                from unsloth_zoo.rl_replacements import (
+                    grpo_chunked_hidden_states_logprobs as chunked_hidden_states_selective_log_softmax,
+                )
                 if not getattr(trainer, "_unsloth_truncated_support_recompute_warned", False):
                     from unsloth_zoo.log import logger as _zoo_logger
                     _zoo_logger.warning(

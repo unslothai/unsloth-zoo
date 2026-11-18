@@ -319,13 +319,18 @@ def test_rows_honour_the_opt_in_128_row_alignment(monkeypatch):
     assert cl.chunked_logprob_rows(1000, target_gb = 1.0, n_rows = 8 * 700) == 700
 
 
-@pytest.mark.parametrize("extra", [{"support_top_k": 4}, {"support_top_p": 0.9}, {"fp32_lm_head": True}])
-def test_grpo_route_hands_support_and_fp32_head_calls_to_the_old_function(monkeypatch, extra):
+@pytest.mark.parametrize("extra, target", [
+    ({"support_top_k": 4}, "grpo_kept_set_logprobs"),
+    ({"support_top_p": 0.9}, "grpo_kept_set_logprobs"),
+    ({"fp32_lm_head": True}, "chunked_hidden_states_selective_log_softmax"),
+])
+def test_grpo_route_hands_support_and_fp32_head_calls_to_their_scorers(monkeypatch, extra, target):
+    # Kept-set calls take the recompute kept-set scorer, an fp32 head the old chunked function.
     seen = []
-    monkeypatch.setattr(rr, "chunked_hidden_states_selective_log_softmax", lambda *a, **k: seen.append(k) or "old")
+    monkeypatch.setattr(rr, target, lambda *a, **k: seen.append(k) or "routed")
     hidden = torch.randn(1, 4, 8, requires_grad = True)
     out = rr.grpo_chunked_hidden_states_logprobs(hidden, torch.randn(16, 8), torch.randint(0, 16, (1, 4)), **extra)
-    assert out == "old" and all(seen[0][k] == v for k, v in extra.items())
+    assert out == "routed" and all(seen[0][k] == v for k, v in extra.items())
 
 
 def test_masked_logprobs_forwards_max_rows_per_chunk(monkeypatch):
