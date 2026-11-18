@@ -129,7 +129,8 @@ def test_softcap_and_excluded_ids_match_float64_oracle(temperature, top_k, top_p
 
 @pytest.mark.parametrize("temperature, top_k, top_p, min_p", CASES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_matches_the_plain_helper_support_branch(temperature, top_k, top_p, min_p, dtype):
+@pytest.mark.parametrize("triton_sampler", [False, True])
+def test_matches_the_plain_helper_support_branch(temperature, top_k, top_p, min_p, dtype, triton_sampler):
     # Same kept set and tie rules as chunked_hidden_states_selective_log_softmax's support branch (main's scorer),
     # at the half dtypes training runs in: forward equal, gradients equal to rounding.
     hidden, head, index, _ = _inputs(dtype = dtype, seed = 5)
@@ -139,9 +140,14 @@ def test_matches_the_plain_helper_support_branch(temperature, top_k, top_p, min_
     w2 = head.clone().requires_grad_(True)
     old_fn = getattr(rr.chunked_hidden_states_selective_log_softmax, "__wrapped__",
                      rr.chunked_hidden_states_selective_log_softmax)
+    if triton_sampler:
+        # Ties at the top-k boundary and a uniform row: where the Triton kept-set rules differ.
+        hidden[0, 0] = 0.0
+        h1 = hidden.clone().requires_grad_(True)
+        h2 = hidden.clone().requires_grad_(True)
     old = old_fn(h1, w1, index, 4, 0.0, 0.0, 0.0, temperature, support_top_k = top_k, support_top_p = top_p,
-                 support_min_p = min_p, fused_linear = False)
-    new = _new(h2, w2, index, temperature, top_k, top_p, min_p)
+                 support_min_p = min_p, support_triton_sampler = triton_sampler, fused_linear = False)
+    new = _new(h2, w2, index, temperature, top_k, top_p, min_p, support_triton_sampler = triton_sampler)
     torch.testing.assert_close(new, old, atol = 0, rtol = 0)
     old.sum().backward()
     new.sum().backward()
