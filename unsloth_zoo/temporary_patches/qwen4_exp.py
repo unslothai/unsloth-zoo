@@ -386,6 +386,11 @@ def _qwen4_exp_cached_decode(module, hidden_states, position_embeddings, attenti
         output_attentions = getattr(module.config, "output_attentions", False)
     if output_attentions or (module.training and module.attention_dropout):
         return None
+    # Dynamic / longrope RoPE recompute inv_freq as the context grows, re-rotating every position; the cached
+    # block keys keep the old rotation, so those configs keep the reference (which re-pools every step).
+    rope_type = (getattr(module.config, "rope_parameters", None) or {}).get("rope_type", "default")
+    if "dynamic" in str(rope_type) or rope_type == "longrope":
+        return None
     if not isinstance(attention_mask, torch.Tensor) or attention_mask.dim() != 4 or attention_mask.shape[1] != 1:
         return None
     indexer = module.indexer

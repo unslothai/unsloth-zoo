@@ -224,11 +224,13 @@ def _assert_matches(model, ids, mask, logits, monkeypatch, dtype, filled):
 
 
 def _run(monkeypatch, *, lengths, steps, greedy = True, dtype = torch.float32, attn = "sdpa", lora = None,
-         kill = False, device = "cpu"):
+         kill = False, device = "cpu", rope_type = None):
     total = max(lengths) + sum(steps)
     ids, mask, prompt = _batch(lengths, total)
     ids, mask = ids.to(device), mask.to(device)
     model = _model(dtype, attn, lora = lora is not None).to(device)
+    if rope_type is not None:
+        model.config.rope_parameters = {**(model.config.rope_parameters or {}), "rope_type": rope_type}
     if lora is not None:
         _set_adapters(model, lora)
     if kill:
@@ -395,3 +397,10 @@ def test_ties_keep_the_count(patched):
 def test_cuda_decode_equals_full_recompute(patched, dtype):
     engaged, record = _run(patched, lengths = [40, 33], steps = [1] * 16 + [3, 5], dtype = dtype, device = "cuda")
     assert engaged == 36 == len(record)
+
+
+@pytest.mark.parametrize("rope_type", ["dynamic", "longrope"])
+def test_dynamic_rope_keeps_the_reference(patched, rope_type):
+    # These RoPE types re-rotate past positions as the context grows; cached block keys would keep the old rotation.
+    engaged, record = _run(patched, lengths = [30, 25], steps = [1] * 8 + [3], rope_type = rope_type)
+    assert engaged == 0 and record == []
