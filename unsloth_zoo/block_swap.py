@@ -29,6 +29,7 @@ import gc
 import importlib
 import itertools
 import tempfile
+import stat
 import time
 import weakref
 
@@ -142,10 +143,24 @@ def _rank_ledger():
         uid = os.getuid() if hasattr(os, "getuid") else 0
         # The launcher is every local rank's parent: a later launch on the same port gets a fresh directory.
         path = os.path.join(tempfile.gettempdir(), f"unsloth_block_swap_{uid}_{job}_{os.getppid()}")
-        os.makedirs(path, exist_ok = True)
+        os.makedirs(path, mode = 0o700, exist_ok = True)
+        if not _private_dir(path):
+            # The name is predictable in a shared temp dir: another OS user may have made it (or a link to one).
+            return None
         return path, int(rank), world
     except (OSError, ValueError):
         return None
+
+
+def _private_dir(path):
+    """True if `path` is a real directory owned by this user that no one else can write to."""
+    if os.name == "nt" or not hasattr(os, "getuid"):
+        return True  # The temp dir is per user there.
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not (st.st_mode & 0o022)
 
 
 def _publish_host_pending(nbytes):
@@ -177,6 +192,7 @@ def _others_host_pending(own):
         try:
             with open(os.path.join(path, str(r))) as f:
                 session, nbytes = (int(x) for x in f.read().split())
+            nbytes = max(0, nbytes)
         except (OSError, ValueError):
             session, nbytes = -1, 0
         # A peer still in an earlier session (loading while this rank already installs) keeps what it published:
