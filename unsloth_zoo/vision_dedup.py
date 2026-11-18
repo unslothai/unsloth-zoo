@@ -26,6 +26,7 @@ __all__ = [
     "DEDUP_STATS",
 ]
 
+import functools
 import inspect
 import logging
 import os
@@ -268,6 +269,10 @@ def _make_wrapper(module, original):
     except (TypeError, ValueError):
         signature = None
 
+    # transformers >= 5.23 generate reads this method's signature to pick the encoder inputs it pops
+    # (_prepare_multimodal_encoder_kwargs_for_generation): keep the original's, else pixel_values stays beside
+    # mm_encoder_outputs and the forward raises.
+    @functools.wraps(original)
     def get_image_features(*args, **kwargs):
         if signature is None or not image_dedup_enabled() or module.__dict__.get(_DISABLED, False):
             return original(*args, **kwargs)
@@ -408,7 +413,7 @@ def _image_modules(model):
 
 def install_image_dedup(model):
     """Wrap the innermost ``get_image_features`` of ``model`` once. Returns the number wrapped."""
-    if model is None or not isinstance(model, torch.nn.Module):
+    if model is None or not isinstance(model, torch.nn.Module) or not image_dedup_enabled():
         return 0
     if model.__dict__.get(_SCANNED, False):
         return 0

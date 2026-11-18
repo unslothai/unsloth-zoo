@@ -188,3 +188,29 @@ def test_self_check_catches_a_wrong_mapping():
     assert vision_dedup._outputs_mismatch(noisy, full, inverse) is None
     swapped = full[[2, 3, 0, 1]]
     assert vision_dedup._outputs_mismatch(swapped, full, inverse) is not None
+
+
+@pytest.mark.parametrize("key", list(MODELS))
+def test_wrapper_keeps_signature_and_generate_runs(key, monkeypatch):
+    # transformers >= 5.23 generate pops encoder inputs by get_image_features' signature: a (*args, **kwargs)
+    # wrapper left pixel_values beside mm_encoder_outputs and every vision generate raised.
+    import inspect
+    proc, model = _load(key)
+    owners = vision_dedup._image_modules(model)
+    before = [inspect.signature(m.get_image_features) for m in owners]
+    assert vision_dedup.install_image_dedup(model) == len(owners) > 0
+    assert [inspect.signature(m.get_image_features) for m in owners] == before
+    inputs = _batch(proc, prompts = 1)
+    tok = getattr(proc, "tokenizer", proc)
+    tok.padding_side = "left"
+    inputs = proc(text = [proc.apply_chat_template([{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Hi"}]}], add_generation_prompt = True)],
+                  images = [[Image.new("RGB", (64, 64), (200, 30, 30))]], return_tensors = "pt")
+    out = model.generate(**inputs, max_new_tokens = 2, do_sample = False)
+    assert out.shape[1] == inputs["input_ids"].shape[1] + 2
+
+
+def test_kill_switch_skips_install(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_GRPO_IMAGE_DEDUP", "0")
+    _, model = _load("qwen2_5_vl")
+    assert vision_dedup.install_image_dedup(model) == 0
+    assert all(not m.__dict__.get(vision_dedup._INSTALLED, False) for m in vision_dedup._image_modules(model))
