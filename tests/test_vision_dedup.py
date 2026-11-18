@@ -192,8 +192,7 @@ def test_self_check_catches_a_wrong_mapping():
 
 @pytest.mark.parametrize("key", list(MODELS))
 def test_wrapper_keeps_signature_and_generate_runs(key, monkeypatch):
-    # transformers >= 5.23 generate pops encoder inputs by get_image_features' signature: a (*args, **kwargs)
-    # wrapper left pixel_values beside mm_encoder_outputs and every vision generate raised.
+    # transformers >= 5.23 generate pops encoder inputs by get_image_features' signature.
     import inspect
     proc, model = _load(key)
     owners = vision_dedup._image_modules(model)
@@ -217,7 +216,7 @@ def test_kill_switch_skips_install(monkeypatch):
 
 
 def test_collective_sharded_forwards_never_dedup(monkeypatch):
-    # FSDP2 towers that reshard after forward all-gather per call; rank-local extra forwards would hang the ranks.
+    # Resharding FSDP2 towers all-gather per forward; rank-local extra forwards would hang.
     import unsloth_zoo.rl_replacements as rr
     _, model = _load("qwen2_5_vl")
     monkeypatch.setattr(rr, "grpo_forwards_are_collective", lambda m: True)

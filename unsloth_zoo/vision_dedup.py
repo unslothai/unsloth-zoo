@@ -264,8 +264,7 @@ def _fallback(module, reason):
 
 
 def _collective(module):
-    # Sharded FSDP2 towers all-gather per forward: the self-check's extra forward (only on ranks whose micro-batch
-    # repeats an image) would desynchronize the collectives, so those layouts always encode per row.
+    # Resharding FSDP2 towers all-gather per forward; a rank-local self-check forward would hang the other ranks.
     try:
         from unsloth_zoo.rl_replacements import grpo_forwards_are_collective
         return grpo_forwards_are_collective(module)
@@ -279,9 +278,7 @@ def _make_wrapper(module, original):
     except (TypeError, ValueError):
         signature = None
 
-    # transformers >= 5.23 generate reads this method's signature to pick the encoder inputs it pops
-    # (_prepare_multimodal_encoder_kwargs_for_generation): keep the original's, else pixel_values stays beside
-    # mm_encoder_outputs and the forward raises.
+    # transformers >= 5.23 generate pops encoder inputs by this signature; (*args, **kwargs) breaks vision generate.
     @functools.wraps(original)
     def get_image_features(*args, **kwargs):
         if (
