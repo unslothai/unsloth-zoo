@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""patch_param_wrapper_for_moe runs from whichever moe_utils copy is current: the package, or the compiled-cache copy
-under UNSLOTH_COMPILE_LOCATION. When the location moves in one process, a fresh copy patches over the previous copy's
-patched forward. It must keep PEFT's own forward as its original, not the other copy's patched one: a nested chain
-runs the separated-LoRA forward twice, and a routed forward that calls the original recursed without end."""
+"""patch_param_wrapper_for_moe must keep PEFT's forward as original, not another copy's patched one."""
 
 import sys
 

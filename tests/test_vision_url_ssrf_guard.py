@@ -722,8 +722,7 @@ def test_an_inline_data_playlist_never_reaches_the_decoder(monkeypatch, no_netwo
         "data:application/vnd.apple.mpegurl;base64;ignored=value",
         "data:video/mp4;BASE64;charset=utf-8",
         "data:video/mp4;charset=utf-8;base64;x=y",
-        # FFmpeg compares with av_strncasecmp over the parameter's own length, so a prefix
-        # of "base64", even an empty parameter, also selects base64.
+        # FFmpeg compares by parameter length, so any base64 prefix, even empty, selects it.
         "data:video/mp4;bas;x=y",
         "data:video/mp4;;x=y",
     ],

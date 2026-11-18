@@ -1531,8 +1531,7 @@ def test_warm_inference_builds_the_pipeline_a_verify_block_launches(qwen_4bit, q
     launched, outputs, evaluated, block_fn, evaluate = [], [], [], inference._verify_gdn_block, mx.eval
 
     def recorded(*args, **variant):
-        # The template arguments a call picks (LMAX and TY are constants): input dtypes, taps, heads, head widths and
-        # the q/k norm and gate variant.
+        # Launch template args: input dtypes, taps, heads, head widths, q/k norm and gate.
         launched.append((*(x.dtype for x in args if isinstance(x, mx.array)), args[1].shape[1], args[6].shape[2],
                          args[-1], args[6].shape[3], args[-2].shape[3], variant.get("l2"), variant.get("sigmoid")))
         outputs.append(block_fn(*args, **variant))
@@ -3217,8 +3216,7 @@ def test_a_dflash_block_drafted_before_its_acceptance_is_read_drafts_and_caches_
     from unsloth_zoo.mlx import inference
     placed, in_place = [], inference._append_in_place
     monkeypatch.setattr(inference, "_append_in_place", lambda *args: placed.append(got := in_place(*args)) or got)
-    # A short window, so the rows rotate out of the ring within the test; built as loaded, so its projections round
-    # each row alike however many rows they read.
+    # Short window: rows rotate out in the test; as loaded, projections round each row alike.
     drafter = speculative._built(ContextDrafter, _tiny_companion(model, "incoai/Qwen3.8-27B-DFlash2", sliding_window = 24), model.language_model, quantize = True)
     assert drafter.predraft_rows == 23
     mx.random.seed(0)

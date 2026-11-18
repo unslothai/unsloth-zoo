@@ -53,8 +53,7 @@ def _tiny_model(impl, seed = 0):
     DeepseekV41TextConfig = impl.TextConfig
     DeepseekV41ForCausalLM = impl.modeling.DeepseekV41ForCausalLM
 
-    # Real schedule kinds: sliding-only, ratio-2 KV source, ratio-2 Reindex source, ratio-1 KV + candidate source,
-    # ratio-1 index source using the candidates.
+    # Covers the real schedule kinds (sliding-only, ratio-1 and ratio-2 KV and index sources).
     config = DeepseekV41TextConfig(
         vocab_size = 256, hidden_size = 64, num_hidden_layers = 6, num_attention_heads = 2, head_dim = 64,
         qk_rope_head_dim = 16, q_lora_rank = 32, o_groups = 2, o_lora_rank = 16, moe_intermediate_size = 32,
@@ -122,9 +121,8 @@ def test_gradient_checkpointing_replays_group_state(impl):
 
 
 def test_checkpointed_layers_keep_the_compile_stance(impl, monkeypatch):
-    # The layers used to run under set_stance("force_eager"); with torch.compile on, a helper that also runs outside
-    # the layers (the final norm, the mHC head) then ran compiled there and was skipped inside, and the recompute
-    # check failed. Both passes now run with whatever stance the caller set.
+    # Layers keep the caller's stance, not force_eager: a helper also used outside must compile
+    # alike.
     _patches()
     from torch._dynamo import eval_frame
     modeling = impl.modeling

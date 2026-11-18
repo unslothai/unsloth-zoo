@@ -127,9 +127,7 @@ def test_unverified_source_is_rejected(monkeypatch):
     monkeypatch.setattr(F, "_STATIC_CLASSES", None)
 
 
-# The patched gpt-oss model generating with a static cache (CUDA: the attention patch needs flex attention):
-# fast update on vs off gives the same tokens and bit-identical logits; the fast path runs on every decode
-# step of every layer once the window is full.
+# Static-cache generation: fast update on and off give the same tokens and bit-identical logits.
 _GEN = textwrap.dedent('''
     import json, os, sys
     os.environ.setdefault("UNSLOTH_MODEL_NAME", "unsloth/gpt-oss-test")

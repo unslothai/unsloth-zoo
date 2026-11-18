@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Vision GRPO through grpo_accumulated_loss: the fused forward-gradient route (fused_linear_grpo_loss) against the
-log-prob route on a Qwen2-VL shaped batch (flattened patch rows, image_grid_thw, num_images with 0 / 1 / 2 images
-per row), and both against an unchunked pass and a per-row float64 reference: per-token ratios, loss and every
-gradient, the vision projector's included."""
+"""Qwen2-VL-shaped GRPO: fused_linear_grpo_loss must match the log-prob route and float64 reference."""
 import os
 import types
 

@@ -13,9 +13,8 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""gpt-oss fused MoE glue: dispatch (kill switch, dtype, device), the eager references the GPU self-check compares
-against equal the chain grouped_qlora_forward ships, and the combine fallback keeps its bits. CPU; the kernels
-themselves are covered on GPU by tests/test_gpt_oss_grouped_qlora.py."""
+"""gpt-oss fused MoE glue on CPU: dispatch (kill switch, dtype, device), eager references matching
+grouped_qlora_forward, and the combine fallback keeping its bits."""
 import os
 import types
 

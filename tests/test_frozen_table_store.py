@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Disk-backed frozen tables: gather == F.embedding oracle, madvise ranges, fp8 + e8m0 planes, a
-parameter-free module, memo reuse under gradient checkpointing, and a tiny Qwen4Exp load that never
-reads the n-gram shards yet matches a normal load bit for bit."""
+"""Disk-backed frozen tables; a tiny Qwen4Exp load never reads n-gram shards yet matches normal load."""
 
 import json
 import mmap

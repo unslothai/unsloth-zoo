@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""torch <= 2.14 flex_decoding read the query's strides before Inductor froze its layout (pytorch/pytorch#198543, fixed
-in 2.15): a query made by a pointwise op on a permuted [B, S, H, D] view (RoPE, scaling) inside the same compiled
-graph is read at the wrong offsets once 1 < q_len < 128. zoo stays clear of it: one-row decode reads no query stride
-but the head / batch ones (identical under both layouts), and longer short queries take the main kernel
-(PREFILL_KERNEL_OPTIONS). Both are checked here inlined into an enclosing compile, against float32 SDPA."""
+"""Checks zoo avoids the torch <= 2.14 flex_decoding query stride bug (pytorch/pytorch issue 198543,
+fixed in 2.15): one-row decode reads no query stride; longer short queries use the main kernel."""
 
 import pytest
 import torch

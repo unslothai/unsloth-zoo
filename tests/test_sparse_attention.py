@@ -872,9 +872,8 @@ def _compiled_graphs(fn, *args):
 
 @pytest.mark.parametrize("with_sink", [True, False])
 def test_compiled_chunked_reference_is_one_op_and_matches_fp64(monkeypatch, with_sink):
-    # The torch path (T4 / sm75, CPU) under torch.compile: the chunk loop unrolled into the graph (one checkpoint HOP
-    # and one inductor index simplification per chunk) took minutes per layer to compile; it is one opaque op whose
-    # backward recomputes chunk by chunk.
+    # Torch path (T4 / sm75, CPU) is one opaque op under torch.compile: unrolling the chunk loop
+    # into the graph took minutes per layer to compile; backward recomputes per chunk.
     q, kv, sink, idxs = _inputs(1, 24, 2, 8, 20, 6, torch.float64, "cpu", empty_rows = [(0, 5)])
     sink = sink.double() if with_sink else None
     go = torch.randn(1, 24, 2, 8, dtype = torch.float64)

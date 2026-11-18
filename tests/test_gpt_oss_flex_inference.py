@@ -471,9 +471,8 @@ def test_inference_gates_cpu(monkeypatch):
 
 
 def test_decode_padding_layout_is_stable_as_the_window_rolls_cpu(monkeypatch):
-    # One-token steps of a sliding layer past its window: generate() widens the 2D mask by a column per step and the
-    # host kv_offset moves with it. The tensors the BlockMask's graph contract carries must keep their shapes and
-    # strides (a decode graph keys on them), or every step re-captures.
+    # Graph-contract tensors must keep shape and stride as the window rolls, or each step
+    # re-captures.
     from torch.nn.attention.flex_attention import create_block_mask
     from transformers.masking_utils import sliding_window_causal_mask_function
     import unsloth_zoo.flex_attention.utils as U

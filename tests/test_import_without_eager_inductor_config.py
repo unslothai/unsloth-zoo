@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
-"""torch 2.4 does not load torch._inductor.config on `import torch`, so module-scope reads of it must import it first.
-Each case runs in a fresh interpreter that unloads the config before importing unsloth_zoo, mimicking torch 2.4 on
-any torch version."""
+"""torch 2.4 does not load torch._inductor.config on import; module-scope reads must import it."""
 
 import os
 import pathlib

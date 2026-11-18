@@ -141,8 +141,7 @@ def test_swap_between_generations_rebuilds(proj, what):
 @pytest.mark.parametrize("proj", ["gate_up_projs", "down_projs"])
 @pytest.mark.parametrize("what", ["module", "weight"])
 def test_registered_replacement_inside_an_epoch_rebuilds(proj, what):
-    # setattr of a Module / Parameter (how PEFT merges and unloads replace layers) starts a new epoch, even on the
-    # same cache between two one-token steps.
+    # Setattr of a Module or Parameter (PEFT merge/unload) starts a new epoch, even mid-cache.
     ex = _Experts(True).eval()
     mid = E // 2
     cache = _Cache()
@@ -226,8 +225,7 @@ def test_registration_after_the_steps_epoch_capture_rebuilds(proj, what):
 @needs_cuda
 @pytest.mark.parametrize("proj", ["gate_up_projs", "down_projs"])
 def test_in_place_change_before_a_cache_reset_rebuilds(proj):
-    # quant_state surgery in place registers nothing; the next generation (here: the reused cache's reset) checks
-    # every expert again.
+    # In-place quant_state edits register nothing; the next cache reset rechecks all experts.
     cache_utils = pytest.importorskip("transformers.cache_utils")
     ex = _Experts(True).eval()
     mid = E // 2

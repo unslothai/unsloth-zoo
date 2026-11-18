@@ -13,14 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Qwen3-MoE and Gemma 4 forced float32 patches must not outlive the load that installed them.
-
-Same bug class as Gemma 3 (test_gemma3_forced_float32_undo.py): the loader sets UNSLOTH_FORCE_FLOAT32
-per load and reruns every temporary patch, but these patches only returned early on "0". An fp16 load
-followed by a bf16 load kept the forced forwards, and the bf16 model raised "expected m1 and m2 to have
-the same dtype, but got: c10::Half != c10::BFloat16". Each scenario runs in its own process because the
-patches are process global.
-"""
+"""Qwen3-MoE and Gemma 4 float32 patches must not outlive the load that set UNSLOTH_FORCE_FLOAT32."""
 
 import json
 import os

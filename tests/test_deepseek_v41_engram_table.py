@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4.1's engram tables streamed from the checkpoint (the frozen table store) instead of loaded into
-host RAM: a tiny model, bf16 and fp8 + e8m0 tables, loaded in disk mode matches the reference load bit for bit and
-never reads a table tensor. Run against every implementation on the path (tests/_dsv41_impl.py): the community
-transformers port (reference: its own DeepseekV41EngramEmbedding, UNSLOTH_FROZEN_TABLE=gpu) and Unsloth's native
-module (parameter-free tables in every mode; reference: the gpu-mode table materialized on the device)."""
+"""DeepSeek-V4.1 engram tables stream from the checkpoint; disk mode never reads a table tensor and
+matches the reference bit for bit; the port reference uses UNSLOTH_FROZEN_TABLE=gpu."""
 
 import json
 import os
@@ -229,10 +226,9 @@ def test_disk_engram_matches_the_ports_table(tiny_dsv41, monkeypatch, kind):
     if NATIVE:
         assert not [k for k in model.state_dict() if "engram_tables" in k]
         return
-    # The export. A bf16 table: zero-copy views under the port's names. An fp8 table on a dequantized load (no GPU
-    # here, so transformers dequantizes): the model holds decoded rows and drops its quantization config, so fp8
-    # rows + scales would reload as raw rows. Outside a full save nothing is exported (an adapter save must not
-    # decode the table); inside one, the decoded rows equal the port's dequantized table.
+    # Outside a full save nothing is exported (adapter saves never decode the table); inside one,
+    # bf16 is zero-copy and fp8 exports decoded rows equal to the port dequantized table, since fp8
+    # rows plus scales would reload raw.
     sd = model.state_dict()
     if kind == "bf16":
         assert {k for k in sd if "engram_tables" in k} == {f"{t}.weight" for t in TABLES}
