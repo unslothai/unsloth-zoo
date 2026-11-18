@@ -8788,11 +8788,43 @@ def _projects(linear):
     return int(linear.weight.shape[-2]) > 1
 
 
+_WEIGHT_READERS = weakref.WeakKeyDictionary()
+
+
+def _weights_read_in_call(cls):
+    """Child names whose `.weight` a `__call__` in cls's MRO reads directly, as ERNIE 5.5's HCA compressor does."""
+    names = _WEIGHT_READERS.get(cls)
+    if names is None:
+        names = set()
+        for klass in cls.__mro__:
+            call = klass.__dict__.get("__call__")
+            try:
+                tree = ast.parse(textwrap.dedent(inspect.getsource(call)))
+            except (OSError, TypeError, SyntaxError):
+                continue
+            names.update(
+                node.value.attr for node in ast.walk(tree)
+                if isinstance(node, ast.Attribute) and node.attr == "weight"
+                and isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name) and node.value.value.id == "self"
+            )
+        _WEIGHT_READERS[cls] = names = frozenset(names)
+    return names
+
+
+def _adaptable(root, path):
+    """False when the owner's `__call__` reads the linear's weight directly, where an adapter would raise."""
+    parent_path, _, leaf = str(path).rpartition(".")
+    owner = _navigate(root, parent_path) if parent_path else root
+    return leaf not in _weights_read_in_call(type(owner))
+
+
 def _role_selected_paths(module, attention, mlp, skip_subtrees=()):
     """``module``'s linears by role, one whose role cannot be read left alone."""
     wanted = {"attention": attention, "mlp": mlp}
     paths = [path for path, linear in _subtree_linears(module)
-             if not _under_any(path, skip_subtrees) and _projects(linear)]
+             if not _under_any(path, skip_subtrees) and _projects(linear)
+             and _adaptable(module, path)]
     roles = {path: _linear_role(path) for path in paths}
     # A projection naming no role takes the role of the linears beside it, where
     # those agree; a patch embedding sits alone, so nothing lends it one.
@@ -9022,7 +9054,7 @@ def _resolve_lora_keys(model, target_modules):
         for name, module in root.named_modules():
             if not _is_mlx_lora_base(module, specs):
                 continue
-            if _lora_name_matches_target(name, target_modules):
+            if _lora_name_matches_target(name, target_modules) and _adaptable(root, name):
                 keys.add(name)
 
     return keys

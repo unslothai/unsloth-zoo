@@ -92,7 +92,7 @@ def _class_namespace(cls):
     return vars(cls)
 
 
-def _resolved_bindings(contract):
+def _resolved_bindings(contract, *, report=True):
     """Resolve a `{module: {dotted name: fingerprint}}` contract, None pinning the name not the body.
 
     A fingerprint may be a tuple of alternatives, for a body that differs across the supported
@@ -134,11 +134,17 @@ def _resolved_bindings(contract):
                         found[id(source.__globals__), alias] = (source.__globals__, alias, mod)
             else:
                 holds = False
-                if (module_name, path) not in _CONTRACT_MISSES:
+                if report and (module_name, path) not in _CONTRACT_MISSES:
                     _CONTRACT_MISSES.add((module_name, path))
                     logger.warning("%s.%s differs from the version the MLX fusions were written "
                                    "against; the native method stays in use", module_name, path)
     return list(found.values()) if holds else None
+
+
+def _first_resolved(contracts):
+    """The first of several accepted contracts that resolves; only when none does is the newest one's miss reported."""
+    found = next(filter(None, (_resolved_bindings(contract, report=False) for contract in contracts)), None)
+    return found if found is not None else _resolved_bindings(contracts[-1])
 
 
 def _exact_route_native(function):
@@ -274,7 +280,7 @@ _MOE_GATE_UP_FUNCTIONS = {
 }
 _MOE_SWITCH_GLU_CALLS = {
     "mlx_lm.models.switch_layers": ("ed00798a68bad37d", "3a412610c5b9c112"),
-    "mlx_vlm.models.switch_layers": ("ed00798a68bad37d", "4e3d80f1396fb265"),
+    "mlx_vlm.models.switch_layers": ("ed00798a68bad37d", "4e3d80f1396fb265", "b3f8c684857eb8fe"),
 }
 
 
@@ -312,6 +318,9 @@ def _moe_gate_up_packable(module, projection_type):
     if gate.trainable_parameters() or up.trainable_parameters():
         return False
     if gate.get("global_scale") is not None or up.get("global_scale") is not None:
+        return False
+    # mlx-vlm 0.8.0 sorts the routes of a rank's share of the experts on its own threshold.
+    if getattr(module, "num_experts", gate.num_experts) != gate.num_experts:
         return False
     if (gate.group_size, gate.bits, gate.mode) != (up.group_size, up.bits, up.mode):
         return False
@@ -9268,7 +9277,12 @@ def draft_tree_accept(tree, target):
         output_shapes = [tree.tokens.shape, (2,)], output_dtypes = [mx.int32, mx.int32]))
 
 
-_DRAFT_LAYER_CONTRACT = {_DFLASH2: {"DFlash2DecoderLayer.__call__": "c1adba4d305aaa16"}}
+# mlx-vlm 0.8.0 moved the layer body into `_forward` and skips rotary on `no_rope_layers`.
+_DRAFT_LAYER_CONTRACTS = (
+    {_DFLASH2: {"DFlash2DecoderLayer.__call__": "c1adba4d305aaa16"}},
+    {_DFLASH2: {"DFlash2DecoderLayer.__call__": "a4bee3318356a55e", "DFlash2DecoderLayer._forward": "8f2e068c3f777518",
+                "_no_rope": "54053377ce5c2a92"}},
+)
 
 
 @functools.cache
@@ -9276,6 +9290,8 @@ def _draft_layer_class(base):
     def call(self, x, x_ctx, rope, cache, projected_context = None):
         if self.training or not _bindings_intact(self._unsloth_draft_layer_bindings):
             return base.__call__(self, x, x_ctx, rope, cache, projected_context)
+        if not getattr(self, "use_rope", True):
+            rope = sys.modules[_DFLASH2]._no_rope
         def finish(conv, hidden, dynamic, residual):
             if (not conv.training and type(conv) is _fused_dflash2_class(sys.modules[_DFLASH2].GroupedDynamicCausalConv)
                     and _fused_dflash2_serves(conv)):
@@ -9295,7 +9311,7 @@ def _draft_layer_class(base):
 def fused_drafter_layers(model) -> int:
     """Fold covered DFlash2 convolution residuals into their layer's kernels; returns covered layers."""
     module = sys.modules.get(_DFLASH2)
-    bindings = _resolved_bindings(_DRAFT_LAYER_CONTRACT) if module else None
+    bindings = _first_resolved(_DRAFT_LAYER_CONTRACTS) if module else None
     if bindings is None:
         return 0
     layers = [layer for layer in model.get("layers", []) if type(layer) is module.DFlash2DecoderLayer]

@@ -333,6 +333,24 @@ def test_a_role_read_in_one_layer_does_not_reach_another():
     assert _adapters(model, "model.layers.1") == []
 
 
+@pytest.mark.parametrize("targets", [None, "all-linear", ["wkv", "wgate"]])
+def test_a_linear_whose_owner_reads_its_weight_stays_unadapted(targets):
+    import mlx.nn as nn
+
+    class Compressor(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.wkv, self.wgate = nn.Linear(HIDDEN, HIDDEN), nn.Linear(HIDDEN, HIDDEN)
+
+        def __call__(self, x):
+            return x @ self.wkv.weight.T + x @ self.wgate.weight.T
+
+    model = _text_model([{"self_attn": {"wkv": (HIDDEN, HIDDEN), "wgate": (HIDDEN, HIDDEN),
+                                        "compressor": Compressor}}] * 2)
+    _peft(model, target_modules=targets)
+    assert _adapters(model, "model.layers.1") == ["self_attn.wgate", "self_attn.wkv"]
+
+
 def test_a_fused_expert_stack_reports_output_width_not_expert_count():
     switch_layers = pytest.importorskip("mlx_lm.models.switch_layers")
     from unsloth_zoo.mlx.loader import _semantic_dims

@@ -774,6 +774,22 @@ def test_global_scale_projections_keep_the_native_path():
             _equal(model(x, indices), expected)
 
 
+def test_a_ranks_share_of_the_experts_keeps_the_native_path():
+    # the fused body does not reimplement how mlx-vlm 0.8.0 sorts a partitioned layer's routes
+    mx.random.seed(23)
+    model = vlm.SwitchGLU(512, 256, 8, bias = False)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        setattr(model, name, getattr(model, name).to_quantized(64, 4))
+    model.num_experts = 16
+    model.eval()
+    model.freeze()
+    with fused_moe_gate_up(model):
+        assert type(model) is vlm.SwitchGLU
+    model.num_experts = 8
+    with fused_moe_gate_up(model):
+        assert type(model) is not vlm.SwitchGLU
+
+
 def test_routing_bodies_cover_the_installed_packages():
     # an unlisted routing body keeps its native call without a word, so it has to fail here
     from mlx_vlm.models.gemma4_text import language as vlm_gemma_text
