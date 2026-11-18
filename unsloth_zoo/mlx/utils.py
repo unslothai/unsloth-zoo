@@ -15124,6 +15124,41 @@ def _unpack_hadamard_modules(model):
     return bool(dense)
 
 
+def _dense_scaled_quantized_modules(model):
+    """mlx-lm's dequantize_model skips NVFP4 modules with a global scale (mlx-vlm's ScaledQuantized*, the loader's scaled
+    embedding) and would save their packed weights as dense; fold the scale and any AWQ pre_quant_scale in instead."""
+    dense = []
+    for name, module in model.named_modules():
+        scale_name = next((key for key in ("weight_scale_2", "weight_global_scale") if key in module), None)
+        if scale_name is None or "scales" not in module or getattr(module.get("weight"), "dtype", None) != mx.uint32:
+            continue
+        weight = mx.dequantize(module["weight"], module["scales"], module.get("biases"), module.group_size,
+                               module.bits, module.mode, dtype=mx.float32)
+        scale = module[scale_name].astype(mx.float32)
+        if scale.size > 1:
+            scale = scale.reshape(*weight.shape[:-2], -1, 1)
+        weight = weight / scale if scale_name == "weight_global_scale" else weight * scale
+        if "pre_quant_scale" in module:
+            pre = module["pre_quant_scale"].astype(mx.float32)
+            weight = weight * (pre.reshape(*pre.shape[:-1], 1, pre.shape[-1]) if pre.ndim > 1 else pre)
+        weight = weight.astype(mx.bfloat16)
+        bias = "bias" in module
+        if hasattr(module, "num_embeddings"):
+            layer = nn.Embedding(*weight.shape)
+        elif weight.ndim == 3:
+            from mlx_lm.models.switch_layers import SwitchLinear
+            layer = SwitchLinear(weight.shape[2], weight.shape[1], weight.shape[0], bias=bias)
+        else:
+            layer = nn.Linear(weight.shape[1], weight.shape[0], bias=bias)
+        layer.weight = weight
+        if bias:
+            layer.bias = module["bias"]
+        dense.append((name, layer))
+    if dense:
+        model.update_modules(mlx.utils.tree_unflatten(dense))
+    return bool(dense)
+
+
 # Pack-only keys; with the layers unpacked the tree is plain mlx-vlm Qwen3.5.
 _HADAMARD_PACK_CONFIG_KEYS = frozenset({
     "schema_version", "base_model_type", "tensor_namespace", "gdn_activation_layout",
@@ -18781,6 +18816,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
 
     if dequantize:
         unpacked = _unpack_hadamard_modules(model)
+        _dense_scaled_quantized_modules(model)
         model = dequantize_model(model)
         # Rewrite what is saved: it may resolve from `model.config` or `model.args`.
         cfg = _get_model_config(model)

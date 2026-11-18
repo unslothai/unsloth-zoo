@@ -293,6 +293,17 @@ def test_a_mixed_fp_checkpoint_with_a_scaled_embedding_loads_as_packed(tmp_path,
     for key, value in tree_flatten(loaded.parameters()):
         assert mx.array_equal(value, scale if key.endswith("weight_scale_2") else params[key]), key
 
+    from unsloth_zoo.mlx.utils import save_merged_model
+
+    # A dense export folds the scale in rather than saving the packed weight.
+    save_merged_model(loaded, type("Tokenizer", (), {"save_pretrained": lambda self, path: None})(), tmp_path / "dense",
+                      dequantize = True)
+    saved = mx.load(str(next((tmp_path / "dense").glob("*.safetensors"))))
+    assert not any(key.endswith(("scales", "weight_scale_2")) for key in saved)
+    dense = (mx.dequantize(stock.weight, stock.scales, group_size = 16, bits = 4, mode = "nvfp4", dtype = mx.float32)
+             * scale).astype(mx.bfloat16)
+    assert mx.array_equal(saved["language_model.model.embed_tokens.weight"], dense)
+
 
 def test_lazy_weights_env_leaves_the_load_lazy(tmp_path, monkeypatch):
     monkeypatch.setenv("UNSLOTH_MLX_LAZY_WEIGHTS", "1")
