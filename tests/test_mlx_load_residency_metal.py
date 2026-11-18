@@ -257,7 +257,7 @@ def test_a_glm5_next_oq_quant_loads_as_its_model(tmp_path, monkeypatch):
 def test_a_mixed_fp_checkpoint_with_a_scaled_embedding_loads_as_packed(tmp_path, monkeypatch):
     qwen2_vl = pytest.importorskip("mlx_vlm.models.qwen2_vl")
     import mlx_vlm.utils as vlm_utils
-    from unsloth_zoo.mlx.loader import _ensure_vlm_checkpoint_quantization
+    from unsloth_zoo.mlx.loader import _ensure_vlm_checkpoint_quantization, _with_packed_quantization
 
     for name in ("load_model_weights", "replace_scaled_quantized_linears"):
         monkeypatch.setattr(vlm_utils, name, getattr(vlm_utils, name))
@@ -284,6 +284,10 @@ def test_a_mixed_fp_checkpoint_with_a_scaled_embedding_loads_as_packed(tmp_path,
     modules = dict(loaded.named_modules())
     assert {path: {"group_size": modules[path].group_size, "bits": modules[path].bits, "mode": modules[path].mode}
             for path in packed} == packed
+    # The saved config names each departing layer, so a stock mlx-vlm reloads the export.
+    saved = _with_packed_quantization(loaded, {"quantization": nvfp4})["quantization"]
+    assert {path: saved[path] for path in packed if packed[path] != nvfp4} == {
+        path: spec for path, spec in packed.items() if spec != nvfp4}
     embedding, stock = modules["language_model.model.embed_tokens"], model.language_model.model.embed_tokens
     assert not isinstance(embedding, nn.QuantizedEmbedding)
     ids, hidden = mx.array([[3, 255, 0, 17]]), mx.random.normal((1, 4, 128)).astype(mx.bfloat16)

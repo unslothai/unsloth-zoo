@@ -1041,6 +1041,7 @@ def _ensure_vlm_checkpoint_quantization():
     def patched_load_model_weights(model, config, weights, *args, **kwargs):
         quantization = config.get("quantization")
         default = _global_quant_params(quantization)
+        inferred = {}
         if default is not None:
             for path, module in model.named_modules():
                 if (
@@ -1049,8 +1050,12 @@ def _ensure_vlm_checkpoint_quantization():
                 ):
                     packed = _packed_quantization(path, module, weights)
                     if packed is not None and packed != default:
-                        quantization[path] = packed
-        return load_model_weights(model, config, weights, *args, **kwargs)
+                        quantization[path] = inferred[path] = packed
+        loaded = load_model_weights(model, config, weights, *args, **kwargs)
+        if inferred:
+            # Outside the module tree, so it is not a parameter; the saved config needs it to reload.
+            object.__setattr__(loaded, "_unsloth_packed_quantization", inferred)
+        return loaded
 
     def patched_replace_scaled(model, weights):
         from mlx.utils import tree_map_with_path
@@ -1070,6 +1075,20 @@ def _ensure_vlm_checkpoint_quantization():
     vlm_utils.load_model_weights = patched_load_model_weights
     if replace_scaled is not None:
         vlm_utils.replace_scaled_quantized_linears = patched_replace_scaled
+
+
+def _with_packed_quantization(model, config):
+    """*config* naming the layers the load found packed otherwise than its default, while the live module still is."""
+    inferred = getattr(model, "_unsloth_packed_quantization", None)
+    if not inferred or not isinstance(config, dict):
+        return config
+    modules = dict(model.named_modules())
+    live = {
+        path: spec for path, spec in inferred.items()
+        if all(getattr(modules.get(path), key, None) == value for key, value in spec.items())
+    }
+    return {key: {**live, **value} if key in ("quantization", "quantization_config") and isinstance(value, dict) else value
+            for key, value in config.items()}
 
 
 def _patch_deepseek_ocr_transformers_import_compat(model_type):
@@ -10532,7 +10551,7 @@ class FastMLXModel:
                     model, vlm_cfg, quantization_spec,
                     is_vlm=True, user_predicate=quant_predicate,
                 )
-                model._config = vlm_cfg
+                model._config = _with_packed_quantization(model, vlm_cfg)
                 _run_with_vlm_config_view(
                     lambda: mx.eval(model.parameters()),
                 )
@@ -10634,7 +10653,7 @@ class FastMLXModel:
                 from .utils import bind_legacy_image_processor
                 _run_with_vlm_config_view(bind_legacy_image_processor, model, processor)
 
-            model._config = getattr(model, "_config", config_data)
+            model._config = _with_packed_quantization(model, getattr(model, "_config", config_data))
             model._hf_repo = model_name
             model._src_path = original_local_path or local_path
             # _src_path is the original snapshot (for commit inference); _config_src_path is the mlx-vlm patched dir
