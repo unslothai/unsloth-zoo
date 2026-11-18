@@ -20,7 +20,6 @@ cache exactly the reference's pooled block keys. Covers prompts below / at / abo
 inside multi-token steps, left-padded batches, a LoRA adapter on and off, eager masks, fp16 / bf16, the kill switch,
 and that a block pooled before all its tokens are written (SGLang #46125) is caught."""
 
-import math
 import os
 
 import pytest
@@ -39,6 +38,8 @@ _REAL_CACHED_DECODE = zoo._qwen4_exp_cached_decode
 def patched(monkeypatch):
     monkeypatch.setenv("UNSLOTH_FROZEN_TABLE", "gpu")
     monkeypatch.delenv("UNSLOTH_QWEN4_EXP_CACHED_DECODE", raising = False)
+    # The tiny model's contexts are far below the default minimum: engage from the budget on.
+    monkeypatch.setenv("UNSLOTH_QWEN4_EXP_CACHED_DECODE_MIN_CONTEXT", "0")
     zoo.patch_qwen4_exp()
     assert modeling.Qwen4ExpTextAttention.forward is zoo.qwen4_exp_attention_forward
     # CPU: the torch linear-attention paths (the GPU host's Triton kernels reject CPU tensors).
@@ -283,6 +284,19 @@ def test_kill_switch_keeps_the_reference(patched):
     assert engaged == 0 and record == []
 
 
+def test_min_context_gates_engagement(patched):
+    # Below UNSLOTH_QWEN4_EXP_CACHED_DECODE_MIN_CONTEXT every step keeps the reference; from it on the cached path
+    # runs (its first step rebuilds the block cache from the raw keys) and still equals the full recompute.
+    assert zoo._CACHED_DECODE_MIN_CONTEXT >= 16384
+    patched.delenv("UNSLOTH_QWEN4_EXP_CACHED_DECODE_MIN_CONTEXT")
+    engaged, record = _run(patched, lengths = [30, 25], steps = [1] * 8 + [3])
+    assert engaged == 0 and record == []
+    # Threshold 36 keys: prompt 30, steps end at 31 .. 38 then 41 keys: 4 steps x 2 QSA layers engage.
+    patched.setenv("UNSLOTH_QWEN4_EXP_CACHED_DECODE_MIN_CONTEXT", "36")
+    engaged, record = _run(patched, lengths = [30, 25], steps = [1] * 8 + [3])
+    assert engaged == 8 == len(record) and min(record) == 36
+
+
 def test_block_pooled_before_it_completes_is_caught(patched):
     # The SGLang #46125 bug: pool the block a step's last token falls in, before its remaining tokens are written.
     patched.setattr(zoo, "_qsa_pooled_blocks",
@@ -316,6 +330,7 @@ def test_cache_edits_rebuild_the_block_cache(patched):
 def test_cuda_decode_step_has_no_host_sync(monkeypatch):
     """Every cached-decode call runs under torch.cuda.set_sync_debug_mode('error'): any GPU -> CPU sync raises."""
     monkeypatch.setenv("UNSLOTH_FROZEN_TABLE", "gpu")
+    monkeypatch.setenv("UNSLOTH_QWEN4_EXP_CACHED_DECODE_MIN_CONTEXT", "0")
     zoo.patch_qwen4_exp()
     real = _REAL_CACHED_DECODE
     calls = []

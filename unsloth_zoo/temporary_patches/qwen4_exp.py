@@ -237,6 +237,18 @@ def _cached_decode_enabled():
     return os.environ.get("UNSLOTH_QWEN4_EXP_CACHED_DECODE", "1") != "0"
 
 
+# Below this many keys an eager cached step launches more small kernels than the reference saves (Colab L4, real
+# Qwen3.8 dims: 0.86x at 8K, 1.20x at 32K for one QSA layer), so shorter contexts keep the reference.
+_CACHED_DECODE_MIN_CONTEXT = 24576
+
+
+def _cached_decode_min_context():
+    try:
+        return int(os.environ.get("UNSLOTH_QWEN4_EXP_CACHED_DECODE_MIN_CONTEXT", _CACHED_DECODE_MIN_CONTEXT))
+    except ValueError:
+        return _CACHED_DECODE_MIN_CONTEXT
+
+
 # Steps longer than this (chunked prefill into a filled cache) keep the reference: the gathered K / V rows grow with
 # query rows x budget. Decode, MTP and speculative verification steps fit.
 _CACHED_DECODE_MAX_QUERY = 16
@@ -364,7 +376,9 @@ def _qwen4_exp_cached_decode(module, hidden_states, position_embeddings, attenti
     Blocks are counted from each row's first visible key, as the reference does, so the cache assumes every query
     sees one interval [first visible key, itself] (causal + left padding: what generate builds). Other masks
     cannot be checked without a sync; they are counted in QWEN4_EXP_CACHED_DECODE_MISMATCH and the selection is
-    still intersected with the mask, so no hidden key is read. UNSLOTH_QWEN4_EXP_CACHED_DECODE=0 disables."""
+    still intersected with the mask, so no hidden key is read. UNSLOTH_QWEN4_EXP_CACHED_DECODE=0 disables; only
+    contexts of at least UNSLOTH_QWEN4_EXP_CACHED_DECODE_MIN_CONTEXT keys (default _CACHED_DECODE_MIN_CONTEXT) take
+    it, the first such step rebuilding the block cache from the raw keys."""
     if not _cached_decode_enabled() or past_key_values is None:
         return None
     output_attentions = kwargs.get("output_attentions")
@@ -397,7 +411,7 @@ def _qwen4_exp_cached_decode(module, hidden_states, position_embeddings, attenti
     # Within the budget the patched indexer already keeps every visible key (dense, no loop): leave it.
     if (filled == 0 or keys.dim() != 4 or keys.shape[-2] != filled or raw_cache.shape[0] != batch
             or attention_mask.shape[-1] != total or attention_mask.shape[-2] != q_len
-            or total < indexer.token_budget + ratio):
+            or total < max(indexer.token_budget + ratio, _cached_decode_min_context())):
         return None
     full_cos, full_sin = position_embeddings
     if full_cos.dim() != 3 or full_cos.shape[-2] != total:
