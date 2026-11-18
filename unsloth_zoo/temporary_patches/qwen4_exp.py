@@ -237,8 +237,7 @@ def _cached_decode_enabled():
     return os.environ.get("UNSLOTH_QWEN4_EXP_CACHED_DECODE", "1") != "0"
 
 
-# Below this many keys an eager cached step launches more small kernels than the reference saves (Colab L4, real
-# Qwen3.8 dims: 0.86x at 8K, 1.20x at 32K for one QSA layer), so shorter contexts keep the reference.
+# Measured break-even (L4, Qwen3.8 dims: 0.86x at 8K, 1.20x at 32K); shorter contexts keep the reference.
 _CACHED_DECODE_MIN_CONTEXT = 24576
 
 
@@ -249,17 +248,14 @@ def _cached_decode_min_context():
         return _CACHED_DECODE_MIN_CONTEXT
 
 
-# Steps longer than this (chunked prefill into a filled cache) keep the reference: the gathered K / V rows grow with
-# query rows x budget. Decode, MTP and speculative verification steps fit.
+# Longer steps (chunked prefill) keep the reference: gathered K / V rows grow with query rows x budget.
 _CACHED_DECODE_MAX_QUERY = 16
-# Device counter of steps whose visible keys were not the interval the cached blocks assume (see below); tests read it.
+# Device counter of steps whose mask was not the interval the block cache assumes.
 QWEN4_EXP_CACHED_DECODE_MISMATCH = {}
 
 
 def _qsa_pooled_blocks(n_tokens, start, ratio):
-    """Blocks of a row (first visible slot `start`) whose every token is among the first `n_tokens` cache slots.
-    Only these may be pooled into the block-key cache: a block that completes inside a multi-token step is pooled
-    after the step's keys are all written, never earlier (the SGLang #46125 trap)."""
+    """Complete blocks within the first `n_tokens` slots; pool only these (the SGLang #46125 trap)."""
     return torch.div(n_tokens - start, ratio, rounding_mode = "floor").clamp_min(0)
 
 
@@ -267,7 +263,7 @@ _ARANGE = {}
 
 
 def _arange(n, device):
-    """torch.arange(n) as a view of a cached, grown-by-doubling range: no kernel launch per call."""
+    """Cached torch.arange(n): no kernel launch per call."""
     have = _ARANGE.get(device)
     if have is None or have.shape[0] < n:
         have = _ARANGE[device] = torch.arange(max(n, 2 * (0 if have is None else have.shape[0]), 4096), device = device)
@@ -276,10 +272,7 @@ def _arange(n, device):
 
 @torch.no_grad()
 def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attention_mask, rope, rope_dtype):
-    """[b, q, budget + ratio - 1] selected cache slots (-1 = unused) of a cached step, as the reference indexer
-    keeps them; appends this step's raw index keys to the cache and extends its block-key cache. No host sync.
-    The reference's selection is a boolean mask: nothing here carries a gradient. `rope_dtype` (or None): the
-    dtype the reference's RoPE tables are cast to, applied only to the rows read here."""
+    """[b, q, budget + ratio - 1] selected slots (-1 = unused), as the reference indexer; extends the caches. No host sync."""
     import math
     batch, q_len = hidden_states.shape[:2]
     raw_cache = layer.indexer_keys
@@ -291,7 +284,6 @@ def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attent
     if rope_dtype is not None:
         cos, sin = cos.to(rope_dtype), sin.to(rope_dtype)
 
-    # Index query and raw key, as the reference indexer.
     qk = indexer.index_qk_proj(hidden_states)
     index_q, token_k = torch.split(qk, [indexer.index_n_heads * dim, indexer.index_kv_heads * dim], dim = -1)
     index_q = indexer.q_layernorm(index_q.reshape(batch, q_len, -1, dim))
@@ -303,7 +295,7 @@ def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attent
     # Any cache edit (crop, beam reorder, reset, offload) swaps the raw key tensor: rebuild from the raw keys.
     rebuild = state is None or state["raw"]() is not raw_cache or state["filled"] != filled
     if rebuild:
-        # First visible slot per row, from the last query row (a real token, never a pad).
+        # From the last query row: a real token, never a pad.
         start = torch.where(visible[:, -1], _arange(total, device), total).amin(-1).clamp_max(total - 1)
         blocks = None
     else:
@@ -317,7 +309,6 @@ def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attent
         blocks = grown
     spare = blocks.shape[1] - 1
 
-    # Pool the blocks this step completed (every block on a rebuild).
     done_after = _qsa_pooled_blocks(total, start, ratio)
     if rebuild:
         n_new = spare
@@ -352,8 +343,7 @@ def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attent
     tail = torch.where(tail <= rows[:, None], tail, -1)
     selected = torch.cat([chosen, tail], dim = -1)                                             # [b, q, S]
 
-    # The cache assumes each query sees [first visible slot, itself]: count (on the device) steps that do not, and
-    # never keep a hidden key.
+    # Count steps whose mask is not [first visible slot, itself]; never keep a hidden key.
     slots = _arange(total, device)
     expected = (slots >= start[:, None, None]) & (slots <= rows[:, None])
     counter = QWEN4_EXP_CACHED_DECODE_MISMATCH.get(device)
@@ -364,21 +354,10 @@ def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attent
 
 
 def _qwen4_exp_cached_decode(module, hidden_states, position_embeddings, attention_mask, past_key_values, kwargs):
-    """QSA attention for a step into a filled DynamicCache (decode, MTP / speculative verification), or None to run
-    transformers' reference (a per-query Python loop with a host sync per row that re-pools, re-norms and re-ropes
-    every block key from the raw index keys, then dense attention over all N keys behind a mask).
-
-    The pooled, k_layernorm-ed, roped block keys (fp32, as the reference scores them) live on the cache layer and
-    are extended by the blocks a step completes. Per step: score every complete block of each query, top-k, gather
-    only the selected K / V rows (budget + ratio - 1 per query) and attend over those. No host sync: shapes come
-    from host-side cache lengths, per-row facts (first visible slot, block counts) stay on the device.
-
-    Blocks are counted from each row's first visible key, as the reference does, so the cache assumes every query
-    sees one interval [first visible key, itself] (causal + left padding: what generate builds). Other masks
-    cannot be checked without a sync; they are counted in QWEN4_EXP_CACHED_DECODE_MISMATCH and the selection is
-    still intersected with the mask, so no hidden key is read. UNSLOTH_QWEN4_EXP_CACHED_DECODE=0 disables; only
-    contexts of at least UNSLOTH_QWEN4_EXP_CACHED_DECODE_MIN_CONTEXT keys (default _CACHED_DECODE_MIN_CONTEXT) take
-    it, the first such step rebuilding the block cache from the raw keys."""
+    """QSA for a step into a filled DynamicCache (decode, MTP), or None for the reference (host sync per row).
+    Roped fp32 block keys are cached on the layer; only the selected K / V rows are gathered and attended.
+    Assumes each query sees [first visible key, itself] (what generate builds); other masks are counted in
+    QWEN4_EXP_CACHED_DECODE_MISMATCH and still intersected, so no hidden key is read."""
     if not _cached_decode_enabled() or past_key_values is None:
         return None
     output_attentions = kwargs.get("output_attentions")
@@ -386,8 +365,7 @@ def _qwen4_exp_cached_decode(module, hidden_states, position_embeddings, attenti
         output_attentions = getattr(module.config, "output_attentions", False)
     if output_attentions or (module.training and module.attention_dropout):
         return None
-    # Dynamic / longrope RoPE recompute inv_freq as the context grows, re-rotating every position; the cached
-    # block keys keep the old rotation, so those configs keep the reference (which re-pools every step).
+    # Dynamic / longrope RoPE re-rotate past positions: cached block keys would be stale.
     rope_type = (getattr(module.config, "rope_parameters", None) or {}).get("rope_type", "default")
     if "dynamic" in str(rope_type) or rope_type == "longrope":
         return None
@@ -403,7 +381,6 @@ def _qwen4_exp_cached_decode(module, hidden_states, position_embeddings, attenti
         layer = layers[module.layer_idx]
     except Exception:
         return None
-    # Concatenating layers only (a static cache keeps its own path, which compiles fullgraph).
     if not isinstance(layer, DynamicIndexedLayer) or not getattr(layer, "is_indexer_initialized", False):
         return None
     raw_cache = layer.indexer_keys
@@ -413,7 +390,7 @@ def _qwen4_exp_cached_decode(module, hidden_states, position_embeddings, attenti
     filled = raw_cache.shape[1]
     total = filled + q_len
     ratio = indexer.compress_ratio
-    # Within the budget the patched indexer already keeps every visible key (dense, no loop): leave it.
+    # Within the budget the patched indexer is already dense and loop-free.
     if (filled == 0 or keys.dim() != 4 or keys.shape[-2] != filled or raw_cache.shape[0] != batch
             or attention_mask.shape[-1] != total or attention_mask.shape[-2] != q_len
             or total < max(indexer.token_budget + ratio, _cached_decode_min_context())):
@@ -421,8 +398,7 @@ def _qwen4_exp_cached_decode(module, hidden_states, position_embeddings, attenti
     full_cos, full_sin = position_embeddings
     if full_cos.dim() != 3 or full_cos.shape[-2] != total:
         return None
-    # As qwen4_exp_attention_forward does before the reference: half activations take half RoPE tables (only the
-    # rows read are cast: the tables span every position).
+    # Half activations take half RoPE tables, as qwen4_exp_attention_forward does.
     rope_dtype = None
     if hidden_states.dtype in (torch.float16, torch.bfloat16) and full_cos.dtype != hidden_states.dtype:
         rope_dtype = hidden_states.dtype
@@ -438,7 +414,6 @@ def _qwen4_exp_cached_decode(module, hidden_states, position_embeddings, attenti
     if _QSA_DECODE_TRACE is not None:
         _QSA_DECODE_TRACE.append((module.layer_idx, selected))
 
-    # Attention over the selected K / V rows only (one selection shared by every head, as the reference).
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, module.head_dim)
     query_states, gate = torch.chunk(module.q_proj(hidden_states).view(*input_shape, -1, module.head_dim * 2), 2, dim=-1)
@@ -456,7 +431,7 @@ def _qwen4_exp_cached_decode(module, hidden_states, position_embeddings, attenti
     v_rows = value_states.gather(2, flat.expand(-1, n_kv, -1, v_dim))
     k_rows = k_rows.view(batch, n_kv, q_len, width, head_dim).transpose(1, 2).reshape(batch * q_len, n_kv, width, head_dim)
     v_rows = v_rows.view(batch, n_kv, q_len, width, v_dim).transpose(1, 2).reshape(batch * q_len, n_kv, width, v_dim)
-    # Query head j reads KV head j // groups (repeat_kv): fold the groups into the query length.
+    # repeat_kv: fold query-head groups into the query length.
     query_rows = query_states.reshape(batch, n_kv, groups_per_kv, q_len, head_dim).permute(0, 3, 1, 2, 4)
     query_rows = query_rows.reshape(batch * q_len, n_kv, groups_per_kv, head_dim).to(k_rows.dtype)
     attn_mask = (selected >= 0).reshape(batch * q_len, 1, 1, width)

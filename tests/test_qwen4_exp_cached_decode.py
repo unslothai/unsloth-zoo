@@ -63,9 +63,7 @@ def _model(dtype = torch.float32, attn = "sdpa", lora = False, seed = 0):
         linear_num_key_heads = 2, linear_num_value_heads = 2, linear_key_head_dim = 16, linear_value_head_dim = 16,
         num_experts = 4, num_experts_per_tok = 2, moe_intermediate_size = 16, shared_expert_intermediate_size = 32,
         hc_count = 2, hc_lowrank = 8, ple_layer_ids = [],
-        # Two QSA layers: each keeps its own block cache. 16 index heads: a block scores exactly 0 (every head's
-        # relu(q . k) is 0) with probability 2^-16, so the top-k never meets a tie, whose order torch.topk leaves
-        # unspecified (the reference loop's pick among equal scores is not a contract; see test_ties_keep_the_count).
+        # 16 index heads make an all-zero block score (a top-k tie, order unspecified) a 2^-16 event.
         layer_types = ["linear_attention", "full_attention", "linear_attention", "full_attention"],
     )
     config._attn_implementation = attn
@@ -249,8 +247,7 @@ def _run(monkeypatch, *, lengths, steps, greedy = True, dtype = torch.float32, a
 
 @pytest.mark.parametrize("prompt", [10, 16, 40], ids = ["below_budget", "at_budget", "above_budget"])
 def test_greedy_decode_equals_full_recompute(patched, prompt):
-    # Left-padded batch of two (the second row 5 shorter: its blocks start 5 slots later); 30 greedy steps cross
-    # the budget (short prompts) and the linear attention's 64-token chunk.
+    # Left-padded batch (row 2 is 5 shorter); 30 steps cross the budget and the 64-token linear-attention chunk.
     steps = [1] * 30
     engaged, record = _run(patched, lengths = [prompt, prompt - 5], steps = steps)
     # Two QSA layers per step from the first step whose keys reach budget + ratio.
@@ -287,8 +284,7 @@ def test_kill_switch_keeps_the_reference(patched):
 
 
 def test_min_context_gates_engagement(patched):
-    # Below UNSLOTH_QWEN4_EXP_CACHED_DECODE_MIN_CONTEXT every step keeps the reference; from it on the cached path
-    # runs (its first step rebuilds the block cache from the raw keys) and still equals the full recompute.
+    # Below MIN_CONTEXT the reference runs; from it on the cached path rebuilds and still matches the recompute.
     assert zoo._CACHED_DECODE_MIN_CONTEXT >= 16384
     patched.delenv("UNSLOTH_QWEN4_EXP_CACHED_DECODE_MIN_CONTEXT")
     engaged, record = _run(patched, lengths = [30, 25], steps = [1] * 8 + [3])
@@ -361,8 +357,7 @@ def test_cuda_decode_step_has_no_host_sync(monkeypatch):
 
 
 def test_ties_keep_the_count(patched):
-    # Every index key 0: every block scores exactly 0, so any top-k pick is equally scored. The cached path keeps
-    # budget / ratio whole blocks plus the tail, as the reference does, all distinct and visible.
+    # All-zero index keys: every block ties; still budget / ratio distinct visible blocks plus the tail.
     lengths, steps = [30, 25], [1] * 6 + [4]
     ids, mask, prompt = _batch(lengths, max(lengths) + sum(steps))
     model = _model()
@@ -401,6 +396,5 @@ def test_cuda_decode_equals_full_recompute(patched, dtype):
 
 @pytest.mark.parametrize("rope_type", ["dynamic", "longrope"])
 def test_dynamic_rope_keeps_the_reference(patched, rope_type):
-    # These RoPE types re-rotate past positions as the context grows; cached block keys would keep the old rotation.
     engaged, record = _run(patched, lengths = [30, 25], steps = [1] * 8 + [3], rope_type = rope_type)
     assert engaged == 0 and record == []
