@@ -1713,17 +1713,10 @@ pass
 
 
 def grpo_truncated_support_kwargs(trainer):
-    """support_* kwargs for the chunked logprob helpers when the trainer scores over the vLLM rollouts'
-    top_k / top_p / min_p kept set, else {}. =1 always (truncated rollouts), =0 never.
-    Unset: on when the truncated, processed (kept-set renormalised) vLLM logprobs feed the IS correction
-    (grpo_truncated_support_automatic), as TRL >= 1.17 does (grpo_trainer.py `return_sampling_mask`:
-    IS correction + top_k / top_p / min_p + temperature > 0). Scored over the full vocabulary instead,
-    every IS ratio is low by the kept probability mass (about 0.97 per token at min_p = 0.1), which the
-    token / sequence truncation and masking then treat as sampler mismatch. The kept-set score
-    differentiates log(p(token) / p(kept set)), the policy the rollouts were sampled from; it is zero
-    where one token is kept, as in TRL >= 1.17. Otherwise the full vocabulary is scored, as verl and
-    TRL before 1.17 do, with a once-per-trainer warning when truncated vLLM logprobs still reach the IS
-    correction or the off-policy mask."""
+    """support_* kwargs to score over the vLLM rollouts' top_k / top_p / min_p kept set, else {}.
+    =1 always, =0 never, unset when grpo_truncated_support_automatic (as TRL >= 1.17). Full-vocabulary
+    scoring biases each IS ratio low by the kept mass (~0.97/token at min_p = 0.1). Otherwise full
+    vocabulary (verl, TRL < 1.17), warning once if truncated logprobs reach the IS correction / off-policy mask."""
     if not getattr(trainer, "use_vllm", False):
         return {}
     support = grpo_sampling_support(trainer)
@@ -1787,13 +1780,9 @@ _GRPO_TRUNCATED_SUPPORT_STATS = {"on": 0}
 
 
 def grpo_truncated_support_automatic(trainer, support = None):
-    """Whether an unset UNSLOTH_GRPO_TRUNCATED_SUPPORT scores over the rollouts' kept set: the rollouts were
-    truncated (top_k / top_p / min_p) at temperature > 0, their logprobs feed the vLLM IS correction, and the
-    colocated engine is known to return processed (kept-set renormalised) logprobs. The same conditions as
-    TRL >= 1.17's `return_sampling_mask` (vllm_importance_sampling_correction, filtered sampling,
-    temperature > 0). Against raw logprobs, or an unknown engine (server mode), a kept-set score would bias
-    the ratio the other way, so those stay on the full vocabulary. NVIDIA CUDA only, where it was measured;
-    =1 forces it elsewhere. The off-policy mask alone does not turn it on (TRL does not either)."""
+    """Unset setting scores the kept set: truncated rollouts at temperature > 0 feeding the IS correction from an
+    engine known to return processed logprobs (TRL >= 1.17 `return_sampling_mask`). Raw / unknown logprobs would
+    bias the ratio the other way. NVIDIA CUDA only (measured there). The off-policy mask alone does not count."""
     if not getattr(trainer, "use_vllm", False):
         return False
     if support is None:
@@ -1812,15 +1801,12 @@ pass
 
 
 def _grpo_truncated_support_auto_platform():
-    """The automatic kept set is measured on NVIDIA CUDA only (not ROCm, XPU or CPU); =1 forces it there."""
     return getattr(torch.version, "hip", None) is None and torch.cuda.is_available()
 pass
 
 
 def _grpo_rollout_logprobs_processed(trainer):
-    """True / False when the colocated vLLM engine's logprobs_mode is known (processed_* or raw_*),
-    None when it is not (server mode, a stub engine, an unexpected vLLM layout).
-    Unsloth's colocated engine asks for processed_logprobs (vllm_utils.load_vllm), like TRL's colocate mode."""
+    """Whether the colocated engine's logprobs_mode is processed_*; None if unknown (e.g. server mode)."""
     llm = getattr(trainer, "llm", None)
     if llm is None:
         llm = getattr(getattr(trainer, "vllm_generation", None), "llm", None)

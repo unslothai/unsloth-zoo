@@ -182,9 +182,7 @@ def test_kill_switch_warns_once_only_when_vllm_logps_are_consumed(monkeypatch, c
 
 @pytest.mark.parametrize("value", [None, "", "auto", "weird"])
 def test_default_scores_the_kept_set_when_truncated_logps_feed_the_is_correction(monkeypatch, caplog, value):
-    # Unset (or not 0 / 1): truncated, processed vLLM logprobs feeding the IS correction are matched by a kept-set
-    # score, as TRL >= 1.17 does, silently. The off-policy mask alone, raw or unknown engine logprobs stay on the
-    # full vocabulary and warn once.
+    # Kept set when processed logprobs feed the IS correction; otherwise full vocabulary + one warning.
     if value is None:
         monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
     else:
@@ -223,7 +221,6 @@ def test_default_scores_the_kept_set_when_truncated_logps_feed_the_is_correction
 
 @pytest.mark.parametrize("hip, cuda, expected", [(None, True, True), ("7.2.0", True, False), (None, False, False)])
 def test_automatic_platform_gate(monkeypatch, hip, cuda, expected):
-    # The automatic kept set is NVIDIA CUDA only; =1 still forces it everywhere.
     monkeypatch.undo()
     monkeypatch.setattr(rr.torch.version, "hip", hip)
     monkeypatch.setattr(rr.torch.cuda, "is_available", lambda: cuda)
@@ -243,7 +240,6 @@ def test_automatic_needs_sampling_temperature_and_a_known_processed_engine(monke
     assert not rr.grpo_truncated_support_automatic(_trainer(min_p = 0.1, logprobs_mode = None))
     assert not rr.grpo_truncated_support_automatic(_trainer(min_p = 0.1, is_correction = False, off_policy = 0.5))
     assert not rr.grpo_truncated_support_automatic(_trainer(is_correction = True))
-    # vllm_config.model_config (other vLLM layouts) and an enum-valued mode are read too.
     t = _trainer(min_p = 0.1, logprobs_mode = None)
     mode = types.SimpleNamespace(value = "processed_logprobs")
     t.vllm_generation = types.SimpleNamespace(llm = types.SimpleNamespace(llm_engine = types.SimpleNamespace(
@@ -307,8 +303,7 @@ def _grpo_loss_and_grad(logits, ids, sampling_logps, advantages, kwargs):
 
 @pytest.mark.parametrize("top_p, top_k, min_p", CASES + [(1.0, 1, 0.0)])
 def test_kill_switch_loss_and_gradient_are_the_full_vocabulary_ones(monkeypatch, top_p, top_k, min_p):
-    # =0 GRPO loss and gradient, with truncated processed vLLM logprobs feeding the IS correction, are exactly
-    # those of the full-vocabulary scorer: the default before the automatic kept set, TRL < 1.17's objective.
+    # =0 matches the full-vocabulary scorer exactly (TRL < 1.17).
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "0")
     g = torch.Generator().manual_seed(5)
     logits = torch.randn(6, 96, generator = g, dtype = torch.float64) * 3
@@ -332,8 +327,7 @@ def test_kill_switch_loss_and_gradient_are_the_full_vocabulary_ones(monkeypatch,
 ], ids = ["top_k_1", "min_p_singleton"])
 def test_singleton_kept_set_gradient_per_setting(monkeypatch, logits, top_k, min_p):
     # A kept set of one token renormalises to log 1 = 0, so scoring over it gives zero policy gradient whatever the
-    # advantage (as in TRL >= 1.17, whose support scoring is the same); =0 keeps the full-vocabulary signal, while
-    # the default (IS correction on) and =1 score the kept set.
+    # advantage (as in TRL >= 1.17); =0 keeps the full-vocabulary signal.
     logits = torch.tensor(logits, dtype = torch.float64)
     ids = torch.tensor([0])
     processed = _vllm_processed_logprobs(logits, 1.0, top_k, 1.0, min_p)
@@ -490,8 +484,7 @@ def test_loss_autotune_counts_the_kept_set_logits_twice():
 
 
 def test_default_warning_describes_trl_117_kept_set_scoring(monkeypatch, caplog):
-    # TRL >= 1.17 (TRL #7866) scores over vLLM's kept set when vLLM returns sampling masks; the warning fires where
-    # the default still scores the full vocabulary (here: the off-policy mask alone consumes vLLM's logprobs).
+    # TRL >= 1.17 (TRL #7866) scores over vLLM's kept set when vLLM returns sampling masks.
     monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
     caplog.set_level(logging.WARNING)
     rr.logger.propagate = True
@@ -504,9 +497,7 @@ def test_default_warning_describes_trl_117_kept_set_scoring(monkeypatch, caplog)
 
 @pytest.mark.parametrize("top_p, top_k, min_p", [(1.0, 0, 0.1), (1.0, 0, 0.05), (0.9, 0, 0.0), (0.95, 20, 0.02)])
 def test_default_is_ratio_is_one_against_vllm_processed_logprobs(monkeypatch, top_p, top_k, min_p):
-    # The reported bug: under min_p (or top_p / top_k) with the IS correction on and the variable unset, the
-    # on-policy IS ratio exp(old - vllm) must be 1 per token. Scored over the full vocabulary it is the kept
-    # probability mass instead (about 0.97 per token at min_p = 0.1), compounding over a sequence.
+    # The reported bug: on-policy IS ratio must be 1 per token, not the kept mass (~0.97 at min_p = 0.1).
     monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER", "pytorch")
     g = torch.Generator().manual_seed(11)
@@ -520,13 +511,11 @@ def test_default_is_ratio_is_one_against_vllm_processed_logprobs(monkeypatch, to
     full_ratio = (torch.log_softmax(logits, -1).gather(1, ids[:, None]).squeeze(1) - vllm_logps).exp()
     assert full_ratio.mean() < 0.999  # the bias is there to remove
     torch.testing.assert_close(ratio, torch.ones_like(ratio), atol = 2e-5, rtol = 0)
-    # And the GRPO loss sees IS weight 1 (token_truncate, Unsloth's mode when the correction is on).
     _, grad, _ = _grpo_loss_and_grad(logits, ids, vllm_logps, torch.ones(64, dtype = torch.float64), kwargs)
     assert torch.isfinite(grad).all() and grad.abs().sum() > 0
 
 
 def test_default_is_correction_off_stays_full_vocabulary_and_silent(monkeypatch, caplog):
-    # The correction is off by default: nothing changes there (no kwargs, no warning).
     monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
     caplog.set_level(logging.WARNING)
     rr.logger.propagate = True
