@@ -1444,8 +1444,7 @@ def _tokenizer_class_for_model_type(model_path):
     return tokenizer_class_from_name(mapped) if mapped else None
 
 
-# Tekken tokenizer.json conversions shipped Llama-3's split (first) in place of
-# mistral-common's own, tekken.json's "config.pattern" (second).
+# Tekken tokenizer.json conversions shipped Llama-3's split, not tekken.json's config.pattern.
 _MISTRAL_WRONG_SPLIT_PATTERN = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}"
     r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"

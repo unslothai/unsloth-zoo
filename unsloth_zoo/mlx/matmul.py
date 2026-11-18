@@ -613,9 +613,8 @@ def qmv_rows_plan(costs, rows):
     return min(sorted(costs), key = lambda plan: sum(costs[(m, plan[1])] for m in qmv_rows_sizes(rows, plan[0])))
 
 
-# Row-invariant small-row affine `x @ W^T` for every Apple GPU and 2- to 8-bit codes, on simdgroup matrices
-# or, on M5 for 4- and 8-bit codes, the tensor units: a row's bits do not depend on the call's other rows, and are within
-# fp32 reordering of stock's products.
+# Row-invariant small-row x @ W^T for 2- to 8-bit codes, on simdgroup matrices or on M5 tensor units
+# for 4- and 8-bit codes; within fp32 reordering of stock products.
 LANE_QMM_MAX_ROWS = 32
 _LANE_BITS = (2, 3, 4, 5, 6, 8)
 _LANE_GROUP_SIZES = (32, 64, 128)
@@ -1208,8 +1207,7 @@ def _lane_column_tiles(N, group_size, bits):
 
 
 def _lane_simd_launch(M, Ns, K, group_size, bits, dtype, output_dtype, groups, reader):
-    """The simdgroup-matrix kernel of `x @ W^T` for weights of `Ns` outputs each, one launch, every output's bits those
-    of its weight's own launch."""
+    """Simdgroup x @ W^T for several weights in one launch; each output's bits match its own."""
     # Row and column tiles only regroup independent outputs; the K split, which orders the sums, follows the weight.
     rows = 8 if M <= 8 else 16
     paired = _lane_paired(group_size, bits)
@@ -1269,9 +1267,7 @@ def lane_qmm_geometry(M, N, K, group_size):
 
 
 def lane_qmm(x, w, scales, biases, group_size, bits, *, output_dtype = None, groups = None, reader = None):
-    """`x @ W^T` of a 2-D x of 1 to `LANE_QMM_MAX_ROWS` rows, each row's bits independent of the others; `groups`
-    reads only K's first groups, and `reader` picks another tensor-unit reader ("slices" also keeps the simdgroup-matrix
-    kernel's one-group loop, whose bits are the same)."""
+    """x @ W^T for 1 to LANE_QMM_MAX_ROWS rows, each row's bits independent of the others."""
     (M, K), N = x.shape, w.shape[0]
     inputs = [x, w, scales, biases]
     if _lane_tensor_units(N, bits):
@@ -1499,10 +1495,7 @@ def radix_shortlist(values):
 
 
 def probe_lane_qmm():
-    """Subprocess probe: every width and group size, bf16 and fp16, one, two and four column tiles (or the tensor-unit
-    readers each shape takes, and the interleaved one; on simdgroup matrices also the "slices" one-group loop), both row
-    tiles and ragged ones; within 2% of stock's largest output, and every row of a block, wherever
-    it starts, bit for bit its one-row call."""
+    """Subprocess probe: every width, group size and dtype within 2% of stock and row-invariant."""
     wide = (_LANE_TENSOR_WIDE,) if nax.nax_available() else ()
     for bits, group_size, dtype, N in itertools.product(_LANE_BITS, _LANE_GROUP_SIZES, (mx.bfloat16, mx.float16),
                                                         (72, 128, _LANE_WIDE_COLUMNS, *wide)):
@@ -1981,8 +1974,7 @@ def differentiable_staged_train_qmm(group_size, bits):
 
 
 def available_train_qmm_routes():
-    """Training routes for this process.
-    `UNSLOTH_MLX_DENSE_TRAIN_QMM=0` turns the dense route off, `UNSLOTH_MLX_STAGED_TRAIN_QMM=0` the staged NAX one."""
+    """UNSLOTH_MLX_DENSE_TRAIN_QMM=0 and UNSLOTH_MLX_STAGED_TRAIN_QMM=0 each disable one route."""
     dense = (os.environ.get("UNSLOTH_MLX_DENSE_TRAIN_QMM", "1") != "0" and nax.gap_open("dense_train_qmm")
              and simd_qmm_available() and _train_dequantize_kernel() is not None
              and nax.kernel_probe_passed(DENSE_TRAIN_QMM_PROBE_KEY, __name__, "probe_dense_train_qmm",

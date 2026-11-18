@@ -335,9 +335,8 @@ class _MappedFile:
         return self._whole
 
     def close(self):
-        # Never unmap explicitly: tensors made with torch.frombuffer (shard views, an exported state_dict) keep the
-        # mmap object alive but not mapped, so an explicit close under them would leave dangling pointers. Dropping
-        # our reference lets the last tensor's release unmap it.
+        # Never unmap explicitly: frombuffer tensors would dangle; drop our reference so the last
+        # tensor release unmaps it.
         self._whole = None
         self.mm = None
         if self.fd is not None:
@@ -1207,8 +1206,7 @@ def iter_frozen_table_modules(model: nn.Module):
 # ----------------------------------------------------------------------------------------------
 # Binding to a checkpoint
 # ----------------------------------------------------------------------------------------------
-# Plane name -> checkpoint key suffix regexes after the table's prefix, tried in order. A regex
-# group 1 (if any) is the shard index used for row order.
+# Plane name to key-suffix regexes after the prefix, in order; group 1 is the shard index.
 DEFAULT_CHECKPOINT_PLANES = {"weight": (r"shard_(\d+)\.weight", r"weight")}
 
 

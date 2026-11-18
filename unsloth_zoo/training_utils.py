@@ -657,9 +657,8 @@ def prepare_model_for_training(
 
     _owner_names = {}
     if _float32_bias_param_ids:
-        # named_parameters() above deduplicates tied Parameters. Discover every
-        # owner by identity: their shared storage has already been upcast, so
-        # checking float16 again would miss later aliases (BERT / RoBERTa heads).
+        # Find owners by identity: upcast storage hides aliases from a float16 check (BERT/RoBERTa
+        # heads).
         for _name, _param in model.named_parameters(remove_duplicate=False):
             if id(_param) in _float32_bias_param_ids:
                 _owner, _, _leaf = _name.rpartition(".")

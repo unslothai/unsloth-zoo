@@ -113,9 +113,7 @@ def _publish_boundary_helpers(modeling_module):
 pass
 
 
-# The Gemma 3 classes are shared by every live Gemma 3 model, and these patches follow
-# UNSLOTH_FORCE_FLOAT32, which each load resets. A load of another family (its types named in
-# UNSLOTH_MODEL_NAME) must not repatch them under a live fp16 or bf16 Gemma 3 model.
+# Other-family loads (UNSLOTH_MODEL_NAME) must not repatch Gemma 3 classes shared with live models.
 _GEMMA3_FAMILY = re.compile(r"(?<![a-z0-9])(gemma3|gemma3_text|shieldgemma2)(?![a-z0-9])")
 
 

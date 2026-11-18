@@ -14,19 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""GRPO-family policy loss with its gradient taken in the forward (TRL GRPOTrainer._compute_loss math).
-
-Every token-level GRPO loss is sum_i w_i * l(logp_i; side inputs) + sum_i e_i * H_i, where the weights w_i / e_i
-depend only on the completion mask and constants (loss-type normaliser, gradient accumulation), and l is a closed
-form of the token's own log-prob. So d loss / d logp_i and d loss / d H_i are known as soon as a chunk's statistics
-are, while its logits are still in the buffer: dz is written in the same pass and the head GEMMs run there. The
-backward only scales the stored gradients by the incoming scalar. Against the log-prob op this drops the logits
-recompute: trainable head 4 -> 3 head GEMMs, frozen head with an entropy gradient 3 -> 2.
-
-Not closed in one pass (the caller keeps the log-prob op + a torch loss): sequence-level importance sampling
-(GSPO), VESPO's sequence gamma weights, the off-policy mask and the top-entropy-quantile mask (both read every
-token's log-prob / entropy before any coefficient is known).
-"""
+"""GRPO loss with gradient taken in the forward: sum_i w_i*l(logp_i) + e_i*H_i, so the logits
+recompute is dropped (trainable head 4 to 3 GEMMs, frozen with entropy grad 3 to 2); GSPO, VESPO,
+off-policy and top-entropy masks keep the log-prob op."""
 
 import math
 import os
@@ -90,9 +80,7 @@ def _token_terms(lp, adv, old, ref, isr, kind, eps_low, eps_high, delta, beta, s
 
 
 def grpo_loss_token_weights(mask, loss_kwargs):
-    """Per-token weights w with sum(w * loss_i) == Unsloth's grpo_compute_loss normalised loss, for a [B, T] completion
-    mask and that function's kwargs (loss_type, current_gradient_accumulation_steps, steps_per_generation,
-    num_processes, num_items_in_batch, max_completion_length, sample_weight)."""
+    """Per-token weights w: sum(w * loss) equals grpo_compute_loss's normalised loss for these kwargs."""
     m = mask.to(torch.float32)
     B = m.shape[0]
     loss_type = loss_kwargs.get("loss_type", "grpo")
@@ -294,12 +282,9 @@ def fused_linear_grpo_loss(
     fp32_head_grad = None,
     token_weights = None, entropy_weights = None,
 ):
-    """TRL GRPOTrainer._compute_loss (token-level importance sampling) on hidden [B, T, H] -> (loss, logps, entropy).
-
-    The returned log-probs / entropies are metrics (no gradient); the loss carries the whole gradient. With
-    UNSLOTH_FUSED_LINEAR_GRPO_FWD_GRAD=0 the same loss is built from fused_linear_logprobs + torch.
-    old_logps None is on-policy (ratio 1). token_weights / entropy_weights ([B, T]) replace the loss_type normaliser
-    and the entropy weights derived from the mask, for a caller with its own (Unsloth's grpo_compute_loss)."""
+    """TRL GRPO token-level loss on hidden [B, T, H]; logps and entropy are metrics, the loss
+    carries the gradient; UNSLOTH_FUSED_LINEAR_GRPO_FWD_GRAD=0 builds the same loss from
+    fused_linear_logprobs plus torch."""
     if loss_type not in _KIND:
         raise ValueError(f"Unsloth: GRPO loss type {loss_type} has no forward gradient.")
     device = weight.device

@@ -8961,8 +8961,7 @@ def _top_candidates(logits, k):
 
 
 def _candidate_scores(predecessors, hidden, successors, unary):
-    # Every edge from each candidate at a position to each at the next: each is `CandidateSelector.select`'s own bf16
-    # product and sum.
+    # Adjacent-position edges use CandidateSelector.select's own bf16 product and sum.
     edges = mx.sum((predecessors * hidden[:, :, None])[:, :, :, None] * successors[:, :, None], axis = -1)
     return unary[:, :, None] + edges
 

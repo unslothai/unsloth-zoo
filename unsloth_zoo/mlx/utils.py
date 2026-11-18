@@ -617,10 +617,7 @@ def _as_array_mask(q, k, mask):
     return mx.arange(S)[None] <= mx.arange(S - T, S)[:, None]
 
 
-# mlx 0.32.4's fused SDPA VJP keeps its S/P/dS tiles in the input dtype, so bf16/fp16 gradients lose to an explicit
-# fp32 softmax; given fp32 inputs, the same fused forward and blocked VJP run in fp32.
-# Below 2047 queries (a 2048-token sequence after the label shift) or above D128, the fp32 copies cost more than
-# mlx's unfused path, so those causal calls keep the stock kernels.
+# mlx 0.32.4 fused SDPA VJP keeps tiles in input dtype; fp32 wins only at 2047+ queries and D64/128.
 _FP32_CAUSAL_HEAD_DIMS = frozenset((64, 128))
 _FP32_CAUSAL_MIN_QUERIES = 2047
 

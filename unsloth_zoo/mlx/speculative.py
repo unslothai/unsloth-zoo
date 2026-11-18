@@ -939,10 +939,8 @@ class DraftController:
         self._measured_at[(bucket, "plain")] = self.steps
 
     def deepening_pays(self, plan: RoundPlan, rows: Sequence[RowState], retry: bool = False) -> bool:
-        """Whether rounds drafted past ``plan``'s depth have emitted tokens faster than ``plan`` would; assumed so for the first few.
-        Trimmed ones compare their cycles with the regular cycle of the width the trim would have verified instead. With
-        ``retry``, a losing verdict admits one deeper round after a doubling gap of tokens: a verdict no deeper round can
-        revise would let the few rounds of its trial decide for the whole load."""
+        """Whether deeper rounds beat the plan rate (assumed so for the first few); with retry, a
+        losing verdict admits one deeper round after a doubling gap of tokens."""
         if self.deepened_cost.count < self._DEEPENED_TRIAL:
             return True
         reference = self.deepened_reference.value if self.deepened_profile is not None else self.round_seconds(plan, rows)
