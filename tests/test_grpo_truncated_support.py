@@ -181,21 +181,32 @@ def test_kill_switch_warns_once_only_when_vllm_logps_are_consumed(monkeypatch, c
 
 
 @pytest.mark.parametrize("value", [None, "", "auto", "weird"])
-def test_default_scores_the_full_vocabulary_and_warns_once_when_truncated_logps_are_consumed(monkeypatch, caplog, value):
-    # Kept-set scoring is opt-in via UNSLOTH_GRPO_TRUNCATED_SUPPORT=1: by default the full vocabulary is scored like TRL < 1.17
-    # and verl, even for truncated vLLM logprobs feeding IS or the off-policy mask.
+def test_default_scores_the_kept_set_when_truncated_logps_feed_the_is_correction(monkeypatch, caplog, value):
+    # Kept set when processed logprobs feed the IS correction; otherwise full vocabulary + one warning.
     if value is None:
         monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
     else:
         monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", value)
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER", "pytorch")
     caplog.set_level(logging.WARNING)
     rr.logger.propagate = True
     quiet = _trainer(top_p = 0.9, is_correction = False)
     assert rr.grpo_truncated_support_kwargs(quiet) == {}
     assert "UNSLOTH_GRPO_TRUNCATED_SUPPORT" not in caplog.text
 
-    for t in (_trainer(top_p = 0.9), _trainer(min_p = 0.1), _trainer(top_k = 20, top_p = 0.95, min_p = 0.05),
-              _trainer(top_k = 20, is_correction = False, off_policy = 0.5)):
+    for t, triple in (
+        (_trainer(top_p = 0.9), (0, 0.9, 0.0)),
+        (_trainer(min_p = 0.1), (0, 1.0, 0.1)),
+        (_trainer(top_k = 20, top_p = 0.95, min_p = 0.05), (20, 0.95, 0.05)),
+    ):
+        got = rr.grpo_truncated_support_kwargs(t)
+        assert _support_only(got) == dict(zip(("support_top_k", "support_top_p", "support_min_p"), triple))
+        assert rr.grpo_truncated_support_automatic(t)
+    assert caplog.text == ""
+
+    for t in (_trainer(top_k = 20, is_correction = False, off_policy = 0.5),
+              _trainer(min_p = 0.1, logprobs_mode = "raw_logprobs"),
+              _trainer(min_p = 0.1, logprobs_mode = None)):
         caplog.clear()
         assert rr.grpo_truncated_support_kwargs(t) == {}
         assert rr.grpo_truncated_support_kwargs(t) == {}
@@ -208,6 +219,45 @@ def test_default_scores_the_full_vocabulary_and_warns_once_when_truncated_logps_
     assert caplog.text == ""
 
 
+@pytest.mark.parametrize("hip, cuda, expected", [(None, True, True), ("7.2.0", True, False), (None, False, False)])
+def test_automatic_platform_gate(monkeypatch, hip, cuda, expected):
+    monkeypatch.undo()
+    monkeypatch.setattr(rr.torch.version, "hip", hip)
+    monkeypatch.setattr(rr.torch.cuda, "is_available", lambda: cuda)
+    monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER", "pytorch")
+    assert rr._grpo_truncated_support_auto_platform() is expected
+    assert bool(rr.grpo_truncated_support_kwargs(_trainer(min_p = 0.1))) is expected
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
+    assert rr.grpo_truncated_support_kwargs(_trainer(min_p = 0.1))
+
+
+def test_automatic_needs_sampling_temperature_and_a_known_processed_engine(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
+    assert rr.grpo_truncated_support_automatic(_trainer(min_p = 0.1, temperature = 0.7))
+    assert not rr.grpo_truncated_support_automatic(_trainer(min_p = 0.1, temperature = 0.0))
+    assert not rr.grpo_truncated_support_automatic(_trainer(min_p = 0.1, logprobs_mode = "raw_logprobs"))
+    assert not rr.grpo_truncated_support_automatic(_trainer(min_p = 0.1, logprobs_mode = None))
+    assert not rr.grpo_truncated_support_automatic(_trainer(min_p = 0.1, is_correction = False, off_policy = 0.5))
+    assert not rr.grpo_truncated_support_automatic(_trainer(is_correction = True))
+    t = _trainer(min_p = 0.1, logprobs_mode = None)
+    mode = types.SimpleNamespace(value = "processed_logprobs")
+    t.vllm_generation = types.SimpleNamespace(llm = types.SimpleNamespace(llm_engine = types.SimpleNamespace(
+        vllm_config = types.SimpleNamespace(model_config = types.SimpleNamespace(logprobs_mode = mode)))))
+    assert rr.grpo_truncated_support_automatic(t)
+
+
+def test_automatic_blockers_fall_back_with_an_automatic_message(monkeypatch, caplog):
+    monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
+    caplog.set_level(logging.WARNING)
+    rr.logger.propagate = True
+    t = _trainer(top_p = 0.9, temperature = 1.0, repetition_penalty = 1.1)
+    assert rr.grpo_truncated_support_kwargs(t) == {}
+    assert rr.grpo_truncated_support_kwargs(t) == {}
+    assert caplog.text.count("automatic for truncated vLLM rollouts feeding the IS correction") == 1
+    assert "ignoring UNSLOTH_GRPO_TRUNCATED_SUPPORT=1" not in caplog.text
+
+
 def test_decision_table(monkeypatch):
     # (setting, truncated, IS correction, off-policy mask, logprobs_mode) -> kept-set scoring?
     for setting in (None, "0", "1", "auto"):
@@ -215,7 +265,8 @@ def test_decision_table(monkeypatch):
             for is_correction in (False, True):
                 for off_policy in (None, 0.5):
                     for logprobs_mode in ("processed_logprobs", "raw_logprobs", None):
-                        expected = truncated and setting == "1"
+                        expected = truncated and (setting == "1" or (
+                            setting in (None, "auto") and is_correction and logprobs_mode == "processed_logprobs"))
                         if setting is None:
                             monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
                         else:
@@ -251,10 +302,9 @@ def _grpo_loss_and_grad(logits, ids, sampling_logps, advantages, kwargs):
 
 
 @pytest.mark.parametrize("top_p, top_k, min_p", CASES + [(1.0, 1, 0.0)])
-def test_default_loss_and_gradient_are_the_full_vocabulary_ones(monkeypatch, top_p, top_k, min_p):
-    # Default GRPO loss and gradient, with truncated processed vLLM logprobs feeding the IS correction, are exactly
-    # those of the full-vocabulary scorer: TRL's objective, the 2084 parent's default.
-    monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
+def test_kill_switch_loss_and_gradient_are_the_full_vocabulary_ones(monkeypatch, top_p, top_k, min_p):
+    # =0 matches the full-vocabulary scorer exactly (TRL < 1.17).
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "0")
     g = torch.Generator().manual_seed(5)
     logits = torch.randn(6, 96, generator = g, dtype = torch.float64) * 3
     processed = _vllm_processed_logprobs(logits, 1.0, top_k, top_p, min_p)
@@ -275,16 +325,16 @@ def test_default_loss_and_gradient_are_the_full_vocabulary_ones(monkeypatch, top
     ([[2.0, 1.0, 0.0]], 1, 0.0),     # top_k = 1
     ([[4.0, 0.0, -1.0]], 0, 0.1),    # min_p leaves one token
 ], ids = ["top_k_1", "min_p_singleton"])
-def test_singleton_kept_set_keeps_the_default_gradient(monkeypatch, logits, top_k, min_p):
+def test_singleton_kept_set_gradient_per_setting(monkeypatch, logits, top_k, min_p):
     # A kept set of one token renormalises to log 1 = 0, so scoring over it gives zero policy gradient whatever the
-    # advantage; the default full vocabulary keeps the signal, =1 opts in.
+    # advantage (as in TRL >= 1.17); =0 keeps the full-vocabulary signal.
     logits = torch.tensor(logits, dtype = torch.float64)
     ids = torch.tensor([0])
     processed = _vllm_processed_logprobs(logits, 1.0, top_k, 1.0, min_p)
     assert torch.isfinite(processed).sum() == 1
     sampling = processed.gather(1, ids[:, None]).squeeze(1)
     advantages = torch.ones(1, dtype = torch.float64)
-    monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "0")
     kwargs = rr.grpo_truncated_support_kwargs(_trainer(top_k = top_k, min_p = min_p))
     _, grad, logps = _grpo_loss_and_grad(logits, ids, sampling, advantages, kwargs)
     p = torch.softmax(logits, -1)[0]
@@ -293,11 +343,15 @@ def test_singleton_kept_set_keeps_the_default_gradient(monkeypatch, logits, top_
     # Full-vocabulary policy gradient for a positive advantage: raise token 0's logit, lower the others.
     assert grad[0, 0] < 0 and (grad[0, 1:] > 0).all()
 
-    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
-    kwargs = rr.grpo_truncated_support_kwargs(_trainer(top_k = top_k, min_p = min_p))
-    assert _support_only(kwargs) == {"support_top_k": top_k, "support_top_p": 1.0, "support_min_p": min_p}
-    _, grad, logps = _grpo_loss_and_grad(logits, ids, sampling, advantages, kwargs)
-    assert torch.equal(logps, torch.zeros_like(logps)) and torch.equal(grad, torch.zeros_like(grad))
+    for setting in (None, "1"):
+        if setting is None:
+            monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
+        else:
+            monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", setting)
+        kwargs = rr.grpo_truncated_support_kwargs(_trainer(top_k = top_k, min_p = min_p))
+        assert _support_only(kwargs) == {"support_top_k": top_k, "support_top_p": 1.0, "support_min_p": min_p}
+        _, grad, logps = _grpo_loss_and_grad(logits, ids, sampling, advantages, kwargs)
+        assert torch.equal(logps, torch.zeros_like(logps)) and torch.equal(grad, torch.zeros_like(grad))
 
 
 @pytest.mark.parametrize("top_p, top_k, min_p", CASES)
@@ -434,8 +488,38 @@ def test_default_warning_describes_trl_117_kept_set_scoring(monkeypatch, caplog)
     monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
     caplog.set_level(logging.WARNING)
     rr.logger.propagate = True
-    assert rr.grpo_truncated_support_kwargs(_trainer(top_p = 0.9)) == {}
+    assert rr.grpo_truncated_support_kwargs(_trainer(top_p = 0.9, is_correction = False, off_policy = 0.5)) == {}
     text = caplog.text
     assert "as TRL does" not in text
-    assert "TRL 1.17" in text and "kept set" in text
+    assert "TRL >= 1.17" in text and "kept set" in text
     assert "as TRL and verl do" not in (rr.grpo_truncated_support_kwargs.__doc__ or "")
+
+
+@pytest.mark.parametrize("top_p, top_k, min_p", [(1.0, 0, 0.1), (1.0, 0, 0.05), (0.9, 0, 0.0), (0.95, 20, 0.02)])
+def test_default_is_ratio_is_one_against_vllm_processed_logprobs(monkeypatch, top_p, top_k, min_p):
+    # The reported bug: on-policy IS ratio must be 1 per token, not the kept mass (~0.97 at min_p = 0.1).
+    monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER", "pytorch")
+    g = torch.Generator().manual_seed(11)
+    logits = torch.randn(64, 256, generator = g, dtype = torch.float64) * 4
+    processed = _vllm_processed_logprobs(logits, 1.0, top_k, top_p, min_p)
+    ids = _sample_kept(processed, g)
+    vllm_logps = processed.gather(1, ids[:, None]).squeeze(1)
+    kwargs = rr.grpo_truncated_support_kwargs(_trainer(top_k = top_k, top_p = top_p, min_p = min_p))
+    old = rr.chunked_selective_log_softmax(logits.float().unsqueeze(0), ids[None], 1.0, 1, **kwargs).reshape(-1)
+    ratio = (old.double() - vllm_logps).exp()
+    full_ratio = (torch.log_softmax(logits, -1).gather(1, ids[:, None]).squeeze(1) - vllm_logps).exp()
+    assert full_ratio.mean() < 0.999  # the bias is there to remove
+    torch.testing.assert_close(ratio, torch.ones_like(ratio), atol = 2e-5, rtol = 0)
+    _, grad, _ = _grpo_loss_and_grad(logits, ids, vllm_logps, torch.ones(64, dtype = torch.float64), kwargs)
+    assert torch.isfinite(grad).all() and grad.abs().sum() > 0
+
+
+def test_default_is_correction_off_stays_full_vocabulary_and_silent(monkeypatch, caplog):
+    monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
+    caplog.set_level(logging.WARNING)
+    rr.logger.propagate = True
+    for t in (_trainer(min_p = 0.1, is_correction = False), _trainer(top_p = 0.9, top_k = 20, is_correction = False)):
+        assert rr.grpo_truncated_support_kwargs(t) == {}
+        assert not rr.grpo_truncated_support_automatic(t)
+    assert caplog.text == ""
