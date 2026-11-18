@@ -25,12 +25,15 @@ import torch
 
 from unsloth_zoo import rl_replacements as rr
 
-_ENVS = ("UNSLOTH_GRPO_CHUNKED_LOGPROBS", "UNSLOTH_VLLM_FP32_LM_HEAD", "UNSLOTH_GRPO_LOGPROB_RECOMPUTE")
+_ENVS = ("UNSLOTH_GRPO_CHUNKED_LOGPROBS", "UNSLOTH_VLLM_FP32_LM_HEAD", "UNSLOTH_GRPO_LOGPROB_RECOMPUTE",
+         "UNSLOTH_GRPO_KEPT_SET_RECOMPUTE")
 
 _CASES = {
     "default": ({}, {}),
     "fp32_head": ({"UNSLOTH_VLLM_FP32_LM_HEAD": "1"}, {}),
     "truncated_support": ({}, {"support_top_k": 20}),
+    # The kept-set scorer's kill switch restores the old one, which keeps every chunk's logits.
+    "kept_set_kill": ({"UNSLOTH_GRPO_KEPT_SET_RECOMPUTE": "0"}, {"support_top_k": 20}),
     "kill_switch": ({"UNSLOTH_GRPO_CHUNKED_LOGPROBS": "0"}, {}),
 }
 
@@ -71,13 +74,15 @@ def test_grpo_scorer_keeps_logits_truth_table(monkeypatch):
     ("default", 2000, 2, False, False),
     ("default", 100, 16, False, False),
     ("fp32_head", 2000, 2, False, True),
-    ("truncated_support", 2000, 2, False, True),
+    ("truncated_support", 2000, 2, False, False),
+    ("kept_set_kill", 2000, 2, False, True),
     ("kill_switch", 2000, 2, False, True),
     ("kill_switch", 100, 16, False, True),
     ("kill_switch", 100, 4, False, False),
     ("kill_switch", 100, 1, False, False),
     ("kill_switch", 2000, 2, True, False),
-    ("truncated_support", 2000, 2, True, True),
+    ("truncated_support", 2000, 2, True, False),
+    ("kept_set_kill", 2000, 2, True, True),
 ])
 def test_efficient_log_softmax_offloads_only_for_the_old_scorer(monkeypatch, case, length, batch, recompute, offloaded):
     env, support = _CASES[case]

@@ -4440,10 +4440,12 @@ def grpo_accumulated_loss(
                                 logit_softcapping=0.0, temperature=1, batch_size=8,
                                 lm_head_bias=None):
             # The old chunked scorer keeps every chunk's logits, so long completions keep the offloaded scorer.
+            # The kept-set scorer recomputes its logits in backward, unless UNSLOTH_GRPO_KEPT_SET_RECOMPUTE=0.
             from unsloth_zoo.rl_replacements import grpo_scorer_keeps_logits as _keeps_logits
             _plain = os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") != "1"
+            _kept_set_keeps = bool(_support_kwargs) and os.environ.get("UNSLOTH_GRPO_KEPT_SET_RECOMPUTE", "1") == "0"
             if not ((index.shape[1] <= 1024 and batch_size <= 8) or batch_size == 1) \
-                    and (bool(_support_kwargs) or (_plain and _keeps_logits())):
+                    and (_kept_set_keeps or (_plain and _keeps_logits())):
                 return Unsloth_Offloaded_Log_Softmax.apply(
                     hidden_states, lm_head, index, chunks,
                     logit_scale_multiply, logit_scale_divide,

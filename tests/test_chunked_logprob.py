@@ -384,14 +384,17 @@ def test_grpo_scorer_keeps_logits_truth_table(monkeypatch):
     assert rr.grpo_scorer_keeps_logits()
 
 
-@pytest.mark.parametrize("fused, support, length, batch, offloaded", [
-    (True, {}, 2000, 16, False),            # fused scorer: recomputes in backward, never offloads
-    (False, {}, 2000, 16, True),            # kill switch: the old scorer keeps logits, long completions offload
-    (True, {"support_top_k": 20}, 2000, 16, True),
-    (False, {}, 100, 4, False),             # short completions: the plain path, as before
+@pytest.mark.parametrize("fused, support, length, batch, offloaded, kept_set_recompute", [
+    (True, {}, 2000, 16, False, "1"),            # fused scorer: recomputes in backward, never offloads
+    (False, {}, 2000, 16, True, "1"),            # kill switch: the old scorer keeps logits, long completions offload
+    (True, {"support_top_k": 20}, 2000, 16, False, "1"),  # kept-set scorer: recomputes in backward too
+    (True, {"support_top_k": 20}, 2000, 16, True, "0"),   # its kill switch: the old scorer again
+    (False, {}, 100, 4, False, "1"),             # short completions: the plain path, as before
 ])
-def test_efficient_log_softmax_offloads_only_for_the_old_scorer(monkeypatch, fused, support, length, batch, offloaded):
+def test_efficient_log_softmax_offloads_only_for_the_old_scorer(monkeypatch, fused, support, length, batch, offloaded,
+                                                                 kept_set_recompute):
     import os, textwrap
+    monkeypatch.setenv("UNSLOTH_GRPO_KEPT_SET_RECOMPUTE", kept_set_recompute)
     monkeypatch.delenv("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", raising = False)
     monkeypatch.delenv("UNSLOTH_GRPO_CHUNKED_LOGPROBS", raising = False)
     monkeypatch.delenv("UNSLOTH_VLLM_FP32_LM_HEAD", raising = False)
