@@ -39,12 +39,14 @@ SCRIPT = textwrap.dedent(
     runtime_path, data_dir, pre_import = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
     if pre_import:
         import datasets.packaged_modules.folder_based_builder.folder_based_builder
+    # datasets < 5 imports torch with its folder builder; what is checked is that the patches add none.
+    torch_before = "torch" in sys.modules
     spec = importlib.util.spec_from_file_location("mlx_runtime_under_test", runtime_path)
     runtime = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(runtime)
     runtime.install_mlx_security_patches()
     runtime.install_mlx_security_patches()
-    assert "torch" not in sys.modules
+    assert ("torch" in sys.modules) == torch_before
     from datasets import load_dataset
     try:
         ds = load_dataset("imagefolder", data_dir = data_dir, split = "train", cache_dir = data_dir + "_cache")
