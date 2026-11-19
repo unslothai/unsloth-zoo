@@ -293,8 +293,7 @@ if triton is not None:
             s = _rnd(_div_rn(g, 1.0 + libdevice.exp(-g)), ROUND, DT)
             d_up = dy * s
             d_s = _rnd(dy * u, ROUND, DT)
-            # nvcc contracts silu_backward's inner mul-add to an fma. tl.fma (fma.rn.f32, Triton >= 3.0), not
-            # libdevice.fma: Triton main removed libdevice.fma / fma_rn.
+            # nvcc fuses this mul-add to an fma; tl.fma since Triton main removed libdevice.fma.
             d_gate = (d_s * sig) * tl.fma(g, 1.0 - sig, 1.0)
         d_gate = d_gate.to(DT)
         d_up = d_up.to(DT)
