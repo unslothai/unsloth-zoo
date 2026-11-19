@@ -280,3 +280,33 @@ def test_ds_id_parameters_never_dedup():
     for p in model.parameters():
         p.ds_id = 0
     assert vision_dedup.install_image_dedup(model) == 0
+
+
+def test_tower_sharded_after_install_never_self_checks(tmp_path):
+    # FSDP2 shards inside train(), after the trainer installed dedup: the wrapper must see the DTensor
+    # parameters at call time and run one per-row encode, never a rank-local self-check forward.
+    import torch.distributed as dist
+    try:
+        from torch.distributed.fsdp import fully_shard
+    except ImportError:
+        pytest.skip("fully_shard needs torch >= 2.6")
+    proc, model = _load("qwen2_5_vl")
+    assert vision_dedup.install_image_dedup(model) > 0
+    inputs = _batch(proc)
+    tower = _tower(model)
+    started = False
+    if not dist.is_initialized():
+        dist.init_process_group("gloo", init_method = f"file://{tmp_path / 'pg'}", rank = 0, world_size = 1)
+        started = True
+    try:
+        fully_shard(tower)
+        calls = []
+        hook = tower.register_forward_hook(lambda m, a, o: calls.append(1))
+        with torch.no_grad():
+            model(**inputs)
+        hook.remove()
+    finally:
+        if started:
+            dist.destroy_process_group()
+    assert len(calls) == 1
+    assert not any(m.__dict__.get(vision_dedup._VERIFIED, False) for m in vision_dedup._image_modules(model))

@@ -30,6 +30,7 @@ import functools
 import inspect
 import logging
 import os
+import weakref
 
 import torch
 
@@ -268,6 +269,30 @@ def _fallback(module, reason):
     logger.warning(f"Unsloth: encoding every image again for {type(module).__name__} ({reason}).")
 
 
+try:
+    from torch.distributed.tensor import DTensor as _DTensor
+except Exception:
+    try:
+        from torch.distributed._tensor import DTensor as _DTensor
+    except Exception:
+        _DTensor = None
+
+
+def _sharded_parameters(module):
+    # FSDP2 (DTensor) or ZeRO-3 (ds_id) parameters all-gather on every forward. Sharding happens inside
+    # train(), after install: fully_shard replaces the Parameter objects, so the answer is cached against
+    # the first parameter's identity and re-read once it changes.
+    first = next(module.parameters(), None)
+    cached = module.__dict__.get("_unsloth_image_dedup_sharded", None)
+    if cached is not None and cached[0]() is first:
+        return cached[1]
+    value = any(
+        hasattr(p, "ds_id") or (_DTensor is not None and isinstance(p, _DTensor)) for p in module.parameters()
+    )
+    module.__dict__["_unsloth_image_dedup_sharded"] = (weakref.ref(first) if first is not None else (lambda: None), value)
+    return value
+
+
 def _zero3(module):
     # DeepSpeed ZeRO-3 gathers each partitioned parameter on every forward (a collective on every rank).
     try:
@@ -276,16 +301,12 @@ def _zero3(module):
             return True
     except Exception:
         pass
-    cached = module.__dict__.get("_unsloth_image_dedup_zero3", None)
-    if cached is None:
-        cached = any(hasattr(p, "ds_id") for p in module.parameters())
-        module.__dict__["_unsloth_image_dedup_zero3"] = cached
-    return cached
+    return _sharded_parameters(module)
 
 
 def _collective(module):
-    # Resharding FSDP2 towers and ZeRO-3 partitioned towers all-gather per forward; a rank-local
-    # self-check or fallback forward would hang the other ranks.
+    # FSDP2 (Unsloth's resharding layout or any DTensor-sharded tower) and ZeRO-3 towers all-gather per
+    # forward; a rank-local self-check or fallback forward would hang the other ranks.
     if _zero3(module):
         return True
     try:
