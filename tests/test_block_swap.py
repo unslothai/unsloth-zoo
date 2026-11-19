@@ -634,9 +634,7 @@ def test_cross_fed_tensor_grads_are_bitwise_with_swap():
 
 
 class _IdsBranchBlock(nn.Module):
-    """A block with a branch fed only by a no-grad input (per-layer token-id embeddings, as Qwen4Exp's PLE keys or
-    Gemma-3n's per-layer inputs): its backward reads the frozen norm weight `n` (saved as the parameter itself, as an
-    RMSNorm's is) to reach the adapter `lora_k`, never the block input."""
+    """No-grad-input branch: backward reaches lora_k through the frozen norm weight, not the block input."""
 
     def __init__(self, d):
         super().__init__()
@@ -1179,8 +1177,7 @@ def test_grow_pool_adds_a_slot_only_with_room_for_the_next_step(monkeypatch):
 def test_grow_pool_ignores_the_load_time_peak(monkeypatch):
     if not torch.cuda.is_available():
         __import__("pytest").skip("needs CUDA")
-    # The process peak still holds the model load (already there at install); only the swap's own last step
-    # counts as headroom.
+    # Peak already holds the model load; only the swap's last step counts as headroom.
     blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
     now = torch.cuda.memory_allocated()
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a, **k: now + (64 << 30))
@@ -2263,8 +2260,7 @@ def test_an_oversized_release_raises_the_published_reservation():
 
 
 def test_committed_chunk_padding_is_not_reserved_again():
-    # 32 blocks of 3 GiB in 4 GiB chunks: 128 GiB in all. With half packed, 64 GiB is committed (padding
-    # included), so 64 GiB is still to come, not 128 - 48.
+    # Committed chunks include padding, so the pending bytes are 64 GiB, not 128 - 48 GiB.
     commits = _mod._chunked_commits([{"cuda": 3 * _GiB}] * 32)
     assert commits[-1] == 128 * _GiB and commits[15] == 64 * _GiB
     walk = _mod._HostWalk(commits, [0] * 32, 3 * _GiB)

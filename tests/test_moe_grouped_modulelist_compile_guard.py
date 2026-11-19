@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The grouped ModuleList MoE forward compiles once: its engagement counters are eager only.
-
-A traced `CALLS["grouped"] += 1` makes Dynamo guard on the counter's old value, so every call
-recompiled (Unsloth's per-layer block compile on transformers 4.x Qwen3-MoE / Mixtral / OLMoE:
-4 recompiles per training step until the region limit, then the block ran eager)."""
+"""Grouped MoE counters stay eager: a traced CALLS increment makes Dynamo recompile every call."""
 import pytest
 import torch
 

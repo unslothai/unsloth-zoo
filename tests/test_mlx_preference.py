@@ -4269,9 +4269,8 @@ def test_grpo_prefix_grouping_gates_layouts_and_models(monkeypatch, capsys):
 
 
 def test_grpo_prefix_grouper_hints_when_admitted_and_gives_each_message_once_per_trainer(monkeypatch, capsys):
-    # Catches a hint for a refused model or config, a hint or refusal suppressed by an earlier different message or by
-    # Python's once-per-line warning filter, a message repeated in one trainer, and, without hint, a hint printed or a
-    # refusal withheld.
+    # Catches hints or refusals lost to an earlier message, the once-per-line warning filter, or
+    # repeats.
     import warnings
     from types import SimpleNamespace
     from unsloth_zoo.mlx import grpo

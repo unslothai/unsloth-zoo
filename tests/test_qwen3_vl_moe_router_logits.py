@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Patched Qwen3-VL-MoE must still expose the gate's router logits for output_router_logits / the aux loss.
-
-On transformers 4.57.x the router logits are recorded from the sparse MoE block's output at index 1,
-so a patched block that returns only the hidden states makes the aux loss read hidden states as logits.
-"""
+"""Patched Qwen3-VL-MoE blocks must return router logits at index 1 (transformers 4.57.x); returning
+only hidden states makes the aux loss read hidden states as logits."""
 import inspect
 
 import pytest

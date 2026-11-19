@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""HF_HUB_OFFLINE with the base in the Hugging Face cache: a 16bit merge must work.
-
-The resolver asked the Hub about any repo id, and offline that raised "could not reach the
-Hub", so a merge whose base was already cached failed before reading a byte.
-"""
+"""HF_HUB_OFFLINE: a 16bit merge with a cached base must not query the Hub, which fails offline."""
 
 from __future__ import annotations
 
@@ -43,9 +39,7 @@ def _merge_on_the_cpu(monkeypatch):
 
 
 def _reset_hub_sessions():
-    # huggingface_hub 0.x builds one HTTP session per thread and mounts its offline adapter only then, so a
-    # session an earlier test opened online keeps reaching the network after HF_HUB_OFFLINE is turned on. 1.x
-    # checks offline mode per request and has no such cache.
+    # huggingface_hub 0.x sessions opened online ignore later HF_HUB_OFFLINE; reset them.
     from huggingface_hub import utils as hub_utils
 
     reset = getattr(hub_utils, "reset_sessions", None)
@@ -137,8 +131,7 @@ def test_merged_16bit_from_a_cached_base_offline(monkeypatch, tmp_path):
 
 
 def test_offline_mode_holds_after_an_online_session_was_opened(monkeypatch, tmp_path):
-    # Order independence: a session opened while online (any earlier Hub test in this worker) must not let
-    # the offline checks below reach the network.
+    # A session opened while online must not let the offline checks below reach the network.
     from huggingface_hub.utils import get_session
 
     get_session()

@@ -2,9 +2,8 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""float32 activations offload exactly when no autocast is active (true float32 training: bf16 storage drifted grads
-~0.1%) and as bfloat16 under autocast (FORCE_FLOAT32 residuals), with UNSLOTH_OFFLOAD_FP32=exact|bf16 overrides.
-Streams are stubbed so the end-to-end checks run on CPU."""
+"""float32 activations offload exactly without autocast (bf16 storage drifted grads), else as
+bfloat16 under autocast (FORCE_FLOAT32 residuals); UNSLOTH_OFFLOAD_FP32=exact|bf16 overrides."""
 import contextlib
 
 import pytest

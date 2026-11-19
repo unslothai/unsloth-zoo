@@ -14,15 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Gemma-4 is in FORCE_FLOAT32: on a GPU without bfloat16 an fp16 request sets UNSLOTH_FORCE_FLOAT32=1, and full
-finetuning then trains the model in float32 with no autocast. The patched RMSNorm always returned float16, and every
-decoder boundary casts back to its Linear's dtype, but the final norm feeds lm_head directly, so the first forward
-died with "expected mat1 and mat2 to have the same dtype, but got: c10::Half != float" at lm_head (Kaggle T4, MoE
-matrix, Gemma-4 loaded alone). Now the norms follow the projections' dtype when no autocast is active: a float32
-model matches vanilla transformers in float32, and the fp16 paths (autocast training, no-autocast eval) still run.
-
-CPU subprocesses: the patches gate on UNSLOTH_FORCE_FLOAT32 at patch time, and the reference never imports the zoo.
-"""
+"""Gemma-4 norms follow the projections dtype when no autocast (a hard float16 cast broke lm_head);
+a float32 model matches vanilla; fp16 autocast and eval still run; env UNSLOTH_FORCE_FLOAT32."""
 
 import json
 import os

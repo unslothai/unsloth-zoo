@@ -28,9 +28,8 @@ from unsloth_zoo.mlx.generate import (  # noqa: E402
 
 @pytest.fixture(autouse = True)
 def _no_simulated_mlx_vlm_model_module_outlives_its_test():
-    """A placeholder mlx_vlm.models.* module left in sys.modules makes every later test here see a fake model
-    package: probes such as getattr(language, "Qwen4ExpQSAIndexer", None) then return shim placeholders that are
-    not classes. Skip the test under the shim, or import through monkeypatch.setitem."""
+    """A leftover mlx_vlm.models.* placeholder in sys.modules makes later probes see shims, not
+    classes; skip the test under the shim or import through monkeypatch.setitem."""
     before = set(sys.modules)
     yield
     leaked = sorted(

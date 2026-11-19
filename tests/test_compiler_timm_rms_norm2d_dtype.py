@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""RmsNorm2d / RmsNormAct2d keep the input dtype after compile_timm_models (Gemma 3N fp16 on T4).
-Runs in a fresh interpreter since the compiler mutates timm."""
+"""Fresh interpreter: compile_timm_models mutates timm. RmsNorm2d keeps the input dtype."""
 
 from __future__ import annotations
 

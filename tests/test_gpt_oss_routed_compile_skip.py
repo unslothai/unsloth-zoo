@@ -22,9 +22,8 @@ import torch
 
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 def test_table_check_runs_eagerly_when_the_compiled_frame_is_skipped():
-    # Inductor raises SkipFrame for a graph it cannot compile (bfloat16 on a T4): the frame then runs eagerly, so
-    # its eager-only branch calls prepare_routed_experts while Dynamo still intercepts nested frames. Tracing it
-    # there fails (operator.itemgetter / data_ptr), so it must stay out of Dynamo.
+    # Inductor SkipFrame runs the table check eagerly; tracing it under Dynamo fails, so it stays
+    # out.
     import torch._dynamo
     from torch._dynamo.exc import SkipFrame
     from unsloth_zoo.temporary_patches import gpt_oss_routed as routed

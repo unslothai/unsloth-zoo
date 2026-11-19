@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The verifier's GGUF reader matches stock GGUFReader on everything the verifier reads
-(or fails with the same error), without one numpy view per vocabulary entry."""
+"""Verifier's GGUF reader matches stock GGUFReader without a numpy view per vocab entry."""
 import struct
 
 import pytest

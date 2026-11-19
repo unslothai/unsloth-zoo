@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""grpo_accumulated_loss routed through fused_linear_grpo_loss against the log-prob route (fused_linear_logprobs +
-UnslothEfficientGRPO + UnslothGRPOEntropyBonus): loss, metrics and every parameter gradient, on the padded and the
-sequence-packed forward, plus the routing decisions."""
+"""fused_linear_grpo_loss route must match the log-prob route: loss, metrics and gradients."""
 import math
 import os
 import types

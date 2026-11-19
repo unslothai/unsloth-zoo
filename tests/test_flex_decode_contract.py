@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The shared one-token flex decode contract (unsloth_zoo.flex_attention.decode) against float64 references: the
-mask against an explicit visibility rule, sinks against the official gpt-oss attention, softcap, a BlockMask refilled
-the way CUDA-graph decode refills it, and the graph identity."""
+"""unsloth_zoo.flex_attention.decode one-token contract vs float64 references: mask, sinks, softcap."""
 
 import os
 import warnings

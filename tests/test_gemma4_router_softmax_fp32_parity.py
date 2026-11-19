@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""higher_precision_softmax must not downcast a softmax the source already runs in float32.
-
-Gemma-4's router computes `softmax(expert_scores, dim=-1, dtype=torch.float32)` and takes top-k, renormalises and
-applies per_expert_scale in float32. Appending `.to(expert_scores.dtype)` there rounds the routing weights to bf16
-before top-k, which flips near-tied experts and moves bf16 logits far past transformers' own bf16 error. CPU only,
-tiny random model built from a config (no download).
-"""
+"""higher_precision_softmax must not downcast a float32 softmax; a bf16 cast flips near-tied experts."""
 
 import inspect
 import textwrap

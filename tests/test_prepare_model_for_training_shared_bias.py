@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU regression: every owner of a tied bias must cast the same float32 master.
-
-named_parameters() deduplicates tied Parameters, so only the first owner of a tied
-float16 bias used to get the forward cast; the second (BERT `cls.predictions.bias` is
-`decoder.bias`, RoBERTa `lm_head.bias` is `decoder.bias`) then ran a Float bias against a
-Half weight. Generic master behaviour (generate, compile, pickling, offload) is covered in
-test_prepare_model_for_training_bias.py; this file only pins the tied-owner case."""
+"""Each owner of a tied float16 bias needs the master cast; named_parameters() dedups tied owners."""
 import pytest
 import torch
 

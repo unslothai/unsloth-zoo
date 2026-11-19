@@ -519,10 +519,8 @@ def test_flex_grads_match_upstream_on_an_empty_real_selection(monkeypatch, attn)
     valid = mask[..., None]
     torch.testing.assert_close(out * valid, ref_out * valid, atol = 1e-5, rtol = 1e-5)
     assert ref_grads.keys() == grads.keys()
-    # A str msg would replace assert_close's report (mismatch count, greatest differences); keep it, for every parameter.
-    # The summed loss puts these gradients in the hundreds, where fp32 reduction order alone moves an element by up
-    # to ~4e-6 of the parameter's largest gradient (5e-4 absolute over 12 seeds): a fixed atol of 1e-4 sat on that
-    # floor and failed on one element per run on some CI hosts. Scale atol with the parameter instead.
+    # Scale atol with each gradient's max (fixed 1e-4 sat on the fp32 reduction-order floor); keep
+    # the assert_close report per parameter, not a str msg.
     mismatched = []
     for name in ref_grads:
         atol = 2e-5 * max(1.0, ref_grads[name].abs().max().item())

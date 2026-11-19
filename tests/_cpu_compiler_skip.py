@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Skip the CPU subprocess checks up front when CPU Inductor has no C++ compiler here.
-
-CPU Inductor needs a C++ compiler; AMD Windows boxes often have none. The checks themselves run unchanged.
-"""
+"""Skip CPU subprocess checks when CPU Inductor has no C++ compiler; AMD Windows often lacks one."""
 
 import json
 import os

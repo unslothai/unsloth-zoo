@@ -531,9 +531,8 @@ def test_backward_checkpoints_block_boundaries_not_steps(T):
 @metal_only
 @pytest.mark.parametrize("stack", ["mlx_lm", "mlx_vlm"])
 def test_a_training_continuation_from_a_given_state_takes_the_kernel(monkeypatch, stack):
-    """A shared-prompt row continues from its prompt's recorded state, which carries the prompt's gradient: in the
-    training window it takes the fused kernel and matches the route it replaces, d_state included; stateful inference
-    keeps its route."""
+    """A shared-prompt row continuing from its recorded state takes the fused kernel in training and
+    matches the replaced route, d_state included; stateful inference keeps its route."""
     import importlib
     import unsloth_zoo.gated_delta_vjp as gdv
     from unsloth_zoo.mlx.utils import acquire_mlx_training_patches, release_mlx_training_patches

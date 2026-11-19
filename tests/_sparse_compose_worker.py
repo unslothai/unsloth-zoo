@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""python _sparse_compose_worker.py {skip_first|flex_first} [model_type ...]: checks skip and flex patches compose.
-
-One process per install order: every family's skip patch goes before (or after) its flex patch, the order under
-test; each family is then checked on its own (environment restored, a failure reported for that family only)."""
+"""Checks skip and flex patches compose per install order, one process per order; each family is
+checked alone, its failure reported for that family only, env restored."""
 
 import os
 import sys

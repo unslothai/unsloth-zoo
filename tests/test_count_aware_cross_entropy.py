@@ -495,8 +495,7 @@ def test_count_aware_ce_rejects_out_of_range_labels(route, monkeypatch):
 
 
 def test_rows_ce_keeps_a_dynamic_vocab_dim_symbolic():
-    # The label check must not specialise the vocab size: no ConstraintViolationError under mark_dynamic,
-    # and one graph across vocab sizes.
+    # Label check must keep the vocab dim symbolic: no ConstraintViolationError, one graph.
     from torch._dynamo.testing import CompileCounter
     from unsloth_zoo.fused_losses.stable_softmax import cross_entropy_rows
     torch._dynamo.reset()

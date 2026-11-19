@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Granite-4 hybrid: float32 norm weights (high precision layernorm) must not feed float32 into 16-bit Linears.
-
-CPU bf16 stands in for the GPU bf16 / fp16 mismatch ("float != BFloat16" at mamba in_proj without autocast).
-"""
+"""Granite-4 hybrid: float32 norm weights must not feed float32 into 16-bit Linears (mamba in_proj)."""
 
 import inspect
 

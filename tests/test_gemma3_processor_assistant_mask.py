@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The patched Gemma3Processor.__call__ must return `text_replacement_offsets` when asked. transformers >= 5.18
-(#48793) shifts assistant spans past expanded image placeholders with them; without them TRL's vision
-`assistant_only_loss` trains on image soft tokens instead of the assistant reply."""
+"""Patched Gemma3Processor.__call__ must return text_replacement_offsets when asked; transformers >=
+5.18 (issue 48793) needs them or assistant_only_loss trains on image tokens."""
 import pytest
 
 transformers = pytest.importorskip("transformers")

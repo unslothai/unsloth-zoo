@@ -194,9 +194,8 @@ def _short_disk_for_backups(monkeypatch, base):
 
 @pytest.mark.parametrize("mode", ["low_disk", "short_disk"])
 def test_failed_later_hub_fetch_keeps_unfetched_shards(tmp_path, monkeypatch, mode):
-    # In low disk mode, or when the disk cannot hold the previous shards beside the new ones,
-    # shards are replaced one at a time (no second copy of the checkpoint), so a network
-    # failure part way only loses the shards already refreshed, and says so.
+    # In low disk mode, or when the disk cannot hold old and new shards together, shards are
+    # replaced one at a time; a failed fetch loses only refreshed shards and says so.
     low_disk = mode == "low_disk"
     base, peft_model = _build(tmp_path, "20KB")
     out = str(tmp_path / "out")
@@ -585,8 +584,7 @@ def test_shard_link_to_the_local_base_shard_is_copied_once(tmp_path, monkeypatch
 
 
 def test_failed_hub_fetch_restores_previous_export_metadata(tmp_path, monkeypatch):
-    # The refresh rewrites config.json and the index before the shard fetch; a rollback of the
-    # shards alone would pair the previous shards with the new metadata.
+    # Rollback must restore config.json and the index, or old shards pair with new metadata.
     import json
 
     base, peft_model = _build(tmp_path, "20KB")
@@ -743,9 +741,8 @@ def test_rollback_and_private_shard_copy_never_carry_setuid(tmp_path):
 
 @pytest.mark.parametrize("relative", [False, True])
 def test_rollback_removes_shards_the_refresh_added(tmp_path, monkeypatch, relative):
-    # A shard name the previous export did not hold, fetched or split before a later step
-    # failed, would otherwise survive the rollback beside the restored shards. A relative
-    # output path must not make every previous shard look new.
+    # Rollback removes shards the refresh added; a relative output path must not make old ones look
+    # new.
     from unsloth_zoo import saving_utils as S
 
     out = tmp_path / "out"
@@ -774,8 +771,7 @@ def test_rollback_removes_shards_the_refresh_added(tmp_path, monkeypatch, relati
 
 
 def test_failed_local_refresh_restores_the_previous_tokenizer_model(tmp_path, monkeypatch):
-    # For a local base, tokenizer.model was copied over the previous one before the snapshot, so a
-    # rollback paired the previous shards with the new tokenizer.
+    # Local base tokenizer.model is copied before the snapshot; rollback must restore it too.
     from unsloth_zoo import saving_utils as S
 
     base, peft_model = _build(tmp_path)

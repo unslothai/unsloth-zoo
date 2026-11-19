@@ -308,9 +308,8 @@ def test_fold_declines_where_base_keeps_cublas(monkeypatch):
 @pytest.mark.parametrize("fresh", [False, True])
 @pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
 def test_fold_traces_without_extra_graphs(monkeypatch, backend, fresh):
-    """Traced callers fold through the opaque op: the same frames and graph breaks as the separated path, the fold op
-    runs forward and dX, and the result matches eager. fresh: traced before the kernel self-check ran (a real
-    training run's first step), which must not cost the fold a recompile."""
+    """Traced fold is one opaque op with the same breaks as the separated path; forward and dX run
+    through it and match eager; a trace before the kernel self-check must not cost a recompile."""
     from torch._dynamo.utils import counters
     _force_triton(monkeypatch)
     if LF._FOLD_OP is None:

@@ -177,8 +177,7 @@ def test_autocast_matches_eager_tiles(in_unsloth_block, monkeypatch):
     # Compiled graphs run with autocast off; the tile body must still see the caller's autocast.
     assert seen and all(seen)
     assert breaks == 0 and y.dtype == yr.dtype
-    # Inductor fuses the tile body (one bf16 rounding where eager rounds per op) and the weights are bf16 too:
-    # compare at a few bf16 ulps (eps 7.8e-3).
+    # Fused tile body rounds once in bf16, weights are bf16: allow a few ulps (eps 7.8e-3).
     for a, b in zip([y] + _grads(block, x), [yr] + _grads(ref, xr)):
         assert (a - b).abs().max() <= 2e-2 * b.abs().max()
 
@@ -479,8 +478,7 @@ def test_an_unchanged_mlp_still_takes_the_op(in_unsloth_block, monkeypatch):
 
 
 def test_a_stochastic_child_added_after_install_replays_rng(in_unsloth_block, monkeypatch):
-    # The cached "no RNG" verdict must be checked against the module tree version: an RReLU added after install
-    # needs RNG replay, which the op does not do.
+    # Cached no-RNG verdict is per tree version: a later RReLU needs RNG replay, not supported.
     torch.manual_seed(0)
     mlp = _LoraMLP()
     R.install_module(mlp, "rows:8")

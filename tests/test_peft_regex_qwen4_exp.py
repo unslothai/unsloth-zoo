@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Qwen4Exp (Qwen3.8-Flash-Next) auto LoRA targets: QSA indexer out, PLE and the hyper-connection mixer in.
-
-Module trees mirror transformers' Qwen4ExpForConditionalGeneration / Qwen4ExpForCausalLM names, so the
-test runs without a transformers that ships qwen4_exp.
-"""
+"""Qwen4Exp auto LoRA: QSA indexer out, PLE and hyper-connection mixer in; mirrored module trees."""
 import re
 from types import SimpleNamespace
 

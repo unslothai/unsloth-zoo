@@ -142,8 +142,7 @@ def _check_cycle(W, A, B, scale, d = None):
 
 
 def run_negative(device):
-    """A corrupted bit stream, a corrupted escape and a changed adapter must each raise, never restore silently (in the
-    stream and in the indexed form)."""
+    """Corrupted stream, escape or adapter must raise, never restore silently."""
     g = torch.Generator(device = device).manual_seed(3)
     cases = [(STREAM, dtype, corrupt) for dtype in DTYPES for corrupt in ("word", "escape", "adapter")]
     cases += [(INDEXED, dtype, corrupt) for dtype in DTYPES for corrupt in ("escape", "adapter")]

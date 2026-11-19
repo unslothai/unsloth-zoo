@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Qwen/Qwen3-ASR-0.6B and -1.7B store weights in the qwen-asr package layout (thinker.*). Unsloth loads them into
-transformers' native Qwen3-ASR names, so a merged export rereading the original checkpoint must map the adapters back,
-or refuse, instead of writing the base weights as a trained model."""
+"""Qwen3-ASR checkpoints use thinker.* names; a merged export must map adapters back or refuse."""
 
 from __future__ import annotations
 

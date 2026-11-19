@@ -80,8 +80,7 @@ def _block_swapped_lora_llama(tie, pad, evict):
 @pytest.mark.parametrize("tie", [False, True])
 @pytest.mark.parametrize("pad", [0, 4096])
 def test_prepare_saving_counts_what_the_writer_writes(tmp_path, tie, pad, evict, safe):
-    # torch.save writes a view's whole storage (the arena, padding and LoRA base weights included); safetensors
-    # writes each view once.
+    # torch.save writes a view's whole storage, safetensors writes each view once.
     model, expected, arena_extra = _block_swapped_lora_llama(tie, pad, evict)
     out = prepare_saving(model, save_directory = str(tmp_path), output_dtype = torch.float32, safe_serialization = safe)
     assert out[8] == expected + (0 if safe else arena_extra)
