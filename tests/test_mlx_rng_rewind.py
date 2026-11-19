@@ -390,8 +390,7 @@ class _HostSyncLM(_TinyLM):
 
 
 def test_a_runtime_compile_failure_trains_eagerly_on_the_pre_trace_state(tmp_path):
-    """A failed captured-state trace leaves placeholder arrays in the model and
-    optimizer state; the eager retry must not evaluate them."""
+    """A failed trace leaves placeholder arrays; the eager retry must not evaluate them."""
     model = _HostSyncLM()
     before = {k: mx.array(v) for k, v in tree_flatten(model.parameters())}
     trainer = MLXTrainer(

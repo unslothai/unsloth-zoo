@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""UNSLOTH_GC_SAVE_ATTENTION=1: the checkpoint replay reuses the first pass's attention kernel outputs.
-
-CPU only: SDPA picks its CPU flash kernel (_scaled_dot_product_flash_attention_for_cpu), which returns
-the logsumexp the backward needs, exactly like the CUDA flash / memory-efficient kernels."""
+"""UNSLOTH_GC_SAVE_ATTENTION=1 reuses the first pass's attention outputs in checkpoint replay; CPU
+only, where SDPA's CPU flash kernel returns the logsumexp the backward needs."""
 import sys
 
 import pytest

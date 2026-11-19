@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The patched GptOssModel.forward keeps two stock call contracts on transformers 4.x and 5.x:
-an omitted use_cache follows config.use_cache in eval (a manual prefill then decode keeps the
-prefix), and caller-supplied inputs_embeds keep their graph in eval (input gradients)."""
+"""GptOssModel.forward keeps stock call contracts on transformers 4.x and 5.x: omitted use_cache
+follows config in eval; caller inputs_embeds keep their graph in eval."""
 
 from __future__ import annotations
 

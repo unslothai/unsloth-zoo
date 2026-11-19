@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Load residency: finished loads own their weights; offloaded PLE rows and experts stay bit-exact."""
 
+import concurrent.futures
+import copy
 import gc
 import inspect
+import itertools
 import json
 import os
 import re
@@ -251,6 +254,61 @@ def test_a_glm5_next_oq_quant_loads_as_its_model(tmp_path, monkeypatch):
         assert value.dtype == params[key].dtype and mx.array_equal(value, params[key]), key
 
 
+def test_a_mixed_fp_checkpoint_with_a_scaled_embedding_loads_as_packed(tmp_path, monkeypatch):
+    qwen2_vl = pytest.importorskip("mlx_vlm.models.qwen2_vl")
+    import mlx_vlm.utils as vlm_utils
+    from unsloth_zoo.mlx.loader import _ensure_vlm_checkpoint_quantization, _with_packed_quantization
+
+    for name in ("load_model_weights", "replace_scaled_quantized_linears"):
+        monkeypatch.setattr(vlm_utils, name, getattr(vlm_utils, name))
+    text = dict(model_type = "qwen2_vl", hidden_size = 128, num_hidden_layers = 2, intermediate_size = 256, num_attention_heads = 2,
+                num_key_value_heads = 2, rms_norm_eps = 1e-6, vocab_size = 256, tie_word_embeddings = True,
+                rope_scaling = {"type": "mrope", "mrope_section": [8, 12, 12]})
+    config = {**text, "text_config": text, "vision_config": {"depth": 1, "embed_dim": 32, "hidden_size": 128, "num_heads": 2}}
+    model = qwen2_vl.Model(vlm_utils.update_module_configs(
+        qwen2_vl.ModelConfig.from_dict(json.loads(json.dumps(config))), qwen2_vl, config, ["text", "vision"]))
+    mx.random.seed(0)
+    model.update(tree_map(lambda value: mx.random.normal(value.shape) * 0.05, model.parameters()))
+    nvfp4, mxfp8 = {"group_size": 16, "bits": 4, "mode": "nvfp4"}, {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+    # Layer 1's MLP and layer 0's attention depart from the default, as Ollama's mixed Gemma4 tags do.
+    packed = {path: mxfp8 if ".layers.1.mlp." in path or ".layers.0.self_attn." in path else nvfp4
+              for path, module in model.named_modules() if path.startswith("language_model") and hasattr(module, "to_quantized")}
+    nn.quantize(model, class_predicate = lambda path, _module: packed.get(path, False))
+    params = dict(tree_flatten(model.parameters()))
+    scale = mx.array(0.25, dtype = mx.float32)
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {**params, "language_model.model.embed_tokens.weight_scale_2": scale})
+    (tmp_path / "config.json").write_text(json.dumps({**config, "quantization": nvfp4}))
+
+    _ensure_vlm_checkpoint_quantization()
+    loaded = vlm_utils.load_model(tmp_path)
+    modules = dict(loaded.named_modules())
+    assert {path: {"group_size": modules[path].group_size, "bits": modules[path].bits, "mode": modules[path].mode}
+            for path in packed} == packed
+    # The saved config names each departing layer, so a stock mlx-vlm reloads the export.
+    saved = _with_packed_quantization(loaded, {"quantization": nvfp4})["quantization"]
+    assert {path: saved[path] for path in packed if packed[path] != nvfp4} == {
+        path: spec for path, spec in packed.items() if spec != nvfp4}
+    embedding, stock = modules["language_model.model.embed_tokens"], model.language_model.model.embed_tokens
+    assert not isinstance(embedding, nn.QuantizedEmbedding)
+    ids, hidden = mx.array([[3, 255, 0, 17]]), mx.random.normal((1, 4, 128)).astype(mx.bfloat16)
+    want_rows = (stock(ids).astype(mx.float32) * scale).astype(mx.bfloat16)
+    want_logits = (stock.as_linear(hidden.astype(mx.float32)) * scale).astype(mx.bfloat16)
+    assert mx.array_equal(embedding(ids), want_rows) and mx.array_equal(embedding.as_linear(hidden), want_logits)
+    for key, value in tree_flatten(loaded.parameters()):
+        assert mx.array_equal(value, scale if key.endswith("weight_scale_2") else params[key]), key
+
+    from unsloth_zoo.mlx.utils import save_merged_model
+
+    # A dense export folds the scale in rather than saving the packed weight.
+    save_merged_model(loaded, type("Tokenizer", (), {"save_pretrained": lambda self, path: None})(), tmp_path / "dense",
+                      dequantize = True)
+    saved = mx.load(str(next((tmp_path / "dense").glob("*.safetensors"))))
+    assert not any(key.endswith(("scales", "weight_scale_2")) for key in saved)
+    dense = (mx.dequantize(stock.weight, stock.scales, group_size = 16, bits = 4, mode = "nvfp4", dtype = mx.float32)
+             * scale).astype(mx.bfloat16)
+    assert mx.array_equal(saved["language_model.model.embed_tokens.weight"], dense)
+
+
 def test_lazy_weights_env_leaves_the_load_lazy(tmp_path, monkeypatch):
     monkeypatch.setenv("UNSLOTH_MLX_LAZY_WEIGHTS", "1")
     model = _lazy_model(tmp_path)
@@ -464,6 +522,34 @@ def test_offloaded_rows_are_never_loaded(tmp_path):
             site.embed_tokens_per_layer(mx.array([outside]))
 
 
+class _TextOnlyVLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.language_model = nn.Embedding(16, 8)
+        self.vision_tower = nn.Linear(4096, 4096, bias = False)
+
+    def get_input_embeddings(self, input_ids = None, pixel_values = None):
+        return self.language_model(input_ids)
+
+    def __call__(self, input_ids):
+        return self.get_input_embeddings(input_ids).cumsum(axis = 1)
+
+
+def test_a_detached_vision_tower_is_never_read(tmp_path):
+    from unsloth_zoo.mlx.loader import _detach_vision_modules, _settle_detached_vision
+
+    model = _lazy_copy(_TextOnlyVLM, str(tmp_path))
+    mx.synchronize()
+    mx.clear_cache()
+    before = mx.get_active_memory()
+    mx.reset_peak_memory()
+    detached = _detach_vision_modules(model)
+    mx.eval(model.parameters())
+    assert _settle_detached_vision(model, detached) == 4096 * 4096 * 4
+    assert mx.get_peak_memory() - before < 4096 * 4096 * 4 // 16
+    assert "vision_tower" not in model and model._unsloth_supports_images is False
+
+
 @pytest.mark.parametrize("cast", [True, False])
 def test_offloaded_floats_get_the_load_cast(tmp_path, cast):
     def build():
@@ -563,6 +649,149 @@ def test_offloaded_experts_match_stock(tmp_path, lib, fraction):
     for got, want in zip(actual, expected):
         assert got.shape == want.shape
         np.testing.assert_array_equal(_bits(got), _bits(want))
+
+
+@pytest.mark.parametrize("int8", [False, True])
+def test_offloaded_experts_take_the_nax_expert_routes(tmp_path, monkeypatch, int8):
+    from unsloth_zoo.mlx import inference, nax
+
+    if not nax.nax_available():
+        # Stock gather_qmm stands in for both NAX kernels, so the scope logic also runs before M5.
+        def stand_in(x, w, scales, biases, indices, bits, token_rows = None):
+            rows = x if token_rows is None else x[token_rows]
+            return mx.gather_qmm(rows[:, None], w, scales, biases, rhs_indices = indices, transpose = True,
+                                 group_size = x.shape[-1] // scales.shape[-1], bits = bits,
+                                 sorted_indices = True)[:, 0]
+
+        monkeypatch.setattr(nax, "nax_available", lambda: True)
+        monkeypatch.setattr(nax, "gap_open", lambda name: True)
+        monkeypatch.setattr(nax, "sorted_gather_qmm", stand_in)
+        monkeypatch.setattr(nax, "int8_gather_qmm", stand_in)
+        # The int8 check compares against int8-rounded activations, which the stock stand-in does not use.
+        monkeypatch.setattr(inference, "_nax_int8_qmm_matches_native", lambda *args: True)
+    stock = _lazy_copy(lambda: _moe("lm", hidden = 128), str(tmp_path))
+    # Within the slots: too few routes per expert for the full table's sorted kernel, then enough; over the slots.
+    calls = [(mx.random.normal((1, n, 512), key = mx.random.key(n)).astype(mx.bfloat16), _routes((1, n), n, among))
+             for n, among in ((40, 12), (80, 12), (300, 64))]
+    expected = [stock.layers[0].switch_mlp(*call) for call in calls]
+    model = _lazy_copy(lambda: _moe("lm", hidden = 128), str(tmp_path))
+    offload_experts(model, str(tmp_path), 0.75)
+    glu = model.layers[0].switch_mlp
+    assert glu._slots.capacity == 16
+
+    tables = []
+    name = "int8_gather_qmm" if int8 else "sorted_gather_qmm"
+    kernel = getattr(nax, name)
+    monkeypatch.setattr(nax, name, lambda *a: tables.append(a[1].shape[0]) or kernel(*a))
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    monkeypatch.setattr(nax, "_SORTED_GATHER_ROWS_BY_GPU", {nax._gpu_generation(): {4: (4, 1000)}})
+    monkeypatch.setattr(nax, "_INT8_PREFILL_EXPERT_ROWS", {4: (4, 4)})
+    for verified in ("_NAX_SORTED_GATHER_VERIFIED", "_NAX_INT8_QMM_VERIFIED"):
+        monkeypatch.setattr(inference, verified, {})
+    with inference.nax_quantized_linear(model, int8):
+        assert all(type(p).__name__.startswith("_NaxGather") and isinstance(p, zoo_offload._FullTableKernels)
+                   for p in glu.projections())
+        got = []
+        for call in calls:
+            tables.clear()
+            got.append(glu(*call))
+            # Three projections a call; the slot table's 16 experts, the full table's 64 on a wide layer.
+            assert tables == {0: [], 1: [16] * 3, 2: [16] * 12}[len(got) - 1]
+        assert glu._wide(read_next = False)
+        tables.clear()
+        got.append(glu(*calls[2]))
+        assert tables == [64] * 3
+    # A table the scope's routes were copied to goes native with the slot table's projections.
+    assert len(glu.projections()) == 6
+    assert not any(type(p).__name__.startswith("_NaxGather") or "_unsloth_nax_sorted_gather" in vars(p)
+                   or "_unsloth_nax_int8_prefill" in vars(p) for p in glu.projections())
+    glu._narrow()
+    # Nested scopes over slot, full and read-ahead tables made before both scopes or inside the inner one, exited in
+    # either order: each projection keeps its routes until the last scope holding them exits. The slot gate is left
+    # to train, so the routes skip it and its copies, except a full table's made before the scopes (which evaluates).
+    def make_tables():
+        assert glu._wide(read_next = False)
+        made, fill = glu._table()
+        fill()
+        done = concurrent.futures.Future()
+        done.set_result(None)
+        object.__setattr__(glu, "_ahead", (done, made))
+
+    routed = lambda: [type(p).__name__.startswith("_NaxGather") and inference._nax_held(p) for p in glu.projections()]
+    flagged = lambda: any(name.startswith("_unsloth_nax") for p in glu.projections() for name in vars(p))
+    glu._glu.gate_proj.train()
+    for before, inner_first in itertools.product((True, False), (True, False)):
+        if before:
+            make_tables()
+        outer, inner = (inference.nax_quantized_linear(model, int8) for _ in range(2))
+        outer.__enter__()
+        inner.__enter__()
+        if not before:
+            make_tables()
+        pattern = [False, True, True, before, True, True, False, True, True]   # the read-ahead copy trains too
+        assert routed() == pattern
+        (inner if inner_first else outer).__exit__(None, None, None)
+        assert routed() == pattern
+        (outer if inner_first else inner).__exit__(None, None, None)
+        assert not any(routed()) and not flagged()
+        glu._narrow()
+        glu._join_ahead()
+        assert len(glu.projections()) == 3
+    glu._glu.gate_proj.train(False)
+    # A table copied in a scope but attached only after its last exit runs stock; a later scope routes it again.
+    with inference.nax_quantized_linear(model, int8):
+        escaped, fill = glu._table()
+        fill()
+    object.__setattr__(glu, "_full", escaped)
+    tables.clear()
+    np.testing.assert_array_equal(_bits(glu(*calls[2])), _bits(expected[2]))
+    assert not tables
+    with inference.nax_quantized_linear(model, int8):
+        assert all(routed())
+        glu(*calls[2])
+        assert tables == [64] * 3
+    assert not any(routed()) and not flagged()
+    glu._narrow()
+    # A copy of a routed table taken between two scopes' entries is held with it until the last of them exits.
+    assert glu._wide(read_next = False)
+    outer, inner = (inference.nax_quantized_linear(model, int8) for _ in range(2))
+    outer.__enter__()
+    copied = copy.copy(glu._full)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        setattr(copied, name, copy.copy(getattr(glu._full, name)))
+    object.__setattr__(glu, "_full", copied)
+    inner.__enter__()
+    outer.__exit__(None, None, None)
+    assert all(routed())
+    inner.__exit__(None, None, None)
+    assert not any(routed()) and not flagged()
+    glu._narrow()
+    # A native copy carrying a stale route flag (copied mid-swap on another thread) is decided afresh.
+    stale, fill = glu._table()
+    fill()
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        getattr(stale, name)._unsloth_nax_int8_prefill = True
+    object.__setattr__(glu, "_full", stale)
+    with inference.nax_quantized_linear(model, False):
+        assert all(routed()) and not any("_unsloth_nax_int8_prefill" in vars(p) for p in glu.projections())
+    glu._narrow()
+    # A copy taken as the last scope exits keeps the routed class without its owner or flags: the next scope routes it.
+    with inference.nax_quantized_linear(model, int8):
+        routed_class = type(glu._glu.down_proj)
+    torn, fill = glu._table()
+    fill()
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        getattr(torn, name).__class__ = routed_class
+    object.__setattr__(glu, "_full", torn)
+    with inference.nax_quantized_linear(model, int8):
+        assert all(routed())
+    assert not any(routed()) and not flagged()
+    glu._narrow()
+    for out, want in zip(got, expected + expected[2:]):
+        if int8:
+            assert mx.allclose(out, want, rtol = 5e-2, atol = 5e-2).item()
+        else:
+            np.testing.assert_array_equal(_bits(out), _bits(want))
 
 
 def test_decode_blocks_follow_the_installed_mlx_vlm(monkeypatch):

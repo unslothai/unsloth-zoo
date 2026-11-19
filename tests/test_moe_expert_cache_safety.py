@@ -13,8 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""UNSLOTH_MOE_EXPERT_CACHE lifetime / staleness / capture / stream / OOM rules and the NF4 auto op's error and cap
-policy, on CPU with a simulated device memory."""
+"""UNSLOTH_MOE_EXPERT_CACHE lifetime, staleness, capture and OOM rules, simulated on CPU."""
 import gc
 import types
 

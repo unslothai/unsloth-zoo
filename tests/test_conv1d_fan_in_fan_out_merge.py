@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A LoRA adapter on a Conv1D (GPT-2) sets fan_in_fan_out and the base weight is stored (in, out), so the delta has to be
-added transposed, as PEFT's own merge does. Rectangular layers used to crash with an in-place shape error and square ones
-got a silently wrong delta."""
+"""Conv1D (GPT-2) stores weights (in, out), so fan_in_fan_out LoRA deltas must be merged transposed."""
 import copy
 
 import pytest

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""psutil < 8 open_files() can hang a Windows process (giampaolo/psutil#1967), so the stall watchdog and the
-live-writer walk must not call it there."""
+"""psutil < 8 open_files() can hang on Windows, so the watchdog and live-writer walk skip it."""
 
 import sys
 import time

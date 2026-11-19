@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Sequence tiling registry: which modules are token-local, and how their tiled outputs are put back together.
-
-The tiled forward lives in the instance `forward`; the forward it tiles lives in `module._unsloth_forward`, so other
-patches (the fused LoRA MLP kernel) write their forward there and it runs inside every tile."""
+"""Which modules are token-local and how tiled outputs recombine; patches set module._unsloth_forward."""
 
 import contextlib
 import functools
@@ -238,11 +235,9 @@ def is_off(value):
 
 
 def parse_mode(value, padded_length = 128):
-    """`True` / "1" / "arctic" / "auto" / "target" / "target:GB" / "rows:N", each optionally followed by
-    `:pattern,pattern` (only modules matching a pattern are tiled). Off spellings (see `is_off`) -> None.
-
-    "target" without a size tiles with half of free memory as the budget, always; "auto" uses the same budget but
-    keeps one tile when tiling would not lower the step peak enough (see estimate_tiling_gain)."""
+    """Modes True/1/arctic/auto/target[:GB]/rows:N, optional :patterns, off -> None; target without
+    size uses half of free memory as budget, always; auto keeps one tile if tiling would not
+    lower peak"""
     if isinstance(value, TilePlan):
         return value
     if is_off(value):
@@ -478,9 +473,8 @@ def needs_rng_replay(module, spec):
         return True
     cached = module.__dict__.get("_unsloth_tiled_random")
     if _is_compiling():
-        # Source inspection cannot run while tracing: use the eager verdict (computed at install) while it still
-        # describes this module tree and inner forward, else replay.
-        # No id(module) here: an identity guard per MLP would compile every layer of a class separately.
+        # Tracing cannot inspect source: use the install-time verdict while it still matches this
+        # module tree and inner forward, else replay; no id(module) guard, it recompiles every layer
         if cached is None or cached[0] != _MODULE_TREE_VERSION[0] or \
                 cached[3] is not module.__dict__.get("_unsloth_forward"):
             return True

@@ -90,6 +90,48 @@ def _native_experts_in_linear_layout(experts_class):
     return shape != (2, 3, 10)
 
 
+def _patch_qwen3_vl_moe_model_router_logits():
+    """On transformers 4.57.x Qwen3VLMoeModel.forward returns only last_hidden_state / past_key_values /
+    rope_deltas and relies on its own @check_model_inputs to attach router_logits. The Unsloth compiler
+    strips that decorator from the classes it rewrites, so output_router_logits=True then fails with
+    "'Qwen3VLMoeModelOutputWithPast' object has no attribute 'router_logits'". The language model keeps
+    its decorator and records them, so forward its router_logits when the wrapper output lacks them.
+    No-op on transformers 5.x (the language model output is returned as is) and on uncompiled 4.57.x."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+    try:
+        from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import Qwen3VLMoeModel
+    except Exception:
+        return
+    original_forward = Qwen3VLMoeModel.forward
+    if getattr(original_forward, "_unsloth_router_logits_wrapper", False):
+        return
+
+    def forward(self, *args, **kwargs):
+        language_model = getattr(self, "language_model", None)
+        text_config = getattr(getattr(self, "config", None), "text_config", None)
+        wants = kwargs.get("output_router_logits", None)
+        if wants is None:
+            wants = getattr(text_config, "output_router_logits", False)
+        if not wants or language_model is None:
+            return original_forward(self, *args, **kwargs)
+        captured = []
+        handle = language_model.register_forward_hook(lambda module, inputs, output: captured.append(output))
+        try:
+            outputs = original_forward(self, *args, **kwargs)
+        finally:
+            handle.remove()
+        router_logits = getattr(captured[-1], "router_logits", None) if captured else None
+        if router_logits is not None and isinstance(outputs, dict) and getattr(outputs, "router_logits", None) is None:
+            outputs["router_logits"] = router_logits
+        return outputs
+
+    forward.__qualname__ = original_forward.__qualname__
+    forward.__doc__ = original_forward.__doc__
+    forward.__wrapped__ = original_forward
+    forward._unsloth_router_logits_wrapper = True
+    Qwen3VLMoeModel.forward = forward
+
+
 def patch_qwen3_vl_moe():
     # This Unsloth Zoo code section is licensed under AGPL3
 
@@ -372,11 +414,14 @@ def patch_qwen3_vl_moe():
 
             gate_output = self.gate(hidden_states_reshaped)
 
+            router_logits = None
             if isinstance(gate_output, tuple):
                 # v5: (router_logits, router_scores, router_indices)
                 _, routing_weights, selected_experts = gate_output
             else:
-                # Fallback: old-style gate returning just logits
+                # 4.57.x: the gate is an nn.Linear returning logits, and the block must
+                # return (hidden, router_logits): OutputRecorder(index = 1) reads them for
+                # output_router_logits / the aux loss.
                 router_logits = gate_output
                 top_k = getattr(self.gate, "top_k", getattr(self, "top_k", 2))
                 norm_topk_prob = getattr(
@@ -401,9 +446,11 @@ def patch_qwen3_vl_moe():
             )
 
             if hidden_states.dim() == 3:
-                return final_hidden_states.reshape(
+                final_hidden_states = final_hidden_states.reshape(
                     batch_size, sequence_length, hidden_dim
                 )
+            if router_logits is not None:
+                return final_hidden_states, router_logits
             return final_hidden_states
 
     if old_transformers:
@@ -428,6 +475,8 @@ def patch_qwen3_vl_moe():
             sparse_moe_block_forward,
             force=True,
         )
+
+    _patch_qwen3_vl_moe_model_router_logits()
 
     # Patch Qwen3VLMoeForConditionalGeneration.forward for GRPO: when
     # UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits.

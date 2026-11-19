@@ -163,9 +163,8 @@ _GRAPH_DECODE_DEFAULT = {}
 
 
 def _gpt_oss_default_graph_decode_attention():
-    """"auto" on compute capability 8.0 and newer, where graphed flex_decoding measured as fast as the dense
-    one-token attention or faster (A100: 1.02x at 1k context, 1.23x at 16k); "dense" on older GPUs (T4), where it
-    was slower at batch 4 and 8."""
+    """auto (flex decoding) on compute capability 8.0+: A100 1.02x at 1k context, 1.23x at 16k vs
+    dense; dense on older GPUs (T4), where flex was slower at batch 4 and 8"""
     if not torch.cuda.is_available():
         return "dense"
     device = torch.cuda.current_device()
@@ -180,10 +179,9 @@ def _gpt_oss_default_graph_decode_attention():
 
 
 def _gpt_oss_graph_decode_attention():
-    """One-token attention inside a generate() call Unsloth decodes through CUDA graphs:
-    "dense" runs the sink attention over a dense mask, "flex" keeps flex_decoding on a BlockMask whose tensors the
-    graph refills, "auto" flex with the dense fallback (UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION, read per call;
-    unset: _gpt_oss_default_graph_decode_attention)."""
+    """UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION (read per call; unset uses default): dense runs sink
+    attention on dense mask; flex keeps flex_decoding on BlockMask refilled by graph; auto is
+    flex with dense fallback"""
     mode = os.environ.get("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "").strip().lower()
     if not mode:
         return _gpt_oss_default_graph_decode_attention()
@@ -196,9 +194,7 @@ def _gpt_oss_in_graph_generate():
 
 
 def _gpt_oss_dense_graph_decode(inputs_embeds):
-    """A one-token step of a graph-planned generate() with dense decode attention: its masks are built dense.
-    A full sliding window rolls by one slot per step and moves the mask offset, which a dense mask of fixed shape
-    carries as values while a BlockMask closure would bake it in."""
+    """Dense masks carry a rolling sliding window's offset as values; BlockMask closures bake it in."""
     return (
         isinstance(inputs_embeds, torch.Tensor) and inputs_embeds.dim() >= 2 and inputs_embeds.shape[1] == 1
         and _gpt_oss_in_graph_generate() and _gpt_oss_graph_decode_attention() == "dense"
@@ -240,9 +236,8 @@ def _gpt_oss_decode_attention(module, query, key, value, attention_mask, scaling
     weights = torch.matmul(q, key.transpose(2, 3), out = logits[..., :kv_len])
     weights *= scaling
     if attention_mask is not None:
-        # [B or 1, 1, 1, L] (one row per sequence, every head) or [B or 1, H, 1, L] (per head, grouped as the
-        # logits are: head h = kv head h // groups, row h % groups).
-        # Shared vs per head from the mask itself: with one KV head a per-head mask still has `groups` rows.
+        # Mask is [B or 1, 1, 1, L] shared or [B or 1, H, 1, L] per head (kv head = h div groups,
+        # row h % groups); with one KV head a per-head mask still has groups rows
         if attention_mask.shape[1] == 1:
             weights += attention_mask.reshape(attention_mask.shape[0], 1, 1, kv_len)
         else:
@@ -294,11 +289,9 @@ def _code_digest(code):
 
 
 def _mask_function_identity(fn, depth = 4):
-    """A flat tuple naming what mask_function computes: every function's code (nested through its closure and
-    defaults) and every scalar it captures. None when it captures anything else (a tensor, a dict, an object, a
-    functools.partial): such a mask cannot be rebuilt over refilled graph buffers, nor told apart by a graph key.
-    Published on the BlockMask, so a graph captured for one mask is never replayed for another (a different window
-    or a different mask_function under the same outer mask_mod)."""
+    """Flat key naming mask_function code and scalar captures; None if it captures a tensor, dict,
+    object or functools.partial (cannot rebuild or key it); published on BlockMask so a graph is
+    never replayed for another mask"""
     out = []
 
     def walk(f, depth):
@@ -315,10 +308,8 @@ def _mask_function_identity(fn, depth = 4):
                 values.append(None)
         values.extend(getattr(f, "__defaults__", None) or ())
         values.extend((getattr(f, "__kwdefaults__", None) or {}).values())
-        # Module-level names the code reads: a scalar is named by its value, a function walked, builtins are code.
-        # A module or class is code too, but its attributes are state the mask can read (settings.WINDOW,
-        # Config.WINDOW): each other name the code loads is looked up on it and keyed the same way.
-        # Anything else (a tensor, a dict, an object) cannot be keyed.
+        # Globals: scalars keyed by value, functions walked, module/class attributes read; else
+        # unkeyable.
         module_globals = getattr(f, "__globals__", None) or {}
         for name in code.co_names:
             if name not in module_globals:
@@ -885,6 +876,11 @@ def _mxfp4_routing_from_topk(module, router_indices, routing_weights):
 pass
 
 
+def _mxfp4_router_logits(router, hidden_states):
+    """Router logits in the router's dtype (fp16 training keeps a float32 residual stream)."""
+    return nn.functional.linear(hidden_states.to(router.weight.dtype), router.weight, router.bias)
+
+
 def _mxfp4_experts_routing(module, hidden_states, routing_data, gather_idx, scatter_idx, router_indices, routing_weights):
     """(hidden_states, routing_data, gather_idx, scatter_idx, leading_shape) from either experts() call form.
 
@@ -1154,7 +1150,7 @@ def patch_gpt_oss():
         def mlp_forward(self, hidden_states):
             batch_size = hidden_states.shape[0]
             hidden_states = hidden_states.reshape(-1, self.router.hidden_dim)
-            router_logits = nn.functional.linear(hidden_states, self.router.weight, self.router.bias)
+            router_logits = _mxfp4_router_logits(self.router, hidden_states)
 
             with torch_cuda_device(router_logits.device):
                 routing_data, gather_idx, scatter_idx = routing(router_logits, self.router.top_k)
@@ -1918,6 +1914,11 @@ def _gpt_oss_cache_locations():
         try:
             import tempfile
             locs.append(os.path.join(tempfile.gettempdir(), os.path.basename(loc)))
+            # compiler._private_temp_compile_folder's per-user fallback.
+            if hasattr(os, "geteuid"):
+                locs.append(os.path.join(
+                    tempfile.gettempdir(), f"{os.path.basename(loc)}_{os.geteuid()}",
+                ))
         except Exception:
             pass
     # De-dup, preserve order (configured first = primary).
@@ -2906,7 +2907,7 @@ def _ogs_dequant_gate_up(x, weight, bias, routing_data, gather_idx, precision_co
     return out
 
 
-def _ogs_dequant_down(h, gammas, weight, bias, routing_data, scatter_idx, precision_config):
+def _ogs_dequant_down(h, gammas, weight, bias, routing_data, scatter_idx, precision_config, out_dtype = None):
     """matmul_ogs down on bf16 decodes: ``out[dst // k] += gamma * (h @ W[e] + b[e])``, summed without atomics."""
     k = routing_data.n_expts_act
     dst = scatter_idx.dst_indx.long()
@@ -2929,7 +2930,7 @@ def _ogs_dequant_down(h, gammas, weight, bias, routing_data, scatter_idx, precis
             keep = where >= 0
             slots[where[keep]] = y[keep]
         del dense
-    return slots.view(-1, k, slots.shape[-1]).sum(1).to(h.dtype)
+    return slots.view(-1, k, slots.shape[-1]).sum(1).to(out_dtype or h.dtype)
 
 
 class _OgsGateUp(torch.autograd.Function):
@@ -2988,7 +2989,7 @@ class _OgsDown(torch.autograd.Function):
     """``out[dst // k] += gamma * (h @ W[e] + b[e])`` via matmul_ogs; frozen MXFP4 ``W``."""
 
     @staticmethod
-    def forward(ctx, h, gammas, bias, module, routing_data, scatter_idx):
+    def forward(ctx, h, gammas, bias, module, routing_data, scatter_idx, out_dtype = None):
         weight = module.down_proj
         backend = _ogs_backend_for(weight, routing_data, module)
         if _ogs_native_training_ok(h.device, backend):
@@ -2999,8 +3000,10 @@ class _OgsDown(torch.autograd.Function):
         else:
             out = _ogs_dequant_down(
                 h, None if gammas is None else gammas.detach(), weight, bias, routing_data, scatter_idx,
-                module.down_proj_precision_config,
+                module.down_proj_precision_config, out_dtype = out_dtype,
             )
+        if out_dtype is not None:
+            out = out.to(out_dtype)
         ctx.module, ctx.routing_data, ctx.scatter_idx = module, routing_data, scatter_idx
         ctx.h_dtype, ctx.bias = h.dtype, bias
         # h only feeds the routing-weight gradient.
@@ -3046,7 +3049,7 @@ class _OgsDown(torch.autograd.Function):
             grad_gamma = grad_gamma.to(gammas.dtype)
         if grad_bias is not None:
             grad_bias = grad_bias.to(bias.dtype)
-        return grad_h, grad_gamma, grad_bias, None, None, None
+        return grad_h, grad_gamma, grad_bias, None, None, None, None
 
 
 class _OgsSwiglu(torch.autograd.Function):
@@ -3081,7 +3084,9 @@ def _ogs_lora_offsets(routing_data):
     return torch.cumsum(routing_data.expt_hist, dim = 0, dtype = torch.int32)
 
 
-def mxfp4_ogs_experts_forward(self, hidden_states, routing_data, gather_idx, scatter_idx, gate_up_lora = None, down_lora = None):
+def mxfp4_ogs_experts_forward(
+    self, hidden_states, routing_data, gather_idx, scatter_idx, gate_up_lora = None, down_lora = None, out_dtype = None,
+):
     """Differentiable native MXFP4 experts: matmul_ogs forward, exact chunked dequant in backward."""
     k = routing_data.n_expts_act
     alpha = getattr(self, "alpha", 1.702)
@@ -3098,7 +3103,7 @@ def mxfp4_ogs_experts_forward(self, hidden_states, routing_data, gather_idx, sca
             grouped_mm_func = native_moe_grouped_mm,
         ).to(pre_activation.dtype)
     swiglu_output = _OgsSwiglu.apply(pre_activation, alpha, limit)
-    out = _OgsDown.apply(swiglu_output, gammas, self.down_proj_bias, self, routing_data, scatter_idx)
+    out = _OgsDown.apply(swiglu_output, gammas, self.down_proj_bias, self, routing_data, scatter_idx, out_dtype)
     if down_lora is not None:
         first, second, scaling, _ = down_lora
         delta = _apply_lora_grouped_mm(
@@ -3110,6 +3115,23 @@ def mxfp4_ogs_experts_forward(self, hidden_states, routing_data, gather_idx, sca
         delta = (delta * gammas.unsqueeze(-1).to(delta.dtype))[valid]
         out = out.index_add(0, dst[valid] // k, delta.to(out.dtype))
     return out
+
+
+def _mxfp4_experts_out_dtype(module, input_dtype, routed_by_unsloth = True):
+    """float32 when training on float16, else input_dtype: an fp16 residual stream overflows to inf on gpt-oss-20b.
+
+    Only for Unsloth-routed calls (they cast the router input) with Unsloth's attention installed (it casts q/k/v
+    input); stock MLP / attention would reject a float32 stream. UNSLOTH_GPT_OSS_MXFP4_FP32_RESIDUAL=0 disables.
+    """
+    if (
+        routed_by_unsloth
+        and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
+        and input_dtype == torch.float16
+        and getattr(module, "training", False)
+        and os.environ.get("UNSLOTH_GPT_OSS_MXFP4_FP32_RESIDUAL", "1") != "0"
+    ):
+        return torch.float32
+    return input_dtype
 
 
 @torch.compiler.disable
@@ -3144,8 +3166,9 @@ def forward_mxfp4_gpt_oss_with_lora(
             f"LoRA={gate_up_lora is not None or down_lora is not None}, experts={self.num_experts}."
         )
 
-    # The native kernels and mxfp4_ogs_experts_forward return bf16; an fp16 residual (T4) would be promoted.
-    input_dtype = hidden_states.dtype
+    out_dtype = _mxfp4_experts_out_dtype(
+        self, hidden_states.dtype, routing_data is not None and not isinstance(routing_data, torch.Tensor),
+    )
     hidden_states, routing_data, gather_idx, scatter_idx, leading_shape = _mxfp4_experts_routing(
         self, hidden_states, routing_data, gather_idx, scatter_idx, router_indices, routing_weights,
     )
@@ -3160,10 +3183,11 @@ def forward_mxfp4_gpt_oss_with_lora(
             out = mxfp4_ogs_experts_forward(
                 self, hidden_states, routing_data, gather_idx, scatter_idx,
                 gate_up_lora = gate_up_lora, down_lora = down_lora,
+                out_dtype = out_dtype if out_dtype == torch.float32 else None,
             )
     if leading_shape is not None:
         out = out.reshape(*leading_shape, out.shape[-1])
-    return out.to(input_dtype)
+    return out.to(out_dtype)
 
 
 def patch_mxfp4_gpt_oss_for_lora():
@@ -3420,6 +3444,17 @@ pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 
+def _gpt_oss_attention_input(attention, hidden_states):
+    """Cast a float32 stream to float16 for a float16 dense q/k/v outside autocast, as autocast would."""
+    if hidden_states.dtype != torch.float32 or torch.is_autocast_enabled():
+        return hidden_states
+    proj = getattr(attention.q_proj, "base_layer", attention.q_proj)
+    weight = getattr(proj, "weight", None)
+    if isinstance(weight, torch.Tensor) and weight.dtype == torch.float16:
+        return hidden_states.to(torch.float16)
+    return hidden_states
+
+
 def patch_GptOssAttention():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
     # Uncompiled flex_attention backward has a dtype bug in PyTorch
@@ -3650,6 +3685,7 @@ def patch_GptOssAttention():
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: KWARGS_TYPE,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states = _gpt_oss_attention_input(self, hidden_states)
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)

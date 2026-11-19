@@ -301,6 +301,9 @@ def _refuse_offloaded(model, action) -> None:
             f"Unsloth: this model was loaded with offload, which is for inference only; "
             f"{action} needs the model loaded without offload."
         )
+    from .utils import refuse_released_vision
+
+    refuse_released_vision(model, action)
 
 
 def _keep_norm_parameters_float32(model) -> None:
@@ -986,6 +989,111 @@ def _ensure_omlx_layout(model_type):
 _ensure_deepseek_v41_omlx_layout = _ensure_omlx_layout
 
 
+def _packed_quantization(path, module, weights):
+    """The quantization a layer's stored tensors were packed with, as mlx-lm's ``infer_quant_config`` reads it."""
+    import mlx.core as mx
+
+    in_dims = module.weight.shape[-1]
+    scales = weights[f"{path}.scales"]
+    group_size, bits = in_dims // scales.shape[-1], weights[f"{path}.weight"].shape[-1] * 32 // in_dims
+    if scales.dtype != mx.uint8:
+        return {"group_size": group_size, "bits": bits, "mode": "affine"}
+    mode = {(4, 16): "nvfp4", (4, 32): "mxfp4", (8, 32): "mxfp8"}.get((bits, group_size))
+    return mode and {"group_size": group_size, "bits": bits, "mode": mode}
+
+
+def _ensure_vlm_checkpoint_quantization():
+    """mlx-vlm quantizes every layer its config does not name with the config's default, and takes an NVFP4
+    ``weight_scale_2`` only on linears. Name each layer packed otherwise (mixed mxfp8/nvfp4 checkpoints) and
+    give scaled embeddings (ModelOpt NVFP4 exports) a module of their own."""
+    try:
+        vlm_utils = importlib.import_module("mlx_vlm.utils")
+    except Exception:
+        return
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    class ScaledQuantizedEmbedding(nn.Module):
+        """As mlx-vlm's ``ScaledQuantizedLinear``. Not a ``QuantizedEmbedding``, so paths that read the packed
+        weight directly cannot drop the scale."""
+
+        def __init__(self, embedding, weight_scale_2):
+            super().__init__()
+            self.weight, self.scales, self.weight_scale_2 = embedding.weight, embedding.scales, weight_scale_2
+            self.group_size, self.bits, self.mode = embedding.group_size, embedding.bits, embedding.mode
+            self.num_embeddings, self.dims = embedding.num_embeddings, embedding.dims
+            self.freeze()
+
+        def __call__(self, x):
+            rows = mx.dequantize(self.weight[x], scales = self.scales[x], group_size = self.group_size,
+                                 bits = self.bits, mode = self.mode, dtype = mx.float32)
+            return (rows * self.weight_scale_2).astype(mx.bfloat16)  # stock nvfp4 rows are bfloat16
+
+        def as_linear(self, x):
+            out = mx.quantized_matmul(x.astype(mx.float32), self.weight, scales = self.scales, transpose = True,
+                                      group_size = self.group_size, bits = self.bits, mode = self.mode)
+            return (out * self.weight_scale_2).astype(x.dtype)
+
+    load_model_weights = getattr(vlm_utils, "load_model_weights", None)
+    replace_scaled = getattr(vlm_utils, "replace_scaled_quantized_linears", None)
+    if load_model_weights is None or getattr(load_model_weights, "_unsloth_packed_quantization", False):
+        return
+    lookup = getattr(vlm_utils, "_quantization_for_module_path", lambda quantization, path, _model: quantization.get(path))
+
+    @wraps(load_model_weights)
+    def patched_load_model_weights(model, config, weights, *args, **kwargs):
+        quantization = config.get("quantization")
+        default = _global_quant_params(quantization)
+        inferred = {}
+        if default is not None:
+            for path, module in model.named_modules():
+                if (
+                    hasattr(module, "to_quantized") and hasattr(module, "weight") and f"{path}.scales" in weights
+                    and f"{path}.weight" in weights and lookup(quantization, path, model) is None
+                ):
+                    packed = _packed_quantization(path, module, weights)
+                    if packed is not None and packed != default:
+                        quantization[path] = inferred[path] = packed
+        loaded = load_model_weights(model, config, weights, *args, **kwargs)
+        if inferred:
+            # Outside the module tree, so it is not a parameter; the saved config needs it to reload.
+            object.__setattr__(loaded, "_unsloth_packed_quantization", inferred)
+        return loaded
+
+    def patched_replace_scaled(model, weights):
+        from mlx.utils import tree_map_with_path
+
+        scaled = set()
+
+        def replace(path, module):
+            if isinstance(module, nn.QuantizedEmbedding) and module.mode == "nvfp4" and f"{path}.weight_scale_2" in weights:
+                scaled.add(f"{path}.weight_scale_2")
+                return ScaledQuantizedEmbedding(module, weights[f"{path}.weight_scale_2"])
+            return module
+
+        model.update_modules(tree_map_with_path(replace, model.leaf_modules(), is_leaf = nn.Module.is_module))
+        return replace_scaled(model, {key: value for key, value in weights.items() if key not in scaled})
+
+    patched_load_model_weights._unsloth_packed_quantization = True
+    vlm_utils.load_model_weights = patched_load_model_weights
+    if replace_scaled is not None:
+        vlm_utils.replace_scaled_quantized_linears = patched_replace_scaled
+
+
+def _with_packed_quantization(model, config):
+    """*config* naming the layers the load found packed otherwise than its default, while the live module still is."""
+    inferred = getattr(model, "_unsloth_packed_quantization", None)
+    if not inferred or not isinstance(config, dict):
+        return config
+    modules = dict(model.named_modules())
+    live = {
+        path: spec for path, spec in inferred.items()
+        if all(getattr(modules.get(path), key, None) == value for key, value in spec.items())
+    }
+    return {key: {**live, **value} if key in ("quantization", "quantization_config") and isinstance(value, dict) else value
+            for key, value in config.items()}
+
+
 def _patch_deepseek_ocr_transformers_import_compat(model_type):
     """Newer Transformers removed the Llama flash-attention symbol that DeepSeek-OCR's config import still reads; the
     MLX path never instantiates it, so an eager-attention alias is provided for import only."""
@@ -1444,8 +1552,7 @@ def _tokenizer_class_for_model_type(model_path):
     return tokenizer_class_from_name(mapped) if mapped else None
 
 
-# Tekken tokenizer.json conversions shipped Llama-3's split (first) in place of
-# mistral-common's own, tekken.json's "config.pattern" (second).
+# Tekken tokenizer.json conversions shipped Llama-3's split, not tekken.json's config.pattern.
 _MISTRAL_WRONG_SPLIT_PATTERN = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}"
     r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
@@ -3959,6 +4066,79 @@ def _freeze_outside_language_model(model) -> None:
     for _, module in model.named_modules():
         if id(module) not in shared:
             module.freeze(recurse=False)
+
+
+def _detach_vision_modules(model) -> dict:
+    """Detach top-level non-audio modules outside the language model that share none of its modules."""
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from .utils import _AUDIO_TOWER_ATTRS
+
+    language_model = getattr(model, "language_model", None)
+    if not isinstance(model, nn.Module) or language_model is None:
+        return {}
+    shared = {id(module) for module in language_model.modules()}
+    released = {}
+    for name, child in model.children().items():
+        modules = [m for _, m in tree_flatten(child, is_leaf=lambda x: isinstance(x, nn.Module))]
+        if (
+            name == "language_model"
+            or "audio" in name
+            or name in _AUDIO_TOWER_ATTRS
+            or not modules
+            or not all(isinstance(m, nn.Module) for m in modules)
+        ):
+            continue
+        if not any(id(m) in shared for module in modules for m in module.modules()):
+            released[name] = child
+    for name in released:
+        del model[name]
+    return released
+
+
+def _settle_detached_vision(model, released, target_dtype=None, model_type="") -> int:
+    """Bytes of the detached modules if text still embeds and runs without them, else reattach (cast to
+    target_dtype, which the load applied while they were out) and return 0."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from .utils import _get_processor_tokenizer
+
+    if not released:
+        return 0
+    ids = mx.array([list(_PROBE_TOKEN_PAIRS[0][0])])
+    try:
+        embed = getattr(model, "get_input_embeddings", None)
+        if callable(embed):
+            embeds = _call_restoring_module_state(model, lambda: embed(ids))
+            mx.eval(getattr(embeds, "inputs_embeds", embeds))
+        _verify_text_only_wrapper(
+            model, getattr(model, "_unsloth_modality_model_type", ""), check_causality=False
+        )
+    except Exception:
+        for name, child in released.items():
+            model[name] = child
+        if target_dtype is not None:
+            _convert_mlx_dtype(model, target_dtype, model_type=model_type)
+        mx.eval(_resident_parameters(model))
+        return 0
+    processor = getattr(model, "_processor", None)
+    for target in (model, processor, _get_processor_tokenizer(processor) if processor else None):
+        if target is not None:
+            target._unsloth_supports_images = False
+    model._unsloth_vision_released = True
+    return sum(value.nbytes for _, value in tree_flatten(released) if isinstance(value, mx.array))
+
+
+def release_vision_weights(model) -> int:
+    """Free a VLM's vision modules for text-only inference and return the bytes freed (0, untouched, if text
+    needs them). The model then reads no images and refuses saving and training."""
+    import mlx.core as mx
+
+    freed = _settle_detached_vision(model, _detach_vision_modules(model))
+    if freed:
+        gc.collect()
+        mx.clear_cache()
+    return freed
 
 
 def _resolve_mlx_vlm_model_class(model_type):
@@ -7712,7 +7892,10 @@ def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, save_directory=None, 
     _refuse_offloaded(self, "saving")
     from .utils import push_to_hub_merged
     tokenizer = tokenizer or self._tokenizer
-    # Default save_directory to repo_id; callers that already saved locally should pass save_directory= to avoid a re-save.
+    # Default save_directory to repo_id, saved fresh each time: a save left there by an earlier push is an older model.
+    # Callers that already saved locally should pass save_directory= to avoid a re-save.
+    if not save_directory:
+        kwargs["_always_save"] = True
     save_directory = save_directory or repo_id
     push_to_hub_merged(self, tokenizer, save_directory, repo_id=repo_id, **kwargs)
 
@@ -8683,11 +8866,43 @@ def _projects(linear):
     return int(linear.weight.shape[-2]) > 1
 
 
+_WEIGHT_READERS = weakref.WeakKeyDictionary()
+
+
+def _weights_read_in_call(cls):
+    """Child names whose `.weight` a `__call__` in cls's MRO reads directly, as ERNIE 5.5's HCA compressor does."""
+    names = _WEIGHT_READERS.get(cls)
+    if names is None:
+        names = set()
+        for klass in cls.__mro__:
+            call = klass.__dict__.get("__call__")
+            try:
+                tree = ast.parse(textwrap.dedent(inspect.getsource(call)))
+            except (OSError, TypeError, SyntaxError):
+                continue
+            names.update(
+                node.value.attr for node in ast.walk(tree)
+                if isinstance(node, ast.Attribute) and node.attr == "weight"
+                and isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name) and node.value.value.id == "self"
+            )
+        _WEIGHT_READERS[cls] = names = frozenset(names)
+    return names
+
+
+def _adaptable(root, path):
+    """False when the owner's `__call__` reads the linear's weight directly, where an adapter would raise."""
+    parent_path, _, leaf = str(path).rpartition(".")
+    owner = _navigate(root, parent_path) if parent_path else root
+    return leaf not in _weights_read_in_call(type(owner))
+
+
 def _role_selected_paths(module, attention, mlp, skip_subtrees=()):
     """``module``'s linears by role, one whose role cannot be read left alone."""
     wanted = {"attention": attention, "mlp": mlp}
     paths = [path for path, linear in _subtree_linears(module)
-             if not _under_any(path, skip_subtrees) and _projects(linear)]
+             if not _under_any(path, skip_subtrees) and _projects(linear)
+             and _adaptable(module, path)]
     roles = {path: _linear_role(path) for path in paths}
     # A projection naming no role takes the role of the linears beside it, where
     # those agree; a patch embedding sits alone, so nothing lends it one.
@@ -8917,7 +9132,7 @@ def _resolve_lora_keys(model, target_modules):
         for name, module in root.named_modules():
             if not _is_mlx_lora_base(module, specs):
                 continue
-            if _lora_name_matches_target(name, target_modules):
+            if _lora_name_matches_target(name, target_modules) and _adaptable(root, name):
                 keys.add(name)
 
     return keys
@@ -9374,6 +9589,7 @@ class FastMLXModel:
         pipeline_group=None,
         tensor_group=None,
         offload=None,
+        drop_vision_weights=False,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Load a model via mlx-lm (text) or mlx-vlm (vision) on Apple Silicon.
@@ -9419,6 +9635,11 @@ class FastMLXModel:
                 for a caller that prices loads its own way: called with the
                 downloaded checkpoint's directory before any weight is read, it
                 returns either of the forms above.
+            drop_vision_weights: Inference only, on a checkpoint that loads
+                through mlx-vlm: never read the vision tower and projector, so
+                the model reads no images and cannot be saved whole. Kept when
+                the text path turns out to need them;
+                ``model._unsloth_vision_freed`` holds the bytes left unread.
 
         Reloading a saved LoRA/DoRA adapter directory returns a model whose
         base is frozen and whose adapter parameters are trainable, so it can be
@@ -9517,8 +9738,9 @@ class FastMLXModel:
                 "Install via: pip install unsloth-zoo[mlx]"
             )
 
-        from .utils import apply_gather_qmm_nax_guard
+        from .utils import apply_gather_qmm_nax_guard, apply_gelu_approx_finite_grad
         apply_gather_qmm_nax_guard()
+        apply_gelu_approx_finite_grad()
 
         chat_template = kwargs.pop("chat_template", None)
         patch_mode = normalize_mlx_patch_mode(kwargs.pop("patch_mode", patch_mode))
@@ -10313,6 +10535,7 @@ class FastMLXModel:
             and _resolve_mlx_vlm_model_class(model_type) is None
         )
 
+        detached_vision = {}
         if force_vlm_text_path:
             is_vlm = True
         elif text_only is True or mlx_lm_images:
@@ -10321,6 +10544,7 @@ class FastMLXModel:
             is_vlm = True
         else:
             is_vlm = _is_vlm(config_data)
+        drop_vision = bool(drop_vision_weights and is_vlm)
 
         extra_kwargs = {"trust_remote_code": bool(trust_remote_code)}
         if token:
@@ -10366,6 +10590,7 @@ class FastMLXModel:
             _ensure_qwen3_omni_audio_per_clip(model_type)
             _ensure_omlx_layout(model_type)
             _ensure_native_vlm_weight_names(model_type)
+            _ensure_vlm_checkpoint_quantization()
 
             quant_state = _ensure_quantization_compatible(
                 config_data, quantization_spec, model_name,
@@ -10440,12 +10665,14 @@ class FastMLXModel:
                         _vlm_load_config,
                         vlm_load_target,
                     )
+                if drop_vision:
+                    detached_vision = _detach_vision_modules(model)
                 model, vlm_cfg = _run_with_vlm_config_view(
                     _apply_mlx_quantization,
                     model, vlm_cfg, quantization_spec,
                     is_vlm=True, user_predicate=quant_predicate,
                 )
-                model._config = vlm_cfg
+                model._config = _with_packed_quantization(model, vlm_cfg)
                 _run_with_vlm_config_view(
                     lambda: mx.eval(model.parameters()),
                 )
@@ -10478,7 +10705,7 @@ class FastMLXModel:
                 # Lazy-load when converting dtype so weights materialize once.
                 vlm_kwargs = dict(extra_kwargs)
                 vlm_kwargs["revision"] = revision
-                if target_dtype is not None:
+                if target_dtype is not None or drop_vision:
                     vlm_kwargs["lazy"] = True
                 model, processor = _run_with_vlm_config_view(
                     _load_mlx_vlm_with_extra_weight_filter,
@@ -10488,9 +10715,13 @@ class FastMLXModel:
                     vlm_kwargs,
                     hf_token=token,
                 )
+                if drop_vision:
+                    detached_vision = _detach_vision_modules(model)
                 _apply_offload(
                     model, original_local_path or local_path, offload, target_dtype, max_seq_length,
                 )
+                if drop_vision and target_dtype is None:
+                    mx.eval(_resident_parameters(model))
 
             processor = _run_with_vlm_config_view(
                 _repair_degraded_vlm_processor,
@@ -10527,6 +10758,9 @@ class FastMLXModel:
                 model_type=model_type,
                 strict=False,
             )
+            model._unsloth_vision_freed = _run_with_vlm_config_view(
+                _settle_detached_vision, model, detached_vision, target_dtype, model_type
+            )
             if force_vlm_text_path:
                 print(
                     "Unsloth: Loading a text model through mlx-vlm; "
@@ -10547,7 +10781,7 @@ class FastMLXModel:
                 from .utils import bind_legacy_image_processor
                 _run_with_vlm_config_view(bind_legacy_image_processor, model, processor)
 
-            model._config = getattr(model, "_config", config_data)
+            model._config = _with_packed_quantization(model, getattr(model, "_config", config_data))
             model._hf_repo = model_name
             model._src_path = original_local_path or local_path
             # _src_path is the original snapshot (for commit inference); _config_src_path is the mlx-vlm patched dir

@@ -109,10 +109,9 @@ def patch_GraniteMoeHybridDecoderLayer_float16():
 TEMPORARY_PATCHES.append(patch_GraniteMoeHybridDecoderLayer_float16)
 
 
-# Unsloth keeps Granite-4 hybrid norm weights in float32 (UNSLOTH_HIGH_PRECISION_LAYERNORM). The stock norms return
-# `self.weight * x.to(input_dtype)`, so a float32 weight promotes the output to float32 and, without autocast, the next
-# 16-bit Linear (mamba in_proj / out_proj) raises "float != BFloat16". Cast back only in that case. The rewrite is
-# installed with its source in linecache so the zoo compiler copies the patched body, not the stock one.
+# Float32 norm weights promote output, so cast back to input dtype only in that case
+# (UNSLOTH_HIGH_PRECISION_LAYERNORM); installed with source in linecache so the compiler copies the
+# patched body
 _NORM_RETURN = "return self.weight * hidden_states.to(input_dtype)"
 _NORM_RETURN_CAST = (
     "output = self.weight * hidden_states.to(input_dtype)\n"

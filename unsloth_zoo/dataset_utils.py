@@ -2807,8 +2807,7 @@ pass
 
 
 def _batched_columns(dataset):
-    # Batch columns hold the same Python values as one-row reads only with no output format;
-    # an IterableDataset runs lazily in training, so it stays row by row.
+    # Batch columns match row reads only with no format set; IterableDataset stays row by row.
     return isinstance(dataset, Dataset) and getattr(dataset, "format", {}).get("type", None) is None
 pass
 

@@ -265,9 +265,8 @@ def _host_alloc_policy():
     settings = _host_allocator_settings()
     policy = _HOST_ALLOC_POLICY
     if settings != policy[0]:
-        # torch reports only the last settings string, but a call naming other keys (vLLM sets max_split_size_mb and
-        # expandable_segments in process) keeps the pinned thresholds, so fold each string into what is in effect,
-        # starting from the environment torch parsed at startup.
+        # Fold each string into the policy in effect, starting from the environment torch parsed at
+        # startup: torch reports only the last, so omitted keys stay pinned.
         prior = policy[1:] if policy[0] is not None else _parse_host_alloc_policy(_env_allocator_settings())
         policy = _HOST_ALLOC_POLICY = (settings, *_parse_host_alloc_policy(settings, prior))
         if policy[1] != _INF: _warn_short_block_reuse()
@@ -765,14 +764,9 @@ def _gradient_checkpoint_recompute_marker():
 # ---------------------------------------------------------------------------
 # Same MoE routing in the checkpoint replay as in the forward that made the loss
 # ---------------------------------------------------------------------------
-# A checkpointed block runs its first pass without grad and its backward replay with grad.
-# Under block compile those are two different compiled graphs, which round differently: the
-# router input differs by a bf16 ulp and some tokens pick other top-k experts in the replay,
-# so backward differentiated a routing the loss never used. Each checkpointed call that will
-# run backward gets a small routing frame: the first pass appends every MoE call's (top-k ids,
-# routing weights) to it, the replay takes them back in order (then the frame is cleared).
-# The frame is read at run time only, by eager code or the body of an opaque custom op, never
-# by traced code, so no graph guards on it. UNSLOTH_MOE_GC_SAME_ROUTING=0 turns it off.
+# Replay reuses first-pass MoE routing (compile rounds differ by a bf16 ulp); read at run time by
+# eager code or opaque ops, never traced code, so no graph guards; UNSLOTH_MOE_GC_SAME_ROUTING=0
+# disables.
 _GC_ROUTING_TLS = threading.local()
 MOE_GC_ROUTING_STATS = collections.Counter()   # stored / reused / mismatch / unmatched
 
@@ -834,8 +828,7 @@ def _checkpoint_route_eager(top_k_index, top_k_weights, grad_mode):
         return None
     frame.current = None
     if not frame.replaying:
-        # The first pass runs without grad; a grad-mode call inside it (block compile's trial run)
-        # is not the forward that makes the loss.
+        # Only no-grad calls make the loss's forward; a grad-mode trial inside it does not.
         if not grad_mode:
             frame.entries.append((top_k_index.detach().clone(), top_k_weights.detach().clone()))
             frame.current = len(frame.entries) - 1
@@ -1058,10 +1051,8 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
         with torch.enable_grad(), _gradient_checkpoint_recompute_marker(), \
                 _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True):
             output = ctx.forward_function(hidden_states, *recompute_args)
-        # A layer may return the tensor itself (every transformers block since the tuple
-        # returns were retired), a 1-tuple, or several tensors: patch_gradient_checkpointing()
-        # routes every torch checkpoint call here, e.g. a chunked (log-prob, entropy) pair.
-        # Autograd hands one incoming grad per forward output; backprop the outputs that got one.
+        # Outputs may be one tensor, a tuple or several; backprop only the outputs that received a
+        # grad.
         outputs = output if isinstance(output, tuple) else (output,)
         pairs = [(o, g) for o, g in zip(outputs, dY)
                  if torch.is_tensor(o) and o.requires_grad and g is not None]

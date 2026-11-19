@@ -3078,11 +3078,9 @@ def _make_preference_cce_scorer(model, *, temperature=1.0):
 
     def score(model, batch, supervised, indices=None, *, every_position=False, logit_sums=True,
               differentiated, hidden=None, shared=None):
-        """Token cross entropy and logit sums per position as float32 grids; cross entropy is zero outside supervised;
-        indices limit the rows, and the sums too unless every_position; without logit_sums the sums are None; every call
-        states differentiated, False for a score no gradient reaches, since a training-mode kernel builds the hidden
-        gradient in its forward; hidden replaces the model's hidden states; shared=(pairs, length): rows past pairs
-        repeat those rows' first length positions, whose softcapped logit sums are then computed once."""
+        """float32 per-position token cross entropy (zero outside supervised) and logit sums (None
+        unless logit_sums); differentiated=False for scores no gradient reaches; shared=(pairs,
+        length) computes repeated prefix sums once."""
         kernel = by_mode(model) if differentiated else loss_only
         targets = _preference_ids(batch)[:, 1:]
         hidden = _preference_hidden(model, batch) if hidden is None else hidden

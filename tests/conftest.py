@@ -280,6 +280,22 @@ def _restore_hidden_states_flag():
             _os.environ[name] = value
 
 
+_MOE_UTILS = "unsloth_zoo.temporary_patches.moe_utils"
+
+
+@_pytest.fixture(autouse = True)
+def _restore_selected_moe_backend():
+    """select_moe_backend() caches its pick for the process. A test that forces UNSLOTH_MOE_BACKEND=grouped_mm or
+    spoofs a CUDA card hands that pick to later tests on the same worker, and on a CPU runner their MoE forward then
+    raises 'torch._grouped_mm is not supported'."""
+    module = sys.modules.get(_MOE_UTILS)
+    before = getattr(module, "_SELECTED_MOE_BACKEND", None)
+    yield
+    module = sys.modules.get(_MOE_UTILS)
+    if module is not None and hasattr(module, "_SELECTED_MOE_BACKEND"):
+        module._SELECTED_MOE_BACKEND = before
+
+
 # UNSLOTH_COMPILE_DISABLE only stops torch.compile, but since PR/issue 1866 fused losses and maybe_compile honour it
 # too; compile-path tests opt in via pytest.mark.usefixtures('compile_enabled'), which clears it and re-enables frozen
 # flags in every loaded module for the test.

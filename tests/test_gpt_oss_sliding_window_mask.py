@@ -191,8 +191,7 @@ print('RESULT ' + json.dumps(seen))
 
 
 def test_mask_target_follows_the_positions_not_a_cpu_placeholder():
-    # The flex mask is chosen per device; a CPU placeholder input_embeds (transformers 4.x generate) must not hide a
-    # model device the positions are on.
+    # Mask follows the positions' device, not a CPU placeholder input_embeds from generate.
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = ""
     env.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)

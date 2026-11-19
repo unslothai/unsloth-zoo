@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""transformers 4.x SDPA attention (OLMoE, StableLM, Nemotron, DBRX, PhiMoE ...) sets
-`is_causal = causal_mask is None and q_len > 1`, a SymBool once the sequence dim is dynamic (Unsloth's
-per-layer block compile marks it). SDPA takes only a bool, so every attention call broke the graph.
-The compiler rewrites it to the conditional form Llama uses."""
+"""transformers 4.x SDPA is_causal is a SymBool under dynamic shapes; SDPA takes only a bool, so the
+compiler rewrites it to the conditional form Llama uses."""
 import textwrap
 
 import torch

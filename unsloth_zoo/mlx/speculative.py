@@ -939,10 +939,8 @@ class DraftController:
         self._measured_at[(bucket, "plain")] = self.steps
 
     def deepening_pays(self, plan: RoundPlan, rows: Sequence[RowState], retry: bool = False) -> bool:
-        """Whether rounds drafted past ``plan``'s depth have emitted tokens faster than ``plan`` would; assumed so for the first few.
-        Trimmed ones compare their cycles with the regular cycle of the width the trim would have verified instead. With
-        ``retry``, a losing verdict admits one deeper round after a doubling gap of tokens: a verdict no deeper round can
-        revise would let the few rounds of its trial decide for the whole load."""
+        """Whether deeper rounds beat the plan rate (assumed so for the first few); with retry, a
+        losing verdict admits one deeper round after a doubling gap of tokens."""
         if self.deepened_cost.count < self._DEEPENED_TRIAL:
             return True
         reference = self.deepened_reference.value if self.deepened_profile is not None else self.round_seconds(plan, rows)
@@ -2696,12 +2694,16 @@ class HeadDrafter:
         return [0] * len(rows)
 
 
-_HEAD_REPLAY_CONTRACT = {"mlx_vlm.speculative.drafters.mtp_base": {
-    "AutoregressiveMTPDraftModel.accept_verified_tokens": "c030ed38f8f3254c"},
+_HEAD_REPLAY_SHARED = {
     "mlx_vlm.models.qwen4_exp.language": {"QSAKVCache.clear_index_blocks": "9beee61ae16211c8"},
     "mlx_vlm.speculative.drafters.qwen4_exp_mtp.qwen4_exp_mtp": {
         "Qwen4ExpMTPDraftModel._forward_hidden": "cef4894d36046e68", "Qwen4ExpMTPDraftModel.fuse_inputs": "37eced1c4e52a595"},
     "mlx_vlm.models.cache": {"KVCache.trim": "8c4d89141d5ceded"}}
+# mlx-vlm 0.8.0 moved the rejected-draft trim into `_prepare_verified_cache`.
+_HEAD_REPLAY_CONTRACTS = tuple({**_HEAD_REPLAY_SHARED, "mlx_vlm.speculative.drafters.mtp_base": base} for base in (
+    {"AutoregressiveMTPDraftModel.accept_verified_tokens": "c030ed38f8f3254c"},
+    {"AutoregressiveMTPDraftModel.accept_verified_tokens": "dc3fa29bf70930e9",
+     "AutoregressiveMTPDraftModel._prepare_verified_cache": "f23c30aaf64dade4"}))
 
 
 def _head_replay_matches(row, replay):
@@ -2722,13 +2724,13 @@ class _Qwen4HeadDrafter(HeadDrafter):
 
     def prepare_replay(self, row, hidden, tokens, count):
         """Queue a private native replay; resolve with host acceptance, or None to discard it."""
-        from .inference import _ast_fingerprint, _bindings_intact, _resolved_bindings, _QSA_TRIM_HELD
+        from .inference import _ast_fingerprint, _bindings_intact, _first_resolved, _QSA_TRIM_HELD
         from mlx_vlm.speculative.drafters.mtp_base import AutoregressiveMTPDraftModel
         from mlx_vlm.models.qwen4_exp.language import QSAKVCache
 
         bindings = getattr(self, "_replay_bindings", None)
         if bindings is None or not _bindings_intact(bindings):
-            bindings = _resolved_bindings(_HEAD_REPLAY_CONTRACT)
+            bindings = _first_resolved(_HEAD_REPLAY_CONTRACTS)
             trim, kept = QSAKVCache.trim, []
             native_trim = trim
             for cls, native_trim_fn, route in _QSA_TRIM_HELD[1] if _QSA_TRIM_HELD else ():

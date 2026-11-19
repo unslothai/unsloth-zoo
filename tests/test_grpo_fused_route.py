@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""grpo_accumulated_loss routed through fused_linear_grpo_loss against the log-prob route (fused_linear_logprobs +
-UnslothEfficientGRPO + UnslothGRPOEntropyBonus): loss, metrics and every parameter gradient, on the padded and the
-sequence-packed forward, plus the routing decisions."""
+"""fused_linear_grpo_loss route must match the log-prob route: loss, metrics and gradients."""
 import math
 import os
 import types
@@ -193,7 +191,7 @@ def test_entropy_bonus_folds_into_the_loss(monkeypatch, packed, loss_type):
              entropy_coef = 0.05)
 
 
-def _prefix_grouper_funcs():
+def _prefix_grouper_funcs(monkeypatch):
     """unsloth's PrefixGrouper layout builder, loaded from its own file (importing unsloth needs a GPU stack)."""
     import importlib.util
     import sys
@@ -216,6 +214,10 @@ def _prefix_grouper_funcs():
             s.loader.exec_module(m)
         mods[name] = sys.modules[full]
     pg = mods["prefix_grouper"]
+    # unsloth#18405 keeps calls saving under ~1024 prompt tokens on the packed path; this
+    # 2 x 3 fixture saves a handful, and what is under test is the grouped forward itself.
+    if hasattr(pg, "_MIN_SAVED"):
+        monkeypatch.setattr(pg, "_MIN_SAVED", 0)
     built = []
 
     def build(*args, **kwargs):
@@ -242,7 +244,7 @@ PG_LTK = 4
     ("grpo", 0.04, False), ("dapo", 0.0, True), ("cispo", 0.04, False), ("sapo", 0.02, False),
 ])
 def test_prefix_grouper_forward_matches_log_prob_route(monkeypatch, loss_type, beta, bias):
-    funcs, built = _prefix_grouper_funcs()
+    funcs, built = _prefix_grouper_funcs(monkeypatch)
     old, ref, _, adv = _side_inputs(input_ids = PG_IDS, ltk = PG_LTK)
     before = _Model.pg_forwards
     _compare(monkeypatch, loss_type = loss_type, beta = beta, old = old, ref = ref, adv = adv, bias = bias,

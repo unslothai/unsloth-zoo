@@ -92,7 +92,7 @@ def _class_namespace(cls):
     return vars(cls)
 
 
-def _resolved_bindings(contract):
+def _resolved_bindings(contract, *, report=True):
     """Resolve a `{module: {dotted name: fingerprint}}` contract, None pinning the name not the body.
 
     A fingerprint may be a tuple of alternatives, for a body that differs across the supported
@@ -134,11 +134,17 @@ def _resolved_bindings(contract):
                         found[id(source.__globals__), alias] = (source.__globals__, alias, mod)
             else:
                 holds = False
-                if (module_name, path) not in _CONTRACT_MISSES:
+                if report and (module_name, path) not in _CONTRACT_MISSES:
                     _CONTRACT_MISSES.add((module_name, path))
                     logger.warning("%s.%s differs from the version the MLX fusions were written "
                                    "against; the native method stays in use", module_name, path)
     return list(found.values()) if holds else None
+
+
+def _first_resolved(contracts):
+    """The first of several accepted contracts that resolves; only when none does is the newest one's miss reported."""
+    found = next(filter(None, (_resolved_bindings(contract, report=False) for contract in contracts)), None)
+    return found if found is not None else _resolved_bindings(contracts[-1])
 
 
 def _exact_route_native(function):
@@ -274,7 +280,7 @@ _MOE_GATE_UP_FUNCTIONS = {
 }
 _MOE_SWITCH_GLU_CALLS = {
     "mlx_lm.models.switch_layers": ("ed00798a68bad37d", "3a412610c5b9c112"),
-    "mlx_vlm.models.switch_layers": ("ed00798a68bad37d", "4e3d80f1396fb265"),
+    "mlx_vlm.models.switch_layers": ("ed00798a68bad37d", "4e3d80f1396fb265", "b3f8c684857eb8fe"),
 }
 
 
@@ -312,6 +318,9 @@ def _moe_gate_up_packable(module, projection_type):
     if gate.trainable_parameters() or up.trainable_parameters():
         return False
     if gate.get("global_scale") is not None or up.get("global_scale") is not None:
+        return False
+    # mlx-vlm 0.8.0 sorts the routes of a rank's share of the experts on its own threshold.
+    if getattr(module, "num_experts", gate.num_experts) != gate.num_experts:
         return False
     if (gate.group_size, gate.bits, gate.mode) != (up.group_size, up.bits, up.mode):
         return False
@@ -6060,11 +6069,24 @@ def _nax_int8_prefill_dense(module, x, bindings):
     return None if routed is None else routed.reshape(*x.shape[:-1], N)
 
 
+class _NaxOwner:
+    """Shared by a routed switch projection and the tables copied from it; their routes run while a scope holds it."""
+    __slots__ = ("live", "holders")
+
+    def __init__(self):
+        self.live, self.holders = True, 0
+
+
+def _nax_held(module):
+    token = module.__dict__.get("_unsloth_nax_owner")
+    return token is not None and token.live
+
+
 def _nax_gather_rows(owner, flag, x, w, indices, sorted_indices, bindings, token_rows):
     """The sorted rows of a gathered call that the NAX route `flag` enables on `owner` may take, or 0."""
     if not sorted_indices or not isinstance(x, mx.array) or x.ndim != 3 or x.shape[1] != 1:
         return 0
-    if not getattr(owner, flag, False) or owner.training:
+    if not getattr(owner, flag, False) or owner.training or not _nax_held(owner):
         return 0
     if bindings is not None and not _bindings_intact(bindings):
         return 0
@@ -6218,7 +6240,35 @@ def _nax_switch_classes():
             swapped = _nax_switch_class(base, base.__call__, path)
             if swapped is not None:
                 classes[base] = swapped
+                slot = offload.slot_class(base)
+                classes[slot] = _nax_slot_class(slot, swapped)
     return classes
+
+
+@functools.cache
+def _nax_slot_class(slot, swapped):
+    # Offloaded experts' slot projections: the offload rule for sorted calls applies before the routes see them.
+    return type(f"_NaxGather{slot.__name__}", (offload.slot_class(swapped),), {"_unsloth_nax_qmm_native": slot})
+
+
+def _nax_modules(model, modules):
+    """`_fusion_modules`, plus the expert projections offloaded experts run outside the module tree."""
+    for path, module in _fusion_modules(model, modules):
+        yield path, module
+        if isinstance(module, offload.OffloadSwitchGLU):
+            yield from ((path, projection) for projection in module.projections())
+
+
+def _nax_restore(module):
+    native = getattr(type(module), "_unsloth_nax_qmm_native", None)
+    if native is not None:
+        module.__class__ = native
+    for name in ("_unsloth_nax_qmm_scopes", "_unsloth_nax_qmm_floor", "_unsloth_nax_qmm_ceiling",
+                 "_unsloth_nax_qmm_next", "_unsloth_nax_int8_prefill_rows",
+                 "_unsloth_nax_int8_prefill", "_unsloth_nax_sorted_gather", "_unsloth_nax_qmm_ready",
+                 "_unsloth_nax_owner"):
+        module.__dict__.pop(name, None)
+    module.pop("_unsloth_nax_qmm_rows", None)   # a tuple is stored in the module mapping
 
 
 def _nax_qmm_shape(module, route):
@@ -6298,7 +6348,7 @@ def int8_prefill_available(model):
         return Int8PrefillStatus(False, "distributed", 0)
     classes = _nax_qmm_classes(_NAX_QMM_ROUTE, nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
     switches, packed = _nax_switch_classes(), _nax_int8_prefill_packed(model)
-    modules = {id(module): module for _, module in model.named_modules()} if hasattr(model, "named_modules") else {}
+    modules = {id(module): module for _, module in _nax_modules(model, None)}
     return _int8_prefill_status(sum(bool(_nax_int8_prefill_route(module, classes, switches, packed))
                                     for module in modules.values()))
 
@@ -6365,7 +6415,7 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
     small-row kernels of `matmul` under their own row table and the same first-use check;
     `UNSLOTH_MLX_SIMD_QMM=0` turns that route off.
 
-    `int8_prefill=True`, or `UNSLOTH_MLX_INT8_PREFILL=1` when it is None, also runs affine 3- to
+    `int8_prefill=True`, or `UNSLOTH_MLX_INT8_PREFILL=1` when it is None, also runs affine 2- to
     8-bit linears and routed experts with int8 activations: faster, but lossy enough to raise the
     loss of precision-sensitive checkpoints. Linears route from 17 rows, so batched decoding of 17
     or more sequences and wider speculative verification also run int8. The outermost scope
@@ -6374,7 +6424,7 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
     Sorted routed-expert projections run on a NAX gather kernel that reproduces `mx.gather_qmm`
     bit for bit where it is measured faster; `UNSLOTH_MLX_NAX_SORTED_GATHER=0` turns it off.
     """
-    changed, tracked = [], hasattr(model, "__dict__")
+    changed, held, owners, released, tracked = [], {}, [], set(), hasattr(model, "__dict__")
     try:
         with _NAX_QMM_LOCK:
             depth, outer = getattr(model, "__dict__", {}).get("_unsloth_nax_int8_prefill_scope", (0, None))
@@ -6396,13 +6446,19 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                 switches = _nax_switch_classes() if int8_prefill or sorted_gather else {}
                 packed = _nax_int8_prefill_packed(model) if int8_prefill else set()
                 nested, fresh, seen = [], [], set()
-                for _, module in _fusion_modules(model, _modules):
+                for _, module in _nax_modules(model, _modules):
                     if id(module) in seen:   # named_modules() yields a shared module once per path
                         continue
                     seen.add(id(module))
                     base = type(module)
+                    # A routed copy whose owner is gone (outlived its scopes, or copied as they exited) starts afresh.
+                    if base in switches.values() and not _nax_held(module):
+                        _nax_restore(module)
+                        base = type(module)
+                    if base is offload.OffloadSwitchGLU:
+                        owners.append(module)
                     if base in classes.values() or base in switches.values():
-                        if getattr(module, "_unsloth_nax_qmm_scopes", 0):
+                        if getattr(module, "_unsloth_nax_qmm_scopes", 0) or "_unsloth_nax_owner" in vars(module):
                             nested.append(module)
                     elif base in classes:
                         rows = _nax_qmm_row_range(module, route) if small_m else None
@@ -6429,10 +6485,14 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                 tiled = any(rows is not None for _, rows, _, _ in fresh) and _tiled_prefill_enabled()
                 for module, rows, int8_prefill_rows, gather in fresh:
                     if type(module) in switches:
-                        if int8_prefill_rows:
-                            module._unsloth_nax_int8_prefill = True
-                        if gather:
-                            module._unsloth_nax_sorted_gather = True
+                        module._unsloth_nax_owner = _NaxOwner()   # inherited by the tables copied from it
+                        # Cleared as well as set: a table copied mid-swap on another thread may carry stale flags.
+                        for flag, on in (("_unsloth_nax_int8_prefill", int8_prefill_rows),
+                                         ("_unsloth_nax_sorted_gather", gather)):
+                            if on:
+                                module.__dict__[flag] = True
+                            else:
+                                module.__dict__.pop(flag, None)
                         module.__class__ = switches[type(module)]
                         continue
                     module._unsloth_nax_qmm_rows = (0, -1) if rows is None else rows
@@ -6446,6 +6506,11 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                         module._unsloth_nax_int8_prefill_rows = int8_prefill_rows
                     module.__class__ = classes[type(module)]
                 for module in nested + [entry[0] for entry in fresh]:
+                    token = module.__dict__.get("_unsloth_nax_owner")
+                    if token is not None:
+                        token.holders += token not in held
+                        held.setdefault(token, []).append(module)
+                        continue
                     module._unsloth_nax_qmm_scopes = getattr(module, "_unsloth_nax_qmm_scopes", 0) + 1
                     changed.append(module)
         yield model
@@ -6460,14 +6525,18 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                 if scopes > 1:
                     module._unsloth_nax_qmm_scopes = scopes - 1
                     continue
-                native = getattr(type(module), "_unsloth_nax_qmm_native", None)
-                if native is not None:
-                    module.__class__ = native
-                for name in ("_unsloth_nax_qmm_scopes", "_unsloth_nax_qmm_floor", "_unsloth_nax_qmm_ceiling",
-                             "_unsloth_nax_qmm_next", "_unsloth_nax_int8_prefill_rows",
-                             "_unsloth_nax_int8_prefill", "_unsloth_nax_sorted_gather", "_unsloth_nax_qmm_ready"):
-                    module.__dict__.pop(name, None)
-                module.pop("_unsloth_nax_qmm_rows", None)   # a tuple is stored in the module mapping
+                _nax_restore(module)
+            for token, modules in held.items():
+                token.holders -= 1
+                if not token.holders:
+                    token.live = False
+                    released.add(token)
+                    for module in modules:
+                        _nax_restore(module)
+            for owner in owners:
+                for projection in owner.projections():
+                    if projection.__dict__.get("_unsloth_nax_owner") in released:
+                        _nax_restore(projection)
 
 
 _DENSE_QMM_CONTRACT = {"mlx.nn.layers.quantized": {"QuantizedLinear.__call__": "ca5cafb6d038d955"}}
@@ -8901,8 +8970,7 @@ def _top_candidates(logits, k):
 
 
 def _candidate_scores(predecessors, hidden, successors, unary):
-    # Every edge from each candidate at a position to each at the next: each is `CandidateSelector.select`'s own bf16
-    # product and sum.
+    # Adjacent-position edges use CandidateSelector.select's own bf16 product and sum.
     edges = mx.sum((predecessors * hidden[:, :, None])[:, :, :, None] * successors[:, :, None], axis = -1)
     return unary[:, :, None] + edges
 
@@ -9208,7 +9276,12 @@ def draft_tree_accept(tree, target):
         output_shapes = [tree.tokens.shape, (2,)], output_dtypes = [mx.int32, mx.int32]))
 
 
-_DRAFT_LAYER_CONTRACT = {_DFLASH2: {"DFlash2DecoderLayer.__call__": "c1adba4d305aaa16"}}
+# mlx-vlm 0.8.0 moved the layer body into `_forward` and skips rotary on `no_rope_layers`.
+_DRAFT_LAYER_CONTRACTS = (
+    {_DFLASH2: {"DFlash2DecoderLayer.__call__": "c1adba4d305aaa16"}},
+    {_DFLASH2: {"DFlash2DecoderLayer.__call__": "a4bee3318356a55e", "DFlash2DecoderLayer._forward": "8f2e068c3f777518",
+                "_no_rope": "54053377ce5c2a92"}},
+)
 
 
 @functools.cache
@@ -9216,6 +9289,8 @@ def _draft_layer_class(base):
     def call(self, x, x_ctx, rope, cache, projected_context = None):
         if self.training or not _bindings_intact(self._unsloth_draft_layer_bindings):
             return base.__call__(self, x, x_ctx, rope, cache, projected_context)
+        if not getattr(self, "use_rope", True):
+            rope = sys.modules[_DFLASH2]._no_rope
         def finish(conv, hidden, dynamic, residual):
             if (not conv.training and type(conv) is _fused_dflash2_class(sys.modules[_DFLASH2].GroupedDynamicCausalConv)
                     and _fused_dflash2_serves(conv)):
@@ -9235,7 +9310,7 @@ def _draft_layer_class(base):
 def fused_drafter_layers(model) -> int:
     """Fold covered DFlash2 convolution residuals into their layer's kernels; returns covered layers."""
     module = sys.modules.get(_DFLASH2)
-    bindings = _resolved_bindings(_DRAFT_LAYER_CONTRACT) if module else None
+    bindings = _first_resolved(_DRAFT_LAYER_CONTRACTS) if module else None
     if bindings is None:
         return 0
     layers = [layer for layer in model.get("layers", []) if type(layer) is module.DFlash2DecoderLayer]

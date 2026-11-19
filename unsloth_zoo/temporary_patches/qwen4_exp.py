@@ -14,18 +14,14 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Qwen4Exp (Qwen3.8-Flash-Next) patches: MoE uses the Qwen3.5-MoE grouped-GEMM backend; QSA indexer skips its per-query
-nonzero/topk loop when kv_length < budget + compress_ratio; UNSLOTH_QWEN4_EXP_FAST_QSA=0 disables. From the budget up
-(training / prefill without a cache), QSA attention selects its blocks vectorised and attends to the selected tokens
-only (``unsloth_zoo.sparse_attention``), instead of a per-query Python loop plus an O(S^2) masked dense attention;
-UNSLOTH_QWEN4_EXP_SPARSE_ATTN=0 disables. Where that path has no kernel (T4 / sm75, CPU) the dense reference
-attention stays, but its indexer builds the selection mask vectorised too (UNSLOTH_QWEN4_EXP_VECTORISED_QSA=0
-keeps transformers' per-query loop). The ~102 GB PLE n-gram table is streamed from the checkpoint by
-``unsloth_zoo.frozen_table_store`` unless UNSLOTH_FROZEN_TABLE=gpu."""
+"""Qwen4Exp: grouped-GEMM MoE; QSA fast path (UNSLOTH_QWEN4_EXP_FAST_QSA=0 disables); sparse
+attention (UNSLOTH_QWEN4_EXP_SPARSE_ATTN=0 disables); UNSLOTH_QWEN4_EXP_VECTORISED_QSA=0 keeps
+the per-query loop; ~102 GB PLE table streamed unless UNSLOTH_FROZEN_TABLE=gpu"""
 
 __all__ = ["patch_qwen4_exp", "patch_qwen4_exp_frozen_table"]
 
 import os
+import weakref
 
 import torch
 
@@ -118,12 +114,9 @@ def _qwen4_exp_vectorised_indexer_mask(indexer, hidden_states, position_embeddin
 
 def qwen4_exp_qsa_indexer_forward_guarded(self, hidden_states, position_embeddings, attention_mask,
                                           past_key_values=None):
-    """transformers' indexer on the filled cache slots only; installed alone under UNSLOTH_QWEN4_EXP_FAST_QSA=0.
-
-    The reference reads the position table by kv slot, which has one row per token seen so far. A static cache's
-    mask spans max_cache_len, and a query row that attends to nothing (a left pad) is given every slot by Unsloth's
-    sdpa_mask fix, unfilled ones included: the reference then indexes past the table (a CUDA device assert in
-    batched generate). Real tokens never see an unfilled slot, so hiding them changes no row that is read."""
+    """Indexer on filled cache slots only (installed alone under UNSLOTH_QWEN4_EXP_FAST_QSA=0);
+    unfilled static-cache slots would index past the position table (CUDA assert in batched
+    generate)"""
     # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
     if attention_mask is not None and attention_mask.dim() == 4:
         n_positions = position_embeddings[0].shape[-2]
@@ -138,7 +131,7 @@ def qwen4_exp_qsa_indexer_forward_guarded(self, hidden_states, position_embeddin
 
 
 _reference_attention_forward = None
-QWEN4_EXP_SPARSE_STATS = {"sparse": 0, "reference": 0}
+QWEN4_EXP_SPARSE_STATS = {"sparse": 0, "reference": 0, "cached_decode": 0}
 
 
 def _sparse_attn_enabled():
@@ -232,6 +225,262 @@ def _select_and_attend(indexer, hidden_states, position_embeddings, attention_ma
     return sparse_gqa_attn(query, key, value, selected, scaling)
 
 
+def _cached_decode_enabled():
+    return os.environ.get("UNSLOTH_QWEN4_EXP_CACHED_DECODE", "1") != "0"
+
+
+# Measured break-even (L4, Qwen3.8 dims: 0.86x at 8K, 1.20x at 32K); shorter contexts keep the reference.
+_CACHED_DECODE_MIN_CONTEXT = 24576
+
+
+def _cached_decode_min_context():
+    try:
+        return int(os.environ.get("UNSLOTH_QWEN4_EXP_CACHED_DECODE_MIN_CONTEXT", _CACHED_DECODE_MIN_CONTEXT))
+    except ValueError:
+        return _CACHED_DECODE_MIN_CONTEXT
+
+
+# Longer steps (chunked prefill) keep the reference: gathered K / V rows grow with query rows x budget.
+_CACHED_DECODE_MAX_QUERY = 16
+# Device counter of accelerator steps whose mask was not the padding shape the block cache assumes.
+QWEN4_EXP_CACHED_DECODE_MISMATCH = {}
+
+
+def _qsa_pooled_blocks(n_tokens, start, ratio):
+    """Complete blocks within the first `n_tokens` slots; pool only these (the SGLang #46125 trap)."""
+    return torch.div(n_tokens - start, ratio, rounding_mode = "floor").clamp_min(0)
+
+
+_ARANGE = {}
+
+
+def _arange(n, device):
+    """Cached torch.arange(n): no kernel launch per call."""
+    have = _ARANGE.get(device)
+    if have is None or have.shape[0] < n:
+        have = _ARANGE[device] = torch.arange(max(n, 2 * (0 if have is None else have.shape[0]), 4096), device = device)
+    return have[:n]
+
+
+@torch.no_grad()
+def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attention_mask, rope, rope_dtype):
+    """[b, q, budget + ratio - 1] selected slots (-1 = unused), as the reference indexer; extends the caches. No host sync.
+
+    The reference forms blocks from each query's ordered visible slots. Every decode mask transformers builds (causal
+    plus a 2D padding mask: left, right or interior gaps) shows each query its row's visible slots up to itself, so
+    the cache keeps the last row's visible slots in order and pools blocks over that list. Returns None, before any
+    cache write, for a mask outside that shape when it lives on the host (checked for free); on an accelerator such
+    a step is counted in QWEN4_EXP_CACHED_DECODE_MISMATCH and intersected, so no hidden key is read."""
+    import math
+    batch, q_len = hidden_states.shape[:2]
+    raw_cache = layer.indexer_keys
+    filled = raw_cache.shape[1]
+    total = filled + q_len
+    ratio, dim, top_blocks = indexer.compress_ratio, indexer.index_head_dim, indexer.block_topk
+    device = hidden_states.device
+
+    visible = attention_mask[:, 0] if attention_mask.dtype == torch.bool else attention_mask[:, 0] == 0
+    state = getattr(layer, "_unsloth_qsa_decode", None)
+    # Any cache edit (crop, beam reorder, reset, offload) swaps the raw key tensor: rebuild from the raw keys.
+    rebuild = state is None or state["raw"]() is not raw_cache or state["filled"] != filled
+    # From the last query row: a real token, never a pad.
+    last = visible[:, -1]
+    seen = last if rebuild else torch.cat([state["seen"][:, :filled], last[:, filled:]], dim = -1)   # [b, total]
+    rows = _arange(total, device)[filled:]                                                   # slot of each query
+    slots = _arange(total, device)
+    expected = seen[:, None, :] & (slots <= rows[:, None])                                     # [b, q, total]
+    mismatch = (expected != visible).any()
+    if device.type == "cpu" and bool(mismatch):
+        return None
+
+    cos, sin = full_cos[:, -q_len:, :], full_sin[:, -q_len:, :]
+    if rope_dtype is not None:
+        cos, sin = cos.to(rope_dtype), sin.to(rope_dtype)
+    qk = indexer.index_qk_proj(hidden_states)
+    index_q, token_k = torch.split(qk, [indexer.index_n_heads * dim, indexer.index_kv_heads * dim], dim = -1)
+    index_q = indexer.q_layernorm(index_q.reshape(batch, q_len, -1, dim))
+    index_q = rope(index_q, cos = cos, sin = sin, unsqueeze_dim = 2)
+    raw_keys = layer.update_indexer(token_k.reshape(batch, q_len, -1, dim).squeeze(2))
+
+    # order[:, i] = the i-th visible slot of the last row (entries past `count` are unused); seen = its slot set.
+    if rebuild:
+        blocks = None
+        order = torch.where(last, slots, total + slots).sort(dim = -1).values.clamp_max(total - 1)
+        count_before = last[:, :filled].sum(-1)
+    else:
+        order, seen_buffer, blocks, count_before = state["order"], state["seen"], state["blocks"], state["count"]
+    if rebuild or order.shape[1] - 1 < total:
+        # One spare column at the end takes every write of a hidden new slot; it is never read.
+        width = -(-total // 1024) * 1024 + 1
+        grown = torch.zeros((batch, width), dtype = torch.int64, device = device)
+        kept = min(order.shape[1], width - 1)
+        grown[:, :kept] = order[:, :kept]
+        order = grown
+        seen_buffer = torch.zeros((batch, width), dtype = torch.bool, device = device)
+        seen_buffer[:, :filled] = seen[:, :filled]
+    new_visible = last[:, filled:]                                                           # [b, q]
+    row_count = count_before[:, None] + new_visible.cumsum(-1)                                 # [b, q] visible keys
+    count = row_count[:, -1]
+    if not rebuild:
+        at = torch.where(new_visible, row_count - 1, order.shape[1] - 1)
+        order.scatter_(1, at, rows.expand(batch, -1))
+    seen_buffer[:, filled:total] = new_visible
+    capacity = total // ratio
+    if blocks is None or blocks.shape[1] - 1 < capacity:
+        # One spare row at the end takes every write of a not-yet-complete block; it is never scored.
+        grown = torch.zeros((batch, -(-capacity // 256) * 256 + 1, dim), dtype = torch.float32, device = device)
+        if blocks is not None:
+            grown[:, : blocks.shape[1] - 1] = blocks[:, :-1]
+        blocks = grown
+    spare = blocks.shape[1] - 1
+    last_index = order.shape[1] - 2
+
+    def slot_at(index):
+        """Slot of the given visible indices ([b, ...]), clamped into range (unused entries are masked later)."""
+        flat = index.reshape(batch, -1).clamp(0, last_index)
+        return order.gather(1, flat).view(index.shape).clamp_max(total - 1)
+
+    done_after = _qsa_pooled_blocks(count, 0, ratio)
+    if rebuild:
+        n_new = spare
+        block_ids = _arange(n_new, device).expand(batch, -1)                                     # [b, n_new]
+    else:
+        n_new = q_len // ratio + 1
+        block_ids = _qsa_pooled_blocks(count_before, 0, ratio)[:, None] + _arange(n_new, device)
+    arange_r = _arange(ratio, device)
+    token_slots = slot_at((block_ids * ratio)[..., None] + arange_r)                          # [b, n_new, ratio]
+    first_slot = token_slots[..., 0]
+    groups = raw_keys.gather(1, token_slots.view(batch, -1, 1).expand(-1, -1, dim)).view(batch, n_new, ratio, dim)
+    pooled = indexer.k_layernorm(groups.float().mean(dim = 2).to(raw_keys.dtype))
+    block_cos = full_cos.gather(1, first_slot[..., None].expand(-1, -1, full_cos.shape[-1]))
+    block_sin = full_sin.gather(1, first_slot[..., None].expand(-1, -1, full_sin.shape[-1]))
+    if rope_dtype is not None:
+        block_cos, block_sin = block_cos.to(rope_dtype), block_sin.to(rope_dtype)
+    pooled = rope(pooled.unsqueeze(2), cos = block_cos, sin = block_sin, unsqueeze_dim = 2).squeeze(2)
+    write_at = torch.where(block_ids < done_after[:, None], block_ids, spare)
+    blocks.scatter_(1, write_at[..., None].expand(-1, -1, dim), pooled.float())
+    layer._unsloth_qsa_decode = {"raw": weakref.ref(raw_keys), "filled": total, "order": order, "seen": seen_buffer,
+                                 "count": count, "blocks": blocks}
+
+    # Score the complete blocks of each query row, as the reference: sum over index heads of relu(q . k) / sqrt(d).
+    row_blocks = torch.div(row_count, ratio, rounding_mode = "floor")                          # [b, q]
+    scores = torch.matmul(index_q.float(), blocks[:, None, :spare].transpose(-1, -2))         # [b, q, h, C]
+    scores = torch.relu(scores).sum(dim = 2) / math.sqrt(dim)
+    scores = scores.masked_fill(_arange(spare, device) >= row_blocks[..., None], float("-inf"))
+    top = scores.topk(min(top_blocks, spare), dim = -1)
+    chosen = slot_at((top.indices * ratio)[..., None] + arange_r)                             # [b, q, k, ratio]
+    chosen = torch.where(torch.isfinite(top.values)[..., None], chosen, -1).flatten(2)
+    tail_index = (row_blocks * ratio)[..., None] + arange_r[: ratio - 1]                       # [b, q, ratio - 1]
+    tail = torch.where(tail_index < row_count[..., None], slot_at(tail_index), -1)
+    selected = torch.cat([chosen, tail], dim = -1)                                             # [b, q, S]
+
+    # Count steps whose mask is not each row's visible slots up to itself; never keep a hidden key.
+    counter = QWEN4_EXP_CACHED_DECODE_MISMATCH.get(device)
+    if counter is None:
+        # Never an inference tensor: a later step under plain no_grad must still be able to add_ into it.
+        with torch.inference_mode(False):
+            counter = QWEN4_EXP_CACHED_DECODE_MISMATCH[device] = torch.zeros((), dtype = torch.int64, device = device)
+    counter.add_(mismatch)
+    return torch.where(visible.gather(-1, selected.clamp_min(0)) & (selected >= 0), selected, -1)
+
+
+def _qwen4_exp_cached_decode(module, hidden_states, position_embeddings, attention_mask, past_key_values, kwargs):
+    """QSA for a step into a filled DynamicCache (decode, MTP), or None for the reference (host sync per row).
+    Roped fp32 block keys are cached on the layer; only the selected K / V rows are gathered and attended.
+    Assumes each query sees its row's visible keys up to itself (causal plus any 2D padding mask: what generate
+    builds); other masks take the reference when on the host, else are counted in QWEN4_EXP_CACHED_DECODE_MISMATCH
+    and still intersected, so no hidden key is read."""
+    if not _cached_decode_enabled() or past_key_values is None:
+        return None
+    output_attentions = kwargs.get("output_attentions")
+    if output_attentions is None:
+        output_attentions = getattr(module.config, "output_attentions", False)
+    if output_attentions or (module.training and module.attention_dropout):
+        return None
+    # Dynamic / longrope RoPE re-rotate past positions: cached block keys would be stale.
+    rope_type = (getattr(module.config, "rope_parameters", None) or {}).get("rope_type", "default")
+    if "dynamic" in str(rope_type) or rope_type == "longrope":
+        return None
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.dim() != 4 or attention_mask.shape[1] != 1:
+        return None
+    indexer = module.indexer
+    batch, q_len = hidden_states.shape[:2]
+    if q_len > _CACHED_DECODE_MAX_QUERY:
+        return None
+    layers = getattr(past_key_values, "layers", None)
+    try:
+        from transformers.cache_utils import DynamicIndexedLayer
+        layer = layers[module.layer_idx]
+    except Exception:
+        return None
+    if not isinstance(layer, DynamicIndexedLayer) or not getattr(layer, "is_indexer_initialized", False):
+        return None
+    raw_cache = layer.indexer_keys
+    keys = getattr(layer, "keys", None)
+    if not isinstance(raw_cache, torch.Tensor) or raw_cache.dim() != 3 or not isinstance(keys, torch.Tensor):
+        return None
+    filled = raw_cache.shape[1]
+    total = filled + q_len
+    ratio = indexer.compress_ratio
+    # Within the budget the patched indexer is already dense and loop-free.
+    if (filled == 0 or keys.dim() != 4 or keys.shape[-2] != filled or raw_cache.shape[0] != batch
+            or attention_mask.shape[-1] != total or attention_mask.shape[-2] != q_len
+            or total < max(indexer.token_budget + ratio, _cached_decode_min_context())):
+        return None
+    full_cos, full_sin = position_embeddings
+    if full_cos.dim() != 3 or full_cos.shape[-2] != total:
+        return None
+    # Half activations take half RoPE tables, as qwen4_exp_attention_forward does.
+    rope_dtype = None
+    if hidden_states.dtype in (torch.float16, torch.bfloat16) and full_cos.dtype != hidden_states.dtype:
+        rope_dtype = hidden_states.dtype
+    import sys
+    rope = getattr(sys.modules.get(type(module).__module__), "apply_rotary_pos_emb", None)
+    if rope is None:   # a subclass defined elsewhere
+        from transformers.models.qwen4_exp import modeling_qwen4_exp
+        rope = modeling_qwen4_exp.apply_rotary_pos_emb
+    cos, sin = full_cos[:, -q_len:, :], full_sin[:, -q_len:, :]
+    if rope_dtype is not None:
+        cos, sin = cos.to(rope_dtype), sin.to(rope_dtype)
+    selected = _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attention_mask, rope, rope_dtype)
+    if selected is None:   # a host mask the block cache cannot serve: the reference, nothing written yet
+        return None
+    if _QSA_DECODE_TRACE is not None:
+        _QSA_DECODE_TRACE.append((module.layer_idx, selected))
+
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, module.head_dim)
+    query_states, gate = torch.chunk(module.q_proj(hidden_states).view(*input_shape, -1, module.head_dim * 2), 2, dim=-1)
+    gate = gate.reshape(*input_shape, -1)
+    query_states = module.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+    key_states = module.k_norm(module.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+    value_states = module.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    query_states, key_states = rope(query_states, key_states, cos, sin)
+    key_states, value_states = past_key_values.update(key_states, value_states, module.layer_idx)
+    n_kv, width = key_states.shape[1], selected.shape[-1]
+    n_q, head_dim, v_dim = query_states.shape[1], key_states.shape[-1], value_states.shape[-1]
+    groups_per_kv = n_q // n_kv
+    flat = selected.clamp_min(0).reshape(batch, 1, q_len * width, 1)
+    k_rows = key_states.gather(2, flat.expand(-1, n_kv, -1, head_dim))
+    v_rows = value_states.gather(2, flat.expand(-1, n_kv, -1, v_dim))
+    k_rows = k_rows.view(batch, n_kv, q_len, width, head_dim).transpose(1, 2).reshape(batch * q_len, n_kv, width, head_dim)
+    v_rows = v_rows.view(batch, n_kv, q_len, width, v_dim).transpose(1, 2).reshape(batch * q_len, n_kv, width, v_dim)
+    # repeat_kv: fold query-head groups into the query length.
+    query_rows = query_states.reshape(batch, n_kv, groups_per_kv, q_len, head_dim).permute(0, 3, 1, 2, 4)
+    query_rows = query_rows.reshape(batch * q_len, n_kv, groups_per_kv, head_dim).to(k_rows.dtype)
+    attn_mask = (selected >= 0).reshape(batch * q_len, 1, 1, width)
+    attn_output = torch.nn.functional.scaled_dot_product_attention(
+        query_rows, k_rows, v_rows, attn_mask = attn_mask, scale = module.scaling,
+    )
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = (attn_output * torch.sigmoid(gate)).to(value_states.dtype)
+    return module.o_proj(attn_output), None
+
+
+# Test hook: a list receives (layer_idx, selected token slots [b, q, S]) per cached-decode call.
+_QSA_DECODE_TRACE = None
+
+
 def qwen4_exp_attention_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kwargs):
     # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
     from unsloth_zoo.temporary_patches.qwen4_exp import (
@@ -242,11 +491,17 @@ def qwen4_exp_attention_forward(self, hidden_states, position_embeddings, attent
         if not torch.compiler.is_compiling():
             QWEN4_EXP_SPARSE_STATS["sparse"] += 1
         return out
+    if past_key_values is not None and not torch.compiler.is_compiling():
+        from unsloth_zoo.temporary_patches.qwen4_exp import _qwen4_exp_cached_decode
+        out = _qwen4_exp_cached_decode(self, hidden_states, position_embeddings, attention_mask, past_key_values,
+                                       kwargs)
+        if out is not None:
+            QWEN4_EXP_SPARSE_STATS["cached_decode"] += 1
+            return out
     if not torch.compiler.is_compiling():
         QWEN4_EXP_SPARSE_STATS["reference"] += 1
-    # fp32 RoPE tables with half-precision projections (4-bit) would promote Q / K but not V after RoPE. The
-    # compiler's rewrites (RoPE tables cast to the activation dtype, V aligned to Q) never reach this reference,
-    # since the class forward it rewrites is this wrapper; cast the tables like its RoPE rewrite does.
+    # fp32 RoPE tables with half-precision projections (4-bit) promote Q/K but not V after RoPE;
+    # compiler rewrites skip this wrapper, so cast tables to the activation dtype here
     if (
         hidden_states.dtype in (torch.float16, torch.bfloat16)
         and isinstance(position_embeddings, (tuple, list))

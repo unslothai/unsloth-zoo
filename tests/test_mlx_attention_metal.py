@@ -1208,3 +1208,36 @@ def test_thread_limited_gpus_include_paravirtual_ones(monkeypatch, arch, limited
         assert attention._thread_limited_gpu() == limited
     finally:
         attention._thread_limited_gpu.cache_clear()
+
+
+@pytest.mark.parametrize("kernel", ["shape_generic", "per_shape"])
+def test_inkling_banded_mask_trains_through_its_metal_kernel(kernel, monkeypatch):
+    import importlib
+    from unsloth_zoo.mlx import attention, utils
+    language = pytest.importorskip("mlx_vlm.models.inkling.language")
+    native = language.banded_additive_mask
+    native = getattr(native, "_unsloth_sparse_attention_original", native)
+    consumers = [language] + [importlib.import_module(path) for path in ("mlx_vlm.models.inkling2.language",)
+                              if importlib.util.find_spec(path.rsplit(".", 1)[0])]
+    for consumer in consumers:
+        monkeypatch.setattr(consumer, "banded_additive_mask", native)
+    B, LQ, H, D, E, S = 2, 5, 3, 4, 4, 9
+    rel, proj = mx.random.normal((B, LQ, H, D)), mx.random.normal((D, E))
+    if kernel == "shape_generic":
+        args, kwargs = (S - LQ, S, 0, E), {"left_padding": mx.array([0, 2]), "shape_ref": mx.zeros((B, H, S, D))}
+    else:
+        args, kwargs = (0, S, 3, E), {}
+    cotangent = mx.random.normal((B, H, LQ, S))
+    with monkeypatch.context() as m:
+        m.setattr(mx.metal, "is_available", lambda: False)
+        _, want = mx.vjp(lambda r, p: native(r, p, *args, **kwargs), (rel, proj), (cotangent,))
+    utils.acquire_mlx_training_patches()
+    try:
+        trained = language.banded_additive_mask
+        assert all(c.banded_additive_mask is trained is not native for c in consumers)
+        assert mx.array_equal(trained(rel, proj, *args, **kwargs), native(rel, proj, *args, **kwargs)).item()
+        _, got = mx.vjp(lambda r, p: trained(r, p, *args, **kwargs), (rel, proj), (cotangent,))
+    finally:
+        utils.release_mlx_training_patches()
+    for g, w in zip(got, want):
+        assert mx.allclose(g, w, atol=1e-4).item()

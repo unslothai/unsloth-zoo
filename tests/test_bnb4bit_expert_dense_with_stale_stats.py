@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A dense fused expert stored beside stale bnb quantization stats loads dense.
-
-On transformers v5 the prequantized expert deserializer received a bf16
-gate_up_proj plus leftover .absmax / .quant_map keys and called
-Params4bit.from_prequantized on it, so the MoE forward read bf16 bytes as nf4.
-transformers 4.x ignores the stray keys and keeps the expert exact.
-"""
+"""Dense expert beside stale bnb stats loads dense; on transformers v5 its bf16 bytes were read as
+nf4 (transformers 4.x ignores the stray keys and keeps the expert exact)."""
 import os
 import shutil
 
@@ -84,8 +79,7 @@ def test_a_dense_expert_beside_stale_stats_stays_dense(monkeypatch):
 
 
 def test_a_dense_expert_beside_stale_stats_gets_the_lone_weight_dtype(monkeypatch):
-    # transformers 5.21+ hands the model dtype to the op for unquantized weights; the
-    # dense expert must come back in that dtype exactly as a stats-free one does.
+    # Dense expert keeps the model dtype on transformers 5.21+, as a stats-free one does.
     M = pytest.importorskip("unsloth_zoo.temporary_patches.moe_utils_bnb4bit")
     recorded = []
     op = _deserializer(monkeypatch, recorded)
@@ -109,8 +103,7 @@ def test_a_packed_expert_still_deserializes(monkeypatch):
 
 @pytest.mark.parametrize("storage", [torch.bfloat16, torch.float16, torch.float32])
 def test_a_packed_expert_in_float_quant_storage_still_deserializes(monkeypatch, storage):
-    # bnb_4bit_quant_storage may be a float dtype: the payload is floating point
-    # but flattened to [n, 1], so it is packed, not dense.
+    # A float bnb_4bit_quant_storage still gives a packed [n, 1] payload, not a dense one.
     recorded = []
     op = _deserializer(monkeypatch, recorded)
     packed = torch.zeros(512, 1, dtype = storage)
@@ -169,8 +162,7 @@ def test_tiny_gpt_oss_with_stale_expert_stats_loads_exact_experts(tmp_path):
 
     tensors = load_file(os.path.join(saved, "model.safetensors"))
     stale = [n for n in tensors if ".experts.gate_up_proj." in n or ".experts.down_proj." in n]
-    # Without expert stats in the 4-bit save there is nothing to leave stale, so the
-    # checkpoint this test needs cannot be built: fail rather than pass vacuously.
+    # Fail, not pass vacuously, if the 4-bit save has no expert stats to leave stale.
     assert stale, "the 4-bit save kept dense experts, so no stale expert stats can be built"
     dense = str(tmp_path / "dense_with_stale_stats")
     os.makedirs(dense)

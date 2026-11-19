@@ -104,9 +104,8 @@ def gated_delta_ops_efficient(
             )
             states.append(s)
 
-        # BPTT: d_state is the cotangent of the returned state, starting at d_state_out; per-step grads are collected in
-        # lists because mx .at[:, t].add scatter-add gives wrong grads for batch rows past the first before mlx 0.32.0
-        # (ml-explore/mlx 3483).
+        # mlx before 0.32.0: scatter-add into .at[:, t] gives wrong grads for batch rows past the
+        # first, so per-step grads are collected in lists (ml-explore/mlx 3483).
         d_q_steps = []
         d_k_steps = []
         d_v_steps = []

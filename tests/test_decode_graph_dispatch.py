@@ -285,9 +285,7 @@ def test_decode_attention_per_head_mask_with_one_kv_head(G):
 
 
 def test_flex_graph_contract_names_the_mask_function(G, monkeypatch):
-    # The graph key sees the outer mask_mod's code, the same for every mask_function: the published identity is
-    # what tells two windows (or causal from sliding) apart, and a mask_function holding anything but scalars
-    # and functions (a dict of document ids, a partial, an object) publishes no contract at all.
+    # Identity tells windows apart; a mask_function with non-scalar data publishes no contract.
     import functools
     from transformers.masking_utils import causal_mask_function, sliding_window_causal_mask_function
     monkeypatch.setenv("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "flex")
@@ -397,9 +395,8 @@ def _torch_attr_mask(b, h, q, kv):
 
 
 def test_flex_graph_contract_keys_module_and_class_attributes(G, monkeypatch):
-    # State read through a module or class global (settings.WINDOW, Config.WINDOW) is part of the identity:
-    # changing the attribute changes the graph key; an attribute holding anything but a scalar publishes no
-    # contract. torch attributes stay library code.
+    # Module or class attributes read by the mask join the graph key; a non-scalar one publishes
+    # none.
     monkeypatch.setenv("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "flex")
     with S.graph_generate():
         ident = lambda fn: getattr(_decode_mask(G, monkeypatch, fn, torch.tensor(140)), "_unsloth_mask_identity", None)
@@ -477,9 +474,7 @@ def _visible_through_blocks(block_mask, kv_len):
 
 @pytest.mark.parametrize("window", [None, 200])
 def test_flex_graph_contract_refill_moves_across_blocks(G, monkeypatch, window):
-    # A graph captured at position p replays later steps by refilling the BlockMask's tensor fields (block counts
-    # included) and the closure tensors, as unsloth's generic decode graphs do; the replayed mask must list the new
-    # blocks and match causal + window + padding visibility at p, p + BLOCK and p + 3 * BLOCK.
+    # Replay refills BlockMask tensors (block counts included); the mask must track the new blocks.
     import copy
     from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE as BLOCK
     from transformers.masking_utils import causal_mask_function, sliding_window_causal_mask_function
@@ -556,9 +551,7 @@ def test_auto_graph_decode_falls_back_to_the_dense_mask(G, monkeypatch):
 
 
 def test_flex_graph_contract_keeps_its_shape_on_a_rolling_window(G, monkeypatch):
-    # A rolling sliding layer reports kv_length = the window and kv_offset growing by one per step while the 2D mask
-    # grows too: the closure tensors (part of the graph key, refilled per replay) must keep one shape, and the
-    # refilled mask must see slot j as position kv_offset + j under causal + window + padding.
+    # Rolling window: closure tensors keep one shape; slot j maps to position kv_offset + j.
     from torch.nn.attention.flex_attention import create_block_mask
     from transformers.masking_utils import sliding_window_causal_mask_function
     import unsloth_zoo.flex_attention.utils as U

@@ -14,14 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""An expert-LoRA adapter trained under Unsloth on Llama-4 / Qwen3-VL-MoE must load in vanilla transformers + PEFT
-and give the model Unsloth trained, and must still reload under Unsloth.
-
-Unsloth flags Llama4TextExperts is_transposed and stores Qwen3VLMoeTextExperts transposed, so PEFT factors their
-stacks over swapped dims; without moe_lora_factor_swap the saved lora_A / lora_B do not fit vanilla PEFT (size
-mismatch). Three CPU subprocesses: vanilla builds and saves a tiny non-square checkpoint, Unsloth (zoo patches)
-loads it, attaches a random expert LoRA, saves it and its logits, vanilla reloads the adapter.
-"""
+"""Unsloth expert LoRA on Llama-4 / Qwen3-VL-MoE must load in vanilla PEFT, give the model Unsloth
+trained, and reload under Unsloth; moe_lora_factor_swap is needed (else lora_A/B size mismatch)."""
 
 import json
 import os
@@ -343,8 +337,7 @@ def test_legacy_grouped_lora_B_saves_3d_and_loads_back_as_trained(monkeypatch):
 
 
 def test_llama4_factors_follow_pefts_is_transposed_support(monkeypatch):
-    # PEFT 0.18 ignores is_transposed, so Llama-4 factors already match vanilla there; a physically transposed
-    # stack (Qwen3-VL-MoE) is swapped on any PEFT.
+    # PEFT 0.18 ignores is_transposed; Llama-4 needs no swap, transposed stacks always do.
     from unsloth_zoo.temporary_patches import moe_lora_factor_swap as swap
 
     class Relabelled:

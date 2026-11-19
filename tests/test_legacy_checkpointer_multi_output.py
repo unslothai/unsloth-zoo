@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""patch_gradient_checkpointing() swaps torch.utils.checkpoint.checkpoint for Unsloth_Gradient_Checkpointer, so every
-caller of torch's checkpoint goes through it, including ones whose function returns several tensors (a chunked
-log-prob / entropy pair, a block returning hidden states and an aux loss). Those must get the same gradients as
-without checkpointing. CPU only."""
+"""Multi-output checkpointed functions must get the same gradients as without checkpointing."""
 import torch
 
 from unsloth_zoo.gradient_checkpointing import Unsloth_Gradient_Checkpointer

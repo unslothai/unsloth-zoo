@@ -29,6 +29,7 @@ import gc
 import importlib
 import itertools
 import tempfile
+import stat
 import time
 import weakref
 
@@ -142,10 +143,24 @@ def _rank_ledger():
         uid = os.getuid() if hasattr(os, "getuid") else 0
         # The launcher is every local rank's parent: a later launch on the same port gets a fresh directory.
         path = os.path.join(tempfile.gettempdir(), f"unsloth_block_swap_{uid}_{job}_{os.getppid()}")
-        os.makedirs(path, exist_ok = True)
+        os.makedirs(path, mode = 0o700, exist_ok = True)
+        if not _private_dir(path):
+            # Predictable name in a shared temp dir: another OS user may have made it.
+            return None
         return path, int(rank), world
     except (OSError, ValueError):
         return None
+
+
+def _private_dir(path):
+    """True if `path` is a real directory owned by this user that no one else can write to."""
+    if os.name == "nt" or not hasattr(os, "getuid"):
+        return True
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not (st.st_mode & 0o022)
 
 
 def _publish_host_pending(nbytes):
@@ -177,6 +192,7 @@ def _others_host_pending(own):
         try:
             with open(os.path.join(path, str(r))) as f:
                 session, nbytes = (int(x) for x in f.read().split())
+            nbytes = max(0, nbytes)
         except (OSError, ValueError):
             session, nbytes = -1, 0
         # A peer still in an earlier session (loading while this rank already installs) keeps what it published:
@@ -668,8 +684,7 @@ class BlockSwap:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.blocks = [_Block(layer, self.streams, self.device, shared) for layer in swapped]
         sizes = [b.nbytes() for b in self.blocks]
-        # Every card a block's frozen weights land on gets slots: its peaks are sampled and its growth judged too,
-        # not only the block's home card.
+        # Every card a block's frozen weights land on gets slots, not only its home card.
         self._peak_devs = sorted({torch.device(dv) for b in self.blocks for dv in (*b.sizes, b.home) if dv is not None
                                   and torch.device(dv).type == "cuda"}, key = lambda d: d.index or 0)
         _begin_host_session()
@@ -699,9 +714,8 @@ class BlockSwap:
         for ptr, n in host_storages.items():
             if not _in_ranges(ptr, file_backed):
                 self._host_credit[next(iter(users[ptr]))] += n
-        # Walk the packing order: block k's bytes are committed before its original is released, so the peak is
-        # the largest (committed through k) - (released before k), not the total less every credit (ten GPU blocks
-        # packed ahead of one CPU block whose storage is 10 GiB still commit all ten first).
+        # Peak is the largest committed through block k minus released before k, not total less
+        # credits.
         if not _can_register():
             # The chunked fallback commits whole chunks, rounded up to powers of two (padding included).
             commits = _chunked_commits([b.sizes for b in self.blocks])
@@ -810,10 +824,9 @@ class BlockSwap:
             self._publish_packed(k)
 
     def _publish_packed(self, k):
-        # Blocks 0..k are packed and their originals released; free RAM already shows what that took. Other local
-        # ranks hold back only the rise still to come over this point of the walk install planned, chunk padding
-        # already committed included, not a share of the first estimate. Not capped at the first estimate either:
-        # releasing a storage larger than its block raises free RAM, and the blocks still to pack need it back.
+        # Other local ranks hold back only the rise still to come, chunk padding already committed
+        # included; not capped at the first estimate, since freeing a storage larger than its block
+        # raises free RAM the next blocks need.
         credit = getattr(self, "_host_credit", None)
         if credit is not None and k < len(credit) and credit[k] > 0:
             # The credit assumes the originals' pages are gone now: heap-served ones need an explicit trim.
@@ -1041,9 +1054,8 @@ class BlockSwap:
                     self._release(self.blocks[i])
             else:
                 self._release(self.blocks[i])
-            # The output's grad hook already queued the step end from the outer graph (see _output_peak). Without
-            # one (a bare layer list), queue it here, once: a non-reentrant checkpoint hooks the same input in the
-            # forward and again in the recompute, so this runs twice per backward.
+            # Queue here only when the output's grad hook did not; else a checkpoint replay ends the
+            # step twice.
             if i == 0 and not self._step_queued:
                 self._step_queued = True
                 try:
@@ -1065,9 +1077,8 @@ class BlockSwap:
             if getattr(b, "marks", None) is not None and getattr(b, "mark_open", 0) == 1:
                 b.mark_open = 3
         if self._step_queued:
-            # Queued from the output's grad hook: a deferred _bwd(0) release (a first swapped layer whose input
-            # needs no grad) runs later in the same backward's final callbacks and must not end the step again.
-            # Clear the mark after those, by queuing the clear behind them.
+            # Clear the mark queued behind deferred releases, so a late _bwd(0) cannot end the step
+            # again.
             try:
                 torch.autograd.Variable._execution_engine.queue_callback(self._clear_step_queued)
             except RuntimeError:
@@ -1586,8 +1597,7 @@ def _mark_host_kept(model):
     if not names or os.environ.get("UNSLOTH_PLACE_NO_PLACEMENT_PARAMS", "0") == "1":
         return
     params = list(model.named_parameters(remove_duplicate = False))
-    # Whole owner module (FP8Embedding's weight_scale sits beside the table), tagged on the module
-    # because a load to host replaces the Parameter.
+    # Tag the whole owner module, not the parameter: a host load replaces the Parameter.
     try:
         from .device_map_planner import no_placement_matcher
     except ImportError:  # loaded as a standalone file (tests): same rule, inline
@@ -1821,9 +1831,8 @@ class _HostLoad:
         # Each selected layer's bytes as declared on meta, to scale a loaded layer's size to the others'.
         self.shape_bytes, self.last_done = {}, None
         self.owned_names = {}
-        # Per selected layer, {param name: (kind, declared bytes)}; per kind, {layer: loaded / declared bytes}.
-        # A layer left unquantized (a skip module) loads at full size while the others load at 4 bits: one ratio
-        # for every layer would charge the quantized ones at full size.
+        # Ratios are per kind and layer: an unquantized skip layer loads full size, the rest at 4
+        # bits.
         self.decl, self.kind_ratios = {}, {}
         self.cpu_to_come = 0
 

@@ -617,10 +617,7 @@ def _as_array_mask(q, k, mask):
     return mx.arange(S)[None] <= mx.arange(S - T, S)[:, None]
 
 
-# mlx 0.32.4's fused SDPA VJP keeps its S/P/dS tiles in the input dtype, so bf16/fp16 gradients lose to an explicit
-# fp32 softmax; given fp32 inputs, the same fused forward and blocked VJP run in fp32.
-# Below 2047 queries (a 2048-token sequence after the label shift) or above D128, the fp32 copies cost more than
-# mlx's unfused path, so those causal calls keep the stock kernels.
+# mlx 0.32.4 fused SDPA VJP keeps tiles in input dtype; fp32 wins only at 2047+ queries and D64/128.
 _FP32_CAUSAL_HEAD_DIMS = frozenset((64, 128))
 _FP32_CAUSAL_MIN_QUERIES = 2047
 
@@ -1024,6 +1021,35 @@ def apply_gather_qmm_nax_guard() -> bool:
             _MLX_GATHER_QMM_ORIGINAL = current
             mx.gather_qmm = _gather_qmm_guarded
         return True
+
+
+_MLX_GELU_APPROX_FINITE_GRAD = None
+_MLX_GELU_APPROX_STOCK = None
+
+
+def _gelu_approx_finite_grad(x):
+    # Stock fp16 grad is NaN for |x| >= ~148 (3x**2 overflows, meets sech^2 = 0). tanh is exactly +-1 past |x| = 10,
+    # so the clip keeps the forward bit-identical (u - v == 0). Other dtypes cannot overflow: stock graph, zero cost.
+    if x.dtype != mx.float16:
+        return _MLX_GELU_APPROX_STOCK(x)
+    t = mx.clip(x, -10, 10)
+    u = 1 + mx.tanh(math.sqrt(2 / math.pi) * (t + 0.044715 * t**3))
+    v = mx.stop_gradient(u)
+    return 0.5 * x * v + 0.5 * t * (u - v)
+
+
+def apply_gelu_approx_finite_grad() -> bool:
+    """Idempotent. Must run before a model is first traced: mx.compile'd callers keep the function they traced."""
+    global _MLX_GELU_APPROX_FINITE_GRAD, _MLX_GELU_APPROX_STOCK
+    activations = importlib.import_module("mlx.nn.layers.activations")
+    if _MLX_GELU_APPROX_FINITE_GRAD is None:
+        _MLX_GELU_APPROX_STOCK = activations.gelu_approx
+        _MLX_GELU_APPROX_FINITE_GRAD = mx.compile(_gelu_approx_finite_grad, shapeless=True)
+    if nn.gelu_approx is _MLX_GELU_APPROX_FINITE_GRAD and activations.gelu_approx is _MLX_GELU_APPROX_FINITE_GRAD:
+        return False
+    # nn.GELU resolves the activations module's name, model code resolves nn's.
+    nn.gelu_approx = activations.gelu_approx = _MLX_GELU_APPROX_FINITE_GRAD
+    return True
 
 
 
@@ -9169,7 +9195,11 @@ _LEGACY_IMAGE_SPEC = "_unsloth_legacy_image_spec"
 def bind_legacy_image_processor(model, processor):
     from mlx_vlm.models.base import BaseImageProcessor
     image_processor = getattr(processor, "image_processor", None)
-    if hasattr(processor, "tokenizer") or not isinstance(image_processor, BaseImageProcessor):
+    if (
+        getattr(model, "_unsloth_vision_released", False)
+        or hasattr(processor, "tokenizer")
+        or not isinstance(image_processor, BaseImageProcessor)
+    ):
         return
     from PIL import Image
 
@@ -15124,6 +15154,44 @@ def _unpack_hadamard_modules(model):
     return bool(dense)
 
 
+def _dense_scaled_quantized_modules(model):
+    """mlx-lm's dequantize_model skips NVFP4 modules with a global scale (mlx-vlm's ScaledQuantized*, the loader's scaled
+    embedding) and would save their packed weights as dense; fold the scale and any AWQ pre_quant_scale in instead."""
+    dense = []
+    for name, module in model.named_modules():
+        scale_name = next((key for key in ("weight_scale_2", "weight_global_scale")
+                           if getattr(module, key, None) is not None), None)
+        packed = getattr(module, "weight", None)
+        if scale_name is None or getattr(module, "scales", None) is None or getattr(packed, "dtype", None) != mx.uint32:
+            continue
+        weight = mx.dequantize(packed, module.scales, getattr(module, "biases", None), module.group_size,
+                               module.bits, module.mode, dtype=mx.float32)
+        scale = getattr(module, scale_name).astype(mx.float32)
+        if scale.size > 1:
+            scale = scale.reshape(*weight.shape[:-2], -1, 1)
+        weight = weight / scale if scale_name == "weight_global_scale" else weight * scale
+        pre = getattr(module, "pre_quant_scale", None)
+        if pre is not None:
+            pre = pre.astype(mx.float32)
+            weight = weight * (pre.reshape(*pre.shape[:-1], 1, pre.shape[-1]) if pre.ndim > 1 else pre)
+        weight = weight.astype(mx.bfloat16)
+        bias = getattr(module, "bias", None)
+        if hasattr(module, "num_embeddings"):
+            layer = nn.Embedding(*weight.shape)
+        elif weight.ndim == 3:
+            from mlx_lm.models.switch_layers import SwitchLinear
+            layer = SwitchLinear(weight.shape[2], weight.shape[1], weight.shape[0], bias=bias is not None)
+        else:
+            layer = nn.Linear(weight.shape[1], weight.shape[0], bias=bias is not None)
+        layer.weight = weight
+        if bias is not None:
+            layer.bias = bias
+        dense.append((name, layer))
+    if dense:
+        model.update_modules(mlx.utils.tree_unflatten(dense))
+    return bool(dense)
+
+
 # Pack-only keys; with the layers unpacked the tree is plain mlx-vlm Qwen3.5.
 _HADAMARD_PACK_CONFIG_KEYS = frozenset({
     "schema_version", "base_model_type", "tensor_namespace", "gdn_activation_layout",
@@ -15456,6 +15524,7 @@ def save_lora_adapters(model, path, adapter_config=None, adapter_format="mlx"):
     """Save lora_a/lora_b and DoRA magnitudes; adapter_format is mlx (native) or peft (HF layout), where uniform LoRA
     loads in transformers, PEFT and vLLM, but per-module rank/alpha only in transformers/PEFT (vLLM has one global
     rank/alpha)."""
+    refuse_released_vision(model, "saving")
     if adapter_format not in ("mlx", "peft"):
         raise ValueError(
             f"Unsloth MLX: adapter_format={adapter_format!r}; expected "
@@ -18757,6 +18826,14 @@ def _restore_mlx_model_state(model, snapshot):
     mx.clear_cache()
 
 
+def refuse_released_vision(model, action) -> None:
+    if getattr(model, "_unsloth_vision_released", False):
+        raise ValueError(
+            f"Unsloth: this model's vision weights were released for text-only inference; "
+            f"{action} needs the model loaded without drop_vision_weights."
+        )
+
+
 def save_merged_model(model, tokenizer, path, dequantize=False,
                       quantize_unquantized=False):
     """Fuse LoRA and save an HF-style merged dir (sharded safetensors, config, tokenizer, card); dequantize=True writes
@@ -18765,6 +18842,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
     from mlx_lm.utils import save_model, create_model_card, dequantize_model
     from mlx.utils import tree_unflatten
 
+    refuse_released_vision(model, "saving")
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     restore_after_save = None
@@ -18781,6 +18859,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
 
     if dequantize:
         unpacked = _unpack_hadamard_modules(model)
+        _dense_scaled_quantized_modules(model)
         model = dequantize_model(model)
         # Rewrite what is saved: it may resolve from `model.config` or `model.args`.
         cfg = _get_model_config(model)
@@ -19706,6 +19785,7 @@ def push_to_hub_merged(
     commit_description=_PUSH_MERGED_DEFAULT_COMMIT_DESCRIPTION,
     create_pr=False,
     revision=None,
+    _always_save=False,
 ):
     """Push merged model to HuggingFace Hub.
 
@@ -19727,7 +19807,8 @@ def push_to_hub_merged(
 
     save_directory = Path(save_directory)
 
-    if not (save_directory / "model.safetensors.index.json").exists():
+    # _always_save: the folder was not chosen by the caller, so an existing save in it may be an earlier model.
+    if _always_save or not (save_directory / "model.safetensors.index.json").exists():
         save_merged_model(model, tokenizer, save_directory)
 
     if repo_id is None:

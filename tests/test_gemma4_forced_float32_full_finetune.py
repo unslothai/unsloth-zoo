@@ -14,15 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Gemma-4 is in FORCE_FLOAT32: on a GPU without bfloat16 an fp16 request sets UNSLOTH_FORCE_FLOAT32=1, and full
-finetuning then trains the model in float32 with no autocast. The patched RMSNorm always returned float16, and every
-decoder boundary casts back to its Linear's dtype, but the final norm feeds lm_head directly, so the first forward
-died with "expected mat1 and mat2 to have the same dtype, but got: c10::Half != float" at lm_head (Kaggle T4, MoE
-matrix, Gemma-4 loaded alone). Now the norms follow the projections' dtype when no autocast is active: a float32
-model matches vanilla transformers in float32, and the fp16 paths (autocast training, no-autocast eval) still run.
-
-CPU subprocesses: the patches gate on UNSLOTH_FORCE_FLOAT32 at patch time, and the reference never imports the zoo.
-"""
+"""Gemma-4 norms follow the projections dtype when no autocast (a hard float16 cast broke lm_head);
+a float32 model matches vanilla; fp16 autocast and eval still run; env UNSLOTH_FORCE_FLOAT32."""
 
 import json
 import os
@@ -159,7 +152,11 @@ def test_decoder_boundary_patch_is_undone_by_a_flag_off_load(monkeypatch):
     monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
     p.patch_Gemma4TextDecoderLayerBoundary()
     p.patch_Gemma4TextDecoderLayerBoundary()  # idempotent: one wrapper
-    assert g.Gemma4TextDecoderLayer.forward.__wrapped__ is original
+    forward = g.Gemma4TextDecoderLayer.forward
+    assert forward._unsloth_gemma4_stock is original
+    # transformers >= 5.23 keeps its checkpoint wrapper outermost, around the one scope.
+    scope = forward.__wrapped__ if forward.__code__.co_name == "forward_with_checkpointing" else forward
+    assert scope.__wrapped__ is p.checkpointed_forward_body(original)
     monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "0")
     p.patch_Gemma4TextDecoderLayerBoundary()
     assert g.Gemma4TextDecoderLayer.forward is original

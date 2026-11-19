@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Dense (unquantized) experts in a prequantized bnb-4bit checkpoint must load in the requested model dtype.
-
-The expert twins carry `hf_quantizer` so transformers >= 5.21 keeps fp32 quant metadata in its checkpoint dtype
-(`HfQuantizer.get_new_dtype` returns None), but that also skips the loader cast for an unquantized expert layer
-(dynamic-quant skip layers, mixed checkpoints). Runs the real `convert_and_load_state_dict_in_model` on CPU."""
+"""Dense experts in a prequantized bnb-4bit checkpoint must load in model dtype; hf_quantizer
+(transformers >= 5.21, keeps fp32 quant metadata) also skips that cast for unquantized experts."""
 
 from __future__ import annotations
 

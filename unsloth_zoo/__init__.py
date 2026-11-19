@@ -18,7 +18,7 @@
 # is a TypeError on the 3.9 floor pyproject declares.
 from __future__ import annotations
 
-__version__ = "2026.11.6"
+__version__ = "2026.11.7"
 
 import os
 import platform
@@ -172,6 +172,10 @@ if _is_mlx_only:
     DEVICE_TYPE_TORCH = "mps"
     DEVICE_COUNT = 1
     ALLOW_PREQUANTIZED_MODELS = True
+    # The GPU-only init below installs temporary_patches; keep their device-independent security guards on MLX.
+    from unsloth_zoo.mlx.runtime import install_mlx_security_patches
+    install_mlx_security_patches()
+    del install_mlx_security_patches
     del _is_mlx_only, is_mlx_available, find_spec
     # Everything below this point is GPU-only. Use a flag to gate it.
     _SKIP_GPU_INIT = True

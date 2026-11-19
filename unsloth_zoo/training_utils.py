@@ -552,6 +552,7 @@ def prepare_model_for_training(
     # Also detect norms by owning-module class name; catches custom norms whose param names lack a token (e.g. Gemma audio tower).
     _norm_class_re = re.compile(r"(?i)(rms_?norm|layer_?norm)")
     _norm_param_ids = set()
+    _active_token_delta_ids = set()
     for _, _module in model.named_modules():
         if hasattr(_module, "_pre_set_compute_dtype"):
             # External policy casts recursively, so all descendants are managed.
@@ -560,6 +561,12 @@ def prepare_model_for_training(
         if _norm_class_re.search(type(_module).__name__):
             for _, _p in _module.named_parameters(recurse=False):
                 _norm_param_ids.add(id(_p))
+        # PEFT trainable_token_indices: active adapters' rows (inactive ones can arrive requires_grad=True).
+        _token_deltas = getattr(_module, "trainable_tokens_delta", None)
+        if isinstance(_token_deltas, torch.nn.ParameterDict):
+            for _adapter in getattr(_module, "active_adapters", ()):
+                if _adapter in _token_deltas:
+                    _active_token_delta_ids.add(id(_token_deltas[_adapter]))
     # Rollback switch (default off): 1 keeps norm weights at their loaded dtype (pre-fix).
     _disable_float32_norm_upcast = (
         os.environ.get("UNSLOTH_DISABLE_FLOAT32_UPCAST", "0") == "1")
@@ -593,6 +600,10 @@ def prepare_model_for_training(
                     or ".lora_embedding_A." in name
                     or ".lora_embedding_B." in name
                     or ".lora_magnitude_vector" in name):
+                upcast = True
+                requires_grad = True
+            elif id(param) in _active_token_delta_ids:
+                # float32 master like LoRA: PEFT casts the delta to the embedding dtype in forward.
                 upcast = True
                 requires_grad = True
             elif (_is_peft_model and "bias" in name and param.requires_grad
@@ -646,9 +657,8 @@ def prepare_model_for_training(
 
     _owner_names = {}
     if _float32_bias_param_ids:
-        # named_parameters() above deduplicates tied Parameters. Discover every
-        # owner by identity: their shared storage has already been upcast, so
-        # checking float16 again would miss later aliases (BERT / RoBERTa heads).
+        # Find owners by identity: upcast storage hides aliases from a float16 check (BERT/RoBERTa
+        # heads).
         for _name, _param in model.named_parameters(remove_duplicate=False):
             if id(_param) in _float32_bias_param_ids:
                 _owner, _, _leaf = _name.rpartition(".")

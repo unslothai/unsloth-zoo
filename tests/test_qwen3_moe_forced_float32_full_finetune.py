@@ -14,14 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Qwen3-MoE is in FORCE_FLOAT32: on a GPU without bfloat16 an fp16 request sets UNSLOTH_FORCE_FLOAT32=1, and full
-finetuning then trains the model in float32 with no autocast. The float32 patches hard-cast the RMSNorm and attention
-outputs to float16, so the first forward died with "expected mat1 and mat2 to have the same dtype ... Half != float"
-at q_proj (Kaggle T4, compose harness). Now each Linear boundary follows its weights: a float32 model matches vanilla
-transformers in float32, and the fp16 paths (autocast training, no-autocast eval) are unchanged.
-
-CPU subprocesses: the patches gate on UNSLOTH_FORCE_FLOAT32 at patch time, and the reference never imports the zoo.
-"""
+"""Qwen3-MoE float32 patches must follow each Linear dtype, not hard-cast to float16 (broke q_proj);
+UNSLOTH_FORCE_FLOAT32=1 gates them; fp16 paths unchanged."""
 
 import json
 import os
