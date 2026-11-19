@@ -1226,17 +1226,8 @@ NO_GRAD_CHECKPOINT_STATS = collections.Counter()   # checkpoint calls run direct
 
 
 def _call_without_checkpoint(function, *args):
-    """A checkpoint entered with grad off records no graph, so no backward replays it.
-
-    Training-mode forwards under ``torch.no_grad()`` / ``torch.inference_mode()``
-    (GRPO old / ref logprobs, DPO reference logps, eval) still reach the checkpoint
-    shims through ``GradientCheckpointingLayer`` and the fast decoder loops. Running
-    the block directly gives the same output without the checkpoint's work: the
-    offloaded checkpointer copied the first layer's input (which the input-grad hook
-    marks requires_grad even under no_grad) to a pinned host slot, recorded routing
-    and attention frames, and advanced the layer counters that pick the last layer
-    to keep on the device. Routing and attention frames are scoped out as the
-    checkpoint's own first pass does."""
+    """Grad off records no graph, so run the block directly: skips the offload copy, routing /
+    attention frames and layer counters (GRPO / DPO ref logps, eval under no_grad)."""
     # All Unsloth Zoo code licensed under LGPLv3
     NO_GRAD_CHECKPOINT_STATS["calls"] += 1
     with _checkpoint_routing_scope(None, False), saved_attention_scope(None, False):
@@ -1814,8 +1805,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
     @classmethod
     def apply(cls, run_function, preserve_rng_state, *args):
-        # Also installed as torch.utils.checkpoint.CheckpointFunction, so torch's own reentrant checkpoint
-        # (a layer's _gradient_checkpointing_func bound before the shims were patched in) lands here too.
+        # Also installed as torch.utils.checkpoint.CheckpointFunction, so pre-bound torch checkpoints land here.
         if not torch.is_grad_enabled() and not torch.compiler.is_compiling():
             return _call_without_checkpoint(run_function, *args)
         return super().apply(run_function, preserve_rng_state, *args)

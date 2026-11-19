@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A checkpoint entered with grad off (GRPO old / ref logprobs, DPO reference logps, eval in training mode) runs the
-block directly: no checkpoint Function, no saved inputs, no offload slot, no layer counter step. The input-grad hook
-marks the first layer's input requires_grad even under no_grad, so before this the offloaded checkpointer copied it
-to a pinned host slot on every no-grad forward. CPU only; the GPU counterpart is the offload count probe."""
+"""A checkpoint entered with grad off runs the block directly (no Function, saved inputs, offload slot or counter step)."""
 
 import pytest
 import torch
@@ -112,8 +109,7 @@ def test_grad_off_scopes_out_routing_frame(gc_module):
 
 
 def test_torch_reentrant_checkpoint_routed_to_unsloth_function(gc_module, monkeypatch):
-    """A layer whose _gradient_checkpointing_func was bound to torch's own checkpoint before the shims were patched in
-    reaches UnslothCheckpointFunction through torch.utils.checkpoint.CheckpointFunction: grad off runs directly."""
+    """A pre-bound torch checkpoint reaches UnslothCheckpointFunction via CheckpointFunction: grad off runs directly."""
     pristine = getattr(torch.utils.checkpoint, "_unsloth_pristine_checkpoint", None)
     if pristine is None:
         pristine = torch.utils.checkpoint.checkpoint
