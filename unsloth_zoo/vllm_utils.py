@@ -4168,16 +4168,12 @@ def _vllm_gdn_reads_ssm_dtype():
 
 
 def _vllm_colocated_cache_args(engine_arg_keys, enable_prefix_caching):
-    """KV cache args for an engine sharing this process with training. Only keys this vLLM has.
+    """KV cache args for an in-process (colocated) engine; only keys this vLLM has.
 
-    enable_extensible_kv_cache = False (vLLM >= 0.34 turns it on for CUDA and ROCm): it caps torch's
-    allocator for the whole process and keeps the cap through sleep, so with UNSLOTH_VLLM_STANDBY the
-    trainer cannot use the memory sleep frees. Off is the estimate-based sizing load_vllm is tuned for.
-
-    prefix_cache_retention_interval = None (vLLM >= 0.29 defaults to 0): sliding-window and Mamba / GDN
-    groups then hash only the replay boundary, so a multi-turn rollout's next turn cannot reuse the
-    previous completion. None hashes every full block, as before 0.29; full attention ignores it.
-    The deprecated VLLM_PREFIX_CACHE_RETENTION_INTERVAL env var still wins when set.
+    enable_extensible_kv_cache=False: vLLM >= 0.34's cap on torch's allocator survives sleep, so the
+    trainer cannot reuse memory freed by UNSLOTH_VLLM_STANDBY.
+    prefix_cache_retention_interval=None: vLLM >= 0.29's default 0 stops sliding-window / Mamba / GDN
+    groups reusing the previous multi-turn completion. The deprecated env var still wins.
     """
     args = {}
     if "enable_extensible_kv_cache" in engine_arg_keys:
@@ -5346,8 +5342,7 @@ def load_vllm(
                 print(f"Unsloth: Not an error, but `{key}` is not supported in vLLM. Skipping.")
             pass
         pass
-        # After the filter, so an older vLLM gets neither key nor a "not supported" line. Not for
-        # return_args: `vllm serve` is its own process, and its CLI drops False values.
+        # After the filter (no "not supported" line). Not for `vllm serve`: own process, CLI drops False.
         if not return_args:
             engine_args.update(_vllm_colocated_cache_args(good_keys, engine_args.get("enable_prefix_caching")))
         ssm_dtype_args, ssm_dtype_message = _vllm_mamba_ssm_cache_dtype_args(config, good_keys, training)

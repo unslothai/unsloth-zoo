@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""load_vllm turns off vLLM >= 0.34's extensible KV cache and keeps dense prefix-cache retention
-(vLLM >= 0.29) for the engines it builds in-process. AST-level: load_vllm needs a GPU."""
+"""_vllm_colocated_cache_args and its use in load_vllm, AST-level (load_vllm needs a GPU)."""
 
 import ast
 import inspect
@@ -29,7 +28,6 @@ TREE = ast.parse(VLLM_UTILS.read_text(encoding = "utf-8-sig"))
 HELPER = "_vllm_colocated_cache_args"
 ENV = "VLLM_PREFIX_CACHE_RETENTION_INTERVAL"
 
-# EngineArgs fields per vLLM line: 0.34 has both, 0.29 to 0.33 only the retention interval.
 KEYS_0_34 = {"model", "enable_prefix_caching", "prefix_cache_retention_interval", "enable_extensible_kv_cache"}
 KEYS_0_29 = {"model", "enable_prefix_caching", "prefix_cache_retention_interval"}
 KEYS_0_11 = {"model", "enable_prefix_caching"}
