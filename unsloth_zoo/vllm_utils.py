@@ -3013,6 +3013,38 @@ def vllm_supports_flashinfer(config) -> bool:
 pass
 
 
+# FlashInferBackend.get_supported_head_sizes() in vLLM 0.10.2 - 0.12.0. Those releases honour
+# VLLM_ATTENTION_BACKEND and refuse a forced backend that cannot take the head size ("Selected backend
+# ... is not valid", "head_size not supported"), while an unset one lets vLLM pick a backend that fits.
+_VLLM_FLASHINFER_HEAD_SIZES = frozenset((64, 128, 256))
+
+
+def _vllm_flashinfer_head_size_ok(config) -> bool:
+    """False when an attention head size of `config` is outside FlashInfer's (64 / 128 / 256), e.g.
+    Phi-3 / Phi-3.5-mini (96) or MLA models; unknown sizes count as unsupported, so FLASHINFER is not forced."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        text_config = config.get_text_config() if hasattr(config, "get_text_config") else config
+    except Exception:
+        text_config = config
+    if any(getattr(text_config, k, None) for k in ("kv_lora_rank", "q_lora_rank")):
+        return False  # MLA: vLLM sizes the cache from kv_lora_rank + qk_rope_head_dim
+    sizes = set()
+    head_dim = getattr(text_config, "head_dim", None)
+    if not head_dim:
+        hidden = getattr(text_config, "hidden_size", None)
+        heads = getattr(text_config, "num_attention_heads", None)
+        if not hidden or not heads:
+            return False
+        head_dim = hidden // heads
+    sizes.add(head_dim)
+    global_head_dim = getattr(text_config, "global_head_dim", None)  # Gemma-4 full-attention layers
+    if global_head_dim:
+        sizes.add(global_head_dim)
+    return all(isinstance(x, int) and x in _VLLM_FLASHINFER_HEAD_SIZES for x in sizes)
+pass
+
+
 def _get_torchao_fp8_config(fp8_mode: str):
     """Float8DynamicActivationFloat8WeightConfig for load_in_fp8=True."""
     from torchao.quantization import (
@@ -4815,6 +4847,9 @@ def load_vllm(
                     if "VLLM_ATTENTION_BACKEND" in os.environ:
                         del os.environ["VLLM_ATTENTION_BACKEND"]
                 elif os.environ.get("VLLM_ATTENTION_BACKEND", "") != "":
+                    pass
+                elif not _vllm_flashinfer_head_size_ok(config):
+                    # Left unset: vLLM picks a backend for this head size itself.
                     pass
                 elif not use_bitsandbytes and major_version >= 8:
                     # Allowed: FLASHINFER, TORCH_SDPA, FLASH_ATTN, XFORMERS, ROCM_FLASH
