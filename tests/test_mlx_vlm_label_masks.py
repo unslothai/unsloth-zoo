@@ -1258,8 +1258,6 @@ def test_a_wrapper_whose_signature_hides_what_it_demands_is_still_called():
 
 
 class _ToyVLM(nn.Module):
-    """A language model beside a tower and a projector; generation embeds through get_input_embeddings, which can read the tower."""
-
     def __init__(self, text_reads_tower=False, tie_projector=False):
         super().__init__()
         self.language_model = nn.Embedding(16, 7)

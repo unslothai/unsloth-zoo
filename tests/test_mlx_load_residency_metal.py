@@ -526,7 +526,7 @@ class _TextOnlyVLM(nn.Module):
     def __init__(self):
         super().__init__()
         self.language_model = nn.Embedding(16, 8)
-        self.vision_tower = nn.Linear(4096, 4096, bias = False)  # 64 MiB of float32
+        self.vision_tower = nn.Linear(4096, 4096, bias = False)
 
     def get_input_embeddings(self, input_ids = None, pixel_values = None):
         return self.language_model(input_ids)
@@ -536,7 +536,6 @@ class _TextOnlyVLM(nn.Module):
 
 
 def test_a_detached_vision_tower_is_never_read(tmp_path):
-    """drop_vision_weights detaches the tower before the load reads its weights, so the peak never holds it."""
     from unsloth_zoo.mlx.loader import _detach_vision_modules, _settle_detached_vision
 
     model = _lazy_copy(_TextOnlyVLM, str(tmp_path))

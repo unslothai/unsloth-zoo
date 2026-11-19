@@ -4072,8 +4072,7 @@ def _freeze_outside_language_model(model) -> None:
 
 
 def _detach_vision_modules(model) -> dict:
-    """Detach an mlx-vlm model's top-level modules outside its language model that share none of its modules;
-    audio modules stay, since only image input is given up."""
+    """Detach top-level non-audio modules outside the language model that share none of its modules."""
     import mlx.nn as nn
     from mlx.utils import tree_flatten
 
@@ -4099,8 +4098,7 @@ def _detach_vision_modules(model) -> dict:
 
 
 def _settle_detached_vision(model, released) -> int:
-    """Keep detached modules out when text embeds and runs without them, returning their bytes (read or not);
-    otherwise reattach and read them in, returning 0."""
+    """Bytes of the detached modules if text still embeds and runs without them, else reattach and return 0."""
     import mlx.core as mx
     from mlx.utils import tree_flatten
     from .utils import _get_processor_tokenizer
@@ -4130,9 +4128,8 @@ def _settle_detached_vision(model, released) -> int:
 
 
 def release_vision_weights(model) -> int:
-    """Free an mlx-vlm model's modules outside its language model for inference that reads no images, and return
-    the bytes freed; 0, with the model untouched, when its text path still needs them. The model can then neither
-    read images nor be saved whole. ``from_pretrained(..., drop_vision_weights=True)`` skips reading them at all."""
+    """Free a VLM's vision modules for text-only inference and return the bytes freed (0, untouched, if text
+    needs them). The model then reads no images and refuses saving and training."""
     import mlx.core as mx
 
     freed = _settle_detached_vision(model, _detach_vision_modules(model))
