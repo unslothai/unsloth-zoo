@@ -6758,22 +6758,18 @@ pass
 
 
 def _fsdp2_merged_rollout_requested():
-    """UNSLOTH_FSDP2_MERGED_ROLLOUT=1 (opt-in): under native FSDP2, fold the gathered adapters into the
-    replicated frozen base vLLM shares, instead of serving them through vLLM LoRA."""
+    """Opt-in: under native FSDP2, fold gathered adapters into the shared base instead of vLLM LoRA."""
     # All Unsloth Zoo code licensed under LGPLv3
     return os.environ.get("UNSLOTH_FSDP2_MERGED_ROLLOUT", "0").strip().lower() in ("1", "true", "yes", "on")
 pass
 
 
-# lora module -> (full A, full B, local shard versions of A / B at the gather); filled by
-# _lora_state_dict under UNSLOTH_FSDP2_MERGED_ROLLOUT, read by the merged-rollout fold.
+# lora module -> (full A, full B, shard versions at the gather)
 _FSDP2_GATHERED_AB = weakref.WeakKeyDictionary()
 
 
 def _local_version(param):
-    """In-place write counters of a (DTensor) parameter. Both are needed (torch 2.14): a non-foreach step
-    bumps the DTensor's own counter, a CUDA foreach / fused AdamW step only its _local_tensor's.
-    A staleness hint only: load_lora re-gathers on every call regardless."""
+    """Both counters needed: non-foreach steps bump the DTensor's, foreach / fused AdamW only _local_tensor's."""
     # All Unsloth Zoo code licensed under LGPLv3
     out = [id(param)]
     for t in (param, getattr(param, "_local_tensor", None)):
@@ -6784,9 +6780,7 @@ pass
 
 
 def _merged_rollout_adapter_weights(module, adapter):
-    """lora_A / lora_B weights to fold. Under native FSDP2 they are DTensor shards: use the full copies
-    gathered by load_lora on every rank, never gather here (a fold on one rank must not wait for peers),
-    and refuse a copy older than the shards (an optimizer step since the gather)."""
+    """Under FSDP2 use load_lora's gathered copies (never gather here: one rank's fold must not wait for peers)."""
     # All Unsloth Zoo code licensed under LGPLv3
     A = module.lora_A[adapter].weight
     B = module.lora_B[adapter].weight
@@ -6808,8 +6802,7 @@ pass
 def _lora_state_dict(model, reuse_gathered = False):
     """Full lora_A / lora_B tensors. Under FSDP2: gathered (collective on every rank), and taken outside
     inference mode, where FSDP2 state_dict fails with "Cannot set version_counter for inference tensor".
-    reuse_gathered: under UNSLOTH_FSDP2_MERGED_ROLLOUT, return load_lora's gather of this step without a
-    collective (a vLLM LoRA fallback inside one rank's generate must not wait for its peers)."""
+    reuse_gathered: return load_lora's cached gather, no collective (used inside one rank's generate)."""
     # All Unsloth Zoo code licensed under LGPLv3
     def lora_items(state_dict):
         return {k: v for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
@@ -6826,7 +6819,6 @@ def _lora_state_dict(model, reuse_gathered = False):
         versions = tuple(_local_version(owner._parameters.get(key)) for owner, key in slots)
         cached = model.__dict__.get("_unsloth_fsdp2_lora_gather")
         if reuse_gathered:
-            # Called inside one rank's generate: a gather here would wait for peers that are not gathering.
             if cached is None or cached[0] != versions:
                 raise RuntimeError(
                     "Unsloth: no up-to-date FSDP2 gather of the adapters (none yet, or an optimizer step since); "
@@ -6861,8 +6853,7 @@ def prepare_merged_rollout(model):
     # All Unsloth Zoo code licensed under LGPLv3
     if not _merged_rollout_enabled(): return None
     if _lora_is_sharded(model) and not _fsdp2_merged_rollout_requested():
-        # Fold needs whole deltas; vLLM LoRA serves the gathered adapters instead
-        # (UNSLOTH_FSDP2_MERGED_ROLLOUT=1 folds the copies load_lora gathers on every rank).
+        # Fold needs whole deltas; vLLM LoRA serves the gathered adapters instead.
         if getattr(getattr(model, "vllm_engine", None), "_unsloth_merged_rollout_wrapped", False):
             _merged_rollout_log_once(
                 "Unsloth: merged-weight vLLM rollouts are off under native FSDP2 (sharded adapters); "
@@ -7568,11 +7559,8 @@ pass
 
 
 def _fsdp2_merged_rollout_gather(model, scope = None):
-    """UNSLOTH_FSDP2_MERGED_ROLLOUT=1 under native FSDP2: gather the adapters here, where every rank calls load_lora
-    (a collective), so the fold and any vLLM LoRA fallback inside one rank's generate read the copies instead of
-    gathering. Inside a vllm_rollout_scope only the first call gathers: the adapter cannot change in a scope, and
-    ranks may run different numbers of turns. Skipped where nothing can fold (quantized base, unwrapped engine),
-    so QLoRA keeps the single gather of vLLM LoRA. True when load_lora's gather is current."""
+    """Gather here, where every rank calls load_lora, so generate never gathers. Once per scope (ranks may run
+    different turn counts); skipped where nothing folds. True when the gather is current."""
     # All Unsloth Zoo code licensed under LGPLv3
     if not (_fsdp2_merged_rollout_requested() and _merged_rollout_enabled()): return False
     if not getattr(getattr(model, "vllm_engine", None), "_unsloth_merged_rollout_wrapped", False): return False
