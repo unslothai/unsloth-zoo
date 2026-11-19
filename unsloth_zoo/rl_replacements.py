@@ -2053,6 +2053,15 @@ def grpo_truncated_support_kwargs(trainer):
             trainer._unsloth_truncated_support_blocked_warned = True
         return {}
     kwargs = {"support_top_k": top_k, "support_top_p": top_p, "support_min_p": min_p}
+    if automatic and not getattr(trainer, "_unsloth_truncated_support_auto_noted", False):
+        # Said once: the automatic choice changes which policy the IS ratio and the loss score.
+        logger.warning(
+            f"Unsloth: rollouts sample with top_k={top_k}, top_p={top_p}, min_p={min_p} and feed the "
+            "IS correction, so the trainer scores the same kept set as vLLM (the kept set is rebuilt "
+            "from the trainer's logits, so a token at the cutoff can differ from the sampler's). "
+            "UNSLOTH_GRPO_TRUNCATED_SUPPORT=0 scores the full vocabulary instead, =1 always scores the kept set."
+        )
+        trainer._unsloth_truncated_support_auto_noted = True
     if grpo_vllm_sampler_uses_triton(trainer, top_k, top_p):
         kwargs["support_triton_sampler"] = True
     if excluded is not None:
@@ -2066,8 +2075,9 @@ _GRPO_TRUNCATED_SUPPORT_STATS = {"on": 0}
 
 def grpo_truncated_support_automatic(trainer, support = None):
     """Unset setting scores the kept set: truncated rollouts at temperature > 0 feeding the IS correction from an
-    engine known to return processed logprobs (TRL >= 1.17 `return_sampling_mask`). Raw / unknown logprobs would
-    bias the ratio the other way. NVIDIA CUDA only (measured there). The off-policy mask alone does not count."""
+    engine known to return processed logprobs. Gated on the engine's logprobs_mode, not on the TRL version (TRL
+    >= 1.17 scores the same kept set by default). Raw / unknown logprobs would bias the ratio the other way.
+    NVIDIA CUDA only (measured there). The off-policy mask alone does not count."""
     if not getattr(trainer, "use_vllm", False):
         return False
     if support is None:

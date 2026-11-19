@@ -202,7 +202,8 @@ def test_default_scores_the_kept_set_when_truncated_logps_feed_the_is_correction
         got = rr.grpo_truncated_support_kwargs(t)
         assert _support_only(got) == dict(zip(("support_top_k", "support_top_p", "support_min_p"), triple))
         assert rr.grpo_truncated_support_automatic(t)
-    assert caplog.text == ""
+        rr.grpo_truncated_support_kwargs(t)          # said once per trainer, not per loss call
+    assert caplog.text.count("scores the full vocabulary instead") == 3
 
     for t in (_trainer(top_k = 20, is_correction = False, off_policy = 0.5),
               _trainer(min_p = 0.1, logprobs_mode = "raw_logprobs"),
@@ -523,3 +524,17 @@ def test_default_is_correction_off_stays_full_vocabulary_and_silent(monkeypatch,
         assert rr.grpo_truncated_support_kwargs(t) == {}
         assert not rr.grpo_truncated_support_automatic(t)
     assert caplog.text == ""
+
+
+def test_automatic_kept_set_is_announced_once(monkeypatch, caplog):
+    """The automatic switch changes what the IS ratio and the loss score: it says so once, naming the opt-out."""
+    monkeypatch.delenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", raising = False)
+    caplog.set_level(logging.WARNING)
+    t = _trainer(min_p = 0.1)
+    assert rr.grpo_truncated_support_kwargs(t)
+    assert rr.grpo_truncated_support_kwargs(t)
+    assert caplog.text.count("UNSLOTH_GRPO_TRUNCATED_SUPPORT=0") == 1
+    caplog.clear()
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
+    assert rr.grpo_truncated_support_kwargs(_trainer(min_p = 0.1))
+    assert caplog.text == ""                         # an explicit choice needs no notice
