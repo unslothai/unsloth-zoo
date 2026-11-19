@@ -3013,15 +3013,12 @@ def vllm_supports_flashinfer(config) -> bool:
 pass
 
 
-# FlashInferBackend.get_supported_head_sizes() in vLLM 0.10.2 - 0.12.0. Those releases honour
-# VLLM_ATTENTION_BACKEND and refuse a forced backend that cannot take the head size ("Selected backend
-# ... is not valid", "head_size not supported"), while an unset one lets vLLM pick a backend that fits.
+# FlashInferBackend.get_supported_head_sizes() in vLLM 0.10.2 - 0.12.0; forcing it for other sizes fails init.
 _VLLM_FLASHINFER_HEAD_SIZES = frozenset((64, 128, 256))
 
 
 def _vllm_flashinfer_head_size_ok(config) -> bool:
-    """False when an attention head size of `config` is outside FlashInfer's (64 / 128 / 256), e.g.
-    Phi-3 / Phi-3.5-mini (96) or MLA models; unknown sizes count as unsupported, so FLASHINFER is not forced."""
+    """False if any head size is outside FlashInfer's (e.g. Phi-3 96, MLA); unknown counts as unsupported."""
     # All Unsloth Zoo code licensed under LGPLv3
     try:
         text_config = config.get_text_config() if hasattr(config, "get_text_config") else config
@@ -4849,8 +4846,7 @@ def load_vllm(
                 elif os.environ.get("VLLM_ATTENTION_BACKEND", "") != "":
                     pass
                 elif not _vllm_flashinfer_head_size_ok(config):
-                    # Left unset: vLLM picks a backend for this head size itself.
-                    pass
+                    pass  # Left unset: vLLM picks a fitting backend
                 elif not use_bitsandbytes and major_version >= 8:
                     # Allowed: FLASHINFER, TORCH_SDPA, FLASH_ATTN, XFORMERS, ROCM_FLASH
                     os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"

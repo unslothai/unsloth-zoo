@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""load_vllm must not force VLLM_ATTENTION_BACKEND=FLASHINFER for a head size vLLM's FlashInfer backend
-rejects (64 / 128 / 256 only in vLLM 0.10.2 - 0.12.0, which honour the variable): engine init then raises."""
+"""load_vllm must not force FLASHINFER for head sizes it rejects (only 64 / 128 / 256)."""
 
 import ast
 import importlib
