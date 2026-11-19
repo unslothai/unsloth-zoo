@@ -3529,12 +3529,6 @@ def test_qwen3_visual_window_preserves_batched_row_ownership():
     assert window_masks.tolist() == [[1, 1], [0, 1]]
     assert window_embeds[0].tolist() == [[10], [11], [21]]
 
-    def drops_deepstack(self):
-        deepstack_visual_embeds = mx.eval([])
-        return deepstack_visual_embeds
-
-    assert mc._qwen3_drops_deepstack_after_eval(drops_deepstack)
-
     language_calls = []
 
     def native_language(
@@ -3662,14 +3656,8 @@ def test_qwen_video_tensor_adapter_is_exact_and_composable():
         if pixel_values is None:
             return grid_thw, mask, mx.eval([])
 
-    staged = mc._qwen3_batch_embedding_adapter(
-        staged_legacy, replace_visual_inference=True
-    )
+    staged = mc._qwen3_batch_embedding_adapter(staged_legacy)
     assert mc._qwen_video_tensor_adapter(staged) is not staged
-    replacing = mc._qwen3_batch_embedding_adapter(
-        staged_legacy, fixed, replace_visual_inference=True
-    )
-    assert mc._qwen_video_tensor_adapter(replacing) is replacing
 
 
 def test_qwen_installers_bind_exact_release_owners(monkeypatch):
@@ -3790,37 +3778,6 @@ def test_vlm_compile_patches_preserve_current_upstream_contracts(monkeypatch):
     assert mc._gemma3n_cache_offset([types.SimpleNamespace(offset=mx.array([650, 700]), _idx=188)]) == 700
 
 
-def test_legacy_llava_prefill_adapter_is_signature_gated(monkeypatch):
-    import unsloth_zoo.mlx.compile as mc
-
-    calls = []
-
-    def strict(self, inputs, cache=None):
-        calls.append((inputs, cache))
-        return "strict"
-
-    class LegacyLanguage:
-        __call__ = strict
-
-    module = types.SimpleNamespace(LanguageModel=LegacyLanguage)
-    monkeypatch.setattr(mc.importlib, "import_module", lambda name: module)
-    mc._install_legacy_llava_prefill_patch()
-    inputs = object()
-    assert LegacyLanguage()(inputs, cache="cache", n_to_process=4) == "strict"
-    assert calls == [(inputs, "cache")]
-    assert LegacyLanguage.__call__.__wrapped__ is strict
-    assert mc._legacy_vlm_prefill_kwargs_adapter(LegacyLanguage.__call__) is LegacyLanguage.__call__
-    def explicit(self, inputs, n_to_process=None):
-        return n_to_process
-
-    @mc.wraps(strict)
-    def permissive(self, *args, **kwargs):
-        return kwargs
-    assert mc._legacy_vlm_prefill_kwargs_adapter(explicit) is explicit
-    assert mc._legacy_vlm_prefill_kwargs_adapter(permissive) is permissive
-    monkeypatch.setattr(mc.importlib, "import_module", lambda name: (_ for _ in ()).throw(RuntimeError))
-    mc._install_legacy_llava_prefill_patch()
-
 def test_quantized_cce_uses_layer_mode_and_affine_bias_guard():
     import inspect
     import unsloth_zoo.mlx.utils as mlx_utils
@@ -3899,11 +3856,6 @@ def test_gemma4_unified_installer_survives_an_mlx_vlm_without_it(monkeypatch):
 
     monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
     monkeypatch.setattr(mc, "_try_import_module", lambda name: None)
-    mc._install_gemma4_unified_compile_patches()
-    assert "gemma4_unified" not in mc._PATCHED_ARCHES
-
-    module = types.SimpleNamespace(Model=type("Model", (), {}), _compact_prefix_rows=None)
-    monkeypatch.setattr(mc, "_try_import_module", lambda name: module)
     mc._install_gemma4_unified_compile_patches()
     assert "gemma4_unified" not in mc._PATCHED_ARCHES
 

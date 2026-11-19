@@ -7775,8 +7775,8 @@ _GEMMA4_AUDIO_SUBSAMPLE_BLOCKS = 2
 
 
 def _gemma4_audio_frame_mask(extractor, waveform, sampling_rate):
-    """Mel frames one clip fills, extracted alone: mlx-vlm pads to the batch's longest clip and 0.4.4 subsamples a
-    sample-level mask, so batching would shift a clip's valid count."""
+    """Mel frames one clip fills, extracted alone: mlx-vlm pads to the batch's longest clip, so batching would shift a
+    clip's valid count."""
     features = extractor(
         [np.asarray(waveform, dtype=np.float32)],
         sampling_rate=sampling_rate,
