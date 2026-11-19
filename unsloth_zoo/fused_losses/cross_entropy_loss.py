@@ -790,8 +790,7 @@ def _chunked_ce_opaque(hidden_states, lm_head_weight, lm_head_bias, labels, mask
 
 
 class _LabelSmoothingOverride:
-    """Trainer-side label smoothing for the next fused CE call. Only `active` is read in traced code (one bool
-    guard, no graph break when off); the rest is read behind torch.compiler.disable."""
+    """Only `active` is read in traced code (no graph break when off); the rest behind torch.compiler.disable."""
     active = False
     epsilon = 0.0
     n_items = None
@@ -802,10 +801,8 @@ _LABEL_SMOOTHING = _LabelSmoothingOverride()
 
 @contextlib.contextmanager
 def unsloth_label_smoothing_override(epsilon, n_items):
-    """Within this block, unsloth_fused_ce_loss computes F.cross_entropy(label_smoothing = epsilon) summed and divided
-    by `n_items` (the divisor the trainer's LabelSmoother would use), instead of the caller's n_items. Yields the state;
-    `engaged` counts the fused CE calls that applied it, so a caller can tell a forward that never reached the fused
-    loss (and fall back). Not reentrant."""
+    """Fused CE uses label_smoothing = epsilon, divided by `n_items` instead of the caller's. `engaged` counts
+    applied calls (0 = caller should fall back). Not reentrant."""
     state = _LABEL_SMOOTHING
     if state.active:
         raise RuntimeError("Unsloth: unsloth_label_smoothing_override is not reentrant.")

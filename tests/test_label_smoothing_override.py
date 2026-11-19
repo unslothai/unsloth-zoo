@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""unsloth_label_smoothing_override: the fused CE inside it equals F.cross_entropy(label_smoothing = eps) summed over
-the shifted active labels and divided by the override's divisor (fp64 oracle, loss and gradients), counts each
-engagement, and leaves calls outside it untouched."""
+"""unsloth_label_smoothing_override vs an fp64 F.cross_entropy(label_smoothing) oracle."""
 
 import pytest
 import torch
@@ -51,7 +49,6 @@ def _oracle(h, w, labels, eps, divisor):
 def test_override_matches_torch_label_smoothing(eps, divisor):
     h, w, labels = _inputs()
     with unsloth_label_smoothing_override(eps, torch.tensor(divisor)) as state:
-        # The caller's n_items is replaced by the override's divisor.
         loss = unsloth_fused_ce_loss(None, h, w, None, labels, n_items = torch.tensor(999), torch_compile = False)
     assert state.engaged == 1 and not state.active
     ref = _oracle(h, w, labels, eps, divisor)
