@@ -4120,7 +4120,7 @@ def _settle_detached_vision(model, released, target_dtype=None, model_type="") -
             model[name] = child
         if target_dtype is not None:
             _convert_mlx_dtype(model, target_dtype, model_type=model_type)
-        mx.eval(model.parameters())
+        mx.eval(_resident_parameters(model))
         return 0
     processor = getattr(model, "_processor", None)
     for target in (model, processor, _get_processor_tokenizer(processor) if processor else None):
@@ -10719,7 +10719,7 @@ class FastMLXModel:
                     model, original_local_path or local_path, offload, target_dtype, max_seq_length,
                 )
                 if drop_vision and target_dtype is None:
-                    mx.eval(model.parameters())
+                    mx.eval(_resident_parameters(model))
 
             processor = _run_with_vlm_config_view(
                 _repair_degraded_vlm_processor,

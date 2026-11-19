@@ -1323,6 +1323,17 @@ def test_vision_kept_for_text_gets_the_load_dtype():
     assert model.multi_modal_projector.weight.dtype == mx.bfloat16
 
 
+def test_a_failed_drop_leaves_disk_backed_tables_unread(monkeypatch):
+    from unsloth_zoo.mlx import loader
+
+    model = _ToyVLM(text_reads_tower=True)
+    detached = loader._detach_vision_modules(model)
+    evaluated = []
+    monkeypatch.setattr(loader, "_resident_parameters", lambda m: evaluated.append(m) or [])
+    assert loader._settle_detached_vision(model, detached) == 0
+    assert evaluated == [model]
+
+
 def test_the_check_leaves_no_state_behind_for_the_first_training_batch():
     """qwen2_vl reuses a cached `_position_ids` without checking it still fits."""
     from unsloth_zoo.mlx import loader
