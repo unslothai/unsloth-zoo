@@ -1660,3 +1660,91 @@ def test_rollout_scope_reuses_the_rest_request_in_attention_mode(monkeypatch, _i
     assert type(rest[0]) is _isolate.LoRARequest
     assert rest[0] is rest[1] is rest[2]
     assert not any(".self_attn." in k for k in rest[0].lora_tensors)
+
+
+# A mixed per-prompt list, another engine's request or a base call after a held fold: release it before the call.
+_SECOND_MODELS = []
+
+
+def _second_engine_req():
+    model2, _, _ = _make_model()
+    _SECOND_MODELS.append(model2)   # the request holds the model weakly
+    return _req(model2)
+
+
+@pytest.mark.parametrize("shape", ["sentinel_none", "none_sentinel", "other_state", "other_engine"])
+def test_rollout_scope_lora_fallback_paths_release_the_fold(shape, _isolate):
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    with vllm_utils.vllm_rollout_scope(llm):
+        _turns(llm, model, 1)
+        assert _folded(before, llm.calls[-1][2])
+        req = _req(model)
+        if shape == "sentinel_none": request = [req, None]
+        elif shape == "none_sentinel": request = (None, req)
+        elif shape == "other_state": request = [req, _second_engine_req()]
+        else: request = _second_engine_req()
+        llm.generate(["a", "b"], lora_request = request)
+        kind, seen_request, seen = llm.calls[-1]
+        # The adapter prompts carry the full vLLM LoRA, so the weights under them must be the base.
+        seen_list = seen_request if isinstance(seen_request, (list, tuple)) else [seen_request]
+        assert any(type(x) is _isolate.LoRARequest and x.lora_tensors for x in seen_list)
+        assert not _folded(before, seen)
+        assert len(llm.resets) == 2   # before the fold, after the release
+        _turns(llm, model, 1)   # folds again
+        assert _folded(before, llm.calls[-1][2])
+    assert len(llm.resets) == 4
+    _assert_bitwise(before, vllm_model)
+
+
+def test_rollout_scope_mixed_chat_releases_and_nested_generate_stays_base(_isolate):
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    with vllm_utils.vllm_rollout_scope(llm):
+        llm.chat(["hi"], None, True, _req(model))
+        n = len(llm.calls)
+        llm.chat(["a", "b"], None, True, [_req(model), None])
+        assert len(llm.calls) == n + 2   # chat + its nested generate
+        for kind, seen_request, seen in llm.calls[n:]:
+            assert type(seen_request[0]) is _isolate.LoRARequest and seen_request[1] is None
+            assert not _folded(before, seen)
+    _assert_bitwise(before, vllm_model)
+
+
+@pytest.mark.parametrize("how", ["false", "raise"])
+@pytest.mark.parametrize("call", ["base", "mixed", "other_engine"])
+def test_rollout_scope_release_refuses_when_the_reset_fails_twice(call, how, _isolate):
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    with vllm_utils.vllm_rollout_scope(llm):
+        _turns(llm, model, 1)
+        n_calls = len(llm.calls)
+        other = _second_engine_req()
+        _failing_reset(llm, how, when = {1, 2})   # the release's reset and the retry
+        with pytest.raises(RuntimeError, match = "prefix cache"):
+            if call == "base": llm.generate(["base"])
+            elif call == "mixed": llm.generate(["a", "b"], lora_request = [_req(model), None])
+            else: llm.generate(["a"], lora_request = other)
+        # Refused: nothing ran on a cache holding the fold's KV under base hashes.
+        assert len(llm.calls) == n_calls
+        _assert_bitwise(before, vllm_model)
+        assert llm._unsloth_merged_rollout_dirty
+        # The next call resets first, then runs on the base weights.
+        llm.generate(["base"])
+        assert not _folded(before, llm.calls[-1][2])
+        assert not llm._unsloth_merged_rollout_dirty
+    _assert_bitwise(before, vllm_model)
+
+
+@pytest.mark.parametrize("how", ["false", "raise"])
+def test_rollout_scope_release_retries_a_failed_reset_before_the_base_call(how):
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    with vllm_utils.vllm_rollout_scope(llm):
+        _turns(llm, model, 1)
+        n = _failing_reset(llm, how, when = {1})   # only the release's reset fails
+        llm.generate(["base"])
+        assert n["n"] == 2   # retried before the call
+        assert not _folded(before, llm.calls[-1][2])
+        assert not llm._unsloth_merged_rollout_dirty
+    _assert_bitwise(before, vllm_model)
