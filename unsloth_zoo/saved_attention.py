@@ -77,10 +77,9 @@ def save_attention_offload():
     return _save_attention_setting() == "offload"
 
 
-# Automatic mode: compute capabilities where Colab measured it faster beyond A/A noise, and the
-# sequence length from which it pays for the graph break around the kept call.
-_AUTO_CAPABILITIES = frozenset({(7, 5), (8, 0), (8, 9)})
-_AUTO_MIN_SEQ = 8192
+# Automatic mode: compute capability -> the shortest query length where Colab measured it faster
+# than the A/A noise (Qwen3-4B LoRA): T4 and A100 from 8K, L4 from 16K (noisy and +1.6% at 8K).
+_AUTO_MIN_SEQ = {(7, 5): 8192, (8, 0): 8192, (8, 9): 16384}
 _AUTO_ACTIVE = [False]
 
 
@@ -96,12 +95,13 @@ def save_attention_auto_min_seq():
         capability = tuple(torch.cuda.get_device_capability())
     except Exception:
         return None
-    if capability not in _AUTO_CAPABILITIES:
+    min_seq = _AUTO_MIN_SEQ.get(capability)
+    if min_seq is None:
         return None
     try:
-        min_seq = int(os.environ.get("UNSLOTH_GC_SAVE_ATTENTION_MIN_SEQ", _AUTO_MIN_SEQ))
+        min_seq = int(os.environ.get("UNSLOTH_GC_SAVE_ATTENTION_MIN_SEQ", min_seq))
     except ValueError:
-        min_seq = _AUTO_MIN_SEQ
+        pass
     _AUTO_ACTIVE[0] = True
     return max(min_seq, 1)
 

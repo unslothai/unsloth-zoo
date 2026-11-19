@@ -592,10 +592,10 @@ def _fake_gpu(monkeypatch, capability, hip = None, cuda = True):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: capability)
 
 
-@pytest.mark.parametrize("capability", [(7, 5), (8, 0), (8, 9)])
-def test_auto_min_seq_on_measured_gpus(monkeypatch, capability):
+@pytest.mark.parametrize("capability, min_seq", [((7, 5), 8192), ((8, 0), 8192), ((8, 9), 16384)])
+def test_auto_min_seq_on_measured_gpus(monkeypatch, capability, min_seq):
     _fake_gpu(monkeypatch, capability)
-    assert SA.save_attention_auto_min_seq() == SA._AUTO_MIN_SEQ
+    assert SA.save_attention_auto_min_seq() == min_seq
     assert SA._AUTO_ACTIVE[0] is True
     monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION_MIN_SEQ", "256")
     assert SA.save_attention_auto_min_seq() == 256
@@ -607,6 +607,8 @@ def test_auto_min_seq_on_measured_gpus(monkeypatch, capability):
         ((8, 0), None, True, "0"),
         ((8, 0), None, True, "1"),
         ((8, 0), None, True, "offload"),
+        ((8, 6), None, True, None),
+        ((9, 0), None, True, None),
         ((8, 0), "6.4", True, None),
         ((8, 0), None, False, None),
         ((10, 0), None, True, None),
