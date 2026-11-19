@@ -6850,6 +6850,8 @@ def _lora_state_dict(model, reuse_gathered = False):
                         gathered[kA], gathered[kB],
                         (_local_version(lora_A[adapter].weight), _local_version(lora_B[adapter].weight)),
                     )
+        # After the gather: its pre-save hooks swap unsharded parameters (reshard_after_forward=False) back to DTensors.
+        versions = tuple(_local_version(owner._parameters.get(key)) for owner, key in slots)
         model.__dict__["_unsloth_fsdp2_lora_gather"] = (versions, gathered)
     return gathered
 pass

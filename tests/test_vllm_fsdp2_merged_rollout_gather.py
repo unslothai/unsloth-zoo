@@ -52,6 +52,9 @@ class LoraLinear(nn.Module):
         self.lora_B = nn.ModuleDict({"default": nn.Linear(4, 16, bias=False)})
         self.base_layer.weight.requires_grad_(False)
 
+    def forward(self, x):
+        return self.base_layer(x) + self.lora_B["default"](self.lora_A["default"](x))
+
 
 class M(nn.Module):
     def __init__(self):
@@ -170,6 +173,36 @@ del m.is_loaded_in_4bit
 os.environ.pop("UNSLOTH_FSDP2_MERGED_ROLLOUT")
 check(not vu._fsdp2_merged_rollout_gather(m) and calls["n"] == 6, "without the opt-in load_lora adds no gather")
 os.environ.pop("UNSLOTH_VLLM_MERGED_ROLLOUT")
+
+# 7. a root group with reshard_after_forward=False (fully_shard's default for the root) keeps its adapters unsharded after a
+# no-grad forward; the gather's pre-save hooks swap them back to DTensors, and the cache must match the swapped parameters.
+os.environ["UNSLOTH_FSDP2_MERGED_ROLLOUT"] = "1"
+
+
+class M2(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layer, self.layer2 = LoraLinear(), LoraLinear()
+
+    def forward(self, x):
+        return self.layer2(self.layer(x)[:, :8])
+
+
+torch.manual_seed(0)
+m = M2()
+fully_shard(m.layer, ignored_params={m.layer.base_layer.weight})
+fully_shard(m, ignored_params={m.layer2.base_layer.weight}, reshard_after_forward=False)
+vu._lora_state_dict(m)
+with torch.no_grad():
+    m(torch.randn(2, 8))
+check(not isinstance(m.layer2.lora_A["default"].weight, DTensor), "the root group's adapters stay unsharded after a no-grad forward")
+vu._lora_state_dict(m)
+try:
+    vu._lora_state_dict(m, reuse_gathered=True)
+    check(True, "reuse_gathered accepts the fresh gather")
+except RuntimeError as e:
+    check(False, f"reuse_gathered refused the fresh gather: {e}")
+os.environ.pop("UNSLOTH_FSDP2_MERGED_ROLLOUT")
 DTensor.full_tensor = orig
 dist.barrier()
 dist.destroy_process_group()
