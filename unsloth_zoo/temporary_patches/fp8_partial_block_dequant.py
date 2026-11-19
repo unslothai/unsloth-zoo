@@ -13,11 +13,8 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Fix FP8 dequant of weights with a partial edge block (huggingface/transformers#50603).
-
-Stock `_dequantize_one` derives the block from the scale grid, so 200x200 in 128x128 blocks reads as 100x100 blocks.
-Self-contained: the CPU backend loads this file alone.
-"""
+"""FP8 dequant of partial edge blocks (huggingface/transformers#50603): stock derives block size
+from scale grid; keep this file self-contained, the CPU backend loads it alone"""
 import math
 
 import torch

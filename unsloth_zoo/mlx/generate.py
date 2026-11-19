@@ -163,19 +163,9 @@ class SamplingParams:
 
 @dataclass(frozen=True)
 class GenerationDefaults:
-    """Batch-wide defaults used when a request does not override a value.
-
-    ``stop_token_ids`` replaces the tokenizer's EOS set as the stop ids.
-    ``token_ids_only`` skips detokenizing and the host read of every sampled
-    log-prob, leaving results' ``text`` and ``logprobs`` empty; on text batches ``logprob_arrays`` puts
-    those log-probs, a stopping id's included, in ``GenerationResult.logprob_array`` as
-    one device array instead.
-    ``logits_warp`` maps every row's logits at once (on mlx-vlm, already normalized), for rows
-    without logits processors; ``batched_draws`` draws all rows in one call, each row
-    seeded at one shared temperature with no other filter, from its own key stream.
-    ``share_prompt_prefill`` prefills a prompt that several rows of one
-    ``generate_batch`` call share once, and starts each of those rows from that cache; on mlx-vlm it embeds the prompt once.
-    """
+    """stop_token_ids replaces the EOS set; token_ids_only skips detokenizing and log-prob reads;
+    logits_warp applies to rows without logits processors; batched_draws needs one shared
+    temperature and no other filter; share_prompt_prefill prefills shared prompts once."""
 
     max_tokens: int = 256
     sampling: SamplingParams = field(default_factory=SamplingParams)

@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Generated compiled modules are byte-identical under any PYTHONHASHSEED (CPU only).
-
-The modeling import list used to follow set order, so gpt_oss, qwen3_next, gemma4 and
-granitemoehybrid files were rewritten by every new process.
-"""
+"""Compiled modules are byte-identical under any PYTHONHASHSEED; the import list was set-ordered."""
 
 import os
 import subprocess

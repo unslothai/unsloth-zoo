@@ -1788,9 +1788,8 @@ def _logged_decode_kernels(monkeypatch, log, shift = 0):
 def test_qwen4_decode_read_matches_mlx_vlm_bitwise(dtype, bits, group_size, lowrank, combine, monkeypatch):
     mx.random.seed(0)
     module, forward = _qwen4_read(combine, lowrank, bits, group_size, dtype), qwen4._QWEN4_BATCH_INVARIANT_FORWARD
-    # Enough one-row reads that a norm rounding off by one float32 ulp shows in some 16-bit result, then verify
-    # blocks of 2..5 rows; a 32-row read is a prefill width. A spread row's inject projection rounds differently
-    # in qmv's order than in qmv_fast's, so a multi-row native read of it differs from its one-row read.
+    # Many one-row reads, then 2-5 row blocks: a spread row rounds differently across qmv and
+    # qmv_fast.
     widths = [1] * 128 + [n for n in (2, 3, 4, 5) for _ in range(4)] + [32]
     inputs = [_qwen4_rows(rows, dtype) for rows in widths]
     spread = _qwen4_spread_row(*{mx.bfloat16: (1235, dtype, 3), mx.float16: (576, dtype, 1.5)}[dtype])

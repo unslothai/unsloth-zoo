@@ -396,9 +396,8 @@ class DiskEmbedding(nn.Module):
         return values.reshape(*x.shape, self.dims)
 
     def _staged(self, x):
-        """``(lookup, fill)``: the lookup of ``x``'s rows as lazy reads of staging memory, and the call that reads ``x``
-        and fills that memory, which must run before anything reading the lookup is evaluated. None for a lookup
-        too large to stage, or one some row of which is held in memory."""
+        """(lookup, fill): lazy staged reads; fill runs first. None when x is too big or a table is
+        resident."""
         tables, offsets = self._tables, self._offsets
         fields = tables[0].fields
         if (x.size > _STAGED_ROWS or any(table.resident for table in tables)

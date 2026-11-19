@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The previous tiled MLP autograd Function, kept importable for released Unsloth versions that import it.
-
-Nothing in Unsloth Zoo uses it; `unsloth_zoo.tiling_registry` replaces it."""
+"""Legacy tiled MLP Function kept for released versions; `unsloth_zoo.tiling_registry` replaces it."""
 
 import os
 import sys

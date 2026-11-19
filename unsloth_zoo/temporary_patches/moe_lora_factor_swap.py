@@ -52,9 +52,8 @@ __all__ = [
     "patch_expert_lora_factor_swap",
 ]
 
-# Set on an experts class by the zoo patch that changes how PEFT factors its stacks: True when the stacks are
-# stored transposed (any PEFT), "is_transposed" when only the class's is_transposed flag differs (a PEFT that
-# ignores is_transposed, such as 0.18, factors it as vanilla does).
+# True when stacks are stored transposed (any PEFT); is_transposed when only the class is_transposed
+# flag differs (a PEFT ignoring it, such as 0.18, factors it as vanilla does)
 SWAPPED_FACTORS_FLAG = "_unsloth_expert_lora_factors_swapped"
 _PEFT_READS_IS_TRANSPOSED = []
 

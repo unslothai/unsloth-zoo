@@ -4925,8 +4925,7 @@ def test_padding_free_messages_do_not_hide_each_other(capsys):
 def test_padding_free_refusal_raises_on_every_run_and_rank_under_the_error_filter():
     trainer, model, loss = object.__new__(MLXTrainer), _pf_model("phi3"), lambda *args: args
     with warnings.catch_warnings():
-        # UserWarning only: a SWIG DeprecationWarning raised inside a lazy import breaks that module, and the
-        # interpreter then crashes at exit.
+        # Only UserWarning is errored; a SWIG DeprecationWarning in a lazy import crashes at exit.
         warnings.simplefilter("error", UserWarning)
         for _ in range(2):  # a refusal raised as an error was not delivered, so the next run raises again
             with pytest.raises(UserWarning, match="has no effect"):

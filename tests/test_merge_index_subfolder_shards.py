@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A base with no root shard, whose root index maps into subfolders (nvidia/Cosmos3-Edge keeps its
-weights under `transformer/` and `vision_encoder/`), must be found and merged.
-
-Only root `.safetensors` counted, so the repo read as absent and merged_16bit / GGUF export raised
-"could not be read locally or on Hugging Face".
-"""
+"""Index shards in subfolders (Cosmos3-Edge, no root shard) must be found, not fail as unreadable."""
 
 from __future__ import annotations
 

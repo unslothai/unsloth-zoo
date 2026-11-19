@@ -1815,11 +1815,9 @@ class MLXKTOConfig(MLXTrainingConfig):
 
 @dataclass(init=False)
 class MLXGRPOConfig(MLXTrainingConfig):
-    """GRPO config: TRL 0.24's GRPOConfig fields with CUDA Unsloth's GRPO defaults, resolved at construction; top_k and
-    min_p None switch those filters off rather than using the model's generation config; max_prompt_length only
-    warns, prompts are never truncated. rollout_logprobs_as_old (off unless UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1)
-    replaces the old-policy forward with the rollout's log-probs, at decode precision (first ratio near, not exactly, 1),
-    for rollouts without a VLM processor at the scoring temperature, with no top-k, top-p, min-p or repetition penalty."""
+    """TRL 0.24 GRPOConfig fields with CUDA Unsloth GRPO defaults; top_k and min_p None switch those
+    filters off; max_prompt_length only warns, prompts are never truncated;
+    UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1 turns on rollout old-logps."""
 
     num_generations: int = field(default=8, kw_only=True)
     max_prompt_length: int | None = field(default=None, kw_only=True)

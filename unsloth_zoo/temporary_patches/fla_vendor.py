@@ -1472,10 +1472,9 @@ def _on_cpu(args, kwargs):
 
 
 def _make_cpu_gated_delta_rule(original, recurrent):
-    """CPU tensors -> transformers' torch reference with fla's contract; anything else -> ``original``.
-    Plain Python so torch.compile traces it: the CPU branch compiles like the stock torch path, the GPU branch
-    meets fla's own compiler-disabled entry exactly as before. ``updated=()`` keeps fla's disable marker in
-    ``__dict__`` from being copied onto this wrapper."""
+    """CPU tensors take transformers torch reference, others the original; plain Python so
+    torch.compile traces it; updated=() keeps fla disable marker from being copied onto this
+    wrapper"""
     names = [
         n for n, p in inspect.signature(original).parameters.items()
         if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)

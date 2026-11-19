@@ -959,10 +959,9 @@ def _layer_pre_hook(layer_index):
 
 
 class _RecordingCall(functools.partial):
-    # The checkpointed function, recording the layer inputs each time it runs. transformers >= 5.23
-    # checkpoints `forward` instead of `__call__`, so the recompute in backward skips the layer's
-    # forward pre hook and would otherwise read no inputs (identical forwards become ambiguous).
-    # A partial over the original, so checkpoint functions that unwrap it to find the layer still do.
+    # transformers >= 5.23 checkpoints forward, not __call__, so recompute must record inputs
+    # itself; a partial over the original so checkpoint functions that unwrap it still find the
+    # layer.
     def __call__(self, *args, **kwargs):
         # Python may flatten a wrapped partial into this one: its bound keywords are ours then.
         inner = getattr(self.func, "keywords", None)

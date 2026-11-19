@@ -6720,9 +6720,8 @@ def _lora_is_sharded(model):
         from torch.distributed.tensor import DTensor
     except Exception:
         return False
-    # Any adapter decides: one left out of FSDP2 (ignored_params) stays a plain tensor beside sharded ones.
-    # The adapter slots are found once (FSDP2 puts the DTensor in the same slot), so an unsharded DDP
-    # run does not walk every parameter on each load_lora.
+    # Any adapter decides: one left out of FSDP2 (ignored_params) stays plain; slots are cached
+    # once.
     if not isinstance(model, torch.nn.Module):
         return any(isinstance(p, DTensor) for n, p in model.named_parameters() if ".lora_A." in n or ".lora_B." in n)
     slots = model.__dict__.get("_unsloth_lora_slots")
@@ -6834,9 +6833,7 @@ def _lora_state_dict(model, reuse_gathered = False):
                     "call model.load_lora(..., load_tensors = True) on every rank right before generate."
                 )
             return dict(cached[1])
-    # Only the adapter subtrees: a whole-model state_dict() packs every bnb Linear4bit QuantState, one
-    # device-to-host sync per 4-bit layer on every load_lora. FSDP2's to-sharded pre-save hook sits on the
-    # module owning each sharded parameter (the lora_A / lora_B Linear), so it still runs here.
+    # Not model.state_dict(): it packs every bnb QuantState (a host sync per 4-bit layer). FSDP2's pre-save hook is on lora_A / lora_B, so it still runs.
     with torch.inference_mode(False), torch.no_grad():
         gathered = {
             k: (v.full_tensor() if isinstance(v, DTensor) else v).detach()

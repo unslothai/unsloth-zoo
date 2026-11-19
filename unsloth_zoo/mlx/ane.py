@@ -14,18 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The Apple Neural Engine through macOS's private AppleNeuralEngine runtime, from ctypes, and the dense SwiGLU
-MLP prefill split it serves.
-
-Programs are MIL text compiled in memory, with fp16 tensors exchanged through IOSurfaces. The runtime is
-undocumented and can change with any macOS release: every entry point here raises `AneError` rather than
-guessing, and `available()` is False wherever the classes this module drives are missing.
-
-The prefill split: the Neural Engine computes intermediate channels [0, k) of each eligible MLP from an int8
-copy of their weights while the GPU computes the rest from the checkpoint's own; the partial outputs are
-summed. Only full tiles of rows take it. The Neural Engine half is approximate, so the split is opt-in through
-`UNSLOTH_MLX_ANE_PREFILL=1`.
-"""
+"""Private AppleNeuralEngine runtime via ctypes, undocumented and may change per macOS; fp16 tensors
+in IOSurfaces; raises AneError rather than guessing; only full row tiles take the split; opt-in
+UNSLOTH_MLX_ANE_PREFILL=1."""
 
 import collections
 import concurrent.futures
@@ -220,12 +211,7 @@ def _free_surface(handle, ref):
 
 
 class Program:
-    """A compiled and loaded MIL program.
-
-    The runtime stages a program under `$TMPDIR/<its identifier>` and reads the compiled form from there for as
-    long as it stays loaded, so the directory lives until `close()`; only the MIL and weight sources go after
-    loading.
-    """
+    """Runtime stages the program under $TMPDIR while loaded, so its directory lives until close()."""
 
     def __init__(self, mil, weights):
         rt = _runtime()
@@ -605,8 +591,7 @@ def _bank_program(layers, tile):
 
 
 def _slice(blob, index, mlp, k, tile):
-    """Procedure `index` for channels [0, k): down[:, :k] @ (silu(gate[:k] @ x) * up[:k] @ x), x laid out
-    [1, hidden, 1, tile]."""
+    """Procedure index: down[:, :k] @ (silu(gate[:k] @ x) * up[:k] @ x), x [1, hidden, 1, tile]"""
     gate, up, down = map(_dequantized, _projections(mlp))
     hidden = down.shape[0]
     fn = Function(f"procedure{index:03d}", x = f"tensor<fp16, [1, {hidden}, 1, {tile}]>")
@@ -648,8 +633,7 @@ def _libc():
 
 
 def _wired_bytes():
-    """System-wide wired memory, where the Neural Engine's buffers show (no process footprint counts them); None when
-    the kernel does not answer."""
+    """System-wide wired memory (Neural Engine buffers show); None if the kernel is silent."""
     libc = _libc()
     stats, count = _VMStatistics(), ctypes.c_uint32(38)   # HOST_VM_INFO64_COUNT
     if libc.host_statistics64(libc.mach_host_self(), 4, ctypes.byref(stats), ctypes.byref(count)):   # HOST_VM_INFO64
@@ -676,8 +660,7 @@ def _memory_budget():
 
 
 class _Attached:
-    """A model's attached MLPs in order, so memory pressure releases from the end. Weak, so an abandoned split
-    keeps no other layer alive."""
+    """Attached MLPs, so pressure releases from the end; weak refs keep no other layer alive."""
 
     def __init__(self, mlps):
         self.mlps, self.warned, self.rerouted = [weakref.ref(m) for m in mlps], False, False
@@ -729,9 +712,7 @@ class _Surfaces:
 
 
 class _Bank:
-    """Consecutive layers' slices as the procedures of one program, so a model loads a few programs instead of one per
-    layer (the system loads at most 127). Running any procedure wires the whole program, so it unloads only with the
-    last split that uses it."""
+    """One program per run of layers, since the system loads at most 127; unloads with its last split."""
 
     def __init__(self, layers, tile):
         source, before = _bank_program(layers, tile), _wired_bytes()
@@ -978,13 +959,9 @@ def _candidates(model):
 
 
 def prepare_ane_prefill(model, *, tile = _TILE, share = None):
-    """Compile the Neural Engine half of every eligible dense SwiGLU MLP in `model` and attach it.
-
-    `share` fixes the fraction of intermediate channels the Neural Engine takes; by default it is calibrated on the
-    first layer of the most common quantization and cached per machine, macOS build, MLX version and shape, and a split that is not at least 5% faster
-    than the GPU alone is not attached. Returns an `AnePrefillStatus`; `layers == 0` with a `reason` when nothing was
-    attached.
-    """
+    """Compile a Neural Engine split per dense SwiGLU MLP, attached only if at least 5% faster than
+    GPU; default share (Neural Engine channel fraction) is calibrated on the first layer of the
+    most common quantization and cached per machine, macOS build, MLX version and shape."""
     started = time.perf_counter()
     try:
         status = _prepare(model, tile, share)
@@ -1005,8 +982,7 @@ def _prepare(model, tile, share):
         return AnePrefillStatus(0, reason = "a Neural Engine evaluation timed out in this process", code = "timed_out")
     if tile % 32:
         raise ValueError("tile must be a multiple of 32 rows")
-    # Calibration times, and each split records, the GPU routes a generation would take; a generation's own scopes
-    # already hold them.
+    # Calibration and splits record GPU routes a generation would take; its scopes hold them.
     with _LOCK, _generation_routes(model):
         mlps = _candidates(model)
         if not mlps:
@@ -1157,12 +1133,9 @@ def ane_prefill_checkpoint_available(model_dir):
 
 @contextmanager
 def ane_prefill_mlp(model, ane_prefill = None, *, _modules = None):
-    """Route prefill tiles of the MLPs `prepare_ane_prefill` attached through their Neural Engine split.
-
-    `ane_prefill=True`, or `UNSLOTH_MLX_ANE_PREFILL=1` when None, turns it on (approximate: int8 weights); the outermost
-    scope decides, and its first entry on prepares the model. A partial tile is padded when calibration measured that as
-    faster; shorter partial tiles, training and a failed split keep the native module.
-    """
+    """Prefill tiles take the Neural Engine split (approximate int8); UNSLOTH_MLX_ANE_PREFILL=1
+    enables it; partial tiles are padded only when calibration measured that faster; short tiles,
+    training and a failed split keep the native module."""
     changed, tracked = [], hasattr(model, "__dict__")
     try:
         with _LOCK:

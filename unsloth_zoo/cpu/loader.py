@@ -30,9 +30,7 @@ from .ops import Bf16StoredLinear, patch_causal_conv1d_fallback, patch_chunked_c
 _DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 # unsloth/Qwen3-0.6B-unsloth-bnb-4bit -> unsloth/Qwen3-0.6B
 _PREQUANTIZED_SUFFIX = re.compile(r"(-unsloth)?-bnb-4bit$", re.IGNORECASE)
-# GPU FastLanguageModel / FastModel.from_pretrained keywords: never model kwargs, so never forwarded to
-# AutoModelForCausalLM.from_pretrained (the model's __init__ rejects them).
-# Compile / logging / multimodal knobs with no CPU meaning: dropped.
+# GPU-only kwargs never reach AutoModelForCausalLM.from_pretrained, whose __init__ rejects them.
 _GPU_LOADER_KWARGS_IGNORED = (
     "load_in_4bit", "load_in_8bit", "quantization_config", "use_exact_model_name",
     "max_lora_rank", "gpu_memory_utilization", "float8_kv_cache", "random_state",
@@ -40,8 +38,7 @@ _GPU_LOADER_KWARGS_IGNORED = (
     "device_map_planner_kwargs", "float32_mixed_precision", "disable_log_stats",
     "fullgraph", "unsloth_force_compile", "text_only", "whisper_language", "whisper_task",
 )
-# Features the CPU backend cannot run: dropped when off (None / False, the GPU defaults), refused when set,
-# so the run never silently trains without them.
+# Features the CPU cannot run: dropped when off, refused when set, never silently skipped.
 _GPU_LOADER_KWARGS_REFUSED = {
     # The GPU route refuses CPU too: float8 GEMMs need fp8 tensor cores (compute capability 8.9+).
     "float8_training": "float8_training needs an NVIDIA GPU with compute capability 8.9+ (fp8 tensor cores)",

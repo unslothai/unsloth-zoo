@@ -308,9 +308,6 @@ def _documented_shim(base, shape, strides, offsets, block_shape, order, _semanti
 
 
 def _documented_removed(base, shape, strides, offsets, block_shape, order, _semantic = None):
-    """
-    Block pointers have been removed. Use a tensor descriptor instead.
-    """
     raise NotImplementedError("Block pointers have been removed in favor of the tensor descriptor API")
 
 

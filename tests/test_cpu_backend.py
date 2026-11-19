@@ -1715,9 +1715,7 @@ print("CPU_SFT_OK", losses)
 
 @pytest.mark.parametrize("serial_spawn", [False, True])
 def test_cpu_lora_sft_end_to_end(tmp_path, serial_spawn):
-    """FastCPUModel + stock TRL SFTTrainer, as notebooks and Studio call them: on_model_resolved,
-    SFTConfig(max_seq_length), dataset_num_proc > 1, a GPU optimizer name; trains and saves the adapter.
-    serial_spawn: unguarded script, dataset_num_proc = 1, spawn (a Pool(1) child re-imports __main__)."""
+    """SFTTrainer on FastCPUModel; with serial_spawn, dataset_num_proc = 1 (spawn re-imports __main__)."""
     import subprocess
     import sys
     from tokenizers import Tokenizer, models, pre_tokenizers

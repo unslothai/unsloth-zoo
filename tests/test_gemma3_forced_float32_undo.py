@@ -14,16 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Gemma3 forced float32 patches must not outlive the load that installed them.
-
-The loader sets UNSLOTH_FORCE_FLOAT32 per load ("1" for an fp16 Gemma3 load, "0"
-for bf16) and reruns every temporary patch (pre_compile, post_compile). The
-generic set only replaces RMSNorm and attention, so an fp16 load followed by a
-bf16 load in one process kept the float32 embedding and the forced MLP, and the
-bf16 attention raised "Expected query, key, and value to have the same dtype".
-
-Each scenario runs in its own process because the patches are process global.
-"""
+"""Gemma3 float32 patches must not outlive the load that set UNSLOTH_FORCE_FLOAT32 (fp16 then bf16)."""
 
 import json
 import os
