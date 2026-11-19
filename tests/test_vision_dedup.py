@@ -234,3 +234,19 @@ def test_collective_sharded_forwards_never_dedup(monkeypatch):
     hook.remove()
     assert len(calls) == 1  # one per-row encode, no self-check forward
     assert not any(m.__dict__.get(vision_dedup._VERIFIED, False) for m in vision_dedup._image_modules(model))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_block_expand_backward_sums_half_copies_without_overflow(dtype):
+    # Four copies of one row with finite fp16 grads whose running sum passes 65504 but whose total is 0.
+    src = torch.ones(1, 3, dtype = dtype, requires_grad = True)
+    out = vision_dedup._BlockExpand.apply(src, torch.zeros(4, dtype = torch.long), [(0, 1, [0, 1, 2, 3])])
+    grad = torch.tensor([40000.0, 40000.0, -40000.0, -40000.0]).repeat_interleave(3).view(4, 3).to(dtype)
+    out.backward(grad)
+    assert src.grad.dtype == dtype
+    assert torch.isfinite(src.grad).all() and src.grad.abs().max().item() == 0
+    # Exact for representable sums: two copies of 1 and 2**-11 (fp16 ulp below 2 is 2**-10).
+    src2 = torch.ones(1, 1, dtype = dtype, requires_grad = True)
+    out2 = vision_dedup._BlockExpand.apply(src2, torch.zeros(3, dtype = torch.long), [(0, 1, [0, 1, 2])])
+    out2.backward(torch.tensor([[1.0], [2.0 ** -11], [2.0 ** -11]], dtype = dtype))
+    assert src2.grad.item() == float(torch.tensor(1.0 + 2.0 ** -10, dtype = dtype))
