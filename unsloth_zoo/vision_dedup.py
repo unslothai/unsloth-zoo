@@ -158,7 +158,8 @@ def _stochastic_vision(module):
             if isinstance(sub, torch.nn.modules.dropout._DropoutNd):
                 cached.append((sub, "p"))
                 continue
-            for attr in ("dropout", "attention_dropout", "attn_dropout", "dropout_p", "drop_path_rate"):
+            # drop_prob: timm / transformers DropPath (stochastic depth) layers, e.g. QianfanOCR's vision tower.
+            for attr in ("dropout", "attention_dropout", "attn_dropout", "dropout_p", "drop_path_rate", "drop_prob"):
                 value = sub.__dict__.get(attr, None)
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     cached.append((sub, attr))

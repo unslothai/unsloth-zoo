@@ -310,3 +310,21 @@ def test_tower_sharded_after_install_never_self_checks(tmp_path):
             dist.destroy_process_group()
     assert len(calls) == 1
     assert not any(m.__dict__.get(vision_dedup._VERIFIED, False) for m in vision_dedup._image_modules(model))
+
+
+def test_drop_path_layers_count_as_stochastic():
+    # Stochastic depth draws per sample: two equal images get different features in training mode.
+    class DropPath(torch.nn.Module):
+        def __init__(self, drop_prob):
+            super().__init__()
+            self.drop_prob = drop_prob
+
+        def forward(self, x):
+            return x
+
+    tower = torch.nn.Sequential(torch.nn.Linear(4, 4), DropPath(0.1)).train()
+    assert vision_dedup._stochastic_vision(tower)
+    tower.eval()
+    assert not vision_dedup._stochastic_vision(tower)
+    quiet = torch.nn.Sequential(torch.nn.Linear(4, 4), DropPath(0.0)).train()
+    assert not vision_dedup._stochastic_vision(quiet)
