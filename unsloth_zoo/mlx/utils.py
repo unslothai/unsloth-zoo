@@ -15095,7 +15095,7 @@ class LoRAPointwiseConv2d(nn.Module):
         return conv
 
 
-# mlx-vlm's, and mlx-lm's from 0.32: the same layers and rotation, under different names.
+# mlx-vlm's, and mlx-lm's from 0.32.1: the same layers and rotation, under different names.
 _HADAMARD_PACK_MODULES = (
     "mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35",
     "mlx_lm.models.prism_hadamard_qwen35",
@@ -15478,11 +15478,9 @@ def _reject_mixed_lora_dora(model):
 
 
 def _lora_module_types(model):
+    from mlx_lm.tuner.dora import DoRALinear
     from mlx_lm.tuner.lora import LoRALinear
-    try:
-        from mlx_lm.tuner.dora import DoRALinear
-    except ImportError:
-        DoRALinear = None
+
     wrapped = {}
     for name, module in model.named_modules():
         if not (hasattr(module, "lora_a") and hasattr(module, "lora_b")):
@@ -15492,8 +15490,7 @@ def _lora_module_types(model):
         if getattr(module_type, "_unsloth_mlx_qat_active", False):
             module_type = module_type.__base__  # QAT forward subclass, see mlx/qat.py
         if (
-            module_type is LoRALinear
-            or (DoRALinear is not None and module_type is DoRALinear)
+            module_type is LoRALinear or module_type is DoRALinear
         ) and type(base_linear) in (nn.Linear, nn.QuantizedLinear):
             wrapped[name] = "linear"
         else:
@@ -18654,8 +18651,8 @@ def _copy_source_sidecars(src_path, path):
     return copied
 
 def _fuse_mlx_module(module, dequantize):
-    """Call module.fuse() with the flag spelled as installed: mlx-lm renamed de_quantize (0.28.3) to dequantize
-    (0.28.4); a flagless fuse (ExtendedLmHead) is called as is, and save_merged_model dequantizes afterwards."""
+    """Call module.fuse(dequantize=); a flagless fuse (ExtendedLmHead) is called as is, and save_merged_model
+    dequantizes afterwards."""
     fuse = module.fuse
     try:
         parameters = inspect.signature(fuse).parameters
@@ -18663,10 +18660,9 @@ def _fuse_mlx_module(module, dequantize):
         # C extensions can hide their signature; assume the current spelling.
         return fuse(dequantize=dequantize)
 
-    for name in ("dequantize", "de_quantize"):
-        if name in parameters:
-            return fuse(**{name: dequantize})
-    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+    if "dequantize" in parameters or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+    ):
         return fuse(dequantize=dequantize)
     return fuse()
 
@@ -20005,23 +20001,13 @@ def attach_and_bind_peft_adapter(model, adapter_dir, cfg):
     import mlx.nn as nn
     from mlx_lm.tuner.lora import LoRALinear
 
-    # Older mlx-lm from_base() rejects scale/dropout.
-    from .loader import _patch_mlx_lora_from_base_compat
-    _patch_mlx_lora_from_base_compat()
-
     if not cfg.get("_unsloth_peft_import"):
         from unsloth_zoo.mlx.peft_interop import normalize_peft_adapter_config
         cfg = normalize_peft_adapter_config(dict(cfg), adapter_dir=adapter_dir)
     _reject_dora_dropout(cfg)
     use_dora = bool(cfg.get("use_dora"))
     if use_dora:
-        try:
-            from mlx_lm.tuner.dora import DoRALinear
-        except ImportError as exc:
-            raise ImportError(
-                "Unsloth MLX: this adapter uses DoRA but mlx_lm.tuner.dora "
-                "is unavailable; upgrade mlx-lm."
-            ) from exc
+        from mlx_lm.tuner.dora import DoRALinear
 
     tensors = dict(mx.load(os.path.join(adapter_dir, PEFT_WEIGHTS_FILE)))
     pairs, full_state, rejected = group_peft_lora_pairs(tensors, cfg)

@@ -468,14 +468,10 @@ def _kv_quant_options(defaults: GenerationDefaults) -> dict:
     }
 
 
-def _prefill_step_option(defaults: GenerationDefaults, constructor = None, *, model = None) -> dict:
+def _prefill_step_option(defaults: GenerationDefaults, *, model = None) -> dict:
     """Supported prefill size, bounded by the loaded model's automatic memory plan."""
     if defaults.prefill_step_size is None:
         return {}
-    if constructor is not None:
-        params = inspect.signature(constructor).parameters
-        if "prefill_step_size" not in params and not any(p.kind is p.VAR_KEYWORD for p in params.values()):
-            return {}
     return {"prefill_step_size": capped_prefill_step(model, defaults.prefill_step_size)}
 
 
@@ -810,7 +806,7 @@ def _api_shape_error(details: str) -> RuntimeError:
         "Unsupported mlx-lm batch-generation API shape "
         f"({details}) in {_installed_mlx_lm_version()}. Batched generation "
         "needs a BatchGenerator that streams per-token events, which requires "
-        "mlx-lm 0.31.2 or newer; upgrade mlx-lm, or use model.generate for "
+        "mlx-lm 0.31.3 or newer; upgrade mlx-lm, or use model.generate for "
         "sequential decoding."
     )
 
@@ -2036,7 +2032,7 @@ class _TextBatchSession:
             prefill_batch_size=defaults.prefill_batch_size,
             completion_batch_size=defaults.completion_batch_size,
             max_kv_size=defaults.max_kv_size,
-            **_prefill_step_option(defaults, adapter.batch_generator_type, model=adapter.model),
+            **_prefill_step_option(defaults, model=adapter.model),
         )
         self._draws = (
             _BatchedDraws(self.generator)

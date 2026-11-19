@@ -348,11 +348,6 @@ def test_adapter_removes_stop_matches_and_closes_on_failure():
         _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))
         assert Generator.instances[-1].kwargs["stop_tokens"] == stops
         assert "prefill_step_size" not in Generator.instances[-1].kwargs  # the runtime's own step
-    # A runtime whose BatchGenerator takes no step keeps its own.
-    adapter.defaults = GenerationDefaults(prefill_step_size=8192)
-    adapter.batch_generator_type = type("Stepless", (Generator,), {"__init__": lambda self, model, max_tokens, stop_tokens, prefill_batch_size, completion_batch_size, max_kv_size: Generator.__init__(self, max_kv_size=max_kv_size)})  # noqa: E501
-    _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))
-    assert Generator.instances[-1].kwargs == {"max_kv_size": None}
     assert GenerationDefaults(256, SamplingParams(), (), 2, 3, 16).max_kv_size == 16
     for bad in ([True], [-1], [1.5]):
         with pytest.raises(ValueError, match="non-negative integer"):
