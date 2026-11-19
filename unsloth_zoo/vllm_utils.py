@@ -5276,8 +5276,7 @@ def load_vllm(
                 engine_args["attention_backend"] = "TRITON_MLA"
             elif _flash_attn_is_selectable():
                 engine_args["attention_backend"] = "FLASH_ATTN"
-            # vLLM's own switch for the sm90+ warmup that imports flashinfer.autotuner
-            # unguarded (model_executor/warmup/kernel_warmup.py); dropped below on older vLLM.
+            # vLLM's switch for the sm90+ warmup's unguarded flashinfer.autotuner import; dropped on older vLLM.
             if "enable_flashinfer_autotune" not in engine_args and "kernel_config" not in engine_args:
                 engine_args["enable_flashinfer_autotune"] = False
 
