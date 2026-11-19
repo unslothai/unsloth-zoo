@@ -1301,6 +1301,19 @@ def test_releasing_vision_weights_frees_only_what_text_never_reads(text_reads_to
     assert model._unsloth_supports_images is not bool(released)
 
 
+def test_released_vision_keeps_audio_and_refuses_a_whole_save():
+    from unsloth_zoo.mlx import loader
+
+    model = _ToyVLM()
+    model.audio_tower = nn.Linear(64, 64)
+    assert loader.release_vision_weights(model) > 0
+    assert "audio_tower" in model and "vision_tower" not in model
+    with pytest.raises(ValueError, match="drop_vision_weights"):
+        loader._mlx_save_pretrained_merged(model, "unused")
+    with pytest.raises(ValueError, match="drop_vision_weights"):
+        loader._mlx_save_pretrained_gguf(model, "unused")
+
+
 def test_the_check_leaves_no_state_behind_for_the_first_training_batch():
     """qwen2_vl reuses a cached `_position_ids` without checking it still fits."""
     from unsloth_zoo.mlx import loader

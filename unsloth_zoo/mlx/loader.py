@@ -301,6 +301,11 @@ def _refuse_offloaded(model, action) -> None:
             f"Unsloth: this model was loaded with offload, which is for inference only; "
             f"{action} needs the model loaded without offload."
         )
+    if getattr(model, "_unsloth_vision_released", False):
+        raise ValueError(
+            f"Unsloth: this model's vision weights were released for text-only inference; "
+            f"{action} needs the model loaded without drop_vision_weights."
+        )
 
 
 def _keep_norm_parameters_float32(model) -> None:
@@ -4067,7 +4072,8 @@ def _freeze_outside_language_model(model) -> None:
 
 
 def _detach_vision_modules(model) -> dict:
-    """Detach an mlx-vlm model's top-level modules outside its language model that share none of its modules."""
+    """Detach an mlx-vlm model's top-level modules outside its language model that share none of its modules;
+    audio modules stay, since only image input is given up."""
     import mlx.nn as nn
     from mlx.utils import tree_flatten
 
@@ -4078,7 +4084,12 @@ def _detach_vision_modules(model) -> dict:
     released = {}
     for name, child in model.children().items():
         modules = [m for _, m in tree_flatten(child, is_leaf=lambda x: isinstance(x, nn.Module))]
-        if name == "language_model" or not modules or not all(isinstance(m, nn.Module) for m in modules):
+        if (
+            name == "language_model"
+            or "audio" in name
+            or not modules
+            or not all(isinstance(m, nn.Module) for m in modules)
+        ):
             continue
         if not any(id(m) in shared for module in modules for m in module.modules()):
             released[name] = child
