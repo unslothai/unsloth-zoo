@@ -5160,12 +5160,15 @@ def _retry_with_temp_file(command):
     return out[:-1] + ["--use-temp-file"] + out[-1:]
 
 
+def _gguf_shard_pattern(output_file):
+    """llama.cpp's SHARD_NAME_FORMAT "{:s}-{:05d}-of-{:05d}.gguf" for `output_file`. Use fullmatch."""
+    stem = os.path.basename(os.path.splitext(output_file)[0])
+    return re.compile(re.escape(stem) + r'-(\d{5})-of-(\d{5})\.gguf')
+
+
 def _gguf_output_paths(output_file):
     """`output_file` plus any shards llama.cpp names after it."""
-    basename_without_gguf = os.path.splitext(output_file)[0]
-    shard_pattern = re.compile(
-        re.escape(os.path.basename(basename_without_gguf)) + r'-(\d{5})-of-(\d{5})\.gguf'
-    )
+    shard_pattern = _gguf_shard_pattern(output_file)
     parent_dir = os.path.dirname(output_file) or '.'
     paths = [output_file]
     try:
@@ -6498,11 +6501,7 @@ def convert_to_gguf(
             all_output_files.append(output_file)
             found_files = [output_file]
         else:
-            # llama.cpp uses SHARD_NAME_FORMAT = "{:s}-{:05d}-of-{:05d}.gguf"
-            basename_without_gguf = os.path.splitext(output_file)[0]
-            shard_pattern = re.compile(
-                re.escape(os.path.basename(basename_without_gguf)) + r'-(\d{5})-of-(\d{5})\.gguf'
-            )
+            shard_pattern = _gguf_shard_pattern(output_file)
             parent_dir = os.path.dirname(output_file) or '.'
             shard_files = sorted(
                 os.path.join(parent_dir, f)
