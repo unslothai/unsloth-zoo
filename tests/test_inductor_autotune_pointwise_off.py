@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""patch_torch_compile turns off Inductor's pointwise launch-config autotuning (cold start: one config per pointwise
-kernel instead of 2 or 6 compiled and timed at first launch). max_autotune still tunes them."""
+"""patch_torch_compile disables triton.autotune_pointwise; O3 keeps max_autotune_pointwise, which outranks it."""
 
 import os
 import subprocess
@@ -34,5 +33,4 @@ def test_patch_torch_compile_turns_pointwise_autotune_off(O3):
     assert out.returncode == 0 and line, out.stderr[-4000:]
     _, before, after, max_pointwise = line[-1].split()
     assert before == "True" and after == "False"
-    # O3 keeps tuning pointwise kernels through max_autotune_pointwise, which outranks autotune_pointwise.
     assert max_pointwise == ("True" if O3 == "1" else "False")
