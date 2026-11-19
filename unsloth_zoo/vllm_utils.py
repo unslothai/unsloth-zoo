@@ -6770,10 +6770,13 @@ def _lora_state_dict(model):
         "Unsloth: native FSDP2 gathers the LoRA adapters across ranks for save_lora / load_lora, "
         "so every rank must call them (a call on rank 0 alone waits for the others)."
     )
+    # Only the adapter subtrees: a whole-model state_dict() packs every bnb Linear4bit QuantState, one
+    # device-to-host sync per 4-bit layer on every load_lora. FSDP2's to-sharded pre-save hook sits on the
+    # module owning each sharded parameter (the lora_A / lora_B Linear), so it still runs here.
     with torch.inference_mode(False), torch.no_grad():
         return {
             k: (v.full_tensor() if isinstance(v, DTensor) else v).detach()
-            for k, v in lora_items(model.state_dict()).items()
+            for k, v in lora_items(_lora_modules_state_dict(model)).items()
         }
 pass
 
