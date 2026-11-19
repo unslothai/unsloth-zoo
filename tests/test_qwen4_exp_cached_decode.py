@@ -491,3 +491,26 @@ def test_mask_outside_the_padding_shape_keeps_the_reference_on_cpu(patched):
     assert past.layers[module.layer_idx].indexer_keys.shape[1] == n - 2   # untouched: the reference appends
     counter = zoo.QWEN4_EXP_CACHED_DECODE_MISMATCH.get(torch.device("cpu"))
     assert (0 if counter is None else int(counter)) == before
+
+
+def test_inference_mode_then_no_grad_decode(patched):
+    # The mismatch counter is created on the first cached step; under inference_mode it must not become an
+    # inference tensor, or a later cached step under plain no_grad raises on counter.add_().
+    zoo.QWEN4_EXP_CACHED_DECODE_MISMATCH.clear()
+    model = _model()
+    ids, mask, prompt = _batch([30, 30], 40)
+    pos = _positions(mask)
+
+    def step(ctx):
+        before = zoo.QWEN4_EXP_SPARSE_STATS["cached_decode"]
+        with ctx():
+            out = model(input_ids = ids[:, :prompt], attention_mask = mask[:, :prompt],
+                        position_ids = pos[:, :prompt], use_cache = True)
+            model(input_ids = ids[:, prompt : prompt + 1], attention_mask = mask[:, : prompt + 1],
+                  position_ids = pos[:, prompt : prompt + 1], past_key_values = out.past_key_values, use_cache = True)
+        return zoo.QWEN4_EXP_SPARSE_STATS["cached_decode"] - before
+
+    assert step(torch.inference_mode) > 0
+    assert step(torch.no_grad) > 0
+    counter = zoo.QWEN4_EXP_CACHED_DECODE_MISMATCH[ids.device]
+    assert not counter.is_inference() and int(counter) == 0

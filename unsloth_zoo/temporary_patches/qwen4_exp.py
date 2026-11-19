@@ -385,7 +385,9 @@ def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attent
     # Count steps whose mask is not each row's visible slots up to itself; never keep a hidden key.
     counter = QWEN4_EXP_CACHED_DECODE_MISMATCH.get(device)
     if counter is None:
-        counter = QWEN4_EXP_CACHED_DECODE_MISMATCH[device] = torch.zeros((), dtype = torch.int64, device = device)
+        # Never an inference tensor: a later step under plain no_grad must still be able to add_ into it.
+        with torch.inference_mode(False):
+            counter = QWEN4_EXP_CACHED_DECODE_MISMATCH[device] = torch.zeros((), dtype = torch.int64, device = device)
     counter.add_(mismatch)
     return torch.where(visible.gather(-1, selected.clamp_min(0)) & (selected >= 0), selected, -1)
 
