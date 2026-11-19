@@ -231,6 +231,14 @@
       "reason": "Module name comes from a fixed tuple or table in this file, not from a model, request or download."
     },
     {
+      "file": "unsloth_zoo/mlx/runtime.py",
+      "rule": "dynamic-import",
+      "sink": "spec_from_file_location",
+      "digest": "2873677cf12e8082",
+      "count": 1,
+      "reason": "Loads unsloth_zoo's own temporary_patches/datasets_folder_metadata.py by a path built from this package's directory; no model, request or download chooses it."
+    },
+    {
       "file": "unsloth_zoo/mlx/speculative.py",
       "rule": "dynamic-import",
       "sink": "__import__",
