@@ -1222,12 +1222,36 @@ def _pristine_for_compiled_checkpoint(use_reentrant, kwargs):
 pass
 
 
+NO_GRAD_CHECKPOINT_STATS = collections.Counter()   # checkpoint calls run directly under grad off
+
+
+def _call_without_checkpoint(function, *args):
+    """A checkpoint entered with grad off records no graph, so no backward replays it.
+
+    Training-mode forwards under ``torch.no_grad()`` / ``torch.inference_mode()``
+    (GRPO old / ref logprobs, DPO reference logps, eval) still reach the checkpoint
+    shims through ``GradientCheckpointingLayer`` and the fast decoder loops. Running
+    the block directly gives the same output without the checkpoint's work: the
+    offloaded checkpointer copied the first layer's input (which the input-grad hook
+    marks requires_grad even under no_grad) to a pinned host slot, recorded routing
+    and attention frames, and advanced the layer counters that pick the last layer
+    to keep on the device. Routing and attention frames are scoped out as the
+    checkpoint's own first pass does."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    NO_GRAD_CHECKPOINT_STATS["calls"] += 1
+    with _checkpoint_routing_scope(None, False), saved_attention_scope(None, False):
+        return function(*args)
+pass
+
+
 @torch._disable_dynamo
 def unsloth_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
     pristine = _pristine_for_compiled_checkpoint(use_reentrant, kwargs)
     if pristine is not None:
         return pristine(function, *args, use_reentrant = False, **kwargs)
     function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
+    if not torch.is_grad_enabled():
+        return _call_without_checkpoint(function, *args, *tensor_args)
     return Unsloth_Gradient_Checkpointer.apply(function, *args, *tensor_args)
 pass
 
@@ -1787,6 +1811,15 @@ pass
 
 
 class UnslothCheckpointFunction(torch.autograd.Function):
+
+    @classmethod
+    def apply(cls, run_function, preserve_rng_state, *args):
+        # Also installed as torch.utils.checkpoint.CheckpointFunction, so torch's own reentrant checkpoint
+        # (a layer's _gradient_checkpointing_func bound before the shims were patched in) lands here too.
+        if not torch.is_grad_enabled() and not torch.compiler.is_compiling():
+            return _call_without_checkpoint(run_function, *args)
+        return super().apply(run_function, preserve_rng_state, *args)
+    pass
 
     @staticmethod
     def forward(ctx, run_function, preserve_rng_state, *args):
@@ -2728,6 +2761,8 @@ def unsloth_checkpoint(
                 "Passing `context_fn` or `debug` is only supported when "
                 "use_reentrant=False."
             )
+        if not torch.is_grad_enabled():
+            return _call_without_checkpoint(function, *args)
         return UnslothCheckpointFunction.apply(function, preserve, *args)
     else:
         gen = _checkpoint_without_reentrant_generator(
@@ -2928,12 +2963,14 @@ def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None,
     pristine = _pristine_for_compiled_checkpoint(use_reentrant, kwargs)
     if pristine is not None:
         return pristine(function, *args, use_reentrant = False, **kwargs)
+    preserve = kwargs.pop("preserve_rng_state", True)
+    function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
+    if not torch.is_grad_enabled():
+        return _call_without_checkpoint(function, *args, *tensor_args)
     # Not `len(...) == 0`: unpatch_unsloth_smart_gradient_checkpointing sets CPU_BUFFERS
     # to None, which is the state this shim normally starts from, and len(None) raises.
     if not CPU_BUFFERS:
         initialize_unsloth_gradient_checkpointing(args[0].dtype)
-    preserve = kwargs.pop("preserve_rng_state", True)
-    function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
     return UnslothCheckpointFunction.apply(function, preserve, *args, *tensor_args)
 
 # Unsloth Zoo - Utilities for Unsloth
