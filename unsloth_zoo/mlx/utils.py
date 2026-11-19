@@ -19774,6 +19774,7 @@ def push_to_hub_merged(
     commit_description=_PUSH_MERGED_DEFAULT_COMMIT_DESCRIPTION,
     create_pr=False,
     revision=None,
+    _always_save=False,
 ):
     """Push merged model to HuggingFace Hub.
 
@@ -19795,7 +19796,8 @@ def push_to_hub_merged(
 
     save_directory = Path(save_directory)
 
-    if not (save_directory / "model.safetensors.index.json").exists():
+    # _always_save: the folder was not chosen by the caller, so an existing save in it may be an earlier model.
+    if _always_save or not (save_directory / "model.safetensors.index.json").exists():
         save_merged_model(model, tokenizer, save_directory)
 
     if repo_id is None:

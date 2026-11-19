@@ -7817,7 +7817,10 @@ def _mlx_push_to_hub_merged(self, repo_id, tokenizer=None, save_directory=None, 
     _refuse_offloaded(self, "saving")
     from .utils import push_to_hub_merged
     tokenizer = tokenizer or self._tokenizer
-    # Default save_directory to repo_id; callers that already saved locally should pass save_directory= to avoid a re-save.
+    # Default save_directory to repo_id, saved fresh each time: a save left there by an earlier push is an older model.
+    # Callers that already saved locally should pass save_directory= to avoid a re-save.
+    if not save_directory:
+        kwargs["_always_save"] = True
     save_directory = save_directory or repo_id
     push_to_hub_merged(self, tokenizer, save_directory, repo_id=repo_id, **kwargs)
 
