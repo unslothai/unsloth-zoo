@@ -1339,6 +1339,26 @@ def test_a_failed_drop_leaves_disk_backed_tables_unread(monkeypatch):
     assert evaluated == [model]
 
 
+def test_a_released_model_skips_legacy_image_binding():
+    from types import SimpleNamespace
+    from mlx_vlm.models.base import BaseImageProcessor
+    from unsloth_zoo.mlx import loader, utils
+
+    class Legacy(BaseImageProcessor):
+        def preprocess(self, images):
+            raise AssertionError("probed a released tower")
+
+    class LegacyVLM(_ToyVLM):
+        def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
+            return inputs_embeds
+
+    model = LegacyVLM()
+    model.config = SimpleNamespace(image_token_index=5)
+    model._unsloth_supports_images = True
+    assert loader.release_vision_weights(model) > 0
+    utils.bind_legacy_image_processor(model, SimpleNamespace(image_processor=Legacy()))
+
+
 def test_the_check_leaves_no_state_behind_for_the_first_training_batch():
     """qwen2_vl reuses a cached `_position_ids` without checking it still fits."""
     from unsloth_zoo.mlx import loader

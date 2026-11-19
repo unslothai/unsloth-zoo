@@ -9198,7 +9198,11 @@ _LEGACY_IMAGE_SPEC = "_unsloth_legacy_image_spec"
 def bind_legacy_image_processor(model, processor):
     from mlx_vlm.models.base import BaseImageProcessor
     image_processor = getattr(processor, "image_processor", None)
-    if hasattr(processor, "tokenizer") or not isinstance(image_processor, BaseImageProcessor):
+    if (
+        getattr(model, "_unsloth_vision_released", False)
+        or hasattr(processor, "tokenizer")
+        or not isinstance(image_processor, BaseImageProcessor)
+    ):
         return
     from PIL import Image
 
