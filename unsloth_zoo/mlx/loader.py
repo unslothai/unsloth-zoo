@@ -4097,8 +4097,9 @@ def _detach_vision_modules(model) -> dict:
     return released
 
 
-def _settle_detached_vision(model, released) -> int:
-    """Bytes of the detached modules if text still embeds and runs without them, else reattach and return 0."""
+def _settle_detached_vision(model, released, target_dtype=None, model_type="") -> int:
+    """Bytes of the detached modules if text still embeds and runs without them, else reattach (cast to
+    target_dtype, which the load applied while they were out) and return 0."""
     import mlx.core as mx
     from mlx.utils import tree_flatten
     from .utils import _get_processor_tokenizer
@@ -4117,6 +4118,8 @@ def _settle_detached_vision(model, released) -> int:
     except Exception:
         for name, child in released.items():
             model[name] = child
+        if target_dtype is not None:
+            _convert_mlx_dtype(model, target_dtype, model_type=model_type)
         mx.eval(model.parameters())
         return 0
     processor = getattr(model, "_processor", None)
@@ -10753,7 +10756,9 @@ class FastMLXModel:
                 model_type=model_type,
                 strict=False,
             )
-            model._unsloth_vision_freed = _settle_detached_vision(model, detached_vision)
+            model._unsloth_vision_freed = _run_with_vlm_config_view(
+                _settle_detached_vision, model, detached_vision, target_dtype, model_type
+            )
             if force_vlm_text_path:
                 print(
                     "Unsloth: Loading a text model through mlx-vlm; "

@@ -1312,6 +1312,17 @@ def test_released_vision_keeps_audio_and_refuses_a_whole_save():
         loader._mlx_save_pretrained_gguf(model, "unused")
 
 
+def test_vision_kept_for_text_gets_the_load_dtype():
+    from unsloth_zoo.mlx import loader
+
+    model = _ToyVLM(text_reads_tower=True)
+    detached = loader._detach_vision_modules(model)
+    loader._convert_mlx_dtype(model, mx.bfloat16)
+    assert loader._settle_detached_vision(model, detached, mx.bfloat16) == 0
+    assert model.vision_tower[0].weight.dtype == mx.bfloat16
+    assert model.multi_modal_projector.weight.dtype == mx.bfloat16
+
+
 def test_the_check_leaves_no_state_behind_for_the_first_training_batch():
     """qwen2_vl reuses a cached `_position_ids` without checking it still fits."""
     from unsloth_zoo.mlx import loader
