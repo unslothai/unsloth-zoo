@@ -4167,6 +4167,23 @@ def _vllm_gdn_reads_ssm_dtype():
         return False
 
 
+def _vllm_colocated_cache_args(engine_arg_keys, enable_prefix_caching):
+    """KV cache args for an in-process (colocated) engine; only keys this vLLM has.
+
+    enable_extensible_kv_cache=False: vLLM >= 0.34's cap on torch's allocator survives sleep, so the
+    trainer cannot reuse memory freed by UNSLOTH_VLLM_STANDBY.
+    prefix_cache_retention_interval=None: vLLM >= 0.29's default 0 stops sliding-window / Mamba / GDN
+    groups reusing the previous multi-turn completion. The deprecated env var still wins.
+    """
+    args = {}
+    if "enable_extensible_kv_cache" in engine_arg_keys:
+        args["enable_extensible_kv_cache"] = False
+    if (enable_prefix_caching and "prefix_cache_retention_interval" in engine_arg_keys
+            and "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" not in os.environ):
+        args["prefix_cache_retention_interval"] = None
+    return args
+
+
 def _vllm_mamba_ssm_cache_dtype_args(config, engine_arg_keys, training, choices = None, gdn_reads_ssm = None):
     # (engine args to add, message or None). Unset env: nothing is passed.
     value = os.environ.get("UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE", "").strip().lower()
@@ -5325,6 +5342,9 @@ def load_vllm(
                 print(f"Unsloth: Not an error, but `{key}` is not supported in vLLM. Skipping.")
             pass
         pass
+        # After the filter (no "not supported" line). Not for `vllm serve`: own process, CLI drops False.
+        if not return_args:
+            engine_args.update(_vllm_colocated_cache_args(good_keys, engine_args.get("enable_prefix_caching")))
         ssm_dtype_args, ssm_dtype_message = _vllm_mamba_ssm_cache_dtype_args(config, good_keys, training)
         engine_args.update(ssm_dtype_args)
         if ssm_dtype_message is not None:
