@@ -309,6 +309,8 @@ def _maybe_enable_exact_pinned():
     user = [current] + [os.environ.get(var) or "" for var in
         ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF")]
     if any(knob in text for text in user for knob in _PINNED_KNOBS): return False
+    # torch reports only the latest settings string: a pinned knob set by an earlier update stays in effect.
+    if any(v != _INF for v in _host_alloc_policy()): return False
     # Each call resets max_split_size_mb, roundup_power2_divisions and garbage_collection_threshold
     # to defaults, so pass the settings in effect back in with ours appended.
     try: setter(",".join(filter(None, (current, f"pinned_max_round_threshold_mb:{_GC_PINNED_EXACT_MB}"))))

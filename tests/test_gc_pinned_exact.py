@@ -51,6 +51,13 @@ def test_enabled_on_cuda_torch_214_keeps_the_settings_in_effect(gc_module, gate)
     assert gc_module._maybe_enable_exact_pinned() and len(gate) == 1  # set once
 
 
+def test_keeps_a_pinned_threshold_from_an_earlier_runtime_update(gc_module, gate):
+    gate.state["settings"] = "pinned_max_round_threshold_mb:64"
+    gc_module._host_alloc_policy()  # seen once, as the GC cap accounting does
+    gate.state["settings"] = "max_split_size_mb:256"  # an unrelated later update
+    assert not gc_module._maybe_enable_exact_pinned() and gate == []
+
+
 def test_flip_160mb_slot_pins_160mb_not_256mb(gc_module, gate):
     assert gc_module._pinned_block_bytes(160 * MIB) == 256 * MIB  # torch's power-of-two rounding
     assert gc_module._maybe_enable_exact_pinned()
