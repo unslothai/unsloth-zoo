@@ -205,8 +205,7 @@ dist.destroy_process_group()
 @pytest.mark.skipif(not _fully_shard_takes_ignored_params(), reason = "needs fully_shard(ignored_params) (torch >= 2.7)")
 @pytest.mark.parametrize("reshard", ["reshard", "no_reshard"])
 def test_fsdp2_gather_reads_only_the_adapter_subtrees(tmp_path, reshard):
-    """load_lora under FSDP2 must not run every frozen layer's state_dict: for QLoRA each bnb Linear4bit
-    packs its QuantState there, one host sync per 4-bit layer per rollout."""
+    """load_lora under FSDP2 must not run frozen layers' state_dict (a host sync per 4-bit layer)."""
     script = tmp_path / "pack_worker.py"
     script.write_text(textwrap.dedent(_PACK_WORKER))
     env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_ALLOW_CPU = "1",
