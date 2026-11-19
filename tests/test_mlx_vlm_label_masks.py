@@ -1302,10 +1302,15 @@ def test_releasing_vision_weights_frees_only_what_text_never_reads(text_reads_to
 def test_released_vision_keeps_audio_and_refuses_a_whole_save():
     from unsloth_zoo.mlx import loader
 
+    from unsloth_zoo.mlx import utils
+
     model = _ToyVLM()
     model.audio_tower = nn.Linear(64, 64)
+    model.sound_encoder = nn.Linear(64, 64)
     assert loader.release_vision_weights(model) > 0
-    assert "audio_tower" in model and "vision_tower" not in model
+    assert "audio_tower" in model and "sound_encoder" in model and "vision_tower" not in model
+    with pytest.raises(ValueError, match="drop_vision_weights"):
+        utils.save_merged_model(model, None, "unused")
     with pytest.raises(ValueError, match="drop_vision_weights"):
         loader._mlx_save_pretrained_merged(model, "unused")
     with pytest.raises(ValueError, match="drop_vision_weights"):

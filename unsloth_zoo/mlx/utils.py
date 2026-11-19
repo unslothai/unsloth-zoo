@@ -18832,6 +18832,11 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
     from mlx_lm.utils import save_model, create_model_card, dequantize_model
     from mlx.utils import tree_unflatten
 
+    if getattr(model, "_unsloth_vision_released", False):
+        raise ValueError(
+            "Unsloth: this model's vision weights were released for text-only inference; "
+            "saving needs the model loaded without drop_vision_weights."
+        )
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     restore_after_save = None

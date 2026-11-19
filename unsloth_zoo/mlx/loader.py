@@ -4075,6 +4075,7 @@ def _detach_vision_modules(model) -> dict:
     """Detach top-level non-audio modules outside the language model that share none of its modules."""
     import mlx.nn as nn
     from mlx.utils import tree_flatten
+    from .utils import _AUDIO_TOWER_ATTRS
 
     language_model = getattr(model, "language_model", None)
     if not isinstance(model, nn.Module) or language_model is None:
@@ -4086,6 +4087,7 @@ def _detach_vision_modules(model) -> dict:
         if (
             name == "language_model"
             or "audio" in name
+            or name in _AUDIO_TOWER_ATTRS
             or not modules
             or not all(isinstance(m, nn.Module) for m in modules)
         ):
