@@ -19,7 +19,11 @@
 """Selective gradient checkpointing: with UNSLOTH_GC_SAVE_ATTENTION=1 (GPU) or =offload (pinned
 host), the first pass keeps each attention kernel's outputs (output, logsumexp, rng state) and the
 backward replay of the same checkpointed call reuses them instead of recomputing attention. Kernels
-the dispatcher cannot see, mismatched replays and random (dropout) calls are recomputed as before."""
+the dispatcher cannot see, mismatched replays and random (dropout) calls are recomputed as before.
+
+Unset (or =auto): Unsloth's attention dispatch routes long training calls here on measured GPUs only
+(save_attention_auto_min_seq), and each output is kept only while the device memory budget allows
+it. =0 turns everything off."""
 
 import collections
 import os
@@ -36,6 +40,7 @@ __all__ = [
     "SavedAttentionFrame",
     "save_attention_enabled",
     "save_attention_offload",
+    "save_attention_auto_min_seq",
     "new_saved_attention_frame",
     "saved_attention_scope",
     "saved_attention_active",
@@ -50,7 +55,7 @@ _TLS = threading.local()
 
 
 def _save_attention_setting():
-    return os.environ.get("UNSLOTH_GC_SAVE_ATTENTION", "0").strip().lower()
+    return os.environ.get("UNSLOTH_GC_SAVE_ATTENTION", "auto").strip().lower() or "auto"
 
 
 _WARNED_HIP = [False]
@@ -72,23 +77,177 @@ def save_attention_offload():
     return _save_attention_setting() == "offload"
 
 
-class SavedAttentionFrame:
-    __slots__ = ("entries", "cursor", "replaying", "offload", "loaded", "__weakref__")
+# Automatic mode: compute capabilities where Colab measured it faster beyond A/A noise, and the
+# sequence length from which it pays for the graph break around the kept call.
+_AUTO_CAPABILITIES = frozenset({(7, 5), (8, 0), (8, 9)})
+_AUTO_MIN_SEQ = 8192
+_AUTO_ACTIVE = [False]
+
+
+def save_attention_auto_min_seq():
+    """Automatic mode: the query length from which training attention calls should go through
+    saved_attention_call, or None when the mode is off (=0, an explicit setting, ROCm, CPU, an
+    unmeasured GPU). A caller that routes calls marks the mode active, which turns on the frames."""
+    if _save_attention_setting() != "auto":
+        return None
+    if getattr(torch.version, "hip", None) or not torch.cuda.is_available():
+        return None
+    try:
+        capability = tuple(torch.cuda.get_device_capability())
+    except Exception:
+        return None
+    if capability not in _AUTO_CAPABILITIES:
+        return None
+    try:
+        min_seq = int(os.environ.get("UNSLOTH_GC_SAVE_ATTENTION_MIN_SEQ", _AUTO_MIN_SEQ))
+    except ValueError:
+        min_seq = _AUTO_MIN_SEQ
+    _AUTO_ACTIVE[0] = True
+    return max(min_seq, 1)
+
+
+class _Budget:
+    """Kept bytes on one device against the headroom left by the run's own peak.
+
+    The peak without kept outputs is learnt from the allocator's running peak (never reset): every
+    change of the kept bytes is preceded by a reading, so a new peak is charged with exactly the
+    bytes kept at that time. Nothing is kept for a call larger than any call already seen through a
+    whole step (its peak is not known yet)."""
+    __slots__ = ("live", "seen_peak", "base_peak", "measured", "capacity")
 
     def __init__(self):
+        self.live = 0
+        self.seen_peak = None
+        self.base_peak = None
+        self.measured = 0
+        self.capacity = None
+
+
+_BUDGETS = {}
+_AUTO_MARGIN_BYTES = 1 << 30
+_AUTO_MARGIN_FRACTION = 0.06
+
+
+def _device_peak(device):
+    if device.type != "cuda":
+        return None
+    return torch.cuda.memory_stats_as_nested_dict(device)["allocated_bytes"]["all"]["peak"]
+
+
+def _device_capacity(device):
+    if device.type != "cuda":
+        return None
+    free, total = torch.cuda.mem_get_info(device)
+    capacity = free + torch.cuda.memory_reserved(device)
+    get_fraction = getattr(torch.cuda, "get_per_process_memory_fraction", None)
+    if get_fraction is not None:
+        try:
+            capacity = min(capacity, int(total * get_fraction(device)))
+        except Exception:
+            pass
+    return capacity
+
+
+def _observe(budget, device):
+    peak = _device_peak(device)
+    if peak is None:
+        return False
+    if peak != budget.seen_peak:
+        # Also after a reset of the peak stats: the new peak is still charged with today's kept bytes.
+        without = peak - budget.live
+        budget.base_peak = without if budget.base_peak is None else max(budget.base_peak, without)
+        budget.seen_peak = peak
+    return True
+
+
+def _auto_admit(frame, tensors):
+    query = tensors[0] if tensors else None
+    if not isinstance(query, torch.Tensor) or query.dim() < 2:
+        return False
+    # Output like Q plus a float32 logsumexp per query row.
+    estimate = _bytes(query) + (query.numel() // max(query.shape[-1], 1)) * 4
+    frame.estimate = max(frame.estimate, estimate)
+    budget = _BUDGETS.get(query.device)
+    if budget is None:
+        budget = _BUDGETS[query.device] = _Budget()
+    if not _observe(budget, query.device):
+        return False
+    if budget.live == 0 or budget.capacity is None:
+        budget.capacity = _device_capacity(query.device)
+    if estimate > budget.measured:
+        SAVED_ATTENTION_STATS["declined_unmeasured"] += 1
+        return False
+    capacity = budget.capacity
+    margin = max(_AUTO_MARGIN_BYTES, int(capacity * _AUTO_MARGIN_FRACTION))
+    if budget.live + estimate > capacity - margin - budget.base_peak:
+        SAVED_ATTENTION_STATS["declined_budget"] += 1
+        return False
+    return True
+
+
+def _auto_keep(frame, entry):
+    device = None
+    kept = 0
+    for _, _, out in entry:
+        for t in tree_flatten(out)[0]:
+            if isinstance(t, torch.Tensor):
+                device = t.device if device is None else device
+                kept += _bytes(t)
+    budget = _BUDGETS.get(device) if device is not None else None
+    if budget is None:
+        return
+    # The kernel may have raised the peak: charge it before the kept bytes grow.
+    _observe(budget, device)
+    budget.live += kept
+    frame.kept.append((device, kept))
+    SAVED_ATTENTION_STATS["kept_bytes"] += kept
+
+
+def _auto_release(frame, measured):
+    # Without a reading first, a later peak reading is charged with fewer kept bytes than it held,
+    # which only overstates the run's own peak: safe, but the replay reads first to stay exact.
+    for device, kept in frame.kept:
+        budget = _BUDGETS[device]
+        if measured:
+            _observe(budget, device)
+        budget.live = max(budget.live - kept, 0)
+    frame.kept.clear()
+    if measured and frame.estimate:
+        for budget in _BUDGETS.values():
+            budget.measured = max(budget.measured, frame.estimate)
+
+
+class SavedAttentionFrame:
+    __slots__ = ("entries", "cursor", "replaying", "offload", "loaded", "auto", "kept", "estimate", "__weakref__")
+
+    def __init__(self, auto = False):
         self.entries = []
         self.cursor = 0
         self.replaying = False
         self.offload = save_attention_offload()
         self.loaded = False
+        self.auto = auto
+        self.kept = []
+        self.estimate = 0
+
+    def __del__(self):
+        try:
+            if self.kept:
+                _auto_release(self, False)
+        except Exception:
+            pass
 
 
 def new_saved_attention_frame(tensors):
-    if not save_attention_enabled():
+    if save_attention_enabled():
+        auto = False
+    elif _AUTO_ACTIVE[0] and _save_attention_setting() == "auto":
+        auto = True
+    else:
         return None
     for t in tensors:
         if isinstance(t, torch.Tensor) and t.requires_grad:
-            return SavedAttentionFrame()
+            return SavedAttentionFrame(auto)
     return None
 
 
@@ -98,6 +257,9 @@ def saved_attention_scope(frame, replay):
     if frame is not None:
         frame.replaying = replay
         frame.cursor = 0
+        if replay and frame.auto:
+            # From here the kept outputs stand in for the ones the replay would allocate anyway.
+            _auto_release(frame, True)
         if frame.offload:
             if replay:
                 _reload_frame(frame)
@@ -374,6 +536,9 @@ def saved_attention_call(function, *tensors):
         # Grad mode here is not the loss forward (block compile's trial run, nested regions).
         if torch.is_grad_enabled():
             return function(*tensors)
+        if frame.auto and not _auto_admit(frame, tensors):
+            frame.entries.append(None)
+            return function(*tensors)
         entry = []
         mode = _StoreMode(entry)
         with torch.enable_grad(), mode:
@@ -387,6 +552,8 @@ def saved_attention_call(function, *tensors):
             if frame.offload:
                 _offload_entry(entry)
             frame.entries.append(("kernel", entry))
+            if frame.auto:
+                _auto_keep(frame, entry)
             SAVED_ATTENTION_STATS["stored"] += len(entry)
         else:
             frame.entries.append(None)
