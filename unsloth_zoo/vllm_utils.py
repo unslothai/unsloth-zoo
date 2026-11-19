@@ -4451,6 +4451,11 @@ def _release_failed_vllm_engine(snapshot):
 pass
 
 
+def _vllm_cascade_attn_needs_disable(vllm_version, major_version):
+    """Never returns a force-on: an explicit False would undo vLLM >= 0.18's disabled default."""
+    return major_version < 9 and Version(str(vllm_version)) < Version("0.11.1")
+
+
 def load_vllm(
     model_name             : str   = "unsloth/Llama-3.2-3B-Instruct-unsloth-bnb-4bit",
     config                 = None,
@@ -5150,21 +5155,12 @@ def load_vllm(
                 }
 
         # [[CRITICAL for RL on policy]]
-        # Check for Cascade Attention which fails on A100 / L40 for vLLM < 0.11.0 versions
-        # Ada Lovelace 8.9 and Ampere 8.0
-        # See https://github.com/vllm-project/flash-attention/pull/87
-        # import vllm.vllm_flash_attn
-        # vllm.vllm_flash_attn.__version__ == 2.7.2.post1
+        # Pre-Hopper cascade attention is wrong until vllm-project/flash-attention#87, first pinned by vLLM 0.11.1.
         if DEVICE_TYPE == "cuda":
             major_version, minor_version = torch.cuda.get_device_capability()
-            if major_version < 9:
-                if Version(vllm_version) >= Version("0.11.0"):
-                    disable_cascade_attn = False
-                else:
-                    # Disable for A100, L40 etc
-                    disable_cascade_attn = True
-                    print("Unsloth: Disabling `disable_cascade_attn` in vLLM to allow for better on policy RL!")
-                engine_args["disable_cascade_attn"] = disable_cascade_attn
+            if _vllm_cascade_attn_needs_disable(vllm_version, major_version):
+                engine_args["disable_cascade_attn"] = True
+                print("Unsloth: Disabling cascade attention in vLLM to allow for better on policy RL!")
 
             # FlashInfer has a bug with block_size=16 and head_dim>=256 on Blackwell (SM100+).
             # https://github.com/flashinfer-ai/flashinfer/issues/1993
