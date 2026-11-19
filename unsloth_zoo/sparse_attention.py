@@ -70,11 +70,9 @@ def _env(name, default):
 
 
 def _exact_ties():
-    """UNSLOTH_QWEN4_EXP_EXACT_TIES=1: rows whose k-th and (k+1)-th block scores tie are recomputed exactly as
-    transformers' indexer does (its matmul and topk over that row's candidates), so the kept tokens are the
-    reference's. Off by default: it needs a host sync per query chunk and one small topk per tied row (L4, medium
-    Qwen at 4k: ~300 tied rows per step, 756 vs 641 ms per step). Without it a tied row may keep a different,
-    equally-scored block (torch.topk's tie order is unspecified); the score multiset is the reference's."""
+    """UNSLOTH_QWEN4_EXP_EXACT_TIES=1 recomputes tied rows as transformers indexer does; off by
+    default (host sync per query chunk, one topk per tied row: L4 medium Qwen 4k 756 vs 641 ms
+    per step); without it a tied row may keep another equally-scored block"""
     return _env("UNSLOTH_QWEN4_EXP_EXACT_TIES", "0") == "1"
 
 _BACKENDS = ("gather", "triton", "flex", "torch")
@@ -305,11 +303,8 @@ def _reference_chunk_rows(q, k):
     return max(1, min(s, _TORCH_CHUNK_ELEMS // max(1, k * d * b)))
 
 
-# Compiled regions run the multi-chunk reference as one opaque op: unrolled into the graph, every chunk was a
-# checkpoint HOP plus its own gather / softmax, and inductor's index simplification under dynamic shapes grew with the
-# chunk count (DeepSeek-V4.1 on T4 has ~85 chunks per layer at 1k tokens), so the first step did not finish.
-# Forward keeps no gathered slab; backward recomputes one chunk at a time, as the eager checkpoints do (an op
-# implementation runs below autograd, so its gradient is written out).
+# Compiled code runs the chunked reference as one opaque op; unrolled, the first step never
+# finished.
 _REF_V = "v1"
 
 
@@ -625,11 +620,9 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, *, backend = None):
 
 
 def sparse_attn_window(q, window_kv, compress_kv, compress_idxs, attn_sink, softmax_scale, window_size, *, backend = None):
-    """Window of this chunk's KV + selected compressed rows; equal to sparse_attn over their concatenation.
-
-    q [b, s, h, d], window_kv [b, s, d] (this chunk, already rotated), compress_kv [b, nc, d],
-    compress_idxs [b, s, k] into compress_kv (-1 = unused, no offset), window_size > 0.
-    """
+    """Equals sparse_attn over this chunk KV plus selected compressed rows (-1 = unused, no offset);
+    q [b,s,h,d], window_kv [b,s,d] already rotated, compress_kv [b,nc,d], compress_idxs [b,s,k],
+    window_size > 0"""
     _check(q, compress_kv, attn_sink, compress_idxs)
     b, s, h, d = q.shape
     if window_kv.dim() != 3 or tuple(window_kv.shape) != (b, s, d):
@@ -637,9 +630,8 @@ def sparse_attn_window(q, window_kv, compress_kv, compress_idxs, attn_sink, soft
     if int(window_size) <= 0:
         raise ValueError(f"sparse_attn_window: window_size must be positive, got {window_size}")
     forced = backend if backend in _BACKENDS + ("hd512",) else _forced_backend(window = True)
-    # Window-only (DeepSeek compress_ratio 0 layers, or no compressed slot): Unsloth's head_dim 512 flash kernel over
-    # the window intervals with the sink applied exactly (L4: 4.8 / 9.9 ms at 4k / 8k vs 9.5 / 19.5 for the window
-    # kernel, half the peak memory).
+    # Window-only (DeepSeek compress_ratio 0 or no compressed slot): head_dim 512 kernel with sink
+    # exact; L4 4.8/9.9 ms at 4k/8k vs 9.5/19.5 ms for window kernel; half the peak memory
     if (compress_idxs.shape[-1] == 0 or compress_kv.shape[1] == 0) and forced in (None, "hd512") and _HAS_TRITON:
         from .sparse_mqa_kernel import window_hd512_attention, window_hd512_supported
         key = ("hd512_window", int(window_size))
@@ -835,11 +827,8 @@ def _qsa_geometry(attention_mask, ratio):
 
 
 def _repair_boundary_ties(out, b, t0, scores, valid, k, q_rows, block_keys, starts, arange_r, top_blocks, ratio, dim):
-    """torch.topk leaves the order of equal scores unspecified (relu makes exact-zero block scores common), so a
-    query whose k-th and (k+1)-th best blocks tie (or nearly tie: the batched scores can differ from the
-    reference's in the last bits) is recomputed exactly as transformers' indexer does it: the same matmul over this
-    query's candidate blocks only, then the same topk call, so the kept tokens are the reference's. One host sync
-    per query chunk; a loop over the tied rows only."""
+    """torch.topk tie order is unspecified; queries whose k-th and (k+1)-th blocks tie or nearly tie
+    (batched scores differ in last bits) are recomputed as the transformers indexer does."""
     best = scores.topk(k + 1, dim = -1).values
     kth, nxt = best[:, k - 1], best[:, k]
     tied = torch.isfinite(nxt) & ((kth - nxt).abs() <= 1e-5 * kth.abs().clamp(min = 1.0))
@@ -859,17 +848,9 @@ def _repair_boundary_ties(out, b, t0, scores, valid, k, q_rows, block_keys, star
 @torch.compiler.disable
 def qsa_select_tokens(indexer, hidden_states, position_embeddings, attention_mask, apply_rotary_pos_emb,
                       query_chunk = 2048, past_key_values = None, exact_ties = None):
-    """Vectorised transformers Qwen4ExpTextQSAIndexer selection (no cache): [b, s, K] token indices, -1 padded,
-    the set the reference's per-query loop keeps (at a k-th / (k+1)-th score tie possibly another equally-scored
-    block, unless UNSLOTH_QWEN4_EXP_EXACT_TIES=1); None when the mask is not interval-shaped.
-
-    Per query: its visible keys split into compress_ratio blocks from its first visible key; complete blocks are
-    mean-pooled (fp32), k_layernorm-ed and rotated at their first token; scored by sum over index heads of
-    relu(q . k) / sqrt(d); the top budget // ratio blocks plus the incomplete tail are kept.
-    `past_key_values` (an empty cache: prefill) receives the raw index keys as the reference indexer stores them,
-    only once the mask was accepted, so a None return never leaves the cache updated.
-    `exact_ties` overrides UNSLOTH_QWEN4_EXP_EXACT_TIES (None reads it).
-    """
+    """Returns [b, s, K] token indices, -1 padded; None if the mask is not interval-shaped (cache
+    untouched); UNSLOTH_QWEN4_EXP_EXACT_TIES=1 keeps the reference tie set, else a k-th tie may
+    keep another equal block."""
     batch, seq, _ = hidden_states.shape
     ratio, top_blocks, dim = indexer.compress_ratio, indexer.block_topk, indexer.index_head_dim
     if (not isinstance(attention_mask, torch.Tensor) or attention_mask.dim() != 4 or attention_mask.shape[1] != 1

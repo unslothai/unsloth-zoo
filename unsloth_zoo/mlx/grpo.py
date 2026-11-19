@@ -211,9 +211,8 @@ def group_advantages(rewards_per_func, reward_weights, num_generations, scale_re
 
 
 def scalerl_sample_weights(rewards, num_generations, lengths, exclude, prompt_level):
-    """Unsloth's ScaleRL per-completion loss weights for one generation, and the fraction of groups excluded: zero-variance
-    exclusion drops groups of equal rewards from the loss and its token count; prompt-level aggregation averages tokens
-    within each group, then over groups."""
+    """ScaleRL per-completion loss weights; zero-variance groups dropped from loss and token count;
+    prompt-level aggregation averages tokens within each group, then over groups."""
     groups = rewards.reshape(-1, num_generations)
     keep = ~np.isclose(groups.std(axis=1, ddof=1), 0.0) if exclude else np.ones(len(groups), dtype=bool)
     rows = np.repeat(keep, num_generations).astype(np.float64)
@@ -705,10 +704,9 @@ def _kv_element_bytes(model):
 
 
 def _cache_bytes_per_row(model, tokens):
-    """Bytes a row's cache may hold at ``tokens`` tokens: every layer's K and V for every token, or more where the
-    caches the language model makes hold more (a linear-attention state, layers wider than ``head_dim``); a rotating
-    cache counts its window at most. mlx-lm grows K/V in 256-position blocks, so tokens round up to one. None when
-    the text config does not say."""
+    """Cache bytes per row at tokens: every layer K and V for every token, more for linear-attention
+    state or layers wider than head_dim; rotating cache counts its window; 256-position blocks
+    round up; None if config lacks it."""
     tokens = -(-int(tokens) // 256) * 256
     config = getattr(model, "args", None) or getattr(model, "config", None)
     config = _config_get(config, "text_config", None) or config
@@ -1004,9 +1002,8 @@ class GRPOBatchPlan:
         return _vlm_batch_family(inputs, symbolic_axes=axes if padable else None), padable, forbidden
 
     def ensure_descriptors(self):
-        """Survey every entry's vision family for a compiled run, one processor call per micro-step at a prompt-only
-        placeholder width over the seeded rows, which layouts later exchange only for rows with matching images.
-        False when a family cannot be planned."""
+        """Survey every entry vision family for a compiled run (one processor call per micro-step at
+        prompt-only placeholder width); False when a family cannot be planned."""
         if self._families is not None:
             return True
         # An engaged shared prompt lays out whole groups per micro-step, which the surveyed families do not plan.
@@ -1602,14 +1599,9 @@ def create_grpo_batch_plan(
     first_pass_old_logps=False,
     rollout_logprobs_as_old=False,
 ):
-    """Encode prompts once and lay out TRL's RepeatSampler schedule; batch_size counts completions, a generation samples
-    batch_size * steps_per_generation of them, num_generations per prompt; score_temperature defaults to the sampling
-    temperature; a VLM processor replaces tokenizer; within each optimizer step group_by_length sorts rows by length and
-    skip_zero_advantage puts zero-advantage rows last; sample_weighting is grpo_sample_weighting's; prefix_grouping
-    (grpo_prefix_grouping's) lays out whole groups per micro-batch and runs each shared prompt once;
-    first_pass_old_logps leaves micro-steps that train before their generation's first update unscored, for a caller
-    that hands their own log-probs back (keep_old_logps); rollout_logprobs_as_old takes old log-probs from
-    tokenizer-only rollouts sampled unfiltered at the scoring temperature instead of a forward."""
+    """Encode prompts once; TRL RepeatSampler schedule; batch_size counts completions;
+    group_by_length sorts rows by length within each optimizer step; skip_zero_advantage puts
+    zero-advantage rows last; VLM processor replaces tokenizer."""
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
     prompt_ids, max_tokens, vision, signatures = _encode_grpo_prompts(
@@ -1928,8 +1920,7 @@ def grpo_sample_weighting(config):
 
 
 def _resolve_scalerl_options(config):
-    """CUDA Unsloth's ScaleRL environment variables are the fields' defaults; the GRPO flags it reads for vLLM rollouts
-    have no MLX counterpart."""
+    """ScaleRL env vars are the field defaults; vLLM-only GRPO flags have no MLX counterpart."""
     if config.zero_variance_exclude is None:
         config.zero_variance_exclude = os.environ.get("UNSLOTH_GRPO_ZERO_VARIANCE_EXCLUDE", "0") == "1"
         if config.zero_variance_exclude:

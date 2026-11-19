@@ -6720,9 +6720,8 @@ def _lora_is_sharded(model):
         from torch.distributed.tensor import DTensor
     except Exception:
         return False
-    # Any adapter decides: one left out of FSDP2 (ignored_params) stays a plain tensor beside sharded ones.
-    # The adapter slots are found once (FSDP2 puts the DTensor in the same slot), so an unsharded DDP
-    # run does not walk every parameter on each load_lora.
+    # Any adapter decides: one left out of FSDP2 (ignored_params) stays plain; slots are cached
+    # once.
     if not isinstance(model, torch.nn.Module):
         return any(isinstance(p, DTensor) for n, p in model.named_parameters() if ".lora_A." in n or ".lora_B." in n)
     slots = model.__dict__.get("_unsloth_lora_slots")

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Shared switches and engagement counters for the sparse-attention fast paths
-(DeepSeek-V3.2 / GLM-MoE-DSA / MiniMax-M3 / DeepSeek-V4 / GLM-5.3-Flash)."""
+"""Shared switches and engagement counters for the sparse-attention fast paths."""
 
 import os
 
@@ -74,13 +73,9 @@ def reset_sparse_attn_stats():
 
 
 def additive_bias_present(mask, visible, kind = None):
-    """Whether an additive float mask holds finite nonzero entries (not just 0 / masked), which flex adds
-    through a score_mod (5-15% slower). Eager this is a host sync. Under CUDA graph capture a sync invalidates
-    the capture, and flipping the answer would need a kernel compiled during capture, so the eager warm-up's
-    answer for the same caller kind and shape is reused (each kind has its own compiled kernels): a bias in
-    any warm-up call of that kind and shape keeps the bias; with none,
-    no bias is asserted on device at every replay (a finite bias raises instead of being dropped); a shape
-    never run eagerly keeps the bias."""
+    """Eager is a host sync; under CUDA graph capture reuse the warm-up answer per kind and shape: a
+    bias in any warm-up call keeps the bias; with none, a device assert raises on any finite
+    bias; unseen shapes keep the bias."""
     key = (kind, mask.device, mask.dtype, tuple(mask.shape))
     if mask.is_cuda and torch.cuda.is_current_stream_capturing():
         if _BIAS_SEEN.get(key) is False:

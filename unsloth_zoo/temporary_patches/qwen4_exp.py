@@ -14,14 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Qwen4Exp (Qwen3.8-Flash-Next) patches: MoE uses the Qwen3.5-MoE grouped-GEMM backend; QSA indexer skips its per-query
-nonzero/topk loop when kv_length < budget + compress_ratio; UNSLOTH_QWEN4_EXP_FAST_QSA=0 disables. From the budget up
-(training / prefill without a cache), QSA attention selects its blocks vectorised and attends to the selected tokens
-only (``unsloth_zoo.sparse_attention``), instead of a per-query Python loop plus an O(S^2) masked dense attention;
-UNSLOTH_QWEN4_EXP_SPARSE_ATTN=0 disables. Where that path has no kernel (T4 / sm75, CPU) the dense reference
-attention stays, but its indexer builds the selection mask vectorised too (UNSLOTH_QWEN4_EXP_VECTORISED_QSA=0
-keeps transformers' per-query loop). The ~102 GB PLE n-gram table is streamed from the checkpoint by
-``unsloth_zoo.frozen_table_store`` unless UNSLOTH_FROZEN_TABLE=gpu."""
+"""Qwen4Exp: grouped-GEMM MoE; QSA fast path (UNSLOTH_QWEN4_EXP_FAST_QSA=0 disables); sparse
+attention (UNSLOTH_QWEN4_EXP_SPARSE_ATTN=0 disables); UNSLOTH_QWEN4_EXP_VECTORISED_QSA=0 keeps
+the per-query loop; ~102 GB PLE table streamed unless UNSLOTH_FROZEN_TABLE=gpu"""
 
 __all__ = ["patch_qwen4_exp", "patch_qwen4_exp_frozen_table"]
 
@@ -119,12 +114,9 @@ def _qwen4_exp_vectorised_indexer_mask(indexer, hidden_states, position_embeddin
 
 def qwen4_exp_qsa_indexer_forward_guarded(self, hidden_states, position_embeddings, attention_mask,
                                           past_key_values=None):
-    """transformers' indexer on the filled cache slots only; installed alone under UNSLOTH_QWEN4_EXP_FAST_QSA=0.
-
-    The reference reads the position table by kv slot, which has one row per token seen so far. A static cache's
-    mask spans max_cache_len, and a query row that attends to nothing (a left pad) is given every slot by Unsloth's
-    sdpa_mask fix, unfilled ones included: the reference then indexes past the table (a CUDA device assert in
-    batched generate). Real tokens never see an unfilled slot, so hiding them changes no row that is read."""
+    """Indexer on filled cache slots only (installed alone under UNSLOTH_QWEN4_EXP_FAST_QSA=0);
+    unfilled static-cache slots would index past the position table (CUDA assert in batched
+    generate)"""
     # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
     if attention_mask is not None and attention_mask.dim() == 4:
         n_positions = position_embeddings[0].shape[-2]
@@ -508,9 +500,8 @@ def qwen4_exp_attention_forward(self, hidden_states, position_embeddings, attent
             return out
     if not torch.compiler.is_compiling():
         QWEN4_EXP_SPARSE_STATS["reference"] += 1
-    # fp32 RoPE tables with half-precision projections (4-bit) would promote Q / K but not V after RoPE. The
-    # compiler's rewrites (RoPE tables cast to the activation dtype, V aligned to Q) never reach this reference,
-    # since the class forward it rewrites is this wrapper; cast the tables like its RoPE rewrite does.
+    # fp32 RoPE tables with half-precision projections (4-bit) promote Q/K but not V after RoPE;
+    # compiler rewrites skip this wrapper, so cast tables to the activation dtype here
     if (
         hidden_states.dtype in (torch.float16, torch.bfloat16)
         and isinstance(position_embeddings, (tuple, list))

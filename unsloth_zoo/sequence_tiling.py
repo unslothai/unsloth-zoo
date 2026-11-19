@@ -51,9 +51,8 @@ pass
 
 
 def _checkpoint(fn, args, preserve_rng_state):
-    # Inductor's min-cut partitioner on torch 2.14+ fails on a checkpointed one-row tile, static or dynamic
-    # ("Node ... was invalid, but is output"; 2.13 is fine). x is [1, t, H] or [t, H], so this is t <= 1:
-    # tiny activations, so keep the owned copy but skip the checkpoint.
+    # Inductor min-cut partitioner fails on checkpointed one-row tiles (torch 2.14+); skip
+    # checkpoint.
     if _is_compiling() and args[0].numel() <= args[0].shape[-1]:
         return _owned(fn, *args)
     body = functools.partial(_owned, fn)
@@ -330,11 +329,9 @@ _ENV_COMPILE = "UNSLOTH_TILED_COMPILE"
 
 
 def _outside_graph_mode():
-    """"unroll", "op", "compile_tile" or "break" (UNSLOTH_TILED_COMPILE forces one). Unrolling costs ~1.1 s compile per
-    tile and lets Inductor overlap the tiles' recomputes (most of the saving is lost), so Unsloth's blocks use "op":
-    the tile loop as one opaque graph node (registry modules that qualify; others fall back to "compile_tile", one
-    fullgraph compiled frame per tile outside the block graph, else eager). A user's compile may be fullgraph=True, so
-    it unrolls."""
+    """Modes: unroll, op, compile_tile, break (UNSLOTH_TILED_COMPILE forces one); unrolling costs
+    ~1.1 s compile per tile and loses most of the overlap, so blocks use op (tile loop as one
+    opaque node); a user compile with fullgraph=True unrolls."""
     mode = os.environ.get(_ENV_COMPILE, "auto").strip().lower()
     if mode in ("unroll", "op", "compile_tile", "break"):
         return mode

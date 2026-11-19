@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""GLM-5.3-Flash (glm5_next) pooled DSA: exact skip, chunked indexer, opt-in flex BlockMask.
-
-Flex reads the patched indexer's fixed layout (index_topk pool slots, -1 padded, then the tail), so it
-engages only on patched indices. Opt-in (UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT=1): ~5x slower than dense on A100."""
+"""Opt-in flex BlockMask for GLM-5.3-Flash (UNSLOTH_SPARSE_ATTN_FLEX_GLM5_NEXT=1), engages only on
+patched indexer layout; ~5x slower than dense on A100"""
 
 __all__ = ["patch_glm5_next_sparse"]
 

@@ -163,9 +163,8 @@ _GRAPH_DECODE_DEFAULT = {}
 
 
 def _gpt_oss_default_graph_decode_attention():
-    """"auto" on compute capability 8.0 and newer, where graphed flex_decoding measured as fast as the dense
-    one-token attention or faster (A100: 1.02x at 1k context, 1.23x at 16k); "dense" on older GPUs (T4), where it
-    was slower at batch 4 and 8."""
+    """auto (flex decoding) on compute capability 8.0+: A100 1.02x at 1k context, 1.23x at 16k vs
+    dense; dense on older GPUs (T4), where flex was slower at batch 4 and 8"""
     if not torch.cuda.is_available():
         return "dense"
     device = torch.cuda.current_device()
@@ -180,10 +179,9 @@ def _gpt_oss_default_graph_decode_attention():
 
 
 def _gpt_oss_graph_decode_attention():
-    """One-token attention inside a generate() call Unsloth decodes through CUDA graphs:
-    "dense" runs the sink attention over a dense mask, "flex" keeps flex_decoding on a BlockMask whose tensors the
-    graph refills, "auto" flex with the dense fallback (UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION, read per call;
-    unset: _gpt_oss_default_graph_decode_attention)."""
+    """UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION (read per call; unset uses default): dense runs sink
+    attention on dense mask; flex keeps flex_decoding on BlockMask refilled by graph; auto is
+    flex with dense fallback"""
     mode = os.environ.get("UNSLOTH_GPT_OSS_GRAPH_DECODE_ATTENTION", "").strip().lower()
     if not mode:
         return _gpt_oss_default_graph_decode_attention()
@@ -196,9 +194,7 @@ def _gpt_oss_in_graph_generate():
 
 
 def _gpt_oss_dense_graph_decode(inputs_embeds):
-    """A one-token step of a graph-planned generate() with dense decode attention: its masks are built dense.
-    A full sliding window rolls by one slot per step and moves the mask offset, which a dense mask of fixed shape
-    carries as values while a BlockMask closure would bake it in."""
+    """Dense masks carry a rolling sliding window's offset as values; BlockMask closures bake it in."""
     return (
         isinstance(inputs_embeds, torch.Tensor) and inputs_embeds.dim() >= 2 and inputs_embeds.shape[1] == 1
         and _gpt_oss_in_graph_generate() and _gpt_oss_graph_decode_attention() == "dense"
@@ -240,9 +236,8 @@ def _gpt_oss_decode_attention(module, query, key, value, attention_mask, scaling
     weights = torch.matmul(q, key.transpose(2, 3), out = logits[..., :kv_len])
     weights *= scaling
     if attention_mask is not None:
-        # [B or 1, 1, 1, L] (one row per sequence, every head) or [B or 1, H, 1, L] (per head, grouped as the
-        # logits are: head h = kv head h // groups, row h % groups).
-        # Shared vs per head from the mask itself: with one KV head a per-head mask still has `groups` rows.
+        # Mask is [B or 1, 1, 1, L] shared or [B or 1, H, 1, L] per head (kv head = h div groups,
+        # row h % groups); with one KV head a per-head mask still has groups rows
         if attention_mask.shape[1] == 1:
             weights += attention_mask.reshape(attention_mask.shape[0], 1, 1, kv_len)
         else:
@@ -294,11 +289,9 @@ def _code_digest(code):
 
 
 def _mask_function_identity(fn, depth = 4):
-    """A flat tuple naming what mask_function computes: every function's code (nested through its closure and
-    defaults) and every scalar it captures. None when it captures anything else (a tensor, a dict, an object, a
-    functools.partial): such a mask cannot be rebuilt over refilled graph buffers, nor told apart by a graph key.
-    Published on the BlockMask, so a graph captured for one mask is never replayed for another (a different window
-    or a different mask_function under the same outer mask_mod)."""
+    """Flat key naming mask_function code and scalar captures; None if it captures a tensor, dict,
+    object or functools.partial (cannot rebuild or key it); published on BlockMask so a graph is
+    never replayed for another mask"""
     out = []
 
     def walk(f, depth):
@@ -315,10 +308,8 @@ def _mask_function_identity(fn, depth = 4):
                 values.append(None)
         values.extend(getattr(f, "__defaults__", None) or ())
         values.extend((getattr(f, "__kwdefaults__", None) or {}).values())
-        # Module-level names the code reads: a scalar is named by its value, a function walked, builtins are code.
-        # A module or class is code too, but its attributes are state the mask can read (settings.WINDOW,
-        # Config.WINDOW): each other name the code loads is looked up on it and keyed the same way.
-        # Anything else (a tensor, a dict, an object) cannot be keyed.
+        # Globals: scalars keyed by value, functions walked, module/class attributes read; else
+        # unkeyable.
         module_globals = getattr(f, "__globals__", None) or {}
         for name in code.co_names:
             if name not in module_globals:

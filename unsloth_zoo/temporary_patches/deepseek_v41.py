@@ -60,9 +60,7 @@ __all__ = [
 
 
 def _modeling():
-    """transformers' deepseek_v41 when it ships one, else Unsloth's native implementation
-    (unsloth/models/deepseek_v41/modeling.py) once loading a deepseek_v41 config imported it. Never imports
-    unsloth from here."""
+    """transformers' deepseek_v41 if present, else native module Unsloth loaded; never imports unsloth."""
     try:
         if importlib.util.find_spec("transformers.models.deepseek_v41") is not None:
             from transformers.models.deepseek_v41 import modeling_deepseek_v41
@@ -88,15 +86,9 @@ REPLAY_STATS = {"runs": 0, "compressor_lora": 0}
 
 
 def prepare_compiled_checkpoint():
-    """Let the checkpointed decoder layers run torch.compile'd helpers. Returns True when it applied.
-
-    The layers always checkpoint non-reentrant (see `patch_deepseek_v41_gradient_checkpointing`), which checks that
-    the recompute saves the same tensors as the forward. With unspecialized floats (torch's default), a compiled region
-    holding a LoRA forward lifts `scaling` to a 0-dim CPU tensor input, and the recompute saved it and `lora_B` in the
-    opposite order from the forward ("Recomputed values ... have different metadata"). Specialized floats bake the
-    per-adapter constants in, one graph per region in both passes. Set once at load, before anything compiles: Dynamo
-    guards its config, so toggling it per call would recompile.
-    """
+    """Set specialize_float so checkpoint recompute saves the same tensors as forward (unspecialized
+    floats reorder LoRA saves); set once at load before anything compiles, since Dynamo guards
+    config and per-call toggling recompiles"""
     dynamo_config = getattr(getattr(torch, "_dynamo", None), "config", None)
     if dynamo_config is None or not hasattr(dynamo_config, "specialize_float"):
         return False
@@ -284,13 +276,9 @@ pass
 TEMPORARY_PATCHES.append(patch_deepseek_v41_fake_quant_ste)
 
 
-# 3. LoRA on the grouped output projection (fallback when unsloth's own grouped LoRA is not registered: plain PEFT,
-#    the CPU loader). `o_a_proj` is a DeepseekV41GroupedLinear: an nn.Linear subclass whose
-#    weight [G * out_g, in_g] holds G independent blocks, applied to x [..., G, in_g] -> [..., G, out_g]. PEFT wraps it
-#    as a plain lora.Linear, whose B(A(x)) is [..., G, G * out_g] and cannot be added to the base output. The grouped
-#    LoRA keeps PEFT's A [r, in_g] / B [G * out_g, r] (so delta_weight = B @ A has the base weight's shape and
-#    merge / unmerge / save are unchanged) and applies group g's rows of B to group g's input, which is exactly what
-#    the merged weight computes.
+# Grouped LoRA for o_a_proj (when unsloth grouped LoRA is not registered): A [r,in_g], B
+# [G*out_g,r], delta=B@A keeps base shape; group g rows of B act on group g input; plain PEFT
+# B(A(x)) is [..,G,G*out_g], cannot add
 _GROUPED_LORA_CLS = None
 
 
@@ -461,12 +449,9 @@ pass
 TEMPORARY_PATCHES.append(patch_deepseek_v41_config_aliases)
 
 
-# 5. LoRA on the pooled (ratio > 1) compressor. That branch computes in fp32 as
-#    `F.linear(hidden_states.float(), self.kv_proj.weight.float())` (same for gate_proj): it reads the weight, never
-#    calls the module, so an adapter on compressor.kv_proj / gate_proj is skipped and gets no gradient. During the
-#    layer call the two modules are swapped for views whose `.weight` is the differentiable merged weight
-#    W + scaling * B @ A (fp32), which is exactly the adapted projection (LoRA dropout is not applied there). The swap is
-#    done from the decoder layer, because the compiled cache replaces the compressor and attention classes.
+# Pooled (ratio > 1) compressor reads .weight, so LoRA on kv_proj/gate_proj is skipped; the decoder
+# layer swaps in merged W + scaling*B@A views (fp32, no LoRA dropout), since the compiled cache
+# replaces the compressor and attention classes
 class _MergedLoraWeight:
     __slots__ = ("module",)
 
