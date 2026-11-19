@@ -134,6 +134,93 @@ def test_save_lora_and_load_lora_tensors_gather_fsdp2_shards(tmp_path, layout):
         assert res["sharded"] is True and res["merged_rollout"] is True, res
 
 
+_PACK_WORKER = """
+import json, os, sys
+import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard
+out_dir = sys.argv[1]
+reshard = sys.argv[2] == "reshard"
+dist.init_process_group("gloo")
+rank = dist.get_rank()
+import unsloth_zoo.vllm_utils as vu
+PACKS = [0]
+
+class Frozen4bit(torch.nn.Linear):
+    # Stand-in for a bnb Linear4bit: its state_dict packs a QuantState with .item(), a host sync on GPU.
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        PACKS[0] += 1
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+
+class Lora(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.base_layer = Frozen4bit(8, 8, bias = False)
+        self.base_layer.weight.requires_grad_(False)
+        self.lora_A = torch.nn.ModuleDict({"default": torch.nn.Linear(8, 4, bias = False)})
+        self.lora_B = torch.nn.ModuleDict({"default": torch.nn.Linear(4, 8, bias = False)})
+    def forward(self, x):
+        return self.base_layer(x) + self.lora_B["default"](self.lora_A["default"](x))
+
+class Model(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([Lora(), Lora(), Lora()])
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+torch.manual_seed(0)
+model = Model()
+full = {k: v.detach().clone() for k, v in model.state_dict().items() if ".lora_" in k}
+mesh = init_device_mesh("cpu", (2,))
+ignored = {l.base_layer.weight for l in model.layers}
+for layer in model.layers:
+    fully_shard(layer, mesh = mesh, reshard_after_forward = reshard, ignored_params = ignored)
+fully_shard(model, mesh = mesh, reshard_after_forward = reshard, ignored_params = ignored)
+# As in GRPO, the first load_lora (which caches the sharded answer) runs before any forward.
+res = {"sharded_first": vu._lora_is_sharded(model)}
+# Without resharding after forward, the adapters are left unsharded until a hook reshards them.
+with torch.no_grad():
+    model(torch.randn(2, 8))
+PACKS[0] = 0
+with torch.inference_mode():
+    gathered = vu._lora_state_dict(model)
+res["packs_during_gather"] = PACKS[0]
+res["gather_equal"] = sorted(gathered) == sorted(full) and all(
+    type(v) is torch.Tensor and torch.equal(v, full[k]) for k, v in gathered.items())
+res["sharded_after"] = all(
+    type(p).__name__ == "DTensor" for n, p in model.named_parameters() if ".lora_" in n)
+# A training step after the gather still works (the gather left FSDP2 in a usable state).
+loss = model(torch.randn(2, 8)).square().sum()
+loss.backward()
+res["grads"] = all(p.grad is not None for n, p in model.named_parameters() if ".lora_" in n)
+json.dump(res, open(os.path.join(out_dir, "rank%d.json" % rank), "w"))
+dist.destroy_process_group()
+"""
+
+
+@pytest.mark.skipif(not _fully_shard_takes_ignored_params(), reason = "needs fully_shard(ignored_params) (torch >= 2.7)")
+@pytest.mark.parametrize("reshard", ["reshard", "no_reshard"])
+def test_fsdp2_gather_reads_only_the_adapter_subtrees(tmp_path, reshard):
+    """load_lora under FSDP2 must not run every frozen layer's state_dict: for QLoRA each bnb Linear4bit
+    packs its QuantState there, one host sync per 4-bit layer per rollout."""
+    script = tmp_path / "pack_worker.py"
+    script.write_text(textwrap.dedent(_PACK_WORKER))
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_ALLOW_CPU = "1",
+               PYTHONPATH = os.pathsep.join([str(_ROOT), os.environ.get("PYTHONPATH", "")]))
+    cmd = [sys.executable, "-m", "torch.distributed.run", "--nnodes", "1", "--nproc-per-node", "2",
+           "--master-addr", "127.0.0.1", "--master-port", str(_free_port()), str(script), str(tmp_path), reshard]
+    r = subprocess.run(cmd, env = env, capture_output = True, text = True, timeout = 300, cwd = tmp_path)
+    assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-3000:]
+    for rank in range(2):
+        res = json.loads((tmp_path / f"rank{rank}.json").read_text())
+        assert res["sharded_first"] and res["gather_equal"] and res["sharded_after"] and res["grads"], res
+        assert res["packs_during_gather"] == 0, res
+
+
 _SCAN_WORKER = """
 import json, os, sys
 import torch
