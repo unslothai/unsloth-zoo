@@ -25,6 +25,7 @@ __all__ = [
     "delete_vllm",
     "save_lora",
     "load_lora",
+    "vllm_rollout_scope",
     "generate_batches",
     "convert_lora_modules",
     "return_lora_modules",
@@ -7225,18 +7226,96 @@ def _merged_rollout_lora_fallback(request, reason):
 pass
 
 
-def _merged_rollout_rest_request(request):
+def _merged_rollout_rest_request(request, scope = None):
     """vLLM LoRA for the layers not folded (attention mode), or None when everything is folded."""
     # All Unsloth Zoo code licensed under LGPLv3
     global LORA_REQUEST_ID
     state = request.state
     if not state.rest: return None
+    key = ("rest", id(state), request.save_directory)
+    if scope is not None and key in scope.requests: return scope.requests[key]
     model = state.model_ref()
     if model is None:
         raise RuntimeError("Unsloth: the model behind this merged-rollout LoRA request was freed.")
     if LORA_REQUEST_ID is None: LORA_REQUEST_ID = 1
     with torch.inference_mode():
-        return _build_lora_request(model, request.save_directory, True, LORA_REQUEST_ID, exclude = state.folded)
+        rest = _build_lora_request(model, request.save_directory, True, LORA_REQUEST_ID, exclude = state.folded)
+    if scope is not None: scope.requests[key] = rest
+    return rest
+pass
+
+
+class _RolloutScope:
+    """An open vllm_rollout_scope on one engine: the fold it holds and the vLLM LoRA requests it reuses."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    __slots__ = ("depth", "hold", "state", "requests")
+
+    def __init__(self):
+        self.depth = 0
+        self.hold = None      # ExitStack keeping merged_rollout(state) entered until the scope closes
+        self.state = None     # the _MergedRolloutState that hold folded
+        self.requests = {}    # LoRA requests built inside the scope, reused by every later call
+pass
+
+
+def _rollout_scope(llm):
+    # All Unsloth Zoo code licensed under LGPLv3
+    scope = getattr(llm, "_unsloth_rollout_scope", None) if llm is not None else None
+    return scope if isinstance(scope, _RolloutScope) else None
+pass
+
+
+def _rollout_scope_idle_hold(scope):
+    """The scope holds a fold and no call is running under it (chat -> generate nests a plain generate)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    return scope is not None and scope.hold is not None and scope.state.depth <= 1
+pass
+
+
+def _rollout_scope_release(llm, scope):
+    """Restore the fold a scope holds, then drop the KV that the folded weights wrote under base hashes."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    hold, scope.hold, scope.state = scope.hold, None, None
+    if hold is None: return
+    try:
+        hold.close()
+    finally:
+        if not _reset_merged_rollout_prefix_cache(llm):
+            llm._unsloth_merged_rollout_dirty = True
+            _merged_rollout_log_once(
+                "Unsloth: vLLM did not reset its prefix cache after a merged rollout. The base weights "
+                "are restored; every later call resets it first and refuses to run if that fails."
+            )
+pass
+
+
+@contextlib.contextmanager
+def vllm_rollout_scope(llm):
+    """Share one adapter fold and one vLLM LoRA request across every generate / chat call made inside, e.g. the
+    turns of one tool-calling rollout, whose weights do not change between calls. Per call, a merged-weight rollout
+    resets the prefix cache, folds, restores and resets again, and vLLM LoRA sends a new adapter name, so no turn
+    can reuse the KV of the turns before it. Inside the scope the first call folds (or builds the request) and the
+    restore plus reset run once at exit. Re-entrant. Nothing may run the training model or step the optimizer
+    inside: its base weights hold the folded adapter until the scope closes."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if llm is None:
+        yield
+        return
+    with _MERGED_ROLLOUT_LOCK:
+        scope = _rollout_scope(llm)
+        if scope is None:
+            scope = _RolloutScope()
+            llm._unsloth_rollout_scope = scope
+        scope.depth += 1
+    try:
+        yield
+    finally:
+        with _MERGED_ROLLOUT_LOCK:
+            scope.depth -= 1
+            if scope.depth == 0:
+                if _rollout_scope(llm) is scope: llm._unsloth_rollout_scope = None
+                scope.requests.clear()
+                _rollout_scope_release(llm, scope)
 pass
 
 
@@ -7246,8 +7325,11 @@ def _merged_rollout_call(request, llm, call, cache_was_reset = False):
     if state.engine_ref() is not llm:
         # Folding here would change another engine's weights and sample this one's base.
         return call(_merged_rollout_lora_fallback(request, "the request was passed to a different vLLM engine"))
+    scope = _rollout_scope(llm)
+    if _rollout_scope_idle_hold(scope) and scope.state is not state:
+        _rollout_scope_release(llm, scope)
     if state.depth != 0:
-        with merged_rollout(state): return call(_merged_rollout_rest_request(request))
+        with merged_rollout(state): return call(_merged_rollout_rest_request(request, scope))
     model = state.model_ref()
     if state.poisoned is None and (model is None or not state.is_valid_for(model)):
         # Adapter or base changed while held: rebuild, never fold a stale P.
@@ -7262,7 +7344,13 @@ def _merged_rollout_call(request, llm, call, cache_was_reset = False):
     if not cache_was_reset and not _reset_merged_rollout_prefix_cache(llm):
         return call(_merged_rollout_lora_fallback(request, "vLLM did not reset its prefix cache before the fold"))
     llm._unsloth_merged_rollout_last = weakref.ref(state)
-    rest_request = _merged_rollout_rest_request(request)
+    rest_request = _merged_rollout_rest_request(request, scope)
+    if scope is not None:
+        # Fold once for the whole scope: its exit restores and resets the prefix cache.
+        hold = contextlib.ExitStack()
+        hold.enter_context(merged_rollout(state))
+        scope.hold, scope.state = hold, state
+        with merged_rollout(state): return call(rest_request)
     try:
         with merged_rollout(state): return call(rest_request)
     finally:
@@ -7309,6 +7397,9 @@ def _wrap_merged_rollout_call(bound, llm):
             if not _merged_rollout_has_sentinel(request):
                 position = next((i for i, x in enumerate(args) if _merged_rollout_has_sentinel(x)), None)
                 if position is None:
+                    # A base-model call inside a scope must not read the weights the scope holds folded.
+                    scope = _rollout_scope(llm)
+                    if _rollout_scope_idle_hold(scope): _rollout_scope_release(llm, scope)
                     last = getattr(llm, "_unsloth_merged_rollout_last", lambda: None)()
                     if last is not None: _merged_rollout_wait_restore(last)
                     return bound(*args, **kwargs)
@@ -7369,7 +7460,13 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
 
     state = prepare_merged_rollout(model) if load_tensors else None
     if state is not None: return _MergedLoRARequest(state, save_directory)
-    return _build_lora_request(model, save_directory, load_tensors, lora_request_id)
+    scope = _rollout_scope(getattr(model, "vllm_engine", None)) if load_tensors else None
+    if scope is None: return _build_lora_request(model, save_directory, load_tensors, lora_request_id)
+    # Same adapter for the whole scope: one name, so vLLM's prefix cache carries over between its calls.
+    key = ("lora", id(model), save_directory)
+    if key not in scope.requests:
+        scope.requests[key] = _build_lora_request(model, save_directory, load_tensors, lora_request_id)
+    return scope.requests[key]
 pass
 
 

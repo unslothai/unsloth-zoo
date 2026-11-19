@@ -1545,3 +1545,118 @@ def test_cuda_automatic_default_engages_exact_fold_and_kill_switch_stops_it(monk
     assert not _folded(before, llm.calls[-1][2])
     _assert_bitwise(before, vllm_model)
     vllm_utils._merged_rollout_auto_platform.cache_clear()
+
+
+# vllm_rollout_scope: one fold / one LoRA request for every call of a multi-turn rollout.
+def _turns(llm, model, n = 3):
+    for _ in range(n):
+        llm.generate(["turn"], lora_request = load_lora(model, _ADAPTER_DIR, load_tensors = True))
+
+
+def test_rollout_scope_folds_once_and_resets_twice_over_three_turns():
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    folds = vllm_utils._MERGED_ROLLOUT_STATS["folds"]
+    _turns(llm, model)
+    assert vllm_utils._MERGED_ROLLOUT_STATS["folds"] - folds == 3 and len(llm.resets) == 6
+    per_call = [c[2] for c in llm.calls]
+    llm.calls.clear(); llm.resets.clear()
+
+    folds = vllm_utils._MERGED_ROLLOUT_STATS["folds"]
+    with vllm_utils.vllm_rollout_scope(llm):
+        _turns(llm, model)
+        # Held between turns: the training base still carries the fold until the scope closes.
+        assert any(not torch.equal(a, b) for a, b in zip(before, vllm_model.parameters()))
+    assert vllm_utils._MERGED_ROLLOUT_STATS["folds"] - folds == 1
+    assert len(llm.resets) == 2
+    assert all(torch.equal(a, b) for a, b in zip(before, llm.resets[0]))   # before the fold
+    assert all(torch.equal(a, b) for a, b in zip(before, llm.resets[1]))   # after the restore
+    # Every turn sampled the same folded weights as the per-call path, bit for bit.
+    for (_, req, seen), ref in zip(llm.calls, per_call):
+        assert req is None
+        assert all(torch.equal(a, b) for a, b in zip(seen, ref))
+    _assert_bitwise(before, vllm_model)
+    assert model._unsloth_merged_rollout_state.depth == 0
+    assert getattr(llm, "_unsloth_rollout_scope", None) is None
+
+
+def test_rollout_scope_base_call_inside_releases_the_fold():
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    with vllm_utils.vllm_rollout_scope(llm):
+        _turns(llm, model, 1)
+        real = object()
+        llm.generate(["base"], lora_request = real)
+        assert llm.calls[-1][1] is real
+        assert all(torch.equal(a, b) for a, b in zip(before, llm.calls[-1][2]))   # base weights
+        assert len(llm.resets) == 2
+        _turns(llm, model, 1)   # folds again
+        assert any(not torch.equal(a, b) for a, b in zip(before, llm.calls[-1][2]))
+    assert len(llm.resets) == 4
+    _assert_bitwise(before, vllm_model)
+
+
+def test_rollout_scope_keeps_chat_nested_generate_folded():
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    with vllm_utils.vllm_rollout_scope(llm):
+        for _ in range(2):
+            llm.chat(["hi"], None, True, load_lora(model, _ADAPTER_DIR, load_tensors = True))
+        assert len(llm.resets) == 1
+    for _, req, seen in llm.calls:
+        assert req is None
+        assert any(not torch.equal(a, b) for a, b in zip(before, seen))
+    assert len(llm.resets) == 2
+    _assert_bitwise(before, vllm_model)
+
+
+def test_rollout_scope_exception_restores_and_resets():
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    with pytest.raises(ValueError):
+        with vllm_utils.vllm_rollout_scope(llm):
+            _turns(llm, model, 2)
+            raise ValueError("tool crashed")
+    assert len(llm.resets) == 2
+    _assert_bitwise(before, vllm_model)
+    assert getattr(llm, "_unsloth_rollout_scope", None) is None
+    # The next rollout starts clean.
+    _turns(llm, model, 1)
+    _assert_bitwise(before, vllm_model)
+
+
+def test_rollout_scope_is_reentrant():
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    with vllm_utils.vllm_rollout_scope(llm):
+        with vllm_utils.vllm_rollout_scope(llm):
+            _turns(llm, model, 2)
+        assert any(not torch.equal(a, b) for a, b in zip(before, vllm_model.parameters()))
+        _turns(llm, model, 1)
+    assert len(llm.resets) == 2
+    _assert_bitwise(before, vllm_model)
+
+
+def test_rollout_scope_reuses_one_lora_request_on_the_vllm_lora_path(monkeypatch, _isolate):
+    monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT", "0")
+    model, llm, vllm_model = _make_model()
+    outside = [load_lora(model, _ADAPTER_DIR, load_tensors = True) for _ in range(2)]
+    assert outside[0].lora_int_id != outside[1].lora_int_id
+    with vllm_utils.vllm_rollout_scope(llm):
+        inside = [load_lora(model, _ADAPTER_DIR, load_tensors = True) for _ in range(3)]
+    assert all(type(r) is _isolate.LoRARequest for r in inside)
+    assert inside[0] is inside[1] is inside[2]
+    after = load_lora(model, _ADAPTER_DIR, load_tensors = True)
+    assert after.lora_int_id not in {inside[0].lora_int_id} | {r.lora_int_id for r in outside}
+
+
+def test_rollout_scope_reuses_the_rest_request_in_attention_mode(monkeypatch, _isolate):
+    monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT", "attention")
+    model, llm, vllm_model = _make_model()
+    llm._unsloth_lora_without_attention = True
+    with vllm_utils.vllm_rollout_scope(llm):
+        _turns(llm, model, 3)
+    rest = [c[1] for c in llm.calls]
+    assert type(rest[0]) is _isolate.LoRARequest
+    assert rest[0] is rest[1] is rest[2]
+    assert not any(".self_attn." in k for k in rest[0].lora_tensors)
