@@ -1181,17 +1181,54 @@ def replace_sdpa_with_amd_aiter(source):
     return "".join(lines)
 
 
+def _temp_compile_folder_is_ours(location):
+    """A real directory (not a link) owned by this user that others cannot write."""
+    try:
+        st = os.lstat(location)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(st.st_mode)
+        and st.st_uid == os.geteuid()
+        and not (st.st_mode & 0o002)
+    )
+
+
+def _private_temp_compile_folder(base, leaf):
+    """The temp fallback cache, never one another user created.
+
+    The system temp dir is shared on POSIX, so `<tmp>/<leaf>` can be pre-created
+    (or linked) by another account, and whatever it holds is then imported. Use it
+    only if it is ours; else use `<tmp>/<leaf>_<uid>`, created 0700. Deterministic,
+    so every rank on a node and every later run agrees on the same folder."""
+    location = os.path.join(base, leaf)
+    os.makedirs(location, mode=0o700, exist_ok=True)
+    if os.name != "posix" or _temp_compile_folder_is_ours(location):
+        return location
+    private = os.path.join(base, f"{leaf}_{os.geteuid()}")
+    try:
+        os.mkdir(private, 0o700)
+    except FileExistsError:
+        pass
+    if _temp_compile_folder_is_ours(private):
+        return private
+    raise RuntimeError(
+        f"Unsloth: Refusing the temp compile folders `{location}` and `{private}`: "
+        f"they are not directories owned by this user that others cannot write. "
+        f"Set UNSLOTH_COMPILE_LOCATION to a writable directory you own."
+    )
+
+
 def _get_compile_folder(use_tempfile=False):
     global UNSLOTH_COMPILE_LOCATION
     global UNSLOTH_COMPILE_USE_TEMP
     if UNSLOTH_COMPILE_USE_TEMP or use_tempfile:
         UNSLOTH_COMPILE_USE_TEMP = True
         leaf = os.path.basename(UNSLOTH_COMPILE_LOCATION)
-        location = os.path.join(tempfile.gettempdir(), leaf)
+        location = _private_temp_compile_folder(tempfile.gettempdir(), leaf)
         logger.info(
             f"Unsloth: We'll be using `{location}` for temporary Unsloth patches."
         )
-        os.makedirs(location, exist_ok=True)
     else:
         location = UNSLOTH_COMPILE_LOCATION
         try:
