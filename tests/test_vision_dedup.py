@@ -234,3 +234,97 @@ def test_collective_sharded_forwards_never_dedup(monkeypatch):
     hook.remove()
     assert len(calls) == 1  # one per-row encode, no self-check forward
     assert not any(m.__dict__.get(vision_dedup._VERIFIED, False) for m in vision_dedup._image_modules(model))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_block_expand_backward_sums_half_copies_without_overflow(dtype):
+    # Four copies of one row with finite fp16 grads whose running sum passes 65504 but whose total is 0.
+    src = torch.ones(1, 3, dtype = dtype, requires_grad = True)
+    out = vision_dedup._BlockExpand.apply(src, torch.zeros(4, dtype = torch.long), [(0, 1, [0, 1, 2, 3])])
+    grad = torch.tensor([40000.0, 40000.0, -40000.0, -40000.0]).repeat_interleave(3).view(4, 3).to(dtype)
+    out.backward(grad)
+    assert src.grad.dtype == dtype
+    assert torch.isfinite(src.grad).all() and src.grad.abs().max().item() == 0
+    # Exact for representable sums: two copies of 1 and 2**-11 (fp16 ulp below 2 is 2**-10).
+    src2 = torch.ones(1, 1, dtype = dtype, requires_grad = True)
+    out2 = vision_dedup._BlockExpand.apply(src2, torch.zeros(3, dtype = torch.long), [(0, 1, [0, 1, 2])])
+    out2.backward(torch.tensor([[1.0], [2.0 ** -11], [2.0 ** -11]], dtype = dtype))
+    assert src2.grad.item() == float(torch.tensor(1.0 + 2.0 ** -10, dtype = dtype))
+
+
+def test_zero3_partitioned_towers_never_dedup(monkeypatch):
+    # ZeRO-3 all-gathers every partitioned parameter per forward: the first deduplicated call's
+    # self-check encode runs only on ranks that saw a duplicate image, so the others would hang.
+    import unsloth_zoo.temporary_patches.utils as tp
+    monkeypatch.setattr(tp, "zero3_partitioned_training", lambda: True)
+    _, model = _load("qwen2_5_vl")
+    assert vision_dedup.install_image_dedup(model) == 0
+    monkeypatch.setattr(tp, "zero3_partitioned_training", lambda: False)
+    proc, model = _load("qwen2_5_vl")
+    assert vision_dedup.install_image_dedup(model) > 0
+    inputs = _batch(proc)
+    tower = _tower(model)
+    calls = []
+    hook = tower.register_forward_hook(lambda m, a, o: calls.append(1))
+    monkeypatch.setattr(tp, "zero3_partitioned_training", lambda: True)
+    with torch.no_grad():
+        model(**inputs)
+    hook.remove()
+    assert len(calls) == 1  # one per-row encode, no self-check forward
+    assert not any(m.__dict__.get(vision_dedup._VERIFIED, False) for m in vision_dedup._image_modules(model))
+
+
+def test_ds_id_parameters_never_dedup():
+    # A tower whose parameters carry DeepSpeed ZeRO-3 ids stands down even without a live HF config.
+    _, model = _load("qwen2_5_vl")
+    for p in model.parameters():
+        p.ds_id = 0
+    assert vision_dedup.install_image_dedup(model) == 0
+
+
+def test_tower_sharded_after_install_never_self_checks(tmp_path):
+    # FSDP2 shards inside train(), after the trainer installed dedup: the wrapper must see the DTensor
+    # parameters at call time and run one per-row encode, never a rank-local self-check forward.
+    import torch.distributed as dist
+    try:
+        from torch.distributed.fsdp import fully_shard
+    except ImportError:
+        pytest.skip("fully_shard needs torch >= 2.6")
+    proc, model = _load("qwen2_5_vl")
+    assert vision_dedup.install_image_dedup(model) > 0
+    inputs = _batch(proc)
+    tower = _tower(model)
+    started = False
+    if not dist.is_initialized():
+        dist.init_process_group("gloo", init_method = f"file://{tmp_path / 'pg'}", rank = 0, world_size = 1)
+        started = True
+    try:
+        fully_shard(tower)
+        calls = []
+        hook = tower.register_forward_hook(lambda m, a, o: calls.append(1))
+        with torch.no_grad():
+            model(**inputs)
+        hook.remove()
+    finally:
+        if started:
+            dist.destroy_process_group()
+    assert len(calls) == 1
+    assert not any(m.__dict__.get(vision_dedup._VERIFIED, False) for m in vision_dedup._image_modules(model))
+
+
+def test_drop_path_layers_count_as_stochastic():
+    # Stochastic depth draws per sample: two equal images get different features in training mode.
+    class DropPath(torch.nn.Module):
+        def __init__(self, drop_prob):
+            super().__init__()
+            self.drop_prob = drop_prob
+
+        def forward(self, x):
+            return x
+
+    tower = torch.nn.Sequential(torch.nn.Linear(4, 4), DropPath(0.1)).train()
+    assert vision_dedup._stochastic_vision(tower)
+    tower.eval()
+    assert not vision_dedup._stochastic_vision(tower)
+    quiet = torch.nn.Sequential(torch.nn.Linear(4, 4), DropPath(0.0)).train()
+    assert not vision_dedup._stochastic_vision(quiet)
