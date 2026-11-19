@@ -54,15 +54,36 @@ def test_autocast_output_matches_stock_dtype_and_values(cls, shape, weight_dtype
 
 @pytest.mark.parametrize("cls,shape", _CONVS)
 def test_without_autocast_output_follows_input_dtype(cls, shape):
-    # bf16 weights, float32 input and no autocast: stock raises, the wrapper computes in bf16 and returns float32
+    # no autocast: stock raises here, the wrapper returns the input's dtype
     conv, _, forward = _wrapped(cls, torch.bfloat16)
     with torch.no_grad():
         assert forward(conv, torch.randn(*shape)).dtype == torch.float32
         assert forward(conv, torch.randn(*shape, dtype = torch.bfloat16)).dtype == torch.bfloat16
 
 
+def test_meta_tensors_still_run():
+    conv = torch.nn.Conv2d(3, 4, 3, device = "meta", dtype = torch.bfloat16)
+    forward = _dtype_safe_forward(torch.nn.Conv2d.forward, True, False)
+    out = forward(conv, torch.empty(1, 3, 8, 8, device = "meta"))
+    assert out.device.type == "meta" and out.dtype == torch.float32
+
+
+def test_skipped_device_types_are_exactly_the_ones_autocast_rejects():
+    import warnings
+    from unsloth_zoo.compiler import _NO_AUTOCAST_DEVICE_TYPES, _no_autocast_device_types
+
+    assert set(_NO_AUTOCAST_DEVICE_TYPES) == set(_no_autocast_device_types())
+    assert "meta" in _NO_AUTOCAST_DEVICE_TYPES and "mkldnn" in _NO_AUTOCAST_DEVICE_TYPES
+    assert "cpu" not in _NO_AUTOCAST_DEVICE_TYPES and "cuda" not in _NO_AUTOCAST_DEVICE_TYPES
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # "mkldnn" is deprecated
+        for name in _NO_AUTOCAST_DEVICE_TYPES:
+            with pytest.raises(RuntimeError):
+                torch.is_autocast_enabled(name)
+
+
 def test_fp16_autocast_with_bf16_weight_returns_fp16():
-    # PR 552's case: a bf16 weight under fp16 autocast must not crash and stays fp16
+    # PR 552: bf16 weight under fp16 autocast
     conv, _, forward = _wrapped(torch.nn.Conv1d, torch.bfloat16)
     with torch.no_grad(), torch.autocast("cpu", dtype = torch.float16):
         assert forward(conv, torch.randn(2, 3, 16, dtype = torch.float16)).dtype == torch.float16
