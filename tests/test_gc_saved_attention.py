@@ -561,6 +561,7 @@ def test_auto_a_longer_call_than_measured_keeps_nothing(monkeypatch, auto):
 
 
 def test_auto_frames_need_a_routing_caller_and_respect_the_kill_switch(monkeypatch):
+    monkeypatch.setattr(torch.version, "hip", None, raising = False)  # ROCm keeps the mode off
     t = [torch.zeros(1, requires_grad = True)]
     monkeypatch.setattr(SA, "_AUTO_ACTIVE", [False])
     assert SA.new_saved_attention_frame(t) is None
