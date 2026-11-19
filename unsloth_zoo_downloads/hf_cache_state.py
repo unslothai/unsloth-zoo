@@ -597,6 +597,8 @@ def _sentence_transformers_subfolder_incomplete(
         elif leaf not in _ST_WEIGHTED_MODULE_TYPES:
             continue  # POST rejects only a KNOWN weight-bearing module (no false-reject on unknowns)
         path = path.strip("/")
+        if _is_unsafe_shard_ref(path):
+            continue  # a repo-supplied UNC / drive / ..-path must not be probed: on Windows that opens an SMB connection
         sub = snapshot_dir / path
         try:
             names = {entry.name for entry in sub.iterdir()} if _safe_is_dir(sub) else set()
@@ -903,9 +905,11 @@ def _diffusers_declared_component_specs(snapshot_dir: Path) -> "Optional[dict]":
         return None
     if not isinstance(data, dict):
         return None
+    # Component names become subfolder paths; a UNC / drive / ..-name would make the probe open an SMB share on Windows.
     specs = {
         key: value for key, value in data.items()
         if not key.startswith("_") and isinstance(value, (list, tuple))
+        and not _is_unsafe_shard_ref(key)
     }
     # An empty / all-metadata model_index.json is degenerate -> fail OPEN (None).
     return specs or None
