@@ -301,11 +301,9 @@ def _refuse_offloaded(model, action) -> None:
             f"Unsloth: this model was loaded with offload, which is for inference only; "
             f"{action} needs the model loaded without offload."
         )
-    if getattr(model, "_unsloth_vision_released", False):
-        raise ValueError(
-            f"Unsloth: this model's vision weights were released for text-only inference; "
-            f"{action} needs the model loaded without drop_vision_weights."
-        )
+    from .utils import refuse_released_vision
+
+    refuse_released_vision(model, action)
 
 
 def _keep_norm_parameters_float32(model) -> None:

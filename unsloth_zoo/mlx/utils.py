@@ -15527,6 +15527,7 @@ def save_lora_adapters(model, path, adapter_config=None, adapter_format="mlx"):
     """Save lora_a/lora_b and DoRA magnitudes; adapter_format is mlx (native) or peft (HF layout), where uniform LoRA
     loads in transformers, PEFT and vLLM, but per-module rank/alpha only in transformers/PEFT (vLLM has one global
     rank/alpha)."""
+    refuse_released_vision(model, "saving")
     if adapter_format not in ("mlx", "peft"):
         raise ValueError(
             f"Unsloth MLX: adapter_format={adapter_format!r}; expected "
@@ -18828,6 +18829,14 @@ def _restore_mlx_model_state(model, snapshot):
     mx.clear_cache()
 
 
+def refuse_released_vision(model, action) -> None:
+    if getattr(model, "_unsloth_vision_released", False):
+        raise ValueError(
+            f"Unsloth: this model's vision weights were released for text-only inference; "
+            f"{action} needs the model loaded without drop_vision_weights."
+        )
+
+
 def save_merged_model(model, tokenizer, path, dequantize=False,
                       quantize_unquantized=False):
     """Fuse LoRA and save an HF-style merged dir (sharded safetensors, config, tokenizer, card); dequantize=True writes
@@ -18836,11 +18845,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
     from mlx_lm.utils import save_model, create_model_card, dequantize_model
     from mlx.utils import tree_unflatten
 
-    if getattr(model, "_unsloth_vision_released", False):
-        raise ValueError(
-            "Unsloth: this model's vision weights were released for text-only inference; "
-            "saving needs the model loaded without drop_vision_weights."
-        )
+    refuse_released_vision(model, "saving")
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     restore_after_save = None

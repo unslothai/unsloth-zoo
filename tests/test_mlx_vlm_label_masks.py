@@ -1312,6 +1312,8 @@ def test_released_vision_keeps_audio_and_refuses_a_whole_save():
     with pytest.raises(ValueError, match="drop_vision_weights"):
         utils.save_merged_model(model, None, "unused")
     with pytest.raises(ValueError, match="drop_vision_weights"):
+        utils.save_lora_adapters(model, "unused")
+    with pytest.raises(ValueError, match="drop_vision_weights"):
         loader._mlx_save_pretrained_merged(model, "unused")
     with pytest.raises(ValueError, match="drop_vision_weights"):
         loader._mlx_save_pretrained_gguf(model, "unused")
