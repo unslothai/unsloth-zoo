@@ -172,6 +172,10 @@ if _is_mlx_only:
     DEVICE_TYPE_TORCH = "mps"
     DEVICE_COUNT = 1
     ALLOW_PREQUANTIZED_MODELS = True
+    # The GPU-only init below installs temporary_patches; keep their device-independent security guards on MLX.
+    from unsloth_zoo.mlx.runtime import install_mlx_security_patches
+    install_mlx_security_patches()
+    del install_mlx_security_patches
     del _is_mlx_only, is_mlx_available, find_spec
     # Everything below this point is GPU-only. Use a flag to gate it.
     _SKIP_GPU_INIT = True
