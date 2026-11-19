@@ -1,9 +1,4 @@
-"""Cascade attention: off below vLLM 0.11.1 on pre-Hopper cards, vLLM's own default everywhere else.
-
-vLLM 0.11.0 still pins the vllm_flash_attn commit just before the FA2 kv-split LSE fix
-(vllm-project/flash-attention#87); 0.11.1 is the first release that carries it. vLLM >= 0.18 disables
-cascade attention by default, so the zoo must never pass an explicit False.
-"""
+"""vLLM 0.11.0 pins flash-attention ee4d25bd, one commit before vllm-project/flash-attention#87."""
 
 import ast
 import pathlib
@@ -28,7 +23,7 @@ def _helper():
     "vllm_version, major, expected",
     [
         ("0.10.2", 8, True),
-        ("0.11.0", 8, True),  # pins flash-attention ee4d25bd, one commit before the fix
+        ("0.11.0", 8, True),
         ("0.11.1", 8, False),
         ("0.11.2", 8, False),
         ("0.18.0", 8, False),  # vLLM's own default (disabled) must stand
@@ -42,7 +37,6 @@ def test_cascade_attention_is_only_ever_disabled(vllm_version, major, expected):
 
 
 def test_load_vllm_never_forces_cascade_attention_on():
-    """An explicit disable_cascade_attn = False would re-enable it on vLLM >= 0.18, where it is off by default."""
     tree = ast.parse(SOURCE.read_text(encoding = "utf-8"))
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):

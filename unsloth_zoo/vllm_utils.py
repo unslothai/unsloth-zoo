@@ -4427,12 +4427,8 @@ def _release_failed_vllm_engine(snapshot):
 pass
 
 
-
 def _vllm_cascade_attn_needs_disable(vllm_version, major_version):
-    """True when cascade attention must be turned off; otherwise vLLM keeps its own default.
-
-    Never forces it on: vLLM >= 0.18 disables it by default, and an explicit False would undo that.
-    """
+    """Never returns a force-on: an explicit False would undo vLLM >= 0.18's disabled default."""
     return major_version < 9 and Version(str(vllm_version)) < Version("0.11.1")
 
 
@@ -5135,8 +5131,7 @@ def load_vllm(
                 }
 
         # [[CRITICAL for RL on policy]]
-        # Cascade attention corrupts batched outputs on Ampere / Ada until the FA2 kv-split LSE fix
-        # (vllm-project/flash-attention#87), first pinned by vLLM 0.11.1; 0.11.0 still pins the commit before it.
+        # Pre-Hopper cascade attention is wrong until vllm-project/flash-attention#87, first pinned by vLLM 0.11.1.
         if DEVICE_TYPE == "cuda":
             major_version, minor_version = torch.cuda.get_device_capability()
             if _vllm_cascade_attn_needs_disable(vllm_version, major_version):
