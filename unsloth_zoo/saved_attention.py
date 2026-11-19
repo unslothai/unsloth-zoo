@@ -166,7 +166,7 @@ def _auto_admit(frame, tensors):
         return False
     # Output like Q plus a float32 logsumexp per query row.
     estimate = _bytes(query) + (query.numel() // max(query.shape[-1], 1)) * 4
-    frame.estimate = max(frame.estimate, estimate)
+    frame.estimate[query.device] = max(frame.estimate.get(query.device, 0), estimate)
     budget = _BUDGETS.get(query.device)
     if budget is None:
         budget = _BUDGETS[query.device] = _Budget()
@@ -212,9 +212,12 @@ def _auto_release(frame, measured):
             _observe(budget, device)
         budget.live = max(budget.live - kept, 0)
     frame.kept.clear()
-    if measured and frame.estimate:
-        for budget in _BUDGETS.values():
-            budget.measured = max(budget.measured, frame.estimate)
+    # Per device: a replay only measures the peaks of the devices its calls ran on.
+    if measured:
+        for device, estimate in frame.estimate.items():
+            budget = _BUDGETS.get(device)
+            if budget is not None:
+                budget.measured = max(budget.measured, estimate)
 
 
 class SavedAttentionFrame:
@@ -228,7 +231,7 @@ class SavedAttentionFrame:
         self.loaded = False
         self.auto = auto
         self.kept = []
-        self.estimate = 0
+        self.estimate = {}
 
     def __del__(self):
         try:

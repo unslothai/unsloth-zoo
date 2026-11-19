@@ -642,3 +642,16 @@ def test_cuda_auto_mode_with_the_real_allocator(monkeypatch, auto):
     assert budget.live == 0 and budget.base_peak >= peak
     # The user's peak statistics are read, never reset.
     assert torch.cuda.max_memory_allocated() >= peak
+
+
+def test_auto_measures_each_device_separately(monkeypatch, auto):
+    # A replay with a long call on one device and a short one on another measures each device at its own size.
+    _fake_memory(monkeypatch, base_peak = 0, capacity = 1 << 40)
+    long_cpu = torch.empty(1, 2, 64, 4, device = "cpu")
+    short_meta, long_meta = torch.empty(1, 2, 8, 4, device = "meta"), torch.empty(1, 2, 64, 4, device = "meta")
+    frame = SA.SavedAttentionFrame(auto = True)
+    assert not SA._auto_admit(frame, [long_cpu]) and not SA._auto_admit(frame, [short_meta])  # nothing measured yet
+    SA._auto_release(frame, True)
+    assert SA._auto_admit(SA.SavedAttentionFrame(auto = True), [long_cpu])
+    assert SA._auto_admit(SA.SavedAttentionFrame(auto = True), [short_meta])
+    assert not SA._auto_admit(SA.SavedAttentionFrame(auto = True), [long_meta])  # never measured at this size there
