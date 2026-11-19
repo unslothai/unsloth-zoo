@@ -164,6 +164,7 @@ def _new_host_buffer(numel, dtype):
 def _grow_host_buffer(buffer, new_size):
     """resize_ on a pinned buffer issues a fresh, larger cudaHostAlloc, which can fail."""
     if new_size <= buffer.numel(): return _mark_host_buffer(buffer)
+    new_size = _exact_growth_numel(new_size, buffer.element_size())
     old_bytes = _storage_bytes(buffer)
     if new_size * buffer.element_size() <= old_bytes:
         # A shrunk buffer keeps its storage, so this resize_ allocates nothing.
@@ -285,6 +286,43 @@ def _warn_short_block_reuse():
         "Gradient checkpointing offload grows pinned buffers, so upgrade torch or unset it.",
         stacklevel = 2,
     )
+
+
+# Offload slots are hidden * tokens * 2 bytes, often not a power of two (Qwen3-4B at 32k: 160MB pinned
+# as 256MB). On CUDA torch 2.14+ (2.13 can hand out a short block) set pinned_max_round_threshold_mb so
+# blocks above _GC_PINNED_EXACT_MB are pinned at their exact size, unless the user set either pinned
+# knob. Smaller pinned users (DataLoader batches) keep power-of-two reuse. UNSLOTH_GC_PINNED_EXACT=0 off.
+_GC_PINNED_EXACT_MB = 4
+_GC_PINNED_EXACT = False
+_PINNED_KNOBS = ("pinned_max_round_threshold_mb", "pinned_max_cached_size_mb")
+
+
+def _maybe_enable_exact_pinned():
+    global _GC_PINNED_EXACT
+    if _GC_PINNED_EXACT: return True
+    if os.environ.get("UNSLOTH_GC_PINNED_EXACT", "1") == "0": return False
+    if DEVICE_TYPE != "cuda" or getattr(torch.version, "hip", None) or _TORCH_MINOR < (2, 14): return False
+    setter = getattr(torch._C, "_accelerator_setAllocatorSettings", None)
+    if setter is None: return False
+    current = _host_allocator_settings()
+    user = [current] + [os.environ.get(var) or "" for var in
+        ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF")]
+    if any(knob in text for text in user for knob in _PINNED_KNOBS): return False
+    # Each call resets max_split_size_mb, roundup_power2_divisions and garbage_collection_threshold
+    # to defaults, so pass the settings in effect back in with ours appended.
+    try: setter(",".join(filter(None, (current, f"pinned_max_round_threshold_mb:{_GC_PINNED_EXACT_MB}"))))
+    except Exception: return False
+    _GC_PINNED_EXACT = True
+    return True
+
+
+def _exact_growth_numel(numel, itemsize):
+    """Exact blocks are only reused by requests no larger, so a slot that grows with the sequence length
+    would pin a fresh block each time. Grow in 1/8 power-of-two steps: few growths, under 12.5% slack."""
+    nbytes = numel * itemsize
+    if not _GC_PINNED_EXACT or nbytes <= (_GC_PINNED_EXACT_MB << 20): return numel
+    step = 1 << (nbytes.bit_length() - 4)
+    return -(-(-(-nbytes // step) * step) // itemsize)
 
 
 def _pinned_block_bytes(nbytes):
@@ -1679,6 +1717,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     global FP32_OFFLOAD_EXACT, FP32_OFFLOAD_MODE
     FP32_OFFLOAD_MODE = _fp32_offload_mode()
     FP32_OFFLOAD_EXACT = FP32_OFFLOAD_MODE == "exact"
+    _maybe_enable_exact_pinned()
     global GC_PREFETCH
     GC_PREFETCH = os.environ.get("UNSLOTH_GC_PREFETCH", "0") == "1"
     _reset_gc_prefetch_state()
