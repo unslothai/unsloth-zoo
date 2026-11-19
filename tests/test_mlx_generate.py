@@ -181,7 +181,7 @@ def test_falsey_defaults_are_not_silently_replaced(monkeypatch):
         with _generation_cache_hygiene():
             raise ValueError("body")
 
-def _record_cache_calls(monkeypatch, *, has_clear_cache=True):
+def _record_cache_calls(monkeypatch):
     for name in (
         "mlx_lm.generate", "mlx_vlm.generate", "mlx_vlm.generate.dispatch",
         "mlx_vlm.generate.ar", "mlx_vlm.speculative.common",
@@ -195,12 +195,7 @@ def _record_cache_calls(monkeypatch, *, has_clear_cache=True):
             f"synchronize:{'default' if stream is None else stream}"
         ),
     )
-    if has_clear_cache:
-        monkeypatch.setattr("mlx.core.clear_cache", lambda: events.append("clear_cache"))
-    else:
-        # Set the attribute to None, not delattr: tests/mlx_simulation trampolines any missing name, so a deleted
-        # attribute stays callable and the guard never fires.
-        monkeypatch.setattr("mlx.core.clear_cache", None, raising=False)
+    monkeypatch.setattr("mlx.core.clear_cache", lambda: events.append("clear_cache"))
     return events
 
 def test_both_cache_clears_drain_gpu_work_first(monkeypatch):
@@ -283,16 +278,6 @@ def test_a_module_getattr_that_raises_does_not_stop_the_clear(monkeypatch):
         "synchronize:default", "clear_cache", "body", "synchronize:default", "clear_cache",
     ]
 
-def test_a_runtime_without_synchronize_still_clears(monkeypatch):
-    events = _record_cache_calls(monkeypatch)
-    monkeypatch.setattr("mlx.core.synchronize", None, raising=False)
-    _fake_stream_module(monkeypatch, "mlx_lm.generate", "stream<mlx_lm>")
-
-    with _generation_cache_hygiene():
-        events.append("body")
-
-    assert events == ["clear_cache", "body", "clear_cache"]
-
 def test_the_exit_clear_still_drains_when_the_body_raised(monkeypatch):
     events = _record_cache_calls(monkeypatch)
     with pytest.raises(ValueError, match="body"):
@@ -301,19 +286,6 @@ def test_the_exit_clear_still_drains_when_the_body_raised(monkeypatch):
     assert events == [
         "synchronize:default", "clear_cache", "synchronize:default", "clear_cache",
     ]
-
-@pytest.mark.parametrize("metal", [
-    types.SimpleNamespace(),
-    # Refused even when the pre-0.22 shape is present: this path never accepted it.
-    types.SimpleNamespace(clear_cache=lambda: None),
-])
-def test_missing_clear_cache_is_rejected_before_any_work(monkeypatch, metal):
-    events = _record_cache_calls(monkeypatch, has_clear_cache=False)
-    monkeypatch.setattr("mlx.core.metal", metal, raising=False)
-    with pytest.raises(RuntimeError, match="clear_cache missing"):
-        with _generation_cache_hygiene():
-            pytest.fail("body must not run when the runtime cannot clear its cache")
-    assert events == []
 
 def test_training_flag_restore_attempts_every_module():
     class Module:

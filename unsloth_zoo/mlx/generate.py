@@ -1291,10 +1291,6 @@ def _restore_training_flags(states: Sequence[tuple[Any, bool]]):
             set_mode = getattr(module, "_set_training_mode", None)
             if callable(set_mode):
                 set_mode(training)
-            elif isinstance(getattr(type(module), "training", None), property):
-                # mlx.nn.Module exposes training read-only; _set_training_mode
-                # only arrived in mlx 0.30.2, so write the backing attribute.
-                module._training = training
             else:
                 setattr(module, "training", training)
         except BaseException as exc:
@@ -1429,14 +1425,11 @@ def _drain_stream_modules():
 def _drain_generation_streams(mx):
     """Drain the generation streams, best effort, before the caller clears the cache.
 
-    A no-argument mx.synchronize() waits on the default stream, not these. Best effort
-    because they can fail, and losing the drain must never cost the caller its clear. Only effective on the generating
-    thread: elsewhere a thread-local stream drains nothing instead of raising.
+    A no-argument mx.synchronize() waits on the default stream, not these. Best effort because they can fail, and
+    losing the drain must never cost the caller its clear. Only effective on the generating thread: elsewhere a
+    thread-local stream drains nothing instead of raising.
     """
 
-    synchronize = getattr(mx, "synchronize", None)
-    if not callable(synchronize):
-        return
     drained = []
     for name in _drain_stream_modules():
         try:
@@ -1450,11 +1443,11 @@ def _drain_generation_streams(mx):
             continue
         drained.append(stream)
         try:
-            synchronize(stream)
+            mx.synchronize(stream)
         except Exception:
             continue
     try:
-        synchronize()
+        mx.synchronize()
     except Exception:
         pass
 
@@ -1465,14 +1458,9 @@ def _generation_cache_hygiene():
 
     import mlx.core as mx
 
-    clear_cache = getattr(mx, "clear_cache", None)
-    if not callable(clear_cache):
-        raise RuntimeError(
-            "Unsupported MLX runtime API shape (mlx.core.clear_cache missing)."
-        )
     # MLX pins buffers a live command buffer reads, but not an output array dropped mid-flight.
     _drain_generation_streams(mx)
-    clear_cache()
+    mx.clear_cache()
     active_error = None
     try:
         yield
@@ -1482,7 +1470,7 @@ def _generation_cache_hygiene():
     finally:
         try:
             _drain_generation_streams(mx)
-            clear_cache()
+            mx.clear_cache()
         except BaseException as cleanup_error:
             if active_error is None:
                 raise

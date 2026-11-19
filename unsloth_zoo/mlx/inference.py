@@ -6549,7 +6549,7 @@ _DENSE_QMM_MIN_ROWS = 1024
 _DENSE_QMM_MIN_TILES = 4096
 # The dequantized weight is a transient the size of the float layer; a vocabulary head would be gigabytes.
 _DENSE_QMM_MAX_WEIGHTS = 1 << 28
-_DENSE_QMM_DISPATCH_MLX = ("0.32.3", "0.32.4")  # 0.32.4's thin NAX case needs N <= 64, so M > 16384 here
+_DENSE_QMM_DISPATCH_MLX = ("0.32.4",)  # 0.32.4's thin NAX case needs N <= 64, so M > 16384 here
 
 
 def _dense_qmm_rows(M, N, K):
@@ -6578,7 +6578,7 @@ _TILED_QMM_SOURCE = """
 TILED_QMM_PROBE_KEY = "tiled_qmm:" + hashlib.sha256(
     _TILED_QMM_SOURCE.format(template = "", **_TILED_QMM_TILE).encode()).hexdigest()[:12]
 # Releases whose quantized matmul dispatch `_tile_shape_loses` keeps clear of split-K and qmv.
-_TILED_QMM_DISPATCH_MLX = ("0.32.3", "0.32.4")
+_TILED_QMM_DISPATCH_MLX = ("0.32.4",)
 # Stock may run qmv up to 32 rows, and fewer rows pad one 64-row tile past stock's 32-row one.
 _TILED_QMM_MIN_ROWS = _TILED_QMM_TILE["BM"] // 2 + 1
 
@@ -10417,13 +10417,13 @@ def _vector_attention_source():
 
 @functools.cache
 def _gpu_class():
-    info = (getattr(mx, "device_info", None) or mx.metal.device_info)()
+    info = mx.device_info()
     return str(info.get("architecture", ""))[-1:]
 
 
 @functools.cache
 def _gpu_generation():
-    info = (getattr(mx, "device_info", None) or mx.metal.device_info)()
+    info = mx.device_info()
     match = re.match(r"applegpu_g(\d+)", str(info.get("architecture", "")))
     return int(match.group(1)) if match else 0
 

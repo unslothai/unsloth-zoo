@@ -1834,7 +1834,7 @@ def staged_qmm_supported(M, N, K, group_size, bits, mode):
 
 
 def staged_qmm_available():
-    return (mx.__version__ in ("0.32.3", "0.32.4") and mx.default_device() == mx.gpu and nax.nax_available()
+    return (mx.__version__ == "0.32.4" and mx.default_device() == mx.gpu and nax.nax_available()
             and os.environ.get("UNSLOTH_MLX_STAGED_PREFILL", "1") != "0" and _staged_qmm_kernel() is not None
             and nax.kernel_probe_passed(STAGED_QMM_PROBE_KEY, __name__, "probe_staged_qmm", nax.nax_available))
 

@@ -1964,7 +1964,7 @@ def test_rejected_dense_prefill_keeps_exact_tile_on_first_and_cached_calls(monke
 def test_staged_prefill_matches_native_rows_gradients_and_restores(monkeypatch, dtype, bits, group):
     from unsloth_zoo.mlx import inference, matmul, nax
 
-    if not nax.nax_available() or mx.__version__ not in ("0.32.3", "0.32.4"):
+    if not nax.nax_available() or mx.__version__ != "0.32.4":
         pytest.skip("requires native NAX kernels")
     assert matmul.staged_qmm_available()
     model = nn.Sequential(nn.QuantizedLinear(2048, 2048, bias = True, group_size = group, bits = bits))
@@ -2008,7 +2008,7 @@ def test_staged_prefill_matches_native_rows_gradients_and_restores(monkeypatch, 
 def test_staged_prefill_rejects_different_result_once_per_shape(monkeypatch):
     from unsloth_zoo.mlx import inference, matmul, nax
 
-    if not nax.nax_available() or mx.__version__ not in ("0.32.3", "0.32.4"):
+    if not nax.nax_available() or mx.__version__ != "0.32.4":
         pytest.skip("requires native NAX kernels")
     assert matmul.staged_qmm_available()
     model = nn.Sequential(nn.QuantizedLinear(2048, 2048, bias = False, group_size = 64, bits = 8)).eval()
@@ -2032,7 +2032,7 @@ def test_staged_prefill_rejects_different_result_once_per_shape(monkeypatch):
 def test_staged_prefill_probe_and_admission_boundaries(monkeypatch):
     from unsloth_zoo.mlx import matmul, nax
 
-    if not nax.nax_available() or mx.__version__ not in ("0.32.3", "0.32.4"):
+    if not nax.nax_available() or mx.__version__ != "0.32.4":
         pytest.skip("requires native NAX kernels")
     matmul.probe_staged_qmm()
     assert matmul.staged_qmm_supported(4096, 16384, 16384, 64, 8, "affine")

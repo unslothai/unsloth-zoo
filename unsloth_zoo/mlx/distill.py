@@ -39,7 +39,6 @@ __all__ = [
 ]
 
 DEFAULT_CHUNK_SIZE = 128
-_depends = getattr(mx, "depends", None)
 
 # Peak per batch*seq*vocab fp32 buffer, fitted on Qwen2.5-0.5B <- 3B and rounded up; an oversized step aborts with
 # "[METAL] Command buffer execution failed" and wedges the GPU.
@@ -136,9 +135,9 @@ def _chunked_jsd_sum(beta, temperature, chunk_size):
         total, grads = mx.zeros((), dtype=mx.float32), []
         for start, end in spans(student_logits.shape[1]):
             chunk = student_logits[:, start:end]
-            if grads and _depends is not None:
+            if grads:
                 # Serialise: independent chunks would otherwise all be live at once.
-                chunk = _depends(chunk, [total, grads[-1]])
+                chunk = mx.depends(chunk, [total, grads[-1]])
             value, grad = chunk_value_and_grad(chunk, teacher_logits[:, start:end], weights[:, start:end])
             total = total + value
             grads.append(grad)
