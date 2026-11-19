@@ -30,6 +30,7 @@ import functools
 import inspect
 import logging
 import os
+import weakref
 
 import torch
 
@@ -77,10 +78,15 @@ class _BlockExpand(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         grad_src = grad.new_zeros(ctx.src_shape)
+        # Half-precision copies are summed in fp32 and rounded once: a running fp16 sum overflows on partial
+        # sums (40000 + 40000 - 40000 - 40000 gave inf) that the unwrapped tower accumulates without.
+        wide = torch.float32 if grad.dtype in (torch.float16, torch.bfloat16) else grad.dtype
         for s0, length, copies in ctx.blocks:
             acc = grad[copies[0] : copies[0] + length]
-            for c in copies[1:]:
-                acc = acc + grad[c : c + length]
+            if len(copies) > 1:
+                acc = acc.to(wide)
+                for c in copies[1:]:
+                    acc = acc + grad[c : c + length]
             grad_src[s0 : s0 + length] = acc
         return grad_src, None, None
 
@@ -152,7 +158,8 @@ def _stochastic_vision(module):
             if isinstance(sub, torch.nn.modules.dropout._DropoutNd):
                 cached.append((sub, "p"))
                 continue
-            for attr in ("dropout", "attention_dropout", "attn_dropout", "dropout_p", "drop_path_rate"):
+            # drop_prob: timm / transformers DropPath (stochastic depth) layers, e.g. QianfanOCR's vision tower.
+            for attr in ("dropout", "attention_dropout", "attn_dropout", "dropout_p", "drop_path_rate", "drop_prob"):
                 value = sub.__dict__.get(attr, None)
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     cached.append((sub, attr))
@@ -263,8 +270,46 @@ def _fallback(module, reason):
     logger.warning(f"Unsloth: encoding every image again for {type(module).__name__} ({reason}).")
 
 
+try:
+    from torch.distributed.tensor import DTensor as _DTensor
+except Exception:
+    try:
+        from torch.distributed._tensor import DTensor as _DTensor
+    except Exception:
+        _DTensor = None
+
+
+def _sharded_parameters(module):
+    # FSDP2 (DTensor) or ZeRO-3 (ds_id) parameters all-gather on every forward. Sharding happens inside
+    # train(), after install: fully_shard replaces the Parameter objects, so the answer is cached against
+    # the first parameter's identity and re-read once it changes.
+    first = next(module.parameters(), None)
+    cached = module.__dict__.get("_unsloth_image_dedup_sharded", None)
+    if cached is not None and cached[0]() is first:
+        return cached[1]
+    value = any(
+        hasattr(p, "ds_id") or (_DTensor is not None and isinstance(p, _DTensor)) for p in module.parameters()
+    )
+    module.__dict__["_unsloth_image_dedup_sharded"] = (weakref.ref(first) if first is not None else (lambda: None), value)
+    return value
+
+
+def _zero3(module):
+    # DeepSpeed ZeRO-3 gathers each partitioned parameter on every forward (a collective on every rank).
+    try:
+        from unsloth_zoo.temporary_patches.utils import zero3_partitioned_training
+        if zero3_partitioned_training():
+            return True
+    except Exception:
+        pass
+    return _sharded_parameters(module)
+
+
 def _collective(module):
-    # Resharding FSDP2 towers all-gather per forward; a rank-local self-check forward would hang the other ranks.
+    # FSDP2 (Unsloth's resharding layout or any DTensor-sharded tower) and ZeRO-3 towers all-gather per
+    # forward; a rank-local self-check or fallback forward would hang the other ranks.
+    if _zero3(module):
+        return True
     try:
         from unsloth_zoo.rl_replacements import grpo_forwards_are_collective
         return grpo_forwards_are_collective(module)

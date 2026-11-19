@@ -3469,6 +3469,28 @@ _UNSLOTH_FLASHINFER_UNUSABLE = False
 _UNSLOTH_FLASHINFER_BLOCK_OWNERS = 0
 
 
+def _reset_vllm_flashinfer_probes():
+    """Drop vLLM's cached FlashInfer probes so they see the current block state.
+
+    vllm/utils/flashinfer.py wraps has_flashinfer() in functools.cache and calls it at
+    import time (`if has_flashinfer():` at module level), which happens long before the
+    block below, since Unsloth imports vLLM first. On a host whose nvcc is on PATH but
+    whose ninja or libcuda.so is missing, that cached True survives the block, so
+    kernel_warmup() still takes `has_flashinfer() and has_device_capability(90)` on
+    sm90+ and runs the unguarded `from flashinfer.autotuner import ...`, which the
+    None entry turns into `No module named 'flashinfer.autotuner'`.
+    """
+    fi_utils = sys.modules.get("vllm.utils.flashinfer")
+    if fi_utils is None: return
+    try:
+        for _value in list(vars(fi_utils).values()):
+            if getattr(_value, "__module__", None) != fi_utils.__name__: continue
+            _cache_clear = getattr(_value, "cache_clear", None)
+            if callable(_cache_clear): _cache_clear()
+    except Exception:
+        pass
+
+
 def _block_flashinfer_import():
     """Hide FlashInfer from vLLM by making `import flashinfer` fail.
 
@@ -3488,6 +3510,7 @@ def _block_flashinfer_import():
         sys.modules["flashinfer"] = None
     except Exception:
         pass
+    _reset_vllm_flashinfer_probes()
 
 
 def _config_uses_mla(config) -> bool:
@@ -3550,6 +3573,7 @@ def _unblock_flashinfer_import():
         _UNSLOTH_BLOCKED_FLASHINFER_MODULES.clear()
     except Exception:
         pass
+    _reset_vllm_flashinfer_probes()
 
 
 # Allocator config env vars: PYTORCH_CUDA_ALLOC_CONF (legacy NVIDIA), PYTORCH_HIP_ALLOC_CONF (legacy AMD/ROCm),
@@ -4427,6 +4451,11 @@ def _release_failed_vllm_engine(snapshot):
 pass
 
 
+def _vllm_cascade_attn_needs_disable(vllm_version, major_version):
+    """Never returns a force-on: an explicit False would undo vLLM >= 0.18's disabled default."""
+    return major_version < 9 and Version(str(vllm_version)) < Version("0.11.1")
+
+
 def load_vllm(
     model_name             : str   = "unsloth/Llama-3.2-3B-Instruct-unsloth-bnb-4bit",
     config                 = None,
@@ -5126,21 +5155,12 @@ def load_vllm(
                 }
 
         # [[CRITICAL for RL on policy]]
-        # Check for Cascade Attention which fails on A100 / L40 for vLLM < 0.11.0 versions
-        # Ada Lovelace 8.9 and Ampere 8.0
-        # See https://github.com/vllm-project/flash-attention/pull/87
-        # import vllm.vllm_flash_attn
-        # vllm.vllm_flash_attn.__version__ == 2.7.2.post1
+        # Pre-Hopper cascade attention is wrong until vllm-project/flash-attention#87, first pinned by vLLM 0.11.1.
         if DEVICE_TYPE == "cuda":
             major_version, minor_version = torch.cuda.get_device_capability()
-            if major_version < 9:
-                if Version(vllm_version) >= Version("0.11.0"):
-                    disable_cascade_attn = False
-                else:
-                    # Disable for A100, L40 etc
-                    disable_cascade_attn = True
-                    print("Unsloth: Disabling `disable_cascade_attn` in vLLM to allow for better on policy RL!")
-                engine_args["disable_cascade_attn"] = disable_cascade_attn
+            if _vllm_cascade_attn_needs_disable(vllm_version, major_version):
+                engine_args["disable_cascade_attn"] = True
+                print("Unsloth: Disabling cascade attention in vLLM to allow for better on policy RL!")
 
             # FlashInfer has a bug with block_size=16 and head_dim>=256 on Blackwell (SM100+).
             # https://github.com/flashinfer-ai/flashinfer/issues/1993
@@ -5252,6 +5272,9 @@ def load_vllm(
                 engine_args["attention_backend"] = "TRITON_MLA"
             elif _flash_attn_is_selectable():
                 engine_args["attention_backend"] = "FLASH_ATTN"
+            # vLLM's switch for the sm90+ warmup's unguarded flashinfer.autotuner import; dropped on older vLLM.
+            if "enable_flashinfer_autotune" not in engine_args and "kernel_config" not in engine_args:
+                engine_args["enable_flashinfer_autotune"] = False
 
         # torchrun / DDP: one engine per rank in the job's process group (see the helper).
         # The async engine always runs its core in a subprocess, which external_launcher refuses.

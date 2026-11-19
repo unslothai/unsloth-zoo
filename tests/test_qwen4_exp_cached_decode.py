@@ -398,3 +398,119 @@ def test_cuda_decode_equals_full_recompute(patched, dtype):
 def test_dynamic_rope_keeps_the_reference(patched, rope_type):
     engaged, record = _run(patched, lengths = [30, 25], steps = [1] * 8 + [3], rope_type = rope_type)
     assert engaged == 0 and record == []
+
+
+def _install_selection_checker(monkeypatch, record):
+    """Around every cached-decode step: the selection must equal the reference indexer's on the same inputs."""
+    real = _REAL_CACHED_DECODE
+
+    def checked(module, hidden_states, position_embeddings, attention_mask, past_key_values, kwargs):
+        trace = []
+        zoo._QSA_DECODE_TRACE = trace
+        try:
+            out = real(module, hidden_states, position_embeddings, attention_mask, past_key_values, kwargs)
+        finally:
+            zoo._QSA_DECODE_TRACE = None
+        if out is None:
+            return None
+        raw = past_key_values.layers[module.layer_idx].indexer_keys
+        total = raw.shape[1]
+        with torch.no_grad():
+            ref = zoo._reference_qsa_forward(module.indexer, hidden_states, position_embeddings, attention_mask,
+                                             _RawKeys(raw))
+        ref = ref if ref.dtype == torch.bool else ref == 0
+        (_, selected), = trace
+        ours = torch.zeros(*selected.shape[:2], total + 1, dtype = torch.bool, device = selected.device)
+        ours.scatter_(-1, torch.where(selected >= 0, selected, total), True)
+        assert torch.equal(ours[..., :total], ref[:, 0]), f"layer {module.layer_idx}: selection differs at {total} keys"
+        record.append(total)
+        return out
+
+    monkeypatch.setattr(zoo, "_qwen4_exp_cached_decode", checked)
+
+
+def test_padding_mask_with_gaps_matches_the_reference(patched):
+    # Right padding and holes inside the prompt (a 2D mask with interior zeros): transformers forms each query's
+    # blocks from its visible slots in order, not from contiguous slots after the first visible one.
+    total, steps = 44, [1] * 10 + [3, 1]
+    ids, mask, _ = _batch([30, 30], total)
+    mask[0, 5:8] = 0
+    mask[1, :2] = 0
+    mask[1, 20:22] = 0
+    ids[mask == 0] = 0
+    model = _model()
+    record = []
+    _install_selection_checker(patched, record)
+    before = zoo.QWEN4_EXP_SPARSE_STATS["cached_decode"]
+    out_ids, logits, filled = _decode(model, ids, mask, 30, steps, greedy = True)
+    engaged = zoo.QWEN4_EXP_SPARSE_STATS["cached_decode"] - before
+    assert engaged == 2 * len(steps) == len(record)
+    _assert_matches(model, out_ids, mask, logits, patched, torch.float32, filled)
+    counter = zoo.QWEN4_EXP_CACHED_DECODE_MISMATCH.get(ids.device)
+    assert counter is None or int(counter) == 0
+
+
+def test_interior_gap_selection_equals_the_reference(patched):
+    # One hidden slot (3) in a 40-key row: 9 slots differed when blocks were taken from contiguous slots.
+    from transformers.cache_utils import DynamicIndexedLayer
+    model = _model()
+    indexer = model.model.layers[1].self_attn.indexer
+    torch.manual_seed(42)
+    layer = DynamicIndexedLayer()
+    layer.update_indexer(torch.randn(1, 39, indexer.index_head_dim))
+    hidden = torch.randn(1, 1, model.config.hidden_size)
+    cos, sin = torch.randn(1, 40, 8), torch.randn(1, 40, 8)
+    mask = torch.ones(1, 1, 1, 40, dtype = torch.bool)
+    mask[..., 3] = False
+    ref = zoo._reference_qsa_forward(indexer, hidden, (cos, sin), mask, _RawKeys(torch.cat(
+        [layer.indexer_keys, indexer.index_qk_proj(hidden)[..., -indexer.index_head_dim:]], dim = 1)))
+    selected = zoo._qsa_cached_select(indexer, layer, hidden, cos, sin, mask, modeling.apply_rotary_pos_emb, None)
+    assert sorted(selected[selected >= 0].tolist()) == ref[0, 0, 0].nonzero().flatten().tolist()
+
+
+def test_mask_outside_the_padding_shape_keeps_the_reference_on_cpu(patched):
+    # A 2-token step whose first row sees slot 3 but whose last row does not (a caller-built 4D mask): no cached
+    # selection can serve both rows, so a host-resident mask takes the reference before any cache write.
+    from transformers.cache_utils import DynamicCache
+    model = _model()
+    module = model.model.layers[1].self_attn
+    torch.manual_seed(5)
+    n = 40
+    past = DynamicCache(config = model.config)
+    past.update(torch.randn(1, 2, n - 2, 32), torch.randn(1, 2, n - 2, 32), module.layer_idx)
+    past.update_indexer(torch.randn(1, n - 2, 16), module.layer_idx)
+    mask = torch.ones(1, 1, 2, n, dtype = torch.bool)
+    mask[:, :, 0, -1] = False
+    mask[:, :, 1, 3] = False
+    counter = zoo.QWEN4_EXP_CACHED_DECODE_MISMATCH.get(torch.device("cpu"))
+    before = 0 if counter is None else int(counter)
+    with torch.no_grad():
+        out = _REAL_CACHED_DECODE(module, torch.randn(1, 2, 64), (torch.randn(1, n, 8), torch.randn(1, n, 8)), mask,
+                                  past, {})
+    assert out is None
+    assert past.layers[module.layer_idx].indexer_keys.shape[1] == n - 2   # untouched: the reference appends
+    counter = zoo.QWEN4_EXP_CACHED_DECODE_MISMATCH.get(torch.device("cpu"))
+    assert (0 if counter is None else int(counter)) == before
+
+
+def test_inference_mode_then_no_grad_decode(patched):
+    # The mismatch counter is created on the first cached step; under inference_mode it must not become an
+    # inference tensor, or a later cached step under plain no_grad raises on counter.add_().
+    zoo.QWEN4_EXP_CACHED_DECODE_MISMATCH.clear()
+    model = _model()
+    ids, mask, prompt = _batch([30, 30], 40)
+    pos = _positions(mask)
+
+    def step(ctx):
+        before = zoo.QWEN4_EXP_SPARSE_STATS["cached_decode"]
+        with ctx():
+            out = model(input_ids = ids[:, :prompt], attention_mask = mask[:, :prompt],
+                        position_ids = pos[:, :prompt], use_cache = True)
+            model(input_ids = ids[:, prompt : prompt + 1], attention_mask = mask[:, : prompt + 1],
+                  position_ids = pos[:, prompt : prompt + 1], past_key_values = out.past_key_values, use_cache = True)
+        return zoo.QWEN4_EXP_SPARSE_STATS["cached_decode"] - before
+
+    assert step(torch.inference_mode) > 0
+    assert step(torch.no_grad) > 0
+    counter = zoo.QWEN4_EXP_CACHED_DECODE_MISMATCH[ids.device]
+    assert not counter.is_inference() and int(counter) == 0
