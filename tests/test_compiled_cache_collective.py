@@ -1226,6 +1226,38 @@ def test_repeated_dtype_patching_does_not_stack_the_source_rewrite(
             sys.modules.pop(f"unsloth_cache_{module}", None)
 
 
+def test_generated_conv_forward_returns_autocast_dtype(monkeypatch, compiler, tmp_path):
+    """The source-rewritten Conv2d.forward must hand back autocast's dtype for a float32 input, as stock conv does,
+    and still follow the input's dtype with autocast off"""
+    import torch
+
+    patched = {
+        module: getattr(torch.nn, module).forward
+        for module in compiler._patch_functions
+        if hasattr(getattr(torch.nn, module, None), "forward")
+    }
+    functional = {
+        attr: getattr(torch.nn.functional, attr)
+        for attr in ("layer_norm", "rms_norm", "group_norm", "batch_norm")
+        if hasattr(torch.nn.functional, attr)
+    }
+    try:
+        _patch_dtype_modules_twice(compiler, monkeypatch, tmp_path)
+        assert "torch.get_autocast_dtype" in pathlib.Path(tmp_path / "Conv2d.py").read_text(encoding="utf-8")
+        conv = torch.nn.Conv2d(3, 4, 3).to(torch.bfloat16)
+        features = torch.randn(1, 3, 8, 8)
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+            assert conv(features).dtype == torch.bfloat16
+        with torch.no_grad():
+            assert conv(features).dtype == torch.float32
+    finally:
+        for module, forward in patched.items():
+            getattr(torch.nn, module).forward = forward
+        for attr, function in functional.items():
+            setattr(torch.nn.functional, attr, function)
+        for module in compiler._patch_functions:
+            sys.modules.pop(module, None)
+            sys.modules.pop(f"unsloth_cache_{module}", None)
 
 
 def test_a_planted_cache_moe_utils_is_kept_off_the_recovery_search_path(

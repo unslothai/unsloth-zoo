@@ -81,7 +81,8 @@ def test_subsampling_runs_16_bit_and_matches_bitwise(unsloth_conv_wrapper):
     _hook(module)  # idempotent: one hook, not two
     assert len(module._forward_pre_hooks) == 1
     got, after = _run(module, features, mask)
-    assert set(before) == {torch.float32}
+    # under autocast the wrapper already returns 16 bit; the hook still matters with autocast off
+    assert set(before) == {torch.bfloat16}
     assert set(after) == {torch.bfloat16}
     assert got.dtype == expected.dtype
     assert torch.equal(got, expected)
