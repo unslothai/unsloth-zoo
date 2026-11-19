@@ -23,6 +23,7 @@ __all__ = [
     "unsloth_fsdp_unshard",
     "unsloth_zero3_partitioned",
     "unsloth_zero3_gathered",
+    "unsloth_label_smoothing_override",
 ]
 
 import torch
@@ -33,6 +34,7 @@ import functools
 import math
 import os
 import sys
+import contextlib
 from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compile_options, logger
 from unsloth_zoo.temporary_patches.common import CHUNK_ALIGN_ROWS, chunk_row_bounds
 from unsloth_zoo.device_type import DEVICE_TYPE
@@ -787,6 +789,43 @@ def _chunked_ce_opaque(hidden_states, lm_head_weight, lm_head_bias, labels, mask
     )
 
 
+class _LabelSmoothingOverride:
+    """Only `active` is read in traced code (no graph break when off); the rest behind torch.compiler.disable."""
+    active = False
+    epsilon = 0.0
+    n_items = None
+    engaged = 0
+
+_LABEL_SMOOTHING = _LabelSmoothingOverride()
+
+
+@contextlib.contextmanager
+def unsloth_label_smoothing_override(epsilon, n_items):
+    """Fused CE uses label_smoothing = epsilon, divided by `n_items` instead of the caller's. `engaged` counts
+    applied calls (0 = caller should fall back). Not reentrant."""
+    state = _LABEL_SMOOTHING
+    if state.active:
+        raise RuntimeError("Unsloth: unsloth_label_smoothing_override is not reentrant.")
+    epsilon = float(epsilon)
+    if not 0.0 <= epsilon <= 1.0:
+        raise ValueError(f"Unsloth: label_smoothing must be between 0.0 and 1.0, got {epsilon}.")
+    state.epsilon, state.n_items, state.engaged, state.active = epsilon, n_items, 0, True
+    try:
+        yield state
+    finally:
+        state.active = False
+        state.n_items = None
+
+
+@torch.compiler.disable
+def _apply_label_smoothing_override(n_items, kwargs):
+    state = _LABEL_SMOOTHING
+    if not state.active or float(kwargs.get("label_smoothing", 0.0) or 0.0) != 0.0:
+        return n_items, kwargs
+    state.engaged += 1
+    return state.n_items, {**kwargs, "label_smoothing": state.epsilon}
+
+
 def unsloth_fused_ce_loss(
     trainer,
     hidden_states  : torch.Tensor,
@@ -822,6 +861,8 @@ def unsloth_fused_ce_loss(
         scaler = None
         if hasattr(scaling, "get_scale"): scaling = None
     scaling = scaler if scaler is not None else scaling
+    if _LABEL_SMOOTHING.active:
+        n_items, kwargs = _apply_label_smoothing_override(n_items, kwargs)
     if TARGET_GB: target_gb = float(TARGET_GB)
     elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)
 
