@@ -301,6 +301,9 @@ def _refuse_offloaded(model, action) -> None:
             f"Unsloth: this model was loaded with offload, which is for inference only; "
             f"{action} needs the model loaded without offload."
         )
+    from .utils import refuse_released_vision
+
+    refuse_released_vision(model, action)
 
 
 def _keep_norm_parameters_float32(model) -> None:
@@ -4064,6 +4067,79 @@ def _freeze_outside_language_model(model) -> None:
     for _, module in model.named_modules():
         if id(module) not in shared:
             module.freeze(recurse=False)
+
+
+def _detach_vision_modules(model) -> dict:
+    """Detach top-level non-audio modules outside the language model that share none of its modules."""
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from .utils import _AUDIO_TOWER_ATTRS
+
+    language_model = getattr(model, "language_model", None)
+    if not isinstance(model, nn.Module) or language_model is None:
+        return {}
+    shared = {id(module) for module in language_model.modules()}
+    released = {}
+    for name, child in model.children().items():
+        modules = [m for _, m in tree_flatten(child, is_leaf=lambda x: isinstance(x, nn.Module))]
+        if (
+            name == "language_model"
+            or "audio" in name
+            or name in _AUDIO_TOWER_ATTRS
+            or not modules
+            or not all(isinstance(m, nn.Module) for m in modules)
+        ):
+            continue
+        if not any(id(m) in shared for module in modules for m in module.modules()):
+            released[name] = child
+    for name in released:
+        del model[name]
+    return released
+
+
+def _settle_detached_vision(model, released, target_dtype=None, model_type="") -> int:
+    """Bytes of the detached modules if text still embeds and runs without them, else reattach (cast to
+    target_dtype, which the load applied while they were out) and return 0."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from .utils import _get_processor_tokenizer
+
+    if not released:
+        return 0
+    ids = mx.array([list(_PROBE_TOKEN_PAIRS[0][0])])
+    try:
+        embed = getattr(model, "get_input_embeddings", None)
+        if callable(embed):
+            embeds = _call_restoring_module_state(model, lambda: embed(ids))
+            mx.eval(getattr(embeds, "inputs_embeds", embeds))
+        _verify_text_only_wrapper(
+            model, getattr(model, "_unsloth_modality_model_type", ""), check_causality=False
+        )
+    except Exception:
+        for name, child in released.items():
+            model[name] = child
+        if target_dtype is not None:
+            _convert_mlx_dtype(model, target_dtype, model_type=model_type)
+        mx.eval(_resident_parameters(model))
+        return 0
+    processor = getattr(model, "_processor", None)
+    for target in (model, processor, _get_processor_tokenizer(processor) if processor else None):
+        if target is not None:
+            target._unsloth_supports_images = False
+    model._unsloth_vision_released = True
+    return sum(value.nbytes for _, value in tree_flatten(released) if isinstance(value, mx.array))
+
+
+def release_vision_weights(model) -> int:
+    """Free a VLM's vision modules for text-only inference and return the bytes freed (0, untouched, if text
+    needs them). The model then reads no images and refuses saving and training."""
+    import mlx.core as mx
+
+    freed = _settle_detached_vision(model, _detach_vision_modules(model))
+    if freed:
+        gc.collect()
+        mx.clear_cache()
+    return freed
 
 
 def _resolve_mlx_vlm_model_class(model_type):
@@ -9514,6 +9590,7 @@ class FastMLXModel:
         pipeline_group=None,
         tensor_group=None,
         offload=None,
+        drop_vision_weights=False,
         **kwargs,  # Accept and ignore GPU-only kwargs
     ):
         """Load a model via mlx-lm (text) or mlx-vlm (vision) on Apple Silicon.
@@ -9559,6 +9636,11 @@ class FastMLXModel:
                 for a caller that prices loads its own way: called with the
                 downloaded checkpoint's directory before any weight is read, it
                 returns either of the forms above.
+            drop_vision_weights: Inference only, on a checkpoint that loads
+                through mlx-vlm: never read the vision tower and projector, so
+                the model reads no images and cannot be saved whole. Kept when
+                the text path turns out to need them;
+                ``model._unsloth_vision_freed`` holds the bytes left unread.
 
         Reloading a saved LoRA/DoRA adapter directory returns a model whose
         base is frozen and whose adapter parameters are trainable, so it can be
@@ -10454,6 +10536,7 @@ class FastMLXModel:
             and _resolve_mlx_vlm_model_class(model_type) is None
         )
 
+        detached_vision = {}
         if force_vlm_text_path:
             is_vlm = True
         elif text_only is True or mlx_lm_images:
@@ -10462,6 +10545,7 @@ class FastMLXModel:
             is_vlm = True
         else:
             is_vlm = _is_vlm(config_data)
+        drop_vision = bool(drop_vision_weights and is_vlm)
 
         extra_kwargs = {"trust_remote_code": bool(trust_remote_code)}
         if token:
@@ -10582,6 +10666,8 @@ class FastMLXModel:
                         _vlm_load_config,
                         vlm_load_target,
                     )
+                if drop_vision:
+                    detached_vision = _detach_vision_modules(model)
                 model, vlm_cfg = _run_with_vlm_config_view(
                     _apply_mlx_quantization,
                     model, vlm_cfg, quantization_spec,
@@ -10620,7 +10706,7 @@ class FastMLXModel:
                 # Lazy-load when converting dtype so weights materialize once.
                 vlm_kwargs = dict(extra_kwargs)
                 vlm_kwargs["revision"] = revision
-                if target_dtype is not None:
+                if target_dtype is not None or drop_vision:
                     vlm_kwargs["lazy"] = True
                 model, processor = _run_with_vlm_config_view(
                     _load_mlx_vlm_with_extra_weight_filter,
@@ -10630,9 +10716,13 @@ class FastMLXModel:
                     vlm_kwargs,
                     hf_token=token,
                 )
+                if drop_vision:
+                    detached_vision = _detach_vision_modules(model)
                 _apply_offload(
                     model, original_local_path or local_path, offload, target_dtype, max_seq_length,
                 )
+                if drop_vision and target_dtype is None:
+                    mx.eval(_resident_parameters(model))
 
             processor = _run_with_vlm_config_view(
                 _repair_degraded_vlm_processor,
@@ -10668,6 +10758,9 @@ class FastMLXModel:
                 model_path=local_path,
                 model_type=model_type,
                 strict=False,
+            )
+            model._unsloth_vision_freed = _run_with_vlm_config_view(
+                _settle_detached_vision, model, detached_vision, target_dtype, model_type
             )
             if force_vlm_text_path:
                 print(
