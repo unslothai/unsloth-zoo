@@ -2825,20 +2825,20 @@ def _prompt_completion_boundary(prompt_ids, pc_ids, anchor = 4):
     i = j = shared
     deleted = False
     while i < len(p) and j < len(q):
-        d = next((d for d in range(1, len(p) - i - anchor + 1) if p[i + d : i + d + anchor] == q[j : j + anchor]), None)
+        d = next((k for k in range(1, len(p) - i - anchor + 1) if p[i + k : i + k + anchor] == q[j : j + anchor]), None)
         if d is None:
             break
         i, deleted = i + d, True
         while i < len(p) and j < len(q) and p[i] == q[j]:
             i, j = i + 1, j + 1
-    kind = "rewrite" if deleted else "diverge"
+    kind = "deleted" if deleted else "diverge"
     # A short unmatched tail is a merged token or prompt-only closing tokens (Gemma 4 "<turn|>\n", DeepSeek-R1
     # "<think>\n"). A long one whose last ids reappear later is a rewrite we cannot line up: mask len(prompt).
     if len(p) - i >= anchor and any(q[r : r + anchor] == p[-anchor:] for r in range(j, len(q) - anchor + 1)):
         kind, j = "unaligned", n
     if kind not in _PROMPT_COMPLETION_BOUNDARY_WARNED:
         _PROMPT_COMPLETION_BOUNDARY_WARNED.add(kind)
-        if kind == "rewrite":
+        if kind == "deleted":
             print(
                 "Unsloth: Warning: the chat template renders earlier turns of the prompt differently once the "
                 "completion is appended (for example GPT-OSS drops the analysis text of tool-calling turns when "
