@@ -457,3 +457,202 @@ def test_cuda_dropout_attention_is_recomputed(monkeypatch, dtype):
         torch.testing.assert_close(a, b)
     assert SA.SAVED_ATTENTION_STATS["random"] == 2, dict(SA.SAVED_ATTENTION_STATS)
     assert SA.SAVED_ATTENTION_STATS["reused"] == 0
+
+
+# Automatic mode: unset / =auto, engaged by a caller (Unsloth's attention dispatch) that routes calls.
+
+
+def _fake_memory(monkeypatch, base_peak, capacity):
+    """CPU stand-in for the allocator: a fixed run peak plus whatever is kept on top of it."""
+    state = {"peak": base_peak}
+
+    def peak(device):
+        live = sum(b.live for b in SA._BUDGETS.values())
+        state["peak"] = max(state["peak"], base_peak + live)
+        return state["peak"]
+
+    monkeypatch.setattr(SA, "_device_peak", peak)
+    monkeypatch.setattr(SA, "_device_capacity", lambda device: capacity)
+    monkeypatch.setattr(SA, "_AUTO_MARGIN_BYTES", 0)
+    monkeypatch.setattr(SA, "_AUTO_MARGIN_FRACTION", 0.0)
+    return state
+
+
+@pytest.fixture
+def auto(monkeypatch):
+    monkeypatch.setattr(SA, "_AUTO_ACTIVE", [True])
+    monkeypatch.setattr(SA, "_BUDGETS", {})
+    yield
+
+
+def _main(monkeypatch, params, x, steps):
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "0")
+    out = _run(params, x, ckpt = True, steps = steps)
+    monkeypatch.delenv("UNSLOTH_GC_SAVE_ATTENTION")
+    assert sum(SA.SAVED_ATTENTION_STATS.values()) == 0 and not SA._BUDGETS
+    return out
+
+
+# One layer keeps the attention output (B, H, S, D) plus a float32 logsumexp (B, H, S).
+_LAYER_BYTES = B * H * S * D * 4 + B * H * S * 4
+
+
+def test_auto_keeps_nothing_until_a_step_was_measured_then_reuses(monkeypatch, auto):
+    params, x = _make()
+    full = _main(monkeypatch, params, x, 2)
+    _fake_memory(monkeypatch, base_peak = 1 << 20, capacity = 1 << 30)
+    saved = _run(params, x, ckpt = True, steps = 2)
+    _close(saved, full)
+    stats = SA.SAVED_ATTENTION_STATS
+    # First step: no step of this size measured yet; second step: every layer kept and reused.
+    assert stats["declined_unmeasured"] == 3, dict(stats)
+    assert stats["stored"] == 3 and stats["reused"] == 3, dict(stats)
+    assert saved[2] == 6 + 3
+    assert stats["kept_bytes"] == 3 * _LAYER_BYTES
+    assert all(b.live == 0 for b in SA._BUDGETS.values())
+
+
+def test_auto_keeps_only_what_the_budget_allows(monkeypatch, auto):
+    params, x = _make()
+    full = _main(monkeypatch, params, x, 3)
+    base_peak = 1 << 20
+    # Room for two layers' outputs on top of the run's own peak, not three.
+    _fake_memory(monkeypatch, base_peak, capacity = base_peak + 2 * _LAYER_BYTES + _LAYER_BYTES // 2)
+    saved = _run(params, x, ckpt = True, steps = 3)
+    _close(saved, full)
+    stats = SA.SAVED_ATTENTION_STATS
+    assert stats["declined_unmeasured"] == 3
+    assert stats["stored"] == 4 and stats["reused"] == 4, dict(stats)
+    assert stats["declined_budget"] == 2, dict(stats)
+
+
+def test_auto_declines_everything_without_headroom(monkeypatch, auto):
+    params, x = _make()
+    _fake_memory(monkeypatch, base_peak = 1 << 20, capacity = (1 << 20) + _LAYER_BYTES // 2)
+    saved = _run(params, x, ckpt = True, steps = 3)
+    stats = SA.SAVED_ATTENTION_STATS
+    assert stats["stored"] == 0 and stats["reused"] == 0
+    assert stats["declined_budget"] == 6
+    assert saved[2] == 2 * 3 * 3
+
+
+def test_auto_peak_reading_charges_kept_bytes_exactly(monkeypatch, auto):
+    """A peak reached while outputs are kept must not be learnt as the run's own peak (that would
+    shrink the budget every step until nothing is kept)."""
+    params, x = _make()
+    _fake_memory(monkeypatch, base_peak = 1 << 20, capacity = 1 << 30)
+    _run(params, x, ckpt = True, steps = 4)
+    stats = SA.SAVED_ATTENTION_STATS
+    assert stats["stored"] == 9 and stats["reused"] == 9
+    (budget,) = SA._BUDGETS.values()
+    assert budget.base_peak == 1 << 20
+
+
+def test_auto_a_longer_call_than_measured_keeps_nothing(monkeypatch, auto):
+    params, x = _make()
+    _fake_memory(monkeypatch, base_peak = 1 << 20, capacity = 1 << 30)
+    _run(params, x, ckpt = True, steps = 2)
+    (budget,) = SA._BUDGETS.values()
+    budget.measured = _LAYER_BYTES - 1
+    SA.SAVED_ATTENTION_STATS.clear()
+    _run(params, x, ckpt = True, steps = 1)
+    assert SA.SAVED_ATTENTION_STATS["stored"] == 0
+    assert SA.SAVED_ATTENTION_STATS["declined_unmeasured"] == 3
+
+
+def test_auto_frames_need_a_routing_caller_and_respect_the_kill_switch(monkeypatch):
+    monkeypatch.setattr(torch.version, "hip", None, raising = False)  # ROCm keeps the mode off
+    t = [torch.zeros(1, requires_grad = True)]
+    monkeypatch.setattr(SA, "_AUTO_ACTIVE", [False])
+    assert SA.new_saved_attention_frame(t) is None
+    monkeypatch.setattr(SA, "_AUTO_ACTIVE", [True])
+    frame = SA.new_saved_attention_frame(t)
+    assert frame is not None and frame.auto
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "auto")
+    assert SA.new_saved_attention_frame(t).auto
+    for off in ("0", "false", "off"):
+        monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", off)
+        assert SA.new_saved_attention_frame(t) is None
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
+    assert SA.new_saved_attention_frame(t).auto is False
+
+
+def test_auto_kill_switch_runs_like_main(monkeypatch, auto):
+    params, x = _make()
+    _fake_memory(monkeypatch, base_peak = 1 << 20, capacity = 1 << 30)
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "0")
+    off = _run(params, x, ckpt = True, steps = 2)
+    assert off[2] == 12
+    assert sum(SA.SAVED_ATTENTION_STATS.values()) == 0
+
+
+def _fake_gpu(monkeypatch, capability, hip = None, cuda = True):
+    monkeypatch.setattr(SA, "_AUTO_ACTIVE", [False])
+    monkeypatch.setattr(torch.version, "hip", hip, raising = False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: capability)
+
+
+@pytest.mark.parametrize("capability, min_seq", [((7, 5), 8192), ((8, 0), 8192), ((8, 9), 16384)])
+def test_auto_min_seq_on_measured_gpus(monkeypatch, capability, min_seq):
+    _fake_gpu(monkeypatch, capability)
+    assert SA.save_attention_auto_min_seq() == min_seq
+    assert SA._AUTO_ACTIVE[0] is True
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION_MIN_SEQ", "256")
+    assert SA.save_attention_auto_min_seq() == 256
+
+
+@pytest.mark.parametrize(
+    "capability, hip, cuda, setting",
+    [
+        ((8, 0), None, True, "0"),
+        ((8, 0), None, True, "1"),
+        ((8, 0), None, True, "offload"),
+        ((8, 6), None, True, None),
+        ((9, 0), None, True, None),
+        ((8, 0), "6.4", True, None),
+        ((8, 0), None, False, None),
+        ((10, 0), None, True, None),
+        ((12, 0), None, True, None),
+    ],
+)
+def test_auto_min_seq_is_off(monkeypatch, capability, hip, cuda, setting):
+    _fake_gpu(monkeypatch, capability, hip, cuda)
+    if setting is not None:
+        monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", setting)
+    assert SA.save_attention_auto_min_seq() is None
+    assert SA._AUTO_ACTIVE[0] is False
+    # An explicit setting keeps its own (unbudgeted) mode.
+    assert SA.save_attention_enabled() is (setting in ("1", "offload") and hip is None)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA (the real allocator's peak and free memory)")
+def test_cuda_auto_mode_with_the_real_allocator(monkeypatch, auto):
+    params, x = _make()
+    params = [[p.detach().to("cuda", torch.bfloat16).requires_grad_() for p in w] for w in params]
+    x = x.to("cuda", torch.bfloat16)
+    full = _main(monkeypatch, params, x, 3)
+    peak = torch.cuda.max_memory_allocated()
+    saved = _run(params, x, ckpt = True, steps = 3)
+    torch.testing.assert_close(saved[0], full[0])
+    for a, b in zip(saved[1], full[1]):
+        torch.testing.assert_close(a, b)
+    stats = SA.SAVED_ATTENTION_STATS
+    assert stats["declined_unmeasured"] == 3 and stats["stored"] == 6 and stats["reused"] == 6, dict(stats)
+    (budget,) = SA._BUDGETS.values()
+    assert budget.live == 0 and budget.base_peak >= peak
+    # The user's peak statistics are read, never reset.
+    assert torch.cuda.max_memory_allocated() >= peak
+
+
+def test_auto_measures_each_device_separately(monkeypatch, auto):
+    # A replay with a long call on one device and a short one on another measures each device at its own size.
+    _fake_memory(monkeypatch, base_peak = 0, capacity = 1 << 40)
+    long_cpu = torch.empty(1, 2, 64, 4, device = "cpu")
+    short_meta, long_meta = torch.empty(1, 2, 8, 4, device = "meta"), torch.empty(1, 2, 64, 4, device = "meta")
+    frame = SA.SavedAttentionFrame(auto = True)
+    assert not SA._auto_admit(frame, [long_cpu]) and not SA._auto_admit(frame, [short_meta])  # nothing measured yet
+    SA._auto_release(frame, True)
+    assert SA._auto_admit(SA.SavedAttentionFrame(auto = True), [long_cpu])
+    assert SA._auto_admit(SA.SavedAttentionFrame(auto = True), [short_meta])
+    assert not SA._auto_admit(SA.SavedAttentionFrame(auto = True), [long_meta])  # never measured at this size there
