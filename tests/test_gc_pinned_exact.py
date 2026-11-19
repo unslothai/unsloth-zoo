@@ -138,3 +138,24 @@ def test_real_setter_keeps_user_settings_string():
     env["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256,expandable_segments:True"
     out = subprocess.run([sys.executable, "-c", code], env = env, capture_output = True, text = True, check = True)
     assert out.stdout.strip() == "max_split_size_mb:256,expandable_segments:True,pinned_max_round_threshold_mb:4"
+
+
+def test_outgrown_exact_block_is_flushed_once_at_the_next_step(monkeypatch, gc_module):
+    flushes, raw = [], []
+    monkeypatch.setattr(gc_module, "_empty_host_cache", lambda: flushes.append(1) or True, raising = False)
+    monkeypatch.setattr(torch._C, "_host_emptyCache", lambda: raw.append(1), raising = False)
+    monkeypatch.setattr(gc_module, "_EXACT_OUTGROWN", False, raising = False)
+    monkeypatch.setattr(gc_module, "_GC_PINNED_EXACT", True, raising = False)
+    gc_module._note_outgrown_block(256 * 1024)      # the initial small slots: torch reuses those
+    gc_module._flush_outgrown_blocks()
+    assert flushes == []
+    gc_module._note_outgrown_block(6 * MIB)
+    gc_module._note_outgrown_block(7 * MIB)
+    assert len(raw) == 2                          # freed at once when its copies are done, no sync
+    gc_module._flush_outgrown_blocks()
+    gc_module._flush_outgrown_blocks()
+    assert flushes == [1] and len(raw) == 2
+    monkeypatch.setattr(gc_module, "_GC_PINNED_EXACT", False, raising = False)  # kill switch / base: never
+    gc_module._note_outgrown_block(6 * MIB)
+    gc_module._flush_outgrown_blocks()
+    assert flushes == [1] and len(raw) == 2

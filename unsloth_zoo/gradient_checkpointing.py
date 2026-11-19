@@ -192,6 +192,7 @@ def _grow_host_buffer(buffer, new_size):
         try:
             buffer.resize_(new_size)
             if pinned: _release_pinned(old_bytes)
+            _note_outgrown_block(old_bytes)
             return _mark_host_buffer(buffer)
         except RuntimeError as e:
             if pinned: _release_pinned(new_bytes)
@@ -323,6 +324,27 @@ def _exact_growth_numel(numel, itemsize):
     if not _GC_PINNED_EXACT or nbytes <= (_GC_PINNED_EXACT_MB << 20): return numel
     step = 1 << (nbytes.bit_length() - 4)
     return -(-(-(-nbytes // step) * step) // itemsize)
+
+
+_EXACT_OUTGROWN = False
+
+
+def _note_outgrown_block(old_bytes):
+    """An outgrown exact block fits none of the larger requests that follow, so it would stay pinned in
+    torch's cache. Free it now if its copies are done (no sync: last used in an earlier step), else at the
+    next step's first offload, after a sync."""
+    global _EXACT_OUTGROWN
+    if not _GC_PINNED_EXACT or old_bytes <= (_GC_PINNED_EXACT_MB << 20): return
+    _EXACT_OUTGROWN = True
+    try: torch._C._host_emptyCache()
+    except Exception: pass
+
+
+def _flush_outgrown_blocks():
+    global _EXACT_OUTGROWN
+    if not _EXACT_OUTGROWN: return
+    _EXACT_OUTGROWN = False
+    with _PINNED_LOCK: _empty_host_cache()
 
 
 def _pinned_block_bytes(nbytes):
@@ -1907,6 +1929,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         # New graph. Host slots are not rewound: pending graphs keep theirs.
                         if BACKWARD_PASS:
                             BACKWARD_PASS = False
+                            _flush_outgrown_blocks()
                             # A new graph: earlier prefetch descriptors and slot records are stale.
                             global OFFLOAD_GENERATION
                             OFFLOAD_GENERATION += 1
