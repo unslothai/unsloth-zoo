@@ -1193,12 +1193,32 @@ def _refuse_unsafe_member_name(name: str) -> str | None:
     return None
 
 
-def iter_archive_files(archive_path: str):
-    """Yield (filename, text_content) for every file in a wheel/sdist.
+def _is_scanned_member(name: str) -> bool:
+    """True for the member types scan_archive pattern-checks; must match its dispatch."""
+    lower = name.lower()
+    return lower.endswith(_SCANNED_SUFFIXES) or (
+        "/.github/workflows/" in lower and lower.endswith((".yml", ".yaml"))
+    )
+
+
+_SCANNED_SUFFIXES = (".pth", ".py", ".js", ".mjs", ".cjs", ".ts", ".sh", ".bash")
+
+
+def _scan_incomplete(incomplete, path: Path, reason: str) -> None:
+    print(f"  [WARN] {path.name}: {reason}", file = sys.stderr)
+    if incomplete is not None:
+        incomplete.append(reason)
+
+
+def iter_archive_files(archive_path: str, incomplete: list | None = None):
+    """Yield (filename, text_content) for every scanned file in a wheel/sdist.
 
     Streams members with size + count caps applied at the member level
     so a tarbomb / zipbomb cannot blow up the scanner's memory budget.
-    On cap breach we emit a `[WARN]` log and short-circuit the archive.
+    Members scan_archive never checks (binaries, data) are not read at
+    all. Anything that leaves a scanned member uninspected (a cap breach,
+    an unreadable member) is appended to ``incomplete`` so the caller
+    reports the archive as not fully scanned instead of clean.
     """
     path = Path(archive_path)
 
@@ -1211,10 +1231,9 @@ def iter_archive_files(archive_path: str):
                     continue
                 count += 1
                 if count > HARD_MAX_MEMBERS:
-                    print(
-                        f"  [WARN] {path.name}: refused; member count "
-                        f"{count} exceeds cap {HARD_MAX_MEMBERS}",
-                        file = sys.stderr,
+                    _scan_incomplete(
+                        incomplete, path,
+                        f"refused; member count {count} exceeds cap {HARD_MAX_MEMBERS}",
                     )
                     return
                 reason = _refuse_unsafe_member_name(info.filename)
@@ -1224,28 +1243,34 @@ def iter_archive_files(archive_path: str):
                         file = sys.stderr,
                     )
                     continue
+                if not _is_scanned_member(info.filename):
+                    continue  # never pattern-checked, so never read
                 # Declared (uncompressed) size cap.
                 if info.file_size > HARD_MAX_FILE_BYTES:
-                    print(
-                        f"  [WARN] {path.name}: skipped {info.filename!r} "
+                    _scan_incomplete(
+                        incomplete, path,
+                        f"skipped {info.filename!r} "
                         f"(declared {info.file_size} > cap {HARD_MAX_FILE_BYTES})",
-                        file = sys.stderr,
                     )
                     continue
                 if total + info.file_size > HARD_MAX_TOTAL_BYTES:
-                    print(
-                        f"  [WARN] {path.name}: cumulative bytes cap "
-                        f"{HARD_MAX_TOTAL_BYTES} hit at {info.filename!r}",
-                        file = sys.stderr,
+                    _scan_incomplete(
+                        incomplete, path,
+                        f"cumulative bytes cap {HARD_MAX_TOTAL_BYTES} hit at {info.filename!r}",
                     )
                     return
                 try:
-                    data = zf.read(info.filename)
-                    total += len(data)
-                    text = data.decode("utf-8", errors = "replace")
-                    yield info.filename, text
-                except Exception:
+                    # Read this entry, not the last one sharing its name: by name a duplicate would
+                    # skip the declared-size check above.
+                    data = zf.read(info)
+                except Exception as exc:
+                    _scan_incomplete(
+                        incomplete, path,
+                        f"could not read {info.filename!r} ({type(exc).__name__})",
+                    )
                     continue
+                total += len(data)
+                yield info.filename, data.decode("utf-8", errors = "replace")
 
     elif path.name.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar")):
         total = 0
@@ -1255,10 +1280,9 @@ def iter_archive_files(archive_path: str):
             for member in tf:
                 count += 1
                 if count > HARD_MAX_MEMBERS:
-                    print(
-                        f"  [WARN] {path.name}: refused; member count "
-                        f"{count} exceeds cap {HARD_MAX_MEMBERS}",
-                        file = sys.stderr,
+                    _scan_incomplete(
+                        incomplete, path,
+                        f"refused; member count {count} exceeds cap {HARD_MAX_MEMBERS}",
                     )
                     return
                 # Refuse symlinks / hardlinks / devices outright -- the
@@ -1287,19 +1311,20 @@ def iter_archive_files(archive_path: str):
                         file = sys.stderr,
                     )
                     continue
+                if not _is_scanned_member(member.name):
+                    continue  # never pattern-checked, so never read
                 declared = max(member.size, 0)
                 if declared > HARD_MAX_FILE_BYTES:
-                    print(
-                        f"  [WARN] {path.name}: skipped {member.name!r} "
+                    _scan_incomplete(
+                        incomplete, path,
+                        f"skipped {member.name!r} "
                         f"(declared {declared} > cap {HARD_MAX_FILE_BYTES})",
-                        file = sys.stderr,
                     )
                     continue
                 if total + declared > HARD_MAX_TOTAL_BYTES:
-                    print(
-                        f"  [WARN] {path.name}: cumulative bytes cap "
-                        f"{HARD_MAX_TOTAL_BYTES} hit at {member.name!r}",
-                        file = sys.stderr,
+                    _scan_incomplete(
+                        incomplete, path,
+                        f"cumulative bytes cap {HARD_MAX_TOTAL_BYTES} hit at {member.name!r}",
                     )
                     return
                 try:
@@ -1309,18 +1334,21 @@ def iter_archive_files(archive_path: str):
                     # Bound the read so a tar header that lies about
                     # size cannot OOM us.
                     data = f.read(HARD_MAX_FILE_BYTES + 1)
-                    if len(data) > HARD_MAX_FILE_BYTES:
-                        print(
-                            f"  [WARN] {path.name}: body of "
-                            f"{member.name!r} exceeded declared cap",
-                            file = sys.stderr,
-                        )
-                        continue
-                    total += len(data)
-                    text = data.decode("utf-8", errors = "replace")
-                    yield member.name, text
-                except Exception:
+                except (tarfile.TarError, EOFError, OSError):
+                    raise  # a broken container: scan_archive reports archive_corrupted
+                except Exception as exc:
+                    _scan_incomplete(
+                        incomplete, path,
+                        f"could not read {member.name!r} ({type(exc).__name__})",
+                    )
                     continue
+                if len(data) > HARD_MAX_FILE_BYTES:
+                    _scan_incomplete(
+                        incomplete, path, f"body of {member.name!r} exceeded declared cap",
+                    )
+                    continue
+                total += len(data)
+                yield member.name, data.decode("utf-8", errors = "replace")
     else:
         print(f"  [WARN] Unknown archive format: {path.name}", file = sys.stderr)
 
@@ -1335,8 +1363,9 @@ def scan_archive(archive_path: str, package: str) -> list[Finding]:
     main loop counts and surfaces it rather than reporting "0 findings".
     """
     findings: list[Finding] = []
+    incomplete: list[str] = []
     try:
-        for filename, content in iter_archive_files(archive_path):
+        for filename, content in iter_archive_files(archive_path, incomplete):
             lower = filename.lower()
             if lower.endswith(".pth"):
                 findings.extend(check_pth_file(content, filename, package))
@@ -1366,6 +1395,17 @@ def scan_archive(archive_path: str, package: str) -> list[Finding]:
                 os.path.basename(archive_path),
                 "archive_corrupted",
                 f"{type(exc).__name__}: {exc}"[:240],
+            )
+        )
+    if incomplete:
+        # Content the checks never saw cannot be reported clean.
+        findings.append(
+            Finding(
+                HIGH,
+                package,
+                os.path.basename(archive_path),
+                "scan_incomplete",
+                f"{len(incomplete)} scanned member(s) not inspected: {incomplete[0]}"[:240],
             )
         )
     return findings
@@ -1519,6 +1559,7 @@ def download_packages(
     """
     results: list[tuple[str, str]] = []
     download_errors: list[str] = []
+    dest = os.path.abspath(dest)  # pip runs with cwd = dest, so a relative --dest would nest
     env = _pip_download_env()
     specs = _split_index_specs(specs, download_errors)
     if not specs:
@@ -1546,6 +1587,7 @@ def download_packages(
                 text = True,
                 timeout = 600,  # transitive resolution can be slow
                 env = env,
+                cwd = dest,  # `-m` puts the cwd on sys.path; a checkout's pip/ must not run
             )
             if proc.returncode != 0:
                 msg = (
@@ -1591,6 +1633,7 @@ def download_packages(
                     text = True,
                     timeout = 120,
                     env = env,
+                    cwd = dest,  # `-m` puts the cwd on sys.path; a checkout's pip/ must not run
                 )
                 if proc.returncode != 0:
                     msg = (

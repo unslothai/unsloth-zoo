@@ -1914,6 +1914,11 @@ def _gpt_oss_cache_locations():
         try:
             import tempfile
             locs.append(os.path.join(tempfile.gettempdir(), os.path.basename(loc)))
+            # compiler._private_temp_compile_folder's per-user fallback.
+            if hasattr(os, "geteuid"):
+                locs.append(os.path.join(
+                    tempfile.gettempdir(), f"{os.path.basename(loc)}_{os.geteuid()}",
+                ))
         except Exception:
             pass
     # De-dup, preserve order (configured first = primary).

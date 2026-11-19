@@ -1342,6 +1342,17 @@ def _flatten(value, indent = 0):
     return json.dumps(value)
 
 
+def _require_safe_torch_load(torch, path):
+    # torch < 2.6 runs code from a crafted file even with weights_only=True (CVE-2025-32434).
+    from packaging.version import Version
+
+    if Version(str(torch.__version__)).release < (2, 6):
+        raise ValueError(
+            f"Unsloth: {path} is a pickle, and torch {torch.__version__} cannot load one safely. "
+            "Upgrade torch to 2.6 or newer, or ship the head as kev_head.safetensors with kev_config.json."
+        )
+
+
 def _plain(value):
     # Special-token text written in a request must not be tokenized as one.
     return re.sub(r"<\|([A-Za-z0-9_]+)\|>", r"<¦\1¦>", _flatten(value))
@@ -1368,6 +1379,7 @@ class _KevModel(_QwenModel):
         if (folder / "head.pt").is_file():
             import torch
 
+            _require_safe_torch_load(torch, folder / "head.pt")
             settings = torch.load(folder / "head.pt", map_location = "cpu", weights_only = True)
             tensors = {name: mx.array(tensor.float().numpy()) for name, tensor in settings["head"].items()}
         else:

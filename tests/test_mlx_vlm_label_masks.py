@@ -1257,6 +1257,110 @@ def test_a_wrapper_whose_signature_hides_what_it_demands_is_still_called():
         loader._TEXT_ONLY_CALL_PATCHED.discard(Wrapper)
 
 
+class _ToyVLM(nn.Module):
+    def __init__(self, text_reads_tower=False, tie_projector=False):
+        super().__init__()
+        self.language_model = nn.Embedding(16, 7)
+        self.vision_tower = [nn.Linear(64, 64), nn.Linear(64, 64)]
+        self.multi_modal_projector = self.language_model if tie_projector else nn.Linear(64, 7)
+        self.text_reads_tower = text_reads_tower
+
+    def get_input_embeddings(self, input_ids=None, pixel_values=None):
+        if self.text_reads_tower:
+            self.vision_tower[0].weight.sum()
+        return self.language_model(input_ids)
+
+    def __call__(self, input_ids):
+        return self.language_model(input_ids).cumsum(axis=1)
+
+
+@pytest.mark.parametrize(
+    "text_reads_tower,tie_projector,released",
+    [
+        pytest.param(False, False, ("vision_tower", "multi_modal_projector"), id="frees the tower and projector"),
+        pytest.param(False, True, ("vision_tower",), id="keeps a module the language model shares"),
+        pytest.param(True, False, (), id="keeps everything the text path still reads"),
+    ],
+)
+def test_releasing_vision_weights_frees_only_what_text_never_reads(text_reads_tower, tie_projector, released):
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx import loader
+
+    model = _ToyVLM(text_reads_tower, tie_projector)
+    model._unsloth_supports_images = True
+    ids = mx.array([[1, 2, 3]])
+    before = model(ids)
+    sizes = {n: sum(v.nbytes for _, v in tree_flatten(p)) for n, p in model.parameters().items()}
+    freed = loader.release_vision_weights(model)
+    assert freed == sum(sizes[name] for name in released)
+    assert all(name not in model for name in released)
+    assert all(name in model for name in sizes if name not in released)
+    assert mx.array_equal(model(ids), before).item()
+    assert model._unsloth_supports_images is not bool(released)
+
+
+def test_released_vision_keeps_audio_and_refuses_a_whole_save():
+    from unsloth_zoo.mlx import loader
+
+    from unsloth_zoo.mlx import utils
+
+    model = _ToyVLM()
+    model.audio_tower = nn.Linear(64, 64)
+    model.sound_encoder = nn.Linear(64, 64)
+    assert loader.release_vision_weights(model) > 0
+    assert "audio_tower" in model and "sound_encoder" in model and "vision_tower" not in model
+    with pytest.raises(ValueError, match="drop_vision_weights"):
+        utils.save_merged_model(model, None, "unused")
+    with pytest.raises(ValueError, match="drop_vision_weights"):
+        utils.save_lora_adapters(model, "unused")
+    with pytest.raises(ValueError, match="drop_vision_weights"):
+        loader._mlx_save_pretrained_merged(model, "unused")
+    with pytest.raises(ValueError, match="drop_vision_weights"):
+        loader._mlx_save_pretrained_gguf(model, "unused")
+
+
+def test_vision_kept_for_text_gets_the_load_dtype():
+    from unsloth_zoo.mlx import loader
+
+    model = _ToyVLM(text_reads_tower=True)
+    detached = loader._detach_vision_modules(model)
+    loader._convert_mlx_dtype(model, mx.bfloat16)
+    assert loader._settle_detached_vision(model, detached, mx.bfloat16) == 0
+    assert model.vision_tower[0].weight.dtype == mx.bfloat16
+    assert model.multi_modal_projector.weight.dtype == mx.bfloat16
+
+
+def test_a_failed_drop_leaves_disk_backed_tables_unread(monkeypatch):
+    from unsloth_zoo.mlx import loader
+
+    model = _ToyVLM(text_reads_tower=True)
+    detached = loader._detach_vision_modules(model)
+    evaluated = []
+    monkeypatch.setattr(loader, "_resident_parameters", lambda m: evaluated.append(m) or [])
+    assert loader._settle_detached_vision(model, detached) == 0
+    assert evaluated == [model]
+
+
+def test_a_released_model_skips_legacy_image_binding():
+    from types import SimpleNamespace
+    from mlx_vlm.models.base import BaseImageProcessor
+    from unsloth_zoo.mlx import loader, utils
+
+    class Legacy(BaseImageProcessor):
+        def preprocess(self, images):
+            raise AssertionError("probed a released tower")
+
+    class LegacyVLM(_ToyVLM):
+        def _prepare_inputs_for_multimodal(self, image_features, inputs_embeds, input_ids):
+            return inputs_embeds
+
+    model = LegacyVLM()
+    model.config = SimpleNamespace(image_token_index=5)
+    model._unsloth_supports_images = True
+    assert loader.release_vision_weights(model) > 0
+    utils.bind_legacy_image_processor(model, SimpleNamespace(image_processor=Legacy()))
+
+
 def test_the_check_leaves_no_state_behind_for_the_first_training_batch():
     """qwen2_vl reuses a cached `_position_ids` without checking it still fits."""
     from unsloth_zoo.mlx import loader
