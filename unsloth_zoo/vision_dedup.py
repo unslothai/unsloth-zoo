@@ -268,8 +268,26 @@ def _fallback(module, reason):
     logger.warning(f"Unsloth: encoding every image again for {type(module).__name__} ({reason}).")
 
 
+def _zero3(module):
+    # DeepSpeed ZeRO-3 gathers each partitioned parameter on every forward (a collective on every rank).
+    try:
+        from unsloth_zoo.temporary_patches.utils import zero3_partitioned_training
+        if zero3_partitioned_training():
+            return True
+    except Exception:
+        pass
+    cached = module.__dict__.get("_unsloth_image_dedup_zero3", None)
+    if cached is None:
+        cached = any(hasattr(p, "ds_id") for p in module.parameters())
+        module.__dict__["_unsloth_image_dedup_zero3"] = cached
+    return cached
+
+
 def _collective(module):
-    # Resharding FSDP2 towers all-gather per forward; a rank-local self-check forward would hang the other ranks.
+    # Resharding FSDP2 towers and ZeRO-3 partitioned towers all-gather per forward; a rank-local
+    # self-check or fallback forward would hang the other ranks.
+    if _zero3(module):
+        return True
     try:
         from unsloth_zoo.rl_replacements import grpo_forwards_are_collective
         return grpo_forwards_are_collective(module)

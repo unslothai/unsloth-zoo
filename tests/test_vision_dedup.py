@@ -250,3 +250,33 @@ def test_block_expand_backward_sums_half_copies_without_overflow(dtype):
     out2 = vision_dedup._BlockExpand.apply(src2, torch.zeros(3, dtype = torch.long), [(0, 1, [0, 1, 2])])
     out2.backward(torch.tensor([[1.0], [2.0 ** -11], [2.0 ** -11]], dtype = dtype))
     assert src2.grad.item() == float(torch.tensor(1.0 + 2.0 ** -10, dtype = dtype))
+
+
+def test_zero3_partitioned_towers_never_dedup(monkeypatch):
+    # ZeRO-3 all-gathers every partitioned parameter per forward: the first deduplicated call's
+    # self-check encode runs only on ranks that saw a duplicate image, so the others would hang.
+    import unsloth_zoo.temporary_patches.utils as tp
+    monkeypatch.setattr(tp, "zero3_partitioned_training", lambda: True)
+    _, model = _load("qwen2_5_vl")
+    assert vision_dedup.install_image_dedup(model) == 0
+    monkeypatch.setattr(tp, "zero3_partitioned_training", lambda: False)
+    proc, model = _load("qwen2_5_vl")
+    assert vision_dedup.install_image_dedup(model) > 0
+    inputs = _batch(proc)
+    tower = _tower(model)
+    calls = []
+    hook = tower.register_forward_hook(lambda m, a, o: calls.append(1))
+    monkeypatch.setattr(tp, "zero3_partitioned_training", lambda: True)
+    with torch.no_grad():
+        model(**inputs)
+    hook.remove()
+    assert len(calls) == 1  # one per-row encode, no self-check forward
+    assert not any(m.__dict__.get(vision_dedup._VERIFIED, False) for m in vision_dedup._image_modules(model))
+
+
+def test_ds_id_parameters_never_dedup():
+    # A tower whose parameters carry DeepSpeed ZeRO-3 ids stands down even without a live HF config.
+    _, model = _load("qwen2_5_vl")
+    for p in model.parameters():
+        p.ds_id = 0
+    assert vision_dedup.install_image_dedup(model) == 0
