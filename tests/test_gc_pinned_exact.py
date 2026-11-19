@@ -125,7 +125,14 @@ def test_counted_accounting_matches_the_allocator(monkeypatch, gc_module, gate, 
     assert again and fake.held() == 3 * 160 * MIB
 
 
-@pytest.mark.skipif(not hasattr(torch._C, "_accelerator_setAllocatorSettings"), reason = "torch < 2.9")
+# pinned_max_round_threshold_mb is not a recognized allocator setting before torch 2.13; match the production gate (2.14).
+_TORCH_MINOR = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+
+
+@pytest.mark.skipif(
+    _TORCH_MINOR < (2, 14) or not hasattr(torch._C, "_accelerator_setAllocatorSettings"),
+    reason = "torch < 2.14",
+)
 def test_real_setter_keeps_user_settings_string():
     # Real torch, no GPU needed: the settings string in effect after the call still carries the user's keys.
     code = (
