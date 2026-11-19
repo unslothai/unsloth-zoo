@@ -17,7 +17,7 @@
 
 eager_rounding=True replays the eager ATen op chain (bit-identical fwd + bwd); False rounds once.
 UNSLOTH_MOE_FUSED_SWIGLU: 0 off, 1 eager frames only (default), 2 also compiled frames. CUDA only
-(no ROCm: div.rn / fma pinned through PTX / libdevice); a failed launch falls back to the eager chain."""
+(no ROCm: div.rn / rcp.rn pinned through PTX); a failed launch falls back to the eager chain."""
 
 __all__ = [
     "ACT_SILU",
@@ -293,8 +293,9 @@ if triton is not None:
             s = _rnd(_div_rn(g, 1.0 + libdevice.exp(-g)), ROUND, DT)
             d_up = dy * s
             d_s = _rnd(dy * u, ROUND, DT)
-            # nvcc contracts silu_backward's inner mul-add to an fma.
-            d_gate = (d_s * sig) * libdevice.fma(g, 1.0 - sig, 1.0)
+            # nvcc contracts silu_backward's inner mul-add to an fma. tl.fma (fma.rn.f32, Triton >= 3.0), not
+            # libdevice.fma: Triton main removed libdevice.fma / fma_rn.
+            d_gate = (d_s * sig) * tl.fma(g, 1.0 - sig, 1.0)
         d_gate = d_gate.to(DT)
         d_up = d_up.to(DT)
         if INTERLEAVED:
