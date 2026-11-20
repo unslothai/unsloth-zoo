@@ -3027,7 +3027,10 @@ def _vllm_flashinfer_head_size_ok(config) -> bool:
     if any(getattr(text_config, k, None) for k in ("kv_lora_rank", "q_lora_rank")):
         return False  # MLA: vLLM sizes the cache from kv_lora_rank + qk_rope_head_dim
     sizes = set()
-    head_dim = getattr(text_config, "head_dim", None)
+    # Same order as vLLM 0.11.2 ModelConfig.get_head_size: head_dim, hidden_size_per_head (PLaMo2), then the division.
+    head_dim = getattr(text_config, "head_dim", None) or getattr(text_config, "hidden_size_per_head", None)
+    if getattr(text_config, "model_type", None) == "zamba2":
+        head_dim = getattr(text_config, "attention_head_dim", None) or head_dim
     if not head_dim:
         hidden = getattr(text_config, "hidden_size", None)
         heads = getattr(text_config, "num_attention_heads", None)
@@ -4860,16 +4863,23 @@ def load_vllm(
                         print(f"Unsloth: `{model_name} does not support `VLLM_ATTENTION_BACKEND==FLASHINFER`. Will disable")
                     if "VLLM_ATTENTION_BACKEND" in os.environ:
                         del os.environ["VLLM_ATTENTION_BACKEND"]
-                elif os.environ.get("VLLM_ATTENTION_BACKEND", "") != "":
-                    pass
+                elif os.environ.get("VLLM_ATTENTION_BACKEND", "") not in (
+                    "", os.environ.get("_UNSLOTH_AUTO_VLLM_ATTENTION_BACKEND", ""),
+                ):
+                    pass  # The user's choice (a value an earlier Unsloth load set is re-decided below)
                 elif not _vllm_flashinfer_head_size_ok(config):
-                    pass  # Left unset: vLLM picks a fitting backend
+                    # Left unset: vLLM picks a fitting backend. Drop a FLASHINFER an earlier load in this process set.
+                    if os.environ.get("_UNSLOTH_AUTO_VLLM_ATTENTION_BACKEND", "") != "":
+                        os.environ.pop("VLLM_ATTENTION_BACKEND", None)
+                        os.environ.pop("_UNSLOTH_AUTO_VLLM_ATTENTION_BACKEND", None)
                 elif not use_bitsandbytes and major_version >= 8:
                     # Allowed: FLASHINFER, TORCH_SDPA, FLASH_ATTN, XFORMERS, ROCM_FLASH
                     os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+                    os.environ["_UNSLOTH_AUTO_VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
                 elif Version(vllm_version) >= Version("0.11.0"):
                     # On 0.11.0, Flashinfer also works!
                     os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+                    os.environ["_UNSLOTH_AUTO_VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
 
                 # Flashinfer sampler maybe makes it somewhat faster on newer GPUs
                 # Tesla T4 is 280 tok/s vs 330 tok/s
