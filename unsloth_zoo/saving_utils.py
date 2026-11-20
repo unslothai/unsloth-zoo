@@ -4213,6 +4213,27 @@ def _carry_over_vocab_size(base_config, trained_config):
 pass
 
 
+def _carry_over_rope_scaling(base_config, trained_config, model):
+    # The loader puts RoPE scaling (the caller's rope_scaling, or linear past the native window) and the widened
+    # max_position_embeddings on the in-memory config only, so the base checkpoint's would reload the merged
+    # weights with a RoPE they were not trained with. A field moves whole, and only when it differs.
+    from copy import deepcopy
+    source = (_text_configs(trained_config) or [trained_config])[0]
+    target = (_text_configs(base_config) or [base_config])[0]
+    # transformers 5 keeps RoPE in rope_parameters (rope_scaling aliases it); 4.x in rope_scaling.
+    keys = ["rope_parameters" if getattr(target, "rope_parameters", None) is not None else "rope_scaling"]
+    # Unsloth's Gemma / Gemma 2 rotary reads only rope_theta, so the linear scaling the loader writes for a
+    # long max_seq_length never reached training: those weights learned the base RoPE.
+    if any(type(module).__name__ == "GemmaFixedRotaryEmbedding" for module in model.modules()): keys = []
+    for key in keys + ["max_position_embeddings"]:
+        trained = getattr(source, key, None)
+        if trained is None or trained == getattr(target, key, None): continue
+        try: setattr(target, key, deepcopy(trained))
+        except Exception: pass  # read-only on some composite configs
+    pass
+pass
+
+
 def _shard_name_stays_inside(name):
     """Whether `name` resolves under the directory it is joined onto.
 
@@ -5780,6 +5801,7 @@ def merge_and_overwrite_lora(
             base_config = config
         else:
             _carry_over_vocab_size(base_config, config)
+            _carry_over_rope_scaling(base_config, config, model)
         # Read before saving: an in-place export overwrites the source config.json.
         source_model_type = source_config = None
         if _is_remote_code_config(base_config):
