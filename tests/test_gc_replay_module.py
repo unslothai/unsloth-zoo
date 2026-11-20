@@ -128,3 +128,14 @@ def test_module_with_forward_hook_is_never_reported():
         handle.remove()
     with gc._gradient_checkpoint_recompute_marker(layer):
         assert gc.gradient_checkpoint_replay_module() is layer
+
+
+def test_module_with_overridden_call_is_never_reported():
+    class _Squared(_Layer):
+        def __call__(self, *args, **kwargs):
+            return super().__call__(*args, **kwargs).square()
+
+    layer = _Squared()
+    assert gc._replayed_module(layer) is None
+    assert gc._replayed_module(layer.__call__) is None
+    assert gc._replayed_module(_Layer()) is not None

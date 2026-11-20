@@ -854,7 +854,8 @@ def _replayed_module(function):
             function = function.function
             continue
         if isinstance(function, torch.nn.Module):
-            return function
+            # An overridden __call__ may transform forward's output.
+            return function if type(function).__call__ in (torch.nn.Module.__call__, torch.nn.Module._call_impl) else None
         if isinstance(function, functools.partial):
             inner = function.func
             if inspect.ismethod(inner):
