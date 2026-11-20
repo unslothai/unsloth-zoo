@@ -15,7 +15,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """UnslothVisionDataCollator pickles for spawn DataLoader workers (Windows, macOS, or an explicit spawn start
-method), for every resize_dimension; its image-side function used to be a constructor-local lambda."""
+method): for every resize_dimension (its image-side function used to be a constructor-local lambda) and with
+train_on_responses_only (its masker used to be a local closure)."""
 
 import pickle
 from types import SimpleNamespace
@@ -23,7 +24,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from unsloth_zoo.dataset_utils import train_on_responses_only
 from unsloth_zoo.vision_utils import UnslothVisionDataCollator
+
+USER, ASSISTANT = "<|user|>", "<|assistant|>"
+MARKERS = {USER: 1, ASSISTANT: 2}
 
 
 class _Embedding:
@@ -37,8 +42,36 @@ class _Model:
         return _Embedding()
 
 
+class _Encoding(dict):
+    __getattr__ = dict.__getitem__
+
+
+class _Tokenizer:
+    """Markers are single ids; other text is per-character ordinals."""
+
+    def __call__(self, text, add_special_tokens = False, **kwargs):
+        if isinstance(text, (list, tuple)):
+            ids = [self(t).input_ids for t in text]
+            return _Encoding(input_ids = ids, attention_mask = [[1] * len(r) for r in ids])
+        ids, rest = [], text
+        while rest:
+            for marker, tid in MARKERS.items():
+                if rest.startswith(marker):
+                    ids.append(tid)
+                    rest = rest[len(marker):]
+                    break
+            else:
+                ids.append(ord(rest[0]))
+                rest = rest[1:]
+        return _Encoding(input_ids = ids, attention_mask = [1] * len(ids))
+
+    def convert_tokens_to_ids(self, tokens):
+        return [0] * len(tokens)
+
+
 class _Processor:
     image_processor = SimpleNamespace()
+    tokenizer = _Tokenizer()
 
     def convert_tokens_to_ids(self, tokens):
         return [0] * len(tokens)
@@ -55,3 +88,27 @@ def test_collator_pickles_for_spawn_workers(dimension, side):
     assert collator.size_func(image) == side
     assert restored.size_func(image) == side
     assert restored.resize_dimension == dimension
+
+
+ROW = [1, 10, 11, 2, 20, 21]
+
+
+def test_response_masker_pickles_and_masks_the_same():
+    masker = train_on_responses_only(
+        None, USER, ASSISTANT, tokenizer = _Tokenizer(), return_function = True
+    )
+    restored = pickle.loads(pickle.dumps(masker))
+    want = masker({"input_ids": [list(ROW)]})["labels"]
+    assert want[0] == [-100, -100, -100, -100, 20, 21]
+    assert restored({"input_ids": [list(ROW)]})["labels"] == want
+
+
+def test_collator_with_response_masking_pickles():
+    collator = UnslothVisionDataCollator(
+        _Model(), _Processor(), train_on_responses_only = True,
+        instruction_part = USER, response_part = ASSISTANT,
+    )
+    restored = pickle.loads(pickle.dumps(collator))
+    batch = {"input_ids": [list(ROW)]}
+    assert restored.train_on_responses_only(batch)["labels"] == \
+        collator.train_on_responses_only(batch)["labels"]
