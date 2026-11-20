@@ -1,6 +1,7 @@
 """Tests full-FT norm fp32 upcast (dangling else left bf16); norms claimed via _pre_set_compute_dtype are never
 overwritten; UNSLOTH_DISABLE_FLOAT32_UPCAST=1 reverts."""
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -106,6 +107,40 @@ def _run(full_finetuning, with_bias=False, env=None,
         patch_modules_to_save=False,
     )
     return m, _params(m)
+
+
+def test_bf16_full_finetuning_preserves_declared_fp32_weights(monkeypatch):
+    from unsloth_zoo.training_utils import prepare_model_for_training
+
+    monkeypatch.setenv("UNSLOTH_MIXED_PRECISION", "bfloat16")
+    model = nn.Module()
+    model.config = SimpleNamespace(torch_dtype=torch.bfloat16)
+    model.proj = nn.Linear(4, 4)
+    model.gate = nn.Linear(4, 4)
+    model.gate.weight = model.proj.weight  # enumerated under the unlisted name first
+    model.gate.weight.requires_grad_(False)
+    model.router = nn.Sequential(nn.Linear(4, 4))
+    model.other_router = nn.Linear(4, 4)
+    model.lm_head = nn.Linear(4, 4).bfloat16()
+    model._keep_in_fp32_modules_strict = ["gate.weight"]
+    model._keep_in_fp32_modules = ["router", "lm_head"]
+    with torch.no_grad():
+        model.gate.weight.fill_(1.001)  # rounding to bf16 loses the checkpoint value
+    saved = model.gate.weight.detach().clone()
+
+    prepare_model_for_training(
+        model, full_finetuning=True, float32_mixed_precision=False,
+        use_gradient_checkpointing=False, use_reentrant=False,
+    )
+
+    assert model.gate.weight.dtype == torch.float32
+    assert torch.equal(model.gate.weight, saved)
+    assert model.gate.weight is model.proj.weight
+    assert model.gate.weight.requires_grad
+    assert model.router[0].weight.dtype == model.router[0].bias.dtype == torch.float32
+    assert model.gate.bias.dtype == torch.bfloat16
+    assert model.other_router.weight.dtype == torch.bfloat16
+    assert model.lm_head.weight.dtype == torch.bfloat16
 
 
 def test_full_ft_norm_weights_become_fp32():
