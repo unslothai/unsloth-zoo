@@ -1968,6 +1968,38 @@ def test_a_vision_row_hands_its_own_cache_back_as_it_leaves(monkeypatch):
     assert handed == [[1, "own"], [0, "own"]] and not session._retiring
 
 
+def test_a_resumed_vision_row_is_freed_without_the_cycle_collector(monkeypatch):
+    import gc
+    import weakref
+    from unsloth_zoo.mlx import generate
+
+    reopened, state = [], types.SimpleNamespace(open = lambda ids: None, checkpoint = lambda n, cache: None)
+    session = _vlm_session(prefill_batch_size = 1)
+    monkeypatch.setattr(generate, "row_prompt_cache_unavailable_reason", lambda: None)
+    monkeypatch.setattr(generate, "_install_row_prefill_batch", lambda module: None)
+    monkeypatch.setattr(session.adapter, "batch_module", None, raising = False)
+    monkeypatch.setattr(session, "_open_row", lambda *a: generate._RowPrefill([], 0, None, frozenset()))
+    monkeypatch.setattr(session, "_reopen", lambda *a: reopened.append(a) or a[-1])
+    row, _, _ = session._resume(GenerationRequest(prompt = "ab", prompt_cache_state = state), [1, 2], {})
+
+    class Prompt:
+        def __init__(self, prompt_kwargs, uids, warm_cache = None): pass
+
+    generate._row_prefill_batch_class(Prompt)(prompt_kwargs = {generate._ROW_PREFILL_KEY: row}, uids = [0])
+    assert reopened[0][-2] is row  # the hook is handed the row it reopens
+    ref = weakref.ref(row)
+    reopened.clear()
+    collecting = gc.isenabled()
+    gc.disable()
+    try:
+        del row
+        assert ref() is None
+    finally:
+        if collecting:
+            gc.enable()
+        session.close()
+
+
 def test_a_batch_s_last_leaving_row_is_handed_views_of_its_own_buffers(monkeypatch):
     import numpy as np
     from unsloth_zoo.mlx.generate import _row_cache

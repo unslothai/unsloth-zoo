@@ -2829,7 +2829,8 @@ class _RowPrefill:
     checkpoint: Callable[[int, list], None]
     lengths: frozenset[int]
     quantize: Callable[[list], None] | None = None
-    reopen: Callable[[dict], dict] | None = None
+    # Takes the row when called: a hook holding its own row would keep the row's cache alive until a cyclic GC.
+    reopen: Callable[["_RowPrefill", dict], dict] | None = None
     step: int | None = None
 
 
@@ -2882,7 +2883,7 @@ def _row_prefill_batch_class(base):
                 if len(kwargs.get("uids") or ()) != 1 or kwargs.get("warm_cache") is not None:
                     raise RuntimeError("A row carrying its own prompt cache must prefill alone.")
                 if row.reopen is not None:
-                    kwargs = row.reopen(kwargs)
+                    kwargs = row.reopen(row, kwargs)
                 kwargs["prompt_kwargs"] = {
                     key: value
                     for key, value in kwargs["prompt_kwargs"].items()
@@ -4187,7 +4188,7 @@ class _VLMBatchSession:
         _install_row_prefill_batch(batch_module)
         if addressed:
             prefill.reopen = functools.partial(
-                self._reopen, prefill, state, list(token_ids), self._banked,
+                self._reopen, state, list(token_ids), self._banked,
             )
         prefix = prefill.prefix
         if not prefix:
@@ -4242,7 +4243,7 @@ class _VLMBatchSession:
         state.checkpoint(token_count, cache)
         self._banked += 1
 
-    def _reopen(self, row: _RowPrefill, state, token_ids: list[int], banked: int, kwargs: dict) -> dict:
+    def _reopen(self, state, token_ids: list[int], banked: int, row: _RowPrefill, kwargs: dict) -> dict:
         """Resume a row as its prefill starts from what rows ahead banked since it was added."""
         pending = self._pending.get((kwargs.get("uids") or (None,))[0])
         if self._banked == banked or pending is None or kwargs.get("inputs_embeds") is None:
