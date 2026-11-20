@@ -331,7 +331,7 @@ def patch_gated_delta():
 
 
 # mlx-vlm 0.6.9 added lower_bound and 0.7.1 added cache, cache_index and state_steps, passed even as None; wrappers
-# accept whatever arrives and forward it, so one wrapper covers 0.4.x-0.7.x without version sniffing.
+# accept whatever arrives and forward it, so one wrapper covers every supported release without version sniffing.
 _VLM_CACHE_KWARGS = frozenset(("cache", "cache_index", "state_steps"))
 _WARNED_UNKNOWN_GATED_DELTA_KWARGS: set = set()
 
@@ -370,9 +370,8 @@ def _rebind_vlm_gated_delta_consumers(original, patched):
 
 
 def patch_gated_delta_vlm():
-    """Patches mlx_vlm >= 0.6's own qwen3_5 gated_delta_update (a distinct copy over non-differentiable
-    gated_delta_kernel) that the identity sweep skips; older mlx_vlm 0.4.x-0.5.x imports mlx_lm's, which the sweep
-    rebinds."""
+    """Patches mlx_vlm's own qwen3_5 gated_delta_update (a distinct copy over non-differentiable
+    gated_delta_kernel) that the identity sweep skips."""
     import sys
     # Importing it here would drag the mlx-vlm model packages into a text-only run.
     if not any(name.startswith("mlx_vlm.models.qwen3_5") for name in sys.modules):
@@ -380,24 +379,6 @@ def patch_gated_delta_vlm():
     try:
         from mlx_vlm.models.qwen3_5 import gated_delta as vlm_gated_delta
     except ImportError:
-        try:
-            from mlx_vlm.models.qwen3_5 import language as vlm_language
-        except ImportError:
-            return
-        patch_gated_delta()
-        try:
-            from mlx_lm.models import gated_delta
-        except ImportError:
-            return
-        if (
-            getattr(vlm_language, "gated_delta_update", None)
-            is not gated_delta.gated_delta_update
-        ):
-            vlm_language.gated_delta_update = gated_delta.gated_delta_update
-            print(
-                "Unsloth: Rebound legacy mlx-vlm GatedDeltaNet to mlx-lm "
-                "patched VJP."
-            )
         return
     try:
         # Imported for its side effect: the rebind sweep below only reaches consumers that are already in sys.modules.
@@ -407,7 +388,7 @@ def patch_gated_delta_vlm():
     try:
         from mlx_lm.models import gated_delta
     except ImportError:
-        # compute_g still comes from mlx_lm even on mlx-vlm 0.6+, which ships its own copy of the update; without mlx_lm there is nothing to patch with.
+        # compute_g still comes from mlx_lm, though mlx-vlm ships its own copy of the update; without mlx_lm there is nothing to patch with.
         return
 
     if getattr(vlm_gated_delta, "_unsloth_gated_delta_patched", False):

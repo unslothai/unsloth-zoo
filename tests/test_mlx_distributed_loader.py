@@ -382,14 +382,14 @@ def test_load_mlx_vlm_distributed_delegates_to_mlx_vlm_sharded_load(monkeypatch,
     from unsloth_zoo.mlx.loader import _load_mlx_vlm_distributed
     calls = []
     bound_calls = []
-    def bind(sharded):
+    def bind(sharded, **_kwargs):
         def wrapped(*args, **kwargs):
             bound_calls.append(True)
             return sharded(*args, **kwargs)
 
         return wrapped
 
-    monkeypatch.setattr(loader, "_bind_mlx_vlm_quantized_projector_loader", bind)
+    monkeypatch.setattr(loader, "_bind_mlx_vlm_processor_loader", bind)
     model_dir = _write_config(tmp_path, {"model_type": "raw"})
     (model_dir / "model.safetensors").write_text("weights")
     monkeypatch.chdir(tmp_path)
@@ -465,7 +465,7 @@ def test_from_pretrained_distributed_vlm_forwards_normalized_override(monkeypatc
         "_ensure_vlm_prompt_utils_patched", "_convert_mlx_dtype",
         "_patch_mixed_precision_set_dtype", "_ensure_minicpmo_mlx_sanitize",
         "_ensure_native_vlm_weight_names",
-        "_ensure_minicpmo_vision_dtype", "_fix_gemma4_kv_sharing",
+        "_fix_gemma4_kv_sharing",
         "_fix_gemma3_vision_post_layernorm_eps", "_fix_gemma3_vision_attention_fp32_sdpa",
         "_fix_gemma3_vision_encoder_fp32_layernorm", "_fix_gemma3_vision_post_layernorm_fp32",
         "_fix_gemma3_vision_mlp_fp32_activation", "_fix_gemma3_language_mlp_fp32_activation",

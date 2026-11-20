@@ -43,7 +43,7 @@ _GPU_ARCHITECTURE_PATTERN = re.compile(r"applegpu_g(\d+)([a-z])")
 
 def _gpu_architecture():
     try:
-        info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+        info = mx.device_info()
     except RuntimeError:
         return ""
     return str(info.get("architecture", ""))
@@ -105,11 +105,11 @@ class Gap(NamedTuple):
 # and older unmeasured ones, turn the route off.
 _GAPS = {
     # A few rows of a transposed quantized matmul run qmv/qmv_wide below the qmv batch limit, then qmm_t_splitk until the output is wide enough for qmm_nax.
-    "small_m_qmm": Gap(open_in = ("0.32.2", "0.32.3", "0.32.4"), closed_on_main = False),
+    "small_m_qmm": Gap(open_in = ("0.32.4",), closed_on_main = False),
     # Without NAX the same rows run qmv_wide (plain qmv before generation 15), then qmm_t_splitk.
-    "small_m_qmm_simd": Gap(open_in = ("0.32.3", "0.32.4"), closed_on_main = False),
+    "small_m_qmm_simd": Gap(open_in = ("0.32.4",), closed_on_main = False),
     # MLX's sorted gather kernel runs 32-row tiles below 64 rows per expert, with two barriers per K step.
-    "sorted_gather_qmm": Gap(open_in = ("0.32.3", "0.32.4"), closed_on_main = False),
+    "sorted_gather_qmm": Gap(open_in = ("0.32.4",), closed_on_main = False),
     # Without NAX, training-sized qmm runs 32x32 tiles; 64x64 ones (open PR 4826) or a dense GEMM run faster.
     "dense_train_qmm": Gap(open_in = ("0.32.4",), closed_on_main = False),
     # On NAX, training-sized qmm_t loads each weight tile only after the last multiplied; staged loads (4682) overlap.

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 import torch
@@ -176,6 +177,18 @@ def test_inference_is_limited_to_families_the_old_forward_owned():
     assert MU._experts_family(OlmoeLikeExperts()) not in MU._LEGACY_GROUPED_LORA_B_FAMILIES
 
 
+def test_family_survives_fully_shard_class_swap():
+    # fully_shard(experts) swaps the class for FSDP<Name>(FSDPModule, <Name>) defined in torch; the family must
+    # still come from the original class, or a markerless legacy adapter loads its expert lora_B unrepacked.
+    assert pathlib.Path(MU.__file__).resolve().is_relative_to(pathlib.Path(__file__).resolve().parents[1])
+    upstream = type("Qwen3MoeExperts", (torch.nn.Module,), {"__module__": "transformers.models.qwen3_moe.modeling_qwen3_moe"})
+    fsdp_module = type("FSDPModule", (), {"__module__": "torch.distributed.fsdp._fully_shard._fully_shard"})
+    sharded = type("FSDPQwen3MoeExperts", (fsdp_module, upstream), {"__module__": "torch.distributed.fsdp._fully_shard._fully_shard"})
+    assert MU._experts_family(sharded()) == "qwen3_moe"
+    compiled = type("Qwen3MoeExperts", (torch.nn.Module,), {"__module__": "unsloth_compiled_module_qwen3_moe"})
+    assert MU._experts_family(type("FSDPQwen3MoeExperts", (fsdp_module, compiled), {})()) == "qwen3_moe"
+
+
 def test_adapter_without_fused_experts_never_reads_its_config(tmp_path, patched_load, monkeypatch):
     model = get_peft_model(_base(), LoraConfig(r = R, target_modules = ["q_proj"]))
     model.save_pretrained(str(tmp_path))
@@ -290,3 +303,28 @@ def test_trainer_resume_hook_installs(monkeypatch):
     monkeypatch.setattr(MU, "_original_trainer_load_optimizer_and_scheduler", None)
     assert MU._patch_trainer_resume_for_legacy_lora_b()
     assert Trainer._load_optimizer_and_scheduler._unsloth_moe_layout_patched
+
+
+@pytest.mark.parametrize("shard_dim, expected", [(0, (1, 0)), (1, (0, 1))])
+def test_local_shard_fp32_state_is_permuted_not_reset(shard_dim, expected):
+    # bitsandbytes 32-bit optimizers keep per-rank state shaped like the local shard of a row-sharded DTensor;
+    # comparing with the global shape reset those fp32 moments and the step instead of permuting them.
+    import pathlib
+    from torch.distributed.tensor.placement_types import Shard
+    assert pathlib.Path(MU.__file__).resolve().is_relative_to(pathlib.Path(__file__).resolve().parents[1])
+    experts, rank = 2, 2
+    param = torch.nn.Parameter(torch.zeros(4, experts * rank))
+    local_shape = (2, experts * rank) if shard_dim == 0 else (4, rank)
+    param.placements = (Shard(shard_dim),)
+    param.to_local = lambda: torch.zeros(local_shape)
+    param._unsloth_lora_b_repacked = (experts, rank)
+    moment = torch.randn(local_shape)
+    optimizer = torch.optim.AdamW([param])
+    optimizer.state[param] = {"step": torch.tensor(12.0), "exp_avg": moment.clone(), "exp_avg_sq": moment.abs()}
+    assert MU.repack_optimizer_state_for_legacy_lora_b(optimizer) == expected
+    if shard_dim == 0:
+        permutation = MU._moe_lora_b_column_permutation(experts, rank, param.device, invert = True)
+        assert torch.equal(optimizer.state[param]["exp_avg"], moment.index_select(1, permutation))
+        assert float(optimizer.state[param]["step"]) == 12.0
+    else:
+        assert param not in optimizer.state

@@ -2860,8 +2860,6 @@ def test_gemma4_loss_masks_follow_the_reference_without_a_host_read(monkeypatch)
     language = pytest.importorskip("mlx_vlm.models.gemma4.language")
     from mlx_vlm.models.cache import BatchKVCache, KVCache
     text_model = language.Gemma4TextModel
-    if not hasattr(text_model, "_apply_blockwise_bidirectional_overlay"):
-        pytest.skip(reason="mlx-vlm < 0.6.1 has no vision overlay; the patch leaves it alone")
     upstream = text_model._make_masks
     monkeypatch.setattr(text_model, "_make_masks", upstream)
     monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
@@ -2920,28 +2918,6 @@ def test_gemma4_loss_masks_follow_the_reference_without_a_host_read(monkeypatch)
             sliding = sliding & mx.array(k > q - 2)
         _, full = arrays(upstream(stack("vision"), h, held, None))
         assert arrays(patched(stack("vision"), h, held, ids)) == [sliding.tolist(), full]
-
-
-def test_gemma4_mask_patch_leaves_pre_overlay_mlx_vlm_alone(monkeypatch):
-    """mlx-vlm < 0.6.1: two-argument `_make_masks`, no overlay; wrapping it broke every forward."""
-    from types import SimpleNamespace
-
-    import unsloth_zoo.mlx.compile as mc
-
-    class Gemma4TextModel:
-        def _make_masks(self, h, cache):
-            return ["upstream"] * len(cache)
-
-    upstream = Gemma4TextModel._make_masks
-    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
-    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
-    monkeypatch.setattr(
-        mc, "_try_import_module",
-        lambda name: SimpleNamespace(Gemma4TextModel=Gemma4TextModel),
-    )
-    mc._runtime_patch_primitive_installers()["gemma4_vision_masks_runtime"]()
-    assert Gemma4TextModel._make_masks is upstream
-    assert Gemma4TextModel()._make_masks(None, [None, None]) == ["upstream", "upstream"]
 
 
 def test_gemma4_unified_call_hands_image_token_types_to_the_text_model(monkeypatch):

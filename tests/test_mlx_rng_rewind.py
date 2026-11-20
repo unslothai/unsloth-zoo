@@ -82,16 +82,7 @@ def _forget_reported_key_problems():
 
 @contextlib.contextmanager
 def _shadowing_random_state(replacement):
-    """Swap ``mx.random.state`` for a stand-in and put the original back.
-
-    Which "back" depends on the mlx version, and getting it wrong poisons the
-    rest of the pytest process rather than failing here. mlx >= 0.31.2 serves
-    ``state`` from a module ``__getattr__``, so the shadow must be deleted or it
-    hides the hook for the whole run; mlx < 0.31.2 keeps it as a real module
-    attribute, so deleting it removes the PRNG state itself and every later read
-    raises AttributeError, which ``_mlx_rng_key`` turns into None. pyproject
-    declares ``mlx>=0.22.0``, so both eras are in support.
-    """
+    """Swap in a stand-in, then delete it (mlx serves ``state`` from ``__getattr__``; a set-back attribute would hide that hook) or restore a real attribute."""
     sentinel = object()
     original = mx.random.__dict__.get("state", sentinel)
     setattr(mx.random, "state", replacement)
@@ -142,7 +133,6 @@ def test_restore_reproduces_the_draws_that_followed_the_capture():
 
 
 def test_restore_works_where_the_state_refuses_item_assignment():
-    """A stand-in shaped like mlx 0.32.1 (no __setitem__) pins the restore contract on any installed mlx, including ones where state is still a list."""
     expected = _draw_after_seed(_SPLIT_KEY_SEED)
 
     mx.random.seed(1)
@@ -167,7 +157,6 @@ def test_capture_reads_nothing_where_the_state_is_not_indexable():
 
 
 def test_shadowing_the_state_does_not_outlive_the_test():
-    """Regression guard: on mlx < 0.31.2 an unshadow by delattr deletes the PRNG state for the rest of the process."""
     before = _mlx_rng_key()
     assert before is not None
 

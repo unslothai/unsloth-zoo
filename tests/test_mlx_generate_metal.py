@@ -222,8 +222,11 @@ def test_compiled_training_state_survives_generation(monkeypatch):
 
 
 @real_mlx_only
-def test_batched_draws_keep_each_row_on_its_own_seeded_stream_as_rows_join_and_leave():
+def test_batched_draws_keep_each_row_on_its_own_seeded_stream_as_rows_join_and_leave(monkeypatch):
+    from unsloth_zoo.mlx import generate as engine
     from unsloth_zoo.mlx.generate import SamplingParams, _BatchedDraws, _seeded_sampler
+
+    monkeypatch.setattr(engine, "_mlx_lm_batches_one_sampler", lambda: True)  # the draws, not mlx-lm's sampling loop
 
     generator = types.SimpleNamespace(_generation_batch=types.SimpleNamespace(uids=[]),
                                       _prompt_batch=types.SimpleNamespace(split=lambda uids: types.SimpleNamespace(uids=uids)))
@@ -1964,7 +1967,7 @@ def test_rejected_dense_prefill_keeps_exact_tile_on_first_and_cached_calls(monke
 def test_staged_prefill_matches_native_rows_gradients_and_restores(monkeypatch, dtype, bits, group):
     from unsloth_zoo.mlx import inference, matmul, nax
 
-    if not nax.nax_available() or mx.__version__ not in ("0.32.3", "0.32.4"):
+    if not nax.nax_available() or mx.__version__ != "0.32.4":
         pytest.skip("requires native NAX kernels")
     assert matmul.staged_qmm_available()
     model = nn.Sequential(nn.QuantizedLinear(2048, 2048, bias = True, group_size = group, bits = bits))
@@ -2008,7 +2011,7 @@ def test_staged_prefill_matches_native_rows_gradients_and_restores(monkeypatch, 
 def test_staged_prefill_rejects_different_result_once_per_shape(monkeypatch):
     from unsloth_zoo.mlx import inference, matmul, nax
 
-    if not nax.nax_available() or mx.__version__ not in ("0.32.3", "0.32.4"):
+    if not nax.nax_available() or mx.__version__ != "0.32.4":
         pytest.skip("requires native NAX kernels")
     assert matmul.staged_qmm_available()
     model = nn.Sequential(nn.QuantizedLinear(2048, 2048, bias = False, group_size = 64, bits = 8)).eval()
@@ -2032,7 +2035,7 @@ def test_staged_prefill_rejects_different_result_once_per_shape(monkeypatch):
 def test_staged_prefill_probe_and_admission_boundaries(monkeypatch):
     from unsloth_zoo.mlx import matmul, nax
 
-    if not nax.nax_available() or mx.__version__ not in ("0.32.3", "0.32.4"):
+    if not nax.nax_available() or mx.__version__ != "0.32.4":
         pytest.skip("requires native NAX kernels")
     matmul.probe_staged_qmm()
     assert matmul.staged_qmm_supported(4096, 16384, 16384, 64, 8, "affine")
@@ -2502,22 +2505,22 @@ def test_vlm_cache_materialization_finishes_the_previous_snapshot(monkeypatch):
 
 
 @metal_only
-@pytest.mark.parametrize("interval", [0, None, 2, "missing"])
-def test_vlm_cache_materialization_preserves_unknown_or_disabled_generators(interval):
+def test_the_installed_mlx_vlm_passes_the_batch_api_probe():
+    from unsloth_zoo.mlx import generate
+
+    assert generate._probe_vlm_api(generate._resolve_vlm_batch_module())
+    assert generate.row_logits_processors_unavailable_reason() is None
+
+
+@metal_only
+def test_vlm_cache_materialization_preserves_a_disabled_generator():
     from unsloth_zoo.mlx.generate import _VLMCacheMaterializer
 
-    generator = types.SimpleNamespace(
-        _cache_eval_interval=interval, _steps_counter=0, stream=mx.new_stream(mx.gpu),
-        _generation_batch=types.SimpleNamespace(prompt_cache=[]), next=lambda: "unchanged",
-    )
-    if interval == 2:
-        del generator.stream
-    elif interval == "missing":
-        del generator._cache_eval_interval
+    generator = types.SimpleNamespace(_cache_eval_interval=0, stream=mx.new_stream(mx.gpu), next=lambda: "unchanged")
     materializer = _VLMCacheMaterializer(generator)
     assert materializer.next() == "unchanged"
     materializer.close()
-    assert getattr(generator, "_cache_eval_interval", "missing") == interval
+    assert generator._cache_eval_interval == 0
 
 
 @metal_only
@@ -2528,7 +2531,7 @@ def test_vlm_cache_materialization_drains_before_a_failed_step(monkeypatch):
     state = mx.array([4.0, -3.0]) * 2
     generator = types.SimpleNamespace(
         _cache_eval_interval=1, _steps_counter=0, stream=mx.new_stream(mx.gpu),
-        _generation_batch=types.SimpleNamespace(prompt_cache=[types.SimpleNamespace(state=[state])]),
+        _generation_batch=types.SimpleNamespace(cache_states=lambda: [[state]]),
     )
     def advance():
         if generator._steps_counter:

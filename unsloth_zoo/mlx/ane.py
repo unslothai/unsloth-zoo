@@ -651,7 +651,7 @@ def _pressure_level():
 
 
 def _working_set():
-    info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+    info = mx.device_info()
     return 0.85 * info["memory_size"]
 
 

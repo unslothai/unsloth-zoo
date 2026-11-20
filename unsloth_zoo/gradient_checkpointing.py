@@ -164,6 +164,7 @@ def _new_host_buffer(numel, dtype):
 def _grow_host_buffer(buffer, new_size):
     """resize_ on a pinned buffer issues a fresh, larger cudaHostAlloc, which can fail."""
     if new_size <= buffer.numel(): return _mark_host_buffer(buffer)
+    new_size = _exact_growth_numel(new_size, buffer.element_size())
     old_bytes = _storage_bytes(buffer)
     if new_size * buffer.element_size() <= old_bytes:
         # A shrunk buffer keeps its storage, so this resize_ allocates nothing.
@@ -191,6 +192,7 @@ def _grow_host_buffer(buffer, new_size):
         try:
             buffer.resize_(new_size)
             if pinned: _release_pinned(old_bytes)
+            _note_outgrown_block(old_bytes)
             return _mark_host_buffer(buffer)
         except RuntimeError as e:
             if pinned: _release_pinned(new_bytes)
@@ -285,6 +287,66 @@ def _warn_short_block_reuse():
         "Gradient checkpointing offload grows pinned buffers, so upgrade torch or unset it.",
         stacklevel = 2,
     )
+
+
+# Offload slots are hidden * tokens * 2 bytes, often not a power of two (Qwen3-4B at 32k: 160MB pinned
+# as 256MB). On CUDA torch 2.14+ (2.13 can hand out a short block) set pinned_max_round_threshold_mb so
+# blocks above _GC_PINNED_EXACT_MB are pinned at their exact size, unless the user set either pinned
+# knob. Smaller pinned users (DataLoader batches) keep power-of-two reuse. UNSLOTH_GC_PINNED_EXACT=0 off.
+_GC_PINNED_EXACT_MB = 4
+_GC_PINNED_EXACT = False
+_PINNED_KNOBS = ("pinned_max_round_threshold_mb", "pinned_max_cached_size_mb")
+
+
+def _maybe_enable_exact_pinned():
+    global _GC_PINNED_EXACT
+    if _GC_PINNED_EXACT: return True
+    if os.environ.get("UNSLOTH_GC_PINNED_EXACT", "1") == "0": return False
+    if DEVICE_TYPE != "cuda" or getattr(torch.version, "hip", None) or _TORCH_MINOR < (2, 14): return False
+    setter = getattr(torch._C, "_accelerator_setAllocatorSettings", None)
+    if setter is None: return False
+    current = _host_allocator_settings()
+    user = [current] + [os.environ.get(var) or "" for var in
+        ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF")]
+    if any(knob in text for text in user for knob in _PINNED_KNOBS): return False
+    # torch reports only the latest settings string: a pinned knob set by an earlier update stays in effect.
+    if any(v != _INF for v in _host_alloc_policy()): return False
+    # Each call resets max_split_size_mb, roundup_power2_divisions and garbage_collection_threshold
+    # to defaults, so pass the settings in effect back in with ours appended.
+    try: setter(",".join(filter(None, (current, f"pinned_max_round_threshold_mb:{_GC_PINNED_EXACT_MB}"))))
+    except Exception: return False
+    _GC_PINNED_EXACT = True
+    return True
+
+
+def _exact_growth_numel(numel, itemsize):
+    """Exact blocks are only reused by requests no larger, so a slot that grows with the sequence length
+    would pin a fresh block each time. Grow in 1/8 power-of-two steps: few growths, under 12.5% slack."""
+    nbytes = numel * itemsize
+    if not _GC_PINNED_EXACT or nbytes <= (_GC_PINNED_EXACT_MB << 20): return numel
+    step = 1 << (nbytes.bit_length() - 4)
+    return -(-(-(-nbytes // step) * step) // itemsize)
+
+
+_EXACT_OUTGROWN = False
+
+
+def _note_outgrown_block(old_bytes):
+    """An outgrown exact block fits none of the larger requests that follow, so it would stay pinned in
+    torch's cache. Free it now if its copies are done (no sync: last used in an earlier step), else at the
+    next step's first offload, after a sync."""
+    global _EXACT_OUTGROWN
+    if not _GC_PINNED_EXACT or old_bytes <= (_GC_PINNED_EXACT_MB << 20): return
+    _EXACT_OUTGROWN = True
+    try: torch._C._host_emptyCache()
+    except Exception: pass
+
+
+def _flush_outgrown_blocks():
+    global _EXACT_OUTGROWN
+    if not _EXACT_OUTGROWN: return
+    _EXACT_OUTGROWN = False
+    with _PINNED_LOCK: _empty_host_cache()
 
 
 def _pinned_block_bytes(nbytes):
@@ -752,13 +814,76 @@ def in_gradient_checkpoint_recompute() -> bool:
 
 
 @contextmanager
-def _gradient_checkpoint_recompute_marker():
+def _gradient_checkpoint_recompute_marker(function = None):
     previous = getattr(_GC_RECOMPUTE_TLS, "active", False)
+    previous_function = getattr(_GC_RECOMPUTE_TLS, "function", None)
     _GC_RECOMPUTE_TLS.active = True
+    _GC_RECOMPUTE_TLS.function = function
     try:
         yield
     finally:
         _GC_RECOMPUTE_TLS.active = previous
+        _GC_RECOMPUTE_TLS.function = previous_function
+
+
+def _module_forward_chain(module):
+    function = getattr(type(module), "forward", None)
+    for _ in range(8):
+        if function is None:
+            return
+        yield function
+        function = getattr(function, "__wrapped__", None)
+pass
+
+
+def _calls_whole_module(function, module):
+    if not isinstance(module, torch.nn.Module):
+        return False
+    if function in (torch.nn.Module.__call__, torch.nn.Module._call_impl):
+        return True
+    return any(function is forward for forward in _module_forward_chain(module))
+pass
+
+
+def _replayed_module(function):
+    """Module whose call is the whole checkpointed function, else None. Any shape that could add work
+    after the module returns (lambdas, other methods) must resolve to None."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    for _ in range(8):
+        if isinstance(function, _KeywordArgumentCall):
+            function = function.function
+            continue
+        if isinstance(function, torch.nn.Module):
+            # An overridden __call__ may transform forward's output.
+            return function if type(function).__call__ in (torch.nn.Module.__call__, torch.nn.Module._call_impl) else None
+        if isinstance(function, functools.partial):
+            inner = function.func
+            if inspect.ismethod(inner):
+                owner = inner.__self__
+                return owner if _calls_whole_module(inner.__func__, owner) else None
+            owner = function.args[0] if function.args else None
+            return owner if _calls_whole_module(inner, owner) else None
+        if inspect.ismethod(function):
+            owner = function.__self__
+            return owner if _calls_whole_module(function.__func__, owner) else None
+        module = getattr(function, "_unsloth_checkpoint_module", None)
+        return module if isinstance(module, torch.nn.Module) else None
+    return None
+pass
+
+
+def gradient_checkpoint_replay_module():
+    """During a reentrant checkpoint replay, the module whose output nothing else reads; else None."""
+    if not getattr(_GC_RECOMPUTE_TLS, "active", False):
+        return None
+    function = getattr(_GC_RECOMPUTE_TLS, "function", None)
+    if function is None:
+        return None
+    module = _replayed_module(function)
+    # Forward hooks may read the output.
+    if module is None or module._forward_hooks or torch.nn.modules.module._global_forward_hooks:
+        return None
+    return module
 
 
 # ---------------------------------------------------------------------------
@@ -1005,7 +1130,7 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
         hidden_states = hidden_states.to(ctx.device, non_blocking = True).detach()
         hidden_states.requires_grad_(True)
         recompute_args, grad_holders = _detach_checkpoint_args(ctx.args)
-        with torch.enable_grad(), _gradient_checkpoint_recompute_marker(), \
+        with torch.enable_grad(), _gradient_checkpoint_recompute_marker(ctx.forward_function), \
                 _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True):
             output = ctx.forward_function(hidden_states, *recompute_args)
         # Layers that return a 1-tuple keep unpacking exactly as before. Layers
@@ -1048,7 +1173,7 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
         hidden_states = hidden_states.detach()
         hidden_states.requires_grad_(True)
         recompute_args, grad_holders = _detach_checkpoint_args(ctx.args)
-        with torch.enable_grad(), _gradient_checkpoint_recompute_marker(), \
+        with torch.enable_grad(), _gradient_checkpoint_recompute_marker(ctx.forward_function), \
                 _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True):
             output = ctx.forward_function(hidden_states, *recompute_args)
         # Outputs may be one tensor, a tuple or several; backprop only the outputs that received a
@@ -1213,12 +1338,27 @@ def _pristine_for_compiled_checkpoint(use_reentrant, kwargs):
 pass
 
 
+NO_GRAD_CHECKPOINT_STATS = collections.Counter()   # checkpoint calls run directly under grad off
+
+
+def _call_without_checkpoint(function, *args):
+    """Grad off records no graph, so run the block directly: skips the offload copy, routing /
+    attention frames and layer counters (GRPO / DPO ref logps, eval under no_grad)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    NO_GRAD_CHECKPOINT_STATS["calls"] += 1
+    with _checkpoint_routing_scope(None, False), saved_attention_scope(None, False):
+        return function(*args)
+pass
+
+
 @torch._disable_dynamo
 def unsloth_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
     pristine = _pristine_for_compiled_checkpoint(use_reentrant, kwargs)
     if pristine is not None:
         return pristine(function, *args, use_reentrant = False, **kwargs)
     function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
+    if not torch.is_grad_enabled():
+        return _call_without_checkpoint(function, *args, *tensor_args)
     return Unsloth_Gradient_Checkpointer.apply(function, *args, *tensor_args)
 pass
 
@@ -1679,6 +1819,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     global FP32_OFFLOAD_EXACT, FP32_OFFLOAD_MODE
     FP32_OFFLOAD_MODE = _fp32_offload_mode()
     FP32_OFFLOAD_EXACT = FP32_OFFLOAD_MODE == "exact"
+    _maybe_enable_exact_pinned()
     global GC_PREFETCH
     GC_PREFETCH = os.environ.get("UNSLOTH_GC_PREFETCH", "0") == "1"
     _reset_gc_prefetch_state()
@@ -1779,6 +1920,14 @@ pass
 
 class UnslothCheckpointFunction(torch.autograd.Function):
 
+    @classmethod
+    def apply(cls, run_function, preserve_rng_state, *args):
+        # Also installed as torch.utils.checkpoint.CheckpointFunction, so pre-bound torch checkpoints land here.
+        if not torch.is_grad_enabled() and not torch.compiler.is_compiling():
+            return _call_without_checkpoint(run_function, *args)
+        return super().apply(run_function, preserve_rng_state, *args)
+    pass
+
     @staticmethod
     def forward(ctx, run_function, preserve_rng_state, *args):
         # All Unsloth Zoo code licensed under LGPLv3
@@ -1868,6 +2017,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         # New graph. Host slots are not rewound: pending graphs keep theirs.
                         if BACKWARD_PASS:
                             BACKWARD_PASS = False
+                            _flush_outgrown_blocks()
                             # A new graph: earlier prefetch descriptors and slot records are stale.
                             global OFFLOAD_GENERATION
                             OFFLOAD_GENERATION += 1
@@ -2119,7 +2269,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 detached_inputs[0] = x
             pass
 
-            with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs), _gradient_checkpoint_recompute_marker(), \
+            with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs), _gradient_checkpoint_recompute_marker(ctx.run_function), \
                     _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True), \
                     saved_attention_scope(getattr(ctx, "_attention_frame", None), True):  # type: ignore[attr-defined]
                 outputs = ctx.run_function(*detached_inputs)
@@ -2719,6 +2869,8 @@ def unsloth_checkpoint(
                 "Passing `context_fn` or `debug` is only supported when "
                 "use_reentrant=False."
             )
+        if not torch.is_grad_enabled():
+            return _call_without_checkpoint(function, *args)
         return UnslothCheckpointFunction.apply(function, preserve, *args)
     else:
         gen = _checkpoint_without_reentrant_generator(
@@ -2919,12 +3071,14 @@ def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None,
     pristine = _pristine_for_compiled_checkpoint(use_reentrant, kwargs)
     if pristine is not None:
         return pristine(function, *args, use_reentrant = False, **kwargs)
+    preserve = kwargs.pop("preserve_rng_state", True)
+    function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
+    if not torch.is_grad_enabled():
+        return _call_without_checkpoint(function, *args, *tensor_args)
     # Not `len(...) == 0`: unpatch_unsloth_smart_gradient_checkpointing sets CPU_BUFFERS
     # to None, which is the state this shim normally starts from, and len(None) raises.
     if not CPU_BUFFERS:
         initialize_unsloth_gradient_checkpointing(args[0].dtype)
-    preserve = kwargs.pop("preserve_rng_state", True)
-    function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
     return UnslothCheckpointFunction.apply(function, preserve, *args, *tensor_args)
 
 # Unsloth Zoo - Utilities for Unsloth

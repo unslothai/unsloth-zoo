@@ -264,6 +264,8 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         # "config.reorder_for_compute_comm_overlap = True", # # enable reordering pass for increasing overlap between compute and communication
         f"config.max_autotune = {O3}", # enable slow autotuning passes to select algorithms
         f"config.max_autotune_pointwise = {O3}", # enable slow autotuning passes to select pointwise/reductions algorithms
+        # Cold start: 1 pointwise launch config instead of 2-6 timed ones; O3 max_autotune_pointwise still tunes.
+        "config.triton.autotune_pointwise = False",
         f"config.max_autotune_gemm = False", # GEMM is unnecessary
         "config.max_autotune_gemm_backends = 'ATEN,TRITON,CPP'", # Not much faster
         "config.autotune_fallback_to_aten = True", # Fallback to ATEN backend

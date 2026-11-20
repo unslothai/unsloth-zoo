@@ -30,7 +30,6 @@ import functools
 import inspect
 import logging
 import os
-import weakref
 
 import torch
 
@@ -281,16 +280,15 @@ except Exception:
 
 def _sharded_parameters(module):
     # FSDP2 (DTensor) or ZeRO-3 (ds_id) parameters all-gather on every forward. Sharding happens inside
-    # train(), after install: fully_shard replaces the Parameter objects, so the answer is cached against
-    # the first parameter's identity and re-read once it changes.
-    first = next(module.parameters(), None)
-    cached = module.__dict__.get("_unsloth_image_dedup_sharded", None)
-    if cached is not None and cached[0]() is first:
-        return cached[1]
+    # train(), after install, and can cover only a child (the tower) while earlier parameters stay plain,
+    # so only a sharded answer is cached (sharding is never undone); an unsharded one is re-read per call.
+    if module.__dict__.get("_unsloth_image_dedup_sharded", False):
+        return True
     value = any(
         hasattr(p, "ds_id") or (_DTensor is not None and isinstance(p, _DTensor)) for p in module.parameters()
     )
-    module.__dict__["_unsloth_image_dedup_sharded"] = (weakref.ref(first) if first is not None else (lambda: None), value)
+    if value:
+        module.__dict__["_unsloth_image_dedup_sharded"] = True
     return value
 
 

@@ -3013,6 +3013,38 @@ def vllm_supports_flashinfer(config) -> bool:
 pass
 
 
+# FlashInferBackend.get_supported_head_sizes() in vLLM 0.10.2 - 0.12.0; forcing it for other sizes fails init.
+_VLLM_FLASHINFER_HEAD_SIZES = frozenset((64, 128, 256))
+
+
+def _vllm_flashinfer_head_size_ok(config) -> bool:
+    """False if any head size is outside FlashInfer's (e.g. Phi-3 96, MLA); unknown counts as unsupported."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        text_config = config.get_text_config() if hasattr(config, "get_text_config") else config
+    except Exception:
+        text_config = config
+    if any(getattr(text_config, k, None) for k in ("kv_lora_rank", "q_lora_rank")):
+        return False  # MLA: vLLM sizes the cache from kv_lora_rank + qk_rope_head_dim
+    sizes = set()
+    # Same order as vLLM 0.11.2 ModelConfig.get_head_size: head_dim, hidden_size_per_head (PLaMo2), then the division.
+    head_dim = getattr(text_config, "head_dim", None) or getattr(text_config, "hidden_size_per_head", None)
+    if getattr(text_config, "model_type", None) == "zamba2":
+        head_dim = getattr(text_config, "attention_head_dim", None) or head_dim
+    if not head_dim:
+        hidden = getattr(text_config, "hidden_size", None)
+        heads = getattr(text_config, "num_attention_heads", None)
+        if not hidden or not heads:
+            return False
+        head_dim = hidden // heads
+    sizes.add(head_dim)
+    global_head_dim = getattr(text_config, "global_head_dim", None)  # Gemma-4 full-attention layers
+    if global_head_dim:
+        sizes.add(global_head_dim)
+    return all(isinstance(x, int) and x in _VLLM_FLASHINFER_HEAD_SIZES for x in sizes)
+pass
+
+
 def _get_torchao_fp8_config(fp8_mode: str):
     """Float8DynamicActivationFloat8WeightConfig for load_in_fp8=True."""
     from torchao.quantization import (
@@ -4138,6 +4170,23 @@ def _vllm_gdn_reads_ssm_dtype():
         return False
 
 
+def _vllm_colocated_cache_args(engine_arg_keys, enable_prefix_caching):
+    """KV cache args for an in-process (colocated) engine; only keys this vLLM has.
+
+    enable_extensible_kv_cache=False: vLLM >= 0.34's cap on torch's allocator survives sleep, so the
+    trainer cannot reuse memory freed by UNSLOTH_VLLM_STANDBY.
+    prefix_cache_retention_interval=None: vLLM >= 0.29's default 0 stops sliding-window / Mamba / GDN
+    groups reusing the previous multi-turn completion. The deprecated env var still wins.
+    """
+    args = {}
+    if "enable_extensible_kv_cache" in engine_arg_keys:
+        args["enable_extensible_kv_cache"] = False
+    if (enable_prefix_caching and "prefix_cache_retention_interval" in engine_arg_keys
+            and "VLLM_PREFIX_CACHE_RETENTION_INTERVAL" not in os.environ):
+        args["prefix_cache_retention_interval"] = None
+    return args
+
+
 def _vllm_mamba_ssm_cache_dtype_args(config, engine_arg_keys, training, choices = None, gdn_reads_ssm = None):
     # (engine args to add, message or None). Unset env: nothing is passed.
     value = os.environ.get("UNSLOTH_VLLM_MAMBA_SSM_CACHE_DTYPE", "").strip().lower()
@@ -4579,7 +4628,7 @@ def load_vllm(
             gpu_memory_utilization = standby_target_gpu_util
 
     if DEVICE_TYPE == "cuda":
-        major_version, minor_version = torch.cuda.get_device_capability()
+        major_version, minor_version = torch.cuda.get_device_capability(get_target_device())
         if major_version < 7: raise NotImplementedError(
             f"Unsloth: Your GPU is too old for vLLM! vLLM needs compute capability 7.0 or higher, "\
             f"but your GPU has {major_version}.{minor_version}. "\
@@ -4624,7 +4673,7 @@ def load_vllm(
     is_fp8 = "fp8" in model_name.lower() or (quant_method in ("fp8", "fbgemm_fp8"))
 
     if is_fp8 and DEVICE_TYPE == "cuda":
-        major_version, minor_version = torch.cuda.get_device_capability()
+        major_version, minor_version = torch.cuda.get_device_capability(get_target_device())
         if major_version == 10:
             # DeepGEMM is generally slower than triton for vLLM here.
             # https://x.com/TheZachMueller/status/2024619480580510117?s=20
@@ -4814,14 +4863,23 @@ def load_vllm(
                         print(f"Unsloth: `{model_name} does not support `VLLM_ATTENTION_BACKEND==FLASHINFER`. Will disable")
                     if "VLLM_ATTENTION_BACKEND" in os.environ:
                         del os.environ["VLLM_ATTENTION_BACKEND"]
-                elif os.environ.get("VLLM_ATTENTION_BACKEND", "") != "":
-                    pass
+                elif os.environ.get("VLLM_ATTENTION_BACKEND", "") not in (
+                    "", os.environ.get("_UNSLOTH_AUTO_VLLM_ATTENTION_BACKEND", ""),
+                ):
+                    pass  # The user's choice (a value an earlier Unsloth load set is re-decided below)
+                elif not _vllm_flashinfer_head_size_ok(config):
+                    # Left unset: vLLM picks a fitting backend. Drop a FLASHINFER an earlier load in this process set.
+                    if os.environ.get("_UNSLOTH_AUTO_VLLM_ATTENTION_BACKEND", "") != "":
+                        os.environ.pop("VLLM_ATTENTION_BACKEND", None)
+                        os.environ.pop("_UNSLOTH_AUTO_VLLM_ATTENTION_BACKEND", None)
                 elif not use_bitsandbytes and major_version >= 8:
                     # Allowed: FLASHINFER, TORCH_SDPA, FLASH_ATTN, XFORMERS, ROCM_FLASH
                     os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+                    os.environ["_UNSLOTH_AUTO_VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
                 elif Version(vllm_version) >= Version("0.11.0"):
                     # On 0.11.0, Flashinfer also works!
                     os.environ["VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
+                    os.environ["_UNSLOTH_AUTO_VLLM_ATTENTION_BACKEND"] = "FLASHINFER"
 
                 # Flashinfer sampler maybe makes it somewhat faster on newer GPUs
                 # Tesla T4 is 280 tok/s vs 330 tok/s
@@ -4846,7 +4904,7 @@ def load_vllm(
         # Prefix Caching fails for V100, Titan X CUDA Compute Capability 7.0
         # See https://github.com/huggingface/trl/issues/2798
         if DEVICE_TYPE == "cuda":
-            major_version, minor_version = torch.cuda.get_device_capability()
+            major_version, minor_version = torch.cuda.get_device_capability(get_target_device())
             if (major_version < 7) or (major_version == 7 and minor_version < 5):
                 print("Unsloth: Your GPU does not support prefix caching - will disable!")
                 enable_prefix_caching = False
@@ -4967,7 +5025,7 @@ def load_vllm(
             message = f"{platform} {torch.npu.get_device_name(0)}"
         else:
             platform = "CUDA"
-            major_version, minor_version = torch.cuda.get_device_capability()
+            major_version, minor_version = torch.cuda.get_device_capability(get_target_device())
             message = f"{platform} compute capability {major_version}.{minor_version}"
         pass
 
@@ -5157,8 +5215,9 @@ def load_vllm(
 
         # [[CRITICAL for RL on policy]]
         # Pre-Hopper cascade attention is wrong until vllm-project/flash-attention#87, first pinned by vLLM 0.11.1.
+        # Judge the engine's card: outside torchrun vLLM's worker runs on ordinal 0 whatever card is current.
         if DEVICE_TYPE == "cuda":
-            major_version, minor_version = torch.cuda.get_device_capability()
+            major_version, minor_version = torch.cuda.get_device_capability(get_target_device())
             if _vllm_cascade_attn_needs_disable(vllm_version, major_version):
                 engine_args["disable_cascade_attn"] = True
                 print("Unsloth: Disabling cascade attention in vLLM to allow for better on policy RL!")
@@ -5294,6 +5353,9 @@ def load_vllm(
                 print(f"Unsloth: Not an error, but `{key}` is not supported in vLLM. Skipping.")
             pass
         pass
+        # After the filter (no "not supported" line). Not for `vllm serve`: own process, CLI drops False.
+        if not return_args:
+            engine_args.update(_vllm_colocated_cache_args(good_keys, engine_args.get("enable_prefix_caching")))
         ssm_dtype_args, ssm_dtype_message = _vllm_mamba_ssm_cache_dtype_args(config, good_keys, training)
         engine_args.update(ssm_dtype_args)
         if ssm_dtype_message is not None:
@@ -6757,9 +6819,52 @@ def _lora_modules_state_dict(model):
 pass
 
 
-def _lora_state_dict(model):
+def _fsdp2_merged_rollout_requested():
+    """Opt-in: under native FSDP2, fold gathered adapters into the shared base instead of vLLM LoRA."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    return os.environ.get("UNSLOTH_FSDP2_MERGED_ROLLOUT", "0").strip().lower() in ("1", "true", "yes", "on")
+pass
+
+
+# lora module -> (full A, full B, shard versions at the gather)
+_FSDP2_GATHERED_AB = weakref.WeakKeyDictionary()
+
+
+def _local_version(param):
+    """Both counters needed: non-foreach steps bump the DTensor's, foreach / fused AdamW only _local_tensor's."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    out = [id(param)]
+    for t in (param, getattr(param, "_local_tensor", None)):
+        try: out.append(None if t is None else t._version)
+        except Exception: out.append(None)
+    return tuple(out)
+pass
+
+
+def _merged_rollout_adapter_weights(module, adapter):
+    """Under FSDP2 use load_lora's gathered copies (never gather here: one rank's fold must not wait for peers)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    A = module.lora_A[adapter].weight
+    B = module.lora_B[adapter].weight
+    try:
+        from torch.distributed.tensor import DTensor
+    except Exception:
+        return A, B
+    if not (isinstance(A, DTensor) or isinstance(B, DTensor)): return A, B
+    entry = _FSDP2_GATHERED_AB.get(module)
+    if entry is None or entry[2] != (_local_version(A), _local_version(B)):
+        raise RuntimeError(
+            "Unsloth: an FSDP2 merged-weight rollout found no up-to-date gathered adapter. Call "
+            "model.load_lora(..., load_tensors = True) on every rank right before generate."
+        )
+    return entry[0], entry[1]
+pass
+
+
+def _lora_state_dict(model, reuse_gathered = False):
     """Full lora_A / lora_B tensors. Under FSDP2: gathered (collective on every rank), and taken outside
-    inference mode, where FSDP2 state_dict fails with "Cannot set version_counter for inference tensor"."""
+    inference mode, where FSDP2 state_dict fails with "Cannot set version_counter for inference tensor".
+    reuse_gathered: return load_lora's cached gather, no collective (used inside one rank's generate)."""
     # All Unsloth Zoo code licensed under LGPLv3
     def lora_items(state_dict):
         return {k: v for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
@@ -6770,19 +6875,46 @@ def _lora_state_dict(model):
         "Unsloth: native FSDP2 gathers the LoRA adapters across ranks for save_lora / load_lora, "
         "so every rank must call them (a call on rank 0 alone waits for the others)."
     )
+    cache = _fsdp2_merged_rollout_requested() and isinstance(model, torch.nn.Module)
+    if cache:
+        slots = model.__dict__.get("_unsloth_lora_slots") or ()
+        versions = tuple(_local_version(owner._parameters.get(key)) for owner, key in slots)
+        cached = model.__dict__.get("_unsloth_fsdp2_lora_gather")
+        if reuse_gathered:
+            if cached is None or cached[0] != versions:
+                raise RuntimeError(
+                    "Unsloth: no up-to-date FSDP2 gather of the adapters (none yet, or an optimizer step since); "
+                    "call model.load_lora(..., load_tensors = True) on every rank right before generate."
+                )
+            return dict(cached[1])
     # Not model.state_dict(): it packs every bnb QuantState (a host sync per 4-bit layer). FSDP2's pre-save hook is on lora_A / lora_B, so it still runs.
     with torch.inference_mode(False), torch.no_grad():
-        return {
+        gathered = {
             k: (v.full_tensor() if isinstance(v, DTensor) else v).detach()
             for k, v in lora_items(_lora_modules_state_dict(model)).items()
         }
+    if cache:
+        for name, module in model.named_modules():
+            lora_A, lora_B = getattr(module, "lora_A", None), getattr(module, "lora_B", None)
+            if not isinstance(lora_A, torch.nn.ModuleDict) or not isinstance(lora_B, torch.nn.ModuleDict): continue
+            for adapter in lora_A.keys():
+                kA, kB = f"{name}.lora_A.{adapter}.weight", f"{name}.lora_B.{adapter}.weight"
+                if kA in gathered and kB in gathered and adapter in lora_B:
+                    _FSDP2_GATHERED_AB[module] = (
+                        gathered[kA], gathered[kB],
+                        (_local_version(lora_A[adapter].weight), _local_version(lora_B[adapter].weight)),
+                    )
+        # After the gather: its pre-save hooks swap unsharded parameters (reshard_after_forward=False) back to DTensors.
+        versions = tuple(_local_version(owner._parameters.get(key)) for owner, key in slots)
+        model.__dict__["_unsloth_fsdp2_lora_gather"] = (versions, gathered)
+    return gathered
 pass
 
 
 def prepare_merged_rollout(model):
     # All Unsloth Zoo code licensed under LGPLv3
     if not _merged_rollout_enabled(): return None
-    if _lora_is_sharded(model):
+    if _lora_is_sharded(model) and not _fsdp2_merged_rollout_requested():
         # Fold needs whole deltas; vLLM LoRA serves the gathered adapters instead.
         if getattr(getattr(model, "vllm_engine", None), "_unsloth_merged_rollout_wrapped", False):
             _merged_rollout_log_once(
@@ -6946,8 +7078,9 @@ def _merged_rollout_fold(W, module, adapter):
     """W = round(W + s * B @ A) once: fp32 row chunks, because CUDA bf16 addmm rounds
     s * B @ A to bf16 before adding W (two roundings)."""
     # All Unsloth Zoo code licensed under LGPLv3
-    A = module.lora_A[adapter].weight.to(W.dtype).float()
-    B = module.lora_B[adapter].weight.to(W.dtype).float()
+    A, B = _merged_rollout_adapter_weights(module, adapter)
+    A = A.to(W.dtype).float()
+    B = B.to(W.dtype).float()
     s = module.scaling[adapter]
     rows = max(1, _MERGED_ROLLOUT_FOLD_CHUNK_BYTES // (4 * W.shape[1]))
     for start in range(0, W.shape[0], rows):
@@ -7049,8 +7182,9 @@ def _merged_rollout_exact_target(ExactFoldTarget, module, W, adapter):
     [E, out, in] when PEFT swapped its in / out features, else [E, in, out].
     """
     # All Unsloth Zoo code licensed under LGPLv3
-    A = module.lora_A[adapter].weight.to(W.dtype)
-    B = module.lora_B[adapter].weight.to(W.dtype)
+    A, B = _merged_rollout_adapter_weights(module, adapter)
+    A = A.to(W.dtype)
+    B = B.to(W.dtype)
     if not _merged_rollout_is_param_wrapper(module):
         return ExactFoldTarget(W.unsqueeze(0), A.unsqueeze(0), B.unsqueeze(0), module.scaling[adapter])
     E = W.shape[0]
@@ -7218,7 +7352,7 @@ def _merged_rollout_lora_fallback(request, reason):
     )
     if LORA_REQUEST_ID is None: LORA_REQUEST_ID = 1
     with torch.inference_mode():
-        return _build_lora_request(model, request.save_directory, True, LORA_REQUEST_ID)
+        return _build_lora_request(model, request.save_directory, True, LORA_REQUEST_ID, reuse_gathered = True)
 pass
 
 
@@ -7235,7 +7369,8 @@ def _merged_rollout_rest_request(request, scope = None):
         raise RuntimeError("Unsloth: the model behind this merged-rollout LoRA request was freed.")
     if LORA_REQUEST_ID is None: LORA_REQUEST_ID = 1
     with torch.inference_mode():
-        rest = _build_lora_request(model, request.save_directory, True, LORA_REQUEST_ID, exclude = state.folded)
+        rest = _build_lora_request(model, request.save_directory, True, LORA_REQUEST_ID, exclude = state.folded,
+                                   reuse_gathered = True)
     if scope is not None: scope.requests[key] = rest
     return rest
 pass
@@ -7470,19 +7605,41 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
     if lora_request_id is None:
         lora_request_id = LORA_REQUEST_ID
 
+    scope = _rollout_scope(getattr(model, "vllm_engine", None)) if load_tensors else None
+    gathered = load_tensors and _fsdp2_merged_rollout_gather(model, scope)
     state = prepare_merged_rollout(model) if load_tensors else None
     if state is not None: return _MergedLoRARequest(state, save_directory)
-    scope = _rollout_scope(getattr(model, "vllm_engine", None)) if load_tensors else None
-    if scope is None: return _build_lora_request(model, save_directory, load_tensors, lora_request_id)
+    if scope is None: return _build_lora_request(model, save_directory, load_tensors, lora_request_id, reuse_gathered = gathered)
     # Same adapter for the whole scope: one name, so vLLM's prefix cache carries over between its calls.
     key = ("lora", id(model), save_directory)
     if key not in scope.requests:
-        scope.requests[key] = _build_lora_request(model, save_directory, load_tensors, lora_request_id)
+        scope.requests[key] = _build_lora_request(
+            model, save_directory, load_tensors, lora_request_id, reuse_gathered = gathered,
+        )
     return scope.requests[key]
 pass
 
 
-def _build_lora_request(model, save_directory, load_tensors, lora_request_id, exclude = None):
+def _fsdp2_merged_rollout_gather(model, scope = None):
+    """Gather here, where every rank calls load_lora, so generate never gathers. Once per scope (ranks may run
+    different turn counts); skipped where nothing folds. True when the gather is current."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not (_fsdp2_merged_rollout_requested() and _merged_rollout_enabled()): return False
+    if not getattr(getattr(model, "vllm_engine", None), "_unsloth_merged_rollout_wrapped", False): return False
+    if _is_bitsandbytes_quantized(model) or \
+        getattr(getattr(model, "config", None), "quantization_config", None) is not None:
+        return False
+    if not _lora_is_sharded(model): return False
+    key = ("fsdp2_gather", id(model))
+    if scope is not None and key in scope.requests: return True
+    with torch.inference_mode(False):
+        _lora_state_dict(model)
+    if scope is not None: scope.requests[key] = True
+    return True
+pass
+
+
+def _build_lora_request(model, save_directory, load_tensors, lora_request_id, exclude = None, reuse_gathered = False):
     # All Unsloth Zoo code licensed under LGPLv3
     global LORA_REQUEST_ID
     if not load_tensors and not os.path.exists(save_directory):
@@ -7492,7 +7649,7 @@ def _build_lora_request(model, save_directory, load_tensors, lora_request_id, ex
     if load_tensors:
         # We extract it directly from the model's state_dict
         peft_config = _live_lora_config(model, save_directory)
-        state_dict = {k.replace(".default", ""):v for k, v in _lora_state_dict(model).items()}
+        state_dict = {k.replace(".default", ""):v for k, v in _lora_state_dict(model, reuse_gathered).items()}
         if exclude:
             # Folded into the base weights already: sending them too would apply the delta twice.
             state_dict = {k: v for k, v in state_dict.items() if re.split(r"\.lora_[AB]\.", k)[0] not in exclude}

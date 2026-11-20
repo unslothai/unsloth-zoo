@@ -1918,6 +1918,28 @@ def _generation_prompt_fuses_answer(processor, chat_template_kwargs = None) -> b
 pass
 
 
+class _ImageSide:
+    """The image side the collator resizes against: 0 / 1 = that side, "max" / "min" = the larger / smaller."""
+    __slots__ = ("dimension",)
+
+    def __init__(self, dimension):
+        self.dimension = dimension
+
+    def __getstate__(self):
+        return (self.dimension,)  # never falsy: pickle skips __setstate__ for a false state (dimension 0)
+
+    def __setstate__(self, state):
+        self.dimension = state[0]
+
+    def __call__(self, image):
+        if self.dimension == "max":
+            return max(image.size[0], image.size[1])
+        if self.dimension == "min":
+            return min(image.size[0], image.size[1])
+        return image.size[self.dimension]
+pass
+
+
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = (
@@ -2051,12 +2073,9 @@ class UnslothVisionDataCollator:
                 "Unsloth: resize_dimension accepts 0, 1, 'max' or 'min'\n"\
                 "For example 0 resizes the first dimension, 1 the second, 'max' resizes based on the max of height width, 'min' the min size"
             )
-        elif resize_dimension in [0, 1]:
-            self.size_func = lambda x: x.size[resize_dimension]
-        elif resize_dimension == 'max':
-            self.size_func = lambda x: max(x.size[0], x.size[1])
-        elif resize_dimension == 'min':
-            self.size_func = lambda x: min(x.size[0], x.size[1])
+        else:
+            # Picklable (not a lambda): spawn DataLoader workers (Windows, macOS) pickle the collator.
+            self.size_func = _ImageSide(resize_dimension)
         self.resize_dimension = resize_dimension
 
         # Sequence lengths

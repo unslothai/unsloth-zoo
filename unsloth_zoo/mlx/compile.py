@@ -2453,12 +2453,6 @@ def _qwen_video_tensor_adapter(original):
 
     if getattr(original, "_unsloth_qwen_video_tensor", False):
         return original
-    if getattr(
-        original,
-        "_unsloth_qwen3_replaces_visual_inference",
-        False,
-    ):
-        return original
     underlying = inspect.unwrap(original)
     if (
         not _qwen_video_signature_supported(original)
@@ -2876,23 +2870,7 @@ def _qwen3_mixed_prompt_batch_adapter(original):
     return patched
 
 
-def _qwen3_callable_source(original):
-    try:
-        return inspect.getsource(original)
-    except (OSError, TypeError):
-        return ""
-
-
-def _qwen3_drops_deepstack_after_eval(original):
-    return "deepstack_visual_embeds = mx.eval(" in _qwen3_callable_source(original)
-
-
-def _qwen3_batch_embedding_adapter(
-    original,
-    replacement=None,
-    *,
-    replace_visual_inference=False,
-):
+def _qwen3_batch_embedding_adapter(original, replacement=None):
     """Expose flattened Qwen3 deepstack state in a compact row-owned format."""
 
     if getattr(original, "_unsloth_qwen3_batch_visual_state", False):
@@ -2901,18 +2879,8 @@ def _qwen3_batch_embedding_adapter(
     @wraps(original)
     def patched(self, input_ids=None, pixel_values=None, **kwargs):
         training = getattr(self, "training", False)
-        use_replacement = replacement is not None and (
-            (
-                training
-                and kwargs.get("position_ids") is not None
-            )
-            or (
-                not training and replace_visual_inference
-                and (
-                    pixel_values is not None
-                    or kwargs.get("pixel_values_videos") is not None
-                )
-            )
+        use_replacement = (
+            replacement is not None and training and kwargs.get("position_ids") is not None
         )
         embedding_call = replacement if use_replacement else original
         features = embedding_call(self, input_ids, pixel_values, **kwargs)
@@ -2937,11 +2905,6 @@ def _qwen3_batch_embedding_adapter(
     )
     patched._unsloth_static_metadata_with_positions = True
     patched._unsloth_qwen3_batch_visual_state = True
-    patched._unsloth_qwen3_replaces_visual_inference = bool(
-        replacement is not None
-        and replace_visual_inference
-        and _qwen_video_contract_matches(replacement, "fixed")
-    )
     return patched
 
 
@@ -3442,29 +3405,15 @@ def _install_qwen3_family_compile_patches():
             generate_module = importlib.import_module(generate_name)
         except Exception:
             continue
-        prompt_merge = getattr(
-            generate_module,
-            "_merge_prefill_prompt_kwargs",
-            None,
+        generate_module._merge_prefill_prompt_kwargs = _qwen3_prompt_merge_adapter(
+            generate_module._merge_prefill_prompt_kwargs
         )
-        if prompt_merge is not None:
-            setattr(
-                generate_module,
-                "_merge_prefill_prompt_kwargs",
-                _qwen3_prompt_merge_adapter(prompt_merge),
-            )
-        batch_generator = getattr(generate_module, "BatchGenerator", None)
-        mixed_prompt_batch = getattr(
+        batch_generator = generate_module.BatchGenerator
+        _patch_method(
             batch_generator,
             "_build_mixed_prompt_batch",
-            None,
+            _qwen3_mixed_prompt_batch_adapter(batch_generator._build_mixed_prompt_batch),
         )
-        if mixed_prompt_batch is not None:
-            _patch_method(
-                batch_generator,
-                "_build_mixed_prompt_batch",
-                _qwen3_mixed_prompt_batch_adapter(mixed_prompt_batch),
-            )
 
     def merge_qwen3(image_features, inputs_embeds, input_ids, image_token_index, video_token_index):
         import mlx.core as mx
@@ -3846,9 +3795,6 @@ def _install_qwen3_family_compile_patches():
         _qwen3_batch_embedding_adapter(
             module.Model.get_input_embeddings,
             patched_qwen3_get_input_embeddings,
-            replace_visual_inference=_qwen3_drops_deepstack_after_eval(
-                module.Model.get_input_embeddings
-            ),
         ),
     )
     _patch_explicit_position_embeddings(qwen35_module.Model, patched_qwen35_get_input_embeddings)
@@ -3873,9 +3819,6 @@ def _install_qwen3_family_compile_patches():
             _qwen3_batch_embedding_adapter(
                 qwen3moe_module.Model.get_input_embeddings,
                 patched_qwen3_get_input_embeddings,
-                replace_visual_inference=_qwen3_drops_deepstack_after_eval(
-                    qwen3moe_module.Model.get_input_embeddings
-                ),
             ),
         )
         _PATCHED_ARCHES.add("qwen3_vl_moe")
@@ -5333,48 +5276,8 @@ def _install_qwen3_get_input_embeddings_patch():
     _PATCHED_ARCHES.add("qwen3_vl")
 
 
-def _legacy_vlm_prefill_kwargs_adapter(original):
-    """Drop generator bookkeeping only for strict legacy language callables."""
-
-    if getattr(original, "_unsloth_legacy_prefill_kwargs", False):
-        return original
-    try:
-        parameters = inspect.signature(original, follow_wrapped=False).parameters
-    except (TypeError, ValueError):
-        return original
-    if (
-        "n_to_process" in parameters
-        or any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters.values()
-        )
-    ):
-        return original
-
-    @wraps(original)
-    def patched(self, *args, **kwargs):
-        kwargs.pop("n_to_process", None)
-        return original(self, *args, **kwargs)
-
-    patched._unsloth_legacy_prefill_kwargs = True
-    return patched
-
-
-def _install_legacy_llava_prefill_patch():
-    language_module = _try_import_module("mlx_vlm.models.llava.language")
-    language_class = getattr(language_module, "LanguageModel", None)
-    if language_class is None:
-        return
-    original = language_class.__call__
-    adapted = _legacy_vlm_prefill_kwargs_adapter(original)
-    if adapted is not original:
-        _patch_method(language_class, "__call__", adapted)
-
-
 def _install_llama_pixtral_mistral_compile_patches():
     """Install compile-safe multimodal merge patches for llama-like families."""
-
-    _install_legacy_llava_prefill_patch()
 
     def merge_single_image_token_family(
         image_token_index, image_features, inputs_embeds, input_ids
@@ -5782,8 +5685,6 @@ def _gemma3n_language_contract(method):
         source = inspect.getsource(method)
     except (OSError, TypeError):
         return None
-    if "cache[self.first_full_idx :]" in source and "int(c.offset)" in source:
-        return "legacy"
     if (
         "cache[self.first_full_idx]" in source
         and "window_size=self.config.sliding_window" in source
@@ -5903,17 +5804,7 @@ def _install_gemma3n_compile_patches():
             if target_len != h.shape[1]:
                 target_len = h.shape[1]
 
-            if language_contract == "legacy":
-                cache_offset = next(
-                    (
-                        int(c.offset)
-                        for c in (cache or [])
-                        if c is not None and hasattr(c, "offset")
-                    ),
-                    0,
-                )
-            else:
-                cache_offset = _gemma3n_cache_offset(cache)
+            cache_offset = _gemma3n_cache_offset(cache)
             max_start = max(per_layer_inputs.shape[1] - target_len, 0)
             start = min(cache_offset, max_start)
             per_layer_inputs = per_layer_inputs[:, start : start + target_len]
@@ -5924,25 +5815,15 @@ def _install_gemma3n_compile_patches():
             cache = [None] * len(self.layers)
 
         if mask is None:
-            if language_contract == "legacy":
-                full_mask = language_module.create_attention_mask(
-                    h,
-                    cache[self.first_full_idx :],
-                )
-                sliding_window_mask = language_module.create_attention_mask(
-                    h,
-                    cache[self.first_sliding_idx :],
-                )
-            else:
-                full_mask = language_module.create_attention_mask(
-                    h,
-                    cache[self.first_full_idx],
-                )
-                sliding_window_mask = language_module.create_attention_mask(
-                    h,
-                    cache[self.first_sliding_idx],
-                    window_size=self.config.sliding_window,
-                )
+            full_mask = language_module.create_attention_mask(
+                h,
+                cache[self.first_full_idx],
+            )
+            sliding_window_mask = language_module.create_attention_mask(
+                h,
+                cache[self.first_sliding_idx],
+                window_size=self.config.sliding_window,
+            )
         h0 = h
 
         target_magnitude = _safe_branch_magnitude(h0)
@@ -6023,8 +5904,7 @@ def _install_gemma4_unified_compile_patches():
     module = _try_import_module("mlx_vlm.models.gemma4_unified.gemma4_unified")
     if module is None:
         return
-    if getattr(module, "_compact_prefix_rows", None) is not None:
-        setattr(module, "_compact_prefix_rows", _static_shape_prefix_rows)
+    module._compact_prefix_rows = _static_shape_prefix_rows
 
     model_cls = getattr(module, "Model", None)
     original_call = getattr(model_cls, "__call__", None)
@@ -6054,9 +5934,7 @@ def _install_gemma4_unified_compile_patches():
 
         _patch_method(model_cls, "__call__", patched_call)
 
-    original_update = getattr(model_cls, "_update_chunked_prefill_mode", None)
-    if original_update is None:
-        return
+    original_update = model_cls._update_chunked_prefill_mode
 
     def patched_update_chunked_prefill_mode(self, input_ids=None, **kwargs):
         # Skip `.item()` syncs; `BatchGenerator` reads the language model flag, so restore the config default.
@@ -6080,10 +5958,7 @@ def _install_gemma4_compile_patches():
     language_module = _try_import_module("mlx_vlm.models.gemma4.language")
     text_model_cls = getattr(language_module, "Gemma4TextModel", None)
     original_make_masks = getattr(text_model_cls, "_make_masks", None)
-    # mlx-vlm < 0.6.1 has no vision overlay and a two-argument `_make_masks`: nothing to fix.
-    if original_make_masks is None or not hasattr(
-        text_model_cls, "_apply_blockwise_bidirectional_overlay"
-    ):
+    if original_make_masks is None:
         return
     from .utils import _PADDING_FREE_LAYOUT, _SharedKVSlot
 
