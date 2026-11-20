@@ -827,7 +827,6 @@ def _gradient_checkpoint_recompute_marker(function = None):
 
 
 def _module_forward_chain(module):
-    # type(module).forward and every function it wraps through functools.wraps (__wrapped__).
     function = getattr(type(module), "forward", None)
     for _ in range(8):
         if function is None:
@@ -838,7 +837,6 @@ pass
 
 
 def _calls_whole_module(function, module):
-    # True when `function` is module.__call__ or module's forward, i.e. calling it runs the module and nothing else.
     if not isinstance(module, torch.nn.Module):
         return False
     if function in (torch.nn.Module.__call__, torch.nn.Module._call_impl):
@@ -848,11 +846,8 @@ pass
 
 
 def _replayed_module(function):
-    """The module whose call is the whole checkpointed function, else None. Only shapes known to add nothing
-    after the module returns: the module itself, its bound __call__ / forward, functools.partial over those
-    (transformers' GradientCheckpointingLayer binds partial(super().__call__, **kwargs) or
-    partial(forward, self, **kwargs)), the keyword re-binder above, or a callable tagged
-    `_unsloth_checkpoint_module`. Anything else returns None."""
+    """Module whose call is the whole checkpointed function, else None. Any shape that could add work
+    after the module returns (lambdas, other methods) must resolve to None."""
     # All Unsloth Zoo code licensed under LGPLv3
     for _ in range(8):
         if isinstance(function, _KeywordArgumentCall):
@@ -877,16 +872,14 @@ pass
 
 
 def gradient_checkpoint_replay_module():
-    """While a reentrant Unsloth checkpoint replays its forward: the module whose call is the entire checkpointed
-    function (so that module's return value is the checkpoint's output and nothing else in the replay reads it).
-    None outside a replay, inside a nested non-replay region, or when the function is not a plain module call."""
+    """During a reentrant checkpoint replay, the module whose output nothing else reads; else None."""
     if not getattr(_GC_RECOMPUTE_TLS, "active", False):
         return None
     function = getattr(_GC_RECOMPUTE_TLS, "function", None)
     if function is None:
         return None
     module = _replayed_module(function)
-    # A forward hook runs after forward and may read the output: never report such a module.
+    # Forward hooks may read the output.
     if module is None or module._forward_hooks or torch.nn.modules.module._global_forward_hooks:
         return None
     return module

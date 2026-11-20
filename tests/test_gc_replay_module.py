@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""gradient_checkpoint_replay_module() names the module whose call is the whole checkpointed function, only
-while a reentrant checkpoint replays it. Unsloth's fused LoRA MLP skips the replay's down projection only for
-that module, so any wrapper that could add work after the module returns must resolve to None."""
+"""Unsloth's fused LoRA MLP skips the replay down projection only for this module, so wrappers must resolve to None."""
 
 import functools
 
@@ -64,7 +62,6 @@ def test_resolves_whole_module_calls_only():
     assert resolve(custom_forward) is None
     custom_forward._unsloth_checkpoint_module = layer
     assert resolve(custom_forward) is layer
-    # Work after the module returns, or another module's method: never a replay root.
     assert resolve(layer.helper) is None
     assert resolve(functools.partial(layer.helper)) is None
     assert resolve(lambda x: layer(x) + 1) is None
@@ -73,7 +70,7 @@ def test_resolves_whole_module_calls_only():
 
 
 def test_wrapped_class_forward_resolves(monkeypatch):
-    # transformers >= 5.23 / Unsloth block compile: type(self).forward wraps the forward it checkpoints.
+    # transformers >= 5.23 / Unsloth block compile wrap type(self).forward.
     inner = _Layer.forward
     monkeypatch.setattr(_Layer, "forward", _wrapped(inner))
     layer = _Layer()
@@ -118,7 +115,6 @@ def test_nested_marker_restores_function():
 
 
 def test_module_with_forward_hook_is_never_reported():
-    # A forward hook runs after forward and may read the output, so the output is not unread.
     layer = _Layer()
     handle = layer.register_forward_hook(lambda module, args, output: output.square())
     with gc._gradient_checkpoint_recompute_marker(layer):
