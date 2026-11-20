@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import textwrap
 from pathlib import Path
@@ -130,3 +131,17 @@ def test_a_neighbours_shards_are_not_adopted_when_the_export_wrote_none(llama_cp
 
     with pytest.raises(RuntimeError, match = "not created"):
         _convert(llama_cpp, tmp_path, own_shards = 0)
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or os.geteuid() == 0, reason = "needs POSIX permissions and a non-root user"
+)
+def test_an_unlistable_output_folder_raises_its_own_error(llama_cpp, tmp_path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    out_dir.chmod(0o300)  # writable and searchable, not listable
+    try:
+        with pytest.raises(PermissionError):
+            _convert(llama_cpp, tmp_path, own_shards = 2)
+    finally:
+        out_dir.chmod(0o700)

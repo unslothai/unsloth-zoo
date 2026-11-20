@@ -5160,21 +5160,23 @@ def _retry_with_temp_file(command):
     return out[:-1] + ["--use-temp-file"] + out[-1:]
 
 
-def _gguf_output_paths(output_file):
-    """`output_file` plus any shards llama.cpp names after it."""
+def _gguf_shard_paths(output_file):
+    """The shards llama.cpp named after `output_file`, sorted. `os.listdir` errors propagate."""
     stem = os.path.basename(os.path.splitext(output_file)[0])
     parent_dir = os.path.dirname(output_file) or '.'
-    paths = [output_file]
+    # The whole stem must match, or a neighbour like "old-model.BF16-00001-of-00002" gets taken.
+    return [
+        os.path.join(parent_dir, f) for f in sorted(os.listdir(parent_dir))
+        if (m := _GGUF_SHARD_PATTERN.match(f)) and m["stem"] == stem
+    ]
+
+
+def _gguf_output_paths(output_file):
+    """`output_file` plus any shards llama.cpp names after it."""
     try:
-        # The whole stem must match: these get os.remove'd, and a suffix match
-        # would take a neighbour like "old-model.BF16-00001-of-00002".
-        for f in sorted(os.listdir(parent_dir)):
-            m = _GGUF_SHARD_PATTERN.match(f)
-            if m and m["stem"] == stem:
-                paths.append(os.path.join(parent_dir, f))
+        return [output_file] + _gguf_shard_paths(output_file)
     except OSError:
-        pass
-    return paths
+        return [output_file]
 
 
 def _remove_gguf_outputs(output_file):
@@ -6497,7 +6499,7 @@ def convert_to_gguf(
             all_output_files.append(output_file)
             found_files = [output_file]
         else:
-            shard_files = _gguf_output_paths(output_file)[1:]
+            shard_files = _gguf_shard_paths(output_file)
 
             if not shard_files:
                 raise RuntimeError(
