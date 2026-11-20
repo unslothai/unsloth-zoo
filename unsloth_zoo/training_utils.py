@@ -503,6 +503,24 @@ def _refuse_scaled_fp8_cast(model, name, param):
     )
 
 
+def _loaded_fp32_parameter_ids(model):
+    paths = {
+        f".{path}."
+        for attr in ("_keep_in_fp32_modules", "_keep_in_fp32_modules_strict")
+        for path in (getattr(model, attr, None) or ())
+    }
+    if not paths:
+        return set()
+    # The loader can leave a non-strict entry in bf16. Preserve only its actual fp32 weights.
+    keep = set()
+    for name, param in model.named_parameters(remove_duplicate=False):
+        if param.dtype == torch.float32:
+            qualified = f".{name}."
+            if any(path in qualified for path in paths):
+                keep.add(id(param))
+    return keep
+
+
 @torch.no_grad
 def prepare_model_for_training(
     model                      : Any,
@@ -586,6 +604,10 @@ def prepare_model_for_training(
     # The loop reuses `dtype`.
     _loaded_float16 = dtype == torch.float16
     _float32_bias_param_ids = set()
+    _loaded_fp32 = (
+        _loaded_fp32_parameter_ids(model)
+        if full_finetuning and mixed_precision_dtype == torch.bfloat16 else set()
+    )
 
     for name, param in model.named_parameters():
         original_name = name
@@ -624,7 +646,7 @@ def prepare_model_for_training(
         else:
             # Norms need fp32 for Adam writeback (~60% of bf16 norm updates round to zero otherwise); a dangling else on train_lm_head once clobbered it.
             requires_grad = True
-            upcast = False
+            upcast = id(param) in _loaded_fp32
             if (train_layernorms
                     and _is_norm
                     and id(param) not in _externally_managed_param_ids
