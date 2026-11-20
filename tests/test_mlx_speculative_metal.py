@@ -2662,8 +2662,10 @@ def test_a_qwen4_head_drafts_from_the_target_tables_shortlist(qwen4, monkeypatch
     hidden, sparse = (mx.concatenate([c[i].reshape(-1, c[i].shape[-1]) for c in calls]) for i in (0, 1))
     full, kept = table(hidden), mx.isfinite(sparse)
     assert (kept.sum(-1) == 2).all().item() and mx.allclose(mx.where(kept, sparse, 0), mx.where(kept, full, 0), atol = 0.05).item()
-    picks = mx.argmax(sparse, axis = -1)
-    assert mx.array_equal(picks, drafter._shortlist(hidden)).item() and not mx.array_equal(picks, mx.argmax(full, axis = -1)).item()
+    # Tied candidates may resolve to either token, so compare the score each pick reaches rather than its index.
+    chosen = mx.concatenate([drafter._shortlist(c[0]).reshape(-1) for c in calls])
+    assert (mx.take_along_axis(sparse, chosen[:, None], axis = -1).squeeze(-1) == sparse.max(axis = -1)).all().item()
+    assert not mx.array_equal(mx.argmax(sparse, axis = -1), mx.argmax(full, axis = -1)).item()
 
 
 def _assert_head_early_replay(drafter, ids, cancel):
