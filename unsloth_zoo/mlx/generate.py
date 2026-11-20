@@ -1026,6 +1026,18 @@ def _row_reductions_match(rows: int, n: int) -> bool:
 
 
 @functools.cache
+def _mlx_lm_batches_one_sampler() -> bool:
+    # mlx-lm 0.31.x calls each row's sampler on that row alone; 0.32.0 calls a shared one once on the batch.
+    try:
+        from importlib.metadata import version
+        from packaging.version import Version
+
+        return Version(version("mlx-lm")) >= Version("0.32.0")
+    except Exception:
+        return False
+
+
+@functools.cache
 def _batched_draws_match() -> bool:
     import mlx.core as mx
 
@@ -1099,7 +1111,7 @@ class _BatchedDraws(_RowKeys):
     def serves(generator) -> bool:
         rows = getattr(getattr(generator, "_generation_batch", None), "uids", None)
         split = getattr(getattr(generator, "_prompt_batch", None), "split", None)
-        return isinstance(rows, list) and callable(split) and _batched_draws_match()
+        return isinstance(rows, list) and callable(split) and _mlx_lm_batches_one_sampler() and _batched_draws_match()
 
     def __call__(self, logprobs):
         uids, self._admitted = self._admitted or list(self._generator._generation_batch.uids), None
