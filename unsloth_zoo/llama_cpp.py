@@ -5160,22 +5160,18 @@ def _retry_with_temp_file(command):
     return out[:-1] + ["--use-temp-file"] + out[-1:]
 
 
-def _gguf_shard_pattern(output_file):
-    """llama.cpp's SHARD_NAME_FORMAT "{:s}-{:05d}-of-{:05d}.gguf" for `output_file`. Use fullmatch."""
-    stem = os.path.basename(os.path.splitext(output_file)[0])
-    return re.compile(re.escape(stem) + r'-(\d{5})-of-(\d{5})\.gguf')
-
-
 def _gguf_output_paths(output_file):
     """`output_file` plus any shards llama.cpp names after it."""
-    shard_pattern = _gguf_shard_pattern(output_file)
+    stem = os.path.basename(os.path.splitext(output_file)[0])
     parent_dir = os.path.dirname(output_file) or '.'
     paths = [output_file]
     try:
-        # fullmatch, not search: these get os.remove'd, and an unanchored match
+        # The whole stem must match: these get os.remove'd, and a suffix match
         # would take a neighbour like "old-model.BF16-00001-of-00002".
-        paths += sorted(os.path.join(parent_dir, f) for f in os.listdir(parent_dir)
-                        if shard_pattern.fullmatch(f))
+        for f in sorted(os.listdir(parent_dir)):
+            m = _GGUF_SHARD_PATTERN.match(f)
+            if m and m["stem"] == stem:
+                paths.append(os.path.join(parent_dir, f))
     except OSError:
         pass
     return paths
@@ -6501,13 +6497,7 @@ def convert_to_gguf(
             all_output_files.append(output_file)
             found_files = [output_file]
         else:
-            shard_pattern = _gguf_shard_pattern(output_file)
-            parent_dir = os.path.dirname(output_file) or '.'
-            shard_files = sorted(
-                os.path.join(parent_dir, f)
-                for f in os.listdir(parent_dir)
-                if shard_pattern.fullmatch(f)
-            )
+            shard_files = _gguf_output_paths(output_file)[1:]
 
             if not shard_files:
                 raise RuntimeError(
@@ -6518,8 +6508,8 @@ def convert_to_gguf(
             # Validate shard completeness
             shard_numbers = []
             for f in shard_files:
-                m = shard_pattern.fullmatch(os.path.basename(f))
-                shard_numbers.append((int(m.group(1)), int(m.group(2))))
+                m = _GGUF_SHARD_PATTERN.match(os.path.basename(f))
+                shard_numbers.append((int(m["index"]), int(m["total"])))
 
             expected_total = shard_numbers[0][1]
             if not all(n[1] == expected_total for n in shard_numbers):
