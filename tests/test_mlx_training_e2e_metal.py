@@ -2135,8 +2135,6 @@ def _fp32_writeback_model(seed=77, dtype=None):
 @pytest.mark.parametrize("max_steps", [1, 4])
 @pytest.mark.parametrize("compiled", [False, True])
 def test_norm_clip_keeps_a_leaf_the_forward_stores_in_fp32(tmp_path, monkeypatch, compiled, max_steps):
-    """A sub-bf16 step on a leaf the forward keeps in fp32 must survive the post-clip dtype restore, while a promotion
-    made inside the update is still undone."""
     import numpy as np
 
     real_decay = MLXTrainer._apply_manual_weight_decay

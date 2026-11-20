@@ -6562,8 +6562,7 @@ class MLXTrainer:
         )
 
         def _trainable_storage_dtypes():
-            # Taken per update, not once before training: a forward pass may store a leaf wider than it was loaded
-            # (Gemma 3n AltUp writes its coefficients back as fp32), and casting that back would drop small updates.
+            # Per update, not once: a forward may widen a leaf (Gemma 3n AltUp coefs -> fp32); narrowing it drops updates.
             if not _restorable_storage_names:
                 return None
             return {
