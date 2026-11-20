@@ -2933,9 +2933,7 @@ RL_REPLACEMENTS["grpo_old_logps_from_new"] = grpo_old_logps_from_new
 
 
 def grpo_old_logps_store(old_logps, row_keep = None, full_rows = None):
-    """pi_old kept for the later num_iterations passes over a micro-batch: the first pass's detached logps, back on
-    every row. Rows the zero-advantage skip left unscored get NaN (no pi_old), which the later passes skip the same
-    way and the IS metrics leave out."""
+    """First pass's detached logps kept as pi_old for later num_iterations passes; rows skipped as unscored get NaN."""
     old_logps = old_logps.detach()
     if row_keep is None or full_rows is None or old_logps.shape[0] == full_rows:
         return old_logps
@@ -3333,7 +3331,6 @@ def grpo_accumulated_loss(
     # Set by unsloth when UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1 skipped the old-policy forward.
     _rollout_logps_as_old = bool(kwargs.pop("rollout_logps_as_old", False))
     _old_from_new = bool(kwargs.pop("old_logps_from_new", False)) and old_logps is None and not _rollout_logps_as_old
-    # Set by unsloth for num_iterations > 1: keep this pass's pi_old (trainer._unsloth_grpo_stored_old_logps).
     _store_old = bool(kwargs.pop("store_old_logps", False)) and _old_from_new
     _row_keep = None
     # TRL defaults the correction flag to True without vLLM too, but only applies the ratio with use_vllm.
@@ -4802,7 +4799,7 @@ def grpo_accumulated_loss(
                         _pick(_full["ids"]), _pick(_full["mask"]), 0.0, _pick(_full["advantages"]), **_kw,
                     )
                 _d_delta, _d_ratio = _out[3], _out[4]
-                # A pi_old kept from an earlier pass (grpo_old_logps_store) has none for these rows: still unscored.
+                # Stored pi_old is NaN for these rows: keep them unscored.
                 _unscored = torch.isnan(_pick(_full["old"])).all(dim = -1, keepdim = True)
                 if bool(_unscored.any()):
                     _d_delta = _d_delta.masked_fill(_unscored.to(_d_delta.device), float("nan"))

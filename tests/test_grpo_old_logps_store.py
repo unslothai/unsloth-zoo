@@ -15,8 +15,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""GRPO num_iterations > 1: the first loss pass hands its detached logps back as pi_old (ratio exactly 1),
-and the later passes, given that pi_old, match TRL's loss on a separately scored pi_old."""
+"""GRPO num_iterations > 1: stored pi_old from pass 1 makes later passes match TRL."""
 
 import sys
 from pathlib import Path
@@ -55,7 +54,6 @@ def _call(monkeypatch, model, adv, old, store, loss_type, level, beta, skip, is_
     monkeypatch.setenv("UNSLOTH_RETURN_HIDDEN_STATES", "0")
     monkeypatch.setenv("UNSLOTH_GRPO_SKIP_ZERO_ADVANTAGE", "1" if skip else "0")
     model.zero_grad(set_to_none = True)
-    # Scored first: _score_old swaps UnslothEfficientGRPO.apply itself.
     ref = h._score_old(h._Model()) - 0.1 if beta else None
     trainer = h._trainer(model, beta = beta, is_mode = is_mode, use_vllm = vllm_is, correction = vllm_is)
     seen = []
@@ -79,7 +77,6 @@ def _call(monkeypatch, model, adv, old, store, loss_type, level, beta, skip, is_
 
 
 def _step(model, scale = 0.05):
-    """Stands in for the optimizer step between iterations: the policy moves, pi_old must not."""
     g = torch.Generator().manual_seed(7)
     with torch.no_grad():
         for p in model.parameters():
@@ -97,7 +94,6 @@ def test_first_pass_ratio_is_exactly_one_and_pi_old_is_kept(monkeypatch, loss_ty
     mask = out[6].bool()
     coef_1 = out[5]
     assert torch.equal(coef_1[mask] if level == "token" else coef_1, torch.ones_like(coef_1[mask] if level == "token" else coef_1))
-    # Same loss and gradient as TRL's iteration 1, whose separately scored pi_old equals pi_theta.
     ref, ref_grads, _, _ = _call(monkeypatch, h._Model(), _ADV, h._score_old(h._Model()), False, loss_type, level, beta, skip = False)
     torch.testing.assert_close(out[0], ref[0], rtol = 1e-6, atol = 1e-9)
     for name in grads:
@@ -109,7 +105,7 @@ def test_later_pass_uses_the_kept_pi_old(monkeypatch, loss_type, level, beta):
     model = h._Model()
     _, _, _, trainer = _call(monkeypatch, model, _ADV, None, True, loss_type, level, beta, skip = False)
     stored = trainer._unsloth_grpo_stored_old_logps
-    pi_old_scored = h._score_old(h._Model())   # TRL's separate no-grad forward of the rollout weights
+    pi_old_scored = h._score_old(h._Model())
     _step(model)
     head, head_grads, seen, trainer2 = _call(monkeypatch, model, _ADV, stored, False, loss_type, level, beta, skip = False)
     assert not hasattr(trainer2, "_unsloth_grpo_stored_old_logps")
@@ -119,7 +115,6 @@ def test_later_pass_uses_the_kept_pi_old(monkeypatch, loss_type, level, beta):
     torch.testing.assert_close(head[0], base[0], rtol = 1e-6, atol = 1e-9)
     for name in head_grads:
         torch.testing.assert_close(head_grads[name], base_grads[name], rtol = 1e-5, atol = 1e-9)
-    # The ratio is pi_theta / kept pi_old, not 1: the iteration actually corrects.
     (new,) = seen
     mask = head[6].bool()
     if level == "token":
@@ -145,7 +140,7 @@ def test_later_pass_matches_the_float64_trl_oracle(monkeypatch):
 
 
 def test_skipped_zero_advantage_rows_keep_no_pi_old(monkeypatch):
-    adv = h._ADV   # rows 0, 1, 4, 5 have zero advantage and are not scored
+    adv = h._ADV
     model = h._Model()
     _, _, seen, trainer = _call(monkeypatch, model, adv, None, True, "dapo", "token", 0.0, skip = True)
     stored = trainer._unsloth_grpo_stored_old_logps
@@ -164,7 +159,6 @@ def test_skipped_zero_advantage_rows_keep_no_pi_old(monkeypatch):
     for name in head_grads:
         assert torch.isfinite(head_grads[name]).all()
         torch.testing.assert_close(head_grads[name], base_grads[name], rtol = 1e-5, atol = 1e-9)
-    # IS metrics: the dropped rows stay unscored (NaN), as on the first pass.
     assert torch.isnan(head[3][dropped]).all() and torch.isnan(head[4][dropped]).all()
     torch.testing.assert_close(head[3][kept], base[3][kept], rtol = 1e-5, atol = 1e-6)
 
@@ -174,7 +168,6 @@ def test_nothing_is_kept_unless_asked_on_a_from_new_pass(monkeypatch, case):
     model = h._Model()
     old = h._score_old(h._Model()) if case == "old_given" else None
     store = case != "no_flag"
-    # Without the flag pi_old None is TRL's aligned single-iteration path (IS off), unchanged.
     _, _, _, trainer = _call(monkeypatch, model, _ADV, old, store, "dapo", "token", 0.0, skip = False,
                              vllm_is = case != "no_flag")
     assert not hasattr(trainer, "_unsloth_grpo_stored_old_logps")
