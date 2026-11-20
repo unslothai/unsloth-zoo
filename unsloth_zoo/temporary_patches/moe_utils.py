@@ -5110,6 +5110,20 @@ def convert_legacy_lora_b(peft_model, adapter_name, config) -> int:
     return len(targets)
 
 
+def _lora_b_state_shapes(param) -> set:
+    """Shapes a permutable state tensor of `param` may have: its own, plus its local shard's when it is a
+    row-sharded DTensor (bitsandbytes and other local-shard optimizers keep per-rank state). The permutation
+    is over columns, so it applies to a row shard as is; a column-sharded tensor keeps only its global shape."""
+    shapes = {tuple(param.shape)}
+    to_local = getattr(param, "to_local", None)
+    placements = getattr(param, "placements", None)
+    if callable(to_local) and placements is not None and not any(
+        type(p).__name__ in ("Shard", "_StridedShard") and getattr(p, "dim", 0) != 0 for p in placements
+    ):
+        shapes.add(tuple(to_local().shape))
+    return shapes
+
+
 def repack_optimizer_state_for_legacy_lora_b(optimizer) -> Tuple[int, int]:
     """Permutes optimizer state of repacked lora_B tensors to match; 8-bit blockwise state cannot be permuted, so it is
     reset and re-initialised; returns (moved, reset)."""
@@ -5126,9 +5140,10 @@ def repack_optimizer_state_for_legacy_lora_b(optimizer) -> Tuple[int, int]:
             if not state:
                 continue
             permutation = _moe_lora_b_column_permutation(*repacked, param.device, invert = True)
-            tensors = [v for v in state.values() if torch.is_tensor(v) and v.shape == param.shape]
+            shapes = _lora_b_state_shapes(param)
+            tensors = [v for v in state.values() if torch.is_tensor(v) and tuple(v.shape) in shapes]
             if tensors and all(v.is_floating_point() for v in tensors) and not any(
-                torch.is_tensor(v) and v.dim() > 0 and v.shape != param.shape for v in state.values()
+                torch.is_tensor(v) and v.dim() > 0 and tuple(v.shape) not in shapes for v in state.values()
             ):
                 with torch.no_grad():
                     for value in tensors:
