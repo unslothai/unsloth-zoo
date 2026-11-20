@@ -6233,12 +6233,13 @@ _NO_AUTOCAST_DEVICE_TYPES = _no_autocast_device_types()
 
 
 def _conv_autocast_eligible(tensor, weight):
-    # Autocast lowers a conv only when it is enabled on this device and no operand is float64.
+    # Autocast lowers a conv only when it is enabled on this device and both operands are real
+    # fp32 / fp16 / bf16 (float64, complex and integer ops keep their dtype).
     return (
         tensor.device.type not in _NO_AUTOCAST_DEVICE_TYPES
         and torch.is_autocast_enabled(tensor.device.type)
-        and tensor.dtype is not torch.float64
-        and weight.dtype is not torch.float64
+        and tensor.dtype in (torch.float32, torch.float16, torch.bfloat16)
+        and weight.dtype in (torch.float32, torch.float16, torch.bfloat16)
     )
 
 

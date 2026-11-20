@@ -99,3 +99,14 @@ def test_float64_conv_under_autocast_keeps_float64():
         out = forward(conv, x)
     assert stock.dtype == out.dtype == torch.float64
     assert torch.equal(out, stock)
+
+
+def test_complex_conv_under_autocast_keeps_complex():
+    conv = torch.nn.Conv1d(2, 2, 3).to(torch.complex64)
+    forward = _dtype_safe_forward(torch.nn.Conv1d.forward, True, False)
+    x = torch.randn(1, 2, 8, dtype = torch.complex64)
+    with torch.no_grad(), torch.autocast("cpu", dtype = torch.bfloat16):
+        stock = torch.nn.Conv1d.forward(conv, x)
+        out = forward(conv, x)
+    assert stock.dtype == out.dtype == torch.complex64
+    assert torch.equal(out, stock)
