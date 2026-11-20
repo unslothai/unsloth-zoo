@@ -35,6 +35,7 @@ import math
 import os
 import sys
 import contextlib
+import threading
 from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compile_options, logger
 from unsloth_zoo.temporary_patches.common import CHUNK_ALIGN_ROWS, chunk_row_bounds
 from unsloth_zoo.device_type import DEVICE_TYPE
@@ -795,6 +796,7 @@ class _LabelSmoothingOverride:
     epsilon = 0.0
     n_items = None
     engaged = 0
+    owner = None  # thread that opened the block; fused CE calls on other threads are left alone
 
 _LABEL_SMOOTHING = _LabelSmoothingOverride()
 
@@ -809,18 +811,24 @@ def unsloth_label_smoothing_override(epsilon, n_items):
     epsilon = float(epsilon)
     if not 0.0 <= epsilon <= 1.0:
         raise ValueError(f"Unsloth: label_smoothing must be between 0.0 and 1.0, got {epsilon}.")
-    state.epsilon, state.n_items, state.engaged, state.active = epsilon, n_items, 0, True
+    state.epsilon, state.n_items, state.engaged, state.owner = epsilon, n_items, 0, threading.get_ident()
+    state.active = True
     try:
         yield state
     finally:
         state.active = False
         state.n_items = None
+        state.owner = None
 
 
 @torch.compiler.disable
 def _apply_label_smoothing_override(n_items, kwargs):
     state = _LABEL_SMOOTHING
-    if not state.active or float(kwargs.get("label_smoothing", 0.0) or 0.0) != 0.0:
+    if (
+        not state.active
+        or state.owner != threading.get_ident()
+        or float(kwargs.get("label_smoothing", 0.0) or 0.0) != 0.0
+    ):
         return n_items, kwargs
     state.engaged += 1
     return state.n_items, {**kwargs, "label_smoothing": state.epsilon}
