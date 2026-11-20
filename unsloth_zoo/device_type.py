@@ -792,7 +792,7 @@ def _apple_bf16_supported():
     """M1 (g13) and M2 (g14) lack native bf16. Matches unsloth's MLX answer."""
     try:
         import mlx.core as mx
-        info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+        info = mx.device_info()
         match = re.fullmatch(r"applegpu_g(\d+)[a-z]", str(info.get("architecture", "")))
         if match:
             return int(match.group(1)) >= 15

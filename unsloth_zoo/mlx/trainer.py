@@ -3061,10 +3061,7 @@ class MLXTrainer:
             if backend is None:
                 world = init()
             else:
-                try:
-                    world = init(backend=backend)
-                except TypeError:
-                    world = init()
+                world = init(backend=backend)
             if world is not None:
                 rank = int(world.rank())
                 world_size = int(world.size())

@@ -45,11 +45,7 @@ _SCRIPT = textwrap.dedent(
     if "mlx_simulation" in str(getattr(mx, "__file__", "")):
         print("SKIP simulation stub leaked into the subprocess")
         raise SystemExit(0)
-    merge = getattr(ar, "_merge_prefill_prompt_kwargs", None)
-    if merge is None:
-        print("SKIP mlx-vlm without _merge_prefill_prompt_kwargs")
-        raise SystemExit(0)
-    merge = mc._qwen3_prompt_merge_adapter(merge)
+    merge = mc._qwen3_prompt_merge_adapter(ar._merge_prefill_prompt_kwargs)
 
     def visual_row(length, positions, base):
         flags = [False] * length

@@ -146,7 +146,6 @@ def _patch_vlm_distributed(monkeypatch, error):
     monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils)
     monkeypatch.setattr(loader, "_mlx_active_distributed_groups", lambda p, t: (None, object()))
     monkeypatch.setattr(loader, "_bind_mlx_vlm_processor_loader", lambda f, **k: f)
-    monkeypatch.setattr(loader, "_bind_mlx_vlm_quantized_projector_loader", lambda f: f)
     monkeypatch.setattr(
         loader, "_materialize_mlx_vlm_config_override", lambda path, cfg, **k: (path, None)
     )

@@ -2195,9 +2195,8 @@ def install_speculative_seam() -> None:
         ar.run_speculative_rounds = _engine_rounds(ar.run_speculative_rounds)
     if getattr(ar.SpeculativePrefill, "unsloth_upstream", None) is None:
         ar.SpeculativePrefill = _prompt_tail_prefill(ar.SpeculativePrefill)
-    gate = getattr(ar, "_chunked_prefill_enabled", None)
-    if callable(gate) and getattr(gate, "unsloth_upstream", None) is None:
-        ar._chunked_prefill_enabled = _copies_chunk_alike(gate)
+    if getattr(ar._chunked_prefill_enabled, "unsloth_upstream", None) is None:
+        ar._chunked_prefill_enabled = _copies_chunk_alike(ar._chunked_prefill_enabled)
 
 
 def _copies_chunk_alike(upstream: Callable) -> Callable:
@@ -2252,18 +2251,13 @@ def _prompt_tail_prefill(upstream: type) -> type:
 def speculative_unavailable_reason() -> str | None:
     """Why the installed mlx-vlm cannot run the engine, or None."""
     import importlib
-    import inspect
 
     try:
-        ar = importlib.import_module("mlx_vlm.generate.ar")
-        from mlx_vlm.speculative.cache_state import SpeculativeCacheTransaction
+        importlib.import_module("mlx_vlm.generate.ar")
+        from mlx_vlm.speculative.cache_state import SpeculativeCacheTransaction  # noqa: F401
         from mlx_vlm.speculative.common import generation_stream, verify_forward  # noqa: F401
     except ImportError as exc:
         return f"mlx-vlm lacks the speculative decoding primitives ({exc})"
-    if not callable(getattr(ar, "run_speculative_rounds", None)) or not {"draft_model", "draft_kind"} <= set(inspect.signature(ar.generate_step).parameters):
-        return "mlx-vlm's generate_step does not hand drafters to run_speculative_rounds"
-    if not all(callable(getattr(SpeculativeCacheTransaction, name, None)) for name in ("validate", "commit", "abort")):
-        return "mlx-vlm's speculative cache transaction lacks validate, commit or abort"
     return None
 
 

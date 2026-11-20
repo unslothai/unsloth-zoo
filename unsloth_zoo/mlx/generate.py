@@ -468,14 +468,10 @@ def _kv_quant_options(defaults: GenerationDefaults) -> dict:
     }
 
 
-def _prefill_step_option(defaults: GenerationDefaults, constructor = None, *, model = None) -> dict:
+def _prefill_step_option(defaults: GenerationDefaults, *, model = None) -> dict:
     """Supported prefill size, bounded by the loaded model's automatic memory plan."""
     if defaults.prefill_step_size is None:
         return {}
-    if constructor is not None:
-        params = inspect.signature(constructor).parameters
-        if "prefill_step_size" not in params and not any(p.kind is p.VAR_KEYWORD for p in params.values()):
-            return {}
     return {"prefill_step_size": capped_prefill_step(model, defaults.prefill_step_size)}
 
 
@@ -525,15 +521,9 @@ def _vlm_kv_controls_refused(defaults: GenerationDefaults) -> list[str]:
     ]
     if not requested:
         return []
-    try:
-        accepted = inspect.signature(
-            _resolve_vlm_batch_module().BatchGenerator.__init__
-        ).parameters
-    except Exception:
-        return requested
-    refused = [name for name in requested if name not in accepted]
+    refused = []
     scheme = defaults.kv_quant_scheme
-    if scheme is not None and "kv_quant_scheme" not in refused and scheme not in _vlm_kv_quant_schemes():
+    if scheme is not None and scheme not in _vlm_kv_quant_schemes():
         # Any other name quietly resolves to uniform.
         refused.append("kv_quant_scheme")
     if defaults.kv_bits is None:
@@ -634,14 +624,6 @@ def _unpadded_lengths(mask) -> list[int] | None:
 VLM_TOKEN_ID_PROMPTS = True
 
 
-@functools.cache
-def _vlm_prepares_videos() -> bool:
-    try:
-        return "videos" in inspect.signature(importlib.import_module("mlx_vlm.utils").prepare_inputs).parameters
-    except Exception:
-        return False
-
-
 def _validate_vlm_requests(
     requests: Sequence[GenerationRequest],
     defaults: GenerationDefaults,
@@ -712,9 +694,6 @@ def _validate_vlm_requests(
             raise TypeError(f"requests[{index}].videos must be a sequence of clip paths.")
         if request.fps is not None and not request.fps > 0:
             raise ValueError(f"requests[{index}].fps must be positive.")
-        if request.videos and not _vlm_prepares_videos():
-            # Before 0.5.0 prepare_inputs swallows ``videos`` in **kwargs: the clip's markers would decode with no frames.
-            raise ValueError(f"requests[{index}] carries videos, which batched generation needs mlx-vlm >= 0.5.0 for.")
         if request.videos:
             validated[index] = replace(
                 validated[index], videos=tuple(os.fspath(clip) for clip in request.videos)
@@ -827,7 +806,7 @@ def _api_shape_error(details: str) -> RuntimeError:
         "Unsupported mlx-lm batch-generation API shape "
         f"({details}) in {_installed_mlx_lm_version()}. Batched generation "
         "needs a BatchGenerator that streams per-token events, which requires "
-        "mlx-lm 0.31.2 or newer; upgrade mlx-lm, or use model.generate for "
+        "mlx-lm 0.31.3 or newer; upgrade mlx-lm, or use model.generate for "
         "sequential decoding."
     )
 
@@ -1047,6 +1026,18 @@ def _row_reductions_match(rows: int, n: int) -> bool:
 
 
 @functools.cache
+def _mlx_lm_batches_one_sampler() -> bool:
+    # mlx-lm 0.31.x calls each row's sampler on that row alone; 0.32.0 calls a shared one once on the batch.
+    try:
+        from importlib.metadata import version
+        from packaging.version import Version
+
+        return Version(version("mlx-lm")) >= Version("0.32.0")
+    except Exception:
+        return False
+
+
+@functools.cache
 def _batched_draws_match() -> bool:
     import mlx.core as mx
 
@@ -1120,7 +1111,7 @@ class _BatchedDraws(_RowKeys):
     def serves(generator) -> bool:
         rows = getattr(getattr(generator, "_generation_batch", None), "uids", None)
         split = getattr(getattr(generator, "_prompt_batch", None), "split", None)
-        return isinstance(rows, list) and callable(split) and _batched_draws_match()
+        return isinstance(rows, list) and callable(split) and _mlx_lm_batches_one_sampler() and _batched_draws_match()
 
     def __call__(self, logprobs):
         uids, self._admitted = self._admitted or list(self._generator._generation_batch.uids), None
@@ -1249,16 +1240,14 @@ class _PerRowSampler:
                 if all(position == 0 for position in positions)
                 else "_generation_batch"
             )
-            batch = getattr(self._generator, name, _MISSING)
-            if batch is not _MISSING:
-                uids = list(getattr(batch, "uids", ()) or ())
-                if len(uids) != width:
-                    raise RuntimeError(
-                        f"{_installed_mlx_vlm_version()} drew {width} rows from a "
-                        f"{name.lstrip('_').replace('_', ' ')} holding {len(uids)}, "
-                        "so per-row sampling cannot be matched to rows."
-                    )
-                return uids
+            uids = list(getattr(getattr(self._generator, name), "uids", ()) or ())
+            if len(uids) != width:
+                raise RuntimeError(
+                    f"{_installed_mlx_vlm_version()} drew {width} rows from a "
+                    f"{name.lstrip('_').replace('_', ' ')} holding {len(uids)}, "
+                    "so per-row sampling cannot be matched to rows."
+                )
+            return uids
         if width != len(self.row_uids):
             raise RuntimeError(
                 f"{_installed_mlx_vlm_version()} stepped a batch of {width} rows "
@@ -1310,10 +1299,6 @@ def _restore_training_flags(states: Sequence[tuple[Any, bool]]):
             set_mode = getattr(module, "_set_training_mode", None)
             if callable(set_mode):
                 set_mode(training)
-            elif isinstance(getattr(type(module), "training", None), property):
-                # mlx.nn.Module exposes training read-only; _set_training_mode
-                # only arrived in mlx 0.30.2, so write the backing attribute.
-                module._training = training
             else:
                 setattr(module, "training", training)
         except BaseException as exc:
@@ -1448,16 +1433,11 @@ def _drain_stream_modules():
 def _drain_generation_streams(mx):
     """Drain the generation streams, best effort, before the caller clears the cache.
 
-    A no-argument mx.synchronize() waits on the default stream, not these. Best effort
-    because they can fail: at the mlx-vlm pin floor generation_stream is a plain
-    mx.new_stream, which raises when synchronized off its creating thread, and losing
-    the drain must never cost the caller its clear. Only effective on the generating
-    thread: elsewhere a thread-local stream drains nothing instead of raising.
+    A no-argument mx.synchronize() waits on the default stream, not these. Best effort because they can fail, and
+    losing the drain must never cost the caller its clear. Only effective on the generating thread: elsewhere a
+    thread-local stream drains nothing instead of raising.
     """
 
-    synchronize = getattr(mx, "synchronize", None)
-    if not callable(synchronize):
-        return
     drained = []
     for name in _drain_stream_modules():
         try:
@@ -1471,11 +1451,11 @@ def _drain_generation_streams(mx):
             continue
         drained.append(stream)
         try:
-            synchronize(stream)
+            mx.synchronize(stream)
         except Exception:
             continue
     try:
-        synchronize()
+        mx.synchronize()
     except Exception:
         pass
 
@@ -1486,14 +1466,9 @@ def _generation_cache_hygiene():
 
     import mlx.core as mx
 
-    clear_cache = getattr(mx, "clear_cache", None)
-    if not callable(clear_cache):
-        raise RuntimeError(
-            "Unsupported MLX runtime API shape (mlx.core.clear_cache missing)."
-        )
     # MLX pins buffers a live command buffer reads, but not an output array dropped mid-flight.
     _drain_generation_streams(mx)
-    clear_cache()
+    mx.clear_cache()
     active_error = None
     try:
         yield
@@ -1503,7 +1478,7 @@ def _generation_cache_hygiene():
     finally:
         try:
             _drain_generation_streams(mx)
-            clear_cache()
+            mx.clear_cache()
         except BaseException as cleanup_error:
             if active_error is None:
                 raise
@@ -1634,16 +1609,15 @@ def _install_arrays_cache_advance_fix():
     the mask-owning cache is forced and every other linear-attention layer strands one
     buffer per token. A Python counter keeps the arithmetic and allocates nothing.
 
-    mlx-vlm needs visiting separately: it re-exports mlx-lm's class up to 0.5.x, vendors
-    this same body from 0.6.4, and only defers for itself from 0.6.17. Visited only once
-    already imported, so a text-only run does not pull in an optional dependency.
+    mlx-vlm needs visiting separately: it vendors this same body and only defers for itself
+    from 0.6.17. Visited only once already imported, so a text-only run does not pull in an
+    optional dependency.
     """
 
     global _ARRAYS_CACHE_ADVANCE_RESOLVED, _VLM_ARRAYS_CACHE_ADVANCE_RESOLVED
     with _ARRAYS_CACHE_ADVANCE_LOCK:
         if _ARRAYS_CACHE_ADVANCE_RESOLVED and _VLM_ARRAYS_CACHE_ADVANCE_RESOLVED:
             return
-        seen = []
         if not _ARRAYS_CACHE_ADVANCE_RESOLVED:
             try:
                 arrays_cache = importlib.import_module("mlx_lm.models.cache").ArraysCache
@@ -1653,15 +1627,11 @@ def _install_arrays_cache_advance_fix():
                 return
             if replaceable:
                 _install_deferred_metadata(arrays_cache)
-            seen.append(arrays_cache)
             _ARRAYS_CACHE_ADVANCE_RESOLVED = True
         if not _VLM_ARRAYS_CACHE_ADVANCE_RESOLVED and "mlx_vlm" in sys.modules:
             try:
                 vlm_cache = importlib.import_module("mlx_vlm.models.cache").ArraysCache
-                # Up to mlx-vlm 0.5.x this is mlx-lm's class, already decided above.
-                replaceable = vlm_cache not in seen and _has_replaceable_advance(
-                    vlm_cache
-                )
+                replaceable = _has_replaceable_advance(vlm_cache)
             except Exception:
                 return
             if replaceable:
@@ -2074,7 +2044,7 @@ class _TextBatchSession:
             prefill_batch_size=defaults.prefill_batch_size,
             completion_batch_size=defaults.completion_batch_size,
             max_kv_size=defaults.max_kv_size,
-            **_prefill_step_option(defaults, adapter.batch_generator_type, model=adapter.model),
+            **_prefill_step_option(defaults, model=adapter.model),
         )
         self._draws = (
             _BatchedDraws(self.generator)
@@ -2424,11 +2394,7 @@ def _probe_vlm_api(batch_module):
     generator = getattr(batch_module, "BatchGenerator", None)
     if generator is None:
         raise _vlm_api_shape_error("BatchGenerator missing")
-    response = getattr(generator, "Response", None)
-    if response is None:
-        # Newer releases move the event to the generation batch.
-        batch = getattr(batch_module, "GenerationBatch", None)
-        response = getattr(batch, "Response", None) if batch is not None else None
+    response = getattr(getattr(batch_module, "GenerationBatch", None), "Response", None)
     if response is None:
         raise _vlm_api_shape_error("no per-token Response class found")
     fields = set(getattr(response, "__dataclass_fields__", {}))
@@ -2438,16 +2404,13 @@ def _probe_vlm_api(batch_module):
         raise _vlm_api_shape_error(
             f"per-token Response lacks {', '.join(missing)}"
         )
-    if not fields & {"logprobs", "token_logprob"}:
-        raise _vlm_api_shape_error(
-            "per-token Response exposes neither logprobs nor token_logprob"
-        )
-    for name in ("insert", "next"):
+    if "token_logprob" not in fields:
+        raise _vlm_api_shape_error("per-token Response lacks token_logprob")
+    for name in ("insert", "next", "remove"):
         if not callable(getattr(generator, name, None)):
             raise _vlm_api_shape_error(f"BatchGenerator.{name} missing")
     try:
         constructor = inspect.signature(generator.__init__).parameters
-        insert = inspect.signature(generator.insert).parameters
     except (TypeError, ValueError) as exc:
         raise _vlm_api_shape_error(
             "BatchGenerator call signatures are unavailable"
@@ -2458,7 +2421,9 @@ def _probe_vlm_api(batch_module):
         raise _vlm_api_shape_error(
             f"BatchGenerator constructor missing {', '.join(absent)}"
         )
-    return constructor, insert, _resolve_cancel(generator)
+    if not _vlm_batches_observable(batch_module):
+        raise _vlm_api_shape_error("its sampler is not told which row it draws for")
+    return constructor
 
 
 def _statements(body):
@@ -2561,7 +2526,7 @@ def _padded_prompt_kwargs(batch_module) -> frozenset:
 
     return frozenset({
         "inputs_embeds",
-        *(getattr(batch_module, "_SEQUENCE_ALIGNED_PROMPT_KWARGS", None) or ()),
+        *batch_module._SEQUENCE_ALIGNED_PROMPT_KWARGS,
     })
 
 
@@ -2668,28 +2633,6 @@ def _keeps_what_it_prepared(model, method = "get_input_embeddings") -> bool:
 
 def _require_streamable_vlm(adapter: "_VLMBatchAdapter") -> None:
 
-    if not adapter.per_row_prompt_kwargs:
-        raise ValueError(
-            f"{_installed_mlx_vlm_version()} admits one set of embeddings for a "
-            "whole prefill batch, so a vision row cannot join a batch it was not "
-            "preprocessed with. Generate with generate_batch or stream_batch, or "
-            "upgrade mlx-vlm."
-        )
-    if not adapter.batches_observable:
-        raise ValueError(
-            f"{_installed_mlx_vlm_version()} does not let a sampler tell which "
-            "row it is drawing for, which a batch that widens while it decodes "
-            "needs. Generate with generate_batch or stream_batch, or upgrade "
-            "mlx-vlm."
-        )
-    if not callable(getattr(adapter.batch_module, "_chunked_prefill_enabled", None)):
-        raise ValueError(
-            f"{_installed_mlx_vlm_version()} settles how to prefill when the "
-            "batch is built, before any prompt has arrived, so a row whose model "
-            "needs its prompt prefilled in one pass would be chunked anyway. "
-            "Generate with generate_batch or stream_batch, which build a batch "
-            "around the prompts it holds, or upgrade mlx-vlm."
-        )
     if _keeps_what_it_prepared(adapter.model):
         raise ValueError(
             "This model keeps what it worked out about one request, which a "
@@ -2697,73 +2640,6 @@ def _require_streamable_vlm(adapter: "_VLMBatchAdapter") -> None:
             "prepared last. Generate it with generate_batch or stream_batch, "
             "which prepare a whole batch together."
         )
-
-
-def _resolve_cancel(generator):
-    """How this generator cancels one sequence, decided once.
-
-    Retrying the other form on TypeError would re-run a partially applied
-    cancel against an already mutated batch.
-    """
-
-    remove = getattr(generator, "remove", None)
-    if not callable(remove):
-        return None
-    try:
-        params = [
-            name
-            for name, param in inspect.signature(remove).parameters.items()
-            if name != "self"
-            and param.kind
-            in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD)
-        ]
-    except (TypeError, ValueError):
-        return None
-    if not params:
-        return None
-    plural = params[0].endswith("s")
-    return (lambda gen, uid: gen.remove([uid])) if plural else (
-        lambda gen, uid: gen.remove(uid)
-    )
-
-
-def _is_mrope_position_ids(key: str, value) -> bool:
-    shape = getattr(value, "shape", None)
-    return (key == "position_ids" and getattr(value, "ndim", 0) == 3
-            and shape is not None and shape[0] == 3)
-
-
-def _split_prompt_kwargs_fallback(prompt_kwargs: dict, batch_size: int) -> list[dict]:
-    """Per-row split for releases without upstream's splitter.
-
-    MRoPE ``position_ids`` carry the batch on axis 1, so an unconditional
-    axis-0 slice would corrupt them.
-    """
-
-    if batch_size <= 1:
-        return [dict(prompt_kwargs or {})]
-    rows: list[dict] = [{} for _ in range(batch_size)]
-    for key, value in (prompt_kwargs or {}).items():
-        ndim = getattr(value, "ndim", None)
-        if ndim is None or ndim == 0:
-            for row in rows:
-                row[key] = value
-            continue
-        if _is_mrope_position_ids(key, value):
-            for index in range(batch_size):
-                rows[index][key] = (
-                    value[:, index : index + 1, :]
-                    if value.shape[1] == batch_size
-                    else value[:, :1, :]
-                )
-            continue
-        for index in range(batch_size):
-            rows[index][key] = (
-                value[index : index + 1]
-                if value.shape[0] == batch_size
-                else value[:1]
-            )
-    return rows
 
 
 def _ensure_quantized_decode_mask(language = None):
@@ -2801,18 +2677,13 @@ def _resolve_vlm_batch_module():
 
 
 def row_logits_processors_unavailable_reason() -> str | None:
-    """Why a batched vision row here cannot carry its own logits processors."""
+    """Why a batched vision row here cannot carry its own logits processors: only when batching is refused outright."""
 
     try:
-        _, insert_params, _ = _probe_vlm_api(_resolve_vlm_batch_module())
+        _probe_vlm_api(_resolve_vlm_batch_module())
     except Exception as refusal:
         return str(refusal)
-    if "logits_processors" in insert_params:
-        return None
-    return (
-        f"{_installed_mlx_vlm_version()} takes no per-row logits processors, "
-        "so a batched vision reply cannot carry a penalty or bias"
-    )
+    return None
 
 
 _ROW_PREFILL_KEY = "_unsloth_row_prefill"
@@ -2846,15 +2717,9 @@ def _slice_row_inputs(batch_module, prompt_kwargs: dict, length: int, start: int
     return sliced
 
 
-_PREFILL_SLOTS = ("_prompt_batch", "_unprocessed_sequences", "_generation_batch", "completion_batch_size")
-
-
 def _schedules_prefill(generator, defaults) -> bool:
-    return (
-        defaults.prefill_batch_size == 1
-        and getattr(generator, "apc", None) is None
-        and all(hasattr(generator, name) for name in _PREFILL_SLOTS)
-    )
+    # mlx-vlm 0.7.0 added the prefix cache, which admits prompts its own way.
+    return defaults.prefill_batch_size == 1 and getattr(generator, "apc", None) is None
 
 
 def _prompt_tokens_left(batch) -> int | None:
@@ -3052,17 +2917,11 @@ def _row_prefill_surface_gap(batch_module) -> str | None:
     version = _installed_mlx_vlm_version()
     try:
         generator = batch_module.BatchGenerator
-        params = inspect.signature(batch_module.PromptProcessingBatch.__init__).parameters
         # mlx-vlm 0.7.12 admits prompts in `_prefill_step`, which replaced `_next`.
         admission = inspect.getsource(getattr(generator, "_prefill_step", None) or generator._next)
     except (AttributeError, TypeError, ValueError, OSError):
         return f"{version} exposes no prompt batch a row's own cache can enter"
-    helpers = ("_is_sequence_aligned_prompt_kwarg", "_slice_sequence_aligned_prompt_kwarg")
-    if (
-        "warm_cache" not in params
-        or "_generate_module_override" not in admission
-        or not all(callable(getattr(batch_module, name, None)) for name in helpers)
-    ):
+    if "_generate_module_override" not in admission:
         return f"{version} cannot prefill a batched row into a cache the caller gives it"
     return None
 
@@ -3104,13 +2963,7 @@ def speculative_quantized_rows_unavailable_reason() -> str | None:
 def row_retire_unavailable_reason() -> str | None:
     """Why a batched vision row here cannot hand its own cache back as it leaves the batch."""
 
-    reason = row_prompt_cache_unavailable_reason()
-    if reason is not None:
-        return reason
-    batch_module = _resolve_vlm_batch_module()
-    if not callable(getattr(getattr(batch_module, "GenerationBatch", None), "filter", None)):
-        return f"{_installed_mlx_vlm_version()} drops a leaving row's cache where it cannot be handed back"
-    return None
+    return row_prompt_cache_unavailable_reason()
 
 
 def _install_row_prefill_batch(batch_module) -> None:
@@ -3368,16 +3221,9 @@ class _VLMBatchAdapter:
         self, model, processor, defaults: GenerationDefaults, *, audio_warn_stacklevel = 3,
     ):
         batch_module = _resolve_vlm_batch_module()
-        (
-            self.constructor_params,
-            insert_params,
-            self.cancel,
-        ) = _probe_vlm_api(batch_module)
+        self.constructor_params = _probe_vlm_api(batch_module)
         self.batch_module = batch_module
         self.generator_type = batch_module.BatchGenerator
-        self.per_row_prompt_kwargs = "prompt_kwargs" in insert_params
-        self.row_logits_processors = "logits_processors" in insert_params
-        self.batches_observable = _vlm_batches_observable(batch_module)
         self.padded_prompt_kwargs = _padded_prompt_kwargs(batch_module)
         self.stream_module = _resolve_module_attr(_VLM_STREAM_MODULES, "wired_limit")
         utils = importlib.import_module("mlx_vlm.utils")
@@ -3425,64 +3271,35 @@ class _VLMBatchAdapter:
     def _chunked_prefill_kwargs(self, *, input_ids=None, prefill_kwargs=None) -> dict:
         """Apply the release's chunked-prefill policy, which needs real inputs."""
 
-        enabled = getattr(self.batch_module, "_chunked_prefill_enabled", None)
-        if callable(enabled):
-            embeds = (prefill_kwargs or {}).get("inputs_embeds")
-            # Every release shipping this helper takes the full keyword form, so
-            # any error is a real policy failure and propagates.
-            allowed = enabled(
-                self.model,
-                input_ids=input_ids,
-                inputs_embeds=embeds,
-                prefill_kwargs=prefill_kwargs,
-            )
-            return {} if allowed else {"prefill_step_size": None}
-        if getattr(self.model, "no_chunked_prefill", False):
-            return {"prefill_step_size": None}
-        return {}
+        embeds = (prefill_kwargs or {}).get("inputs_embeds")
+        allowed = self.batch_module._chunked_prefill_enabled(
+            self.model,
+            input_ids=input_ids,
+            inputs_embeds=embeds,
+            prefill_kwargs=prefill_kwargs,
+        )
+        return {} if allowed else {"prefill_step_size": None}
 
     def _split_prompt_kwargs(self, prompt_kwargs: dict, batch_size: int) -> list[dict]:
-        upstream = getattr(self.batch_module, "_split_prompt_kwargs_per_row", None)
-        mrope_aware = getattr(
-            self.batch_module,
-            "_is_mrope_position_ids_prompt_kwarg",
-            None,
-        )
-        # Only the MRoPE-aware upstream splitter is used; an axis-0 one would
-        # corrupt position ids.
-        if callable(upstream) and callable(mrope_aware):
-            return upstream(prompt_kwargs, batch_size)
-        return _split_prompt_kwargs_fallback(prompt_kwargs, batch_size)
+        return self.batch_module._split_prompt_kwargs_per_row(prompt_kwargs, batch_size)
 
     def _row_logits_processors(self, requests) -> list[list] | None:
         rows = [_row_processors(request) for request in requests]
-        if not any(rows):
-            return None
-        if not self.row_logits_processors:
-            raise _vlm_api_shape_error(
-                "BatchGenerator.insert does not take logits_processors, so a "
-                "request cannot carry a penalty or bias into a batch"
-            )
-        return rows
+        return rows if any(rows) else None
 
     def _admission_stalled(self, generator) -> bool | None:
-        """True when no prompt can ever be admitted; None when unobservable.
+        """True when no prompt can ever be admitted; None when the batch state is unreadable.
 
         Prefill legitimately yields eventless polls for as long as a long
         prompt needs, so a stall is judged by whether a prompt batch is in
         flight, never by counting empty polls.
         """
 
-        prompt_batch = getattr(generator, "_prompt_batch", _MISSING)
-        generation_batch = getattr(generator, "_generation_batch", _MISSING)
-        queued = getattr(generator, "_unprocessed_sequences", _MISSING)
-        if _MISSING in (prompt_batch, generation_batch, queued):
-            return None
         try:
             return (
-                prompt_batch is None
-                and len(generation_batch) == 0
-                and len(queued) > 0
+                generator._prompt_batch is None
+                and len(generator._generation_batch) == 0
+                and len(generator._unprocessed_sequences) > 0
             )
         except TypeError:
             return None
@@ -3504,17 +3321,13 @@ class _VLMBatchAdapter:
         if ids is not None:
             inputs = request.vision_inputs or {}
             alone = id(request) if any(isinstance(value, (list, tuple)) for value in inputs.values()) else None
-            key = ("ids", _vision_inputs_layout(inputs), len(ids), alone)
+            return ("ids", _vision_inputs_layout(inputs), len(ids), alone)
         else:
             shape = self._image_shape(request.image)
             tokenizer = getattr(self.processor, "tokenizer", self.processor)
             # Clips set a row's frame count, so only rows of the same clips and rate stack.
             clips = (tuple(request.videos), request.fps) if request.videos else None
-            key = (request.image is None, shape, len(tokenizer.encode(request.prompt)), clips)
-        if self.batches_observable:
-            return key
-        sampling = request.sampling or self.defaults.sampling
-        return (_sampler_key(sampling), *key)
+        return (request.image is None, shape, len(tokenizer.encode(request.prompt)), clips)
 
     def _prompt_inputs(self, requests: Sequence[GenerationRequest]) -> dict:
         """``prepare_inputs`` for rows grouped alike; token-id rows are their own input ids and vision inputs."""
@@ -3608,21 +3421,7 @@ class _VLMBatchAdapter:
             if request.audio is None:
                 groups.setdefault(self._group_key(request), []).append(index)
         for indices in groups.values():
-            inferred_rows = not self.batches_observable and any(
-                _draws_seeded(requests[index].sampling or self.defaults.sampling)
-                for index in indices
-            )
-            capacity = (
-                None
-                if self.per_row_prompt_kwargs and not inferred_rows
-                else min(
-                    self.defaults.prefill_batch_size,
-                    self.defaults.completion_batch_size,
-                )
-            )
-            step = capacity or len(indices)
-            for start in range(0, len(indices), step):
-                yield from self._run_chunk(requests, indices[start : start + step])
+            yield from self._run_chunk(requests, indices)
 
     def _stream_sequentially(
         self,
@@ -3736,7 +3535,7 @@ class _VLMBatchAdapter:
             raise ValueError("A row with logits processors cannot take logits_warp: the order would be ambiguous.")
         # Rows given one prompt object embed it once: the vision tower runs per distinct prompt, fanned out per row.
         sources = list(range(batch_size))
-        if defaults.share_prompt_prefill and self.per_row_prompt_kwargs:
+        if defaults.share_prompt_prefill:
             first = {}
             sources = [first.setdefault(_shared_prompt_key(request, row), len(first)) for row, request in enumerate(chunk)]
             leaders = {source: row for row, source in reversed(list(enumerate(sources)))}
@@ -3751,16 +3550,8 @@ class _VLMBatchAdapter:
             if key not in ("input_ids", "pixel_values", "attention_mask")
         }
         options = {
-            "prefill_batch_size": (
-                self.defaults.prefill_batch_size
-                if self.per_row_prompt_kwargs
-                else batch_size
-            ),
-            "completion_batch_size": (
-                self.defaults.completion_batch_size
-                if self.per_row_prompt_kwargs
-                else batch_size
-            ),
+            "prefill_batch_size": self.defaults.prefill_batch_size,
+            "completion_batch_size": self.defaults.completion_batch_size,
             "sampler": self.make_sampler(
                 temp=sampling.temperature,
                 top_p=sampling.top_p,
@@ -3821,10 +3612,8 @@ class _VLMBatchAdapter:
                 )
                 prompt_ids = input_ids.tolist()
                 token_ids = [prompt_ids[source] for source in sources]
-                insert_kwargs = {}
-                if self.per_row_prompt_kwargs:
-                    rows = self._split_prompt_kwargs(gen_kwargs, len(chunk))
-                    insert_kwargs["prompt_kwargs"] = [dict(rows[source]) for source in sources]
+                rows = self._split_prompt_kwargs(gen_kwargs, len(chunk))
+                insert_kwargs = {"prompt_kwargs": [dict(rows[source]) for source in sources]}
                 if row_processors is not None:
                     insert_kwargs["logits_processors"] = row_processors
                 uids = generator.insert(token_ids, max_tokens, **insert_kwargs)
@@ -3833,7 +3622,7 @@ class _VLMBatchAdapter:
                     row_sampler.bind_generator(generator)
                 counts = _unpadded_lengths(mask)
                 yield from self._drive(
-                    generator, uids, indices, gen_kwargs, row_sampler,
+                    generator, uids, indices, row_sampler,
                     prompt_token_count=len(token_ids[0]),
                     prompt_token_counts=None if counts is None else [counts[source] for source in sources],
                 )
@@ -3863,7 +3652,6 @@ class _VLMBatchAdapter:
         generator,
         uids,
         indices,
-        gen_kwargs,
         row_sampler=None,
         prompt_token_count=0,
         prompt_token_counts=None,
@@ -3888,24 +3676,15 @@ class _VLMBatchAdapter:
         while pending:
             if row_sampler is not None:
                 row_sampler.row_uids = list(live)
-            if self.per_row_prompt_kwargs:
-                if not generator.has_work:
-                    raise RuntimeError(
-                        "mlx-vlm ended its event stream before every request "
-                        "reported a finish reason."
-                    )
-                _, events = generator.next()
-            else:
-                events = generator.next(**gen_kwargs)
+            if not generator.has_work:
+                raise RuntimeError(
+                    "mlx-vlm ended its event stream before every request "
+                    "reported a finish reason."
+                )
+            _, events = generator.next()
             if not events:
-                stalled = self._admission_stalled(generator)
-                if stalled:
+                if self._admission_stalled(generator):
                     raise self._stall_error()
-                if stalled is None and not self.per_row_prompt_kwargs:
-                    raise RuntimeError(
-                        "mlx-vlm ended its event stream before every request "
-                        "reported a finish reason."
-                    )
                 continue
             for event in events:
                 finish_reason = event.finish_reason
@@ -3923,10 +3702,9 @@ class _VLMBatchAdapter:
                     if not stopped:
                         yield from _text_events(row_of[event.uid], state)
                         continue
-                    if self.cancel is not None:
-                        self.cancel(generator, event.uid)
-                        if event.uid in live:
-                            live.remove(event.uid)
+                    generator.remove(event.uid)
+                    if event.uid in live:
+                        live.remove(event.uid)
                     yield from _finished_events(row_of[event.uid], state, tokenizer)
                     del pending[event.uid]
                     continue
@@ -3985,15 +3763,8 @@ class _VLMCacheMaterializer:
     def __init__(self, generator):
         self.generator = generator
         self.pending = []
-        self.interval = self.restore = getattr(generator, "_cache_eval_interval", 0)
-        self.stream = getattr(generator, "stream", None)
-        if not (
-            isinstance(self.interval, int) and self.interval > 0
-            and isinstance(getattr(generator, "_steps_counter", None), int)
-            and hasattr(getattr(generator, "_generation_batch", None), "prompt_cache")
-            and self.stream is not None
-        ):
-            self.interval = 0
+        self.interval = self.restore = generator._cache_eval_interval
+        self.stream = generator.stream
         if self.interval:
             generator._cache_eval_interval = 0
             if "MLX_VLM_BATCH_CACHE_EVAL_INTERVAL" not in os.environ:
@@ -4012,8 +3783,7 @@ class _VLMCacheMaterializer:
             step = self.generator._steps_counter
             if step != before and step % self.interval == 0:
                 batch = self.generator._generation_batch
-                states = getattr(batch, "cache_states", None)
-                states = states() if callable(states) else [c.state for c in batch.prompt_cache]
+                states = batch.cache_states()
                 # Cache lists and array handles can be updated in place on the next step.
                 self.pending = [copy.copy(value) for _, value in tree_flatten(states) if isinstance(value, mx.array)]
                 if self.pending:
@@ -4084,20 +3854,8 @@ class _VLMBatchSession:
                 "An audio request decodes on its own and cannot join a batch; "
                 "generate it with generate_batch or stream_batch."
             )
-        if request.logits_processors and not adapter.row_logits_processors:
-            raise BatchRowRefused(
-                "This mlx-vlm's batch cannot carry a row's own logits processors."
-            )
         input_ids, prompt_kwargs = self._prepare(request)
-        try:
-            row_processors = adapter._row_logits_processors([request])
-        except RuntimeError as refusal:
-            # Reachable when the penalties come from the defaults rather than the
-            # request, so the check above passes. add() refuses a row without
-            # disturbing the batch, and nothing here has been inserted yet, so this
-            # is a row refusal rather than the API-shape error raised when a whole
-            # batch is being built.
-            raise BatchRowRefused(str(refusal)) from refusal
+        row_processors = adapter._row_logits_processors([request])
         token_ids = input_ids.tolist()
         prefill, row_ids, row_kwargs = self._resume(request, token_ids[0], prompt_kwargs)
         layout = None if prefill is None else _decode_layout(prefill.cache, prefill.quantize)
@@ -4438,15 +4196,13 @@ class _VLMBatchSession:
             if uid in batch.uids:
                 self._parked.remove(batch)
                 return True
-        if self.adapter.cancel is None:
-            return False
         self._hand_back_rows()
-        return self.adapter.cancel(self.generator, uid) is not False
+        return self.generator.remove(uid) is not False
 
     def _hand_back_rows(self) -> None:
         """Arm the decoding batch, which mlx-vlm replaces when it empties, to hand leaving rows back."""
-        batch = getattr(self.generator, "_generation_batch", None)
-        if not self._retiring or not callable(getattr(type(batch), "filter", None)):
+        batch = self.generator._generation_batch
+        if not self._retiring:
             return
         batch.__class__ = _retiring_batch_class(getattr(type(batch), "_unsloth_retiring_base", type(batch)))
         batch._unsloth_retiring = self._retiring

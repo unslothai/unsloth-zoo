@@ -1,6 +1,5 @@
 """Covers MLX LoRA adapter save/reload metadata: rank/scale/dropout inference (_get_mlx_dropout_probability,
-_infer_mlx_lora_rank, _enrich_mlx_adapter_config) and the reload wrapper that restores scale/dropout on older mlx-lm
-wrappers."""
+_infer_mlx_lora_rank, _enrich_mlx_adapter_config)."""
 
 import os
 import sys
@@ -30,11 +29,6 @@ class _FakeArray:
 class _FakeDropout:
     def __init__(self, keep_prob):
         self._p_1 = keep_prob
-
-
-class _ShimDropout:
-    def __init__(self, p):
-        self.p = p
 
 
 class _FakeLoRAModule:
@@ -233,35 +227,6 @@ def test_enrich_normalizes_string_explicit_path():
     )
     assert cfg["unsloth_mlx_lora_module_paths"] == ["layers.0.q_proj"]
     assert cfg["rank"] == 4
-
-
-def test_typeerror_fallback_restores_scale_and_dropout_via_p1():
-    _load_utils()
-    from unsloth_zoo.mlx.loader import _lora_from_base_compat
-
-    class _NoKwargCls:
-        @classmethod
-        def from_base(cls, module, r=None, scale=None, dropout=None):
-            if scale is not None or dropout is not None:
-                raise TypeError("old mlx-lm: scale/dropout not accepted")
-            return types.SimpleNamespace(scale=1.0,
-                                          dropout=_FakeDropout(1.0))
-
-    wrapped = _lora_from_base_compat(
-        _NoKwargCls, object(), rank=4, scale=2.5, dropout=0.3,
-    )
-    assert wrapped.scale == 2.5
-    assert abs(wrapped.dropout._p_1 - 0.7) < 1e-9
-
-
-def test_typeerror_fallback_handles_shim_dropout_with_p_attr():
-    _load_utils()
-    from unsloth_zoo.mlx.loader import _apply_lora_metadata_to_wrapper
-
-    wrapped = types.SimpleNamespace(scale=1.0, dropout=_ShimDropout(0.0))
-    _apply_lora_metadata_to_wrapper(wrapped, scale=2.5, dropout=0.4)
-    assert wrapped.scale == 2.5
-    assert abs(wrapped.dropout.p - 0.4) < 1e-9
 
 
 def _trainer_loop_metadata(model):
