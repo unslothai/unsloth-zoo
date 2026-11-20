@@ -145,3 +145,17 @@ def test_an_unlistable_output_folder_raises_its_own_error(llama_cpp, tmp_path):
             _convert(llama_cpp, tmp_path, own_shards = 2)
     finally:
         out_dir.chmod(0o700)
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "Windows file names cannot hold a newline")
+def test_a_shard_name_with_a_trailing_newline_is_not_collected(llama_cpp, tmp_path):
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "model.BF16-00001-of-00002.gguf\n").write_bytes(b"OLD")
+
+    outputs, _ = _convert(llama_cpp, tmp_path, own_shards = 2)
+
+    assert sorted(Path(p).name for p in outputs) == [
+        "model.BF16-00001-of-00002.gguf",
+        "model.BF16-00002-of-00002.gguf",
+    ]

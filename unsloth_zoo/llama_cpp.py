@@ -5133,7 +5133,7 @@ def _gguf_shard_paths(output_file):
     # The whole stem must match, or a neighbour like "old-model.BF16-00001-of-00002" gets taken.
     return [
         os.path.join(parent_dir, f) for f in sorted(os.listdir(parent_dir))
-        if (m := _GGUF_SHARD_PATTERN.match(f)) and m["stem"] == stem
+        if (m := _GGUF_SHARD_PATTERN.fullmatch(f)) and m["stem"] == stem
     ]
 
 
@@ -6463,7 +6463,7 @@ def convert_to_gguf(
             # Validate shard completeness
             shard_numbers = []
             for f in shard_files:
-                m = _GGUF_SHARD_PATTERN.match(os.path.basename(f))
+                m = _GGUF_SHARD_PATTERN.fullmatch(os.path.basename(f))
                 shard_numbers.append((int(m["index"]), int(m["total"])))
 
             expected_total = shard_numbers[0][1]
