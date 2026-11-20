@@ -328,3 +328,27 @@ def test_drop_path_layers_count_as_stochastic():
     assert not vision_dedup._stochastic_vision(tower)
     quiet = torch.nn.Sequential(torch.nn.Linear(4, 4), DropPath(0.0)).train()
     assert not vision_dedup._stochastic_vision(quiet)
+
+
+def test_sharding_a_child_after_the_first_probe_is_seen():
+    # The answer was cached against the first parameter's identity; sharding only a later child (the tower)
+    # kept that parameter, so a stale False sent ranks into rank-local self-check encodes (collective mismatch).
+    import pathlib
+    import unsloth_zoo.vision_dedup as vision_dedup
+    assert pathlib.Path(vision_dedup.__file__).resolve().is_relative_to(pathlib.Path(__file__).resolve().parents[1])
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
+    assert vision_dedup._sharded_parameters(model) is False
+    model[1].weight.ds_id = 1   # ZeRO-3 marker on the child only; the first parameter is untouched
+    assert vision_dedup._sharded_parameters(model) is True
+
+
+def test_install_keeps_model_picklable():
+    # The probe cached a weakref in module.__dict__, so torch.save(model) raised after install.
+    import io
+    import pathlib
+    import unsloth_zoo.vision_dedup as vision_dedup
+    assert pathlib.Path(vision_dedup.__file__).resolve().is_relative_to(pathlib.Path(__file__).resolve().parents[1])
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2))
+    vision_dedup.install_image_dedup(model)
+    assert vision_dedup._sharded_parameters(model) is False
+    torch.save(model, io.BytesIO())

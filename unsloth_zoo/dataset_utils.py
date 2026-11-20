@@ -787,6 +787,27 @@ class _KeepUnlistedRows:
 pass
 
 
+class _ResponseMasker:
+    """train_on_responses_only(return_function = True): the masking closure plus the arguments it was built
+    from. Pickles as those arguments and rebuilds the closure on load, for spawn DataLoader workers."""
+
+    def __init__(self, function, arguments):
+        self.function = function
+        self.arguments = arguments
+
+    def __call__(self, *args, **kwargs):
+        return self.function(*args, **kwargs)
+
+    def __reduce__(self):
+        return (_rebuild_response_masker, (self.arguments,))
+pass
+
+
+def _rebuild_response_masker(arguments):
+    return train_on_responses_only(None, **arguments)
+pass
+
+
 def train_on_responses_only(
     trainer,
     instruction_part  = None,
@@ -836,6 +857,8 @@ def train_on_responses_only(
 
     if tokenizer is None and trainer is not None:
         tokenizer = trainer.processing_class if hasattr(trainer, "processing_class") else trainer.tokenizer
+    # As given (before auto-detect / the tokenizer's preset parts): what a pickled masker is rebuilt from.
+    _given_instruction_part, _given_response_part = instruction_part, response_part
     # Keep the original object (may be a VLM processor) so auto-detect can read a
     # chat template that lives only on the processor; the matcher uses the inner one.
     processor = tokenizer
@@ -1143,7 +1166,18 @@ def train_on_responses_only(
         return { "labels" : torch.tensor(all_labels, dtype = torch.int64) if use_tensors else all_labels }
     pass
     if return_function:
-        return _train_on_responses_only
+        # Picklable: spawn DataLoader workers pickle the collator holding this masker (a local closure
+        # cannot be pickled); the worker rebuilds it from the same arguments.
+        return _ResponseMasker(_train_on_responses_only, dict(
+            instruction_part   = _given_instruction_part,
+            response_part      = _given_response_part,
+            force_match        = force_match,
+            tokenizer          = processor,
+            return_function    = True,
+            num_proc           = num_proc,
+            last_response_only = last_response_only,
+            mask_out_tokens    = mask_out_tokens,
+        ))
 
     _num_proc_was_auto = num_proc is None or type(num_proc) is not int
     if _num_proc_was_auto:
