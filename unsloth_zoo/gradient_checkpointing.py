@@ -814,13 +814,76 @@ def in_gradient_checkpoint_recompute() -> bool:
 
 
 @contextmanager
-def _gradient_checkpoint_recompute_marker():
+def _gradient_checkpoint_recompute_marker(function = None):
     previous = getattr(_GC_RECOMPUTE_TLS, "active", False)
+    previous_function = getattr(_GC_RECOMPUTE_TLS, "function", None)
     _GC_RECOMPUTE_TLS.active = True
+    _GC_RECOMPUTE_TLS.function = function
     try:
         yield
     finally:
         _GC_RECOMPUTE_TLS.active = previous
+        _GC_RECOMPUTE_TLS.function = previous_function
+
+
+def _module_forward_chain(module):
+    function = getattr(type(module), "forward", None)
+    for _ in range(8):
+        if function is None:
+            return
+        yield function
+        function = getattr(function, "__wrapped__", None)
+pass
+
+
+def _calls_whole_module(function, module):
+    if not isinstance(module, torch.nn.Module):
+        return False
+    if function in (torch.nn.Module.__call__, torch.nn.Module._call_impl):
+        return True
+    return any(function is forward for forward in _module_forward_chain(module))
+pass
+
+
+def _replayed_module(function):
+    """Module whose call is the whole checkpointed function, else None. Any shape that could add work
+    after the module returns (lambdas, other methods) must resolve to None."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    for _ in range(8):
+        if isinstance(function, _KeywordArgumentCall):
+            function = function.function
+            continue
+        if isinstance(function, torch.nn.Module):
+            # An overridden __call__ may transform forward's output.
+            return function if type(function).__call__ in (torch.nn.Module.__call__, torch.nn.Module._call_impl) else None
+        if isinstance(function, functools.partial):
+            inner = function.func
+            if inspect.ismethod(inner):
+                owner = inner.__self__
+                return owner if _calls_whole_module(inner.__func__, owner) else None
+            owner = function.args[0] if function.args else None
+            return owner if _calls_whole_module(inner, owner) else None
+        if inspect.ismethod(function):
+            owner = function.__self__
+            return owner if _calls_whole_module(function.__func__, owner) else None
+        module = getattr(function, "_unsloth_checkpoint_module", None)
+        return module if isinstance(module, torch.nn.Module) else None
+    return None
+pass
+
+
+def gradient_checkpoint_replay_module():
+    """During a reentrant checkpoint replay, the module whose output nothing else reads; else None."""
+    if not getattr(_GC_RECOMPUTE_TLS, "active", False):
+        return None
+    function = getattr(_GC_RECOMPUTE_TLS, "function", None)
+    if function is None:
+        return None
+    module = _replayed_module(function)
+    # Forward hooks may read the output.
+    if module is None or module._forward_hooks or torch.nn.modules.module._global_forward_hooks:
+        return None
+    return module
 
 
 # ---------------------------------------------------------------------------
@@ -1067,7 +1130,7 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
         hidden_states = hidden_states.to(ctx.device, non_blocking = True).detach()
         hidden_states.requires_grad_(True)
         recompute_args, grad_holders = _detach_checkpoint_args(ctx.args)
-        with torch.enable_grad(), _gradient_checkpoint_recompute_marker(), \
+        with torch.enable_grad(), _gradient_checkpoint_recompute_marker(ctx.forward_function), \
                 _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True):
             output = ctx.forward_function(hidden_states, *recompute_args)
         # Layers that return a 1-tuple keep unpacking exactly as before. Layers
@@ -1110,7 +1173,7 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
         hidden_states = hidden_states.detach()
         hidden_states.requires_grad_(True)
         recompute_args, grad_holders = _detach_checkpoint_args(ctx.args)
-        with torch.enable_grad(), _gradient_checkpoint_recompute_marker(), \
+        with torch.enable_grad(), _gradient_checkpoint_recompute_marker(ctx.forward_function), \
                 _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True):
             output = ctx.forward_function(hidden_states, *recompute_args)
         # Outputs may be one tensor, a tuple or several; backprop only the outputs that received a
@@ -2206,7 +2269,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 detached_inputs[0] = x
             pass
 
-            with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs), _gradient_checkpoint_recompute_marker(), \
+            with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs), _gradient_checkpoint_recompute_marker(ctx.run_function), \
                     _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True), \
                     saved_attention_scope(getattr(ctx, "_attention_frame", None), True):  # type: ignore[attr-defined]
                 outputs = ctx.run_function(*detached_inputs)
