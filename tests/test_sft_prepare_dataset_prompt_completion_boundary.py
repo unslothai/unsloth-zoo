@@ -168,6 +168,10 @@ def test_boundary_starts_after_the_prompt_tail_when_it_cannot_line_up():
     assert _prompt_completion_boundary([1, 2, 8, 3, 4, 9, 10, 5, 6, 7, 11], [1, 2, 3, 4, 5, 6, 7, 11, 20, 21]) == 8
     # Mistral v0.3: the joined ids drop the system text [30, 31, 32] and "Cap" "ital" becomes "▁Capital" [41].
     assert _prompt_completion_boundary([1, 2, 30, 31, 32, 40, 42, 5, 6, 7, 9], [1, 2, 41, 5, 6, 7, 9, 50, 51]) == 7
+    # A completion that echoes the prompt's last ids [5, 6, 7, 9] stays trained.
+    assert _prompt_completion_boundary([1, 2, 30, 31, 32, 40, 42, 5, 6, 7, 9], [1, 2, 41, 5, 6, 7, 9, 5, 6, 7, 9, 50]) == 7
+    # An earlier turn ending like the prompt [11, 5, 6, 7, 9] is not taken for the prompt's end.
+    assert _prompt_completion_boundary([1, 2, 30, 31, 3, 5, 6, 7, 9, 4, 8, 12, 5, 6, 7, 9], [1, 2, 33, 3, 5, 6, 7, 9, 4, 8, 12, 5, 6, 7, 9, 50]) == 15
 
 
 def test_boundary_warns_once_per_cause(monkeypatch, capsys):

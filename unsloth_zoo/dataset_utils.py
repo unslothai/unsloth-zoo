@@ -2834,10 +2834,15 @@ def _prompt_completion_boundary(prompt_ids, pc_ids, anchor = 4):
     kind = "deleted" if deleted else "diverge"
     # A short unmatched tail is a merged token or prompt-only closing tokens (Gemma 4 "<turn|>\n", DeepSeek-R1
     # "<think>\n"). A long one is a rewrite we cannot line up (Mistral v0.3 drops the system text and re-spaces the
-    # next word): start after the last place the prompt's last ids appear in pc_ids.
+    # next word): start after the place in pc_ids that matches the most of the prompt's tail, so an earlier turn's
+    # header or a completion echoing the prompt's last ids is not picked.
     tails = [r for r in range(j, len(q) - anchor + 1) if q[r : r + anchor] == p[-anchor:]] if len(p) - i >= anchor else []
     if tails:
-        kind, j = "unaligned", tails[-1] + anchor
+        def tail_match(r):
+            k = anchor
+            while k < min(len(p), r + anchor) and p[-k - 1] == q[r + anchor - k - 1]: k += 1
+            return k
+        kind, j = "unaligned", max(tails, key = tail_match) + anchor
     if kind not in _PROMPT_COMPLETION_BOUNDARY_WARNED:
         _PROMPT_COMPLETION_BOUNDARY_WARNED.add(kind)
         if kind == "deleted":
