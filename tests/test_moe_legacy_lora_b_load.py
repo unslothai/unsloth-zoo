@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 
 import pytest
 import torch
@@ -174,6 +175,18 @@ def test_inference_is_limited_to_families_the_old_forward_owned():
     class OlmoeLikeExperts(torch.nn.Module):
         pass
     assert MU._experts_family(OlmoeLikeExperts()) not in MU._LEGACY_GROUPED_LORA_B_FAMILIES
+
+
+def test_family_survives_fully_shard_class_swap():
+    # fully_shard(experts) swaps the class for FSDP<Name>(FSDPModule, <Name>) defined in torch; the family must
+    # still come from the original class, or a markerless legacy adapter loads its expert lora_B unrepacked.
+    assert pathlib.Path(MU.__file__).resolve().is_relative_to(pathlib.Path(__file__).resolve().parents[1])
+    upstream = type("Qwen3MoeExperts", (torch.nn.Module,), {"__module__": "transformers.models.qwen3_moe.modeling_qwen3_moe"})
+    fsdp_module = type("FSDPModule", (), {"__module__": "torch.distributed.fsdp._fully_shard._fully_shard"})
+    sharded = type("FSDPQwen3MoeExperts", (fsdp_module, upstream), {"__module__": "torch.distributed.fsdp._fully_shard._fully_shard"})
+    assert MU._experts_family(sharded()) == "qwen3_moe"
+    compiled = type("Qwen3MoeExperts", (torch.nn.Module,), {"__module__": "unsloth_compiled_module_qwen3_moe"})
+    assert MU._experts_family(type("FSDPQwen3MoeExperts", (fsdp_module, compiled), {})()) == "qwen3_moe"
 
 
 def test_adapter_without_fused_experts_never_reads_its_config(tmp_path, patched_load, monkeypatch):

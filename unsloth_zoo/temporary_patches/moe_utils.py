@@ -5017,15 +5017,17 @@ _original_peft_model_load_adapter = None
 def _experts_family(module):
     """`qwen3_moe` for Qwen3MoeExperts from `transformers.models.qwen3_moe.modeling_qwen3_moe`
     or from Unsloth's compiled copy, `unsloth_compiled_module_qwen3_moe`."""
-    if type(module).__name__ == "Mxfp4GptOssExperts":
-        return "gpt_oss"
-    name = type(module).__module__
-    leaf = name.rsplit(".", 1)[-1]
-    if leaf.startswith("unsloth_compiled_module_"):
-        return leaf[len("unsloth_compiled_module_"):]
-    parts = name.split(".")
-    if len(parts) > 2 and parts[:2] == ["transformers", "models"]:
-        return parts[2]
+    # fully_shard swaps the class for a generated FSDP<Name> subclass defined in torch, so walk the MRO.
+    for cls in type(module).__mro__:
+        if cls.__name__ == "Mxfp4GptOssExperts":
+            return "gpt_oss"
+        name = cls.__module__ or ""
+        leaf = name.rsplit(".", 1)[-1]
+        if leaf.startswith("unsloth_compiled_module_"):
+            return leaf[len("unsloth_compiled_module_"):]
+        parts = name.split(".")
+        if len(parts) > 2 and parts[:2] == ["transformers", "models"]:
+            return parts[2]
     return None
 
 
