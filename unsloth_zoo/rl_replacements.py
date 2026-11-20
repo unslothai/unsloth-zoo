@@ -3870,11 +3870,17 @@ def grpo_accumulated_loss(
             try:
                 _pg_build_layout, _pg_enabled_fn, _pg_verify_on, _pg_tol_ok, _PG_TOL_KILL = _pg_funcs
                 # Exclusions: softcap models (gemma2) - the FlexAttention kernel skips
-                # attn_logit_softcapping; hybrid SSM (FalconH1) and MoE (Qwen3-MoE) - their
-                # decoders do not thread prefix_seg_info, so state would leak across suffixes.
+                # attn_logit_softcapping; hybrid SSM (FalconH1) and MoE unless unsloth verified the
+                # family (Qwen3-MoE, opt-in) - else their decoders may not thread prefix_seg_info.
                 _pg_cfg = getattr(unwrapped_model, "config", None)
+                # Given the model, unsloth also checks its forward applies prefix_seg_info and, for
+                # verified MoE families (opt-in), marks the model MoE-safe (older unsloth takes no argument).
+                try:
+                    _pg_model_ok = _pg_enabled_fn(unwrapped_model)
+                except TypeError:
+                    _pg_model_ok = _pg_enabled_fn()
                 _pg_engage = (
-                    _pg_enabled_fn()
+                    _pg_model_ok
                     and pixel_values is None
                     and token_type_ids is None
                     and mm_token_type_ids is None
@@ -3885,11 +3891,14 @@ def grpo_accumulated_loss(
                         getattr(_pg_cfg, _pg_a, None) is not None
                         for _pg_a in ("mamba_d_ssm", "mamba_d_state", "mamba_expand")
                     )
-                    and not any(
-                        getattr(_pg_cfg, _pg_a, None) is not None
-                        for _pg_a in (
-                            "num_experts", "num_experts_per_tok", "num_local_experts",
-                            "n_routed_experts", "moe_intermediate_size",
+                    and (
+                        getattr(unwrapped_model, "_unsloth_prefix_grouper_moe_ok", False)
+                        or not any(
+                            getattr(_pg_cfg, _pg_a, None) is not None
+                            for _pg_a in (
+                                "num_experts", "num_experts_per_tok", "num_local_experts",
+                                "n_routed_experts", "moe_intermediate_size",
+                            )
                         )
                     )
                 )
