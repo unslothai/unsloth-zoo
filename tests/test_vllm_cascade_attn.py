@@ -68,3 +68,21 @@ def test_load_vllm_never_forces_cascade_attention_on():
                     assert not (isinstance(value, ast.Constant) and value.value is False), (
                         f"line {node.lineno} forces cascade attention on"
                     )
+
+
+def test_load_vllm_reads_the_engine_card_capability():
+    # Outside torchrun the engine runs on ordinal 0 (get_target_device), not the caller's current card: on a mixed
+    # host (A100 at 0, H100 current) a no-argument query saw 9.0 and left vLLM 0.11.0's broken cascade path on.
+    tree = ast.parse(SOURCE.read_text(encoding = "utf-8"))
+    load = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
+    calls = [
+        n for n in ast.walk(load)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "get_device_capability"
+    ]
+    assert calls
+    for call in calls:
+        arg = call.args[0] if call.args else None
+        assert (
+            isinstance(arg, ast.Call) and isinstance(arg.func, ast.Name) and arg.func.id == "get_target_device"
+            and not arg.args
+        ), f"line {call.lineno} queries the current card, not the engine's"

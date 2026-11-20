@@ -4625,7 +4625,7 @@ def load_vllm(
             gpu_memory_utilization = standby_target_gpu_util
 
     if DEVICE_TYPE == "cuda":
-        major_version, minor_version = torch.cuda.get_device_capability()
+        major_version, minor_version = torch.cuda.get_device_capability(get_target_device())
         if major_version < 7: raise NotImplementedError(
             f"Unsloth: Your GPU is too old for vLLM! vLLM needs compute capability 7.0 or higher, "\
             f"but your GPU has {major_version}.{minor_version}. "\
@@ -4670,7 +4670,7 @@ def load_vllm(
     is_fp8 = "fp8" in model_name.lower() or (quant_method in ("fp8", "fbgemm_fp8"))
 
     if is_fp8 and DEVICE_TYPE == "cuda":
-        major_version, minor_version = torch.cuda.get_device_capability()
+        major_version, minor_version = torch.cuda.get_device_capability(get_target_device())
         if major_version == 10:
             # DeepGEMM is generally slower than triton for vLLM here.
             # https://x.com/TheZachMueller/status/2024619480580510117?s=20
@@ -4894,7 +4894,7 @@ def load_vllm(
         # Prefix Caching fails for V100, Titan X CUDA Compute Capability 7.0
         # See https://github.com/huggingface/trl/issues/2798
         if DEVICE_TYPE == "cuda":
-            major_version, minor_version = torch.cuda.get_device_capability()
+            major_version, minor_version = torch.cuda.get_device_capability(get_target_device())
             if (major_version < 7) or (major_version == 7 and minor_version < 5):
                 print("Unsloth: Your GPU does not support prefix caching - will disable!")
                 enable_prefix_caching = False
@@ -5015,7 +5015,7 @@ def load_vllm(
             message = f"{platform} {torch.npu.get_device_name(0)}"
         else:
             platform = "CUDA"
-            major_version, minor_version = torch.cuda.get_device_capability()
+            major_version, minor_version = torch.cuda.get_device_capability(get_target_device())
             message = f"{platform} compute capability {major_version}.{minor_version}"
         pass
 
@@ -5205,8 +5205,9 @@ def load_vllm(
 
         # [[CRITICAL for RL on policy]]
         # Pre-Hopper cascade attention is wrong until vllm-project/flash-attention#87, first pinned by vLLM 0.11.1.
+        # Judge the engine's card: outside torchrun vLLM's worker runs on ordinal 0 whatever card is current.
         if DEVICE_TYPE == "cuda":
-            major_version, minor_version = torch.cuda.get_device_capability()
+            major_version, minor_version = torch.cuda.get_device_capability(get_target_device())
             if _vllm_cascade_attn_needs_disable(vllm_version, major_version):
                 engine_args["disable_cascade_attn"] = True
                 print("Unsloth: Disabling cascade attention in vLLM to allow for better on policy RL!")
