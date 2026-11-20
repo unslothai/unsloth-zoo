@@ -21,6 +21,7 @@ the counting, aot_eager and inductor backends and restore bit for bit; the host 
 in place and allocates nothing once a repeated fold / unfold loop is warm. Without CUDA the kernel runs under
 TRITON_INTERPRET=1 in a subprocess (test_cpu_interpreter_ops)."""
 
+import gc
 import os
 import subprocess
 import sys
@@ -61,6 +62,9 @@ def _restored(ws, before):
 
 
 def _fresh_arenas(device):
+    # A store whose unfold raised stays leased until its traceback cycle is collected; when that happens depends on
+    # the allocation history, so collect here or clear() keeps the old chunk.
+    gc.collect()
     for arena in ex._ARENAS.values():
         arena.clear()
     return "pageable" if device == "cpu" else "pinned"

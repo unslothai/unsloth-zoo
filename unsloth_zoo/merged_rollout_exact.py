@@ -148,18 +148,21 @@ if triton is not None:
         g = tile0 + (e * tl.num_programs(0) + pid_n) * tl.num_programs(1) + pid_k
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         rk = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+        # Row and column products are 64-bit too: rn * sWn passes 2**31 on one matrix of 2**31+ elements (even e = 0).
+        rn64 = rn.to(tl.int64)
+        rk64 = rk.to(tl.int64)
         mn = rn < N
         mk = rk < K
         mask = mn[:, None] & mk[None, :]
 
         acc = tl.zeros((BLOCK_N, BLOCK_K), dtype = tl.float32)
         for j in tl.static_range(R):
-            b = tl.load(B + e64 * sBe + rn * sBn + j * sBr, mask = mn, other = 0.0).to(tl.float32)
-            a = tl.load(A + e64 * sAe + j * sAr + rk * sAk, mask = mk, other = 0.0).to(tl.float32)
+            b = tl.load(B + e64 * sBe + rn64 * sBn + j * sBr, mask = mn, other = 0.0).to(tl.float32)
+            a = tl.load(A + e64 * sAe + j * sAr + rk64 * sAk, mask = mk, other = 0.0).to(tl.float32)
             acc = tl.fma(b[:, None], a[None, :], acc)
         d = acc * scale
 
-        ptrs = W + e64 * sWe + rn[:, None] * sWn + rk[None, :] * sWk
+        ptrs = W + e64 * sWe + rn64[:, None] * sWn + rk64[None, :] * sWk
         w = tl.load(ptrs, mask = mask, other = 0.0)
         # Each mode lives in its own helper: a runtime branch must not leave differently typed names behind.
         if mode == 2:
