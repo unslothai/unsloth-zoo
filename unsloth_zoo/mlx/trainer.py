@@ -6550,25 +6550,35 @@ class MLXTrainer:
         )
 
         _restore_storage_after_norm_clip = max_grad_norm > 0
-        _trainable_storage_dtypes = (
+        _restorable_storage_names = (
             {
-                name: value.dtype
-                for name, value in tree_flatten(model.trainable_parameters())
+                name
+                for name, _value in tree_flatten(model.trainable_parameters())
                 if not self._is_norm_parameter_name(name)
                 and not self._is_lora_parameter_name(name)
             }
             if _restore_storage_after_norm_clip
-            else {}
+            else set()
         )
 
-        def _restore_trainable_storage_dtypes():
+        def _trainable_storage_dtypes():
+            # Per update, not once: a forward may widen a leaf (Gemma 3n AltUp coefs -> fp32); narrowing it drops updates.
+            if not _restorable_storage_names:
+                return None
+            return {
+                name: value.dtype
+                for name, value in tree_flatten(model.trainable_parameters())
+                if name in _restorable_storage_names
+            }
+
+        def _restore_trainable_storage_dtypes(storage_dtypes):
             """Keep norm-clipped MLX updates from promoting base params."""
-            if not _restore_storage_after_norm_clip:
+            if not storage_dtypes:
                 return
             recast = []
             needs_update = False
             for name, value in tree_flatten(model.trainable_parameters()):
-                dtype = _trainable_storage_dtypes.get(name)
+                dtype = storage_dtypes.get(name)
                 if dtype is not None and value.dtype != dtype:
                     value = value.astype(dtype)
                     needs_update = True
@@ -6627,6 +6637,7 @@ class MLXTrainer:
                 final_grad = _clip_grad_by_leaf_norm(final_grad, max_grad_leaf_norm)
             # Snapshot BEFORE decay so the rescale covers decay + optimizer step.
             _scoped_snap = _snapshot_scoped_params() if _needs_step_rescale else None
+            _storage_dtypes = _trainable_storage_dtypes()
             # Coupled (SGD) decay folds into the post-clip grad so it feeds
             # momentum; decoupled (AdamW-family) decay shrinks params directly.
             final_grad = self._apply_coupled_weight_decay(model, final_grad)
@@ -6634,7 +6645,7 @@ class MLXTrainer:
             optimizer.update(model, final_grad)
             if _scoped_snap:
                 _rescale_scoped_params(_scoped_snap)
-            _restore_trainable_storage_dtypes()
+            _restore_trainable_storage_dtypes(_storage_dtypes)
             return grad_norm
 
         def _apply_update_direct(grad, toks_f):
@@ -6668,10 +6679,11 @@ class MLXTrainer:
                 grad = _clip_grad_by_value(grad, max_grad_value)
             if _clip_grad_leaf_norm:
                 grad = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm)
+            _storage_dtypes = _trainable_storage_dtypes()
             grad = self._apply_coupled_weight_decay(model, grad)
             self._apply_manual_weight_decay(model, optimizer, grad)
             optimizer.update(model, grad)
-            _restore_trainable_storage_dtypes()
+            _restore_trainable_storage_dtypes(_storage_dtypes)
             return grad_norm
 
         def _loss_and_grad(batch_data):

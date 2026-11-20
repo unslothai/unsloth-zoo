@@ -1990,10 +1990,10 @@ _CLIP = {
 
 def _norm_train(tmp_path, mode, *, report=False, compiled=False, accum=1,
                 optim="adamw", weight_decay=0.0, dtype=None, max_steps=1,
-                batches=None, overrides=None):
+                batches=None, overrides=None, model_fn=_norm_model):
     import numpy as np
 
-    model = _norm_model(dtype=dtype)
+    model = model_fn(dtype=dtype)
     config = dict(
         per_device_train_batch_size=1, gradient_accumulation_steps=accum,
         max_steps=max_steps, warmup_steps=0, learning_rate=1e-3,
@@ -2106,6 +2106,58 @@ def test_compiled_clip_accum_matches_eager_bitwise(tmp_path, capsys):
     for key in eager_snap:
         assert eager_snap[key][0] == comp_snap[key][0], key
         assert np.array_equal(eager_snap[key][1], comp_snap[key][1]), key
+
+
+def _fp32_writeback_model(seed=77, dtype=None):
+    class _TinyLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(32, 4)
+            self.mix = nn.Linear(4, 4, bias=False)
+            self.proj = nn.Linear(4, 32, bias=False)
+            self._config = {"model_type": "tiny"}
+
+        def __call__(self, input_ids):
+            # As mlx-vlm's Gemma 3n AltUp.correct() does with correction_coefs.
+            self.mix.weight = self.mix.weight.astype(mx.float32)
+            h = self.embed(input_ids)
+            return self.proj(self.mix(h.astype(mx.float32)).astype(h.dtype))
+
+    mx.random.seed(seed)
+    model = _TinyLM()
+    if dtype is not None:
+        model.set_dtype(dtype)
+    mx.eval(model.parameters())
+    return model
+
+
+@metal_only
+@pytest.mark.parametrize("max_steps", [1, 4])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_norm_clip_keeps_a_leaf_the_forward_stores_in_fp32(tmp_path, monkeypatch, compiled, max_steps):
+    import numpy as np
+
+    real_decay = MLXTrainer._apply_manual_weight_decay
+
+    def promoting_decay(self, model, optimizer, grad):
+        real_decay(self, model, optimizer, grad)
+        model.update({"proj": {"weight": model.proj.weight.astype(mx.float32)}})
+
+    monkeypatch.setattr(MLXTrainer, "_apply_manual_weight_decay", promoting_decay)
+    before = np.asarray(_fp32_writeback_model(dtype=mx.bfloat16).mix.weight.astype(mx.float32).tolist())
+    # One width, so a compiled run reuses its step once the weight (step 2) and its Adam state (step 3) have widened.
+    batches = FiniteTextBatchPlan(
+        [_FiniteTextRow(input_ids=(1, 2, 3, 4, 5))], [(0,)] * max_steps, max_seq_length=8, pad_id=0,
+    )
+    _trainer, result, _cb, snap = _norm_train(
+        tmp_path, "global", compiled=compiled, max_steps=max_steps, dtype=mx.bfloat16, batches=batches,
+        model_fn=_fp32_writeback_model, overrides={"learning_rate": 1e-5},
+    )
+    assert result["compile_enabled"] is compiled
+    dtype, after = snap["param.mix.weight"]
+    assert dtype == "mlx.core.float32"
+    assert np.all(after != before)
+    assert snap["param.proj.weight"][0] == snap["param.embed.weight"][0] == "mlx.core.bfloat16"
 
 
 @metal_only
