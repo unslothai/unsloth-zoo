@@ -885,7 +885,8 @@ def _decode_step_contract(base):
     if language is None or source is None or cache is None or os.environ.get("UNSLOTH_MLX_FUSED_GDN_DECODE") == "0":
         return None
     layer = language.Qwen3_5GatedDeltaNet
-    if any(getattr(base, name, None) is not getattr(layer, name)
+    # mlx-vlm below 0.6.17 has no _normalize_qk and below 0.7.1 no _project_gates.
+    if any(getattr(layer, name, None) is None or getattr(base, name, None) is not getattr(layer, name)
            for name in ("__call__", "_normalize_qk", "_project_gates", "_causal_conv1d_decode")):
         return None
     if language.ArraysCache is not cache.ArraysCache or "gated_delta_update" not in vars(language):
@@ -7767,7 +7768,8 @@ def _decode_gdn_fits(layer, inputs, mask, cache):
     arrays = getattr(arrays, "ArraysCache", None)
     if (inputs.ndim != 3 or inputs.shape[1] != 1 or arrays is None or not isinstance(cache, arrays)
             or getattr(cache, "history_capacity", 0)
-            or any(getattr(type(cache), name) is not getattr(arrays, name) or name in vars(cache)
+            or any(getattr(arrays, name, None) is None or getattr(type(cache), name, None) is not getattr(arrays, name)
+                   or name in vars(cache)
                    for name in ("update_window", "update_recurrent"))
             or not _gdn_block_fits(layer, inputs, mask, cache)):
         return False

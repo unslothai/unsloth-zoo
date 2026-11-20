@@ -1526,6 +1526,8 @@ def test_the_fused_gated_delta_step_refuses_a_cache_overriding_its_updates(monke
     inference = pytest.importorskip("unsloth_zoo.mlx.inference")
     mx = pytest.importorskip("mlx.core")
     ArraysCache = pytest.importorskip("mlx_vlm.models.cache").ArraysCache
+    if not hasattr(ArraysCache, "update_window"):
+        pytest.skip("mlx-vlm below 0.7.1 has no ArraysCache.update_window, so no fused decode step")
     monkeypatch.setattr(inference, "_gdn_block_fits", lambda *a: True)
     layer, inputs = types.SimpleNamespace(conv_kernel_size = 4, conv_dim = 8), mx.zeros((1, 1, 8))
     cache = ArraysCache(2)
@@ -1535,6 +1537,20 @@ def test_the_fused_gated_delta_step_refuses_a_cache_overriding_its_updates(monke
         setattr(cache, name, getattr(cache, name))
         assert not inference._decode_gdn_fits(layer, inputs, None, cache)
         delattr(cache, name)
+
+
+def test_the_fused_decode_step_declines_a_qwen3_5_layer_missing_a_pinned_method(monkeypatch):
+    inference = pytest.importorskip("unsloth_zoo.mlx.inference")
+
+    class Layer:  # mlx-vlm 0.6.4 to 0.6.16: no _normalize_qk, no _project_gates
+        def __call__(self, *a): pass
+        def _causal_conv1d_decode(self, *a): pass
+
+    monkeypatch.delenv("UNSLOTH_MLX_FUSED_GDN_DECODE", raising = False)
+    for name in ("language", "gated_delta"):
+        monkeypatch.setitem(sys.modules, f"mlx_vlm.models.qwen3_5.{name}", types.SimpleNamespace(Qwen3_5GatedDeltaNet = Layer))
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.cache", types.SimpleNamespace())
+    assert inference._decode_step_contract(Layer) is None
 
 
 def test_a_qwen4_moe_block_without_norm_topk_prob_reaches_the_plan(monkeypatch):
