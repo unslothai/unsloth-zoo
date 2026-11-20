@@ -222,8 +222,11 @@ def test_compiled_training_state_survives_generation(monkeypatch):
 
 
 @real_mlx_only
-def test_batched_draws_keep_each_row_on_its_own_seeded_stream_as_rows_join_and_leave():
+def test_batched_draws_keep_each_row_on_its_own_seeded_stream_as_rows_join_and_leave(monkeypatch):
+    from unsloth_zoo.mlx import generate as engine
     from unsloth_zoo.mlx.generate import SamplingParams, _BatchedDraws, _seeded_sampler
+
+    monkeypatch.setattr(engine, "_mlx_lm_batches_one_sampler", lambda: True)  # the draws, not mlx-lm's sampling loop
 
     generator = types.SimpleNamespace(_generation_batch=types.SimpleNamespace(uids=[]),
                                       _prompt_batch=types.SimpleNamespace(split=lambda uids: types.SimpleNamespace(uids=uids)))
