@@ -2833,9 +2833,11 @@ def _prompt_completion_boundary(prompt_ids, pc_ids, anchor = 4):
             i, j = i + 1, j + 1
     kind = "deleted" if deleted else "diverge"
     # A short unmatched tail is a merged token or prompt-only closing tokens (Gemma 4 "<turn|>\n", DeepSeek-R1
-    # "<think>\n"). A long one whose last ids reappear later is a rewrite we cannot line up: mask len(prompt).
-    if len(p) - i >= anchor and any(q[r : r + anchor] == p[-anchor:] for r in range(j, len(q) - anchor + 1)):
-        kind, j = "unaligned", n
+    # "<think>\n"). A long one is a rewrite we cannot line up (Mistral v0.3 drops the system text and re-spaces the
+    # next word): start after the last place the prompt's last ids appear in pc_ids.
+    tails = [r for r in range(j, len(q) - anchor + 1) if q[r : r + anchor] == p[-anchor:]] if len(p) - i >= anchor else []
+    if tails:
+        kind, j = "unaligned", tails[-1] + anchor
     if kind not in _PROMPT_COMPLETION_BOUNDARY_WARNED:
         _PROMPT_COMPLETION_BOUNDARY_WARNED.add(kind)
         if kind == "deleted":
@@ -2849,9 +2851,8 @@ def _prompt_completion_boundary(prompt_ids, pc_ids, anchor = 4):
             print(
                 "Unsloth: Warning: the chat template renders earlier turns of the prompt into different tokens "
                 "once the completion is appended, and the prompt could not be lined up with prompt + completion. "
-                "For these rows the completion is trained from len(prompt) tokens on, which can leave the start "
-                "of the completion (or all of it) without loss, or train the last prompt tokens if the template "
-                "added tokens to earlier turns. Check the labels of such rows."
+                "For these rows the completion is trained from where the prompt's last tokens end in prompt + "
+                "completion. Check the labels of such rows."
             )
         else:
             print(

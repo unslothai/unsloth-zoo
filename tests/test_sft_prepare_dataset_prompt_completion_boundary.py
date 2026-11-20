@@ -161,11 +161,13 @@ def test_boundary_keeps_the_divergence_for_prompt_only_closing_tokens():
     assert _prompt_completion_boundary([1, 2, 30, 31, 32, 33, 40, 41], [1, 2, 30, 31, 32, 33, 41, 50, 60]) == 6
 
 
-def test_boundary_falls_back_to_the_prompt_length_when_it_cannot_line_up():
-    # [8, 8] became [9, 9] and the prompt's last ids reappear later: mask len(prompt).
+def test_boundary_starts_after_the_prompt_tail_when_it_cannot_line_up():
+    # [8, 8] became [9, 9] and the prompt's last ids reappear later: start after them.
     assert _prompt_completion_boundary([1, 2, 8, 8, 3, 4, 5, 6], [1, 2, 9, 9, 3, 4, 5, 6, 20]) == 8
-    # Deleted spans too close together to anchor: mask the prompt even if the answer loses its start.
-    assert _prompt_completion_boundary([1, 2, 8, 3, 4, 9, 10, 5, 6, 7, 11], [1, 2, 3, 4, 5, 6, 7, 11, 20, 21]) == 10
+    # Deleted spans too close together to anchor: the answer [20, 21] is still trained whole.
+    assert _prompt_completion_boundary([1, 2, 8, 3, 4, 9, 10, 5, 6, 7, 11], [1, 2, 3, 4, 5, 6, 7, 11, 20, 21]) == 8
+    # Mistral v0.3: the joined ids drop the system text [30, 31, 32] and "Cap" "ital" becomes "▁Capital" [41].
+    assert _prompt_completion_boundary([1, 2, 30, 31, 32, 40, 42, 5, 6, 7, 9], [1, 2, 41, 5, 6, 7, 9, 50, 51]) == 7
 
 
 def test_boundary_warns_once_per_cause(monkeypatch, capsys):
