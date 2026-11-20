@@ -3869,12 +3869,10 @@ def grpo_accumulated_loss(
         if _pg_engage and _pg_funcs:
             try:
                 _pg_build_layout, _pg_enabled_fn, _pg_verify_on, _pg_tol_ok, _PG_TOL_KILL = _pg_funcs
-                # Exclusions: softcap models (gemma2) - the FlexAttention kernel skips
-                # attn_logit_softcapping; hybrid SSM (FalconH1) and MoE unless unsloth verified the
-                # family (Qwen3-MoE, opt-in) - else their decoders may not thread prefix_seg_info.
+                # Exclusions: softcap (FlexAttention skips it); hybrid SSM and unverified MoE
+                # (decoders may not thread prefix_seg_info).
                 _pg_cfg = getattr(unwrapped_model, "config", None)
-                # Given the model, unsloth also checks its forward applies prefix_seg_info and, for
-                # verified MoE families (opt-in), marks the model MoE-safe (older unsloth takes no argument).
+                # Older unsloth takes no argument.
                 try:
                     _pg_model_ok = _pg_enabled_fn(unwrapped_model)
                 except TypeError:
