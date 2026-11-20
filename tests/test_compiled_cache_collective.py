@@ -1245,7 +1245,7 @@ def test_generated_conv_forward_returns_autocast_dtype(monkeypatch, compiler, tm
         _patch_dtype_modules_twice(compiler, monkeypatch, tmp_path)
         generated = pathlib.Path(tmp_path / "Conv2d.py").read_text(encoding="utf-8")
         assert "torch.get_autocast_dtype" in generated
-        assert "from unsloth_zoo.compiler import _NO_AUTOCAST_DEVICE_TYPES" in generated
+        assert "from unsloth_zoo.compiler import _conv_autocast_eligible" in generated
         conv = torch.nn.Conv2d(3, 4, 3).to(torch.bfloat16)
         features = torch.randn(1, 3, 8, 8)
         with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
@@ -1254,6 +1254,10 @@ def test_generated_conv_forward_returns_autocast_dtype(monkeypatch, compiler, tm
             assert conv(features).dtype == torch.float32
         meta = torch.nn.Conv2d(3, 4, 3, device="meta", dtype=torch.bfloat16)
         assert meta(torch.empty(1, 3, 8, 8, device="meta")).device.type == "meta"
+        # float64 is not autocast-eligible: stock keeps the conv in float64.
+        double = torch.nn.Conv2d(3, 4, 3).double()
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+            assert double(features.double()).dtype == torch.float64
     finally:
         for module, forward in patched.items():
             getattr(torch.nn, module).forward = forward

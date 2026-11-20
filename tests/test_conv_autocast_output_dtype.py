@@ -87,3 +87,15 @@ def test_fp16_autocast_with_bf16_weight_returns_fp16():
     conv, _, forward = _wrapped(torch.nn.Conv1d, torch.bfloat16)
     with torch.no_grad(), torch.autocast("cpu", dtype = torch.float16):
         assert forward(conv, torch.randn(2, 3, 16, dtype = torch.float16)).dtype == torch.float16
+
+
+def test_float64_conv_under_autocast_keeps_float64():
+    # Autocast leaves float64 ops alone; the wrapper must not lower their result.
+    conv = torch.nn.Conv2d(3, 4, 3).double()
+    forward = _dtype_safe_forward(torch.nn.Conv2d.forward, True, False)
+    x = torch.randn(1, 3, 8, 8, dtype = torch.float64)
+    with torch.no_grad(), torch.autocast("cpu", dtype = torch.bfloat16):
+        stock = torch.nn.Conv2d.forward(conv, x)
+        out = forward(conv, x)
+    assert stock.dtype == out.dtype == torch.float64
+    assert torch.equal(out, stock)

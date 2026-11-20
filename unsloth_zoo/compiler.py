@@ -6232,6 +6232,16 @@ def _no_autocast_device_types():
 _NO_AUTOCAST_DEVICE_TYPES = _no_autocast_device_types()
 
 
+def _conv_autocast_eligible(tensor, weight):
+    # Autocast lowers a conv only when it is enabled on this device and no operand is float64.
+    return (
+        tensor.device.type not in _NO_AUTOCAST_DEVICE_TYPES
+        and torch.is_autocast_enabled(tensor.device.type)
+        and tensor.dtype is not torch.float64
+        and weight.dtype is not torch.float64
+    )
+
+
 def _dtype_safe_forward(original_forward, is_conv, disable, is_batchnorm = False):
     """The dtype casts of the source rewrite, without needing the source.
 
@@ -6263,7 +6273,7 @@ def _dtype_safe_forward(original_forward, is_conv, disable, is_batchnorm = False
             return original_forward(self, *args, **kwargs)
         original_dtype = tensor.dtype
         if is_conv:
-            if tensor.device.type not in _NO_AUTOCAST_DEVICE_TYPES and torch.is_autocast_enabled(tensor.device.type):
+            if _conv_autocast_eligible(tensor, self.weight):
                 original_dtype = torch.get_autocast_dtype(tensor.device.type)
             tensor = tensor.to(self.weight.dtype)
         elif disable and getattr(self, "weight", None) is not None:
@@ -6393,15 +6403,14 @@ def _patch_torch_dtype_modules(
                 body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
                 prologue = [
                     body_indent + "original_dtype = input.dtype",
-                    body_indent + "if input.device.type not in _NO_AUTOCAST_DEVICE_TYPES and "
-                    "torch.is_autocast_enabled(input.device.type): "
+                    body_indent + "if _conv_autocast_eligible(input, self.weight): "
                     "original_dtype = torch.get_autocast_dtype(input.device.type)",
                     body_indent + "input = input.to(self.weight.dtype)",
                 ]
                 source = "\n".join([def_line] + prologue + body_lines)
                 append_str = ".to(original_dtype)\n"
                 # Imported, not baked in: it depends on the installed torch.
-                extra_prepend = "from unsloth_zoo.compiler import _NO_AUTOCAST_DEVICE_TYPES\n"
+                extra_prepend = "from unsloth_zoo.compiler import _conv_autocast_eligible\n"
             else:
                 extra_prepend = ""
                 # Norm modules: detect the actual parameter name (input or x)
