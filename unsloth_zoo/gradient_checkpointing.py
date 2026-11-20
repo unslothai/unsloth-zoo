@@ -885,7 +885,11 @@ def gradient_checkpoint_replay_module():
     function = getattr(_GC_RECOMPUTE_TLS, "function", None)
     if function is None:
         return None
-    return _replayed_module(function)
+    module = _replayed_module(function)
+    # A forward hook runs after forward and may read the output: never report such a module.
+    if module is None or module._forward_hooks or torch.nn.modules.module._global_forward_hooks:
+        return None
+    return module
 
 
 # ---------------------------------------------------------------------------

@@ -115,3 +115,20 @@ def test_nested_marker_restores_function():
             assert gc.gradient_checkpoint_replay_module() is None
         assert gc.gradient_checkpoint_replay_module() is layer
     assert gc.gradient_checkpoint_replay_module() is None
+
+
+def test_module_with_forward_hook_is_never_reported():
+    # A forward hook runs after forward and may read the output, so the output is not unread.
+    layer = _Layer()
+    handle = layer.register_forward_hook(lambda module, args, output: output.square())
+    with gc._gradient_checkpoint_recompute_marker(layer):
+        assert gc.gradient_checkpoint_replay_module() is None
+    handle.remove()
+    handle = torch.nn.modules.module.register_module_forward_hook(lambda module, args, output: None)
+    try:
+        with gc._gradient_checkpoint_recompute_marker(layer):
+            assert gc.gradient_checkpoint_replay_module() is None
+    finally:
+        handle.remove()
+    with gc._gradient_checkpoint_recompute_marker(layer):
+        assert gc.gradient_checkpoint_replay_module() is layer
