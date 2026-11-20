@@ -295,15 +295,16 @@ _OFFLOAD_RUNTIME_QUANT = (
 )
 
 
-def _refuse_offloaded(model, action) -> None:
+def _refuse_offloaded(model, action, *, needs_vision=True) -> None:
     if getattr(model, "_unsloth_offload", None):
         raise ValueError(
             f"Unsloth: this model was loaded with offload, which is for inference only; "
             f"{action} needs the model loaded without offload."
         )
-    from .utils import refuse_released_vision
+    if needs_vision:
+        from .utils import refuse_released_vision
 
-    refuse_released_vision(model, action)
+        refuse_released_vision(model, action)
 
 
 def _keep_norm_parameters_float32(model) -> None:
@@ -3864,6 +3865,52 @@ def _detach_vision_modules(model) -> dict:
     return released
 
 
+def _detached_holder(detached):
+    import mlx.nn as nn
+
+    holder = nn.Module()
+    for name, child in detached.items():
+        holder[name] = child
+    return holder
+
+
+def _record_detached_quantization(model, detached, spec, user_predicate) -> None:
+    """Record what the runtime quantization just applied to the model would have done to the detached modules,
+    without building layers or reading weights, so adapters saved without them carry the full base's map."""
+    if not detached or not spec.enabled:
+        return
+
+    def resolved(mode, group_size=None, bits=None):
+        default_group_size, default_bits = _MLX_QUANT_MODE_DEFAULTS.get(mode, (64, 4))
+        return {"bits": bits or default_bits, "group_size": group_size or default_group_size, "mode": mode}
+
+    mode = spec.mode or "affine"
+    # Dense NF4 always records 4 bits, whatever bits were requested.
+    params = resolved(mode, spec.group_size, 4 if mode == "nf4_dense" else spec.bits)
+    predicate = _compose_mlx_quant_predicate(model, spec, is_vlm=True, user_predicate=user_predicate)
+    recorded = {}
+    for path, module in _detached_holder(detached).named_modules():
+        shape = getattr(getattr(module, "weight", None), "shape", ())
+        # As the load selects: dense NF4 takes any selected 2-D weight; quantize_model needs to_quantized and a
+        # divisible width, and passes a predicate's dict to to_quantized alone, whose own defaults fill the rest.
+        eligible = len(shape) == 2 if mode == "nf4_dense" else (
+            hasattr(module, "to_quantized") and len(shape) > 0 and shape[-1] % params["group_size"] == 0
+        )
+        selected = eligible and predicate(path, module)
+        if not selected:
+            continue
+        if not isinstance(selected, dict) or mode == "nf4_dense":
+            recorded[path] = dict(params)
+        elif not selected.get("quantize_input"):
+            recorded[path] = resolved(selected.get("mode", "affine"), selected.get("group_size"), selected.get("bits"))
+        elif "bits" in selected and "group_size" in selected:
+            # A QQLinear is not in the module scan; the full base lists it only through the config entry mlx-lm wrote.
+            recorded[path] = {
+                "bits": selected["bits"], "group_size": selected["group_size"], "mode": selected.get("mode", "affine")
+            }
+    model._unsloth_detached_quantization = recorded
+
+
 def _settle_detached_vision(model, released, target_dtype=None, model_type="") -> int:
     """Bytes of the detached modules if text still embeds and runs without them, else reattach (cast to
     target_dtype, which the load applied while they were out) and return 0."""
@@ -3894,12 +3941,40 @@ def _settle_detached_vision(model, released, target_dtype=None, model_type="") -
         if target is not None:
             target._unsloth_supports_images = False
     model._unsloth_vision_released = True
+    # Adapters record and check the full base's quantization map, so they reload onto a base that kept the tower.
+    from .utils import iter_mlx_lora_modules
+
+    holder = _detached_holder(released)
+    recorded = {
+        **(getattr(model, "_unsloth_packed_quantization", None) or {}),
+        **(getattr(model, "_unsloth_detached_quantization", None) or {}),
+    }
+    model._unsloth_released_quantization_map = {
+        **_quantization_config_to_path_map(
+            {path: spec for path, spec in recorded.items() if path.split(".", 1)[0] in released}
+        ),
+        **_quantized_module_map(holder),
+    }
+    # Saving the rest would silently drop adapter state on them: LoRA, tensors an adapter reload restored (frozen or
+    # not), or, once the model carries adapters (so the base is frozen), anything left trainable.
+    restored = getattr(model, "_unsloth_reloaded_parameter_keys", None) or ()
+    adapted = restored or any(True for _ in iter_mlx_lora_modules(model))
+    model._unsloth_released_adapter_state = (
+        any(True for _ in iter_mlx_lora_modules(holder))
+        or any(key.split(".", 1)[0] in released for key in restored)
+        or bool(adapted and tree_flatten(holder.trainable_parameters()))
+    )
     return sum(value.nbytes for _, value in tree_flatten(released) if isinstance(value, mx.array))
 
 
+# Marks a zoo whose drop_vision_weights load supports LoRA training and adapter saves.
+DROP_VISION_WEIGHTS_TRAINS_LORA = True
+
+
 def release_vision_weights(model) -> int:
-    """Free a VLM's vision modules for text-only inference and return the bytes freed (0, untouched, if text
-    needs them). The model then reads no images and refuses saving and training."""
+    """Free a VLM's vision modules for text-only use and return the bytes freed (0, untouched, if text needs
+    them). The model then reads no images; it still trains and saves LoRA adapters, but refuses whole-model saves,
+    full fine-tuning and vision or projector LoRA."""
     import mlx.core as mx
 
     freed = _settle_detached_vision(model, _detach_vision_modules(model))
@@ -4705,7 +4780,6 @@ def _infer_snapshot_commit(path):
 
 
 def _effective_mlx_quantization_map(model):
-    quantized_types = _mlx_quantized_module_types()
     quantized = {}
     quantized.update(_quantization_config_to_path_map(
         _get_existing_mlx_quantization(getattr(model, "_config", None))
@@ -4713,6 +4787,13 @@ def _effective_mlx_quantization_map(model):
     quantized.update(_quantization_config_to_path_map(
         getattr(model, "_unsloth_quantization_config", None)
     ))
+    quantized.update(_quantized_module_map(model))
+    return quantized
+
+
+def _quantized_module_map(model):
+    quantized_types = _mlx_quantized_module_types()
+    quantized = {}
     for path, module in model.named_modules():
         if not path:
             continue
@@ -4804,7 +4885,10 @@ def _validate_mlx_adapter_base(model, adapter_cfg):
         or adapter_cfg.get("base_quantization_map")
     )
     if expected_map:
-        live_map = _normalize_quantization_map(_effective_mlx_quantization_map(model))
+        live_map = _normalize_quantization_map({
+            **(getattr(model, "_unsloth_released_quantization_map", None) or {}),
+            **_effective_mlx_quantization_map(model),
+        })
         expected_paths = set(expected_map)
         live_paths = set(live_map)
         missing = sorted(expected_paths - live_paths)
@@ -7220,7 +7304,8 @@ def _ensure_vlm_processor_inputs_patched():
 
 
 def _mlx_save_pretrained_merged(self, save_directory, tokenizer=None, **kwargs):
-    _refuse_offloaded(self, "saving")
+    # A merged save refuses a released tower itself; an adapter save does not need it.
+    _refuse_offloaded(self, "saving", needs_vision=False)
     from .utils import collect_mlx_lora_adapter_tensors, save_pretrained_merged
     tokenizer = tokenizer or self._tokenizer
     if "save_method" not in kwargs and not collect_mlx_lora_adapter_tensors(self):
@@ -9044,10 +9129,12 @@ class FastMLXModel:
                 for a caller that prices loads its own way: called with the
                 downloaded checkpoint's directory before any weight is read, it
                 returns either of the forms above.
-            drop_vision_weights: Inference only, on a checkpoint that loads
-                through mlx-vlm: never read the vision tower and projector, so
-                the model reads no images and cannot be saved whole. Kept when
-                the text path turns out to need them;
+            drop_vision_weights: For text-only inference and LoRA training,
+                on a checkpoint that loads through mlx-vlm: never read the
+                vision tower and projector, so the model reads no images, trains
+                and saves only language-model LoRA adapters (which reload onto
+                the full base), and cannot be saved whole or fully fine-tuned.
+                Kept when the text path turns out to need them;
                 ``model._unsloth_vision_freed`` holds the bytes left unread.
 
         Reloading a saved LoRA/DoRA adapter directory returns a model whose
@@ -10062,6 +10149,7 @@ class FastMLXModel:
                     model, vlm_cfg, quantization_spec,
                     is_vlm=True, user_predicate=quant_predicate,
                 )
+                _record_detached_quantization(model, detached_vision, quantization_spec, quant_predicate)
                 model._config = _with_packed_quantization(model, vlm_cfg)
                 _run_with_vlm_config_view(
                     lambda: mx.eval(model.parameters()),
@@ -10151,6 +10239,12 @@ class FastMLXModel:
             model._unsloth_vision_freed = _run_with_vlm_config_view(
                 _settle_detached_vision, model, detached_vision, target_dtype, model_type
             )
+            if full_finetuning and getattr(model, "_unsloth_vision_released", False):
+                raise ValueError(
+                    "Unsloth: drop_vision_weights=True cannot be combined with "
+                    "full_finetuning=True; the saved model would have no vision "
+                    "tower. Use LoRA, or load without drop_vision_weights."
+                )
             if force_vlm_text_path:
                 print(
                     "Unsloth: Loading a text model through mlx-vlm; "
@@ -10395,7 +10489,7 @@ class FastMLXModel:
         """Apply LoRA via mlx-lm; for VLMs the language model plus optionally the vision tower (train_vision=True) and
         projector (train_projector=True); no-op when loaded with full_finetuning=True."""
         _warn_block_swap(kwargs)
-        _refuse_offloaded(model, "LoRA training")
+        _refuse_offloaded(model, "LoRA training", needs_vision=False)
         loftq_config = kwargs.pop("loftq_config", None)
         if loftq_config is not None:
             raise NotImplementedError(
@@ -10420,6 +10514,7 @@ class FastMLXModel:
         _validate_mlx_init_lora_weights(init_lora_weights)
 
         if getattr(model, "_unsloth_full_finetuning", False):
+            _refuse_offloaded(model, "full fine-tuning")
             print(
                 "Unsloth: full_finetuning=True — skipping LoRA, training "
                 "all model parameters directly."
@@ -10440,7 +10535,15 @@ class FastMLXModel:
         if finetune_vision_layers is not None:
             train_vision = bool(finetune_vision_layers)
             vision_flag = "finetune_vision_layers"
-
+        if getattr(model, "_unsloth_vision_released", False):
+            for flag, requested in ((vision_flag, train_vision), ("train_projector", train_projector)):
+                if requested:
+                    raise ValueError(
+                        f"Unsloth: {flag}=True, but this model's vision weights were "
+                        "released (drop_vision_weights=True), so there is no vision "
+                        f"tower or projector to train. Set {flag}=False, or reload "
+                        "without drop_vision_weights."
+                    )
 
         # `all-linear` means every nn.Linear (fused QKV, MoE, vision, projector, untied lm_head), not the canonical 7
         # that leave fused-attention and MoE models mostly un-LoRA'd; in a mixed list like ['all-linear',

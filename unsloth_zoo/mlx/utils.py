@@ -15342,6 +15342,7 @@ def _is_base_tensor_inside_lora_module(
 def save_trainable_adapters(model, path, adapter_config=None):
     """Save trainable parameters plus all LoRA adapter tensors, frozen or not; wrapped base weights inside LoRA modules
     are excluded, as reload leaks them and would bloat the adapter export."""
+    refuse_released_vision(model, "saving", whole_model=False)
     _reject_mixed_lora_dora(model)
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
     adapter_tensors = collect_mlx_lora_adapter_tensors(model)
@@ -15524,7 +15525,7 @@ def save_lora_adapters(model, path, adapter_config=None, adapter_format="mlx"):
     """Save lora_a/lora_b and DoRA magnitudes; adapter_format is mlx (native) or peft (HF layout), where uniform LoRA
     loads in transformers, PEFT and vLLM, but per-module rank/alpha only in transformers/PEFT (vLLM has one global
     rank/alpha)."""
-    refuse_released_vision(model, "saving")
+    refuse_released_vision(model, "saving", whole_model=False)
     if adapter_format not in ("mlx", "peft"):
         raise ValueError(
             f"Unsloth MLX: adapter_format={adapter_format!r}; expected "
@@ -16037,7 +16038,10 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     else:
         adapter_config.pop("base_quantized_source", None)
 
-    resolved_map = _effective_mlx_quantization_map(model)
+    resolved_map = {
+        **(getattr(model, "_unsloth_released_quantization_map", None) or {}),
+        **_effective_mlx_quantization_map(model),
+    }
     if resolved_map:
         adapter_config["base_resolved_quantization_map"] = resolved_map
         adapter_config["base_resolved_quantization_map_supports_switch"] = True
@@ -18825,10 +18829,12 @@ def _restore_mlx_model_state(model, snapshot):
     mx.clear_cache()
 
 
-def refuse_released_vision(model, action) -> None:
-    if getattr(model, "_unsloth_vision_released", False):
+def refuse_released_vision(model, action, *, whole_model=True) -> None:
+    adapter_state = getattr(model, "_unsloth_released_adapter_state", False)
+    if getattr(model, "_unsloth_vision_released", False) and (whole_model or adapter_state):
+        what = "vision weights and the adapter state trained on them" if adapter_state else "vision weights"
         raise ValueError(
-            f"Unsloth: this model's vision weights were released for text-only inference; "
+            f"Unsloth: this model's {what} were released for text-only use; "
             f"{action} needs the model loaded without drop_vision_weights."
         )
 
