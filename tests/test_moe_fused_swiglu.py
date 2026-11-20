@@ -23,7 +23,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA required")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None, reason = "NVIDIA CUDA required (the kernel uses PTX inline asm)"
+)
 
 if torch.cuda.is_available():
     sw = importlib.import_module("unsloth_zoo.temporary_patches.moe_fused_swiglu")
@@ -333,8 +335,8 @@ ALPHA, LIMIT = 1.702, 7.0
 
 
 def _gptoss_fp64(gate, up, alpha = ALPHA, limit = LIMIT):
-    """Independent fp64 reference (no torch.clamp / autograd): value and analytic d/dgate, d/dup per unit grad.
-    Boundary ties follow the running torch's clamp gradient (inclusive <= 2.13, exclusive on 2.14)."""
+    """Independent fp64 reference with no torch.clamp or autograd, giving value and analytic d/dgate, d/dup per unit
+    grad; boundary ties follow the running torch clamp gradient (inclusive <= 2.13, exclusive on 2.14)"""
     g, u = gate.double(), up.double()
     gc = torch.where(g > limit, torch.full_like(g, limit), g)
     uc = torch.where(u > limit, torch.full_like(u, limit), torch.where(u < -limit, torch.full_like(u, -limit), u))
@@ -473,3 +475,50 @@ def test_fp16_extremes_gradscaler(act, layout):
         assert bitwise(y_f, y_e)
         assert bitwise(g_f, g_e)
         assert torch.equal(torch.isfinite(g_f), torch.isfinite(g_e))
+
+
+_NO_LIBDEVICE_FMA_SCRIPT = r"""
+import sys, warnings
+import torch
+import torch.nn.functional as F
+import triton.language.extra.libdevice as _ld
+import triton.language.extra.cuda.libdevice as _cld
+for _m in (_ld, _cld):
+    for _name in ("fma", "fma_rn"):
+        if hasattr(_m, _name):
+            delattr(_m, _name)
+assert not hasattr(_ld, "fma")
+from unsloth_zoo.temporary_patches import moe_fused_swiglu as sw
+print("module", sw.__file__)
+ok = True
+for dtype in ([torch.bfloat16] if torch.cuda.get_device_capability()[0] >= 8 else []) + [torch.float16, torch.float32]:
+    for interleaved in (False, True):
+        g = torch.Generator(device = "cuda").manual_seed(0)
+        gu = (torch.randn(65, 2 * 300, device = "cuda", generator = g) * 4.0).to(dtype)
+        dy = torch.randn(65, 300, device = "cuda", generator = g).to(dtype)
+        x_e = gu.clone().requires_grad_()
+        gate, up = (x_e[..., ::2], x_e[..., 1::2]) if interleaved else x_e.chunk(2, dim = -1)
+        (F.silu(gate) * up).backward(dy)
+        before = sw.FUSED_SWIGLU_CALLS[1]
+        x_f = gu.clone().requires_grad_()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            sw.moe_fused_swiglu(x_f, sw.ACT_SILU, interleaved, eager_rounding = True).backward(dy)
+        fused = sw.FUSED_SWIGLU_CALLS[1] == before + 1 and not sw._STATE["failed"]
+        same = torch.equal(x_f.grad, x_e.grad) and torch.equal(torch.signbit(x_f.grad), torch.signbit(x_e.grad))
+        print(dtype, interleaved, "fused" if fused else "FELL BACK", "bitwise" if same else "DIFF")
+        ok = ok and fused and same
+sys.exit(0 if ok else 1)
+"""
+
+
+def test_silu_backward_without_libdevice_fma(tmp_path):
+    # Triton main removed libdevice.fma / fma_rn: the fused SiLU backward must still compile and launch.
+    import subprocess
+    import sys
+
+    env = dict(os.environ, TRITON_CACHE_DIR = str(tmp_path / "triton_cache"))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(sw.__file__)))
+    env["PYTHONPATH"] = os.path.dirname(root) + os.pathsep + env.get("PYTHONPATH", "")
+    r = subprocess.run([sys.executable, "-c", _NO_LIBDEVICE_FMA_SCRIPT], env = env, capture_output = True, text = True, timeout = 600)
+    assert r.returncode == 0, r.stderr[-3000:] + r.stdout

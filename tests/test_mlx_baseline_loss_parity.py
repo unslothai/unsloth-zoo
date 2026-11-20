@@ -45,10 +45,7 @@ def _labels_none_block():
 
 
 def test_no_fp32_mask_cast_in_fast_path():
-    """The labels=None path must NOT cast the bool mask to fp32. mlx-lm's
-    default_loss multiplies the cross-entropy result by a raw bool mask;
-    casting to fp32 produces a different MLX autodiff graph and shifts
-    gradients by ~1e-2 per step on small fixtures."""
+    """labels=None path must not cast the bool mask to fp32: mlx-lm's default_loss multiplies by the raw mask, and fp32 changes the MLX autodiff graph."""
     block = _labels_none_block()
     bad_patterns = (
         r"length_mask\.astype\(mx\.float32\)",
@@ -62,9 +59,7 @@ def test_no_fp32_mask_cast_in_fast_path():
 
 
 def test_no_safe_targets_where_in_fast_path():
-    """The labels=None path has no -100 to worry about, so no mx.where
-    is needed on targets. The where node was empirically the cause of
-    step-2 loss divergence vs mlx-lm CLI (Round BO probe_31 vs probe_37)."""
+    """labels=None path has no -100 targets, so mx.where is unneeded there; the where node caused step-2 loss divergence vs mlx-lm CLI."""
     block = _labels_none_block()
     assert "mx.where" not in block, (
         "labels=None fast path must not include mx.where on targets; "
@@ -77,10 +72,8 @@ def test_no_safe_targets_where_in_fast_path():
 
 
 def test_no_safe_token_denominator_in_fast_path():
-    """mlx-lm's default_loss divides by raw `ntoks` (int). The fast path
-    must match that to preserve the autodiff graph; the safety wrapper
-    `_safe_token_denominator` introduces a fp32 cast + maximum() that
-    changes rounding in MLX."""
+    """Fast path must divide by raw ntoks (int) like mlx-lm default_loss to keep the autodiff graph;
+    _safe_token_denominator adds an fp32 cast and maximum() that changes MLX rounding"""
     block = _labels_none_block()
     assert "_safe_token_denominator" not in block, (
         "labels=None fast path must divide by raw ntoks for mlx-lm parity. "
@@ -89,11 +82,9 @@ def test_no_safe_token_denominator_in_fast_path():
 
 
 def test_fast_path_returns_ce_and_ntoks_in_that_order():
-    """Match the (loss, ntoks) return signature mlx-lm uses; the test
-    pins return-order so a future refactor doesn't accidentally swap."""
+    """Pins the (loss, ntoks) return order used by mlx-lm so a refactor cannot silently swap the two values."""
     block = _labels_none_block()
-    # The names are loose (mlx-lm uses `ce`; zoo previously used `loss`), so only
-    # the order is pinned.
+    # Only the return order is pinned; the names are loose (mlx-lm uses ce, zoo has used loss).
     m = re.search(r"return\s+(\w+),\s*(\w+)", block)
     assert m, "labels=None fast path must return a (loss, ntoks) tuple"
     loss_name, ntoks_name = m.group(1), m.group(2)
@@ -104,8 +95,7 @@ def test_fast_path_returns_ce_and_ntoks_in_that_order():
 
 
 def test_labels_aware_path_still_uses_safe_targets():
-    """The labels-aware path (train_on_responses_only) DOES need
-    `safe_targets` and the fp32 mask because labels can contain -100."""
+    """The labels-aware path (train_on_responses_only) needs safe_targets and the fp32 mask because labels can contain -100."""
     from unsloth_zoo.mlx import utils
     src = inspect.getsource(utils.make_baseline_loss_fn)
     # This path lives after the fast path's `return`, so read the full source.

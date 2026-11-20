@@ -20,9 +20,7 @@ from unsloth_zoo import vllm_utils
 
 
 def test_hip_clears_forced_flashinfer_even_when_package_absent():
-    # Regression: on ROCm with a forced FlashInfer backend inherited from the env
-    # but the flashinfer package NOT installed, the vars must still be cleared so
-    # vLLM does not try to use FlashInfer.
+    # On ROCm, forced FlashInfer env vars must be cleared even when the flashinfer package is absent, so vLLM does not try to use FlashInfer.
     env = {"VLLM_ATTENTION_BACKEND": "FLASHINFER", "VLLM_USE_FLASHINFER_SAMPLER": "1"}
     with mock.patch.object(vllm_utils, "is_hip", return_value=True), \
          mock.patch("importlib.util.find_spec", return_value=None), \

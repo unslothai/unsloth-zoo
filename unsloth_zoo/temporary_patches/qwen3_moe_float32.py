@@ -41,6 +41,8 @@
 # ============================================================================
 
 import os
+import sys
+import threading
 import torch
 from .common import (
     TEMPORARY_PATCHES,
@@ -49,19 +51,54 @@ from .common import (
     unwrap_norm_weight,
     publish_to_modeling_module,
 )
-from .utils import compile_with_eager_fallback, patch_function, raise_error
+from .utils import (
+    compile_with_eager_fallback,
+    other_family_load,
+    patch_forced_float32,
+    raise_error,
+    undo_forced_float32,
+)
+# Full finetuning on a GPU without bfloat16 runs this family in float32 with no autocast, so the fp16 RMSNorm output
+# meets float32 weights: cast at each Linear boundary (identity on the fp16 LoRA path), as gemma4_float32 does.
+from .gemma import _linear_boundary_dtype, _to_boundary_dtype, _to_forced_output_dtype
 
 # Mirrors gemma.py: flex dispatch can be turned off globally.
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
 
 
+# Set by each decoder layer forward: the dtype its projections take when no autocast is active. Per thread, so a
+# float16 and a float32 Qwen3-MoE running at once never read each other's decision.
+_QWEN3_MOE_BOUNDARY = threading.local()
+
+
+_QWEN3_MOE_FAMILY = r"(?<![a-z0-9])qwen3_moe(?![a-z0-9])"
+
+
+def _skip_or_undo(class_name):
+    """True when the forced patch must not install; a flag "0" load of this family undoes it first."""
+    if other_family_load(_QWEN3_MOE_FAMILY): return True
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") != "0": return False
+    # Not imported means never patched; do not import qwen3_moe for this.
+    modeling = sys.modules.get("transformers.models.qwen3_moe.modeling_qwen3_moe")
+    undo_forced_float32(getattr(modeling, class_name, None), "forward")
+    return True
+
+
 def patch_Qwen3MoeDecoderLayer_float32():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if _skip_or_undo("Qwen3MoeDecoderLayer"): return
     try:
         import transformers.models.qwen3_moe.modeling_qwen3_moe
         transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeDecoderLayer
     except Exception as e:
         return raise_error("Qwen3MoeDecoderLayer.forward", e)
+    # Compiled copies are rebuilt from source and read free names from the modeling module.
+    publish_to_modeling_module(
+        transformers.models.qwen3_moe.modeling_qwen3_moe,
+        _linear_boundary_dtype  = _linear_boundary_dtype,
+        _to_boundary_dtype      = _to_boundary_dtype,
+        _to_forced_output_dtype = _to_forced_output_dtype,
+        _QWEN3_MOE_BOUNDARY     = _QWEN3_MOE_BOUNDARY,
+    )
 
     def forward(
         self,
@@ -73,6 +110,12 @@ def patch_Qwen3MoeDecoderLayer_float32():
         position_embeddings = None,
         **kwargs,
     ):
+        # Projection dtype for this forward (float32 on full finetuning without autocast, else None = fp16 path);
+        # read by every Qwen3-MoE RMSNorm that runs after this layer, including the final norm before lm_head.
+        _QWEN3_MOE_BOUNDARY.dtype = (
+            None if torch.is_autocast_enabled(hidden_states.device.type)
+            else _linear_boundary_dtype(self.self_attn, "q_proj")
+        )
         # float32 residual highway (qwen3 embedding is unscaled -> upcast here).
         # No-op when hidden_states is already float32 (layers >= 1).
         residual = hidden_states.to(torch.float32)
@@ -90,6 +133,9 @@ def patch_Qwen3MoeDecoderLayer_float32():
 
         residual = hidden_states  # fp32
         hidden_states = self.post_attention_layernorm(hidden_states)  # -> fp16
+        if not torch.is_autocast_enabled(hidden_states.device.type):
+            # Router / dense MLP weights are float32 on full finetuning; fp16 stays fp16 (identity).
+            hidden_states = _to_boundary_dtype(hidden_states, _linear_boundary_dtype(self.mlp, "gate", "gate_proj"))
         hidden_states = self.mlp(hidden_states)  # MoE / MLP -> fp16
         # Old-transformers sparse MoE blocks return (hidden_states, router_logits);
         # mirror the upstream decoder's unpack.
@@ -100,19 +146,17 @@ def patch_Qwen3MoeDecoderLayer_float32():
     pass
     # force = True: guarantee the residual-float32 forward wins even if a wrapper
     # is pre-installed; the layer is not compiled so this stays eager Python.
-    patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeDecoderLayer, "forward", forward, force = True, match_level = "relaxed")
+    patch_forced_float32(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeDecoderLayer, "forward", forward, force = True, match_level = "relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Qwen3MoeDecoderLayer_float32)
 
 
-# Clamp bound so a large residual never becomes inf on the cast back. Module-level
-# keeps `torch.finfo` out of the graph.
+# Clamp to the fp16 max so a large residual never becomes inf on the cast back; module-level keeps torch.finfo out of the graph.
 _QWEN3_MOE_FP16_MAX = float(torch.finfo(torch.float16).max)
 
 
-# Every Qwen3-MoE RMSNorm shares this one kernel, so its Dynamo cache holds the product
-# of every axis its guards see. A plain Tensor weight view and a rank 2 input drop the
-# width and rank axes, leaving dtype, grad mode and requires_grad.
+# All Qwen3-MoE RMSNorms share this kernel, so Dynamo's cache holds the product of every axis its guards check; a plain
+# Tensor weight view and a rank-2 input drop the width and rank axes, leaving dtype, grad mode and requires_grad.
 def _qwen3_moe_rms_norm(hidden_states_2d, weight_1d, variance_epsilon):
     x_fp32 = hidden_states_2d.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim = True)
@@ -121,13 +165,20 @@ def _qwen3_moe_rms_norm(hidden_states_2d, weight_1d, variance_epsilon):
     return torch.clamp(normed_fp32, min = -_QWEN3_MOE_FP16_MAX, max = _QWEN3_MOE_FP16_MAX).to(torch.float16)
 pass
 
-# Not a bare decorator: under `fullgraph = True` cache exhaustion raises, and only
-# this wrapper latches to eager instead of aborting the run.
+def _qwen3_moe_rms_norm_float32(hidden_states_2d, weight_1d, variance_epsilon):
+    # Full finetuning in float32: the consumers are float32, so no fp16 clamp / cast.
+    x_fp32 = hidden_states_2d.to(torch.float32)
+    variance = x_fp32.pow(2).mean(-1, keepdim = True)
+    return x_fp32 * torch.rsqrt(variance + variance_epsilon) * weight_1d.to(torch.float32)
+pass
+
+# Not a bare decorator: under fullgraph = True cache exhaustion raises, and only this wrapper latches to eager instead of aborting the run.
 _qwen3_moe_rms_norm = compile_with_eager_fallback(_qwen3_moe_rms_norm, "Qwen3MoeRMSNorm.forward")
+_qwen3_moe_rms_norm_float32 = compile_with_eager_fallback(_qwen3_moe_rms_norm_float32, "Qwen3MoeRMSNorm.forward")
 
 
 def patch_Qwen3MoeRMSNorm_float32():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if _skip_or_undo("Qwen3MoeRMSNorm"): return
     try:
         import transformers.models.qwen3_moe.modeling_qwen3_moe
         transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm
@@ -139,30 +190,41 @@ def patch_Qwen3MoeRMSNorm_float32():
         flatten_for_elementwise_norm = flatten_for_elementwise_norm,
         unwrap_norm_weight           = unwrap_norm_weight,
         _qwen3_moe_rms_norm          = _qwen3_moe_rms_norm,
+        _qwen3_moe_rms_norm_float32  = _qwen3_moe_rms_norm_float32,
+        _QWEN3_MOE_BOUNDARY          = _QWEN3_MOE_BOUNDARY,
     )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor: # fp32 (residual) or fp16 (sub-layer)
         # Qwen3 scales by `weight` directly (no 1.0 + weight) with variance_epsilon.
         # `self` stays in eager, so it never reaches the kernel's guards.
         hidden_states_2d, shape = flatten_for_elementwise_norm(hidden_states)
-        normed = _qwen3_moe_rms_norm(
-            hidden_states_2d, unwrap_norm_weight(self.weight), self.variance_epsilon,
-        )
+        kernel = _qwen3_moe_rms_norm
+        if getattr(_QWEN3_MOE_BOUNDARY, "dtype", None) == torch.float32 and not torch.is_autocast_enabled(hidden_states.device.type):
+            kernel = _qwen3_moe_rms_norm_float32
+        normed = kernel(hidden_states_2d, unwrap_norm_weight(self.weight), self.variance_epsilon)
         return normed.reshape(shape)
     pass
-    patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm, "forward", forward, match_level = "relaxed")
+    patch_forced_float32(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeRMSNorm, "forward", forward, match_level = "relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Qwen3MoeRMSNorm_float32)
 
 
 def patch_Qwen3MoeAttention_float32():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if _skip_or_undo("Qwen3MoeAttention"): return
     try:
         import transformers.models.qwen3_moe.modeling_qwen3_moe
         transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention
         from transformers.models.qwen3_moe.modeling_qwen3_moe import apply_rotary_pos_emb, ALL_ATTENTION_FUNCTIONS
     except Exception as e:
         return raise_error("Qwen3MoeAttention.forward", e)
+    # Compiled copies are rebuilt from source and read free names from the modeling module.
+    publish_to_modeling_module(
+        transformers.models.qwen3_moe.modeling_qwen3_moe,
+        _linear_boundary_dtype  = _linear_boundary_dtype,
+        _to_boundary_dtype      = _to_boundary_dtype,
+        _to_forced_output_dtype = _to_forced_output_dtype,
+        _QWEN3_MOE_BOUNDARY     = _QWEN3_MOE_BOUNDARY,
+    )
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
     from .sdpa_gqa import make_gqa_sdpa
     float32_sdpa = make_gqa_sdpa(scaled_dot_product_attention)
@@ -181,6 +243,10 @@ def patch_Qwen3MoeAttention_float32():
         cos, sin = position_embeddings
         cos_fp32 = cos.to(torch.float32)
         sin_fp32 = sin.to(torch.float32)
+
+        if not torch.is_autocast_enabled(hidden_states.device.type):
+            # fp16 norm output meets float32 projections on full finetuning (identity on LoRA).
+            hidden_states = _to_boundary_dtype(hidden_states, _linear_boundary_dtype(self, "q_proj"))
 
         # q/k: fp16 proj -> fp16 q_norm/k_norm (returns fp16) -> float32 -> (b, h, s, d) -> RoPE (float32)
         query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).to(torch.float32).transpose(1, 2)
@@ -262,12 +328,16 @@ def patch_Qwen3MoeAttention_float32():
 
         # (b, q, h, d) -> (b, q, h*d), down-cast to fp16 for o_proj.
         attn_output = attn_output.contiguous().reshape(*input_shape, -1)
-        attn_output = attn_output.to(torch.float16)
+        # Match o_proj's dtype (float32 on full finetuning); autocast, 4bit and unknown weights stay fp16.
+        if torch.is_autocast_enabled(attn_output.device.type):
+            attn_output = attn_output.to(torch.float16)
+        else:
+            attn_output = _to_forced_output_dtype(attn_output, _linear_boundary_dtype(self, "o_proj"))
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
     pass
     # force = True: win over the compiled / dtype-aligned attention forward that
     # unsloth installs (q/k float32 vs v fp16 -> SDPA mismatch otherwise).
-    patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention, "forward", forward, force = True, match_level = "relaxed")
+    patch_forced_float32(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeAttention, "forward", forward, force = True, match_level = "relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Qwen3MoeAttention_float32)

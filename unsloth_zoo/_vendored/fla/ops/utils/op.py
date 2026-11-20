@@ -50,7 +50,7 @@ if IS_NVIDIA_BLACKWELL:
     Track upstream issue at: https://github.com/triton-lang/triton/issues/8695
     """
     @triton.jit
-    def safe_dot(a, b, allow_tf32: tl.constexpr = None):
+    def safe_dot(a, b, allow_tf32: tl.constexpr = None):  # tf32 dots allowed
         return tl.inline_asm_elementwise(
             asm="mov.f32 $0, $1;",
             constraints="=r,r",
@@ -61,7 +61,7 @@ if IS_NVIDIA_BLACKWELL:
         )
 else:
     @triton.jit
-    def safe_dot(a, b, allow_tf32: tl.constexpr = None):
+    def safe_dot(a, b, allow_tf32: tl.constexpr = None):  # tf32 dots allowed
         return tl.dot(a, b, allow_tf32=allow_tf32)
 
 

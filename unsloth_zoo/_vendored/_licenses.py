@@ -97,6 +97,22 @@ vLLM (Gated DeltaNet ReplaySSM decode kernel)
 
   One Triton kernel file (gdn_replayssm_decode.py), with its launch-config lookup
   inlined; see the MANIFEST for the exact change.
+
+--------------------------------------------------------------------------------
+attention-gym (sparse gather attention)
+--------------------------------------------------------------------------------
+  Upstream:  https://github.com/meta-pytorch/attention-gym
+  Commit:    26beb363c6d1328851bfc5c9c8691fa2066bd1fa
+  License:   BSD-3-Clause
+  Copyright: (c) 2023, Driss Guessous; (c) 2025 Meta Platforms, Inc. and affiliates
+  Location:  unsloth_zoo/_vendored/attn_gym/
+  License text + provenance: unsloth_zoo/_vendored/attn_gym/LICENSE and
+                             unsloth_zoo/_vendored/attn_gym/MANIFEST
+                             (also embedded verbatim in the shipped module
+                             unsloth_zoo/_vendored/_licenses.py).
+
+  The Triton closure of gather_attn only (forward + backward, custom ops); the
+  CuTe backend is pruned and the tuner rewritten; see the MANIFEST.
 """
 
 # fla-core snapshot provenance, verbatim from unsloth_zoo/_vendored/fla/MANIFEST.
@@ -229,12 +245,40 @@ modifications =
       on triton 3.4.0, 3.5.1, 3.6.0 and 3.7.1 (torch 2.8.0 to 2.13.0), and on
       3.7.1 the autotuner picks one of those configs, so excluding them there
       cost up to 2.7% of a KDA layer fwd+bwd (B 1, T 8192, H 64, D 128).
+    - Backported fla PR #1242 and the KDA hunk of fla PR #1554 in
+      ops/kda/chunk_intra.py (+ inline "Unsloth: backported from fla PR
+      #1242" / "#1554" comments), safe_gate path only: the 16x16 diagonal
+      blocks anchor on the block's first cumulative gate shifted by a fixed
+      amount (GATE_SHIFT) instead of the middle token's gate, so earlier
+      causal scores never read future gates, and the four safe-gate backward
+      dots use bf16x3 (ieee before Triton 3.6). Without them the safe_gate dg
+      error against an fp32 recurrence is 5e-2 to 2.6e-1 with GLM-5.3-Flash
+      style gates (T 256 to 2048, gates down to the -5 lower bound); with
+      them it is 3e-3 to 5e-3, as safe_gate=False. The safe_gate=False
+      code is unchanged (identical outputs and gradients under the same
+      autotuned configs).
+      unsloth_zoo (temporary_patches/fla_vendor.py) passes safe_gate=True
+      only from GLM-5.3-Flash (glm5_next), whose forget gate is
+      linear_lower_bound * sigmoid(.) with linear_lower_bound in [-5, 0).
     - Backported fla PR #1229 in ops/common/chunk_o.py (+ inline "Unsloth:
       backported from fla PR #1229" comment): on Blackwell the chunk_fwd_kernel_o
       autotune drops its 8-warp BK=BV=128 config, which hits a Triton tl.dot
       recurrence race. Reproduced on B200 with triton 3.7.1: with cu_seqlens and
       48 or 64 value heads the autotuner picks that config, and o differs from
       the dense path by up to 0.08 and between identical runs.
+    - Backported fla PR #1399 (fla issue #1327, triton-lang/triton#10590) in
+      ops/common/chunk_o.py (+ TRITON_ABOVE_3_8_0 in utils/_compat.py and
+      utils/__init__.py): on Blackwell with Triton < 3.8 the
+      chunk_bwd_kernel_dv_local autotune is limited to 2 / 4 warps
+      (BLACKWELL_8_WARP_RACE), since its 8-warp configs race (TMEM read vs
+      zero-fill with no barrier) and give nondeterministic dv. Reproduced on B200
+      with triton 3.7.1 (T=65536, 48 heads, dense: 2 of 19 repeat calls differ at
+      8 warps / 2 or 3 stages; 2 / 4 warps and triton 3.6.0 / 3.8.0 clean). Triton
+      3.8+ and other GPUs keep the full NUM_WARPS list. The chunk_fwd_kernel_o
+      8-warp drop above stays unconditional (not narrowed to Triton < 3.8 as
+      upstream does) until the #1229 repro is re-run on Triton 3.8. ops/utils/cache.py
+      ignores an FLA_CACHE_MODE disk config whose num_warps the kernel's config
+      list no longer offers, so a cached 8-warp entry cannot bring the race back.
     - Sequence start offsets past 2**31 elements (fixed upstream after 0.5.1 by
       fla PR #1329, which forces int64 program ids everywhere). In
       ops/gated_delta_rule/chunk_fwd.py, ops/kda/{chunk_bwd,chunk_intra,
@@ -279,11 +323,66 @@ modifications =
       the causal_conv1d forward / backward autotune keys, signatures and
       launches (neither kernel reads it), so every new 1024-token bucket no
       longer re-tunes and recompiles both kernels.
+    - Backported fla PR #1514 in ops/common/chunk_o.py (inline "Unsloth: backported
+      from fla PR #1514" comments): chunk_bwd_dv, chunk_bwd_dv_local and
+      chunk_bwd_dqkwg take 128-wide K/V tiles on A100-class GPUs (shared memory
+      >= the 'ampere' tier, below 'hopper') when every tensor the wrapper loads is
+      16-bit, and keep 64 otherwise. Measured on a Colab A100-SXM4-40GB (torch
+      2.14.1, triton 3.8.0), Qwen3.5 GDN fwd+bwd, B=1 T=8192 HV=32/64 and packed:
+      chunk_bwd_kernel_dqkwg 952 -> 773 us, layer fwd+bwd 1.04-1.05x; parity vs an
+      fp32 recurrence unchanged. Every other GPU keeps its tile (the branch is not
+      reached on Hopper / Blackwell / Ada / Turing / AMD).
+    - Synced ops/kda/fused_recurrent.py (the KDA decode kernel GLM-5.3-Flash,
+      Kimi-Linear and Kimi K3 reach through transformers'
+      recurrent_kimi_delta_attention) to fla 54ab79ec, minus the API-only
+      #1107 (optional A_log) and #1347 (fla.backends dispatch) hunks, each change
+      marked with an inline "Unsloth: backported from fla PR #..." comment:
+        * PR #1415: BV 32 -> 8 with 1 warp / 3 stages (the gated delta rule
+          decode kernel's config). Upstream, H200 / Triton 3.5: 9-20% lower
+          kernel latency on dense decode shapes (B 1-32, H 16-32, K=V=128).
+          Unsloth gates it by device (_kda_decode_config): A100 measured 5-10%
+          slower at batch 8-128, T4 2-14% faster, so sm8x and ROCm keep BV=32 /
+          4 warps / 2 stages.
+        * PR #1416: dense calls allocate the output with empty_like instead of
+          zeros_like (every row is overwritten); packed calls keep the zero fill.
+          Upstream, H200: 4-26% lower latency on the same shapes.
+        * PR #1329 (this kernel's hunk): int64 program id, so a decode batch
+          past 2**31 / (HV * K * V) sequences no longer overflows the int32
+          state offsets.
+        * PR #1135: mask the g load for K that is not a power of 2.
+        * PR #1571: empty packed sequences write their final state (a copy of
+          h0, or zeros) instead of leaving it uninitialised.
+        * PR #1414: strided state-index tables, per-token states for indexed
+          out-of-place storage, and no state-pool writeback when
+          output_final_state is off (continuous batching only).
+    - Backported fla PR #1582 in ops/gla/chunk.py (chunk_gla_fwd_kernel_o, the
+      output kernel of chunk_kda's forward): the causal mask is applied in the
+      score load instead of a where() after it. Fixes a CUDA "misaligned
+      address" on GB200 / Triton 3.6 (8-warp BK=BV=64 config); upstream measured
+      the output kernel at 68.3 -> 59.5 us (B 1, T 8192, H 16, K=V=128, GB200).
+      Identical arithmetic.
+    - Backported fla PR #996 in ops/backends/__init__.py (+ find_spec_cached in
+      utils/_compat.py and utils/__init__.py): BaseBackend.is_available() caches
+      its package probe. The dispatch loop calls it on every dispatched call, so
+      chunk_kda's forward and its fused WY backward each re-ran an uncached
+      find_spec("flash_kda") (about 50 us of host time each when flash_kda is
+      not installed).
+    - Modified by Unsloth in modules/l2norm.py and modules/fused_norm_gate.py (not
+      upstream as of fla 9d478fa), the same change as the #1388 conv backport above:
+      NB = cdiv(T, 65536) is dropped from the l2norm_{fwd,bwd}_kernel and
+      layer_norm_gated_{fwd,bwd}_kernel autotune keys, signatures and launches
+      (no kernel reads it; zoo's _ReuseBestCache already reuses one config across
+      buckets), so a new 65536-row bucket no longer recompiles them. The three
+      layer_norm_gated kernels also get do_not_specialize=['T'], as upstream has.
     - Modified by Unsloth in ops/utils/cumsum.py (inline "Unsloth:" comment, not
       upstream as of fla 9d478fa): B is dropped from the autotune keys and
       constexpr arguments of the four chunk_{local,global}_cumsum_{scalar,vector}
       kernels (none reads it; the grid carries B * H), so padded batches no
       longer re-tune and recompile per batch size.
+    - Modified by Unsloth in ops/common/chunk_o.py (inline "Unsloth:" comment, not
+      upstream as of fla 9d478fa): chunk_bwd_kernel_dqkwg takes B as a runtime
+      argument in do_not_specialize (it only feeds the dg offset B * T), so the
+      GDN / KDA backward no longer compiles one variant per batch size.
     - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
       reference implementation is unused on the fast path).
     - Dropped the three heavy tilelang kernel files
@@ -531,7 +630,8 @@ modifications =
       "Modified by Unsloth": the launch-config lookup imported from
       vllm.model_executor.layers.mamba.ops.replayssm_config is inlined (released
       vLLM has no "gdn_decode" entry), with the same values as the PR plus a
-      T4 (sm75) entry (32, 1, 1, 4) and a per-device cache, and the kernel
+      T4 (sm75) entry (32, 1, 1, 4) and a per-device cache, a table nk is
+      clamped so BK // nk stays >= 16 for small key dims, and the kernel
       imports triton directly instead of vllm.triton_utils.
     - The runtime integration (state page, metadata builder, layer dispatch) is
       Unsloth's own code in unsloth_zoo/vllm_gdn_replayssm.py, ported from the
@@ -542,4 +642,101 @@ file_count = 1 python module + __init__.py + this MANIFEST + LICENSE
 vendored_by = Unsloth (unsloth_zoo/_vendored/vllm)
 """
 
-__all__ = ["FLA_LICENSE", "NOTICE", "FLA_MANIFEST", "VLLM_LICENSE", "VLLM_MANIFEST"]
+# attention-gym upstream license, verbatim from unsloth_zoo/_vendored/attn_gym/LICENSE.
+ATTN_GYM_LICENSE = """BSD 3-Clause License
+
+Copyright (c) 2023, Driss Guessous
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+"""
+
+# attention-gym snapshot provenance, verbatim from unsloth_zoo/_vendored/attn_gym/MANIFEST.
+ATTN_GYM_MANIFEST = """name = attention-gym (attn_gym)
+commit = 26beb363c6d1328851bfc5c9c8691fa2066bd1fa
+upstream = https://github.com/meta-pytorch/attention-gym
+license = BSD-3-Clause
+license_file = LICENSE
+copyright = Copyright (c) 2023, Driss Guessous; Copyright (c) 2025 Meta Platforms, Inc. and affiliates
+
+description =
+    The sparse gather-attention operator of attention-gym (attn_gym/sparse/
+    gather_attn): one softmax over a causal local window plus explicitly indexed
+    KV rows, a single shared KV head, an optional per-head attention sink, Triton
+    forward and backward kernels registered as torch.library custom ops with fake
+    implementations. unsloth_zoo.sparse_attention runs DeepSeek-V4.1 index-gather
+    attention and Qwen3.8-Flash-Next QSA attention on it for training.
+
+exported_api =
+    attn_gym.sparse.gather_attn.gather_attn
+    attn_gym.sparse.gather_attn.RopePair
+    attn_gym.sparse.gather_attn.AuxRequest
+
+modifications =
+    - Only the Triton closure of gather_attn is vendored: types.py, _cu_seqlens.py,
+      _backends/triton/{utils,tune}.py, sparse/gather_attn/{api,impl/__init__,
+      impl/ops,impl/reference,impl/triton/*}.py. Pruned: the CuTe backend
+      (impl/cute.py, impl/packed_kv.py, impl/indices.py, _backends/cute/*; they
+      need cutlass-dsl and tvm_ffi), the lightning indexer and every other
+      attention family. Files keep their upstream text except the changes below,
+      each marked "Modified by Unsloth".
+    - Absolute "attn_gym." imports are package-absolute
+      "unsloth_zoo._vendored.attn_gym." imports, so nothing is injected into
+      sys.modules and a user's own attention-gym install is untouched.
+    - impl/ops.py: the custom-op namespace attn_gym:: is unsloth_attn_gym::, so a
+      real attention-gym imported in the same process cannot define the same
+      operators twice.
+    - sparse/gather_attn/api.py: _select_backend always returns "triton" (CuTe is
+      not vendored).
+    - _backends/triton/tune.py is rewritten: upstream TritonTuner delegates to the
+      CuTe run_tunable machinery (on-disk winner cache, parallel compile). The
+      vendored TritonTuner keeps the interface (configs, key, prune, reset) and
+      times the surviving candidates in process with triton.testing.do_bench on
+      the first launch per key, restoring mutated outputs through reset, and
+      memoizes the winner; UNSLOTH_ATTN_GYM_AUTOTUNE=0 pins the first candidate
+      that launches. An untimed selection's launch is the call's launch (no second
+      launch on a cold key).
+    - Python 3.9 (unsloth_zoo requires-python >= 3.9): "from __future__ import
+      annotations" added to types.py, _backends/triton/utils.py,
+      sparse/gather_attn/impl/{__init__,ops,reference}.py and
+      impl/triton/{backward,forward,primitives}.py; the runtime aliases
+      AttentionInput (api.py) and Grid (tune.py) use typing.Union; the
+      dataclass(slots=True) in api.py and types.py passes slots only on 3.10+.
+      The Triton kernel modules need triton >= 3.5 (no Python 3.9 wheels): where
+      gather_attn cannot be imported, unsloth_zoo.sparse_attention never selects
+      it.
+    - Relative imports whose target is a package or a dotted submodule are
+      spelled absolutely (sparse/__init__.py: gather_attn; gather_attn/api.py:
+      impl; gather_attn/impl/ops.py: triton.backward, triton.forward), because
+      transformers' custom_object_save opens relative-import targets as files.
+    - __init__.py, sparse/__init__.py and sparse/gather_attn/__init__.py are
+      narrowed to the vendored closure.
+
+file_count = 18 python modules + this MANIFEST + LICENSE
+
+vendored_by = Unsloth (unsloth_zoo/_vendored/attn_gym)
+"""
+
+__all__ = ["FLA_LICENSE", "NOTICE", "FLA_MANIFEST", "VLLM_LICENSE", "VLLM_MANIFEST", "ATTN_GYM_LICENSE", "ATTN_GYM_MANIFEST"]

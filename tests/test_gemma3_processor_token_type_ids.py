@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Patched Gemma3Processor.__call__ must mark the 256 image soft tokens (not the BOI token) in token_type_ids,
-or Gemma3 loses bidirectional attention over the image (transformers >= 5.15)."""
+"""Tests the patched Gemma3Processor marks the 256 image soft tokens (not the BOI token) in token_type_ids; otherwise
+Gemma3 loses bidirectional attention over the image (transformers >= 5.15)."""
 import pytest
 
 pytest.importorskip("transformers")

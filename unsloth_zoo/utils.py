@@ -38,6 +38,64 @@ import re
 import pathlib
 from typing import Optional
 from filelock import FileLock
+import ast
+import inspect
+import linecache
+import sys
+
+# file -> (linecache lines, {qualname: 0-based line}); valid while linecache keeps the same list.
+_CLASS_LINES = {}
+
+
+def _class_lines(lines):
+    # Same walk and first-match-wins as inspect._ClassFinder (identical on 3.9 - 3.12).
+    found = {}
+    stack = []
+
+    def visit(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                stack.extend((child.name, "<locals>"))
+                visit(child)
+                del stack[-2:]
+            elif isinstance(child, ast.ClassDef):
+                stack.append(child.name)
+                first = child.decorator_list[0] if child.decorator_list else child
+                found.setdefault(".".join(stack), first.lineno - 1)
+                visit(child)
+                stack.pop()
+            else:
+                visit(child)
+
+    visit(ast.parse("".join(lines)))
+    return found
+
+
+def _class_source(cls):
+    """inspect.getsource(cls), parsing each module once instead of per class on Python < 3.13."""
+    if sys.version_info >= (3, 13) or not isinstance(cls, type) or hasattr(cls, "__wrapped__"):
+        return inspect.getsource(cls)
+    try:
+        file = inspect.getsourcefile(cls)
+        if not file:
+            return inspect.getsource(cls)
+        linecache.checkcache(file)
+        module = inspect.getmodule(cls, file)
+        lines = linecache.getlines(file, module.__dict__ if module else None)
+        entry = _CLASS_LINES.get(file)
+        if entry is None or entry[0] is not lines:
+            entry = _CLASS_LINES[file] = (lines, _class_lines(lines))
+        lnum = entry[1].get(cls.__qualname__)
+    except Exception:
+        lnum = None
+    if lnum is None:
+        return inspect.getsource(cls)
+    return "".join(inspect.getblock(lines[lnum:]))
+
+# Precompiled: torch 2.11 Dynamo tracing re.match through re._compile corrupts Python's regex cache.
+_PACKAGE_NAME_RE = re.compile(r'^[A-Za-z](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$')
+_VERSION_NUMBER_RE = re.compile(r"[0-9]+(?:\.[0-9]+)*")
+
 
 def Version(version):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -51,7 +109,7 @@ def Version(version):
         if isinstance(version, str):
             # Treat as a package name (e.g. "trl") if it matches the pattern,
             # else as a literal version string.
-            if re.match(r'^[A-Za-z](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$', version):
+            if _PACKAGE_NAME_RE.match(version):
                 try:
                     raw = importlib_version(version)
                     package_name = version
@@ -80,10 +138,10 @@ def Version(version):
                 pass
 
         # First try matching from the start, then search anywhere in the string.
-        match = re.match(r"[0-9]+(?:\.[0-9]+)*", raw)
+        match = _VERSION_NUMBER_RE.match(raw)
         match_at_start = match is not None
         if match is None:
-            match = re.search(r"[0-9]+(?:\.[0-9]+)*", raw)
+            match = _VERSION_NUMBER_RE.search(raw)
             match_at_start = False
         if match is None:
             raise ValueError(f"Invalid version format: {raw}")
@@ -99,7 +157,6 @@ def Version(version):
             f"Unsloth: Could not get version for `{version}`\n"\
             f"File name = [{caller.filename}] Line number = [{caller.lineno}]"
         )
-    pass
 pass
 
 

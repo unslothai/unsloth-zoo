@@ -32,11 +32,9 @@ def _load_module():
 
 @pytest.fixture(autouse = True)
 def _trust_ambient_tmp_ancestors(tmp_path_factory, monkeypatch):
-    """Make dirs at/above pytest's basetemp look owner-only + sticky so the
-    full-chain walk in ``_is_trusted_directory`` depends only on the dirs each
-    test builds under ``tmp_path``. Without this the suite is non-hermetic: a
-    group-writable, non-sticky temp root (common on shared CI runners) rejects
-    every path and turns the accept-side tests red for the wrong reason."""
+    """Makes dirs at and above pytest's basetemp owner-only and sticky so _is_trusted_directory depends only on each
+    test's tmp_path; otherwise a group-writable, non-sticky temp root on shared CI rejects every path and fails the
+    accept-side tests for the wrong reason"""
     if os.name != "posix":
         yield
         return
@@ -375,8 +373,7 @@ def test_megacache_refuses_a_fifo_bundle_without_blocking(tmp_path):
     fifo = tmp_path / "bundle.fifo"
     os.mkfifo(fifo)
     os.chmod(fifo, 0o600)
-    # O_NONBLOCK keeps the open from hanging on a writerless FIFO, so the S_ISREG
-    # check can refuse this non-regular file.
+    # O_NONBLOCK stops the open hanging on a writerless FIFO, so the S_ISREG check can refuse this non-regular file
     assert module._read_trusted_file(fifo, binary = True) is None
 
 

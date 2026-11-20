@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import sys
 
+import numpy as np
 import pytest
 
 
@@ -78,10 +79,8 @@ def test_single_simd_forward_preserves_each_row(dtype, finalize):
 def test_automatic_chunks_reduce_backward_peak(frozen, dim):
     _skip_torch_shim()
     if not mx.metal.is_available():
-        # Both halves need Metal: the peak assertion needs Metal memory accounting, and
-        # off-Metal the bf16 LSE accumulates at the logits dtype (the float32 cast in
-        # _forward_chunked_fused_finalize is gated on label smoothing), so the loss moves
-        # with the chunk size and the two plans do not agree.
+        # Both halves need Metal: peaks need Metal memory accounting, and off Metal bf16 LSE accumulates at logits dtype
+        # (float32 cast gated on label smoothing), so loss tracks chunk size.
         pytest.skip("requires Metal memory accounting")
     import gc
     from unsloth_zoo.mlx.cce import _get_runtime_cce
@@ -107,11 +106,8 @@ def test_automatic_chunks_reduce_backward_peak(frozen, dim):
     for left, right in pairs:
         assert mx.allclose(left, right, atol=2e-5, rtol=0.02).item()
     del expected, actual, left, right, pairs
-    # Only a frozen head is admitted at these shapes, so for the other two the automatic
-    # arm resolves to 2048 and both arms run the identical plan. Comparing their peaks
-    # then measures allocator noise and nothing else: on a macos-15 M1 the [False-1024]
-    # pair, byte-identical work, came back 212941388 against 203504192 and failed. The
-    # numerics above are the whole of what those cells can assert.
+    # Only a frozen head is admitted at these shapes, so the other cells run identical plans; comparing their peaks
+    # measures allocator noise (it failed on macos-15); assert numerics only.
     assert plans[0] == 2048
     if plans[1] == plans[0]:
         assert not frozen
@@ -127,22 +123,14 @@ def test_automatic_chunks_reduce_backward_peak(frozen, dim):
         mx.eval(result)
         peaks.append(mx.get_peak_memory() - resident)
         del result
-    # Reached only when the promotion actually changed the plan, which is the frozen
-    # head. There the wider chunk is supposed to pay for itself, so require a strict
-    # drop rather than a tie.
+    # Reached only when promotion changed the plan (frozen head); there the wider chunk must pay for itself, so require a strict peak drop, not a tie.
     assert plans[1] == 4096 and frozen
     assert peaks[1] < peaks[0]
 
 
 def test_a_trainable_bfloat16_head_is_not_promoted_to_the_wide_chunk():
-    """The promotion rule itself, as integers.
-
-    The peak assertions above can only discriminate on hardware where the promoted
-    plan is actually worse, which so far is one runner, and they skip entirely off
-    Metal. The rule is a pure integer predicate, so pin it directly: at these shapes
-    a frozen head takes the wide chunk and a trainable bfloat16 head must not, on
-    every device.
-    """
+    """Pins the promotion rule as a pure integer predicate, since peak asserts only discriminate on Metal: a frozen head
+    takes the wide chunk, a trainable bfloat16 head must not."""
     _skip_torch_shim()
     import unsloth_zoo.mlx.cce.runtime_cce as runtime_cce_module
     from unsloth_zoo.mlx.cce import _get_runtime_cce, clear_cce_cache
@@ -151,8 +139,7 @@ def test_a_trainable_bfloat16_head_is_not_promoted_to_the_wide_chunk():
     weight = mx.zeros((16384, 512), dtype=mx.bfloat16)
     saved_budget = runtime_cce_module._CHUNK_BUDGET
     try:
-        # Every budget _get_memory_budget can return, from its 4 MB floor (smallest
-        # supported device) to its 128 MB cap. The answer must not depend on which.
+        # Sweeps every budget _get_memory_budget can return, from its 4 MB floor to its 128 MB cap; the answer must not depend on which one.
         for budget_mib in (4, 6, 12, 27, 103, 128):
             runtime_cce_module._CHUNK_BUDGET = budget_mib * 1024 * 1024
             clear_cce_cache()
@@ -167,9 +154,8 @@ def test_a_trainable_bfloat16_head_is_not_promoted_to_the_wide_chunk():
                 plans[frozen] = runtime._unsloth_get_chunk_plan(hidden, weight)[0]
             assert plans == {True: 4096, False: 2048}, (budget_mib, plans)
 
-            # Label smoothing never promotes, at any shape the unsmoothed path would.
-            # It routes to _fallback_dlogits, whose float32 intermediates the bound
-            # underestimates by 3-4x, so a wider chunk there is unbounded in practice.
+            # Label smoothing never promotes, at any shape the unsmoothed path would; it routes to _fallback_dlogits,
+            # whose float32 intermediates the bound underestimates 3-4x.
             for frozen in (True, False):
                 for n_tokens in (256, 512, 1024):
                     smoothed = _get_runtime_cce(
@@ -206,8 +192,7 @@ def test_runtime_cce_zero_tokens_with_non_empty_targets_raises():
 
 
 def test_runtime_cce_int64_wrap_to_ignore_index_poisons_gradients():
-    # Wide labels (e.g. 2**32-100) narrow to -100 in int32; backward must
-    # propagate NaN from the poisoned lse instead of zeroing the gradient.
+    # Wide labels (e.g. 2**32-100) narrow to -100 in int32; backward must propagate NaN from the poisoned lse rather than zero the gradient.
     _skip_torch_shim()
     from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
 
@@ -407,8 +392,7 @@ def test_runtime_cce_invalid_labels_poison_loss_and_gradients(bad_target):
 
     assert math.isnan(loss.item())
     assert math.isnan(grad_norm.item())
-    # Per-row check: only the invalid row's grad_hidden goes NaN. Otherwise
-    # a leak into valid rows would be masked by grad_weight's NaN in grad_norm.
+    # Per-row check: only the invalid row's grad_hidden goes NaN, since grad_weight's NaN in grad_norm would otherwise mask a leak into valid rows.
     grad_hidden_rows = mx.sum(mx.abs(grad_hidden).astype(mx.float32), axis=1)
     mx.eval(grad_hidden_rows)
     assert math.isfinite(grad_hidden_rows[0].item()), "valid row must have finite grad_hidden"
@@ -784,9 +768,8 @@ def test_trainable_head_orders_weight_gradient_only_when_d_logits_are_larger():
 def test_frozen_head_gradient_is_built_in_the_forward(monkeypatch, quantized, softcap):
     _skip_torch_shim()
     if not mx.metal.is_available():
-        # precompute_hidden_gradient is admitted only when the Metal kernels exist, so
-        # off Metal the loss-only path is returned and `calls == [1]` fails rather than
-        # skips. The silent fallback is the documented contract, not a defect.
+        # precompute_hidden_gradient is admitted only with Metal kernels; off Metal the loss-only path is returned, so
+        # calls == [1] would fail; the silent fallback is documented, not a defect.
         pytest.skip("requires Metal kernels")
     from unsloth_zoo.mlx.cce import runtime_cce
 
@@ -829,15 +812,8 @@ def test_frozen_head_gradient_is_built_in_the_forward(monkeypatch, quantized, so
 
 @pytest.mark.parametrize("frozen", [False, True])
 def test_vlm_cce_passes_a_frozen_dense_head_to_the_runtime_cce(monkeypatch, frozen):
-    """The dense VLM loss must tell the runtime whether the head is trainable.
-
-    This lives here rather than beside the other VLM tests because that file runs on
-    the torch shim, whose Module.freeze/unfreeze are `return self` no-ops
-    (tests/mlx_simulation/mlx_nn_stub.py). Under the shim trainable_parameters() still
-    reports lm_head.weight, so the freeze below cannot be read back and the frozen case
-    can never be observed. Real MLX runs the whole chain: freeze -> trainable_parameters
-    -> _is_lm_head_trainable -> _skip_weight_grad -> weight_is_frozen.
-    """
+    """Dense VLM loss must pass head trainability to the runtime; shim freeze/unfreeze are no-ops, so only real MLX can
+    check the freeze chain down to weight_is_frozen."""
     _skip_torch_shim()
     from unsloth_zoo.mlx import utils as U
 
@@ -869,18 +845,16 @@ def test_vlm_cce_passes_a_frozen_dense_head_to_the_runtime_cce(monkeypatch, froz
         model.language_model.model.proj = adapter
         model.freeze()
         adapter.unfreeze(keys=["lora_a", "lora_b"])
-    # The derivation is left real. Pinning it here would only re-assert the literal
-    # `frozen` and would stop the nested `language_model.lm_head` head-prefix
-    # resolution from being covered at all.
+    # Derivation is left real rather than pinned: pinning would re-assert the literal frozen and stop nested
+    # language_model.lm_head prefix resolution being covered.
     assert U._is_lm_head_trainable(model) is (not frozen)
 
     factories = []
     monkeypatch.setattr(U, "_get_runtime_cce", lambda **kwargs: factories.append(kwargs))
     U.make_vlm_cce_loss_fn(model)
     assert {kwargs.get("weight_is_frozen") for kwargs in factories} == {frozen}
-    # A frozen head also builds the training-mode runtime that precomputes the hidden
-    # gradient, which is this PR's actual optimisation. Ordered, not collapsed to a set:
-    # a bare set would still pass with the training arm deleted outright.
+    # A frozen head also builds the training-mode runtime that precomputes the hidden gradient; assert an ordered list,
+    # since a bare set would pass with that arm deleted.
     assert [kwargs.get("precompute_hidden_gradient") for kwargs in factories] == (
         [None, True] if frozen else [None]
     )
@@ -922,8 +896,7 @@ def test_finite_logits_past_the_cap_match_the_saturated_loss(dtype, ratio):
         pytest.skip("requires Metal kernels")
     from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
 
-    # Finite logits: even classes at ratio * cap, odd classes at 0. Near 44 fast::tanh
-    # returns 0 (a finite, wrong loss) and past about 44.4 it returns NaN.
+    # Finite logits: even classes at ratio * cap, odd at 0; near 44 fast::tanh returns 0 (a finite, wrong loss) and past about 44.4 it returns NaN.
     cap, rows, dim, vocab = 9.0, 64, 128, 8192
     hidden = mx.ones((rows, dim), dtype=dtype)
     even = (mx.arange(vocab) % 2 == 0)[:, None]
@@ -1013,8 +986,7 @@ def test_smoothed_finite_logits_past_the_cap_match_the_saturated_loss(ratio):
         pytest.skip("requires Metal kernels")
     from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
 
-    # The smoothing kernels cap their own logits, so they need the same saturation
-    # the eps=0 kernels use: raw fast::tanh gives 576.70 here at 44.2 and NaN at 60.
+    # Smoothing kernels cap their own logits and need the same saturation as the eps=0 kernels; raw fast::tanh gives 576.70 at 44.2 and NaN at 60.
     cap, eps, rows, dim, vocab = 9.0, 0.1, 64, 128, 8192
     hidden = mx.ones((rows, dim), dtype=mx.float32)
     even = (mx.arange(vocab) % 2 == 0)[:, None]
@@ -1030,6 +1002,71 @@ def test_smoothed_finite_logits_past_the_cap_match_the_saturated_loss(ratio):
     lse = math.log(vocab / 2 * (1.0 + math.exp(-cap))) + cap
     expected = rows * (lse - (1 - eps) * cap - eps * (cap / 2))
     assert losses.item() == pytest.approx(expected, rel=1e-4)
+
+
+@pytest.mark.parametrize("kind, dtype, rows", [
+    ("trainable", mx.float32, 64),
+    ("trainable", mx.bfloat16, 256),  # the single-SIMD forward
+    ("frozen", mx.float32, 64),
+    ("quantized", mx.float32, 64),
+    ("lora", mx.float32, 64),
+    ("fallback", mx.float32, 64),
+])
+def test_confident_rows_keep_their_loss_and_gradient(monkeypatch, kind, dtype, rows):
+    _skip_torch_shim()
+    if kind != "fallback" and not mx.metal.is_available():
+        pytest.skip("requires Metal kernels")
+    from unsloth_zoo.mlx.cce import runtime_cce
+
+    # Logits near 20, so fp32 spacing rounds lse - z_t to 0 past ~14 nats of margin.
+    vocab, margins = 1024, (-20.0, -5.0, 0.0, 5.0, 10.0, 14.0, 17.0, 25.0, 40.0, 60.0)
+    rng = np.random.default_rng(0)
+    logits = rng.standard_normal((rows, vocab)) * 2.0 + 20.0
+    targets = np.arange(rows) * 131 % vocab
+    for row, target in enumerate(targets):
+        others = np.delete(logits[row], target)
+        logits[row, target] = np.logaddexp.reduce(others) + margins[row % len(margins)]
+    targets[-1] = -100
+    hidden = mx.array(logits.astype(np.float32)).astype(dtype)
+    targets = mx.array(targets.astype(np.int32))
+    weight = mx.eye(vocab, dtype=dtype)
+    head = (weight,)
+    if kind == "fallback":
+        monkeypatch.setattr(runtime_cce, "_build_kernel_set", lambda *args, **kwargs: (None,) * 3)
+    if kind == "lora":
+        lora = runtime_cce.make_lora_head_cce(chunk_size=256)
+        adapter = (mx.zeros((rows, 4), dtype=dtype), mx.zeros((4, vocab), dtype=dtype), None)
+        call = lambda h: lora(h, weight, None, None, *adapter, targets)
+    else:
+        if kind == "quantized":
+            head = mx.quantize(weight, group_size=64, bits=8)
+        runtime, _ = runtime_cce.make_chunked_cross_entropy_loss(
+            chunk_size=256, quantized=kind == "quantized",
+            group_size=64 if kind == "quantized" else None, bits=8 if kind == "quantized" else None,
+            weight_is_frozen=kind != "trainable", precompute_hidden_gradient=kind == "frozen",
+        )
+        call = lambda h: runtime(h, *head, targets)
+    losses = np.array(call(hidden), dtype=np.float64)
+    grad = np.array(mx.grad(lambda h: call(h).sum())(hidden).astype(mx.float32), dtype=np.float64)
+
+    head64 = np.array((mx.dequantize(*head, group_size=64, bits=8) if kind == "quantized" else weight)
+                      .astype(mx.float32), dtype=np.float64)
+    z = np.array(hidden.astype(mx.float32), dtype=np.float64) @ head64.T
+    scored, safe = np.arange(rows - 1), np.array(targets)[:-1]
+    z, z_t = z[:-1], z[:-1][scored, safe]
+    others = z.copy()
+    others[scored, safe] = -np.inf
+    lse_others = np.logaddexp.reduce(others, axis=1)
+    expected = np.logaddexp(0.0, lse_others - z_t)
+    expected_dz = np.exp(z - np.logaddexp(lse_others, z_t)[:, None])
+    expected_dz[scored, safe] = np.expm1(-expected)
+    expected_grad = expected_dz @ head64
+
+    assert losses[-1] == 0 and not grad[-1].any()
+    assert np.max(np.abs(losses[:-1] - expected) / expected) < 1e-4
+    error = np.linalg.norm(grad[:-1] - expected_grad, axis=1) / np.linalg.norm(expected_grad, axis=1)
+    # A bfloat16 hidden gradient carries bfloat16 rounding.
+    assert error.max() < (1e-2 if dtype == mx.bfloat16 else 1e-4)
 
 
 @pytest.mark.parametrize("quantized", [False, True])

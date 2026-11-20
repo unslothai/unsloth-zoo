@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Under DeepSpeed the efficient GRPO backward multiplies grad_output by upstream_scale to undo
-the 1/GAS Trainer.training_step put on the loss. It must only undo a division that happened:
-transformers >= 5.19 skips it when the trainer declares loss_is_scaled_for_ga = True (TRL >= 1.15
-GRPO), and multiplying by GAS anyway scaled every gradient up GAS times (grad_norm 4x at GAS 4)."""
+"""Under DeepSpeed, upstream_scale must undo the 1/GAS division only when it happened: transformers >= 5.19 skips it if
+loss_is_scaled_for_ga is True (TRL >= 1.15), otherwise multiplying by GAS scales grads up GAS times."""
 import inspect
 import types
 
@@ -26,6 +24,13 @@ import torch
 import transformers
 
 import unsloth_zoo.rl_replacements as _rl
+
+
+@pytest.fixture(autouse = True)
+def _log_prob_route(monkeypatch):
+    # These stub UnslothEfficientGRPO, the log-prob route; test_grpo_fused_route.py covers the forward-gradient one.
+    import unsloth_zoo.fused_losses.fused_grpo as _fused_grpo
+    monkeypatch.setattr(_fused_grpo, "GRPO_FWD_GRAD", False)
 
 HIDDEN, VOCAB, GAS = 4, 8, 4
 INPUT_IDS = torch.tensor([[1, 2, 3, 4, 5], [1, 2, 6, 7, 3]])

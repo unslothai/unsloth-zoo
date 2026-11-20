@@ -1,8 +1,5 @@
-"""torchvision.io.read_video passes av.open(..., metadata_errors=...), which PyAV 19 removed.
-
-_read_video_torchvision is both a primary backend and fetch_video's last resort, so on
-PyAV 19 video input stopped working unless decord or torchcodec happened to succeed.
-"""
+"""PyAV 19 removed the metadata_errors kwarg that torchvision.io.read_video passes to av.open; _read_video_torchvision
+is both a primary backend and last resort, so video broke."""
 
 import pytest
 
@@ -38,7 +35,7 @@ def _torchvision_rejects_the_keyword(monkeypatch):
     def read_video(*args, **kwargs):
         raise TypeError(PYAV_19_ERROR)
 
-    monkeypatch.setattr(vision_utils.io, "read_video", read_video)
+    monkeypatch.setattr(vision_utils.io, "read_video", read_video, raising = False)
 
 
 def test_a_pyav_19_torchvision_read_falls_back_to_pyav(monkeypatch, clip):
@@ -61,7 +58,7 @@ def test_an_unrelated_type_error_still_propagates(monkeypatch, clip):
     def read_video(*args, **kwargs):
         raise TypeError("expected str, bytes or os.PathLike object")
 
-    monkeypatch.setattr(vision_utils.io, "read_video", read_video)
+    monkeypatch.setattr(vision_utils.io, "read_video", read_video, raising = False)
     with pytest.raises(TypeError, match = "PathLike"):
         vision_utils._read_video_torchvision({"video": clip})
 

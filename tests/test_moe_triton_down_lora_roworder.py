@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The second grouped GEMM runs permute_y=True, so its output is in token order
-while the down-LoRA delta stays expert-sorted: without scattering the delta
-through gather_indices the LoRA rows land on the wrong tokens.
-"""
+"""Down-LoRA row order: the second grouped GEMM uses permute_y=True (token order); the expert-sorted LoRA delta must be
+scattered through gather_indices or rows land on wrong tokens."""
 
 import sys
 import types
@@ -41,10 +39,7 @@ def _reference_grouped_gemm(
     permute_y=False,
     **kwargs,
 ):
-    """Pure-torch grouped GEMM implementing the documented permute semantics:
-    ``permute_x`` gathers token-order rows into expert-sorted order, ``permute_y``
-    scatters the expert-sorted output back to token order.
-    """
+    """Pure-torch reference grouped GEMM: permute_x gathers token-order rows into expert-sorted order, permute_y scatters the sorted output back to token order."""
     if permute_x:
         X = X[gather_indices // topk]
     outputs, start = [], 0
@@ -121,11 +116,13 @@ def _setup(monkeypatch):
     _install_fake_unsloth_kernels(monkeypatch)
     monkeypatch.setattr(moe_utils, "native_moe_grouped_mm", moe_utils._manual_grouped_mm)
 
-    num_experts, hidden, intermediate, rank = 4, 16, 12, 4
+    num_experts, hidden, intermediate, rank = 4, 16, 16, 4
     num_tokens, top_k = 8, 2
 
     torch.manual_seed(0)
     experts = _build_experts(num_experts, hidden, intermediate)
+    # Dims must be multiples of 16, else forward_triton_grouped_gemm routes to the native fallback (ref 2057) and these row-order tests stop reaching Triton.
+    assert moe_utils._triton_grouped_gemm_dims_supported(experts, hidden)
     first = torch.randn(num_experts, intermediate, rank)
     second = torch.randn(num_experts, rank, hidden)
     scaling = 0.5

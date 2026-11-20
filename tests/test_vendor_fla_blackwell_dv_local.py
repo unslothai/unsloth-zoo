@@ -49,7 +49,7 @@ def _autotuner(fn):
 def test_dv_local_warps_follow_the_race_guard():
     chunk_o = _load_chunk_o()
     warps = {c.num_warps for c in _autotuner(chunk_o.chunk_bwd_kernel_dv_local).configs}
-    race = chunk_o.IS_NVIDIA_BLACKWELL and not chunk_o.TRITON_ABOVE_3_8_0
+    race = (chunk_o.IS_NVIDIA_BLACKWELL or chunk_o._any_visible_blackwell()) and not chunk_o.TRITON_ABOVE_3_8_0
     assert chunk_o.BLACKWELL_8_WARP_RACE == race
     assert warps == set(chunk_o.CHUNK_BWD_DV_LOCAL_NUM_WARPS)
     if race:
@@ -91,3 +91,50 @@ def test_every_dv_local_config_is_deterministic(varlen):
         tuner.configs = configs
         tuner.cache.clear()
     assert not bad, f"nondeterministic dv_local configs (warps, stages, differing calls of 19): {bad}"
+
+
+def _guard_warps(capabilities, import_index, triton_above_3_8_0 = False):
+    # Run chunk_o.py's own module-level guard with a fake torch whose devices have ``capabilities``
+    # and whose import-time current device is ``import_index``: no CUDA or fla import needed.
+    import ast
+    import pathlib
+    import types
+
+    import unsloth_zoo
+    src = pathlib.Path(unsloth_zoo.__file__).parent / "_vendored" / "fla" / "ops" / "common" / "chunk_o.py"
+    tree = ast.parse(src.read_text())
+    body = []
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        body.append(node)
+        if isinstance(node, ast.Assign) and any(
+            getattr(t, "id", None) == "CHUNK_BWD_DV_LOCAL_NUM_WARPS" for t in node.targets
+        ):
+            break
+    cuda = types.SimpleNamespace(
+        is_available = lambda: True,
+        device_count = lambda: len(capabilities),
+        current_device = lambda: import_index,
+        get_device_capability = lambda i = None: capabilities[import_index if i is None else i],
+    )
+    ns = {
+        "torch": types.SimpleNamespace(cuda = cuda, version = types.SimpleNamespace(hip = None)),
+        "functools": __import__("functools"),
+        "check_shared_mem": lambda *a, **k: True,
+        "IS_NVIDIA": True,
+        "IS_NVIDIA_HOPPER": capabilities[import_index][0] == 9,
+        "IS_NVIDIA_BLACKWELL": capabilities[import_index][0] in (10, 12),
+        "TRITON_ABOVE_3_8_0": triton_above_3_8_0,
+    }
+    exec(compile(ast.Module(body = body, type_ignores = []), str(src), "exec"), ns)
+    return ns["CHUNK_BWD_DV_LOCAL_NUM_WARPS"]
+
+
+@pytest.mark.parametrize("import_index", [0, 1], ids = ["imported_on_ampere", "imported_on_blackwell"])
+def test_dv_local_guard_covers_a_blackwell_card_that_was_not_current_at_import(import_index):
+    # The autotune configs (and the autotune cache) are shared by every device in the process, so a
+    # Blackwell card anywhere in it must keep 8 warps out, whichever card was current at import.
+    assert 8 not in _guard_warps([(8, 0), (10, 0)], import_index)
+    assert 8 in _guard_warps([(8, 0), (10, 0)], import_index, triton_above_3_8_0 = True)
+    assert 8 in _guard_warps([(8, 0), (8, 9)], import_index)

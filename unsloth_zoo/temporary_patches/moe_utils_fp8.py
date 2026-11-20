@@ -136,9 +136,8 @@ def _slice_fp8_quant_state(weight: torch.Tensor, quant_state, expert_idx: int):
     return sliced
 
 
-# Triton refuses to compile a kernel that builds a tensor larger than this, so a
-# BLOCK_SIZE x BLOCK_SIZE tile is only legal up to BLOCK_SIZE = 1024. Fallback
-# only: _triton_max_tensor_numel() below prefers Triton's own value.
+# Triton refuses tensors above this numel, so a BLOCK_SIZE x BLOCK_SIZE tile is only legal up to BLOCK_SIZE = 1024;
+# fallback only, _triton_max_tensor_numel() prefers Triton's own value.
 _TRITON_MAX_TENSOR_NUMEL = 1048576
 
 _TRITON_MAX_TENSOR_NUMEL_RESOLVED = None
@@ -352,20 +351,13 @@ def _dequantize_full_expert_weights_unsloth(weight, scale, target_dtype):
         # weight_dequant_block uses a single BLOCK_SIZE; fall through to caller.
         return None
     if bm * bn > _triton_max_tensor_numel():
-        # The kernel materialises a BLOCK_SIZE x BLOCK_SIZE tile, so a coarse
-        # scale makes the tile larger than any Triton tensor may be and the
-        # launch fails to compile. A per-expert per-tensor scale (p == q == 1)
-        # derives BLOCK_SIZE = M, which is how
-        # mistralai/Mistral-Small-4-119B-2603 reached
-        # "numel (16777216) exceeds triton maximum tensor numel (1048576)".
-        # The vectorized fallback in the caller handles these layouts.
+        # A coarse scale makes the BLOCK_SIZE x BLOCK_SIZE tile exceed Triton's max tensor numel; a per-expert
+        # per-tensor scale (p == q == 1) derives BLOCK_SIZE = M (seen on mistralai/Mistral-Small-4-119B-2603);
+        # vectorized fallback handles it.
         return None
 
-    # Fast path: when M is exactly p*bm and both tensors are expert-major contiguous,
-    # flatten (E, M, N) -> (E*M, N) and dequant in ONE kernel call. The 2-D dequant
-    # kernel's row-major scale index r // bm equals e*p + (r%M)//bm for the flattened
-    # layout, which matches scale.view(E*p, q). On B200 this is ~25x faster than the
-    # per-expert loop because it removes 128 kernel launches.
+    # Fast path when M == p*bm and both tensors are expert-major contiguous: flatten to (E*M, N) for one kernel call
+    # instead of a per-expert loop; scale.view(E*p, q) matches the row index.
     if M == p * bm and weight.is_contiguous() and scale.is_contiguous():
         w_flat = weight.view(E * M, N)
         s_flat = scale.view(E * p, q).to(torch.float32).contiguous()
@@ -418,8 +410,8 @@ def _fp4_dequant_whole_stack(packed_u8, scale_f, values, target_dtype):
     return (pairs * scale_f.unsqueeze(-1)).to(target_dtype).view(E, M, 2 * K_packed)
 
 
-# dynamic=False: automatic-dynamic ran slower than eager. Past dynamo's per-code-object recompile limit
-# the unchunked body would run eagerly (GBs of indices), so shapes are capped and each device has its own copy.
+# dynamic=False: automatic-dynamic ran slower than eager; past dynamo's recompile limit the unchunked body would run
+# eagerly (GBs of indices), so shapes are capped and each device keeps its own copy.
 _FP4_COMPILED = {}
 _FP4_COMPILED_SHAPES = {}
 _FP4_COMPILED_MAX_SHAPES = 6
@@ -509,9 +501,8 @@ def _dequantize_full_expert_weights(weight: torch.Tensor, quant_state, target_dt
     if result is not None:
         return result
 
-    # Fallback 2: per-expert loop. Only reachable when scale is 2-D with an
-    # explicit transposed block_size annotation; vectorized + unsloth Triton
-    # paths above cover every standard 3-D scale layout.
+    # Fallback 2: per-expert loop, reachable only when scale is 2-D with an explicit transposed block_size annotation;
+    # vectorized and Triton paths cover standard 3-D scale layouts.
     if (
         not isinstance(quant_state, torch.Tensor)
         or quant_state.ndim != 2
@@ -764,8 +755,7 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
     flat_weights = top_k_weights.view(-1)
     permuted_weights = flat_weights[sorted_indices]
     mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
-    # Same duplicate-index atomicAdd reduction as the bf16/native path; see
-    # combine_permuted_moe_outputs for why this is not an index_add_.
+    # Same duplicate-index atomicAdd reduction as the bf16/native path; see combine_permuted_moe_outputs for why this is not an index_add_.
     final_hidden_states = combine_permuted_moe_outputs(
         mm2_out,
         sorted_indices,
@@ -795,8 +785,7 @@ def _unwrap_param_attr(module, name):
         return None
     if isinstance(obj, torch.Tensor):
         return obj
-    # Call get_param() BEFORE walking base_layer: base_layer points back to the
-    # experts module, not the tensor.
+    # Call get_param() before walking base_layer: base_layer points back to the experts module, not the tensor.
     while hasattr(obj, "get_param") and callable(obj.get_param):
         try:
             inner = obj.get_param()
@@ -807,8 +796,7 @@ def _unwrap_param_attr(module, name):
         if inner is obj:
             break
         obj = inner
-    # Walk a base_layer chain ending in something with the named attribute
-    # (handles nested ParamWrappers).
+    # Walk a base_layer chain until an object with the named attribute is found (handles nested ParamWrappers).
     seen = set()
     while hasattr(obj, "base_layer") and id(obj) not in seen:
         seen.add(id(obj))
@@ -831,15 +819,9 @@ def _slice_fp8_linear_quant_state(experts_module, param_name: str, expert_idx: i
 
 
 def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weights):
-    # This is the last-resort FP8 path (no scaled_grouped_mm support AND
-    # _dequantize_full_expert_weights returned None for either projection).
-    # It computes the FP8 forward but does NOT consume the separated LoRA
-    # attributes that `patch_param_wrapper_for_moe` injects, so reaching this
-    # path while LoRA is active would silently train without the adapter.
-    # Refuse rather than corrupt: the user can disable LoRA or fix the
-    # missing kernel before retrying. The reads are recorded so the refusal stays in charge:
-    # `_patched_param_wrapper_forward` must not reroute a quantized parameter through PEFT
-    # on the grounds that this path ignored the stash.
+    # Last-resort FP8 path (no scaled_grouped_mm, dequant returned None) ignores the LoRA stash from
+    # patch_param_wrapper_for_moe, so it refuses rather than train silently without the adapter;
+    # _patched_param_wrapper_forward must not reroute quantized params to PEFT.
     from .moe_utils import take_moe_lora_stash
     if (
         take_moe_lora_stash(self, "gate_up_proj") is not None
@@ -864,7 +846,10 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
     hidden_states = hidden_states.view(-1, hidden_dim)
     top_k_index = top_k_index.view(-1, top_k_index.shape[-1])
     top_k_weights = top_k_weights.view(-1, top_k_weights.shape[-1])
-    final_hidden_states = torch.zeros_like(hidden_states)
+    # fp32-reference experts (Unsloth's native DeepSeek-V4.1): gate and routed-output sum in fp32, as their own forward.
+    fp32_reference = bool(getattr(type(self), "_unsloth_moe_fp32_reference", False))
+    accum_dtype = torch.float32 if fp32_reference else input_dtype
+    final_hidden_states = torch.zeros_like(hidden_states, dtype = accum_dtype)
 
     gate_up_weight, _, _ = _get_moe_weight_and_quant_info(self, "gate_up_proj")
     down_weight, _, _ = _get_moe_weight_and_quant_info(self, "down_proj")
@@ -901,7 +886,10 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
             gate_up_out = F.linear(current_state, expert_gate_up, gate_up_bias_expert)
 
         if getattr(self, "_unsloth_own_apply_gate", False):
-            current_hidden_states = self._apply_gate(gate_up_out)
+            if fp32_reference:
+                current_hidden_states = self._apply_gate(gate_up_out.float()).to(gate_up_out.dtype)
+            else:
+                current_hidden_states = self._apply_gate(gate_up_out)
         elif "GptOssExperts" in self.__class__.__name__:
             gate = gate_up_out[..., ::2]
             up = gate_up_out[..., 1::2]
@@ -937,10 +925,13 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
         else:
             current_hidden_states = F.linear(current_hidden_states, expert_down, down_bias_expert)
 
-        current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-        final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(input_dtype))
+        routing_weights = top_k_weights[token_idx, top_k_pos, None]
+        if fp32_reference:
+            current_hidden_states, routing_weights = current_hidden_states.float(), routing_weights.float()
+        current_hidden_states = current_hidden_states * routing_weights
+        final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(accum_dtype))
 
-    return final_hidden_states.view(original_shape)
+    return final_hidden_states.to(input_dtype).view(original_shape)
 
 
 def _release_dequantized_banks_until_backward(output, inputs, banks):
@@ -1052,10 +1043,74 @@ def _refuse_fp4_with_an_unapplied_gate(module, gate_up_weight):
     )
 
 
+def _ue8m0_codes(scale):
+    """uint8 e8m0 codes of a ue8m0 / power-of-two scale tensor, else None (a non power of two is not MXFP4)."""
+    scale = scale.detach()  # FP8Experts registers its float8 scales as parameters that require grad
+    if getattr(torch, "float8_e8m0fnu", None) is not None and scale.dtype == torch.float8_e8m0fnu:
+        return scale.view(torch.uint8)
+    if scale.dtype == torch.uint8:
+        return scale
+    if not scale.dtype.is_floating_point:
+        return None
+    s = scale.float()
+    exponent = torch.round(torch.log2(s))
+    if not bool(torch.isfinite(exponent).all()) or not torch.equal(torch.exp2(exponent), s):
+        return None
+    codes = exponent + 127
+    if bool((codes < 0).any()) or bool((codes > 254).any()):
+        return None
+    return codes.to(torch.uint8)
+
+
+def _fp4_experts_as_mxfp4(module):
+    """(gate_up, down) Mxfp4ExpertParam views of FP4-packed experts (transformers' FP8Experts with expert_dtype="fp4":
+    int8 (E, M, K / 2), e2m1 low nibble first, one ue8m0 scale per 32 along K), cached per storage; None when the
+    experts are not that, train their base weights, or UNSLOTH_FP8_EXPERTS_MXFP4=0."""
+    if os.environ.get("UNSLOTH_FP8_EXPERTS_MXFP4", "1") == "0":
+        return None
+    try:
+        from unsloth_zoo.mxfp4_dequant import Mxfp4ExpertParam
+    except Exception:
+        return None
+    views = []
+    for name in ("gate_up_proj", "down_proj"):
+        weight, scale, _ = _get_moe_weight_and_quant_info(module, name)
+        if (
+            not _is_fp4_packed_tensor(weight) or weight.ndim != 3 or weight.requires_grad
+            or not isinstance(scale, torch.Tensor) or scale.ndim != 3
+            or weight.device.type != "cuda" or not weight.is_contiguous()
+        ):
+            return None
+        E, M, half_k = weight.shape
+        if half_k % 16 or tuple(scale.shape) != (E, M, half_k // 16):
+            return None
+        cache = module.__dict__.setdefault("_unsloth_fp4_mxfp4_views", {})
+        # _version: an in-place copy_ / load_state_dict keeps the storage but must drop converted scale codes.
+        key = (name, weight.data_ptr(), scale.data_ptr(), tuple(weight.shape), weight._version, scale._version)
+        view = cache.get(key)
+        if view is None:
+            # Outside inference mode: a view cached by a generate() must still be savable for a later backward.
+            with torch.inference_mode(False):
+                codes = _ue8m0_codes(scale)
+                if codes is None:
+                    return None
+                view = Mxfp4ExpertParam(
+                    weight.detach().view(torch.uint8).view(E, M, half_k // 16, 16),
+                    mxfp4_scales = codes.contiguous(),
+                    mxfp4_transposed = False,
+                    mxfp4_dtype = torch.bfloat16,
+                )
+            if len(cache) > 4:  # stale storages (a reload)
+                cache.clear()
+            cache[key] = view
+        views.append(view)
+    return tuple(views)
+
+
 @torch.compiler.disable
 def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
     from .moe_utils import (
-        select_moe_backend,
+        select_moe_backend_without_sonic,
         forward_native_grouped_mm,
         forward_triton_grouped_gemm,
         forward_native_moe_loop,
@@ -1067,7 +1122,20 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
     if not getattr(self, "_unsloth_own_apply_gate", False) and _fp8_experts_own_gate(self):
         self._unsloth_own_apply_gate = True
 
-    backend = select_moe_backend()
+    backend = select_moe_backend_without_sonic(hidden_states.device)
+
+    # 0. FP4-packed experts are MXFP4: decode inside the grouped GEMM instead of rebuilding both bf16 stacks.
+    if backend == "grouped_mm":
+        packed = _fp4_experts_as_mxfp4(self)
+        if packed is not None:
+            _log_moe_fp8_backend_once(self, "Unsloth: MoE FP4 experts are using the fused MXFP4 grouped GEMM.")
+            output = swap_moe_weights_for_call(
+                self, packed[0], packed[1], forward_native_grouped_mm,
+                hidden_states.to(_get_fp8_dequant_target_dtype(hidden_states)), top_k_index, top_k_weights,
+            )
+            if isinstance(output, torch.Tensor) and output.dtype != hidden_states.dtype:
+                output = output.to(hidden_states.dtype)
+            return output
 
     # 1. _scaled_grouped_mm (fast FP8 path on Hopper/Blackwell)
     if backend == "grouped_mm" and _check_torch_scaled_grouped_mm_supported(hidden_states.device):
@@ -1132,19 +1200,15 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
 
 
 # ============================================================================
-# Save-side hooks: dequant base FP8 weights before LoRA merge, requant after.
-# saving_utils.py consults `_MOE_QUANT_HANDLERS` for every expert weight key
-# it reads, so the FP8 plumbing stays local to this file instead of polluting
-# the generic save path.
+# Save-side hooks dequant base FP8 weights before LoRA merge and requant after; saving_utils.py consults
+# _MOE_QUANT_HANDLERS per expert weight key, keeping FP8 plumbing local to this file.
 # ============================================================================
 
-# FP8 e4m3 max representable magnitude — matches transformers' Fp8Quantize.convert
-# (finegrained_fp8.py:838-859) and compressed-tensors' fp8 encode path.
+# FP8 e4m3 max representable magnitude; matches transformers' Fp8Quantize.convert (finegrained_fp8.py:838-859) and compressed-tensors' fp8 encode path.
 _FP8_E4M3_MAX = 448.0
 
-# Sentinel returned by a handler when it positively identifies its quant kind on
-# the key but cannot safely apply a LoRA merge (e.g. missing companion scale).
-# saving_utils.py treats this as "skip this expert, record a fallback".
+# Sentinel a handler returns when it identifies its quant kind but cannot safely apply a LoRA merge (e.g. missing
+# companion scale); saving_utils.py then skips the expert and records a fallback.
 _MOE_QUANT_UNSAFE = object()
 
 
@@ -1157,6 +1221,9 @@ def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor, block_s
     which is only exact when rows/cols are block multiples.
     """
     rows, cols = W_fp8.shape
+    if scale_inv.dtype == torch.uint8:
+        # MXFP8 (compressed-tensors mxfp8-quantized): e8m0 exponent bytes, scale = 2 ** (byte - 127), one per 32.
+        scale_inv = (scale_inv.to(torch.float32) - 127.0).exp2()
     out_dtype = scale_inv.dtype if scale_inv.dtype.is_floating_point else torch.float32
     W = W_fp8.to(out_dtype)
     if scale_inv.numel() == 1:
@@ -1172,8 +1239,7 @@ def _fp8_dequant_blockwise(W_fp8: torch.Tensor, scale_inv: torch.Tensor, block_s
         )
     srows, scols = scale_inv.shape
     bm = bn = None
-    # Use the configured block size only when the scale grid tiles the weight by it;
-    # per-channel 2-D scales (e.g. (rows, 1)) fall back to inference.
+    # Use the configured block size only when the scale grid tiles the weight by it; per-channel 2-D scales (e.g. (rows, 1)) fall back to inference.
     if block_size is not None and len(block_size) == 2:
         cand_bm, cand_bn = block_size
         if srows == -(-rows // cand_bm) and scols == -(-cols // cand_bn):
@@ -1208,6 +1274,12 @@ def _fp8_requant_blockwise(W: torch.Tensor, block_shape: tuple, scale_dtype: tor
         Wf = Wpad
     W_blocks = Wf.reshape(srows, bm, scols, bn)
     block_max = W_blocks.abs().amax(dim=(1, 3))
+    if scale_dtype == torch.uint8:
+        # MXFP8: power-of-two scales stored as e8m0 bytes, the smallest 2**e with block_max / 2**e <= 448.
+        e = torch.ceil(torch.log2((block_max / _FP8_E4M3_MAX).clamp_min(2.0 ** -127))).clamp(-127, 127)
+        W_scaled = (W_blocks / torch.exp2(e).unsqueeze(-1).unsqueeze(1)).clamp(-_FP8_E4M3_MAX, _FP8_E4M3_MAX)
+        W_fp8 = W_scaled.reshape(srows * bm, scols * bn)[:rows, :cols].to(torch.float8_e4m3fn)
+        return W_fp8, (e + 127).to(torch.uint8)
     scale_inv = (block_max / _FP8_E4M3_MAX).clamp_min(1e-12)
     W_scaled = (
         W_blocks / scale_inv.unsqueeze(-1).unsqueeze(1)
@@ -1232,8 +1304,8 @@ def _fp8_save_handler(file, header_metadata, weight_key, block_size = None):
     """
     dtype_str = header_metadata.get(weight_key, {}).get("dtype")
     _e5m2 = getattr(torch, "float8_e5m2", None)
-    # e5m2 is FP8 but this requant path only encodes e4m3; refuse (UNSAFE) so the merge is
-    # skipped and logged rather than writing raw FP8 back with a stale scale.
+    # e5m2 is FP8 but this requant path only encodes e4m3, so it refuses (UNSAFE) and the merge is skipped and logged
+    # rather than writing raw FP8 back with a stale scale.
     if dtype_str == "F8_E5M2":
         return _MOE_QUANT_UNSAFE, None
     # Cheap probe: skip non-FP8 keys without paying for a tensor read.
@@ -1263,10 +1335,8 @@ def _fp8_save_handler(file, header_metadata, weight_key, block_size = None):
         return _MOE_QUANT_UNSAFE, None
     rows, cols = W.shape
     srows, scols = scale_inv.shape
-    # Prefer the configured block size when its grid tiles the weight (handles partial
-    # final blocks, e.g. 130x256 with 128x128 blocks). Otherwise fall back to exact-division
-    # inference, which also covers per-channel scales like (rows, 1) that a global block size
-    # does not tile.
+    # Prefer the configured block size when its grid tiles the weight (handles partial final blocks, e.g. 130x256 with
+    # 128x128); else infer by exact division, covering per-channel (rows, 1) scales.
     block_shape = None
     if block_size is not None and len(block_size) == 2:
         cand_bm, cand_bn = block_size
@@ -1307,13 +1377,8 @@ def apply_moe_quant_load(file, header_metadata, key, block_size = None):
 # ============================================================================
 # Hook FP8 experts dispatch + relax HF Trainer FP8 guard
 # ============================================================================
-#
-# transformers swaps a model's experts class with FP8Experts at load time when
-# the checkpoint is FP8 (compressed-tensors / finegrained_fp8). The per-arch
-# patch (patch_qwen3_moe etc.) targets the original Qwen3MoeExperts class, so
-# the FP8 instance never sees our patched forward. Override the transformers
-# FP8 experts registry directly so every FP8Experts.forward routes through
-# forward_moe_backend_fp8.
+# transformers swaps in FP8Experts for FP8 checkpoints, so per-arch patches of Qwen3MoeExperts never reach it; override
+# the FP8 experts registry so every forward uses forward_moe_backend_fp8.
 
 from .common import (
     TEMPORARY_PATCHES,

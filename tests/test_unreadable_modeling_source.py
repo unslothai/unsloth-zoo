@@ -14,33 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A model must not fail to LOAD because we could not read its source.
-
-`unsloth_compile_transformers` calls
-
-    full_source = inspect.getsource(modeling_file)
-
-and everything after it is source-level feature detection and regex class
-discovery -- work done purely to make the model FASTER. `inspect.getsource`
-reads through linecache, and when that comes back empty it raises
-
-    OSError: could not get source code
-
-Unguarded, that propagates out of `FastModel.from_pretrained`, so the model
-does not load at all, and the message names neither unsloth nor the module it
-could not read. Hit while collecting the whisper saving test.
-
-Returning early is the honest degradation: LoRA forwards are already patched
-by that point, and the model loads without the source-level optimisations.
-
-What we must NOT do is carry on with an empty string. Several checks have the
-shape
-
-    "_supports_sdpa = False" not in full_source
-
-which is TRUE for an empty string, so an empty `full_source` would silently
-enable paths the model never claimed to support. Slower is fine; wrong is not.
-"""
+"""Unreadable modeling source must not fail the load: unsloth_compile_transformers returns early on OSError, never with
+an empty full_source, since a not-in check is true for an empty string and would silently enable unsupported paths;
+slower is fine, wrong is not."""
 
 import ast
 import inspect
@@ -58,13 +34,8 @@ SRC = COMPILER.read_text(encoding="utf-8")
 
 
 def _require_index(anchor: str, what: str) -> int:
-    """`SRC.index`, but a miss says which contract broke.
-
-    A bare `.index` raises `ValueError: substring not found` and names neither
-    the anchor nor the test's subject, which is how #967's rename showed up:
-    six tests failed pointing at the test file's own line rather than at the
-    production edit that moved the text out from under them.
-    """
+    """Looks up an anchor in SRC with a message naming the contract; a bare .index miss names neither, and issue 967's
+    rename failed six tests at the test file's own line."""
     i = SRC.find(anchor)
     assert i != -1, (
         f"{what}: no `{anchor}` in compiler.py. Either the guard is gone, or "
@@ -94,12 +65,8 @@ def _caught_names(handler) -> set:
 
 
 def _catches(caught: set, name: str) -> bool:
-    """Whether `name` is caught under a spelling this module can actually resolve.
-
-    A bare `TokenError` is not interchangeable with `tokenize.TokenError` here:
-    compiler.py imports the module and not the name, so an unqualified handler
-    would raise NameError at the moment it is asked to handle a failure.
-    """
+    """Whether name is caught, matched only by a spelling this module can resolve: compiler.py imports the tokenize
+    module, not TokenError, so a bare handler would be a NameError."""
     if name in caught:
         return True
     bare = name.rsplit(".", 1)[-1]
@@ -109,18 +76,8 @@ def _catches(caught: set, name: str) -> bool:
 
 
 def _getsource_guards(call: str) -> list:
-    """What every `try` whose body calls `call` catches, one union per `try`.
-
-    Read off the parse, not matched as one spelling: a wider guard is a stronger
-    premise, yet #1149 widening it to `tokenize.TokenError` failed three tests here
-    while catching strictly more. A union per `try` rather than a set per handler,
-    because `except OSError:` beside `except TypeError:` guards the call exactly as
-    well as the single tuple does.
-
-    The nearest enclosing `try` only. An outer `try` unparses its whole body, so it
-    contains the call too, but a handler out there for something unrelated is not the
-    thing guarding this call and must not be asked to catch what this one catches.
-    """
+    """What each try whose body calls the given call catches, one union per try, matched on the parse; only the nearest
+    enclosing try counts. Widening to tokenize.TokenError (issue 1149) failed three tests while catching more."""
     matching = [
         node for node in ast.walk(ast.parse(SRC))
         if isinstance(node, ast.Try)
@@ -154,15 +111,13 @@ def test_it_catches_what_getsource_actually_raises():
 
 
 def test_the_real_exception_type_is_oserror():
-    """Guards the premise: if inspect ever stopped raising OSError here, the
-    except clause would be catching nothing."""
+    """Guards the premise: if inspect.getsource stopped raising OSError for a built-in module, the except clause would catch nothing."""
     with pytest.raises((OSError, TypeError)):
         inspect.getsource(sys)          # built-in module, no source file
 
 
 def test_it_returns_rather_than_continuing_with_empty_source():
-    """The critical half. Continuing with full_source = "" would make every
-    `X not in full_source` check true."""
+    """The critical half: continuing with an empty full_source would make every X not in full_source check true, so the handler must return."""
     window = _guard_region()
     assert "\n        return\n" in window, (
         "the handler must return, not fall through to the source-based logic")
@@ -189,8 +144,7 @@ def test_the_warning_says_the_model_still_works():
 
 
 def test_lora_patching_happens_before_the_guard():
-    """Returning early is only acceptable because the LoRA forwards have
-    already been patched by this point."""
+    """An early return is acceptable only because the LoRA forwards are already patched by the time the modeling-file guard runs."""
     lora = _require_index(
         "patch_lora_forwards(torch_compile_options)", "the LoRA forward patch")
     guard = _require_index(
@@ -213,8 +167,7 @@ def test_the_module_still_parses():
 
 
 def test_a_bare_return_is_the_functions_contract():
-    """unsloth_compile_transformers returns None and already has early
-    returns, so this one is consistent with the rest."""
+    """unsloth_compile_transformers returns None and already has early returns, so a bare return matches the function's contract."""
     tree = ast.parse(SRC)
     fn = next(n for n in ast.walk(tree)
               if isinstance(n, ast.FunctionDef)
@@ -225,23 +178,9 @@ def test_a_bare_return_is_the_functions_contract():
 
 
 def _nn_forward_read() -> tuple:
-    """The torch.nn forward read, discovered rather than spelled out.
-
-    Returns `(name, statement)` where `name` is whatever local the loop reads
-    the forward's source from and `statement` is the assignment as written.
-
-    Discovered because the spelling is not the contract. #967 renamed this
-    operand from `function.forward` to `original_forward` -- a strictly better
-    version of the same read, pinning the pristine forward so a second pass
-    cannot consume its own generated output -- and six tests here reported it
-    as the guard having been deleted. A test that fails on a correct rename is
-    reporting on the test, not on compiler.py.
-
-    Matched on shape: an assignment to `source` of `inspect.getsource(<Name>)
-    .rstrip()`. The name is then held to its real contract by
-    `test_the_forward_source_is_read_from_the_pinned_original` below, so this
-    stays a rename-tolerant search and not a weaker assertion.
-    """
+    """Returns (name, statement) of the forward read, matched by shape so a correct rename (issue 967 moved
+    function.forward to original_forward) does not fail it; pinned by
+    test_the_forward_source_is_read_from_the_pinned_original."""
     found = []
     for node in ast.walk(ast.parse(SRC)):
         if not isinstance(node, ast.Assign) or len(node.targets) != 1:
@@ -282,14 +221,9 @@ def _nn_patch_region() -> str:
 
 
 def test_the_forward_source_is_read_from_the_pinned_original():
-    """The operand is discovered, so pin what it must BE.
-
-    Either it is `function.forward` itself, or it is a local assigned from
-    `function.forward` in the same loop -- #967's pin, which is what makes the
-    read idempotent across the two passes a vision load performs. Without this,
-    `_nn_forward_read` would happily latch onto a rename to something that is
-    not the forward at all and every test below would still pass.
-    """
+    """The read operand must be function.forward or a local assigned from it in the same loop (issue 967 pin), keeping
+    the read idempotent across a vision load's two passes; otherwise _nn_forward_read could latch onto a non-forward
+    rename and every test would still pass."""
     if NN_FORWARD_NAME == "function":
         pytest.skip("read directly off `function.forward`, nothing to pin")
     pin = f"{NN_FORWARD_NAME} = function.forward"
@@ -301,19 +235,9 @@ def test_the_forward_source_is_read_from_the_pinned_original():
 
 
 def test_the_nn_forward_patch_loop_is_guarded():
-    """`inspect.getsource` on a forward it cannot retrieve raises
-    `OSError: could not get source code`, which propagates out of
-    `FastModel.from_pretrained` -- so the model does not load, over source we
-    only wanted in order to patch a dtype cast.
-
-    Observed while collecting tests/saving/text_to_speech_models, after
-    another model had been loaded in the same process.
-
-    Scope, stated honestly: the precondition is NOT fully characterised. Two
-    plain Qwen loads do not trigger it, and after such a load no torch.nn
-    forward is unreadable -- both measured, not assumed. This guards a state
-    we have observed rather than encoding a theory about how it arises.
-    """
+    """An unreadable torch.nn forward raises OSError out of FastModel.from_pretrained, so the model fails to load; seen
+    in tests/saving/text_to_speech_models after another model loaded in the same process; trigger not fully
+    characterised, so this guards the observed state."""
     guards = _getsource_guards(NN_FORWARD_GETSOURCE)
     assert guards, f"`{NN_FORWARD_GETSOURCE}` is no longer inside a try"
     for caught in guards:
@@ -323,17 +247,10 @@ def test_the_nn_forward_patch_loop_is_guarded():
 
 
 def test_an_unreadable_forward_is_skipped_not_fatal():
-    """Every other unsupported case in this loop uses `continue`; this must
-    too. Raising abandons the remaining modules as well as this one.
-
-    Checked on the parsed handler rather than its text: the comment inside it
-    contains the word "raises", which a substring search reads as a `raise`
-    statement.
-    """
+    """The handler must continue like every other unsupported case in this loop, since raising would abandon the
+    remaining modules too; checked on the parsed AST, not the text."""
     tree = ast.parse(SRC)
-    # Exactly the try whose body IS this assignment -- several other blocks
-    # also call getsource on a forward, and their handlers legitimately do
-    # something else.
+    # Matches only the try whose body is this assignment; other blocks also call getsource on a forward and their handlers may legitimately do something else.
     target = NN_FORWARD_READ
     handlers = []
     for node in ast.walk(tree):
@@ -355,15 +272,14 @@ def test_an_unreadable_forward_is_skipped_not_fatal():
 
 
 def test_the_compiler_config_check_is_kept():
-    """It catches torch.compile wrappers, which is a different case from our
-    own exec'd replacements -- the new guard adds to it, not replaces it."""
+    """The hasattr get_compiler_config check catches torch.compile wrappers, a different case from our exec'd
+    replacements, so the new guard adds to it rather than replacing it."""
     region = _nn_patch_region()
     assert 'hasattr(function.forward, "get_compiler_config")' in region
 
 
 def test_both_getsource_guards_are_present():
-    """Two distinct sites, two distinct failures. Fixing only the first one
-    just moves the crash later, which is exactly what happened."""
+    """Two distinct getsource sites with distinct failures; fixing only the first just moved the crash later, which is exactly what happened."""
     sites = {"inspect.getsource(modeling_file)", NN_FORWARD_GETSOURCE}
     for call in sites:
         guards = _getsource_guards(call)
@@ -373,14 +289,11 @@ def test_both_getsource_guards_are_present():
             f"{call} is unguarded, so an unreadable source is fatal again")
 
 
-# Returning early is a degradation, and a degradation has to be honest about
-# which of the surrounding work it gave up. Three separate questions, and they
-# do not have the same answer.
+# An early return is a degradation, so say which surrounding work it gives up; the three separate questions here do not have the same answer.
 
 
 def _break_getsource(monkeypatch, module):
-    """Make exactly one module's source unreadable, the way the wild failure
-    does: the file is gone as far as inspect and linecache are concerned."""
+    """Makes one module's source unreadable the way the wild failure does: the file is gone as far as inspect and linecache are concerned."""
     import linecache
 
     path = inspect.getfile(module)
@@ -401,9 +314,9 @@ def unreadable_llama(monkeypatch):
     import transformers.models.llama.modeling_llama as modeling
 
     _break_getsource(monkeypatch, modeling)
-    # Both markers, with their values: restoring only the patched one leaves a
-    # module that reports itself done and then declines to answer, so a later
-    # test's supports_sdpa accumulator is silently left untouched.
+    # Both markers must be restored with their saved values: restoring only __UNSLOTH_PATCHED__ leaves a module that
+    # reports itself done yet declines to answer, and a later test's supports_sdpa accumulator is silently left
+    # untouched.
     _MISSING = object()
     saved = {name: getattr(modeling, name, _MISSING)
              for name in ("__UNSLOTH_PATCHED__", "__UNSLOTH_SUPPORTS_SDPA__")}
@@ -419,9 +332,8 @@ def unreadable_llama(monkeypatch):
 
 
 def test_sdpa_is_reported_unsupported(unreadable_llama):
-    """The caller seeds `[True]` and only the normal path writes it, so a
-    silent return leaves SDPA selected for a model whose source never claimed
-    it. Eager always exists; guessing does not."""
+    """The caller seeds supports_sdpa as [True] and only the normal path writes it, so a silent return leaves SDPA
+    selected for a model whose source never claimed it; eager always exists, guessing does not."""
     from unsloth_zoo import compiler
 
     supports_sdpa = [True]
@@ -433,9 +345,7 @@ def test_sdpa_is_reported_unsupported(unreadable_llama):
 
 
 def test_the_answer_survives_a_second_call(unreadable_llama):
-    """`__UNSLOTH_PATCHED__` is set before the guard, so every later call takes
-    the already-patched branch and reads `__UNSLOTH_SUPPORTS_SDPA__` instead.
-    Unset, that branch leaves the caller's optimistic value alone."""
+    """__UNSLOTH_PATCHED__ is set before the guard, so later calls read __UNSLOTH_SUPPORTS_SDPA__ instead; unset, that branch keeps the caller's optimistic value."""
     from unsloth_zoo import compiler
 
     compiler.unsloth_compile_transformers(
@@ -460,9 +370,8 @@ def test_a_supports_sdpa_of_none_is_still_allowed(unreadable_llama):
 
 
 def test_the_torch_dtype_patches_still_run():
-    """They read torch's source, not the model's, so an unreadable model is no
-    reason to skip them. Skipping turned a load-time failure into a first
-    forward pass failure."""
+    """The torch dtype patches read torch's source, not the model's, so an unreadable model is no reason to skip them;
+    skipping turned a load-time failure into a first-forward-pass failure."""
     tree = ast.parse(SRC)
     fn = next(n for n in ast.walk(tree)
               if isinstance(n, ast.FunctionDef)
@@ -479,10 +388,7 @@ def test_the_torch_dtype_patches_still_run():
 
 
 def test_gradient_accumulation_needs_that_same_source():
-    """Which is why the early return does not skip anything there: the patch
-    re-reads the model's source itself and gives up on the same failure. This
-    test exists so a future reader does not add a fallback for a case that
-    cannot occur."""
+    """patch_gradient_accumulation re-reads the model's source and gives up on the same failure, so the early return skips nothing there and no fallback is needed."""
     import transformers.models.llama.modeling_llama as modeling
     from unsloth_zoo.compiler import patch_gradient_accumulation
 
@@ -536,8 +442,7 @@ def test_an_eager_norm_input_is_cast_too():
 
 
 def test_a_compiled_norm_input_is_left_alone():
-    """The source rewrite only casts the result when compiling is on; casting
-    the input as well changes batched numerics."""
+    """The source rewrite casts the result only when compiling is on; casting the input as well changes batched numerics."""
     import torch
 
     saw, got = _run(False, False, torch.bfloat16, torch.float32)
@@ -558,8 +463,7 @@ def test_an_affineless_norm_has_no_weight_to_match():
 
 
 def test_the_wrapper_is_marked_so_it_is_not_wrapped_twice():
-    """Loading a second model runs the loop again; without a marker each load
-    would add another layer of casts."""
+    """Loading a second model reruns the loop; without the __unsloth_dtype_wrapped__ marker each load would add another layer of casts."""
     from unsloth_zoo.compiler import _dtype_safe_forward
 
     assert _dtype_safe_forward(lambda self, x: x, True, False).__unsloth_dtype_wrapped__
@@ -572,9 +476,8 @@ def test_the_unreadable_forward_is_wrapped_rather_than_dropped():
 
 
 def test_the_tensor_may_arrive_by_keyword():
-    """These become the public forward. torch.nn.RMSNorm declares `x`, not
-    `input`, and `rms_norm(x = t)` works today, so a hard-coded parameter name
-    would start raising TypeError on a call that used to be fine."""
+    """The wrapper becomes the public forward; torch.nn.RMSNorm declares x, not input, so a hard-coded parameter name
+    would break keyword calls such as rms_norm(x = t) with TypeError."""
     import torch
 
     from unsloth_zoo.compiler import _dtype_safe_forward
@@ -606,8 +509,7 @@ def test_a_call_it_cannot_read_is_passed_straight_through():
 
 
 def test_the_wrapper_records_the_compile_mode_it_was_built_for():
-    """`disable` decides whether a norm casts its input, and it is baked into
-    the closure, so a second load with the other setting must be able to tell."""
+    """disable decides whether a norm casts its input and is baked into the closure, so a later load with the other setting must be detectable."""
     from unsloth_zoo.compiler import _dtype_safe_forward
 
     def original(self, x):

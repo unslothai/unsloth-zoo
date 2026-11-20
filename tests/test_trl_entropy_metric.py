@@ -14,37 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""trl logs a token-entropy metric from logits Unsloth deliberately does not have.
-
-`SFTTrainer.compute_loss` does this, with no way to turn it off short of
-`use_liger_kernel`:
-
-    if not self.args.use_liger_kernel:
-        with torch.no_grad():
-            per_token_entropy = entropy_from_logits(outputs.logits)
-
-Unsloth's entire point there is that a [batch, seq, vocab] float32 tensor -- the
-largest allocation in an SFT step -- is never materialised, and `EMPTY_LOGITS`
-stands in for it. So a diagnostic metric became a hard training failure, in two
-different shapes, both observed live in the sweep:
-
-    Qwen3_(32B)_A100   NotImplementedError: Unsloth: Logits are empty from
-                       2024.11 onwards ... set UNSLOTH_RETURN_LOGITS=1
-    Spark_TTS_(0_5B)   TypeError: iteration over a 0-d tensor
-                       (trl/trainer/utils.py, per_token_entropies.extend)
-
-on Colab AND on Kaggle, on notebooks that trained fine before trl added the
-metric. The advice in the first cannot be taken: UNSLOTH_RETURN_LOGITS=1 buys
-the metric back by giving up the memory saving the user came to Unsloth for.
-
-The detection is on the OBJECT, not the exception text, and that matters.
-`EmptyLogits.__getattr__` returns the `raise_logits_error` FUNCTION for every
-attribute, so what actually blows up depends on which attribute the installed
-trl touches first -- `.split(...)` raises NotImplementedError, while
-`logits.shape[:-1]` subscripts a function object and raises TypeError. A first
-draft of this patch keyed on the two messages and would have fixed one trl
-version while missing the other.
-"""
+"""trl's token-entropy metric must not break SFT on Unsloth's EmptyLogits stand-in for logits; detect the object, not
+the message, since EmptyLogits.__getattr__ makes the error depend on the attribute touched; UNSLOTH_RETURN_LOGITS=1
+gives up the memory saving."""
 
 import inspect
 import sys
@@ -79,14 +51,8 @@ class EmptyLogits:
 
 @pytest.fixture(autouse = True)
 def _pin_the_accelerate_device(monkeypatch):
-    """`accelerate.PartialState` is a process-global borg. Anything earlier in
-    the session that builds an Accelerator (many tests here do) leaves
-    `_shared_state["device"] = cuda`, and the fallback below then allocates its
-    scalar there, where it meets the CPU tensors in these tests and raises
-    "Expected all tensors to be on the same device". Pinned so the result of
-    this module does not depend on what ran before it in the same process; the
-    two device tests set their own value on top of it.
-    """
+    """accelerate.PartialState is a process-global borg: an earlier Accelerator leaves the shared device set to cuda, so
+    the fallback scalar meets CPU tensors; pin it to CPU here."""
     state = pytest.importorskip("accelerate.state")
     monkeypatch.setitem(state.PartialState._shared_state, "device", torch.device("cpu"))
 
@@ -97,16 +63,14 @@ def patched():
     import trl.trainer.sft_trainer as sft
     from unsloth_zoo.temporary_patches.misc import patch_trl_entropy_from_logits
 
-    # entropy_from_logits landed in trl 0.20.0 and pyproject allows >= 0.18.2,
-    # so an allowed build can lack it. Production no-ops there, so skip rather
-    # than error out of the fixture.
+    # entropy_from_logits landed in trl 0.20.0 and pyproject allows >= 0.18.2, so an allowed build can lack it;
+    # production no-ops there, so skip rather than error.
     original = getattr(trl_utils, "entropy_from_logits", None)
     if original is None:
         pytest.skip("this trl predates entropy_from_logits (added in 0.20.0)")
-    # Importing unsloth_zoo applies TEMPORARY_PATCHES, so by the time this
-    # fixture runs the name may already be the wrapper. functools.wraps records
-    # the real one on __wrapped__; without this the "unpatched control" test
-    # would call the wrapper and conclude the bug had never existed.
+    # Importing unsloth_zoo applies TEMPORARY_PATCHES, so the name may already be the wrapper; functools.wraps records
+    # the real one on __wrapped__, and the unpatched control must unwrap it or it would call the wrapper and conclude
+    # the bug never existed.
     while getattr(original, "_unsloth_patched", False) and \
             getattr(original, "__wrapped__", None) is not None:
         original = original.__wrapped__
@@ -122,8 +86,7 @@ def test_the_unsloth_sentinel_no_longer_raises(patched):
 
 
 def test_the_unpatched_call_really_does_raise(patched):
-    """Without this the test above could be passing against a bug that no
-    longer exists."""
+    """Guards that the unpatched call really raises, so the test above cannot pass against a bug that no longer exists."""
     _, _, original = patched
     with pytest.raises(Exception):
         original(EmptyLogits())
@@ -136,9 +99,8 @@ def test_other_unusable_logits_degrade_too(patched, logits):
 
 
 def test_the_result_broadcasts_the_way_the_caller_uses_it(patched):
-    """The caller does `sum(entropy * attention_mask) / sum(mask)` in one
-    branch and `mean(entropy)` in the other. A shape that raises in either is
-    no better than the original failure."""
+    """The caller uses sum(entropy * attention_mask) / sum(mask) in one branch and mean(entropy) in the other, so the
+    result must work with both; a shape that raises in either is no better than the original failure."""
     trl_utils, _, _ = patched
     e = trl_utils.entropy_from_logits(EmptyLogits())
     mask = torch.ones(2, 5)
@@ -148,13 +110,9 @@ def test_the_result_broadcasts_the_way_the_caller_uses_it(patched):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "no accelerator to land on")
 def test_the_fallback_lands_on_the_accelerate_device(patched, monkeypatch):
-    """trl passes this straight to `accelerator.gather_for_metrics`, whose
-    distributed path allocates on PartialState().device and calls NCCL, which
-    rejects a CPU tensor with "Tensors must be CUDA and dense". The masked
-    branch is rescued by multiplying with a device-resident mask, but the
-    padding-free branch (trl's default packing_strategy is "bfd", so plain
-    packing=True reaches it) is a bare mean(), so a CPU scalar would swap one
-    multi-GPU crash for another."""
+    """trl passes the scalar to accelerator.gather_for_metrics, which NCCL rejects on CPU; the masked branch is saved by
+    a device-resident mask, but the padding-free bare mean() (plain packing=True reaches it) is not, so the scalar
+    must be on the accelerate device."""
     trl_utils, _, _ = patched
     state = pytest.importorskip("accelerate.state")
     monkeypatch.setitem(state.PartialState._shared_state, "device", torch.device("cuda", 0))
@@ -167,12 +125,8 @@ def test_the_fallback_lands_on_the_accelerate_device(patched, monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "no accelerator to land on")
 def test_a_cpu_sentinel_tensor_does_not_drag_the_scalar_to_cpu(patched, monkeypatch):
-    """The fused-loss path returns a MODULE-LEVEL `EMPTY_LOGITS = torch.empty(0)`
-    (unsloth_zoo/fused_losses/forward_adapter.py), built at import time and so
-    always on cpu regardless of the run's device. Following the tensor's own
-    device there would hand NCCL a CPU scalar on exactly the distributed run
-    this fallback exists for, and the padding-free branch is a bare mean() with
-    no device-resident mask to rescue it."""
+    """EMPTY_LOGITS (unsloth_zoo/fused_losses/forward_adapter.py) is built on cpu at import, so the fallback must not
+    follow the sentinel's device: NCCL would get a CPU scalar."""
     trl_utils, _, _ = patched
     state = pytest.importorskip("accelerate.state")
     monkeypatch.setitem(state.PartialState._shared_state, "device", torch.device("cuda", 0))
@@ -194,8 +148,7 @@ def test_the_fallback_follows_the_logits_device(patched):
 
 
 def test_the_fallback_stays_on_cpu_for_a_cpu_run(patched, monkeypatch):
-    """A CPU-only run must not be handed a device it never allocates on, so the
-    device is read off accelerate rather than guessed from torch.cuda."""
+    """A CPU-only run must not get a device it never allocates on, so the device is read from accelerate, not guessed from torch.cuda."""
     trl_utils, _, _ = patched
     state = pytest.importorskip("accelerate.state")
     monkeypatch.setitem(state.PartialState._shared_state, "device", torch.device("cpu"))
@@ -203,8 +156,7 @@ def test_the_fallback_stays_on_cpu_for_a_cpu_run(patched, monkeypatch):
 
 
 def test_real_logits_are_untouched(patched):
-    """The patch must be invisible when logits do exist -- otherwise it turns
-    a working metric into a zero for every non-Unsloth user of trl."""
+    """The patch must leave real logits untouched; otherwise a working metric becomes zero for every non-Unsloth user of trl."""
     trl_utils, _, original = patched
     logits = torch.randn(2, 5, 11)
     assert torch.allclose(trl_utils.entropy_from_logits(logits), original(logits))
@@ -218,9 +170,7 @@ def test_a_genuine_error_still_raises(patched):
 
 
 def test_it_patches_the_module_the_caller_actually_reads(patched):
-    """sft_trainer.py does `from ..trainer.utils import entropy_from_logits`,
-    which binds the name at import time. Patching only trl.trainer.utils would
-    be a no-op for the one caller that matters."""
+    """sft_trainer.py binds entropy_from_logits at import time, so patching only trl.trainer.utils is a no-op for the one caller that matters."""
     trl_utils, sft, _ = patched
     assert getattr(trl_utils.entropy_from_logits, "_unsloth_patched", False)
     if not hasattr(sft, "entropy_from_logits"):
@@ -249,8 +199,7 @@ def _src():
 
 
 def test_detection_is_on_the_object_not_the_message():
-    """The point of the rewrite. If someone reintroduces a message match as
-    the primary discriminator, it will pass on one trl and fail on another."""
+    """Detection must key on the object, not the message: a message match as the primary discriminator passes on one trl and fails on another."""
     src = _src()
     i = src.index("def patch_trl_entropy_from_logits")
     body = src[i:src.index('TEMPORARY_PATCHES.append(patch_trl_entropy_from_logits)', i)]
@@ -267,8 +216,7 @@ def test_the_backstop_stays_narrow():
 
 
 def test_the_logger_is_imported():
-    """The warning is not inside a bare `except Exception: pass`, so a missing
-    `logger` would be a NameError on the first step rather than a silent no-op."""
+    """The warning is not inside a bare except Exception: pass, so a missing logger raises NameError on the first step, not a silent no-op."""
     import unsloth_zoo.temporary_patches.misc as misc
     assert hasattr(misc, "logger")
     assert hasattr(misc, "functools")

@@ -14,18 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""gated_delta_vjp end-to-end through the shim.
-
-Exercises:
-  * mx.custom_function decorator + .vjp registration
-  * Chunked forward (mx.zeros, mx.ones, mx.repeat, mx.concatenate)
-  * .at[:, t].add(...) JAX functional update at 5 sites in the VJP
-  * .astype(mx.float32) at ~30 sites
-  * mx.where / mx.expand_dims / mx.zeros_like
-
-If forward + backward both produce finite tensors with the right
-shapes, the VJP path is exercisable on Linux+CUDA.
-"""
+"""gated_delta_vjp forward and backward run end-to-end through the torch shim and give finite, correctly shaped tensors; the VJP path is exercisable on Linux+CUDA."""
 
 from __future__ import annotations
 

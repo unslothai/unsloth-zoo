@@ -1,27 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Regression tests for the import-time PyTorch allocator config.
-
-``unsloth_zoo/__init__.py`` configures the CUDA/HIP caching allocator env vars
-(``PYTORCH_ALLOC_CONF`` / ``PYTORCH_CUDA_ALLOC_CONF`` / ``PYTORCH_HIP_ALLOC_CONF``)
-at import time. Two behaviours are covered here:
-
-* The unified ``PYTORCH_ALLOC_CONF`` is only *read* by the allocator from torch
-  2.10; torch <= 2.9.x reads only the legacy per-backend vars. The block must
-  therefore write the legacy var on torch <= 2.9.x and the unified var on 2.10+.
-* Windows / WSL cannot use ``expandable_segments``, so a
-  ``roundup_power2_divisions`` fallback is applied there instead of leaving the
-  allocator with no fragmentation mitigation (unslothai/unsloth#7203).
-
-Each case runs ``import unsloth_zoo`` in a **fresh subprocess** so the
-import-time, process-global allocator config is exercised in isolation (the
-block cannot be re-run cleanly in-process, and doing so would leak module state
-into sibling tests). The torch version and device backend are faked in the
-child so the whole matrix runs deterministically under whatever torch is
-actually installed; only the selected env var / value (branch logic) is
-asserted, never torch's own reading.
-"""
+"""Import-time allocator env setup in unsloth_zoo/__init__.py: torch <=2.9 uses legacy per-backend vars, 2.10+ the
+unified PYTORCH_ALLOC_CONF; WSL/Windows get roundup_power2_divisions (unslothai/unsloth issue 7203); each case runs
+in a fresh subprocess with faked torch and backend."""
 
 from __future__ import annotations
 
@@ -40,17 +22,12 @@ ROUNDUP = "roundup_power2_divisions:[32:256,64:128,256:64,>:32]"
 _ALLOC_KEYS = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF")
 _WIPE = _ALLOC_KEYS + (
     "WSL_DISTRO_NAME", "WSL_INTEROP", "UNSLOTH_VLLM_STANDBY", "UNSLOTH_DISABLE_ALLOC_FALLBACK",
-    # The switch that turns off the block under test. `__init__.py` runs the whole
-    # allocator section under `if not _SKIP_GPU_INIT`, and _SKIP_GPU_INIT is this variable
-    # (`__init__.py:179`), so a child that inherits it reports every case as "the product
-    # wrote nothing" while the product was never asked to write anything. Anything in the
-    # process that sets it -- hf_xet_fallback puts it on the PARENT around a spawn -- then
-    # reddens this file instead of itself, which is how it reached CI.
+    # Inheriting UNSLOTH_ZOO_DISABLE_GPU_INIT skips the allocator block in the child, so every case reports that nothing
+    # was written; hf_xet_fallback sets it on the parent around a spawn.
     "UNSLOTH_ZOO_DISABLE_GPU_INIT",
 )
 
-# Repo root (.../unsloth_zoo), so the child's `import unsloth_zoo` resolves to this
-# checkout rather than a namespace-package shadow on a crowded sys.path.
+# Repo root, so the child's import of unsloth_zoo resolves to this checkout rather than a namespace-package shadow on a crowded sys.path.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _CHILD = textwrap.dedent(
@@ -107,8 +84,7 @@ _CHILD = textwrap.dedent(
 
 def _conf(*, torch_version, wsl=False, wsl_interop=False, windows=False,
           standby=False, opt_out=False, device=None, preset=None, kernel_release=None):
-    """Import unsloth_zoo in a fresh child with the given fake env and return the
-    resulting allocator env vars as a dict (values may be ``None``)."""
+    """Import unsloth_zoo in a fresh child process with the faked env and return its allocator env vars as a dict (values may be None)."""
     env = {k: v for k, v in os.environ.items() if k not in _WIPE and k != "_FAKE_TORCH_VERSION"}
     env["_FAKE_TORCH_VERSION"] = torch_version
     # Pin the kernel so a run on a real WSL host does not turn the Linux cases into WSL ones.
@@ -128,8 +104,7 @@ def _conf(*, torch_version, wsl=False, wsl_interop=False, windows=False,
         env["_FAKE_DEVICE"] = device
     for key, val in (preset or {}).items():
         env[key] = val
-    # `windows` (os.name=='nt') cannot be faked on Linux (pathlib raises), so it
-    # is covered by the drift guard test instead, not here.
+    # windows (os.name == 'nt') cannot be faked on Linux (pathlib raises), so the source drift guard test covers it instead.
     assert not windows
 
     proc = subprocess.run(
@@ -149,8 +124,7 @@ def _conf(*, torch_version, wsl=False, wsl_interop=False, windows=False,
 class TestBoundary:
     @pytest.mark.parametrize("ver", ["2.6.0", "2.8.1", "2.9.1"])
     def test_le_2_9_uses_legacy_cuda_var(self, ver):
-        # torch <= 2.9.x only READS PYTORCH_CUDA_ALLOC_CONF, so the mitigation
-        # must land there (expandable + roundup); the unified var stays unset.
+        # torch <= 2.9.x only reads PYTORCH_CUDA_ALLOC_CONF, so the mitigation (expandable + roundup) must land there; the unified var stays unset.
         conf = _conf(torch_version=ver)
         assert conf["PYTORCH_CUDA_ALLOC_CONF"] is not None, conf
         assert "expandable_segments:True" in conf["PYTORCH_CUDA_ALLOC_CONF"], conf
@@ -160,8 +134,7 @@ class TestBoundary:
 
     @pytest.mark.parametrize("ver", ["2.10.0", "2.13.0"])
     def test_ge_2_10_uses_unified_var(self, ver):
-        # torch >= 2.10 reads the unified var; behaviour matches today (expandable
-        # only, no roundup) -> guards against a Linux regression.
+        # torch >= 2.10 reads the unified PYTORCH_ALLOC_CONF; on Linux it must stay expandable-only with no roundup, guarding against a regression.
         conf = _conf(torch_version=ver)
         assert conf["PYTORCH_ALLOC_CONF"] == "expandable_segments:True", conf
         assert conf["PYTORCH_CUDA_ALLOC_CONF"] is None, conf
@@ -205,12 +178,8 @@ class TestWindowsWslFallback:
         assert "roundup" not in (conf["PYTORCH_ALLOC_CONF"] or ""), conf
 
     def test_windows_shares_wsl_branch_source_guard(self):
-        # Native Windows (os.name == 'nt') takes the exact same
-        # `elif IS_WSL_OR_WINDOWS` branch + fallback as WSL, so the WSL cases
-        # above cover the runtime behaviour. A reload under a spoofed os.name
-        # cannot run on Linux (pathlib flips to WindowsPath), so guard the shared
-        # detection + fallback wiring against drift (same source-inspection style
-        # as tests/test_upstream_import_fixes_drift.py).
+        # Native Windows shares the IS_WSL_OR_WINDOWS branch with WSL, so WSL cases cover it; spoofing os.name cannot
+        # run on Linux (pathlib flips), so this source guard checks wiring for drift.
         src = os.path.join(_REPO_ROOT, "unsloth_zoo", "__init__.py")
         text = open(src).read()
         assert 'os.name == "nt"' in text
@@ -220,8 +189,7 @@ class TestWindowsWslFallback:
 
 class TestUserPrecedence:
     def test_user_unified_backend_preserved_2_10(self):
-        # A custom backend on torch 2.10 must survive untouched (roundup is a
-        # no-op under cudaMallocAsync anyway, so none is added).
+        # A custom backend on torch 2.10 must survive untouched; no roundup is added, since it is a no-op under cudaMallocAsync anyway.
         conf = _conf(torch_version="2.10.0", wsl=True,
                      preset={"PYTORCH_ALLOC_CONF": "backend:cudaMallocAsync"})
         assert conf["PYTORCH_ALLOC_CONF"] == "backend:cudaMallocAsync", conf
@@ -232,24 +200,21 @@ class TestUserPrecedence:
         assert conf["PYTORCH_CUDA_ALLOC_CONF"] == "backend:cudaMallocAsync", conf
 
     def test_promotion_gap_closed_2_10(self):
-        # A legacy var pairing expandable with another option must end up with
-        # expandable stripped (futile on WSL) but the other option preserved, and
-        # must NOT re-surface expandable via the >=2.10 promotion step.
+        # A legacy var pairing expandable with another option must lose expandable (futile on WSL), keep the other
+        # option, and not re-promote expandable on >=2.10.
         conf = _conf(torch_version="2.10.0", wsl=True,
                      preset={"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True,max_split_size_mb:128"})
         assert conf["PYTORCH_ALLOC_CONF"] == "max_split_size_mb:128", conf
         assert "expandable_segments" not in (conf["PYTORCH_ALLOC_CONF"] or ""), conf
 
     def test_user_only_expandable_on_wsl_replaced_by_roundup_2_10(self):
-        # If the only thing the user set is the futile expandable, strip it and
-        # fall back to roundup so the box is not left unmitigated.
+        # If the user's only setting is the futile expandable option, strip it and fall back to roundup so the WSL box is not left unmitigated.
         conf = _conf(torch_version="2.10.0", wsl=True,
                      preset={"PYTORCH_ALLOC_CONF": "expandable_segments:True"})
         assert conf["PYTORCH_ALLOC_CONF"] == ROUNDUP, conf
 
     def test_explicit_empty_preserved_2_10(self):
-        # An explicit empty value is a user opt-out (gradient_checkpointing.py
-        # advises it); do not overwrite it with the roundup fallback.
+        # An explicit empty value is a user opt-out (gradient_checkpointing.py advises it); do not overwrite it with the roundup fallback.
         conf = _conf(torch_version="2.10.0", wsl=True,
                      preset={"PYTORCH_ALLOC_CONF": ""})
         assert conf["PYTORCH_ALLOC_CONF"] == "", conf
@@ -288,7 +253,6 @@ class TestBackendIsolation:
             assert "roundup" not in (val or ""), (key, val)
 
     def test_fake_cuda_control_still_fires(self):
-        # Sanity: same fake-device harness with device="cuda" DOES fire, proving
-        # the hip/xpu isolation above is real and not a harness artefact.
+        # Control: the same fake-device harness on cuda must fire, proving the hip/xpu isolation above is real and not a harness artefact.
         conf = _conf(torch_version="2.10.0", wsl=True, device="cuda")
         assert conf["PYTORCH_ALLOC_CONF"] == ROUNDUP, conf

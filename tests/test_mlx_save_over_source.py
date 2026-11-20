@@ -14,22 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Writing safetensors back over the file they were loaded from.
-
-mx.load() returns lazily file-backed arrays; saving them to their own source path
-truncates the file before they are read. From mlx 0.32.1 that surfaces as "[read]
-Unable to read from file", which took the Apple Silicon lane red on 2026-08-18 with
-no change on our side.
-
-How it surfaces depends on the backend, which matters when reading a failure here.
-On CPU the bad save raises on the spot. On Metal it returns quietly and leaves the
-failed read pending on the graph, so it lands on the NEXT mx.eval touching
-file-backed arrays, which can be an unrelated later test in the same process.
-
-Re-saving into the directory you loaded from is the ordinary lifecycle for adapters
-(switch/merge) and optimizer state (resume, checkpoint), so each writer materializes
-and writes through a temp file. These tests pin that per writer.
-"""
+"""Re-saving lazily loaded adapters or optimizer state over their own source must work, so writers use a temp file; mlx
+0.32.1 raises on CPU but defers to the next mx.eval on Metal."""
 
 import os
 import stat
@@ -38,9 +24,7 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
-# The Linux lane answers `import mlx.core` with the torch-backed simulation in
-# tests/mlx_simulation/, which saves eagerly and so has no laziness to protect.
-# Asserting these against it would only pin the simulation.
+# On Linux, import mlx.core is the torch-backed simulation in tests/mlx_simulation/, which saves eagerly; asserting against it would only pin the simulation.
 if mx.__name__ != "mlx.core":
     pytest.skip(
         "needs real mlx, not the torch-backed simulation", allow_module_level=True
@@ -54,10 +38,7 @@ def _adapter_tensors():
     }
 
 
-# There is deliberately no test that performs a bare save-over-source to pin the
-# upstream behaviour. On Metal that call does not raise; it poisons the graph, and
-# the error then lands on whichever test evaluates file-backed arrays next. Such a
-# test fails on the platform it is meant to protect and takes its neighbours with it.
+# No bare save-over-source test on purpose: on Metal it poisons the graph instead of raising, and the error lands on the next file-backed evaluation.
 
 
 def test_saving_adapters_back_over_their_source_survives(tmp_path, monkeypatch):
@@ -138,11 +119,7 @@ def test_vlm_processor_failure_preserves_finished_adapter(tmp_path, failure):
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
 def test_resaving_adapters_keeps_the_targets_permissions(tmp_path, monkeypatch):
-    """os.replace() installs a new inode, so the temp file must inherit the mode.
-
-    An in-place write kept whatever mode the adapter had. Without inheriting it, a
-    re-save of a deliberately private 0600 adapter widens it to the umask default.
-    """
+    """os.replace() installs a new inode, so the temp file must inherit the target mode; otherwise re-saving widens a private 0600 adapter to the umask default."""
     from unsloth_zoo.mlx import utils as mlx_utils
     from unsloth_zoo.mlx.utils import _save_adapter_artifacts
 
@@ -182,13 +159,7 @@ def test_resaving_optimizer_state_keeps_the_targets_permissions(tmp_path):
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
 def test_resaving_keeps_the_targets_group(tmp_path, monkeypatch):
-    """A group-shared checkpoint must not move to the writer's primary group.
-
-    os.replace() installs the temp file's inode, and outside a setgid directory
-    that inode carries the writer's primary group, so a 0640 checkpoint shared
-    with collaborators via its group silently stops being readable by them.
-    Restoring a different owner needs privileges, but the group does not.
-    """
+    """os.replace() gives the temp inode the writer's primary group outside setgid dirs, so the target's group must be restored, which needs no privileges."""
     others = [g for g in os.getgroups() if g != os.getgid()]
     if not others:
         pytest.skip("needs a second group to move the file between")

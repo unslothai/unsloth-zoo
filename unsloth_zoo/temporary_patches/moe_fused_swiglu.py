@@ -17,7 +17,7 @@
 
 eager_rounding=True replays the eager ATen op chain (bit-identical fwd + bwd); False rounds once.
 UNSLOTH_MOE_FUSED_SWIGLU: 0 off, 1 eager frames only (default), 2 also compiled frames. CUDA only
-(no ROCm: div.rn / fma pinned through PTX / libdevice); a failed launch falls back to the eager chain."""
+(no ROCm: div.rn / rcp.rn pinned through PTX); a failed launch falls back to the eager chain."""
 
 __all__ = [
     "ACT_SILU",
@@ -76,10 +76,14 @@ def _bf16_capable(gate_up) -> bool:
     # sm75 has no bf16 conversion instructions.
     if torch.compiler.is_compiling():
         return True
-    ok = _CACHE.get("bf16_ok")
+    # Per operand device: in a mixed system an older visible card must not disable fusion on a capable one.
+    index = gate_up.device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    key = ("bf16_ok", index)
+    ok = _CACHE.get(key)
     if ok is None:
-        n = torch.cuda.device_count()
-        ok = _CACHE["bf16_ok"] = n > 0 and all(torch.cuda.get_device_capability(i)[0] >= 8 for i in range(n))
+        ok = _CACHE[key] = torch.cuda.get_device_capability(index)[0] >= 8
     return ok
 
 
@@ -183,13 +187,13 @@ def moe_swiglu_backward_reference(grad, gate_up, act = ACT_SILU, interleaved = F
 if triton is not None:
 
     @triton.jit
-    def _rnd(x, ROUND: tl.constexpr, DT: tl.constexpr):
+    def _rnd(x, ROUND: tl.constexpr, DT: tl.constexpr):  # round to out dtype / out dtype
         if ROUND:
             return x.to(DT).to(tl.float32)
         return x
 
     @triton.jit
-    def _load_gate_up(GU, rows, cols, mask, s_m, s_c, N, INTERLEAVED: tl.constexpr):
+    def _load_gate_up(GU, rows, cols, mask, s_m, s_c, N, INTERLEAVED: tl.constexpr):  # gate / up interleaved columns
         base = GU + rows[:, None] * s_m
         if INTERLEAVED:
             g_col = cols.to(tl.int64) * 2
@@ -202,7 +206,7 @@ if triton is not None:
         return g, u, g_col, u_col
 
     @triton.jit
-    def _clamp_gptoss(g, u, LIMIT, ROUND: tl.constexpr, DT: tl.constexpr):
+    def _clamp_gptoss(g, u, LIMIT, ROUND: tl.constexpr, DT: tl.constexpr):  # round to out dtype / out dtype
         gc = _rnd(tl.where(g > LIMIT, LIMIT, g), ROUND, DT)
         uc = _rnd(tl.where(u > LIMIT, LIMIT, tl.where(u < -LIMIT, -LIMIT, u)), ROUND, DT)
         return gc, uc
@@ -220,11 +224,12 @@ if triton is not None:
     def _sigmoid(x):
         return _rcp_rn(1.0 + libdevice.exp(-x))
 
-    @triton.jit
+    # M (routed rows) runtime: BLOCK_M already buckets it; no extra %16 / == 1 variant per token count.
+    @triton.jit(do_not_specialize = ["M"])
     def _swiglu_fwd_kernel(
         GU, OUT, M, N, s_gm, s_gc, s_om, ALPHA, LIMIT,
-        ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,  # 1 gpt-oss clamp, else silu / interleaved / eager rounding
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,  # tile rows / tile intermediate cols
     ):
         rows = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
         cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -243,12 +248,12 @@ if triton is not None:
             y = s * u
         tl.store(OUT + rows[:, None] * s_om + cols[None, :], y.to(DT), mask = mask)
 
-    @triton.jit
+    @triton.jit(do_not_specialize = ["M"])
     def _swiglu_bwd_kernel(
         DY, GU, DGU, M, N, s_dm, s_dc, s_gm, s_gc, s_om, ALPHA, LIMIT,
-        ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,
-        G_MAX_INC: tl.constexpr, U_MAX_INC: tl.constexpr, U_MIN_INC: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+        ACT: tl.constexpr, INTERLEAVED: tl.constexpr, ROUND: tl.constexpr,  # 1 gpt-oss clamp, else silu / interleaved / eager rounding
+        G_MAX_INC: tl.constexpr, U_MAX_INC: tl.constexpr, U_MIN_INC: tl.constexpr,  # clamp bounds inclusive: gate max / up max / up min
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,  # tile rows / tile intermediate cols
     ):
         rows = tl.program_id(0).to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
         cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -288,8 +293,8 @@ if triton is not None:
             s = _rnd(_div_rn(g, 1.0 + libdevice.exp(-g)), ROUND, DT)
             d_up = dy * s
             d_s = _rnd(dy * u, ROUND, DT)
-            # nvcc contracts silu_backward's inner mul-add to an fma.
-            d_gate = (d_s * sig) * libdevice.fma(g, 1.0 - sig, 1.0)
+            # nvcc fuses this mul-add to an fma; tl.fma since Triton main removed libdevice.fma.
+            d_gate = (d_s * sig) * tl.fma(g, 1.0 - sig, 1.0)
         d_gate = d_gate.to(DT)
         d_up = d_up.to(DT)
         if INTERLEAVED:
@@ -477,15 +482,30 @@ def _bits_equal(a, b):
     return torch.equal(a.contiguous().view(iv), b.contiguous().view(iv))
 
 
+def _identity(t):
+    return t
+
+
 def fused_swiglu_self_check(device, dtype, act, interleaved, alpha = 1.702, limit = 7.0) -> bool:
     """Cached bitwise probe of fused fwd + bwd vs eager autograd; eager ATen bits change across torch releases."""
     key = ("self_check", str(device), dtype, int(act), bool(interleaved), float(alpha), float(limit))
     hit = _CACHE.get(key)
     if hit is not None:
         return hit
-    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+    if torch.compiler.is_compiling():
         return False
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            return False
     ok = False
+    # First call may sit in a non-reentrant checkpoint region; identity saved_tensors_hooks (innermost wins) keep the
+    # probe self-contained, since outer hooks would count its tensors (CheckpointError) and its grad would trigger a
+    # nested recompute.
+    try:
+        hooks = torch.autograd.graph.saved_tensors_hooks(_identity, _identity)
+        hooks.__enter__()
+    except Exception:
+        return False  # hooks disabled here (e.g. a functorch transform): eager now, probe again later
     try:
         with torch.inference_mode(False), torch.enable_grad(), torch.cuda.device(device):
             gen = torch.Generator(device = device).manual_seed(1234)
@@ -512,6 +532,8 @@ def fused_swiglu_self_check(device, dtype, act, interleaved, alpha = 1.702, limi
         if isinstance(err, torch.cuda.OutOfMemoryError):
             raise
         ok = False
+    finally:
+        hooks.__exit__(None, None, None)
     _CACHE[key] = ok
     return ok
 

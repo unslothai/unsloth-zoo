@@ -34,12 +34,14 @@ class _DeprecatedEntry:
         return getattr(self._entry, name)
 
 
-def test_deprecated_dynamo_key_is_not_written(monkeypatch):
+def test_deprecated_dynamo_key_is_not_written(monkeypatch, request):
     key = "numpy_default_float"
     assert key in dynamo_config._config
-    monkeypatch.setattr(dynamo_config, key, "float64")
+    # config.patch, not monkeypatch: pytest 9.2's undo deletes a ConfigModule key it cannot see in __dict__.
+    patched = dynamo_config.patch({key: "float64", "recompile_limit": 8})
+    patched.__enter__()
+    request.addfinalizer(lambda: patched.__exit__(None, None, None))
     monkeypatch.setitem(dynamo_config._config, key, _DeprecatedEntry(dynamo_config._config[key]))
-    monkeypatch.setattr(dynamo_config, "recompile_limit", 8)
 
     patch_torch_compile(debug = False, O3 = False, ignore_errors = True)
 

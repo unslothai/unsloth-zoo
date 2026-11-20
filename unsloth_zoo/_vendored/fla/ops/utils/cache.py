@@ -62,6 +62,104 @@ class FlaCacheMode(enum.Enum):
 FLA_CACHE_MODE: FlaCacheMode = FlaCacheMode.from_env()
 logger = logging.getLogger(__name__)
 
+# Unsloth: a cold autotune key compiles every config before benchmarking it, and those compiles
+# ran one at a time: most of a cold first Qwen3.5 / Qwen3.6 training step. Triton releases the
+# GIL while compiling, so the configs are compiled together on a thread pool through Triton's
+# AsyncCompileMode and the benchmark then finds them compiled. The configs and the benchmark are
+# unchanged. Triton >= 3.6 (3.5's AsyncCompileMode re-raises a failed compile on exit);
+# UNSLOTH_FLA_PARALLEL_COMPILE=0 turns it off.
+try:
+    import inspect as _inspect
+
+    from triton.runtime._async_compile import AsyncCompileMode as _AsyncCompileMode
+    if "ignore_errors" not in _inspect.signature(_AsyncCompileMode.__init__).parameters:
+        _AsyncCompileMode = None
+except Exception:
+    _AsyncCompileMode = None
+
+
+def _cpu_budget() -> int:
+    try:
+        n = len(os.sched_getaffinity(0))
+    except Exception:
+        n = os.cpu_count() or 1
+    try:  # cgroup v2 CPU quota (containers), which affinity does not show
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()[:2]
+        if quota != "max":
+            n = min(n, max(1, -(-int(quota) // int(period))))
+    except Exception:
+        pass
+    return n
+
+
+def _parallel_compile_threads() -> int:
+    if _AsyncCompileMode is None or os.environ.get("UNSLOTH_FLA_PARALLEL_COMPILE", "1") == "0":
+        return 0
+    return min(_cpu_budget(), 16)
+
+
+def _precompile_run(autotuner, args, kwargs, configs, threads) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(threads, thread_name_prefix = "fla_compile") as pool:
+        with _AsyncCompileMode(pool, ignore_errors = True):
+            for config in configs:
+                current = dict(kwargs, **config.all_kwargs())
+                current["warmup"] = True
+                try:
+                    autotuner.fn.run(*args, **current)
+                except Exception:
+                    pass
+
+
+def _precompile_configs(autotuner, args, kwargs, configs) -> None:
+    """Compile every config autotune is about to benchmark, in parallel; a config that fails to
+    compile fails again inside the benchmark, which skips it exactly as before."""
+    threads = _parallel_compile_threads()
+    if threads < 2 or len(configs) < 2:
+        return
+    import contextvars
+    try:
+        # AsyncCompileMode lives in a ContextVar and is cleared only after its compiles finish:
+        # a copied context keeps an interrupted round from leaving this thread in async mode.
+        contextvars.copy_context().run(_precompile_run, autotuner, args, kwargs, configs, min(threads, len(configs)))
+    except Exception as exc:
+        logger.debug("Parallel autotune compile skipped: %r", exc)
+
+
+def _full_autotune() -> bool:
+    return os.environ.get("UNSLOTH_FLA_FULL_AUTOTUNE", "0") == "1"
+
+
+def _operand_device(autotuner, kwargs):
+    for value in list((getattr(autotuner, "nargs", None) or {}).values()) + list(kwargs.values()):
+        if isinstance(value, torch.Tensor):
+            return value.device
+    return None
+
+
+def _drop_stage_only_twins(autotuner, configs, kwargs):
+    """Unsloth: before sm80 Triton never software-pipelines (its NVIDIA backend runs the pipeline
+    passes, the only readers of num_stages, for capability >= 80 only, Triton 3.3 to 3.9), so
+    configs that differ only in num_stages compile to the same kernel there; T4 compiled and
+    benchmarked each copy. Keep the first of each. UNSLOTH_FLA_FULL_AUTOTUNE=1 keeps all."""
+    if len(configs) < 2 or _full_autotune() or getattr(torch.version, "hip", None):
+        return configs
+    device = _operand_device(autotuner, kwargs)
+    # Triton compiles for the current device (fla's launchers set it to the operands').
+    if device is None or device.type != "cuda" or torch.cuda.get_device_capability()[0] >= 8:
+        return configs
+    seen, kept = set(), []
+    for config in configs:
+        key = (
+            tuple(sorted((k, repr(v)) for k, v in config.all_kwargs().items() if k != "num_stages")),
+            id(config.pre_hook),
+        )
+        if key not in seen:
+            seen.add(key)
+            kept.append(config)
+    return kept
+
 
 def sanitize_gpu_name(gpu_name: str) -> str:
     sanitized = re.sub(r"[^0-9A-Za-z]+", "_", gpu_name)
@@ -379,6 +477,19 @@ class CachedAutotuner(Autotuner):
                 self.maybe_load_cached_config(key)
         return super().run(*args, **kwargs)
 
+    def prune_configs(self, kwargs, *args, **kw):
+        # Unsloth: Autotuner.run prunes once per cold key, right before benchmarking the result.
+        configs = _drop_stage_only_twins(self, super().prune_configs(kwargs, *args, **kw), kwargs)
+        self._unsloth_to_compile = configs
+        return configs
+
+    def _bench(self, *args, config, **meta):
+        # Unsloth: the first benchmark of a round compiles all of the round's configs in parallel.
+        configs = self.__dict__.pop("_unsloth_to_compile", None)
+        if configs is not None:
+            _precompile_configs(self, args, meta, configs)
+        return super()._bench(*args, config=config, **meta)
+
     def maybe_load_cached_config(self, key: AutotuneKey):
         best_config = load_cached_config(self.kernel_name, key)
 
@@ -386,6 +497,15 @@ class CachedAutotuner(Autotuner):
             kw = best_config["kwargs"]
             num_warps = best_config["num_warps"]
             num_stages = best_config["num_stages"]
+            # Unsloth: a cached num_warps the kernel's config list no longer offers (e.g. the 8-warp
+            # configs dropped on Blackwell with Triton < 3.8 for the TMEM tl.dot race) is not used.
+            allowed_warps = {c.num_warps for c in self.configs}
+            if allowed_warps and num_warps not in allowed_warps:
+                logger.debug(
+                    "Ignoring cached config for kernel %s: num_warps=%s is not in %s on this host",
+                    self.kernel_name, num_warps, sorted(allowed_warps),
+                )
+                return
 
             extra = {
                 "num_ctas": best_config["num_ctas"],

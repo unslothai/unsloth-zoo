@@ -14,13 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_VLLM_SUFFIX_DECODING turns on vLLM suffix decoding for fast_inference engines.
-
-Off by default. On, load_vllm passes speculative_config={"method": "suffix", ...} only
-when the installed vLLM lists the "suffix" method (vLLM >= 0.11.1) and Arctic Inference
-is importable, and refuses with a clear message otherwise. load_vllm needs a GPU, so the
-helper is exercised on its own and the wiring is checked on the AST.
-"""
+"""UNSLOTH_VLLM_SUFFIX_DECODING (off by default) makes load_vllm pass speculative_config with method 'suffix' only when
+vLLM >= 0.11.1 lists it and Arctic Inference imports; else it refuses; wiring is checked on the AST since load_vllm
+needs a GPU."""
 
 import ast
 import json
@@ -185,8 +181,8 @@ def test_load_vllm_memory_retry_uses_the_refitting_shrink():
 
 
 def test_return_args_callers_get_no_speculative_config():
-    # SyntheticDataKit stringifies load_vllm(return_args = True) into `vllm serve` flags;
-    # str(dict) is not JSON, so --speculative-config would make vLLM's parser exit.
+    # SyntheticDataKit stringifies load_vllm(return_args = True) into vllm serve flags; str(dict) is not JSON, so
+    # --speculative-config would make the parser exit.
     load_vllm = next(n for n in ast.walk(_tree()) if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
     assigns = [
         n for n in ast.walk(load_vllm)

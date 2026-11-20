@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""unsloth-zoo#1751: fused CE under FSDP2 when lm_head is its own FSDP group.
-
-accelerate >= 1.15 shards an untied lm_head (plus the final norm it can find) in a separate
-group whose all-gather only fires when lm_head is called. The fused losses read lm_head.weight
-instead, so on two gloo ranks the stock forward below died with "aten.mm.default got mixed
-torch.Tensor and DTensor". Loss and the reduced lm_head gradient must match a plain reference.
-"""
+"""unsloth-zoo issue 1751: with accelerate >=1.15 untied lm_head gets its own FSDP group that fused CE skips; loss and lm_head grad must match a plain reference."""
 
 import os
 import socket

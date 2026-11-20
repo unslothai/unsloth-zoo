@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 across the paths around the scoring helpers: a tied top-p
-cutoff, the logprob recompute helper, entropy scoring, and raw vllm.SamplingParams overrides."""
+"""Tests UNSLOTH_GRPO_TRUNCATED_SUPPORT=1 on the paths around the scoring helpers: tied top-p cutoffs, logprob
+recompute, entropy scoring and raw vllm.SamplingParams overrides."""
 
 import inspect
 import os
@@ -28,6 +28,13 @@ import torch
 import unsloth_zoo.rl_replacements as rr
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_grpo_truncated_support import _vllm_processed_logprobs  # noqa: E402
+
+
+@pytest.fixture(autouse = True)
+def _log_prob_route(monkeypatch):
+    # These stub UnslothEfficientGRPO, the log-prob route; test_grpo_fused_route.py covers the forward-gradient one.
+    import unsloth_zoo.fused_losses.fused_grpo as _fused_grpo
+    monkeypatch.setattr(_fused_grpo, "GRPO_FWD_GRAD", False)
 
 
 @pytest.mark.parametrize("top_p", [0.9, 0.1])
@@ -130,8 +137,7 @@ def test_recompute_helper_takes_the_truncated_support(monkeypatch):
 
 
 def test_refused_trainer_scores_the_full_vocabulary(monkeypatch):
-    # No old / ref logps here (beta = 0, efficient path): only unsloth's refusal can tell the loss
-    # that the current policy's kept set is not the sampler's.
+    # No old or ref logps here (beta = 0, efficient path), so only unsloth's refusal can tell the loss that the current policy's kept set is not the sampler's.
     full = _new_logps(monkeypatch, support = False)
     torch.testing.assert_close(_new_logps(monkeypatch, support = True, refused = True), full)
     assert not torch.allclose(_new_logps(monkeypatch, support = True), full)
@@ -145,8 +151,7 @@ def test_entropy_scoring_keeps_the_truncated_support(monkeypatch):
 
 
 class _RawSamplingParams:
-    """vllm.SamplingParams built directly, so it has no _set_kwargs (explicit keyword signature,
-    as grpo_update_SamplingParams reads it)."""
+    """vllm.SamplingParams built directly has no _set_kwargs, so grpo_update_SamplingParams reads its explicit keyword signature instead."""
 
     def __init__(
         self, n = 1, temperature = 1.0, top_p = 1.0, top_k = 0, min_p = 0.0, repetition_penalty = 1.0,
@@ -158,7 +163,7 @@ class _RawSamplingParams:
                 setattr(self, key, value)
 
 
-# unsloth >= #11595 grpo_update_SamplingParams (unsloth/models/rl_replacements.py), verbatim; the
+# Verbatim copy of grpo_update_SamplingParams from unsloth after change 11595 (unsloth/models/rl_replacements.py); the
 # compiled trainer module defines it, so the trainer class's module carries it.
 _UNSLOTH_UPDATE = '''
 import inspect
@@ -225,6 +230,8 @@ def _raw_trainer(trainer_class = None, **raw):
 def test_raw_sampling_params_follow_unsloth_generation(monkeypatch):
     # Current unsloth applies the raw fields that differ from SamplingParams(), so scoring does too.
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
+    # support_triton_sampler follows the installed vLLM; pinned so the kwargs compare exactly.
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER", "pytorch")
     klass = _compiled_trainer_class(monkeypatch)
     assert rr.grpo_truncated_support_kwargs(_raw_trainer(klass, top_k = 20)) == {
         "support_top_k": 20, "support_top_p": 0.9, "support_min_p": 0.0,
@@ -241,10 +248,12 @@ def test_raw_sampling_params_follow_unsloth_generation(monkeypatch):
 
 
 def test_raw_sampling_params_follow_zoo_generation_helper(monkeypatch):
-    # Without the unsloth copy (unsloth before #11595), generation goes through this module's
-    # grpo_update_SamplingParams, which only copies non-empty list / tuple fields: raw scalars never
-    # reach the rollout, so scoring must not use them either.
+    # Without unsloth's copy (unsloth before change 11595), generation uses this module's grpo_update_SamplingParams,
+    # which copies only non-empty list / tuple fields: raw scalars never reach the rollout, so scoring must not use
+    # them.
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
+    # support_triton_sampler follows the installed vLLM; pinned so the kwargs compare exactly.
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER", "pytorch")
     applied = rr.grpo_update_SamplingParams(_RawSamplingParams, {}, _RawSamplingParams(top_k = 20, top_p = 0.8, stop = ["x"]))
     assert applied == {"stop": ["x"]}
     assert rr.grpo_truncated_support_kwargs(_raw_trainer(top_k = 20, top_p = 0.8)) == {
@@ -254,8 +263,8 @@ def test_raw_sampling_params_follow_zoo_generation_helper(monkeypatch):
 
 
 def test_boundary_tied_sampled_token_is_in_the_denominator():
-    # 100 equal logits at top_p = 0.9 keep 90 of them. A sampled token the sort dropped must take one
-    # kept token's place: logprob -log(90) and d/dlogit = 1 - 1/90, as for a kept token.
+    # 100 equal logits at top_p = 0.9 keep 90; a sampled token the sort dropped takes a kept token's place: logprob
+    # -log(90), d/dlogit = 1 - 1/90 as for a kept token.
     logits = torch.zeros(1, 100)
     keep = rr._truncated_support_mask(logits, 0, 0.9, 0.0)[0]
     for token in (int((~keep).nonzero()[0]), int(keep.nonzero()[0])):
@@ -274,10 +283,12 @@ def test_boundary_tied_sampled_token_is_in_the_denominator():
 
 
 def test_raw_sampling_params_temperature_is_not_a_false_blocker(monkeypatch):
-    # Neither generation helper applies a raw SamplingParams temperature (unsloth's skips it, this
-    # module's copies list fields only): the rollout samples at the trainer temperature, so a raw
-    # temperature must not block truncated scoring.
+    # Neither generation helper applies a raw SamplingParams temperature (unsloth skips it, this module copies list
+    # fields only): the rollout samples at the trainer temperature, so a raw temperature must not block truncated
+    # scoring.
     monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT", "1")
+    # support_triton_sampler follows the installed vLLM; pinned so the kwargs compare exactly.
+    monkeypatch.setenv("UNSLOTH_GRPO_TRUNCATED_SUPPORT_SAMPLER", "pytorch")
     want = {"support_top_k": 0, "support_top_p": 0.9, "support_min_p": 0.0}
     klass = _compiled_trainer_class(monkeypatch)
     for trainer in (_raw_trainer(klass, temperature = 0.7), _raw_trainer(temperature = 0.7)):

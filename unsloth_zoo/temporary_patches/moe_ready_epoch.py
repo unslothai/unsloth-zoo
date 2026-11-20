@@ -13,28 +13,9 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Process-wide expert-state stamp, so the grouped MoE readiness checks and NF4 pointer tables
-skip their O(experts) keys on every block call (forward, checkpoint replay, decode token).
-
-The stamp is (struct, step). `struct` moves on whatever can change a checked expert subtree:
-torch's global module / parameter / buffer registration hooks on a tracked module (every module of
-a checked subtree; not the throwaway ModuleList `self.layers[:n]` builds per forward), `_apply`
-(.to / .cuda / .half) on a tracked module, Module.requires_grad_, PEFT tuner-layer state methods
-(set_adapter, merge, unmerge, enable_adapters, delete_adapter, update_layer, scaling) and bump().
-`step` moves on every optimizer step; a cache then re-reads only a lean storage key (weight /
-absmax addresses, requires_grad), which bounds a hook-less `.data =` swap to one step.
-
-A cached verdict is reused only while the stamp (or the lean key), the call context and a spot
-signature of the first and last expert all match (see Record / valid). LoRA dropout is the one
-input that depends on train / eval, so non-Identity dropouts are compared on every call instead
-of wrapping Module.train (Trainer calls model.train() over every module each step). Subtrees with
-accelerate hooks (`_hf_hook`, which swap `_parameters` every forward) never get a record, nor do
-subtrees holding FSDP2 all-gathered weights (marked `_unsloth_fsdp2_gathered` by unsloth's
-fsdp2_qlora): FSDP2 frees and re-allocates their storage around every forward and backward, so
-their addresses move without any hook firing.
-
-UNSLOTH_MOE_FAST_READY=0 (read per call) runs the full checks on every call.
-"""
+"""Process-wide expert-state stamp so grouped MoE readiness and NF4 table checks skip per-expert scans; moves on module
+hooks, _apply, PEFT tuner state, and each optimizer step; accelerate-hooked or FSDP2-gathered subtrees are never
+cached; UNSLOTH_MOE_FAST_READY=0 runs full checks every call."""
 import functools
 import os
 import weakref
@@ -60,8 +41,7 @@ _PEFT_METHODS = (
 _WRAPPED = "_unsloth_moe_ready_wrapped"
 # Pointer-table caches whose held storages a move must release (rebuilt on the next call).
 _TABLES = ("_unsloth_nf4_stack_tables", "_unsloth_routed_nf4")
-# Tracked module -> weakref to the experts container that holds those caches (a move of one
-# expert or projection must release its ancestor's tables). Kept off the module so it pickles.
+# Tracked module -> weakref to its experts container, so a move of one expert or projection releases the ancestor's tables; kept off the module so it pickles.
 _OWNER = weakref.WeakKeyDictionary()
 
 
@@ -101,8 +81,8 @@ def _wrap_bumping(owner, name):
 
 
 def wrap_peft():
-    """Wrap the state methods of PEFT's BaseTunerLayer and every subclass defined so far (lora.bnb
-    and others import lazily, so the full checks call this again). Returns False without PEFT."""
+    """Wrap PEFT BaseTunerLayer state methods and every subclass defined so far (lora.bnb and others import lazily, so
+    full checks re-call); returns False without PEFT."""
     try:
         from peft.tuners.tuners_utils import BaseTunerLayer
     except Exception:
@@ -173,8 +153,7 @@ def track(modules):
 
 
 def scan(root):
-    """Track every module under `root` (itself included); returns (an accelerate hook was seen,
-    the non-Identity dropout modules)."""
+    """Track every module under `root`, itself included; returns (accelerate hook seen, the non-Identity dropout modules)."""
     hooked = False
     drops = []
     dropout = torch.nn.modules.dropout._DropoutNd
@@ -219,8 +198,8 @@ def _qs_key(qs):
 
 
 def _qs_ptrs(qs):
-    """Addresses the NF4 pointer tables embed: absmax, code and, when nested, state2 (absmax /
-    code) and the offset (a hook-less swap of any of them must re-key the tables)."""
+    """Storage addresses the NF4 pointer tables embed: absmax, code, and when nested, state2 (absmax / code) and the
+    offset; a hook-less swap of any must re-key the tables."""
     key = (_ptr(qs.absmax), _ptr(qs.code))
     if getattr(qs, "nested", False):
         s2, off = qs.state2, qs.offset
@@ -229,11 +208,8 @@ def _qs_ptrs(qs):
 
 
 class Lean:
-    """What a hook-less `.data =` / quant_state / absmax / compute dtype swap or requires_grad flip
-    changes, over the base projections' `__dict__`s: compute dtypes, weight and bias identity,
-    weight address and requires_grad, quant state identity and the addresses its tables embed
-    (_qs_ptrs). Re-read in C-level maps (one optimizer step bumps only the step stamp, so this runs
-    once per block per step)."""
+    """Lean view of base projections (compute dtypes, weight and bias identity and address, requires_grad, quant state)
+    that catches hook-less .data swaps; re-read once per block per step."""
     __slots__ = ("dicts", "params", "cds", "ws", "wptrs", "rgs", "qss", "aptrs", "bs", "brgs")
 
     def __init__(self, dicts):
@@ -272,10 +248,8 @@ class Lean:
 
 
 class Record:
-    """What a full check saw: the stamp it is valid at, the call context, the spot signature of
-    the end experts (and what keeps its ids alive), the Lean storage view, non-Identity dropouts and
-    their (training, p), and a token for the NF4 tables (new per full check, so a table re-keys
-    over every expert once after any expert-state change; a step re-validation keeps it)."""
+    """Snapshot of a full check (stamp, call context, end-expert spot signature, Lean view, dropouts); the NF4 table
+    token is new per full check, so tables re-key once after any expert-state change (step re-validation keeps it)."""
     __slots__ = ("stamp", "ctx", "spot", "lean", "drops", "drop_state", "gen", "refs")
 
     def __init__(self, ctx, spot, dicts, drops, refs):

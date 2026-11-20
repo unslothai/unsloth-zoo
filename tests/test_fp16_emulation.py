@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests for the dormant float16 matmul emulation.
-
-The important test here is not that the scaled split is accurate, it is that the UNSCALED
-split collapses at small magnitudes. float16's 5-bit exponent is the whole difficulty, and a
-split implementation that quietly stopped splitting would still pass an accuracy test run at
-magnitude 1.0. test_unscaled_underflows_at_small_magnitude fails if the cliff is absent.
-"""
+"""Tests for the dormant float16 matmul emulation; the key property is that the unscaled split collapses at small
+magnitudes (float16 5-bit exponent), and test_unscaled_underflows_at_small_magnitude fails if that cliff is absent."""
 import os
 import sys
 
@@ -50,19 +45,15 @@ def _reference(A, B):
 
 
 def _pair(m, k, n, mag = 0.02, device = "cuda"):
-    """Operand pair at a magnitude typical of LLM weights, which is below float16's
-    normal-range floor of 0.125 and therefore depends on the scaling to work at all."""
+    """Operand pair at an LLM-weight-typical magnitude, below float16's normal-range floor of 0.125, so it needs the scaling to work at all."""
     torch.manual_seed(3407)
     return (torch.randn(m, k, device = device) * mag,
             torch.randn(k, n, device = device) * mag)
 
 
 def _fp16_direct(A, B):
-    """float16 operands with float32 accumulate, i.e. what a tensor core actually does.
-
-    Not torch.mm(A.half(), B.half()), which also accumulates in float16 and is a different
-    and much worse baseline. The question here is the precision of the stored operands.
-    """
+    """float16 operands with float32 accumulate (what a tensor core does), not torch.mm(A.half(), B.half()), which
+    accumulates in float16 and is a much worse baseline; measures stored-operand precision."""
     return torch.mm(A.half().float(), B.half().float())
 
 
@@ -119,12 +110,8 @@ def test_scaled_split_holds_ieee_parity(magnitude):
 
 
 def test_unscaled_underflows_at_small_magnitude():
-    """The cliff below |x| = 0.125 must be reproducible.
-
-    If this passes trivially, the split is not actually splitting. At 1e-6 the low term is
-    entirely subnormal or zero, so the unscaled split should be no better than plain float16,
-    while the scaled split stays at IEEE parity.
-    """
+    """Cliff below |x| = 0.125 must reproduce: at 1e-6 the low term is subnormal or zero, so unscaled split is no better
+    than plain float16 while scaled stays at IEEE parity; a trivial pass means the split is not actually splitting."""
     torch.manual_seed(3407)
     A = torch.randn(256, 256) * 1e-6
     B = torch.randn(256, 256) * 1e-6
@@ -176,12 +163,7 @@ def test_autograd_matches_float32_matmul():
 
 
 def test_bf16_control_reproduces_upstream_relationship():
-    """bf16x3 9-product needs no scaling, because bfloat16 has float32's exponent range.
-
-    This is the control that validates the rig: it should track IEEE closely even unscaled,
-    which is the property that makes the upstream bfloat16 scheme work and the float16 port
-    require scaling.
-    """
+    """bf16x3 9-product needs no scaling since bfloat16 has float32's exponent range; this control tracks IEEE unscaled, which float16 cannot do without scaling."""
     torch.manual_seed(3407)
     A = torch.randn(256, 256) * 1e-6
     B = torch.randn(256, 256) * 1e-6
@@ -204,12 +186,8 @@ def test_compiles_fullgraph():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 def test_compiled_keeps_float32_accuracy():
-    """The regression that matters, and the reason _round_to is a custom op.
-
-    Without the opaque-op barrier Inductor fuses the float16 round trip away, the residual
-    becomes exactly 0, and this lands at plain-float16 error (~2.9e-04) while running
-    faster. Compiled output must stay at float32 parity, not merely be finite.
-    """
+    """_round_to is a custom op: without the opaque-op barrier Inductor fuses the float16 round trip away, the residual
+    becomes 0 and error rises to plain float16 (~2.9e-04); output must keep float32 parity."""
     A, B = _pair(2048, 2048, 2048, mag = 0.02)
     ref = A.double() @ B.double()
     rel = lambda t: ((t.double() - ref).norm() / ref.norm()).item()
@@ -235,8 +213,8 @@ def test_round_to_actually_rounds_under_compile():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 def test_pow2_exponent_applies_cleanly_at_extremes():
-    """A materialised scale is unusable here however it is stored: 2**128 overflows float32,
-    and a 0-dim float64 scale still promotes down to float32 when applied. ldexp does not."""
+    """A materialised scale is unusable however it is stored: 2**128 overflows float32, and a 0-dim float64 scale still
+    promotes down to float32 when applied; ldexp does not."""
     x = torch.tensor([2.0 ** -114])
     n = pow2_exponent(x)
     assert 2.0 ** n.item() == pow2_scale(x)
@@ -245,8 +223,7 @@ def test_pow2_exponent_applies_cleanly_at_extremes():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 def test_round_to_does_not_alias_when_dtype_matches():
-    """.to(dtype) returns the input itself when the dtype already matches, and a custom op
-    declaring no aliasing may not return one of its inputs."""
+    """.to(dtype) returns the input itself when dtype already matches, and a custom op declaring no aliasing may not return one of its inputs."""
     A = torch.randn(8, 8, device = "cuda")
     terms = split_terms(A, torch.float32, 2)
     assert terms[0] is not A
@@ -255,8 +232,7 @@ def test_round_to_does_not_alias_when_dtype_matches():
 
 
 def test_pow2_exponent_matches_pow2_scale():
-    """The sync-free form must give the same number, not merely a similar one. Runs on CPU:
-    it is device-independent, and the CPU gate executes this file."""
+    """The sync-free pow2_exponent must give exactly the pow2_scale value; runs on CPU since it is device-independent and the CPU gate executes this file."""
     for mag in (1e-6, 1e-3, 0.1, 1.0, 1e3):
         x = torch.randn(256, 256) * mag
         assert 2.0 ** pow2_exponent(x).item() == pow2_scale(x)
@@ -265,21 +241,14 @@ def test_pow2_exponent_matches_pow2_scale():
 
 
 # ---------------------------------------------------------------- degenerate operands
-#
-# Each of these returned something silently wrong before: a NaN, a zero, or an exception,
-# where torch.mm returns the right answer. The emulation advertises itself as a float32
-# matmul stand-in, so "wrong but fast" is the one outcome it must not have.
+# Degenerate operands where torch.mm is right: the emulation must not silently return a NaN or zero, or raise; as a
+# float32 matmul stand-in, wrong-but-fast is the one outcome it must not have.
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 def test_out_dtype_probe_matches_a_direct_call():
-    """aten::mm.dtype is CUDA-only. Probing it on CPU raises NotImplementedError, which
-    subclasses RuntimeError, so a CPU probe would cache False and disable the tensor-core
-    path the module exists for.
-
-    Asserted against a direct attempt rather than against True: pyproject allows torch>=2.4,
-    and out_dtype only landed in 2.8, so False is the correct answer on a supported older
-    install and this must not fail there.
-    """
+    """aten::mm.dtype is CUDA-only: a CPU probe raises NotImplementedError, a RuntimeError subclass, so it would cache
+    False and disable the tensor-core path; compare with a direct call since out_dtype needs torch 2.8 while
+    pyproject allows torch>=2.4, so False is correct on older installs."""
     from unsloth_zoo.fp16_emulation import _has_out_dtype
     zero = torch.zeros(1, 1, dtype = torch.float16, device = "cuda")
     try:
@@ -307,8 +276,7 @@ def test_scale_that_would_overflow_float32():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 def test_scale_product_overflows_but_operands_do_not():
-    """Each scale is representable at 2**69; only sA * sB overflows, so the division is
-    done one scale at a time."""
+    """Each scale is representable at 2**69 but sA * sB overflows, so the division is applied one scale at a time."""
     A = torch.tensor([[2.0 ** -55]], device = "cuda")
     B = torch.tensor([[2.0 ** -55]], device = "cuda")
     assert torch.allclose(fp16_split_mm(A, B).double(), A.double() @ B.double(), rtol = 1e-5)
@@ -316,8 +284,7 @@ def test_scale_product_overflows_but_operands_do_not():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 def test_large_times_small_does_not_overflow_intermediately():
-    """2**114 @ 2**-113 is 2.0. Applying the inverse scales one at a time passes through inf
-    in either order, so the combined exponent goes on in a single ldexp."""
+    """2**114 @ 2**-113 is 2.0; applying the inverse scales one at a time passes through inf in either order, so the combined exponent goes in one ldexp."""
     A = torch.tensor([[2.0 ** 114]], device = "cuda")
     B = torch.tensor([[2.0 ** -113]], device = "cuda")
     assert torch.allclose(fp16_split_mm(A, B).double(), A.double() @ B.double(), rtol = 1e-5)
@@ -325,9 +292,8 @@ def test_large_times_small_does_not_overflow_intermediately():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 def test_ordinary_tensors_are_not_diverted_to_the_fallback():
-    """The dynamic-range guard is a catastrophe guard. A tighter bound would fire on ordinary
-    randn operands, whose hi/lo runs past 2**23 on any near-zero entry, and would quietly
-    replace the emulation with float32 mm on the workload it exists for."""
+    """The dynamic-range guard is a catastrophe guard only: a tighter bound would fire on ordinary randn operands (hi/lo
+    runs past 2**23) and silently replace the emulation with float32 mm on the workload it exists for."""
     from unsloth_zoo.fp16_emulation import _split_can_represent
     A, B = _pair(1024, 1024, 1024, mag = 0.02)
     assert _split_can_represent(A) and _split_can_represent(B)
@@ -335,8 +301,7 @@ def test_ordinary_tensors_are_not_diverted_to_the_fallback():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 def test_within_tensor_range_wider_than_float16():
-    """One per-tensor scale cannot hold a range this wide, so the small entries would round
-    to zero. Falls back to float32 rather than returning an all-zero matrix."""
+    """One per-tensor scale cannot hold a range this wide, so small entries would round to zero; falls back to float32 rather than an all-zero matrix."""
     A = torch.diag(torch.tensor([1.0, 2.0 ** -39], device = "cuda"))
     B = torch.diag(torch.tensor([1.0, 2.0 ** 39], device = "cuda"))
     assert torch.allclose(fp16_split_mm(A, B).diagonal(), torch.ones(2, device = "cuda"))
@@ -352,8 +317,7 @@ def test_empty_dimension_matches_torch_mm():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 def test_float32_accumulate_survives_autocast():
-    """torch.mm is autocast-eligible, so .float() operands alone do not keep the fallback in
-    float32 inside an autocast region."""
+    """torch.mm is autocast-eligible, so .float() operands alone do not keep the fallback in float32 inside an autocast region."""
     A, B = _pair(512, 512, 512, mag = 0.02)
     ref = A.double() @ B.double()
     with torch.autocast(device_type = "cuda", dtype = torch.float16):

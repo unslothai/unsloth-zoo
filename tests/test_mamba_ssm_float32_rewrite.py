@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""fix_mamba_ssm_float32 must rewrite ssd_chunk_scan.py atomically: an in-place write let a
-concurrent reader see an empty module (issue: "cannot import name '_chunk_scan_fwd'")."""
+"""Tests fix_mamba_ssm_float32 rewrites ssd_chunk_scan.py atomically: an in-place write let a concurrent reader see an
+empty module (cannot import name '_chunk_scan_fwd')."""
 
 import ast
 import builtins

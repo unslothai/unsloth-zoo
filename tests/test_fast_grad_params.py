@@ -14,13 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""unsloth_zoo.fast_grad_params: Trainer's per-step clip / zero_grad over a cached parameter tuple.
-
-Every training test runs the same model twice, UNSLOTH_FAST_GRAD_PARAMS=0 and on, and asserts
-BITWISE equal per-microstep losses, logged grad norms and final weights, plus the engagement
-counters (FAST_GRAD_CALLS) of the fast arm. Unit tests pin each guard: the cache invalidations,
-the Accelerator / generator / flag gates, torch's zero_grad semantics.
-"""
+"""Tests unsloth_zoo.fast_grad_params (per-step clip and zero_grad over a cached parameter tuple); training tests
+require bitwise-equal losses, grad norms and weights with UNSLOTH_FAST_GRAD_PARAMS=0 vs on, plus FAST_GRAD_CALLS
+engagement."""
 import contextlib
 import functools
 import json
@@ -90,8 +86,8 @@ def _first_lora(model):
 
 def _train(model, out, kind = "hf", ga = 1, max_grad_norm = 1.0, steps = 10, events = None, set_to_none = True,
            calls = 1, between = None, **extra):
-    """(exact losses per microstep, logged grad norms, final weights). `events[k](model)` runs after
-    microstep k's backward; `between(trainer)` runs between `calls` train() calls."""
+    """Result tuple: exact per-microstep losses, logged grad norms and final weights; events[k](model) runs after
+    microstep k's backward; between(trainer) runs between train() calls."""
     from transformers import TrainerCallback, TrainingArguments, Trainer
     if kind == "sft":
         from trl import SFTConfig, SFTTrainer
@@ -101,8 +97,8 @@ def _train(model, out, kind = "hf", ga = 1, max_grad_norm = 1.0, steps = 10, eve
         tok.pad_token = tok.eos_token
         kw = dict(processing_class = tok, train_dataset = _dataset(labels = False))
         extra.setdefault("max_length", 64)
-        # SFTConfig turns bf16 on by default, which TrainingArguments refuses on a host without a bf16
-        # accelerator; TrainingArguments' own default (off) is what the hf arm already runs with there.
+        # SFTConfig defaults bf16 on, which TrainingArguments refuses without a bf16 accelerator; bf16 is set only when
+        # CUDA supports it, matching the hf arm's default off.
         extra.setdefault("bf16", torch.cuda.is_available() and torch.cuda.is_bf16_supported())
     else:
         base, Args = Trainer, TrainingArguments
@@ -475,8 +471,7 @@ def test_flat_params_is_parameters_order():
 
 
 def test_forward_does_not_invalidate():
-    """transformers' `self.layers[:n]` builds a new ModuleList (module registrations) every forward:
-    outside the cached tree, so no rebuild."""
+    """transformers' self.layers[:n] builds a new ModuleList every forward, but it is outside the cached tree, so forward does not invalidate the cache."""
     m = _llama()
     F._flat_params(m)
     gen = F._GEN[0]
@@ -490,8 +485,8 @@ def test_forward_does_not_invalidate():
 
 
 def test_train_call_rebuilds(tmp_path):
-    """A direct _parameters edit (no registration hook) between train() calls is picked up by the
-    Trainer.train bump alone (prepare_model's bump disabled here)."""
+    """A direct _parameters edit (no registration hook) between train() calls is picked up by the Trainer.train bump
+    alone; prepare_model's bump is disabled in this test."""
     from accelerate import Accelerator
     import unittest.mock as mock
     model = _llama()
@@ -507,8 +502,7 @@ def test_train_call_rebuilds(tmp_path):
 
 
 def test_prepare_model_rebuilds(tmp_path):
-    """Same, with Trainer.train unwrapped (a subclass that captured it before the wrap): the
-    Accelerator.prepare_model bump inside train() rebuilds."""
+    """With Trainer.train unwrapped (a subclass captured it before the wrap), the Accelerator.prepare_model bump inside train() still triggers the rebuild."""
     from transformers import Trainer
     import unittest.mock as mock
     model = _llama()
@@ -656,8 +650,8 @@ json.dump({"flag_base": flag_base, "flag_peft": F._is_flagged(model), "losses": 
 
 
 def test_unsloth_fast_language_model_path(tmp_path):
-    """FastLanguageModel.from_pretrained + get_peft_model flag the model (zoo's loader wrapper);
-    the Trainer step runs the fast clip / zero_grad and equals UNSLOTH_FAST_GRAD_PARAMS=0."""
+    """FastLanguageModel.from_pretrained and get_peft_model flag the model via zoo's loader wrapper; the Trainer step
+    with fast clip/zero_grad must equal UNSLOTH_FAST_GRAD_PARAMS=0."""
     if DEV != "cuda":
         pytest.skip("Unsloth needs CUDA")
     pytest.importorskip("unsloth")

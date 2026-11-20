@@ -134,6 +134,8 @@ class _MLXLoader:
 
 
 _MLX_PREFIXES = ("mlx", "mlx_lm", "mlx_vlm")
+# Speculative decoding is not simulated; fabricating it would report the engine available.
+_UNSIMULATED_PACKAGE = "mlx_vlm.speculative"
 
 
 class _MLXFinder(MetaPathFinder):
@@ -141,6 +143,9 @@ class _MLXFinder(MetaPathFinder):
     _loader = _MLXLoader()
 
     def find_spec(self, fullname, path, target=None):
+        # The module shadows the builtin any() with mlx.core's.
+        if fullname == _UNSIMULATED_PACKAGE or fullname.startswith(_UNSIMULATED_PACKAGE + "."):
+            return None
         for prefix in _MLX_PREFIXES:
             if fullname == prefix or fullname.startswith(prefix + "."):
                 if fullname not in sys.modules:

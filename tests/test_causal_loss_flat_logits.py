@@ -103,6 +103,29 @@ def test_a_custom_ignore_index_matches_the_stock_loss(patched_loss, flat):
         )
 
 
+def test_a_custom_ignore_index_scores_half_logits_in_float32(patched_loss):
+    # 4000 tokens at nll 20 sum to 80000, past float16's 65504.
+    stock, unsloth = patched_loss
+    tokens, vocab = 4001, 4
+    logits = torch.zeros(1, tokens, vocab, dtype = torch.float16)
+    logits[..., 3] = 20
+    labels = torch.zeros(1, tokens, dtype = torch.long)
+    labels[:, 0] = -1
+    count = torch.tensor(tokens - 1)
+    got = unsloth(logits, labels, vocab, num_items_in_batch = count, ignore_index = -1)
+    assert torch.isfinite(got)
+    torch.testing.assert_close(got, torch.tensor(20.0))
+    torch.testing.assert_close(got, stock(logits, labels, vocab, num_items_in_batch = count, ignore_index = -1))
+
+    g = torch.Generator().manual_seed(0)
+    logits = torch.randn(1, 64, 11, generator = g).bfloat16()
+    labels = torch.randint(0, 11, (1, 64), generator = g)
+    labels[0, :3] = -1
+    torch.testing.assert_close(
+        unsloth(logits, labels, 11, ignore_index = -1), stock(logits, labels, 11, ignore_index = -1),
+    )
+
+
 @pytest.mark.parametrize("labels_present", [False, True])
 def test_explicit_targets_preserve_boundary_loss_and_gradient(patched_loss, labels_present):
     stock, unsloth = patched_loss

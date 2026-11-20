@@ -4991,8 +4991,7 @@ def test_the_hub_allowance_reads_the_real_hostname():
         'head = r.content[:8]\n'
     ) == []
 
-    # The hub through an f-string is still the hub, including upstream's own
-    # f"{BASE_DOMAIN}/{path}" and a BASE_DOMAIN with no trailing path.
+    # An f-string of the hub is still the hub, including upstream f"{BASE_DOMAIN}/{path}" and a BASE_DOMAIN with no trailing path.
     assert _beside_the_hub('f"https://huggingface.co/api/models/{name}"') == []
     assert _beside_the_hub('f"{HUB}/api/models"') == []
     assert _beside_the_hub('"https://huggingface.co"') == []

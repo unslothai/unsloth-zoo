@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""unslothai/unsloth#3419: a fullgraph = False region calling a fullgraph = True one whose Conv2d
-carries accelerate's disabled `AlignDevicesHook` (InternVL on a split device map) must not raise."""
+"""Regression test (unslothai/unsloth issue 3419): a fullgraph = False region calling a fullgraph = True one whose
+Conv2d carries accelerate's disabled AlignDevicesHook must not raise."""
 
 import os
 import subprocess

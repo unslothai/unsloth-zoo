@@ -54,24 +54,18 @@ __all__ = [
     "resolve_responses_only_num_proc",
 ]
 
-# Escape hatch: a positive integer forces that count verbatim (no cap, no
-# start-method veto), "0"/"none" forces in-process tokenization.
+# Escape hatch: a positive integer forces that count verbatim (no cap, no start-method veto); 0 or none forces in-process tokenization.
 NUM_PROC_ENV_VAR = "UNSLOTH_DATASET_NUM_PROC"
 
-# Upper bound for the *auto* count only; raise it via NUM_PROC_ENV_VAR. The old
-# min(max(cpu_count + 4, 2), 64) forked up to 64 workers, each handed its own
-# dill-pickled tokenizer closure and an Arrow shard over a pipe. Measured on
-# 8000 rows, Qwen2.5 fast tokenizer, 3 reps: None 6.3s, 1 9.5s, 8 8.1s,
-# 32 14.2s, 64 21.7s -- more workers were slower than none at every size.
+# Upper bound for the auto count only, raised via NUM_PROC_ENV_VAR; the old heuristic forked up to 64 workers, each
+# handed a dill-pickled tokenizer closure and an Arrow shard, and more workers were slower than none at every size.
 AUTO_NUM_PROC_CAP = 8
 
 # ~680 MB peak RSS per worker on that run, flat across counts; 1 GB for headroom.
 WORKER_MEMORY_BUDGET_GB = 1.0
 
-# Share of *available* RAM tokenization may spend; the rest belongs to the run
-# that follows. This is what bounds issue #2693, where OOM-killed workers
-# surface only as "One of the subprocesses has abruptly died during map
-# operation", the real cause discarded.
+# Share of available RAM tokenization may spend, the rest left for the run; bounds issue 2693, where OOM-killed workers
+# surface only as 'One of the subprocesses has abruptly died during map operation', hiding the real cause.
 MEMORY_BUDGET_FRACTION = 0.5
 
 # Mirrors _MIN_ROWS_FOR_MULTIPROC, a local inside
@@ -98,17 +92,8 @@ def _warn_once(key: str, message: str) -> None:
 
 
 def _unpinned_default_start_method(module) -> Optional[str]:
-    """The default start method of a module that has not pinned one yet.
-
-    ``get_all_start_methods()[0]`` is the documented default, but ``multiprocess``
-    copies that function verbatim -- darwin branch listing ``spawn`` first --
-    without copying the darwin default that goes with it, keeping ``fork`` as its
-    ``_default_context`` (``#FIXME: spawn`` in its ``context.py``). So its list
-    says ``spawn`` while its ``Pool`` forks, and ``datasets`` builds from
-    ``multiprocess``. Read the default context's own name instead; unlike
-    ``get_context()`` it does not assign ``_actual_context``, keeping the probe
-    side-effect free. Private attributes, hence the fallback.
-    """
+    """Read the name of the default context itself, since multiprocess lists spawn first yet its Pool forks; unlike
+    get_context() it does not assign _actual_context; private attributes, hence a fallback."""
     try:
         methods = module.get_all_start_methods()
     except Exception:
@@ -116,9 +101,8 @@ def _unpinned_default_start_method(module) -> Optional[str]:
 
     try:
         name = module.context._default_context._default_context._name
-        # Only if the platform actually offers it: a Windows runner answered
-        # 'fork' while get_all_start_methods() was ['spawn'], which would read
-        # Windows as forkable -- the spawn re-import loop of #3211 / #3397.
+        # Only if the platform offers it: a Windows runner answered 'fork' while get_all_start_methods() was ['spawn'],
+        # reading Windows as forkable and looping on spawn re-import (issues 3211, 3397).
         if isinstance(name, str) and name and (not methods or name in methods):
             return name
     except Exception:
@@ -127,11 +111,8 @@ def _unpinned_default_start_method(module) -> Optional[str]:
 
 
 def _module_start_method(module_name: str) -> Optional[str]:
-    """One module's start method. Raises if the module cannot be read at all.
-
-    Observing must not mutate: ``get_start_method(allow_none = False)`` pins
-    ``_actual_context``, which would make a later ``set_start_method()`` raise.
-    """
+    """Raises if the module cannot be read; observing must not call get_start_method(allow_none = False), which pins
+    _actual_context and makes a later set_start_method() raise."""
     module = __import__(module_name)
     method = module.get_start_method(allow_none = True)
     if method is None:
@@ -140,13 +121,8 @@ def _module_start_method(module_name: str) -> Optional[str]:
 
 
 def multiprocessing_start_method() -> Optional[str]:
-    """Return the start method ``datasets`` will actually use, or None.
-
-    ``datasets.arrow_dataset`` does ``from multiprocess import Pool``, so
-    ``multiprocess`` -- not stdlib ``multiprocessing`` -- decides how
-    ``Dataset.map(num_proc = ...)`` spawns workers. Falls back to the stdlib
-    module, then to None (the caller then treats forking as unavailable).
-    """
+    """Start method datasets will use, or None: datasets imports Pool from multiprocess, not stdlib multiprocessing, so
+    multiprocess decides, falling back to stdlib; None means the caller treats forking as unavailable."""
     for module_name in ("multiprocess", "multiprocessing"):
         try:
             return _module_start_method(module_name)
@@ -156,19 +132,9 @@ def multiprocessing_start_method() -> Optional[str]:
 
 
 def _workers_unusable_reason() -> Optional[str]:
-    """Why ``datasets`` workers cannot be used here, or None when they can.
-
-    * **Not ``fork``.** The child must re-import the dynamically generated
-      trainer module, which has no importable name, so it cannot come up at all.
-
-    * **macOS, whatever the start method says.** CPython moved the macOS default
-      to ``spawn`` in 3.8 (bpo-33725) because forking there "can lead to crashes
-      of the subprocess as macOS system libraries may start threads".
-      ``multiprocess`` never copied that, so ``datasets`` genuinely forks on
-      macOS out of a parent holding Torch and a threaded BLAS. Reporting that
-      truthfully is right; acting on it is not, so macOS stays in-process as a
-      stated policy rather than as a side effect of the probe.
-    """
+    """Non-fork workers cannot re-import the dynamically generated trainer module; macOS stays in-process by stated
+    policy, not as a probe side effect, since fork can crash there (CPython moved its default to spawn in 3.8,
+    bpo-33725; multiprocess never copied that)."""
     start_method = multiprocessing_start_method()
     if start_method != "fork":
         return f"this process uses the {start_method!r} start method"
@@ -178,13 +144,8 @@ def _workers_unusable_reason() -> Optional[str]:
 
 
 def _cgroup_cpu_quota() -> Optional[float]:
-    """This process's cgroup CPU ceiling in cores, or None outside one.
-
-    Reuses the reader in ``hf_xet_tuning`` rather than parsing ``/sys/fs/cgroup``
-    again: it already handles v1 against v2, the ``/proc/self/cgroup`` path walk
-    and the "unlimited" sentinels. Imported lazily, so this module still loads on
-    its own.
-    """
+    """cgroup CPU ceiling in cores, or None outside one; reuses hf_xet_tuning's reader (v1 and v2, /proc/self/cgroup
+    walk, unlimited sentinels), imported lazily so the module loads alone."""
     try:
         from unsloth_zoo.hf_xet_tuning import cgroup_cpu_limit
         return cgroup_cpu_limit()
@@ -198,9 +159,8 @@ CGROUP_ROOT = "/sys/fs/cgroup"
 
 def _cgroup_first_line(path: str) -> Optional[str]:
     try:
-        # encoding named explicitly: these are ASCII kernel files, but a
-        # locale-dependent read crashes or produces mojibake on a Windows
-        # console codepage, and CI polices every read/write for it.
+        # Encoding is explicit: these kernel files are ASCII, but a locale-dependent read crashes or produces mojibake
+        # on a Windows console codepage, and CI checks every read and write for it.
         with open(path, "r", encoding = "utf-8") as f:
             return f.readline().strip()
     except OSError:
@@ -226,10 +186,7 @@ def _cgroup_limit(raw: Optional[str]) -> Optional[int]:
 
 
 def _cgroup_dirs(root: str, rel: Optional[str]) -> list:
-    """``root/rel`` and every ancestor up to *root*, innermost first.
-
-    A parent slice's limit binds this process just as its own does.
-    """
+    """root/rel and every ancestor up to root, innermost first; a parent slice's limit binds this process just as its own does."""
     dirs = []
     if rel and rel != "/":
         current = os.path.normpath(os.path.join(root, rel.lstrip("/")))
@@ -249,20 +206,14 @@ def _proc_self_cgroup() -> list:
 
 
 def _cgroup_free_bytes_unaided() -> Optional[int]:
-    """``_cgroup_free_bytes`` without unsloth_zoo's private cgroup helpers.
-
-    Only reached on an older unsloth_zoo, and only ever a fallback: the pairing
-    rule, the "unlimited" sentinels and the innermost-first walk are the ones
-    documented on ``_cgroup_free_bytes``. Reading the public ``cgroup_memory_limit``
-    alone is the last resort, since a limit is still a ceiling even unpaired.
-    """
+    """Fallback for an older unsloth_zoo without the private cgroup helpers, mirroring _cgroup_free_bytes; a bare public
+    cgroup_memory_limit is last resort, as a limit is still a ceiling."""
     lines = _proc_self_cgroup()
     free = []
 
     if os.path.isdir(CGROUP_ROOT):
         rel = None
-        # The v2 line is "0::<path>"; under systemd hybrid mode v1 lines share
-        # the file, so scan rather than taking the first.
+        # The v2 line starts with 0::<path>; under systemd hybrid mode v1 lines share the file, so scan for it rather than taking the first line.
         for line in lines:
             if line.startswith("0::"):
                 rel = line[3:].strip()
@@ -302,16 +253,9 @@ def _cgroup_free_bytes_unaided() -> Optional[int]:
 
 
 def _cgroup_free_bytes() -> Optional[int]:
-    """Bytes free under the binding cgroup memory limit, or None outside one.
-
-    Each limit is paired with the usage of the directory that set it. The binding
-    limit is often an ancestor's -- a systemd slice, a Slurm job step -- and that
-    ancestor's usage counts siblings this process cannot see from its own leaf,
-    so pairing a leaf's usage with an ancestor's limit would report memory that
-    is already spent as free. The reverse pairing is worse still: the root
-    ``memory.current`` is the whole machine, and subtracting it from a unit's own
-    MemoryMax leaves every run with nothing.
-    """
+    """Bytes free under the binding cgroup memory limit, or None; each limit pairs with the usage of the directory that
+    set it, since an ancestor's usage counts unseen siblings; root memory.current is the whole machine, so never
+    subtract it from a unit's MemoryMax."""
     try:
         from unsloth_zoo.hf_xet_tuning import (
             _cgroup_v1_dirs,
@@ -320,10 +264,8 @@ def _cgroup_free_bytes() -> Optional[int]:
             _read_first_line,
         )
     except Exception:
-        # An older unsloth_zoo has no such private helpers. Do the same pairing
-        # here rather than reading the public limit alone: an 8GB cgroup with 6GB
-        # already resident would otherwise report 8GB free, and memory pressure
-        # is the one condition this ceiling exists for.
+        # An older unsloth_zoo lacks these helpers, so pair the limit with current usage: an 8GB cgroup with 6GB
+        # resident would otherwise report 8GB free, and memory pressure is what this ceiling guards.
         return _cgroup_free_bytes_unaided()
 
     def _used(path):
@@ -352,12 +294,7 @@ def _cgroup_free_bytes() -> Optional[int]:
 
 
 def _available_memory_gb() -> Optional[float]:
-    """Free RAM this process may actually use, or None when it cannot be read.
-
-    ``psutil.virtual_memory().available`` reports the HOST inside a container, so
-    a 2GB pod on a 512GB box read as having room for the full worker set and got
-    OOM-killed -- the exact failure the memory ceiling exists to prevent.
-    """
+    """Free RAM usable by this process, or None; psutil's virtual_memory().available reports the host inside a container, so a 2GB pod on a 512GB box got OOM-killed."""
     try:
         import psutil
         available_gb = psutil.virtual_memory().available / (1024**3)
@@ -371,12 +308,8 @@ def _available_memory_gb() -> Optional[float]:
 
 
 def _usable_cpus() -> Optional[int]:
-    """CPUs this process may actually run on, or None when that cannot be read.
-
-    ``cpu_count()`` is the host's, so under ``taskset``, Slurm pinning or a
-    Kubernetes CPU quota a one-core job would auto-size workers that then contend
-    for that one core, making tokenization slower than doing it in-process.
-    """
+    """CPUs this process may run on, or None: cpu_count() reports the host's, so under taskset, Slurm pinning or a
+    Kubernetes CPU quota a one-core job would auto-size workers that contend for that core."""
     try:
         import psutil
         cpus = psutil.cpu_count()
@@ -407,16 +340,11 @@ def _affordable_workers() -> Optional[int]:
 
 
 def _clamp_by_memory(num_proc: int) -> Optional[int]:
-    """Bound a worker count by RAM. None means "do not use workers at all".
-
-    Applies to explicit counts too: the old heuristic capped only the auto path,
-    so a caller passing a number (Studio passes ``max(1, cpu_count // 4)``) could
-    ask for dozens of workers on a machine with no room. That is what OOMs.
-    """
+    """Bound a worker count by RAM; None means do not use workers. Applies to explicit counts too, since a caller's
+    number (Studio passes max(1, cpu_count // 4)) could OOM a machine with no room."""
     affordable = _affordable_workers()
     if affordable is None:
-        # No memory reading, so honour the request rather than serialising a
-        # machine that may be perfectly capable.
+        # Without a memory reading, honour the requested count rather than serialise a machine that may be perfectly capable.
         return num_proc
 
     if affordable < 2:
@@ -508,15 +436,9 @@ def _from_environment() -> "tuple[bool, Optional[int]]":
 
 
 def environment_override() -> "tuple[bool, Optional[int]]":
-    """Whether NUM_PROC_ENV_VAR decided the count, and what it asked for.
-
-    ``(was_set_and_valid, value)``, with ``value = None`` meaning "in-process".
-    Public because a caller that layers its own caps on top of this module needs
-    to know whether the hatch chose the answer: the hatch is uncapped by
-    contract, and an unparseable or negative value is *not* the hatch, it is
-    ignored with a warning. Reading the variable directly cannot tell those
-    apart.
-    """
+    """Returns (was_set_and_valid, value), value None meaning in-process; NUM_PROC_ENV_VAR is the uncapped hatch, so
+    callers need this rather than reading it directly; an unparseable or negative value is not the hatch and is
+    ignored with a warning."""
     return _from_environment()
 
 
@@ -542,17 +464,14 @@ def get_dataset_num_proc(
         A worker count >= 2, or this layer's in-process sentinel (``None`` at a
         call site, ``1`` at the config layer).
     """
-    # 1. The environment override wins over everything, uncapped and unvetoed,
-    #    so a user who knows their workload is fork-safe is never downgraded.
+    # 1. The environment override wins over everything, uncapped and unvetoed, so a user who knows their workload is fork-safe is never downgraded.
     env_set, env_value = _from_environment()
     if env_set:
-        # In-process still has to be encoded for this layer, or
-        # UNSLOTH_DATASET_NUM_PROC=0 -- the hatch the dead-worker message
-        # recommends -- would inflate a config instead of removing workers.
+        # In-process must still be encoded for this layer, or UNSLOTH_DATASET_NUM_PROC=0 (the hatch the dead-worker
+        # message recommends) would inflate a config instead of removing workers.
         return _serial(serial_as_none) if env_value is None else env_value
 
-    # 2. Workers are unusable whatever was requested; see
-    #    `_workers_unusable_reason` for the two refusals.
+    # 2. Workers are unusable whatever was requested; see _workers_unusable_reason for the two refusals.
     unusable = _workers_unusable_reason()
     if unusable is not None:
         if isinstance(desired, int) and not isinstance(desired, bool) and desired > 1:
@@ -564,13 +483,11 @@ def get_dataset_num_proc(
             )
         return _serial(serial_as_none)
 
-    # 3. Normalise "no multiprocessing" requests. `1` is the trap: callers pass
-    #    it meaning "serial" and datasets >= 4.1 hands them a Pool(1).
+    # 3. Normalise no-multiprocessing requests: 1 is the trap, since callers pass it to mean serial but datasets >= 4.1 hands them a Pool(1).
     if isinstance(desired, int) and not isinstance(desired, bool) and desired <= 1:
         return _serial(serial_as_none)
 
-    # 4. Auto-size when no usable request was made, then bound by memory. A
-    #    non-int, or a bool (an int subclass), is not a request.
+    # 4. Auto-size when no usable request was made, then bound by memory; a non-int, or a bool (an int subclass), is not a request.
     if desired is None or not isinstance(desired, int) or isinstance(desired, bool):
         num_proc = _auto_num_proc()
     else:
@@ -581,19 +498,14 @@ def get_dataset_num_proc(
     return num_proc
 
 
-# The message datasets raises when a pool worker dies. It never reads the child's
-# exit status, so an OOM kill, a segfault and a genuine exception all arrive as
-# this one string -- which is why #2693 looks untraceable.
+# datasets raises this message when a pool worker dies, never reads its exit status, so an OOM kill, a segfault and a
+# real exception look identical (issue 2693).
 _WORKER_DIED = "subprocesses has abruptly died"
 
 
 @contextlib.contextmanager
 def map_failure_diagnostics(num_proc: Optional[int]) -> "Iterator[None]":
-    """Re-raise a dead-worker error from ``Dataset.map`` with usable context.
-
-    Names the start method, the worker count and roughly what they cost, none of
-    which survives the original message. The cause is chained.
-    """
+    """Re-raise a dead-worker error from Dataset.map naming the start method and worker count, which the original message drops; the cause is chained."""
     try:
         yield
     except RuntimeError as exception:
@@ -621,14 +533,8 @@ def map_failure_diagnostics(num_proc: Optional[int]) -> "Iterator[None]":
 
 
 def _largest_split_rows(trainer) -> Optional[int]:
-    """Rows in the biggest *sized* split ``train_on_responses_only`` will map over.
-
-    None only when no split has a readable length at all. Unsized splits are
-    skipped rather than abandoning the measurement, since sizing is per split and
-    an unsized one can never use workers anyway; letting one hide a large sized
-    sibling left that sibling on the uncapped auto count. ``eval_dataset`` may be
-    a dict of named splits, so unpack that too.
-    """
+    """Rows in the largest sized split train_on_responses_only maps over, or None if no split has a readable length;
+    unsized splits are skipped so they cannot hide a sized sibling; eval_dataset may be a dict."""
     if trainer is None:
         return None
 
@@ -653,13 +559,9 @@ def _largest_split_rows(trainer) -> Optional[int]:
 
 
 def _zoo_auto_sizer_forks() -> bool:
-    """Whether ``train_on_responses_only`` would pick workers for a bare ``None``.
-
-    Its auto path asks stdlib ``multiprocessing``, not ``multiprocess`` -- the
-    split this whole module is about. Where the two disagree, ``None`` is not
-    "serial" to it, it is "size it for me", and ``datasets`` then builds that pool
-    on the non-fork ``multiprocess`` context.
-    """
+    """Whether train_on_responses_only auto-sizes workers for a bare None; it asks stdlib multiprocessing, not
+    multiprocess, so where the two disagree None means size-it-for-me and datasets builds that pool on the non-fork
+    multiprocess context."""
     try:
         return _module_start_method("multiprocessing") == "fork"
     except Exception:
@@ -667,14 +569,8 @@ def _zoo_auto_sizer_forks() -> bool:
 
 
 def _serial_for_the_zoo(value: Optional[int]) -> Optional[int]:
-    """Re-encode a serial ``None`` for a reader that decides on the other module.
-
-    ``None`` only means "no workers" to ``train_on_responses_only`` while its own
-    check refuses them too. When it would not, ``1`` is the smallest request it
-    honours verbatim, and that helper now reads ``1`` as in-process; on a release
-    that predates this it is a ``Pool(1)``, still one child rather than the
-    ``cpu_count + 4`` its auto path would have chosen.
-    """
+    """Serial is None only while train_on_responses_only's own check refuses workers, else 1: in-process on newer
+    releases, a Pool(1) (not cpu_count + 4) on older ones."""
     if value is not None or not _zoo_auto_sizer_forks():
         return value
     _warn_once(
@@ -688,29 +584,10 @@ def _serial_for_the_zoo(value: Optional[int]) -> Optional[int]:
 
 
 def resolve_responses_only_num_proc(trainer, num_proc):
-    """Bound the worker count ``train_on_responses_only`` hands to ``map()``.
-
-    Older ``dataset_utils.train_on_responses_only`` releases auto-size with the
-    uncapped ``min(max(cpu_count + 4, 2), 64)`` heuristic (issue #2693), so the
-    bound is applied from outside, and two properties of its API constrain what
-    can be expressed:
-
-    * **Serial is the config-layer sentinel, not the call-site one.** That helper
-      reads ``None`` as "size it for me", so on ``fork`` handing it ``None``
-      would *inflate* the count rather than remove it; ``1`` is the closest
-      expressible request, and it is in-process on any release that reads it as
-      such. Under spawn the trade flips -- each ``Pool(1)`` child re-imports
-      the user's ``__main__`` (#3211 / #3397), while ``None`` is safe because its
-      auto path vetoes non-fork itself. That is exactly what
-      ``serial_as_none = False`` encodes, so defer to it -- then re-check with
-      ``_serial_for_the_zoo``, since that veto reads the other module.
-    * **An explicit count disables its per-split small-split guard.** A small
-      eval split alongside a large train split then picks up workers it would not
-      have had: worth it only when a split is big enough to have been
-      parallelized at all, which is what the row check below establishes.
-    """
-    # Mirror that helper's own test, so "explicit" means the same on both sides
-    # (it treats bools as auto, since type(True) is not int).
+    """Caps the auto worker count (uncapped in older releases, issue 2693); serial is 1 on fork but None on spawn, since
+    a Pool(1) child re-imports __main__ (issues 3211, 3397); an explicit count skips its small-split guard, so it is
+    worth it only for splits big enough to parallelize."""
+    # Mirrors that helper's own test so explicit means the same on both sides; it treats bools as auto, since type(True) is not int.
     was_auto = num_proc is None or type(num_proc) is not int
     rows = _largest_split_rows(trainer)
     small = rows is None or rows < ZOO_MIN_ROWS_FOR_MULTIPROC
@@ -718,11 +595,8 @@ def resolve_responses_only_num_proc(trainer, num_proc):
     if not was_auto:
         resolved = get_dataset_num_proc(num_proc, serial_as_none = False)
         if resolved == 1 and small:
-            # Serial, and every split is under the threshold, so the helper's own
-            # guard runs each of them in-process, which an older unsloth_zoo
-            # would not do for the 1 expressible here: reaching this with
-            # UNSLOTH_DATASET_NUM_PROC=0 and a config sentinel of 1 was the
-            # escape hatch still building a Pool(1) there.
+            # Serial with every split under the threshold: the helper's guard runs them in-process, but an older
+            # unsloth_zoo would not run that 1 in-process, so UNSLOTH_DATASET_NUM_PROC=0 would still build a Pool(1).
             return None
         return _serial_for_the_zoo(resolved)
 
@@ -731,10 +605,7 @@ def resolve_responses_only_num_proc(trainer, num_proc):
         env_set, env_value = _from_environment()
         if env_set and env_value is not None:
             return env_value
-        # Otherwise it would have gone in-process anyway, and its guard yields
-        # None, which is more in-process than the 1 expressible here. Safe whatever
-        # the start method: every split here is under the threshold, so its own
-        # per-split guard serialises them all.
+        # Otherwise its guard yields None, more in-process than the 1 expressible here; safe on any start method since every split is under the per-split guard.
         return num_proc
 
     return _serial_for_the_zoo(get_dataset_num_proc(None, serial_as_none = False))

@@ -20,7 +20,7 @@ def fused_beta_sigmoid_fwd_kernel(
     y,
     scale,
     n_elements,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,  # block size
 ):
     pid = tl.program_id(0).to(tl.int64)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
@@ -37,7 +37,7 @@ def fused_beta_sigmoid_bwd_kernel(
     dx,
     scale,
     n_elements,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,  # block size
 ):
     pid = tl.program_id(0).to(tl.int64)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)

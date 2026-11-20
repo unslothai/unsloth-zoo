@@ -153,8 +153,8 @@ _MAX_INSTANCE_CONFIG_NODES = 1024
 
 
 def _instance_attribute_model_types(config) -> list:
-    # to_dict() writes the class model_type, so remote configs naming themselves only on
-    # the instance (Ling-2.6-flash: class "", instance "bailing_hybrid") serialize as ""
+    # to_dict() writes the class model_type, so configs naming themselves only on the instance (Ling-2.6-flash: class
+    # '', instance 'bailing_hybrid') serialize as empty.
     found, seen, stack = [], set(), [config]
     while stack and len(seen) < _MAX_INSTANCE_CONFIG_NODES:
         obj = stack.pop(0)
@@ -179,6 +179,17 @@ def _instance_attribute_model_types(config) -> list:
     pass
     return found
 pass
+
+
+NATIVE_MODEL_TYPES = set()
+
+
+def is_native_model_type(model_type):
+    """True for a model type whose modeling code is Unsloth's own and is already imported
+    (unsloth.models.<model_type>.modeling, or registered). Reads sys.modules only; never imports unsloth."""
+    import sys
+    model_type = str(model_type)
+    return model_type in NATIVE_MODEL_TYPES or f"unsloth.models.{model_type}.modeling" in sys.modules
 
 
 def get_transformers_model_type(config, trust_remote_code=False):
@@ -215,9 +226,21 @@ def get_transformers_model_type(config, trust_remote_code=False):
             model_type = model_type_list[0].group(1)
             model_types = [model_type]
         elif getattr(config, "auto_mapping", None) is not None:
+            parent = str(config.auto_mapping.get("parent_library", "") or "")
+            native = re.fullmatch(r"unsloth\.models\.([^.]+)\.modeling", parent)
+            if native is not None and is_native_model_type(native.group(1)):
+                model_types = [native.group(1)]
+            else:
+                try:
+                    from .compiler import NATIVE_MODELING_MODULES
+                except Exception:
+                    NATIVE_MODELING_MODULES = {}
+                registered = [t for t, location in NATIVE_MODELING_MODULES.items() if location == parent]
+                if registered:
+                    model_types = registered[:1]
             # e.g. GptOssForCausalLM
             model_type = config.auto_mapping.get("base_model_class", None)
-            if model_type is not None:
+            if model_types is None and model_type is not None:
                 model_type = str(model_type)
                 model_type = model_type.rsplit("For", 1)[0].lower()
                 # Find exact modeling-path name
@@ -299,7 +322,10 @@ def get_transformers_model_type(config, trust_remote_code=False):
     _REMOTE_CODE_MODEL_TYPES = {"nemotron_h", "nemotronh_nano_vl_v2",}
     found_type = False
     for j, model_type in enumerate(final_model_types):
-        if from_instance_attribute:
+        if is_native_model_type(model_type):
+            # Unsloth's own implementation: never trim to a transformers prefix (deepseek_v41 -> deepseek_v4).
+            found_type = True
+        elif from_instance_attribute:
             # Remote code; trimming would rewrite eg llama_foo to the wrong llama path
             found_type = True
         elif model_type in _REMOTE_CODE_MODEL_TYPES:
@@ -309,7 +335,7 @@ def get_transformers_model_type(config, trust_remote_code=False):
             model_types = list(model_type)
             model_types = ["".join(model_types[:i]) for i in range(len(model_types), 0, -1)]
             for current_model_type in model_types:
-                if current_model_type in all_model_types:
+                if current_model_type in all_model_types or is_native_model_type(current_model_type):
                     final_model_types[j] = current_model_type
                     found_type = True
                     break
@@ -348,7 +374,6 @@ def fix_lora_auto_mapping(model):
         }
         if getattr(config, "auto_mapping", None) is None:
             config.auto_mapping = auto_mapping_dict
-    pass
 pass
 
 
@@ -457,4 +482,3 @@ def get_auto_processor(name, **kwargs):
         except:
             raise TypeError(f"Unsloth: Failed loading a AutoProcessor from `{name}`")
     return processor
-pass

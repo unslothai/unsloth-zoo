@@ -40,14 +40,14 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
     cu_seqlens,
     N,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-    BH: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    LONG_INDEXING: tl.constexpr = False,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    BT: tl.constexpr,  # chunk size along T
+    BC: tl.constexpr,  # sub-chunk size along T
+    BH: tl.constexpr,  # block along heads
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    LONG_INDEXING: tl.constexpr = False,  # int64 offsets
 ):
     i_tg, i_hg = tl.program_id(0), tl.program_id(1)
 

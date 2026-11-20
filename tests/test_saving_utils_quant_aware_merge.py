@@ -14,19 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""End-to-end behaviour for `_merge_moe_expert_quant_aware`.
-
-The registry inversion pushed FP8 dequant/requant out of saving_utils into
-moe_utils_fp8. These tests pin both legs:
-
-- bf16 base weight: the helper writes the merged tensor unchanged in shape,
-  no companion-scale write, no fallback recorded.
-- FP8 base weight: the helper dequantises, applies the LoRA merge in bf16,
-  requantises back to FP8, writes the data tensor AND the companion
-  weight_scale_inv to the output mm.
-- FP8 base without companion scale: the helper records a merge fallback
-  and skips writing.
-"""
+"""End-to-end tests for _merge_moe_expert_quant_aware: bf16 writes unchanged; FP8 is dequantised, merged in bf16,
+requantised and written with weight_scale_inv; FP8 without a companion scale records a fallback and skips writing."""
 
 from __future__ import annotations
 
@@ -66,8 +55,7 @@ def _identity_merge(W, lora_stats, expert_idx, num_experts, output_dtype):
 
 @pytest.fixture(autouse=True)
 def _stub_write_tensor_direct_torch(monkeypatch):
-    """`_write_tensor_direct_torch` does real safetensors header arithmetic;
-    here we just capture (key, tensor, dtype)."""
+    """_write_tensor_direct_torch does real safetensors header arithmetic, so this stub only captures (key, tensor, dtype)."""
     from unsloth_zoo import saving_utils
 
     def _capture(mm, header_metadata, length_of_header, key, tensor, dtype):

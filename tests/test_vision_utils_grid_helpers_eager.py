@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Grid helpers in transformers/vision_utils.py must never be compiled fullgraph:
-`grid_thw.tolist()` builds unguardable shapes from unbacked SymInts, a hard UserError on
-the first vision forward. The probe below enumerates vision_utils rather than hard-coding
-today's names."""
+"""Vision grid helpers in transformers/vision_utils.py must never compile fullgraph: grid_thw.tolist() gives unbacked
+SymInt shapes that raise UserError; names are enumerated, not hard-coded."""
 
 import inspect
 
@@ -35,8 +33,7 @@ vision_utils = pytest.importorskip(
 
 GRID_THW = torch.tensor([[1, 24, 32]], dtype=torch.long)
 
-# Keyed by name so an upstream signature reorder cannot pass the wrong value; without a
-# default `config` the probe below skips get_vision_attention_seqlens.
+# Keyed by name so an upstream signature reorder cannot pass the wrong value; without a default `config`, the probe skips get_vision_attention_seqlens.
 _ARGS = {
     "grid_thw": GRID_THW,
     "spatial_merge_size": 2,
@@ -48,8 +45,7 @@ _ARGS = {
 
 
 def _grid_helpers():
-    """Public vision_utils helpers taking an image grid. Not filtered on `.tolist()`:
-    get_vision_cu_seqlens reaches the same unbacked shapes via `repeat_interleave`."""
+    """Public vision_utils grid helpers are not filtered on `.tolist()`: get_vision_cu_seqlens reaches the same unbacked shapes via repeat_interleave."""
     found = {}
     for name in dir(vision_utils):
         if not name.startswith("get_vision_"):
@@ -81,8 +77,8 @@ def test_grid_helpers_are_discoverable():
 
 @pytest.mark.parametrize("name", sorted(_grid_helpers()))
 def test_uncompilable_grid_helpers_are_listed(name):
-    """Anything Dynamo cannot capture fullgraph must be in DISABLE_COMPILE_FUNCTIONS. The
-    assert fires only inside `except`, so a helper turning traceable upstream cannot fail it."""
+    """Anything Dynamo cannot capture fullgraph must be in DISABLE_COMPILE_FUNCTIONS; the assert only runs inside
+    `except`, so an upstream-traceable helper cannot fail it."""
     fn, kwargs = _grid_helpers()[name]
 
     eager = fn(**kwargs)
@@ -139,8 +135,8 @@ def test_get_vision_position_ids_eager_result_is_the_block_major_layout():
 
 
 def test_disable_compile_functions_selects_the_disable_decorator():
-    """Membership is checked ahead of the `torch_compile_with_fallback` branch; invert that
-    and these names compile again while the runtime tests above still pass."""
+    """DISABLE_COMPILE_FUNCTIONS membership is checked ahead of the `torch_compile_with_fallback` branch; inverting that
+    compiles these names again while runtime tests pass."""
     source = inspect.getsource(
         __import__("unsloth_zoo.compiler", fromlist=["compiler"])
     )

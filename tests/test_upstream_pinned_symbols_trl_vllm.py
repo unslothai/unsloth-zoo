@@ -6,47 +6,9 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Pinned-symbol regression tests for the TRL + vLLM API surface
-unsloth_zoo touches.
-
-Background
-==========
-``unsloth_zoo.rl_replacements`` overrides TRL GRPO internals via two
-mechanisms:
-
-  1. Function/class **dispatch by name** (``RL_REPLACEMENTS[...]``
-     entries keyed on TRL function names). If TRL renames a method,
-     the rewriter silently no-ops AND the patch never lands AND user-
-     facing GRPO behaviour silently diverges -- which is the worst
-     possible failure mode (no exception, just wrong loss).
-  2. **String rewrites** on the TRL source (e.g. emit
-     ``from trl.trainer.utils import pad as _unsloth_trl_pad`` into the
-     compile cell). If the import path moves (TRL 0.18 split
-     ``DataCollatorForPreference`` into ``trl.trainer.dpo_trainer``,
-     for example), the compile cell ``ImportError``s on user import.
-
-This file pins both surfaces against the **anchor TRL versions** the
-project tracks (0.22.2, 0.27.1, 1.0.0) plus the **installed** TRL/vllm
-when present. Tests are CPU-safe and ``pytest.importorskip``-skippable.
-
-Coverage matrix
----------------
-| # | Anchor                                                            | What breaks if regressed                                          |
-|---|-------------------------------------------------------------------|-------------------------------------------------------------------|
-| 1 | ``trl.trainer.utils.pad``                                         | ``rl_replacements.py:326`` emits ``import pad`` into compile cell |
-| 2 | ``trl.trainer.dpo_trainer.DataCollatorForPreference``             | ``rl_replacements.py:318`` hard imports it                        |
-| 3 | ``trl.trainer.grpo_trainer.GRPOTrainer`` + method dispatch keys   | ``RL_REPLACEMENTS`` dispatch by name silently no-ops              |
-| 4 | ``trl.trainer.dpo_trainer.MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES``  | ``temporary_patches/misc.py:1376`` patch silently no-ops          |
-| 5 | ``trl.is_conversational`` (soft)                                  | ``dataset_utils.py:712`` falls back to a local impl (must work)   |
-| 6 | ``trl.trainer.utils.ConstantLengthDataset`` (soft, removed 0.20)  | ``dataset_utils.py:596`` soft import contract                     |
-| 7 | ``vllm.SamplingParams`` constructor signature                     | ``grpo_update_SamplingParams`` filters by ``inspect.signature``   |
-| 8 | ``vllm.RequestOutput.outputs[i].logprobs`` shape                  | ``sanitize_logprob`` reads ``.logprob`` attribute                 |
-
-For (1)-(6) we ALSO parametrize across the three anchor TRL tags using
-the offline fetch shim under ``_postmerge_audit/`` when reachable, so
-we get early warning BEFORE a TRL upgrade hits PyPI -- mirroring the
-shape of ``_postmerge_audit/tests/version_compat/test_trl_grpo_pinned_symbols.py``.
-"""
+"""Pinned-symbol regression tests for TRL and vLLM APIs that unsloth_zoo.rl_replacements rewrites; a renamed dispatch
+key silently no-ops the rewrite, while a moved import raises ImportError. Anchors TRL 0.22.2, 0.27.1, 1.0.0;
+CPU-safe, importorskip-skippable."""
 
 from __future__ import annotations
 
@@ -59,32 +21,18 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# Anchor TRL versions the project commits to (per pyproject + spec).
-# 0.22.2 = older floor, 0.27.1 = mid, 1.0.0 = newest breaking. We don't
-# require ALL of them to be installed; we parametrize for fetch-based
-# checks and skip cleanly for installed-only checks when the running
-# venv has a different minor.
+# Anchor TRL versions per pyproject and spec: 0.22.2 older floor, 0.27.1 mid, 1.0.0 newest breaking; installed-only checks skip on another minor.
 # ---------------------------------------------------------------------------
 TRL_ANCHOR_TAGS = ("v0.22.2", "v0.27.1", "v1.0.0")
 
 
 # ---------------------------------------------------------------------------
-# Optional fetch shim — reuse the sibling audit suite's _fetch.py if it
-# lives in the same machine (parent agent will run the unified runner).
-# If the shim isn't on disk we cleanly skip the network-based checks
-# without failing.
+# Optional fetch shim: reuse the sibling audit suite's _fetch.py if it is on this machine; if missing, network-based checks skip instead of failing.
 # ---------------------------------------------------------------------------
 def _try_load_fetch_shim():
-    """Return ``_fetch.py``'s (fetch_text, has_def) helpers, or ``None`` so the
-    fetch-based tests skip.
-
-    The shim lives outside the repo, so its path must be derived from
-    ``__file__``; a hardcoded absolute path made collection depend on one
-    machine. ``is_file()`` raises rather than returning False when a parent
-    directory denies traversal, turning "not present, skip" into a
-    ``PermissionError`` that pytest treats as a fatal collection error for the
-    whole session -- hence ``OSError`` is swallowed per candidate.
-    """
+    """Returns _fetch.py helpers or None; path must be derived from __file__ (a hardcoded absolute path made collection
+    machine-dependent); OSError caught per candidate since is_file() can raise PermissionError, a fatal session-wide
+    collection error."""
     candidates = [
         Path(__file__).resolve().parents[2] / "_postmerge_audit/tests/version_compat/_fetch.py",
     ]
@@ -128,8 +76,7 @@ def _require_fetch():
 
 @pytest.mark.parametrize("tag", TRL_ANCHOR_TAGS)
 def test_trl_trainer_utils_pad_anchor_versions(tag):
-    """`from trl.trainer.utils import pad` must resolve on every
-    anchor TRL the project commits to."""
+    """`from trl.trainer.utils import pad` must resolve on every anchor TRL version the project commits to."""
     fetch_text, has_def = _require_fetch()
     src = fetch_text("huggingface/trl", tag, "trl/trainer/utils.py")
     if src is None:
@@ -144,8 +91,7 @@ def test_trl_trainer_utils_pad_anchor_versions(tag):
 
 
 def test_trl_trainer_utils_pad_installed():
-    """If TRL is installed in this venv, the same symbol must resolve
-    via plain Python import. Skipped (not failed) if TRL isn't there."""
+    """If TRL is installed, the same pad symbol must resolve via plain Python import; the test skips rather than fails when TRL is absent."""
     pytest.importorskip("trl")
     pytest.importorskip("trl.trainer.utils")
     from trl.trainer import utils as trl_utils
@@ -166,10 +112,8 @@ def test_trl_trainer_utils_pad_installed():
 
 
 # ===========================================================================
-# 2. DataCollatorForPreference — hard-imported in the DPO rewriter.
-#    TRL 0.18+ split it out of trl.trainer.utils into trl.trainer.dpo_trainer.
-#    Either path must define it (we tolerate both, the unsloth rewriter
-#    string-emits the dpo_trainer path on modern TRL).
+# DataCollatorForPreference is hard-imported by the DPO rewriter; TRL 0.18+ moved it to trl.trainer.dpo_trainer, so
+# either path is accepted and modern TRL emits the latter.
 # ===========================================================================
 
 
@@ -191,10 +135,7 @@ def test_trl_data_collator_for_preference_anchor_versions(tag):
 
 
 # ===========================================================================
-# 3. GRPOTrainer method dispatch keys. RL_REPLACEMENTS keys on
-#    `function_name` substrings; if a method is renamed upstream,
-#    the rewriter is a silent no-op. These three are stable across the
-#    entire 0.22 -> 1.0+ window.
+# GRPOTrainer dispatch keys: RL_REPLACEMENTS matches function_name substrings, so a renamed method is a silent no-op; these three hold across TRL 0.22 to 1.0+.
 # ===========================================================================
 
 
@@ -212,11 +153,8 @@ def test_trl_grpo_trainer_required_methods_anchor_versions(tag):
             f"{tag}: GRPOTrainer.{method} missing -- "
             f"unsloth_zoo RL_REPLACEMENTS dispatch by name silently skips"
         )
-    # Per-token-logps surface: TRL 0.20+ renamed `_get_per_token_logps`
-    # to `_get_per_token_logps_and_entropies`. Either is fine because
-    # RL_REPLACEMENTS dispatches on function name -- but at least one
-    # MUST exist or both code paths in rl_replacements:1130 silently
-    # no-op AND user GRPO loss is wrong.
+    # TRL 0.20+ renamed _get_per_token_logps to _get_per_token_logps_and_entropies; one of the two must exist or
+    # rl_replacements:1130 silently no-ops and GRPO loss goes wrong.
     assert has_def(src, "_get_per_token_logps", "func") or has_def(
         src, "_get_per_token_logps_and_entropies", "func"
     ), (
@@ -226,15 +164,11 @@ def test_trl_grpo_trainer_required_methods_anchor_versions(tag):
 
 
 def test_trl_grpo_trainer_installed():
-    """Installed TRL must keep `from trl import GRPOTrainer, GRPOConfig`
-    resolvable AND keep the canonical submodule path
-    `trl.trainer.grpo_trainer.GRPOTrainer`."""
+    """Installed TRL must keep `from trl import GRPOTrainer, GRPOConfig` resolvable and the canonical path trl.trainer.grpo_trainer.GRPOTrainer."""
     pytest.importorskip("trl")
     trl = pytest.importorskip("trl")
-    # exc_type=ImportError so a broken downstream import (e.g. vLLM
-    # version mismatch dragged in by `import trl.trainer.grpo_trainer`)
-    # cleanly skips instead of failing the suite. This matches
-    # pytest>=8.2 guidance and silences the 9.1 deprecation.
+    # importorskip uses exc_type=ImportError so a broken downstream import (e.g. vLLM mismatch) skips instead of
+    # failing; matches pytest>=8.2 and silences the pytest 9.1 deprecation.
     pytest.importorskip("trl.trainer.grpo_trainer", exc_type=ImportError)
     assert hasattr(trl, "GRPOTrainer"), "from trl import GRPOTrainer broken"
     assert hasattr(trl, "GRPOConfig"), "from trl import GRPOConfig broken"
@@ -244,8 +178,7 @@ def test_trl_grpo_trainer_installed():
         "trl.trainer.grpo_trainer.GRPOTrainer missing; "
         "unsloth_zoo dispatch via `eval(f'trl.trainer.{trainer_file}.{name}')` breaks"
     )
-    # Method dispatch keys unsloth_zoo's RL_REPLACEMENTS rewrites.
-    # Each is a string-rewrite key; missing => silent no-op (bad).
+    # Method dispatch keys RL_REPLACEMENTS rewrites; each is a string-rewrite key, and a missing method is a silent no-op.
     for method in ("_prepare_inputs", "_generate_and_score_completions", "compute_loss"):
         assert hasattr(grpo_trainer.GRPOTrainer, method) or any(
             method in inspect.getsource(grpo_trainer)
@@ -254,10 +187,8 @@ def test_trl_grpo_trainer_installed():
 
 
 # ===========================================================================
-# 4. trl.trainer.dpo_trainer.MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES —
-#    patched by unsloth_zoo/temporary_patches/misc.py:1376-1379 to
-#    inject the new transformers 5.x name for VLM DPO. If the alias
-#    name disappears upstream, the patch silently no-ops.
+# trl.trainer.dpo_trainer.MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES is patched at temporary_patches/misc.py:1376-1379 to add
+# the transformers 5.x VLM DPO name; if it vanishes, the patch silently no-ops.
 # ===========================================================================
 
 
@@ -266,10 +197,7 @@ def test_trl_dpo_vision_mapping_attr_installed():
     pytest.importorskip("trl.trainer.dpo_trainer")
     import trl.trainer.dpo_trainer as dpo_mod
 
-    # We don't require the mapping to be NON-EMPTY (the unsloth patch
-    # populates it FROM transformers when empty). We only require the
-    # *attribute name* to be a thing the module looks up via getattr,
-    # which it is -- so the patch site stays valid.
+    # The mapping may be empty (the patch fills it from transformers); only the attribute name must exist, since the module looks it up via getattr.
     assert "MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES" in dir(dpo_mod) or hasattr(
         dpo_mod, "MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES"
     ) or True, (
@@ -277,9 +205,7 @@ def test_trl_dpo_vision_mapping_attr_installed():
         "trl.trainer.dpo_trainer.MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES; "
         "if TRL renames this constant, the patch silently no-ops"
     )
-    # Confirm DPOTrainer is still importable from this module (it's
-    # the patch's prerequisite -- the rest of the patch site assumes
-    # the dpo_trainer module exists).
+    # DPOTrainer must stay importable from trl.trainer.dpo_trainer; the VLM patch entry point assumes that module exists.
     assert hasattr(dpo_mod, "DPOTrainer"), (
         "trl.trainer.dpo_trainer.DPOTrainer missing -- "
         "unsloth_zoo VLM patch entry point broken"
@@ -287,10 +213,7 @@ def test_trl_dpo_vision_mapping_attr_installed():
 
 
 # ===========================================================================
-# 5. trl.is_conversational — soft import in dataset_utils:712. If TRL
-#    keeps the export, our code calls it; if not, we fall back to a
-#    local impl. The contract: when the soft import succeeds, the
-#    returned callable accepts a single dict.
+# trl.is_conversational is soft-imported in dataset_utils:712 with a local fallback; when the import succeeds, the returned callable must accept a single dict.
 # ===========================================================================
 
 
@@ -309,9 +232,7 @@ def test_trl_is_conversational_contract():
 
 
 # ===========================================================================
-# 6. trl.trainer.utils.ConstantLengthDataset — soft import that TRL
-#    0.20 removed on some paths. Just assert we can survive both
-#    cases; if it's present, it must still be a class.
+# trl.trainer.utils.ConstantLengthDataset is soft-imported (TRL 0.20 removed it on some paths); both cases must work, and if present it must still be a class.
 # ===========================================================================
 
 
@@ -328,11 +249,8 @@ def test_trl_constant_length_dataset_soft():
 
 
 # ===========================================================================
-# 7. vllm.SamplingParams — `grpo_update_SamplingParams` does
-#    `inspect.signature(SamplingParams).parameters.keys()` to filter
-#    user kwargs. If vLLM stops accepting `inspect.signature` (e.g.
-#    becomes a C-extension type without a proper signature), the
-#    filter silently drops every key and generation becomes broken.
+# grpo_update_SamplingParams filters user kwargs by inspect.signature(SamplingParams); if vLLM stops exposing a proper
+# signature, every key is dropped silently and generation breaks.
 # ===========================================================================
 
 
@@ -351,8 +269,7 @@ def test_vllm_sampling_params_introspectable():
             f"top_p/top_k/etc. are all reset to vLLM defaults"
         )
     params = sig.parameters
-    # These are the kwargs unsloth_zoo plumbs through; if vLLM renames
-    # one, the filter silently drops it and GRPO generation diverges.
+    # temperature, top_p, top_k and max_tokens are the kwargs unsloth_zoo plumbs through; a vLLM rename silently drops one and GRPO generation diverges.
     expected_kwargs = {"temperature", "top_p", "top_k", "max_tokens"}
     missing = expected_kwargs - set(params.keys())
     assert not missing, (
@@ -363,19 +280,13 @@ def test_vllm_sampling_params_introspectable():
 
 
 # ===========================================================================
-# 8. vllm CompletionOutput.logprobs entry — `sanitize_logprob` reads
-#    `logprob.logprob` (the .logprob attribute on a Logprob dataclass).
-#    A vLLM rename to e.g. `.value` would silently make every logprob
-#    look like NaN to our filter.
+# sanitize_logprob reads the .logprob attribute of vLLM's Logprob dataclass; a rename (e.g. to .value) would make every logprob look like NaN to the filter.
 # ===========================================================================
 
 
 def test_vllm_logprob_attribute_contract():
     pytest.importorskip("vllm")
-    # vLLM moved the Logprob dataclass around over time:
-    #   - old: vllm.sequence.Logprob
-    #   - newer: vllm.outputs.Logprob
-    #   - newest (v1 engine): vllm.v1.outputs.Logprob
+    # vLLM's Logprob dataclass moved: vllm.sequence.Logprob (old), vllm.outputs.Logprob (newer), vllm.v1.outputs.Logprob (v1 engine).
     Logprob = None
     for modpath in ("vllm.sequence", "vllm.outputs", "vllm.v1.outputs"):
         try:

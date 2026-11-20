@@ -18,6 +18,8 @@
 import pytest
 import torch
 
+pytestmark = pytest.mark.usefixtures("compile_enabled")
+
 
 def _ce_module():
     try:

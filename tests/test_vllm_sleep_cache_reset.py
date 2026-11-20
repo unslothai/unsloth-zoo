@@ -1,17 +1,6 @@
-"""Tests for the vLLM pre-sleep multimodal/encoder cache reset.
-
-Drives the real `unsloth_zoo.vllm_utils.patch_vllm_reset_caches_on_sleep`
-against a fake `vllm` module bound onto the module global (the function uses a
-bare `vllm` global, so the test injects it). No GPU, no real vLLM needed.
-
-Asserts the contract:
-  - pre-sleep cache resets fire BEFORE the original sleep, then gc.collect();
-  - reset_mm_cache is called on the LLM, reset_encoder_cache on llm_engine;
-  - a missing method / missing llm_engine is a clean no-op (text models, and
-    vLLM builds that expose only reset_mm_cache);
-  - a raising reset is swallowed and the original sleep still runs;
-  - double-patching is idempotent (flag-guarded, no re-wrap).
-"""
+"""Tests patch_vllm_reset_caches_on_sleep: reset_mm_cache (LLM) and reset_encoder_cache (llm_engine) run before
+gc.collect() and the original sleep; missing methods are no-ops, a raising reset is swallowed, double-patching is
+idempotent."""
 
 from __future__ import annotations
 
@@ -31,8 +20,7 @@ def vllm_utils():
 
 def _make_fake_vllm(calls, *, has_mm=True, has_encoder=True,
                     has_engine=True, mm_raises=False):
-    """Build a fake module exposing an `LLM` class that logs every call to
-    `calls`. `sleep` stands in for vLLM's real LLM.sleep (the wrap target)."""
+    """Builds a fake vllm module exposing an LLM class that logs every call to calls; sleep stands in for vLLM's real LLM.sleep (the wrap target)."""
 
     class Engine:
         pass

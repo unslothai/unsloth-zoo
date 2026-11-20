@@ -44,17 +44,17 @@ def recompute_w_u_fwd_kda_kernel(
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    STORE_QG: tl.constexpr,
-    STORE_KG: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    LONG_INDEXING: tl.constexpr = False,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    STORE_QG: tl.constexpr,  # write qg
+    STORE_KG: tl.constexpr,  # write kg
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    LONG_INDEXING: tl.constexpr = False,  # int64 offsets
 ):
     i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1)
     i_b, i_hv = i_bh // HV, i_bh % HV
@@ -161,15 +161,15 @@ def prepare_wy_repr_bwd_kda_kernel(
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    LONG_INDEXING: tl.constexpr = False,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BK: tl.constexpr,  # block along K
+    BV: tl.constexpr,  # block along V
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    LONG_INDEXING: tl.constexpr = False,  # int64 offsets
 ):
     i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1)
     i_b, i_hv = i_bh // HV, i_bh % HV

@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CUDA-parity continued pretraining, end to end on real MLX (Apple Silicon).
-
-Drives get_peft_model + save routing (LR key, full-module unfreeze, save/reload).
-Fine-grained matrix: analysis_artifacts/2026-07-21_mlx-cpt-validation/.
-"""
+"""CUDA-parity continued pretraining end to end on real MLX (Apple Silicon); drives get_peft_model and save routing (LR
+key, full-module unfreeze, save/reload); fine-grained matrix: analysis_artifacts/2026-07-21_mlx-cpt-validation/"""
 
 from __future__ import annotations
 
@@ -131,9 +128,8 @@ def test_all_linear_sentinel_accepts_set_form():
 
 
 def test_all_linear_expands_inside_a_mixed_cpt_target_list():
-    # ["all-linear", "embed_tokens"] is the CPT spelling of the sentinel. A
-    # literal "all-linear" left in the list matches no module, and the CPT
-    # entry keeps the no-target guard quiet, so every layer adapter vanished.
+    # In a CPT target list the sentinel is "all-linear"; a literal all-linear matches no module and the CPT entry
+    # silences the no-target guard, so layer adapters vanished
     m = _tiny()
     _peft(m, target_modules=["all-linear", "embed_tokens"])
     trn = set(dict(mu.tree_flatten(m.trainable_parameters())))
@@ -157,10 +153,9 @@ def test_all_linear_expands_inside_a_mixed_cpt_target_list():
 
 
 def test_full_module_only_checkpoint_reloads_without_unfreezing_the_base():
-    # No LoRA anywhere, so the artifact is stamped fine_tune_type="full" with no
-    # exact LoRA paths and reload takes the pathless route. mlx-lm's
-    # load_adapters never freezes, so without a selective freeze every base
-    # tensor came back trainable and the scoped-LR keys were lost.
+    # With no LoRA the artifact is stamped fine_tune_type="full" with no LoRA paths and reload takes the pathless route;
+    # mlx-lm load_adapters never freezes, so without a selective freeze every base tensor came back trainable and
+    # scoped-LR keys were lost
     import json
 
     from unsloth_zoo.mlx.loader import (
@@ -245,8 +240,7 @@ class _AltHead(nn.Module):
 
 
 def test_unusable_lm_head_keeps_the_other_lora_targets():
-    # An untrainable lm_head must warn and drop, not abort, so the other
-    # targets keep the pre-CPT behaviour.
+    # An untrainable lm_head must warn and be dropped rather than abort, so the other targets keep the pre-CPT behaviour
     m = _tiny(tied=True)
     with pytest.warns(UserWarning, match="tied"):
         _peft(m, target_modules=["q_proj", "lm_head"])
@@ -286,8 +280,7 @@ def test_lm_head_wrapper_mlx_lm_cannot_lora_is_dropped_not_fatal():
 
 
 def test_wrapper_head_records_its_real_weight_keys_for_the_scoped_lr():
-    # A wrapper head owns no `.weight`, so `lm_head.weight` named nothing live
-    # and embedding_learning_rate never reached the head.
+    # A wrapper head owns no .weight, so lm_head.weight named nothing live and embedding_learning_rate never reached the head
     m = _tiny(); m.lm_head = _WrappedHead()
     _peft(m, target_modules=["q_proj"], modules_to_save=["lm_head"])
     keys = m._unsloth_cpt_full_module_weight_keys
@@ -303,8 +296,7 @@ def test_wrapper_head_records_its_real_weight_keys_for_the_scoped_lr():
 
 
 def test_quantized_child_of_a_wrapper_head_is_rejected():
-    # A wrapper head carries `scales` on a descendant, which a leaf-only check
-    # missed until MLX raised at the first backward.
+    # A wrapper head carries scales on a descendant, which a leaf-only check missed until MLX raised at the first backward
     m = _tiny(); m.lm_head = _WrappedHead()
     m.lm_head.linear = nn.QuantizedLinear.from_linear(
         m.lm_head.linear, group_size=32, bits=4)
@@ -374,8 +366,7 @@ def test_root_lm_head_lora_is_attached_outside_the_layer_walk():
 
 
 def test_reloaded_cpt_adapter_rebuilds_the_scoped_lr_keys():
-    # Reload restores trainability, so the scoped-LR keys must come back too or
-    # embedding_learning_rate degrades to the main LR for alt-named embeddings.
+    # Reload restores trainability, so scoped-LR keys must be rebuilt too or embedding_learning_rate falls back to the main LR for alt-named embeddings
     import json
 
     from unsloth_zoo.mlx.loader import (

@@ -1,15 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Regression tests for scripts/lint_dynamic_exec.py.
-
-The lint is what stops PR #1083's bug class coming back: an `exec`/`eval`/`compile`
-whose first argument is built by interpolation, which is the shape that turns a value
-into syntax. Everything already in the tree is allowlisted with a written
-justification, so the live tree must pass and any new call must not.
-
-CPU-only and network-free: the lint is stdlib only and runs as a subprocess.
-"""
+"""Tests scripts/lint_dynamic_exec.py: interpolated exec/eval/compile is flagged, the allowlisted live tree passes; CPU-only, network-free, stdlib-only."""
 
 from __future__ import annotations
 
@@ -84,8 +76,7 @@ def test_non_interpolated_calls_are_not_flagged(body, tmp_path):
 # --- the allowlist has to stay honest ----------------------------------------
 
 def test_every_allowlist_entry_has_a_justification():
-    # An empty allowlist is a legitimate state: it means no interpolated dynamic
-    # execution is left in this repo at all.
+    # An empty allowlist is legitimate: it means no interpolated dynamic execution is left in the repo.
     entries = json.loads(ALLOWLIST.read_text())["allowed"]
     unjustified = [
         e for e in entries
@@ -135,8 +126,7 @@ def test_a_stale_allowlist_entry_fails(tmp_path):
         "path": "gone.py", "qualname": "f", "sink": "exec",
         "kind": "f-string", "hash": "0" * 16, "reason": "was reviewed once",
     }]})
-    # A full scan, not --paths: staleness is only meaningful over the whole tree,
-    # and this copy's tree contains none of the package directories.
+    # Full scan, not --paths: staleness only means something over the whole tree, and this copy's tree has none of the package directories.
     proc = subprocess.run(
         [sys.executable, str(script)], capture_output = True, text = True,
     )

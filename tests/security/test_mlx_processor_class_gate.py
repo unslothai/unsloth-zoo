@@ -1,23 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""A name out of a model repo may only select a real processing class.
-
-`_build_vlm_image_processor_from_config` resolves `image_processor_type` from the
-repo's sidecar JSON against the `transformers` namespace and calls the result with
-the rest of that JSON as kwargs. `transformers.pipeline` is a function there that
-accepts `trust_remote_code`, which imports the repo's own `auto_map` Python on a
-path the user reached with `trust_remote_code=False`.
-"""
+"""A repo's image_processor_type may only select a real processor class; transformers.pipeline would import its auto_map code despite trust_remote_code=False."""
 
 import pytest
 
 
 @pytest.fixture(autouse = True, scope = "module")
 def _install_shim():
-    # The shim is torch-backed and `[core]` ships no torch on darwin/arm64. Unguarded
-    # (as every tests/test_mlx_*.py is) that is 7 collection ERRORs, not skips, and
-    # this file is in the security gate.
+    # The shim is torch-backed and `[core]` has no torch on darwin/arm64; unguarded, like every tests/test_mlx_*.py, this gives 7 collection ERRORs, not skips.
     pytest.importorskip("torch", reason = "the MLX simulation shim is torch-backed")
     from mlx_simulation import simulate_mlx_on_torch
     simulate_mlx_on_torch()
@@ -76,12 +67,7 @@ def test_non_processing_names_are_refused(name):
 
 
 def test_a_real_image_processor_still_builds():
-    """The gate must not break the case this code exists for.
-
-    Not an exact-name assertion: `CLIPImageProcessor` is a `TorchvisionBackend` in
-    Transformers 5 and resolves to `CLIPImageProcessorPil` when torchvision is absent,
-    which is what `tests-security` (`.[core]`, no torchvision) actually builds.
-    """
+    """A real image processor must still build; in Transformers 5 CLIPImageProcessor resolves to CLIPImageProcessorPil without torchvision, as in tests-security."""
     from transformers.image_processing_base import ImageProcessingMixin
 
     built = _build({

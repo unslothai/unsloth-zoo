@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""An exported config must not declare an MTP head the weights do not contain.
-
-transformers drops Qwen3.5's `mtp.*` tensors on load, so a re-saved export keeps
-`mtp_num_hidden_layers` with no weights behind it (unsloth#7681).
-"""
+"""Exported configs must not declare an MTP head the weights lack: transformers drops Qwen3.5's `mtp.*` tensors on load,
+so `mtp_num_hidden_layers` stays set (unsloth#7681)."""
 
 import json
 import os

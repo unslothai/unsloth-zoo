@@ -107,9 +107,24 @@ class _BatchResponse:
     top_logprobs: object = None
 
 
-class _BatchGenerator:
+def _sample_with_positions(sampler, logprobs, row_ids=None, positions=None):
+    raise NotImplementedError("mlx-shim: sampling not implemented")
+
+
+# 0.6.4 hangs the per-token event on GenerationBatch and tells the sampler which row and position it draws for.
+class _PromptProcessingBatch:
+    def generate(self):
+        return _sample_with_positions(None, None, row_ids=self.uids, positions=self.positions)
+
+
+class _GenerationBatch:
     Response = _BatchResponse
 
+    def _step(self):
+        return _sample_with_positions(None, None, row_ids=self.uids, positions=self.positions)
+
+
+class _BatchGenerator:
     def __init__(self, model, processor, max_tokens=256, stop_tokens=None,
                  sampler=None, completion_batch_size=32, prefill_batch_size=8,
                  prefill_step_size=512, prompt_cache=None, kv_bits=None,
@@ -117,6 +132,7 @@ class _BatchGenerator:
                  compute_logprobs=False, top_logprobs_k=0, logits_processors=None,
                  stream=None, apc_manager=None, draft_model=None, draft_kind=None,
                  draft_block_size=None, greedy_sampling=False):
+        self._prompt_batch, self._generation_batch = None, None
         self.kwargs = {
             "kv_bits": kv_bits, "kv_group_size": kv_group_size,
             "kv_quant_scheme": kv_quant_scheme,
@@ -133,8 +149,31 @@ class _BatchGenerator:
     def remove(self, uid):
         raise NotImplementedError("mlx-shim: BatchGenerator.remove not implemented")
 
+    def _build_mixed_prompt_batch(self, sequences):
+        raise NotImplementedError("mlx-shim: BatchGenerator._build_mixed_prompt_batch not implemented")
+
     def close(self):
         pass
+
+
+# The 0.6.4 batch-module helpers the engine reads directly; calling one is not simulated.
+_SEQUENCE_ALIGNED_PROMPT_KWARGS = frozenset({
+    "attention_mask", "decoder_inputs_embeds", "deepstack_visual_embeds", "visual_pos_masks",
+    "per_layer_inputs", "full_text_row_masked_out_mask", "position_ids", "pos_hw",
+    "mm_token_type_ids", "token_type_ids",
+})
+
+
+def _split_prompt_kwargs_per_row(prompt_kwargs, batch_size):
+    raise NotImplementedError("mlx-shim: _split_prompt_kwargs_per_row not implemented")
+
+
+def _merge_prefill_prompt_kwargs(prompt_kwargs_list, input_ids):
+    raise NotImplementedError("mlx-shim: _merge_prefill_prompt_kwargs not implemented")
+
+
+def _chunked_prefill_enabled(model, *, input_ids=None, **kwargs):
+    raise NotImplementedError("mlx-shim: _chunked_prefill_enabled not implemented")
 
 
 def turboquant_enabled(bits, scheme=None):
@@ -153,9 +192,15 @@ _BatchGenerator.__module__ = "mlx_vlm.generate.ar"
 turboquant_enabled.__module__ = "mlx_vlm.generate.ar"
 
 generate_ar_module.BatchGenerator = _BatchGenerator
+generate_ar_module.GenerationBatch = _GenerationBatch
+generate_ar_module.PromptProcessingBatch = _PromptProcessingBatch
 generate_ar_module.turboquant_enabled = turboquant_enabled
 generate_module.BatchGenerator = _BatchGenerator
 generate_module.turboquant_enabled = turboquant_enabled
+for _name in ("_SEQUENCE_ALIGNED_PROMPT_KWARGS", "_split_prompt_kwargs_per_row",
+              "_merge_prefill_prompt_kwargs", "_chunked_prefill_enabled"):
+    setattr(generate_ar_module, _name, globals()[_name])
+    setattr(generate_module, _name, globals()[_name])
 
 # mlx_vlm.kv_quant only exists from 0.6.12, so it stays absent here: the engine's
 # own fallback names the two schemes, and this shim tracks the pinned release.

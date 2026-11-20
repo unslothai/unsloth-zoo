@@ -1,20 +1,5 @@
-"""Q2_K_L preset dispatch inside quantize_gguf.
-
-Q2_K_L is an Unsloth-side preset, not a native llama.cpp ftype. Recipe:
-
-  llama-quantize \\
-      --tensor-type "\\.ffn_down_exps=Q3_K" \\
-      --tensor-type "\\.ffn_down=Q3_K" \\
-      --output-tensor-type Q6_K \\
-      --token-embedding-type Q4_K \\
-      IN OUT q2_k NTHREADS
-
-``--tensor-type`` is matched with ``std::regex_search`` (NOT substring) and
-iterates first-match-wins inside llama-quantize, so we chain the more-
-specific MoE pattern first. The leading ``\\.`` anchors the override on the
-GGUF path-separator dot so it cannot leak into hypothetical tensor names
-that merely contain the substring "ffn_down".
-"""
+"""Tests the Unsloth-side Q2_K_L preset: llama-quantize q2_k with Q3_K ffn_down overrides, Q6_K output and Q4_K token
+embeddings; ffn_down_exps must precede ffn_down (first match wins), both dot-anchored."""
 
 from __future__ import annotations
 

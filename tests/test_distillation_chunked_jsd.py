@@ -6,29 +6,9 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""CPU-pure numerics for `distillation_chunked_jsd`.
-
-The chunked loss exists so the two `(batch, seq, vocab)` logit tensors a
-knowledge-distillation step would otherwise hold never get materialized. That
-only helps if the chunk loop carries exactly the same value and the same
-gradient as the straight-line version, so the bulk of this file is parity
-against a dense reference written inline below.
-
-The reference is written here rather than imported because implementations
-disagree on the objective: some blend a hard cross-entropy term and some apply a
-`T**2` gradient rescale. Pinning ours against an inline reference states the
-convention instead of inheriting whichever one a dependency happens to ship.
-
-Covers:
-  - chunked equals dense in value and gradient, every beta, every chunk size
-  - the closed forms: self-distillation is 0, a fully masked batch is a
-    graph-connected 0 rather than 0 / 0
-  - beta = 0 and beta = 1 take their own branches instead of degenerating
-  - lm_head bias, Cohere logit_scale and Gemma final_logit_softcapping are applied
-  - a frozen output head allocates no dense gradient (the LoRA case)
-  - the teacher never receives a gradient
-  - `num_items_in_batch` reduction is applied once, not twice
-"""
+"""CPU numerics for distillation_chunked_jsd: chunked matches an inline dense reference in value and gradient
+(objectives differ across implementations); also checks beta endpoints, lm_head bias, logit_scale,
+final_logit_softcapping, frozen heads, no teacher gradient, one reduction."""
 
 from __future__ import annotations
 
@@ -123,8 +103,7 @@ def _make(batch = 2, seq = 7, student_hidden = 16, teacher_hidden = 24, vocab = 
     swt = (torch.randn(vocab, student_hidden, generator = generator) * 0.05).requires_grad_(True)
     twt = torch.randn(vocab, teacher_hidden, generator = generator) * 0.05
     mask = torch.ones(batch, seq, dtype = torch.long)
-    # Ragged on purpose, so masking is actually exercised rather than assumed.
-    # Guarded on the shape so the helper also serves the single-row cases.
+    # Ragged on purpose so masking is exercised; guarded on the shape so the helper also serves the single-row cases.
     if seq >= 3:
         mask[0, -2:] = 0
     if batch >= 2 and seq >= 2:
@@ -173,11 +152,7 @@ def test_self_distillation_is_zero(beta):
 
 @pytest.mark.parametrize("beta", BETAS)
 def test_fully_masked_batch_is_finite_zero_and_connected(beta):
-    """A fully masked batch must give a graph-connected 0, never 0 / 0 = nan.
-
-    The gradient still has to reach every trainable parameter or the collective
-    that follows backward has nothing to synchronise and the run hangs.
-    """
+    """A fully masked batch must give a graph-connected 0, not 0/0 nan; every trainable parameter still needs a gradient or the collective after backward hangs."""
     sh, th, swt, twt, mask, _, _ = _make()
     loss, _, n_valid = rr.distillation_chunked_jsd(
         sh, th, swt, twt, torch.zeros_like(mask), beta = beta, chunk_size = 4,
@@ -190,11 +165,7 @@ def test_fully_masked_batch_is_finite_zero_and_connected(beta):
 
 
 def test_endpoints_do_not_degenerate():
-    """beta 0 and 1 need their own branches.
-
-    Substituting either endpoint into the interior mixture expression collapses
-    it to exactly zero, which would look like a converged run.
-    """
+    """beta 0 and 1 need their own branches: the interior mixture expression collapses to exactly zero at either endpoint, which looks like convergence."""
     sh, th, swt, twt, mask, _, _ = _make()
     for beta in (0.0, 1.0):
         loss, _, _ = rr.distillation_chunked_jsd(sh, th, swt, twt, mask, beta = beta, chunk_size = 4)
@@ -306,11 +277,7 @@ def test_differing_hidden_widths(widths):
 
 
 def test_chunking_bounds_peak_logit_memory():
-    """The reason the function exists: peak must not scale with the batch.
-
-    Counted rather than measured, so it holds on CPU CI: the chunk loop only ever
-    holds one `chunk_size x vocab` pair of logit tensors at a time.
-    """
+    """Peak logit memory must not scale with batch: the chunk loop holds one chunk_size x vocab pair of logit tensors at a time; counted, not measured, for CPU CI."""
     vocab = 53
     seen = []
     original = rr._distillation_project_logits
@@ -335,9 +302,8 @@ def test_registered_in_rl_replacements():
     assert rr.RL_REPLACEMENTS["distillation_chunked_jsd"] is rr.distillation_chunked_jsd
 
 
-# The loss differentiates in the forward pass with torch.func.grad_and_value and
-# compiles that transform, rather than recomputing each chunk under gradient
-# checkpointing. These pin the paths that choice introduces.
+# The loss differentiates in forward with torch.func.grad_and_value and compiles that transform rather than per-chunk
+# gradient checkpointing; these tests pin the paths that introduces.
 
 
 def test_trainable_bias_receives_a_gradient():
@@ -355,12 +321,8 @@ def test_trainable_bias_receives_a_gradient():
 
 
 def test_frozen_bias_with_trained_head():
-    """The (0, 1) argnums branch: a bias that exists but is not trained.
-
-    `_make` already returns a bias with `requires_grad = False`, so the call
-    below is stating the precondition rather than changing it; assert it, or this
-    test passes for a reason it does not name.
-    """
+    """Covers the (0, 1) argnums branch with a bias that exists but is frozen; _make already sets requires_grad False,
+    so assert that precondition or the test passes for a reason it does not name."""
     sh, th, swt, twt, mask, sb, tb = _make(bias = True)
     sb.requires_grad_(False)
     assert not sb.requires_grad
@@ -397,12 +359,7 @@ def test_compile_disabled_gives_the_same_answer(beta, monkeypatch):
 
 
 def test_hidden_gradient_is_returned_in_the_callers_row_order():
-    """Packing sorts rows; the gradient has to come back unsorted.
-
-    Masked rows contribute nothing, so a gradient left in packed order would put
-    real values on masked positions and zeros on trained ones, which still trains
-    and still looks plausible.
-    """
+    """Packing sorts rows, so the hidden gradient must come back in the caller's row order; in packed order it lands on the wrong rows yet still trains plausibly."""
     sh, th, swt, twt, mask, _, _ = _make()
     loss, _, _ = rr.distillation_chunked_jsd(sh, th, swt, twt, mask, beta = 0.5, chunk_size = 3)
     loss.backward()
@@ -424,8 +381,7 @@ def test_entropy_and_token_count_are_not_differentiable():
 
 @pytest.mark.parametrize("batch,seq,chunk_size", [(1, 5, 4), (3, 7, 4), (2, 9, 256), (1, 1, 8)])
 def test_row_count_not_a_multiple_of_chunk_size(batch, seq, chunk_size):
-    """The packed rows are padded out to whole chunks, so every chunk is the same
-    shape. That has to leave the answer alone."""
+    """Packed rows are padded to whole chunks so every chunk has the same shape; that padding must not change the answer."""
     sh, th, swt, twt, mask, _, _ = _make(batch = batch, seq = seq)
     got, _, got_n = rr.distillation_chunked_jsd(
         sh, th, swt, twt, mask, beta = 0.5, chunk_size = chunk_size,
@@ -447,11 +403,7 @@ def test_padding_rows_do_not_reach_the_gradient():
 
 
 def test_every_chunk_is_the_same_width():
-    """What lets the compiled region be traced for static shapes.
-
-    Counted rather than inferred: a ragged tail would show up as a second width
-    here, and as a second Dynamo trace in a real run.
-    """
+    """Equal chunk widths let the compiled region trace with static shapes; a ragged tail would add a second width and a second Dynamo trace."""
     widths = []
     original = rr._distillation_project_logits
 
@@ -490,14 +442,9 @@ def test_low_precision_inputs_are_scored_in_float32(dtype, beta):
         sh.double(), th.double(), swt.double(), twt.double(), mask, beta = beta,
     )
     relative_error = (got.double() - reference).abs().item() / reference.abs().item()
-    # The threshold separates two measured populations rather than pinning one
-    # machine's number. Dropping the upcast in exactly this configuration gives
-    # 4.6e-01, 4.6e-01, 4.5e-01 (bfloat16) and 1.7e-02, 5.6e-02, 2.9e-01
-    # (float16) at the interior betas, which is where the mixture subtracts two
-    # nearly equal terms and the precision actually decides the answer. With the
-    # upcast the same cells are 1e-05 or better here. An earlier 1e-4 bound was
-    # tuned against this box and failed on a CPU-only runner at 1.1e-04 and
-    # 1.3e-04, so it was measuring the host, not the dtype.
+    # Threshold separates measured populations: dropping the float32 upcast gives ~0.45 (bfloat16) or up to 0.29
+    # (float16) relative error at interior betas, vs 1e-05 or better with it; an old 1e-4 bound, tuned on this box,
+    # failed on CPU-only runners.
     assert relative_error < 1e-3, (
         f"{dtype} beta={beta} relative error {relative_error:.3e}; the divergence "
         "is no longer being computed in float32"
@@ -550,8 +497,7 @@ def test_models_dispatched_across_devices(student_head, teacher_hidden, teacher_
 def test_trained_bias_with_frozen_head():
     """The (0, 2) argnums branch: bias-only tuning, or LoRA with bias = "all". Enumerating the combinations by hand missed it, so the first forward raised IndexError."""
     sh, th, swt, twt, mask, sb, tb = _make(bias = True)
-    # `_make` hands back a bias that does NOT require grad, which is why nothing
-    # covered this branch before; ask for it explicitly.
+    # _make returns a bias that does NOT require grad, so this branch must request it explicitly.
     sb.requires_grad_(True)
     swt.requires_grad_(False)
     loss, _, _ = rr.distillation_chunked_jsd(
@@ -563,9 +509,8 @@ def test_trained_bias_with_frozen_head():
     assert sb.grad is not None and torch.isfinite(sb.grad).all()
     assert sh.grad is not None and torch.isfinite(sh.grad).all()
 
-    # The bias gradient must be the real one, not whatever happened to sit at
-    # that tuple position: the same run with the head trainable too must give the
-    # same bias gradient, since the bias gradient does not depend on that.
+    # The bias gradient must be the real one, not whatever sits at that tuple position; it must match a run with the
+    # head trainable, since it does not depend on that.
     sh2, th2, swt2, twt2, mask2, sb2, tb2 = _make(bias = True)
     sb2.requires_grad_(True)
     loss2, _, _ = rr.distillation_chunked_jsd(
@@ -589,8 +534,7 @@ def test_a_supplied_zero_token_count_does_not_produce_nan(supplied, as_tensor):
     assert torch.isfinite(loss), f"loss is {loss}"
     assert loss.item() == 0.0
     loss.backward()
-    # Graph-connected zero, not a detached one: every trainable parameter must
-    # still receive a gradient or the collective that follows backward hangs.
+    # Graph-connected zero, not a detached one: every trainable parameter must still get a gradient or the collective after backward hangs.
     for name, tensor in (("hidden", sh), ("head", swt)):
         assert tensor.grad is not None, f"{name} got no gradient"
         assert torch.isfinite(tensor.grad).all(), f"{name} gradient is not finite"
@@ -601,8 +545,7 @@ def test_double_backward_is_not_silently_wrong():
     sh, th, swt, twt, mask, _, _ = _make()
     loss, _, _ = rr.distillation_chunked_jsd(sh, th, swt, twt, mask, beta = 0.5, chunk_size = 3)
     (grad_hidden,) = torch.autograd.grad(loss, sh, create_graph = True)
-    # The saved gradient is a constant with respect to the inputs, so a second
-    # derivative through it is zero rather than a silently wrong value.
+    # The saved gradient is constant w.r.t. the inputs, so a second derivative through it is zero rather than a silently wrong value.
     assert grad_hidden.grad_fn is not None or not grad_hidden.requires_grad
 
 

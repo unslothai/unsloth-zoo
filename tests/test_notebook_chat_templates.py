@@ -1,54 +1,27 @@
-"""Auto-detection coverage over the unslothai/notebooks model set.
-
-For every model shipped in unslothai/notebooks (mostly unsloth/* names, listed in
-notebook_models.json) this checks that train_on_responses_only can auto-detect the
-instruction/response markers and that the resulting mask is content-exact on BOTH a
-plain multi-turn conversation AND a reasoning conversation (final assistant turn
-carries "<think>...</think>answer"). The reasoning probe is what catches markers
-that bake in an injected empty think block and so miss the trained turn.
-
-Content-exactness alone leaves the span BOUNDARIES untested, so `_boundary_arms`
-adds the four cases that only show up at the edges of a response: last_response_only,
-force_match = False, padding that reuses the EOS id, and a second conversation packed
-into the same row.
-
-The model list is discovered dynamically from a notebooks checkout (git clone, or
-UNSLOTH_NOTEBOOKS_DIR), so a newly added notebook is picked up automatically; the
-pinned notebook_models.json is unioned in as a fallback so coverage never shrinks.
-
-This is a network/integration test and is OFF by default. Enable it with
-    UNSLOTH_TEST_NOTEBOOK_MODELS=1 pytest tests/test_notebook_chat_templates.py
-Tokenizers are fetched config-only and cached; set UNSLOTH_NOTEBOOK_TOK_CACHE to
-reuse an existing cache directory. Models that 404/gate/need a newer transformers,
-or whose template legitimately has no atomic role markers, are skipped, not failed.
-"""
+"""Notebook auto-detection sweep: masks must be content-exact on plain, reasoning and boundary chats; models from
+UNSLOTH_NOTEBOOKS_DIR or a clone plus notebook_models.json (coverage never shrinks); off unless
+UNSLOTH_TEST_NOTEBOOK_MODELS=1; cache UNSLOTH_NOTEBOOK_TOK_CACHE; 404/gated models skip."""
 import os, sys, json, re, glob, tempfile, subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))  # import the in-tree unsloth_zoo
-# unsloth_zoo is imported lazily (inside _check / _content_leak_free), not at module
-# scope: importing it runs unsloth_zoo/__init__.py, which raises ImportError when the
-# separate `unsloth` package is absent, and that would break pytest collection.
+# Import unsloth_zoo lazily inside _check / _content_leak_free: a module-scope import runs __init__.py, which raises ImportError without the unsloth package.
 
 ENABLED = os.environ.get("UNSLOTH_TEST_NOTEBOOK_MODELS", "") not in ("", "0", "false")
 
-# Notebook models are expected to auto-detect, so a ValueError from get_chat_template_parts
-# is a regression and FAILS the sweep. The only sanctioned exceptions are templates that
-# genuinely have no atomic role markers (e.g. zephyr-sft's multi-piece <|assistant|>); list
-# them here (substring match) so a real detection regression can never hide as a SKIP.
+# A ValueError from get_chat_template_parts on notebook models is a regression that fails the sweep; only templates with
+# no atomic role markers (e.g. zephyr-sft, multi-piece <|assistant|>) are listed in KNOWN_NON_ATOMIC (substring match)
+# so regressions cannot hide as SKIP.
 KNOWN_NON_ATOMIC = ("zephyr-sft",)
-# Templates offering no message boundary at all: ERNIE's '<|end_of_sentence|>User:' and
-# 'Assistant:' share no token prefix, and <|end_of_sentence|> is not eos_token_id, so a
-# packed row has nothing to stop at and role-based labels are the documented answer.
-# Listed rather than tolerated so a boundary regression elsewhere cannot hide as a skip.
+# ERNIE's '<|end_of_sentence|>User:' and 'Assistant:' share no token prefix and <|end_of_sentence|> is not eos_token_id,
+# so packed rows have nothing to stop at; role-based labels are the documented answer; listed so a boundary regression
+# cannot hide as a skip.
 KNOWN_NO_BOUNDARY = ("ernie-4.5",)
 CACHE = os.environ.get("UNSLOTH_NOTEBOOK_TOK_CACHE", os.path.join(tempfile.gettempdir(), "unsloth_nb_tok"))
 ALLOW_PATTERNS = ["*.json", "*.model", "tokenizer*", "merges*", "vocab*", "*.jinja", "*.txt"]
 NOTEBOOKS_REPO = "https://github.com/unslothai/notebooks"
 
-# Dynamically discover every model named in the notebooks so a newly added notebook
-# is covered automatically. A few hard cases (templated names, non-conversational
-# repos) are intentionally dropped.
+# Discover every model named in the notebooks so new ones are covered automatically; templated names and non-conversational repos are intentionally dropped.
 _MODEL_RE = re.compile(r"""(?:model_name\s*=\s*|from_pretrained\(\s*)["']([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)["']""")
 _SUFFIX = ["-unsloth-bnb-4bit", "-bnb-4bit", "-unsloth", "-FP8-Block", "-FP8", "-BF16", "-GGUF"]
 _DROP = ("embedding", "minilm", "mpnet", "bge-", "modernbert", "whisper", "outetts", "llasa",
@@ -84,8 +57,7 @@ def _scan_notebooks(root):
 
 
 def _models():
-    """Dynamically extract model names from a notebooks checkout; union with the
-    pinned fixture so coverage never shrinks and new notebooks are auto-covered."""
+    """Extract model names from a notebooks checkout, unioned with the pinned fixture so coverage never shrinks and new notebooks are auto-covered."""
     fixture = set(json.load(open(os.path.join(HERE, "notebook_models.json"))))
     discovered = set()
     env_dir = os.environ.get("UNSLOTH_NOTEBOOKS_DIR")
@@ -111,9 +83,8 @@ PLAIN = [{"role": "user", "content": USERS[0]}, {"role": "assistant", "content":
 # Reasoning probe: the final assistant turn carries a think block + answer.
 REASON = [{"role": "user", "content": "Reason user one"},
           {"role": "assistant", "content": "<think>HIDDENREASON</think>VISIBLEANSWER"}]
-# A second conversation to concatenate after PLAIN, standing in for packing. It opens
-# with a system message because that is what the old scan ran into: with no user marker
-# left in the first sample, its last span continued into the next sample's system prompt.
+# Second conversation concatenated after PLAIN to stand in for packing; it opens with a system message since, with no
+# user marker left in the first sample, the old scan's last span ran into the next sample's system prompt.
 NEXT_SYS, NEXT_USER, NEXT_ASST = "Ibex directive golf", "Ocelot question charlie", "Macaw answer foxtrot"
 NEXT = [{"role": "system", "content": NEXT_SYS},
         {"role": "user", "content": NEXT_USER},
@@ -130,8 +101,7 @@ def _download(repo):
 
 
 def _content_leak_free(t, ins, res, convo, asst_texts, user_texts):
-    """True iff every assistant-content token present is trained and no user-content
-    token is trained. Content pieces the template drops are ignored."""
+    """True iff every assistant-content token present is trained and no user-content token is trained; pieces the template drops are ignored."""
     from unsloth_zoo.dataset_utils import train_on_responses_only
     text = t.apply_chat_template(convo, tokenize=False, add_generation_prompt=False)
     enc = t(text, add_special_tokens=False, return_offsets_mapping=True)
@@ -157,8 +127,7 @@ def _content_leak_free(t, ins, res, convo, asst_texts, user_texts):
 
 
 def _piece_index(t, text):
-    """(token ids, sub -> the token indices covering it, or None if the template
-    dropped it)."""
+    """Returns (token ids, idx) where idx(sub) gives the covering token indices, or None if the template dropped it."""
     enc = t(text, add_special_tokens=False, return_offsets_mapping=True)
     offs = enc["offset_mapping"]
 
@@ -183,9 +152,8 @@ def _all_trained(labels, idx):
 
 
 def _boundary_arms(t, repo, ins, res):
-    """The arms the plain content check cannot reach: last_response_only, force_match
-    off, padding that reuses the EOS id, and a packed second sample. Every arm is run
-    and every failure reported, so one broken arm cannot hide the rest."""
+    """Arms the plain content check cannot reach: last_response_only, force_match off, EOS-id padding, a packed second
+    sample; every arm runs and every failure is reported."""
     text = t.apply_chat_template(PLAIN, tokenize=False, add_generation_prompt=False)
     ids, idx = _piece_index(t, text)
     bad = []
@@ -212,8 +180,7 @@ def _boundary_arms(t, repo, ins, res):
             if i and _all_trained(labels, i) is True:
                 bad.append(f"force_match=False leaked {sub!r}")
 
-    # Padding that reuses the EOS id. One eos may be kept as the answer's own target;
-    # the rest of the pad run must not be trained.
+    # Padding that reuses the EOS id: one eos may stay as the answer's own target; the rest of the pad run must not be trained.
     eos = getattr(t, "eos_token_id", None)
     if eos is not None:
         labels = _mask(t, ins, res, list(ids) + [eos] * 6)
@@ -223,8 +190,7 @@ def _boundary_arms(t, repo, ins, res):
 
     if not any(k in repo.lower() for k in KNOWN_NO_BOUNDARY):
         try:
-            # Templates that reject a system role skip THIS arm only: letting the
-            # exception out would demote an otherwise checkable model to SKIP.
+            # Templates that reject a system role skip only this arm; letting the exception escape would demote an otherwise checkable model to SKIP.
             tail = t.apply_chat_template(NEXT, tokenize=False, add_generation_prompt=False)
         except Exception:
             return (not bad), "; ".join(bad)

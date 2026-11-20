@@ -1,20 +1,6 @@
-"""The gpt-oss grouped bnb4bit readiness probe honors both env gates.
-
-GptOssExpertsBnb4bit._grouped_bnb4bit_ready decides whether the grouped
-torch._grouped_mm forward replaces the per-expert loop. It must be:
-
-  * ON by default,
-  * OFF when UNSLOTH_GPTOSS_GROUPED=0 (explicit opt-out of the grouped path),
-  * OFF when UNSLOTH_COMPILE_DISABLE=1 (the grouped stacks are meant to run under
-    the compiled cache; disabling compilation opts into the plain eager loop).
-
-The probe is self-contained (local imports, reads os.environ directly) so the
-compiler can copy its source into the standalone compiled cache. These are the
-env gates only: the downstream expert/quant_state checks are held True via a
-minimal CPU fake so the gate logic is exercised in isolation. No CUDA compute is
-performed (the fake Params4bit is never quantized), though importing unsloth_zoo
-requires a visible torch accelerator.
-"""
+"""Env gates of GptOssExpertsBnb4bit._grouped_bnb4bit_ready: ON by default, OFF with UNSLOTH_GPTOSS_GROUPED=0, ON with
+UNSLOTH_COMPILE_DISABLE=1/partial; probe stays self-contained (compiler copies its source); no CUDA compute, but
+importing unsloth_zoo needs a torch accelerator."""
 import os
 from types import SimpleNamespace
 
@@ -32,16 +18,17 @@ try:
 except Exception as e:  # pragma: no cover - unsloth_zoo import needs an accelerator
     pytest.skip(f"cannot import unsloth_zoo gpt_oss patches: {e}", allow_module_level=True)
 
+from unsloth_zoo.stubs.bitsandbytes_stub import real_bitsandbytes_available
+
+if not real_bitsandbytes_available():
+    pytest.skip("bitsandbytes is the unsloth_zoo stub on this host", allow_module_level=True)
+
 
 _NF4_CODE = torch.linspace(-1, 1, 16)
 
 
 def _fake_expert_linear():
-    """A LoRA-free bnb Linear4bit-like expert whose readiness checks all pass.
-
-    The Params4bit is left unquantized on CPU and given a hand-built quant_state
-    so the probe's attribute inspection succeeds without any GPU dequant.
-    """
+    """LoRA-free bnb Linear4bit-like expert passing all readiness checks: Params4bit stays unquantized on CPU with a hand-built quant_state, so no GPU dequant runs."""
     w = Params4bit(
         torch.zeros(4, 32, 64, dtype=torch.bfloat16),
         requires_grad=False,
@@ -88,10 +75,11 @@ def test_grouped_disabled_by_gptoss_grouped_zero(experts, monkeypatch):
     assert _ready(experts) is False
 
 
-def test_grouped_disabled_by_compile_disable(experts, monkeypatch):
+@pytest.mark.parametrize("value", ["1", "partial"])
+def test_compile_disable_keeps_grouped_on(experts, monkeypatch, value):
     monkeypatch.delenv("UNSLOTH_GPTOSS_GROUPED", raising=False)
-    monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", "1")
-    assert _ready(experts) is False
+    monkeypatch.setenv("UNSLOTH_COMPILE_DISABLE", value)
+    assert _ready(experts) is True
 
 
 def test_compile_disable_zero_keeps_grouped_on(experts, monkeypatch):

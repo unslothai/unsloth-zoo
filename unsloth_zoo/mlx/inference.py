@@ -35,17 +35,18 @@ import struct
 import sys
 import textwrap
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from threading import RLock, local
-from types import FunctionType
+from types import FunctionType, ModuleType
 from typing import Callable, NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from . import attention, nax, qmm
+from . import ane, attention, matmul, nax, offload
+from .ane import ane_prefill_available, ane_prefill_checkpoint_available, ane_prefill_mlp, release_ane_prefill
 
 
 logger = logging.getLogger(__name__)
@@ -86,7 +87,12 @@ def _resolve_dotted(module, path):
     return target
 
 
-def _resolved_bindings(contract):
+@functools.cache
+def _class_namespace(cls):
+    return vars(cls)
+
+
+def _resolved_bindings(contract, *, report=True):
     """Resolve a `{module: {dotted name: fingerprint}}` contract, None pinning the name not the body.
 
     A fingerprint may be a tuple of alternatives, for a body that differs across the supported
@@ -120,18 +126,25 @@ def _resolved_bindings(contract):
                 matches = False
             if matches:
                 # A static method's class entry is its descriptor, which is what a rebinding replaces.
-                raw = vars(holder).get(name)
-                found[id(holder), name] = (vars(holder), name, raw if isinstance(raw, staticmethod) else target)
+                namespace = _class_namespace(holder) if isinstance(holder, type) else vars(holder)
+                raw = namespace.get(name)
+                found[id(holder), name] = (namespace, name, raw if isinstance(raw, staticmethod) else target)
                 for alias, mod in (_ALIASES if expected is not None else ()):
                     if alias in source.__globals__:
                         found[id(source.__globals__), alias] = (source.__globals__, alias, mod)
             else:
                 holds = False
-                if (module_name, path) not in _CONTRACT_MISSES:
+                if report and (module_name, path) not in _CONTRACT_MISSES:
                     _CONTRACT_MISSES.add((module_name, path))
                     logger.warning("%s.%s differs from the version the MLX fusions were written "
                                    "against; the native method stays in use", module_name, path)
     return list(found.values()) if holds else None
+
+
+def _first_resolved(contracts):
+    """The first of several accepted contracts that resolves; only when none does is the newest one's miss reported."""
+    found = next(filter(None, (_resolved_bindings(contract, report=False) for contract in contracts)), None)
+    return found if found is not None else _resolved_bindings(contracts[-1])
 
 
 def _exact_route_native(function):
@@ -144,7 +157,7 @@ def _exact_route_native(function):
 def _bindings_intact(bindings):
     for namespace, name, target in bindings:
         current = namespace.get(name)
-        if current is not target and _exact_route_native(current) is not target:
+        if current is not target and (target is None or _exact_route_native(current) is not target):
             return False
     return True
 
@@ -163,9 +176,61 @@ def _settled(verdict):
     """`verdict`, after synchronizing on a mismatch: a failed command buffer's garbage reads as one, and MLX
     raises that error only at the next synchronize."""
     _FIRST_USE_WORK[0] += 1
+    if getattr(offload.STAGED_FILLS, "fills", None) and not _STAGED_ROWS_OFF:
+        _STAGED_ROWS_OFF.append(True)
+        logger.warning("a first-use check ran while disk PLE rows were staged; rows are read in the forward from now on")
     if not verdict:
         mx.synchronize()
     return verdict
+
+
+# Each first-use check calls this before it evaluates any of the forward's arrays.
+_staged_ready = offload.read_staged
+
+
+_STAGED_SUBMIT_ROOTS = 40
+
+
+def _staged_forward_rows(inputs):
+    """Bound the forward; each disk table also bounds its expanded row IDs before staging."""
+    if not isinstance(inputs, mx.array) or inputs.ndim != 2:
+        return 0
+    batch, rows = inputs.shape
+
+    if batch != 1 or not 0 < rows <= offload._STAGED_ROWS:
+        return 0
+    return rows
+
+
+@functools.cache
+def _staged_submit_window():
+    if mx.__version__ != "0.32.4":
+        return 0
+    if not mx.metal.is_available():
+        return 0
+    if mx.device_info().get("architecture") != "applegpu_g15s":
+        return 0
+    return _STAGED_SUBMIT_ROOTS
+
+
+def _submit(*arrays):
+    held = getattr(offload.STAGED_FILLS, "held", None)
+    if held is not None and getattr(offload.STAGED_FILLS, "fills", None):
+        held.append(arrays)
+        after = getattr(offload.STAGED_FILLS, "submit_after", 0)
+        if after and len(held) >= after:
+            _staged_ready()
+    else:
+        mx.async_eval(*arrays)
+
+
+class _HeldMx(ModuleType):
+    def __getattr__(self, name):
+        return getattr(mx, name)
+
+
+_HELD_MX = _HeldMx("mlx.core")
+_HELD_MX.async_eval = _submit
 
 
 def _unless_failed_buffer(error):
@@ -181,7 +246,26 @@ _MOE_PACK_ROW_MULTIPLE = 8
 
 
 _MOE_GATE_UP_CLASSES = {}
+_MOE_GENERATED_CALLS = {}
+_MOE_GENERATED_BINDINGS = {}
 _MOE_GATE_UP_LOCK = RLock()
+
+
+def _moe_contract_bindings(*contracts):
+    found = {}
+    for bindings in contracts:
+        if bindings is None or not _bindings_intact(bindings):
+            return None
+        for space, name, value in bindings:
+            found.setdefault((id(space), name), (space, name, value))
+    return list(found.values())
+
+
+def _moe_generated_bindings(cls):
+    expected = _MOE_GENERATED_CALLS.get(cls)
+    if expected is None or cls.__call__ is not expected[0] or cls.__mro__ != expected[1]:
+        return None
+    return _moe_contract_bindings(_MOE_GENERATED_BINDINGS.get(cls))
 
 
 # Bodies the fused expert call reimplements. The two switch layer packages no longer share a
@@ -196,7 +280,7 @@ _MOE_GATE_UP_FUNCTIONS = {
 }
 _MOE_SWITCH_GLU_CALLS = {
     "mlx_lm.models.switch_layers": ("ed00798a68bad37d", "3a412610c5b9c112"),
-    "mlx_vlm.models.switch_layers": ("ed00798a68bad37d", "4e3d80f1396fb265"),
+    "mlx_vlm.models.switch_layers": ("ed00798a68bad37d", "4e3d80f1396fb265", "b3f8c684857eb8fe"),
 }
 
 
@@ -234,6 +318,9 @@ def _moe_gate_up_packable(module, projection_type):
     if gate.trainable_parameters() or up.trainable_parameters():
         return False
     if gate.get("global_scale") is not None or up.get("global_scale") is not None:
+        return False
+    # mlx-vlm 0.8.0 sorts the routes of a rank's share of the experts on its own threshold.
+    if getattr(module, "num_experts", gate.num_experts) != gate.num_experts:
         return False
     if (gate.group_size, gate.bits, gate.mode) != (up.group_size, up.bits, up.mode):
         return False
@@ -368,7 +455,10 @@ def _fused_moe_gate_up_class(original_class, projection_type, scatter_unsort, de
             f"_FusedMoEGateUp{original_class.__name__}", (original_class,),
             {"__call__": fused_call, "sorted_experts": sorted_experts},
         )
-    return _MOE_GATE_UP_CLASSES[key]
+        _MOE_GENERATED_CALLS[_MOE_GATE_UP_CLASSES[key]] = (fused_call, _MOE_GATE_UP_CLASSES[key].__mro__)
+        _MOE_GENERATED_BINDINGS[_MOE_GATE_UP_CLASSES[key]] = tuple(bindings)
+    fused = _MOE_GATE_UP_CLASSES[key]
+    return fused if _moe_generated_bindings(fused) is not None else None
 
 
 @contextmanager
@@ -407,6 +497,8 @@ def fused_moe_gate_up(model, *, _modules = None):
                             continue
                         packed = _PackedMoEGateUp(module)
                         fused = _fused_moe_gate_up_class(original, *spec)
+                        if fused is None:
+                            continue
                     packed.active_scopes += 1
                     patched.append((module, original, fused, packed))
                     if type(module) is not fused:
@@ -793,7 +885,8 @@ def _decode_step_contract(base):
     if language is None or source is None or cache is None or os.environ.get("UNSLOTH_MLX_FUSED_GDN_DECODE") == "0":
         return None
     layer = language.Qwen3_5GatedDeltaNet
-    if any(getattr(base, name, None) is not getattr(layer, name)
+    # mlx-vlm below 0.6.17 has no _normalize_qk and below 0.7.1 no _project_gates.
+    if any(getattr(layer, name, None) is None or getattr(base, name, None) is not getattr(layer, name)
            for name in ("__call__", "_normalize_qk", "_project_gates", "_causal_conv1d_decode")):
         return None
     if language.ArraysCache is not cache.ArraysCache or "gated_delta_update" not in vars(language):
@@ -873,6 +966,7 @@ def _decode_step_route(language, bound, update, update_window, update_recurrent,
             out, new_state = update(q, k, v, a, b, self.A_log, self.dt_bias, state = state, use_kernel = True)
             out = self.norm(out, z)
             if fits and verdict is None:
+                _staged_ready()
                 try:
                     verdict = _settled(all(bool(mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item())
                                            for x, y in zip(fused(), (window, out, new_state))))
@@ -1144,6 +1238,7 @@ def _packed_gated_delta_route(native, bindings):
             return _packed_gated_delta(q, k, v, g, beta, state)
         stock = native(q, k, v, g, beta, state, mask)
         if verdict is None:
+            _staged_ready()
             try:
                 verdict = _settled(all(bool(mx.array_equal(a.view(mx.uint8), b.view(mx.uint8)).item())
                                        for a, b in zip(_packed_gated_delta(q, k, v, g, beta, state), stock)))
@@ -1348,6 +1443,7 @@ def _qwen4_verified(key, fused, native, what):
     if verdict is None:
         candidate = fused()
         outputs = [out if isinstance(out, tuple) else (out,) for out in (reference, candidate)]
+        _staged_ready()
         try:
             verdict = _settled(len(outputs[0]) == len(outputs[1]) and all(
                 a.dtype == b.dtype and a.shape == b.shape and mx.array_equal(a.view(mx.uint8), b.view(mx.uint8)).item()
@@ -1445,7 +1541,7 @@ def fused_qwen4_prefill(model, *, _modules = None):
                     module.__dict__.pop("_unsloth_qwen4_prefill_scopes", None)
 
 
-# Qwen4-Exp single-token decode: the batch-invariant forward's hyper-connection read in two launches, built from
+# Qwen4-Exp decode: the batch-invariant forward's hyper-connection read, built from
 # MLX's qmv_fast and qmv bodies (mlx/backend/metal/kernels/quantized.h, Copyright © 2023-2024 Apple Inc., MIT).
 _QWEN4_DECODE_CONTRACT = {
     "mlx_vlm.models.qwen4_exp.language": {
@@ -1454,6 +1550,7 @@ _QWEN4_DECODE_CONTRACT = {
         "Qwen4ExpGatedResidual": None,
         "Qwen4ExpRMSNorm": None,
         "Qwen4ExpBatchInvariantForward._hyper_connection": "0b22ede797c90e60",
+        "Qwen4ExpBatchInvariantForward._inject": "e05cbb2d38af4834",
         "Qwen4ExpRMSNorm.__call__": "b47a270c1b0eade5",
     },
     "mlx_vlm.models.qwen3_5.speculative_verifier": {
@@ -1486,11 +1583,27 @@ def _qwen4_decode_kernels():
         load_tg = load.replace("load_vector(const device T* x", "load_vector_tg(const threadgroup T* x")
         if load_tg == load:
             return None
-        # Norm in MLX's row reduction order (a simdgroup per 128 values), kept in threadgroup memory for qmv_fast.
+        # Norm in MLX's row reduction order (a simdgroup per 128 values), kept in threadgroup memory for qmv_fast; each
+        # grid row (y) is one token row, read as its own one-row call. FOLD reads `x + branch * weights` (the residual
+        # inject before this read) in mlx-vlm's two rounded ops and writes it out; INJECT adds a last threadgroup for
+        # the inject projection (MLX's qmv_fast with partial rows) and gate.
         norm_down = mx.fast.metal_kernel(
             name = "unsloth_qwen4_decode_norm_down",
-            input_names = ["x", "w", "inv_n", "eps", "wd", "sd", "bd", "activate"], output_names = ["normed", "act"],
+            input_names = ["x", "branch", "weights", "w", "inv_n", "eps", "wd", "sd", "bd", "activate", "w_inject",
+                           "s_inject", "b_inject", "gate"],
+            output_names = ["normed", "act", "inj", "hidden"],
             header = quantized + load_tg, compile_options = _QWEN4_SAFE_MATH, source = pragma + """
+            #define INPUT(e) (FOLD ? T(x[e] + T(branch[(e) % G] * weights[(e) / G])) : x[e])
+            const uint token = threadgroup_position_in_grid.y;
+            x += token * STREAMS * G;
+            normed += token * STREAMS * G;
+            act += token * LR;
+            if (FOLD) {
+                branch += token * G;
+                weights += token * STREAMS;
+                hidden += token * STREAMS * G;
+            }
+            if (INJECT) inj += token * STREAMS;
             const uint lane = thread_index_in_simdgroup;
             const uint sg = simdgroup_index_in_threadgroup;
             const uint tile = threadgroup_position_in_grid.x;
@@ -1506,7 +1619,7 @@ def _qwen4_decode_kernels():
                 const uint g = c / CHUNKS, v = c % CHUNKS;
                 float total = 0.0f;
                 for (uint i = 0; i < 4; ++i) {
-                    const float y = float(x[g * G + (v * 32 + lane) * 4 + i]);
+                    const float y = float(INPUT(g * G + (v * 32 + lane) * 4 + i));
                     total = y * y + total;
                 }
                 total = simd_sum(total);
@@ -1522,11 +1635,49 @@ def _qwen4_decode_kernels():
             threadgroup_barrier(mem_flags::mem_threadgroup);
             const uint span = (STREAMS * G + threadgroups_per_grid.x - 1) / threadgroups_per_grid.x;
             for (uint e = t; e < STREAMS * G; e += THREADS) {
-                const T value = T((float(x[e]) * inverse[e / G]) * (1.0f + float(w[e])));
+                const T input = INPUT(e);
+                const T value = T((float(input) * inverse[e / G]) * (1.0f + float(w[e])));
                 normed_tg[e] = value;
-                if (e / span == tile) normed[e] = value;
+                if (e / span == tile) {
+                    normed[e] = value;
+                    if (FOLD) hidden[e] = input;
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (INJECT && tile == threadgroups_per_grid.x - 1) {
+                if (sg != 0) return;
+                constexpr int pack_factor = get_pack_factor<IBITS, 32>();
+                constexpr int bytes_per_pack = get_bytes_per_pack<IBITS, 32>();
+                constexpr int values_per_thread = pack_factor * 2;
+                constexpr int block_size = values_per_thread * 32;
+                constexpr int scale_step_per_thread = IGS / values_per_thread;
+                constexpr int in_vec_size = STREAMS * G;
+                constexpr int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+                constexpr int in_vec_size_g = in_vec_size / IGS;
+                thread float x_thread[values_per_thread];
+                thread float result[STREAMS] = {0};
+                const device uint8_t* ws = (const device uint8_t*)w_inject + lane * 2 * bytes_per_pack;
+                const device T* sc = s_inject + lane / scale_step_per_thread;
+                const device T* bs = b_inject + lane / scale_step_per_thread;
+                const threadgroup T* xp = normed_tg + lane * values_per_thread;
+                for (int k = 0; k < in_vec_size; k += block_size) {
+                    float sum = load_vector_tg<T, float, values_per_thread, IBITS>(xp, x_thread);
+                    for (int r = 0; r < STREAMS; r++) {
+                        auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+                        result[r] += qdot<float, values_per_thread, IBITS>(
+                            wl, x_thread, float(sc[r * in_vec_size_g]), float(bs[r * in_vec_size_g]), sum);
+                    }
+                    ws += block_size * bytes_per_pack / pack_factor;
+                    sc += block_size / IGS;
+                    bs += block_size / IGS;
+                    xp += block_size;
+                }
+                for (int r = 0; r < STREAMS; r++) {
+                    result[r] = simd_sum(result[r]);
+                    if (lane == 0) inj[r] = gate[as_type<ushort>(static_cast<T>(result[r]))];
+                }
+                return;
+            }
 
             constexpr int results = 4;
             constexpr int pack_factor = get_pack_factor<BITS, 32>();
@@ -1564,6 +1715,10 @@ def _qwen4_decode_kernels():
         up_mix = mx.fast.metal_kernel(
             name = "unsloth_qwen4_decode_up_mix", input_names = ["act", "normed", "wu", "su", "bu", "sigmoid", "inv_n"],
             output_names = ["out"], header = quantized, compile_options = _QWEN4_SAFE_MATH, source = pragma + """
+            const uint token = threadgroup_position_in_grid.y;
+            act += token * K;
+            normed += token * STREAMS * G;
+            out += token * G;
             const uint lane = thread_index_in_simdgroup;
             const uint h = simdgroup_index_in_threadgroup;
             const uint i0 = threadgroup_position_in_grid.x * 4;
@@ -1646,10 +1801,410 @@ class _Qwen4DecodePlan(NamedTuple):
     width: int
     key: tuple
     launch: Callable
+    fold: bool
+    streams: int
+    bounded: Callable | None = None
 
 
-def _qwen4_decode_plan(language, module):
-    """The fused one-row read of `module`, settled when the scope opens; None keeps the native read."""
+def _qwen4_inject_qmv(linear, streams, width, dtype):
+    """Whether MLX runs `linear` on one row as the qmv_fast body (partial rows) the read's inject tile repeats."""
+    call = type(linear).__call__
+    if call is not nn.QuantizedLinear.__call__ and call not in _ONE_ROW_STOCK_CALLS:
+        return False
+    # 0.32.4 takes qmv_fast for K in whole fast blocks whatever N is; 0.32.3 only for whole 8-row tiles.
+    return (linear.mode == "affine" and linear.bits in (4, 8) and "bias" not in linear
+            and linear.scales.dtype == dtype and linear.biases.dtype == dtype
+            and linear.weight.shape == (streams, width * linear.bits // 32) and streams < 8
+            and linear.group_size in (32, 64, 128) and width % (32 // linear.bits * 64) == 0
+            and mx.__version__ == "0.32.4")
+
+
+@functools.cache
+def _qwen4_ordered_down_kernel():
+    if mx.__version__ != "0.32.4" or not mx.metal.is_available():
+        return None
+    try:
+        seen = set()
+        _inline("mlx/backend/metal/kernels/utils.h", seen)
+        quantized = _inline("mlx/backend/metal/kernels/quantized.h", seen, "get_pack_factor", "dequantize")
+        # Keep each lane's qdot terms, then add them in the native block order: summing K-slice partial sums
+        # instead would change rounding. The norm and up projection retain their existing arithmetic.
+        return mx.fast.metal_kernel(
+            name = "unsloth_qwen4_ordered_decode_down",
+            input_names = ["x", "wd", "sd", "bd", "activate", "wi", "si", "bi", "gate"],
+            output_names = ["act", "inj"], compile_options = _QWEN4_SAFE_MATH,
+            header = quantized + "\n#pragma clang fp contract(off) reassociate(off)\n" + """
+            template <typename T, int BITS, int GS, int K, int N>
+            METAL_FUNC void ordered_hc_qmv(
+                const device T* x, const device uint* w, const device T* s, const device T* b,
+                const device T* table, device T* out, int row0, uint lane, uint sg, uint nsg,
+                threadgroup float* parts) {
+                constexpr int PF = get_pack_factor<BITS, 32>();
+                constexpr int BP = get_bytes_per_pack<BITS, 32>();
+                constexpr int VPT = PF * 2;
+                constexpr int BLOCK = VPT * 32;
+                constexpr int BLOCKS = K / BLOCK;
+                constexpr int KW = K * BP / PF;
+                constexpr int KG = K / GS;
+                constexpr int STEP = GS / VPT;
+                for (uint block = sg; block < BLOCKS; block += nsg) {
+                    thread float xt[VPT];
+                    const float sum = load_vector<T, float, VPT, BITS>(x + block * BLOCK + lane * VPT, xt);
+                    for (int r = 0; r < 4; ++r) {
+                        if (row0 + r < N) {
+                            const device uint8_t* wp = (const device uint8_t*)w + (row0 + r) * KW
+                                + block * BLOCK * BP / PF + lane * 2 * BP;
+                            const int qi = (row0 + r) * KG + block * BLOCK / GS + lane / STEP;
+                            parts[(block * 4 + r) * 32 + lane] = qdot<float, VPT, BITS>(
+                                wp, xt, float(s[qi]), float(b[qi]), sum);
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg == 0) {
+                    for (int r = 0; r < 4; ++r) {
+                        if (row0 + r < N) {
+                            float result = 0.0f;
+                            for (int block = 0; block < BLOCKS; ++block) result += parts[(block * 4 + r) * 32 + lane];
+                            result = simd_sum(result);
+                            if (lane == 0) out[row0 + r] = table[as_type<ushort>(static_cast<T>(result))];
+                        }
+                    }
+                }
+            }
+            """,
+            source = """
+            #pragma clang fp contract(off) reassociate(off)
+            const uint token = threadgroup_position_in_grid.y;
+            const uint tile = threadgroup_position_in_grid.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            constexpr int K = STREAMS * G;
+            constexpr int DB = K / ((32 / BITS) * 64);
+            constexpr int IB = K / ((32 / IBITS) * 64);
+            constexpr int MB = DB > IB ? DB : IB;
+            threadgroup float parts[MB * 4 * 32];
+            x += token * K;
+            if (tile < LR / 4) {
+                ordered_hc_qmv<T, BITS, GS, K, LR>(x, wd, sd, bd, activate, act + token * LR,
+                    tile * 4, lane, sg, NSG, parts);
+            } else if (INJECT) {
+                ordered_hc_qmv<T, IBITS, IGS, K, STREAMS>(x, (const device uint*)wi, si, bi, gate, inj + token * STREAMS,
+                    (tile - LR / 4) * 4, lane, sg, NSG, parts);
+            }
+            """)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+_QWEN4_STREAM_VERDICTS = {}
+
+
+@functools.cache
+def _qwen4_stream_header():
+    seen = set()
+    _inline("mlx/backend/metal/kernels/utils.h", seen)
+    quantized = _inline("mlx/backend/metal/kernels/quantized.h", seen, "get_pack_factor", "dequantize")
+    signature = "template <typename T, typename U, int values_per_thread, int bits>\ninline U "
+    start = quantized.index(signature + "load_vector(")
+    stop = quantized.index(signature + "load_vector_safe(")
+    load = quantized[start:stop].replace("load_vector(const device T* x", "load_vector_tg(const threadgroup T* x")
+    end = quantized.index("\n}", stop) + 2
+    safe = quantized[stop:end].replace("load_vector_safe(const device T* x", "load_vector_safe_tg(const threadgroup T* x")
+    header = quantized + load + safe
+    return header
+
+
+def _qwen4_stream_down_source(reuse = 1):
+    source = """
+    const uint row = threadgroup_position_in_grid.z;
+    const uint stream = threadgroup_position_in_grid.y % STREAMS;
+    const uint tile = threadgroup_position_in_grid.y / STREAMS;
+    const uint t = thread_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    constexpr int K = STREAMS * G, PR = LR + STREAMS;
+    threadgroup T xs[G];
+    threadgroup float part[32];
+    x += row * K + stream * G;
+    w += stream * G;
+    for (uint i = t; i < 32; i += 256) part[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint c = sg; c < G / 128; c += 8) {
+        float s = 0.0f;
+        for (uint i = 0; i < 4; ++i) {
+            const uint k = (c * 32 + lane) * 4 + i;
+            const T h = FOLD ? T(x[k] + T(branch[row * G + k] * weights[row * STREAMS + stream])) : x[k];
+            const float v = float(h);
+            s = v * v + s;
+        }
+        s = simd_sum(s);
+        if (lane == 0) part[c] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = simd_sum(part[lane]);
+    const float inv = metal::precise::rsqrt(total * inv_n + eps);
+    for (uint k = t; k < G; k += 256) {
+        const T h = FOLD ? T(x[k] + T(branch[row * G + k] * weights[row * STREAMS + stream])) : x[k];
+        xs[k] = T((float(h) * inv) * (1.0f + float(w[k])));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tile < LR / 8) {
+        constexpr int PF = get_pack_factor<BITS, 32>();
+        constexpr int BP = get_bytes_per_pack<BITS, 32>();
+        constexpr int VPT = PF * 2, BLOCK = VPT * 32;
+        const int n = tile * 8 + sg;
+        float result = 0.0f;
+        thread float xt[VPT];
+        for (int base = 0; base < G; base += BLOCK) {
+            const float sum = load_vector_tg<T, float, VPT, BITS>(xs + base + lane * VPT, xt);
+            const int e = stream * G + base;
+            const device uint8_t* wp = (const device uint8_t*)wd + n * K * BP / PF + (e + lane * VPT) * BP / PF;
+            const int qi = n * (K / GS) + e / GS + lane / (GS / VPT);
+            result += qdot<float, VPT, BITS>(wp, xt, float(sd[qi]), float(bd[qi]), sum);
+        }
+        result = simd_sum(result);
+        if (lane == 0) parts[(row * STREAMS + stream) * PR + n] = result;
+    } else if (INJECT && sg < STREAMS) {
+        constexpr int PF = get_pack_factor<IBITS, 32>();
+        constexpr int BP = get_bytes_per_pack<IBITS, 32>();
+        constexpr int VPT = PF * 2, BLOCK = VPT * 32;
+        float result = 0.0f;
+        thread float xt[VPT];
+        for (int base = 0; base < G; base += BLOCK) {
+            const float sum = load_vector_tg<T, float, VPT, IBITS>(xs + base + lane * VPT, xt);
+            const int e = stream * G + base;
+            const device uint8_t* wp = (const device uint8_t*)wi + sg * K * BP / PF + (e + lane * VPT) * BP / PF;
+            const int qi = sg * (K / IGS) + e / IGS + lane / (IGS / VPT);
+            result += qdot<float, VPT, IBITS>(wp, xt, float(si[qi]), float(bi[qi]), sum);
+        }
+        result = simd_sum(result);
+        if (lane == 0) parts[(row * STREAMS + stream) * PR + LR + sg] = result;
+    }
+    const uint k = tile * 256 + t;
+    if (k < G) {
+        normed[row * K + stream * G + k] = xs[k];
+        if (FOLD) hidden[row * K + stream * G + k] = T(x[k] + T(branch[row * G + k] * weights[row * STREAMS + stream]));
+    }
+"""
+    if reuse == 1:
+        return source
+    source = source.replace("i += 256", "i += THREADS").replace("c += 8", "c += NSG").replace("k += 256", "k += THREADS")
+    source = source.replace("const int n = tile * 8 + sg;", "const int n = tile * (NSG * ROWS) + sg * ROWS;")
+    source = source.replace("tile < LR / 8", "tile < LR / (NSG * ROWS)")
+    start = source.index("        float result = 0.0f;")
+    end = source.index("    } else if (INJECT", start)
+    projection = source[start:end].replace("float result = 0.0f;", "float result[ROWS] = {0};")
+    begin = projection.index("            const device uint8_t* wp =")
+    stop = projection.index("        }\n        result = simd_sum", begin)
+    rows = projection[begin:stop].replace("n * K", "(n + r) * K").replace("n * (K / GS)", "(n + r) * (K / GS)")
+    rows = rows.replace("result +=", "result[r] +=")
+    projection = projection[:begin] + "            for (int r = 0; r < ROWS; ++r) {\n" + rows + "            }\n" + projection[stop:]
+    projection = projection.replace("        result = simd_sum(result);\n        if (lane == 0) parts[(row * STREAMS + stream) * PR + n] = result;",
+                                    "        for (int r = 0; r < ROWS; ++r) {\n            result[r] = simd_sum(result[r]);\n"
+                                    "            if (lane == 0) parts[(row * STREAMS + stream) * PR + n + r] = result[r];\n        }")
+    source = source[:start] + projection + source[end:]
+    return source.replace("    const uint k = tile * 256 + t;\n    if (k < G) {",
+                          "    for (uint k = tile * THREADS + t; k < G; k += (LR / (NSG * ROWS) + INJECT) * THREADS) {")
+
+
+@functools.cache
+def _qwen4_stream_kernels():
+    if (mx.__version__ != "0.32.4" or not mx.metal.is_available()
+            or mx.device_info().get("architecture") != "applegpu_g15s"):
+        return None
+    try:
+        header = _qwen4_stream_header()
+        pragma = "#pragma clang fp contract(off) reassociate(off)\n"
+        down = mx.fast.metal_kernel(
+            name = "unsloth_qwen4_stream_norm_down",
+            input_names = ["x", "branch", "weights", "w", "inv_n", "eps", "wd", "sd", "bd", "wi", "si", "bi"],
+            output_names = ["normed", "parts", "hidden"], header = header, compile_options = _QWEN4_SAFE_MATH,
+            source = pragma + _qwen4_stream_down_source())
+        up = mx.fast.metal_kernel(
+            name = "unsloth_qwen4_stream_up_mix",
+            input_names = ["parts", "normed", "wu", "su", "bu", "sigmoid", "inv_n", "activate", "gate"],
+            output_names = ["out", "inj"], header = header, compile_options = _QWEN4_SAFE_MATH,
+            source = pragma + """
+            const uint token = threadgroup_position_in_grid.y;
+
+            threadgroup T act[K];
+            constexpr int PR = K + STREAMS;
+            parts += token * STREAMS * PR;
+            const uint t = thread_index_in_threadgroup;
+            for (uint i = t; i < K; i += 32 * STREAMS) {
+                float sum = 0.0f;
+                for (int s = 0; s < STREAMS; ++s) sum += parts[s * PR + i];
+                act[i] = activate[as_type<ushort>(T(sum))];
+            }
+            if (INJECT && threadgroup_position_in_grid.x == 0 && t < STREAMS) {
+                float sum = 0.0f;
+                for (int s = 0; s < STREAMS; ++s) sum += parts[s * PR + K + t];
+                inj[token * STREAMS + t] = gate[as_type<ushort>(T(sum))];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            normed += token * STREAMS * G;
+            out += token * G;
+            const uint lane = thread_index_in_simdgroup;
+            const uint h = simdgroup_index_in_threadgroup;
+            const uint i0 = threadgroup_position_in_grid.x * 4;
+            threadgroup T up[STREAMS][4];
+            constexpr int results = 4;
+            constexpr int pack_factor = get_pack_factor<BITS, 32>();
+            constexpr int bytes_per_pack = get_bytes_per_pack<BITS, 32>();
+            constexpr int values_per_thread = pack_factor;
+            constexpr int block_size = values_per_thread * 32;
+            constexpr int scale_step_per_thread = GS / values_per_thread;
+            constexpr int in_vec_size_w = K * bytes_per_pack / pack_factor;
+            constexpr int in_vec_size_g = K / GS;
+            thread float x_thread[values_per_thread];
+            thread float result[results] = {0};
+            const int out_row = h * G + i0;
+            const device uint8_t* ws = (const device uint8_t*)wu + out_row * in_vec_size_w + lane * bytes_per_pack;
+            const device T* sc = su + out_row * in_vec_size_g + lane / scale_step_per_thread;
+            const device T* bi = bu + out_row * in_vec_size_g + lane / scale_step_per_thread;
+            const threadgroup T* xp = act + lane * values_per_thread;
+            int k = 0;
+            for (; k < K - block_size; k += block_size) {
+                float sum = load_vector_tg<T, float, values_per_thread, BITS>(xp, x_thread);
+                for (int r = 0; r < results; r++) {
+                    auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+                    result[r] += qdot<float, values_per_thread, BITS>(
+                        wl, x_thread, float(sc[r * in_vec_size_g]), float(bi[r * in_vec_size_g]), sum);
+                }
+                ws += block_size * bytes_per_pack / pack_factor;
+                sc += block_size / GS;
+                bi += block_size / GS;
+                xp += block_size;
+            }
+            const int remaining = clamp(static_cast<int>(K - k - lane * values_per_thread), 0, values_per_thread);
+            if (remaining > 0) {
+                float sum = load_vector_safe_tg<T, float, values_per_thread, BITS>(xp, x_thread, remaining);
+                for (int r = 0; r < results; r++) {
+                    auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+                    result[r] += qdot_safe<float, values_per_thread, BITS>(
+                        wl, x_thread, float(sc[r * in_vec_size_g]), float(bi[r * in_vec_size_g]), sum, remaining);
+                }
+            }
+            for (int r = 0; r < results; r++) {
+                result[r] = simd_sum(result[r]);
+                if (lane == 0) up[h][r] = static_cast<T>(result[r]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (h == 0 && lane < 4) {
+                T total = T(0);
+                for (uint s = 0; s < STREAMS; ++s) {
+                    const T gate = sigmoid[as_type<ushort>(up[s][lane])];
+                    const T product = gate * normed[s * G + i0 + lane];
+                    const T partial = product + T(0);
+                    total = s == 0 ? partial : T(partial + total);
+                }
+                out[i0 + lane] = total * inv_n;
+            }
+            """)
+        return down, up
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        _unless_failed_buffer(error)
+        return None
+
+
+def _qwen4_stream_matches(module, normed, parts):
+    projections = [module.input_mix_weight_down]
+    if "block_inject_weight" in module:
+        projections.append(module.block_inject_weight)
+    summed = mx.zeros_like(parts[:, 0])
+    for stream in range(module.hc_count):
+        summed = summed + parts[:, stream]
+    offset = 0
+    for projection in projections:
+        width = projection.weight.shape[0]
+        got = summed[:, offset:offset + width].astype(normed.dtype)
+        if not _nax_qmm_matches_native(normed.reshape(-1, normed.shape[-1]), projection.weight,
+                                       projection.scales, projection.biases, projection.group_size,
+                                       projection.bits, got):
+            return False
+        offset += width
+    return True
+
+
+def _qwen4_stream_plan(module, tables, inject):
+    norm, d, u = module.hc_norm, module.input_mix_weight_down, module.input_mix_weight_up
+    g, streams, lr, dtype = module.hidden_size, module.hc_count, d.weight.shape[0], d.scales.dtype
+    if (streams != 4 or g % 512 or lr % 8 or g // 256 > lr // 8 + inject
+            or inject != ("block_inject_weight" in module) or _qwen4_stream_kernels() is None):
+        return None
+    kernels = _qwen4_stream_kernels()
+    ip = module.block_inject_weight if inject else None
+    key = (dtype, g, streams, lr, d.bits, d.group_size, u.bits, u.group_size,
+           (ip.bits, ip.group_size) if inject else None, norm.weight.dtype, norm.eps)
+    template = [("T", dtype), ("G", g), ("STREAMS", streams), ("LR", lr), ("BITS", d.bits),
+                ("GS", d.group_size), ("INJECT", inject), ("IBITS", ip.bits if inject else 4),
+                ("IGS", ip.group_size if inject else 32)]
+    activate, gate, unused = tables
+    inv_n, epsilon = _qwen4_scalar(1.0 / g, mx.float32), _qwen4_scalar(norm.eps, mx.float32)
+    sigmoid, inv_streams = _qwen4_table(mx.sigmoid, dtype), _qwen4_scalar(1.0 / streams, dtype)
+    up_template = [("T", dtype), ("G", g), ("STREAMS", streams), ("K", lr), ("GS", u.group_size),
+                   ("BITS", u.bits), ("INJECT", inject)]
+
+    def launch(module, x, folded):
+        rows = x.size // x.shape[-1]
+        if not 0 < rows < _QWEN4_PREFILL_MIN_ROWS or _QWEN4_STREAM_VERDICTS.get(key) is False:
+            return None
+        n, d, u = module.hc_norm, module.input_mix_weight_down, module.input_mix_weight_up
+        branch, weights, h = folded or (unused, unused, x)
+        p = module.block_inject_weight if inject else None
+        normed, parts, hidden = kernels[0](
+            inputs = [h, branch, weights, n.weight, inv_n, epsilon, d.weight, d.scales, d.biases,
+                      *((p.weight, p.scales, p.biases) if inject else (unused,) * 3)],
+            template = [*template, ("FOLD", folded is not None)], grid = (256, streams * (lr // 8 + inject), rows),
+            threadgroup = (256, 1, 1), output_shapes = [x.shape, (rows, streams, lr + streams),
+                                                       x.shape if folded else (1,)],
+            output_dtypes = [dtype, mx.float32, dtype])
+        if key not in _QWEN4_STREAM_VERDICTS:
+            _staged_ready()
+            try:
+                good = _settled(_qwen4_stream_matches(module, normed, parts))
+            except (RuntimeError, ValueError) as error:
+                _unless_failed_buffer(error)
+                return None
+            _QWEN4_STREAM_VERDICTS[key] = good
+            if not good:
+                return None
+        mixed, injection = kernels[1](
+            inputs = [parts, normed, u.weight, u.scales, u.biases, sigmoid, inv_streams,
+                      activate, gate if inject else unused], template = up_template,
+            grid = (32 * streams * g // 4, rows, 1), threadgroup = (32 * streams, 1, 1),
+            output_shapes = [(*x.shape[:-1], g), (*x.shape[:-1], streams) if inject else (1,)],
+            output_dtypes = [dtype] * 2)
+        return (mixed, hidden if folded else x, injection) if inject else mixed
+
+    return launch
+
+
+def _qwen4_ordered_read(language, module, x, folded, kernel, template, tables, inject):
+    norm, down = module.hc_norm, module.input_mix_weight_down
+    streams, group, lowrank = module.hc_count, module.hidden_size, down.weight.shape[0]
+    rows, dtype = x.size // x.shape[-1], down.scales.dtype
+    activate, gate, unused = tables
+    branch, weights, hidden = folded or (unused, unused, x)
+    if folded is not None:
+        hidden = language.Qwen4ExpBatchInvariantForward._inject(branch, hidden, weights)
+    normed = _qwen4_hc_norm(hidden, norm.weight, group, norm.eps)
+    projection = module.block_inject_weight if inject else None
+    tiles = lowrank // 4 + ((streams + 3) // 4 if inject else 0)
+    act, injection = kernel(
+        inputs = [normed, down.weight, down.scales, down.biases, activate,
+                  *((projection.weight, projection.scales, projection.biases, gate) if inject else (unused,) * 4)],
+        template = template, grid = (32 * 16 * tiles, rows, 1), threadgroup = (32 * 16, 1, 1),
+        output_shapes = [(*x.shape[:-1], lowrank), (*x.shape[:-1], streams) if inject else (1,)],
+        output_dtypes = [dtype] * 2)
+    return normed, act, injection, hidden
+
+
+def _qwen4_decode_plan(language, module, fold = False):
+    """The fused decode/verify read of `module`, settled when the scope opens; None keeps the native read.
+
+    `fold` reads the residual inject that produced the input in the same launch (the MLP read of a layer)."""
     norm, down, up = module.hc_norm, module.input_mix_weight_down, module.input_mix_weight_up
     group, streams = module.hidden_size, module.hc_count
     # Same reduction bounds as prefill; the normalized streams must fit 32 KB of threadgroup memory.
@@ -1668,56 +2223,149 @@ def _qwen4_decode_plan(language, module):
     activate_table, sigmoid_table = _qwen4_table(activate, dtype), _qwen4_table(mx.sigmoid, dtype)
     inv_streams = _qwen4_scalar(1.0 / streams, dtype)
     norm_template = [("T", dtype), ("G", group), ("STREAMS", streams), ("GS", down.group_size),
-                     ("BITS", down.bits), ("NSG", simdgroups)]
+                     ("BITS", down.bits), ("NSG", simdgroups), ("LR", lowrank)]
     mix_template = [("T", dtype), ("G", group), ("STREAMS", streams), ("K", lowrank), ("GS", up.group_size),
                     ("BITS", up.bits)]
+    inject = combine and _qwen4_inject_qmv(module.block_inject_weight, streams, streams * group, dtype)
+    fold = fold and inject
+    gate_table = _qwen4_table(injection_gate, dtype) if inject else None
+    inject_template = ([("IGS", module.block_inject_weight.group_size), ("IBITS", module.block_inject_weight.bits)]
+                       if inject else [("IGS", 32), ("IBITS", 4)])
+    ordered = _qwen4_ordered_down_kernel()
+    ordered_template = ([(k, v) for k, v in (*norm_template, *inject_template) if k != "NSG"]
+                        + [("NSG", 16), ("INJECT", inject)])
+    unused = mx.zeros((8,), dtype)   # MLX binds a smaller input in the constant address space
+    tiles = lowrank // 4 // simdgroups + inject
 
-    def launch(module, x):
+    def launch(module, x, folded = None):
         norm, down, up = module.hc_norm, module.input_mix_weight_down, module.input_mix_weight_up
-        normed, act = norm_down(
-            inputs = [x, norm.weight, *norm_constants, down.weight, down.scales, down.biases, activate_table],
-            template = norm_template, grid = (32 * lowrank // 4, 1, 1), threadgroup = (32 * simdgroups, 1, 1),
-            output_shapes = [x.shape, (*x.shape[:-1], lowrank)], output_dtypes = [dtype, dtype])
+        rows = x.size // x.shape[-1]
+        branch, weights, h = folded or (unused, unused, x)
+        projection = module.block_inject_weight if inject else None
+        if 1 <= rows <= 4 and ordered is not None:
+            normed, act, injection, hidden = _qwen4_ordered_read(
+                language, module, x, folded, ordered, ordered_template, (activate_table, gate_table, unused), inject)
+        else:
+            normed, act, injection, hidden = norm_down(
+                inputs = [h, branch, weights, norm.weight, *norm_constants, down.weight, down.scales, down.biases,
+                          activate_table, *((projection.weight, projection.scales, projection.biases, gate_table)
+                                            if inject else (unused,) * 4)],
+                template = [*norm_template, *inject_template, ("FOLD", folded is not None), ("INJECT", inject)],
+                grid = (32 * simdgroups * tiles, rows, 1), threadgroup = (32 * simdgroups, 1, 1),
+                output_shapes = [x.shape, (*x.shape[:-1], lowrank), (*x.shape[:-1], streams) if inject else (1,),
+                                 x.shape if folded else (1,)],
+                output_dtypes = [dtype] * 4)
         mixed = up_mix(
             inputs = [act, normed, up.weight, up.scales, up.biases, sigmoid_table, inv_streams],
-            template = mix_template, grid = (32 * streams * group // 4, 1, 1), threadgroup = (32 * streams, 1, 1),
+            template = mix_template, grid = (32 * streams * group // 4, rows, 1), threadgroup = (32 * streams, 1, 1),
             output_shapes = [(*x.shape[:-1], group)], output_dtypes = [dtype])[0]
         if not combine:
             return mixed
-        return mixed, x, injection_gate(module.block_inject_weight(normed))
+        if not inject:
+            injection = injection_gate(module.block_inject_weight(normed))
+        return mixed, hidden if folded else x, injection
 
     key = ("decode hyper-connection read", streams, group, lowrank, dtype, norm.weight.dtype, down.bits,
-           down.group_size, up.bits, up.group_size, combine)
-    return _Qwen4DecodePlan(dtype, streams * group, key, launch)
+           down.group_size, up.bits, up.group_size, ordered is not None, combine, inject)
+    bounded = _qwen4_stream_plan(module, (activate_table, gate_table, unused), inject)
+    return _Qwen4DecodePlan(dtype, streams * group, key, launch, fold, streams, bounded)
+
+
+# The last residual inject each thread's decode forward built: (output, branch, hyper input, injection weights).
+_QWEN4_LAST_INJECT = local()
+
+
+def _qwen4_decode_inject(forward, branch, hyper_input, injection_weights):
+    out = type(forward)._inject(branch, hyper_input, injection_weights)
+    _QWEN4_LAST_INJECT.slot = (out, branch, hyper_input, injection_weights)
+    return out
+
+
+def _qwen4_pending_inject(x):
+    slot = getattr(_QWEN4_LAST_INJECT, "slot", None)
+    if slot is None or slot[0] is not x:
+        return None
+    _, branch, hidden, weights = slot
+    if (branch.dtype == weights.dtype == hidden.dtype == x.dtype and hidden.shape == x.shape
+            and branch.shape[:-1] == weights.shape[:-1] == x.shape[:-1]
+            and branch.shape[-1] * weights.shape[-1] == x.shape[-1]):
+        return branch, hidden, weights
+    return None
+
+
+def _qwen4_submit(*arrays):
+    if (len(arrays) == 1 and getattr(offload.STAGED_FILLS, "plain_step", True)
+            and getattr(offload.STAGED_FILLS, "submit_after", 0)):
+        pending = _qwen4_pending_inject(arrays[0])
+        if pending is not None:
+            # The next read folds the tail; submit every producer without materializing the add.
+            return _submit(*pending)
+    return _submit(*arrays)
+
+
+_HELD_MX.async_eval = _qwen4_submit
 
 
 def _qwen4_decode_read(forward, module, x):
     native = type(forward)._hyper_connection
     plan = module.__dict__.get("_unsloth_qwen4_decode_plan")
-    if plan is None or x.ndim != 3 or x.size != x.shape[-1] or x.dtype != plan.dtype or x.shape[-1] != plan.width:
+    # Projections Fast Verify holds keep its arithmetic, which verify rows share.
+    rows = x.size // x.shape[-1] if x.ndim == 3 and x.shape[-1] else 0
+    down = module.input_mix_weight_down
+    if (plan is None or (down.__dict__.get("_unsloth_lane_qmm") and not _lane_low(down, rows))
+            or not 0 < rows < _QWEN4_PREFILL_MIN_ROWS or x.dtype != plan.dtype or x.shape[-1] != plan.width):
         return native(forward, module, x)
-    return _qwen4_verified(plan.key, lambda: plan.launch(module, x), lambda: native(forward, module, x),
+    fold = plan.fold or (getattr(offload.STAGED_FILLS, "plain_step", True)
+                         and getattr(offload.STAGED_FILLS, "submit_after", 0) and "block_inject_weight" in module)
+    pending = _qwen4_pending_inject(x) if fold else None
+    _QWEN4_LAST_INJECT.slot = None
+    folded = ((pending[0], pending[2], pending[1])
+              if fold and pending is not None and pending[2].shape[-1] == plan.streams else None)
+    if plan.bounded is not None:
+        output = plan.bounded(module, x, folded)
+        if output is not None:
+            return output
+    return _qwen4_verified((*plan.key, folded is not None, rows), lambda: plan.launch(module, x, folded),
+                           lambda: _qwen4_row_reads(lambda row: native(forward, module, row), x),
                            "decode hyper-connection read")
+
+
+def _qwen4_row_reads(read, x):
+    # Each row's one-row read: a native multi-row read can take other MLX kernels (qmv_wide, or the guarded
+    # gather_qmv for the inject projection's few outputs) that round differently from a decode step's qmv_fast.
+    if x.size == x.shape[-1]:
+        return read(x)
+    flat = x.reshape(-1, 1, x.shape[-1])
+    outs = [read(flat[i:i + 1]) for i in range(flat.shape[0])]
+    join = lambda parts: mx.concatenate(parts).reshape(*x.shape[:-1], parts[0].shape[-1])
+    if isinstance(outs[0], tuple):   # (mixed, the input itself, injection)
+        return join([out[0] for out in outs]), x, join([out[2] for out in outs])
+    return join(outs)
 
 
 @contextmanager
 def fused_qwen4_decode(model, *, _modules = None):
-    """Run Qwen4-Exp's single-token decode hyper-connection reads as two fused launches.
+    """Run Qwen4-Exp's decode and verify-block hyper-connection reads on checked fused kernels.
 
-    mlx-vlm's batch-invariant decode forward reads each hyper-connection through a norm, two quantized projections
-    and a stream mix; a one-row read of this model's modules takes kernels bit-identical to it, each layout,
-    quantization and dtype compared on its first use. Eligibility is settled when the scope opens: modules,
-    projections and mlx-vlm methods replaced while it is open are not rechecked. Verify blocks, training and a
-    drifted mlx-vlm keep the native read. `UNSLOTH_MLX_QWEN4_DECODE=0` turns the route off.
+    mlx-vlm's batch-invariant forward reads each hyper-connection through a norm, two quantized projections and a
+    stream mix; a read of fewer than 32 rows of this model's modules takes kernels that read each row as a one-row
+    call. Projections may be reordered within the fp32-reordering bound of stock's per-row reference, checked on
+    first use per layout, quantization and dtype; everything else matches bit for bit. Routes requiring exact
+    projections are compared bit for bit with mlx-vlm's one-row reads on first use per row count as well.
+    Eligibility is settled when the scope opens: modules, projections and mlx-vlm methods replaced while it is open
+    are not rechecked. Fast Verify's projections, training and a drifted mlx-vlm keep the native read.
+    `UNSLOTH_MLX_QWEN4_DECODE=0` turns the route off.
     """
     changed, forward = [], None
     try:
         with _QWEN4_DECODE_LOCK:
             language = sys.modules.get("mlx_vlm.models.qwen4_exp.language")
             target = getattr(language, "_QWEN4_BATCH_INVARIANT_FORWARD", None)
-            hook = vars(target).get("_hyper_connection") if target is not None else None
+            hooks = [(vars(target).get(name), fn) for name, fn in (("_hyper_connection", _qwen4_decode_read),
+                                                                     ("_inject", _qwen4_decode_inject))
+                     ] if target is not None else ()
             if (target is not None and os.environ.get("UNSLOTH_MLX_QWEN4_DECODE", "1") != "0"
-                    and (hook is None or getattr(hook, "func", None) is _qwen4_decode_read)
+                    and all(_qwen4_decode_hook(target, hook, fn) for hook, fn in hooks)
                     and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
                     and mx.default_device() == mx.gpu and _qwen4_decode_kernels() is not None):
                 if _QWEN4_DECODE_BINDINGS[0] is None or not _bindings_intact(_QWEN4_DECODE_BINDINGS[0]):
@@ -1730,16 +2378,17 @@ def fused_qwen4_decode(model, *, _modules = None):
                 stock = (_QWEN4_DECODE_BINDINGS[0] is not None and linear is not None
                          and getattr(type(target), "_hyper_connection", None)
                          is language.Qwen4ExpBatchInvariantForward._hyper_connection
+                         and getattr(type(target), "_inject", None) is language.Qwen4ExpBatchInvariantForward._inject
                          and getattr(native_class, "_linear", None) is language.Qwen3_5BatchInvariantForward._linear
                          and (linear is native_class._linear or getattr(linear, "__code__", None) is sliced))
                 seen = set()
-                for _, module in _fusion_modules(model, _modules) if stock else ():
+                for name, module in _fusion_modules(model, _modules) if stock else ():
                     if id(module) in seen or not isinstance(module, language.Qwen4ExpGatedResidual):
                         continue
                     seen.add(id(module))
                     scopes = module.__dict__.get("_unsloth_qwen4_decode_scopes", 0)
                     if not scopes:
-                        plan = _qwen4_decode_plan(language, module)
+                        plan = _qwen4_decode_plan(language, module, name.endswith("mlp_hyper_connection"))
                         if plan is None:
                             continue
                         vars(module)["_unsloth_qwen4_decode_plan"] = plan   # a tuple attribute would become a child
@@ -1748,6 +2397,7 @@ def fused_qwen4_decode(model, *, _modules = None):
                 if changed:
                     if not target.__dict__.get("_unsloth_qwen4_decode_scopes"):
                         target._hyper_connection = functools.partial(_qwen4_decode_read, target)
+                        target._inject = functools.partial(_qwen4_decode_inject, target)
                     target._unsloth_qwen4_decode_scopes = target.__dict__.get("_unsloth_qwen4_decode_scopes", 0) + 1
                     forward = target
         yield model
@@ -1758,9 +2408,247 @@ def fused_qwen4_decode(model, *, _modules = None):
                 if not owner._unsloth_qwen4_decode_scopes:
                     owner.__dict__.pop("_unsloth_qwen4_decode_scopes", None)
                     owner.__dict__.pop("_unsloth_qwen4_decode_plan", None)
-                    hook = owner.__dict__.get("_hyper_connection")
-                    if owner is forward and getattr(hook, "func", None) is _qwen4_decode_read:
-                        del owner.__dict__["_hyper_connection"]
+                    if owner is forward:
+                        _QWEN4_LAST_INJECT.slot = None
+                    for name, fn in (("_hyper_connection", _qwen4_decode_read), ("_inject", _qwen4_decode_inject)):
+                        if owner is forward and getattr(owner.__dict__.get(name), "func", None) is fn:
+                            del owner.__dict__[name]
+
+
+@functools.cache
+def _qwen4_fast_hc_down(reuse):
+    if _qwen4_stream_kernels() is None:
+        return None
+    try:
+        return mx.fast.metal_kernel(
+            name = f"unsloth_qwen4_fast_hc_down_{reuse}",
+            input_names = ["x", "branch", "weights", "w", "inv_n", "eps", "wd", "sd", "bd", "wi", "si", "bi"],
+            output_names = ["normed", "parts", "hidden"], header = _qwen4_stream_header(),
+            compile_options = _QWEN4_SAFE_MATH,
+            source = "#pragma clang fp contract(off) reassociate(off)\n" + _qwen4_stream_down_source(reuse))
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        _unless_failed_buffer(error)
+        return None
+
+
+_QWEN4_FAST_HC_VERDICTS = {}
+
+
+@functools.cache
+def _qwen4_fast_hc_kernel():
+    if _qwen4_stream_kernels() is None:
+        return None
+    try:
+        return mx.fast.metal_kernel(
+            name = "unsloth_qwen4_fast_hc_mix", input_names = ["parts", "normed", "w", "s", "b"],
+            output_names = ["out", "inj"], header = _qwen4_stream_header(), source = """
+    const uint token = threadgroup_position_in_grid.y;
+    const uint tile = threadgroup_position_in_grid.x;
+    const uint worker = thread_position_in_threadgroup.x;
+    constexpr int PACK = 32 / BITS;
+    constexpr int STEP = PACK * 2;
+    constexpr int PIECES = LR / STEP;
+    constexpr int FEATURES = OUT / STREAMS;
+    constexpr int STRIDE = OUT + 1;
+    constexpr int PR = LR + STREAMS;
+    threadgroup T activated[LR];
+    threadgroup float sums[PIECES * STRIDE];
+    threadgroup float gated[OUT];
+    parts += token * STREAMS * PR;
+    normed += token * STREAMS * G;
+    for (uint j = worker; j < LR; j += THREADS) {
+        float value = 0.0f;
+        for (int h = 0; h < STREAMS; ++h) value += parts[h * PR + j];
+        value *= 1.0f / STREAMS;
+        activated[j] = T(value / (1.0f + fast::exp(-value)));
+    }
+    if (INJECT && tile == 0 && worker < STREAMS) {
+        float value = 0.0f;
+        for (int h = 0; h < STREAMS; ++h) value += parts[h * PR + LR + worker];
+        value *= 1.0f / STREAMS;
+        inj[token * STREAMS + worker] = T(2.0f / (1.0f + fast::exp(-value)));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint job = worker; job < OUT * PIECES; job += THREADS) {
+        const int local = job / PIECES;
+        const int piece = job % PIECES;
+        const int feature = tile * FEATURES + local / STREAMS;
+        const int stream = local % STREAMS;
+        const int row = stream * G + feature;
+        const int k = piece * STEP;
+        float values[STEP];
+        const float total = load_vector_tg<T, float, STEP, BITS>(activated + k, values);
+        const device uint8_t* codes = (const device uint8_t*)w + row * LR * BITS / 8 + k * BITS / 8;
+        const int group = row * (LR / GS) + k / GS;
+        sums[piece * STRIDE + local] = qdot<float, STEP, BITS>(codes, values, float(s[group]), float(b[group]), total);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (worker < OUT) {
+        float value = 0.0f;
+        for (int piece = 0; piece < PIECES; ++piece) value += sums[piece * STRIDE + worker];
+        const int feature = tile * FEATURES + worker / STREAMS;
+        const int stream = worker % STREAMS;
+        gated[worker] = float(normed[stream * G + feature]) / (1.0f + fast::exp(-value));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (worker < FEATURES) {
+        const float left = gated[worker * STREAMS] + gated[worker * STREAMS + 1];
+        const float right = gated[worker * STREAMS + 2] + gated[worker * STREAMS + 3];
+        out[token * G + tile * FEATURES + worker] = T((left + right) * (1.0f / STREAMS));
+    }
+""")
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as error:
+        _unless_failed_buffer(error)
+        return None
+
+
+def _qwen4_fast_hc_plan(module):
+    exact = vars(module).get("_unsloth_qwen4_decode_plan")
+    down, up = module.input_mix_weight_down, module.input_mix_weight_up
+    inject = "block_inject_weight" in module
+    projection = module.block_inject_weight if inject else None
+    if (exact is None or exact.bounded is None or module.training or exact.dtype != mx.bfloat16
+            or (module.hidden_size, module.hc_count, down.weight.shape[0]) != (2560, 4, 320)
+            or (down.bits, down.group_size, up.bits, up.group_size) != (4, 32, 4, 32)
+            or inject and not _qwen4_inject_qmv(projection, 4, 10240, mx.bfloat16)
+            or _qwen4_fast_hc_kernel() is None):
+        return None
+    unused = mx.zeros((8,), mx.bfloat16)
+    constants = [_qwen4_scalar(1.0 / 2560, mx.float32), _qwen4_scalar(module.hc_norm.eps, mx.float32)]
+    template = [("T", mx.bfloat16), ("G", 2560), ("STREAMS", 4), ("LR", 320), ("BITS", 4),
+                ("GS", 32), ("INJECT", inject)]
+    key = (inject, projection.bits if inject else 4, projection.group_size if inject else 32)
+
+    kernels = _qwen4_stream_kernels()
+    mix = _qwen4_fast_hc_kernel()
+    norm_down = {1: kernels[0], 2: _qwen4_fast_hc_down(2), 4: _qwen4_fast_hc_down(4)}
+    if any(kernel is None for kernel in norm_down.values()):
+        return None
+    down_template = [*template, ("IBITS", key[1]), ("IGS", key[2])]
+    up_template = [*template, ("OUT", 64), ("THREADS", 320)]
+
+    def launch(x, folded):
+        rows = x.size // x.shape[-1]
+        verdict_key = (*key, rows, folded is not None)
+        if _QWEN4_FAST_HC_VERDICTS.get(verdict_key) is False:
+            return None
+        n, d, u = module.hc_norm, module.input_mix_weight_down, module.input_mix_weight_up
+        branch, weights, hidden = folded or (unused, unused, x)
+        reuse = 1 if rows < 3 else 2 if rows <= 4 else 4
+        row_template = [] if reuse == 1 else [("NSG", 8), ("THREADS", 256), ("ROWS", reuse)]
+        normed, parts, h = norm_down[reuse](
+            inputs = [hidden, branch, weights, n.weight, *constants, d.weight, d.scales, d.biases,
+                      *((projection.weight, projection.scales, projection.biases) if inject else (unused,) * 3)],
+            template = [*down_template, *row_template, ("FOLD", folded is not None)],
+            grid = (256, 4 * (320 // (8 * reuse) + inject), rows), threadgroup = (256, 1, 1),
+            output_shapes = [x.shape, (rows, 4, 324), x.shape if folded else (1,)],
+            output_dtypes = [x.dtype, mx.float32, x.dtype])
+        mixed, injection = mix(
+            inputs = [parts, normed, u.weight, u.scales, u.biases],
+            template = up_template, grid = (320 * 160, rows, 1),
+            threadgroup = (320, 1, 1), output_shapes = [(*x.shape[:-1], 2560),
+                                                       (*x.shape[:-1], 4) if inject else (1,)],
+            output_dtypes = [x.dtype] * 2)
+        output = (mixed, h if folded else x, injection) if inject else mixed
+        if verdict_key not in _QWEN4_FAST_HC_VERDICTS:
+            _staged_ready()
+            try:
+                leaves = output if inject else (output,)
+                good = _settled(all(bool(mx.all(mx.isfinite(value)).item()) for value in leaves))
+            except (RuntimeError, ValueError) as error:
+                _unless_failed_buffer(error)
+                return None
+            _QWEN4_FAST_HC_VERDICTS[verdict_key] = good
+            if not good:
+                return None
+        return output
+
+    return launch
+
+
+def _qwen4_fast_hc_read(forward, module, x):
+    fallback = forward._unsloth_qwen4_fast_hc_native
+    plan = vars(module).get("_unsloth_qwen4_fast_hc_plan")
+    rows = x.size // x.shape[-1] if x.ndim == 3 and x.shape[-1] == 10240 else 0
+    if (plan is None or not getattr(_VERIFY_STATE, "lane", False) or module.training
+            or not module.input_mix_weight_down.__dict__.get("_unsloth_lane_verify_scopes")
+            or not 0 < rows <= 9 or x.dtype != mx.bfloat16):
+        return fallback(module, x)
+    exact = module._unsloth_qwen4_decode_plan
+    pending = _qwen4_pending_inject(x) if exact.fold else None
+    folded = ((pending[0], pending[2], pending[1])
+              if pending is not None and pending[2].shape[-1] == exact.streams else None)
+    try:
+        output = plan(x, folded)
+    except (RuntimeError, ValueError) as error:
+        _unless_failed_buffer(error)
+        return fallback(module, x)
+    if output is None:
+        return fallback(module, x)
+    _QWEN4_LAST_INJECT.slot = None
+    return output
+
+
+@contextmanager
+def fast_qwen4_hc(model, *, _modules = None):
+    """Fast Verify's Qwen4-Exp read: short FP32 chunks and one rounded stream mix.
+
+    Only the speculative lane scope owns these plans. Eligibility is settled on entry, as in fused_qwen4_decode;
+    the target's per-call lane marker keeps concurrent plain and exact calls on their original route.
+    """
+    changed, forward = [], None
+    try:
+        with _QWEN4_DECODE_LOCK:
+            language = sys.modules.get("mlx_vlm.models.qwen4_exp.language")
+            target = getattr(language, "_QWEN4_BATCH_INVARIANT_FORWARD", None)
+            hook = vars(target).get("_hyper_connection") if target is not None else None
+            if (target is not None and _fast_verify_held(model)
+                    and getattr(hook, "func", None) in (_qwen4_decode_read, _qwen4_fast_hc_read)
+                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                    and mx.default_device() == mx.gpu):
+                seen = set()
+                for _, module in _fusion_modules(model, _modules):
+                    if (not isinstance(module, language.Qwen4ExpGatedResidual) or id(module) in seen
+                            or not module.input_mix_weight_down.__dict__.get("_unsloth_lane_verify_scopes")):
+                        continue
+                    scopes = vars(module).get("_unsloth_qwen4_fast_hc_scopes", 0)
+                    if not scopes:
+                        plan = _qwen4_fast_hc_plan(module)
+                        if plan is None:
+                            continue
+                        vars(module)["_unsloth_qwen4_fast_hc_plan"] = plan
+                    module._unsloth_qwen4_fast_hc_scopes = scopes + 1
+                    changed.append(module)
+                    seen.add(id(module))
+                if changed:
+                    depth = vars(target).get("_unsloth_qwen4_fast_hc_scopes", 0)
+                    if not depth:
+                        target._unsloth_qwen4_fast_hc_native = target._hyper_connection
+                        target._hyper_connection = functools.partial(_qwen4_fast_hc_read, target)
+                    target._unsloth_qwen4_fast_hc_scopes = depth + 1
+                    forward = target
+        yield model
+    finally:
+        with _QWEN4_DECODE_LOCK:
+            for owner in changed + ([forward] if forward is not None else []):
+                owner._unsloth_qwen4_fast_hc_scopes -= 1
+                if not owner._unsloth_qwen4_fast_hc_scopes:
+                    owner.__dict__.pop("_unsloth_qwen4_fast_hc_scopes", None)
+                    owner.__dict__.pop("_unsloth_qwen4_fast_hc_plan", None)
+                    if owner is forward:
+                        held = owner.__dict__.pop("_unsloth_qwen4_fast_hc_native")
+                        if getattr(vars(owner).get("_hyper_connection"), "func", None) is _qwen4_fast_hc_read:
+                            owner._hyper_connection = held
+
+
+def _qwen4_decode_hook(target, hook, native):
+    if hook is None or getattr(hook, "func", None) is native:
+        return True
+    if native is not _qwen4_decode_read:
+        return False
+    return (getattr(hook, "func", None) is _qwen4_fast_hc_read
+            and vars(target).get("_unsloth_qwen4_fast_hc_scopes", 0) > 0
+            and getattr(vars(target).get("_unsloth_qwen4_fast_hc_native"), "func", None) is native)
 
 
 def _single_row(x):
@@ -2245,6 +3133,7 @@ _ADD_NORM_VERDICTS = {}
 
 
 def _add_norm_verified(dtype, axis):
+    _staged_ready()
     verdict = _ADD_NORM_VERDICTS.get((dtype, axis))
     if verdict is None:
         keys = mx.random.split(mx.random.key(axis), 3)
@@ -2668,6 +3557,7 @@ _MOE_ROUTER_NO_SCALE = mx.zeros((1,), dtype = mx.float32)
 
 @functools.cache
 def _moe_router_verified(dtype, scale_dtype, experts, top_k, mode, normalize):
+    _staged_ready()
     if mode == _QWEN_ROUTING:
         scale = _MOE_ROUTER_NO_SCALE
     else:
@@ -2702,6 +3592,7 @@ def _fused_moe_router(logits, scale, top_k, mode, normalize, run = True):
 
 @functools.cache
 def _moe_router_shared_verified(dtype, experts, top_k, normalize):
+    _staged_ready()
     for rows in (1, 9):
         logits = (mx.random.normal((rows, experts), key = mx.random.key(rows)) * 3).astype(dtype)
         gate = (mx.random.normal((rows, 1), key = mx.random.key(rows + 1)) * 8).astype(dtype)
@@ -2767,6 +3658,8 @@ _DOWN_ROWS = 4
 _INPUTS = {
     "gate_up": ("wg", "sg", "bg", "wu", "su", "bu", "x", "inds", "k", "n", "top_k"),
     "down": ("w", "ws", "wb", "x", "inds", "scores", "shared", "s", "k", "n", "top_k"),
+    "gate_up_fold": ("wg", "sg", "bg", "wu", "su", "bu", "cg", "csg", "cbg", "cu", "csu", "cbu", "x", "inds", "k", "n", "top_k", "routes"),
+    "down_fold": ("w", "ws", "wb", "cw", "cs", "cb", "x", "inds", "scores", "shared", "k", "n", "top_k", "routes"),
 }
 
 _QDOT = r"""
@@ -2843,13 +3736,17 @@ struct Terms<U, values_per_thread, 3> {
 template <typename U, int values_per_thread>
 struct Terms<U, values_per_thread, 4> {
   U t[values_per_thread];
+  // Codes as subnormal halves, q * 2^-24: no integer conversion, about 10% of a route's time on M5. With x left
+  // unscaled every product is stock's times 2^-24 exactly, so sums round alike unless a product underflows fp32.
   void load(const device uint8_t* w) {
-    const device uint16_t* ws = (const device uint16_t*)w;
-    UNROLL for (int i = 0; i < values_per_thread / 4; i++) {
-      t[4 * i] = ws[i] & 0x000f;
-      t[4 * i + 1] = ws[i] & 0x00f0;
-      t[4 * i + 2] = ws[i] & 0x0f00;
-      t[4 * i + 3] = ws[i] & 0xf000;
+    const device uint* ws = (const device uint*)w;
+    UNROLL for (int i = 0; i < values_per_thread / 8; i++) {
+      const uint v = ws[i];
+      UNROLL for (int m = 0; m < 4; m++) {
+        const half2 c = as_type<half2>((v >> (4 * m)) & 0x000F000Fu);
+        t[8 * i + m] = c.x;
+        t[8 * i + 4 + m] = c.y;
+      }
     }
   }
   U dot(const thread U* x) {
@@ -2943,6 +3840,27 @@ struct Terms<U, values_per_thread, 8> {
     return accum;
   }
 };
+
+// x as `Terms<bits>` reads it; a dot of its 4-bit codes wants `code_unit` on its scale.
+template <typename T, typename U, int values_per_thread, int bits>
+inline U load_terms_x(const device T* x, thread U* x_thread) {
+  if constexpr (bits != 4) {
+    return load_vector<T, U, values_per_thread, bits>(x, x_thread);
+  } else {
+    U sum = 0;
+    UNROLL for (int i = 0; i < values_per_thread; i += 4) {
+      sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
+      x_thread[i] = x[i];
+      x_thread[i + 1] = x[i + 1];
+      x_thread[i + 2] = x[i + 2];
+      x_thread[i + 3] = x[i + 3];
+    }
+    return sum;
+  }
+}
+
+template <int bits>
+constexpr float code_unit() { return bits == 4 ? 16777216.0f : 1.0f; }
 #else
 template <typename T, int bits, int fast>
 struct Lane {
@@ -3050,7 +3968,7 @@ struct Dots {
     UNROLL for (int o = 0; o < out; o++) {
       terms.load(p.w + o * K_w);
 #ifdef UNSLOTH_AFFINE
-      U s = p.s[o * K_g];
+      U s = p.s[o * K_g] * code_unit<bits>();
       U b = p.b[o * K_g];
       result[o] += s * terms.dot(xt) + sum * b;
 #else
@@ -3070,7 +3988,7 @@ struct Dots {
       // qmv's last block: lanes past K add nothing.
       if (fast || k + lane_id * values_per_thread < K) {
 #ifdef UNSLOTH_AFFINE
-        sum = load_vector<T, U, values_per_thread, bits>(x, xt);
+        sum = load_terms_x<T, U, values_per_thread, bits>(x, xt);
 #else
         load_vector<T, U, values_per_thread>(x, xt);
 #endif
@@ -3091,7 +4009,7 @@ struct Dots {
   }
 };
 
-template <typename T, int group_size, int bits, int out, int fast, typename Inds>
+template <typename T, int group_size, int bits, int out, int fast>
 METAL_FUNC void gate_up_rows(
     const device uint8_t* wg,
     const device uint8_t* sg,
@@ -3100,7 +4018,8 @@ METAL_FUNC void gate_up_rows(
     const device uint8_t* su,
     const device uint8_t* bu,
     const device T* x,
-    Inds inds,
+    int64_t e,
+    uint row,
     device T* y,
     ExpertParams p,
     uint3 tid,
@@ -3108,8 +4027,7 @@ METAL_FUNC void gate_up_rows(
   typedef Dots<T, group_size, bits, out, fast> dots;
   const int lane = lid.x;
   const int n0 = tid.x * (2 * out) + lid.y * out;
-  const int64_t e = inds[tid.y];
-  x += size_t(tid.y / p.top_k) * p.K;
+  x += size_t(row) * p.K;
   y += size_t(tid.y) * p.N + n0;
   thread typename dots::U result[2 * out] = {};
   thread typename dots::Proj proj[2] = {
@@ -3128,11 +4046,16 @@ METAL_FUNC void gate_up_rows(
   }
 }
 
-template <typename T, int group_size, int bits, int out, int fast, typename Inds, typename Scores, typename Shared, typename S>
+// With `fold`, a row's top_k routes take one more simdgroup, the shared expert's, whose rows follow the `routes` routes in x.
+template <typename T, int group_size, int bits, int out, int fast, int fold, typename Inds, typename Scores, typename Shared, typename S>
 METAL_FUNC void down_rows(
     const device uint8_t* w,
     const device uint8_t* ws,
     const device uint8_t* wb,
+    const device uint8_t* cw,
+    const device uint8_t* cs,
+    const device uint8_t* cb,
+    size_t routes,
     const device T* x,
     Inds inds,
     Scores scores,
@@ -3148,22 +4071,35 @@ METAL_FUNC void down_rows(
   const int lane = lid.x;
   const int n0 = tid.x * out;
   const size_t route = size_t(tid.y) * p.top_k;
-  for (int slot = lid.y; slot < p.top_k; slot += lsize.y) {
-    const int64_t e = inds[route + slot];
+  for (int slot = lid.y; slot < p.top_k + fold; slot += lsize.y) {
+    const bool common = fold && slot == p.top_k;
+    const T score = common ? T(0) : T(scores[route + slot]);
     thread typename dots::U result[out] = {};
-    thread typename dots::Proj proj = dots::proj(w + e * p.w[0][0], ws + e * p.w[0][1], wb + e * p.w[0][2], p.K, n0, lane);
-    dots::template run<1>(&proj, x + (route + slot) * p.K, p.K, lane, result);
-    const T score = scores[route + slot];
+    thread typename dots::Proj proj;
+    if (common) {
+      proj = dots::proj(cw, cs, cb, p.K, n0, lane);
+      dots::template run<1>(&proj, x + (routes + tid.y) * p.K, p.K, lane, result);
+    } else {
+      const int64_t e = inds[route + slot];
+      proj = dots::proj(w + e * p.w[0][0], ws + e * p.w[0][1], wb + e * p.w[0][2], p.K, n0, lane);
+      dots::template run<1>(&proj, x + (route + slot) * p.K, p.K, lane, result);
+    }
     UNROLL for (int o = 0; o < out; o++) {
       if (lane == o) {
-        products[slot * out + o] = static_cast<T>(result[o]) * score;
+        products[slot * out + o] = common ? static_cast<T>(result[o]) : static_cast<T>(result[o]) * score;
       }
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (lid.y == 0 && lane < out) {
     const size_t i = size_t(tid.y) * p.N + n0 + lane;
-    y[i] = shared_add(slot_sum<T>(products + lane, out, p.top_k), shared[tid.y], s[i]);
+    T common;
+    if constexpr (fold) {
+      common = products[p.top_k * out + lane];
+    } else {
+      common = s[i];
+    }
+    y[i] = shared_add(slot_sum<T>(products + lane, out, p.top_k), shared[tid.y], common);
   }
 }
 """
@@ -3176,13 +4112,35 @@ _BODIES = {
   gate_up_rows<T, group_size, bits, out, fast>(
       (const device uint8_t*)wg, (const device uint8_t*)sg, (const device uint8_t*)bg,
       (const device uint8_t*)wu, (const device uint8_t*)su, (const device uint8_t*)bu,
-      x, inds, y, p, threadgroup_position_in_grid, thread_position_in_threadgroup);
+      x, inds[threadgroup_position_in_grid.y], threadgroup_position_in_grid.y / top_k, y, p,
+      threadgroup_position_in_grid, thread_position_in_threadgroup);
+""",
+    "gate_up_fold": r"""
+  const ExpertParams p{k, n, top_k, {
+      {wg_strides[0] * int64_t(sizeof(*wg)), sg_strides[0] * int64_t(sizeof(*sg)), bg_strides[0] * int64_t(sizeof(*bg))},
+      {wu_strides[0] * int64_t(sizeof(*wu)), su_strides[0] * int64_t(sizeof(*su)), bu_strides[0] * int64_t(sizeof(*bu))}}};
+  const int route = threadgroup_position_in_grid.y;
+  const bool common = route >= routes;
+  gate_up_rows<T, group_size, bits, out, fast>(
+      common ? (const device uint8_t*)cg : (const device uint8_t*)wg, common ? (const device uint8_t*)csg : (const device uint8_t*)sg,
+      common ? (const device uint8_t*)cbg : (const device uint8_t*)bg, common ? (const device uint8_t*)cu : (const device uint8_t*)wu,
+      common ? (const device uint8_t*)csu : (const device uint8_t*)su, common ? (const device uint8_t*)cbu : (const device uint8_t*)bu,
+      x, common ? 0 : int64_t(inds[route]), common ? route - routes : route / top_k, y, p,
+      threadgroup_position_in_grid, thread_position_in_threadgroup);
 """,
     "down": r"""
   threadgroup T products[31 * out];
   const ExpertParams p{k, n, top_k, {{w_strides[0] * int64_t(sizeof(*w)), ws_strides[0] * int64_t(sizeof(*ws)), wb_strides[0] * int64_t(sizeof(*wb))}, {}}};
-  down_rows<T, group_size, bits, out, fast>(
-      (const device uint8_t*)w, (const device uint8_t*)ws, (const device uint8_t*)wb, x, inds, scores, shared, s, y, p,
+  down_rows<T, group_size, bits, out, fast, 0>(
+      (const device uint8_t*)w, (const device uint8_t*)ws, (const device uint8_t*)wb, nullptr, nullptr, nullptr, 0, x, inds, scores, shared, s, y, p,
+      products, threadgroup_position_in_grid, thread_position_in_threadgroup, threads_per_threadgroup);
+""",
+    "down_fold": r"""
+  threadgroup T products[32 * out];
+  const ExpertParams p{k, n, top_k, {{w_strides[0] * int64_t(sizeof(*w)), ws_strides[0] * int64_t(sizeof(*ws)), wb_strides[0] * int64_t(sizeof(*wb))}, {}}};
+  down_rows<T, group_size, bits, out, fast, 1>(
+      (const device uint8_t*)w, (const device uint8_t*)ws, (const device uint8_t*)wb,
+      (const device uint8_t*)cw, (const device uint8_t*)cs, (const device uint8_t*)cb, routes, x, inds, scores, shared, shared, y, p,
       products, threadgroup_position_in_grid, thread_position_in_threadgroup, threads_per_threadgroup);
 """,
 }
@@ -3414,6 +4372,274 @@ def _routed_down(x, inds, scores, shared, s, w, group_size, bits, mode):
     return _run(launch, list(w), [x, inds, scores, shared, s])
 
 
+# Rows up to which the shared expert rides the routed launches: only launch-bound GPUs (4-bit, no tensor units) gain.
+_FOLD_GATE_UP_ROWS = 4
+_FOLD_ROWS = 5
+
+
+def _fold_launch(name, dtype, quant, out_rows, owned, shape, grid, threadgroup, k, n, top_k, routes, experts):
+    call = _kernel(name, True)
+    if call is None:
+        return None
+    scalars = [_scalar(k), _scalar(n), _scalar(top_k), _scalar(routes)]
+    args = dict(template = [("T", dtype), ("group_size", quant[0]), ("bits", quant[1]), ("out", out_rows), ("fast", quant[2])],
+                grid = grid, threadgroup = threadgroup, output_shapes = [shape], output_dtypes = [dtype])
+    reachable = min(routes, experts)
+
+    def run(*arrays):
+        return call(inputs = [*(t[:reachable] for t in arrays[:owned]), *arrays[owned : 2 * owned],
+                              *map(mx.contiguous, arrays[2 * owned:]), *scalars], **args)[0]
+
+    return mx.compile(run)
+
+
+@functools.lru_cache(maxsize = 1024)
+def _fold_plan(x, inds, scores, shared, routed, common, group_size, bits):
+    """The gate/up and down launches running a sparse block's routes and shared expert together, or None."""
+    x, inds, scores, shared = _specs((x, inds, scores, shared))
+    gate, up, down = map(_specs, routed)
+    if (x.ndim == 0 or x.dtype not in _HALF or inds.ndim != x.ndim or inds.dtype not in _INDS or x.shape[:-1] != inds.shape[:-1]
+            or scores.shape != inds.shape or scores.dtype != x.dtype or shared.dtype != x.dtype
+            or shared.shape != (*inds.shape[:-1], 1) or not 1 <= inds.shape[-1] < min(_MAX_SLOTS, _MAX_SIMDS)):
+        return None
+    k, top_k, routes = x.shape[-1], inds.shape[-1], math.prod(inds.shape)
+    n, fast = _projection(gate, "affine", group_size, bits, x.dtype, k)
+    h, fast_down = _projection(down, "affine", group_size, bits, x.dtype, n) if n > 0 else (-1, -1)
+    keys = [tuple(t.shape[1:] for t in p) for p in (gate, up, down)]
+    if (n < 0 or h != k or n % (2 * _FOLD_GATE_UP_ROWS) != 0 or h % _DOWN_ROWS != 0 or routes == 0
+            or _projection(up, "affine", group_size, bits, x.dtype, k) != (n, fast)
+            or gate[0].shape[0] != up[0].shape[0] or gate[0].shape[0] != down[0].shape[0]
+            or any(tuple(a[0] for a in c) != key or tuple(a[1] for a in c) != tuple(t.dtype for t in p)
+                   for c, key, p in zip(common, keys, (gate, up, down)))):
+        return None
+    rows, experts = routes // top_k, gate[0].shape[0]
+    quant = (group_size, bits, fast)
+    gate_up = _fold_launch("gate_up_fold", x.dtype, quant, _FOLD_GATE_UP_ROWS, 6, (routes + rows, n),
+                           (32 * n // (2 * _FOLD_GATE_UP_ROWS), 2 * (routes + rows), 1), (32, 2, 1), k, n, top_k, routes, experts)
+    simds = top_k + 1
+    last = _fold_launch("down_fold", x.dtype, (group_size, bits, fast_down), _DOWN_ROWS, 3, (*inds.shape[:-1], h),
+                        (32 * h // _DOWN_ROWS, simds * rows, 1), (32, simds, 1), n, h, top_k, routes, experts)
+    return (gate_up, last) if gate_up is not None and last is not None else None
+
+
+@functools.cache
+def _shared_expert_bindings(cls):
+    """What a stock `down(swiglu(gate(x), up(x)))` shared expert class resolves to, or None."""
+    name = f"{cls.__name__}.__call__"
+    return _resolved_bindings({cls.__module__: {name: "ec6fbfefb1f0b4c0", "swiglu": _MOE_ROUTED_FUNCTIONS["swiglu"]}, **_CONV_SILU_CONTRACT})
+
+
+def _rows_packed(tensor):
+    try:
+        strides = memoryview(tensor).strides
+    except (TypeError, ValueError, BufferError):
+        return False
+    return tensor.ndim == 2 and strides == (tensor.shape[1] * tensor.itemsize, tensor.itemsize)
+
+
+_MOE_FOLD_VERDICTS = {}
+
+_GROUPED_TILE = 2
+_MOE_GROUPED_CHOICES = {}
+
+_GROUPED_MAP = r"""
+  // One thread per expert: its routes, in route order, split into tiles of TILE; tiles laid out by expert.
+  const uint e = thread_index_in_threadgroup;
+  const uint lane = thread_index_in_simdgroup;
+  const uint sg = simdgroup_index_in_threadgroup;
+  threadgroup uint totals[32];
+  uint count = 0;
+  for (uint r = 0; r < R; ++r) count += uint(inds[r]) == e;
+  const uint tiles = (count + TILE - 1) / TILE;
+  const uint before = simd_prefix_exclusive_sum(tiles);
+  if (lane == 31) totals[sg] = before + tiles;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint offset = before;
+  for (uint j = 0; j < sg; ++j) offset += totals[j];
+  uint live = 0;
+  for (uint j = 0; j < E / 32; ++j) live += totals[j];
+  for (uint t = 0; t < tiles; ++t) {
+    experts[offset + t] = e;
+    counts[offset + t] = min(uint(TILE), count - t * TILE);
+  }
+  uint at = 0;
+  for (uint r = 0; r < R; ++r) {
+    if (uint(inds[r]) == e) {
+      routes[(offset + at / TILE) * TILE + at % TILE] = r;
+      ++at;
+    }
+  }
+  for (uint t = live + e; t < R; t += E) counts[t] = 0;
+"""
+
+_GROUPED_DOT = r"""
+// Each route's dot is the routed kernels' own: lanes accumulate the same K blocks, then simd_sum. A tile's routes
+// share one expert, so each weight block is loaded once for all of them.
+template <typename T, int GS, int BITS, int OUT, int FAST, int ROWS, int P>
+METAL_FUNC void grouped_dot(thread typename Dots<T, GS, BITS, OUT, FAST>::Proj* proj, const device T* x,
+                            thread uint* rr, uint count, int K, int top_k, uint lane,
+                            thread float (&result)[ROWS][P * OUT]) {
+  typedef Dots<T, GS, BITS, OUT, FAST> D;
+  constexpr int V = D::values_per_thread;
+  thread float xt[ROWS][V];
+  thread float sums[ROWS];
+  Terms<float, V, BITS> terms;
+  for (int k = 0; k < K; k += D::block_size) {
+    if (FAST || k + lane * V < K) {
+      UNROLL for (int r = 0; r < ROWS; ++r) if (r < count)
+        sums[r] = load_terms_x<T, float, V, BITS>(x + size_t(rr[r] / top_k) * K + k + lane * V, xt[r]);
+      UNROLL for (int p = 0; p < P; ++p) {
+        UNROLL for (int o = 0; o < OUT; ++o) {
+          terms.load(proj[p].w + o * K * D::lane::bytes_per_pack / D::lane::pack_factor);
+          float scale = proj[p].s[o * (K / GS)] * code_unit<BITS>();
+          float bias = proj[p].b[o * (K / GS)];
+          UNROLL for (int r = 0; r < ROWS; ++r) if (r < count)
+            result[r][p * OUT + o] += scale * terms.dot(xt[r]) + sums[r] * bias;
+        }
+      }
+    }
+    UNROLL for (int p = 0; p < P; ++p) {
+      proj[p].w += D::block_size * D::lane::bytes_per_pack / D::lane::pack_factor;
+      proj[p].s += D::block_size / GS;
+      proj[p].b += D::block_size / GS;
+    }
+  }
+  UNROLL for (int r = 0; r < ROWS; ++r) if (r < count)
+    UNROLL for (int i = 0; i < P * OUT; ++i) result[r][i] = simd_sum(result[r][i]);
+}
+"""
+
+_GROUPED_COMBINE = r"""
+  const uint i = thread_position_in_grid.x;
+  if (i >= M * N) return;
+  const uint row = i / N, col = i % N;
+  thread T products[TOP];
+  for (uint j = 0; j < TOP; ++j) products[j] = y[(row * TOP + j) * N + col] * scores[row * TOP + j];
+  out[i] = shared_add(slot_sum<T>(products, 1, TOP), shared[row], s[i]);
+"""
+
+
+def _grouped_projection_source(gate):
+    proj = lambda p, w, s, b: (
+        f"p[{p}] = D::proj((const device uint8_t*){w} + e * {w}_strides[0] * sizeof(*{w}), "
+        f"(const device uint8_t*){s} + e * {s}_strides[0] * sizeof(*{s}), "
+        f"(const device uint8_t*){b} + e * {b}_strides[0] * sizeof(*{b}), K, n0, lane);\n")
+    store = ("T a = T(result[r][o]); T b = T(result[r][OUT + o]); T sig = Sigmoid{}(a); T g = a * sig; y[size_t(rr[r]) * N + n0 + o] = g * b;"
+             if gate else "y[size_t(rr[r]) * N + n0 + o] = T(result[r][o]);")
+    return (
+        "const uint tile = threadgroup_position_in_grid.y;\n"
+        "const uint count = counts[tile];\n"
+        "if (!count) return;\n"
+        "const uint lane = thread_index_in_simdgroup;\n"
+        "const uint n0 = threadgroup_position_in_grid.x * OUT;\n"
+        "const uint e = experts[tile];\n"
+        "thread uint rr[TILE];\n"
+        "UNROLL for (int r = 0; r < TILE; ++r) if (r < count) rr[r] = routes[tile * TILE + r];\n"
+        "typedef Dots<T, GS, BITS, OUT, FAST> D;\n"
+        "typename D::Proj p[P];\n"
+        + proj(0, "wg", "sg", "bg") + (proj(1, "wu", "su", "bu") if gate else "")
+        + "thread float result[TILE][P * OUT] = {};\n"
+        "grouped_dot<T, GS, BITS, OUT, FAST, TILE, P>(p, x, rr, count, K, TOP, lane, result);\n"
+        "UNROLL for (int r = 0; r < TILE; ++r) if (r < count) UNROLL for (int o = 0; o < OUT; ++o) if (lane == o) {\n"
+        + store + "}\n"
+    )
+
+
+@functools.cache
+def _grouped_kernels():
+    try:
+        if not mx.metal.is_available():
+            return None
+        header = _mlx_headers(True) + "#define UNSLOTH_AFFINE 1\n" + _QDOT + _SLOTS + _ROUTED + _GROUPED_DOT
+        projections = tuple(
+            mx.fast.metal_kernel(
+                name = f"unsloth_moe_grouped_{'gate_up' if gate else 'down'}",
+                input_names = [*(["wg", "sg", "bg", "wu", "su", "bu"] if gate else ["wg", "sg", "bg"]),
+                               "x", "experts", "routes", "counts"],
+                output_names = ["y"], header = header, source = _grouped_projection_source(gate),
+                ensure_row_contiguous = False,
+            )
+            for gate in (True, False)
+        )
+        mapping = mx.fast.metal_kernel(name = "unsloth_moe_grouped_map", input_names = ["inds"],
+                                       output_names = ["experts", "routes", "counts"], source = _GROUPED_MAP)
+        combine = mx.fast.metal_kernel(name = "unsloth_moe_grouped_combine", input_names = ["y", "scores", "shared", "s"],
+                                       output_names = ["out"], header = _SLOTS, source = _GROUPED_COMBINE)
+        return mapping, *projections, combine
+    except (AttributeError, OSError, RuntimeError, TypeError):
+        return None
+
+
+def _grouped_routed(x, inds, scores, shared, s, tensors, group_size, bits):
+    """`_routed_down(_routed_gate_up(...))` of affine experts with each expert's routes grouped into tiles, or None.
+
+    Every route keeps the routed kernels' arithmetic; only which routes share a weight read changes, so it serves
+    exactly the calls both routed kernels accept.
+    """
+    kernels = _grouped_kernels()
+    experts, top_k, hidden_width = tensors[0][0].shape[0], inds.shape[-1], tensors[0][0].shape[-2]
+    width, routes = x.shape[-1], inds.size
+    keys = [tuple(map(_key, t)) for t in tensors]
+    if (kernels is None or experts % 32 or experts > 1024
+            or not callable(_gate_up_plan(_key(x), _key(inds), keys[0], keys[1], group_size, bits, "affine"))
+            or not callable(_down_plan(((*inds.shape, hidden_width), x.dtype), _key(inds), _key(scores), _key(shared),
+                                       _key(s), keys[2], group_size, bits, "affine"))):
+        return None
+    mapping, gate_up, down, combine = kernels
+    tile = _GROUPED_TILE
+    owners, routed, counts = mapping(
+        inputs = [inds.reshape(-1)], template = [("R", routes), ("E", experts), ("TILE", tile)],
+        grid = (experts, 1, 1), threadgroup = (experts, 1, 1),
+        output_shapes = [(routes,), (routes * tile,), (routes,)], output_dtypes = [mx.uint32] * 3)
+
+    def project(a, weights, gate):
+        k, n = a.shape[-1], weights[0][0].shape[1]
+        fast = _one_row_kernel("affine", group_size, bits, a.dtype, k, n, *weights[0])
+        per_simd = _GATE_UP_ROWS if gate else _DOWN_ROWS
+        return (gate_up if gate else down)(
+            inputs = [*(t for p in weights for t in p), mx.contiguous(a), owners, routed, counts],
+            template = [("T", a.dtype), ("GS", group_size), ("BITS", bits), ("OUT", per_simd), ("FAST", fast), ("TILE", tile),
+                        ("P", 2 if gate else 1), ("TOP", top_k if gate else 1), ("K", k), ("N", n)],
+            grid = (32 * n // per_simd, routes, 1), threadgroup = (32, 1, 1),
+            output_shapes = [(routes, n)], output_dtypes = [a.dtype])[0]
+
+    y = project(project(x.reshape(-1, width), tensors[:2], True), tensors[2:], False)
+    rows = routes // top_k
+    return combine(inputs = [y, scores, shared, s], template = [("T", x.dtype), ("M", rows), ("N", width), ("TOP", top_k)],
+                   grid = (rows * width, 1, 1), threadgroup = (256, 1, 1),
+                   output_shapes = [s.shape], output_dtypes = [x.dtype])[0]
+
+
+# Sub-millisecond calls jitter and often run a slower mode, which a median hides: average many, less the slowest.
+_GROUPED_RACE_CALLS = 9
+# Below this many rows the race's short low-clock calls misjudge grouped tiles.
+_ROUTED_ROWS_WITHOUT_NAX = 8
+# There the race picks by chance on tensor units: whole verifies ran faster on grouped tiles from 5 4-bit rows or 3 8-bit ones.
+_GROUPED_ROW_BITS_WITH_NAX = 20
+
+
+def _grouped_routed_faster(routed, grouped, clock = time.perf_counter, race = True):
+    _staged_ready()
+    try:
+        native, candidate = routed(), grouped()
+        if native is None or candidate is None or not _settled(
+                native.dtype == candidate.dtype and bool(mx.array_equal(native, candidate, equal_nan = True))):
+            return False
+        if not race:
+            return True
+        seconds = ([], [])
+        for repeat in range(_GROUPED_RACE_CALLS):
+            for index in ((0, 1) if repeat % 2 == 0 else (1, 0)):
+                mx.synchronize()
+                start = clock()
+                mx.eval((routed, grouped)[index]())
+                seconds[index].append(clock() - start)
+        return sum(sorted(seconds[1])[:-1]) < sum(sorted(seconds[0])[:-1])
+    except (AttributeError, OSError, RuntimeError, TypeError) as error:
+        _unless_failed_buffer(error)
+        return False
+
+
 _MOE_UNSORTED_ROUTES = 64
 # The switch layer bodies the routed-expert kernels reimplement besides the gate/up contract's.
 _MOE_ROUTED_FUNCTIONS = {"SwiGLU.__call__": "b6e81906a2a7d4c9", "swiglu": "bc9e3d24f39fe8b1"}
@@ -3442,6 +4668,644 @@ def _switch_base(cls, specs):
     return None
 
 
+_PLAIN_MOE_ROUTING = r"""
+template <typename T, int E, int TOP>
+METAL_FUNC uint plain_routes(const device T* logits, uint lane, int stop, bool write,
+                            device uint* inds, device T* scores) {
+    constexpr int R = E / 32;
+    float values[R];
+    float maximum = -INFINITY;
+    #pragma clang loop unroll(full)
+    for (int r = 0; r < R; ++r) {
+        values[r] = float(logits[128 * (r / 4) + 4 * lane + r % 4]);
+        maximum = max(maximum, values[r]);
+    }
+    maximum = simd_max(maximum);
+    float total = 0;
+    #pragma clang loop unroll(full)
+    for (int g = 0; g < R / 4; ++g) {
+        float partial = 0;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 4; ++i) {
+            values[4 * g + i] = fast::exp(values[4 * g + i] - maximum);
+            partial += values[4 * g + i];
+        }
+        float group = simd_sum(partial);
+        if (lane == uint(g)) total = group;
+    }
+    total = simd_sum(total);
+    #pragma clang loop unroll(full)
+    for (int r = 0; r < R; ++r) values[r] = float(T(values[r] * (1 / total)));
+    uint used = 0, selected = 0, ranked = 0;
+    T probability = T(0);
+    for (int k = TOP - 1; k >= stop; --k) {
+        float best = -INFINITY;
+        int at = -1;
+        #pragma clang loop unroll(full)
+        for (int r = 0; r < R; ++r) {
+            if (!(used & (1u << r)) && values[r] >= best) { best = values[r]; at = r; }
+        }
+        float winner = simd_max(best);
+        uint index = (at >= 0 && best == winner) ? uint(128 * (at / 4) + 4 * lane + at % 4) : 0;
+        index = simd_max(index);
+        if ((index / 4) % 32 == lane) used |= 1u << (4 * (index / 128) + index % 4);
+        if (k == stop) selected = index;
+        if (lane == uint(k)) { ranked = index; probability = T(winner); }
+    }
+    if (write) {
+        T denominator = simd_shuffle(probability, 0);
+        for (int k = 1; k < TOP; ++k) denominator = T(float(denominator) + float(simd_shuffle(probability, k)));
+        if (lane < TOP) { inds[lane] = ranked; scores[lane] = T(float(probability) / float(denominator)); }
+    }
+    return selected;
+}
+"""
+
+_PLAIN_MOE_DOT = r"""
+template <typename T, int BITS, int GS, int K, int N, bool FAST, int ROWS>
+METAL_FUNC void plain_qmv(const device T* x, const device uint* w, const device T* scales,
+                         const device T* biases, int row, uint lane, thread float* result) {
+    constexpr int PF = get_pack_factor<BITS, 32>();
+    constexpr int BP = get_bytes_per_pack<BITS, 32>();
+    constexpr int VPT = PF * ((FAST && BITS != 2) ? 2 : 1);
+    constexpr int BLOCK = 32 * VPT;
+    constexpr int STEP = GS / VPT;
+    const device uint8_t* packed = (const device uint8_t*)w;
+    #pragma clang loop unroll(disable)
+    for (int block = 0; block < K; block += BLOCK) {
+        int remaining = min(VPT, max(0, K - block - int(lane) * VPT));
+        if (!remaining) continue;
+        // Generic qmv uses safe arithmetic for its final block, including lanes with a full pack.
+        bool tail = !FAST && block + BLOCK >= K;
+        thread float xt[VPT];
+        float sum = tail ? load_vector_safe<T, float, VPT, BITS>(x + block + lane * VPT, xt, remaining)
+                         : load_vector<T, float, VPT, BITS>(x + block + lane * VPT, xt);
+        for (int r = 0; r < ROWS; ++r) {
+            if (row + r >= N) continue;
+            const device uint8_t* wp = packed + (row + r) * (K * BP / PF) + (block / PF + lane * (VPT / PF)) * BP;
+            int q = (row + r) * (K / GS) + block / GS + lane / STEP;
+            result[r] += tail ? qdot_safe<float, VPT, BITS>(wp, xt, float(scales[q]), float(biases[q]), sum, remaining)
+                              : qdot<float, VPT, BITS>(wp, xt, float(scales[q]), float(biases[q]), sum);
+        }
+    }
+    for (int r = 0; r < ROWS; ++r) result[r] = simd_sum(result[r]);
+}
+"""
+
+
+@functools.cache
+def _plain_moe_kernels(rows = False):
+    if (mx.__version__ != "0.32.4" or not mx.metal.is_available()
+            or mx.device_info().get("architecture") != "applegpu_g15s"):
+        return None
+    try:
+        seen = set()
+        _inline("mlx/backend/metal/kernels/utils.h", seen)
+        header = _inline("mlx/backend/metal/kernels/quantized.h", seen, "get_pack_factor", "dequantize")
+        header += _inline("mlx/backend/metal/kernels/unary_ops.h", seen, "Sigmoid", "Sign")
+        header += "#define UNSLOTH_AFFINE 1\n" + _QDOT + _ROUTED + _PLAIN_MOE_ROUTING + _PLAIN_MOE_DOT + _SLOTS
+        gate_offset = r"""
+            uint batch = threadgroup_position_in_grid.z;
+            x += batch * H; logits += batch * E;
+            h += batch * (TOP + 1) * I;
+            indices += batch * TOP; scores += batch * TOP; shared_scale += batch;
+            """ if rows else ""
+        down_offset = r"""
+            uint batch = threadgroup_position_in_grid.z;
+            h += batch * (TOP + 1) * I; indices += batch * TOP; scores += batch * TOP;
+            shared_scale += batch; y += batch * H;
+            """ if rows else ""
+        gate_up = mx.fast.metal_kernel(
+            name = "unsloth_verify_moe_route_gate_up" if rows else "unsloth_plain_moe_route_gate_up", ensure_row_contiguous = False,
+            input_names = ["x", "logits", "wg", "sg", "bg", "wu", "su", "bu", "cg", "csg", "cbg", "cu", "csu", "cbu", "gw", "gs", "gb"],
+            output_names = ["h", "indices", "scores", "shared_scale"], header = header,
+            compile_options = {"math_mode": "safe"}, source = "#pragma clang fp contract(off) reassociate(off)\n" + gate_offset + r"""
+            uint lane = thread_index_in_simdgroup;
+            uint simd = simdgroup_index_in_threadgroup;
+            uint row = threadgroup_position_in_grid.x * 16 + simd * 4;
+            uint slot = threadgroup_position_in_grid.y;
+            bool common = slot == TOP;
+            uint expert = 0;
+            if (!common) {
+                expert = plain_routes<T, E, TOP>(logits, lane, slot, row == 0 && slot == 0, indices, scores);
+            }
+            const device uint* gate_w = common ? cg : wg + expert * wg_strides[0];
+            const device T* gate_s = common ? csg : sg + expert * sg_strides[0];
+            const device T* gate_b = common ? cbg : bg + expert * bg_strides[0];
+            const device uint* up_w = common ? cu : wu + expert * wu_strides[0];
+            const device T* up_s = common ? csu : su + expert * su_strides[0];
+            const device T* up_b = common ? cbu : bu + expert * bu_strides[0];
+            typedef Dots<T, GS, BITS, 4, true> dots;
+            thread float values[8] = {};
+            thread typename dots::Proj projections[2] = {
+                dots::proj((const device uint8_t*)gate_w, (const device uint8_t*)gate_s, (const device uint8_t*)gate_b, H, row, lane),
+                dots::proj((const device uint8_t*)up_w, (const device uint8_t*)up_s, (const device uint8_t*)up_b, H, row, lane)};
+            dots::template run<2>(projections, x, H, lane, values);
+            if (lane == 0) {
+                for (int r = 0; r < 4; ++r) {
+                    T g = T(values[r]), u = T(values[4 + r]);
+                    T activated = g * Sigmoid{}(g);
+                    h[slot * I + row + r] = activated * u;
+                }
+            }
+            if (common && row == 0) {
+                thread float value[1] = {};
+                plain_qmv<T, GBITS, GGS, H, 1, true, 1>(x, gw, gs, gb, 0, lane, value);
+                if (lane == 0) shared_scale[0] = Sigmoid{}(T(value[0]));
+            }
+            """)
+        down = mx.fast.metal_kernel(
+            name = "unsloth_verify_moe_down_combine" if rows else "unsloth_plain_moe_down_combine", ensure_row_contiguous = False,
+            input_names = ["h", "indices", "scores", "shared_scale", "w", "s", "b", "cw", "cs", "cb"],
+            output_names = ["y"], header = header, compile_options = {"math_mode": "safe"}, source = "#pragma clang fp contract(off) reassociate(off)\n" + down_offset + r"""
+            uint lane = thread_index_in_simdgroup;
+            uint simd = simdgroup_index_in_threadgroup;
+            uint row = threadgroup_position_in_grid.x * 4;
+            threadgroup T products[(TOP + 1) * 4];
+            uint slot = simd;
+                bool common = slot == TOP;
+                uint expert = common ? 0 : indices[slot];
+                thread float value[4] = {};
+                typedef Dots<T, GS, BITS, 4, DFAST> dots;
+                thread typename dots::Proj projection = dots::proj(
+                    (const device uint8_t*)(common ? cw : w + expert * w_strides[0]),
+                    (const device uint8_t*)(common ? cs : s + expert * s_strides[0]),
+                    (const device uint8_t*)(common ? cb : b + expert * b_strides[0]), I, row, lane);
+                dots::template run<1>(&projection, h + slot * I, I, lane, value);
+                if (lane == 0) {
+                    for (int r = 0; r < 4; ++r) products[slot * 4 + r] = common ? T(value[r]) : T(value[r]) * scores[slot];
+                }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd == 0 && lane < 4) {
+                y[row + lane] = shared_add(slot_sum<T>(products + lane, 4, TOP), shared_scale[0], products[TOP * 4 + lane]);
+            }
+            """)
+        return gate_up, down
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+_PLAIN_MOE_CONTRACT = {
+    "mlx_vlm.models.qwen4_exp.language": {
+        "Qwen4ExpSparseMoeBlock._shared_expert_scale": "ebaed577eec4a7ae",
+        "_row_invariant_quantized_projection": "75dc4975ef847716",
+    },
+}
+
+
+def _moe_dispatch_bindings(objects, roots = ("__call__", "__getattribute__", "__getattr__", "__getitem__", "__contains__"), *, follow = True):
+    """Bind instance and full-MRO entries reached by native dispatch bodies.
+    Attribute discovery is conservative and follows Python helpers and property getters.
+    Child mappings contribute stored fields; methods resolve through instance/class dictionaries.
+    """
+    records, found, seen = [], {}, set()
+    for obj in objects:
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        hierarchy = obj.__mro__ if isinstance(obj, type) else type(obj).__mro__
+        spaces = [(id(cls), _class_namespace(cls)) for cls in hierarchy]
+        if not isinstance(obj, type):
+            spaces.append((id(obj), vars(obj)))
+            if isinstance(obj, dict):
+                spaces.append(((id(obj), "items"), obj))
+        records.append((obj, spaces))
+    pending = [(i, name) for i in range(len(records)) for name in roots]
+    seen.clear()
+    while pending:
+        i, name = pending.pop()
+        if (i, name) in seen:
+            continue
+        seen.add((i, name))
+        for key, space in records[i][1]:
+            if isinstance(key, tuple) and name not in space:
+                continue
+            value = space.get(name)
+            found[key, name] = (space, name, value)
+            function = value.fget if isinstance(value, property) else getattr(value, "__func__", value)
+            code = getattr(function, "__code__", None)
+            if follow and code is not None:
+                pending.extend((j, attr) for attr in code.co_names for j, (obj, _) in enumerate(records)
+                               if (j, attr) not in seen and hasattr(obj, attr))
+    return tuple(found.values())
+
+
+class _PlainMoEShared:
+    def __init__(self):
+        self.entries, self.hierarchies = {}, {}
+        self.bindings, self.version = (), 0
+
+    def add(self, bindings, classes):
+        size = len(self.entries), len(self.hierarchies)
+        for space, name, value in bindings:
+            self.entries.setdefault((id(space), name), (space, name, value))
+        for cls, hierarchy in classes:
+            self.hierarchies.setdefault(cls, hierarchy)
+        if size != (len(self.entries), len(self.hierarchies)):
+            self.bindings = tuple(self.entries.values())
+            self.version += 1
+
+    def check(self):
+        return (_bindings_intact(self.bindings)
+                and all(cls.__mro__ == hierarchy for cls, hierarchy in self.hierarchies.items()))
+
+    def matches(self):
+        step = getattr(_VERIFY_STATE, "plain_moe", None)
+        if step is None or step[0] is not self:
+            return self.check()
+        if step[1] != self.version:
+            step[1:] = self.version, self.check()
+        return step[2]
+
+
+def _code_name(code):
+    return getattr(code, "co_qualname", code.co_name)  # co_qualname is Python 3.11+
+
+
+@functools.cache
+def _moe_module_codes(module):
+    path = sys.modules[module].__file__
+    pending, codes = [compile(Path(path).read_text(), path, "exec", dont_inherit = True)], {}
+    while pending:
+        code = pending.pop()
+        codes.setdefault(_code_name(code), set()).add(code)
+        pending.extend(c for c in code.co_consts if inspect.iscode(c))
+    return codes
+
+
+_MOE_VERIFY_DISPATCH = {}
+_MOE_VERIFY_METHODS = {}
+
+
+class _MoEVerifyDispatch:
+    """The native feed-forward dispatch that a row plan bypasses, pinned before serving."""
+
+    def __init__(self, cls, native, contracts):
+        self.cls, self.names, self.methods = cls, set(), set()
+        self.functions, self.cells, self.objects = [], [], []
+        classes, bindings, pending, seen = {cls}, list(contracts), [native._feed_forward], set()
+        receivers = {id(native._feed_forward): cls}
+        allowed = {id(getattr(v, "__func__", v)) for _, _, v in contracts}
+        allowed.add(id(object.__getattribute__))
+        for parent in cls.__mro__:
+            allowed.update(_MOE_VERIFY_METHODS.get(parent, ()))
+
+        def visit(value, receiver = None):
+            if isinstance(value, (staticmethod, classmethod)):
+                value = value.__func__
+            bound = getattr(value, "__self__", None)
+            if bound is not None:
+                receiver = bound
+            value = getattr(value, "__func__", value)
+            if receiver is not None:
+                receivers[id(value)] = receiver
+            if isinstance(value, FunctionType):
+                pending.append(value)
+            elif callable(value) and isinstance(getattr(value, "__wrapped__", None), FunctionType):
+                bindings.append((vars(value), "__wrapped__", value.__wrapped__))
+                pending.append(value.__wrapped__)
+
+        for name in ("__getattribute__", "__getattr__"):
+            value = getattr(cls, name, None)
+            if value is not None and id(getattr(value, "__func__", value)) not in allowed:
+                raise ValueError("the verifier attribute dispatch is not pinned")
+            visit(value, cls)
+        while pending:
+            fn = pending.pop()
+            if id(fn) in seen:
+                continue
+            seen.add(id(fn))
+            module = fn.__globals__.get("__name__", "")
+            owner = sys.modules.get(module)
+            if owner is None or fn.__globals__ is not vars(owner):
+                raise ValueError("the verifier helper has an unverified namespace")
+            self.functions.append((fn, fn.__code__, fn.__defaults__, fn.__kwdefaults__))
+            if fn.__kwdefaults__:
+                bindings.extend((fn.__kwdefaults__, n, v) for n, v in fn.__kwdefaults__.items())
+            values = [*(fn.__defaults__ or ()), *(fn.__kwdefaults__ or {}).values()]
+            environment = dict(fn.__globals__)
+            for name, cell in zip(fn.__code__.co_freevars, fn.__closure__ or ()):
+                value = cell.cell_contents
+                self.cells.append((cell, value))
+                environment[name] = value
+                values.append(value)
+            for value in values:
+                visit(value)
+            trusted = module.startswith(("mlx.", "mlx_vlm.", "unsloth_zoo.mlx."))
+            if not trusted and module.split(".")[0] not in sys.stdlib_module_names:
+                raise ValueError("the verifier helper is outside the verified runtime")
+            if not fn.__code__.co_filename.startswith("<frozen "):
+                if fn.__code__ not in _moe_module_codes(module).get(_code_name(fn.__code__), ()):
+                    raise ValueError("the verifier helper differs from its installed body")
+            if not trusted:
+                continue
+            codes, names = [fn.__code__], set()
+            while codes:
+                code = codes.pop()
+                names.update(code.co_names)
+                codes.extend(c for c in code.co_consts if inspect.iscode(c))
+            for name in names & fn.__globals__.keys():
+                value = fn.__globals__[name]
+                bindings.append((fn.__globals__, name, value))
+                visit(value)
+            if id(fn) in receivers:
+                environment["self"] = receivers[id(fn)]
+
+            tree = ast.parse(textwrap.dedent(inspect.getsource(fn.__code__)))
+            called = {n.func.attr for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+
+            def resolve(node):
+                if isinstance(node, ast.Name):
+                    return environment.get(node.id)
+                if not isinstance(node, ast.Attribute) or node.attr not in names:
+                    return None
+                obj = resolve(node.value)
+                if isinstance(obj, type):
+                    classes.add(obj)
+                    bindings.extend(_moe_dispatch_bindings((obj,), (node.attr,), follow = False))
+                elif isinstance(obj, ModuleType):
+                    bindings.append((vars(obj), node.attr, vars(obj).get(node.attr)))
+                elif hasattr(obj, "__dict__") and callable(getattr(obj, node.attr, None)):
+                    classes.add(type(obj))
+                    self.objects.append((obj, type(obj)))
+                    bindings.extend(_moe_dispatch_bindings((obj,), (node.attr, "__getattribute__", "__getattr__"), follow = False))
+                else:
+                    return None
+                value = getattr(obj, node.attr, None)
+                parent = obj is not object and any(obj is c for c in cls.__mro__)
+                if parent and (callable(value) or node.attr in called):
+                    if id(getattr(value, "__func__", value)) not in allowed:
+                        raise ValueError(f"the verifier method {obj.__name__}.{node.attr} is not a pinned or generated body")
+                if obj is cls and isinstance(node.value, ast.Name) and node.value.id == "self":
+                    self.names.add(node.attr)
+                    if callable(value):
+                        self.methods.add(node.attr)
+                # Recursive shared-expert calls use this same native body, not the fusion being guarded.
+                visit(native._feed_forward if node.attr == "_feed_forward" else value, cls if parent else obj)
+                return value
+
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Attribute):
+                    resolve(node)
+        bindings.extend(_moe_dispatch_bindings((cls,), ("__getattribute__", "__getattr__")))
+        self.shared = _PlainMoEShared()
+        self.shared.add(bindings, tuple((c, c.__mro__) for c in classes))
+        self.names, self.methods = frozenset(self.names), frozenset(self.methods)
+
+    def check(self):
+        return (self.shared.check()
+                and all(f.__code__ is code and f.__defaults__ is defaults and f.__kwdefaults__ is kw
+                        for f, code, defaults, kw in self.functions)
+                and all(cell.cell_contents is value for cell, value in self.cells)
+                and all(type(obj) is cls for obj, cls in self.objects))
+
+
+def _moe_verifier_class(cls):
+    _MOE_VERIFY_METHODS[cls] = tuple(id(getattr(v, "__func__", v)) for v in vars(cls).values()
+                                   if isinstance(getattr(v, "__func__", v), FunctionType))
+    native = _verifier_native(cls)
+    target = getattr(sys.modules.get("mlx_vlm.models.qwen4_exp.language"), "Qwen4ExpBatchInvariantForward", None)
+    if target is not None and issubclass(native, target):
+        try:
+            contracts = _resolved_bindings(_QWEN4_FORWARD_CONTRACT)
+            _MOE_VERIFY_DISPATCH[cls] = _MoEVerifyDispatch(cls, native, contracts) if contracts is not None else None
+        except (AttributeError, OSError, RuntimeError, SyntaxError, TypeError, ValueError):
+            _MOE_VERIFY_DISPATCH[cls] = None
+    return cls
+
+
+def _moe_verifier_context(verifier):
+    state = vars(verifier)
+    context = state.get("_unsloth_moe_verify_context")
+    if context is None:
+        dispatch = _MOE_VERIFY_DISPATCH.get(type(verifier))
+        if dispatch is None or not dispatch.methods.isdisjoint(state):
+            return None
+        local_bindings = tuple((state, name, state.get(name)) for name in dispatch.names)
+        context = verifier, dispatch, local_bindings
+        state["_unsloth_moe_verify_context"] = context
+    return context
+
+
+def _moe_verifier_matches(verifier, experts = None):
+    step = getattr(_VERIFY_STATE, "moe_verifier", None)
+    if experts is None or step is None or step[0] is not verifier:
+        context = _moe_verifier_context(verifier)
+        valid = (context is not None and type(verifier) is context[1].cls
+                 and context[1].check())
+    else:
+        _, context, valid = step
+    if experts is None:
+        return context, valid
+    if experts.verify_context is None:
+        experts.verify_context = context
+    return (valid and context is experts.verify_context and type(verifier) is context[1].cls
+            and _bindings_intact(context[2]))
+
+
+class _PlainMoE:
+    def __init__(self, block, experts, bindings, rows = 1):
+        self.block, self.mlp = block, experts.mlp
+        common = block.shared_expert
+        self.projections = (self.mlp.gate_proj, self.mlp.up_proj, self.mlp.down_proj,
+                            common.gate_proj, common.up_proj, common.down_proj, block.shared_expert_gate)
+        self.parents = (block, self.mlp, common, self.mlp.activation, getattr(self.mlp, "_unsloth_moe_gate_up", None))
+        self.parents = tuple(parent for parent in self.parents if parent is not None)
+        self.classes = tuple((type(p), type(p).__mro__) for p in (*self.projections, *self.parents))
+        self.router = block.gate
+        self.weights_router = _projection_tensors(self.router)
+        self.router_class = (type(self.router), type(self.router).__mro__)
+        self.objects = (*self.projections, *self.parents, self.router)
+        self.class_ids = tuple(id(type(obj)) for obj in self.objects)
+        self.shared = experts.shared or _PlainMoEShared()
+        self.weights = tuple(_projection_tensors(p) for p in self.projections)
+        self.bindings = _moe_dispatch_bindings((*self.projections, *self.parents, self.router,
+                                                getattr(type(block), "_unsloth_router_native", type(block))))
+        self.bindings += tuple(bindings)
+        self.bindings += tuple(
+            (p, name, tensor) for p in self.projections for name, tensor in zip(("weight", "scales", "biases"), _projection_tensors(p)))
+        self.bindings += ((self.mlp if "activation" in self.mlp else vars(self.mlp), "activation", self.mlp.activation),)
+        self.bindings += tuple((vars(block), name, vars(block).get(name)) for name in ("top_k", "num_experts", "norm_topk_prob"))
+        self.bindings += tuple((p, "bias", None) for p in (*self.projections, self.router))
+        for projection in (*self.projections, self.router):
+            self.bindings += tuple((vars(projection), name, getattr(projection, name)) for name in ("bits", "group_size", "mode"))
+        self.bindings += tuple((self.router, name, tensor) for name, tensor in zip(("weight", "scales", "biases"), _projection_tensors(self.router)))
+        self.bindings += tuple((parent, name, projection) for parent, names in ((self.mlp, ("gate_proj", "up_proj", "down_proj")),
+                                                                              (common, ("gate_proj", "up_proj", "down_proj")))
+                               for name in names for projection in (parent[name],))
+        self.bindings = tuple({(id(space), name): (space, name, value) for space, name, value in self.bindings}.values())
+        local = {id(space) for obj in self.objects for space in (vars(obj), obj)}
+        self.shared_bindings = tuple(binding for binding in self.bindings if id(binding[0]) not in local)
+        self.bindings = tuple(binding for binding in self.bindings if id(binding[0]) in local)
+        absent = {}
+        for binding in self.bindings:
+            space, name, value = binding
+            if value is None:
+                absent.setdefault(id(space), (space, []))[1].append(binding)
+        groups = {}
+        for space, bindings in absent.values():
+            names = frozenset(name for _, name, _ in bindings)
+            spaces, entries = groups.setdefault(names, ([], []))
+            spaces.append(dict.keys(space))
+            entries.extend(bindings)
+        self.absent = tuple((names.isdisjoint, tuple(spaces), tuple(entries))
+                            for names, (spaces, entries) in groups.items())
+        self.bindings = tuple(binding for binding in self.bindings if binding[2] is not None)
+        self.share(self.shared)
+        self.verdict = None
+        self.dtype = self.weights[0][1].dtype
+        self.hidden = self.mlp.down_proj.weight.shape[1]
+        self.width = self.mlp.gate_proj.weight.shape[1]
+        self.top_k = block.top_k
+        gate = self.projections[0]
+        shared_gate = self.projections[-1]
+        self.template = [("T", self.dtype), ("BITS", gate.bits), ("GS", gate.group_size),
+                         ("GBITS", shared_gate.bits), ("GGS", shared_gate.group_size), ("H", self.hidden),
+                         ("I", self.width), ("E", block.num_experts), ("TOP", self.top_k), ("DFAST", self.width % 512 == 0)]
+        self.first = dict(template = self.template, grid = (32 * (self.width // 16), 4 * 11, 1), threadgroup = (32, 4, 1),
+                          output_shapes = [(11, self.width), (1, 1, 10), (1, 1, 10), (1, 1, 1)],
+                          output_dtypes = [self.dtype, mx.uint32, self.dtype, self.dtype])
+        self.last = dict(template = self.template, grid = (32 * (self.hidden // 4), 11, 1), threadgroup = (32, 11, 1),
+                         output_shapes = [(1, 1, self.hidden)], output_dtypes = [self.dtype])
+        routed = tuple(tuple(t[:self.top_k] for t in group) for group in self.weights[:3])
+        mx.eval(routed)
+        self.first_weights = (*routed[0], *routed[1], *self.weights[3], *self.weights[4], *self.weights[6])
+        self.last_weights = (*routed[2], *self.weights[5])
+        self.configure_rows(rows)
+
+    def for_rows(self, rows):
+        # Constants and bindings are shared; launch dictionaries and real-input verdicts belong to each width.
+        plan = copy.copy(self)
+        plan.first, plan.last = dict(self.first), dict(self.last)
+        plan.verdict = None
+        plan.configure_rows(rows)
+        return plan
+
+    def configure_rows(self, rows):
+        self.shape = (1, rows, self.hidden)
+        self.gate_up, self.down = _plain_moe_kernels(rows > 1)
+        self.router_kernel = mx.quantized_matmul if rows > 1 else None
+        self.router_shape = (rows, 1, self.hidden)
+        self.router_output_shape = (1, rows, self.block.num_experts)
+        self.router_args = dict(transpose = True, group_size = self.router.group_size,
+                                bits = self.router.bits, mode = self.router.mode)
+        self.first.update(grid = (*self.first["grid"][:2], rows),
+                          output_shapes = [(11, self.width) if rows == 1 else (rows, 11, self.width),
+                                           (1, rows, 10), (1, rows, 10), (1, rows, 1)])
+        self.last.update(grid = (*self.last["grid"][:2], rows), output_shapes = [self.shape])
+
+    def share(self, shared):
+        self.shared = shared
+        shared.add(self.shared_bindings, (*self.classes, self.router_class))
+
+    def run(self, x):
+        x = mx.contiguous(x)
+        # Fresh weight batches avoid qmv_wide and stale views after parameter writes.
+        logits = (self.router_kernel(x.reshape(self.router_shape), *(w[None] for w in self.weights_router), **self.router_args)
+                  .reshape(self.router_output_shape)
+                  if self.router_kernel is not None else self.router(x))
+        h, inds, scores, scale = self.gate_up(inputs = [x, logits, *self.first_weights], **self.first)
+        return self.down(inputs = [h, inds, scores, scale, *self.last_weights], **self.last)[0]
+
+    def __call__(self, block, x, native):
+        if (x.shape != self.shape or x.dtype != self.dtype or self.verdict is False
+                or block is not self.block or tuple(map(id, map(type, self.objects))) != self.class_ids
+                or not self.shared.matches() or not _bindings_intact(self.bindings)):
+            return None
+        for disjoint, spaces, bindings in self.absent:
+            if not all(map(disjoint, spaces)) and not _bindings_intact(bindings):
+                return None
+        if self.verdict is None:
+            _staged_ready()
+        try:
+            candidate = self.run(x)
+            if self.verdict is None:
+                reference = native()
+                self.verdict = _settled(candidate.dtype == reference.dtype and bool(mx.array_equal(candidate.view(mx.uint16), reference.view(mx.uint16))))
+                if not self.verdict:
+                    logger.warning("the MoE plan differs from native; the native graph stays in use")
+                    return reference
+        except (RuntimeError, ValueError, TypeError) as error:
+            _unless_failed_buffer(error)
+            self.verdict = False
+            logger.warning("the MoE plan cannot run; the native graph stays in use: %s", error)
+            return native()
+        return candidate
+
+
+def _plain_moe_plan(block, experts, rows = 1):
+    if (os.environ.get("UNSLOTH_MLX_PLAIN_MOE", "1") == "0" or _plain_moe_kernels() is None
+            or getattr(type(block), "_unsloth_router_native", type(block)).__module__ != "mlx_vlm.models.qwen4_exp.language"
+            or block.top_k != 10 or block.num_experts != 512 or not getattr(block, "norm_topk_prob", True)):  # < 0.7.8 always normalizes
+        return None
+    language = sys.modules["mlx_vlm.models.qwen4_exp.language"]
+    native = getattr(type(block), "_unsloth_router_native", type(block))
+    common = getattr(block, "shared_expert", None)
+    router = _moe_router_class(native)
+    if common is None or router is None:
+        return None
+    contracts = [_resolved_bindings({**_PLAIN_MOE_CONTRACT, **_DENSE_QMM_CONTRACT}),
+                 _shared_expert_bindings(type(common)), experts.bindings, _MOE_PACK_BINDINGS,
+                 _moe_generated_bindings(router[0])]
+    for obj, base in ((block, native), (experts.mlp, experts.base)):
+        if type(obj) is not base:
+            contracts.append(_moe_generated_bindings(type(obj)))
+    bindings = _moe_contract_bindings(*contracts)
+    if bindings is None:
+        return None
+    scale = type(block)._shared_expert_scale
+    if (scale is not language.Qwen4ExpSparseMoeBlock._shared_expert_scale
+            or scale.__globals__.get("_row_invariant_quantized_projection") is not language._row_invariant_quantized_projection):
+        return None
+    bindings.append((scale.__globals__, "_row_invariant_quantized_projection", language._row_invariant_quantized_projection))
+    pack = getattr(experts.mlp, "_unsloth_moe_gate_up", None)
+    if pack is not None and (type(pack) is not _PackedMoEGateUp or type(pack).__mro__ != _MOE_PACK_MRO):
+        return None
+    if type(experts.mlp.activation) is not experts.activation_type:
+        return None
+    projections = (experts.mlp.gate_proj, experts.mlp.up_proj, experts.mlp.down_proj,
+                   common.gate_proj, common.up_proj, common.down_proj)
+    dense = (*projections[3:], block.shared_expert_gate, block.gate)
+    if (any(type(p) is not experts.projection_type for p in projections[:3])
+            or any(not isinstance(p, nn.QuantizedLinear) or (_stock_call(p, rows) is not nn.QuantizedLinear.__call__
+                   and _stock_call(p, rows) not in _ONE_ROW_STOCK_CALLS) for p in dense)):
+        return None
+    if any(p.training or getattr(p, "bits", None) != 4 or p.group_size != 32 or p.mode != "affine" or "bias" in p
+           or len(_projection_tensors(p)) != 3 or p.scales.dtype != mx.bfloat16 or p.biases.dtype != mx.bfloat16 for p in projections):
+        return None
+    if (projections[0].scales.dtype != mx.bfloat16 or projections[0].weight.shape[1] % 16
+            or projections[2].weight.shape[1] % 512 or any(not _expert_rows_packed(t) for p in projections[:3] for t in _projection_tensors(p))
+            or any(not _rows_packed(t) for p in projections[3:] for t in _projection_tensors(p))):
+        return None
+    hidden, width = projections[2].weight.shape[1], projections[0].weight.shape[1]
+    # The shared linear uses native qmv_quad at these widths; routed gathers use ordinary qmv.
+    if width in (64, 128):
+        return None
+    dimensions = ((hidden, width), (hidden, width), (width, hidden))
+    for p, (k, n) in zip(projections[:3], dimensions):
+        if p.weight.shape[0] != 512 or _projection(_projection_tensors(p), "affine", 32, 4, mx.bfloat16, k) != (n, int(k % 512 == 0)):
+            return None
+    for p, (k, n) in zip(projections[3:], dimensions):
+        if _one_row_kernel("affine", 32, 4, mx.bfloat16, k, n, *_projection_tensors(p)) != int(k % 512 == 0):
+            return None
+    gate = block.shared_expert_gate
+    if (gate.training or gate.bits != 8 or gate.group_size != 64 or gate.mode != "affine" or "bias" in gate
+            or len(_projection_tensors(gate)) != 3 or not all(_rows_packed(t) for t in _projection_tensors(gate))
+            or not _qwen4_inject_qmv(gate, 1, hidden, mx.bfloat16) or "_shared_expert_scale" in block.__dict__
+            or not isinstance(block.gate, nn.QuantizedLinear) or block.gate.weight.shape[0] != 512
+            or block.gate.training or "bias" in block.gate or len(_projection_tensors(block.gate)) != 3
+            or block.gate.scales.dtype != mx.bfloat16 or block.gate.biases.dtype != mx.bfloat16):
+        return None
+    router = block.gate
+    if rows > 1 and (router.bits != 8 or router.group_size != 64 or router.mode != "affine"
+                     or not all(_rows_packed(t) for t in _projection_tensors(router))
+                     or router.weight.dtype != mx.uint32 or router.weight.shape != (block.num_experts, hidden // 4)
+                     or router.scales.shape != (block.num_experts, hidden // 64)
+                     or router.biases.shape != router.scales.shape):
+        return None
+    return _PlainMoE(block, experts, bindings, rows)
+
+
 class _RoutedExperts:
     """A sparse block's routed experts on the decode kernels, for unsorted routes outside the short-block band."""
 
@@ -3451,10 +5315,59 @@ class _RoutedExperts:
         self.decode_block, self.bindings = decode_block, bindings
         self.verdicts = {}
         self.layout = (None, False)
+        self.plain_plan = None
+        self.plain_built = False
+        self.plain_enabled = False
+        self.verify_enabled = False
+        self.verify_plans = {}
+        self.verify_context = None
+        self.shared = None
 
-    def __call__(self, block, x, inds, scores, shared, s):
+    def plain(self, block, x, native):
+        if (x.ndim != 3 or x.shape[:2] != (1, 1) or block.training
+                or "_unsloth_speculative_call" in block.__dict__):
+            return None
+        if not self.plain_built:
+            self.plain_built = True
+            try:
+                self.plain_plan = _plain_moe_plan(block, self)
+            except (RuntimeError, ValueError, TypeError) as error:
+                _unless_failed_buffer(error)
+                logger.warning("the plain MoE plan cannot be built; the native graph stays in use: %s", error)
+        if self.plain_plan is None:
+            return None
+        output = self.plain_plan(block, x, native)
+        return native() if output is None else output
+
+    def verify(self, block, x, native, verifier = None):
+        if x.ndim != 3 or x.shape[0] != 1 or not 1 < x.shape[1] <= _VERIFY_FUSED_ROWS or block.training:
+            return None
+        if verifier is not None and not _moe_verifier_matches(verifier, self):
+            return native()
+        rows = x.shape[1]
+        if rows not in self.verify_plans:
+            try:
+                existing = next((plan for plan in self.verify_plans.values() if plan is not None), None)
+                if existing is not None and any(_stock_call(p, rows) is not _stock_call(p, existing.shape[1])
+                                                for p in existing.projections):
+                    existing = None   # Fast Verify's lane kernel holds this width's projections
+                self.verify_plans[rows] = (existing.for_rows(rows) if existing is not None else
+                                           _plain_moe_plan(block, self, rows))
+            except (RuntimeError, ValueError, TypeError) as error:
+                _unless_failed_buffer(error)
+                self.verify_plans[rows] = None
+        plan = self.verify_plans[rows]
+        if plan is None:
+            return None  # main's admitted routed path
+        output = plan(block, x, native)
+        return native() if output is None else output
+
+    def _tensors(self, block, x):
         mlp = block.switch_mlp
+        pack = getattr(mlp, "_unsloth_moe_gate_up", None)
         if (mlp is not self.mlp or mlp.training or (x.ndim == 3 and 1 < x.shape[1] <= self.decode_block)
+                or (self.plain_enabled and pack is not None and (type(pack) is not _PackedMoEGateUp or type(pack).__mro__ != _MOE_PACK_MRO))
+                or (type(mlp) in _MOE_GENERATED_CALLS and (type(mlp).__call__, type(mlp).__mro__) != _MOE_GENERATED_CALLS[type(mlp)])
                 or not _bindings_intact(self.bindings)):
             return None
         if type(mlp) not in self.classes:
@@ -3469,22 +5382,102 @@ class _RoutedExperts:
         key = tuple(id(t) for group in tensors for t in group)
         if self.layout[0] != key:
             self.layout = (key, all(_expert_rows_packed(t) for group in tensors for t in group))
-        if not self.layout[1]:
+        return tensors if self.layout[1] else None
+
+    def __call__(self, block, x, inds, scores, shared, s):
+        tensors = self._tensors(block, x)
+        if tensors is None:
             return None
         verdict = self.verdicts.get(x.dtype)
         if verdict is None:
             verdict = self.verdicts[x.dtype] = self._verified(x.dtype, inds.shape[-1])
         if not verdict:
             return None
-        return self._run(tensors, x, inds, scores, shared, s)
+        return self._run(tensors, x, inds, scores, shared, s, select = "_unsloth_speculative_call" in block.__dict__)
 
-    def _run(self, tensors, x, inds, scores, shared, s):
-        gate, up, down = self.mlp.gate_proj, self.mlp.up_proj, self.mlp.down_proj
-        activations = _routed_gate_up(x, inds, tensors[0], tensors[1], gate.group_size, gate.bits, gate.mode)
-        if activations is None:
+    def folded(self, block, x, inds, scores, shared):
+        """What `__call__` returns for `s = block.shared_expert(x)`, computed in the routed launches, or None. Only a
+        speculative call folds: its rows are the same bits, and a plain decode keeps stock's launch count."""
+        if "_unsloth_speculative_call" not in block.__dict__:
             return None
-        return _routed_down(activations, inds, scores, shared, s, tensors[2],
-                                   down.group_size, down.bits, down.mode)
+        expert = getattr(block, "shared_expert", None)
+        tensors = self._tensors(block, x)
+        if (nax._nax_gpu() or tensors is None or inds.size > _FOLD_ROWS * inds.shape[-1] or expert is None or expert.training):
+            return None
+        bindings = _shared_expert_bindings(type(expert))
+        if bindings is None or not _bindings_intact(bindings):
+            return None
+        projections = (expert.gate_proj, expert.up_proj, expert.down_proj)
+        mlp = self.mlp
+        quant = (mlp.gate_proj.group_size, mlp.gate_proj.bits, mlp.gate_proj.mode)
+        if (quant[1] != 4 or quant[2] != "affine" or any(not isinstance(p, nn.QuantizedLinear) or "bias" in p or (
+                hasattr(type(p), "_unsloth_lane_native") and not _lane_low(p, x.size // x.shape[-1])) for p in projections)):
+            return None
+        common = tuple(map(_projection_tensors, projections))
+        if not all(_rows_packed(t) for group in common for t in group):
+            return None
+        signature = (x.dtype, inds.shape[-1], self.base, *(tuple(map(_key, t)) for t in (*tensors, *common)), quant,
+                     *(type(p).__call__ for p in projections))
+        if signature not in _MOE_FOLD_VERDICTS:
+            _MOE_FOLD_VERDICTS[signature] = self._fold_probe(block, tensors, common, x.dtype, inds.shape[-1])
+        return self._fold(tensors, common, x, inds, scores, shared) if _MOE_FOLD_VERDICTS[signature] else None
+
+    def _fold(self, tensors, common, x, inds, scores, shared):
+        gate = self.mlp.gate_proj
+        plan = _fold_plan(*map(_key, (x, inds, scores, shared)), *(tuple(tuple(map(_key, t)) for t in g) for g in (tensors, common)),
+                          gate.group_size, gate.bits)
+        if plan is None:
+            return None
+        activations = plan[0](*tensors[0], *tensors[1], *common[0], *common[1], x, inds)
+        return plan[1](*tensors[2], *common[2], activations, inds, scores, shared)
+
+    def _fold_probe(self, block, tensors, common, dtype, top_k):
+        _staged_ready()
+        gate = self.mlp.gate_proj
+        experts, width = gate.weight.shape[0], gate.scales.shape[-1] * gate.group_size
+        for rows in (1, _FOLD_ROWS):
+            kx, ki, kw, kg = mx.random.split(mx.random.key(rows), 4)
+            x = mx.random.normal((rows, 1, width), key = kx).astype(dtype)
+            inds = mx.random.randint(0, experts, (rows, 1, top_k), key = ki).astype(mx.uint32)
+            scores = mx.softmax(mx.random.normal((rows, 1, top_k), key = kw), axis = -1).astype(dtype)
+            shared = mx.sigmoid(mx.random.normal((rows, 1, 1), key = kg)).astype(dtype)
+            fused = self._fold(tensors, common, x, inds, scores, shared)
+            if fused is None:
+                return False
+            y = self.base.__call__(self.mlp, x, inds)
+            s = mx.concatenate([block.shared_expert(x[i : i + 1]) for i in range(rows)])
+            native = (y * scores[..., None]).sum(axis = -2) + shared * s
+            if not _settled(fused.dtype == native.dtype and bool(mx.array_equal(fused, native, equal_nan = True))):
+                logger.warning("the folded shared expert does not reproduce this MLX build's native experts; "
+                               "its own launches stay in use")
+                return False
+        return True
+
+    def _run(self, tensors, x, inds, scores, shared, s, select = False):
+        gate, up, down = self.mlp.gate_proj, self.mlp.up_proj, self.mlp.down_proj
+
+        def routed():
+            activations = _routed_gate_up(x, inds, tensors[0], tensors[1], gate.group_size, gate.bits, gate.mode)
+            if activations is None:
+                return None
+            return _routed_down(activations, inds, scores, shared, s, tensors[2],
+                                down.group_size, down.bits, down.mode)
+
+        rows = inds.size // inds.shape[-1]
+        raced = rows > _ROUTED_ROWS_WITHOUT_NAX
+        if (select and gate.mode == "affine" and (raced or rows * gate.bits >= _GROUPED_ROW_BITS_WITH_NAX and nax._nax_gpu())
+                and len({(p.group_size, p.bits, p.mode) for p in (gate, up, down)}) == 1):
+            key = (self.base, *map(_key, (x, inds, scores, shared, s)),
+                   tuple(tuple(map(_key, t)) for t in tensors), gate.group_size, gate.bits)
+            grouped = lambda: _grouped_routed(x, inds, scores, shared, s, tensors, gate.group_size, gate.bits)
+            if key not in _MOE_GROUPED_CHOICES:
+                try:
+                    _MOE_GROUPED_CHOICES[key] = _grouped_routed_faster(routed, grouped, race = raced)
+                except ValueError:  # inside a function transformation, which cannot evaluate; raced later
+                    return routed()
+            if _MOE_GROUPED_CHOICES[key]:
+                return grouped()
+        return routed()
 
     def _verified(self, dtype, top_k):
         mlp = self.mlp
@@ -3499,6 +5492,7 @@ class _RoutedExperts:
         return _MOE_ROUTED_VERDICTS[signature]
 
     def _probe(self, dtype, top_k):
+        _staged_ready()
         mlp = self.mlp
         tensors = tuple(map(_projection_tensors, (mlp.gate_proj, mlp.up_proj, mlp.down_proj)))
         experts, hidden = mlp.gate_proj.weight.shape[0], mlp.down_proj.weight.shape[1]
@@ -3536,22 +5530,35 @@ def _moe_routed_experts(block):
         functions[f"{base.__name__}._combine"] = "fe6e29351fdc9b1e"
     routed_bindings = _resolved_bindings({base.__module__: functions, **_CONV_SILU_CONTRACT})
     native = sys.modules[base.__module__]
-    if routed_bindings is None or type(getattr(mlp, "activation", None)) is not native.SwiGLU:
+    family = getattr(type(block), "_unsloth_router_native", type(block))
+    router = _moe_router_class(family)
+    plain = family.__module__ == "mlx_vlm.models.qwen4_exp.language"
+    bindings = _moe_contract_bindings(bindings, routed_bindings,
+                                     _moe_generated_bindings(router[0]) if router is not None else None,
+                                     _MOE_PACK_BINDINGS if plain else ())
+    if bindings is None or type(getattr(mlp, "activation", None)) is not native.SwiGLU:
         return None
-    return _RoutedExperts(mlp, base, projection_type, native.SwiGLU, decode_block, bindings + routed_bindings)
+    routed = _RoutedExperts(mlp, base, projection_type, native.SwiGLU, decode_block, bindings)
+    routed.plain_enabled = plain
+    routed.verify_enabled = routed.plain_enabled and os.environ.get("UNSLOTH_MLX_VERIFY_MOE", "1") != "0"
+    return routed
 
 
-# MLX multiplies and sums in the array dtype, in route order; the kernel rounds at the same two places.
-# Single precision is left native: its sum does not round like a sequential one.
+# MLX multiplies in the array dtype, then sums the routes in the array dtype over eight lanes (route k into lane k % 8,
+# in order), adding the lanes in order; the kernel rounds at the same places. Single precision is left native.
 _MOE_COMBINE_DTYPES = (mx.bfloat16, mx.float16)
 _MOE_COMBINE_MAX_ELEMENTS = 1 << 32
 _MOE_COMBINE_SOURCE = """
     uint token = thread_position_in_grid.y;
     uint d = thread_position_in_grid.x;
-    T acc = T(0);
+    T lanes[8] = {T(0), T(0), T(0), T(0), T(0), T(0), T(0), T(0)};
     for (uint k = 0; k < K; ++k) {
         uint route = token * K + k;
-        acc = T(float(acc) + float(T(float(y[rows[route] * D + d]) * float(scores[route]))));
+        lanes[k % 8] = T(float(lanes[k % 8]) + float(T(float(y[rows[route] * D + d]) * float(scores[route]))));
+    }
+    T acc = T(0);
+    for (uint lane = 0; lane < 8; ++lane) {
+        acc = T(float(acc) + float(lanes[lane]));
     }
     out[token * D + d] = acc;
 """
@@ -3576,6 +5583,7 @@ def _run_moe_combine(y, inv_order, scores):
 
 @functools.cache
 def _moe_combine_verified(dtype, top_k, width):
+    _staged_ready()
     for tokens in (1, 67):
         routes = tokens * top_k
         y = (mx.random.normal((routes, 1, width), key = mx.random.key(tokens)) * 3).astype(dtype)
@@ -3619,6 +5627,11 @@ def _qwen3_5_moe_call(native, scaled_shared, top_k_norm):
         if target_verify or self.training or getattr(self, "sharding_group", None) is not None:
             return native(self, x, target_verify) if target_verify else native(self, x)
         normalize = bool(self.norm_topk_prob) if top_k_norm else True
+        experts = getattr(self, "_unsloth_moe_routed", None)
+        if experts is not None and experts.plain_enabled:
+            out = experts.plain(self, x, lambda: native(self, x))
+            if out is not None:
+                return out
         logits = self.gate(x)
         experts = getattr(self, "_unsloth_moe_routed", None)
         # Fold the shared-gate sigmoid into the routing launch only where the routed kernel consumes it.
@@ -3634,6 +5647,10 @@ def _qwen3_5_moe_call(native, scaled_shared, top_k_norm):
                 return native(self, x)
             routed += (None,)
         inds, scores, shared_scale = routed
+        if shared_scale is not None and experts is not None and inds.size < _MOE_UNSORTED_ROUTES:
+            out = experts.folded(self, x, inds, scores, shared_scale)
+            if out is not None:
+                return out
         shared_y = self.shared_expert(x)
         if gate is not None and shared_scale is None:
             shared_scale = mx.sigmoid(gate)
@@ -3709,9 +5726,16 @@ def _moe_router_class(base):
         return None
     if spec is None or call.__globals__.get("mx") is not mx:
         return None
+    owner = next(cls for cls in base.__mro__ if "__call__" in vars(cls))
+    bindings = _resolved_bindings({owner.__module__: {f"{owner.__name__}.__call__": tuple(_MOE_ROUTER_BODIES)}})
+    if bindings is None or not _bindings_intact(bindings):
+        return None
+    bindings += list(_moe_dispatch_bindings((base,), ("__call__",), follow = False))
     build, mode, experts_path, top_k_path = spec
     patched = type(f"_FusedMoERouter{base.__name__}", (base,),
                    {"__call__": build(call), "_unsloth_router_native": base})
+    _MOE_GENERATED_CALLS[patched] = (patched.__call__, patched.__mro__)
+    _MOE_GENERATED_BINDINGS[patched] = tuple(bindings)
     return patched, mode, experts_path, top_k_path
 
 
@@ -3755,7 +5779,7 @@ def fused_moe_router(model, *, _modules = None):
                             changed.append(module)
                         continue
                     spec = _moe_router_class(base)
-                    if spec is None:
+                    if spec is None or _moe_generated_bindings(spec[0]) is None:
                         continue
                     patched, mode, experts_path, top_k_path = spec
                     experts = _resolve_dotted(module, experts_path)
@@ -3843,7 +5867,8 @@ _NAX_SORTED_GATHER_VERIFIED = {}
 
 
 class _SmallRowRoute(NamedTuple):
-    """A small-row kernel, by its module and the prefix its functions share there (resolved at call time)."""
+    """A small-row kernel, by its module and the prefix its functions share there (resolved at call time);
+    its module state lives under `_unsloth_{state}_*`."""
     module: object
     kernel: str
     tag: str
@@ -3852,27 +5877,34 @@ class _SmallRowRoute(NamedTuple):
     gap: str
     probe: tuple
     takes_blocks: bool   # whether one sequence's [1, T, K] block routes
+    state: str = "nax_qmm"
+    reader: str = None
+    code_offset: bool = False   # the kernel may fold `s * (sum x (2^bits + q) - 2^bits * sum x)` out of each group
 
     def call(self, suffix, *args):
-        return getattr(self.module, self.kernel + suffix)(*args)
+        kernel = getattr(self.module, self.kernel + suffix)
+        return kernel(*args, reader = self.reader) if self.reader and not suffix else kernel(*args)
 
 
 _NAX_QMM_ROUTE = _SmallRowRoute(nax, "small_m_qmm", "Nax", "NAX", "UNSLOTH_MLX_NAX_QMM", "small_m_qmm",
                                 ("QMM_PROBE_KEY", "probe_small_m_qmm"), True)
 # Leaves single-sequence blocks native: Auto depth drafts those shallow, where a few-row verify gains nothing.
-_SIMD_QMM_ROUTE = _SmallRowRoute(qmm, "simd_qmm", "Simd", "SIMD small-row", "UNSLOTH_MLX_SIMD_QMM",
+_SIMD_QMM_ROUTE = _SmallRowRoute(matmul, "simd_qmm", "Simd", "SIMD small-row", "UNSLOTH_MLX_SIMD_QMM",
                                  "small_m_qmm_simd", ("SIMD_QMM_PROBE_KEY", "probe_simd_qmm"), False)
+_LANE_QMM_ROUTE = _SmallRowRoute(matmul, "lane_qmm", "Lane", "row-invariant lane", "UNSLOTH_MLX_LANE_QMM", None,
+                                 ("LANE_QMM_PROBE_KEY", "probe_lane_qmm"), True, "lane_qmm", code_offset = True)
 
 
 def _small_row_route():
     """The small-row kernel this GPU runs, or None: stock's NAX kernels decide, not `UNSLOTH_MLX_NAX`."""
     if nax.nax_available():
         return _NAX_QMM_ROUTE
-    return _SIMD_QMM_ROUTE if qmm.simd_qmm_available() else None
+    return _SIMD_QMM_ROUTE if matmul.simd_qmm_available() else None
 
 
-def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed):
-    """Compare the kernel with stock's fp32 qmv of each row, within fp32 reordering of K products.
+def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed, code_offset = False):
+    """Compare the kernel with stock's fp32 qmv of each row, within fp32 reordering of K products, and with
+    `code_offset` of the kernel's offset terms too.
 
     A batched native call is no reference: its qmm rounds dequantized weights to the input dtype.
     """
@@ -3882,26 +5914,29 @@ def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed):
                                                  group_size = group_size, bits = bits)
     rows = range(x.shape[0])
     reference = mx.concatenate([row(i, x32, scales32, biases32) for i in rows])
-    # |s q + b| <= |s| q + |b|, so this is a bound on sum_k |x_k w_k|.
-    magnitude = mx.concatenate([row(i, mx.abs(x32), mx.abs(scales32), mx.abs(biases32)) for i in rows])
+    # |s q + b| <= |s| q + |b|, so this is a bound on sum_k |x_k w_k|; a folded offset adds |s| 2^(bits + 1) |x_k|,
+    # which a column of zero codes under a nonzero scale leaves as the whole error.
+    spread = mx.abs(biases32) + (2.0 ** (bits + 1) if code_offset else 0.0) * mx.abs(scales32)
+    magnitude = mx.concatenate([row(i, mx.abs(x32), mx.abs(scales32), spread) for i in rows])
     got = routed.astype(mx.float32)
     bound = mx.finfo(x.dtype).eps * mx.abs(reference) + x.shape[-1] * 2.0 ** -23 * magnitude
     agree = (mx.abs(got - reference) <= bound) | (got == reference) | (mx.isnan(got) & mx.isnan(reference))
     return bool(mx.all(agree).item())
 
 
-def _nax_small_m_qmm(module, x, bindings):
+def _nax_small_m_qmm(module, x, bindings, route = None, rows = None):
     """The small-row kernel's result for this call, or None when it takes the native call."""
+    route = route or module._unsloth_nax_qmm_route
     # A verified shape for this weight layout skips the checks (they cost more host time than a few rows save).
-    ready = module.__dict__.get("_unsloth_nax_qmm_ready", {}).get(x.shape) if type(x) is mx.array else None
+    ready = module.__dict__.get(f"_unsloth_{route.state}_ready", {}).get(x.shape) if type(x) is mx.array else None
     if ready is not None and not module.training and _bindings_intact(bindings):
         w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
         if (type(w) is type(scales) is type(biases) is mx.array and ready[1] == (
                 x.dtype, w.dtype, w.shape, scales.dtype, scales.shape, biases.dtype, biases.shape,
                 module.group_size, module.bits, module.mode)):
-            return module._unsloth_nax_qmm_route.call("", x.reshape(ready[0], -1), w, scales, biases,
-                                                      module.group_size, module.bits).reshape(*x.shape[:-1], -1)
-    low, high = module._unsloth_nax_qmm_rows
+            return route.call("", x.reshape(ready[0], -1), w, scales, biases,
+                              module.group_size, module.bits).reshape(*x.shape[:-1], -1)
+    low, high = rows or module._unsloth_nax_qmm_rows
     if not isinstance(x, mx.array) or x.ndim < 2 or not x.shape[-1] or not low <= x.size // x.shape[-1] <= high:
         return None
     if module.training or not _bindings_intact(bindings):
@@ -3911,7 +5946,7 @@ def _nax_small_m_qmm(module, x, bindings):
         return None
     N, K = w.shape[0], x.shape[-1]
     M = x.size // K
-    group_size, bits, route = module.group_size, module.bits, module._unsloth_nax_qmm_route
+    group_size, bits = module.group_size, module.bits
     if (not route.call("_supported", N, K, group_size, bits, module.mode)
             or x.dtype not in (mx.bfloat16, mx.float16) or not x.dtype == scales.dtype == biases.dtype
             or w.dtype != mx.uint32 or w.shape != (N, K * bits // 32)
@@ -3920,19 +5955,21 @@ def _nax_small_m_qmm(module, x, bindings):
     # Every kernel variant a call can select is checked on its own first use; a ragged row count
     # selects the bounds-checked one.
     geometry = route.call("_geometry", M, N, K, group_size)
-    key = (N, K, bits, group_size, x.dtype, geometry, M % geometry[0] == 0)
+    key = (route.tag, N, K, bits, group_size, x.dtype, geometry, M % geometry[0] == 0)
     verified = _NAX_QMM_VERIFIED.get(key)
     if verified is False:
         return None
     flat = x.reshape(M, K)
     routed = route.call("", flat, w, scales, biases, group_size, bits)
     if verified is None:
+        _staged_ready()
         try:
-            verified = _settled(_nax_qmm_matches_native(flat, w, scales, biases, group_size, bits, routed))
+            verified = _settled(_nax_qmm_matches_native(flat, w, scales, biases, group_size, bits, routed,
+                                                        route.code_offset))
         except (RuntimeError, ValueError) as error:
             _unless_failed_buffer(error)
             return None  # inside a function transformation, which cannot evaluate; checked later
-        if verified and not any(_NAX_QMM_VERIFIED.values()):
+        if verified and not any(v for k, v in _NAX_QMM_VERIFIED.items() if k[0] == route.tag):
             logger.info("small-batch quantized projections now run on the %s kernel; "
                         "%s=0 keeps the native call", route.label, route.switch)
         _NAX_QMM_VERIFIED[key] = verified
@@ -3942,7 +5979,7 @@ def _nax_small_m_qmm(module, x, bindings):
                            group_size, x.dtype)
     if not verified:
         return None
-    module.__dict__.setdefault("_unsloth_nax_qmm_ready", {})[x.shape] = (
+    module.__dict__.setdefault(f"_unsloth_{route.state}_ready", {})[x.shape] = (
         M, (x.dtype, w.dtype, w.shape, scales.dtype, scales.shape, biases.dtype, biases.shape, group_size, bits,
             module.mode))
     return routed.reshape(*x.shape[:-1], N)
@@ -3999,6 +6036,7 @@ def _nax_verified_int8_qmm(key, flat, w, scales, biases, group_size, bits, indic
         routed = nax.int8_gather_qmm(flat, w, scales, biases, indices, bits, token_rows)
     if verified is None:
         rows = flat if token_rows is None else flat[token_rows]
+        _staged_ready()
         try:
             verified = _settled(_nax_int8_qmm_matches_native(rows, w, scales, biases, group_size, bits, routed,
                                                              indices))
@@ -4032,11 +6070,24 @@ def _nax_int8_prefill_dense(module, x, bindings):
     return None if routed is None else routed.reshape(*x.shape[:-1], N)
 
 
+class _NaxOwner:
+    """Shared by a routed switch projection and the tables copied from it; their routes run while a scope holds it."""
+    __slots__ = ("live", "holders")
+
+    def __init__(self):
+        self.live, self.holders = True, 0
+
+
+def _nax_held(module):
+    token = module.__dict__.get("_unsloth_nax_owner")
+    return token is not None and token.live
+
+
 def _nax_gather_rows(owner, flag, x, w, indices, sorted_indices, bindings, token_rows):
     """The sorted rows of a gathered call that the NAX route `flag` enables on `owner` may take, or 0."""
     if not sorted_indices or not isinstance(x, mx.array) or x.ndim != 3 or x.shape[1] != 1:
         return 0
-    if not getattr(owner, flag, False) or owner.training:
+    if not getattr(owner, flag, False) or owner.training or not _nax_held(owner):
         return 0
     if bindings is not None and not _bindings_intact(bindings):
         return 0
@@ -4082,6 +6133,7 @@ def _nax_sorted_gather(owner, x, w, scales, biases, indices, sorted_indices, gro
         return None
     routed = nax.sorted_gather_qmm(x.reshape(-1, K), w, scales, biases, indices, bits, token_rows).reshape(T, 1, N)
     if verified is None:
+        _staged_ready()
         try:
             native = mx.gather_qmm(x if token_rows is None else x[token_rows], w, scales, biases, rhs_indices = indices,
                                    transpose = True, group_size = group_size, bits = bits, sorted_indices = True)
@@ -4147,7 +6199,7 @@ def _nax_qmm_classes(route, *cache_key):
         routed = _nax_small_m_qmm(self, x, bindings)
         return nn.QuantizedEmbedding.as_linear(self, x) if routed is None else routed
 
-    _ONE_ROW_STOCK_CALLS.add(linear)   # the small-row routes start at two rows
+    _ONE_ROW_STOCK_CALLS.update((linear, as_linear))   # the small-row routes start at two rows
     return {
         base: type(f"_{route.tag}SmallM{base.__name__}", (base,),
                    {name: method, "_unsloth_nax_qmm_native": base, "_unsloth_nax_qmm_route": route,
@@ -4189,18 +6241,52 @@ def _nax_switch_classes():
             swapped = _nax_switch_class(base, base.__call__, path)
             if swapped is not None:
                 classes[base] = swapped
+                slot = offload.slot_class(base)
+                classes[slot] = _nax_slot_class(slot, swapped)
     return classes
 
 
-def _nax_qmm_row_range(module, route):
-    """The rows at which this module's calls take the route's kernel, or None when none ever would."""
+@functools.cache
+def _nax_slot_class(slot, swapped):
+    # Offloaded experts' slot projections: the offload rule for sorted calls applies before the routes see them.
+    return type(f"_NaxGather{slot.__name__}", (offload.slot_class(swapped),), {"_unsloth_nax_qmm_native": slot})
+
+
+def _nax_modules(model, modules):
+    """`_fusion_modules`, plus the expert projections offloaded experts run outside the module tree."""
+    for path, module in _fusion_modules(model, modules):
+        yield path, module
+        if isinstance(module, offload.OffloadSwitchGLU):
+            yield from ((path, projection) for projection in module.projections())
+
+
+def _nax_restore(module):
+    native = getattr(type(module), "_unsloth_nax_qmm_native", None)
+    if native is not None:
+        module.__class__ = native
+    for name in ("_unsloth_nax_qmm_scopes", "_unsloth_nax_qmm_floor", "_unsloth_nax_qmm_ceiling",
+                 "_unsloth_nax_qmm_next", "_unsloth_nax_int8_prefill_rows",
+                 "_unsloth_nax_int8_prefill", "_unsloth_nax_sorted_gather", "_unsloth_nax_qmm_ready",
+                 "_unsloth_nax_owner"):
+        module.__dict__.pop(name, None)
+    module.pop("_unsloth_nax_qmm_rows", None)   # a tuple is stored in the module mapping
+
+
+def _nax_qmm_shape(module, route):
+    """The `(N, K)` of this module's weight when the route's kernel covers it, else None."""
     weight = module.get("weight")
     if module.training or not isinstance(weight, mx.array) or weight.ndim != 2 or module.get("biases") is None:
         return None
     N, K = weight.shape[0], weight.shape[1] * 32 // module.bits
-    if not route.call("_supported", N, K, module.group_size, module.bits, module.mode):
+    return (N, K) if route.call("_supported", N, K, module.group_size, module.bits, module.mode) else None
+
+
+def _nax_qmm_row_range(module, route):
+    """The rows at which this module's calls take the route's kernel, or None when none ever would."""
+    shape = _nax_qmm_shape(module, route)
+    if shape is None:
         return None
-    low, high = route.call("_row_range", N, K, module.group_size, module.bits)
+    low, high = route.call("_row_range", *shape, module.group_size, module.bits)
     return (low, high) if low <= high else None
 
 
@@ -4263,7 +6349,7 @@ def int8_prefill_available(model):
         return Int8PrefillStatus(False, "distributed", 0)
     classes = _nax_qmm_classes(_NAX_QMM_ROUTE, nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
     switches, packed = _nax_switch_classes(), _nax_int8_prefill_packed(model)
-    modules = {id(module): module for _, module in model.named_modules()} if hasattr(model, "named_modules") else {}
+    modules = {id(module): module for _, module in _nax_modules(model, None)}
     return _int8_prefill_status(sum(bool(_nax_int8_prefill_route(module, classes, switches, packed))
                                     for module in modules.values()))
 
@@ -4327,10 +6413,10 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
     training and other quantizations keep the native call. `UNSLOTH_MLX_NAX_QMM=0` turns the route off.
 
     Where stock MLX has no NAX kernels (the GPUs before M5), 4- and 8-bit projections take the
-    small-row kernels of `qmm` under their own row table and the same first-use check;
+    small-row kernels of `matmul` under their own row table and the same first-use check;
     `UNSLOTH_MLX_SIMD_QMM=0` turns that route off.
 
-    `int8_prefill=True`, or `UNSLOTH_MLX_INT8_PREFILL=1` when it is None, also runs affine 3- to
+    `int8_prefill=True`, or `UNSLOTH_MLX_INT8_PREFILL=1` when it is None, also runs affine 2- to
     8-bit linears and routed experts with int8 activations: faster, but lossy enough to raise the
     loss of precision-sensitive checkpoints. Linears route from 17 rows, so batched decoding of 17
     or more sequences and wider speculative verification also run int8. The outermost scope
@@ -4339,7 +6425,7 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
     Sorted routed-expert projections run on a NAX gather kernel that reproduces `mx.gather_qmm`
     bit for bit where it is measured faster; `UNSLOTH_MLX_NAX_SORTED_GATHER=0` turns it off.
     """
-    changed, tracked = [], hasattr(model, "__dict__")
+    changed, held, owners, released, tracked = [], {}, [], set(), hasattr(model, "__dict__")
     try:
         with _NAX_QMM_LOCK:
             depth, outer = getattr(model, "__dict__", {}).get("_unsloth_nax_int8_prefill_scope", (0, None))
@@ -4361,13 +6447,19 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                 switches = _nax_switch_classes() if int8_prefill or sorted_gather else {}
                 packed = _nax_int8_prefill_packed(model) if int8_prefill else set()
                 nested, fresh, seen = [], [], set()
-                for _, module in _fusion_modules(model, _modules):
+                for _, module in _nax_modules(model, _modules):
                     if id(module) in seen:   # named_modules() yields a shared module once per path
                         continue
                     seen.add(id(module))
                     base = type(module)
+                    # A routed copy whose owner is gone (outlived its scopes, or copied as they exited) starts afresh.
+                    if base in switches.values() and not _nax_held(module):
+                        _nax_restore(module)
+                        base = type(module)
+                    if base is offload.OffloadSwitchGLU:
+                        owners.append(module)
                     if base in classes.values() or base in switches.values():
-                        if getattr(module, "_unsloth_nax_qmm_scopes", 0):
+                        if getattr(module, "_unsloth_nax_qmm_scopes", 0) or "_unsloth_nax_owner" in vars(module):
                             nested.append(module)
                     elif base in classes:
                         rows = _nax_qmm_row_range(module, route) if small_m else None
@@ -4394,10 +6486,14 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                 tiled = any(rows is not None for _, rows, _, _ in fresh) and _tiled_prefill_enabled()
                 for module, rows, int8_prefill_rows, gather in fresh:
                     if type(module) in switches:
-                        if int8_prefill_rows:
-                            module._unsloth_nax_int8_prefill = True
-                        if gather:
-                            module._unsloth_nax_sorted_gather = True
+                        module._unsloth_nax_owner = _NaxOwner()   # inherited by the tables copied from it
+                        # Cleared as well as set: a table copied mid-swap on another thread may carry stale flags.
+                        for flag, on in (("_unsloth_nax_int8_prefill", int8_prefill_rows),
+                                         ("_unsloth_nax_sorted_gather", gather)):
+                            if on:
+                                module.__dict__[flag] = True
+                            else:
+                                module.__dict__.pop(flag, None)
                         module.__class__ = switches[type(module)]
                         continue
                     module._unsloth_nax_qmm_rows = (0, -1) if rows is None else rows
@@ -4411,6 +6507,11 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                         module._unsloth_nax_int8_prefill_rows = int8_prefill_rows
                     module.__class__ = classes[type(module)]
                 for module in nested + [entry[0] for entry in fresh]:
+                    token = module.__dict__.get("_unsloth_nax_owner")
+                    if token is not None:
+                        token.holders += token not in held
+                        held.setdefault(token, []).append(module)
+                        continue
                     module._unsloth_nax_qmm_scopes = getattr(module, "_unsloth_nax_qmm_scopes", 0) + 1
                     changed.append(module)
         yield model
@@ -4425,26 +6526,31 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                 if scopes > 1:
                     module._unsloth_nax_qmm_scopes = scopes - 1
                     continue
-                native = getattr(type(module), "_unsloth_nax_qmm_native", None)
-                if native is not None:
-                    module.__class__ = native
-                for name in ("_unsloth_nax_qmm_scopes", "_unsloth_nax_qmm_floor", "_unsloth_nax_qmm_ceiling",
-                             "_unsloth_nax_qmm_next", "_unsloth_nax_int8_prefill_rows",
-                             "_unsloth_nax_int8_prefill", "_unsloth_nax_sorted_gather", "_unsloth_nax_qmm_ready"):
-                    module.__dict__.pop(name, None)
-                module.pop("_unsloth_nax_qmm_rows", None)   # a tuple is stored in the module mapping
+                _nax_restore(module)
+            for token, modules in held.items():
+                token.holders -= 1
+                if not token.holders:
+                    token.live = False
+                    released.add(token)
+                    for module in modules:
+                        _nax_restore(module)
+            for owner in owners:
+                for projection in owner.projections():
+                    if projection.__dict__.get("_unsloth_nax_owner") in released:
+                        _nax_restore(projection)
 
 
 _DENSE_QMM_CONTRACT = {"mlx.nn.layers.quantized": {"QuantizedLinear.__call__": "ca5cafb6d038d955"}}
 _DENSE_QMM_LOCK = RLock()
 _DENSE_QMM_VERIFIED = {}
+_STAGED_QMM_VERIFIED = {}
 _DENSE_QMM_MIN_ROWS = 1024
 # MLX's quantized and dense matmuls each split the sum over K for small outputs, by different rules,
 # and then round differently; at or below this many 16x16 output tiles the comparison would mostly fail.
 _DENSE_QMM_MIN_TILES = 4096
 # The dequantized weight is a transient the size of the float layer; a vocabulary head would be gigabytes.
 _DENSE_QMM_MAX_WEIGHTS = 1 << 28
-_DENSE_QMM_DISPATCH_MLX = ("0.32.3", "0.32.4")  # 0.32.4's thin NAX case needs N <= 64, so M > 16384 here
+_DENSE_QMM_DISPATCH_MLX = ("0.32.4",)  # 0.32.4's thin NAX case needs N <= 64, so M > 16384 here
 
 
 def _dense_qmm_rows(M, N, K):
@@ -4473,7 +6579,7 @@ _TILED_QMM_SOURCE = """
 TILED_QMM_PROBE_KEY = "tiled_qmm:" + hashlib.sha256(
     _TILED_QMM_SOURCE.format(template = "", **_TILED_QMM_TILE).encode()).hexdigest()[:12]
 # Releases whose quantized matmul dispatch `_tile_shape_loses` keeps clear of split-K and qmv.
-_TILED_QMM_DISPATCH_MLX = ("0.32.3", "0.32.4")
+_TILED_QMM_DISPATCH_MLX = ("0.32.4",)
 # Stock may run qmv up to 32 rows, and fewer rows pad one 64-row tile past stock's 32-row one.
 _TILED_QMM_MIN_ROWS = _TILED_QMM_TILE["BM"] // 2 + 1
 
@@ -4574,8 +6680,8 @@ def _tiled_prefill_enabled():
             or mx.__version__ not in _TILED_QMM_DISPATCH_MLX):
         return False
     # Where stock runs its NAX kernels (another tile and K order) it keeps them, whatever `UNSLOTH_MLX_NAX` says.
-    return (qmm.simd_qmm_available() and _tiled_qmm_kernel() is not None and nax.kernel_probe_passed(
-        TILED_QMM_PROBE_KEY, __name__, "probe_tiled_qmm", qmm.simd_qmm_available))
+    return (matmul.simd_qmm_available() and _tiled_qmm_kernel() is not None and nax.kernel_probe_passed(
+        TILED_QMM_PROBE_KEY, __name__, "probe_tiled_qmm", matmul.simd_qmm_available))
 
 
 def _dense_prefill_qmm(module, x, bindings):
@@ -4590,12 +6696,18 @@ def _dense_prefill_qmm(module, x, bindings):
         return None
     if not isinstance(x, mx.array) or x.ndim < 2 or x.dtype not in (mx.bfloat16, mx.float16) or not x.shape[-1]:
         return None
+    if x.size == x.shape[-1]:  # one row: the staged and dense routes need 1024, the tiled tile pads past stock's
+        return None
     w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
     if not isinstance(w, mx.array) or w.ndim != 2 or not isinstance(scales, mx.array):
         return None
     N, K, M = w.shape[0], x.shape[-1], x.shape[-2]
     if x.size != M * K:  # MLX reads the row count of a batch from its memory layout
         return None
+    if module.__dict__.get("_unsloth_staged_qmm") and not module.training and _bindings_intact(bindings):
+        staged = _staged_prefill_qmm(module, x, w, scales, biases, M, N, K)
+        if staged is not None:
+            return staged
     if (M < _DENSE_QMM_MIN_ROWS or N == 1 or -(-M // 16) * -(-N // 16) <= _DENSE_QMM_MIN_TILES
             or N * K > _DENSE_QMM_MAX_WEIGHTS or module.training or not _bindings_intact(bindings)):
         if module.__dict__.get("_unsloth_tiled_qmm"):
@@ -4606,12 +6718,14 @@ def _dense_prefill_qmm(module, x, bindings):
     key = (_dense_qmm_rows(M, N, K), *family)
     verified = _DENSE_QMM_VERIFIED.get(key)
     if verified is False or family in _DENSE_QMM_VERIFIED:   # one differing row count retires the projection shape
-        return None
+        return (_tiled_prefill_qmm(module, x, w, scales, biases, M, N, K, bindings)
+                if module.__dict__.get("_unsloth_tiled_qmm") else None)
     weight = mx.dequantize(w, scales, biases, group_size = group_size, bits = bits, mode = mode).astype(x.dtype)
     dense = x @ weight.T
     if verified is None:
         native = mx.quantized_matmul(x, w, scales = scales, biases = biases, transpose = True,
                                      group_size = group_size, bits = bits, mode = mode)
+        _staged_ready()
         try:
             verified = _settled(native.dtype == dense.dtype and bool(
                 mx.array_equal(native.view(mx.uint16), dense.view(mx.uint16)).item()))
@@ -4622,9 +6736,39 @@ def _dense_prefill_qmm(module, x, bindings):
         if not verified:
             _DENSE_QMM_VERIFIED[family] = False
             logger.warning("the dense prefill matmul differs from the quantized one for N=%d K=%d %d-bit "
-                           "%s group %d %s at %d rows; the native call stays in use",
+                           "%s group %d %s at %d rows; the dense route stays disabled",
                            N, K, bits, mode, group_size, x.dtype, M)
-    return dense if verified else None
+    if verified:
+        return dense
+    return (_tiled_prefill_qmm(module, x, w, scales, biases, M, N, K, bindings)
+            if module.__dict__.get("_unsloth_tiled_qmm") else None)
+
+
+def _staged_prefill_qmm(module, x, w, scales, biases, M, N, K):
+    group_size, bits, mode = module.group_size, module.bits, module.mode
+    if (mx.default_device() != mx.gpu or not matmul.staged_qmm_supported(M, N, K, group_size, bits, mode)
+            or not isinstance(biases, mx.array) or not x.dtype == scales.dtype == biases.dtype
+            or w.dtype != mx.uint32 or w.shape != (N, K * bits // 32)
+            or scales.shape != (N, K // group_size) or biases.shape != scales.shape):
+        return None
+    key = (M, N, K, group_size, bits, x.dtype)
+    verified = _STAGED_QMM_VERIFIED.get(key)
+    if verified is False:
+        return None
+    routed = matmul.differentiable_staged_qmm(group_size, bits)(x.reshape(M, K), w, scales, biases)
+    if verified is None:
+        native = mx.quantized_matmul(x.reshape(M, K), w, scales, biases, transpose = True,
+                                     group_size = group_size, bits = bits)
+        _staged_ready()
+        try:
+            verified = _settled(bool(mx.array_equal(routed.view(mx.uint16), native.view(mx.uint16)).item()))
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            return None
+        _STAGED_QMM_VERIFIED[key] = verified
+        if not verified:
+            logger.warning("staged prefill differs from native for %s; the staged route stays disabled", key)
+    return routed.reshape(*x.shape[:-1], N) if verified else None
 
 
 def _tiled_prefill_qmm(module, x, w, scales, biases, M, N, K, bindings):
@@ -4653,6 +6797,33 @@ def _dense_prefill_in_scope(module, x):
     return None if bindings is None else _dense_prefill_qmm(module, x, bindings)
 
 
+def prefill_route(module, rows):
+    """The route a `rows`-row call of this quantized linear takes under the scopes it holds now: "int8", "dense",
+    "staged", "tiled" or "stock". A route whose first-use check has not run yet counts as taken; one that failed it does not."""
+    d, w, scales = module.__dict__, module["weight"], module["scales"]
+    N, K, dtype = w.shape[0], scales.shape[-1] * module.group_size, scales.dtype
+    low = getattr(module, "_unsloth_nax_int8_prefill_rows", 0)
+    if low and rows >= low and _NAX_INT8_QMM_VERIFIED.get(
+            ("dense", N, K, module.group_size, module.bits, dtype)) is not False:
+        return "int8"
+    if not d.get("_unsloth_dense_qmm_scopes"):
+        return "stock"
+    if (d.get("_unsloth_staged_qmm") and matmul.staged_qmm_supported(rows, N, K, module.group_size, module.bits, module.mode)
+            and _STAGED_QMM_VERIFIED.get((rows, N, K, module.group_size, module.bits, dtype)) is not False):
+        return "staged"
+    if (mx.__version__ in _DENSE_QMM_DISPATCH_MLX and rows >= _DENSE_QMM_MIN_ROWS and N != 1
+            and -(-rows // 16) * -(-N // 16) > _DENSE_QMM_MIN_TILES and N * K <= _DENSE_QMM_MAX_WEIGHTS):
+        biases = module.get("biases")
+        family = (N, K, module.bits, module.group_size, module.mode, dtype, w.dtype, dtype,
+                  getattr(biases, "dtype", None))
+        if family not in _DENSE_QMM_VERIFIED:
+            return "dense"
+    if (d.get("_unsloth_tiled_qmm") and module.mode == "affine" and not N % _TILED_QMM_TILE["BN"]
+            and not _tile_shape_loses(rows, N)):
+        return "tiled"
+    return "stock"
+
+
 @functools.cache
 def _dense_qmm_class(*cache_key):
     bindings = _dense_qmm_bindings(*cache_key)
@@ -4675,7 +6846,8 @@ def dense_prefill_linear(model, *, _modules = None):
 
     Calls of 1024 or more rows on a large enough output dequantize the weight once and multiply
     densely, bit-identical to the quantized matmul; smaller calls,
-    training, and any shape that fails its first-use comparison keep the native call. A linear the
+    training, and any shape that fails its first-use comparison keep the exact tiled route when eligible,
+    otherwise the native call. A linear the
     NAX scope already routes keeps its small-row and int8 routes and takes this one for the rest.
     `UNSLOTH_MLX_DENSE_PREFILL=0` turns the route off.
 
@@ -4683,6 +6855,8 @@ def dense_prefill_linear(model, *, _modules = None):
     run that kernel at a 64x32x64 tile instead. It sums K in stock's order, so it is bit-identical by
     construction (checked once per MLX version by a probe, not per shape); `UNSLOTH_MLX_TILED_PREFILL=0`
     turns that off.
+    On NAX GPUs, eligible affine prefill uses staged loads with native accumulation order, checked by a probe
+    and per shape on first use. `UNSLOTH_MLX_STAGED_PREFILL=0` turns this off; native vjps are retained.
     """
     changed = []
     try:
@@ -4692,6 +6866,7 @@ def dense_prefill_linear(model, *, _modules = None):
                     and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)):
                 fused = _dense_qmm_class(nn.QuantizedLinear.__call__)
                 tiled = None   # its probe waits for a linear it could serve
+                staged = None
             if fused is not None:
                 seen = set()
                 for _, module in _fusion_modules(model, _modules):
@@ -4708,11 +6883,14 @@ def dense_prefill_linear(model, *, _modules = None):
                     else:
                         if tiled is None:   # before this module changes, so an interrupted probe leaves none behind
                             tiled = _tiled_prefill_enabled()
+                            staged = matmul.staged_qmm_available()
                         if type(module) is nn.QuantizedLinear:
                             module.__class__ = fused
                         module._unsloth_dense_qmm_scopes = 1
                         if tiled:
                             module.__dict__["_unsloth_tiled_qmm"] = True
+                        if staged:
+                            module.__dict__["_unsloth_staged_qmm"] = True
                     changed.append((module, fused))
         yield model
     finally:
@@ -4724,6 +6902,178 @@ def dense_prefill_linear(model, *, _modules = None):
                         module.__class__ = nn.QuantizedLinear
                     module.__dict__.pop("_unsloth_dense_qmm_scopes", None)
                     module.__dict__.pop("_unsloth_tiled_qmm", None)
+                    module.__dict__.pop("_unsloth_staged_qmm", None)
+
+
+_WINDOW_MASK_LOCK = RLock()
+_WINDOW_MASK_MODULE = "mlx_vlm.models.gemma4.language"
+_WINDOW_MASK_CONTRACT = {
+    _WINDOW_MASK_MODULE: {
+        "Gemma4TextModel._make_masks": ("d02d670a2d988a1d", "bc6547b19c9add74"),
+        "Gemma4TextModel.__call__": "bad1bb823b9aa527",
+        "create_attention_mask": "a5e4c86965a3c8dc",
+        "RotatingKVCache.make_mask": "7868d53d8c02ff7c",
+        "RotatingKVCache.update_and_fetch": "7a59166cc2b5aa39",
+        "RotatingKVCache._update_concat": "fa642883e696d809",
+        "RotatingKVCache._trim": "d7e33b6fefc66bde",
+        "RotatingKVCache._temporal_order": "a83d18372d17df76",
+    },
+    "mlx_vlm.models.cache": {"create_causal_mask": "f1b52d364f9131c5"},
+}
+
+
+def _native_window_mask_source_matches(original):
+    """Follow only our known compiler wrapper to a pinned runtime mask builder."""
+    leaf = original
+    seen = set()
+    try:
+        while isinstance(leaf, FunctionType) and _ast_fingerprint(leaf) == "bc6547b19c9add74":
+            if id(leaf) in seen:
+                return False
+            seen.add(id(leaf))
+            cells = dict(zip(leaf.__code__.co_freevars, leaf.__closure__ or ()))
+            leaf = cells["original_make_masks"].cell_contents
+        if not isinstance(leaf, FunctionType):
+            return False
+        return not hasattr(leaf, "__wrapped__") and _ast_fingerprint(leaf) == "d02d670a2d988a1d"
+    except (AttributeError, KeyError, OSError, TypeError, SyntaxError):
+        return False
+
+
+@functools.cache
+def _native_window_class(base, cache_type, *cache_key):
+    original = base._make_masks
+    bindings = _resolved_bindings(_WINDOW_MASK_CONTRACT)
+    if bindings is None or not _native_window_mask_source_matches(original):
+        return None
+
+    @functools.wraps(original)
+    def masks(self, h, cache, mm_token_type_ids = None):
+        if not _bindings_intact(bindings):
+            return base._make_masks(self, h, cache, mm_token_type_ids)
+        result = original(self, h, cache, mm_token_type_ids)
+        if (self.training or mm_token_type_ids is not None or h.ndim != 3 or h.shape[0] != 1
+                or h.shape[1] <= 1 or not attention.native_window_available()):
+            return result
+        window = self.window_size
+        if type(window) is not int or window <= 0:
+            return result
+        rotating = [c for layer, c in zip(self.layers, cache)
+                    if layer.layer_type == "sliding_attention" and c is not None]
+        if (not rotating or any(type(c) is not cache_type or c.keep != 0 or c.max_size != window
+                or type(c.offset) is not int or getattr(c, "left_padding", None) is not None
+                or getattr(c, "right_padding", None) is not None for c in rotating)
+                or any(c.offset != rotating[0].offset for c in rotating[1:])):
+            return result
+        # The pinned builder owns these masks; caller-supplied masks bypass it entirely.
+        return [attention.WindowMask(mask, window) if layer.layer_type == "sliding_attention" else mask
+                for layer, mask in zip(self.layers, result)]
+
+    return type("_NativeWindowTextModel", (base,), {
+        "_make_masks": masks, "_unsloth_window_native": base,
+    })
+
+
+@contextmanager
+def native_window_attention(model, *, _modules = None):
+    """Run unpadded text-only Gemma4 sliding prefill on the native window kernel when available."""
+    changed = []
+    try:
+        runtime = sys.modules.get(_WINDOW_MASK_MODULE)
+        bindings = _resolved_bindings(_WINDOW_MASK_CONTRACT) if runtime is not None else None
+        if bindings is not None and attention.native_window_available():
+            attention.install_fused_attention()
+            base, cache_type = runtime.Gemma4TextModel, runtime.RotatingKVCache
+            patched = _native_window_class(base, cache_type, *(target for _, _, target in bindings))
+            if patched is None:
+                yield model
+                return
+            with _WINDOW_MASK_LOCK:
+                seen = set()
+                for _, module in _fusion_modules(model, _modules):
+                    if id(module) in seen or type(module) not in (base, patched) or module.training:
+                        continue
+                    seen.add(id(module))
+                    state = module.__dict__
+                    if state.get("_unsloth_window_scopes"):
+                        state["_unsloth_window_scopes"] += 1
+                    else:
+                        module.__class__ = patched
+                        state["_unsloth_window_scopes"] = 1
+                    changed.append((module, base, patched))
+        yield model
+    finally:
+        with _WINDOW_MASK_LOCK:
+            for module, base, patched in reversed(changed):
+                module._unsloth_window_scopes -= 1
+                if not module._unsloth_window_scopes:
+                    if type(module) is patched:
+                        module.__class__ = base
+                    del module.__dict__["_unsloth_window_scopes"]
+
+
+@functools.cache
+def _singleton_quantized_class(base, method, original, *cache_key):
+    bindings = _resolved_bindings(_NAX_QMM_CONTRACT)
+    if bindings is None:
+        return None
+
+    def call(self, x):
+        native = getattr(base, method)
+        if (isinstance(x, mx.array) and x.ndim == 3 and x.shape[0] > 1 and x.shape[1] == 1 and not self.training
+                and native is original
+                and isinstance(self.get("weight"), mx.array) and self.weight.ndim == 2
+                and _bindings_intact(bindings)):
+            return mx.concatenate([native(self, x[row:row + 1]) for row in range(x.shape[0])], axis = 0)
+        return native(self, x)
+
+    _ONE_ROW_STOCK_CALLS.add(call)
+    return type(f"_Singleton{base.__name__}", (base,), {method: call, "_unsloth_singleton_native": base})
+
+
+@contextmanager
+def singleton_quantized_decode(model, *, _modules = None):
+    """Keep each request's one-row quantized arithmetic in a speculative call's batched decode and tied verify heads, which
+    its rows must match. A plain batch keeps stock's multi-row call, and a projection Fast Verify moves to the lane kernel
+    its row-independent one."""
+    changed = []
+    lanes = _lane_coverage(model, _modules)[3] if _fast_verify_held(model) else []
+    try:
+        with _NAX_QMM_LOCK:
+            if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+                seen = {id(module) for module in lanes} if lanes and _fast_verify_status(len(lanes)) else set()
+                for _, module in _fusion_modules(model, _modules):
+                    if id(module) in seen:
+                        continue
+                    seen.add(id(module))
+                    base = type(module)
+                    if "_unsloth_singleton_native" in vars(base):
+                        module._unsloth_singleton_scopes += 1
+                        changed.append(module)
+                        continue
+                    stock = (nn.QuantizedEmbedding if isinstance(module, nn.QuantizedEmbedding)
+                             else nn.QuantizedLinear if isinstance(module, nn.QuantizedLinear) else None)
+                    if stock is None or module.training:
+                        continue
+                    method = "as_linear" if stock is nn.QuantizedEmbedding else "__call__"
+                    original = getattr(base, method)
+                    if base is not stock and original not in _ONE_ROW_STOCK_CALLS:
+                        continue
+                    swapped = _singleton_quantized_class(base, method, original,
+                                                        nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
+                    if swapped is not None:
+                        module.__class__ = swapped
+                        module._unsloth_singleton_scopes = 1
+                        changed.append(module)
+        yield model
+    finally:
+        with _NAX_QMM_LOCK:
+            for module in reversed(changed):
+                module._unsloth_singleton_scopes -= 1
+                if not module._unsloth_singleton_scopes:
+                    module.__dict__.pop("_unsloth_singleton_scopes", None)
+                    if "_unsloth_singleton_native" in vars(type(module)):
+                        module.__class__ = type(module)._unsloth_singleton_native
 
 
 # The mlx-vlm bodies the verify scope wraps, and the projection kernels whose row bound its slices follow.
@@ -4755,21 +7105,105 @@ _EXACT_VERIFY_CONTRACT = {
 # qwen4_exp runs its decode steps as well as its verify blocks on one batch-invariant forward, entered at
 # `__call__`, whose `_model` already submits each layer. It inherits the Qwen3.5 bodies pinned above.
 _QWEN4_FORWARD_CONTRACT = {
+    **_EXACT_VERIFY_CONTRACT,
     "mlx_vlm.models.qwen4_exp.language": {
         "Qwen4ExpBatchInvariantForward.__call__": "d7a813b4f944d125",
         "Qwen4ExpBatchInvariantForward._layer": "537ce3afba7c9732",
     },
 }
-# (language module, its forward object, the forward's module and class, the entry that serves, wrap `_layer`)
-_QWEN3_5_VERIFIER = ("mlx_vlm.models.qwen3_5.language", "_EXACT_SPECULATIVE_VERIFIER",
-                     "mlx_vlm.models.qwen3_5.speculative_verifier", "Qwen3_5BatchInvariantForward", "verify", True)
-_QWEN4_FORWARD = ("mlx_vlm.models.qwen4_exp.language", "_QWEN4_BATCH_INVARIANT_FORWARD",
-                  "mlx_vlm.models.qwen4_exp.language", "Qwen4ExpBatchInvariantForward", "__call__", False)
+
+
+_LAZY_REPLAY_CONTRACT = {"mlx_vlm.models.qwen4_exp.language": {
+    "LanguageModel._speculative_verify": "9ea85a31b8caa1b4",
+    "LanguageModel.speculative_verify_logits": "34737ce85732b150",
+}}
+
+
+@functools.cache
+def _lazy_replay_verifier(verify, body):
+    if verify is None or body is None:
+        return None
+    bindings = _resolved_bindings(_LAZY_REPLAY_CONTRACT)
+    if (bindings is None or not any(name == "_speculative_verify" and target is body for _, name, target in bindings)
+            or not any(name == "speculative_verify_logits" and target is verify for _, name, target in bindings)):
+        return None
+    tree = copy.deepcopy(_function_ast(body))
+    submissions = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                   and _source_expression(node) == "mx.async_eval([entry.state for entry in cache])"]
+    if len(submissions) != 1:
+        return None
+    submission = submissions[0]
+    submission.args[0].elt = ast.Call(func = ast.Name(id = "_unsloth_prefix_state", ctx = ast.Load()),
+                                    args = [ast.Name(id = "entry", ctx = ast.Load())], keywords = [])
+    function = _function_from_ast(body, tree)
+    from .speculative import _committed_eval_state
+    namespace = {**body.__globals__, "_unsloth_prefix_state": _committed_eval_state}
+    bindings += [(body.__globals__, name, body.__globals__[name])
+                 for name in body.__code__.co_names if name in body.__globals__]
+    routed = FunctionType(function.__code__, namespace, function.__name__, body.__defaults__, body.__closure__)
+    routed.__kwdefaults__ = body.__kwdefaults__
+    return routed, bindings
+
+
+def _verify_with_lazy_replay(model, inputs, cache, sampler):
+    verify = model.speculative_verify_logits
+    if not any("_unsloth_pending" in vars(entry) for entry in cache):
+        return verify(inputs, cache, sampler)
+    body = getattr(model, "_speculative_verify", None)
+    bound = getattr(verify, "__self__", None) is model and getattr(body, "__self__", None) is model
+    plan = (_lazy_replay_verifier(getattr(verify, "__func__", None), getattr(body, "__func__", None))
+            if bound else None)
+    if (plan is not None and not model.training and getattr(model, "_unsloth_verify_scopes", 0)
+            and _bindings_intact(plan[1])):
+        # The next fused block consumes the replay inputs instead of its materialized state.
+        return plan[0](model, inputs, cache, sampler)
+    return verify(inputs, cache, sampler)
+
+
+class SpeculativeFamily(NamedTuple):
+    """`language`'s forward object `target`, a `module.forward` entered at `entry` ("verify", or "__call__" when it also
+    decodes), served once `contract` holds. The fused gated-delta block takes `gdn_layer`s with a `gdn_norm` once
+    `gdn_contract` holds and `gdn_qk_eps(normalize)` gives each layer's q/k epsilon from the forward's normalization.
+    `capabilities` maps the further optimizations its arithmetic admits, "attention", "lanes" and
+    "invariant_attention" (its one-token decode attention body), to the bodies each pins apart (the lanes' own
+    contract is the kernel's); `causal_mask(attention, cache, length)` tells when a verify
+    block's mask array is its causal mask."""
+    language: str
+    target: str
+    module: str
+    forward: str
+    entry: str
+    submit_layers: bool
+    contract: dict
+    gdn_layer: str
+    gdn_norm: str
+    gdn_contract: dict
+    gdn_qk_eps: Callable
+    gdn_l2: bool = False
+    capabilities: dict = {}
+    causal_mask: Callable = None
+
+
 # mlx-vlm's `optimized_affine_linears` serves 1 < rows <= 8; a wider block leaves its fused verify kernels.
 _VERIFY_FUSED_ROWS = 8
 # Pinned apart, so a drifted attention body leaves only the attention route native.
 _EXACT_ATTENTION_CONTRACT = {"mlx_vlm.models.qwen3_5.speculative_verifier": {
     "Qwen3_5BatchInvariantForward._attention": "0c8e3b361ee34362"}}
+# qwen4_exp attends a dense-regime verify block through `_attention` with the mask `build_mask` gives it.
+_QWEN4_ATTENTION_CONTRACT = {**_EXACT_ATTENTION_CONTRACT, "mlx_vlm.models.qwen4_exp.language": {
+    "QSAKVCache": None, "Qwen4ExpBatchInvariantForward._qsa_attention": "19e3c72333ce7c72",
+    "Qwen4ExpQSAIndexer.from_projected": "df79546e849cb1e1",
+    "Qwen4ExpQSAIndexer.select_from_projected": "379bb821075d65a8", "Qwen4ExpQSAIndexer.build_mask": "b11b51a6551a398c"}}
+
+
+def _qwen4_causal_mask(attention, cache, length):
+    """Whether `build_mask` gave this block the causal mask: one sequence, no row past the indexer's `block_topk`."""
+    qsa = getattr(sys.modules.get("mlx_vlm.models.qwen4_exp.language"), "QSAKVCache", None)
+    indexer, offset = getattr(attention, "indexer", None), getattr(cache, "offset", None)
+    return (qsa is not None and type(cache) is qsa and type(offset) is int and indexer is not None
+            and (offset + length) // indexer.compress_ratio <= indexer.block_topk)
+
+
 _VERIFY_METHODS = ("verify", "__call__", "_linear", "_linears", "_layer", "_feed_forward", "_gated_delta", "_attention")
 _VERIFY_LOCK = RLock()
 _VERIFY_VERDICTS = {}
@@ -4786,6 +7220,7 @@ def _verify_admitted(key, native, fused):
     reference = native()
     if verdict is None and (candidate := fused()) is not None:
         pairs = zip(reference, candidate) if isinstance(reference, tuple) else ((reference, candidate),)
+        _staged_ready()
         try:
             verdict = _settled(all(a.dtype == b.dtype and a.shape == b.shape
                                    and mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item() for a, b in pairs))
@@ -4797,6 +7232,39 @@ def _verify_admitted(key, native, fused):
             logger.warning("a verify block differs from mlx-vlm's verifier for %s; the native verifier "
                            "stays in use there", key)
     return reference
+
+
+def _verify_gathers(linear, x, eligible):
+    """Whether verification would gather a frozen projection with different rounding from one-row decode."""
+    return (getattr(_VERIFY_STATE, "serving", False) and not getattr(_VERIFY_STATE, "plain_decode", False)
+            and isinstance(linear, nn.QuantizedLinear) and x.ndim == 3 and x.shape[0] * x.shape[1] > 1 and not eligible(linear, x) and not linear.trainable_parameters())
+
+
+def _batched_weights(linear):
+    """A projection's tensors under a batch axis, contiguous once: stock copies such a view at every call."""
+    arrays = (linear["weight"], linear["scales"], linear.get("biases"))
+    held = linear.__dict__.get("_unsloth_batched_weights")
+    if held is None or any(a is not b for a, b in zip(held[0], arrays)):
+        held = (arrays, tuple(None if a is None else mx.contiguous(a[None]) for a in arrays))
+        linear.__dict__["_unsloth_batched_weights"] = held
+    return held[1]
+
+
+def _verify_rows_alone(linear, x):
+    K = x.shape[-1]
+
+    def one_row_calls():
+        return mx.concatenate([linear(row[None]) for row in mx.contiguous(x).reshape(-1, 1, K)]).reshape(*x.shape[:-1], -1)
+
+    def batched():
+        weight, scales, biases = _batched_weights(linear)
+        y = mx.quantized_matmul(x.reshape(-1, 1, K), weight, scales = scales, biases = biases, transpose = True,
+                                group_size = linear.group_size, bits = linear.bits, mode = linear.mode)
+        y = y.reshape(*x.shape[:-1], -1)
+        return y + linear["bias"] if "bias" in linear else y
+
+    key = ("rows alone", x.dtype, linear["weight"].shape, linear.bits, linear.group_size, linear.mode, "bias" in linear)
+    return _verify_admitted(key, one_row_calls, batched)
 
 
 def _verify_sliced(project, linears, x, eligible):
@@ -4852,6 +7320,11 @@ def _replay_matches(stock, replay, mask, initial):
                and mx.array_equal(a.view(mx.uint8), b.view(mx.uint8)).item() for a, b in pairs)
 
 
+def _tape_key(q, k, v, a, b, initial, mask):
+    return (*k.shape[2:], *v.shape[2:], q.shape[1], a.ndim, q.dtype, k.dtype, v.dtype, a.dtype, b.dtype,
+            getattr(initial, "dtype", None), getattr(mask, "dtype", None))
+
+
 def _taped_update(native, with_states):
     """`gated_delta_update` keeping no per-step states for a block that fills its cache's speculative window."""
     def gated_delta_update(q, k, v, a, b, A_log, dt_bias, state = None, mask = None, use_kernel = True,
@@ -4868,13 +7341,13 @@ def _taped_update(native, with_states):
         def update(initial, steps):
             replay = functools.partial(with_states, q, k, v, a, b, A_log, dt_bias, initial,
                                        use_kernel = use_kernel, state_steps = 0)
-            key = (*k.shape[2:], *v.shape[2:], length, a.ndim, q.dtype, k.dtype, v.dtype, a.dtype, b.dtype,
-                   getattr(initial, "dtype", None), getattr(mask, "dtype", None))
+            key = _tape_key(q, k, v, a, b, initial, mask)
             verdict = _TAPE_VERDICTS.get(key)
             if not verdict:
                 stock = with_states(q, k, v, a, b, A_log, dt_bias, initial, mask, use_kernel = use_kernel,
                                     state_steps = steps)
                 if verdict is None:
+                    _staged_ready()
                     try:
                         verdict = _settled(_replay_matches(stock, replay, mask, initial))
                     except (RuntimeError, ValueError) as error:
@@ -4886,7 +7359,7 @@ def _taped_update(native, with_states):
                                        "states for %s; verify keeps writing every step's state there", key)
                 return stock
             y, final, _ = replay(mask = mask)
-            tapes.append((cache, cache_index, replay, mask))
+            tapes.append((cache, cache_index, replay, mask, False))
             return y, final, mx.broadcast_to(final[:, None], (final.shape[0], steps, *final.shape[1:]))
 
         return cache.update_recurrent(cache_index, length, update)
@@ -4894,27 +7367,607 @@ def _taped_update(native, with_states):
     return gated_delta_update
 
 
+def _committed_lengths(lengths):
+    if isinstance(lengths, int):
+        return lengths
+    return [int(value) for value in (lengths.reshape(-1).tolist() if isinstance(lengths, mx.array) else lengths)]
+
+
+def _replay_tapes(tapes, lengths):
+    counts = {lengths} if isinstance(lengths, int) else set(lengths)
+    retained = None
+    for cache, index, replay, mask, folds in tapes:
+        length = replay.args[0].shape[1]  # its own block's: a sized tree's first layers verify more rows than the rest
+        # Retaining all or none, stock committed the final or the entry state itself; otherwise a stand-in the replay replaces.
+        if counts == {length} or counts == {0}:
+            continue
+        rows = [lengths] * replay.args[0].shape[0] if isinstance(lengths, int) else lengths
+        cache[index] = replay(mask = _retained_mask(rows, length, mask))[1]
+        if folds:  # the next fused block can advance from the replay's own entry instead
+            if retained is None:
+                retained = mx.array(rows, mx.uint32)
+            cache._unsloth_pending = (cache[index], replay, retained)
+
+
 @functools.cache
 def _taped_transaction_class(base):
     def commit(self, lengths):
-        if not isinstance(lengths, int):
-            lengths = [int(value) for value in (lengths.reshape(-1).tolist() if isinstance(lengths, mx.array) else lengths)]
+        lengths = _committed_lengths(lengths)
         base.commit(self, lengths)
-        tapes = self.__dict__.pop("_unsloth_tapes", ())
-        counts = {lengths} if isinstance(lengths, int) else set(lengths)
-        # Retaining all or none, stock committed the final or the entry state itself.
-        if counts == {self.length} or counts == {0}:
-            return
-        # Otherwise stock selected from a stand-in history; the retained state is the replayed prefix.
-        for cache, index, replay, mask in tapes:
-            rows = [lengths] * replay.args[0].shape[0] if isinstance(lengths, int) else lengths
-            cache[index] = replay(mask = _retained_mask(rows, self.length, mask))[1]
+        _replay_tapes(self.__dict__.pop("_unsloth_tapes", ()), lengths)
 
     def abort(self):
         self.__dict__.pop("_unsloth_tapes", None)
         base.abort(self)
 
     return type(f"_Taped{base.__name__}", (base,), {"commit": commit, "abort": abort})
+
+
+# A forward entered at `__call__` never sees the transaction, so its taped caches replay on their own commit.
+_CACHE_TAPE_CONTRACT = {**_VERIFY_TAPE_CONTRACT, "mlx_vlm.models.cache": {
+    **_VERIFY_TAPE_CONTRACT["mlx_vlm.models.cache"], "ArraysCache.start_speculation": "ef020ee767e8a8fc",
+    "ArraysCache.abort_speculation": "b029b95363a7f3ff"}}
+
+
+@functools.cache
+def _taped_cache_class(base):
+    def commit_speculation(self, lengths, generation = None):
+        lengths, speculation = _committed_lengths(lengths), self._speculation
+        base.commit_speculation(self, lengths, generation)
+        self.__class__ = base
+        taped, tapes = self.__dict__.pop("_unsloth_tapes")
+        if taped is speculation:  # not a later block this cache started without committing the taped one
+            _replay_tapes(tapes, lengths)
+
+    def abort_speculation(self, generation = None):
+        base.abort_speculation(self, generation)
+        self.__class__ = base
+        self.__dict__.pop("_unsloth_tapes", None)
+
+    return type(f"_Taped{base.__name__}", (base,), {"commit_speculation": commit_speculation,
+                                                   "abort_speculation": abort_speculation,
+                                                   "_unsloth_tape_native": base})
+
+
+# A verify block's convolution through gated norm in one launch per head, the decode step's arithmetic per row:
+# every row's taps, SiLU, q/k norms and gates, then the recurrence over the rows, then every row's gated norm.
+_VERIFY_GDN_SOURCE = """
+    constexpr uint NT = 32 * TY;
+    constexpr uint KEY = Hk * Dk;
+    constexpr uint C = 2 * KEY + Hv * Dv;
+    constexpr uint W = 2 * Dk + Dv;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint tid = sg * 32 + lane;
+    uint n = threadgroup_position_in_grid.z;
+    uint row = n / Hv;
+    uint hv = n % Hv;
+    uint hk = hv / (Hv / Hk);
+    const uint L = length;
+    threadgroup T qs[LMAX * Dk];
+    threadgroup T ks[LMAX * Dk];
+    threadgroup T vs[LMAX * Dv];
+    threadgroup T ys[LMAX * Dv];
+    threadgroup float decay[LMAX];
+    threadgroup T beta[LMAX];
+
+    {
+        // MLX's depthwise_conv_1d over each row's window, then SiLU.
+        #pragma clang fp contract(off) reassociate(off)
+        for (uint i = tid; i < L * W; i += NT) {
+            uint t = i / W, j = i % W;
+            uint c = j < Dk ? hk * Dk + j : j < 2 * Dk ? KEY + hk * Dk + j - Dk : 2 * KEY + hv * Dv + j - 2 * Dk;
+            float acc = 0.0f;
+            for (uint tap = 0; tap < K; ++tap) {
+                float product = static_cast<float>(conv_input[(row * (K - 1 + L) + t + tap) * C + c]) * conv_weight[c * K + tap];
+                acc = acc + product;
+            }
+            T conv = static_cast<T>(acc);
+            T act = Multiply()(conv, static_cast<T>(Sigmoid()(conv)));
+            if (j < Dk) qs[t * Dk + j] = act;
+            else if (j < 2 * Dk) ks[t * Dk + j - Dk] = act;
+            else vs[t * Dv + j - 2 * Dk] = act;
+        }
+    }
+    if (tid < L) {
+        uint gi = (row * L + tid) * Hv + hv;
+        PT gate = Add()(static_cast<PT>(a[gi]), static_cast<PT>(dt_bias[hv]));
+        float softplus = static_cast<float>(static_cast<PT>(LogAddExp()(gate, static_cast<PT>(0))));
+        decay[tid] = Exp()(Multiply()(Negative()(Exp()(static_cast<float>(A_log[hv]))), softplus));
+        beta[tid] = Sigmoid()(b[gi]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint r = sg; r < 2 * L; r += TY) {
+        threadgroup T* x = r < L ? qs + r * Dk : ks + (r - L) * Dk;
+        if (QK_L2) {
+            // qwen4_exp's L2 norm in T, its row sum as MLX's: each lane's four squares, then the simdgroup.
+            T vals[4];
+            T total = static_cast<T>(0);
+            for (int i = 0; i < 4; i++) {
+                vals[i] = x[lane * 4 + i];
+                total = Add()(Square()(vals[i]), total);
+            }
+            total = simd_sum(total);
+            T inv = Rsqrt()(Add()(total, static_cast<T>(qk_eps[0])));
+            for (int i = 0; i < 4; i++) {
+                T normed = Multiply()(vals[i], inv);
+                x[lane * 4 + i] = r < L ? Multiply()(normed, q_scale[0]) : normed;
+            }
+            continue;
+        }
+        T scale = r < L ? q_scale[0] : k_scale[0];
+        float thread_x[4];
+        float acc = 0;
+        for (int i = 0; i < 4; i++) {
+            thread_x[i] = x[lane * 4 + i];
+            acc += thread_x[i] * thread_x[i];
+        }
+        acc = simd_sum(acc);
+        acc = simd_sum(lane == 0 ? acc : 0.0f);
+        float inv = metal::precise::rsqrt(acc / Dk + qk_eps[0]);
+        for (int i = 0; i < 4; i++) {
+            T normed = static_cast<T>(1) * static_cast<T>(thread_x[i] * inv);
+            x[lane * 4 + i] = Multiply()(scale, normed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // The block's q, k and v, for the commit to replay a retained prefix from.
+    for (uint i = tid; i < L * Dv; i += NT) {
+        uint t = i / Dv, d = i % Dv;
+        v_out[((row * L + t) * Hv + hv) * Dv + d] = vs[i];
+        if (hv % (Hv / Hk) == 0 && d < Dk) {
+            q_out[((row * L + t) * Hk + hk) * Dk + d] = qs[t * Dk + d];
+            k_out[((row * L + t) * Hk + hk) * Dk + d] = ks[t * Dk + d];
+        }
+    }
+
+    for (uint dv = sg; dv < Dv; dv += TY) {
+        float state[4];
+        auto i_state = state_in + (n * Dv + dv) * Dk + lane * 4;
+        for (int i = 0; i < 4; ++i) {
+            state[i] = static_cast<float>(i_state[i]);
+        }
+        for (uint t = 0; t < L; ++t) {
+            float kv_mem = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                state[i] = state[i] * decay[t];
+                kv_mem += state[i] * ks[t * Dk + lane * 4 + i];
+            }
+            kv_mem = simd_sum(kv_mem);
+            auto delta = (vs[t * Dv + dv] - kv_mem) * beta[t];
+            float out = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                state[i] = state[i] + ks[t * Dk + lane * 4 + i] * delta;
+                out += state[i] * qs[t * Dk + lane * 4 + i];
+            }
+            out = simd_sum(out);
+            if (lane == 0) {
+                ys[t * Dv + dv] = static_cast<T>(out);
+            }
+        }
+        auto o_state = state_out + (n * Dv + dv) * Dk + lane * 4;
+        for (int i = 0; i < 4; ++i) {
+            o_state[i] = state[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint t = sg; t < L; t += TY) {
+        float acc = 0;
+        for (int i = 0; i < 4; i++) {
+            float xi = ys[t * Dv + lane * 4 + i];
+            acc += xi * xi;
+        }
+        acc = simd_sum(acc);
+        acc = simd_sum(lane == 0 ? acc : 0.0f);
+        float inv = metal::precise::rsqrt(acc / Dv + norm_eps[0]);
+        for (int i = 0; i < 4; i++) {
+            uint d = lane * 4 + i, o = ((row * L + t) * Hv + hv) * Dv + d;
+            T normed = norm_weight[d] * static_cast<T>(static_cast<float>(ys[t * Dv + d]) * inv);
+            float zf = static_cast<float>(z[o]);
+            float gate = SIGMOID_GATE ? Sigmoid()(zf) : Multiply()(zf, Sigmoid()(zf));
+            y[o] = static_cast<T>(Multiply()(gate, static_cast<float>(normed)));
+        }
+    }
+"""
+# The block after a partly retained one: each row first advances the retained block's entry state over its retained
+# steps, the replay's recurrence with no outputs, and writes that state for this block's own commit to replay from.
+_VERIFY_GDN_PENDING_LOADS = """
+    threadgroup T pending_ks[LMAX * Dk];
+    threadgroup T pending_vs[LMAX * Dv];
+    threadgroup float pending_decay[LMAX];
+    threadgroup T pending_beta[LMAX];
+    const uint P = retained[row];
+    const uint PL = pending_length;
+    for (uint i = tid; i < P * Dk; i += NT) {
+        pending_ks[i] = pending_k[((row * PL + i / Dk) * Hk + hk) * Dk + i % Dk];
+    }
+    for (uint i = tid; i < P * Dv; i += NT) {
+        pending_vs[i] = pending_v[((row * PL + i / Dv) * Hv + hv) * Dv + i % Dv];
+    }
+    if (tid < P) {
+        uint gi = (row * PL + tid) * Hv + hv;
+        PT gate = Add()(static_cast<PT>(pending_a[gi]), static_cast<PT>(dt_bias[hv]));
+        float softplus = static_cast<float>(static_cast<PT>(LogAddExp()(gate, static_cast<PT>(0))));
+        pending_decay[tid] = Exp()(Multiply()(Negative()(Exp()(static_cast<float>(A_log[hv]))), softplus));
+        pending_beta[tid] = Sigmoid()(pending_b[gi]);
+    }
+"""
+_VERIFY_GDN_PENDING_STEPS = """
+        for (uint t = 0; t < P; ++t) {
+            float kv_mem = 0.0f;
+            for (int i = 0; i < 4; ++i) {
+                state[i] = state[i] * pending_decay[t];
+                kv_mem += state[i] * pending_ks[t * Dk + lane * 4 + i];
+            }
+            kv_mem = simd_sum(kv_mem);
+            auto delta = (pending_vs[t * Dv + dv] - kv_mem) * pending_beta[t];
+            for (int i = 0; i < 4; ++i) {
+                state[i] = state[i] + pending_ks[t * Dk + lane * 4 + i] * delta;
+            }
+        }
+        auto a_state = advanced + (n * Dv + dv) * Dk + lane * 4;
+        for (int i = 0; i < 4; ++i) {
+            a_state[i] = state[i];
+        }
+"""
+_VERIFY_GDN_FOLD_SOURCE = (
+    _VERIFY_GDN_SOURCE.replace("    threadgroup T beta[LMAX];\n", "    threadgroup T beta[LMAX];" + _VERIFY_GDN_PENDING_LOADS)
+    .replace("        for (uint t = 0; t < L; ++t) {\n", _VERIFY_GDN_PENDING_STEPS[1:] + "        for (uint t = 0; t < L; ++t) {\n"))
+# A draft tree's block (`TreeBlock`, row 0 the anchor, rows in preorder): each row's taps follow its path through the
+# conv window and the block, and the recurrence runs on from its parent's state, kept where a row has several children.
+_VERIFY_GDN_TREE_SOURCE = (
+    _VERIFY_GDN_SOURCE.replace(
+        "conv_input[(row * (K - 1 + L) + t + tap) * C + c]",
+        "conv_input[(int(tap) < int(K - 1) - depth[t] ? tap + depth[t] : K - 1 + path[t * path_shape[1] + depth[t] + tap - (K - 1)]) * C + c]")
+    .replace("        for (uint t = 0; t < L; ++t) {\n            float kv_mem = 0.0f;",
+             "        float forks[8][4];\n        for (uint t = 0; t < L; ++t) {\n"
+             "            if (back[t] >= 0) for (int i = 0; i < 4; ++i) state[i] = forks[back[t]][i];\n            float kv_mem = 0.0f;")
+    .replace("                ys[t * Dv + dv] = static_cast<T>(out);\n            }\n",
+             "                ys[t * Dv + dv] = static_cast<T>(out);\n            }\n"
+             "            if (fork[t] >= 0) for (int i = 0; i < 4; ++i) forks[fork[t]][i] = state[i];\n"))
+_VERIFY_GDN_TREE_FOLD_SOURCE = (
+    _VERIFY_GDN_TREE_SOURCE.replace("    threadgroup T beta[LMAX];\n", "    threadgroup T beta[LMAX];" + _VERIFY_GDN_PENDING_LOADS.replace(
+        "    const uint PL = pending_length;\n", "").replace("row * PL + i / Dk", "pending_path[i / Dk]").replace(
+        "row * PL + i / Dv", "pending_path[i / Dv]").replace("row * PL + tid", "pending_path[tid]"))
+    .replace("        float forks[8][4];\n", _VERIFY_GDN_PENDING_STEPS[1:] + "        float forks[8][4];\n"))
+_VERIFY_GDN_ROWS = 16  # simdgroups per value head: 8 and 32, or two state rows in flight each, measured no faster
+# Block rows the threadgroup holds; the row count is an input, so every verify width shares one pipeline build.
+_VERIFY_GDN_MAX_ROWS = 16
+# Causal verify rows `_native_causal_attention` takes outside an engine-deepened round, and in one pass over the KV prefix.
+_NATIVE_CAUSAL_ROWS = 8
+_EXACT_ATTENTION_MAX_ROWS = 32
+# The verifier's own q/k normalization keeps 1e-6; the loader's replacement uses the layer's.
+_VERIFY_QK_EPS = {"abddec205f64acc5": lambda layer: 1e-6,
+                  "4fa05fbe449bee52": lambda layer: _NORMALIZE_QK_EPS.get(
+                      _ast_fingerprint(type(layer)._normalize_qk), lambda width: None)(layer.head_k_dim)}
+_VERIFY_GDN_CONTRACT = {
+    "mlx_vlm.models.qwen3_5.speculative_verifier": {
+        "Qwen3_5BatchInvariantForward._normalize_gated_delta_qk": tuple(_VERIFY_QK_EPS)},
+    "mlx_vlm.models.qwen3_5.language": {"Qwen3_5RMSNormGated.__call__": "7c0c74be3b59d596",
+                                       "_precise_swiglu": "d5cc9afa38657b66"},
+    "mlx_vlm.models.qwen3_5.gated_delta": {"_compute_g_beta": "1185629ef7a77fba", "compute_g": "837fdb794c06f7f5",
+                                           "_make_gated_delta_with_states_kernel": "95debad27edcc930"},
+    "mlx.nn": {"silu": "78867fdb7e42731c", "softplus": "4d48a9bee57aeadd", "Conv1d.__call__": "e6c4e02415104dd1"},
+}
+# qwen4_exp's L2 q/k norm, epsilon after the sum, and its sigmoid or SiLU gated norm. The normalization is
+# compiled, which leaves no globals to pin: the contract pins its name and `_QWEN4_QK_NORM` its body.
+_QWEN4_VERIFY_GDN_CONTRACT = {**_VERIFY_GDN_CONTRACT, "mlx_vlm.models.qwen4_exp.language": {
+    "Qwen4ExpBatchInvariantForward._normalize_gated_delta_qk": "e6ee65b778220bf3",
+    "_qwen4_normalize_gated_delta_qk": None, "Qwen4ExpRMSNormGated.__call__": "46820c5ac7651e4c"}}
+_QWEN4_QK_NORM = "405c5c572ed60e76"
+
+
+def _qwen3_5_qk_eps(normalize):
+    return _VERIFY_QK_EPS.get(_ast_fingerprint(normalize))
+
+
+def _qwen4_qk_eps(normalize):
+    compiled = normalize.__globals__.get("_qwen4_normalize_gated_delta_qk")
+    return (lambda layer: 1e-6) if _ast_fingerprint(compiled) == _QWEN4_QK_NORM else None
+
+
+_VERIFY_GDN_VERDICTS = {}
+_VERIFY_GDN_FOLDS = {}
+
+
+@functools.cache
+def _verify_gdn_kernel(fold = False):
+    try:
+        header = mx.metal.is_available() and nax._mlx_kernel_header("unary_ops.h")
+        binary = header and nax._mlx_kernel_header("binary_ops.h")
+        return binary and mx.fast.metal_kernel(
+            name = "unsloth_gated_delta_verify_block" + "_folded" * fold,
+            input_names = ["conv_input", "conv_weight", "a", "b", "A_log", "dt_bias", "z", "norm_weight", "q_scale",
+                           "k_scale", "qk_eps", "norm_eps", "state_in", "length",
+                           *(("pending_k", "pending_v", "pending_a", "pending_b", "retained", "pending_length") if fold else ())],
+            output_names = ["y", "state_out", "q_out", "k_out", "v_out", *(("advanced",) if fold else ())],
+            header = header + binary,
+            compile_options = {"math_mode": "safe"}, source = _VERIFY_GDN_FOLD_SOURCE if fold else _VERIFY_GDN_SOURCE,
+        ) or None
+    except (AttributeError, TypeError):
+        return None
+
+
+@functools.cache
+def _verify_gdn_tree_kernel(fold = False):
+    header = nax._mlx_kernel_header("unary_ops.h") + nax._mlx_kernel_header("binary_ops.h")
+    return mx.fast.metal_kernel(
+        name = "unsloth_gated_delta_verify_tree" + "_folded" * fold,
+        input_names = ["conv_input", "conv_weight", "a", "b", "A_log", "dt_bias", "z", "norm_weight", "q_scale",
+                       "k_scale", "qk_eps", "norm_eps", "state_in", "length", "depth", "path", "fork", "back",
+                       *(("pending_k", "pending_v", "pending_a", "pending_b", "retained", "pending_path") if fold else ())],
+        output_names = ["y", "state_out", "q_out", "k_out", "v_out", *(("advanced",) if fold else ())], header = header,
+        compile_options = {"math_mode": "safe"}, source = _VERIFY_GDN_TREE_FOLD_SOURCE if fold else _VERIFY_GDN_TREE_SOURCE)
+
+
+def _verify_gdn_launch(conv_input, weight, a, b, A_log, dt_bias, z, norm_weight, qk_eps, eps, state, key_heads,
+                       pending, l2 = False, sigmoid = False, tree = None):
+    B, L, value_heads, Dv = z.shape
+    Dk, dtype = state.shape[-1], conv_input.dtype
+    q_scale, k_scale, qk_norm_eps, norm_eps = _decode_step_scalars(Dk, dtype, qk_eps, eps)
+    if l2:  # q's one scale is k's RMSNorm one, the head width's -1/2 power in T
+        q_scale = k_scale
+    extra = [state.shape] if pending else []
+    kernel = _verify_gdn_kernel(bool(pending)) if tree is None else _verify_gdn_tree_kernel(bool(pending))
+    rows = [] if tree is None else [tree.depth, tree.path, tree.fork, tree.back]
+    return kernel(
+        inputs = [conv_input, weight, a, b, A_log, dt_bias, z, norm_weight, q_scale, k_scale, qk_norm_eps, norm_eps,
+                  state, L, *rows, *pending],
+        template = [("T", dtype), ("PT", a.dtype if a.dtype == dt_bias.dtype else mx.float32), ("K", weight.shape[1]),
+                    ("LMAX", _VERIFY_GDN_MAX_ROWS), ("Hk", key_heads), ("Hv", value_heads), ("Dk", Dk), ("Dv", Dv),
+                    ("TY", _VERIFY_GDN_ROWS), ("QK_L2", l2), ("SIGMOID_GATE", sigmoid)],
+        grid = (32, _VERIFY_GDN_ROWS, B * value_heads), threadgroup = (32, _VERIFY_GDN_ROWS, 1),
+        output_shapes = [z.shape, state.shape, (B, L, key_heads, Dk), (B, L, key_heads, Dk), z.shape, *extra],
+        output_dtypes = [dtype, state.dtype, dtype, dtype, dtype, *(state.dtype for _ in extra)],
+    )
+
+
+def _verify_gdn_block(*args, l2 = False, sigmoid = False, tree = None):
+    return _verify_gdn_launch(*args, (), l2, sigmoid, tree)
+
+
+def _verify_gdn_folded_block(*args, pending, l2 = False, sigmoid = False, tree = None):
+    """`_verify_gdn_block` from the entry state of a block whose retained prefix was not replayed yet, given that
+    block's k, v, a, b and each row's retained count; it also returns the state after that prefix. Below a draft tree,
+    `pending` also names the block rows the retained path took."""
+    k, v, a, b, rows, *path = pending
+    return _verify_gdn_launch(*args, (k, v, a, b, rows, *(path or [k.shape[1]])), l2, sigmoid, tree)
+
+
+class _TreeRows:
+    """A tree block's attention cache, keeping the keys and values the block appends: `tree_commit` writes a path's rows from
+    them, as reading them back from the cache would have its write copy the buffers whole."""
+
+    def __init__(self, cache):
+        self._cache = cache
+
+    def __getattr__(self, name):
+        return getattr(self._cache, name)
+
+    def update_and_fetch(self, keys, values):
+        self._cache._unsloth_tree_rows = keys, values
+        return self._cache.update_and_fetch(keys, values)
+
+
+def _tree_attention(queries, keys, values, scale, tree):
+    return attention.invariant_attention(queries, keys, values, scale, tree.depth, tree.path)
+
+
+def _verify_gdn_fits(layer, inputs, mask, cache):
+    """Whether the fused block can take this unmasked block, before its projections run."""
+    length = inputs.shape[1]
+    return (3 <= length <= _VERIFY_GDN_MAX_ROWS and cache is not None
+            and getattr(cache, "history_capacity", 0) == length and _gdn_block_fits(layer, inputs, mask, cache))
+
+
+def _decode_gdn_fits(layer, inputs, mask, cache):
+    """Whether the fused block can take this unmasked one-row step of a plain cache, before its projections run."""
+    arrays = sys.modules.get("mlx_vlm.models.cache")
+    arrays = getattr(arrays, "ArraysCache", None)
+    if (inputs.ndim != 3 or inputs.shape[1] != 1 or arrays is None or not isinstance(cache, arrays)
+            or getattr(cache, "history_capacity", 0)
+            or any(getattr(arrays, name, None) is None or getattr(type(cache), name, None) is not getattr(arrays, name)
+                   or name in vars(cache)
+                   for name in ("update_window", "update_recurrent"))
+            or not _gdn_block_fits(layer, inputs, mask, cache)):
+        return False
+    conv_state = cache[0]
+    return (conv_state is not None and cache[1] is not None and conv_state.dtype == inputs.dtype
+            and conv_state.shape == (inputs.shape[0], layer.conv_kernel_size - 1, layer.conv_dim))
+
+
+def _gdn_block_fits(layer, inputs, mask, cache):
+    batch = inputs.shape[0]
+    K, Dk, Dv, Hv = layer.conv_kernel_size, layer.head_k_dim, layer.head_v_dim, layer.num_v_heads
+    conv, norm = layer.conv1d, layer.norm
+    if (mask is not None or cache is None or layer.training or mx.default_device() != mx.gpu
+            or Dk != 128 or Dv != 128 or not 2 <= K <= 8
+            or Hv % layer.num_k_heads or inputs.dtype not in (mx.bfloat16, mx.float16)):
+        return False
+    state = cache[1]
+    if state is not None and (state.shape != (batch, Hv, Dv, Dk) or state.dtype != mx.float32):
+        return False
+    norms = [getattr(sys.modules.get(family.language), family.gdn_norm, None) for family in SPECULATIVE_FAMILIES.values()]
+    return (type(conv) is nn.Conv1d and "bias" not in conv and conv.weight.shape == (layer.conv_dim, K, 1)
+            and conv.weight.dtype == inputs.dtype and conv.groups == layer.conv_dim
+            and (conv.stride, conv.padding, conv.dilation) == (1, 0, 1)
+            and type(norm) in norms and norm.weight.shape == (Dv,) and norm.weight.dtype == inputs.dtype
+            and layer.A_log.shape == (Hv,) and layer.dt_bias.shape == (Hv,)
+            and all(t.dtype in (mx.float32, mx.bfloat16, mx.float16) for t in (layer.A_log, layer.dt_bias)))
+
+
+def _verify_gdn_folded(key, folded, fused, entry):
+    """`folded()` once `key`'s first fold matched `fused(entry)` and `entry` bit for bit; until then `fused(entry)`
+    and `entry`, which a failed key keeps for good."""
+    verdict = _VERIFY_GDN_FOLDS.get(key)
+    if verdict:
+        return folded()
+    reference = (*fused(entry), entry)
+    if verdict is None:
+        _staged_ready()
+        try:
+            verdict = _settled(all(x.dtype == y.dtype and x.shape == y.shape
+                                   and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
+                                   for x, y in zip(reference, folded())))
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            if str(error).startswith("[metal::Device] Unable to "):
+                _VERIFY_GDN_FOLDS[key] = False
+        else:
+            _VERIFY_GDN_FOLDS[key] = verdict
+            if not verdict:
+                logger.warning("advancing a fused verify block over the retained prefix of the one before differs "
+                               "from replaying that prefix for %s; the replay stays in use there", key)
+    return reference
+
+
+def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps, l2 = False):
+    """The verifier's `_gated_delta` for a block `_verify_gdn_fits` took, its convolution through gated norm fused
+    once a first block matched the stock ops bit for bit; the commit replays the kernel's q/k/v like a taped block's.
+    A block on a partly retained one's unevaluated replay starts from that block's entry state instead, once a first
+    such block matched."""
+    batch, length, _ = inputs.shape
+    K, Dv, Hk = layer.conv_kernel_size, layer.head_v_dim, layer.num_k_heads
+    mixed_qkv, z, b, a = self._linears((layer.in_proj_qkv, layer.in_proj_z, layer.in_proj_b, layer.in_proj_a), inputs)
+    z = z.reshape(batch, length, -1, Dv)
+    conv_state = cache[0]
+    if conv_state is None or conv_state.shape[0] != batch:
+        conv_state = mx.zeros((batch, K - 1, layer.conv_dim), dtype = inputs.dtype)
+    conv_input = mx.concatenate([conv_state, mixed_qkv], axis = 1)
+    cache.update_window(0, conv_input, K - 1, lengths = cache.lengths)
+    initial, dtype = cache[1], conv_input.dtype
+    pending = cache.__dict__.pop("_unsloth_pending", None)
+    retained_path = cache.__dict__.pop("_unsloth_pending_path", None)
+    tree = getattr(_VERIFY_STATE, "tree", None)
+    sigmoid = getattr(layer.norm, "activation", None) == "sigmoid"
+    key = (length, Hk, layer.num_v_heads, K, dtype, a.dtype, b.dtype, layer.A_log.dtype, layer.dt_bias.dtype,
+           getattr(initial, "dtype", None), qk_eps, layer.norm.eps, l2, sigmoid)
+    verdict = _VERIFY_GDN_VERDICTS.get(key)
+    fits = all(t.dtype == dtype for t in (z, a, b)) and a.shape == b.shape == (batch, length, layer.num_v_heads)
+    block = lambda state: (
+        conv_input, layer.conv1d.weight.reshape(layer.conv_dim, K), a, b, layer.A_log, layer.dt_bias, z,
+        layer.norm.weight, qk_eps, layer.norm.eps,
+        mx.zeros((batch, layer.num_v_heads, Dv, layer.head_k_dim), mx.float32) if state is None else state, Hk)
+    fused = lambda state: _verify_gdn_block(*block(state), l2 = l2, sigmoid = sigmoid, tree = tree)
+    # A passed check holds the key of the replay its commit relies on.
+    if fits and verdict and _TAPE_VERDICTS.get(verdict):
+        fold = None
+        if pending is not None:  # still the state the last commit's replay of this layer's fused block left
+            state, replay, rows = pending
+            _, pending_k, pending_v, pending_a, pending_b, A_log, dt_bias, pending_entry = replay.args
+            if (state is initial and A_log is layer.A_log and dt_bias is layer.dt_bias and pending_k.dtype == dtype
+                    and (pending_a.dtype, pending_b.dtype) == (a.dtype, b.dtype)):
+                retained = (pending_k, pending_v, pending_a, pending_b, rows)
+                if tree is not None:
+                    # A tree reads the retained rows in place; a chain block reads the replay's own gathered ones.
+                    retained = (*retained[:4], rows, attention._invariant_depths(pending_k.shape[1])) if retained_path is None else (*retained_path[:4], rows, retained_path[4])
+                fold = (*key, retained[0].shape[1], tree is not None), lambda: _verify_gdn_folded_block(
+                    *block(pending_entry), pending = retained, l2 = l2, sigmoid = sigmoid, tree = tree)
+
+        def update(entry, steps):
+            if fold is not None:
+                y, final, q, k, v, entry = _verify_gdn_folded(*fold, fused, entry)
+            else:
+                y, final, q, k, v = fused(entry)
+            replay = functools.partial(with_states, q, k, v, a, b, layer.A_log, layer.dt_bias, entry,
+                                       use_kernel = True, state_steps = 0)
+            _VERIFY_STATE.tapes.append((cache, 1, replay, None, True))
+            return y, final, mx.broadcast_to(final[:, None], (batch, steps, *final.shape[1:]))
+        output, _ = cache.update_recurrent(1, length, update)
+    elif tree is not None:
+        raise RuntimeError("a draft tree's block needs its width's fused verify block")
+    else:
+        conv_output = nn.silu(layer.conv1d(conv_input))
+        q, k, v = [value.reshape(batch, length, heads, width) for value, heads, width in zip(
+            mx.split(conv_output, [layer.key_dim, 2 * layer.key_dim], -1), [Hk, Hk, layer.num_v_heads],
+            [layer.head_k_dim, layer.head_k_dim, Dv])]
+        q, k = self._normalize_gated_delta_qk(layer, q, k)
+        output, state = route(q, k, v, a, b, layer.A_log, layer.dt_bias, use_kernel = True, cache = cache)
+        output = layer.norm(output, z)
+        tape_key = _tape_key(q, k, v, a, b, initial, None)
+        taped = _TAPE_VERDICTS.get(tape_key)
+        if fits and verdict is None and taped is not None:
+            _staged_ready()
+            try:
+                verdict = _settled(taped and all(
+                    x.dtype == y.dtype and x.shape == y.shape and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
+                    for x, y in zip(fused(initial), (output, state, q, k, v))))
+            except (RuntimeError, ValueError) as error:
+                _unless_failed_buffer(error)
+                # A build Metal rejects stays rejected; a function transformation or memory pressure is checked later.
+                if str(error).startswith("[metal::Device] Unable to "):
+                    _VERIFY_GDN_VERDICTS[key] = False
+            else:
+                _VERIFY_GDN_VERDICTS[key] = verdict and tape_key
+                if taped and not verdict:
+                    logger.warning("the fused gated-delta verify block differs from the verifier's ops for %d rows, "
+                                   "%d key heads, %d value heads, a %d-tap convolution and %s inputs; the verifier's "
+                                   "ops stay in use", *key[:5])
+    if hasattr(cache, "advance"):
+        cache.advance(length)
+        self._helpers()._qwen3_5_advance_lengths_info(cache, length)
+    return self._linear(layer.out_proj, output.reshape(batch, length, -1))
+
+
+_DECODE_GDN_VERDICTS = {}
+_DECODE_GDN_CONTRACT = {"mlx_vlm.models.cache": {"ArraysCache.update_window": "5580299b90d3a0b1"}}
+# The qwen4_exp forward body that submits each layer as it builds it, rebound to hold those submissions back.
+_STAGED_ROWS_CONTRACT = {"mlx_vlm.models.qwen4_exp.language": {"Qwen4ExpBatchInvariantForward._model": "5148d15462bdbae0"}}
+_STAGED_ROWS_OFF = []
+
+
+def _decode_gdn(self, base, layer, inputs, mask, cache, qk_eps, l2):
+    """The forward's `_gated_delta` for a one-row decode step `_decode_gdn_fits` took: its convolution through gated
+    norm on the fused block kernel, once the first step of its layout matched the native method's output and state
+    bit for bit. Writes the cache as the native method does."""
+    batch, K, Dv = inputs.shape[0], layer.conv_kernel_size, layer.head_v_dim
+    sigmoid = getattr(layer.norm, "activation", None) == "sigmoid"
+    key = (batch, layer.num_k_heads, layer.num_v_heads, K, inputs.dtype, layer.A_log.dtype, layer.dt_bias.dtype,
+           qk_eps, layer.norm.eps, l2, sigmoid)
+    verdict = _DECODE_GDN_VERDICTS.get(key)
+    if verdict is False:
+        return base._gated_delta(self, layer, inputs, mask, cache)
+    initial = cache[1]
+    mixed_qkv, z, b, a = self._linears((layer.in_proj_qkv, layer.in_proj_z, layer.in_proj_b, layer.in_proj_a), inputs)
+    conv_input = mx.concatenate([cache[0], mixed_qkv], axis = 1)
+
+    def fused():
+        if not all(t.dtype == inputs.dtype for t in (z, a, b)):
+            return None
+        return _verify_gdn_block(
+            conv_input, layer.conv1d.weight.reshape(layer.conv_dim, K), a, b, layer.A_log, layer.dt_bias,
+            z.reshape(batch, 1, -1, Dv), layer.norm.weight, qk_eps, layer.norm.eps, initial, layer.num_k_heads,
+            l2 = l2, sigmoid = sigmoid)[:2]
+
+    if verdict is None:
+        output = base._gated_delta(self, layer, inputs, mask, cache)
+        candidate = fused()
+        _staged_ready()
+        try:
+            verdict = _settled(candidate is not None and all(
+                x.dtype == y.dtype and x.shape == y.shape and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
+                for x, y in zip((self._linear(layer.out_proj, candidate[0].reshape(batch, 1, -1)), candidate[1]),
+                                (output, cache[1]))))
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            return output  # inside a function transformation, which cannot evaluate; checked later
+        _DECODE_GDN_VERDICTS[key] = verdict
+        if not verdict:
+            logger.warning("the fused gated-delta decode step differs from the forward's ops for %d rows, %d key heads, "
+                           "%d value heads, a %d-tap convolution and %s inputs; the forward's ops stay in use", *key[:5])
+        return output
+    served = fused()
+    if served is None:
+        return base._gated_delta(self, layer, inputs, mask, cache)
+    y, state = served
+    cache.update_window(0, conv_input, K - 1, lengths = cache.lengths)
+    cache.update_recurrent(1, 1, lambda entry, steps: (y, state))
+    if hasattr(cache, "advance"):
+        cache.advance(1)
+        self._helpers()._qwen3_5_advance_lengths_info(cache, 1)
+    return self._linear(layer.out_proj, y.reshape(batch, 1, -1))
 # MLX 0.32.3's sdpa_vector_2pass_1 and _2 over a causal block of rows, each row's arithmetic and
 # order the one-row call's: key i goes to block i % BLOCKS, and a row skips the keys past its own.
 # Each simdgroup carries two rows, so a K/V load serves both; the row pairs of a threadgroup share it through L1.
@@ -4930,24 +7983,24 @@ _EXACT_ATTENTION_ROWS = """
 
     float qr[2][qk], o[2][qk], m[2], s[2];
     for (int r = 0; r < 2; r++) {
-        const device T* qp = q + b * q_strides[0] + (h * G + g) * q_strides[1] + min(r0 + r, L - 1) * q_strides[2] + lane * qk;
+        const device T* qp = q + b * q_strides[0] + (h * G + g) * q_strides[1] + min(r0 + r, L - 1) * q_strides[2] + lane * qk * q_strides[3];
         for (int j = 0; j < qk; j++) {
-            qr[r][j] = static_cast<float>(scale) * qp[j];
+            qr[r][j] = static_cast<float>(scale) * qp[j * q_strides[3]];
             o[r][j] = 0;
         }
         m[r] = Limits<float>::finite_min;
         s[r] = 0;
     }
 
-    const device T* kp = k + b * k_strides[0] + h * k_strides[1] + block * k_strides[2] + lane * qk;
-    const device T* vp = v + b * v_strides[0] + h * v_strides[1] + block * v_strides[2] + lane * qk;
+    const device T* kp = k + b * k_strides[0] + h * k_strides[1] + block * k_strides[2] + lane * qk * k_strides[3];
+    const device T* vp = v + b * v_strides[0] + h * v_strides[1] + block * v_strides[2] + lane * qk * v_strides[3];
     // The last threadgroup's spare row-pair slots load nothing.
     const int end = r0 < L ? prefix + min(r0 + 2, L) : 0;
     for (int i = block; i < end; i += BLOCKS) {
         float kr[qk], vr[qk];
         for (int j = 0; j < qk; j++) {
-            kr[j] = kp[j];
-            vr[j] = vp[j];
+            kr[j] = kp[j * k_strides[3]];
+            vr[j] = vp[j * v_strides[3]];
         }
         for (int r = 0; r < 2; r++) {
             if (r0 + r < L && i <= prefix + r0 + r) {
@@ -5040,13 +8093,100 @@ _EXACT_ATTENTION_TIMINGS, _EXACT_ATTENTION_RETRY = 3, 128
 _EXACT_ATTENTION_THREADS = {}
 
 
+# Seconds per `matmul.qmv_rows` launch by (rows, inputs prepared), per (dtype, group size, bits), measured on the device:
+# the fastest launch width depends on the GPU and not monotonically on the rows (a wider launch can spill registers).
+_QMV_ROWS_COSTS = {}
+# Per (dtype, group size, bits, weight shape): whether every kind of `matmul.qmv_rows` gave each row its one-row stock bits.
+_QMV_ROWS_LAYOUTS = {}
+
+
+@functools.cache
+def _stock_linear_pinned(linear):
+    """Whether `linear`, the current `QuantizedLinear.__call__`, is the MLX body the multi-row kernel reproduces: a
+    rebinding (a patch scaling every projection, say) keeps the native verifier."""
+    return linear is nn.QuantizedLinear.__call__ and _resolved_bindings(_DENSE_QMM_CONTRACT) is not None
+
+
+def _qmv_rows_kernel(p):
+    """The (dtype, group size, bits) `matmul.qmv_rows` runs an affine projection's verify rows with, or None. Settled once
+    per quantized weight, at load or on its first block: built, timed, and checked on random rows."""
+    arrays, settled = (p.get("weight"), p.get("scales"), p.get("biases")), p.__dict__.get("_unsloth_qmv_rows")
+    # The kernel bypasses the layer's call, so it must be one whose one-row result is the stock one; zoo's own
+    # wrappers count as stock, so a projection settled at load keeps its verdict when generation installs them.
+    call, linear = _stock_call(p, 1), nn.QuantizedLinear.__call__
+    stock = isinstance(p, nn.QuantizedLinear) and (call is linear or call in _ONE_ROW_STOCK_CALLS)
+    quantized = (stock, linear, *(getattr(p, name, None) for name in ("group_size", "bits", "mode")))
+    if settled is not None and all(a is b for a, b in zip(settled[0], arrays)) and settled[1] == quantized:
+        return settled[2]
+    kernel = None
+    if (stock and _stock_linear_pinned(linear)
+            and p.scales.dtype in (mx.bfloat16, mx.float16) and p.scales.dtype == getattr(p.get("biases"), "dtype", None)
+            and matmul.qmv_rows_supported(p.weight.shape[0], p.scales.shape[-1] * p.group_size, p.group_size, p.bits, p.mode)
+            and matmul.qmv_rows_probe_passed(p.scales.dtype, p.group_size, p.bits)):
+        kernel = (p.scales.dtype, p.group_size, p.bits)
+        layout = (*kernel, p.weight.shape)
+        _staged_ready()
+        try:
+            matmul.compile_qmv_rows(*kernel)
+            if kernel not in _QMV_ROWS_COSTS:
+                _FIRST_USE_WORK[0] += 1
+                _QMV_ROWS_COSTS[kernel] = tuple(matmul.qmv_rows_launch_costs(*kernel).items())
+            if layout not in _QMV_ROWS_LAYOUTS:
+                K = p.scales.shape[-1] * p.group_size
+                x = mx.random.normal((matmul.QMV_ROWS_STAGED_MAX, K), key = mx.random.key(K)).astype(kernel[0])
+                _QMV_ROWS_LAYOUTS[layout] = _settled(all(
+                    matmul.qmv_rows_matches(x[:rows], p.weight, p.scales, p.biases, p.group_size, p.bits)
+                    for rows in {matmul.QMV_ROWS_MAX, matmul.QMV_ROWS_STAGED_MAX}))
+                if not _QMV_ROWS_LAYOUTS[layout]:
+                    logger.warning("verify rows differ from one-row calls for a %s weight of %d-bit groups of %d; "
+                                   "the native verifier stays in use there", p.weight.shape, p.bits, p.group_size)
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            return None  # inside a function transformation, which cannot evaluate; settled later
+        kernel = kernel if _QMV_ROWS_LAYOUTS[layout] else None
+    p.__dict__["_unsloth_qmv_rows"] = (arrays, quantized, kernel)
+    return kernel
+
+
+def _verify_qmv_rows(native, linears, x):
+    """`native()`, with affine projections that `_qmv_rows_kernel` settled run by `matmul.qmv_rows`."""
+    if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[0] * x.shape[1] < 2
+            or os.environ.get("UNSLOTH_MLX_VERIFY_QMV_ROWS") == "0"):
+        return native()
+    kernels = [_qmv_rows_kernel(p) for p in linears]
+    if not all(kernel is not None and kernel[0] == x.dtype and not p.trainable_parameters()
+               for p, kernel in zip(linears, kernels)):
+        return native()
+    rows, launches, outs = x.reshape(-1, x.shape[-1]), {}, []
+    for p, kernel in zip(linears, kernels):
+        if kernel not in launches:
+            most, kind = matmul.qmv_rows_plan(_QMV_ROWS_COSTS[kernel], rows.shape[0])
+            stops = list(itertools.accumulate(matmul.qmv_rows_sizes(rows.shape[0], most)))
+            launches[kernel] = [(part, matmul.qmv_rows_args(part, p.bits, kind))
+                                for part in (rows[a:b] for a, b in zip([0, *stops], stops))]
+        ys = [matmul.qmv_rows(part, p.weight, p.scales, p.biases, p.group_size, p.bits, *args)
+              for part, args in launches[kernel]]
+        y = (ys[0] if len(ys) == 1 else mx.concatenate(ys)).reshape(*x.shape[:-1], -1)
+        outs.append(y + p["bias"] if "bias" in p else y)
+    return tuple(outs) if len(outs) > 1 else outs[0]
+
+
+def _exact_attention_rows_source():
+    # Unit feature strides take the source as written without them; other views read through their strides.
+    contiguous = _EXACT_ATTENTION_ROWS
+    for name in ("q", "k", "v"):
+        contiguous = contiguous.replace(f" * {name}_strides[3]", "")
+    return ("if (q_strides[3] == 1 && k_strides[3] == 1 && v_strides[3] == 1) {\n"
+            + contiguous + "\n} else {\n" + _EXACT_ATTENTION_ROWS + "\n}")
+
+
 @functools.cache
 def _exact_attention_kernels():
     try:
         if not mx.metal.is_available():
             return None
         return (mx.fast.metal_kernel(name = "unsloth_exact_attention_rows", input_names = ["q", "k", "v", "N", "L", "scale"],
-                                     output_names = ["partials", "sums", "maxs"], source = _EXACT_ATTENTION_ROWS,
+                                     output_names = ["partials", "sums", "maxs"], source = _exact_attention_rows_source(),
                                      ensure_row_contiguous = False),
                 mx.fast.metal_kernel(name = "unsloth_exact_attention_reduce", input_names = ["partials", "sums", "maxs"],
                                      output_names = ["out"], source = _EXACT_ATTENTION_REDUCE))
@@ -5081,8 +8221,105 @@ def _exact_attention_rows(queries, keys, values, scale, blocks):
                   output_shapes = [queries.shape], output_dtypes = [queries.dtype])[0]
 
 
+def _vector_launch(gqa, rows, keys, dim):
+    """MLX's unmasked vector SDPA launch for `rows` query rows per head: passes, key interleave, one-row GQA kernel."""
+    if not ((_gpu_class() in ("d", "s") and keys >= 1024) or (gqa > 1 and keys >= 4096)):
+        return 1, 0, False
+    # MLX 0.32.4 gives one-row calls of these shapes a GQA kernel that reduces keys in another order.
+    grouped = rows == 1 and keys >= 8192 and (gqa == 8 and dim in (64, 128) or gqa in (12, 16) and dim == 128)
+    return 2, _vector_blocks(gqa * rows, keys), grouped
+
+
+@functools.lru_cache(maxsize = 64)
+def _causal_chunks(gqa, dim, prefix, length, size, forced):
+    """(start, rows) chunks of at most `size` rows launching their rows' one-row kernel; `forced` only keys the cache."""
+    chunks, start = [], 0
+    while start < length:
+        rows = min(size, length - start)
+        launch = lambda rows, keys: _vector_launch(gqa, rows, prefix + start + keys, dim)
+        while rows > 1 and any(launch(1, row + 1) != launch(rows, rows) for row in range(rows)):
+            rows -= 1
+        chunks.append((start, rows))
+        start += rows
+    return tuple(chunks)
+
+
+@functools.lru_cache(maxsize = 64)
+def _causal_rows_blocks(gqa, dim, prefix, length, forced):
+    """The 2-pass key interleave every row's one-row launch shares, or None; `forced` only keys the cache."""
+    launches = {_vector_launch(gqa, 1, prefix + row + 1, dim) for row in range(length)}
+    (passes, blocks, grouped), = launches if len(launches) == 1 else ((1, 0, False),)
+    return blocks if passes == 2 and not grouped else None
+
+
+def _launched_rows(queries, keys, values, scale, blocks):
+    """`_exact_attention_rows`, evaluated, its threadgroup refitted to any limit MLX quotes; None where it cannot launch."""
+    _staged_ready()
+    while True:
+        try:
+            out = _exact_attention_rows(queries, keys, values, scale, blocks)
+            mx.eval(out)
+            return out
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            if not _fit_threadgroup(error, queries.dtype, queries.shape[1] // keys.shape[1]):
+                return None
+
+
+def _stores_as_kv_cache(cache):
+    native = getattr(sys.modules.get("mlx_vlm.models.cache"), "KVCache", None)
+    return native is not None and getattr(type(cache), "update_and_fetch", None) is native.update_and_fetch
+
+
+def _native_causal_attention(queries, keys, values, scale, cache, mask, per_row):
+    """A causal verify block, each row with its one-row call's bits: in one pass over the KV prefix where the rows share
+    their one-row launch and MLX's fused SDPA would take several calls, else through those calls; None where the block's
+    shape does not apply. Outside Fast Verify a plan serves once it matched `per_row()`."""
+    if (not getattr(_VERIFY_STATE, "serving", False) or getattr(_LANE_STATE, "native", False)
+            or not (cache is None or _stores_as_kv_cache(cache))
+            or not (mask is None or isinstance(mask, str) and mask == "causal")
+            or not all(isinstance(x, mx.array) and x.ndim == 4 for x in (queries, keys, values))
+            or queries.dtype not in (mx.bfloat16, mx.float16) or not queries.dtype == keys.dtype == values.dtype
+            or not queries.shape[0] == keys.shape[0] == values.shape[0] or keys.shape != values.shape
+            or queries.shape[-1] != keys.shape[-1] or queries.shape[-1] not in (64, 128, 256)
+            or not 2 <= queries.shape[2] <= _EXACT_ATTENTION_MAX_ROWS
+            or keys.shape[2] < queries.shape[2] or keys.shape[1] == 0
+            or queries.shape[1] % keys.shape[1] or queries.shape[1] // keys.shape[1] > 16):
+        return None
+    length, gqa, dim = queries.shape[2], queries.shape[1] // keys.shape[1], queries.shape[-1]
+    prefix, forced = keys.shape[2] - length, os.environ.get("MLX_SDPA_BLOCKS")
+    # The fused kernel serves at most 8 query rows and 32 across a GQA group; each chunk's keys end at its last row,
+    # where the lower-right causal mask aligns. A launch other than a row's own reduces it in another order.
+    chunks = _causal_chunks(gqa, dim, prefix, length, min(8, 32 // gqa), forced)
+    chunked = lambda: mx.concatenate([mx.fast.scaled_dot_product_attention(
+        queries[:, :, start : start + rows], keys[:, :, : prefix + start + rows], values[:, :, : prefix + start + rows],
+        scale = scale, mask = "causal") for start, rows in chunks], axis = 2)
+    blocks = _causal_rows_blocks(gqa, dim, prefix, length, forced) if len(chunks) > 1 else None
+    rows_kernel = blocks is not None and _exact_attention_kernels() is not None
+    one_pass = lambda: _exact_attention_rows(queries, keys, values, scale, blocks)
+    fits = length <= getattr(_VERIFY_STATE, "causal_rows", _NATIVE_CAUSAL_ROWS)
+    if getattr(_VERIFY_STATE, "lane", False) and not getattr(_VERIFY_STATE, "lane_low", False):
+        if not rows_kernel:
+            return chunked() if fits else None
+        key = (queries.shape[:3], "causal attention", keys.shape[1], queries.dtype, dim, blocks)
+        if key not in _VERIFY_VERDICTS and _launched_rows(queries, keys, values, scale, blocks) is None:
+            return chunked()
+        return _verify_admitted(key, chunked, one_pass)
+    # MLX's dispatch changes at or just past powers of two: a plan is checked again for each such class of key counts its
+    # chunks' first and last rows fall in, so a dispatch `_vector_launch` does not model falls back.
+    octave = lambda n: (n.bit_length(), (n - 1).bit_length())
+    plan = (queries.shape[:3], keys.shape[1], queries.dtype, dim, forced, *(
+        (rows, octave(prefix + start + 1), octave(prefix + start + rows)) for start, rows in chunks))
+    if rows_kernel and ((key := ("causal attention", blocks, *plan)) in _VERIFY_VERDICTS
+                        or _launched_rows(queries, keys, values, scale, blocks) is not None):
+        return _verify_admitted(key, per_row, one_pass)
+    return _verify_admitted(("causal chunks", *plan), per_row, chunked) if fits else None
+
+
 def _exact_attention(queries, keys, values, scale, cache, mask, per_row):
     """`per_row()`, mlx-vlm's one-row SDPA calls over a causal verify block, read in one pass over the KV prefix where that is faster."""
+    if (output := _native_causal_attention(queries, keys, values, scale, cache, mask, per_row)) is not None:
+        return output
     if (not isinstance(keys, mx.array) or not isinstance(values, mx.array) or isinstance(mask, mx.array)
             or hasattr(cache, "bits") or hasattr(cache, "decode_attention") or queries.ndim != 4
             or queries.dtype not in (mx.bfloat16, mx.float16) or keys.dtype != queries.dtype or values.dtype != queries.dtype
@@ -5103,6 +8340,7 @@ def _exact_attention(queries, keys, values, scale, cache, mask, per_row):
             lost[1] -= 1
             if lost[1] > 0 or lost[0] >= _EXACT_ATTENTION_TIMINGS:
                 return per_row()
+        _staged_ready()
         try:
             mx.eval(queries, keys, values)
         except (RuntimeError, ValueError) as error:
@@ -5151,21 +8389,52 @@ def _exact_attention_faster(per_row, fused, clock = time.perf_counter):
 
 
 @functools.cache
-def _exact_verify_class(base, entry, submit_layers, *cache_key):
-    contract = _EXACT_VERIFY_CONTRACT if entry == "verify" else {**_EXACT_VERIFY_CONTRACT, **_QWEN4_FORWARD_CONTRACT}
-    bindings = _resolved_bindings(contract)
+def _exact_verify_class(base, name, *cache_key):
+    family = SPECULATIVE_FAMILIES[name]
+    entry = family.entry
+    bindings = _resolved_bindings(family.contract)
     eligible = getattr(sys.modules.get("mlx_vlm.models.quantized_verifier"), "_can_optimized_affine_linear", None)
     if bindings is None or eligible is None:
         return None
     native_entry = getattr(base, entry)
-    tape_bindings = _resolved_bindings(_VERIFY_TAPE_CONTRACT)
-    gated_delta, kernels = vars(base).get("_gated_delta"), sys.modules.get("mlx_vlm.models.qwen3_5.gated_delta")
+    tape_bindings = _resolved_bindings(_VERIFY_TAPE_CONTRACT if entry == "verify" else _CACHE_TAPE_CONTRACT)
+    # A family's forward may inherit the pinned Qwen3.5 body.
+    forward = getattr(sys.modules.get("mlx_vlm.models.qwen3_5.speculative_verifier"), "Qwen3_5BatchInvariantForward", None)
+    gated_delta, kernels = getattr(base, "_gated_delta", None), sys.modules.get("mlx_vlm.models.qwen3_5.gated_delta")
     taped = None
-    if (entry == "verify" and tape_bindings is not None and gated_delta is not None and kernels is not None
+    if (tape_bindings is not None and gated_delta is not None and kernels is not None
+            and gated_delta is getattr(forward, "_gated_delta", None)
             and gated_delta.__globals__.get("gated_delta_update") is kernels.gated_delta_update):
         route = _taped_update(kernels.gated_delta_update, kernels.gated_delta_update_with_states)
         taped = FunctionType(gated_delta.__code__, {**gated_delta.__globals__, "gated_delta_update": route},
                              gated_delta.__name__, gated_delta.__defaults__, gated_delta.__closure__)
+    fused_bindings, l2 = None, family.gdn_l2
+    if taped is not None and os.environ.get("UNSLOTH_MLX_FUSED_GDN_VERIFY") != "0" and _verify_gdn_kernel():
+        fused_bindings = _resolved_bindings(family.gdn_contract)
+        normalize = getattr(base, "_normalize_gated_delta_qk", None)
+        try:
+            qk_eps_of = fused_bindings is not None and normalize is not None and family.gdn_qk_eps(normalize)
+        except (OSError, TypeError, SyntaxError, AttributeError):
+            qk_eps_of = None
+        fused_bindings = fused_bindings if qk_eps_of else None
+    # One-row steps only on a forward that also decodes (qwen4_exp); the tape contract pins the `_gated_delta` they mirror.
+    decode_bindings = (_resolved_bindings(_DECODE_GDN_CONTRACT)
+                       if fused_bindings is not None and entry == "__call__" and tape_bindings is not None else None)
+    # A forward reads its disk PLE rows after its prefix is built, so the build overlaps the previous step's GPU
+    # work. Only after a step that ran no first-use check: a check evaluates arrays that would read the rows unfilled.
+    staged_bindings = (_resolved_bindings(_STAGED_ROWS_CONTRACT)
+                       if entry == "__call__" and os.environ.get("UNSLOTH_MLX_STAGED_PLE_ROWS") != "0" else None)
+    model_body, held_model, quiet = getattr(base, "_model", None), None, [False]
+    if staged_bindings is not None and model_body is not None and model_body.__globals__.get("mx") is mx:
+        held_model = FunctionType(model_body.__code__, {**model_body.__globals__, "mx": _HELD_MX}, model_body.__name__,
+                                  model_body.__defaults__, model_body.__closure__)
+
+    def staged_ple(self, *args, **kwargs):
+        output = base._ple(self, *args, **kwargs)
+        fills = getattr(offload.STAGED_FILLS, "fills", None)
+        if fills and isinstance(output, mx.array):
+            fills[-1].ready = output
+        return output
 
     def verify(self, language_model, inputs, *, cache = None, **kwargs):
         outer, outer_tapes = getattr(_VERIFY_STATE, "serving", False), getattr(_VERIFY_STATE, "tapes", None)
@@ -5174,6 +8443,9 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
         _VERIFY_STATE.tapes = [] if _VERIFY_STATE.serving and taped is not None and _bindings_intact(tape_bindings) else None
         try:
             output = base.verify(self, language_model, inputs, cache = cache, **kwargs)
+            if getattr(_VERIFY_STATE, "tree_head", None) is not None and output.hidden_states:
+                rows = _VERIFY_STATE.tree.depth.size  # a layer captured before the block narrowed holds every row
+                output.hidden_states = [h if h.shape[1] == rows else h[:, :rows] for h in output.hidden_states]
             if _VERIFY_STATE.tapes:
                 transaction = output.gdn_states
                 transaction.__class__ = _taped_transaction_class(type(transaction))
@@ -5183,27 +8455,103 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
             _VERIFY_STATE.serving, _VERIFY_STATE.tapes = outer, outer_tapes
 
     def entered(self, language_model, *args, **kwargs):
-        outer = getattr(_VERIFY_STATE, "serving", False)
+        outer, outer_tapes = getattr(_VERIFY_STATE, "serving", False), getattr(_VERIFY_STATE, "tapes", None)
+        outer_plain = getattr(_VERIFY_STATE, "plain_decode", False)
         _VERIFY_STATE.serving = bool(getattr(language_model, "_unsloth_verify_scopes", 0)
                                      and not language_model.training and _bindings_intact(bindings))
+        _VERIFY_STATE.plain_decode = "_unsloth_speculative_call" not in language_model.__dict__
+        # The entry also runs decode steps: only a block some cache holds a speculative window for is taped.
+        _VERIFY_STATE.tapes = ([] if _VERIFY_STATE.serving and taped is not None
+                               and any(getattr(entry, "history_capacity", 0) for entry in kwargs.get("cache") or ())
+                               and _bindings_intact(tape_bindings) else None)
+        outer_fills, outer_held, outer_after, outer_step = (getattr(offload.STAGED_FILLS, name, True if name == "plain_step" else None)
+                                                          for name in ("fills", "held", "submit_after", "plain_step"))
+        inputs = args[0] if args else kwargs.get("inputs")
+        staged_rows = _staged_forward_rows(inputs)
+        submit_after = _staged_submit_window()
+        if _VERIFY_STATE.plain_decode:
+            submit_after = submit_after if staged_rows == 1 else 0
+        else:
+            submit_after = min(1, submit_after)
+        staged = (held_model is not None and quiet[0] and not _STAGED_ROWS_OFF and _VERIFY_STATE.serving
+                  and staged_rows and (_VERIFY_STATE.plain_decode or submit_after) and _bindings_intact(staged_bindings))
+        offload.STAGED_FILLS.fills, offload.STAGED_FILLS.held = ([], []) if staged else (None, None)
+        outer_moe = getattr(_VERIFY_STATE, "plain_moe", None)
+        outer_verifier = getattr(_VERIFY_STATE, "moe_verifier", None)
+        context, valid = (_moe_verifier_matches(self) if _VERIFY_STATE.serving and not _VERIFY_STATE.plain_decode
+                          and os.environ.get("UNSLOTH_MLX_VERIFY_MOE", "1") != "0"
+                          and getattr(inputs, "ndim", 0) == 2 and inputs.shape[0] == 1
+                          and 1 < inputs.shape[1] <= _VERIFY_FUSED_ROWS else (None, False))
+        _VERIFY_STATE.moe_verifier = (self, context, valid)
+        shared = vars(language_model).get("_unsloth_plain_moe_shared")
+        # Shared identities are stable during a forward, and rechecked on every token entry.
+        _VERIFY_STATE.plain_moe = ([shared, shared.version, shared.check()]
+                                  if shared is not None and _VERIFY_STATE.serving and (
+                                      _VERIFY_STATE.plain_decode and getattr(inputs, "shape", None) == (1, 1)
+                                      or os.environ.get("UNSLOTH_MLX_VERIFY_MOE", "1") != "0" and getattr(inputs, "ndim", 0) == 2
+                                      and inputs.shape[0] == 1 and 1 < inputs.shape[1] <= _VERIFY_FUSED_ROWS) else None)
+        # Fill before releasing the prefix; later layers can then build while it runs.
+        offload.STAGED_FILLS.submit_after = submit_after if staged else 0
+        offload.STAGED_FILLS.plain_step = _VERIFY_STATE.plain_decode and staged_rows == 1
+        work = _FIRST_USE_WORK[0]
         try:
-            return native_entry(self, language_model, *args, **kwargs)
+            output = native_entry(self, language_model, *args, **kwargs)
+            _staged_ready()
+            caches = {}
+            for tape in _VERIFY_STATE.tapes or ():
+                caches.setdefault(id(tape[0]), (tape[0], []))[1].append(tape)
+            for cache, tapes in caches.values():
+                cache.__class__ = _taped_cache_class(getattr(type(cache), "_unsloth_tape_native", type(cache)))
+                cache._unsloth_tapes = (cache._speculation, tapes)
+            return output
         finally:
-            _VERIFY_STATE.serving = outer
+            for fill in getattr(offload.STAGED_FILLS, "fills", None) or ():
+                fill.abandon()
+            quiet[0] = _FIRST_USE_WORK[0] == work
+            offload.STAGED_FILLS.fills, offload.STAGED_FILLS.held = outer_fills, outer_held
+            offload.STAGED_FILLS.submit_after = outer_after
+            offload.STAGED_FILLS.plain_step = outer_step
+            _VERIFY_STATE.serving, _VERIFY_STATE.tapes, _VERIFY_STATE.plain_decode = outer, outer_tapes, outer_plain
+            _VERIFY_STATE.plain_moe = outer_moe
+            _VERIFY_STATE.moe_verifier = outer_verifier
 
     def taped_gated_delta(self, layer, inputs, mask, cache):
         if getattr(_VERIFY_STATE, "tapes", None) is None:
+            if (decode_bindings is not None and getattr(_VERIFY_STATE, "serving", False)
+                    and _decode_gdn_fits(layer, inputs, mask, cache) and _bindings_intact(fused_bindings)
+                    and _bindings_intact(decode_bindings) and _bindings_intact(tape_bindings)
+                    and (qk_eps := qk_eps_of(layer)) is not None):
+                return _decode_gdn(self, base, layer, inputs, mask, cache, qk_eps, l2)
             return base._gated_delta(self, layer, inputs, mask, cache)
+        if fused_bindings is not None and _verify_gdn_fits(layer, inputs, mask, cache) and _bindings_intact(fused_bindings):
+            qk_eps = qk_eps_of(layer)
+            if qk_eps is not None:
+                return _verify_gdn(self, layer, inputs, cache, route, kernels.gated_delta_update_with_states, qk_eps, l2)
+        if getattr(_VERIFY_STATE, "tree", None) is not None:
+            raise RuntimeError("a draft tree's gated delta layers need the fused verify block")
         return taped(self, layer, inputs, mask, cache)
 
+    def projected(self, linear, x):
+        return _verify_rows_alone(linear, x) if _verify_gathers(linear, x, eligible) else base._linear(self, linear, x)
+
+    # A one-row call (a decode step) is the native projection on every route below, so it skips their wrappers.
     def sliced_linear(self, linear, x):
-        return _verify_sliced(lambda rows: base._linear(self, linear, rows), (linear,), x, eligible)
+        if x.size == x.shape[-1]:
+            return base._linear(self, linear, x)
+        project = lambda rows: projected(self, linear, rows)
+        return _verify_qmv_rows(lambda: _verify_sliced(project, (linear,), x, eligible), (linear,), x)
 
     def sliced_linears(self, linears, x):
-        return _verify_sliced(lambda rows: base._linears(self, linears, rows), linears, x, eligible)
+        if x.size == x.shape[-1]:
+            return base._linears(self, linears, x)
+        if all(isinstance(p, (nn.Linear, nn.QuantizedLinear)) for p in linears) and any(_verify_gathers(p, x, eligible) for p in linears):
+            project = lambda rows: tuple(projected(self, p, rows) for p in linears)
+        else:
+            project = lambda rows: base._linears(self, linears, rows)
+        return _verify_qmv_rows(lambda: _verify_sliced(project, linears, x, eligible), linears, x)
 
-    def submitted_layer(self, *args, **kwargs):
-        hidden = base._layer(self, *args, **kwargs)
+    def submitted_layer(self, layer, hidden, mask, cache, *args):
+        hidden = base._layer(self, layer, _tree_head_rows(hidden, cache), mask, cache, *args)
         if getattr(_VERIFY_STATE, "serving", False):
             try:
                 mx.async_eval(hidden)
@@ -5213,6 +8561,16 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
 
     def routed_feed_forward(self, feed_forward, x):
         experts, mlp = getattr(feed_forward, "_unsloth_moe_routed", None), getattr(feed_forward, "switch_mlp", None)
+        if (experts is not None and experts.plain_enabled and getattr(_VERIFY_STATE, "serving", False)
+                and getattr(_VERIFY_STATE, "plain_decode", False)):
+            out = experts.plain(feed_forward, x, lambda: base._feed_forward(self, feed_forward, x))
+            if out is not None:
+                return out
+        if (experts is not None and experts.verify_enabled and getattr(_VERIFY_STATE, "serving", False)
+                and not getattr(_VERIFY_STATE, "plain_decode", False)):
+            out = experts.verify(feed_forward, x, lambda: base._feed_forward(self, feed_forward, x), self)
+            if out is not None:
+                return out
         projections = [getattr(mlp, name, None) for name in ("gate_proj", "up_proj", "down_proj")]
         # The routed object refuses projections it was not built for; only quantized, frozen ones reach it.
         if (experts is None or x.ndim != 3 or not getattr(_VERIFY_STATE, "serving", False)
@@ -5229,8 +8587,11 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
                 scores = mx.take_along_axis(gates, indices, axis = -1)
                 routing = indices, scores / scores.sum(axis = -1, keepdims = True), mx.sigmoid(gate)
             indices, scores, scale = routing
-            shared = self._feed_forward(feed_forward.shared_expert, x)
             rows = (x.shape[0] * x.shape[1], 1, -1)
+            out = experts.folded(feed_forward, *(a.reshape(rows) for a in (x, indices, scores, scale)))
+            if out is not None:
+                return out.reshape(*x.shape[:2], -1)
+            shared = self._feed_forward(feed_forward.shared_expert, x)
             out = experts(feed_forward, *(a.reshape(rows) for a in (x, indices, scores, scale, shared)))
             return None if out is None else out.reshape(*x.shape[:2], -1)
 
@@ -5240,29 +8601,52 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
 
     methods = {entry: verify if entry == "verify" else entered, "_linear": sliced_linear, "_linears": sliced_linears,
                "_feed_forward": routed_feed_forward, "_unsloth_verify_native": base}
-    if submit_layers:
+    if family.submit_layers:
         methods["_layer"] = submitted_layer
+    if held_model is not None:
+        methods["_model"] = held_model
+        if name == "qwen4_exp":
+            methods["_ple"] = staged_ple
     if taped is not None:
         methods["_gated_delta"] = taped_gated_delta
-    attention_bindings = _resolved_bindings(_EXACT_ATTENTION_CONTRACT)
+    pins = family.capabilities.get("attention")
+    attention_bindings = None if pins is None else _resolved_bindings(pins)
     module = sys.modules.get("mlx_vlm.models.qwen3_5.speculative_verifier")
-    # Qwen3.5's verify blocks only: qwen4_exp's forward also routes its sparse attention through `_attention`.
-    if entry != "verify" or attention_bindings is None or module is None:
-        return type(f"_ScopedVerify{base.__name__}", (base,), methods)
+    if attention_bindings is None or module is None:
+        return _moe_verifier_class(type(f"_ScopedVerify{base.__name__}", (base,), methods))
 
     def block_attention(self, attention, x, mask, cache, position_ids, position_embeddings):
-        if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[1] <= 2
-                or not _bindings_intact(attention_bindings)):
+        # The native two-row call launches for both rows' keys, so pairs the rows below can mask come here.
+        pair = isinstance(mask, str) and mask == "causal" or isinstance(mask, mx.array) and mask.ndim >= 4
+        # A layer `row_invariant_attention` holds attends one-row blocks as its decode steps do.
+        invariant = _invariant_attention_held(attention)
+        if (not getattr(_VERIFY_STATE, "serving", False) or x.ndim != 3 or x.shape[1] < 2 and not invariant
+                or x.shape[1] == 2 and not pair or not _bindings_intact(attention_bindings)):
             return base._attention(self, attention, x, mask, cache, position_ids, position_embeddings)
-        # The native body for a block wider than two rows, with its one-row SDPA calls handed to `_exact_attention`.
         batch, length, _ = x.shape
+        causal = isinstance(mask, mx.array) and family.causal_mask is not None and family.causal_mask(attention, cache, length)
         q_proj_output, keys, values = self._linears((attention.q_proj, attention.k_proj, attention.v_proj), x)
+        tree = getattr(_VERIFY_STATE, "tree", None)
+        if tree is not None:
+            if not invariant or position_embeddings is not None or not isinstance(cache.offset, int):
+                raise RuntimeError("a draft tree attends on `row_invariant_attention` with one row's rotary positions")
+            # Each row at its one-token decode's position: the block's first, any rope delta in it, plus its depth.
+            first = mx.full((3, 1, 1), cache.offset, mx.int32) if position_ids is None else position_ids[..., :1]
+            position_ids = first + tree.depth
         queries, keys, values, gate, mask = attention._prepare_projected_qkv(
-            q_proj_output, keys, values, cache, position_ids, position_embeddings, mask)
-        if isinstance(mask, str) and mask == "left_padded_decode":
+            q_proj_output, keys, values, cache if tree is None else _TreeRows(cache), position_ids, position_embeddings, mask)
+        padded = isinstance(mask, str) and mask == "left_padded_decode"
+        if padded:
             mask = None
-        output = self._helpers()._qwen3_5_left_padded_attention(
-            queries, keys, values, cache = cache, scale = attention.scale, mask = mask)
+        if tree is not None:
+            output = _tree_attention(queries, keys, values, attention.scale, tree)
+            return self._linear(attention.o_proj, output.transpose(0, 2, 1, 3).reshape(batch, length, -1) * mx.sigmoid(gate))
+        output = _invariant_attention(queries, keys, values, attention.scale, cache, "causal" if causal else mask) if invariant else None
+        if output is None and (length > 1 or padded):
+            output = self._helpers()._qwen3_5_left_padded_attention(
+                queries, keys, values, cache = cache, scale = attention.scale, mask = mask)
+        if output is None and length == 1:
+            output = module.scaled_dot_product_attention(queries, keys, values, cache = cache, scale = attention.scale, mask = mask)
         if output is None:
             prefix = module.kv_sequence_length(keys) - length
 
@@ -5272,39 +8656,106 @@ def _exact_verify_class(base, entry, submit_layers, *cache_key):
                     module.slice_kv_sequence(values, prefix + i + 1), cache = cache, scale = attention.scale,
                     mask = mask[..., i : i + 1, : prefix + i + 1] if isinstance(mask, mx.array) and mask.ndim >= 4 else None,
                 ) for i in range(length)], axis = 2)
-            output = _exact_attention(queries, keys, values, attention.scale, cache, mask, per_row)
+            output = _exact_attention(queries, keys, values, attention.scale, cache, "causal" if causal else mask, per_row)
         output = output.transpose(0, 2, 1, 3).reshape(batch, length, -1)
         return self._linear(attention.o_proj, output * mx.sigmoid(gate))
 
-    return type(f"_ScopedVerify{base.__name__}", (base,), {**methods, "_attention": block_attention})
+    language = sys.modules.get(family.language)
+    if f"{family.forward}._qsa_attention" not in pins.get(family.language, {}) or language is None:
+        return type(f"_ScopedVerify{base.__name__}", (base,), {**methods, "_attention": block_attention})
+
+    def block_qsa_attention(self, attention, x, cache, position_ids, mask):
+        # mlx-vlm verifies a sparse-regime block wider than two rows as ordered pairs. Its own selection branch takes the
+        # whole block, each row scored, selected and attended as its decode step (one geometry for any row count).
+        indexer, length = attention.indexer, x.shape[1] if x.ndim == 3 else 0
+        past = getattr(cache, "index_offset", getattr(cache, "offset", 0))
+        native = lambda c: base._qsa_attention(self, attention, x, c, position_ids, mask)
+        # A single unquantized cache only: the twin below copies its own state, and a quantized one attends densely.
+        if (length < 3 or not getattr(_VERIFY_STATE, "serving", False) or type(cache) is not language.QSAKVCache
+                or type(past) is not int or past + 1 < (indexer.block_topk + 1) * indexer.compress_ratio
+                or not _bindings_intact(attention_bindings)
+                or getattr(type(indexer).select_from_projected, "_unsloth_exact_route_of", None) is None
+                or not _QSA_VERDICTS.get((indexer.n_heads, indexer.head_dim, indexer.block_topk, False))):
+            return native(cache)
+
+        def block(c):
+            selection = indexer.select_from_projected(self._linear(indexer.index_qk_proj, x), c, position_ids)
+            if selection is None or selection.key_len // indexer.compress_ratio <= indexer.block_topk:
+                return self._attention(attention, x, mask, c, position_ids, None)
+            q_proj, keys, values = self._linears((attention.q_proj, attention.k_proj, attention.v_proj), x)
+            queries, keys, values, gate, _ = attention._prepare_projected_qkv(q_proj, keys, values, c, position_ids,
+                                                                              None, None)
+            output = language.dispatch_qsa_attention(
+                queries, keys, values, selection.selected_blocks, selection.query_ends, cache = c, scale = attention.scale,
+                block_size = indexer.compress_ratio, causal = True, mask = mask,
+                mask_factory = lambda: indexer.build_mask(selection), allow_sparse_decode = True)
+            output = output.transpose(0, 2, 1, 3).reshape(*x.shape[:2], -1)
+            return self._linear(attention.o_proj, output * mx.sigmoid(gate))
+
+        key = ("qsa_block", x.shape[:2], x.dtype)
+        verdict = _VERIFY_VERDICTS.get(key)
+        if verdict:
+            return block(cache)
+        if verdict is False:
+            return native(cache)
+        # First use: the block on a twin of the cache, then the native pairs on the cache itself (both write the
+        # same key slots, the pairs last), compared bit for bit.
+        twin = copy.copy(cache)
+        for name, value in list(vars(cache).items()):
+            if isinstance(value, (list, dict)):
+                setattr(twin, name, copy.copy(value))
+        candidate, reference = block(twin), native(cache)
+        _staged_ready()
+        try:
+            verdict = _settled(candidate.dtype == reference.dtype and candidate.shape == reference.shape
+                               and mx.array_equal(candidate.view(mx.uint16), reference.view(mx.uint16)).item())
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            return reference  # inside a function transformation, which cannot evaluate; checked later
+        _VERIFY_VERDICTS[key] = verdict
+        if not verdict:
+            logger.warning("a QSA verify block differs from mlx-vlm's paired verify for %s; the pairs stay in use", key)
+        return reference
+
+    return _moe_verifier_class(type(f"_ScopedVerify{base.__name__}", (base,),
+                {**methods, "_attention": block_attention, "_qsa_attention": block_qsa_attention}))
 
 
 @contextmanager
 def _exact_forwards(model, forwards, modules):
-    """Serve each of `forwards` (as `_QWEN3_5_VERIFIER`) for the language models of `model` it belongs to."""
+    """Serve each family of `forwards` (names in `SPECULATIVE_FAMILIES`) for the language models of `model` it belongs to."""
     owners, verifiers = [], []
     try:
         with _VERIFY_LOCK:
             usable = not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None) and mx.metal.is_available()
-            for language_name, target_name, native_module, native_name, entry, submit in forwards if usable else ():
-                language = sys.modules.get(language_name)
-                native = getattr(sys.modules.get(native_module), native_name, None)
+            for name in forwards if usable else ():
+                family = SPECULATIVE_FAMILIES[name]
+                language = sys.modules.get(family.language)
+                native = getattr(sys.modules.get(family.module), family.forward, None)
                 call = getattr(getattr(language, "LanguageModel", None), "__call__", None)
-                target = getattr(language, target_name, None)
-                if (call is None or native is None
-                        or getattr(type(target), "_unsloth_verify_native", type(target)) is not native):
+                target = getattr(language, family.target, None)
+                if call is None or native is None or _verifier_native(type(target)) is not native:
                     continue
                 # qwen3_5_moe inherits the call; a shared module is yielded once per path.
                 found = {id(module): module for _, module in _fusion_modules(model, modules)
                          if getattr(type(module), "__call__", None) is call}
-                methods = [getattr(native, name, None) for name in _VERIFY_METHODS]
-                patched = _exact_verify_class(native, entry, submit, *methods) if found else None
+                methods = [getattr(native, method, None) for method in _VERIFY_METHODS]
+                patched = _exact_verify_class(native, name, *methods) if found else None
                 if patched is not None:
-                    target.__class__ = patched
                     target._unsloth_verify_scopes = getattr(target, "_unsloth_verify_scopes", 0) + 1
+                    target.__dict__.setdefault("_unsloth_verify_layer", patched)
+                    _layer_verifier(target, native)
                     verifiers.append(target)
                     for module in found.values():
                         module._unsloth_verify_scopes = getattr(module, "_unsloth_verify_scopes", 0) + 1
+                        if family.entry == "__call__":
+                            shared = vars(module).setdefault("_unsloth_plain_moe_shared", _PlainMoEShared())
+                            for _, child in module.named_modules():
+                                experts = vars(child).get("_unsloth_moe_routed")
+                                if experts is not None:
+                                    experts.shared = shared
+                                    if experts.plain_plan is not None:
+                                        experts.plain_plan.share(shared)
                         owners.append(module)
         yield model
     finally:
@@ -5313,8 +8764,29 @@ def _exact_forwards(model, forwards, modules):
                 owner._unsloth_verify_scopes -= 1
                 if not owner._unsloth_verify_scopes:
                     owner.__dict__.pop("_unsloth_verify_scopes", None)
+                    owner.__dict__.pop("_unsloth_plain_moe_shared", None)
                     if any(owner is verifier for verifier in verifiers):
-                        owner.__class__ = type(owner)._unsloth_verify_native
+                        owner.__dict__.pop("_unsloth_moe_verify_context", None)
+                        owner.__dict__.pop("_unsloth_verify_layer", None)
+                        _layer_verifier(owner, _verifier_native(type(owner)))
+
+
+def _verifier_native(cls):
+    """The mlx-vlm class under the verify scopes' layers."""
+    for name in ("_unsloth_lane_verify_native", "_unsloth_verify_native"):
+        cls = vars(cls).get(name, cls)
+    return cls
+
+
+def _layer_verifier(target, native):
+    """The verifier's class from the scopes holding it, so either scope can nest in the other: the exact layer its
+    first scope installed over the native class, then the lane layer on top. Held layers are never re-resolved."""
+    cls = native
+    if getattr(target, "_unsloth_verify_scopes", 0):
+        cls = target._unsloth_verify_layer
+    if getattr(target, "_unsloth_lane_verify_scopes", 0):
+        cls = _lane_verify_class(cls)
+    target.__class__ = cls
 
 
 @contextmanager
@@ -5329,10 +8801,14 @@ def exact_speculative_verify(model, *, _modules = None):
     pair of rows instead of once per row, where that measured faster on this device. A block's gated-delta layers
     write only their final state, and the commit replays each layer over the retained prefix with the same kernel
     instead of keeping every step's state, once replays of a key's first block matched every per-step state bit
-    for bit. Only verify calls of the language models found here are served; other, training and distributed
-    models, and an mlx-vlm whose verifier drifted, keep the native methods.
+    for bit. 4-, 5-, 6- and 8-bit affine projections run every row of a block in one call per eight rows, each row
+    with its one-row decode arithmetic, on the same condition; `UNSLOTH_MLX_VERIFY_QMV_ROWS=0` keeps them native.
+    Quantized projections mlx-vlm's exact affine kernel refuses (N % 8 or K % 512 off, as a MoE shared-expert gate's)
+    run each row as the one-row call does, which mlx-vlm's gather does not. Only verify calls of the
+    language models found here are served; other, training and distributed models, and an mlx-vlm whose verifier
+    drifted, keep the native methods.
     """
-    with _exact_forwards(model, (_QWEN3_5_VERIFIER,), _modules):
+    with _exact_forwards(model, [n for n, f in SPECULATIVE_FAMILIES.items() if f.entry == "verify"], _modules):
         yield model
 
 
@@ -5343,12 +8819,1461 @@ def exact_batch_invariant_decode(model, *, _modules = None):
 
     As `exact_speculative_verify` does for the Qwen3.5 verifier, frozen quantized projections in blocks wider than
     eight rows run over balanced row slices and sparse blocks' routed experts run on the decode kernels, each once its
-    first call of that shape matched the native call bit for bit. The forward already submits each layer. Only calls
+    first call of that shape matched the native call bit for bit; affine projections of multi-row blocks run their
+    rows together as there. A speculative block's gated-delta layers are taped and fused as the Qwen3.5 verifier's
+    are, each cache replaying its retained prefix on its own commit. A one-token step's gated-delta layers run their
+    convolution through gated norm in that fused launch, once a first step of each layout matched the native method
+    bit for bit (`UNSLOTH_MLX_FUSED_GDN_VERIFY=0` keeps both native). A one-token step's disk PLE rows are read once
+    its forward is built, so the build overlaps the previous step (`UNSLOTH_MLX_STAGED_PLE_ROWS=0` reads them inside
+    the forward). The forward already submits each layer. Only calls
     of the language models found here are served; other, training and distributed models, and an mlx-vlm whose
     forward drifted, keep the native methods.
     """
-    with _exact_forwards(model, (_QWEN4_FORWARD,), _modules):
+    with _exact_forwards(model, [n for n, f in SPECULATIVE_FAMILIES.items() if f.entry != "verify"], _modules):
         yield model
+
+
+_DFLASH2 = "mlx_vlm.speculative.drafters.dflash2.dflash2"
+_DFLASH2_CONTRACT = {_DFLASH2: {
+    "_grouped_dynamic_convolve": "5ab4bc6fa008dbf5",
+    "GroupedDynamicCausalConv.prepare": "ac69137fe6f70673",
+    "GroupedDynamicCausalConv.finish": "9c486c6f81e51dcb",
+    "CandidateSelector.select": "3b72a48573b5e422",
+}}
+
+
+@functools.cache
+def _dynamic_convolve(group_size):
+    # `_grouped_dynamic_convolve`'s arithmetic in one compiled kernel instead of a handful per tap.
+    def convolve(hidden, dynamic, base):
+        batch, length, size = hidden.shape
+        groups = size // group_size
+        blocks = hidden.reshape(batch, length, groups, group_size)
+        dynamic = dynamic.reshape(batch, length, base.shape[0], groups, 1)
+        output = mx.zeros_like(blocks)
+        for offset in range(base.shape[0]):
+            values = blocks if offset == 0 else mx.pad(blocks, [(0, 0), (offset, 0), (0, 0), (0, 0)])[:, :length]
+            kernel = base[offset].reshape(1, 1, groups, group_size).astype(hidden.dtype)
+            output = output + (kernel + dynamic[:, :, offset]) * values
+        return output.reshape(hidden.shape)
+    return mx.compile(convolve)
+
+
+@functools.cache
+def _draft_convolution_kernel(residual):
+    return mx.fast.metal_kernel(
+        name = "unsloth_draft_convolution" + "_residual" * residual,
+        input_names = ["hidden", "dynamic", "base", *(["residual"] if residual else [])], output_names = ["out"],
+        ensure_row_contiguous = False, compile_options = {"math_mode": "safe"},
+        source = r"""
+            uint i = thread_position_in_grid.x;
+            uint C = hidden_shape[2], L = hidden_shape[1];
+            if (i >= hidden_shape[0] * L * C) return;
+            uint c = i % C, r = (i / C) % L, b = i / (C * L);
+            T sum = T(0);
+            for (uint t = 0; t < base_shape[0]; ++t) {
+                T v = r < t ? T(0) : hidden[b * hidden_strides[0] + (r - t) * hidden_strides[1] + c * hidden_strides[2]];
+                T k = T(float(base[t * base_strides[0] + c * base_strides[1]])
+                      + float(dynamic[b * dynamic_strides[0] + r * dynamic_strides[1]
+                                    + t * dynamic_strides[2] + (c / GROUP) * dynamic_strides[3]]));
+                T product = T(float(k) * float(v));
+                sum = T(float(sum) + float(product));
+            }
+        """ + ("out[i] = T(float(residual[b * residual_strides[0] + r * residual_strides[1] + c * residual_strides[2]]) + float(sum));"
+                 if residual else "out[i] = sum;"))
+
+
+def _draft_convolution(hidden, dynamic, base, group_size, residual = None):
+    if (mx.default_device() != mx.gpu
+            or hidden.dtype not in _HALF or hidden.ndim != 3 or not hidden.size
+            or group_size <= 0 or hidden.shape[-1] % group_size
+            or dynamic.shape != (*hidden.shape[:2], base.shape[0], hidden.shape[-1] // group_size)
+            or base.shape != (base.shape[0], hidden.shape[-1]) or dynamic.dtype != hidden.dtype or base.dtype != hidden.dtype
+            or residual is not None and (residual.shape != hidden.shape or residual.dtype != hidden.dtype)):
+        return None
+    return _draft_convolution_kernel(residual is not None)(
+        inputs = [hidden, dynamic, base, *([] if residual is None else [residual])],
+        template = [("T", hidden.dtype), ("GROUP", group_size)], grid = (hidden.size, 1, 1),
+        threadgroup = (256, 1, 1), output_shapes = [hidden.shape], output_dtypes = [hidden.dtype])[0]
+
+
+@functools.cache
+def _draft_selector_kernel():
+    return mx.fast.metal_kernel(
+        name = "unsloth_draft_candidate_walk", input_names = ["pred", "hidden", "succ", "unary", "ids", "anchor"],
+        output_names = ["path", "confidence"], compile_options = {"math_mode": "safe"}, source = r"""
+            uint b = threadgroup_position_in_grid.x, lane = thread_index_in_simdgroup;
+            uint candidate = simdgroup_index_in_threadgroup;
+            threadgroup float scores[TOP];
+            threadgroup uint previous;
+            if (thread_index_in_threadgroup == 0) previous = anchor[b];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint p = 0; p < LENGTH; ++p) {
+                uint token = ids[(b * LENGTH + p) * TOP + candidate];
+                float total = 0.0f;
+                for (uint r = lane; r < RANK; r += 32) {
+                    T a = T(float(pred[previous * RANK + r]) * float(hidden[(b * LENGTH + p) * RANK + r]));
+                    T product = T(float(a) * float(succ[token * RANK + r]));
+                    total += float(product);
+                }
+                total = simd_sum(total);
+                if (lane == 0) scores[candidate] = float(T(float(unary[(b * LENGTH + p) * TOP + candidate]) + float(T(total))));
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (thread_index_in_threadgroup == 0) {
+                    uint best = 0;
+                    for (uint j = 1; j < TOP; ++j) if (scores[j] > scores[best]) best = j;
+                    previous = ids[(b * LENGTH + p) * TOP + best];
+                    path[b * LENGTH + p] = previous;
+                    float denominator = 0.0f;
+                    for (uint j = 0; j < TOP; ++j) denominator += exp(scores[j] - scores[best]);
+                    confidence[b * LENGTH + p] = 1.0f / denominator;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        """)
+
+
+def _draft_selector(selector, previous, hidden, candidates, unary):
+    pred, succ = selector.predecessor_codebook, selector.successor_codebook
+    if (mx.default_device() != mx.gpu or selector.training or hidden.dtype not in _HALF
+            or hidden.ndim != 3 or candidates.ndim != 3 or candidates.shape[:2] != hidden.shape[:2]
+            or unary.shape != candidates.shape or previous.shape != candidates.shape
+            or not 0 < candidates.shape[-1] <= 32 or not 0 < hidden.shape[1] <= matmul.LANE_QMM_MAX_ROWS
+            or type(pred) is not nn.Embedding or type(succ) is not nn.Embedding
+            or pred.weight.dtype != hidden.dtype or succ.weight.dtype != hidden.dtype
+            or unary.dtype != hidden.dtype or candidates.dtype not in (mx.int32, mx.uint32, mx.int64, mx.uint64)
+            or pred.weight.shape != succ.weight.shape or not 0 < pred.weight.shape[1] <= 1024):
+        return None
+    projected = selector.hidden_projection(hidden)
+    if projected.dtype != hidden.dtype or projected.shape != (*hidden.shape[:2], pred.weight.shape[1]):
+        return None
+    path, confidence = _draft_selector_kernel()(
+        inputs = [pred.weight, projected, succ.weight, unary, candidates, previous[:, 0, 0]],
+        template = [("T", hidden.dtype), ("TOP", candidates.shape[-1]), ("LENGTH", hidden.shape[1]), ("RANK", projected.shape[-1])],
+        grid = (32 * candidates.shape[-1] * hidden.shape[0], 1, 1), threadgroup = (32 * candidates.shape[-1], 1, 1),
+        output_shapes = [hidden.shape[:2], hidden.shape[:2]], output_dtypes = [candidates.dtype, mx.float32])
+    if selector.__dict__.get("_unsloth_wants_confidence"):
+        selector.__dict__["_unsloth_confidence"] = confidence
+    return path
+
+
+def _top_candidates(logits, k):
+    # Metal's argpartition sorts the whole vocabulary; each chunk's top k, then theirs, select the same entries in the
+    # same order, as its sort is stable. A vocabulary no chunk divides keeps the one call, which padding could change.
+    chunk = next((c for c in (512, 256) if logits.shape[-1] % c == 0 and logits.shape[-1] > 2 * c and k <= c), None)
+    if chunk is None:
+        return mx.argpartition(logits, -k, axis = -1)[..., -k:]
+    blocks = logits.reshape(*logits.shape[:-1], -1, chunk)
+    local = mx.argpartition(blocks, -k, axis = -1)[..., -k:]
+    offsets = (mx.arange(blocks.shape[-2]) * chunk).astype(local.dtype)
+    index = (local + offsets[:, None]).reshape(*logits.shape[:-1], -1)
+    pick = mx.argpartition(mx.take_along_axis(blocks, local, axis = -1).reshape(index.shape), -k, axis = -1)[..., -k:]
+    return mx.take_along_axis(index, pick, axis = -1)
+
+
+def _candidate_scores(predecessors, hidden, successors, unary):
+    # Adjacent-position edges use CandidateSelector.select's own bf16 product and sum.
+    edges = mx.sum((predecessors * hidden[:, :, None])[:, :, :, None] * successors[:, :, None], axis = -1)
+    return unary[:, :, None] + edges
+
+
+@mx.compile
+def _candidate_walk(predecessors, hidden, successors, unary, candidates, with_confidence = False):
+    # The greedy walk over the edge tables.
+    scores = _candidate_scores(predecessors, hidden, successors, unary)
+    choice, path, confidence = mx.zeros((candidates.shape[0],), mx.int32), [], []
+    for position in range(candidates.shape[1]):
+        row = mx.take_along_axis(scores[:, position], choice[:, None, None], axis = 1)[:, 0]
+        selected = mx.argmax(row, axis = -1)
+        path.append(mx.take_along_axis(candidates[:, position], selected[:, None], axis = -1)[:, 0])
+        if with_confidence:
+            confidence.append(mx.take_along_axis(mx.softmax(row.astype(mx.float32), axis = -1), selected[:, None], axis = -1)[:, 0])
+        choice = selected.astype(mx.int32)
+    path = mx.stack(path, axis = 1)
+    return (path, mx.stack(confidence, axis = 1)) if with_confidence else path
+
+
+def _selector_walk(selector, previous, hidden, candidates, unary):
+    """The selector's greedy walk; a selector asked for confidences also leaves each drafted position's probability."""
+    if (path := _draft_selector(selector, previous, hidden, candidates, unary)) is not None:
+        return path
+    tables = (selector.predecessor_codebook(previous), selector.hidden_projection(hidden),
+              selector.successor_codebook(candidates), unary)
+    if selector.__dict__.get("_unsloth_wants_confidence"):
+        path, selector.__dict__["_unsloth_confidence"] = _candidate_walk(*tables, candidates, True)
+        return path
+    return _candidate_walk(*tables, candidates)
+
+
+def _fused_dflash2_serves(module):
+    # Checked against the native methods on Metal; the CPU's argpartition does not sort.
+    return mx.default_device() == mx.gpu and _bindings_intact(module._unsloth_fused_bindings)
+
+
+@functools.cache
+def _fused_dflash2_class(base):
+    if hasattr(base, "select"):
+        def select(self, hidden, logits, anchor_ids, sampler):
+            if callable(getattr(sampler, "sample_proposal", None)) or not _fused_dflash2_serves(self):
+                return base.select(self, hidden, logits, anchor_ids, sampler)
+            candidates = _top_candidates(logits, self.top_k)
+            # Position 0 follows the anchor, each later one every candidate before it.
+            previous = mx.concatenate([mx.broadcast_to(anchor_ids.reshape(-1, 1, 1), (candidates.shape[0], 1, self.top_k)),
+                                       candidates[:, :-1]], axis = 1)
+            return _selector_walk(self, previous, hidden, candidates, mx.take_along_axis(logits, candidates, axis = -1))
+        return type(f"_Fused{base.__name__}", (base,), {"select": select, "_unsloth_fused_native": base})
+
+    def prepare(self, hidden):
+        if not _fused_dflash2_serves(self):
+            return base.prepare(self, hidden)
+        groups = hidden.shape[-1] // self.group_size
+        dynamic = self.kernel_projection(hidden).reshape(*hidden.shape[:-1], 2, self.kernel_size, groups)
+        prepared = None if self.training else _draft_convolution(hidden, dynamic[..., 0, :, :], self.base_kernel[0], self.group_size)
+        if prepared is None:
+            prepared = _dynamic_convolve(self.group_size)(hidden, dynamic[..., 0, :, :], self.base_kernel[0])
+        return prepared, dynamic[..., 1, :, :]
+
+    def finish(self, hidden, dynamic):
+        if not _fused_dflash2_serves(self):
+            return base.finish(self, hidden, dynamic)
+        result = None if self.training else _draft_convolution(hidden, dynamic, self.base_kernel[1], self.group_size)
+        return _dynamic_convolve(self.group_size)(hidden, dynamic, self.base_kernel[1]) if result is None else result
+
+    return type(f"_Fused{base.__name__}", (base,), {"prepare": prepare, "finish": finish, "_unsloth_fused_native": base})
+
+
+def fused_drafter_ops(model) -> int:
+    """Run a DFlash2 drafter's grouped dynamic convolutions and greedy candidate selection in a few kernels instead of
+    hundreds; returns how many modules now do. Each produces the drafts mlx-vlm's methods do, bit for bit."""
+    module = sys.modules.get(_DFLASH2)
+    bindings = _resolved_bindings(_DFLASH2_CONTRACT) if module is not None else None
+    if bindings is None:
+        return 0
+    fused = [child for _, child in model.named_modules()
+             if type(child) in (module.GroupedDynamicCausalConv, module.CandidateSelector)]
+    for child in fused:
+        child.__dict__["_unsloth_fused_bindings"] = bindings
+        child.__class__ = _fused_dflash2_class(type(child))
+    return len(fused)
+
+
+class TreeBlock(NamedTuple):
+    """A draft tree's rows, parents first, row 0 the anchor: each row's `depth`, its `path` from the anchor (block rows [n, A],
+    itself last, zero padded), the stack slot it keeps its state in for later children (`fork`) and the one it restores its
+    parent's state from (`back`), -1 for none."""
+    depth: mx.array
+    path: mx.array
+    fork: mx.array
+    back: mx.array
+
+    def first(self, rows):
+        return TreeBlock(self.depth[:rows], self.path[:rows], self.fork[:rows], self.back[:rows])
+
+
+# One threadgroup grows the tree best first over the selector's lattice: a node's score is the sum of log p along its
+# path, p = sigmoid(alpha + beta * logit q) by `calibration`'s [alpha, beta] rows at the node's depth (the last one's past
+# them), q the softmax over the TOP candidates of (unary + edge from its parent). A child never scores above its
+# parent, so the first n nodes taken are a tree for every n. They go out in preorder, siblings best first, with the order
+# each was taken in (`tree_rank`): a row's first child is the row after it. With TAKEN they go out as taken: m rows' tree first.
+_DRAFT_TREE_KERNEL = r"""
+    constexpr uint CAP = FRONTIER;
+    uint candidate = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
+    threadgroup float scores[TOP];
+    threadgroup float frontier[CAP * TOP];
+    threadgroup uint entries[CAP * TOP];
+    threadgroup int parents[CAP], tokens[CAP], depths[CAP];
+    threadgroup float totals[CAP], logqs[CAP], frontier_logq[CAP * TOP];
+    threadgroup uint frontier_size, taken, expand;
+    if (thread_index_in_threadgroup == 0) {
+        frontier_size = 0;
+        taken = 1;
+        expand = 0;
+        parents[0] = -1;
+        tokens[0] = anchor[0];
+        depths[0] = 0;
+        totals[0] = 0.0f;
+        logqs[0] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 0; step + 1 < CAP; ++step) {
+        const uint node = expand;
+        const int position = depths[node];
+        const bool grows = position < int(LENGTH) && node < CAP;
+        if (grows) {
+            const uint previous = uint(tokens[node]);
+            const uint token = ids[position * TOP + candidate];
+            float total = 0.0f;
+            for (uint r = lane; r < RANK; r += 32) {
+                total += float(pred[previous * RANK + r]) * float(hidden[position * RANK + r]) * float(succ[token * RANK + r]);
+            }
+            total = simd_sum(total);
+            if (lane == 0) scores[candidate] = float(unary[position * TOP + candidate]) + total;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (thread_index_in_threadgroup == 0) {
+            if (grows) {
+                float top = scores[0];
+                for (uint j = 1; j < TOP; ++j) top = max(top, scores[j]);
+                float denominator = 0.0f;
+                for (uint j = 0; j < TOP; ++j) denominator += exp(scores[j] - top);
+                const float log_denominator = log(denominator);
+                const uint depth = min(uint(position), uint(DEPTHS) - 1u);
+                for (uint j = 0; j < TOP; ++j) {
+                    const float logq = scores[j] - top - log_denominator;
+                    const float q = clamp(exp(logq), 1e-6f, 1.0f - 1e-6f);
+                    const float z = calibration[depth] + calibration[DEPTHS + depth] * log(q / (1.0f - q));
+                    frontier[frontier_size] = totals[node] - log(1.0f + exp(-z));
+                    frontier_logq[frontier_size] = logq;
+                    entries[frontier_size] = node | (j << 8) | (uint(position) << 16);
+                    ++frontier_size;
+                }
+            }
+            float best = -INFINITY;
+            uint at = 0;
+            for (uint i = 0; i < frontier_size; ++i) if (frontier[i] > best) { best = frontier[i]; at = i; }
+            const uint entry = entries[at], from = entry & 255u, j = (entry >> 8) & 255u, p = entry >> 16;
+            frontier[at] = -INFINITY;
+            const uint row = taken++;
+            parents[row] = int(from);
+            tokens[row] = int(ids[p * TOP + j]);
+            depths[row] = depths[from] + 1;
+            totals[row] = best;
+            logqs[row] = frontier_logq[at];
+            expand = row;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (TAKEN && thread_index_in_threadgroup == 0) {
+        // A row whose children are not all the row after it keeps its state for them, in a slot of its own.
+        int slots[CAP], kept = 0;
+        for (uint at = 0; at < CAP; ++at) {
+            const int up = parents[at];
+            tree_tokens[at] = tokens[at];
+            tree_rank[at] = int(at);
+            tree_score[at] = totals[at];
+            tree_logq[at] = logqs[at];
+            tree_depth[at] = depths[at];
+            tree_parent[at] = up;
+            for (int d = 0; d < int(A); ++d) tree_path[at * A + d] = d < depths[at] ? tree_path[uint(up) * A + d] : 0;
+            tree_path[at * A + depths[at]] = int(at);
+            slots[at] = -1;
+            for (uint child = at + 2; child < CAP; ++child) if (uint(parents[child]) == at) slots[at] = kept;
+            kept += slots[at] >= 0;
+            tree_fork[at] = slots[at];
+            tree_back[at] = at != 0 && up != int(at) - 1 ? slots[up] : -1;
+        }
+    } else if (thread_index_in_threadgroup == 0) {
+        // Preorder; a node's children are those with its index as parent, in taking order.
+        const uint n = CAP;
+        int stack[CAP], rank[CAP], slots[CAP];
+        uint top = 0, out = 0;
+        stack[top++] = 0;
+        int open_forks = 0;
+        for (uint i = 0; i < n; ++i) slots[i] = -1;
+        while (top > 0) {
+            const uint at = uint(stack[--top]);
+            rank[at] = int(out);
+            tree_tokens[out] = tokens[at];
+            tree_rank[out] = int(at);
+            tree_score[out] = totals[at];
+            tree_logq[out] = logqs[at];
+            tree_depth[out] = depths[at];
+            tree_parent[out] = at == 0 ? -1 : rank[parents[at]];
+            for (uint d = 0; d < A; ++d) tree_path[out * A + d] = 0;
+            if (at != 0) {
+                const int up = rank[parents[at]];
+                for (int d = 0; d < depths[at]; ++d) tree_path[out * A + d] = tree_path[up * A + d];
+            }
+            tree_path[out * A + depths[at]] = int(out);
+            uint children = 0;
+            for (int child = int(n) - 1; child > int(at); --child) {
+                if (uint(parents[child]) == at) {
+                    stack[top++] = child;
+                    ++children;
+                }
+            }
+            tree_fork[out] = -1;
+            tree_back[out] = -1;
+            if (children > 1) {
+                // The slot stays this node's while its children run, so nested forks stack up.
+                slots[at] = open_forks++;
+                tree_fork[out] = slots[at];
+            }
+            if (at != 0 && out > 0 && tree_parent[out] != int(out) - 1) {
+                tree_back[out] = slots[parents[at]];
+            }
+            ++out;
+        }
+    }
+"""
+_DRAFT_TREE_ACCEPT = r"""
+    // From the anchor into the child whose token is the target's own after its parent, for as long as there is one.
+    uint at = 0, count = 0;
+    for (uint i = 0; i < L; ++i) path[i] = 0;
+    for (uint row = 1; row < L; ++row) {
+        if (parent[row] == int(at) && tokens[row] == target[at]) {
+            path[++count] = int(row);
+            at = row;
+        }
+    }
+    accepted[0] = int(count);
+    accepted[1] = int(at);
+"""
+
+@functools.cache
+def _draft_tree_kernels():
+    return (mx.fast.metal_kernel(
+        name = "unsloth_draft_tree", input_names = ["pred", "hidden", "succ", "unary", "ids", "anchor", "calibration"],
+        output_names = ["tree_tokens", "tree_depth", "tree_parent", "tree_path", "tree_fork", "tree_back", "tree_rank", "tree_score",
+                        "tree_logq"],
+        compile_options = {"math_mode": "safe"}, source = _DRAFT_TREE_KERNEL),
+        mx.fast.metal_kernel(name = "unsloth_draft_tree_accept", input_names = ["tokens", "parent", "target", "L"],
+                             output_names = ["path", "accepted"], source = _DRAFT_TREE_ACCEPT))
+
+
+class DraftTree(NamedTuple):
+    """A drafter's best-first tree: `tokens` [n], row 0 the anchor, `parent` [n], the verify's `block`, and the order each
+    row's node was taken in (`rank`): the rows of rank below m are this lattice's tree of m rows. `score` is each row's
+    log probability along its path, `logq` the selector's for its last edge, `first(m)` that tree of m rows in taking order."""
+    tokens: mx.array
+    parent: mx.array
+    block: TreeBlock
+    rank: mx.array
+    score: mx.array = None
+    logq: mx.array = None
+
+    def first(self, rows):
+        return DraftTree(self.tokens[:rows], self.parent[:rows], self.block.first(rows), self.rank[:rows], self.score[:rows],
+                         self.logq[:rows])
+
+
+_TAKEN_TREE_ROWS = 10  # a gated delta layer keeps eight forked states, and the last two rows fork none
+
+
+def draft_tree(selector, hidden, anchor, candidates, unary, rows, taken = False, calibration = None):
+    """The first `rows` nodes of the best-first tree over a block's candidate lattice, for one drafting row: best by the
+    selector's own probabilities, or by those `calibration`'s float32 [2, depths] rows of alpha and beta map them to."""
+    if taken and rows > _TAKEN_TREE_ROWS:
+        raise RuntimeError(f"a draft tree in taking order holds at most {_TAKEN_TREE_ROWS} rows")
+    projected = selector.hidden_projection(hidden)
+    pred, succ, top = selector.predecessor_codebook.weight, selector.successor_codebook.weight, candidates.shape[-1]
+    length, depth = hidden.shape[1], min(rows - 1, candidates.shape[1])
+    if calibration is None:
+        calibration = mx.array([[0.0], [1.0]])
+    outputs = _draft_tree_kernels()[0](
+        inputs = [pred, projected, succ, unary, candidates, anchor, calibration],
+        template = [("TOP", top), ("LENGTH", length), ("RANK", projected.shape[-1]), ("FRONTIER", rows), ("A", depth + 1),
+                    ("TAKEN", taken), ("DEPTHS", calibration.shape[1])],
+        grid = (32 * top, 1, 1), threadgroup = (32 * top, 1, 1),
+        output_shapes = [(rows,), (rows,), (rows,), (rows, depth + 1), (rows,), (rows,), (rows,), (rows,), (rows,)],
+        output_dtypes = [mx.int32] * 7 + [mx.float32] * 2)
+    tokens, depths, parents, path, fork, back, rank, score, logq = outputs
+    return DraftTree(tokens, parents, TreeBlock(depths, path, fork, back), rank, score, logq)
+
+
+def draft_tree_accept(tree, target):
+    """(path, accepted): the rows the target's own tokens walk from the anchor, zero padded, and [count, last row]."""
+    return tuple(_draft_tree_kernels()[1](
+        inputs = [tree.tokens, tree.parent, target.astype(mx.int32), tree.tokens.size], grid = (1, 1, 1), threadgroup = (1, 1, 1),
+        output_shapes = [tree.tokens.shape, (2,)], output_dtypes = [mx.int32, mx.int32]))
+
+
+# mlx-vlm 0.8.0 moved the layer body into `_forward` and skips rotary on `no_rope_layers`.
+_DRAFT_LAYER_CONTRACTS = (
+    {_DFLASH2: {"DFlash2DecoderLayer.__call__": "c1adba4d305aaa16"}},
+    {_DFLASH2: {"DFlash2DecoderLayer.__call__": "a4bee3318356a55e", "DFlash2DecoderLayer._forward": "8f2e068c3f777518",
+                "_no_rope": "54053377ce5c2a92"}},
+)
+
+
+@functools.cache
+def _draft_layer_class(base):
+    def call(self, x, x_ctx, rope, cache, projected_context = None):
+        if self.training or not _bindings_intact(self._unsloth_draft_layer_bindings):
+            return base.__call__(self, x, x_ctx, rope, cache, projected_context)
+        if not getattr(self, "use_rope", True):
+            rope = sys.modules[_DFLASH2]._no_rope
+        def finish(conv, hidden, dynamic, residual):
+            if (not conv.training and type(conv) is _fused_dflash2_class(sys.modules[_DFLASH2].GroupedDynamicCausalConv)
+                    and _fused_dflash2_serves(conv)):
+                out = _draft_convolution(hidden, dynamic, conv.base_kernel[1], conv.group_size, residual)
+                if out is not None:
+                    return out
+            return residual + conv.finish(hidden, dynamic)
+        residual = x
+        x, dynamic = self.attention_conv.prepare(self.input_layernorm(x))
+        x = finish(self.attention_conv, self.self_attn(x, x_ctx, rope, cache, projected_context), dynamic, residual)
+        residual = x
+        x, dynamic = self.mlp_conv.prepare(self.post_attention_layernorm(x))
+        return finish(self.mlp_conv, self.mlp(x), dynamic, residual)
+    return type(f"_FusedDraft{base.__name__}", (base,), {"__call__": call})
+
+
+def fused_drafter_layers(model) -> int:
+    """Fold covered DFlash2 convolution residuals into their layer's kernels; returns covered layers."""
+    module = sys.modules.get(_DFLASH2)
+    bindings = _first_resolved(_DRAFT_LAYER_CONTRACTS) if module else None
+    if bindings is None:
+        return 0
+    layers = [layer for layer in model.get("layers", []) if type(layer) is module.DFlash2DecoderLayer]
+    for layer in layers:
+        layer.__dict__["_unsloth_draft_layer_bindings"] = bindings
+        layer.__class__ = _draft_layer_class(type(layer))
+    return len(layers)
+
+
+@functools.cache
+def _submitted_drafter_layer_class(base):
+    def call(self, *args, **kwargs):
+        hidden = base.__call__(self, *args, **kwargs)
+        if not self.training and not getattr(_LANE_STATE, "native", False):
+            try:
+                mx.async_eval(hidden)
+            except ValueError:  # not allowed inside a function transformation
+                pass
+        return hidden
+
+    return type(f"_SubmittedDraft{base.__name__}", (base,), {"__call__": call})
+
+
+def submitted_drafter_layers(model) -> int:
+    """Have each of `model.layers` with attention and an MLP submit its output when built in eval mode, so the GPU
+    starts on a draft while the host still builds its later layers; returns how many layers do."""
+    layers = [layer for layer in model.get("layers", []) if hasattr(layer, "self_attn") and hasattr(layer, "mlp")]
+    for layer in layers:
+        layer.__class__ = _submitted_drafter_layer_class(type(layer))
+    return len(layers)
+
+
+_LANE_STATE = local()
+
+
+@contextmanager
+def native_lane_projections():
+    """Keep lane-held projections native for a forward that must evaluate nothing, since the kernel's first call of a
+    shape evaluates it to check it against stock."""
+    outer = getattr(_LANE_STATE, "native", False)
+    _LANE_STATE.native = True
+    try:
+        yield
+    finally:
+        _LANE_STATE.native = outer
+
+
+# Fast Verify leaves small affine projections on the exact routes; its fused family kernels have their own bounds.
+_LANE_LOW_ROWS = int(os.environ.get("UNSLOTH_MLX_FAST_VERIFY_LOW_ROWS", "4"))
+
+
+def _lane_low(module, rows):
+    return rows <= _LANE_LOW_ROWS and bool(module.__dict__.get("_unsloth_lane_verify_scopes"))
+
+
+def _stock_call(p, rows):
+    """`type(p).__call__`, or the stock call Fast Verify's lane wrapper keeps for calls of `rows` rows."""
+    native = vars(type(p)).get("_unsloth_lane_native")
+    return native.__call__ if native is not None and _lane_low(p, rows) else type(p).__call__
+
+
+def _lane_rows(module, x, bindings):
+    """`module`'s projection of x on the lane kernel where `row_invariant_lane_projections` covers it, or None."""
+    if (not module.__dict__.get("_unsloth_lane_qmm") or getattr(_LANE_STATE, "native", False)
+            or (isinstance(x, mx.array) and x.ndim and x.shape[-1] and _lane_low(module, x.size // x.shape[-1]))):
+        return None
+    most = matmul.LANE_QMM_MAX_ROWS
+    if isinstance(x, mx.array) and x.ndim > 2 and x.size // x.shape[-1] > most >= x.shape[-2]:
+        # A batch of short blocks, in launches of `most` rows: a row's bits do not depend on its launch.
+        flat = x.reshape(-1, x.shape[-1])
+        parts = [_lane_rows(module, flat[i:i + most], bindings) for i in range(0, flat.shape[0], most)]
+        return None if any(part is None for part in parts) else mx.concatenate(parts).reshape(*x.shape[:-1], -1)
+    y = _nax_small_m_qmm(module, x, bindings, _LANE_QMM_ROUTE, (1, most))
+    return y if y is None or "bias" not in module else y + module["bias"]
+
+
+def _verify_lane(p, x, bindings):
+    return _lane_rows(p, x, bindings) if getattr(_VERIFY_STATE, "lane", False) and x.ndim == 3 else None
+
+
+def _verify_lanes(ps, x, bindings):
+    return _lane_projections(ps, x, bindings) if getattr(_VERIFY_STATE, "lane", False) else {}
+
+
+def _lane_projections(ps, x, bindings):
+    """By index, the projections of `ps` that `matmul.lane_qmms` launches serve, one per reader two or more of them take:
+    covered weights whose calls of x's shape are verified; each output's bits are its own call's."""
+    if (type(x) is not mx.array or x.ndim != 3 or not x.shape[-1] or getattr(_LANE_STATE, "native", False)
+            or not _bindings_intact(bindings) or x.size // x.shape[-1] > matmul.LANE_QMM_MAX_ROWS):
+        return {}
+    K = x.shape[-1]
+    M = x.size // K
+    groups = {}
+    for i, p in enumerate(ps):
+        ready = p.__dict__.get("_unsloth_lane_qmm_ready", {}).get(x.shape) if p.__dict__.get("_unsloth_lane_qmm") else None
+        if ready is None or p.training or "bias" in p:
+            continue
+        w, scales, biases = p.get("weight"), p.get("scales"), p.get("biases")
+        if type(w) is type(scales) is type(biases) is mx.array and ready[1] == (
+                x.dtype, w.dtype, w.shape, scales.dtype, scales.shape, biases.dtype, biases.shape, p.group_size, p.bits, p.mode):
+            reader = matmul.lane_qmms_reader(w.shape[0], K, p.group_size, p.bits, x.dtype)
+            if reader is not None:
+                groups.setdefault((p.group_size, p.bits, reader), []).append((i, (w, scales, biases)))
+    served = {}
+    for (group_size, bits, _), group in groups.items():
+        if len(group) > 1:
+            ys = matmul.lane_qmms(x.reshape(M, K), [weight for _, weight in group], group_size, bits)
+            served.update({i: y.reshape(*x.shape[:-1], -1) for (i, _), y in zip(group, ys)})
+    return served
+
+
+@functools.cache
+def _lane_module_class(base):
+    """`base` with its covered calls of 1 to `LANE_QMM_MAX_ROWS` rows on the lane kernel, or None."""
+    bindings = _resolved_bindings(_NAX_QMM_CONTRACT)
+    if bindings is None:
+        return None
+    if issubclass(base, nn.QuantizedEmbedding):
+        def as_linear(self, x):
+            y = _lane_rows(self, x, bindings)
+            return base.as_linear(self, x) if y is None else y
+        methods = {"as_linear": as_linear}
+    else:
+        def call(self, x):
+            y = _lane_rows(self, x, bindings)
+            return base.__call__(self, x) if y is None else y
+        methods = {"__call__": call}
+    return type(f"_Lane{base.__name__}", (base,), {**methods, "_unsloth_lane_native": base})
+
+
+@functools.cache
+def _lane_verify_class(base):
+    native = _verifier_native(base)
+    entry = next(family.entry for family in SPECULATIVE_FAMILIES.values()
+                 if getattr(sys.modules.get(family.module), family.forward, None) is native)
+
+    def verify(self, language_model, *args, **kwargs):
+        outer = getattr(_VERIFY_STATE, "lane", False)
+        inputs, outer_low = args[0] if args else kwargs.get("inputs"), getattr(_VERIFY_STATE, "lane_low", False)
+        _VERIFY_STATE.lane = bool(getattr(language_model, "_unsloth_lane_verify_scopes", 0)) and not language_model.training
+        _VERIFY_STATE.lane_low = (_VERIFY_STATE.lane and isinstance(inputs, mx.array) and inputs.ndim == 2
+                                  and _lane_low(language_model, inputs.size))
+        try:
+            return getattr(base, entry)(self, language_model, *args, **kwargs)
+        finally:
+            _VERIFY_STATE.lane, _VERIFY_STATE.lane_low = outer, outer_low
+
+    def linear(self, p, x):
+        y = _verify_lane(p, x, self._unsloth_lane_bindings)
+        if y is None and isinstance(p, _TargetHeadFP32) and _lane_low(p.base_head, x.size // x.shape[-1]):
+            p = p.base_head
+        return base._linear(self, p, x) if y is None else y
+
+    def linears(self, ps, x):
+        shared = _verify_lanes(ps, x, self._unsloth_lane_bindings)
+        ys = [shared[i] if i in shared else _verify_lane(p, x, self._unsloth_lane_bindings) for i, p in enumerate(ps)]
+        if all(y is None for y in ys):
+            return base._linears(self, ps, x)
+        return tuple(base._linear(self, p, x) if y is None else y for p, y in zip(ps, ys))   # the rest as alone
+
+    def embedding_as_linear(self, embedding, x):
+        y = _verify_lane(embedding, x, self._unsloth_lane_bindings)
+        return base._embedding_as_linear(self, embedding, x) if y is None else y
+
+    # mlx-vlm's fused heads read a covered head's codes themselves; declining them leaves its call to the module.
+    def lane_head(linear):
+        return linear.__dict__.get("_unsloth_lane_qmm") and not getattr(_VERIFY_STATE, "lane_low", False)
+
+    def quantized_linear(self, linear, x):
+        return None if lane_head(linear) else base.quantized_linear(self, linear, x)
+
+    def quantized_argmax(self, linear, x, token_mask = None):
+        if lane_head(linear):
+            return None
+        return base.quantized_argmax(self, linear, x, token_mask = token_mask)
+
+    def can_quantized_head(self, linear):
+        return not lane_head(linear) and base.can_quantized_head(self, linear)
+
+    return _moe_verifier_class(type(f"_LaneVerify{base.__name__}", (base,), {
+        entry: verify, "_linear": linear, "_linears": linears, "_embedding_as_linear": embedding_as_linear,
+        "quantized_linear": quantized_linear, "quantized_argmax": quantized_argmax,
+        "can_quantized_head": can_quantized_head, "_unsloth_lane_verify_native": base}))
+
+
+_FAST_VERIFY_ENV = "UNSLOTH_MLX_FAST_VERIFY"
+_FAST_VERIFY_PIN = "_unsloth_fast_verify_pin"       # what the model's drafter was built for
+_FAST_VERIFY_SCOPE = "_unsloth_fast_verify_scope"   # (depth, the outermost scope's decision)
+
+
+def _lane_kernel_on():
+    return matmul.lane_qmm_available() and os.environ.get(_LANE_QMM_ROUTE.switch, "1") != "0"
+
+
+def _fast_verify_state(model):
+    return getattr(getattr(model, "language_model", model), "__dict__", {})
+
+
+def pin_fast_verify(model, fast_verify = None) -> bool:
+    """Settle Fast Verify for `model` until it is reloaded: what an earlier drafter or an open scope decided, else
+    `fast_verify` (`UNSLOTH_MLX_FAST_VERIFY` when None). A drafter's selector, verify floor and warmed costs hold for one
+    decision, so building one pins its target."""
+    pinned = _fast_verify_decision(model, fast_verify)
+    if fast_verify is not None and bool(fast_verify) != pinned:
+        raise ValueError(f"an open scope decided fast_verify = {pinned}; build the drafter outside it")
+    _fast_verify_state(model)[_FAST_VERIFY_PIN] = pinned
+    return pinned
+
+
+def _fast_verify_decision(model, fast_verify = None) -> bool:
+    state = _fast_verify_state(model)
+    pinned = state.get(_FAST_VERIFY_PIN)
+    if pinned is not None:
+        if fast_verify is not None and bool(fast_verify) != pinned:
+            raise ValueError(f"this model's drafter was built with fast_verify = {pinned}; reload it to change that")
+        return pinned
+    outer = state.get(_FAST_VERIFY_SCOPE, (0, None))[1]
+    if outer is not None:
+        return outer
+    return os.environ.get(_FAST_VERIFY_ENV) == "1" if fast_verify is None else bool(fast_verify)
+
+
+def _hold_fast_verify(model, decided):
+    state = _fast_verify_state(model)
+    with _VERIFY_LOCK:
+        state[_FAST_VERIFY_SCOPE] = (state.get(_FAST_VERIFY_SCOPE, (0, None))[0] + 1, decided)
+
+
+def _release_fast_verify(model):
+    state = _fast_verify_state(model)
+    with _VERIFY_LOCK:
+        depth, decided = state.pop(_FAST_VERIFY_SCOPE, (1, None))
+        if depth > 1:
+            state[_FAST_VERIFY_SCOPE] = (depth - 1, decided)
+
+
+def _fast_verify_held(model):
+    return _fast_verify_state(model).get(_FAST_VERIFY_SCOPE, (0, False))[1]
+
+
+def fast_verify_requested(model) -> bool:
+    """Whether `model`'s speculative generations decode under Fast Verify where it covers it and the GPU has its kernel,
+    readable before any generation. A failed kernel probe still keeps the default path."""
+    return _fast_verify_decision(model) and _lane_kernel_on()
+
+
+def fast_verify_enabled(model) -> bool:
+    """`fast_verify_requested`, and Fast Verify covers `model`."""
+    return fast_verify_requested(model) and fast_verify_covers(model)
+
+
+def fast_verify_covers(model) -> bool:
+    """Whether Fast Verify covers `model`, whether or not it is asked for."""
+    return bool(_lane_coverage(model, None)[3])
+
+
+class FastVerifyStatus(NamedTuple):
+    available: bool
+    # "", no_lane_kernel, distributed, not_downloaded, no_eligible_projections or probe_failed
+    reason: str
+    projections: int   # quantized projections the lane kernel takes; approximate before load
+
+    def __bool__(self):
+        return self.available
+
+
+def _fast_verify_status(projections):
+    if not projections:
+        return FastVerifyStatus(False, "no_eligible_projections", 0)
+    if _resolved_bindings(_NAX_QMM_CONTRACT) is None or not nax.kernel_probe_passed(
+            matmul.LANE_QMM_PROBE_KEY, matmul.__name__, "probe_lane_qmm", matmul.lane_qmm_available):
+        return FastVerifyStatus(False, "probe_failed", projections)
+    return FastVerifyStatus(True, "", projections)
+
+
+def fast_verify_available(model):
+    """Whether `fast_verify=True` moves any of `model`'s projections to the lane kernel in a speculative generation here. It ignores the decision and
+    `UNSLOTH_MLX_FAST_VERIFY`, and leaves the model unchanged."""
+    if not _lane_kernel_on():
+        return FastVerifyStatus(False, "no_lane_kernel", 0)
+    if getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+        return FastVerifyStatus(False, "distributed", 0)
+    return _fast_verify_status(len(_lane_coverage(model, None)[3]))
+
+
+def fast_verify_checkpoint_available(model_dir):
+    """`fast_verify_available` for the directory of a downloaded MLX checkpoint, judged from its config.json and
+    safetensors headers without loading it: reason "not_downloaded" when either is missing."""
+    if not _lane_kernel_on():
+        return FastVerifyStatus(False, "no_lane_kernel", 0)
+    model_dir = Path(model_dir)
+    shards = list(model_dir.glob("*.safetensors"))
+    if not (model_dir / "config.json").is_file() or not shards:
+        return FastVerifyStatus(False, "not_downloaded", 0)
+    config = json.loads((model_dir / "config.json").read_text())
+    family = SPECULATIVE_FAMILIES.get(str(config.get("model_type")).removesuffix("_moe"))
+    if family is None or "lanes" not in family.capabilities:
+        return FastVerifyStatus(False, "no_eligible_projections", 0)
+    quantization = config.get("quantization") or {}
+    tensors = {}
+    for shard in shards:
+        with open(shard, "rb") as file:
+            tensors.update(json.loads(file.read(struct.unpack("<Q", file.read(8))[0])))
+    projections = 0
+    for name in tensors:
+        prefix = name.removesuffix(".scales")
+        weight = tensors.get(f"{prefix}.weight")
+        if prefix == name or weight is None or f"{prefix}.biases" not in tensors or len(weight["shape"]) != 2:
+            continue
+        layer = next((quantization[key] for key in (prefix, prefix.removeprefix("language_model."))
+                      if key in quantization), quantization)
+        if isinstance(layer, dict):
+            bits = layer.get("bits", 4)
+            projections += matmul.lane_qmm_supported(weight["shape"][0], weight["shape"][1] * 32 // bits,
+                                                     layer.get("group_size", 64), bits, layer.get("mode", "affine"))
+    return _fast_verify_status(projections)
+
+
+def lane_tile_rows(model) -> int:
+    """The row tile (8 or 16) of the covered quantized weights that hold most of the weight bits; 0 if none."""
+    weight_bits = {8: 0, 16: 0}
+    for module in _lane_coverage(model, None)[3]:
+        if isinstance(module, nn.QuantizedEmbedding):  # a lookup table; a tied head is one matrix, not the bulk
+            continue
+        N, K = _nax_qmm_shape(module, _LANE_QMM_ROUTE)
+        weight_bits[16 if matmul._lane_tensor_units(N, module.bits) else 8] += N * K * module.bits
+    return 0 if not any(weight_bits.values()) else 16 if weight_bits[16] > weight_bits[8] else 8
+
+
+def _lane_coverage(model, modules):
+    if not _lane_kernel_on() or getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+        return None, None, [], []
+    modules = {id(module): module for _, module in _fusion_modules(model, modules)}
+    for family in SPECULATIVE_FAMILIES.values():
+        language = sys.modules.get(family.language)
+        native = getattr(sys.modules.get(family.module), family.forward, None)
+        call = getattr(getattr(language, "LanguageModel", None), "__call__", None)
+        target = getattr(language, family.target, None)
+        if "lanes" not in family.capabilities or call is None or native is None or _verifier_native(type(target)) is not native:
+            continue
+        found = [module for module in modules.values() if getattr(type(module), "__call__", None) is call]
+        if found:
+            covered = [module for module in modules.values() if isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding))
+                       and _nax_qmm_shape(module, _LANE_QMM_ROUTE)]
+            return target, native, found, covered
+    return None, None, [], []
+
+
+@contextmanager
+def row_invariant_lane_projections(model, *, _modules = None):
+    """Fast Verify, in speculative calls: every affine 2- to 8-bit projection called with more than `_LANE_LOW_ROWS`
+    and up to 32 rows, in decode steps, heads and verify blocks alike, runs on the `matmul.lane_qmm` kernel, whose rows
+    do not depend on the call; fewer rows keep stock's arithmetic on the exact verifier's routes. Output is not default
+    decoding's and may depend on row counts. Each shape is checked against stock on first use and a subprocess probe
+    gates the kernel; `UNSLOTH_MLX_LANE_QMM=0` turns the mode off with it, `UNSLOTH_MLX_FAST_VERIFY_LOW_ROWS=0` puts
+    every row count on the kernel, and other, training and distributed models keep their methods.
+    """
+    owners, verifier = [], None
+    try:
+        with _VERIFY_LOCK:
+            target, native, found, covered = _lane_coverage(model, _modules)
+            if covered:
+                bindings = _resolved_bindings(_NAX_QMM_CONTRACT)
+                if bindings is not None and nax.kernel_probe_passed(
+                        matmul.LANE_QMM_PROBE_KEY, matmul.__name__, "probe_lane_qmm", matmul.lane_qmm_available):
+                    target.__dict__.setdefault("_unsloth_lane_bindings", bindings)
+                    for owner in [target, *found, *covered]:
+                        owner._unsloth_lane_verify_scopes = getattr(owner, "_unsloth_lane_verify_scopes", 0) + 1
+                        owners.append(owner)
+                    _layer_verifier(target, native)
+                    verifier = target
+                    for module in covered:
+                        module._unsloth_lane_qmm = True
+                        swapped = _lane_module_class(type(module))
+                        if "_unsloth_lane_native" not in vars(type(module)) and swapped is not None:
+                            module.__class__ = swapped
+        yield model
+    finally:
+        with _VERIFY_LOCK:
+            for owner in owners:
+                owner._unsloth_lane_verify_scopes -= 1
+                if not owner._unsloth_lane_verify_scopes:
+                    for name in ("_unsloth_lane_verify_scopes", "_unsloth_lane_qmm", "_unsloth_lane_qmm_ready",
+                                 "_unsloth_lane_bindings"):
+                        owner.__dict__.pop(name, None)
+                    if "_unsloth_lane_native" in vars(type(owner)):
+                        owner.__class__ = type(owner)._unsloth_lane_native
+                    if owner is verifier:
+                        _layer_verifier(verifier, _verifier_native(type(verifier)))
+
+
+# The one-token decode body whose attention `row_invariant_attention` reroutes (verify blocks reach it through the
+# family's "attention" capability), and the batch cache whose rows it attends as the row-wise forward extracts them.
+_INVARIANT_ATTENTION_CONTRACT = {
+    "mlx_vlm.models.qwen3_5.language": {"Qwen3_5Attention.__call__": "f90d80c414d62ac1",
+                                        "_qwen3_5_left_padding_info": "ef87537a11cd4671",
+                                        "_qwen3_5_left_padded_attention": "df12e7fbee9adf0e"},
+    # 0.7.12's extract adds a bounds check and an empty-cache early return; rows slice alike.
+    "mlx_vlm.models.cache": {"BatchKVCache.update_and_fetch": "73901e5b680dfb41",
+                             "BatchKVCache.extract": ("ff095c4fa939e86a", "e98951dd52b8f67c"),
+                             "BatchKVCache.make_mask": "5a43f29692bfa568"},
+}
+
+
+def _invariant_attention(queries, keys, values, scale, cache, mask):
+    """`attention.invariant_attention` for a KV-cache layer's causal block or lone query row, else None. A batch
+    cache's rows each attend their keys past their left padding: the keys a row's extracted cache holds."""
+    if not attention.invariant_attention_supported(queries, keys, values):
+        return None
+    if _stores_as_kv_cache(cache):
+        causal = isinstance(mask, str) and mask == "causal" or mask is None and queries.shape[2] == 1
+        return attention.invariant_attention(queries, keys, values, scale) if causal else None
+    batch = getattr(sys.modules.get("mlx_vlm.models.cache"), "BatchKVCache", None)
+    if batch is None or any(getattr(type(cache), name, None) is not getattr(batch, name)
+                            for name in ("update_and_fetch", "extract", "make_mask")):
+        return None
+    pads = getattr(cache, "_qwen3_5_decode_left_padding", None)
+    pads = pads or (sys.modules["mlx_vlm.models.qwen3_5.language"]._qwen3_5_left_padding_info(cache) or ((),))[0]
+    if len(pads) != queries.shape[0] or not 0 <= min(pads) <= max(pads) <= keys.shape[2] - queries.shape[2]:
+        return None
+    if len(set(pads)) == 1:
+        return attention.invariant_attention(queries, keys[:, :, pads[0]:], values[:, :, pads[0]:], scale)
+    return mx.concatenate([attention.invariant_attention(queries[i:i + 1], keys[i:i + 1, :, pad:], values[i:i + 1, :, pad:], scale)
+                           for i, pad in enumerate(pads)], axis = 0)
+
+
+def _invariant_attention_held(module):
+    return module.__dict__.get("_unsloth_invariant_attention", 0) > 0 and _bindings_intact(module._unsloth_invariant_bindings)
+
+
+@functools.cache
+def _invariant_attention_class(base):
+    call = base.__call__
+    helper, padded = call.__globals__["scaled_dot_product_attention"], call.__globals__["_qwen3_5_left_padded_attention"]
+
+    def attend(queries, keys, values, cache, scale, mask, sinks = None, **kwargs):
+        out = None
+        if sinks is None and not kwargs and queries.shape[2] == 1:   # prefill stays stock
+            out = _invariant_attention(queries, keys, values, scale, cache, mask)
+        return helper(queries, keys, values, cache, scale, mask, sinks = sinks, **kwargs) if out is None else out
+
+    def attend_padded(queries, keys, values, *, cache, scale, mask):
+        out = _invariant_attention(queries, keys, values, scale, cache, mask) if queries.shape[2] == 1 else None
+        return padded(queries, keys, values, cache = cache, scale = scale, mask = mask) if out is None else out
+
+    def decode_call(self, *args, **kwargs):
+        if _invariant_attention_held(self) and not self.training:
+            routed = FunctionType(call.__code__, {**call.__globals__, "scaled_dot_product_attention": attend,
+                                                  "_qwen3_5_left_padded_attention": attend_padded},
+                                  call.__name__, call.__defaults__, call.__closure__)
+            routed.__kwdefaults__ = call.__kwdefaults__
+            return routed(self, *args, **kwargs)
+        return call(self, *args, **kwargs)
+
+    return type(f"_InvariantAttention{base.__name__}", (base,), {"__call__": decode_call, "_unsloth_invariant_native": base})
+
+
+@contextmanager
+def row_invariant_attention(model, *, _modules = None):
+    """Fast Verify, on Apple GPUs: the KV-cache attention of one-token
+    decode steps and of the exact verifier's blocks runs on `attention.invariant_attention`, whose rows do not depend
+    on the block, so verify rows stay Fast Verify's one-token decoding while a block reads each key once for all its
+    rows. Not stock's bits (within fp32 reordering of stock attention); prefill stays stock. A subprocess probe gates
+    the kernel; other, training and distributed models keep their methods.
+    """
+    changed = []
+    try:
+        with _VERIFY_LOCK:
+            calls = {}
+            for family in SPECULATIVE_FAMILIES.values():
+                pins = family.capabilities.get("invariant_attention")
+                # Decode and verify switch together: both need every body either side pins.
+                parts = [] if pins is None else [_resolved_bindings(c) for c in (pins, family.contract, family.capabilities["attention"])]
+                if parts and None not in parts:
+                    calls.update((target, sum(parts, [])) for _, name, target in parts[0] if name == "__call__")
+            # Off where the lane projections are (`fast_verify_enabled`).
+            if (calls and _lane_coverage(model, _modules)[3] and _resolved_bindings(_NAX_QMM_CONTRACT) is not None
+                    and nax.kernel_probe_passed(matmul.LANE_QMM_PROBE_KEY, matmul.__name__, "probe_lane_qmm", matmul.lane_qmm_available)
+                    and nax.kernel_probe_passed(attention.INVARIANT_PROBE_KEY, attention.__name__, "probe_invariant_attention",
+                                                attention.invariant_attention_available)):
+                for _, module in _fusion_modules(model, _modules):
+                    if not isinstance(module, nn.Module) or module.training:
+                        continue
+                    if "_unsloth_invariant_native" not in vars(type(module)):
+                        if getattr(type(module), "__call__", None) not in calls:
+                            continue
+                        module.__dict__["_unsloth_invariant_bindings"] = calls[type(module).__call__]
+                        module.__class__ = _invariant_attention_class(type(module))
+                    module._unsloth_invariant_attention = module.__dict__.get("_unsloth_invariant_attention", 0) + 1
+                    changed.append(module)
+        yield model
+    finally:
+        with _VERIFY_LOCK:
+            for module in reversed(changed):
+                module._unsloth_invariant_attention -= 1
+                if not module._unsloth_invariant_attention:
+                    for name in ("_unsloth_invariant_attention", "_unsloth_invariant_bindings"):
+                        module.__dict__.pop(name)
+                    module.__class__ = type(module)._unsloth_invariant_native
+
+
+# What a tree verify reproduces of the verifier's one-token positions and the caches' speculation records.
+_TREE_VERIFY_CONTRACT = {
+    "mlx_vlm.models.qwen3_5.language": {"Qwen3_5Attention._prepare_projected_qkv": "19c238671719839f"},
+    "mlx_vlm.models.cache": {"ArraysCache.record_speculative_window": "5d1e2ca5ac5b2419",
+                             "ArraysCache.abort_speculation": "b029b95363a7f3ff", "KVCache.trim": "8c4d89141d5ceded"},
+}
+
+
+@contextmanager
+def row_invariant_tree_verify(model, *, _modules = None):
+    """Fast Verify: let speculative rounds of a language model whose attention layers
+    `row_invariant_attention` holds verify best-first draft trees (`tree_verify`), once `warm_speculative_rounds` has
+    checked and timed them. Nothing changes for a round that verifies a chain."""
+    changed = []
+    try:
+        with _VERIFY_LOCK:
+            for family in SPECULATIVE_FAMILIES.values():
+                pins = family.capabilities.get("tree_verify")
+                call = getattr(getattr(sys.modules.get(family.language), "LanguageModel", None), "__call__", None)
+                if pins is None or call is None or _resolved_bindings(pins) is None:
+                    continue
+                modules = list(_fusion_modules(model, _modules))
+                if not any(isinstance(m, nn.Module) and "_unsloth_invariant_attention" in m.__dict__ for _, m in modules):
+                    continue
+                for module in {id(module): module for _, module in modules if getattr(type(module), "__call__", None) is call}.values():
+                    module.__dict__["_unsloth_tree_verify"] = module.__dict__.get("_unsloth_tree_verify", 0) + 1
+                    changed.append(module)
+        yield model
+    finally:
+        with _VERIFY_LOCK:
+            for module in changed:
+                module.__dict__["_unsloth_tree_verify"] -= 1
+                if not module.__dict__["_unsloth_tree_verify"]:
+                    del module.__dict__["_unsloth_tree_verify"]
+
+
+class _TargetHeadFP32(nn.Module):
+    def __init__(self, head, bindings):
+        super().__init__()
+        self.base_head = head
+        self._training = head.training
+        self._bindings = bindings
+        self._head_type, self._head_call = type(head), type(head).__call__
+        self._layout = (head.group_size, head.bits, head.mode)
+        self._scopes = 0
+
+    def __call__(self, x):
+        p = self.base_head
+        if (os.environ.get(_LANE_QMM_ROUTE.switch, "1") == "0"
+                or p.training or getattr(_LANE_STATE, "native", False) or "bias" in p
+                or type(p) is not self._head_type or type(p).__call__ is not self._head_call
+                or not _bindings_intact(self._bindings) or not isinstance(x, mx.array) or x.ndim < 2
+                or not x.shape[-1] or not x.size or x.dtype not in (mx.bfloat16, mx.float16)
+                or self._layout != (p.group_size, p.bits, p.mode) or not p.__dict__.get("_unsloth_lane_qmm")
+                or _lane_low(p, x.size // x.shape[-1])):
+            return p(x)
+        most = matmul.LANE_QMM_MAX_ROWS
+        if x.size // x.shape[-1] <= most:
+            return self._served(p, x)[0]
+        # In launches of `most` rows, as `_lane_rows` splits them: a row's bits do not depend on its launch.
+        flat = x.reshape(1, -1, x.shape[-1])
+        parts = [self._served(p, flat[:, i : i + most]) for i in range(0, flat.shape[1], most)]
+        if all(served for _, served in parts):
+            return mx.concatenate([y for y, _ in parts], axis = 1).reshape(*x.shape[:-1], -1)
+        return p(x)
+
+    def _served(self, p, x):
+        """(output, whether the lane kernel produced it): the stock head's until x's shape is admitted."""
+        ready = p.__dict__.get("_unsloth_lane_qmm_ready", {}).get(x.shape)
+        if ready is None:
+            original = p(x)
+            ready = p.__dict__.get("_unsloth_lane_qmm_ready", {}).get(x.shape)
+            if ready is None:
+                return original, False
+        w, scales, biases = p.get("weight"), p.get("scales"), p.get("biases")
+        if (not all(isinstance(a, mx.array) for a in (w, scales, biases)) or ready[1] != (
+                x.dtype, w.dtype, w.shape, scales.dtype, scales.shape, biases.dtype, biases.shape,
+                p.group_size, p.bits, p.mode)):
+            return p(x), False
+        y = matmul.lane_qmm(x.reshape(-1, x.shape[-1]), w, scales, biases, p.group_size, p.bits, output_dtype = mx.float32)
+        return y.reshape(*x.shape[:-1], w.shape[0]), True
+
+
+@contextmanager
+def target_head_precision(model, *, _modules = None):
+    """Keep small-row target logits in fp32 under Fast Verify; the drafter retains its original head."""
+    owners = []
+    try:
+        with _VERIFY_LOCK:
+            bindings = _resolved_bindings(_NAX_QMM_CONTRACT)
+            for _, owner in tuple(_fusion_modules(model, _modules)) if bindings is not None else ():
+                head = owner.get("lm_head") if isinstance(owner, nn.Module) else None
+                if isinstance(head, _TargetHeadFP32):
+                    replacement = head
+                elif (isinstance(head, nn.Module) and not head.training and "bias" not in head
+                      and getattr(head, "bits", None) in (4, 8) and head.__dict__.get("_unsloth_lane_qmm")):
+                    replacement = _TargetHeadFP32(head, bindings)
+                    owner.lm_head = replacement
+                else:
+                    continue
+                replacement._scopes += 1
+                owners.append((owner, replacement))
+        yield model
+    finally:
+        with _VERIFY_LOCK:
+            for owner, replacement in reversed(owners):
+                replacement._scopes -= 1
+                if not replacement._scopes and owner.get("lm_head") is replacement:
+                    owner.lm_head = replacement.base_head
+
+
+def lane_drafter_projections(model) -> int:
+    """Run a speculative drafter's covered projections on the `matmul.lane_qmm` kernel from now on; returns how many.
+
+    A drafter only proposes tokens, which verification accepts or rejects, so its rows' fp32 reordering cannot change
+    the output. `UNSLOTH_MLX_LANE_QMM=0` keeps the native calls.
+    """
+    if not _lane_kernel_on():
+        return 0
+    covered = [module for _, module in model.named_modules()
+               if isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding)) and _nax_qmm_shape(module, _LANE_QMM_ROUTE)
+               and "_unsloth_lane_native" not in vars(type(module))]
+    if (not covered or _resolved_bindings(_NAX_QMM_CONTRACT) is None or not nax.kernel_probe_passed(
+            matmul.LANE_QMM_PROBE_KEY, matmul.__name__, "probe_lane_qmm", matmul.lane_qmm_available)):
+        return 0
+    for module in covered:
+        module._unsloth_lane_qmm = True
+        module.__class__ = _lane_module_class(type(module))
+    return len(covered)
+
+
+def lane_drafter_head(model, head) -> bool:
+    """Give a drafter holding `head`, its target's quantized head, its own module over the same arrays on the lane
+    kernel, as its projections are; the target's module keeps its path. Whether it did."""
+    if model.get("lm_head") is head and isinstance(head, _TargetHeadFP32):
+        model.lm_head = head = head.base_head
+    if model.get("lm_head") is not head or not isinstance(head, nn.QuantizedLinear):
+        return False
+    own = copy.copy(head)
+    own.__dict__.pop("_unsloth_lane_verify_scopes", None)   # the target's Fast Verify scope, which a drafter's head is not in
+    if "_unsloth_lane_native" in vars(type(own)):
+        own.__class__ = type(own)._unsloth_lane_native
+    if not lane_drafter_projections(own):
+        return False
+    model.lm_head = own
+    return True
+
+
+_SPARSE_DFLASH2_CONTRACT = {_DFLASH2: {
+    "DFlash2DraftModel.draft_block": "412f77b881193fc9",
+    "DFlash2DraftModel._logits": "bb52b6838eb6afe7",
+}}
+
+
+def _sparse_head_shape(head):
+    if (type(head) not in (nn.QuantizedLinear, _lane_module_class(nn.QuantizedLinear))
+            or head.training or "bias" in head or head.bits not in (4, 8) or head.mode != "affine"
+            or head.group_size not in matmul._LANE_GROUP_SIZES):
+        return None
+    w, scales, biases = (head.get(name) for name in ("weight", "scales", "biases"))
+    if not all(isinstance(a, mx.array) and a.ndim == 2 for a in (w, scales, biases)):
+        return None
+    N, K, dtype = w.shape[0], w.shape[1] * 32 // head.bits, scales.dtype
+    if (w.dtype != mx.uint32 or biases.dtype != dtype or scales.shape != (N, K // head.group_size)
+            or biases.shape != scales.shape):
+        return None
+    if (dtype not in (mx.float16, mx.bfloat16) or N <= 512 or K % (2 * head.group_size)
+            or not matmul.lane_qmm_supported(N, K, head.group_size, head.bits, head.mode)):
+        return None
+    return N, K, dtype
+
+
+_HEAD_SCAN_BLOCK, _HEAD_SCAN_BASE = 2048, 98304
+
+
+class _HeadScan:
+    """The ids one reply's coarse shortlist reads: those below `_HEAD_SCAN_BASE`, the last block, and each block of
+    `_HEAD_SCAN_BLOCK` ids holding a token the reply has seen. A token of another block is drafted only once the reply
+    holds one of that block: a round's drafts lost once per block, for most of the head spared in most replies."""
+
+    def __init__(self, N, tokens = ()):
+        self.N, self.blocks, self._runs = N, {(N - 1) // _HEAD_SCAN_BLOCK}, None
+        self.note(tokens)
+
+    def note(self, tokens):
+        seen = {int(token) // _HEAD_SCAN_BLOCK for token in tokens if _HEAD_SCAN_BASE <= token < self.N} - self.blocks
+        if seen:
+            self.blocks |= seen
+            self._runs = None
+
+    def runs(self, head):
+        """(each scanned position's id, each scanned span's (weight, scales, biases)); None to read the whole head,
+        as past three quarters of it the spans' launches cost what the skipped rows save."""
+        if 4 * (_HEAD_SCAN_BASE + len(self.blocks) * _HEAD_SCAN_BLOCK) >= 3 * self.N:
+            return None
+        source = head.weight, head.scales, head.biases
+        if self._runs is None or any(a is not b for a, b in zip(self._runs[0], source)):
+            spans = [(0, _HEAD_SCAN_BASE)] + [(block * _HEAD_SCAN_BLOCK, min(self.N, (block + 1) * _HEAD_SCAN_BLOCK))
+                                              for block in sorted(self.blocks)]
+            ids = mx.concatenate([mx.arange(lo, hi, dtype = mx.uint32) for lo, hi in spans])
+            self._runs = source, ids, [tuple(a[lo:hi] for a in source) for lo, hi in spans]
+        return self._runs[1:]
+
+
+def _sparse_head_candidates(head, hidden, shape, scan = None):
+    N, K, dtype = shape
+    flat = hidden.reshape(-1, K).astype(dtype)
+    M, w, scales, biases = flat.shape[0], head.weight, head.scales, head.biases
+    coarse = functools.partial(matmul.lane_qmm, flat, group_size = head.group_size, bits = head.bits,
+                               groups = K // (2 * head.group_size), reader = matmul.lane_shortlist_reader(M, head.bits))
+    runs = scan.runs(head) if scan is not None and scan.N == N else None
+    if runs is None:
+        ids = matmul.radix_shortlist(coarse(w, scales, biases))
+    else:
+        ids = mx.take(runs[0], matmul.radix_shortlist(mx.concatenate([coarse(*run) for run in runs[1]], axis = 1)))
+    values = matmul._lane_indexed(flat, w, scales, biases, ids, head.group_size, head.bits)
+    return ids, values
+
+
+def _sparse_candidate_walk(selector, hidden, anchor, ids, values, multiplier, ascending = False):
+    if ascending:
+        values = values * multiplier
+    else:
+        order = mx.argsort(ids, axis = -1)
+        ids, values = mx.take_along_axis(ids, order, axis = -1), mx.take_along_axis(values, order, axis = -1) * multiplier
+    chosen = mx.argpartition(values, -selector.top_k, axis = -1)[:, -selector.top_k:]
+    candidates = mx.take_along_axis(ids, chosen, axis = -1).reshape(*hidden.shape[:-1], selector.top_k)
+    unary = mx.take_along_axis(values, chosen, axis = -1).reshape(candidates.shape)
+    previous = mx.concatenate([mx.broadcast_to(anchor.reshape(-1, 1, 1), (candidates.shape[0], 1, selector.top_k)),
+                               candidates[:, :-1]], axis = 1)
+    return _selector_walk(selector, previous, hidden, candidates, unary)
+
+
+class _SparseDrafter:
+    """A proposal owns its shortlist until the selector consumes it; the head keeps only its weights."""
+
+    def __init__(self, model, target, original, bindings):
+        self.model, self.target, self.original, self.bindings = model, target, original, bindings
+        self.head, self.selector = model.lm_head, model.candidate_selector
+        self.hidden, self.logits, self.select = model._hidden, model._logits, self.selector.select
+
+    def head_shape(self, batch, length, sampler, hidden):
+        """The sparse head's shape when a block of ``batch`` x ``length`` drafts from ``hidden`` runs on the lane kernel;
+        None when `original` answers it."""
+        model, head, selector = self.model, self.head, self.selector
+        multiplier = model.config.output_multiplier
+        if (model.draft_block != self.original or not _lane_kernel_on() or getattr(_LANE_STATE, "native", False)
+                or model.training or model.lm_head is not head or model.candidate_selector is not selector
+                or selector.training or model._hidden != self.hidden or model._logits != self.logits or selector.select != self.select
+                or not _bindings_intact(self.bindings) or not _fused_dflash2_serves(selector)
+                or getattr(self.target, "_unsloth_mlx_distributed_parallel_mode", None)
+                or getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                or callable(getattr(sampler, "sample_proposal", None)) or model.config.final_logit_softcapping is not None
+                or not isinstance(multiplier, (float, int)) or not math.isfinite(multiplier) or multiplier <= 0
+                or not 1 <= selector.top_k <= 512 or not 1 <= batch * length <= matmul.LANE_QMM_MAX_ROWS
+                or not isinstance(hidden, mx.array) or hidden.ndim != 3 or hidden.shape[0] != batch):
+            return None
+        shape = _sparse_head_shape(head)
+        if shape is None or hidden.dtype != shape[2] or model.config.hidden_size != shape[1]:
+            return None
+        return shape
+
+    def head_scan(self, tokens):
+        """A reply's `_HeadScan`, started from its prompt; None when the head is not the sparse one."""
+        shape = _sparse_head_shape(self.head)
+        return None if shape is None else _HeadScan(shape[0], tokens)
+
+    def __call__(self, last_bonus, hidden, cache, block_size, sampler, token_dtype = mx.int32, scan = None):
+        model, selector, original = self.model, self.selector, self.model.draft_block
+        length = int(block_size) - 1
+        batch = 1 if isinstance(last_bonus, int) else int(last_bonus.shape[0])
+        shape = self.head_shape(batch, length, sampler, hidden)
+        if shape is None:
+            return original(last_bonus, hidden, cache, block_size, sampler, token_dtype)
+        head, multiplier = self.head, model.config.output_multiplier
+        anchor = (mx.array([last_bonus], dtype = token_dtype) if isinstance(last_bonus, int)
+                  else last_bonus.reshape(-1).astype(token_dtype))
+        masks = mx.full((batch, length), int(model.config.mask_token_id), dtype = token_dtype)
+        proposed = model._hidden(mx.concatenate([anchor[:, None], masks], axis = 1), hidden, cache)[:, 1:]
+        if proposed.shape != (batch, length, shape[1]) or proposed.dtype != shape[2]:
+            return selector.select(proposed, model._logits(proposed), anchor, sampler).astype(token_dtype)
+        ids, values = _sparse_head_candidates(head, proposed, shape, scan)
+        return _sparse_candidate_walk(selector, proposed, anchor, ids, values, multiplier, ascending = True).astype(token_dtype)
+
+    def tree(self, last_bonus, hidden, cache, block_size, rows, scan = None, taken = False, calibration = None):
+        """This block's best-first `DraftTree` of `rows` rows, in taking order with `taken`."""
+        model, selector = self.model, self.selector
+        length = int(block_size) - 1
+        shape = self.head_shape(1, length, None, hidden)
+        if shape is None:
+            raise RuntimeError("a draft tree needs the sparse head's lane kernel")
+        anchor = mx.array([last_bonus], mx.int32) if isinstance(last_bonus, int) else last_bonus.reshape(-1).astype(mx.int32)
+        masks = mx.full((1, length), int(model.config.mask_token_id), dtype = mx.int32)
+        proposed = model._hidden(mx.concatenate([anchor[:, None], masks], axis = 1), hidden, cache)[:, 1:]
+        ids, values = _sparse_head_candidates(self.head, proposed, shape, scan)
+        values = values * model.config.output_multiplier
+        chosen = mx.argpartition(values, -selector.top_k, axis = -1)[:, -selector.top_k:]
+        candidates = mx.take_along_axis(ids, chosen, axis = -1).reshape(*proposed.shape[:-1], selector.top_k)
+        unary = mx.take_along_axis(values, chosen, axis = -1).reshape(candidates.shape)
+        return draft_tree(selector, proposed, anchor, candidates, unary, rows, taken, calibration)
+
+
+def sparse_drafter(model, target, original):
+    module = sys.modules.get(_DFLASH2)
+    if (not _lane_kernel_on() or module is None or type(model) is not module.DFlash2DraftModel
+            or type(model.candidate_selector) is not _fused_dflash2_class(module.CandidateSelector)):
+        return original
+    bindings = _resolved_bindings({**_SPARSE_DFLASH2_CONTRACT, **_NAX_QMM_CONTRACT})
+    if bindings is None or not nax.kernel_probe_passed(
+            matmul.LANE_QMM_PROBE_KEY, matmul.__name__, "probe_lane_qmm", matmul.lane_qmm_available):
+        return original
+    return _SparseDrafter(model, target, original, bindings)
+
+_DFLASH = "mlx_vlm.speculative.drafters.qwen3_dflash.dflash"
+_PREDRAFT_CONTRACT = {_DFLASH: {"DFlashAttention.__call__": "38d25e361a41e018"}, "mlx_vlm.models.cache": {
+    "KVCache.update_and_fetch": "c169611f253ecb9b",
+    "RotatingKVCache._update_concat": "fa642883e696d809",
+    "RotatingKVCache._update_in_place": "6f3e71619a2f37a3",
+    "RotatingKVCache._temporal_order": "a83d18372d17df76",
+    "RotatingKVCache._trim": "d7e33b6fefc66bde",
+}}
+
+
+class PredraftCache:
+    """Stands in for a DFlash drafter layer's cache while the drafter drafts ahead of its round's acceptance. The
+    layer attends over ``cache``'s context and the round's verified rows, those not ``valid`` (a device mask) left
+    out, with its queries at ``position`` (a device scalar); ``cache`` stays untouched until ``append``."""
+
+    def __init__(self, cache, valid: mx.array, position: mx.array):
+        self.cache, self.valid, self.position, self.rows = cache, valid, position, None
+
+    def history(self):
+        # Every context row the cache holds, in buffer order: the layer attends without a causal mask.
+        cache = self.cache
+        if cache.keys is None:
+            return None, None
+        held = min(cache.offset, cache.keys.shape[2])
+        return cache.keys[..., :held, :], cache.values[..., :held, :]
+
+    def append(self, rows: int):
+        """Write the first ``rows`` verified rows' keys and values, as the block drafted from them would have."""
+        keys, values = self.rows
+        keys, values = keys[:, :, :rows], values[:, :, :rows]
+        if not _append_in_place(self.cache, keys, values):
+            self.cache.update_and_fetch(keys, values)
+
+
+def _append_in_place(cache, keys, values) -> bool:
+    """A multi-row rotating-cache update written in place, grown a step at a time as the single-row update grows it and
+    then wrapping as its ring does, instead of copying the whole window each round; False where the native update runs."""
+    size, rows = getattr(cache, "max_size", None), keys.shape[2]
+    if (size is None or cache.keys is None or cache.keep or rows > size
+            or keys.dtype != cache.keys.dtype or values.dtype != cache.values.dtype):
+        return False
+    held = cache.keys.shape[2]
+    if held > size:
+        if cache._idx != held:
+            return False
+        # A native multi-row update's buffer, in temporal order: its newest `size` rows become the ring.
+        cache.keys, cache.values = cache.keys[..., held - size :, :], cache.values[..., held - size :, :]
+        cache._idx = held = size
+    start = cache._idx % size
+    end = start + rows
+    if end > held and held < size:
+        grown = min(size, max(end, start + cache.step))
+        cache.keys, cache.values = (mx.concatenate([b[..., :start, :], mx.zeros((*b.shape[:2], grown - start, b.shape[3]), b.dtype)], axis = 2)
+                                    for b in (cache.keys, cache.values))
+        held = grown
+    first = min(end, held) - start
+    cache.keys[..., start : start + first, :] = keys[..., :first, :]
+    cache.values[..., start : start + first, :] = values[..., :first, :]
+    if first < rows:
+        cache.keys[..., : rows - first, :] = keys[..., first:, :]
+        cache.values[..., : rows - first, :] = values[..., first:, :]
+    cache._idx = start + first if first == rows else rows - first
+    cache.offset += rows
+    return True
+
+
+def _draft_attention_on():
+    return nax.kernel_probe_passed(attention.DRAFT_PROBE_KEY, attention.__name__, "probe_draft_attention",
+                                   attention.invariant_attention_available)
+
+
+@functools.cache
+def _predraft_class(base):
+    def __call__(self, x, x_ctx, rope, cache, projected_context = None):
+        B, L, _ = x.shape
+        S, commit = x_ctx.shape[1], 0
+        if not isinstance(cache, PredraftCache):
+            # The first context, or one past the window, keeps the native trim; later ones append as a predraft's would.
+            if cache.keys is None or S >= (self.sliding_window if self.is_sliding else 1 << 30):
+                return base.__call__(self, x, x_ctx, rope, cache, projected_context)
+            cache, commit = PredraftCache(cache, mx.ones((S,), mx.bool_), mx.array(cache.offset + S, mx.int32)), S
+        # `DFlashAttention.__call__` with the context's keys appended to the cache's only in `PredraftCache.append`.
+        bindings = self.__dict__.get("_unsloth_lane_bindings")
+        shared = {}
+        if bindings is not None and projected_context is None and type(self)._project_kv is base._project_kv and _lane_kernel_on():
+            # The context's keys and values in one launch, the block's queries, keys and values in another.
+            shared = {**{i + 3: y for i, y in _lane_projections((self.k_proj, self.v_proj), x_ctx, bindings).items()},
+                      **_lane_projections((self.q_proj, self.k_proj, self.v_proj), x, bindings)}
+        if len(shared) == 5:
+            queries, prop_keys, prop_values, ctx_keys, ctx_values = (shared[i] for i in range(5))
+        else:
+            queries = self.q_proj(x)
+            ctx_keys, ctx_values = self._project_kv(x_ctx) if projected_context is None else projected_context
+            prop_keys, prop_values = self._project_kv(x)
+        queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(0, 2, 1, 3)
+        ctx_keys = self.k_norm(ctx_keys.reshape(B, S, self.n_kv_heads, ctx_keys.shape[-1] // self.n_kv_heads)).transpose(0, 2, 1, 3)
+        ctx_values = ctx_values.reshape(B, S, self.n_kv_heads, ctx_values.shape[-1] // self.n_kv_heads).transpose(0, 2, 1, 3)
+        prop_keys = self.k_norm(prop_keys.reshape(B, L, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
+        prop_values = prop_values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        queries = rope(queries, offset = cache.position)
+        ctx_keys = rope(ctx_keys, offset = cache.cache.offset)
+        prop_keys = rope(prop_keys, offset = cache.position)
+        cache.rows = ctx_keys, ctx_values
+        old_keys, old_values = cache.history()
+        held = 0 if old_keys is None else old_keys.shape[2]
+        # Block rows first, so verified rows keep their places whether the block drafts before or after acceptance.
+        keys = mx.concatenate([prop_keys, ctx_keys], axis = 2)
+        values = mx.concatenate([prop_values, ctx_values], axis = 2)
+        mask = mx.concatenate([mx.ones((L,), mx.bool_), cache.valid])
+        if held and _draft_attention_on() and attention.draft_attention_supported(queries, old_keys, old_values, keys, values):
+            o = attention.draft_attention(queries, old_keys, old_values, keys, values, mask, self.attention_sink_bias, self.scale)
+        else:
+            if held:
+                keys = mx.concatenate([old_keys, keys], axis = 2)
+                values = mx.concatenate([old_values, values], axis = 2)
+                mask = mx.concatenate([mx.ones((held,), mx.bool_), mask])
+            o = mx.fast.scaled_dot_product_attention(queries, keys, values, scale = self.scale, mask = mask[None, None, None],
+                                                     sinks = self.attention_sink_bias)
+        if commit:
+            cache.append(commit)
+        return self.o_proj(o.transpose(0, 2, 1, 3).reshape(B, L, -1))
+
+    return type(f"_Predraft{base.__name__}", (base,), {"__call__": __call__, "_unsloth_predraft_native": base})
+
+
+def predraft_attention(model) -> int:
+    """Let a DFlash-family drafter draft a block through `PredraftCache`s; returns how many verified rows a block may
+    then read (0 when an attention or cache is not one the predraft reproduces, or upstream changed)."""
+    module = sys.modules.get(_DFLASH)
+    if module is None or _resolved_bindings(_PREDRAFT_CONTRACT) is None:
+        return 0
+    from mlx_vlm.models.cache import KVCache, RotatingKVCache
+
+    attentions = [getattr(layer, "self_attn", None) for layer in getattr(model, "layers", ())]
+    native = [getattr(type(a), "_unsloth_predraft_native", type(a)) for a in attentions]
+    # A causal layer's mask counts positions by key index, which the masked rows would shift.
+    if not attentions or any(base is not module.DFlashAttention or a.is_causal for a, base in zip(attentions, native)):
+        return 0
+    if any(type(cache) not in (KVCache, RotatingKVCache) for cache in model.make_cache()):
+        return 0
+    bindings = _resolved_bindings(_NAX_QMM_CONTRACT)
+    for attention in attentions:
+        attention.__class__ = _predraft_class(module.DFlashAttention)
+        attention.__dict__["_unsloth_lane_bindings"] = bindings
+    _draft_attention_on()   # its probe at load, not in a reply's first round
+    # Past a sliding layer's window, the native call would trim the rows the predraft masks.
+    return min([a.sliding_window - 1 for a in attentions if a.is_sliding] or [1 << 30])
 
 
 # MLX's sdpa_vector_2pass_1/2 (mlx/backend/metal/kernels/sdpa_vector.h, Copyright © 2024 Apple Inc., MIT),
@@ -5494,13 +10419,13 @@ def _vector_attention_source():
 
 @functools.cache
 def _gpu_class():
-    info = (getattr(mx, "device_info", None) or mx.metal.device_info)()
+    info = mx.device_info()
     return str(info.get("architecture", ""))[-1:]
 
 
 @functools.cache
 def _gpu_generation():
-    info = (getattr(mx, "device_info", None) or mx.metal.device_info)()
+    info = mx.device_info()
     match = re.match(r"applegpu_g(\d+)", str(info.get("architecture", "")))
     return int(match.group(1)) if match else 0
 
@@ -5565,7 +10490,7 @@ def _decode_attention(queries, keys, values, scale):
 
 # Query heads per KV head served by default: at 8 (E2B, 26B-A4B, 31B) MLX decodes a lone query on the same
 # vector kernel, so each verify row is the attention a decode step computes. At 4 (E4B) decode stays unfused
-# and the kernel only changes rounding, so it is opt-in with UNSLOTH_MLX_VERIFY_ATTENTION=1. At 16 (12B) the
+# and the kernel only changes rounding, so it waits for Fast Verify. At 16 (12B) the
 # unfused attention is already as fast.
 _VERIFY_ATTENTION_GQA = (8,)
 _VERIFY_ATTENTION_OPT_IN_GQA = (4,)
@@ -5575,9 +10500,8 @@ _VERIFY_ATTENTION_LOCK = RLock()
 _VERIFY_ATTENTION_VERDICTS = {}
 
 
-def _verify_attention_serves(gqa):
-    return gqa in _VERIFY_ATTENTION_GQA or (
-        gqa in _VERIFY_ATTENTION_OPT_IN_GQA and os.environ.get("UNSLOTH_MLX_VERIFY_ATTENTION", "0") == "1")
+def _verify_attention_serves(gqa, fast_verify):
+    return gqa in _VERIFY_ATTENTION_GQA or (gqa in _VERIFY_ATTENTION_OPT_IN_GQA and fast_verify)
 
 
 def _two_pass_keys(keys):
@@ -5615,6 +10539,7 @@ def _wide_head_decode_attention(queries, keys, values, scale, mask):
     out = _vector_attention(queries, keys, values, scale, blocks)
     if verdict is None:
         with _WIDE_ATTENTION_LOCK:
+            _staged_ready()
             try:
                 native = mx.fast.scaled_dot_product_attention(queries, keys, values, scale = scale, mask = mask)
                 verdict = _settled(mx.array_equal(out.view(mx.uint16), native.view(mx.uint16)).item())
@@ -5708,7 +10633,7 @@ def fused_decode_attention(model, *, _modules = None):
                 module.__class__ = type(module)._unsloth_wide_attention_native
 
 
-def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache):
+def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache, fast_verify = False):
     """A verify block's head-dim-512 causal attention on MLX's vector kernel, or None for the native call."""
     if not (isinstance(mask, str) and mask == "causal" and (cache is None or type(cache) is kv_cache)
             and queries.ndim == 4 and queries.shape[0] == 1 and keys.shape == values.shape
@@ -5716,7 +10641,7 @@ def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache):
             and queries.dtype in (mx.bfloat16, mx.float16) and queries.dtype == keys.dtype == values.dtype
             and 2 <= queries.shape[2] <= min(_VERIFY_ATTENTION_ROWS, keys.shape[2])
             and keys.shape[1] and queries.shape[1] % keys.shape[1] == 0
-            and _verify_attention_serves(queries.shape[1] // keys.shape[1])
+            and _verify_attention_serves(queries.shape[1] // keys.shape[1], fast_verify)
             and _two_pass_keys(keys.shape[2] - queries.shape[2] + 1)
             and _vector_attention_kernels() is not None):
         return None
@@ -5737,6 +10662,7 @@ def _verify_attention(queries, keys, values, cache, scale, mask, kv_cache):
         out = _vector_attention(*chunk, scale, blocks)
         if verdict is None:
             with _VERIFY_ATTENTION_LOCK:
+                _staged_ready()
                 try:
                     verdict = _settled(mx.array_equal(out.view(mx.uint16),
                                                       _decode_attention(*chunk, scale).view(mx.uint16)).item())
@@ -5768,7 +10694,8 @@ def _verify_attention_class(base):
         return None
 
     def attention(queries, keys, values, cache, scale, mask, sinks = None):
-        out = None if sinks is not None else _verify_attention(queries, keys, values, cache, scale, mask, kv_cache)
+        out = None if sinks is not None else _verify_attention(queries, keys, values, cache, scale, mask, kv_cache,
+                                                               _VERIFY_STATE.attention_fast_verify)
         return native(queries, keys, values, cache = cache, scale = scale, mask = mask) if out is None else out
 
     routed = FunctionType(call.__code__, {**namespace, "scaled_dot_product_attention": attention},
@@ -5778,6 +10705,7 @@ def _verify_attention_class(base):
     def verify_call(self, *args, **kwargs):
         if (getattr(_VERIFY_STATE, "attention", False) and not self.training
                 and namespace.get("scaled_dot_product_attention") is native and _bindings_intact(bindings)):
+            _VERIFY_STATE.attention_fast_verify = self.__dict__.get("_unsloth_verify_attention_fast_verify", False)
             return routed(self, *args, **kwargs)
         return call(self, *args, **kwargs)
 
@@ -5797,6 +10725,115 @@ def verify_block_attention():
 
 
 @contextmanager
+def deeper_causal_verify(rows: int):
+    """Admit causal verify blocks of up to ``rows`` query rows to `_native_causal_attention` for the forwards built inside."""
+    outer = getattr(_VERIFY_STATE, "causal_rows", _NATIVE_CAUSAL_ROWS)
+    _VERIFY_STATE.causal_rows = rows
+    try:
+        yield
+    finally:
+        _VERIFY_STATE.causal_rows = outer
+
+
+_TREE_HEAD_LAYERS = 1  # layers a sized tree's verify runs over every drafted row while its lattice is read
+
+
+@contextmanager
+def tree_verify(block, size = None):
+    """While open, the forward built verifies its block as `block`'s tree: each row is its path's one-token decode.
+    Given `size`, of rows in taking order it verifies the first `size()`, asked once its first `_TREE_HEAD_LAYERS` layers
+    are submitted over the whole block: the GPU runs those while `size` waits for the lattice instead of idling."""
+    outer = getattr(_VERIFY_STATE, "tree", None), getattr(_VERIFY_STATE, "tree_head", None)
+    _VERIFY_STATE.tree, _VERIFY_STATE.tree_head = block, None if size is None else [_TREE_HEAD_LAYERS, size]
+    try:
+        yield
+    finally:
+        _VERIFY_STATE.tree, _VERIFY_STATE.tree_head = outer
+
+
+def _tree_head_rows(hidden, cache):
+    """`hidden` as a verify layer on `cache` takes it: past a sized tree's first layers, the rows its lattice pays for."""
+    head = getattr(_VERIFY_STATE, "tree_head", None)
+    if head is None:
+        return hidden
+    head[0] -= 1
+    if head[0] >= 0:
+        return hidden
+    if head[1] is not None:
+        size, head[1] = head[1], None
+        _VERIFY_STATE.tree = _VERIFY_STATE.tree.first(size())
+    rows = _VERIFY_STATE.tree.depth.size
+    speculation = getattr(cache, "_speculation", None)
+    if speculation is not None:
+        speculation["length"] = rows  # nothing is recorded yet: the cache's window is the narrowed block's
+    return hidden if hidden.shape[1] == rows else hidden[:, :rows]
+
+
+def tree_commit(transaction, caches, path):
+    """Commit block rows `path` (a list from the anchor) of a tree verify: a prefix of the block as any block's, others
+    by writing their keys and values at the front of the block, and leaving each gated delta layer the path's replay, which
+    the next tree block folds in reading the rows where they are."""
+    blocks = [vars(entry).pop("_unsloth_tree_rows", None) for entry in caches]
+    if path == list(range(len(path))):
+        transaction.commit([len(path)])
+        return
+    rows, tapes = mx.array(path, mx.int32), transaction.__dict__.pop("_unsloth_tapes", ())
+    windows = [cache._speculation["records"][0] for cache, *_ in tapes]
+    transaction.abort()
+    gather = lambda x: mx.take(x, rows, axis = 1)
+    retained, taps = mx.array([len(path)], mx.uint32), {}
+    for (cache, index, replay, mask, _), (_, source, width) in zip(tapes, windows):
+        q, k, v, a, b, A_log, dt_bias, entry = replay.args
+        path_replay = functools.partial(replay.func, gather(q), gather(k), gather(v), gather(a), gather(b), A_log, dt_bias, entry,
+                                        **replay.keywords)
+        cache[index] = path_replay(mask = mask)[1]
+        cache._unsloth_pending = (cache[index], path_replay, retained)
+        cache._unsloth_pending_path = (k, v, a, b, rows)
+        if width not in taps:   # built on the host, once: as arrays per layer they were most of the commit's GPU ops
+            taps[width] = mx.array([*range(width), *(row + width for row in path)][-width:], mx.int32)
+        cache[0] = mx.take(source, taps[width], axis = 1)
+    for entry, block in zip(caches, blocks):
+        if block is not None:
+            prefix, length = entry.offset, len(path)
+            entry.keys[..., prefix : prefix + length, :] = mx.take(block[0], rows, axis = 2)
+            entry.values[..., prefix : prefix + length, :] = mx.take(block[1], rows, axis = 2)
+            entry.offset = prefix + length
+
+
+def tree_verify_matches(engine) -> bool:
+    """Whether, on `engine`'s live caches, a chain-shaped tree verifies as the chain does and a forked tree's rows as their
+    paths' chains do, bit for bit. Every verify here is undone."""
+    pending = engine._rows[0].pending
+    tokens = [pending, (pending + 1) % 1000, (pending + 2) % 1000, (pending + 3) % 1000]
+
+    def verify(rows, block = None):
+        with mx.stream(engine._stream), tree_verify(block) if block is not None else nullcontext():
+            logits, _, transaction = engine._verify(mx.array([rows], mx.int32))
+        try:
+            mx.eval(logits)
+        finally:
+            transaction.abort()
+        return logits[0]
+
+    table = lambda *rows: mx.array([list(row) + [0] * (4 - len(row)) for row in rows], mx.int32)
+    same = lambda x, y: x.dtype == y.dtype and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
+    none = mx.full((4,), -1, mx.int32)
+    chain = TreeBlock(mx.arange(4, dtype = mx.int32), table((0,), (0, 1), (0, 1, 2), (0, 1, 2, 3)), none, none)
+    forked = TreeBlock(mx.array([0, 1, 2, 1], mx.int32), table((0,), (0, 1), (0, 1, 2), (0, 3)),
+                       mx.array([0, -1, -1, -1], mx.int32), mx.array([-1, -1, -1, 0], mx.int32))
+    try:
+        straight = verify(tokens)
+        if not same(straight, verify(tokens, chain)):
+            return False
+        tree = verify(tokens, forked)
+        branch = verify([pending, tokens[3], tokens[1]])
+        return same(tree[:3], straight[:3]) and same(tree[3], branch[1])
+    except (RuntimeError, ValueError) as error:
+        _unless_failed_buffer(error)
+        return False
+
+
+@contextmanager
 def fused_verify_attention(model, *, _modules = None):
     """Run Gemma 4's head-dim-512 attention for a speculative verify block on MLX's vector kernel.
 
@@ -5804,7 +10841,7 @@ def fused_verify_attention(model, *, _modules = None):
     step's at long context. Inside `verify_block_attention`, an eligible single-sequence causal block with 8
     query heads per KV head runs on a copy of MLX's own two-pass vector kernel instead, once its first launch
     of that shape matched, row by row and bit for bit, the attention a decode step computes; 4 query heads per
-    KV head join with `UNSLOTH_MLX_VERIFY_ATTENTION=1`. Other calls, training and distributed models keep the
+    KV head join under Fast Verify. Other calls, training and distributed models keep the
     native attention. Instance classes are restored when the context exits.
     """
     changed = []
@@ -5828,6 +10865,7 @@ def fused_verify_attention(model, *, _modules = None):
                     if patched is not None:
                         module.__class__ = patched
                         module._unsloth_verify_attention_scopes = 1
+                        module._unsloth_verify_attention_fast_verify = _fast_verify_held(model)
                         changed.append(module)
         yield model
     finally:
@@ -5838,12 +10876,13 @@ def fused_verify_attention(model, *, _modules = None):
                     module._unsloth_verify_attention_scopes = scopes - 1
                     continue
                 module.__dict__.pop("_unsloth_verify_attention_scopes", None)
+                module.__dict__.pop("_unsloth_verify_attention_fast_verify", None)
                 native = getattr(type(module), "_unsloth_verify_attention_native", None)
                 if native is not None:
                     module.__class__ = native
 
 
-# The selection route recomputes the indexer query and per-head scores exactly as this body does.
+# Admitted selection layouts reuse this pinned body's query, pooling and float32 scores.
 _QSA_SELECT_CONTRACT = {
     "mlx_vlm.models.qwen4_exp.language": {"Qwen4ExpQSAIndexer.select_from_projected": "379bb821075d65a8"},
 }
@@ -5852,8 +10891,42 @@ _QSA_SCOPES = {}
 _QSA_VERDICTS = {}
 
 
+@functools.cache
+def _qsa_direct_selection(native):
+    tree = copy.deepcopy(_function_ast(native))
+    scores = [i for i, node in enumerate(tree.body) if isinstance(node, ast.Assign)
+              and isinstance(node.value, ast.BinOp) and isinstance(node.value.op, ast.MatMult)]
+    counts = [copy.deepcopy(node) for node in tree.body if isinstance(node, ast.Assign)
+              and any(isinstance(target, ast.Name) and target.id in ("query_ends", "visible_counts", "complete_counts")
+                      for target in node.targets)]
+    if len(scores) != 1 or len(counts) != 3 or not isinstance(tree.body[-1], ast.Return):
+        return None
+    branch = ast.parse("if zero_padding and cache is not None and self.block_topk > 0 "
+                       "and pooled_keys.shape[2] > self.block_topk: pass").body[0]
+    branch.body = [*counts, *ast.parse("selected_blocks = _unsloth_qsa_attention.select_blocks("
+                                     "scores, complete_counts, self.block_topk, self.head_dim)").body,
+                   copy.deepcopy(tree.body[-1])]
+    tree.body.insert(scores[0] + 1, branch)
+    function = _function_from_ast(native, tree)
+    namespace = {**native.__globals__, "_unsloth_qsa_attention": attention}
+    routed = FunctionType(function.__code__, namespace, function.__name__, native.__defaults__, native.__closure__)
+    routed.__kwdefaults__ = native.__kwdefaults__
+    bindings = [(native.__globals__, name, native.__globals__[name])
+                for name in native.__code__.co_names if name in native.__globals__]
+    return routed, bindings
+
+
 def _qsa_select_route(native, bindings):
+    plan = _qsa_direct_selection(native)
+    direct_bindings = [*bindings, *plan[1]] if plan is not None else None
+
     def select_from_projected(self, qk, cache, position_ids):
+        if plan is not None:
+            if self.training or not _bindings_intact(direct_bindings):
+                return native(self, qk, cache, position_ids)
+            verdict = _QSA_VERDICTS.get((self.n_heads, self.head_dim, self.block_topk, qk.shape[1] == 1))
+            if verdict is not None:
+                return plan[0](self, qk, cache, position_ids) if verdict else native(self, qk, cache, position_ids)
         past = cache.offset if cache is not None else 0
         selection = native(self, qk, cache, position_ids)
         pooled = getattr(cache, "index_block_keys", None)
@@ -5872,6 +10945,7 @@ def _qsa_select_route(native, bindings):
         key = (self.n_heads, self.head_dim, self.block_topk, rows == 1)
         verdict = _QSA_VERDICTS.get(key)
         if verdict is None:
+            _staged_ready()
             try:
                 verdict = _settled(bool(mx.array_equal(mx.sort(selection.selected_blocks, axis = -1), picks).item()))
             except (RuntimeError, ValueError) as error:
@@ -5887,6 +10961,76 @@ def _qsa_select_route(native, bindings):
 
     select_from_projected._unsloth_exact_route_of = native
     return select_from_projected
+
+
+_QSA_DECODE_CONTRACT = {
+    "mlx_vlm.models.qwen4_exp.qsa_kernel": {
+        "qsa_sparse_attention": "fba8493893421648",
+        "select_qsa_execution_plan": "73a34b78cc396c32",
+        "_qsa_sparse_attention_kernel": None,
+        "_qsa_sparse_attention_kernel.__wrapped__": "52e130d59444ce3e",
+        "_qsa_sparse_attention_scalars": None,
+        "_qsa_sparse_attention_scalars.__wrapped__": "ea56a58fb11effad",
+        "_QSA_SPARSE_ATTENTION_SOURCE": None,
+    },
+}
+_QSA_DECODE_SOURCE = "15388c560af7468e7c3c9641bdb454ec4991167b94496fec24a7d0685e3292aa"
+
+
+@functools.cache
+def _qsa_decode_kernel(source):
+    if (mx.__version__ != "0.32.4" or not mx.metal.is_available()
+            or hashlib.sha256(source.encode()).hexdigest() != _QSA_DECODE_SOURCE):
+        return None
+    # Keep native arithmetic and geometry; only K/V integer addresses change. Feature views read their strides too.
+    for name, pointer in (("keys", "kptr"), ("values", "vptr")):
+        pattern = (rf"{name} \+ \(\(\(batch_idx \* NUM_KV_HEADS \+ kv_head_idx\) \* key_length \+"
+                   rf"\s*(key_pos|tail_pos)\) \* D_SIZE\) \+\s*int\(simd_lid\) \* (qk_per_thread|v_per_thread)")
+        source, count = re.subn(pattern, rf"{name} + (batch_idx * {name}_strides[0] + kv_head_idx * {name}_strides[1]"
+                               rf" + \1 * {name}_strides[2]) + int(simd_lid) * \2 * {name}_strides[3]", source)
+        if count != 2:
+            return None
+        source = source.replace(f"{pointer}[j]", f"{pointer}[j * {name}_strides[3]]")
+    contiguous = source
+    for name in ("keys", "values"):
+        contiguous = contiguous.replace(f" * {name}_strides[3]", "")
+    source = ("if (keys_strides[3] == 1 && values_strides[3] == 1) {\n" + contiguous
+              + "\n} else {\n" + source + "\n}")
+    try:
+        return mx.fast.metal_kernel(
+            name = "unsloth_qsa_decode_strides",
+            input_names = ["queries", "keys", "values", "block_indices", "query_ends", "scale", "k_size"],
+            output_names = ["out"], header = "#include <metal_simdgroup>\nusing namespace metal;\n",
+            source = source, ensure_row_contiguous = False)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _qsa_decode_route(native, bindings, kernel):
+    tree = copy.deepcopy(_function_ast(native))
+    tree.body = [statement for statement in tree.body if not (
+        isinstance(statement, ast.Assign) and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name) and statement.targets[0].id in ("keys", "values")
+        and _source_expression(statement.value) == f"mx.contiguous({statement.targets[0].id})")]
+    fused = _function_from_ast(native, tree)
+    fused = FunctionType(fused.__code__, {**fused.__globals__, "_qsa_sparse_attention_kernel": lambda *args: kernel},
+                         fused.__name__, fused.__defaults__)
+    fused.__kwdefaults__ = native.__kwdefaults__
+
+    def qsa_sparse_attention(queries, keys, values, block_indices, query_ends, *, scale, block_size,
+                             allow_sparse_decode = False, _plan = None):
+        from .utils import mlx_training_patches_active
+        args = queries, keys, values, block_indices, query_ends
+        kwargs = dict(scale = scale, block_size = block_size, allow_sparse_decode = allow_sparse_decode, _plan = _plan)
+        reference = lambda: native(*args, **kwargs)
+        if (mlx_training_patches_active() or not _bindings_intact(bindings) or not isinstance(queries, mx.array)
+                or queries.ndim != 4 or not 1 <= queries.shape[2] <= 4):
+            return reference()
+        key = ("indexed decode strides", queries.dtype, queries.shape, keys.shape[:2], keys.shape[3], block_size, block_indices.shape)
+        return _qwen4_verified(key, lambda: fused(*args, **kwargs), reference, "indexed decode strides")
+
+    qsa_sparse_attention._unsloth_exact_route_of = native
+    return qsa_sparse_attention
 
 
 _QSA_PREFILL_CONTRACT = {
@@ -5947,16 +11091,22 @@ def _qsa_routes(model, modules, enter):
 
 
 def fused_qsa_attention(model, *, _modules = None):
-    """Speed up mlx-vlm's Qwen sparse attention (qwen4_exp) block selection during serialized inference.
+    """Speed up Qwen sparse block selection and exact small-block indexed attention during serialized inference.
 
-    Block selection runs on one kernel per query row that picks exactly `argpartition`'s blocks
-    from the native float32 scores, checked against the native selection at first use per layout.
-    `Qwen4ExpQSAIndexer.select_from_projected` is rebound process-wide while any scope is open.
-    `UNSLOTH_MLX_QSA_SELECT=0` turns the route off.
+    Block selection picks exactly `argpartition`'s blocks from native float32 scores. Indexed attention retains
+    native arithmetic while reading K/V cache strides directly. Both routes compare bits at first use per layout.
+    Their upstream methods are rebound process-wide while any scope is open. `UNSLOTH_MLX_QSA_SELECT=0` and
+    `UNSLOTH_MLX_QSA_DECODE=0` independently disable selection and indexed decode.
     """
     def enter(entered, language, indexer):
         if os.environ.get("UNSLOTH_MLX_QSA_SELECT", "1") != "0" and attention._select_kernel() is not None:
             _qsa_enter(entered, "select", _QSA_SELECT_CONTRACT, indexer, "select_from_projected", _qsa_select_route)
+        kernels = sys.modules.get("mlx_vlm.models.qwen4_exp.qsa_kernel")
+        source = getattr(kernels, "_QSA_SPARSE_ATTENTION_SOURCE", "")
+        if (os.environ.get("UNSLOTH_MLX_QSA_DECODE", "1") != "0" and kernels is not None
+                and (kernel := _qsa_decode_kernel(source)) is not None):
+            _qsa_enter(entered, "decode", _QSA_DECODE_CONTRACT, kernels, "qsa_sparse_attention",
+                       lambda native, bindings: _qsa_decode_route(native, bindings, kernel))
 
     return _qsa_routes(model, _modules, enter)
 
@@ -6115,14 +11265,14 @@ def _ple_pread_rows(table, row_ids):
     return pending
 
 
-def _ple_read_class(base, bindings):
+def _ple_read_class(base, bindings, prepare):
     if base not in _PLE_READ_CLASSES:  # built on the first resolution, whose bindings it rechecks
 
         def _read_rows(self, row_ids):
             pending = None
             if _bindings_intact(bindings):
                 try:
-                    pending = _ple_pread_rows(self, row_ids)
+                    pending = prepare(self, row_ids)
                 except OSError:
                     pass  # the gather reads the memory maps itself
             _PLE_PENDING.reads = pending
@@ -6135,7 +11285,53 @@ def _ple_read_class(base, bindings):
     return _PLE_READ_CLASSES[base]
 
 
+# DeepSeek V4.1 Engram rows: their pages are read in concurrently and the stock gather maps them, since pages only a
+# pread holds leave core under the expert reads. macOS only: Linux's readahead faults beat the reads.
+_ENGRAM = "mlx_vlm.models.deepseek_v41.engram"
+_ENGRAM_READ_CONTRACT = {_ENGRAM: {"OffloadedEngramEmbedding._read_rows": "ac9bcec7d02ec47f"}}
+_ENGRAM_RUN_PAGES = 64
+
+
+def _engram_read(chunk):
+    buffer = memoryview(bytearray(max(length for _, _, length in chunk)))
+    for descriptor, offset, length in chunk:
+        os.preadv(descriptor, [buffer[:length]], offset)
+
+
+def _engram_pread_rows(table, indices):
+    if isinstance(indices, slice):
+        return
+    rows = np.unique(np.asarray(indices, dtype = np.int64))
+    maps = list(table._arrays.values())
+    if _ple_resident([(maps[0], rows)]) >= _PLE_RESIDENT:
+        return
+    page, files, work = os.sysconf("SC_PAGESIZE"), {}, []
+    for memmap in maps:
+        stride = memmap.strides[0]
+        first = (memmap.offset + rows * stride) // page
+        count = (memmap.offset + (rows + 1) * stride - 1) // page - first + 1
+        files.setdefault(memmap.filename, []).append(np.repeat(first - np.cumsum(count) + count, count) + np.arange(count.sum()))
+    try:
+        for name, pages in files.items():
+            files[name] = descriptor = os.open(name, os.O_RDONLY)
+            pages = np.unique(np.concatenate(pages))  # tensors of one file can share a page
+            run = np.cumsum(np.r_[True, np.diff(pages) != 1])
+            starts = np.flatnonzero(np.r_[True, run[1:] != run[:-1]])
+            split = np.flatnonzero((np.arange(pages.size) - starts[run - 1]) % _ENGRAM_RUN_PAGES == 0)
+            end = os.fstat(descriptor).st_size
+            work += [(descriptor, offset, min(length, end - offset)) for offset, length in
+                     zip((pages[split] * page).tolist(), (np.diff(np.r_[split, pages.size]) * page).tolist())]
+        step = -(-len(work) // _PLE_READ_WORKERS)
+        list(_ple_read_pool().map(_engram_read, [work[i:i + step] for i in range(0, len(work), step)]))
+    finally:
+        for descriptor in files.values():
+            if isinstance(descriptor, int):
+                os.close(descriptor)
+
+
 def _ple_wrap_maps(table):
+    if not hasattr(table, "_shards"):  # Engram's gather is stock
+        return
     table._shards = [(start, end, {name: _PreadMap(memmap) for name, memmap in arrays.items()})
                      for start, end, arrays in table._shards]
     if table._interleaved is not None:
@@ -6143,14 +11339,27 @@ def _ple_wrap_maps(table):
 
 
 def _ple_unwrap_maps(table):
+    if not hasattr(table, "_shards"):
+        return
     table._shards = [(start, end, {name: getattr(wrapped, "memmap", wrapped) for name, wrapped in arrays.items()})
                      for start, end, arrays in table._shards]
     table._interleaved = getattr(table._interleaved, "memmap", table._interleaved)
 
 
+def _ple_read_sites():
+    """(module, class, attribute, contract, row reads) per table kind; reads resolve per call, the class is built once."""
+    sites = [(_PLE_STORAGE, "QuantizedMMapNGramEmbedding", "ngram_embedding", _PLE_READ_CONTRACT,
+              lambda table, rows: _ple_pread_rows(table, rows))]
+    if sys.platform == "darwin":
+        sites.append((_ENGRAM, "OffloadedEngramEmbedding", "embed", _ENGRAM_READ_CONTRACT,
+                      lambda table, rows: _engram_pread_rows(table, rows)))
+    return sites
+
+
 @contextmanager
 def exact_ple_row_reads(model, *, _modules = None):
-    """Read cold SSD-backed Qwen4-Exp PLE rows with concurrent preads, byte for byte the memory map's rows.
+    """Read cold SSD-backed Qwen4-Exp PLE rows and DeepSeek V4.1 Engram rows with concurrent preads, byte for byte the
+    memory map's rows.
 
     mlx-vlm's own gather still assembles every row. Tables return to their own class and memory maps when the
     last scope holding them exits.
@@ -6158,27 +11367,30 @@ def exact_ple_row_reads(model, *, _modules = None):
     changed = []
     try:
         with _PLE_READ_LOCK:
-            base = getattr(sys.modules.get(_PLE_STORAGE), "QuantizedMMapNGramEmbedding", None)
-            if base is not None and hasattr(os, "preadv") and _mincore() is not None:
-                bindings = None
-                for _, module in _fusion_modules(model, _modules):
-                    table = getattr(module, "ngram_embedding", None)
-                    if not isinstance(table, base):
+            if hasattr(os, "preadv") and _mincore() is not None:
+                for module_name, class_name, attribute, contract, prepare in _ple_read_sites():
+                    base = getattr(sys.modules.get(module_name), class_name, None)
+                    if base is None:
                         continue
-                    if table.__dict__.get("_unsloth_ple_scopes"):
-                        table._unsloth_ple_scopes += 1
+                    bindings = None
+                    for _, module in _fusion_modules(model, _modules):
+                        table = getattr(module, attribute, None)
+                        if not isinstance(table, base):
+                            continue
+                        if table.__dict__.get("_unsloth_ple_scopes"):
+                            table._unsloth_ple_scopes += 1
+                            changed.append(table)
+                            continue
+                        if type(table) is not base:
+                            continue
+                        if bindings is None:
+                            bindings = _resolved_bindings(contract) or ()
+                        if not bindings:
+                            break
+                        _ple_wrap_maps(table)
+                        table.__class__ = _ple_read_class(base, bindings, prepare)
+                        table._unsloth_ple_scopes = 1
                         changed.append(table)
-                        continue
-                    if type(table) is not base:
-                        continue
-                    if bindings is None:
-                        bindings = _resolved_bindings(_PLE_READ_CONTRACT) or ()
-                    if not bindings:
-                        break
-                    _ple_wrap_maps(table)
-                    table.__class__ = _ple_read_class(base, bindings)
-                    table._unsloth_ple_scopes = 1
-                    changed.append(table)
         yield model
     finally:
         with _PLE_READ_LOCK:
@@ -6297,6 +11509,7 @@ def _depthwise_conv(x, weight, dilation):
 
 @functools.cache
 def _depthwise_conv_verified(dtype, channels, taps, dilation):
+    _staged_ready()
     keys = mx.random.split(mx.random.key(channels), 3)
     weight = mx.random.normal((channels, taps, 1), key = keys[0]).astype(dtype)
     for rows, scale, key in ((1, 1, keys[1]), (67, 64, keys[2])):
@@ -6381,13 +11594,39 @@ def exact_dilated_depthwise_conv(model, *, _modules = None):
                         module.__class__ = nn.Conv1d
 
 
+@contextmanager
+def speculative_call(model, *, _modules = None):
+    """Mark the language models and routed-expert blocks of a call that verifies drafts. What pays only there checks the
+    mark, each path bitwise equal to the one it replaces, so a plain generation keeps its own route and cost."""
+    marked = []
+    try:
+        with _VERIFY_LOCK:
+            for _, module in _fusion_modules(model, _modules):
+                state = getattr(module, "__dict__", {})
+                if "_unsloth_moe_routed" in state or "_unsloth_verify_scopes" in state:
+                    state["_unsloth_speculative_call"] = state.get("_unsloth_speculative_call", 0) + 1
+                    marked.append(state)
+        yield model
+    finally:
+        with _VERIFY_LOCK:
+            for state in marked:
+                state["_unsloth_speculative_call"] -= 1
+                if not state["_unsloth_speculative_call"]:
+                    del state["_unsloth_speculative_call"]
+
+
 class InferenceScope(NamedTuple):
     """`serves`: call traits that admit it (empty admits all). `opt_in`: env switch that must be "1".
-    `int8_prefill`: pass the generation's Int8 Prefill decision as the second argument."""
+    `int8_prefill` / `ane_prefill`: pass the generation's Int8 / Neural Engine Prefill decision as the second argument.
+    `speculative`: entered only by a call naming that trait, which None does not. `fast_verify`: entered only under the
+    generation's Fast Verify decision. New fields go last: callers build these positionally."""
     enter: Callable
     serves: frozenset = frozenset()
     opt_in: str = None
     int8_prefill: bool = False
+    ane_prefill: bool = False
+    speculative: bool = False
+    fast_verify: bool = False
 
     @property
     def name(self):
@@ -6396,11 +11635,34 @@ class InferenceScope(NamedTuple):
     def admits(self, call):
         if self.opt_in is not None and os.environ.get(self.opt_in) != "1":
             return False
+        if self.speculative:
+            return call is not None and "speculative" in call
         return call is None or not self.serves or not self.serves.isdisjoint(call)
 
 
+# The model families the exact speculative scopes serve.
+SPECULATIVE_FAMILIES = {
+    "qwen3_5": SpeculativeFamily(
+        language = "mlx_vlm.models.qwen3_5.language", target = "_EXACT_SPECULATIVE_VERIFIER",
+        module = "mlx_vlm.models.qwen3_5.speculative_verifier", forward = "Qwen3_5BatchInvariantForward",
+        entry = "verify", submit_layers = True, contract = _EXACT_VERIFY_CONTRACT,
+        gdn_layer = "Qwen3_5GatedDeltaNet", gdn_norm = "Qwen3_5RMSNormGated", gdn_contract = _VERIFY_GDN_CONTRACT,
+        gdn_qk_eps = _qwen3_5_qk_eps, capabilities = {"attention": _EXACT_ATTENTION_CONTRACT, "lanes": {},
+                                                       "invariant_attention": _INVARIANT_ATTENTION_CONTRACT,
+                                                       "tree_verify": _TREE_VERIFY_CONTRACT}),
+    "qwen4_exp": SpeculativeFamily(
+        language = "mlx_vlm.models.qwen4_exp.language", target = "_QWEN4_BATCH_INVARIANT_FORWARD",
+        module = "mlx_vlm.models.qwen4_exp.language", forward = "Qwen4ExpBatchInvariantForward",
+        entry = "__call__", submit_layers = False, contract = _QWEN4_FORWARD_CONTRACT,
+        gdn_layer = "Qwen4ExpGatedDeltaNet", gdn_norm = "Qwen4ExpRMSNormGated", gdn_contract = _QWEN4_VERIFY_GDN_CONTRACT,
+        gdn_qk_eps = _qwen4_qk_eps, gdn_l2 = True, capabilities = {"attention": _QWEN4_ATTENTION_CONTRACT, "lanes": {}},
+        causal_mask = _qwen4_causal_mask),
+}
+
+
 # Outermost first; every generation path (Studio included) enters these. A scope that is not bitwise stock
-# and not measured at least as accurate as stock against an fp32 reference (max and mean error) sets `opt_in`.
+# and not measured at least as accurate as stock against an fp32 reference (max and mean error) sets `opt_in`, or takes
+# a decision that defaults off.
 # Call traits: "batch", "speculative" (drafts verified in blocks), "vision" (mlx-vlm), "audio".
 INFERENCE_SCOPES = [
     InferenceScope(fused_moe_gate_up),
@@ -6410,6 +11672,9 @@ INFERENCE_SCOPES = [
     InferenceScope(fused_moe_routed_experts),
     InferenceScope(nax_quantized_linear, int8_prefill = True),
     InferenceScope(dense_prefill_linear),
+    InferenceScope(native_window_attention),
+    InferenceScope(singleton_quantized_decode, speculative = True),
+    InferenceScope(ane_prefill_mlp, ane_prefill = True),
     InferenceScope(fused_packed_gated_delta),
     InferenceScope(fused_qsa_attention),
     InferenceScope(fast_qsa_prefill),
@@ -6419,6 +11684,12 @@ INFERENCE_SCOPES = [
     # qwen4_exp decodes on the forward its verify blocks run on, so every generation holds this one.
     InferenceScope(exact_batch_invariant_decode),
     InferenceScope(exact_speculative_verify, serves = frozenset({"speculative"})),
+    InferenceScope(speculative_call, speculative = True),
+    InferenceScope(row_invariant_lane_projections, speculative = True, fast_verify = True),
+    InferenceScope(row_invariant_attention, speculative = True, fast_verify = True),
+    InferenceScope(row_invariant_tree_verify, speculative = True, fast_verify = True),
+    InferenceScope(target_head_precision, speculative = True, fast_verify = True),
+    InferenceScope(fast_qwen4_hc, speculative = True, fast_verify = True),
     InferenceScope(fused_verify_attention, serves = frozenset({"speculative"})),
     InferenceScope(fused_decode_attention),
     InferenceScope(exact_ple_row_reads),
@@ -6428,20 +11699,32 @@ INFERENCE_SCOPES = [
 
 
 @contextmanager
-def inference_scopes(model, call = None, *, int8_prefill = None, on_error = None, _modules = None):
-    """Hold the registered scopes that serve `call`, an iterable of call traits; None serves any generation.
+def inference_scopes(model, call = None, *, int8_prefill = None, ane_prefill = None, fast_verify = None, on_error = None,
+                     _modules = None):
+    """Hold the registered scopes that serve `call`, an iterable of call traits; None serves any generation, short of
+    the scopes only a call naming "speculative" enters.
 
     Traits this zoo does not know are ignored. A scope that raises on entry propagates unless `on_error` is
     given: then `on_error(name, error)` runs and, if it returns, the generation continues without that scope.
+
+    `fast_verify=True`, or `UNSLOTH_MLX_FAST_VERIFY=1` when it is None, runs every speculative speedup that changes
+    decode bits, in a call naming "speculative": projections and reductions may round differently from stock.
+    A plain generation stays stock whatever this says. The outermost scope decides,
+    and a model with a drafter keeps what `companion_drafter(fast_verify = ...)` pinned, refusing the opposite request.
+    `fast_verify_available(model)` says whether it takes effect here.
     """
     if call is not None:
         call = frozenset((call,) if isinstance(call, str) else call)
     modules = tuple(_fusion_modules(model, _modules))
+    decided = _fast_verify_decision(model, fast_verify)
     with ExitStack() as stack:
+        # Held before any scope enters, so a scope that steps aside for it sees it.
+        _hold_fast_verify(model, decided)
+        stack.callback(_release_fast_verify, model)
         for scope in INFERENCE_SCOPES:
-            if not scope.admits(call):
+            if not scope.admits(call) or (scope.fast_verify and not decided):
                 continue
-            args = (int8_prefill,) if scope.int8_prefill else ()
+            args = (int8_prefill,) if scope.int8_prefill else (ane_prefill,) if scope.ane_prefill else ()
             try:
                 stack.enter_context(scope.enter(model, *args, _modules = modules))
             except Exception as error:
@@ -6454,8 +11737,159 @@ def inference_scopes(model, call = None, *, int8_prefill = None, on_error = None
 _WARM_PROMPT = 64  # reaches MoE's sorted route (64 routes) and Int8 Prefill (17 rows)
 
 
-def warm_inference(model, int8_prefill = None):
+def _warm_verify_moe(model):
+    """Compile pipelines without caching a plan or settling any real-input verdict."""
+    if (os.environ.get("UNSLOTH_MLX_VERIFY_MOE", "1") == "0"
+            or not getattr(model, "_unsloth_speculates", False)):
+        return
+    language = sys.modules.get("mlx_vlm.models.qwen4_exp.language")
+    target = getattr(language, "_QWEN4_BATCH_INVARIANT_FORWARD", None)
+    if target is None:
+        return
+    from .generate import generation_mode
+
+    with generation_mode(model, call = ("batch", "speculative")):
+        base = getattr(type(target), "_unsloth_verify_native", None)
+        if base is None:
+            return
+        outer = (getattr(_VERIFY_STATE, "serving", False),
+                 getattr(_VERIFY_STATE, "plain_decode", False))
+        try:
+            _VERIFY_STATE.serving, _VERIFY_STATE.plain_decode = True, False
+            for _, block in model.named_modules():
+                experts = vars(block).get("_unsloth_moe_routed")
+                if experts is None or not experts.verify_enabled:
+                    continue
+                try:
+                    plan = _plain_moe_plan(block, experts, 2)
+                    if plan is None:
+                        continue
+                    for rows in range(2, _VERIFY_FUSED_ROWS + 1):
+                        variant = plan.for_rows(rows)
+                        x = mx.zeros(variant.shape, variant.dtype)
+                        mx.eval(variant.run(x))
+                        mx.eval(base._feed_forward(target, block, x))
+                except (RuntimeError, ValueError, TypeError) as error:
+                    _unless_failed_buffer(error)
+                # Other layer geometries, if any, keep their normal first-use compilation and checks.
+                break
+        finally:
+            _VERIFY_STATE.serving, _VERIFY_STATE.plain_decode = outer
+
+
+def warm_inference(model, int8_prefill = None, ane_prefill = None, fast_verify = None):
     """Generate two greedy tokens from a short prompt, so the first request skips the scopes' kernel builds and
     first-use checks; checks keyed by a request's row count still run then."""
-    model.generate(mx.arange(1, _WARM_PROMPT + 1)[None], max_tokens = 2, do_sample = False,
-                   int8_prefill = int8_prefill)
+    speculates = getattr(model, "_unsloth_speculates", False)   # set by building a drafter for it
+    with (inference_scopes(model, ("speculative",), int8_prefill = int8_prefill, ane_prefill = ane_prefill, fast_verify = fast_verify)
+          if speculates else nullcontext()):
+        model.generate(mx.arange(1, _WARM_PROMPT + 1)[None], max_tokens = 2, do_sample = False,
+                       int8_prefill = int8_prefill, ane_prefill = ane_prefill, fast_verify = fast_verify)
+    _warm_qmv_rows(model)
+    _warm_verify_moe(model)
+    _warm_verify_gdn(model)
+    if speculates:
+        from .speculative import warm_speculative_rounds
+
+        warm_speculative_rounds(model)
+
+
+def _warm_verify_gdn(model):
+    """Build the fused verify block's pipeline for each linear-attention layer shape, and settle each block width's
+    and each pair of widths' bitwise checks through the verifier for a model a drafter was built for: either would
+    otherwise land in the first speculative replies."""
+    # Whether a layer class takes the L2 q/k norm.
+    speculates = getattr(model, "_unsloth_speculates", False)
+    # A family decoding on its verify forward launches the block only in speculative calls.
+    l2_of = {getattr(sys.modules.get(family.language), family.gdn_layer, None): family.gdn_l2
+             for family in SPECULATIVE_FAMILIES.values() if speculates or family.entry == "verify"}
+    l2_of.pop(None, None)
+    if (not l2_of or os.environ.get("UNSLOTH_MLX_FUSED_GDN_VERIFY") == "0" or not hasattr(model, "named_modules")
+            or mx.default_device() != mx.gpu or not _verify_gdn_kernel()):
+        return
+    shapes = {}
+    for _, layer in model.named_modules():
+        l2 = l2_of.get(type(layer))
+        if (l2 is not None and layer.head_k_dim == layer.head_v_dim == 128
+                and not layer.num_v_heads % layer.num_k_heads and layer.conv1d.weight.dtype in (mx.bfloat16, mx.float16)):
+            shapes.setdefault((layer.conv1d.weight.dtype, layer.A_log.dtype, layer.dt_bias.dtype, layer.conv_kernel_size,
+                               layer.num_k_heads, layer.num_v_heads, l2,
+                               getattr(layer.norm, "activation", None) == "sigmoid"), layer)
+    for shape, layer in list(shapes.items()):
+        dtype, K, Hv, D, length = shape[0], layer.conv_kernel_size, layer.num_v_heads, layer.head_v_dim, 3
+        gates = mx.zeros((1, length, Hv), dtype)
+        try:
+            mx.eval(_verify_gdn_block(
+                mx.zeros((1, K - 1 + length, layer.conv_dim), dtype), layer.conv1d.weight.reshape(layer.conv_dim, K),
+                gates, gates, layer.A_log, layer.dt_bias, mx.zeros((1, length, Hv, D), dtype), layer.norm.weight, 1e-6,
+                layer.norm.eps, mx.zeros((1, Hv, D, D), mx.float32), layer.num_k_heads, l2 = shape[-2],
+                sigmoid = shape[-1]))
+        except (RuntimeError, ValueError) as error:
+            _unless_failed_buffer(error)
+            del shapes[shape]  # its blocks keep the verifier's ops
+    if speculates:
+        for name, family in SPECULATIVE_FAMILIES.items():
+            with _exact_forwards(model, (name,), None):
+                _settle_verify_gdn(model, getattr(sys.modules.get(family.language), family.target, None), shapes)
+
+
+def _settle_verify_gdn(model, verifier, shapes):
+    caches = sys.modules.get("mlx_vlm.models.cache")
+    served = {id(layer) for _, owner in model.named_modules() if vars(owner).get("_unsloth_verify_scopes")
+              for _, layer in owner.named_modules()}
+    transactions, widths = sys.modules.get("mlx_vlm.speculative.cache_state"), range(3, _VERIFY_GDN_MAX_ROWS + 1)
+    if caches is None or transactions is None or not hasattr(type(verifier), "_unsloth_verify_native"):
+        return
+    outer = getattr(_VERIFY_STATE, "serving", False), getattr(_VERIFY_STATE, "tapes", None)
+
+    def fresh(layer, dtype, seed):
+        cache, key = caches.ArraysCache(2), mx.random.key(seed)
+        cache[0] = mx.random.normal((1, layer.conv_kernel_size - 1, layer.conv_dim), key = key).astype(dtype)
+        cache[1] = mx.random.normal((1, layer.num_v_heads, layer.head_v_dim, layer.head_k_dim), key = key) * 0.1
+        return cache
+
+    def verified(layer, dtype, cache, length, keep):
+        transaction, key = transactions.start_speculative_cache([cache], length), mx.random.key(length)
+        _VERIFY_STATE.tapes = []
+        mx.eval(verifier._gated_delta(layer, mx.random.normal((1, length, layer.hidden_size), key = key)
+                                      .astype(dtype), None, cache))
+        if keep and _VERIFY_STATE.tapes:
+            transaction.__class__ = _taped_transaction_class(type(transaction))
+            transaction._unsloth_tapes = _VERIFY_STATE.tapes
+        transaction.commit(keep) if keep else transaction.abort()
+    try:
+        _VERIFY_STATE.serving = True
+        for (dtype, *_), layer in shapes.items():
+            if id(layer) not in served:
+                continue
+            for length in widths:
+                verified(layer, dtype, fresh(layer, dtype, length), length, 0)
+            # Then a block after each partly retained width, which folds that width's replay.
+            for first, length in itertools.product(widths, widths):
+                cache = fresh(layer, dtype, first)
+                verified(layer, dtype, cache, first, 1)
+                verified(layer, dtype, cache, length, 0)
+    finally:
+        _VERIFY_STATE.serving, _VERIFY_STATE.tapes = outer
+
+
+def _warm_qmv_rows(model):
+    """Settle `_qmv_rows_kernel` for the projections of every language model the multi-row scopes serve, for a model a
+    drafter was built for."""
+    if not getattr(model, "_unsloth_speculates", False) or os.environ.get("UNSLOTH_MLX_VERIFY_QMV_ROWS") == "0":
+        return
+    with exact_speculative_verify(model), exact_batch_invariant_decode(model):
+        served = [language for _, language in model.named_modules() if vars(language).get("_unsloth_verify_scopes")]
+        for p in {id(p): p for language in served for _, p in language.named_modules()
+                  if isinstance(p, nn.QuantizedLinear)}.values():
+            _qmv_rows_kernel(p)
+
+
+_MOE_PACK_MRO = _PackedMoEGateUp.__mro__
+_MOE_PACK_METHODS = {name: fn for name, fn in vars(_PackedMoEGateUp).items() if isinstance(fn, FunctionType)}
+_MOE_PACK_BINDINGS = _moe_dispatch_bindings((_PackedMoEGateUp,),
+    (*_moe_dispatch_bindings.__defaults__[0], *_MOE_PACK_METHODS,
+     *(name for fn in _MOE_PACK_METHODS.values() for name in fn.__code__.co_names)))
+_MOE_PACK_BINDINGS += tuple({(id(fn.__globals__), name): (fn.__globals__, name, fn.__globals__[name])
+                            for fn in _MOE_PACK_METHODS.values() for name in fn.__code__.co_names
+                            if name in fn.__globals__}.values())

@@ -50,18 +50,18 @@ def pre_process_fwd_kernel_merged(
     hm,
     cu_seqlens,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    BK1: tl.constexpr,
-    USE_G: tl.constexpr,
-    USE_GK: tl.constexpr,
-    USE_BG: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    MULTI_SEQS: tl.constexpr,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BLOCK_SIZE: tl.constexpr,  # block along V + K columns
+    BK1: tl.constexpr,  # first block along K
+    USE_G: tl.constexpr,  # scalar gate
+    USE_GK: tl.constexpr,  # per-key gate
+    USE_BG: tl.constexpr,  # gated beta given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    MULTI_SEQS: tl.constexpr,  # several sequences per card
 ):
     i_col, i_h = tl.program_id(0), tl.program_id(1)
     if MULTI_SEQS:
@@ -340,11 +340,11 @@ def merge_fwd_bwd_kernel(
     init_offsets,        # None for CP, [num_split_seqs+1] for intracard
     h0_seq_ids,          # None for CP, [num_split_seqs] for intracard
     h0,                  # None or [N_orig, HV, K, V] for intracard (or [V, K] when transposed)
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BV: tl.constexpr,
-    BK: tl.constexpr,
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BV: tl.constexpr,  # block along V
+    BK: tl.constexpr,  # block along K
     FORWARD: tl.constexpr,                # True for FWD, False for BWD
     INTRACARD_MODE: tl.constexpr,          # True: intracard mode, False: CP mode
     NUM_SEQ_ENTRIES,         # num_split_seqs for intracard
@@ -490,17 +490,17 @@ def pre_process_bwd_kernel_merged(
     cu_seqlens,
     scale,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BT: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    BK1: tl.constexpr,
-    USE_G: tl.constexpr,
-    USE_GK: tl.constexpr,
-    USE_BG: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    V: tl.constexpr,  # value hd
+    BT: tl.constexpr,  # chunk size along T
+    BLOCK_SIZE: tl.constexpr,  # block along V + K columns
+    BK1: tl.constexpr,  # first block along K
+    USE_G: tl.constexpr,  # scalar gate
+    USE_GK: tl.constexpr,  # per-key gate
+    USE_BG: tl.constexpr,  # gated beta given
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
 ):
     """
     Merged backward kernel that computes both dh (K x V) and dm (K x K) in a single kernel.

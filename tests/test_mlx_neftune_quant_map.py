@@ -1,18 +1,5 @@
-"""Regression: NEFTune's runtime ``__class__`` swap must not drop the quantized
-``embed_tokens`` from the resolved quantization map.
-
-MLXTrainer._install_neftune reassigns ``embed_tokens.__class__`` to a subclass
-(``_NEFTuneEmbed``) for the duration of training, which includes the adapter
-save. ``_effective_mlx_quantization_map`` used to detect quantized layers by an
-exact class-name match (``type(module).__name__ in {...}``), so the subclassed
-embedding was silently dropped from the saved ``base_resolved_quantization_map``.
-On reload the saved map was then validated against the unmodified base (a real
-``QuantizedEmbedding``), producing "unexpected quantized modules:
-['model.embed_tokens']" and a hard failure. The fix switches both copies of the
-scan to ``isinstance``.
-
-Apple-Silicon/Metal only (needs a real quantized MLX model).
-"""
+"""Regression: NEFTune's embed_tokens __class__ swap must not drop the quantized embedding from the saved quantization
+map; class-name matching did, so scans now use isinstance; needs Metal and a real quantized model."""
 
 import pytest
 
@@ -20,25 +7,18 @@ try:
     import mlx.core as mx
     from mlx_simulation import mlx_is_simulated
 
-    # Not `True` on a successful import: another test module installs the
-    # MLX-on-torch shim into sys.modules while being IMPORTED, and collection
-    # imports every module, so `import mlx` here lands on that shim whenever
-    # collection reaches the other file first. These tests need real mlx --
-    # nn.RMSNorm, Module.train/_set_training_mode, a rewindable RNG key -- none
-    # of which the shim implements, so gating on the import alone made the file
-    # pass or fail on collection order (stable serially, not under xdist).
+    # Requires real mlx: a shim another test file installs during collection can win the import and lacks nn.RMSNorm and
+    # a rewindable RNG key, making results order-dependent.
     _MLX = not mlx_is_simulated()
     _METAL = _MLX and mx.metal.is_available()
 except Exception:
     _MLX = _METAL = False
 
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
-# Identification, scale resolution and cleanup are pure logic over a synthetic
-# tree: real mlx, no Metal, no downloads, so they gate any host with mlx installed.
+# Identification, scale resolution and cleanup are pure logic over a synthetic tree, so they need real mlx but not Metal or downloads.
 mlx_only = pytest.mark.skipif(not _MLX, reason="requires the real mlx runtime")
 
-# mlx 0.32 made mx.random.state a sentinel refusing item assignment, so tests
-# rewind through the same reseed pair the production code uses.
+# mlx 0.32 made mx.random.state a sentinel refusing item assignment, so tests rewind through the same reseed pair the production code uses.
 _RNG_STATE_WRITABLE = _MLX and isinstance(mx.random.state, list)
 
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
@@ -84,8 +64,7 @@ def test_neftune_subclass_kept_in_quantization_map():
 
 @metal_only
 def test_neftune_saved_map_reloads_against_base():
-    """A map written while NEFTune is active must validate against the
-    unmodified base (reproduces the reload ValueError before the fix)."""
+    """A map saved while NEFTune is active must validate against the unmodified base, guarding the reload ValueError."""
     from unsloth_zoo.mlx.loader import (
         FastMLXModel,
         _effective_mlx_quantization_map,
@@ -108,8 +87,7 @@ def test_neftune_saved_map_reloads_against_base():
 
 @metal_only
 def test_neftune_subclass_is_name_transparent():
-    """The real _install_neftune subclass must report the base class name, so
-    every save-time name-based check sees through the transparent stand-in."""
+    """The real _install_neftune subclass must report the base class name so every save-time name-based check sees through the stand-in."""
     import mlx.nn as nn
     from unsloth_zoo.mlx.loader import FastMLXModel
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
@@ -136,8 +114,7 @@ def test_neftune_subclass_is_name_transparent():
 
 @metal_only
 def test_neftune_preserves_dora_name_detection():
-    """A DoRA-adapted embed_tokens must still satisfy the save-time
-    `type(module).__name__.startswith("DoRA")` check while NEFTune is active."""
+    """A DoRA-adapted embed_tokens must still pass the save-time check on type(module).__name__ starting with DoRA while NEFTune is active."""
     from unsloth_zoo.mlx.loader import FastMLXModel
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
     from unsloth_zoo.mlx.utils import _get_text_model
@@ -145,9 +122,7 @@ def test_neftune_preserves_dora_name_detection():
     model, tok = FastMLXModel.from_pretrained(MODEL, max_seq_length=128)
     emb = _get_text_model(model).model.embed_tokens
     real_base = type(emb)
-    # A DoRA-named class exercises the name check. (Real DoRA wraps via
-    # composition instead; that topology is covered by the wrapped-embedding
-    # test below.)
+    # A DoRA-named class exercises the name check; real DoRA wraps by composition instead, which the wrapped-embedding test below covers.
     emb.__class__ = type("DoRAEmbedding", (real_base,), {})
     try:
         tr = MLXTrainer(
@@ -168,12 +143,8 @@ def test_neftune_preserves_dora_name_detection():
 
 @metal_only
 def test_lora_wrapped_embedding_map_key_and_reload():
-    """A real LoRA/DoRA-wrapped quantized embedding (what target_modules
-    including embed_tokens produces) must keep its canonical ``embed_tokens``
-    key in both map scans, and a map saved from the wrapped model must
-    validate against the unwrapped base. Before the fix the wrapper leaked
-    the key as ``embed_tokens.embedding`` and reload failed with
-    missing/unexpected quantized modules."""
+    """A LoRA/DoRA-wrapped quantized embed_tokens keeps the canonical key in both map scans and validates against the
+    unwrapped base; guards a leaked embed_tokens.embedding key."""
     from mlx_lm.tuner.dora import DoRAEmbedding
     from mlx_lm.tuner.lora import LoRAEmbedding
     from unsloth_zoo.mlx import loader as mlx_loader
@@ -212,13 +183,7 @@ H, V = 4, 32
 
 @pytest.fixture(scope="module")
 def vlm():
-    """The one test needing a real 4-bit VLM, or a skip saying why not.
-
-    Building it is a cold download plus a transformers processor lookup, both
-    outside anything NEFTune touches and both able to fail on a runner this
-    branch cannot fix. Scoped to construction, so a real probe regression still
-    fails loudly.
-    """
+    """Needs a real 4-bit VLM; construction failures (cold download, processor lookup) skip, so a real probe regression still fails loudly."""
     from unsloth_zoo.mlx.loader import FastMLXModel
     try:
         return FastMLXModel.from_pretrained(VLM_MODEL, max_seq_length=128)[0]
@@ -323,8 +288,7 @@ def test_vlm_neftune_lands_on_the_module_the_embed_path_uses(vlm):
     assert mx.max(mx.abs(noise)).item() <= scale * 1.02
     rms = mx.sqrt(mx.mean(noise * noise)).item()
     assert rms == pytest.approx(scale / (3 ** 0.5), rel=0.15), rms
-    # A clean row survives the aggregate, and a constant offset survives all of
-    # it; require every row, redrawn per call.
+    # Aggregates can hide a clean row or a constant offset, so require every row to carry noise and be redrawn per call.
     assert mx.min(mx.max(mx.abs(noise), axis=-1)).item() > 0
     assert not mx.array_equal(noise, again), "noise is redrawn per call"
     distinct = len({round(v, 6) for v in noise.flatten().tolist()})
@@ -363,8 +327,7 @@ def test_probe_leaves_no_trace(opts, resolves):
     import mlx.core as mx, mlx.nn as nn
     from unsloth_zoo.mlx.utils import _probe_vlm_embedding_module
     class Noisy(nn.Module):
-        """Draws in any mode, and counts mode flips, so neither check is
-        vacuous."""
+        """Draws noise in any mode and counts training-mode flips, so the assertions cannot pass vacuously."""
         def __init__(self, inner):
             super().__init__()
             self.inner, self.flips = inner, 0
@@ -418,9 +381,7 @@ GEMMA3_TEXT = "mlx-community/gemma-3-270m-it-4bit"
 
 @mlx_only
 @pytest.mark.parametrize("model_type,inside,scaled", [
-    # transformers moved gemma and gemma2's multiply inside the embedding
-    # partway through the supported version range, so the answer follows the
-    # installed transformers rather than a fixed list.
+    # transformers moved gemma/gemma2 scaling into the embedding partway through the supported range; follow the installed version, not a fixed list.
     ("gemma", True, True),
     ("gemma", False, False),
     ("gemma2", True, True),
@@ -456,16 +417,14 @@ def test_embed_scale_probe_reads_the_installed_transformers():
     assert probe("gemma3_text") is True
     assert probe("qwen3") is False
     assert probe("not_a_real_architecture") is None
-    # It must answer without importing: a modeling module needs torch, which is
-    # not installed alongside MLX on macOS arm64.
+    # The probe must answer without importing the modeling module, since it needs torch, which is not installed alongside MLX on macOS arm64.
     sys.modules.pop("transformers.models.gemma3.modeling_gemma3", None)
     probe.cache_clear()
     with mock.patch.dict(sys.modules, {"torch": None}):
         assert probe("gemma3_text") is True, "the probe needs torch importable"
     probe.cache_clear()
 
-    # And it must go through the loader, so a package that is not loose files
-    # on disk still answers rather than silently reporting "no such thing".
+    # The probe must go through the module loader so packages not stored as loose files still answer instead of silently reporting absence.
     spec = importlib.util.find_spec("transformers.models.gemma3.modeling_gemma3")
     assert spec.loader.get_source(spec.name).count("ScaledWordEmbedding") > 0
 
@@ -484,14 +443,11 @@ def test_embed_scale_probe_reads_the_installed_transformers():
 
 @mlx_only
 @pytest.mark.parametrize("model_type,scaled", [
-    # transformers 4.x predates these, so the probe cannot answer; they have
-    # scaled inside the embedding in every transformers that has them.
+    # transformers 4.x predates these architectures, so the probe cannot answer; they are scaled inside the embedding in every transformers that has them.
     ("gemma4_text", True),
     ("gemma4_unified_text", True),
     ("gemma", False),      # genuinely version-dependent, so not assumed
-    # minicpm3 is unaskable for a different reason: no built-in arch in the
-    # supported range, so the reference is trust_remote_code, which scales
-    # OUTSIDE the embedding as mlx-lm does. See the dedicated test below.
+    # minicpm3 has no built-in arch in the supported range, so the reference is trust_remote_code, which scales outside the embedding like mlx-lm.
     ("minicpm3", False),
 ])
 def test_embed_scale_falls_back_when_transformers_cannot_be_asked(
@@ -543,9 +499,7 @@ def test_embed_scale_prefers_the_backbone_attribute():
 
 @metal_only
 def test_neftune_noise_is_divided_by_a_post_embedding_scale():
-    """On these families the model multiplies after the embedding returns, so
-    the injected noise has to be smaller by that factor to land where
-    transformers puts it."""
+    """On families that scale after the embedding returns, injected noise must be smaller by that factor to land where transformers puts it."""
     import mlx.core as mx
     from unsloth_zoo.mlx.loader import FastMLXModel
     from unsloth_zoo.mlx.utils import _neftune_embed_scale
@@ -571,10 +525,7 @@ def test_neftune_noise_is_divided_by_a_post_embedding_scale():
 
 @metal_only
 def test_compiled_step_carries_the_rng_so_noise_is_redrawn():
-    """A compiled step traces its body once. Unless the random state is one of
-    the compiled inputs and outputs, every step replays a single draw and the
-    noise becomes a fixed offset -- which is not NEFTune at all, and is
-    invisible from the loss."""
+    """A compiled step traces once, so the RNG state must be a compiled input and output, or every step replays one draw as a fixed offset."""
     import mlx.core as mx
     from unittest import mock
     from unsloth_zoo.mlx.loader import FastMLXModel
@@ -609,9 +560,7 @@ def test_compiled_step_carries_the_rng_so_noise_is_redrawn():
 @mlx_only
 @pytest.mark.parametrize("state", [(), None])
 def test_probe_survives_a_backend_without_a_list_random_state(monkeypatch, state):
-    """A stub backend need not present the random state as a mutable list.
-    Identification still has to run: the snapshot is a courtesy, not a
-    precondition."""
+    """A backend whose random state is not a mutable list must still be identified; the RNG snapshot is a courtesy, not a precondition."""
     import mlx.core as mx
     from unsloth_zoo.mlx.utils import _probe_vlm_embedding_module
 
@@ -629,9 +578,7 @@ def test_probe_survives_a_backend_without_a_list_random_state(monkeypatch, state
 ])
 def test_embed_scale_reads_both_spellings_of_a_family(
         monkeypatch, family, embed_scale, expected):
-    """A tower arrives as either `<family>` or `<family>_text` depending on the
-    wrapper, and the transformers lookup normalises before asking, so the family
-    sets it falls back to have to answer the same for both."""
+    """A tower may arrive as `<family>` or `<family>_text`; the transformers lookup normalises first, so fallback family sets must answer both alike."""
     from types import SimpleNamespace
     from unsloth_zoo.mlx import utils as mlx_utils
 
@@ -650,19 +597,14 @@ def test_embed_scale_reads_both_spellings_of_a_family(
 
 @mlx_only
 def test_probe_survives_the_backends_own_random_state():
-    """The shapes above are hypothetical; this is the one that actually ships.
-
-    Nothing is monkeypatched: identification and the rewind have to work against
-    whatever random state this mlx really exposes.
-    """
+    """Uses the real mlx random state with no monkeypatching; identification and the RNG rewind must work against whatever this mlx exposes."""
     import mlx.core as mx
     from unsloth_zoo.mlx.utils import _probe_vlm_embedding_module
 
     model = _tree()
     found = _probe_vlm_embedding_module(model)
     assert found is model.language_model.model.embed_tokens
-    # And the sentinel must survive: rebinding it to a list shadows the object
-    # mx.compile captured, which stops a compiled step redrawing.
+    # The mx.random.state sentinel must survive: rebinding it to a list shadows the object mx.compile captured, which stops a compiled step redrawing noise.
     assert isinstance(mx.random.state, list) is _RNG_STATE_WRITABLE
 
     import mlx.nn as nn
@@ -692,13 +634,8 @@ def test_probe_survives_the_backends_own_random_state():
 
 @mlx_only
 def test_minicpm3_keeps_the_scale_transformers_actually_applies():
-    """minicpm3 must not be corrected while transformers ships no built-in arch.
-
-    Then the only reference is trust_remote_code, which multiplies by scale_emb
-    outside the embedding just as mlx-lm does, so both sides already agree.
-    Derived rather than hardcoded: a transformers carrying the scaled class
-    flips this on its own.
-    """
+    """minicpm3 is not corrected while transformers has no built-in arch: trust_remote_code scales outside the embedding
+    like mlx-lm; a transformers carrying the scaled class flips it."""
     import importlib.util
     from types import SimpleNamespace
     from unsloth_zoo.mlx import utils as mlx_utils
@@ -725,8 +662,7 @@ def test_minicpm3_keeps_the_scale_transformers_actually_applies():
 
 @mlx_only
 def test_neftune_forwards_extra_call_arguments():
-    """The probe can return a wrapper taking more than one argument; the swapped
-    __call__ must forward them."""
+    """The probe may return a wrapper taking several arguments, so the swapped __call__ must forward all of them."""
     import mlx.core as mx
     import mlx.nn as nn
     from types import SimpleNamespace
@@ -755,12 +691,7 @@ def test_neftune_forwards_extra_call_arguments():
 @mlx_only
 @pytest.mark.parametrize("model_type", ["gemma3n_text", "gemma3n"])
 def test_refusal_covers_both_spellings_of_a_value_comparing_family(model_type):
-    """The refusal must not depend on which spelling the wrapper exposes.
-
-    `_vlm_embed_scale` compares the raw model type, so the bare name slips past
-    it. A missed refusal injects noise into that comparison; a spurious one only
-    trains un-noised, so the gate is conservative across both.
-    """
+    """The refusal must cover both spellings: _vlm_embed_scale compares the raw model type, so the bare name slips past; a spurious refusal is the safer error."""
     from types import SimpleNamespace
     from unsloth_zoo.mlx.utils import _vlm_compares_embedding_values
 
@@ -772,11 +703,7 @@ def test_refusal_covers_both_spellings_of_a_value_comparing_family(model_type):
 
 @mlx_only
 def test_neftune_noise_is_zero_mean():
-    """RMS and max both survive a sign change, so neither pins the distribution.
-
-    transformers draws U(-m, m); U(0, m) matches on both while shifting every
-    dimension positively. Only the mean separates them.
-    """
+    """RMS and max survive a sign change, so only the mean separates transformers' U(-m, m) noise from a positively shifted U(0, m) draw."""
     import mlx.core as mx
     from types import SimpleNamespace
 
@@ -796,8 +723,7 @@ def test_neftune_noise_is_zero_mean():
         mx.eval(noise)
         total += float(mx.mean(noise).item())
     mean = total / draws
-    # sd of the mean over draws*3*H samples of U(-m, m); 6 sigma is still tiny
-    # next to the m/2 offset a one-sided draw would produce.
+    # Tolerance is 6 sigma of the mean over draws*3*H samples of U(-m, m), still tiny next to the m/2 offset a one-sided draw would give.
     m = 15.0 / ((3 * H) ** 0.5)
     tolerance = 6.0 * m / (3.0 ** 0.5) / ((draws * 3 * H) ** 0.5)
     assert abs(mean) < tolerance, (
@@ -807,8 +733,7 @@ def test_neftune_noise_is_zero_mean():
 
 @mlx_only
 def test_embed_scale_failure_does_not_abort_training():
-    """A config that cannot be reduced to a number degrades to uncorrected noise,
-    like every other lookup in _install_neftune, rather than taking train() down."""
+    """An unreducible embed-scale config degrades to uncorrected noise, like other _install_neftune lookups, instead of aborting train()."""
     import mlx.core as mx
     from types import SimpleNamespace
 

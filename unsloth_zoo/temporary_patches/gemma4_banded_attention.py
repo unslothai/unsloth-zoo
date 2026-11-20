@@ -32,6 +32,7 @@
 # this module only exports the block-local kernel and the shared band probe.
 # ============================================================================
 
+import os
 import torch
 import torch.nn.functional as F
 
@@ -51,9 +52,8 @@ def _block_mask(w, nb, device):
     m = base[None].expand(nb, w, 2 * w).clone()           # (nb, w, 2w)
     m[0] &= (torch.arange(2 * w, device=device)[None, :] >= w)  # block 0: drop phantom prev-block
     m = m[:, None]                                         # (nb, 1, w, 2w)
-    # FIFO bound: varying seq lengths yield many (w, nb) keys, so evict the oldest
-    # entry once the cache hits the cap (dict is insertion-ordered) to keep this a
-    # pure recompute-on-miss optimization rather than an unbounded leak.
+    # FIFO-bounded cache: varying seq lengths make many (w, nb) keys, so the oldest entry is evicted at the cap (dict is
+    # insertion-ordered) to avoid an unbounded leak.
     if len(_MASK_CACHE) >= 8:
         _MASK_CACHE.pop(next(iter(_MASK_CACHE)))
     _MASK_CACHE[key] = m
@@ -74,49 +74,31 @@ def _packed_documents(packed_seq_lengths):
 
 
 def _mask_is_plain_band(mask, S, w, _block=1024, packed_seq_lengths=None):
-    """True only if `mask` is exactly the causal+sliding band with no token padding.
-
-    Shared by both the FlashAttention-2 window path and the banded SDPA fallback,
-    so both engage/defer on provably identical decisions. Every row of every batch
-    element is verified (not a sampled subset), so packed or padded masks, whose
-    extra segment boundaries neither path can honour, are always rejected. Per-head
-    (shape[1] > 1) masks are rejected as well: the banded kernel applies one block
-    mask to every head, so it cannot honour them. The verdict is stashed on the
-    tensor itself and keyed by its version and the band parameters, so it cannot
-    outlive an in-place edit or collide with a recycled object id.
-    A mask-free packed row of several documents is not a plain band.
-    """
+    """True only if mask is exactly the causal+sliding band with no padding (every row checked; packed and per-head
+    masks rejected; a mask-free multi-document row is not plain); shared by FA2 and banded SDPA; cached on the tensor
+    by version and band params."""
     if mask is None:
         return not _packed_documents(packed_seq_lengths)
     if not torch.is_tensor(mask) or mask.dim() != 4:
         return False
-    # Under torch.compile the band verdict drives Python control flow via .item()
-    # (a data-dependent graph break -> hard error under fullgraph) and mutates a
-    # tensor attribute, neither of which is traceable. Defer to the original SDPA
-    # while compiling so the graph stays intact; correctness is unchanged.
+    # Under torch.compile the band check (.item() control flow, tensor attribute mutation) is untraceable and breaks
+    # fullgraph; defer to the original SDPA while compiling.
     if torch.compiler.is_compiling():
         return False
-    # Inference tensors have no version counter: keyed by (S, w) only, else
-    # every sliding layer re-scans the shared mask during prefill.
+    # Inference tensors have no version counter, so they are keyed by (S, w) only; otherwise every sliding layer re-scans the shared mask during prefill.
     key = (S, w, None if mask.is_inference() else mask._version)
     cached = getattr(mask, "_unsloth_plain_band", None)
     if cached is not None and cached[0] == key:
         return cached[1]
-    # Reject per-head masks (shape[1] > 1): a single block mask / window is
-    # applied to every head, so a distinct per-head mask cannot be honoured.
+    # Reject per-head masks (shape[1] > 1): one block mask or window applies to every head, so a distinct per-head mask cannot be honoured.
     if mask.shape[1] != 1 or mask.shape[-2] != S or mask.shape[-1] != S:
         ok = False
     else:
-        # Validate EVERY batch element, not just batch 0: a padded batch can carry
-        # per-sample padding (for example left padding during batched generation)
-        # that neither the window nor the block kernel honours, and checking only
-        # batch 0 would route a padded batch to the fast path and drop the padding.
+        # Validate every batch element, not just batch 0: per-sample padding (e.g. left padding in batched generation)
+        # is honoured by neither the window nor the block kernel and would be dropped.
         m = mask[:, 0]                                    # (B, S, S)
-        # Scan in row blocks so we never materialise a second dense S x S band
-        # plus its comparison: at 16k/32k that is gigabytes of transient GPU
-        # memory. Each block only builds a (block, S) band. A float mask must
-        # additionally carry no in-band bias (exactly 0), else the banded path
-        # would replace it with a boolean mask and silently drop the bias.
+        # Scan in row blocks to avoid a dense S x S band (gigabytes at 16k/32k); a float mask must also have no in-band
+        # bias (exactly 0), else the bias is silently dropped.
         is_bool = m.dtype == torch.bool
         idx = torch.arange(S, device=m.device)
         ok = True
@@ -221,26 +203,40 @@ def _mask_is_block_causal(mask, lengths, w, _block=1024):
     return ok
 
 
-def _packed_document_sdpa(query, key, value, mask, packed_seq_lengths, w, scaling, num_key_value_groups):
+def _packed_document_sdpa(query, key, value, mask, packed_seq_lengths, w, scaling, num_key_value_groups,
+                          batch_equal_lengths=None):
     """Per-document SDPA for a packed row; None unless `mask` is its block-causal mask."""
     if query.shape[0] != 1 or key.shape[2] != query.shape[2]:
         return None
     lengths = _packed_lengths(packed_seq_lengths)
     if not lengths or not _mask_is_block_causal(mask, lengths, w):
         return None
+    if batch_equal_lengths is None:
+        batch_equal_lengths = os.environ.get("UNSLOTH_GEMMA4_PACKED_BATCH", "1") != "0"
     if num_key_value_groups > 1:
         # enable_gqa would put fp32 on the math kernel.
         key = key.repeat_interleave(num_key_value_groups, dim=1)
         value = value.repeat_interleave(num_key_value_groups, dim=1)
-    outs, start = [], 0
-    for L in lengths:
-        q, k, v = (x[:, :, start : start + L] for x in (query, key, value))
+    outs, start, i, n_docs = [], 0, 0, len(lengths)
+    while i < n_docs:
+        # Batch equal-length consecutive documents (batch-1 idles SMs; T4 744 -> 824 tok/s); still per-document.
+        L, j = lengths[i], i + 1
+        while batch_equal_lengths and j < n_docs and lengths[j] == L:
+            j += 1
+        n = j - i
+        q, k, v = (x[:, :, start : start + n * L] for x in (query, key, value))
+        if n > 1:
+            q, k, v = (x.unflatten(2, (n, L)).transpose(1, 2).flatten(0, 1) for x in (q, k, v))
         if w and L > w:
-            i = torch.arange(L, device=query.device)
-            band = (i[None, :] <= i[:, None]) & (i[None, :] > i[:, None] - w)
-            outs.append(F.scaled_dot_product_attention(q, k, v, attn_mask=band, scale=scaling))
+            r = torch.arange(L, device=query.device)
+            band = (r[None, :] <= r[:, None]) & (r[None, :] > r[:, None] - w)
+            o = F.scaled_dot_product_attention(q, k, v, attn_mask=band, scale=scaling)
         else:
-            outs.append(F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scaling))
-        start += L
+            o = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scaling)
+        if n > 1:
+            o = o.unflatten(0, (1, n)).transpose(1, 2).flatten(2, 3)
+        outs.append(o)
+        start += n * L
+        i = j
     _PACKED_DOC_ENGAGED[0] += 1
-    return torch.cat(outs, dim=2)
+    return outs[0] if len(outs) == 1 else torch.cat(outs, dim=2)

@@ -14,19 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Rollout logprobs as pi_old (unsloth UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1) against float64 oracles.
-
-verl rollout_correction bypass_mode with loss_type="ppo_clip" (verl/trainer/ppo/rollout_corr_helper.py
-apply_bypass_mode, core_algos.py compute_policy_loss_bypass_mode): old_log_prob = rollout_log_prob, then
-compute_policy_loss_vanilla with no IS weight (would be double-counting):
-    r = exp(log_prob - rollout_log_prob)
-    l = max(-A r, -A clip(r, 1 - eps_low, 1 + eps_high)), and for A < 0 the dual clip min(l, -A c), c = 3.0
-vime (--use-rollout-logprobs, ppo_utils.compute_policy_loss with eps_clip_c) is the same per-token loss.
-TRL's delta (clamp(r, max = delta) on the unclipped term) equals that dual clip for delta > 1 + eps_high,
-which unsloth sets to verl's c = 3.0 when delta is unset. Bypass mismatch metrics are verl's
-compute_offpolicy_metrics with the current log_prob in place of old_log_prob: k1 = rollout - current,
-k3 = r - 1 - log r, ESS = (sum r)^2 / (N sum r^2).
-"""
+"""Rollout logprobs as pi_old (UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1) vs float64 oracles of verl bypass ppo_clip with
+no IS weight, dual clip c=3.0 (unsloth sets TRL delta to c=3.0 when unset); bypass mismatch metrics are verl's k1, k3
+and ESS with the current logp in place of old."""
 
 import collections
 import types
@@ -35,6 +25,13 @@ import pytest
 import torch
 
 import unsloth_zoo.rl_replacements as rr
+
+
+@pytest.fixture(autouse = True)
+def _log_prob_route(monkeypatch):
+    # These stub UnslothEfficientGRPO, the log-prob route; test_grpo_fused_route.py covers the forward-gradient one.
+    import unsloth_zoo.fused_losses.fused_grpo as _fused_grpo
+    monkeypatch.setattr(_fused_grpo, "GRPO_FWD_GRAD", False)
 
 EPS_LOW, EPS_HIGH = 0.2, 0.28
 
@@ -250,7 +247,7 @@ class _Model(torch.nn.Module):
 
 
 def _drive(monkeypatch, as_old, old_logps = None, use_vllm = True, correction = True, coef_1 = None, metrics_on = True,
-           unscored = None):
+           unscored = None, entropy_coef = 0.0, mask_threshold = None):
     monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "0")
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
     monkeypatch.setenv("UNSLOTH_RETURN_HIDDEN_STATES", "0")
@@ -274,7 +271,7 @@ def _drive(monkeypatch, as_old, old_logps = None, use_vllm = True, correction = 
     metrics = {"train": collections.defaultdict(list), "eval": collections.defaultdict(list)}
     trainer = types.SimpleNamespace(
         args = types.SimpleNamespace(
-            unsloth_grpo_mini_batch = 1, unsloth_logit_chunk_multiplier = 1, off_policy_mask_threshold = None,
+            unsloth_grpo_mini_batch = 1, unsloth_logit_chunk_multiplier = 1, off_policy_mask_threshold = mask_threshold,
             vllm_importance_sampling_mode = "token_truncate",
         ),
         processing_class = types.SimpleNamespace(pad_token_id = 0),
@@ -289,6 +286,7 @@ def _drive(monkeypatch, as_old, old_logps = None, use_vllm = True, correction = 
         _autocast_dtype = None,
         beta = 0.0,
         loss_type = "dapo",
+        entropy_coef = entropy_coef,
     )
     # Distinct values per row and column, so a misaligned copy cannot pass.
     sampling = -(torch.arange(9, dtype = torch.float32).view(3, 3) + 1) / 10
@@ -323,22 +321,33 @@ def test_accumulated_loss_without_the_marker_is_unchanged(monkeypatch):
     assert seen["old"] is None and seen["sampling"] is None
 
 
+def test_correction_flag_without_vllm_drops_the_sampling_logps(monkeypatch):
+    # TRL defaults vllm_importance_sampling_correction to True with use_vllm False (e.g. a custom rollout_func).
+    seen, _, _, _ = _drive(monkeypatch, False, use_vllm = False, correction = True)
+    assert seen["sampling"] is None
+    seen, sampling, _, _ = _drive(monkeypatch, False, use_vllm = False, correction = True, mask_threshold = 0.5)
+    torch.testing.assert_close(seen["sampling"], rr.align_logprobs_with_mask(sampling, seen["mask"]))
+
+
 def test_accumulated_loss_reports_the_clipped_ratio(monkeypatch):
+    # r and its ESS are the loss ratio coef_1 (verl SAFETY_BOUND-clamped), but |log r| and the k1/k3 metrics use raw new
+    # - rollout, so gaps past the [-20, 20] loss clamp are not under-reported.
     values = torch.tensor([1.5, 0.5, 1.0, 2.0, 1.0, 0.25, 1.1, 7.0, 9.0, 3.0, 0.1, 4.0, 2.5, 1.25, 0.75])
 
     def coef_of(mask):
         return values[: mask.numel()].view(mask.shape)
 
-    _, _, out, metrics = _drive(monkeypatch, True, coef_1 = coef_of)
+    seen, _, out, metrics = _drive(monkeypatch, True, coef_1 = coef_of)
     delta, ratio, mask = out[3], out[4], out[6]
     coef_1 = coef_of(mask)
     keep = mask.bool()
+    raw = seen["new"].double() - seen["old"].double()
     torch.testing.assert_close(ratio[keep], coef_1[keep])
-    torch.testing.assert_close(delta[keep], coef_1.log().abs()[keep])
-    lr = coef_1.double().log()[keep]
-    r = lr.exp()
+    torch.testing.assert_close(delta[keep], raw.abs().float()[keep])
+    lr = raw[keep]
+    r = coef_1.double()[keep]
     m = metrics["train"]
-    assert m["sampling/rollout_kl_k3/mean"] == [pytest.approx((r - 1 - lr).mean().item(), rel = 1e-6)]
+    assert m["sampling/rollout_kl_k3/mean"] == [pytest.approx((lr.exp() - 1 - lr).mean().item(), rel = 1e-6)]
     assert m["sampling/importance_sampling_ess"] == [
         pytest.approx((r.sum() ** 2 / (r.numel() * (r * r).sum())).item(), rel = 1e-6)
     ]
@@ -374,8 +383,10 @@ def test_unscored_rollout_tokens_get_ratio_one(monkeypatch):
     keep = mask.bool() & ~hole
     torch.testing.assert_close(old[keep], rr.align_logprobs_with_mask(sampling, mask)[keep])
     assert seen["kwargs"]["rollout_logps_as_old"] is True
-    assert metrics["train"]["sampling/rollout_kl_k3/mean"] == [0.0]
-    assert metrics["train"]["sampling/rollout_kl_k1/mean"] == [0.0]
+    # The hole is left out of the sums; the scored tokens report their raw new - rollout gap.
+    lr = (new.double() - old.double())[keep]
+    assert metrics["train"]["sampling/rollout_kl_k3/mean"] == [pytest.approx((lr.exp() - 1 - lr).mean().item(), rel = 1e-6)]
+    assert metrics["train"]["sampling/rollout_kl_k1/mean"] == [pytest.approx((-lr).mean().item(), rel = 1e-6)]
 
 
 def test_default_batch_does_not_ask_for_the_clamp(monkeypatch):
@@ -386,3 +397,80 @@ def test_default_batch_does_not_ask_for_the_clamp(monkeypatch):
 def test_marker_with_trainer_old_logps_is_refused(monkeypatch):
     with pytest.raises(ValueError):
         _drive(monkeypatch, True, old_logps = torch.zeros(3, 3))
+
+
+# The keep mask grpo_compute_loss applies must also zero reported IS weights on the rollout-as-old path (so
+# rejected_frac and ESS see rejections) and the entropy bonus weights on both paths, as verl's response_mask does.
+from test_grpo_rollout_rejection_exclusion import _oracle_keep  # noqa: E402
+
+
+def _capture_entropy_weights(monkeypatch):
+    captured = {}
+
+    class _Bonus:
+        @staticmethod
+        def apply(entropies, weights, scaling, upstream_scale = None):
+            captured["weights"] = weights.detach().clone()
+            return (entropies.to(torch.float32) * weights).sum()
+
+    monkeypatch.setattr(rr, "UnslothGRPOEntropyBonus", _Bonus)
+    # Pins trl_version to 1.10.0: the expected weights are TRL >= 1.10's; TRL < 1.10 takes a legacy dapo branch that
+    # needs num_items_in_batch, which this fake trainer does not pass.
+    weights_fn = rr.grpo_entropy_bonus_weights
+    monkeypatch.setattr(
+        rr, "grpo_entropy_bonus_weights",
+        lambda *a, **k: weights_fn(*a, **{**k, "trl_version": "1.10.0"}),
+    )
+    return captured
+
+
+# Toy logps sit 0.9 to 2.6 nats below rollout: token_k1 [0.01, 5.5] keeps gaps up to log 5.5 = 1.70 and rejects the
+# rest; on the vLLM IS path [0.01, 3] rejects gaps of 1.4 and 2.0.
+_BOUNDS = {True: "0.01_5.5", False: "0.01_3"}
+
+
+def test_bypass_rejection_reaches_is_weights_and_metrics(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_GRPO_ROLLOUT_RS", "token_k1")
+    monkeypatch.setenv("UNSLOTH_GRPO_ROLLOUT_RS_THRESHOLD", _BOUNDS[True])
+    seen, _, out, metrics = _drive(monkeypatch, True)
+    mask = seen["mask"]
+    keep = _oracle_keep(seen["new"].double(), seen["old"].double(), mask, rr.grpo_parse_rollout_rs("token_k1", _BOUNDS[True])) > 0
+    rejected = mask.bool() & ~keep
+    assert 0 < int(rejected.sum()) < int(mask.sum()), "the bounds should reject some tokens, not all"
+    ratio = out[4]
+    assert torch.all(ratio[rejected] == 0) and torch.all(ratio[keep & mask.bool()] == 1)
+    frac = metrics["train"]["sampling/importance_sampling_rejected_frac"]
+    assert frac == [pytest.approx(rejected.sum().item() / mask.sum().item())]
+    # Unit weights on the k survivors, 0 on the rest, as the vLLM IS path reports: ESS = k^2 / (N k) = k / N.
+    n, k = mask.sum().item(), (keep & mask.bool()).sum().item()
+    assert metrics["train"]["sampling/importance_sampling_ess"] == [pytest.approx(k / n)]
+
+
+@pytest.mark.parametrize("as_old", [True, False])
+def test_rejected_tokens_leave_the_entropy_bonus(monkeypatch, as_old):
+    monkeypatch.setenv("UNSLOTH_GRPO_ROLLOUT_RS", "token_k1")
+    monkeypatch.setenv("UNSLOTH_GRPO_ROLLOUT_RS_THRESHOLD", _BOUNDS[as_old])
+    captured = _capture_entropy_weights(monkeypatch)
+    # vLLM IS path: trainer-scored old logps (already completion aligned) against the rollout.
+    old = None if as_old else torch.tensor([[-1.5, -0.2, -0.3], [-0.4, -2.5, -0.6], [-0.7, -0.8, -0.9]])
+    seen, _, _, _ = _drive(monkeypatch, as_old, old_logps = old, entropy_coef = 0.1, metrics_on = False)
+    mask = seen["mask"]
+    parsed = rr.grpo_parse_rollout_rs("token_k1", _BOUNDS[as_old])
+    if as_old:
+        keep = _oracle_keep(seen["new"].double(), seen["old"].double(), mask, parsed) > 0
+    else:
+        keep = _oracle_keep(seen["old"].double(), seen["sampling"].double(), mask, parsed) > 0
+    rejected = mask.bool() & ~keep
+    assert 0 < int(rejected.sum()) < int(mask.sum()), "the bounds should reject some tokens, not all"
+    w = captured["weights"]
+    assert torch.all(w[rejected] == 0)
+    # Survivors keep TRL's weight -coef / (all completion tokens): the normaliser is unchanged.
+    want = torch.full_like(w, -0.1 / mask.sum().item())
+    torch.testing.assert_close(w[keep & mask.bool()], want[keep & mask.bool()])
+
+
+def test_entropy_weights_without_rejection_are_unchanged(monkeypatch):
+    captured = _capture_entropy_weights(monkeypatch)
+    seen, _, _, _ = _drive(monkeypatch, True, entropy_coef = 0.1, metrics_on = False)
+    mask = seen["mask"]
+    torch.testing.assert_close(captured["weights"], mask.float() * (-0.1 / mask.sum().item()))

@@ -1,22 +1,6 @@
-"""Dynamic regression-prevention test for the PR #624 failure mode.
-
-PR #624 fixed a Gemma-4 MoE LoRA crash: the patch set
-`Gemma4TextExperts._unsloth_already_patched=True` but never registered
-`_unsloth_lora_extractor_fn`. Without the extractor the default canonical
-permutation yields tensors whose contraction dims mismatch for
-`torch._grouped_mm` on PEFT 0.19+ swapped 3D LoRA layouts, crashing on the
-first training step with `RuntimeError: contraction dimension of mat_a and
-mat_b must match`.
-
-This test applies every `TEMPORARY_PATCHES` entry, walks loaded
-`transformers.models.*`, and asserts every patched class with 3D
-`gate_up_proj`/`down_proj` params also has `_unsloth_lora_extractor_fn`.
-GPU-free, version-agnostic (walks the live tree), single test. When a
-class can be instantiated it also drives per-expert delta parity on PEFT
-0.18 raw and 0.19 swapped factors, surfaced as a separate assertion.
-Importing transformers submodules may fail (optional deps); such failures
-are skipped, not test failures.
-"""
+"""PR 624 regression test: every patched 3D-expert class must register _unsloth_lora_extractor_fn (else LoRA crashes on
+PEFT 0.19+ swapped layouts); GPU-free; optional import failures are skipped, not failed; per-expert delta parity on
+PEFT 0.18 and 0.19"""
 
 from __future__ import annotations
 
@@ -36,9 +20,7 @@ from unsloth_zoo.temporary_patches.moe_utils import moe_lora_b_expert_columns
 from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
 
 
-# Match 3D `self.gate_up_proj`/`self.down_proj = nn.Parameter(...)` class
-# declarations. Mxfp4 / GptOss style is intentionally not matched (different
-# LoRA path).
+# Match 3D self.gate_up_proj / self.down_proj = nn.Parameter(...) declarations; Mxfp4 / GptOss style is intentionally not matched (different LoRA path).
 _3D_PARAM_PATTERNS = [
     re.compile(r"self\.gate_up_proj\s*=\s*nn\.Parameter\("),
     re.compile(r"self\.down_proj\s*=\s*nn\.Parameter\("),
@@ -78,8 +60,7 @@ def _iter_modeling_modules():
 
 
 def _looks_like_grouped_moe_experts(cls: type) -> bool:
-    """True if `cls.__init__` declares both `gate_up_proj` and `down_proj`
-    as `nn.Parameter`s (the grouped-MoE LoRA extractor's surface)."""
+    """True if cls.__init__ declares both gate_up_proj and down_proj as nn.Parameters (the grouped-MoE LoRA extractor's surface)."""
     try:
         src = inspect.getsource(cls.__init__)
     except (OSError, TypeError):
@@ -88,11 +69,9 @@ def _looks_like_grouped_moe_experts(cls: type) -> bool:
 
 
 def _has_unsloth_patched_forward(cls: type) -> bool:
-    """True when `patch_function` has replaced `cls.forward`. It stores the
-    original under `_original_<modeling_tail>_<ClassName>_forward`
-    (`utils.py:_get_unique_storage_name`); that attribute is a uniform marker
-    independent of family-specific flags like `_unsloth_already_patched`.
-    """
+    """True when patch_function replaced cls.forward; the original is stored as
+    _original_<modeling_tail>_<ClassName>_forward (utils.py:_get_unique_storage_name), a uniform marker independent
+    of family-specific flags such as _unsloth_already_patched."""
     cls_name = cls.__name__
     for attr in dir(cls):
         if attr.startswith("_original_") and attr.endswith(f"_{cls_name}_forward"):
@@ -101,11 +80,8 @@ def _has_unsloth_patched_forward(cls: type) -> bool:
 
 
 def _discover_patched_moe_classes() -> list[type]:
-    """Find every class whose `forward` unsloth-zoo replaced AND whose source
-    matches the grouped-MoE 3D shape (`gate_up_proj` + `down_proj`
-    nn.Parameters). That combination requires a registered extractor; PR #624
-    was a class satisfying both where registration was forgotten.
-    """
+    """Find every class whose forward unsloth-zoo replaced and whose source declares 3D gate_up_proj and down_proj
+    nn.Parameters; such a class needs a registered extractor (PR 624 forgot to register one)."""
     seen: set[type] = set()
     out: list[type] = []
     for modeling in _iter_modeling_modules():
@@ -136,13 +112,8 @@ class _StubWrapper:
 
 
 def _try_instantiate_experts(cls: type):
-    """Best-effort instantiate an MoE experts class with tiny synthetic dims;
-    returns the instance or None.
-
-    Dims H=16, I=10, 2*I=20 are all distinct (no ambiguous PEFT dispatch) and
-    keep `H > I`, `2*I > H` to match production MoE configs (Qwen3-MoE,
-    Gemma-4 MoE, Glm4-MoE-Lite, DeepSeek-V3). Other regimes surface fragile
-    orientation behavior unrelated to the PR #624 contract."""
+    """Best-effort instantiate an MoE experts class with tiny dims H=16, I=10, 2*I=20 (distinct, so PEFT dispatch is
+    unambiguous, H > I and 2*I > H like production); returns the instance or None."""
     cfg_cls = _find_sibling_config(cls)
     if cfg_cls is None:
         return None
@@ -189,8 +160,7 @@ def _try_instantiate_experts(cls: type):
 
 
 def _find_sibling_config(cls: type):
-    """Find the likely Config class in `cls`'s modeling module, trying
-    Foo*Config / Foo*TextConfig after stripping common experts suffixes."""
+    """Find the likely Config class in cls's modeling module, trying Foo*Config / Foo*TextConfig after stripping common experts suffixes."""
     mod = importlib.import_module(cls.__module__)
     base = cls.__name__
     for suffix in ("Experts", "NaiveMoe", "MoEBlock", "MoeBlock", "MoE", "Moe"):
@@ -250,22 +220,16 @@ def _parity_one(extractor, experts, name: str, in_dim: int, out_dim: int,
 
 
 def test_every_patched_moe_experts_class_has_lora_extractor():
-    """Regression test for PR #624: every class whose `forward` unsloth-zoo
-    patched to the grouped-MoE backend with `(E, 2*I, H)`/`(E, H, I)` 3D
-    params MUST register `_unsloth_lora_extractor_fn`, else LoRA crashes on
-    step 1 with a `torch._grouped_mm` contraction-dim mismatch on PEFT
-    0.19+."""
+    """Regression test for PR 624: every class patched to the grouped-MoE backend with (E, 2*I, H)/(E, H, I) 3D params
+    must register _unsloth_lora_extractor_fn, else LoRA crashes on step 1 (torch._grouped_mm contraction-dim
+    mismatch, PEFT 0.19+)."""
     _apply_all_temporary_patches()
 
     patched = _discover_patched_moe_classes()
     if not patched:
-        # Zero discovery has three causes: (a) transformers predates every
-        # targeted MoE class and no patch fn set a marker -- legit skip;
-        # (b) the runtime broke ALL targeting patches before their
-        # `_unsloth_already_patched = True` line -- infra failure, not marker
-        # drift; (c) the `_original_..._forward` convention
-        # `_has_unsloth_patched_forward` reads drifted from `patch_function`
-        # -- a real test-helper regression.
+        # Zero discovery: (a) transformers predates the targeted MoE classes, a legit skip; (b) all targeting patches
+        # broke before _unsloth_already_patched = True, an infra failure; (c) _has_unsloth_patched_forward's _original_
+        # naming drifted from patch_function, a test-helper regression.
         already = []
         for modeling in _iter_modeling_modules():
             for _name, cls in inspect.getmembers(modeling, inspect.isclass):
@@ -334,8 +298,7 @@ def test_every_patched_moe_experts_class_has_lora_extractor():
                     )
 
     if parity_failures:
-        # pytest.fail (not assert) keeps orientation separate from the
-        # primary registration-coverage assertion above.
+        # pytest.fail (not assert) keeps orientation failures separate from the primary registration-coverage assertion above.
         pytest.fail(
             "Per-expert delta parity failed for some patched MoE families. "
             "This is independent of registration coverage but indicates an "

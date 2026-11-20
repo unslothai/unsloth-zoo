@@ -1,11 +1,6 @@
-"""Regression tests for forward_native_moe_loop LoRA application.
-
-Cover the gate_up_proj/down_proj transpose-on-mismatch checks and the
-once-per-forward dtype pre-cast (PR #618). PEFT-version-agnostic: build LoRA
-factors by hand and check forward_native_moe_loop matches the naive reference
-base_out + (X @ first[e]) @ second[e] * scaling, for both canonical Qwen3-MoE
-and transposed Qwen3-VL-MoE storage.
-"""
+"""Regression tests for forward_native_moe_loop LoRA: gate_up_proj/down_proj transpose-on-mismatch checks and
+once-per-forward dtype pre-cast (PR 618); PEFT-agnostic hand-built LoRA vs naive reference on canonical Qwen3-MoE and
+transposed Qwen3-VL-MoE storage."""
 
 import pytest
 import torch
@@ -40,9 +35,7 @@ def _build_experts(num_experts, hidden, intermediate, transposed_storage):
 
 
 def _build_lora_for(experts, rank, scaling):
-    """Build (first_weight, second_weight, scaling) tuples in the layout
-    that `_make_qwen_moe_lora_extractor` returns: first=(E, in, R), second=(E, R, out).
-    """
+    """Build (first_weight, second_weight, scaling) tuples in the layout _make_qwen_moe_lora_extractor returns: first=(E, in, R), second=(E, R, out)."""
     E = experts.num_experts
     if experts.gate_up_proj.shape[1] == 2 * (experts.down_proj.shape[1] if experts.down_proj.shape[1] != experts.gate_up_proj.shape[2] else experts.down_proj.shape[2]):
         pass
@@ -78,9 +71,7 @@ def _build_lora_for(experts, rank, scaling):
 
 
 def _naive_forward(experts, hidden_states, top_k_index, top_k_weights, gate_up_lora, down_lora):
-    """Reference implementation that mirrors forward_native_moe_loop without
-    the under-test transpose / pre-cast logic. Used as ground truth.
-    """
+    """Reference implementation mirroring forward_native_moe_loop without its under-test transpose and pre-cast logic; used as ground truth."""
     E = experts.num_experts
     out = torch.zeros_like(hidden_states)
     expert_mask = F.one_hot(top_k_index, num_classes=E).permute(2, 1, 0)
@@ -146,9 +137,7 @@ def test_forward_native_moe_loop_with_lora_matches_naive(transposed_storage):
 @pytest.mark.parametrize("transposed_storage", [False, True],
                          ids=["canonical_storage", "transposed_storage"])
 def test_forward_native_moe_loop_no_lora_matches_naive(transposed_storage):
-    """Same but without LoRA. Confirms the down_proj transpose-on-mismatch
-    check (gemini HIGH) does not break the LoRA-disabled path.
-    """
+    """Same without LoRA; confirms the down_proj transpose-on-mismatch check (gemini HIGH review) does not break the LoRA-disabled path."""
     torch.manual_seed(1)
     num_experts = 3
     hidden = 16
@@ -169,9 +158,7 @@ def test_forward_native_moe_loop_no_lora_matches_naive(transposed_storage):
 
 
 def test_forward_native_moe_loop_square_dim_uses_grouped_mm_flag():
-    """At square dims (intermediate_dim == hidden_dim) the shape check can't tell
-    the weight orientation; the `_unsloth_grouped_mm_format` flag must win.
-    """
+    """At square dims (intermediate == hidden) the shape check cannot tell weight orientation, so the _unsloth_grouped_mm_format flag must win."""
     torch.manual_seed(13)
     num_experts = 3
     dim = 16  # hidden == intermediate, so 2*intermediate == 2*hidden
@@ -221,8 +208,7 @@ def test_forward_native_moe_loop_square_dim_uses_grouped_mm_flag():
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16],
                          ids=["fp32", "bf16", "fp16"])
 def test_forward_native_moe_loop_lora_dtype_precast_no_loop_alloc(dtype):
-    """Ensure the new pre-cast (LoRA factors cast to hidden_states.dtype once
-    before the per-expert loop) produces correct output across dtypes."""
+    """LoRA factors are cast to hidden_states.dtype once before the per-expert loop; output must stay correct across dtypes."""
     torch.manual_seed(2)
     num_experts = 3
     hidden = 16

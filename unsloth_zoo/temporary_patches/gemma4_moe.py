@@ -24,23 +24,15 @@ from .moe_utils import (
     get_forward_moe_backend,
     extract_moe_lora_weights_for_grouped_mm,
 )
-# Reuse the Qwen-MoE standard-layout LoRA extractor: Gemma4TextExperts shares
-# the (E, out, in) layout and attribute names, and per_expert_scale is folded
-# into top_k_weights upstream by Gemma4TextRouter.forward, so no Gemma-4
-# specific scale handling is needed inside the extractor.
+# Reuse the Qwen-MoE standard-layout LoRA extractor: Gemma4TextExperts shares the (E, out, in) layout and attribute
+# names, and Gemma4TextRouter.forward folds per_expert_scale into top_k_weights.
 from .qwen3_moe import _make_qwen_moe_lora_extractor
 
 
 def _register_gemma4_lora_extractor(experts_cls):
-    """Attach _unsloth_lora_extractor_fn to a Gemma-4 experts class.
-
-    Idempotent and safe if experts_cls is None. Without it,
-    _extract_lora_from_wrapper falls through to the default canonical-permutation
-    branch, which on PEFT 0.19+ swapped layouts yields mismatched contraction
-    dims for torch._grouped_mm (RuntimeError: contraction dimension of mat_a
-    and mat_b must match) on the first step. The Qwen extractor handles both
-    PEFT 0.18 and 0.19 cleanly.
-    """
+    """Attach _unsloth_lora_extractor_fn to a Gemma-4 experts class (idempotent; returns False for None); without it,
+    _extract_lora_from_wrapper falls to the canonical-permutation branch, which mismatches torch._grouped_mm dims on
+    PEFT 0.19+; the Qwen extractor handles PEFT 0.18 and 0.19."""
     if experts_cls is None:
         return False
     if getattr(experts_cls, "_unsloth_lora_extractor_registered", False):
@@ -215,16 +207,14 @@ def _patch_gemma4_moe_current():
         return False
 
     if getattr(Gemma4TextExperts, "_unsloth_already_patched", False):
-        # Re-register the extractor even if forward is patched, guarding
-        # against an older unsloth-zoo that patched forward without it.
+        # Re-register the extractor even when forward is already patched, since an older unsloth-zoo patched forward without registering it.
         _register_gemma4_lora_extractor(Gemma4TextExperts)
         return True
 
     _moe_backend = get_forward_moe_backend()
 
     def _gemma4_experts_forward(self, hidden_states, top_k_index, top_k_weights):
-        # Gemma4TextRouter.forward already folds per_expert_scale into
-        # top_k_weights, so dispatch straight to the grouped-GEMM backend.
+        # Gemma4TextRouter.forward already folds per_expert_scale into top_k_weights, so dispatch straight to the grouped-GEMM backend.
         return _moe_backend(self, hidden_states, top_k_index, top_k_weights)
 
     ok = patch_function(Gemma4TextExperts, "forward", _gemma4_experts_forward, force=True)
@@ -250,9 +240,7 @@ def _patch_gemma4_moe_legacy():
         _register_gemma4_lora_extractor(Gemma4TextMoEBlock)
         return True
 
-    # Remap decoder layer module names to match checkpoint key layout:
-    #   moe.{gate_up_proj,down_proj} -> experts.{...}
-    #   moe.per_expert_scale         -> router.per_expert_scale
+    # Remap decoder layer names to checkpoint key layout: moe.{gate_up_proj,down_proj} -> experts.{...}; moe.per_expert_scale -> router.per_expert_scale.
     _original_decoder_init = Gemma4TextDecoderLayer.__init__
 
     def _patched_decoder_init(self, config, layer_idx):

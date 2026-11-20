@@ -42,6 +42,20 @@ _DISABLED = {
     "_tp_grad_group",
     "_validate_attention_tp_divisibility",
     "_quantize_qat",
+    "_fake_quant_fp8_block",
+    "_fake_quant_fp4_block",
+    "engram_layout",
+    "make_engram_table",
+    "is_parameter_free_table",
+    "_checkpoint_key_names",
+    "has_core_model_loading",
+    "_is_fp8_quant_config",
+    "_released_layout",
+    "_engram_cut_safe",
+    "pipeline_safe_cut_points",
+    "_resolve_sparse_attn",
+    "ensure_sparse_attn",
+    "_drop_engram_tables_outside_full_save",
 }
 
 
@@ -65,25 +79,55 @@ def test_rope_rewrite_is_value_identical():
         assert torch.equal(scope_old[name], scope_new[name])
 
 
-modeling = None
-if importlib.util.find_spec("transformers.models.deepseek_v41") is not None:
-    import transformers.models.deepseek_v41.modeling_deepseek_v41 as modeling
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _dsv41_impl import NATIVE_ALIAS, available  # noqa: E402
 
-needs_port = pytest.mark.skipif(modeling is None, reason = "needs the community deepseek_v41 port")
+IMPLS = available()
+needs_impl = pytest.mark.skipif(
+    not IMPLS, reason = "needs a DeepSeek-V4.1 implementation (transformers port, or unsloth's native module)"
+)
+impl_param = pytest.mark.parametrize("impl", IMPLS, ids = lambda impl: impl.name)
+
+_NATIVE_DISABLED = {
+    "build_compressed_token_map", "compute_hash_multipliers", "_is_prime", "engram_layout", "make_engram_table",
+    "is_parameter_free_table", "_checkpoint_key_names", "has_core_model_loading", "_is_fp8_quant_config",
+    "_released_layout", "_engram_cut_safe", "pipeline_safe_cut_points", "_resolve_sparse_attn",
+    "ensure_sparse_attn", "_drop_engram_tables_outside_full_save",
+}
+_PORT_DISABLED = _DISABLED - (_NATIVE_DISABLED - {"build_compressed_token_map", "compute_hash_multipliers", "_is_prime"})
 
 
-@needs_port
-def test_port_defines_every_entry_and_the_rope_rewrite_matches():
-    missing = sorted(name for name in _DISABLED if not callable(getattr(modeling, name, None)))
+@needs_impl
+@impl_param
+def test_implementation_defines_its_entries_and_the_rewrites_match(impl, monkeypatch):
+    from unsloth_zoo.compiler import module_forward_eager_rewrites, module_forward_source_rewrites
+
+    modeling = impl.modeling
+    names = _PORT_DISABLED if impl.name == "port" else _NATIVE_DISABLED
+    missing = sorted(name for name in names if not callable(getattr(modeling, name, None)))
     assert not missing, missing
     assert hasattr(modeling, "DeepseekV41HyperConnection")
-    assert "apply_rotary_pos_emb" in model_function_source_rewrites(modeling, "deepseek_v41")
+    if impl.name == "port":
+        assert "apply_rotary_pos_emb" in model_function_source_rewrites(modeling, "deepseek_v41")
+    else:
+        monkeypatch.setenv("UNSLOTH_DSV4_MHC_FAST", "unrolled")
+        eager = module_forward_eager_rewrites(modeling, "deepseek_v41")
+        assert "unsloth_mhc_projection_rsqrt(" in eager["DeepseekV41HyperConnection"]
+        source = module_forward_source_rewrites(modeling, "deepseek_v41")["DeepseekV41HyperConnection"]
+        assert "unsloth_sinkhorn_knopp(" in source and "unsloth_mhc_projection_rsqrt(" in source
 
 
 _CHILD = r'''
 import os, sys, json, io, contextlib
 os.environ["UNSLOTH_COMPILE_LOCATION"] = os.path.abspath("unsloth_compiled_cache")
-from unsloth_zoo.compiler import unsloth_compile_transformers
+impl_name, tests_dir = sys.argv[1], sys.argv[2]
+sys.path.insert(0, tests_dir)
+from unsloth_zoo.compiler import register_native_modeling, resolve_modeling_module, unsloth_compile_transformers
+if impl_name == "native":
+    from _dsv41_impl import NATIVE_ALIAS, native
+    native()
+    register_native_modeling("deepseek_v41", NATIVE_ALIAS + ".modeling")
+location = resolve_modeling_module("deepseek_v41")[0]
 with contextlib.redirect_stdout(io.StringIO()):
     unsloth_compile_transformers(
         model_type = "deepseek_v41", fast_lora_forwards = False, fullgraph = True,
@@ -91,18 +135,42 @@ with contextlib.redirect_stdout(io.StringIO()):
     )
 path = os.path.join(os.environ["UNSLOTH_COMPILE_LOCATION"], "unsloth_compiled_module_deepseek_v41.py")
 generated = open(path, encoding = "utf-8").read()
-out = {}
-for name in sys.argv[1:]:
+out = {"location": location}
+for name in sys.argv[3:]:
     where = generated.find(f"def {name}(")
     out[name] = None if where == -1 else generated[:where].rsplit("\n@", 1)[-1].strip()
 where = generated.find("def apply_rotary_pos_emb(")
-out["rope_split"] = "x.split([x.shape[-1] - rope_dim, rope_dim]" in generated[where:where + 3000]
+out["rope_split"] = where != -1 and "x.split([x.shape[-1] - rope_dim, rope_dim]" in generated[where:where + 3000]
+out["mhc"] = "unsloth_mhc_projection_rsqrt(" in generated or "unsloth_mhc_projection(" in generated
+import re as _re
+helpers = ("unsloth_sinkhorn_knopp", "unsloth_mhc_projection", "unsloth_mhc_projection_rsqrt")
+model_imports = " ".join(_re.findall(r"from " + _re.escape(location) + r" import \(([^)]*)\)", generated))
+out["helpers_from_model"] = [h for h in helpers if _re.search(rf"\b{h}\b", model_imports)]
+out["helpers_missing"] = [
+    h for h in helpers
+    if _re.search(rf"\b{h}\(", generated)
+    and f"from unsloth_zoo.temporary_patches.mhc_sinkhorn import {h}\n" not in generated
+]
 print("@@@" + json.dumps(out))
 '''
 
+_FRESH = r'''
+import importlib.util, os, sys
+impl_name, tests_dir, path = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, tests_dir)
+if impl_name == "native":
+    from _dsv41_impl import native
+    native()
+spec = importlib.util.spec_from_file_location("unsloth_compiled_module_deepseek_v41_fresh", path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print("@@@ok")
+'''
 
-@needs_port
-def test_generated_cache_keeps_helpers_eager(tmp_path):
+
+@needs_impl
+@impl_param
+def test_generated_cache_keeps_helpers_eager(impl, tmp_path):
     env = dict(os.environ)
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env["PYTHONPATH"] = os.pathsep.join(
@@ -110,16 +178,34 @@ def test_generated_cache_keeps_helpers_eager(tmp_path):
     )
     env.pop("UNSLOTH_COMPILE_DISABLE", None)
     env["UNSLOTH_ALLOW_CPU"] = "1"
-    if importlib.util.find_spec("unsloth") is None:
+    if importlib.util.find_spec("unsloth") is None or impl.name == "native":
         env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
+    names = sorted(_PORT_DISABLED if impl.name == "port" else _NATIVE_DISABLED)
     result = subprocess.run(
-        [sys.executable, "-c", _CHILD, *sorted(_DISABLED)], cwd = str(tmp_path), env = env,
-        capture_output = True, text = True, timeout = 1800,
+        [sys.executable, "-c", _CHILD, impl.name, os.path.dirname(os.path.abspath(__file__)), *names],
+        cwd = str(tmp_path), env = env, capture_output = True, text = True, timeout = 1800,
     )
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
     line = next(l for l in result.stdout.splitlines() if l.startswith("@@@"))
     out = json.loads(line[3:])
-    assert out.pop("rope_split"), out
-    assert (out.pop("apply_rotary_pos_emb") or "").startswith("torch_compile_with_fallback("), out
+    location = out.pop("location")
+    mhc = out.pop("mhc")
+    rope_split = out.pop("rope_split")
+    assert out.pop("helpers_from_model") == [], "injected mHC helpers imported from the model module"
+    assert out.pop("helpers_missing") == [], "an mHC helper used without its zoo import"
+    fresh = subprocess.run(
+        [sys.executable, "-c", _FRESH, impl.name, os.path.dirname(os.path.abspath(__file__)),
+         str(tmp_path / "unsloth_compiled_cache" / "unsloth_compiled_module_deepseek_v41.py")],
+        cwd = str(tmp_path), env = env, capture_output = True, text = True, timeout = 1800,
+    )
+    assert "@@@ok" in fresh.stdout, fresh.stdout[-3000:] + fresh.stderr[-3000:]
+    if impl.name == "port":
+        assert location.startswith("transformers.models.deepseek_v41"), location
+        assert rope_split, out
+        assert (out.pop("apply_rotary_pos_emb") or "").startswith("torch_compile_with_fallback("), out
+    else:
+        assert location == NATIVE_ALIAS + ".modeling", location
+        assert mhc, out
+    assert any(v is not None for v in out.values()), out
     compiled = {k: v for k, v in out.items() if v is not None and "compile" in v and "disable" not in v}
     assert not compiled, compiled

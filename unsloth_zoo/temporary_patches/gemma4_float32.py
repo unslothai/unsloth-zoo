@@ -43,6 +43,7 @@ import inspect
 import importlib
 import linecache
 import sys
+import threading
 import torch
 from .common import (
     TEMPORARY_PATCHES,
@@ -52,7 +53,16 @@ from .common import (
     unwrap_norm_weight,
     publish_to_modeling_module,
 )
-from .utils import compile_with_eager_fallback, patch_function, raise_error
+from .utils import (
+    checkpointed_forward_body,
+    compile_with_eager_fallback,
+    keep_layer_checkpointing,
+    other_family_load,
+    patch_forced_float32,
+    raise_error,
+    undo_forced_float32,
+)
+from .gemma import _linear_boundary_dtype, _to_boundary_dtype, _to_forced_output_dtype
 
 # Mirrors gemma.py: flex dispatch can be turned off globally.
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
@@ -74,10 +84,8 @@ def _unsloth_gemma4_ple_cast_input(module, x):
     dtype = getattr(weight, "dtype", None)
     if dtype is None or not getattr(dtype, "is_floating_point", False):
         return x
-    # Skip sub-2-byte floats (e.g. float8_e4m3fn / float8_e5m2): casting the fp32
-    # carrier down to fp8 destroys it, and fp8 matmul kernels expect a higher
-    # precision input they scale internally. getattr keeps this a no-op on older
-    # torch builds whose dtypes lack `itemsize`.
+    # Skip sub-2-byte floats such as float8 (casting the fp32 carrier to fp8 destroys it; fp8 matmuls scale internally);
+    # getattr keeps older torch dtypes without itemsize a no-op.
     if getattr(dtype, "itemsize", 2) < 2:
         return x
     return x if x.dtype == dtype else x.to(dtype)
@@ -120,15 +128,8 @@ def _is_gemma4_ple_fixed_call(node, attr, argument):
 
 
 def _gemma4_ple_validate(model_cls, method_name, targets):
-    """Classify a PLE method WITHOUT mutating anything.
-
-    Returns (status, payload) where status is one of:
-      "ALREADY"     - marker set, or every boundary is already cast (safe no-op).
-      "PATCH"       - payload carries what is needed to rewrite the method.
-      "DRIFT"       - the method exists but its source shape is unexpected.
-      "UNAVAILABLE" - the class / source cannot be introspected here.
-    payload is None unless status == "PATCH".
-    """
+    """Classifies a PLE method without mutating: ALREADY (marker set or all boundaries cast), PATCH (payload to
+    rewrite), DRIFT (unexpected source shape), UNAVAILABLE (cannot introspect); payload only for PATCH."""
     marker = f"_unsloth_ple_dtype_{method_name}_patched"
     if getattr(model_cls, marker, False):
         return "ALREADY", None
@@ -280,8 +281,38 @@ def _gemma4_text_variants(class_suffix = None):
         yield module, prefix
 
 
+_GEMMA4_FAMILY = r"(?<![a-z0-9])gemma4"
+
+
+def _gemma4_skip_or_undo(class_suffix):
+    """True when the forced patch must not install; a flag "0" load of this family undoes it first."""
+    if other_family_load(_GEMMA4_FAMILY): return True
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") != "0": return False
+    for name, prefix in (("gemma4", "Gemma4"), ("gemma4_unified", "Gemma4Unified")):
+        # Not imported means never patched; do not import gemma4 for this.
+        modeling = sys.modules.get(f"transformers.models.{name}.modeling_{name}")
+        undo_forced_float32(getattr(modeling, prefix + class_suffix, None), "forward")
+    return True
+
+
+# Per-thread projection dtype without autocast (float32 on full finetuning), set and restored around the text model and
+# each text / vision layer; the RMSNorms inside read it, norms outside (embedders, audio) keep the fp16 output.
+_GEMMA4_BOUNDARY = threading.local()
+_GEMMA4_RESIDUAL_OUT = "_unsloth_gemma4_residual_out"
+_GEMMA4_RESIDUAL_NORMS = ("post_attention_layernorm", "post_feedforward_layernorm", "post_per_layer_input_norm")
+
+
+def _gemma4_mark_residual_norms(layer):
+    if os.environ.get("UNSLOTH_GEMMA4_FP32_POST_NORM", "1") == "0": return
+    for name in _GEMMA4_RESIDUAL_NORMS:
+        norm = getattr(layer, name, None)
+        if isinstance(norm, torch.nn.Module):
+            norm.__dict__[_GEMMA4_RESIDUAL_OUT] = True
+pass
+
+
 def patch_Gemma4TextScaledWordEmbedding():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if _gemma4_skip_or_undo("TextScaledWordEmbedding"): return
 
     def forward(self, input_ids: torch.Tensor):
         input_embeds = torch.nn.functional.embedding(
@@ -293,19 +324,17 @@ def patch_Gemma4TextScaledWordEmbedding():
         return input_embeds.to(torch.float32) * self.embed_scale.to(torch.float32)
     pass
     for module, prefix in _gemma4_text_variants("TextScaledWordEmbedding"):
-        patch_function(getattr(module, prefix + "TextScaledWordEmbedding"), "forward", forward, fullgraph = True)
+        patch_forced_float32(getattr(module, prefix + "TextScaledWordEmbedding"), "forward", forward, fullgraph = True)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4TextScaledWordEmbedding)
 
 
-# Clamp bound so a large residual never becomes inf on the cast back. Module-level
-# keeps `torch.finfo` out of the graph.
+# Clamp bound so a large residual never becomes inf on the cast back; module-level keeps torch.finfo out of the graph.
 _GEMMA4_FP16_MAX = float(torch.finfo(torch.float16).max)
 
 
-# gemma-4-E2B has 504 RMSNorms sharing this one code object, so its Dynamo cache holds
-# the product of every axis its guards see. A pure tensor kernel instead of a bound
-# method drops three: `with_scale` (own kernel), width (Tensor view) and rank (2D).
+# gemma-4-E2B has 504 RMSNorms sharing one code object, so Dynamo caches the product of guard axes; a pure tensor kernel
+# drops with_scale (own kernel), width (Tensor view) and rank (2D).
 def _gemma4_rms_norm_scaled(hidden_states_2d, weight_1d, eps):
     x_fp32 = hidden_states_2d.to(torch.float32)
     variance = x_fp32.pow(2).mean(-1, keepdim = True)
@@ -314,8 +343,7 @@ def _gemma4_rms_norm_scaled(hidden_states_2d, weight_1d, eps):
     return torch.clamp(normed_fp32, min = -_GEMMA4_FP16_MAX, max = _GEMMA4_FP16_MAX).to(torch.float16)
 pass
 
-# Not a bare decorator: under `fullgraph = True` cache exhaustion raises, and only
-# this wrapper latches to eager instead of aborting the run.
+# Not a bare decorator: under `fullgraph = True` cache exhaustion raises, and only this wrapper latches to eager instead of aborting the run.
 _gemma4_rms_norm_scaled = compile_with_eager_fallback(_gemma4_rms_norm_scaled, "Gemma4RMSNorm.forward (scaled)")
 
 
@@ -329,19 +357,46 @@ pass
 _gemma4_rms_norm_unscaled = compile_with_eager_fallback(_gemma4_rms_norm_unscaled, "Gemma4RMSNorm.forward (unscaled)")
 
 
+def _gemma4_rms_norm_scaled_float32(hidden_states_2d, weight_1d, eps):
+    x_fp32 = hidden_states_2d.to(torch.float32)
+    variance = x_fp32.pow(2).mean(-1, keepdim = True)
+    return x_fp32 * torch.pow(variance + eps, -0.5) * weight_1d.to(torch.float32)
+pass
+
+_gemma4_rms_norm_scaled_float32 = compile_with_eager_fallback(
+    _gemma4_rms_norm_scaled_float32, "Gemma4RMSNorm.forward (scaled, float32)",
+)
+
+
+def _gemma4_rms_norm_unscaled_float32(hidden_states_2d, eps):
+    x_fp32 = hidden_states_2d.to(torch.float32)
+    variance = x_fp32.pow(2).mean(-1, keepdim = True)
+    return x_fp32 * torch.pow(variance + eps, -0.5)
+pass
+
+_gemma4_rms_norm_unscaled_float32 = compile_with_eager_fallback(
+    _gemma4_rms_norm_unscaled_float32, "Gemma4RMSNorm.forward (unscaled, float32)",
+)
+
+
 def patch_Gemma4RMSNorm():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if _gemma4_skip_or_undo("RMSNorm"): return
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor: # fp32 (residual) or fp16 (sub-layer)
         # Gemma4 scales by `weight` directly (no 1.0 + weight) and only when
         # with_scale. `self` is read in eager, so it never reaches the kernel's guards.
         hidden_states_2d, shape = flatten_for_elementwise_norm(hidden_states)
+        # Full finetuning keeps float32, else the final norm hands fp16 to a float32 lm_head ("Half != float").
+        # Residual post-norms return float32: their output gradient is the residual gradient, which overflows fp16.
+        boundary = getattr(_GEMMA4_BOUNDARY, "dtype", None)
+        to_float32 = (boundary == torch.float32 or self.__dict__.get(_GEMMA4_RESIDUAL_OUT, False)) \
+            and not torch.is_autocast_enabled(hidden_states.device.type)
         if self.with_scale:
-            normed = _gemma4_rms_norm_scaled(
-                hidden_states_2d, unwrap_norm_weight(self.weight), self.eps,
-            )
+            kernel = _gemma4_rms_norm_scaled_float32 if to_float32 else _gemma4_rms_norm_scaled
+            normed = kernel(hidden_states_2d, unwrap_norm_weight(self.weight), self.eps)
         else:
-            normed = _gemma4_rms_norm_unscaled(hidden_states_2d, self.eps)
+            kernel = _gemma4_rms_norm_unscaled_float32 if to_float32 else _gemma4_rms_norm_unscaled
+            normed = kernel(hidden_states_2d, self.eps)
         return normed.reshape(shape)
     pass
     # No `fullgraph`: the kernels are the compiled units; compiling this wrapper too
@@ -354,10 +409,53 @@ def patch_Gemma4RMSNorm():
             unwrap_norm_weight = unwrap_norm_weight,
             _gemma4_rms_norm_scaled = _gemma4_rms_norm_scaled,
             _gemma4_rms_norm_unscaled = _gemma4_rms_norm_unscaled,
+            _gemma4_rms_norm_scaled_float32 = _gemma4_rms_norm_scaled_float32,
+            _gemma4_rms_norm_unscaled_float32 = _gemma4_rms_norm_unscaled_float32,
+            _GEMMA4_BOUNDARY = _GEMMA4_BOUNDARY,
+            _GEMMA4_RESIDUAL_OUT = _GEMMA4_RESIDUAL_OUT,
         )
-        patch_function(getattr(module, prefix + "RMSNorm"), "forward", forward, match_level = "relaxed")
+        patch_forced_float32(getattr(module, prefix + "RMSNorm"), "forward", forward, match_level = "relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4RMSNorm)
+
+
+def patch_Gemma4ClippableLinear():
+    """Cast the fp16 norm output to the Linear's dtype (fp32 on full finetuning; identity on LoRA)."""
+    if _gemma4_skip_or_undo("ClippableLinear"): return
+    for module, prefix in _gemma4_text_variants("ClippableLinear"):
+        publish_to_modeling_module(
+            module,
+            _linear_boundary_dtype = _linear_boundary_dtype,
+            _to_boundary_dtype = _to_boundary_dtype,
+        )
+
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            hidden_states = _to_boundary_dtype(hidden_states, _linear_boundary_dtype(self, "linear"))
+            if self.use_clipped_linears:
+                hidden_states = torch.clamp(hidden_states, self.input_min, self.input_max)
+
+            hidden_states = self.linear(hidden_states)
+
+            if self.use_clipped_linears:
+                hidden_states = torch.clamp(hidden_states, self.output_min, self.output_max)
+
+            return hidden_states
+        pass
+        patch_forced_float32(getattr(module, prefix + "ClippableLinear"), "forward", forward, match_level = "relaxed")
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4ClippableLinear)
+
+
+def _gemma4_native_bf16():
+    """bfloat16 in hardware (sm80+, ROCm). torch.cuda.is_bf16_supported() also counts T4's emulation."""
+    try:
+        if not torch.cuda.is_available():
+            return False
+        if torch.version.hip:
+            return True
+        return torch.cuda.get_device_capability()[0] >= 8
+    except Exception:
+        return False
 
 
 def _patch_gemma4_text_attention(module, prefix):
@@ -371,6 +469,9 @@ def _patch_gemma4_text_attention(module, prefix):
     # Eager: the mask check syncs to host.
     packed_document_sdpa = torch.compiler.disable(_packed_document_sdpa, recursive = True)
     packed_documents = os.environ.get("UNSLOTH_GEMMA4_PACKED_DOCUMENTS", "1") != "0"
+    # float16 SDPA operands (kernels accumulate in float32): T4 578 -> 744 tok/s. Off: UNSLOTH_GEMMA4_FP16_SDPA=0.
+    # Non-bf16 GPUs only: bf16 cards keep float32 to stay off cuDNN (B200 cuDNN 9.24: NaN dq at hd256 + mask).
+    fp16_sdpa = os.environ.get("UNSLOTH_GEMMA4_FP16_SDPA", "1") != "0" and not _gemma4_native_bf16()
 
     def forward(
         self,
@@ -381,8 +482,7 @@ def _patch_gemma4_text_attention(module, prefix):
         past_key_values = None,
         **kwargs,
     ):
-        # Shared-KV carrier (5.5.0-5.5.1, no native shared_kv_states); a no-op
-        # for 31B / 26B-A4B where num_kv_shared_layers == 0 and no carrier is attached.
+        # Shared-KV carrier for 5.5.0-5.5.1 (no native shared_kv_states); a no-op for 31B / 26B-A4B where num_kv_shared_layers == 0 and no carrier is attached.
         carrier = getattr(self, "_unsloth_shared_kv_carrier", None)
         if carrier is not None and past_key_values is None:
             past_key_values = carrier
@@ -394,6 +494,12 @@ def _patch_gemma4_text_attention(module, prefix):
         cos = cos.to(torch.float32)
         sin = sin.to(torch.float32)
 
+        # Published for the RMSNorms after this layer: fp16 norm output meets fp32 projections on full finetuning.
+        boundary = None if torch.is_autocast_enabled(hidden_states.device.type) else \
+            _linear_boundary_dtype(self, "q_proj")
+        _GEMMA4_BOUNDARY.dtype = boundary
+        hidden_states = _to_boundary_dtype(hidden_states, boundary)
+
         # q: fp16 proj -> fp16 q_norm -> float32 -> RoPE (float32) -> (b, h, q, d)
         query_states = self.q_proj(hidden_states).view(hidden_shape)
         query_states = self.q_norm(query_states).to(torch.float32)
@@ -401,9 +507,8 @@ def _patch_gemma4_text_attention(module, prefix):
         query_states = query_states.transpose(1, 2).contiguous()
 
         if self.is_kv_shared_layer and shared_kv_states is not None:
-            # Native shared-KV (5.5.2+): dict keyed by layer_type, read even with a
-            # cache (sliding caches forget past the window). Shared layers define no
-            # k/v projections on these builds, so this branch must win.
+            # Native shared-KV (5.5.2+): dict keyed by layer_type, read even with a cache (sliding caches forget past
+            # the window); shared layers have no k/v projections, so this branch must win.
             key_states, value_states = shared_kv_states[self.layer_type]
             key_states = key_states.to(query_states.device, torch.float32)
             value_states = value_states.to(query_states.device, torch.float32)
@@ -413,8 +518,7 @@ def _patch_gemma4_text_attention(module, prefix):
             value_states = value_states.to(query_states.device, torch.float32)
         else:
             key_states = self.k_proj(hidden_states).view(hidden_shape)
-            # attention_k_eq_v global layers have v_proj is None -> value shares the
-            # raw k_proj output (before k_norm / RoPE rebind key_states below).
+            # attention_k_eq_v global layers have v_proj None, so value shares the raw k_proj output, taken before k_norm and RoPE rebind key_states.
             value_states = self.v_proj(hidden_states).view(hidden_shape) if self.v_proj is not None else key_states
 
             key_states = self.k_norm(key_states).to(torch.float32)
@@ -464,10 +568,9 @@ def _patch_gemma4_text_attention(module, prefix):
             )
             attn_output = torch.matmul(attn_weights, v_r).transpose(1, 2)
         elif attention_interface is not None:
-            # Registered backend (flex / flash) owns the mask semantics; pass the
-            # mask exactly as upstream prepared it (FA uses a 2-D padding mask,
-            # flex a BlockMask). Flash kernels need fp16 inputs and accumulate in
-            # float32 internally, so stability is preserved; flex handles fp32.
+            # Registered backend (flex/flash) owns mask semantics: pass the mask as upstream prepared it (2-D padding
+            # for FA, BlockMask for flex); flash kernels need fp16 inputs and accumulate in fp32 so stability holds;
+            # flex handles fp32.
             q, k, v = query_states, key_states, value_states
             if attn_impl != "flex_attention":
                 q, k, v = q.to(torch.float16), k.to(torch.float16), v.to(torch.float16)
@@ -484,8 +587,19 @@ def _patch_gemma4_text_attention(module, prefix):
             )  # returns (b, q, h, d), already transposed
         else:
             attn_mask = attention_mask
+            sdpa_dtype = torch.float16 if (
+                fp16_sdpa and query_states.is_cuda and query_states.dtype == torch.float32
+                and not (self.training and self.attention_dropout)
+            ) else torch.float32
             if isinstance(attn_mask, torch.Tensor) and attn_mask.dtype != torch.bool:
                 attn_mask = attn_mask.to(torch.float32)
+                if sdpa_dtype is torch.float16:
+                    # No clamp: masked entries must become -inf, else fully masked rows attend instead of returning 0.
+                    attn_mask = attn_mask.to(torch.float16)
+            if sdpa_dtype is torch.float16:
+                query_states = query_states.to(torch.float16)
+                key_states = key_states.to(torch.float16)
+                value_states = value_states.to(torch.float16)
             is_causal = attn_mask is None and query_states.shape[2] > 1 and getattr(self, "is_causal", True)
             attn_output = None
             if (
@@ -520,23 +634,90 @@ def _patch_gemma4_text_attention(module, prefix):
 
         # (b, q, h, d) -> (b, q, h*d), down-cast to fp16 for o_proj.
         attn_output = attn_output.contiguous().reshape(*input_shape, -1)
-        attn_output = attn_output.to(torch.float16)
+        # Match o_proj's dtype (fp32 on full finetuning); 4bit / unknown weights stay fp16.
+        if torch.is_autocast_enabled(attn_output.device.type):
+            attn_output = attn_output.to(torch.float16)
+        else:
+            attn_output = _to_forced_output_dtype(attn_output, _linear_boundary_dtype(self, "o_proj"))
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
     pass
-    # force = True: gemma4.py's shared-KV carrier already wrapped forward as
-    # (self, *args, **kwargs); a signature check would reject this replacement (capturing
-    # the carrier's q/k-fp32-vs-v-fp16 SDPA mismatch). Carrier handled inline above, so safe.
-    patch_function(getattr(module, prefix + "TextAttention"), "forward", forward, force = True, match_level = "relaxed")
+    # force=True: gemma4.py's shared-KV carrier already wraps forward as (self, *args, **kwargs), so a signature check
+    # would reject this; the carrier's q/k fp32 vs v fp16 SDPA mismatch is handled inline above.
+    patch_forced_float32(getattr(module, prefix + "TextAttention"), "forward", forward, force = True, match_level = "relaxed")
 pass
 
 
 def patch_Gemma4TextAttention():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    if _gemma4_skip_or_undo("TextAttention"): return
     for module, prefix in _gemma4_text_variants("TextAttention"):
         _patch_gemma4_text_attention(module, prefix)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4TextAttention)
+
+
+def _gemma4_layer_boundary(layer):
+    attn = getattr(layer, "self_attn", None)
+    q_proj = getattr(attn, "q_proj", None)
+    if hasattr(q_proj, "linear"):  # vision attention: Gemma4ClippableLinear
+        return _linear_boundary_dtype(q_proj, "linear")
+    return _linear_boundary_dtype(attn, "q_proj")
+
+
+def _gemma4_model_boundary(model):
+    layers = getattr(model, "layers", None)
+    return _gemma4_layer_boundary(layers[0]) if layers is not None and len(layers) else None
+
+
+def patch_Gemma4TextDecoderLayerBoundary():
+    # Scoped to each forward and restored on exit, so a checkpoint recomputation picks the same norm kernel and norms
+    # outside the scopes never see a stale float32 (CheckpointError, or float32 into an fp16 projector).
+    if other_family_load(_GEMMA4_FAMILY): return
+    scopes = (
+        ("TextModel", _gemma4_model_boundary),
+        ("TextDecoderLayer", _gemma4_layer_boundary),
+        ("VisionEncoderLayer", _gemma4_layer_boundary),
+    )
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
+        # A flag "0" load undoes it, as _gemma4_skip_or_undo does for the stashed patches.
+        for name, prefix in (("gemma4", "Gemma4"), ("gemma4_unified", "Gemma4Unified")):
+            modeling = sys.modules.get(f"transformers.models.{name}.modeling_{name}")
+            for suffix, _ in scopes:
+                cls = getattr(modeling, prefix + suffix, None)
+                if cls is not None and getattr(cls.forward, "_unsloth_gemma4_boundary", False):
+                    cls.forward = getattr(cls.forward, "_unsloth_gemma4_stock", None) or cls.forward.__wrapped__
+        return
+    for suffix, boundary_of in scopes:
+        for module, prefix in _gemma4_text_variants():
+            cls = getattr(module, prefix + suffix, None)
+            if cls is None: continue
+            stock = cls.forward
+            if getattr(stock, "_unsloth_gemma4_boundary", False):
+                continue
+            # Wrap the body under transformers >= 5.23's checkpoint wrapper, then wrap the class again: wrapping the
+            # wrapper turned checkpointing off (E2B LoRA kept every activation, 27 GB instead of 10 GB).
+            original = checkpointed_forward_body(stock)
+
+            def forward(self, *args, _unsloth_original = original, _unsloth_boundary_of = boundary_of,
+                        _unsloth_text_layer = suffix == "TextDecoderLayer", **kwargs):
+                if _unsloth_text_layer and "_unsloth_gemma4_marked" not in self.__dict__:
+                    _gemma4_mark_residual_norms(self)
+                    self.__dict__["_unsloth_gemma4_marked"] = True
+                previous = getattr(_GEMMA4_BOUNDARY, "dtype", None)
+                autocast = torch.is_autocast_enabled("cuda") or torch.is_autocast_enabled("cpu")
+                _GEMMA4_BOUNDARY.dtype = None if autocast else _unsloth_boundary_of(self)
+                try:
+                    return _unsloth_original(self, *args, **kwargs)
+                finally:
+                    _GEMMA4_BOUNDARY.dtype = previous
+            pass
+            forward._unsloth_gemma4_boundary = True
+            forward._unsloth_gemma4_stock = stock
+            forward.__wrapped__ = original
+            cls.forward = forward
+            keep_layer_checkpointing(cls, "forward", stock)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4TextDecoderLayerBoundary)
 
 
 def patch_Gemma4UnifiedVisionEmbedder():

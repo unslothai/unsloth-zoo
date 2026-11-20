@@ -2,13 +2,11 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""saved_tensors_hooks offload for torch's non-reentrant checkpoint.
-
-Gradients must match plain non-reentrant checkpointing bit for bit in every mode: side
-stream pinned copies, unsloth_stream (keep last N on device, reload i-1 ahead), and the
-pageable fallback once the pinned cap is hit. The engagement counters prove each path ran.
-"""
+"""saved_tensors_hooks offload for non-reentrant checkpoint: grads must match plain checkpointing bit for bit in
+side-stream pinned, unsloth_stream (keep last N on device, reload i-1 ahead) and the pageable fallback past the
+pinned cap; engagement counters prove each path ran."""
 import functools
+import weakref
 
 import pytest
 import torch
@@ -25,6 +23,7 @@ def gc_module(monkeypatch):
     monkeypatch.setattr(gc_module, "GC_PINNED_CAP", None, raising = False)
     monkeypatch.setattr(gc_module, "GC_PINNED_BYTES", 0, raising = False)
     monkeypatch.setattr(gc_module, "_PINNED_CACHED", {}, raising = False)
+    monkeypatch.setattr(gc_module, "_PINNED_LIVE", {}, raising = False)
     monkeypatch.delenv("UNSLOTH_GC_PINNED_MAX_GB", raising = False)
     return gc_module
 
@@ -95,8 +94,7 @@ def test_gradients_match_plain_checkpoint(gc_module, monkeypatch, mode):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_side_stream_host_copy_is_pinned(gc_module):
-    # Bytes are charged to the pinned cap only for a destination that really is pinned:
-    # a non_blocking CUDA to CPU .to() allocates it from the pinned host allocator.
+    # Bytes are charged to the pinned cap only for a destination that is really pinned: non_blocking CUDA-to-CPU .to() allocates from the pinned host allocator.
     offloader = gc_module.NonReentrantActivationOffloader(stream_mode = False)
     x = torch.randn(1024, 1024, device = "cuda", requires_grad = True)
     record = offloader.pack(x)
@@ -170,8 +168,8 @@ def test_stream_prefetch_skips_inputs_already_unpacked(gc_module, monkeypatch, k
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 @pytest.mark.parametrize("keep_last", ["0", "1"])
 def test_stream_prefetch_reloads_every_input_of_the_previous_checkpoint(gc_module, monkeypatch, keep_last):
-    # Each unpack queues the newest input still on the host, so both inputs of checkpoint i-1
-    # are reloaded while checkpoint i recomputes; only the last checkpoint's inputs load cold.
+    # Each unpack queues the newest host-resident input, so both inputs of checkpoint i-1 reload while checkpoint i
+    # recomputes; only the last checkpoint loads cold.
     monkeypatch.setenv("UNSLOTH_GC_STREAM_KEEP_LAST", keep_last)
     torch.manual_seed(0)
     layers = [_TwoInputLayer().cuda() for _ in range(5)]
@@ -201,8 +199,8 @@ def _max_prefetched_waiting(offloader, monkeypatch):
     peak = [0]
     original = offloader._prefetch
 
-    def counting(index):
-        original(index)
+    def counting(*args):
+        original(*args)
         live = (ref() for ref in offloader.order)
         peak[0] = max(peak[0], sum(1 for r in live if r is not None and r.ready is not None))
 
@@ -212,8 +210,7 @@ def _max_prefetched_waiting(offloader, monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_stream_prefetch_never_reaches_past_the_previous_checkpoint(gc_module, monkeypatch):
-    # A three input checkpoint after single input ones: its three unpacks may only reload the
-    # one input of the checkpoint before it, not walk on into older checkpoints.
+    # A three-input checkpoint after single-input ones: its unpacks may reload only the one input of the checkpoint before, never older checkpoints.
     monkeypatch.setenv("UNSLOTH_GC_STREAM_KEEP_LAST", "0")
     torch.manual_seed(0)
     singles = [torch.nn.Linear(256, 256).cuda() for _ in range(3)]
@@ -235,8 +232,7 @@ def test_stream_prefetch_never_reaches_past_the_previous_checkpoint(gc_module, m
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_stream_prefetch_is_one_step_when_hooks_span_every_checkpoint(gc_module, monkeypatch):
-    # One hooks() entry around all checkpoints gives no checkpoint boundaries: keep to index - 1,
-    # so at most the next reload is queued while one still waits, however deep the stack is.
+    # One hooks() entry spanning all checkpoints has no boundaries, so prefetch stays at index - 1: at most one reload waits ahead, however deep the stack.
     monkeypatch.setenv("UNSLOTH_GC_STREAM_KEEP_LAST", "0")
     torch.manual_seed(0)
     layers = [_TwoInputLayer().cuda() for _ in range(8)]
@@ -254,8 +250,8 @@ def test_stream_prefetch_is_one_step_when_hooks_span_every_checkpoint(gc_module,
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_low_ram_growth_fallback_frees_the_old_pinned_block(gc_module, monkeypatch):
-    # One local rank, host RAM short: the grown slot goes pageable and its old pinned block must
-    # be returned to the OS, not left cached in torch's host allocator beside the pageable copy.
+    # One local rank, host RAM short: the grown slot goes pageable and its old pinned block must go back to the OS, not
+    # sit in torch's host allocator beside the pageable copy.
     monkeypatch.setattr(gc_module, "PINNED_MEMORY_AVAILABLE", True, raising = False)
     monkeypatch.delenv("UNSLOTH_DISABLE_PINNED_MEMORY", raising = False)
     monkeypatch.setattr(gc_module, "GC_PINNED_CAP", gc_module._PIN_PER_BLOCK, raising = False)
@@ -293,8 +289,7 @@ def _forward_peak_active(hooks, n_layers = 12):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_single_gpu_default_copies_on_the_compute_stream(gc_module, monkeypatch):
-    # Copying on the compute stream, like the saved_tensors_hooks Unsloth used before, frees
-    # each block in stream order, so offloading adds no VRAM over that baseline.
+    # Copying on the compute stream frees each block in stream order, so offloading adds no VRAM over the earlier saved_tensors_hooks baseline.
     monkeypatch.delenv("UNSLOTH_GC_MAX_INFLIGHT_COPIES", raising = False)
     monkeypatch.setattr(gc_module, "is_distributed", lambda: False)
     offloader = gc_module.NonReentrantActivationOffloader(stream_mode = False)
@@ -323,9 +318,9 @@ def test_distributed_default_bounds_inflight_copies(gc_module, monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_capped_pinning_survives_blocks_freed_after_async_copies(gc_module, monkeypatch):
-    # unpack's non_blocking H2D leaves each freed host block in torch's event queue, and
-    # host_memory_stats() does not drain it, so the cached blocks read as not free. Once the
-    # cap was reached, every later layer used to go pageable for the rest of training.
+    # unpack's non_blocking H2D leaves each freed host block in torch's event queue; host_memory_stats() does not drain
+    # it, so blocks read as not free and, once the cap was reached, every later layer went pageable for the rest of
+    # training.
     if not hasattr(torch.cuda, "host_memory_stats"):
         pytest.skip("torch < 2.7 has no host_memory_stats")
     torch.cuda.synchronize()
@@ -355,8 +350,7 @@ def test_capped_pinning_survives_blocks_freed_after_async_copies(gc_module, monk
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 def test_a_probe_that_pins_a_new_block_releases_it(gc_module):
-    # Another pinned user holds the cached block, so the probe pins a fresh one: it must not stay
-    # cached past the cap.
+    # Another pinned user holds the cached block, so the probe pins a fresh one that must not stay cached past the cap.
     if not hasattr(torch.cuda, "host_memory_stats"):
         pytest.skip("torch < 2.7 has no host_memory_stats")
     torch.cuda.synchronize()
@@ -389,3 +383,116 @@ def test_a_probe_failure_other_than_oom_is_raised(gc_module, monkeypatch):
 
     monkeypatch.setattr(torch, "empty", oom)
     assert gc_module._host_cache_reuses_block(1 << 20) is False
+
+
+# CPU caching allocator: a block freed on its allocation stream is reusable at once, so other-stream use is safe only
+# if, at free time, the allocation stream waited on it or record_stream() named a stream that did; record_stream ignores
+# the allocation stream.
+class _Stream:
+    def __init__(self, name): self.name, self.waited, self.ops = name, [], []
+    def wait_event(self, event): self.waited.append(event)
+    def wait_stream(self, other): pass
+    def record_event(self): return _Event()
+    def __repr__(self): return self.name
+
+
+class _Event:
+    def record(self, stream = None): pass
+    def query(self): return False
+
+
+class _Source:
+    """A device tensor: `uses` is what record_stream() registered, `safe` is decided at free."""
+    def __init__(self, stream, guards):
+        self.alloc_stream, self.uses, self.guards, self.freed = stream, [], guards, []
+        self.device = type("D", (), {"index": 0, "type": "cuda"})()
+        weakref.finalize(self, _Source._free, self.alloc_stream, self.uses, self.guards, self.freed)
+
+    @staticmethod
+    def _free(alloc_stream, uses, guards, freed):
+        # Every guard (a copy's event, or work queued on a consumer stream) must be ordered before reuse on the allocation stream.
+        for guard in guards:
+            if isinstance(guard, _Stream):
+                freed.append(guard is alloc_stream or guard in uses)
+            else:
+                freed.append(guard in alloc_stream.waited or any(guard in s.waited for s in uses))
+
+    def record_stream(self, stream):
+        if stream is not self.alloc_stream and stream not in self.uses: self.uses.append(stream)
+    def numel(self): return 4
+    def element_size(self): return 4
+    def to(self, device, non_blocking = False): return "host copy"
+
+
+@pytest.fixture
+def fake_cuda(gc_module, monkeypatch):
+    import contextlib
+    state = {"current": _Stream("compute"), "side": _Stream("side")}
+    monkeypatch.setattr(gc_module, "PINNED_MEMORY_AVAILABLE", True)
+    monkeypatch.setattr(gc_module, "_pinned_memory_disabled", lambda: False)
+    monkeypatch.setattr(gc_module, "_reserve_pinned", lambda n: True)
+    monkeypatch.setattr(gc_module, "_release_pinned", lambda n: None)
+    monkeypatch.setattr(gc_module, "_new_extra_stream", lambda i: state["side"])
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device = None: state["current"])
+    monkeypatch.setattr(torch.cuda, "stream", lambda s: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "Event", _Event)
+    monkeypatch.setenv("UNSLOTH_GC_MAX_INFLIGHT_COPIES", "1")
+    return state
+
+
+def _pack_on_side_stream(gc_module, alloc_stream):
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = False)
+    record = gc_module._OffloadedActivation(None, 0)
+    guards = []
+    x = _Source(alloc_stream, guards)
+    offloader._to_host(record, x)
+    guards.append(record.copied)
+    return offloader, record, x.freed, x.uses, weakref.ref(x)
+
+
+@pytest.mark.parametrize("same_stream", [True, False])
+def test_d2h_source_is_reused_only_after_its_copy(gc_module, fake_cuda, same_stream):
+    alloc = fake_cuda["current"] if same_stream else _Stream("producer")
+    offloader, record, freed, uses, alive = _pack_on_side_stream(gc_module, alloc)
+    offloader._drain()  # backward starts: the keepalive is retired
+    assert alive() is None and freed == [True]
+    # The usual case costs no delayed reuse: nothing is recorded on the side stream.
+    assert fake_cuda["side"] not in uses
+    assert uses == ([] if same_stream else [fake_cuda["current"]])
+
+
+@pytest.mark.parametrize("same_stream", [True, False])
+def test_a_dropped_graph_releases_its_d2h_source_after_the_copy(gc_module, fake_cuda, same_stream):
+    alloc = fake_cuda["current"] if same_stream else _Stream("producer")
+    offloader, record, freed, uses, alive = _pack_on_side_stream(gc_module, alloc)
+    del record  # graph discarded without backward, offloader idle
+    assert alive() is None and freed == [True]
+    assert not offloader.inflight[0] or offloader.inflight[0][0][0] is None
+
+
+def test_a_record_outliving_its_offloader_keeps_the_source_until_the_copy(gc_module, fake_cuda):
+    offloader, record, freed, uses, alive = _pack_on_side_stream(gc_module, fake_cuda["current"])
+    del offloader
+    assert alive() is not None or freed == [True]
+    del record
+    assert alive() is None and freed == [True]
+
+
+@pytest.mark.parametrize("same_stream", [True, False])
+def test_a_consumed_prefetch_outlives_its_reload_and_its_consumer(gc_module, fake_cuda, same_stream):
+    alloc = fake_cuda["current"] if same_stream else _Stream("prefetching")
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = False)
+    record = gc_module._OffloadedActivation(type("D", (), {"index": 0})(), 0)
+    guards = []
+    x = _Source(alloc, guards)
+    freed = x.freed
+    ready = _Event()
+    record.device_tensor, record.ready, record.ready_stream, record.host = x, ready, alloc, "host copy"
+    guards.append(ready)
+    del x
+    out = offloader.unpack(record)
+    guards.append(fake_cuda["current"])  # the consumer then reads it on the unpacking stream
+    del record
+    alive = weakref.ref(out)
+    del out
+    assert alive() is None and freed == [True, True]

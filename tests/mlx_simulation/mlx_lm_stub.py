@@ -178,6 +178,9 @@ class TextDataset:
 
 
 class CacheDataset:
+    """mlx-lm's CacheDataset returns ``data.process(data[idx])``, cached. Wrapped datasets
+    without ``process`` (this module's TextDataset tokenizes in ``__getitem__``) pass through."""
+
     def __init__(self, dataset, *args, **kwargs):
         self.dataset = dataset
         self._cache = {}
@@ -185,9 +188,14 @@ class CacheDataset:
     def __len__(self):
         return len(self.dataset)
 
+    def itemlen(self, idx):
+        return len(self.dataset[idx])
+
     def __getitem__(self, idx):
         if idx not in self._cache:
-            self._cache[idx] = self.dataset[idx]
+            item = self.dataset[idx]
+            process = getattr(self.dataset, "process", None)
+            self._cache[idx] = process(item) if callable(process) else item
         return self._cache[idx]
 
 

@@ -1,13 +1,4 @@
-"""Regression tests for the Gemma-4 MoE LoRA extractor registration (PR #624).
-
-Do NOT require ``transformers.models.gemma4``; they drive the registration
-helper against a synthetic stand-in with the same surface (gate_up_proj
-(E, 2*I, H), down_proj (E, H, I), hidden_dim, intermediate_dim). Cover:
-registration attaches the Qwen extractor + model-type tag, is idempotent,
-returns False (no raise / no half-registered state) on None or a raising
-factory, reconstructs the per-expert delta on PEFT 0.18 raw and 0.19 swapped
-layouts for both params, and does not disturb sibling families.
-"""
+"""Gemma-4 MoE LoRA extractor registration (PR 624) on a stub: idempotent, no raise, PEFT 0.18/0.19"""
 
 from __future__ import annotations
 
@@ -38,8 +29,7 @@ def _fresh_stub_class():
 
 
 class _StubWrapper:
-    """PEFT ParamWrapper surface read by ``_make_qwen_moe_lora_extractor``:
-    ``parameter_name``, ``get_base_layer()``, ``_did_swap_in_out_features``."""
+    """PEFT ParamWrapper stand-in: parameter_name, get_base_layer(), private _did_swap_in_out_features"""
 
     def __init__(self, parameter_name: str, base_layer, peft_swapped: bool):
         self.parameter_name = parameter_name
@@ -95,8 +85,7 @@ def test_register_does_not_disturb_sibling_registration():
 
 
 def _drive_extractor(cls, parameter_name: str, peft_swapped: bool):
-    """Drive the registered extractor on hand-built LoRA factors and compare
-    the per-expert reconstructed delta to a naive reference."""
+    """Compare the extractor's per-expert delta with a naive reference, on hand-built LoRA factors"""
     torch.manual_seed(0)
     base = cls()
     if parameter_name == "gate_up_proj":
@@ -167,16 +156,12 @@ def test_extractor_down_swapped_peft019():
 
 
 def test_patch_gemma4_moe_is_noop_without_gemma4(monkeypatch):
-    """When transformers lacks ``models.gemma4.modeling_gemma4``, the public
-    entrypoint must not raise: inner patches guard their imports and
-    ``patch_gemma4_moe`` short-circuits via ``raise_error`` (returns)."""
+    """Without models.gemma4.modeling_gemma4, patch_gemma4_moe must not raise; it returns via raise_error"""
     g4.patch_gemma4_moe()  # must not raise
 
 
 def test_register_handles_legacy_block_class_shape():
-    """A legacy Gemma4TextMoEBlock-shaped class registers like
-    Gemma4TextExperts: it exposes the same num_experts/hidden_dim/
-    intermediate_dim + gate_up_proj/down_proj surface."""
+    """A legacy Gemma4TextMoEBlock-shaped class registers the same way as Gemma4TextExperts."""
     LegacyBlock = _fresh_stub_class()
     assert g4._register_gemma4_lora_extractor(LegacyBlock) is True
     _drive_extractor(LegacyBlock, "gate_up_proj", peft_swapped=False)

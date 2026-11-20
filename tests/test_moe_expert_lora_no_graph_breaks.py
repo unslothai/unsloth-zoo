@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Expert LoRA trains with no graph breaks on experts-interface families outside the own-gate route: default
-gate (GLM-4.7-Flash), non-gated stacks (NemotronH), a cast router (Ernie 4.5) and Jamba's decoder layer mapping."""
+"""Expert LoRA trains with no graph breaks on experts-interface families outside the own-gate route: GLM-4.7-Flash
+(default gate), NemotronH (non-gated), Ernie 4.5 (cast router), Jamba (decoder layer mapping)."""
 
 import json
 import os

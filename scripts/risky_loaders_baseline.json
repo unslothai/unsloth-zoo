@@ -34,9 +34,9 @@
       "file": "unsloth_zoo/compiler.py",
       "rule": "dynamic-import",
       "sink": "import_module",
-      "digest": "885dc7a9d18c2d47",
+      "digest": "d327daedda374223",
       "count": 1,
-      "reason": "model_type is checked against [a-z0-9_]+ first, and the import is prefix-bounded to transformers.models.<type>.modeling_<type>."
+      "reason": "model_type is checked against [a-z0-9_]+ first (in resolve_modeling_module itself), and the import is prefix-bounded to transformers.models.<type>.modeling_<type>."
     },
     {
       "file": "unsloth_zoo/compiler.py",
@@ -53,6 +53,14 @@
       "digest": "3b5d271a7507f295",
       "count": 1,
       "reason": "Loads the module this process just generated into its own compile cache folder."
+    },
+    {
+      "file": "unsloth_zoo/cpu/runtime.py",
+      "rule": "dynamic-import",
+      "sink": "spec_from_file_location",
+      "digest": "7e28e71786fdeb78",
+      "count": 1,
+      "reason": "Loads a fixed, package-shipped guard file (unsloth_zoo/temporary_patches/datasets_folder_metadata.py) by a hard-coded name; no caller-controlled path."
     },
     {
       "file": "unsloth_zoo/dataset_num_proc.py",
@@ -177,14 +185,6 @@
     {
       "file": "unsloth_zoo/mlx/loader.py",
       "rule": "dynamic-import",
-      "sink": "__import__",
-      "digest": "6a41e8f101f60025",
-      "count": 1,
-      "reason": "Iterates fixed mlx_lm.tuner module names."
-    },
-    {
-      "file": "unsloth_zoo/mlx/loader.py",
-      "rule": "dynamic-import",
       "sink": "import_module",
       "digest": "0970017c63eaedce",
       "count": 1,
@@ -223,12 +223,28 @@
       "reason": "Module name comes from a fixed tuple or table in this file, not from a model, request or download."
     },
     {
+      "file": "unsloth_zoo/mlx/runtime.py",
+      "rule": "dynamic-import",
+      "sink": "spec_from_file_location",
+      "digest": "2873677cf12e8082",
+      "count": 1,
+      "reason": "Loads unsloth_zoo's own temporary_patches/datasets_folder_metadata.py by a path built from this package's directory; no model, request or download chooses it."
+    },
+    {
       "file": "unsloth_zoo/mlx/speculative.py",
       "rule": "dynamic-import",
       "sink": "__import__",
       "digest": "b0d2b11936c8679d",
       "count": 1,
       "reason": "Family is one of the two literals this file passes (qwen3_5, gemma4), bounded to mlx_vlm.models.<family>.language."
+    },
+    {
+      "file": "unsloth_zoo/mlx/speculative.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "1b828f3737f5d751",
+      "count": 1,
+      "reason": "Module name is a value of _MERGED_ASSISTANT_MODULES, a fixed table in this file; the checkpoint config only selects a key."
     },
     {
       "file": "unsloth_zoo/mlx/speculative.py",
@@ -295,6 +311,14 @@
       "reason": "Reads back a .pt file this function just wrote with torch.save into a temporary location; never a downloaded file."
     },
     {
+      "file": "unsloth_zoo/sparse_mqa_kernel.py",
+      "rule": "dynamic-import",
+      "sink": "spec_from_file_location",
+      "digest": "81a60b8eabc5e5c0",
+      "count": 1,
+      "reason": "Loads the fixed file kernels/large_head_attention.py of the installed unsloth package (found via find_spec(\"unsloth\") without importing it), never a user-supplied path."
+    },
+    {
       "file": "unsloth_zoo/speculative/__init__.py",
       "rule": "dynamic-import",
       "sink": "import_module",
@@ -325,6 +349,14 @@
       "digest": "37f520ba5b9ea0dc",
       "count": 1,
       "reason": "Iterates the fixed _EXPORT_SUBMODULES of the vendored fla package."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/fla_vendor.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "f79d15f13ee764d4",
+      "count": 1,
+      "reason": "Imports _GLM5_NEXT_MODULE, a fixed transformers module path defined in this file, to patch Glm5NextTextLinearAttention."
     },
     {
       "file": "unsloth_zoo/temporary_patches/fla_vendor.py",

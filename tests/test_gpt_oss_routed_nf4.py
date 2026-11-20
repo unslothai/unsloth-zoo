@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Routed NF4 gpt-oss experts: the routed GEMV against bitsandbytes' dequantized weights
-per expert (nested and plain, distinct per-expert offsets), the routed forward against
-the dense eval branch (with and without LoRA), torch.compile fullgraph and CUDA graph
-replay with changed routes."""
+"""Routed NF4 gpt-oss experts match bitsandbytes' dequantized weights and the dense eval branch (with and without LoRA),
+incl. torch.compile fullgraph and CUDA graph replay with changed routes."""
 import os
 
 import pytest

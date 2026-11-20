@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""End-to-end LoRA merge correctness for vision / multimodal models.
-
-Language-side LoRA must merge while every vision-tower / projector / audio tensor
-stays byte-identical. Also exercises the #773 key remap (runtime
-`model.language_model.` vs on-disk `language_model.model.`): reference keys use the
-production remapper `_convert_lora_keys_to_safetensor_format`, and a clean run proves
-the key-count check does not false-positive when only the nested language model is
-adapted.
-"""
+"""Language LoRA merges; vision, projector and audio tensors stay byte-identical (issue 773 remap)."""
 
 from __future__ import annotations
 
@@ -109,8 +101,7 @@ def test_vision_language_only_merge_preserves_vision(family, tmp_path):
             if sk in base:
                 ref[sk] = st
     if not ref:
-        # remapper could not line language LoRA keys to on-disk keys on this
-        # transformers version; vision preservation below is the core check.
+        # Remapper cannot match language LoRA keys on this transformers version; vision check is core.
         pytest.skip(f"{family}: language adapter keys did not resolve against base "
                     f"on this transformers version")
 

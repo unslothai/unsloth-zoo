@@ -14,9 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""load_vllm sizing: an explicit max_num_seqs / max_num_batched_tokens reaches vLLM instead of the
-memory tier, and the KV estimate uses the real per-layer cache (head_dim, sliding window, MLA,
-linear attention, KV sharing) rather than hidden_size / heads on every layer."""
+"""load_vllm sizing: explicit max_num_seqs / max_num_batched_tokens reach vLLM instead of the memory tier; the KV
+estimate uses the real per-layer cache (head_dim, sliding window, MLA, linear attention, KV sharing), not hidden_size
+/ heads."""
 
 import os
 import sys

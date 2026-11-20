@@ -1,18 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Regression test for #121: add_new_tokens must not shrink a padded embedding.
-
-Some models ship an embedding padded LARGER than the tokenizer vocab (Gemma3:
-262208 rows vs 262145 tokens). The old code resized to len(tokenizer), which
-SHRANK the matrix and silently destroyed the already-trained rows past the
-tokenizer length (no exception raised). The fix never resizes below the existing
-embedding, fills only the genuinely-new rows with the trained mean, keeps tied
-weights tied, and keeps config.vocab_size equal to the real matrix row count so
-the model still round-trips through save_pretrained/from_pretrained.
-
-Fully synthetic (tiny tied Llama, ~100-token tokenizer), CPU only, no download.
-"""
+"""Regression for issue 121: add_new_tokens must not shrink a padded embedding (Gemma3: 262208 rows vs 262145 tokens)
+since shrinking silently destroyed trained rows; new rows get the trained mean; ties stay tied; config.vocab_size
+equals the real row count so save and reload round-trip."""
 
 import tempfile
 
@@ -56,9 +47,7 @@ def test_padded_embedding_preserves_trained_rows_and_places_new_tokens():
     model, tokenizer = _build(VOCAB_TOK, PADDED)
     emb = model.get_input_embeddings().weight
 
-    # Snapshot everything the fix must preserve, and mark the alignment padding
-    # rows [VOCAB_TOK, PADDED) with a distinctive sentinel so we can tell if a
-    # new token wrongly resolves to a leftover padding row.
+    # Snapshot what the fix must preserve, and mark alignment padding rows [VOCAB_TOK, PADDED) with a sentinel so a new token resolving to one is detectable.
     trained_rows = emb.detach()[:VOCAB_TOK].clone()
     with torch.no_grad():
         emb[VOCAB_TOK:PADDED] = 7.0
@@ -85,8 +74,7 @@ def test_padded_embedding_preserves_trained_rows_and_places_new_tokens():
         # Row is real (finite, non-zero), i.e. mean-initialised.
         assert torch.isfinite(row).all() and row.abs().sum() > 0
 
-    # 3. mean-init touched ONLY the genuinely-new rows: the leftover padding
-    #    beyond the new tokens is exactly as shipped.
+    # Mean-init touches ONLY the genuinely-new rows; leftover padding beyond the new tokens stays exactly as shipped.
     assert torch.equal(emb2[new_len:PADDED], sentinel_rows[new_len - VOCAB_TOK:]), \
         "alignment padding rows were overwritten"
 

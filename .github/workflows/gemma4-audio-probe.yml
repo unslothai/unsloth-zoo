@@ -10,9 +10,10 @@
 #
 # What it found: mlx-vlm 0.6.2 (Blaizzy/mlx-vlm#1301) stopped building k_proj /
 # v_proj / k_norm for layers in the KV-shared range, the 60 tensors E2B does
-# not ship. 0.6.1 red, 0.6.2 green; both stay in the matrix to hold that edge.
+# not ship. 0.6.1 red, 0.6.2 green; both are now below pyproject's 0.6.4 floor,
+# so the matrix holds the floor alone. Add candidate versions to re-measure an edge.
 #
-# Opt-in. 0.6.5+ is not probed: it needs transformers>=5.14, above the pinned 5.5.0.
+# Opt-in. Releases from 0.6.5 need transformers>=5.14, above the pinned 5.5.0.
 
 name: Gemma4 audio probe (Apple Silicon)
 
@@ -40,7 +41,7 @@ jobs:
   probe:
     name: "gemma4 audio @ mlx-vlm ${{ matrix.mlx_vlm }}"
     # Match the label just added: `contains(labels.*)` fires on any label event
-    # while the label is attached, replaying all seven macOS jobs.
+    # while the label is attached, replaying every macOS job.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.label.name == 'gemma4-probe'
@@ -51,7 +52,7 @@ jobs:
       # the rest.
       fail-fast: false
       matrix:
-        mlx_vlm: ['0.4.4', '0.5.0', '0.6.0', '0.6.1', '0.6.2', '0.6.3', '0.6.4']
+        mlx_vlm: ['0.6.4']
     env:
       # Point HF_HOME at a directory inside the workspace, and cache that, which is how
       # every model cache in unslothai/unsloth is arranged (studio-api-smoke.yml:114,
@@ -68,7 +69,7 @@ jobs:
       HF_HOME: ${{ github.workspace }}/hf-cache
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25  # v2.22.1
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a  # v2.22.4
         with:
           egress-policy: audit
 
@@ -76,7 +77,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
         with:
           python-version: '3.12'
 
@@ -95,7 +96,7 @@ jobs:
         # alone. torch first: pyproject gates it off on darwin+arm64, zoo still imports it.
         run: |
           python -m pip install --upgrade pip
-          pip install "torch>=2.4.0,<2.15.0"
+          pip install "torch>=2.4.0,<2.16.0"
           pip install -e .[mlx] "mlx-vlm==${{ matrix.mlx_vlm }}" "transformers==5.5.0"
           python -c "
           import mlx_vlm, transformers
@@ -137,7 +138,7 @@ jobs:
         # reason pip-cache-save carries at length: `actions/cache` saves from its
         # own post-step on WHATEVER REF the job ran on. This one triggers on a
         # label, so a labelled PR wrote 3.4 GB to refs/pull/N/merge that only that
-        # PR's re-runs could ever restore, seven legs racing the one key, against
+        # PR's re-runs could ever restore, every leg racing the one key, against
         # a 20 GiB budget the repo has already been at 99% of. The janitor could
         # not clean it up either: the key carries no trailing hash, so generation
         # ranking skips it and only closing the PR would have freed it.

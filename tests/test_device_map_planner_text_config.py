@@ -2,10 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""The planner can plan from a resolved config (eg a VLM's text_config) instead of the repo's own.
-
-Meta-device models only: no GPU, no weights, no network.
-"""
+"""Planner can plan from a resolved config (e.g. a VLM's text_config) instead of the repo's own; meta-device models only, so no GPU, weights or network."""
 import pytest
 import torch
 

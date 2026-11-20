@@ -29,9 +29,9 @@ def logsumexp_fwd_kernel(
     x,
     z,
     scale,
-    D: tl.constexpr,
-    B: tl.constexpr,
-    HAS_SCALE: tl.constexpr,
+    D: tl.constexpr,  # feature dim
+    B: tl.constexpr,  # block along D
+    HAS_SCALE: tl.constexpr,  # scale given
 ):
     i_n, i_d = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     o_d = i_d * B + tl.arange(0, B)

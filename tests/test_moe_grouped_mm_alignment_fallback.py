@@ -6,9 +6,8 @@ from unsloth_zoo.temporary_patches import moe_utils as M
 
 @pytest.fixture(autouse=True)
 def _pretend_the_kernel_is_supported(monkeypatch):
-    """These test kernel ERROR handling, so the kernel has to be reached: the new
-    capability early-return in `_grouped_mm_with_backward_fix` always fires on CPU-only
-    CI, so the monkeypatched kernel below would never be called."""
+    """Error-handling tests must reach the kernel: the capability early-return in _grouped_mm_with_backward_fix always
+    fires on CPU-only CI, so the check is forced true"""
     monkeypatch.setattr(M, "_check_torch_grouped_mm_supported", lambda: True)
 
 

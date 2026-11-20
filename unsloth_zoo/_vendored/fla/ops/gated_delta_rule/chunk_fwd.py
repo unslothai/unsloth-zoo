@@ -43,15 +43,15 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel(
     cu_seqlens,
     chunk_indices,
     T,
-    H: tl.constexpr,
-    HV: tl.constexpr,
-    K: tl.constexpr,
-    BT: tl.constexpr,
-    BC: tl.constexpr,
-    BK: tl.constexpr,
-    USE_G: tl.constexpr,
-    IS_VARLEN: tl.constexpr,
-    LONG_INDEXING: tl.constexpr = False,
+    H: tl.constexpr,  # heads
+    HV: tl.constexpr,  # value heads
+    K: tl.constexpr,  # key hd
+    BT: tl.constexpr,  # chunk size along T
+    BC: tl.constexpr,  # sub-chunk size along T
+    BK: tl.constexpr,  # block along K
+    USE_G: tl.constexpr,  # scalar gate
+    IS_VARLEN: tl.constexpr,  # cu_seqlens given
+    LONG_INDEXING: tl.constexpr = False,  # int64 offsets
 ):
     """
     Fused kernel: compute beta * K @ K^T (lower triangular) + solve_tril (I+A)^{-1} in one pass.

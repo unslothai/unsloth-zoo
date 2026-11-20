@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""internal_scripts_dir_pin holds its lock across the conversion, so it has to be reentrant:
-the MLX save path enters it inside a caller that already pinned around save_pretrained_gguf
-(Unsloth Studio's GGUF export), and a plain threading.Lock blocks there forever.
-"""
+"""Tests that internal_scripts_dir_pin is reentrant, since the MLX save path re-enters it under an outer pin; a plain threading.Lock would block forever."""
 
 from __future__ import annotations
 
@@ -114,8 +111,7 @@ def test_nested_pin_leaves_a_user_pin_alone(tmp_path, monkeypatch):
 
 
 def test_a_second_thread_still_waits_its_turn(tmp_path, monkeypatch):
-    """Reentrant for its holder, still exclusive for everyone else: two conversions must
-    not interleave edits to one process-wide variable."""
+    """Reentrant for the holder but still exclusive to other threads, so two conversions never interleave edits to one process-wide variable."""
     llama_cpp = _load("llama_cpp_reentrant_exclusion_probe", "unsloth_zoo/llama_cpp.py")
 
     installed = tmp_path / "llama.cpp"

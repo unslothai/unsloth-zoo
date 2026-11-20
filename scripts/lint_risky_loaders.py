@@ -74,8 +74,7 @@ DYNAMIC_IMPORTS = {
     "pydoc.locate": "pydoc.locate",
     "pkgutil.resolve_name": "pkgutil.resolve_name",
 }
-# Matched on the last name alone: distinctive enough, and reached through several
-# import paths (`transformers.dynamic_module_utils`, `sentence_transformers.util`).
+# Matched on last name alone, which is distinctive and reached via several import paths (transformers.dynamic_module_utils, sentence_transformers.util).
 DYNAMIC_IMPORT_TAILS = {
     "import_from_string": "import_from_string",
     "get_class_from_dynamic_module": "get_class_from_dynamic_module",
@@ -313,8 +312,7 @@ def _unpinned_fetches(calls: list, git_commands: list) -> list:
             and _keyword(call, "revision") is None
         ):
             found.append((call, "hub-download-loaded-as-code"))
-    # Written-out git commands, passed directly or held in a variable first. A pin is a git
-    # command that moves to a revision, not any string that mentions one.
+    # Written-out git commands, passed directly or via a variable; a pin is a git command that moves to a revision, not any string mentioning one.
     if not any(set(words) & PIN_WORDS for _, words in git_commands):
         found += [
             (node, "git-clone-unpinned") for node, words in git_commands if words[1:2] == ["clone"]

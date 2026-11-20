@@ -14,12 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Opt-in merged-weight GRPO rollouts (UNSLOTH_VLLM_MERGED_ROLLOUT), CPU only.
-
-The HF base weights are row views of a fake fused vLLM qkv tensor, exactly the aliasing
-fast_inference sets up, and the vLLM engine is a stub whose generate records what the
-weights held while it ran. No vLLM engine is built.
-"""
+"""Opt-in merged-weight GRPO rollouts (UNSLOTH_VLLM_MERGED_ROLLOUT), CPU only: HF base weights alias a fake fused vLLM
+qkv tensor and the stub engine records weights during generate; no vLLM engine is built."""
 
 import copy
 import inspect
@@ -379,10 +375,17 @@ def test_eligible_baseline_has_no_reason():
     assert isinstance(load_lora(model, _ADAPTER_DIR, load_tensors = True), _MergedLoRARequest)
 
 
-def test_only_1_turns_it_on(monkeypatch):
-    for value, on in (("1", True), ("0", False), ("", False), ("true", False), ("auto", False)):
-        monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT", value)
-        assert vllm_utils._merged_rollout_enabled() is on
+def test_flag_values(monkeypatch):
+    # "1" forces it, "0" (and any other value) is off, unset / "auto" follows the platform gate.
+    for platform_reason in (None, "this is ROCm"):
+        monkeypatch.setattr(vllm_utils, "_merged_rollout_auto_platform", lambda r = platform_reason: r)
+        automatic = platform_reason is None
+        for value, on in (("1", True), ("0", False), ("", automatic), ("true", False), ("auto", automatic), ("off", False)):
+            monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT", value)
+            assert vllm_utils._merged_rollout_enabled() is on, (value, platform_reason)
+            assert vllm_utils._merged_rollout_automatic() is (value in ("", "auto"))
+        monkeypatch.delenv("UNSLOTH_VLLM_MERGED_ROLLOUT")
+        assert vllm_utils._merged_rollout_enabled() is automatic
 
 
 # 5. An exception inside generate still restores the weights.
@@ -462,7 +465,16 @@ def test_kill_switch_off_returns_a_real_lora_request(monkeypatch, _isolate):
     _assert_bitwise(before, vllm_model)
 
 
-def test_kill_switch_defaults_off(monkeypatch, _isolate):
+def test_kill_switch_zero_is_off(monkeypatch, _isolate):
+    monkeypatch.setattr(vllm_utils, "_merged_rollout_auto_platform", lambda: None)
+    monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT", "0")
+    assert not vllm_utils._merged_rollout_enabled()
+    model, llm, vllm_model = _make_model()
+    assert type(load_lora(model, _ADAPTER_DIR, load_tensors = True)) is _isolate.LoRARequest
+
+
+def test_unset_off_where_the_platform_gate_refuses(monkeypatch, _isolate):
+    monkeypatch.setattr(vllm_utils, "_merged_rollout_auto_platform", lambda: "this is ROCm")
     monkeypatch.delenv("UNSLOTH_VLLM_MERGED_ROLLOUT", raising = False)
     assert not vllm_utils._merged_rollout_enabled()
     model, llm, vllm_model = _make_model()
@@ -917,9 +929,10 @@ def test_sentinel_keeps_the_probe_marker():
     assert getattr(_req(model), "_unsloth_merged", False) is True
 
 
-# 11. Kill switch unset: load_lora and load_vllm behave exactly as origin/main.
-def test_kill_switch_unset_matches_build_lora_request(monkeypatch, _isolate):
-    monkeypatch.delenv("UNSLOTH_VLLM_MERGED_ROLLOUT", raising = False)
+# 11. Kill switch "0": load_lora and load_vllm behave exactly as before the feature.
+def test_kill_switch_zero_matches_build_lora_request(monkeypatch, _isolate):
+    monkeypatch.setattr(vllm_utils, "_merged_rollout_auto_platform", lambda: None)
+    monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT", "0")
     model, llm, vllm_model = _make_model(wrap = False)
     real_generate = llm.generate
     r1 = load_lora(model, _ADAPTER_DIR, load_tensors = True)
@@ -943,7 +956,8 @@ def test_load_vllm_only_wraps_when_enabled():
         )
     ]
     assert any(
-        isinstance(n.test, ast.Call) and getattr(n.test.func, "id", None) == "_merged_rollout_enabled" and
+        isinstance(n.test, ast.BoolOp) and isinstance(n.test.op, ast.And) and
+        [getattr(v.func, "id", None) for v in n.test.values] == ["_merged_rollout_enabled", "_merged_rollout_auto_engine_ok"] and
         getattr(n.body[-1].value.func, "id", None) == "install_merged_rollout_engine_wrapper"
         for n in guards
     )
@@ -958,7 +972,7 @@ def test_load_vllm_only_wraps_when_enabled():
         "(_merged_rollout_mode() == 'attention')"
     )
     assert [ast.unparse(t) for t in mode_guards[0].body] == ["engine_args['lora_target_modules'] = list(_MERGED_ROLLOUT_PUNICA_MODULES)"]
-    assert source.count("_merged_rollout") == 3
+    assert source.count("_merged_rollout") == 4
 
 
 # 12. Round 2: untracked reloads, per-prompt lists, one lock, current modules, engine, dirty cache.
@@ -1123,8 +1137,7 @@ def test_failed_reset_after_restore_blocks_plain_calls_until_it_resets(how):
 
 
 def test_async_engine_is_not_wrapped_and_keeps_vllm_lora(monkeypatch, _isolate):
-    # AsyncLLMEngine.generate is an async generator: a fold around the call would be
-    # restored before inference, so such engines stay on the vLLM LoRA path.
+    # AsyncLLMEngine.generate is an async generator: a fold around the call would be restored before inference, so such engines stay on vLLM LoRA.
     model, llm, vllm_model = _make_model(wrap = False)
 
     async def generate(prompts, sampling_params = None, *, lora_request = None):
@@ -1161,6 +1174,7 @@ def _is_attention(name):
 
 
 def test_mode_parsing(monkeypatch):
+    monkeypatch.setattr(vllm_utils, "_merged_rollout_auto_platform", lambda: "CUDA is not available")
     for value, mode in (("1", "all"), ("attention", "attention"), ("ATTN", "attention"), ("0", None), ("", None), ("yes", None)):
         monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT", value)
         assert vllm_utils._merged_rollout_mode() == mode
@@ -1213,9 +1227,8 @@ def test_attention_mode_with_only_attention_lora_sends_no_request(_attention_mod
 @pytest.mark.parametrize("cause", ["refused", "reset_failed", "mixed_list"])
 @pytest.mark.parametrize("name_check", ["on", "off"])
 def test_attention_engine_never_gets_attention_lora_it_cannot_serve(cause, name_check, monkeypatch, _attention_mode):
-    # vLLM was started without attention LoRA: every path that would hand it attention tensors
-    # (refused model, failed pre-fold cache reset, mixed per-prompt list) must raise, never let
-    # vLLM drop them, even with the name check disabled.
+    # vLLM has no attention LoRA: a refused model, failed pre-fold cache reset or mixed per-prompt list must raise, not
+    # be dropped, even with name check disabled.
     if name_check == "off": monkeypatch.setenv("UNSLOTH_DISABLE_LORA_NAME_CHECK", "1")
     model, llm, vllm_model = _make_model(lora_bias = True) if cause == "refused" else _make_model()
     llm._unsloth_lora_without_attention = True
@@ -1302,8 +1315,7 @@ def test_cuda_exact_failed_unfold_poisons(monkeypatch):
 
 @_cuda
 def test_cuda_exact_failed_target_build_keeps_state_usable(monkeypatch):
-    # e.g. an OOM casting the adapter factors: nothing was folded, so the original error
-    # surfaces, the weights are untouched and the next rollout works.
+    # E.g. an OOM casting the adapter factors: nothing was folded, so the original error surfaces, weights stay untouched and the next rollout works.
     import unsloth_zoo.vllm_utils as vu
     model, llm, vllm_model = _make_model(device = "cuda")
     state = prepare_merged_rollout(model)
@@ -1443,3 +1455,296 @@ def test_exact_mode_needs_one_device(monkeypatch):
     two = [one[0], (None, None, torch.empty(2, dtype = DTYPE, device = "meta"))]
     assert vllm_utils._merged_rollout_use_exact(one) is True
     assert vllm_utils._merged_rollout_use_exact(two) is False
+
+
+# Automatic default (variable unset): only the exact fold, never the pinned copy; no MoE experts; an engine the load-time gate declined stays silent.
+@pytest.fixture
+def _automatic(monkeypatch):
+    monkeypatch.setattr(vllm_utils, "_merged_rollout_auto_platform", lambda: None)
+    monkeypatch.delenv("UNSLOTH_VLLM_MERGED_ROLLOUT", raising = False)
+
+
+def test_automatic_refuses_the_pinned_copy(_automatic, _isolate, monkeypatch, capsys):
+    monkeypatch.setattr(vllm_utils, "_merged_rollout_use_exact", lambda targets: False)
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    request = load_lora(model, _ADAPTER_DIR, load_tensors = True)
+    assert type(request) is _isolate.LoRARequest
+    out = capsys.readouterr().out
+    assert "(automatic) are not used" in out and "does not pin a host copy" in out
+    assert getattr(model._unsloth_merged_rollout_state, "reason", "").startswith("the exact in-place fold is unavailable")
+    _assert_bitwise(before, vllm_model)
+
+
+def test_forced_still_uses_the_pinned_copy(_isolate, monkeypatch):
+    monkeypatch.setattr(vllm_utils, "_merged_rollout_use_exact", lambda targets: False)
+    model, llm, vllm_model = _make_model()
+    assert isinstance(load_lora(model, _ADAPTER_DIR, load_tensors = True), _MergedLoRARequest)
+
+
+def test_automatic_silent_when_the_engine_was_not_wrapped(_automatic, _isolate, capsys):
+    model, llm, vllm_model = _make_model(wrap = False)
+    request = load_lora(model, _ADAPTER_DIR, load_tensors = True)
+    assert type(request) is _isolate.LoRARequest
+    assert "merged" not in capsys.readouterr().out.lower()
+
+
+def test_automatic_refuses_moe_expert_lora(_automatic, _isolate, monkeypatch):
+    model, llm, vllm_model = _make_model()
+    real = vllm_utils._merged_rollout_targets
+    def with_expert(m):
+        targets, reason = real(m)
+        name, module, W = targets[0]
+        monkeypatch.setattr(module, "parameter_name", "gate_up_proj", raising = False)
+        monkeypatch.setattr(module, "get_param", lambda: W, raising = False)
+        return targets, reason
+    monkeypatch.setattr(vllm_utils, "_merged_rollout_targets", with_expert)
+    assert type(load_lora(model, _ADAPTER_DIR, load_tensors = True)) is _isolate.LoRARequest
+    assert "does not fold MoE expert LoRA" in model._unsloth_merged_rollout_state.reason
+
+
+def test_automatic_folds_with_the_exact_fold(_automatic, _isolate, monkeypatch):
+    # CPU stand-in: the exact path is only on CUDA, so the eligibility verdict is checked here
+    # and the real fold / restore is in test_merged_rollout_auto_gpu.py.
+    calls = []
+    monkeypatch.setattr(vllm_utils, "_merged_rollout_use_exact", lambda targets: calls.append(len(targets)) or True)
+    model, llm, vllm_model = _make_model()
+    state = vllm_utils.prepare_merged_rollout(model)
+    assert state is not None and state.entries[0][2] is None and calls
+
+
+@_cuda
+def test_cuda_automatic_default_engages_exact_fold_and_kill_switch_stops_it(monkeypatch, _isolate):
+    # The real platform gate (Linux, NVIDIA CUDA, Triton); only a missing vLLM is stood in for.
+    uname = getattr(vllm_utils.os, "uname", None)  # not on native Windows
+    if torch.version.hip is not None or not sys.platform.startswith("linux") \
+            or (uname is not None and "microsoft" in uname().release.lower()):
+        pytest.skip("the automatic default is off on ROCm, Windows and WSL")
+    if "vllm_version" not in vars(vllm_utils):
+        monkeypatch.setattr(vllm_utils, "vllm_version", "0.19.1", raising = False)
+    vllm_utils._merged_rollout_auto_platform.cache_clear()
+    monkeypatch.delenv("UNSLOTH_VLLM_MERGED_ROLLOUT", raising = False)
+    assert vllm_utils._merged_rollout_auto_platform() is None
+    assert vllm_utils._merged_rollout_mode() == "all"
+    model, llm, vllm_model = _make_model(device = "cuda")
+    before = _snapshot(vllm_model)
+    folds = vllm_utils._MERGED_ROLLOUT_STATS["folds"]
+    for step in range(5):
+        _perturb_adapter(model, step)
+        llm.generate(["hi"], lora_request = load_lora(model, _ADAPTER_DIR, load_tensors = True))
+        assert llm.calls[-1][1] is None and _folded(before, llm.calls[-1][2])
+    assert vllm_utils._MERGED_ROLLOUT_STATS["folds"] == folds + 5
+    assert all(P is None for _, _, P in model._unsloth_merged_rollout_state.entries)
+    _assert_bitwise(before, vllm_model)
+    # Kill switch: "0" on the same engine sends a real LoRARequest and folds nothing.
+    monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT", "0")
+    request = load_lora(model, _ADAPTER_DIR, load_tensors = True)
+    assert type(request) is _isolate.LoRARequest
+    llm.generate(["hi"], lora_request = request)
+    assert vllm_utils._MERGED_ROLLOUT_STATS["folds"] == folds + 5
+    assert not _folded(before, llm.calls[-1][2])
+    _assert_bitwise(before, vllm_model)
+    vllm_utils._merged_rollout_auto_platform.cache_clear()
+
+
+# vllm_rollout_scope: one fold / one LoRA request for every call of a multi-turn rollout.
+def _turns(llm, model, n = 3):
+    for _ in range(n):
+        llm.generate(["turn"], lora_request = load_lora(model, _ADAPTER_DIR, load_tensors = True))
+
+
+def test_rollout_scope_folds_once_and_resets_twice_over_three_turns():
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    folds = vllm_utils._MERGED_ROLLOUT_STATS["folds"]
+    _turns(llm, model)
+    assert vllm_utils._MERGED_ROLLOUT_STATS["folds"] - folds == 3 and len(llm.resets) == 6
+    per_call = [c[2] for c in llm.calls]
+    llm.calls.clear(); llm.resets.clear()
+
+    folds = vllm_utils._MERGED_ROLLOUT_STATS["folds"]
+    with vllm_utils.vllm_rollout_scope(llm):
+        _turns(llm, model)
+        # Held between turns: the training base still carries the fold until the scope closes.
+        assert any(not torch.equal(a, b) for a, b in zip(before, vllm_model.parameters()))
+    assert vllm_utils._MERGED_ROLLOUT_STATS["folds"] - folds == 1
+    assert len(llm.resets) == 2
+    assert all(torch.equal(a, b) for a, b in zip(before, llm.resets[0]))   # before the fold
+    assert all(torch.equal(a, b) for a, b in zip(before, llm.resets[1]))   # after the restore
+    # Every turn sampled the same folded weights as the per-call path, bit for bit.
+    for (_, req, seen), ref in zip(llm.calls, per_call):
+        assert req is None
+        assert all(torch.equal(a, b) for a, b in zip(seen, ref))
+    _assert_bitwise(before, vllm_model)
+    assert model._unsloth_merged_rollout_state.depth == 0
+    assert getattr(llm, "_unsloth_rollout_scope", None) is None
+
+
+def test_rollout_scope_base_call_inside_releases_the_fold():
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    with vllm_utils.vllm_rollout_scope(llm):
+        _turns(llm, model, 1)
+        real = object()
+        llm.generate(["base"], lora_request = real)
+        assert llm.calls[-1][1] is real
+        assert all(torch.equal(a, b) for a, b in zip(before, llm.calls[-1][2]))   # base weights
+        assert len(llm.resets) == 2
+        _turns(llm, model, 1)   # folds again
+        assert any(not torch.equal(a, b) for a, b in zip(before, llm.calls[-1][2]))
+    assert len(llm.resets) == 4
+    _assert_bitwise(before, vllm_model)
+
+
+def test_rollout_scope_keeps_chat_nested_generate_folded():
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    with vllm_utils.vllm_rollout_scope(llm):
+        for _ in range(2):
+            llm.chat(["hi"], None, True, load_lora(model, _ADAPTER_DIR, load_tensors = True))
+        assert len(llm.resets) == 1
+    for _, req, seen in llm.calls:
+        assert req is None
+        assert any(not torch.equal(a, b) for a, b in zip(before, seen))
+    assert len(llm.resets) == 2
+    _assert_bitwise(before, vllm_model)
+
+
+def test_rollout_scope_exception_restores_and_resets():
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    with pytest.raises(ValueError):
+        with vllm_utils.vllm_rollout_scope(llm):
+            _turns(llm, model, 2)
+            raise ValueError("tool crashed")
+    assert len(llm.resets) == 2
+    _assert_bitwise(before, vllm_model)
+    assert getattr(llm, "_unsloth_rollout_scope", None) is None
+    # The next rollout starts clean.
+    _turns(llm, model, 1)
+    _assert_bitwise(before, vllm_model)
+
+
+def test_rollout_scope_is_reentrant():
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    with vllm_utils.vllm_rollout_scope(llm):
+        with vllm_utils.vllm_rollout_scope(llm):
+            _turns(llm, model, 2)
+        assert any(not torch.equal(a, b) for a, b in zip(before, vllm_model.parameters()))
+        _turns(llm, model, 1)
+    assert len(llm.resets) == 2
+    _assert_bitwise(before, vllm_model)
+
+
+def test_rollout_scope_reuses_one_lora_request_on_the_vllm_lora_path(monkeypatch, _isolate):
+    monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT", "0")
+    model, llm, vllm_model = _make_model()
+    outside = [load_lora(model, _ADAPTER_DIR, load_tensors = True) for _ in range(2)]
+    assert outside[0].lora_int_id != outside[1].lora_int_id
+    with vllm_utils.vllm_rollout_scope(llm):
+        inside = [load_lora(model, _ADAPTER_DIR, load_tensors = True) for _ in range(3)]
+    assert all(type(r) is _isolate.LoRARequest for r in inside)
+    assert inside[0] is inside[1] is inside[2]
+    after = load_lora(model, _ADAPTER_DIR, load_tensors = True)
+    assert after.lora_int_id not in {inside[0].lora_int_id} | {r.lora_int_id for r in outside}
+
+
+def test_rollout_scope_reuses_the_rest_request_in_attention_mode(monkeypatch, _isolate):
+    monkeypatch.setenv("UNSLOTH_VLLM_MERGED_ROLLOUT", "attention")
+    model, llm, vllm_model = _make_model()
+    llm._unsloth_lora_without_attention = True
+    with vllm_utils.vllm_rollout_scope(llm):
+        _turns(llm, model, 3)
+    rest = [c[1] for c in llm.calls]
+    assert type(rest[0]) is _isolate.LoRARequest
+    assert rest[0] is rest[1] is rest[2]
+    assert not any(".self_attn." in k for k in rest[0].lora_tensors)
+
+
+# A mixed per-prompt list, another engine's request or a base call after a held fold: release it before the call.
+_SECOND_MODELS = []
+
+
+def _second_engine_req():
+    model2, _, _ = _make_model()
+    _SECOND_MODELS.append(model2)   # the request holds the model weakly
+    return _req(model2)
+
+
+@pytest.mark.parametrize("shape", ["sentinel_none", "none_sentinel", "other_state", "other_engine"])
+def test_rollout_scope_lora_fallback_paths_release_the_fold(shape, _isolate):
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    with vllm_utils.vllm_rollout_scope(llm):
+        _turns(llm, model, 1)
+        assert _folded(before, llm.calls[-1][2])
+        req = _req(model)
+        if shape == "sentinel_none": request = [req, None]
+        elif shape == "none_sentinel": request = (None, req)
+        elif shape == "other_state": request = [req, _second_engine_req()]
+        else: request = _second_engine_req()
+        llm.generate(["a", "b"], lora_request = request)
+        kind, seen_request, seen = llm.calls[-1]
+        # The adapter prompts carry the full vLLM LoRA, so the weights under them must be the base.
+        seen_list = seen_request if isinstance(seen_request, (list, tuple)) else [seen_request]
+        assert any(type(x) is _isolate.LoRARequest and x.lora_tensors for x in seen_list)
+        assert not _folded(before, seen)
+        assert len(llm.resets) == 2   # before the fold, after the release
+        _turns(llm, model, 1)   # folds again
+        assert _folded(before, llm.calls[-1][2])
+    assert len(llm.resets) == 4
+    _assert_bitwise(before, vllm_model)
+
+
+def test_rollout_scope_mixed_chat_releases_and_nested_generate_stays_base(_isolate):
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    with vllm_utils.vllm_rollout_scope(llm):
+        llm.chat(["hi"], None, True, _req(model))
+        n = len(llm.calls)
+        llm.chat(["a", "b"], None, True, [_req(model), None])
+        assert len(llm.calls) == n + 2   # chat + its nested generate
+        for kind, seen_request, seen in llm.calls[n:]:
+            assert type(seen_request[0]) is _isolate.LoRARequest and seen_request[1] is None
+            assert not _folded(before, seen)
+    _assert_bitwise(before, vllm_model)
+
+
+@pytest.mark.parametrize("how", ["false", "raise"])
+@pytest.mark.parametrize("call", ["base", "mixed", "other_engine"])
+def test_rollout_scope_release_refuses_when_the_reset_fails_twice(call, how, _isolate):
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    with vllm_utils.vllm_rollout_scope(llm):
+        _turns(llm, model, 1)
+        n_calls = len(llm.calls)
+        other = _second_engine_req()
+        _failing_reset(llm, how, when = {1, 2})   # the release's reset and the retry
+        with pytest.raises(RuntimeError, match = "prefix cache"):
+            if call == "base": llm.generate(["base"])
+            elif call == "mixed": llm.generate(["a", "b"], lora_request = [_req(model), None])
+            else: llm.generate(["a"], lora_request = other)
+        # Refused: nothing ran on a cache holding the fold's KV under base hashes.
+        assert len(llm.calls) == n_calls
+        _assert_bitwise(before, vllm_model)
+        assert llm._unsloth_merged_rollout_dirty
+        # The next call resets first, then runs on the base weights.
+        llm.generate(["base"])
+        assert not _folded(before, llm.calls[-1][2])
+        assert not llm._unsloth_merged_rollout_dirty
+    _assert_bitwise(before, vllm_model)
+
+
+@pytest.mark.parametrize("how", ["false", "raise"])
+def test_rollout_scope_release_retries_a_failed_reset_before_the_base_call(how):
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    with vllm_utils.vllm_rollout_scope(llm):
+        _turns(llm, model, 1)
+        n = _failing_reset(llm, how, when = {1})   # only the release's reset fails
+        llm.generate(["base"])
+        assert n["n"] == 2   # retried before the call
+        assert not _folded(before, llm.calls[-1][2])
+        assert not llm._unsloth_merged_rollout_dirty
+    _assert_bitwise(before, vllm_model)

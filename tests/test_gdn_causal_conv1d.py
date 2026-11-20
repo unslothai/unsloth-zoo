@@ -26,8 +26,8 @@ os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
 from unsloth_zoo.temporary_patches import gdn_causal_conv1d as gcc  # noqa: E402
 
-_HAS_CUDA = torch.cuda.is_available() and getattr(torch.version, "hip", None) is None
-requires_cuda = pytest.mark.skipif(not _HAS_CUDA, reason = "needs a CUDA GPU")
+_HAS_CUDA = torch.cuda.is_available()
+requires_cuda = pytest.mark.skipif(not _HAS_CUDA, reason = "needs a CUDA or ROCm GPU")
 
 
 def _inputs(B, D, T, W, dtype, bias, channel_last, seed = 0):
@@ -233,8 +233,7 @@ def _unpatched_decorator(decorator):
 
 @pytest.fixture(autouse = True)
 def _restore_modeling_modules(monkeypatch):
-    """The patch rebinds every imported target modeling module, not just the one a test asked for;
-    restore them all so the next test (or file) starts from the same state."""
+    """The patch rebinds every imported target modeling module, not just the one a test asks for; restoring all keeps later tests starting from the same state."""
     import sys
     for module_name, module in list(sys.modules.items()):
         if module is None or not module_name.startswith("transformers.models.") or ".modeling_" not in module_name:
@@ -250,16 +249,17 @@ def _real_gdn_modeling(monkeypatch, name = "transformers.models.qwen3_5.modeling
     if getattr(modeling, "causal_conv1d_fn", None) is None or not hasattr(modeling, "use_kernel_func_from_hub_with_fallback"):
         pytest.skip(f"transformers < 5.15 {name}")
     decorator = _unpatched_decorator(modeling.use_kernel_func_from_hub_with_fallback)
-    # Both names: the patch rebinds the decode update too, and a test that leaves it patched
-    # changes what the next test starts from.
+    # Both attributes are rebound: the patch also rebinds the decode update, and a test that leaves it patched changes what the next test starts from.
     for attr in ("causal_conv1d_fn", "causal_conv1d_update"):
         fn = getattr(modeling, attr, None)
         if fn is None:
             continue
         if gcc._is_marked(fn):
-            # Patched at import on a CUDA host: rebuild the unpatched hub function.
-            dispatch = inspect.unwrap(fn, stop = lambda f: getattr(f, gcc._MARK, False))
-            fn = decorator(attr, "causal_conv1d")(dispatch.__wrapped__)
+            # Rebuild from the first unpatched layer: functools.wraps copies the mark, so a patched one stays marked.
+            base = fn
+            while gcc._is_marked(base) and getattr(base, "__wrapped__", None) is not None:
+                base = base.__wrapped__
+            fn = decorator(attr, "causal_conv1d")(base)
         monkeypatch.setattr(modeling, attr, fn)
     monkeypatch.setattr(modeling, "use_kernel_func_from_hub_with_fallback", decorator)
     return modeling
@@ -287,11 +287,12 @@ def test_hub_decorator_wraps_only_gdn_fallbacks(hub_kernels):
     assert legacy.causal_conv1d_fn is gcc._legacy_causal_conv1d_fn
 
 
-def test_patch_rebinds_the_real_modeling_module(hub_kernels, monkeypatch):
+@pytest.mark.parametrize("hip", [None, "7.0"])
+def test_patch_rebinds_the_real_modeling_module(hub_kernels, monkeypatch, hip):
     pytest.importorskip("triton")
     modeling = _real_gdn_modeling(monkeypatch)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch.version, "hip", hip)
     assert not gcc._is_marked(modeling.causal_conv1d_fn)
 
     monkeypatch.setenv(gcc._KILL_SWITCH, "1")
@@ -567,8 +568,7 @@ def test_mamba_drop_ins_take_the_torch_path_when_autograd_tracks(monkeypatch):
 
 
 def _oracle_seq(x, w, b, seq_idx, act = "silu"):
-    """fp64 per-position oracle with causal_conv1d's packing rules: taps stay in their segment and
-    a padding position (seq_idx < 0) outputs 0."""
+    """fp64 per-position oracle with causal_conv1d's packing rules: taps stay in their segment and seq_idx < 0 padding outputs 0."""
     x, w = x.double(), w.double()
     b = b.double() if b is not None else None
     B, D, T = x.shape
@@ -593,8 +593,7 @@ def _oracle_seq(x, w, b, seq_idx, act = "silu"):
 @requires_cuda
 @pytest.mark.parametrize("wdtype", [torch.float32, torch.bfloat16])
 def test_mamba_drop_ins_keep_the_parameter_dtype(wdtype):
-    # Autocast hands causal_conv1d a bf16 x with the fp32 parameter: no downcast, fp32 accumulate,
-    # output in x's dtype, dW / db in the parameter's dtype (causal_conv1d's DISPATCH_WTYPE).
+    # Autocast gives causal_conv1d bf16 x with fp32 parameter: no downcast, fp32 accumulate, output in x dtype, dW/db in parameter dtype (DISPATCH_WTYPE).
     B, T, D, W = 2, 70, 96, 4
     g = torch.Generator(device = "cuda").manual_seed(0)
     x = torch.randn(B, T, D, device = "cuda", generator = g).to(torch.bfloat16).transpose(1, 2)
@@ -619,8 +618,8 @@ def test_mamba_drop_ins_keep_the_parameter_dtype(wdtype):
 @requires_cuda
 @pytest.mark.parametrize("act", ["silu", None])
 def test_negative_seq_idx_is_padding(act):
-    # causal_conv1d zeroes the output at seq_idx < 0 and never lets a padding tap reach a real
-    # position; the exact gradient of a constant 0 is 0, so padding adds nothing to dx / dW / db.
+    # causal_conv1d zeroes output at seq_idx < 0 and no padding tap reaches a real position; the gradient of that
+    # constant 0 is exact 0, so padding adds nothing to dx, dW, db.
     B, T, D, W = 2, 40, 64, 4
     g = torch.Generator(device = "cuda").manual_seed(1)
     x = torch.randn(B, T, D, device = "cuda", generator = g).to(torch.bfloat16).transpose(1, 2)
@@ -667,3 +666,189 @@ def test_mamba_drop_ins_launch_with_the_fp32_parameter(monkeypatch):
     gcc.mamba_causal_conv1d_fwd_function(x, w, b, None, None, None, True)
     gcc.mamba_causal_conv1d_bwd_function(x, w, b, torch.randn_like(x), None, None, None, None, False, True)
     assert seen == [(torch.float32, torch.float32)] * 2
+
+
+@requires_cuda
+def test_cuda_graph_capture_after_one_warmup(monkeypatch):
+    # The launcher's self-check syncs to the host and would invalidate CUDA graph capture; one eager warm-up builds plans so capture takes the full launch.
+    if not gcc._triton_launcher_verified():
+        pytest.skip("cached launcher needs Triton 3.6+")
+    monkeypatch.setattr(gcc, "_conv_plans", {})
+    monkeypatch.setattr(gcc, "_conv_fast_ok", {})
+    x0, w0, b0, dy = _inputs(1, 64, 64, 4, torch.float32, True, False)
+    x, w, b = (t.detach().clone().requires_grad_(True) for t in (x0, w0, b0))
+
+    def step():
+        y = gcc.triton_causal_conv1d(x, w, b, "silu")
+        y.backward(dy)
+        return y
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        eager = step().detach().clone()
+        eager_grads = [t.grad.clone() for t in (x, w, b)]
+        for t in (x, w, b):
+            t.grad = None
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    assert len(gcc._conv_plans) == 3 and gcc._conv_fast_ok == {}
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        y = step()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(y, eager)
+    for t, ref in zip((x, w, b), eager_grads):
+        assert torch.equal(t.grad, ref)
+    # No verdict was recorded while capturing: the next eager call still runs the self-check.
+    assert gcc._conv_fast_ok == {}
+    for t in (x, w, b):
+        t.grad = None
+    assert torch.equal(step(), eager)
+    assert gcc._conv_fast_ok == {"fwd": True, "bwd_g": True, "bwd_dxdw": True}
+
+
+@requires_cuda
+def test_wrong_cached_launch_still_caught_after_a_capture(monkeypatch):
+    # Skipping the self-check during capture must not skip it for good: a wrong cached launch is still caught on the first eager cached launch.
+    if not gcc._triton_launcher_verified():
+        pytest.skip("cached launcher needs Triton 3.6+")
+    monkeypatch.setattr(gcc, "_conv_plans", {})
+    monkeypatch.setattr(gcc, "_conv_fast_ok", {})
+    x, w, b, _ = _inputs(1, 64, 64, 4, torch.float32, True, False)
+    ref = gcc._launch_fwd(x.transpose(1, 2), w, b, "silu")  # builds the plan
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = gcc._launch_fwd(x.transpose(1, 2), w, b, "silu")
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(captured, ref) and gcc._conv_fast_ok == {}
+    monkeypatch.setattr(gcc, "_conv_fast_launch", lambda plan, ptrs, ints, consts: ptrs[3].add_(1))
+    assert torch.equal(gcc._launch_fwd(x.transpose(1, 2), w, b, "silu"), ref)
+    assert gcc._conv_fast_ok == {"fwd": False}
+
+
+@requires_cuda
+@pytest.mark.parametrize("xdtype", [torch.float16, torch.bfloat16])
+def test_mamba_mixed_dtype_preactivation_stays_in_the_parameter_dtype(xdtype):
+    # fp16 x with fp32 parameter: SiLU must see the fp32 pre-activation, as narrowing -360000 to fp16 first gives -inf and SiLU then NaN; bf16 must agree too.
+    B, T, D, W = 1, 8, 64, 4
+    x = torch.full((B, T, D), -30000.0, device = "cuda", dtype = xdtype).transpose(1, 2)
+    w = torch.full((D, W), 3.0, device = "cuda")
+    g = torch.Generator(device = "cuda").manual_seed(0)
+    dout = torch.randn(B, T, D, device = "cuda", generator = g).to(xdtype).transpose(1, 2)
+    before = dict(gcc.GDN_CAUSAL_CONV1D_STATS)
+    y = gcc.mamba_causal_conv1d_fwd_function(x, w, None, None, None, None, True)
+    dx, dw, db, _ = gcc.mamba_causal_conv1d_bwd_function(x, w, None, dout, None, None, None, None, False, True)
+    assert gcc.GDN_CAUSAL_CONV1D_STATS["mamba_fused_fwd"] == before["mamba_fused_fwd"] + 1
+    assert gcc.GDN_CAUSAL_CONV1D_STATS["mamba_fused_bwd"] == before["mamba_fused_bwd"] + 1
+    assert db is None
+    xr, wr = (t.detach().clone().requires_grad_(True) for t in (x, w))
+    ref = gcc.causal_conv1d_reference(xr, wr, None, "silu")
+    ref.backward(dout)
+    for ours, theirs in ((y, ref.detach()), (dx, xr.grad), (dw, wr.grad)):
+        assert torch.isfinite(theirs).all()
+        assert torch.isfinite(ours).all()
+        assert torch.equal(ours, theirs)
+
+
+_REVERSE_MIXED_SCRIPT = r"""
+import json, sys, torch
+from unsloth_zoo.temporary_patches import gdn_causal_conv1d as gcc
+gcc._conv_launch = lambda name, kernel, grid, ptrs, ints, consts, num_warps, outs: kernel[grid](
+    *(ptrs + ints + consts), num_warps = num_warps,
+)
+out = {"file": gcc.__file__}
+for xdtype in (torch.float32, torch.bfloat16):
+    x = torch.full((1, 8, 64), -30000.0, dtype = xdtype)
+    w = torch.full((64, 4), 3.0, dtype = torch.float16)
+    y = gcc._launch_fwd(x, w, None, "silu")
+    dx, dw, _ = gcc._launch_bwd(x, w, None, torch.ones_like(x), "silu", True, True, False)
+    out[str(xdtype)] = [int(t.isnan().sum() + t.isinf().sum()) for t in (y, dx, dw)]
+print("RESULT " + json.dumps(out))
+"""
+
+
+def test_reverse_mixed_dtype_preactivation_does_not_overflow():
+    # fp16 weights with wider x: rounding the fp32 accumulator to fp16 before SiLU gives -inf, then NaN.
+    pytest.importorskip("triton")
+    import json
+    import subprocess
+    import sys
+    env = dict(os.environ, TRITON_INTERPRET = "1", CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1")
+    proc = subprocess.run([sys.executable, "-c", _REVERSE_MIXED_SCRIPT], env = env, capture_output = True, text = True)
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    line = next(l for l in proc.stdout.splitlines() if l.startswith("RESULT "))
+    result = json.loads(line[len("RESULT "):])
+    assert result.pop("file") == gcc.__file__
+    assert result == {"torch.float32": [0, 0, 0], "torch.bfloat16": [0, 0, 0]}
+    # The torch references the drop-ins fall back to follow the same rule.
+    for xdtype in (torch.float32, torch.bfloat16):
+        x = torch.full((1, 64, 8), -30000.0, dtype = xdtype)
+        w = torch.full((64, 4), 3.0, dtype = torch.float16)
+        seq_idx = torch.zeros(1, 8, dtype = torch.int64)
+        assert torch.isfinite(gcc.causal_conv1d_reference(x, w, None, "silu")).all()
+        ref = gcc._causal_conv1d_reference_seq_idx(x, w, None, "silu", seq_idx, pad_negative = True)
+        assert torch.isfinite(ref).all()
+
+
+def _kernels_func_layer(func):
+    # kernels' use_kernel_forward_from_hub on a function: a Func() module whose class forward
+    # closes over the decorated function and that keeps no __wrapped__ (kernels 0.16 / 0.17).
+    class Func(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            return func(*args, **kwargs)
+
+    return Func()
+
+
+def test_patch_rebinds_a_hub_layer_imported_before_the_patch(hub_kernels, monkeypatch):
+    # Modeling module imported with kernels installed before the patch: its conv is already a hub
+    # layer. Packed calls must still reach the Triton dispatch, not the "install causal_conv1d" error.
+    pytest.importorskip("triton")
+    modeling = _real_gdn_modeling(monkeypatch)
+    monkeypatch.setattr(hub_kernels, "use_kernel_forward_from_hub", lambda name: _kernels_func_layer)
+    decorator = hub_kernels.use_kernel_func_from_hub_with_fallback
+    for attr in ("causal_conv1d_fn", "causal_conv1d_update"):
+        fn = getattr(modeling, attr)
+        # Without kernels the module holds transformers' wrapper; decorate its torch function again as import would.
+        if isinstance(fn, torch.nn.Module):
+            # Skip because with kernels installed the module already holds the real layer (no __wrapped__ to rebuild from).
+            pytest.skip("kernels installed: test_patch_rebinds_the_real_modeling_module covers the real layer")
+        layer = decorator(attr, "causal_conv1d")(fn.__wrapped__)
+        assert isinstance(layer, torch.nn.Module) and not hasattr(layer, "__wrapped__")
+        monkeypatch.setattr(modeling, attr, layer)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.version, "hip", None)
+    gcc.patch_gdn_causal_conv1d()
+    assert gcc._is_marked(modeling.causal_conv1d_fn)
+    assert gcc._is_marked(modeling.causal_conv1d_update)
+    x, w = torch.randn(1, 8, 10), torch.randn(8, 4)
+    seq_idx = torch.tensor([[0, 0, 0, 1, 1, 1, 1, 2, 2, 2]], dtype = torch.int32)
+    y = modeling.causal_conv1d_fn(x, w, None, activation = "silu", seq_idx = seq_idx)
+    expected = torch.cat([
+        gcc.causal_conv1d_reference(x[..., a:b], w, None, "silu") for a, b in ((0, 3), (3, 7), (7, 10))
+    ], dim = -1)
+    torch.testing.assert_close(y, expected)
+
+
+def test_qwen4_exp_gdn_conv_honours_seq_idx(hub_kernels, monkeypatch):
+    # The torch fallback drops seq_idx, so the hybrid packing gate refuses padding-free rows.
+    pytest.importorskip("triton")
+    if torch.version.hip is not None:
+        pytest.skip("the Triton seq_idx conv is CUDA only; ROCm keeps transformers' conv")
+    modeling = _real_gdn_modeling(monkeypatch, "transformers.models.qwen4_exp.modeling_qwen4_exp")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.version, "hip", None)
+    gcc.patch_gdn_causal_conv1d()
+    assert gcc._is_marked(modeling.causal_conv1d_fn)
+    assert gcc._is_marked(modeling.causal_conv1d_update)
+    g = torch.Generator().manual_seed(0)
+    x, w, b = torch.randn(1, 8, 12, generator = g), torch.randn(8, 4, generator = g), torch.randn(8, generator = g)
+    cuts = ((0, 1), (1, 6), (6, 12))   # a 1-token document, one wider than the kernel, the rest
+    seq_idx = torch.cat([torch.full((e - s,), i, dtype = torch.int32) for i, (s, e) in enumerate(cuts)])[None]
+    y = modeling.causal_conv1d_fn(x, w, b, activation = "silu", seq_idx = seq_idx)
+    expected = torch.cat([gcc.causal_conv1d_reference(x[..., s:e], w, b, "silu") for s, e in cuts], dim = -1)
+    torch.testing.assert_close(y, expected)

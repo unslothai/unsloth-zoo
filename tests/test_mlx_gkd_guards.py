@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""GKD guards under the torch shim. Preflight figures: Qwen2.5-0.5B student +
-Qwen2.5-3B teacher (vocab 151936, 2.881 GB resident) on a 16 GB Mac."""
+"""GKD guards under the torch shim; preflight figures: Qwen2.5-0.5B student + Qwen2.5-3B teacher (vocab 151936, 2.881 GB resident) on a 16 GB Mac."""
 
 import pytest
 

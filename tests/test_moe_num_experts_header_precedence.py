@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Expert-count resolution precedence for per-expert MoE merges.
-
-A w1/w3/w2 checkpoint can split one layer's experts across shards; a low-index shard
-(experts 0..15 of 64) reports 16, which drives the per-expert LoRA slicing stride. These
-tests pin that the authoritative module/fused-LoRA count always wins and the shard header
-may only RAISE a missing/too-low count, never lower it.
-"""
+"""Expert-count precedence for per-expert MoE merges: module or fused-LoRA count always wins; a shard header may only
+raise a missing or too-low count, never lower it (a shard may hold only some experts)."""
 
 from __future__ import annotations
 
@@ -65,8 +60,7 @@ def test_partial_low_index_shard_does_not_lower_module_count():
 
 
 def test_header_seeds_count_when_module_absent_single_shard():
-    # No module, no fused LoRA to derive from: a down_proj-only adapter would
-    # otherwise leave experts 1..N-1 unmerged. The full shard header supplies 64.
+    # No module or fused LoRA to derive from: a down_proj-only adapter would leave experts 1..N-1 unmerged, so the full shard header must supply 64.
     stats = _Stats(module=None)
     moe_num_experts = {}
     header = _header(PREFIX, range(64))
@@ -79,8 +73,7 @@ def test_header_seeds_count_when_module_absent_single_shard():
 
 
 def test_header_raises_a_degenerate_derived_count():
-    # Per-expert LoRA derives a degenerate 1 (total_rank == rank); the header,
-    # which sees all 64 experts in this shard, must raise it.
+    # Per-expert LoRA derives a degenerate count of 1 (total_rank == rank); the shard header sees all 64 experts and must raise it.
     import torch
 
     stats = _Stats(

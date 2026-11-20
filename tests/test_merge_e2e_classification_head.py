@@ -14,17 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""End-to-end merge correctness for a trained head the base checkpoint does not have.
-
-`merged_16bit` takes its weights from the base checkpoint and rewrites the shards in
-place, so a `modules_to_save` head trained on a causal-LM base (sequence classification,
-token classification) had no key to be written into and was dropped. The Step-7 count
-excluded it from both sides, so nothing raised: the export simply reloaded with a fresh
-random head and the wrong label count.
-
-The load-bearing assertion is that the reloaded head is bit-identical to the trained one.
-A shape match alone passes against a randomly initialized head of the right size.
-"""
+"""Tests end-to-end merge of a trained head the base lacks: merged_16bit rewrites base shards in place, so a
+modules_to_save head with no base key was dropped silently; assert it reloads bit-identical, since a shape match
+passes for a random init."""
 
 from __future__ import annotations
 
@@ -122,8 +114,7 @@ def test_label_maps_and_architecture_follow_the_head(tmp_path):
 
 
 def test_the_head_bias_travels_with_its_weight():
-    """Unit level on purpose: Llama builds `score` with bias=False, so an end-to-end case
-    cannot show this. Heads that do carry a bias must not have it left behind."""
+    """Unit level on purpose: Llama builds score with bias=False, so an end-to-end case cannot show this; heads that carry a bias must not leave it behind."""
     import collections
     from unsloth_zoo.saving_utils import LoraStats, _unbacked_trained_tensors
 
@@ -205,8 +196,7 @@ def test_a_plain_causal_lm_export_is_untouched(tmp_path):
 
 
 def test_only_modules_to_save_is_seeded_not_an_unbacked_lora():
-    """A LoRA target missing from the base has no trained tensor of its own to lose, so it
-    must stay excluded; only `modules_to_save` carries weights that exist nowhere else."""
+    """A LoRA target missing from the base has no trained tensor of its own to lose, so it stays excluded; only modules_to_save weights exist nowhere else."""
     import collections
     from unsloth_zoo.saving_utils import LoraStats, _unbacked_trained_tensors
 
@@ -237,9 +227,8 @@ def test_a_backed_head_is_not_seeded_twice():
 
 @pytest.mark.parametrize("name", ["lm_head", "embed_tokens", "model.language_model.lm_head"])
 def test_backbone_tensors_are_never_seeded(name):
-    """gemma3 ties its text embeddings, so that architecture has no `lm_head` slot at all.
-    Seeding one put an unexpected key in the export and broke the text_only resize case on
-    transformers 4.51.3, which is why this exclusion exists rather than a general rule."""
+    """gemma3 ties text embeddings, so it has no lm_head slot; seeding one added an unexpected key and broke the
+    text_only resize on transformers 4.51.3, hence this exclusion."""
     import collections
     from unsloth_zoo.saving_utils import LoraStats, _unbacked_trained_tensors
 
@@ -257,8 +246,7 @@ def test_backbone_tensors_are_never_seeded(name):
 
 
 def test_a_sharded_export_records_the_head_in_its_index(tmp_path):
-    """transformers resolves a sharded checkpoint through the index alone, so a key absent
-    from the weight_map is invisible even though the bytes are on disk."""
+    """transformers resolves a sharded checkpoint through the index alone, so a key missing from weight_map is invisible even when its bytes are on disk."""
     from unsloth_zoo.saving_utils import _add_keys_to_index
 
     index = tmp_path / "model.safetensors.index.json"
@@ -283,9 +271,7 @@ def test_an_unsharded_export_has_no_index_to_touch(tmp_path):
 
 
 def test_seeding_refuses_rather_than_dropping_the_head_when_disk_is_short(tmp_path, monkeypatch):
-    """Adding a key rewrites the shard through a temp copy, and appending moves every offset
-    so there is no in-place fallback. Refusing beats silently dropping the head, which is the
-    bug this whole path exists to fix."""
+    """Adding a key rewrites the shard via a temp copy and appending moves every offset, so there is no in-place fallback; refusing beats silently dropping the head."""
     import collections
     import shutil as _shutil
     from safetensors.torch import save_file
@@ -315,9 +301,7 @@ def test_seeding_refuses_rather_than_dropping_the_head_when_disk_is_short(tmp_pa
 
 
 def test_the_corrected_config_is_re_uploaded_when_pushing():
-    """Step 2 uploads config.json before the head exists and Step 7's folder re-upload is
-    skipped in low-disk mode, so without this the remote keeps the causal-LM config beside
-    shards that hold the head."""
+    """config.json is uploaded before the head exists and the Step 7 re-upload is skipped in low-disk mode; without this the remote keeps the causal-LM config."""
     import inspect
     from unsloth_zoo.saving_utils import merge_and_overwrite_lora
 
@@ -331,11 +315,7 @@ def test_the_corrected_config_is_re_uploaded_when_pushing():
 
 
 def test_the_mxfp4_rewrite_counts_a_seeded_head(tmp_path):
-    """An mxfp4 base with save_method='merged_16bit' routes to _merge_and_overwrite_lora_mxfp4,
-    whose every `count += 1` was gated on lora_A. A seeded head has no lora_A, so it counted
-    zero there while the Step-7 `_count_backed_lora_modules` counted it as backed, and the
-    export aborted on the count mismatch. The dense path has always had this branch.
-    """
+    """A seeded head with no lora_A must still be counted by the mxfp4 merge, or the export aborts."""
     import collections
     from safetensors.torch import save_file
     from unsloth_zoo.saving_utils import LoraStats, _merge_and_overwrite_lora_mxfp4

@@ -14,17 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The merged_16bit config must describe the weights the merge actually writes (#969).
-
-`merge_and_overwrite_lora` takes its weights from the resolved base checkpoint but used to
-save `model.config`, which `text_only = True` has already replaced with the nested text
-config, so a `gemma3_text` config landed next to full VLM weights. Nothing raised: every
-tensor was silently re-initialized on reload, so a finetune could be served untrained.
-
-The fixture is the real shape -- a text-only decoder whose `_name_or_path` points at a VLM
-checkpoint. Passing is not "no exception" (the bug threw none) but the saved architecture
-matching the written tensors and a reload reporting no missing/unexpected/mismatched keys.
-"""
+"""merged_16bit config must describe the weights written (issue 969), not the text_only config."""
 
 from __future__ import annotations
 
@@ -68,8 +58,7 @@ def _write_vlm_base(tmp_path):
 
 
 def _text_only_model(cfg, base_dir):
-    """What `text_only = True` leaves in memory: the nested text decoder, pointed at
-    the VLM checkpoint. Mirrors `_get_text_only_config` in unsloth/models/_utils.py."""
+    """Nested text decoder pointed at the VLM checkpoint, as _get_text_only_config builds it."""
     import transformers as T
     text_config = cfg.get_text_config()
     torch.manual_seed(H.SEED)
@@ -126,11 +115,7 @@ def test_text_only_export_config_matches_written_weights(tmp_path):
 
 
 def test_text_only_export_preserves_resized_vocab(tmp_path):
-    """Reading the base config must not drop vocab growth from training.
-
-    Without the carry-over the export declares the base vocab beside larger embedding
-    tensors, and the reload fails on a size mismatch instead of silently succeeding.
-    """
+    """Without carry-over, export declares base vocab beside larger embeddings, so reload fails on size."""
     H.set_offline_cpu_env()
     base_dir, cfg = _write_vlm_base(tmp_path)
     out_dir = os.path.join(str(tmp_path), "merged")
@@ -158,11 +143,7 @@ def test_text_only_export_preserves_resized_vocab(tmp_path):
 
 
 def test_base_config_read_failure_falls_back_with_a_warning(tmp_path, monkeypatch):
-    """The fallback keeps a previously-working export working, and says so.
-
-    It deliberately restores the #969 output, so it is an availability fallback and not
-    a correct one: the warning is the only signal the user gets.
-    """
+    """Base config read failure falls back to the issue 969 output, not a correct one; only a warning."""
     import transformers
     import unsloth_zoo.saving_utils as SU
 
@@ -215,8 +196,7 @@ def test_config_vocab_size_precedence(top, nested, expected):
 
 
 def test_carry_over_updates_both_levels_for_stale_top_level():
-    """PaliGemma is the shape that makes precedence load-bearing: resize updates the
-    nested vocab and leaves the top-level compat value behind."""
+    """PaliGemma: resize updates nested vocab and leaves a stale top-level value, so both must update."""
     from unsloth_zoo.saving_utils import _carry_over_vocab_size
     base = _shape(top=64, nested=64)
     _carry_over_vocab_size(base, _shape(top=64, nested=72))
@@ -235,8 +215,7 @@ def test_carry_over_nested_only_and_top_only():
 
 
 def test_carry_over_leaves_a_distinct_top_level_vocabulary_alone():
-    """A top level that already differs from the text vocab is a DIFFERENT vocabulary, not a
-    stale copy, so it must not be overwritten."""
+    """A top-level vocab differing from the text vocab is a distinct vocabulary; never overwrite it."""
     from unsloth_zoo.saving_utils import _carry_over_vocab_size
     base = _shape(top=64, nested=72)
     _carry_over_vocab_size(base, _shape(nested=80))
@@ -245,8 +224,7 @@ def test_carry_over_leaves_a_distinct_top_level_vocabulary_alone():
 
 
 def test_carry_over_preserves_ovis2_top_level_vocabulary():
-    """Ovis2 sizes its lm_head from the top-level vocab_size and ships it deliberately
-    different from text_config.vocab_size, so writing one value to both breaks the reload."""
+    """Ovis2 deliberately differs top-level and text vocab_size; one shared value breaks reload."""
     import transformers as T
     from unsloth_zoo.saving_utils import _carry_over_vocab_size
 
@@ -308,8 +286,7 @@ def test_carry_over_does_not_invent_fields():
 
 @pytest.mark.parametrize("family", ["qwen2_5_omni", "qwen3_omni_moe", "colqwen2", "t5gemma"])
 def test_carry_over_reaches_text_configs_not_named_text_config(family):
-    """Some composite configs nest the text section under another name, so `.text_config`
-    misses it entirely. `get_text_config()` is the documented accessor."""
+    """Some configs nest text under another name, so .text_config misses it; use get_text_config()."""
     import transformers as T
     from unsloth_zoo.saving_utils import _carry_over_vocab_size, _config_vocab_size
 

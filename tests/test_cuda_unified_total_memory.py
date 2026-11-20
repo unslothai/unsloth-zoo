@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""``props.total_memory`` on a unified-memory NVIDIA host can be the dedicated carve-out while
-the runtime's own total spans the shared pool, so ``cuda_total_memory`` applies the rule the ROCm
-path already follows: compare, and adopt only a LARGER driver total. The tests below pin every
-branch of it, above all the ones that must NOT change anything, since a discrete card is the
-common case and its two figures always agree.
-"""
+"""Tests cuda_total_memory on unified-memory NVIDIA hosts: props.total_memory may be the dedicated carve-out, so only a
+LARGER driver total is adopted; discrete cards must not change."""
 
 from __future__ import annotations
 
@@ -19,8 +15,7 @@ GIB = 1024 ** 3
 
 
 class _Props:
-    """Only the fields the probe reads. ``is_integrated`` is omitted when None, so a wheel that
-    does not publish the field is covered too."""
+    """Stub with only the fields the probe reads; is_integrated is omitted when None, so a wheel that does not publish the field is still covered."""
 
     def __init__(self, total_memory, is_integrated = None):
         self.name = "stub"
@@ -30,8 +25,7 @@ class _Props:
 
 
 def _install(monkeypatch, props, driver_total = None, hip = None):
-    """``driver_total`` of None makes ``mem_get_info`` an assertion failure, which is how the
-    tests prove a path never pays for the primary context that call pins."""
+    """driver_total None makes mem_get_info an assertion failure, which proves a path never pays for the primary context that call pins."""
     torch = pytest.importorskip("torch")
     calls = []
 
@@ -70,8 +64,8 @@ class TestIntegratedDetection:
         assert integrated_device.cuda_props_are_integrated(props) is True
 
     def test_hip_is_excluded_by_name(self, monkeypatch):
-        # clr left the field unassigned before ROCm 6.2, and the ROCm total has its own
-        # handling; this probe must never reach an AMD part, flag set or not.
+        # clr left the integrated field unassigned before ROCm 6.2, and the ROCm total has its own handling, so this
+        # probe must never reach an AMD part, flag set or not.
         monkeypatch.setattr(pytest.importorskip("torch").version, "hip", "6.4.0", raising = False)
         assert integrated_device.cuda_props_are_integrated(_Props(8 * GIB, 1)) is False
 
@@ -103,8 +97,7 @@ class TestTotalMemoryRule:
         assert integrated_device.cuda_total_memory(0) == 45 * GIB
 
     def test_mem_get_info_returning_junk_degrades_to_properties(self, monkeypatch):
-        # mem_get_info semantics have shifted across torch versions; a non-number answer
-        # must be dropped, not propagated as a TypeError out of a capacity probe.
+        # mem_get_info semantics have shifted across torch versions; a non-number answer must be dropped, not raised as a TypeError from the capacity probe.
         torch = pytest.importorskip("torch")
         monkeypatch.setattr(torch.version, "hip", None, raising = False)
         monkeypatch.setattr(torch.cuda, "get_device_properties", lambda *a, **k: _Props(45 * GIB, 1))
@@ -138,8 +131,7 @@ class TestDiscreteIsUntouched:
         assert integrated_device.cuda_total_memory(0) == 80 * GIB
 
     def test_discrete_never_calls_mem_get_info(self, monkeypatch):
-        # driver_total None makes the call an AssertionError: a discrete card must not
-        # pay for the primary context mem_get_info pins for the life of the process.
+        # A discrete card must not call mem_get_info, which pins the primary context for the life of the process; driver_total None makes that call fail.
         calls = _install(monkeypatch, _Props(80 * GIB, 0), driver_total = None)
         assert integrated_device.cuda_total_memory(0) == 80 * GIB
         assert calls == []
@@ -178,13 +170,8 @@ class TestUnreadableDevice:
 
 
 class TestFlexAttentionCallSite:
-    """The kernel-option probe must keep raising for a device it cannot describe.
-
-    `cuda_total_memory` answers 0 there, which is right for a caller comparing budgets and wrong
-    for this one: 0 GiB reads as "16GB or less", so flex attention would stay ENABLED with 32x32
-    kernel options where the probe previously turned it off. The real assignment is lifted out of
-    the module source and evaluated here, so this tests the shipped expression, not a copy.
-    """
+    """The kernel-option probe must keep raising for an undescribed device: cuda_total_memory's 0 would read as 16GB or
+    less and leave flex attention enabled; the shipped expression is evaluated."""
 
     @staticmethod
     def _vram_expression():

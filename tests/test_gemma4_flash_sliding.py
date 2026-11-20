@@ -1,12 +1,5 @@
-"""FA2 sliding-window path for gemma-4 must match full SDPA with the band mask.
-
-Gemma-4 mixes head_dim=256 sliding-window layers with head_dim=512 global
-layers, so FlashAttention-2 (head_dim <= 256) is disabled model-wide and the
-sliding layers fall back to full O(S^2) SDPA. Routing the sliding layers to
-FA2 with window_size=(w-1, 0) reproduces the causal sliding band exactly. This
-checks forward + backward parity against SDPA with the explicit band mask, and
-that the mask probe accepts a genuine band / rejects a padded one.
-"""
+"""Gemma-4 sliding layers (head_dim 256) route to FA2 with window_size=(w-1, 0), since FA2 (head_dim <= 256) is off
+model-wide for head_dim 512 globals; fwd/bwd match band-mask SDPA; probe rejects padding"""
 import pytest
 import torch
 import torch.nn.functional as F
@@ -74,8 +67,7 @@ def _band(S, w, device="cuda"):
 
 
 def test_mask_probe_rejects_packed_boundary():
-    # An interior band break (a packed-sequence boundary) must be rejected; the
-    # whole-mask verification does not sample rows.
+    # An interior band break (packed boundary) must be rejected; the full mask check does not sample rows
     from unsloth_zoo.temporary_patches import gemma4_flash_sliding as gf
     S, w = 512, 128
     band = _band(S, w)
@@ -110,8 +102,7 @@ def test_chunked_verification_matches_dense():
 
 
 class Gemma4SlidingFake:
-    """Minimal stand-in for a Gemma-4 sliding-window attention module: just the
-    attributes the router gates on (is_sliding, class name, head_dim <= 256)."""
+    """Stand-in with only the attributes the router gates on: is_sliding, class name, head_dim <= 256"""
     is_sliding = True
     is_causal = True
     training = False
@@ -122,8 +113,7 @@ class Gemma4SlidingFake:
 
 
 def test_router_routes_to_fa2_and_matches_band(monkeypatch):
-    # With flash-attn present the wrapper must take the FA2 window branch, never
-    # the wrapped SDPA.
+    # With flash-attn present the wrapper must take the FA2 window branch, never the wrapped SDPA.
     from unsloth_zoo.temporary_patches import gemma4_flash_sliding as gf
 
     monkeypatch.setenv("UNSLOTH_GEMMA4_FLASH_SLIDING", "1")

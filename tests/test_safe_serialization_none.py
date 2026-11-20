@@ -14,21 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`safe_serialization = None` means the safetensors default, never a pickle.
-
-Unsloth's own warning, and the troubleshooting page it points at, tell a caller to pass
-`safe_serialization = None` to FORCE safetensors. `None` is falsy to peft and to
-transformers, so a save that forwards it verbatim selects the torch pickle writer and
-produces `adapter_model.bin` or `pytorch_model.bin`: the documented remedy for `.bin`
-files produces `.bin` files (unslothai/unsloth#1792).
-
-Measured on unsloth main before the fix, on a two-step Llama-3.2-1B LoRA:
-`model.save_pretrained(directory, safe_serialization = None)` wrote a 22.6 MB
-`adapter_model.bin`, while the same call with the argument omitted wrote
-`adapter_model.safetensors`.
-
-CPU-only, no network, no model download.
-"""
+"""safe_serialization = None must mean the safetensors default, never a pickle: Unsloth's warning tells callers to pass
+it to force safetensors, but forwarded verbatim None is falsy to peft and transformers and writes .bin
+(unslothai/unsloth issue 1792); CPU-only."""
 
 import ast
 import inspect
@@ -64,13 +52,8 @@ def test_it_is_exported():
 
 
 def test_the_dequantizing_merge_normalises_before_it_writes():
-    """`merge_and_dequantize_lora` forwards the value into two `save_pretrained` calls.
-
-    Asserted on the source rather than by running the merge: the function rewrites
-    `PreTrainedModel.save_pretrained` from its own source text and needs a real model,
-    which is neither CPU-cheap nor network-free, while the normalisation is a single
-    statement whose position is the whole point. It must come before either writer.
-    """
+    """Checked on source since the merge needs a real model: merge_and_dequantize_lora forwards the value to two
+    save_pretrained calls, so normalise before either writer."""
     source = inspect.getsource(SU.merge_and_dequantize_lora)
     tree = ast.parse(source.lstrip())
     body = tree.body[0].body
@@ -102,12 +85,7 @@ def test_the_dequantizing_merge_normalises_before_it_writes():
 
 
 def test_no_save_entry_point_forwards_an_unnormalised_parameter():
-    """A drift gate over the package, not just over the one function fixed here.
-
-    Any function that takes a `safe_serialization` parameter AND passes that same name on
-    to something else has to normalise it first, or `None` reaches a writer again the
-    next time one of these is added.
-    """
+    """Drift gate over the whole package: any function that takes safe_serialization and forwards that name must normalise it first, or None reaches a writer again."""
     package = Path(SU.__file__).resolve().parent
     offenders = []
     for path in sorted(package.rglob("*.py")):

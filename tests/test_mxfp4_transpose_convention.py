@@ -14,17 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The mxfp4 export path calls convert_moe_packed_tensors directly and must apply an external
-transpose(1, 2) for every convention EXCEPT stock transformers >= 4.56.0, which already self-
-transposes inside the function. Keying the decision only on the presence of the Unsloth-only
-convert_moe_packed_tensors_cpu variant under-transposed exports on stock transformers 4.55.x
-(supported by unsloth_zoo's pin: only 4.55.0/4.55.1 are excluded), silently corrupting weights.
-Stock behaviour verified against the real transformers source:
-  * v4.55.0 / v4.55.4: convert_moe_packed_tensors returns `out` (no transpose); dequantize()
-    applied `dequantized.transpose(1, 2).contiguous().to(target_device)`.
-  * v4.56.0 / v4.56.2 / v4.57.0 / 4.57.6: returns `out.transpose(1, 2).contiguous()`; dequantize()
-    does not transpose.
-"""
+"""Export must apply transpose(1, 2) unless stock transformers >= 4.56.0 self-transposes; keying only on the _cpu
+variant silently corrupted stock 4.55.x exports (pin supports 4.55.x except 4.55.0/4.55.1)."""
 import torch
 
 from unsloth_zoo.saving_utils import _mxfp4_base_returns_transposed
@@ -47,8 +38,7 @@ def test_decision_matrix_patch_and_version():
     assert _mxfp4_base_returns_transposed(None, "4.57.0") is True
     assert _mxfp4_base_returns_transposed(None, "4.57.6") is True
 
-    # 4.56.0 pre-releases (dev/rc) already carry the self-transpose, so they must be
-    # treated like the final 4.56.0 (not sorted below it, which would double-transpose).
+    # 4.56.0 dev/rc pre-releases already carry the self-transpose, so treat them like final 4.56.0; sorting them below it would double-transpose.
     assert _mxfp4_base_returns_transposed(None, "4.56.0.dev0") is True
     assert _mxfp4_base_returns_transposed(None, "4.56.0.dev20250801") is True
     assert _mxfp4_base_returns_transposed(None, "4.56.0rc1") is True
@@ -63,9 +53,8 @@ def test_unparseable_version_defaults_to_modern_stock():
 
 
 def test_all_conventions_produce_identical_gpt_oss_layout():
-    """The export weight must land in the same transposed GPT-OSS layout regardless of which
-    convert_moe_packed_tensors convention produced the raw dequant. The ground truth is the
-    stock >= 4.56.0 output: out.transpose(1, 2).contiguous()."""
+    """The export weight must match the GPT-OSS layout whichever convert_moe_packed_tensors convention made the raw
+    dequant; ground truth is stock >= 4.56.0's out.transpose(1, 2).contiguous()."""
     torch.manual_seed(0)
     E, D, N = 4, 6, 8  # [experts, rows, cols] of the un-transposed dequant `out`
     out = torch.randn(E, D, N)
@@ -83,9 +72,8 @@ def test_all_conventions_produce_identical_gpt_oss_layout():
 
 
 def test_old_cpu_only_keying_would_corrupt_stock_4_55():
-    """Documents the fixed bug: the previous decision (base_returns_transposed == (_cpu is None))
-    would treat stock 4.55.x as self-transposing and skip the external transpose, producing the
-    wrong (un-transposed) layout."""
+    """Guards the fixed bug: base_returns_transposed == (_cpu is None) treated stock 4.55.x as self-transposing,
+    skipping the external transpose and giving an un-transposed layout."""
     torch.manual_seed(0)
     out = torch.randn(4, 6, 8)
     ground_truth = out.transpose(1, 2).contiguous()

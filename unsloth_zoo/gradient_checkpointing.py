@@ -21,11 +21,20 @@ from contextlib import contextmanager, nullcontext
 import os
 import functools
 import inspect
+import sys
 import warnings
 import gc
+import collections
+import heapq
 import threading
 import weakref
 from .utils import _get_dtype, Version, is_distributed
+from .saved_attention import (
+    new_saved_attention_frame,
+    saved_attention_scope,
+    save_attention_enabled,
+    patch_transformers_saved_attention,
+)
 # Re-exported under its old name: it lives in integrated_device.py so the import-time
 # allocator block can share the topic without importing torch.
 from .integrated_device import _any_device_integrated
@@ -56,6 +65,8 @@ __all__ = [
     "reset_unsloth_gradient_checkpointing_buffers",
     "NonReentrantActivationOffloader",
     "non_reentrant_offload_hooks",
+    "activation_offloader_for",
+    "get_activation_offload_stats",
 ]
 
 # Initial buffer sizes for gradient checkpointing
@@ -138,20 +149,22 @@ def _mark_host_buffer(buffer):
 
 def _new_host_buffer(numel, dtype):
     nbytes = numel * dtype.itemsize
-    if not (PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled() and _reserve_pinned(nbytes)):
-        return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
-    try:
-        return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu", pin_memory = True))
-    except RuntimeError as e:
-        _release_pinned(nbytes)
-        if not _is_host_alloc_oom(e): raise
-        _warn_pinned_unavailable(e)
-        return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
+    if PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled():
+        with _PINNED_LOCK:  # held through allocation: no double-spent headroom
+            if _reserve_pinned(nbytes):
+                try:
+                    return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu", pin_memory = True))
+                except RuntimeError as e:
+                    _release_pinned(nbytes)
+                    if not _is_host_alloc_oom(e): raise
+                    _warn_pinned_unavailable(e)
+    return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
 
 
 def _grow_host_buffer(buffer, new_size):
     """resize_ on a pinned buffer issues a fresh, larger cudaHostAlloc, which can fail."""
     if new_size <= buffer.numel(): return _mark_host_buffer(buffer)
+    new_size = _exact_growth_numel(new_size, buffer.element_size())
     old_bytes = _storage_bytes(buffer)
     if new_size * buffer.element_size() <= old_bytes:
         # A shrunk buffer keeps its storage, so this resize_ allocates nothing.
@@ -164,30 +177,29 @@ def _grow_host_buffer(buffer, new_size):
         # pinned again once RAM allows, instead of staying pageable after one low-RAM moment.
         return _new_host_buffer(new_size, buffer.dtype)
     # resize_ takes a new pinned block and hands the old one back to the host cache.
-    if pinned and not _reserve_pinned(new_bytes):
-        _release_pinned(old_bytes)
-        replacement = _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
-        if GC_PINNED_CAP == _PIN_PER_BLOCK:
-            # Host RAM is short and the flush inside _reserve_pinned ran while this slot still held
-            # its old block. The caller replaces the slot (its contents are rewritten before every
-            # read), so free the old block now instead of leaving it cached beside the pageable copy.
-            try:
-                buffer.resize_(0)
-                buffer.untyped_storage().resize_(0)  # Tensor.resize_ alone never shrinks a storage
-            except Exception: pass
-            else: _empty_host_cache()
-        return replacement
-    try:
-        buffer.resize_(new_size)
-        if pinned: _release_pinned(old_bytes)
-        return _mark_host_buffer(buffer)
-    except RuntimeError as e:
-        if pinned: _release_pinned(new_bytes)
-        if not _is_host_alloc_oom(e) or not buffer.is_pinned(): raise
-        _release_pinned(old_bytes)
-        _warn_pinned_unavailable(e)
-        # Pinning is gone for this slot, so the cached flag has to flip with it.
-        return _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
+    with _PINNED_LOCK:  # held through allocation: no double-spent headroom
+        if pinned and not _reserve_pinned(new_bytes):
+            _release_pinned(old_bytes)
+            replacement = _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
+            if GC_PINNED_CAP == _PIN_PER_BLOCK:
+                # Free the old block rather than leave it cached beside the pageable copy.
+                try:
+                    buffer.resize_(0)
+                    buffer.untyped_storage().resize_(0)  # Tensor.resize_ alone never shrinks a storage
+                except Exception: pass
+                else: _empty_host_cache()
+            return replacement
+        try:
+            buffer.resize_(new_size)
+            if pinned: _release_pinned(old_bytes)
+            _note_outgrown_block(old_bytes)
+            return _mark_host_buffer(buffer)
+        except RuntimeError as e:
+            if pinned: _release_pinned(new_bytes)
+            if not _is_host_alloc_oom(e) or not buffer.is_pinned(): raise
+            _release_pinned(old_bytes)
+            _warn_pinned_unavailable(e)
+            return _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
 
 
 # Pinned pages cannot be swapped and every local rank pins its own pool (Arctic ALST), so
@@ -195,9 +207,9 @@ def _grow_host_buffer(buffer, new_size):
 # torch's CachingHostAllocator rounds each pinned block up to a power of two and keeps
 # freed blocks page-locked in per-size free lists until empty_host_cache (aten/src/ATen/
 # core/CachingHostAllocator.h: PowerOf2Ceil in allocate, free_list_ in free, torch 2.6
-# through 2.13). So GC_PINNED_BYTES charges rounded blocks, a release only moves a block
-# into _PINNED_CACHED (reusable by the next reservation of that size), and it drops only
-# when torch.cuda.host_memory_stats() shows the allocator holding less.
+# through 2.15; 2.13+ settings turn both off above a size, see _host_alloc_policy). So
+# GC_PINNED_BYTES charges rounded blocks; a release moves one into _PINNED_CACHED, and it drops
+# only when torch.cuda.host_memory_stats() shows the allocator holding less.
 # A single local rank has no other ranks to leave RAM for, and a refused pin still stores the
 # same bytes pageable, so it only refuses a block that would not fit in the RAM available now.
 GC_PINNED_BYTES = 0
@@ -206,12 +218,148 @@ _PIN_PER_BLOCK = -2
 _PIN_HEADROOM_BYTES = 1 << 30
 _WARNED_ABOUT_PINNED_CAP = False
 _PINNED_CACHED = {}         # rounded block bytes -> count released but still cached
+_PINNED_LIVE = {}           # requested bytes -> blocks charged at allocation, still live
 _HOST_HELD_BASELINE = None  # allocator bytes not ours when the cap was computed
+_PINNED_RELEASED = 0        # settings mode: blocks released since the last flush (may wait on events)
+
+
+# torch 2.13+ (c10/core/AllocatorConfig.h): above the round threshold / max cached size blocks are exact;
+# freed blocks above max cached size go back to the OS. torch 2.12 ignores the keys.
+_HOST_ALLOC_POLICY = (None, None, None)
+_TORCH_MINOR = Version(torch.__version__).release[:2]
+_HOST_ALLOC_KNOBS = _TORCH_MINOR >= (2, 13)
+_INF = float("inf")
+
+
+def _env_allocator_settings():
+    # The variable torch parsed at startup: the first one set, in c10/core/AllocatorConfig.cpp's order.
+    for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+        value = os.environ.get(var)
+        if value is not None: return value
+    return ""
+
+
+def _host_allocator_settings():
+    getter = getattr(torch._C, "_accelerator_getAllocatorSettings", None)
+    if getter is not None:
+        try: return getter() or ""
+        except Exception: pass
+    return _env_allocator_settings()
+
+
+def _parse_host_alloc_policy(settings, prior = (_INF, _INF)):
+    round_max, cached_max = prior
+    for item in settings.split(","):
+        key, _, value = item.partition(":")
+        key = key.strip()
+        if key not in ("pinned_max_round_threshold_mb", "pinned_max_cached_size_mb"): continue
+        try: limit = int(float(value.strip()) * (1 << 20))
+        except ValueError: continue
+        if key == "pinned_max_round_threshold_mb": round_max = limit
+        else: cached_max = limit
+    return round_max, cached_max
+
+
+def _host_alloc_policy():
+    """(round threshold, max cached size) in bytes; inf when unset or unsupported by this torch."""
+    global _HOST_ALLOC_POLICY
+    if not _HOST_ALLOC_KNOBS: return _INF, _INF
+    settings = _host_allocator_settings()
+    policy = _HOST_ALLOC_POLICY
+    if settings != policy[0]:
+        # Fold each string into the policy in effect, starting from the environment torch parsed at
+        # startup: torch reports only the last, so omitted keys stay pinned.
+        prior = policy[1:] if policy[0] is not None else _parse_host_alloc_policy(_env_allocator_settings())
+        policy = _HOST_ALLOC_POLICY = (settings, *_parse_host_alloc_policy(settings, prior))
+        if policy[1] != _INF: _warn_short_block_reuse()
+    return policy[1], policy[2]
+
+
+_WARNED_SHORT_BLOCK = False
+def _warn_short_block_reuse():
+    # torch 2.13 get_free_block can hand out a shorter unrounded block (fixed in 2.14).
+    global _WARNED_SHORT_BLOCK
+    if _WARNED_SHORT_BLOCK or _TORCH_MINOR >= (2, 14): return
+    _WARNED_SHORT_BLOCK = True
+    warnings.warn(
+        "Unsloth: pinned_max_round_threshold_mb is set on torch 2.13, whose pinned host cache can "
+        "reuse a smaller block for a larger request above that threshold (fixed in torch 2.14). "
+        "Gradient checkpointing offload grows pinned buffers, so upgrade torch or unset it.",
+        stacklevel = 2,
+    )
+
+
+# Offload slots are hidden * tokens * 2 bytes, often not a power of two (Qwen3-4B at 32k: 160MB pinned
+# as 256MB). On CUDA torch 2.14+ (2.13 can hand out a short block) set pinned_max_round_threshold_mb so
+# blocks above _GC_PINNED_EXACT_MB are pinned at their exact size, unless the user set either pinned
+# knob. Smaller pinned users (DataLoader batches) keep power-of-two reuse. UNSLOTH_GC_PINNED_EXACT=0 off.
+_GC_PINNED_EXACT_MB = 4
+_GC_PINNED_EXACT = False
+_PINNED_KNOBS = ("pinned_max_round_threshold_mb", "pinned_max_cached_size_mb")
+
+
+def _maybe_enable_exact_pinned():
+    global _GC_PINNED_EXACT
+    if _GC_PINNED_EXACT: return True
+    if os.environ.get("UNSLOTH_GC_PINNED_EXACT", "1") == "0": return False
+    if DEVICE_TYPE != "cuda" or getattr(torch.version, "hip", None) or _TORCH_MINOR < (2, 14): return False
+    setter = getattr(torch._C, "_accelerator_setAllocatorSettings", None)
+    if setter is None: return False
+    current = _host_allocator_settings()
+    user = [current] + [os.environ.get(var) or "" for var in
+        ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF")]
+    if any(knob in text for text in user for knob in _PINNED_KNOBS): return False
+    # torch reports only the latest settings string: a pinned knob set by an earlier update stays in effect.
+    if any(v != _INF for v in _host_alloc_policy()): return False
+    # Each call resets max_split_size_mb, roundup_power2_divisions and garbage_collection_threshold
+    # to defaults, so pass the settings in effect back in with ours appended.
+    try: setter(",".join(filter(None, (current, f"pinned_max_round_threshold_mb:{_GC_PINNED_EXACT_MB}"))))
+    except Exception: return False
+    _GC_PINNED_EXACT = True
+    return True
+
+
+def _exact_growth_numel(numel, itemsize):
+    """Exact blocks are only reused by requests no larger, so a slot that grows with the sequence length
+    would pin a fresh block each time. Grow in 1/8 power-of-two steps: few growths, under 12.5% slack."""
+    nbytes = numel * itemsize
+    if not _GC_PINNED_EXACT or nbytes <= (_GC_PINNED_EXACT_MB << 20): return numel
+    step = 1 << (nbytes.bit_length() - 4)
+    return -(-(-(-nbytes // step) * step) // itemsize)
+
+
+_EXACT_OUTGROWN = False
+
+
+def _note_outgrown_block(old_bytes):
+    """An outgrown exact block fits none of the larger requests that follow, so it would stay pinned in
+    torch's cache. Free it now if its copies are done (no sync: last used in an earlier step), else at the
+    next step's first offload, after a sync."""
+    global _EXACT_OUTGROWN
+    if not _GC_PINNED_EXACT or old_bytes <= (_GC_PINNED_EXACT_MB << 20): return
+    _EXACT_OUTGROWN = True
+    try: torch._C._host_emptyCache()
+    except Exception: pass
+
+
+def _flush_outgrown_blocks():
+    global _EXACT_OUTGROWN
+    if not _EXACT_OUTGROWN: return
+    _EXACT_OUTGROWN = False
+    with _PINNED_LOCK: _empty_host_cache()
 
 
 def _pinned_block_bytes(nbytes):
+    """Bytes torch's host allocator really pins for an `nbytes` request."""
     if nbytes <= 0: return 0
+    round_max, cached_max = _host_alloc_policy()
+    if nbytes > round_max or nbytes > cached_max: return int(nbytes)
     return 1 << (int(nbytes) - 1).bit_length()
+
+
+def _pinned_block_cached(block):
+    """False when torch frees a released block of this size instead of caching it."""
+    return block <= _host_alloc_policy()[1]
 
 
 def _host_allocator_held_bytes():
@@ -249,31 +397,32 @@ def _host_cache_reuses_block(block):
     return False
 
 
-def _compute_pinned_cap():
+def _compute_pinned_cap(held = None):
+    """`held`: counted mode, the allocator's pinned bytes now (everyone's), which the cap then bounds."""
     env = os.environ.get("UNSLOTH_GC_PINNED_MAX_GB")
     if env:
         try: return max(0, int(float(env) * (1 << 30)))
         except ValueError: pass
     try:
-        import psutil
         from .block_swap import _PIN_RESERVE_MIN_BYTES, _PIN_RESERVE_FRACTION, _local_world_size
-        vm = psutil.virtual_memory()
+        from .memory_budget import host_memory_bytes
+        total, available = host_memory_bytes()
     except Exception:
         return -1  # unmeasurable: keep the old uncapped behaviour
     if _local_world_size() == 1: return _PIN_PER_BLOCK
-    reserve = max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
-    # Bytes this process already pinned are missing from `available`, so add them back.
-    return max(0, vm.available - reserve) // _local_world_size() + GC_PINNED_BYTES
+    reserve = max(_PIN_RESERVE_MIN_BYTES, int(total * _PIN_RESERVE_FRACTION))
+    # Free RAM already excludes pinned bytes, so add back what is held (ours, or all in counted mode).
+    return max(0, available - reserve) // _local_world_size() + (GC_PINNED_BYTES if held is None else held)
 
 
 def _block_fits_host_ram(block):
     """One local rank: pin unless the block would leave under min(1 GiB, 10% of RAM) available."""
     try:
-        import psutil
-        vm = psutil.virtual_memory()
+        from .memory_budget import host_memory_bytes
+        total, available = host_memory_bytes()
     except Exception:
         return True
-    return block + min(_PIN_HEADROOM_BYTES, vm.total // 10) <= vm.available
+    return block + min(_PIN_HEADROOM_BYTES, total // 10) <= available
 
 
 def _synchronize_used_devices():
@@ -290,15 +439,16 @@ pass
 def _empty_host_cache():
     """Return cached free pinned blocks to the OS. A pinned buffer that grows leaves its old block
     in torch's host cache, and once growth goes pageable nothing reuses it. True if any were freed."""
-    global GC_PINNED_BYTES
+    global GC_PINNED_BYTES, _PINNED_RELEASED
     if DEVICE_TYPE not in ("cuda", "hip"): return False
     ours = sum(k * v for k, v in _PINNED_CACHED.items())
     free = _host_allocator_free_bytes()
     # host_memory_stats() does not process pending copy events, so a dead block whose last use was a
     # non_blocking copy (every pinned offload slot) still reads as active there: our own released
     # blocks are reason enough to flush, and _host_emptyCache processes those events first.
-    if not (ours or free): return False
-    if ours:
+    released = _PINNED_RELEASED
+    if not (ours or released or free): return False
+    if ours or released:
         # _host_emptyCache only frees blocks whose copy events completed: wait for our released
         # blocks' last non_blocking copies, or the bookkeeping below drops blocks still held.
         _synchronize_used_devices()
@@ -306,6 +456,7 @@ def _empty_host_cache():
     except Exception: return False
     GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - ours)
     _PINNED_CACHED.clear()
+    _PINNED_RELEASED = 0
     return True
 
 
@@ -329,10 +480,13 @@ def _reset_pinned_cap():
     _WARNED_ABOUT_PINNED_CAP = False
 
 
-def _reserve_pinned(nbytes):
+def _reserve_pinned_unlocked(nbytes):
     """Count `nbytes` against the pinned cap; False means allocate pageable instead."""
     global GC_PINNED_BYTES, GC_PINNED_CAP, _WARNED_ABOUT_PINNED_CAP, _HOST_HELD_BASELINE
     block = _pinned_block_bytes(nbytes)
+    if _host_alloc_settings_active():
+        counted = _reserve_pinned_counted(nbytes, block)
+        if counted is not None: return counted
     if _PINNED_CACHED.get(block, 0) > 0:
         _PINNED_CACHED[block] -= 1
         free = _host_allocator_free_bytes()
@@ -341,6 +495,7 @@ def _reserve_pinned(nbytes):
         if free is None or free >= block or (
             GC_PINNED_CAP is not None and GC_PINNED_CAP >= 0 and _host_cache_reuses_block(block)
         ):
+            _charge_live(nbytes, block)
             return True  # the allocator hands back the cached block, already charged
         # Another pinned user took the block: it is no longer ours, and this request is new.
         GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - block)
@@ -349,8 +504,7 @@ def _reserve_pinned(nbytes):
         GC_PINNED_CAP = _compute_pinned_cap()
         _HOST_HELD_BASELINE = None if held is None else max(0, held - GC_PINNED_BYTES)
     elif _HOST_HELD_BASELINE is None and held is not None:
-        # host_memory_stats() is empty before CUDA initialises, so a cap computed first has no
-        # baseline yet: take it at the first reading instead of never.
+        # host_memory_stats() is empty before CUDA init: take the baseline at the first reading.
         _HOST_HELD_BASELINE = max(0, held - GC_PINNED_BYTES)
     used = GC_PINNED_BYTES
     if held is not None:
@@ -364,31 +518,91 @@ def _reserve_pinned(nbytes):
             used = max(used, held - _HOST_HELD_BASELINE)
     if GC_PINNED_CAP == _PIN_PER_BLOCK:
         if not _block_fits_host_ram(block) and not (_empty_host_cache() and _block_fits_host_ram(block)):
-            if not _WARNED_ABOUT_PINNED_CAP:
-                _WARNED_ABOUT_PINNED_CAP = True
-                print(
-                    "Unsloth: Host RAM is nearly full, so gradient checkpointing offload buffers that "
-                    "do not fit use pageable memory. Training continues; "
-                    "set UNSLOTH_GC_PINNED_MAX_GB to set a fixed pinned cap instead."
-                )
+            _warn_host_ram_full()
             return False
     elif GC_PINNED_CAP >= 0 and used + block > GC_PINNED_CAP and not (
-        # Our released blocks (old blocks of grown slots) still count against the cap: return
-        # them to the OS once and retry before going pageable for good. Only when some exist,
-        # so a full cap with nothing of ours cached costs no device sync.
         _PINNED_CACHED and any(_PINNED_CACHED.values()) and _flushed_cached_fits(block, used)
     ):
-        if not _WARNED_ABOUT_PINNED_CAP:
-            _WARNED_ABOUT_PINNED_CAP = True
-            print(
-                f"Unsloth: Gradient checkpointing pinned host memory reached its cap of "
-                f"{GC_PINNED_CAP / (1 << 30):.1f}GB (free host RAM split across local ranks), "
-                "so further offload buffers use pageable memory. Training continues; "
-                "set UNSLOTH_GC_PINNED_MAX_GB to change the cap."
-            )
+        _warn_pinned_cap()
         return False
     GC_PINNED_BYTES += block
+    _charge_live(nbytes, block)
     return True
+
+
+def _warn_host_ram_full():
+    global _WARNED_ABOUT_PINNED_CAP
+    if _WARNED_ABOUT_PINNED_CAP: return
+    _WARNED_ABOUT_PINNED_CAP = True
+    print(
+        "Unsloth: Host RAM is nearly full, so gradient checkpointing offload buffers that "
+        "do not fit use pageable memory. Training continues; "
+        "set UNSLOTH_GC_PINNED_MAX_GB to set a fixed pinned cap instead."
+    )
+
+
+def _warn_pinned_cap():
+    global _WARNED_ABOUT_PINNED_CAP
+    if _WARNED_ABOUT_PINNED_CAP: return
+    _WARNED_ABOUT_PINNED_CAP = True
+    print(
+        f"Unsloth: Gradient checkpointing pinned host memory reached its cap of "
+        f"{GC_PINNED_CAP / (1 << 30):.1f}GB (free host RAM split across local ranks), "
+        "so further offload buffers use pageable memory. Training continues; "
+        "set UNSLOTH_GC_PINNED_MAX_GB to change the cap."
+    )
+
+
+# With torch 2.13+ settings the allocator count (live + cached + event-pending) is the ground truth.
+def _host_alloc_settings_active():
+    if not _HOST_ALLOC_KNOBS: return False
+    round_max, cached_max = _host_alloc_policy()
+    return round_max != _INF or cached_max != _INF
+
+
+def _reserve_pinned_counted(nbytes, block):
+    """None if the allocator cannot be read (the simulated path then decides)."""
+    global GC_PINNED_BYTES, GC_PINNED_CAP
+    # Re-read every time: other users pin between ours; the cap bounds all held bytes.
+    held = _host_allocator_held_bytes()
+    if held is None: return None
+    if GC_PINNED_CAP is None:
+        GC_PINNED_CAP = _compute_pinned_cap(held)
+    if GC_PINNED_CAP == _PIN_PER_BLOCK:
+        if not _block_fits_host_ram(block) and not (_empty_host_cache() and _block_fits_host_ram(block)):
+            _warn_host_ram_full()
+            return False
+    elif GC_PINNED_CAP >= 0 and held + block > GC_PINNED_CAP:
+        if not _counted_slow_path_fits(block):
+            _warn_pinned_cap()
+            return False
+    GC_PINNED_BYTES += block
+    _charge_live(nbytes, -block)
+    return True
+
+
+def _counted_slow_path_fits(block):
+    """Over the cap: process pending copy events, then flush the cache and re-read. Never trial-allocate
+    `block`: an uncached one would itself pin past the cap."""
+    free = _host_allocator_free_bytes() or 0
+    if not (_PINNED_RELEASED or free > 0):
+        return False
+    # A tiny pinned allocation processes completed copy events (host_memory_stats does not).
+    try: drain = torch.empty(1, dtype = torch.uint8, device = "cpu", pin_memory = True)
+    except Exception as exception:
+        if not _is_host_alloc_oom(exception): raise
+    else: del drain
+    held = _host_allocator_held_bytes()
+    if held is not None and held + block <= GC_PINNED_CAP: return True
+    if not _empty_host_cache(): return False
+    held = _host_allocator_held_bytes()
+    return held is not None and held + block <= GC_PINNED_CAP
+
+
+def _charge_live(nbytes, block):
+    blocks = _PINNED_LIVE.get(nbytes)
+    if blocks is None: _PINNED_LIVE[nbytes] = [block]
+    else: blocks.append(block)
 
 
 def _flushed_cached_fits(block, used):
@@ -398,16 +612,45 @@ def _flushed_cached_fits(block, used):
     held = _host_allocator_held_bytes()
     if held is None or _HOST_HELD_BASELINE is None:
         return max(0, used - ours) + block <= GC_PINNED_CAP
-    # Re-read the allocator: a released block another pinned user took is still held after the
-    # flush, so only what was really returned to the OS makes room under the cap.
     return max(GC_PINNED_BYTES, held - _HOST_HELD_BASELINE) + block <= GC_PINNED_CAP
 
 
-def _release_pinned(nbytes):
-    """The block stays pinned in torch's host cache, so it stays charged until reused."""
-    block = _pinned_block_bytes(nbytes)
-    if block: _PINNED_CACHED[block] = _PINNED_CACHED.get(block, 0) + 1
+def _release_pinned_unlocked(nbytes):
+    """The block stays pinned in torch's host cache, so it stays charged until reused; one above
+    pinned_max_cached_size_mb (torch 2.13+) goes back to the OS, so it stops being charged."""
+    global GC_PINNED_BYTES, _PINNED_RELEASED
+    blocks = _PINNED_LIVE.get(nbytes)
+    if blocks:
+        block = blocks.pop()
+        if not blocks: del _PINNED_LIVE[nbytes]
+    else:
+        block = _pinned_block_bytes(nbytes)
+    if not block: return
+    if block < 0:
+        GC_PINNED_BYTES = max(0, GC_PINNED_BYTES + block)
+        _PINNED_RELEASED += 1
+        return
+    if _pinned_block_cached(block):
+        _PINNED_CACHED[block] = _PINNED_CACHED.get(block, 0) + 1
+    else:
+        GC_PINNED_BYTES = max(0, GC_PINNED_BYTES - block)
 
+
+
+# Releases may run on autograd worker threads. Held from the cap check through allocation, so two
+# callers cannot spend the same headroom (re-entrant for flushes).
+_PINNED_LOCK = threading.RLock()
+
+
+def _reserve_pinned(nbytes):
+    """Count `nbytes` against the pinned cap; False means allocate pageable instead."""
+    with _PINNED_LOCK:
+        return _reserve_pinned_unlocked(nbytes)
+
+
+def _release_pinned(nbytes):
+    with _PINNED_LOCK:
+        return _release_pinned_unlocked(nbytes)
 
 def _view_bytes_as(buffer, nbytes, dtype, shape):
     """Reinterpret raw buffer bytes, never cast: the init dtype can differ from the activation's."""
@@ -415,11 +658,34 @@ def _view_bytes_as(buffer, nbytes, dtype, shape):
     return buffer.view(torch.uint8)[:nbytes].view(dtype).view(shape)
 
 
-# float32 activations (FORCE_FLOAT32 residuals) offload as bfloat16, the same bytes as before, and are
-# cast back to float32 for the recompute. float16 overflows gemma3 residuals (~3e5) and per-row scaled
-# float16 spiked grad norms 20x on a T4 (outlier rows leave small entries subnormal). The dtype restore,
-# not the storage, is what the recompute needs. UNSLOTH_OFFLOAD_FP32=exact keeps the exact float32 bytes.
-FP32_OFFLOAD_EXACT = os.environ.get("UNSLOTH_OFFLOAD_FP32", "bf16").lower() == "exact"
+# float32 activations offloaded while autocast is on for their device (FORCE_FLOAT32 residuals under fp16 /
+# bf16 autocast) are stored as bfloat16, the same bytes as before, and cast back to float32 for the
+# recompute. float16 overflows gemma3 residuals (~3e5) and per-row scaled float16 spiked grad norms 20x on a
+# T4 (outlier rows leave small entries subnormal). Without autocast the model trains in true float32, where
+# bf16 storage drifted LoRA grads ~0.1% (up to 4% on one full finetuning param), so those are stored exactly.
+# UNSLOTH_OFFLOAD_FP32=exact always keeps float32, =bf16 always stores bfloat16, unset / auto picks per tensor.
+def _fp32_offload_mode():
+    mode = os.environ.get("UNSLOTH_OFFLOAD_FP32", "auto").strip().lower()
+    if mode in ("exact", "fp32", "float32"): return "exact"
+    if mode in ("bf16", "bfloat16"): return "bf16"
+    return "auto"
+FP32_OFFLOAD_MODE = _fp32_offload_mode()
+FP32_OFFLOAD_EXACT = FP32_OFFLOAD_MODE == "exact"
+
+
+def _autocast_enabled(device_type):
+    try:
+        return torch.is_autocast_enabled(device_type)
+    except TypeError:  # torch < 2.4 has no device argument
+        return torch.is_autocast_cpu_enabled() if device_type == "cpu" else torch.is_autocast_enabled()
+
+
+def _offload_store_dtype(tensor):
+    """Dtype an offloaded activation is stored in; the recompute always gets tensor.dtype back."""
+    dtype = tensor.dtype
+    if dtype != torch.float32 or FP32_OFFLOAD_EXACT: return dtype
+    if FP32_OFFLOAD_MODE == "bf16" or _autocast_enabled(tensor.device.type): return torch.bfloat16
+    return dtype
 
 
 @contextmanager
@@ -548,13 +814,257 @@ def in_gradient_checkpoint_recompute() -> bool:
 
 
 @contextmanager
-def _gradient_checkpoint_recompute_marker():
+def _gradient_checkpoint_recompute_marker(function = None):
     previous = getattr(_GC_RECOMPUTE_TLS, "active", False)
+    previous_function = getattr(_GC_RECOMPUTE_TLS, "function", None)
     _GC_RECOMPUTE_TLS.active = True
+    _GC_RECOMPUTE_TLS.function = function
     try:
         yield
     finally:
         _GC_RECOMPUTE_TLS.active = previous
+        _GC_RECOMPUTE_TLS.function = previous_function
+
+
+def _module_forward_chain(module):
+    function = getattr(type(module), "forward", None)
+    for _ in range(8):
+        if function is None:
+            return
+        yield function
+        function = getattr(function, "__wrapped__", None)
+pass
+
+
+def _calls_whole_module(function, module):
+    if not isinstance(module, torch.nn.Module):
+        return False
+    if function in (torch.nn.Module.__call__, torch.nn.Module._call_impl):
+        return True
+    return any(function is forward for forward in _module_forward_chain(module))
+pass
+
+
+def _replayed_module(function):
+    """Module whose call is the whole checkpointed function, else None. Any shape that could add work
+    after the module returns (lambdas, other methods) must resolve to None."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    for _ in range(8):
+        if isinstance(function, _KeywordArgumentCall):
+            function = function.function
+            continue
+        if isinstance(function, torch.nn.Module):
+            # An overridden __call__ may transform forward's output.
+            return function if type(function).__call__ in (torch.nn.Module.__call__, torch.nn.Module._call_impl) else None
+        if isinstance(function, functools.partial):
+            inner = function.func
+            if inspect.ismethod(inner):
+                owner = inner.__self__
+                return owner if _calls_whole_module(inner.__func__, owner) else None
+            owner = function.args[0] if function.args else None
+            return owner if _calls_whole_module(inner, owner) else None
+        if inspect.ismethod(function):
+            owner = function.__self__
+            return owner if _calls_whole_module(function.__func__, owner) else None
+        module = getattr(function, "_unsloth_checkpoint_module", None)
+        return module if isinstance(module, torch.nn.Module) else None
+    return None
+pass
+
+
+def gradient_checkpoint_replay_module():
+    """During a reentrant checkpoint replay, the module whose output nothing else reads; else None."""
+    if not getattr(_GC_RECOMPUTE_TLS, "active", False):
+        return None
+    function = getattr(_GC_RECOMPUTE_TLS, "function", None)
+    if function is None:
+        return None
+    module = _replayed_module(function)
+    # Forward hooks may read the output.
+    if module is None or module._forward_hooks or torch.nn.modules.module._global_forward_hooks:
+        return None
+    return module
+
+
+# ---------------------------------------------------------------------------
+# Same MoE routing in the checkpoint replay as in the forward that made the loss
+# ---------------------------------------------------------------------------
+# Replay reuses first-pass MoE routing (compile rounds differ by a bf16 ulp); read at run time by
+# eager code or opaque ops, never traced code, so no graph guards; UNSLOTH_MOE_GC_SAME_ROUTING=0
+# disables.
+_GC_ROUTING_TLS = threading.local()
+MOE_GC_ROUTING_STATS = collections.Counter()   # stored / reused / mismatch / unmatched
+
+
+class CheckpointRoutingFrame:
+    """First-pass routing in call order. Kept for the checkpoint context's lifetime and read through a cursor reset
+    at each replay, so a second backward (retain_graph) replays the same routing."""
+    __slots__ = ("entries", "cursor", "replaying", "current", "kept", "__weakref__")
+
+    def __init__(self):
+        self.entries = []
+        self.cursor = 0
+        self.replaying = False
+        self.current = None   # entry index of the MoE call being routed now (moe_checkpoint_call)
+        self.kept = {}        # first-pass frozen base expert outputs the replay reuses (moe_gc_keep_base)
+
+
+def _new_checkpoint_routing_frame(tensors):
+    """A frame only when the checkpoint will run backward (some input requires grad)."""
+    if os.environ.get("UNSLOTH_MOE_GC_SAME_ROUTING", "1") == "0":
+        return None
+    for t in tensors:
+        if isinstance(t, torch.Tensor) and t.requires_grad:
+            return CheckpointRoutingFrame()
+    return None
+
+
+@contextmanager
+def _checkpoint_routing_scope(frame, replay):
+    previous = getattr(_GC_ROUTING_TLS, "frame", None)
+    if frame is not None:
+        frame.replaying = replay
+        frame.cursor = 0
+        frame.current = None
+    _GC_ROUTING_TLS.frame = frame
+    try:
+        yield
+    finally:
+        _GC_ROUTING_TLS.frame = previous
+        if frame is not None and replay and frame.cursor < len(frame.entries):
+            MOE_GC_ROUTING_STATS["unmatched"] += len(frame.entries) - frame.cursor
+
+
+@contextmanager
+def suspended_checkpoint_routing():
+    """No routing frame inside: for throwaway probe forwards that are not the call making the loss."""
+    previous = getattr(_GC_ROUTING_TLS, "frame", None)
+    _GC_ROUTING_TLS.frame = None
+    try:
+        yield
+    finally:
+        _GC_ROUTING_TLS.frame = previous
+
+
+def _checkpoint_route_eager(top_k_index, top_k_weights, grad_mode):
+    """(ids, weights) the experts must use: the first pass's in a replay, else the given ones."""
+    frame = getattr(_GC_ROUTING_TLS, "frame", None)
+    if frame is None:
+        return None
+    frame.current = None
+    if not frame.replaying:
+        # Only no-grad calls make the loss's forward; a grad-mode trial inside it does not.
+        if not grad_mode:
+            frame.entries.append((top_k_index.detach().clone(), top_k_weights.detach().clone()))
+            frame.current = len(frame.entries) - 1
+            MOE_GC_ROUTING_STATS["stored"] += 1
+        return None
+    if not grad_mode or frame.cursor >= len(frame.entries):
+        return None
+    index, weights = frame.entries[frame.cursor]
+    frame.cursor += 1
+    if (
+        index.shape != top_k_index.shape or index.dtype != top_k_index.dtype or index.device != top_k_index.device
+        or weights.shape != top_k_weights.shape or weights.dtype != top_k_weights.dtype
+        or weights.device != top_k_weights.device
+    ):
+        # Not the same call (a layer that routes differently in its replay): keep the replay's routing.
+        MOE_GC_ROUTING_STATS["mismatch"] += 1
+        frame.cursor = len(frame.entries)
+        return None
+    frame.current = frame.cursor - 1
+    MOE_GC_ROUTING_STATS["reused"] += 1
+    return index, weights
+
+
+def moe_checkpoint_call():
+    """(frame, entry index, replaying) for the MoE experts call whose routing was just stored (first pass) or
+    reused (replay), else None; consumed by the read, so a later call without routing gets None. Eager only."""
+    frame = getattr(_GC_ROUTING_TLS, "frame", None)
+    if frame is None:
+        return None
+    current = frame.current
+    frame.current = None
+    if current is None:
+        return None
+    return frame, current, frame.replaying
+
+
+def _moe_checkpoint_route_impl(
+    top_k_index: torch.Tensor, top_k_weights: torch.Tensor, grad_mode: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Resolved at call time: a reloaded copy of this module keeps the op registered by the first.
+    found = sys.modules[__name__]._checkpoint_route_eager(top_k_index, top_k_weights, grad_mode)
+    if found is None:
+        return top_k_index.clone(), top_k_weights.clone()
+    # Clone: Inductor may write later ops in place into this output, corrupting the stored routing.
+    return found[0].clone(), found[1].clone()
+
+
+def _moe_checkpoint_route_fake(top_k_index, top_k_weights, grad_mode):
+    return torch.empty_like(top_k_index), torch.empty_like(top_k_weights)
+
+
+def _register_moe_checkpoint_route_op():
+    name = "unsloth_zoo::moe_checkpoint_route"
+    existing = getattr(getattr(torch.ops, "unsloth_zoo", None), "moe_checkpoint_route", None)
+    if existing is not None:   # a reloaded copy of this module
+        return existing.default
+    # Host-side state: a CUDA graph replay would skip the body, so keep the op out of CUDA graphs.
+    kwargs = {}
+    tag = getattr(getattr(torch, "Tag", None), "cudagraph_unsafe", None)
+    if tag is not None and "tags" in inspect.signature(torch.library.custom_op).parameters:
+        kwargs["tags"] = (tag,)
+    op = torch.library.custom_op(name, mutates_args = (), **kwargs)(_moe_checkpoint_route_impl)
+    op.register_fake(_moe_checkpoint_route_fake)
+    return op
+
+
+_moe_checkpoint_route_op = _register_moe_checkpoint_route_op()
+
+
+def _blend_checkpoint_routing(top_k_index, top_k_weights, index, weights):
+    """Routing weights with the first pass's values and, where it is exact, the replay's gradient.
+
+    ``weights`` (first pass, no grad) give the values. A token whose replay picked the same expert set
+    (in any slot order) takes the replay's gradient, matched slot by slot: the same set under the same
+    normalization is the same differentiable function, so the gradient is exact. A token whose replay
+    picked a different set takes no router gradient: the replay's weights are normalized over experts
+    the loss never used, so their gradient would reach an expert the first pass did not select, and the
+    first pass's set has no differentiable weights here. Aligned [T, k] weights are matched per slot;
+    dense [T, E] weights line up already. When nothing changed (``index`` equals ``top_k_index``) the
+    values are bitwise ``top_k_weights`` and so is the gradient."""
+    if top_k_weights.shape == top_k_index.shape:
+        match = index.unsqueeze(-1) == top_k_index.unsqueeze(-2)          # [T, k, k]
+        same_set = match.any(-1).all(-1, keepdim = True)                   # [T, 1]
+        aligned = (match.to(top_k_weights.dtype) * top_k_weights.unsqueeze(-2)).sum(-1)
+        delta = aligned - aligned.detach()
+    else:
+        same_set = (index.sort(-1).values == top_k_index.sort(-1).values).all(-1, keepdim = True)
+        delta = top_k_weights - top_k_weights.detach()
+    return weights + torch.where(same_set, delta, torch.zeros_like(delta))
+
+
+def moe_checkpoint_routing(module, top_k_index, top_k_weights):
+    """The (top-k ids, routing weights) an MoE experts call must use.
+
+    Inside an Unsloth gradient-checkpoint replay these are the ids the first (no-grad) pass used,
+    so backward differentiates the routing that produced the loss. Everywhere else they are the
+    given tensors (eager: the same objects). Training mode only."""
+    if not isinstance(top_k_index, torch.Tensor) or not isinstance(top_k_weights, torch.Tensor) \
+            or not getattr(module, "training", False):
+        return top_k_index, top_k_weights
+    grad_mode = torch.is_grad_enabled()
+    if not torch.compiler.is_compiling():
+        found = _checkpoint_route_eager(top_k_index, top_k_weights, grad_mode)
+        if found is None:
+            return top_k_index, top_k_weights
+        index, weights = found
+    else:
+        index, weights = _moe_checkpoint_route_op(top_k_index, top_k_weights.detach(), grad_mode)
+    if not grad_mode:
+        return index, weights
+    return index, _blend_checkpoint_routing(top_k_index, top_k_weights, index, weights)
 
 
 def _detach_checkpoint_args(args):
@@ -604,7 +1114,8 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
     def forward(ctx, forward_function, hidden_states, *args):
         ctx.device = hidden_states.device
         saved_hidden_states = hidden_states.to("cpu", non_blocking = True)
-        with torch.no_grad():
+        ctx._routing_frame = _new_checkpoint_routing_frame((hidden_states, *args))
+        with torch.no_grad(), _checkpoint_routing_scope(ctx._routing_frame, False):
             output = forward_function(hidden_states, *args)
         ctx.save_for_backward(saved_hidden_states)
         ctx.forward_function = forward_function
@@ -619,7 +1130,8 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
         hidden_states = hidden_states.to(ctx.device, non_blocking = True).detach()
         hidden_states.requires_grad_(True)
         recompute_args, grad_holders = _detach_checkpoint_args(ctx.args)
-        with torch.enable_grad(), _gradient_checkpoint_recompute_marker():
+        with torch.enable_grad(), _gradient_checkpoint_recompute_marker(ctx.forward_function), \
+                _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True):
             output = ctx.forward_function(hidden_states, *recompute_args)
         # Layers that return a 1-tuple keep unpacking exactly as before. Layers
         # that return the tensor itself (Qwen2-VL's vision block, and every
@@ -634,7 +1146,6 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
         return (None, hidden_states.grad,) + tuple(
             None if holder is None else holder.grad for holder in grad_holders
         )
-    pass
 pass
 
 
@@ -646,7 +1157,8 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
     @staticmethod
     @torch_amp_custom_fwd
     def forward(ctx, forward_function, hidden_states, *args):
-        with torch.no_grad():
+        ctx._routing_frame = _new_checkpoint_routing_frame((hidden_states, *args))
+        with torch.no_grad(), _checkpoint_routing_scope(ctx._routing_frame, False):
             output = forward_function(hidden_states, *args)
         ctx.save_for_backward(hidden_states)
         ctx.forward_function = forward_function
@@ -656,27 +1168,28 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
 
     @staticmethod
     @torch_amp_custom_bwd
-    def backward(ctx, dY):
+    def backward(ctx, *dY):
         (hidden_states,) = ctx.saved_tensors
         hidden_states = hidden_states.detach()
         hidden_states.requires_grad_(True)
         recompute_args, grad_holders = _detach_checkpoint_args(ctx.args)
-        with torch.enable_grad(), _gradient_checkpoint_recompute_marker():
+        with torch.enable_grad(), _gradient_checkpoint_recompute_marker(ctx.forward_function), \
+                _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True):
             output = ctx.forward_function(hidden_states, *recompute_args)
-        # Layers that return a 1-tuple keep unpacking exactly as before. Layers
-        # that return the tensor itself (Qwen2-VL's vision block, and every
-        # transformers block since the tuple returns were retired) used to raise
-        # `ValueError: too many values to unpack` here, because forward() stored
-        # whatever the layer returned while backward() insisted on a 1-tuple.
-        if isinstance(output, tuple):
-            (output,) = output
-        torch.autograd.backward(output, dY)
+        # Outputs may be one tensor, a tuple or several; backprop only the outputs that received a
+        # grad.
+        outputs = output if isinstance(output, tuple) else (output,)
+        pairs = [(o, g) for o, g in zip(outputs, dY)
+                 if torch.is_tensor(o) and o.requires_grad and g is not None]
+        if not pairs:
+            # As torch's reentrant checkpoint: nothing to backprop is an error, not a step with no gradients.
+            raise RuntimeError("none of output has requires_grad=True, this checkpoint() is not necessary")
+        torch.autograd.backward([o for o, _ in pairs], [g for _, g in pairs])
         # Gradients for the extra inputs are returned to the engine instead of
         # being left to accumulate as a side effect of the nested backward.
         return (None, hidden_states.grad,) + tuple(
             None if holder is None else holder.grad for holder in grad_holders
         )
-    pass
 pass
 
 
@@ -771,7 +1284,6 @@ class _KeywordArgumentCall:
         kwargs = dict(self.constants)
         kwargs.update(zip(self.keys, args[split:]))
         return self.function(*args[:split], **kwargs)
-    pass
 pass
 
 
@@ -816,8 +1328,37 @@ pass
 
 
 @torch._disable_dynamo
+def _pristine_for_compiled_checkpoint(use_reentrant, kwargs):
+    # torch.compile's checkpoint HOP (tag_activation_checkpoint_impl) re-enters torch.utils.checkpoint.checkpoint while
+    # AOT autograd traces it, with use_reentrant = False and a context_fn; the shims must hand that to torch's own.
+    context_fn = kwargs.get("context_fn")
+    if use_reentrant is False and context_fn is not None and context_fn is not torch.utils.checkpoint.noop_context_fn:
+        return getattr(torch.utils.checkpoint, "_unsloth_pristine_checkpoint", None)
+    return None
+pass
+
+
+NO_GRAD_CHECKPOINT_STATS = collections.Counter()   # checkpoint calls run directly under grad off
+
+
+def _call_without_checkpoint(function, *args):
+    """Grad off records no graph, so run the block directly: skips the offload copy, routing /
+    attention frames and layer counters (GRPO / DPO ref logps, eval under no_grad)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    NO_GRAD_CHECKPOINT_STATS["calls"] += 1
+    with _checkpoint_routing_scope(None, False), saved_attention_scope(None, False):
+        return function(*args)
+pass
+
+
+@torch._disable_dynamo
 def unsloth_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
+    pristine = _pristine_for_compiled_checkpoint(use_reentrant, kwargs)
+    if pristine is not None:
+        return pristine(function, *args, use_reentrant = False, **kwargs)
     function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
+    if not torch.is_grad_enabled():
+        return _call_without_checkpoint(function, *args, *tensor_args)
     return Unsloth_Gradient_Checkpointer.apply(function, *args, *tensor_args)
 pass
 
@@ -1181,10 +1722,104 @@ CPU_BUFFERS = []
 CPU_INDEX = None
 GPU_BUFFER_DTYPE = None
 
+# CPU_BUFFERS slots are leased per checkpoint until its backward, so 1F1B schedules (two forwards
+# then two backwards) never reuse a pending slot. Lowest free slot first keeps 1F1B-free runs unchanged.
+_FREE_CPU_SLOTS = []    # min-heap of returned slot indices
+_CPU_SLOT_TOP = 0       # slots [0, _CPU_SLOT_TOP) have been handed out at least once
+_CPU_SLOT_EPOCH = 0     # bumped by every pool reset; a lease from an older epoch is ignored
+# A slot released on one device's side stream and leased on another waits on the release event.
+_SLOT_FENCES = {}       # slot index -> (device index, event recorded at release)
+# A retain_graph=True graph re-reads its slot on the next backward: hold it until the graph is freed.
+_SLOT_HOLDERS = {}      # slot index -> weakref to the autograd ctx whose backward returned it
+_RETAINED_SLOTS = {}    # slot index -> weakref to a ctx whose graph is still retained
+
+
+def _reset_cpu_slots():
+    global _CPU_SLOT_TOP, _CPU_SLOT_EPOCH
+    del _FREE_CPU_SLOTS[:]
+    _CPU_SLOT_TOP = 0
+    _CPU_SLOT_EPOCH += 1
+    _SLOT_FENCES.clear()
+    _SLOT_HOLDERS.clear()
+    _RETAINED_SLOTS.clear()
+pass
+
+
+def _graph_retained(ctx_ref):
+    ctx = ctx_ref()
+    if ctx is None: return False
+    try:
+        ctx._raw_saved_tensors
+    except (RuntimeError, AttributeError):
+        return False
+    return True
+pass
+
+
+def _reclaim_retained_slots():
+    for index, ctx_ref in list(_RETAINED_SLOTS.items()):
+        if not _graph_retained(ctx_ref):
+            del _RETAINED_SLOTS[index]
+            heapq.heappush(_FREE_CPU_SLOTS, index)
+pass
+
+
+class _CpuSlotLease:
+    """One CPU_BUFFERS slot held by an offloaded checkpoint until its backward has read it."""
+    __slots__ = ("index", "epoch", "device", "stream", "slot")
+
+    def __init__(self, device = None, stream = None):
+        global _CPU_SLOT_TOP
+        if _RETAINED_SLOTS: _reclaim_retained_slots()
+        self.index = None
+        while _FREE_CPU_SLOTS:
+            index = heapq.heappop(_FREE_CPU_SLOTS)
+            holder = _SLOT_HOLDERS.pop(index, None)
+            if holder is not None and _graph_retained(holder):
+                _RETAINED_SLOTS[index] = holder
+                continue
+            self.index = index
+            break
+        if self.index is None:
+            self.index = _CPU_SLOT_TOP
+            _CPU_SLOT_TOP += 1
+        self.slot = self.index
+        self.epoch = _CPU_SLOT_EPOCH
+        self.device, self.stream = device, stream
+        fence = _SLOT_FENCES.pop(self.index, None)
+        if fence is not None and fence[0] != device and stream is not None:
+            stream.wait_event(fence[1])
+
+    def release(self, ctx = None):
+        index, self.index = self.index, None
+        if index is None and ctx is not None and self.stream is not None and self.epoch == _CPU_SLOT_EPOCH:
+            # A retained graph's next backward reloads the slot again: fence that reload, not the first.
+            holder = _SLOT_HOLDERS.get(self.slot) or _RETAINED_SLOTS.get(self.slot)
+            if holder is not None and holder() is ctx:
+                _SLOT_FENCES[self.slot] = (self.device, self.stream.record_event())
+        if index is not None and self.epoch == _CPU_SLOT_EPOCH:
+            if self.stream is not None:
+                _SLOT_FENCES[index] = (self.device, self.stream.record_event())
+            if ctx is not None:
+                try:
+                    _SLOT_HOLDERS[index] = weakref.ref(ctx)
+                except TypeError:
+                    pass
+            heapq.heappush(_FREE_CPU_SLOTS, index)
+
+    def __del__(self):
+        try:
+            self.release()
+        except Exception:
+            pass  # interpreter shutdown
+pass
+
 def initialize_unsloth_gradient_checkpointing(dtype = None):
     # All Unsloth Zoo code licensed under LGPLv3
-    global FP32_OFFLOAD_EXACT
-    FP32_OFFLOAD_EXACT = os.environ.get("UNSLOTH_OFFLOAD_FP32", "bf16").lower() == "exact"
+    global FP32_OFFLOAD_EXACT, FP32_OFFLOAD_MODE
+    FP32_OFFLOAD_MODE = _fp32_offload_mode()
+    FP32_OFFLOAD_EXACT = FP32_OFFLOAD_MODE == "exact"
+    _maybe_enable_exact_pinned()
     global GC_PREFETCH
     GC_PREFETCH = os.environ.get("UNSLOTH_GC_PREFETCH", "0") == "1"
     _reset_gc_prefetch_state()
@@ -1208,6 +1843,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     _reset_pinned_cap()
     CPU_BUFFERS = []
     CPU_INDEX = 0
+    _reset_cpu_slots()
 
     if dtype is None:
         if DEVICE_TYPE == "cuda":
@@ -1222,8 +1858,13 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
             # still answers True here, so this is inert until unsloth patches the probe.
             SUPPORTS_BFLOAT16 = torch.cuda.is_bf16_supported()
         elif DEVICE_TYPE == "xpu":
+            # One buffer dtype for the pool below, which covers every visible XPU.
             from .device_type import _xpu_bf16_supported
-            SUPPORTS_BFLOAT16 = _xpu_bf16_supported()
+            try:
+                _xpu_indices = list(range(torch.xpu.device_count()))
+            except Exception:
+                _xpu_indices = None
+            SUPPORTS_BFLOAT16 = _xpu_bf16_supported(_xpu_indices or None)
         elif DEVICE_TYPE == "npu":
             SUPPORTS_BFLOAT16 = torch.npu.is_bf16_supported()
         dtype = torch.bfloat16 if SUPPORTS_BFLOAT16 else torch.float16
@@ -1278,6 +1919,14 @@ pass
 
 
 class UnslothCheckpointFunction(torch.autograd.Function):
+
+    @classmethod
+    def apply(cls, run_function, preserve_rng_state, *args):
+        # Also installed as torch.utils.checkpoint.CheckpointFunction, so pre-bound torch checkpoints land here.
+        if not torch.is_grad_enabled() and not torch.compiler.is_compiling():
+            return _call_without_checkpoint(run_function, *args)
+        return super().apply(run_function, preserve_rng_state, *args)
+    pass
 
     @staticmethod
     def forward(ctx, run_function, preserve_rng_state, *args):
@@ -1342,8 +1991,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                     global CURRENT_GC_INDEX
                     CURRENT_GC_INDEX += 1
 
-                    # The cutoff counts stored bytes, so bf16-stored float32 offloads exactly where it always did.
-                    store_dtype = torch.bfloat16 if (arg.dtype == torch.float32 and not FP32_OFFLOAD_EXACT) else arg.dtype
+                    # The cutoff counts stored bytes: bf16-stored float32 (autocast) offloads exactly where it always
+                    # did; exactly stored float32 (no autocast) counts 4 bytes, so 2-4MB activations now offload too.
+                    store_dtype = _offload_store_dtype(arg)
                     new_size = arg.numel() * store_dtype.itemsize
 
                     global MINIMUM_SIZE
@@ -1364,10 +2014,10 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         MAIN_STREAM  = _compute_stream(device_index)
                         EXTRA_STREAM = EXTRA_STREAMS[device_index]
 
-                        # Handle interrupted training runs
+                        # New graph. Host slots are not rewound: pending graphs keep theirs.
                         if BACKWARD_PASS:
                             BACKWARD_PASS = False
-                            CPU_INDEX = 0
+                            _flush_outgrown_blocks()
                             # A new graph: earlier prefetch descriptors and slot records are stale.
                             global OFFLOAD_GENERATION
                             OFFLOAD_GENERATION += 1
@@ -1391,8 +2041,10 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     _free_gpu_buffers_b()
                         pass
 
+                        lease = _CpuSlotLease(device_index, EXTRA_STREAM)
+                        CPU_INDEX = lease.index
                         # Extend buffer size
-                        if CPU_INDEX >= len(CPU_BUFFERS):
+                        while CPU_INDEX >= len(CPU_BUFFERS):
                             with _no_inference_mode():
                                 x = _new_host_buffer(-(-new_size // GPU_BUFFER.element_size()), GPU_BUFFER.dtype)
                             CPU_BUFFERS.append(x)
@@ -1458,6 +2110,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         while len(OFFLOAD_SLOT_META) <= CPU_INDEX: OFFLOAD_SLOT_META.append(None)
                         OFFLOAD_SLOT_META[CPU_INDEX] = None if ctx._offload_generation is None else \
                             (OFFLOAD_GENERATION, device_index, buffer_slot, new_size, shape, store_dtype)
+                        ctx._cpu_slot = lease
                         CPU_INDEX += 1
                         tensor_inputs.append(None)
 
@@ -1480,7 +2133,10 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         pass
         if ctx._requires_gradient: ctx.save_for_backward(*tensor_inputs)
 
-        with torch.no_grad():
+        ctx._routing_frame = _new_checkpoint_routing_frame(args) if ctx._requires_gradient else None
+        ctx._attention_frame = new_saved_attention_frame(args) if ctx._requires_gradient else None
+        with torch.no_grad(), _checkpoint_routing_scope(ctx._routing_frame, False), \
+                saved_attention_scope(ctx._attention_frame, False):
             outputs = run_function(*args)
 
         if use_gpu_buffer: MAIN_STREAM.wait_stream(EXTRA_STREAM)
@@ -1551,6 +2207,10 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 if in_chain:
                     _prefetch_offloaded_input(CPU_INDEX - 1, device_index, generation, buffer_slot)
             pass
+            # Reload is queued on EXTRA_STREAM, as is the next offload into it: safe to reuse now
+            # unless the graph is retained (checked at lease time).
+            lease = getattr(ctx, "_cpu_slot", None)
+            if lease is not None: lease.release(ctx)
         else:
             # No GPU buffer seen
             if len(tensor_indices) != 0:
@@ -1609,7 +2269,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 detached_inputs[0] = x
             pass
 
-            with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs), _gradient_checkpoint_recompute_marker():  # type: ignore[attr-defined]
+            with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs), _gradient_checkpoint_recompute_marker(ctx.run_function), \
+                    _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True), \
+                    saved_attention_scope(getattr(ctx, "_attention_frame", None), True):  # type: ignore[attr-defined]
                 outputs = ctx.run_function(*detached_inputs)
             pass
         pass
@@ -1652,7 +2314,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         pass
 
         return (None, None) + grads
-    pass
 pass
 
 
@@ -1662,24 +2323,76 @@ def _is_compiling():
 pass
 
 
+GC_OFFLOAD_MIN_BYTES = 0
+_ALL_OFFLOADERS = weakref.WeakSet()
+
+
+def _env_nonnegative_int(name, default):
+    try:
+        return max(0, int(os.environ.get(name, default)))
+    except (TypeError, ValueError):
+        return default
+pass
+
+
+def _new_offload_stats():
+    stats = {"pinned": 0, "pageable": 0, "kept": 0, "prefetched": 0, "prefetch_hits": 0, "forwards": 0,
+             "offloaded": 0, "offloaded_bytes": 0, "restored": 0, "restored_bytes": 0, "prefetched_bytes": 0}
+    for reason in ("small", "expanded"):
+        stats["kept_" + reason] = 0
+        stats["kept_" + reason + "_bytes"] = 0
+    return stats
+pass
+
+
+def _release_keepalive(entry, stream = None):
+    """Drop an inflight D2H source once its packing stream is ordered after the copy."""
+    copied, owner = entry[1], entry[2]
+    if copied is not None: (owner or stream).wait_event(copied)
+    entry[0] = entry[1] = entry[2] = None
+pass
+
+
+class _ForwardOrder(list):
+    """Weak refs to one forward's records in pack order. Records hold their own order, so the offloader keeps only
+    the newest and an abandoned forward's metadata dies with its records."""
+    __slots__ = ("forward_id", "backward_started", "counted", "__weakref__")
+
+    def __init__(self, forward_id = 0):
+        super().__init__()
+        self.forward_id = forward_id
+        self.backward_started = False
+        self.counted = False
+pass
+
+
 class _OffloadedActivation:
     """One saved activation: a host copy (`copied` marks the D2H), or still a device tensor."""
-    __slots__ = ("device", "host", "copied", "device_tensor", "ready", "index", "pinned_bytes", "unpacked", "group", "__weakref__")
+    __slots__ = ("device", "host", "copied", "device_tensor", "ready", "ready_stream", "index", "pinned_bytes",
+                 "unpacked", "group", "keepalive", "order", "nbytes", "__weakref__")
 
-    def __init__(self, device, index):
+    def __init__(self, device, index, order = None):
+        self.order         = order
+        self.nbytes        = 0
         self.device        = device
         self.host          = None
         self.copied        = None
         self.device_tensor = None
         self.ready         = None  # set only on a prefetched device_tensor
+        self.ready_stream  = None  # the stream that allocated it
         self.index         = index
         self.pinned_bytes  = 0
         self.unpacked      = False
         self.group         = 0     # which hooks() entry (checkpoint call) packed it
+        self.keepalive     = None  # its inflight entry: [source, copied, packing stream]
 
     def __del__(self):
         try:
+            # Graph dropped before the keepalive was retired: release the source now, after its copy.
+            if self.keepalive is not None: _release_keepalive(self.keepalive)
             if self.pinned_bytes: _release_pinned(self.pinned_bytes)
+            # Prefetch dropped unread: order the allocating stream after the reload still writing it.
+            if self.ready is not None: self.ready_stream.wait_event(self.ready)
         except Exception:
             pass  # interpreter shutdown
 pass
@@ -1696,6 +2409,9 @@ class NonReentrantActivationOffloader:
     also keeps the last UNSLOTH_GC_STREAM_KEEP_LAST (default 1) activations on the device,
     whose backward comes first, and reloads layer i-1 on a second side stream while layer i
     recomputes. Costs up to one more layer's checkpoint inputs of VRAM each way.
+
+    Saved tensors under UNSLOTH_GC_OFFLOAD_MIN_BYTES (default 0, off) and expanded views stay on
+    the device. Prefetch and keep-last stay inside the forward a record belongs to.
     """
     def __init__(self, stream_mode = None):
         if stream_mode is None:
@@ -1705,94 +2421,213 @@ class NonReentrantActivationOffloader:
             self.keep_last = max(0, int(os.environ.get("UNSLOTH_GC_STREAM_KEEP_LAST", "1")))
         except ValueError:
             self.keep_last = 1
-        # A side stream D2H keeps its device block until the copy ends (record_stream), and
-        # unthrottled copies piled up 2-4 activations of extra VRAM. 0 copies on the compute
-        # stream (no extra VRAM, no overlap, the single GPU default); N > 0 overlaps the next
-        # layers with at most N copies in flight per device (distributed default 1).
+        # 0: copy on the compute stream (single GPU default). N > 0: side stream, at most N sources
+        # kept alive per device, released after the compute stream waits on the copy. No
+        # record_stream on the side stream: its block reuse depends on how far the CPU runs ahead
+        # (distributed default 1).
         default_inflight = 1 if is_distributed() else 0
         try:
             self.max_inflight = max(0, int(os.environ.get("UNSLOTH_GC_MAX_INFLIGHT_COPIES", default_inflight)))
         except ValueError:
             self.max_inflight = default_inflight
+        self.min_bytes = _env_nonnegative_int("UNSLOTH_GC_OFFLOAD_MIN_BYTES", GC_OFFLOAD_MIN_BYTES)
         self.inflight = {}
         self.d2h_streams = {}
         self.h2d_streams = {}
-        # Weak, so a graph dropped without backward frees its activations. Forward order.
-        self.order = []
-        self.backward_started = False
+        self.owned = False
+        self.forward_id = 0
+        # Weak, so a graph dropped without backward frees its activations. Newest forward only.
+        self.order = _ForwardOrder(0)
         self.group = 0
-        self.stats = {"pinned": 0, "pageable": 0, "kept": 0, "prefetched": 0, "prefetch_hits": 0}
+        self.stats = _new_offload_stats()
+        _ALL_OFFLOADERS.add(self)
+    pass
+
+    @property
+    def backward_started(self):
+        return self.order.backward_started
+
+    @backward_started.setter
+    def backward_started(self, value):
+        self.order.backward_started = bool(value)
+
+    def begin_forward(self):
+        self.forward_id += 1
+        # Counted here: an empty order is reused, not replaced.
+        self.stats["forwards"] += 1
+        if len(self.order) or self.order.backward_started:
+            self.order = _ForwardOrder(self.forward_id)
+        self.order.counted = True
+    pass
+
+    def _current_order(self):
+        order = self.order
+        # No owner, no pre-hook: a new forward starts after backward began or the newest record died.
+        if order.backward_started or (not self.owned and len(order) and order[-1]() is None):
+            self.forward_id += 1
+            order = self.order = _ForwardOrder(self.forward_id)
+        if not order.counted:
+            order.counted = True
+            self.stats["forwards"] += 1
+        return order
+    pass
+
+    def _keep_reason(self, x, nbytes):
+        if nbytes < self.min_bytes:
+            return "small"
+        # Expanded views only: a host copy would materialise every repeat. Other views are offloaded, as
+        # they may be the last owner of a larger allocation.
+        try:
+            storage_bytes = x.untyped_storage().nbytes()
+        except Exception:
+            return None
+        if storage_bytes < nbytes:
+            return "expanded"
+        return None
+    pass
+
+    def _keep(self, reason, nbytes):
+        stats = self.stats
+        stats["kept_" + reason] += 1
+        stats["kept_" + reason + "_bytes"] += nbytes
     pass
 
     def _stream(self, cache, device_index):
         stream = cache.get(device_index)
         if stream is None:
-            stream = cache[device_index] = _new_extra_stream(device_index)
+            stream = cache[device_index] = self._new_stream(device_index)
         return stream
     pass
 
+    # Device seams, overridden by the CPU lifecycle tests.
+    def _on_host(self, x):
+        return x.device.type == "cpu"
+
+    def _streamable(self, x):
+        return DEVICE_TYPE in ("cuda", "hip") and x.device.type == "cuda" and not _is_compiling()
+
+    def _new_stream(self, device_index):
+        return _new_extra_stream(device_index)
+
+    def _current_stream(self, device_index):
+        return torch.cuda.current_stream(device_index)
+
+    def _stream_ctx(self, stream):
+        return torch.cuda.stream(stream)
+
+    def _new_event(self):
+        return torch.cuda.Event()
+
+    def _record_stream(self, x, stream):
+        x.record_stream(stream)
+
+    def _host_copy(self, x, non_blocking = True):
+        return x.to("cpu", non_blocking = non_blocking)
+
+    def _device_copy(self, host, device):
+        return host.to(device, non_blocking = True)
+
+    def _empty_on_device(self, host, device):
+        return torch.empty_like(host, device = device)
+
     def _to_host(self, record, x):
         nbytes = x.numel() * x.element_size()
-        if PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled() and _reserve_pinned(nbytes):
-            device_index = x.device.index
-            if self.max_inflight == 0:
-                try:
-                    host = x.to("cpu", non_blocking = True)
-                except RuntimeError as e:
-                    _release_pinned(nbytes)
-                    if not _is_host_alloc_oom(e): raise
-                    _warn_pinned_unavailable(e)
-                else:
-                    record.host, record.pinned_bytes = host, nbytes
-                    self.stats["pinned"] += 1
-                    return
-                record.host = x.to("cpu")
-                self.stats["pageable"] += 1
-                return
-            inflight = self.inflight.setdefault(device_index, [])
-            # Wait on the host for the oldest copies past the limit so their blocks can be reused.
-            while inflight and (len(inflight) >= self.max_inflight or inflight[0].query()):
-                inflight.pop(0).synchronize()
-            side = self._stream(self.d2h_streams, device_index)
-            side.wait_stream(torch.cuda.current_stream(device_index))
+        if PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled():
+            with _PINNED_LOCK:  # held through allocation: no double-spent headroom
+                if _reserve_pinned(nbytes) and self._to_pinned(record, x, nbytes): return
+        record.host = self._host_copy(x, non_blocking = False)
+        self.stats["pageable"] += 1
+        self._count_offload(nbytes)
+    pass
+
+    def _count_offload(self, nbytes):
+        stats = self.stats
+        stats["offloaded"] += 1
+        stats["offloaded_bytes"] += nbytes
+    pass
+
+    def _to_pinned(self, record, x, nbytes):
+        """Non_blocking D2H into a pinned block already reserved; False (released) if pinning failed."""
+        device_index = x.device.index
+        if self.max_inflight == 0:
             try:
-                with torch.cuda.stream(side):
-                    # A non_blocking D2H allocates its destination pinned.
-                    host = x.to("cpu", non_blocking = True)
-                    copied = torch.cuda.Event()
-                    copied.record(side)
+                host = self._host_copy(x)
             except RuntimeError as e:
                 _release_pinned(nbytes)
                 if not _is_host_alloc_oom(e): raise
                 _warn_pinned_unavailable(e)
-            else:
-                # The caller drops x next; its block must outlive the copy.
-                x.record_stream(side)
-                inflight.append(copied)
-                record.host, record.copied, record.pinned_bytes = host, copied, nbytes
-                self.stats["pinned"] += 1
-                return
-        record.host = x.to("cpu")
-        self.stats["pageable"] += 1
+                return False
+            record.host, record.pinned_bytes = host, nbytes
+            self.stats["pinned"] += 1
+            self._count_offload(nbytes)
+            return True
+        inflight = self.inflight.get(device_index)
+        if inflight is None:
+            inflight = self.inflight[device_index] = collections.deque()
+        compute = self._current_stream(device_index)
+        self._retire(inflight, compute, self.max_inflight - 1)
+        side = self._stream(self.d2h_streams, device_index)
+        side.wait_stream(compute)
+        try:
+            with self._stream_ctx(side):
+                host = self._host_copy(x)
+                copied = self._new_event()
+                copied.record(side)
+        except RuntimeError as e:
+            _release_pinned(nbytes)
+            if not _is_host_alloc_oom(e): raise
+            _warn_pinned_unavailable(e)
+            return False
+        else:
+            # Keepalive: x's block must outlive the copy; record_stream is a no-op on its own stream.
+            self._record_stream(x, compute)
+            entry = [x, copied, compute]
+            inflight.append(entry)
+            record.host, record.copied, record.pinned_bytes, record.keepalive = host, copied, nbytes, entry
+            self.stats["pinned"] += 1
+            self._count_offload(nbytes)
+            return True
+    pass
+
+    @staticmethod
+    def _retire(inflight, compute, keep):
+        while inflight and (len(inflight) > keep or inflight[0][1] is None or inflight[0][1].query()):
+            _release_keepalive(inflight.popleft(), compute)
+    pass
+
+    def _drain(self):
+        """Release every keepalive (backward reads the host copies after waiting on them)."""
+        for device_index, inflight in self.inflight.items():
+            if inflight: self._retire(inflight, self._current_stream(device_index), 0)
     pass
 
     def pack(self, x):
-        if not x.requires_grad or x.device.type == "cpu":
+        if not x.requires_grad or self._on_host(x):
             return None, x
-        if DEVICE_TYPE not in ("cuda", "hip") or x.device.type != "cuda" or _is_compiling():
+        if _is_compiling():
+            # Traced: no size or storage checks, which would add guards on symbolic shapes.
             return x.device, x.to("cpu", non_blocking = True)
-        if self.backward_started:
-            self.backward_started = False
-            self.order = []
-        record = _OffloadedActivation(x.device, len(self.order))
+        nbytes = x.numel() * x.element_size()
+        reason = self._keep_reason(x, nbytes)
+        if reason is not None:
+            self._keep(reason, nbytes)
+            # Detached: an op that saves its own output would otherwise hold itself through its grad_fn.
+            return None, x.detach()
+        if not self._streamable(x):
+            self._count_offload(nbytes)
+            # The third item marks an eager copy, so unpack counts its restore.
+            return x.device, x.to("cpu", non_blocking = True), nbytes
+        order = self._current_order()
+        record = _OffloadedActivation(x.device, len(order), order)
         record.group = self.group
-        self.order.append(weakref.ref(record))
+        record.nbytes = nbytes
+        order.append(weakref.ref(record))
         x = x.detach()
         if self.stream_mode and self.keep_last > 0:
             record.device_tensor = x
             self.stats["kept"] += 1
             if record.index >= self.keep_last:
-                older = self.order[record.index - self.keep_last]()
+                older = order[record.index - self.keep_last]()
                 if older is not None and older.host is None and older.device_tensor is not None:
                     self._to_host(older, older.device_tensor)
                     older.device_tensor = None
@@ -1802,43 +2637,46 @@ class NonReentrantActivationOffloader:
         return record
     pass
 
-    def _prefetch(self, index):
-        if index < 0 or index >= len(self.order): return
-        record = self.order[index]()
+    def _prefetch(self, index, order = None):
+        if order is None: order = self.order
+        if index < 0 or index >= len(order): return
+        record = order[index]()
         # A checkpoint with several saved inputs unpacks them in order, so index - 1 can be an
         # input of the same checkpoint that was already handed out: reloading it duplicates it.
         if record is None or record.unpacked or record.host is None or record.device_tensor is not None: return
         device_index = record.device.index
-        compute = torch.cuda.current_stream(device_index)
+        compute = self._current_stream(device_index)
         side = self._stream(self.h2d_streams, device_index)
         # Allocated on the compute stream, which consumes it; the side stream waits for
         # that stream's earlier users of the block and for this record's D2H.
         try:
-            x = torch.empty_like(record.host, device = record.device)
+            x = self._empty_on_device(record.host, record.device)
         except torch.cuda.OutOfMemoryError:
             return  # unpack reloads it in place instead
         side.wait_stream(compute)
         if record.copied is not None: side.wait_event(record.copied)
-        with torch.cuda.stream(side):
+        with self._stream_ctx(side):
             x.copy_(record.host, non_blocking = True)
-            ready = torch.cuda.Event()
+            ready = self._new_event()
             ready.record(side)
-        x.record_stream(side)
-        record.device_tensor, record.ready = x, ready
+        # No record_stream: compute waits on `ready` in unpack, or in __del__ if never read.
+        record.device_tensor, record.ready, record.ready_stream = x, ready, compute
         self.stats["prefetched"] += 1
+        self.stats["prefetched_bytes"] += record.nbytes
     pass
 
-    def _prefetch_target(self, index, group):
+    def _prefetch_target(self, index, group, order = None):
         """The newest record before `index` still to be reloaded. A checkpoint with several saved
         inputs unpacks them back to back: skipping its own handed out inputs and the ones already
         prefetched makes each unpack queue one input of the previous checkpoint, so all of them
         are reloaded early, not only the one at index - 1. Single input checkpoints get index - 1.
         Never past the previous checkpoint, so at most its inputs wait on the device, and only
         index - 1 when the hooks were not entered per checkpoint (one group for every record)."""
+        if order is None: order = self.order
         start = index - 1
         index = start
         while index >= 0:
-            record = self.order[index]() if index < len(self.order) else None
+            record = order[index]() if index < len(order) else None
             if record is not None and (record.group < group - 1 or (
                 record.group == group and not record.unpacked and index != start
             )):
@@ -1850,43 +2688,112 @@ class NonReentrantActivationOffloader:
 
     def unpack(self, packed):
         if type(packed) is tuple:
-            device, x = packed
-            return x if device is None else x.to(device, non_blocking = True)
+            device, x = packed[0], packed[1]
+            if device is None: return x
+            if len(packed) == 3: self._count_restore(packed[2])
+            return x.to(device, non_blocking = True)
         record = packed
-        self.backward_started = True
+        order = record.order
+        if order is None: order = self.order
+        if not order.backward_started: self._drain()
+        order.backward_started = True
         record.unpacked = True
         device_index = record.device.index
-        compute = torch.cuda.current_stream(device_index)
+        compute = self._current_stream(device_index)
         if record.device_tensor is not None:
             x = record.device_tensor
             if record.ready is not None:
                 compute.wait_event(record.ready)
+                # Consumed on another stream than it was allocated on: its free must wait for this one.
+                if compute != record.ready_stream: self._record_stream(x, compute)
                 # One shot: a retain_graph rerun reloads from the host copy.
-                record.device_tensor, record.ready = None, None
+                record.device_tensor, record.ready, record.ready_stream = None, None, None
                 self.stats["prefetch_hits"] += 1
+                self._count_restore(record.nbytes)
         else:
             if record.copied is not None: compute.wait_event(record.copied)
-            x = record.host.to(record.device, non_blocking = True)
-        if self.stream_mode: self._prefetch(self._prefetch_target(record.index, record.group))
+            x = self._device_copy(record.host, record.device)
+            self._count_restore(record.nbytes)
+        if self.stream_mode: self._prefetch(self._prefetch_target(record.index, record.group, order), order)
         return x
+    pass
+
+    def _count_restore(self, nbytes):
+        stats = self.stats
+        stats["restored"] += 1
+        stats["restored_bytes"] += nbytes
     pass
 
     def hooks(self):
         # One call per checkpoint (vision.py wraps each checkpoint call): groups its saved inputs.
         self.group += 1
         return torch.autograd.graph.saved_tensors_hooks(self.pack, self.unpack)
-    pass
 pass
 
 
 NONREENTRANT_OFFLOADER = None
+# Weak keys: the offloader never refers back to its owner.
+_OWNED_OFFLOADERS = weakref.WeakKeyDictionary()
+_OWNED_OFFLOADERS_LOCK = threading.Lock()
 
-def non_reentrant_offload_hooks():
+
+def _new_activation_offloader():
+    return NonReentrantActivationOffloader()
+pass
+
+
+def _begin_forward_hook(module, args):
+    # Module level and looked up per call: the model stays picklable and a copy never drives the original's.
+    if _is_compiling(): return
+    offloader = _OWNED_OFFLOADERS.get(module)
+    if offloader is not None: offloader.begin_forward()
+pass
+
+
+def activation_offloader_for(owner):
+    """
+    All Unsloth Zoo code licensed under LGPLv3
+    Per-owner offloader, created on first use, so two models never touch each other's saved inputs.
+    """
+    with _OWNED_OFFLOADERS_LOCK:
+        offloader = _OWNED_OFFLOADERS.get(owner)
+        if offloader is None:
+            offloader = _new_activation_offloader()
+            offloader.owned = hasattr(owner, "register_forward_pre_hook")
+            # A copied or unpickled model already carries the hook.
+            if offloader.owned and _begin_forward_hook not in getattr(owner, "_forward_pre_hooks", {}).values():
+                owner.register_forward_pre_hook(_begin_forward_hook)
+            _OWNED_OFFLOADERS[owner] = offloader
+    return offloader
+pass
+
+
+def non_reentrant_offload_hooks(owner = None):
     """saved_tensors_hooks context that offloads non-reentrant checkpoint inputs to the host."""
+    if owner is not None:
+        return activation_offloader_for(owner).hooks()
     global NONREENTRANT_OFFLOADER
     if NONREENTRANT_OFFLOADER is None:
-        NONREENTRANT_OFFLOADER = NonReentrantActivationOffloader()
+        NONREENTRANT_OFFLOADER = _new_activation_offloader()
     return NONREENTRANT_OFFLOADER.hooks()
+pass
+
+
+def get_activation_offload_stats(reset = False):
+    """
+    All Unsloth Zoo code licensed under LGPLv3
+    Counters summed over every live non-reentrant offloader: tensors and bytes offloaded / restored, prefetches
+    and their hits, and what stayed on the device and why (kept_small, kept_expanded).
+    "forwards": owned = every model forward, unowned = once per inferred forward.
+    `reset = True` zeroes them after reading.
+    """
+    total = _new_offload_stats()
+    for offloader in list(_ALL_OFFLOADERS):
+        for key, value in offloader.stats.items():
+            total[key] = total.get(key, 0) + value
+        if reset:
+            offloader.stats = _new_offload_stats()
+    return total
 pass
 
 
@@ -1928,6 +2835,14 @@ def unsloth_checkpoint(
     Returns:
         Output of running :attr:`function` on :attr:`*args`.
     """
+    pristine = _pristine_for_compiled_checkpoint(
+        use_reentrant, dict(kwargs, context_fn = context_fn),
+    )
+    if pristine is not None:
+        return pristine(
+            function, *args, use_reentrant = False, context_fn = context_fn,
+            determinism_check = determinism_check, debug = debug, **kwargs
+        )
     # Force use_reentrant=True so UnslothCheckpointFunction (smart CPU offloading)
     # is always used. This is safe because unsloth_checkpoint is only active when
     # smart GC is patched; when unpatched, the original torch checkpoint is restored.
@@ -1954,6 +2869,8 @@ def unsloth_checkpoint(
                 "Passing `context_fn` or `debug` is only supported when "
                 "use_reentrant=False."
             )
+        if not torch.is_grad_enabled():
+            return _call_without_checkpoint(function, *args)
         return UnslothCheckpointFunction.apply(function, preserve, *args)
     else:
         gen = _checkpoint_without_reentrant_generator(
@@ -1989,6 +2906,8 @@ def patch_unsloth_smart_gradient_checkpointing(dtype = None):
     # torch.utils.checkpoint may already be patched while this one is not.
     import transformers.modeling_utils
     transformers.modeling_utils.checkpoint = unsloth_checkpoint
+    if save_attention_enabled():
+        patch_transformers_saved_attention()
 pass
 
 
@@ -2017,6 +2936,7 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         if GPU_BUFFERS_B is not None:
             _free_gpu_buffers_b()
         CPU_BUFFERS = None
+        _reset_cpu_slots()
         GPU_BUFFERS = None
         BUFFER_EVENTS_A = None
         BUFFER_EVENTS_B = None
@@ -2102,6 +3022,7 @@ def reset_unsloth_gradient_checkpointing_buffers():
 
     # Reset state for a fresh training run
     CPU_INDEX = 0
+    _reset_cpu_slots()
     BACKWARD_PASS = True
     _reset_gc_prefetch_state()
     LAST_GC_INDEX = 0
@@ -2147,14 +3068,18 @@ pass
 @torch._disable_dynamo
 def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
     global CPU_BUFFERS
+    pristine = _pristine_for_compiled_checkpoint(use_reentrant, kwargs)
+    if pristine is not None:
+        return pristine(function, *args, use_reentrant = False, **kwargs)
+    preserve = kwargs.pop("preserve_rng_state", True)
+    function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
+    if not torch.is_grad_enabled():
+        return _call_without_checkpoint(function, *args, *tensor_args)
     # Not `len(...) == 0`: unpatch_unsloth_smart_gradient_checkpointing sets CPU_BUFFERS
     # to None, which is the state this shim normally starts from, and len(None) raises.
     if not CPU_BUFFERS:
         initialize_unsloth_gradient_checkpointing(args[0].dtype)
-    preserve = kwargs.pop("preserve_rng_state", True)
-    function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
     return UnslothCheckpointFunction.apply(function, preserve, *args, *tensor_args)
-pass
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.

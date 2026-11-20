@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Expert LoRA GEMMs run in the adapter's dtype: fp16 adapters on T4 met bf16 matmul_ogs rows and grouped_mm
-raised a dtype mismatch. CPU only."""
+"""Expert LoRA GEMMs run in the adapter's dtype (fp16 adapters on T4 met bf16 matmul_ogs rows and grouped_mm raised a dtype mismatch); CPU only."""
 
 import types
 
