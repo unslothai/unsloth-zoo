@@ -6209,11 +6209,46 @@ def _batchnorm_input_needs_cast(module, tensor):
     return not native
 
 
+def _no_autocast_device_types():
+    # Device types torch.is_autocast_enabled raises on (meta; mps on torch 2.4).
+    # A denylist so a renamed privateuse1 backend is still asked.
+    names = (
+        "cpu", "cuda", "mkldnn", "opengl", "opencl", "ideep", "hip", "fpga",
+        "maia", "xla", "vulkan", "metal", "xpu", "mps", "meta", "hpu", "ve",
+        "lazy", "ipu", "mtia", "privateuseone",
+    )
+    found = []
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # "mkldnn" is deprecated
+        for name in names:
+            try:
+                torch.is_autocast_enabled(name)
+            except Exception:
+                found.append(name)
+    return tuple(found)
+
+
+_NO_AUTOCAST_DEVICE_TYPES = _no_autocast_device_types()
+
+
+def _conv_autocast_eligible(tensor, weight):
+    # Autocast lowers a conv only when it is enabled on this device and both operands are real
+    # fp32 / fp16 / bf16 (float64, complex and integer ops keep their dtype).
+    return (
+        tensor.device.type not in _NO_AUTOCAST_DEVICE_TYPES
+        and torch.is_autocast_enabled(tensor.device.type)
+        and tensor.dtype in (torch.float32, torch.float16, torch.bfloat16)
+        and weight.dtype in (torch.float32, torch.float16, torch.bfloat16)
+    )
+
+
 def _dtype_safe_forward(original_forward, is_conv, disable, is_batchnorm = False):
     """The dtype casts of the source rewrite, without needing the source.
 
     Same three shapes: a conv casts its input to the weight dtype and the
-    result back; an eager norm does the same but only when it is affine; a
+    result back (to autocast's dtype under autocast, as stock conv does);
+    an eager norm does the same but only when it is affine; a
     compiled norm only casts the result, since casting in changes batched
     numerics.
 
@@ -6239,6 +6274,8 @@ def _dtype_safe_forward(original_forward, is_conv, disable, is_batchnorm = False
             return original_forward(self, *args, **kwargs)
         original_dtype = tensor.dtype
         if is_conv:
+            if _conv_autocast_eligible(tensor, self.weight):
+                original_dtype = torch.get_autocast_dtype(tensor.device.type)
             tensor = tensor.to(self.weight.dtype)
         elif disable and getattr(self, "weight", None) is not None:
             tensor = tensor.to(self.weight.dtype)
@@ -6357,7 +6394,9 @@ def _patch_torch_dtype_modules(
                 # Conv modules: cast input to weight dtype before the conv op,
                 # then cast output back to original input dtype. This prevents
                 # dtype mismatches under mixed-precision autocast (eg bf16
-                # weight + fp16 input crashes F.conv1d).
+                # weight + fp16 input crashes F.conv1d). Under autocast, return
+                # autocast's dtype as stock conv does, so float32 input_features
+                # don't keep the conv stem in float32.
                 lines = source.split("\n")
                 def_line = lines[0]
                 body_lines = lines[1:]
@@ -6365,11 +6404,16 @@ def _patch_torch_dtype_modules(
                 body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
                 prologue = [
                     body_indent + "original_dtype = input.dtype",
+                    body_indent + "if _conv_autocast_eligible(input, self.weight): "
+                    "original_dtype = torch.get_autocast_dtype(input.device.type)",
                     body_indent + "input = input.to(self.weight.dtype)",
                 ]
                 source = "\n".join([def_line] + prologue + body_lines)
                 append_str = ".to(original_dtype)\n"
+                # Imported, not baked in: it depends on the installed torch.
+                extra_prepend = "from unsloth_zoo.compiler import _conv_autocast_eligible\n"
             else:
+                extra_prepend = ""
                 # Norm modules: detect the actual parameter name (input or x)
                 import re as _re
                 m = _re.search(r"def forward\(self,\s*(\w+)", source)
@@ -6411,7 +6455,8 @@ def _patch_torch_dtype_modules(
                 model_location,
                 functions,
                 prepend=_license_header
-                + f"\ntorch_compile_options = {torch_compile_options}\n",
+                + f"\ntorch_compile_options = {torch_compile_options}\n"
+                + extra_prepend,
                 append=append_str,
                 overwrite=False,
                 add_torch_compile=False,
