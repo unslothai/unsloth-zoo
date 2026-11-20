@@ -138,14 +138,22 @@ _AUTO_MARGIN_FRACTION = 0.06
 def _device_peak(device):
     if device.type != "cuda":
         return None
-    return torch.cuda.memory_stats_as_nested_dict(device)["allocated_bytes"]["all"]["peak"]
+    try:
+        return torch.cuda.memory_stats_as_nested_dict(device)["allocated_bytes"]["all"]["peak"]
+    except Exception:
+        # No allocator statistics (a global CUDAPluggableAllocator raises from getDeviceStats):
+        # nothing is kept, the call recomputes as with saved attention off.
+        return None
 
 
 def _device_capacity(device):
     if device.type != "cuda":
         return None
-    free, total = torch.cuda.mem_get_info(device)
-    capacity = free + torch.cuda.memory_reserved(device)
+    try:
+        free, total = torch.cuda.mem_get_info(device)
+        capacity = free + torch.cuda.memory_reserved(device)
+    except Exception:
+        return None
     get_fraction = getattr(torch.cuda, "get_per_process_memory_fraction", None)
     if get_fraction is not None:
         try:
@@ -158,7 +166,10 @@ def _device_capacity(device):
 def _device_allocated(device):
     if device.type != "cuda":
         return None
-    return torch.cuda.memory_allocated(device)
+    try:
+        return torch.cuda.memory_allocated(device)
+    except Exception:
+        return None
 
 
 def _observe(budget, device):
@@ -205,6 +216,9 @@ def _auto_admit(frame, tensors):
         SAVED_ATTENTION_STATS["declined_unmeasured"] += 1
         return False
     capacity = budget.capacity
+    if capacity is None:
+        SAVED_ATTENTION_STATS["declined_budget"] += 1
+        return False
     margin = max(_AUTO_MARGIN_BYTES, int(capacity * _AUTO_MARGIN_FRACTION))
     if budget.live + estimate > capacity - margin - _expected_peak(budget):
         SAVED_ATTENTION_STATS["declined_budget"] += 1
