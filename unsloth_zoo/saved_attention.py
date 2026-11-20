@@ -112,8 +112,13 @@ class _Budget:
     The peak without kept outputs is learnt from the allocator's running peak (never reset): every
     change of the kept bytes is preceded by a reading, so a new peak is charged with exactly the
     bytes kept at that time. Nothing is kept for a call larger than any call already seen through a
-    whole step (its peak is not known yet)."""
-    __slots__ = ("live", "seen_peak", "base_peak", "measured", "capacity")
+    whole step (its peak is not known yet).
+
+    The floor (allocated bytes at the start of a step, read with the capacity) is remembered with the
+    learnt peak: state allocated after that peak was reached (AdamW moments created by the first
+    optimizer step, gradients kept across accumulation steps) raises the floor and lifts the expected
+    peak by the same amount until a step with that state has been measured."""
+    __slots__ = ("live", "seen_peak", "base_peak", "measured", "capacity", "floor", "peak_floor")
 
     def __init__(self):
         self.live = 0
@@ -121,6 +126,8 @@ class _Budget:
         self.base_peak = None
         self.measured = 0
         self.capacity = None
+        self.floor = None
+        self.peak_floor = None
 
 
 _BUDGETS = {}
@@ -148,6 +155,12 @@ def _device_capacity(device):
     return capacity
 
 
+def _device_allocated(device):
+    if device.type != "cuda":
+        return None
+    return torch.cuda.memory_allocated(device)
+
+
 def _observe(budget, device):
     peak = _device_peak(device)
     if peak is None:
@@ -155,9 +168,18 @@ def _observe(budget, device):
     if peak != budget.seen_peak:
         # Also after a reset of the peak stats: the new peak is still charged with today's kept bytes.
         without = peak - budget.live
-        budget.base_peak = without if budget.base_peak is None else max(budget.base_peak, without)
+        if budget.base_peak is None or without > budget.base_peak:
+            budget.base_peak = without
+            budget.peak_floor = budget.floor  # the last floor read before this peak was seen
         budget.seen_peak = peak
     return True
+
+
+def _expected_peak(budget):
+    """The learnt peak, lifted by whatever the floor gained since that peak was reached."""
+    if budget.floor is None or budget.peak_floor is None:
+        return budget.base_peak
+    return budget.base_peak + max(budget.floor - budget.peak_floor, 0)
 
 
 def _auto_admit(frame, tensors):
@@ -174,12 +196,17 @@ def _auto_admit(frame, tensors):
         return False
     if budget.live == 0 or budget.capacity is None:
         budget.capacity = _device_capacity(query.device)
+        allocated = _device_allocated(query.device)
+        if allocated is not None:
+            budget.floor = allocated - budget.live
+            if budget.peak_floor is None:
+                budget.peak_floor = budget.floor  # a peak seen before any floor reading
     if estimate > budget.measured:
         SAVED_ATTENTION_STATS["declined_unmeasured"] += 1
         return False
     capacity = budget.capacity
     margin = max(_AUTO_MARGIN_BYTES, int(capacity * _AUTO_MARGIN_FRACTION))
-    if budget.live + estimate > capacity - margin - budget.base_peak:
+    if budget.live + estimate > capacity - margin - _expected_peak(budget):
         SAVED_ATTENTION_STATS["declined_budget"] += 1
         return False
     return True
