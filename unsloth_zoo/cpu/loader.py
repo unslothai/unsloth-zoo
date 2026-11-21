@@ -16,6 +16,7 @@
 
 __all__ = ["FastCPUModel"]
 
+import contextlib
 import functools
 import os
 import re
@@ -286,6 +287,32 @@ def _is_control_flow(error):
     return stop is not None and isinstance(error, stop)
 
 
+def _first_error_line(error, limit):
+    """Dynamo's BackendCompilerFailed reads "backend='inductor' raised:" on its first line; the cause is the next one."""
+    lines = [line.strip() for line in str(error).strip().splitlines() if line.strip()]
+    if len(lines) > 1 and lines[0].endswith(":"):
+        return f"{lines[0]} {lines[1]}"[:limit]
+    return lines[0][:limit] if lines else ""
+
+
+@contextlib.contextmanager
+def _backward_lowered_in_forward():
+    """AOTAutograd lowers the backward graph lazily, at the first backward, when the forward saves no symbolic sizes,
+    and re-defers it after a failed eager attempt otherwise; a backward that cannot build would then raise from
+    loss.backward(), out of reach of the fallback. Forcing the lowering into the forward call puts it inside it.
+    Entered only with grad enabled (no backward graph otherwise), so generate() and eval skip it."""
+    config = getattr(getattr(torch, "_functorch", None), "config", None)
+    if config is None or not hasattr(config, "force_non_lazy_backward_lowering"):
+        yield  # older torch: a backward lowering error still surfaces in backward
+        return
+    previous = config.force_non_lazy_backward_lowering
+    config.force_non_lazy_backward_lowering = True
+    try:
+        yield
+    finally:
+        config.force_non_lazy_backward_lowering = previous
+
+
 def _fall_back_to_eager_on_compile_error(layers):
     """The toolchain probe compiles one small kernel; a decoder layer can still fail to trace or build (an op or a
     patched module Dynamo / Inductor cannot handle; Dynamo can raise plain AssertionErrors). The first failure of a
@@ -297,9 +324,8 @@ def _fall_back_to_eager_on_compile_error(layers):
     def disable(error):
         if not state["eager"]:
             state["eager"] = True
-            message = str(error).strip().splitlines()
             _print(f"torch.compile failed on a decoder layer ({type(error).__name__}: "
-                   f"{message[0][:160] if message else ''}), training eagerly.")
+                   f"{_first_error_line(error, 160)}), training eagerly.")
         for layer in layers:
             layer._compiled_call_impl = None
 
@@ -312,7 +338,10 @@ def _fall_back_to_eager_on_compile_error(layers):
             if state["eager"]:
                 return _layer._call_impl(*args, **kwargs)
             try:
-                return _compiled(*args, **kwargs)
+                if not torch.is_grad_enabled():
+                    return _compiled(*args, **kwargs)
+                with _backward_lowered_in_forward():
+                    return _compiled(*args, **kwargs)
             except Exception as error:
                 if _is_control_flow(error):
                     raise
@@ -384,8 +413,7 @@ def _cpu_compile_unavailable():
             return "probe kernel gave wrong results"
         return None
     except Exception as error:
-        message = str(error).strip().splitlines()
-        return f"{type(error).__name__}: {message[0][:200] if message else ''}"
+        return f"{type(error).__name__}: {_first_error_line(error, 200)}"
     finally:
         try:
             torch._dynamo.reset()

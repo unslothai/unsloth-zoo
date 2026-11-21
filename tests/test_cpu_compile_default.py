@@ -251,3 +251,37 @@ def test_compile_gate_not_installed_when_overridden(monkeypatch):
         t = T()
         t.model = model
         assert trainer._install_compile_gate(t) is None
+
+
+def test_backward_only_compile_error_falls_back_to_eager(monkeypatch, capsys):
+    """A layer whose forward lowers but whose backward cannot: AOTAutograd would defer that failure to
+    loss.backward(), past the fallback. The guarded call lowers the backward inside the forward instead."""
+    import torch._functorch.config as functorch_config
+    from unsloth_zoo.cpu import loader
+    if not hasattr(functorch_config, "force_non_lazy_backward_lowering"):
+        pytest.skip("this torch always lowers the backward lazily")
+    if loader._cpu_compile_unavailable() is not None:
+        pytest.skip("no C++ toolchain for Inductor here")
+    import torch._inductor.compile_fx as compile_fx
+    original = compile_fx._compile_fx_inner
+
+    def backward_fails(*args, **kwargs):
+        if kwargs.get("is_backward"):
+            raise RuntimeError("backward lowering failed")
+        return original(*args, **kwargs)
+    monkeypatch.setattr(compile_fx, "_compile_fx_inner", backward_fails)
+    from peft import LoraConfig, get_peft_model
+    torch._dynamo.reset()
+    torch.manual_seed(0)
+    model = _tiny_model()
+    model.config.use_cache = False
+    assert loader._compile_layers(model) == len(model.model.layers)
+    lora = get_peft_model(model, LoraConfig(r = 4, target_modules = ["q_proj"]))
+    ids = torch.randint(3, 1000, (2, 11), generator = torch.Generator().manual_seed(0))
+    try:
+        lora(input_ids = ids, labels = ids, use_cache = False).loss.backward()
+    finally:
+        torch._dynamo.reset()
+    assert all(layer._compiled_call_impl is None for layer in model.model.layers)
+    out = capsys.readouterr().out
+    assert "training eagerly" in out and "backward lowering failed" in out
