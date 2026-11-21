@@ -687,8 +687,9 @@ def _kept_set_sparse_max_density():
         return _KEPT_SET_SPARSE_MAX_DENSITY
 
 
-# Union / vocab above this runs the dense backward (crossover measured on an L4, Qwen3 vocab).
-_KEPT_SET_SPARSE_MAX_DENSITY = 0.6
+# Union / vocab above this runs the dense backward. L4, Qwen3 head, 441-row chunks: the sparse backward is faster up
+# to a 0.81 union (94 vs 114 ms) but its transients pass the dense ones near 0.5 (764 vs 602 MiB at 0.63).
+_KEPT_SET_SPARSE_MAX_DENSITY = 0.45
 
 
 def _kept_set_save(keep, sparse, z = None, logits = None, logits_dtype = None):
