@@ -211,11 +211,12 @@ class _Layer(nn.Module):
         super().__init__()
         self.w = nn.Linear(d, d, bias = False, dtype = torch.bfloat16).requires_grad_(False)
         self.up = nn.Linear(d, 2 * d, bias = bias, dtype = torch.bfloat16).requires_grad_(False)
-        self.norm = nn.Parameter(torch.ones(d, dtype = torch.bfloat16), requires_grad = False)
+        # Named like a norm's `.weight` (real models: input_layernorm.weight).
+        self.norm_weight = nn.Parameter(torch.ones(d, dtype = torch.bfloat16), requires_grad = False)
         self.lora_A = nn.Parameter(torch.randn(d, 8, dtype = torch.bfloat16) * 0.01)
 
     def forward(self, x):
-        h = x * self.norm
+        h = x * self.norm_weight
         h = self.w(h) + (h @ self.lora_A) @ self.lora_A.t()
         return x + self.up(torch.tanh(h)).view(*x.shape, 2).sum(-1)
 
