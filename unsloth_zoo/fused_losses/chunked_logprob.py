@@ -124,7 +124,7 @@ _eager = set()
 
 def _device_scalars(values, device):
     """A small float32 vector on `device` without a host sync: staged in pinned memory, copied without blocking."""
-    host = torch.tensor(values, dtype = torch.float32)
+    host = torch.tensor(values, dtype = torch.float32, )
     if device.type != "cuda" or not torch.cuda.is_available():
         return host.to(device)
     return host.pin_memory().to(device, non_blocking = True)
