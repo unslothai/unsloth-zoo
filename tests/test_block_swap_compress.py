@@ -288,6 +288,8 @@ def test_peft_adapter_state_dict_skips_decoding(monkeypatch):
 
 def test_compressed_swap_under_torch_compile_adds_no_graph_breaks(monkeypatch):
     _cuda()
+    if not C.triton_decode_available():
+        pytest.skip("no Triton: Inductor cannot compile here, and compression stays off")
     import torch._dynamo as dynamo
     from torch._dynamo.utils import counters
 
