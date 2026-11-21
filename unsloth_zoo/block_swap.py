@@ -1006,6 +1006,13 @@ class BlockSwap:
                 return False
         return True
 
+    def _release_decoders(self):
+        """Drop every decoder's GPU buffers (callers drained the decode streams first)."""
+        self._decoders = {}
+        for b in self.blocks:
+            if getattr(b, "decoders", None) is not None:
+                b.decoders = None
+
     def _build_decoders(self):
         used = {d for b in self.blocks for d, c in b.codec.items() if c is not None}
         self._decoders = {d: dec for d, dec in self._decoders.items() if d in used}
@@ -1433,6 +1440,10 @@ class BlockSwap:
                             if oom:
                                 # Outside the except block, so its traceback no longer holds the decoded region.
                                 # No room for a decoded region beside the weights: decode on the host, upload each.
+                                # The decode streams were drained above, so their staging ring and aux buffers can
+                                # go now (the rest of the restore decodes on the host); empty_cache can then hand
+                                # their memory to the uploads.
+                                self._release_decoders()
                                 torch.cuda.empty_cache()
                                 c = b.codec.get(d)
                                 restore(_codec().decode_region_cpu(c, b.host_buf[d]) if c is not None else b.host_buf[d])

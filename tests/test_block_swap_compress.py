@@ -212,6 +212,51 @@ def test_packing_keeps_the_encoder_scratch_in_the_published_reservation(monkeypa
     assert seen == [sw._host_walk.pending(0) + 1000, sw._host_walk.pending(1), sw._host_walk.pending(2)]
 
 
+def test_remove_releases_decoder_buffers_before_the_host_decode_retry(monkeypatch):
+    # A card where the restored weights fit but not beside the staging ring + aux buffers: the GPU decode OOMs,
+    # and the host-decode uploads only fit once every reference to the decoders (controller and blocks) is gone.
+    raw = _weights(2 * C.GROUP)
+    codec, blob = _encode(raw, chunk = C.GROUP)
+    from types import SimpleNamespace
+    decoders = {torch.device("cpu"): SimpleNamespace(stream = SimpleNamespace(device = torch.device("cpu")))}
+
+    class FakeBlock:
+        resident = False
+
+        def __init__(self):
+            self.codec = {torch.device("cpu"): codec}
+            self.host_buf = {torch.device("cpu"): blob}
+            self.decoders = decoders
+            self.params = [nn.Parameter(torch.empty(0, dtype = torch.bfloat16), requires_grad = False)]
+            self.devices = [torch.device("cpu")]
+            self.sig = [((raw.numel() // 2,), torch.bfloat16, torch.device("cpu"), 0)]
+
+        def compressed(self):
+            return True
+
+        def _region_on(self, d, target):
+            raise torch.cuda.OutOfMemoryError("simulated: no room for a decoded region")
+
+    blocks = [FakeBlock(), FakeBlock()]
+    sw = _bs.BlockSwap.__new__(_bs.BlockSwap)
+    sw.handles, sw.streams, sw.blocks, sw.free = [], {}, list(blocks), {}
+    sw._decoders = dict(decoders)
+
+    real = C.decode_region_cpu
+
+    def host_decode(c, b):
+        held = bool(sw._decoders) or any(x.decoders for x in blocks)
+        if held:
+            raise torch.cuda.OutOfMemoryError("simulated: decoder buffers still hold the spare VRAM")
+        return real(c, b)
+
+    monkeypatch.setattr(C, "decode_region_cpu", host_decode)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    sw.remove()
+    for b in blocks:
+        assert torch.equal(b.params[0].data.view(torch.uint8), raw)
+
+
 def test_compression_is_off_by_default(monkeypatch):
     monkeypatch.delenv("UNSLOTH_BLOCK_SWAP_COMPRESS", raising = False)
     assert not _bs._compress_requested()
