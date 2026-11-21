@@ -112,16 +112,27 @@ def _activation_bytes_without_checkpointing(model, batch, length):
     return needed
 
 
+def _args_checkpointing(training_args):
+    # transformers >= 5.24 reads activation_checkpointing; gradient_checkpointing is its deprecated alias.
+    return bool(getattr(training_args, "gradient_checkpointing", False) or getattr(training_args, "activation_checkpointing", False))
+
+
+def _args_checkpointing_off(training_args):
+    training_args.gradient_checkpointing = False
+    if hasattr(training_args, "activation_checkpointing"):
+        training_args.activation_checkpointing = False
+
+
 def _auto_cpu_gradient_checkpointing(model, training_args):
     """use_gradient_checkpointing = "unsloth" on CPU means offloading to host RAM, which is where activations already
     live, so it is plain recomputation (one more forward per step). When the activations of a full micro-batch fit in
     a quarter of the free RAM, train without it. True / False from the user, or UNSLOTH_CPU_AUTO_GC=0, keep theirs."""
-    if not isinstance(model, torch.nn.Module) or not getattr(training_args, "gradient_checkpointing", False):
+    if not isinstance(model, torch.nn.Module) or not _args_checkpointing(training_args):
         return None
     choice = getattr(model, "_unsloth_cpu_gradient_checkpointing", None)
     if choice is False:
         # TRL's SFTConfig turns checkpointing on by default, which would override use_gradient_checkpointing = False.
-        training_args.gradient_checkpointing = False
+        _args_checkpointing_off(training_args)
         return True
     if choice != "unsloth" or os.environ.get("UNSLOTH_CPU_AUTO_GC", "1").strip().lower() in ("0", "false", "no", "off"):
         return None
@@ -140,7 +151,7 @@ def _auto_cpu_gradient_checkpointing(model, training_args):
         pass
     if needed * ranks > available // 4:
         return False
-    training_args.gradient_checkpointing = False
+    _args_checkpointing_off(training_args)
     if getattr(model, "is_gradient_checkpointing", False) and hasattr(model, "gradient_checkpointing_disable"):
         # PEFT forwards this to the transformers model; input require-grads hooks stay (a no-op without checkpointing).
         model.gradient_checkpointing_disable()

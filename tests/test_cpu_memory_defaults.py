@@ -199,3 +199,32 @@ def test_auto_gradient_checkpointing_counts_eager_attention_scores(monkeypatch, 
     args = _GcArgs(length = 2048, batch = 2)
     assert bool(trainer._auto_cpu_gradient_checkpointing(model, args)) is expect_off
     assert args.gradient_checkpointing is (not expect_off)
+
+
+def test_available_ram_honours_a_cgroup_v1_container_limit(monkeypatch, tmp_path):
+    """A cgroup v1 container (Docker on RHEL 8 / Amazon Linux 2) sees the host's MemAvailable in /proc/meminfo: the
+    16-bit and no-checkpointing decisions must use the container's own limit, or a model that fits the host OOMs."""
+    import types
+    import psutil
+    import unsloth_zoo.hf_xet_tuning as xet
+    from unsloth_zoo.cpu import runtime
+    gib = 1024 ** 3
+    (tmp_path / "memory.limit_in_bytes").write_text(str(8 * gib))
+    (tmp_path / "memory.usage_in_bytes").write_text(str(1 * gib))
+    monkeypatch.delenv("UNSLOTH_HOST_BUDGET_CGROUP", raising = False)
+    monkeypatch.setattr(psutil, "virtual_memory", lambda: types.SimpleNamespace(total = 512 * gib, available = 256 * gib))
+    monkeypatch.setattr(xet, "_cgroup_v2_dirs", lambda: [])
+    monkeypatch.setattr(xet, "_cgroup_v1_dirs", lambda controller: [tmp_path] if controller == "memory" else [])
+    real_open = open
+
+    def fake_open(path, *args, **kwargs):  # the host view a v1 container gets
+        if str(path) == "/proc/meminfo":
+            import io
+            return io.StringIO(f"MemTotal: {512 * gib // 1024} kB\nMemAvailable: {256 * gib // 1024} kB\n")
+        if str(path) == "/proc/self/cgroup":
+            import io
+            return io.StringIO("4:memory:/docker/abc\n1:name=systemd:/docker/abc\n")
+        return real_open(path, *args, **kwargs)
+    monkeypatch.setattr("builtins.open", fake_open)
+    assert runtime.available_ram() <= 7 * gib
+

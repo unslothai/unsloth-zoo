@@ -185,8 +185,8 @@ def _cgroup_memory_headroom():
 
 
 def available_ram():
-    """Bytes of RAM still available to this process (MemAvailable, capped by the cgroup v2 memory.max headroom of its
-    cgroup and every ancestor), or None."""
+    """Bytes of RAM still available to this process, or None: MemAvailable capped by the cgroup v2 memory.max headroom
+    of its cgroup and every ancestor, and by memory_budget's reading (cgroup v1, memory.high), whichever is lower."""
     available = None
     try:
         with open("/proc/meminfo") as f:
@@ -206,6 +206,15 @@ def available_ram():
         headroom = None
     if headroom is not None:
         available = min(available or 1 << 62, headroom)
+    # memory_budget also knows cgroup v1 (a v1 container sees the host's MemAvailable), memory.high and the ancestors
+    # it can read; the stricter of the two readings wins.
+    try:
+        from unsloth_zoo.memory_budget import host_memory_bytes
+        budget = host_memory_bytes()[1]
+        if isinstance(budget, int) and not isinstance(budget, bool) and budget >= 0:
+            available = budget if available is None else min(available, budget)
+    except Exception:
+        pass
     return available
 
 
