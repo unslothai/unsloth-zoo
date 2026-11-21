@@ -48,7 +48,16 @@ def _cuda():
         pytest.skip("needs a real CUDA device")
 
 
+def _require_compression():
+    _cuda()
+    if not C.triton_decode_available():
+        pytest.skip("needs the Triton decode (compression stays off without it)")
+    if not _bs._can_register():
+        pytest.skip("needs host registration (the chunked fallback stays raw)")
+
+
 def _encode(raw, **kw):
+    kw.setdefault("max_escape_fraction", 1.0)
     enc = C.encode_region(raw, **kw)
     assert enc is not None
     parts, codec = enc
@@ -101,6 +110,26 @@ def test_a_corrupt_table_is_detected():
     codec, blob = _encode(raw)
     blob[codec.aux_off] ^= 1
     assert not torch.equal(C.decode_region_cpu(codec, blob), raw)
+
+
+def test_escape_heavy_regions_stay_raw():
+    raw = _weights(4 * C.GROUP)
+    w = raw.view(torch.int16)
+    g = torch.Generator().manual_seed(3)
+    w[::50] = torch.randint(-32768, 32767, (w[::50].numel(),), generator = g, dtype = torch.int16)
+    assert C.encode_region(raw, max_ratio = 10.0) is None, "2% escapes is past the 0.5% cap"
+    assert C.encode_region(raw, max_ratio = 10.0, max_escape_fraction = 1.0) is not None
+    assert C.encode_region(torch.zeros(0, dtype = torch.uint8)) is None
+
+
+def test_streaming_encode_writes_the_same_blob():
+    raw = _weights(3 * C.GROUP + 512)
+    codec, blob = _encode(raw, chunk = C.GROUP)
+    out = torch.full((raw.numel(),), 0xEE, dtype = torch.uint8)
+    parts, c2 = C.encode_region(raw, chunk = C.GROUP, out = out, max_escape_fraction = 1.0)
+    C.write_parts(out, parts)
+    assert c2.nbytes == codec.nbytes and torch.equal(out[:c2.nbytes], blob)
+    assert C.max_aux_nbytes(raw.numel(), 1.0) >= codec.aux_nbytes
 
 
 def test_incompressible_words_stay_raw():
@@ -178,10 +207,10 @@ def test_self_check_passes():
 
 
 class _Layer(nn.Module):
-    def __init__(self, d):
+    def __init__(self, d, bias = False):
         super().__init__()
         self.w = nn.Linear(d, d, bias = False, dtype = torch.bfloat16).requires_grad_(False)
-        self.up = nn.Linear(d, 2 * d, bias = False, dtype = torch.bfloat16).requires_grad_(False)
+        self.up = nn.Linear(d, 2 * d, bias = bias, dtype = torch.bfloat16).requires_grad_(False)
         self.norm = nn.Parameter(torch.ones(d, dtype = torch.bfloat16), requires_grad = False)
         self.lora_A = nn.Parameter(torch.randn(d, 8, dtype = torch.bfloat16) * 0.01)
 
@@ -213,18 +242,18 @@ def _run(layers, compress, monkeypatch, idx, mode = "non_reentrant", steps = 2):
     return outs, sw, st
 
 
-def _layers(n = 6, d = 512):
+def _layers(n = 6, d = 512, bias = False):
     try:
         torch.ones(2, 2, device = "cuda", dtype = torch.bfloat16) @ torch.ones(2, 2, device = "cuda", dtype = torch.bfloat16)
     except RuntimeError:
         pytest.skip("no bf16 matmul on this card")
     torch.manual_seed(0)
-    return nn.ModuleList([_Layer(d) for _ in range(n)]).cuda()
+    return nn.ModuleList([_Layer(d, bias) for _ in range(n)]).cuda()
 
 
 @pytest.mark.parametrize("mode", ["non_reentrant", "reentrant", "none"])
 def test_compressed_swap_is_bitwise_to_raw_swap_and_no_swap(monkeypatch, mode):
-    _cuda()
+    _require_compression()
     layers = _layers()
     ref, _, _ = _run(layers, False, monkeypatch, None, mode)
     raw, sw, st = _run(layers, False, monkeypatch, [1, 3, 5], mode)
@@ -242,7 +271,7 @@ def test_compressed_swap_is_bitwise_to_raw_swap_and_no_swap(monkeypatch, mode):
 
 
 def test_state_dict_and_remove_restore_the_exact_weights(monkeypatch):
-    _cuda()
+    _require_compression()
     layers = _layers(4, 256)
     for b in layers:
         b.lora_A.requires_grad_(False)
@@ -265,7 +294,7 @@ def test_state_dict_and_remove_restore_the_exact_weights(monkeypatch):
 
 
 def test_peft_adapter_state_dict_skips_decoding(monkeypatch):
-    _cuda()
+    _require_compression()
     layers = _layers(3, 256)
     monkeypatch.setenv("UNSLOTH_BLOCK_SWAP_COMPRESS", "1")
     sw = _bs.BlockSwap(layers, [1, 2], prefetch_depth = 1, device = "cuda")
@@ -286,10 +315,38 @@ def test_peft_adapter_state_dict_skips_decoding(monkeypatch):
     sw.remove()
 
 
-def test_compressed_swap_under_torch_compile_adds_no_graph_breaks(monkeypatch):
+def test_peft_adapter_state_dict_still_returns_frozen_biases(monkeypatch):
+    # bias = "all" saves every bias by key: a swapped frozen bias must come back with its real values.
+    _require_compression()
+    layers = _layers(3, 256, bias = True)
+    ref = {k: v.clone() for k, v in layers.state_dict().items()}
+    monkeypatch.setenv("UNSLOTH_BLOCK_SWAP_COMPRESS", "1")
+    sw = _bs.BlockSwap(layers, [1, 2], prefetch_depth = 1, device = "cuda")
+    ns = {"__name__": "peft.utils.save_and_load", "layers": layers}
+    exec("def get_peft_model_state_dict():\n    return layers.state_dict()", ns)
+    sd = ns["get_peft_model_state_dict"]()
+    for k in ("1.up.bias", "2.up.bias"):
+        assert torch.equal(sd[k].cpu(), ref[k].cpu()), k
+    sw.remove()
+
+
+def test_compression_without_triton_stays_raw_and_exact(monkeypatch):
     _cuda()
-    if not C.triton_decode_available():
-        pytest.skip("no Triton: Inductor cannot compile here, and compression stays off")
+    if not _bs._can_register():
+        pytest.skip("needs host registration")
+    monkeypatch.setattr(_bs._codec(), "triton_decode_available", lambda: False)
+    layers = _layers(3, 256)
+    ref, _, _ = _run(layers, False, monkeypatch, None)
+    got, sw, st = _run(layers, True, monkeypatch, [0, 1, 2])
+    assert st["compression"]["enabled"] is False and st["compression"]["fetches"] == 0
+    assert st["wire_bytes"] == st["copy_bytes"]
+    for a, b in zip(ref, got):
+        assert all(torch.equal(x, y) for x, y in zip(a, b))
+    sw.remove()
+
+
+def test_compressed_swap_under_torch_compile_adds_no_graph_breaks(monkeypatch):
+    _require_compression()
     import torch._dynamo as dynamo
     from torch._dynamo.utils import counters
 

@@ -30,6 +30,7 @@ Host blob per region of N words (N a multiple of 256):
 
 import os
 import sys
+import threading
 import torch
 
 __all__ = [
@@ -50,6 +51,8 @@ CHUNK = 1 << 23
 _ESC = 15
 # Keep a region raw unless the codec saves at least this much (fp16, fp32 and packed 4 bit words do not).
 MAX_RATIO = 0.9
+# And unless escapes stay rare (real bf16 weights: about 0.02%), which also bounds the card's aux buffer.
+MAX_ESCAPE_FRACTION = 0.005
 _LITTLE = sys.byteorder == "little"
 
 
@@ -119,15 +122,27 @@ def _encode_chunk(raw_u8, first_word):
     return torch.cat((sm, packed)), tables, pos, vals
 
 
-def encode_region(raw_u8, chunk = CHUNK, max_ratio = MAX_RATIO, device = None):
+def max_aux_nbytes(raw_nbytes, max_escape_fraction = MAX_ESCAPE_FRACTION):
+    """Largest aux block an accepted region of raw_nbytes can have (tables + escapes at the cap)."""
+    words = int(raw_nbytes) // 2
+    return _align(-(-words // GROUP) * 16, 8) + 16 + int(words * max_escape_fraction) * 9 + 16
+
+
+def encode_region(raw_u8, chunk = CHUNK, max_ratio = MAX_RATIO, device = None, out = None,
+                  max_escape_fraction = MAX_ESCAPE_FRACTION):
     """Encode a host region (1-D uint8, length a multiple of 512) of 16 bit words.
 
     Returns (parts, codec): parts are (blob offset, CPU uint8 tensor) to write at the region's base, or None
-    when the encoding would not be at least 1 - max_ratio smaller. `device` runs the encode there."""
-    if not _LITTLE or raw_u8.dtype != torch.uint8 or raw_u8.dim() != 1 or raw_u8.numel() % 512:
+    when the encoding would not be at least 1 - max_ratio smaller or escapes pass max_escape_fraction. With
+    `out` (a CPU uint8 view at least as long as the region) chunks are written there as they are made and
+    parts holds only the aux pieces; after None, `out` holds partial bytes the caller overwrites.
+    `device` runs the encode there."""
+    if (not _LITTLE or raw_u8.dtype != torch.uint8 or raw_u8.dim() != 1 or raw_u8.numel() == 0
+            or raw_u8.numel() % 512):
         return None
     assert chunk % GROUP == 0
     words = raw_u8.numel() // 2
+    max_esc = int(words * max_escape_fraction)
     dev = torch.device(device) if device is not None else raw_u8.device
     parts, tables, pos_all, vals_all, esc_n = [], [], [], [], 0
     for s in range(0, words, chunk):
@@ -136,14 +151,18 @@ def encode_region(raw_u8, chunk = CHUNK, max_ratio = MAX_RATIO, device = None):
         if src.device != dev:
             src = src.to(dev)
         body, tab, pos, vals = _encode_chunk(src, s)
-        parts.append((s * 3 // 2, body.cpu()))
+        esc_n += pos.numel()
+        # Escapes past the budget: stop early, a raw copy is cheaper.
+        if esc_n > max_esc or (s + k) * 3 // 2 + 5 * esc_n > max_ratio * 2 * words:
+            return None
+        if out is not None:
+            out[s * 3 // 2:s * 3 // 2 + body.numel()].copy_(body)
+        else:
+            parts.append((s * 3 // 2, body.cpu()))
         tables.append(tab.cpu())
         pos_all.append((pos + s).cpu())
         vals_all.append(vals.cpu())
-        esc_n += pos.numel()
-        # Escapes past the budget: stop early, a raw copy is cheaper.
-        if (s + k) * 3 // 2 + 5 * esc_n > max_ratio * 2 * words:
-            return None
+        del body, src
     codec = RegionCodec(words, chunk, esc_n)
     if codec.nbytes > max_ratio * codec.raw_nbytes:
         return None
@@ -352,6 +371,9 @@ class DeviceDecoder:
         self._chunk = 0
         self.fetches = 0
         self.failed = None
+        # One submitter at a time: the ring and aux events are re-recorded per fetch (a state_dict decode on
+        # another thread must not interleave with a prefetch).
+        self._lock = threading.Lock()
 
     def nbytes(self):
         return sum(t.numel() for t in self.staging) + sum(t.numel() for t in self.aux)
@@ -359,7 +381,13 @@ class DeviceDecoder:
     def fetch(self, codec, blob, out_u8, copy_stream, done):
         """Enqueue host blob -> device raw region `out_u8`; `done` is recorded once the region is complete.
         The caller made `copy_stream` wait for the compute stream (the slot is free)."""
+        with self._lock:
+            self._fetch(codec, blob, out_u8, copy_stream, done)
+
+    def _fetch(self, codec, blob, out_u8, copy_stream, done):
         ds = self.stream
+        # The decode stream writes the slot: the allocator must not hand its memory out before that is done.
+        out_u8.record_stream(ds)
         a = self.fetches & 1
         with torch.cuda.device(self.device):
             with torch.cuda.stream(copy_stream):
@@ -423,7 +451,7 @@ def self_check(device, use_triton = True):
         chunk = 4 * GROUP
         words = 2 * chunk + 3 * GROUP + 256
         raw = _self_check_data(words)
-        enc = encode_region(raw, chunk = chunk, max_ratio = 10.0)
+        enc = encode_region(raw, chunk = chunk, max_ratio = 10.0, max_escape_fraction = 1.0)
         if enc is None:
             return False, False, "self-check data did not encode"
         parts, codec = enc
