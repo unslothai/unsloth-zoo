@@ -422,7 +422,8 @@ def _peft_state(compress, monkeypatch, tmp_path):
     evicted = sum(not b.resident for b in sw.blocks)
     state = peft.get_peft_model_state_dict(model)
     path = os.path.join(str(tmp_path), f"adapter_{int(compress)}.safetensors")
-    save_file({k: v.detach().contiguous().cpu() for k, v in state.items()}, path)
+    # Own storage per entry, as peft's save_pretrained does for tensors that share a buffer.
+    save_file({k: v.detach().cpu().clone() for k, v in state.items()}, path)
     back = load_file(path)
     stats = sw.compression_stats()
     sw.remove()
