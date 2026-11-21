@@ -2932,6 +2932,17 @@ pass
 RL_REPLACEMENTS["grpo_old_logps_from_new"] = grpo_old_logps_from_new
 
 
+def grpo_old_logps_store(old_logps, row_keep = None, full_rows = None):
+    """First pass's detached logps kept as pi_old for later num_iterations passes; rows skipped as unscored get NaN."""
+    old_logps = old_logps.detach()
+    if row_keep is None or full_rows is None or old_logps.shape[0] == full_rows:
+        return old_logps
+    out = old_logps.new_full((full_rows, *old_logps.shape[1:]), float("nan"))
+    return out.index_copy(0, row_keep.to(out.device), old_logps)
+pass
+RL_REPLACEMENTS["grpo_old_logps_store"] = grpo_old_logps_store
+
+
 def _grpo_positive_rate(value):
     if isinstance(value, dict):
         return any(_grpo_positive_rate(v) for v in value.values())
@@ -3320,6 +3331,7 @@ def grpo_accumulated_loss(
     # Set by unsloth when UNSLOTH_GRPO_ROLLOUT_LOGPROBS_AS_OLD=1 skipped the old-policy forward.
     _rollout_logps_as_old = bool(kwargs.pop("rollout_logps_as_old", False))
     _old_from_new = bool(kwargs.pop("old_logps_from_new", False)) and old_logps is None and not _rollout_logps_as_old
+    _store_old = bool(kwargs.pop("store_old_logps", False)) and _old_from_new
     _row_keep = None
     # TRL defaults the correction flag to True without vLLM too, but only applies the ratio with use_vllm.
     _sampling_logps_used = (
@@ -4623,6 +4635,11 @@ def grpo_accumulated_loss(
         if _old_from_new:
             from unsloth_zoo.rl_replacements import grpo_old_logps_from_new as _grpo_old_logps_from_new
             old_logps = _grpo_old_logps_from_new(new_logprobs)
+            if _store_old:
+                from unsloth_zoo.rl_replacements import grpo_old_logps_store as _grpo_old_logps_store
+                trainer._unsloth_grpo_stored_old_logps = _grpo_old_logps_store(
+                    old_logps, _row_keep, _full_rows if _row_keep is not None else None,
+                )
         _rollout_unscored = None
         if _rollout_logps_as_old:
             old_logps, _rollout_unscored = grpo_rollout_old_fill_unscored(old_logps, new_logprobs)
@@ -4781,8 +4798,14 @@ def grpo_accumulated_loss(
                         None, _pick(_full["old"]), _pick(_full["old"]), _pick(_full["sampling"]),
                         _pick(_full["ids"]), _pick(_full["mask"]), 0.0, _pick(_full["advantages"]), **_kw,
                     )
-                delta = delta.index_copy(0, _dropped.to(delta.device), _out[3].to(delta.dtype))
-                flat_is_ratio = flat_is_ratio.index_copy(0, _dropped.to(flat_is_ratio.device), _out[4].to(flat_is_ratio.dtype))
+                _d_delta, _d_ratio = _out[3], _out[4]
+                # Stored pi_old is NaN for these rows: keep them unscored.
+                _unscored = torch.isnan(_pick(_full["old"])).all(dim = -1, keepdim = True)
+                if bool(_unscored.any()):
+                    _d_delta = _d_delta.masked_fill(_unscored.to(_d_delta.device), float("nan"))
+                    _d_ratio = _d_ratio.masked_fill(_unscored.to(_d_ratio.device), float("nan"))
+                delta = delta.index_copy(0, _dropped.to(delta.device), _d_delta.to(delta.dtype))
+                flat_is_ratio = flat_is_ratio.index_copy(0, _dropped.to(flat_is_ratio.device), _d_ratio.to(flat_is_ratio.dtype))
         coef_1 = _expand(_row_keep, _full_rows, coef_1, 1.0)
         completion_mask = _full["mask"]
         completion_length = completion_mask.to(torch.float32).sum(1).mean()
