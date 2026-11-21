@@ -38,8 +38,9 @@ def _tree():
 
 
 def _helper(monkeypatch, methods, has_arctic, version = "0.29.0"):
-    nodes = [n for n in _tree().body if isinstance(n, ast.FunctionDef) and n.name == "_vllm_suffix_decoding_config"]
-    assert len(nodes) == 1, "_vllm_suffix_decoding_config is missing from vllm_utils.py"
+    names = ("_vllm_suffix_decoding_config", "_vllm_speculative_methods", "_check_vllm_suffix_decoding")
+    nodes = [n for n in _tree().body if isinstance(n, ast.FunctionDef) and n.name in names]
+    assert len(nodes) == len(names), "suffix decoding helpers are missing from vllm_utils.py"
     fake_util = types.SimpleNamespace(
         find_spec = lambda name: object() if (name == "arctic_inference" and has_arctic) else None,
     )
@@ -103,8 +104,8 @@ def test_missing_arctic_refused(monkeypatch):
 def test_load_vllm_passes_speculative_config_before_arg_filter():
     load_vllm = next(n for n in ast.walk(_tree()) if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
     src = ast.unparse(load_vllm)
-    call = src.find("_vllm_suffix_decoding_config()")
-    assign = src.find("engine_args['speculative_config'] = suffix_config")
+    call = src.find("_vllm_speculative_config(speculative_config)")
+    assign = src.find("engine_args['speculative_config'] = user_speculative_config")
     arg_filter = src.find("good_keys = inspect.signature(AsyncEngineArgs", max(assign, 0))
     assert -1 < call < assign < arg_filter
 
@@ -143,7 +144,7 @@ def test_max_num_seqs_fits_lora_speculation(seqs, tokens, config, expected):
 def test_load_vllm_fits_max_num_seqs_with_lora():
     load_vllm = next(n for n in ast.walk(_tree()) if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
     src = ast.unparse(load_vllm)
-    assign = src.find("engine_args['speculative_config'] = suffix_config")
+    assign = src.find("engine_args['speculative_config'] = user_speculative_config")
     fit = src.find("_fit_max_num_seqs_to_speculation(", max(assign, 0))
     lowered = src.find("engine_args['max_num_seqs'] = fitted_max_num_seqs", max(fit, 0))
     arg_filter = src.find("good_keys = inspect.signature(AsyncEngineArgs", max(lowered, 0))
@@ -186,11 +187,11 @@ def test_return_args_callers_get_no_speculative_config():
     load_vllm = next(n for n in ast.walk(_tree()) if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
     assigns = [
         n for n in ast.walk(load_vllm)
-        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "suffix_config" for t in n.targets)
+        if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "user_speculative_config" for t in n.targets)
     ]
     assert len(assigns) == 1
     value = ast.unparse(assigns[0].value)
-    assert "return_args" in value and "_vllm_suffix_decoding_config()" in value
+    assert "return_args" in value and "_vllm_speculative_config(speculative_config)" in value
 
 
 @pytest.mark.parametrize("seqs, tokens, config, expected", [

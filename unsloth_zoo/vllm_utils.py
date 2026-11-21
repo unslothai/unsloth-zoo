@@ -3949,31 +3949,123 @@ def _vllm_suffix_decoding_config():
     elif value.lower() not in ("1", "true", "on", "yes"):
         raise ValueError(f"Unsloth: UNSLOTH_VLLM_SUFFIX_DECODING={value!r} must be 1 or a JSON object.")
 
-    installed = globals().get("vllm_version", "not installed")
+    _check_vllm_suffix_decoding("unset UNSLOTH_VLLM_SUFFIX_DECODING")
+    return {**extra, "method": "suffix"}
+
+
+def _vllm_speculative_methods():
+    # Every method name vLLM's SpeculativeMethod Literal lists (it nests Literals); None when this vLLM has none.
     try:
         from typing import get_args
         from vllm.config.speculative import SpeculativeMethod
-        supported = "suffix" in get_args(SpeculativeMethod)
     except Exception:
-        supported = False
-    if not supported:
+        return None
+    methods, stack = set(), [SpeculativeMethod]
+    while stack:
+        for arg in get_args(stack.pop()):
+            if isinstance(arg, str): methods.add(arg)
+            else: stack.append(arg)
+    return frozenset(methods) or None
+
+
+def _check_vllm_suffix_decoding(how_to_turn_off):
+    installed = globals().get("vllm_version", "not installed")
+    methods = _vllm_speculative_methods()
+    if methods is None or "suffix" not in methods:
         raise RuntimeError(
             f"Unsloth: suffix decoding needs vLLM >= 0.11.1 (speculative method 'suffix'), but found "
-            f"vLLM {installed}. Upgrade vLLM or unset UNSLOTH_VLLM_SUFFIX_DECODING."
+            f"vLLM {installed}. Upgrade vLLM or {how_to_turn_off}."
         )
     if importlib.util.find_spec("arctic_inference") is None:
         raise RuntimeError(
             "Unsloth: suffix decoding needs the Arctic Inference package. Install it with "
-            "`pip install arctic-inference` (vLLM suggests arctic-inference==0.1.1), or unset "
-            "UNSLOTH_VLLM_SUFFIX_DECODING."
+            "`pip install arctic-inference` (vLLM suggests arctic-inference==0.1.1), or "
+            f"{how_to_turn_off}."
         )
-    return {**extra, "method": "suffix"}
+
+
+_SPECULATIVE_CONFIG_ENV = "UNSLOTH_VLLM_SPECULATIVE_CONFIG"
+
+
+def _vllm_speculative_config(speculative_config = None):
+    # load_vllm(speculative_config = {...}), else UNSLOTH_VLLM_SPECULATIVE_CONFIG (a JSON object), else
+    # UNSLOTH_VLLM_SUFFIX_DECODING. Returns a dict for vLLM's speculative_config or None; raises on a value vLLM cannot run.
+    source = "speculative_config"
+    if speculative_config is None:
+        value = os.environ.get(_SPECULATIVE_CONFIG_ENV, "").strip()
+        if value.lower() in ("", "0", "false", "off", "no", "none"):
+            return _vllm_suffix_decoding_config()
+        source, speculative_config = _SPECULATIVE_CONFIG_ENV, value
+    how_to_turn_off = f"unset {_SPECULATIVE_CONFIG_ENV}" if source == _SPECULATIVE_CONFIG_ENV \
+        else "drop speculative_config"
+    if isinstance(speculative_config, str):
+        try:
+            speculative_config = json.loads(speculative_config)
+        except ValueError as error:
+            raise ValueError(f"Unsloth: {source} is not valid JSON: {error}")
+    if not isinstance(speculative_config, dict):
+        raise ValueError(
+            f"Unsloth: {source} must be a dict (or a JSON object), such as "
+            '{"method": "ngram", "num_speculative_tokens": 4, "prompt_lookup_max": 4} or '
+            '{"method": "eagle3", "model": "<draft repo>", "num_speculative_tokens": 3}.'
+        )
+    config = dict(speculative_config)
+    method = config.get("method", None)
+    if method is None and not config.get("model", None):
+        raise ValueError(f"Unsloth: {source} needs a 'method' (such as 'ngram') or a draft 'model'.")
+    if os.environ.get("UNSLOTH_VLLM_SUFFIX_DECODING", "").strip().lower() not in ("", "0", "false", "off", "no"):
+        print(f"Unsloth: {source} is set, so UNSLOTH_VLLM_SUFFIX_DECODING is ignored.")
+    if method == "suffix":
+        _check_vllm_suffix_decoding(how_to_turn_off)
+    elif method is not None:
+        methods = _vllm_speculative_methods()
+        if methods is not None and method not in methods:
+            raise ValueError(
+                f"Unsloth: {source} method {method!r} is not one this vLLM "
+                f"({globals().get('vllm_version', 'not installed')}) knows: {sorted(methods)}."
+            )
+    # A forced Model Runner V2 would only get the engine refused (vLLM falls back to V1 for these by itself).
+    if method in _MRV2_UNSUPPORTED_SPECULATIVE_METHODS and \
+        os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "").strip().lower() in ("1", "true"):
+        raise ValueError(
+            f"Unsloth: vLLM Model Runner V2 does not run speculative method {method!r}, but "
+            "VLLM_USE_V2_MODEL_RUNNER=1 forces it. Unset VLLM_USE_V2_MODEL_RUNNER, or use a method V2 runs "
+            "(eagle, eagle3, mtp, dflash)."
+        )
+    return config
+
+
+# Methods whose 'model' is a separate draft checkpoint loaded beside the target (MTP reuses the target's own layers).
+_SPECULATIVE_DRAFT_METHODS = frozenset((
+    None, "draft_model", "eagle", "eagle3", "medusa", "mlp_speculator", "dflash", "dspark",
+))
+
+
+def _speculative_draft_gb(speculative_config, target_model_name):
+    # GiB of draft weights vLLM loads beside the target: 0 for ngram / suffix / MTP, None when it cannot be sized.
+    draft = speculative_config.get("model", None)
+    if not draft or speculative_config.get("method", None) not in _SPECULATIVE_DRAFT_METHODS: return 0.0
+    if str(draft) == str(target_model_name): return 0.0
+    suffixes = (".safetensors", ".bin", ".pt", ".pth")
+    try:
+        if os.path.isdir(draft):
+            sizes = [os.path.getsize(os.path.join(d, f)) for d, _, files in os.walk(draft) for f in files if f.endswith(suffixes)]
+        else:
+            from huggingface_hub import HfApi
+            info = HfApi().model_info(draft, revision = speculative_config.get("revision", None), files_metadata = True)
+            files = [(s.rfilename, s.size or 0) for s in (info.siblings or [])]
+            sizes = [n for f, n in files if f.endswith(".safetensors")] or [n for f, n in files if f.endswith(suffixes)]
+    except Exception:
+        return None
+    return sum(sizes) / (1024 ** 3) if sizes else None
 
 
 def _speculation_lookahead(speculative_config):
-    # Tokens proposed per step (k), defaulting to suffix_decoding_max_tree_depth (24); None for a malformed value so vLLM's own validation names it.
+    # Tokens proposed per step (k); suffix defaults to suffix_decoding_max_tree_depth (24). None for a malformed or unset value so vLLM's own validation names it.
     k = speculative_config.get("num_speculative_tokens")
     if k is None:
+        # Other methods take k from the draft's config (MTP / EAGLE n_predict), which only vLLM reads.
+        if speculative_config.get("method", None) != "suffix": return None
         k = speculative_config.get("suffix_decoding_max_tree_depth", 24)
     if isinstance(k, bool):
         return None
@@ -4695,6 +4787,7 @@ def load_vllm(
     fp8_mode               : Optional[str] = None,
     max_num_batched_tokens : Optional[int] = None, # chunked prefill budget. None = pick from free memory
     rope_scaling           : Optional[dict] = None, # caller's RoPE scaling, e.g. YaRN past the native window
+    speculative_config     : Optional[dict] = None, # vLLM speculative_config, e.g. {"method": "ngram", "num_speculative_tokens": 4}
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Create vLLM instance
@@ -4855,6 +4948,12 @@ def load_vllm(
                 "fast_inference = False."
             )
 
+    # return_args callers (SyntheticDataKit's `vllm serve`) turn every value into a CLI flag with
+    # str(), and vLLM parses --speculative-config as JSON, so a dict there kills the server.
+    if return_args and speculative_config is not None:
+        print("Unsloth: speculative_config is not passed on with return_args = True; give it to `vllm serve` directly.")
+    user_speculative_config = None if return_args else _vllm_speculative_config(speculative_config)
+
     requested_max_num_batched_tokens = max_num_batched_tokens
     max_num_batched_tokens, approx_max_num_seqs, \
     actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
@@ -4879,6 +4978,22 @@ def load_vllm(
             int(requested_max_num_batched_tokens or 0),
         ),
     )
+
+    # A draft model's weights live inside the same gpu_memory_utilization, so they come out of the KV cache estimate
+    # that picks max_num_seqs; vLLM's own profile then sizes the real KV cache with both models loaded.
+    if user_speculative_config is not None:
+        draft_gb = _speculative_draft_gb(user_speculative_config, model_name)
+        if draft_gb is None:
+            print(
+                "Unsloth: could not size the speculative draft model, so its weights are not taken out of the "
+                "KV cache estimate; lower gpu_memory_utilization if vLLM runs out of memory."
+            )
+        elif draft_gb > 0:
+            memory_left_for_kv_cache_gb = max(memory_left_for_kv_cache_gb - draft_gb, 0.0)
+            print(
+                f"Unsloth: speculative draft weights take {draft_gb:.2f} GB, leaving about "
+                f"{memory_left_for_kv_cache_gb:.2f} GB for vLLM's KV cache."
+            )
 
     # Pre-flight warning: if KV cache headroom is very low with standby mode,
     # warn before LLM() is called (which may crash unrecoverably).
@@ -5426,38 +5541,37 @@ def load_vllm(
                 rope_overrides["max_position_embeddings"] = max_seq_length
             engine_args["hf_overrides"] = {**engine_args.get("hf_overrides", {}), **rope_overrides}
 
-        # return_args callers (SyntheticDataKit's `vllm serve`) turn every value into a CLI flag with
-        # str(), and vLLM parses --speculative-config as JSON, so a dict here kills the server.
-        suffix_config = None if return_args else _vllm_suffix_decoding_config()
         pre_speculation_sizes = None
-        if suffix_config is not None:
+        if user_speculative_config is not None:
+            spec_what = "suffix decoding" if user_speculative_config.get("method", None) == "suffix" \
+                else "speculative decoding"
             pre_speculation_sizes = (
                 approx_max_num_seqs, max_num_batched_tokens,
                 engine_args.get("max_num_seqs"), engine_args.get("max_num_batched_tokens"),
             )
-            engine_args["speculative_config"] = suffix_config
+            engine_args["speculative_config"] = user_speculative_config
             if enable_lora:
                 fitted_max_num_seqs = _fit_max_num_seqs_to_speculation(
-                    engine_args["max_num_seqs"], engine_args["max_num_batched_tokens"], suffix_config,
+                    engine_args["max_num_seqs"], engine_args["max_num_batched_tokens"], user_speculative_config,
                 )
                 if fitted_max_num_seqs < engine_args["max_num_seqs"]:
                     print(
                         f"Unsloth: Lowering vLLM max_num_seqs from {engine_args['max_num_seqs']} to "
-                        f"{fitted_max_num_seqs} so LoRA fits the suffix decoding lookahead."
+                        f"{fitted_max_num_seqs} so LoRA fits the {spec_what} lookahead."
                     )
                     approx_max_num_seqs = fitted_max_num_seqs
                     engine_args["max_num_seqs"] = fitted_max_num_seqs
                 fitted_max_num_batched_tokens = _fit_max_num_batched_tokens_to_speculation(
-                    engine_args["max_num_seqs"], engine_args["max_num_batched_tokens"], suffix_config,
+                    engine_args["max_num_seqs"], engine_args["max_num_batched_tokens"], user_speculative_config,
                 )
                 if fitted_max_num_batched_tokens > engine_args["max_num_batched_tokens"]:
                     print(
                         f"Unsloth: Raising vLLM max_num_batched_tokens from {engine_args['max_num_batched_tokens']} "
-                        f"to {fitted_max_num_batched_tokens} so one LoRA sequence fits the suffix decoding lookahead."
+                        f"to {fitted_max_num_batched_tokens} so one LoRA sequence fits the {spec_what} lookahead."
                     )
                     max_num_batched_tokens = fitted_max_num_batched_tokens
                     engine_args["max_num_batched_tokens"] = fitted_max_num_batched_tokens
-            print(f"Unsloth: vLLM uses suffix decoding for generation with speculative_config = {suffix_config}.")
+            print(f"Unsloth: vLLM uses {spec_what} for generation with speculative_config = {user_speculative_config}.")
         # Same str() problem for return_args: vLLM json-parses --hf-overrides, and a `vllm serve`
         # has no trainer whose logprobs the fp32 head would have to match.
         fp32_head_overrides = {} if return_args else _vllm_fp32_lm_head_overrides(training)
