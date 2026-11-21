@@ -103,7 +103,10 @@ def test_sysfs_carveout_matched_by_pci_bus(tmp_path):
         real.mkdir(parents = True)
         (real / "mem_info_vram_total").write_text(f"{vram}\n")
         (tmp_path / card).mkdir()
-        (tmp_path / card / "device").symlink_to(real)
+        try:
+            (tmp_path / card / "device").symlink_to(real)
+        except OSError as e:  # Windows without the symlink privilege; the sysfs probe is Linux only anyway
+            pytest.skip(f"no symlinks here: {e}")
     assert D._amdgpu_sysfs_vram_total(_Props(pci_bus_id = 195), root = str(tmp_path)) == 512 * 1024 ** 2
     assert D._amdgpu_sysfs_vram_total(_Props(pci_bus_id = 3), root = str(tmp_path)) == 24 * GIB
     assert D._amdgpu_sysfs_vram_total(_Props(pci_bus_id = 7), root = str(tmp_path)) is None
