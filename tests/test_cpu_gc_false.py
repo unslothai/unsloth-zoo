@@ -44,9 +44,11 @@ class _GcArgs:
         self.per_device_train_batch_size = batch
 
 
-def test_use_gradient_checkpointing_false_beats_trl_default():
+def test_use_gradient_checkpointing_false_beats_trl_default(monkeypatch):
     """SFTConfig defaults gradient_checkpointing = True; the model's use_gradient_checkpointing = False wins."""
     from unsloth_zoo.cpu import trainer
+    # With the memory defaults, "unsloth" may also drop checkpointing when RAM is plentiful: pin it to none free.
+    monkeypatch.setattr(trainer, "available_ram", lambda: 0, raising = False)
     model = _tiny_model()
     model._unsloth_cpu_gradient_checkpointing = False
     args = _GcArgs()
