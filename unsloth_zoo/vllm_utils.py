@@ -1130,6 +1130,143 @@ def patch_vllm_reset_caches_on_sleep():
 pass
 
 
+# device index -> [MemPool, held tensors]: workspaces vLLM's CUDA graphs replay into, never freed.
+_VLLM_CUBLAS_WORKSPACES = {}
+_VLLM_CUBLAS_WORKSPACE_WARNED = set()
+
+
+def _free_pool_blocks(pool, device):
+    blocks = []
+    for segment in torch.cuda.memory._snapshot()["segments"]:
+        if segment.get("device", device.index) != device.index or tuple(segment.get("segment_pool_id", ())) != tuple(pool.id):
+            continue
+        address = segment["address"]
+        small = segment.get("segment_type", "large") == "small"
+        for block in segment["blocks"]:
+            if block["state"] == "inactive": blocks.append((address, block["size"], segment.get("stream", 0), small))
+            address += block["size"]
+    return sorted(blocks, key = lambda x: -x[1])
+pass
+
+
+_SMALL_ALLOCATION = 1 << 20
+
+
+def _hold_pool_blocks(pool, device, streams, use_mem_pool):
+    # A free block is reused only on its own stream, and a small segment only for <=1 MiB requests (the cuBLASLt
+    # workspace lives in one): allocate each block on its stream, in pieces that fit.
+    held, missed = [], 0
+    for address, size, stream, small in _free_pool_blocks(pool, device):
+        stream = streams.get(stream) or torch.cuda.ExternalStream(stream, device = device)
+        with torch.cuda.stream(stream), use_mem_pool(pool, device = device), torch.inference_mode(False):
+            at = address
+            while at < address + size:
+                piece = min(address + size - at, _SMALL_ALLOCATION) if small else size
+                tensor = torch.empty(piece, dtype = torch.uint8, device = device)
+                missed += tensor.data_ptr() != at
+                held.append(tensor)
+                at += piece
+    return held, missed
+pass
+
+
+def _cublas_workspaces_into(pool, device, use_mem_pool):
+    with use_mem_pool(pool, device = device), torch.inference_mode(False):
+        a = torch.ones(16, 64, device = device, dtype = torch.float16)
+        b = torch.ones(64, 32, device = device, dtype = torch.float16)
+        bias = torch.zeros(32, device = device, dtype = torch.float16)
+        torch.mm(a, b)
+        torch.addmm(bias, a, b)
+        del a, b, bias
+pass
+
+
+def _cublas_workspace_cached():
+    # torch >= 2.15 allocates cuBLAS(Lt) workspaces per call unless TORCH_CUBLAS_WORKSPACE_CACHE=1 (pytorch#194311):
+    # a captured call's workspace then lives in the graph's own pool, so there is nothing to hold.
+    if Version(torch_version.split("+")[0]) < Version("2.15.0"): return True
+    return os.environ.get("TORCH_CUBLAS_WORKSPACE_CACHE", "0").strip().lower() in ("1", "true", "yes", "on")
+pass
+
+
+def _capture_holds_workspace(runner):
+    # Dual-batch overlap captures on worker threads with their own handles and streams: left as vLLM ships it.
+    return not getattr(getattr(runner, "parallel_config", None), "use_ubatching", False)
+pass
+
+
+@contextlib.contextmanager
+def _vllm_cublas_workspace_held(enabled = True):
+    """vLLM's CUDA graphs bake in the capture stream's cuBLAS workspace (split-K for decode GEMMs).
+    _cuda_clearCublasWorkspaces (called by Inductor CUDA graph trees) frees it, so replays then write into memory
+    the trainer owns or empty_cache unmapped (illegal address). Allocate it in a private pool and hold it forever."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    MemPool = getattr(torch.cuda, "MemPool", None)
+    use_mem_pool = getattr(torch.cuda, "use_mem_pool", None)
+    clear = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
+    graphs = getattr(torch.cuda, "graphs", None)
+    CUDAGraph = getattr(graphs, "CUDAGraph", None)
+    original = getattr(CUDAGraph, "capture_begin", None)
+    backend = getattr(torch.cuda, "get_allocator_backend", None)
+    if not enabled or not _cublas_workspace_cached() or not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None or \
+            MemPool is None or use_mem_pool is None or clear is None or original is None or \
+            getattr(original, "_unsloth_cublas_workspace", False) or \
+            (backend is not None and backend() != "native"):
+        yield False
+        return
+    device = torch.device("cuda", torch.cuda.current_device())
+    try:
+        held = _VLLM_CUBLAS_WORKSPACES.get(device.index)
+        if held is None: held = _VLLM_CUBLAS_WORKSPACES[device.index] = [MemPool(), []]
+    except Exception as error:
+        if device.index not in _VLLM_CUBLAS_WORKSPACE_WARNED:
+            _VLLM_CUBLAS_WORKSPACE_WARNED.add(device.index)
+            logger.info(f"Unsloth: could not pin the cuBLAS workspace for vLLM CUDA graphs ({error!r}).")
+        yield False
+        return
+    pool = held[0]
+    seen = {}
+    owner = threading.get_ident()
+
+    @functools.wraps(original)
+    def capture_begin(self, *args, **kwargs):
+        stream = torch.cuda.current_stream()
+        if threading.get_ident() == owner and stream.device == device and stream.cuda_stream not in seen:
+            try:
+                # An earlier capture's holds go back to the pool only once this one captures (a no-capture call keeps
+                # them); reuse is safe: all graphs replay serially on one stream.
+                if not seen: held[1] = []
+                clear()
+                _cublas_workspaces_into(pool, stream.device, use_mem_pool)
+                seen[stream.cuda_stream] = stream
+            except Exception as error:
+                if device.index not in _VLLM_CUBLAS_WORKSPACE_WARNED:
+                    _VLLM_CUBLAS_WORKSPACE_WARNED.add(device.index)
+                    logger.info(f"Unsloth: could not pin the cuBLAS workspace for vLLM CUDA graphs ({error!r}).")
+        return original(self, *args, **kwargs)
+    capture_begin._unsloth_cublas_workspace = True
+
+    CUDAGraph.capture_begin = capture_begin
+    try:
+        yield True
+    finally:
+        CUDAGraph.capture_begin = original
+        if seen:
+            try:
+                torch.cuda.synchronize(device)
+                clear()
+                with torch.cuda.device(device):
+                    held[1], missed = _hold_pool_blocks(pool, device, seen, use_mem_pool)
+                if missed and device.index not in _VLLM_CUBLAS_WORKSPACE_WARNED:
+                    _VLLM_CUBLAS_WORKSPACE_WARNED.add(device.index)
+                    logger.info(f"Unsloth: {missed} cuBLAS workspace blocks of vLLM CUDA graphs were not held in place.")
+            except Exception as error:
+                if device.index not in _VLLM_CUBLAS_WORKSPACE_WARNED:
+                    _VLLM_CUBLAS_WORKSPACE_WARNED.add(device.index)
+                    logger.info(f"Unsloth: could not hold the cuBLAS workspace of vLLM CUDA graphs ({error!r}).")
+pass
+
+
 def patch_vllm_graph_capture():
     """Temporarily disable gc.collect to speed up CUDA graph capture with torch.compile."""
     from contextlib import contextmanager
@@ -1153,7 +1290,7 @@ def patch_vllm_graph_capture():
             gc.collect = original_gc_collect
     pass
 
-    def wrap(load, tag):
+    def wrap(load, tag, gc_cleanup = True):
         try:
             cls, log = load()
             original = cls.capture_model
@@ -1161,11 +1298,20 @@ def patch_vllm_graph_capture():
             if getattr(original, "_unsloth_graph_capture", False): return
             log.info(f"Unsloth: Patching vLLM {tag} graph capture")
 
+            if not gc_cleanup:
+                @wraps(original)
+                def capture_model(self, *args, **kwargs):
+                    with _vllm_cublas_workspace_held(_capture_holds_workspace(self)):
+                        return original(self, *args, **kwargs)
+                capture_model._unsloth_graph_capture = True
+                cls.capture_model = capture_model
+                return
+
             @wraps(original)
             def capture_model(self, *args, **kwargs):
                 log.info(f"Unsloth: Running patched vLLM {tag} `capture_model`.")
                 start_time = time.perf_counter()
-                with suppress_gc_collect():
+                with _vllm_cublas_workspace_held(_capture_holds_workspace(self)), suppress_gc_collect():
                     result = original(self, *args, **kwargs)
                 log.info(
                     f"Unsloth: Patched vLLM {tag} graph capture finished in %.0f secs.",
@@ -1184,11 +1330,26 @@ def patch_vllm_graph_capture():
         from vllm.v1.worker.gpu_model_runner import GPUModelRunner, logger
         return GPUModelRunner, logger
 
+    def load_v2():
+        # Model Runner V2 is not a V1 subclass.
+        from vllm.v1.worker.gpu import model_runner
+        log = getattr(model_runner, "logger", None)
+        if log is None:
+            from vllm.logger import init_logger
+            log = init_logger("vllm.v1.worker.gpu.model_runner")
+        return model_runner.GPUModelRunner, log
+
     def load_v0():
         from vllm.worker.model_runner import GPUModelRunnerBase, logger
         return GPUModelRunnerBase, logger
 
     wrap(load_v1, "v1")
+    try:
+        has_v2 = importlib.util.find_spec("vllm.v1.worker.gpu.model_runner") is not None
+    except (ImportError, ValueError):
+        has_v2 = False
+    if has_v2:
+        wrap(load_v2, "v2", gc_cleanup = False)
     # vLLM v0 is deprecated in vLLM v0.11.0.
     if Version(vllm.__version__) < Version("0.11.0"):
         wrap(load_v0, "v0")
