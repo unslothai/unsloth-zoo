@@ -2306,6 +2306,66 @@ GRPO_VISION_KEYS = (
     "num_videos",
 )
 
+# Index keys that travel with the vision inputs but are not model kwargs, kept out of GRPO_VISION_KEYS so the
+# companion key-count checks below are unchanged. video_bank_rows: [n_videos, 2] (start, end) patch rows of each
+# per-sample video inside a pixel_values_videos holding one copy per distinct prompt; GRPO repeats each prompt
+# num_generations times, so the flat layout held that many copies of every video.
+GRPO_VISION_INDEX_KEYS = ("video_bank_rows",)
+
+
+def grpo_video_bank_supported():
+    """Whether grpo_vision_chunks reads video_bank_rows. unsloth emits the deduplicated layout only when this is
+    True: an older chunker would slice the bank as if it were flat and could feed another prompt's video."""
+    return True
+pass
+RL_REPLACEMENTS["grpo_video_bank_supported"] = grpo_video_bank_supported
+
+
+def grpo_video_bank_rows(pixel_values_videos, video_bank_rows, vid_start, vid_end):
+    """Patch rows of videos [vid_start, vid_end) out of a deduplicated bank: a view when they are contiguous
+    in the bank, else one copy of just those rows."""
+    rows = video_bank_rows[vid_start:vid_end]
+    if rows.shape[0] == 0:
+        return pixel_values_videos[:0]
+    rows = rows.tolist()
+    if all(rows[i][1] == rows[i + 1][0] for i in range(len(rows) - 1)):
+        return pixel_values_videos[rows[0][0] : rows[-1][1]]
+    return torch.cat([pixel_values_videos[a:b] for a, b in rows], dim = 0)
+pass
+RL_REPLACEMENTS["grpo_video_bank_rows"] = grpo_video_bank_rows
+
+
+class _GrpoBankRows:
+    # A chunk's video rows out of the bank, built only when the chunk is read: a noncontiguous range (repeated
+    # prompts) is a copy, and holding every chunk's copy at once would bring back the per-generation copies.
+    __slots__ = ("bank", "rows", "start", "end")
+
+    def __init__(self, bank, rows, start, end):
+        self.bank, self.rows, self.start, self.end = bank, rows, start, end
+
+    def materialize(self):
+        return grpo_video_bank_rows(self.bank, self.rows, self.start, self.end)
+
+
+def _grpo_materialize_chunk(chunk):
+    if not any(isinstance(value, _GrpoBankRows) for value in chunk.values()):
+        return chunk
+    return {key: (value.materialize() if isinstance(value, _GrpoBankRows) else value) for key, value in chunk.items()}
+
+
+class _GrpoVisionChunks(list):
+    """grpo_vision_chunks' result: a list whose items are built when read (iteration or indexing), so a forward loop
+    holds one chunk's video rows at a time."""
+
+    def __iter__(self):
+        for chunk in list.__iter__(self):
+            yield _grpo_materialize_chunk(chunk)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return _GrpoVisionChunks(list.__getitem__(self, index))
+        return _grpo_materialize_chunk(list.__getitem__(self, index))
+
 
 def grpo_get_vision_inputs(source):
     """Collect the GRPO multimodal inputs out of a kwargs or inputs mapping."""
@@ -2314,7 +2374,12 @@ def grpo_get_vision_inputs(source):
     get = getattr(source, "get", None)
     if get is None:
         return {}
-    return {key: get(key, None) for key in GRPO_VISION_KEYS}
+    out = {key: get(key, None) for key in GRPO_VISION_KEYS}
+    for key in GRPO_VISION_INDEX_KEYS:
+        value = get(key, None)
+        if value is not None:
+            out[key] = value
+    return out
 pass
 RL_REPLACEMENTS["grpo_get_vision_inputs"] = grpo_get_vision_inputs
 
@@ -2453,7 +2518,10 @@ def grpo_shared_vision_inputs(source):
     keys = grpo_companion_vision_keys()
     if len(keys) == len(GRPO_VISION_KEYS):
         return grpo_get_vision_inputs(source)
-    return {key: value for key, value in grpo_get_vision_inputs(source).items() if key in keys}
+    return {
+        key: value for key, value in grpo_get_vision_inputs(source).items()
+        if key in keys or key in GRPO_VISION_INDEX_KEYS
+    }
 pass
 RL_REPLACEMENTS["grpo_shared_vision_inputs"] = grpo_shared_vision_inputs
 
@@ -2563,6 +2631,7 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
     if num_videos is not None and len(num_videos) != total_samples:
         num_videos = None
     cum_videos = cum_video_rows = None
+    video_bank_rows = vision.get("video_bank_rows", None)
     if pixel_values_videos is not None and video_grid_thw is not None:
         if num_videos is None or sum(num_videos) != video_grid_thw.shape[0]:
             raise ValueError(
@@ -2574,6 +2643,17 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
             torch.zeros(1, dtype = torch.long),
             video_grid_thw.prod(dim = -1).cumsum(0).cpu(),
         ])
+        if video_bank_rows is not None:
+            video_bank_rows = torch.as_tensor(video_bank_rows).cpu()
+            _bank_sizes = video_bank_rows[:, 1] - video_bank_rows[:, 0]
+            if (
+                video_bank_rows.shape[0] != video_grid_thw.shape[0]
+                or not torch.equal(_bank_sizes, video_grid_thw.prod(dim = -1).cpu().to(_bank_sizes.dtype))
+                or (video_bank_rows.numel() > 0 and int(video_bank_rows.max()) > pixel_values_videos.shape[0])
+            ):
+                raise ValueError(
+                    "Unsloth: GRPO video_bank_rows does not match video_grid_thw / pixel_values_videos."
+                )
 
     def _row_axis_is_images(value, flat_ndim):
         """Whether this tensor's first dimension counts IMAGES rather than samples.
@@ -2644,9 +2724,14 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
         if cum_videos is not None:
             vid_start, vid_end = int(cum_videos[start]), int(cum_videos[end])
         if vid_end > vid_start:
-            chunk["pixel_values_videos"] = pixel_values_videos[
-                int(cum_video_rows[vid_start]) : int(cum_video_rows[vid_end])
-            ]
+            if video_bank_rows is not None:
+                chunk["pixel_values_videos"] = _GrpoBankRows(
+                    pixel_values_videos, video_bank_rows, vid_start, vid_end,
+                )
+            else:
+                chunk["pixel_values_videos"] = pixel_values_videos[
+                    int(cum_video_rows[vid_start]) : int(cum_video_rows[vid_end])
+                ]
             chunk["video_grid_thw"] = video_grid_thw[vid_start:vid_end]
             if second_per_grid_ts is not None:
                 chunk["second_per_grid_ts"] = second_per_grid_ts[vid_start:vid_end]
@@ -2732,7 +2817,7 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
             chunk.pop("pixel_values", None)
             chunk.pop("pixel_attention_mask", None)
         chunks.append(chunk)
-    return chunks
+    return _GrpoVisionChunks(chunks) if video_bank_rows is not None else chunks
 pass
 RL_REPLACEMENTS["grpo_vision_chunks"] = grpo_vision_chunks
 
