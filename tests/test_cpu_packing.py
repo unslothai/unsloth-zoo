@@ -119,3 +119,47 @@ def test_padding_free_token_loss_matches_padded():
         grads.append(model.model.layers[0].self_attn.q_proj.weight.grad.clone())
     torch.testing.assert_close(sums[0], sums[1], rtol = 1e-5, atol = 1e-4)
     torch.testing.assert_close(grads[0], grads[1], rtol = 1e-4, atol = 1e-6)
+
+
+@pytest.mark.parametrize("padding_free, packing, strategy, kept", [
+    (False, False, "bfd", False),  # eval-only packing: TRL's collator is not padding-free, no position_ids resets
+    (True, False, "bfd", True),
+    (False, True, "bfd", True),
+    (False, True, "bfd_split", True),
+])
+def test_eval_packing_needs_a_padding_free_collator(monkeypatch, padding_free, packing, strategy, kept):
+    from unsloth_zoo.cpu import trainer
+    monkeypatch.setattr(trainer, "cpu_packing_supported", lambda: True)
+
+    class Args:
+        pass
+    args = Args()
+    args.padding_free, args.packing, args.packing_strategy, args.eval_packing = padding_free, packing, strategy, True
+    args = trainer.normalize_cpu_training_arguments(args)
+    assert args.eval_packing is kept
+    assert (args.padding_free, args.packing) == (padding_free, packing)
+
+
+def test_eval_packing_collator_really_has_no_resets():
+    """The reason for the rule above: TRL's collator without padding_free emits an attention mask, no position_ids."""
+    from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
+    batch = DataCollatorForLanguageModeling(pad_token_id = 0, padding_free = False)(
+        [{"input_ids": [5, 6, 7, 8, 9], "seq_lengths": [3, 2]}]
+    )
+    assert "position_ids" not in batch and "attention_mask" in batch
+
+
+@pytest.mark.parametrize("model", ["facebook/opt-125m", Path("/some/checkpoint")])
+def test_string_model_cannot_skip_the_packing_probe(monkeypatch, model):
+    from unsloth_zoo.cpu import trainer
+    called = []
+    monkeypatch.setattr(trainer, "_packed_examples_isolated", lambda m: called.append(m) or True)
+
+    class Args:
+        packing = True
+        padding_free = True
+        eval_packing = True
+    args = Args()
+    assert trainer._check_cpu_packing(model, args) is False
+    assert (args.packing, args.padding_free, args.eval_packing) == (False, False, False)
+    assert called == []
