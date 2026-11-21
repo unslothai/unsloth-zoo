@@ -25,7 +25,10 @@ import warnings
 import torch
 
 from .runtime import cpu_bf16_supported, cpu_bnb_4bit_supported
-from .ops import Bf16StoredLinear, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, store_frozen_linears_in_bf16
+from .ops import (
+    Bf16StoredLinear, _plain_lm_head, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss,
+    store_frozen_linears_in_bf16,
+)
 
 _DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 # unsloth/Qwen3-0.6B-unsloth-bnb-4bit -> unsloth/Qwen3-0.6B
@@ -271,7 +274,52 @@ def _compile_layers(model):
     dynamic = os.environ.get("UNSLOTH_CPU_COMPILE_DYNAMIC", "1") == "1"
     for layer in layers:
         layer.compile(dynamic = dynamic)
+    _fall_back_to_eager_on_compile_error(layers)
     return len(layers)
+
+
+def _is_control_flow(error):
+    """Exceptions torch raises on purpose through a layer call: non-reentrant checkpointing stops a recomputation
+    early with _StopRecomputationError once it has every saved tensor."""
+    import torch.utils.checkpoint as checkpoint
+    stop = getattr(checkpoint, "_StopRecomputationError", None)
+    return stop is not None and isinstance(error, stop)
+
+
+def _fall_back_to_eager_on_compile_error(layers):
+    """The toolchain probe compiles one small kernel; a decoder layer can still fail to trace or build (an op or a
+    patched module Dynamo / Inductor cannot handle; Dynamo can raise plain AssertionErrors). The first failure of a
+    compiled call drops every layer back to eager and reruns that call eagerly, so a genuine model error still
+    raises, now from eager code."""
+    layers = list(layers)
+    state = {"eager": False}
+
+    def disable(error):
+        if not state["eager"]:
+            state["eager"] = True
+            message = str(error).strip().splitlines()
+            _print(f"torch.compile failed on a decoder layer ({type(error).__name__}: "
+                   f"{message[0][:160] if message else ''}), training eagerly.")
+        for layer in layers:
+            layer._compiled_call_impl = None
+
+    for layer in layers:
+        compiled = layer._compiled_call_impl
+        if compiled is None:
+            continue
+
+        def guarded(*args, _compiled = compiled, _layer = layer, **kwargs):
+            if state["eager"]:
+                return _layer._call_impl(*args, **kwargs)
+            try:
+                return _compiled(*args, **kwargs)
+            except Exception as error:
+                if _is_control_flow(error):
+                    raise
+                disable(error)
+                return _layer._call_impl(*args, **kwargs)
+
+        layer._compiled_call_impl = guarded
 
 
 def _load_msvc_environment():
@@ -323,8 +371,13 @@ def _cpu_compile_unavailable():
         return ("no MSVC: install Visual Studio Build Tools with the C++ workload "
                 "(winget install Microsoft.VisualStudio.2022.BuildTools --override \"--add "
                 "Microsoft.VisualStudio.Workload.VCTools --includeRecommended\")")
+    if os.environ.get("TORCHDYNAMO_DISABLE", "").strip().lower() in ("1", "true"):
+        # Studio's Windows Triton gate sets it; torch.compile then runs eagerly and the probe below would still pass.
+        return "TORCHDYNAMO_DISABLE=1"
     try:
         import torch._dynamo
+        if getattr(torch._dynamo.config, "disable", False):
+            return "torch._dynamo.config.disable is set"
         x = torch.linspace(-4, 4, 64)  # not randn: the probe must not move the RNG that seeds LoRA init
         out = torch.compile(lambda t: torch.nn.functional.silu(t) * 2, dynamic = False)(x)
         if not torch.allclose(out, torch.nn.functional.silu(x) * 2):
@@ -338,6 +391,49 @@ def _cpu_compile_unavailable():
             torch._dynamo.reset()
         except Exception:
             pass
+
+
+# Checked compiled vs eager in fp32 (tiny Llama / Mistral / Qwen2 / Qwen3 / Phi-3 / Gemma / OLMo-2, SmolLM2-135M).
+_CPU_COMPILE_MODEL_TYPES = frozenset(("llama", "mistral", "qwen2", "qwen3", "phi3", "gemma", "olmo2"))
+
+
+def compile_cpu_layers(model, explicit = False):
+    """Compiles the decoder layers when Inductor can build CPU kernels here. Returns the layer count (0 = eager)."""
+    if getattr(model, "_unsloth_cpu_compiled", False):
+        return 0
+    reason = _cpu_compile_unavailable()
+    if reason is not None:
+        if explicit:
+            _print(f"UNSLOTH_CPU_COMPILE=1 ignored, training eagerly: torch.compile cannot build CPU kernels here ({reason}).")
+        else:
+            _print(f"torch.compile cannot build CPU kernels here ({reason}), training eagerly.")
+        return 0
+    count = _compile_layers(model)
+    model._unsloth_cpu_compiled = True
+    _print(f"torch.compile (Inductor C++) on {count} decoder layers." + ("" if explicit else " UNSLOTH_CPU_COMPILE=0 trains eagerly."))
+    return count
+
+
+def _cpu_compile_wanted(model):
+    """"explicit" for UNSLOTH_CPU_COMPILE=1, "auto" for the dense architectures whose compiled layers were checked
+    against eager (fp32 loss equal, gradients within 1e-6 relative; ~24% less CPU time per step after a one-off
+    compile), None otherwise or for UNSLOTH_CPU_COMPILE=0. Quantized models stay eager (bitsandbytes ops)."""
+    value = os.environ.get("UNSLOTH_CPU_COMPILE", "").strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return "explicit"
+    if value in ("0", "false", "no", "off"):
+        return None
+    config = getattr(model, "config", None)
+    if getattr(config, "quantization_config", None) is not None or getattr(model, "is_loaded_in_4bit", False) \
+            or getattr(model, "is_loaded_in_8bit", False):
+        return None
+    text = getattr(config, "get_text_config", lambda: config)()
+    if getattr(text, "model_type", None) not in _CPU_COMPILE_MODEL_TYPES:
+        return None
+    try:
+        return "auto" if _plain_lm_head(model) else None
+    except Exception:
+        return None
 
 
 def _non_reentrant_checkpointing_on(model):
@@ -568,14 +664,12 @@ class FastCPUModel:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
         # Training forwards never reuse a KV cache; generate() turns it back on via for_inference.
         model.config.use_cache = False
-        if os.environ.get("UNSLOTH_CPU_COMPILE", "0") == "1" and not getattr(model, "_unsloth_cpu_compiled", False):
-            reason = _cpu_compile_unavailable()
-            if reason is not None:
-                _print(f"UNSLOTH_CPU_COMPILE=1 ignored, training eagerly: torch.compile cannot build CPU kernels here ({reason}).")
-                return
-            count = _compile_layers(model)
-            model._unsloth_cpu_compiled = True
-            _print(f"torch.compile (Inductor C++) on {count} decoder layers.")
+        wanted = _cpu_compile_wanted(model)
+        if wanted == "auto":
+            # Decided by the trainer once it has timed eager steps: a short run never repays the cold compile.
+            model._unsloth_cpu_compile_pending = True
+        elif wanted and not getattr(model, "_unsloth_cpu_compiled", False):
+            compile_cpu_layers(model, explicit = True)
 
     @staticmethod
     def get_peft_model(

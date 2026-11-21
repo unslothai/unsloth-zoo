@@ -20,6 +20,7 @@ __all__ = ["install_cpu_training_defaults", "normalize_cpu_training_arguments"]
 
 import functools
 import json
+import os
 
 import torch
 
@@ -83,6 +84,74 @@ def normalize_cpu_training_arguments(args):
         kwargs.setdefault("use_reentrant", False)
         args.gradient_checkpointing_kwargs = kwargs
     return args
+
+
+# Compiling the decoder layers cost 7 s (warm Inductor cache) to 138 s (cold, Qwen3-0.6B on a loaded 2-core slot) and
+# saved 24% of a SmolLM2-135M step. Auto mode times eager steps first and compiles only when the steps left would repay a
+# cold compile at a conservative saving: UNSLOTH_CPU_COMPILE_COST_S / UNSLOTH_CPU_COMPILE_SAVING override the estimates.
+_COMPILE_COLD_SECONDS = 150.0
+
+
+_COMPILE_SAVING = 0.2
+
+
+_COMPILE_DECIDE_STEP = 2  # step 1 also pays for dataloader / allocator warm-up
+
+
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def _compile_worth_it(eager_step_seconds, steps_left):
+    """(compile?, seconds saved, cold compile estimate)."""
+    cost = _env_float("UNSLOTH_CPU_COMPILE_COST_S", _COMPILE_COLD_SECONDS)
+    saved = max(0, steps_left) * eager_step_seconds * _env_float("UNSLOTH_CPU_COMPILE_SAVING", _COMPILE_SAVING)
+    return saved > cost, saved, cost
+
+
+def _compile_target(model):
+    for candidate in (model, getattr(model, "base_model", None), getattr(getattr(model, "base_model", None), "model", None)):
+        if candidate is not None and vars(candidate).get("_unsloth_cpu_compile_pending", False):
+            return candidate
+    return None
+
+
+def _install_compile_gate(trainer):
+    """Auto CPU compile: time an eager step, then compile from the next step only if the rest of the run repays it."""
+    target = _compile_target(getattr(trainer, "model", None))
+    if target is None:
+        return None
+    import time
+    from transformers import TrainerCallback
+
+    class _UnslothCPUCompileGate(TrainerCallback):
+        def __init__(self):
+            self.started = None
+
+        def on_step_begin(self, args, state, control, **kwargs):
+            self.started = time.perf_counter()
+
+        def on_step_end(self, args, state, control, **kwargs):
+            if self.started is None or state.global_step < _COMPILE_DECIDE_STEP or \
+                    not vars(target).get("_unsloth_cpu_compile_pending", False):
+                return
+            seconds = time.perf_counter() - self.started
+            target._unsloth_cpu_compile_pending = False
+            steps_left = (state.max_steps or 0) - state.global_step
+            worth, saved, cost = _compile_worth_it(seconds, steps_left)
+            if worth:
+                from .loader import compile_cpu_layers
+                compile_cpu_layers(target)
+            else:
+                print(f"Unsloth (CPU): staying eager: {steps_left} steps left at {seconds:.1f} s would save about "
+                      f"{saved:.0f} s with torch.compile, under its ~{cost:.0f} s cold compile. "
+                      "UNSLOTH_CPU_COMPILE=1 compiles anyway.")
+
+    trainer.add_callback(_UnslothCPUCompileGate())
+    return True
 
 
 def _patch_post_init(cls):
@@ -285,6 +354,7 @@ def _make_cpu_sft_trainer(base):
                 if serial:
                     training_args.dataset_num_proc = num_proc
             _count_items_for_sft_loss(self)
+            _install_compile_gate(self)
 
     # Pickled by reference: by value (TRL's tokenize map, dataset_num_proc > 1) fails on torch config modules.
     SFTTrainer.__module__ = __name__
