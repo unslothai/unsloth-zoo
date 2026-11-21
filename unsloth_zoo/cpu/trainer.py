@@ -304,6 +304,9 @@ def __getattr__(name):
 def install_cpu_training_defaults():
     """Idempotent. Only ever called from a CPU-backend process."""
     import sys
+    from .runtime import fit_cpu_threads
+    # Before any kernel runs: the pool size is read on first use by every op.
+    fit_cpu_threads()
     from transformers import Trainer, TrainingArguments
     _patch_post_init(TrainingArguments)
     if hasattr(Trainer, "create_accelerator_and_postprocess"):

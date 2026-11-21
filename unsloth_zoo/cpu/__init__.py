@@ -22,6 +22,8 @@ from .runtime import (
     cpu_capabilities,
     cpu_bf16_supported,
     cpu_bnb_4bit_supported,
+    cpu_compute_cores,
+    fit_cpu_threads,
 )
 from .loader import FastCPUModel
 from .trainer import install_cpu_training_defaults
