@@ -270,6 +270,9 @@ def test_backward_only_compile_error_falls_back_to_eager(monkeypatch, capsys):
             raise RuntimeError("backward lowering failed")
         return original(*args, **kwargs)
     monkeypatch.setattr(compile_fx, "_compile_fx_inner", backward_fails)
+    # Importing unsloth's GPU model utilities (as other tests in this process may) sets suppress_errors = True, and
+    # Dynamo then swallows the injected failure before the fallback sees it; a CPU-only Unsloth process leaves it False.
+    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False)
     from peft import LoraConfig, get_peft_model
     torch._dynamo.reset()
     torch.manual_seed(0)
