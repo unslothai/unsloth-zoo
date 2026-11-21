@@ -59,16 +59,55 @@ def _save_attention_setting():
 
 
 _WARNED_HIP = [False]
+_ROCM_SDPA_KEPT = {}
+
+
+class _OpNames(TorchDispatchMode):
+    def __init__(self):
+        super().__init__()
+        self.ops = []
+
+    def __torch_dispatch__(self, func, types, args = (), kwargs = None):
+        self.ops.append(func)
+        return func(*args, **(kwargs or {}))
+
+
+def _rocm_sdpa_is_kept():
+    """ROCm: whether a training SDPA call on the current GPU runs one attention kernel this module keeps.
+    torch 2.11 + ROCm 7.13 on gfx1151 dispatches _scaled_dot_product_flash_attention (kept, bit-identical
+    replay); a build that decomposes SDPA into matmul + softmax keeps nothing and only adds graph breaks.
+    Probed once per device with a tiny bf16 causal call; CPU tensors use the CPU kernel, which is kept."""
+    if not torch.cuda.is_available():
+        return True
+    try:
+        index = torch.cuda.current_device()
+    except Exception:
+        return False
+    found = _ROCM_SDPA_KEPT.get(index)
+    if found is not None:
+        return found
+    if torch.compiler.is_compiling():
+        return False
+    try:
+        q = torch.zeros(1, 2, 16, 64, device = f"cuda:{index}", dtype = torch.bfloat16, requires_grad = True)
+        mode = _OpNames()
+        with torch.enable_grad(), mode:
+            torch.nn.functional.scaled_dot_product_attention(q, q, q, is_causal = True)
+        found = any(_is_attention_forward(func) for func in mode.ops)
+    except Exception:
+        found = False
+    _ROCM_SDPA_KEPT[index] = found
+    return found
 
 
 def save_attention_enabled():
     if _save_attention_setting() not in ("1", "true", "yes", "on", "offload"):
         return False
-    # ROCm SDPA kernels are not intercepted: nothing is kept, only graph breaks are added.
-    if getattr(torch.version, "hip", None):
+    # ROCm: only where SDPA runs a kernel the dispatch mode intercepts; elsewhere nothing would be kept.
+    if getattr(torch.version, "hip", None) and not _rocm_sdpa_is_kept():
         if not _WARNED_HIP[0]:
             _WARNED_HIP[0] = True
-            print("Unsloth: UNSLOTH_GC_SAVE_ATTENTION is not supported on ROCm yet and is ignored.")
+            print("Unsloth: UNSLOTH_GC_SAVE_ATTENTION is ignored on this ROCm GPU: its SDPA kernels are not intercepted.")
         return False
     return True
 

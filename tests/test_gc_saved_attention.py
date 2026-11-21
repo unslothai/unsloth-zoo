@@ -264,14 +264,41 @@ def test_function_level_with_q_k_v_split_from_one_buffer(monkeypatch):
     assert SA.SAVED_ATTENTION_STATS["reused"] == 2
 
 
-def test_rocm_keeps_the_mode_off(monkeypatch):
+def test_rocm_keeps_the_mode_off_where_sdpa_is_not_intercepted(monkeypatch):
     from unsloth_zoo import saved_attention as sa
     monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
     monkeypatch.setattr(torch.version, "hip", "6.4", raising = False)
+    monkeypatch.setattr(sa, "_rocm_sdpa_is_kept", lambda: False)
     assert sa.save_attention_enabled() is False
     assert sa.new_saved_attention_frame([torch.zeros(1, requires_grad = True)]) is None
-    monkeypatch.setattr(torch.version, "hip", None, raising = False)
+    monkeypatch.setattr(sa, "_rocm_sdpa_is_kept", lambda: True)
     assert sa.save_attention_enabled() is True
+    monkeypatch.setattr(torch.version, "hip", None, raising = False)
+    monkeypatch.setattr(sa, "_rocm_sdpa_is_kept", lambda: False)
+    assert sa.save_attention_enabled() is True
+
+
+def test_rocm_probe_reads_the_dispatched_kernel(monkeypatch):
+    from unsloth_zoo import saved_attention as sa
+    monkeypatch.setattr(sa, "_ROCM_SDPA_KEPT", {})
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert sa._rocm_sdpa_is_kept() is True  # CPU tensors: the CPU kernel is intercepted
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(sa, "_ROCM_SDPA_KEPT", {0: False})
+    assert sa._rocm_sdpa_is_kept() is False  # cached per device, no second probe
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
+def test_rocm_probe_matches_a_real_training_call(monkeypatch):
+    from unsloth_zoo import saved_attention as sa
+    monkeypatch.setattr(sa, "_ROCM_SDPA_KEPT", {})
+    probed = sa._rocm_sdpa_is_kept()
+    q = torch.randn(1, 8, 128, 64, device = "cuda", dtype = torch.bfloat16, requires_grad = True)
+    mode = sa._OpNames()
+    with torch.enable_grad(), mode:
+        torch.nn.functional.scaled_dot_product_attention(q, q, q, is_causal = True)
+    assert probed is any(sa._is_attention_forward(func) for func in mode.ops)
 
 
 def _math_attention(q, k, v, keep):
