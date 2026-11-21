@@ -326,6 +326,8 @@ def _graph_writes_freed_workspace(pin):
 def test_pinned_workspace_survives_a_clear():
     if getattr(torch.cuda, "MemPool", None) is None or getattr(torch.cuda, "use_mem_pool", None) is None:
         pytest.skip("this torch has no torch.cuda.MemPool")
+    if not vllm_utils._cublas_workspace_cached() or torch.cuda.get_allocator_backend() != "native":
+        pytest.skip("per-call cuBLAS workspaces or a non-native allocator: nothing is held")
     hazard = _graph_writes_freed_workspace(pin = False)
     assert not _graph_writes_freed_workspace(pin = True)
     if not hazard:
