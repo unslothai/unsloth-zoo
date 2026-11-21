@@ -111,3 +111,26 @@ def test_not_enough_disk_keeps_ram(fresh, monkeypatch):
     monkeypatch.setattr(shutil, "disk_usage", lambda p: SimpleNamespace(total = 1, used = 1, free = 0))
     assert dataset_utils._map_to_disk_kwargs(_rows()) == {}
     assert not os.listdir(fresh)
+
+
+def test_stale_dirs_of_exited_processes_are_swept(fresh, monkeypatch):
+    """Windows keeps a still-mapped file at exit; the next run removes dirs whose process is gone."""
+    import subprocess
+    import sys
+
+    monkeypatch.setenv("UNSLOTH_DATASET_MAP_TO_DISK", "1")
+    monkeypatch.setattr(dataset_utils, "_SWEEP_STALE_MAP_DIRS", True, raising = False)
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    stale = fresh / f"unsloth_dataset_{child.pid}_abc"
+    stale.mkdir()
+    (stale / "tokenized_old.arrow").write_bytes(b"x")
+    live = fresh / f"unsloth_dataset_{os.getppid()}_abc"
+    live.mkdir()
+    unrelated = fresh / "unsloth_dataset_notapid"
+    unrelated.mkdir()
+    out = _prepare(_rows())
+    assert out.cache_files
+    assert not stale.exists(), "a dead process's dir was left behind"
+    assert live.exists() and unrelated.exists()
+    assert os.path.basename(os.path.dirname(out.cache_files[0]["filename"])).startswith(f"unsloth_dataset_{os.getpid()}_")

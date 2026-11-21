@@ -2898,6 +2898,28 @@ def _row_tools(example):
 
 # Faster SFTTrainer prepare_dataset
 _MAP_TO_DISK_DIR = None
+# Windows cannot delete a file that is still memory-mapped, and the tokenized dataset is usually still
+# alive when the atexit cleanup runs, so each run would leave its dir behind; the next run removes them.
+_SWEEP_STALE_MAP_DIRS = __import__("os").name == "nt"
+
+
+def _sweep_stale_map_dirs(parent):
+    """Remove `unsloth_dataset_<pid>_*` dirs in `parent` whose process has exited."""
+    import os
+    import re
+    import shutil
+
+    try:
+        import psutil
+
+        for name in os.listdir(parent):
+            matched = re.match(r"unsloth_dataset_(\d+)_", name)
+            if matched is None or int(matched.group(1)) == os.getpid():
+                continue
+            if not psutil.pid_exists(int(matched.group(1))):
+                shutil.rmtree(os.path.join(parent, name), ignore_errors = True)
+    except Exception:
+        pass
 
 
 def _map_to_disk_kwargs(dataset):
@@ -2935,7 +2957,9 @@ def _map_to_disk_kwargs(dataset):
             parent = os.environ.get("UNSLOTH_DATASET_MAP_TO_DISK_DIR") or tempfile.gettempdir()
             if shutil.disk_usage(parent).free < 4 * source_bytes:
                 return {}
-            _MAP_TO_DISK_DIR = tempfile.mkdtemp(prefix = "unsloth_dataset_", dir = parent)
+            if _SWEEP_STALE_MAP_DIRS:
+                _sweep_stale_map_dirs(parent)
+            _MAP_TO_DISK_DIR = tempfile.mkdtemp(prefix = f"unsloth_dataset_{os.getpid()}_", dir = parent)
             import atexit
 
             atexit.register(shutil.rmtree, _MAP_TO_DISK_DIR, ignore_errors = True)
