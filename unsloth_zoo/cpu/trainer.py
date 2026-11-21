@@ -86,13 +86,24 @@ def normalize_cpu_training_arguments(args):
     return args
 
 
+def _args_checkpointing(training_args):
+    # transformers >= 5.24 reads activation_checkpointing; gradient_checkpointing is its deprecated alias.
+    return bool(getattr(training_args, "gradient_checkpointing", False) or getattr(training_args, "activation_checkpointing", False))
+
+
+def _args_checkpointing_off(training_args):
+    training_args.gradient_checkpointing = False
+    if hasattr(training_args, "activation_checkpointing"):
+        training_args.activation_checkpointing = False
+
+
 def _auto_cpu_gradient_checkpointing(model, training_args):
     """use_gradient_checkpointing = False on the model wins over SFTConfig's gradient_checkpointing = True default,
     which would turn recomputation back on."""
-    if not isinstance(model, torch.nn.Module) or not getattr(training_args, "gradient_checkpointing", False):
+    if not isinstance(model, torch.nn.Module) or not _args_checkpointing(training_args):
         return None
     if getattr(model, "_unsloth_cpu_gradient_checkpointing", None) is False:
-        training_args.gradient_checkpointing = False
+        _args_checkpointing_off(training_args)
         return True
     return None
 
