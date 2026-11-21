@@ -123,3 +123,69 @@ def test_streamed_merge_tied_embeddings_match(tmp_path):
     new, new_config = _read_checkpoint(tmp_path / "stream")
     assert set(ref) == set(new) and "lm_head.weight" not in new
     assert all(torch.equal(ref[k], new[k]) for k in ref) and ref_config == new_config
+
+
+def _tiny_llama():
+    import transformers
+    config = transformers.LlamaConfig(hidden_size = 64, intermediate_size = 128, num_hidden_layers = 2,
+                                      num_attention_heads = 4, num_key_value_heads = 2, vocab_size = 256)
+    torch.manual_seed(0)
+    return transformers.LlamaForCausalLM(config)
+
+
+def _assert_save_merged_matches_copy(model, tmp_path):
+    from unsloth_zoo.cpu import loader
+    merged, _ = loader._merged_copy(model, "merged_16bit")
+    merged.save_pretrained(tmp_path / "copy")
+    del merged
+    loader._save_merged(model, str(tmp_path / "out"), "merged_16bit")
+    ref, ref_config = _read_checkpoint(tmp_path / "copy")
+    new, new_config = _read_checkpoint(tmp_path / "out")
+    assert set(new) == set(ref)
+    assert all(torch.equal(ref[k], new[k]) for k in ref) and ref_config == new_config
+
+
+@pytest.mark.parametrize("adapter", ["trainable_token_indices", "ia3", "dora"])
+def test_streamed_merge_falls_back_for_peft_it_cannot_merge(tmp_path, adapter):
+    """Token adapters, IA3 and DoRA: the streamed writer would leave adapter tensors / unmerged or wrong weights."""
+    from peft import IA3Config, LoraConfig, get_peft_model
+    from unsloth_zoo.cpu import loader
+    if adapter == "trainable_token_indices":
+        config = LoraConfig(r = 4, target_modules = ["q_proj"], trainable_token_indices = [0, 1])
+    elif adapter == "ia3":
+        config = IA3Config(target_modules = ["k_proj", "v_proj", "down_proj"], feedforward_modules = ["down_proj"],
+                           init_ia3_weights = False)
+    else:
+        config = LoraConfig(r = 4, target_modules = ["q_proj"], use_dora = True, init_lora_weights = False)
+    torch.manual_seed(0)
+    model = get_peft_model(_tiny_llama(), config)
+    if adapter == "trainable_token_indices":
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if "trainable_tokens_delta" in name:
+                    parameter.add_(1.0)
+    assert loader._stream_merge_source(model) is None
+    assert loader._stream_merged_save(model, str(tmp_path / "x"), "merged_16bit") is False
+    _assert_save_merged_matches_copy(model, tmp_path)
+
+
+def test_streamed_merge_keeps_checkpoint_conversions(tmp_path):
+    """transformers 5 saves Qwen3MoE experts back in the per-expert checkpoint layout; the merged save must too."""
+    import transformers
+    from peft import LoraConfig, get_peft_model
+    if not hasattr(transformers, "Qwen3MoeConfig"):
+        pytest.skip("no Qwen3MoE in this transformers")
+    config = transformers.Qwen3MoeConfig(hidden_size = 64, intermediate_size = 128, moe_intermediate_size = 32,
+                                         num_hidden_layers = 2, num_attention_heads = 4, num_key_value_heads = 2,
+                                         vocab_size = 256, num_experts = 4, num_experts_per_tok = 2, head_dim = 16)
+    torch.manual_seed(0)
+    model = get_peft_model(transformers.Qwen3MoeForCausalLM(config),
+                           LoraConfig(r = 4, target_modules = ["q_proj"], init_lora_weights = False))
+    _assert_save_merged_matches_copy(model, tmp_path)
+
+
+def test_streamed_merge_still_streams_plain_lora():
+    from unsloth_zoo.cpu import loader
+    from peft import LoraConfig, get_peft_model
+    model = get_peft_model(_tiny_llama(), LoraConfig(r = 4, target_modules = ["q_proj", "v_proj"]))
+    assert loader._stream_merge_source(model) is not None

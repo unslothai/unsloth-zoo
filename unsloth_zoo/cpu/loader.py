@@ -822,31 +822,61 @@ def _merged_copy(model, save_method):
 
 
 def _stream_merge_source(model):
-    """The transformers model whose live weights a streamed merge reads, or None when the merge needs the full copy:
-    LoRA on Linear layers only (no modules_to_save, embedding / conv LoRA, already merged adapters), no 4-bit,
-    no remote code (save_pretrained also copies its modeling files)."""
+    """The transformers model whose live weights a streamed merge reads, or None when the merge needs the full copy.
+    Allowlist: plain LoRA on Linear layers (no DoRA, lora_bias, already merged adapters), no other PEFT tuner
+    (IA3, trainable token adapters, modules_to_save, ...), no 4-bit, no remote code (save_pretrained also copies its
+    modeling files)."""
     try:
         from peft import PeftModel
         from peft.tuners.lora import LoraLayer
         from peft.tuners.lora.layer import Linear as LoraLinear
+        from peft.tuners.tuners_utils import BaseTunerLayer
     except Exception:
         return None
     if os.environ.get("UNSLOTH_CPU_STREAM_MERGE", "1") == "0":
         return None
+    if isinstance(model, PeftModel):
+        configs = getattr(model, "peft_config", None) or {}
+        if any(str(getattr(config, "peft_type", "")).rsplit(".", 1)[-1] != "LORA" for config in configs.values()):
+            return None
     hf = model.get_base_model() if isinstance(model, PeftModel) else model
     if not hasattr(hf, "save_pretrained") or getattr(hf, "_auto_class", None) is not None:
         return None
     if getattr(getattr(hf, "config", None), "quantization_config", None) is not None:
         return None
+    if getattr(hf, "_checkpoint_conversion_mapping", None):
+        return None  # transformers 4.x VLMs: save_pretrained renames keys back to the checkpoint layout
     for module in hf.modules():
-        if type(module).__name__ in ("ModulesToSaveWrapper", "Linear4bit", "Linear8bitLt"):
+        name = type(module).__name__
+        if name in ("ModulesToSaveWrapper", "TrainableTokensWrapper", "Linear4bit", "Linear8bitLt") or \
+            "AuxiliaryTrainingWrapper" in (cls.__name__ for cls in type(module).__mro__):
             return None
+        if isinstance(module, BaseTunerLayer) and not isinstance(module, LoraLayer):
+            return None  # IA3, trainable token adapters, other tuners: only merge_and_unload knows their merge
         if isinstance(module, LoraLayer):
             if type(module) is not LoraLinear or getattr(module, "merged_adapters", None):
                 return None
             if any(getattr(module, "lora_bias", {}).get(name, False) for name in module.active_adapters):
                 return None
+            if any(getattr(module, "use_dora", {}).get(name, False) for name in module.active_adapters):
+                return None
     return hf
+
+
+def _save_keeps_live_layout(hf, entries):
+    """True when save_pretrained would write the live names / shapes. transformers 5 reverts its checkpoint conversions
+    on save (e.g. Qwen3MoE fused experts back to per-expert weights): dry-run that revert on meta tensors and stream
+    only when it changes nothing."""
+    try:
+        from transformers.core_model_loading import revert_weight_conversion
+    except Exception:
+        return True  # transformers 4.x: no save-time conversion beyond _checkpoint_conversion_mapping (checked above)
+    meta = {out: torch.empty(shape, dtype = dtype, device = "meta") for out, _, dtype, _, shape in entries}
+    try:
+        reverted = revert_weight_conversion(hf, dict(meta))
+    except Exception:
+        return False
+    return set(reverted) == set(meta) and all(tuple(reverted[k].shape) == tuple(meta[k].shape) for k in meta)
 
 
 def _merged_weight(module, to_float):
@@ -957,6 +987,8 @@ def _stream_merged_save(model, save_directory, save_method, max_shard_size = Non
         if target is not None and dtype.is_floating_point:
             dtype = target
         entries.append((out, make, dtype, tensor.numel(), tuple(tensor.shape)))
+    if not _save_keeps_live_layout(hf, entries):
+        return False
 
     limit = _shard_bytes(max_shard_size or "5GB")
     shards, current, size = [], [], 0
