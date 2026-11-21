@@ -4,6 +4,7 @@ import contextlib
 import itertools
 import json
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -1662,6 +1663,124 @@ def test_the_fused_verify_block_matches_the_verifiers_ops_with_grouped_value_hea
                for x, y in zip(got, (norm(out, z), final, q, k, v)))
 
 
+def test_pathsum_admission_requires_both_variant_probes(monkeypatch):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import attention, inference as I
+    args = SimpleNamespace(linear_num_key_heads = 16, linear_num_value_heads = 48,
+                           num_attention_heads = 24, num_key_value_heads = 4, head_dim = 256)
+    language = SimpleNamespace(model = nn.Module(), args = args)
+    gdn = (I._PATHSUM_PROBE_KEY, I.__name__, "probe_gdn_pathsum", attention.invariant_attention_available)
+    half = (attention.INVARIANT_HALF_PROBE_KEY, attention.__name__, "probe_invariant_half_attention")
+    monkeypatch.setattr(I.nax, "kernel_probe_passed", lambda *probe: probe in passed)
+    monkeypatch.setattr(I.nax, "nax_available", lambda: True)
+    for passed in (set(), {gdn}, {half}, {gdn, half}):
+        assert I._pathsum_verify_supported(language) == (len(passed) == 2)
+    for keys, values, heads, kv, dim, supported in (
+        (12, 36, 16, 2, 256, True), (16, 32, 24, 4, 256, True), (16, 8, 24, 4, 256, False),
+        (16, 48, 24, 5, 256, False), (16, 48, 24, 4, 128, False), (2**18, 2**19, 24, 4, 256, False), (16, 48, 24, 4, 256, True)):
+        args.linear_num_key_heads, args.linear_num_value_heads = keys, values
+        args.num_attention_heads, args.num_key_value_heads, args.head_dim = heads, kv, dim
+        assert I._pathsum_verify_supported(language) == supported
+    monkeypatch.setattr(I.nax, "nax_available", lambda: False)
+    passed, affine = {gdn}, nn.QuantizedLinear(64, 64, bits = 4)
+    for extra in ([], [nn.Linear(64, 64)], [nn.QuantizedLinear(64, 64, bits = 8)], [nn.QuantizedLinear(64, 64, mode = "mxfp4")]):
+        language.model.layers = [affine, *extra]
+        assert I._pathsum_verify_supported(language) == (not extra)
+
+
+@pytest.fixture
+def pathsum_engine(monkeypatch):
+    import mlx.nn as nn
+    from mlx_vlm.models import qwen3_5, qwen3_5_moe
+    from unsloth_zoo.mlx import inference as I, nax, speculative as S
+    from unsloth_zoo.mlx.loader import _ensure_exact_verify_sums_promoted, _ensure_verify_qk_norm_matches_decode
+    _ensure_exact_verify_sums_promoted()
+    _ensure_verify_qk_norm_matches_decode()
+    moe = nax.nax_available()
+    family = qwen3_5_moe if moe else qwen3_5
+    name = family.__name__.split(".")[-1]
+    args = family.TextConfig.from_dict(dict(model_type = name + "_text", hidden_size = 128, vocab_size = 256, intermediate_size = 256,
+                       num_experts = 8, num_experts_per_tok = 2, shared_expert_intermediate_size = 256, moe_intermediate_size = 256,
+                       num_hidden_layers = 3, full_attention_interval = 2, linear_conv_kernel_dim = 4, rms_norm_eps = 1e-6,
+                       num_attention_heads = 16 if moe else 24, num_key_value_heads = 2 if moe else 4, head_dim = 256, max_position_embeddings = 4096,
+                       linear_num_key_heads = 16, linear_num_value_heads = 32 if moe else 48, linear_key_head_dim = 128, linear_value_head_dim = 128))
+    lm = family.LanguageModel(args, family.ModelConfig(args, family.VisionConfig(), name))
+    lm.set_dtype(mx.bfloat16)
+    nn.quantize(lm, bits = 4, group_size = 64)
+    if not I._pathsum_verify_supported(lm):
+        pytest.skip("path-sum verify is unavailable for this model and GPU")
+    with _tree_mode(lm.eval(), monkeypatch):
+        assert lm._unsloth_pathsum_verify
+        engine = S.SpeculativeEngine(lm, S.DraftController(max_depth = 7))
+        prompt = list(range(96))
+        cache, _, _ = _prefill(lm, prompt, SimpleNamespace(temperature = 0, seed = 0))
+        engine.add(S.EngineRow(cache, 0, prompt, max_tokens = 9))
+        yield engine
+
+
+@pytest.mark.parametrize("sized,cutoff", [(False, 4), (True, 4), (True, 8)])
+def test_pathsum_tree_budget_keeps_the_widths_that_match(pathsum_engine, monkeypatch, sized, cutoff):
+    from unsloth_zoo.mlx import inference as I, speculative as S
+    drafter = object.__new__(S.ContextDrafter)
+    drafter.tree_widths, drafter.sized_trees, drafter.trained_depth = (8, 16), sized, 7
+    pathsum_engine.drafter, row = drafter, pathsum_engine._rows[0]
+    row.draft = draft = S.ContextRow([])
+    draft.prefetched_tree = SimpleNamespace(tokens = mx.arange(16))
+    drafter._context, drafter._tree = Mock(), Mock()
+    monkeypatch.setattr(I, "tree_verify_matches", checked := Mock(side_effect = lambda engine, width = 4: width != 16))
+    monkeypatch.setattr(I, "_LANE_LOW_ROWS", cutoff)
+    warm = Mock(lm = pathsum_engine.lm, _rows = [row], _stream = pathsum_engine._stream)
+    S._warm_trees(warm, drafter)
+    assert [call.args[1] if len(call.args) > 1 else 4 for call in checked.call_args_list] == ([4, 8, 16] if cutoff == 4 else [4, 16])
+    assert {call.args[0].tree for call in warm._round.call_args_list} == ({8} if sized else {0, 8})
+    assert list(drafter.tree_budget.load_costs if sized else drafter.tree_budget.tree_costs) == [8]
+    plan = S.RoundPlan("round", rows = (S.RowPlan("draft", 7),))
+    scheduled = pathsum_engine._tree_plan(plan, pathsum_engine._states())
+    assert drafter.tree(draft, scheduled.tree) is drafter._tree.return_value
+    drafter._tree.assert_called_once_with(draft.pending, drafter._context.return_value, draft.cache, 8, draft.scan)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_pathsum_attention_rounds_history_weights_at_split_boundaries(monkeypatch, dtype):
+    from unsloth_zoo.mlx import attention, inference as I
+    if not I.nax.nax_available():
+        pytest.skip("FP16 history weights need tensor units")
+    first, tail, reduce = attention._invariant_kernels(True)
+    launch = Mock(side_effect = first)
+    monkeypatch.setattr(attention, "_invariant_kernels", lambda half: (launch, tail, reduce) if half else pytest.fail("stock history weights"))
+    monkeypatch.setattr(I._VERIFY_STATE, "pathsum", True, raising = False)
+    q = mx.broadcast_to(mx.array([-16.0, -1.0], dtype)[None, :, None, None], (1, 2, 8, 256))
+    keys = mx.broadcast_to(((mx.arange(280) % 2)[:, None] * (mx.arange(256) == 0)).astype(dtype), (1, 1, 280, 256))
+    mx.eval(I._verify_invariant_attention(I._LANE_LOW_ROWS + 1)(q, keys, 1024 * keys, 1.0))
+    partials, _ = first(**launch.call_args.kwargs)
+    rounded = (mx.exp(q[0, :, 0, 0].astype(mx.float32)) * 32768).astype(mx.float16).astype(mx.float32) / 32768
+    assert mx.allclose(partials.reshape(2, 8, 2, 256)[:, :, 0, 0], rounded[:, None] * 1024 * 128, rtol = 1e-5, atol = 0).item()
+
+
+@pytest.mark.parametrize("keep, accepted", [(4, 2), (5, 4), (8, 7)])
+def test_pathsum_sized_tree_commits_each_layers_verified_rows(pathsum_engine, monkeypatch, keep, accepted):
+    from unsloth_zoo.mlx import inference as I
+    lm, cache, tokens = pathsum_engine.lm, pathsum_engine.cache, list(range(8))
+    monkeypatch.setattr(I, "_LANE_LOW_ROWS", 4)
+    _chain_verified(lm, cache, tokens[:keep])
+    assert I.tree_verify_matches(pathsum_engine, len(tokens))
+    tree, paths = _tree_block(list(range(-1, 7)) if keep == 8 else [-1, 0, 0, 0, 3, 0, 5, 6])
+    branch, reference, chain = _clone(cache), _clone(cache), paths[accepted]
+    logits, tx = _tree_verified(lm, branch, tokens, tree, lambda: keep)
+    tapes = tx._unsloth_tapes
+    assert [(t.replay.args[0].shape[1], t.has_final) for t in tapes] == [(8, False), (keep, keep <= 4)]
+    causal, chain_tx = _tree_verified(lm, reference, chain + [7] * (8 - len(chain)), _tree_block(list(range(-1, 7)))[0], lambda: keep)
+    assert _bits(logits[chain], causal[:len(chain)])
+    I.tree_commit(tx, branch, chain)
+    for tape, expected in zip(tapes, chain_tx._unsloth_tapes, strict = True):
+        args = expected.replay.args
+        retained = [x[:, :len(chain)] for x in args[:5]]
+        assert all(_bits(x[:, chain], y) for x, y in zip(tape.replay.args[:5], retained))
+        assert _bits(tape.cache[tape.index], expected.replay.func(*retained, *args[5:], **expected.replay.keywords)[1])
+        assert keep == 8 or tape.cache._unsloth_pending_path[-1].tolist() == chain
+    chain_tx.abort()
+
+
 def test_replay_admission_refuses_a_replay_one_bit_off_or_misreading_retained_lengths():
     from functools import partial
     from mlx_vlm.models.qwen3_5.gated_delta import gated_delta_update_with_states
@@ -1851,7 +1970,7 @@ def test_a_qwen4_verify_block_taped_and_fused_commits_what_stock_commits(qwen4, 
         # Each gated-delta layer's cache holds its tapes until the commit replays them, then is a plain cache again.
         run, transaction, out = verify()
         taped = [entry for entry in run if "_unsloth_tapes" in vars(entry)]
-        assert len(taped) == linear == len(fused) - checked and {tuple(sorted(v.items())) for v in fused} == {(("l2", True), ("sigmoid", True), ("tree", None))}
+        assert len(taped) == linear == len(fused) - checked and all(v["l2"] and v["sigmoid"] and v.get("tree") is None and not v.get("pathsum") for v in fused)
         transaction.commit([keeps[0]])
         assert _same(native[0], _state(out, run)) and all(type(entry) is ArraysCache and "_unsloth_tapes" not in vars(entry) for entry in taped)
         # A cache that started another block before committing the taped one commits that block alone.

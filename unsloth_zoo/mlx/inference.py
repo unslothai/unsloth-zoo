@@ -7325,6 +7325,15 @@ def _tape_key(q, k, v, a, b, initial, mask):
             getattr(initial, "dtype", None), getattr(mask, "dtype", None))
 
 
+class _VerifyTape(NamedTuple):
+    cache: object
+    index: int
+    replay: functools.partial
+    mask: object
+    folds: bool = False
+    has_final: bool = True
+
+
 def _taped_update(native, with_states):
     """`gated_delta_update` keeping no per-step states for a block that fills its cache's speculative window."""
     def gated_delta_update(q, k, v, a, b, A_log, dt_bias, state = None, mask = None, use_kernel = True,
@@ -7359,7 +7368,7 @@ def _taped_update(native, with_states):
                                        "states for %s; verify keeps writing every step's state there", key)
                 return stock
             y, final, _ = replay(mask = mask)
-            tapes.append((cache, cache_index, replay, mask, False))
+            tapes.append(_VerifyTape(cache, cache_index, replay, mask))
             return y, final, mx.broadcast_to(final[:, None], (final.shape[0], steps, *final.shape[1:]))
 
         return cache.update_recurrent(cache_index, length, update)
@@ -7376,10 +7385,10 @@ def _committed_lengths(lengths):
 def _replay_tapes(tapes, lengths):
     counts = {lengths} if isinstance(lengths, int) else set(lengths)
     retained = None
-    for cache, index, replay, mask, folds in tapes:
+    for cache, index, replay, mask, folds, has_final in tapes:
         length = replay.args[0].shape[1]  # its own block's: a sized tree's first layers verify more rows than the rest
-        # Retaining all or none, stock committed the final or the entry state itself; otherwise a stand-in the replay replaces.
-        if counts == {length} or counts == {0}:
+        # Path-sum leaves the entry state in the final slot, so even a fully accepted block needs replay.
+        if counts == {0} or has_final and counts == {length}:
             continue
         rows = [lengths] * replay.args[0].shape[0] if isinstance(lengths, int) else lengths
         cache[index] = replay(mask = _retained_mask(rows, length, mask))[1]
@@ -7632,6 +7641,62 @@ _VERIFY_GDN_TREE_FOLD_SOURCE = (
         "    const uint PL = pending_length;\n", "").replace("row * PL + i / Dk", "pending_path[i / Dk]").replace(
         "row * PL + i / Dv", "pending_path[i / Dv]").replace("row * PL + tid", "pending_path[tid]"))
     .replace("        float forks[8][4];\n", _VERIFY_GDN_PENDING_STEPS[1:] + "        float forks[8][4];\n"))
+# Carry each query back through its ancestors; the entry-state product and the weighted path values give its output.
+_VERIFY_GDN_PATHSUM = """
+    {
+        const uint per = TY / L, t = sg % L, part = sg / L;
+        if (part < per) {
+            const uint A = path_shape[1];
+            const int d = depth[t];
+            float w[4], coefficient[LMAX], u[4];
+            for (int i = 0; i < 4; ++i) {
+                w[i] = static_cast<float>(qs[t * Dk + lane * 4 + i]);
+                u[i] = 0.0f;
+            }
+            for (int j = d; j >= 0; --j) {
+                const uint p = path[t * A + j];
+                float kw = 0.0f;
+                for (int i = 0; i < 4; ++i) {
+                    kw += static_cast<float>(ks[p * Dk + lane * 4 + i]) * w[i];
+                }
+                kw = simd_sum(kw);
+                coefficient[j] = kw * static_cast<float>(beta[p]);
+                for (int i = 0; i < 4; ++i) {
+                    w[i] = (w[i] - static_cast<float>(ks[p * Dk + lane * 4 + i]) * coefficient[j]) * decay[p];
+                }
+            }
+            for (int j = 0; j <= d; ++j) {
+                const uint p = path[t * A + j];
+                for (int i = 0; i < 4; ++i) {
+                    u[i] += coefficient[j] * static_cast<float>(vs[p * Dv + lane * 4 + i]);
+                }
+            }
+            for (uint dv = part; dv < Dv; dv += per) {
+                auto s = entry + (n * Dv + dv) * Dk + lane * 4;
+                float out = 0.0f;
+                for (int i = 0; i < 4; ++i) {
+                    out += static_cast<float>(s[i]) * w[i];
+                }
+                out = simd_sum(out);
+                if (lane == dv / 4) {
+                    ys[t * Dv + dv] = static_cast<T>(out + u[dv % 4]);
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+"""
+
+
+def _gdn_pathsum_source(source, scan_start, entry):
+    norm = source.index("    for (uint t = sg; t < L; t += TY)")
+    return source[:source.index(scan_start)] + entry + _VERIFY_GDN_PATHSUM + source[norm:]
+
+
+_VERIFY_GDN_PATHSUM_SOURCE = _gdn_pathsum_source(_VERIFY_GDN_TREE_SOURCE, "    for (uint dv = sg;", "    auto entry = state_in;\n")
+_VERIFY_GDN_PATHSUM_FOLD_SOURCE = _gdn_pathsum_source(_VERIFY_GDN_TREE_FOLD_SOURCE, _VERIFY_GDN_PENDING_STEPS[1:],
+    _VERIFY_GDN_PENDING_STEPS + "    }\n    threadgroup_barrier(mem_flags::mem_device);\n    auto entry = advanced;\n")
 _VERIFY_GDN_ROWS = 16  # simdgroups per value head: 8 and 32, or two state rows in flight each, measured no faster
 # Block rows the threadgroup holds; the row count is an input, so every verify width shares one pipeline build.
 _VERIFY_GDN_MAX_ROWS = 16
@@ -7691,49 +7756,148 @@ def _verify_gdn_kernel(fold = False):
 
 
 @functools.cache
-def _verify_gdn_tree_kernel(fold = False):
+def _verify_gdn_tree_kernel(fold = False, pathsum = False):
     header = nax._mlx_kernel_header("unary_ops.h") + nax._mlx_kernel_header("binary_ops.h")
     return mx.fast.metal_kernel(
-        name = "unsloth_gated_delta_verify_tree" + "_folded" * fold,
+        name = "unsloth_gated_delta_verify_tree" + "_pathsum" * pathsum + "_folded" * fold,
         input_names = ["conv_input", "conv_weight", "a", "b", "A_log", "dt_bias", "z", "norm_weight", "q_scale",
-                       "k_scale", "qk_eps", "norm_eps", "state_in", "length", "depth", "path", "fork", "back",
+                       "k_scale", "qk_eps", "norm_eps", "state_in", "length", "depth", "path", *(() if pathsum else ("fork", "back")),
                        *(("pending_k", "pending_v", "pending_a", "pending_b", "retained", "pending_path") if fold else ())],
-        output_names = ["y", "state_out", "q_out", "k_out", "v_out", *(("advanced",) if fold else ())], header = header,
-        compile_options = {"math_mode": "safe"}, source = _VERIFY_GDN_TREE_FOLD_SOURCE if fold else _VERIFY_GDN_TREE_SOURCE)
+        output_names = ["y", *(() if pathsum else ("state_out",)), "q_out", "k_out", "v_out", *(("advanced",) if fold else ())], header = header,
+        compile_options = {"math_mode": "safe"}, source = (
+            (_VERIFY_GDN_PATHSUM_FOLD_SOURCE if fold else _VERIFY_GDN_PATHSUM_SOURCE) if pathsum else
+            (_VERIFY_GDN_TREE_FOLD_SOURCE if fold else _VERIFY_GDN_TREE_SOURCE)))
+
+
+@functools.cache
+def _gdn_chain_path(length):
+    depth = attention._invariant_depths(length)
+    path = mx.contiguous(mx.broadcast_to(depth, (length, length)))
+    mx.eval(path)
+    return depth, path
 
 
 def _verify_gdn_launch(conv_input, weight, a, b, A_log, dt_bias, z, norm_weight, qk_eps, eps, state, key_heads,
-                       pending, l2 = False, sigmoid = False, tree = None):
+                       pending, l2 = False, sigmoid = False, tree = None, pathsum = False):
     B, L, value_heads, Dv = z.shape
     Dk, dtype = state.shape[-1], conv_input.dtype
     q_scale, k_scale, qk_norm_eps, norm_eps = _decode_step_scalars(Dk, dtype, qk_eps, eps)
     if l2:  # q's one scale is k's RMSNorm one, the head width's -1/2 power in T
         q_scale = k_scale
     extra = [state.shape] if pending else []
-    kernel = _verify_gdn_kernel(bool(pending)) if tree is None else _verify_gdn_tree_kernel(bool(pending))
-    rows = [] if tree is None else [tree.depth, tree.path, tree.fork, tree.back]
-    return kernel(
+    if pathsum:
+        kernel = _verify_gdn_tree_kernel(bool(pending), True)
+        rows = _gdn_chain_path(L) if tree is None else (tree.depth, tree.path)
+    else:
+        kernel = _verify_gdn_kernel(bool(pending)) if tree is None else _verify_gdn_tree_kernel(bool(pending))
+        rows = () if tree is None else tree
+    final_shape = [] if pathsum else [state.shape]
+    outputs = kernel(
         inputs = [conv_input, weight, a, b, A_log, dt_bias, z, norm_weight, q_scale, k_scale, qk_norm_eps, norm_eps,
                   state, L, *rows, *pending],
         template = [("T", dtype), ("PT", a.dtype if a.dtype == dt_bias.dtype else mx.float32), ("K", weight.shape[1]),
                     ("LMAX", _VERIFY_GDN_MAX_ROWS), ("Hk", key_heads), ("Hv", value_heads), ("Dk", Dk), ("Dv", Dv),
                     ("TY", _VERIFY_GDN_ROWS), ("QK_L2", l2), ("SIGMOID_GATE", sigmoid)],
         grid = (32, _VERIFY_GDN_ROWS, B * value_heads), threadgroup = (32, _VERIFY_GDN_ROWS, 1),
-        output_shapes = [z.shape, state.shape, (B, L, key_heads, Dk), (B, L, key_heads, Dk), z.shape, *extra],
-        output_dtypes = [dtype, state.dtype, dtype, dtype, dtype, *(state.dtype for _ in extra)],
+        output_shapes = [z.shape, *final_shape, (B, L, key_heads, Dk), (B, L, key_heads, Dk), z.shape, *extra],
+        output_dtypes = [dtype, *(state.dtype for _ in final_shape), dtype, dtype, dtype, *(state.dtype for _ in extra)],
     )
+    if pathsum:
+        y, q, k, v, *advanced = outputs
+        return y, advanced[0] if advanced else state, q, k, v, *advanced
+    return outputs
 
 
-def _verify_gdn_block(*args, l2 = False, sigmoid = False, tree = None):
-    return _verify_gdn_launch(*args, (), l2, sigmoid, tree)
+def _verify_gdn_block(*args, l2 = False, sigmoid = False, tree = None, pathsum = False):
+    return _verify_gdn_launch(*args, (), l2, sigmoid, tree, pathsum)
 
 
-def _verify_gdn_folded_block(*args, pending, l2 = False, sigmoid = False, tree = None):
+def _verify_gdn_folded_block(*args, pending, l2 = False, sigmoid = False, tree = None, pathsum = False):
     """`_verify_gdn_block` from the entry state of a block whose retained prefix was not replayed yet, given that
     block's k, v, a, b and each row's retained count; it also returns the state after that prefix. Below a draft tree,
     `pending` also names the block rows the retained path took."""
     k, v, a, b, rows, *path = pending
-    return _verify_gdn_launch(*args, (k, v, a, b, rows, *(path or [k.shape[1]])), l2, sigmoid, tree)
+    return _verify_gdn_launch(*args, (k, v, a, b, rows, *(path or [k.shape[1]])), l2, sigmoid, tree, pathsum)
+
+
+_PATHSUM_PROBE_KEY = "gdn_pathsum_fold_v2:" + hashlib.sha256(
+    (_VERIFY_GDN_PATHSUM_SOURCE + _VERIFY_GDN_PATHSUM_FOLD_SOURCE).encode()).hexdigest()[:12]
+
+
+def probe_gdn_pathsum():
+    D, K, L, Hk = 128, 4, 16, 16
+    paths = [[*range(i + 1)] if i < 8 else [0, *range(8, i + 1)] for i in range(L)]
+    tree = TreeBlock(mx.array([len(p) - 1 for p in paths], mx.int32),
+                     mx.array([p + [0] * (L - len(p)) for p in paths], mx.int32), None, None)
+    for dtype, Hv in itertools.product((mx.bfloat16, mx.float16), (32, 48)):
+        C = (2 * Hk + Hv) * D
+        rand = lambda seed, *shape: mx.random.normal(shape, key = mx.random.key(seed)).astype(dtype)
+        conv, weight = rand(0, 1, K - 1 + L, C), rand(1, C, K)
+        a, b, z = rand(2, 1, L, Hv), rand(3, 1, L, Hv), rand(4, 1, L, Hv, D)
+        state = 0.1 * rand(5, 1, Hv, D, D).astype(mx.float32)
+        gates, bias, norm = rand(6, Hv), rand(7, Hv), rand(8, D)
+
+        def block(rows, tree = None, pathsum = True, entry = state, pending = None):
+            taps = mx.array([*range(K - 1), *(K - 1 + i for i in rows)])
+            args = (conv[:, taps], weight, a[:, rows], b[:, rows], gates, bias, z[:, rows], norm, 1e-6, 1e-6, entry, Hk)
+            if pending is None:
+                return _verify_gdn_block(*args, tree = tree, pathsum = pathsum)
+            return _verify_gdn_folded_block(*args, tree = tree, pathsum = pathsum, pending = pending)
+
+        rows = list(range(L))
+        chain, stock = block(rows), block(rows, pathsum = False)
+        assert all(mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item() for x, y in zip(chain[2:], stock[2:]))
+        delta = mx.abs(chain[0].astype(mx.float32) - stock[0].astype(mx.float32))
+        assert delta.max().item() <= 0.02 * mx.abs(stock[0]).max().item()
+        for width in range(3, L):
+            assert mx.array_equal(block(rows[:width])[0].view(mx.uint8), chain[0][:, :width].view(mx.uint8)).item()
+        fork = block(rows, tree)[0].view(mx.uint8)
+        assert mx.array_equal(fork, block(rows, tree)[0].view(mx.uint8)).item()
+        for path in (paths[7], paths[-1]):
+            assert mx.array_equal(fork[:, path], block(path)[0].view(mx.uint8)).item()
+        pending = (*chain[3:5], a, b)
+        retained, path = mx.array([3], mx.uint32), mx.array([0, 8, 9], mx.int32)
+        advanced = block(rows, pathsum = False, pending = (*(x[:, path] for x in pending), retained))[-1]
+        folded = block(rows, tree, pending = (*pending, retained, path))
+        assert mx.array_equal(advanced.view(mx.uint8), folded[-1].view(mx.uint8)).item()
+        assert mx.array_equal(block(rows, tree, entry = advanced)[0].view(mx.uint8), folded[0].view(mx.uint8)).item()
+
+
+def _pathsum_head_layout(key_heads, value_heads):
+    # The path kernel is probed with two and three value heads sharing each key head.
+    return (isinstance(key_heads, int) and isinstance(value_heads, int) and key_heads > 0
+            and value_heads in (2 * key_heads, 3 * key_heads)
+            and value_heads * 128 * 128 <= 1 << 32
+            and (2 * key_heads + value_heads) * 128 * (_VERIFY_GDN_MAX_ROWS + 3) <= 1 << 31)
+
+
+def _pathsum_verify_supported(language_model):
+    # This also admits half-history attention when fused GDN is disabled.
+    args = getattr(language_model, "args", None)
+    if not _pathsum_head_layout(getattr(args, "linear_num_key_heads", None),
+                                getattr(args, "linear_num_value_heads", None)):
+        return False
+    heads, kv = getattr(args, "num_attention_heads", None), getattr(args, "num_key_value_heads", None)
+    if not (isinstance(heads, int) and isinstance(kv, int) and 0 < kv <= heads and heads % kv == 0
+            and getattr(args, "head_dim", None) == 256):
+        return False
+    tensor_units = nax.nax_available()
+    if not tensor_units:
+        formats = {(getattr(p, "bits", None), getattr(p, "mode", None)) for p in language_model.model.modules()
+                   if isinstance(p, nn.Linear) or hasattr(p, "bits") and not isinstance(p, nn.QuantizedEmbedding)}
+        if formats != {(4, "affine")}:
+            return False
+    return (nax.kernel_probe_passed(_PATHSUM_PROBE_KEY, __name__, "probe_gdn_pathsum", attention.invariant_attention_available)
+            and (not tensor_units or nax.kernel_probe_passed(
+                attention.INVARIANT_HALF_PROBE_KEY, attention.__name__, "probe_invariant_half_attention")))
+
+
+def _pathsum_rows(rows):
+    return rows > _LANE_LOW_ROWS and getattr(_VERIFY_STATE, "pathsum", False)
+
+
+def _verify_invariant_attention(rows):
+    return attention.invariant_half_attention if _pathsum_rows(rows) and nax._nax_gpu() else attention.invariant_attention
 
 
 class _TreeRows:
@@ -7752,7 +7916,7 @@ class _TreeRows:
 
 
 def _tree_attention(queries, keys, values, scale, tree):
-    return attention.invariant_attention(queries, keys, values, scale, tree.depth, tree.path)
+    return _verify_invariant_attention(queries.shape[2])(queries, keys, values, scale, tree.depth, tree.path)
 
 
 def _verify_gdn_fits(layer, inputs, mask, cache):
@@ -7850,7 +8014,9 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps, l2 = Fal
         conv_input, layer.conv1d.weight.reshape(layer.conv_dim, K), a, b, layer.A_log, layer.dt_bias, z,
         layer.norm.weight, qk_eps, layer.norm.eps,
         mx.zeros((batch, layer.num_v_heads, Dv, layer.head_k_dim), mx.float32) if state is None else state, Hk)
-    fused = lambda state: _verify_gdn_block(*block(state), l2 = l2, sigmoid = sigmoid, tree = tree)
+    pathsum = (_pathsum_rows(length) and K == 4 and _pathsum_head_layout(Hk, layer.num_v_heads)
+               and layer.A_log.dtype == layer.dt_bias.dtype == dtype == inputs.dtype and not l2 and not sigmoid)
+    fused = lambda state: _verify_gdn_block(*block(state), l2 = l2, sigmoid = sigmoid, tree = tree, pathsum = pathsum)
     # A passed check holds the key of the replay its commit relies on.
     if fits and verdict and _TAPE_VERDICTS.get(verdict):
         fold = None
@@ -7860,11 +8026,11 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps, l2 = Fal
             if (state is initial and A_log is layer.A_log and dt_bias is layer.dt_bias and pending_k.dtype == dtype
                     and (pending_a.dtype, pending_b.dtype) == (a.dtype, b.dtype)):
                 retained = (pending_k, pending_v, pending_a, pending_b, rows)
-                if tree is not None:
-                    # A tree reads the retained rows in place; a chain block reads the replay's own gathered ones.
+                if tree is not None or pathsum:
+                    # Both tree and path-sum kernels can read a retained path in the original block.
                     retained = (*retained[:4], rows, attention._invariant_depths(pending_k.shape[1])) if retained_path is None else (*retained_path[:4], rows, retained_path[4])
-                fold = (*key, retained[0].shape[1], tree is not None), lambda: _verify_gdn_folded_block(
-                    *block(pending_entry), pending = retained, l2 = l2, sigmoid = sigmoid, tree = tree)
+                fold = (*key, *(("pathsum",) if pathsum else ()), retained[0].shape[1], tree is not None), lambda: _verify_gdn_folded_block(
+                    *block(pending_entry), pending = retained, l2 = l2, sigmoid = sigmoid, tree = tree, pathsum = pathsum)
 
         def update(entry, steps):
             if fold is not None:
@@ -7873,7 +8039,7 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps, l2 = Fal
                 y, final, q, k, v = fused(entry)
             replay = functools.partial(with_states, q, k, v, a, b, layer.A_log, layer.dt_bias, entry,
                                        use_kernel = True, state_steps = 0)
-            _VERIFY_STATE.tapes.append((cache, 1, replay, None, True))
+            _VERIFY_STATE.tapes.append(_VerifyTape(cache, 1, replay, None, folds = True, has_final = not pathsum))
             return y, final, mx.broadcast_to(final[:, None], (batch, steps, *final.shape[1:]))
         output, _ = cache.update_recurrent(1, length, update)
     elif tree is not None:
@@ -7893,7 +8059,7 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps, l2 = Fal
             try:
                 verdict = _settled(taped and all(
                     x.dtype == y.dtype and x.shape == y.shape and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
-                    for x, y in zip(fused(initial), (output, state, q, k, v))))
+                    for x, y in zip(_verify_gdn_block(*block(initial), l2 = l2, sigmoid = sigmoid), (output, state, q, k, v))))
             except (RuntimeError, ValueError) as error:
                 _unless_failed_buffer(error)
                 # A build Metal rejects stays rejected; a function transformation or memory pressure is checked later.
@@ -8441,6 +8607,9 @@ def _exact_verify_class(base, name, *cache_key):
         _VERIFY_STATE.serving = bool(getattr(language_model, "_unsloth_verify_scopes", 0)
                                      and not language_model.training and _bindings_intact(bindings))
         _VERIFY_STATE.tapes = [] if _VERIFY_STATE.serving and taped is not None and _bindings_intact(tape_bindings) else None
+        outer_pathsum = getattr(_VERIFY_STATE, "pathsum", False)
+        _VERIFY_STATE.pathsum = bool(_VERIFY_STATE.tapes is not None and inputs.shape[0] == 1
+                                     and vars(language_model).get("_unsloth_pathsum_verify"))
         try:
             output = base.verify(self, language_model, inputs, cache = cache, **kwargs)
             if getattr(_VERIFY_STATE, "tree_head", None) is not None and output.hidden_states:
@@ -8452,6 +8621,7 @@ def _exact_verify_class(base, name, *cache_key):
                 transaction._unsloth_tapes = _VERIFY_STATE.tapes
             return output
         finally:
+            _VERIFY_STATE.pathsum = outer_pathsum
             _VERIFY_STATE.serving, _VERIFY_STATE.tapes = outer, outer_tapes
 
     def entered(self, language_model, *args, **kwargs):
@@ -8641,7 +8811,8 @@ def _exact_verify_class(base, name, *cache_key):
         if tree is not None:
             output = _tree_attention(queries, keys, values, attention.scale, tree)
             return self._linear(attention.o_proj, output.transpose(0, 2, 1, 3).reshape(batch, length, -1) * mx.sigmoid(gate))
-        output = _invariant_attention(queries, keys, values, attention.scale, cache, "causal" if causal else mask) if invariant else None
+        output = _invariant_attention(queries, keys, values, attention.scale, cache, "causal" if causal else mask,
+                                      attend = _verify_invariant_attention(length)) if invariant else None
         if output is None and (length > 1 or padded):
             output = self._helpers()._qwen3_5_left_padded_attention(
                 queries, keys, values, cache = cache, scale = attention.scale, mask = mask)
@@ -9717,14 +9888,15 @@ _INVARIANT_ATTENTION_CONTRACT = {
 }
 
 
-def _invariant_attention(queries, keys, values, scale, cache, mask):
+def _invariant_attention(queries, keys, values, scale, cache, mask, *, attend = None):
     """`attention.invariant_attention` for a KV-cache layer's causal block or lone query row, else None. A batch
     cache's rows each attend their keys past their left padding: the keys a row's extracted cache holds."""
+    attend = attend or attention.invariant_attention
     if not attention.invariant_attention_supported(queries, keys, values):
         return None
     if _stores_as_kv_cache(cache):
         causal = isinstance(mask, str) and mask == "causal" or mask is None and queries.shape[2] == 1
-        return attention.invariant_attention(queries, keys, values, scale) if causal else None
+        return attend(queries, keys, values, scale) if causal else None
     batch = getattr(sys.modules.get("mlx_vlm.models.cache"), "BatchKVCache", None)
     if batch is None or any(getattr(type(cache), name, None) is not getattr(batch, name)
                             for name in ("update_and_fetch", "extract", "make_mask")):
@@ -9734,7 +9906,7 @@ def _invariant_attention(queries, keys, values, scale, cache, mask):
     if len(pads) != queries.shape[0] or not 0 <= min(pads) <= max(pads) <= keys.shape[2] - queries.shape[2]:
         return None
     if len(set(pads)) == 1:
-        return attention.invariant_attention(queries, keys[:, :, pads[0]:], values[:, :, pads[0]:], scale)
+        return attend(queries, keys[:, :, pads[0]:], values[:, :, pads[0]:], scale)
     return mx.concatenate([attention.invariant_attention(queries[i:i + 1], keys[i:i + 1, :, pad:], values[i:i + 1, :, pad:], scale)
                            for i, pad in enumerate(pads)], axis = 0)
 
@@ -9774,11 +9946,11 @@ def _invariant_attention_class(base):
 def row_invariant_attention(model, *, _modules = None):
     """Fast Verify, on Apple GPUs: the KV-cache attention of one-token
     decode steps and of the exact verifier's blocks runs on `attention.invariant_attention`, whose rows do not depend
-    on the block, so verify rows stay Fast Verify's one-token decoding while a block reads each key once for all its
-    rows. Not stock's bits (within fp32 reordering of stock attention); prefill stays stock. A subprocess probe gates
+    on other rows at the same precision. FP32 sums reorder stock attention. Above the low-row cutoff, tensor-unit verifiers
+    can round history weights to FP16 for the value product and differ from one-token decode. A subprocess probe gates
     the kernel; other, training and distributed models keep their methods.
     """
-    changed = []
+    changed, pathsum_models = [], []
     try:
         with _VERIFY_LOCK:
             calls = {}
@@ -9789,7 +9961,8 @@ def row_invariant_attention(model, *, _modules = None):
                 if parts and None not in parts:
                     calls.update((target, sum(parts, [])) for _, name, target in parts[0] if name == "__call__")
             # Off where the lane projections are (`fast_verify_enabled`).
-            if (calls and _lane_coverage(model, _modules)[3] and _resolved_bindings(_NAX_QMM_CONTRACT) is not None
+            _, _, languages, covered = _lane_coverage(model, _modules) if calls else (None, None, [], [])
+            if (covered and _resolved_bindings(_NAX_QMM_CONTRACT) is not None
                     and nax.kernel_probe_passed(matmul.LANE_QMM_PROBE_KEY, matmul.__name__, "probe_lane_qmm", matmul.lane_qmm_available)
                     and nax.kernel_probe_passed(attention.INVARIANT_PROBE_KEY, attention.__name__, "probe_invariant_attention",
                                                 attention.invariant_attention_available)):
@@ -9803,9 +9976,18 @@ def row_invariant_attention(model, *, _modules = None):
                         module.__class__ = _invariant_attention_class(type(module))
                     module._unsloth_invariant_attention = module.__dict__.get("_unsloth_invariant_attention", 0) + 1
                     changed.append(module)
+                if changed and _fast_verify_held(model):
+                    for language in languages:
+                        if _pathsum_verify_supported(language):
+                            language._unsloth_pathsum_verify = vars(language).get("_unsloth_pathsum_verify", 0) + 1
+                            pathsum_models.append(language)
         yield model
     finally:
         with _VERIFY_LOCK:
+            for language in pathsum_models:
+                language._unsloth_pathsum_verify -= 1
+                if not language._unsloth_pathsum_verify:
+                    del language._unsloth_pathsum_verify
             for module in reversed(changed):
                 module._unsloth_invariant_attention -= 1
                 if not module._unsloth_invariant_attention:
@@ -10782,7 +10964,7 @@ def tree_commit(transaction, caches, path):
     transaction.abort()
     gather = lambda x: mx.take(x, rows, axis = 1)
     retained, taps = mx.array([len(path)], mx.uint32), {}
-    for (cache, index, replay, mask, _), (_, source, width) in zip(tapes, windows):
+    for (cache, index, replay, mask, _, _), (_, source, width) in zip(tapes, windows):
         q, k, v, a, b, A_log, dt_bias, entry = replay.args
         path_replay = functools.partial(replay.func, gather(q), gather(k), gather(v), gather(a), gather(b), A_log, dt_bias, entry,
                                         **replay.keywords)
@@ -10800,11 +10982,11 @@ def tree_commit(transaction, caches, path):
             entry.offset = prefix + length
 
 
-def tree_verify_matches(engine) -> bool:
+def tree_verify_matches(engine, width = 4) -> bool:
     """Whether, on `engine`'s live caches, a chain-shaped tree verifies as the chain does and a forked tree's rows as their
     paths' chains do, bit for bit. Every verify here is undone."""
     pending = engine._rows[0].pending
-    tokens = [pending, (pending + 1) % 1000, (pending + 2) % 1000, (pending + 3) % 1000]
+    tokens = [pending, *((pending + i) % 1000 for i in range(1, width))]
 
     def verify(rows, block = None):
         with mx.stream(engine._stream), tree_verify(block) if block is not None else nullcontext():
@@ -10815,19 +10997,26 @@ def tree_verify_matches(engine) -> bool:
             transaction.abort()
         return logits[0]
 
-    table = lambda *rows: mx.array([list(row) + [0] * (4 - len(row)) for row in rows], mx.int32)
     same = lambda x, y: x.dtype == y.dtype and mx.array_equal(x.view(mx.uint8), y.view(mx.uint8)).item()
-    none = mx.full((4,), -1, mx.int32)
-    chain = TreeBlock(mx.arange(4, dtype = mx.int32), table((0,), (0, 1), (0, 1, 2), (0, 1, 2, 3)), none, none)
-    forked = TreeBlock(mx.array([0, 1, 2, 1], mx.int32), table((0,), (0, 1), (0, 1, 2), (0, 3)),
-                       mx.array([0, -1, -1, -1], mx.int32), mx.array([-1, -1, -1, 0], mx.int32))
+    rows, path = _gdn_chain_path(width)
+    none = mx.full((width,), -1, mx.int32)
+    chain = TreeBlock(rows, path, none, none)
+    split = width // 2 + 1
+    paths = [list(range(i + 1)) if i < split else [0, *range(split, i + 1)] for i in range(width)]
+    forked = TreeBlock(mx.array([len(p) - 1 for p in paths], mx.int32), mx.array([p + [0] * (width - len(p)) for p in paths], mx.int32),
+                       mx.where(rows == 0, 0, none), mx.where(rows == split, 0, none))
     try:
+        work = first_use_work()
         straight = verify(tokens)
+        if first_use_work() != work:
+            straight = verify(tokens)
         if not same(straight, verify(tokens, chain)):
             return False
         tree = verify(tokens, forked)
-        branch = verify([pending, tokens[3], tokens[1]])
-        return same(tree[:3], straight[:3]) and same(tree[3], branch[1])
+        branch = [pending, *tokens[split:], *tokens[1:split]]
+        if width == 4 and width <= _LANE_LOW_ROWS:
+            branch.pop()  # Preserve the short fork's three-row reference.
+        return same(tree[:split], straight[:split]) and same(tree[split:], verify(branch)[1:1 + width - split])
     except (RuntimeError, ValueError) as error:
         _unless_failed_buffer(error)
         return False
