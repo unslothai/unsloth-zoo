@@ -265,7 +265,10 @@ def add_new_tokens(
     written_hi = resize_target if (pad_to_multiple_of is not None and resize_target > max(old_rows, new_vocab_length)) \
         else new_vocab_length
     rows_all_overwritten = old_length <= grown_lo and written_hi >= resize_target
-    if rows_all_overwritten and _accepts_mean_resizing(model):
+    # A biased lm_head (Phi) keeps the default: its new bias entries are never overwritten here, and mean_resizing
+    # initialises them from the existing bias distribution.
+    head_bias = getattr(model.get_output_embeddings(), "bias", None)
+    if rows_all_overwritten and head_bias is None and _accepts_mean_resizing(model):
         model.resize_token_embeddings(resize_target, mean_resizing = False)
     else:
         model.resize_token_embeddings(resize_target)
