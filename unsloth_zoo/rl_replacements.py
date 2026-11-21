@@ -682,9 +682,19 @@ def _kept_set_sparse_max_density():
         return 0.0
     env = os.environ.get("UNSLOTH_GRPO_KEPT_SET_SPARSE_MAX_DENSITY", "").strip()
     try:
-        return min(max(float(env), 0.0), 1.0) if env else _KEPT_SET_SPARSE_MAX_DENSITY
+        value = float(env) if env else _KEPT_SET_SPARSE_MAX_DENSITY
     except ValueError:
         return _KEPT_SET_SPARSE_MAX_DENSITY
+    return min(max(value, 0.0), 1.0) if math.isfinite(value) else _KEPT_SET_SPARSE_MAX_DENSITY
+
+
+def _kept_set_is_compiling():
+    # The CSR size decision and the route counters are data-dependent / side effects: packed + no counters
+    # while an outer torch.compile traces the scorer.
+    try:
+        return torch.compiler.is_compiling()
+    except AttributeError:
+        return torch._dynamo.is_compiling()
 
 
 # Union / vocab above this runs the dense backward. L4, Qwen3 head, 441-row chunks: the sparse backward is faster up
@@ -702,11 +712,13 @@ def _kept_set_save(keep, sparse, z = None, logits = None, logits_dtype = None):
         nnz = int(counts.sum())
         per_id = 4 + z.element_size() + (logits.element_size() if logits is not None else 0)
         if nnz * per_id + rows * 4 < rows * ((V + 7) // 8):
+            row_ids, col_ids = keep.nonzero(as_tuple = True)
             return (
-                "csr", counts, keep.nonzero()[:, 1].to(torch.int32), z[keep],
-                None if logits is None else logits[keep], logits_dtype,
+                "csr", counts, col_ids.to(torch.int32), z[row_ids, col_ids],
+                None if logits is None else logits[row_ids, col_ids], logits_dtype,
             )
-    return ("packed", _pack_bool_rows(keep))
+    # Declined: the caller frees z / logits before packing the mask.
+    return None
 
 
 def _kept_set_logits(chunk_hidden_states, lm_head, lm_head_bias):
@@ -760,7 +772,7 @@ class _KeptSetLogprobs(torch.autograd.Function):
         )
         logps, lses, kept = [], [], []
         # A trainable (or tied, trainable) head needs the full grad_head: dense. Else CSR ids for a W[ids] backward.
-        max_density = _kept_set_sparse_max_density()
+        max_density = 0.0 if _kept_set_is_compiling() else _kept_set_sparse_max_density()
         sparse = max_density > 0.0 and not any(ctx.needs_input_grad[1:3])
         for a, b in zip(bounds[:-1], bounds[1:]):
             logits = _kept_set_logits(hidden_states[a:b], lm_head, lm_head_bias)
@@ -772,8 +784,10 @@ class _KeptSetLogprobs(torch.autograd.Function):
             logp, lse, keep = _kept_set_chunk_forward(z, index[a:b].to(lm_head.device), support)
             logps.append(logp)
             lses.append(lse)
-            kept.append(_kept_set_save(keep, sparse, z, raw, logits_dtype))
-            del keep, z, raw
+            saved = _kept_set_save(keep, sparse, z, raw, logits_dtype)
+            del z, raw
+            kept.append(saved if saved is not None else ("packed", _pack_bool_rows(keep)))
+            del keep, saved
         logps = torch.cat(logps)
         # Kept sets go through save_for_backward (flattened, layout on ctx) so a retain_graph backward can run twice
         # and autograd still frees them after a normal backward.
@@ -835,36 +849,43 @@ class _KeptSetLogprobs(torch.autograd.Function):
             # Columns outside the kept set get zero gradient, so the backward only needs the forward's z at the
             # kept ids (saved) and W[kept ids]: dh = g_U @ W[U] over the chunk's union U of kept ids.
             ids = None
-            z = logits = None
+            z = logits = keep = packed = None
+            rows = b - a
             if saved[0] == "csr":
                 counts, cols, z_vals, raw_vals, logits_dtype = saved[1:]
                 ids, local = torch.unique(cols, sorted = True, return_inverse = True)
-                if ids.numel() > ctx.max_density * ctx.vocab:
-                    ids = None
+                width = ids.numel()
+                # W[U] (+ its cast) and the R x |U| buffers must cost less than the R x V buffers they replace:
+                # a short chunk under a wide head can pass the density cutoff and still gather more than that.
+                head_bytes = width * lm_head.shape[1] * lm_head.element_size()
+                if lm_head.dtype != logits_dtype:
+                    head_bytes += width * lm_head.shape[1] * torch.empty((), dtype = logits_dtype).element_size()
+                per_logit = z_vals.element_size() + 1 + torch.empty((), dtype = logits_dtype).element_size() \
+                    + (raw_vals.element_size() if raw_vals is not None else 0)
+                if width > ctx.max_density * ctx.vocab or head_bytes + rows * width * per_logit > rows * ctx.vocab * per_logit:
+                    # Full width, from the saved z: no logits GEMM, the dense dh GEMM.
+                    ids, local, width = None, cols.long(), ctx.vocab
                 row_of = torch.repeat_interleave(
-                    torch.arange(b - a, device = device), counts.to(device), output_size = cols.numel(),
+                    torch.arange(rows, device = device), counts.to(device), output_size = cols.numel(),
                 )
-                if ids is None:
-                    keep = torch.zeros((b - a, ctx.vocab), dtype = torch.bool, device = device)
-                    keep[row_of, cols.long()] = True
-                else:
-                    keep = torch.zeros((b - a, ids.numel()), dtype = torch.bool, device = device)
-                    keep[row_of, local] = True
-                    # Entries outside the kept set are masked out of p below; 0 keeps them finite.
-                    z = torch.zeros((b - a, ids.numel()), dtype = z_vals.dtype, device = device)
-                    z[row_of, local] = z_vals
-                    if raw_vals is not None:
-                        logits = torch.zeros((b - a, ids.numel()), dtype = raw_vals.dtype, device = device)
-                        logits[row_of, local] = raw_vals
+                keep = torch.zeros((rows, width), dtype = torch.bool, device = device)
+                keep[row_of, local] = True
+                # Entries outside the kept set are masked out of p below; 0 keeps them finite.
+                z = torch.zeros((rows, width), dtype = z_vals.dtype, device = device)
+                z[row_of, local] = z_vals
+                if raw_vals is not None:
+                    logits = torch.zeros((rows, width), dtype = raw_vals.dtype, device = device)
+                    logits[row_of, local] = raw_vals
+                if ids is not None:
                     # The target is always kept, so it is in U.
                     chunk_index = torch.searchsorted(ids, chunk_index.to(ids.dtype))
                 del row_of, local, counts, cols, z_vals, raw_vals
             else:
-                keep = _unpack_bool_rows(saved[1], ctx.vocab)
-            saved = None
-            stat = "kept_set_sparse_bwd" if ids is not None else "kept_set_dense_bwd"
-            _GRPO_TRUNCATED_SUPPORT_STATS[stat] = _GRPO_TRUNCATED_SUPPORT_STATS.get(stat, 0) + 1
-            chunk_head = lm_head if ids is None else lm_head.index_select(0, ids)
+                packed = saved[1]
+            del saved
+            if not _kept_set_is_compiling():
+                stat = "kept_set_sparse_bwd" if ids is not None else "kept_set_dense_bwd"
+                _GRPO_TRUNCATED_SUPPORT_STATS[stat] = _GRPO_TRUNCATED_SUPPORT_STATS.get(stat, 0) + 1
             if z is None:
                 with torch.no_grad(), torch.autocast(**ctx.autocast_kwargs):
                     logits = _kept_set_logits(chunk_hidden_states, lm_head, lm_head_bias)
@@ -882,6 +903,9 @@ class _KeptSetLogprobs(torch.autograd.Function):
                 tanh = torch.tanh(x / softcapping)
                 del x
             del logits
+            if packed is not None:
+                keep = _unpack_bool_rows(packed, ctx.vocab)
+                del packed
             # d logp / dz_j = 1[j = t] - p_j over the kept set (0 outside it); the target's 1 - p_t = -expm1(logp).
             p = torch.exp(z.sub_(lses[a:b].unsqueeze(-1))).masked_fill_(~keep, 0.0)
             del keep, z
@@ -901,12 +925,14 @@ class _KeptSetLogprobs(torch.autograd.Function):
             grad_logits = grad_z.to(logits_dtype)
             del grad_z
             if ids is not None:
-                head = chunk_head if chunk_head.dtype == grad_logits.dtype else chunk_head.to(grad_logits.dtype)
+                # Gathered only now, after the probability / derivative buffers are gone.
+                head = lm_head.index_select(0, ids.long())
+                if head.dtype != grad_logits.dtype:
+                    head = head.to(grad_logits.dtype)
                 half_to_float32 = grad_logits.dtype == torch.float16
-            elif head is None or head.shape[0] != lm_head.shape[0]:
+            elif head is None:
                 head = lm_head if lm_head.dtype == grad_logits.dtype else lm_head.to(grad_logits.dtype)
                 half_to_float32 = grad_logits.dtype == torch.float16
-            del chunk_head
             if need_hidden:
                 if half_to_float32 and hidden_states.dtype != torch.float16:
                     grad_chunk = mm_float32(grad_logits, head)
@@ -929,10 +955,8 @@ class _KeptSetLogprobs(torch.autograd.Function):
                 else:
                     grad_head.add_(grad_logits.t() @ x)
             if need_bias:
-                if ids is None:
-                    grad_bias.add_(grad_logits.to(torch.float32).sum(0))
-                else:
-                    grad_bias.index_add_(0, ids, grad_logits.to(torch.float32).sum(0))
+                # A trainable bias forces the packed (dense) route in forward.
+                grad_bias.add_(grad_logits.to(torch.float32).sum(0))
             del grad_logits
             if ids is not None:
                 head = None

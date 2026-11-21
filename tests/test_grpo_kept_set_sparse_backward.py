@@ -109,15 +109,19 @@ def test_sparse_backward_matches_dense_and_float64(monkeypatch, temperature, top
     if top_k > 0 or top_p < 0.99:
         assert cs["kept_set_sparse_bwd"] > 0 and cs["kept_set_dense_bwd"] == 0
     else:
-        # Kept sets denser than 1/32 are saved as the bit mask: dense backward, bit-equal.
+        # Kept sets denser than ~1/64 (CSR ids + float32 z) are saved as the bit mask: dense backward, bit-equal.
         assert cs["kept_set_sparse_bwd"] == 0 and torch.equal(gs, gd)
     # Forward untouched.
     assert torch.equal(out_d, out_s)
     ref, kept, h64 = _oracle(*args)
     (ref * weights.double()).sum().backward()
+    # Each path against the float64 oracle on its own, then against each other: the relative bound allows the dh
+    # GEMM's blocking to round either way (torch 2.15 CPU: 1.85e-5 vs 1.80e-5) but not a wrong p or kept set.
+    torch.testing.assert_close(gd.double(), h64.grad, atol = 2e-5, rtol = 1e-4)
+    torch.testing.assert_close(gs.double(), h64.grad, atol = 2e-5, rtol = 1e-4)
     err_dense = (gd.double() - h64.grad).abs().max().item()
     err_sparse = (gs.double() - h64.grad).abs().max().item()
-    assert err_sparse <= 1.01 * err_dense + 1e-7, (err_sparse, err_dense)
+    assert err_sparse <= 1.25 * err_dense + 1e-7, (err_sparse, err_dense)
     # Same z and p as the dense backward (the forward's z is saved): only the dh GEMM blocking differs.
     torch.testing.assert_close(gs, gd, atol = 1e-6, rtol = 1e-6)
 
@@ -141,9 +145,9 @@ def test_full_rows_and_excluded_ids(monkeypatch):
     _, gd, _, _, _ = _run(monkeypatch, "dense", *args, excluded = excluded)
     _, g_default, _, c_default, _ = _run(monkeypatch, "sparse", *args, excluded = excluded)
     _, g_full, _, c_full, _ = _run(monkeypatch, "sparse_full", *args, excluded = excluded)
-    assert c_default["kept_set_sparse_bwd"] == 0  # packed mask (density > 1/32): dense backward
+    assert c_default["kept_set_sparse_bwd"] == 0  # packed mask (density > ~1/64): dense backward
     assert torch.equal(g_default, gd)
-    # density > 1/32 is saved packed, so even a forced crossover stays dense here
+    # density > ~1/64 is saved packed, so even a forced crossover stays dense here
     assert c_full["kept_set_sparse_bwd"] == 0
     torch.testing.assert_close(g_full, gd, atol = 0, rtol = 0)
 
@@ -194,8 +198,9 @@ def test_csr_saves_less_than_the_bit_mask():
     rebuilt[rows, cols.long()] = True
     assert torch.equal(rebuilt, sparse_mask)
     dense_mask = torch.rand(16, V, generator = g) < 0.1
-    assert rr._kept_set_save(dense_mask, True, z)[0] == "packed"
-    assert rr._kept_set_save(sparse_mask, False, z)[0] == "packed"
+    # Declined: None, so the forward frees z before packing the mask.
+    assert rr._kept_set_save(dense_mask, True, z) is None
+    assert rr._kept_set_save(sparse_mask, False, z) is None
     # A softcap also keeps the raw logits there, for the float32 tanh derivative.
     raw_logits = z.to(torch.bfloat16)
     saved = rr._kept_set_save(sparse_mask, True, z, raw_logits, raw_logits.dtype)
@@ -212,16 +217,123 @@ def test_ragged_chunks(monkeypatch, chunks):
     torch.testing.assert_close(gs, gd, atol = 1e-6, rtol = 1e-6)
 
 
-def test_crossover_routes_by_union_density(monkeypatch):
-    # top_k 64 over 111 rows: union well above 1% of V and below 100%.
+@pytest.mark.parametrize("limit, sparse_calls", [("0.001", 0), ("1.0", 1)])
+@pytest.mark.parametrize("softcap", [0.0, 30.0])
+def test_crossover_routes_by_union_density(monkeypatch, limit, sparse_calls, softcap):
+    # top_k 8 over 111 rows is saved as CSR (68 bytes a row vs 376 packed); its union is ~25% of V, so a 0.001
+    # cutoff sends it through the full-width CSR backward and 1.0 through W[U]. Both equal the kill switch.
     hidden, head, index, _ = _inputs(seed = 15)
-    monkeypatch.setenv("UNSLOTH_GRPO_KEPT_SET_SPARSE_MAX_DENSITY", "0.001")
+    _, gd, _, _, _ = _run(monkeypatch, "dense", hidden, head, index, 1.0, 8, 1.0, 0.0, softcap, chunks = 1)
+    monkeypatch.delenv("UNSLOTH_GRPO_KEPT_SET_SPARSE", raising = False)
+    monkeypatch.setenv("UNSLOTH_GRPO_KEPT_SET_SPARSE_MAX_DENSITY", limit)
     h = hidden.clone().requires_grad_(True)
+    keys = ("kept_set_sparse_bwd", "kept_set_dense_bwd")
     before = dict(rr._GRPO_TRUNCATED_SUPPORT_STATS)
-    rr.grpo_chunked_hidden_states_logprobs(h, head, index, 1, 0.0, 0.0, 0.0, 1.0, support_top_k = 64).sum().backward()
+    out = rr.grpo_chunked_hidden_states_logprobs(h, head, index, 1, 0.0, 0.0, softcap, 1.0, support_top_k = 8)
+    weights = torch.randn(tuple(out.shape), generator = torch.Generator().manual_seed(1))
+    (out * weights).sum().backward()
     after = rr._GRPO_TRUNCATED_SUPPORT_STATS
-    assert after.get("kept_set_sparse_bwd", 0) == before.get("kept_set_sparse_bwd", 0)
-    assert after.get("kept_set_dense_bwd", 0) == before.get("kept_set_dense_bwd", 0) + 1
+    assert tuple(after.get(k, 0) - before.get(k, 0) for k in keys) == (sparse_calls, 1 - sparse_calls)
+    torch.testing.assert_close(h.grad, gd, atol = 1e-6, rtol = 1e-6)
+
+
+def test_wide_head_short_chunk_stays_dense(monkeypatch):
+    # 4 rows under a 4096-wide head: the union passes the density cutoff but gathering W[U] costs more than the
+    # 4 x V buffers it replaces, so the byte guard keeps the full-width backward.
+    g = torch.Generator().manual_seed(21)
+    hidden = torch.randn(1, 4, 4096, generator = g)
+    head = torch.randn(V, 4096, generator = g) * 0.05
+    index = torch.randint(0, V, (1, 4), generator = g)
+    _, gd, _, _, _ = _run(monkeypatch, "dense", hidden, head, index, 1.0, 8, 1.0, 0.0, 0.0, chunks = 1)
+    _, gs, _, cs, _ = _run(monkeypatch, "sparse_full", hidden, head, index, 1.0, 8, 1.0, 0.0, 0.0, chunks = 1)
+    assert cs == {"kept_set_sparse_bwd": 0, "kept_set_dense_bwd": 1}
+    torch.testing.assert_close(gs, gd, atol = 1e-6, rtol = 1e-6)
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "junk"])
+def test_non_finite_crossover_falls_back_to_the_default(monkeypatch, value):
+    monkeypatch.delenv("UNSLOTH_GRPO_KEPT_SET_SPARSE", raising = False)
+    monkeypatch.setenv("UNSLOTH_GRPO_KEPT_SET_SPARSE_MAX_DENSITY", value)
+    assert rr._kept_set_sparse_max_density() == rr._KEPT_SET_SPARSE_MAX_DENSITY
+
+
+def test_trainable_bias_frozen_head_stays_dense(monkeypatch):
+    hidden, head, index, b = _inputs(seed = 23, bias = True)
+    grads = {}
+    for mode in ("dense", "sparse_full"):
+        monkeypatch.setenv("UNSLOTH_GRPO_KEPT_SET_SPARSE", "0" if mode == "dense" else "1")
+        monkeypatch.setenv("UNSLOTH_GRPO_KEPT_SET_SPARSE_MAX_DENSITY", "1.0")
+        h = hidden.clone().requires_grad_(True)
+        bb = b.clone().requires_grad_(True)
+        before = rr._GRPO_TRUNCATED_SUPPORT_STATS.get("kept_set_sparse_bwd", 0)
+        out = rr.grpo_chunked_hidden_states_logprobs(h, head, index, 3, 0.0, 0.0, 0.0, 1.0, lm_head_bias = bb,
+                                                     support_top_k = 8)
+        out.sum().backward()
+        assert rr._GRPO_TRUNCATED_SUPPORT_STATS.get("kept_set_sparse_bwd", 0) == before
+        grads[mode] = (h.grad, bb.grad)
+    assert torch.equal(grads["dense"][0], grads["sparse_full"][0]) and torch.equal(grads["dense"][1], grads["sparse_full"][1])
+
+
+def test_bf16_autocast_matches_dense(monkeypatch):
+    hidden, head, index, _ = _inputs(seed = 25)
+    outs = {}
+    for mode in ("dense", "sparse_full"):
+        monkeypatch.setenv("UNSLOTH_GRPO_KEPT_SET_SPARSE", "0" if mode == "dense" else "1")
+        monkeypatch.setenv("UNSLOTH_GRPO_KEPT_SET_SPARSE_MAX_DENSITY", "1.0")
+        h = hidden.to(torch.bfloat16).requires_grad_(True)
+        before = rr._GRPO_TRUNCATED_SUPPORT_STATS.get("kept_set_sparse_bwd", 0)
+        with torch.autocast("cpu", dtype = torch.bfloat16):
+            out = rr.grpo_chunked_hidden_states_logprobs(h, head.to(torch.bfloat16), index, 3, 2.0, 4.0, 0.0, 0.8,
+                                                         support_top_k = 16, support_top_p = 0.9)
+        out.float().sum().backward()
+        sparse_calls = rr._GRPO_TRUNCATED_SUPPORT_STATS.get("kept_set_sparse_bwd", 0) - before
+        assert sparse_calls == (0 if mode == "dense" else 3)
+        outs[mode] = (out.detach(), h.grad.float())
+    assert torch.equal(outs["dense"][0], outs["sparse_full"][0])
+    # bf16 hidden grad: dh GEMM blocking can move the last bf16 bit.
+    torch.testing.assert_close(outs["sparse_full"][1], outs["dense"][1], atol = 1e-2, rtol = 1e-2)
+
+
+@pytest.mark.parametrize("mode", ["sparse_full", "dense"])
+def test_kept_sets_go_through_saved_tensor_hooks(monkeypatch, mode):
+    # save_on_cpu / offload hooks must see the kept-set tensors in both layouts (CSR int32 ids, packed uint8 bits).
+    monkeypatch.setenv("UNSLOTH_GRPO_KEPT_SET_SPARSE", "0" if mode == "dense" else "1")
+    monkeypatch.setenv("UNSLOTH_GRPO_KEPT_SET_SPARSE_MAX_DENSITY", "1.0")
+    hidden, head, index, _ = _inputs(seed = 27)
+    seen = []
+    def pack(t):
+        seen.append(t.dtype)
+        return t
+    h = hidden.clone().requires_grad_(True)
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda t: t):
+        out = rr.grpo_chunked_hidden_states_logprobs(h, head, index, 3, 0.0, 0.0, 0.0, 1.0, support_top_k = 8)
+    out.sum().backward()
+    assert (torch.int32 in seen) if mode == "sparse_full" else (torch.uint8 in seen), seen
+
+
+def test_outer_compile_traces_one_graph(monkeypatch):
+    # An outer torch.compile of the scorer: packed storage and no route counters while tracing, so fullgraph holds
+    # (the data-dependent CSR size check and the backward counter write each broke it).
+    monkeypatch.delenv("UNSLOTH_GRPO_KEPT_SET_SPARSE", raising = False)
+    monkeypatch.delenv("UNSLOTH_GRPO_KEPT_SET_SPARSE_MAX_DENSITY", raising = False)
+    torch._dynamo.reset()
+    hidden, head, index, _ = _inputs(rows = (2, 16), seed = 29)
+
+    def score(h):
+        return rr._KeptSetLogprobs.apply(
+            h.reshape(-1, H), head, None, index.reshape(-1), (0, 16, 32), (0.0, 0.0, 0.0, 1.0),
+            (8, 1.0, 0.0, False, None),
+        )
+
+    h_eager = hidden.clone().requires_grad_(True)
+    ref = score(h_eager)
+    ref.sum().backward()
+    h = hidden.clone().requires_grad_(True)
+    out = torch.compile(score, fullgraph = True, backend = "aot_eager")(h)
+    out.sum().backward()
+    torch.testing.assert_close(out, ref, atol = 1e-5, rtol = 0)
+    torch.testing.assert_close(h.grad, h_eager.grad, atol = 1e-5, rtol = 1e-4)
+    torch._dynamo.reset()
 
 
 @pytest.mark.parametrize("mode", ["sparse_full", "dense"])
