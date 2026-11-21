@@ -174,3 +174,28 @@ def test_failed_4bit_load_is_released_before_the_16bit_retry(monkeypatch):
     with pytest.raises(_StopLoad):
         loader.FastCPUModel.from_pretrained("org/model", load_in_4bit = True)
     assert attempts == [True, False, True]
+
+
+def _config_llama(attention):
+    from transformers import LlamaConfig, LlamaForCausalLM
+    config = LlamaConfig(vocab_size = 1000, hidden_size = 64, intermediate_size = 128, num_hidden_layers = 2,
+                         num_attention_heads = 4, num_key_value_heads = 2, max_position_embeddings = 2048,
+                         attn_implementation = attention)
+    model = LlamaForCausalLM(config)
+    model._unsloth_cpu_gradient_checkpointing = "unsloth"
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
+    return model
+
+
+@pytest.mark.parametrize("attention, expect_off", [("eager", False), ("sdpa", True)])
+def test_auto_gradient_checkpointing_counts_eager_attention_scores(monkeypatch, attention, expect_off):
+    """2 layers x 4 heads, batch 2 x 2048: eager keeps ~295 MB of scores / softmax for backward (the linear terms are
+    ~74 MB), so 512 MB free (a 128 MB budget) must keep checkpointing for eager; SDPA keeps no scores and turns it off."""
+    from unsloth_zoo.cpu import trainer
+    monkeypatch.setattr(trainer, "available_ram", lambda: 512 << 20)
+    monkeypatch.delenv("UNSLOTH_CPU_AUTO_GC", raising = False)
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    model = _config_llama(attention)
+    args = _GcArgs(length = 2048, batch = 2)
+    assert bool(trainer._auto_cpu_gradient_checkpointing(model, args)) is expect_off
+    assert args.gradient_checkpointing is (not expect_off)

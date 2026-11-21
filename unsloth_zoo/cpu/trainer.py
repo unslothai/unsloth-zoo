@@ -86,10 +86,11 @@ def normalize_cpu_training_arguments(args):
     return args
 
 
-def _activation_bytes_without_checkpointing(model, tokens):
-    """Upper estimate of the activations autograd keeps for ``tokens`` tokens with no checkpointing: per layer about
-    9 hidden + 3 kv + 4 intermediate values per token (norms, q/k/v, attention out, MLP gate / up / act), doubled for
-    fp32 norm upcasts and LoRA / autograd extras."""
+def _activation_bytes_without_checkpointing(model, batch, length):
+    """Upper estimate of the activations autograd keeps for a ``batch`` x ``length`` micro-batch with no checkpointing:
+    per layer about 9 hidden + 3 kv + 4 intermediate values per token (norms, q/k/v, attention out, MLP gate / up /
+    act), doubled for fp32 norm upcasts and LoRA / autograd extras. Eager (and any non SDPA / flash) attention also
+    keeps heads x length x length scores per sequence: the fp32 softmax plus its cast, doubled the same way."""
     config = getattr(model, "config", None)
     text = getattr(config, "get_text_config", lambda: config)()
     hidden = getattr(text, "hidden_size", None)
@@ -104,7 +105,11 @@ def _activation_bytes_without_checkpointing(model, tokens):
     except StopIteration:
         element = 4
     element = max(element, 2)
-    return 2 * (9 * hidden + 3 * kv + 4 * intermediate) * element * layers * tokens
+    needed = 2 * (9 * hidden + 3 * kv + 4 * intermediate) * element * layers * batch * length
+    attention = getattr(text, "_attn_implementation", None) or getattr(config, "_attn_implementation", None)
+    if isinstance(attention, str) and not any(fast in attention for fast in ("sdpa", "flash", "flex")):
+        needed += 2 * (4 + element) * heads * layers * batch * length * length
+    return needed
 
 
 def _auto_cpu_gradient_checkpointing(model, training_args):
@@ -124,7 +129,7 @@ def _auto_cpu_gradient_checkpointing(model, training_args):
     batch = getattr(training_args, "per_device_train_batch_size", None) or 1
     if not isinstance(length, int) or length <= 0:
         return None
-    needed = _activation_bytes_without_checkpointing(model, batch * length)
+    needed = _activation_bytes_without_checkpointing(model, batch, length)
     available = available_ram()
     if needed is None or available is None:
         return None
