@@ -114,7 +114,6 @@ def _fake_cuda(monkeypatch):
 
     def gemm(name):
         def run(*args, **kwargs):
-            # The workspace is fetched (and allocated when missing) by the first cuBLAS / cuBLASLt call.
             events.append((name, state["pool"], state["stream"].cuda_stream))
         return run
 
@@ -122,7 +121,6 @@ def _fake_cuda(monkeypatch):
         def capture_begin(self, *args, **kwargs):
             events.append(("capture_begin", state["stream"].cuda_stream))
 
-    # Free blocks of the pool: (address, bytes, stream); the allocator hands a block back from its start.
     blocks = [[1000, 4096, 200], [5096, 512, 200], [20000, 3 << 20, 200]]
 
     def empty(size, **kwargs):
@@ -171,20 +169,16 @@ def test_capture_stream_workspace_comes_from_a_pool_and_is_held(monkeypatch):
         with on_stream(_Stream(200)):
             CUDAGraph().capture_begin()
             CUDAGraph().capture_begin()
-    # Only the capture stream's first graph drops its eager workspace and fetches both workspaces from the pool.
     assert events[:4] == ["clear", ("mm", pool, 200), ("addmm", pool, 200), ("capture_begin", 200)]
     assert events[4] == ("capture_begin", 200)
-    # After the capture: out of cuBLAS's cache, and every free block of the pool held on the stream it belongs to.
     mib = 1 << 20
     assert events[5:] == ["device_sync", "clear", ("hold", mib, pool, 200), ("hold", mib, pool, 200), ("hold", mib, pool, 200),
                           ("hold", 4096, pool, 200), ("hold", 512, pool, 200)]
     held = vllm_utils._VLLM_CUBLAS_WORKSPACES[0][1]
     assert [t.size for t in held] == [mib, mib, mib, 4096, 512]
-    # Every piece sits where the freed block was.
     assert [t.data_ptr() for t in held] == [20000, 20000 + mib, 20000 + 2 * mib, 1000, 5096]
     assert CUDAGraph.capture_begin is original
 
-    # A later capture (vLLM profiles, then captures) reuses the pool: the old hold goes back first.
     events.clear()
     with vllm_utils._vllm_cublas_workspace_held():
         assert vllm_utils._VLLM_CUBLAS_WORKSPACES[0] == [pool, []]
@@ -250,7 +244,6 @@ def _graph_writes_freed_workspace(pin):
         reference = y.clone()
     torch._C._cuda_clearCublasWorkspaces()
     with torch.cuda.stream(capture_stream):
-        # The freed workspace goes back to the capture stream's free list: the next same-size block there reuses it.
         sentinels = [torch.full((size // 2,), 0x2B2B, dtype = torch.int16, device = device) for _ in range(4)]
     torch.cuda.synchronize()
     with torch.cuda.stream(replay_stream):

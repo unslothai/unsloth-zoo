@@ -1130,14 +1130,12 @@ def patch_vllm_reset_caches_on_sleep():
 pass
 
 
-# device index -> [MemPool, placeholders]: the cuBLAS / cuBLASLt workspaces vLLM's CUDA graphs were captured with, held
-# after the capture so nothing else can be handed (or unmap) that memory while the graphs replay into it.
+# device index -> [MemPool, held tensors]: workspaces vLLM's CUDA graphs replay into, never freed.
 _VLLM_CUBLAS_WORKSPACES = {}
 _VLLM_CUBLAS_WORKSPACE_WARNED = set()
 
 
 def _free_pool_blocks(pool, device):
-    # (address, bytes, stream, small segment) of every free block of a private pool, largest first.
     blocks = []
     for segment in torch.cuda.memory._snapshot()["segments"]:
         if segment.get("device", device.index) != device.index or tuple(segment.get("segment_pool_id", ())) != tuple(pool.id):
@@ -1151,12 +1149,12 @@ def _free_pool_blocks(pool, device):
 pass
 
 
-_SMALL_ALLOCATION = 1 << 20  # the caching allocator serves requests up to 1 MiB from its small (2 MiB) segments
+_SMALL_ALLOCATION = 1 << 20
 
 
 def _hold_pool_blocks(pool, device, streams, use_mem_pool):
-    # A free block is only handed out again on the stream it was allocated on, and a small segment only to small
-    # requests (the 1 MiB cuBLASLt workspace lives in one): take each block back on its stream, in pieces that fit.
+    # A free block is reused only on its own stream, and a small segment only for <=1 MiB requests (the cuBLASLt
+    # workspace lives in one): allocate each block on its stream, in pieces that fit.
     held, missed = [], 0
     for address, size, stream, small in _free_pool_blocks(pool, device):
         stream = streams.get(stream) or torch.cuda.ExternalStream(stream, device = device)
@@ -1173,8 +1171,6 @@ pass
 
 
 def _cublas_workspaces_into(pool, device, use_mem_pool):
-    # cuBLAS (mm) and cuBLASLt (addmm with a bias) each fetch, and allocate when missing, the workspace of the current
-    # handle and stream: inside use_mem_pool that allocation comes from the private pool.
     with use_mem_pool(pool, device = device), torch.inference_mode(False):
         a = torch.ones(16, 64, device = device, dtype = torch.bfloat16)
         b = torch.ones(64, 32, device = device, dtype = torch.bfloat16)
@@ -1187,15 +1183,9 @@ pass
 
 @contextlib.contextmanager
 def _vllm_cublas_workspace_held():
-    """cuBLAS keeps one workspace per (handle, stream) and splits small-M GEMMs (vLLM decode) over it, so a captured
-    CUDA graph bakes in the workspace of the stream it was captured on: vLLM's graph_capture() makes a fresh capture
-    stream, and nothing but the graphs uses that workspace afterwards. torch._C._cuda_clearCublasWorkspaces frees it
-    back to the caching allocator (Inductor CUDA graph trees call it around every warm-up and recording, e.g.
-    Unsloth's block CUDA graphs in training), after which every decode replay writes split-K partials into memory the
-    trainer was handed, or that empty_cache unmapped (cudaErrorIllegalAddress). Around vLLM's capture: each capture
-    stream's workspaces are allocated in a private pool when its first graph starts capturing, and after the capture
-    they leave cuBLAS's cache into tensors held here for the life of the process, so no clear can free them. Runs per
-    capture (engine load), never per step."""
+    """vLLM's CUDA graphs bake in the capture stream's cuBLAS workspace (split-K for decode GEMMs).
+    _cuda_clearCublasWorkspaces (called by Inductor CUDA graph trees) frees it, so replays then write into memory
+    the trainer owns or empty_cache unmapped (illegal address). Allocate it in a private pool and hold it forever."""
     # All Unsloth Zoo code licensed under LGPLv3
     MemPool = getattr(torch.cuda, "MemPool", None)
     use_mem_pool = getattr(torch.cuda, "use_mem_pool", None)
@@ -1218,8 +1208,7 @@ def _vllm_cublas_workspace_held():
         yield False
         return
     pool = held[0]
-    # Workspaces held for an earlier capture go back into the pool for this one: graphs replay one at a time on vLLM's
-    # stream, so graphs of two captures sharing a workspace is what one stream's graphs do anyway.
+    # Reuse is safe: all graphs replay serially on one stream.
     held[1] = []
     seen = {}
 
@@ -1229,8 +1218,6 @@ def _vllm_cublas_workspace_held():
         if stream.cuda_stream not in seen:
             seen[stream.cuda_stream] = stream
             try:
-                # Before this stream's first capture: drop its eager workspace (stream-ordered free) and fetch the one
-                # the graphs will bake in from the pool.
                 clear()
                 _cublas_workspaces_into(pool, stream.device, use_mem_pool)
             except Exception as error:
@@ -1248,8 +1235,6 @@ def _vllm_cublas_workspace_held():
         if seen:
             try:
                 torch.cuda.synchronize(device)
-                # The graphs reference the pool's workspaces: take them out of cuBLAS's cache (later GEMMs get new
-                # ones) and hold every free block of the pool, so the memory is never reused or released.
                 clear()
                 with torch.cuda.device(device):
                     held[1], missed = _hold_pool_blocks(pool, device, seen, use_mem_pool)
@@ -1327,7 +1312,7 @@ def patch_vllm_graph_capture():
         return GPUModelRunner, logger
 
     def load_v2():
-        # Model Runner V2 (default on CUDA in newer vLLM) is its own class, not a V1 subclass.
+        # Model Runner V2 is not a V1 subclass.
         from vllm.v1.worker.gpu.model_runner import GPUModelRunner
         from vllm.v1.worker.gpu_model_runner import logger
         return GPUModelRunner, logger
@@ -1342,7 +1327,6 @@ def patch_vllm_graph_capture():
     except (ImportError, ValueError):
         has_v2 = False
     if has_v2:
-        # Only the workspace pin: V2's own capture path is left as vLLM ships it.
         wrap(load_v2, "v2", gc_cleanup = False)
     # vLLM v0 is deprecated in vLLM v0.11.0.
     if Version(vllm.__version__) < Version("0.11.0"):
