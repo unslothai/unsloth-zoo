@@ -267,6 +267,9 @@ def _env_int(name, default):
 # CTAs (0 = one per tile), to trade decode latency against how many SMs it takes from the forward beside it.
 _PRIORITY = os.environ.get("UNSLOTH_BLOCK_SWAP_DECODE_PRIORITY", "high").strip().lower()
 _MAX_CTAS = _env_int("UNSLOTH_BLOCK_SWAP_DECODE_CTAS", 0)
+# Staging chunks in flight: the copy engine runs up to this many chunks ahead of a decode that waits for SMs
+# (a long attention or GEMM tile on the training stream), instead of idling.
+_RING = max(2, _env_int("UNSLOTH_BLOCK_SWAP_DECODE_RING", 4))
 
 
 def _decode_chunk(src, tables, first_word, k, out_u8, use_triton):
@@ -291,12 +294,13 @@ def _patch(pos, vals, out_u8, use_triton):
 
 
 class DeviceDecoder:
-    """Per card: a high priority decode stream, two staging buffers and an aux buffer.
+    """Per card: a high priority decode stream, a ring of staging buffers and two aux buffers.
 
-    Chunk j is copied into staging[j % 2] on the block's copy stream while chunk j - 1 decodes on the decode
-    stream, so the copy engine never waits on the decode unless the decode is slower than the bus."""
+    Chunks are copied into the ring on the block's copy stream while earlier ones decode on the decode stream,
+    so the copy engine only waits when the decode falls a whole ring behind. The ring and the aux buffers
+    continue across fetches: the next block's copies start while this block's last chunks still decode."""
 
-    def __init__(self, device, staging_bytes, aux_bytes, use_triton = True):
+    def __init__(self, device, staging_bytes, aux_bytes, use_triton = True, ring = None):
         self.device = torch.device(device)
         self.use_triton = bool(use_triton) and triton_decode_available()
         prio = 0
@@ -307,34 +311,38 @@ class DeviceDecoder:
             except Exception:
                 prio = 0
         self.stream = torch.cuda.Stream(device = self.device, priority = prio)
-        self.staging = [torch.empty(max(16, staging_bytes), dtype = torch.uint8, device = self.device) for _ in range(2)]
-        self.aux = torch.empty(max(16, aux_bytes), dtype = torch.uint8, device = self.device)
-        self.copied = [torch.cuda.Event() for _ in range(2)]
-        self.freed = [torch.cuda.Event() for _ in range(2)]
-        self.aux_ready = torch.cuda.Event()
-        self.aux_free = torch.cuda.Event()
+        ring = max(2, int(ring or _RING))
+        self.staging = [torch.empty(max(16, staging_bytes), dtype = torch.uint8, device = self.device) for _ in range(ring)]
+        self.aux = [torch.empty(max(16, aux_bytes), dtype = torch.uint8, device = self.device) for _ in range(2)]
+        self.copied = [torch.cuda.Event() for _ in range(ring)]
+        self.freed = [torch.cuda.Event() for _ in range(ring)]
+        self.aux_ready = [torch.cuda.Event() for _ in range(2)]
+        self.aux_free = [torch.cuda.Event() for _ in range(2)]
+        self._chunk = 0
         self.fetches = 0
         self.failed = None
 
     def nbytes(self):
-        return sum(t.numel() for t in self.staging) + self.aux.numel()
+        return sum(t.numel() for t in self.staging) + sum(t.numel() for t in self.aux)
 
     def fetch(self, codec, blob, out_u8, copy_stream, done):
         """Enqueue host blob -> device raw region `out_u8`; `done` is recorded once the region is complete.
         The caller made `copy_stream` wait for the compute stream (the slot is free)."""
         ds = self.stream
+        a = self.fetches & 1
         with torch.cuda.device(self.device):
             with torch.cuda.stream(copy_stream):
-                copy_stream.wait_event(self.aux_free)
-                aux = self.aux[:codec.aux_nbytes]
+                copy_stream.wait_event(self.aux_free[a])
+                aux = self.aux[a][:codec.aux_nbytes]
                 aux.copy_(blob[codec.aux_off:codec.nbytes], non_blocking = True)
-                self.aux_ready.record(copy_stream)
-            ds.wait_event(self.aux_ready)
+                self.aux_ready[a].record(copy_stream)
+            ds.wait_event(self.aux_ready[a])
             tables, pos, vals = _aux_views(codec, aux)
             for j in range(codec.n_chunks):
                 s, k, off = codec.chunk_span(j)
                 n = k * 3 // 2
-                slot = j & 1
+                slot = self._chunk % len(self.staging)
+                self._chunk += 1
                 staged = self.staging[slot][:n]
                 with torch.cuda.stream(copy_stream):
                     copy_stream.wait_event(self.freed[slot])
@@ -347,7 +355,7 @@ class DeviceDecoder:
                     self.freed[slot].record(ds)
             with torch.cuda.stream(ds):
                 self._run(lambda: _patch(pos, vals, out_u8, self.use_triton), lambda: _patch_torch(pos, vals, out_u8))
-                self.aux_free.record(ds)
+                self.aux_free[a].record(ds)
                 done.record(ds)
         self.fetches += 1
 
