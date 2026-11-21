@@ -242,7 +242,26 @@ def _triton_kernels():
             w = (w & 0x807F) | (e << 7)
             tl.store(out + p, w.to(tl.int16), mask = mask)
 
-        _TRITON = (_bswap_decode_kernel, _bswap_patch_kernel)
+        @triton.jit(do_not_specialize = ["q_n", "first_word", "n_blocks"])
+        def _bswap_decode4_kernel(sm32, nib16, tab, out64, q_n, first_word, n_blocks, BLOCK: tl.constexpr):
+            # Four words per lane: one 32 bit load of sign + mantissa bytes, one 16 bit load of codes, one 64 bit
+            # store. A tile never straddles a 64K-word table group (4 * BLOCK divides GROUP).
+            for b in range(tl.program_id(0), n_blocks, tl.num_programs(0)):
+                q = tl.arange(0, BLOCK).to(tl.int64) + b * BLOCK
+                mask = q < q_n
+                smw = tl.load(sm32 + q, mask = mask, other = 0)
+                nw = tl.load(nib16 + q, mask = mask, other = 0).to(tl.int32)
+                base = tab + ((first_word + q * 4) >> 16) * 16
+                res = tl.zeros([BLOCK], dtype = tl.int64)
+                for i in tl.static_range(4):
+                    sb = (smw >> (8 * i)) & 0xFF
+                    c = (nw >> (4 * i)) & 15
+                    e = tl.load(base + c, mask = mask, other = 0).to(tl.int32)
+                    w = ((sb & 0x80) << 8) | (e << 7) | (sb & 0x7F)
+                    res = res | (w.to(tl.int64) << (16 * i))
+                tl.store(out64 + q, res, mask = mask)
+
+        _TRITON = (_bswap_decode_kernel, _bswap_patch_kernel, _bswap_decode4_kernel)
     except Exception:
         _TRITON = False
     return _TRITON or None
@@ -272,9 +291,21 @@ _MAX_CTAS = _env_int("UNSLOTH_BLOCK_SWAP_DECODE_CTAS", 0)
 _RING = max(2, _env_int("UNSLOTH_BLOCK_SWAP_DECODE_RING", 4))
 
 
+# Four words per lane (wide loads and stores); 0 = one word per lane.
+_VEC = _env_int("UNSLOTH_BLOCK_SWAP_DECODE_VEC", 1)
+_BLOCK4 = 1024
+
+
 def _decode_chunk(src, tables, first_word, k, out_u8, use_triton):
-    if use_triton:
-        dec, _ = _triton_kernels()
+    if use_triton and _VEC:
+        dec4 = _triton_kernels()[2]
+        q_n = k // 4
+        n_blocks = -(-q_n // _BLOCK4)
+        grid = min(n_blocks, _MAX_CTAS) if _MAX_CTAS > 0 else n_blocks
+        dec4[(grid,)](src[:k].view(torch.int32), src[k:k + k // 2].view(torch.int16), tables, out_u8.view(torch.int64),
+                      q_n, first_word, n_blocks, BLOCK = _BLOCK4, num_warps = 4)
+    elif use_triton:
+        dec = _triton_kernels()[0]
         n_blocks = -(-k // _BLOCK)
         grid = min(n_blocks, _MAX_CTAS) if _MAX_CTAS > 0 else n_blocks
         dec[(grid,)](src, tables, out_u8.view(torch.int16), k, first_word, n_blocks, BLOCK = _BLOCK, num_warps = 4)
@@ -287,7 +318,7 @@ def _patch(pos, vals, out_u8, use_triton):
     if m == 0:
         return
     if use_triton:
-        _, patch = _triton_kernels()
+        patch = _triton_kernels()[1]
         patch[(-(-m // _PATCH_BLOCK),)](pos, vals, out_u8.view(torch.int16), m, BLOCK = _PATCH_BLOCK, num_warps = 4)
     else:
         _patch_torch(pos, vals, out_u8)
