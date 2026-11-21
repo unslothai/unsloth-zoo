@@ -3,7 +3,7 @@
 
 """B12: the hf_xet 429 log scan reuses its answer for unchanged files and rescans changed / new ones.
 Function loaded by AST from unsloth_zoo/__init__.py ; CPU only."""
-import ast, builtins, os, pathlib, time
+import __future__, ast, builtins, os, pathlib, time
 import pytest
 
 _INIT = pathlib.Path(__file__).resolve().parents[1] / "unsloth_zoo" / "__init__.py"
@@ -14,7 +14,9 @@ def _fn():
     tree = ast.parse(_INIT.read_text(encoding = "utf-8"))
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "has_429_exact_full_read")
     ns = {"Path": pathlib.Path, "os": os}
-    exec(compile(ast.Module(body = [node], type_ignores = []), str(_INIT), "exec"), ns)
+    # __init__.py has `from __future__ import annotations`; keep it so `str | Path` works on Python 3.9.
+    code = compile(ast.Module(body = [node], type_ignores = []), str(_INIT), "exec", flags = __future__.annotations.compiler_flag)
+    exec(code, ns)
     return ns["has_429_exact_full_read"]
 
 
