@@ -31,6 +31,7 @@ Host blob per region of N words (N a multiple of 256):
 import os
 import sys
 import threading
+from contextlib import contextmanager
 import torch
 
 __all__ = [
@@ -67,6 +68,8 @@ class RegionCodec:
                  "pos_off", "vals_off", "nbytes", "raw_nbytes")
 
     def __init__(self, words, chunk, esc_n):
+        if int(words) <= 0 or int(words) % 256 or int(chunk) <= 0 or int(chunk) % GROUP or int(esc_n) < 0:
+            raise ValueError(f"bad region geometry: words={words} chunk={chunk} escapes={esc_n}")
         self.words = int(words)
         self.chunk = int(chunk)
         self.n_chunks = -(-self.words // self.chunk)
@@ -76,8 +79,9 @@ class RegionCodec:
         self.esc_n = int(esc_n)
         self.pos_dtype = torch.int32 if self.words < 2**31 else torch.int64
         size = 4 if self.pos_dtype == torch.int32 else 8
-        self.pos_off = _align(self.aux_off + self.tables_bytes, 8)
-        self.vals_off = self.pos_off + self.esc_n * size
+        # 16 byte aligned, like every staging / aux base: the patch kernel compiles to one variant.
+        self.pos_off = _align(self.aux_off + self.tables_bytes, 16)
+        self.vals_off = _align(self.pos_off + self.esc_n * size, 16)
         self.nbytes = self.vals_off + self.esc_n
         self.raw_nbytes = 2 * self.words
 
@@ -101,14 +105,30 @@ def _planes(raw_u8):
     return sm, exp
 
 
-def _encode_chunk(raw_u8, first_word):
+@contextmanager
+def _integer_counts_ok():
+    """bincount has no 'deterministic' CUDA kernel, but integer counts are exact whatever the order:
+    lift torch.use_deterministic_algorithms(True) for the histogram only."""
+    strict = torch.are_deterministic_algorithms_enabled()
+    warn = torch.is_deterministic_algorithms_warn_only_enabled() if strict else False
+    if strict:
+        torch.use_deterministic_algorithms(False)
+    try:
+        yield
+    finally:
+        if strict:
+            torch.use_deterministic_algorithms(True, warn_only = warn)
+
+
+def _encode_chunk(raw_u8):
     """One chunk: (sm + packed codes bytes, tables [groups, 16], escape local positions, escape exponents)."""
     sm, exp = _planes(raw_u8)
     k = sm.numel()
     groups = -(-k // GROUP)
     gidx = torch.arange(k, device = raw_u8.device, dtype = torch.int32) >> 16
     key = (gidx * 256 + exp.to(torch.int32)).long()
-    counts = torch.bincount(key, minlength = groups * 256).view(groups, 256)
+    with _integer_counts_ok():
+        counts = torch.bincount(key, minlength = groups * 256).view(groups, 256)
     top = counts.topk(_ESC, dim = 1).indices
     tables = torch.zeros(groups, 16, dtype = torch.uint8, device = raw_u8.device)
     tables[:, :_ESC] = top.to(torch.uint8)
@@ -140,7 +160,10 @@ def encode_region(raw_u8, chunk = CHUNK, max_ratio = MAX_RATIO, device = None, o
     if (not _LITTLE or raw_u8.dtype != torch.uint8 or raw_u8.dim() != 1 or raw_u8.numel() == 0
             or raw_u8.numel() % 512):
         return None
-    assert chunk % GROUP == 0
+    if chunk <= 0 or chunk % GROUP:
+        raise ValueError(f"chunk must be a positive multiple of {GROUP}, got {chunk}")
+    if out is not None and (out.dtype != torch.uint8 or out.dim() != 1 or out.numel() < raw_u8.numel()):
+        raise ValueError("out must be a 1-D uint8 view at least as long as the region")
     words = raw_u8.numel() // 2
     max_esc = int(words * max_escape_fraction)
     dev = torch.device(device) if device is not None else raw_u8.device
@@ -150,7 +173,7 @@ def encode_region(raw_u8, chunk = CHUNK, max_ratio = MAX_RATIO, device = None, o
         src = raw_u8[2 * s:2 * (s + k)]
         if src.device != dev:
             src = src.to(dev)
-        body, tab, pos, vals = _encode_chunk(src, s)
+        body, tab, pos, vals = _encode_chunk(src)
         esc_n += pos.numel()
         # Escapes past the budget: stop early, a raw copy is cheaper.
         if esc_n > max_esc or (s + k) * 3 // 2 + 5 * esc_n > max_ratio * 2 * words:
@@ -164,7 +187,7 @@ def encode_region(raw_u8, chunk = CHUNK, max_ratio = MAX_RATIO, device = None, o
         vals_all.append(vals.cpu())
         del body, src
     codec = RegionCodec(words, chunk, esc_n)
-    if codec.nbytes > max_ratio * codec.raw_nbytes:
+    if codec.nbytes > max_ratio * codec.raw_nbytes or (out is not None and codec.nbytes > out.numel()):
         return None
     parts.append((codec.aux_off, torch.cat(tables).view(-1)))
     if esc_n:
@@ -179,16 +202,22 @@ def write_parts(blob, parts):
         blob[off:off + t.numel()].copy_(t)
 
 
+# Words per torch-decode slice: bounds its temporaries (about 20 bytes a word) on a card that is already full.
+_TORCH_SLICE = 1 << 20
+
+
 def _decode_chunk_torch(src, tables, first_word, k, out_u8):
     """Reference / fallback decode of one chunk into out_u8 (2k bytes), torch ops only (any device)."""
-    sm = src[:k]
-    packed = src[k:k + k // 2]
-    code = torch.stack((packed & 15, packed >> 4), dim = 1).view(-1)
-    gidx = (torch.arange(k, device = src.device, dtype = torch.int64) + first_word) >> 16
-    exp = tables.view(-1)[gidx * 16 + code.long()]
-    o = out_u8.view(-1, 2)
-    o[:, 0] = ((exp & 1) << 7) | (sm & 0x7F)
-    o[:, 1] = (sm & 0x80) | (exp >> 1)
+    for a in range(0, k, _TORCH_SLICE):
+        n = min(_TORCH_SLICE, k - a)
+        sm = src[a:a + n]
+        packed = src[k + a // 2:k + (a + n) // 2]
+        code = torch.stack((packed & 15, packed >> 4), dim = 1).view(-1)
+        gidx = (torch.arange(n, device = src.device, dtype = torch.int64) + (first_word + a)) >> 16
+        exp = tables.view(-1)[gidx * 16 + code.long()]
+        o = out_u8[2 * a:2 * (a + n)].view(-1, 2)
+        o[:, 0] = ((exp & 1) << 7) | (sm & 0x7F)
+        o[:, 1] = (sm & 0x80) | (exp >> 1)
 
 
 def _patch_torch(pos, vals, out_u8):
@@ -211,10 +240,18 @@ def _aux_views(codec, aux):
     return tables, pos, vals
 
 
+def _check_buffers(codec, blob, out):
+    if blob.dtype != torch.uint8 or blob.dim() != 1 or blob.numel() < codec.nbytes:
+        raise ValueError(f"blob holds {blob.numel()} bytes, the region needs {codec.nbytes}")
+    if out.dtype != torch.uint8 or out.dim() != 1 or out.numel() < codec.raw_nbytes:
+        raise ValueError(f"output holds {out.numel()} bytes, the region needs {codec.raw_nbytes}")
+
+
 def decode_region_cpu(codec, blob, out = None):
     """Decode a host blob back to the region's raw bytes (CPU, exact)."""
     if out is None:
         out = torch.empty(codec.raw_nbytes, dtype = torch.uint8)
+    _check_buffers(codec, blob, out)
     tables, pos, vals = _aux_views(codec, blob[codec.aux_off:codec.nbytes])
     for j in range(codec.n_chunks):
         s, k, off = codec.chunk_span(j)
@@ -225,19 +262,19 @@ def decode_region_cpu(codec, blob, out = None):
 
 # ---------------------------------------------------------------------------------------------------------------
 # GPU decode
+# Module level, not inside a function: Triton 3.2 resolves `tl` and other names in a kernel body from the module's
+# globals, not from an enclosing scope.
+try:
+    import triton
+    import triton.language as tl
+except Exception:
+    triton = tl = None
+
 _TRITON = None
-
-
-def _triton_kernels():
-    global _TRITON
-    if _TRITON is not None:
-        return _TRITON or None
+if tl is not None:
     try:
-        import triton
-        import triton.language as tl
-
         @triton.jit(do_not_specialize = ["k", "first_word", "n_blocks"])
-        def _bswap_decode_kernel(src, tab, out, k, first_word, n_blocks, BLOCK: tl.constexpr):
+        def _bswap_decode_kernel(src, tab, out, k, first_word, n_blocks, BLOCK: tl.constexpr):  # words per tile, fixed
             # Grid-stride over BLOCK-word tiles (the grid may be capped below n_blocks). Offsets inside a chunk stay
             # below CHUNK; the region-wide index (first_word + offs) is int64, since a region can pass 2**31 words.
             for b in range(tl.program_id(0), n_blocks, tl.num_programs(0)):
@@ -252,7 +289,7 @@ def _triton_kernels():
                 tl.store(out + offs, w.to(tl.int16), mask = mask)
 
         @triton.jit(do_not_specialize = ["m"])
-        def _bswap_patch_kernel(pos, vals, out, m, BLOCK: tl.constexpr):
+        def _bswap_patch_kernel(pos, vals, out, m, BLOCK: tl.constexpr):  # escapes per program, fixed
             offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
             mask = offs < m
             p = tl.load(pos + offs, mask = mask, other = 0).to(tl.int64)
@@ -262,7 +299,7 @@ def _triton_kernels():
             tl.store(out + p, w.to(tl.int16), mask = mask)
 
         @triton.jit(do_not_specialize = ["q_n", "first_word", "n_blocks"])
-        def _bswap_decode4_kernel(sm32, nib16, tab, out64, q_n, first_word, n_blocks, BLOCK: tl.constexpr):
+        def _bswap_decode4_kernel(sm32, nib16, tab, out64, q_n, first_word, n_blocks, BLOCK: tl.constexpr):  # 4-word lanes per tile, fixed
             # Four words per lane: one 32 bit load of sign + mantissa bytes, one 16 bit load of codes, one 64 bit
             # store. A tile never straddles a 64K-word table group (4 * BLOCK divides GROUP).
             for b in range(tl.program_id(0), n_blocks, tl.num_programs(0)):
@@ -282,8 +319,11 @@ def _triton_kernels():
 
         _TRITON = (_bswap_decode_kernel, _bswap_patch_kernel, _bswap_decode4_kernel)
     except Exception:
-        _TRITON = False
-    return _TRITON or None
+        _TRITON = None
+
+
+def _triton_kernels():
+    return _TRITON
 
 
 def triton_decode_available():
@@ -354,16 +394,21 @@ class DeviceDecoder:
         self.device = torch.device(device)
         self.use_triton = bool(use_triton) and triton_decode_available()
         prio = 0
-        if _PRIORITY != "normal":
-            try:
-                lo, hi = torch.cuda.Stream.priority_range()
-                prio = min(lo, hi)
-            except Exception:
-                prio = 0
-        self.stream = torch.cuda.Stream(device = self.device, priority = prio)
-        ring = max(2, int(ring or _RING))
+        with torch.cuda.device(self.device):
+            if _PRIORITY != "normal":
+                try:
+                    lo, hi = torch.cuda.Stream.priority_range()
+                    prio = min(lo, hi)
+                except Exception:
+                    prio = 0
+            self.stream = torch.cuda.Stream(device = self.device, priority = prio)
+        ring = max(2, int(_RING if ring is None else ring))
         self.staging = [torch.empty(max(16, staging_bytes), dtype = torch.uint8, device = self.device) for _ in range(ring)]
         self.aux = [torch.empty(max(16, aux_bytes), dtype = torch.uint8, device = self.device) for _ in range(2)]
+        # Staging and aux are written on a copy stream and read on the decode stream: freeing them (teardown) must
+        # wait for both, so record each stream once.
+        self._streams_seen = set()
+        self._own(self.stream)
         self.copied = [torch.cuda.Event() for _ in range(ring)]
         self.freed = [torch.cuda.Event() for _ in range(ring)]
         self.aux_ready = [torch.cuda.Event() for _ in range(2)]
@@ -375,19 +420,41 @@ class DeviceDecoder:
         # another thread must not interleave with a prefetch).
         self._lock = threading.Lock()
 
+    def _own(self, stream):
+        key = (stream.device, stream.stream_id)
+        if key not in self._streams_seen:
+            for t in self.staging + self.aux:
+                t.record_stream(stream)
+            self._streams_seen.add(key)
+
     def nbytes(self):
         return sum(t.numel() for t in self.staging) + sum(t.numel() for t in self.aux)
 
     def fetch(self, codec, blob, out_u8, copy_stream, done):
         """Enqueue host blob -> device raw region `out_u8`; `done` is recorded once the region is complete.
         The caller made `copy_stream` wait for the compute stream (the slot is free)."""
+        if blob.numel() < codec.nbytes or out_u8.numel() < codec.raw_nbytes or out_u8.dtype != torch.uint8:
+            raise ValueError("fetch buffers smaller than the region")
+        if (codec.aux_nbytes > self.aux[0].numel()
+                or min(codec.chunk, codec.words) * 3 // 2 > self.staging[0].numel()):
+            raise ValueError("region larger than this decoder's staging / aux buffers")
         with self._lock:
-            self._fetch(codec, blob, out_u8, copy_stream, done)
+            try:
+                self._fetch(codec, blob, out_u8, copy_stream, done)
+            except BaseException:
+                # A partial submission skipped some release records: release every ring and aux slot after all
+                # work queued so far, so a later fetch never reuses a buffer still in flight.
+                ds = self.stream
+                ds.wait_stream(copy_stream)
+                for e in self.freed + self.aux_free:
+                    e.record(ds)
+                raise
 
     def _fetch(self, codec, blob, out_u8, copy_stream, done):
         ds = self.stream
         # The decode stream writes the slot: the allocator must not hand its memory out before that is done.
         out_u8.record_stream(ds)
+        self._own(copy_stream)
         a = self.fetches & 1
         with torch.cuda.device(self.device):
             with torch.cuda.stream(copy_stream):

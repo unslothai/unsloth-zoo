@@ -37,6 +37,8 @@ def _load(name, file):
 
 C = _load("block_swap_codec_under_test", "block_swap_codec.py")
 _bs = _load("block_swap_compress_under_test", "block_swap.py")
+# block_swap finds its codec through the package import; standalone, hand it the copy loaded above.
+_bs._CODEC.append(C)
 
 
 def _cuda():
@@ -147,7 +149,67 @@ def test_positions_switch_to_int64_past_two_billion_words():
     assert C.RegionCodec(2**31 - 256, C.CHUNK, 3).pos_dtype == torch.int32
     big = C.RegionCodec(2**31 + 256, C.CHUNK, 3)
     assert big.pos_dtype == torch.int64 and big.pos_off % 8 == 0
-    assert big.nbytes == big.pos_off + 3 * 8 + 3
+    assert big.vals_off >= big.pos_off + 3 * 8 and big.nbytes == big.vals_off + 3
+
+
+def test_aux_offsets_are_16_byte_aligned():
+    # One patch-kernel variant: Triton specializes pointer arguments on 16 byte alignment.
+    for esc in (0, 1, 3, 17, 1000):
+        c = C.RegionCodec(5 * C.GROUP + 256, C.GROUP, esc)
+        assert c.aux_off % 16 == 0 and c.pos_off % 16 == 0 and c.vals_off % 16 == 0
+
+
+def test_bad_geometry_is_refused():
+    for args in ((0, C.CHUNK, 0), (300, C.CHUNK, 0), (256, 0, 0), (256, C.GROUP + 1, 0), (256, C.GROUP, -1)):
+        with pytest.raises(ValueError):
+            C.RegionCodec(*args)
+    with pytest.raises(ValueError):
+        C.encode_region(_weights(C.GROUP), chunk = 0)
+    with pytest.raises(ValueError):
+        C.encode_region(_weights(C.GROUP), out = torch.zeros(10, dtype = torch.uint8))
+
+
+def test_kernels_resolve_names_from_module_globals():
+    # Triton 3.2 looks names in a kernel body up in the defining module's globals (not an enclosing function).
+    if not C.triton_decode_available():
+        pytest.skip("no Triton")
+    for k in C._triton_kernels():
+        assert k.fn.__globals__.get("tl") is not None, k.fn.__name__
+
+
+def test_encode_works_under_strict_determinism():
+    raw = _weights(2 * C.GROUP)
+    torch.use_deterministic_algorithms(True)
+    try:
+        codec, blob = _encode(raw)
+        assert torch.are_deterministic_algorithms_enabled()
+    finally:
+        torch.use_deterministic_algorithms(False)
+    assert torch.equal(C.decode_region_cpu(codec, blob), raw)
+
+
+def test_packing_keeps_the_encoder_scratch_in_the_published_reservation(monkeypatch):
+    # Peers read the published bytes while this rank still has blocks to encode through one raw region of scratch.
+    seen = []
+    monkeypatch.setattr(_bs, "_publish_host_pending", lambda n: seen.append(n))
+    monkeypatch.setattr(_bs, "_trim_host_heap", lambda: None)
+
+    class B:
+        def __init__(self, ok):
+            self.ok = ok
+
+        def compressible(self):
+            return self.ok
+
+    sw = _bs.BlockSwap.__new__(_bs.BlockSwap)
+    sw.blocks = [B(True), B(True), B(False)]
+    sw._host_credit = [0, 0, 0]
+    sw._host_own = 1
+    sw._host_walk = _bs._HostWalk([100, 200, 300], [0, 0, 0], 100)
+    sw._encode_scratch = 1000
+    for k in range(3):
+        sw._publish_packed(k)
+    assert seen == [sw._host_walk.pending(0) + 1000, sw._host_walk.pending(1), sw._host_walk.pending(2)]
 
 
 def test_compression_is_off_by_default(monkeypatch):
@@ -172,16 +234,56 @@ def _device_round_trip(raw, chunk, use_triton):
     return out.cpu(), dec
 
 
-@pytest.mark.parametrize("use_triton", [True, False])
-def test_device_decode_is_bitwise(use_triton):
+@pytest.mark.parametrize("use_triton,vec", [(True, 1), (True, 0), (False, 1)])
+def test_device_decode_is_bitwise(use_triton, vec, monkeypatch):
     _cuda()
     if use_triton and not C.triton_decode_available():
         pytest.skip("no Triton")
+    monkeypatch.setattr(C, "_VEC", vec)
     words = torch.arange(-32768, 32768, dtype = torch.int32).to(torch.int16).view(torch.uint8)
     for raw in (_weights(5 * C.GROUP + 256), torch.cat((words, _weights(3 * C.GROUP)))):
         got, dec = _device_round_trip(raw, 2 * C.GROUP, use_triton)
         assert dec.use_triton == use_triton
         assert torch.equal(got, raw)
+
+
+def test_a_failed_submission_leaves_the_decoder_usable(monkeypatch):
+    # An OOM mid-fetch propagates; every ring / aux slot is released after queued work, so the next fetch is exact.
+    _cuda()
+    raw = _weights(4 * C.GROUP)
+    codec, blob = _encode(raw, chunk = C.GROUP)
+    dec = C.DeviceDecoder("cuda", C.GROUP * 3 // 2, codec.aux_nbytes, ring = 2)
+    real, calls = C._decode_chunk, []
+
+    def flaky(*a, **k):
+        calls.append(1)
+        if len(calls) == 3:
+            raise torch.cuda.OutOfMemoryError("simulated")
+        return real(*a, **k)
+
+    monkeypatch.setattr(C, "_decode_chunk", flaky)
+    out = torch.zeros(codec.raw_nbytes, dtype = torch.uint8, device = "cuda")
+    cs = torch.cuda.Stream()
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        dec.fetch(codec, blob.pin_memory(), out, cs, torch.cuda.Event())
+    monkeypatch.setattr(C, "_decode_chunk", real)
+    done = torch.cuda.Event()
+    cs.wait_stream(torch.cuda.current_stream())
+    dec.fetch(codec, blob.pin_memory(), out, cs, done)
+    torch.cuda.current_stream().wait_event(done)
+    assert torch.equal(out.cpu(), raw)
+
+
+def test_fetch_refuses_buffers_smaller_than_the_region():
+    _cuda()
+    raw = _weights(2 * C.GROUP)
+    codec, blob = _encode(raw, chunk = C.GROUP)
+    dec = C.DeviceDecoder("cuda", C.GROUP * 3 // 2, codec.aux_nbytes)
+    out = torch.zeros(codec.raw_nbytes - 512, dtype = torch.uint8, device = "cuda")
+    with pytest.raises(ValueError):
+        dec.fetch(codec, blob, out, torch.cuda.Stream(), torch.cuda.Event())
+    with pytest.raises(ValueError):
+        C.decode_region_cpu(codec, blob[:-1])
 
 
 def test_failed_kernel_launch_falls_back_to_the_torch_decode(monkeypatch):
@@ -294,41 +396,140 @@ def test_state_dict_and_remove_restore_the_exact_weights(monkeypatch):
     assert len(set(ptrs)) == len(ptrs)
 
 
-def test_peft_adapter_state_dict_skips_decoding(monkeypatch):
+class _Net(nn.Module):
+    def __init__(self, layers):
+        super().__init__()
+        self.layers = layers
+
+    def forward(self, x):
+        for b in self.layers:
+            x = b(x)
+        return x
+
+
+def _peft_state(compress, monkeypatch, tmp_path):
+    peft = pytest.importorskip("peft")
+    from safetensors.torch import load_file, save_file
+    net = _Net(_layers(4, 256, bias = True))
+    model = peft.get_peft_model(net, peft.LoraConfig(r = 4, target_modules = ["w"], modules_to_save = ["up"], bias = "all"))
+    # Frozen copies peft still saves by key: modules_to_save weights and (bias = "all") every bias.
+    for name, p in model.named_parameters():
+        if "lora_" not in name:
+            p.requires_grad_(False)
+    ref = {k: v.detach().clone().cpu() for k, v in peft.get_peft_model_state_dict(model).items()}
+    monkeypatch.setenv("UNSLOTH_BLOCK_SWAP_COMPRESS", "1" if compress else "0")
+    sw = _bs.BlockSwap(model.base_model.model.layers, [1, 2, 3], prefetch_depth = 1, device = "cuda")
+    evicted = sum(not b.resident for b in sw.blocks)
+    state = peft.get_peft_model_state_dict(model)
+    path = os.path.join(str(tmp_path), f"adapter_{int(compress)}.safetensors")
+    save_file({k: v.detach().contiguous().cpu() for k, v in state.items()}, path)
+    back = load_file(path)
+    stats = sw.compression_stats()
+    sw.remove()
+    return ref, back, evicted, stats
+
+
+def test_real_peft_adapter_save_reloads_every_selected_frozen_weight(monkeypatch, tmp_path):
+    _require_compression()
+    ref, back, evicted, stats = _peft_state(True, monkeypatch, tmp_path)
+    assert evicted >= 1 and stats["layers"] == 3
+    assert any("modules_to_save" in k for k in ref) and any(k.endswith("bias") for k in ref)
+    assert set(back) == set(ref)
+    for k, v in ref.items():
+        assert back[k].shape == v.shape and torch.equal(back[k], v), k
+    ref0, back0, _, _ = _peft_state(False, monkeypatch, tmp_path)
+    assert all(torch.equal(back0[k], ref0[k]) for k in ref0)
+
+
+def test_state_dict_under_inference_mode_returns_normal_tensors(monkeypatch):
     _require_compression()
     layers = _layers(3, 256)
     monkeypatch.setenv("UNSLOTH_BLOCK_SWAP_COMPRESS", "1")
     sw = _bs.BlockSwap(layers, [1, 2], prefetch_depth = 1, device = "cuda")
-    calls = []
-    orig = _bs._Block.host_views
-    monkeypatch.setattr(_bs._Block, "host_views", lambda self, *a, **k: calls.append(1) or orig(self, *a, **k))
-
-    ref = {k: v.clone() for k, v in layers.state_dict().items()}
-    assert len(calls) == 2
-    ns = {"__name__": "peft.utils.save_and_load", "layers": layers}
-    exec("def get_peft_model_state_dict():\n    return layers.state_dict()", ns)
-    sd = ns["get_peft_model_state_dict"]()
-    assert len(calls) == 2, "no decode under peft's adapter state dict"
-    evicted = [k for k in ("1.w.weight", "2.w.weight") if sd[k].numel() == 0]
-    assert evicted, "an evicted frozen weight is left as its placeholder"
-    sd = layers.state_dict()
-    assert len(calls) == 4 and all(torch.equal(sd[k].cpu(), v.cpu()) for k, v in ref.items())
+    with torch.inference_mode():
+        sd = layers.state_dict()
+    assert not any(v.is_inference() for v in sd.values())
     sw.remove()
 
 
-def test_peft_adapter_state_dict_still_returns_frozen_biases(monkeypatch):
-    # bias = "all" saves every bias by key: a swapped frozen bias must come back with its real values.
+def test_install_falls_back_to_raw_when_only_the_encoder_scratch_does_not_fit(monkeypatch):
     _require_compression()
-    layers = _layers(3, 256, bias = True)
-    ref = {k: v.clone() for k, v in layers.state_dict().items()}
+    real = _bs._check_host_fit
+
+    def tight(sizes, on_host = 0, slack = 0):
+        if slack > 0:
+            raise ValueError("simulated: no host room for the scratch")
+        return real(sizes, on_host = on_host, slack = slack)
+
+    monkeypatch.setattr(_bs, "_check_host_fit", tight)
+    ref, _, _ = _run(_layers(3, 256), False, monkeypatch, None)
+    got, sw, st = _run(_layers(3, 256), True, monkeypatch, [1, 2])
+    assert st["compression"]["enabled"] is False and st["compression"]["decoder_bytes"] == 0
+    assert all(torch.equal(x, y) for a, b in zip(ref, got) for x, y in zip(a, b))
+    sw.remove()
+
+
+def test_install_stays_raw_when_decode_buffers_and_slots_do_not_fit(monkeypatch):
+    _require_compression()
+    layers = _layers(3, 256)
+    for b in layers:   # host-loaded originals: packing frees nothing on the card
+        b.w.weight.data, b.up.weight.data = b.w.weight.data.cpu(), b.up.weight.data.cpu()
+        b.norm_weight.data = b.norm_weight.data.cpu()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a, **k: (1 << 20, 1 << 30))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *a, **k: 0)
+    monkeypatch.setenv("UNSLOTH_BLOCK_SWAP_COMPRESS", "1")
+    sw = _bs.BlockSwap(layers, [0, 1, 2], prefetch_depth = 1, device = "cuda")
+    st = sw.compression_stats()
+    assert st["enabled"] is False and st["decoder_bytes"] == 0, st
+    sw.remove()
+
+
+def test_no_decoders_are_kept_when_every_region_stays_raw(monkeypatch):
+    _require_compression()
+    layers = _layers(3, 256)
+    g = torch.Generator().manual_seed(0)
+    for p in layers.parameters():   # random bit patterns: bf16 dtype, nothing to compress
+        if not p.requires_grad:
+            p.data.view(torch.int16).copy_(torch.randint(-32768, 32767, p.shape, generator = g, dtype = torch.int16))
     monkeypatch.setenv("UNSLOTH_BLOCK_SWAP_COMPRESS", "1")
     sw = _bs.BlockSwap(layers, [1, 2], prefetch_depth = 1, device = "cuda")
-    ns = {"__name__": "peft.utils.save_and_load", "layers": layers}
-    exec("def get_peft_model_state_dict():\n    return layers.state_dict()", ns)
-    sd = ns["get_peft_model_state_dict"]()
-    for k in ("1.up.bias", "2.up.bias"):
-        assert torch.equal(sd[k].cpu(), ref[k].cpu()), k
+    st = sw.compression_stats()
+    assert st["layers"] == 0 and st["decoder_bytes"] == 0 and st["enabled"] is False, st
     sw.remove()
+
+
+def test_install_under_strict_determinism(monkeypatch):
+    _require_compression()
+    torch.use_deterministic_algorithms(True, warn_only = False)
+    try:
+        monkeypatch.setenv("UNSLOTH_BLOCK_SWAP_COMPRESS", "1")
+        sw = _bs.BlockSwap(_layers(3, 256), [1, 2], prefetch_depth = 1, device = "cuda")
+        assert sw.compression_stats()["layers"] == 2
+        sw.remove()
+    finally:
+        torch.use_deterministic_algorithms(False)
+
+
+def test_remove_falls_back_to_a_host_decode_when_the_card_is_full(monkeypatch):
+    _require_compression()
+    layers = _layers(4, 256)
+    ref = {k: v.clone() for k, v in layers.state_dict().items()}
+    monkeypatch.setenv("UNSLOTH_BLOCK_SWAP_COMPRESS", "1")
+    sw = _bs.BlockSwap(layers, [0, 2, 3], prefetch_depth = 1, device = "cuda")
+    assert any(not b.resident for b in sw.blocks)
+
+    def full(self, d, target):
+        if torch.device(target).type == "cuda":
+            raise torch.cuda.OutOfMemoryError("simulated")
+        return orig(self, d, target)
+
+    orig = _bs._Block._region_on
+    monkeypatch.setattr(_bs._Block, "_region_on", full)
+    sw.remove()
+    for k, v in layers.state_dict().items():
+        assert v.device.type == "cuda" and torch.equal(v, ref[k]), k
 
 
 def test_compression_without_triton_stays_raw_and_exact(monkeypatch):
@@ -365,15 +566,18 @@ def test_compressed_swap_under_torch_compile_adds_no_graph_breaks(monkeypatch):
             return x
 
         with torch.no_grad():
+            before = sw.compression_stats()["fetches"]
             out = torch.compile(f)(x)
+            fetched = sw.compression_stats()["fetches"] - before
+            graphs = counters["stats"]["unique_graphs"]
             eager = f(x)
         n = sum(counters["graph_break"].values())
-        st = sw.compression_stats()
         sw.remove()
-        return out, eager, n, st
+        return out, eager, n, fetched, graphs
 
-    o0, e0, n0, s0 = breaks(False)
-    o1, e1, n1, s1 = breaks(True)
-    assert s1["fetches"] > 0 and s0["fetches"] == 0
+    o0, e0, n0, f0, g0 = breaks(False)
+    o1, e1, n1, f1, g1 = breaks(True)
+    assert g0 > 0 and g1 > 0, "a graph was compiled"
+    assert f1 > 0 and f0 == 0, "the compiled call itself ran compressed fetches"
     assert n1 == n0, (n0, n1)
     assert torch.equal(o0, o1) and torch.equal(e0, e1)
