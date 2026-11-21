@@ -52,21 +52,28 @@ def _fit_in_subprocess(extra, cores = None):
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
+# "user": the count torch derived from the user's OMP_NUM_THREADS / MKL_NUM_THREADS is kept as is. Newer torch builds
+# cap those to the CPUs it sees (a 2-vCPU CI runner reports 2 for OMP_NUM_THREADS=8), so compare with torch's own count.
+_USER = "user"
+
+
 @pytest.mark.parametrize("extra, cores, expected", [
-    # No user setting: one thread per physical core, never more than torch's default.
-    ({"OMP_NUM_THREADS": "8"}, 3, 8),  # a user's OMP_NUM_THREADS is kept
-    ({"MKL_NUM_THREADS": "3"}, 2, 3),  # so is MKL_NUM_THREADS
+    ({"OMP_NUM_THREADS": "8"}, 3, _USER),  # a user's OMP_NUM_THREADS is kept
+    ({"MKL_NUM_THREADS": "3"}, 2, _USER),  # so is MKL_NUM_THREADS
     ({"UNSLOTH_CPU_THREADS": "5", "OMP_NUM_THREADS": "3"}, 2, 5),  # UNSLOTH_CPU_THREADS wins
     ({"OMP_NUM_THREADS": "1"}, 4, 1),  # a plain OMP_NUM_THREADS=1 is the user's
     # torchrun with 2 local ranks exported OMP_NUM_THREADS=1: split the cores instead.
     ({"OMP_NUM_THREADS": "1", "TORCHELASTIC_RUN_ID": "r", "LOCAL_WORLD_SIZE": "2"}, 8, 4),
     ({"OMP_NUM_THREADS": "1", "TORCHELASTIC_RUN_ID": "r", "LOCAL_WORLD_SIZE": "2", "UNSLOTH_CPU_THREADS": "1"}, 8, 1),
-    ({"OMP_NUM_THREADS": "4", "TORCHELASTIC_RUN_ID": "r", "LOCAL_WORLD_SIZE": "2"}, 8, 4),
+    ({"OMP_NUM_THREADS": "4", "TORCHELASTIC_RUN_ID": "r", "LOCAL_WORLD_SIZE": "2"}, 8, _USER),
     ({"OMP_NUM_THREADS": "1", "ACCELERATE_MIXED_PRECISION": "no"}, 6, 6),  # accelerate launch's 1
 ])
 def test_fit_cpu_threads_env_cases(extra, cores, expected):
     before, fitted, reason, idempotent, live = _fit_in_subprocess(extra, cores)
-    assert fitted == expected == live, (extra, before, fitted, reason)
+    if expected == _USER:
+        assert fitted == before == live and reason == "OMP_NUM_THREADS / MKL_NUM_THREADS", (extra, before, fitted, reason)
+    else:
+        assert fitted == expected == live, (extra, before, fitted, reason)
     assert idempotent
 
 
@@ -138,3 +145,21 @@ def test_fit_threads_names_the_cgroup_quota(monkeypatch):
     finally:
         torch.set_num_threads(before)
         runtime._THREADS_FITTED = None
+
+
+def test_user_thread_env_kept_when_torch_caps_it(monkeypatch):
+    """Spoof of a small CI runner: torch already capped OMP_NUM_THREADS=8 to 2; the fit keeps torch's 2 and never
+    swaps in its own count, whatever cores it would pick."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_zoo_cpu_runtime_spoof", _ROOT / "unsloth_zoo" / "cpu" / "runtime.py")
+    runtime = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runtime)
+    for name in _THREAD_ENV:
+        monkeypatch.delenv(name, raising = False)
+    monkeypatch.setenv("OMP_NUM_THREADS", "8")
+    calls = []
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 2)
+    monkeypatch.setattr(torch, "set_num_threads", lambda n: calls.append(n))
+    monkeypatch.setattr(runtime, "cpu_compute_cores", lambda: 1)
+    assert runtime.fit_cpu_threads() == (2, "OMP_NUM_THREADS / MKL_NUM_THREADS")
+    assert calls == []
