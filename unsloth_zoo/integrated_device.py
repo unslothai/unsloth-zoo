@@ -159,7 +159,8 @@ def device_is_integrated_part(index):
     """True when CUDA / HIP device ``index`` is an integrated GPU (an APU / SoC part with no memory chips of its own).
 
     Three signals, any one is enough: the driver's integrated flag (trusted on HIP only from ROCm 6.2, where clr
-    started filling it in), an AMD APU architecture name, or an NVIDIA unified-memory part name. Never raises.
+    started filling it in), an AMD APU architecture name, or (CUDA wheels without the flag only) an NVIDIA
+    unified-memory part name. Never raises.
     """
     try:
         import torch
@@ -178,6 +179,9 @@ def device_is_integrated_part(index):
         if value is not None and bool(value):
             return True
     if hip:
+        return False
+    # CUDA fills the flag reliably: when the wheel publishes it, 0 means discrete and a name never overrides it.
+    if any(getattr(props, field, None) is not None for field in ("is_integrated", "integrated")):
         return False
     name = str(getattr(props, "name", "") or "").lower()
     return any(marker in name for marker in _NVIDIA_UNIFIED_NAME_MARKERS)

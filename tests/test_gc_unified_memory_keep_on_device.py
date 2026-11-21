@@ -51,6 +51,9 @@ def _install(monkeypatch, props_list, hip = None, carveout = 512 * 1024 ** 2, pl
     (_Props("Orin", integrated = 1), None, True),
     (_Props("NVIDIA H100 80GB HBM3", is_integrated = 0), None, False),
     (_Props("Tesla T4"), None, False),
+    # The driver says discrete: a name that merely contains a unified-part marker must not override it.
+    (_Props("NVIDIA GB100", is_integrated = 0), None, False),
+    (_Props("NVIDIA Thor-X", integrated = 0), None, False),
 ])
 def test_integrated_part_detection(monkeypatch, props, hip, expect):
     if getattr(props, "total_memory", None) is None:
