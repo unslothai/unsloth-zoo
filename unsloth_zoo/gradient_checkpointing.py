@@ -101,12 +101,41 @@ def _keep_on_device_indices():
 
 
 _WARNED_KEEP_ON_DEVICE = False
+_WARNED_KEEP_LOW_MEMORY = False
+# Free device memory below which a unified device offloads again (the old path): the device budget can still be
+# smaller than host RAM there (a GTT limit, a partial carve-out), so a run that only fits with offload keeps fitting.
+KEEP_ON_DEVICE_HEADROOM_MIN  = 2 * 1024 * 1024 * 1024
+KEEP_ON_DEVICE_HEADROOM_FRAC = 0.05
+# device_index -> [projected free bytes, headroom]. Re-read only when the projection nears the headroom, so a run
+# with room to spare pays one mem_get_info (no sync) every few steps, not one per layer.
+_KEEP_BUDGET = {}
 
 
-def _keeps_on_device(device_index):
-    global _WARNED_KEEP_ON_DEVICE
+def _device_free_bytes(device_index):
+    free, total = torch.cuda.mem_get_info(device_index)
+    # Blocks torch has cached but not handed out are free for the next activation too.
+    cached = torch.cuda.memory_reserved(device_index) - torch.cuda.memory_allocated(device_index)
+    return int(free) + max(int(cached), 0), int(total)
+
+
+def _keeps_on_device(device_index, nbytes = 0):
+    global _WARNED_KEEP_ON_DEVICE, _WARNED_KEEP_LOW_MEMORY
     keep = _keep_on_device_indices()
     if not keep or device_index not in keep: return False
+    budget = _KEEP_BUDGET.get(device_index)
+    if budget is None or budget[0] - nbytes < 2 * budget[1]:
+        try:
+            free, total = _device_free_bytes(device_index)
+        except Exception:
+            return False # cannot tell: offload, as before
+        headroom = max(KEEP_ON_DEVICE_HEADROOM_MIN, int(total * KEEP_ON_DEVICE_HEADROOM_FRAC))
+        budget = _KEEP_BUDGET[device_index] = [free, headroom]
+    if budget[0] - nbytes < budget[1]:
+        if not _WARNED_KEEP_LOW_MEMORY:
+            _WARNED_KEEP_LOW_MEMORY = True
+            print("Unsloth: GPU memory is nearly full, so gradient checkpointing offloads activations to RAM again.")
+        return False
+    budget[0] -= nbytes
     if not _WARNED_KEEP_ON_DEVICE:
         _WARNED_KEEP_ON_DEVICE = True
         print("Unsloth: GPU shares memory with the CPU, so gradient checkpointing keeps activations on the device.")
@@ -1867,6 +1896,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     CPU_BUFFERS = []
     CPU_INDEX = 0
     _reset_cpu_slots()
+    _KEEP_BUDGET.clear()
 
     if dtype is None:
         if DEVICE_TYPE == "cuda":
@@ -2025,7 +2055,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                     global MINIMUM_SIZE
                     global CPU_INDEX
                     if new_size > MINIMUM_SIZE and ((CURRENT_GC_INDEX != LAST_GC_INDEX) or FIRST_PASS) and \
-                            not _keeps_on_device(arg.device.index):
+                            not _keeps_on_device(arg.device.index, new_size):
                         use_gpu_buffer = True
                         global CPU_BUFFERS
                         global GPU_BUFFERS
@@ -2633,11 +2663,12 @@ class NonReentrantActivationOffloader:
     def pack(self, x):
         if not x.requires_grad or self._on_host(x):
             return None, x
-        if self.keep_on_device and x.device.index in self.keep_on_device:
-            if not _is_compiling():
-                _keeps_on_device(x.device.index) # one-time notice
-                self._keep("unified", x.numel() * x.element_size())
-            return None, x.detach()
+        # Traced: offload as before (the budget check reads allocator state).
+        if self.keep_on_device and x.device.index in self.keep_on_device and not _is_compiling():
+            nbytes = x.numel() * x.element_size()
+            if _keeps_on_device(x.device.index, nbytes):
+                self._keep("unified", nbytes)
+                return None, x.detach()
         if _is_compiling():
             # Traced: no size or storage checks, which would add guards on symbolic shapes.
             return x.device, x.to("cpu", non_blocking = True)

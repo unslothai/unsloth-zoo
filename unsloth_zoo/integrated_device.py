@@ -39,6 +39,8 @@ __all__ = [
     "expandable_segments_unsupported",
     "cuda_props_are_integrated",
     "cuda_total_memory",
+    "device_is_integrated_part",
+    "device_memory_pool",
     "device_shares_host_memory",
     "unified_memory_device_indices",
 ]
@@ -153,8 +155,8 @@ def _hip_version_at_least(major, minor):
         return False
 
 
-def device_shares_host_memory(index):
-    """True when CUDA / HIP device ``index`` draws its memory from the same physical pool as the host.
+def device_is_integrated_part(index):
+    """True when CUDA / HIP device ``index`` is an integrated GPU (an APU / SoC part with no memory chips of its own).
 
     Three signals, any one is enough: the driver's integrated flag (trusted on HIP only from ROCm 6.2, where clr
     started filling it in), an AMD APU architecture name, or an NVIDIA unified-memory part name. Never raises.
@@ -179,6 +181,105 @@ def device_shares_host_memory(index):
         return False
     name = str(getattr(props, "name", "") or "").lower()
     return any(marker in name for marker in _NVIDIA_UNIFIED_NAME_MARKERS)
+
+
+# An integrated AMD part still has a BIOS carve-out ("UMA frame buffer", 512 MiB up to 96 GiB on Strix Halo) that the
+# OS never sees. Device allocations draw on host RAM (GTT / shared memory) only beyond it, so a large carve-out is a
+# separate budget that host offload DOES relieve. Shared only when the carve-out is at most this share of what torch
+# can allocate.
+CARVEOUT_MAX_SHARE = 0.25
+
+
+def _amdgpu_sysfs_vram_total(props, root = "/sys/class/drm"):
+    """Bytes of dedicated VRAM (the carve-out) amdgpu reports for the card at ``props``' PCI address, or None."""
+    import glob as _glob
+    bus = getattr(props, "pci_bus_id", None)
+    found = []
+    for device in sorted(_glob.glob(os.path.join(root, "card*", "device"))):
+        try:
+            with open(os.path.join(device, "mem_info_vram_total"), "rb") as file:
+                vram = int(file.read(64).strip())
+        except (OSError, ValueError):
+            continue
+        address = os.path.basename(os.path.realpath(device)).lower() # 0000:c3:00.0
+        try:
+            card_bus = int(address.split(":")[1], 16)
+        except (IndexError, ValueError):
+            card_bus = None
+        found.append((card_bus, vram))
+    if bus is not None:
+        for card_bus, vram in found:
+            if card_bus == bus:
+                return vram
+    return found[0][1] if len(found) == 1 else None
+
+
+def _windows_hidden_memory():
+    """Installed RAM minus what Windows can use, i.e. the carve-out (plus firmware reservations), or None."""
+    try:
+        import ctypes
+        installed_kib = ctypes.c_ulonglong(0)
+        if not ctypes.windll.kernel32.GetPhysicallyInstalledSystemMemory(ctypes.byref(installed_kib)):
+            return None
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return max(int(installed_kib.value) * 1024 - int(status.ullTotalPhys), 0)
+    except Exception:
+        return None
+
+
+def device_memory_pool(index):
+    """Where device ``index``'s allocations come from, for the offload decision. A dict with ``pool`` one of
+    "discrete", "shared" (device memory IS host RAM: offloading frees nothing), "carveout" (an integrated part
+    whose allocations come from a dedicated carve-out the host cannot use: offloading frees device budget) or
+    "unknown" (integrated, carve-out unreadable: treated like "carveout"), plus the numbers it was decided on.
+    """
+    info = {"pool": "discrete", "total_memory": None, "carveout": None, "carveout_source": None}
+    if not device_is_integrated_part(index):
+        return info
+    try:
+        import torch
+        props = torch.cuda.get_device_properties(index)
+        total = int(getattr(props, "total_memory", 0) or 0)
+    except Exception:
+        info["pool"] = "unknown"
+        return info
+    info["total_memory"] = total
+    if not _is_hip_build():
+        # GB10 / Tegra: one coherent LPDDR pool, no carve-out.
+        info["pool"] = "shared"
+        return info
+    carveout, source = None, None
+    if sys.platform.startswith("linux"):
+        carveout, source = _amdgpu_sysfs_vram_total(props), "sysfs mem_info_vram_total"
+    elif sys.platform == "win32":
+        carveout, source = _windows_hidden_memory(), "installed minus usable RAM"
+    info["carveout"], info["carveout_source"] = carveout, source
+    if carveout is None or total <= 0:
+        info["pool"] = "unknown"
+    elif carveout <= CARVEOUT_MAX_SHARE * total:
+        info["pool"] = "shared"
+    else:
+        info["pool"] = "carveout"
+    return info
+
+
+def device_shares_host_memory(index):
+    """True when device ``index``'s allocations come out of the same RAM host offload would use (see
+    ``device_memory_pool``): an integrated part with no carve-out or a small one. Never raises."""
+    try:
+        return device_memory_pool(index)["pool"] == "shared"
+    except Exception:
+        return False
 
 
 def unified_memory_device_indices():
