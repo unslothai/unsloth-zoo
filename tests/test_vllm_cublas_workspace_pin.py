@@ -50,7 +50,6 @@ def _fake_vllm(monkeypatch):
         "vllm.v1.worker": types.ModuleType("vllm.v1.worker"),
         "vllm.v1.worker.gpu_model_runner": types.SimpleNamespace(GPUModelRunner = V1Runner, logger = logger),
         "vllm.v1.worker.gpu": types.ModuleType("vllm.v1.worker.gpu"),
-        # Its own logger, as on vLLM without the V1 runner module.
         "vllm.v1.worker.gpu.model_runner": types.SimpleNamespace(GPUModelRunner = V2Runner, logger = logger),
     }
     for name, module in modules.items():
@@ -182,7 +181,6 @@ def test_capture_stream_workspace_comes_from_a_pool_and_is_held(monkeypatch):
     assert [t.data_ptr() for t in held] == [20000, 20000 + mib, 20000 + 2 * mib, 1000, 5096]
     assert CUDAGraph.capture_begin is original
 
-    # A call that captures nothing keeps the holds.
     with vllm_utils._vllm_cublas_workspace_held():
         pass
     assert vllm_utils._VLLM_CUBLAS_WORKSPACES[0][1] is held
@@ -192,7 +190,6 @@ def test_capture_stream_workspace_comes_from_a_pool_and_is_held(monkeypatch):
         assert vllm_utils._VLLM_CUBLAS_WORKSPACES[0][1] is held
         with on_stream(_Stream(200)):
             CUDAGraph().capture_begin()
-        # The next capture takes them back into the pool and re-holds after it.
         assert vllm_utils._VLLM_CUBLAS_WORKSPACES[0] == [pool, []]
     assert events[:3] == ["clear", ("mm", pool, 200), ("addmm", pool, 200)]
 
@@ -217,7 +214,6 @@ def test_failed_priming_is_not_held(monkeypatch):
     with vllm_utils._vllm_cublas_workspace_held():
         with on_stream(_Stream(200)):
             CUDAGraph().capture_begin()
-    # Only the pre-capture clear ran: nothing to hold, no end-of-capture clear.
     assert events == ["clear", ("capture_begin", 200)]
 
 

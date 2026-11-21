@@ -1231,7 +1231,6 @@ def _vllm_cublas_workspace_held(enabled = True):
     @functools.wraps(original)
     def capture_begin(self, *args, **kwargs):
         stream = torch.cuda.current_stream()
-        # Only this runner's captures: another thread or device keeps stock behaviour.
         if threading.get_ident() == owner and stream.device == device and stream.cuda_stream not in seen:
             try:
                 # An earlier capture's holds go back to the pool only once this one captures (a no-capture call keeps
@@ -1333,7 +1332,6 @@ def patch_vllm_graph_capture():
 
     def load_v2():
         # Model Runner V2 is not a V1 subclass.
-        # Its own logger: newer vLLM removes the V1 module.
         from vllm.v1.worker.gpu import model_runner
         log = getattr(model_runner, "logger", None)
         if log is None:
