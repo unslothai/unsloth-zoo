@@ -50,7 +50,8 @@ def _fake_vllm(monkeypatch):
         "vllm.v1.worker": types.ModuleType("vllm.v1.worker"),
         "vllm.v1.worker.gpu_model_runner": types.SimpleNamespace(GPUModelRunner = V1Runner, logger = logger),
         "vllm.v1.worker.gpu": types.ModuleType("vllm.v1.worker.gpu"),
-        "vllm.v1.worker.gpu.model_runner": types.SimpleNamespace(GPUModelRunner = V2Runner),
+        # Its own logger, as on vLLM without the V1 runner module.
+        "vllm.v1.worker.gpu.model_runner": types.SimpleNamespace(GPUModelRunner = V2Runner, logger = logger),
     }
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
@@ -137,6 +138,7 @@ def _fake_cuda(monkeypatch):
     monkeypatch.setattr(torch.cuda, "stream", on_stream)
     monkeypatch.setattr(torch.cuda, "ExternalStream", lambda ptr, device = None: _Stream(ptr), raising = False)
     monkeypatch.setattr(torch.cuda, "MemPool", _Pool, raising = False)
+    monkeypatch.setattr(torch.cuda, "get_allocator_backend", lambda: "native", raising = False)
     monkeypatch.setattr(torch.cuda, "use_mem_pool", use_mem_pool, raising = False)
     monkeypatch.setattr(torch.cuda, "graphs", types.SimpleNamespace(CUDAGraph = CUDAGraph), raising = False)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: events.append("device_sync"))
@@ -187,6 +189,46 @@ def test_capture_stream_workspace_comes_from_a_pool_and_is_held(monkeypatch):
     assert events[:3] == ["clear", ("mm", pool, 200), ("addmm", pool, 200)]
 
 
+def test_other_thread_or_device_capture_is_left_alone(monkeypatch):
+    import threading
+    CUDAGraph, on_stream, events = _fake_cuda(monkeypatch)
+    other = _Stream(300)
+    other.device = torch.device("cuda", 1)
+    with vllm_utils._vllm_cublas_workspace_held():
+        with on_stream(other):
+            CUDAGraph().capture_begin()
+        worker = threading.Thread(target = lambda: CUDAGraph().capture_begin())
+        worker.start(); worker.join()
+    assert "clear" not in events and not any(e[0] in ("mm", "hold") for e in events if isinstance(e, tuple))
+
+
+def test_failed_priming_is_not_held(monkeypatch):
+    CUDAGraph, on_stream, events = _fake_cuda(monkeypatch)
+    def boom(*args, **kwargs): raise RuntimeError("no workspace")
+    monkeypatch.setattr(torch, "mm", boom)
+    with vllm_utils._vllm_cublas_workspace_held():
+        with on_stream(_Stream(200)):
+            CUDAGraph().capture_begin()
+    # Only the pre-capture clear ran: nothing to hold, no end-of-capture clear.
+    assert events == ["clear", ("capture_begin", 200)]
+
+
+@pytest.mark.parametrize("why", ["async_allocator", "disabled"])
+def test_async_allocator_or_disabled_is_a_no_op(monkeypatch, why):
+    CUDAGraph, on_stream, events = _fake_cuda(monkeypatch)
+    original = CUDAGraph.capture_begin
+    if why == "async_allocator":
+        monkeypatch.setattr(torch.cuda, "get_allocator_backend", lambda: "cudaMallocAsync", raising = False)
+    with vllm_utils._vllm_cublas_workspace_held(why != "disabled") as ok:
+        assert ok is False and CUDAGraph.capture_begin is original
+
+
+def test_dual_batch_overlap_runner_is_not_held():
+    ubatch = types.SimpleNamespace(parallel_config = types.SimpleNamespace(use_ubatching = True))
+    assert vllm_utils._capture_holds_workspace(ubatch) is False
+    assert vllm_utils._capture_holds_workspace(types.SimpleNamespace()) is True
+
+
 def test_no_capture_no_clear(monkeypatch):
     CUDAGraph, on_stream, events = _fake_cuda(monkeypatch)
     with vllm_utils._vllm_cublas_workspace_held():
@@ -221,7 +263,7 @@ def _graph_writes_freed_workspace(pin):
     the freed memory with a sentinel, replay: True when the replay overwrote the sentinel."""
     device = torch.device("cuda", torch.cuda.current_device())
     replay_stream = torch.cuda.Stream(device = device)
-    size = max(int(torch._C._cuda_getCublasWorkspaceSize()), 1 << 20)
+    size = max(int(getattr(torch._C, "_cuda_getCublasWorkspaceSize", lambda: 0)()), 1 << 20)
     x = torch.randn(16, 3072, device = device, dtype = torch.bfloat16)
     w = torch.randn(1024, 3072, device = device, dtype = torch.bfloat16)
     torch.cuda.synchronize()

@@ -1181,8 +1181,14 @@ def _cublas_workspaces_into(pool, device, use_mem_pool):
 pass
 
 
+def _capture_holds_workspace(runner):
+    # Dual-batch overlap captures on worker threads with their own handles and streams: left as vLLM ships it.
+    return not getattr(getattr(runner, "parallel_config", None), "use_ubatching", False)
+pass
+
+
 @contextlib.contextmanager
-def _vllm_cublas_workspace_held():
+def _vllm_cublas_workspace_held(enabled = True):
     """vLLM's CUDA graphs bake in the capture stream's cuBLAS workspace (split-K for decode GEMMs).
     _cuda_clearCublasWorkspaces (called by Inductor CUDA graph trees) frees it, so replays then write into memory
     the trainer owns or empty_cache unmapped (illegal address). Allocate it in a private pool and hold it forever."""
@@ -1193,9 +1199,11 @@ def _vllm_cublas_workspace_held():
     graphs = getattr(torch.cuda, "graphs", None)
     CUDAGraph = getattr(graphs, "CUDAGraph", None)
     original = getattr(CUDAGraph, "capture_begin", None)
-    if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None or \
+    backend = getattr(torch.cuda, "get_allocator_backend", None)
+    if not enabled or not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None or \
             MemPool is None or use_mem_pool is None or clear is None or original is None or \
-            getattr(original, "_unsloth_cublas_workspace", False):
+            getattr(original, "_unsloth_cublas_workspace", False) or \
+            (backend is not None and backend() != "native"):
         yield False
         return
     device = torch.device("cuda", torch.cuda.current_device())
@@ -1211,15 +1219,17 @@ def _vllm_cublas_workspace_held():
     # Reuse is safe: all graphs replay serially on one stream.
     held[1] = []
     seen = {}
+    owner = threading.get_ident()
 
     @functools.wraps(original)
     def capture_begin(self, *args, **kwargs):
         stream = torch.cuda.current_stream()
-        if stream.cuda_stream not in seen:
-            seen[stream.cuda_stream] = stream
+        # Only this runner's captures: another thread or device keeps stock behaviour.
+        if threading.get_ident() == owner and stream.device == device and stream.cuda_stream not in seen:
             try:
                 clear()
                 _cublas_workspaces_into(pool, stream.device, use_mem_pool)
+                seen[stream.cuda_stream] = stream
             except Exception as error:
                 if device.index not in _VLLM_CUBLAS_WORKSPACE_WARNED:
                     _VLLM_CUBLAS_WORKSPACE_WARNED.add(device.index)
@@ -1282,7 +1292,7 @@ def patch_vllm_graph_capture():
             if not gc_cleanup:
                 @wraps(original)
                 def capture_model(self, *args, **kwargs):
-                    with _vllm_cublas_workspace_held():
+                    with _vllm_cublas_workspace_held(_capture_holds_workspace(self)):
                         return original(self, *args, **kwargs)
                 capture_model._unsloth_graph_capture = True
                 cls.capture_model = capture_model
@@ -1292,7 +1302,7 @@ def patch_vllm_graph_capture():
             def capture_model(self, *args, **kwargs):
                 log.info(f"Unsloth: Running patched vLLM {tag} `capture_model`.")
                 start_time = time.perf_counter()
-                with _vllm_cublas_workspace_held(), suppress_gc_collect():
+                with _vllm_cublas_workspace_held(_capture_holds_workspace(self)), suppress_gc_collect():
                     result = original(self, *args, **kwargs)
                 log.info(
                     f"Unsloth: Patched vLLM {tag} graph capture finished in %.0f secs.",
@@ -1313,9 +1323,13 @@ def patch_vllm_graph_capture():
 
     def load_v2():
         # Model Runner V2 is not a V1 subclass.
-        from vllm.v1.worker.gpu.model_runner import GPUModelRunner
-        from vllm.v1.worker.gpu_model_runner import logger
-        return GPUModelRunner, logger
+        # Its own logger: newer vLLM removes the V1 module.
+        from vllm.v1.worker.gpu import model_runner
+        log = getattr(model_runner, "logger", None)
+        if log is None:
+            from vllm.logger import init_logger
+            log = init_logger("vllm.v1.worker.gpu.model_runner")
+        return model_runner.GPUModelRunner, log
 
     def load_v0():
         from vllm.worker.model_runner import GPUModelRunnerBase, logger
