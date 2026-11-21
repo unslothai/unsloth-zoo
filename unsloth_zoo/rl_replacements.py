@@ -2335,6 +2335,38 @@ pass
 RL_REPLACEMENTS["grpo_video_bank_rows"] = grpo_video_bank_rows
 
 
+class _GrpoBankRows:
+    # A chunk's video rows out of the bank, built only when the chunk is read: a noncontiguous range (repeated
+    # prompts) is a copy, and holding every chunk's copy at once would bring back the per-generation copies.
+    __slots__ = ("bank", "rows", "start", "end")
+
+    def __init__(self, bank, rows, start, end):
+        self.bank, self.rows, self.start, self.end = bank, rows, start, end
+
+    def materialize(self):
+        return grpo_video_bank_rows(self.bank, self.rows, self.start, self.end)
+
+
+def _grpo_materialize_chunk(chunk):
+    if not any(isinstance(value, _GrpoBankRows) for value in chunk.values()):
+        return chunk
+    return {key: (value.materialize() if isinstance(value, _GrpoBankRows) else value) for key, value in chunk.items()}
+
+
+class _GrpoVisionChunks(list):
+    """grpo_vision_chunks' result: a list whose items are built when read (iteration or indexing), so a forward loop
+    holds one chunk's video rows at a time."""
+
+    def __iter__(self):
+        for chunk in list.__iter__(self):
+            yield _grpo_materialize_chunk(chunk)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return _GrpoVisionChunks(list.__getitem__(self, index))
+        return _grpo_materialize_chunk(list.__getitem__(self, index))
+
+
 def grpo_get_vision_inputs(source):
     """Collect the GRPO multimodal inputs out of a kwargs or inputs mapping."""
     if source is None:
@@ -2693,7 +2725,7 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
             vid_start, vid_end = int(cum_videos[start]), int(cum_videos[end])
         if vid_end > vid_start:
             if video_bank_rows is not None:
-                chunk["pixel_values_videos"] = grpo_video_bank_rows(
+                chunk["pixel_values_videos"] = _GrpoBankRows(
                     pixel_values_videos, video_bank_rows, vid_start, vid_end,
                 )
             else:
@@ -2785,7 +2817,7 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
             chunk.pop("pixel_values", None)
             chunk.pop("pixel_attention_mask", None)
         chunks.append(chunk)
-    return chunks
+    return _GrpoVisionChunks(chunks) if video_bank_rows is not None else chunks
 pass
 RL_REPLACEMENTS["grpo_vision_chunks"] = grpo_vision_chunks
 

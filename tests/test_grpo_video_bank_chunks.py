@@ -88,3 +88,20 @@ def test_mismatched_index_raises():
     banked["video_bank_rows"] = torch.tensor([[0, 2], [0, 3]])
     with pytest.raises(ValueError, match = "video_bank_rows"):
         grpo_vision_chunks(banked, 2, 1)
+
+
+def test_noncontiguous_chunks_are_built_only_when_read():
+    # Repeated prompts give noncontiguous bank ranges, so each chunk's rows are a copy: they must be built per
+    # read, not all up front, or a forward loop would hold every chunk's copy at once.
+    import unsloth_zoo.rl_replacements as rr
+
+    flat, banked = _layouts([0, 1, 0, 1, 0, 1, 0, 1], [1, 2])
+    chunks = grpo_vision_chunks(grpo_get_vision_inputs(banked), 8, 2)
+    stored = [list.__getitem__(chunks, i)["pixel_values_videos"] for i in range(len(chunks))]
+    assert all(isinstance(v, rr._GrpoBankRows) for v in stored)
+    ref = grpo_vision_chunks(grpo_get_vision_inputs(flat), 8, 2)
+    for x, y in zip(ref, chunks):
+        assert torch.is_tensor(y["pixel_values_videos"])
+        assert torch.equal(x["pixel_values_videos"], y["pixel_values_videos"])
+    assert torch.equal(chunks[1]["pixel_values_videos"], ref[1]["pixel_values_videos"])
+    assert isinstance(chunks[1:], rr._GrpoVisionChunks)
