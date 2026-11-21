@@ -607,6 +607,8 @@ class FastCPUModel:
         _runtime.apply_cpu_security_patches()
         if use_gradient_checkpointing is None:
             use_gradient_checkpointing = getattr(model, "_unsloth_cpu_gradient_checkpointing", "unsloth")
+        # The trainer reads the choice back (SFTConfig would otherwise turn checkpointing on for False).
+        model._unsloth_cpu_gradient_checkpointing = use_gradient_checkpointing
         leaf_names = {name.rsplit(".", 1)[-1] for name, _ in model.named_modules()}
         # Models with their own projection names (Unsloth's native DeepSeek-V4.1) translate q/k/v/o/gate/up/down_proj,
         # "all-linear" and None into their real Linears, exactly as the GPU get_peft_model does.
@@ -683,6 +685,7 @@ class FastCPUModel:
         _set_inference_mode(model, False)
         # None keeps whatever from_pretrained / get_peft_model set up; an explicit value switches it.
         if use_gradient_checkpointing is not None and hasattr(model, "gradient_checkpointing_enable"):
+            model._unsloth_cpu_gradient_checkpointing = use_gradient_checkpointing
             if use_gradient_checkpointing:
                 if not _non_reentrant_checkpointing_on(model):
                     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
