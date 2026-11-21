@@ -152,8 +152,41 @@ def cpu_bnb_4bit_supported():
         return False
 
 
+_CGROUP_ROOT = "/sys/fs/cgroup"
+_PROC_SELF_CGROUP = "/proc/self/cgroup"
+
+
+def _cgroup_memory_headroom():
+    """Smallest memory.max - memory.current over this process's cgroup v2 and every ancestor (a limit set on an
+    enclosing job / slice applies even when the leaf says max), or None when no finite limit is readable."""
+    try:
+        with open(_PROC_SELF_CGROUP) as f:
+            path = next((line.split(":", 2)[2].strip() for line in f if line.startswith("0::")), None)
+    except OSError:
+        return None
+    if path is None:
+        return None
+    headroom = None
+    parts = [part for part in path.strip("/").split("/") if part]
+    for depth in range(len(parts), -1, -1):
+        base = os.path.join(_CGROUP_ROOT, *parts[:depth])
+        try:
+            with open(os.path.join(base, "memory.max")) as f:
+                limit = f.read().strip()
+            if limit == "max":
+                continue
+            with open(os.path.join(base, "memory.current")) as f:
+                used = int(f.read())
+            room = max(0, int(limit) - used)
+        except (OSError, ValueError):
+            continue  # not mounted here (container without a cgroup namespace) or the root, which has no limit
+        headroom = room if headroom is None else min(headroom, room)
+    return headroom
+
+
 def available_ram():
-    """Bytes of RAM still available to this process (MemAvailable, capped by a cgroup v2 memory.max), or None."""
+    """Bytes of RAM still available to this process (MemAvailable, capped by the cgroup v2 memory.max headroom of its
+    cgroup and every ancestor), or None."""
     available = None
     try:
         with open("/proc/meminfo") as f:
@@ -168,18 +201,11 @@ def available_ram():
         except Exception:
             return None
     try:
-        with open("/proc/self/cgroup") as f:
-            path = next((line.split(":", 2)[2].strip() for line in f if line.startswith("0::")), None)
-        if path is not None:
-            base = os.path.join("/sys/fs/cgroup", path.lstrip("/"))
-            with open(os.path.join(base, "memory.max")) as f:
-                limit = f.read().strip()
-            if limit != "max":
-                with open(os.path.join(base, "memory.current")) as f:
-                    used = int(f.read())
-                available = min(available or 1 << 62, max(0, int(limit) - used))
-    except (OSError, ValueError, StopIteration):
-        pass
+        headroom = _cgroup_memory_headroom()
+    except Exception:
+        headroom = None
+    if headroom is not None:
+        available = min(available or 1 << 62, headroom)
     return available
 
 
