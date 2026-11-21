@@ -198,12 +198,15 @@ def test_load_vllm_resolves_before_sizing_and_budgets_the_draft():
     assert "speculative_config" in [a.arg for a in fn.args.args]
     src = ast.unparse(fn)
     resolve = src.find("user_speculative_config = None if return_args else _vllm_speculative_config(speculative_config)")
-    sizing = src.find("approximate_vllm_memory_usage(", max(resolve, 0))
-    budget = src.find("memory_left_for_kv_cache_gb = max(memory_left_for_kv_cache_gb - draft_gb, 0.0)", max(sizing, 0))
-    tiers = src.find("if memory_left_for_kv_cache_gb <= 2:", max(budget, 0))
+    # The draft is sized before the capacity estimate and counted inside it, so the KV estimate, max_num_seqs and
+    # the context-length fit all see the draft weights (subtracting afterwards left max_num_batched_tokens stale).
+    budget = src.find("draft_gb = _speculative_draft_gb(user_speculative_config, model_name)", max(resolve, 0))
+    sizing = src.find("approximate_vllm_memory_usage(", max(budget, 0))
+    counted = src.find("extra_weight_bytes=int(draft_gb * 1024 ** 3)", max(sizing, 0))
+    tiers = src.find("if memory_left_for_kv_cache_gb <= 2:", max(counted, 0))
     assign = src.find("engine_args['speculative_config'] = user_speculative_config", max(tiers, 0))
     arg_filter = src.find("good_keys = inspect.signature(AsyncEngineArgs", max(assign, 0))
-    assert -1 < resolve < sizing < budget < tiers < assign < arg_filter
+    assert -1 < resolve < budget < sizing < counted < tiers < assign < arg_filter
     # Padded-vocab guard and memory retry read the engine's config, so they cover every method.
     assert "speculative=engine_args.get('speculative_config', None) is not None" in src
     assert "engine_args.get('speculative_config') if enable_lora else None" in src
@@ -216,3 +219,20 @@ def test_real_vllm_methods_if_installed():
     exec(compile(ast.Module(body = nodes, type_ignores = []), "vllm_utils_real", "exec"), out)
     methods = out["_vllm_speculative_methods"]()
     assert {"ngram", "draft_model", "eagle3"} <= methods
+
+
+def test_draft_weights_shrink_the_capacity_estimate(monkeypatch):
+    # The draft is counted inside the estimate, so max_num_batched_tokens (which the context-length fit reads) and the
+    # KV budget both shrink with it, instead of only the KV budget being lowered afterwards.
+    import types
+    import unsloth_zoo.vllm_utils as vu
+    monkeypatch.setattr(vu, "get_mem_info", lambda: (80 * 1024**3, 80 * 1024**3))
+    config = types.SimpleNamespace(
+        vocab_size = 32000, hidden_size = 2048, max_position_embeddings = 131072, num_hidden_layers = 24,
+        num_key_value_heads = 8, num_attention_heads = 16, intermediate_size = 8192, tie_word_embeddings = True,
+    )
+    kwargs = dict(max_seq_length = 131072, gpu_memory_utilization = 0.5, max_num_batched_tokens = 8192)
+    base = vu.approximate_vllm_memory_usage(config, **kwargs)
+    with_draft = vu.approximate_vllm_memory_usage(config, extra_weight_bytes = 3 * 1024**3, **kwargs)
+    assert abs((base[3] - with_draft[3]) - 3.0) < 1e-6, (base, with_draft)
+    assert with_draft[0] <= base[0] and with_draft[1] <= base[1]

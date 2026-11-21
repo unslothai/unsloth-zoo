@@ -2860,6 +2860,7 @@ def approximate_vllm_memory_usage(
     parallel_sequences = 64,
     cuda_graph_overhead = True,
     weight_bytes = None,
+    extra_weight_bytes = 0, # e.g. a speculative draft model's weights, inside the same gpu_memory_utilization
     max_num_batched_tokens = 8192, # chunked prefill budget; sliding-window layers keep window + 2x this
 ):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -2960,7 +2961,7 @@ def approximate_vllm_memory_usage(
     elif load_in_8bit: factor = 8/5 # Very vague approximation. Will fix later
     if weight_bytes is None:
         weight_bytes = total_quantizable_elements / factor + total_float16_elements
-    bytes_for_model = weight_bytes + lora_elements
+    bytes_for_model = weight_bytes + lora_elements + int(extra_weight_bytes or 0)
 
     # KV cache size (float16 is 2 bytes. float8 is 1.25 bytes)
     float_bytes = 1.25 if float8_kv_cache else 2
@@ -4954,6 +4955,19 @@ def load_vllm(
         print("Unsloth: speculative_config is not passed on with return_args = True; give it to `vllm serve` directly.")
     user_speculative_config = None if return_args else _vllm_speculative_config(speculative_config)
 
+    # A draft model's weights live inside the same gpu_memory_utilization: count them with the target's weights so the
+    # KV cache estimate, max_num_seqs and the context-length fit all see them; vLLM's own profile then sizes the real
+    # KV cache with both models loaded.
+    draft_gb = 0.0
+    if user_speculative_config is not None:
+        draft_gb = _speculative_draft_gb(user_speculative_config, model_name)
+        if draft_gb is None:
+            print(
+                "Unsloth: could not size the speculative draft model, so its weights are not taken out of the "
+                "KV cache estimate; lower gpu_memory_utilization if vLLM runs out of memory."
+            )
+            draft_gb = 0.0
+
     requested_max_num_batched_tokens = max_num_batched_tokens
     max_num_batched_tokens, approx_max_num_seqs, \
     actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
@@ -4971,6 +4985,7 @@ def load_vllm(
         weight_bytes = vllm_weights_memory_usage(
             config, load_in_4bit = use_bitsandbytes, load_in_8bit = is_fp8,
         ),
+        extra_weight_bytes = int(draft_gb * (1024 ** 3)),
         # Sliding layers hold the prefill budget past their window: max(8192, max_seq_length) for vision models.
         max_num_batched_tokens = max(
             8192,
@@ -4979,21 +4994,11 @@ def load_vllm(
         ),
     )
 
-    # A draft model's weights live inside the same gpu_memory_utilization, so they come out of the KV cache estimate
-    # that picks max_num_seqs; vLLM's own profile then sizes the real KV cache with both models loaded.
-    if user_speculative_config is not None:
-        draft_gb = _speculative_draft_gb(user_speculative_config, model_name)
-        if draft_gb is None:
-            print(
-                "Unsloth: could not size the speculative draft model, so its weights are not taken out of the "
-                "KV cache estimate; lower gpu_memory_utilization if vLLM runs out of memory."
-            )
-        elif draft_gb > 0:
-            memory_left_for_kv_cache_gb = max(memory_left_for_kv_cache_gb - draft_gb, 0.0)
-            print(
-                f"Unsloth: speculative draft weights take {draft_gb:.2f} GB, leaving about "
-                f"{memory_left_for_kv_cache_gb:.2f} GB for vLLM's KV cache."
-            )
+    if draft_gb > 0:
+        print(
+            f"Unsloth: speculative draft weights take {draft_gb:.2f} GB, leaving about "
+            f"{memory_left_for_kv_cache_gb:.2f} GB for vLLM's KV cache."
+        )
 
     # Pre-flight warning: if KV cache headroom is very low with standby mode,
     # warn before LLM() is called (which may crash unrecoverably).
