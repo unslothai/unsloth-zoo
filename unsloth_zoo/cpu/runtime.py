@@ -180,8 +180,10 @@ def _cgroup_cpu_limit(proc_cgroup = "/proc/self/cgroup", root = "/sys/fs/cgroup"
         return None
     for line in lines:
         hierarchy, _, path = line.partition(":")[2].partition(":")
+        # The process's own cgroup and every ancestor up to the mount root bound it; a path that does not exist under
+        # the mount (a host path seen inside a container) just falls through to the levels that do.
+        parts = [p for p in path.split("/") if p]
         if hierarchy == "":  # v2 unified
-            parts = [p for p in path.split("/") if p]
             for depth in range(len(parts), -1, -1):
                 try:
                     with open(os.path.join(root, *parts[:depth], "cpu.max")) as f:
@@ -192,15 +194,18 @@ def _cgroup_cpu_limit(proc_cgroup = "/proc/self/cgroup", root = "/sys/fs/cgroup"
                     limits.append(int(quota) / int(period))
         elif "cpu" in hierarchy.split(","):
             for v1 in (f"{root}/cpu,cpuacct", f"{root}/cpu"):
-                try:
-                    with open(f"{v1}/cpu.cfs_quota_us") as f:
-                        quota = int(f.read())
-                    with open(f"{v1}/cpu.cfs_period_us") as f:
-                        period = int(f.read())
-                except (OSError, ValueError):
+                if not os.path.isdir(v1):
                     continue
-                if quota > 0 and period > 0:
-                    limits.append(quota / period)
+                for depth in range(len(parts), -1, -1):
+                    try:
+                        with open(os.path.join(v1, *parts[:depth], "cpu.cfs_quota_us")) as f:
+                            quota = int(f.read())
+                        with open(os.path.join(v1, *parts[:depth], "cpu.cfs_period_us")) as f:
+                            period = int(f.read())
+                    except (OSError, ValueError):
+                        continue
+                    if quota > 0 and period > 0:
+                        limits.append(quota / period)
                 break
     if not limits:
         return None
@@ -272,8 +277,10 @@ def fit_cpu_threads():
             warnings.warn(f"Unsloth: UNSLOTH_CPU_THREADS = {explicit!r} is not an integer; ignoring it.")
     if target is None:
         launcher = _launcher_set_one_thread()
-        user_set = any(os.environ.get(n, "").strip() for n in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"))
-        if user_set and not launcher:
+        # A launcher only ever exports OMP_NUM_THREADS, so an MKL_NUM_THREADS next to it is still the user's.
+        user_mkl = bool(os.environ.get("MKL_NUM_THREADS", "").strip())
+        user_set = user_mkl or bool(os.environ.get("OMP_NUM_THREADS", "").strip())
+        if user_set and (user_mkl or not launcher):
             _THREADS_FITTED = (current, "OMP_NUM_THREADS / MKL_NUM_THREADS")
             return _THREADS_FITTED
         cores = cpu_compute_cores()

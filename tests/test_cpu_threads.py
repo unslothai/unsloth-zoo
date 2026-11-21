@@ -67,6 +67,8 @@ _USER = "user"
     ({"OMP_NUM_THREADS": "1", "TORCHELASTIC_RUN_ID": "r", "LOCAL_WORLD_SIZE": "2", "UNSLOTH_CPU_THREADS": "1"}, 8, 1),
     ({"OMP_NUM_THREADS": "4", "TORCHELASTIC_RUN_ID": "r", "LOCAL_WORLD_SIZE": "2"}, 8, _USER),
     ({"OMP_NUM_THREADS": "1", "ACCELERATE_MIXED_PRECISION": "no"}, 6, 6),  # accelerate launch's 1
+    # A launcher's OMP_NUM_THREADS=1 next to the user's MKL_NUM_THREADS: the MKL setting stays authoritative.
+    ({"MKL_NUM_THREADS": "2", "OMP_NUM_THREADS": "1", "TORCHELASTIC_RUN_ID": "r", "LOCAL_WORLD_SIZE": "2"}, 16, _USER),
 ])
 def test_fit_cpu_threads_env_cases(extra, cores, expected):
     before, fitted, reason, idempotent, live = _fit_in_subprocess(extra, cores)
@@ -119,6 +121,30 @@ def test_cgroup_cpu_quota(tmp_path):
     (v1 / "cpu,cpuacct" / "cpu.cfs_period_us").write_text("100000\n")
     proc.write_text("4:cpu,cpuacct:/x\n")
     assert _cgroup_cpu_limit(str(proc), str(v1)) == 4
+
+
+def test_cgroup_v1_quota_follows_the_process_path(tmp_path):
+    """cgroup v1: the quota on the process's own cgroup (4:cpu,cpuacct:/jobs/train) applies even when the controller
+    root is unlimited; ancestors bound it too, and a path missing under the mount falls back to the root."""
+    from unsloth_zoo.cpu.runtime import _cgroup_cpu_limit
+    proc = tmp_path / "cgroup"
+    proc.write_text("12:memory:/jobs/train\n4:cpu,cpuacct:/jobs/train\n")
+    mount = tmp_path / "v1" / "cpu,cpuacct"
+    leaf = mount / "jobs" / "train"
+    leaf.mkdir(parents = True)
+    for d, quota in ((mount, "-1"), (mount / "jobs", "-1"), (leaf, "200000")):
+        (d / "cpu.cfs_quota_us").write_text(quota + "\n")
+        (d / "cpu.cfs_period_us").write_text("100000\n")
+    root = str(tmp_path / "v1")
+    assert _cgroup_cpu_limit(str(proc), root) == 2
+    (leaf / "cpu.cfs_quota_us").write_text("-1\n")
+    (mount / "jobs" / "cpu.cfs_quota_us").write_text("150000\n")
+    assert _cgroup_cpu_limit(str(proc), root) == 2  # parent's 1.5 CPUs, rounded up
+    (mount / "jobs" / "cpu.cfs_quota_us").write_text("-1\n")
+    assert _cgroup_cpu_limit(str(proc), root) is None
+    proc.write_text("4:cpu,cpuacct:/host/only/path\n")
+    (mount / "cpu.cfs_quota_us").write_text("300000\n")
+    assert _cgroup_cpu_limit(str(proc), root) == 3
 
 
 def test_cpu_compute_cores_within_affinity():
