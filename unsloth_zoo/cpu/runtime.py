@@ -22,6 +22,7 @@ __all__ = [
     "cpu_bnb_4bit_supported",
     "cpu_capabilities",
     "apply_cpu_security_patches",
+    "available_ram",
 ]
 
 import functools
@@ -149,6 +150,37 @@ def cpu_bnb_4bit_supported():
             return bool(torch.isfinite(y).all()) and x.grad is not None and bool(torch.isfinite(x.grad).all())
     except Exception:
         return False
+
+
+def available_ram():
+    """Bytes of RAM still available to this process (MemAvailable, capped by a cgroup v2 memory.max), or None."""
+    available = None
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    available = int(line.split()[1]) * 1024
+                    break
+    except OSError:
+        try:
+            import psutil
+            available = psutil.virtual_memory().available
+        except Exception:
+            return None
+    try:
+        with open("/proc/self/cgroup") as f:
+            path = next((line.split(":", 2)[2].strip() for line in f if line.startswith("0::")), None)
+        if path is not None:
+            base = os.path.join("/sys/fs/cgroup", path.lstrip("/"))
+            with open(os.path.join(base, "memory.max")) as f:
+                limit = f.read().strip()
+            if limit != "max":
+                with open(os.path.join(base, "memory.current")) as f:
+                    used = int(f.read())
+                available = min(available or 1 << 62, max(0, int(limit) - used))
+    except (OSError, ValueError, StopIteration):
+        pass
+    return available
 
 
 def cpu_capabilities():
