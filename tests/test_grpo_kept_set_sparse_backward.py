@@ -222,3 +222,22 @@ def test_crossover_routes_by_union_density(monkeypatch):
     after = rr._GRPO_TRUNCATED_SUPPORT_STATS
     assert after.get("kept_set_sparse_bwd", 0) == before.get("kept_set_sparse_bwd", 0)
     assert after.get("kept_set_dense_bwd", 0) == before.get("kept_set_dense_bwd", 0) + 1
+
+
+@pytest.mark.parametrize("mode", ["sparse_full", "dense"])
+def test_retain_graph_backward_runs_twice(monkeypatch, mode):
+    # The kept sets live in save_for_backward, so a retained graph can be differentiated again with equal grads.
+    if mode == "dense":
+        monkeypatch.setenv("UNSLOTH_GRPO_KEPT_SET_SPARSE", "0")
+    else:
+        monkeypatch.delenv("UNSLOTH_GRPO_KEPT_SET_SPARSE", raising = False)
+        monkeypatch.setenv("UNSLOTH_GRPO_KEPT_SET_SPARSE_MAX_DENSITY", "1.0")
+    hidden, head, index, _ = _inputs()
+    h = hidden.clone().requires_grad_(True)
+    out = rr.grpo_chunked_hidden_states_logprobs(
+        h, head, index, 3, 0.0, 0.0, 30.0, 0.7, support_top_k = 64, support_top_p = 0.95,
+    )
+    loss = out.sum()
+    (g1,) = torch.autograd.grad(loss, h, retain_graph = True)
+    (g2,) = torch.autograd.grad(loss, h)
+    assert torch.equal(g1, g2)

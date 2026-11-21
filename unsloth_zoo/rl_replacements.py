@@ -775,8 +775,20 @@ class _KeptSetLogprobs(torch.autograd.Function):
             kept.append(_kept_set_save(keep, sparse, z, raw, logits_dtype))
             del keep, z, raw
         logps = torch.cat(logps)
-        ctx.save_for_backward(hidden_states, lm_head, lm_head_bias, index, torch.cat(lses), logps)
-        ctx.kept = kept
+        # Kept sets go through save_for_backward (flattened, layout on ctx) so a retain_graph backward can run twice
+        # and autograd still frees them after a normal backward.
+        flat, layout = [], []
+        for item in kept:
+            if item[0] == "csr":
+                _, counts, cols, z_vals, raw_vals, kept_dtype = item
+                layout.append(("csr", len(flat), raw_vals is not None, kept_dtype))
+                flat += [counts, cols, z_vals] + ([raw_vals] if raw_vals is not None else [])
+            else:
+                layout.append(("packed", len(flat)))
+                flat.append(item[1])
+        del kept
+        ctx.save_for_backward(hidden_states, lm_head, lm_head_bias, index, torch.cat(lses), logps, *flat)
+        ctx.kept_layout = layout
         ctx.max_density = max_density
         ctx.bounds = bounds
         ctx.transforms = transforms
@@ -785,8 +797,17 @@ class _KeptSetLogprobs(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_logps):
-        hidden_states, lm_head, lm_head_bias, index, lses, logps = ctx.saved_tensors
-        kept_chunks, ctx.kept = ctx.kept, None
+        hidden_states, lm_head, lm_head_bias, index, lses, logps, *flat = ctx.saved_tensors
+        kept_chunks = []
+        for entry in ctx.kept_layout:
+            if entry[0] == "csr":
+                _, at, has_raw, kept_dtype = entry
+                kept_chunks.append(
+                    ("csr", flat[at], flat[at + 1], flat[at + 2], flat[at + 3] if has_raw else None, kept_dtype)
+                )
+            else:
+                kept_chunks.append(("packed", flat[entry[1]]))
+        del flat
         need_hidden, need_head, need_bias = ctx.needs_input_grad[:3]
         device = lm_head.device
         scale_multiply, scale_divide, softcapping, temperature = ctx.transforms
