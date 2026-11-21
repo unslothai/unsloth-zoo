@@ -4016,6 +4016,8 @@ def _vllm_speculative_config(speculative_config = None, training = True):
     # load_vllm(speculative_config = {...}), else UNSLOTH_VLLM_SPECULATIVE_CONFIG (a JSON object), else
     # UNSLOTH_VLLM_SUFFIX_DECODING. Returns a dict for vLLM's speculative_config or None; raises on a value vLLM cannot run.
     source = "speculative_config"
+    if speculative_config is False:
+        return None
     if speculative_config is None:
         value = os.environ.get(_SPECULATIVE_CONFIG_ENV, "").strip()
         if value.lower() in ("", "0", "false", "off", "no", "none"):
@@ -4053,6 +4055,9 @@ def _vllm_speculative_config(speculative_config = None, training = True):
             f"Unsloth: {source} method {method!r} is not one this vLLM "
             f"({globals().get('vllm_version', 'not installed')}) knows: {sorted(installed)}."
         )
+    for key in ("model", "revision"):
+        if config.get(key, None) is not None and not isinstance(config[key], str):
+            raise ValueError(f"Unsloth: {source} '{key}' must be a string; got {config[key]!r}.")
     if method in ("eagle", "eagle3", "draft_model") and not config.get("model", None):
         raise ValueError(f"Unsloth: {source} method {method!r} needs the draft checkpoint as 'model'.")
     verifier = config.get("rejection_sample_method", "standard")
@@ -4192,6 +4197,22 @@ def _speculative_draft_load_format(speculative_config):
     return getattr(load, "load_format", "auto") if load is not None else "auto"
 
 
+_HUB_REPO_ID = re.compile(r"^[A-Za-z0-9][\w.-]*(/[\w.-]+)?$")
+
+
+def _same_checkpoint(draft, target):
+    # The same checkpoint by path (realpath, trailing slash), or a repo id and the local Hub snapshot it resolved to.
+    draft, target = str(draft), str(target)
+    if draft == target: return True
+    if os.path.exists(draft) and os.path.exists(target):
+        return os.path.realpath(draft) == os.path.realpath(target)
+    for repo, path in ((draft, target), (target, draft)):
+        if _HUB_REPO_ID.match(repo) and "/" in repo and os.path.isdir(path):
+            if ("models--" + repo.replace("/", "--")) in os.path.realpath(path).split(os.sep):
+                return True
+    return False
+
+
 def _speculative_draft_gb(speculative_config, target_model_name, target_revision = None):
     # GiB of draft weights vLLM loads beside the target: 0 for ngram / suffix and for MTP layers inside the target's
     # own checkpoint; None when it cannot be sized.
@@ -4199,17 +4220,24 @@ def _speculative_draft_gb(speculative_config, target_model_name, target_revision
     draft = speculative_config.get("model", None)
     if method not in _SPECULATIVE_DRAFT_METHODS: return 0.0
     if method == "mtp" and (not draft or (
-        str(draft) == str(target_model_name)
+        _same_checkpoint(draft, target_model_name)
         and speculative_config.get("revision", None) in (None, target_revision)
     )):
         return 0.0
-    if not draft: return None
+    if not draft or not isinstance(draft, str): return None
     load_format = _speculative_draft_load_format(speculative_config)
     index_name = "consolidated.safetensors.index.json" if load_format == "mistral" else "model.safetensors.index.json"
+    if not os.path.isdir(draft) and not _HUB_REPO_ID.match(draft):
+        return None  # a path that does not exist here: never sent to the Hub as a repo id
     try:
         if os.path.isdir(draft):
+            files = []
             with os.scandir(draft) as entries:
-                files = [(e.name, e.stat().st_size) for e in entries if e.is_file()]
+                for e in entries:
+                    try:
+                        if e.is_file(): files.append((e.name, e.stat().st_size))
+                    except OSError:
+                        continue  # a dangling symlink is not a weight vLLM can load
             index = None
             for name in (index_name, "consolidated.safetensors.index.json"):
                 path = os.path.join(draft, name)
@@ -5176,7 +5204,7 @@ def load_vllm(
 
     # return_args callers (SyntheticDataKit's `vllm serve`) turn every value into a CLI flag with
     # str(), and vLLM parses --speculative-config as JSON, so a dict there kills the server.
-    if return_args and speculative_config is not None:
+    if return_args and (speculative_config not in (None, False) or os.environ.get(_SPECULATIVE_CONFIG_ENV, "").strip()):
         print("Unsloth: speculative_config is not passed on with return_args = True; give it to `vllm serve` directly.")
     user_speculative_config = None if return_args else _vllm_speculative_config(speculative_config, training = training)
     # Routing replay drops speculation Model Runner V2 cannot run; decide that before the draft is charged below.

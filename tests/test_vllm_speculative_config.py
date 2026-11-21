@@ -35,14 +35,14 @@ _FUNCS = (
     "_normalize_speculative_keys", "_vllm_suffix_decoding_config", "_vllm_speculative_methods", "_vllm_release",
     "_check_vllm_suffix_decoding", "_vllm_speculative_config", "_redact_speculative_config",
     "_speculative_config_has_secret", "_patch_vllm_log_non_default_args", "_mrv2_unsupported_speculative_methods",
-    "_speculative_method", "_select_draft_weight_files", "_speculative_draft_load_format", "_speculative_draft_gb",
+    "_speculative_method", "_same_checkpoint", "_select_draft_weight_files", "_speculative_draft_load_format", "_speculative_draft_gb",
     "_routing_replay_will_drop_speculation", "_resolve_speculative_depth", "_speculation_lookahead",
     "_fit_max_num_seqs_to_speculation", "_fit_max_num_batched_tokens_to_speculation", "_shrink_for_memory_retry",
 )
 _CONSTS = (
     "_SPECULATIVE_CONFIG_ENV", "_SUPPORTED_SPECULATIVE_METHODS", "_LOSSLESS_REJECTION_SAMPLE_METHODS",
     "_SECRET_KEY_PATTERN", "_MRV2_UNSUPPORTED_BY_RELEASE", "_MRV2_UNSUPPORTED_BEFORE_0_31",
-    "_SPECULATIVE_DRAFT_METHODS", "_NOT_FOR_INFERENCE_WEIGHTS",
+    "_SPECULATIVE_DRAFT_METHODS", "_NOT_FOR_INFERENCE_WEIGHTS", "_HUB_REPO_ID",
 )
 _METHODS = typing.Literal[
     "ngram", "medusa", "draft_model", "suffix", "custom_class",
@@ -90,6 +90,25 @@ def ns(monkeypatch):
 
 def test_off_by_default(ns):
     assert ns(methods = None, has_arctic = False)["_vllm_speculative_config"](None) is None
+    assert ns(methods = None, has_arctic = False)["_vllm_speculative_config"](False) is None
+
+
+def test_draft_sizing_edge_paths(ns, tmp_path):
+    called = []
+    class Api:
+        def model_info(self, repo, **k):
+            called.append(repo); raise OSError("no")
+    fn = ns(hf_api = Api)["_speculative_draft_gb"]
+    # A missing local path is never sent to the Hub as a repo id.
+    assert fn({"method": "draft_model", "model": "./does/not/exist"}, "t") is None and called == []
+    # A dangling symlink does not discard the real weights.
+    (tmp_path / "model.safetensors").write_bytes(b"\0" * (1 << 20))
+    (tmp_path / "broken.safetensors").symlink_to(tmp_path / "gone.safetensors")
+    assert fn({"method": "draft_model", "model": str(tmp_path)}, "t") == pytest.approx(1 / 1024)
+    # MTP in the target's own checkpoint, by an equivalent path or the Hub snapshot the repo id resolved to.
+    assert fn({"method": "mtp", "model": str(tmp_path) + "/"}, str(tmp_path)) == 0.0
+    snap = tmp_path / "hub" / "models--org--target" / "snapshots" / "abc"; snap.mkdir(parents = True)
+    assert fn({"method": "mtp", "model": "org/target"}, str(snap)) == 0.0
 
 
 def test_nested_literal_methods_are_flattened(ns):
@@ -160,6 +179,8 @@ def test_suffix_env_still_works_and_loses_to_the_new_config(ns, monkeypatch, cap
     ({"method": "ngram_gpu", "num_speculative_tokens": 4}, "not supported for Unsloth rollouts"),
     ({"method": "deepseek_mtp", "num_speculative_tokens": 1}, "Use 'mtp'"),
     ({"method": "eagle3", "num_speculative_tokens": 3}, "needs the draft checkpoint"),
+    ({"method": "draft_model", "model": 3, "num_speculative_tokens": 3}, "'model' must be a string"),
+    ({"method": "draft_model", "model": "x", "revision": 2, "num_speculative_tokens": 3}, "'revision' must be a string"),
     # (12) lossy verification would sample rollouts from another distribution than the reported target logprobs.
     ({"method": "eagle3", "model": "x", "num_speculative_tokens": 3, "rejection_sample_method": "synthetic"}, "lossy"),
     ({"method": "ngram", "num_speculative_tokens": 3, "rejection_sample_method": "fly"}, "lossy"),
