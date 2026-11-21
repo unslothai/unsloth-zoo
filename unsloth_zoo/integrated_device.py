@@ -39,6 +39,8 @@ __all__ = [
     "expandable_segments_unsupported",
     "cuda_props_are_integrated",
     "cuda_total_memory",
+    "device_shares_host_memory",
+    "unified_memory_device_indices",
 ]
 
 _ENV_TRUE  = ("1", "true", "yes", "on")
@@ -126,6 +128,76 @@ def _any_device_integrated():
         )
     except Exception:
         return False
+
+
+# AMD APU graphics: the GPU has no memory of its own, only a carve-out of system RAM (Raven / Picasso, Renoir / Cezanne,
+# Van Gogh, Rembrandt, Raphael, Mendocino, Phoenix / Hawk Point, Strix Point, Strix Halo, Krackan). Read from
+# gcnArchName, which every ROCm reports correctly, unlike hipDeviceProp_t::integrated before ROCm 6.2.
+_HIP_APU_ARCHS = frozenset((
+    "gfx902", "gfx909", "gfx90c", "gfx1033", "gfx1035", "gfx1036", "gfx1037",
+    "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153",
+))
+# NVIDIA parts whose device memory is system memory, for wheels that do not publish the integrated field.
+_NVIDIA_UNIFIED_NAME_MARKERS = ("gb10", "dgx spark", "thor", "orin", "xavier", "tegra", "jetson")
+
+# 1 keeps checkpointed activations on the device everywhere, 0 offloads them even on unified memory (the old default).
+KEEP_ON_DEVICE_ENV = "UNSLOTH_GC_KEEP_ON_DEVICE"
+
+
+def _hip_version_at_least(major, minor):
+    try:
+        import torch
+        parts = str(torch.version.hip or "").split(".")
+        return (int(parts[0]), int(parts[1])) >= (major, minor)
+    except Exception:
+        return False
+
+
+def device_shares_host_memory(index):
+    """True when CUDA / HIP device ``index`` draws its memory from the same physical pool as the host.
+
+    Three signals, any one is enough: the driver's integrated flag (trusted on HIP only from ROCm 6.2, where clr
+    started filling it in), an AMD APU architecture name, or an NVIDIA unified-memory part name. Never raises.
+    """
+    try:
+        import torch
+        props = torch.cuda.get_device_properties(index)
+    except Exception:
+        return False
+    hip = _is_hip_build()
+    if hip:
+        arch = str(getattr(props, "gcnArchName", "") or "").split(":")[0].strip().lower()
+        if arch in _HIP_APU_ARCHS:
+            return True
+        if not _hip_version_at_least(6, 2):
+            return False
+    for field in ("is_integrated", "integrated"):
+        value = getattr(props, field, None)
+        if value is not None and bool(value):
+            return True
+    if hip:
+        return False
+    name = str(getattr(props, "name", "") or "").lower()
+    return any(marker in name for marker in _NVIDIA_UNIFIED_NAME_MARKERS)
+
+
+def unified_memory_device_indices():
+    """Visible CUDA / HIP device indices whose checkpointed activations should stay on the device.
+
+    Offloading to the host there is a copy into the same DRAM: no memory is saved, and the pinned blocks plus the
+    D2H and H2D copies are pure cost. ``UNSLOTH_GC_KEEP_ON_DEVICE`` = 1 selects every device, 0 none.
+    """
+    forced = _env_tristate(KEEP_ON_DEVICE_ENV)
+    if forced is False:
+        return frozenset()
+    try:
+        import torch
+        count = torch.cuda.device_count()
+    except Exception:
+        return frozenset()
+    if forced is True:
+        return frozenset(range(count))
+    return frozenset(i for i in range(count) if device_shares_host_memory(i))
 
 
 def _tegra_device_visible_for_free():

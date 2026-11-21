@@ -37,7 +37,7 @@ from .saved_attention import (
 )
 # Re-exported under its old name: it lives in integrated_device.py so the import-time
 # allocator block can share the topic without importing torch.
-from .integrated_device import _any_device_integrated
+from .integrated_device import _any_device_integrated, unified_memory_device_indices
 from .device_type import (
     is_hip,
     get_device_type,
@@ -87,7 +87,30 @@ def _double_buffer_disabled():
     env = os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER")
     if env is not None: return env == "1"
     if DEVICE_TYPE not in ("cuda", "hip"): return False
-    return _any_device_integrated()
+    return _any_device_integrated() or bool(_keep_on_device_indices())
+
+
+@functools.cache
+def _keep_on_device_indices():
+    # Devices whose checkpointed inputs stay where they are: on unified memory (AMD APUs gfx1150/1151, NVIDIA GB10) the
+    # "host" is the same DRAM, so offloading saves nothing and costs a D2H + H2D copy per layer plus pinned blocks.
+    # Cached like _double_buffer_disabled: first read at GC init, after device selection, never at import.
+    # UNSLOTH_GC_KEEP_ON_DEVICE=1 keeps them on every device, 0 offloads everywhere (the old behaviour).
+    if DEVICE_TYPE not in ("cuda", "hip"): return frozenset()
+    return unified_memory_device_indices()
+
+
+_WARNED_KEEP_ON_DEVICE = False
+
+
+def _keeps_on_device(device_index):
+    global _WARNED_KEEP_ON_DEVICE
+    keep = _keep_on_device_indices()
+    if not keep or device_index not in keep: return False
+    if not _WARNED_KEEP_ON_DEVICE:
+        _WARNED_KEEP_ON_DEVICE = True
+        print("Unsloth: GPU shares memory with the CPU, so gradient checkpointing keeps activations on the device.")
+    return True
 
 
 # Pinned (page-locked) host memory is a far smaller budget than VRAM or RAM, and
@@ -1876,10 +1899,13 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     global _WARNED_ABOUT_PINNED_MEMORY
     PINNED_MEMORY_AVAILABLE = True
     _WARNED_ABOUT_PINNED_MEMORY = False
-    with _no_inference_mode():
-        for i in range(INITIAL_CPU_BUFFER_COUNT):
-            x = _new_host_buffer(INITIAL_CPU_BUFFER_SIZE, dtype)
-            CPU_BUFFERS.append(x)
+    # Every visible device keeps its inputs: no slot is ever leased, so skip the pinned pool (it grows on demand).
+    keep = _keep_on_device_indices()
+    if not (keep and len(keep) >= _visible_device_count()):
+        with _no_inference_mode():
+            for i in range(INITIAL_CPU_BUFFER_COUNT):
+                x = _new_host_buffer(INITIAL_CPU_BUFFER_SIZE, dtype)
+                CPU_BUFFERS.append(x)
     pass
 
     global GPU_BUFFER_DTYPE
@@ -1998,7 +2024,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
                     global MINIMUM_SIZE
                     global CPU_INDEX
-                    if new_size > MINIMUM_SIZE and ((CURRENT_GC_INDEX != LAST_GC_INDEX) or FIRST_PASS):
+                    if new_size > MINIMUM_SIZE and ((CURRENT_GC_INDEX != LAST_GC_INDEX) or FIRST_PASS) and \
+                            not _keeps_on_device(arg.device.index):
                         use_gpu_buffer = True
                         global CPU_BUFFERS
                         global GPU_BUFFERS
@@ -2338,7 +2365,7 @@ pass
 def _new_offload_stats():
     stats = {"pinned": 0, "pageable": 0, "kept": 0, "prefetched": 0, "prefetch_hits": 0, "forwards": 0,
              "offloaded": 0, "offloaded_bytes": 0, "restored": 0, "restored_bytes": 0, "prefetched_bytes": 0}
-    for reason in ("small", "expanded"):
+    for reason in ("small", "expanded", "unified"):
         stats["kept_" + reason] = 0
         stats["kept_" + reason + "_bytes"] = 0
     return stats
@@ -2431,6 +2458,8 @@ class NonReentrantActivationOffloader:
         except ValueError:
             self.max_inflight = default_inflight
         self.min_bytes = _env_nonnegative_int("UNSLOTH_GC_OFFLOAD_MIN_BYTES", GC_OFFLOAD_MIN_BYTES)
+        # Device indices on unified memory: their saved inputs stay put (see _keep_on_device_indices).
+        self.keep_on_device = _keep_on_device_indices()
         self.inflight = {}
         self.d2h_streams = {}
         self.h2d_streams = {}
@@ -2604,6 +2633,11 @@ class NonReentrantActivationOffloader:
     def pack(self, x):
         if not x.requires_grad or self._on_host(x):
             return None, x
+        if self.keep_on_device and x.device.index in self.keep_on_device:
+            if not _is_compiling():
+                _keeps_on_device(x.device.index) # one-time notice
+                self._keep("unified", x.numel() * x.element_size())
+            return None, x.detach()
         if _is_compiling():
             # Traced: no size or storage checks, which would add guards on symbolic shapes.
             return x.device, x.to("cpu", non_blocking = True)
