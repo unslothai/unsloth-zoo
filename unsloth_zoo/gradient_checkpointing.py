@@ -106,9 +106,12 @@ _WARNED_KEEP_LOW_MEMORY = False
 # smaller than host RAM there (a GTT limit, a partial carve-out), so a run that only fits with offload keeps fitting.
 KEEP_ON_DEVICE_HEADROOM_MIN  = 2 * 1024 * 1024 * 1024
 KEEP_ON_DEVICE_HEADROOM_FRAC = 0.05
-# device_index -> [projected free bytes, headroom]. Re-read only when the projection nears the headroom, so a run
-# with room to spare pays one mem_get_info (no sync) every few steps, not one per layer.
+# device_index -> [free bytes at the last read, torch allocated bytes at that read, headroom, calls since the read].
+# Free memory is projected as the last read minus everything torch allocated since (activations, optimizer state
+# created after step 1, ...), read from the allocator's host-side counter. mem_get_info (no sync) is re-read when
+# the projection nears the headroom and every _KEEP_BUDGET_REFRESH calls, so memory taken outside torch is seen too.
 _KEEP_BUDGET = {}
+_KEEP_BUDGET_REFRESH = 256
 
 
 def _device_free_bytes(device_index):
@@ -122,20 +125,26 @@ def _keeps_on_device(device_index, nbytes = 0):
     global _WARNED_KEEP_ON_DEVICE, _WARNED_KEEP_LOW_MEMORY
     keep = _keep_on_device_indices()
     if not keep or device_index not in keep: return False
+    try:
+        allocated = int(torch.cuda.memory_allocated(device_index))
+    except Exception:
+        return False # cannot tell: offload, as before
     budget = _KEEP_BUDGET.get(device_index)
-    if budget is None or budget[0] - nbytes < 2 * budget[1]:
+    projected = None if budget is None else budget[0] - max(allocated - budget[1], 0)
+    if projected is None or projected - nbytes < 2 * budget[2] or budget[3] >= _KEEP_BUDGET_REFRESH:
         try:
             free, total = _device_free_bytes(device_index)
         except Exception:
             return False # cannot tell: offload, as before
         headroom = max(KEEP_ON_DEVICE_HEADROOM_MIN, int(total * KEEP_ON_DEVICE_HEADROOM_FRAC))
-        budget = _KEEP_BUDGET[device_index] = [free, headroom]
-    if budget[0] - nbytes < budget[1]:
+        budget = _KEEP_BUDGET[device_index] = [free, allocated, headroom, 0]
+        projected = free
+    budget[3] += 1
+    if projected - nbytes < budget[2]:
         if not _WARNED_KEEP_LOW_MEMORY:
             _WARNED_KEEP_LOW_MEMORY = True
             print("Unsloth: GPU memory is nearly full, so gradient checkpointing offloads activations to RAM again.")
         return False
-    budget[0] -= nbytes
     if not _WARNED_KEEP_ON_DEVICE:
         _WARNED_KEEP_ON_DEVICE = True
         print("Unsloth: GPU shares memory with the CPU, so gradient checkpointing keeps activations on the device.")

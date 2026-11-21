@@ -309,3 +309,28 @@ def test_non_reentrant_offloader_low_memory_offloads(G, monkeypatch):
     packed = off.pack(x)
     assert packed[0] is not None  # offloaded (eager copy), not kept
     assert off.stats["kept_unified"] == 0
+
+
+def test_allocator_growth_between_reads_is_counted(G, monkeypatch):
+    # Optimizer moments (or anything torch allocates) after a read shrink the projection without another driver read.
+    monkeypatch.setattr(G, "_keep_on_device_indices", lambda: frozenset({None}))
+    allocated = [0]
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda i = None: allocated[0])
+    G._test_free = (64 << 30, 128 << 30)
+    assert G._keeps_on_device(None, 1024) is True
+    reads = len(G._test_free_reads)
+    allocated[0] = 60 << 30  # 60 GiB allocated since the read: the projection falls near the headroom
+    G._test_free = (4 << 30, 128 << 30)
+    assert G._keeps_on_device(None, 1024) is False
+    assert len(G._test_free_reads) == reads + 1  # the shrinking projection forced a fresh read
+
+
+def test_free_memory_is_re_read_periodically(G, monkeypatch):
+    # Memory taken outside torch (another process) is seen within _KEEP_BUDGET_REFRESH calls.
+    monkeypatch.setattr(G, "_keep_on_device_indices", lambda: frozenset({None}))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda i = None: 0)
+    G._test_free = (64 << 30, 128 << 30)
+    assert G._keeps_on_device(None, 1024) is True
+    G._test_free = (0, 128 << 30)
+    results = [G._keeps_on_device(None, 1024) for _ in range(G._KEEP_BUDGET_REFRESH)]
+    assert results[-1] is False and len(G._test_free_reads) == 2
