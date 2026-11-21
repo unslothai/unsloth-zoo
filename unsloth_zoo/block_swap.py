@@ -27,6 +27,7 @@ from contextlib import contextmanager, nullcontext
 import functools
 import gc
 import importlib
+import importlib.util
 import itertools
 import tempfile
 import stat
@@ -67,6 +68,8 @@ _PIN_RESERVE_MIN_BYTES = 4 << 30
 _PIN_RESERVE_FRACTION = 0.15
 # Copy, stall and compute timings for stats(); UNSLOTH_OFFLOAD_STATS=0 skips the timing events.
 _TIMING = os.environ.get("UNSLOTH_OFFLOAD_STATS", "1") != "0"
+# Lossless bf16 compression of the host copies (fewer PCIe bytes per fetch, decoded on the card); opt in with 1.
+_COMPRESS_ENV = "UNSLOTH_BLOCK_SWAP_COMPRESS"
 # prefetch_depth = "auto": deepest pool it grows to, and the steps it watches before settling.
 _AUTO_MAX_DEPTH = 4
 _AUTO_STEPS = 12
@@ -76,6 +79,43 @@ _AUTO_STALL = 0.02
 # Auto pool growth keeps this much of each card free for temporaries made inside a layer or the loss.
 _WORKSPACE_MIN_BYTES = 512 << 20
 _WORKSPACE_FRACTION = 0.05
+
+
+def _compress_requested():
+    return os.environ.get(_COMPRESS_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+_CODEC = []
+
+
+def _codec():
+    """unsloth_zoo.block_swap_codec, or the sibling file when this module was loaded on its own (tests)."""
+    if not _CODEC:
+        mod = None
+        try:
+            if __package__ != "unsloth_zoo":
+                raise ImportError(__name__)
+            from unsloth_zoo import block_swap_codec as mod
+        except Exception:
+            try:
+                path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "block_swap_codec.py")
+                spec = importlib.util.spec_from_file_location("unsloth_zoo_block_swap_codec", path)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+            except Exception:
+                mod = None
+        _CODEC.append(mod)
+    return _CODEC[0]
+
+
+def _in_peft_adapter_state_dict():
+    """True inside peft's get_peft_model_state_dict, which keeps only adapter weights (never a swapped one)."""
+    f = sys._getframe(2)
+    while f is not None:
+        if f.f_code.co_name == "get_peft_model_state_dict" and str(f.f_globals.get("__name__", "")).startswith("peft"):
+            return True
+        f = f.f_back
+    return False
 
 
 def _host_copy(t):
@@ -474,7 +514,7 @@ def _swappable(module):
 class _Block:
     __slots__ = ("params", "host", "devices", "index", "streams", "events", "resident", "slot", "sig",
                  "pending", "layout", "sizes", "src", "empties", "host_buf", "home",
-                 "t_copy", "copy_open", "copy_pending", "marks", "mark_open")
+                 "t_copy", "copy_open", "copy_pending", "marks", "mark_open", "codec", "decoders")
 
     def __init__(self, layer, streams, device, shared = ()):
         self.params, self.host, self.devices = [], [], []
@@ -509,6 +549,8 @@ class _Block:
         # Ran with grad on and autograd holds its weights until the backward hook fires.
         self.pending = False
         self.src, self.host_buf = {}, {}
+        # {device: RegionCodec} for regions stored compressed; their host copies decode on demand (host_views).
+        self.codec, self.decoders = {}, None
         self.home = self.devices[0] if self.devices else None
         self.sig = tuple((tuple(p.shape), p.dtype, d, off) for p, d, off in zip(self.params, self.devices, self.layout))
 
@@ -523,6 +565,78 @@ class _Block:
                 view = regions[d][off:off + p.data.nbytes].view(p.dtype).view(p.shape)
                 view.copy_(p.data)
                 self.host.append(view)
+
+    def compressible(self):
+        return bool(self.params) and all(p.dtype == torch.bfloat16 for p in self.params)
+
+    def pack_compressed(self, arena, used, encode_device):
+        """Like pack, but each device's region is stored encoded (when that saves bytes) at arena[used:].
+        Returns the next free arena offset."""
+        codec = _codec()
+        self.host_buf = {}
+        with torch.no_grad():
+            for d, need in self.sizes.items():
+                # Zeroed padding: alignment gaps then cost no escapes.
+                raw = torch.zeros(need, dtype = torch.uint8)
+                for p, pd, off in zip(self.params, self.devices, self.layout):
+                    if pd == d:
+                        raw[off:off + p.data.nbytes].view(p.dtype).view(p.shape).copy_(p.data)
+                enc = None
+                try:
+                    enc = codec.encode_region(raw, device = encode_device)
+                except torch.cuda.OutOfMemoryError:
+                    enc = codec.encode_region(raw)
+                if enc is None:
+                    region = arena[used:used + need]
+                    region.copy_(raw)
+                    self.codec[d] = None
+                else:
+                    parts, c = enc
+                    region = arena[used:used + c.nbytes]
+                    codec.write_parts(region, parts)
+                    self.codec[d] = c
+                del raw
+                self.host_buf[d] = region
+                used += -(-region.numel() // _ALIGN) * _ALIGN
+            for p, d, off in zip(self.params, self.devices, self.layout):
+                self.host.append(None if self.codec.get(d) is not None else
+                                 self.host_buf[d][off:off + p.data.nbytes].view(p.dtype).view(p.shape))
+        return used
+
+    def compressed(self):
+        return any(c is not None for c in self.codec.values())
+
+    def wire_bytes(self):
+        return sum(t.numel() for t in self.host_buf.values())
+
+    def _region_on(self, d, target):
+        """Region d's raw bytes on `target` (decoded on card d when it is compressed)."""
+        c = self.codec.get(d)
+        if c is None:
+            return self.host_buf[d].to(target, copy = True) if torch.device(target).type != "cpu" else self.host_buf[d]
+        dec = (self.decoders or {}).get(d)
+        if dec is not None:
+            try:
+                with _no_inference_mode():
+                    out = torch.empty(c.raw_nbytes, dtype = torch.uint8, device = d)
+                    stream = self.streams[d]
+                    stream.wait_stream(torch.cuda.current_stream(d))
+                    done = torch.cuda.Event()
+                    dec.fetch(c, self.host_buf[d], out, stream, done)
+                    torch.cuda.current_stream(d).wait_event(done)
+                    return out if torch.device(target) == torch.device(d) else out.to(target)
+            except torch.cuda.OutOfMemoryError:
+                pass
+        out = _codec().decode_region_cpu(c, self.host_buf[d])
+        return out if torch.device(target).type == "cpu" else out.to(target)
+
+    def host_views(self, target = "cpu"):
+        """The block's weights from the host copy (decoded when compressed). Views of one buffer per device."""
+        if not self.compressed() and torch.device(target).type == "cpu":
+            return self.host
+        regions = {d: self._region_on(d, target) for d in self.host_buf}
+        return [regions[d][off:off + torch.Size(shape).numel() * torch.empty(0, dtype = dt).element_size()]
+                .view(dt).view(shape) for shape, dt, d, off in self.sig]
 
     def evict(self):
         if not self.resident:
@@ -549,8 +663,13 @@ class _Block:
             with torch.cuda.stream(stream):
                 if self.t_copy is not None:
                     self.t_copy[d].record(stream)
-                bufs[d].copy_(self.host_buf[d], non_blocking = True)
-                event.record(stream)
+                c = self.codec.get(d)
+                if c is None:
+                    bufs[d].copy_(self.host_buf[d], non_blocking = True)
+                    event.record(stream)
+            if c is not None:
+                # Compressed bytes over the bus, decoded into the slot on the card's decode stream.
+                self.decoders[d].fetch(c, self.host_buf[d], bufs[d], stream, event)
         self.copy_open = self.t_copy is not None
         for p, v in zip(self.params, views):
             p.data = v
@@ -641,6 +760,9 @@ class BlockSwap:
         self._grew = False
         self._chunks = []
         self.pinned_bytes = 0
+        self._decoders = {}
+        self._compress = False
+        self._compress_note = None
         if isinstance(n, int):
             self.indices = swap_indices(len(layers), n, placement)
         else:
@@ -771,8 +893,12 @@ class BlockSwap:
                         self.handles.append(
                             layer.register_forward_pre_hook(_opaque(self._plain_peak), with_kwargs = True))
 
+            self._compress = self._compress_check()
             self._pack()
-            total = self.host_bytes()
+            if self._compress:
+                self._build_decoders()
+            # What sits in host RAM: compressed regions are smaller than host_bytes() (the raw size).
+            total = sum(b.wire_bytes() for b in self.blocks) if self._compress else self.host_bytes()
             if self.pinned_bytes < total:
                 # Pageable copies are several times slower than pinned ones and cannot hide behind compute.
                 print(f"Unsloth: offload_layers pinned {self.pinned_bytes / 2**30:.1f} of {total / 2**30:.1f} GiB of host "
@@ -799,6 +925,49 @@ class BlockSwap:
             raise
         finally:
             _end_host_session()
+
+    def _compress_check(self):
+        """Compression is opt in, needs the registered arena (pageable chunks keep raw copies) and a device
+        decode that round trips exactly on every card a compressible block fetches onto."""
+        if not _compress_requested() or not _can_register():
+            return False
+        codec = _codec()
+        if codec is None:
+            self._compress_note = "codec unavailable"
+            return False
+        devs = sorted({torch.device(d) for b in self.blocks if b.compressible() for d in b.sizes
+                       if torch.device(d).type == "cuda"}, key = lambda d: d.index or 0)
+        if not devs:
+            return False
+        with _no_inference_mode():
+            for d in devs:
+                ok, triton_on, why = codec.self_check(d)
+                if not ok:
+                    self._compress_note = f"self-check failed on {d}: {why}"
+                    print(f"Unsloth: offload_layers compression is off ({self._compress_note}); copying raw weights.")
+                    return False
+                self._compress_note = "triton" if triton_on else "torch"
+        return True
+
+    def _build_decoders(self):
+        codec = _codec()
+        staging, aux = {}, {}
+        for b in self.blocks:
+            for d, c in b.codec.items():
+                if c is not None:
+                    staging[d] = max(staging.get(d, 0), min(c.chunk, c.words) * 3 // 2)
+                    aux[d] = max(aux.get(d, 0), c.aux_nbytes)
+        with _no_inference_mode():
+            for d in staging:
+                self._decoders[d] = codec.DeviceDecoder(d, staging[d], aux[d], use_triton = self._compress_note == "triton")
+        for b in self.blocks:
+            b.decoders = self._decoders
+        raw = sum(b.nbytes() for b in self.blocks if b.compressed())
+        if raw:
+            stored = sum(b.wire_bytes() for b in self.blocks if b.compressed())
+            n = sum(b.compressed() for b in self.blocks)
+            print(f"Unsloth: offload_layers stores {n} of {len(self.blocks)} swapped layers compressed (lossless), "
+                  f"{stored / 2**30:.2f} of {raw / 2**30:.2f} GiB ({100 * stored / raw:.0f}%), so fetches copy fewer bytes.")
 
     def _pack(self):
         # Block by block, releasing each original as soon as it is packed: never two host copies of the tail.
@@ -845,11 +1014,16 @@ class BlockSwap:
         arena = _lazy_host_empty(total)
         used, ends = 0, []
         for k, b in enumerate(self.blocks):
-            regions = {}
-            for d, need in b.sizes.items():
-                regions[d] = arena[used:used + need]
-                used += need
-            b.pack(regions)
+            if self._compress and b.compressible():
+                # Encoded regions are never larger than raw ones, so they fit the arena; on Linux its unused tail
+                # is never written and so never committed (and never pinned).
+                used = b.pack_compressed(arena, used, self.device)
+            else:
+                regions = {}
+                for d, need in b.sizes.items():
+                    regions[d] = arena[used:used + need]
+                    used += need
+                b.pack(regions)
             self._release(b)
             ends.append(used)
             self._publish_packed(k)
@@ -1120,10 +1294,18 @@ class BlockSwap:
         def hook(module, state_dict, prefix, local_metadata):
             # Per call: PEFT renames weights after install, and every alias must get the host copy.
             b = self.blocks[i]
+            host = b.host
+            if b.compressed():
+                # peft's adapter state dict drops every frozen base weight: skip decoding them for checkpoints.
+                if _in_peft_adapter_state_dict():
+                    return
+                host = None
             for name, p in module.named_parameters(remove_duplicate = False):
                 idx = b.index.get(id(p))
                 if idx is not None and prefix + name in state_dict:
-                    state_dict[prefix + name] = b.host[idx]
+                    if host is None:
+                        host = b.host_views()
+                    state_dict[prefix + name] = host[idx]
         return hook
 
     @_opaque
@@ -1170,11 +1352,21 @@ class BlockSwap:
         with _no_inference_mode():
             for b in self.blocks:
                 if not b.resident:
-                    for p, h, d in zip(b.params, b.host, b.devices):
-                        p.data = h.to(d, copy = True)
+                    if getattr(b, "codec", None) and b.compressed():
+                        # Decoded on the card one region at a time, then each weight gets its own storage.
+                        for d in list(b.host_buf):
+                            views = b.host_views(target = d)
+                            for p, h, pd in zip(b.params, views, b.devices):
+                                if pd == d:
+                                    p.data = h.clone()
+                            del views
+                    else:
+                        for p, h, d in zip(b.params, b.host, b.devices):
+                            p.data = h.to(d, copy = True)
                     b.resident = True
         # Callers holding this object (the fast decode loop) must see a no-op, not an empty pool.
         self.blocks = []
+        self._decoders = {}
         self._chunks = []
         # A removed controller must not keep the model's layers (and their restored GPU weights) alive.
         self._reserve_layers, self._reserve_owner = (), None
@@ -1201,6 +1393,22 @@ class BlockSwap:
     def host_bytes(self):
         return sum(b.nbytes() for b in self.blocks)
 
+    def compression_stats(self):
+        """Engagement of the lossless fetch codec: compressed layers, stored vs raw bytes, decoded fetches."""
+        blocks = [b for b in self.blocks if getattr(b, "codec", None) and b.compressed()]
+        decs = getattr(self, "_decoders", {}) or {}
+        return {
+            "enabled": bool(getattr(self, "_compress", False)),
+            "decode": getattr(self, "_compress_note", None),
+            "layers": len(blocks),
+            "raw_bytes": sum(b.nbytes() for b in blocks),
+            "stored_bytes": sum(b.wire_bytes() for b in blocks),
+            "fetches": sum(d.fetches for d in decs.values()),
+            "triton": all(d.use_triton for d in decs.values()) if decs else None,
+            "fallback": next((d.failed for d in decs.values() if d.failed), None),
+            "decoder_bytes": sum(d.nbytes() for d in decs.values()),
+        }
+
     def pool_bytes(self):
         held = [b.slot for b in self.blocks if b.slot is not None]
         free = [slot for slots in self.free.values() for slot in slots]
@@ -1222,6 +1430,9 @@ class BlockSwap:
             self._tot["copy_ms"] += sum(max(0.0, starts[d].elapsed_time(e)) for d, e in ends.items())
             self._tot["copies"] += 1
             self._tot["copy_bytes"] += b.nbytes()
+            if "wire_bytes" in self._tot:
+                wire = getattr(b, "wire_bytes", None)
+                self._tot["wire_bytes"] += wire() if wire is not None else b.nbytes()
 
         keep = []
         for starts, ends in getattr(b, "copy_pending", []):
@@ -1422,11 +1633,12 @@ class BlockSwap:
             "pinned_bytes": self.pinned_bytes,
             "pool_bytes": self.pool_bytes(),
             "timing": _TIMING,
+            "compression": self.compression_stats(),
             **window,
         }
 
 
-_STAT_KEYS = ("copies", "copy_ms", "copy_bytes", "stall_ms", "compute_ms", "layers")
+_STAT_KEYS = ("copies", "copy_ms", "copy_bytes", "wire_bytes", "stall_ms", "compute_ms", "layers")
 
 
 def _text_config(config):
