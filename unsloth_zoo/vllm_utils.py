@@ -3933,6 +3933,12 @@ def _patch_vllm_replayssm_gdn():
     return _widen_vllm_replayssm_capability(GDN_REPLAYSSM_ARCHITECTURES)
 
 
+def _normalize_speculative_keys(config):
+    # vLLM's create_speculative_config does the same ("num-speculative-tokens" -> "num_speculative_tokens"; a later
+    # spelling of one key wins, as in vLLM's dict comprehension).
+    return {str(key).replace("-", "_"): value for key, value in config.items()}
+
+
 def _vllm_suffix_decoding_config():
     # UNSLOTH_VLLM_SUFFIX_DECODING=1, or a JSON object of extra speculative_config keys
     # (e.g. {"num_speculative_tokens": 16}). None when unset; raises when vLLM cannot run it.
@@ -3951,7 +3957,7 @@ def _vllm_suffix_decoding_config():
         raise ValueError(f"Unsloth: UNSLOTH_VLLM_SUFFIX_DECODING={value!r} must be 1 or a JSON object.")
 
     _check_vllm_suffix_decoding("unset UNSLOTH_VLLM_SUFFIX_DECODING")
-    return {**extra, "method": "suffix"}
+    return {**_normalize_speculative_keys(extra), "method": "suffix"}
 
 
 def _vllm_speculative_methods():
@@ -3969,6 +3975,14 @@ def _vllm_speculative_methods():
     return frozenset(methods) or None
 
 
+def _vllm_release():
+    # (major, minor) of the installed vLLM, or None.
+    try:
+        return tuple(Version(str(globals().get("vllm_version"))).release[:2])
+    except Exception:
+        return None
+
+
 def _check_vllm_suffix_decoding(how_to_turn_off):
     installed = globals().get("vllm_version", "not installed")
     methods = _vllm_speculative_methods()
@@ -3977,9 +3991,11 @@ def _check_vllm_suffix_decoding(how_to_turn_off):
             f"Unsloth: suffix decoding needs vLLM >= 0.11.1 (speculative method 'suffix'), but found "
             f"vLLM {installed}. Upgrade vLLM or {how_to_turn_off}."
         )
-    if importlib.util.find_spec("arctic_inference") is None:
+    # vLLM 0.34 ships its own suffix decoding; 0.11.1 to 0.33 run Arctic Inference's.
+    release = _vllm_release()
+    if (release is None or release < (0, 34)) and importlib.util.find_spec("arctic_inference") is None:
         raise RuntimeError(
-            "Unsloth: suffix decoding needs the Arctic Inference package. Install it with "
+            "Unsloth: suffix decoding needs the Arctic Inference package on this vLLM. Install it with "
             "`pip install arctic-inference` (vLLM suggests arctic-inference==0.1.1), or "
             f"{how_to_turn_off}."
         )
@@ -3987,8 +4003,16 @@ def _check_vllm_suffix_decoding(how_to_turn_off):
 
 _SPECULATIVE_CONFIG_ENV = "UNSLOTH_VLLM_SPECULATIVE_CONFIG"
 
+# Methods verified lossless with LoRA rollouts here: the target verifies every draft token, so samples follow the
+# target distribution. Others (medusa, mlp_speculator, dflash, dspark, ngram_gpu, custom_class, plugin speculators)
+# are refused rather than passed on unverified.
+_SUPPORTED_SPECULATIVE_METHODS = frozenset(("eagle", "eagle3", "mtp", "ngram", "draft_model", "suffix"))
+# 'synthetic' and 'fly' accept draft tokens the target would reject, so a GRPO rollout would be sampled from another
+# distribution than the target logprobs it reports.
+_LOSSLESS_REJECTION_SAMPLE_METHODS = frozenset(("standard", "block"))
 
-def _vllm_speculative_config(speculative_config = None):
+
+def _vllm_speculative_config(speculative_config = None, training = True):
     # load_vllm(speculative_config = {...}), else UNSLOTH_VLLM_SPECULATIVE_CONFIG (a JSON object), else
     # UNSLOTH_VLLM_SUFFIX_DECODING. Returns a dict for vLLM's speculative_config or None; raises on a value vLLM cannot run.
     source = "speculative_config"
@@ -4010,55 +4034,253 @@ def _vllm_speculative_config(speculative_config = None):
             '{"method": "ngram", "num_speculative_tokens": 4, "prompt_lookup_max": 4} or '
             '{"method": "eagle3", "model": "<draft repo>", "num_speculative_tokens": 3}.'
         )
-    config = dict(speculative_config)
+    config = _normalize_speculative_keys(speculative_config)
     method = config.get("method", None)
-    if method is None and not config.get("model", None):
-        raise ValueError(f"Unsloth: {source} needs a 'method' (such as 'ngram') or a draft 'model'.")
+    supported = sorted(_SUPPORTED_SPECULATIVE_METHODS)
+    if method is None:
+        # vLLM would infer the method from the draft name (incl. a Python proposer path); make it explicit instead.
+        raise ValueError(f"Unsloth: {source} needs an explicit 'method', one of {supported}.")
+    if not isinstance(method, str):
+        raise ValueError(f"Unsloth: {source} 'method' must be a string, one of {supported}; got {method!r}.")
+    if method not in _SUPPORTED_SPECULATIVE_METHODS:
+        hint = " Use 'mtp'." if method.endswith("_mtp") else ""
+        raise ValueError(
+            f"Unsloth: {source} method {method!r} is not supported for Unsloth rollouts; use one of {supported}.{hint}"
+        )
+    installed = _vllm_speculative_methods()
+    if installed is not None and method not in installed:
+        raise ValueError(
+            f"Unsloth: {source} method {method!r} is not one this vLLM "
+            f"({globals().get('vllm_version', 'not installed')}) knows: {sorted(installed)}."
+        )
+    if method in ("eagle", "eagle3", "draft_model") and not config.get("model", None):
+        raise ValueError(f"Unsloth: {source} method {method!r} needs the draft checkpoint as 'model'.")
+    verifier = config.get("rejection_sample_method", "standard")
+    if training and verifier not in _LOSSLESS_REJECTION_SAMPLE_METHODS:
+        raise ValueError(
+            f"Unsloth: {source} rejection_sample_method={verifier!r} is lossy: it emits draft tokens the target "
+            "would reject, so RL rollouts would not follow the target's logprobs. Use 'standard' (default) or 'block'."
+        )
     if os.environ.get("UNSLOTH_VLLM_SUFFIX_DECODING", "").strip().lower() not in ("", "0", "false", "off", "no"):
         print(f"Unsloth: {source} is set, so UNSLOTH_VLLM_SUFFIX_DECODING is ignored.")
     if method == "suffix":
         _check_vllm_suffix_decoding(how_to_turn_off)
-    elif method is not None:
-        methods = _vllm_speculative_methods()
-        if methods is not None and method not in methods:
-            raise ValueError(
-                f"Unsloth: {source} method {method!r} is not one this vLLM "
-                f"({globals().get('vllm_version', 'not installed')}) knows: {sorted(methods)}."
-            )
-    # A forced Model Runner V2 would only get the engine refused (vLLM falls back to V1 for these by itself).
-    if method in _MRV2_UNSUPPORTED_SPECULATIVE_METHODS and \
-        os.environ.get("VLLM_USE_V2_MODEL_RUNNER", "").strip().lower() in ("1", "true"):
-        raise ValueError(
-            f"Unsloth: vLLM Model Runner V2 does not run speculative method {method!r}, but "
-            "VLLM_USE_V2_MODEL_RUNNER=1 forces it. Unset VLLM_USE_V2_MODEL_RUNNER, or use a method V2 runs "
-            "(eagle, eagle3, mtp, dflash)."
-        )
     return config
 
 
-# Methods whose 'model' is a separate draft checkpoint loaded beside the target (MTP reuses the target's own layers).
-_SPECULATIVE_DRAFT_METHODS = frozenset((
-    None, "draft_model", "eagle", "eagle3", "medusa", "mlp_speculator", "dflash", "dspark",
+_SECRET_KEY_PATTERN = re.compile(r"secret|token|passw|credential|api_?key|access_?key|auth|private", re.IGNORECASE)
+
+
+def _redact_speculative_config(value, key = None):
+    # Copy safe to print: values under credential-like keys (e.g. a tensorizer s3_secret_access_key) become '***'.
+    if key is not None and _SECRET_KEY_PATTERN.search(str(key)) and key != "num_speculative_tokens":
+        return "***"
+    if isinstance(value, dict):
+        return {k: _redact_speculative_config(v, k) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_redact_speculative_config(v) for v in value)
+    if hasattr(value, "__dataclass_fields__"):
+        return _redact_speculative_config(
+            {f: getattr(value, f, None) for f in value.__dataclass_fields__}
+        )
+    return value
+
+
+def _speculative_config_has_secret(value, key = None):
+    if key is not None and _SECRET_KEY_PATTERN.search(str(key)) and key != "num_speculative_tokens":
+        return value is not None
+    if isinstance(value, dict):
+        return any(_speculative_config_has_secret(v, k) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_speculative_config_has_secret(v) for v in value)
+    if hasattr(value, "__dataclass_fields__"):
+        return any(_speculative_config_has_secret(getattr(value, f, None), f) for f in value.__dataclass_fields__)
+    return False
+
+
+def _patch_vllm_log_non_default_args():
+    # LLM() logs its non-default engine args verbatim, and vLLM only redacts top-level api_key / hf_token, so a
+    # credential nested in speculative_config (draft loader extra config) would reach the log.
+    try:
+        import vllm.entrypoints.llm as llm_module
+    except Exception:
+        return False
+    original = getattr(llm_module, "log_non_default_args", None)
+    if original is None: return False
+    if getattr(original, "_unsloth_redacts_speculative", False): return True
+
+    @functools.wraps(original)
+    def log_non_default_args(args, *a, **k):
+        spec = getattr(args, "speculative_config", None)
+        if spec is not None and _speculative_config_has_secret(spec):
+            try:
+                args = copy.copy(args)
+                args.speculative_config = _redact_speculative_config(spec)
+            except Exception:
+                return None
+        return original(args, *a, **k)
+
+    log_non_default_args._unsloth_redacts_speculative = True
+    llm_module.log_non_default_args = log_non_default_args
+    return True
+
+
+# Speculative methods vLLM's Model Runner V2 refuses, per release (vllm/config/vllm.py
+# _get_v2_model_runner_unsupported_features); 0.34 removed Model Runner V1, so V2 runs every method it accepts.
+_MRV2_UNSUPPORTED_BY_RELEASE = (
+    ((0, 31), frozenset(("ngram", "ngram_gpu", "suffix", "medusa", "mlp_speculator", "custom_class"))),
+    ((0, 32), frozenset(("suffix", "medusa", "mlp_speculator", "custom_class"))),
+    ((0, 33), frozenset(("suffix", "custom_class"))),
+    ((0, 34), frozenset()),
+)
+_MRV2_UNSUPPORTED_BEFORE_0_31 = frozenset((
+    "ngram", "ngram_gpu", "draft_model", "suffix", "medusa", "mlp_speculator", "custom_class",
 ))
 
 
-def _speculative_draft_gb(speculative_config, target_model_name):
-    # GiB of draft weights vLLM loads beside the target: 0 for ngram / suffix / MTP, None when it cannot be sized.
+def _mrv2_unsupported_speculative_methods(release = None):
+    release = _vllm_release() if release is None else tuple(release)
+    if release is None: return _MRV2_UNSUPPORTED_BY_RELEASE[0][1]
+    if release < (0, 31): return _MRV2_UNSUPPORTED_BEFORE_0_31
+    unsupported = _MRV2_UNSUPPORTED_BY_RELEASE[0][1]
+    for since, methods in _MRV2_UNSUPPORTED_BY_RELEASE:
+        if release >= since: unsupported = methods
+    return unsupported
+
+
+def _speculative_method(speculative_config):
+    if isinstance(speculative_config, dict): return speculative_config.get("method", None)
+    return getattr(speculative_config, "method", None)
+
+
+# Methods whose 'model' is a separate checkpoint vLLM loads beside the target.
+_SPECULATIVE_DRAFT_METHODS = frozenset(("draft_model", "eagle", "eagle3", "mtp"))
+_NOT_FOR_INFERENCE_WEIGHTS = frozenset(("training_args.bin", "optimizer.bin", "optimizer.pt", "scheduler.pt", "scaler.pt"))
+
+
+def _select_draft_weight_files(files, load_format = "auto", index = None):
+    # The files vLLM's DefaultModelLoader loads, from root-level (name, size) pairs: mistral consolidated*.safetensors
+    # under 'auto' when present, else the first of *.safetensors / *.bin / *.pt that matches, a safetensors index
+    # filtering duplicates. Returns GiB, or None when the format is not the default loader's or a size is unknown.
+    import fnmatch
+    files = [(n, b) for n, b in files if "/" not in n and "\\" not in n]
+    if load_format in (None, "auto"):
+        load_format = "mistral" if any(fnmatch.fnmatchcase(n, "consolidated*.safetensors") for n, _ in files) else "hf"
+    patterns = {
+        "hf": ("*.safetensors", "*.bin", "*.pt"),
+        "safetensors": ("*.safetensors",),
+        "mistral": ("consolidated*.safetensors",),
+        "pt": ("*.pt",),
+    }.get(load_format)
+    if patterns is None: return None
+    for pattern in patterns:
+        chosen = [(n, b) for n, b in files if fnmatch.fnmatchcase(n, pattern)]
+        if not chosen: continue
+        if pattern.endswith(".safetensors"):
+            if index is not None:
+                chosen = [(n, b) for n, b in chosen if n in index]
+        else:
+            chosen = [(n, b) for n, b in chosen if n not in _NOT_FOR_INFERENCE_WEIGHTS]
+        if not chosen or any(b is None for _, b in chosen): return None
+        return sum(b for _, b in chosen) / (1024 ** 3)
+    return None
+
+
+def _speculative_draft_load_format(speculative_config):
+    load = speculative_config.get("draft_load_config", None)
+    if isinstance(load, dict): return load.get("load_format", "auto")
+    return getattr(load, "load_format", "auto") if load is not None else "auto"
+
+
+def _speculative_draft_gb(speculative_config, target_model_name, target_revision = None):
+    # GiB of draft weights vLLM loads beside the target: 0 for ngram / suffix and for MTP layers inside the target's
+    # own checkpoint; None when it cannot be sized.
+    method = speculative_config.get("method", None)
     draft = speculative_config.get("model", None)
-    if not draft or speculative_config.get("method", None) not in _SPECULATIVE_DRAFT_METHODS: return 0.0
-    if str(draft) == str(target_model_name): return 0.0
-    suffixes = (".safetensors", ".bin", ".pt", ".pth")
+    if method not in _SPECULATIVE_DRAFT_METHODS: return 0.0
+    if method == "mtp" and (not draft or (
+        str(draft) == str(target_model_name)
+        and speculative_config.get("revision", None) in (None, target_revision)
+    )):
+        return 0.0
+    if not draft: return None
+    load_format = _speculative_draft_load_format(speculative_config)
+    index_name = "consolidated.safetensors.index.json" if load_format == "mistral" else "model.safetensors.index.json"
     try:
         if os.path.isdir(draft):
-            sizes = [os.path.getsize(os.path.join(d, f)) for d, _, files in os.walk(draft) for f in files if f.endswith(suffixes)]
+            with os.scandir(draft) as entries:
+                files = [(e.name, e.stat().st_size) for e in entries if e.is_file()]
+            index = None
+            for name in (index_name, "consolidated.safetensors.index.json"):
+                path = os.path.join(draft, name)
+                if os.path.isfile(path):
+                    with open(path, "r", encoding = "utf-8") as f:
+                        index = set(json.load(f).get("weight_map", {}).values())
+                    break
         else:
             from huggingface_hub import HfApi
-            info = HfApi().model_info(draft, revision = speculative_config.get("revision", None), files_metadata = True)
-            files = [(s.rfilename, s.size or 0) for s in (info.siblings or [])]
-            sizes = [n for f, n in files if f.endswith(".safetensors")] or [n for f, n in files if f.endswith(suffixes)]
+            revision = speculative_config.get("revision", None)
+            info = HfApi().model_info(draft, revision = revision, files_metadata = True)
+            files = [(s.rfilename, s.size) for s in (info.siblings or [])]
+            index = None
+            names = {n for n, _ in files}
+            for name in (index_name, "consolidated.safetensors.index.json"):
+                if name in names and sum(n.endswith(".safetensors") for n in names) > 1:
+                    from huggingface_hub import hf_hub_download
+                    with open(hf_hub_download(draft, name, revision = revision), "r", encoding = "utf-8") as f:
+                        index = set(json.load(f).get("weight_map", {}).values())
+                    break
     except Exception:
         return None
-    return sum(sizes) / (1024 ** 3) if sizes else None
+    return _select_draft_weight_files(files, load_format, index)
+
+
+def _routing_replay_will_drop_speculation(config, speculative_config, enable_prefix_caching = True):
+    # Before the memory estimate: True when _routing_replay_model_runner will drop this speculation (routing replay on
+    # an MoE model needs Model Runner V2 on vLLM 0.31+), so the draft is never charged. Mirrors its replay_off exits.
+    if speculative_config is None: return False
+    try:
+        from .routing_replay import routing_replay_requested, _config_is_moe, _vllm_at_least
+        if not (routing_replay_requested() and _config_is_moe(config) and _vllm_at_least(0, 31)): return False
+    except Exception:
+        return False
+    if enable_prefix_caching is False: return False
+    value = os.environ.get("VLLM_USE_V2_MODEL_RUNNER", None)
+    try:
+        forced = None if value is None else bool(int(value.strip()))
+    except ValueError:
+        forced = None
+    if forced is False and not _UNSLOTH_SET_V1_RUNNER: return False
+    if forced is not True and is_hip():
+        default_v1 = _vllm_rocm_default_v1_architectures()
+        if any(a in default_v1 for a in (getattr(config, "architectures", None) or ())): return False
+    return _speculative_method(speculative_config) in _mrv2_unsupported_speculative_methods()
+
+
+def _resolve_speculative_depth(engine_args, args_cls):
+    # num_speculative_tokens as vLLM resolves it (a draft config's n_predict, suffix's tree depth default), filled in
+    # before the LoRA lookahead fit so the fit and the memory retry use the depth vLLM will check.
+    spec = engine_args.get("speculative_config", None)
+    if not isinstance(spec, dict) or spec.get("num_speculative_tokens", None) is not None: return spec
+    good_keys = inspect.signature(args_cls).parameters
+    try:
+        from vllm.config import ParallelConfig
+        probe = args_cls(**{k: v for k, v in engine_args.items() if k in good_keys and k != "speculative_config"},
+                         speculative_config = dict(spec))
+        parallel = ParallelConfig(
+            tensor_parallel_size = probe.tensor_parallel_size,
+            pipeline_parallel_size = probe.pipeline_parallel_size,
+        )
+        resolved = probe.create_speculative_config(probe.create_model_config(), parallel)
+        k = int(resolved.num_speculative_tokens)
+    except Exception as error:
+        raise ValueError(
+            f"Unsloth: could not work out num_speculative_tokens for speculative method {spec.get('method')!r} "
+            f"the way vLLM does ({type(error).__name__}: {str(error)[:300]}). Pass num_speculative_tokens explicitly."
+        )
+    spec = {**spec, "num_speculative_tokens": k}
+    engine_args["speculative_config"] = spec
+    return spec
 
 
 def _speculation_lookahead(speculative_config):
@@ -4181,11 +4403,11 @@ def suppress_vllm_padded_vocab(llm, padded_ids, speculative = False):
         # would fail every request; older V1 only warns and drops it.
         if _mask_in_model():
             return _record()
-        print(
-            "Unsloth: vLLM does not support logit_bias with speculative decoding, so this padded "
-            "vocabulary's alignment rows stay sampleable."
+        raise RuntimeError(
+            "Unsloth: vLLM does not support logit_bias with speculative decoding, and this engine's model could not "
+            "be patched to mask the padded vocabulary rows, so they would stay sampleable. Drop speculative_config "
+            "(or UNSLOTH_VLLM_SUFFIX_DECODING) for this model."
         )
-        return llm
     try:
         # Model Runner V2 refuses a request with more logit_bias entries than this.
         from vllm.v1.worker.gpu.sample.logit_bias import MAX_NUM_LOGIT_BIAS_TOKENS as max_bias
@@ -4516,10 +4738,6 @@ def _vllm_disable_envs_cache():
         pass
 
 
-# Speculative methods vLLM 0.31 MRV2 cannot run (_get_v2_model_runner_unsupported_features).
-_MRV2_UNSUPPORTED_SPECULATIVE_METHODS = frozenset((
-    "ngram", "ngram_gpu", "suffix", "medusa", "mlp_speculator", "custom_class",
-))
 
 # vLLM 0.31 ROCM_DEFAULT_MRV1_ARCHITECTURES: V1 on ROCm when the runner is unset; gone in 0.32 (#56360).
 _ROCM_DEFAULT_MRV1_ARCHITECTURES = frozenset((
@@ -4597,9 +4815,8 @@ def _routing_replay_model_runner(engine_args, config = None):
         print("Unsloth: routing replay needs vLLM Model Runner V2; dropping the V1 runner an earlier ReplaySSM load set.")
         action = "restored_v2"
     speculative_config = engine_args.get("speculative_config", None)
-    method = speculative_config.get("method", None) if isinstance(speculative_config, dict) \
-        else getattr(speculative_config, "method", None)
-    if method in _MRV2_UNSUPPORTED_SPECULATIVE_METHODS:
+    method = _speculative_method(speculative_config)
+    if speculative_config is not None and method in _mrv2_unsupported_speculative_methods():
         engine_args.pop("speculative_config", None)
         what = "suffix decoding" if method == "suffix" else f"speculative method {method!r}"
         print(
@@ -4607,6 +4824,14 @@ def _routing_replay_model_runner(engine_args, config = None):
             f"routing replay ({ROUTING_REPLAY_ENV}=1) needs V2 on this vLLM."
         )
         action = action or "speculation_off"
+    elif isinstance(speculative_config, dict) and speculative_config.get("enable_adaptive_verification", False):
+        # vLLM refuses routed-expert capture with adaptive verification (_verify_aux_output_compatibility).
+        engine_args["speculative_config"] = {**speculative_config, "enable_adaptive_verification": False}
+        warnings.warn(
+            f"Unsloth: routing replay ({ROUTING_REPLAY_ENV}=1) turns off adaptive speculative verification, "
+            "which vLLM cannot combine with routed-expert capture.",
+            stacklevel = 2,
+        )
     return action
 
 
@@ -4953,7 +5178,24 @@ def load_vllm(
     # str(), and vLLM parses --speculative-config as JSON, so a dict there kills the server.
     if return_args and speculative_config is not None:
         print("Unsloth: speculative_config is not passed on with return_args = True; give it to `vllm serve` directly.")
-    user_speculative_config = None if return_args else _vllm_speculative_config(speculative_config)
+    user_speculative_config = None if return_args else _vllm_speculative_config(speculative_config, training = training)
+    # Routing replay drops speculation Model Runner V2 cannot run; decide that before the draft is charged below.
+    if _routing_replay_will_drop_speculation(config, user_speculative_config, enable_prefix_caching) \
+            and not (use_async or use_engine):
+        method = _speculative_method(user_speculative_config)
+        what = "suffix decoding" if method == "suffix" else f"speculative method {method!r}"
+        print(
+            f"Unsloth: {what} is off for this engine: vLLM Model Runner V2 does not run it, and "
+            "routing replay (UNSLOTH_ROUTING_REPLAY=1) needs V2 on this vLLM."
+        )
+        user_speculative_config = None
+    if user_speculative_config is not None and (use_async or use_engine) and _padded_vocab_ids(config):
+        # Padded vocabulary rows are masked inside the in-process model under speculation (vLLM rejects logit_bias
+        # there); an async / engine-core-process vLLM has no model to patch, so they would stay sampleable.
+        raise ValueError(
+            "Unsloth: speculative decoding with an async vLLM engine cannot mask this model's padded vocabulary "
+            "rows. Use the synchronous engine (use_async = False) or drop speculative_config."
+        )
 
     # A draft model's weights live inside the same gpu_memory_utilization: count them with the target's weights so the
     # KV cache estimate, max_num_seqs and the context-length fit all see them; vLLM's own profile then sizes the real
@@ -5554,8 +5796,18 @@ def load_vllm(
                 approx_max_num_seqs, max_num_batched_tokens,
                 engine_args.get("max_num_seqs"), engine_args.get("max_num_batched_tokens"),
             )
+            if use_bitsandbytes and user_speculative_config.get("method", None) in ("eagle", "eagle3", "draft_model") \
+                    and user_speculative_config.get("draft_load_config", None) is None:
+                # vLLM loads the draft with the target's load config when draft_load_config is unset, i.e. the
+                # bitsandbytes loader of a QLoRA target, which a 16-bit draft checkpoint fails.
+                from vllm.config import LoadConfig
+                user_speculative_config = {**user_speculative_config, "draft_load_config": LoadConfig(load_format = "auto")}
+                print("Unsloth: the speculative draft loads with vLLM's default loader, not the target's bitsandbytes one.")
             engine_args["speculative_config"] = user_speculative_config
             if enable_lora:
+                user_speculative_config = _resolve_speculative_depth(
+                    engine_args, AsyncEngineArgs if use_async else EngineArgs,
+                )
                 fitted_max_num_seqs = _fit_max_num_seqs_to_speculation(
                     engine_args["max_num_seqs"], engine_args["max_num_batched_tokens"], user_speculative_config,
                 )
@@ -5576,7 +5828,12 @@ def load_vllm(
                     )
                     max_num_batched_tokens = fitted_max_num_batched_tokens
                     engine_args["max_num_batched_tokens"] = fitted_max_num_batched_tokens
-            print(f"Unsloth: vLLM uses {spec_what} for generation with speculative_config = {user_speculative_config}.")
+            if _speculative_config_has_secret(user_speculative_config):
+                _patch_vllm_log_non_default_args()
+            print(
+                f"Unsloth: vLLM uses {spec_what} for generation with speculative_config = "
+                f"{_redact_speculative_config(user_speculative_config)}."
+            )
         # Same str() problem for return_args: vLLM json-parses --hf-overrides, and a `vllm serve`
         # has no trainer whose logprobs the fp32 head would have to match.
         fp32_head_overrides = {} if return_args else _vllm_fp32_lm_head_overrides(training)

@@ -38,13 +38,15 @@ def _tree():
 
 
 def _helper(monkeypatch, methods, has_arctic, version = "0.29.0"):
-    names = ("_vllm_suffix_decoding_config", "_vllm_speculative_methods", "_check_vllm_suffix_decoding")
+    names = ("_vllm_suffix_decoding_config", "_vllm_speculative_methods", "_check_vllm_suffix_decoding",
+             "_normalize_speculative_keys", "_vllm_release")
     nodes = [n for n in _tree().body if isinstance(n, ast.FunctionDef) and n.name in names]
     assert len(nodes) == len(names), "suffix decoding helpers are missing from vllm_utils.py"
     fake_util = types.SimpleNamespace(
         find_spec = lambda name: object() if (name == "arctic_inference" and has_arctic) else None,
     )
-    ns = {"os": os, "json": json, "importlib": types.SimpleNamespace(util = fake_util), "vllm_version": version}
+    from packaging.version import Version
+    ns = {"os": os, "json": json, "importlib": types.SimpleNamespace(util = fake_util), "vllm_version": version, "Version": Version}
     exec(compile(ast.Module(body = nodes, type_ignores = []), "vllm_utils_helper", "exec"), ns)
     names = ["vllm", "vllm.config", "vllm.config.speculative"]
     for name in names:
@@ -104,7 +106,7 @@ def test_missing_arctic_refused(monkeypatch):
 def test_load_vllm_passes_speculative_config_before_arg_filter():
     load_vllm = next(n for n in ast.walk(_tree()) if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
     src = ast.unparse(load_vllm)
-    call = src.find("_vllm_speculative_config(speculative_config)")
+    call = src.find("_vllm_speculative_config(speculative_config, training=training)")
     assign = src.find("engine_args['speculative_config'] = user_speculative_config")
     arg_filter = src.find("good_keys = inspect.signature(AsyncEngineArgs", max(assign, 0))
     assert -1 < call < assign < arg_filter
@@ -189,9 +191,11 @@ def test_return_args_callers_get_no_speculative_config():
         n for n in ast.walk(load_vllm)
         if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "user_speculative_config" for t in n.targets)
     ]
-    assert len(assigns) == 1
+    # The first assignment decides; later ones only narrow it (replay drop, bnb draft loader, resolved depth).
+    assert len(assigns) >= 1
     value = ast.unparse(assigns[0].value)
-    assert "return_args" in value and "_vllm_speculative_config(speculative_config)" in value
+    assert all("return_args" not in ast.unparse(a.value) or a is assigns[0] for a in assigns)
+    assert "return_args" in value and "_vllm_speculative_config(speculative_config, training=training)" in value
 
 
 @pytest.mark.parametrize("seqs, tokens, config, expected", [
