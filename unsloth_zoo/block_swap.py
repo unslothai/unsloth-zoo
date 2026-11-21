@@ -942,11 +942,14 @@ class BlockSwap:
         with _no_inference_mode():
             for d in devs:
                 ok, triton_on, why = codec.self_check(d)
+                if ok and not triton_on:
+                    # The torch decode is exact but slower than the bus (about 4 GB/s on an L4): no gain without Triton.
+                    ok, why = False, "no Triton decode"
                 if not ok:
                     self._compress_note = f"self-check failed on {d}: {why}"
                     print(f"Unsloth: offload_layers compression is off ({self._compress_note}); copying raw weights.")
                     return False
-                self._compress_note = "triton" if triton_on else "torch"
+                self._compress_note = "triton"
         return True
 
     def _build_decoders(self):

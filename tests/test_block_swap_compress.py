@@ -254,11 +254,13 @@ def test_state_dict_and_remove_restore_the_exact_weights(monkeypatch):
     sd = layers.state_dict()
     for k, v in ref.items():
         assert torch.equal(sd[k].to(v.device), v), k
+    evicted = [p for b in sw.blocks if not b.resident for p in b.params]
+    assert evicted
     sw.remove()
     for k, v in layers.state_dict().items():
         assert torch.equal(v, ref[k]) and v.device.type == "cuda", k
     # Each restored weight owns its storage (safetensors refuses shared ones).
-    ptrs = [p.untyped_storage().data_ptr() for p in layers.parameters()]
+    ptrs = [p.untyped_storage().data_ptr() for p in evicted]
     assert len(set(ptrs)) == len(ptrs)
 
 
@@ -271,12 +273,16 @@ def test_peft_adapter_state_dict_skips_decoding(monkeypatch):
     orig = _bs._Block.host_views
     monkeypatch.setattr(_bs._Block, "host_views", lambda self, *a, **k: calls.append(1) or orig(self, *a, **k))
 
+    ref = {k: v.clone() for k, v in layers.state_dict().items()}
+    assert len(calls) == 2
     ns = {"__name__": "peft.utils.save_and_load", "layers": layers}
     exec("def get_peft_model_state_dict():\n    return layers.state_dict()", ns)
     sd = ns["get_peft_model_state_dict"]()
-    assert calls == [] and sd["1.w.weight"].numel() == 0
+    assert len(calls) == 2, "no decode under peft's adapter state dict"
+    evicted = [k for k in ("1.w.weight", "2.w.weight") if sd[k].numel() == 0]
+    assert evicted, "an evicted frozen weight is left as its placeholder"
     sd = layers.state_dict()
-    assert len(calls) == 2 and sd["1.w.weight"].shape == (256, 256)
+    assert len(calls) == 4 and all(torch.equal(sd[k].cpu(), v.cpu()) for k, v in ref.items())
     sw.remove()
 
 

@@ -28,6 +28,7 @@ Host blob per region of N words (N a multiple of 256):
     aligned) [E], escape exponents (uint8) [E]
 """
 
+import os
 import sys
 import torch
 
@@ -216,18 +217,20 @@ def _triton_kernels():
         import triton
         import triton.language as tl
 
-        @triton.jit(do_not_specialize = ["k", "first_word"])
-        def _bswap_decode_kernel(src, tab, out, k, first_word, BLOCK: tl.constexpr):
-            # int64 offsets: a region can pass 2**31 words.
-            offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
-            mask = offs < k
-            sm = tl.load(src + offs, mask = mask, other = 0).to(tl.int32)
-            packed = tl.load(src + k + (offs >> 1), mask = mask, other = 0).to(tl.int32)
-            code = (packed >> ((offs & 1).to(tl.int32) * 4)) & 15
-            g = (first_word + offs) >> 16
-            e = tl.load(tab + g * 16 + code, mask = mask, other = 0).to(tl.int32)
-            w = ((sm & 0x80) << 8) | (e << 7) | (sm & 0x7F)
-            tl.store(out + offs, w.to(tl.int16), mask = mask)
+        @triton.jit(do_not_specialize = ["k", "first_word", "n_blocks"])
+        def _bswap_decode_kernel(src, tab, out, k, first_word, n_blocks, BLOCK: tl.constexpr):
+            # Grid-stride over BLOCK-word tiles (the grid may be capped below n_blocks). Offsets inside a chunk stay
+            # below CHUNK; the region-wide index (first_word + offs) is int64, since a region can pass 2**31 words.
+            for b in range(tl.program_id(0), n_blocks, tl.num_programs(0)):
+                offs = tl.arange(0, BLOCK).to(tl.int64) + b * BLOCK
+                mask = offs < k
+                sm = tl.load(src + offs, mask = mask, other = 0).to(tl.int32)
+                packed = tl.load(src + k + (offs >> 1), mask = mask, other = 0).to(tl.int32)
+                code = (packed >> ((offs & 1).to(tl.int32) * 4)) & 15
+                g = (first_word + offs) >> 16
+                e = tl.load(tab + g * 16 + code, mask = mask, other = 0).to(tl.int32)
+                w = ((sm & 0x80) << 8) | (e << 7) | (sm & 0x7F)
+                tl.store(out + offs, w.to(tl.int16), mask = mask)
 
         @triton.jit(do_not_specialize = ["m"])
         def _bswap_patch_kernel(pos, vals, out, m, BLOCK: tl.constexpr):
@@ -253,10 +256,25 @@ _BLOCK = 4096
 _PATCH_BLOCK = 1024
 
 
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+# Decode stream priority ("high": its tiles are scheduled ahead of the training stream's) and a cap on decode
+# CTAs (0 = one per tile), to trade decode latency against how many SMs it takes from the forward beside it.
+_PRIORITY = os.environ.get("UNSLOTH_BLOCK_SWAP_DECODE_PRIORITY", "high").strip().lower()
+_MAX_CTAS = _env_int("UNSLOTH_BLOCK_SWAP_DECODE_CTAS", 0)
+
+
 def _decode_chunk(src, tables, first_word, k, out_u8, use_triton):
     if use_triton:
         dec, _ = _triton_kernels()
-        dec[(-(-k // _BLOCK),)](src, tables, out_u8.view(torch.int16), k, first_word, BLOCK = _BLOCK, num_warps = 4)
+        n_blocks = -(-k // _BLOCK)
+        grid = min(n_blocks, _MAX_CTAS) if _MAX_CTAS > 0 else n_blocks
+        dec[(grid,)](src, tables, out_u8.view(torch.int16), k, first_word, n_blocks, BLOCK = _BLOCK, num_warps = 4)
     else:
         _decode_chunk_torch(src, tables, first_word, k, out_u8)
 
@@ -281,11 +299,13 @@ class DeviceDecoder:
     def __init__(self, device, staging_bytes, aux_bytes, use_triton = True):
         self.device = torch.device(device)
         self.use_triton = bool(use_triton) and triton_decode_available()
-        try:
-            lo, hi = torch.cuda.Stream.priority_range()
-            prio = min(lo, hi)
-        except Exception:
-            prio = 0
+        prio = 0
+        if _PRIORITY != "normal":
+            try:
+                lo, hi = torch.cuda.Stream.priority_range()
+                prio = min(lo, hi)
+            except Exception:
+                prio = 0
         self.stream = torch.cuda.Stream(device = self.device, priority = prio)
         self.staging = [torch.empty(max(16, staging_bytes), dtype = torch.uint8, device = self.device) for _ in range(2)]
         self.aux = torch.empty(max(16, aux_bytes), dtype = torch.uint8, device = self.device)
