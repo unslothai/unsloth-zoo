@@ -56,7 +56,7 @@ def test_use_gradient_checkpointing_false_beats_trl_default(monkeypatch):
     assert args.gradient_checkpointing is False
     model._unsloth_cpu_gradient_checkpointing = "unsloth"
     args = _GcArgs()
-    assert trainer._auto_cpu_gradient_checkpointing(model, args) is None and args.gradient_checkpointing is True
+    assert not trainer._auto_cpu_gradient_checkpointing(model, args) and args.gradient_checkpointing is True
 
 
 def test_get_peft_model_records_the_choice():
