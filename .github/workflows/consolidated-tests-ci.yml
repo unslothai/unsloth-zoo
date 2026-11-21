@@ -1268,7 +1268,8 @@ jobs:
           }
 
           lane t4576-trl0latest "transformers==4.57.6" "trl>=0.18.2,<1.0.0" "peft>=0.18,<0.20"
-          lane tlatest5-trl1latest "transformers>=5,<6" "trl>=1,<2" "peft"
+          # Held below 5.24 until the patches are ported: 5.24.0 rewrote the sources they match.
+          lane tlatest5-trl1latest "transformers>=5,<5.24" "trl>=1,<2" "peft"
           lane pyproject __from_pyproject__ __from_pyproject__ __from_pyproject__
           wait
           echo "all three lanes finished"
