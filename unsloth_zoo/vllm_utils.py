@@ -1172,12 +1172,20 @@ pass
 
 def _cublas_workspaces_into(pool, device, use_mem_pool):
     with use_mem_pool(pool, device = device), torch.inference_mode(False):
-        a = torch.ones(16, 64, device = device, dtype = torch.bfloat16)
-        b = torch.ones(64, 32, device = device, dtype = torch.bfloat16)
-        bias = torch.zeros(32, device = device, dtype = torch.bfloat16)
+        a = torch.ones(16, 64, device = device, dtype = torch.float16)
+        b = torch.ones(64, 32, device = device, dtype = torch.float16)
+        bias = torch.zeros(32, device = device, dtype = torch.float16)
         torch.mm(a, b)
         torch.addmm(bias, a, b)
         del a, b, bias
+pass
+
+
+def _cublas_workspace_cached():
+    # torch >= 2.15 allocates cuBLAS(Lt) workspaces per call unless TORCH_CUBLAS_WORKSPACE_CACHE=1 (pytorch#194311):
+    # a captured call's workspace then lives in the graph's own pool, so there is nothing to hold.
+    if Version(torch_version.split("+")[0]) < Version("2.15.0"): return True
+    return os.environ.get("TORCH_CUBLAS_WORKSPACE_CACHE", "0").strip().lower() in ("1", "true", "yes", "on")
 pass
 
 
@@ -1200,7 +1208,7 @@ def _vllm_cublas_workspace_held(enabled = True):
     CUDAGraph = getattr(graphs, "CUDAGraph", None)
     original = getattr(CUDAGraph, "capture_begin", None)
     backend = getattr(torch.cuda, "get_allocator_backend", None)
-    if not enabled or not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None or \
+    if not enabled or not _cublas_workspace_cached() or not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None or \
             MemPool is None or use_mem_pool is None or clear is None or original is None or \
             getattr(original, "_unsloth_cublas_workspace", False) or \
             (backend is not None and backend() != "native"):
@@ -1208,7 +1216,8 @@ def _vllm_cublas_workspace_held(enabled = True):
         return
     device = torch.device("cuda", torch.cuda.current_device())
     try:
-        held = _VLLM_CUBLAS_WORKSPACES.setdefault(device.index, [MemPool(), []])
+        held = _VLLM_CUBLAS_WORKSPACES.get(device.index)
+        if held is None: held = _VLLM_CUBLAS_WORKSPACES[device.index] = [MemPool(), []]
     except Exception as error:
         if device.index not in _VLLM_CUBLAS_WORKSPACE_WARNED:
             _VLLM_CUBLAS_WORKSPACE_WARNED.add(device.index)
@@ -1216,8 +1225,6 @@ def _vllm_cublas_workspace_held(enabled = True):
         yield False
         return
     pool = held[0]
-    # Reuse is safe: all graphs replay serially on one stream.
-    held[1] = []
     seen = {}
     owner = threading.get_ident()
 
@@ -1227,6 +1234,9 @@ def _vllm_cublas_workspace_held(enabled = True):
         # Only this runner's captures: another thread or device keeps stock behaviour.
         if threading.get_ident() == owner and stream.device == device and stream.cuda_stream not in seen:
             try:
+                # An earlier capture's holds go back to the pool only once this one captures (a no-capture call keeps
+                # them); reuse is safe: all graphs replay serially on one stream.
+                if not seen: held[1] = []
                 clear()
                 _cublas_workspaces_into(pool, stream.device, use_mem_pool)
                 seen[stream.cuda_stream] = stream

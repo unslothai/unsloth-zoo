@@ -139,6 +139,7 @@ def _fake_cuda(monkeypatch):
     monkeypatch.setattr(torch.cuda, "ExternalStream", lambda ptr, device = None: _Stream(ptr), raising = False)
     monkeypatch.setattr(torch.cuda, "MemPool", _Pool, raising = False)
     monkeypatch.setattr(torch.cuda, "get_allocator_backend", lambda: "native", raising = False)
+    monkeypatch.setattr(vllm_utils, "torch_version", "2.14.1")
     monkeypatch.setattr(torch.cuda, "use_mem_pool", use_mem_pool, raising = False)
     monkeypatch.setattr(torch.cuda, "graphs", types.SimpleNamespace(CUDAGraph = CUDAGraph), raising = False)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: events.append("device_sync"))
@@ -181,11 +182,18 @@ def test_capture_stream_workspace_comes_from_a_pool_and_is_held(monkeypatch):
     assert [t.data_ptr() for t in held] == [20000, 20000 + mib, 20000 + 2 * mib, 1000, 5096]
     assert CUDAGraph.capture_begin is original
 
+    # A call that captures nothing keeps the holds.
+    with vllm_utils._vllm_cublas_workspace_held():
+        pass
+    assert vllm_utils._VLLM_CUBLAS_WORKSPACES[0][1] is held
+
     events.clear()
     with vllm_utils._vllm_cublas_workspace_held():
-        assert vllm_utils._VLLM_CUBLAS_WORKSPACES[0] == [pool, []]
+        assert vllm_utils._VLLM_CUBLAS_WORKSPACES[0][1] is held
         with on_stream(_Stream(200)):
             CUDAGraph().capture_begin()
+        # The next capture takes them back into the pool and re-holds after it.
+        assert vllm_utils._VLLM_CUBLAS_WORKSPACES[0] == [pool, []]
     assert events[:3] == ["clear", ("mm", pool, 200), ("addmm", pool, 200)]
 
 
@@ -221,6 +229,22 @@ def test_async_allocator_or_disabled_is_a_no_op(monkeypatch, why):
         monkeypatch.setattr(torch.cuda, "get_allocator_backend", lambda: "cudaMallocAsync", raising = False)
     with vllm_utils._vllm_cublas_workspace_held(why != "disabled") as ok:
         assert ok is False and CUDAGraph.capture_begin is original
+
+
+@pytest.mark.parametrize("version, env, cached", [
+    ("2.14.1+cu130", None, True), ("2.15.0+cu132", None, False), ("2.15.0", "1", True), ("2.16.0", "0", False),
+])
+def test_per_call_workspaces_need_no_hold(monkeypatch, version, env, cached):
+    # torch >= 2.15 allocates workspaces per call unless TORCH_CUBLAS_WORKSPACE_CACHE=1 (pytorch#194311).
+    monkeypatch.setattr(vllm_utils, "torch_version", version)
+    if env is None: monkeypatch.delenv("TORCH_CUBLAS_WORKSPACE_CACHE", raising = False)
+    else: monkeypatch.setenv("TORCH_CUBLAS_WORKSPACE_CACHE", env)
+    assert vllm_utils._cublas_workspace_cached() is cached
+    if not cached:
+        CUDAGraph, on_stream, events = _fake_cuda(monkeypatch)
+        monkeypatch.setattr(vllm_utils, "torch_version", version)
+        with vllm_utils._vllm_cublas_workspace_held() as ok:
+            assert ok is False
 
 
 def test_dual_batch_overlap_runner_is_not_held():
