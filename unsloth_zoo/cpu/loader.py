@@ -25,7 +25,10 @@ import warnings
 import torch
 
 from .runtime import available_ram, cpu_bf16_supported, cpu_bnb_4bit_supported
-from .ops import Bf16StoredLinear, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, store_frozen_linears_in_bf16
+from .ops import (
+    Bf16StoredLinear, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, set_bf16_stored_dtype,
+    store_frozen_linears_in_bf16,
+)
 
 _DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 # unsloth/Qwen3-0.6B-unsloth-bnb-4bit -> unsloth/Qwen3-0.6B
@@ -588,6 +591,9 @@ class FastCPUModel:
 
         if frozen_bf16:
             _print(f"{store_frozen_linears_in_bf16(model)} frozen Linear weights kept in bfloat16, computing in float32.")
+            # Generation upcasts them back to fp32 unless UNSLOTH_CPU_FROZEN_BF16=1 forced the storage: the per-call
+            # upcast costs decode speed (about 3x per projection at one token), training pays nothing for it.
+            model._unsloth_cpu_frozen_bf16 = "forced" if frozen_env in ("1", "true", "yes", "on") else "training"
         patch_causal_conv1d_fallback(model)
         # Also for a checkpoint that ships its own 4-bit quantization_config.
         _disable_bnb_cpu_weight_packing(model)
@@ -735,6 +741,7 @@ class FastCPUModel:
         if use_gradient_checkpointing in (True, "unsloth") and hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
         peft_model = get_peft_model(model, config)
+        _frozen_bf16_for(peft_model, training = True)  # after PEFT froze the base weights
         if max_seq_length is not None:
             peft_model.max_seq_length = max_seq_length
         FastCPUModel._attach(peft_model)
@@ -743,6 +750,7 @@ class FastCPUModel:
     @staticmethod
     def for_training(model, use_gradient_checkpointing = None):
         model.train()
+        _frozen_bf16_for(model, training = True)
         _set_inference_mode(model, False)
         # None keeps whatever from_pretrained / get_peft_model set up; an explicit value switches it.
         if use_gradient_checkpointing is not None and hasattr(model, "gradient_checkpointing_enable"):
@@ -757,6 +765,7 @@ class FastCPUModel:
     @staticmethod
     def for_inference(model):
         model.eval()
+        _frozen_bf16_for(model, training = False)
         _set_inference_mode(model, True)
         return model
 
@@ -837,6 +846,19 @@ def _set_inference_mode(model, inference):
             break
 
 
+def _frozen_bf16_for(model, training):
+    """Default frozen bf16 storage is for training only: generation upcasts the weights to fp32 (decode speed), and
+    training stores them in bf16 again (half their RAM). UNSLOTH_CPU_FROZEN_BF16=1 keeps bf16 throughout."""
+    inner, mode = model, None
+    for _ in range(4):
+        mode = mode or getattr(inner, "_unsloth_cpu_frozen_bf16", None)
+        inner = getattr(inner, "base_model", None) or getattr(inner, "model", None)
+        if inner is None:
+            break
+    if mode == "training" and isinstance(model, torch.nn.Module):
+        set_bf16_stored_dtype(model, torch.bfloat16 if training else torch.float32)
+
+
 def _unpack_encoding_generate(generate):
     """Notebooks pass `input_ids = tokenizer.apply_chat_template(..., return_tensors = "pt")`, which is a
     BatchEncoding on transformers 5; generate() then fails on `.shape`. The GPU path unpacks it, so do the same."""
@@ -846,6 +868,9 @@ def _unpack_encoding_generate(generate):
         if encoding is not None and not isinstance(encoding, torch.Tensor) and hasattr(encoding, "items"):
             for key, value in kwargs.pop("input_ids").items():
                 kwargs.setdefault(key, value)
+        if isinstance(self, torch.nn.Module) and not self.training:
+            # Inference-only loads and for_inference: fp32 frozen weights (a training-time callback keeps bf16).
+            _frozen_bf16_for(self, training = False)
         set_stance = getattr(torch.compiler, "set_stance", None)
         modules = self.modules() if isinstance(self, torch.nn.Module) else ()
         if set_stance is not None and any(getattr(m, "_compiled_call_impl", None) is not None for m in modules):

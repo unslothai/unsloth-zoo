@@ -228,3 +228,59 @@ def test_available_ram_honours_a_cgroup_v1_container_limit(monkeypatch, tmp_path
     monkeypatch.setattr("builtins.open", fake_open)
     assert runtime.available_ram() <= 7 * gib
 
+
+def _tiny_bf16_llama(mode):
+    from transformers import LlamaConfig, LlamaForCausalLM
+    from unsloth_zoo.cpu import loader
+    from unsloth_zoo.cpu.ops import store_frozen_linears_in_bf16
+    torch.manual_seed(0)
+    config = LlamaConfig(vocab_size = 64, hidden_size = 32, intermediate_size = 64, num_hidden_layers = 2,
+                         num_attention_heads = 4, num_key_value_heads = 2, max_position_embeddings = 64)
+    model = LlamaForCausalLM(config).bfloat16().eval()
+    reference = LlamaForCausalLM(config).eval()
+    reference.load_state_dict({k: v.float() for k, v in model.state_dict().items()})
+    assert store_frozen_linears_in_bf16(model) > 0
+    model._unsloth_cpu_frozen_bf16 = mode
+    loader.FastCPUModel._attach(model)
+    return model, reference
+
+
+def _stored_dtypes(model):
+    from unsloth_zoo.cpu.ops import Bf16StoredLinear
+    return {m.weight.dtype for m in model.modules() if isinstance(m, Bf16StoredLinear)}
+
+
+def test_default_frozen_bf16_is_for_training_only():
+    """Frozen bf16 storage upcasts every projection per call, which made decode ~26% slower on CPUs without native
+    bf16. The default is kept for training only: generate() / for_inference upcast the frozen weights to fp32 once
+    (outputs unchanged), for_training / get_peft_model store them in bf16 again, bit for bit."""
+    from unsloth_zoo.cpu import loader
+    model, reference = _tiny_bf16_llama("training")
+    original = {k: v.clone() for k, v in model.state_dict().items() if v.dtype == torch.bfloat16}
+    ids = torch.tensor([[1, 5, 9, 3]])
+    tokens = model.generate(input_ids = ids, max_new_tokens = 6, do_sample = False, pad_token_id = 0)
+    assert _stored_dtypes(model) == {torch.float32}  # an inference-only load generates in fp32
+    assert torch.equal(tokens, reference.generate(input_ids = ids, max_new_tokens = 6, do_sample = False, pad_token_id = 0))
+    for param in model.parameters():
+        param.requires_grad_(False)  # frozen, as under LoRA
+    loader.FastCPUModel.for_training(model)
+    assert _stored_dtypes(model) == {torch.bfloat16}
+    state = model.state_dict()
+    assert all(torch.equal(state[k], v) for k, v in original.items())  # the round trip is lossless
+    model.generate(input_ids = ids, max_new_tokens = 2, do_sample = False, pad_token_id = 0)
+    assert _stored_dtypes(model) == {torch.bfloat16}  # generating mid-training (train mode) keeps the RAM saving
+    loader.FastCPUModel.for_inference(model)
+    assert _stored_dtypes(model) == {torch.float32}
+
+
+def test_frozen_bf16_get_peft_model_restores_bf16_and_forced_storage_stays():
+    from unsloth_zoo.cpu import loader
+    model, _ = _tiny_bf16_llama("training")
+    loader.FastCPUModel.for_inference(model)
+    assert _stored_dtypes(model) == {torch.float32}
+    lora = loader.FastCPUModel.get_peft_model(model, r = 4, lora_alpha = 4, use_gradient_checkpointing = False)
+    assert _stored_dtypes(lora) == {torch.bfloat16}  # PEFT froze the base: stored compactly for training
+    forced, _ = _tiny_bf16_llama("forced")  # UNSLOTH_CPU_FROZEN_BF16=1 keeps bf16 for generation too
+    forced.generate(input_ids = torch.tensor([[1, 2]]), max_new_tokens = 2, do_sample = False, pad_token_id = 0)
+    loader.FastCPUModel.for_inference(forced)
+    assert _stored_dtypes(forced) == {torch.bfloat16}

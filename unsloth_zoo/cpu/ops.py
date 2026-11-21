@@ -466,6 +466,28 @@ def store_frozen_linears_in_bf16(model):
     return len(stored)
 
 
+def set_bf16_stored_dtype(model, dtype):
+    """Moves Bf16StoredLinear weights to fp32 (generation) or back to bf16 (training). Lossless both ways: they hold
+    bf16 checkpoint values. Only weights this upcast are stored again, and only while frozen, so a trained copy
+    (modules_to_save) is never rounded. Returns how many weights moved."""
+    moved = 0
+    for module in model.modules():
+        weight = getattr(module, "weight", None)
+        if not isinstance(module, Bf16StoredLinear) or weight is None or weight.dtype == dtype:
+            continue
+        if dtype == torch.bfloat16:
+            if not getattr(module, "_unsloth_upcast", False) or weight.requires_grad:
+                continue
+            module._unsloth_upcast = False
+        elif weight.dtype == torch.bfloat16:
+            module._unsloth_upcast = True
+        else:
+            continue
+        weight.data = weight.data.to(dtype)
+        moved += 1
+    return moved
+
+
 def cpu_causal_conv1d(hidden_states, weight, bias = None, activation = None, **kwargs):
     """Causal depthwise conv1d as K shifted multiply-adds: transformers' grouped F.conv1d fallback is slow without oneDNN."""
     x = hidden_states.to(weight.dtype)
