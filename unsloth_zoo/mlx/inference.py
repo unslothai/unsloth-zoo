@@ -7641,20 +7641,39 @@ _VERIFY_GDN_TREE_FOLD_SOURCE = (
         "    const uint PL = pending_length;\n", "").replace("row * PL + i / Dk", "pending_path[i / Dk]").replace(
         "row * PL + i / Dv", "pending_path[i / Dv]").replace("row * PL + tid", "pending_path[tid]"))
     .replace("        float forks[8][4];\n", _VERIFY_GDN_PENDING_STEPS[1:] + "        float forks[8][4];\n"))
+
+
 # Carry each query back through its ancestors; the entry-state product and the weighted path values give its output.
-_VERIFY_GDN_PATHSUM = """
+def _gdn_pathsum_source(source, pending = ""):
+    qkv = source.index("    threadgroup T qs[")
+    gates = source.index("    threadgroup float decay[")
+    scan = source.index("    for (uint dv = sg;")
+    norm = source.index("    for (uint t = sg; t < L; t += TY)")
+    prepare = source[gates:scan].replace("threadgroup T* x =", "threadgroup float* x =")
+    prepare = prepare.replace("vals[i] = x[lane * 4 + i];", "vals[i] = T(x[lane * 4 + i]);")
+    for array in ("qs", "ks"):
+        prepare = prepare.replace(f"= {array}[t * Dk + d];", f"= T({array}[t * Dk + d]);")
+    return source[:qkv] + """
+    static_assert(Dk == Dv, "path-sum uses the key buffer for value corrections");
+    threadgroup float qs[LMAX * Dk], ks[LMAX * Dk];
+    threadgroup T vs[LMAX * Dv];
+""" + prepare + """
+    threadgroup float* queries = qs;
+    threadgroup float* corrections = ks;
+    threadgroup T* ys = vs;
     {
-        const uint per = TY / L, t = sg % L, part = sg / L;
-        if (part < per) {
-            const uint A = path_shape[1];
+        const uint t = sg;
+        float w[4], u[4];
+        if (t < L) {
+            const auto ancestors = path + t * path_shape[1];
             const int d = depth[t];
-            float w[4], coefficient[LMAX], u[4];
+            float coefficient[LMAX];
             for (int i = 0; i < 4; ++i) {
                 w[i] = static_cast<float>(qs[t * Dk + lane * 4 + i]);
                 u[i] = 0.0f;
             }
             for (int j = d; j >= 0; --j) {
-                const uint p = path[t * A + j];
+                const uint p = d == int(t) ? j : ancestors[j];
                 float kw = 0.0f;
                 for (int i = 0; i < 4; ++i) {
                     kw += static_cast<float>(ks[p * Dk + lane * 4 + i]) * w[i];
@@ -7666,37 +7685,54 @@ _VERIFY_GDN_PATHSUM = """
                 }
             }
             for (int j = 0; j <= d; ++j) {
-                const uint p = path[t * A + j];
+                const uint p = d == int(t) ? j : ancestors[j];
                 for (int i = 0; i < 4; ++i) {
                     u[i] += coefficient[j] * static_cast<float>(vs[p * Dv + lane * 4 + i]);
                 }
             }
-            for (uint dv = part; dv < Dv; dv += per) {
-                auto s = entry + (n * Dv + dv) * Dk + lane * 4;
+        }
+        // All Q/K/V reads finish before their storage is reused for FP32 path sums.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (t < L) {
+            for (int i = 0; i < 4; ++i) {
+                queries[t * Dk + lane * 4 + i] = w[i];
+                corrections[t * Dv + lane * 4 + i] = u[i];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    constexpr uint TILE = 4;
+    for (uint base = sg * TILE; base < Dv; base += TY * TILE) {
+        float states[TILE][4];
+        for (uint v = 0; v < TILE; ++v) {
+            uint dv = base + v;
+            auto state = states[v];
+            for (int i = 0; i < 4; ++i) {
+                state[i] = state_in[(n * Dv + dv) * Dk + lane * 4 + i];
+            }
+""" + pending + """
+        }
+        for (uint t = 0; t < L; ++t) {
+            for (uint v = 0; v < TILE; ++v) {
                 float out = 0.0f;
                 for (int i = 0; i < 4; ++i) {
-                    out += static_cast<float>(s[i]) * w[i];
+                    out += states[v][i] * queries[t * Dk + lane * 4 + i];
                 }
                 out = simd_sum(out);
-                if (lane == dv / 4) {
-                    ys[t * Dv + dv] = static_cast<T>(out + u[dv % 4]);
+                if (lane == 0) {
+                    ys[t * Dv + base + v] = static_cast<T>(out + corrections[t * Dv + base + v]);
                 }
             }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-"""
+""" + source[norm:]
 
 
-def _gdn_pathsum_source(source, scan_start, entry):
-    norm = source.index("    for (uint t = sg; t < L; t += TY)")
-    return source[:source.index(scan_start)] + entry + _VERIFY_GDN_PATHSUM + source[norm:]
-
-
-_VERIFY_GDN_PATHSUM_SOURCE = _gdn_pathsum_source(_VERIFY_GDN_TREE_SOURCE, "    for (uint dv = sg;", "    auto entry = state_in;\n")
-_VERIFY_GDN_PATHSUM_FOLD_SOURCE = _gdn_pathsum_source(_VERIFY_GDN_TREE_FOLD_SOURCE, _VERIFY_GDN_PENDING_STEPS[1:],
-    _VERIFY_GDN_PENDING_STEPS + "    }\n    threadgroup_barrier(mem_flags::mem_device);\n    auto entry = advanced;\n")
+_VERIFY_GDN_PATHSUM_SOURCE = _gdn_pathsum_source(_VERIFY_GDN_TREE_SOURCE)
+_VERIFY_GDN_PATHSUM_FOLD_SOURCE = _gdn_pathsum_source(_VERIFY_GDN_TREE_FOLD_SOURCE, _VERIFY_GDN_PENDING_STEPS)
 _VERIFY_GDN_ROWS = 16  # simdgroups per value head: 8 and 32, or two state rows in flight each, measured no faster
 # Block rows the threadgroup holds; the row count is an input, so every verify width shares one pipeline build.
 _VERIFY_GDN_MAX_ROWS = 16

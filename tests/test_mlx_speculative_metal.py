@@ -1688,6 +1688,30 @@ def test_pathsum_admission_requires_both_variant_probes(monkeypatch):
         assert I._pathsum_verify_supported(language) == (not extra)
 
 
+def test_pathsum_tree_matches_query_per_group(monkeypatch):
+    from functools import partial
+    from unsloth_zoo.mlx import inference as I
+    build, source = I._verify_gdn_tree_kernel.__wrapped__, I._VERIFY_GDN_PATHSUM_SOURCE
+    scan = source[:source.index("    constexpr uint TILE =")] + """for (uint t = 0; t < L; ++t) for (uint dv = sg; dv < Dv; dv += TY) {
+        float out = 0.0f;
+        for (int i = 0; i < 4; ++i) out += state_in[(n * Dv + dv) * Dk + lane * 4 + i] * queries[t * Dk + lane * 4 + i];
+        out = simd_sum(out);
+        if (lane == 0) ys[t * Dv + dv] = static_cast<T>(out + corrections[t * Dv + dv]);
+    } threadgroup_barrier(mem_flags::mem_threadgroup);"""
+    with monkeypatch.context() as patch:
+        patch.setattr(I, "_VERIFY_GDN_PATHSUM_SOURCE", scan + source[source.index("    for (uint t = sg; t < L; t += TY)"):])
+        reference = build(False, True)
+    def compare(actual, fold, **launch):
+        got = actual(**launch)
+        if fold:
+            launch["inputs"] = [*launch["inputs"][:12], got[-1], *launch["inputs"][13:16]]
+            launch["output_shapes"], launch["output_dtypes"] = launch["output_shapes"][:-1], launch["output_dtypes"][:-1]
+        assert all(_bits(x, y) for x, y in zip(got[:-1] if fold else got, reference(**launch), strict = True))
+        return got
+    monkeypatch.setattr(I, "_verify_gdn_tree_kernel", lambda fold = False, pathsum = False: partial(compare, build(fold, True), fold) if pathsum else build(fold))
+    I.probe_gdn_pathsum()
+
+
 @pytest.fixture
 def pathsum_engine(monkeypatch):
     import mlx.nn as nn
