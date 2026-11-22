@@ -1080,7 +1080,7 @@ def _adapter_base_model(model_name, token, revision, **hub_kwargs):
         return None
     # A Hub adapter names its base itself: on Windows a UNC base would make the load probe a host the repo chose (SMB, NTLM).
     if not os.path.isdir(model_name):
-        from ..vision_utils import _is_network_share
+        from unsloth_zoo.vision_utils import _is_network_share
         if _is_network_share(str(base[0])):
             raise ValueError(
                 f"Unsloth: The adapter {model_name} names a base model on a network share ({base[0]!r}). "
