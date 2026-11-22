@@ -22,6 +22,7 @@ import sys
 import pytest
 import torch
 from _torch_config_patch import patch_torch_config
+from _cpu_compiler_skip import skip_without_cpu_inductor
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -88,6 +89,8 @@ def _loss(out):
 
 
 def _sweep(fn, params, backend, dynamic, seqs = SEQS, x_grad = True):
+    if backend == "inductor":
+        skip_without_cpu_inductor()  # CPU tensors compile through C++ Inductor
     from torch._dynamo.utils import counters
     torch._dynamo.reset()
     counters.clear()
@@ -175,6 +178,8 @@ def test_with_unsloth_checkpoint_shim(backend, shim, monkeypatch):
 
 @pytest.mark.parametrize("backend", ["eager", "aot_eager", "inductor"])
 def test_compiled_tiles_recompute(backend):
+    if backend == "inductor":
+        skip_without_cpu_inductor()  # CPU tensors compile through C++ Inductor
     torch.manual_seed(0)
     m = lora_mlp(inter = 512)
     x = torch.randn(1, 8192, H)
@@ -229,6 +234,7 @@ def _expert(x, w):
 def test_inner_compiled_function_recompute_uses_the_same_graph(n_tiles):
     torch._dynamo.reset()
     torch.manual_seed(0)
+    skip_without_cpu_inductor()  # CPU tensors compile through C++ Inductor
     m = _CompiledExpertMoE(torch.compile(_expert, backend = "inductor"))
     ref = copy.deepcopy(m)
     ref.expert_fn = _expert
@@ -299,6 +305,7 @@ def test_user_compile_keeps_the_unrolled_fullgraph(monkeypatch):
 
 
 def test_compiled_tile_body_is_one_graph_for_every_tile_and_layer(monkeypatch):
+    skip_without_cpu_inductor()  # UNSLOTH_TILED_COMPILE=compile_tile compiles the tile body through C++ Inductor
     from torch._dynamo.utils import counters
     from unsloth_zoo import sequence_tiling as ST
 
