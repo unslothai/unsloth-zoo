@@ -154,9 +154,25 @@ def _probe_cache_key():
             ).stdout.strip()
         except Exception:
             pass
+    # The child inherits the environment, and oneDNN / ATen read these to pick (or cap) the bf16 kernels:
+    # ONEDNN_MAX_CPU_ISA=AVX2 on an AMX CPU turns a 0.4x bf16 matmul into an 85x one.
+    dispatch_env = sorted(
+        (name, value) for name, value in os.environ.items()
+        if name.startswith(("ONEDNN_", "DNNL_", "TORCH_MKLDNN_")) or name == "ATEN_CPU_CAPABILITY"
+    )
+    # Same version string, different build (a reinstall, conda vs pip variants): torch rewrites version.py on install.
+    torch_stamp = None
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("torch")
+        if spec is not None and spec.origin:
+            version_file = os.path.join(os.path.dirname(spec.origin), "version.py")
+            torch_stamp = [spec.origin, os.path.getmtime(version_file), os.path.getsize(version_file)]
+    except Exception:
+        pass
     identity = [
         sys.executable, list(sys.version_info[:3]), torch_version, system, platform.machine(),
-        platform.node(), cpu, _BF16_PROBE_CODE,
+        platform.node(), cpu, _BF16_PROBE_CODE, dispatch_env, torch_stamp,
     ]
     return hashlib.sha256(json.dumps(identity).encode("utf-8")).hexdigest()
 

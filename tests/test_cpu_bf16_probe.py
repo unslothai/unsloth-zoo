@@ -235,6 +235,20 @@ def test_changed_cpu_reprobes(runtime, monkeypatch):
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize("name, value", [("ONEDNN_MAX_CPU_ISA", "AVX2"), ("DNNL_MAX_CPU_ISA", "AVX2"), ("ATEN_CPU_CAPABILITY", "default")])
+def test_changed_kernel_dispatch_env_reprobes(runtime, monkeypatch, name, value):
+    """The child inherits these and oneDNN / ATen pick the bf16 kernels from them (ONEDNN_MAX_CPU_ISA=AVX2 on an AMX
+    CPU measures 85x slower bf16), so a verdict cached without them must not answer a process that sets them."""
+    monkeypatch.delenv(name, raising = False)
+    calls = _spoof(monkeypatch, (0, FAST))
+    assert runtime.cpu_bf16_supported() is True
+    monkeypatch.setenv(name, value)
+    calls_slow = _spoof(monkeypatch, (0, SLOW))
+    _new_process(runtime)
+    assert runtime.cpu_bf16_supported() is False
+    assert len(calls) == 1 and len(calls_slow) == 1
+
+
 @pytest.mark.parametrize("override, expected", [("0", False), ("1", True)])
 def test_override_wins_over_cached_verdict(runtime, monkeypatch, override, expected):
     calls = _spoof(monkeypatch, (0, SLOW if expected else FAST))
