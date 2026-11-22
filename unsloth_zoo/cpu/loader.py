@@ -1160,6 +1160,301 @@ def _merged_copy(model, save_method):
     return merged, False
 
 
+def _stream_merge_source(model):
+    """The transformers model whose live weights a streamed merge reads, or None when the merge needs the full copy.
+    Allowlist: plain LoRA on Linear layers (no DoRA, lora_bias, already merged adapters), no other PEFT tuner
+    (IA3, trainable token adapters, modules_to_save, ...), no 4-bit, no remote code (save_pretrained also copies its
+    modeling files)."""
+    try:
+        from peft import PeftModel
+        from peft.tuners.lora import LoraLayer
+        from peft.tuners.lora.layer import Linear as LoraLinear
+        from peft.tuners.tuners_utils import BaseTunerLayer
+    except Exception:
+        return None
+    if os.environ.get("UNSLOTH_CPU_STREAM_MERGE", "1") == "0":
+        return None
+    if isinstance(model, PeftModel):
+        configs = getattr(model, "peft_config", None) or {}
+        if any(str(getattr(config, "peft_type", "")).rsplit(".", 1)[-1] != "LORA" for config in configs.values()):
+            return None
+    hf = model.get_base_model() if isinstance(model, PeftModel) else model
+    if not hasattr(hf, "save_pretrained") or getattr(hf, "_auto_class", None) is not None:
+        return None
+    if getattr(getattr(hf, "config", None), "quantization_config", None) is not None:
+        return None
+    if getattr(hf, "_checkpoint_conversion_mapping", None):
+        return None  # transformers 4.x VLMs: save_pretrained renames keys back to the checkpoint layout
+    for module in hf.modules():
+        name = type(module).__name__
+        if name in ("ModulesToSaveWrapper", "TrainableTokensWrapper", "Linear4bit", "Linear8bitLt") or \
+            "AuxiliaryTrainingWrapper" in (cls.__name__ for cls in type(module).__mro__):
+            return None
+        if isinstance(module, BaseTunerLayer) and not isinstance(module, LoraLayer):
+            return None  # IA3, trainable token adapters, other tuners: only merge_and_unload knows their merge
+        if isinstance(module, LoraLayer):
+            if type(module) is not LoraLinear or getattr(module, "merged_adapters", None):
+                return None
+            if any(getattr(module, "lora_bias", {}).get(name, False) for name in module.active_adapters):
+                return None
+            if any(getattr(module, "use_dora", {}).get(name, False) for name in module.active_adapters):
+                return None
+    return hf
+
+
+def _save_keeps_live_layout(hf, entries):
+    """True when save_pretrained would write the live names / shapes. transformers 5 reverts its checkpoint conversions
+    on save (e.g. Qwen3MoE fused experts back to per-expert weights): dry-run that revert on meta tensors and stream
+    only when it changes nothing."""
+    try:
+        from transformers.core_model_loading import revert_weight_conversion
+    except Exception:
+        return True  # transformers 4.x: no save-time conversion beyond _checkpoint_conversion_mapping (checked above)
+    meta = {out: torch.empty(shape, dtype = dtype, device = "meta") for out, _, dtype, _, shape in entries}
+    try:
+        reverted = revert_weight_conversion(hf, dict(meta))
+    except Exception:
+        return False
+    return set(reverted) == set(meta) and all(tuple(reverted[k].shape) == tuple(meta[k].shape) for k in meta)
+
+
+def _merged_weight(module, to_float):
+    """PEFT's own merge on a scratch copy of the base weight: bit-identical to merge_and_unload, live model unchanged."""
+    base = module.get_base_layer()
+    live = base.weight.data
+    scratch = live.float() if to_float else live.clone()
+    base.weight.data = scratch
+    try:
+        module.merge()
+    finally:
+        base.weight.data = live
+        module.merged_adapters.clear()
+    return scratch
+
+
+def _shard_bytes(size):
+    """save_pretrained's max_shard_size: an int (bytes) or "5GB" / "500MB" / "2GiB" (decimal units, *iB binary)."""
+    if isinstance(size, int):
+        return size
+    match = re.fullmatch(r"\s*([0-9.]+)\s*([KMGT]?)(I?)B?\s*", str(size).upper())
+    if not match:
+        raise ValueError(f"Unsloth (CPU): max_shard_size = {size!r} is not a size like '5GB'.")
+    value, unit, binary = match.groups()
+    base = 1024 if binary else 1000
+    return int(float(value) * base ** "_KMGT".index(unit or "_"))
+
+
+_SAFETENSORS_DTYPES = {
+    torch.float64: "F64", torch.float32: "F32", torch.float16: "F16", torch.bfloat16: "BF16", torch.int64: "I64",
+    torch.int32: "I32", torch.int16: "I16", torch.int8: "I8", torch.uint8: "U8", torch.bool: "BOOL",
+}
+
+
+def _safetensors_dtype_rank():
+    """safetensors' save_file lays tensors out by dtype (its own order, widest first) then name: read that order from
+    the installed safetensors so the streamed file is byte-identical to save_file's."""
+    import json
+    import struct
+    try:
+        from safetensors.torch import save
+        blob = save({str(i): torch.zeros(1, dtype = dtype) for i, dtype in enumerate(_SAFETENSORS_DTYPES)})
+        order = list(json.loads(blob[8:8 + struct.unpack("<Q", blob[:8])[0]]))
+        dtypes = list(_SAFETENSORS_DTYPES)
+        return {dtypes[int(k)]: rank for rank, k in enumerate(k for k in order if k != "__metadata__")}
+    except Exception:
+        return {dtype: rank for rank, dtype in enumerate((torch.int64, torch.float64, torch.float32, torch.int32,
+            torch.bfloat16, torch.float16, torch.int16, torch.int8, torch.uint8, torch.bool))}
+
+
+def _write_safetensors(path, entries, rank = None):
+    """A safetensors file written one tensor at a time: the header comes from shapes / dtypes, then each tensor is
+    made, written and dropped, so at most one merged tensor is alive (safetensors' save_file holds the whole file as
+    bytes). Same layout as save_file (metadata first, dtype then name order). Returns the payload size in bytes."""
+    import json
+    import struct
+    rank = rank or _safetensors_dtype_rank()
+    entries = sorted(entries, key = lambda entry: (rank.get(entry[2], len(rank)), entry[0]))
+    header, offset = {"__metadata__": {"format": "pt"}}, 0
+    for out, _, dtype, numel, shape in entries:
+        if dtype not in _SAFETENSORS_DTYPES:
+            raise TypeError(f"Unsloth (CPU): no safetensors dtype for {dtype}")
+        nbytes = numel * torch.empty((), dtype = dtype).element_size()
+        header[out] = {"dtype": _SAFETENSORS_DTYPES[dtype], "shape": list(shape), "data_offsets": [offset, offset + nbytes]}
+        offset += nbytes
+    encoded = json.dumps(header, separators = (",", ":")).encode("utf-8")
+    encoded += b" " * (-len(encoded) % 8)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(encoded)))
+        f.write(encoded)
+        for out, make, dtype, numel, shape in entries:
+            value = make().to(dtype).contiguous()
+            if tuple(value.shape) != shape:
+                raise RuntimeError(f"Unsloth (CPU): merged {out} has shape {tuple(value.shape)}, expected {shape}")
+            if value.numel():
+                f.write(memoryview(value.view(-1).view(torch.uint8).numpy()))
+            del value
+    return offset
+
+
+def _default_shard_size(hf):
+    """save_pretrained's own default (5GB on transformers 4.x, 50GB on 5.x)."""
+    import inspect
+    try:
+        default = inspect.signature(type(hf).save_pretrained).parameters["max_shard_size"].default
+        return default if isinstance(default, (int, str)) else "5GB"
+    except Exception:
+        return "5GB"
+
+
+def _split_shards(entries, limit):
+    """Shard grouping and names from huggingface_hub's splitter (what save_pretrained uses), on meta tensors."""
+    try:
+        from huggingface_hub import split_torch_state_dict_into_shards
+        meta = {entry[0]: torch.empty(entry[4], dtype = entry[2], device = "meta") for entry in entries}
+        split = split_torch_state_dict_into_shards(meta, filename_pattern = "model{suffix}.safetensors",
+                                                   max_shard_size = limit)
+        by_name = {entry[0]: entry for entry in entries}
+        return [(name, [by_name[k] for k in keys]) for name, keys in split.filename_to_tensors.items()], split.metadata
+    except Exception:
+        pass
+    shards, current, size = [], [], 0
+    for entry in entries:
+        nbytes = entry[3] * torch.empty((), dtype = entry[2]).element_size()
+        if current and size + nbytes > limit:
+            shards.append(current)
+            current, size = [], 0
+        current.append(entry)
+        size += nbytes
+    if current:
+        shards.append(current)
+    names = ["model.safetensors"] if len(shards) == 1 else \
+        [f"model-{i + 1:05d}-of-{len(shards):05d}.safetensors" for i in range(len(shards))]
+    total = sum(e[3] * torch.empty((), dtype = e[2]).element_size() for e in entries)
+    return list(zip(names, shards)), {"total_size": total}
+
+
+_STALE_SHARD = re.compile(r"model-\d{5}-of-\d{5}\.safetensors")
+
+
+def _remove_stale_weights(save_directory, names):
+    """Re-exporting into the same folder: drop an earlier export's weights that are not part of this one, as
+    save_pretrained does, so a different shard count leaves no obsolete shards (or a single file / index that
+    transformers would load instead). Only model.safetensors, model-NNNNN-of-NNNNN.safetensors and the index; other
+    files (adapters, tokenizer, other names) are never touched. Rank 0 only."""
+    if os.environ.get("RANK", "0").strip() not in ("", "0"):
+        return
+    keep = set(names)
+    if len(names) > 1:
+        keep.add("model.safetensors.index.json")
+    for filename in os.listdir(save_directory):
+        if filename in keep:
+            continue
+        if filename in ("model.safetensors", "model.safetensors.index.json") or _STALE_SHARD.fullmatch(filename):
+            path = os.path.join(save_directory, filename)
+            if os.path.isfile(path):
+                os.remove(path)
+
+
+def _stream_merged_save(model, save_directory, save_method, max_shard_size = None):
+    """Writes the merged checkpoint shard by shard from the live model (peak RSS about the model plus one shard,
+    instead of a full deepcopy). Same tensors, names, dtypes and config as merge_and_unload().save_pretrained().
+    Returns False when the model needs the copying path."""
+    hf = _stream_merge_source(model)
+    if hf is None:
+        return False
+    import copy
+    import json
+    from peft.tuners.lora import LoraLayer
+
+    lora = {name: module for name, module in hf.named_modules() if isinstance(module, LoraLayer)}
+    bf16_stored = {name.replace(".base_layer", "") for name, module in hf.named_modules() if isinstance(module, Bf16StoredLinear)}
+    model_dtype = hf.dtype
+    target = (torch.bfloat16 if cpu_bf16_supported() else torch.float16) \
+        if save_method == "merged_16bit" and model_dtype == torch.float32 else None
+    # bf16-stored frozen weights are upcast to fp32 first, as the copying path does (unrounded merge / GGUF staging).
+    shared = {}
+    for name, module in hf.named_parameters(remove_duplicate = False):
+        shared.setdefault(module.untyped_storage().data_ptr(), []).append(name)
+    for name, module in lora.items():
+        weight = module.get_base_layer().weight
+        if len(shared.get(weight.untyped_storage().data_ptr(), ())) > 1:
+            return False  # a LoRA on a tied weight: merge_and_unload edits the shared tensor, keep its semantics
+
+    entries, seen = [], set()
+    for key, tensor in hf.state_dict(keep_vars = True).items():
+        if ".lora_" in key:
+            continue
+        out = key.replace(".base_layer.", ".")
+        storage = (tensor.untyped_storage().data_ptr(), tensor.storage_offset(), tuple(tensor.shape))
+        if storage in seen:
+            continue  # tied (lm_head = embed_tokens): save_pretrained keeps the first name only
+        seen.add(storage)
+        owner = out.rsplit(".", 1)[0]
+        stored = owner in bf16_stored and out.endswith(".weight") and tensor.dtype == torch.bfloat16
+        if owner in lora and key.endswith(".base_layer.weight"):
+            make = functools.partial(_merged_weight, lora[owner], stored)
+            dtype = torch.float32 if stored else tensor.dtype
+        elif stored:
+            make, dtype = (lambda t = tensor: t.detach().float()), torch.float32
+        else:
+            make, dtype = (lambda t = tensor: t.detach()), tensor.dtype
+        if target is not None and dtype.is_floating_point:
+            dtype = target
+        entries.append((out, make, dtype, tensor.numel(), tuple(tensor.shape)))
+    if not _save_keeps_live_layout(hf, entries):
+        return False
+
+    limit = _shard_bytes(max_shard_size or _default_shard_size(hf))
+    shards, split_metadata = _split_shards(entries, limit)
+    names = [name for name, _ in shards]
+    os.makedirs(save_directory, exist_ok = True)
+    # Each file is written under a temporary name and moved into place only after every shard is complete: the live
+    # weights may be memory-mapped from the files being replaced (a model loaded from save_directory), and an
+    # interrupted export must not leave a half-written model.safetensors that loaders would pick.
+    rank, staged = _safetensors_dtype_rank(), []
+    try:
+        with torch.no_grad():
+            for name, shard in shards:
+                temporary = os.path.join(save_directory, f".{name}.unsloth-tmp")
+                staged.append((temporary, os.path.join(save_directory, name)))
+                _write_safetensors(temporary, shard, rank)
+        if len(shards) > 1:
+            total_parameters = sum(p.numel() for n, p in hf.named_parameters() if ".lora_" not in n)
+            index = {"metadata": {"total_parameters": total_parameters, **split_metadata},
+                     "weight_map": {entry[0]: name for name, shard in shards for entry in shard}}
+            temporary = os.path.join(save_directory, ".model.safetensors.index.json.unsloth-tmp")
+            staged.append((temporary, os.path.join(save_directory, "model.safetensors.index.json")))
+            with open(temporary, "w", encoding = "utf-8") as f:
+                f.write(json.dumps(index, indent = 2, sort_keys = True) + "\n")
+        for temporary, final in staged:
+            os.replace(temporary, final)
+    finally:
+        for temporary, _ in staged:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+    _remove_stale_weights(save_directory, names)
+    config = copy.deepcopy(hf.config)
+    # save_pretrained records the first floating parameter's dtype under the field this transformers reads.
+    setattr(config, _DTYPE_KWARG, str(target or model_dtype).split(".")[1])
+    config.architectures = [type(hf).__name__]
+    config.save_pretrained(save_directory)
+    generation = getattr(hf, "generation_config", None)
+    if generation is not None and getattr(hf, "can_generate", lambda: False)():
+        generation.save_pretrained(save_directory)
+    return True
+
+
+def _save_merged(model, save_directory, save_method, **kwargs):
+    """Streamed merge when the model allows it, else the full merged copy."""
+    if kwargs.get("safe_serialization", True) and _stream_merged_save(
+        model, save_directory, save_method, kwargs.get("max_shard_size"),
+    ):
+        return
+    merged, _ = _merged_copy(model, save_method)
+    merged.save_pretrained(save_directory, **{k: v for k, v in kwargs.items() if k in ("safe_serialization", "max_shard_size")})
+    del merged
+
+
 def _check_save_method(save_method):
     if save_method not in ("lora", "merged_16bit"):
         raise NotImplementedError(f"Unsloth (CPU): save_method = {save_method!r} is not supported on CPU.")
@@ -1168,10 +1463,12 @@ def _check_save_method(save_method):
 def save_pretrained_merged(self, save_directory, tokenizer = None, save_method = "merged_16bit", **kwargs):
     """CPU save_pretrained_merged: "lora" (adapters) or "merged_16bit"."""
     _check_save_method(save_method)
-    model, _ = _merged_copy(self, save_method)
     for key in ("maximum_memory_usage", "temporary_location", "max_shard_size_gb"):
         kwargs.pop(key, None)
-    model.save_pretrained(save_directory, **{k: v for k, v in kwargs.items() if k in ("safe_serialization", "max_shard_size")})
+    if save_method == "lora":
+        self.save_pretrained(save_directory, **{k: v for k, v in kwargs.items() if k in ("safe_serialization", "max_shard_size")})
+    else:
+        _save_merged(self, save_directory, save_method, **kwargs)
     if tokenizer is not None:
         tokenizer.save_pretrained(save_directory)
     return save_directory
@@ -1234,8 +1531,7 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
     # Stage merged weights unrounded: the converter casts once per requested type instead of rounding through fp16/bf16
     # first; fp16 without native bf16 would also clip bf16's range.
     unrounded = [m for m in methods if m in ("f32", "f16")]
-    staged, _ = _merged_copy(self, "merged_32bit")
-    staged.save_pretrained(merged_directory)
+    _save_merged(self, merged_directory, "merged_32bit")
     if tokenizer is not None:
         tokenizer.save_pretrained(merged_directory)
     quantizer, converter = install_llama_cpp(print_output = False)
