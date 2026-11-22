@@ -272,7 +272,7 @@ def test_backward_only_compile_error_falls_back_to_eager(monkeypatch, capsys):
     monkeypatch.setattr(compile_fx, "_compile_fx_inner", backward_fails)
     # Importing unsloth's GPU model utilities (as other tests in this process may) sets suppress_errors = True, and
     # Dynamo then swallows the injected failure before the fallback sees it; a CPU-only Unsloth process leaves it False.
-    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False)
+    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False, raising = False)  # gone from newer torch
     from peft import LoraConfig, get_peft_model
     torch._dynamo.reset()
     torch.manual_seed(0)
@@ -297,7 +297,7 @@ def test_compile_error_on_a_later_layer_keeps_checkpoint_recompute_compiled(monk
     from unsloth_zoo.cpu import loader
     if loader._cpu_compile_unavailable() is not None:
         pytest.skip("no C++ toolchain for Inductor here")
-    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False)
+    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False, raising = False)  # gone from newer torch
     BackendCompilerFailed = type("BackendCompilerFailed", (RuntimeError,), {"__module__": "torch._dynamo.exc"})
     real_compile = torch.nn.Module.compile
     ids = torch.randint(3, 1000, (2, 17), generator = torch.Generator().manual_seed(0))
@@ -341,7 +341,7 @@ def test_compile_error_after_a_graph_break_restarts_the_checkpoint_eagerly(monke
     from functools import partial
     from transformers.modeling_layers import GradientCheckpointingLayer
     from unsloth_zoo.cpu import loader
-    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False)
+    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False, raising = False)  # gone from newer torch
 
     class Block(GradientCheckpointingLayer):
         def __init__(self):
@@ -396,7 +396,7 @@ def test_cached_forward_never_appends_twice_after_a_compile_failure(monkeypatch,
     run eagerly, so each layer's cache grows by exactly the tokens of the forward."""
     from transformers.modeling_layers import GradientCheckpointingLayer
     from unsloth_zoo.cpu import loader
-    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False)
+    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False, raising = False)  # gone from newer torch
 
     class Block(GradientCheckpointingLayer):
         def __init__(self, index):
@@ -449,7 +449,7 @@ def test_two_outstanding_checkpoints_of_one_layer_replay_in_their_own_mode(monke
     from functools import partial
     from transformers.modeling_layers import GradientCheckpointingLayer
     from unsloth_zoo.cpu import loader
-    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False)
+    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False, raising = False)  # gone from newer torch
 
     class Block(GradientCheckpointingLayer):
         def __init__(self):
