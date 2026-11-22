@@ -14,13 +14,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The compile cache's temp fallback must not reuse a folder another user made.
-
-`<tmp>/unsloth_compiled_cache` has a fixed name in a shared directory. Another
-account can create it (or a link to a folder it owns) before us, and the cache
-then serves Python it can rewrite. A folder owned by someone else is simulated by
-patching `os.geteuid`; creating a really foreign folder would need root.
-"""
+"""Compile cache temp fallback must not reuse a folder another user made:
+<tmp>/unsloth_compiled_cache has a fixed name, so another account could pre-create it and serve
+rewritable Python; foreign ownership is faked by patching os.geteuid, since a real one needs
+root."""
 import os
 import stat
 import sys

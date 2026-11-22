@@ -537,8 +537,7 @@ def test_auto_declines_everything_without_headroom(monkeypatch, auto):
 
 
 def test_auto_peak_reading_charges_kept_bytes_exactly(monkeypatch, auto):
-    """A peak reached while outputs are kept must not be learnt as the run's own peak (that would
-    shrink the budget every step until nothing is kept)."""
+    """Kept-output peaks must not be learnt as the run's peak: the budget shrinks each step."""
     params, x = _make()
     _fake_memory(monkeypatch, base_peak = 1 << 20, capacity = 1 << 30)
     _run(params, x, ckpt = True, steps = 4)

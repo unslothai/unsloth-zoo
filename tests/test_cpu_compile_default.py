@@ -291,9 +291,8 @@ def test_backward_only_compile_error_falls_back_to_eager(monkeypatch, capsys):
 
 
 def test_compile_error_on_a_later_layer_keeps_checkpoint_recompute_compiled(monkeypatch, capsys):
-    """Non-reentrant checkpointing: layer 0's compiled forward already ran when the last layer fails to compile.
-    Recomputing layer 0 eagerly in backward saves different tensors (CheckpointError); it replays compiled once,
-    then every layer is eager. Grads equal an all-eager run."""
+    """Non-reentrant checkpoint: when the last layer fails to compile, layer 0 recomputes compiled,
+    since eager saves different tensors (CheckpointError); grads equal an all-eager run."""
     from unsloth_zoo.cpu import loader
     if loader._cpu_compile_unavailable() is not None:
         pytest.skip("no C++ toolchain for Inductor here")
@@ -391,9 +390,8 @@ def test_compile_error_after_a_graph_break_restarts_the_checkpoint_eagerly(monke
 
 
 def test_cached_forward_never_appends_twice_after_a_compile_failure(monkeypatch, capsys):
-    """Cached inference through compiled layers: a segment that updates the KV cache, a graph break, then a segment
-    that fails to compile. A retry of the layer call would append the same tokens to the cache again; cached calls
-    run eagerly, so each layer's cache grows by exactly the tokens of the forward."""
+    """Cached inference through compiled layers: a KV-cache update, then a graph break, then a
+    compile failure; a retry would append the same tokens twice, so cached calls run eagerly."""
     from transformers.modeling_layers import GradientCheckpointingLayer
     from unsloth_zoo.cpu import loader
     monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False, raising = False)  # gone from newer torch
@@ -443,9 +441,8 @@ def test_cached_forward_never_appends_twice_after_a_compile_failure(monkeypatch,
 
 @pytest.mark.parametrize("reentrant", [False, True])
 def test_two_outstanding_checkpoints_of_one_layer_replay_in_their_own_mode(monkeypatch, capsys, reentrant):
-    """Two checkpointed forwards through the same layer before one backward, the second shape failing to compile:
-    the first (compiled) checkpoint recomputes compiled, the second (retried eagerly) recomputes eagerly instead of
-    retrying the failed compile in backward."""
+    """Two outstanding checkpoints of one layer, the second shape failing to compile: each
+    recomputes in its own mode, so the eager one never retries the compile in backward."""
     from functools import partial
     from transformers.modeling_layers import GradientCheckpointingLayer
     from unsloth_zoo.cpu import loader

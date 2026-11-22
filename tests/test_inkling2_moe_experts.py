@@ -117,9 +117,8 @@ def _dense_nf4(p):
 @pytest.mark.parametrize("T", [1, 4])
 @pytest.mark.parametrize("use_lora", [False, True])
 def test_nf4_decode_routes_only_the_routed_experts(loop, T, use_lora, monkeypatch):
-    # Decode used to decline own-gate experts and dequantize all experts of every layer per token (real Mini 4-bit on an
-    # A100: 2.28 tok/s vs 3.09 for transformers bf16). The routed path must engage and match the dense softcapped
-    # reference on the same dequantized weights, as the current path does.
+    # Decode must route own-gate experts instead of dequantizing all experts per token, and match
+    # the dense softcapped reference on the same dequantized weights.
     pytest.importorskip("triton")
     from unsloth_zoo.temporary_patches import moe_routed as MR
     from unsloth_zoo.temporary_patches import moe_utils as MU
