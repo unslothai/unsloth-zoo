@@ -322,11 +322,44 @@ def _in_backward():
         return False
 
 
+class _RestartEagerly(Exception):
+    """Raised out of a layer's failed compiled call so its __call__ reruns the whole call, checkpoint included."""
+
+
+_RESTARTABLE_CLASSES = {}
+
+
+def _restartable(layer):
+    """Gives ``layer`` a __call__ that reruns itself once on _RestartEagerly. transformers' GradientCheckpointingLayer
+    opens the checkpoint in __call__, so the rerun gets a fresh checkpoint instead of one still holding what a
+    partly compiled forward (a graph break, then a segment that fails to compile) saved before the failure."""
+    cls = type(layer)
+    if getattr(cls, "_unsloth_restartable", False):
+        return
+    sub = _RESTARTABLE_CLASSES.get(cls)
+    if sub is None:
+        def __call__(self, *args, **kwargs):
+            self.__dict__["_unsloth_restart_depth"] = self.__dict__.get("_unsloth_restart_depth", 0) + 1
+            try:
+                return cls.__call__(self, *args, **kwargs)
+            except _RestartEagerly:
+                return cls.__call__(self, *args, **kwargs)
+            finally:
+                self.__dict__["_unsloth_restart_depth"] -= 1
+        sub = type(cls.__name__, (cls,), {
+            "__call__": __call__, "_unsloth_restartable": True,
+            "__module__": cls.__module__, "__qualname__": cls.__qualname__,
+        })
+        _RESTARTABLE_CLASSES[cls] = sub
+    layer.__class__ = sub
+
+
 def _fall_back_to_eager_on_compile_error(layers):
     """The toolchain probe compiles one small kernel; a decoder layer can still fail to trace or build (an op or a
     patched module Dynamo / Inductor cannot handle; Dynamo can raise plain AssertionErrors). The first failure of a
-    compiled call drops every layer back to eager and reruns that call eagerly, so a genuine model error still
-    raises, now from eager code. A layer whose compiled forward is still waiting for its checkpoint recomputation
+    compiled call drops every layer back to eager and restarts that layer call eagerly (its checkpoint included, so
+    nothing a compiled segment saved before the failure stays behind), so a genuine model error still raises, now
+    from eager code. A layer whose compiled forward is still waiting for its checkpoint recomputation
     (an earlier layer of the same step) replays it compiled once more: an eager recompute saves different tensors
     and checkpointing raises CheckpointError. It goes eager after that."""
     layers = list(layers)
@@ -371,15 +404,23 @@ def _fall_back_to_eager_on_compile_error(layers):
                     with _backward_lowered_in_forward():
                         out = _compiled(*args, **kwargs)
             except Exception as error:
-                if _is_control_flow(error):
+                if _is_control_flow(error) or isinstance(error, _RestartEagerly):
                     raise
                 disable(error)
+                if not backward and _layer.__dict__.get("_unsloth_restart_depth", 0) > 0:
+                    # A compiled segment before a graph break may already have saved tensors into this call's
+                    # checkpoint: start the call over (eager now) rather than rerun inside it.
+                    raise _RestartEagerly() from error
                 return _layer._call_impl(*args, **kwargs)
             if not backward and checkpointed(_layer):
                 pending[key] = pending.get(key, 0) + 1
             return out
 
         layer._compiled_call_impl = guarded
+        try:
+            _restartable(layer)
+        except TypeError:
+            pass  # a class that cannot be subclassed / reassigned keeps the in-place eager rerun
 
 
 def _load_msvc_environment():

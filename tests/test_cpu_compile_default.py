@@ -332,3 +332,59 @@ def test_compile_error_on_a_later_layer_keeps_checkpoint_recompute_compiled(monk
             assert all(layer._compiled_call_impl is None for layer in layers)
     assert "training eagerly" in capsys.readouterr().out
     torch.testing.assert_close(grads[0], grads[1], rtol = 1e-4, atol = 1e-6)
+
+
+def test_compile_error_after_a_graph_break_restarts_the_checkpoint_eagerly(monkeypatch, capsys):
+    """A layer with a graph break runs its first compiled segment (Linear / GELU), then the second segment fails to
+    compile. Rerunning eagerly inside the same non-reentrant checkpoint would leave the first segment's saved tensors
+    in it and backward raises CheckpointError; the whole checkpointed call restarts eagerly instead."""
+    from functools import partial
+    from transformers.modeling_layers import GradientCheckpointingLayer
+    from unsloth_zoo.cpu import loader
+    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False)
+
+    class Block(GradientCheckpointingLayer):
+        def __init__(self):
+            super().__init__()
+            self.up, self.down = torch.nn.Linear(8, 16), torch.nn.Linear(16, 8)
+
+        def forward(self, x):
+            x = torch.nn.functional.gelu(self.up(x))
+            torch._dynamo.graph_break()
+            return self.down(x) * 2.0
+
+    graphs = []
+
+    def first_segment_only(gm, example_inputs):
+        graphs.append(gm)
+        if len(graphs) > 1:
+            raise RuntimeError("C++ build failed")
+        return gm.forward
+
+    x = torch.randn(4, 8, generator = torch.Generator().manual_seed(0))
+    grads = []
+    for compiled in (False, True):
+        torch.manual_seed(0)
+        blocks = torch.nn.ModuleList([Block(), Block()]).train()
+        for block in blocks:
+            block.gradient_checkpointing = True
+            block._gradient_checkpointing_func = partial(torch.utils.checkpoint.checkpoint, use_reentrant = False)
+        if compiled:
+            for block in blocks:
+                block.compile(backend = first_segment_only)
+            loader._fall_back_to_eager_on_compile_error(blocks)
+        try:
+            for _ in range(2):  # the failing step, then a fully eager one
+                blocks.zero_grad()
+                h = x.clone().requires_grad_(True)
+                for block in blocks:
+                    h = block(h)
+                h.square().sum().backward()
+        finally:
+            torch._dynamo.reset()
+        grads.append(torch.cat([p.grad.flatten() for p in blocks.parameters()]))
+        if compiled:
+            assert len(graphs) >= 2  # the first segment really ran compiled before the second failed
+            assert all(block._compiled_call_impl is None for block in blocks)
+    assert "training eagerly" in capsys.readouterr().out
+    torch.testing.assert_close(grads[0], grads[1])
