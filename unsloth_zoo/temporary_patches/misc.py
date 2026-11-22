@@ -1329,6 +1329,48 @@ pass
 TEMPORARY_PATCHES.append(patch_flex_mask_keeps_padding_mask_mod)
 
 
+def patch_flex_attention_static_shapes_on_rocm():
+    # ROCm: transformers compiles flex_attention once with automatic dynamic shapes, so the first call at a new
+    # sequence length recompiles it with a symbolic length. On gfx1151 (torch 2.11, ROCm 7.13 / 7.14) that kernel
+    # returns inf / NaN gradients (tiny Gemma-3 trained at 24 tokens after a 32 token step), while a static compile
+    # per length and eager flex are both correct. Compile with dynamic = False there; the recompile limit is 1024.
+    if getattr(torch.version, "hip", None) is None:
+        return
+    try:
+        import transformers.integrations.flex_attention as flex_module
+        from torch.nn.attention.flex_attention import flex_attention
+    except Exception:
+        return
+    original = getattr(flex_module, "compile_friendly_flex_attention", None)
+    if original is None or getattr(original, "_unsloth_rocm_static", False):
+        return
+    try:
+        parameters = inspect.signature(original).parameters
+    except Exception:
+        return
+    if list(parameters)[:4] != ["query", "key", "value", "training"]:
+        return
+    is_compiling = getattr(flex_module, "is_torchdynamo_compiling", torch.compiler.is_compiling)
+    compiled = {}
+
+    @functools.wraps(original)
+    def compile_friendly_flex_attention(query, key, value, training = False, **kwargs):
+        # Already inside a compiled graph: call flex directly, as transformers does.
+        if is_compiling():
+            return flex_attention(query, key, value, **kwargs)
+        function = compiled.get(training)
+        if function is None:
+            # transformers' torch 2.6 training workaround (pytorch/pytorch#146260), kept.
+            options = {"mode": "max-autotune-no-cudagraphs"} if training and torch.__version__.startswith("2.6.0") else {}
+            function = compiled[training] = torch.compile(flex_attention, dynamic = False, **options)
+        return function(query, key, value, **kwargs)
+
+    compile_friendly_flex_attention._unsloth_rocm_static = True
+    flex_module.compile_friendly_flex_attention = compile_friendly_flex_attention
+pass
+TEMPORARY_PATCHES.append(patch_flex_attention_static_shapes_on_rocm)
+
+
 def patch_sdpa_bool_causal_mask():
     """Fix unslothai/unsloth#4906: inf grad_norm on Qwen3.5 at seq_len > 65536.
 
