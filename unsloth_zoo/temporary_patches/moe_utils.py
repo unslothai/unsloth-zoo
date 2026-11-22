@@ -1331,6 +1331,46 @@ def _selective_dequant_chunk_experts() -> int:
         return 0
 
 
+_DEVICE_TOTAL_BYTES = {}
+
+
+def _auto_dequant_chunk_experts(splits, dtype, experts_module, device) -> int:
+    """Experts per chunk keeping one projection's dequantized stack under a scratch cap, or 0 for the whole stack.
+
+    The cap is UNSLOTH_MOE_DEQUANT_MAX_MB when set (chunks whenever a stack exceeds it), else the experts class's
+    `_unsloth_dequant_scratch_fraction` of the card, applied only to stacks over twice that share: chunking costs a
+    host sync per call and disables the kept checkpoint base, so a stack the card holds easily stays whole (Inkling-2-
+    Mini's 1.27 GiB gate_up stack is chunked on a 15 GB T4, not on a 40 GB A100; Small's 16 GiB one on any card).
+    An explicit UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS (0 included) wins. Chunks read the same values as the whole stack."""
+    if "UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS" in os.environ:
+        return 0
+    raw = os.environ.get("UNSLOTH_MOE_DEQUANT_MAX_MB", "auto").strip().lower()
+    whole_up_to = 1.0
+    if raw not in ("", "auto"):
+        try:
+            cap = float(raw) * 2**20
+        except ValueError:
+            return 0
+    else:
+        whole_up_to = 2.0
+        fraction = getattr(experts_module, "_unsloth_dequant_scratch_fraction", None)
+        if not fraction or device.type != "cuda":
+            return 0
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        total = _DEVICE_TOTAL_BYTES.get(index)
+        if total is None:
+            total = _DEVICE_TOTAL_BYTES[index] = torch.cuda.get_device_properties(index).total_memory
+        cap = float(fraction) * total
+    if cap <= 0:
+        return 0
+    element = torch.empty((), dtype = dtype).element_size()
+    E = splits[0][0]
+    per_expert = max(inner[0] * inner[1] for _, inner in splits) * element
+    if E * per_expert <= whole_up_to * cap:
+        return 0
+    return max(1, int(cap // per_expert))
+
+
 def _bnb4bit_expert_split(param):
     """(E, per-expert shape) only when every expert owns whole packed elements and whole absmax blocks, so gathering experts is exact; None otherwise."""
     while hasattr(param, "base_layer"):
@@ -1452,11 +1492,21 @@ def _dequantize_bnb4bit_experts_once(param, experts, target_dtype = None):
     return out.to(target_dtype) if target_dtype is not None else out
 
 
-def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows):
+def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows, experts_module = None):
     """Expert chunks to dequantize, or None to keep the full-stack path when off, traced, capturing, a source that cannot split exactly, or nothing to save."""
     mode = os.environ.get("UNSLOTH_MOE_SELECTIVE_DEQUANT", "auto")
     selective = mode == "1"
     chunk = _selective_dequant_chunk_experts()
+    if chunk == 0 and mode != "0" and experts_module is not None and not torch.compiler.is_compiling():
+        splits = [_bnb4bit_expert_split(source) for source in sources]
+        E = int(num_tokens_per_expert.numel())
+        if splits and all(split is not None and split[0] == E for split in splits):
+            param = sources[0]
+            while hasattr(param, "base_layer"):
+                param = param.base_layer
+            chunk = _auto_dequant_chunk_experts(
+                splits, param.quant_state.dtype, experts_module, num_tokens_per_expert.device,
+            )
     if not selective and chunk == 0:
         if mode == "0":
             return None
@@ -5542,6 +5592,7 @@ def forward_native_grouped_mm(
             if _recompute:
                 selective_plan = _selective_dequant_plan(
                     (_gate_up_src, getattr(self, "down_proj", None)), num_tokens_per_expert, permuted_input.shape[0],
+                    experts_module = self,
                 )
             # LoRA folded into the base GEMM (moe_lora_fold) and the first pass's base output reused by the checkpoint
             # replay (moe_gc_keep_base); a LoRA left over is added by the separated path below.

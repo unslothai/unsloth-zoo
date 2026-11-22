@@ -23,7 +23,12 @@ unless the experts declare their own `_apply_gate`, so declare it, and the fp32 
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING
 from .utils import logger
 
-__all__ = ["patch_inkling2_moe_experts", "INKLING2_EXPERT_CLASSES"]
+__all__ = ["patch_inkling2_moe_experts", "INKLING2_EXPERT_CLASSES", "INKLING2_DEQUANT_SCRATCH_FRACTION"]
+
+# Training dequantizes a frozen 4-bit expert stack per projection call: a whole Mini gate_up stack is 1.27 GiB, a
+# Small one 16 GiB. Where a stack exceeds twice this share of the card, read it in chunks of at most this share
+# (moe_utils._auto_dequant_chunk_experts); the chunks give the whole-stack values bit for bit.
+INKLING2_DEQUANT_SCRATCH_FRACTION = 0.025
 
 INKLING2_EXPERT_CLASSES = (
     ("transformers.models.inkling2.modeling_inkling2", "Inkling2Experts"),
@@ -44,6 +49,7 @@ def patch_inkling2_moe_experts():
             continue
         klass._unsloth_own_apply_gate = True
         klass._unsloth_moe_fp32_reference = True
+        klass._unsloth_dequant_scratch_fraction = INKLING2_DEQUANT_SCRATCH_FRACTION
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: {class_name} uses its own softcapped SwiGLU in the MoE backends.")
 

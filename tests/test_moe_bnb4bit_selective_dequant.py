@@ -243,3 +243,63 @@ def test_default_capped_plan_declines_when_rows_cover_the_stack(monkeypatch):
     counts[5], counts[9] = 2, 1   # unrouted expert pads
     ids, row_lo, row_hi, offsets = mu._selective_dequant_plan(sources, counts, 3).chunks[0]
     assert (row_lo, row_hi) == (0, 3) and ids.tolist() == [5, 9, 0] and offsets.tolist() == [2, 3, 3]
+
+
+def _routed_all(T, monkeypatch):
+    torch.manual_seed(1)
+    hidden = torch.randn(T, H, dtype = torch.bfloat16, device = DEVICE)
+    top_k_index = torch.stack([torch.randperm(E, device = DEVICE)[:TOP_K] for _ in range(T)])
+    top_k_weights = torch.rand(T, TOP_K, dtype = torch.bfloat16, device = DEVICE)
+    lora = {
+        "gate_up_proj": (torch.randn(E, H, RANK, device = DEVICE) * 0.1, torch.randn(E, RANK, 2 * I, device = DEVICE) * 0.1),
+        "down_proj": (torch.randn(E, I, RANK, device = DEVICE) * 0.1, torch.randn(E, RANK, H, device = DEVICE) * 0.1),
+    }
+    return hidden, top_k_index, top_k_weights, lora
+
+
+def test_scratch_cap_chunks_the_whole_stack_bit_exactly(monkeypatch):
+    """UNSLOTH_MOE_DEQUANT_MAX_MB bounds one projection's dequantized stack: every expert is routed (the auto plan
+    declines), yet the stack is read in chunks and the result is the whole-stack one bit for bit."""
+    monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
+    experts = _Experts(True)
+    hidden, top_k_index, top_k_weights, lora = _routed_all(64, monkeypatch)
+    base_out, base_grads = _run(experts, hidden, top_k_index, top_k_weights, lora, monkeypatch)
+    assert mu.SELECTIVE_DEQUANT_STATS["dequant_calls"] == 0
+    per_expert = 2 * I * H * 2   # gate_up, bf16: the larger stack
+    monkeypatch.setenv("UNSLOTH_MOE_DEQUANT_MAX_MB", str(5 * per_expert / 2**20))
+    out, grads = _run(experts, hidden, top_k_index, top_k_weights, lora, monkeypatch)
+    assert torch.equal(out, base_out)
+    for got, want in zip(grads, base_grads):
+        assert torch.equal(got, want)
+    stats = mu.SELECTIVE_DEQUANT_STATS
+    assert stats["plans"] == 1
+    assert stats["dequant_calls"] == 4 * -(-E // 5)   # 5 experts per chunk, gate_up + down, forward + backward
+    # An explicit chunk setting wins, 0 included.
+    for key in stats:
+        stats[key] = 0
+    monkeypatch.setenv("UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS", "0")
+    _run(experts, hidden, top_k_index, top_k_weights, lora, monkeypatch)
+    assert stats["dequant_calls"] == 0
+
+
+def test_scratch_fraction_follows_the_experts_class_and_the_card(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
+    cuda0 = torch.device("cuda", 0)
+    monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, 0, int(14.56 * 2**30))   # a T4
+    mini = [(128, (2304, 2304)), (128, (2304, 1152))]                  # Inkling-2-Mini gate_up, down
+
+    class Flagged:
+        _unsloth_dequant_scratch_fraction = 0.025
+
+    cap = 0.025 * 14.56 * 2**30
+    assert mu._auto_dequant_chunk_experts(mini, torch.float16, object(), cuda0) == 0     # unflagged: whole stack
+    assert mu._auto_dequant_chunk_experts(mini, torch.float16, Flagged(), torch.device("cpu")) == 0
+    chunk = mu._auto_dequant_chunk_experts(mini, torch.float16, Flagged(), cuda0)
+    assert chunk == int(cap // (2304 * 2304 * 2)) == 36   # 4 chunks
+    # Stacks up to twice the cap stay whole: Mini's down stack alone (0.63 GiB), or Mini on a 40 GB card.
+    assert mu._auto_dequant_chunk_experts(mini[1:], torch.float16, Flagged(), cuda0) == 0
+    monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, 0, int(39.4 * 2**30))
+    assert mu._auto_dequant_chunk_experts(mini, torch.float16, Flagged(), cuda0) == 0
+    small = [(384, (4608, 4608)), (384, (4608, 2304))]                 # Inkling-2-Small: 15.2 GiB gate_up stack
+    monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, 0, int(79.2 * 2**30))
+    assert mu._auto_dequant_chunk_experts(small, torch.float16, Flagged(), cuda0) == int(0.025 * 79.2 * 2**30 // (4608 * 4608 * 2))

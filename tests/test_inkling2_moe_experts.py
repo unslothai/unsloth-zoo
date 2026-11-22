@@ -66,6 +66,8 @@ def test_flags_declared_on_both_classes():
         klass = getattr(importlib.import_module(module_name), class_name)
         assert klass._unsloth_own_apply_gate is True
         assert klass._unsloth_moe_fp32_reference is True
+        # Training reads the frozen 4-bit stacks in bounded chunks (a whole Mini gate_up stack is 1.27 GiB).
+        assert 0 < klass._unsloth_dequant_scratch_fraction < 0.1
 
 
 @pytest.mark.parametrize("loop", [True, False])
