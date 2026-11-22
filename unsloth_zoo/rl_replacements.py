@@ -675,6 +675,52 @@ def _unpack_bool_rows(packed, V):
     return bits.view(packed.shape[0], -1)[:, :V].to(torch.bool)
 
 
+def _kept_set_sparse_max_density():
+    """Backward on W[kept ids] while the chunk's kept-id union is at most this fraction of the vocabulary
+    (UNSLOTH_GRPO_KEPT_SET_SPARSE_MAX_DENSITY, 0 = always dense); UNSLOTH_GRPO_KEPT_SET_SPARSE=0 turns it off."""
+    if os.environ.get("UNSLOTH_GRPO_KEPT_SET_SPARSE", "1").strip().lower() in ("0", "false", "off", "no"):
+        return 0.0
+    env = os.environ.get("UNSLOTH_GRPO_KEPT_SET_SPARSE_MAX_DENSITY", "").strip()
+    try:
+        value = float(env) if env else _KEPT_SET_SPARSE_MAX_DENSITY
+    except ValueError:
+        return _KEPT_SET_SPARSE_MAX_DENSITY
+    return min(max(value, 0.0), 1.0) if math.isfinite(value) else _KEPT_SET_SPARSE_MAX_DENSITY
+
+
+def _kept_set_is_compiling():
+    # The CSR size decision and the route counters are data-dependent / side effects: packed + no counters
+    # while an outer torch.compile traces the scorer.
+    try:
+        return torch.compiler.is_compiling()
+    except AttributeError:
+        return torch._dynamo.is_compiling()
+
+
+# Union / vocab above this runs the dense backward. L4, Qwen3 head, 441-row chunks: the sparse backward is faster up
+# to a 0.81 union (94 vs 114 ms) but its transients pass the dense ones near 0.5 (764 vs 602 MiB at 0.63).
+_KEPT_SET_SPARSE_MAX_DENSITY = 0.45
+
+
+def _kept_set_save(keep, sparse, z = None, logits = None, logits_dtype = None):
+    # CSR (int32 per-row counts, column ids, the forward's float32 z there, and its raw logits under a softcap)
+    # while that is smaller than the 1-bit mask (density < 1/64 without a softcap). The backward then reuses
+    # the exact z the forward normalised with (p stays consistent with lse) and needs no logits GEMM.
+    rows, V = keep.shape
+    if sparse and z is not None:
+        counts = keep.sum(-1, dtype = torch.int32)
+        nnz = int(counts.sum())
+        per_id = 4 + z.element_size() + (logits.element_size() if logits is not None else 0)
+        if nnz * per_id + rows * 4 < rows * ((V + 7) // 8):
+            row_ids, col_ids = keep.nonzero(as_tuple = True)
+            return (
+                "csr", counts, col_ids.to(torch.int32), z[row_ids, col_ids],
+                None if logits is None else logits[row_ids, col_ids], logits_dtype,
+            )
+    # Declined: the caller frees z / logits before packing the mask.
+    return None
+
+
 def _kept_set_logits(chunk_hidden_states, lm_head, lm_head_bias):
     chunk_hidden_states = chunk_hidden_states.to(device = lm_head.device, dtype = lm_head.dtype)
     if lm_head_bias is None:
@@ -713,7 +759,8 @@ def _kept_set_chunk_forward(z, chunk_index, support):
 
 
 class _KeptSetLogprobs(torch.autograd.Function):
-    # Saves only per-row stats and a 1-bit kept set; backward recomputes logits. The kept set is a detached mask.
+    # Saves only per-row stats and the kept set: CSR ids with the forward's z there (frozen head, sparse), else a
+    # 1-bit mask and the backward recomputes the logits. The kept set is detached.
     @staticmethod
     def forward(ctx, hidden_states, lm_head, lm_head_bias, index, bounds, transforms, support):
         device_type = lm_head.device.type
@@ -723,19 +770,40 @@ class _KeptSetLogprobs(torch.autograd.Function):
             dtype = torch.get_autocast_dtype(device_type),
             cache_enabled = torch.is_autocast_cache_enabled(),
         )
-        logps, lses, packed = [], [], []
+        logps, lses, kept = [], [], []
+        # A trainable (or tied, trainable) head needs the full grad_head: dense. Else CSR ids for a W[ids] backward.
+        max_density = 0.0 if _kept_set_is_compiling() else _kept_set_sparse_max_density()
+        sparse = max_density > 0.0 and not any(ctx.needs_input_grad[1:3])
         for a, b in zip(bounds[:-1], bounds[1:]):
             logits = _kept_set_logits(hidden_states[a:b], lm_head, lm_head_bias)
             z = _kept_set_transform(logits, *transforms)
+            logits_dtype = logits.dtype
+            # The softcap derivative needs the raw logits; without a softcap they are freed as before.
+            raw = logits if sparse and transforms[2] != 0.0 else None
             del logits
             logp, lse, keep = _kept_set_chunk_forward(z, index[a:b].to(lm_head.device), support)
-            del z
             logps.append(logp)
             lses.append(lse)
-            packed.append(_pack_bool_rows(keep))
-            del keep
+            saved = _kept_set_save(keep, sparse, z, raw, logits_dtype)
+            del z, raw
+            kept.append(saved if saved is not None else ("packed", _pack_bool_rows(keep)))
+            del keep, saved
         logps = torch.cat(logps)
-        ctx.save_for_backward(hidden_states, lm_head, lm_head_bias, index, torch.cat(lses), logps, torch.cat(packed))
+        # Kept sets go through save_for_backward (flattened, layout on ctx) so a retain_graph backward can run twice
+        # and autograd still frees them after a normal backward.
+        flat, layout = [], []
+        for item in kept:
+            if item[0] == "csr":
+                _, counts, cols, z_vals, raw_vals, kept_dtype = item
+                layout.append(("csr", len(flat), raw_vals is not None, kept_dtype))
+                flat += [counts, cols, z_vals] + ([raw_vals] if raw_vals is not None else [])
+            else:
+                layout.append(("packed", len(flat)))
+                flat.append(item[1])
+        del kept
+        ctx.save_for_backward(hidden_states, lm_head, lm_head_bias, index, torch.cat(lses), logps, *flat)
+        ctx.kept_layout = layout
+        ctx.max_density = max_density
         ctx.bounds = bounds
         ctx.transforms = transforms
         ctx.vocab = lm_head.shape[0]
@@ -743,7 +811,17 @@ class _KeptSetLogprobs(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_logps):
-        hidden_states, lm_head, lm_head_bias, index, lses, logps, packed = ctx.saved_tensors
+        hidden_states, lm_head, lm_head_bias, index, lses, logps, *flat = ctx.saved_tensors
+        kept_chunks = []
+        for entry in ctx.kept_layout:
+            if entry[0] == "csr":
+                _, at, has_raw, kept_dtype = entry
+                kept_chunks.append(
+                    ("csr", flat[at], flat[at + 1], flat[at + 2], flat[at + 3] if has_raw else None, kept_dtype)
+                )
+            else:
+                kept_chunks.append(("packed", flat[entry[1]]))
+        del flat
         need_hidden, need_head, need_bias = ctx.needs_input_grad[:3]
         device = lm_head.device
         scale_multiply, scale_divide, softcapping, temperature = ctx.transforms
@@ -765,11 +843,56 @@ class _KeptSetLogprobs(torch.autograd.Function):
                     mm_out_dtype = False
             return torch.mm(a.float(), b.float())
 
-        for a, b in zip(ctx.bounds[:-1], ctx.bounds[1:]):
+        for (a, b), saved in zip(zip(ctx.bounds[:-1], ctx.bounds[1:]), kept_chunks):
             chunk_hidden_states = hidden_states[a:b]
-            with torch.no_grad(), torch.autocast(**ctx.autocast_kwargs):
-                logits = _kept_set_logits(chunk_hidden_states, lm_head, lm_head_bias)
-            z = _kept_set_transform(logits, scale_multiply, scale_divide, softcapping, 1.0)
+            chunk_index = index[a:b].to(device)
+            # Columns outside the kept set get zero gradient, so the backward only needs the forward's z at the
+            # kept ids (saved) and W[kept ids]: dh = g_U @ W[U] over the chunk's union U of kept ids.
+            ids = None
+            z = logits = keep = packed = None
+            rows = b - a
+            if saved[0] == "csr":
+                counts, cols, z_vals, raw_vals, logits_dtype = saved[1:]
+                ids, local = torch.unique(cols, sorted = True, return_inverse = True)
+                width = ids.numel()
+                # W[U] (+ its cast) and the R x |U| buffers must cost less than the R x V buffers they replace:
+                # a short chunk under a wide head can pass the density cutoff and still gather more than that.
+                head_bytes = width * lm_head.shape[1] * lm_head.element_size()
+                if lm_head.dtype != logits_dtype:
+                    head_bytes += width * lm_head.shape[1] * torch.empty((), dtype = logits_dtype).element_size()
+                per_logit = z_vals.element_size() + 1 + torch.empty((), dtype = logits_dtype).element_size() \
+                    + (raw_vals.element_size() if raw_vals is not None else 0)
+                if width > ctx.max_density * ctx.vocab or head_bytes + rows * width * per_logit > rows * ctx.vocab * per_logit:
+                    # Full width, from the saved z: no logits GEMM, the dense dh GEMM.
+                    ids, local, width = None, cols.long(), ctx.vocab
+                row_of = torch.repeat_interleave(
+                    torch.arange(rows, device = device), counts.to(device), output_size = cols.numel(),
+                )
+                keep = torch.zeros((rows, width), dtype = torch.bool, device = device)
+                keep[row_of, local] = True
+                # Entries outside the kept set are masked out of p below; 0 keeps them finite.
+                z = torch.zeros((rows, width), dtype = z_vals.dtype, device = device)
+                z[row_of, local] = z_vals
+                if raw_vals is not None:
+                    logits = torch.zeros((rows, width), dtype = raw_vals.dtype, device = device)
+                    logits[row_of, local] = raw_vals
+                if ids is not None:
+                    # The target is always kept, so it is in U.
+                    chunk_index = torch.searchsorted(ids, chunk_index.to(ids.dtype))
+                del row_of, local, counts, cols, z_vals, raw_vals
+            else:
+                packed = saved[1]
+            del saved
+            if not _kept_set_is_compiling():
+                stat = "kept_set_sparse_bwd" if ids is not None else "kept_set_dense_bwd"
+                _GRPO_TRUNCATED_SUPPORT_STATS[stat] = _GRPO_TRUNCATED_SUPPORT_STATS.get(stat, 0) + 1
+            if z is None:
+                with torch.no_grad(), torch.autocast(**ctx.autocast_kwargs):
+                    logits = _kept_set_logits(chunk_hidden_states, lm_head, lm_head_bias)
+                z = _kept_set_transform(logits, scale_multiply, scale_divide, softcapping, 1.0)
+                if temperature != 1.0:
+                    z = z / temperature
+                logits_dtype = logits.dtype
             if softcapping != 0.0:
                 # The softcap derivative in float32 (autograd took it in the matmul dtype).
                 x = logits.to(torch.promote_types(logits.dtype, torch.float32))
@@ -779,12 +902,10 @@ class _KeptSetLogprobs(torch.autograd.Function):
                     x = x / scale_divide
                 tanh = torch.tanh(x / softcapping)
                 del x
-            logits_dtype = logits.dtype
             del logits
-            if temperature != 1.0:
-                z = z / temperature
-            keep = _unpack_bool_rows(packed[a:b], ctx.vocab)
-            chunk_index = index[a:b].to(device)
+            if packed is not None:
+                keep = _unpack_bool_rows(packed, ctx.vocab)
+                del packed
             # d logp / dz_j = 1[j = t] - p_j over the kept set (0 outside it); the target's 1 - p_t = -expm1(logp).
             p = torch.exp(z.sub_(lses[a:b].unsqueeze(-1))).masked_fill_(~keep, 0.0)
             del keep, z
@@ -803,7 +924,13 @@ class _KeptSetLogprobs(torch.autograd.Function):
                 grad_z = grad_z * scale_multiply
             grad_logits = grad_z.to(logits_dtype)
             del grad_z
-            if head is None:
+            if ids is not None:
+                # Gathered only now, after the probability / derivative buffers are gone.
+                head = lm_head.index_select(0, ids.long())
+                if head.dtype != grad_logits.dtype:
+                    head = head.to(grad_logits.dtype)
+                half_to_float32 = grad_logits.dtype == torch.float16
+            elif head is None:
                 head = lm_head if lm_head.dtype == grad_logits.dtype else lm_head.to(grad_logits.dtype)
                 half_to_float32 = grad_logits.dtype == torch.float16
             if need_hidden:
@@ -828,8 +955,11 @@ class _KeptSetLogprobs(torch.autograd.Function):
                 else:
                     grad_head.add_(grad_logits.t() @ x)
             if need_bias:
+                # A trainable bias forces the packed (dense) route in forward.
                 grad_bias.add_(grad_logits.to(torch.float32).sum(0))
             del grad_logits
+            if ids is not None:
+                head = None
         if need_head:
             grad_head = grad_head.to(lm_head.dtype)
         if need_bias:
@@ -2306,6 +2436,66 @@ GRPO_VISION_KEYS = (
     "num_videos",
 )
 
+# Index keys that travel with the vision inputs but are not model kwargs, kept out of GRPO_VISION_KEYS so the
+# companion key-count checks below are unchanged. video_bank_rows: [n_videos, 2] (start, end) patch rows of each
+# per-sample video inside a pixel_values_videos holding one copy per distinct prompt; GRPO repeats each prompt
+# num_generations times, so the flat layout held that many copies of every video.
+GRPO_VISION_INDEX_KEYS = ("video_bank_rows",)
+
+
+def grpo_video_bank_supported():
+    """Whether grpo_vision_chunks reads video_bank_rows. unsloth emits the deduplicated layout only when this is
+    True: an older chunker would slice the bank as if it were flat and could feed another prompt's video."""
+    return True
+pass
+RL_REPLACEMENTS["grpo_video_bank_supported"] = grpo_video_bank_supported
+
+
+def grpo_video_bank_rows(pixel_values_videos, video_bank_rows, vid_start, vid_end):
+    """Patch rows of videos [vid_start, vid_end) out of a deduplicated bank: a view when they are contiguous
+    in the bank, else one copy of just those rows."""
+    rows = video_bank_rows[vid_start:vid_end]
+    if rows.shape[0] == 0:
+        return pixel_values_videos[:0]
+    rows = rows.tolist()
+    if all(rows[i][1] == rows[i + 1][0] for i in range(len(rows) - 1)):
+        return pixel_values_videos[rows[0][0] : rows[-1][1]]
+    return torch.cat([pixel_values_videos[a:b] for a, b in rows], dim = 0)
+pass
+RL_REPLACEMENTS["grpo_video_bank_rows"] = grpo_video_bank_rows
+
+
+class _GrpoBankRows:
+    # A chunk's video rows out of the bank, built only when the chunk is read: a noncontiguous range (repeated
+    # prompts) is a copy, and holding every chunk's copy at once would bring back the per-generation copies.
+    __slots__ = ("bank", "rows", "start", "end")
+
+    def __init__(self, bank, rows, start, end):
+        self.bank, self.rows, self.start, self.end = bank, rows, start, end
+
+    def materialize(self):
+        return grpo_video_bank_rows(self.bank, self.rows, self.start, self.end)
+
+
+def _grpo_materialize_chunk(chunk):
+    if not any(isinstance(value, _GrpoBankRows) for value in chunk.values()):
+        return chunk
+    return {key: (value.materialize() if isinstance(value, _GrpoBankRows) else value) for key, value in chunk.items()}
+
+
+class _GrpoVisionChunks(list):
+    """grpo_vision_chunks' result: a list whose items are built when read (iteration or indexing), so a forward loop
+    holds one chunk's video rows at a time."""
+
+    def __iter__(self):
+        for chunk in list.__iter__(self):
+            yield _grpo_materialize_chunk(chunk)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return _GrpoVisionChunks(list.__getitem__(self, index))
+        return _grpo_materialize_chunk(list.__getitem__(self, index))
+
 
 def grpo_get_vision_inputs(source):
     """Collect the GRPO multimodal inputs out of a kwargs or inputs mapping."""
@@ -2314,7 +2504,12 @@ def grpo_get_vision_inputs(source):
     get = getattr(source, "get", None)
     if get is None:
         return {}
-    return {key: get(key, None) for key in GRPO_VISION_KEYS}
+    out = {key: get(key, None) for key in GRPO_VISION_KEYS}
+    for key in GRPO_VISION_INDEX_KEYS:
+        value = get(key, None)
+        if value is not None:
+            out[key] = value
+    return out
 pass
 RL_REPLACEMENTS["grpo_get_vision_inputs"] = grpo_get_vision_inputs
 
@@ -2453,7 +2648,10 @@ def grpo_shared_vision_inputs(source):
     keys = grpo_companion_vision_keys()
     if len(keys) == len(GRPO_VISION_KEYS):
         return grpo_get_vision_inputs(source)
-    return {key: value for key, value in grpo_get_vision_inputs(source).items() if key in keys}
+    return {
+        key: value for key, value in grpo_get_vision_inputs(source).items()
+        if key in keys or key in GRPO_VISION_INDEX_KEYS
+    }
 pass
 RL_REPLACEMENTS["grpo_shared_vision_inputs"] = grpo_shared_vision_inputs
 
@@ -2563,6 +2761,7 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
     if num_videos is not None and len(num_videos) != total_samples:
         num_videos = None
     cum_videos = cum_video_rows = None
+    video_bank_rows = vision.get("video_bank_rows", None)
     if pixel_values_videos is not None and video_grid_thw is not None:
         if num_videos is None or sum(num_videos) != video_grid_thw.shape[0]:
             raise ValueError(
@@ -2574,6 +2773,17 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
             torch.zeros(1, dtype = torch.long),
             video_grid_thw.prod(dim = -1).cumsum(0).cpu(),
         ])
+        if video_bank_rows is not None:
+            video_bank_rows = torch.as_tensor(video_bank_rows).cpu()
+            _bank_sizes = video_bank_rows[:, 1] - video_bank_rows[:, 0]
+            if (
+                video_bank_rows.shape[0] != video_grid_thw.shape[0]
+                or not torch.equal(_bank_sizes, video_grid_thw.prod(dim = -1).cpu().to(_bank_sizes.dtype))
+                or (video_bank_rows.numel() > 0 and int(video_bank_rows.max()) > pixel_values_videos.shape[0])
+            ):
+                raise ValueError(
+                    "Unsloth: GRPO video_bank_rows does not match video_grid_thw / pixel_values_videos."
+                )
 
     def _row_axis_is_images(value, flat_ndim):
         """Whether this tensor's first dimension counts IMAGES rather than samples.
@@ -2644,9 +2854,14 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
         if cum_videos is not None:
             vid_start, vid_end = int(cum_videos[start]), int(cum_videos[end])
         if vid_end > vid_start:
-            chunk["pixel_values_videos"] = pixel_values_videos[
-                int(cum_video_rows[vid_start]) : int(cum_video_rows[vid_end])
-            ]
+            if video_bank_rows is not None:
+                chunk["pixel_values_videos"] = _GrpoBankRows(
+                    pixel_values_videos, video_bank_rows, vid_start, vid_end,
+                )
+            else:
+                chunk["pixel_values_videos"] = pixel_values_videos[
+                    int(cum_video_rows[vid_start]) : int(cum_video_rows[vid_end])
+                ]
             chunk["video_grid_thw"] = video_grid_thw[vid_start:vid_end]
             if second_per_grid_ts is not None:
                 chunk["second_per_grid_ts"] = second_per_grid_ts[vid_start:vid_end]
@@ -2732,7 +2947,7 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
             chunk.pop("pixel_values", None)
             chunk.pop("pixel_attention_mask", None)
         chunks.append(chunk)
-    return chunks
+    return _GrpoVisionChunks(chunks) if video_bank_rows is not None else chunks
 pass
 RL_REPLACEMENTS["grpo_vision_chunks"] = grpo_vision_chunks
 

@@ -154,6 +154,17 @@ def _install_compile_gate(trainer):
     return True
 
 
+def _auto_cpu_gradient_checkpointing(model, training_args):
+    """use_gradient_checkpointing = False on the model wins over SFTConfig's gradient_checkpointing = True default,
+    which would turn recomputation back on."""
+    if not isinstance(model, torch.nn.Module) or not getattr(training_args, "gradient_checkpointing", False):
+        return None
+    if getattr(model, "_unsloth_cpu_gradient_checkpointing", None) is False:
+        training_args.gradient_checkpointing = False
+        return True
+    return None
+
+
 def _patch_post_init(cls):
     original = cls.__post_init__
     if getattr(original, "_unsloth_cpu", False):
@@ -344,6 +355,8 @@ def _make_cpu_sft_trainer(base):
             # Configs write in-process as dataset_num_proc = 1, but datasets >= 4.1 builds a Pool(1) for it
             # (under spawn its child re-imports an unguarded __main__): stock TRL must see None while it maps.
             training_args = kwargs.get("args", args[1] if len(args) > 1 else None)
+            if training_args is not None:
+                _auto_cpu_gradient_checkpointing(kwargs.get("model", args[0] if args else None), training_args)
             num_proc = getattr(training_args, "dataset_num_proc", None)
             serial = isinstance(num_proc, int) and not isinstance(num_proc, bool) and 0 <= num_proc <= 1
             if serial:
