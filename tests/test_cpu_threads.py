@@ -189,3 +189,43 @@ def test_user_thread_env_kept_when_torch_caps_it(monkeypatch):
     monkeypatch.setattr(runtime, "cpu_compute_cores", lambda: 1)
     assert runtime.fit_cpu_threads() == (2, "OMP_NUM_THREADS / MKL_NUM_THREADS")
     assert calls == []
+
+
+def test_physical_cores_unknown_topology_falls_back(tmp_path):
+    """sysfs reports unknown topology as physical_package_id -1, core_id 0: not one core, so None (count the CPUs)."""
+    from unsloth_zoo.cpu.runtime import _linux_physical_cores
+    for cpu in range(8):
+        topo = tmp_path / f"cpu{cpu}" / "topology"
+        topo.mkdir(parents = True)
+        (topo / "physical_package_id").write_text("-1\n")
+        (topo / "core_id").write_text("0\n")
+    assert _linux_physical_cores(list(range(8)), root = str(tmp_path)) is None
+
+
+def _fit_with(monkeypatch, cores, ranks, mine, parent, quota = None):
+    from unsloth_zoo.cpu import runtime
+    for name in _THREAD_ENV:
+        monkeypatch.delenv(name, raising = False)
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", str(ranks))
+    monkeypatch.setattr(runtime, "_THREADS_FITTED", None)
+    monkeypatch.setattr(runtime, "cpu_compute_cores", lambda: cores)
+    monkeypatch.setattr(runtime, "_cgroup_cpu_limit", lambda *a, **k: quota)
+    monkeypatch.setattr(runtime.sys, "platform", "linux")
+    monkeypatch.setattr(runtime.os, "sched_getaffinity", lambda pid: set(mine if pid == 0 else parent), raising = False)
+    threads = [64]
+    monkeypatch.setattr(torch, "get_num_threads", lambda: threads[0])
+    monkeypatch.setattr(torch, "set_num_threads", lambda n: threads.__setitem__(0, n))
+    try:
+        return runtime.fit_cpu_threads()[0]
+    finally:
+        runtime._THREADS_FITTED = None
+
+
+@pytest.mark.parametrize("mine, parent, quota, expected", [
+    (range(4), range(8), None, 4),  # torchrun --numa-binding / mpirun --bind-to: each rank owns 4 cores
+    (range(4), range(8), 4, 2),  # a cgroup quota is still shared by both ranks
+    (range(4), range(4), None, 2),  # taskset -c 0-3 on the whole job: both ranks share the 4 cores
+    (range(8), range(8), None, 2),  # 8 SMT CPUs = 4 cores shared by both ranks: split
+])
+def test_fit_threads_does_not_split_a_per_rank_affinity_again(monkeypatch, mine, parent, quota, expected):
+    assert _fit_with(monkeypatch, 4, 2, mine, parent, quota) == expected

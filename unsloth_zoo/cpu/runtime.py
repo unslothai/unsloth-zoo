@@ -164,6 +164,10 @@ def _linux_physical_cores(cpus, root = "/sys/devices/system/cpu"):
                 core = f.read().strip()
             with open(base + "physical_package_id") as f:
                 package = f.read().strip()
+            # Unknown topology reads as package -1 (and core 0 everywhere): it names no real core, so the caller
+            # falls back to counting CPUs instead of collapsing them all into one.
+            if int(package) < 0 or int(core) < 0:
+                return None
             cores.add((package, core))
     except (OSError, ValueError):
         return None
@@ -232,6 +236,20 @@ def cpu_compute_cores():
     return max(1, min(cores, quota) if quota else cores)
 
 
+def _affinity_split_per_rank(ranks):
+    """True when a launcher pinned this rank to its own slice of CPUs (torchrun --numa-binding, mpirun --bind-to):
+    the parent launcher's affinity is wider than ours and holds a slice this size for every local rank. A whole job
+    pinned with taskset shares one mask with its parent, so its ranks still split it."""
+    if ranks <= 1 or not sys.platform.startswith("linux"):
+        return False
+    try:
+        mine = os.sched_getaffinity(0)
+        parent = os.sched_getaffinity(os.getppid())
+    except (AttributeError, OSError):
+        return False
+    return bool(mine) and mine < parent and len(mine) * ranks <= len(parent)
+
+
 def _local_world_size():
     for name in ("LOCAL_WORLD_SIZE", "MPI_LOCALNRANKS", "OMPI_COMM_WORLD_LOCAL_SIZE"):
         try:
@@ -290,6 +308,13 @@ def fit_cpu_threads():
                 target, reason = max(1, (os.cpu_count() or 1) // ranks), "launcher OMP_NUM_THREADS=1 undone"
         else:
             fitted = max(1, cores // ranks)
+            if _affinity_split_per_rank(ranks):
+                # cores already counts this rank's own CPUs; only a cgroup quota is still shared by the ranks.
+                try:
+                    quota = _cgroup_cpu_limit() if sys.platform.startswith("linux") else None
+                except Exception:
+                    quota = None
+                fitted = max(1, min(cores, quota // ranks) if quota else cores)
             if launcher:
                 target, reason = fitted, "launcher OMP_NUM_THREADS=1 undone"
             elif fitted < current:
