@@ -13,6 +13,7 @@ import textwrap
 import types
 
 import pytest
+import torch
 
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 os.environ.setdefault("UNSLOTH_VENDORED_FLA_NO_AUTORUN", "1")
@@ -28,6 +29,13 @@ VENDORED = ZOO_ROOT / "unsloth_zoo" / "_vendored" / "fla"
 _GPU = pytest.mark.skipif(
     not fla_vendor._vendored_injection_supported() or fla_vendor._gpu_lacks_dot_instructions(),
     reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3 (never on RDNA1)",
+)
+
+# fla_vendor._withhold_kda_on_rocm keeps fla.ops.kda unimportable on ROCm (Triton's AMD pipeline cannot compile the
+# KDA kernels), so the vendored KDA kernels are NVIDIA only; test_rocm_withholds_kda_and_keeps_gated_delta covers ROCm.
+_NVIDIA_KDA = pytest.mark.skipif(
+    getattr(torch.version, "hip", None) is not None,
+    reason="vendored fla KDA kernels are withheld on ROCm by design (NVIDIA only)",
 )
 
 
@@ -170,6 +178,7 @@ _KERNEL_CHILD = textwrap.dedent(
 
 
 @_GPU
+@_NVIDIA_KDA
 def test_kda_kernels_match_reference_subprocess():
     env = dict(os.environ)
     env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
@@ -209,6 +218,7 @@ _BIND_CHILD = textwrap.dedent(
 
 
 @_GPU
+@_NVIDIA_KDA
 @pytest.mark.parametrize("order", ["after", "before"])
 @pytest.mark.parametrize("package", ["glm5_next", "kimi_linear"])
 def test_kda_models_bind_vendored_kernels(package, order):
