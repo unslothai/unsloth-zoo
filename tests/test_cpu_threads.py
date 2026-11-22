@@ -160,8 +160,9 @@ def test_fit_threads_names_the_cgroup_quota(monkeypatch):
     from unsloth_zoo.cpu import runtime
     if not sys.platform.startswith("linux"):
         pytest.skip("Linux only")
-    for name in _THREAD_ENV:
-        monkeypatch.delenv(name, raising = False)
+    for name in _THREAD_ENV:  # setenv first so teardown also removes what the fit exports
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
     before = torch.get_num_threads()
     monkeypatch.setattr(runtime, "_THREADS_FITTED", None)
     monkeypatch.setattr(runtime, "_cgroup_cpu_limit", lambda *a, **k: 1)
@@ -180,8 +181,9 @@ def test_user_thread_env_kept_when_torch_caps_it(monkeypatch):
     spec = importlib.util.spec_from_file_location("_zoo_cpu_runtime_spoof", _ROOT / "unsloth_zoo" / "cpu" / "runtime.py")
     runtime = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(runtime)
-    for name in _THREAD_ENV:
-        monkeypatch.delenv(name, raising = False)
+    for name in _THREAD_ENV:  # setenv first so teardown also removes what the fit exports
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
     monkeypatch.setenv("OMP_NUM_THREADS", "8")
     calls = []
     monkeypatch.setattr(torch, "get_num_threads", lambda: 2)
@@ -204,8 +206,9 @@ def test_physical_cores_unknown_topology_falls_back(tmp_path):
 
 def _fit_with(monkeypatch, cores, ranks, mine, parent, quota = None):
     from unsloth_zoo.cpu import runtime
-    for name in _THREAD_ENV:
-        monkeypatch.delenv(name, raising = False)
+    for name in _THREAD_ENV:  # setenv first so teardown also removes what the fit exports
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
     monkeypatch.setenv("LOCAL_WORLD_SIZE", str(ranks))
     monkeypatch.setattr(runtime, "_THREADS_FITTED", None)
     monkeypatch.setattr(runtime, "cpu_compute_cores", lambda: cores)
@@ -229,3 +232,36 @@ def _fit_with(monkeypatch, cores, ranks, mine, parent, quota = None):
 ])
 def test_fit_threads_does_not_split_a_per_rank_affinity_again(monkeypatch, mine, parent, quota, expected):
     assert _fit_with(monkeypatch, 4, 2, mine, parent, quota) == expected
+
+
+@pytest.mark.parametrize("extra, expected", [
+    ({"UNSLOTH_CPU_THREADS": "3", "LOCAL_WORLD_SIZE": "2", "OMPI_COMM_WORLD_LOCAL_SIZE": "2"}, 3),
+    ({"LOCAL_WORLD_SIZE": "2", "OMPI_COMM_WORLD_LOCAL_SIZE": "2"}, None),  # the fitted count, whatever it is
+])
+def test_fitted_threads_survive_accelerate_partial_state(extra, expected):
+    """mpirun leaves OMP_NUM_THREADS unset; Accelerate's PartialState then calls torch.set_num_threads(physical cores
+    // local ranks) after the fit. The fit exports OMP_NUM_THREADS, which PartialState reads as set and leaves alone."""
+    env = {k: v for k, v in os.environ.items() if k not in _THREAD_ENV}
+    env.update(extra)
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(_ROOT), env.get("PYTHONPATH")]))
+    code = (
+        "import json, os, torch\n"
+        "from unsloth_zoo.cpu import runtime\n"
+        "runtime.cpu_compute_cores = lambda: 4\n"
+        "threads = runtime.fit_cpu_threads()[0]\n"
+        "from accelerate.utils import get_int_from_env\n"
+        "print(json.dumps([threads, os.environ.get('OMP_NUM_THREADS'), get_int_from_env(['OMP_NUM_THREADS'], 0)]))\n"
+    )
+    out = subprocess.run([sys.executable, "-c", code], env = env, capture_output = True, text = True, timeout = 300)
+    assert out.returncode == 0, out.stderr[-2000:]
+    threads, omp, seen = json.loads(out.stdout.strip().splitlines()[-1])
+    assert omp == str(threads) and seen == threads  # PartialState's "unset" check now fails: the fit is kept
+    if expected is not None:
+        assert threads == expected
+
+
+def test_user_omp_env_is_never_rewritten(monkeypatch):
+    from unsloth_zoo.cpu import runtime
+    monkeypatch.setenv("OMP_NUM_THREADS", "1")
+    runtime._pin_omp_env(8)
+    assert os.environ["OMP_NUM_THREADS"] == "1"

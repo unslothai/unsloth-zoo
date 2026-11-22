@@ -300,6 +300,7 @@ def fit_cpu_threads():
         user_set = user_mkl or bool(os.environ.get("OMP_NUM_THREADS", "").strip())
         if user_set and (user_mkl or not launcher):
             _THREADS_FITTED = (current, "OMP_NUM_THREADS / MKL_NUM_THREADS")
+            _pin_omp_env(current)
             return _THREADS_FITTED
         cores = cpu_compute_cores()
         ranks = _local_world_size()
@@ -331,7 +332,16 @@ def fit_cpu_threads():
         except Exception:
             target = current
     _THREADS_FITTED = (torch.get_num_threads(), reason)
+    _pin_omp_env(_THREADS_FITTED[0])
     return _THREADS_FITTED
+
+
+def _pin_omp_env(threads):
+    """Accelerate's PartialState (built later by TrainingArguments) sets torch threads to physical cores / local
+    ranks on a multi-CPU launch whenever OMP_NUM_THREADS is unset (mpirun), undoing this fit and UNSLOTH_CPU_THREADS.
+    Exporting the fitted count keeps it there, and hands the same count to spawned workers."""
+    if not os.environ.get("OMP_NUM_THREADS", "").strip():
+        os.environ["OMP_NUM_THREADS"] = str(max(1, int(threads)))
 
 
 def cpu_capabilities():
