@@ -20,6 +20,7 @@ import types
 
 import pytest
 import torch
+from _torch_config_patch import patch_torch_config
 from torch.overrides import TorchFunctionMode
 
 import unsloth_zoo.rl_replacements as _rl
@@ -168,13 +169,13 @@ def test_default_scorer_keeps_sharing_the_head_parameter(monkeypatch, train_head
 
 @pytest.mark.parametrize("train_head", [False, True])
 @pytest.mark.parametrize("autocast_off", ["dtype_none", "disabled", "backward_off"])
-def test_compiled_scorer_without_autocast_shares_one_fp32_head(monkeypatch, autocast_off, train_head):
+def test_compiled_scorer_without_autocast_shares_one_fp32_head(monkeypatch, autocast_off, train_head, request):
     # Without autocast the compiled scorer's backward keeps its own fp32 head per call unless the head is pre-cast.
     if autocast_off == "backward_off":
         import torch._functorch.config as _functorch_config
         if not hasattr(_functorch_config, "backward_pass_autocast"):
             pytest.skip("torch has no backward_pass_autocast")
-        monkeypatch.setattr(_functorch_config, "backward_pass_autocast", "off")
+        patch_torch_config(request, _functorch_config, "backward_pass_autocast", "off")
         torch._dynamo.reset()
     monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "0")
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")

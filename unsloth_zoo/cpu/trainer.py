@@ -16,7 +16,7 @@
 
 """CPU defaults for transformers / TRL trainers. Installed only by the CPU backend."""
 
-__all__ = ["install_cpu_training_defaults", "normalize_cpu_training_arguments"]
+__all__ = ["install_cpu_training_defaults", "normalize_cpu_training_arguments", "cpu_packing_supported"]
 
 import functools
 import json
@@ -45,6 +45,14 @@ def _name(value):
     return getattr(value, "value", value)
 
 
+# TRL's SFTTrainer makes its collator padding-free for packing with these strategies (0.22: bfd; 1.x: bfd, bfd_split).
+_PADDING_FREE_STRATEGIES = ("bfd", "bfd_split")
+
+
+def _packing_strategy(args):
+    return str(_name(getattr(args, "packing_strategy", "bfd")) or "bfd").lower()
+
+
 def normalize_cpu_training_arguments(args):
     args.use_cpu = True
     if getattr(args, "fp16", False):
@@ -67,14 +75,29 @@ def normalize_cpu_training_arguments(args):
         args.tf32 = None
     if hasattr(args, "dataloader_pin_memory"):
         args.dataloader_pin_memory = False
-    # Packing / padding-free flatten a batch into one row with position_ids; SDPA on CPU then
-    # attends across examples. Keep TRL's padded batches.
-    if getattr(args, "padding_free", False):
+    # Packing / padding-free flatten a batch into one row with position_ids. transformers >= 4.53 on torch >= 2.6
+    # turns those resets into a block-diagonal SDPA / eager mask; older stacks, and TRL's "wrapped" strategy (no
+    # resets), attend across examples, so those keep TRL's padded batches.
+    supported = cpu_packing_supported()
+    wrapped = _packing_strategy(args) == "wrapped"
+    if getattr(args, "padding_free", False) and not supported:
+        print("Unsloth (CPU): padding_free needs transformers >= 4.53 and torch >= 2.6 to keep examples apart, "
+              "turning it off.")
         args.padding_free = False
     for key in ("packing", "eval_packing"):
-        if getattr(args, key, False):
-            print(f"Unsloth (CPU): {key} needs FlashAttention to keep packed examples apart, turning it off.")
+        if getattr(args, key, False) and (not supported or wrapped):
+            reason = "the 'wrapped' packing strategy attends across examples without FlashAttention" if supported \
+                else "keeping packed examples apart needs transformers >= 4.53 and torch >= 2.6 (or FlashAttention)"
+            print(f"Unsloth (CPU): {key}: {reason}, turning it off.")
             setattr(args, key, False)
+    # TRL's collator is padding-free (position_ids reset, no attention_mask) only for padding_free or bfd packing of
+    # the TRAIN set, and eval batches share it: eval_packing alone packs eval rows under a plain attention mask.
+    padding_free_collator = getattr(args, "padding_free", False) or (
+        getattr(args, "packing", False) and _packing_strategy(args) in _PADDING_FREE_STRATEGIES)
+    if getattr(args, "eval_packing", False) and not padding_free_collator:
+        print("Unsloth (CPU): eval_packing without packing / padding_free gives eval batches no position_ids "
+              "resets, so packed examples would attend across each other; turning it off.")
+        args.eval_packing = False
     if getattr(args, "gradient_checkpointing", False):
         kwargs = getattr(args, "gradient_checkpointing_kwargs", None) or {}
         if isinstance(kwargs, str):
@@ -84,6 +107,88 @@ def normalize_cpu_training_arguments(args):
         kwargs.setdefault("use_reentrant", False)
         args.gradient_checkpointing_kwargs = kwargs
     return args
+
+
+@functools.cache
+def cpu_packing_supported():
+    """transformers builds a block-diagonal mask from packed position_ids (masking_utils, 4.53+, needs torch 2.6), and
+    TRL's padding-free collator leaves attention_mask out, which that detection requires. UNSLOTH_CPU_PACKING=0 opts out."""
+    if os.environ.get("UNSLOTH_CPU_PACKING", "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    try:
+        from transformers import masking_utils
+        if not hasattr(masking_utils, "find_packed_sequence_indices") or \
+                not getattr(masking_utils, "_is_torch_greater_or_equal_than_2_6", False):
+            return False
+        from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
+        batch = DataCollatorForLanguageModeling(pad_token_id = 0, padding_free = True)(
+            [{"input_ids": [5, 6, 7]}, {"input_ids": [8, 9]}]
+        )
+        return "attention_mask" not in batch and torch.equal(batch["position_ids"][0], torch.tensor([0, 1, 2, 0, 1]))
+    except Exception:
+        return False
+
+
+def _packed_examples_isolated(model):
+    """A packed forward (position_ids reset, no attention_mask) gives the same logits as the examples alone: True
+    when this model's attention keeps packed examples apart on CPU."""
+    try:
+        from .loader import _disable_bnb_cpu_weight_packing
+        # bitsandbytes repacks 4-bit weights on a no-grad eval forward, which breaks their backward.
+        _disable_bnb_cpu_weight_packing(model)
+        config = getattr(model, "config", None)
+        vocab = getattr(getattr(config, "get_text_config", lambda: config)(), "vocab_size", None) or 32
+        device = next(model.parameters()).device
+        generator = torch.Generator().manual_seed(0)
+        a = torch.randint(1, max(2, min(vocab, 1000)), (1, 3), generator = generator).to(device)
+        b = torch.randint(1, max(2, min(vocab, 1000)), (1, 4), generator = generator).to(device)
+        position_ids = torch.tensor([[0, 1, 2, 0, 1, 2, 3]], device = device)
+        was_training = model.training
+        model.eval()
+        import contextlib
+        set_stance = getattr(torch.compiler, "set_stance", None)
+        # Compiled training layers would build an extra no-grad graph for these 3 calls.
+        eager = set_stance("force_eager") if set_stance is not None else contextlib.nullcontext()
+        try:
+            with torch.no_grad(), eager:
+                run = lambda **kw: model(use_cache = False, **kw).logits.float()  # noqa: E731
+                separate = torch.cat([run(input_ids = a), run(input_ids = b)], dim = 1)
+                packed = run(input_ids = torch.cat([a, b], dim = 1), position_ids = position_ids)
+        finally:
+            model.train(was_training)
+        # Relative to the logits' own scale (no floor: small-logit models must not get an absolute pass) and to the
+        # compute dtype: fp32 rounding between the packed and separate shapes stays near 1e-6, attending across
+        # examples moves the second example's logits by a sizeable fraction of their scale.
+        compute = next((p.dtype for p in model.parameters() if p.is_floating_point()), torch.float32)
+        tolerance = 1e-3 if compute in (torch.float32, torch.float64) else 2e-2
+        scale = separate.abs().amax().clamp(min = torch.finfo(torch.float32).tiny)
+        return bool(torch.isfinite(packed).all()) and float((packed - separate).abs().amax() / scale) < tolerance
+    except Exception:
+        return False
+
+
+def _check_cpu_packing(model, training_args):
+    """Per model: packing / padding_free stay on only when this model's attention keeps packed examples apart."""
+    keys = [key for key in ("packing", "eval_packing", "padding_free") if getattr(training_args, key, False)]
+    if not keys or model is None:
+        return None
+    if not isinstance(model, torch.nn.Module):
+        # A model id / path is loaded inside TRL after the dataset is packed, too late to probe its attention.
+        print(f"Unsloth (CPU): cannot check a model passed as {type(model).__name__} for packed-example isolation, "
+              f"turning {', '.join(keys)} off. Pass the loaded model to keep them.")
+        for key in keys:
+            setattr(training_args, key, False)
+        return False
+    if _packed_examples_isolated(model):
+        # Training forwards must not build a KV cache: a cache disables transformers' packed-sequence detection.
+        config = getattr(model, "config", None)
+        if config is not None:
+            config.use_cache = False
+        return True
+    print(f"Unsloth (CPU): {type(model).__name__} attends across packed examples on CPU, turning {', '.join(keys)} off.")
+    for key in keys:
+        setattr(training_args, key, False)
+    return False
 
 
 # Compiling the decoder layers cost 7 s (warm Inductor cache) to 138 s (cold, Qwen3-0.6B on a loaded 2-core slot) and
@@ -428,6 +533,7 @@ def _make_cpu_sft_trainer(base):
             # (under spawn its child re-imports an unguarded __main__): stock TRL must see None while it maps.
             training_args = kwargs.get("args", args[1] if len(args) > 1 else None)
             if training_args is not None:
+                _check_cpu_packing(kwargs.get("model", args[0] if args else None), training_args)
                 _auto_cpu_gradient_checkpointing(kwargs.get("model", args[0] if args else None), training_args)
             num_proc = getattr(training_args, "dataset_num_proc", None)
             serial = isinstance(num_proc, int) and not isinstance(num_proc, bool) and 0 <= num_proc <= 1

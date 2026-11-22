@@ -37,7 +37,12 @@ from .saved_attention import (
 )
 # Re-exported under its old name: it lives in integrated_device.py so the import-time
 # allocator block can share the topic without importing torch.
-from .integrated_device import _any_device_integrated, unified_memory_device_indices
+from .integrated_device import (
+    KEEP_ON_DEVICE_ENV,
+    _any_device_integrated,
+    _env_tristate,
+    unified_memory_device_indices,
+)
 from .device_type import (
     is_hip,
     get_device_type,
@@ -146,8 +151,16 @@ def _keeps_on_device(device_index, nbytes = 0):
         return False
     if not _WARNED_KEEP_ON_DEVICE:
         _WARNED_KEEP_ON_DEVICE = True
-        print("Unsloth: GPU shares memory with the CPU, so gradient checkpointing keeps activations on the device.")
+        if _keep_on_device_forced():
+            # A discrete GPU can be selected too: do not claim it shares memory with the CPU.
+            print(f"Unsloth: {KEEP_ON_DEVICE_ENV}=1, so gradient checkpointing keeps activations on the device.")
+        else:
+            print("Unsloth: GPU shares memory with the CPU, so gradient checkpointing keeps activations on the device.")
     return True
+
+
+def _keep_on_device_forced():
+    return _env_tristate(KEEP_ON_DEVICE_ENV) is True
 
 
 # Pinned (page-locked) host memory is a far smaller budget than VRAM or RAM, and
@@ -1780,6 +1793,9 @@ pass
 
 CPU_BUFFERS = []
 CPU_INDEX = None
+# None until initialize_unsloth_gradient_checkpointing runs (and again after unpatching): the "initialized"
+# sentinel. CPU_BUFFERS cannot be one, it stays [] on purpose when every device keeps its inputs.
+GPU_BUFFERS = None
 GPU_BUFFER_DTYPE = None
 
 # CPU_BUFFERS slots are leased per checkpoint until its backward, so 1F1B schedules (two forwards
@@ -3148,9 +3164,10 @@ def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None,
     function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
     if not torch.is_grad_enabled():
         return _call_without_checkpoint(function, *args, *tensor_args)
-    # Not `len(...) == 0`: unpatch_unsloth_smart_gradient_checkpointing sets CPU_BUFFERS
-    # to None, which is the state this shim normally starts from, and len(None) raises.
-    if not CPU_BUFFERS:
+    # Not `not CPU_BUFFERS`: when every device keeps its inputs (unified memory, UNSLOTH_GC_KEEP_ON_DEVICE=1)
+    # the pool stays empty on purpose, and re-initializing on every call reset the streams, the GPU buffers
+    # and the free-memory budget each time. unpatch_unsloth_smart_gradient_checkpointing sets both to None.
+    if CPU_BUFFERS is None or GPU_BUFFERS is None:
         initialize_unsloth_gradient_checkpointing(args[0].dtype)
     return UnslothCheckpointFunction.apply(function, preserve, *args, *tensor_args)
 

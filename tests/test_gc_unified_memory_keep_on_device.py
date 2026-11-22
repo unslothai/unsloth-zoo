@@ -337,3 +337,58 @@ def test_free_memory_is_re_read_periodically(G, monkeypatch):
     G._test_free = (0, 128 << 30)
     results = [G._keeps_on_device(None, 1024) for _ in range(G._KEEP_BUDGET_REFRESH)]
     assert results[-1] is False and len(G._test_free_reads) == 2
+
+
+def test_offloaded_checkpoint_initializes_once_when_every_device_keeps(G, monkeypatch):
+    """unsloth_offloaded_gradient_checkpoint (patch_unsloth_gradient_checkpointing) took an empty CPU_BUFFERS for
+    "not initialized", but every device keeping its inputs leaves it empty on purpose: each checkpoint call
+    re-initialized, resetting the streams, GPU buffers and the free-memory budget (one driver read per call)."""
+    monkeypatch.setattr(G, "_keep_on_device_indices", lambda: frozenset({None}))
+    monkeypatch.setattr(G, "_visible_device_count", lambda: 1)
+    stubs = {n: getattr(G, n) for n in ("GPU_BUFFERS", "GPU_BUFFERS_B", "USE_DOUBLE_BUFFER", "EXTRA_STREAMS",
+                                        "NEXT_BUFFER_SLOT", "MINIMUM_SIZE", "FP32_OFFLOAD_EXACT")}
+    real = G.initialize_unsloth_gradient_checkpointing
+    inits = []
+
+    def counting(dtype = None):
+        inits.append(dtype)
+        real(dtype)
+        assert G.CPU_BUFFERS == []  # every device keeps: no pinned pool
+        for n, v in stubs.items(): setattr(G, n, v)  # CPU stand-ins for the device buffers / streams
+    monkeypatch.setattr(G, "initialize_unsloth_gradient_checkpointing", counting)
+    ref = _grads(G, ckpt = False)
+    G.CPU_BUFFERS, G.GPU_BUFFERS = [], None  # the import-time state
+    G._test_free_reads.clear()
+
+    g = torch.Generator().manual_seed(0)
+    ws = [(torch.randn(H, H, generator = g) / H ** 0.5).requires_grad_() for _ in range(L)]
+    x = torch.randn(2, S, H, generator = g).requires_grad_()
+    for step in range(2):
+        h = x * 1.0
+        for w in ws:
+            h = G.unsloth_offloaded_gradient_checkpoint((lambda w: lambda h: h + torch.tanh(h @ w))(w), h)
+        h.square().mean().backward()
+        G.BACKWARD_PASS = True
+        G.FIRST_PASS = False
+    got = [w.grad.clone() for w in ws] + [x.grad.clone()]
+    assert len(inits) == 1, f"{len(inits)} initializations for {2 * L} checkpoint calls"
+    assert len(G._test_free_reads) == 1  # the budget survives between calls
+    assert G._test_leases == []
+    for a, b in zip(ref, got): torch.testing.assert_close(a, b, rtol = 0, atol = 0)
+
+
+@pytest.mark.parametrize("forced, expect", [
+    ("1", "UNSLOTH_GC_KEEP_ON_DEVICE=1, so gradient checkpointing keeps activations on the device."),
+    (None, "GPU shares memory with the CPU, so gradient checkpointing keeps activations on the device."),
+])
+def test_keep_message_names_the_reason(G, monkeypatch, capsys, forced, expect):
+    """UNSLOTH_GC_KEEP_ON_DEVICE=1 also selects discrete GPUs: the notice must not claim shared memory there."""
+    if forced is None:
+        monkeypatch.delenv("UNSLOTH_GC_KEEP_ON_DEVICE", raising = False)
+    else:
+        monkeypatch.setenv("UNSLOTH_GC_KEEP_ON_DEVICE", forced)
+    monkeypatch.setattr(G, "_keep_on_device_indices", lambda: frozenset({0}))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda i = None: 0)
+    monkeypatch.setattr(G, "_WARNED_KEEP_ON_DEVICE", False)
+    assert G._keeps_on_device(0, 1024) is True
+    assert expect in capsys.readouterr().out

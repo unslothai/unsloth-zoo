@@ -353,6 +353,11 @@ def test_compile_error_after_a_graph_break_restarts_the_checkpoint_eagerly(monke
             torch._dynamo.graph_break()
             return self.down(x) * 2.0
 
+    if loader._checkpoints_inside_forward(Block()):
+        # transformers >= 5.23 checkpoints inside forward, so the compiled call contains the checkpoint and Dynamo
+        # cannot split it at a graph break: no segment compiles before the failure, the case this test pins.
+        pytest.skip("this transformers checkpoints inside forward; no compiled segment precedes the graph break")
+
     graphs = []
 
     def first_segment_only(gm, example_inputs):
