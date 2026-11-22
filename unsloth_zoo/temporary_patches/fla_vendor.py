@@ -986,9 +986,11 @@ def _live_fla_kernel(module_name, name):
     return getattr(module, name, None) if module is not None else None
 
 
-def _repair_kernel_hub_closures(packages=_HUB_REPAIR_MODELING):
+def _repair_kernel_hub_closures(packages=_HUB_REPAIR_MODELING, cpu_wrapped_only=False):
     """Re-apply kernel-hub decorators frozen before the live fla existed (post-#47630).
-    Re-decorate rather than patch cell_contents: the wrapper also closes over param names."""
+    Re-decorate rather than patch cell_contents: the wrapper also closes over param names.
+    cpu_wrapped_only: only closures holding exactly the kernel the CPU pure-torch wrapper now wraps
+    (models whose fla binding is otherwise left alone, such as olmo_hybrid on installed fla)."""
     try:
         from transformers.integrations.hub_kernels import (
             use_kernel_func_from_hub_with_fallback,
@@ -1011,6 +1013,12 @@ def _repair_kernel_hub_closures(packages=_HUB_REPAIR_MODELING):
             current = _resolved_implementation(wrapper)
             live = _live_fla_kernel(kernel_module, kernel)
             if live is not None and current is live:
+                continue
+            if cpu_wrapped_only and (
+                live is None
+                or getattr(live, _CPU_TORCH_MARK, None) is None
+                or current is not getattr(live, "__wrapped__", None)
+            ):
                 continue
             try:
                 rebuilt = use_kernel_func_from_hub_with_fallback(kernel, "fla")(original)
@@ -1246,7 +1254,7 @@ def _install_gdn_backend():
 # float32 calls leave fla: they take transformers' pure-torch chunked reference. Never on CUDA.
 _ROCM_FP32_TORCH_PATH_GFX = "gfx11"
 _ROCM_FP32_MARK = "_unsloth_rocm_fp32_torch_path"
-_rocm_fp32_state = {"arch": {}, "reference": None, "calls": 0, "logged": False}
+_rocm_fp32_state = {"arch": {}, "reference": None, "recurrent_reference": None, "calls": 0, "logged": False}
 
 
 def _hip_gfx_arch(torch_mod, index):
@@ -1292,33 +1300,40 @@ def _rocm_fp32_on_faulting_gpu(*tensors):
     return False
 
 
-def _torch_reference_chunk_gated_delta_rule():
-    """transformers' pure-torch ``torch_chunk_gated_delta_rule`` (the kernel-hub fallback), unwrapped."""
-    if _rocm_fp32_state["reference"] is not None:
-        return _rocm_fp32_state["reference"]
-    fn = None
-    try:
-        from transformers.models.qwen3_next.modeling_qwen3_next import torch_chunk_gated_delta_rule as fn
-    except Exception:
+def _torch_reference_gated_delta_rule(recurrent = False):
+    """transformers' pure-torch ``torch_chunk_gated_delta_rule`` (or ``torch_recurrent_gated_delta_rule``,
+    the kernel-hub fallbacks), unwrapped. The recurrent one decays the state token by token like fla's
+    fused_recurrent kernel, so a reset gate (g = -inf, decay exp(g) = 0) clears it; the chunk one forms
+    exp(g_i - g_j) from cumulative gates, which is -inf - -inf = NaN there."""
+    key = "recurrent_reference" if recurrent else "reference"
+    if _rocm_fp32_state[key] is not None:
+        return _rocm_fp32_state[key]
+    name = "torch_recurrent_gated_delta_rule" if recurrent else "torch_chunk_gated_delta_rule"
+    for model in ("qwen3_next", "qwen3_5", "qwen3_5_moe"):
         try:
-            from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule as fn
+            fn = getattr(importlib.import_module(f"transformers.models.{model}.modeling_{model}"), name)
         except Exception:
-            try:
-                from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import torch_chunk_gated_delta_rule as fn
-            except Exception:
-                fn = None
-    if fn is not None:
-        _rocm_fp32_state["reference"] = inspect.unwrap(fn)
-        return _rocm_fp32_state["reference"]
-    raise RuntimeError("Unsloth: transformers has no torch_chunk_gated_delta_rule to run float32 gated delta on ROCm gfx11.")
+            continue
+        reference = inspect.unwrap(fn)
+        # Filled only outside tracing: a cache filled mid-trace invalidates that trace's guard (a second graph).
+        if not _compiling():
+            _rocm_fp32_state[key] = reference
+        return reference
+    raise RuntimeError(f"Unsloth: transformers has no {name} to run gated delta in pure torch.")
+
+
+def _torch_reference_chunk_gated_delta_rule():
+    return _torch_reference_gated_delta_rule(recurrent = False)
 
 
 def _rocm_fp32_chunk_gated_delta_rule(
-    q, k, v, g, beta, scale = None, initial_state = None, output_final_state = False,
+    q, k, v, g, beta = None, scale = None, initial_state = None, output_final_state = False,
     use_qk_l2norm_in_kernel = False, use_beta_sigmoid_in_kernel = False, allow_neg_eigval = False,
-    state_v_first = False, cu_seqlens = None, cu_seqlens_cpu = None, cp_context = None, **kwargs,
+    state_v_first = False, cu_seqlens = None, cu_seqlens_cpu = None, cp_context = None, *, _recurrent = False,
+    **kwargs,
 ):
-    """fla's ``chunk_gated_delta_rule`` contract computed by transformers' torch reference."""
+    """fla's ``chunk_gated_delta_rule`` contract computed by transformers' torch reference; ``_recurrent``:
+    fla's ``fused_recurrent_gated_delta_rule`` contract (token-by-token reference, output in v's dtype)."""
     import torch
     if "transpose_state_layout" in kwargs:
         # fla's deprecated name for state_v_first, with fla's conflict check.
@@ -1330,7 +1345,10 @@ def _rocm_fp32_chunk_gated_delta_rule(
             "Unsloth: gated delta runs in pure torch for CPU tensors and for float32 on ROCm gfx11, which does "
             "not support context parallel, use_gate_in_kernel or head_first. Use bfloat16 / float16 on the GPU."
         )
-    reference = _torch_reference_chunk_gated_delta_rule()
+    reference = _torch_reference_gated_delta_rule(_recurrent)
+    if _recurrent and beta is None:
+        # fla's fused_recurrent default: beta = 1 per value head.
+        beta = v.new_ones(v.shape[:-1])
     if use_beta_sigmoid_in_kernel:
         beta = beta.float().sigmoid() * (2.0 if allow_neg_eigval else 1.0)
     groups = v.shape[2] // q.shape[2]
@@ -1372,6 +1390,8 @@ def _rocm_fp32_chunk_gated_delta_rule(
         final_state = torch.cat(states, dim = 0) if output_final_state else None
     if final_state is not None and state_v_first:
         final_state = final_state.transpose(-1, -2).contiguous()
+    if _recurrent:
+        o = o.to(v.dtype)  # fla's fused_recurrent allocates its output like v
     return o, final_state
 
 
@@ -1419,6 +1439,41 @@ def _make_rocm_fp32_guard(original, what):
     return guarded
 
 
+# Every spelling a gated-delta entry point is exported under (fla's package, its parent fla.ops, the kernel
+# submodule, the decode alias added above); a wrapper installed on the canonical name is rebound onto each
+# of them that still names the callable it wraps, so no shorthand keeps the unwrapped kernel.
+_GATED_DELTA_EXPORTS = {
+    "chunk_gated_delta_rule": ("chunk_gdn",),
+    "fused_recurrent_gated_delta_rule": ("fused_recurrent_gdn",),
+}
+_GATED_DELTA_NAMESPACES = (
+    "fla.ops",
+    "fla.ops.gated_delta_rule",
+    "fla.ops.gated_delta_rule.chunk",
+    "fla.ops.gated_delta_rule.fused_recurrent",
+)
+
+
+def _gated_delta_export_names(name):
+    aliases = tuple(alias for alias, source in _MISSING_GATED_DELTA_ALIASES.items() if source == name)
+    return (name,) + _GATED_DELTA_EXPORTS.get(name, ()) + aliases
+
+
+def _rebind_gated_delta_exports(name, original, wrapped, modules = ()):
+    """Point every export of ``name`` that is still ``original`` at ``wrapped`` (identity only, so a
+    separately implemented export is never replaced), in fla's namespaces and in ``modules``."""
+    rebound = 0
+    for modname in _GATED_DELTA_NAMESPACES + tuple(modules):
+        module = sys.modules.get(modname)
+        if module is None:
+            continue
+        for export in _gated_delta_export_names(name):
+            if getattr(module, export, None) is original:
+                setattr(module, export, wrapped)
+                rebound += 1
+    return rebound
+
+
 def _install_rocm_fp32_torch_path(torch_mod=None):
     """ROCm with a gfx11 GPU: route the live fla's float32 chunk_gated_delta_rule calls to the
     torch reference and guard its float32 internals. Anything else: nothing is touched. Idempotent."""
@@ -1437,19 +1492,13 @@ def _install_rocm_fp32_torch_path(torch_mod=None):
     except Exception:
         wrapped = _make_rocm_fp32_chunk_gated_delta_rule(original)
     setattr(wrapped, _ROCM_FP32_MARK, "torch")
-    package.chunk_gated_delta_rule = wrapped
+    # The package, chunk_gdn and modeling modules (and unsloth's compiled copies) that bound the original.
+    _rebind_gated_delta_exports("chunk_gated_delta_rule", original, wrapped, _l2norm_modules(_GATED_DELTA_MODELING))
     if chunk_mod is not None:
-        if getattr(chunk_mod, "chunk_gated_delta_rule", None) is original:
-            chunk_mod.chunk_gated_delta_rule = wrapped
         for name in ("chunk_gated_delta_rule_fwd", "chunk_gated_delta_rule_bwd"):
             fn = getattr(chunk_mod, name, None)
             if fn is not None and getattr(fn, _ROCM_FP32_MARK, None) is None:
                 setattr(chunk_mod, name, _make_rocm_fp32_guard(fn, name))
-    # Modeling modules (and unsloth's compiled copies) that bound the original at import.
-    for modname in _l2norm_modules(_GATED_DELTA_MODELING):
-        mod = sys.modules.get(modname)
-        if mod is not None and getattr(mod, "chunk_gated_delta_rule", None) is original:
-            setattr(mod, "chunk_gated_delta_rule", wrapped)
     if UNSLOTH_ENABLE_LOGGING:
         logger.info("Unsloth: float32 gated-delta calls on ROCm gfx11 take the pure-torch path.")
     return True
@@ -1494,6 +1543,7 @@ def _make_cpu_gated_delta_rule(original, recurrent):
                     "which supports a scalar gate g only (no gk / gv)."
                 )
             extra["use_gate_in_kernel"] = a.pop("use_gate_in_kernel", False)
+            extra["_recurrent"] = True
             a.pop("A_log", None)
             a.pop("dt_bias", None)
         # Host-side bookkeeping only outside tracing: a traced global counter is a guard, recompiling every call.
@@ -1515,30 +1565,24 @@ def _install_cpu_torch_path():
     if package is None:
         return False
     installed = False
-    for name, submodule, recurrent in (
-        ("chunk_gated_delta_rule", "fla.ops.gated_delta_rule.chunk", False),
-        ("fused_recurrent_gated_delta_rule", "fla.ops.gated_delta_rule.fused_recurrent", True),
-    ):
+    for name, recurrent in (("chunk_gated_delta_rule", False), ("fused_recurrent_gated_delta_rule", True)):
         original = getattr(package, name, None)
         if original is None:
             continue
+        try:
+            # Resolved here, not in the first (possibly traced) call: an import there breaks the graph.
+            _torch_reference_gated_delta_rule(recurrent)
+        except Exception:
+            pass
         if getattr(original, _CPU_TORCH_MARK, None) is not None:
-            installed = True
-            continue
-        wrapped = _make_cpu_gated_delta_rule(original, recurrent)
-        setattr(package, name, wrapped)
-        # The decode alias (recurrent_gated_delta_rule, added before this runs) must follow the
-        # wrapper, or transformers' kernel-hub lookup resolves the unwrapped Triton kernel.
-        for alias, source in _MISSING_GATED_DELTA_ALIASES.items():
-            if source == name and getattr(package, alias, None) is original:
-                setattr(package, alias, wrapped)
-        sub = sys.modules.get(submodule)
-        if sub is not None and getattr(sub, name, None) is original:
-            setattr(sub, name, wrapped)
-        for modname in _l2norm_modules(_GATED_DELTA_MODELING):
-            mod = sys.modules.get(modname)
-            if mod is not None and getattr(mod, name, None) is original:
-                setattr(mod, name, wrapped)
+            # Installed already: still pick up a shorthand or alias bound to the unwrapped kernel since.
+            wrapped, original = original, getattr(original, "__wrapped__", None)
+        else:
+            wrapped = _make_cpu_gated_delta_rule(original, recurrent)
+        if original is not None:
+            # Every export (package, fla.ops, kernel submodule, chunk_gdn / fused_recurrent_gdn, the decode
+            # alias) and the modeling modules that bound the kernel at import.
+            _rebind_gated_delta_exports(name, original, wrapped, _l2norm_modules(_GATED_DELTA_MODELING))
         installed = True
     return installed
 
@@ -1726,6 +1770,8 @@ def patch_vendor_fla(phase=None):
                 logger.warning(f"Unsloth: could not enable UNSLOTH_GDN_BACKEND: {e}")
             try:
                 _repair_kernel_hub_closures()
+                # olmo_hybrid bound before the patch keeps its fla kernel, but not one CPU tensors cannot run.
+                _repair_kernel_hub_closures(_UNCOVERED_GATED_DELTA, cpu_wrapped_only=True)
             except Exception as e:
                 if UNSLOTH_ENABLE_LOGGING:
                     logger.warning(f"Unsloth: could not re-resolve fla kernel closures: {e}")

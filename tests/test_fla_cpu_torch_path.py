@@ -205,3 +205,162 @@ def test_cpu_path_repeated_compiled_calls_reuse_one_graph(monkeypatch):
     torch.testing.assert_close(out, layer(q, k, v, g, beta))
     assert counter.frame_count == 1
     assert calls == []
+
+
+def _bind_every_alias(monkeypatch, package, chunk, recurrent):
+    """Installed fla's and the vendored tree's other spellings: chunk_gdn / fused_recurrent_gdn in the kernel
+    submodules and the package, the fla.ops re-exports and the decode alias (recurrent_gated_delta_rule)."""
+    ops = types.ModuleType("fla.ops")
+    ops.gated_delta_rule = package
+    root = types.ModuleType("fla")
+    root.ops = ops
+    chunk_fn, recurrent_fn = package.chunk_gated_delta_rule, package.fused_recurrent_gated_delta_rule
+    for module in (package, ops):
+        module.chunk_gated_delta_rule = module.chunk_gdn = chunk_fn
+        module.fused_recurrent_gated_delta_rule = module.fused_recurrent_gdn = recurrent_fn
+    package.recurrent_gated_delta_rule = recurrent_fn
+    chunk.chunk_gdn = chunk_fn
+    recurrent.fused_recurrent_gdn = recurrent_fn
+    monkeypatch.setitem(sys.modules, "fla", root)
+    monkeypatch.setitem(sys.modules, "fla.ops", ops)
+    return ops
+
+
+_CHUNK_SPELLINGS = [("package", "chunk_gdn"), ("chunk", "chunk_gdn"), ("ops", "chunk_gated_delta_rule"), ("ops", "chunk_gdn")]
+_RECURRENT_SPELLINGS = [
+    ("package", "recurrent_gated_delta_rule"), ("package", "fused_recurrent_gdn"), ("recurrent", "fused_recurrent_gdn"),
+    ("ops", "fused_recurrent_gated_delta_rule"), ("ops", "fused_recurrent_gdn"),
+]
+
+
+@pytest.mark.parametrize("where, name", _CHUNK_SPELLINGS + _RECURRENT_SPELLINGS)
+def test_every_gated_delta_spelling_takes_the_cpu_path(monkeypatch, where, name):
+    package, chunk, recurrent, modeling, calls = _install_fake_fla(monkeypatch)
+    ops = _bind_every_alias(monkeypatch, package, chunk, recurrent)
+    _run_patch_vendor_fla(monkeypatch)
+    _run_patch_vendor_fla(monkeypatch)  # a second install keeps every spelling on the one wrapper
+    fn = getattr({"package": package, "chunk": chunk, "recurrent": recurrent, "ops": ops}[where], name)
+    assert getattr(fn, fla_vendor._CPU_TORCH_MARK, None) == "torch"
+    B, T = 1, (6 if (where, name) in _CHUNK_SPELLINGS else 1)
+    q, k, v, g, beta = _inputs(B, T, 2, 4, 8, 8)
+    h0 = torch.randn(B, 4, 8, 8, generator = torch.Generator().manual_seed(5)) * 0.1
+    o_ref, ht_ref = _recurrent_fp64(q, k, v, g, beta, 8 ** -0.5, h0)
+    o, ht = fn(q, k, v, g = g, beta = beta, initial_state = h0, output_final_state = True, use_qk_l2norm_in_kernel = True)
+    torch.testing.assert_close(o.double(), o_ref, atol = 2e-5, rtol = 1e-4)
+    torch.testing.assert_close(ht.double(), ht_ref, atol = 2e-5, rtol = 1e-4)
+    assert calls == []
+
+
+def test_rocm_wrapper_installed_first_keeps_chunk_gdn_on_the_cpu_path(monkeypatch):
+    """The gfx11 float32 wrapper replaces the canonical chunk callable first; chunk_gdn must follow it, or the
+    CPU installer (which matches by identity) leaves the shorthand on the raw kernel."""
+    package, chunk, recurrent, modeling, calls = _install_fake_fla(monkeypatch)
+    ops = _bind_every_alias(monkeypatch, package, chunk, recurrent)
+    monkeypatch.setattr(fla_vendor, "_rocm_has_fp32_faulting_gpu", lambda *a, **k: True)
+    assert fla_vendor._install_rocm_fp32_torch_path()
+    assert fla_vendor._install_cpu_torch_path()
+    q, k, v, g, beta = _inputs(1, 6, 2, 2, 8, 8)
+    o_ref, _ = _recurrent_fp64(q, k, v, g, beta, 8 ** -0.5)
+    for fn in (package.chunk_gated_delta_rule, package.chunk_gdn, chunk.chunk_gdn, ops.chunk_gdn):
+        o, _ = fn(q, k, v, g = g, beta = beta, use_qk_l2norm_in_kernel = True)
+        torch.testing.assert_close(o.double(), o_ref, atol = 2e-5, rtol = 1e-4)
+    assert calls == []
+
+
+def test_a_separately_implemented_export_is_never_rebound(monkeypatch):
+    package, chunk, recurrent, modeling, calls = _install_fake_fla(monkeypatch)
+
+    def upstream_recurrent(q, k, v, g, beta):
+        return "upstream"
+
+    package.recurrent_gated_delta_rule = package.fused_recurrent_gdn = upstream_recurrent
+    _run_patch_vendor_fla(monkeypatch)
+    assert getattr(package.fused_recurrent_gated_delta_rule, fla_vendor._CPU_TORCH_MARK, None) == "torch"
+    assert package.recurrent_gated_delta_rule is upstream_recurrent
+    assert package.fused_recurrent_gdn is upstream_recurrent
+
+
+def test_cpu_decode_reset_gate_clears_the_state_instead_of_nan(monkeypatch):
+    """g = -inf is a full reset (decay exp(g) = 0): fla's fused_recurrent kernel and the fp64 recurrence
+    give a finite output and state; the chunk reference forms -inf - -inf = NaN in its decay matrix."""
+    package, chunk, recurrent, modeling, calls = _install_fake_fla(monkeypatch)
+    _run_patch_vendor_fla(monkeypatch)
+    q, k, v, g, beta = _inputs(1, 1, 2, 4, 8, 8)
+    g = torch.full_like(g, -float("inf"))
+    h0 = torch.ones(1, 4, 8, 8)
+    o_ref, ht_ref = _recurrent_fp64(q, k, v, g, beta, 8 ** -0.5, h0)
+    assert torch.isfinite(o_ref).all() and torch.isfinite(ht_ref).all()
+    o, ht = package.fused_recurrent_gated_delta_rule(
+        q, k, v, g = g, beta = beta, initial_state = h0, output_final_state = True, use_qk_l2norm_in_kernel = True,
+    )
+    torch.testing.assert_close(o.double(), o_ref, atol = 2e-5, rtol = 1e-4)
+    torch.testing.assert_close(ht.double(), ht_ref, atol = 2e-5, rtol = 1e-4)
+    assert calls == []
+
+
+def test_cpu_decode_keeps_fla_defaults_and_output_dtype(monkeypatch):
+    """fla's fused_recurrent: beta defaults to 1 per value head, the output is allocated like v."""
+    package, chunk, recurrent, modeling, calls = _install_fake_fla(monkeypatch)
+    _run_patch_vendor_fla(monkeypatch)
+    q, k, v, g, beta = _inputs(1, 1, 2, 4, 8, 8)
+    o_ref, _ = _recurrent_fp64(q, k, v, g, torch.ones_like(beta), 8 ** -0.5)
+    for passed in ({}, {"beta": None}):
+        o, _ = package.fused_recurrent_gated_delta_rule(q, k, v, g = g, use_qk_l2norm_in_kernel = True, **passed)
+        torch.testing.assert_close(o.double(), o_ref, atol = 2e-5, rtol = 1e-4)
+    o, _ = package.fused_recurrent_gated_delta_rule(q, k, v.bfloat16(), g = g, beta = beta, use_qk_l2norm_in_kernel = True)
+    assert o.dtype == torch.bfloat16
+    assert calls == []
+
+
+def test_cold_reference_cache_compiles_one_graph(monkeypatch):
+    from torch._dynamo.testing import CompileCounter
+
+    monkeypatch.setitem(fla_vendor._rocm_fp32_state, "reference", None)
+    package, chunk, recurrent, modeling, calls = _install_fake_fla(monkeypatch)
+    _run_patch_vendor_fla(monkeypatch)
+    q, k, v, g, beta = _inputs(1, 8, 2, 2, 8, 8)
+    fn = package.chunk_gated_delta_rule
+    counter = CompileCounter()
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(lambda *t: fn(*t, use_qk_l2norm_in_kernel = True)[0] * 2, backend = counter)
+        for _ in range(3):
+            compiled(q, k, v, g, beta)
+    finally:
+        torch._dynamo.reset()
+    assert counter.frame_count == 1
+
+
+def test_olmo_hybrid_bound_before_the_patch_takes_the_cpu_path(monkeypatch):
+    """olmo_hybrid is left out of the general kernel-hub repair; a closure that captured the raw kernel the
+    CPU wrapper now wraps is still re-resolved, so CPU decode never reaches Triton."""
+    hub = pytest.importorskip("transformers.integrations.hub_kernels")
+    decorate = getattr(hub, "use_kernel_func_from_hub_with_fallback", None)
+    if decorate is None:
+        pytest.skip("transformers without use_kernel_func_from_hub_with_fallback")
+    package, chunk, recurrent, modeling, calls = _install_fake_fla(monkeypatch)
+    _bind_every_alias(monkeypatch, package, chunk, recurrent)
+    from transformers.models.qwen3_next import modeling_qwen3_next as qwen3_next
+
+    olmo = types.ModuleType("transformers.models.olmo_hybrid.modeling_olmo_hybrid")
+    olmo.torch_recurrent_gated_delta_rule = decorate("fused_recurrent_gated_delta_rule", "fla")(
+        inspect_unwrap(qwen3_next.torch_recurrent_gated_delta_rule))
+    assert fla_vendor._resolved_implementation(olmo.torch_recurrent_gated_delta_rule) is package.fused_recurrent_gated_delta_rule
+    monkeypatch.setitem(sys.modules, olmo.__name__, olmo)
+    monkeypatch.setenv("UNSLOTH_DISABLE_VENDORED_FLA", "1")
+    monkeypatch.setenv("FLA_FLASH_QLA", "0")
+    for name in ("_patch_l2norm_fp32_on_torch_path", "_alias_missing_gated_delta_names", "_install_fp32_ieee_dots",
+                 "_install_gdn_backend", "_install_glm5_kda_safe_gate", "_install_rocm_fp32_torch_path"):
+        monkeypatch.setattr(fla_vendor, name, lambda *a, **k: None)
+    monkeypatch.setattr(fla_vendor, "_gpu_lacks_dot_instructions", lambda *a, **k: False)
+    fla_vendor.patch_vendor_fla()
+    q, k, v, g, beta = _inputs(1, 1, 2, 2, 8, 8)
+    o_ref, _ = _recurrent_fp64(q, k, v, g, beta, 8 ** -0.5)
+    o, _ = olmo.torch_recurrent_gated_delta_rule(q, k, v, g = g, beta = beta, use_qk_l2norm_in_kernel = True)
+    torch.testing.assert_close(o.double(), o_ref, atol = 2e-5, rtol = 1e-4)
+    assert calls == []
+
+
+def inspect_unwrap(fn):
+    import inspect
+    return inspect.unwrap(fn)

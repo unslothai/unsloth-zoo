@@ -354,6 +354,13 @@ def test_decode_alias_never_overwrites_a_real_export(monkeypatch):
     assert added == (), added
     assert fake.recurrent_gated_delta_rule is upstream
     assert fake.__all__.count("recurrent_gated_delta_rule") == 1
+    # Nor does the CPU wrapper installed afterwards (it rebinds by identity only).
+    from unsloth_zoo.temporary_patches import fla_vendor
+    for name in ("fla.ops", "fla.ops.gated_delta_rule.chunk", "fla.ops.gated_delta_rule.fused_recurrent"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    assert fla_vendor._install_cpu_torch_path()
+    assert getattr(fake.fused_recurrent_gated_delta_rule, fla_vendor._CPU_TORCH_MARK, None) == "torch"
+    assert fake.recurrent_gated_delta_rule is upstream
 
 
 def test_decode_alias_noop_on_partial_fla(monkeypatch):
@@ -393,8 +400,13 @@ def test_decode_alias_follows_the_cpu_torch_wrapper(monkeypatch):
     for name in ("fla.ops.gated_delta_rule.chunk", "fla.ops.gated_delta_rule.fused_recurrent"):
         monkeypatch.delitem(sys.modules, name, raising=False)
     assert fla_vendor._install_cpu_torch_path()
-    assert fake.fused_recurrent_gated_delta_rule is not fused_recurrent_gated_delta_rule
-    assert fake.recurrent_gated_delta_rule is fake.fused_recurrent_gated_delta_rule
+    wrapped = fake.fused_recurrent_gated_delta_rule
+    assert wrapped is not fused_recurrent_gated_delta_rule
+    assert fake.recurrent_gated_delta_rule is wrapped
+    # A second install keeps the one wrapper on both names.
+    assert fla_vendor._install_cpu_torch_path()
+    assert fake.fused_recurrent_gated_delta_rule is wrapped
+    assert fake.recurrent_gated_delta_rule is wrapped
 
 
 def test_decode_alias_survives_absent_fla(monkeypatch):
