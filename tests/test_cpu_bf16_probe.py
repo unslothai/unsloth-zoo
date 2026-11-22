@@ -317,7 +317,11 @@ def test_concurrent_writers_never_tear_the_file(probe_cache_dir):
     reads = 0
     while any(w.poll() is None for w in workers):
         if os.path.exists(path):
-            with open(path, encoding = "utf-8") as f:
+            try:
+                f = open(path, encoding = "utf-8")
+            except PermissionError:
+                continue  # Windows refuses an open while os.replace swaps the file; the reader treats it as a miss
+            with f:
                 assert isinstance(json.load(f), dict)  # os.replace: a reader never sees a partial write
             reads += 1
     assert all(w.wait() == 0 for w in workers)
