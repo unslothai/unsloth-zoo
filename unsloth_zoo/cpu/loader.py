@@ -17,6 +17,7 @@
 __all__ = ["FastCPUModel"]
 
 import contextlib
+import gc
 import functools
 import os
 import re
@@ -394,8 +395,15 @@ def _restartable(layer):
         def __call__(self, *args, **kwargs):
             self.__dict__["_unsloth_restart_depth"] = self.__dict__.get("_unsloth_restart_depth", 0) + 1
             try:
-                return cls.__call__(self, *args, **kwargs)
-            except _RestartEagerly:
+                try:
+                    return cls.__call__(self, *args, **kwargs)
+                except _RestartEagerly as error:
+                    # The aborted checkpoint's generator still holds its saved-tensor hooks (non-reentrant
+                    # checkpoint never closes it when the function raises) and the traceback keeps it alive: drop
+                    # both before the retry, or its tensors land in the aborted frame and backward raises.
+                    error.__traceback__ = None
+                    del error
+                gc.collect()
                 return cls.__call__(self, *args, **kwargs)
             finally:
                 self.__dict__["_unsloth_restart_depth"] -= 1
