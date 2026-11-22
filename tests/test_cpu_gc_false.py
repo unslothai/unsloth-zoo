@@ -66,3 +66,39 @@ def test_get_peft_model_records_the_choice():
     assert getattr(lora, "_unsloth_cpu_gradient_checkpointing") is False
     loader.FastCPUModel.for_training(lora, use_gradient_checkpointing = True)
     assert getattr(lora, "_unsloth_cpu_gradient_checkpointing") is True
+
+
+def test_use_gradient_checkpointing_false_also_clears_activation_checkpointing(monkeypatch, tmp_path):
+    """transformers >= 5.24 enables checkpointing from activation_checkpointing (gradient_checkpointing is its alias):
+    clearing only the alias left recomputation on in every training step."""
+    from transformers import TrainingArguments
+    from unsloth_zoo.cpu import trainer
+    monkeypatch.setattr(trainer, "available_ram", lambda: 0, raising = False)
+    model = torch.nn.Linear(2, 2)
+    model._unsloth_cpu_gradient_checkpointing = False
+    args = _GcArgs()
+    args.activation_checkpointing = True
+    assert trainer._auto_cpu_gradient_checkpointing(model, args) is True
+    assert args.gradient_checkpointing is False and args.activation_checkpointing is False
+    # Only the new name set (5.24 spelling): still read and cleared.
+    args = _GcArgs(gc = False)
+    args.activation_checkpointing = True
+    assert trainer._auto_cpu_gradient_checkpointing(model, args) is True
+    assert args.activation_checkpointing is False
+    # The installed transformers' own TrainingArguments, whichever field its Trainer reads.
+    real = TrainingArguments(output_dir = str(tmp_path), gradient_checkpointing = True, report_to = "none")
+    assert trainer._auto_cpu_gradient_checkpointing(model, real) is True
+    assert not real.gradient_checkpointing and not getattr(real, "activation_checkpointing", False)
+
+
+def test_auto_checkpointing_off_also_clears_activation_checkpointing(monkeypatch):
+    """The memory default ("unsloth", activations fit) must clear the field transformers >= 5.24 reads, too."""
+    from unsloth_zoo.cpu import trainer
+    monkeypatch.setattr(trainer, "available_ram", lambda: 1 << 40, raising = False)
+    monkeypatch.delenv("UNSLOTH_CPU_AUTO_GC", raising = False)
+    model = _tiny_model()
+    model._unsloth_cpu_gradient_checkpointing = "unsloth"
+    args = _GcArgs()
+    args.activation_checkpointing = True
+    assert trainer._auto_cpu_gradient_checkpointing(model, args) is True
+    assert args.gradient_checkpointing is False and args.activation_checkpointing is False

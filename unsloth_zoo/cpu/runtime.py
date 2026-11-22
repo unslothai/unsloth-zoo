@@ -22,6 +22,7 @@ __all__ = [
     "cpu_bnb_4bit_supported",
     "cpu_capabilities",
     "apply_cpu_security_patches",
+    "available_ram",
 ]
 
 import functools
@@ -178,6 +179,72 @@ def cpu_bnb_4bit_supported():
             return bool(torch.isfinite(y).all()) and x.grad is not None and bool(torch.isfinite(x.grad).all())
     except Exception:
         return False
+
+
+_CGROUP_ROOT = "/sys/fs/cgroup"
+_PROC_SELF_CGROUP = "/proc/self/cgroup"
+
+
+def _cgroup_memory_headroom():
+    """Smallest memory.max - memory.current over this process's cgroup v2 and every ancestor (a limit set on an
+    enclosing job / slice applies even when the leaf says max), or None when no finite limit is readable."""
+    try:
+        with open(_PROC_SELF_CGROUP) as f:
+            path = next((line.split(":", 2)[2].strip() for line in f if line.startswith("0::")), None)
+    except OSError:
+        return None
+    if path is None:
+        return None
+    headroom = None
+    parts = [part for part in path.strip("/").split("/") if part]
+    for depth in range(len(parts), -1, -1):
+        base = os.path.join(_CGROUP_ROOT, *parts[:depth])
+        try:
+            with open(os.path.join(base, "memory.max")) as f:
+                limit = f.read().strip()
+            if limit == "max":
+                continue
+            with open(os.path.join(base, "memory.current")) as f:
+                used = int(f.read())
+            room = max(0, int(limit) - used)
+        except (OSError, ValueError):
+            continue  # not mounted here (container without a cgroup namespace) or the root, which has no limit
+        headroom = room if headroom is None else min(headroom, room)
+    return headroom
+
+
+def available_ram():
+    """Bytes of RAM still available to this process, or None: MemAvailable capped by the cgroup v2 memory.max headroom
+    of its cgroup and every ancestor, and by memory_budget's reading (cgroup v1, memory.high), whichever is lower."""
+    available = None
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    available = int(line.split()[1]) * 1024
+                    break
+    except OSError:
+        try:
+            import psutil
+            available = psutil.virtual_memory().available
+        except Exception:
+            return None
+    try:
+        headroom = _cgroup_memory_headroom()
+    except Exception:
+        headroom = None
+    if headroom is not None:
+        available = min(available or 1 << 62, headroom)
+    # memory_budget also knows cgroup v1 (a v1 container sees the host's MemAvailable), memory.high and the ancestors
+    # it can read; the stricter of the two readings wins.
+    try:
+        from unsloth_zoo.memory_budget import host_memory_bytes
+        budget = host_memory_bytes()[1]
+        if isinstance(budget, int) and not isinstance(budget, bool) and budget >= 0:
+            available = budget if available is None else min(available, budget)
+    except Exception:
+        pass
+    return available
 
 
 def cpu_capabilities():
