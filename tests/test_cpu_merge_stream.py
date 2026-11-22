@@ -189,3 +189,48 @@ def test_streamed_merge_still_streams_plain_lora():
     from peft import LoraConfig, get_peft_model
     model = get_peft_model(_tiny_llama(), LoraConfig(r = 4, target_modules = ["q_proj", "v_proj"]))
     assert loader._stream_merge_source(model) is not None
+
+
+def test_streamed_merge_reexport_removes_obsolete_shards(tmp_path):
+    """Exporting again into the same folder with another shard count leaves only the new export's weights, as
+    save_pretrained does; unrelated files (adapters, tokenizer, other names) stay."""
+    import json
+    from unsloth_zoo.cpu import loader
+    model = _lora_model(_TINY, torch.float32)
+    out = tmp_path / "merged"
+    out.mkdir()
+    unrelated = ["adapter_model.safetensors", "tokenizer.json", "other_model.safetensors", "model-notes.txt",
+                 "model-00001-of-00002.bin"]
+    for name in unrelated:
+        (out / name).write_text("keep")
+
+    def weights():
+        return sorted(f for f in os.listdir(out) if f not in unrelated and f.startswith("model"))
+
+    def tensors():
+        from safetensors.torch import load_file
+        loaded = {}
+        for name in weights():
+            if name.endswith(".safetensors"):
+                loaded.update(load_file(str(out / name)))
+        return loaded
+
+    def expected_shards():
+        with open(out / "model.safetensors.index.json") as f:
+            return sorted(set(json.load(f)["weight_map"].values()))
+
+    assert loader._stream_merged_save(model, str(out), "merged_16bit", 1000) is True
+    many = expected_shards()
+    assert len(many) > 2 and weights() == sorted(many + ["model.safetensors.index.json"])
+    assert loader._stream_merged_save(model, str(out), "merged_16bit", 4000) is True
+    fewer = expected_shards()
+    assert 1 < len(fewer) < len(many)
+    assert weights() == sorted(fewer + ["model.safetensors.index.json"])  # no shard of the earlier export is left
+    assert loader._stream_merged_save(model, str(out), "merged_16bit", None) is True
+    assert weights() == ["model.safetensors"]  # single file: the stale index and shards are gone
+    single = tensors()
+    assert loader._stream_merged_save(model, str(out), "merged_16bit", 1000) is True
+    assert weights() == sorted(expected_shards() + ["model.safetensors.index.json"])  # and the other way round
+    sharded = tensors()
+    assert set(sharded) == set(single) and all(torch.equal(sharded[k], single[k]) for k in single)
+    assert all((out / name).read_text() == "keep" for name in unrelated)

@@ -941,6 +941,28 @@ def _write_safetensors(path, entries):
     return offset
 
 
+_STALE_SHARD = re.compile(r"model-\d{5}-of-\d{5}\.safetensors")
+
+
+def _remove_stale_weights(save_directory, names):
+    """Re-exporting into the same folder: drop an earlier export's weights that are not part of this one, as
+    save_pretrained does, so a different shard count leaves no obsolete shards (or a single file / index that
+    transformers would load instead). Only model.safetensors, model-NNNNN-of-NNNNN.safetensors and the index; other
+    files (adapters, tokenizer, other names) are never touched. Rank 0 only."""
+    if os.environ.get("RANK", "0").strip() not in ("", "0"):
+        return
+    keep = set(names)
+    if len(names) > 1:
+        keep.add("model.safetensors.index.json")
+    for filename in os.listdir(save_directory):
+        if filename in keep:
+            continue
+        if filename in ("model.safetensors", "model.safetensors.index.json") or _STALE_SHARD.fullmatch(filename):
+            path = os.path.join(save_directory, filename)
+            if os.path.isfile(path):
+                os.remove(path)
+
+
 def _stream_merged_save(model, save_directory, save_method, max_shard_size = None):
     """Writes the merged checkpoint shard by shard from the live model (peak RSS about the model plus one shard,
     instead of a full deepcopy). Same tensors, names, dtypes and config as merge_and_unload().save_pretrained().
@@ -1012,6 +1034,7 @@ def _stream_merged_save(model, save_directory, save_method, max_shard_size = Non
     if len(shards) > 1:
         with open(os.path.join(save_directory, "model.safetensors.index.json"), "w", encoding = "utf-8") as f:
             json.dump({"metadata": {"total_size": total}, "weight_map": dict(sorted(weight_map.items()))}, f, indent = 2)
+    _remove_stale_weights(save_directory, names)
     config = copy.deepcopy(hf.config)
     # save_pretrained records the first floating parameter's dtype under the field this transformers reads.
     setattr(config, _DTYPE_KWARG, str(target or model_dtype).split(".")[1])
