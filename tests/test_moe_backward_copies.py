@@ -24,6 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from _cpu_compiler_skip import skip_without_cpu_inductor
 from unsloth_zoo.temporary_patches import moe_grouped_fp16 as MG
 from unsloth_zoo.temporary_patches import moe_utils as mu
 
@@ -536,6 +537,7 @@ def test_expert_bias_gather_compiled_upcast_caps_the_fp32_copy(dtype, dynamic, m
     width; bias grad is bitwise the eager chunked one."""
     if not hasattr(torch.library, "custom_op"):
         pytest.skip("torch.library.custom_op unavailable")
+    skip_without_cpu_inductor()  # CPU tensors compile through C++ Inductor
     monkeypatch.setattr(mu, "_MM_OUT_DTYPE", False, raising = False)
     E, D = 16, 96
     monkeypatch.setattr(mu, "_EXPERT_BIAS_ONE_HOT_ELEMENTS", 1 << 12)

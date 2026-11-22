@@ -30,6 +30,11 @@ def gpu(monkeypatch):
         })
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index = None: capability)
         monkeypatch.setattr(torch.version, "hip", hip)
+        # A traced call answers through _available_in_trace, which would run the real kernel self-check on a host
+        # that has a GPU (under the faked capability, hip version and capture state above: the ROCm runner's
+        # process died there). The verdict under test is the arch gate, so the self-check passes by fiat.
+        monkeypatch.setattr(mg, "mxfp4_grouped_mm_available", lambda device = None: True)
+        monkeypatch.setattr(mg, "_probe_dense", lambda device, dtype: True)
         monkeypatch.delenv("UNSLOTH_MXFP4_FUSED_GEMM", raising = False)
         return torch.device("cuda", 0)
     return make
