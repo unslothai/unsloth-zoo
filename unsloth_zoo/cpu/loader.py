@@ -26,9 +26,9 @@ import weakref
 
 import torch
 
-from .runtime import cpu_bf16_supported, cpu_bnb_4bit_supported
+from .runtime import available_ram, cpu_bf16_supported, cpu_bnb_4bit_supported
 from .ops import (
-    Bf16StoredLinear, _plain_lm_head, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss,
+    Bf16StoredLinear, _plain_lm_head, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, set_bf16_stored_dtype,
     store_frozen_linears_in_bf16,
 )
 
@@ -80,6 +80,44 @@ _DTYPE_KWARG = _dtype_kwarg()
 
 def _print(message):
     print(f"Unsloth (CPU): {message}")
+
+
+def _dense_parameter_count(config):
+    """Parameters of a dense decoder from its config (embeddings, attention, gated MLP), None when unknown or MoE."""
+    text = getattr(config, "get_text_config", lambda: config)()
+    get = lambda name: getattr(text, name, None)  # noqa: E731
+    if any(get(name) for name in ("num_experts", "num_local_experts", "n_routed_experts", "moe_intermediate_size")):
+        return None
+    hidden, layers, vocab = get("hidden_size"), get("num_hidden_layers"), get("vocab_size")
+    if not (isinstance(hidden, int) and isinstance(layers, int) and isinstance(vocab, int)):
+        return None
+    heads = get("num_attention_heads") or 1
+    head_dim = get("head_dim") or hidden // heads
+    kv = (get("num_key_value_heads") or heads) * head_dim
+    intermediate = get("intermediate_size") or 4 * hidden
+    per_layer = hidden * heads * head_dim * 2 + 2 * hidden * kv + 3 * hidden * intermediate
+    embeddings = vocab * hidden * (1 if getattr(config, "tie_word_embeddings", True) else 2)
+    return embeddings + layers * per_layer
+
+
+def _prefer_16bit_weights(model_name, dtype, token, revision, trust_remote_code, **kwargs):
+    """4-bit on CPU dequantizes every weight in forward, backward and the checkpointed recompute (~12% more CPU time
+    per step on SmolLM2-135M, no lower peak RSS at that size). When the 16-bit weights take at most a quarter of the
+    free RAM, train on them instead. UNSLOTH_CPU_LOAD_IN_4BIT=1 keeps 4-bit. Returns the 16-bit size or None."""
+    if os.environ.get("UNSLOTH_CPU_LOAD_IN_4BIT", "").strip().lower() in ("1", "true", "yes", "on"):
+        return None
+    try:
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_name, token = token, revision = revision,
+                                            trust_remote_code = trust_remote_code, **kwargs)
+    except Exception:
+        return None
+    count = _dense_parameter_count(config)
+    available = available_ram()
+    if count is None or available is None:
+        return None
+    size = count * torch.empty((), dtype = dtype).element_size()
+    return size if size * 4 <= available else None
 
 
 def _checkpoint_dtype(model_name, **kwargs):
@@ -633,6 +671,8 @@ class FastCPUModel:
 
         if fast_inference:
             raise NotImplementedError("Unsloth (CPU): fast_inference (vLLM) needs a GPU.")
+        # A quantization config the caller built is a choice of quantization: never swapped for 16-bit weights.
+        user_quantization = kwargs.get("quantization_config", None) is not None
         # Before anything downloads: a refused GPU-only feature fails fast.
         _pop_gpu_loader_kwargs(kwargs)
         # Chunked CE returns logits = None in training steps; return_logits keeps the full-logit loss.
@@ -681,6 +721,15 @@ class FastCPUModel:
         if use_4bit and not cpu_bnb_4bit_supported():
             _print("bitsandbytes 4-bit does not work on this CPU, loading 16-bit weights instead.")
             use_4bit = False
+        if use_4bit and not user_quantization and kwargs.get("config") is None \
+                and not _PREQUANTIZED_SUFFIX.search(model_name) and quant_method is None:
+            # A pre-quantized repo was picked to download less; its 16-bit base would be a new download.
+            size = _prefer_16bit_weights(model_name, dtype, token, revision, trust_remote_code, **probe_kwargs)
+            if size is not None:
+                _print(f"load_in_4bit = True, but loading 16-bit weights instead: they fit in RAM "
+                       f"({size / 1024 ** 3:.2f} GB of {available_ram() / 1024 ** 3:.0f} GB free) and train faster than "
+                       "4-bit on CPU. Set UNSLOTH_CPU_LOAD_IN_4BIT=1 to keep 4-bit.")
+                use_4bit = False
         if not use_4bit and _PREQUANTIZED_SUFFIX.search(model_name):
             base = _PREQUANTIZED_SUFFIX.sub("", model_name)
             _print(f"{model_name} is pre-quantized; loading {base} for 16-bit training.")
@@ -711,8 +760,15 @@ class FastCPUModel:
         # Left to transformers when unset: SDPA where the class supports it, eager otherwise (Bloom, MPT, ...).
         if attn_implementation is not None:
             kwargs["attn_implementation"] = attn_implementation
+        # fp32 training of a bf16 checkpoint keeps the frozen projections in bf16 (lossless, half their RAM, no
+        # measurable step-time cost). Default where fp32 is the default (no native bf16); UNSLOTH_CPU_FROZEN_BF16=1 / 0
+        # forces it on / off.
+        frozen_env = os.environ.get("UNSLOTH_CPU_FROZEN_BF16", "").strip().lower()
+        frozen_wanted = frozen_env in ("1", "true", "yes", "on") or (
+            frozen_env not in ("0", "false", "no", "off") and not cpu_bf16_supported()
+        )
         frozen_bf16 = (
-            os.environ.get("UNSLOTH_CPU_FROZEN_BF16", "0") == "1" and dtype == torch.float32 and not auto_dtype
+            frozen_wanted and dtype == torch.float32 and not auto_dtype
             and not use_4bit and not full_finetuning
             and _checkpoint_dtype(model_name, token = token, revision = revision,
                                   trust_remote_code = trust_remote_code, **probe_kwargs) == torch.bfloat16
@@ -726,6 +782,7 @@ class FastCPUModel:
         )
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
+            model = None
             try:
                 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
             except RuntimeError as error:
@@ -733,6 +790,10 @@ class FastCPUModel:
                 if quantization_config is None:
                     raise
                 _print(f"bitsandbytes 4-bit failed on CPU ({error}), loading 16-bit weights instead.")
+            if model is None:
+                # Outside the handler: its traceback keeps the failed load's half-built model alive.
+                import gc
+                gc.collect()
                 kwargs.pop("quantization_config", None)
                 use_4bit = False
                 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
@@ -774,6 +835,9 @@ class FastCPUModel:
 
         if frozen_bf16:
             _print(f"{store_frozen_linears_in_bf16(model)} frozen Linear weights kept in bfloat16, computing in float32.")
+            # Generation upcasts them back to fp32 unless UNSLOTH_CPU_FROZEN_BF16=1 forced the storage: the per-call
+            # upcast costs decode speed (about 3x per projection at one token), training pays nothing for it.
+            model._unsloth_cpu_frozen_bf16 = "forced" if frozen_env in ("1", "true", "yes", "on") else "training"
         patch_causal_conv1d_fallback(model)
         # Also for a checkpoint that ships its own 4-bit quantization_config.
         _disable_bnb_cpu_weight_packing(model)
@@ -919,6 +983,7 @@ class FastCPUModel:
         if use_gradient_checkpointing in (True, "unsloth") and hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
         peft_model = get_peft_model(model, config)
+        _frozen_bf16_for(peft_model, training = True)  # after PEFT froze the base weights
         if max_seq_length is not None:
             peft_model.max_seq_length = max_seq_length
         FastCPUModel._attach(peft_model)
@@ -927,6 +992,7 @@ class FastCPUModel:
     @staticmethod
     def for_training(model, use_gradient_checkpointing = None):
         model.train()
+        _frozen_bf16_for(model, training = True)
         _set_inference_mode(model, False)
         # None keeps whatever from_pretrained / get_peft_model set up; an explicit value switches it.
         if use_gradient_checkpointing is not None and hasattr(model, "gradient_checkpointing_enable"):
@@ -941,6 +1007,7 @@ class FastCPUModel:
     @staticmethod
     def for_inference(model):
         model.eval()
+        _frozen_bf16_for(model, training = False)
         _set_inference_mode(model, True)
         return model
 
@@ -1021,6 +1088,19 @@ def _set_inference_mode(model, inference):
             break
 
 
+def _frozen_bf16_for(model, training):
+    """Default frozen bf16 storage is for training only: generation upcasts the weights to fp32 (decode speed), and
+    training stores them in bf16 again (half their RAM). UNSLOTH_CPU_FROZEN_BF16=1 keeps bf16 throughout."""
+    inner, mode = model, None
+    for _ in range(4):
+        mode = mode or getattr(inner, "_unsloth_cpu_frozen_bf16", None)
+        inner = getattr(inner, "base_model", None) or getattr(inner, "model", None)
+        if inner is None:
+            break
+    if mode == "training" and isinstance(model, torch.nn.Module):
+        set_bf16_stored_dtype(model, torch.bfloat16 if training else torch.float32)
+
+
 def _unpack_encoding_generate(generate):
     """Notebooks pass `input_ids = tokenizer.apply_chat_template(..., return_tensors = "pt")`, which is a
     BatchEncoding on transformers 5; generate() then fails on `.shape`. The GPU path unpacks it, so do the same."""
@@ -1030,6 +1110,9 @@ def _unpack_encoding_generate(generate):
         if encoding is not None and not isinstance(encoding, torch.Tensor) and hasattr(encoding, "items"):
             for key, value in kwargs.pop("input_ids").items():
                 kwargs.setdefault(key, value)
+        if isinstance(self, torch.nn.Module) and not self.training:
+            # Inference-only loads and for_inference: fp32 frozen weights (a training-time callback keeps bf16).
+            _frozen_bf16_for(self, training = False)
         set_stance = getattr(torch.compiler, "set_stance", None)
         modules = self.modules() if isinstance(self, torch.nn.Module) else ()
         if set_stance is not None and any(getattr(m, "_compiled_call_impl", None) is not None for m in modules):

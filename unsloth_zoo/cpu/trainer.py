@@ -24,7 +24,7 @@ import os
 
 import torch
 
-from .runtime import cpu_bf16_supported, cpu_fp16_supported
+from .runtime import available_ram, cpu_bf16_supported, cpu_fp16_supported
 
 # bitsandbytes 8-bit / paged optimizers have no CPU kernels; AdamW states for LoRA are tiny anyway.
 _GPU_ONLY_OPTIMIZERS = (
@@ -154,15 +154,88 @@ def _install_compile_gate(trainer):
     return True
 
 
-def _auto_cpu_gradient_checkpointing(model, training_args):
-    """use_gradient_checkpointing = False on the model wins over SFTConfig's gradient_checkpointing = True default,
-    which would turn recomputation back on."""
-    if not isinstance(model, torch.nn.Module) or not getattr(training_args, "gradient_checkpointing", False):
+def _activation_bytes_without_checkpointing(model, batch, length):
+    """Upper estimate of the activations autograd keeps for a ``batch`` x ``length`` micro-batch with no checkpointing:
+    per layer about 9 hidden + 3 kv + 4 intermediate values per token (norms, q/k/v, attention out, MLP gate / up /
+    act), doubled for fp32 norm upcasts and LoRA / autograd extras. Eager (and any non SDPA / flash) attention also
+    keeps heads x length x length scores per sequence: the fp32 softmax plus its cast, doubled the same way."""
+    config = getattr(model, "config", None)
+    text = getattr(config, "get_text_config", lambda: config)()
+    hidden = getattr(text, "hidden_size", None)
+    layers = getattr(text, "num_hidden_layers", None)
+    if not hidden or not layers:
         return None
-    if getattr(model, "_unsloth_cpu_gradient_checkpointing", None) is False:
-        training_args.gradient_checkpointing = False
+    intermediate = getattr(text, "intermediate_size", None) or 4 * hidden
+    heads = getattr(text, "num_attention_heads", None) or 1
+    kv = (getattr(text, "num_key_value_heads", None) or heads) * (getattr(text, "head_dim", None) or hidden // heads)
+    try:
+        element = next(p for p in model.parameters() if p.is_floating_point()).element_size()
+    except StopIteration:
+        element = 4
+    element = max(element, 2)
+    needed = 2 * (9 * hidden + 3 * kv + 4 * intermediate) * element * layers * batch * length
+    attention = getattr(text, "_attn_implementation", None) or getattr(config, "_attn_implementation", None)
+    dropout = 0.0
+    for name in ("attention_dropout", "attn_pdrop", "attention_probs_dropout_prob", "attn_dropout"):
+        try:
+            dropout = max(dropout, float(getattr(text, name, 0.0) or 0.0))
+        except (TypeError, ValueError):
+            pass
+    # Eager attention keeps the B x H x L x L scores and probabilities for backward; so does SDPA with attention
+    # dropout, which CPU runs on its math path.
+    quadratic = isinstance(attention, str) and not any(fast in attention for fast in ("sdpa", "flash", "flex"))
+    if quadratic or dropout > 0:
+        needed += 2 * (4 + element) * heads * layers * batch * length * length
+    return needed
+
+
+def _args_checkpointing(training_args):
+    # transformers >= 5.24 reads activation_checkpointing; gradient_checkpointing is its deprecated alias.
+    return bool(getattr(training_args, "gradient_checkpointing", False) or getattr(training_args, "activation_checkpointing", False))
+
+
+def _args_checkpointing_off(training_args):
+    training_args.gradient_checkpointing = False
+    if hasattr(training_args, "activation_checkpointing"):
+        training_args.activation_checkpointing = False
+
+
+def _auto_cpu_gradient_checkpointing(model, training_args):
+    """use_gradient_checkpointing = "unsloth" on CPU means offloading to host RAM, which is where activations already
+    live, so it is plain recomputation (one more forward per step). When the activations of a full micro-batch fit in
+    a quarter of the free RAM, train without it. True / False from the user, or UNSLOTH_CPU_AUTO_GC=0, keep theirs."""
+    if not isinstance(model, torch.nn.Module) or not _args_checkpointing(training_args):
+        return None
+    choice = getattr(model, "_unsloth_cpu_gradient_checkpointing", None)
+    if choice is False:
+        # TRL's SFTConfig turns checkpointing on by default, which would override use_gradient_checkpointing = False.
+        _args_checkpointing_off(training_args)
         return True
-    return None
+    if choice != "unsloth" or os.environ.get("UNSLOTH_CPU_AUTO_GC", "1").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    length = getattr(training_args, "max_length", None) or getattr(model, "max_seq_length", None)
+    batch = getattr(training_args, "per_device_train_batch_size", None) or 1
+    if not isinstance(length, int) or length <= 0:
+        return None
+    needed = _activation_bytes_without_checkpointing(model, batch, length)
+    available = available_ram()
+    if needed is None or available is None:
+        return None
+    ranks = 1
+    try:
+        ranks = max(1, int(os.environ.get("LOCAL_WORLD_SIZE", "1")))
+    except ValueError:
+        pass
+    if needed * ranks > available // 4:
+        return False
+    _args_checkpointing_off(training_args)
+    if getattr(model, "is_gradient_checkpointing", False) and hasattr(model, "gradient_checkpointing_disable"):
+        # PEFT forwards this to the transformers model; input require-grads hooks stay (a no-op without checkpointing).
+        model.gradient_checkpointing_disable()
+    print(f"Unsloth (CPU): activations for {batch} x {length} tokens (~{needed / 1024 ** 3:.2f} GB) fit in RAM "
+          f"({available / 1024 ** 3:.0f} GB free), so gradient checkpointing is off (one less forward per step). "
+          "Pass use_gradient_checkpointing = True or set UNSLOTH_CPU_AUTO_GC=0 to keep it.")
+    return True
 
 
 def _patch_post_init(cls):
@@ -387,6 +460,9 @@ def __getattr__(name):
 def install_cpu_training_defaults():
     """Idempotent. Only ever called from a CPU-backend process."""
     import sys
+    if os.environ.get("UNSLOTH_CPU_SDPA_GQA", "1") != "0":
+        from .ops import patch_cpu_sdpa_gqa
+        patch_cpu_sdpa_gqa()
     from transformers import Trainer, TrainingArguments
     _patch_post_init(TrainingArguments)
     if hasattr(Trainer, "create_accelerator_and_postprocess"):
