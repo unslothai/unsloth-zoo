@@ -122,6 +122,14 @@ _compiled = {}
 _eager = set()
 
 
+def _device_scalars(values, device):
+    """A small float32 vector on `device` without a host sync: staged in pinned memory, copied without blocking."""
+    host = torch.tensor(values, dtype = torch.float32, device = "cpu")  # pinned staging, whatever the default device
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return host.to(device)
+    return host.pin_memory().to(device, non_blocking = True)
+
+
 def _run(name, fn, *args):
     if not _COMPILE or name in _eager:
         return fn(*args)
@@ -196,7 +204,7 @@ class UnslothChunkedLogProbs(torch.autograd.Function):
             compute_dtype = weight.dtype if weight.dtype in (torch.float16, torch.bfloat16, torch.float32) else hidden.dtype
         n = hidden.shape[0]
         mul, div, cap = float(logit_scale_multiply), float(logit_scale_divide), float(logit_softcapping)
-        scalars = torch.tensor([1.0 / float(temperature), mul, div, cap], device = device, dtype = torch.float32)
+        scalars = _device_scalars([1.0 / float(temperature), mul, div, cap], device)
         flags = (mul != 0.0, div != 0.0, cap != 0.0)
         logps = torch.empty(n, device = device, dtype = torch.float32)
         lse = torch.empty(n, device = device, dtype = torch.float32)
@@ -355,7 +363,7 @@ class UnslothChunkedCE(torch.autograd.Function):
         else:
             compute_dtype = weight.dtype if weight.dtype in (torch.float16, torch.bfloat16, torch.float32) else hidden.dtype
         mul, div, cap = float(logit_scale_multiply), float(logit_scale_divide), float(logit_softcapping)
-        scalars = torch.tensor([1.0, mul, div, cap], device = device, dtype = torch.float32)
+        scalars = _device_scalars([1.0, mul, div, cap], device)
         flags = (mul != 0.0, div != 0.0, cap != 0.0)
         need_h = hidden.requires_grad
         need_w = weight.requires_grad
