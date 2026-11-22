@@ -1370,6 +1370,15 @@ def _remove_stale_weights(save_directory, names):
                 os.remove(path)
 
 
+def _keep_existing_mode(temporary, final):
+    """A re-export replaces the file, so carry over the mode the user set on the old one (else 0600 weights become
+    umask-default 0644); a first export keeps the umask default."""
+    try:
+        os.chmod(temporary, os.stat(final).st_mode & 0o7777)
+    except OSError:
+        pass
+
+
 def _stream_merged_save(model, save_directory, save_method, max_shard_size = None):
     """Writes the merged checkpoint shard by shard from the live model (peak RSS about the model plus one shard,
     instead of a full deepcopy). Same tensors, names, dtypes and config as merge_and_unload().save_pretrained().
@@ -1442,6 +1451,7 @@ def _stream_merged_save(model, save_directory, save_method, max_shard_size = Non
             with open(temporary, "w", encoding = "utf-8") as f:
                 f.write(json.dumps(index, indent = 2, sort_keys = True) + "\n")
         for temporary, final in staged:
+            _keep_existing_mode(temporary, final)
             os.replace(temporary, final)
     finally:
         for temporary, _ in staged:
