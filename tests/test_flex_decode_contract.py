@@ -23,6 +23,7 @@ os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
 import pytest
 import torch
+from _torch_config_patch import patch_torch_config
 
 flex = pytest.importorskip("torch.nn.attention.flex_attention")
 
@@ -211,10 +212,10 @@ def test_graph_identity_follows_window_and_captured_scalars_and_offsets_are_copi
     assert torch.equal(effective_mask(bm, 1, 256), before)
 
 
-def _suppress_errors(monkeypatch):
+def _suppress_errors(request):
     # Turned on to prove the guard turns it off; builds without the flag have nothing to suppress.
     if hasattr(torch._dynamo.config, "suppress_errors"):
-        monkeypatch.setattr(torch._dynamo.config, "suppress_errors", True)
+        patch_torch_config(request, torch._dynamo.config, "suppress_errors", True)
 
 
 def test_compiled_flex_runs_on_torch_builds_without_suppress_errors(monkeypatch):
@@ -229,7 +230,7 @@ def test_compiled_flex_runs_on_torch_builds_without_suppress_errors(monkeypatch)
 
 
 @pytest.mark.parametrize("compile_fails", [False, True])
-def test_unsloth_attention_serves_the_same_visibility_densely_when_flex_decoding_cannot(compile_fails, monkeypatch):
+def test_unsloth_attention_serves_the_same_visibility_densely_when_flex_decoding_cannot(compile_fails, monkeypatch, request):
     # Unsupported shape, or a failing flex compile that must raise once and then be served densely.
     d, S_len, window = 16, 150, (0 if compile_fails else 128)
     _, q, k, v = _qkv(2, 4, 2, S_len, d, seed = 3 if compile_fails else 2)
@@ -243,7 +244,7 @@ def test_unsloth_attention_serves_the_same_visibility_densely_when_flex_decoding
         monkeypatch.setattr(D, "_flex_function", lambda device: (failing_compiled_flex, True))
         monkeypatch.setattr(D, "flex_decode_supported", lambda *args: True)
         monkeypatch.setattr(D, "_FAILED_SHAPES", set())
-        _suppress_errors(monkeypatch)
+        _suppress_errors(request)
     else:
         assert not D.flex_decode_supported(d, 4, 2, torch.float64, "cpu")
     want = D._eager_attention(q, k, v, visible(mask_2d, window)[:, None, None, :], d ** -0.5)
@@ -401,7 +402,7 @@ def test_reference_fallback_keeps_an_elided_causal_mask_and_attention_dropout(wh
 
 
 @pytest.mark.parametrize("change", ["batch", "scale"])
-def test_a_new_specialisation_after_a_compiled_call_still_gets_failure_handling(monkeypatch, change):
+def test_a_new_specialisation_after_a_compiled_call_still_gets_failure_handling(monkeypatch, change, request):
     # A success must not send a later specialisation (batch is static; scale, strides, the mask closure) down an
     # unguarded path where a suppressed compile failure would silently run eager flex.
     calls = []
@@ -417,7 +418,7 @@ def test_a_new_specialisation_after_a_compiled_call_still_gets_failure_handling(
     monkeypatch.setattr(D, "_flex_function", lambda device: (compiled_flex, True))
     monkeypatch.setattr(D, "_FAILED_SHAPES", set())
     monkeypatch.setattr(D, "_output_and_lse", lambda result: result)
-    _suppress_errors(monkeypatch)
+    _suppress_errors(request)
     second = (2, 0.25) if change == "batch" else (1, 0.5)
     for (batch, scale), fails in (((1, 0.25), False), (second, True)):
         _, q, k, v = _qkv(batch, 4, 2, 64, 16, seed = 0)

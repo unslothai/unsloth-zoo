@@ -21,6 +21,7 @@ import sys
 
 import pytest
 import torch
+from _torch_config_patch import patch_torch_config
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -348,12 +349,12 @@ def test_lengths_inside_one_bucket_share_one_graph(dynamic):
     assert cnt.inner.frame_count <= allowed, cnt.inner.frame_count
 
 
-def test_many_tiled_classes_stay_under_the_recompile_limit(monkeypatch):
+def test_many_tiled_classes_stay_under_the_recompile_limit(monkeypatch, request):
     from unsloth_zoo import tiling_registry as R
     monkeypatch.setenv("UNSLOTH_TILED_COMPILE", "compile_tile")
     for name in ("recompile_limit", "cache_size_limit"):
         if hasattr(torch._dynamo.config, name):
-            monkeypatch.setattr(torch._dynamo.config, name, 8)
+            patch_torch_config(request, torch._dynamo.config, name, 8)
     torch._dynamo.reset()
     classes = []
     for k in range(10):
