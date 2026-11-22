@@ -380,15 +380,14 @@ def test_vllm_padded_vocab_biases_async_streaming_chunks():
     assert [r.sampling_params.logit_bias for r in llm.engine_core.seen] == [WANT, {9: 1.0, **WANT}]
 
 
-def test_vllm_padded_vocab_not_biased_under_speculative_decoding(capsys):
-    # vLLM 0.29 SamplingParams._validate_spec_decode raises on any logit_bias with speculation.
+def test_vllm_padded_vocab_not_biased_under_speculative_decoding():
+    # vLLM 0.29 SamplingParams._validate_spec_decode raises on any logit_bias with speculation, so requests are never
+    # biased; with no in-process model to mask, the rows would stay sampleable, so the load refuses instead.
     llm = _LLM()
     add_request = llm.llm_engine.engine_core.add_request
-    _vllm_wrapper_ns()["suppress_vllm_padded_vocab"](llm, IDS, speculative = True)
+    with pytest.raises(RuntimeError, match = "stay sampleable"):
+        _vllm_wrapper_ns()["suppress_vllm_padded_vocab"](llm, IDS, speculative = True)
     assert llm.llm_engine.engine_core.add_request == add_request
-    llm.generate(["a"], _Params())
-    assert llm.llm_engine.engine_core.seen[0].sampling_params.logit_bias is None
-    assert "speculative decoding" in capsys.readouterr().out
 
 
 def test_vllm_padded_vocab_bias_respects_the_logit_bias_limit(capsys):

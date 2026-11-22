@@ -6090,6 +6090,10 @@ DISABLE_COMPILE_MODULES = [
     "DeepseekV41HyperConnection",
     # GLM-5.3-Flash: same Sinkhorn mixer. Its HyperHead is an unweighted mean and stays compiled.
     "Glm5NextTextHyperConnection",
+    # Inkling 2 block attention residuals: compiled alone (dynamic = True, CUDA), the one-query form over 3+ stacked
+    # blocks returns correct values but wrong input grads (8-34% relative); the LoRA grads of every layer drift.
+    "Inkling2BlockAttentionResidual",
+    "Inkling2LoopBlockAttentionResidual",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [

@@ -51,6 +51,7 @@ from .mixtral_moe import *
 from .llama4_moe import *
 from .moe_lora_factor_swap import *
 from .inkling import *
+from .inkling2 import *
 from .compiled_model_identity import *
 from .bitsandbytes_large_tensors import *
 from .remote_mamba2 import *
