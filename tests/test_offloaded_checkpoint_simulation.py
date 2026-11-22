@@ -242,14 +242,17 @@ def test_use_reentrant_false_is_accepted_and_ignored(gc_module):
     torch.testing.assert_close(x.grad, torch.full_like(x, 5.0))
 
 
-@pytest.mark.parametrize("initial", [None, []], ids = ["unpatched-to-None", "empty-list"])
+@pytest.mark.parametrize("initial", [None, []], ids = ["unpatched-to-None", "import-time-empty-list"])
 def test_buffers_are_reinitialised_when_absent(gc_module, monkeypatch, initial):
-    """unpatch nulls the buffers, so None - not [] - is the normal starting state."""
+    """unpatch nulls the buffers, so None - not [] - is the normal starting state; at import CPU_BUFFERS
+    is [] and GPU_BUFFERS None. GPU_BUFFERS is the sentinel (both reset it to None)."""
     monkeypatch.setattr(gc_module, "CPU_BUFFERS", initial, raising = False)
+    monkeypatch.setattr(gc_module, "GPU_BUFFERS", None, raising = False)
     called = []
     def fake_init(dtype = None):
         called.append(dtype)
         gc_module.CPU_BUFFERS = [torch.empty(0)]
+        gc_module.GPU_BUFFERS = []
     monkeypatch.setattr(gc_module, "initialize_unsloth_gradient_checkpointing", fake_init)
 
     x = torch.randn(2, 4, requires_grad = True)
@@ -258,7 +261,10 @@ def test_buffers_are_reinitialised_when_absent(gc_module, monkeypatch, initial):
     assert called == [x.dtype]
 
 
-def test_existing_buffers_are_not_reinitialised(gc_module, monkeypatch):
+@pytest.mark.parametrize("cpu_buffers", [[torch.empty(0)], []], ids = ["populated", "every-device-keeps"])
+def test_existing_buffers_are_not_reinitialised(gc_module, monkeypatch, cpu_buffers):
+    """An initialized pool whose CPU_BUFFERS is empty (every device keeps its inputs) is initialized too."""
+    monkeypatch.setattr(gc_module, "CPU_BUFFERS", cpu_buffers, raising = False)
     def boom(dtype = None):
         raise AssertionError("must not re-initialise populated buffers")
     monkeypatch.setattr(gc_module, "initialize_unsloth_gradient_checkpointing", boom)
