@@ -37,7 +37,7 @@ from .saved_attention import (
 )
 # Re-exported under its old name: it lives in integrated_device.py so the import-time
 # allocator block can share the topic without importing torch.
-from .integrated_device import _any_device_integrated
+from .integrated_device import _any_device_integrated, unified_memory_device_indices
 from .device_type import (
     is_hip,
     get_device_type,
@@ -87,7 +87,68 @@ def _double_buffer_disabled():
     env = os.environ.get("UNSLOTH_DISABLE_DOUBLE_BUFFER")
     if env is not None: return env == "1"
     if DEVICE_TYPE not in ("cuda", "hip"): return False
-    return _any_device_integrated()
+    return _any_device_integrated() or bool(_keep_on_device_indices())
+
+
+@functools.cache
+def _keep_on_device_indices():
+    # Devices whose checkpointed inputs stay where they are: on unified memory (AMD APUs gfx1150/1151, NVIDIA GB10) the
+    # "host" is the same DRAM, so offloading saves nothing and costs a D2H + H2D copy per layer plus pinned blocks.
+    # Cached like _double_buffer_disabled: first read at GC init, after device selection, never at import.
+    # UNSLOTH_GC_KEEP_ON_DEVICE=1 keeps them on every device, 0 offloads everywhere (the old behaviour).
+    if DEVICE_TYPE not in ("cuda", "hip"): return frozenset()
+    return unified_memory_device_indices()
+
+
+_WARNED_KEEP_ON_DEVICE = False
+_WARNED_KEEP_LOW_MEMORY = False
+# Free device memory below which a unified device offloads again (the old path): the device budget can still be
+# smaller than host RAM there (a GTT limit, a partial carve-out), so a run that only fits with offload keeps fitting.
+KEEP_ON_DEVICE_HEADROOM_MIN  = 2 * 1024 * 1024 * 1024
+KEEP_ON_DEVICE_HEADROOM_FRAC = 0.05
+# device_index -> [free bytes at the last read, torch allocated bytes at that read, headroom, calls since the read].
+# Free memory is projected as the last read minus everything torch allocated since (activations, optimizer state
+# created after step 1, ...), read from the allocator's host-side counter. mem_get_info (no sync) is re-read when
+# the projection nears the headroom and every _KEEP_BUDGET_REFRESH calls, so memory taken outside torch is seen too.
+_KEEP_BUDGET = {}
+_KEEP_BUDGET_REFRESH = 256
+
+
+def _device_free_bytes(device_index):
+    free, total = torch.cuda.mem_get_info(device_index)
+    # Blocks torch has cached but not handed out are free for the next activation too.
+    cached = torch.cuda.memory_reserved(device_index) - torch.cuda.memory_allocated(device_index)
+    return int(free) + max(int(cached), 0), int(total)
+
+
+def _keeps_on_device(device_index, nbytes = 0):
+    global _WARNED_KEEP_ON_DEVICE, _WARNED_KEEP_LOW_MEMORY
+    keep = _keep_on_device_indices()
+    if not keep or device_index not in keep: return False
+    try:
+        allocated = int(torch.cuda.memory_allocated(device_index))
+    except Exception:
+        return False # cannot tell: offload, as before
+    budget = _KEEP_BUDGET.get(device_index)
+    projected = None if budget is None else budget[0] - max(allocated - budget[1], 0)
+    if projected is None or projected - nbytes < 2 * budget[2] or budget[3] >= _KEEP_BUDGET_REFRESH:
+        try:
+            free, total = _device_free_bytes(device_index)
+        except Exception:
+            return False # cannot tell: offload, as before
+        headroom = max(KEEP_ON_DEVICE_HEADROOM_MIN, int(total * KEEP_ON_DEVICE_HEADROOM_FRAC))
+        budget = _KEEP_BUDGET[device_index] = [free, allocated, headroom, 0]
+        projected = free
+    budget[3] += 1
+    if projected - nbytes < budget[2]:
+        if not _WARNED_KEEP_LOW_MEMORY:
+            _WARNED_KEEP_LOW_MEMORY = True
+            print("Unsloth: GPU memory is nearly full, so gradient checkpointing offloads activations to RAM again.")
+        return False
+    if not _WARNED_KEEP_ON_DEVICE:
+        _WARNED_KEEP_ON_DEVICE = True
+        print("Unsloth: GPU shares memory with the CPU, so gradient checkpointing keeps activations on the device.")
+    return True
 
 
 # Pinned (page-locked) host memory is a far smaller budget than VRAM or RAM, and
@@ -1844,6 +1905,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     CPU_BUFFERS = []
     CPU_INDEX = 0
     _reset_cpu_slots()
+    _KEEP_BUDGET.clear()
 
     if dtype is None:
         if DEVICE_TYPE == "cuda":
@@ -1876,10 +1938,13 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     global _WARNED_ABOUT_PINNED_MEMORY
     PINNED_MEMORY_AVAILABLE = True
     _WARNED_ABOUT_PINNED_MEMORY = False
-    with _no_inference_mode():
-        for i in range(INITIAL_CPU_BUFFER_COUNT):
-            x = _new_host_buffer(INITIAL_CPU_BUFFER_SIZE, dtype)
-            CPU_BUFFERS.append(x)
+    # Every visible device keeps its inputs: no slot is ever leased, so skip the pinned pool (it grows on demand).
+    keep = _keep_on_device_indices()
+    if not (keep and len(keep) >= _visible_device_count()):
+        with _no_inference_mode():
+            for i in range(INITIAL_CPU_BUFFER_COUNT):
+                x = _new_host_buffer(INITIAL_CPU_BUFFER_SIZE, dtype)
+                CPU_BUFFERS.append(x)
     pass
 
     global GPU_BUFFER_DTYPE
@@ -1998,7 +2063,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
                     global MINIMUM_SIZE
                     global CPU_INDEX
-                    if new_size > MINIMUM_SIZE and ((CURRENT_GC_INDEX != LAST_GC_INDEX) or FIRST_PASS):
+                    if new_size > MINIMUM_SIZE and ((CURRENT_GC_INDEX != LAST_GC_INDEX) or FIRST_PASS) and \
+                            not _keeps_on_device(arg.device.index, new_size):
                         use_gpu_buffer = True
                         global CPU_BUFFERS
                         global GPU_BUFFERS
@@ -2338,7 +2404,7 @@ pass
 def _new_offload_stats():
     stats = {"pinned": 0, "pageable": 0, "kept": 0, "prefetched": 0, "prefetch_hits": 0, "forwards": 0,
              "offloaded": 0, "offloaded_bytes": 0, "restored": 0, "restored_bytes": 0, "prefetched_bytes": 0}
-    for reason in ("small", "expanded"):
+    for reason in ("small", "expanded", "unified"):
         stats["kept_" + reason] = 0
         stats["kept_" + reason + "_bytes"] = 0
     return stats
@@ -2431,6 +2497,8 @@ class NonReentrantActivationOffloader:
         except ValueError:
             self.max_inflight = default_inflight
         self.min_bytes = _env_nonnegative_int("UNSLOTH_GC_OFFLOAD_MIN_BYTES", GC_OFFLOAD_MIN_BYTES)
+        # Device indices on unified memory: their saved inputs stay put (see _keep_on_device_indices).
+        self.keep_on_device = _keep_on_device_indices()
         self.inflight = {}
         self.d2h_streams = {}
         self.h2d_streams = {}
@@ -2604,6 +2672,12 @@ class NonReentrantActivationOffloader:
     def pack(self, x):
         if not x.requires_grad or self._on_host(x):
             return None, x
+        # Traced: offload as before (the budget check reads allocator state).
+        if self.keep_on_device and x.device.index in self.keep_on_device and not _is_compiling():
+            nbytes = x.numel() * x.element_size()
+            if _keeps_on_device(x.device.index, nbytes):
+                self._keep("unified", nbytes)
+                return None, x.detach()
         if _is_compiling():
             # Traced: no size or storage checks, which would add guards on symbolic shapes.
             return x.device, x.to("cpu", non_blocking = True)
