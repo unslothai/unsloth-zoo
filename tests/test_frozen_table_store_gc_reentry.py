@@ -62,3 +62,30 @@ def test_a_table_collected_while_another_maps_its_files_does_not_deadlock(tmp_pa
     assert all(f.mm is not None and f.refs >= 1 for f in fts._FILES.values())
     store.close()
     assert not any(f.path.startswith(str(tmp_path)) for f in fts._FILES.values())
+
+
+class _FakeMapping:
+    def __init__(self, path):
+        self.path, self.refs, self.closed = path, 1, False
+
+    def close(self):
+        self.closed = True
+
+
+def test_a_release_queued_during_another_drain_is_not_stranded(monkeypatch):
+    """Thread B queues a release while thread A holds the lock for its last drain: B's non-blocking acquire fails,
+    so A must recheck the queue after unlocking or B's mappings stay open until some later open or close."""
+    early, late = _FakeMapping("early"), _FakeMapping("late")
+    real_drain = fts._drain_releases
+    arrived = []
+
+    def drain_then_a_late_release():
+        real_drain()
+        if not arrived:
+            arrived.append(True)
+            fts._PENDING_RELEASES.append([late])  # what B's _release_files does while A still holds the lock
+
+    monkeypatch.setattr(fts, "_drain_releases", drain_then_a_late_release)
+    fts._release_files([early])
+    assert early.closed and late.closed
+    assert not fts._PENDING_RELEASES

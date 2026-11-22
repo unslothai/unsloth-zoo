@@ -383,7 +383,8 @@ def _drain_releases():
 
 
 def _try_drain_releases():
-    if _PENDING_RELEASES and _FILES_LOCK.acquire(blocking = False):
+    # Recheck after unlocking: a release queued while we held the lock found it busy and left the drain to us.
+    while _PENDING_RELEASES and _FILES_LOCK.acquire(blocking = False):
         try:
             _drain_releases()
         finally:
