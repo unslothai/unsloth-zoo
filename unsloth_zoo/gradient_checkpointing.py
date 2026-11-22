@@ -32,7 +32,7 @@ from .utils import _get_dtype, Version, is_distributed
 from .saved_attention import (
     new_saved_attention_frame,
     saved_attention_scope,
-    save_attention_enabled,
+    save_attention_requested,
     patch_transformers_saved_attention,
 )
 # Re-exported under its old name: it lives in integrated_device.py so the import-time
@@ -2996,7 +2996,8 @@ def patch_unsloth_smart_gradient_checkpointing(dtype = None):
     # torch.utils.checkpoint may already be patched while this one is not.
     import transformers.modeling_utils
     transformers.modeling_utils.checkpoint = unsloth_checkpoint
-    if save_attention_enabled():
+    # Configuration only: which devices keep anything is decided per checkpoint frame.
+    if save_attention_requested():
         patch_transformers_saved_attention()
 pass
 
