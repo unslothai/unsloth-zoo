@@ -1075,9 +1075,18 @@ def _adapter_base_model(model_name, token, revision, **hub_kwargs):
         config = PeftConfig.from_pretrained(model_name, revision = revision, token = token, **hub_kwargs)
         if not config.base_model_name_or_path:
             return None
-        return config.base_model_name_or_path, getattr(config, "revision", None)
+        base = config.base_model_name_or_path, getattr(config, "revision", None)
     except Exception:
         return None
+    # A Hub adapter names its base itself: on Windows a UNC base would make the load probe a host the repo chose (SMB, NTLM).
+    if not os.path.isdir(model_name):
+        from ..vision_utils import _is_network_share
+        if _is_network_share(str(base[0])):
+            raise ValueError(
+                f"Unsloth: The adapter {model_name} names a base model on a network share ({base[0]!r}). "
+                "Refusing to load it: download the base model and load the adapter from a local folder instead."
+            )
+    return base
 
 
 def _clamp_to_learned_positions(model, max_seq_length):
