@@ -116,3 +116,23 @@ def test_text_only_carry_over_targets_the_nested_text_config():
     assert text.rope_parameters == yarn and text.rope_parameters is not yarn
     assert text.max_position_embeddings == WIDE
     assert not hasattr(base, "rope_parameters") and not hasattr(base, "max_position_embeddings")
+
+
+def test_rope_a_fixed_gemma_rotary_applied_is_exported(tmp_path):
+    """A Gemma rotary that applied the loader's linear scaling records it as scaling_factor: export it."""
+    from copy import deepcopy
+    from transformers.models.gemma2.modeling_gemma2 import Gemma2RotaryEmbedding
+
+    class GemmaFixedRotaryEmbedding(Gemma2RotaryEmbedding):
+        """Stand-in for a fixed unsloth/models/gemma.py: built from the loader's scaled config."""
+
+        def __init__(self, config):
+            config = deepcopy(config)
+            config.rope_parameters, config.max_position_embeddings = dict(LINEAR), WIDE
+            super().__init__(config)
+            self.scaling_factor = LINEAR["factor"]
+
+    saved, base, diff = _export(tmp_path, "gemma2", LINEAR, rotary=GemmaFixedRotaryEmbedding)
+    got = _rope(saved)
+    assert (got.get("rope_type") or got.get("type")) == "linear" and got.get("factor") == 4.0, got
+    assert diff < 1e-4, f"export reloads with different logits than the trained model: {diff:.3e}"

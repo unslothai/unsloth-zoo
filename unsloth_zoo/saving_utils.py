@@ -4222,9 +4222,10 @@ def _carry_over_rope_scaling(base_config, trained_config, model):
     target = (_text_configs(base_config) or [base_config])[0]
     # transformers 5 keeps RoPE in rope_parameters (rope_scaling aliases it); 4.x in rope_scaling.
     keys = ["rope_parameters" if getattr(target, "rope_parameters", None) is not None else "rope_scaling"]
-    # Unsloth's Gemma / Gemma 2 rotary reads only rope_theta, so the linear scaling the loader writes for a
-    # long max_seq_length never reached training: those weights learned the base RoPE.
-    if any(type(module).__name__ == "GemmaFixedRotaryEmbedding" for module in model.modules()): keys = []
+    # Older Unsloth Gemma / Gemma 2 rotaries read only rope_theta, so the linear scaling the loader writes for a
+    # long max_seq_length never reached training; one that applied it records it as scaling_factor.
+    if any(type(module).__name__ == "GemmaFixedRotaryEmbedding" and getattr(module, "scaling_factor", 1.0) == 1.0
+           for module in model.modules()): keys = []
     for key in keys + ["max_position_embeddings"]:
         trained = getattr(source, key, None)
         if trained is None or trained == getattr(target, key, None): continue
