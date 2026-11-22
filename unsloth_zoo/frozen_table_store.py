@@ -285,6 +285,9 @@ def resolve_tensor_locations(
 _PAGE = mmap.PAGESIZE
 _FILES_LOCK = threading.Lock()
 _FILES: Dict[str, "_MappedFile"] = {}
+# Releases waiting for _FILES_LOCK. A table's finalizer can run inside any allocation, including one made while this
+# thread already holds the lock (a cyclic GC pass inside _acquire_file), so it queues instead of blocking on itself.
+_PENDING_RELEASES: List[List["_MappedFile"]] = []
 
 
 def _madvise(mm: mmap.mmap, start: int, length: int, advice: int) -> bool:
@@ -353,24 +356,45 @@ def _file_identity(path: str):
 
 
 def _acquire_file(path: str) -> _MappedFile:
-    with _FILES_LOCK:
-        f = _FILES.get(path)
-        # Keyed by path, but a file replaced at that path (a new save) is a new mapping: never the old inode.
-        if f is None or f.mm is None or f.identity != _file_identity(path):
-            f = _FILES[path] = _MappedFile(path)
-        f.refs += 1
-        return f
+    try:
+        with _FILES_LOCK:
+            f = _FILES.get(path)
+            # Keyed by path, but a file replaced at that path (a new save) is a new mapping: never the old inode.
+            if f is None or f.mm is None or f.identity != _file_identity(path):
+                f = _FILES[path] = _MappedFile(path)
+            f.refs += 1
+            # After our reference is taken, so a release queued meanwhile cannot close the mapping we return.
+            _drain_releases()
+            return f
+    finally:
+        _try_drain_releases()
 
 
-def _release_files(files: List["_MappedFile"]):
-    # The mappings themselves, not their paths: a file replaced at the same path is a different mapping.
-    with _FILES_LOCK:
-        for f in files:
+def _drain_releases():
+    """Apply queued releases; the caller holds _FILES_LOCK."""
+    while _PENDING_RELEASES:
+        # The mappings themselves, not their paths: a file replaced at the same path is a different mapping.
+        for f in _PENDING_RELEASES.pop():
             f.refs -= 1
             if f.refs <= 0:
                 if _FILES.get(f.path) is f:
                     _FILES.pop(f.path, None)
                 f.close()
+
+
+def _try_drain_releases():
+    # Recheck after unlocking: a release queued while we held the lock found it busy and left the drain to us.
+    while _PENDING_RELEASES and _FILES_LOCK.acquire(blocking = False):
+        try:
+            _drain_releases()
+        finally:
+            _FILES_LOCK.release()
+
+
+def _release_files(files: List["_MappedFile"]):
+    # list.append is atomic, so this is safe from a finalizer. If the lock is busy, its holder drains the queue.
+    _PENDING_RELEASES.append(list(files))
+    _try_drain_releases()
 
 
 # ----------------------------------------------------------------------------------------------
