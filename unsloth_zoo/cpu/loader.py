@@ -16,17 +16,19 @@
 
 __all__ = ["FastCPUModel"]
 
+import contextlib
 import functools
 import os
 import re
 import types
 import warnings
+import weakref
 
 import torch
 
 from .runtime import available_ram, cpu_bf16_supported, cpu_bnb_4bit_supported
 from .ops import (
-    Bf16StoredLinear, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, set_bf16_stored_dtype,
+    Bf16StoredLinear, _plain_lm_head, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, set_bf16_stored_dtype,
     store_frozen_linears_in_bf16,
 )
 
@@ -312,7 +314,202 @@ def _compile_layers(model):
     dynamic = os.environ.get("UNSLOTH_CPU_COMPILE_DYNAMIC", "1") == "1"
     for layer in layers:
         layer.compile(dynamic = dynamic)
+    _fall_back_to_eager_on_compile_error(layers)
     return len(layers)
+
+
+def _is_control_flow(error):
+    """Exceptions torch raises on purpose through a layer call: non-reentrant checkpointing stops a recomputation
+    early with _StopRecomputationError once it has every saved tensor."""
+    import torch.utils.checkpoint as checkpoint
+    stop = getattr(checkpoint, "_StopRecomputationError", None)
+    return stop is not None and isinstance(error, stop)
+
+
+def _first_error_line(error, limit):
+    """Dynamo's BackendCompilerFailed reads "backend='inductor' raised:" on its first line; the cause is the next one."""
+    lines = [line.strip() for line in str(error).strip().splitlines() if line.strip()]
+    if len(lines) > 1 and lines[0].endswith(":"):
+        return f"{lines[0]} {lines[1]}"[:limit]
+    return lines[0][:limit] if lines else ""
+
+
+@contextlib.contextmanager
+def _backward_lowered_in_forward():
+    """AOTAutograd lowers the backward graph lazily, at the first backward, when the forward saves no symbolic sizes,
+    and re-defers it after a failed eager attempt otherwise; a backward that cannot build would then raise from
+    loss.backward(), out of reach of the fallback. Forcing the lowering into the forward call puts it inside it.
+    Entered only with grad enabled (no backward graph otherwise), so generate() and eval skip it."""
+    config = getattr(getattr(torch, "_functorch", None), "config", None)
+    if config is None or not hasattr(config, "force_non_lazy_backward_lowering"):
+        yield  # older torch: a backward lowering error still surfaces in backward
+        return
+    previous = config.force_non_lazy_backward_lowering
+    config.force_non_lazy_backward_lowering = True
+    try:
+        yield
+    finally:
+        config.force_non_lazy_backward_lowering = previous
+
+
+def _in_backward():
+    """True inside autograd's backward pass, where checkpointing recomputes a layer's forward."""
+    current = getattr(torch._C, "_current_graph_task_id", None)
+    try:
+        return current is not None and current() != -1
+    except Exception:
+        return False
+
+
+_CACHE_KWARGS = ("past_key_values", "past_key_value", "layer_past", "cache_params", "past_key_values_cache")
+
+
+def _carries_cache(args, kwargs):
+    """A decoder layer call that would write into a KV / state cache."""
+    if any(kwargs.get(name) is not None for name in _CACHE_KWARGS):
+        return True
+    try:
+        from transformers.cache_utils import Cache
+    except Exception:
+        return False
+    return any(isinstance(value, Cache) for value in (*args, *kwargs.values()))
+
+
+class _RestartEagerly(Exception):
+    """Raised out of a layer's failed compiled call so its __call__ reruns the whole call, checkpoint included."""
+
+
+_RESTARTABLE_CLASSES = {}
+
+
+def _restartable(layer):
+    """Gives ``layer`` a __call__ that reruns itself once on _RestartEagerly. transformers' GradientCheckpointingLayer
+    opens the checkpoint in __call__, so the rerun gets a fresh checkpoint instead of one still holding what a
+    partly compiled forward (a graph break, then a segment that fails to compile) saved before the failure."""
+    cls = type(layer)
+    if getattr(cls, "_unsloth_restartable", False):
+        return
+    sub = _RESTARTABLE_CLASSES.get(cls)
+    if sub is None:
+        def __call__(self, *args, **kwargs):
+            self.__dict__["_unsloth_restart_depth"] = self.__dict__.get("_unsloth_restart_depth", 0) + 1
+            try:
+                return cls.__call__(self, *args, **kwargs)
+            except _RestartEagerly:
+                return cls.__call__(self, *args, **kwargs)
+            finally:
+                self.__dict__["_unsloth_restart_depth"] -= 1
+        sub = type(cls.__name__, (cls,), {
+            "__call__": __call__, "_unsloth_restartable": True,
+            "__module__": cls.__module__, "__qualname__": cls.__qualname__,
+        })
+        _RESTARTABLE_CLASSES[cls] = sub
+    layer.__class__ = sub
+
+
+def _fall_back_to_eager_on_compile_error(layers):
+    """The toolchain probe compiles one small kernel; a decoder layer can still fail to trace or build (an op or a
+    patched module Dynamo / Inductor cannot handle; Dynamo can raise plain AssertionErrors). The first failure of a
+    compiled call drops every layer back to eager and restarts that layer call eagerly (its checkpoint included, so
+    nothing a compiled segment saved before the failure stays behind), so a genuine model error still raises, now
+    from eager code. A layer whose compiled forward is still waiting for its checkpoint recomputation
+    (an earlier layer of the same step) replays it compiled once more: an eager recompute saves different tensors
+    and checkpointing raises CheckpointError. It goes eager after that."""
+    layers = list(layers)
+    state = {"eager": False}
+    # id(layer) -> one entry per compiled checkpointed forward whose backward has not recomputed it yet, keyed by
+    # its first tensor input: two checkpoints of one layer can be outstanding, and only the compiled one replays
+    # compiled (an eagerly retried one must recompute eagerly).
+    pending = {}
+
+    def first_tensor(args):
+        for value in args:
+            if isinstance(value, torch.Tensor):
+                return value
+        return None
+
+    def remember(key, args):
+        x = first_tensor(args)
+        entry = (None, None, None) if x is None else (weakref.ref(x), x.data_ptr(), tuple(x.shape))
+        entries = pending.setdefault(key, [])
+        entries.append(entry)
+        del entries[:-64]  # forwards never backpropagated (grad-enabled eval) must not pile up
+
+    def take(key, args):
+        entries = pending.get(key)
+        if not entries:
+            return False
+        x = first_tensor(args)
+        for index in range(len(entries) - 1, -1, -1):
+            ref, ptr, shape = entries[index]
+            alive = None if ref is None else ref()
+            if (
+                ref is None
+                or x is None
+                or alive is x
+                # reentrant checkpointing recomputes on detached copies: same storage and shape
+                or (alive is None and ptr == x.data_ptr() and shape == tuple(x.shape))
+            ):
+                del entries[index]
+                return True
+        return False
+
+    def drop(layer):
+        if not pending.get(id(layer)):
+            layer._compiled_call_impl = None
+
+    def disable(error):
+        if not state["eager"]:
+            state["eager"] = True
+            _print(f"torch.compile failed on a decoder layer ({type(error).__name__}: "
+                   f"{_first_error_line(error, 160)}), training eagerly.")
+        for layer in layers:
+            drop(layer)
+
+    def checkpointed(layer):
+        return torch.is_grad_enabled() and layer.training and getattr(layer, "gradient_checkpointing", True)
+
+    for layer in layers:
+        compiled = layer._compiled_call_impl
+        if compiled is None:
+            continue
+
+        def guarded(*args, _compiled = compiled, _layer = layer, **kwargs):
+            key = id(_layer)
+            backward = _in_backward()
+            if backward and take(key, args):
+                # Checkpoint recomputation of a compiled forward: replay it compiled, as the forward saved it.
+                if state["eager"]:
+                    drop(_layer)
+                return _compiled(*args, **kwargs)
+            if state["eager"] or _carries_cache(args, kwargs):
+                # A KV cache is mutated in place (update() appends): a compiled segment that ran before a later one
+                # failed could not be undone by a retry, so cached forwards (inference) always run eagerly.
+                return _layer._call_impl(*args, **kwargs)
+            try:
+                if not torch.is_grad_enabled():
+                    out = _compiled(*args, **kwargs)
+                else:
+                    with _backward_lowered_in_forward():
+                        out = _compiled(*args, **kwargs)
+            except Exception as error:
+                if _is_control_flow(error) or isinstance(error, _RestartEagerly):
+                    raise
+                disable(error)
+                if not backward and _layer.__dict__.get("_unsloth_restart_depth", 0) > 0:
+                    # A compiled segment before a graph break may already have saved tensors into this call's
+                    # checkpoint: start the call over (eager now) rather than rerun inside it.
+                    raise _RestartEagerly() from error
+                return _layer._call_impl(*args, **kwargs)
+            if not backward and checkpointed(_layer):
+                remember(key, args)
+            return out
+
+        layer._compiled_call_impl = guarded
+        try:
+            _restartable(layer)
+        except TypeError:
+            pass  # a class that cannot be subclassed / reassigned keeps the in-place eager rerun
 
 
 def _load_msvc_environment():
@@ -364,21 +561,68 @@ def _cpu_compile_unavailable():
         return ("no MSVC: install Visual Studio Build Tools with the C++ workload "
                 "(winget install Microsoft.VisualStudio.2022.BuildTools --override \"--add "
                 "Microsoft.VisualStudio.Workload.VCTools --includeRecommended\")")
+    if os.environ.get("TORCHDYNAMO_DISABLE", "").strip().lower() in ("1", "true"):
+        # Studio's Windows Triton gate sets it; torch.compile then runs eagerly and the probe below would still pass.
+        return "TORCHDYNAMO_DISABLE=1"
     try:
         import torch._dynamo
+        if getattr(torch._dynamo.config, "disable", False):
+            return "torch._dynamo.config.disable is set"
         x = torch.linspace(-4, 4, 64)  # not randn: the probe must not move the RNG that seeds LoRA init
         out = torch.compile(lambda t: torch.nn.functional.silu(t) * 2, dynamic = False)(x)
         if not torch.allclose(out, torch.nn.functional.silu(x) * 2):
             return "probe kernel gave wrong results"
         return None
     except Exception as error:
-        message = str(error).strip().splitlines()
-        return f"{type(error).__name__}: {message[0][:200] if message else ''}"
+        return f"{type(error).__name__}: {_first_error_line(error, 200)}"
     finally:
         try:
             torch._dynamo.reset()
         except Exception:
             pass
+
+
+# Checked compiled vs eager in fp32 (tiny Llama / Mistral / Qwen2 / Qwen3 / Phi-3 / Gemma / OLMo-2, SmolLM2-135M).
+_CPU_COMPILE_MODEL_TYPES = frozenset(("llama", "mistral", "qwen2", "qwen3", "phi3", "gemma", "olmo2"))
+
+
+def compile_cpu_layers(model, explicit = False):
+    """Compiles the decoder layers when Inductor can build CPU kernels here. Returns the layer count (0 = eager)."""
+    if getattr(model, "_unsloth_cpu_compiled", False):
+        return 0
+    reason = _cpu_compile_unavailable()
+    if reason is not None:
+        if explicit:
+            _print(f"UNSLOTH_CPU_COMPILE=1 ignored, training eagerly: torch.compile cannot build CPU kernels here ({reason}).")
+        else:
+            _print(f"torch.compile cannot build CPU kernels here ({reason}), training eagerly.")
+        return 0
+    count = _compile_layers(model)
+    model._unsloth_cpu_compiled = True
+    _print(f"torch.compile (Inductor C++) on {count} decoder layers." + ("" if explicit else " UNSLOTH_CPU_COMPILE=0 trains eagerly."))
+    return count
+
+
+def _cpu_compile_wanted(model):
+    """"explicit" for UNSLOTH_CPU_COMPILE=1, "auto" for the dense architectures whose compiled layers were checked
+    against eager (fp32 loss equal, gradients within 1e-6 relative; ~24% less CPU time per step after a one-off
+    compile), None otherwise or for UNSLOTH_CPU_COMPILE=0. Quantized models stay eager (bitsandbytes ops)."""
+    value = os.environ.get("UNSLOTH_CPU_COMPILE", "").strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return "explicit"
+    if value in ("0", "false", "no", "off"):
+        return None
+    config = getattr(model, "config", None)
+    if getattr(config, "quantization_config", None) is not None or getattr(model, "is_loaded_in_4bit", False) \
+            or getattr(model, "is_loaded_in_8bit", False):
+        return None
+    text = getattr(config, "get_text_config", lambda: config)()
+    if getattr(text, "model_type", None) not in _CPU_COMPILE_MODEL_TYPES:
+        return None
+    try:
+        return "auto" if _plain_lm_head(model) else None
+    except Exception:
+        return None
 
 
 def _non_reentrant_checkpointing_on(model):
@@ -635,14 +879,12 @@ class FastCPUModel:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
         # Training forwards never reuse a KV cache; generate() turns it back on via for_inference.
         model.config.use_cache = False
-        if os.environ.get("UNSLOTH_CPU_COMPILE", "0") == "1" and not getattr(model, "_unsloth_cpu_compiled", False):
-            reason = _cpu_compile_unavailable()
-            if reason is not None:
-                _print(f"UNSLOTH_CPU_COMPILE=1 ignored, training eagerly: torch.compile cannot build CPU kernels here ({reason}).")
-                return
-            count = _compile_layers(model)
-            model._unsloth_cpu_compiled = True
-            _print(f"torch.compile (Inductor C++) on {count} decoder layers.")
+        wanted = _cpu_compile_wanted(model)
+        if wanted == "auto":
+            # Decided by the trainer once it has timed eager steps: a short run never repays the cold compile.
+            model._unsloth_cpu_compile_pending = True
+        elif wanted and not getattr(model, "_unsloth_cpu_compiled", False):
+            compile_cpu_layers(model, explicit = True)
 
     @staticmethod
     def get_peft_model(
