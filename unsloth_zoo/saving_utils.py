@@ -4113,6 +4113,13 @@ def _restore_checkpoint_config_keys(config_path, source, config_class, carried =
     aliases = getattr(config_class, "attribute_map", None) or {}
     # Only when the save lost a checkpoint key to an alias: every other built-in export stays as it was.
     if not any(alias in source and alias not in written for alias in aliases): return False
+    # A carried field the class saves under its own name (bailing_hybrid: max_position_embeddings is model_max_length)
+    # goes back under the checkpoint's spelling, else the restore reverts it to the checkpoint's value.
+    for key in carried:
+        real = aliases.get(key, key)
+        if real == key or real not in written: continue
+        spellings = [name for name in (key, real) if name in source] or [key]
+        for name in spellings: source[name] = written[real]
     _overlay_export_managed_keys(source, written, carried)
     config_path.write_text(json.dumps(source, indent = 2), encoding = "utf-8")
     return True
@@ -4245,13 +4252,21 @@ def _rotary_ignored_rope_scaling(model, rope):
 pass
 
 
+def _rope_config_holder(config):
+    # Nested first, as the vocab carry-over: a repo-code composite whose get_text_config() returns itself keeps the
+    # language model's RoPE and window in llm_config / language_config, which is what its reload reads.
+    holders = _text_configs(config)
+    nested = [holder for holder in holders if holder is not config]
+    return nested[0] if nested else config
+pass
+
+
 def _carry_over_rope_scaling(base_config, trained_config, model):
     # The loader puts RoPE scaling (the caller's rope_scaling, or linear past the native window) and the widened
     # max_position_embeddings on the in-memory config only, so the base checkpoint's would reload the merged
     # weights with a RoPE they were not trained with. A field moves whole, and only when it differs.
     from copy import deepcopy
-    source = (_text_configs(trained_config) or [trained_config])[0]
-    target = (_text_configs(base_config) or [base_config])[0]
+    source, target = _rope_config_holder(trained_config), _rope_config_holder(base_config)
     # transformers 5 keeps RoPE in rope_parameters (rope_scaling aliases it); 4.x in rope_scaling.
     keys = ["rope_parameters" if getattr(target, "rope_parameters", None) is not None else "rope_scaling"]
     # The weights trained with the RoPE the rotary applied, which is not always what the config says.

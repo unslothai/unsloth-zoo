@@ -259,3 +259,23 @@ def test_yarn_that_only_scales_attention_still_counts_as_applied(attention_scali
     _carry_over_rope_scaling(base, trained, model)
     assert base.rope_parameters == (yarn if exported else default)
     assert base.max_position_embeddings == 4 * 32768
+
+
+def test_wrapper_whose_text_config_is_itself_moves_rope_into_llm_config():
+    """A repo-code composite (InternVL style) whose get_text_config() returns the wrapper keeps the language model's
+    RoPE and window in llm_config; a text-only export trains that config, and the reload reads llm_config."""
+    import transformers as T
+    from unsloth_zoo.saving_utils import _carry_over_rope_scaling
+
+    llm = T.LlamaConfig(max_position_embeddings=NATIVE)
+    base = NS(llm_config=llm, vision_config=NS())
+    base.get_text_config = lambda: base
+    trained = T.LlamaConfig(max_position_embeddings=WIDE)
+    field = "rope_parameters" if getattr(llm, "rope_parameters", None) is not None else "rope_scaling"
+    setattr(trained, field, {"rope_type": "linear", "factor": 4.0, "rope_theta": 10000.0})
+    _carry_over_rope_scaling(base, trained, torch.nn.Module())
+    got = getattr(llm, field) or {}
+    assert (got.get("rope_type") or got.get("type")) == "linear" and got.get("factor") == 4.0, got
+    assert llm.max_position_embeddings == WIDE
+    assert not hasattr(base, "rope_parameters") and not hasattr(base, "rope_scaling")
+    assert not hasattr(base, "max_position_embeddings")
