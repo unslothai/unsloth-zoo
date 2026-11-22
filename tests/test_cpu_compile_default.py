@@ -388,3 +388,54 @@ def test_compile_error_after_a_graph_break_restarts_the_checkpoint_eagerly(monke
             assert all(block._compiled_call_impl is None for block in blocks)
     assert "training eagerly" in capsys.readouterr().out
     torch.testing.assert_close(grads[0], grads[1])
+
+
+def test_cached_forward_never_appends_twice_after_a_compile_failure(monkeypatch, capsys):
+    """Cached inference through compiled layers: a segment that updates the KV cache, a graph break, then a segment
+    that fails to compile. A retry of the layer call would append the same tokens to the cache again; cached calls
+    run eagerly, so each layer's cache grows by exactly the tokens of the forward."""
+    from transformers.modeling_layers import GradientCheckpointingLayer
+    from unsloth_zoo.cpu import loader
+    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False)
+
+    class Block(GradientCheckpointingLayer):
+        def __init__(self, index):
+            super().__init__()
+            self.index = index
+            self.up, self.down = torch.nn.Linear(8, 16), torch.nn.Linear(16, 8)
+
+        def forward(self, x, past_key_values = None):
+            x = torch.nn.functional.gelu(self.up(x))
+            if past_key_values is not None:
+                past_key_values[self.index].append(x.detach())
+            torch._dynamo.graph_break()
+            return self.down(x) * 2.0
+
+    graphs = []
+
+    def first_segment_only(gm, example_inputs):
+        graphs.append(gm)
+        if len(graphs) > 1:
+            raise RuntimeError("C++ build failed")
+        return gm.forward
+
+    x = torch.randn(1, 3, 8, generator = torch.Generator().manual_seed(0))
+    outs = []
+    for compiled in (False, True):
+        torch.manual_seed(0)
+        blocks = torch.nn.ModuleList([Block(0), Block(1)]).eval()
+        if compiled:
+            for block in blocks:
+                block.compile(backend = first_segment_only)
+            loader._fall_back_to_eager_on_compile_error(blocks)
+        cache = [[], []]
+        try:
+            with torch.no_grad():
+                h = x
+                for block in blocks:
+                    h = block(h, past_key_values = cache)
+        finally:
+            torch._dynamo.reset()
+        assert [len(c) for c in cache] == [1, 1], [len(c) for c in cache]
+        outs.append(h)
+    torch.testing.assert_close(outs[0], outs[1])

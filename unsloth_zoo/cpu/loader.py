@@ -322,6 +322,20 @@ def _in_backward():
         return False
 
 
+_CACHE_KWARGS = ("past_key_values", "past_key_value", "layer_past", "cache_params", "past_key_values_cache")
+
+
+def _carries_cache(args, kwargs):
+    """A decoder layer call that would write into a KV / state cache."""
+    if any(kwargs.get(name) is not None for name in _CACHE_KWARGS):
+        return True
+    try:
+        from transformers.cache_utils import Cache
+    except Exception:
+        return False
+    return any(isinstance(value, Cache) for value in (*args, *kwargs.values()))
+
+
 class _RestartEagerly(Exception):
     """Raised out of a layer's failed compiled call so its __call__ reruns the whole call, checkpoint included."""
 
@@ -395,7 +409,9 @@ def _fall_back_to_eager_on_compile_error(layers):
                 if state["eager"]:
                     drop(_layer)
                 return _compiled(*args, **kwargs)
-            if state["eager"]:
+            if state["eager"] or _carries_cache(args, kwargs):
+                # A KV cache is mutated in place (update() appends): a compiled segment that ran before a later one
+                # failed could not be undone by a retry, so cached forwards (inference) always run eagerly.
                 return _layer._call_impl(*args, **kwargs)
             try:
                 if not torch.is_grad_enabled():
