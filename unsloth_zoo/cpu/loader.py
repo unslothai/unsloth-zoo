@@ -376,6 +376,17 @@ def _carries_cache(args, kwargs):
     return any(isinstance(value, Cache) for value in (*args, *kwargs.values()))
 
 
+def _checkpoints_inside_forward(layer):
+    """transformers' GradientCheckpointingLayer opens its checkpoint in __call__ up to 5.22 and wraps ``forward`` from
+    5.23 on (module hooks stay outside the checkpoint), so a compiled layer call then carries its own checkpoint."""
+    try:
+        from transformers.modeling_layers import GradientCheckpointingLayer
+    except Exception:
+        return False
+    # __init_subclass__, not a missing __call__: temporary_patches.misc installs its own __call__ on every version.
+    return isinstance(layer, GradientCheckpointingLayer) and "__init_subclass__" in GradientCheckpointingLayer.__dict__
+
+
 class _RestartEagerly(Exception):
     """Raised out of a layer's failed compiled call so its __call__ reruns the whole call, checkpoint included."""
 
@@ -475,6 +486,10 @@ def _fall_back_to_eager_on_compile_error(layers):
             drop(layer)
 
     def checkpointed(layer):
+        # Only a checkpoint opened around the layer call recomputes through it. transformers >= 5.23 checkpoints
+        # inside forward instead, so the recomputation never comes back here and there is nothing to replay.
+        if _checkpoints_inside_forward(layer):
+            return False
         return torch.is_grad_enabled() and layer.training and getattr(layer, "gradient_checkpointing", True)
 
     for layer in layers:
