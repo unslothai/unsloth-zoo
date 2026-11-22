@@ -1196,6 +1196,10 @@ def _merge_and_overwrite_lora(
     mm = None
     header_metadata = None
     length_of_header = 0
+    # Tensors that outgrew their byte slot (vocab grew), rewritten after the pass. A local, not a function
+    # attribute: an exception mid-merge used to keep them (and the model parameters they alias) alive, and the
+    # next merge in the process then wrote them into an unrelated shard.
+    resized = {}
 
     try:
         if source_path is not None:
@@ -1471,11 +1475,7 @@ def _merge_and_overwrite_lora(
 
                 if not success:
                     # Tensor was resized (e.g. vocab grew); track for rewrite
-                    if not hasattr(_merge_and_overwrite_lora, "_resized"):
-                        _merge_and_overwrite_lora._resized = {}
-                    _merge_and_overwrite_lora._resized[output_key] = W.to(
-                        dtype=W_original_dtype, device="cpu"
-                    )
+                    resized[output_key] = W.to(dtype=W_original_dtype, device="cpu")
 
                 nbytes = W.numel() * W.element_size()
                 del W
@@ -1493,9 +1493,7 @@ def _merge_and_overwrite_lora(
 
         # Vocab grew -> resized tensors no longer fit their byte slots; rewrite the
         # shard. Stream to a temp file when disk allows, else rewrite in place.
-        resized = getattr(_merge_and_overwrite_lora, "_resized", {})
         if resized:
-            _merge_and_overwrite_lora._resized = {}
             gc.collect()
             device_empty_cache()
 

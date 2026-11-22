@@ -18,7 +18,7 @@
 # is a TypeError on the 3.9 floor pyproject declares.
 from __future__ import annotations
 
-__version__ = "2026.11.8"
+__version__ = "2026.11.9"
 
 import os
 import platform
@@ -103,20 +103,56 @@ def has_429_exact_full_read(log_dir: str | Path) -> bool:
     log_dir = Path(log_dir).expanduser()
     if not log_dir.is_dir():
         return False
-    # Streamed: a single hf_xet log can reach hundreds of MB and this runs on every import.
+    # Streamed: a single hf_xet log can reach hundreds of MB and this runs on every import. Files whose inode, size and
+    # mtime match the last scan reuse its answer (logs are append-only, so any write changes size or mtime); a missing,
+    # unreadable or unwritable manifest just means a full scan, as before.
     marker = b"429 Too Many Requests"
     keep = len(marker) - 1
+    manifest_path = log_dir / ".unsloth_429_scan.json"
+    import json
+    try:
+        previous = json.loads(manifest_path.read_text(encoding = "utf-8"))
+        if not isinstance(previous, dict):
+            previous = {}
+    except Exception:
+        previous = {}
+    seen = {}
+    found = dirty = False
     for log_file in log_dir.glob("*.log"):
         try:
-            with open(log_file, "rb") as f:
-                tail = b""
-                while block := f.read(1 << 20):
-                    if marker in block or marker in tail + block[:keep]:
-                        return True
-                    tail = block[-keep:]
+            st = log_file.stat()
+            key = [st.st_ino, st.st_size, st.st_mtime_ns]
+            cached = previous.get(log_file.name)
+            if isinstance(cached, list) and len(cached) == 4 and cached[:3] == key:
+                hit = bool(cached[3])
+            else:
+                hit, dirty = False, True
+                with open(log_file, "rb") as f:
+                    tail = b""
+                    while block := f.read(1 << 20):
+                        if marker in block or marker in tail + block[:keep]:
+                            hit = True
+                            break
+                        tail = block[-keep:]
+            seen[log_file.name] = key + [hit]
         except OSError:
             continue
-    return False
+        if hit:
+            found = True
+            break
+    if dirty:
+        try:
+            if found:  # stopped early: keep what is still known about the files not reached
+                seen = {**{k: v for k, v in previous.items() if (log_dir / k).exists()}, **seen}
+            tmp = manifest_path.with_name(f"{manifest_path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(seen), encoding = "utf-8")
+            os.replace(tmp, manifest_path)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok = True)
+            except Exception:
+                pass
+    return found
 
 # Redirect the HF cache off a read-only default so snapshot_download() can write; must run before any huggingface_hub import.
 from .hf_cache import redirect_hf_cache_if_readonly, _active_caches

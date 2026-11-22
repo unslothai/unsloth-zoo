@@ -227,15 +227,19 @@ def test_fp16_trainer_gets_cpu_autocast_and_grad_scaler(monkeypatch, tmp_path, d
     assert seen == [torch.float16]
 
 
-def test_cpu_training_arguments_turn_off_packing_and_gpu_optimizers(dtype_policy):
+@pytest.mark.parametrize("packing_supported", [False, True])
+def test_cpu_training_arguments_turn_off_packing_and_gpu_optimizers(dtype_policy, monkeypatch, packing_supported):
+    """Packing / padding_free stay on only where transformers keeps packed examples apart (masking_utils + torch 2.6);
+    the trainer then still checks the model itself (test_cpu_train_speed)."""
     from types import SimpleNamespace
-    from unsloth_zoo.cpu.trainer import normalize_cpu_training_arguments
+    from unsloth_zoo.cpu import trainer
     dtype_policy("0", "0")
+    monkeypatch.setattr(trainer, "cpu_packing_supported", lambda: packing_supported)
     args = SimpleNamespace(use_cpu = False, fp16 = True, bf16 = False, optim = "paged_adamw_8bit",
                            packing = True, eval_packing = True, padding_free = True, dataloader_pin_memory = True)
-    normalize_cpu_training_arguments(args)
-    assert args.use_cpu and not args.fp16 and args.optim == "adamw_torch_fused"
-    assert not args.packing and not args.eval_packing and not args.padding_free and not args.dataloader_pin_memory
+    trainer.normalize_cpu_training_arguments(args)
+    assert args.use_cpu and not args.fp16 and args.optim == "adamw_torch_fused" and not args.dataloader_pin_memory
+    assert (args.packing, args.eval_packing, args.padding_free) == (packing_supported,) * 3
 
 
 @pytest.mark.parametrize("torch_version, expected", [("2.13.0+cpu", "adamw_torch_fused"), ("2.3.1", "adamw_torch")])
@@ -893,6 +897,7 @@ def test_cpu_4bit_keeps_the_gpu_skip_modules_in_16bit(monkeypatch):
         raise Stop
     monkeypatch.setattr(loader, "_adapter_base_model", lambda *a, **k: None)
     monkeypatch.setattr(loader, "cpu_bnb_4bit_supported", lambda: True)
+    monkeypatch.setattr(loader, "available_ram", lambda: 0)  # 16-bit never fits: the 4-bit config is under test
     monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", fake_load)
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _StubTokenizer(64))
     with pytest.raises(Stop):
@@ -1353,8 +1358,11 @@ def test_store_frozen_linears_in_bf16_keeps_head_and_norms_fp32_and_merges_unrou
 
 
 @pytest.mark.parametrize("env, ckpt_dtype, expected", [("1", torch.bfloat16, torch.bfloat16), ("1", torch.float32, torch.float32),
-                                                       ("0", torch.bfloat16, torch.float32)])
-def test_frozen_bf16_storage_is_opt_in_and_only_for_bf16_checkpoints(monkeypatch, env, ckpt_dtype, expected):
+                                                       ("0", torch.bfloat16, torch.float32),
+                                                       # Unset on a CPU without native bf16 (fp32 training): on.
+                                                       ("", torch.bfloat16, torch.bfloat16),
+                                                       ("", torch.float32, torch.float32)])
+def test_frozen_bf16_storage_defaults_on_without_native_bf16_only_for_bf16_checkpoints(monkeypatch, env, ckpt_dtype, expected):
     import transformers
     from unsloth_zoo.cpu import loader
     seen = {}

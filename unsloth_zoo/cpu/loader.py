@@ -16,16 +16,22 @@
 
 __all__ = ["FastCPUModel"]
 
+import contextlib
+import gc
 import functools
 import os
 import re
 import types
 import warnings
+import weakref
 
 import torch
 
-from .runtime import cpu_bf16_supported, cpu_bnb_4bit_supported
-from .ops import Bf16StoredLinear, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, store_frozen_linears_in_bf16
+from .runtime import available_ram, cpu_bf16_supported, cpu_bnb_4bit_supported
+from .ops import (
+    Bf16StoredLinear, _plain_lm_head, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, set_bf16_stored_dtype,
+    store_frozen_linears_in_bf16,
+)
 
 _DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 # unsloth/Qwen3-0.6B-unsloth-bnb-4bit -> unsloth/Qwen3-0.6B
@@ -75,6 +81,44 @@ _DTYPE_KWARG = _dtype_kwarg()
 
 def _print(message):
     print(f"Unsloth (CPU): {message}")
+
+
+def _dense_parameter_count(config):
+    """Parameters of a dense decoder from its config (embeddings, attention, gated MLP), None when unknown or MoE."""
+    text = getattr(config, "get_text_config", lambda: config)()
+    get = lambda name: getattr(text, name, None)  # noqa: E731
+    if any(get(name) for name in ("num_experts", "num_local_experts", "n_routed_experts", "moe_intermediate_size")):
+        return None
+    hidden, layers, vocab = get("hidden_size"), get("num_hidden_layers"), get("vocab_size")
+    if not (isinstance(hidden, int) and isinstance(layers, int) and isinstance(vocab, int)):
+        return None
+    heads = get("num_attention_heads") or 1
+    head_dim = get("head_dim") or hidden // heads
+    kv = (get("num_key_value_heads") or heads) * head_dim
+    intermediate = get("intermediate_size") or 4 * hidden
+    per_layer = hidden * heads * head_dim * 2 + 2 * hidden * kv + 3 * hidden * intermediate
+    embeddings = vocab * hidden * (1 if getattr(config, "tie_word_embeddings", True) else 2)
+    return embeddings + layers * per_layer
+
+
+def _prefer_16bit_weights(model_name, dtype, token, revision, trust_remote_code, **kwargs):
+    """4-bit on CPU dequantizes every weight in forward, backward and the checkpointed recompute (~12% more CPU time
+    per step on SmolLM2-135M, no lower peak RSS at that size). When the 16-bit weights take at most a quarter of the
+    free RAM, train on them instead. UNSLOTH_CPU_LOAD_IN_4BIT=1 keeps 4-bit. Returns the 16-bit size or None."""
+    if os.environ.get("UNSLOTH_CPU_LOAD_IN_4BIT", "").strip().lower() in ("1", "true", "yes", "on"):
+        return None
+    try:
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_name, token = token, revision = revision,
+                                            trust_remote_code = trust_remote_code, **kwargs)
+    except Exception:
+        return None
+    count = _dense_parameter_count(config)
+    available = available_ram()
+    if count is None or available is None:
+        return None
+    size = count * torch.empty((), dtype = dtype).element_size()
+    return size if size * 4 <= available else None
 
 
 def _checkpoint_dtype(model_name, **kwargs):
@@ -271,7 +315,224 @@ def _compile_layers(model):
     dynamic = os.environ.get("UNSLOTH_CPU_COMPILE_DYNAMIC", "1") == "1"
     for layer in layers:
         layer.compile(dynamic = dynamic)
+    _fall_back_to_eager_on_compile_error(layers)
     return len(layers)
+
+
+def _is_control_flow(error):
+    """Exceptions torch raises on purpose through a layer call: non-reentrant checkpointing stops a recomputation
+    early with _StopRecomputationError once it has every saved tensor."""
+    import torch.utils.checkpoint as checkpoint
+    stop = getattr(checkpoint, "_StopRecomputationError", None)
+    return stop is not None and isinstance(error, stop)
+
+
+def _first_error_line(error, limit):
+    """Dynamo's BackendCompilerFailed reads "backend='inductor' raised:" on its first line; the cause is the next one."""
+    lines = [line.strip() for line in str(error).strip().splitlines() if line.strip()]
+    if len(lines) > 1 and lines[0].endswith(":"):
+        return f"{lines[0]} {lines[1]}"[:limit]
+    return lines[0][:limit] if lines else ""
+
+
+@contextlib.contextmanager
+def _backward_lowered_in_forward():
+    """AOTAutograd lowers the backward graph lazily, at the first backward, when the forward saves no symbolic sizes,
+    and re-defers it after a failed eager attempt otherwise; a backward that cannot build would then raise from
+    loss.backward(), out of reach of the fallback. Forcing the lowering into the forward call puts it inside it.
+    Entered only with grad enabled (no backward graph otherwise), so generate() and eval skip it."""
+    config = getattr(getattr(torch, "_functorch", None), "config", None)
+    if config is None or not hasattr(config, "force_non_lazy_backward_lowering"):
+        yield  # older torch: a backward lowering error still surfaces in backward
+        return
+    previous = config.force_non_lazy_backward_lowering
+    config.force_non_lazy_backward_lowering = True
+    try:
+        yield
+    finally:
+        config.force_non_lazy_backward_lowering = previous
+
+
+def _in_backward():
+    """True inside autograd's backward pass, where checkpointing recomputes a layer's forward."""
+    current = getattr(torch._C, "_current_graph_task_id", None)
+    try:
+        return current is not None and current() != -1
+    except Exception:
+        return False
+
+
+_CACHE_KWARGS = ("past_key_values", "past_key_value", "layer_past", "cache_params", "past_key_values_cache")
+
+
+def _carries_cache(args, kwargs):
+    """A decoder layer call that would write into a KV / state cache."""
+    if any(kwargs.get(name) is not None for name in _CACHE_KWARGS):
+        return True
+    try:
+        from transformers.cache_utils import Cache
+    except Exception:
+        return False
+    return any(isinstance(value, Cache) for value in (*args, *kwargs.values()))
+
+
+def _checkpoints_inside_forward(layer):
+    """transformers' GradientCheckpointingLayer opens its checkpoint in __call__ up to 5.22 and wraps ``forward`` from
+    5.23 on (module hooks stay outside the checkpoint), so a compiled layer call then carries its own checkpoint."""
+    try:
+        from transformers.modeling_layers import GradientCheckpointingLayer
+    except Exception:
+        return False
+    # __init_subclass__, not a missing __call__: temporary_patches.misc installs its own __call__ on every version.
+    return isinstance(layer, GradientCheckpointingLayer) and "__init_subclass__" in GradientCheckpointingLayer.__dict__
+
+
+class _RestartEagerly(Exception):
+    """Raised out of a layer's failed compiled call so its __call__ reruns the whole call, checkpoint included."""
+
+
+_RESTARTABLE_CLASSES = {}
+
+
+def _restartable(layer):
+    """Gives ``layer`` a __call__ that reruns itself once on _RestartEagerly. transformers' GradientCheckpointingLayer
+    opens the checkpoint in __call__, so the rerun gets a fresh checkpoint instead of one still holding what a
+    partly compiled forward (a graph break, then a segment that fails to compile) saved before the failure."""
+    cls = type(layer)
+    if getattr(cls, "_unsloth_restartable", False):
+        return
+    sub = _RESTARTABLE_CLASSES.get(cls)
+    if sub is None:
+        def __call__(self, *args, **kwargs):
+            self.__dict__["_unsloth_restart_depth"] = self.__dict__.get("_unsloth_restart_depth", 0) + 1
+            try:
+                try:
+                    return cls.__call__(self, *args, **kwargs)
+                except _RestartEagerly as error:
+                    # The aborted checkpoint's generator still holds its saved-tensor hooks (non-reentrant
+                    # checkpoint never closes it when the function raises) and the traceback keeps it alive: drop
+                    # both before the retry, or its tensors land in the aborted frame and backward raises.
+                    error.__traceback__ = None
+                    del error
+                gc.collect()
+                return cls.__call__(self, *args, **kwargs)
+            finally:
+                self.__dict__["_unsloth_restart_depth"] -= 1
+        sub = type(cls.__name__, (cls,), {
+            "__call__": __call__, "_unsloth_restartable": True,
+            "__module__": cls.__module__, "__qualname__": cls.__qualname__,
+        })
+        _RESTARTABLE_CLASSES[cls] = sub
+    layer.__class__ = sub
+
+
+def _fall_back_to_eager_on_compile_error(layers):
+    """The toolchain probe compiles one small kernel; a decoder layer can still fail to trace or build (an op or a
+    patched module Dynamo / Inductor cannot handle; Dynamo can raise plain AssertionErrors). The first failure of a
+    compiled call drops every layer back to eager and restarts that layer call eagerly (its checkpoint included, so
+    nothing a compiled segment saved before the failure stays behind), so a genuine model error still raises, now
+    from eager code. A layer whose compiled forward is still waiting for its checkpoint recomputation
+    (an earlier layer of the same step) replays it compiled once more: an eager recompute saves different tensors
+    and checkpointing raises CheckpointError. It goes eager after that."""
+    layers = list(layers)
+    state = {"eager": False}
+    # id(layer) -> one entry per compiled checkpointed forward whose backward has not recomputed it yet, keyed by
+    # its first tensor input: two checkpoints of one layer can be outstanding, and only the compiled one replays
+    # compiled (an eagerly retried one must recompute eagerly).
+    pending = {}
+
+    def first_tensor(args):
+        for value in args:
+            if isinstance(value, torch.Tensor):
+                return value
+        return None
+
+    def remember(key, args):
+        x = first_tensor(args)
+        entry = (None, None, None) if x is None else (weakref.ref(x), x.data_ptr(), tuple(x.shape))
+        entries = pending.setdefault(key, [])
+        entries.append(entry)
+        del entries[:-64]  # forwards never backpropagated (grad-enabled eval) must not pile up
+
+    def take(key, args):
+        entries = pending.get(key)
+        if not entries:
+            return False
+        x = first_tensor(args)
+        for index in range(len(entries) - 1, -1, -1):
+            ref, ptr, shape = entries[index]
+            alive = None if ref is None else ref()
+            if (
+                ref is None
+                or x is None
+                or alive is x
+                # reentrant checkpointing recomputes on detached copies: same storage and shape
+                or (alive is None and ptr == x.data_ptr() and shape == tuple(x.shape))
+            ):
+                del entries[index]
+                return True
+        return False
+
+    def drop(layer):
+        if not pending.get(id(layer)):
+            layer._compiled_call_impl = None
+
+    def disable(error):
+        if not state["eager"]:
+            state["eager"] = True
+            _print(f"torch.compile failed on a decoder layer ({type(error).__name__}: "
+                   f"{_first_error_line(error, 160)}), training eagerly.")
+        for layer in layers:
+            drop(layer)
+
+    def checkpointed(layer):
+        # Only a checkpoint opened around the layer call recomputes through it. transformers >= 5.23 checkpoints
+        # inside forward instead, so the recomputation never comes back here and there is nothing to replay.
+        if _checkpoints_inside_forward(layer):
+            return False
+        return torch.is_grad_enabled() and layer.training and getattr(layer, "gradient_checkpointing", True)
+
+    for layer in layers:
+        compiled = layer._compiled_call_impl
+        if compiled is None:
+            continue
+
+        def guarded(*args, _compiled = compiled, _layer = layer, **kwargs):
+            key = id(_layer)
+            backward = _in_backward()
+            if backward and take(key, args):
+                # Checkpoint recomputation of a compiled forward: replay it compiled, as the forward saved it.
+                if state["eager"]:
+                    drop(_layer)
+                return _compiled(*args, **kwargs)
+            if state["eager"] or _carries_cache(args, kwargs):
+                # A KV cache is mutated in place (update() appends): a compiled segment that ran before a later one
+                # failed could not be undone by a retry, so cached forwards (inference) always run eagerly.
+                return _layer._call_impl(*args, **kwargs)
+            try:
+                if not torch.is_grad_enabled():
+                    out = _compiled(*args, **kwargs)
+                else:
+                    with _backward_lowered_in_forward():
+                        out = _compiled(*args, **kwargs)
+            except Exception as error:
+                if _is_control_flow(error) or isinstance(error, _RestartEagerly):
+                    raise
+                disable(error)
+                if not backward and _layer.__dict__.get("_unsloth_restart_depth", 0) > 0:
+                    # A compiled segment before a graph break may already have saved tensors into this call's
+                    # checkpoint: start the call over (eager now) rather than rerun inside it.
+                    raise _RestartEagerly() from error
+                return _layer._call_impl(*args, **kwargs)
+            if not backward and checkpointed(_layer):
+                remember(key, args)
+            return out
+
+        layer._compiled_call_impl = guarded
+        try:
+            _restartable(layer)
+        except TypeError:
+            pass  # a class that cannot be subclassed / reassigned keeps the in-place eager rerun
 
 
 def _load_msvc_environment():
@@ -323,21 +584,68 @@ def _cpu_compile_unavailable():
         return ("no MSVC: install Visual Studio Build Tools with the C++ workload "
                 "(winget install Microsoft.VisualStudio.2022.BuildTools --override \"--add "
                 "Microsoft.VisualStudio.Workload.VCTools --includeRecommended\")")
+    if os.environ.get("TORCHDYNAMO_DISABLE", "").strip().lower() in ("1", "true"):
+        # Studio's Windows Triton gate sets it; torch.compile then runs eagerly and the probe below would still pass.
+        return "TORCHDYNAMO_DISABLE=1"
     try:
         import torch._dynamo
+        if getattr(torch._dynamo.config, "disable", False):
+            return "torch._dynamo.config.disable is set"
         x = torch.linspace(-4, 4, 64)  # not randn: the probe must not move the RNG that seeds LoRA init
         out = torch.compile(lambda t: torch.nn.functional.silu(t) * 2, dynamic = False)(x)
         if not torch.allclose(out, torch.nn.functional.silu(x) * 2):
             return "probe kernel gave wrong results"
         return None
     except Exception as error:
-        message = str(error).strip().splitlines()
-        return f"{type(error).__name__}: {message[0][:200] if message else ''}"
+        return f"{type(error).__name__}: {_first_error_line(error, 200)}"
     finally:
         try:
             torch._dynamo.reset()
         except Exception:
             pass
+
+
+# Checked compiled vs eager in fp32 (tiny Llama / Mistral / Qwen2 / Qwen3 / Phi-3 / Gemma / OLMo-2, SmolLM2-135M).
+_CPU_COMPILE_MODEL_TYPES = frozenset(("llama", "mistral", "qwen2", "qwen3", "phi3", "gemma", "olmo2"))
+
+
+def compile_cpu_layers(model, explicit = False):
+    """Compiles the decoder layers when Inductor can build CPU kernels here. Returns the layer count (0 = eager)."""
+    if getattr(model, "_unsloth_cpu_compiled", False):
+        return 0
+    reason = _cpu_compile_unavailable()
+    if reason is not None:
+        if explicit:
+            _print(f"UNSLOTH_CPU_COMPILE=1 ignored, training eagerly: torch.compile cannot build CPU kernels here ({reason}).")
+        else:
+            _print(f"torch.compile cannot build CPU kernels here ({reason}), training eagerly.")
+        return 0
+    count = _compile_layers(model)
+    model._unsloth_cpu_compiled = True
+    _print(f"torch.compile (Inductor C++) on {count} decoder layers." + ("" if explicit else " UNSLOTH_CPU_COMPILE=0 trains eagerly."))
+    return count
+
+
+def _cpu_compile_wanted(model):
+    """"explicit" for UNSLOTH_CPU_COMPILE=1, "auto" for the dense architectures whose compiled layers were checked
+    against eager (fp32 loss equal, gradients within 1e-6 relative; ~24% less CPU time per step after a one-off
+    compile), None otherwise or for UNSLOTH_CPU_COMPILE=0. Quantized models stay eager (bitsandbytes ops)."""
+    value = os.environ.get("UNSLOTH_CPU_COMPILE", "").strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return "explicit"
+    if value in ("0", "false", "no", "off"):
+        return None
+    config = getattr(model, "config", None)
+    if getattr(config, "quantization_config", None) is not None or getattr(model, "is_loaded_in_4bit", False) \
+            or getattr(model, "is_loaded_in_8bit", False):
+        return None
+    text = getattr(config, "get_text_config", lambda: config)()
+    if getattr(text, "model_type", None) not in _CPU_COMPILE_MODEL_TYPES:
+        return None
+    try:
+        return "auto" if _plain_lm_head(model) else None
+    except Exception:
+        return None
 
 
 def _non_reentrant_checkpointing_on(model):
@@ -386,6 +694,8 @@ class FastCPUModel:
 
         if fast_inference:
             raise NotImplementedError("Unsloth (CPU): fast_inference (vLLM) needs a GPU.")
+        # A quantization config the caller built is a choice of quantization: never swapped for 16-bit weights.
+        user_quantization = kwargs.get("quantization_config", None) is not None
         # Before anything downloads: a refused GPU-only feature fails fast.
         _pop_gpu_loader_kwargs(kwargs)
         # Chunked CE returns logits = None in training steps; return_logits keeps the full-logit loss.
@@ -434,6 +744,15 @@ class FastCPUModel:
         if use_4bit and not cpu_bnb_4bit_supported():
             _print("bitsandbytes 4-bit does not work on this CPU, loading 16-bit weights instead.")
             use_4bit = False
+        if use_4bit and not user_quantization and kwargs.get("config") is None \
+                and not _PREQUANTIZED_SUFFIX.search(model_name) and quant_method is None:
+            # A pre-quantized repo was picked to download less; its 16-bit base would be a new download.
+            size = _prefer_16bit_weights(model_name, dtype, token, revision, trust_remote_code, **probe_kwargs)
+            if size is not None:
+                _print(f"load_in_4bit = True, but loading 16-bit weights instead: they fit in RAM "
+                       f"({size / 1024 ** 3:.2f} GB of {available_ram() / 1024 ** 3:.0f} GB free) and train faster than "
+                       "4-bit on CPU. Set UNSLOTH_CPU_LOAD_IN_4BIT=1 to keep 4-bit.")
+                use_4bit = False
         if not use_4bit and _PREQUANTIZED_SUFFIX.search(model_name):
             base = _PREQUANTIZED_SUFFIX.sub("", model_name)
             _print(f"{model_name} is pre-quantized; loading {base} for 16-bit training.")
@@ -464,8 +783,15 @@ class FastCPUModel:
         # Left to transformers when unset: SDPA where the class supports it, eager otherwise (Bloom, MPT, ...).
         if attn_implementation is not None:
             kwargs["attn_implementation"] = attn_implementation
+        # fp32 training of a bf16 checkpoint keeps the frozen projections in bf16 (lossless, half their RAM, no
+        # measurable step-time cost). Default where fp32 is the default (no native bf16); UNSLOTH_CPU_FROZEN_BF16=1 / 0
+        # forces it on / off.
+        frozen_env = os.environ.get("UNSLOTH_CPU_FROZEN_BF16", "").strip().lower()
+        frozen_wanted = frozen_env in ("1", "true", "yes", "on") or (
+            frozen_env not in ("0", "false", "no", "off") and not cpu_bf16_supported()
+        )
         frozen_bf16 = (
-            os.environ.get("UNSLOTH_CPU_FROZEN_BF16", "0") == "1" and dtype == torch.float32 and not auto_dtype
+            frozen_wanted and dtype == torch.float32 and not auto_dtype
             and not use_4bit and not full_finetuning
             and _checkpoint_dtype(model_name, token = token, revision = revision,
                                   trust_remote_code = trust_remote_code, **probe_kwargs) == torch.bfloat16
@@ -479,6 +805,7 @@ class FastCPUModel:
         )
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
+            model = None
             try:
                 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
             except RuntimeError as error:
@@ -486,6 +813,10 @@ class FastCPUModel:
                 if quantization_config is None:
                     raise
                 _print(f"bitsandbytes 4-bit failed on CPU ({error}), loading 16-bit weights instead.")
+            if model is None:
+                # Outside the handler: its traceback keeps the failed load's half-built model alive.
+                import gc
+                gc.collect()
                 kwargs.pop("quantization_config", None)
                 use_4bit = False
                 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
@@ -527,6 +858,9 @@ class FastCPUModel:
 
         if frozen_bf16:
             _print(f"{store_frozen_linears_in_bf16(model)} frozen Linear weights kept in bfloat16, computing in float32.")
+            # Generation upcasts them back to fp32 unless UNSLOTH_CPU_FROZEN_BF16=1 forced the storage: the per-call
+            # upcast costs decode speed (about 3x per projection at one token), training pays nothing for it.
+            model._unsloth_cpu_frozen_bf16 = "forced" if frozen_env in ("1", "true", "yes", "on") else "training"
         patch_causal_conv1d_fallback(model)
         # Also for a checkpoint that ships its own 4-bit quantization_config.
         _disable_bnb_cpu_weight_packing(model)
@@ -568,14 +902,12 @@ class FastCPUModel:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
         # Training forwards never reuse a KV cache; generate() turns it back on via for_inference.
         model.config.use_cache = False
-        if os.environ.get("UNSLOTH_CPU_COMPILE", "0") == "1" and not getattr(model, "_unsloth_cpu_compiled", False):
-            reason = _cpu_compile_unavailable()
-            if reason is not None:
-                _print(f"UNSLOTH_CPU_COMPILE=1 ignored, training eagerly: torch.compile cannot build CPU kernels here ({reason}).")
-                return
-            count = _compile_layers(model)
-            model._unsloth_cpu_compiled = True
-            _print(f"torch.compile (Inductor C++) on {count} decoder layers.")
+        wanted = _cpu_compile_wanted(model)
+        if wanted == "auto":
+            # Decided by the trainer once it has timed eager steps: a short run never repays the cold compile.
+            model._unsloth_cpu_compile_pending = True
+        elif wanted and not getattr(model, "_unsloth_cpu_compiled", False):
+            compile_cpu_layers(model, explicit = True)
 
     @staticmethod
     def get_peft_model(
@@ -607,6 +939,8 @@ class FastCPUModel:
         _runtime.apply_cpu_security_patches()
         if use_gradient_checkpointing is None:
             use_gradient_checkpointing = getattr(model, "_unsloth_cpu_gradient_checkpointing", "unsloth")
+        # The trainer reads the choice back (SFTConfig would otherwise turn checkpointing on for False).
+        model._unsloth_cpu_gradient_checkpointing = use_gradient_checkpointing
         leaf_names = {name.rsplit(".", 1)[-1] for name, _ in model.named_modules()}
         # Models with their own projection names (Unsloth's native DeepSeek-V4.1) translate q/k/v/o/gate/up/down_proj,
         # "all-linear" and None into their real Linears, exactly as the GPU get_peft_model does.
@@ -672,6 +1006,7 @@ class FastCPUModel:
         if use_gradient_checkpointing in (True, "unsloth") and hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
         peft_model = get_peft_model(model, config)
+        _frozen_bf16_for(peft_model, training = True)  # after PEFT froze the base weights
         if max_seq_length is not None:
             peft_model.max_seq_length = max_seq_length
         FastCPUModel._attach(peft_model)
@@ -680,9 +1015,11 @@ class FastCPUModel:
     @staticmethod
     def for_training(model, use_gradient_checkpointing = None):
         model.train()
+        _frozen_bf16_for(model, training = True)
         _set_inference_mode(model, False)
         # None keeps whatever from_pretrained / get_peft_model set up; an explicit value switches it.
         if use_gradient_checkpointing is not None and hasattr(model, "gradient_checkpointing_enable"):
+            model._unsloth_cpu_gradient_checkpointing = use_gradient_checkpointing
             if use_gradient_checkpointing:
                 if not _non_reentrant_checkpointing_on(model):
                     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
@@ -693,6 +1030,7 @@ class FastCPUModel:
     @staticmethod
     def for_inference(model):
         model.eval()
+        _frozen_bf16_for(model, training = False)
         _set_inference_mode(model, True)
         return model
 
@@ -773,6 +1111,19 @@ def _set_inference_mode(model, inference):
             break
 
 
+def _frozen_bf16_for(model, training):
+    """Default frozen bf16 storage is for training only: generation upcasts the weights to fp32 (decode speed), and
+    training stores them in bf16 again (half their RAM). UNSLOTH_CPU_FROZEN_BF16=1 keeps bf16 throughout."""
+    inner, mode = model, None
+    for _ in range(4):
+        mode = mode or getattr(inner, "_unsloth_cpu_frozen_bf16", None)
+        inner = getattr(inner, "base_model", None) or getattr(inner, "model", None)
+        if inner is None:
+            break
+    if mode == "training" and isinstance(model, torch.nn.Module):
+        set_bf16_stored_dtype(model, torch.bfloat16 if training else torch.float32)
+
+
 def _unpack_encoding_generate(generate):
     """Notebooks pass `input_ids = tokenizer.apply_chat_template(..., return_tensors = "pt")`, which is a
     BatchEncoding on transformers 5; generate() then fails on `.shape`. The GPU path unpacks it, so do the same."""
@@ -782,6 +1133,9 @@ def _unpack_encoding_generate(generate):
         if encoding is not None and not isinstance(encoding, torch.Tensor) and hasattr(encoding, "items"):
             for key, value in kwargs.pop("input_ids").items():
                 kwargs.setdefault(key, value)
+        if isinstance(self, torch.nn.Module) and not self.training:
+            # Inference-only loads and for_inference: fp32 frozen weights (a training-time callback keeps bf16).
+            _frozen_bf16_for(self, training = False)
         set_stance = getattr(torch.compiler, "set_stance", None)
         modules = self.modules() if isinstance(self, torch.nn.Module) else ()
         if set_stance is not None and any(getattr(m, "_compiled_call_impl", None) is not None for m in modules):
@@ -821,6 +1175,301 @@ def _merged_copy(model, save_method):
     return merged, False
 
 
+def _stream_merge_source(model):
+    """The transformers model whose live weights a streamed merge reads, or None when the merge needs the full copy.
+    Allowlist: plain LoRA on Linear layers (no DoRA, lora_bias, already merged adapters), no other PEFT tuner
+    (IA3, trainable token adapters, modules_to_save, ...), no 4-bit, no remote code (save_pretrained also copies its
+    modeling files)."""
+    try:
+        from peft import PeftModel
+        from peft.tuners.lora import LoraLayer
+        from peft.tuners.lora.layer import Linear as LoraLinear
+        from peft.tuners.tuners_utils import BaseTunerLayer
+    except Exception:
+        return None
+    if os.environ.get("UNSLOTH_CPU_STREAM_MERGE", "1") == "0":
+        return None
+    if isinstance(model, PeftModel):
+        configs = getattr(model, "peft_config", None) or {}
+        if any(str(getattr(config, "peft_type", "")).rsplit(".", 1)[-1] != "LORA" for config in configs.values()):
+            return None
+    hf = model.get_base_model() if isinstance(model, PeftModel) else model
+    if not hasattr(hf, "save_pretrained") or getattr(hf, "_auto_class", None) is not None:
+        return None
+    if getattr(getattr(hf, "config", None), "quantization_config", None) is not None:
+        return None
+    if getattr(hf, "_checkpoint_conversion_mapping", None):
+        return None  # transformers 4.x VLMs: save_pretrained renames keys back to the checkpoint layout
+    for module in hf.modules():
+        name = type(module).__name__
+        if name in ("ModulesToSaveWrapper", "TrainableTokensWrapper", "Linear4bit", "Linear8bitLt") or \
+            "AuxiliaryTrainingWrapper" in (cls.__name__ for cls in type(module).__mro__):
+            return None
+        if isinstance(module, BaseTunerLayer) and not isinstance(module, LoraLayer):
+            return None  # IA3, trainable token adapters, other tuners: only merge_and_unload knows their merge
+        if isinstance(module, LoraLayer):
+            if type(module) is not LoraLinear or getattr(module, "merged_adapters", None):
+                return None
+            if any(getattr(module, "lora_bias", {}).get(name, False) for name in module.active_adapters):
+                return None
+            if any(getattr(module, "use_dora", {}).get(name, False) for name in module.active_adapters):
+                return None
+    return hf
+
+
+def _save_keeps_live_layout(hf, entries):
+    """True when save_pretrained would write the live names / shapes. transformers 5 reverts its checkpoint conversions
+    on save (e.g. Qwen3MoE fused experts back to per-expert weights): dry-run that revert on meta tensors and stream
+    only when it changes nothing."""
+    try:
+        from transformers.core_model_loading import revert_weight_conversion
+    except Exception:
+        return True  # transformers 4.x: no save-time conversion beyond _checkpoint_conversion_mapping (checked above)
+    meta = {out: torch.empty(shape, dtype = dtype, device = "meta") for out, _, dtype, _, shape in entries}
+    try:
+        reverted = revert_weight_conversion(hf, dict(meta))
+    except Exception:
+        return False
+    return set(reverted) == set(meta) and all(tuple(reverted[k].shape) == tuple(meta[k].shape) for k in meta)
+
+
+def _merged_weight(module, to_float):
+    """PEFT's own merge on a scratch copy of the base weight: bit-identical to merge_and_unload, live model unchanged."""
+    base = module.get_base_layer()
+    live = base.weight.data
+    scratch = live.float() if to_float else live.clone()
+    base.weight.data = scratch
+    try:
+        module.merge()
+    finally:
+        base.weight.data = live
+        module.merged_adapters.clear()
+    return scratch
+
+
+def _shard_bytes(size):
+    """save_pretrained's max_shard_size: an int (bytes) or "5GB" / "500MB" / "2GiB" (decimal units, *iB binary)."""
+    if isinstance(size, int):
+        return size
+    match = re.fullmatch(r"\s*([0-9.]+)\s*([KMGT]?)(I?)B?\s*", str(size).upper())
+    if not match:
+        raise ValueError(f"Unsloth (CPU): max_shard_size = {size!r} is not a size like '5GB'.")
+    value, unit, binary = match.groups()
+    base = 1024 if binary else 1000
+    return int(float(value) * base ** "_KMGT".index(unit or "_"))
+
+
+_SAFETENSORS_DTYPES = {
+    torch.float64: "F64", torch.float32: "F32", torch.float16: "F16", torch.bfloat16: "BF16", torch.int64: "I64",
+    torch.int32: "I32", torch.int16: "I16", torch.int8: "I8", torch.uint8: "U8", torch.bool: "BOOL",
+}
+
+
+def _safetensors_dtype_rank():
+    """safetensors' save_file lays tensors out by dtype (its own order, widest first) then name: read that order from
+    the installed safetensors so the streamed file is byte-identical to save_file's."""
+    import json
+    import struct
+    try:
+        from safetensors.torch import save
+        blob = save({str(i): torch.zeros(1, dtype = dtype) for i, dtype in enumerate(_SAFETENSORS_DTYPES)})
+        order = list(json.loads(blob[8:8 + struct.unpack("<Q", blob[:8])[0]]))
+        dtypes = list(_SAFETENSORS_DTYPES)
+        return {dtypes[int(k)]: rank for rank, k in enumerate(k for k in order if k != "__metadata__")}
+    except Exception:
+        return {dtype: rank for rank, dtype in enumerate((torch.int64, torch.float64, torch.float32, torch.int32,
+            torch.bfloat16, torch.float16, torch.int16, torch.int8, torch.uint8, torch.bool))}
+
+
+def _write_safetensors(path, entries, rank = None):
+    """A safetensors file written one tensor at a time: the header comes from shapes / dtypes, then each tensor is
+    made, written and dropped, so at most one merged tensor is alive (safetensors' save_file holds the whole file as
+    bytes). Same layout as save_file (metadata first, dtype then name order). Returns the payload size in bytes."""
+    import json
+    import struct
+    rank = rank or _safetensors_dtype_rank()
+    entries = sorted(entries, key = lambda entry: (rank.get(entry[2], len(rank)), entry[0]))
+    header, offset = {"__metadata__": {"format": "pt"}}, 0
+    for out, _, dtype, numel, shape in entries:
+        if dtype not in _SAFETENSORS_DTYPES:
+            raise TypeError(f"Unsloth (CPU): no safetensors dtype for {dtype}")
+        nbytes = numel * torch.empty((), dtype = dtype).element_size()
+        header[out] = {"dtype": _SAFETENSORS_DTYPES[dtype], "shape": list(shape), "data_offsets": [offset, offset + nbytes]}
+        offset += nbytes
+    encoded = json.dumps(header, separators = (",", ":")).encode("utf-8")
+    encoded += b" " * (-len(encoded) % 8)
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(encoded)))
+        f.write(encoded)
+        for out, make, dtype, numel, shape in entries:
+            value = make().to(dtype).contiguous()
+            if tuple(value.shape) != shape:
+                raise RuntimeError(f"Unsloth (CPU): merged {out} has shape {tuple(value.shape)}, expected {shape}")
+            if value.numel():
+                f.write(memoryview(value.view(-1).view(torch.uint8).numpy()))
+            del value
+    return offset
+
+
+def _default_shard_size(hf):
+    """save_pretrained's own default (5GB on transformers 4.x, 50GB on 5.x)."""
+    import inspect
+    try:
+        default = inspect.signature(type(hf).save_pretrained).parameters["max_shard_size"].default
+        return default if isinstance(default, (int, str)) else "5GB"
+    except Exception:
+        return "5GB"
+
+
+def _split_shards(entries, limit):
+    """Shard grouping and names from huggingface_hub's splitter (what save_pretrained uses), on meta tensors."""
+    try:
+        from huggingface_hub import split_torch_state_dict_into_shards
+        meta = {entry[0]: torch.empty(entry[4], dtype = entry[2], device = "meta") for entry in entries}
+        split = split_torch_state_dict_into_shards(meta, filename_pattern = "model{suffix}.safetensors",
+                                                   max_shard_size = limit)
+        by_name = {entry[0]: entry for entry in entries}
+        return [(name, [by_name[k] for k in keys]) for name, keys in split.filename_to_tensors.items()], split.metadata
+    except Exception:
+        pass
+    shards, current, size = [], [], 0
+    for entry in entries:
+        nbytes = entry[3] * torch.empty((), dtype = entry[2]).element_size()
+        if current and size + nbytes > limit:
+            shards.append(current)
+            current, size = [], 0
+        current.append(entry)
+        size += nbytes
+    if current:
+        shards.append(current)
+    names = ["model.safetensors"] if len(shards) == 1 else \
+        [f"model-{i + 1:05d}-of-{len(shards):05d}.safetensors" for i in range(len(shards))]
+    total = sum(e[3] * torch.empty((), dtype = e[2]).element_size() for e in entries)
+    return list(zip(names, shards)), {"total_size": total}
+
+
+_STALE_SHARD = re.compile(r"model-\d{5}-of-\d{5}\.safetensors")
+
+
+def _remove_stale_weights(save_directory, names):
+    """Re-exporting into the same folder: drop an earlier export's weights that are not part of this one, as
+    save_pretrained does, so a different shard count leaves no obsolete shards (or a single file / index that
+    transformers would load instead). Only model.safetensors, model-NNNNN-of-NNNNN.safetensors and the index; other
+    files (adapters, tokenizer, other names) are never touched. Rank 0 only."""
+    if os.environ.get("RANK", "0").strip() not in ("", "0"):
+        return
+    keep = set(names)
+    if len(names) > 1:
+        keep.add("model.safetensors.index.json")
+    for filename in os.listdir(save_directory):
+        if filename in keep:
+            continue
+        if filename in ("model.safetensors", "model.safetensors.index.json") or _STALE_SHARD.fullmatch(filename):
+            path = os.path.join(save_directory, filename)
+            if os.path.isfile(path):
+                os.remove(path)
+
+
+def _stream_merged_save(model, save_directory, save_method, max_shard_size = None):
+    """Writes the merged checkpoint shard by shard from the live model (peak RSS about the model plus one shard,
+    instead of a full deepcopy). Same tensors, names, dtypes and config as merge_and_unload().save_pretrained().
+    Returns False when the model needs the copying path."""
+    hf = _stream_merge_source(model)
+    if hf is None:
+        return False
+    import copy
+    import json
+    from peft.tuners.lora import LoraLayer
+
+    lora = {name: module for name, module in hf.named_modules() if isinstance(module, LoraLayer)}
+    bf16_stored = {name.replace(".base_layer", "") for name, module in hf.named_modules() if isinstance(module, Bf16StoredLinear)}
+    model_dtype = hf.dtype
+    target = (torch.bfloat16 if cpu_bf16_supported() else torch.float16) \
+        if save_method == "merged_16bit" and model_dtype == torch.float32 else None
+    # bf16-stored frozen weights are upcast to fp32 first, as the copying path does (unrounded merge / GGUF staging).
+    shared = {}
+    for name, module in hf.named_parameters(remove_duplicate = False):
+        shared.setdefault(module.untyped_storage().data_ptr(), []).append(name)
+    for name, module in lora.items():
+        weight = module.get_base_layer().weight
+        if len(shared.get(weight.untyped_storage().data_ptr(), ())) > 1:
+            return False  # a LoRA on a tied weight: merge_and_unload edits the shared tensor, keep its semantics
+
+    entries, seen = [], set()
+    for key, tensor in hf.state_dict(keep_vars = True).items():
+        if ".lora_" in key:
+            continue
+        out = key.replace(".base_layer.", ".")
+        storage = (tensor.untyped_storage().data_ptr(), tensor.storage_offset(), tuple(tensor.shape))
+        if storage in seen:
+            continue  # tied (lm_head = embed_tokens): save_pretrained keeps the first name only
+        seen.add(storage)
+        owner = out.rsplit(".", 1)[0]
+        stored = owner in bf16_stored and out.endswith(".weight") and tensor.dtype == torch.bfloat16
+        if owner in lora and key.endswith(".base_layer.weight"):
+            make = functools.partial(_merged_weight, lora[owner], stored)
+            dtype = torch.float32 if stored else tensor.dtype
+        elif stored:
+            make, dtype = (lambda t = tensor: t.detach().float()), torch.float32
+        else:
+            make, dtype = (lambda t = tensor: t.detach()), tensor.dtype
+        if target is not None and dtype.is_floating_point:
+            dtype = target
+        entries.append((out, make, dtype, tensor.numel(), tuple(tensor.shape)))
+    if not _save_keeps_live_layout(hf, entries):
+        return False
+
+    limit = _shard_bytes(max_shard_size or _default_shard_size(hf))
+    shards, split_metadata = _split_shards(entries, limit)
+    names = [name for name, _ in shards]
+    os.makedirs(save_directory, exist_ok = True)
+    # Each file is written under a temporary name and moved into place only after every shard is complete: the live
+    # weights may be memory-mapped from the files being replaced (a model loaded from save_directory), and an
+    # interrupted export must not leave a half-written model.safetensors that loaders would pick.
+    rank, staged = _safetensors_dtype_rank(), []
+    try:
+        with torch.no_grad():
+            for name, shard in shards:
+                temporary = os.path.join(save_directory, f".{name}.unsloth-tmp")
+                staged.append((temporary, os.path.join(save_directory, name)))
+                _write_safetensors(temporary, shard, rank)
+        if len(shards) > 1:
+            total_parameters = sum(p.numel() for n, p in hf.named_parameters() if ".lora_" not in n)
+            index = {"metadata": {"total_parameters": total_parameters, **split_metadata},
+                     "weight_map": {entry[0]: name for name, shard in shards for entry in shard}}
+            temporary = os.path.join(save_directory, ".model.safetensors.index.json.unsloth-tmp")
+            staged.append((temporary, os.path.join(save_directory, "model.safetensors.index.json")))
+            with open(temporary, "w", encoding = "utf-8") as f:
+                f.write(json.dumps(index, indent = 2, sort_keys = True) + "\n")
+        for temporary, final in staged:
+            os.replace(temporary, final)
+    finally:
+        for temporary, _ in staged:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+    _remove_stale_weights(save_directory, names)
+    config = copy.deepcopy(hf.config)
+    # save_pretrained records the first floating parameter's dtype under the field this transformers reads.
+    setattr(config, _DTYPE_KWARG, str(target or model_dtype).split(".")[1])
+    config.architectures = [type(hf).__name__]
+    config.save_pretrained(save_directory)
+    generation = getattr(hf, "generation_config", None)
+    if generation is not None and getattr(hf, "can_generate", lambda: False)():
+        generation.save_pretrained(save_directory)
+    return True
+
+
+def _save_merged(model, save_directory, save_method, **kwargs):
+    """Streamed merge when the model allows it, else the full merged copy."""
+    if kwargs.get("safe_serialization", True) and _stream_merged_save(
+        model, save_directory, save_method, kwargs.get("max_shard_size"),
+    ):
+        return
+    merged, _ = _merged_copy(model, save_method)
+    merged.save_pretrained(save_directory, **{k: v for k, v in kwargs.items() if k in ("safe_serialization", "max_shard_size")})
+    del merged
+
+
 def _check_save_method(save_method):
     if save_method not in ("lora", "merged_16bit"):
         raise NotImplementedError(f"Unsloth (CPU): save_method = {save_method!r} is not supported on CPU.")
@@ -829,17 +1478,40 @@ def _check_save_method(save_method):
 def save_pretrained_merged(self, save_directory, tokenizer = None, save_method = "merged_16bit", **kwargs):
     """CPU save_pretrained_merged: "lora" (adapters) or "merged_16bit"."""
     _check_save_method(save_method)
-    model, _ = _merged_copy(self, save_method)
     for key in ("maximum_memory_usage", "temporary_location", "max_shard_size_gb"):
         kwargs.pop(key, None)
-    model.save_pretrained(save_directory, **{k: v for k, v in kwargs.items() if k in ("safe_serialization", "max_shard_size")})
+    if save_method == "lora":
+        self.save_pretrained(save_directory, **{k: v for k, v in kwargs.items() if k in ("safe_serialization", "max_shard_size")})
+    else:
+        _save_merged(self, save_directory, save_method, **kwargs)
     if tokenizer is not None:
         tokenizer.save_pretrained(save_directory)
     return save_directory
 
 
+def _refuse_public_repo_for_private_push(repo_id, token, private):
+    # transformers' push_to_hub calls create_repo(private=True, exist_ok=True), which keeps an existing public repo
+    # public: refuse before the first upload, as saving_utils.create_huggingface_repo does on the GPU path.
+    if not private: return
+    from huggingface_hub import HfApi
+    try:
+        api = HfApi(token = token)
+        url = api.create_repo(repo_id = repo_id, private = True, exist_ok = True)
+        is_private = getattr(api.repo_info(repo_id = getattr(url, "repo_id", None) or repo_id, repo_type = "model"), "private", None)
+    except Exception as exc:
+        print(f"Unsloth: Could not confirm the visibility of {repo_id} ({exc}); continuing.")
+        return
+    if is_private is False:
+        raise RuntimeError(
+            f"Unsloth: private=True was requested but the Hugging Face repo {repo_id!r} already exists and is "
+            "public. Refusing to upload so private weights are not published. Make the repo private on the Hub, "
+            "push to a new repo id, or pass private=False."
+        )
+
+
 def push_to_hub_merged(self, repo_id, tokenizer = None, save_method = "merged_16bit", token = None, private = None, **kwargs):
     _check_save_method(save_method)
+    _refuse_public_repo_for_private_push(repo_id, token, private)
     model, _ = _merged_copy(self, save_method)
     # Branch / PR / message options shared by model and tokenizer push_to_hub on transformers 4.57 and 5.x.
     hub = {k: kwargs[k] for k in ("revision", "create_pr", "commit_message", "commit_description", "tags") if k in kwargs}
@@ -874,8 +1546,7 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
     # Stage merged weights unrounded: the converter casts once per requested type instead of rounding through fp16/bf16
     # first; fp16 without native bf16 would also clip bf16's range.
     unrounded = [m for m in methods if m in ("f32", "f16")]
-    staged, _ = _merged_copy(self, "merged_32bit")
-    staged.save_pretrained(merged_directory)
+    _save_merged(self, merged_directory, "merged_32bit")
     if tokenizer is not None:
         tokenizer.save_pretrained(merged_directory)
     quantizer, converter = install_llama_cpp(print_output = False)

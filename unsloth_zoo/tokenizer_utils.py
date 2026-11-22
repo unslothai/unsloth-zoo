@@ -170,6 +170,16 @@ def _suppress_padded_rows(model, start, end, now_valid = range(0), old_rows = No
 pass
 
 
+def _accepts_mean_resizing(model):
+    # Remote-code models may override resize_token_embeddings with an older signature.
+    try:
+        params = inspect.signature(model.resize_token_embeddings).parameters
+    except (TypeError, ValueError):
+        return False
+    return "mean_resizing" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+pass
+
+
 def add_new_tokens(
     model,
     tokenizer,
@@ -249,7 +259,19 @@ def add_new_tokens(
         resize_target = _round_up_vocab(resize_target, pad_to_multiple_of)
     pass
     # Also resizes lm_head as well!
-    model.resize_token_embeddings(resize_target)
+    # Every grown row is overwritten below, so skip HF's mean_resizing (fp32 copies of the matrix + a d x d covariance
+    # and its sampling); keep it if some grown row would survive (input and output row counts differ).
+    grown_lo = min(old_input_length, old_output_length)
+    written_hi = resize_target if (pad_to_multiple_of is not None and resize_target > max(old_rows, new_vocab_length)) \
+        else new_vocab_length
+    rows_all_overwritten = old_length <= grown_lo and written_hi >= resize_target
+    # A biased lm_head (Phi) keeps the default: its new bias entries are never overwritten here, and mean_resizing
+    # initialises them from the existing bias distribution.
+    head_bias = getattr(model.get_output_embeddings(), "bias", None)
+    if rows_all_overwritten and head_bias is None and _accepts_mean_resizing(model):
+        model.resize_token_embeddings(resize_target, mean_resizing = False)
+    else:
+        model.resize_token_embeddings(resize_target)
 
     # With method interpolation, new rows blend the mean embedding with the Word2Vec sum of the other vectors.
     embedding_matrix = model.get_input_embeddings ().weight

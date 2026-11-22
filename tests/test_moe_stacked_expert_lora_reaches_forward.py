@@ -31,6 +31,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from _cpu_compiler_skip import skip_without_cpu_inductor
 from unsloth_zoo.temporary_patches import moe_utils as MU
 
 
@@ -777,6 +778,7 @@ def test_the_static_answer_recognises_a_stash_reading_forward():
 def test_a_stash_ignoring_family_compiles_under_fullgraph(restore_param_wrapper):
     """The reroute must not cost full-graph compilation: PEFT _activate_lora registers a parametrization and calls set_
     on the stored parameter, which Dynamo refuses under fullgraph; the fold must match PEFT numbers and gradients."""
+    skip_without_cpu_inductor()  # CPU tensors compile through C++ Inductor
     assert MU.patch_param_wrapper_for_moe()
     model = _build(_StashIgnoringExperts)
     x = _inputs()
@@ -882,6 +884,7 @@ def _install_peft_main_delta_factors(model):
 def test_one_adapter_over_many_experts_folds_through_the_factors(restore_param_wrapper):
     """Fold via low-rank factors in one baddbmm as PEFT does; get_delta_weight plus the add allocate two dense
     expert-stack tensors per projection (64 experts on OlmoE)."""
+    skip_without_cpu_inductor()  # CPU tensors compile through C++ Inductor
     assert MU.patch_param_wrapper_for_moe()
     model = _build(_StashIgnoringExperts)
     wrappers = _install_peft_main_delta_factors(model)
@@ -1009,6 +1012,7 @@ def test_every_float8_storage_dtype_is_refused_not_just_the_cuda_pair():
 def test_the_static_scan_does_not_wedge_dynamo(restore_param_wrapper):
     """The scan runs under Dynamo, so it must not install a guard that cannot match; id(forward) on a bound method,
     reallocated per access, failed its guard and blocked every unmeasured family from compiling."""
+    skip_without_cpu_inductor()  # CPU tensors compile through C++ Inductor
     import torch
 
     class _Experts(torch.nn.Module):

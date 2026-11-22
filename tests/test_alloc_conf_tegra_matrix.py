@@ -71,6 +71,18 @@ _CHILD = textwrap.dedent(
         return _real(name, *a, **k)
     _m.version = _version
 
+    # Pin the backend to CUDA (Jetson is CUDA) with a stub unsloth_zoo.device_type, as
+    # test_alloc_conf_platform_matrix.py does: on a real ROCm host the real detector
+    # reports "hip" and the HIP branch strips expandable_segments from every case.
+    _dt = types.ModuleType("unsloth_zoo.device_type")
+    _dt.is_hip = lambda: False
+    _dt.get_device_type = lambda: "cuda"
+    _dt.DEVICE_TYPE = "cuda"
+    _dt.DEVICE_TYPE_TORCH = "cuda"
+    _dt.DEVICE_COUNT = 1
+    _dt.ALLOW_PREQUANTIZED_MODELS = True
+    sys.modules["unsloth_zoo.device_type"] = _dt
+
     spoofed = False
     _cost = {}
     detector = os.path.join(ZOO, "unsloth_zoo", "integrated_device.py")

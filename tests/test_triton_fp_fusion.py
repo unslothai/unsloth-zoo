@@ -37,6 +37,8 @@ _NOT_LAUNCHES = {
     "temporary_patches/deepseek_v41.py": {"backend"},
     # Custom ops out of the pinned-op tuple, and a weakref read out of a cache entry.
     "temporary_patches/moe_utils_sonic.py": {"_pinned_ops()", "hit"},
+    # Lazy safetensors readers keyed by tensor name: `tensors[key]()` loads one tensor.
+    "block_swap.py": {"tensors"},
 }
 # Launches that deliberately disable contraction to match an eager reference bit for bit.
 _DELIBERATE_FALSE = {
@@ -389,7 +391,11 @@ def test_compiled_kernels_keep_fp_fusion(tmp_path, default):
     assert proc.returncode == 0 and line, proc.stdout[-3000:] + proc.stderr[-6000:]
     meta = json.loads(line[-1][len("A1META ") :])
     expected = ["gdn_causal_conv1d.fwd", "gdn_causal_conv1d.bwd_g", "gdn_causal_conv1d.bwd_dxdw"]
-    if _triton_at_least(3, 3):
+    import torch
+
+    # triton_grouped_available() is False on ROCm by design (the generic grouped GEMM is CUDA only), so its
+    # kernels are never compiled there.
+    if _triton_at_least(3, 3) and torch.version.hip is None:
         expected += ["moe_grouped_fp16._grouped_gemm_kernel", "moe_grouped_fp16._grouped_wgrad_kernel"]
     if _has_bf16():
         expected += ["mxfp4_gemm._decode_only_kernel"]

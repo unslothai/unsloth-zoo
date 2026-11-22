@@ -1182,7 +1182,8 @@ def replace_sdpa_with_amd_aiter(source):
 
 
 def _temp_compile_folder_is_ours(location):
-    """A real directory (not a link) owned by this user that others cannot write."""
+    """A real directory (not a link) owned by this user that no group member or other user can write.
+    A group-writable one (an older 0775 umask-002 folder) falls back to the 0700 `_<uid>` folder."""
     try:
         st = os.lstat(location)
     except OSError:
@@ -1190,7 +1191,7 @@ def _temp_compile_folder_is_ours(location):
     return (
         stat.S_ISDIR(st.st_mode)
         and st.st_uid == os.geteuid()
-        and not (st.st_mode & 0o002)
+        and not (st.st_mode & 0o022)
     )
 
 
@@ -6090,6 +6091,10 @@ DISABLE_COMPILE_MODULES = [
     "DeepseekV41HyperConnection",
     # GLM-5.3-Flash: same Sinkhorn mixer. Its HyperHead is an unweighted mean and stays compiled.
     "Glm5NextTextHyperConnection",
+    # Inkling 2 block attention residuals: compiled alone (dynamic = True, CUDA), the one-query form over 3+ stacked
+    # blocks returns correct values but wrong input grads (8-34% relative); the LoRA grads of every layer drift.
+    "Inkling2BlockAttentionResidual",
+    "Inkling2LoopBlockAttentionResidual",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
