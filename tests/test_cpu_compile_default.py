@@ -439,3 +439,49 @@ def test_cached_forward_never_appends_twice_after_a_compile_failure(monkeypatch,
         assert [len(c) for c in cache] == [1, 1], [len(c) for c in cache]
         outs.append(h)
     torch.testing.assert_close(outs[0], outs[1])
+
+
+@pytest.mark.parametrize("reentrant", [False, True])
+def test_two_outstanding_checkpoints_of_one_layer_replay_in_their_own_mode(monkeypatch, capsys, reentrant):
+    """Two checkpointed forwards through the same layer before one backward, the second shape failing to compile:
+    the first (compiled) checkpoint recomputes compiled, the second (retried eagerly) recomputes eagerly instead of
+    retrying the failed compile in backward."""
+    from functools import partial
+    from transformers.modeling_layers import GradientCheckpointingLayer
+    from unsloth_zoo.cpu import loader
+    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False)
+
+    class Block(GradientCheckpointingLayer):
+        def __init__(self):
+            super().__init__()
+            self.up, self.down = torch.nn.Linear(8, 16), torch.nn.Linear(16, 8)
+
+        def forward(self, x):
+            return self.down(torch.nn.functional.gelu(self.up(x)))
+
+    def first_shape_only(gm, example_inputs):
+        if any(isinstance(t, torch.Tensor) and t.shape[0] == 3 for t in example_inputs):
+            raise RuntimeError("C++ build failed")
+        return gm.forward
+
+    g = torch.Generator().manual_seed(0)
+    xs = [torch.randn(4, 8, generator = g), torch.randn(3, 8, generator = g)]
+    grads = []
+    for compiled in (False, True):
+        torch.manual_seed(0)
+        block = Block().train()
+        block.gradient_checkpointing = True
+        block._gradient_checkpointing_func = partial(torch.utils.checkpoint.checkpoint, use_reentrant = reentrant)
+        if compiled:
+            block.compile(backend = first_shape_only, dynamic = False)
+            loader._fall_back_to_eager_on_compile_error([block])
+        try:
+            outs = [block(x.clone().requires_grad_(True)) for x in xs]
+            sum(o.square().sum() for o in outs).backward()
+        finally:
+            torch._dynamo.reset()
+        grads.append(torch.cat([p.grad.flatten() for p in block.parameters()]))
+        if compiled:
+            assert block._compiled_call_impl is None
+    assert "training eagerly" in capsys.readouterr().out
+    torch.testing.assert_close(grads[0], grads[1])
