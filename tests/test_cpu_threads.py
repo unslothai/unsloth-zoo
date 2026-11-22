@@ -30,7 +30,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 
 
 _THREAD_ENV = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "UNSLOTH_CPU_THREADS", "TORCHELASTIC_RUN_ID",
-               "LOCAL_WORLD_SIZE", "ACCELERATE_MIXED_PRECISION", "MPI_LOCALNRANKS", "OMPI_COMM_WORLD_LOCAL_SIZE")
+               "LOCAL_WORLD_SIZE", "ACCELERATE_MIXED_PRECISION", "MPI_LOCALNRANKS", "OMPI_COMM_WORLD_LOCAL_SIZE",
+               "MV2_COMM_WORLD_LOCAL_SIZE")
 
 
 def _fit_in_subprocess(extra, cores = None):
@@ -87,9 +88,14 @@ def test_fit_cpu_threads_default_drops_smt_siblings_never_raises():
     assert fitted == before  # more cores than torch's default: left alone
 
 
-def test_fit_cpu_threads_splits_across_local_ranks_without_launcher_marker():
-    _, fitted, reason, _, _ = _fit_in_subprocess({"LOCAL_WORLD_SIZE": "2"}, 2)
-    assert fitted == 1 and "local ranks" in reason
+@pytest.mark.parametrize("variable", ["LOCAL_WORLD_SIZE", "MPI_LOCALNRANKS", "OMPI_COMM_WORLD_LOCAL_SIZE",
+                                      "MV2_COMM_WORLD_LOCAL_SIZE"])
+def test_fit_cpu_threads_splits_across_local_ranks_without_launcher_marker(variable):
+    # Every local-size variable Accelerate's get_cpu_distributed_information reads (MVAPICH included) ends at one
+    # thread per rank on two cores. Intel / Open MPI runtimes may already start torch at one thread from their own
+    # variables, in which case there is nothing to fit.
+    _, fitted, reason, _, _ = _fit_in_subprocess({variable: "2"}, 2)
+    assert fitted == 1 and ("local ranks" in reason or reason == "default")
 
 
 def test_physical_cores_from_sysfs(tmp_path):

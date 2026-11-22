@@ -281,7 +281,8 @@ def _affinity_split_per_rank(ranks):
 
 
 def _local_world_size():
-    for name in ("LOCAL_WORLD_SIZE", "MPI_LOCALNRANKS", "OMPI_COMM_WORLD_LOCAL_SIZE"):
+    # The variables Accelerate's get_cpu_distributed_information reads (torchrun, Intel MPI, Open MPI, MVAPICH).
+    for name in ("LOCAL_WORLD_SIZE", "MPI_LOCALNRANKS", "OMPI_COMM_WORLD_LOCAL_SIZE", "MV2_COMM_WORLD_LOCAL_SIZE"):
         try:
             value = int(os.environ.get(name, ""))
         except ValueError:
