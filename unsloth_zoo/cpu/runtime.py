@@ -91,23 +91,156 @@ b = torch.randn(512, 512)
 
 def best(dtype):
     times = []
-    for _ in range(3):
+    for _ in range(8):
         start = time.perf_counter()
         with torch.autocast("cpu", dtype = dtype, enabled = dtype is not None):
             a @ b
         times.append(time.perf_counter() - start)
-    return min(times[1:])
+    return min(times[1:])  # each matmul is ~1 ms: the minimum of 7 drops runs a busy host preempted
 
-print("UNSLOTH_BF16_FAST=" + str(int(best(torch.bfloat16) < 1.5 * best(None))))
+ratio = best(torch.bfloat16) / max(best(None), 1e-9)
+print("UNSLOTH_BF16_RATIO=%.4f" % ratio)
+print("UNSLOTH_BF16_FAST=" + str(int(ratio < 1.5)))
 """
+# Only a clear answer is kept on disk: native bf16 measures 0.25-0.5x fp32, the reference fallback 30-200x, so a ratio
+# between these bounds is a noisy run (a loaded host) that decides this process only.
+_PROBE_CACHE_RATIO_BOUNDS = (1.0, 3.0)
 _BF16_PROBE_TIMEOUT = 180
+_ILLEGAL_INSTRUCTION_CODES = (132, -4, 0xC000001D, -1073741795)
+_ILLEGAL_INSTRUCTION_WARNING = (
+    "Unsloth: the bfloat16 matmul probe crashed with an illegal instruction; training in float32."
+)
+_PROBE_CACHE_NAME = "cpu_bf16_probe.json"
+_PROBE_CACHE_MAX = 64
+
+
+def _probe_cache_path():
+    """~/.cache/unsloth/cpu_bf16_probe.json (UNSLOTH_CPU_PROBE_CACHE_DIR moves it), or None when disabled
+    (UNSLOTH_CPU_PROBE_CACHE=0) or there is no usable home directory."""
+    if os.environ.get("UNSLOTH_CPU_PROBE_CACHE", "").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    root = os.path.expanduser(os.environ.get("UNSLOTH_CPU_PROBE_CACHE_DIR", "").strip())
+    if root == "":
+        home = os.path.expanduser("~")
+        # No resolvable home (restricted containers): skip the cache rather than write a literal ~ into the CWD.
+        if home == "~" or not os.path.isdir(home):
+            return None
+        root = os.path.join(home, ".cache", "unsloth")
+    return os.path.join(root, _PROBE_CACHE_NAME)
+
+
+def _probe_cache_key():
+    """What the verdict depends on: the interpreter and torch the child runs, the CPU, and the probe itself."""
+    import hashlib
+    import json
+    import sys
+    torch = sys.modules.get("torch")
+    torch_version = getattr(torch, "__version__", None)
+    if not isinstance(torch_version, str):
+        try:
+            import importlib.metadata
+            torch_version = importlib.metadata.version("torch")
+        except Exception:
+            torch_version = None
+    system = platform.system()
+    cpu = ""
+    if system == "Windows":
+        cpu = os.environ.get("PROCESSOR_IDENTIFIER", "").strip() or platform.processor()  # family, model, stepping
+    elif system == "Darwin":
+        try:
+            import subprocess
+            cpu = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"], capture_output = True, text = True, timeout = 5,
+            ).stdout.strip()
+        except Exception:
+            pass
+    identity = [
+        sys.executable, list(sys.version_info[:3]), torch_version, system, platform.machine(),
+        platform.node(), cpu, _BF16_PROBE_CODE,
+    ]
+    return hashlib.sha256(json.dumps(identity).encode("utf-8")).hexdigest()
+
+
+def _probe_cache_read(path):
+    import json
+    try:
+        with open(path, "r", encoding = "utf-8") as f:
+            data = json.load(f)
+    except Exception:  # missing, unreadable or corrupt: probe as if there were no cache
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _probe_cache_lookup(path, key):
+    entry = _probe_cache_read(path).get(key)
+    if isinstance(entry, dict) and isinstance(entry.get("fast"), bool):
+        return entry["fast"], bool(entry.get("illegal_instruction"))
+    return None
+
+
+def _probe_cache_store(path, key, fast, illegal_instruction):
+    """Atomic (temporary file + os.replace), so concurrent first runs never leave a torn file; two writers at once can
+    drop each other's new entry, which only costs a later probe. Any failure (read-only dir, full disk) is ignored."""
+    import json
+    import tempfile
+    tmp = None
+    try:
+        data = _probe_cache_read(path)
+        data.pop(key, None)
+        data[key] = {"fast": bool(fast), "illegal_instruction": bool(illegal_instruction)}
+        while len(data) > _PROBE_CACHE_MAX:
+            data.pop(next(iter(data)))
+        directory = os.path.dirname(path)
+        os.makedirs(directory, exist_ok = True)
+        fd, tmp = tempfile.mkstemp(prefix = ".cpu_bf16_probe_", suffix = ".tmp", dir = directory)
+        with os.fdopen(fd, "w", encoding = "utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+        tmp = None
+    except Exception:
+        pass
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _bf16_autocast_is_fast():
     """Probes bf16 autocast matmul vs fp32: native bf16 (AVX512-BF16, AMX, Arm BF16 via oneDNN or ACL) runs 2-3x faster,
     the reference fallback 30-200x slower; a 1.5x threshold separates them. Only reached where /proc/cpuinfo is
     unreadable (Windows, macOS). The probe runs in a short child process (once: cpu_bf16_supported is cached), so a
-    crash, a timeout or any failure means bf16 is not fast and training stays fp32."""
+    crash, a timeout or any failure means bf16 is not fast and training stays fp32.
+
+    Every import of unsloth on such a CPU-only host asks, and each new process (Studio workers) would pay a second
+    torch import plus the benchmark, so settled answers (a verdict with a clear speed ratio, or an illegal-instruction
+    crash) are kept on disk, keyed by interpreter, torch, CPU and probe. Timeouts, spawn errors, other failures and
+    ratios too close to the threshold to trust are not. UNSLOTH_CPU_PROBE_CACHE=0 turns the disk cache off."""
+    try:
+        path = _probe_cache_path()
+        key = _probe_cache_key() if path is not None else None
+    except Exception:
+        path = key = None
+    if path is not None:
+        cached = _probe_cache_lookup(path, key)
+        if cached is not None:
+            fast, illegal_instruction = cached
+            if illegal_instruction:
+                warnings.warn(_ILLEGAL_INSTRUCTION_WARNING)
+            return fast
+    verdict = _run_bf16_probe()
+    if verdict is None:
+        return False
+    fast, illegal_instruction, settled = verdict
+    if settled and path is not None:
+        _probe_cache_store(path, key, fast, illegal_instruction)
+    return fast
+
+
+def _run_bf16_probe():
+    """(fast, illegal_instruction, settled) when the child answered, None when it did not (timeout, spawn error, other
+    failures), which reads as not fast. Only settled answers (a clear ratio, an illegal instruction) are cached."""
     import subprocess
     import sys
     import tempfile
@@ -124,12 +257,26 @@ def _bf16_autocast_is_fast():
             cwd = tempfile.gettempdir(), creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except Exception:
-        return False
+        return None
     if done.returncode != 0:
-        if done.returncode in (132, -4, 0xC000001D, -1073741795):
-            warnings.warn("Unsloth: the bfloat16 matmul probe crashed with an illegal instruction; training in float32.")
-        return False
-    return "UNSLOTH_BF16_FAST=1" in (done.stdout or "").splitlines()
+        if done.returncode in _ILLEGAL_INSTRUCTION_CODES:
+            warnings.warn(_ILLEGAL_INSTRUCTION_WARNING)
+            return False, True, True
+        return None
+    lines = (done.stdout or "").splitlines()
+    fast = True if "UNSLOTH_BF16_FAST=1" in lines else False if "UNSLOTH_BF16_FAST=0" in lines else None
+    if fast is None:
+        return None
+    ratio = None
+    for line in lines:
+        if line.startswith("UNSLOTH_BF16_RATIO="):
+            try:
+                ratio = float(line.split("=", 1)[1])
+            except ValueError:
+                pass
+    low, high = _PROBE_CACHE_RATIO_BOUNDS
+    settled = ratio is not None and (ratio <= low or ratio >= high)
+    return fast, False, settled
 
 
 @functools.cache
