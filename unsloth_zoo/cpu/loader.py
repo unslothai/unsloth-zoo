@@ -313,13 +313,29 @@ def _backward_lowered_in_forward():
         config.force_non_lazy_backward_lowering = previous
 
 
+def _in_backward():
+    """True inside autograd's backward pass, where checkpointing recomputes a layer's forward."""
+    current = getattr(torch._C, "_current_graph_task_id", None)
+    try:
+        return current is not None and current() != -1
+    except Exception:
+        return False
+
+
 def _fall_back_to_eager_on_compile_error(layers):
     """The toolchain probe compiles one small kernel; a decoder layer can still fail to trace or build (an op or a
     patched module Dynamo / Inductor cannot handle; Dynamo can raise plain AssertionErrors). The first failure of a
     compiled call drops every layer back to eager and reruns that call eagerly, so a genuine model error still
-    raises, now from eager code."""
+    raises, now from eager code. A layer whose compiled forward is still waiting for its checkpoint recomputation
+    (an earlier layer of the same step) replays it compiled once more: an eager recompute saves different tensors
+    and checkpointing raises CheckpointError. It goes eager after that."""
     layers = list(layers)
     state = {"eager": False}
+    pending = {}  # id(layer) -> compiled checkpointed forwards whose backward has not recomputed them yet
+
+    def drop(layer):
+        if not pending.get(id(layer)):
+            layer._compiled_call_impl = None
 
     def disable(error):
         if not state["eager"]:
@@ -327,7 +343,10 @@ def _fall_back_to_eager_on_compile_error(layers):
             _print(f"torch.compile failed on a decoder layer ({type(error).__name__}: "
                    f"{_first_error_line(error, 160)}), training eagerly.")
         for layer in layers:
-            layer._compiled_call_impl = None
+            drop(layer)
+
+    def checkpointed(layer):
+        return torch.is_grad_enabled() and layer.training and getattr(layer, "gradient_checkpointing", True)
 
     for layer in layers:
         compiled = layer._compiled_call_impl
@@ -335,18 +354,30 @@ def _fall_back_to_eager_on_compile_error(layers):
             continue
 
         def guarded(*args, _compiled = compiled, _layer = layer, **kwargs):
+            key = id(_layer)
+            backward = _in_backward()
+            if backward and pending.get(key):
+                # Checkpoint recomputation of a compiled forward: replay it compiled, as the forward saved it.
+                pending[key] -= 1
+                if state["eager"]:
+                    drop(_layer)
+                return _compiled(*args, **kwargs)
             if state["eager"]:
                 return _layer._call_impl(*args, **kwargs)
             try:
                 if not torch.is_grad_enabled():
-                    return _compiled(*args, **kwargs)
-                with _backward_lowered_in_forward():
-                    return _compiled(*args, **kwargs)
+                    out = _compiled(*args, **kwargs)
+                else:
+                    with _backward_lowered_in_forward():
+                        out = _compiled(*args, **kwargs)
             except Exception as error:
                 if _is_control_flow(error):
                     raise
                 disable(error)
                 return _layer._call_impl(*args, **kwargs)
+            if not backward and checkpointed(_layer):
+                pending[key] = pending.get(key, 0) + 1
+            return out
 
         layer._compiled_call_impl = guarded
 

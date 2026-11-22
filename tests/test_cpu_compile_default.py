@@ -288,3 +288,47 @@ def test_backward_only_compile_error_falls_back_to_eager(monkeypatch, capsys):
     assert all(layer._compiled_call_impl is None for layer in model.model.layers)
     out = capsys.readouterr().out
     assert "training eagerly" in out and "backward lowering failed" in out
+
+
+def test_compile_error_on_a_later_layer_keeps_checkpoint_recompute_compiled(monkeypatch, capsys):
+    """Non-reentrant checkpointing: layer 0's compiled forward already ran when the last layer fails to compile.
+    Recomputing layer 0 eagerly in backward saves different tensors (CheckpointError); it replays compiled once,
+    then every layer is eager. Grads equal an all-eager run."""
+    from unsloth_zoo.cpu import loader
+    if loader._cpu_compile_unavailable() is not None:
+        pytest.skip("no C++ toolchain for Inductor here")
+    monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False)
+    BackendCompilerFailed = type("BackendCompilerFailed", (RuntimeError,), {"__module__": "torch._dynamo.exc"})
+    real_compile = torch.nn.Module.compile
+    ids = torch.randint(3, 1000, (2, 17), generator = torch.Generator().manual_seed(0))
+    grads = []
+    for compile_layers in (False, True):
+        torch.manual_seed(0)
+        model = _tiny_model()
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
+        model.enable_input_require_grads()
+        model.train()
+        layers = list(model.model.layers)
+        if compile_layers:
+            def compile_all_but_last(self, *args, **kwargs):
+                if self is layers[-1]:
+                    def fail(*a, **k):
+                        raise BackendCompilerFailed("C++ build failed")
+                    self._compiled_call_impl = fail
+                else:
+                    real_compile(self, *args, **kwargs)
+            monkeypatch.setattr(torch.nn.Module, "compile", compile_all_but_last)
+            loader._compile_layers(model)
+            monkeypatch.setattr(torch.nn.Module, "compile", real_compile)
+        try:
+            for _ in range(2):  # the failing step, then a fully eager one
+                model.zero_grad()
+                model(input_ids = ids, labels = ids, use_cache = False).loss.backward()
+        finally:
+            torch._dynamo.reset()
+        grads.append(torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None]))
+        if compile_layers:
+            assert all(layer._compiled_call_impl is None for layer in layers)
+    assert "training eagerly" in capsys.readouterr().out
+    torch.testing.assert_close(grads[0], grads[1], rtol = 1e-4, atol = 1e-6)
