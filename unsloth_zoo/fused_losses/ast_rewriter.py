@@ -36,6 +36,7 @@ __all__ = [
     "rewrite_forward_source_spliced",
     "rewrite_count_aware_ce_spliced",
     "TripletCapture",
+    "inline_softcap_modules",
 ]
 
 import ast
@@ -628,6 +629,10 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     logits = cap.logits_name
     loss = cap.loss_name
     vocab = ast.unparse(cap.vocab_expr) if cap.vocab_expr is not None else "None"
+    # The fused call never binds the logits (Inkling's `vocab_size=logits.shape[-1]`); the kernel ignores vocab_size.
+    fused_vocab = "None" if any(
+        isinstance(n, ast.Name) and n.id == logits for n in ast.walk(cap.vocab_expr or ast.Constant(None))
+    ) else vocab
     extra = "".join(
         f", {name}={ast.unparse(value)}" for name, value in cap.extra_loss_kws
     )
@@ -672,7 +677,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
                 else:
                     {loss} = unsloth_fused_lm_head_loss(
                         {hidden_src}, self.{head_attr}, labels,
-                        vocab_size={vocab}{extra}{scale_extra}{scaler_kw}{kwargs_unpack},
+                        vocab_size={fused_vocab}{extra}{scale_extra}{scaler_kw}{kwargs_unpack},
                     )
                     {logits} = EMPTY_LOGITS
             else:
@@ -710,7 +715,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
         ]
         fused_call = (
             f"{loss} = unsloth_fused_lm_head_loss({hidden_src}, self.{head_attr}, labels, "
-            f"vocab_size={vocab}{extra}{scale_extra}{scaler_kw}{kwargs_unpack})"
+            f"vocab_size={fused_vocab}{extra}{scale_extra}{scaler_kw}{kwargs_unpack})"
         )
     fused = [*(ast.unparse(s) for s in cap.fused_pre), fused_call, *loss_casts, f"{logits} = EMPTY_LOGITS"]
     def ind(lines, n):
@@ -964,3 +969,102 @@ def _decorator_name(node: ast.AST) -> str | None:
     if isinstance(node, ast.Call):
         return _decorator_name(node.func)
     return None
+
+
+def _softcap_module_cap_attr(module_cls) -> str | None:
+    """`C` when `module_cls.forward(self, x)` is exactly `return tanh(x / self.C) * self.C` (Inkling's
+    `Inkling2Softcap`), else None."""
+    import inspect
+
+    try:
+        import torch
+        if not (isinstance(module_cls, type) and issubclass(module_cls, torch.nn.Module)):
+            return None
+        if "__call__" in module_cls.__dict__ or getattr(module_cls, "forward", None) is None:
+            return None
+        src = textwrap.dedent(inspect.getsource(inspect.unwrap(module_cls.forward)))
+        fn = ast.parse(src).body[0]
+    except Exception:
+        return None
+    if not isinstance(fn, ast.FunctionDef):
+        return None
+    args = fn.args
+    if (len(args.args) != 2 or args.vararg or args.kwarg or args.kwonlyargs or args.posonlyargs
+            or args.defaults or args.args[0].arg != "self"):
+        return None
+    body = fn.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        body = body[1:]
+    if len(body) != 1 or not isinstance(body[0], ast.Return) or body[0].value is None:
+        return None
+    x = args.args[1].arg
+    cap = _softcap_cap(ast.Assign(targets = [ast.Name(id = x)], value = body[0].value), x)
+    if (isinstance(cap, ast.Attribute) and isinstance(cap.value, ast.Name) and cap.value.id == "self"):
+        return cap.attr
+    return None
+
+
+def _init_assigned_class(cls, attr):
+    """The class `__init__` builds `self.<attr>` from (first match along the MRO), resolved in its module."""
+    import inspect
+    import sys
+
+    for klass in getattr(cls, "__mro__", ()):
+        init = klass.__dict__.get("__init__")
+        if init is None:
+            continue
+        try:
+            tree = ast.parse(textwrap.dedent(inspect.getsource(init)))
+        except (OSError, TypeError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                    and any(ast.unparse(t) == f"self.{attr}" for t in node.targets)):
+                continue
+            ns = dict(vars(sys.modules.get(klass.__module__, object())))
+            try:
+                ns.update(inspect.getclosurevars(init).nonlocals)
+            except (TypeError, ValueError):
+                pass
+            obj = None
+            for i, part in enumerate(ast.unparse(node.value.func).split(".")):
+                obj = ns.get(part) if i == 0 else getattr(obj, part, None)
+                if obj is None:
+                    return None
+            return obj
+    return None
+
+
+def inline_softcap_modules(source: str, cls) -> str:
+    """Spell `logits = self.<m>(logits)` as `logits = torch.tanh(logits / self.<m>.<C>) * self.<m>.<C>` when
+    `cls.__init__` builds `self.<m>` from a module whose whole forward is that softcap (Inkling 2's final
+    `self.logit_softcap`). The statement form is what the triplet rewriters hand to the fused CE kernel as
+    `logit_softcapping`; any other module call is left alone. Only that statement's text changes."""
+    if cls is None or "self." not in source:
+        return source
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        return source
+    lines = source.splitlines(keepends = True)
+    first = next((line for line in lines if line.strip()), "")
+    indent = len(first) - len(first.lstrip())
+    edits = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                and node.lineno == node.end_lineno):
+            continue
+        v, name = node.value, node.targets[0].id
+        if not (_is_self_attr_call(v) and len(v.args) == 1 and not v.keywords
+                and isinstance(v.args[0], ast.Name) and v.args[0].id == name):
+            continue
+        cap_attr = _softcap_module_cap_attr(_init_assigned_class(cls, v.func.attr))
+        if cap_attr is None:
+            continue
+        cap = f"self.{v.func.attr}.{cap_attr}"
+        edits.append((node.lineno - 1, v.col_offset + indent, v.end_col_offset + indent,
+                      f"torch.tanh({name} / {cap}) * {cap}"))
+    for row, lo, hi, text in sorted(edits, reverse = True):
+        line = lines[row]
+        lines[row] = line[:lo] + text + line[hi:]
+    return "".join(lines)
