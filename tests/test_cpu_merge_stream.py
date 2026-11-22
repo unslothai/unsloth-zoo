@@ -234,3 +234,119 @@ def test_streamed_merge_reexport_removes_obsolete_shards(tmp_path):
     sharded = tensors()
     assert set(sharded) == set(single) and all(torch.equal(sharded[k], single[k]) for k in single)
     assert all((out / name).read_text() == "keep" for name in unrelated)
+
+
+def _file_hashes(directory):
+    import hashlib
+    return {name: hashlib.sha256((directory / name).read_bytes()).hexdigest() for name in sorted(os.listdir(directory))}
+
+
+def _lora_llama(dtype = torch.float32, vocab = 256, hidden = 64, mixed = False):
+    import transformers
+    from peft import LoraConfig, get_peft_model
+    config = transformers.LlamaConfig(hidden_size = hidden, intermediate_size = 2 * hidden, num_hidden_layers = 2,
+                                      num_attention_heads = 4, num_key_value_heads = 2, vocab_size = vocab)
+    torch.manual_seed(0)
+    model = transformers.LlamaForCausalLM(config).to(dtype)
+    if mixed:
+        model.model.norm.float()  # bf16 and fp32 tensors in one file
+    torch.manual_seed(1)
+    return get_peft_model(model, LoraConfig(r = 4, target_modules = ["q_proj", "v_proj", "down_proj"],
+                                            init_lora_weights = False))
+
+
+@pytest.mark.parametrize("case", ["single", "sharded", "mixed_dtype"])
+@pytest.mark.parametrize("save_method", ["merged_16bit", "merged_32bit"])
+def test_streamed_merge_files_are_byte_identical(tmp_path, case, save_method):
+    """Not only the tensors: every file (safetensors layout, shard grouping, index) matches save_pretrained's."""
+    from unsloth_zoo.cpu import loader
+    model = _lora_llama(torch.bfloat16 if case == "mixed_dtype" else torch.float32,
+                        vocab = 4096 if case == "sharded" else 256, hidden = 128 if case == "sharded" else 64,
+                        mixed = case == "mixed_dtype")
+    kwargs = {"max_shard_size": 300000} if case == "sharded" else {}
+    merged, _ = loader._merged_copy(model, save_method)
+    merged.save_pretrained(tmp_path / "copy", **kwargs)
+    del merged
+    assert loader._stream_merged_save(model, str(tmp_path / "stream"), save_method, kwargs.get("max_shard_size"))
+    expected = _file_hashes(tmp_path / "copy")
+    if case == "sharded":
+        assert "model.safetensors.index.json" in expected
+    assert _file_hashes(tmp_path / "stream") == expected
+
+
+def test_streamed_merge_default_shard_size_follows_save_pretrained(tmp_path):
+    """No max_shard_size: shard as this transformers' save_pretrained would (5GB on 4.x, 50GB on 5.x)."""
+    import transformers
+    from unsloth_zoo.cpu import loader
+
+    class SmallShards(transformers.LlamaForCausalLM):
+        def save_pretrained(self, save_directory, max_shard_size = 300000, **kwargs):
+            return super().save_pretrained(save_directory, max_shard_size = max_shard_size, **kwargs)
+
+    import inspect
+    default = inspect.signature(transformers.PreTrainedModel.save_pretrained).parameters["max_shard_size"].default
+    assert loader._default_shard_size(_tiny_llama()) == default
+    config = transformers.LlamaConfig(hidden_size = 128, intermediate_size = 256, num_hidden_layers = 2,
+                                      num_attention_heads = 4, num_key_value_heads = 2, vocab_size = 4096)
+    torch.manual_seed(0)
+    model = SmallShards(config)
+    model.save_pretrained(tmp_path / "copy")
+    assert loader._stream_merged_save(model, str(tmp_path / "stream"), "merged_32bit") is True
+    assert _file_hashes(tmp_path / "stream") == _file_hashes(tmp_path / "copy")
+
+
+_SOURCE_DIR_SCRIPT = r"""
+import sys, torch, transformers
+from peft import LoraConfig, get_peft_model
+from safetensors.torch import load_file
+from unsloth_zoo.cpu import loader
+src, ref, dtype = sys.argv[1], sys.argv[2], getattr(torch, sys.argv[3])
+config = transformers.LlamaConfig(hidden_size = 256, intermediate_size = 512, num_hidden_layers = 2,
+                                  num_attention_heads = 4, num_key_value_heads = 2, vocab_size = 2048)
+torch.manual_seed(0)
+transformers.LlamaForCausalLM(config).to(dtype).save_pretrained(src)
+model = transformers.AutoModelForCausalLM.from_pretrained(src, dtype = dtype)  # weights memory-mapped from src
+torch.manual_seed(1)
+model = get_peft_model(model, LoraConfig(r = 4, target_modules = ["q_proj", "v_proj"], init_lora_weights = False))
+loader.save_pretrained_merged(model, ref, save_method = "merged_16bit")
+loader.save_pretrained_merged(model, src, save_method = "merged_16bit")
+a, b = load_file(ref + "/model.safetensors"), load_file(src + "/model.safetensors")
+assert set(a) == set(b) and all(torch.equal(a[k], b[k]) for k in a), "merged export differs"
+print("OK")
+"""
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_streamed_merge_into_the_directory_the_model_was_loaded_from(tmp_path, dtype):
+    """from_pretrained memory-maps the weights: overwriting model.safetensors in place crashed (SIGBUS) or failed
+    with EFAULT and destroyed the source checkpoint. Files are now written aside and moved into place."""
+    script = tmp_path / "run.py"
+    script.write_text(_SOURCE_DIR_SCRIPT)
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    result = subprocess.run([sys.executable, str(script), str(tmp_path / "src"), str(tmp_path / "ref"), dtype],
+                            capture_output = True, text = True, env = env, timeout = 600)
+    assert result.returncode == 0 and "OK" in result.stdout, (result.returncode, result.stderr[-2000:])
+
+
+def test_streamed_merge_interrupted_keeps_the_previous_export(tmp_path):
+    """An export that fails part way leaves the previous export loadable and no partial or temporary file."""
+    from unsloth_zoo.cpu import loader
+    model = _lora_llama(vocab = 4096, hidden = 128)
+    out = tmp_path / "out"
+    loader.save_pretrained_merged(model, str(out), save_method = "merged_16bit", max_shard_size = 300000)
+    before = _file_hashes(out)
+    original, calls = loader._merged_weight, []
+
+    def failing(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 3:
+            raise KeyboardInterrupt("simulated")
+        return original(*args, **kwargs)
+
+    loader._merged_weight = failing
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            loader.save_pretrained_merged(model, str(out), save_method = "merged_16bit")
+    finally:
+        loader._merged_weight = original
+    assert _file_hashes(out) == before

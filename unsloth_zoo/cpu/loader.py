@@ -911,21 +911,37 @@ _SAFETENSORS_DTYPES = {
 }
 
 
-def _write_safetensors(path, entries):
-    """A safetensors file written one tensor at a time: the header comes from shapes / dtypes, then each tensor is
-    made, written and dropped, so at most one merged tensor is alive (safetensors' save_file holds the whole file as
-    bytes). Returns the payload size in bytes."""
+def _safetensors_dtype_rank():
+    """safetensors' save_file lays tensors out by dtype (its own order, widest first) then name: read that order from
+    the installed safetensors so the streamed file is byte-identical to save_file's."""
     import json
     import struct
-    entries = sorted(entries, key = lambda entry: entry[0])
-    header, offset = {}, 0
+    try:
+        from safetensors.torch import save
+        blob = save({str(i): torch.zeros(1, dtype = dtype) for i, dtype in enumerate(_SAFETENSORS_DTYPES)})
+        order = list(json.loads(blob[8:8 + struct.unpack("<Q", blob[:8])[0]]))
+        dtypes = list(_SAFETENSORS_DTYPES)
+        return {dtypes[int(k)]: rank for rank, k in enumerate(k for k in order if k != "__metadata__")}
+    except Exception:
+        return {dtype: rank for rank, dtype in enumerate((torch.int64, torch.float64, torch.float32, torch.int32,
+            torch.bfloat16, torch.float16, torch.int16, torch.int8, torch.uint8, torch.bool))}
+
+
+def _write_safetensors(path, entries, rank = None):
+    """A safetensors file written one tensor at a time: the header comes from shapes / dtypes, then each tensor is
+    made, written and dropped, so at most one merged tensor is alive (safetensors' save_file holds the whole file as
+    bytes). Same layout as save_file (metadata first, dtype then name order). Returns the payload size in bytes."""
+    import json
+    import struct
+    rank = rank or _safetensors_dtype_rank()
+    entries = sorted(entries, key = lambda entry: (rank.get(entry[2], len(rank)), entry[0]))
+    header, offset = {"__metadata__": {"format": "pt"}}, 0
     for out, _, dtype, numel, shape in entries:
         if dtype not in _SAFETENSORS_DTYPES:
             raise TypeError(f"Unsloth (CPU): no safetensors dtype for {dtype}")
         nbytes = numel * torch.empty((), dtype = dtype).element_size()
         header[out] = {"dtype": _SAFETENSORS_DTYPES[dtype], "shape": list(shape), "data_offsets": [offset, offset + nbytes]}
         offset += nbytes
-    header["__metadata__"] = {"format": "pt"}
     encoded = json.dumps(header, separators = (",", ":")).encode("utf-8")
     encoded += b" " * (-len(encoded) % 8)
     with open(path, "wb") as f:
@@ -939,6 +955,43 @@ def _write_safetensors(path, entries):
                 f.write(memoryview(value.view(-1).view(torch.uint8).numpy()))
             del value
     return offset
+
+
+def _default_shard_size(hf):
+    """save_pretrained's own default (5GB on transformers 4.x, 50GB on 5.x)."""
+    import inspect
+    try:
+        default = inspect.signature(type(hf).save_pretrained).parameters["max_shard_size"].default
+        return default if isinstance(default, (int, str)) else "5GB"
+    except Exception:
+        return "5GB"
+
+
+def _split_shards(entries, limit):
+    """Shard grouping and names from huggingface_hub's splitter (what save_pretrained uses), on meta tensors."""
+    try:
+        from huggingface_hub import split_torch_state_dict_into_shards
+        meta = {entry[0]: torch.empty(entry[4], dtype = entry[2], device = "meta") for entry in entries}
+        split = split_torch_state_dict_into_shards(meta, filename_pattern = "model{suffix}.safetensors",
+                                                   max_shard_size = limit)
+        by_name = {entry[0]: entry for entry in entries}
+        return [(name, [by_name[k] for k in keys]) for name, keys in split.filename_to_tensors.items()], split.metadata
+    except Exception:
+        pass
+    shards, current, size = [], [], 0
+    for entry in entries:
+        nbytes = entry[3] * torch.empty((), dtype = entry[2]).element_size()
+        if current and size + nbytes > limit:
+            shards.append(current)
+            current, size = [], 0
+        current.append(entry)
+        size += nbytes
+    if current:
+        shards.append(current)
+    names = ["model.safetensors"] if len(shards) == 1 else \
+        [f"model-{i + 1:05d}-of-{len(shards):05d}.safetensors" for i in range(len(shards))]
+    total = sum(e[3] * torch.empty((), dtype = e[2]).element_size() for e in entries)
+    return list(zip(names, shards)), {"total_size": total}
 
 
 _STALE_SHARD = re.compile(r"model-\d{5}-of-\d{5}\.safetensors")
@@ -1012,28 +1065,34 @@ def _stream_merged_save(model, save_directory, save_method, max_shard_size = Non
     if not _save_keeps_live_layout(hf, entries):
         return False
 
-    limit = _shard_bytes(max_shard_size or "5GB")
-    shards, current, size = [], [], 0
-    for entry in entries:
-        nbytes = entry[3] * torch.empty((), dtype = entry[2]).element_size()
-        if current and size + nbytes > limit:
-            shards.append(current)
-            current, size = [], 0
-        current.append(entry)
-        size += nbytes
-    if current:
-        shards.append(current)
+    limit = _shard_bytes(max_shard_size or _default_shard_size(hf))
+    shards, split_metadata = _split_shards(entries, limit)
+    names = [name for name, _ in shards]
     os.makedirs(save_directory, exist_ok = True)
-    names = ["model.safetensors"] if len(shards) == 1 else \
-        [f"model-{i + 1:05d}-of-{len(shards):05d}.safetensors" for i in range(len(shards))]
-    weight_map, total = {}, 0
-    with torch.no_grad():
-        for name, shard in zip(names, shards):
-            total += _write_safetensors(os.path.join(save_directory, name), shard)
-            weight_map.update({entry[0]: name for entry in shard})
-    if len(shards) > 1:
-        with open(os.path.join(save_directory, "model.safetensors.index.json"), "w", encoding = "utf-8") as f:
-            json.dump({"metadata": {"total_size": total}, "weight_map": dict(sorted(weight_map.items()))}, f, indent = 2)
+    # Each file is written under a temporary name and moved into place only after every shard is complete: the live
+    # weights may be memory-mapped from the files being replaced (a model loaded from save_directory), and an
+    # interrupted export must not leave a half-written model.safetensors that loaders would pick.
+    rank, staged = _safetensors_dtype_rank(), []
+    try:
+        with torch.no_grad():
+            for name, shard in shards:
+                temporary = os.path.join(save_directory, f".{name}.unsloth-tmp")
+                staged.append((temporary, os.path.join(save_directory, name)))
+                _write_safetensors(temporary, shard, rank)
+        if len(shards) > 1:
+            total_parameters = sum(p.numel() for n, p in hf.named_parameters() if ".lora_" not in n)
+            index = {"metadata": {"total_parameters": total_parameters, **split_metadata},
+                     "weight_map": {entry[0]: name for name, shard in shards for entry in shard}}
+            temporary = os.path.join(save_directory, ".model.safetensors.index.json.unsloth-tmp")
+            staged.append((temporary, os.path.join(save_directory, "model.safetensors.index.json")))
+            with open(temporary, "w", encoding = "utf-8") as f:
+                f.write(json.dumps(index, indent = 2, sort_keys = True) + "\n")
+        for temporary, final in staged:
+            os.replace(temporary, final)
+    finally:
+        for temporary, _ in staged:
+            if os.path.exists(temporary):
+                os.remove(temporary)
     _remove_stale_weights(save_directory, names)
     config = copy.deepcopy(hf.config)
     # save_pretrained records the first floating parameter's dtype under the field this transformers reads.
