@@ -2897,6 +2897,79 @@ def _row_tools(example):
 
 
 # Faster SFTTrainer prepare_dataset
+_MAP_TO_DISK_DIR = None
+# Windows cannot delete a file that is still memory-mapped, and the tokenized dataset is usually still
+# alive when the atexit cleanup runs, so each run would leave its dir behind; the next run removes them.
+_SWEEP_STALE_MAP_DIRS = __import__("os").name == "nt"
+
+
+def _sweep_stale_map_dirs(parent):
+    """Remove `unsloth_dataset_<pid>_*` dirs in `parent` whose process has exited."""
+    import os
+    import re
+    import shutil
+
+    try:
+        import psutil
+
+        for name in os.listdir(parent):
+            matched = re.match(r"unsloth_dataset_(\d+)_", name)
+            if matched is None or int(matched.group(1)) == os.getpid():
+                continue
+            if not psutil.pid_exists(int(matched.group(1))):
+                shutil.rmtree(os.path.join(parent, name), ignore_errors = True)
+    except Exception:
+        pass
+
+
+def _map_to_disk_kwargs(dataset):
+    """`cache_file_name` for tokenizing an in-memory `Dataset` (from_dict / from_list / pandas).
+
+    With no cache file to sit next to, `datasets` builds the mapped table in anonymous RAM and
+    keeps it there for the whole run (about 5 bytes per token, more with labels). A file in a
+    per-process temp dir makes it memory-mapped instead. The name is unique, so nothing is ever
+    reused across runs; the dir is removed at exit. UNSLOTH_DATASET_MAP_TO_DISK=0 turns it off,
+    =1 applies it whatever the size; the default (auto) only above
+    UNSLOTH_DATASET_MAP_TO_DISK_MIN_MB (128) of source data and with 4x that free on disk.
+    """
+    global _MAP_TO_DISK_DIR
+    import os
+
+    mode = os.environ.get("UNSLOTH_DATASET_MAP_TO_DISK", "auto").strip().lower()
+    if mode in ("0", "false", "off", "no"):
+        return {}
+    try:
+        if not isinstance(dataset, Dataset) or dataset.cache_files:
+            return {}
+        source_bytes = int(dataset.data.nbytes)
+        if mode not in ("1", "true", "on", "yes"):
+            try:
+                min_mb = float(os.environ.get("UNSLOTH_DATASET_MAP_TO_DISK_MIN_MB", "128"))
+            except ValueError:
+                min_mb = 128.0
+            if source_bytes < min_mb * 2**20:
+                return {}
+        import shutil
+        import tempfile
+        import uuid
+
+        if _MAP_TO_DISK_DIR is None or not os.path.isdir(_MAP_TO_DISK_DIR):
+            parent = os.environ.get("UNSLOTH_DATASET_MAP_TO_DISK_DIR") or tempfile.gettempdir()
+            if shutil.disk_usage(parent).free < 4 * source_bytes:
+                return {}
+            if _SWEEP_STALE_MAP_DIRS:
+                _sweep_stale_map_dirs(parent)
+            _MAP_TO_DISK_DIR = tempfile.mkdtemp(prefix = f"unsloth_dataset_{os.getpid()}_", dir = parent)
+            import atexit
+
+            atexit.register(shutil.rmtree, _MAP_TO_DISK_DIR, ignore_errors = True)
+        elif shutil.disk_usage(_MAP_TO_DISK_DIR).free < 4 * source_bytes:
+            return {}
+        return {"cache_file_name": os.path.join(_MAP_TO_DISK_DIR, f"tokenized_{uuid.uuid4().hex}.arrow")}
+    except Exception:
+        return {}
+
+
 def sft_prepare_dataset(
     self,
     dataset: Union[Dataset, IterableDataset],
@@ -3114,6 +3187,9 @@ def sft_prepare_dataset(
             )
         else:
             map_kwargs["batch_size"] = _iterable_batch_size(dataset)
+        # Tokenize an in-memory dataset into a temp file, not anonymous RAM; only these maps, not packing.
+        from unsloth_zoo.dataset_utils import _map_to_disk_kwargs
+        _tokenize_map_kwargs = {**map_kwargs, **_map_to_disk_kwargs(dataset)}
 
         if do_messages or do_prompt_completion:
             assistant_only_loss = bool(getattr(args, "assistant_only_loss", False))
@@ -3276,14 +3352,14 @@ def sft_prepare_dataset(
                 return results
 
             if use_desc:
-                map_kwargs["desc"] = 'Unsloth: Tokenizing ["prompt"+"completion"]'
+                _tokenize_map_kwargs["desc"] = 'Unsloth: Tokenizing ["prompt"+"completion"]'
             import warnings as _w
             with _w.catch_warnings():
                 _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
                 dataset = dataset.map(
                     _batched_rows(_tokenize_pc, _tokenize_pc_rows) if _batch_map else _tokenize_pc,
                     batched=_batch_map,
-                    remove_columns=source_column_names, **map_kwargs,
+                    remove_columns=source_column_names, **_tokenize_map_kwargs,
                 )
             if assistant_only_loss:
                 # Prompt-history assistant turns are no target while completion_mask applies.
@@ -3400,14 +3476,14 @@ def sft_prepare_dataset(
                         results[i] = _tokenize_messages(row)
                 return results
 
-            if use_desc: map_kwargs["desc"] = 'Unsloth: Tokenizing ["messages"]'
+            if use_desc: _tokenize_map_kwargs["desc"] = 'Unsloth: Tokenizing ["messages"]'
             import warnings as _w
             with _w.catch_warnings():
                 _w.filterwarnings("ignore", message = ".*couldn't be hashed properly.*")
                 dataset = dataset.map(
                     _batched_rows(_tokenize_messages, _tokenize_messages_rows) if _batch_map else _tokenize_messages,
                     batched=_batch_map,
-                    remove_columns=source_column_names, **map_kwargs,
+                    remove_columns=source_column_names, **_tokenize_map_kwargs,
                 )
             if assistant_only_loss:
                 # Truncation can drop every assistant token; such a row has no target.
@@ -3419,11 +3495,11 @@ def sft_prepare_dataset(
                 else:
                     dataset = dataset.filter(lambda row: any(row["assistant_masks"]))
         else:
-            if use_desc: map_kwargs["desc"] = f'Unsloth: Tokenizing ["{dataset_text_field}"]'
+            if use_desc: _tokenize_map_kwargs["desc"] = f'Unsloth: Tokenizing ["{dataset_text_field}"]'
             import warnings as _w
             with _w.catch_warnings():
                 _w.filterwarnings("ignore", message=".*couldn't be hashed properly.*")
-                dataset = dataset.map(_tokenize, batched = True, remove_columns = source_column_names, **map_kwargs)
+                dataset = dataset.map(_tokenize, batched = True, remove_columns = source_column_names, **_tokenize_map_kwargs)
 
         # VLMs need .pad; switch the data collator
         # transformers' collator rebuilds labels from input_ids, dropping assistant masks: keep TRL's for messages.
