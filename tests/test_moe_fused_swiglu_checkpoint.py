@@ -158,3 +158,32 @@ def test_fused_moe_activation_non_reentrant_checkpoint(dtype, expert_cls, interl
         assert torch.equal(y_f, y_e) and torch.equal(gx_f, gx_e) and torch.equal(gw_f, gw_e)
     assert [v for k, v in sw._CACHE.items() if isinstance(k, tuple) and k[0] == "self_check"] == [True]
     _clear_self_check_cache()
+
+
+def test_self_check_failing_before_backward_frees_its_graph(monkeypatch):
+    # The gpt-oss reference saves a sigmoid output: under an identity pack hook it holds its own node,
+    # so a probe whose grad raises keeps the eager graph (and its input clone) alive.
+    import gc
+
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    _cpu_probe(monkeypatch)
+    _clear_self_check_cache()
+    probed = []
+    reference = sw.moe_swiglu_reference
+
+    def tracked(gate_up, *args, **kwargs):
+        probed.append(StorageWeakRef(gate_up.untyped_storage()))
+        return reference(gate_up, *args, **kwargs)
+
+    def failing_grad(*args, **kwargs):
+        raise RuntimeError("probe backward")
+
+    monkeypatch.setattr(sw, "moe_swiglu_reference", tracked)
+    monkeypatch.setattr(torch.autograd, "grad", failing_grad)
+    assert sw.fused_swiglu_self_check(torch.device("cpu"), torch.float32, sw.ACT_GPTOSS, False) is False
+    monkeypatch.undo()
+    gc.collect()
+    assert probed, "the probe did not run"
+    assert probed[0].expired(), "the failed self-check's eager graph outlived the probe"
+    _clear_self_check_cache()

@@ -328,8 +328,8 @@ def _self_check(device, acc_dtype, alpha, limit) -> bool:
         if torch.cuda.is_current_stream_capturing():
             return False
     try:
-        # Identity hooks keep the probe out of an enclosing checkpoint frame (innermost wins).
-        hooks = torch.autograd.graph.saved_tensors_hooks(_identity, _identity)
+        # Own hooks keep the probe out of an enclosing checkpoint frame (innermost wins).
+        hooks = torch.autograd.graph.saved_tensors_hooks(_detached, _identity)
         hooks.__enter__()
     except Exception:
         return False  # hooks disabled here (e.g. a functorch transform)
@@ -380,6 +380,11 @@ def _self_check(device, acc_dtype, alpha, limit) -> bool:
 
 def _identity(t):
     return t
+
+
+def _detached(t):
+    # A probe failing before its backward leaves the graph unfreed: an op saving its own output would hold itself.
+    return t.detach()
 
 
 def _passthrough(err):

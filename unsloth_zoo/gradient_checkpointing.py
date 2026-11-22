@@ -2686,8 +2686,11 @@ class NonReentrantActivationOffloader:
     pass
 
     def pack(self, x):
-        if not x.requires_grad or self._on_host(x):
+        if not x.requires_grad:
             return None, x
+        if self._on_host(x):
+            # Detached like the keep branches below: a CPU op saving its own output would hold itself.
+            return None, x.detach()
         # Traced: offload as before (the budget check reads allocator state).
         if self.keep_on_device and x.device.index in self.keep_on_device and not _is_compiling():
             nbytes = x.numel() * x.element_size()
