@@ -22,12 +22,15 @@ __all__ = [
     "cpu_bnb_4bit_supported",
     "cpu_capabilities",
     "apply_cpu_security_patches",
+    "cpu_compute_cores",
+    "fit_cpu_threads",
     "available_ram",
 ]
 
 import functools
 import os
 import platform
+import sys
 import warnings
 
 
@@ -179,6 +182,197 @@ def cpu_bnb_4bit_supported():
             return bool(torch.isfinite(y).all()) and x.grad is not None and bool(torch.isfinite(x.grad).all())
     except Exception:
         return False
+
+
+def _linux_physical_cores(cpus, root = "/sys/devices/system/cpu"):
+    """Distinct (package, core) pairs among ``cpus``; None when sysfs topology is unreadable."""
+    cores = set()
+    try:
+        for cpu in cpus:
+            base = f"{root}/cpu{cpu}/topology/"
+            with open(base + "core_id") as f:
+                core = f.read().strip()
+            with open(base + "physical_package_id") as f:
+                package = f.read().strip()
+            # Unknown topology reads as package -1 (and core 0 everywhere): it names no real core, so the caller
+            # falls back to counting CPUs instead of collapsing them all into one.
+            if int(package) < 0 or int(core) < 0:
+                return None
+            cores.add((package, core))
+    except (OSError, ValueError):
+        return None
+    return len(cores) or None
+
+
+def _cgroup_cpu_limit(proc_cgroup = "/proc/self/cgroup", root = "/sys/fs/cgroup"):
+    """CPUs the cgroup quota allows (cgroup v2 cpu.max up the hierarchy, else v1 cfs), None when unlimited."""
+    limits = []
+    try:
+        with open(proc_cgroup) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        hierarchy, _, path = line.partition(":")[2].partition(":")
+        # The process's own cgroup and every ancestor up to the mount root bound it; a path that does not exist under
+        # the mount (a host path seen inside a container) just falls through to the levels that do.
+        parts = [p for p in path.split("/") if p]
+        if hierarchy == "":  # v2 unified
+            for depth in range(len(parts), -1, -1):
+                try:
+                    with open(os.path.join(root, *parts[:depth], "cpu.max")) as f:
+                        quota, period = (f.read().split() + ["100000"])[:2]
+                except OSError:
+                    continue
+                if quota != "max" and int(period) > 0:
+                    limits.append(int(quota) / int(period))
+        elif "cpu" in hierarchy.split(","):
+            for v1 in (f"{root}/cpu,cpuacct", f"{root}/cpu"):
+                if not os.path.isdir(v1):
+                    continue
+                for depth in range(len(parts), -1, -1):
+                    try:
+                        with open(os.path.join(v1, *parts[:depth], "cpu.cfs_quota_us")) as f:
+                            quota = int(f.read())
+                        with open(os.path.join(v1, *parts[:depth], "cpu.cfs_period_us")) as f:
+                            period = int(f.read())
+                    except (OSError, ValueError):
+                        continue
+                    if quota > 0 and period > 0:
+                        limits.append(quota / period)
+                break
+    if not limits:
+        return None
+    import math
+    return max(1, math.ceil(min(limits)))
+
+
+def cpu_compute_cores():
+    """Cores this process can really compute on: physical cores in its affinity mask (SMT siblings share one core's
+    vector / AMX units), capped by a cgroup CPU quota. Linux only; None elsewhere (keep torch's default)."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        cpus = sorted(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return None
+    if not cpus:
+        return None
+    cores = _linux_physical_cores(cpus) or len(cpus)
+    try:
+        quota = _cgroup_cpu_limit()
+    except Exception:
+        quota = None
+    return max(1, min(cores, quota) if quota else cores)
+
+
+def _affinity_split_per_rank(ranks):
+    """True when a launcher pinned this rank to its own slice of CPUs (torchrun --numa-binding, mpirun --bind-to):
+    the parent launcher's affinity is wider than ours and holds a slice this size for every local rank. A whole job
+    pinned with taskset shares one mask with its parent, so its ranks still split it."""
+    if ranks <= 1 or not sys.platform.startswith("linux"):
+        return False
+    try:
+        mine = os.sched_getaffinity(0)
+        parent = os.sched_getaffinity(os.getppid())
+    except (AttributeError, OSError):
+        return False
+    return bool(mine) and mine < parent and len(mine) * ranks <= len(parent)
+
+
+def _local_world_size():
+    # The variables Accelerate's get_cpu_distributed_information reads (torchrun, Intel MPI, Open MPI, MVAPICH).
+    for name in ("LOCAL_WORLD_SIZE", "MPI_LOCALNRANKS", "OMPI_COMM_WORLD_LOCAL_SIZE", "MV2_COMM_WORLD_LOCAL_SIZE"):
+        try:
+            value = int(os.environ.get(name, ""))
+        except ValueError:
+            continue
+        if value >= 1:
+            return value
+    return 1
+
+
+def _launcher_set_one_thread():
+    """torchrun (nproc > 1) and accelerate launch export OMP_NUM_THREADS=1 when the user did not set it, so CPU ranks
+    run single-threaded; a 1 next to their markers is the launcher's, not the user's (UNSLOTH_CPU_THREADS=1 keeps 1)."""
+    if os.environ.get("OMP_NUM_THREADS", "").strip() != "1":
+        return False
+    if os.environ.get("TORCHELASTIC_RUN_ID") and _local_world_size() > 1:
+        return True
+    return "ACCELERATE_MIXED_PRECISION" in os.environ
+
+
+_THREADS_FITTED = None
+
+
+def fit_cpu_threads():
+    """Sizes torch's intra-op pool for CPU training. Idempotent; returns (threads, reason).
+    UNSLOTH_CPU_THREADS wins; a user's OMP_NUM_THREADS / MKL_NUM_THREADS is kept; otherwise one thread per physical
+    core in the affinity mask / cgroup quota, split across the local ranks of torchrun / accelerate. Never raises the
+    count above torch's default except to undo a launcher's OMP_NUM_THREADS=1."""
+    global _THREADS_FITTED
+    import torch
+    if _THREADS_FITTED is not None:
+        return _THREADS_FITTED
+    current = torch.get_num_threads()
+    reason = "default"
+    target = None
+    explicit = os.environ.get("UNSLOTH_CPU_THREADS", "").strip()
+    if explicit:
+        try:
+            target = max(1, int(explicit))
+            reason = "UNSLOTH_CPU_THREADS"
+        except ValueError:
+            warnings.warn(f"Unsloth: UNSLOTH_CPU_THREADS = {explicit!r} is not an integer; ignoring it.")
+    if target is None:
+        launcher = _launcher_set_one_thread()
+        # A launcher only ever exports OMP_NUM_THREADS, so an MKL_NUM_THREADS next to it is still the user's.
+        user_mkl = bool(os.environ.get("MKL_NUM_THREADS", "").strip())
+        user_set = user_mkl or bool(os.environ.get("OMP_NUM_THREADS", "").strip())
+        if user_set and (user_mkl or not launcher):
+            _THREADS_FITTED = (current, "OMP_NUM_THREADS / MKL_NUM_THREADS")
+            _pin_omp_env(current)
+            return _THREADS_FITTED
+        cores = cpu_compute_cores()
+        ranks = _local_world_size()
+        if cores is None:
+            if launcher:
+                target, reason = max(1, (os.cpu_count() or 1) // ranks), "launcher OMP_NUM_THREADS=1 undone"
+        else:
+            fitted = max(1, cores // ranks)
+            if _affinity_split_per_rank(ranks):
+                # cores already counts this rank's own CPUs; only a cgroup quota is still shared by the ranks.
+                try:
+                    quota = _cgroup_cpu_limit() if sys.platform.startswith("linux") else None
+                except Exception:
+                    quota = None
+                fitted = max(1, min(cores, quota // ranks) if quota else cores)
+            if launcher:
+                target, reason = fitted, "launcher OMP_NUM_THREADS=1 undone"
+            elif fitted < current:
+                try:
+                    quota = _cgroup_cpu_limit() if sys.platform.startswith("linux") else None
+                except Exception:
+                    quota = None
+                basis = "cgroup CPU quota" if quota is not None and quota <= cores else "physical cores"
+                target, reason = fitted, basis + (f" / {ranks} local ranks" if ranks > 1 else "")
+    if target is not None and target != current:
+        try:
+            torch.set_num_threads(target)
+            print(f"Unsloth (CPU): {current} -> {target} torch threads ({reason}); UNSLOTH_CPU_THREADS overrides.")
+        except Exception:
+            target = current
+    _THREADS_FITTED = (torch.get_num_threads(), reason)
+    _pin_omp_env(_THREADS_FITTED[0])
+    return _THREADS_FITTED
+
+
+def _pin_omp_env(threads):
+    """Accelerate's PartialState (built later by TrainingArguments) sets torch threads to physical cores / local
+    ranks on a multi-CPU launch whenever OMP_NUM_THREADS is unset (mpirun), undoing this fit and UNSLOTH_CPU_THREADS.
+    Exporting the fitted count keeps it there, and hands the same count to spawned workers."""
+    if not os.environ.get("OMP_NUM_THREADS", "").strip():
+        os.environ["OMP_NUM_THREADS"] = str(max(1, int(threads)))
 
 
 _CGROUP_ROOT = "/sys/fs/cgroup"
