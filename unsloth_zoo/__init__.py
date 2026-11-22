@@ -145,8 +145,7 @@ def has_429_exact_full_read(log_dir: str | Path) -> bool:
         try:
             if found:  # stopped early: keep what is still known about the files not reached
                 seen = {**{k: v for k, v in previous.items() if (log_dir / k).exists()}, **seen}
-            # mkstemp (O_EXCL), not a fixed pid name: in a shared HF cache another account could plant a symlink at
-            # a predictable name and have this write follow it.
+            # mkstemp, not a fixed pid name: in a shared HF cache another account could pre-plant a symlink there.
             import tempfile
             fd, tmp = tempfile.mkstemp(prefix = f"{manifest_path.name}.", suffix = ".tmp", dir = str(log_dir))
             with os.fdopen(fd, "w", encoding = "utf-8") as f:
