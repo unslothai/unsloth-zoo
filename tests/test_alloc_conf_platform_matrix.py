@@ -83,7 +83,7 @@ _CHILD = textwrap.dedent(
 
 
 def _conf(*, torch_version, wsl=False, wsl_interop=False, windows=False,
-          standby=False, opt_out=False, device=None, preset=None, kernel_release=None):
+          standby=False, opt_out=False, device="cuda", preset=None, kernel_release=None):
     """Import unsloth_zoo in a fresh child process with the faked env and return its allocator env vars as a dict (values may be None)."""
     env = {k: v for k, v in os.environ.items() if k not in _WIPE and k != "_FAKE_TORCH_VERSION"}
     env["_FAKE_TORCH_VERSION"] = torch_version
@@ -100,8 +100,9 @@ def _conf(*, torch_version, wsl=False, wsl_interop=False, windows=False,
         env["UNSLOTH_VLLM_STANDBY"] = "1"
     if opt_out:
         env["UNSLOTH_DISABLE_ALLOC_FALLBACK"] = "1"
-    if device:
-        env["_FAKE_DEVICE"] = device
+    # Always fake the backend (CUDA unless the case says otherwise): on a real ROCm host the
+    # unfaked child would detect "hip" and take the HIP branch, so every CUDA case would fail.
+    env["_FAKE_DEVICE"] = device
     for key, val in (preset or {}).items():
         env[key] = val
     # windows (os.name == 'nt') cannot be faked on Linux (pathlib raises), so the source drift guard test covers it instead.
