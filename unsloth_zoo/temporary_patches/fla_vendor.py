@@ -1527,6 +1527,11 @@ def _install_cpu_torch_path():
             continue
         wrapped = _make_cpu_gated_delta_rule(original, recurrent)
         setattr(package, name, wrapped)
+        # The decode alias (recurrent_gated_delta_rule, added before this runs) must follow the
+        # wrapper, or transformers' kernel-hub lookup resolves the unwrapped Triton kernel.
+        for alias, source in _MISSING_GATED_DELTA_ALIASES.items():
+            if source == name and getattr(package, alias, None) is original:
+                setattr(package, alias, wrapped)
         sub = sys.modules.get(submodule)
         if sub is not None and getattr(sub, name, None) is original:
             setattr(sub, name, wrapped)

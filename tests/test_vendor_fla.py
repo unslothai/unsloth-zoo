@@ -374,6 +374,29 @@ def test_decode_alias_is_idempotent(monkeypatch):
     assert fake.__all__.count("recurrent_gated_delta_rule") == 1
 
 
+def test_decode_alias_follows_the_cpu_torch_wrapper(monkeypatch):
+    """The CPU pure-torch wrapper installed after the alias must also be what the alias names: transformers resolves
+    recurrent_gated_delta_rule, so a stale alias sends CPU decode tensors to the Triton kernel."""
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    def chunk_gated_delta_rule(q, k, v, g, beta):
+        return "chunk"
+
+    def fused_recurrent_gated_delta_rule(q, k, v, g, beta):
+        return "fused"
+
+    fake = _FakeGatedDeltaModule(
+        chunk_gated_delta_rule=chunk_gated_delta_rule,
+        fused_recurrent_gated_delta_rule=fused_recurrent_gated_delta_rule,
+    )
+    assert _alias_into(fake, monkeypatch) == ("recurrent_gated_delta_rule",)
+    for name in ("fla.ops.gated_delta_rule.chunk", "fla.ops.gated_delta_rule.fused_recurrent"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    assert fla_vendor._install_cpu_torch_path()
+    assert fake.fused_recurrent_gated_delta_rule is not fused_recurrent_gated_delta_rule
+    assert fake.recurrent_gated_delta_rule is fake.fused_recurrent_gated_delta_rule
+
+
 def test_decode_alias_survives_absent_fla(monkeypatch):
     """No fla at all (pure-torch host) must not raise."""
     from unsloth_zoo.temporary_patches import fla_vendor
