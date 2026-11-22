@@ -1982,8 +1982,7 @@ def _gpt_oss_replace_marker(marker_path, desired_flavor, mode = 0o600):
         prefix = f".{os.path.basename(marker_path)}.", suffix = ".tmp", dir = directory,
     )
     try:
-        # mkstemp is 0600; a shared cache needs more. Set it on the open descriptor: a group member can swap the
-        # temporary name for a symlink, and a path chmod would then widen whatever file it points at.
+        # mkstemp is 0600; widen via the fd, since a path chmod would follow a swapped-in symlink.
         if hasattr(os, "fchmod"):
             os.fchmod(descriptor, mode)
         else:
