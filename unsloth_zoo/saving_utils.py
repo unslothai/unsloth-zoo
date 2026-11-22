@@ -4079,12 +4079,17 @@ _EXPORT_MANAGED_CONFIG_KEYS = frozenset((
 ))
 
 
-def _overlay_export_managed_keys(target, written):
+def _overlay_export_managed_keys(target, written, carried = ()):
+    # `carried`: fields the export set from the trained config (RoPE scaling, widened window), which win too.
     for key, value in written.items():
-        if key in _EXPORT_MANAGED_CONFIG_KEYS:
+        if key in _EXPORT_MANAGED_CONFIG_KEYS or key in carried:
             target[key] = value
+            # A checkpoint spelling RoPE the other way would otherwise reload with its stale copy.
+            if key in carried and key in ("rope_parameters", "rope_scaling"):
+                other = "rope_scaling" if key == "rope_parameters" else "rope_parameters"
+                if other in target: target[other] = value
         elif isinstance(value, dict) and isinstance(target.get(key), dict):
-            _overlay_export_managed_keys(target[key], value)
+            _overlay_export_managed_keys(target[key], value, carried)
         elif key in target and target[key] == value:
             # The saved type: transformers 5.20 rejects Ling-3.0-tiny's own `"kda_lower_bound": -5` (int).
             target[key] = value
@@ -4093,7 +4098,7 @@ def _overlay_export_managed_keys(target, written):
 pass
 
 
-def _restore_checkpoint_config_keys(config_path, source, config_class):
+def _restore_checkpoint_config_keys(config_path, source, config_class, carried = ()):
     """A built-in class saved a repo-code (auto_map) checkpoint's keys under its own names (bailing_hybrid:
     `norm_topk_prob` -> `moe_renormalize`, `head_dim` 128 -> 64), but the weights keep the checkpoint's layout
     and llama.cpp / its code read its keys (#14916): write its config.json back. True if rewritten."""
@@ -4106,7 +4111,14 @@ def _restore_checkpoint_config_keys(config_path, source, config_class):
     aliases = getattr(config_class, "attribute_map", None) or {}
     # Only when the save lost a checkpoint key to an alias: every other built-in export stays as it was.
     if not any(alias in source and alias not in written for alias in aliases): return False
-    _overlay_export_managed_keys(source, written)
+    # A carried field the class saves under its own name (bailing_hybrid: max_position_embeddings is model_max_length)
+    # goes back under the checkpoint's spelling, else the restore reverts it to the checkpoint's value.
+    for key in carried:
+        real = aliases.get(key, key)
+        if real == key or real not in written: continue
+        spellings = [name for name in (key, real) if name in source] or [key]
+        for name in spellings: source[name] = written[real]
+    _overlay_export_managed_keys(source, written, carried)
     config_path.write_text(json.dumps(source, indent = 2), encoding = "utf-8")
     return True
 pass
@@ -4208,6 +4220,65 @@ def _carry_over_vocab_size(base_config, trained_config):
             f"the embedding rows written."
         )
     pass
+pass
+
+
+def _rotary_ignored_rope_scaling(model, rope):
+    """Whether the model's rotary trained without the config's RoPE scaling, so exporting it would change the model.
+    Older Unsloth Gemma / Gemma 2 rotaries read only rope_theta (one that applied linear records scaling_factor), and
+    Unsloth's Llama rotary falls back to unscaled frequencies when transformers cannot build the scaled ones
+    (transformers 4.57 YaRN on a config whose head_dim is None, as Mistral's)."""
+    rope = rope if isinstance(rope, dict) else {}
+    rope_type = rope.get("rope_type") or rope.get("type")
+    for module in model.modules():
+        name = type(module).__name__
+        if name == "GemmaFixedRotaryEmbedding" and getattr(module, "scaling_factor", 1.0) == 1.0: return True
+        # dynamic leaves the frequencies unchanged at build time, so only static schemes can be judged here.
+        if name != "LlamaRotaryEmbedding" or rope_type not in ("linear", "yarn", "llama3"): continue
+        inv_freq = getattr(module, "_unsloth_inv_freq_cpu", None)
+        dim, base = getattr(module, "dim", None), getattr(module, "base", None)
+        if not isinstance(inv_freq, torch.Tensor) or not dim or not base: continue
+        # YaRN can leave every frequency unchanged and scale only cos / sin, which the fallback never does.
+        if getattr(module, "attention_scaling", 1.0) != 1.0: continue
+        try:
+            # The exact expression of the unscaled fallback.
+            unscaled = 1.0 / (base ** (torch.arange(0, dim, 2, dtype = torch.int64, device = "cpu").float() / dim))
+            if inv_freq.shape == unscaled.shape and torch.equal(inv_freq.detach().float().cpu(), unscaled): return True
+        except Exception:
+            continue
+    return False
+pass
+
+
+def _rope_config_holder(config):
+    # Nested first, as the vocab carry-over: a repo-code composite whose get_text_config() returns itself keeps the
+    # language model's RoPE and window in llm_config / language_config, which is what its reload reads.
+    holders = _text_configs(config)
+    nested = [holder for holder in holders if holder is not config]
+    return nested[0] if nested else config
+pass
+
+
+def _carry_over_rope_scaling(base_config, trained_config, model):
+    # The loader puts RoPE scaling (the caller's rope_scaling, or linear past the native window) and the widened
+    # max_position_embeddings on the in-memory config only, so the base checkpoint's would reload the merged
+    # weights with a RoPE they were not trained with. A field moves whole, and only when it differs.
+    from copy import deepcopy
+    source, target = _rope_config_holder(trained_config), _rope_config_holder(base_config)
+    # transformers 5 keeps RoPE in rope_parameters (rope_scaling aliases it); 4.x in rope_scaling.
+    keys = ["rope_parameters" if getattr(target, "rope_parameters", None) is not None else "rope_scaling"]
+    # The weights trained with the RoPE the rotary applied, which is not always what the config says.
+    if _rotary_ignored_rope_scaling(model, getattr(source, keys[0], None)): keys = []
+    carried = []
+    for key in keys + ["max_position_embeddings"]:
+        trained = getattr(source, key, None)
+        if trained is None or trained == getattr(target, key, None): continue
+        try:
+            setattr(target, key, deepcopy(trained))
+            carried.append(key)
+        except Exception: pass  # read-only on some composite configs
+    pass
+    return carried
 pass
 
 
@@ -5776,8 +5847,10 @@ def merge_and_overwrite_lora(
                 f"describe the exported weights (see #969)."
             )
             base_config = config
+            carried_rope_keys = ()
         else:
             _carry_over_vocab_size(base_config, config)
+            carried_rope_keys = _carry_over_rope_scaling(base_config, config, model)
         # Read before saving: an in-place export overwrites the source config.json.
         source_model_type = source_config = None
         if _is_remote_code_config(base_config):
@@ -5790,7 +5863,9 @@ def merge_and_overwrite_lora(
             _restore_source_model_type(Path(save_directory) / "config.json", source_model_type)
             _copy_export_remote_code(model_name, save_directory, token, model)
         else:
-            _restore_checkpoint_config_keys(Path(save_directory) / "config.json", source_config, type(base_config))
+            _restore_checkpoint_config_keys(
+                Path(save_directory) / "config.json", source_config, type(base_config), carried = carried_rope_keys,
+            )
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
         if upcast_to_float32:

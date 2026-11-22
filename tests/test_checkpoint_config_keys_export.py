@@ -99,6 +99,20 @@ def test_ling_export_gets_the_checkpoint_keys_back(tmp_path):
     assert isinstance(out["kda_lower_bound"], float)
 
 
+def test_carried_window_under_an_alias_goes_back_under_the_checkpoint_spelling(tmp_path):
+    """The export widened the window to what training used; BailingHybrid saves it as model_max_length, and the
+    checkpoint spells it max_position_embeddings, so the restore must not put the checkpoint's 131072 back."""
+    path = _write(tmp_path, {**_LING_NATIVE_SAVE, "model_max_length": 524288})
+    assert _restore_checkpoint_config_keys(
+        path, json.loads(json.dumps(_LING_SOURCE)), _BailingHybridLikeConfig, carried = ("max_position_embeddings",))
+    out = json.loads(path.read_text(encoding = "utf-8"))
+    assert out["max_position_embeddings"] == 524288 and "model_max_length" not in out
+    # Not carried: the checkpoint's own window, as before.
+    path = _write(tmp_path, {**_LING_NATIVE_SAVE, "model_max_length": 524288})
+    assert _restore_checkpoint_config_keys(path, json.loads(json.dumps(_LING_SOURCE)), _BailingHybridLikeConfig)
+    assert json.loads(path.read_text(encoding = "utf-8"))["max_position_embeddings"] == 131072
+
+
 def test_nested_managed_keys_come_from_the_export(tmp_path):
     source = {"auto_map": {}, "norm_topk_prob": True, "text_config": {"vocab_size": 10, "head_dim": 128}}
     written = {"auto_map": {}, "moe_renormalize": True, "text_config": {"vocab_size": 12, "head_dim": 64}}
