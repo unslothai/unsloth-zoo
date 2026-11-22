@@ -82,8 +82,7 @@ dependencies = [
     "typing_extensions",
     "filelock",
     # Imported at module level by llama_cpp, rl_environments and vision_utils. It used to arrive
-    # through datasets, which dropped it in 5.x. 2.32.4 fixes CVE-2024-47081 (a crafted media URL
-    # sent ~/.netrc credentials to another host).
+    # through datasets, which dropped it in 5.x. 2.32.4 fixes the .netrc leak CVE-2024-47081.
     "requests>=2.32.4",
     # requests and huggingface_hub verify TLS against certifi; 2026.10.19 drops the compromised
     # eMudhra/emSign root, and an older bundle already installed would otherwise be kept.
@@ -137,8 +136,7 @@ core = [
     "typing_extensions",
     "filelock",
     # Imported at module level by llama_cpp, rl_environments and vision_utils. It used to arrive
-    # through datasets, which dropped it in 5.x. 2.32.4 fixes CVE-2024-47081 (a crafted media URL
-    # sent ~/.netrc credentials to another host).
+    # through datasets, which dropped it in 5.x. 2.32.4 fixes the .netrc leak CVE-2024-47081.
     "requests>=2.32.4",
     # requests and huggingface_hub verify TLS against certifi; 2026.10.19 drops the compromised
     # eMudhra/emSign root, and an older bundle already installed would otherwise be kept.

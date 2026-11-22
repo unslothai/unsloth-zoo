@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""requests < 2.32.4 can send ~/.netrc credentials to another host for a crafted URL (CVE-2024-47081), and media
-fetches take URLs from datasets: every dependency list that pulls requests must floor it."""
+"""Every dependency list must floor requests at 2.32.4 (CVE-2024-47081 .netrc leak)."""
 import pytest
 
 try:
