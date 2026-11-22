@@ -80,26 +80,55 @@ def cpu_bf16_supported():
     return False
 
 
+# Runs in a child interpreter: a bf16 matmul on a CPU whose torch build picks an instruction the CPU lacks dies with
+# an illegal instruction (Windows 0xc000001d, exit 132), which would otherwise kill the user's process.
+_BF16_PROBE_CODE = """
+import time
+import torch
+a = torch.randn(512, 512)
+b = torch.randn(512, 512)
+
+def best(dtype):
+    times = []
+    for _ in range(3):
+        start = time.perf_counter()
+        with torch.autocast("cpu", dtype = dtype, enabled = dtype is not None):
+            a @ b
+        times.append(time.perf_counter() - start)
+    return min(times[1:])
+
+print("UNSLOTH_BF16_FAST=" + str(int(best(torch.bfloat16) < 1.5 * best(None))))
+"""
+_BF16_PROBE_TIMEOUT = 180
+
+
 def _bf16_autocast_is_fast():
     """Probes bf16 autocast matmul vs fp32: native bf16 (AVX512-BF16, AMX, Arm BF16 via oneDNN or ACL) runs 2-3x faster,
-    the reference fallback 30-200x slower; a 1.5x threshold separates them."""
+    the reference fallback 30-200x slower; a 1.5x threshold separates them. Only reached where /proc/cpuinfo is
+    unreadable (Windows, macOS). The probe runs in a short child process (once: cpu_bf16_supported is cached), so a
+    crash, a timeout or any failure means bf16 is not fast and training stays fp32."""
+    import subprocess
+    import sys
+    import tempfile
+    command = [sys.executable]
+    if sys.version_info >= (3, 11):
+        command.append("-P")  # do not put the working directory on sys.path
+    command += ["-c", _BF16_PROBE_CODE]
+    env = dict(os.environ)
+    for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        env.setdefault(name, "1")  # one thread is enough to tell 2x faster from 30x slower
     try:
-        import time
-        import torch
-        a = torch.randn(512, 512)
-        b = torch.randn(512, 512)
-
-        def best(dtype):
-            times = []
-            for _ in range(3):
-                start = time.perf_counter()
-                with torch.autocast("cpu", dtype = dtype, enabled = dtype is not None):
-                    a @ b
-                times.append(time.perf_counter() - start)
-            return min(times[1:])
-        return best(torch.bfloat16) < 1.5 * best(None)
+        done = subprocess.run(
+            command, capture_output = True, text = True, timeout = _BF16_PROBE_TIMEOUT, env = env,
+            cwd = tempfile.gettempdir(), creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
     except Exception:
         return False
+    if done.returncode != 0:
+        if done.returncode in (132, -4, 0xC000001D, -1073741795):
+            warnings.warn("Unsloth: the bfloat16 matmul probe crashed with an illegal instruction; training in float32.")
+        return False
+    return "UNSLOTH_BF16_FAST=1" in (done.stdout or "").splitlines()
 
 
 @functools.cache
