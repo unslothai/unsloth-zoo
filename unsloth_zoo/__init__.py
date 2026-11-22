@@ -103,9 +103,8 @@ def has_429_exact_full_read(log_dir: str | Path) -> bool:
     log_dir = Path(log_dir).expanduser()
     if not log_dir.is_dir():
         return False
-    # Streamed: a single hf_xet log can reach hundreds of MB and this runs on every import. Files whose inode, size and
-    # mtime match the last scan reuse its answer (logs are append-only, so any write changes size or mtime); a missing,
-    # unreadable or unwritable manifest just means a full scan, as before.
+    # hf_xet logs reach hundreds of MB, scanned per import; append-only, so unchanged inode, size
+    # and mtime reuse the answer; missing, unreadable or unwritable manifest forces a full scan.
     marker = b"429 Too Many Requests"
     keep = len(marker) - 1
     manifest_path = log_dir / ".unsloth_429_scan.json"

@@ -13,12 +13,10 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Inkling 2 (inkling2 / inkling2_loop, transformers >= 5.24) MoE experts.
-
-Their activation is a softcapped SwiGLU, `tanh(g / c_g) * c_g * sigmoid(g) * tanh(u / c_u) * c_u`, taking gate AND up
-(`act_fn(gate, up)`), with the routed outputs accumulated in fp32. The generic MoE backends call `act_fn(gate) * up`
-unless the experts declare their own `_apply_gate`, so declare it, and the fp32 reference, on both expert classes.
-"""
+"""Inkling 2 (inkling2 / inkling2_loop, transformers >= 5.24) MoE experts: softcapped SwiGLU over
+gate and up, tanh(g / c_g) * c_g * sigmoid(g) * tanh(u / c_u) * c_u, with fp32 routed outputs;
+both expert classes and fp32 reference must declare _apply_gate, else generic backends use
+act_fn(gate) * up."""
 
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING
 from .utils import logger

@@ -231,10 +231,8 @@ def _flat_tensors(obj, out):
 
 
 def _outputs_mismatch(a, b, inverse):
-    """None if ``a`` has the layout of full encode ``b``, else the reason.
-
-    Structural, not tight: compiled towers vary ~12% with batch size, distinct images ~50%.
-    """
+    """None if ``a`` has the layout of full encode ``b``, else the reason; the check is structural,
+    not tight (compiled towers vary ~12% with batch size, distinct images ~50%)."""
     ta, tb = _flat_tensors(a, []), _flat_tensors(b, [])
     if len(ta) != len(tb):
         return f"{len(ta)} tensors vs {len(tb)}"
@@ -279,9 +277,8 @@ except Exception:
 
 
 def _sharded_parameters(module):
-    # FSDP2 (DTensor) or ZeRO-3 (ds_id) parameters all-gather on every forward. Sharding happens inside
-    # train(), after install, and can cover only a child (the tower) while earlier parameters stay plain,
-    # so only a sharded answer is cached (sharding is never undone); an unsharded one is re-read per call.
+    # FSDP2 (DTensor) or ZeRO-3 (ds_id) params all-gather each forward; sharding can start after
+    # install and cover only a child, so only a sharded answer, which never reverts, is cached.
     if module.__dict__.get("_unsloth_image_dedup_sharded", False):
         return True
     value = any(

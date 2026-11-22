@@ -106,10 +106,9 @@ _WARNED_KEEP_LOW_MEMORY = False
 # smaller than host RAM there (a GTT limit, a partial carve-out), so a run that only fits with offload keeps fitting.
 KEEP_ON_DEVICE_HEADROOM_MIN  = 2 * 1024 * 1024 * 1024
 KEEP_ON_DEVICE_HEADROOM_FRAC = 0.05
-# device_index -> [free bytes at the last read, torch allocated bytes at that read, headroom, calls since the read].
-# Free memory is projected as the last read minus everything torch allocated since (activations, optimizer state
-# created after step 1, ...), read from the allocator's host-side counter. mem_get_info (no sync) is re-read when
-# the projection nears the headroom and every _KEEP_BUDGET_REFRESH calls, so memory taken outside torch is seen too.
+# _KEEP_BUDGET maps device_index to [free bytes at last read, torch allocated then, headroom, calls
+# since]; free is projected as last read minus later torch allocations, and mem_get_info (no sync)
+# is re-read near headroom or every _KEEP_BUDGET_REFRESH calls so outside allocations are seen.
 _KEEP_BUDGET = {}
 _KEEP_BUDGET_REFRESH = 256
 
