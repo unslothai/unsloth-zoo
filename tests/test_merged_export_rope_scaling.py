@@ -31,7 +31,21 @@ import _merge_e2e_helpers as H
 NATIVE, WIDE = H._POS, 4 * H._POS
 
 
-def _export(tmp_path, family, rope=None, wide=WIDE, in_memory_rope=None, rotary=None):
+def _set_base_rope(base_dir, native):
+    """Give the saved base checkpoint a native RoPE scheme, under the key this transformers writes."""
+    path = os.path.join(base_dir, "config.json")
+    with open(path) as f:
+        config = json.load(f)
+    if "rope_parameters" in config:  # transformers 5 keeps rope_theta inside
+        config["rope_parameters"] = {**native, "rope_theta": config["rope_parameters"].get("rope_theta", 10000.0)}
+    else:
+        config["rope_scaling"] = dict(native)
+    with open(path, "w") as f:
+        json.dump(config, f)
+
+
+def _export(tmp_path, family, rope=None, wide=WIDE, in_memory_rope=None, rotary=None, base_rope=None,
+            rotary_from_trained=False):
     """Load like Unsloth's loader (scaling and window on the in-memory config), merge, and reload the export."""
     import transformers as T
     from peft import LoraConfig, get_peft_model
@@ -39,13 +53,16 @@ def _export(tmp_path, family, rope=None, wide=WIDE, in_memory_rope=None, rotary=
     H.set_offline_cpu_env()
     base_dir, out_dir = str(tmp_path / "base"), str(tmp_path / "out")
     H.build_and_save_base(H.make_spec(family), base_dir)
+    if base_rope is not None:
+        _set_base_rope(base_dir, base_rope)
     kwargs = {"rope_scaling": rope} if rope else {}
     model = T.AutoModelForCausalLM.from_pretrained(
         base_dir, max_position_embeddings=wide, dtype=torch.float32, **kwargs)
-    if in_memory_rope is not None:
+    # transformers 4.x reads rope_scaling only, which already holds the loader's dict from the kwarg.
+    if in_memory_rope is not None and getattr(model.config, "rope_parameters", None) is not None:
         model.config.rope_parameters = in_memory_rope
     if rotary is not None:
-        model.model.rotary_emb = rotary(T.AutoConfig.from_pretrained(base_dir))
+        model.model.rotary_emb = rotary(model.config if rotary_from_trained else T.AutoConfig.from_pretrained(base_dir))
     pm = get_peft_model(model, LoraConfig(r=8, lora_alpha=16, target_modules=["q_proj", "k_proj", "v_proj"]))
     H.seed_lora(pm)
     pm.eval()
@@ -66,6 +83,11 @@ def _rope(config):
     return config.get("rope_parameters") or config.get("rope_scaling") or {}
 
 
+def _theta(config):
+    # transformers 5 keeps rope_theta in rope_parameters, 4.x at the top level (the loader also puts it in rope_scaling).
+    return _rope(config).get("rope_theta", config.get("rope_theta"))
+
+
 # As the loader builds them: rope_theta inside, since on transformers 5 rope_scaling replaces all of rope_parameters.
 LINEAR = {"rope_type": "linear", "factor": 4.0, "rope_theta": 10000.0}
 YARN = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": NATIVE, "rope_theta": 10000.0}
@@ -80,7 +102,7 @@ def test_merged_export_keeps_trained_rope_scaling(tmp_path, rope, in_memory_rope
     saved, base, diff = _export(tmp_path, "llama", rope, in_memory_rope=in_memory_rope)
     got = _rope(saved)
     assert (got.get("rope_type") or got.get("type")) == rope["rope_type"] and got.get("factor") == 4.0, got
-    assert got.get("rope_theta") == _rope(base).get("rope_theta")
+    assert _theta(saved) == _theta(base) is not None
     assert saved["max_position_embeddings"] == WIDE
     assert diff < 1e-4, f"export reloads with different logits than the trained model: {diff:.3e}"
 
@@ -128,7 +150,10 @@ def test_rope_a_fixed_gemma_rotary_applied_is_exported(tmp_path):
 
         def __init__(self, config):
             config = deepcopy(config)
-            config.rope_parameters, config.max_position_embeddings = dict(LINEAR), WIDE
+            # transformers 5 reads rope_parameters, 4.x rope_scaling.
+            field = "rope_parameters" if getattr(config, "rope_parameters", None) is not None else "rope_scaling"
+            setattr(config, field, dict(LINEAR))
+            config.max_position_embeddings = WIDE
             super().__init__(config)
             self.scaling_factor = LINEAR["factor"]
 
@@ -136,3 +161,101 @@ def test_rope_a_fixed_gemma_rotary_applied_is_exported(tmp_path):
     got = _rope(saved)
     assert (got.get("rope_type") or got.get("type")) == "linear" and got.get("factor") == 4.0, got
     assert diff < 1e-4, f"export reloads with different logits than the trained model: {diff:.3e}"
+
+
+def test_native_llama3_past_the_window_keeps_its_rope_and_the_window(tmp_path):
+    """The loader keeps a native llama3 scheme and only widens max_position_embeddings past the window."""
+    llama3 = {"rope_type": "llama3", "factor": 4.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0,
+              "original_max_position_embeddings": NATIVE // 4}
+    saved, base, diff = _export(tmp_path, "llama", base_rope=llama3)
+    assert _rope(saved) == _rope(base) and _rope(saved)["rope_type"] == "llama3", _rope(saved)
+    assert saved["max_position_embeddings"] == WIDE
+    assert diff < 1e-4, diff
+
+
+@pytest.mark.parametrize("native", [
+    {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": NATIVE // 4},
+    {"rope_type": "dynamic", "factor": 2.0},
+], ids=["yarn", "dynamic"])
+def test_native_rope_below_the_window_is_untouched(tmp_path, native):
+    saved, base, diff = _export(tmp_path, "llama", wide=NATIVE, base_rope=native)
+    assert _rope(saved) == _rope(base) and (_rope(saved).get("rope_type") or _rope(saved).get("type")) == native["rope_type"]
+    assert saved["max_position_embeddings"] == NATIVE
+    assert diff < 1e-4, diff
+
+
+def _unsloth_llama_rotary(applied):
+    """Stand-in for unsloth/models/llama.py's LlamaRotaryEmbedding, which keeps its frequencies as
+    _unsloth_inv_freq_cpu; when transformers cannot build the scaled ones it falls back to unscaled RoPE."""
+    from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding as HFLlamaRotaryEmbedding
+
+    class LlamaRotaryEmbedding(HFLlamaRotaryEmbedding):
+        def __init__(self, config):
+            # Built from the trained config when it applied the scaling, else from the unscaled base config.
+            super().__init__(config)
+            self.dim, self.base = H._H // H._HEADS, 10000.0
+            self._unsloth_inv_freq_cpu = self.inv_freq.detach().clone()
+            if not applied:
+                # The fallback's own expression, as unsloth/models/llama.py computes it.
+                self._unsloth_inv_freq_cpu = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
+
+    return LlamaRotaryEmbedding
+
+
+@pytest.mark.parametrize("applied", [False, True], ids=["fell_back_unscaled", "applied"])
+def test_rope_a_llama_rotary_could_not_apply_is_not_exported(tmp_path, applied):
+    """transformers 4.57 cannot build YaRN for a config whose head_dim is None (Mistral), and Unsloth's rotary then
+    trains unscaled: exporting the config's YaRN would reload a different model."""
+    saved, base, diff = _export(tmp_path, "llama", YARN, rotary=_unsloth_llama_rotary(applied), rotary_from_trained=applied)
+    got = _rope(saved)
+    if applied:
+        assert got.get("rope_type") == "yarn" and got.get("factor") == 4.0, got
+    else:
+        assert _rope(saved) == _rope(base), got
+    assert saved["max_position_embeddings"] == WIDE
+    assert diff < 1e-4, f"export reloads with different logits than the trained model: {diff:.3e}"
+
+
+def test_checkpoint_key_restore_keeps_the_carried_rope(tmp_path):
+    """A repo-code checkpoint whose keys the built-in class renamed is written back from its own config.json; the RoPE
+    and window the export carried over from training must survive that, and nothing else changes."""
+    from unsloth_zoo.saving_utils import _restore_checkpoint_config_keys
+
+    class AliasConfig:
+        attribute_map = {"norm_topk_prob": "moe_renormalize"}
+
+    source = {"auto_map": {}, "norm_topk_prob": True, "max_position_embeddings": NATIVE, "rope_scaling": None}
+    written = {"auto_map": {}, "moe_renormalize": True, "max_position_embeddings": WIDE,
+               "rope_scaling": {"type": "linear", "factor": 4.0}}
+    for carried, want in [((), source), (("rope_scaling", "max_position_embeddings"), None)]:
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps(written))
+        assert _restore_checkpoint_config_keys(path, json.loads(json.dumps(source)), AliasConfig, carried=carried)
+        got = json.loads(path.read_text())
+        if want is not None:
+            assert got == want
+        else:
+            assert got == {**source, "max_position_embeddings": WIDE, "rope_scaling": written["rope_scaling"]}, got
+
+
+@pytest.mark.parametrize("attention_scaling,exported", [(1.0, False), (1.1386, True)], ids=["fallback", "yarn_mscale_only"])
+def test_yarn_that_only_scales_attention_still_counts_as_applied(attention_scaling, exported):
+    """With a long original window every frequency can stay unscaled under YaRN and only cos / sin scale (mscale), as
+    on Qwen2 (theta 1e6, original 32768): that is applied scaling, unlike the fallback, which leaves both at 1."""
+    from unsloth_zoo.saving_utils import _carry_over_rope_scaling
+
+    class LlamaRotaryEmbedding(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dim, self.base, self.attention_scaling = 8, 1e6, attention_scaling
+            self._unsloth_inv_freq_cpu = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float() / self.dim))
+
+    yarn = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768, "rope_theta": 1e6}
+    default = {"rope_type": "default", "rope_theta": 1e6}
+    trained = NS(rope_parameters=yarn, max_position_embeddings=4 * 32768)
+    base = NS(rope_parameters=dict(default), max_position_embeddings=32768)
+    model = torch.nn.Module()
+    model.rotary_emb = LlamaRotaryEmbedding()
+    _carry_over_rope_scaling(base, trained, model)
+    assert base.rope_parameters == (yarn if exported else default)
+    assert base.max_position_embeddings == 4 * 32768
