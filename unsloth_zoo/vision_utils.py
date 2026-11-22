@@ -589,7 +589,12 @@ def smart_resize(
 
 def _refuse_network_share_image(path):
     # Same rule as fetch_video: on Windows even os.path.isfile on a UNC path opens an SMB connection.
-    if isinstance(path, str) and _is_network_share(path) and not _allow_private_url_fetch():
+    # PIL also opens bytes / PathLike paths (a dict row's binary "path" column), so check their decoded form too.
+    try:
+        name = os.fsdecode(path) if isinstance(path, (bytes, os.PathLike)) else path
+    except Exception:
+        name = path
+    if isinstance(name, str) and _is_network_share(name) and not _allow_private_url_fetch():
         raise ValueError(
             f"Unsloth: Refusing an image path on a network share: `{path}`. "
             f"Set {UNSLOTH_ALLOW_PRIVATE_URL_FETCH_VAR}=1 to load images from shares you trust."
