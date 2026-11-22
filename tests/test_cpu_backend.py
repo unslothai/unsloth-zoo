@@ -893,6 +893,7 @@ def test_cpu_4bit_keeps_the_gpu_skip_modules_in_16bit(monkeypatch):
         raise Stop
     monkeypatch.setattr(loader, "_adapter_base_model", lambda *a, **k: None)
     monkeypatch.setattr(loader, "cpu_bnb_4bit_supported", lambda: True)
+    monkeypatch.setattr(loader, "available_ram", lambda: 0)  # 16-bit never fits: the 4-bit config is under test
     monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", fake_load)
     monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: _StubTokenizer(64))
     with pytest.raises(Stop):
@@ -1353,8 +1354,11 @@ def test_store_frozen_linears_in_bf16_keeps_head_and_norms_fp32_and_merges_unrou
 
 
 @pytest.mark.parametrize("env, ckpt_dtype, expected", [("1", torch.bfloat16, torch.bfloat16), ("1", torch.float32, torch.float32),
-                                                       ("0", torch.bfloat16, torch.float32)])
-def test_frozen_bf16_storage_is_opt_in_and_only_for_bf16_checkpoints(monkeypatch, env, ckpt_dtype, expected):
+                                                       ("0", torch.bfloat16, torch.float32),
+                                                       # Unset on a CPU without native bf16 (fp32 training): on.
+                                                       ("", torch.bfloat16, torch.bfloat16),
+                                                       ("", torch.float32, torch.float32)])
+def test_frozen_bf16_storage_defaults_on_without_native_bf16_only_for_bf16_checkpoints(monkeypatch, env, ckpt_dtype, expected):
     import transformers
     from unsloth_zoo.cpu import loader
     seen = {}

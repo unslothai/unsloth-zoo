@@ -399,6 +399,14 @@
       "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
     },
     {
+      "file": "unsloth_zoo/temporary_patches/inkling2.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "59e72c01edb14c86",
+      "count": 1,
+      "reason": "The Inkling 2 transformers expert modules, from the fixed INKLING2_EXPERT_CLASSES tuple of two literal names (transformers.models.inkling2.modeling_inkling2, transformers.models.inkling2_loop.modeling_inkling2_loop), not external input."
+    },
+    {
       "file": "unsloth_zoo/temporary_patches/misc.py",
       "rule": "dynamic-import",
       "sink": "import_module",

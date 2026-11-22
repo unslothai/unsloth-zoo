@@ -16,16 +16,21 @@
 
 __all__ = ["FastCPUModel"]
 
+import contextlib
 import functools
 import os
 import re
 import types
 import warnings
+import weakref
 
 import torch
 
-from .runtime import cpu_bf16_supported, cpu_bnb_4bit_supported
-from .ops import Bf16StoredLinear, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, store_frozen_linears_in_bf16
+from .runtime import available_ram, cpu_bf16_supported, cpu_bnb_4bit_supported
+from .ops import (
+    Bf16StoredLinear, _plain_lm_head, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, set_bf16_stored_dtype,
+    store_frozen_linears_in_bf16,
+)
 
 _DEFAULT_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 # unsloth/Qwen3-0.6B-unsloth-bnb-4bit -> unsloth/Qwen3-0.6B
@@ -75,6 +80,44 @@ _DTYPE_KWARG = _dtype_kwarg()
 
 def _print(message):
     print(f"Unsloth (CPU): {message}")
+
+
+def _dense_parameter_count(config):
+    """Parameters of a dense decoder from its config (embeddings, attention, gated MLP), None when unknown or MoE."""
+    text = getattr(config, "get_text_config", lambda: config)()
+    get = lambda name: getattr(text, name, None)  # noqa: E731
+    if any(get(name) for name in ("num_experts", "num_local_experts", "n_routed_experts", "moe_intermediate_size")):
+        return None
+    hidden, layers, vocab = get("hidden_size"), get("num_hidden_layers"), get("vocab_size")
+    if not (isinstance(hidden, int) and isinstance(layers, int) and isinstance(vocab, int)):
+        return None
+    heads = get("num_attention_heads") or 1
+    head_dim = get("head_dim") or hidden // heads
+    kv = (get("num_key_value_heads") or heads) * head_dim
+    intermediate = get("intermediate_size") or 4 * hidden
+    per_layer = hidden * heads * head_dim * 2 + 2 * hidden * kv + 3 * hidden * intermediate
+    embeddings = vocab * hidden * (1 if getattr(config, "tie_word_embeddings", True) else 2)
+    return embeddings + layers * per_layer
+
+
+def _prefer_16bit_weights(model_name, dtype, token, revision, trust_remote_code, **kwargs):
+    """4-bit on CPU dequantizes every weight in forward, backward and the checkpointed recompute (~12% more CPU time
+    per step on SmolLM2-135M, no lower peak RSS at that size). When the 16-bit weights take at most a quarter of the
+    free RAM, train on them instead. UNSLOTH_CPU_LOAD_IN_4BIT=1 keeps 4-bit. Returns the 16-bit size or None."""
+    if os.environ.get("UNSLOTH_CPU_LOAD_IN_4BIT", "").strip().lower() in ("1", "true", "yes", "on"):
+        return None
+    try:
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_name, token = token, revision = revision,
+                                            trust_remote_code = trust_remote_code, **kwargs)
+    except Exception:
+        return None
+    count = _dense_parameter_count(config)
+    available = available_ram()
+    if count is None or available is None:
+        return None
+    size = count * torch.empty((), dtype = dtype).element_size()
+    return size if size * 4 <= available else None
 
 
 def _checkpoint_dtype(model_name, **kwargs):
@@ -271,7 +314,202 @@ def _compile_layers(model):
     dynamic = os.environ.get("UNSLOTH_CPU_COMPILE_DYNAMIC", "1") == "1"
     for layer in layers:
         layer.compile(dynamic = dynamic)
+    _fall_back_to_eager_on_compile_error(layers)
     return len(layers)
+
+
+def _is_control_flow(error):
+    """Exceptions torch raises on purpose through a layer call: non-reentrant checkpointing stops a recomputation
+    early with _StopRecomputationError once it has every saved tensor."""
+    import torch.utils.checkpoint as checkpoint
+    stop = getattr(checkpoint, "_StopRecomputationError", None)
+    return stop is not None and isinstance(error, stop)
+
+
+def _first_error_line(error, limit):
+    """Dynamo's BackendCompilerFailed reads "backend='inductor' raised:" on its first line; the cause is the next one."""
+    lines = [line.strip() for line in str(error).strip().splitlines() if line.strip()]
+    if len(lines) > 1 and lines[0].endswith(":"):
+        return f"{lines[0]} {lines[1]}"[:limit]
+    return lines[0][:limit] if lines else ""
+
+
+@contextlib.contextmanager
+def _backward_lowered_in_forward():
+    """AOTAutograd lowers the backward graph lazily, at the first backward, when the forward saves no symbolic sizes,
+    and re-defers it after a failed eager attempt otherwise; a backward that cannot build would then raise from
+    loss.backward(), out of reach of the fallback. Forcing the lowering into the forward call puts it inside it.
+    Entered only with grad enabled (no backward graph otherwise), so generate() and eval skip it."""
+    config = getattr(getattr(torch, "_functorch", None), "config", None)
+    if config is None or not hasattr(config, "force_non_lazy_backward_lowering"):
+        yield  # older torch: a backward lowering error still surfaces in backward
+        return
+    previous = config.force_non_lazy_backward_lowering
+    config.force_non_lazy_backward_lowering = True
+    try:
+        yield
+    finally:
+        config.force_non_lazy_backward_lowering = previous
+
+
+def _in_backward():
+    """True inside autograd's backward pass, where checkpointing recomputes a layer's forward."""
+    current = getattr(torch._C, "_current_graph_task_id", None)
+    try:
+        return current is not None and current() != -1
+    except Exception:
+        return False
+
+
+_CACHE_KWARGS = ("past_key_values", "past_key_value", "layer_past", "cache_params", "past_key_values_cache")
+
+
+def _carries_cache(args, kwargs):
+    """A decoder layer call that would write into a KV / state cache."""
+    if any(kwargs.get(name) is not None for name in _CACHE_KWARGS):
+        return True
+    try:
+        from transformers.cache_utils import Cache
+    except Exception:
+        return False
+    return any(isinstance(value, Cache) for value in (*args, *kwargs.values()))
+
+
+class _RestartEagerly(Exception):
+    """Raised out of a layer's failed compiled call so its __call__ reruns the whole call, checkpoint included."""
+
+
+_RESTARTABLE_CLASSES = {}
+
+
+def _restartable(layer):
+    """Gives ``layer`` a __call__ that reruns itself once on _RestartEagerly. transformers' GradientCheckpointingLayer
+    opens the checkpoint in __call__, so the rerun gets a fresh checkpoint instead of one still holding what a
+    partly compiled forward (a graph break, then a segment that fails to compile) saved before the failure."""
+    cls = type(layer)
+    if getattr(cls, "_unsloth_restartable", False):
+        return
+    sub = _RESTARTABLE_CLASSES.get(cls)
+    if sub is None:
+        def __call__(self, *args, **kwargs):
+            self.__dict__["_unsloth_restart_depth"] = self.__dict__.get("_unsloth_restart_depth", 0) + 1
+            try:
+                return cls.__call__(self, *args, **kwargs)
+            except _RestartEagerly:
+                return cls.__call__(self, *args, **kwargs)
+            finally:
+                self.__dict__["_unsloth_restart_depth"] -= 1
+        sub = type(cls.__name__, (cls,), {
+            "__call__": __call__, "_unsloth_restartable": True,
+            "__module__": cls.__module__, "__qualname__": cls.__qualname__,
+        })
+        _RESTARTABLE_CLASSES[cls] = sub
+    layer.__class__ = sub
+
+
+def _fall_back_to_eager_on_compile_error(layers):
+    """The toolchain probe compiles one small kernel; a decoder layer can still fail to trace or build (an op or a
+    patched module Dynamo / Inductor cannot handle; Dynamo can raise plain AssertionErrors). The first failure of a
+    compiled call drops every layer back to eager and restarts that layer call eagerly (its checkpoint included, so
+    nothing a compiled segment saved before the failure stays behind), so a genuine model error still raises, now
+    from eager code. A layer whose compiled forward is still waiting for its checkpoint recomputation
+    (an earlier layer of the same step) replays it compiled once more: an eager recompute saves different tensors
+    and checkpointing raises CheckpointError. It goes eager after that."""
+    layers = list(layers)
+    state = {"eager": False}
+    # id(layer) -> one entry per compiled checkpointed forward whose backward has not recomputed it yet, keyed by
+    # its first tensor input: two checkpoints of one layer can be outstanding, and only the compiled one replays
+    # compiled (an eagerly retried one must recompute eagerly).
+    pending = {}
+
+    def first_tensor(args):
+        for value in args:
+            if isinstance(value, torch.Tensor):
+                return value
+        return None
+
+    def remember(key, args):
+        x = first_tensor(args)
+        entry = (None, None, None) if x is None else (weakref.ref(x), x.data_ptr(), tuple(x.shape))
+        entries = pending.setdefault(key, [])
+        entries.append(entry)
+        del entries[:-64]  # forwards never backpropagated (grad-enabled eval) must not pile up
+
+    def take(key, args):
+        entries = pending.get(key)
+        if not entries:
+            return False
+        x = first_tensor(args)
+        for index in range(len(entries) - 1, -1, -1):
+            ref, ptr, shape = entries[index]
+            alive = None if ref is None else ref()
+            if (
+                ref is None
+                or x is None
+                or alive is x
+                # reentrant checkpointing recomputes on detached copies: same storage and shape
+                or (alive is None and ptr == x.data_ptr() and shape == tuple(x.shape))
+            ):
+                del entries[index]
+                return True
+        return False
+
+    def drop(layer):
+        if not pending.get(id(layer)):
+            layer._compiled_call_impl = None
+
+    def disable(error):
+        if not state["eager"]:
+            state["eager"] = True
+            _print(f"torch.compile failed on a decoder layer ({type(error).__name__}: "
+                   f"{_first_error_line(error, 160)}), training eagerly.")
+        for layer in layers:
+            drop(layer)
+
+    def checkpointed(layer):
+        return torch.is_grad_enabled() and layer.training and getattr(layer, "gradient_checkpointing", True)
+
+    for layer in layers:
+        compiled = layer._compiled_call_impl
+        if compiled is None:
+            continue
+
+        def guarded(*args, _compiled = compiled, _layer = layer, **kwargs):
+            key = id(_layer)
+            backward = _in_backward()
+            if backward and take(key, args):
+                # Checkpoint recomputation of a compiled forward: replay it compiled, as the forward saved it.
+                if state["eager"]:
+                    drop(_layer)
+                return _compiled(*args, **kwargs)
+            if state["eager"] or _carries_cache(args, kwargs):
+                # A KV cache is mutated in place (update() appends): a compiled segment that ran before a later one
+                # failed could not be undone by a retry, so cached forwards (inference) always run eagerly.
+                return _layer._call_impl(*args, **kwargs)
+            try:
+                if not torch.is_grad_enabled():
+                    out = _compiled(*args, **kwargs)
+                else:
+                    with _backward_lowered_in_forward():
+                        out = _compiled(*args, **kwargs)
+            except Exception as error:
+                if _is_control_flow(error) or isinstance(error, _RestartEagerly):
+                    raise
+                disable(error)
+                if not backward and _layer.__dict__.get("_unsloth_restart_depth", 0) > 0:
+                    # A compiled segment before a graph break may already have saved tensors into this call's
+                    # checkpoint: start the call over (eager now) rather than rerun inside it.
+                    raise _RestartEagerly() from error
+                return _layer._call_impl(*args, **kwargs)
+            if not backward and checkpointed(_layer):
+                remember(key, args)
+            return out
+
+        layer._compiled_call_impl = guarded
+        try:
+            _restartable(layer)
+        except TypeError:
+            pass  # a class that cannot be subclassed / reassigned keeps the in-place eager rerun
 
 
 def _load_msvc_environment():
@@ -323,21 +561,68 @@ def _cpu_compile_unavailable():
         return ("no MSVC: install Visual Studio Build Tools with the C++ workload "
                 "(winget install Microsoft.VisualStudio.2022.BuildTools --override \"--add "
                 "Microsoft.VisualStudio.Workload.VCTools --includeRecommended\")")
+    if os.environ.get("TORCHDYNAMO_DISABLE", "").strip().lower() in ("1", "true"):
+        # Studio's Windows Triton gate sets it; torch.compile then runs eagerly and the probe below would still pass.
+        return "TORCHDYNAMO_DISABLE=1"
     try:
         import torch._dynamo
+        if getattr(torch._dynamo.config, "disable", False):
+            return "torch._dynamo.config.disable is set"
         x = torch.linspace(-4, 4, 64)  # not randn: the probe must not move the RNG that seeds LoRA init
         out = torch.compile(lambda t: torch.nn.functional.silu(t) * 2, dynamic = False)(x)
         if not torch.allclose(out, torch.nn.functional.silu(x) * 2):
             return "probe kernel gave wrong results"
         return None
     except Exception as error:
-        message = str(error).strip().splitlines()
-        return f"{type(error).__name__}: {message[0][:200] if message else ''}"
+        return f"{type(error).__name__}: {_first_error_line(error, 200)}"
     finally:
         try:
             torch._dynamo.reset()
         except Exception:
             pass
+
+
+# Checked compiled vs eager in fp32 (tiny Llama / Mistral / Qwen2 / Qwen3 / Phi-3 / Gemma / OLMo-2, SmolLM2-135M).
+_CPU_COMPILE_MODEL_TYPES = frozenset(("llama", "mistral", "qwen2", "qwen3", "phi3", "gemma", "olmo2"))
+
+
+def compile_cpu_layers(model, explicit = False):
+    """Compiles the decoder layers when Inductor can build CPU kernels here. Returns the layer count (0 = eager)."""
+    if getattr(model, "_unsloth_cpu_compiled", False):
+        return 0
+    reason = _cpu_compile_unavailable()
+    if reason is not None:
+        if explicit:
+            _print(f"UNSLOTH_CPU_COMPILE=1 ignored, training eagerly: torch.compile cannot build CPU kernels here ({reason}).")
+        else:
+            _print(f"torch.compile cannot build CPU kernels here ({reason}), training eagerly.")
+        return 0
+    count = _compile_layers(model)
+    model._unsloth_cpu_compiled = True
+    _print(f"torch.compile (Inductor C++) on {count} decoder layers." + ("" if explicit else " UNSLOTH_CPU_COMPILE=0 trains eagerly."))
+    return count
+
+
+def _cpu_compile_wanted(model):
+    """"explicit" for UNSLOTH_CPU_COMPILE=1, "auto" for the dense architectures whose compiled layers were checked
+    against eager (fp32 loss equal, gradients within 1e-6 relative; ~24% less CPU time per step after a one-off
+    compile), None otherwise or for UNSLOTH_CPU_COMPILE=0. Quantized models stay eager (bitsandbytes ops)."""
+    value = os.environ.get("UNSLOTH_CPU_COMPILE", "").strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return "explicit"
+    if value in ("0", "false", "no", "off"):
+        return None
+    config = getattr(model, "config", None)
+    if getattr(config, "quantization_config", None) is not None or getattr(model, "is_loaded_in_4bit", False) \
+            or getattr(model, "is_loaded_in_8bit", False):
+        return None
+    text = getattr(config, "get_text_config", lambda: config)()
+    if getattr(text, "model_type", None) not in _CPU_COMPILE_MODEL_TYPES:
+        return None
+    try:
+        return "auto" if _plain_lm_head(model) else None
+    except Exception:
+        return None
 
 
 def _non_reentrant_checkpointing_on(model):
@@ -386,6 +671,8 @@ class FastCPUModel:
 
         if fast_inference:
             raise NotImplementedError("Unsloth (CPU): fast_inference (vLLM) needs a GPU.")
+        # A quantization config the caller built is a choice of quantization: never swapped for 16-bit weights.
+        user_quantization = kwargs.get("quantization_config", None) is not None
         # Before anything downloads: a refused GPU-only feature fails fast.
         _pop_gpu_loader_kwargs(kwargs)
         # Chunked CE returns logits = None in training steps; return_logits keeps the full-logit loss.
@@ -434,6 +721,15 @@ class FastCPUModel:
         if use_4bit and not cpu_bnb_4bit_supported():
             _print("bitsandbytes 4-bit does not work on this CPU, loading 16-bit weights instead.")
             use_4bit = False
+        if use_4bit and not user_quantization and kwargs.get("config") is None \
+                and not _PREQUANTIZED_SUFFIX.search(model_name) and quant_method is None:
+            # A pre-quantized repo was picked to download less; its 16-bit base would be a new download.
+            size = _prefer_16bit_weights(model_name, dtype, token, revision, trust_remote_code, **probe_kwargs)
+            if size is not None:
+                _print(f"load_in_4bit = True, but loading 16-bit weights instead: they fit in RAM "
+                       f"({size / 1024 ** 3:.2f} GB of {available_ram() / 1024 ** 3:.0f} GB free) and train faster than "
+                       "4-bit on CPU. Set UNSLOTH_CPU_LOAD_IN_4BIT=1 to keep 4-bit.")
+                use_4bit = False
         if not use_4bit and _PREQUANTIZED_SUFFIX.search(model_name):
             base = _PREQUANTIZED_SUFFIX.sub("", model_name)
             _print(f"{model_name} is pre-quantized; loading {base} for 16-bit training.")
@@ -464,8 +760,15 @@ class FastCPUModel:
         # Left to transformers when unset: SDPA where the class supports it, eager otherwise (Bloom, MPT, ...).
         if attn_implementation is not None:
             kwargs["attn_implementation"] = attn_implementation
+        # fp32 training of a bf16 checkpoint keeps the frozen projections in bf16 (lossless, half their RAM, no
+        # measurable step-time cost). Default where fp32 is the default (no native bf16); UNSLOTH_CPU_FROZEN_BF16=1 / 0
+        # forces it on / off.
+        frozen_env = os.environ.get("UNSLOTH_CPU_FROZEN_BF16", "").strip().lower()
+        frozen_wanted = frozen_env in ("1", "true", "yes", "on") or (
+            frozen_env not in ("0", "false", "no", "off") and not cpu_bf16_supported()
+        )
         frozen_bf16 = (
-            os.environ.get("UNSLOTH_CPU_FROZEN_BF16", "0") == "1" and dtype == torch.float32 and not auto_dtype
+            frozen_wanted and dtype == torch.float32 and not auto_dtype
             and not use_4bit and not full_finetuning
             and _checkpoint_dtype(model_name, token = token, revision = revision,
                                   trust_remote_code = trust_remote_code, **probe_kwargs) == torch.bfloat16
@@ -479,6 +782,7 @@ class FastCPUModel:
         )
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
+            model = None
             try:
                 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
             except RuntimeError as error:
@@ -486,6 +790,10 @@ class FastCPUModel:
                 if quantization_config is None:
                     raise
                 _print(f"bitsandbytes 4-bit failed on CPU ({error}), loading 16-bit weights instead.")
+            if model is None:
+                # Outside the handler: its traceback keeps the failed load's half-built model alive.
+                import gc
+                gc.collect()
                 kwargs.pop("quantization_config", None)
                 use_4bit = False
                 model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs, **kwargs)
@@ -527,6 +835,9 @@ class FastCPUModel:
 
         if frozen_bf16:
             _print(f"{store_frozen_linears_in_bf16(model)} frozen Linear weights kept in bfloat16, computing in float32.")
+            # Generation upcasts them back to fp32 unless UNSLOTH_CPU_FROZEN_BF16=1 forced the storage: the per-call
+            # upcast costs decode speed (about 3x per projection at one token), training pays nothing for it.
+            model._unsloth_cpu_frozen_bf16 = "forced" if frozen_env in ("1", "true", "yes", "on") else "training"
         patch_causal_conv1d_fallback(model)
         # Also for a checkpoint that ships its own 4-bit quantization_config.
         _disable_bnb_cpu_weight_packing(model)
@@ -568,14 +879,12 @@ class FastCPUModel:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
         # Training forwards never reuse a KV cache; generate() turns it back on via for_inference.
         model.config.use_cache = False
-        if os.environ.get("UNSLOTH_CPU_COMPILE", "0") == "1" and not getattr(model, "_unsloth_cpu_compiled", False):
-            reason = _cpu_compile_unavailable()
-            if reason is not None:
-                _print(f"UNSLOTH_CPU_COMPILE=1 ignored, training eagerly: torch.compile cannot build CPU kernels here ({reason}).")
-                return
-            count = _compile_layers(model)
-            model._unsloth_cpu_compiled = True
-            _print(f"torch.compile (Inductor C++) on {count} decoder layers.")
+        wanted = _cpu_compile_wanted(model)
+        if wanted == "auto":
+            # Decided by the trainer once it has timed eager steps: a short run never repays the cold compile.
+            model._unsloth_cpu_compile_pending = True
+        elif wanted and not getattr(model, "_unsloth_cpu_compiled", False):
+            compile_cpu_layers(model, explicit = True)
 
     @staticmethod
     def get_peft_model(
@@ -607,6 +916,8 @@ class FastCPUModel:
         _runtime.apply_cpu_security_patches()
         if use_gradient_checkpointing is None:
             use_gradient_checkpointing = getattr(model, "_unsloth_cpu_gradient_checkpointing", "unsloth")
+        # The trainer reads the choice back (SFTConfig would otherwise turn checkpointing on for False).
+        model._unsloth_cpu_gradient_checkpointing = use_gradient_checkpointing
         leaf_names = {name.rsplit(".", 1)[-1] for name, _ in model.named_modules()}
         # Models with their own projection names (Unsloth's native DeepSeek-V4.1) translate q/k/v/o/gate/up/down_proj,
         # "all-linear" and None into their real Linears, exactly as the GPU get_peft_model does.
@@ -672,6 +983,7 @@ class FastCPUModel:
         if use_gradient_checkpointing in (True, "unsloth") and hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
         peft_model = get_peft_model(model, config)
+        _frozen_bf16_for(peft_model, training = True)  # after PEFT froze the base weights
         if max_seq_length is not None:
             peft_model.max_seq_length = max_seq_length
         FastCPUModel._attach(peft_model)
@@ -680,9 +992,11 @@ class FastCPUModel:
     @staticmethod
     def for_training(model, use_gradient_checkpointing = None):
         model.train()
+        _frozen_bf16_for(model, training = True)
         _set_inference_mode(model, False)
         # None keeps whatever from_pretrained / get_peft_model set up; an explicit value switches it.
         if use_gradient_checkpointing is not None and hasattr(model, "gradient_checkpointing_enable"):
+            model._unsloth_cpu_gradient_checkpointing = use_gradient_checkpointing
             if use_gradient_checkpointing:
                 if not _non_reentrant_checkpointing_on(model):
                     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
@@ -693,6 +1007,7 @@ class FastCPUModel:
     @staticmethod
     def for_inference(model):
         model.eval()
+        _frozen_bf16_for(model, training = False)
         _set_inference_mode(model, True)
         return model
 
@@ -773,6 +1088,19 @@ def _set_inference_mode(model, inference):
             break
 
 
+def _frozen_bf16_for(model, training):
+    """Default frozen bf16 storage is for training only: generation upcasts the weights to fp32 (decode speed), and
+    training stores them in bf16 again (half their RAM). UNSLOTH_CPU_FROZEN_BF16=1 keeps bf16 throughout."""
+    inner, mode = model, None
+    for _ in range(4):
+        mode = mode or getattr(inner, "_unsloth_cpu_frozen_bf16", None)
+        inner = getattr(inner, "base_model", None) or getattr(inner, "model", None)
+        if inner is None:
+            break
+    if mode == "training" and isinstance(model, torch.nn.Module):
+        set_bf16_stored_dtype(model, torch.bfloat16 if training else torch.float32)
+
+
 def _unpack_encoding_generate(generate):
     """Notebooks pass `input_ids = tokenizer.apply_chat_template(..., return_tensors = "pt")`, which is a
     BatchEncoding on transformers 5; generate() then fails on `.shape`. The GPU path unpacks it, so do the same."""
@@ -782,6 +1110,9 @@ def _unpack_encoding_generate(generate):
         if encoding is not None and not isinstance(encoding, torch.Tensor) and hasattr(encoding, "items"):
             for key, value in kwargs.pop("input_ids").items():
                 kwargs.setdefault(key, value)
+        if isinstance(self, torch.nn.Module) and not self.training:
+            # Inference-only loads and for_inference: fp32 frozen weights (a training-time callback keeps bf16).
+            _frozen_bf16_for(self, training = False)
         set_stance = getattr(torch.compiler, "set_stance", None)
         modules = self.modules() if isinstance(self, torch.nn.Module) else ()
         if set_stance is not None and any(getattr(m, "_compiled_call_impl", None) is not None for m in modules):
