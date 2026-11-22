@@ -6511,6 +6511,17 @@ def _is_moe_per_expert_lora_key(key):
     )
 
 
+def _require_safe_adapter_bin_load(bin_path):
+    # torch < 2.6 runs code from a crafted pickle even with weights_only=True (CVE-2025-32434).
+    # All Unsloth Zoo code licensed under LGPLv3
+    from packaging.version import Version
+    if Version(str(torch.__version__)).release < (2, 6):
+        raise ValueError(
+            f"Unsloth: {bin_path} is a pickle, and torch {torch.__version__} cannot load one safely. "
+            "Upgrade torch to 2.6 or newer, or save the adapter as adapter_model.safetensors."
+        )
+
+
 def _saved_adapter_lora_keys(save_directory):
     """Adapter key names in a saved PEFT adapter, read from the file on disk.
 
@@ -6532,6 +6543,7 @@ def _saved_adapter_lora_keys(save_directory):
         except Exception:
             return []
     elif os.path.isfile(bin_path):
+        _require_safe_adapter_bin_load(bin_path)
         try:
             state_dict = torch.load(bin_path, map_location = "cpu", weights_only = True)
             keys = list(state_dict.keys())
@@ -6550,6 +6562,7 @@ def _saved_adapter_lora_tensors(save_directory):
         state_dict = load_file(safetensors_path, device = "cpu")
     else:
         bin_path = os.path.join(save_directory, "adapter_model.bin")
+        _require_safe_adapter_bin_load(bin_path)
         state_dict = torch.load(bin_path, map_location = "cpu", weights_only = True)
     return state_dict
 
