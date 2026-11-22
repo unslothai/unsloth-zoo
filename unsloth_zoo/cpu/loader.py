@@ -1371,8 +1371,7 @@ def _remove_stale_weights(save_directory, names):
 
 
 def _keep_existing_mode(temporary, final):
-    """A re-export replaces the file, so carry over the mode the user set on the old one (else 0600 weights become
-    umask-default 0644); a first export keeps the umask default."""
+    """Carry the old file's mode over on re-export (else 0600 weights become umask-default 0644)."""
     try:
         os.chmod(temporary, os.stat(final).st_mode & 0o7777)
     except OSError:
