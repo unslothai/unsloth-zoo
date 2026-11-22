@@ -94,6 +94,19 @@ def test_packed_probe_flips_with_mask_support(monkeypatch):
     assert args.padding_free is False
 
 
+def test_small_logit_model_that_attends_across_examples_is_refused():
+    """OPT's decoder builds its mask without position_ids, so packed examples see each other. With a tiny init its
+    logits are small: the probe must still refuse it (no absolute pass from a scale floor)."""
+    from unsloth_zoo.cpu import trainer
+    from transformers import OPTConfig, OPTForCausalLM
+    torch.manual_seed(0)
+    config = OPTConfig(vocab_size = 128, hidden_size = 32, num_hidden_layers = 2, ffn_dim = 64,
+                       num_attention_heads = 4, word_embed_proj_dim = 32, max_position_embeddings = 64,
+                       init_std = 0.005)
+    model = OPTForCausalLM(config).float().train()
+    assert trainer._packed_examples_isolated(model) is False
+
+
 def test_padding_free_token_loss_matches_padded():
     """Same examples, padded vs padding-free: the summed token loss and its gradient agree (the mean's divisor is
     TRL's count, which in padded mode also counts each row's unshifted first label)."""

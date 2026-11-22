@@ -156,8 +156,13 @@ def _packed_examples_isolated(model):
                 packed = run(input_ids = torch.cat([a, b], dim = 1), position_ids = position_ids)
         finally:
             model.train(was_training)
-        scale = separate.abs().amax().clamp(min = 1.0)
-        return bool(torch.isfinite(packed).all()) and float((packed - separate).abs().amax() / scale) < 2e-2
+        # Relative to the logits' own scale (no floor: small-logit models must not get an absolute pass) and to the
+        # compute dtype: fp32 rounding between the packed and separate shapes stays near 1e-6, attending across
+        # examples moves the second example's logits by a sizeable fraction of their scale.
+        compute = next((p.dtype for p in model.parameters() if p.is_floating_point()), torch.float32)
+        tolerance = 1e-3 if compute in (torch.float32, torch.float64) else 2e-2
+        scale = separate.abs().amax().clamp(min = torch.finfo(torch.float32).tiny)
+        return bool(torch.isfinite(packed).all()) and float((packed - separate).abs().amax() / scale) < tolerance
     except Exception:
         return False
 
