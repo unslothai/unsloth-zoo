@@ -1177,8 +1177,29 @@ def save_pretrained_merged(self, save_directory, tokenizer = None, save_method =
     return save_directory
 
 
+def _refuse_public_repo_for_private_push(repo_id, token, private):
+    # transformers' push_to_hub calls create_repo(private=True, exist_ok=True), which keeps an existing public repo
+    # public: refuse before the first upload, as saving_utils.create_huggingface_repo does on the GPU path.
+    if not private: return
+    from huggingface_hub import HfApi
+    try:
+        api = HfApi(token = token)
+        url = api.create_repo(repo_id = repo_id, private = True, exist_ok = True)
+        is_private = getattr(api.repo_info(repo_id = getattr(url, "repo_id", None) or repo_id, repo_type = "model"), "private", None)
+    except Exception as exc:
+        print(f"Unsloth: Could not confirm the visibility of {repo_id} ({exc}); continuing.")
+        return
+    if is_private is False:
+        raise RuntimeError(
+            f"Unsloth: private=True was requested but the Hugging Face repo {repo_id!r} already exists and is "
+            "public. Refusing to upload so private weights are not published. Make the repo private on the Hub, "
+            "push to a new repo id, or pass private=False."
+        )
+
+
 def push_to_hub_merged(self, repo_id, tokenizer = None, save_method = "merged_16bit", token = None, private = None, **kwargs):
     _check_save_method(save_method)
+    _refuse_public_repo_for_private_push(repo_id, token, private)
     model, _ = _merged_copy(self, save_method)
     # Branch / PR / message options shared by model and tokenizer push_to_hub on transformers 4.57 and 5.x.
     hub = {k: kwargs[k] for k in ("revision", "create_pr", "commit_message", "commit_description", "tags") if k in kwargs}
