@@ -176,11 +176,11 @@ def test_failed_4bit_load_is_released_before_the_16bit_retry(monkeypatch):
     assert attempts == [True, False, True]
 
 
-def _config_llama(attention):
+def _config_llama(attention, dropout = 0.0):
     from transformers import LlamaConfig, LlamaForCausalLM
     config = LlamaConfig(vocab_size = 1000, hidden_size = 64, intermediate_size = 128, num_hidden_layers = 2,
                          num_attention_heads = 4, num_key_value_heads = 2, max_position_embeddings = 2048,
-                         attn_implementation = attention)
+                         attn_implementation = attention, attention_dropout = dropout)
     model = LlamaForCausalLM(config)
     model._unsloth_cpu_gradient_checkpointing = "unsloth"
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
@@ -196,6 +196,20 @@ def test_auto_gradient_checkpointing_counts_eager_attention_scores(monkeypatch, 
     monkeypatch.delenv("UNSLOTH_CPU_AUTO_GC", raising = False)
     monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
     model = _config_llama(attention)
+    args = _GcArgs(length = 2048, batch = 2)
+    assert bool(trainer._auto_cpu_gradient_checkpointing(model, args)) is expect_off
+    assert args.gradient_checkpointing is (not expect_off)
+
+
+@pytest.mark.parametrize("dropout, expect_off", [(0.1, False), (0.0, True)])
+def test_auto_gradient_checkpointing_counts_sdpa_dropout_scores(monkeypatch, dropout, expect_off):
+    """SDPA with attention dropout runs CPU's math path, which keeps the quadratic scores like eager: same budget as
+    the eager test, checkpointing stays on with dropout and turns off without it."""
+    from unsloth_zoo.cpu import trainer
+    monkeypatch.setattr(trainer, "available_ram", lambda: 512 << 20)
+    monkeypatch.delenv("UNSLOTH_CPU_AUTO_GC", raising = False)
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising = False)
+    model = _config_llama("sdpa", dropout)
     args = _GcArgs(length = 2048, batch = 2)
     assert bool(trainer._auto_cpu_gradient_checkpointing(model, args)) is expect_off
     assert args.gradient_checkpointing is (not expect_off)
