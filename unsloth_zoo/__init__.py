@@ -141,15 +141,20 @@ def has_429_exact_full_read(log_dir: str | Path) -> bool:
             found = True
             break
     if dirty:
+        tmp = None
         try:
             if found:  # stopped early: keep what is still known about the files not reached
                 seen = {**{k: v for k, v in previous.items() if (log_dir / k).exists()}, **seen}
-            tmp = manifest_path.with_name(f"{manifest_path.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(seen), encoding = "utf-8")
+            # mkstemp, not a fixed pid name: in a shared HF cache another account could pre-plant a symlink there.
+            import tempfile
+            fd, tmp = tempfile.mkstemp(prefix = f"{manifest_path.name}.", suffix = ".tmp", dir = str(log_dir))
+            with os.fdopen(fd, "w", encoding = "utf-8") as f:
+                f.write(json.dumps(seen))
             os.replace(tmp, manifest_path)
         except Exception:
             try:
-                tmp.unlink(missing_ok = True)
+                if tmp is not None:
+                    os.unlink(tmp)
             except Exception:
                 pass
     return found
