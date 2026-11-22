@@ -382,8 +382,9 @@ def test_shared_flex_compile_gets_the_static_variant():
         "print(bool(getattr(u.flex_attention, '_unsloth_rocm_static', False)))\n"
     )
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    # A clean environment: pytest-session switches (UNSLOTH_PYTEST_NO_GPU and friends) would change the import path.
-    env = {name: os.environ[name] for name in ("PATH", "HOME", "TMPDIR", "HF_HOME") if name in os.environ}
+    # No pytest-session switches (UNSLOTH_PYTEST_NO_GPU and friends would change the import path); the rest of the
+    # environment stays (Windows needs SYSTEMROOT and friends to import torch).
+    env = {name: value for name, value in os.environ.items() if not name.startswith(("UNSLOTH_", "PYTEST_"))}
     env.update(CUDA_VISIBLE_DEVICES = "", PYTHONPATH = root, UNSLOTH_IS_PRESENT = "1")
     out = subprocess.run([sys.executable, "-c", code], capture_output = True, text = True, env = env, cwd = root)
     assert out.returncode == 0, out.stderr[-2000:]
