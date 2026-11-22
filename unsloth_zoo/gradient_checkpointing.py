@@ -3081,9 +3081,9 @@ def reset_unsloth_gradient_checkpointing_buffers():
     global BUFFER_EVENTS_A
     global BUFFER_EVENTS_B
 
+    # GPU_BUFFERS is the "initialized" sentinel. An empty CPU_BUFFERS is a valid initialized pool (every
+    # device keeps its inputs), and its run state (first pass, last checkpoint index) still has to be reset.
     if CPU_BUFFERS is None or GPU_BUFFERS is None:
-        return
-    if len(CPU_BUFFERS) == 0:
         return
 
     _release_pool_pinned(INITIAL_CPU_BUFFER_COUNT)
