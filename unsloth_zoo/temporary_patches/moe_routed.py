@@ -1397,9 +1397,12 @@ def _build_stacked_nf4(experts, hidden_dim):
     device = gu_p.data.device
     if device.type != "cuda" or getattr(experts, "is_transposed", False) or not getattr(experts, "has_gate", True):
         return _decline(experts, "not CUDA, transposed or ungated")
+    from .moe_utils import _uses_own_apply_gate
     act = _act_code(experts)
-    if act is None:
-        return _decline(experts, f"activation {type(getattr(experts, 'act_fn', None)).__name__} / own gate")
+    # Experts owning their gate (Inkling 2's softcapped SwiGLU) take _nf4_own_gate: no fused activation there.
+    own_gate = act is None and _uses_own_apply_gate(experts) and callable(getattr(experts, "_apply_gate", None))
+    if act is None and not own_gate:
+        return _decline(experts, f"activation {type(getattr(experts, 'act_fn', None)).__name__}")
     gu, dn = _nf4_table(gu_p, device), _nf4_table(dn_p, device)
     if gu is None or dn is None:
         return _decline(experts, "not a stacked NF4 [E, N, K] with whole absmax blocks per row")
@@ -1427,7 +1430,7 @@ def _build_stacked_nf4(experts, hidden_dim):
             return _decline(experts, f"{name} not a contiguous [E, N] float tensor")
         tb["bias"], tb["bias_kind"] = bias.detach(), 4
     return {
-        "gate_up": gu, "down": dn, "E": E, "act": act,
+        "gate_up": gu, "down": dn, "E": E, "act": act, "own_gate": own_gate,
         "interleaved": bool(_gate_up_is_interleaved(experts)),
         "alpha": float(getattr(experts, "alpha", 1.702)), "limit": float(getattr(experts, "limit", 7.0)),
     }
@@ -1515,6 +1518,38 @@ def _nf4_routed(state, x, idx, rw, top_k, gu_lora, dn_lora, out_dtype):
         first, second, scaling = dn_lora[:3]
         lora = (second.transpose(1, 2), routed_lora_a(inter, flat, first), scaling)
     return routed_down(inter, flat, rw, False, dn_tb, top_k, out_dtype, lora)
+
+
+# Own-gate NF4 experts dequantize one [N, K] expert per (token, expert) slot, so cap the slots (4 decode rows x top_k 8).
+OWN_GATE_MAX_SLOTS = _env_int("UNSLOTH_MOE_ROUTED_OWN_GATE_MAX_SLOTS", 32)
+
+
+def _nf4_own_gate(experts, state, x, idx, rw, top_k, gu_lora, dn_lora, out_dtype):
+    """Stacked NF4 experts with their own _apply_gate: dequantize only the routed experts (bit-exact), one batched
+    GEMV per projection, the module's gate between them, routed outputs weighted and summed in fp32."""
+    from .moe_utils import _apply_own_gate
+    gu_tb, dn_tb = state["gate_up"], state["down"]
+    T, H = x.shape
+    flat = idx.reshape(-1)
+    dtype = x.dtype
+    xs = x.unsqueeze(1).expand(T, top_k, H).reshape(-1, H)
+    w_gu = nf4_select_dequant(gu_tb, flat, dtype)
+    mm1 = torch.bmm(w_gu, xs.unsqueeze(-1)).squeeze(-1)
+    del w_gu
+    if gu_tb["bias"] is not None:
+        mm1 = mm1 + gu_tb["bias"][flat].to(dtype)
+    if gu_lora is not None:
+        mm1 = (mm1.float() + _lora_delta(xs, flat, [gu_lora[:3]])).to(dtype)
+    inter = _apply_own_gate(experts, mm1)
+    w_dn = nf4_select_dequant(dn_tb, flat, dtype)
+    mm2 = torch.bmm(w_dn, inter.unsqueeze(-1)).squeeze(-1)
+    del w_dn
+    if dn_tb["bias"] is not None:
+        mm2 = mm2 + dn_tb["bias"][flat].to(dtype)
+    if dn_lora is not None:
+        mm2 = (mm2.float() + _lora_delta(inter, flat, [dn_lora[:3]])).to(dtype)
+    out = (mm2.float().view(T, top_k, -1) * rw.float()[..., None]).sum(1)
+    return out.to(out_dtype)
 
 
 def _nf4_grouped(state, x, idx, rw, top_k, gu_lora, dn_lora, out_dtype):
@@ -1684,7 +1719,10 @@ def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
         sub = graph_step and not routed_16bit_supported(hidden_states.device)
         if not nf4_routes(state["E"], top_k_index.numel(), sub, graph_step):
             return None
-        if mode == "grouped":
+        if state.get("own_gate"):
+            if top_k_index.numel() > OWN_GATE_MAX_SLOTS:
+                return None
+        elif mode == "grouped":
             # torch._grouped_mm takes bf16 only (its fake impl rejects fp16 under compile).
             from .moe_utils import _grouped_mm_supported_on, moe_compute_dtype
             if moe_compute_dtype(hidden_states) != torch.bfloat16 or not _grouped_mm_supported_on(hidden_states.device):
@@ -1716,11 +1754,14 @@ def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
     if nf4:
         x = x.to(moe_compute_dtype(hidden_states)).contiguous()
         out_dtype = hidden_states.dtype if hidden_states.dtype.is_floating_point else x.dtype
-        fn = _nf4_grouped if mode == "grouped" else _nf4_routed
         state = _live_biases(experts, state)
         if state is None:
             return None
-        out = fn(state, x, top_k_index, rw, top_k, gu_lora, dn_lora, out_dtype)
+        if state.get("own_gate"):
+            out = _nf4_own_gate(experts, state, x, top_k_index, rw, top_k, gu_lora, dn_lora, out_dtype)
+        else:
+            fn = _nf4_grouped if mode == "grouped" else _nf4_routed
+            out = fn(state, x, top_k_index, rw, top_k, gu_lora, dn_lora, out_dtype)
     else:
         w_gu, w_dn, act, interleaved, _ = views
         biases = (getattr(experts, "gate_up_proj_bias", None), getattr(experts, "down_proj_bias", None))

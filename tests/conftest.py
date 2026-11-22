@@ -556,3 +556,11 @@ class _MlxModuleWorlds:
 def pytest_configure(config):
     if importlib.util.find_spec("mlx") is not None:
         config.pluginmanager.register(_MlxModuleWorlds(), "unsloth-mlx-module-worlds")
+
+
+@_pytest.fixture(autouse = True)
+def _cpu_backend_compiles_only_when_asked(monkeypatch):
+    """The CPU backend compiles decoder layers by default for dense models; one Inductor build per test would dominate
+    the suite. Tests of that path set or delete UNSLOTH_CPU_COMPILE themselves."""
+    if "UNSLOTH_CPU_COMPILE" not in _os.environ:
+        monkeypatch.setenv("UNSLOTH_CPU_COMPILE", "0")

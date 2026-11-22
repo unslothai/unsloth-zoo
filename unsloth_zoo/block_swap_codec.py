@@ -362,12 +362,12 @@ def _decode_chunk(src, tables, first_word, k, out_u8, use_triton):
         n_blocks = -(-q_n // _BLOCK4)
         grid = min(n_blocks, _MAX_CTAS) if _MAX_CTAS > 0 else n_blocks
         dec4[(grid,)](src[:k].view(torch.int32), src[k:k + k // 2].view(torch.int16), tables, out_u8.view(torch.int64),
-                      q_n, first_word, n_blocks, BLOCK = _BLOCK4, num_warps = 4)
+                      q_n, first_word, n_blocks, BLOCK = _BLOCK4, num_warps = 4, enable_fp_fusion = True)
     elif use_triton:
         dec = _triton_kernels()[0]
         n_blocks = -(-k // _BLOCK)
         grid = min(n_blocks, _MAX_CTAS) if _MAX_CTAS > 0 else n_blocks
-        dec[(grid,)](src, tables, out_u8.view(torch.int16), k, first_word, n_blocks, BLOCK = _BLOCK, num_warps = 4)
+        dec[(grid,)](src, tables, out_u8.view(torch.int16), k, first_word, n_blocks, BLOCK = _BLOCK, num_warps = 4, enable_fp_fusion = True)
     else:
         _decode_chunk_torch(src, tables, first_word, k, out_u8)
 
@@ -378,7 +378,7 @@ def _patch(pos, vals, out_u8, use_triton):
         return
     if use_triton:
         patch = _triton_kernels()[1]
-        patch[(-(-m // _PATCH_BLOCK),)](pos, vals, out_u8.view(torch.int16), m, BLOCK = _PATCH_BLOCK, num_warps = 4)
+        patch[(-(-m // _PATCH_BLOCK),)](pos, vals, out_u8.view(torch.int16), m, BLOCK = _PATCH_BLOCK, num_warps = 4, enable_fp_fusion = True)
     else:
         _patch_torch(pos, vals, out_u8)
 

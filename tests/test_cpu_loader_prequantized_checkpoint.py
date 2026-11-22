@@ -62,6 +62,8 @@ def _load_kwargs(monkeypatch, path, bnb_cpu = True, **load):
     monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", capture)
     # The decision is under test, not the host's bitsandbytes CPU backend.
     monkeypatch.setattr(loader, "cpu_bnb_4bit_supported", lambda: bnb_cpu)
+    # The quantization decision is under test, not whether this host's RAM fits the 16-bit weights.
+    monkeypatch.setattr(loader, "available_ram", lambda: 0)
     monkeypatch.setattr(loader, "_print", printed.append)
     with pytest.raises(_Captured):
         loader.FastCPUModel.from_pretrained(path, load_in_4bit = True, **load)
@@ -172,3 +174,64 @@ def test_a_model_without_fp8_dequantize_never_imports_the_gpu_model_stack(monkey
     attempted = _block_unsloth_models(monkeypatch)
     assert loader._drop_reverse_fp8_conversions(model) == 0
     assert attempted == []
+
+
+def test_a_plain_checkpoint_loads_16bit_when_the_weights_fit_in_ram(tmp_path, monkeypatch):
+    """4-bit only costs CPU time when the 16-bit weights fit: load those (UNSLOTH_CPU_LOAD_IN_4BIT=1 keeps 4-bit)."""
+    from unsloth_zoo.cpu import loader
+    path = _write(tmp_path)
+    monkeypatch.setattr(loader, "available_ram", lambda: 1 << 40)
+    import transformers
+    seen, printed = {}, []
+
+    def capture(name, *args, **kwargs):
+        seen.update({k: type(v).__name__ for k, v in kwargs.items()})
+        raise _Captured
+
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", capture)
+    monkeypatch.setattr(loader, "cpu_bnb_4bit_supported", lambda: True)
+    monkeypatch.setattr(loader, "_print", printed.append)
+    with pytest.raises(_Captured):
+        loader.FastCPUModel.from_pretrained(path, load_in_4bit = True)
+    assert "quantization_config" not in seen
+    lines = [line for line in printed if "16-bit weights" in line]
+    assert len(lines) == 1 and "load_in_4bit = True" in lines[0] and "UNSLOTH_CPU_LOAD_IN_4BIT=1" in lines[0], printed
+    seen.clear()
+    monkeypatch.setenv("UNSLOTH_CPU_LOAD_IN_4BIT", "1")
+    with pytest.raises(_Captured):
+        loader.FastCPUModel.from_pretrained(path, load_in_4bit = True)
+    assert seen.get("quantization_config") == "BitsAndBytesConfig"
+
+
+def test_dense_parameter_count_matches_a_built_model():
+    import transformers
+    from unsloth_zoo.cpu.loader import _dense_parameter_count
+    config = transformers.LlamaConfig(hidden_size = 64, intermediate_size = 160, num_hidden_layers = 3,
+                                      num_attention_heads = 4, num_key_value_heads = 2, vocab_size = 300,
+                                      tie_word_embeddings = False)
+    model = transformers.LlamaForCausalLM(config)
+    norms = sum(p.numel() for n, p in model.named_parameters() if "norm" in n)
+    assert _dense_parameter_count(config) == sum(p.numel() for p in model.parameters()) - norms
+    moe = transformers.MixtralConfig(num_local_experts = 4)
+    assert _dense_parameter_count(moe) is None
+
+
+def test_a_caller_quantization_config_is_never_swapped_for_16bit(tmp_path, monkeypatch):
+    import transformers
+    from unsloth_zoo.cpu import loader
+    path = _write(tmp_path)
+    monkeypatch.setattr(loader, "available_ram", lambda: 1 << 40)
+    seen, printed = {}, []
+
+    def capture(name, *args, **kwargs):
+        seen.update({k: type(v).__name__ for k, v in kwargs.items()})
+        raise _Captured
+
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_pretrained", capture)
+    monkeypatch.setattr(loader, "cpu_bnb_4bit_supported", lambda: True)
+    monkeypatch.setattr(loader, "_print", printed.append)
+    with pytest.raises(_Captured):
+        loader.FastCPUModel.from_pretrained(path, load_in_4bit = True,
+                                            quantization_config = transformers.BitsAndBytesConfig(load_in_4bit = True))
+    assert seen.get("quantization_config") == "BitsAndBytesConfig"
+    assert not any("16-bit weights" in line for line in printed), printed

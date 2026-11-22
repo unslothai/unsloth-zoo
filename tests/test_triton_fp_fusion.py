@@ -37,6 +37,8 @@ _NOT_LAUNCHES = {
     "temporary_patches/deepseek_v41.py": {"backend"},
     # Custom ops out of the pinned-op tuple, and a weakref read out of a cache entry.
     "temporary_patches/moe_utils_sonic.py": {"_pinned_ops()", "hit"},
+    # Lazy safetensors readers keyed by tensor name: `tensors[key]()` loads one tensor.
+    "block_swap.py": {"tensors"},
 }
 # Launches that deliberately disable contraction to match an eager reference bit for bit.
 _DELIBERATE_FALSE = {
