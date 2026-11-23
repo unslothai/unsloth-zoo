@@ -326,7 +326,8 @@ def test_scratch_fraction_follows_the_experts_class_and_the_card(monkeypatch):
 
 def test_auto_chunking_waits_for_memory_need(monkeypatch):
     """A 24 GB card holds Mini's 1.27 GiB stack while memory is free: no chunking, so no host sync per MoE call. Once
-    the stack does not fit, that device chunks from then on; other devices are unaffected."""
+    the stack does not fit, that device chunks, and a checkpoint replay there chunks without a new reading (it
+    matches its first pass); other devices are unaffected."""
     monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
     for index in (0, 1):
         monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, index, int(21.96 * 2**30))   # L4
@@ -341,13 +342,74 @@ def test_auto_chunking_waits_for_memory_need(monkeypatch):
     assert chunk == int(0.025 * 21.96 * 2**30 // (2304 * 2304 * 2)) == 55
     calls = []
     _headroom(monkeypatch, 8.0, calls)
-    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0) == 55   # stays chunked
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0, replaying = True) == 55
     assert calls == []
     assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda1) == 0
     # The unchunked plan's real scratch decides: a sync-free plan over 16 of 128 experts fits anywhere.
     mu._AUTO_DEQUANT_TIGHT.clear()
     _headroom(monkeypatch, 0.5)
     assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0, experts_needed = 16) == 0
+
+
+def test_a_transient_shortfall_clears_once_memory_is_back(monkeypatch):
+    """One short reading (an eval spike, a fragmented moment) must not chunk the device for the rest of the process:
+    the next call outside a checkpoint replay reads the headroom again and goes back to the whole stack (no host
+    sync, kept checkpoint base). A replay never clears it, so it keeps its first pass's plan."""
+    monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
+    monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, 0, int(21.96 * 2**30))   # L4
+    cuda0 = torch.device("cuda", 0)
+    _headroom(monkeypatch, 2.5)
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0) == 55
+    calls = []
+    _headroom(monkeypatch, 8.0, calls)
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0) == 0
+    assert calls == [0] and 0 not in mu._AUTO_DEQUANT_TIGHT
+    # A replay reads the headroom only where the last reading was not short, and never clears a short one.
+    _headroom(monkeypatch, 2.5)
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0, replaying = True) == 55
+    _headroom(monkeypatch, 8.0)
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0, replaying = True) == 55
+    assert 0 in mu._AUTO_DEQUANT_TIGHT
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0) == 0
+
+
+def test_capture_check_asks_the_counts_device(monkeypatch):
+    """A graph captured on cuda:1 while cuda:0 is current: the plan must see the capture on the counts' device and
+    not read the counts on the host (a copy during capture fails)."""
+    import contextlib
+
+    experts = _Experts(True)
+    sources = (experts.gate_up_proj, experts.down_proj)
+    monkeypatch.setenv("UNSLOTH_MOE_DEQUANT_MAX_MB", str(5 * 2 * I * H * 2 / 2**20))   # a cap: no driver reading
+    current = {"index": 0}
+
+    @contextlib.contextmanager
+    def device(d):
+        before, current["index"] = current["index"], torch.device(d).index
+        try:
+            yield
+        finally:
+            current["index"] = before
+
+    monkeypatch.setattr(torch.cuda, "device", device)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: current["index"] == 1)
+
+    class _Counts:
+        device = torch.device("cuda", 1)
+
+        def numel(self):
+            return E
+
+        def tolist(self):
+            raise AssertionError("counts read on the host during capture")
+
+    for chunk_env in (None, "4"):   # the automatic cap, and an explicit chunk setting
+        if chunk_env is None:
+            monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS", raising = False)
+        else:
+            monkeypatch.setenv("UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS", chunk_env)
+        assert mu._selective_dequant_plan(sources, _Counts(), E, experts_module = experts) is None
+    assert current["index"] == 0
 
 
 def test_unflagged_models_skip_the_scratch_cap_prep(monkeypatch):

@@ -1332,9 +1332,19 @@ def _selective_dequant_chunk_experts() -> int:
 
 
 _DEVICE_TOTAL_BYTES = {}
-# Devices where an auto-capped stack once did not fit: chunk there from then on. One way, so a checkpointed layer's
-# first pass and replay take the same plan (and the kept base output) except across the single flip.
+# Devices whose latest headroom reading outside a checkpoint replay was short. A replay chunks there without a new
+# reading, so it takes the plan its first pass took (and the kept base output); every other call reads the headroom
+# again, so a transient shortfall clears once memory is back.
 _AUTO_DEQUANT_TIGHT = set()
+
+
+def _cuda_capturing(device):
+    """Whether `device`'s current stream is capturing a CUDA graph (is_current_stream_capturing alone asks the
+    current device, which a split-device model need not have switched to the operand's)."""
+    if device.type != "cuda":
+        return False
+    with torch.cuda.device(device):
+        return torch.cuda.is_current_stream_capturing()
 
 
 def _auto_dequant_cap_source(experts_module):
@@ -1361,7 +1371,7 @@ def _device_headroom_bytes(index):
     return free, lambda: free + max(torch.cuda.memory_reserved(index) - torch.cuda.memory_allocated(index), 0)
 
 
-def _auto_dequant_chunk_experts(splits, dtype, experts_module, device, experts_needed = None) -> int:
+def _auto_dequant_chunk_experts(splits, dtype, experts_module, device, experts_needed = None, replaying = False) -> int:
     """Experts per chunk keeping one projection's dequantized scratch under a cap, or 0 for the unchunked plan.
 
     `experts_needed` is how many experts the unchunked plan reads (the sync-free capped plan's rows, else the whole
@@ -1370,10 +1380,11 @@ def _auto_dequant_chunk_experts(splits, dtype, experts_module, device, experts_n
     Otherwise only experts classes declaring `_unsloth_dequant_scratch_fraction` (Inkling 2) take part, with a cap of
     that share of the card. Chunking costs a host sync per call and disables the kept checkpoint base, so it engages
     only on need: the scratch is over twice the cap AND it does not fit the device right now (twice the scratch, for
-    the dequant plus a cast or transposed copy, plus one cap of slack, above the free memory). Once a device is found
-    short it stays chunked (`_AUTO_DEQUANT_TIGHT`). Inkling-2-Mini's 1.27 GiB gate_up stack therefore stays whole on
-    a 40 GB card without any query, and on 16 to 32 GB cards until memory is actually short; Small's 16 GiB stack
-    chunks wherever it does not fit. An explicit UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS (0 included) wins. Chunks read
+    the dequant plus a cast or transposed copy, plus one cap of slack, above the free memory). A checkpoint replay
+    (`replaying`) on a device last found short chunks without reading again, so it matches its first pass; any other
+    call reads again and clears that verdict once the stack fits (`_AUTO_DEQUANT_TIGHT`). Inkling-2-Mini's 1.27 GiB
+    gate_up stack therefore stays whole on a 40 GB card without any query, and on 16 to 32 GB cards while memory is
+    not short; Small's 16 GiB stack chunks wherever it does not fit. An explicit UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS (0 included) wins. Chunks read
     the same values as the whole stack."""
     cap, fraction = _auto_dequant_cap_source(experts_module)
     if cap is None and fraction is None:
@@ -1394,13 +1405,17 @@ def _auto_dequant_chunk_experts(splits, dtype, experts_module, device, experts_n
     cap = fraction * total
     if cap <= 0 or scratch <= 2 * cap:
         return 0
-    if index not in _AUTO_DEQUANT_TIGHT:
-        want = 2 * scratch + cap
-        free, with_cached = _device_headroom_bytes(index)
-        if free >= want or with_cached() >= want:
-            return 0
-        _AUTO_DEQUANT_TIGHT.add(index)
-    return max(1, int(cap // per_expert))
+    chunk = max(1, int(cap // per_expert))
+    if replaying and index in _AUTO_DEQUANT_TIGHT:
+        return chunk
+    want = 2 * scratch + cap
+    free, with_cached = _device_headroom_bytes(index)
+    if free >= want or with_cached() >= want:
+        if not replaying:
+            _AUTO_DEQUANT_TIGHT.discard(index)
+        return 0
+    _AUTO_DEQUANT_TIGHT.add(index)
+    return chunk
 
 
 def _bnb4bit_expert_split(param):
@@ -1524,7 +1539,7 @@ def _dequantize_bnb4bit_experts_once(param, experts, target_dtype = None):
     return out.to(target_dtype) if target_dtype is not None else out
 
 
-def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows, experts_module = None):
+def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows, experts_module = None, replaying = False):
     """Expert chunks to dequantize, or None to keep the full-stack path when off, traced, capturing, a source that cannot split exactly, or nothing to save."""
     mode = os.environ.get("UNSLOTH_MOE_SELECTIVE_DEQUANT", "auto")
     selective = mode == "1"
@@ -1534,7 +1549,7 @@ def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows, experts_mo
         chunk == 0 and mode != "0" and experts_module is not None
         and _auto_dequant_cap_source(experts_module) != (None, None)   # flag / env first: unflagged models stop here
         and not torch.compiler.is_compiling()
-        and not (num_tokens_per_expert.device.type == "cuda" and torch.cuda.is_current_stream_capturing())
+        and not _cuda_capturing(num_tokens_per_expert.device)
     ):
         splits = [_bnb4bit_expert_split(source) for source in sources]
         E = int(num_tokens_per_expert.numel())
@@ -1546,7 +1561,7 @@ def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows, experts_mo
             capped = not selective and 0 < num_rows and 8 * num_rows <= 7 * E
             chunk = _auto_dequant_chunk_experts(
                 splits, param.quant_state.dtype, experts_module, num_tokens_per_expert.device,
-                experts_needed = num_rows if capped else E,
+                experts_needed = num_rows if capped else E, replaying = replaying,
             )
             # The chunked plan reads the routed counts on the host anyway: read only the routed experts.
             capped_scratch = chunk > 0
@@ -1557,7 +1572,7 @@ def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows, experts_mo
     if torch.compiler.is_compiling():
         return None
     device = num_tokens_per_expert.device
-    if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+    if _cuda_capturing(device):
         return None
     E = int(num_tokens_per_expert.numel())
     for source in sources:
@@ -5635,7 +5650,7 @@ def forward_native_grouped_mm(
             if _recompute:
                 selective_plan = _selective_dequant_plan(
                     (_gate_up_src, getattr(self, "down_proj", None)), num_tokens_per_expert, permuted_input.shape[0],
-                    experts_module = self,
+                    experts_module = self, replaying = keep_slot is not None and keep_slot.replaying,
                 )
             # LoRA folded into the base GEMM (moe_lora_fold) and the first pass's base output reused by the checkpoint
             # replay (moe_gc_keep_base); a LoRA left over is added by the separated path below.
