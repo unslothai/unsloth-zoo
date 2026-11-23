@@ -6250,8 +6250,7 @@ def _save_dir_atomically(save_fn, save_directory, rank):
     parent, base = os.path.split(save_directory.rstrip(os.sep) or save_directory)
     parent = parent or os.curdir
     os.makedirs(parent, exist_ok = True)
-    # mkdtemp: owner-only (adapters a private output folder protects are not readable beside it while written), and
-    # an unpredictable O_EXCL name, so a peer who can write the parent cannot pre-create or link the staging folder.
+    # mkdtemp: owner-only, unpredictable O_EXCL name a peer writing the parent cannot pre-create or link.
     tmp = tempfile.mkdtemp(prefix = f"{base}.unsloth_tmp_rank{rank}_", dir = parent)
     try:
         save_fn(tmp)

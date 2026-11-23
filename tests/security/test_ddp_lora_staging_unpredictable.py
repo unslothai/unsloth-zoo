@@ -42,7 +42,6 @@ def test_preplanted_staging_folder_is_not_used(tmp_path):
     out = tmp_path / "lora"
     planted = tmp_path / "planted"
     planted.mkdir(mode = 0o777); os.chmod(planted, 0o777)
-    # Every predictable name a peer could guess for this process.
     for rank in (0, 1):
         os.symlink(planted, f"{out}.unsloth_tmp_rank{rank}_{os.getpid()}")
     used = []
