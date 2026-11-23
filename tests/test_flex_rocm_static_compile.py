@@ -20,6 +20,7 @@ gfx1151 (tiny Gemma-3 trained at 24 tokens after a 32 token step). No-grad calls
 Runs on CPU with HIP simulated: real Dynamo with a recording backend, flex replaced by a math attention (CPU flex has
 no backward), the ROCm device check widened to CPU tensors where a test needs it."""
 
+import inspect
 import os
 import subprocess
 import sys
@@ -29,6 +30,9 @@ import torch
 
 flex_module = pytest.importorskip("transformers.integrations.flex_attention")
 pytest.importorskip("torch.nn.attention.flex_attention")
+
+# The rocm fixture records torch.compile; torch 2.13+ takes a per-call recompile_limit.
+_REAL_TORCH_COMPILE = torch.compile
 
 
 def _unwrap(fn):
@@ -336,8 +340,13 @@ def test_static_compile_has_room_for_many_lengths(rocm):
         fn = install()
         for length in range(16, 28):
             fn(*_qkv(length), training = True)
-        assert getattr(config, name) >= 1024
         assert len(_static(graphs)) == 12, "every length compiled, none fell back to eager"
+        if "recompile_limit" in inspect.signature(_REAL_TORCH_COMPILE).parameters:
+            # The static compile has its own limit and the process-wide one is left alone.
+            assert getattr(config, name) == 8
+            assert all(kwargs.get("recompile_limit") == 1024 for _, kwargs, _ in _static(graphs))
+        else:
+            assert getattr(config, name) >= 1024
         set_torch_config(config, name, 4096)
         _raise_recompile_budget()
         assert getattr(config, name) == 4096, "a larger limit is never lowered"
@@ -460,7 +469,7 @@ def test_zoo_flex_wrapper_dispatch(monkeypatch):
     with torch.no_grad():
         fn(*_qkv(8))
     fn(*_qkv(8, grad = False))
-    assert calls == ["static", "auto", "auto"] and compiled == [{"dynamic": False}]
+    assert calls == ["static", "auto", "auto"] and [c["dynamic"] for c in compiled] == [False]
     monkeypatch.setattr(torch.version, "hip", None, raising = False)
     assert rocm_flex_static.rocm_static_flex(auto, entry) is auto
 
@@ -481,7 +490,7 @@ def test_shared_flex_compile_gets_the_static_variant():
         "import types, torch, unsloth_zoo\n"
         "torch.version.hip = '7.13.0'\n"
         "torch.cuda.device_count = lambda: 1\n"
-        "torch.cuda.get_device_properties = lambda i: types.SimpleNamespace(total_memory = 64 << 30)\n"
+        "torch.cuda.get_device_properties = lambda i: types.SimpleNamespace(total_memory = 64 << 30, gcnArchName = 'gfx1151', name = 'AMD Radeon 8060S', major = 11, minor = 5)\n"
         "import unsloth_zoo.flex_attention.utils as u\n"
         "assert u.HAS_FLEX_ATTENTION\n"
         "print(bool(getattr(u.flex_attention, '_unsloth_rocm_static', False)))\n"

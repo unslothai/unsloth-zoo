@@ -38,6 +38,7 @@ __all__ = [
     "rocm_static_flex",
 ]
 
+import inspect
 import os
 import warnings
 import torch
@@ -156,13 +157,27 @@ def _note_static_call():
     ROCM_FLEX_STATIC_STATS["static_calls"] += 1
 
 
-def _raise_recompile_budget():
+def _per_call_recompile_limit():
+    # torch 2.13+: torch.compile(recompile_limit = N) limits that compile alone.
+    try:
+        return "recompile_limit" in inspect.signature(torch.compile).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+_PER_CALL_RECOMPILE_LIMIT = _per_call_recompile_limit()
+
+
+def _raise_recompile_budget(per_frame = True):
     try:
         from unsloth_zoo.torch_config import set_torch_config
     except Exception:
         set_torch_config = lambda config, name, value: setattr(config, name, value)
     config = torch._dynamo.config
-    for names in (("recompile_limit", "cache_size_limit"), ("accumulated_recompile_limit", "accumulated_cache_size_limit")):
+    groups = [("accumulated_recompile_limit", "accumulated_cache_size_limit")]
+    if per_frame:
+        groups.insert(0, ("recompile_limit", "cache_size_limit"))
+    for names in groups:
         for name in names:
             if hasattr(config, name):
                 try:
@@ -176,8 +191,14 @@ def _raise_recompile_budget():
 def compile_static_flex(entry, training = False):
     """torch.compile(entry, dynamic = False) with room for one graph per length. `entry` should be a function of the
     call site's own, so its Dynamo cache is not shared with another compile of flex_attention."""
-    _raise_recompile_budget()
     options = {}
+    if _PER_CALL_RECOMPILE_LIMIT:
+        # This compile's own limit: the process-wide recompile_limit stays as its owner configured it. The
+        # accumulated limit is a per code object safety cap counted across compiles, so it still needs room.
+        options["recompile_limit"] = _RECOMPILE_FLOOR
+        _raise_recompile_budget(per_frame = False)
+    else:
+        _raise_recompile_budget()
     # transformers' torch 2.6 training workaround (pytorch/pytorch#146260), kept.
     if training and torch.__version__.startswith("2.6.0"):
         options["mode"] = "max-autotune-no-cudagraphs"
