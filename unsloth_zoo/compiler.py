@@ -788,7 +788,7 @@ from unsloth_zoo.loss_utils import (
     fused_linear_cross_entropy,
     unsloth_fused_ce_loss,
 )
-from unsloth_zoo.fused_losses.forward_adapter import lm_head_fake_quantize, unsloth_fused_lm_head_loss
+from unsloth_zoo.fused_losses.forward_adapter import lm_head_fake_quantize, lm_head_needs_module_forward, unsloth_fused_lm_head_loss
 from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
 from unsloth_zoo.compiler import lm_head_on_old_cuda_arch
 from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs, unsloth_fsdp_unshard
@@ -3767,7 +3767,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and not lm_head_needs_module_forward(self.lm_head) and getattr(self.lm_head, "bias", None) is None:
     _hidden_states, lm_head_weight = lm_head_fake_quantize(self.lm_head, hidden_states\\1)
     loss = fused_linear_cross_entropy(
         hidden_states      = _hidden_states,
@@ -3794,6 +3794,7 @@ else:
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
         torch_compile        = not UNSLOTH_COMPILE_DISABLE and not lm_head_on_old_cuda_arch(lm_head_weight),
+        lm_head_module       = self.lm_head,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
@@ -3868,7 +3869,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and not lm_head_needs_module_forward(self.lm_head) and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
     _hidden_states, lm_head_weight = lm_head_fake_quantize(self.lm_head, hidden_states\\1)
     loss = fused_linear_cross_entropy(
         hidden_states      = _hidden_states,
@@ -3896,6 +3897,7 @@ elif _can_fuse_loss(self.loss_function) and labels is not None and NOT_RETURN_LO
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
         torch_compile        = not UNSLOTH_COMPILE_DISABLE and not lm_head_on_old_cuda_arch(lm_head_weight),
+        lm_head_module       = self.lm_head,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
@@ -4019,6 +4021,7 @@ else:
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
         torch_compile        = not UNSLOTH_COMPILE_DISABLE and not lm_head_on_old_cuda_arch(lm_head_weight),
+        lm_head_module       = self.lm_head,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
