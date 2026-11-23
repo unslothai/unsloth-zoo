@@ -2515,6 +2515,8 @@ def create_new_function(
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"
     if "torch_compiler_disable_unless_decode" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compiler_disable_unless_decode\n"
+    if "inkling2_residual_eager_unless_decode" in new_source:
+        imports += "from unsloth_zoo.temporary_patches.inkling2 import inkling2_residual_eager_unless_decode\n"
     # mHC helpers come from the zoo: they are set on the modeling module only at runtime.
     for helper in _MHC_INJECTED_HELPERS:
         if re.search(rf"\b{helper}\b", new_source):
@@ -3373,7 +3375,11 @@ def create_standalone_class(
         compile = (
             f"@torch_compile_with_fallback(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
             if not disable
-            else "@torch_compiler_disable_unless_decode"
+            else (
+                "@inkling2_residual_eager_unless_decode"
+                if any(module.endswith(x) for x in DISABLE_COMPILE_EAGER_OP_MODULES)
+                else "@torch_compiler_disable_unless_decode"
+            )
         )
     else:
         compile = ""
@@ -6110,6 +6116,13 @@ DISABLE_COMPILE_MODULES = [
     "Glm5NextTextHyperConnection",
     # Inkling 2 block attention residuals: compiled alone (dynamic = True, CUDA), the one-query form over 3+ stacked
     # blocks returns correct values but wrong input grads (8-34% relative); the LoRA grads of every layer drift.
+    "Inkling2BlockAttentionResidual",
+    "Inkling2LoopBlockAttentionResidual",
+]
+
+# Disabled modules that stay eager inside an enclosing compiled graph through an opaque custom op (eager forward and
+# backward) instead of a graph break, which fullgraph = True refuses.
+DISABLE_COMPILE_EAGER_OP_MODULES = [
     "Inkling2BlockAttentionResidual",
     "Inkling2LoopBlockAttentionResidual",
 ]
