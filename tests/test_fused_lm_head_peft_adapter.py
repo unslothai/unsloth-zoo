@@ -365,6 +365,23 @@ def test_module_ce_all_ignored_is_zero_and_row_mismatch_raises():
         ce._module_head_ce_loss(head, hidden[:, -4:], _ids(), None, None, True, {})
 
 
+def test_module_ce_moves_the_count_to_the_loss_device(monkeypatch):
+    # n_items on another GPU than the head (a split model): the divisor must be moved to the logits' device.
+    moved = []
+
+    class _Count(torch.Tensor):
+        def to(self, *args, **kwargs):
+            moved.append(kwargs.get("device", args[0] if args else None))
+            return torch.Tensor.to(self.as_subclass(torch.Tensor), *args, **kwargs)
+    torch.manual_seed(0)
+    head = torch.nn.Linear(H, V, bias = False)
+    hidden = torch.randn(2, 9, H)
+    got = ce._module_head_ce_loss(head, hidden, _ids(), None, torch.tensor([7.0, 7.0]).as_subclass(_Count), True, {})
+    assert moved and all(torch.device(d) == head.weight.device for d in moved)
+    want = ce._module_head_ce_loss(head, hidden, _ids(), None, 7, True, {})
+    torch.testing.assert_close(got.as_subclass(torch.Tensor), want)
+
+
 def test_module_route_follows_the_label_smoothing_override():
     model, inner = _wrap()
     ids = _ids()

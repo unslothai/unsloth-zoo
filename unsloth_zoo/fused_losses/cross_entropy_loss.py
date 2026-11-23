@@ -929,8 +929,8 @@ def _module_head_ce_loss(lm_head, hidden_states, labels, mask, n_items, shift_la
         )
     # An ignored row never reaches the loss; zeroing it keeps a half precision overflow there out of backward.
     logits = logits.masked_fill((targets == ignore_index).unsqueeze(-1), 0)
-    if torch.is_tensor(n_items) and n_items.numel() != 1:
-        n_items = n_items.ravel()[0]  # DataParallel replica: one count
+    # One count (a DataParallel replica passes several) on the loss device: the head may sit on another GPU.
+    n_items = _chunked_logprob._ce_divisor(n_items, targets, ignore_index, logits.device)
     return _logits_ce_loss(logits, targets, n_items, kwargs)
 
 
