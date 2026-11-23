@@ -6196,12 +6196,8 @@ pass
 def create_batches(requests, num_sequences = 64):
     # All Unsloth Zoo code licensed under LGPLv3
     # llm.generate must be batched
-    n_splits = int(math.ceil(len(requests) / num_sequences))
-    offsets = np.arange(0, len(requests), num_sequences)
-    if offsets[-1] != len(requests):
-        offsets = np.hstack((offsets, len(requests)))
-    batches = [requests[offsets[i]:offsets[i+1]] for i in range(len(offsets)-1)]
-    return batches
+    num_sequences = max(int(num_sequences), 1)
+    return [requests[i:i+num_sequences] for i in range(0, len(requests), num_sequences)]
 pass
 
 
@@ -8287,6 +8283,8 @@ def generate_batches(llm, inputs, n_batches = None, lora_request = None, *args, 
     if n_batches is None:
         if "UNSLOTH_VLLM_BATCHES" in os.environ:
             n_batches = int(os.environ["UNSLOTH_VLLM_BATCHES"])
+        elif getattr(llm, "_unsloth_batches", None) is not None:
+            n_batches = llm._unsloth_batches
         else:
             free_memory, total_memory = get_mem_info()
             total_memory_gb = round(total_memory / 1024 / 1024 / 1024, 2)
@@ -8294,8 +8292,11 @@ def generate_batches(llm, inputs, n_batches = None, lora_request = None, *args, 
             elif total_memory_gb <= 16: n_batches = llm.approx_max_num_seqs // 5
             elif total_memory_gb <= 24: n_batches = llm.approx_max_num_seqs // 2
             else: n_batches = llm.approx_max_num_seqs
-
-            os.environ["UNSLOTH_VLLM_BATCHES"] = str(n_batches)
+            # Small engines round to 0. Keep the width on this engine, not the environment,
+            # so another engine in the same process sizes its own.
+            n_batches = max(n_batches, 1)
+            try: llm._unsloth_batches = n_batches
+            except Exception: pass
 
             if n_batches != llm.approx_max_num_seqs:
                 print(f"Unsloth: Will use {n_batches} batches to reduce memory usage for generation!")
