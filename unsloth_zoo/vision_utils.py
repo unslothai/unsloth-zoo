@@ -477,7 +477,7 @@ def _netrc_names_host(host) -> bool:
     # Same file requests reads (NETRC, else ~/.netrc, ~/_netrc); only an explicit `machine` line counts, never `default`.
     import netrc
     location = os.environ.get("NETRC")
-    paths = (location,) if location else (os.path.expanduser("~/.netrc"), os.path.expanduser("~/_netrc"))
+    paths = (os.path.expanduser(location),) if location else (os.path.expanduser("~/.netrc"), os.path.expanduser("~/_netrc"))
     for path in paths:
         if not os.path.exists(path): continue
         try:

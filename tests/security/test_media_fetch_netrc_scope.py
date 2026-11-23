@@ -75,3 +75,12 @@ def test_https_explicit_machine_keeps_netrc_auth(tmp_path, monkeypatch):
     auth = vision_utils._media_auth("https://media.example/a.png")
     assert tuple(auth) == ("someone", "hunter2")
     assert vision_utils._media_auth("https://other.example/a.png") is vision_utils._no_media_auth
+
+
+def test_tilde_netrc_path_is_expanded_like_requests(tmp_path, monkeypatch):
+    path = tmp_path / "media.netrc"
+    path.write_text("machine media.example login someone password hunter2\n")
+    path.chmod(0o600)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("NETRC", "~/media.netrc")
+    assert tuple(vision_utils._media_auth("https://media.example/a.png")) == ("someone", "hunter2")
