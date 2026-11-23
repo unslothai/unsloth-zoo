@@ -119,7 +119,10 @@ def forward(self, input_ids=None, labels=None, **kwargs):
     return (loss, logits)
 """
     new, _ = rewrite_forward_source(canonical)
-    assert "if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' or not _can_fuse_loss(self.loss_function):" in new
+    # A live head adapter is routed inside unsloth_fused_lm_head_loss, not by this condition.
+    assert (
+        "if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' or not _can_fuse_loss(self.loss_function):"
+    ) in new
     assert (
         "unsloth_fused_lm_head_loss(hidden_states, self.lm_head, labels, vocab_size=self.config.vocab_size, "
         "accelerator_scaler=getattr(self, 'accelerator_scaler', None), **kwargs)"

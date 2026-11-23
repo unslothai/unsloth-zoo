@@ -662,6 +662,8 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     hidden_src = ast.unparse(cap.hidden_expr)
     logits_rhs = cap.logits_rhs_src or f"self.{head_attr}({hidden_src})"
 
+    # A live PEFT adapter on the head is not checked here: unsloth_fused_lm_head_loss sends such a head through its
+    # own forward (lm_head_needs_module_forward), as the compiler path does, so both return EMPTY_LOGITS.
     # Re-checked per call: the loss can be swapped after install.
     if cap.guarded_scale_expr is not None and "logit_scale_multiply" not in already:
         scale_extra += f", logit_scale_multiply={ast.unparse(cap.guarded_scale_expr)}"

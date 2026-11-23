@@ -29,7 +29,7 @@ import warnings
 from .peft_utils import get_lora_layer_modules
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
-from .private_staging import keep_mode
+from .private_staging import keep_mode, precreate_private_temp
 from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH, device_empty_cache
 from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
 from collections import defaultdict
@@ -4664,6 +4664,7 @@ def _download_shard_over_previous_export(repo_id, filename, save_directory, cach
             token = token,
             revision = revision,
         )
+        keep_mode(os.path.join(staging_dir, filename), file_path, add = stat.S_IWUSR)  # a re-export keeps weights the user restricted restricted
         os.replace(os.path.join(staging_dir, filename), file_path)
     finally:
         shutil.rmtree(staging_dir, ignore_errors = True)
@@ -8074,7 +8075,9 @@ def _seed_unbacked_trained_tensors(save_directory, safetensors_list, lora_weight
         header_metadata = json.loads(f.read(length_of_header))
     temp_path = path + ".unsloth_seed_tmp"
     try:
+        precreate_private_temp(temp_path, path)  # restricted weights stay private while written
         _stream_rewrite_resized_shard(source, temp_path, header_metadata, length_of_header, tensors)
+        keep_mode(temp_path, path, add = stat.S_IWUSR)  # the rewritten shard keeps the mode of the one it replaces
         os.replace(temp_path, path)
     except Exception:
         if os.path.exists(temp_path): os.remove(temp_path)

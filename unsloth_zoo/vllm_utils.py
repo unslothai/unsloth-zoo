@@ -6249,6 +6249,8 @@ def _save_dir_atomically(save_fn, save_directory, rank):
     tmp = f"{save_directory.rstrip(os.sep)}.unsloth_tmp_rank{rank}_{os.getpid()}"
     shutil.rmtree(tmp, ignore_errors = True)
     try:
+        # Owner-only, so adapters a private output folder protects are not readable beside it while written.
+        os.makedirs(tmp, mode = 0o700, exist_ok = True)
         save_fn(tmp)
         for root, _, files in os.walk(tmp):
             rel = os.path.relpath(root, tmp)

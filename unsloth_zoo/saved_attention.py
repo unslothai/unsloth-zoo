@@ -27,6 +27,7 @@ it. =0 turns everything off."""
 
 import collections
 import os
+import sys
 import threading
 import weakref
 from contextlib import contextmanager
@@ -881,11 +882,83 @@ def saved_function_call(function, n_inputs, *args, **kwargs):
 _PATCHED_MARK = "_unsloth_saved_attention"
 
 
+def _in_unsloth_compiled_block():
+    # Unsloth's own per-layer compile (fullgraph=False, a graph break is legal). Not set when the block
+    # is inlined into a user's torch.compile, which may be fullgraph=True.
+    flag = getattr(sys.modules.get("unsloth.models._block_compile"), "_IN_COMPILED_REGION", None)
+    return bool(flag) and bool(flag[0])
+
+
+def _strict_trace():
+    # Trace time only: is the frame being compiled one that may not graph break (fullgraph=True, or
+    # torch._dynamo.error_on_graph_break(True))? Unknown torch internals answer yes, the in-graph route.
+    try:
+        from torch._dynamo.symbolic_convert import InstructionTranslator
+        tx = InstructionTranslator.current_tx()
+        return bool(getattr(tx, "one_graph", True) or getattr(tx, "error_on_graph_break", False))
+    except Exception:
+        return True
+
+
+try:
+    # Dynamo calls it while tracing and keeps the answer as a constant, so it costs no graph break.
+    _strict_trace = torch._dynamo.assume_constant_result(_strict_trace)
+except Exception:
+    pass
+
+
+def _strict_slot_impl(token, grad):
+    # Runs every time the strict in-graph route runs, compiled or not: it does to the frame what the
+    # helpers do for a call that keeps nothing (one empty entry in the first pass, one entry taken in the
+    # replay), so entries stay matched by call order whichever route each pass took.
+    frame = getattr(_TLS, "frame", None)
+    if frame is None:
+        return
+    if not frame.replaying:
+        if not grad:
+            frame.entries.append(None)
+    elif grad:
+        _take_entry(frame)
+
+
+_SLOT_TOKEN = torch.zeros(())
+try:
+    # An opaque op stays in a fullgraph compile; the declared mutation keeps it from being dropped as dead
+    # code and orders the slots of one graph. Grad mode is read at trace time, as the helpers read it.
+    @torch.library.custom_op("unsloth_zoo::saved_attention_strict_slot", mutates_args = ("token",))
+    def _strict_slot(token: torch.Tensor, grad: bool) -> None:
+        _strict_slot_impl(token, grad)
+except Exception:
+    _strict_slot = None
+
+
+def saved_attention_skip_slot():
+    """For a caller that keeps an attention call in a strict compile's graph inside a frame (no saving
+    helper): accounts for the call's entry so the other pass lines up even if it runs eagerly."""
+    if _strict_slot is not None and getattr(_TLS, "frame", None) is not None:
+        _strict_slot(_SLOT_TOKEN, torch.is_grad_enabled())
+
+
 def _rocm_without_frame():
     # ROCm: a call outside any frame (no Unsloth checkpoint, or a device whose SDPA keeps nothing) stays
     # in the caller's graph instead of reaching the compiler-disabled helpers, which a fullgraph=True
-    # training compile cannot cross. Dynamo guards on the thread-local read.
-    return bool(getattr(torch.version, "hip", None)) and getattr(_TLS, "frame", None) is None
+    # training compile cannot cross. Dynamo guards on the thread-local read. Inside a frame, only a call
+    # traced by a compile that may not graph break stays in the graph: it keeps nothing, and its slot op
+    # fills or takes that call's entry, so a pass that falls back to eager (a fullgraph=False compile
+    # under error_on_graph_break at its recompile limit) still lines up with the other. Any other compile (Unsloth's
+    # blocks, a user's fullgraph=False) breaks into the helpers as eager code does: a fullgraph=False
+    # frame can fall back to eager on one pass only (recompile limit), and the frame's entries are
+    # matched by call order, so both passes must take the same route whatever the compile does.
+    if not getattr(torch.version, "hip", None):
+        return False
+    if getattr(_TLS, "frame", None) is None:
+        return True
+    if not torch.compiler.is_compiling() or _in_unsloth_compiled_block():
+        return False
+    if not _strict_trace():
+        return False
+    saved_attention_skip_slot()
+    return True
 
 
 def _wrap_attention_interface(fn):
