@@ -391,6 +391,19 @@ def test_shared_flex_compile_gets_the_static_variant():
     assert out.stdout.strip().splitlines()[-1] == "True"
 
 
+def test_the_short_query_guard_keeps_the_rocm_static_marker():
+    """Triton without block pointers (torch 2.10 with Triton 3.9) re-wraps the exported flex for short queries; the
+    static variant is still inside, and the marker must say so or rocm_static_flex would wrap the call site again."""
+    from unsloth_zoo.flex_attention import utils
+
+    def static(*args, **kwargs):
+        return kwargs
+
+    static._unsloth_rocm_static = True
+    assert utils._main_kernel_for_short_queries(static, {})._unsloth_rocm_static is True
+    assert not hasattr(utils._main_kernel_for_short_queries(lambda *a, **k: k, {}), "_unsloth_rocm_static")
+
+
 def test_sparse_backward_probe_runs_once_per_length(monkeypatch):
     from unsloth_zoo import rocm_flex_static
     from unsloth_zoo.flex_attention import sparse
