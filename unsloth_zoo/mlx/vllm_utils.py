@@ -24,6 +24,7 @@ import os
 import shutil
 import tempfile
 import warnings
+import weakref
 
 from .peft_interop import MLX_WEIGHTS_FILE, PEFT_WEIGHTS_FILE, convert_mlx_dir_to_peft, detect_adapter_format
 
@@ -45,6 +46,10 @@ _INSTALL_HINT = (
 )
 _LORA_IDS = itertools.count(1)
 _scratch_root = None
+# The in-process engine whose live adapter (``engine._unsloth_live_lora``) a request path names; no file is there.
+_IN_MEMORY_LORAS = weakref.WeakValueDictionary()
+_IN_MEMORY_ROOT = "/unsloth-in-memory-lora/"
+_IN_MEMORY_PATHS = (f"{_IN_MEMORY_ROOT}{n}" for n in itertools.count(1))
 
 
 def _installed():
@@ -156,7 +161,66 @@ def load_vllm(model, *, max_seq_length, gpu_memory_utilization=0.5, max_lora_ran
     if os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] != "0":
         return LLM(**engine_kwargs)
     with _in_process_engine_loads(model):
-        return LLM(**engine_kwargs)
+        engine = LLM(**engine_kwargs)
+    engine._unsloth_in_memory_lora = _serve_in_memory_loras(engine)
+    return engine
+
+
+def _serve_in_memory_loras(engine):
+    """Let vllm-metal's adapter loader answer in-memory request paths from ``_IN_MEMORY_LORAS``; False without it."""
+    try:
+        from vllm_metal.v1.lora import worker_manager
+    except ImportError:
+        return False
+    add_request = engine.llm_engine.add_request
+
+    def checked_add_request(*args, lora_request=None, **kwargs):
+        # Refuse here, where vLLM aborts the batch cleanly: a load failing mid-step leaves the engine unusable.
+        path = getattr(lora_request, "lora_path", "")
+        if path.startswith(_IN_MEMORY_ROOT) and path not in _IN_MEMORY_LORAS:
+            raise ValueError(
+                "Unsloth MLX: this live LoRA request was released or replaced by a newer "
+                "load_lora(load_tensors=True); call load_lora(load_tensors=True) again."
+            )
+        return add_request(*args, lora_request=lora_request, **kwargs)
+
+    engine.llm_engine.add_request = checked_add_request
+    original = worker_manager.load_peft_adapter
+    if getattr(original, "_unsloth_in_memory", False):
+        return True
+
+    def load_peft_adapter(adapter_path, *, lora_id, lora_config=None, **kwargs):
+        engine = _IN_MEMORY_LORAS.get(str(adapter_path))
+        if engine is None:
+            return original(adapter_path, lora_id=lora_id, lora_config=lora_config, **kwargs)
+        adapter = engine._unsloth_live_lora[1]
+        from vllm_metal.v1.lora.peft_loader import LoadedLoRA, LoRALayerWeightsMLX
+
+        rank = max(int(a.shape[0]) for a, _, _ in adapter.values())
+        if lora_config is not None and rank > lora_config.max_lora_rank:
+            raise ValueError(f"LoRA rank {rank} is greater than max_lora_rank {lora_config.max_lora_rank}.")
+        weights = {name: LoRALayerWeightsMLX(name, int(a.shape[0]), a, b, scaling) for name, (a, b, scaling) in adapter.items()}
+        return LoadedLoRA(lora_id=lora_id, rank=rank, weights=weights)
+
+    load_peft_adapter._unsloth_in_memory = True
+    worker_manager.load_peft_adapter = load_peft_adapter
+    return True
+
+
+def _live_adapter(model):
+    """The live LoRA in PEFT layout per module (A = lora_a.T, B = lora_b.T, scale), or None when only a PEFT directory
+    can carry it (DoRA, other wrappers, full-state modules)."""
+    import mlx.core as mx
+    from mlx_lm.tuner.lora import LoRALinear
+
+    from .utils import iter_mlx_lora_modules
+
+    modules = list(iter_mlx_lora_modules(model))
+    if not modules or getattr(model, "_unsloth_full_state_modules", None) or any(type(m) is not LoRALinear for _, m in modules):
+        return None
+    adapter = {name: (module.lora_a.T, module.lora_b.T, float(module.scale)) for name, module in modules}
+    mx.eval([array for a, b, _ in adapter.values() for array in (a, b)])
+    return adapter
 
 
 def attach_vllm_engine(model, engine):
@@ -216,8 +280,14 @@ def load_lora(model, save_directory=None, load_tensors=False, lora_request_id=No
         )
     from vllm.lora.request import LoRARequest
 
-    if load_tensors:
-        # vllm-metal reads adapters only from PEFT directories, so the live weights go through one.
+    adapter = _live_adapter(model) if load_tensors and getattr(model.vllm_engine, "_unsloth_in_memory_lora", False) else None
+    if adapter is not None:
+        # One live adapter per engine: vllm-metal keeps every request it served, so each unreleased snapshot would stay.
+        if getattr(model.vllm_engine, "_unsloth_live_lora", None) is not None:
+            release_lora(model, model.vllm_engine._unsloth_live_lora[0])
+        path = next(_IN_MEMORY_PATHS)
+    elif load_tensors:
+        # A multiprocess engine, or an adapter only PEFT can describe, reads the live weights from a PEFT directory.
         path = os.path.join(_scratch_dir(), "peft")
         model.save_lora_adapters(path, adapter_format="peft")
     else:
@@ -228,11 +298,17 @@ def load_lora(model, save_directory=None, load_tensors=False, lora_request_id=No
     request_id = next(_LORA_IDS)
     if lora_request_id is not None:
         request_id = int(lora_request_id)
-    return LoRARequest(str(request_id), request_id, path)
+    request = LoRARequest(str(request_id), request_id, path)
+    if adapter is not None:
+        model.vllm_engine._unsloth_live_lora = (request, adapter)
+        _IN_MEMORY_LORAS[path] = model.vllm_engine
+    return request
 
 
 def release_lora(model, request):
-    """Drop a request's adapter from the engine and delete its directory when Unsloth created it."""
+    """Drop a request's adapter from the engine and delete its in-memory arrays or directory when Unsloth created it."""
     model.vllm_engine.llm_engine.remove_lora(request.lora_int_id)
+    if _IN_MEMORY_LORAS.pop(request.lora_path, None) is not None:
+        model.vllm_engine._unsloth_live_lora = None
     if _scratch_root is not None and os.path.commonpath([_scratch_root, request.lora_path]) == _scratch_root:
         shutil.rmtree(os.path.dirname(request.lora_path), ignore_errors=True)

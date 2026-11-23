@@ -1313,7 +1313,7 @@ class GRPOBatchPlan:
         return self._finish_generation(visit, prompts, read, encoded, results)
 
     def _generate_vllm(self, visit, prompts):
-        """Rollouts from the model's vLLM engine with a snapshot of the live adapter, which it reads from disk."""
+        """Rollouts from the model's vLLM engine with a snapshot of the live adapter."""
         from vllm import SamplingParams as VLLMSamplingParams
 
         from .vllm_utils import load_lora, release_lora

@@ -129,11 +129,44 @@ def test_an_in_process_engine_shares_only_matching_weights(monkeypatch, layers, 
     v1, original, model._src_path = types.SimpleNamespace(model_lifecycle=life), life.mlx_lm_load_model, "/snap"
     for item in (("vllm_metal", types.SimpleNamespace(v1=v1)), ("vllm_metal.v1", v1), ("vllm_metal.v1.model_lifecycle", life)):
         monkeypatch.setitem(sys.modules, *item)
-    monkeypatch.setattr(sys.modules["vllm"], "LLM", lambda **kw: (life.mlx_lm_load_model(kw["model"])[0], life.mlx_vlm_load_model(kw["model"])))
-    engine, vision = vllm_utils.load_vllm(model, max_seq_length=64)
+    monkeypatch.setattr(sys.modules["vllm"], "LLM", lambda **kw: types.SimpleNamespace(models=(life.mlx_lm_load_model(kw["model"])[0], life.mlx_vlm_load_model(kw["model"]))))
+    engine, vision = vllm_utils.load_vllm(model, max_seq_length=64).models
     aliased = [array is dict(tree_flatten(model.parameters())).get(name) for name, array in tree_flatten(engine.parameters())]
     assert calls == loads and life.mlx_lm_load_model is original and all(aliased) == (loads == [True]) == any(aliased)
     assert all(getattr(m, "_unsloth_no_checkpoint", False) == (multiprocess == "0") for x in (engine, vision) for _, m in x.named_modules())
+
+
+def test_an_in_process_engine_reads_the_live_lora_from_memory(monkeypatch):
+    import mlx.core as mx
+    from mlx_lm.tuner.utils import linear_to_lora_layers
+    from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
+    worker = types.SimpleNamespace(load_peft_adapter=lambda path, *, lora_id, **kwargs: ("disk", path))
+    lora = types.SimpleNamespace(worker_manager=worker, peft_loader=types.SimpleNamespace(LoadedLoRA=lambda **kwargs: kwargs, LoRALayerWeightsMLX=lambda *args: args))
+    for item in (("vllm_metal", types.SimpleNamespace(v1=types.SimpleNamespace(lora=lora))), ("vllm_metal.v1.lora", lora), ("vllm_metal.v1.lora.peft_loader", lora.peft_loader)):
+        monkeypatch.setitem(sys.modules, *item)
+    _fake_vllm(monkeypatch, "vllm_metal.platform")
+    model = _tiny(0)
+    linear_to_lora_layers(model, 2, {"rank": 4, "scale": 2.0, "dropout": 0.0})
+    model.vllm_engine = type("LLM", (), {"llm_engine": types.SimpleNamespace(remove_lora=lambda i: None, add_request=lambda *a, lora_request: "added")})()  # weak-referenceable, as vLLM's is
+    model.vllm_engine._unsloth_in_memory_lora = vllm_utils._serve_in_memory_loras(model.vllm_engine)
+    request, snapshot = vllm_utils.load_lora(model, load_tensors=True), {n: (m.lora_a.T, m.lora_b.T) for n, m in iter_mlx_lora_modules(model)}
+    for _, module in iter_mlx_lora_modules(model):  # training goes on after the snapshot
+        module.lora_a = module.lora_a + 1
+    loaded = worker.load_peft_adapter(request.lora_path, lora_id=3)
+    assert loaded["rank"] == 4 and loaded["lora_id"] == 3 and set(loaded["weights"]) == set(snapshot) and not os.path.exists(request.lora_path)
+    assert all(mx.array_equal(w[2], snapshot[n][0]) and mx.array_equal(w[3], snapshot[n][1]) and w[4] == 2.0 for n, w in loaded["weights"].items())
+    with pytest.raises(ValueError, match="max_lora_rank 2"):
+        worker.load_peft_adapter(request.lora_path, lora_id=3, lora_config=types.SimpleNamespace(max_lora_rank=2))
+    newer = vllm_utils.load_lora(model, load_tensors=True)  # replaces the unreleased live adapter
+    add_request = model.vllm_engine.llm_engine.add_request
+    assert add_request("1", "p", None, lora_request=newer) == add_request("2", "p", None, lora_request=None) == "added"
+    with pytest.raises(ValueError, match="replaced by a newer"):
+        add_request("3", "p", None, lora_request=request)
+    vllm_utils.release_lora(model, newer)
+    assert len(vllm_utils._IN_MEMORY_LORAS) == 0 and model.vllm_engine._unsloth_live_lora is None and worker.load_peft_adapter("/saved", lora_id=4) == ("disk", "/saved")
+    vllm_utils.load_lora(model, load_tensors=True)
+    model.vllm_engine = None  # an engine dropped without a release takes its live adapter with it
+    assert len(vllm_utils._IN_MEMORY_LORAS) == 0
 
 
 def test_load_vllm_refuses_a_non_metal_vllm(monkeypatch):
