@@ -474,7 +474,12 @@ def _compiled_flex():
     global _FLEX
     if _FLEX is None:
         from torch.nn.attention.flex_attention import flex_attention
-        _FLEX = torch.compile(flex_attention)
+        from unsloth_zoo.rocm_flex_static import rocm_static_flex
+
+        def rocm_static_entry(query, key, value, *args, **kwargs):
+            return flex_attention(query, key, value, *args, **kwargs)
+        # ROCm: calls whose backward will run get a static compile (symbolic lengths gave NaN grads on gfx1151).
+        _FLEX = rocm_static_flex(torch.compile(flex_attention), rocm_static_entry)
     return _FLEX
 
 

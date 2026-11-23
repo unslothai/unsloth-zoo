@@ -84,6 +84,13 @@ try:
         _flex_attention = functools.partial(_flex_attention, kernel_options = kernel_options)
     pass
     flex_attention = _torch_compile(_flex_attention)
+    if flex_attention is not _flex_attention:
+        from unsloth_zoo.rocm_flex_static import rocm_static_flex
+
+        def _rocm_static_flex_entry(query, key, value, *args, **kwargs):
+            return _flex_attention(query, key, value, *args, **kwargs)
+        # ROCm: calls whose backward will run get a static compile (symbolic lengths gave NaN grads on gfx1151).
+        flex_attention = rocm_static_flex(flex_attention, _rocm_static_flex_entry)
     # Prefill/training: AUTO sends queries under 128 rows to flex_decoding, which has no valid config once q_len * GQA
     # group > 128; Dynamo then runs flex eagerly and checkpoint recompute raises CheckpointError.
     PREFILL_KERNEL_OPTIONS = {**(kernel_options or {}), "FORCE_USE_FLEX_ATTENTION": True}

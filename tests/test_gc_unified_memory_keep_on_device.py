@@ -392,3 +392,39 @@ def test_keep_message_names_the_reason(G, monkeypatch, capsys, forced, expect):
     monkeypatch.setattr(G, "_WARNED_KEEP_ON_DEVICE", False)
     assert G._keeps_on_device(0, 1024) is True
     assert expect in capsys.readouterr().out
+
+
+def test_reset_after_training_when_every_device_keeps(G, monkeypatch):
+    """Every device keeping its inputs leaves CPU_BUFFERS empty on purpose. reset_unsloth_gradient_checkpointing_buffers
+    took that for "not initialized" and returned early: the next run inherited FIRST_PASS = False and the previous
+    model's LAST_GC_INDEX, and the allocator cache was never emptied after training."""
+    monkeypatch.setattr(G, "_keep_on_device_indices", lambda: frozenset({None}))
+    monkeypatch.setattr(G, "_visible_device_count", lambda: 1)
+    stubs = {n: getattr(G, n) for n in ("GPU_BUFFERS", "GPU_BUFFERS_B", "USE_DOUBLE_BUFFER", "EXTRA_STREAMS",
+                                        "NEXT_BUFFER_SLOT", "MINIMUM_SIZE", "FP32_OFFLOAD_EXACT")}
+    G.initialize_unsloth_gradient_checkpointing(torch.float32)
+    assert G.CPU_BUFFERS == []  # every device keeps: no pinned pool
+    for n, v in stubs.items(): setattr(G, n, v)
+    _grads(G, ckpt = True)  # one training run: L checkpointed layers
+    assert G._test_leases == []
+    assert G.FIRST_PASS is False and G.LAST_GC_INDEX == L
+    G.CURRENT_GC_INDEX = 3  # an interrupted forward
+    emptied = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: emptied.append(1))
+    G.reset_unsloth_gradient_checkpointing_buffers()
+    assert (G.FIRST_PASS, G.LAST_GC_INDEX, G.CURRENT_GC_INDEX, G.BACKWARD_PASS) == (True, 0, 0, True)
+    assert G.CPU_BUFFERS == []  # still no pinned pool
+    assert emptied == [1]
+    # The next run counts its own checkpointed layers again and trains exactly.
+    got = _grads(G, ckpt = True)
+    assert G.LAST_GC_INDEX == L
+    ref = _grads(G, ckpt = False)
+    for a, b in zip(ref, got): torch.testing.assert_close(a, b, rtol = 0, atol = 0)
+
+
+def test_reset_before_initialization_is_a_no_op(G):
+    G.CPU_BUFFERS, G.GPU_BUFFERS = [], None  # the import-time state
+    G.FIRST_PASS, G.LAST_GC_INDEX = False, 7
+    G.reset_unsloth_gradient_checkpointing_buffers()
+    assert (G.FIRST_PASS, G.LAST_GC_INDEX) == (False, 7)
+    assert G.GPU_BUFFERS is None
