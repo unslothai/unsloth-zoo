@@ -788,9 +788,7 @@ from unsloth_zoo.loss_utils import (
     fused_linear_cross_entropy,
     unsloth_fused_ce_loss,
 )
-from unsloth_zoo.fused_losses.forward_adapter import (
-    lm_head_fake_quantize, lm_head_needs_module_forward, unsloth_fused_lm_head_loss, unsloth_module_head_ce_loss,
-)
+from unsloth_zoo.fused_losses.forward_adapter import lm_head_fake_quantize, lm_head_needs_module_forward, unsloth_fused_lm_head_loss
 from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
 from unsloth_zoo.compiler import lm_head_on_old_cuda_arch
 from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs, unsloth_fsdp_unshard
@@ -3769,17 +3767,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif labels is not None and lm_head_needs_module_forward(self.lm_head):
-    # A live PEFT adapter on lm_head: the same loss through the head's own forward. Under
-    # UNSLOTH_RETURN_LOGITS=1 the prelude already projected: reuse it (one projection, one dropout draw).
-    loss = unsloth_module_head_ce_loss(
-        hidden_states\\1, self.lm_head, labels, mask = None, n_items = n_items,
-        precomputed_logits = None if NOT_RETURN_LOGITS else logits,
-        logit_scale_multiply = (\\2) if (\\2) != () else 0,
-        logit_scale_divide   = (\\3) if (\\3) != () else 0,
-        logit_softcapping    = (\\4) if (\\4) != () else 0,
-    )
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and not lm_head_needs_module_forward(self.lm_head) and getattr(self.lm_head, "bias", None) is None:
     _hidden_states, lm_head_weight = lm_head_fake_quantize(self.lm_head, hidden_states\\1)
     loss = fused_linear_cross_entropy(
         hidden_states      = _hidden_states,
@@ -3806,6 +3794,7 @@ else:
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
         torch_compile        = not UNSLOTH_COMPILE_DISABLE and not lm_head_on_old_cuda_arch(lm_head_weight),
+        lm_head_module       = self.lm_head,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
@@ -3860,11 +3849,6 @@ if (\\9) != () and type(\\9) is dict:
 if labels is not None: unsloth_fsdp_unshard(self.lm_head)
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
-# A live PEFT adapter on lm_head: lm_head.weight is its base weight, so only the head's forward trains it.
-_needs_module_head = (
-    not RETURN_HIDDEN_STATES and labels is not None and NOT_RETURN_LOGITS
-    and _can_fuse_loss(self.loss_function) and lm_head_needs_module_forward(self.lm_head)
-)
 
 __UNSLOTH_TRAINING_STANCE_MARKER__
 if RETURN_HIDDEN_STATES:
@@ -3885,20 +3869,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif _needs_module_head and NOT_RETURN_LOGITS:
-    # Stock loss (_can_fuse_loss) on the head's own logits, with the kernel's reduction and smoothing override.
-    _loss_kwargs = (\\9) if type(\\9) is dict else {}
-    loss, logits = unsloth_module_head_ce_loss(
-        hidden_states\\1, self.lm_head, labels if explicit_shift_labels is None else explicit_shift_labels,
-        n_items = n_items, shift_labels = explicit_shift_labels is None,
-        ignore_index = _loss_kwargs.get("ignore_index", -100),
-        label_smoothing = _loss_kwargs.get("label_smoothing", 0.0),
-        logit_scale_multiply = (\\2) if (\\2) != () else 0,
-        logit_scale_divide   = (\\3) if (\\3) != () else 0,
-        logit_softcapping    = (\\4) if (\\4) != () else 0,
-        return_logits        = True,
-    )
-elif not _needs_module_head and ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and not lm_head_needs_module_forward(self.lm_head) and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
     _hidden_states, lm_head_weight = lm_head_fake_quantize(self.lm_head, hidden_states\\1)
     loss = fused_linear_cross_entropy(
         hidden_states      = _hidden_states,
@@ -3907,7 +3878,7 @@ elif not _needs_module_head and ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABL
         num_items_in_batch = n_items,
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
-elif _can_fuse_loss(self.loss_function) and not _needs_module_head and labels is not None and NOT_RETURN_LOGITS:
+elif _can_fuse_loss(self.loss_function) and labels is not None and NOT_RETURN_LOGITS:
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
     # ========= NEW fused =========
@@ -3926,6 +3897,7 @@ elif _can_fuse_loss(self.loss_function) and not _needs_module_head and labels is
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
         torch_compile        = not UNSLOTH_COMPILE_DISABLE and not lm_head_on_old_cuda_arch(lm_head_weight),
+        lm_head_module       = self.lm_head,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
@@ -4025,19 +3997,6 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif labels is not None and lm_head_needs_module_forward(self.lm_head):
-    _mask = \\6
-    if _mask is not None and _mask.shape[-1] > labels.shape[-1]:
-        _mask = _mask[..., -labels.shape[-1]:]
-    # A live PEFT adapter on lm_head: the same loss through the head's own forward. Under
-    # UNSLOTH_RETURN_LOGITS=1 the prelude already projected: reuse it (one projection, one dropout draw).
-    loss = unsloth_module_head_ce_loss(
-        hidden_states\\1, self.lm_head, labels, mask = _mask, n_items = n_items,
-        precomputed_logits = None if NOT_RETURN_LOGITS else logits,
-        logit_scale_multiply = (\\2) if (\\2) != () else 0,
-        logit_scale_divide   = (\\3) if (\\3) != () else 0,
-        logit_softcapping    = (\\4) if (\\4) != () else 0,
-    )
 else:
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
@@ -4062,6 +4021,7 @@ else:
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
         torch_compile        = not UNSLOTH_COMPILE_DISABLE and not lm_head_on_old_cuda_arch(lm_head_weight),
+        lm_head_module       = self.lm_head,
         logit_scale_multiply = (\\2) if (\\2) != () else 0,
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,

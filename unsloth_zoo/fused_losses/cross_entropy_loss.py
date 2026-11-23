@@ -167,7 +167,6 @@ def compute_fused_ce_loss(
     6) logits_bias          (X = X + logits_bias, right after the head; no gradient)
     """
     ignore_index = int(kwargs.get("ignore_index", -100))
-    label_smoothing = float(kwargs.get("label_smoothing", 0.0))
     device = lm_head_weight.device
     if shift_labels:
         # Get shifted labels first
@@ -182,13 +181,27 @@ def compute_fused_ce_loss(
         lm_head_weight,
         lm_head_bias,
     )
+    loss = _logits_ce_loss(logits, labels, n_items, kwargs)
+    # Scale loss if needed for mixed precision training
+    scaled_loss = loss * scaling if scaling is not None else loss
+    # Must add .loss.detach otherwise autograd uses 2x VRAM
+    return scaled_loss, (loss.detach(),)
+pass
+
+
+def _logits_ce_loss(logits, labels, n_items, kwargs):
+    """compute_fused_ce_loss after the head projection: vocab bias, logit transforms in the logits' dtype, then a
+    stable fp32 (smoothed) nll summed over labelled rows / n_items (else the labelled token count)."""
+    ignore_index = int(kwargs.get("ignore_index", -100))
+    label_smoothing = float(kwargs.get("label_smoothing", 0.0))
+    device = logits.device
     # Extra vocab bias added after the head (Bart `final_logits_bias`), with the stock dtype promotion.
     logits_bias = kwargs.get("logits_bias", None)
     if logits_bias is not None:
         # Promote before the add: torch 2.7 inductor folds a bare add into a mixed dtype addmm under autocast.
         logits_bias = logits_bias.to(device = device)
         logits = logits.to(torch.promote_types(logits.dtype, logits_bias.dtype)) + logits_bias
-    vocab_size = lm_head_weight.shape[0]
+    vocab_size = logits.shape[-1]
 
     # Apply softcapping and other functions
     logit_scale_multiply = kwargs.get("logit_scale_multiply", None)
@@ -212,11 +225,7 @@ def compute_fused_ce_loss(
         label_smoothing,
     )
     loss = torch.where(keep, nll, torch.zeros_like(nll)).sum()
-    loss = loss / _nonzero_count(n_items if n_items is not None else (target != ignore_index).sum())
-    # Scale loss if needed for mixed precision training
-    scaled_loss = loss * scaling if scaling is not None else loss
-    # Must add .loss.detach otherwise autograd uses 2x VRAM
-    return scaled_loss, (loss.detach(),)
+    return loss / _nonzero_count(n_items if n_items is not None else (target != ignore_index).sum())
 pass
 
 
@@ -834,6 +843,97 @@ def _apply_label_smoothing_override(n_items, kwargs):
     return state.n_items, {**kwargs, "label_smoothing": state.epsilon}
 
 
+def _adapter_containers_fully_merged(module):
+    """True only when every adapter a PEFT tuner layer holds is merged into its base (forward == base_layer(x))."""
+    merged = set(getattr(module, "merged_adapters", None) or ())
+    held = set()
+    for layer_name in getattr(module, "adapter_layer_names", None) or ():
+        container = module
+        for part in layer_name.split("."):
+            container = getattr(container, part, None)
+        if container is None:
+            return False  # a layout this check does not know: assume live
+        held.update(container.keys())
+    return bool(held) and held <= merged
+
+
+def _lm_head_module_reason(lm_head):
+    """Why lm_head.forward() is not `hidden @ lm_head.weight.T + bias` (a live PEFT adapter), else None.
+    Conservative: anything ambiguous takes the head's own forward, which is always right, only slower."""
+    tuner = None
+    for module in lm_head.modules():
+        for hook in module._forward_pre_hooks.values():
+            if getattr(getattr(hook, "func", hook), "__name__", "") == "_adapter_names_pre_forward_hook":
+                return "per-example adapter_names"
+        if getattr(type(module), "adapter_layer_names", None) is None or not hasattr(module, "base_layer"):
+            continue
+        tuner = tuner or module
+        if getattr(module, "disable_adapters", False):
+            # Disabled: PEFT's forward unmerges a merged adapter first, then runs the base layer.
+            return f"disabled {type(module).__name__}"
+        if not _adapter_containers_fully_merged(module):
+            return type(module).__name__
+    if tuner is not None:
+        base = tuner
+        while getattr(base, "base_layer", None) is not None:
+            base = base.base_layer
+        if type(base) is not torch.nn.Linear:
+            return f"{type(base).__name__} under a merged {type(tuner).__name__}"
+    return None
+
+
+_WARNED_MODULE_HEADS = set()
+
+
+def _warn_module_head(reason):
+    if reason in _WARNED_MODULE_HEADS:
+        return
+    _WARNED_MODULE_HEADS.add(reason)
+    print(
+        f"Unsloth: the LM head has a live PEFT adapter ({reason}). The fused cross entropy reads only "
+        "lm_head.weight, so the loss calls the head's own forward and builds the full logits (more memory). "
+        "modules_to_save on lm_head, or a merged adapter, keeps the fused loss."
+    )
+
+
+def lm_head_needs_module_forward(lm_head):
+    """True when only lm_head.forward() gives the right logits: a live PEFT adapter anywhere in the head."""
+    if lm_head is None or type(lm_head) is torch.nn.Linear:
+        return False
+    reason = _lm_head_module_reason(lm_head)
+    if reason is None:
+        return False
+    # Printing inside a trace would break fullgraph capture; an eager call prints it.
+    if not torch.compiler.is_compiling():
+        _warn_module_head(reason)
+    return True
+
+
+def _module_head_ce_loss(lm_head, hidden_states, labels, mask, n_items, shift_labels, kwargs):
+    """unsloth_fused_ce_loss on lm_head(hidden_states): the chunked path's targets (shift, mask on shifted or
+    pre-aligned labels) and compute_fused_ce_loss's reduction (_logits_ce_loss), on the head's own logits."""
+    ignore_index = int(kwargs.get("ignore_index", -100))
+    weight = getattr(lm_head, "weight", None)
+    if weight is not None and weight.device.type != "meta" and getattr(lm_head, "_hf_hook", None) is None:
+        # As the kernel feeds its matmul: on the head's device, in a floating head's dtype outside autocast.
+        dtype = hidden_states.dtype
+        if weight.is_floating_point() and not _autocast_enabled(weight.device.type):
+            dtype = weight.dtype
+        hidden_states = hidden_states.to(device = weight.device, dtype = dtype)
+    logits = lm_head(hidden_states)
+    targets = _chunked_logprob._ce_targets(labels.to(torch.long), mask, shift_labels, ignore_index, logits.device)
+    logits = logits.reshape(-1, logits.shape[-1])
+    if logits.shape[0] != targets.shape[0]:
+        raise ValueError(
+            f"Unsloth: the LM head produced {logits.shape[0]} rows for {targets.shape[0]} target tokens."
+        )
+    # An ignored row never reaches the loss; zeroing it keeps a half precision overflow there out of backward.
+    logits = logits.masked_fill((targets == ignore_index).unsqueeze(-1), 0)
+    if torch.is_tensor(n_items) and n_items.numel() != 1:
+        n_items = n_items.ravel()[0]  # DataParallel replica: one count
+    return _logits_ce_loss(logits, targets, n_items, kwargs)
+
+
 def unsloth_fused_ce_loss(
     trainer,
     hidden_states  : torch.Tensor,
@@ -847,6 +947,7 @@ def unsloth_fused_ce_loss(
     torch_compile  : Optional[bool] = True,
     overwrite      : Optional[bool] = False,
     shift_labels   : bool = True,
+    lm_head_module : Optional[torch.nn.Module] = None,
     **kwargs,
 ):
     """
@@ -856,6 +957,7 @@ def unsloth_fused_ce_loss(
       Set False when caller already pre-shifted (e.g. trl padding_free).
     * Allows scaling factor from mixed precision fp16, fp8
     * target_gb specifies the max GB memory the fused loss can use - default detects VRAM left
+    * lm_head_module: the head module; one with a live PEFT adapter is scored through its own forward
     * Upcasts to float32 and allows kwargs to have:
     1) logit_scale_multiply (X = X * logit_scale_multiply)
     2) logit_scale_divide   (X = X / logit_scale_divide)
@@ -871,6 +973,10 @@ def unsloth_fused_ce_loss(
     scaling = scaler if scaler is not None else scaling
     if _LABEL_SMOOTHING.active:
         n_items, kwargs = _apply_label_smoothing_override(n_items, kwargs)
+    # A live PEFT adapter on the head (lm_head_module): lm_head_weight is its base weight, which would drop the
+    # adapter (no gradient, the base head's loss). Same reduction on the head's own logits.
+    if lm_head_needs_module_forward(lm_head_module):
+        return _module_head_ce_loss(lm_head_module, hidden_states, labels, mask, n_items, shift_labels, kwargs)
     if TARGET_GB: target_gb = float(TARGET_GB)
     elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)
 

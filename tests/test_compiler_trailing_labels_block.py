@@ -146,8 +146,6 @@ def test_real_bamba_forward_is_guarded():
         pytest.skip("this transformers BambaForCausalLM has no z-loss")
     new, fused = compiler.apply_fused_lm_head(source, "BambaForCausalLM")
     assert fused
-    # CCE, fused CE and the lm_head-adapter branch all skip the z-loss block; the exact branch replays it.
-    assert new.count("and not (self.z_loss_coefficient > 0):") == 3
-    assert "elif _needs_module_head and NOT_RETURN_LOGITS and not (self.z_loss_coefficient > 0):" in new
+    assert new.count("and not (self.z_loss_coefficient > 0):") == 2
     assert "and labels is not None and not NOT_RETURN_LOGITS:" in new
     assert new.count("z_loss = logits.logsumexp(") == 2
