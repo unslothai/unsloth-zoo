@@ -27,7 +27,7 @@ import weakref
 
 import torch
 
-from unsloth_zoo.private_staging import precreate_private_temp
+from unsloth_zoo.private_staging import keep_mode, precreate_private_temp
 from .runtime import available_ram, cpu_bf16_supported, cpu_bnb_4bit_supported
 from .ops import (
     Bf16StoredLinear, _plain_lm_head, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, set_bf16_stored_dtype,
@@ -1380,14 +1380,6 @@ def _remove_stale_weights(save_directory, names):
                 os.remove(path)
 
 
-def _keep_existing_mode(temporary, final):
-    """Carry the old file's mode over on re-export (else 0600 weights become umask-default 0644)."""
-    try:
-        os.chmod(temporary, os.stat(final).st_mode & 0o7777)
-    except OSError:
-        pass
-
-
 def _stream_merged_save(model, save_directory, save_method, max_shard_size = None):
     """Writes the merged checkpoint shard by shard from the live model (peak RSS about the model plus one shard,
     instead of a full deepcopy). Same tensors, names, dtypes and config as merge_and_unload().save_pretrained().
@@ -1445,6 +1437,9 @@ def _stream_merged_save(model, save_directory, save_method, max_shard_size = Non
     # weights may be memory-mapped from the files being replaced (a model loaded from save_directory), and an
     # interrupted export must not leave a half-written model.safetensors that loaders would pick.
     rank, staged = _safetensors_dtype_rank(), []
+    # A different shard count writes new names: those take the mode of an earlier export's weights in this folder.
+    earlier = [os.path.join(save_directory, f) for f in sorted(os.listdir(save_directory))
+               if f == "model.safetensors" or _STALE_SHARD.fullmatch(f)]
     try:
         with torch.no_grad():
             for name, shard in shards:
@@ -1462,7 +1457,7 @@ def _stream_merged_save(model, save_directory, save_method, max_shard_size = Non
             with open(temporary, "w", encoding = "utf-8") as f:
                 f.write(json.dumps(index, indent = 2, sort_keys = True) + "\n")
         for temporary, final in staged:
-            _keep_existing_mode(temporary, final)
+            keep_mode(temporary, final, like = earlier)
             os.replace(temporary, final)
     finally:
         for temporary, _ in staged:

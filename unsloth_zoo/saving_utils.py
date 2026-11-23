@@ -29,6 +29,7 @@ import warnings
 from .peft_utils import get_lora_layer_modules
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
+from .private_staging import keep_mode
 from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH, device_empty_cache
 from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
 from collections import defaultdict
@@ -6645,7 +6646,9 @@ def _copy_file_from_source(src_path: Union[str, Path], target_dir_str: str, file
         )
         os.close(_fd)
         shutil.copy2(str(src_path), _staging) # Use string paths for shutil
-        os.chmod(_staging, stat.S_IMODE(os.stat(_staging).st_mode) | stat.S_IWUSR)
+        # Re-export keeps the existing output's mode (a 0600 file the user restricted stays 0600); a first copy takes
+        # the source's mode narrowed by the umask.
+        keep_mode(_staging, dst_path, source_mode = stat.S_IMODE(os.stat(_staging).st_mode), add = stat.S_IWUSR)
         os.replace(_staging, dst_path)
     except Exception as e:
         if _staging is not None and os.path.exists(_staging):
@@ -9431,6 +9434,7 @@ def split_safetensor_file(filename, save_directory, max_shard_size_gb=2):
             temp_filename = f"temp_split_{temp_base}_{i:03d}.safetensors"
             temp_file_path = os.path.join(save_directory, temp_filename)
             save_file(shard, temp_file_path, metadata={"format": "pt"})
+            keep_mode(temp_file_path, file_path)  # the split pieces keep the mode of the shard they replace
             temp_filenames.append(temp_filename)
 
             shard_size = sum(tensor.numel() * tensor.element_size() for tensor in shard.values())
@@ -9784,14 +9788,9 @@ class _SinglePassShardWriter:
         st = os.stat(self._staging)
         if self._wrote:
             os.utime(self._staging, ns = (st.st_atime_ns, time.time_ns()))
-        mode = stat.S_IMODE(st.st_mode)
-        try:
-            # Re-export over an earlier output: keep that file's mode, else a 0600 shard the user restricted takes the base
-            # checkpoint's (usually 0644) mode on publication.
-            mode = stat.S_IMODE(os.stat(self.destination).st_mode)
-        except OSError:
-            pass
-        os.chmod(self._staging, mode | stat.S_IWUSR)
+        # Re-export over an earlier output: keep that file's mode, else a 0600 shard the user restricted takes the base
+        # checkpoint's (usually 0644) mode on publication; a first export takes the base's mode narrowed by the umask.
+        keep_mode(self._staging, self.destination, source_mode = stat.S_IMODE(st.st_mode), add = stat.S_IWUSR)
         os.replace(self._staging, self.destination)
         self._staging = None
 

@@ -78,6 +78,7 @@ from unsloth_zoo.temporary_patches.common import (
     UNSLOTH_ENABLE_LOGGING,
 )
 from .log import logger
+from .private_staging import keep_mode
 from .device_type import DEVICE_TYPE, is_hip, device_is_bf16_supported
 global LORA_REQUEST_ID
 
@@ -6254,6 +6255,8 @@ def _save_dir_atomically(save_fn, save_directory, rank):
             target = save_directory if rel == "." else os.path.join(save_directory, rel)
             os.makedirs(target, exist_ok = True)
             for name in files:
+                # A re-save keeps the mode of the file it replaces (weights the user restricted stay restricted).
+                keep_mode(os.path.join(root, name), os.path.join(target, name))
                 os.replace(os.path.join(root, name), os.path.join(target, name))
     finally:
         shutil.rmtree(tmp, ignore_errors = True)
