@@ -20,10 +20,20 @@ Their activation is a softcapped SwiGLU, `tanh(g / c_g) * c_g * sigmoid(g) * tan
 unless the experts declare their own `_apply_gate`, so declare it, and the fp32 reference, on both expert classes.
 """
 
-from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING
-from .utils import logger
+import functools
+from typing import List
 
-__all__ = ["patch_inkling2_moe_experts", "INKLING2_EXPERT_CLASSES"]
+import torch
+
+from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING
+from .utils import UNSLOTH_DECODE_COMPILE, logger, torch_compiler_disable_unless_decode
+
+__all__ = [
+    "patch_inkling2_moe_experts",
+    "INKLING2_EXPERT_CLASSES",
+    "inkling2_residual_eager_unless_decode",
+    "inkling2_block_residual_reference",
+]
 
 INKLING2_EXPERT_CLASSES = (
     ("transformers.models.inkling2.modeling_inkling2", "Inkling2Experts"),
@@ -49,3 +59,121 @@ def patch_inkling2_moe_experts():
 
 
 TEMPORARY_PATCHES.append(patch_inkling2_moe_experts)
+
+
+# Block attention residuals. Compiled with Inductor (dynamic = True, CUDA), the one-query form over 3+ stacked blocks
+# returns correct values but wrong input grads, so the compiler keeps them eager. A torch.compiler.disable boundary
+# does that outside any graph, but inside an enclosing compiled graph it is a graph break, and under fullgraph = True
+# a hard Unsupported. The opaque custom ops below keep the same eager forward and backward inside the graph instead.
+def inkling2_block_residual_reference(block_states, partial_block_states, query, eps):
+    """transformers' Inkling2{,Loop}BlockAttentionResidual.forward (eager attention), stacked as
+    [..., num_queries, hidden] in fp32 instead of unbound."""
+    stacked = torch.cat([block_states, partial_block_states.unsqueeze(-2)], dim = -2).float()
+    stacked = stacked * torch.rsqrt(stacked.square().mean(-1, keepdim = True) + eps)
+    hidden = stacked.shape[-1]
+    q = query.float().view(-1, hidden)
+    scores = torch.matmul(q, stacked.transpose(-1, -2)) * hidden ** -0.5  # [..., num_queries, blocks]
+    return torch.matmul(torch.softmax(scores, dim = -1, dtype = torch.float32), stacked)
+
+
+_RESIDUAL_OP = None
+try:
+    @torch.library.custom_op("unsloth_zoo::inkling2_block_residual", mutates_args = ())
+    def _residual_op(block_states: torch.Tensor, partial_block_states: torch.Tensor, query: torch.Tensor,
+                     eps: float) -> torch.Tensor:
+        with torch.no_grad():
+            return inkling2_block_residual_reference(block_states, partial_block_states, query, eps)
+
+    @_residual_op.register_fake
+    def _residual_fake(block_states, partial_block_states, query, eps):
+        hidden = partial_block_states.shape[-1]
+        return partial_block_states.new_empty(
+            (*partial_block_states.shape[:-1], query.numel() // hidden, hidden), dtype = torch.float32)
+
+    @torch.library.custom_op("unsloth_zoo::inkling2_block_residual_backward", mutates_args = ())
+    def _residual_backward_op(grad: torch.Tensor, block_states: torch.Tensor, partial_block_states: torch.Tensor,
+                              query: torch.Tensor, eps: float) -> List[torch.Tensor]:
+        # The op body runs below autograd: torch.func.vjp carries its own grad transform.
+        _, vjp = torch.func.vjp(
+            lambda b, p, q: inkling2_block_residual_reference(b, p, q, eps), block_states, partial_block_states, query)
+        taken = {t.untyped_storage().data_ptr() for t in (grad, block_states, partial_block_states, query)}
+        grads = []
+        for g in vjp(grad):
+            # Contiguous, as the fake promises; op outputs may not alias its inputs or each other.
+            g = g.contiguous()
+            ptr = g.untyped_storage().data_ptr()
+            grads.append(g.clone() if ptr in taken else g)
+            taken.add(ptr)
+        return grads
+
+    @_residual_backward_op.register_fake
+    def _residual_backward_fake(grad, block_states, partial_block_states, query, eps):
+        return [t.new_empty(t.shape) for t in (block_states, partial_block_states, query)]
+
+    def _residual_setup_context(ctx, inputs, output):
+        block_states, partial_block_states, query, eps = inputs
+        ctx.save_for_backward(block_states, partial_block_states, query)
+        ctx.eps = eps
+
+    def _residual_backward(ctx, grad):
+        block_states, partial_block_states, query = ctx.saved_tensors
+        grads = torch.ops.unsloth_zoo.inkling2_block_residual_backward(
+            grad.contiguous(), block_states, partial_block_states, query, ctx.eps)
+        return grads[0], grads[1], grads[2], None
+
+    _residual_op.register_autograd(_residual_backward, setup_context = _residual_setup_context)
+    _RESIDUAL_OP = _residual_op
+except Exception:  # torch without torch.library.custom_op: the plain compiler boundary stays
+    _RESIDUAL_OP = None
+
+
+def _residual_inputs(args, kwargs):
+    # The compiler's generated forward passes both by name.
+    if not kwargs and len(args) == 2:
+        return args
+    if len(args) + len(kwargs) != 2:
+        return None
+    names = ("block_states", "partial_block_states")
+    got = dict(zip(names, args))
+    for name, value in kwargs.items():
+        if name not in names or name in got:
+            return None
+        got[name] = value
+    return got["block_states"], got["partial_block_states"]
+
+
+def _residual_op_eps(module, args):
+    # Only the layout the reference reproduces: two tensor inputs, an unweighted RMSNorm, eager or sdpa attention
+    # (transformers 5.23 calls sdpa directly and keeps no config on the module).
+    if _RESIDUAL_OP is None or args is None:
+        return None
+    query, norm = getattr(module, "query", None), getattr(module, "norm", None)
+    eps = getattr(norm, "eps", None)
+    if not isinstance(query, torch.Tensor) or not type(norm).__name__.endswith("UnweightedRMSNorm"):
+        return None
+    if not isinstance(eps, float) or len(list(norm.parameters())) != 0:
+        return None
+    config = getattr(module, "config", None)
+    if config is not None and getattr(config, "_attn_implementation", None) not in ("eager", "sdpa"):
+        return None
+    if not all(isinstance(x, torch.Tensor) for x in args) or args[0].shape[-1] != query.shape[-1]:
+        return None
+    return eps
+
+
+def inkling2_residual_eager_unless_decode(func):
+    """torch_compiler_disable_unless_decode for the block attention residuals, except that inside an enclosing
+    compiled training graph the residual runs as an opaque op (eager forward and backward, no graph break)."""
+    disabled = torch_compiler_disable_unless_decode(func)
+    plain = getattr(func, "_unsloth_undisabled", func)
+
+    @functools.wraps(plain)
+    def forward(self, *args, **kwargs):
+        if torch.compiler.is_compiling() and not UNSLOTH_DECODE_COMPILE[0]:
+            inputs = _residual_inputs(args, kwargs)
+            eps = _residual_op_eps(self, inputs)
+            if eps is not None:
+                return _RESIDUAL_OP(inputs[0], inputs[1], self.query, eps).unbind(-2)
+        return disabled(self, *args, **kwargs)
+    forward._unsloth_undisabled = plain
+    return forward
