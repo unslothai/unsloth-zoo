@@ -633,8 +633,15 @@ def _lora_op_args(lora):
     return B, [], lora[1], float(lora[2])
 
 
+def _flat_index(idx):
+    """idx flattened with unit stride: the kernels read expert ids at IDX + p, and reshape(-1) of a strided view
+    (a column slice of the router's top-k) can keep a non-unit stride and read the wrong ids."""
+    return idx.reshape(-1).contiguous()
+
+
 def routed_gate_up(x, idx, tb, top_k, alpha, limit, lora = None, act = ACT_GPTOSS, interleaved = True):
     """[T * top_k, N // 2] fp32 gated activation of the routed gate_up GEMVs."""
+    idx = _flat_index(idx)
     if torch.compiler.is_compiling():
         return torch.ops.unsloth_zoo.routed_nf4_gate_up(
             x, idx, *_table_args(tb), top_k, *_lora_op_args(lora), float(alpha), float(limit),
@@ -646,6 +653,7 @@ def routed_gate_up(x, idx, tb, top_k, alpha, limit, lora = None, act = ACT_GPTOS
 
 def routed_down(x, idx, rw, dense_rw, tb, top_k, out_dtype, lora = None):
     """[T, N]: routing-weighted top-k sum of the routed down GEMVs."""
+    idx = _flat_index(idx)
     if torch.compiler.is_compiling():
         return torch.ops.unsloth_zoo.routed_nf4_down(
             x, idx, rw, dense_rw, *_table_args(tb), top_k, *_lora_op_args(lora), out_dtype, _bias_list(tb))
@@ -717,6 +725,7 @@ if triton is not None:
 
 def routed_lora_h(x, idx, a_list, row_div = 1):
     """fp32 [P, r]: row p = A[idx[p]] @ x[p // row_div], read in place via lora_pointer_table."""
+    idx = _flat_index(idx)
     if torch.compiler.is_compiling():
         return torch.ops.unsloth_zoo.routed_lora_h(x, idx, list(a_list), int(row_div))
     return _lora_h_eager(x, idx, a_list, row_div)
@@ -789,12 +798,6 @@ if triton is not None:
     @_lora_b_op.register_fake
     def _routed_lora_b_fake(base, prev, h, idx, b, scaling):
         return h.new_empty((h.shape[0], b.shape[2]), dtype = torch.float32)
-
-
-def _flat_index(idx):
-    """idx flattened with unit stride: the kernels read expert ids at IDX + p, and reshape(-1) of a strided view
-    (a column slice of the router's top-k) can keep a non-unit stride and read the wrong ids."""
-    return idx.reshape(-1).contiguous()
 
 
 def _lora_x(x):
