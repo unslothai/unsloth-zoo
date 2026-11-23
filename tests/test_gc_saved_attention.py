@@ -527,6 +527,113 @@ def test_rocm_frame_still_keeps_inside_an_unsloth_compiled_block(monkeypatch):
     assert SA.SAVED_ATTENTION_STATS["stored"] >= 1
 
 
+def _rocm_frame_qkv_wrapper(monkeypatch, kind):
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
+    monkeypatch.setattr(torch.version, "hip", "7.13.0", raising = False)
+    module = torch.nn.Module()
+    module.train()
+    if kind == "interface":
+        wrapped = SA._wrap_attention_interface(lambda m, q, k, v, **kw: _sdpa(q, k, v))
+        return lambda q, k, v: wrapped(module, q, k, v)  # noqa: E731
+    wrapped = SA._wrap_flex_kernel(lambda q, k, v, **kw: _sdpa(q, k, v))
+    return lambda q, k, v: wrapped(q, k, v, training = True)  # noqa: E731
+
+
+def _two_attention_frame(call, first_call, inputs):
+    """One checkpoint frame holding two attention calls with equal shapes; the first goes through
+    `first_call(replaying)`. Returns the loss and the Q / K / V gradients."""
+    q, k, v = (x.clone().requires_grad_() for x in inputs)
+    frame = SA.new_saved_attention_frame([q, k, v])
+    assert frame is not None
+
+    def layer(replaying):
+        first = first_call(replaying)(q, k, v)
+        second = call(q + 0.7, k * 0.4, v + 3.0)
+        return (first + 2 * second).square().mean()
+
+    with SA.saved_attention_scope(frame, False), torch.no_grad():
+        layer(False)
+    with SA.saved_attention_scope(frame, True):
+        loss = layer(True)
+        loss.backward()
+    return loss.detach(), [x.grad for x in (q, k, v)]
+
+
+def _two_attention_reference(inputs):
+    q, k, v = (x.clone().requires_grad_() for x in inputs)
+    loss = (_sdpa(q, k, v) + 2 * _sdpa(q + 0.7, k * 0.4, v + 3.0)).square().mean()
+    loss.backward()
+    return loss.detach(), [x.grad for x in (q, k, v)]
+
+
+@pytest.mark.parametrize("kind", ["interface", "flex"])
+def test_rocm_frame_replays_the_right_call_when_a_compile_falls_back_to_eager(monkeypatch, kind):
+    """A user's fullgraph=False compile at its recompile limit runs the replay eagerly while the first
+    pass was compiled. Both passes must take the same route, or the replay of one call takes the entry
+    another call kept (entries are matched by call order) and its gradients are wrong."""
+    call = _rocm_frame_qkv_wrapper(monkeypatch, kind)
+    torch.manual_seed(0)
+    inputs = tuple(torch.randn(1, 2, 32, 16) for _ in range(3))
+    ref_loss, ref_grads = _two_attention_reference(inputs)
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(call, backend = "eager", fullgraph = False)
+        # The first pass (no_grad) compiles; the replay needs a grad-mode graph and runs eagerly.
+        with torch._dynamo.config.patch(recompile_limit = 1):
+            loss, grads = _two_attention_frame(call, lambda replaying: compiled, inputs)
+    finally:
+        torch._dynamo.reset()
+    torch.testing.assert_close(loss, ref_loss)
+    for got, want in zip(grads, ref_grads):
+        torch.testing.assert_close(got, want, rtol = 1e-4, atol = 1e-6)
+
+
+@pytest.mark.parametrize("kind", ["interface", "flex"])
+def test_rocm_frame_keeps_inside_a_fullgraph_false_user_compile(monkeypatch, kind):
+    """A user's fullgraph=False compile may break the graph: inside a frame it keeps and the replay
+    reuses, as in eager code and in Unsloth's own blocks."""
+    call = _rocm_frame_qkv_wrapper(monkeypatch, kind)
+    torch.manual_seed(0)
+    inputs = tuple(torch.randn(1, 2, 32, 16) for _ in range(3))
+    ref_loss, ref_grads = _two_attention_reference(inputs)
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(call, backend = "eager", fullgraph = False)
+        loss, grads = _two_attention_frame(call, lambda replaying: compiled, inputs)
+    finally:
+        torch._dynamo.reset()
+    torch.testing.assert_close(loss, ref_loss)
+    for got, want in zip(grads, ref_grads):
+        torch.testing.assert_close(got, want, rtol = 1e-4, atol = 1e-6)
+    assert SA.SAVED_ATTENTION_STATS.get("stored", 0) == 2, dict(SA.SAVED_ATTENTION_STATS)
+    assert SA.SAVED_ATTENTION_STATS.get("reused", 0) == 2, dict(SA.SAVED_ATTENTION_STATS)
+
+
+def test_rocm_frame_stays_in_the_graph_under_error_on_graph_break(monkeypatch):
+    """torch._dynamo.error_on_graph_break(True) inside a fullgraph=False compile is as strict as fullgraph."""
+    if not hasattr(torch._dynamo, "error_on_graph_break"):
+        pytest.skip("torch._dynamo.error_on_graph_break is torch 2.9+")
+    call = _rocm_frame_wrapper(monkeypatch, "interface")
+    q = torch.randn(1, 2, 8, 16, requires_grad = True)
+    frame = SA.new_saved_attention_frame([q])
+
+    def strict(q):
+        with torch._dynamo.error_on_graph_break(True):
+            return call(q)
+
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(strict, backend = "eager", fullgraph = False)
+        with SA.saved_attention_scope(frame, False), torch.no_grad():
+            compiled(q)
+        with SA.saved_attention_scope(frame, True):
+            out = compiled(q)
+    finally:
+        torch._dynamo.reset()
+    torch.testing.assert_close(out, _sdpa(q, q, q))
+    assert frame.entries == [] and SA.SAVED_ATTENTION_STATS.get("stored", 0) == 0
+
+
 def test_rocm_hooks_install_from_the_setting_not_the_current_gpu(monkeypatch):
     monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
     _simulated_rocm(monkeypatch, verdicts = {0: _MATH})

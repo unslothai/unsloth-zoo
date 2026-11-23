@@ -886,17 +886,40 @@ def _in_unsloth_compiled_block():
     return bool(flag) and bool(flag[0])
 
 
+def _strict_trace():
+    # Trace time only: is the frame being compiled one that may not graph break (fullgraph=True, or
+    # torch._dynamo.error_on_graph_break(True))? Unknown torch internals answer yes, the in-graph route.
+    try:
+        from torch._dynamo.symbolic_convert import InstructionTranslator
+        tx = InstructionTranslator.current_tx()
+        return bool(getattr(tx, "one_graph", True) or getattr(tx, "error_on_graph_break", False))
+    except Exception:
+        return True
+
+
+try:
+    # Dynamo calls it while tracing and keeps the answer as a constant, so it costs no graph break.
+    _strict_trace = torch._dynamo.assume_constant_result(_strict_trace)
+except Exception:
+    pass
+
+
 def _rocm_without_frame():
     # ROCm: a call outside any frame (no Unsloth checkpoint, or a device whose SDPA keeps nothing) stays
     # in the caller's graph instead of reaching the compiler-disabled helpers, which a fullgraph=True
-    # training compile cannot cross. Dynamo guards on the thread-local read. Inside a frame, a call traced
-    # by any compile but Unsloth's blocks stays in the graph too: that compile may be fullgraph=True, and
-    # both passes of the checkpoint take the same route, so nothing is kept and nothing is looked up.
+    # training compile cannot cross. Dynamo guards on the thread-local read. Inside a frame, only a call
+    # traced by a compile that may not graph break stays in the graph: it keeps nothing, and a fullgraph
+    # compile never falls back to eager, so the replay takes that route too. Any other compile (Unsloth's
+    # blocks, a user's fullgraph=False) breaks into the helpers as eager code does: a fullgraph=False
+    # frame can fall back to eager on one pass only (recompile limit), and the frame's entries are
+    # matched by call order, so both passes must take the same route whatever the compile does.
     if not getattr(torch.version, "hip", None):
         return False
     if getattr(_TLS, "frame", None) is None:
         return True
-    return torch.compiler.is_compiling() and not _in_unsloth_compiled_block()
+    if not torch.compiler.is_compiling() or _in_unsloth_compiled_block():
+        return False
+    return _strict_trace()
 
 
 def _wrap_attention_interface(fn):
