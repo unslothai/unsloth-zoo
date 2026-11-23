@@ -172,8 +172,10 @@ def test_residual_op_follows_the_caller_autocast(monkeypatch, num_queries, attn,
         return patch.inkling2_block_residual_op(
             block_states, partial, module.query, module.norm.eps, sdpa = attn == "sdpa").unbind(-2)
 
-    # Half precision: the sdpa module and the matmul reference round differently in a few elements.
-    tol = {} if precision == "fp32" else dict(rtol = 2e-2, atol = 5e-2)
+    # sdpa: the op matches the stock module bitwise. eager: the stock module scales q.k after the product, the op
+    # scales the query first (fp16 overflow), so half precision rounds differently. Both sit equally far from an
+    # fp64 reference; over 30 seeds of these shapes the op needs atol 3.8e-2 (bf16) / 5.3e-3 (fp16) at the rtol below.
+    tol = {"fp32": {}, "bf16": dict(rtol = 2e-2, atol = 5e-2), "fp16": dict(rtol = 2e-3, atol = 1.5e-2)}[precision]
     torch._dynamo.reset()
     want = _run_typed(stock, layer, precision, compiled = False)
     for name, forward, compiled in (
