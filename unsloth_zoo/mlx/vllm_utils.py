@@ -136,8 +136,8 @@ def _share_weights(engine_model, model):
 
 @contextlib.contextmanager
 def _in_process_engine_loads(model):
-    """While an in-process engine starts, its mlx-lm model takes the training model's weights instead of a second
-    copy, and its layers skip Unsloth's class-level gradient checkpointing."""
+    """While an in-process engine starts, its mlx-lm or mlx-vlm model takes the training model's weights instead of a
+    second copy, and its layers skip Unsloth's class-level gradient checkpointing."""
     try:
         import vllm_metal.v1.model_lifecycle as lifecycle
     except ImportError:
@@ -147,20 +147,23 @@ def _in_process_engine_loads(model):
 
     original, original_vlm = lifecycle.mlx_lm_load_model, lifecycle.mlx_vlm_load_model
 
-    def load(model_path, lazy=False, **kwargs):
+    def shared(load_engine, lazy):
         # Lazy, so the checkpoint's arrays are never read when the training model's replace them. This has to
         # happen inside the load: the runner compiles blocks over the weights it holds right after it.
-        engine_model, config = original(model_path, lazy=True, **kwargs)
+        engine_model, *rest = load_engine(True)
         if not _share_weights(_quantize_like(engine_model, model), model):
-            engine_model, config = original(model_path, lazy=lazy, **kwargs)
+            engine_model, *rest = load_engine(lazy)
             if _training_dtype(model) is not None:  # load_vllm gives vLLM this dtype for the KV cache
                 from .loader import _convert_mlx_dtype
 
                 _convert_mlx_dtype(engine_model, _training_dtype(model))
-        return exempt_from_gradient_checkpointing(engine_model), config
+        return exempt_from_gradient_checkpointing(engine_model), *rest
 
-    def load_vlm(*args, **kwargs):
-        return exempt_from_gradient_checkpointing(original_vlm(*args, **kwargs))
+    def load(model_path, lazy=False, **kwargs):
+        return shared(lambda lazy: original(model_path, lazy=lazy, **kwargs), lazy)
+
+    def load_vlm(model_path, lazy=False, **kwargs):
+        return shared(lambda lazy: (original_vlm(model_path, lazy=lazy, **kwargs),), lazy)[0]
 
     lifecycle.mlx_lm_load_model, lifecycle.mlx_vlm_load_model = load, load_vlm
     try:

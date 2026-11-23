@@ -131,15 +131,15 @@ def test_an_in_process_engine_shares_only_matching_weights(monkeypatch, width, d
     if quant:  # as load_in_8bit / load_in_mxfp4 leave it; the engine must mirror it per layer
         nn.quantize(model, *quant[:2], mode=quant[2], class_predicate=lambda path, m: quant[3] in path and hasattr(m, "to_quantized"))
     engine_model = lambda: (e := _tiny(1), quant and quant[4] and nn.quantize(e, *quant[:2], mode=quant[4]))[0]  # a checkpoint already quantized otherwise
-    life = types.SimpleNamespace(mlx_lm_load_model=lambda path, lazy=False: (calls.append(lazy), (engine_model(), {}))[1], mlx_vlm_load_model=lambda path: _tiny(2))
+    life = types.SimpleNamespace(mlx_lm_load_model=lambda path, lazy=False: (calls.append(lazy), (engine_model(), {}))[1], mlx_vlm_load_model=lambda path, lazy=False: (calls.append(lazy), engine_model())[1])
     v1, original, model._src_path = types.SimpleNamespace(model_lifecycle=life), life.mlx_lm_load_model, "/snap"
     for item in (("vllm_metal", types.SimpleNamespace(v1=v1)), ("vllm_metal.v1", v1), ("vllm_metal.v1.model_lifecycle", life)):
         monkeypatch.setitem(sys.modules, *item)
     monkeypatch.setattr(sys.modules["vllm"], "LLM", lambda **kw: types.SimpleNamespace(kwargs=kw, models=(life.mlx_lm_load_model(kw["model"])[0], life.mlx_vlm_load_model(kw["model"]))))
     (engine, vision), types_of = (llm := vllm_utils.load_vllm(model, max_seq_length=64)).models, lambda m: [(p, type(x)) for p, x in m.named_modules()]
     assert llm.kwargs.get("dtype") == (dtype if multiprocess == "0" else None) and (not quant or types_of(engine) == types_of(model)) and vllm_utils._training_dtype(engine) == getattr(mx, dtype if multiprocess == "0" else "bfloat16")
-    aliased = [array is dict(tree_flatten(model.parameters())).get(name) for name, array in tree_flatten(engine.parameters())]
-    assert calls == loads and life.mlx_lm_load_model is original and all(aliased) == (loads == [True]) == any(aliased)
+    aliased = [array is dict(tree_flatten(model.parameters())).get(name) for e in (engine, vision) for name, array in tree_flatten(e.parameters())]
+    assert calls == loads * 2 and life.mlx_lm_load_model is original and all(aliased) == (loads == [True]) == any(aliased)
     assert all(getattr(m, "_unsloth_no_checkpoint", False) == (multiprocess == "0") for x in (engine, vision) for _, m in x.named_modules())
 
 
