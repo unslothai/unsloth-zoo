@@ -48,7 +48,9 @@ import threading
 import warnings
 from typing import Any
 
-from .ast_rewriter import rewrite_count_aware_ce_spliced, rewrite_forward_source
+from .ast_rewriter import (
+    inline_softcap_modules, restore_softcap_modules, rewrite_count_aware_ce_spliced, rewrite_forward_source,
+)
 from .cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs
 from .forward_adapter import EMPTY_LOGITS, unsloth_fused_lm_head_loss
 from .aux_loss import rewrite_aux_loss_ga, unscaled_extra_loss_terms, unsloth_ga_scale_aux_loss
@@ -250,7 +252,9 @@ def install_for_class(cls) -> bool:
             _UNMATCHED[qn] = f"source-unavailable: {exc}"
         return False
 
-    new_src, cap = rewrite_forward_source(src)
+    new_src, cap = rewrite_forward_source(inline_softcap_modules(src, cls))
+    # The materialised branches call the softcap module as upstream does (forward hooks run).
+    new_src = restore_softcap_modules(new_src, cls)
     tier = "2-ast-triplet"
     unshifted = False
     if new_src is None and ".deprecated." in getattr(cls, "__module__", ""):

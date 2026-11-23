@@ -972,7 +972,7 @@ MOE_GC_ROUTING_STATS = collections.Counter()   # stored / reused / mismatch / un
 class CheckpointRoutingFrame:
     """First-pass routing in call order. Kept for the checkpoint context's lifetime and read through a cursor reset
     at each replay, so a second backward (retain_graph) replays the same routing."""
-    __slots__ = ("entries", "cursor", "replaying", "current", "kept", "__weakref__")
+    __slots__ = ("entries", "cursor", "replaying", "current", "kept", "dequant_chunks", "__weakref__")
 
     def __init__(self):
         self.entries = []
@@ -980,6 +980,7 @@ class CheckpointRoutingFrame:
         self.replaying = False
         self.current = None   # entry index of the MoE call being routed now (moe_checkpoint_call)
         self.kept = {}        # first-pass frozen base expert outputs the replay reuses (moe_gc_keep_base)
+        self.dequant_chunks = {}   # first-pass expert dequant chunk decisions the replay reuses (moe_utils)
 
 
 def _new_checkpoint_routing_frame(tensors):

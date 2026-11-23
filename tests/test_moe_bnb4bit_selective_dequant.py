@@ -243,3 +243,264 @@ def test_default_capped_plan_declines_when_rows_cover_the_stack(monkeypatch):
     counts[5], counts[9] = 2, 1   # unrouted expert pads
     ids, row_lo, row_hi, offsets = mu._selective_dequant_plan(sources, counts, 3).chunks[0]
     assert (row_lo, row_hi) == (0, 3) and ids.tolist() == [5, 9, 0] and offsets.tolist() == [2, 3, 3]
+
+
+def _routed_all(T, monkeypatch):
+    torch.manual_seed(1)
+    hidden = torch.randn(T, H, dtype = torch.bfloat16, device = DEVICE)
+    top_k_index = torch.stack([torch.randperm(E, device = DEVICE)[:TOP_K] for _ in range(T)])
+    top_k_weights = torch.rand(T, TOP_K, dtype = torch.bfloat16, device = DEVICE)
+    lora = {
+        "gate_up_proj": (torch.randn(E, H, RANK, device = DEVICE) * 0.1, torch.randn(E, RANK, 2 * I, device = DEVICE) * 0.1),
+        "down_proj": (torch.randn(E, I, RANK, device = DEVICE) * 0.1, torch.randn(E, RANK, H, device = DEVICE) * 0.1),
+    }
+    return hidden, top_k_index, top_k_weights, lora
+
+
+def test_scratch_cap_chunks_the_whole_stack_bit_exactly(monkeypatch):
+    """UNSLOTH_MOE_DEQUANT_MAX_MB bounds one projection's dequantized stack: every expert is routed (the auto plan
+    declines), yet the stack is read in chunks and the result is the whole-stack one bit for bit."""
+    monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
+    experts = _Experts(True)
+    hidden, top_k_index, top_k_weights, lora = _routed_all(64, monkeypatch)
+    base_out, base_grads = _run(experts, hidden, top_k_index, top_k_weights, lora, monkeypatch)
+    assert mu.SELECTIVE_DEQUANT_STATS["dequant_calls"] == 0
+    per_expert = 2 * I * H * 2   # gate_up, bf16: the larger stack
+    monkeypatch.setenv("UNSLOTH_MOE_DEQUANT_MAX_MB", str(5 * per_expert / 2**20))
+    out, grads = _run(experts, hidden, top_k_index, top_k_weights, lora, monkeypatch)
+    assert torch.equal(out, base_out)
+    for got, want in zip(grads, base_grads):
+        assert torch.equal(got, want)
+    stats = mu.SELECTIVE_DEQUANT_STATS
+    assert stats["plans"] == 1
+    assert stats["dequant_calls"] == 4 * -(-E // 5)   # 5 experts per chunk, gate_up + down, forward + backward
+    # An explicit chunk setting wins, 0 included.
+    for key in stats:
+        stats[key] = 0
+    monkeypatch.setenv("UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS", "0")
+    _run(experts, hidden, top_k_index, top_k_weights, lora, monkeypatch)
+    assert stats["dequant_calls"] == 0
+
+
+def _headroom(monkeypatch, gib, calls = None):
+    def fake(index):
+        if calls is not None:
+            calls.append(index)
+        free = int(gib * 2**30)
+        return free, lambda: free
+    monkeypatch.setattr(mu, "_device_headroom_bytes", fake, raising = False)
+
+
+class _Flagged:
+    _unsloth_dequant_scratch_fraction = 0.025
+
+
+MINI = [(128, (2304, 2304)), (128, (2304, 1152))]                      # Inkling-2-Mini gate_up, down
+
+
+def test_scratch_fraction_follows_the_experts_class_and_the_card(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
+    cuda0 = torch.device("cuda", 0)
+    monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, 0, int(14.56 * 2**30))   # a T4
+    _headroom(monkeypatch, 1.0)                                         # memory is short
+    cap = 0.025 * 14.56 * 2**30
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, object(), cuda0) == 0     # unflagged: whole stack
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), torch.device("cpu")) == 0
+    chunk = mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0)
+    assert chunk == int(cap // (2304 * 2304 * 2)) == 36   # 4 chunks
+    # Stacks up to twice the cap stay whole without reading free memory: Mini's down stack alone (0.63 GiB), or Mini
+    # on a 40 GB card.
+    calls = []
+    _headroom(monkeypatch, 0.0, calls)
+    assert mu._auto_dequant_chunk_experts(MINI[1:], torch.float16, _Flagged(), cuda0) == 0
+    monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, 0, int(39.4 * 2**30))
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0) == 0
+    assert calls == []
+    small = [(384, (4608, 4608)), (384, (4608, 2304))]                 # Inkling-2-Small: 15.2 GiB gate_up stack
+    monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, 0, int(79.2 * 2**30))
+    _headroom(monkeypatch, 20.0)
+    assert mu._auto_dequant_chunk_experts(small, torch.float16, _Flagged(), cuda0) == int(0.025 * 79.2 * 2**30 // (4608 * 4608 * 2))
+
+
+def _checkpoint_frame():
+    from unsloth_zoo.gradient_checkpointing import CheckpointRoutingFrame
+    return CheckpointRoutingFrame()
+
+
+def test_auto_chunking_waits_for_memory_need(monkeypatch):
+    """A 24 GB card holds Mini's 1.27 GiB stack while memory is free: no chunking, so no host sync per MoE call. Once
+    the stack does not fit, that device chunks, and a checkpoint replay of that call chunks without a new reading (it
+    matches its first pass); other devices are unaffected."""
+    monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
+    for index in (0, 1):
+        monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, index, int(21.96 * 2**30))   # L4
+    cuda0, cuda1 = torch.device("cuda", 0), torch.device("cuda", 1)
+    _headroom(monkeypatch, 8.0)
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0) == 0
+    # Twice the scratch plus one cap of slack (2.54 + 0.55 GiB) is the bar.
+    _headroom(monkeypatch, 3.2)
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0) == 0
+    _headroom(monkeypatch, 2.5)
+    frame, layer = _checkpoint_frame(), _Flagged()
+    chunk = mu._auto_dequant_chunk_experts(MINI, torch.float16, layer, cuda0, checkpoint_call = (frame, 0, False))
+    assert chunk == int(0.025 * 21.96 * 2**30 // (2304 * 2304 * 2)) == 55
+    calls = []
+    _headroom(monkeypatch, 8.0, calls)
+    frame.replaying = True
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, layer, cuda0, checkpoint_call = (frame, 0, True)) == 55
+    assert calls == []
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda1) == 0
+    # The unchunked plan's real scratch decides: a sync-free plan over 16 of 128 experts fits anywhere.
+    _headroom(monkeypatch, 0.5)
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0, experts_needed = 16) == 0
+
+
+def test_a_transient_shortfall_clears_once_memory_is_back(monkeypatch):
+    """One short reading (an eval spike, a fragmented moment) must not chunk the device for the rest of the process:
+    the next call reads the headroom again and goes back to the whole stack (no host sync, kept checkpoint base). A
+    checkpoint replay instead takes its own first pass's decision back, whichever way memory moved since."""
+    monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
+    monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, 0, int(21.96 * 2**30))   # L4
+    cuda0 = torch.device("cuda", 0)
+    _headroom(monkeypatch, 2.5)
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0) == 55
+    calls = []
+    _headroom(monkeypatch, 8.0, calls)
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0) == 0
+    assert calls == [0]
+    # A replay with no recorded first pass decides fresh.
+    frame = _checkpoint_frame()
+    frame.replaying = True
+    _headroom(monkeypatch, 2.5)
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0, checkpoint_call = (frame, 0, True)) == 55
+    assert frame.dequant_chunks == {}
+
+
+def test_replay_keeps_its_own_layers_first_pass_decision(monkeypatch):
+    """Two checkpointed layers on one card: A decides 0 at 8 GiB free, B decides 55 at 2.5 GiB. Each replay (B first,
+    as backward runs) takes its own first pass's decision back, whatever the headroom reads then, and a retained
+    graph's second backward does again; a device-wide verdict would hand B's 55 to A's replay."""
+    monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
+    monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, 0, int(21.96 * 2**30))   # L4
+    cuda0 = torch.device("cuda", 0)
+    frame_a, frame_b, layer_a, layer_b = _checkpoint_frame(), _checkpoint_frame(), _Flagged(), _Flagged()
+    decide = lambda layer, frame, replaying: mu._auto_dequant_chunk_experts(
+        MINI, torch.float16, layer, cuda0, checkpoint_call = (frame, 0, replaying),
+    )
+    _headroom(monkeypatch, 8.0)
+    assert decide(layer_a, frame_a, False) == 0
+    _headroom(monkeypatch, 2.5)
+    assert decide(layer_b, frame_b, False) == 55
+    for free_b, free_a in ((2.5, 8.0), (8.0, 2.5), (8.0, 8.0)):
+        calls = []
+        _headroom(monkeypatch, free_b, calls)
+        assert decide(layer_b, frame_b, True) == 55
+        _headroom(monkeypatch, free_a, calls)
+        assert decide(layer_a, frame_a, True) == 0
+        assert calls == []   # a replay reads no headroom
+    # Outside a checkpoint every call decides fresh.
+    _headroom(monkeypatch, 8.0)
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, layer_a, cuda0) == 0
+    _headroom(monkeypatch, 2.5)
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, layer_a, cuda0) == 55
+
+
+def test_capture_check_asks_the_counts_device(monkeypatch):
+    """A graph captured on cuda:1 while cuda:0 is current: the plan must see the capture on the counts' device and
+    not read the counts on the host (a copy during capture fails)."""
+    import contextlib
+
+    experts = _Experts(True)
+    sources = (experts.gate_up_proj, experts.down_proj)
+    monkeypatch.setenv("UNSLOTH_MOE_DEQUANT_MAX_MB", str(5 * 2 * I * H * 2 / 2**20))   # a cap: no driver reading
+    current = {"index": 0}
+
+    @contextlib.contextmanager
+    def device(d):
+        before, current["index"] = current["index"], torch.device(d).index
+        try:
+            yield
+        finally:
+            current["index"] = before
+
+    monkeypatch.setattr(torch.cuda, "device", device)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: current["index"] == 1)
+
+    class _Counts:
+        device = torch.device("cuda", 1)
+
+        def numel(self):
+            return E
+
+        def tolist(self):
+            raise AssertionError("counts read on the host during capture")
+
+    for chunk_env in (None, "4"):   # the automatic cap, and an explicit chunk setting
+        if chunk_env is None:
+            monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS", raising = False)
+        else:
+            monkeypatch.setenv("UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS", chunk_env)
+        assert mu._selective_dequant_plan(sources, _Counts(), E, experts_module = experts) is None
+    assert current["index"] == 0
+
+
+def test_unflagged_models_skip_the_scratch_cap_prep(monkeypatch):
+    """An experts class without _unsloth_dequant_scratch_fraction (and no UNSLOTH_MOE_DEQUANT_MAX_MB) does no
+    scratch-cap work in the plan: no 4-bit split of its sources, no total-memory read."""
+    monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
+    experts = _Experts(False)
+    sources = (experts.gate_up_proj, experts.down_proj)
+    calls = []
+    real = mu._bnb4bit_expert_split
+    monkeypatch.setattr(mu, "_bnb4bit_expert_split", lambda param: calls.append(1) or real(param))
+    counts = torch.ones(E, dtype = torch.int32, device = DEVICE)
+    assert mu._selective_dequant_plan(sources, counts, E, experts_module = experts) is None   # every expert routed
+    assert calls == []
+
+
+def test_scratch_cap_keeps_a_sparse_plan_that_already_fits(monkeypatch):
+    """Two routed rows under a five-expert cap: the sync-free plan reads two experts, inside the cap, so it is kept
+    rather than replaced by a chunked whole-stack read (two chunks, six experts and a host sync)."""
+    experts = _Experts(True)
+    sources = (experts.gate_up_proj, experts.down_proj)
+    per_expert = 2 * I * H * 2
+    monkeypatch.setenv("UNSLOTH_MOE_DEQUANT_MAX_MB", str(5 * per_expert / 2**20))
+    counts = torch.zeros(E, dtype = torch.int32, device = DEVICE)
+    counts[1], counts[9] = 1, 1
+    plan = mu._selective_dequant_plan(sources, counts, 2, experts_module = experts)
+    assert plan is not None and len(plan.chunks) == 1
+    ids, row_lo, row_hi, _ = plan.chunks[0]
+    assert isinstance(ids, torch.Tensor) and ids.tolist() == [1, 9] and (row_lo, row_hi) == (0, 2)
+    # A plan over the cap is still chunked.
+    counts = torch.ones(E, dtype = torch.int32, device = DEVICE)
+    plan = mu._selective_dequant_plan(sources, counts, E, experts_module = experts)
+    assert [c[0] for c in plan.chunks] == [slice(0, 5), slice(5, 10), slice(10, 15), slice(15, 16)]
+
+
+def test_scratch_cap_chunks_only_the_routed_experts(monkeypatch):
+    """Over the cap the chunked plan already reads the counts on the host, so it reads the routed experts only (6 of
+    16 here, in chunks of 4), not every expert of each chunk a token reaches; values match the whole stack bit for
+    bit."""
+    monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
+    torch.manual_seed(0)
+    experts = _Experts(True)
+    T = 24   # 48 rows: the sync-free plan declines, the whole stack would be read
+    hidden = torch.randn(T, H, dtype = torch.bfloat16, device = DEVICE)
+    pool = torch.tensor([0, 3, 4, 9, 10, 14], device = DEVICE)
+    top_k_index = pool[torch.stack([torch.randperm(6, device = DEVICE)[:TOP_K] for _ in range(T)])]
+    top_k_weights = torch.rand(T, TOP_K, dtype = torch.bfloat16, device = DEVICE)
+    lora = {
+        "gate_up_proj": (torch.randn(E, H, RANK, device = DEVICE) * 0.1, torch.randn(E, RANK, 2 * I, device = DEVICE) * 0.1),
+        "down_proj": (torch.randn(E, I, RANK, device = DEVICE) * 0.1, torch.randn(E, RANK, H, device = DEVICE) * 0.1),
+    }
+    base_out, base_grads = _run(experts, hidden, top_k_index, top_k_weights, lora, monkeypatch)
+    monkeypatch.setenv("UNSLOTH_MOE_DEQUANT_MAX_MB", str(4 * 2 * I * H * 2 / 2**20))
+    for key in mu.SELECTIVE_DEQUANT_STATS:
+        mu.SELECTIVE_DEQUANT_STATS[key] = 0
+    out, grads = _run(experts, hidden, top_k_index, top_k_weights, lora, monkeypatch)
+    assert torch.equal(out, base_out)
+    for got, want in zip(grads, base_grads):
+        assert torch.equal(got, want)
+    stats = mu.SELECTIVE_DEQUANT_STATS
+    assert stats["experts_dequantized"] == 4 * 6        # gate_up + down, forward + backward, 6 routed each
+    assert stats["dequant_calls"] == 4 * 2              # chunks of 4 + 2

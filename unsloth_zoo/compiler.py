@@ -5715,9 +5715,23 @@ def _count_aware_ce_fallback(source, module = None, module_class = None):
 
 def fused_lm_head_forward(module, module_class, modeling_module_name, source):
     """Fused-CE rewrite of one forward: (new_source, "regex" | "ast" | None, supports_return_hidden_states)."""
+    out = _fused_lm_head_forward(module, module_class, modeling_module_name, source, True)
+    if out[1] is None:
+        # Nothing fused: keep the softcap module call as written.
+        return _fused_lm_head_forward(module, module_class, modeling_module_name, source, False)
+    # The materialised branches call the softcap module as upstream does (forward hooks run).
+    from unsloth_zoo.fused_losses.ast_rewriter import restore_softcap_modules
+    return (restore_softcap_modules(out[0], module_class), *out[1:])
+
+
+def _fused_lm_head_forward(module, module_class, modeling_module_name, source, inline_softcap):
     # Fix some arguments up like for Gemma 3N
     new_source = fixup_fused_lm_head(source)
     new_source = fixup_dropped_logit_scale(new_source, module)
+    if inline_softcap:
+        # Inkling 2's final softcap is a module call; the fused kernel takes it as logit_softcapping.
+        from unsloth_zoo.fused_losses.ast_rewriter import inline_softcap_modules
+        new_source = inline_softcap_modules(new_source, module_class)
     # Fused CE reads lm_head.weight, which Roberta-style composite heads lack.
     from unsloth_zoo.fused_losses.forward_install import _head_built_as_linear
     # Only classes defined here: an imported one (4.x Blenderbot) lacks its base classes.
