@@ -27,7 +27,9 @@ from __future__ import annotations
 __all__ = [
     "EMPTY_LOGITS",
     "lm_head_fake_quantize",
+    "lm_head_needs_module_forward",
     "unsloth_fused_lm_head_loss",
+    "unsloth_module_head_ce_loss",
 ]
 
 import inspect
@@ -52,41 +54,76 @@ def lm_head_on_old_cuda_arch(weight):
     return False
 
 
-def _live_lora_adapters(lm_head):
-    """Active adapter names a PEFT tuner head adds in its forward, or () when it acts as its base layer."""
-    if getattr(lm_head, "base_layer", None) is None:
-        return ()
+def _head_adapter_plan(lm_head):
+    """How the fused CE reproduces a head's forward: (None, ()) base weight as is, ("fold", adapters) plain LoRA
+    folded into the kernel inputs, ("module", reason) only the head's own forward can (DoRA, lora_bias, other LoRA
+    variants, fan_in_fan_out, non-LoRA tuners)."""
+    if type(lm_head) is torch.nn.Linear or getattr(lm_head, "base_layer", None) is None:
+        return None, ()
+    # PEFT's forward returns base_layer(x) alone once any adapter is merged or adapters are disabled.
     if getattr(lm_head, "merged", False) or getattr(lm_head, "disable_adapters", False):
-        return ()
-    active = getattr(lm_head, "active_adapters", None)
+        return None, ()
+    active = getattr(lm_head, "active_adapters", None) or ()
     if isinstance(active, str):
-        active = [active]
+        active = (active,)
     lora_A = getattr(lm_head, "lora_A", None)
     if lora_A is None:
-        # Another tuner type (IA3, LoHa, ...) whose forward is not base + low-rank: no fused equivalent.
-        raise NotImplementedError(
-            f"Unsloth: the fused cross entropy loss cannot apply a {type(lm_head).__name__} adapter on the LM head. "
-            "Use LoRA (or modules_to_save) for the LM head."
-        )
-    return tuple(name for name in (active or ()) if name in lora_A)
+        held = set()
+        for layer_name in getattr(lm_head, "adapter_layer_names", None) or ():
+            held.update(getattr(lm_head, layer_name, None) or ())
+        if any(name in held for name in active):
+            return "module", type(lm_head).__name__
+        return None, ()
+    adapters = tuple(name for name in active if name in lora_A)
+    if not adapters:
+        return None, ()
+    if getattr(lm_head, "fan_in_fan_out", False):
+        return "module", "fan_in_fan_out LoRA"
+    use_dora = getattr(lm_head, "use_dora", None) or {}
+    lora_bias = getattr(lm_head, "lora_bias", None) or {}
+    lora_variant = getattr(lm_head, "lora_variant", None) or {}
+    for name in adapters:
+        if use_dora.get(name, False):
+            return "module", "DoRA"
+        if lora_bias.get(name, False):
+            return "module", "LoRA with lora_bias"
+        if name in lora_variant:
+            return "module", f"LoRA variant {type(lora_variant[name]).__name__}"
+    return "fold", adapters
+
+
+_WARNED_MODULE_HEADS = set()
+
+
+@torch.compiler.disable
+def _warn_module_head(reason):
+    if reason in _WARNED_MODULE_HEADS:
+        return
+    _WARNED_MODULE_HEADS.add(reason)
+    print(
+        f"Unsloth: the LM head carries a {reason} adapter, which the fused cross entropy kernel cannot apply, so "
+        "the loss calls the head's own forward and materialises the full logits (more memory). A plain LoRA "
+        "adapter or modules_to_save on lm_head keeps the fused loss."
+    )
+
+
+def lm_head_needs_module_forward(lm_head):
+    """True when only lm_head.forward() gives the right logits (a live adapter the fused kernel cannot fold)."""
+    if type(lm_head) is torch.nn.Linear:
+        return False
+    plan, reason = _head_adapter_plan(lm_head)
+    if plan == "module":
+        _warn_module_head(reason)
+        return True
+    return False
 
 
 def _fold_lora_head(lm_head, base_hidden_states, hidden_states, weight, adapters):
     """Logits of base + LoRA as one matmul: [x, s * A(dropout(x))] @ [W, B]^T. Exact, dropout included, and it
     keeps the head fused (r extra columns, never a V x V or full logits tensor)."""
-    use_dora = getattr(lm_head, "use_dora", {}) or {}
-    lora_bias = getattr(lm_head, "lora_bias", {}) or {}
-    lora_variant = getattr(lm_head, "lora_variant", {}) or {}
-    if getattr(lm_head, "fan_in_fan_out", False):
-        raise NotImplementedError("Unsloth: the fused cross entropy loss does not support a fan_in_fan_out LoRA head.")
     # PEFT feeds the adapters the head's raw input; only the base layer sees its own activation fake quantizer.
     xs, ws = [base_hidden_states], [weight]
     for name in adapters:
-        if use_dora.get(name, False) or lora_bias.get(name, False) or name in lora_variant:
-            raise NotImplementedError(
-                f"Unsloth: the fused cross entropy loss cannot apply LoRA adapter '{name}' on the LM head "
-                "(DoRA, lora_bias or another LoRA variant). Use a plain LoRA adapter or modules_to_save for lm_head."
-            )
         A = lm_head.lora_A[name]
         B = lm_head.lora_B[name]
         dropout = lm_head.lora_dropout[name] if name in getattr(lm_head, "lora_dropout", {}) else None
@@ -98,6 +135,57 @@ def _fold_lora_head(lm_head, base_hidden_states, hidden_states, weight, adapters
     return torch.cat(xs, dim = -1), torch.cat(ws, dim = 1)
 
 
+def unsloth_module_head_ce_loss(
+    hidden_states,
+    lm_head,
+    labels,
+    mask = None,
+    n_items = None,
+    shift_labels = True,
+    logit_scale_multiply = 0,
+    logit_scale_divide = 0,
+    logit_softcapping = 0,
+    logits_bias = None,
+    ignore_index = -100,
+    label_smoothing = 0.0,
+    **kwargs,
+):
+    """unsloth_fused_ce_loss's loss with the logits from lm_head(hidden_states): same label shift and mask, divisor
+    (n_items, else the labelled token count), fp32 logit scale / softcap and label smoothing. For heads whose
+    forward the kernel cannot fold (lm_head_needs_module_forward); memory heavier but exact."""
+    if _ce._LABEL_SMOOTHING.active:
+        n_items, smoothing = _ce._apply_label_smoothing_override(n_items, {"label_smoothing": label_smoothing})
+        label_smoothing = smoothing["label_smoothing"]
+    logits = lm_head(hidden_states)
+    labels = labels.to(logits.device)
+    if shift_labels:
+        _labels = torch.full_like(labels, ignore_index)
+        _labels[..., :-1] = labels[..., 1:]
+        if mask is not None:
+            _labels[..., :-1][mask.to(logits.device)[..., 1:] == 0] = ignore_index
+        labels = _labels
+    logits = logits.float()
+    if logits_bias is not None:
+        logits = logits + logits_bias.float()
+    if logit_scale_multiply:
+        logits = logits * logit_scale_multiply
+    if logit_scale_divide:
+        logits = logits / logit_scale_divide
+    if logit_softcapping:
+        logits = torch.tanh(logits / logit_softcapping) * logit_softcapping
+    labels = labels.reshape(-1)
+    loss = torch.nn.functional.cross_entropy(
+        logits.reshape(labels.shape[0], -1), labels, ignore_index = ignore_index, reduction = "sum",
+        label_smoothing = float(label_smoothing or 0.0),
+    )
+    divisor = n_items if n_items is not None else (labels != ignore_index).sum()
+    if not torch.is_tensor(divisor):
+        divisor = torch.full((), divisor, dtype = torch.float32, device = loss.device)
+    if divisor.numel() != 1:
+        divisor = divisor.ravel()[0]
+    return loss / _ce._nonzero_count(divisor.to(dtype = torch.float32, device = loss.device))
+
+
 def lm_head_fake_quantize(lm_head, hidden_states):
     """(hidden_states, weight) whose product is lm_head.forward()'s logits: the TorchAO QAT QDQ that the head's
     forward applies and fused CE skips, plus any live PEFT LoRA adapter on the head, which the fused kernel would
@@ -105,10 +193,11 @@ def lm_head_fake_quantize(lm_head, hidden_states):
     weight = lm_head.weight
     if type(lm_head) is torch.nn.Linear:
         return hidden_states, weight
-    adapters = _live_lora_adapters(lm_head)
-    if adapters:
+    plan, adapters = _head_adapter_plan(lm_head)
+    if plan == "fold":
         base_hidden_states, weight = lm_head_fake_quantize(lm_head.base_layer, hidden_states)
         return _fold_lora_head(lm_head, base_hidden_states, hidden_states, weight, adapters)
+    # plan == "module": callers route such heads through unsloth_module_head_ce_loss / their exact branch first.
     if getattr(lm_head, "base_layer", None) is not None:
         lm_head = lm_head.base_layer
         weight = lm_head.weight
@@ -175,6 +264,12 @@ def unsloth_fused_lm_head_loss(
     kwargs = {k: v for k, v in kwargs.items() if k in _KERNEL_KWARGS}
 
     unsloth_fsdp_unshard(lm_head)
+    if lm_head_needs_module_forward(lm_head):
+        # An adapter the kernel cannot fold (DoRA, ...): the same loss through the head's own forward.
+        loss = unsloth_module_head_ce_loss(
+            hidden_states, lm_head, target, n_items = n_items, shift_labels = do_shift, **kwargs,
+        )
+        return loss.clone()
     # A head on a pre-Turing card skips Inductor. Asked after unshard: FSDP2 CPUOffloadPolicy keeps
     # the shard on CPU until then.
     if kwargs.get("torch_compile", True) and lm_head_on_old_cuda_arch(lm_head.weight):

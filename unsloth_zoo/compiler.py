@@ -788,7 +788,9 @@ from unsloth_zoo.loss_utils import (
     fused_linear_cross_entropy,
     unsloth_fused_ce_loss,
 )
-from unsloth_zoo.fused_losses.forward_adapter import lm_head_fake_quantize, unsloth_fused_lm_head_loss
+from unsloth_zoo.fused_losses.forward_adapter import (
+    lm_head_fake_quantize, lm_head_needs_module_forward, unsloth_fused_lm_head_loss, unsloth_module_head_ce_loss,
+)
 from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
 from unsloth_zoo.compiler import lm_head_on_old_cuda_arch
 from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs, unsloth_fsdp_unshard
@@ -3767,6 +3769,14 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
+elif labels is not None and lm_head_needs_module_forward(self.lm_head):
+    # An lm_head adapter the kernel cannot fold (DoRA, ...): the same loss through the head's own forward.
+    loss = unsloth_module_head_ce_loss(
+        hidden_states\\1, self.lm_head, labels, mask = None, n_items = n_items,
+        logit_scale_multiply = (\\2) if (\\2) != () else 0,
+        logit_scale_divide   = (\\3) if (\\3) != () else 0,
+        logit_softcapping    = (\\4) if (\\4) != () else 0,
+    )
 elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
     _hidden_states, lm_head_weight = lm_head_fake_quantize(self.lm_head, hidden_states\\1)
     loss = fused_linear_cross_entropy(
@@ -3868,7 +3878,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
+elif not lm_head_needs_module_forward(self.lm_head) and ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and not lm_head_on_old_cuda_arch(self.lm_head.weight) and NOT_RETURN_LOGITS and _can_fuse_loss(self.loss_function) and labels is not None and not requires_grad_ and explicit_shift_labels is None and getattr(self.lm_head, "bias", None) is None:
     _hidden_states, lm_head_weight = lm_head_fake_quantize(self.lm_head, hidden_states\\1)
     loss = fused_linear_cross_entropy(
         hidden_states      = _hidden_states,
@@ -3877,7 +3887,8 @@ elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENT
         num_items_in_batch = n_items,
         logit_softcapping  = None if (\\4) == () else (\\4),
     )
-elif _can_fuse_loss(self.loss_function) and labels is not None and NOT_RETURN_LOGITS:
+elif _can_fuse_loss(self.loss_function) and not lm_head_needs_module_forward(self.lm_head) and labels is not None and NOT_RETURN_LOGITS:
+    # A head adapter the kernel cannot fold (DoRA, ...) falls to the exact branch below.
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
     # ========= NEW fused =========
@@ -3995,6 +4006,17 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
+elif labels is not None and lm_head_needs_module_forward(self.lm_head):
+    _mask = \\6
+    if _mask is not None and _mask.shape[-1] > labels.shape[-1]:
+        _mask = _mask[..., -labels.shape[-1]:]
+    # An lm_head adapter the kernel cannot fold (DoRA, ...): the same loss through the head's own forward.
+    loss = unsloth_module_head_ce_loss(
+        hidden_states\\1, self.lm_head, labels, mask = _mask, n_items = n_items,
+        logit_scale_multiply = (\\2) if (\\2) != () else 0,
+        logit_scale_divide   = (\\3) if (\\3) != () else 0,
+        logit_softcapping    = (\\4) if (\\4) != () else 0,
+    )
 else:
     lm_head_bias   = getattr(self.lm_head, "bias", None)
 
