@@ -645,7 +645,47 @@ def _allowlist_builtins():
     exposed["__build_class__"] = _py_builtins.__build_class__
     exposed["__name__"] = "__user_code__"
     exposed["__import__"] = _safe_import
+    exposed[_ATTR_TARGET_GUARD] = _attr_target_guard
     return exposed
+pass
+
+
+# Allowlisted modules hand out real classes (collections.Counter, random.Random, ...), and type(x) reaches the class
+# of any host object, so `Counter.most_common = f` would rewrite the host's class: every later evaluation and the
+# reward code see it. _guard_attribute_targets routes every attribute store/delete target through this check, which
+# refuses classes the generated code did not define itself; instances and its own classes stay assignable.
+_ATTR_TARGET_GUARD = "__unsloth_attr_target__"
+
+
+def _attr_target_guard(obj):
+    if isinstance(obj, type) and getattr(obj, "__module__", None) != "__user_code__":
+        raise AttributeError(
+            f"Assigning attributes on '{getattr(obj, '__qualname__', obj)}' is not allowed in generated code."
+        )
+    return obj
+pass
+
+
+class _GuardAttributeTargets(ast.NodeTransformer):
+    # `X.a = v` becomes `guard(X).a = v`: X is still evaluated once, in the same order, in every target position
+    # (assign, augmented, for, with, unpacking, del).
+    def visit_Attribute(self, node):
+        self.generic_visit(node)
+        if isinstance(node.ctx, (ast.Store, ast.Del)):
+            node.value = ast.copy_location(
+                ast.Call(
+                    func = ast.Name(id = _ATTR_TARGET_GUARD, ctx = ast.Load()),
+                    args = [node.value],
+                    keywords = [],
+                ),
+                node.value,
+            )
+        return node
+pass
+
+
+def _guard_attribute_targets(tree):
+    return ast.fix_missing_locations(_GuardAttributeTargets().visit(tree))
 pass
 
 
@@ -875,6 +915,7 @@ def load_single_function(
         exposed_builtins = _allowlist_builtins()
         # Only meaningful alongside the restricted builtins above.
         _reject_dunder_access(tree)
+        tree = _guard_attribute_targets(tree)
     else:
         raise ValueError("builtins_policy must be 'full' or 'allowlist'")
 
