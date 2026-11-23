@@ -20,6 +20,7 @@ Their activation is a softcapped SwiGLU, `tanh(g / c_g) * c_g * sigmoid(g) * tan
 unless the experts declare their own `_apply_gate`, so declare it, and the fp32 reference, on both expert classes.
 """
 
+import contextlib
 import functools
 from typing import List
 
@@ -108,6 +109,25 @@ def _residual_under(device_type, autocast, autocast_dtype, sdpa, block_states, p
     return out.to(autocast_dtype if autocast else torch.float32)  # the dtype the fake promises
 
 
+@contextlib.contextmanager
+def _without_saved_tensors_hooks():
+    # Pop the thread's saved tensor default hooks for the block and push them back after, in order.
+    autograd = torch._C._autograd
+    top_hooks = getattr(autograd, "_top_saved_tensors_default_hooks", None)  # torch < 2.7 lacks it
+    if top_hooks is None:
+        yield
+        return
+    stack = []
+    try:
+        while (top := top_hooks(True)) is not None:
+            stack.append(top)
+            autograd._pop_saved_tensors_default_hooks()
+        yield
+    finally:
+        for pack, unpack in reversed(stack):
+            autograd._push_saved_tensors_default_hooks(pack, unpack)
+
+
 _RESIDUAL_OP = None
 try:
     @torch.library.custom_op("unsloth_zoo::inkling2_block_residual", mutates_args = ())
@@ -131,13 +151,16 @@ try:
                               query: torch.Tensor, eps: float, device_type: str, autocast: bool,
                               autocast_dtype: torch.dtype, sdpa: bool) -> List[torch.Tensor]:
         # The op body runs below autograd: torch.func.vjp carries its own grad transform. The recompute re-enters the
-        # forward's autocast, whatever the backward pass runs under.
-        _, vjp = torch.func.vjp(
-            lambda b, p, q: _residual_under(device_type, autocast, autocast_dtype, sdpa, b, p, q, eps),
-            block_states, partial_block_states, query)
+        # forward's autocast, whatever the backward pass runs under, and sets aside the caller's saved tensor hooks
+        # (save_on_cpu offloading), which torch.func refuses and this local recompute has no use for.
+        with _without_saved_tensors_hooks():
+            _, vjp = torch.func.vjp(
+                lambda b, p, q: _residual_under(device_type, autocast, autocast_dtype, sdpa, b, p, q, eps),
+                block_states, partial_block_states, query)
+            vjp_grads = vjp(grad)
         taken = {t.untyped_storage().data_ptr() for t in (grad, block_states, partial_block_states, query)}
         grads = []
-        for g in vjp(grad):
+        for g in vjp_grads:
             # Contiguous, as the fake promises; op outputs may not alias its inputs or each other.
             g = g.contiguous()
             ptr = g.untyped_storage().data_ptr()

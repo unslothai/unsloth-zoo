@@ -18,6 +18,7 @@
 compiler emits for them must still let an enclosing fullgraph = True training compile trace through (no graph break,
 no Unsupported), with the eager forward and gradients."""
 
+import contextlib
 import importlib
 import re
 
@@ -259,3 +260,46 @@ def test_hooked_norm_keeps_the_original_boundary(monkeypatch):
         torch.testing.assert_close(fn(b, p), want)
     finally:
         handle.remove()
+
+
+def _identity_hooks():
+    return torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t)
+
+
+@pytest.mark.parametrize("hooks", ["save_on_cpu", "saved_tensors_hooks"])
+@pytest.mark.parametrize("sdpa", [False, True])
+@pytest.mark.parametrize("num_queries", [1, 3])
+def test_residual_op_backward_under_saved_tensor_hooks(hooks, sdpa, num_queries):
+    """Activation offloading (save_on_cpu, or any saved_tensors_hooks) around a fullgraph compiled step: the op's
+    backward recompute must not trip torch.func's saved tensor hooks guard, and must give the eager grads."""
+    from unsloth_zoo.temporary_patches import inkling2 as patch
+    if patch._RESIDUAL_OP is None:
+        pytest.skip("torch without torch.library.custom_op")
+    hooks_context = {"save_on_cpu": torch.autograd.graph.save_on_cpu, "saved_tensors_hooks": _identity_hooks}[hooks]
+    eps = 1e-6
+
+    def outer(block_states, partial, query, op):
+        out = op(block_states, partial, query, eps, sdpa = sdpa)
+        return (out * torch.arange(1, out.shape[-2] + 1, dtype = out.dtype).unsqueeze(-1)).sum()
+
+    def run(op, compiled, context):
+        fn = torch.compile(outer, backend = "aot_eager", fullgraph = True, dynamic = True) if compiled else outer
+        g = torch.Generator().manual_seed(num_queries)
+        inputs = (
+            torch.randn(2, 5, 3, 32, generator = g).requires_grad_(),
+            torch.randn(2, 5, 32, generator = g).requires_grad_(),
+            torch.randn(num_queries, 32, generator = g).requires_grad_(),
+        )
+        with context():
+            loss = fn(*inputs, op)
+            loss.backward()
+        return [loss.detach(), *(t.grad for t in inputs)]
+
+    torch._dynamo.reset()
+    want = run(patch.inkling2_block_residual_reference, False, hooks_context)
+    plain = run(patch.inkling2_block_residual_op, True, contextlib.nullcontext)
+    torch._dynamo.reset()
+    got = run(patch.inkling2_block_residual_op, True, hooks_context)
+    for a, b, c in zip(want, plain, got):
+        torch.testing.assert_close(c, a, rtol = 1e-5, atol = 1e-5)
+        torch.testing.assert_close(c, b, rtol = 0, atol = 0)  # the hooks change nothing in the op's own grads
