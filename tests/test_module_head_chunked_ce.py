@@ -252,3 +252,20 @@ def test_per_example_head_hooks_keep_the_all_rows_forward(hook_name, monkeypatch
     assert n == 0
     *_, n = _run(head, hidden, _labels(), True, 4, monkeypatch = monkeypatch)
     assert n == 1
+
+
+def test_non_lora_adapters_and_flat_parameters_keep_the_all_rows_forward(monkeypatch):
+    # LoHa / LoKr draw rank / module dropout once per forward; FSDP1 flat parameters hide the head's tensors.
+    torch.manual_seed(0)
+    cfg = peft.LoHaConfig(r = 4, alpha = 8, target_modules = ["lm_head"], rank_dropout = 0.5, init_weights = False)
+    loha = peft.get_peft_model(_Toy().to(torch.float64), cfg).train().base_model.model.lm_head
+    hidden = torch.randn(B, T, H, dtype = torch.float64, requires_grad = True)
+    *_, n = _run(loha, hidden, _labels(), True, 4, monkeypatch = monkeypatch)
+    assert n == 0
+    head = _head()
+    head._is_fsdp_managed_module = True
+    *_, n = _run(head, hidden, _labels(), True, 4, monkeypatch = monkeypatch)
+    assert n == 0
+    del head._is_fsdp_managed_module
+    *_, n = _run(head, hidden, _labels(), True, 4, monkeypatch = monkeypatch)
+    assert n == 1

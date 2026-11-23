@@ -981,6 +981,12 @@ def _module_head_chunkable(lm_head, base, hidden_states, n_targets, scaling):
         return False
     if _fp16_without_scaler(lm_head, hidden_states, scaling):
         return False
+    # Only PEFT LoRA layers are known to be row-wise and deterministic (LoHa / LoKr sample rank / module
+    # dropout once per forward with torch.rand); FSDP1 flat parameters leave lm_head.parameters() empty.
+    if not type(lm_head).__module__.startswith("peft.tuners.lora"):
+        return False
+    if getattr(lm_head, "_is_fsdp_managed_module", False) or next(lm_head.parameters(), None) is None:
+        return False
     for module in lm_head.modules():
         # A dropout mask drawn per chunk would not be the all-rows forward's mask.
         if isinstance(module, torch.nn.modules.dropout._DropoutNd) and module.training and module.p > 0:
