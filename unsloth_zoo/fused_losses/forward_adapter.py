@@ -52,11 +52,68 @@ def lm_head_on_old_cuda_arch(weight):
     return False
 
 
+def _live_lora_adapters(lm_head):
+    """Active adapter names a PEFT tuner head adds in its forward, or () when it acts as its base layer."""
+    if getattr(lm_head, "base_layer", None) is None:
+        return ()
+    if getattr(lm_head, "merged", False) or getattr(lm_head, "disable_adapters", False):
+        return ()
+    active = getattr(lm_head, "active_adapters", None)
+    if isinstance(active, str):
+        active = [active]
+    lora_A = getattr(lm_head, "lora_A", None)
+    if lora_A is None:
+        # Another tuner type (IA3, LoHa, ...) whose forward is not base + low-rank: no fused equivalent.
+        raise NotImplementedError(
+            f"Unsloth: the fused cross entropy loss cannot apply a {type(lm_head).__name__} adapter on the LM head. "
+            "Use LoRA (or modules_to_save) for the LM head."
+        )
+    return tuple(name for name in (active or ()) if name in lora_A)
+
+
+def _fold_lora_head(lm_head, base_hidden_states, hidden_states, weight, adapters):
+    """Logits of base + LoRA as one matmul: [x, s * A(dropout(x))] @ [W, B]^T. Exact, dropout included, and it
+    keeps the head fused (r extra columns, never a V x V or full logits tensor)."""
+    use_dora = getattr(lm_head, "use_dora", {}) or {}
+    lora_bias = getattr(lm_head, "lora_bias", {}) or {}
+    lora_variant = getattr(lm_head, "lora_variant", {}) or {}
+    if getattr(lm_head, "fan_in_fan_out", False):
+        raise NotImplementedError("Unsloth: the fused cross entropy loss does not support a fan_in_fan_out LoRA head.")
+    # PEFT feeds the adapters the head's raw input; only the base layer sees its own activation fake quantizer.
+    xs, ws = [base_hidden_states], [weight]
+    for name in adapters:
+        if use_dora.get(name, False) or lora_bias.get(name, False) or name in lora_variant:
+            raise NotImplementedError(
+                f"Unsloth: the fused cross entropy loss cannot apply LoRA adapter '{name}' on the LM head "
+                "(DoRA, lora_bias or another LoRA variant). Use a plain LoRA adapter or modules_to_save for lm_head."
+            )
+        A = lm_head.lora_A[name]
+        B = lm_head.lora_B[name]
+        dropout = lm_head.lora_dropout[name] if name in getattr(lm_head, "lora_dropout", {}) else None
+        x = hidden_states.to(A.weight.dtype)
+        if dropout is not None:
+            x = dropout(x)
+        xs.append((A(x) * lm_head.scaling[name]).to(base_hidden_states.dtype))
+        ws.append(B.weight.to(weight.dtype))
+    return torch.cat(xs, dim = -1), torch.cat(ws, dim = 1)
+
+
 def lm_head_fake_quantize(lm_head, hidden_states):
-    """(hidden_states, weight) after the TorchAO QAT QDQ that lm_head.forward() applies and fused CE skips."""
+    """(hidden_states, weight) whose product is lm_head.forward()'s logits: the TorchAO QAT QDQ that the head's
+    forward applies and fused CE skips, plus any live PEFT LoRA adapter on the head, which the fused kernel would
+    otherwise drop (wrong loss, no adapter gradient)."""
     weight = lm_head.weight
     if type(lm_head) is torch.nn.Linear:
         return hidden_states, weight
+    adapters = _live_lora_adapters(lm_head)
+    if adapters:
+        base_hidden_states, weight = lm_head_fake_quantize(lm_head.base_layer, hidden_states)
+        return _fold_lora_head(lm_head, base_hidden_states, hidden_states, weight, adapters)
+    if getattr(lm_head, "base_layer", None) is not None:
+        lm_head = lm_head.base_layer
+        weight = lm_head.weight
+        if type(lm_head) is torch.nn.Linear:
+            return hidden_states, weight
     activation_fake_quantizer = getattr(lm_head, "activation_fake_quantizer", None)
     if activation_fake_quantizer is not None:
         hidden_states = activation_fake_quantizer(hidden_states)
