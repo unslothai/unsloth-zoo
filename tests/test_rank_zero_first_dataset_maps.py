@@ -46,6 +46,9 @@ def _double(batch):
 def _worker(rank, world, port, kind, data_dir, out_dir):
     os.environ.update(MASTER_ADDR = "127.0.0.1", MASTER_PORT = str(port))
     dist.init_process_group("gloo", rank = rank, world_size = world)
+    from _spawn_bootstrap import bootstrap
+
+    bootstrap()  # tests/conftest.py's setup is not inherited by a spawned process
     from datasets.arrow_dataset import Dataset
     from unsloth_zoo.dataset_utils import rank_zero_first, rank_zero_first_prepare
 
