@@ -286,8 +286,7 @@ def _activation_bytes_without_checkpointing(model, batch, length):
             dropout = max(dropout, float(getattr(text, name, 0.0) or 0.0))
         except (TypeError, ValueError):
             pass
-    # Eager attention keeps the B x H x L x L scores and probabilities for backward; so does SDPA with attention
-    # dropout, which CPU runs on its math path.
+    # Eager attention and SDPA with dropout (CPU math path) keep B x H x L x L for backward.
     quadratic = isinstance(attention, str) and not any(fast in attention for fast in ("sdpa", "flash", "flex"))
     if quadratic or dropout > 0:
         needed += 2 * (4 + element) * heads * layers * batch * length * length
@@ -566,6 +565,9 @@ def __getattr__(name):
 def install_cpu_training_defaults():
     """Idempotent. Only ever called from a CPU-backend process."""
     import sys
+    from .runtime import fit_cpu_threads
+    # Before any kernel runs: the pool size is read on first use by every op.
+    fit_cpu_threads()
     if os.environ.get("UNSLOTH_CPU_SDPA_GQA", "1") != "0":
         from .ops import patch_cpu_sdpa_gqa
         patch_cpu_sdpa_gqa()

@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Automatic saved attention budget across the first optimizer step. Step 1 never holds AdamW moments
-and activations at once (the moments are created by the first optimizer.step, after the activations
-are freed), so the peak learnt through step 1 is below step 2's. A budget that trusted it kept outputs
-in step 2 past the card (full finetuning, trained embeddings / lm_head). The floor read at the start of
-each step must lift the expected peak until a step with the moments has been measured. CPU, with the
-allocator readings faked; drives the real admission code."""
+"""Automatic saved attention budget: step 1's peak is below step 2's (AdamW moments come after
+activations are freed), so trusting it overcommitted step 2 past the card (full finetuning,
+trained embeddings / lm_head); the per-step floor lifts the expected peak until a step with
+moments is measured."""
 import pathlib
 
 import pytest

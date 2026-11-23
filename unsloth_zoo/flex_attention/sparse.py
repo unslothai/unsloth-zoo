@@ -20,6 +20,8 @@ import os
 
 import torch
 
+from unsloth_zoo import rocm_flex_static as _rocm_flex_static
+
 __all__ = [
     "SPARSE_ATTN_STATS",
     "sparse_skip_full_enabled",
@@ -38,6 +40,8 @@ SPARSE_ATTN_STATS = {}
 _BIAS_SEEN = {}
 # Failure keys whose flex backward probe passed; _PROBING is nonzero while one runs.
 _BACKWARD_OK = set()
+# Decided at import (no environment reads inside traced code).
+_ROCM_STATIC_FLEX = _rocm_flex_static.rocm_flex_static_enabled()
 _PROBING = [0]
 
 
@@ -94,13 +98,23 @@ def _same(tensor):
     return tensor
 
 
+def _detached(tensor):
+    # A failed probe backward leaves its graph unfreed: an op saving its own output would hold itself.
+    return tensor.detach()
+
+
 def probe_flex_backward(key, fn, args):
     """Run fwd + bwd of `fn(*args)` once per `key` on detached aliases so a failing flex backward raises
     inside the caller's try / except (latching the dense path) instead of in loss.backward().
     Aliases share storage / strides, so the real call reuses the compiled kernels."""
-    if torch.compiler.is_compiling() or not torch.is_grad_enabled() or key in _BACKWARD_OK:
+    if torch.compiler.is_compiling() or not torch.is_grad_enabled():
         return
     tensors = [a for a in args if isinstance(a, torch.Tensor)]
+    # ROCm compiles a static flex kernel per length (unsloth_zoo.rocm_flex_static): probe each length's backward.
+    if _ROCM_STATIC_FLEX and tensors and _rocm_flex_static._affected_device(tensors[0].device):
+        key = (key, tuple(t.shape[-2] for t in tensors[:3]))
+    if key in _BACKWARD_OK:
+        return
     if not any(t.requires_grad for t in tensors):
         return
     if any(t.is_cuda for t in tensors) and torch.cuda.is_current_stream_capturing():
@@ -111,8 +125,8 @@ def probe_flex_backward(key, fn, args):
     inputs = [t for t in aliases.values() if t.requires_grad]
     _PROBING[0] += 1
     try:
-        # Shield the probe's saved tensors from an active checkpoint's pack hook.
-        with torch.autograd.graph.saved_tensors_hooks(_same, _same):
+        # Shield the probe's saved tensors from an active checkpoint's pack hook (detached, see _detached).
+        with torch.autograd.graph.saved_tensors_hooks(_detached, _same):
             out = fn(*probe)
             torch.autograd.grad(out, inputs, torch.zeros_like(out), allow_unused = True)
     finally:

@@ -353,3 +353,29 @@ def test_moe_triton_disable_reraises_oom(monkeypatch):
     with pytest.raises(torch.cuda.OutOfMemoryError):
         K._disable("weighted_unpermute", torch.cuda.OutOfMemoryError("oom"))
     assert K._DISABLED_REASON is None
+
+
+def test_self_check_failing_before_backward_frees_its_graph(emulated):
+    # _swiglu_eager saves a sigmoid output: under an identity pack hook it holds its own node, so a
+    # probe whose grad raises keeps the eager graph (and its input clone) alive.
+    import gc
+
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    probed = []
+    reference = glue._eager_gate_up
+
+    def tracked(gu, *args, **kwargs):
+        probed.append(StorageWeakRef(gu.untyped_storage()))
+        return reference(gu, *args, **kwargs)
+
+    def failing_grad(*args, **kwargs):
+        raise RuntimeError("probe backward")
+
+    emulated.setattr(glue, "_eager_gate_up", tracked)
+    emulated.setattr(torch.autograd, "grad", failing_grad)
+    with pytest.warns(UserWarning, match = "self-check failed"):
+        assert glue._self_check(torch.device("cpu"), torch.float32, ALPHA, LIMIT) is False
+    gc.collect()
+    assert probed, "the probe did not run"
+    assert probed[0].expired(), "the failed self-check's eager graph outlived the probe"

@@ -258,9 +258,8 @@ def add_new_tokens(
     if pad_to_multiple_of is not None and resize_target > old_rows:
         resize_target = _round_up_vocab(resize_target, pad_to_multiple_of)
     pass
-    # Also resizes lm_head as well!
-    # Every grown row is overwritten below, so skip HF's mean_resizing (fp32 copies of the matrix + a d x d covariance
-    # and its sampling); keep it if some grown row would survive (input and output row counts differ).
+    # lm_head is resized too; grown rows are all overwritten, so skip HF's mean_resizing (fp32
+    # copies and a d x d covariance) unless a grown row survives (input and output counts differ).
     grown_lo = min(old_input_length, old_output_length)
     written_hi = resize_target if (pad_to_multiple_of is not None and resize_target > max(old_rows, new_vocab_length)) \
         else new_vocab_length

@@ -151,16 +151,18 @@ class KeepSlot:
         return tensor
 
 
-def keep_base_slot(module):
+def keep_base_slot(module, found = None):
     """KeepSlot for this experts call when it runs inside an Unsloth checkpoint whose routing frame stored (first
-    pass) or reused (replay) this call's routing; else None."""
+    pass) or reused (replay) this call's routing; else None. `found` is moe_checkpoint_call()'s answer when the
+    caller already consumed it."""
     if not keep_base_enabled() or torch.compiler.is_compiling() or not getattr(module, "training", False):
         return None
-    try:
-        from unsloth_zoo.gradient_checkpointing import moe_checkpoint_call
-    except ImportError:
-        return None
-    found = moe_checkpoint_call()
+    if found is None:
+        try:
+            from unsloth_zoo.gradient_checkpointing import moe_checkpoint_call
+        except ImportError:
+            return None
+        found = moe_checkpoint_call()
     if found is None:
         return None
     frame, call, replaying = found

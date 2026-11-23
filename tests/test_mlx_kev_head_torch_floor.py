@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Kev's head.pt must not be unpickled by a torch that runs code under weights_only=True (CVE-2025-32434).
-
-decision.py imports mlx at module level, so the guard is read with ast and run on its own."""
+"""Kev's head.pt must not be unpickled by a torch that runs code under weights_only=True
+(CVE-2025-32434); decision.py imports mlx at module level, so its guard is read with ast."""
 
 import ast
 import types

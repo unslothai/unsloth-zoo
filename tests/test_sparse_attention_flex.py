@@ -1108,3 +1108,25 @@ def test_flex_backward_probe_traces_without_graph_break():
     q, k, v = _qkv()
     f(q, k, v)
     assert not calls and not sparse_gates._BACKWARD_OK
+
+
+def test_failed_backward_probe_frees_its_graph():
+    """A probe whose backward fails is never freed by autograd: its saved tensors must not hold the graph."""
+    import gc
+
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    from unsloth_zoo.temporary_patches import sparse_attention_flex as s
+    q, k, v = _qkv()
+    probed = []
+
+    def flex(query, key, value):
+        # sigmoid saves its own output, so an identity pack hook makes it hold its own node.
+        hidden = torch.sigmoid(query * 2)
+        probed.append(StorageWeakRef(hidden.untyped_storage()))
+        return _BackwardFails.apply(hidden) + key * value
+
+    assert s._flex_or_none("dsa", "DSA", flex, q, k, v, q, k, v) is None
+    gc.collect()
+    assert probed, "the probe did not run"
+    assert probed[0].expired(), "the failed probe's forward graph outlived the probe"

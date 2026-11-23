@@ -468,6 +468,44 @@ def _guarded_session():
     return session
 
 
+def _no_media_auth(request):
+    # A set auth stops requests from filling one in from ~/.netrc.
+    return request
+
+
+def _netrc_names_host(host) -> bool:
+    # Same file requests reads (NETRC, else ~/.netrc, ~/_netrc); only an explicit `machine` line counts, never `default`.
+    import netrc
+    location = os.environ.get("NETRC")
+    paths = (os.path.expanduser(location),) if location else (os.path.expanduser("~/.netrc"), os.path.expanduser("~/_netrc"))
+    for path in paths:
+        if not os.path.exists(path): continue
+        try:
+            return host != "default" and host in netrc.netrc(path).hosts
+        except Exception:
+            return False
+    return False
+
+
+def _media_auth(url):
+    """Auth for one media hop. A dataset names the host, so a netrc `default` entry or a plain-http URL must not
+    receive the user's saved credentials; an https host the netrc names explicitly keeps them, as do credentials
+    written into the URL itself. Proxies (trust_env) are unaffected."""
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    if parts.username or parts.password:
+        return requests.auth.HTTPBasicAuth(*requests.utils.get_auth_from_url(url))
+    if parts.scheme != "https" or not parts.hostname:
+        return _no_media_auth
+    try:
+        auth = requests.utils.get_netrc_auth(url)
+    except Exception:
+        auth = None
+    if auth and _netrc_names_host(parts.hostname):
+        return auth
+    return _no_media_auth
+
+
 def _stream_guarded_media(url: str, sink, timeout: int = 30) -> int:
     """Write an http(s) body into `sink`, checking every redirect hop.
 
@@ -485,7 +523,10 @@ def _stream_guarded_media(url: str, sink, timeout: int = 30) -> int:
             # Each redirect hop is checked and connects to the address that check resolved, so a redirect cannot be rebound either.
             token = _PINNED_ADDRESSES.set(_check_fetchable_url(current))
             try:
-                response = session.get(current, stream = True, timeout = timeout, allow_redirects = False)
+                response = session.get(
+                    current, stream = True, timeout = timeout, allow_redirects = False,
+                    auth = _media_auth(current),
+                )
                 try:
                     if response.is_redirect or response.is_permanent_redirect:
                         location = response.headers.get("location")

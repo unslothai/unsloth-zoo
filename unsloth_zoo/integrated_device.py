@@ -187,10 +187,9 @@ def device_is_integrated_part(index):
     return any(marker in name for marker in _NVIDIA_UNIFIED_NAME_MARKERS)
 
 
-# An integrated AMD part still has a BIOS carve-out ("UMA frame buffer", 512 MiB up to 96 GiB on Strix Halo) that the
-# OS never sees. Device allocations draw on host RAM (GTT / shared memory) only beyond it, so a large carve-out is a
-# separate budget that host offload DOES relieve. Shared only when the carve-out is at most this share of what torch
-# can allocate.
+# An integrated AMD part's BIOS carve-out (UMA frame buffer, 512 MiB to 96 GiB on Strix Halo) is
+# hidden from the OS; allocations use host RAM (GTT) only beyond it, a separate budget host offload
+# relieves; shared only if the carve-out is at most CARVEOUT_MAX_SHARE of what torch can allocate.
 CARVEOUT_MAX_SHARE = 0.25
 
 

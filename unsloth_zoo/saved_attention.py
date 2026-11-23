@@ -39,6 +39,8 @@ __all__ = [
     "SAVED_ATTENTION_STATS",
     "SavedAttentionFrame",
     "save_attention_enabled",
+    "save_attention_requested",
+    "register_rocm_saved_attention_selector",
     "save_attention_offload",
     "save_attention_auto_min_seq",
     "new_saved_attention_frame",
@@ -58,19 +60,99 @@ def _save_attention_setting():
     return os.environ.get("UNSLOTH_GC_SAVE_ATTENTION", "auto").strip().lower() or "auto"
 
 
-_WARNED_HIP = [False]
+_EXPLICIT_SETTINGS = ("1", "true", "yes", "on", "offload")
+_WARNED_HIP = set()
+_ROCM_PROBE_DTYPE = {}
 
 
-def save_attention_enabled():
-    if _save_attention_setting() not in ("1", "true", "yes", "on", "offload"):
+def save_attention_requested():
+    """UNSLOTH_GC_SAVE_ATTENTION=1 / offload: configuration only, no device is touched. Whether a
+    checkpoint on a given device keeps anything is save_attention_enabled(device), asked per frame."""
+    return _save_attention_setting() in _EXPLICIT_SETTINGS
+
+
+def _default_rocm_sdpa_selector(q):
+    return torch._fused_sdp_choice(q, q, q, is_causal = True)
+
+
+# Unsloth registers its own selector, which applies the backend filter its training SDPA calls run under
+# (AOTriton kernels refused by rocm_sdpa_check) and declines a refused choice.
+_ROCM_SDPA_SELECT = _default_rocm_sdpa_selector
+
+
+def register_rocm_saved_attention_selector(selector):
+    """selector(q) -> int SDPBackend that a causal training SDPA call on q's device would run."""
+    global _ROCM_SDPA_SELECT
+    _ROCM_SDPA_SELECT = selector if selector is not None else _default_rocm_sdpa_selector
+
+
+def _rocm_kept_backends():
+    from torch.nn.attention import SDPBackend
+    names = ("FLASH_ATTENTION", "EFFICIENT_ATTENTION", "CUDNN_ATTENTION", "OVERRIDEABLE")
+    return {int(getattr(SDPBackend, name)) for name in names if hasattr(SDPBackend, name)}
+
+
+def _rocm_probe_dtype(device):
+    """The training dtype of the selection sample: bf16, fp16 on gfx10 (no bf16 SDPA) or without bf16."""
+    dtype = _ROCM_PROBE_DTYPE.get(device.index)
+    if dtype is None:
+        arch = str(getattr(torch.cuda.get_device_properties(device), "gcnArchName", "") or "")
+        arch = arch.split(":", 1)[0].strip().lower()
+        with torch.cuda.device(device):
+            bf16 = torch.cuda.is_bf16_supported()
+        dtype = torch.float16 if arch.startswith("gfx10") or not bf16 else torch.bfloat16
+        _ROCM_PROBE_DTYPE[device.index] = dtype
+    return dtype
+
+
+def _select_rocm_sdpa(device):
+    # Backend selection only, never a launch: the SDPA kernels themselves are validated in isolated
+    # processes by Unsloth's rocm_sdpa_check. Read under the caller's live backend policy (sdpa_kernel,
+    # torch.backends.cuda flags), so nothing is cached.
+    with torch.cuda.device(device), torch.inference_mode(False), torch.enable_grad():
+        q = torch.empty((1, 2, 16, 64), device = device, dtype = _rocm_probe_dtype(device), requires_grad = True)
+        choice = int(_ROCM_SDPA_SELECT(q))
+    return choice in _rocm_kept_backends()
+
+
+def _rocm_sdpa_is_kept(device = None):
+    """ROCm: True when a training SDPA call on ``device`` runs an attention kernel this module keeps,
+    False when it decomposes into matmul + softmax (nothing kept, only graph breaks added), None when
+    the answer is unknown (traced code, allocation failure): that frame keeps nothing, the next asks again.
+    torch 2.11 + ROCm 7.13 on gfx1151 selects _scaled_dot_product_flash_attention. CPU tensors run the
+    CPU kernel, which is kept."""
+    if torch.compiler.is_compiling():
+        return None
+    try:
+        if device is not None:
+            device = torch.device(device)
+            if device.type != "cuda":
+                return device.type == "cpu"
+        elif not torch.cuda.is_available():
+            return True
+        if device is None or device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        return _select_rocm_sdpa(device)
+    except (AttributeError, RuntimeError, MemoryError):
+        return None
+
+
+def save_attention_enabled(device = None):
+    """Whether a checkpoint on ``device`` (default: the current GPU, or CPU without one) keeps attention."""
+    if not save_attention_requested():
         return False
-    # ROCm SDPA kernels are not intercepted: nothing is kept, only graph breaks are added.
-    if getattr(torch.version, "hip", None):
-        if not _WARNED_HIP[0]:
-            _WARNED_HIP[0] = True
-            print("Unsloth: UNSLOTH_GC_SAVE_ATTENTION is not supported on ROCm yet and is ignored.")
-        return False
-    return True
+    if not getattr(torch.version, "hip", None):
+        return True
+    kept = _rocm_sdpa_is_kept(device)
+    if kept is False:
+        key = str(device) if device is not None else "current"
+        if key not in _WARNED_HIP:
+            _WARNED_HIP.add(key)
+            print(
+                f"Unsloth: UNSLOTH_GC_SAVE_ATTENTION keeps nothing on ROCm device {key}: its SDPA "
+                "calls select no attention kernel this mode intercepts, so they are recomputed as before."
+            )
+    return kept is True
 
 
 def save_attention_offload():
@@ -283,15 +365,19 @@ class SavedAttentionFrame:
 
 
 def new_saved_attention_frame(tensors):
-    if save_attention_enabled():
+    if save_attention_requested():
         auto = False
     elif _AUTO_ACTIVE[0] and _save_attention_setting() == "auto":
         auto = True
     else:
         return None
+    asked = set()
     for t in tensors:
-        if isinstance(t, torch.Tensor) and t.requires_grad:
-            return SavedAttentionFrame(auto)
+        if isinstance(t, torch.Tensor) and t.requires_grad and t.device not in asked:
+            # Explicit mode: eligibility of the device the checkpoint runs on (ROCm reads it per device).
+            if auto or save_attention_enabled(t.device):
+                return SavedAttentionFrame(auto)
+            asked.add(t.device)
     return None
 
 
@@ -326,7 +412,8 @@ def saved_attention_scope(frame, replay):
 
 
 def saved_attention_active():
-    """Runtime state: never read it in traced code."""
+    """Runtime state. Traced code may read it only to choose between a frame and none (Dynamo guards
+    on the thread-local, one graph each); never to branch on a frame's contents."""
     return getattr(_TLS, "frame", None) is not None
 
 
@@ -717,6 +804,9 @@ def saved_function_call(function, n_inputs, *args, **kwargs):
             for i, leaf in enumerate(leaves):
                 if _same_view_of(t, leaf):
                     return ("leaf", i, t.shape, t.stride(), t.storage_offset() - leaf.storage_offset())
+            # Detached: a rejected graph (random / too big) is never backpropagated, and an op saving its
+            # own output would hold itself through its grad_fn.
+            t = t.detach()
             kept.append(t)
             return t
 
@@ -791,6 +881,13 @@ def saved_function_call(function, n_inputs, *args, **kwargs):
 _PATCHED_MARK = "_unsloth_saved_attention"
 
 
+def _rocm_without_frame():
+    # ROCm: a call outside any frame (no Unsloth checkpoint, or a device whose SDPA keeps nothing) stays
+    # in the caller's graph instead of reaching the compiler-disabled helpers, which a fullgraph=True
+    # training compile cannot cross. Dynamo guards on the thread-local read.
+    return bool(getattr(torch.version, "hip", None)) and getattr(_TLS, "frame", None) is None
+
+
 def _wrap_attention_interface(fn):
     if getattr(fn, _PATCHED_MARK, False):
         return fn
@@ -798,7 +895,7 @@ def _wrap_attention_interface(fn):
 
     @functools.wraps(fn)
     def attention_forward(module, query, key, value, *args, **kwargs):
-        if not getattr(module, "training", False):
+        if not getattr(module, "training", False) or _rocm_without_frame():
             return fn(module, query, key, value, *args, **kwargs)
         return saved_attention_call(
             lambda q, k, v: fn(module, q, k, v, *args, **kwargs), query, key, value,
@@ -815,7 +912,7 @@ def _wrap_flex_kernel(fn):
 
     @functools.wraps(fn)
     def flex_kernel(query, key, value, *args, **kwargs):
-        if not kwargs.get("training", True):
+        if not kwargs.get("training", True) or _rocm_without_frame():
             return fn(query, key, value, *args, **kwargs)
         return saved_function_call(fn, 3, query, key, value, *args, **kwargs)
 

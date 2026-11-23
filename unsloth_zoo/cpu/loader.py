@@ -27,6 +27,7 @@ import weakref
 
 import torch
 
+from unsloth_zoo.private_staging import keep_mode, precreate_private_temp
 from .runtime import available_ram, cpu_bf16_supported, cpu_bnb_4bit_supported
 from .ops import (
     Bf16StoredLinear, _plain_lm_head, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, set_bf16_stored_dtype,
@@ -1075,9 +1076,18 @@ def _adapter_base_model(model_name, token, revision, **hub_kwargs):
         config = PeftConfig.from_pretrained(model_name, revision = revision, token = token, **hub_kwargs)
         if not config.base_model_name_or_path:
             return None
-        return config.base_model_name_or_path, getattr(config, "revision", None)
+        base = config.base_model_name_or_path, getattr(config, "revision", None)
     except Exception:
         return None
+    # A Hub adapter names its base itself: on Windows a UNC base would make the load probe a host the repo chose (SMB, NTLM).
+    if not os.path.isdir(model_name):
+        from unsloth_zoo.vision_utils import _is_network_share
+        if _is_network_share(str(base[0])):
+            raise ValueError(
+                f"Unsloth: The adapter {model_name} names a base model on a network share ({base[0]!r}). "
+                "Refusing to load it: download the base model and load the adapter from a local folder instead."
+            )
+    return base
 
 
 def _clamp_to_learned_positions(model, max_seq_length):
@@ -1427,11 +1437,15 @@ def _stream_merged_save(model, save_directory, save_method, max_shard_size = Non
     # weights may be memory-mapped from the files being replaced (a model loaded from save_directory), and an
     # interrupted export must not leave a half-written model.safetensors that loaders would pick.
     rank, staged = _safetensors_dtype_rank(), []
+    # A different shard count writes new names: those take the mode of an earlier export's weights in this folder.
+    earlier = [os.path.join(save_directory, f) for f in sorted(os.listdir(save_directory))
+               if f == "model.safetensors" or _STALE_SHARD.fullmatch(f)]
     try:
         with torch.no_grad():
             for name, shard in shards:
                 temporary = os.path.join(save_directory, f".{name}.unsloth-tmp")
                 staged.append((temporary, os.path.join(save_directory, name)))
+                precreate_private_temp(temporary, staged[-1][1])
                 _write_safetensors(temporary, shard, rank)
         if len(shards) > 1:
             total_parameters = sum(p.numel() for n, p in hf.named_parameters() if ".lora_" not in n)
@@ -1439,9 +1453,11 @@ def _stream_merged_save(model, save_directory, save_method, max_shard_size = Non
                      "weight_map": {entry[0]: name for name, shard in shards for entry in shard}}
             temporary = os.path.join(save_directory, ".model.safetensors.index.json.unsloth-tmp")
             staged.append((temporary, os.path.join(save_directory, "model.safetensors.index.json")))
+            precreate_private_temp(temporary, staged[-1][1])
             with open(temporary, "w", encoding = "utf-8") as f:
                 f.write(json.dumps(index, indent = 2, sort_keys = True) + "\n")
         for temporary, final in staged:
+            keep_mode(temporary, final, like = earlier)
             os.replace(temporary, final)
     finally:
         for temporary, _ in staged:

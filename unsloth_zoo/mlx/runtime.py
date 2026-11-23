@@ -38,8 +38,7 @@ _FOLDER_BUILDER = "datasets.packaged_modules.folder_based_builder.folder_based_b
 
 
 def _load_folder_metadata_patch():
-    """Loads temporary_patches/datasets_folder_metadata.py on its own: the package __init__ imports torch and GPU
-    kernels, which an MLX host does not have."""
+    """Loads the folder metadata patch alone: __init__ imports torch and GPU kernels MLX lacks."""
     import sys
     import types
 
@@ -71,8 +70,7 @@ def _load_folder_metadata_patch():
 
 
 class _FolderBuilderGuardFinder:
-    """Installs the folder-dataset metadata guard right after `datasets` loads its folder builder, so MLX startup does
-    not pay for importing datasets."""
+    """Installed right after datasets loads its folder builder, so MLX startup skips datasets."""
 
     _unsloth_folder_guard = True
 

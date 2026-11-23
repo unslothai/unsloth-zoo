@@ -285,9 +285,8 @@ _MOE_UTILS = "unsloth_zoo.temporary_patches.moe_utils"
 
 @_pytest.fixture(autouse = True)
 def _restore_selected_moe_backend():
-    """select_moe_backend() caches its pick for the process. A test that forces UNSLOTH_MOE_BACKEND=grouped_mm or
-    spoofs a CUDA card hands that pick to later tests on the same worker, and on a CPU runner their MoE forward then
-    raises 'torch._grouped_mm is not supported'."""
+    """select_moe_backend() caches its pick per process; forcing UNSLOTH_MOE_BACKEND=grouped_mm or
+    spoofing CUDA leaks it to later CPU tests, raising 'torch._grouped_mm is not supported'."""
     module = sys.modules.get(_MOE_UTILS)
     before = getattr(module, "_SELECTED_MOE_BACKEND", None)
     yield
@@ -378,6 +377,44 @@ def pytest_runtest_setup(item):
         n: _sys.modules.get(n)
         for n in _GUARDED_MODULES + _GUARDED_BARE_MODULES
     })
+    setattr(item, _CHECKPOINT_SNAPSHOT_KEY, _checkpoint_snapshot())
+
+
+# patch_unsloth_*_gradient_checkpointing swap these for the whole process. A test that patches without unpatching hands
+# the Unsloth checkpoint to every later test on its xdist worker, which then fails far from the cause (reentrant counts,
+# recompiles, grads, the set-once pristine capture), so each test gets back the checkpoint it started with.
+_CHECKPOINT_SNAPSHOT_KEY = "_unsloth_checkpoint_snapshot"
+_CHECKPOINT_ATTRS = (
+    "checkpoint", "CheckpointFunction", "_old_checkpoint", "_old_CheckpointFunction", "_unsloth_pristine_checkpoint",
+)
+
+
+def _checkpoint_snapshot():
+    import sys as _sys
+
+    ckpt = _sys.modules.get("torch.utils.checkpoint")
+    modeling_utils = _sys.modules.get("transformers.modeling_utils")
+    return (
+        {n: getattr(ckpt, n, _MISSING) for n in _CHECKPOINT_ATTRS} if ckpt is not None else None,
+        getattr(modeling_utils, "checkpoint", _MISSING) if modeling_utils is not None else _MISSING,
+    )
+
+
+def _restore_checkpoint(snapshot):
+    import sys as _sys
+
+    before, before_mu = snapshot
+    ckpt = _sys.modules.get("torch.utils.checkpoint")
+    if before is not None and ckpt is not None:
+        for name, value in before.items():
+            if value is _MISSING:
+                if hasattr(ckpt, name):
+                    delattr(ckpt, name)
+            elif getattr(ckpt, name, _MISSING) is not value:
+                setattr(ckpt, name, value)
+    modeling_utils = _sys.modules.get("transformers.modeling_utils")
+    if before_mu is not _MISSING and modeling_utils is not None and getattr(modeling_utils, "checkpoint", None) is not before_mu:
+        modeling_utils.checkpoint = before_mu
 
 
 @_pytest.hookimpl(trylast = True)
@@ -386,6 +423,10 @@ def pytest_runtest_teardown(item, nextitem):
     a fixture check ran before monkeypatch restored sys.modules and flagged correct tests."""
     import sys as _sys
 
+    # After every fixture, including monkeypatch, has finalized, so its own undo of these attributes is not disturbed.
+    snapshot = getattr(item, _CHECKPOINT_SNAPSHOT_KEY, None)
+    if snapshot is not None:
+        _restore_checkpoint(snapshot)
     before = getattr(item, _MODULE_SNAPSHOT_KEY, None)
     if before is None:
         return

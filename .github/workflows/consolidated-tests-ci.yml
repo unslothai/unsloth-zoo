@@ -454,6 +454,7 @@ jobs:
           behavioral() {
             run_gate behavioral python -m pytest \
               tests/test_ci_cpu_gate_results.py \
+              tests/test_flex_rocm_static_compile.py \
               tests/test_compile_cache_concurrency.py \
               tests/test_top_level_imports_are_declared.py \
               tests/test_custom_op_annotations.py \

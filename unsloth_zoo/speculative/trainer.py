@@ -97,6 +97,19 @@ def mtp_step_losses(head, parts, final_hidden, input_ids, attention_mask, data_l
     # The effective head: an unmerged LoRA on the target's lm_head is part of the teacher (and the draft).
     target_lm_head_weight = effective_lm_head_weight(parts["lm_head"])
     supervised = data_labels != -100
+    teacher_ids_all = None
+    if args.mtp_label_source == "teacher":
+        # Step k's teacher rows are final_hidden[:, k:k + length]: one [rows, V] projection per batch serves every
+        # depth (shifted below), not one per depth. Same logits budget as chunked_lm_loss.
+        w = target_lm_head_weight
+        per_row = w.shape[0] * w.element_size()
+        rows = max(1, min(args.mtp_chunk_size, losses.LOGITS_BUDGET_BYTES // per_row))
+        with torch.no_grad():
+            teacher_ids_all = torch.cat([
+                (chunk.to(device = w.device, dtype = w.dtype) @ w.T).argmax(-1)
+                for chunk in final_hidden.reshape(-1, final_hidden.shape[-1]).split(rows)
+            ]).view(final_hidden.shape[:2])
+            # Rows past the end are zero hidden states (all-zero logits, argmax 0); their labels are -100.
     total = final_hidden.new_zeros((), dtype = torch.float32)
     stats = []
     for k, (step, weight) in enumerate(zip(steps, weights)):
@@ -109,18 +122,10 @@ def mtp_step_losses(head, parts, final_hidden, input_ids, attention_mask, data_l
         keep = _shift_window(supervised, k + 1, length, False)
         labels = torch.where(keep, labels, torch.full_like(labels, -100))
         teacher_hidden = None
-        if args.mtp_loss_type != "ce" or args.mtp_label_source == "teacher":
+        if args.mtp_loss_type != "ce":
             teacher_hidden = _shift_window(final_hidden, k, length, 0).reshape(-1, final_hidden.shape[-1])
-        if args.mtp_label_source == "teacher":
-            # Same logits budget as chunked_lm_loss: one [rows, V] projection per chunk.
-            per_row = target_lm_head_weight.shape[0] * target_lm_head_weight.element_size()
-            rows = max(1, min(args.mtp_chunk_size, losses.LOGITS_BUDGET_BYTES // per_row))
-            with torch.no_grad():
-                w = target_lm_head_weight
-                teacher_ids = torch.cat([
-                    (chunk.to(device = w.device, dtype = w.dtype) @ w.T).argmax(-1).to(labels.device)
-                    for chunk in teacher_hidden.split(rows)
-                ]).view_as(labels)
+        if teacher_ids_all is not None:
+            teacher_ids = _shift_window(teacher_ids_all, k, length, 0).to(labels.device).view_as(labels)
             labels = torch.where(labels != -100, teacher_ids, labels)
         loss_sum, n_tokens, n_correct = chunked_lm_loss(
             hidden.reshape(-1, hidden.shape[-1]),

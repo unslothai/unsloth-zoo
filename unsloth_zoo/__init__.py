@@ -103,9 +103,8 @@ def has_429_exact_full_read(log_dir: str | Path) -> bool:
     log_dir = Path(log_dir).expanduser()
     if not log_dir.is_dir():
         return False
-    # Streamed: a single hf_xet log can reach hundreds of MB and this runs on every import. Files whose inode, size and
-    # mtime match the last scan reuse its answer (logs are append-only, so any write changes size or mtime); a missing,
-    # unreadable or unwritable manifest just means a full scan, as before.
+    # hf_xet logs reach hundreds of MB, scanned per import; append-only, so unchanged inode, size
+    # and mtime reuse the answer; missing, unreadable or unwritable manifest forces a full scan.
     marker = b"429 Too Many Requests"
     keep = len(marker) - 1
     manifest_path = log_dir / ".unsloth_429_scan.json"
@@ -141,15 +140,20 @@ def has_429_exact_full_read(log_dir: str | Path) -> bool:
             found = True
             break
     if dirty:
+        tmp = None
         try:
             if found:  # stopped early: keep what is still known about the files not reached
                 seen = {**{k: v for k, v in previous.items() if (log_dir / k).exists()}, **seen}
-            tmp = manifest_path.with_name(f"{manifest_path.name}.{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(seen), encoding = "utf-8")
+            # mkstemp, not a fixed pid name: in a shared HF cache another account could pre-plant a symlink there.
+            import tempfile
+            fd, tmp = tempfile.mkstemp(prefix = f"{manifest_path.name}.", suffix = ".tmp", dir = str(log_dir))
+            with os.fdopen(fd, "w", encoding = "utf-8") as f:
+                f.write(json.dumps(seen))
             os.replace(tmp, manifest_path)
         except Exception:
             try:
-                tmp.unlink(missing_ok = True)
+                if tmp is not None:
+                    os.unlink(tmp)
             except Exception:
                 pass
     return found

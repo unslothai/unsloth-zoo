@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Automatic saved attention with no allocator statistics: a global CUDAPluggableAllocator raises from
-getDeviceStats, so the budget's peak / capacity reads raised out of the attention call and aborted the
-training step. Without readings the call must recompute as with saved attention off. CPU, with the
-CUDA allocator queries replaced by ones that raise."""
+"""Automatic saved attention with no allocator statistics: a global CUDAPluggableAllocator raising
+from getDeviceStats made the budget's peak / capacity reads abort the training step; without
+readings the call must recompute as with saved attention off."""
 import pathlib
 
 import pytest

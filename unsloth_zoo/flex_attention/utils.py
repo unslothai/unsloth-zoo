@@ -84,6 +84,13 @@ try:
         _flex_attention = functools.partial(_flex_attention, kernel_options = kernel_options)
     pass
     flex_attention = _torch_compile(_flex_attention)
+    if flex_attention is not _flex_attention:
+        from unsloth_zoo.rocm_flex_static import rocm_static_flex
+
+        def _rocm_static_flex_entry(query, key, value, *args, **kwargs):
+            return _flex_attention(query, key, value, *args, **kwargs)
+        # ROCm: calls whose backward will run get a static compile (symbolic lengths gave NaN grads on gfx1151).
+        flex_attention = rocm_static_flex(flex_attention, _rocm_static_flex_entry)
     # Prefill/training: AUTO sends queries under 128 rows to flex_decoding, which has no valid config once q_len * GQA
     # group > 128; Dynamo then runs flex eagerly and checkpoint recompute raises CheckpointError.
     PREFILL_KERNEL_OPTIONS = {**(kernel_options or {}), "FORCE_USE_FLEX_ATTENTION": True}
@@ -558,6 +565,9 @@ def _main_kernel_for_short_queries(flex_attention_fn, forced_options):
             args = args[:position] + args[position + 1:]
         kwargs["kernel_options"] = _main_kernel_options(kwargs.get("kernel_options"), forced_options)
         return flex_attention_fn(*args, **kwargs)
+    # Only the ROCm static marker, so rocm_static_flex still sees this call site as wrapped and does not wrap it twice.
+    if getattr(flex_attention_fn, "_unsloth_rocm_static", False):
+        flex_attention._unsloth_rocm_static = True
     return flex_attention
 
 
