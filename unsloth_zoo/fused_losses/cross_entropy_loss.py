@@ -910,7 +910,8 @@ def _warn_module_head(reason):
 
 def lm_head_needs_module_forward(lm_head):
     """True when only lm_head.forward() gives the right logits: a live PEFT adapter anywhere in the head."""
-    if lm_head is None or type(lm_head) is torch.nn.Linear:
+    # Only a module can carry a PEFT tuner; a plain Linear, or a head object without submodules, has none.
+    if lm_head is None or type(lm_head) is torch.nn.Linear or not isinstance(lm_head, torch.nn.Module):
         return False
     reason = _lm_head_module_reason(lm_head)
     if reason is None:
