@@ -5005,7 +5005,9 @@ def _rewrite_compressed_int_shard(save_directory, filename, plan, output_dtype =
             state = {k: v.to(device) for k, v in state.items()}
             weight = _decompress_int_packed(state, bases[base])
             tensors[base + ".weight"] = weight.to(dtype).cpu().contiguous()
+    precreate_private_temp(path + ".unsloth_tmp", path)  # restricted weights stay private while written
     save_file(tensors, path + ".unsloth_tmp", metadata = metadata)
+    keep_mode(path + ".unsloth_tmp", path, add = stat.S_IWUSR)  # the rewritten shard keeps the mode of the one it replaces
     os.replace(path + ".unsloth_tmp", path)
 pass
 
@@ -5231,7 +5233,9 @@ def _rewrite_compressed_mxfp4_shard(save_directory, filename, plan, output_dtype
                     delta = _expert_slice(deltas[cache_key][None], stacks[stack_path][0], 0, proj)
                     weight = weight + delta.to(weight.device)
             tensors[base + ".weight"] = weight.to(dtype).cpu().contiguous()
+    precreate_private_temp(path + ".unsloth_tmp", path)  # restricted weights stay private while written
     save_file(tensors, path + ".unsloth_tmp", metadata = metadata)
+    keep_mode(path + ".unsloth_tmp", path, add = stat.S_IWUSR)  # the rewritten shard keeps the mode of the one it replaces
     os.replace(path + ".unsloth_tmp", path)
 pass
 
@@ -9436,6 +9440,7 @@ def split_safetensor_file(filename, save_directory, max_shard_size_gb=2):
         for i, shard in enumerate(shards):
             temp_filename = f"temp_split_{temp_base}_{i:03d}.safetensors"
             temp_file_path = os.path.join(save_directory, temp_filename)
+            precreate_private_temp(temp_file_path, file_path)  # restricted weights stay private while written
             save_file(shard, temp_file_path, metadata={"format": "pt"})
             keep_mode(temp_file_path, file_path)  # the split pieces keep the mode of the shard they replace
             temp_filenames.append(temp_filename)
