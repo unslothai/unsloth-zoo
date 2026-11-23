@@ -1292,6 +1292,9 @@ def patch_flex_mask_keeps_padding_mask_mod():
     if not {"attention_mask", "mask_function", "kv_length", "q_length"} <= signature.parameters.keys():
         return
 
+    from unsloth_zoo import rocm_flex_static
+    rocm_static = rocm_flex_static.rocm_flex_static_enabled()
+
     @functools.wraps(original)
     def flex_attention_mask(*args, **kwargs):
         try:
@@ -1310,7 +1313,9 @@ def patch_flex_mask_keeps_padding_mask_mod():
             padding = masking_utils.prepare_padding_mask(
                 mask, arguments["kv_length"], arguments.get("kv_offset", 0)
             )
-            torch._dynamo.maybe_mark_dynamic(padding, 1)
+            # ROCm: a symbolic padding width would reach the static flex graph (see the patch below).
+            if not (rocm_static and rocm_flex_static._affected_device(padding.device)):
+                torch._dynamo.maybe_mark_dynamic(padding, 1)
             arguments["mask_function"] = masking_utils.and_masks(
                 arguments["mask_function"], masking_utils.padding_mask_function(padding)
             )
@@ -1327,6 +1332,75 @@ def patch_flex_mask_keeps_padding_mask_mod():
             pass
 pass
 TEMPORARY_PATCHES.append(patch_flex_mask_keeps_padding_mask_mod)
+
+
+def patch_flex_attention_static_shapes_on_rocm():
+    # ROCm: transformers compiles flex_attention once with automatic dynamic shapes, so the first call at a new
+    # sequence length recompiles it with a symbolic length. On gfx1151 (torch 2.11, ROCm 7.13 / 7.14) that kernel
+    # returns inf / NaN gradients (tiny Gemma-3 trained at 24 tokens after a 32 token step), while a static compile
+    # per length and eager flex are both correct. Calls whose backward will run on a ROCm GPU get a static compile;
+    # inside an enclosing graph their Q / K / V sizes are specialized. No-grad calls (decode) keep transformers'
+    # compile. The module globals that compile_friendly_flex_attention resolves per call are patched (the class's
+    # __call__ and flex_attention), so a helper imported before this patch (Doge) is covered, and the helper itself,
+    # with its compiler boundary and any saved-attention wrapper, stays in place.
+    from unsloth_zoo.rocm_flex_static import (
+        rocm_flex_static_enabled, needs_static_flex, specialize_flex_shapes, compile_static_flex,
+        _without_dynamic_marks,
+    )
+    if not rocm_flex_static_enabled():
+        return
+    try:
+        import transformers.integrations.flex_attention as flex_module
+    except Exception:
+        return
+    raw_flex = getattr(flex_module, "flex_attention", None)
+    wrapped = getattr(flex_module, "WrappedFlexAttention", None)
+    helper = getattr(flex_module, "compile_friendly_flex_attention", None)
+    if raw_flex is None or wrapped is None or helper is None:
+        return
+    if getattr(raw_flex, "_unsloth_rocm_static", False):
+        return
+    try:
+        parameters = list(inspect.signature(helper).parameters)
+        stock_call = wrapped.__call__
+    except Exception:
+        return
+    if parameters[:4] != ["query", "key", "value", "training"]:
+        return
+
+    def rocm_static_flex_attention(query, key, value, **kwargs):
+        # Its own code object: static graphs do not use up the recompile budget of transformers' compile.
+        return raw_flex(query, key, value, **kwargs)
+    static = {}
+
+    @functools.wraps(stock_call)
+    def __call__(self):
+        stock = stock_call(self)
+        training = bool(getattr(self, "training", False))
+
+        def flex_attention_call(query, key, value, **kwargs):
+            if needs_static_flex(query, key, value):
+                function = static.get(training)
+                if function is None:
+                    function = static[training] = compile_static_flex(rocm_static_flex_attention, training)
+                query, key, value = map(_without_dynamic_marks, (query, key, value))
+                return function(query, key, value, **kwargs)
+            return stock(query, key, value, **kwargs)
+        return flex_attention_call
+
+    @functools.wraps(raw_flex)
+    def flex_attention(query, key, value, *args, **kwargs):
+        # compile_friendly_flex_attention calls this directly inside a graph.
+        if torch.compiler.is_compiling() and needs_static_flex(query, key, value):
+            specialize_flex_shapes(query, key, value)
+        return raw_flex(query, key, value, *args, **kwargs)
+
+    flex_attention._unsloth_rocm_static = True
+    __call__._unsloth_rocm_static = True
+    wrapped.__call__ = __call__
+    flex_module.flex_attention = flex_attention
+pass
+TEMPORARY_PATCHES.append(patch_flex_attention_static_shapes_on_rocm)
 
 
 def patch_sdpa_bool_causal_mask():

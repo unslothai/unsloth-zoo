@@ -1075,9 +1075,18 @@ def _adapter_base_model(model_name, token, revision, **hub_kwargs):
         config = PeftConfig.from_pretrained(model_name, revision = revision, token = token, **hub_kwargs)
         if not config.base_model_name_or_path:
             return None
-        return config.base_model_name_or_path, getattr(config, "revision", None)
+        base = config.base_model_name_or_path, getattr(config, "revision", None)
     except Exception:
         return None
+    # A Hub adapter names its base itself: on Windows a UNC base would make the load probe a host the repo chose (SMB, NTLM).
+    if not os.path.isdir(model_name):
+        from unsloth_zoo.vision_utils import _is_network_share
+        if _is_network_share(str(base[0])):
+            raise ValueError(
+                f"Unsloth: The adapter {model_name} names a base model on a network share ({base[0]!r}). "
+                "Refusing to load it: download the base model and load the adapter from a local folder instead."
+            )
+    return base
 
 
 def _clamp_to_learned_positions(model, max_seq_length):
@@ -1370,6 +1379,14 @@ def _remove_stale_weights(save_directory, names):
                 os.remove(path)
 
 
+def _keep_existing_mode(temporary, final):
+    """Carry the old file's mode over on re-export (else 0600 weights become umask-default 0644)."""
+    try:
+        os.chmod(temporary, os.stat(final).st_mode & 0o7777)
+    except OSError:
+        pass
+
+
 def _stream_merged_save(model, save_directory, save_method, max_shard_size = None):
     """Writes the merged checkpoint shard by shard from the live model (peak RSS about the model plus one shard,
     instead of a full deepcopy). Same tensors, names, dtypes and config as merge_and_unload().save_pretrained().
@@ -1442,6 +1459,7 @@ def _stream_merged_save(model, save_directory, save_method, max_shard_size = Non
             with open(temporary, "w", encoding = "utf-8") as f:
                 f.write(json.dumps(index, indent = 2, sort_keys = True) + "\n")
         for temporary, final in staged:
+            _keep_existing_mode(temporary, final)
             os.replace(temporary, final)
     finally:
         for temporary, _ in staged:
