@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import types
 import re
 import warnings
 
@@ -1312,11 +1313,162 @@ def test_released_vision_keeps_audio_and_refuses_a_whole_save():
     with pytest.raises(ValueError, match="drop_vision_weights"):
         utils.save_merged_model(model, None, "unused")
     with pytest.raises(ValueError, match="drop_vision_weights"):
-        utils.save_lora_adapters(model, "unused")
-    with pytest.raises(ValueError, match="drop_vision_weights"):
-        loader._mlx_save_pretrained_merged(model, "unused")
+        loader._mlx_save_pretrained_merged(model, "unused", types.SimpleNamespace())
     with pytest.raises(ValueError, match="drop_vision_weights"):
         loader._mlx_save_pretrained_gguf(model, "unused")
+    model._unsloth_full_finetuning = True
+    with pytest.raises(ValueError, match="drop_vision_weights"):
+        loader.FastMLXModel.get_peft_model(model)
+
+
+@pytest.mark.parametrize("flag", ["train_vision", "finetune_vision_layers", "train_projector"])
+def test_released_vision_refuses_vision_lora(flag):
+    from unsloth_zoo.mlx import loader
+
+    model = _ToyVLM()
+    assert loader.release_vision_weights(model) > 0
+    with pytest.raises(ValueError, match=f"{flag}=True.*drop_vision_weights"):
+        loader.FastMLXModel.get_peft_model(model, **{flag: True})
+
+
+def test_released_vision_adapter_keeps_the_full_base_quantization_map():
+    from unsloth_zoo.mlx import loader, utils
+
+    def quantized_vlm():
+        model = _ToyVLM()
+        model.language_model = nn.QuantizedEmbedding(16, 64, group_size=64, bits=4)
+        model.vision_tower[1] = nn.QuantizedLinear(64, 64, group_size=64, bits=8)
+        return model
+
+    kept, dropped = quantized_vlm(), quantized_vlm()
+    packed = {"vision_tower.0": {"bits": 8, "group_size": 32, "mode": "mxfp8"}}
+    kept._config = {"quantization": packed}
+    dropped._unsloth_packed_quantization = packed
+    assert loader.release_vision_weights(dropped) > 0
+    kept_map = utils._enrich_mlx_adapter_config(kept, {})["base_resolved_quantization_map"]
+    saved = utils._enrich_mlx_adapter_config(dropped, {})
+    assert saved["base_resolved_quantization_map"] == kept_map
+    assert kept_map["vision_tower.1"]["bits"] == 8 and kept_map["vision_tower.0"]["mode"] == "mxfp8"
+    for base in (kept, dropped):
+        loader._validate_mlx_adapter_base(base, saved)
+    loader._validate_mlx_adapter_base(dropped, {"base_resolved_quantization_map": kept_map})
+
+
+def test_released_vision_saves_lora_adapters(tmp_path):
+    import json
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx import loader, utils
+
+    model = _ToyVLM()
+    assert loader.release_vision_weights(model) > 0
+    model.head = LoRALinear.from_base(nn.Linear(7, 7), r=2)
+    utils.save_lora_adapters(model, tmp_path, adapter_config={"fine_tune_type": "lora"})
+    assert "head.lora_a" in mx.load(str(tmp_path / "adapters.safetensors"))
+    assert json.loads((tmp_path / "adapter_config.json").read_text())["fine_tune_type"] == "lora"
+    tokenizer = types.SimpleNamespace(save_pretrained=lambda path: None)
+    loader._mlx_save_pretrained_merged(model, tmp_path / "via_merged", tokenizer, save_method="lora")
+    assert (tmp_path / "via_merged" / "adapters.safetensors").exists()
+
+
+@pytest.mark.parametrize("state", ["vision LoRA", "frozen reloaded projector", "trained projector"])
+def test_released_adapter_state_refuses_an_adapter_save(tmp_path, state):
+    from mlx_lm.tuner.lora import LoRALinear
+    from unsloth_zoo.mlx import loader, utils
+
+    model = _ToyVLM()
+    if state == "vision LoRA":
+        model.vision_tower[0] = LoRALinear.from_base(model.vision_tower[0], r=2)
+    elif state == "frozen reloaded projector":
+        model._unsloth_reloaded_parameter_keys = {"multi_modal_projector.weight"}
+        model.freeze()
+    else:
+        from mlx_lm.tuner.lora import LoRAEmbedding
+
+        model.language_model = LoRAEmbedding.from_base(model.language_model, r=2)
+        model.freeze()
+        model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
+        model.multi_modal_projector.unfreeze()
+    assert loader.release_vision_weights(model) > 0
+    model.head = LoRALinear.from_base(nn.Linear(7, 7), r=2)
+    for save in (utils.save_lora_adapters, utils.save_trainable_adapters):
+        with pytest.raises(ValueError, match="adapter state trained on them"):
+            save(model, tmp_path)
+
+
+_DETACHED_QUANT_OVERRIDES = {
+    "none": None,
+    "selects": lambda path, module: path.endswith("1"),
+    "dict": lambda path, module: {"bits": 8, "mode": "mxfp8"} if path.endswith("2") else True,
+    "input, no width": lambda path, module: {"mode": "nvfp4", "quantize_input": True} if path.endswith("0") else True,
+    "input, width": lambda path, module: (
+        {"mode": "nvfp4", "bits": 4, "group_size": 16, "quantize_input": True} if path.endswith("0") else True
+    ),
+}
+
+
+@pytest.mark.parametrize("mode", ["affine", "nf4_dense"])
+@pytest.mark.parametrize("override", list(_DETACHED_QUANT_OVERRIDES))
+def test_detached_quantization_record_matches_a_kept_load(mode, override):
+    from unsloth_zoo.mlx import loader
+
+    def build():
+        model = _ToyVLM()
+        model.tts = nn.Sequential(
+            nn.Linear(128, 128, bias=False), nn.Linear(64, 64), nn.Linear(256, 64, bias=False),
+            nn.Linear(48, 64), nn.LayerNorm(64),
+        )
+        return model
+
+    spec = loader._MLXQuantizationSpec(enabled=True, bits=2 if mode == "nf4_dense" else 4, group_size=64, mode=mode)
+    predicate = _DETACHED_QUANT_OVERRIDES[override]
+    kept, dropped = build(), build()
+    kept, _ = loader._apply_mlx_quantization(kept, {}, spec, is_vlm=True, user_predicate=predicate)
+    kept_map = {
+        path: entry for path, entry in loader._effective_mlx_quantization_map(kept).items() if path.startswith("tts")
+    }
+    detached = loader._detach_vision_modules(dropped)
+    mx.random.seed(0)
+    loader._record_detached_quantization(dropped, detached, spec, predicate)
+    drawn = mx.random.uniform(shape=(2,))
+    mx.random.seed(0)
+    assert mx.array_equal(drawn, mx.random.uniform(shape=(2,))).item()
+    assert [type(layer) for layer in detached["tts"].layers] == [type(layer) for layer in build().tts.layers]
+    assert loader._settle_detached_vision(dropped, detached) > 0
+    assert kept_map
+    assert dropped._unsloth_released_quantization_map == kept_map
+
+
+
+@pytest.mark.parametrize("mode", ["affine", "nf4_dense"])
+@pytest.mark.parametrize("override", ["none", "selects"])
+def test_detached_quantization_record_matches_a_forced_requantize(mode, override):
+    from unsloth_zoo.mlx import loader
+
+    def build():
+        model = _ToyVLM()
+        model.tts = nn.Sequential(
+            nn.QuantizedLinear(128, 64, group_size=64, bits=8), nn.QuantizedLinear(256, 64, group_size=32, bits=4),
+            nn.Linear(64, 64),
+        )
+        return model
+
+    packed = {"tts.layers.0": {"bits": 8, "group_size": 64}, "tts.layers.1": {"bits": 4, "group_size": 32}}
+    spec = loader._MLXQuantizationSpec(
+        enabled=True, bits=2 if mode == "nf4_dense" else 4, group_size=64, mode=mode, force_requantize=True,
+    )
+    predicate = _DETACHED_QUANT_OVERRIDES[override]
+    kept, dropped = build(), build()
+    kept, _ = loader._apply_mlx_quantization(kept, {"quantization": dict(packed)}, spec, is_vlm=True, user_predicate=predicate)
+    kept_map = {
+        path: entry for path, entry in loader._effective_mlx_quantization_map(kept).items() if path.startswith("tts")
+    }
+    dropped._unsloth_packed_quantization = packed
+    detached = loader._detach_vision_modules(dropped)
+    loader._record_detached_quantization(dropped, detached, spec, predicate)
+    assert [type(layer) for layer in detached["tts"].layers] == [type(layer) for layer in build().tts.layers]
+    assert loader._settle_detached_vision(dropped, detached) > 0
+    released = {path: entry for path, entry in dropped._unsloth_released_quantization_map.items() if path.startswith("tts")}
+    assert loader._normalize_quantization_map(released) == loader._normalize_quantization_map(kept_map)
 
 
 def test_vision_kept_for_text_gets_the_load_dtype():
