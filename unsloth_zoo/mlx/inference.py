@@ -8837,8 +8837,7 @@ def _exact_verify_class(base, name, *cache_key):
             if not invariant or position_embeddings is not None or not isinstance(cache.offset, int):
                 raise RuntimeError("a draft tree attends on `row_invariant_attention` with one row's rotary positions")
             # Each row at its one-token decode's position: the block's first, any rope delta in it, plus its depth.
-            first = mx.full((3, 1, 1), cache.offset, mx.int32) if position_ids is None else position_ids[..., :1]
-            position_ids = first + tree.depth
+            position_ids = _tree_position_ids(tree.depth, cache.offset, position_ids)
         queries, keys, values, gate, mask = attention._prepare_projected_qkv(
             q_proj_output, keys, values, cache if tree is None else _TreeRows(cache), position_ids, position_embeddings, mask)
         padded = isinstance(mask, str) and mask == "left_padded_decode"
@@ -10956,17 +10955,35 @@ def deeper_causal_verify(rows: int):
 _TREE_HEAD_LAYERS = 1  # layers a sized tree's verify runs over every drafted row while its lattice is read
 
 
+def _tree_position_ids(depth, offset, positions):
+    cached = _VERIFY_STATE.tree_positions
+    if cached is not None:
+        old_depth, old_offset, old_positions, ids = cached
+        if old_depth is depth and old_offset == offset and old_positions is positions:
+            return ids
+    if positions is None:
+        first = mx.full((3, 1, 1), offset, mx.int32)
+    else:
+        first = positions[..., :1]
+    ids = mx.contiguous(first + depth)
+    _VERIFY_STATE.tree_positions = (depth, offset, positions, ids)
+    return ids
+
+
 @contextmanager
 def tree_verify(block, size = None):
     """While open, the forward built verifies its block as `block`'s tree: each row is its path's one-token decode.
     Given `size`, of rows in taking order it verifies the first `size()`, asked once its first `_TREE_HEAD_LAYERS` layers
     are submitted over the whole block: the GPU runs those while `size` waits for the lattice instead of idling."""
     outer = getattr(_VERIFY_STATE, "tree", None), getattr(_VERIFY_STATE, "tree_head", None)
+    outer_positions = getattr(_VERIFY_STATE, "tree_positions", None)
     _VERIFY_STATE.tree, _VERIFY_STATE.tree_head = block, None if size is None else [_TREE_HEAD_LAYERS, size]
+    _VERIFY_STATE.tree_positions = None
     try:
         yield
     finally:
         _VERIFY_STATE.tree, _VERIFY_STATE.tree_head = outer
+        _VERIFY_STATE.tree_positions = outer_positions
 
 
 def _tree_head_rows(hidden, cache):

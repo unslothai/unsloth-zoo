@@ -944,6 +944,9 @@ def _warm_tree_widths(lm, cache, tokens):
 @pytest.mark.parametrize("prefix, delta", [(24, 0), (24, 5), (500, 0), (1020, 0)])
 def test_tree_verify_rows_equal_their_paths_one_token_decoding(qwen_4bit, monkeypatch, prefix, delta):
     from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx import inference
+    positions = Mock(wraps = inference._tree_position_ids)
+    monkeypatch.setattr(inference, "_tree_position_ids", positions)
     model, ids, cache = qwen_4bit
     lm, tokens = model.language_model, ids[1][:len(TREE_PARENTS)]
     rope = dict(rope_deltas = mx.array([[delta]]))
@@ -956,6 +959,11 @@ def test_tree_verify_rows_equal_their_paths_one_token_decoding(qwen_4bit, monkey
         block, paths = _tree_block(TREE_PARENTS)
         logits, transaction = _tree_verified(lm, _clone(cache), tokens, block, **rope)
         transaction.abort()
+        with inference.tree_verify(block):
+            depth, offset, source = positions.call_args.args
+            first = positions(depth, offset, source)
+            assert positions(depth, offset, source) is first
+            assert _bits(positions(depth, offset, first + 9), first[..., :1] + 9 + depth)
         for row, path in enumerate(paths):
             assert _bits(logits[row], _stepped(lm, _clone(cache), [tokens[i] for i in path], **rope)[-1]), row
         # A sized tree: the first layer has verified every row when the size is asked, the rest verify the first rows.
