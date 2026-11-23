@@ -157,3 +157,19 @@ def test_fused_loss_and_grads_match_the_materialised_softcap(monkeypatch):
         torch.testing.assert_close(got["0"][0], got["1"][0], rtol = 1e-5, atol = 1e-6)
         for a, b in zip(got["0"][2], got["1"][2]):
             torch.testing.assert_close(a, b, rtol = 1e-4, atol = 1e-6)
+
+
+def test_zero_softcap_takes_the_exact_path(monkeypatch):
+    """The kernel reads a zero cap as "no softcap"; the module's tanh(x / 0) * 0 zeroes the logits (loss log V)."""
+    cls = _make_class("ZeroCapToyForCausalLM", _Softcap)
+    model = cls()
+    model.logit_softcap.softcap = 0.0
+    torch.manual_seed(0)
+    x = torch.randn(2, 8, 16)
+    labels = torch.randint(0, 300, (2, 8))
+    want = model(x = x, labels = labels).loss
+    monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", "0")
+    assert forward_install.install_for_class(cls)
+    got = model(x = x, labels = labels).loss
+    torch.testing.assert_close(got, want)
+

@@ -729,6 +729,9 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     # The kernel computes no gradient for the extra bias: a trainable one takes the exact path.
     if cap.logits_bias_src is not None:
         zero_scale += f" or {cap.logits_bias_src}.requires_grad"
+    # The kernel reads zero as "no softcap", where the model's tanh(x / 0) * 0 zeroes the logits: exact path.
+    if cap.softcap_expr is not None:
+        zero_scale += f" or ({ast.unparse(cap.softcap_expr)}) == 0"
     # Legacy CE blocks never call self.loss_function.
     custom_loss = "" if cap.legacy_body else " or not _can_fuse_loss(self.loss_function)"
     template = (
