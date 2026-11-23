@@ -43,7 +43,7 @@ from pathlib import Path
 
 import torch
 
-from ..private_staging import current_umask
+from unsloth_zoo.private_staging import current_umask
 
 MTP_HEAD_WEIGHTS_NAME = "mtp_head.safetensors"
 MTP_HEAD_INFO_NAME = "mtp_head.json"
