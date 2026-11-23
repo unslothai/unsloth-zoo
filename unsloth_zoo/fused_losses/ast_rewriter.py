@@ -662,13 +662,14 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     hidden_src = ast.unparse(cap.hidden_expr)
     logits_rhs = cap.logits_rhs_src or f"self.{head_attr}({hidden_src})"
 
-    # The kernel reads only lm_head.weight / bias, which equals the PEFT head's forward only for an unmerged head
-    # with its adapters disabled: an enabled adapter would get no gradient, and a merged-then-disabled head unmerges
-    # inside its forward. Any other tuner-layer state takes the exact path. Builtins only, so any namespace runs it.
+    # The kernel reads only lm_head.weight / bias. A PEFT head's forward is exactly that when it is merged with its
+    # adapters enabled (base_layer alone, on the merged weight) or unmerged with them disabled. Unmerged and enabled
+    # adds adapters the kernel would give no gradient; merged and disabled unmerges inside its forward. Those two
+    # states take the exact path. Builtins only, so any namespace runs it.
     live_adapter = (
         f" or (getattr(self.{head_attr}, 'base_layer', None) is not None"
-        f" and (bool(getattr(self.{head_attr}, 'merged', False))"
-        f" or not getattr(self.{head_attr}, 'disable_adapters', False)))"
+        f" and bool(getattr(self.{head_attr}, 'merged', False))"
+        f" == bool(getattr(self.{head_attr}, 'disable_adapters', False)))"
     )
     # Re-checked per call: the loss can be swapped after install.
     if cap.guarded_scale_expr is not None and "logit_scale_multiply" not in already:
