@@ -246,6 +246,23 @@ def test_strictly_dynamic_length_is_counted_and_warned(rocm, stats):
     assert stats.ROCM_FLEX_STATIC_STATS["left_dynamic"] >= 1
 
 
+def test_warnings_as_errors_do_not_fail_the_trace(rocm, stats):
+    # -W error::RuntimeWarning: the trace-time diagnostic is logged instead of raising inside Dynamo.
+    import warnings
+
+    graphs, install = rocm
+    install()
+    compiled = _batched_layer()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        for length in (32, 24):
+            x = torch.randn(1, length, 8)
+            torch._dynamo.mark_dynamic(x, 1)
+            compiled(x).sum().backward()
+    counts = stats.ROCM_FLEX_STATIC_STATS
+    assert counts["left_dynamic"] >= 1 and counts["failed"] == 0, counts
+
+
 def test_moved_dynamo_internals_warn_once_instead_of_failing_silently(rocm, stats, monkeypatch):
     graphs, install = rocm
     install()
@@ -352,6 +369,50 @@ def test_static_compile_has_room_for_many_lengths(rocm):
         assert getattr(config, name) == 4096, "a larger limit is never lowered"
     finally:
         set_torch_config(config, name, before)
+
+
+def test_static_compile_keeps_a_higher_configured_limit(rocm):
+    from unsloth_zoo.torch_config import set_torch_config
+
+    if "recompile_limit" not in inspect.signature(_REAL_TORCH_COMPILE).parameters:
+        pytest.skip("torch.compile takes no per-call recompile_limit before torch 2.12")
+    graphs, install = rocm
+    config = torch._dynamo.config
+    before = config.recompile_limit
+    try:
+        set_torch_config(config, "recompile_limit", 4096)
+        fn = install()
+        fn(*_qkv(16), training = True)
+        assert [kwargs.get("recompile_limit") for _, kwargs, _ in _static(graphs)] == [4096]
+        assert config.recompile_limit == 4096
+    finally:
+        set_torch_config(config, "recompile_limit", before)
+
+
+def test_static_compile_budget_is_never_below_the_configured_one(monkeypatch):
+    # Real Dynamo with the floor scaled down to 2: a configured limit of 4 must still compile 4 lengths.
+    from torch._dynamo.testing import CompileCounter
+    from unsloth_zoo import rocm_flex_static
+
+    if "recompile_limit" not in inspect.signature(_REAL_TORCH_COMPILE).parameters:
+        pytest.skip("torch.compile takes no per-call recompile_limit before torch 2.12")
+    monkeypatch.setattr(rocm_flex_static, "_RECOMPILE_FLOOR", 2)
+    count = CompileCounter()
+    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: _REAL_TORCH_COMPILE(fn, backend = count, **kwargs))
+
+    def entry(q):
+        return q.sin()
+
+    torch._dynamo.reset()
+    try:
+        with torch._dynamo.config.patch(recompile_limit = 4):
+            compiled = rocm_flex_static.compile_static_flex(entry)
+            for length in (5, 6, 7, 8):
+                compiled(torch.ones(length))
+            assert torch._dynamo.config.recompile_limit == 4
+        assert count.frame_count == 4
+    finally:
+        torch._dynamo.reset()
 
 
 def test_static_entry_has_its_own_code_object(rocm):

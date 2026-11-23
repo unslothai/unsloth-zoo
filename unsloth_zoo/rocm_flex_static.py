@@ -39,6 +39,7 @@ __all__ = [
 ]
 
 import inspect
+import logging
 import os
 import warnings
 import torch
@@ -58,13 +59,19 @@ _RECOMPILE_FLOOR = 1024
 # static_calls: eager calls routed to the static compile of a call site's own entry point.
 ROCM_FLEX_STATIC_STATS = {"specialized": 0, "left_dynamic": 0, "failed": 0, "static_calls": 0}
 _WARNED = set()
+_logger = logging.getLogger(__name__)
 
 
 def _warn_once(kind, message):
+    # Also called at trace time (comptime): a warning filter that turns RuntimeWarning into an error
+    # (-W error::RuntimeWarning) must not fail the enclosing Dynamo trace, so it is logged instead.
     if kind in _WARNED:
         return
     _WARNED.add(kind)
-    warnings.warn(f"Unsloth: {message}", RuntimeWarning, stacklevel = 3)
+    try:
+        warnings.warn(f"Unsloth: {message}", RuntimeWarning, stacklevel = 3)
+    except Exception:
+        _logger.warning("Unsloth: %s", message)
 
 
 def rocm_flex_static_enabled():
@@ -158,7 +165,7 @@ def _note_static_call():
 
 
 def _per_call_recompile_limit():
-    # torch 2.13+: torch.compile(recompile_limit = N) limits that compile alone.
+    # torch 2.12+: torch.compile(recompile_limit = N) limits that compile alone.
     try:
         return "recompile_limit" in inspect.signature(torch.compile).parameters
     except (TypeError, ValueError):
@@ -188,6 +195,17 @@ def _raise_recompile_budget(per_frame = True):
                 break
 
 
+def _configured_recompile_limit():
+    config = torch._dynamo.config
+    for name in ("recompile_limit", "cache_size_limit"):
+        if hasattr(config, name):
+            try:
+                return int(getattr(config, name))
+            except Exception:
+                return 0
+    return 0
+
+
 def compile_static_flex(entry, training = False):
     """torch.compile(entry, dynamic = False) with room for one graph per length. `entry` should be a function of the
     call site's own, so its Dynamo cache is not shared with another compile of flex_attention."""
@@ -195,7 +213,8 @@ def compile_static_flex(entry, training = False):
     if _PER_CALL_RECOMPILE_LIMIT:
         # This compile's own limit: the process-wide recompile_limit stays as its owner configured it. The
         # accumulated limit is a per code object safety cap counted across compiles, so it still needs room.
-        options["recompile_limit"] = _RECOMPILE_FLOOR
+        # A process-wide limit set higher than the floor is kept for this compile too.
+        options["recompile_limit"] = max(_configured_recompile_limit(), _RECOMPILE_FLOOR)
         _raise_recompile_budget(per_frame = False)
     else:
         _raise_recompile_budget()
