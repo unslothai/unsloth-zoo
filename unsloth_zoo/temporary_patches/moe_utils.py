@@ -1378,12 +1378,56 @@ def _device_headroom_bytes(index):
     return free, lambda: free + max(torch.cuda.memory_reserved(index) - torch.cuda.memory_allocated(index), 0)
 
 
+class _TorchCheckpointRecord:
+    """Chunk decisions of one torch non-reentrant checkpoint frame: dequant_chunks keyed (nth call, module) by the
+    forward, and a per-module call count for the forward (gid None) and each recompute (its graph task id)."""
+    def __init__(self):
+        self.dequant_chunks = {}
+        self.counts = {}
+
+
+def _torch_checkpoint_call(experts_module):
+    """(record, call, replaying) shaped like moe_checkpoint_call when this call runs inside torch's own non-reentrant
+    checkpoint: its forward (top saved-tensors hook packs into `frame`) or its recompute (packs into
+    `target_frame_ref` for graph task `gid`). The decision lives on that frame, so each in-flight checkpoint and each
+    backward of it matches its own forward. None on older torch, other hooks on top, or no checkpoint."""
+    top = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
+    if top is None:
+        return None
+    try:
+        hooks = top(True)
+        if not hooks:
+            return None
+        pack = inspect.unwrap(hooks[0])
+        cells = dict(zip(pack.__code__.co_freevars, pack.__closure__ or ()))
+        if "frame" in cells:
+            frame, gid = cells["frame"].cell_contents, None
+        elif "target_frame_ref" in cells and "gid" in cells:
+            frame, gid = cells["target_frame_ref"].cell_contents(), cells["gid"].cell_contents
+        else:
+            return None
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if frame is None or not hasattr(frame, "weak_holders"):
+        return None
+    record = getattr(frame, "_unsloth_dequant_record", None)
+    if record is None:
+        record = frame._unsloth_dequant_record = _TorchCheckpointRecord()
+    counts = record.counts.setdefault(gid, {})
+    call = counts.get(id(experts_module), 0)
+    counts[id(experts_module)] = call + 1
+    return record, call, gid is not None
+
+
 def _auto_dequant_chunk_experts(splits, dtype, experts_module, device, experts_needed = None, checkpoint_call = None) -> int:
     """_auto_dequant_decide_chunk, decided once per checkpointed experts call: the first pass records its decision on
     the call's routing frame and that call's replay (every backward of it) takes exactly that decision back, whatever
     the headroom or other layers read since, so the replay runs the same plan, kept base and LoRA fold as its first
-    pass. Calls outside a checkpoint (or a replay with no recorded decision) decide fresh."""
+    pass. torch's non-reentrant checkpoint (no routing frame) gets the same on its own frame. Calls outside a checkpoint
+    (or a replay with no recorded decision) decide fresh."""
     record = key = None
+    if checkpoint_call is None:
+        checkpoint_call = _torch_checkpoint_call(experts_module)
     if checkpoint_call is not None:
         frame, call, replaying = checkpoint_call
         record = getattr(frame, "dequant_chunks", None)
