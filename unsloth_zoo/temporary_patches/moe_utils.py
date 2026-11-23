@@ -1251,14 +1251,25 @@ def _lora_fold_base_mm(inputs, offsets, weight_provider, recompute, lora, source
     return lora_fold_base_mm(inputs, offsets, weight_provider, recompute, lora, source)
 
 
-def _gc_keep_base_slot(module):
+def _gc_moe_checkpoint_call():
+    """(routing frame, entry index, replaying) for this experts call inside an Unsloth checkpoint, else None (eager only)."""
     if torch.compiler.is_compiling():
+        return None
+    try:
+        from unsloth_zoo.gradient_checkpointing import moe_checkpoint_call
+    except ImportError:
+        return None
+    return moe_checkpoint_call()
+
+
+def _gc_keep_base_slot(module, checkpoint_call = None):
+    if torch.compiler.is_compiling() or checkpoint_call is None:
         return None
     try:
         from unsloth_zoo.temporary_patches.moe_gc_keep_base import keep_base_slot
     except ImportError:
         return None
-    return keep_base_slot(module)
+    return keep_base_slot(module, checkpoint_call)
 
 
 def _moe_base_and_lora(inputs, offsets, weight_provider, recompute, plan, lora, source, keep_slot, proj):
@@ -1332,10 +1343,6 @@ def _selective_dequant_chunk_experts() -> int:
 
 
 _DEVICE_TOTAL_BYTES = {}
-# Devices whose latest headroom reading outside a checkpoint replay was short. A replay chunks there without a new
-# reading, so it takes the plan its first pass took (and the kept base output); every other call reads the headroom
-# again, so a transient shortfall clears once memory is back.
-_AUTO_DEQUANT_TIGHT = set()
 
 
 def _cuda_capturing(device):
@@ -1371,7 +1378,27 @@ def _device_headroom_bytes(index):
     return free, lambda: free + max(torch.cuda.memory_reserved(index) - torch.cuda.memory_allocated(index), 0)
 
 
-def _auto_dequant_chunk_experts(splits, dtype, experts_module, device, experts_needed = None, replaying = False) -> int:
+def _auto_dequant_chunk_experts(splits, dtype, experts_module, device, experts_needed = None, checkpoint_call = None) -> int:
+    """_auto_dequant_decide_chunk, decided once per checkpointed experts call: the first pass records its decision on
+    the call's routing frame and that call's replay (every backward of it) takes exactly that decision back, whatever
+    the headroom or other layers read since, so the replay runs the same plan, kept base and LoRA fold as its first
+    pass. Calls outside a checkpoint (or a replay with no recorded decision) decide fresh."""
+    record = key = None
+    if checkpoint_call is not None:
+        frame, call, replaying = checkpoint_call
+        record = getattr(frame, "dequant_chunks", None)
+        key = (call, id(experts_module))
+        if record is not None and replaying and key in record:
+            return record[key]
+        if replaying:
+            record = None   # never let a replay overwrite (or create) its first pass's decision
+    chunk = _auto_dequant_decide_chunk(splits, dtype, experts_module, device, experts_needed)
+    if record is not None:
+        record[key] = chunk
+    return chunk
+
+
+def _auto_dequant_decide_chunk(splits, dtype, experts_module, device, experts_needed = None) -> int:
     """Experts per chunk keeping one projection's dequantized scratch under a cap, or 0 for the unchunked plan.
 
     `experts_needed` is how many experts the unchunked plan reads (the sync-free capped plan's rows, else the whole
@@ -1380,9 +1407,9 @@ def _auto_dequant_chunk_experts(splits, dtype, experts_module, device, experts_n
     Otherwise only experts classes declaring `_unsloth_dequant_scratch_fraction` (Inkling 2) take part, with a cap of
     that share of the card. Chunking costs a host sync per call and disables the kept checkpoint base, so it engages
     only on need: the scratch is over twice the cap AND it does not fit the device right now (twice the scratch, for
-    the dequant plus a cast or transposed copy, plus one cap of slack, above the free memory). A checkpoint replay
-    (`replaying`) on a device last found short chunks without reading again, so it matches its first pass; any other
-    call reads again and clears that verdict once the stack fits (`_AUTO_DEQUANT_TIGHT`). Inkling-2-Mini's 1.27 GiB
+    the dequant plus a cast or transposed copy, plus one cap of slack, above the free memory). Every call reads again,
+    so a transient shortfall clears once the stack fits; a checkpoint replay instead reuses its own first pass's
+    decision (_auto_dequant_chunk_experts). Inkling-2-Mini's 1.27 GiB
     gate_up stack therefore stays whole on a 40 GB card without any query, and on 16 to 32 GB cards while memory is
     not short; Small's 16 GiB stack chunks wherever it does not fit. An explicit UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS (0 included) wins. Chunks read
     the same values as the whole stack."""
@@ -1405,17 +1432,11 @@ def _auto_dequant_chunk_experts(splits, dtype, experts_module, device, experts_n
     cap = fraction * total
     if cap <= 0 or scratch <= 2 * cap:
         return 0
-    chunk = max(1, int(cap // per_expert))
-    if replaying and index in _AUTO_DEQUANT_TIGHT:
-        return chunk
     want = 2 * scratch + cap
     free, with_cached = _device_headroom_bytes(index)
     if free >= want or with_cached() >= want:
-        if not replaying:
-            _AUTO_DEQUANT_TIGHT.discard(index)
         return 0
-    _AUTO_DEQUANT_TIGHT.add(index)
-    return chunk
+    return max(1, int(cap // per_expert))
 
 
 def _bnb4bit_expert_split(param):
@@ -1539,7 +1560,7 @@ def _dequantize_bnb4bit_experts_once(param, experts, target_dtype = None):
     return out.to(target_dtype) if target_dtype is not None else out
 
 
-def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows, experts_module = None, replaying = False):
+def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows, experts_module = None, checkpoint_call = None):
     """Expert chunks to dequantize, or None to keep the full-stack path when off, traced, capturing, a source that cannot split exactly, or nothing to save."""
     mode = os.environ.get("UNSLOTH_MOE_SELECTIVE_DEQUANT", "auto")
     selective = mode == "1"
@@ -1561,7 +1582,7 @@ def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows, experts_mo
             capped = not selective and 0 < num_rows and 8 * num_rows <= 7 * E
             chunk = _auto_dequant_chunk_experts(
                 splits, param.quant_state.dtype, experts_module, num_tokens_per_expert.device,
-                experts_needed = num_rows if capped else E, replaying = replaying,
+                experts_needed = num_rows if capped else E, checkpoint_call = checkpoint_call,
             )
             # The chunked plan reads the routed counts on the host anyway: read only the routed experts.
             capped_scratch = chunk > 0
@@ -5608,7 +5629,8 @@ def forward_native_grouped_mm(
     permuted_input = gather_routed_rows(hidden_states, sorted_indices, top_k_index.shape[-1])
 
     # Inside an Unsloth checkpoint: keep (first pass) or reuse (replay) the frozen base outputs.
-    keep_slot = _gc_keep_base_slot(self)
+    checkpoint_call = _gc_moe_checkpoint_call()
+    keep_slot = _gc_keep_base_slot(self, checkpoint_call)
 
     # Gate + Up projection with optional separated LoRA (default).
     use_separated_lora = _should_use_separated_lora()
@@ -5650,7 +5672,7 @@ def forward_native_grouped_mm(
             if _recompute:
                 selective_plan = _selective_dequant_plan(
                     (_gate_up_src, getattr(self, "down_proj", None)), num_tokens_per_expert, permuted_input.shape[0],
-                    experts_module = self, replaying = keep_slot is not None and keep_slot.replaying,
+                    experts_module = self, checkpoint_call = checkpoint_call,
                 )
             # LoRA folded into the base GEMM (moe_lora_fold) and the first pass's base output reused by the checkpoint
             # replay (moe_gc_keep_base); a LoRA left over is added by the separated path below.

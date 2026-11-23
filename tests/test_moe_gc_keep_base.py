@@ -262,3 +262,57 @@ def test_nf4_auto_above_cap_takes_kept_path(monkeypatch):
     KB.KEEP_BASE_STATS.clear()
     _step(layers, x0)
     assert NF.NF4_FUSED_STATS["launches"] > before and KB.KEEP_BASE_STATS["stored"] == 0
+
+
+class _Headroom(nn.Module):
+    """Runs `layer` with the auto dequant headroom reading `gib` free, first pass and replay alike."""
+
+    def __init__(self, layer, gib, state, outputs):
+        super().__init__()
+        self.layer, self.gib, self.state, self.outputs = layer, gib, state, outputs
+
+    def forward(self, x):
+        self.state["gib"] = self.gib
+        out = self.layer(x)
+        self.outputs.setdefault(id(self), []).append(out.detach().clone())
+        return out
+
+
+@needs_gpu
+@pytest.mark.parametrize("fold", ["0", "1"])
+def test_auto_dequant_chunk_decision_is_per_checkpoint_call(monkeypatch, fold):
+    """Two QLoRA layers on one card, the first with headroom (whole stack: kept base, LoRA fold), the second short
+    (chunked). Each layer's replay takes its own first pass's decision, so it runs the same plan and its output is
+    bitwise the first pass's; a device-wide verdict would chunk the first layer's replay after the second's."""
+    pytest.importorskip("bitsandbytes")
+    for name in ("UNSLOTH_MOE_SELECTIVE_DEQUANT", "UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS", "UNSLOTH_MOE_DEQUANT_MAX_MB"):
+        monkeypatch.delenv(name, raising = False)
+    monkeypatch.setenv("UNSLOTH_MOE_NF4_FUSED", "0")
+    monkeypatch.setenv("UNSLOTH_MOE_LORA_FOLD", fold)
+    if fold == "1":
+        monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "1")
+        MU._TRITON_GROUPED_MM_POLICY.clear()
+        if torch.cuda.get_device_capability() < (8, 0) or not MG.triton_grouped_available(torch.device("cuda")):
+            pytest.skip("Triton grouped GEMM unavailable")
+    # gate_up per expert 192 x 128 bf16 = 48 KiB, 8 experts = 384 KiB against a 2.5% x 4 MiB = 102 KiB cap.
+    index = torch.cuda.current_device()
+    monkeypatch.setitem(MU._DEVICE_TOTAL_BYTES, index, 4 * 2**20)
+    state = {"gib": 0.0}
+    monkeypatch.setattr(MU, "_device_headroom_bytes", lambda i: (int(state["gib"] * 2**30), lambda: int(state["gib"] * 2**30)))
+    plans = []
+    real_plan = MU._selective_dequant_plan
+    monkeypatch.setattr(MU, "_selective_dequant_plan", lambda *a, **k: (lambda p: plans.append((state["gib"], p is None)) or p)(real_plan(*a, **k)))
+    outputs = {}
+    layers = []
+    for seed, gib in ((0, 8.0), (1, 0.0)):
+        layer = Layer(seed = seed, nf4 = True)
+        layer.experts._unsloth_dequant_scratch_fraction = 0.025
+        layers.append(_Headroom(layer, gib, state, outputs))
+    layers = nn.ModuleList(layers).train()
+    _step(layers, _x())
+    # First pass A (whole), B (chunked); replay B then A, each as its first pass.
+    assert plans == [(8.0, True), (0.0, False), (0.0, False), (8.0, True)], plans
+    for wrapper in layers:
+        first, replay = outputs[id(wrapper)]
+        assert torch.equal(first, replay)
+    assert KB.KEEP_BASE_STATS["reused"] == 2   # layer A's two projections

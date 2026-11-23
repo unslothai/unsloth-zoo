@@ -60,7 +60,6 @@ def _env(monkeypatch):
         monkeypatch.setattr(mu, "_transposed_view_grouped_mm_is_safe", lambda: True)
     for key in mu.SELECTIVE_DEQUANT_STATS:
         mu.SELECTIVE_DEQUANT_STATS[key] = 0
-    monkeypatch.setattr(mu, "_AUTO_DEQUANT_TIGHT", set(), raising = False)
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -311,7 +310,6 @@ def test_scratch_fraction_follows_the_experts_class_and_the_card(monkeypatch):
     assert chunk == int(cap // (2304 * 2304 * 2)) == 36   # 4 chunks
     # Stacks up to twice the cap stay whole without reading free memory: Mini's down stack alone (0.63 GiB), or Mini
     # on a 40 GB card.
-    mu._AUTO_DEQUANT_TIGHT.clear()
     calls = []
     _headroom(monkeypatch, 0.0, calls)
     assert mu._auto_dequant_chunk_experts(MINI[1:], torch.float16, _Flagged(), cuda0) == 0
@@ -324,9 +322,14 @@ def test_scratch_fraction_follows_the_experts_class_and_the_card(monkeypatch):
     assert mu._auto_dequant_chunk_experts(small, torch.float16, _Flagged(), cuda0) == int(0.025 * 79.2 * 2**30 // (4608 * 4608 * 2))
 
 
+def _checkpoint_frame():
+    from unsloth_zoo.gradient_checkpointing import CheckpointRoutingFrame
+    return CheckpointRoutingFrame()
+
+
 def test_auto_chunking_waits_for_memory_need(monkeypatch):
     """A 24 GB card holds Mini's 1.27 GiB stack while memory is free: no chunking, so no host sync per MoE call. Once
-    the stack does not fit, that device chunks, and a checkpoint replay there chunks without a new reading (it
+    the stack does not fit, that device chunks, and a checkpoint replay of that call chunks without a new reading (it
     matches its first pass); other devices are unaffected."""
     monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
     for index in (0, 1):
@@ -338,23 +341,24 @@ def test_auto_chunking_waits_for_memory_need(monkeypatch):
     _headroom(monkeypatch, 3.2)
     assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0) == 0
     _headroom(monkeypatch, 2.5)
-    chunk = mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0)
+    frame, layer = _checkpoint_frame(), _Flagged()
+    chunk = mu._auto_dequant_chunk_experts(MINI, torch.float16, layer, cuda0, checkpoint_call = (frame, 0, False))
     assert chunk == int(0.025 * 21.96 * 2**30 // (2304 * 2304 * 2)) == 55
     calls = []
     _headroom(monkeypatch, 8.0, calls)
-    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0, replaying = True) == 55
+    frame.replaying = True
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, layer, cuda0, checkpoint_call = (frame, 0, True)) == 55
     assert calls == []
     assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda1) == 0
     # The unchunked plan's real scratch decides: a sync-free plan over 16 of 128 experts fits anywhere.
-    mu._AUTO_DEQUANT_TIGHT.clear()
     _headroom(monkeypatch, 0.5)
     assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0, experts_needed = 16) == 0
 
 
 def test_a_transient_shortfall_clears_once_memory_is_back(monkeypatch):
     """One short reading (an eval spike, a fragmented moment) must not chunk the device for the rest of the process:
-    the next call outside a checkpoint replay reads the headroom again and goes back to the whole stack (no host
-    sync, kept checkpoint base). A replay never clears it, so it keeps its first pass's plan."""
+    the next call reads the headroom again and goes back to the whole stack (no host sync, kept checkpoint base). A
+    checkpoint replay instead takes its own first pass's decision back, whichever way memory moved since."""
     monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
     monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, 0, int(21.96 * 2**30))   # L4
     cuda0 = torch.device("cuda", 0)
@@ -363,14 +367,42 @@ def test_a_transient_shortfall_clears_once_memory_is_back(monkeypatch):
     calls = []
     _headroom(monkeypatch, 8.0, calls)
     assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0) == 0
-    assert calls == [0] and 0 not in mu._AUTO_DEQUANT_TIGHT
-    # A replay reads the headroom only where the last reading was not short, and never clears a short one.
+    assert calls == [0]
+    # A replay with no recorded first pass decides fresh.
+    frame = _checkpoint_frame()
+    frame.replaying = True
     _headroom(monkeypatch, 2.5)
-    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0, replaying = True) == 55
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0, checkpoint_call = (frame, 0, True)) == 55
+    assert frame.dequant_chunks == {}
+
+
+def test_replay_keeps_its_own_layers_first_pass_decision(monkeypatch):
+    """Two checkpointed layers on one card: A decides 0 at 8 GiB free, B decides 55 at 2.5 GiB. Each replay (B first,
+    as backward runs) takes its own first pass's decision back, whatever the headroom reads then, and a retained
+    graph's second backward does again; a device-wide verdict would hand B's 55 to A's replay."""
+    monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
+    monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, 0, int(21.96 * 2**30))   # L4
+    cuda0 = torch.device("cuda", 0)
+    frame_a, frame_b, layer_a, layer_b = _checkpoint_frame(), _checkpoint_frame(), _Flagged(), _Flagged()
+    decide = lambda layer, frame, replaying: mu._auto_dequant_chunk_experts(
+        MINI, torch.float16, layer, cuda0, checkpoint_call = (frame, 0, replaying),
+    )
     _headroom(monkeypatch, 8.0)
-    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0, replaying = True) == 55
-    assert 0 in mu._AUTO_DEQUANT_TIGHT
-    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, _Flagged(), cuda0) == 0
+    assert decide(layer_a, frame_a, False) == 0
+    _headroom(monkeypatch, 2.5)
+    assert decide(layer_b, frame_b, False) == 55
+    for free_b, free_a in ((2.5, 8.0), (8.0, 2.5), (8.0, 8.0)):
+        calls = []
+        _headroom(monkeypatch, free_b, calls)
+        assert decide(layer_b, frame_b, True) == 55
+        _headroom(monkeypatch, free_a, calls)
+        assert decide(layer_a, frame_a, True) == 0
+        assert calls == []   # a replay reads no headroom
+    # Outside a checkpoint every call decides fresh.
+    _headroom(monkeypatch, 8.0)
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, layer_a, cuda0) == 0
+    _headroom(monkeypatch, 2.5)
+    assert mu._auto_dequant_chunk_experts(MINI, torch.float16, layer_a, cuda0) == 55
 
 
 def test_capture_check_asks_the_counts_device(monkeypatch):
