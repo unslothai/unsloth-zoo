@@ -49,17 +49,18 @@ def _is_safe_private_dir(path: Path) -> bool:
     # so cached models and the HF_HOME token stay private; ownership check is POSIX-only.
     try:
         if hasattr(os, "getuid"):
-            # /tmp is race-safe thanks to the sticky bit; a world-writable non-sticky ancestor we do not own is not, so refuse a fallback there.
-            ancestor = path
-            while not ancestor.exists():
-                ancestor = ancestor.parent
-            st = ancestor.stat()
-            if (
-                st.st_mode & 0o002
-                and not st.st_mode & 0o1000
-                and st.st_uid != os.getuid()
-            ):
-                return False
+            # /tmp is race-safe thanks to the sticky bit; a group- or world-writable non-sticky ancestor we do not own
+            # is not (anyone it lets write can rename our folder away and plant their own), so refuse a fallback there.
+            for ancestor in (path, *path.parents):
+                if not ancestor.exists():
+                    continue
+                st = ancestor.stat()
+                if (
+                    st.st_mode & 0o022
+                    and not st.st_mode & 0o1000
+                    and st.st_uid != os.getuid()
+                ):
+                    return False
         # mode applies only to the leaf, so a fresh dir is never looser than 0700 under a permissive umask; chmod covers pre-existing dirs.
         path.mkdir(mode = 0o700, parents = True, exist_ok = True)
         if path.is_symlink():
