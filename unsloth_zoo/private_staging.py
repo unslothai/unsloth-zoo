@@ -17,8 +17,10 @@
 """Stdlib only (imported by the MLX path on Mac, where torch may be absent)."""
 
 import os
+import shutil
+import stat
 
-__all__ = ["precreate_private_temp"]
+__all__ = ["precreate_private_temp", "current_umask", "keep_mode", "copy_keep_mode"]
 
 
 def precreate_private_temp(temporary, final):
@@ -39,3 +41,63 @@ def precreate_private_temp(temporary, final):
     except OSError:
         return
     os.close(fd)
+
+
+def current_umask():
+    """The process umask, read without changing it where /proc allows (else briefly narrowed to 077 and restored)."""
+    try:
+        with open("/proc/self/status", encoding = "ascii") as f:
+            for line in f:
+                if line.startswith("Umask:"):
+                    return int(line.split()[1], 8)
+    except (OSError, ValueError):
+        pass
+    old = os.umask(0o077)
+    os.umask(old)
+    return old
+
+
+def keep_mode(temporary, final, source_mode = None, like = (), add = 0):
+    """Before publishing `temporary` as `final`: take the mode of the existing `final` (or the first existing path in
+    `like`), so a re-export never widens weights the user restricted. With nothing existing, a copied file's
+    `source_mode` is narrowed by the umask; else the temp keeps the mode it was written with. `add` bits are ORed in.
+    Idempotent, never raises, no-op on Windows."""
+    if os.name == "nt":
+        return
+    mode = None
+    for path in (final, *like):
+        try:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            break
+        except (OSError, TypeError, ValueError):
+            continue
+    if mode is None:
+        if source_mode is None and not add:
+            return
+        try:
+            mode = stat.S_IMODE(os.stat(temporary).st_mode) if source_mode is None else source_mode & ~current_umask()
+        except OSError:
+            return
+    try:
+        os.chmod(temporary, mode | add)
+    except OSError:
+        pass
+
+
+def copy_keep_mode(src, dst, *, follow_symlinks = True):
+    """shutil.copy2 (also as a copytree copy_function) that keeps an existing `dst`'s mode, or narrows the source's
+    mode by the umask on a first copy, instead of copying a wider source mode across. The bytes go in through
+    copyfile (an existing dst keeps its mode while written), then the times and the mode."""
+    try:
+        existing = stat.S_IMODE(os.stat(dst).st_mode)
+    except OSError:
+        existing = None
+    result = shutil.copyfile(src, dst, follow_symlinks = follow_symlinks)
+    try:
+        info = os.stat(src)
+        os.utime(result, ns = (info.st_atime_ns, info.st_mtime_ns))
+        if os.name != "nt":
+            os.chmod(result, existing if existing is not None else stat.S_IMODE(info.st_mode) & ~current_umask())
+    except OSError:
+        pass
+    return result

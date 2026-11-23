@@ -40,6 +40,15 @@ def _extract(path, names, namespace):
     return namespace
 
 
+def _with_keep_mode(ns):
+    try:
+        from unsloth_zoo.private_staging import keep_mode
+        ns["keep_mode"] = keep_mode
+    except ImportError:
+        pass
+    return ns
+
+
 @pytest.fixture
 def umask022():
     old = os.umask(0o022)
@@ -89,7 +98,7 @@ def _fake_shard(path):
 
 def test_single_pass_writer_keeps_restricted_output_mode(tmp_path, umask022):
     ns = _extract(ROOT / "saving_utils.py", ["_SinglePassShardWriter"],
-                  dict(os = os, stat = stat, shutil = shutil, time = time, json = json, tempfile = tempfile))
+                  _with_keep_mode(dict(os = os, stat = stat, shutil = shutil, time = time, json = json, tempfile = tempfile)))
     Writer = ns["_SinglePassShardWriter"]
     source = tmp_path / "base.safetensors"; _fake_shard(source); os.chmod(source, 0o644)  # HF cache blob mode
     out = tmp_path / "out"; out.mkdir()

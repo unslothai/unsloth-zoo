@@ -35,6 +35,8 @@ import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
+from unsloth_zoo.private_staging import copy_keep_mode, keep_mode
+
 __all__ = [
     "DecisionModel",
     "DecisionPipeline",
@@ -2011,10 +2013,11 @@ def save_decision_model(model, folder, source, agent_config = None):
     # Replaced, not written in place: in a Hugging Face cache the file is a link to a blob other revisions share.
     partial = folder / "model.partial.safetensors"
     mx.save_safetensors(str(partial), weights)
+    keep_mode(partial, folder / "model.safetensors")  # a re-save keeps weights the user restricted restricted
     os.replace(partial, folder / "model.safetensors")
     if folder.resolve() != source.resolve():
         for name in ("encoder", "tokenizer"):
-            shutil.copytree(source / name, folder / name, dirs_exist_ok = True)
+            shutil.copytree(source / name, folder / name, dirs_exist_ok = True, copy_function = copy_keep_mode)
     # Written last: a folder with rl_agent_config.json is a complete checkpoint.
     partial = folder / "rl_agent_config.json.tmp"
     partial.write_text(json.dumps(agent_config, indent = 2), encoding = "utf-8")
@@ -2188,6 +2191,8 @@ def _commit_clef(pipeline, staging, folder, source, head, config, copied = ("*",
     for item in {item for pattern in copied for item in source.glob(pattern)}:
         if item.is_file() and not item.name.startswith(".") and item.name not in skipped and not (staging / item.name).exists():
             shutil.copyfile(item, staging / item.name)
+    for item in staging.iterdir():
+        keep_mode(item, folder / item.name)  # a re-save keeps weights the user restricted restricted
     # The head's file makes a folder a checkpoint: it is removed first and written last, so an interrupted save over an
     # earlier checkpoint never reads as complete.
     (folder / "joint_head.safetensors").unlink(missing_ok = True)

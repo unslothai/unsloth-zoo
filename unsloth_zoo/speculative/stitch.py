@@ -43,6 +43,8 @@ from pathlib import Path
 
 import torch
 
+from ..private_staging import current_umask
+
 MTP_HEAD_WEIGHTS_NAME = "mtp_head.safetensors"
 MTP_HEAD_INFO_NAME = "mtp_head.json"
 # Starts with "model" and ends ".safetensors": llama.cpp lists parts by that prefix when no index exists.
@@ -231,13 +233,14 @@ def _declare_mtp_layers(directory, num_layers, config_key = _MTP_CONFIG_KEY):
     return True
 
 
-def _existing_mode(paths, default = 0o644):
+def _existing_mode(paths, default = None):
     for path in paths:
         try:
             return stat.S_IMODE(os.stat(path).st_mode)
         except OSError:
             pass
-    return default
+    # A first save follows the umask (0644 under the usual 022), never a fixed world-readable mode.
+    return (0o666 & ~current_umask()) if default is None else default
 
 
 def _append_mtp_shard(directory, layout, has_index, head, prefix, dtype):
