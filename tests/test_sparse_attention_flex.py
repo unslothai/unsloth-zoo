@@ -1108,3 +1108,27 @@ def test_flex_backward_probe_traces_without_graph_break():
     q, k, v = _qkv()
     f(q, k, v)
     assert not calls and not sparse_gates._BACKWARD_OK
+
+
+def test_failed_flex_backward_probe_frees_its_graph():
+    """A probe whose backward raises must not keep its graph: an identity pack hook saves an op's output on its
+    own node, a cycle gc cannot collect (ROCm probes once per length, so each failing length kept one)."""
+    import gc
+    import weakref
+
+    kept = []
+
+    def refuse(grad):
+        raise RuntimeError("stand-in for a refused flex backward")
+
+    def flex(query, key, value):
+        out = (query * key * value).sigmoid()  # sigmoid saves its own output
+        kept.append(weakref.ref(out))
+        out.register_hook(refuse)
+        return out
+
+    with pytest.raises(RuntimeError, match = "refused flex backward"):
+        sparse_gates.probe_flex_backward(("dsa", "leak"), flex, _qkv())
+    gc.collect()
+    assert kept and all(ref() is None for ref in kept)
+    assert ("dsa", "leak") not in sparse_gates._BACKWARD_OK

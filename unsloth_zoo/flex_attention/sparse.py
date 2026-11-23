@@ -98,6 +98,12 @@ def _same(tensor):
     return tensor
 
 
+def _detach(tensor):
+    # Packing the tensor itself saves an op's output on its own autograd node: a cycle through the C++ graph that
+    # gc cannot break, so a probe whose backward raises would keep its whole graph alive.
+    return tensor.detach()
+
+
 def probe_flex_backward(key, fn, args):
     """Run fwd + bwd of `fn(*args)` once per `key` on detached aliases so a failing flex backward raises
     inside the caller's try / except (latching the dense path) instead of in loss.backward().
@@ -121,7 +127,7 @@ def probe_flex_backward(key, fn, args):
     _PROBING[0] += 1
     try:
         # Shield the probe's saved tensors from an active checkpoint's pack hook.
-        with torch.autograd.graph.saved_tensors_hooks(_same, _same):
+        with torch.autograd.graph.saved_tensors_hooks(_detach, _same):
             out = fn(*probe)
             torch.autograd.grad(out, inputs, torch.zeros_like(out), allow_unused = True)
     finally:
