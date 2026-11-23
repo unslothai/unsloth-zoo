@@ -61,6 +61,7 @@ from packaging.version import Version as _Version
 
 
 from unsloth_zoo.mlx.cce import _get_runtime_cce
+from unsloth_zoo.private_staging import precreate_private_temp
 from unsloth_zoo.mlx.cce.runtime_cce import _normalize_label_smoothing
 
 
@@ -15044,6 +15045,7 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
     mx.eval(*tensors.values())
     tmp_file = target.with_name(f"{target.stem}.tmp{target.suffix}")
     try:
+        precreate_private_temp(tmp_file, target)
         mx.save_safetensors(str(tmp_file), tensors)
         _inherit_target_permissions(tmp_file, target)
         os.replace(tmp_file, target)
@@ -15379,6 +15381,7 @@ def save_optimizer_state(optimizer, path):
     # Name the temp file .tmp.safetensors, not .safetensors.tmp: mx.save_safetensors appends .safetensors to any path lacking it, silently writing a third file.
     tmp_target = f"{path}/optimizer_state.tmp.safetensors"
     try:
+        precreate_private_temp(tmp_target, target)
         if hasattr(optimizer, "group_size") and hasattr(optimizer, "bits"):
             metadata = {
                 "quantized_moment_group_size" : str(optimizer.group_size),

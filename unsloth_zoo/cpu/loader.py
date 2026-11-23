@@ -27,6 +27,7 @@ import weakref
 
 import torch
 
+from ..private_staging import precreate_private_temp
 from .runtime import available_ram, cpu_bf16_supported, cpu_bnb_4bit_supported
 from .ops import (
     Bf16StoredLinear, _plain_lm_head, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, set_bf16_stored_dtype,
@@ -1449,6 +1450,7 @@ def _stream_merged_save(model, save_directory, save_method, max_shard_size = Non
             for name, shard in shards:
                 temporary = os.path.join(save_directory, f".{name}.unsloth-tmp")
                 staged.append((temporary, os.path.join(save_directory, name)))
+                precreate_private_temp(temporary, staged[-1][1])
                 _write_safetensors(temporary, shard, rank)
         if len(shards) > 1:
             total_parameters = sum(p.numel() for n, p in hf.named_parameters() if ".lora_" not in n)
@@ -1456,6 +1458,7 @@ def _stream_merged_save(model, save_directory, save_method, max_shard_size = Non
                      "weight_map": {entry[0]: name for name, shard in shards for entry in shard}}
             temporary = os.path.join(save_directory, ".model.safetensors.index.json.unsloth-tmp")
             staged.append((temporary, os.path.join(save_directory, "model.safetensors.index.json")))
+            precreate_private_temp(temporary, staged[-1][1])
             with open(temporary, "w", encoding = "utf-8") as f:
                 f.write(json.dumps(index, indent = 2, sort_keys = True) + "\n")
         for temporary, final in staged:

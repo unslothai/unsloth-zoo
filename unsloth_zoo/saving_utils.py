@@ -9784,7 +9784,14 @@ class _SinglePassShardWriter:
         st = os.stat(self._staging)
         if self._wrote:
             os.utime(self._staging, ns = (st.st_atime_ns, time.time_ns()))
-        os.chmod(self._staging, stat.S_IMODE(st.st_mode) | stat.S_IWUSR)
+        mode = stat.S_IMODE(st.st_mode)
+        try:
+            # Re-export over an earlier output: keep that file's mode, else a 0600 shard the user restricted takes the base
+            # checkpoint's (usually 0644) mode on publication.
+            mode = stat.S_IMODE(os.stat(self.destination).st_mode)
+        except OSError:
+            pass
+        os.chmod(self._staging, mode | stat.S_IWUSR)
         os.replace(self._staging, self.destination)
         self._staging = None
 
