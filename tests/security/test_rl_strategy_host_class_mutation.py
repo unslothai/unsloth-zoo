@@ -80,6 +80,20 @@ def test_own_classes_and_instances_stay_assignable():
     assert fn([1, 2]) == (1, 12, 2, "ok", [(1, 1)])
 
 
+def test_factory_made_classes_stay_assignable():
+    source = (
+        "def s(values):\n"
+        "    import collections\n"
+        "    Node = type('Node', (), {})\n"
+        "    Node.count = len(values)\n"
+        "    Point = collections.namedtuple('Point', 'x y')\n"
+        "    Point.label = 'p'\n"
+        "    return Node.count, Point.label, Point(1, 2).x\n"
+    )
+    fn = create_locked_down_function(source, builtins_policy = "allowlist")
+    assert fn([1, 2, 3]) == (3, "p", 1)
+
+
 def test_full_policy_unchanged():
     # "full" is the documented permissive mode: no rewrite there.
     fn = create_locked_down_function("def s(x):\n    class A:\n        pass\n    A.y = x\n    return A.y\n", builtins_policy = "full")

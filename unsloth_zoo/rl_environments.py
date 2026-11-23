@@ -657,8 +657,23 @@ pass
 _ATTR_TARGET_GUARD = "__unsloth_attr_target__"
 
 
+def _is_host_class(cls):
+    # A host class is one its module publishes under its qualname. Classes the strategy makes itself (class blocks,
+    # type(...), namedtuple) resolve to nothing, so they stay assignable.
+    if getattr(cls, "__module__", None) == "__user_code__":
+        return False
+    target = sys.modules.get(getattr(cls, "__module__", None) or "")
+    try:
+        for part in cls.__qualname__.split("."):
+            target = getattr(target, part)
+    except AttributeError:
+        return False
+    return target is cls
+pass
+
+
 def _attr_target_guard(obj):
-    if isinstance(obj, type) and getattr(obj, "__module__", None) != "__user_code__":
+    if isinstance(obj, type) and _is_host_class(obj):
         raise AttributeError(
             f"Assigning attributes on '{getattr(obj, '__qualname__', obj)}' is not allowed in generated code."
         )
