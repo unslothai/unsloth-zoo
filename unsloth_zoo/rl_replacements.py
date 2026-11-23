@@ -1249,16 +1249,29 @@ def autotune_batch_and_chunks(
     seq_len,
     hidden_size,
     vocab_size,
-    dtype_bytes=16,
+    dtype_bytes=2,
     multiplier=None
 ):
+    """Rows per forward that fit in free memory, and the logit chunk multiplier.
+    Callers turn rows into a split count with ceil division."""
+    # Older unsloth passes bits (16 / 32); no element is that wide.
+    if dtype_bytes >= 16:
+        dtype_bytes = dtype_bytes // 8
     if multiplier is None:
         final_m = max(4, seq_len // 4096)
     else:
         final_m = multiplier
 
     if torch.cuda.is_available():
-        free_bytes, _ = torch.cuda.mem_get_info()
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        # Cached blocks no tensor uses are reusable too, within any per-process memory fraction.
+        allocated = torch.cuda.memory_allocated()
+        free_bytes += max(0, torch.cuda.memory_reserved() - allocated)
+        try:
+            fraction = torch.cuda.get_per_process_memory_fraction()
+        except Exception:
+            fraction = 1.0
+        free_bytes = min(free_bytes, max(0, total_bytes * fraction - allocated))
         limit_gb = (free_bytes / (1024**3))*.80
     elif hasattr(torch, "xpu") and torch.xpu.is_available():
         # XPU: estimate free memory as total - reserved.
@@ -1285,9 +1298,8 @@ def autotune_batch_and_chunks(
     valid_indices = torch.nonzero(valid_mask, as_tuple=False)
 
     if valid_indices.shape[0] == 0:
-        #This means your GPU will OOM
-        # Capped at the row count: unsloth's no-grad pass divides rows by this without max(1, ...).
-        return max(1, min(4, total_input_rows)), final_m
+        # Nothing fits: one row per forward is the smallest plan.
+        return 1, final_m
 
     best_idx = valid_indices[0].item()
     final_b = int(b_vals[best_idx].item())
@@ -3783,7 +3795,7 @@ def grpo_accumulated_loss(
             chunked_selective_log_softmax = partial(chunked_selective_log_softmax, **_support_kwargs)
         # Unsloth keeps _autocast_dtype set when it turns autocast off (float32 training on a GPU without bfloat16).
         _autocast_on = trainer._autocast_dtype is not None and getattr(trainer, "_autocast_enabled", True)
-        dtype_bytes = 16 if _autocast_on and trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 32
+        dtype_bytes = 2 if _autocast_on and trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 4
         if _support_kwargs:
             # Kept-set scoring saves one more float32 [rows, vocab] tensor per chunk for the backward
             # (the masked logits), so the mini-batch autotune counts the logits twice. No effect
@@ -3803,7 +3815,8 @@ def grpo_accumulated_loss(
             B, multiplier = autotune_batch_and_chunks(
                 total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
             )
-            B = max(1, total_rows//B)
+            # Rows per forward -> split count; floor division would put more rows in one forward than fit.
+            B = max(1, -(-total_rows // B))
             if _collective_forwards:
                 B = grpo_agree_mini_batch(B, input_ids.device)
         else:
@@ -3932,7 +3945,7 @@ def grpo_accumulated_loss(
                 B, multiplier = autotune_batch_and_chunks(
                     total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
                 )
-                B = max(1, total_rows//B)
+                B = max(1, -(-total_rows // B))
             else:
                 B = min(B, total_rows)
             trainer._unsloth_zero_advantage_rows_skipped = (
@@ -4728,7 +4741,7 @@ def grpo_accumulated_loss(
                     logit_scale_divide = logit_scale_divide,
                     logit_softcapping = logit_softcapping,
                     temperature = temperature,
-                    batch_size = B,
+                    batch_size = completion_ids.shape[0],
                     lm_head_bias = lm_head_bias,
                 )
             if _need_entropy:

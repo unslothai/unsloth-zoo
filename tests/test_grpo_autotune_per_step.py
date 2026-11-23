@@ -123,9 +123,8 @@ def test_the_out_of_memory_fallback_never_asks_for_zero_chunks(monkeypatch, rows
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     if hasattr(torch, "xpu"):
         monkeypatch.setattr(torch.xpu, "is_available", lambda: False)
-    B, multiplier = rr.autotune_batch_and_chunks(rows, 1_000_000, 4096, 151936, 16, None)
+    B, multiplier = rr.autotune_batch_and_chunks(rows, 1_000_000, 4096, 151936, 2, None)
 
-    # unsloth's no-grad pass computes rows // B with no max(1, ...).
-    assert rows // B >= 1
-    assert max(1, rows // B) == max(1, rows // 4)
+    # One row per forward; older unsloth computes rows // B with no max(1, ...).
+    assert B == 1 and rows // B >= 1
     assert multiplier == max(4, 1_000_000 // 4096)
