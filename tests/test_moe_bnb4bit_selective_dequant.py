@@ -381,3 +381,32 @@ def test_scratch_cap_keeps_a_sparse_plan_that_already_fits(monkeypatch):
     counts = torch.ones(E, dtype = torch.int32, device = DEVICE)
     plan = mu._selective_dequant_plan(sources, counts, E, experts_module = experts)
     assert [c[0] for c in plan.chunks] == [slice(0, 5), slice(5, 10), slice(10, 15), slice(15, 16)]
+
+
+def test_scratch_cap_chunks_only_the_routed_experts(monkeypatch):
+    """Over the cap the chunked plan already reads the counts on the host, so it reads the routed experts only (6 of
+    16 here, in chunks of 4), not every expert of each chunk a token reaches; values match the whole stack bit for
+    bit."""
+    monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
+    torch.manual_seed(0)
+    experts = _Experts(True)
+    T = 24   # 48 rows: the sync-free plan declines, the whole stack would be read
+    hidden = torch.randn(T, H, dtype = torch.bfloat16, device = DEVICE)
+    pool = torch.tensor([0, 3, 4, 9, 10, 14], device = DEVICE)
+    top_k_index = pool[torch.stack([torch.randperm(6, device = DEVICE)[:TOP_K] for _ in range(T)])]
+    top_k_weights = torch.rand(T, TOP_K, dtype = torch.bfloat16, device = DEVICE)
+    lora = {
+        "gate_up_proj": (torch.randn(E, H, RANK, device = DEVICE) * 0.1, torch.randn(E, RANK, 2 * I, device = DEVICE) * 0.1),
+        "down_proj": (torch.randn(E, I, RANK, device = DEVICE) * 0.1, torch.randn(E, RANK, H, device = DEVICE) * 0.1),
+    }
+    base_out, base_grads = _run(experts, hidden, top_k_index, top_k_weights, lora, monkeypatch)
+    monkeypatch.setenv("UNSLOTH_MOE_DEQUANT_MAX_MB", str(4 * 2 * I * H * 2 / 2**20))
+    for key in mu.SELECTIVE_DEQUANT_STATS:
+        mu.SELECTIVE_DEQUANT_STATS[key] = 0
+    out, grads = _run(experts, hidden, top_k_index, top_k_weights, lora, monkeypatch)
+    assert torch.equal(out, base_out)
+    for got, want in zip(grads, base_grads):
+        assert torch.equal(got, want)
+    stats = mu.SELECTIVE_DEQUANT_STATS
+    assert stats["experts_dequantized"] == 4 * 6        # gate_up + down, forward + backward, 6 routed each
+    assert stats["dequant_calls"] == 4 * 2              # chunks of 4 + 2

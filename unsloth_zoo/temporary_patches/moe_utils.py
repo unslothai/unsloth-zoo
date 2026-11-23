@@ -1529,6 +1529,7 @@ def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows, experts_mo
     mode = os.environ.get("UNSLOTH_MOE_SELECTIVE_DEQUANT", "auto")
     selective = mode == "1"
     chunk = _selective_dequant_chunk_experts()
+    capped_scratch = False
     if (
         chunk == 0 and mode != "0" and experts_module is not None
         and _auto_dequant_cap_source(experts_module) != (None, None)   # flag / env first: unflagged models stop here
@@ -1547,6 +1548,8 @@ def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows, experts_mo
                 splits, param.quant_state.dtype, experts_module, num_tokens_per_expert.device,
                 experts_needed = num_rows if capped else E,
             )
+            # The chunked plan reads the routed counts on the host anyway: read only the routed experts.
+            capped_scratch = chunk > 0
     if not selective and chunk == 0:
         if mode == "0":
             return None
@@ -1562,7 +1565,7 @@ def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows, experts_mo
         if split is None or split[0] != E:
             return None
     counts = num_tokens_per_expert.tolist()
-    experts = [e for e, c in enumerate(counts) if c > 0] if selective else list(range(E))
+    experts = [e for e, c in enumerate(counts) if c > 0] if (selective or capped_scratch) else list(range(E))
     if not experts:
         return None
     if not chunk and 8 * len(experts) > 7 * E:
