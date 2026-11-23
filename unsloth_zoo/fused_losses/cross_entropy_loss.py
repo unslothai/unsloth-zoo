@@ -24,6 +24,7 @@ __all__ = [
     "unsloth_zero3_partitioned",
     "unsloth_zero3_gathered",
     "unsloth_label_smoothing_override",
+    "lm_head_needs_module_forward",
 ]
 
 import torch
@@ -193,7 +194,10 @@ def _logits_ce_loss(logits, labels, n_items, kwargs):
     """compute_fused_ce_loss after the head projection: vocab bias, logit transforms in the logits' dtype, then a
     stable fp32 (smoothed) nll summed over labelled rows / n_items (else the labelled token count)."""
     ignore_index = int(kwargs.get("ignore_index", -100))
-    label_smoothing = float(kwargs.get("label_smoothing", 0.0))
+    # As fused_linear_cross_entropy: None is no smoothing, anything outside [0, 1] is rejected.
+    label_smoothing = float(kwargs.get("label_smoothing", 0.0) or 0.0)
+    if not 0.0 <= label_smoothing <= 1.0:
+        raise ValueError(f"Unsloth: label_smoothing must be between 0.0 and 1.0, got {label_smoothing}.")
     device = logits.device
     # Extra vocab bias added after the head (Bart `final_logits_bias`), with the stock dtype promotion.
     logits_bias = kwargs.get("logits_bias", None)
@@ -845,40 +849,48 @@ def _apply_label_smoothing_override(n_items, kwargs):
 
 def _adapter_containers_fully_merged(module):
     """True only when every adapter a PEFT tuner layer holds is merged into its base (forward == base_layer(x))."""
-    merged = set(getattr(module, "merged_adapters", None) or ())
-    held = set()
+    merged = getattr(module, "merged_adapters", None) or ()
+    found = False
     for layer_name in getattr(module, "adapter_layer_names", None) or ():
         container = module
         for part in layer_name.split("."):
             container = getattr(container, part, None)
-        if container is None:
+        if container is None or not callable(getattr(container, "keys", None)):
             return False  # a layout this check does not know: assume live
-        held.update(container.keys())
-    return bool(held) and held <= merged
+        # Membership, not a set update: torch 2.4 Dynamo cannot trace set.update over dict keys.
+        for name in container.keys():
+            if name not in merged:
+                return False
+            found = True
+    return found
 
 
 def _lm_head_module_reason(lm_head):
     """Why lm_head.forward() is not `hidden @ lm_head.weight.T + bias` (a live PEFT adapter), else None.
     Conservative: anything ambiguous takes the head's own forward, which is always right, only slower."""
-    tuner = None
     for module in lm_head.modules():
-        for hook in module._forward_pre_hooks.values():
-            if getattr(getattr(hook, "func", hook), "__name__", "") == "_adapter_names_pre_forward_hook":
-                return "per-example adapter_names"
+        if module._forward_pre_hooks:  # torch 2.4 Dynamo cannot iterate an empty hook dict
+            for hook in module._forward_pre_hooks.values():
+                if getattr(getattr(hook, "func", hook), "__name__", "") == "_adapter_names_pre_forward_hook":
+                    return "per-example adapter_names"
         if getattr(type(module), "adapter_layer_names", None) is None or not hasattr(module, "base_layer"):
             continue
-        tuner = tuner or module
         if getattr(module, "disable_adapters", False):
-            # Disabled: PEFT's forward unmerges a merged adapter first, then runs the base layer.
-            return f"disabled {type(module).__name__}"
-        if not _adapter_containers_fully_merged(module):
+            # Disabled: PEFT's forward unmerges a merged adapter first, then runs base_layer(x); unmerged it is
+            # already base_layer(x), which the kernel scores from lm_head.weight.
+            if getattr(module, "merged_adapters", None):
+                return f"disabled {type(module).__name__}"
+        elif not _adapter_containers_fully_merged(module):
             return type(module).__name__
-    if tuner is not None:
-        base = tuner
+        # Merged or disabled: the base layer's forward must be x @ weight.T + bias, for every tuner in the head.
+        base = module
         while getattr(base, "base_layer", None) is not None:
             base = base.base_layer
         if type(base) is not torch.nn.Linear:
-            return f"{type(base).__name__} under a merged {type(tuner).__name__}"
+            return f"{type(base).__name__} under {type(module).__name__}"
+        # The kernel reads getattr(lm_head, "bias"); a wrapper exposing only weight (TrainableTokensWrapper) hides it.
+        if base.bias is not None and getattr(lm_head, "bias", None) is not base.bias:
+            return f"a bias {type(lm_head).__name__} does not expose"
     return None
 
 
@@ -909,24 +921,63 @@ def lm_head_needs_module_forward(lm_head):
     return True
 
 
+_ASSERT_ASYNC_MSG = "msg" in torch.ops.aten._assert_async.overloads()
+
+
+def _check_ce_targets(targets, vocab_size, ignore_index):
+    """Reject a labelled target outside the vocabulary like F.cross_entropy and the fused kernel do; on GPU (and
+    in a trace) a device-side assert, since a host read would sync every step."""
+    bad = (targets != ignore_index) & ((targets < 0) | (targets >= vocab_size))
+    if targets.is_cuda or torch.compiler.is_compiling():
+        ok = torch.logical_not(bad.any())
+        if _ASSERT_ASYNC_MSG:
+            torch._assert_async(ok, f"Unsloth: cross entropy target out of bounds for a vocabulary of {vocab_size}")
+        else:
+            torch._assert_async(ok)
+    elif bool(bad.any()):
+        raise IndexError(f"Unsloth: cross entropy target {int(targets[bad][0])} is out of bounds for a vocabulary "
+                         f"of {vocab_size} (ignore_index = {ignore_index}).")
+
+
 def _module_head_ce_loss(lm_head, hidden_states, labels, mask, n_items, shift_labels, kwargs):
     """unsloth_fused_ce_loss on lm_head(hidden_states): the chunked path's targets (shift, mask on shifted or
     pre-aligned labels) and compute_fused_ce_loss's reduction (_logits_ce_loss), on the head's own logits."""
     ignore_index = int(kwargs.get("ignore_index", -100))
-    weight = getattr(lm_head, "weight", None)
-    if weight is not None and weight.device.type != "meta" and getattr(lm_head, "_hf_hook", None) is None:
-        # As the kernel feeds its matmul: on the head's device, in a floating head's dtype outside autocast.
+    # Placement from the resident base weight: a TrainableTokensWrapper's .weight builds the merged [V, H] weight.
+    base = getattr(lm_head, "original_module", None)
+    base = lm_head if base is None else base
+    while getattr(base, "base_layer", None) is not None:
+        base = base.base_layer
+    weight = getattr(base, "weight", None)
+    if weight is not None:
+        # As the kernel feeds its matmul: in a floating head's dtype outside autocast, but never in a packed or
+        # 8-bit storage dtype (bitsandbytes, FP8), which the base dequantizes itself.
         dtype = hidden_states.dtype
-        if weight.is_floating_point() and not _autocast_enabled(weight.device.type):
+        if (weight.is_floating_point() and weight.element_size() >= 2
+                and type(weight) in (torch.Tensor, torch.nn.Parameter)
+                and not _autocast_enabled(weight.device.type)):
             dtype = weight.dtype
-        hidden_states = hidden_states.to(device = weight.device, dtype = dtype)
+        # An Accelerate hook places the input itself (the weight may be offloaded).
+        device = hidden_states.device
+        if getattr(lm_head, "_hf_hook", None) is None and weight.device.type != "meta":
+            device = weight.device
+        hidden_states = hidden_states.to(device = device, dtype = dtype)
+    targets = _chunked_logprob._ce_targets(labels.to(torch.long), mask, shift_labels, ignore_index,
+                                           hidden_states.device)
+    rows = hidden_states.shape[:-1]
+    if type(base) is torch.nn.Linear and targets.numel() == rows.numel():
+        # A row-wise head over a plain Linear: zero the ignored inputs so a half precision overflow inside the
+        # adapter (lora_A) on a row the loss never reads cannot reach backward as 0 * inf. Same shape, so per-row
+        # adapter_names and dropout see the batch they would.
+        hidden_states = hidden_states.masked_fill((targets == ignore_index).reshape(rows).unsqueeze(-1), 0)
     logits = lm_head(hidden_states)
-    targets = _chunked_logprob._ce_targets(labels.to(torch.long), mask, shift_labels, ignore_index, logits.device)
+    targets = targets.to(logits.device)
     logits = logits.reshape(-1, logits.shape[-1])
     if logits.shape[0] != targets.shape[0]:
         raise ValueError(
             f"Unsloth: the LM head produced {logits.shape[0]} rows for {targets.shape[0]} target tokens."
         )
+    _check_ce_targets(targets, logits.shape[-1], ignore_index)
     # An ignored row never reaches the loss; zeroing it keeps a half precision overflow there out of backward.
     logits = logits.masked_fill((targets == ignore_index).unsqueeze(-1), 0)
     # One count (a DataParallel replica passes several) on the loss device: the head may sit on another GPU.

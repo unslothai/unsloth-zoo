@@ -200,13 +200,26 @@ def test_fp16_overflow_on_an_ignored_row_stays_out_of_backward():
     labels = ids.clone()
     labels[:, 1] = -100  # shifted: row 0 of each sequence is ignored
     hidden = inner.embed(ids).detach().clone()
-    hidden[:, 0] = 3e4  # overflows the fp16 head output on the ignored row
+    lora_a = inner.lm_head.lora_A["default"]
+    with torch.no_grad():
+        lora_a.weight.fill_(2)
+        hidden[:, 0] = 3e4  # finite, but overflows inside lora_A (saved for lora_B's backward) on the ignored row
+        assert torch.isinf(lora_a(hidden[:, 0])).all()
     hidden.requires_grad_(True)
     loss = unsloth_fused_lm_head_loss(hidden, inner.lm_head, labels, torch_compile = False)
     loss.backward()
     assert torch.isfinite(loss)
     assert torch.isfinite(hidden.grad).all()
     assert torch.isfinite(inner.lm_head.lora_B["default"].weight.grad).all()
+    # The valid rows alone give the same loss and adapter gradient.
+    grad = inner.lm_head.lora_B["default"].weight.grad.clone()
+    inner.lm_head.zero_grad()
+    keep = hidden.detach().clone()
+    keep[:, 0] = 0
+    want = unsloth_fused_lm_head_loss(keep, inner.lm_head, labels, torch_compile = False)
+    want.backward()
+    torch.testing.assert_close(loss, want)
+    torch.testing.assert_close(grad, inner.lm_head.lora_B["default"].weight.grad)
 
 
 def test_half_hidden_states_feed_an_fp32_lora_head():
@@ -224,7 +237,7 @@ def test_confident_rows_keep_their_target_gradient():
     base = torch.nn.Linear(2, 2, bias = False)
     with torch.no_grad():
         base.weight.copy_(torch.eye(2))  # logits = the input
-    head = LoraLinear(base, "default", peft.LoraConfig(), r = 1, lora_alpha = 1)  # B = 0: adapter adds nothing
+    head = LoraLinear(base, "default", config = peft.LoraConfig(), r = 1, lora_alpha = 1)  # B = 0: adapter adds nothing
     hidden = torch.tensor([[[20.0, 0.0], [0.0, 0.0]]], requires_grad = True)
     labels = torch.tensor([[0, 0]])
     loss = unsloth_fused_lm_head_loss(hidden, head, labels, torch_compile = False)
@@ -234,18 +247,19 @@ def test_confident_rows_keep_their_target_gradient():
     assert hidden.grad[0, 0, 0] < 0  # the target logit still gets its gradient
 
 
-def test_merged_heads_stay_fused_and_disabled_heads_take_the_forward(monkeypatch):
+def test_merged_and_disabled_heads_stay_fused(monkeypatch):
     spy = _Spy(monkeypatch)
     model, inner = _wrap()
     ids = _ids()
     inner.proj.base_layer.weight.requires_grad_(True)
     with model.disable_adapter():
-        _assert_match(inner, model, ids)  # conservative: a disabled tuner takes the head's forward
-    assert spy.calls == 1
+        assert not lm_head_needs_module_forward(inner.lm_head)
+        _assert_match(inner, model, ids)  # disabled and unmerged: forward is base_layer(x), the kernel's product
+    assert spy.calls == 0
     inner.lm_head.merge()
     model.base_model.model.proj.merge()
     _assert_match(inner, model, ids)  # fully merged into a plain Linear: the kernel
-    assert spy.calls == 1
+    assert spy.calls == 0
 
 
 def test_merged_then_disabled_head_unmerges_like_its_forward():
@@ -283,9 +297,10 @@ def _nest(outer_active):
     """LoRA inside LoRA: an outer tuner whose own adapter is inactive, or merged, over a live inner LoRA."""
     torch.manual_seed(0)
     cfg = peft.LoraConfig(init_lora_weights = False)
-    inner_head = LoraLinear(torch.nn.Linear(H, V, bias = False), "inner", cfg, r = 2, lora_alpha = 4,
+    # config by keyword: PEFT 0.18 has no config parameter (a positional one binds to r), later versions do.
+    inner_head = LoraLinear(torch.nn.Linear(H, V, bias = False), "inner", config = cfg, r = 2, lora_alpha = 4,
                             init_lora_weights = False)
-    outer = LoraLinear(inner_head, "outer", cfg, r = 2, lora_alpha = 4, init_lora_weights = False)
+    outer = LoraLinear(inner_head, "outer", config = cfg, r = 2, lora_alpha = 4, init_lora_weights = False)
     if not outer_active:
         outer._active_adapter = ["nothing"]
     return outer
@@ -380,6 +395,9 @@ def test_module_ce_moves_the_count_to_the_loss_device(monkeypatch):
     assert moved and all(torch.device(d) == head.weight.device for d in moved)
     want = ce._module_head_ce_loss(head, hidden, _ids(), None, 7, True, {})
     torch.testing.assert_close(got.as_subclass(torch.Tensor), want)
+    single = ce._module_head_ce_loss(head, hidden, _ids(), None, torch.tensor([7.0], dtype = torch.float64), True, {})
+    assert single.shape == torch.Size([]) and single.dtype == torch.float32
+    torch.testing.assert_close(single, want)
 
 
 def test_module_route_follows_the_label_smoothing_override():
@@ -613,6 +631,212 @@ def test_ast_rewritten_forward_trains_the_head_adapter(use_dora, monkeypatch):
     out = _check_against_stock(_exec_forward(AST_CANONICAL, header = False), rewritten, model, inner,
                                input_ids = ids, labels = ids)
     assert out.logits.numel() == 0
+
+
+def test_module_ce_rejects_out_of_vocabulary_targets():
+    """Row 9: like F.cross_entropy and the kernel, a labelled id outside the vocabulary raises."""
+    head = torch.nn.Linear(H, V, bias = False)
+    hidden = torch.randn(2, 9, H)
+    for bad in (V, -3):
+        labels = _ids()
+        labels[0, 3] = bad
+        with pytest.raises(IndexError, match = "out of bounds"):
+            ce._module_head_ce_loss(head, hidden, labels, None, None, True, {})
+    labels = _ids()
+    labels[0, 0] = V  # dropped by the shift: never a target
+    ce._module_head_ce_loss(head, hidden, labels, None, None, True, {})
+
+
+@pytest.mark.parametrize("smoothing", [None, -0.1, 1.5])
+def test_module_ce_label_smoothing_matches_the_kernel_contract(smoothing):
+    """Row 10: None means no smoothing and a coefficient outside [0, 1] raises, as in fused_linear."""
+    torch.manual_seed(0)
+    head = torch.nn.Linear(H, V, bias = False)
+    hidden = torch.randn(2, 9, H)
+    if smoothing is None:
+        got = ce._module_head_ce_loss(head, hidden, _ids(), None, None, True, dict(label_smoothing = None))
+        torch.testing.assert_close(got, ce._module_head_ce_loss(head, hidden, _ids(), None, None, True, {}))
+    else:
+        with pytest.raises(ValueError, match = "label_smoothing"):
+            ce._module_head_ce_loss(head, hidden, _ids(), None, None, True, dict(label_smoothing = smoothing))
+
+
+class _FP8Linear(torch.nn.Linear):
+    """FP8 storage dequantized in forward: the input must keep its own dtype."""
+
+    def __init__(self, src):
+        super().__init__(src.in_features, src.out_features, bias = False)
+        self.weight = torch.nn.Parameter(src.weight.detach().to(torch.float8_e4m3fn), requires_grad = False)
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, self.weight.to(x.dtype))
+
+
+def test_storage_dtype_is_not_an_activation_dtype():
+    """Row 13: an FP8 stored base must not get FP8 activations (stock lm_head(hidden) works)."""
+    torch.manual_seed(0)
+    head = LoraLinear(_FP8Linear(torch.nn.Linear(H, V, bias = False)), "default", config = peft.LoraConfig(),
+                      r = 2, lora_alpha = 4, init_lora_weights = False)
+    head.lora_A.float(), head.lora_B.float()  # PEFT moves the adapter to the base's (FP8) dtype
+    hidden = torch.randn(2, 9, H)
+    ids = _ids()
+    got = unsloth_fused_lm_head_loss(hidden, head, ids, torch_compile = False)
+    torch.testing.assert_close(got, ForCausalLMLoss(head(hidden).float(), ids, vocab_size = V))
+
+
+def test_accelerate_hooked_head_still_gets_its_input_dtype():
+    """Row 17: an Accelerate hook places the input, but the dtype cast for a resident fp32 head still applies."""
+    model, inner = _wrap()
+    inner.lm_head._hf_hook = types.SimpleNamespace()
+    ids = _ids()
+    hidden = inner.proj(inner.embed(ids)).to(torch.bfloat16)
+    loss = unsloth_fused_lm_head_loss(hidden, inner.lm_head, ids, torch_compile = False)
+    torch.testing.assert_close(loss, ForCausalLMLoss(inner.lm_head(hidden.float()).float(), ids, vocab_size = V))
+
+
+def test_every_merged_tuner_base_is_checked():
+    """Row 14: a merged tuner over a custom base is caught even when a merged plain one is visited first."""
+
+    class _Pair(torch.nn.Module):
+        def __init__(self, first, second):
+            super().__init__()
+            self.first, self.second = first, second
+
+    def merged(base):
+        layer = LoraLinear(base, "default", config = peft.LoraConfig(), r = 2, lora_alpha = 4,
+                           init_lora_weights = False)
+        layer.merge()
+        return layer
+    plain, custom = merged(torch.nn.Linear(H, V, bias = False)), merged(_FakeQuantLinear(H, V, bias = False))
+    assert ce._lm_head_module_reason(_Pair(plain, custom)) is not None
+    assert ce._lm_head_module_reason(_Pair(custom, plain)) is not None
+    assert ce._lm_head_module_reason(_Pair(plain, merged(torch.nn.Linear(H, V, bias = False)))) is None
+
+
+def test_merged_trainable_tokens_head_keeps_its_bias():
+    """Row 18: a merged TrainableTokensWrapper exposes weight only; its base bias must still reach the loss."""
+    from peft.utils.other import TrainableTokensWrapper
+
+    torch.manual_seed(0)
+    head = TrainableTokensWrapper(torch.nn.Linear(H, V, bias = True), "default", token_indices = [0, 1])
+    with torch.no_grad():
+        head.token_adapter.trainable_tokens_delta["default"].add_(1.0)
+    head.token_adapter.merge()
+    assert getattr(head, "bias", None) is None
+    hidden = torch.randn(2, 9, H)
+    ids = _ids()
+    got = unsloth_fused_lm_head_loss(hidden, head, ids, torch_compile = False)
+    torch.testing.assert_close(got, ForCausalLMLoss(head(hidden).float(), ids, vocab_size = V))
+
+
+def test_unknown_adapter_container_is_treated_as_live():
+    """Row 23: a container without keys() (a bare Parameter) is not a layout the merge check knows."""
+    layer = types.SimpleNamespace(adapter_layer_names = ("delta",), delta = torch.nn.Parameter(torch.zeros(1)),
+                                  merged_adapters = ["default"])
+    assert not ce._adapter_containers_fully_merged(layer)
+
+
+def test_detector_is_exported_from_the_package():
+    """Row 29: fused_losses star-imports cross_entropy_loss."""
+    from unsloth_zoo.fused_losses import lm_head_needs_module_forward as exported
+    assert exported is lm_head_needs_module_forward
+
+
+class _ActQuant(torch.nn.Module):
+    """A non-idempotent stand-in for a TorchAO activation fake quantizer, counting its calls."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, x):
+        self.calls += 1
+        return x * 0.5
+
+
+class _QATLinear(torch.nn.Linear):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.activation_fake_quantizer = _ActQuant()
+
+    def forward(self, x):
+        return torch.nn.functional.linear(self.activation_fake_quantizer(x), self.weight)
+
+
+class _QATToy(Toy):
+    def __init__(self):
+        super().__init__()
+        self.lm_head = _QATLinear(H, V, bias = False)
+
+
+def _qat_mixed_batch():
+    """modules_to_save over a QAT head, scored per row by adapter_names: each selected head quantizes once."""
+    torch.manual_seed(0)
+    cfg = peft.LoraConfig(r = 4, target_modules = ["proj"], modules_to_save = ["lm_head"])
+    model = peft.get_peft_model(_QATToy(), cfg).eval()
+    inner = model.base_model.model
+    with torch.no_grad():
+        weight = inner.lm_head.modules_to_save["default"].weight
+        weight.add_(0.5 * torch.randn(weight.shape, generator = torch.Generator().manual_seed(7)))
+    quantizers = [m for m in inner.lm_head.modules() if isinstance(m, _ActQuant)]
+    assert len(quantizers) == 2
+    return model, inner, quantizers
+
+
+@pytest.mark.parametrize("route", ["ast", "p1", "p2_no_kwargs", "p3"])
+def test_qat_head_is_quantized_once_on_the_module_route(route, monkeypatch):
+    """Rows 2-5: the module route passes raw activations; the selected heads apply their own quantizer once."""
+    from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
+
+    monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", "0")
+    pattern = dict(ast = AST_CANONICAL, p1 = PATTERN_1, p2_no_kwargs = PATTERN_2_NO_KWARGS, p3 = PATTERN_3)[route]
+    if route == "ast":
+        new, _ = rewrite_forward_source(pattern)
+        rewritten = _exec_forward(new, dict(
+            unsloth_fused_lm_head_loss = unsloth_fused_lm_head_loss, _can_fuse_loss = _can_fuse_loss,
+            EMPTY_LOGITS = torch.empty(0),
+        ), header = False)
+    else:
+        new, fused = compiler.apply_fused_lm_head(pattern, "ToyForCausalLM")
+        assert fused
+        rewritten = _exec_forward(new)
+    model, inner, quantizers = _qat_mixed_batch()
+    inner.config = types.SimpleNamespace(vocab_size = V)
+    inner.loss_function = ForCausalLMLoss
+    ids = _ids()
+    with model.base_model._enable_peft_forward_hooks(adapter_names = ["__base__", "default"]):
+        want = _exec_forward(pattern, header = False)(inner, input_ids = ids, labels = ids).loss
+        assert [q.calls for q in quantizers] == [1, 1]
+        got = rewritten(inner, input_ids = ids, labels = ids).loss
+    assert [q.calls for q in quantizers] == [2, 2]
+    torch.testing.assert_close(got, want)
+
+
+@pytest.mark.parametrize("pattern", [PATTERN_1, PATTERN_2_NO_KWARGS], ids = ["p1", "p2_no_kwargs"])
+def test_cce_gate_skips_a_live_lora_head_and_admits_a_merged_one(pattern, monkeypatch):
+    """Row 30: with Cut Cross Entropy on, a live head adapter stays off CCE (which reads only the weight)."""
+    monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", "0")
+    new, fused = compiler.apply_fused_lm_head(pattern, "ToyForCausalLM")
+    assert fused
+    calls = []
+
+    def fake_cce(**kwargs):
+        calls.append(kwargs)
+        return torch.zeros(())
+    forward = _exec_forward(new)
+    forward.__globals__.update(UNSLOTH_ENABLE_CCE = True, HAS_CUT_CROSS_ENTROPY = True,
+                               fused_linear_cross_entropy = fake_cce)
+    model, inner = _wrap()
+    model.to(torch.bfloat16)
+    inner.config = types.SimpleNamespace(vocab_size = V)
+    inner.loss_function = ForCausalLMLoss
+    ids = _ids()
+    forward(inner, input_ids = ids, labels = ids).loss.backward()
+    assert calls == []
+    assert inner.lm_head.lora_B["default"].weight.grad is not None
+    inner.lm_head.merge()
+    forward(inner, input_ids = ids, labels = ids)
+    assert len(calls) == 1
 
 
 def test_plain_head_needs_no_module_forward():
