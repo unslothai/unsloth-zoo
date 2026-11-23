@@ -1088,6 +1088,16 @@ def test_invariant_attention_rows_are_their_one_row_calls_and_near_fp32():
     probe_invariant_attention()
 
 
+def test_wide_half_attention_preserves_every_tree_row(monkeypatch):
+    from unsloth_zoo.mlx import attention
+    if not nax.nax_available():
+        pytest.skip("needs tensor units")
+    kernels, calls = attention._invariant_kernels, []
+    monkeypatch.setattr(attention, "_invariant_kernels", lambda *args: calls.append(args) or kernels(*args))
+    attention.probe_invariant_half_attention()
+    assert calls.count((True, True)) == 16
+
+
 def test_draft_attention_follows_stock_over_a_window_read_in_place():
     if not invariant_attention_available():
         pytest.skip("needs an Apple GPU")

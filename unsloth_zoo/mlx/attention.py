@@ -1185,6 +1185,13 @@ _INVARIANT_HALF_SOURCE = (_INVARIANT_SOURCE
     .replace("pv_op.run(pf, vf, o);", """pv_op.run(pf, vf, o);
         _Pragma("unroll") for (int i = 0; i < o.get_capacity(); ++i) if (o.is_valid_element(i)) o[i] *= 0x1p-15f;"""))
 
+# Each SIMD group owns its score rows and reads them before reusing their storage for half weights.
+_INVARIANT_HALF_WIDE_SOURCE = (_INVARIANT_HALF_SOURCE
+    .replace("threadgroup half weights[FM * S];", "threadgroup half* weights = (threadgroup half*)sp;")
+    .replace("tensor(weights, dextents<int, 2>{S, FM}, array<int, 2>{1, S}",
+             "tensor(weights, dextents<int, 2>{S, FM}, array<int, 2>{1, 2 * S}")
+    .replace("weights[r * S +", "weights[2 * r * S +"))
+
 # Rows are head-major, (b, KV head, query head of its group, position): `out`'s own row order.
 _INVARIANT_REDUCE = """
     const int d = thread_position_in_threadgroup.x;
@@ -1250,15 +1257,18 @@ INVARIANT_KEYS = 256
 INVARIANT_PROBE_KEY = "invariant_attention:" + hashlib.sha256(
     (_INVARIANT_SOURCE + _INVARIANT_TAIL + _INVARIANT_HEADER + _INVARIANT_REDUCE + str(INVARIANT_KEYS)).encode()).hexdigest()[:12]
 INVARIANT_HALF_PROBE_KEY = "invariant_attention_half_gdn:" + hashlib.sha256(
-    (_INVARIANT_HALF_SOURCE + _INVARIANT_TAIL + _INVARIANT_HEADER + _INVARIANT_REDUCE + str(INVARIANT_KEYS)).encode()).hexdigest()[:12]
+    (_INVARIANT_HALF_SOURCE + _INVARIANT_HALF_WIDE_SOURCE + _INVARIANT_TAIL + _INVARIANT_HEADER
+     + _INVARIANT_REDUCE + str(INVARIANT_KEYS)).encode()).hexdigest()[:12]
 
 
 @functools.cache
-def _invariant_kernels(half_weights = False):
+def _invariant_kernels(half_weights = False, wide = False):
     from .nax import _QMM_HEADER
-    return (mx.fast.metal_kernel(name = "unsloth_invariant_attention" + "_half" * half_weights, input_names = ["q", "k", "v", "scale", "depth"],
+    source = _INVARIANT_HALF_WIDE_SOURCE if wide else _INVARIANT_HALF_SOURCE if half_weights else _INVARIANT_SOURCE
+    return (mx.fast.metal_kernel(name = "unsloth_invariant_attention" + "_half" * half_weights + "_wide" * wide,
+                                 input_names = ["q", "k", "v", "scale", "depth"],
                                  output_names = ["partials", "stats"], header = _QMM_HEADER + _INVARIANT_HEADER,
-                                 source = _INVARIANT_HALF_SOURCE if half_weights else _INVARIANT_SOURCE, ensure_row_contiguous = False),
+                                 source = source, ensure_row_contiguous = False),
             mx.fast.metal_kernel(name = "unsloth_invariant_attention_tail", input_names = ["q", "k", "v", "scale", "depth", "path"],
                                  output_names = ["tail", "tail_stats"], header = _INVARIANT_HEADER, source = _INVARIANT_TAIL,
                                  ensure_row_contiguous = False),
@@ -1306,9 +1316,11 @@ def invariant_attention(queries, keys, values, scale, depth = None, path = None,
     B, H, L, D = queries.shape
     kv_heads, N = keys.shape[1], keys.shape[2]
     G, frag = H // kv_heads, _invariant_frag()
-    rows, splits = L * G, -(-N // INVARIANT_KEYS)
-    first, tail, second = _invariant_kernels(half_weights)
     tree = depth is not None
+    if half_weights and tree and L == 16 and D == 256 and frag == 16:
+        frag = 32
+    rows, splits = L * G, -(-N // INVARIANT_KEYS)
+    first, tail, second = _invariant_kernels(True, True) if frag == 32 else _invariant_kernels(half_weights)
     depth = depth if tree else _invariant_depths(L)
     partials, stats = first(
         inputs = [mx.contiguous(queries), keys, values, scale, depth],
@@ -1442,11 +1454,13 @@ def probe_draft_attention():
 
 
 def probe_invariant_half_attention():
-    probe_invariant_attention(invariant_half_attention, itertools.product(((24, 4, 256), (16, 2, 256)), (mx.bfloat16, mx.float16)))
+    probe_invariant_attention(invariant_half_attention, itertools.product(((24, 4, 256), (16, 2, 256)), (mx.bfloat16, mx.float16)),
+                              wide_tree = True)
 
 
 def probe_invariant_attention(invariant_attention = invariant_attention, cases = (
-    ((24, 4, 256), mx.bfloat16), ((16, 2, 256), mx.float16), ((32, 8, 128), mx.bfloat16), ((16, 4, 64), mx.bfloat16), ((12, 12, 128), mx.bfloat16))):
+    ((24, 4, 256), mx.bfloat16), ((16, 2, 256), mx.float16), ((32, 8, 128), mx.bfloat16), ((16, 4, 64), mx.bfloat16), ((12, 12, 128), mx.bfloat16)),
+    *, wide_tree = False):
     """Every row of causal blocks, on both sides of key split boundaries and through cache-like views, bit for bit its
     one-row call; each output within 2% of fp32 attention's largest."""
     for (H, KV, D), dtype in cases:
@@ -1467,6 +1481,8 @@ def probe_invariant_attention(invariant_attention = invariant_attention, cases =
             assert error <= 0.02 * mx.abs(want).max().item(), (H, KV, D, prefix, L, error)
         # A tree's rows, across a tile and a split boundary: each its own path's chain, whatever its block holds.
         parents = [-1, 0, 1, 1, 3, 0, 5, 6]
+        if wide_tree:
+            parents.extend([4, 5, 7, 9, 8, 0, 13, 6])
         depth, paths = [], []
         for parent in parents:
             depth.append(0 if parent < 0 else depth[parent] + 1)
