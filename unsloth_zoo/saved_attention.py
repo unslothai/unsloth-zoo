@@ -27,6 +27,7 @@ it. =0 turns everything off."""
 
 import collections
 import os
+import sys
 import threading
 import weakref
 from contextlib import contextmanager
@@ -878,11 +879,24 @@ def saved_function_call(function, n_inputs, *args, **kwargs):
 _PATCHED_MARK = "_unsloth_saved_attention"
 
 
+def _in_unsloth_compiled_block():
+    # Unsloth's own per-layer compile (fullgraph=False, a graph break is legal). Not set when the block
+    # is inlined into a user's torch.compile, which may be fullgraph=True.
+    flag = getattr(sys.modules.get("unsloth.models._block_compile"), "_IN_COMPILED_REGION", None)
+    return bool(flag) and bool(flag[0])
+
+
 def _rocm_without_frame():
     # ROCm: a call outside any frame (no Unsloth checkpoint, or a device whose SDPA keeps nothing) stays
     # in the caller's graph instead of reaching the compiler-disabled helpers, which a fullgraph=True
-    # training compile cannot cross. Dynamo guards on the thread-local read.
-    return bool(getattr(torch.version, "hip", None)) and getattr(_TLS, "frame", None) is None
+    # training compile cannot cross. Dynamo guards on the thread-local read. Inside a frame, a call traced
+    # by any compile but Unsloth's blocks stays in the graph too: that compile may be fullgraph=True, and
+    # both passes of the checkpoint take the same route, so nothing is kept and nothing is looked up.
+    if not getattr(torch.version, "hip", None):
+        return False
+    if getattr(_TLS, "frame", None) is None:
+        return True
+    return torch.compiler.is_compiling() and not _in_unsloth_compiled_block()
 
 
 def _wrap_attention_interface(fn):

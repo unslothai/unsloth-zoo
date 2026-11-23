@@ -463,6 +463,70 @@ def test_rocm_transformers_wrappers_stay_in_a_fullgraph_compile_without_a_frame(
     torch.testing.assert_close(out, _sdpa(q, q, q))
 
 
+def _rocm_frame_wrapper(monkeypatch, kind):
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
+    monkeypatch.setattr(torch.version, "hip", "7.13.0", raising = False)
+    module = torch.nn.Module()
+    module.train()
+    if kind == "interface":
+        wrapped = SA._wrap_attention_interface(lambda m, q, k, v, **kw: _sdpa(q, k, v))
+        return lambda q: wrapped(module, q, q, q)  # noqa: E731
+    wrapped = SA._wrap_flex_kernel(lambda q, k, v, **kw: _sdpa(q, k, v))
+    return lambda q: wrapped(q, q, q, training = True)  # noqa: E731
+
+
+@pytest.mark.parametrize("kind", ["interface", "flex"])
+def test_rocm_transformers_wrappers_stay_in_a_fullgraph_compile_inside_a_frame(monkeypatch, kind):
+    """A live checkpoint frame on an eligible ROCm device (CPU tensors are kept) must not send a user's
+    fullgraph=True training compile into the compiler-disabled helpers: forward + backward compile, and
+    both checkpoint passes take the in-graph route, so the frame keeps nothing."""
+    call = _rocm_frame_wrapper(monkeypatch, kind)
+    q = torch.randn(1, 2, 8, 16, requires_grad = True)
+    frame = SA.new_saved_attention_frame([q])
+    assert frame is not None
+    ref_q = q.detach().requires_grad_()
+    _sdpa(ref_q, ref_q, ref_q).sum().backward()
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(call, backend = "eager", fullgraph = True)
+        with SA.saved_attention_scope(frame, False), torch.no_grad():
+            first = compiled(q)
+        with SA.saved_attention_scope(frame, True):
+            out = compiled(q)
+            out.sum().backward()
+    finally:
+        torch._dynamo.reset()
+    torch.testing.assert_close(first, _sdpa(q, q, q).detach())
+    torch.testing.assert_close(out, _sdpa(q, q, q))
+    torch.testing.assert_close(q.grad, ref_q.grad)
+    assert frame.entries == [] and SA.SAVED_ATTENTION_STATS.get("stored", 0) == 0
+    assert SA.SAVED_ATTENTION_STATS.get("unmatched", 0) == 0
+
+
+def test_rocm_frame_still_keeps_inside_an_unsloth_compiled_block(monkeypatch):
+    """Unsloth's own block compile (fullgraph=False) may break the graph: there the frame keeps and the
+    replay reuses as in eager code."""
+    import types
+
+    call = _rocm_frame_wrapper(monkeypatch, "interface")
+    block = types.ModuleType("unsloth.models._block_compile")
+    block._IN_COMPILED_REGION = [True]
+    monkeypatch.setitem(sys.modules, "unsloth.models._block_compile", block)
+    q = torch.randn(1, 2, 8, 16, requires_grad = True)
+    frame = SA.new_saved_attention_frame([q])
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(call, backend = "eager", fullgraph = False)
+        with SA.saved_attention_scope(frame, False), torch.no_grad():
+            compiled(q)
+        with SA.saved_attention_scope(frame, True):
+            out = compiled(q)
+    finally:
+        torch._dynamo.reset()
+    torch.testing.assert_close(out, _sdpa(q, q, q))
+    assert SA.SAVED_ATTENTION_STATS["stored"] >= 1
+
+
 def test_rocm_hooks_install_from_the_setting_not_the_current_gpu(monkeypatch):
     monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
     _simulated_rocm(monkeypatch, verdicts = {0: _MATH})
