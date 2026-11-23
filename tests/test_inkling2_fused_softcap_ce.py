@@ -192,8 +192,8 @@ def _lora_head(base):
 
 
 def test_unmerged_peft_adapter_on_the_head_still_trains(monkeypatch):
-    """A PEFT LoRA head adds its adapter in forward; the fused kernel reads only lm_head.weight, so such a head takes
-    the exact path and its adapter gets the gradient UNSLOTH_RETURN_LOGITS=1 gives. Disabled and unmerged: fused."""
+    """A PEFT LoRA head adds its adapter in forward; the fused loss runs the head's own forward (no logits returned)
+    and its adapter gets the gradient UNSLOTH_RETURN_LOGITS=1 gives. Disabled and unmerged: the kernel on the weight."""
     cls = _make_class("AdapterHeadToyForCausalLM", _Softcap)
     assert forward_install.install_for_class(cls)
     torch.manual_seed(0)
@@ -209,6 +209,7 @@ def test_unmerged_peft_adapter_on_the_head_still_trains(monkeypatch):
         out.loss.backward()
         grads.append(model.lm_head.lora_B["default"].weight.grad)
         losses.append(out.loss.detach())
+        assert (out.logits.numel() == 0) == (mode == "0")   # live adapter: fused, not the materialized path
     assert grads[1] is not None
     torch.testing.assert_close(grads[1], grads[0])
     torch.testing.assert_close(losses[1], losses[0])
@@ -227,10 +228,10 @@ class _disabled:
         self.layer.enable_adapters(True)
 
 
-def test_merged_then_disabled_peft_head_takes_the_exact_path(monkeypatch):
-    """PEFT unmerges a merged head inside its forward when the adapters are disabled; the fused kernel would read the
-    merged weight (the adapter's loss) and leave the head merged. Merged and enabled runs base_layer alone on the
-    merged weight, which the kernel reads, so it stays fused."""
+def test_merged_then_disabled_peft_head_runs_the_head_forward(monkeypatch):
+    """PEFT unmerges a merged head inside its forward when the adapters are disabled; the kernel would read the
+    merged weight (the adapter's loss) and leave the head merged, so the fused loss runs the head's own forward.
+    Merged and enabled runs base_layer alone on the merged weight, which the kernel reads."""
     cls = _make_class("MergedHeadToyForCausalLM", _Softcap)
     assert forward_install.install_for_class(cls)
     torch.manual_seed(0)
@@ -251,7 +252,7 @@ def test_merged_then_disabled_peft_head_takes_the_exact_path(monkeypatch):
     torch.testing.assert_close(out.loss.detach(), want_adapter)
     head.enable_adapters(False)
     out = model(x = x, labels = labels)
-    assert out.logits.numel() > 0 and not head.merged
+    assert out.logits.numel() == 0 and not head.merged   # fused through the head's forward, which unmerged it
     torch.testing.assert_close(out.loss.detach(), want_base)
     assert model(x = x, labels = labels).logits.numel() == 0   # unmerged and disabled: fused again
 
