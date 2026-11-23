@@ -364,3 +364,45 @@ def test_olmo_hybrid_bound_before_the_patch_takes_the_cpu_path(monkeypatch):
 def inspect_unwrap(fn):
     import inspect
     return inspect.unwrap(fn)
+
+
+@pytest.mark.parametrize("has_gpu", [True, False])
+def test_install_imports_no_modeling_module_on_a_gpu_host(monkeypatch, has_gpu):
+    """Routing the live fla at `import unsloth` must not import transformers' Qwen3-Next modeling on a GPU host (about
+    a second for every model): there the reference comes from a modeling module already imported, or from the first
+    CPU call. A host with no GPU still resolves it at install, outside any trace."""
+    import importlib
+
+    package, chunk, recurrent, modeling, calls = _install_fake_fla(monkeypatch)
+    for key in ("reference", "recurrent_reference"):
+        monkeypatch.setitem(fla_vendor._rocm_fp32_state, key, None)
+    saved = {}
+    for model in ("qwen3_next", "qwen3_5_moe"):
+        name = f"transformers.models.{model}.modeling_{model}"
+        if name in sys.modules:
+            saved[name] = sys.modules[name]
+            monkeypatch.delitem(sys.modules, name)
+    imported = []
+    real_import = importlib.import_module
+
+    def import_module(name, *args, **kwargs):
+        imported.append(name)
+        return saved[name] if name in saved else real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(fla_vendor.importlib, "import_module", import_module)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: has_gpu)
+    assert fla_vendor._install_cpu_torch_path()
+    modeling_imports = [n for n in imported if ".modeling_" in n]
+    if has_gpu:
+        assert modeling_imports == []
+        assert fla_vendor._rocm_fp32_state["reference"] is None
+    else:
+        assert "transformers.models.qwen3_next.modeling_qwen3_next" in modeling_imports
+        assert fla_vendor._rocm_fp32_state["reference"] is not None
+    # The first CPU call resolves it and runs the torch path.
+    q, k, v, g, beta = _inputs(1, 6, 2, 2, 8, 8)
+    out, _ = package.chunk_gated_delta_rule(q, k, v, g = g, beta = beta, use_qk_l2norm_in_kernel = True)
+    want, _ = _recurrent_fp64(q, k, v, g, beta, 8 ** -0.5)
+    torch.testing.assert_close(out.double(), want, atol = 1e-4, rtol = 1e-4)
+    assert fla_vendor._rocm_fp32_state["reference"] is not None
+    assert calls == []

@@ -1300,18 +1300,25 @@ def _rocm_fp32_on_faulting_gpu(*tensors):
     return False
 
 
-def _torch_reference_gated_delta_rule(recurrent = False):
+def _torch_reference_gated_delta_rule(recurrent = False, import_missing = True):
     """transformers' pure-torch ``torch_chunk_gated_delta_rule`` (or ``torch_recurrent_gated_delta_rule``,
     the kernel-hub fallbacks), unwrapped. The recurrent one decays the state token by token like fla's
     fused_recurrent kernel, so a reset gate (g = -inf, decay exp(g) = 0) clears it; the chunk one forms
-    exp(g_i - g_j) from cumulative gates, which is -inf - -inf = NaN there."""
+    exp(g_i - g_j) from cumulative gates, which is -inf - -inf = NaN there.
+    ``import_missing=False`` only looks in modeling modules already imported and returns None if none has it."""
     key = "recurrent_reference" if recurrent else "reference"
     if _rocm_fp32_state[key] is not None:
         return _rocm_fp32_state[key]
     name = "torch_recurrent_gated_delta_rule" if recurrent else "torch_chunk_gated_delta_rule"
     for model in ("qwen3_next", "qwen3_5", "qwen3_5_moe"):
+        module_name = f"transformers.models.{model}.modeling_{model}"
         try:
-            fn = getattr(importlib.import_module(f"transformers.models.{model}.modeling_{model}"), name)
+            module = sys.modules.get(module_name)
+            if module is None:
+                if not import_missing:
+                    continue
+                module = importlib.import_module(module_name)
+            fn = getattr(module, name)
         except Exception:
             continue
         reference = inspect.unwrap(fn)
@@ -1319,6 +1326,8 @@ def _torch_reference_gated_delta_rule(recurrent = False):
         if not _compiling():
             _rocm_fp32_state[key] = reference
         return reference
+    if not import_missing:
+        return None
     raise RuntimeError(f"Unsloth: transformers has no {name} to run gated delta in pure torch.")
 
 
@@ -1515,6 +1524,17 @@ def _compiling():
     return torch.compiler.is_compiling()
 
 
+def _has_gpu():
+    import torch
+    try:
+        if torch.cuda.is_available():
+            return True
+        xpu = getattr(torch, "xpu", None)
+        return bool(xpu is not None and xpu.is_available())
+    except Exception:
+        return True   # unknown: keep the import out of import time
+
+
 def _on_cpu(args, kwargs):
     q = kwargs.get("q", args[0] if args else None)
     return getattr(getattr(q, "device", None), "type", None) == "cpu"
@@ -1570,8 +1590,11 @@ def _install_cpu_torch_path():
         if original is None:
             continue
         try:
-            # Resolved here, not in the first (possibly traced) call: an import there breaks the graph.
-            _torch_reference_gated_delta_rule(recurrent)
+            # Resolved here rather than in the first (possibly traced) call, where an import breaks the graph. A GPU
+            # host takes it only from a modeling module already imported: importing transformers' Qwen3-Next
+            # modeling costs every `import unsloth` about a second, for a CPU gated-delta call a GPU host seldom
+            # makes; its first CPU call resolves it then. A host with no GPU, where every call is a CPU one, imports.
+            _torch_reference_gated_delta_rule(recurrent, import_missing = not _has_gpu())
         except Exception:
             pass
         if getattr(original, _CPU_TORCH_MARK, None) is not None:
