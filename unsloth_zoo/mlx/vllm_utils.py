@@ -94,13 +94,40 @@ def use_vllm(fast_inference):
     return False
 
 
+def _training_dtype(model):
+    import collections
+
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    counts = collections.Counter(a.dtype for _, a in tree_flatten(model.parameters()) if mx.issubdtype(a.dtype, mx.floating))
+    return counts.most_common(1)[0][0] if counts else None
+
+
+def _quantize_like(engine_model, model):
+    """Quantize each engine layer the training model has quantized, with its group size, bits and mode."""
+    import mlx.nn as nn
+
+    quantized = {path: m for path, m in model.named_modules() if hasattr(m, "scales") and hasattr(m, "bits")}
+    if quantized:
+        nn.quantize(engine_model, class_predicate=lambda path, module: (
+            path in quantized and hasattr(module, "to_quantized")
+            and dict(group_size=quantized[path].group_size, bits=quantized[path].bits, mode=getattr(quantized[path], "mode", "affine"))))
+    return engine_model
+
+
 def _share_weights(engine_model, model):
-    """Point the engine's (lazily loaded) arrays at ``model``'s when every name, shape and dtype matches."""
+    """Point the engine's (lazily loaded) arrays at ``model``'s when every name and shape matches and dtypes differ only
+    in float precision; the engine then runs at the training model's dtypes, float32 parameters a model keeps included."""
+    import mlx.core as mx
     from mlx.utils import tree_flatten, tree_unflatten
 
     wanted = dict(tree_flatten(engine_model.parameters()))
     trained = dict(tree_flatten(model.parameters()))
-    if any(name not in trained or trained[name].shape != array.shape or trained[name].dtype != array.dtype
+    floating = lambda a: mx.issubdtype(a.dtype, mx.floating)
+    # Integer dtypes must match: packed weights and uint8 scales of another quantization mode can share a shape.
+    if any(name not in trained or trained[name].shape != array.shape
+           or (trained[name].dtype != array.dtype and not (floating(array) and floating(trained[name])))
            for name, array in wanted.items()):
         return False
     engine_model.update(tree_unflatten([(name, trained[name]) for name in wanted]))
@@ -124,8 +151,12 @@ def _in_process_engine_loads(model):
         # Lazy, so the checkpoint's arrays are never read when the training model's replace them. This has to
         # happen inside the load: the runner compiles blocks over the weights it holds right after it.
         engine_model, config = original(model_path, lazy=True, **kwargs)
-        if not _share_weights(engine_model, model):
+        if not _share_weights(_quantize_like(engine_model, model), model):
             engine_model, config = original(model_path, lazy=lazy, **kwargs)
+            if _training_dtype(model) is not None:  # load_vllm gives vLLM this dtype for the KV cache
+                from .loader import _convert_mlx_dtype
+
+                _convert_mlx_dtype(engine_model, _training_dtype(model))
         return exempt_from_gradient_checkpointing(engine_model), config
 
     def load_vlm(*args, **kwargs):
@@ -160,6 +191,10 @@ def load_vllm(model, *, max_seq_length, gpu_memory_utilization=0.5, max_lora_ran
         engine_kwargs.update(enable_lora=True, max_lora_rank=int(max_lora_rank), max_loras=1)
     if os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] != "0":
         return LLM(**engine_kwargs)
+    dtype = _training_dtype(model)
+    if dtype is not None:
+        # The engine shares the training model's arrays at this dtype; vllm-metal sizes its KV cache by it.
+        engine_kwargs["dtype"] = str(dtype).rsplit(".", 1)[-1]
     with _in_process_engine_loads(model):
         engine = LLM(**engine_kwargs)
     engine._unsloth_in_memory_lora = _serve_in_memory_loras(engine)

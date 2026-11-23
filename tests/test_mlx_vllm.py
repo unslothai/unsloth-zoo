@@ -98,7 +98,7 @@ def _fake_vllm(monkeypatch, platform_module):
 def test_load_vllm_starts_an_in_process_metal_engine_on_the_loaded_checkpoint(monkeypatch):
     monkeypatch.delenv("VLLM_ENABLE_V1_MULTIPROCESSING", raising=False)
     created = _fake_vllm(monkeypatch, "vllm_metal.platform")
-    model = types.SimpleNamespace(_src_path="/snap/qwen", _hf_repo="Qwen/Qwen3-0.6B")
+    model = types.SimpleNamespace(_src_path="/snap/qwen", _hf_repo="Qwen/Qwen3-0.6B", parameters=dict)
     engine = vllm_utils.load_vllm(model, max_seq_length=512, gpu_memory_utilization=0.3, max_lora_rank=32, seed=7)
     assert engine.kwargs == dict(
         model="/snap/qwen", max_model_len=512, gpu_memory_utilization=0.3, seed=7,
@@ -111,26 +111,33 @@ def test_load_vllm_starts_an_in_process_metal_engine_on_the_loaded_checkpoint(mo
     assert model.vllm_engine is engine and model.fast_generate("hi")[0] == "generated"
 
 
-def _tiny(seed, layers=2, dtype="bfloat16"):
+def _tiny(seed, width=128, dtype="bfloat16"):
     import mlx.core as mx
     qwen3 = pytest.importorskip("mlx_lm.models.qwen3")
     mx.random.seed(seed)
-    model = qwen3.Model(qwen3.ModelArgs("qwen3", 64, layers, 128, 4, 1e-6, 128, 2, 128, 16, True, 1e4))
+    model = qwen3.Model(qwen3.ModelArgs("qwen3", 64, 2, width, 4, 1e-6, 128, 2, 128, 16, True, 1e4))
     return model.set_dtype(getattr(mx, dtype)) or model
 
 
-@pytest.mark.parametrize("layers, dtype, multiprocess, loads", [(2, "bfloat16", "0", [True]), (1, "bfloat16", "0", [True, False]), (2, "float16", "0", [True, False]), (2, "bfloat16", "1", [False])])
-def test_an_in_process_engine_shares_only_matching_weights(monkeypatch, layers, dtype, multiprocess, loads):
+@pytest.mark.parametrize("width, dtype, quant, multiprocess, loads", [(128, "bfloat16", None, "0", [True]), (256, "float16", None, "0", [True, False]), (128, "float16", None, "0", [True]), (128, "bfloat16", (64, 8, "affine", "mlp", None), "0", [True]), (128, "float16", (32, 4, "mxfp4", "", None), "0", [True]), (128, "bfloat16", (32, 8, "affine", "", "mxfp8"), "0", [True, False]), (128, "bfloat16", None, "1", [False])])
+def test_an_in_process_engine_shares_only_matching_weights(monkeypatch, width, dtype, quant, multiprocess, loads):
+    import mlx.core as mx
+    import mlx.nn as nn
     from mlx.utils import tree_flatten
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", multiprocess)
     _fake_vllm(monkeypatch, "vllm_metal.platform")
-    calls, model = [], _tiny(0, layers, dtype)
-    life = types.SimpleNamespace(mlx_lm_load_model=lambda path, lazy=False: (calls.append(lazy), (_tiny(1), {}))[1], mlx_vlm_load_model=lambda path: _tiny(2))
+    calls, model = [], _tiny(0, width, dtype)
+    model.model.norm.set_dtype(mx.float32)  # a layer kept in float32 is shared as is; the training dtype is the majority's
+    if quant:  # as load_in_8bit / load_in_mxfp4 leave it; the engine must mirror it per layer
+        nn.quantize(model, *quant[:2], mode=quant[2], class_predicate=lambda path, m: quant[3] in path and hasattr(m, "to_quantized"))
+    engine_model = lambda: (e := _tiny(1), quant and quant[4] and nn.quantize(e, *quant[:2], mode=quant[4]))[0]  # a checkpoint already quantized otherwise
+    life = types.SimpleNamespace(mlx_lm_load_model=lambda path, lazy=False: (calls.append(lazy), (engine_model(), {}))[1], mlx_vlm_load_model=lambda path: _tiny(2))
     v1, original, model._src_path = types.SimpleNamespace(model_lifecycle=life), life.mlx_lm_load_model, "/snap"
     for item in (("vllm_metal", types.SimpleNamespace(v1=v1)), ("vllm_metal.v1", v1), ("vllm_metal.v1.model_lifecycle", life)):
         monkeypatch.setitem(sys.modules, *item)
-    monkeypatch.setattr(sys.modules["vllm"], "LLM", lambda **kw: types.SimpleNamespace(models=(life.mlx_lm_load_model(kw["model"])[0], life.mlx_vlm_load_model(kw["model"]))))
-    engine, vision = vllm_utils.load_vllm(model, max_seq_length=64).models
+    monkeypatch.setattr(sys.modules["vllm"], "LLM", lambda **kw: types.SimpleNamespace(kwargs=kw, models=(life.mlx_lm_load_model(kw["model"])[0], life.mlx_vlm_load_model(kw["model"]))))
+    (engine, vision), types_of = (llm := vllm_utils.load_vllm(model, max_seq_length=64)).models, lambda m: [(p, type(x)) for p, x in m.named_modules()]
+    assert llm.kwargs.get("dtype") == (dtype if multiprocess == "0" else None) and (not quant or types_of(engine) == types_of(model)) and vllm_utils._training_dtype(engine) == getattr(mx, dtype if multiprocess == "0" else "bfloat16")
     aliased = [array is dict(tree_flatten(model.parameters())).get(name) for name, array in tree_flatten(engine.parameters())]
     assert calls == loads and life.mlx_lm_load_model is original and all(aliased) == (loads == [True]) == any(aliased)
     assert all(getattr(m, "_unsloth_no_checkpoint", False) == (multiprocess == "0") for x in (engine, vision) for _, m in x.named_modules())
