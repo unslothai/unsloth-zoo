@@ -6246,11 +6246,13 @@ def _save_dir_atomically(save_fn, save_directory, rank):
     """
     # All Unsloth Zoo code licensed under LGPLv3
     save_directory = os.fspath(save_directory)
-    tmp = f"{save_directory.rstrip(os.sep)}.unsloth_tmp_rank{rank}_{os.getpid()}"
-    shutil.rmtree(tmp, ignore_errors = True)
+    import tempfile
+    parent, base = os.path.split(save_directory.rstrip(os.sep) or save_directory)
+    parent = parent or os.curdir
+    os.makedirs(parent, exist_ok = True)
+    # mkdtemp: owner-only, unpredictable O_EXCL name a peer writing the parent cannot pre-create or link.
+    tmp = tempfile.mkdtemp(prefix = f"{base}.unsloth_tmp_rank{rank}_", dir = parent)
     try:
-        # Owner-only, so adapters a private output folder protects are not readable beside it while written.
-        os.makedirs(tmp, mode = 0o700, exist_ok = True)
         save_fn(tmp)
         for root, _, files in os.walk(tmp):
             rel = os.path.relpath(root, tmp)
