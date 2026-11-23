@@ -209,3 +209,15 @@ def test_keep_mode_is_noop_on_first_save_and_idempotent(tmp_path, umask022):
     final = tmp_path / "f"; final.write_bytes(b"y"); os.chmod(final, 0o600)
     keep_mode(tmp, final); keep_mode(tmp, final)
     assert _mode(tmp) == 0o600
+
+
+def test_windows_keeps_owner_write_bit(tmp_path, monkeypatch):
+    # A read-only source must not publish a read-only output on Windows: the next export's os.replace would fail.
+    from unsloth_zoo import private_staging
+    staging = tmp_path / "staging"
+    staging.write_bytes(b"x")
+    staging.chmod(0o444)
+    monkeypatch.setattr(private_staging.os, "name", "nt")
+    private_staging.keep_mode(str(staging), str(tmp_path / "missing"), source_mode = 0o444, add = stat.S_IWUSR)
+    monkeypatch.undo()
+    assert _mode(staging) & stat.S_IWUSR

@@ -61,8 +61,13 @@ def keep_mode(temporary, final, source_mode = None, like = (), add = 0):
     """Before publishing `temporary` as `final`: take the mode of the existing `final` (or the first existing path in
     `like`), so a re-export never widens weights the user restricted. With nothing existing, a copied file's
     `source_mode` is narrowed by the umask; else the temp keeps the mode it was written with. `add` bits are ORed in.
-    Idempotent, never raises, no-op on Windows."""
+    Idempotent, never raises; on Windows only the `add` bits are applied (a read-only copy would block the next replace)."""
     if os.name == "nt":
+        if add:
+            try:
+                os.chmod(temporary, stat.S_IMODE(os.stat(temporary).st_mode) | add)
+            except OSError:
+                pass
         return
     mode = None
     for path in (final, *like):
