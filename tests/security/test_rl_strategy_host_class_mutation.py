@@ -94,6 +94,20 @@ def test_factory_made_classes_stay_assignable():
     assert fn([1, 2, 3]) == (3, "p", 1)
 
 
+SHADOWS = {
+    "parameter": "def s(b, __unsloth_attr_target__ = None):\n    import collections\n    collections.Counter.update = len\n    return 1\n",
+    "import_alias": "def s(b):\n    import collections as __unsloth_attr_target__\n    return 1\n",
+    "except_name": "def s(b):\n    try:\n        pass\n    except Exception as __unsloth_attr_target__:\n        pass\n    return 1\n",
+    "lambda_arg": "def s(b):\n    f = lambda __unsloth_attr_target__: 1\n    return f(1)\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(SHADOWS))
+def test_guard_name_cannot_be_shadowed(name):
+    with pytest.raises(RuntimeError, match = "is not allowed in generated code"):
+        create_locked_down_function(SHADOWS[name], builtins_policy = "allowlist")
+
+
 def test_full_policy_unchanged():
     # "full" is the documented permissive mode: no rewrite there.
     fn = create_locked_down_function("def s(x):\n    class A:\n        pass\n    A.y = x\n    return A.y\n", builtins_policy = "full")

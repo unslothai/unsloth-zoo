@@ -699,7 +699,28 @@ class _GuardAttributeTargets(ast.NodeTransformer):
 pass
 
 
+def _bound_identifiers(tree):
+    # Every identifier a strategy can bind besides plain Names (which _reject_dunder_access already checks).
+    for node in ast.walk(tree):
+        if isinstance(node, ast.arg):
+            yield node.arg
+        elif isinstance(node, ast.alias):
+            yield node.asname or node.name.split(".")[0]
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            yield from node.names
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)):
+            yield getattr(node, "name", None)
+        else:
+            for field in ("name", "rest"):  # MatchAs / MatchStar / MatchMapping (3.10+)
+                if type(node).__name__.startswith("Match"):
+                    yield getattr(node, field, None)
+pass
+
+
 def _guard_attribute_targets(tree):
+    # The guard is found by name lookup, so the strategy must not be able to bind that name anywhere.
+    if _ATTR_TARGET_GUARD in set(_bound_identifiers(tree)):
+        raise RuntimeError(f"Name '{_ATTR_TARGET_GUARD}' is not allowed in generated code.")
     return ast.fix_missing_locations(_GuardAttributeTargets().visit(tree))
 pass
 
