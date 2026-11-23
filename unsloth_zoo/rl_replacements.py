@@ -3797,13 +3797,21 @@ def grpo_accumulated_loss(
         # Imported here: this body is copied into the generated trainer.
         from unsloth_zoo.rl_replacements import grpo_forwards_are_collective, grpo_agree_mini_batch
         _collective_forwards = grpo_forwards_are_collective(trainer.model)
+        if not _collective_forwards:
+            # DeepSpeed ZeRO-3 gathers partitioned weights in every forward too.
+            import torch.distributed as _dist
+            from unsloth_zoo.temporary_patches.utils import zero3_partitioned_training as _zero3_live
+            _collective_forwards = (
+                _zero3_live() and _dist.is_available() and _dist.is_initialized() and _dist.get_world_size() > 1
+            )
 
         if trainer.args.unsloth_grpo_mini_batch is None:
             # Size per call, as unsloth's copy does: caching in args froze the first step's plan.
             B, multiplier = autotune_batch_and_chunks(
                 total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
             )
-            B = max(1, total_rows//B)
+            # Rows per forward -> split count; floor division would put more rows in one forward than fit.
+            B = max(1, -(-total_rows // B))
             if _collective_forwards:
                 B = grpo_agree_mini_batch(B, input_ids.device)
         else:
@@ -3932,7 +3940,7 @@ def grpo_accumulated_loss(
                 B, multiplier = autotune_batch_and_chunks(
                     total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
                 )
-                B = max(1, total_rows//B)
+                B = max(1, -(-total_rows // B))
             else:
                 B = min(B, total_rows)
             trainer._unsloth_zero_advantage_rows_skipped = (
@@ -4081,6 +4089,9 @@ def grpo_accumulated_loss(
         # Skip PG under vLLM (fast_inference=True): rollout dominates the step, so the
         # saving is small and the first-use self-verify is net overhead.
         _pg_engage = bool(_pg_funcs) and not getattr(trainer, "use_vllm", False) and not _need_entropy
+        # Collective forwards (sharded FSDP2): PG's layout and verify forward are rank-local, so ranks would
+        # run different forward counts. Its own line: unsloth rewrites the one above.
+        _pg_engage = _pg_engage and not _collective_forwards
 
         # ---- PrefixGrouper (GRPO shared-prompt dedup; UNSLOTH_GRPO_PREFIX_GROUPER=0 disables) ----
         # Each prompt's G completions share the prefix; PG forwards it once + the G suffixes
@@ -4152,6 +4163,9 @@ def grpo_accumulated_loss(
                     _pg_unsafe = set()
                 if _pg_layout is not None and _pg_layout.signature in _pg_unsafe:
                     _pg_layout = None
+                elif _pg_layout is not None and _pg_layout.flat_ids.shape[1] > batch_size * input_ids.shape[1]:
+                    # Over one padded mini-batch's tokens: the chunked loop keeps the mini-batch cap.
+                    _pg_layout = None
                 elif _pg_layout is not None:
                     _pg_layout.W = logits_to_keep + max_left_pad
                     _pg_verified = getattr(unwrapped_model, "_unsloth_prefix_grouper_grad_verified", None)
@@ -4192,7 +4206,8 @@ def grpo_accumulated_loss(
         _pack_in_packed = False
         _pack_enabled = os.environ.get("UNSLOTH_GRPO_SEQ_PACKING", "1").lower() not in ("0", "false", "no", "off")
         _pack_ok = getattr(unwrapped_model, "_unsloth_seq_packing_grad_ok", None)
-        if (_pack_enabled and not _pg_skip_pack and pixel_values is None
+        # Collective forwards: the packed forward and its per-row verify are rank-local, like PG above.
+        if (_pack_enabled and not _pg_skip_pack and not _collective_forwards and pixel_values is None
                 and token_type_ids is None and mm_token_type_ids is None and _pack_ok is not False):
             try:
                 # Imported here: this body is copied into the generated trainer.
@@ -4228,6 +4243,8 @@ def grpo_accumulated_loss(
                 # skip the whole packed forward for a known-unsafe length region (a prior moderate mismatch or a
                 # packed OOM), before the flatten and the active-row read, so a capped batch costs one sync
                 _pack_capped = _pack_unsafe is not None and _pack_T >= _pack_unsafe
+                # Over one padded [batch_size, L] mini-batch's tokens: the chunked loop keeps the mini-batch cap.
+                _pack_capped = _pack_capped or _pack_T > batch_size * _pack_L
                 if not _pack_capped:
                     _pack_nz_idx = grpo_nonzero_static(_pack_keep, _pack_T)     # [T, 2] = (row, col)
                     _pack_flat_ids = input_ids[_pack_nz_idx[:, 0], _pack_nz_idx[:, 1]].unsqueeze(0)
@@ -4528,8 +4545,9 @@ def grpo_accumulated_loss(
             zipped_inputs = []
         else:
             # packing rejected/unused: drop the packed graph and its index buffers before the padded loop so
-            # neither co-resides with it
+            # neither co-resides with it; same for a declined PrefixGrouper layout
             _pack_hidden = _pack_sel = _pack_result = None
+            _pg_layout = None
             _pack_ent = _pack_entropies = None
             _fused_pack = None
             if _pack_T is not None:
