@@ -14,11 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Qwen4Exp QSA cached decode: decoding through the cache (block keys cached, selected K / V rows gathered) must give
-the full-prefix recompute's logits, and every step must keep the reference indexer's tokens on the same inputs and
-cache exactly the reference's pooled block keys. Covers prompts below / at / above the budget, blocks completing
-inside multi-token steps, left-padded batches, a LoRA adapter on and off, eager masks, fp16 / bf16, the kill switch,
-and that a block pooled before all its tokens are written (SGLang #46125) is caught."""
+"""Cached QSA decode (Qwen4Exp) must match the full-prefix recompute's logits and the reference
+indexer's tokens and pooled block keys across budget, padding, LoRA, mask, dtype and kill-switch
+cases; it also catches a block pooled before its tokens are written (SGLang #46125)."""
 
 import os
 

@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""model.push_to_hub_merged(repo_id) on MLX must upload the current model, not a save an earlier push left behind.
-
-mlx/loader.py and mlx/utils.py import mlx, so the two functions are read with ast and run against fakes."""
+"""model.push_to_hub_merged(repo_id) on MLX must upload the current model, not a save left behind by
+an earlier push; mlx/loader.py and mlx/utils.py import mlx, so they are read with ast."""
 
 import ast
 import sys

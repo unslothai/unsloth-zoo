@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_FSDP2_MERGED_ROLLOUT=1: load_lora's gathered adapter copies feed the merged-rollout fold under native
-FSDP2, any later in-place step makes them refused, and the default path caches nothing. CPU only: two gloo
-torchrun ranks, no vLLM."""
+"""UNSLOTH_FSDP2_MERGED_ROLLOUT=1: load_lora's gathered adapter copies feed the merged-rollout fold
+under FSDP2; any later in-place step makes them refused, and the default caches nothing."""
 
 import os
 import pathlib
