@@ -66,14 +66,27 @@ TEMPORARY_PATCHES.append(patch_inkling2_moe_experts)
 # returns correct values but wrong input grads, so the compiler keeps them eager. A torch.compiler.disable boundary
 # does that outside any graph, but inside an enclosing compiled graph it is a graph break, and under fullgraph = True
 # a hard Unsupported. The opaque custom ops below keep the same eager forward and backward inside the graph instead.
-def inkling2_block_residual_reference(block_states, partial_block_states, query, eps):
-    """transformers' Inkling2{,Loop}BlockAttentionResidual.forward (eager attention), stacked as
-    [..., num_queries, hidden] in fp32 instead of unbound."""
+def inkling2_block_residual_reference(block_states, partial_block_states, query, eps, sdpa = False):
+    """transformers' Inkling2{,Loop}BlockAttentionResidual.forward (sdpa, else eager attention), stacked as
+    [..., num_queries, hidden] instead of unbound."""
     stacked = torch.cat([block_states, partial_block_states.unsqueeze(-2)], dim = -2).float()
     stacked = stacked * torch.rsqrt(stacked.square().mean(-1, keepdim = True) + eps)
     hidden = stacked.shape[-1]
     q = query.float().view(-1, hidden)
-    scores = torch.matmul(q, stacked.transpose(-1, -2)) * hidden ** -0.5  # [..., num_queries, blocks]
+    if sdpa:
+        # The module's own call, on the operands autocast would give it (each cast on its own, after the expand, so
+        # the grads accumulate in fp32 as there). Cast by hand: torch.func.vjp through the math backend under an
+        # active autocast fails ("expected scalar type Float but found Half", torch 2.10).
+        q, k, v = q.expand(*stacked.shape[:-2], -1, -1), stacked, stacked
+        device_type = stacked.device.type
+        autocast, autocast_dtype = _autocast_state(device_type)
+        if autocast:
+            q, k, v = q.to(autocast_dtype), k.to(autocast_dtype), v.to(autocast_dtype)
+        with torch.autocast(device_type, enabled = False):
+            return torch.nn.functional.scaled_dot_product_attention(q, k, v, scale = hidden ** -0.5)
+    # Eager: the scale goes on the fp32 query before the matmul (the module scales after it), so under fp16 autocast
+    # the score (up to hidden * |q| unscaled) cannot overflow to inf.
+    scores = torch.matmul(q * hidden ** -0.5, stacked.transpose(-1, -2))  # [..., num_queries, blocks]
     return torch.matmul(torch.softmax(scores, dim = -1, dtype = torch.float32), stacked)
 
 
@@ -88,23 +101,26 @@ def _autocast_state(device_type):
         return torch.is_autocast_enabled(), torch.get_autocast_gpu_dtype()
 
 
-def _residual_under(device_type, autocast, autocast_dtype, block_states, partial_block_states, query, eps):
-    # The eager module under the same autocast: its matmuls autocast (output in autocast_dtype), the rest stays fp32.
+def _residual_under(device_type, autocast, autocast_dtype, sdpa, block_states, partial_block_states, query, eps):
+    # The eager module under the same autocast: its attention autocasts (output in autocast_dtype), the rest is fp32.
     with torch.autocast(device_type, dtype = autocast_dtype, enabled = autocast):
-        return inkling2_block_residual_reference(block_states, partial_block_states, query, eps)
+        out = inkling2_block_residual_reference(block_states, partial_block_states, query, eps, sdpa)
+    return out.to(autocast_dtype if autocast else torch.float32)  # the dtype the fake promises
 
 
 _RESIDUAL_OP = None
 try:
     @torch.library.custom_op("unsloth_zoo::inkling2_block_residual", mutates_args = ())
     def _residual_op(block_states: torch.Tensor, partial_block_states: torch.Tensor, query: torch.Tensor,
-                     eps: float, device_type: str, autocast: bool, autocast_dtype: torch.dtype) -> torch.Tensor:
+                     eps: float, device_type: str, autocast: bool, autocast_dtype: torch.dtype,
+                     sdpa: bool) -> torch.Tensor:
         with torch.no_grad():
             return _residual_under(
-                device_type, autocast, autocast_dtype, block_states, partial_block_states, query, eps).contiguous()
+                device_type, autocast, autocast_dtype, sdpa, block_states, partial_block_states, query, eps,
+            ).contiguous()
 
     @_residual_op.register_fake
-    def _residual_fake(block_states, partial_block_states, query, eps, device_type, autocast, autocast_dtype):
+    def _residual_fake(block_states, partial_block_states, query, eps, device_type, autocast, autocast_dtype, sdpa):
         hidden = partial_block_states.shape[-1]
         return partial_block_states.new_empty(
             (*partial_block_states.shape[:-1], query.numel() // hidden, hidden),
@@ -113,11 +129,11 @@ try:
     @torch.library.custom_op("unsloth_zoo::inkling2_block_residual_backward", mutates_args = ())
     def _residual_backward_op(grad: torch.Tensor, block_states: torch.Tensor, partial_block_states: torch.Tensor,
                               query: torch.Tensor, eps: float, device_type: str, autocast: bool,
-                              autocast_dtype: torch.dtype) -> List[torch.Tensor]:
+                              autocast_dtype: torch.dtype, sdpa: bool) -> List[torch.Tensor]:
         # The op body runs below autograd: torch.func.vjp carries its own grad transform. The recompute re-enters the
         # forward's autocast, whatever the backward pass runs under.
         _, vjp = torch.func.vjp(
-            lambda b, p, q: _residual_under(device_type, autocast, autocast_dtype, b, p, q, eps),
+            lambda b, p, q: _residual_under(device_type, autocast, autocast_dtype, sdpa, b, p, q, eps),
             block_states, partial_block_states, query)
         taken = {t.untyped_storage().data_ptr() for t in (grad, block_states, partial_block_states, query)}
         grads = []
@@ -131,19 +147,19 @@ try:
 
     @_residual_backward_op.register_fake
     def _residual_backward_fake(grad, block_states, partial_block_states, query, eps, device_type, autocast,
-                                autocast_dtype):
+                                autocast_dtype, sdpa):
         return [t.new_empty(t.shape) for t in (block_states, partial_block_states, query)]
 
     def _residual_setup_context(ctx, inputs, output):
-        block_states, partial_block_states, query, eps, device_type, autocast, autocast_dtype = inputs
+        block_states, partial_block_states, query, eps, device_type, autocast, autocast_dtype, sdpa = inputs
         ctx.save_for_backward(block_states, partial_block_states, query)
-        ctx.state = (eps, device_type, autocast, autocast_dtype)
+        ctx.state = (eps, device_type, autocast, autocast_dtype, sdpa)
 
     def _residual_backward(ctx, grad):
         block_states, partial_block_states, query = ctx.saved_tensors
         grads = torch.ops.unsloth_zoo.inkling2_block_residual_backward(
             grad.contiguous(), block_states, partial_block_states, query, *ctx.state)
-        return grads[0], grads[1], grads[2], None, None, None, None
+        return grads[0], grads[1], grads[2], None, None, None, None, None
 
     _residual_op.register_autograd(_residual_backward, setup_context = _residual_setup_context)
     _RESIDUAL_OP = _residual_op
@@ -151,11 +167,12 @@ except Exception:  # torch without torch.library.custom_op: the plain compiler b
     _RESIDUAL_OP = None
 
 
-def inkling2_block_residual_op(block_states, partial_block_states, query, eps):
+def inkling2_block_residual_op(block_states, partial_block_states, query, eps, sdpa = False):
     """The opaque residual under the caller's autocast, as the eager module computes it."""
     device_type = partial_block_states.device.type
     autocast, autocast_dtype = _autocast_state(device_type)
-    return _RESIDUAL_OP(block_states, partial_block_states, query, eps, device_type, autocast, autocast_dtype)
+    return _RESIDUAL_OP(block_states, partial_block_states, query, eps, device_type, autocast, autocast_dtype,
+                        bool(sdpa))
 
 
 def _residual_inputs(args, kwargs):
@@ -173,6 +190,16 @@ def _residual_inputs(args, kwargs):
     return got["block_states"], got["partial_block_states"]
 
 
+def _has_hooks(module):
+    # The op computes the norm inline, so a hook on it (or a global module hook) would silently not run.
+    names = ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks")
+    if any(len(getattr(module, name, None) or ()) for name in names):
+        return True
+    names = ("_global_forward_hooks", "_global_forward_pre_hooks", "_global_backward_hooks",
+             "_global_backward_pre_hooks")
+    return any(len(getattr(torch.nn.modules.module, name, None) or ()) for name in names)
+
+
 def _residual_op_eps(module, args):
     # Only the layout the reference reproduces: two tensor inputs, an unweighted RMSNorm, eager or sdpa attention
     # (transformers 5.23 calls sdpa directly and keeps no config on the module).
@@ -182,7 +209,7 @@ def _residual_op_eps(module, args):
     eps = getattr(norm, "eps", None)
     if not isinstance(query, torch.Tensor) or not type(norm).__name__.endswith("UnweightedRMSNorm"):
         return None
-    if not isinstance(eps, float) or len(list(norm.parameters())) != 0:
+    if not isinstance(eps, float) or len(list(norm.parameters())) != 0 or _has_hooks(norm):
         return None
     config = getattr(module, "config", None)
     if config is not None and getattr(config, "_attn_implementation", None) not in ("eager", "sdpa"):
@@ -204,7 +231,9 @@ def inkling2_residual_eager_unless_decode(func):
             inputs = _residual_inputs(args, kwargs)
             eps = _residual_op_eps(self, inputs)
             if eps is not None:
-                return inkling2_block_residual_op(inputs[0], inputs[1], self.query, eps).unbind(-2)
+                config = getattr(self, "config", None)
+                sdpa = config is None or config._attn_implementation == "sdpa"
+                return inkling2_block_residual_op(inputs[0], inputs[1], self.query, eps, sdpa).unbind(-2)
         return disabled(self, *args, **kwargs)
     forward._unsloth_undisabled = plain
     return forward

@@ -168,7 +168,8 @@ def test_residual_op_follows_the_caller_autocast(monkeypatch, num_queries, attn,
     stock = getattr(modeling, class_name).forward
 
     def op_forward(module, block_states, partial):
-        return patch.inkling2_block_residual_op(block_states, partial, module.query, module.norm.eps).unbind(-2)
+        return patch.inkling2_block_residual_op(
+            block_states, partial, module.query, module.norm.eps, sdpa = attn == "sdpa").unbind(-2)
 
     # Half precision: the sdpa module and the matmul reference round differently in a few elements.
     tol = {} if precision == "fp32" else dict(rtol = 2e-2, atol = 5e-2)
@@ -186,3 +187,75 @@ def test_residual_op_follows_the_caller_autocast(monkeypatch, num_queries, attn,
         for a, b in zip(want[1:], got[1:]):
             assert b.dtype == a.dtype, (name, b.dtype, a.dtype)
             torch.testing.assert_close(b, a, **tol, msg = lambda m: f"{name}: {m}")
+
+
+@pytest.mark.parametrize("backend", ["default", "math"])
+@pytest.mark.parametrize("model_type, hidden, num_queries, fill", [
+    ("inkling2", 512, 1, 200.0),
+    ("inkling2_loop", 2304, 3, 64.0),
+])
+def test_fp16_residual_stays_finite_where_sdpa_does(monkeypatch, model_type, hidden, num_queries, fill, backend):
+    """A large finite query: hidden * |q| overflows fp16 unless the softmax scale is applied before the product,
+    as SDPA does. The op must stay finite and match the stock sdpa module, values and grads, on the default and
+    the math SDPA backend (the one a wide head falls back to)."""
+    import contextlib
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    kernel = sdpa_kernel(SDPBackend.MATH) if backend == "math" else contextlib.nullcontext()
+    class_name, config_name = _CLASSES[model_type]
+    modeling, decorator = _generated_decorator(monkeypatch, model_type, class_name)
+    config = getattr(importlib.import_module(f"transformers.models.{model_type}.configuration_{model_type}"), config_name)(
+        hidden_size = hidden)
+    config._attn_implementation = "sdpa"
+    layer = getattr(modeling, class_name)(config, num_queries = num_queries)
+    with torch.no_grad():
+        layer.query.fill_(fill)
+    stock = getattr(modeling, class_name).forward
+
+    def run(forward, compiled):
+        def outer(block_states, partial):
+            with _autocast("fp16"):
+                outs = forward(layer, block_states, partial)
+            return outs, sum((out.float() * (i + 1)).sum() for i, out in enumerate(outs))
+
+        fn = torch.compile(outer, backend = "aot_eager", fullgraph = True, dynamic = True) if compiled else outer
+        g = torch.Generator().manual_seed(5)
+        block_states = torch.randn(1, 3, 2, hidden, generator = g).abs().requires_grad_()
+        partial = torch.randn(1, 3, hidden, generator = g).abs().requires_grad_()
+        layer.zero_grad(set_to_none = True)
+        outs, loss = fn(block_states, partial)
+        loss.backward()
+        return [o.detach() for o in outs], block_states.grad, partial.grad, layer.query.grad
+
+    torch._dynamo.reset()
+    with kernel:
+        want = run(stock, compiled = False)
+        got = run(decorator(stock), compiled = True)
+    for a, b in zip([*want[0], *want[1:]], [*got[0], *got[1:]]):
+        assert a.isfinite().all()
+        assert b.isfinite().all(), f"{b.isnan().sum().item()} NaN of {b.numel()}"
+        torch.testing.assert_close(b, a, rtol = 1e-3, atol = 1e-3)
+
+
+def test_hooked_norm_keeps_the_original_boundary(monkeypatch):
+    """The op computes the norm inline: a hook on the norm must make the residual fall back to the stock module."""
+    class_name, config_name = _CLASSES["inkling2"]
+    modeling, decorator = _generated_decorator(monkeypatch, "inkling2", class_name)
+    from transformers.models.inkling2.configuration_inkling2 import Inkling2TextConfig
+    config = Inkling2TextConfig(hidden_size = 32)
+    config._attn_implementation = "sdpa"
+    torch.manual_seed(0)
+    layer = getattr(modeling, class_name)(config)
+    with torch.no_grad():
+        layer.query.normal_()
+    stock = getattr(modeling, class_name).forward
+    decorated = decorator(stock)
+    handle = layer.norm.register_forward_hook(lambda module, args, out: out * 0)
+    try:
+        torch._dynamo.reset()
+        fn = torch.compile(lambda b, p: decorated(layer, b, p)[0], backend = "aot_eager")
+        b, p = torch.randn(1, 2, 3, 32), torch.randn(1, 2, 32)
+        want = stock(layer, b, p)[0]
+        assert want.abs().max() == 0  # the hook ran: zero states, uniform attention, zero output
+        torch.testing.assert_close(fn(b, p), want)
+    finally:
+        handle.remove()
