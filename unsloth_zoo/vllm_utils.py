@@ -972,8 +972,13 @@ def patch_vllm_enable_sleep_mode():
     def sleep(
             self,
             offload_tags: Optional[Union[Tuple[str, ...],
-                                            str]] = None) -> None:
+                                            str]] = None,
+            discardable = (),
+            *args, **kwargs) -> None:
         """Sleep mode: offload allocations with offload_tags to CPU, discard the rest."""
+        # vLLM >= 0.34 calls sleep(offload_tags, discardable). `discardable` names weight tensors vLLM may drop
+        # instead of backing up; Unsloth never offloads or frees "weights" (they are shared with training), so it
+        # is accepted and has nothing to act on. *args/**kwargs keep later additions from breaking the call.
         if offload_tags is None:
             # by default, allocated tensors are offloaded on sleep
             offload_tags = (MemAllocator.default_tag, )
@@ -997,6 +1002,9 @@ def patch_vllm_enable_sleep_mode():
             if data.tag == 'weights':
                 # Weights are unsloth-managed; don't offload/delete them here.
                 continue
+            if getattr(data, "is_asleep", False):
+                # vLLM >= 0.34 tracks is_asleep; an already released handle must not be released twice.
+                continue
             if data.tag in offload_tags:
                 size_in_bytes = handle[1]
                 cpu_backup_tensor = torch.empty(
@@ -1011,6 +1019,8 @@ def patch_vllm_enable_sleep_mode():
             logger.debug(f"data's tag is {data.tag} and is offloaded to cpu? {data.tag in offload_tags}")
 
             unmap_and_release(handle)
+            if hasattr(data, "is_asleep"):
+                data.is_asleep = True
             true_offloads += 1
         pass
 
@@ -1026,9 +1036,14 @@ def patch_vllm_enable_sleep_mode():
             if data.tag == "weights":
                 # Weights are unsloth-managed; don't onload/create them here.
                 continue
+            if hasattr(data, "is_asleep") and not data.is_asleep:
+                # vLLM >= 0.34: still mapped, mapping it again would fail.
+                continue
             if tags is None or data.tag in tags:
                 handle = data.handle
                 create_and_map(handle)
+                if hasattr(data, "is_asleep"):
+                    data.is_asleep = False
                 if data.cpu_backup_tensor is not None:
                     cpu_backup_tensor = data.cpu_backup_tensor
                     if cpu_backup_tensor is not None:
