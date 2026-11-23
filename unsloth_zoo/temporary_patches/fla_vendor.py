@@ -1300,6 +1300,27 @@ def _rocm_fp32_on_faulting_gpu(*tensors):
     return False
 
 
+def _import_reference(model, recurrent):
+    """``from ... import`` statements, one per candidate: Dynamo runs these at trace time, while it refuses to trace
+    importlib.import_module (a fullgraph error) and a sys.modules guard the import then changes fails on its frame."""
+    if model == "qwen3_next":
+        if recurrent:
+            from transformers.models.qwen3_next.modeling_qwen3_next import torch_recurrent_gated_delta_rule as fn
+        else:
+            from transformers.models.qwen3_next.modeling_qwen3_next import torch_chunk_gated_delta_rule as fn
+    elif model == "qwen3_5":
+        if recurrent:
+            from transformers.models.qwen3_5.modeling_qwen3_5 import torch_recurrent_gated_delta_rule as fn
+        else:
+            from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule as fn
+    else:
+        if recurrent:
+            from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import torch_recurrent_gated_delta_rule as fn
+        else:
+            from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import torch_chunk_gated_delta_rule as fn
+    return fn
+
+
 def _torch_reference_gated_delta_rule(recurrent = False, import_missing = True):
     """transformers' pure-torch ``torch_chunk_gated_delta_rule`` (or ``torch_recurrent_gated_delta_rule``,
     the kernel-hub fallbacks), unwrapped. The recurrent one decays the state token by token like fla's
@@ -1313,12 +1334,15 @@ def _torch_reference_gated_delta_rule(recurrent = False, import_missing = True):
     for model in ("qwen3_next", "qwen3_5", "qwen3_5_moe"):
         module_name = f"transformers.models.{model}.modeling_{model}"
         try:
-            module = sys.modules.get(module_name)
-            if module is None:
-                if not import_missing:
-                    continue
-                module = importlib.import_module(module_name)
-            fn = getattr(module, name)
+            if import_missing and _compiling():
+                fn = _import_reference(model, recurrent)
+            else:
+                module = sys.modules.get(module_name)
+                if module is None:
+                    if not import_missing:
+                        continue
+                    module = importlib.import_module(module_name)
+                fn = getattr(module, name)
         except Exception:
             continue
         reference = inspect.unwrap(fn)

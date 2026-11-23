@@ -366,6 +366,37 @@ def inspect_unwrap(fn):
     return inspect.unwrap(fn)
 
 
+@pytest.mark.parametrize("entry", ["chunk_gated_delta_rule", "fused_recurrent_gated_delta_rule"])
+def test_gpu_host_cold_reference_first_call_compiles_fullgraph(monkeypatch, entry):
+    """A GPU host defers the reference to the first CPU call. When that first call is a fullgraph compile and no
+    Qwen modeling module is imported, resolving it must not call importlib.import_module, which Dynamo refuses."""
+    package, chunk, recurrent, modeling, calls = _install_fake_fla(monkeypatch)
+    for key in ("reference", "recurrent_reference"):
+        monkeypatch.setitem(fla_vendor._rocm_fp32_state, key, None)
+    for model in ("qwen3_next", "qwen3_5_moe"):
+        name = f"transformers.models.{model}.modeling_{model}"
+        if name in sys.modules:
+            monkeypatch.delitem(sys.modules, name)
+    with monkeypatch.context() as m:
+        m.setattr(torch.cuda, "is_available", lambda: True)
+        _run_patch_vendor_fla(monkeypatch)
+    assert fla_vendor._rocm_fp32_state["reference"] is None
+    q, k, v, g, beta = _inputs(1, 6, 2, 2, 8, 8)
+    fn = getattr(package, entry)
+
+    def layer(q, k, v, g, beta):
+        return fn(q, k, v, g = g, beta = beta, use_qk_l2norm_in_kernel = True)[0] * 2
+
+    torch._dynamo.reset()
+    try:
+        out = torch.compile(layer, backend = "eager", fullgraph = True)(q, k, v, g, beta)
+    finally:
+        torch._dynamo.reset()
+    want, _ = _recurrent_fp64(q, k, v, g, beta, 8 ** -0.5)
+    torch.testing.assert_close(out.double(), 2 * want, atol = 1e-4, rtol = 1e-4)
+    assert calls == []
+
+
 @pytest.mark.parametrize("has_gpu", [True, False])
 def test_install_imports_no_modeling_module_on_a_gpu_host(monkeypatch, has_gpu):
     """Routing the live fla at `import unsloth` must not import transformers' Qwen3-Next modeling on a GPU host (about
