@@ -929,6 +929,13 @@ except Exception:
     _strict_slot = None
 
 
+def saved_attention_skip_slot():
+    """For a caller that keeps an attention call in a strict compile's graph inside a frame (no saving
+    helper): accounts for the call's entry so the other pass lines up even if it runs eagerly."""
+    if _strict_slot is not None and getattr(_TLS, "frame", None) is not None:
+        _strict_slot(_SLOT_TOKEN, torch.is_grad_enabled())
+
+
 def _rocm_without_frame():
     # ROCm: a call outside any frame (no Unsloth checkpoint, or a device whose SDPA keeps nothing) stays
     # in the caller's graph instead of reaching the compiler-disabled helpers, which a fullgraph=True
@@ -947,8 +954,7 @@ def _rocm_without_frame():
         return False
     if not _strict_trace():
         return False
-    if _strict_slot is not None:
-        _strict_slot(_SLOT_TOKEN, torch.is_grad_enabled())
+    saved_attention_skip_slot()
     return True
 
 
