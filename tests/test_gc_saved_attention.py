@@ -773,8 +773,7 @@ def test_auto_declines_everything_without_headroom(monkeypatch, auto):
 
 
 def test_auto_peak_reading_charges_kept_bytes_exactly(monkeypatch, auto):
-    """A peak reached while outputs are kept must not be learnt as the run's own peak (that would
-    shrink the budget every step until nothing is kept)."""
+    """Kept-output peaks must not be learnt as the run's peak: the budget shrinks each step."""
     params, x = _make()
     _fake_memory(monkeypatch, base_peak = 1 << 20, capacity = 1 << 30)
     _run(params, x, ckpt = True, steps = 4)
@@ -895,3 +894,36 @@ def test_auto_measures_each_device_separately(monkeypatch, auto):
     assert SA._auto_admit(SA.SavedAttentionFrame(auto = True), [long_cpu])
     assert SA._auto_admit(SA.SavedAttentionFrame(auto = True), [short_meta])
     assert not SA._auto_admit(SA.SavedAttentionFrame(auto = True), [long_meta])  # never measured at this size there
+
+
+def test_rejected_function_graph_is_freed_before_backward(monkeypatch):
+    """A refused first-pass graph (too big here, random likewise) is never backpropagated: its saved tensors
+    must not hold it. sigmoid saves its own output, which an identity pack hook makes hold its own node."""
+    import gc
+
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    params, x = _make(n_layers = 1)
+    first_pass = []
+
+    def attention(q, k, v):
+        gate = torch.sigmoid(q * 1.0)
+        first_pass.append(StorageWeakRef(gate.untyped_storage()))
+        return _sdpa(gate, (k * 1.0).repeat(1, 1, 1, 1), (v * 1.0).repeat(1, 1, 1, 1))
+
+    call = lambda fn, q, k, v: SA.saved_function_call(fn, 3, q, k, v)  # noqa: E731
+    monkeypatch.setattr(SA, "_FUNCTION_SLACK_BYTES", 0)
+    full = _run(params, x, ckpt = True, attention = attention)
+    first_pass.clear()
+    monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
+    for w in params:
+        for p in w:
+            p.grad = None
+    h = x.clone().requires_grad_()
+    h = G.UnslothCheckpointFunction.apply(_layer(params[0], attention, call), True, h)
+    gc.collect()
+    assert SA.SAVED_ATTENTION_STATS["too_big"] == 1 and len(first_pass) == 1
+    assert first_pass[0].expired(), "the refused first-pass graph outlived the forward"
+    h.float().pow(2).mean().backward()
+    for a, b in zip([p.grad for p in params[0]], full[1]):
+        torch.testing.assert_close(a, b, rtol = 1e-4, atol = 1e-6)

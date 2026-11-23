@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Lossless bf16 codec for block swap fetches (unsloth_zoo/block_swap_codec.py): exact round trips on CPU, and on
-a GPU the decode kernel, its torch fallback and BlockSwap with UNSLOTH_BLOCK_SWAP_COMPRESS=1 against raw fetches.
-Loaded from file, like test_block_swap.py."""
+"""Lossless bf16 block swap codec (unsloth_zoo/block_swap_codec.py): CPU round trips; GPU decode
+kernel, torch fallback and BlockSwap with UNSLOTH_BLOCK_SWAP_COMPRESS=1 match raw fetches."""
 
 import importlib.util
 import os

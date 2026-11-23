@@ -24,6 +24,8 @@ __all__ = [
 ]
 
 from typing import Union, Callable, Optional, List, Dict
+import contextlib as _contextlib
+import functools as _functools
 import itertools as _itertools
 import json as _json
 from bisect import bisect_left as _bisect_left
@@ -805,6 +807,53 @@ pass
 
 def _rebuild_response_masker(arguments):
     return train_on_responses_only(None, **arguments)
+pass
+
+
+@_contextlib.contextmanager
+def rank_zero_first(dataset):
+    """On a multi-rank run, rank 0 runs the body first and the other ranks after it, so their
+    `map` calls load the Arrow cache rank 0 wrote instead of recomputing it (the window TRL's own
+    `_prepare_dataset` runs in). Only for a file-backed split: an in-memory one writes no cache,
+    so waiting would just serialise the ranks. Rank 0 reaches the barrier even when the body
+    raises, so the other ranks run it and raise too instead of hanging at the barrier."""
+    try:
+        import torch.distributed as dist
+        active = (
+            dist.is_available()
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+            and bool(getattr(dataset, "cache_files", None))
+        )
+    except Exception:
+        active = False
+    if not active:
+        yield
+        return
+    is_main = dist.get_rank() == 0
+    if not is_main:
+        dist.barrier()
+    try:
+        yield
+    finally:
+        if is_main:
+            dist.barrier()
+pass
+
+
+def rank_zero_first_prepare(prepare):
+    """Wrap a trainer's `_prepare_dataset(dataset, ...)` in `rank_zero_first(dataset)`."""
+    if getattr(prepare, "_unsloth_rank_zero_first", False):
+        return prepare
+
+    @_functools.wraps(prepare)
+    def prepare_rank_zero_first(*args, **kwargs):
+        dataset = args[0] if args else kwargs.get("dataset")
+        with rank_zero_first(dataset):
+            return prepare(*args, **kwargs)
+
+    prepare_rank_zero_first._unsloth_rank_zero_first = True
+    return prepare_rank_zero_first
 pass
 
 
@@ -2334,12 +2383,14 @@ def train_on_responses_only(
                 columns = getattr(dataset, "_format_columns", fmt.get("columns")),
                 output_all_columns = fmt.get("output_all_columns", False),
             )
-        dataset = _maybe_tokenize_dataset(dataset)
-        if isinstance(dataset, IterableDataset):
-            dataset = dataset.map(_train_on_responses_only, batch_size = _iterable_batch_size(dataset), batched = True)
-        else:
-            dataset = dataset.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(dataset))
-        return _filter_fully_masked(dataset, dataset_name)
+        # Rank 0 first on a file-backed split: the other ranks then load its cached maps.
+        with rank_zero_first(dataset):
+            dataset = _maybe_tokenize_dataset(dataset)
+            if isinstance(dataset, IterableDataset):
+                dataset = dataset.map(_train_on_responses_only, batch_size = _iterable_batch_size(dataset), batched = True)
+            else:
+                dataset = dataset.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(dataset))
+            return _filter_fully_masked(dataset, dataset_name)
     pass
 
     # Map both splits before assigning: a raise on eval must not leave train half-masked for a retry.

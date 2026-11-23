@@ -66,6 +66,8 @@ def test_flags_declared_on_both_classes():
         klass = getattr(importlib.import_module(module_name), class_name)
         assert klass._unsloth_own_apply_gate is True
         assert klass._unsloth_moe_fp32_reference is True
+        # Training reads the frozen 4-bit stacks in bounded chunks (a whole Mini gate_up stack is 1.27 GiB).
+        assert 0 < klass._unsloth_dequant_scratch_fraction < 0.1
 
 
 @pytest.mark.parametrize("loop", [True, False])
@@ -117,9 +119,8 @@ def _dense_nf4(p):
 @pytest.mark.parametrize("T", [1, 4])
 @pytest.mark.parametrize("use_lora", [False, True])
 def test_nf4_decode_routes_only_the_routed_experts(loop, T, use_lora, monkeypatch):
-    # Decode used to decline own-gate experts and dequantize all experts of every layer per token (real Mini 4-bit on an
-    # A100: 2.28 tok/s vs 3.09 for transformers bf16). The routed path must engage and match the dense softcapped
-    # reference on the same dequantized weights, as the current path does.
+    # Decode must route own-gate experts instead of dequantizing all experts per token, and match
+    # the dense softcapped reference on the same dequantized weights.
     pytest.importorskip("triton")
     from unsloth_zoo.temporary_patches import moe_routed as MR
     from unsloth_zoo.temporary_patches import moe_utils as MU

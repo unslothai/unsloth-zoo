@@ -111,10 +111,9 @@ _WARNED_KEEP_LOW_MEMORY = False
 # smaller than host RAM there (a GTT limit, a partial carve-out), so a run that only fits with offload keeps fitting.
 KEEP_ON_DEVICE_HEADROOM_MIN  = 2 * 1024 * 1024 * 1024
 KEEP_ON_DEVICE_HEADROOM_FRAC = 0.05
-# device_index -> [free bytes at the last read, torch allocated bytes at that read, headroom, calls since the read].
-# Free memory is projected as the last read minus everything torch allocated since (activations, optimizer state
-# created after step 1, ...), read from the allocator's host-side counter. mem_get_info (no sync) is re-read when
-# the projection nears the headroom and every _KEEP_BUDGET_REFRESH calls, so memory taken outside torch is seen too.
+# _KEEP_BUDGET maps device_index to [free bytes at last read, torch allocated then, headroom, calls
+# since]; free is projected as last read minus later torch allocations, and mem_get_info (no sync)
+# is re-read near headroom or every _KEEP_BUDGET_REFRESH calls so outside allocations are seen.
 _KEEP_BUDGET = {}
 _KEEP_BUDGET_REFRESH = 256
 
@@ -973,7 +972,7 @@ MOE_GC_ROUTING_STATS = collections.Counter()   # stored / reused / mismatch / un
 class CheckpointRoutingFrame:
     """First-pass routing in call order. Kept for the checkpoint context's lifetime and read through a cursor reset
     at each replay, so a second backward (retain_graph) replays the same routing."""
-    __slots__ = ("entries", "cursor", "replaying", "current", "kept", "__weakref__")
+    __slots__ = ("entries", "cursor", "replaying", "current", "kept", "dequant_chunks", "__weakref__")
 
     def __init__(self):
         self.entries = []
@@ -981,6 +980,7 @@ class CheckpointRoutingFrame:
         self.replaying = False
         self.current = None   # entry index of the MoE call being routed now (moe_checkpoint_call)
         self.kept = {}        # first-pass frozen base expert outputs the replay reuses (moe_gc_keep_base)
+        self.dequant_chunks = {}   # first-pass expert dequant chunk decisions the replay reuses (moe_utils)
 
 
 def _new_checkpoint_routing_frame(tensors):
@@ -2686,8 +2686,11 @@ class NonReentrantActivationOffloader:
     pass
 
     def pack(self, x):
-        if not x.requires_grad or self._on_host(x):
+        if not x.requires_grad:
             return None, x
+        if self._on_host(x):
+            # Detached like the keep branches below: a CPU op saving its own output would hold itself.
+            return None, x.detach()
         # Traced: offload as before (the budget check reads allocator state).
         if self.keep_on_device and x.device.index in self.keep_on_device and not _is_compiling():
             nbytes = x.numel() * x.element_size()

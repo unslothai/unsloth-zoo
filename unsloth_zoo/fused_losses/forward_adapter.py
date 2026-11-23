@@ -27,6 +27,7 @@ from __future__ import annotations
 __all__ = [
     "EMPTY_LOGITS",
     "lm_head_fake_quantize",
+    "lm_head_needs_module_forward",
     "unsloth_fused_lm_head_loss",
 ]
 
@@ -35,7 +36,7 @@ import inspect
 import torch
 
 from . import cross_entropy_loss as _ce
-from .cross_entropy_loss import unsloth_fsdp_unshard, unsloth_fused_ce_loss
+from .cross_entropy_loss import lm_head_needs_module_forward, unsloth_fsdp_unshard, unsloth_fused_ce_loss
 
 
 EMPTY_LOGITS = torch.empty(0)
@@ -44,7 +45,7 @@ EMPTY_LOGITS = torch.empty(0)
 _KERNEL_KWARGS = frozenset(_ce._FUSED_LINEAR_CE_KWARGS) | frozenset(("n_chunks",)) | frozenset(
     inspect.signature(_ce.unsloth_fused_ce_loss).parameters
 ) - frozenset(("trainer", "hidden_states", "lm_head_weight", "lm_head_bias", "labels", "n_items", "shift_labels",
-               "kwargs"))
+               "lm_head_module", "kwargs"))
 
 
 def lm_head_on_old_cuda_arch(weight):
@@ -53,10 +54,15 @@ def lm_head_on_old_cuda_arch(weight):
 
 
 def lm_head_fake_quantize(lm_head, hidden_states):
-    """(hidden_states, weight) after the TorchAO QAT QDQ that lm_head.forward() applies and fused CE skips."""
-    weight = lm_head.weight
+    """(hidden_states, weight) after the TorchAO QAT QDQ that lm_head.forward() applies and fused CE skips.
+    A head the loss scores through its own forward (lm_head_needs_module_forward) gets raw activations and None."""
     if type(lm_head) is torch.nn.Linear:
-        return hidden_states, weight
+        return hidden_states, lm_head.weight
+    if lm_head_needs_module_forward(lm_head):
+        # The loss calls lm_head(hidden_states), whose (per-row) heads fake-quantize once themselves; no weight
+        # read either, which on a TrainableTokensWrapper would build the merged [V, H] weight for nothing.
+        return hidden_states, None
+    weight = lm_head.weight
     activation_fake_quantizer = getattr(lm_head, "activation_fake_quantizer", None)
     if activation_fake_quantizer is not None:
         hidden_states = activation_fake_quantizer(hidden_states)
@@ -131,6 +137,7 @@ def unsloth_fused_lm_head_loss(
         labels         = target,
         n_items        = n_items,
         shift_labels   = do_shift,
+        lm_head_module = lm_head,
         **kwargs,
     )
     # The autograd.Function output is a view; MoE forwards then do an in-place

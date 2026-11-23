@@ -20,6 +20,7 @@ gfx1151 (tiny Gemma-3 trained at 24 tokens after a 32 token step). No-grad calls
 Runs on CPU with HIP simulated: real Dynamo with a recording backend, flex replaced by a math attention (CPU flex has
 no backward), the ROCm device check widened to CPU tensors where a test needs it."""
 
+import inspect
 import os
 import subprocess
 import sys
@@ -29,6 +30,9 @@ import torch
 
 flex_module = pytest.importorskip("transformers.integrations.flex_attention")
 pytest.importorskip("torch.nn.attention.flex_attention")
+
+# The rocm fixture records torch.compile; torch 2.13+ takes a per-call recompile_limit.
+_REAL_TORCH_COMPILE = torch.compile
 
 
 def _unwrap(fn):
@@ -162,6 +166,128 @@ def test_enclosing_graph_with_a_strictly_dynamic_input_is_left_alone(rocm):
     assert graphs and all(symbolic for _, _, symbolic in graphs)
 
 
+def _batched_layer():
+    w = torch.randn(8, 8, requires_grad = True)
+
+    def layer(x):
+        q = (x @ w).unsqueeze(1)
+        return flex_module.compile_friendly_flex_attention(q, q, q, training = True)
+    return torch.compile(layer, fullgraph = True)
+
+
+def test_enclosing_graph_keeps_a_dynamic_batch_symbolic(rocm):
+    # Block compile marks the block batch maybe_mark_dynamic (#15106): only the sequence length may be specialized,
+    # else every batch size is a new block graph and eats the block's isolate_recompiles budget.
+    graphs, install = rocm
+    install()
+    compiled = _batched_layer()
+    for batch in (2, 3, 4, 5):
+        x = torch.randn(batch, 32, 8)
+        torch._dynamo.maybe_mark_dynamic(x, 0)
+        compiled(x).sum().backward()
+    assert len(graphs) == 1 and all(symbolic for _, _, symbolic in graphs), graphs
+
+
+def test_enclosing_graph_compiles_once_per_length_not_per_batch_and_length(rocm):
+    graphs, install = rocm
+    install()
+    compiled = _batched_layer()
+    for length in (32, 24, 40):
+        for batch in (2, 3):
+            x = torch.randn(batch, length, 8)
+            torch._dynamo.maybe_mark_dynamic(x, 0)
+            compiled(x).sum().backward()
+    assert len(graphs) == 3, graphs
+
+
+def test_strictly_dynamic_batch_still_specializes_the_length(rocm):
+    # mark_dynamic on the batch only: the length is not derived from it, so it is still made static.
+    graphs, install = rocm
+    install()
+    compiled = _batched_layer()
+    for length in (32, 24, 40):
+        x = torch.randn(2, length, 8)
+        torch._dynamo.mark_dynamic(x, 0)
+        compiled(x).sum().backward()
+    assert len(graphs) == 3 and all(symbolic for _, _, symbolic in graphs), graphs
+
+
+@pytest.fixture
+def stats(monkeypatch):
+    from unsloth_zoo import rocm_flex_static
+    monkeypatch.setattr(rocm_flex_static, "ROCM_FLEX_STATIC_STATS", dict.fromkeys(rocm_flex_static.ROCM_FLEX_STATIC_STATS, 0))
+    monkeypatch.setattr(rocm_flex_static, "_WARNED", set())
+    return rocm_flex_static
+
+
+def test_engagement_counters(rocm, stats):
+    graphs, install = rocm
+    fn = install()
+    for length in (32, 24):
+        fn(*_qkv(length), training = True)[0].sum().backward()
+    assert stats.ROCM_FLEX_STATIC_STATS["static_calls"] == 2
+    compiled = _batched_layer()
+    for length in (32, 24, 40):
+        compiled(torch.randn(2, length, 8)).sum().backward()
+    counts = stats.ROCM_FLEX_STATIC_STATS
+    # The first trace is static already (nothing to specialize); the next two carry a symbolic length.
+    assert counts["specialized"] == 2 and counts["failed"] == 0 and counts["left_dynamic"] == 0, counts
+
+
+def test_strictly_dynamic_length_is_counted_and_warned(rocm, stats):
+    graphs, install = rocm
+    install()
+    compiled = _batched_layer()
+    with pytest.warns(RuntimeWarning, match = "stays symbolic"):
+        for length in (32, 24):
+            x = torch.randn(1, length, 8)
+            torch._dynamo.mark_dynamic(x, 1)
+            compiled(x).sum().backward()
+    assert stats.ROCM_FLEX_STATIC_STATS["left_dynamic"] >= 1
+
+
+def test_warnings_as_errors_do_not_fail_the_trace(rocm, stats):
+    # -W error::RuntimeWarning: the trace-time diagnostic is logged instead of raising inside Dynamo.
+    import warnings
+
+    graphs, install = rocm
+    install()
+    compiled = _batched_layer()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        for length in (32, 24):
+            x = torch.randn(1, length, 8)
+            torch._dynamo.mark_dynamic(x, 1)
+            compiled(x).sum().backward()
+    counts = stats.ROCM_FLEX_STATIC_STATS
+    assert counts["left_dynamic"] >= 1 and counts["failed"] == 0, counts
+
+
+def test_moved_dynamo_internals_warn_once_instead_of_failing_silently(rocm, stats, monkeypatch):
+    graphs, install = rocm
+    install()
+
+    def moved(ctx):
+        raise AttributeError("_ComptimeContext__tx")
+    monkeypatch.setattr(stats, "_strict_symbols", moved)
+    compiled = _batched_layer()
+    with pytest.warns(RuntimeWarning, match = "could not make flex_attention sequence lengths static") as record:
+        for length in (32, 24, 40):
+            compiled(torch.randn(1, length, 8)).sum().backward()
+    assert len([w for w in record if "could not make" in str(w.message)]) == 1
+    # The symbolic length is kept (one graph serves 24 and 40), as on a torch whose internals moved.
+    assert stats.ROCM_FLEX_STATIC_STATS["failed"] == 1 and stats.ROCM_FLEX_STATIC_STATS["specialized"] == 0
+    assert len(graphs) == 2 and graphs[-1][2], graphs
+
+
+def test_missing_comptime_warns_at_install(rocm, stats, monkeypatch):
+    graphs, install = rocm
+    monkeypatch.setattr(stats, "_comptime", None)
+    with pytest.warns(RuntimeWarning, match = "comptime is unavailable"):
+        install()
+    assert stats.ROCM_FLEX_STATIC_STATS["failed"] == 1
+
+
 def test_helper_imported_before_the_patch_is_covered(rocm):
     # modeling_doge imports compile_friendly_flex_attention by name.
     graphs, install = rocm
@@ -231,13 +357,62 @@ def test_static_compile_has_room_for_many_lengths(rocm):
         fn = install()
         for length in range(16, 28):
             fn(*_qkv(length), training = True)
-        assert getattr(config, name) >= 1024
         assert len(_static(graphs)) == 12, "every length compiled, none fell back to eager"
+        if "recompile_limit" in inspect.signature(_REAL_TORCH_COMPILE).parameters:
+            # The static compile has its own limit and the process-wide one is left alone.
+            assert getattr(config, name) == 8
+            assert all(kwargs.get("recompile_limit") == 1024 for _, kwargs, _ in _static(graphs))
+        else:
+            assert getattr(config, name) >= 1024
         set_torch_config(config, name, 4096)
         _raise_recompile_budget()
         assert getattr(config, name) == 4096, "a larger limit is never lowered"
     finally:
         set_torch_config(config, name, before)
+
+
+def test_static_compile_keeps_a_higher_configured_limit(rocm):
+    from unsloth_zoo.torch_config import set_torch_config
+
+    if "recompile_limit" not in inspect.signature(_REAL_TORCH_COMPILE).parameters:
+        pytest.skip("torch.compile takes no per-call recompile_limit before torch 2.12")
+    graphs, install = rocm
+    config = torch._dynamo.config
+    before = config.recompile_limit
+    try:
+        set_torch_config(config, "recompile_limit", 4096)
+        fn = install()
+        fn(*_qkv(16), training = True)
+        assert [kwargs.get("recompile_limit") for _, kwargs, _ in _static(graphs)] == [4096]
+        assert config.recompile_limit == 4096
+    finally:
+        set_torch_config(config, "recompile_limit", before)
+
+
+def test_static_compile_budget_is_never_below_the_configured_one(monkeypatch):
+    # Real Dynamo with the floor scaled down to 2: a configured limit of 4 must still compile 4 lengths.
+    from torch._dynamo.testing import CompileCounter
+    from unsloth_zoo import rocm_flex_static
+
+    if "recompile_limit" not in inspect.signature(_REAL_TORCH_COMPILE).parameters:
+        pytest.skip("torch.compile takes no per-call recompile_limit before torch 2.12")
+    monkeypatch.setattr(rocm_flex_static, "_RECOMPILE_FLOOR", 2)
+    count = CompileCounter()
+    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: _REAL_TORCH_COMPILE(fn, backend = count, **kwargs))
+
+    def entry(q):
+        return q.sin()
+
+    torch._dynamo.reset()
+    try:
+        with torch._dynamo.config.patch(recompile_limit = 4):
+            compiled = rocm_flex_static.compile_static_flex(entry)
+            for length in (5, 6, 7, 8):
+                compiled(torch.ones(length))
+            assert torch._dynamo.config.recompile_limit == 4
+        assert count.frame_count == 4
+    finally:
+        torch._dynamo.reset()
 
 
 def test_static_entry_has_its_own_code_object(rocm):
@@ -355,7 +530,7 @@ def test_zoo_flex_wrapper_dispatch(monkeypatch):
     with torch.no_grad():
         fn(*_qkv(8))
     fn(*_qkv(8, grad = False))
-    assert calls == ["static", "auto", "auto"] and compiled == [{"dynamic": False}]
+    assert calls == ["static", "auto", "auto"] and [c["dynamic"] for c in compiled] == [False]
     monkeypatch.setattr(torch.version, "hip", None, raising = False)
     assert rocm_flex_static.rocm_static_flex(auto, entry) is auto
 
@@ -376,7 +551,7 @@ def test_shared_flex_compile_gets_the_static_variant():
         "import types, torch, unsloth_zoo\n"
         "torch.version.hip = '7.13.0'\n"
         "torch.cuda.device_count = lambda: 1\n"
-        "torch.cuda.get_device_properties = lambda i: types.SimpleNamespace(total_memory = 64 << 30)\n"
+        "torch.cuda.get_device_properties = lambda i: types.SimpleNamespace(total_memory = 64 << 30, gcnArchName = 'gfx1151', name = 'AMD Radeon 8060S', major = 11, minor = 5)\n"
         "import unsloth_zoo.flex_attention.utils as u\n"
         "assert u.HAS_FLEX_ATTENTION\n"
         "print(bool(getattr(u.flex_attention, '_unsloth_rocm_static', False)))\n"
@@ -389,6 +564,19 @@ def test_shared_flex_compile_gets_the_static_variant():
     out = subprocess.run([sys.executable, "-c", code], capture_output = True, text = True, env = env, cwd = root)
     assert out.returncode == 0, out.stderr[-2000:]
     assert out.stdout.strip().splitlines()[-1] == "True"
+
+
+def test_the_short_query_guard_keeps_the_rocm_static_marker():
+    """Triton without block pointers (torch 2.10 with Triton 3.9) re-wraps the exported flex for short queries; the
+    static variant is still inside, and the marker must say so or rocm_static_flex would wrap the call site again."""
+    from unsloth_zoo.flex_attention import utils
+
+    def static(*args, **kwargs):
+        return kwargs
+
+    static._unsloth_rocm_static = True
+    assert utils._main_kernel_for_short_queries(static, {})._unsloth_rocm_static is True
+    assert not hasattr(utils._main_kernel_for_short_queries(lambda *a, **k: k, {}), "_unsloth_rocm_static")
 
 
 def test_sparse_backward_probe_runs_once_per_length(monkeypatch):

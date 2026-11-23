@@ -13,12 +13,10 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Inkling 2 (inkling2 / inkling2_loop, transformers >= 5.24) MoE experts.
-
-Their activation is a softcapped SwiGLU, `tanh(g / c_g) * c_g * sigmoid(g) * tanh(u / c_u) * c_u`, taking gate AND up
-(`act_fn(gate, up)`), with the routed outputs accumulated in fp32. The generic MoE backends call `act_fn(gate) * up`
-unless the experts declare their own `_apply_gate`, so declare it, and the fp32 reference, on both expert classes.
-"""
+"""Inkling 2 (inkling2 / inkling2_loop, transformers >= 5.24) MoE experts: softcapped SwiGLU over
+gate and up, tanh(g / c_g) * c_g * sigmoid(g) * tanh(u / c_u) * c_u, with fp32 routed outputs;
+both expert classes and fp32 reference must declare _apply_gate, else generic backends use
+act_fn(gate) * up."""
 
 import contextlib
 import functools
@@ -32,10 +30,17 @@ from .utils import UNSLOTH_DECODE_COMPILE, logger, torch_compiler_disable_unless
 __all__ = [
     "patch_inkling2_moe_experts",
     "INKLING2_EXPERT_CLASSES",
+    "INKLING2_DEQUANT_SCRATCH_FRACTION",
     "inkling2_residual_eager_unless_decode",
     "inkling2_block_residual_reference",
     "inkling2_block_residual_op",
 ]
+
+# Training dequantizes a frozen 4-bit expert stack per projection call: a whole Mini gate_up stack is 1.27 GiB, a
+# Small one 16 GiB. Where a stack exceeds twice this share of the card and does not fit the free memory, read it in
+# chunks of at most this share (moe_utils._auto_dequant_chunk_experts); the chunks give the whole-stack values bit
+# for bit.
+INKLING2_DEQUANT_SCRATCH_FRACTION = 0.025
 
 INKLING2_EXPERT_CLASSES = (
     ("transformers.models.inkling2.modeling_inkling2", "Inkling2Experts"),
@@ -56,6 +61,7 @@ def patch_inkling2_moe_experts():
             continue
         klass._unsloth_own_apply_gate = True
         klass._unsloth_moe_fp32_reference = True
+        klass._unsloth_dequant_scratch_fraction = INKLING2_DEQUANT_SCRATCH_FRACTION
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: {class_name} uses its own softcapped SwiGLU in the MoE backends.")
 

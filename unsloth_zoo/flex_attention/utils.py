@@ -565,6 +565,9 @@ def _main_kernel_for_short_queries(flex_attention_fn, forced_options):
             args = args[:position] + args[position + 1:]
         kwargs["kernel_options"] = _main_kernel_options(kwargs.get("kernel_options"), forced_options)
         return flex_attention_fn(*args, **kwargs)
+    # Only the ROCm static marker, so rocm_static_flex still sees this call site as wrapped and does not wrap it twice.
+    if getattr(flex_attention_fn, "_unsloth_rocm_static", False):
+        flex_attention._unsloth_rocm_static = True
     return flex_attention
 
 

@@ -285,9 +285,8 @@ _MOE_UTILS = "unsloth_zoo.temporary_patches.moe_utils"
 
 @_pytest.fixture(autouse = True)
 def _restore_selected_moe_backend():
-    """select_moe_backend() caches its pick for the process. A test that forces UNSLOTH_MOE_BACKEND=grouped_mm or
-    spoofs a CUDA card hands that pick to later tests on the same worker, and on a CPU runner their MoE forward then
-    raises 'torch._grouped_mm is not supported'."""
+    """select_moe_backend() caches its pick per process; forcing UNSLOTH_MOE_BACKEND=grouped_mm or
+    spoofing CUDA leaks it to later CPU tests, raising 'torch._grouped_mm is not supported'."""
     module = sys.modules.get(_MOE_UTILS)
     before = getattr(module, "_SELECTED_MOE_BACKEND", None)
     yield

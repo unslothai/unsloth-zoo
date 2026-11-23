@@ -804,6 +804,9 @@ def saved_function_call(function, n_inputs, *args, **kwargs):
             for i, leaf in enumerate(leaves):
                 if _same_view_of(t, leaf):
                     return ("leaf", i, t.shape, t.stride(), t.storage_offset() - leaf.storage_offset())
+            # Detached: a rejected graph (random / too big) is never backpropagated, and an op saving its
+            # own output would hold itself through its grad_fn.
+            t = t.detach()
             kept.append(t)
             return t
 

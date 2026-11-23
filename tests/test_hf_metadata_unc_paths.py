@@ -14,11 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Repo metadata (model_index.json keys, modules.json paths) must never name a probed path outside the snapshot.
-
-On Windows `snapshot_dir / r"\\\\host\\share"` is the UNC path itself, and probing it opens an SMB connection that
-sends the user's NTLM hash. The join is POSIX here, so the test records which names get probed instead.
-"""
+"""Repo metadata (model_index.json keys, modules.json paths) must never name a probed path outside
+the snapshot: on Windows a UNC name becomes the probed path and opens an SMB connection that
+sends the user's NTLM hash; the join is POSIX here, so the test records probed names instead."""
 import json
 from pathlib import Path
 
