@@ -235,3 +235,20 @@ def test_fp16_with_a_grad_scaler_stays_chunked(monkeypatch):
     got, engaged = _fp16_case(monkeypatch, chunked = True, scaling = 1024.0)
     assert engaged == 1
     assert all(g <= 1.5 * w + 2e-3 for g, w in zip(got, want)), (got, want)
+
+
+@pytest.mark.parametrize("hook_name", ["_adapter_names_pre_forward_hook", "_alora_offsets_pre_forward_hook"])
+def test_per_example_head_hooks_keep_the_all_rows_forward(hook_name, monkeypatch):
+    # PEFT's adapter_names / aLoRA offsets hooks index the original batch and positions, not row chunks.
+    head = _head()
+    hidden = torch.randn(B, T, H, dtype = torch.float64, requires_grad = True)
+    hook = lambda module, args, kwargs: None  # noqa: E731
+    hook.__name__ = hook_name
+    handle = head.register_forward_pre_hook(hook, with_kwargs = True)
+    try:
+        *_, n = _run(head, hidden, _labels(), True, 4, monkeypatch = monkeypatch)
+    finally:
+        handle.remove()
+    assert n == 0
+    *_, n = _run(head, hidden, _labels(), True, 4, monkeypatch = monkeypatch)
+    assert n == 1

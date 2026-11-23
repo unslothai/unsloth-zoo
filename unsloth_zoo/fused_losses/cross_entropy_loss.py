@@ -969,6 +969,9 @@ def _fp16_without_scaler(lm_head, hidden_states, scaling):
         return device_type != "cpu" and torch.get_autocast_gpu_dtype() == torch.float16
 
 
+_PER_EXAMPLE_HEAD_HOOKS = ("_adapter_names_pre_forward_hook", "_alora_offsets_pre_forward_hook")
+
+
 def _module_head_chunkable(lm_head, base, hidden_states, n_targets, scaling):
     """True when lm_head(h)[rows] == lm_head(h[rows]) and one call per chunk changes nothing else."""
     # A trace keeps the traceable all-rows forward (no new graph break).
@@ -983,8 +986,9 @@ def _module_head_chunkable(lm_head, base, hidden_states, n_targets, scaling):
         if isinstance(module, torch.nn.modules.dropout._DropoutNd) and module.training and module.p > 0:
             return False
         for hook in module._forward_pre_hooks.values():
-            if getattr(getattr(hook, "func", hook), "__name__", "") == "_adapter_names_pre_forward_hook":
-                return False  # adapter_names index whole examples
+            # adapter_names / aLoRA offsets index the original batch and positions, not flattened row chunks
+            if getattr(getattr(hook, "func", hook), "__name__", "") in _PER_EXAMPLE_HEAD_HOOKS:
+                return False
     for param in lm_head.parameters():
         # FSDP2 / ZeRO-3 shards gather and reduce in the head's own hooks, once per forward.
         if hasattr(param, "ds_id") or type(param).__name__ == "DTensor":
