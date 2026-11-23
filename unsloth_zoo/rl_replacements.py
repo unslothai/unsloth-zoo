@@ -4094,6 +4094,9 @@ def grpo_accumulated_loss(
         # Skip PG under vLLM (fast_inference=True): rollout dominates the step, so the
         # saving is small and the first-use self-verify is net overhead.
         _pg_engage = bool(_pg_funcs) and not getattr(trainer, "use_vllm", False) and not _need_entropy
+        # Collective forwards (sharded FSDP2): PG's layout and verify forward are rank-local, so ranks would
+        # run different forward counts. Its own line: unsloth rewrites the one above.
+        _pg_engage = _pg_engage and not _collective_forwards
 
         # ---- PrefixGrouper (GRPO shared-prompt dedup; UNSLOTH_GRPO_PREFIX_GROUPER=0 disables) ----
         # Each prompt's G completions share the prefix; PG forwards it once + the G suffixes
@@ -4164,6 +4167,9 @@ def grpo_accumulated_loss(
                 if _pg_unsafe is None:
                     _pg_unsafe = set()
                 if _pg_layout is not None and _pg_layout.signature in _pg_unsafe:
+                    _pg_layout = None
+                elif _pg_layout is not None and _pg_layout.flat_ids.shape[1] > batch_size * input_ids.shape[1]:
+                    # Over one padded mini-batch's tokens: the chunked loop keeps the mini-batch cap.
                     _pg_layout = None
                 elif _pg_layout is not None:
                     _pg_layout.W = logits_to_keep + max_left_pad
@@ -4241,6 +4247,8 @@ def grpo_accumulated_loss(
                 # skip the whole packed forward for a known-unsafe length region (a prior moderate mismatch or a
                 # packed OOM), before the flatten and the active-row read, so a capped batch costs one sync
                 _pack_capped = _pack_unsafe is not None and _pack_T >= _pack_unsafe
+                # Over one padded [batch_size, L] mini-batch's tokens: the chunked loop keeps the mini-batch cap.
+                _pack_capped = _pack_capped or _pack_T > batch_size * _pack_L
                 if not _pack_capped:
                     _pack_nz_idx = grpo_nonzero_static(_pack_keep, _pack_T)     # [T, 2] = (row, col)
                     _pack_flat_ids = input_ids[_pack_nz_idx[:, 0], _pack_nz_idx[:, 1]].unsqueeze(0)

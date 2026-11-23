@@ -111,6 +111,7 @@ def _run(model, input_ids, **overrides):
         ),
         "logits_to_keep": KEEP,
         "total_rows": input_ids.shape[0],
+        "batch_size": input_ids.shape[0],
         "multiplier": 1,
         "autocaster": contextlib.nullcontext(),
         "pixel_values": None, "token_type_ids": None, "mm_token_type_ids": None,
