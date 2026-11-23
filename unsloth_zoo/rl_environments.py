@@ -584,8 +584,7 @@ class _SafeModule:
                     f"Access to module '{dotted}' is not allowed in generated code."
                 )
             return _SafeModule(value, dotted)
-        # Module-level registries are host state (`copy.dispatch_table[cls] = f` rewires every later copy.copy in the
-        # process), so generated code gets a read-only view; item stores and .update()/.pop() both fail.
+        # Registries are host state (`copy.dispatch_table[cls] = f` rewires every copy.copy): read-only view.
         if type(value) is dict:
             return types.MappingProxyType(value)
         if type(value) in (list, set, bytearray):
