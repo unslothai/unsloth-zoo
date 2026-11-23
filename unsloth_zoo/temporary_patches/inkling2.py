@@ -33,6 +33,7 @@ __all__ = [
     "INKLING2_EXPERT_CLASSES",
     "inkling2_residual_eager_unless_decode",
     "inkling2_block_residual_reference",
+    "inkling2_block_residual_op",
 ]
 
 INKLING2_EXPERT_CLASSES = (
@@ -76,26 +77,48 @@ def inkling2_block_residual_reference(block_states, partial_block_states, query,
     return torch.matmul(torch.softmax(scores, dim = -1, dtype = torch.float32), stacked)
 
 
+def _autocast_state(device_type):
+    # The caller's autocast for this device. The op body runs below the dispatcher's autocast handling and, compiled,
+    # outside the enclosing autocast region, so the state is passed in and re-entered explicitly.
+    try:
+        return torch.is_autocast_enabled(device_type), torch.get_autocast_dtype(device_type)
+    except Exception:  # older torch: per-device getters
+        if device_type == "cpu":
+            return torch.is_autocast_cpu_enabled(), torch.get_autocast_cpu_dtype()
+        return torch.is_autocast_enabled(), torch.get_autocast_gpu_dtype()
+
+
+def _residual_under(device_type, autocast, autocast_dtype, block_states, partial_block_states, query, eps):
+    # The eager module under the same autocast: its matmuls autocast (output in autocast_dtype), the rest stays fp32.
+    with torch.autocast(device_type, dtype = autocast_dtype, enabled = autocast):
+        return inkling2_block_residual_reference(block_states, partial_block_states, query, eps)
+
+
 _RESIDUAL_OP = None
 try:
     @torch.library.custom_op("unsloth_zoo::inkling2_block_residual", mutates_args = ())
     def _residual_op(block_states: torch.Tensor, partial_block_states: torch.Tensor, query: torch.Tensor,
-                     eps: float) -> torch.Tensor:
+                     eps: float, device_type: str, autocast: bool, autocast_dtype: torch.dtype) -> torch.Tensor:
         with torch.no_grad():
-            return inkling2_block_residual_reference(block_states, partial_block_states, query, eps)
+            return _residual_under(
+                device_type, autocast, autocast_dtype, block_states, partial_block_states, query, eps).contiguous()
 
     @_residual_op.register_fake
-    def _residual_fake(block_states, partial_block_states, query, eps):
+    def _residual_fake(block_states, partial_block_states, query, eps, device_type, autocast, autocast_dtype):
         hidden = partial_block_states.shape[-1]
         return partial_block_states.new_empty(
-            (*partial_block_states.shape[:-1], query.numel() // hidden, hidden), dtype = torch.float32)
+            (*partial_block_states.shape[:-1], query.numel() // hidden, hidden),
+            dtype = autocast_dtype if autocast else torch.float32)
 
     @torch.library.custom_op("unsloth_zoo::inkling2_block_residual_backward", mutates_args = ())
     def _residual_backward_op(grad: torch.Tensor, block_states: torch.Tensor, partial_block_states: torch.Tensor,
-                              query: torch.Tensor, eps: float) -> List[torch.Tensor]:
-        # The op body runs below autograd: torch.func.vjp carries its own grad transform.
+                              query: torch.Tensor, eps: float, device_type: str, autocast: bool,
+                              autocast_dtype: torch.dtype) -> List[torch.Tensor]:
+        # The op body runs below autograd: torch.func.vjp carries its own grad transform. The recompute re-enters the
+        # forward's autocast, whatever the backward pass runs under.
         _, vjp = torch.func.vjp(
-            lambda b, p, q: inkling2_block_residual_reference(b, p, q, eps), block_states, partial_block_states, query)
+            lambda b, p, q: _residual_under(device_type, autocast, autocast_dtype, b, p, q, eps),
+            block_states, partial_block_states, query)
         taken = {t.untyped_storage().data_ptr() for t in (grad, block_states, partial_block_states, query)}
         grads = []
         for g in vjp(grad):
@@ -107,24 +130,32 @@ try:
         return grads
 
     @_residual_backward_op.register_fake
-    def _residual_backward_fake(grad, block_states, partial_block_states, query, eps):
+    def _residual_backward_fake(grad, block_states, partial_block_states, query, eps, device_type, autocast,
+                                autocast_dtype):
         return [t.new_empty(t.shape) for t in (block_states, partial_block_states, query)]
 
     def _residual_setup_context(ctx, inputs, output):
-        block_states, partial_block_states, query, eps = inputs
+        block_states, partial_block_states, query, eps, device_type, autocast, autocast_dtype = inputs
         ctx.save_for_backward(block_states, partial_block_states, query)
-        ctx.eps = eps
+        ctx.state = (eps, device_type, autocast, autocast_dtype)
 
     def _residual_backward(ctx, grad):
         block_states, partial_block_states, query = ctx.saved_tensors
         grads = torch.ops.unsloth_zoo.inkling2_block_residual_backward(
-            grad.contiguous(), block_states, partial_block_states, query, ctx.eps)
-        return grads[0], grads[1], grads[2], None
+            grad.contiguous(), block_states, partial_block_states, query, *ctx.state)
+        return grads[0], grads[1], grads[2], None, None, None, None
 
     _residual_op.register_autograd(_residual_backward, setup_context = _residual_setup_context)
     _RESIDUAL_OP = _residual_op
 except Exception:  # torch without torch.library.custom_op: the plain compiler boundary stays
     _RESIDUAL_OP = None
+
+
+def inkling2_block_residual_op(block_states, partial_block_states, query, eps):
+    """The opaque residual under the caller's autocast, as the eager module computes it."""
+    device_type = partial_block_states.device.type
+    autocast, autocast_dtype = _autocast_state(device_type)
+    return _RESIDUAL_OP(block_states, partial_block_states, query, eps, device_type, autocast, autocast_dtype)
 
 
 def _residual_inputs(args, kwargs):
@@ -173,7 +204,7 @@ def inkling2_residual_eager_unless_decode(func):
             inputs = _residual_inputs(args, kwargs)
             eps = _residual_op_eps(self, inputs)
             if eps is not None:
-                return _RESIDUAL_OP(inputs[0], inputs[1], self.query, eps).unbind(-2)
+                return inkling2_block_residual_op(inputs[0], inputs[1], self.query, eps).unbind(-2)
         return disabled(self, *args, **kwargs)
     forward._unsloth_undisabled = plain
     return forward

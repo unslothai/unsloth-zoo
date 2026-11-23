@@ -119,3 +119,70 @@ def test_frozen_query_and_decode_compile(monkeypatch):
             torch.testing.assert_close(fn(b, p), stock(layer, b, p)[0])
     finally:
         patch_utils.UNSLOTH_DECODE_COMPILE[0] = previous
+
+
+def _autocast(precision):
+    if precision == "fp32":
+        return torch.autocast("cpu", enabled = False)
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[precision]
+    try:
+        with torch.autocast("cpu", dtype = dtype):
+            torch.ones(2, 2) @ torch.ones(2, 2)
+    except Exception:
+        pytest.skip(f"CPU autocast without {precision}")
+    return torch.autocast("cpu", dtype = dtype)
+
+
+def _run_typed(forward, layer, precision, compiled):
+    def outer(block_states, partial):
+        with _autocast(precision):
+            outs = forward(layer, block_states, partial)
+        return outs, sum((out.float() * (i + 1)).sum() for i, out in enumerate(outs))
+
+    fn = torch.compile(outer, backend = "aot_eager", fullgraph = True, dynamic = True) if compiled else outer
+    g = torch.Generator().manual_seed(3)
+    block_states = torch.randn(2, 5, 3, 32, generator = g, requires_grad = True)
+    partial = torch.randn(2, 5, 32, generator = g, requires_grad = True)
+    layer.zero_grad(set_to_none = True)
+    outs, loss = fn(block_states, partial)
+    loss.backward()
+    return [o.detach() for o in outs], block_states.grad, partial.grad, layer.query.grad
+
+
+@pytest.mark.parametrize("precision", ["fp32", "bf16", "fp16"])
+@pytest.mark.parametrize("attn", ["eager", "sdpa"])
+@pytest.mark.parametrize("num_queries", [1, 3])
+def test_residual_op_follows_the_caller_autocast(monkeypatch, num_queries, attn, precision):
+    """Under autocast the op returns what the eager module returns (dtype, values, grads), eagerly and inside a
+    fullgraph aot_eager compile, with the backward recompute under the forward's autocast."""
+    from unsloth_zoo.temporary_patches import inkling2 as patch
+    class_name, config_name = _CLASSES["inkling2"]
+    modeling, decorator = _generated_decorator(monkeypatch, "inkling2", class_name)
+    from transformers.models.inkling2.configuration_inkling2 import Inkling2TextConfig
+    config = Inkling2TextConfig(hidden_size = 32)
+    config._attn_implementation = attn
+    torch.manual_seed(0)
+    layer = getattr(modeling, class_name)(config, num_queries = num_queries)
+    with torch.no_grad():
+        layer.query.normal_()
+    stock = getattr(modeling, class_name).forward
+
+    def op_forward(module, block_states, partial):
+        return patch.inkling2_block_residual_op(block_states, partial, module.query, module.norm.eps).unbind(-2)
+
+    # Half precision: the sdpa module and the matmul reference round differently in a few elements.
+    tol = {} if precision == "fp32" else dict(rtol = 2e-2, atol = 5e-2)
+    torch._dynamo.reset()
+    want = _run_typed(stock, layer, precision, compiled = False)
+    for name, forward, compiled in (
+        ("decorated compiled", decorator(stock), True),
+        ("op eager", op_forward, False),
+        ("op compiled", op_forward, True),
+    ):
+        got = _run_typed(forward, layer, precision, compiled)
+        for a, b in zip(want[0], got[0]):
+            assert b.dtype == a.dtype, (name, b.dtype, a.dtype)
+            torch.testing.assert_close(b, a, **tol, msg = lambda m: f"{name}: {m}")
+        for a, b in zip(want[1:], got[1:]):
+            assert b.dtype == a.dtype, (name, b.dtype, a.dtype)
+            torch.testing.assert_close(b, a, **tol, msg = lambda m: f"{name}: {m}")
