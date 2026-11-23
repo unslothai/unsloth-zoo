@@ -903,8 +903,8 @@ def _warn_module_head(reason):
     _WARNED_MODULE_HEADS.add(reason)
     print(
         f"Unsloth: the LM head has a live PEFT adapter ({reason}). The fused cross entropy reads only "
-        "lm_head.weight, so the loss calls the head's own forward and builds the full logits (more memory). "
-        "modules_to_save on lm_head, or a merged adapter, keeps the fused loss."
+        "lm_head.weight, so the loss calls the head's own forward, chunk by chunk (all rows at once, the full "
+        "logits, with a live lora_dropout). modules_to_save on lm_head, or a merged adapter, keeps the fused loss."
     )
 
 
@@ -940,7 +940,129 @@ def _check_ce_targets(targets, vocab_size, ignore_index):
                          f"of {vocab_size} (ignore_index = {ignore_index}).")
 
 
-def _module_head_ce_loss(lm_head, hidden_states, labels, mask, n_items, shift_labels, kwargs):
+# UNSLOTH_CHUNKED_MODULE_HEAD=0 runs a live adapter head over all rows at once (full float32 logits).
+_CHUNKED_MODULE_HEAD = os.environ.get("UNSLOTH_CHUNKED_MODULE_HEAD", "1") != "0"
+_MODULE_HEAD_ROWS = 0  # rows per chunk; 0 sizes it from the vocabulary like the chunked CE
+_MODULE_HEAD_CHUNKED_CALLS = 0  # engagement count (tests)
+# Trainable head tensors up to this many elements accumulate their per-chunk gradients in float32.
+_MODULE_HEAD_FP32_ACCUM_NUMEL = 1 << 26
+
+
+def _module_head_chunkable(lm_head, base, n_rows, n_targets):
+    """True when lm_head(h)[rows] == lm_head(h[rows]) and one call per chunk changes nothing else."""
+    # A trace keeps the traceable all-rows forward (no new graph break).
+    if not _CHUNKED_MODULE_HEAD or torch.compiler.is_compiling():
+        return False
+    if type(base) is not torch.nn.Linear or n_rows != n_targets:
+        return False
+    for module in lm_head.modules():
+        # A dropout mask drawn per chunk would not be the all-rows forward's mask.
+        if isinstance(module, torch.nn.modules.dropout._DropoutNd) and module.training and module.p > 0:
+            return False
+        for hook in module._forward_pre_hooks.values():
+            if getattr(getattr(hook, "func", hook), "__name__", "") == "_adapter_names_pre_forward_hook":
+                return False  # adapter_names index whole examples
+    for param in lm_head.parameters():
+        # FSDP2 / ZeRO-3 shards gather and reduce in the head's own hooks, once per forward.
+        if hasattr(param, "ds_id") or type(param).__name__ == "DTensor":
+            return False
+    return True
+
+
+def _module_head_chunks(hidden, lm_head, keep, targets, divisor, scale, rows, kwargs, params):
+    """Chunk loop of _ModuleHeadChunkedCE: (loss, grad of hidden or None, per-param gradient or None)."""
+    need_h = hidden.requires_grad
+    need_grad = need_h or len(params) > 0
+    grad_hidden = torch.zeros_like(hidden) if need_h else None
+    accum = [None] * len(params)
+    loss = None
+    with torch.enable_grad() if need_grad else contextlib.nullcontext():
+        for a in range(0, keep.numel(), rows):
+            index = keep[a:a + rows]
+            h = hidden.detach().index_select(0, index).requires_grad_(need_h)
+            logits = lm_head(h)
+            logits = logits.reshape(-1, logits.shape[-1])
+            if logits.shape[0] != index.shape[0]:
+                raise ValueError(
+                    f"Unsloth: the LM head produced {logits.shape[0]} rows for {index.shape[0]} target tokens."
+                )
+            chunk = _logits_ce_loss(logits, targets[a:a + rows].to(logits.device), divisor.to(logits.device), kwargs)
+            del logits
+            if need_grad:
+                grads = torch.autograd.grad(chunk * scale.to(chunk.device), params + ((h,) if need_h else ()),
+                                            allow_unused = True)
+                for i, grad in enumerate(grads[:len(params)]):
+                    if grad is None:
+                        continue
+                    if accum[i] is None:
+                        fp32 = params[i].numel() <= _MODULE_HEAD_FP32_ACCUM_NUMEL
+                        accum[i] = grad.to(torch.float32 if fp32 else grad.dtype)
+                    else:
+                        accum[i].add_(grad)
+                if need_h:
+                    grad_hidden.index_copy_(0, index, grads[-1].to(grad_hidden.dtype))
+                del grads
+            chunk = chunk.detach()
+            loss = chunk if loss is None else loss + chunk.to(loss.device)
+    if loss is None:  # no labelled row: as the all-rows path, a zero loss and zero gradients
+        loss = torch.zeros((), device = hidden.device, dtype = torch.float32)
+    return loss, grad_hidden, accum
+
+
+class _ModuleHeadChunkedCE(torch.autograd.Function):
+    """Sum of _logits_ce_loss(lm_head(h[rows])) over row chunks of the labelled rows, each chunk's gradients
+    (hidden, every trainable head tensor) taken in forward: no full logits and no recompute in backward.
+    `scale` (fp16 GradScaler) multiplies the chunk losses so half precision gradients do not underflow;
+    backward divides it back out."""
+
+    @staticmethod
+    def forward(ctx, hidden, lm_head, keep, targets, divisor, scale, rows, kwargs, *params):
+        loss, grad_hidden, accum = _module_head_chunks(hidden, lm_head, keep, targets, divisor, scale, rows, kwargs,
+                                                       params)
+        ctx.need_h = grad_hidden is not None
+        ctx.dtypes = [p.dtype for p in params]
+        accum = [torch.zeros_like(p) if g is None else g for p, g in zip(params, accum)]
+        ctx.save_for_backward(scale, *(() if grad_hidden is None else (grad_hidden,)), *accum)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        scale, *saved = ctx.saved_tensors
+        factor = grad_output.detach().float().reshape(()) / scale.to(grad_output.device)
+        grad_hidden = None
+        if ctx.need_h:
+            grad_hidden = saved.pop(0)
+            grad_hidden = grad_hidden * factor.to(grad_hidden.device).to(grad_hidden.dtype)
+        grads = [(g * factor.to(g.device)).to(dtype) for g, dtype in zip(saved, ctx.dtypes)]
+        return (grad_hidden, None, None, None, None, None, None, None, *grads)
+
+
+def _module_head_chunked_ce(lm_head, vocab_size, hidden_states, targets, n_items, scaling, kwargs):
+    global _MODULE_HEAD_CHUNKED_CALLS
+    _MODULE_HEAD_CHUNKED_CALLS += 1
+    ignore_index = int(kwargs.get("ignore_index", -100))
+    hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+    targets = targets.to(hidden.device)
+    _check_ce_targets(targets, vocab_size, ignore_index)
+    # Only labelled rows enter the head: an ignored row adds 0 and gets a zero gradient, as on the all-rows path.
+    keep = (targets != ignore_index).nonzero().reshape(-1)
+    divisor = _chunked_logprob._ce_divisor(n_items, targets, ignore_index, hidden.device)
+    rows = _MODULE_HEAD_ROWS or _chunked_logprob.chunked_logprob_rows(
+        vocab_size, n_rows = keep.numel(), device = hidden.device,
+    )
+    args = (lm_head, keep, targets[keep], divisor)
+    if not torch.is_grad_enabled():
+        return _module_head_chunks(hidden.detach(), *args, divisor.new_ones(()), int(rows), kwargs, ())[0]
+    params = tuple(p for p in lm_head.parameters() if p.requires_grad)
+    scale = _scaler_scale(scaling)
+    scale = torch.as_tensor(1.0 if scale is None else scale, dtype = torch.float32, device = hidden.device)
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale).reshape(())
+    if not params and not hidden.requires_grad:
+        return _module_head_chunks(hidden, *args, scale, int(rows), kwargs, ())[0]
+    return _ModuleHeadChunkedCE.apply(hidden, *args, scale, int(rows), kwargs, *params)
+
+
+def _module_head_ce_loss(lm_head, hidden_states, labels, mask, n_items, shift_labels, kwargs, scaling = None):
     """unsloth_fused_ce_loss on lm_head(hidden_states): the chunked path's targets (shift, mask on shifted or
     pre-aligned labels) and compute_fused_ce_loss's reduction (_logits_ce_loss), on the head's own logits."""
     ignore_index = int(kwargs.get("ignore_index", -100))
@@ -966,6 +1088,8 @@ def _module_head_ce_loss(lm_head, hidden_states, labels, mask, n_items, shift_la
     targets = _chunked_logprob._ce_targets(labels.to(torch.long), mask, shift_labels, ignore_index,
                                            hidden_states.device)
     rows = hidden_states.shape[:-1]
+    if _module_head_chunkable(lm_head, base, rows.numel(), targets.numel()):
+        return _module_head_chunked_ce(lm_head, base.out_features, hidden_states, targets, n_items, scaling, kwargs)
     if type(base) is torch.nn.Linear and targets.numel() == rows.numel():
         # A row-wise head over a plain Linear: zero the ignored inputs so a half precision overflow inside the
         # adapter (lora_A) on a row the loss never reads cannot reach backward as 0 * inf. Same shape, so per-row
@@ -1028,7 +1152,8 @@ def unsloth_fused_ce_loss(
     # A live PEFT adapter on the head (lm_head_module): lm_head_weight is its base weight, which would drop the
     # adapter (no gradient, the base head's loss). Same reduction on the head's own logits.
     if lm_head_needs_module_forward(lm_head_module):
-        return _module_head_ce_loss(lm_head_module, hidden_states, labels, mask, n_items, shift_labels, kwargs)
+        return _module_head_ce_loss(lm_head_module, hidden_states, labels, mask, n_items, shift_labels, kwargs,
+                                    scaling = scaling)
     if TARGET_GB: target_gb = float(TARGET_GB)
     elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)
 
