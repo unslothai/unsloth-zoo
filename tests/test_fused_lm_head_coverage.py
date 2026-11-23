@@ -121,8 +121,8 @@ def forward(self, input_ids=None, labels=None, **kwargs):
     new, _ = rewrite_forward_source(canonical)
     assert (
         "if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' or not _can_fuse_loss(self.loss_function) or "
-        "(getattr(self.lm_head, 'base_layer', None) is not None and (not getattr(self.lm_head, 'merged', False)) "
-        "and (not getattr(self.lm_head, 'disable_adapters', False))):"
+        "(getattr(self.lm_head, 'base_layer', None) is not None and (bool(getattr(self.lm_head, 'merged', False)) "
+        "or not getattr(self.lm_head, 'disable_adapters', False))):"
     ) in new
     assert (
         "unsloth_fused_lm_head_loss(hidden_states, self.lm_head, labels, vocab_size=self.config.vocab_size, "

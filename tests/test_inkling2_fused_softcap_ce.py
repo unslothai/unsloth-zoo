@@ -35,6 +35,7 @@ _INKLING = {
     "inkling2_loop": ("Inkling2LoopForConditionalGeneration", "Inkling2LoopForCausalLM"),
 }
 _STATEMENT = "logits = torch.tanh(logits / self.logit_softcap.softcap) * self.logit_softcap.softcap"
+_MODULE_CALL = "logits = self.logit_softcap(logits)"
 
 
 def _inkling_classes():
@@ -59,6 +60,7 @@ def test_inkling_forwards_fuse_with_the_module_softcap(entry):
         assert forward_install.audit()["patched"][cls.__qualname__]["head_attr"] == "lm_head"
         fused = next(line for line in src.splitlines() if "unsloth_fused_lm_head_loss(" in line)
         assert "logit_softcapping=self.logit_softcap.softcap" in fused and "vocab_size=None" in fused
+        assert _STATEMENT not in src and src.count(_MODULE_CALL) == 2
         return
     assert "self.logit_softcap(logits)" in src   # the upstream form this handles
     inlined = inline_softcap_modules(src, cls)
@@ -69,8 +71,9 @@ def test_inkling_forwards_fuse_with_the_module_softcap(entry):
     assert "logit_softcapping=self.logit_softcap.softcap" in fused
     # `vocab_size=logits.shape[-1]` would read logits the fused branch never binds.
     assert "vocab_size=None" in fused and "logits.shape" not in fused
-    # Generation (no labels) and the custom-loss path keep the softcap.
-    assert new.count(_STATEMENT) == 2
+    # Generation (no labels) and the custom-loss path call the softcap module as upstream does (hooks run).
+    assert _STATEMENT not in new and new.count(_MODULE_CALL) == 2
+    assert "isinstance(self.logit_softcap.softcap, (int, float))" in new
 
 
 class _Softcap(nn.Module):
@@ -174,17 +177,28 @@ def test_zero_softcap_takes_the_exact_path(monkeypatch):
     torch.testing.assert_close(got, want)
 
 
-def test_unmerged_peft_adapter_on_the_head_still_trains(monkeypatch):
-    """A PEFT LoRA head adds its adapter in forward; the fused kernel reads only lm_head.weight, so such a head takes
-    the exact path and its adapter gets the gradient UNSLOTH_RETURN_LOGITS=1 gives. Merged or disabled: fused."""
+def _lora_head(base):
+    """A PEFT LoRA Linear around `base` with a nonzero adapter: PEFT 0.18 takes r / lora_alpha / init_lora_weights
+    as keywords, later releases also need the LoraConfig."""
     peft = pytest.importorskip("peft")
     from peft.tuners.lora.layer import Linear as LoraLinear
 
+    kwargs = dict(r = 2, lora_alpha = 2)
+    if "config" in inspect.signature(LoraLinear.__init__).parameters:
+        kwargs["config"] = peft.LoraConfig(r = 2, lora_alpha = 2, init_lora_weights = False)
+    else:
+        kwargs["init_lora_weights"] = False
+    return LoraLinear(base, "default", **kwargs)
+
+
+def test_unmerged_peft_adapter_on_the_head_still_trains(monkeypatch):
+    """A PEFT LoRA head adds its adapter in forward; the fused kernel reads only lm_head.weight, so such a head takes
+    the exact path and its adapter gets the gradient UNSLOTH_RETURN_LOGITS=1 gives. Disabled and unmerged: fused."""
     cls = _make_class("AdapterHeadToyForCausalLM", _Softcap)
     assert forward_install.install_for_class(cls)
     torch.manual_seed(0)
     model = cls()
-    model.lm_head = LoraLinear(model.lm_head, "default", peft.LoraConfig(init_lora_weights = False), r = 2, lora_alpha = 2)
+    model.lm_head = _lora_head(model.lm_head)
     x = torch.randn(2, 8, 16)
     labels = torch.randint(0, 300, (2, 8))
     grads, losses = [], []
@@ -211,3 +225,106 @@ class _disabled:
 
     def __exit__(self, *exc):
         self.layer.enable_adapters(True)
+
+
+def test_merged_then_disabled_peft_head_takes_the_exact_path(monkeypatch):
+    """PEFT unmerges a merged head inside its forward when the adapters are disabled; the fused kernel would read the
+    merged weight (the adapter's loss) and leave the head merged. Merged and enabled is also left to the forward."""
+    cls = _make_class("MergedHeadToyForCausalLM", _Softcap)
+    assert forward_install.install_for_class(cls)
+    torch.manual_seed(0)
+    model = cls()
+    model.lm_head = head = _lora_head(model.lm_head)
+    x = torch.randn(2, 8, 16)
+    labels = torch.randint(0, 300, (2, 8))
+    monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", "1")
+    head.enable_adapters(False)
+    want_base = model(x = x, labels = labels).loss.detach()
+    head.enable_adapters(True)
+    want_adapter = model(x = x, labels = labels).loss.detach()
+    assert not torch.allclose(want_base, want_adapter)   # the adapter changes the loss
+    monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", "0")
+    head.merge()
+    out = model(x = x, labels = labels)
+    assert out.logits.numel() > 0
+    torch.testing.assert_close(out.loss.detach(), want_adapter)
+    head.enable_adapters(False)
+    out = model(x = x, labels = labels)
+    assert out.logits.numel() > 0 and not head.merged
+    torch.testing.assert_close(out.loss.detach(), want_base)
+    assert model(x = x, labels = labels).logits.numel() == 0   # unmerged and disabled: fused again
+
+
+def _compiles_fullgraph(model, x, labels):
+    torch._dynamo.reset()
+    loss = torch.compile(model, backend = "aot_eager", fullgraph = True, dynamic = True)(x = x, labels = labels).loss
+    loss.backward()
+    return loss.detach()
+
+
+def test_tensor_softcap_keeps_its_gradient_and_fullgraph(monkeypatch):
+    """The kernel takes the cap as a Python float: a trainable cap (nn.Parameter) takes the exact path, keeping its
+    gradient, and the guard is a trace-time isinstance (no data-dependent branch under fullgraph)."""
+    cls = _make_class("ParamCapToyForCausalLM", _Softcap)
+    torch.manual_seed(0)
+    model = cls()
+    model.logit_softcap.softcap = nn.Parameter(torch.tensor(30.0))
+    x = torch.randn(2, 8, 16)
+    labels = torch.randint(0, 300, (2, 8))
+    want = model(x = x, labels = labels).loss
+    want.backward()
+    want_grad = model.logit_softcap.softcap.grad.clone()
+    assert forward_install.install_for_class(cls)
+    monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", "0")
+    model.zero_grad(set_to_none = True)
+    got = model(x = x, labels = labels)
+    got.loss.backward()
+    torch.testing.assert_close(got.loss.detach(), want.detach())
+    torch.testing.assert_close(model.logit_softcap.softcap.grad, want_grad)
+    model.zero_grad(set_to_none = True)
+    torch.testing.assert_close(_compiles_fullgraph(model, x, labels), want.detach())
+    torch.testing.assert_close(model.logit_softcap.softcap.grad, want_grad)
+
+
+def test_softcap_module_hooks_run_in_the_materialised_branches(monkeypatch):
+    """Generation, the no-label call and UNSLOTH_RETURN_LOGITS=1 call the softcap module as upstream does, so its
+    forward hooks run there; only the fused branch takes the scalar cap."""
+    cls = _make_class("HookedCapToyForCausalLM", _Softcap)
+    torch.manual_seed(0)
+    model = cls()
+    x = torch.randn(2, 8, 16)
+    labels = torch.randint(0, 300, (2, 8))
+    calls = []
+    model.logit_softcap.register_forward_hook(lambda module, args, out: calls.append(1) or out * 0)
+    assert forward_install.install_for_class(cls)
+    for mode in ("0", "1"):
+        monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", mode)
+        calls.clear()
+        logits = model(x = x).logits
+        assert calls == [1] and float(logits.abs().max()) == 0.0
+    calls.clear()
+    assert float(model(x = x, labels = labels).logits.abs().max()) == 0.0 and calls == [1]
+    monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", "0")
+    assert model(x = x, labels = labels).logits is EMPTY_LOGITS
+
+
+def test_fused_linear_kill_switch_keeps_the_stock_forward(monkeypatch):
+    """UNSLOTH_FUSED_LINEAR=0 runs fused CE behind torch.compiler.disable: the softcap forward is not rewritten, so it
+    stays as compilable as upstream. The default switch fuses and compiles in one graph."""
+    from unsloth_zoo.fused_losses import chunked_logprob
+
+    x = torch.randn(2, 8, 16)
+    labels = torch.randint(0, 300, (2, 8))
+    monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", "0")
+    cls = _make_class("FusedOnToyForCausalLM", _Softcap)
+    assert forward_install.install_for_class(cls)
+    model = cls()
+    want = model(x = x, labels = labels)
+    assert want.logits is EMPTY_LOGITS
+    torch.testing.assert_close(_compiles_fullgraph(model, x, labels), want.loss.detach())
+    monkeypatch.setattr(chunked_logprob, "_FUSED_LINEAR", False)
+    cls = _make_class("FusedOffToyForCausalLM", _Softcap)
+    src = inspect.getsource(cls.forward)
+    assert inline_softcap_modules(src, cls) == src
+    assert not forward_install.install_for_class(cls)
+    assert "unsloth_fused_lm_head_loss" not in inspect.getsource(cls.forward)

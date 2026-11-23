@@ -37,6 +37,7 @@ __all__ = [
     "rewrite_count_aware_ce_spliced",
     "TripletCapture",
     "inline_softcap_modules",
+    "restore_softcap_modules",
 ]
 
 import ast
@@ -661,12 +662,13 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     hidden_src = ast.unparse(cap.hidden_expr)
     logits_rhs = cap.logits_rhs_src or f"self.{head_attr}({hidden_src})"
 
-    # A PEFT tuner layer on the head adds its unmerged, enabled adapters in forward, while the kernel reads only
-    # lm_head.weight / bias (the adapter would get no gradient): exact path. Builtins only, so any namespace runs it.
+    # The kernel reads only lm_head.weight / bias, which equals the PEFT head's forward only for an unmerged head
+    # with its adapters disabled: an enabled adapter would get no gradient, and a merged-then-disabled head unmerges
+    # inside its forward. Any other tuner-layer state takes the exact path. Builtins only, so any namespace runs it.
     live_adapter = (
         f" or (getattr(self.{head_attr}, 'base_layer', None) is not None"
-        f" and not getattr(self.{head_attr}, 'merged', False)"
-        f" and not getattr(self.{head_attr}, 'disable_adapters', False))"
+        f" and (bool(getattr(self.{head_attr}, 'merged', False))"
+        f" or not getattr(self.{head_attr}, 'disable_adapters', False)))"
     )
     # Re-checked per call: the loss can be swapped after install.
     if cap.guarded_scale_expr is not None and "logit_scale_multiply" not in already:
@@ -736,9 +738,12 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     # The kernel computes no gradient for the extra bias: a trainable one takes the exact path.
     if cap.logits_bias_src is not None:
         zero_scale += f" or {cap.logits_bias_src}.requires_grad"
-    # The kernel reads zero as "no softcap", where the model's tanh(x / 0) * 0 zeroes the logits: exact path.
+    # The kernel takes the cap as a Python float: a tensor cap (a trainable nn.Parameter) would lose its gradient, and
+    # comparing it would branch on data under fullgraph, so only a nonzero Python number fuses (isinstance is a trace
+    # time constant). Zero reads as "no softcap" there, where the model's tanh(x / 0) * 0 zeroes the logits.
     if cap.softcap_expr is not None:
-        zero_scale += f" or ({ast.unparse(cap.softcap_expr)}) == 0"
+        cap_src = ast.unparse(cap.softcap_expr)
+        zero_scale += f" or not (isinstance({cap_src}, (int, float)) and {cap_src} != 0)"
     # Legacy CE blocks never call self.loss_function.
     custom_loss = "" if cap.legacy_body else " or not _can_fuse_loss(self.loss_function)"
     custom_loss += live_adapter
@@ -1050,9 +1055,60 @@ def inline_softcap_modules(source: str, cls) -> str:
     """Spell `logits = self.<m>(logits)` as `logits = torch.tanh(logits / self.<m>.<C>) * self.<m>.<C>` when
     `cls.__init__` builds `self.<m>` from a module whose whole forward is that softcap (Inkling 2's final
     `self.logit_softcap`). The statement form is what the triplet rewriters hand to the fused CE kernel as
-    `logit_softcapping`; any other module call is left alone. Only that statement's text changes."""
-    if cls is None or "self." not in source:
+    `logit_softcapping`; any other module call is left alone. Only that statement's text changes.
+
+    Skipped while fused CE would run behind torch.compiler.disable (UNSLOTH_FUSED_LINEAR=0 and the other non-default
+    CE switches), so such a forward stays the stock, compilable one. `restore_softcap_modules` puts the module call
+    back wherever the rewrite kept the statement (the materialised branches)."""
+    if cls is None or "self." not in source or not _fused_ce_traceable():
         return source
+
+    def edit(v, name):
+        if not (_is_self_attr_call(v) and len(v.args) == 1 and not v.keywords
+                and isinstance(v.args[0], ast.Name) and v.args[0].id == name):
+            return None
+        cap_attr = _softcap_module_cap_attr(_init_assigned_class(cls, v.func.attr))
+        if cap_attr is None:
+            return None
+        cap = f"self.{v.func.attr}.{cap_attr}"
+        return f"torch.tanh({name} / {cap}) * {cap}"
+    return _edit_single_line_assigns(source, edit)
+
+
+def restore_softcap_modules(source: str, cls) -> str:
+    """Undo `inline_softcap_modules` on a rewritten forward: each remaining `logits = torch.tanh(logits /
+    self.<m>.<C>) * self.<m>.<C>` for a softcap module `self.<m>` is the module call again, so the generation, no-label
+    and UNSLOTH_RETURN_LOGITS=1 branches run its forward and hooks as upstream does. The fused branch keeps only the
+    scalar `logit_softcapping=self.<m>.<C>`."""
+    if cls is None or source is None or "torch.tanh(" not in source:
+        return source
+
+    def edit(v, name):
+        cap = _softcap_cap(ast.Assign(targets = [ast.Name(id = name)], value = v), name)
+        if not (cap is not None and ast.unparse(v.left.func) == "torch.tanh" and isinstance(cap, ast.Attribute)
+                and isinstance(cap.value, ast.Attribute) and isinstance(cap.value.value, ast.Name)
+                and cap.value.value.id == "self"):
+            return None
+        if _softcap_module_cap_attr(_init_assigned_class(cls, cap.value.attr)) != cap.attr:
+            return None
+        return f"self.{cap.value.attr}({name})"
+    return _edit_single_line_assigns(source, edit)
+
+
+def _fused_ce_traceable() -> bool:
+    """Fused CE traces into an enclosing compile (no torch.compiler.disable boundary) under the default switches."""
+    try:
+        from . import chunked_logprob, cross_entropy_loss as ce
+    except Exception:
+        return False
+    return bool(
+        chunked_logprob._FUSED_LINEAR and ce._CHUNKED_CE
+        and not (ce.TARGET_GB or ce.N_CHUNKS or ce._FUSED_CE_COMPILE_DISABLED)
+    )
+
+
+def _edit_single_line_assigns(source: str, edit) -> str:
+    """Replace the value of each single-line `name = value` for which `edit(value_node, name)` gives new text."""
     try:
         tree = ast.parse(textwrap.dedent(source))
     except SyntaxError:
@@ -1065,16 +1121,10 @@ def inline_softcap_modules(source: str, cls) -> str:
         if not (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
                 and node.lineno == node.end_lineno):
             continue
-        v, name = node.value, node.targets[0].id
-        if not (_is_self_attr_call(v) and len(v.args) == 1 and not v.keywords
-                and isinstance(v.args[0], ast.Name) and v.args[0].id == name):
-            continue
-        cap_attr = _softcap_module_cap_attr(_init_assigned_class(cls, v.func.attr))
-        if cap_attr is None:
-            continue
-        cap = f"self.{v.func.attr}.{cap_attr}"
-        edits.append((node.lineno - 1, v.col_offset + indent, v.end_col_offset + indent,
-                      f"torch.tanh({name} / {cap}) * {cap}"))
+        v = node.value
+        text = edit(v, node.targets[0].id)
+        if text is not None:
+            edits.append((node.lineno - 1, v.col_offset + indent, v.end_col_offset + indent, text))
     for row, lo, hi, text in sorted(edits, reverse = True):
         line = lines[row]
         lines[row] = line[:lo] + text + line[hi:]

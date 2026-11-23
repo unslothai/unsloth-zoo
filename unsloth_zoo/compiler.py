@@ -5718,8 +5718,10 @@ def fused_lm_head_forward(module, module_class, modeling_module_name, source):
     out = _fused_lm_head_forward(module, module_class, modeling_module_name, source, True)
     if out[1] is None:
         # Nothing fused: keep the softcap module call as written.
-        out = _fused_lm_head_forward(module, module_class, modeling_module_name, source, False)
-    return out
+        return _fused_lm_head_forward(module, module_class, modeling_module_name, source, False)
+    # The materialised branches call the softcap module as upstream does (forward hooks run).
+    from unsloth_zoo.fused_losses.ast_rewriter import restore_softcap_modules
+    return (restore_softcap_modules(out[0], module_class), *out[1:])
 
 
 def _fused_lm_head_forward(module, module_class, modeling_module_name, source, inline_softcap):
