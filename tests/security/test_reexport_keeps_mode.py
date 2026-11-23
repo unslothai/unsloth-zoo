@@ -37,7 +37,8 @@ def _helpers(ns):
         from unsloth_zoo import private_staging
         assert Path(private_staging.__file__).resolve().parent == ROOT  # this arm's own tree
         ns.update(keep_mode = private_staging.keep_mode, copy_keep_mode = private_staging.copy_keep_mode,
-                  current_umask = private_staging.current_umask)
+                  current_umask = private_staging.current_umask,
+                  precreate_private_temp = private_staging.precreate_private_temp)
     except (ImportError, AttributeError):
         pass
     return ns
@@ -221,3 +222,109 @@ def test_windows_keeps_owner_write_bit(tmp_path, monkeypatch):
     private_staging.keep_mode(str(staging), str(tmp_path / "missing"), source_mode = 0o444, add = stat.S_IWUSR)
     monkeypatch.undo()
     assert _mode(staging) & stat.S_IWUSR
+
+
+def test_mlx_d1_resave_keeps_restricted_mode(tmp_path, umask022):
+    ns = _extract(ROOT / "mlx" / "decision.py", ["save_d1_model"],
+                  dict(json = json, os = os, shutil = shutil, Path = Path, tempfile = tempfile,
+                       _apart = lambda folder, source: (Path(folder), Path(source)),
+                       _write_merged_shards = lambda model, source, staging: (staging / "model.safetensors").write_bytes(b"w"),
+                       _read_json = lambda path: {}, _as_d1_config = lambda config: config))
+    source = tmp_path / "src"; source.mkdir()
+    (source / "tokenizer.json").write_text("{}"); (source / "config.json").write_text("{}")
+    out = tmp_path / "out"
+    pipeline = types.SimpleNamespace(model = None, source = source)
+    ns["save_d1_model"](pipeline, out, source)
+    assert _mode(out / "model.safetensors") == 0o644  # first save: umask default
+    os.chmod(out / "model.safetensors", 0o600); os.chmod(out / "tokenizer.json", 0o600)
+    ns["save_d1_model"](pipeline, out, source); ns["save_d1_model"](pipeline, out, source)
+    assert _mode(out / "model.safetensors") == 0o600, "MLX d1 re-save widened restricted weights"
+    assert _mode(out / "tokenizer.json") == 0o600, "MLX d1 re-save widened a restricted copied file"
+
+
+def test_mlx_decision_resave_private_while_written(tmp_path, umask022):
+    seen = []
+    def save_safetensors(path, weights, metadata = None):  # opens with truncate, as mx.save_safetensors does
+        with open(path, "wb") as f:
+            f.write(b"w")
+        seen.append(_mode(path))
+    mx = types.SimpleNamespace(save_safetensors = save_safetensors, load = lambda path: {}, float16 = "f16")
+    ns = _extract(ROOT / "mlx" / "decision.py", ["save_decision_model"],
+                  dict(mx = mx, json = json, os = os, shutil = shutil, Path = Path,
+                       _merged_parameters = lambda model: {}, _state_name = lambda n: n))
+    source = tmp_path / "src"
+    for name in ("encoder", "tokenizer"):
+        (source / name).mkdir(parents = True)
+    (source / "rl_agent_config.json").write_text("{}"); (source / "model.safetensors").write_bytes(b"s")
+    out = tmp_path / "out"
+    ns["save_decision_model"](None, out, source)
+    os.chmod(out / "model.safetensors", 0o600)
+    ns["save_decision_model"](None, out, source)
+    assert seen == [0o644, 0o600], "Laya re-save wrote restricted weights at the umask default"
+    assert _mode(out / "model.safetensors") == 0o600
+
+
+def test_cpu_shard_count_change_private_while_written(tmp_path, umask022, monkeypatch):
+    pytest.importorskip("torch"); pytest.importorskip("peft")
+    transformers = pytest.importorskip("transformers")
+    import torch
+    from peft import LoraConfig, get_peft_model
+    from unsloth_zoo.cpu import loader
+    assert Path(loader.__file__).resolve() == ROOT / "cpu" / "loader.py"
+    config = transformers.LlamaConfig(vocab_size = 64, hidden_size = 32, intermediate_size = 64, num_hidden_layers = 2,
+                                      num_attention_heads = 2, num_key_value_heads = 2, tie_word_embeddings = False)
+    torch.manual_seed(0)
+    model = get_peft_model(transformers.LlamaForCausalLM(config), LoraConfig(r = 4, target_modules = ["q_proj"]))
+    out = tmp_path / "merged"
+    assert loader._stream_merged_save(model, str(out), "merged_16bit")
+    os.chmod(out / "model.safetensors", 0o600)
+    seen, write = [], loader._write_safetensors
+    def recording(path, *args, **kwargs):
+        result = write(path, *args, **kwargs); seen.append(_mode(path)); return result
+    monkeypatch.setattr(loader, "_write_safetensors", recording)
+    assert loader._stream_merged_save(model, str(out), "merged_16bit", max_shard_size = "20KB")
+    assert len(seen) > 1 and set(seen) == {0o600}, f"new shard names written at {sorted(map(oct, set(seen)))}"
+
+
+def test_vllm_atomic_dir_save_stages_owner_only(tmp_path, umask022):
+    ns = _extract(ROOT / "vllm_utils.py", ["_save_dir_atomically"], dict(os = os, shutil = shutil))
+    out, seen = tmp_path / "lora", []
+    def save_fn(d):
+        os.makedirs(d, exist_ok = True)  # as PEFT save_pretrained does
+        Path(d, "adapter_model.safetensors").write_bytes(b"w")
+        seen.append(_mode(d))
+    ns["_save_dir_atomically"](save_fn, str(out), 0)
+    assert seen == [0o700], "distributed LoRA save staged adapters in a world-readable sibling folder"
+    assert _mode(out / "adapter_model.safetensors") == 0o644  # final files unchanged
+
+
+def test_hub_reexport_keeps_restricted_mode(tmp_path, umask022):
+    def hf_hub_download(repo_id, filename, repo_type, local_dir, cache_dir, token, revision):
+        Path(local_dir, filename).write_bytes(b"new")  # lands at the umask default
+    ns = _extract(ROOT / "saving_utils.py", ["_download_shard_over_previous_export"],
+                  dict(os = os, stat = stat, shutil = shutil, tempfile = tempfile, hf_hub_download = hf_hub_download))
+    shard = tmp_path / "model.safetensors"; shard.write_bytes(b"old"); os.chmod(shard, 0o600)
+    for _ in range(2):
+        ns["_download_shard_over_previous_export"]("r", "model.safetensors", str(tmp_path), None, None)
+    assert shard.read_bytes() == b"new"
+    assert _mode(shard) == 0o600, "re-downloaded shard replaced a restricted export at 0644"
+
+
+def test_seeded_head_keeps_restricted_mode(tmp_path, umask022):
+    torch = pytest.importorskip("torch")
+    from safetensors.torch import save_file, safe_open
+    seen = []
+    def rewrite(src, dst, header_metadata, length_of_header, resized):
+        with open(dst, "wb") as out, open(src, "rb") as f:
+            out.write(f.read())
+        seen.append(_mode(dst))
+    ns = _extract(ROOT / "saving_utils.py", ["_seed_unbacked_trained_tensors"],
+                  dict(os = os, stat = stat, shutil = shutil, json = json, safe_open = safe_open,
+                       _unbacked_trained_tensors = lambda *a, **k: {"lm_head.weight": torch.zeros(2, 2)},
+                       _stream_rewrite_resized_shard = rewrite))
+    shard = tmp_path / "model.safetensors"
+    save_file({"w": torch.zeros(4)}, str(shard)); os.chmod(shard, 0o600)
+    ns["_seed_unbacked_trained_tensors"](str(tmp_path), ["model.safetensors"], {}, "LlamaForCausalLM")
+    ns["_seed_unbacked_trained_tensors"](str(tmp_path), ["model.safetensors"], {}, "LlamaForCausalLM")
+    assert seen == [0o600, 0o600], "head rewrite wrote restricted weights at the umask default"
+    assert _mode(shard) == 0o600, "adding a trained head published a restricted shard at 0644"
