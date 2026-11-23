@@ -406,3 +406,26 @@ def test_install_imports_no_modeling_module_on_a_gpu_host(monkeypatch, has_gpu):
     torch.testing.assert_close(out.double(), want, atol = 1e-4, rtol = 1e-4)
     assert fla_vendor._rocm_fp32_state["reference"] is not None
     assert calls == []
+
+
+def test_cpu_decode_with_half_qk_and_float_v_keeps_values_past_half_range(monkeypatch):
+    """fla's fused_recurrent computes in float32 and stores into an output allocated like v. With fp16 q / k and
+    fp32 v, an output of 100000 (past fp16's 65504) must come back as 100000, not inf from a pass through q's dtype."""
+    package, chunk, recurrent, modeling, calls = _install_fake_fla(monkeypatch)
+    _run_patch_vendor_fla(monkeypatch)
+    K = 256
+    q = torch.ones(1, 1, 1, K, dtype = torch.float16)
+    k = torch.ones(1, 1, 1, K, dtype = torch.float16)
+    v = torch.full((1, 1, 1, 4), 6250.0)
+    g = torch.zeros(1, 1, 1)
+    beta = torch.ones(1, 1, 1)
+    o, ht = package.fused_recurrent_gated_delta_rule(
+        q, k, v, g = g, beta = beta, scale = 1 / 16, output_final_state = True,
+    )
+    assert o.dtype == torch.float32
+    torch.testing.assert_close(o, torch.full_like(o, 100000.0))
+    assert ht.dtype == torch.float32 and torch.isfinite(ht).all()
+    # The chunk entry point returns q's dtype, as fla's chunk does (o.to(q.dtype)).
+    o, _ = package.chunk_gated_delta_rule(q, k, v, g = g, beta = beta, scale = 1 / 16)
+    assert o.dtype == torch.float16
+    assert calls == []

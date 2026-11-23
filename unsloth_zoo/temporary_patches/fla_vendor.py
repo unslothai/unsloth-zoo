@@ -1355,6 +1355,9 @@ def _rocm_fp32_chunk_gated_delta_rule(
             "not support context parallel, use_gate_in_kernel or head_first. Use bfloat16 / float16 on the GPU."
         )
     reference = _torch_reference_gated_delta_rule(_recurrent)
+    # fla computes in float32 and stores into v's dtype (fused_recurrent) or returns q's (chunk). The reference casts
+    # its output to its query's dtype, so it gets float32 q / k: an fp16 q would overflow a value v's dtype holds.
+    out_dtype = v.dtype if _recurrent else q.dtype
     if _recurrent and beta is None:
         # fla's fused_recurrent default: beta = 1 per value head.
         beta = v.new_ones(v.shape[:-1])
@@ -1371,7 +1374,8 @@ def _rocm_fp32_chunk_gated_delta_rule(
     if scale is None:
         scale = head_dim ** -0.5
     # The reference multiplies q by head_dim ** -0.5 itself.
-    q = q * (scale * head_dim ** 0.5)
+    q = q.float() * (scale * head_dim ** 0.5)
+    k = k.float()
     if initial_state is not None and state_v_first:
         initial_state = initial_state.transpose(-1, -2)
 
@@ -1399,9 +1403,7 @@ def _rocm_fp32_chunk_gated_delta_rule(
         final_state = torch.cat(states, dim = 0) if output_final_state else None
     if final_state is not None and state_v_first:
         final_state = final_state.transpose(-1, -2).contiguous()
-    if _recurrent:
-        o = o.to(v.dtype)  # fla's fused_recurrent allocates its output like v
-    return o, final_state
+    return o.to(out_dtype), final_state
 
 
 def _make_rocm_fp32_chunk_gated_delta_rule(original):
