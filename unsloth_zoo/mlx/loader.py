@@ -1098,11 +1098,15 @@ def _patch_deepseek_ocr_transformers_import_compat(model_type):
         from transformers.models.llama import modeling_llama
     except Exception:
         return
-    if (
-        not hasattr(modeling_llama, "LlamaFlashAttention2")
-        and hasattr(modeling_llama, "LlamaAttention")
-    ):
-        modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
+    try:
+        if (
+            not hasattr(modeling_llama, "LlamaFlashAttention2")
+            and hasattr(modeling_llama, "LlamaAttention")
+        ):
+            modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
+    except ImportError:
+        # Without torch, modeling_llama is a placeholder whose attributes raise ImportError, not AttributeError.
+        pass
     try:
         from transformers.utils import import_utils
     except Exception:

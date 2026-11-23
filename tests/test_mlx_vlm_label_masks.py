@@ -945,6 +945,27 @@ def test_deepseek_ocr_loader_patches_removed_llama_flash_attention(monkeypatch):
     assert import_utils.is_torch_fx_available() is False
 
 
+def test_deepseek_ocr_loader_patch_tolerates_torch_free_transformers(monkeypatch):
+    import sys
+    import types
+
+    from unsloth_zoo.mlx.loader import _patch_deepseek_ocr_transformers_import_compat
+
+    class TorchFreeLlama(types.ModuleType):
+        def __getattr__(self, name):
+            raise ImportError(f"{name} requires the PyTorch library")
+
+    package = types.ModuleType("transformers.models.llama")
+    package.modeling_llama = TorchFreeLlama("transformers.models.llama.modeling_llama")
+    monkeypatch.setitem(sys.modules, "transformers.models.llama", package)
+    import transformers.utils.import_utils as import_utils
+    monkeypatch.delattr(import_utils, "is_torch_fx_available", raising=False)
+
+    _patch_deepseek_ocr_transformers_import_compat("deepseek_vl_v2")
+
+    assert import_utils.is_torch_fx_available() is False
+
+
 def test_deepseek_rendering_repairs_missing_image_token():
     from unsloth_zoo.mlx.utils import _render_vlm_messages
 
