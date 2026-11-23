@@ -966,6 +966,60 @@ def test_deepseek_ocr_loader_patch_tolerates_torch_free_transformers(monkeypatch
     assert import_utils.is_torch_fx_available() is False
 
 
+def test_mlx_vlm_loads_install_the_torch_free_image_processor_lookup():
+    from unsloth_zoo.mlx import loader
+
+    # Ahead of the runtime-quantized, distributed and plain VLM loads alike.
+    source = inspect.getsource(loader.FastMLXModel.from_pretrained)
+    patch = source.index("_patch_torch_free_image_processor_lookup()")
+    assert patch < source.index("if want_runtime_quant:\n                print(")
+
+
+def test_torch_free_image_processor_lookup_resolves_mis_tagged_pil_class(monkeypatch):
+    import sys
+    import types
+
+    from transformers.models.auto import image_processing_auto
+    from transformers.utils.import_utils import DummyObject
+
+    from unsloth_zoo.mlx.loader import _patch_torch_free_image_processor_lookup
+
+    class Placeholder(metaclass=DummyObject):
+        _backends = ["torch", "torchvision"]
+
+    pil_class = type("FakeVlmImageProcessorPil", (), {})
+    kept = type("KeptImageProcessorPil", (), {})
+    package = types.ModuleType("transformers.models.fakevlm")
+    package._class_to_module = {"FakeVlmImageProcessorPil": "image_processing_pil_fakevlm"}
+    submodule = types.ModuleType("transformers.models.fakevlm.image_processing_pil_fakevlm")
+    submodule.FakeVlmImageProcessorPil = pil_class
+    monkeypatch.setitem(sys.modules, package.__name__, package)
+    monkeypatch.setitem(sys.modules, submodule.__name__, submodule)
+    monkeypatch.setitem(
+        vars(image_processing_auto)["IMAGE_PROCESSOR_MAPPING_NAMES"],
+        "fakevlm",
+        {"torchvision": "FakeVlmImageProcessor", "pil": "FakeVlmImageProcessorPil"},
+    )
+    # Transformers 4 shape: a (slow, fast) tuple, which the lookup must step over.
+    monkeypatch.setitem(
+        vars(image_processing_auto)["IMAGE_PROCESSOR_MAPPING_NAMES"],
+        "oldvlm",
+        ("OldVlmImageProcessor", "OldVlmImageProcessorFast"),
+    )
+    resolved = {"FakeVlmImageProcessorPil": Placeholder, "FakeVlmImageProcessor": Placeholder, "KeptImageProcessorPil": kept}
+    monkeypatch.setattr(image_processing_auto, "get_image_processor_class_from_name", resolved.get)
+
+    _patch_torch_free_image_processor_lookup()
+    lookup = image_processing_auto.get_image_processor_class_from_name
+    _patch_torch_free_image_processor_lookup()
+
+    assert image_processing_auto.get_image_processor_class_from_name is lookup
+    assert lookup("FakeVlmImageProcessorPil") is pil_class
+    assert lookup("FakeVlmImageProcessor") is Placeholder
+    assert lookup("KeptImageProcessorPil") is kept
+    assert lookup("Missing") is None
+
+
 def test_deepseek_rendering_repairs_missing_image_token():
     from unsloth_zoo.mlx.utils import _render_vlm_messages
 

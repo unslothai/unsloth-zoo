@@ -1115,6 +1115,43 @@ def _patch_deepseek_ocr_transformers_import_compat(model_type):
         import_utils.is_torch_fx_available = lambda: False
 
 
+def _patch_torch_free_image_processor_lookup():
+    """Transformers 5 tags some PIL image processors (Idefics2, Idefics3, SmolVLM) as needing torch and torchvision,
+    which they never import, so a torch-free install resolves them to a placeholder and AutoImageProcessor rejects the
+    checkpoint; resolve such a placeholder from the module that defines it."""
+    try:
+        from transformers.models.auto import image_processing_auto
+        from transformers.utils.import_utils import DummyObject
+    except Exception:
+        return
+    lookup = image_processing_auto.get_image_processor_class_from_name
+    if getattr(lookup, "_unsloth_torch_free", False):
+        return
+    names = vars(image_processing_auto).get("IMAGE_PROCESSOR_MAPPING_NAMES") or {}
+    to_module = vars(image_processing_auto).get("model_type_to_module_name")
+
+    def get_image_processor_class_from_name(class_name):
+        found = lookup(class_name)
+        if not isinstance(found, DummyObject) or to_module is None:
+            return found
+        for model_type, classes in names.items():
+            # Transformers 4 maps a model type to a (slow, fast) tuple with no PIL entry.
+            if not isinstance(classes, dict) or class_name != classes.get("pil"):
+                continue
+            try:
+                package = importlib.import_module(f"transformers.models.{to_module(model_type)}")
+                submodule = package._class_to_module[class_name]
+                real = getattr(importlib.import_module(f"{package.__name__}.{submodule}"), class_name)
+            except Exception:
+                continue
+            if not isinstance(real, DummyObject):
+                return real
+        return found
+
+    get_image_processor_class_from_name._unsloth_torch_free = True
+    image_processing_auto.get_image_processor_class_from_name = get_image_processor_class_from_name
+
+
 def _deepseek_ocr_config_model_type(config_data):
     architectures = config_data.get("architectures") or ()
     if isinstance(architectures, str):
@@ -10031,6 +10068,7 @@ class FastMLXModel:
                     return operation(*args, **kwargs)
                 return vlm_config_view_owner.call(operation, *args, **kwargs)
 
+            _patch_torch_free_image_processor_lookup()
             if want_runtime_quant:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM, "
                       f"runtime {quantization_spec.bits}-bit {quantization_spec.mode} quantization)...")
