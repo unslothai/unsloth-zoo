@@ -33,7 +33,31 @@ def test_cpu_tensors_and_frozen_inputs_pass_through(gc_module):
     frozen = torch.ones(4)
     assert offloader.unpack(offloader.pack(frozen)) is frozen
     live = torch.ones(4, requires_grad = True)
-    assert offloader.unpack(offloader.pack(live)) is live
+    back = offloader.unpack(offloader.pack(live))
+    assert back.data_ptr() == live.data_ptr() and not back.requires_grad
+
+
+def test_host_tensor_saved_on_its_own_node_is_freed_without_backward(gc_module):
+    # sigmoid saves its own output: returned live, a CPU save holds its own node and a forward dropped
+    # without backward (eval under grad, an aborted step) is never freed.
+    import gc
+
+    from torch.multiprocessing.reductions import StorageWeakRef
+
+    offloader = gc_module.NonReentrantActivationOffloader(stream_mode = False)
+    x = torch.randn(16, 16, requires_grad = True)
+    with offloader.hooks():
+        y = torch.sigmoid(x * 2)
+    saved = StorageWeakRef(y.untyped_storage())
+    del y
+    gc.collect()
+    assert saved.expired(), "a dropped CPU forward outlived its last reference"
+    # Backward through the host shortcut still matches a plain forward.
+    with offloader.hooks():
+        torch.sigmoid(x * 2).sum().backward()
+    x2 = x.detach().requires_grad_()
+    torch.sigmoid(x2 * 2).sum().backward()
+    torch.testing.assert_close(x.grad, x2.grad)
 
 
 def test_stream_backend_is_opt_in(gc_module, monkeypatch):

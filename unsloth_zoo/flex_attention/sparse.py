@@ -98,6 +98,11 @@ def _same(tensor):
     return tensor
 
 
+def _detached(tensor):
+    # A failed probe backward leaves its graph unfreed: an op saving its own output would hold itself.
+    return tensor.detach()
+
+
 def probe_flex_backward(key, fn, args):
     """Run fwd + bwd of `fn(*args)` once per `key` on detached aliases so a failing flex backward raises
     inside the caller's try / except (latching the dense path) instead of in loss.backward().
@@ -120,8 +125,8 @@ def probe_flex_backward(key, fn, args):
     inputs = [t for t in aliases.values() if t.requires_grad]
     _PROBING[0] += 1
     try:
-        # Shield the probe's saved tensors from an active checkpoint's pack hook.
-        with torch.autograd.graph.saved_tensors_hooks(_same, _same):
+        # Shield the probe's saved tensors from an active checkpoint's pack hook (detached, see _detached).
+        with torch.autograd.graph.saved_tensors_hooks(_detached, _same):
             out = fn(*probe)
             torch.autograd.grad(out, inputs, torch.zeros_like(out), allow_unused = True)
     finally:

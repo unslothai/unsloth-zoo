@@ -486,6 +486,11 @@ def _identity(t):
     return t
 
 
+def _detached(t):
+    # A probe failing before its backward leaves the graph unfreed: an op saving its own output would hold itself.
+    return t.detach()
+
+
 def fused_swiglu_self_check(device, dtype, act, interleaved, alpha = 1.702, limit = 7.0) -> bool:
     """Cached bitwise probe of fused fwd + bwd vs eager autograd; eager ATen bits change across torch releases."""
     key = ("self_check", str(device), dtype, int(act), bool(interleaved), float(alpha), float(limit))
@@ -498,11 +503,11 @@ def fused_swiglu_self_check(device, dtype, act, interleaved, alpha = 1.702, limi
         if torch.cuda.is_current_stream_capturing():
             return False
     ok = False
-    # First call may sit in a non-reentrant checkpoint region; identity saved_tensors_hooks (innermost wins) keep the
+    # First call may sit in a non-reentrant checkpoint region; own saved_tensors_hooks (innermost wins) keep the
     # probe self-contained, since outer hooks would count its tensors (CheckpointError) and its grad would trigger a
     # nested recompute.
     try:
-        hooks = torch.autograd.graph.saved_tensors_hooks(_identity, _identity)
+        hooks = torch.autograd.graph.saved_tensors_hooks(_detached, _identity)
         hooks.__enter__()
     except Exception:
         return False  # hooks disabled here (e.g. a functorch transform): eager now, probe again later
