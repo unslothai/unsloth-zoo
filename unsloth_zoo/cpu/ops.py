@@ -384,10 +384,9 @@ def patch_trl_fused_lm_head():
 
 
 def patch_cpu_sdpa_gqa():
-    """transformers repeats K / V to the query head count whenever SDPA gets an attention mask (padded batches), since
-    CUDA's GQA path rejects masks; torch's CPU kernels take a mask with enable_gqa = True (torch >= 2.5) and backward
-    accumulates into the grouped heads. Qwen3-0.6B at 2 x 2048: 16 MiB of K / V copies per layer call saved.
-    CPU tensors only; idempotent. Returns True when installed."""
+    """Lets CPU SDPA take a mask with enable_gqa = True (torch >= 2.5), so transformers skips
+    repeating K / V (CUDA GQA rejects masks); Qwen3-0.6B at 2 x 2048 saves 16 MiB per layer. CPU
+    tensors only; idempotent; returns True when installed."""
     try:
         from transformers.integrations import sdpa_attention
     except Exception:
@@ -467,9 +466,8 @@ def store_frozen_linears_in_bf16(model):
 
 
 def set_bf16_stored_dtype(model, dtype):
-    """Moves Bf16StoredLinear weights to fp32 (generation) or back to bf16 (training). Lossless both ways: they hold
-    bf16 checkpoint values. Only weights this upcast are stored again, and only while frozen, so a trained copy
-    (modules_to_save) is never rounded. Returns how many weights moved."""
+    """Moves Bf16StoredLinear weights to fp32 or back to bf16 (lossless: bf16 checkpoint values),
+    returns count; only frozen upcast weights go back, so modules_to_save is never rounded."""
     moved = 0
     for module in model.modules():
         weight = getattr(module, "weight", None)

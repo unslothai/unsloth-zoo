@@ -264,13 +264,10 @@ def _arange(n, device):
 
 @torch.no_grad()
 def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attention_mask, rope, rope_dtype):
-    """[b, q, budget + ratio - 1] selected slots (-1 = unused), as the reference indexer; extends the caches. No host sync.
-
-    The reference forms blocks from each query's ordered visible slots. Every decode mask transformers builds (causal
-    plus a 2D padding mask: left, right or interior gaps) shows each query its row's visible slots up to itself, so
-    the cache keeps the last row's visible slots in order and pools blocks over that list. Returns None, before any
-    cache write, for a mask outside that shape when it lives on the host (checked for free); on an accelerator such
-    a step is counted in QWEN4_EXP_CACHED_DECODE_MISMATCH and intersected, so no hidden key is read."""
+    """Returns [b, q, budget + ratio - 1] slots, no host sync; blocks pool over each query's ordered
+    visible slots, so masks must show each query its visible slots; other masks: None before
+    cache writes on host, else counted in QWEN4_EXP_CACHED_DECODE_MISMATCH and intersected, so no
+    hidden key is read."""
     import math
     batch, q_len = hidden_states.shape[:2]
     raw_cache = layer.indexer_keys
@@ -385,11 +382,10 @@ def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attent
 
 
 def _qwen4_exp_cached_decode(module, hidden_states, position_embeddings, attention_mask, past_key_values, kwargs):
-    """QSA for a step into a filled DynamicCache (decode, MTP), or None for the reference (host sync per row).
-    Roped fp32 block keys are cached on the layer; only the selected K / V rows are gathered and attended.
-    Assumes each query sees its row's visible keys up to itself (causal plus any 2D padding mask: what generate
-    builds); other masks take the reference when on the host, else are counted in QWEN4_EXP_CACHED_DECODE_MISMATCH
-    and still intersected, so no hidden key is read."""
+    """QSA into a filled DynamicCache (decode, MTP), else None for the reference; caches roped fp32
+    block keys per layer, gathering only selected K / V rows; assumes each query sees its row's
+    visible keys up to itself; other masks take the reference on host, else are counted in
+    QWEN4_EXP_CACHED_DECODE_MISMATCH and intersected, so no hidden key is read."""
     if not _cached_decode_enabled() or past_key_values is None:
         return None
     output_attentions = kwargs.get("output_attentions")
