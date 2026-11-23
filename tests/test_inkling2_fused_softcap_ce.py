@@ -173,3 +173,41 @@ def test_zero_softcap_takes_the_exact_path(monkeypatch):
     got = model(x = x, labels = labels).loss
     torch.testing.assert_close(got, want)
 
+
+def test_unmerged_peft_adapter_on_the_head_still_trains(monkeypatch):
+    """A PEFT LoRA head adds its adapter in forward; the fused kernel reads only lm_head.weight, so such a head takes
+    the exact path and its adapter gets the gradient UNSLOTH_RETURN_LOGITS=1 gives. Merged or disabled: fused."""
+    peft = pytest.importorskip("peft")
+    from peft.tuners.lora.layer import Linear as LoraLinear
+
+    cls = _make_class("AdapterHeadToyForCausalLM", _Softcap)
+    assert forward_install.install_for_class(cls)
+    torch.manual_seed(0)
+    model = cls()
+    model.lm_head = LoraLinear(model.lm_head, "default", peft.LoraConfig(init_lora_weights = False), r = 2, lora_alpha = 2)
+    x = torch.randn(2, 8, 16)
+    labels = torch.randint(0, 300, (2, 8))
+    grads, losses = [], []
+    for mode in ("1", "0"):
+        monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", mode)
+        model.zero_grad(set_to_none = True)
+        out = model(x = x, labels = labels)
+        out.loss.backward()
+        grads.append(model.lm_head.lora_B["default"].weight.grad)
+        losses.append(out.loss.detach())
+    assert grads[1] is not None
+    torch.testing.assert_close(grads[1], grads[0])
+    torch.testing.assert_close(losses[1], losses[0])
+    with _disabled(model.lm_head):
+        assert model(x = x, labels = labels).logits.numel() == 0   # adapter off: the fused kernel engages again
+
+
+class _disabled:
+    def __init__(self, layer):
+        self.layer = layer
+
+    def __enter__(self):
+        self.layer.enable_adapters(False)
+
+    def __exit__(self, *exc):
+        self.layer.enable_adapters(True)

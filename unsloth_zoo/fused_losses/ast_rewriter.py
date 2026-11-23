@@ -661,6 +661,13 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     hidden_src = ast.unparse(cap.hidden_expr)
     logits_rhs = cap.logits_rhs_src or f"self.{head_attr}({hidden_src})"
 
+    # A PEFT tuner layer on the head adds its unmerged, enabled adapters in forward, while the kernel reads only
+    # lm_head.weight / bias (the adapter would get no gradient): exact path. Builtins only, so any namespace runs it.
+    live_adapter = (
+        f" or (getattr(self.{head_attr}, 'base_layer', None) is not None"
+        f" and not getattr(self.{head_attr}, 'merged', False)"
+        f" and not getattr(self.{head_attr}, 'disable_adapters', False))"
+    )
     # Re-checked per call: the loss can be swapped after install.
     if cap.guarded_scale_expr is not None and "logit_scale_multiply" not in already:
         scale_extra += f", logit_scale_multiply={ast.unparse(cap.guarded_scale_expr)}"
@@ -671,7 +678,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
             or cap.logits_bias_src is not None):
         template = textwrap.dedent(f"""
             if labels is not None:
-                if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' or not _can_fuse_loss(self.loss_function):
+                if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' or not _can_fuse_loss(self.loss_function){live_adapter}:
                     {logits} = {logits_rhs}
                     {loss} = self.loss_function({lf_args}{lf_extra}{kwargs_unpack})
                 else:
@@ -734,6 +741,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
         zero_scale += f" or ({ast.unparse(cap.softcap_expr)}) == 0"
     # Legacy CE blocks never call self.loss_function.
     custom_loss = "" if cap.legacy_body else " or not _can_fuse_loss(self.loss_function)"
+    custom_loss += live_adapter
     template = (
         "if labels is not None:\n"
         f"    if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1'{custom_loss}{zero_scale}:\n"
