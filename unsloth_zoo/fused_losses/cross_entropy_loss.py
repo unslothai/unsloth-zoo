@@ -948,12 +948,35 @@ _MODULE_HEAD_CHUNKED_CALLS = 0  # engagement count (tests)
 _MODULE_HEAD_FP32_ACCUM_NUMEL = 1 << 26
 
 
-def _module_head_chunkable(lm_head, base, n_rows, n_targets):
+def _fp16_without_scaler(lm_head, hidden_states, scaling):
+    """Float16 gradients with no loss scale: per-chunk sums (a bias gradient) underflow where one all-rows sum does
+    not, so such a head keeps the all-rows forward. With a GradScaler the chunk losses are scaled first."""
+    if not torch.is_grad_enabled():
+        return False
+    scale = _scaler_scale(scaling)
+    if torch.is_tensor(scale) or (scale is not None and float(scale) > 1.0):
+        return False
+    if hidden_states.dtype == torch.float16:
+        return True
+    if any(p.dtype == torch.float16 for p in lm_head.parameters() if p.requires_grad):
+        return True
+    device_type = hidden_states.device.type
+    if not _autocast_enabled(device_type):
+        return False
+    try:
+        return torch.get_autocast_dtype(device_type) == torch.float16
+    except AttributeError:  # torch < 2.4
+        return device_type != "cpu" and torch.get_autocast_gpu_dtype() == torch.float16
+
+
+def _module_head_chunkable(lm_head, base, hidden_states, n_targets, scaling):
     """True when lm_head(h)[rows] == lm_head(h[rows]) and one call per chunk changes nothing else."""
     # A trace keeps the traceable all-rows forward (no new graph break).
     if not _CHUNKED_MODULE_HEAD or torch.compiler.is_compiling():
         return False
-    if type(base) is not torch.nn.Linear or n_rows != n_targets:
+    if type(base) is not torch.nn.Linear or hidden_states.shape[:-1].numel() != n_targets:
+        return False
+    if _fp16_without_scaler(lm_head, hidden_states, scaling):
         return False
     for module in lm_head.modules():
         # A dropout mask drawn per chunk would not be the all-rows forward's mask.
@@ -1088,7 +1111,7 @@ def _module_head_ce_loss(lm_head, hidden_states, labels, mask, n_items, shift_la
     targets = _chunked_logprob._ce_targets(labels.to(torch.long), mask, shift_labels, ignore_index,
                                            hidden_states.device)
     rows = hidden_states.shape[:-1]
-    if _module_head_chunkable(lm_head, base, rows.numel(), targets.numel()):
+    if _module_head_chunkable(lm_head, base, hidden_states, targets.numel(), scaling):
         return _module_head_chunked_ce(lm_head, base.out_features, hidden_states, targets, n_items, scaling, kwargs)
     if type(base) is torch.nn.Linear and targets.numel() == rows.numel():
         # A row-wise head over a plain Linear: zero the ignored inputs so a half precision overflow inside the

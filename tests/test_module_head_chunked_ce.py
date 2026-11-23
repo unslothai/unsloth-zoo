@@ -18,6 +18,8 @@
 labelled rows with each chunk's gradients taken in forward, so the full logits never exist: loss and every
 gradient must match the all-rows path (UNSLOTH_CHUNKED_MODULE_HEAD=0) (CPU, float64)."""
 
+import copy
+
 import pytest
 import torch
 
@@ -186,3 +188,50 @@ def test_traced_call_keeps_the_all_rows_forward(monkeypatch):
     got = torch.compile(loss_fn, fullgraph = True, backend = "eager")(hidden)
     assert getattr(ce, "_MODULE_HEAD_CHUNKED_CALLS", 0) == before
     _close(got, loss_fn(hidden))
+
+
+def _fp16_case(monkeypatch, chunked, scaling = None):
+    """A float16 LoRA head (trainable bias), 32000 vocabulary, 1648 labelled rows: per-element gradients sit at the
+    float16 subnormal floor. Returns each trainable tensor's error against the float32 head, and the engagement."""
+    torch.manual_seed(0)
+    toy = torch.nn.Module()
+    toy.lm_head = torch.nn.Linear(512, 32000, bias = True)
+    cfg = peft.LoraConfig(r = 16, lora_alpha = 32, target_modules = ["lm_head"], init_lora_weights = False,
+                          bias = "all")
+    head16 = peft.get_peft_model(toy, cfg).base_model.model.lm_head
+    ref = copy.deepcopy(head16)
+    head16.half()
+    torch.manual_seed(1)
+    labels = torch.randint(0, 32000, (1, 2048))
+    labels[:, :400] = -100
+    hidden = torch.randn(1, 2048, 512) * 0.5
+    monkeypatch.setattr(ce, "_MODULE_HEAD_ROWS", 300, raising = False)
+    monkeypatch.setattr(ce, "_CHUNKED_MODULE_HEAD", chunked, raising = False)
+    upstream = 2.0 * (scaling or 1.0)  # a loss weight of 2, times the GradScaler scale when there is one
+    out = []
+    for head, h in ((head16, hidden.half()), (ref, hidden)):
+        before = getattr(ce, "_MODULE_HEAD_CHUNKED_CALLS", 0)
+        loss = unsloth_fused_ce_loss(trainer = None, hidden_states = h, lm_head_weight = head.base_layer.weight,
+                                     lm_head_bias = head.base_layer.bias, labels = labels, torch_compile = False,
+                                     lm_head_module = head, scaling = scaling)
+        engaged = getattr(ce, "_MODULE_HEAD_CHUNKED_CALLS", 0) - before
+        (loss * upstream).backward()
+        out.append(([p.grad.float() / upstream for p in head.parameters() if p.requires_grad], engaged))
+    (got, engaged), (want, _) = out
+    return [((g - w).norm() / w.norm()).item() for g, w in zip(got, want)], engaged
+
+
+def test_fp16_without_a_grad_scaler_keeps_the_all_rows_forward(monkeypatch):
+    # Flip: chunked, the upstream factor reached the float16 per-chunk gradients only after they were rounded
+    # (bias error 0.15 against 0.007 all rows); without a loss scale the head now keeps the all-rows forward.
+    want, _ = _fp16_case(monkeypatch, chunked = False)
+    got, engaged = _fp16_case(monkeypatch, chunked = True)
+    torch.testing.assert_close(got, want, rtol = 1e-3, atol = 0)
+    assert engaged == 0
+
+
+def test_fp16_with_a_grad_scaler_stays_chunked(monkeypatch):
+    want, _ = _fp16_case(monkeypatch, chunked = False, scaling = 1024.0)
+    got, engaged = _fp16_case(monkeypatch, chunked = True, scaling = 1024.0)
+    assert engaged == 1
+    assert all(g <= 1.5 * w + 2e-3 for g, w in zip(got, want)), (got, want)
