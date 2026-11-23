@@ -111,6 +111,31 @@ def test_load_vllm_starts_an_in_process_metal_engine_on_the_loaded_checkpoint(mo
     assert model.vllm_engine is engine and model.fast_generate("hi")[0] == "generated"
 
 
+def _tiny(seed, layers=2, dtype="bfloat16"):
+    import mlx.core as mx
+    qwen3 = pytest.importorskip("mlx_lm.models.qwen3")
+    mx.random.seed(seed)
+    model = qwen3.Model(qwen3.ModelArgs("qwen3", 64, layers, 128, 4, 1e-6, 128, 2, 128, 16, True, 1e4))
+    return model.set_dtype(getattr(mx, dtype)) or model
+
+
+@pytest.mark.parametrize("layers, dtype, multiprocess, loads", [(2, "bfloat16", "0", [True]), (1, "bfloat16", "0", [True, False]), (2, "float16", "0", [True, False]), (2, "bfloat16", "1", [False])])
+def test_an_in_process_engine_shares_only_matching_weights(monkeypatch, layers, dtype, multiprocess, loads):
+    from mlx.utils import tree_flatten
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", multiprocess)
+    _fake_vllm(monkeypatch, "vllm_metal.platform")
+    calls, model = [], _tiny(0, layers, dtype)
+    life = types.SimpleNamespace(mlx_lm_load_model=lambda path, lazy=False: (calls.append(lazy), (_tiny(1), {}))[1], mlx_vlm_load_model=lambda path: _tiny(2))
+    v1, original, model._src_path = types.SimpleNamespace(model_lifecycle=life), life.mlx_lm_load_model, "/snap"
+    for item in (("vllm_metal", types.SimpleNamespace(v1=v1)), ("vllm_metal.v1", v1), ("vllm_metal.v1.model_lifecycle", life)):
+        monkeypatch.setitem(sys.modules, *item)
+    monkeypatch.setattr(sys.modules["vllm"], "LLM", lambda **kw: (life.mlx_lm_load_model(kw["model"])[0], life.mlx_vlm_load_model(kw["model"])))
+    engine, vision = vllm_utils.load_vllm(model, max_seq_length=64)
+    aliased = [array is dict(tree_flatten(model.parameters())).get(name) for name, array in tree_flatten(engine.parameters())]
+    assert calls == loads and life.mlx_lm_load_model is original and all(aliased) == (loads == [True]) == any(aliased)
+    assert all(getattr(m, "_unsloth_no_checkpoint", False) == (multiprocess == "0") for x in (engine, vision) for _, m in x.named_modules())
+
+
 def test_load_vllm_refuses_a_non_metal_vllm(monkeypatch):
     _fake_vllm(monkeypatch, "vllm.platforms.cpu")
     with pytest.raises(ImportError, match="not vllm-metal"):

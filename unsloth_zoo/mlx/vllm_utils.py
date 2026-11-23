@@ -17,6 +17,7 @@
 """vLLM on Apple Silicon through the vllm-metal platform plugin: the MLX counterpart of ``unsloth_zoo.vllm_utils``."""
 
 import atexit
+import contextlib
 import importlib.util
 import itertools
 import os
@@ -88,8 +89,52 @@ def use_vllm(fast_inference):
     return False
 
 
+def _share_weights(engine_model, model):
+    """Point the engine's (lazily loaded) arrays at ``model``'s when every name, shape and dtype matches."""
+    from mlx.utils import tree_flatten, tree_unflatten
+
+    wanted = dict(tree_flatten(engine_model.parameters()))
+    trained = dict(tree_flatten(model.parameters()))
+    if any(name not in trained or trained[name].shape != array.shape or trained[name].dtype != array.dtype
+           for name, array in wanted.items()):
+        return False
+    engine_model.update(tree_unflatten([(name, trained[name]) for name in wanted]))
+    return True
+
+
+@contextlib.contextmanager
+def _in_process_engine_loads(model):
+    """While an in-process engine starts, its mlx-lm model takes the training model's weights instead of a second
+    copy, and its layers skip Unsloth's class-level gradient checkpointing."""
+    try:
+        import vllm_metal.v1.model_lifecycle as lifecycle
+    except ImportError:
+        yield
+        return
+    from .utils import exempt_from_gradient_checkpointing
+
+    original, original_vlm = lifecycle.mlx_lm_load_model, lifecycle.mlx_vlm_load_model
+
+    def load(model_path, lazy=False, **kwargs):
+        # Lazy, so the checkpoint's arrays are never read when the training model's replace them. This has to
+        # happen inside the load: the runner compiles blocks over the weights it holds right after it.
+        engine_model, config = original(model_path, lazy=True, **kwargs)
+        if not _share_weights(engine_model, model):
+            engine_model, config = original(model_path, lazy=lazy, **kwargs)
+        return exempt_from_gradient_checkpointing(engine_model), config
+
+    def load_vlm(*args, **kwargs):
+        return exempt_from_gradient_checkpointing(original_vlm(*args, **kwargs))
+
+    lifecycle.mlx_lm_load_model, lifecycle.mlx_vlm_load_model = load, load_vlm
+    try:
+        yield
+    finally:
+        lifecycle.mlx_lm_load_model, lifecycle.mlx_vlm_load_model = original, original_vlm
+
+
 def load_vllm(model, *, max_seq_length, gpu_memory_utilization=0.5, max_lora_rank=64, enable_lora=True, seed=0):
-    """Start an in-process vllm-metal engine on the checkpoint ``model`` was loaded from."""
+    """Start an in-process vllm-metal engine on the checkpoint ``model`` was loaded from, sharing its weights."""
     # In-process engine core: a spawned one re-imports the notebook or script's __main__.
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     error = _metal_platform_error()
@@ -108,7 +153,10 @@ def load_vllm(model, *, max_seq_length, gpu_memory_utilization=0.5, max_lora_ran
     )
     if enable_lora:
         engine_kwargs.update(enable_lora=True, max_lora_rank=int(max_lora_rank), max_loras=1)
-    return LLM(**engine_kwargs)
+    if os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] != "0":
+        return LLM(**engine_kwargs)
+    with _in_process_engine_loads(model):
+        return LLM(**engine_kwargs)
 
 
 def attach_vllm_engine(model, engine):
