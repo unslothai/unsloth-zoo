@@ -162,6 +162,111 @@ def test_enclosing_graph_with_a_strictly_dynamic_input_is_left_alone(rocm):
     assert graphs and all(symbolic for _, _, symbolic in graphs)
 
 
+def _batched_layer():
+    w = torch.randn(8, 8, requires_grad = True)
+
+    def layer(x):
+        q = (x @ w).unsqueeze(1)
+        return flex_module.compile_friendly_flex_attention(q, q, q, training = True)
+    return torch.compile(layer, fullgraph = True)
+
+
+def test_enclosing_graph_keeps_a_dynamic_batch_symbolic(rocm):
+    # Block compile marks the block batch maybe_mark_dynamic (#15106): only the sequence length may be specialized,
+    # else every batch size is a new block graph and eats the block's isolate_recompiles budget.
+    graphs, install = rocm
+    install()
+    compiled = _batched_layer()
+    for batch in (2, 3, 4, 5):
+        x = torch.randn(batch, 32, 8)
+        torch._dynamo.maybe_mark_dynamic(x, 0)
+        compiled(x).sum().backward()
+    assert len(graphs) == 1 and all(symbolic for _, _, symbolic in graphs), graphs
+
+
+def test_enclosing_graph_compiles_once_per_length_not_per_batch_and_length(rocm):
+    graphs, install = rocm
+    install()
+    compiled = _batched_layer()
+    for length in (32, 24, 40):
+        for batch in (2, 3):
+            x = torch.randn(batch, length, 8)
+            torch._dynamo.maybe_mark_dynamic(x, 0)
+            compiled(x).sum().backward()
+    assert len(graphs) == 3, graphs
+
+
+def test_strictly_dynamic_batch_still_specializes_the_length(rocm):
+    # mark_dynamic on the batch only: the length is not derived from it, so it is still made static.
+    graphs, install = rocm
+    install()
+    compiled = _batched_layer()
+    for length in (32, 24, 40):
+        x = torch.randn(2, length, 8)
+        torch._dynamo.mark_dynamic(x, 0)
+        compiled(x).sum().backward()
+    assert len(graphs) == 3 and all(symbolic for _, _, symbolic in graphs), graphs
+
+
+@pytest.fixture
+def stats(monkeypatch):
+    from unsloth_zoo import rocm_flex_static
+    monkeypatch.setattr(rocm_flex_static, "ROCM_FLEX_STATIC_STATS", dict.fromkeys(rocm_flex_static.ROCM_FLEX_STATIC_STATS, 0))
+    monkeypatch.setattr(rocm_flex_static, "_WARNED", set())
+    return rocm_flex_static
+
+
+def test_engagement_counters(rocm, stats):
+    graphs, install = rocm
+    fn = install()
+    for length in (32, 24):
+        fn(*_qkv(length), training = True)[0].sum().backward()
+    assert stats.ROCM_FLEX_STATIC_STATS["static_calls"] == 2
+    compiled = _batched_layer()
+    for length in (32, 24, 40):
+        compiled(torch.randn(2, length, 8)).sum().backward()
+    counts = stats.ROCM_FLEX_STATIC_STATS
+    # The first trace is static already (nothing to specialize); the next two carry a symbolic length.
+    assert counts["specialized"] == 2 and counts["failed"] == 0 and counts["left_dynamic"] == 0, counts
+
+
+def test_strictly_dynamic_length_is_counted_and_warned(rocm, stats):
+    graphs, install = rocm
+    install()
+    compiled = _batched_layer()
+    with pytest.warns(RuntimeWarning, match = "stays symbolic"):
+        for length in (32, 24):
+            x = torch.randn(1, length, 8)
+            torch._dynamo.mark_dynamic(x, 1)
+            compiled(x).sum().backward()
+    assert stats.ROCM_FLEX_STATIC_STATS["left_dynamic"] >= 1
+
+
+def test_moved_dynamo_internals_warn_once_instead_of_failing_silently(rocm, stats, monkeypatch):
+    graphs, install = rocm
+    install()
+
+    def moved(ctx):
+        raise AttributeError("_ComptimeContext__tx")
+    monkeypatch.setattr(stats, "_strict_symbols", moved)
+    compiled = _batched_layer()
+    with pytest.warns(RuntimeWarning, match = "could not make flex_attention sequence lengths static") as record:
+        for length in (32, 24, 40):
+            compiled(torch.randn(1, length, 8)).sum().backward()
+    assert len([w for w in record if "could not make" in str(w.message)]) == 1
+    # The symbolic length is kept (one graph serves 24 and 40), as on a torch whose internals moved.
+    assert stats.ROCM_FLEX_STATIC_STATS["failed"] == 1 and stats.ROCM_FLEX_STATIC_STATS["specialized"] == 0
+    assert len(graphs) == 2 and graphs[-1][2], graphs
+
+
+def test_missing_comptime_warns_at_install(rocm, stats, monkeypatch):
+    graphs, install = rocm
+    monkeypatch.setattr(stats, "_comptime", None)
+    with pytest.warns(RuntimeWarning, match = "comptime is unavailable"):
+        install()
+    assert stats.ROCM_FLEX_STATIC_STATS["failed"] == 1
+
+
 def test_helper_imported_before_the_patch_is_covered(rocm):
     # modeling_doge imports compile_friendly_flex_attention by name.
     graphs, install = rocm
