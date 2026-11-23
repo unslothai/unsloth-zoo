@@ -1445,7 +1445,8 @@ def _stream_merged_save(model, save_directory, save_method, max_shard_size = Non
             for name, shard in shards:
                 temporary = os.path.join(save_directory, f".{name}.unsloth-tmp")
                 staged.append((temporary, os.path.join(save_directory, name)))
-                precreate_private_temp(temporary, staged[-1][1])
+                # A new shard name (shard count changed) is kept private while written like the earlier export's.
+                precreate_private_temp(temporary, next((p for p in (staged[-1][1], *earlier) if os.path.isfile(p)), staged[-1][1]))
                 _write_safetensors(temporary, shard, rank)
         if len(shards) > 1:
             total_parameters = sum(p.numel() for n, p in hf.named_parameters() if ".lora_" not in n)

@@ -35,7 +35,7 @@ import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
-from unsloth_zoo.private_staging import copy_keep_mode, keep_mode
+from unsloth_zoo.private_staging import copy_keep_mode, keep_mode, precreate_private_temp
 
 __all__ = [
     "DecisionModel",
@@ -2012,6 +2012,7 @@ def save_decision_model(model, folder, source, agent_config = None):
     (folder / "rl_agent_config.json").unlink(missing_ok = True)
     # Replaced, not written in place: in a Hugging Face cache the file is a link to a blob other revisions share.
     partial = folder / "model.partial.safetensors"
+    precreate_private_temp(partial, folder / "model.safetensors")  # restricted weights stay private while written
     mx.save_safetensors(str(partial), weights)
     keep_mode(partial, folder / "model.safetensors")  # a re-save keeps weights the user restricted restricted
     os.replace(partial, folder / "model.safetensors")
@@ -2984,6 +2985,8 @@ def save_d1_model(pipeline, folder, source = None, temperatures = None):
             buckets = {"noul": temperatures["noul"], **{f"choice:{size}": temperatures["choice"] for size in ("small", "mid", "large", "inventory")}}
             (staging / "calibration.json").write_text(json.dumps({"temperatures": buckets, "default": temperatures["score"]}), encoding = "utf-8")
         (staging / "config.json").write_text(json.dumps(_as_d1_config(_read_json(source / "config.json")), indent = 2), encoding = "utf-8")
+        for item in staging.iterdir():
+            keep_mode(item, folder / item.name)  # a re-save keeps weights the user restricted restricted
         # config.json makes a folder a d1: it is replaced last, so an interrupted save does not read as complete.
         (folder / "config.json").unlink(missing_ok = True)
         (folder / "calibration.json").unlink(missing_ok = True)

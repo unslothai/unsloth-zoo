@@ -662,15 +662,8 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     hidden_src = ast.unparse(cap.hidden_expr)
     logits_rhs = cap.logits_rhs_src or f"self.{head_attr}({hidden_src})"
 
-    # The kernel reads only lm_head.weight / bias. A PEFT head's forward is exactly that when it is merged with its
-    # adapters enabled (base_layer alone, on the merged weight) or unmerged with them disabled. Unmerged and enabled
-    # adds adapters the kernel would give no gradient; merged and disabled unmerges inside its forward. Those two
-    # states take the exact path. Builtins only, so any namespace runs it.
-    live_adapter = (
-        f" or (getattr(self.{head_attr}, 'base_layer', None) is not None"
-        f" and bool(getattr(self.{head_attr}, 'merged', False))"
-        f" == bool(getattr(self.{head_attr}, 'disable_adapters', False)))"
-    )
+    # A live PEFT adapter on the head is not checked here: unsloth_fused_lm_head_loss sends such a head through its
+    # own forward (lm_head_needs_module_forward), as the compiler path does, so both return EMPTY_LOGITS.
     # Re-checked per call: the loss can be swapped after install.
     if cap.guarded_scale_expr is not None and "logit_scale_multiply" not in already:
         scale_extra += f", logit_scale_multiply={ast.unparse(cap.guarded_scale_expr)}"
@@ -681,7 +674,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
             or cap.logits_bias_src is not None):
         template = textwrap.dedent(f"""
             if labels is not None:
-                if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' or not _can_fuse_loss(self.loss_function){live_adapter}:
+                if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' or not _can_fuse_loss(self.loss_function):
                     {logits} = {logits_rhs}
                     {loss} = self.loss_function({lf_args}{lf_extra}{kwargs_unpack})
                 else:
@@ -747,7 +740,6 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
         zero_scale += f" or not (isinstance({cap_src}, (int, float)) and {cap_src} != 0)"
     # Legacy CE blocks never call self.loss_function.
     custom_loss = "" if cap.legacy_body else " or not _can_fuse_loss(self.loss_function)"
-    custom_loss += live_adapter
     template = (
         "if labels is not None:\n"
         f"    if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1'{custom_loss}{zero_scale}:\n"
