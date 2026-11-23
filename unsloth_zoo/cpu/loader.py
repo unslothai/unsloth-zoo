@@ -27,7 +27,7 @@ import weakref
 
 import torch
 
-from ..private_staging import precreate_private_temp
+from unsloth_zoo.private_staging import precreate_private_temp
 from .runtime import available_ram, cpu_bf16_supported, cpu_bnb_4bit_supported
 from .ops import (
     Bf16StoredLinear, _plain_lm_head, patch_causal_conv1d_fallback, patch_chunked_causal_lm_loss, set_bf16_stored_dtype,
