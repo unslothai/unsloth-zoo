@@ -1339,13 +1339,13 @@ def patch_flex_attention_static_shapes_on_rocm():
     # sequence length recompiles it with a symbolic length. On gfx1151 (torch 2.11, ROCm 7.13 / 7.14) that kernel
     # returns inf / NaN gradients (tiny Gemma-3 trained at 24 tokens after a 32 token step), while a static compile
     # per length and eager flex are both correct. Calls whose backward will run on a ROCm GPU get a static compile;
-    # inside an enclosing graph their Q / K / V sizes are specialized. No-grad calls (decode) keep transformers'
-    # compile. The module globals that compile_friendly_flex_attention resolves per call are patched (the class's
-    # __call__ and flex_attention), so a helper imported before this patch (Doge) is covered, and the helper itself,
-    # with its compiler boundary and any saved-attention wrapper, stays in place.
+    # inside an enclosing graph their Q / K / V sequence lengths are specialized (the batch stays symbolic). No-grad
+    # calls (decode) keep transformers' compile. The module globals that compile_friendly_flex_attention resolves per
+    # call are patched (the class's __call__ and flex_attention), so a helper imported before this patch (Doge) is
+    # covered, and the helper itself, with its compiler boundary and any saved-attention wrapper, stays in place.
     from unsloth_zoo.rocm_flex_static import (
         rocm_flex_static_enabled, needs_static_flex, specialize_flex_shapes, compile_static_flex,
-        _without_dynamic_marks,
+        _without_dynamic_marks, _note_static_call, _check_comptime,
     )
     if not rocm_flex_static_enabled():
         return
@@ -1384,6 +1384,7 @@ def patch_flex_attention_static_shapes_on_rocm():
                 if function is None:
                     function = static[training] = compile_static_flex(rocm_static_flex_attention, training)
                 query, key, value = map(_without_dynamic_marks, (query, key, value))
+                _note_static_call()
                 return function(query, key, value, **kwargs)
             return stock(query, key, value, **kwargs)
         return flex_attention_call
@@ -1395,6 +1396,7 @@ def patch_flex_attention_static_shapes_on_rocm():
             specialize_flex_shapes(query, key, value)
         return raw_flex(query, key, value, *args, **kwargs)
 
+    _check_comptime()
     flex_attention._unsloth_rocm_static = True
     __call__._unsloth_rocm_static = True
     wrapped.__call__ = __call__
