@@ -904,12 +904,38 @@ except Exception:
     pass
 
 
+def _strict_slot_impl(token, grad):
+    # Runs every time the strict in-graph route runs, compiled or not: it does to the frame what the
+    # helpers do for a call that keeps nothing (one empty entry in the first pass, one entry taken in the
+    # replay), so entries stay matched by call order whichever route each pass took.
+    frame = getattr(_TLS, "frame", None)
+    if frame is None:
+        return
+    if not frame.replaying:
+        if not grad:
+            frame.entries.append(None)
+    elif grad:
+        _take_entry(frame)
+
+
+_SLOT_TOKEN = torch.zeros(())
+try:
+    # An opaque op stays in a fullgraph compile; the declared mutation keeps it from being dropped as dead
+    # code and orders the slots of one graph. Grad mode is read at trace time, as the helpers read it.
+    @torch.library.custom_op("unsloth_zoo::saved_attention_strict_slot", mutates_args = ("token",))
+    def _strict_slot(token: torch.Tensor, grad: bool) -> None:
+        _strict_slot_impl(token, grad)
+except Exception:
+    _strict_slot = None
+
+
 def _rocm_without_frame():
     # ROCm: a call outside any frame (no Unsloth checkpoint, or a device whose SDPA keeps nothing) stays
     # in the caller's graph instead of reaching the compiler-disabled helpers, which a fullgraph=True
     # training compile cannot cross. Dynamo guards on the thread-local read. Inside a frame, only a call
-    # traced by a compile that may not graph break stays in the graph: it keeps nothing, and a fullgraph
-    # compile never falls back to eager, so the replay takes that route too. Any other compile (Unsloth's
+    # traced by a compile that may not graph break stays in the graph: it keeps nothing, and its slot op
+    # fills or takes that call's entry, so a pass that falls back to eager (a fullgraph=False compile
+    # under error_on_graph_break at its recompile limit) still lines up with the other. Any other compile (Unsloth's
     # blocks, a user's fullgraph=False) breaks into the helpers as eager code does: a fullgraph=False
     # frame can fall back to eager on one pass only (recompile limit), and the frame's entries are
     # matched by call order, so both passes must take the same route whatever the compile does.
@@ -919,7 +945,11 @@ def _rocm_without_frame():
         return True
     if not torch.compiler.is_compiling() or _in_unsloth_compiled_block():
         return False
-    return _strict_trace()
+    if not _strict_trace():
+        return False
+    if _strict_slot is not None:
+        _strict_slot(_SLOT_TOKEN, torch.is_grad_enabled())
+    return True
 
 
 def _wrap_attention_interface(fn):

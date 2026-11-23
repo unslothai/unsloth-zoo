@@ -634,6 +634,62 @@ def test_rocm_frame_stays_in_the_graph_under_error_on_graph_break(monkeypatch):
     assert frame.entries == [] and SA.SAVED_ATTENTION_STATS.get("stored", 0) == 0
 
 
+@pytest.mark.parametrize("kind", ["interface", "flex"])
+@pytest.mark.parametrize("backend", ["eager", "aot_eager", "inductor"])
+def test_rocm_strict_frame_replays_the_right_call_when_a_compile_falls_back_to_eager(monkeypatch, kind, backend):
+    """error_on_graph_break(True) in a fullgraph=False compile: the first pass (no_grad) compiles and
+    keeps nothing for that call, the replay hits the recompile limit and runs eagerly. The eager replay
+    of the strict call must not take the entry the next (eager) call kept."""
+    if not hasattr(torch._dynamo, "error_on_graph_break"):
+        pytest.skip("torch._dynamo.error_on_graph_break is torch 2.9+")
+    call = _rocm_frame_qkv_wrapper(monkeypatch, kind)
+    torch.manual_seed(0)
+    inputs = tuple(torch.randn(1, 2, 32, 16) for _ in range(3))
+    ref_loss, ref_grads = _two_attention_reference(inputs)
+
+    def strict(q, k, v):
+        with torch._dynamo.error_on_graph_break(True):
+            return call(q, k, v)
+
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(strict, backend = backend, fullgraph = False)
+        with torch._dynamo.config.patch(recompile_limit = 1):
+            loss, grads = _two_attention_frame(call, lambda replaying: compiled, inputs)
+    finally:
+        torch._dynamo.reset()
+    torch.testing.assert_close(loss, ref_loss)
+    for got, want in zip(grads, ref_grads):
+        torch.testing.assert_close(got, want, rtol = 1e-4, atol = 1e-6)
+    assert SA.SAVED_ATTENTION_STATS.get("unmatched", 0) == 0, dict(SA.SAVED_ATTENTION_STATS)
+
+
+@pytest.mark.parametrize("kind", ["interface", "flex"])
+def test_rocm_strict_replay_after_an_eager_first_pass_keeps_call_order(monkeypatch, kind):
+    """The reverse: the first pass runs the strict call eagerly (it keeps an entry), the replay runs it
+    compiled in the graph. The compiled replay must consume that entry so the next call takes its own."""
+    if not hasattr(torch._dynamo, "error_on_graph_break"):
+        pytest.skip("torch._dynamo.error_on_graph_break is torch 2.9+")
+    call = _rocm_frame_qkv_wrapper(monkeypatch, kind)
+    torch.manual_seed(0)
+    inputs = tuple(torch.randn(1, 2, 32, 16) for _ in range(3))
+    ref_loss, ref_grads = _two_attention_reference(inputs)
+
+    def strict(q, k, v):
+        with torch._dynamo.error_on_graph_break(True):
+            return call(q, k, v)
+
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(strict, backend = "eager", fullgraph = False)
+        loss, grads = _two_attention_frame(call, lambda replaying: compiled if replaying else strict, inputs)
+    finally:
+        torch._dynamo.reset()
+    torch.testing.assert_close(loss, ref_loss)
+    for got, want in zip(grads, ref_grads):
+        torch.testing.assert_close(got, want, rtol = 1e-4, atol = 1e-6)
+
+
 def test_rocm_hooks_install_from_the_setting_not_the_current_gpu(monkeypatch):
     monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
     _simulated_rocm(monkeypatch, verdicts = {0: _MATH})
