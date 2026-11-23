@@ -1332,42 +1332,74 @@ def _selective_dequant_chunk_experts() -> int:
 
 
 _DEVICE_TOTAL_BYTES = {}
+# Devices where an auto-capped stack once did not fit: chunk there from then on. One way, so a checkpointed layer's
+# first pass and replay take the same plan (and the kept base output) except across the single flip.
+_AUTO_DEQUANT_TIGHT = set()
 
 
-def _auto_dequant_chunk_experts(splits, dtype, experts_module, device) -> int:
-    """Experts per chunk keeping one projection's dequantized stack under a scratch cap, or 0 for the whole stack.
-
-    The cap is UNSLOTH_MOE_DEQUANT_MAX_MB when set (chunks whenever a stack exceeds it), else the experts class's
-    `_unsloth_dequant_scratch_fraction` of the card, applied only to stacks over twice that share: chunking costs a
-    host sync per call and disables the kept checkpoint base, so a stack the card holds easily stays whole (Inkling-2-
-    Mini's 1.27 GiB gate_up stack is chunked on a 15 GB T4, not on a 40 GB A100; Small's 16 GiB one on any card).
-    An explicit UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS (0 included) wins. Chunks read the same values as the whole stack."""
+def _auto_dequant_cap_source(experts_module):
+    """(cap from UNSLOTH_MOE_DEQUANT_MAX_MB in bytes or None, class scratch fraction or None); both None means no
+    automatic cap applies. Reads no tensor, so unflagged models pay nothing beyond two lookups."""
     if "UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS" in os.environ:
-        return 0
+        return None, None   # an explicit chunk setting wins, 0 included
     raw = os.environ.get("UNSLOTH_MOE_DEQUANT_MAX_MB", "auto").strip().lower()
-    whole_up_to = 1.0
     if raw not in ("", "auto"):
         try:
             cap = float(raw) * 2**20
         except ValueError:
-            return 0
-    else:
-        whole_up_to = 2.0
-        fraction = getattr(experts_module, "_unsloth_dequant_scratch_fraction", None)
-        if not fraction or device.type != "cuda":
-            return 0
-        index = device.index if device.index is not None else torch.cuda.current_device()
-        total = _DEVICE_TOTAL_BYTES.get(index)
-        if total is None:
-            total = _DEVICE_TOTAL_BYTES[index] = torch.cuda.get_device_properties(index).total_memory
-        cap = float(fraction) * total
-    if cap <= 0:
+            return None, None
+        return (cap if cap > 0 else None), None
+    fraction = getattr(experts_module, "_unsloth_dequant_scratch_fraction", None)
+    return None, (float(fraction) if fraction else None)
+
+
+def _device_headroom_bytes(index):
+    """(driver free bytes on cuda:index, callable adding the allocator's reserved but unused blocks, which it releases
+    and retries with before failing). The allocator stats are read only when the driver reading alone is short; both
+    cost host time (mem_get_info ~0.2 ms), never a device sync."""
+    free = torch.cuda.mem_get_info(index)[0]
+    return free, lambda: free + max(torch.cuda.memory_reserved(index) - torch.cuda.memory_allocated(index), 0)
+
+
+def _auto_dequant_chunk_experts(splits, dtype, experts_module, device, experts_needed = None) -> int:
+    """Experts per chunk keeping one projection's dequantized scratch under a cap, or 0 for the unchunked plan.
+
+    `experts_needed` is how many experts the unchunked plan reads (the sync-free capped plan's rows, else the whole
+    stack E); the scratch is that many experts of the largest projection.
+    UNSLOTH_MOE_DEQUANT_MAX_MB set: a hard cap, chunk whenever the scratch exceeds it.
+    Otherwise only experts classes declaring `_unsloth_dequant_scratch_fraction` (Inkling 2) take part, with a cap of
+    that share of the card. Chunking costs a host sync per call and disables the kept checkpoint base, so it engages
+    only on need: the scratch is over twice the cap AND it does not fit the device right now (twice the scratch, for
+    the dequant plus a cast or transposed copy, plus one cap of slack, above the free memory). Once a device is found
+    short it stays chunked (`_AUTO_DEQUANT_TIGHT`). Inkling-2-Mini's 1.27 GiB gate_up stack therefore stays whole on
+    a 40 GB card without any query, and on 16 to 32 GB cards until memory is actually short; Small's 16 GiB stack
+    chunks wherever it does not fit. An explicit UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS (0 included) wins. Chunks read
+    the same values as the whole stack."""
+    cap, fraction = _auto_dequant_cap_source(experts_module)
+    if cap is None and fraction is None:
+        return 0
+    if cap is None and device.type != "cuda":
         return 0
     element = torch.empty((), dtype = dtype).element_size()
     E = splits[0][0]
+    needed = E if experts_needed is None else min(max(int(experts_needed), 0), E)
     per_expert = max(inner[0] * inner[1] for _, inner in splits) * element
-    if E * per_expert <= whole_up_to * cap:
+    scratch = needed * per_expert
+    if cap is not None:
+        return 0 if scratch <= cap else max(1, int(cap // per_expert))
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    total = _DEVICE_TOTAL_BYTES.get(index)
+    if total is None:
+        total = _DEVICE_TOTAL_BYTES[index] = torch.cuda.get_device_properties(index).total_memory
+    cap = fraction * total
+    if cap <= 0 or scratch <= 2 * cap:
         return 0
+    if index not in _AUTO_DEQUANT_TIGHT:
+        want = 2 * scratch + cap
+        free, with_cached = _device_headroom_bytes(index)
+        if free >= want or with_cached() >= want:
+            return 0
+        _AUTO_DEQUANT_TIGHT.add(index)
     return max(1, int(cap // per_expert))
 
 
@@ -1497,15 +1529,23 @@ def _selective_dequant_plan(sources, num_tokens_per_expert, num_rows, experts_mo
     mode = os.environ.get("UNSLOTH_MOE_SELECTIVE_DEQUANT", "auto")
     selective = mode == "1"
     chunk = _selective_dequant_chunk_experts()
-    if chunk == 0 and mode != "0" and experts_module is not None and not torch.compiler.is_compiling():
+    if (
+        chunk == 0 and mode != "0" and experts_module is not None
+        and _auto_dequant_cap_source(experts_module) != (None, None)   # flag / env first: unflagged models stop here
+        and not torch.compiler.is_compiling()
+        and not (num_tokens_per_expert.device.type == "cuda" and torch.cuda.is_current_stream_capturing())
+    ):
         splits = [_bnb4bit_expert_split(source) for source in sources]
         E = int(num_tokens_per_expert.numel())
         if splits and all(split is not None and split[0] == E for split in splits):
             param = sources[0]
             while hasattr(param, "base_layer"):
                 param = param.base_layer
+            # The unchunked plan reads num_rows experts when the sync-free capped plan applies, else the whole stack.
+            capped = not selective and 0 < num_rows and 8 * num_rows <= 7 * E
             chunk = _auto_dequant_chunk_experts(
                 splits, param.quant_state.dtype, experts_module, num_tokens_per_expert.device,
+                experts_needed = num_rows if capped else E,
             )
     if not selective and chunk == 0:
         if mode == "0":
