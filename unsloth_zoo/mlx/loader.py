@@ -3877,6 +3877,8 @@ def _detached_holder(detached):
 def _record_detached_quantization(model, detached, spec, user_predicate) -> None:
     """Record what the runtime quantization just applied to the model would have done to the detached modules,
     without building layers or reading weights, so adapters saved without them carry the full base's map."""
+    import mlx.nn as nn
+
     if not detached or not spec.enabled:
         return
 
@@ -3891,10 +3893,19 @@ def _record_detached_quantization(model, detached, spec, user_predicate) -> None
     recorded = {}
     for path, module in _detached_holder(detached).named_modules():
         shape = getattr(getattr(module, "weight", None), "shape", ())
+        # force_requantize dequantizes selected quantized modules first; None records one left dense.
+        requantized = (
+            spec.force_requantize
+            and isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding))
+            and predicate(path, module)
+        )
+        if requantized:
+            shape = (shape[0], shape[1] * 32 // module.bits)
+            recorded[path] = None
         # As the load selects: dense NF4 takes any selected 2-D weight; quantize_model needs to_quantized and a
         # divisible width, and passes a predicate's dict to to_quantized alone, whose own defaults fill the rest.
         eligible = len(shape) == 2 if mode == "nf4_dense" else (
-            hasattr(module, "to_quantized") and len(shape) > 0 and shape[-1] % params["group_size"] == 0
+            (requantized or hasattr(module, "to_quantized")) and len(shape) > 0 and shape[-1] % params["group_size"] == 0
         )
         selected = eligible and predicate(path, module)
         if not selected:
@@ -3945,16 +3956,18 @@ def _settle_detached_vision(model, released, target_dtype=None, model_type="") -
     from .utils import iter_mlx_lora_modules
 
     holder = _detached_holder(released)
-    recorded = {
-        **(getattr(model, "_unsloth_packed_quantization", None) or {}),
-        **(getattr(model, "_unsloth_detached_quantization", None) or {}),
-    }
-    model._unsloth_released_quantization_map = {
+    predicted = getattr(model, "_unsloth_detached_quantization", None) or {}
+    packed = getattr(model, "_unsloth_packed_quantization", None) or {}
+    released_map = {
         **_quantization_config_to_path_map(
-            {path: spec for path, spec in recorded.items() if path.split(".", 1)[0] in released}
+            {path: spec for path, spec in packed.items() if path.split(".", 1)[0] in released}
         ),
         **_quantized_module_map(holder),
+        **_quantization_config_to_path_map({path: spec for path, spec in predicted.items() if spec is not None}),
     }
+    for path in (path for path, spec in predicted.items() if spec is None):
+        released_map.pop(_canonical_mlx_quantization_path(path), None)
+    model._unsloth_released_quantization_map = released_map
     # Saving the rest would silently drop adapter state on them: LoRA, tensors an adapter reload restored (frozen or
     # not), or, once the model carries adapters (so the base is frozen), anything left trainable.
     restored = getattr(model, "_unsloth_reloaded_parameter_keys", None) or ()

@@ -1439,6 +1439,38 @@ def test_detached_quantization_record_matches_a_kept_load(mode, override):
 
 
 
+@pytest.mark.parametrize("mode", ["affine", "nf4_dense"])
+@pytest.mark.parametrize("override", ["none", "selects"])
+def test_detached_quantization_record_matches_a_forced_requantize(mode, override):
+    from unsloth_zoo.mlx import loader
+
+    def build():
+        model = _ToyVLM()
+        model.tts = nn.Sequential(
+            nn.QuantizedLinear(128, 64, group_size=64, bits=8), nn.QuantizedLinear(256, 64, group_size=32, bits=4),
+            nn.Linear(64, 64),
+        )
+        return model
+
+    packed = {"tts.layers.0": {"bits": 8, "group_size": 64}, "tts.layers.1": {"bits": 4, "group_size": 32}}
+    spec = loader._MLXQuantizationSpec(
+        enabled=True, bits=2 if mode == "nf4_dense" else 4, group_size=64, mode=mode, force_requantize=True,
+    )
+    predicate = _DETACHED_QUANT_OVERRIDES[override]
+    kept, dropped = build(), build()
+    kept, _ = loader._apply_mlx_quantization(kept, {"quantization": dict(packed)}, spec, is_vlm=True, user_predicate=predicate)
+    kept_map = {
+        path: entry for path, entry in loader._effective_mlx_quantization_map(kept).items() if path.startswith("tts")
+    }
+    dropped._unsloth_packed_quantization = packed
+    detached = loader._detach_vision_modules(dropped)
+    loader._record_detached_quantization(dropped, detached, spec, predicate)
+    assert [type(layer) for layer in detached["tts"].layers] == [type(layer) for layer in build().tts.layers]
+    assert loader._settle_detached_vision(dropped, detached) > 0
+    released = {path: entry for path, entry in dropped._unsloth_released_quantization_map.items() if path.startswith("tts")}
+    assert loader._normalize_quantization_map(released) == loader._normalize_quantization_map(kept_map)
+
+
 def test_vision_kept_for_text_gets_the_load_dtype():
     from unsloth_zoo.mlx import loader
 
