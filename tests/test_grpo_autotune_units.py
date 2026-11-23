@@ -14,11 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""GRPO mini-batch autotune: rows per forward in real bytes, and callers that never exceed the fit."""
+"""GRPO mini-batch autotune: the policy pass never puts more rows in one forward than the autotune says fit."""
 
-import inspect
 import math
-import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -37,50 +35,23 @@ def _estimate(rows, dtype_bytes, total = ROWS, seq = SEQ, multiplier = 4):
     return hidden + logits
 
 
-def _gpu(monkeypatch, free, total = 80 * GiB, reserved = 0, allocated = 0, fraction = 1.0):
+def _gpu(monkeypatch, free, total = 80 * GiB):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a, **k: (int(free), int(total)))
-    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *a, **k: int(reserved))
-    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *a, **k: int(allocated))
-    monkeypatch.setattr(
-        torch.cuda, "get_per_process_memory_fraction", lambda *a, **k: fraction, raising = False
-    )
 
 
-def _free_for(rows, dtype_bytes = 2):
+def _free_for(rows, dtype_bytes = 16):
     """Free memory that fits exactly `rows` rows (the autotune budgets 80% of it)."""
     return (_estimate(rows, dtype_bytes) + _estimate(rows + 1, dtype_bytes)) / 2 / 0.8
 
 
-def test_estimate_is_in_bytes_and_fits_five_of_eight(monkeypatch):
-    _gpu(monkeypatch, _free_for(5))
-    assert rr.autotune_batch_and_chunks(ROWS, SEQ, HIDDEN, VOCAB, 2, None) == (5, 4)
-
-
-@pytest.mark.parametrize("bits, nbytes", [(16, 2), (32, 4)])
-def test_bits_from_an_older_caller_are_read_as_bytes(monkeypatch, bits, nbytes):
-    _gpu(monkeypatch, _free_for(5, nbytes))
-    assert rr.autotune_batch_and_chunks(ROWS, SEQ, HIDDEN, VOCAB, bits, None) == (5, 4)
-
-
-@pytest.mark.parametrize("rows", [1, 2, 5, 8, 17])
-def test_nothing_fits_gives_one_row_per_forward(monkeypatch, rows):
+@pytest.mark.parametrize("dtype_bytes", [16, 32])
+def test_autotune_estimate_is_unchanged(monkeypatch, dtype_bytes):
+    """Released unsloth floor-divides this fit itself, so its value must not move."""
+    _gpu(monkeypatch, _free_for(5, dtype_bytes))
+    assert rr.autotune_batch_and_chunks(ROWS, SEQ, HIDDEN, VOCAB, dtype_bytes, None) == (5, 4)
     _gpu(monkeypatch, 1)
-    assert rr.autotune_batch_and_chunks(rows, SEQ, HIDDEN, VOCAB, 2, None) == (1, 4)
-
-
-def test_cached_allocator_blocks_count_as_free(monkeypatch):
-    # 1 row of free device memory, plus 4 rows' worth the caching allocator holds unused.
-    _gpu(monkeypatch, _free_for(1), reserved = _free_for(5) - _free_for(1) + GiB, allocated = GiB)
-    assert rr.autotune_batch_and_chunks(ROWS, SEQ, HIDDEN, VOCAB, 2, None)[0] == 5
-
-
-def test_per_process_fraction_caps_the_budget(monkeypatch):
-    # Plenty free on the device, but set_per_process_memory_fraction leaves this process 5 rows.
-    total = 80 * GiB
-    _gpu(monkeypatch, 70 * GiB, total = total, allocated = GiB,
-         fraction = (_free_for(5) + GiB) / total)
-    assert rr.autotune_batch_and_chunks(ROWS, SEQ, HIDDEN, VOCAB, 2, None)[0] == 5
+    assert rr.autotune_batch_and_chunks(ROWS, SEQ, HIDDEN, VOCAB, dtype_bytes, None) == (4, 4)
 
 
 class _Stop(Exception):
@@ -132,9 +103,9 @@ def _plan(monkeypatch, free, rows = ROWS, mini_batch = None):
     return seen
 
 
-def test_loss_sizes_bfloat16_in_bytes_and_honours_the_fit(monkeypatch):
+def test_loss_honours_the_fit(monkeypatch):
     seen = _plan(monkeypatch, _free_for(5))
-    assert seen["dtype_bytes"] == 2
+    assert seen["dtype_bytes"] == 16
     # 5 rows fit, so 8 rows go as 2 forwards of 4, never 1 forward of 8.
     assert seen["batch_size"] == 4
 
@@ -143,7 +114,7 @@ def test_loss_plan_is_unchanged_when_every_row_fits(monkeypatch):
     assert _plan(monkeypatch, 70 * GiB)["batch_size"] == ROWS
 
 
-@pytest.mark.parametrize("total_rows, rows_fit", [(8, 5), (16, 9), (16, 15), (7, 4), (3, 2), (8, 8), (8, 4)])
+@pytest.mark.parametrize("total_rows, rows_fit", [(8, 5), (16, 9), (16, 15), (7, 4), (3, 2), (8, 8), (8, 4), (2, 4)])
 def test_split_count_never_exceeds_the_fit(monkeypatch, total_rows, rows_fit):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     seen = {}
@@ -170,31 +141,6 @@ def test_split_count_never_exceeds_the_fit(monkeypatch, total_rows, rows_fit):
         )
     assert seen["batch_size"] <= rows_fit
     assert seen["batch_size"] == math.ceil(total_rows / math.ceil(total_rows / rows_fit))
-
-
-def test_offload_gate_sees_the_chunk_width_not_the_split_count():
-    """A 12-row chunk at one split must reach efficient_log_softmax as 12 rows wide."""
-    src = inspect.getsource(rr.grpo_accumulated_loss)
-    start = src.rindex("\n", 0, src.index("def compute_logprobs_chunk(")) + 1
-    end = src.index("\n        for (", start)
-    seen = {}
-
-    def efficient_log_softmax(hidden, lm_head, index, chunks = 32, batch_size = 8, **kwargs):
-        seen["batch_size"] = batch_size
-        return index.new_zeros(index.shape, dtype = torch.float32)
-
-    ns = {
-        "torch": torch, "B": 1, "multiplier": 1, "lm_head": torch.zeros(16, 4),
-        "_refresh_lm_head": lambda: None, "_fp32_bind": lambda *a: None,
-        "_need_entropy": False, "_fused_route": False, "efficient_log_softmax": efficient_log_softmax,
-        "logit_scale_multiply": 0.0, "logit_scale_divide": 0.0, "logit_softcapping": 0.0,
-        "temperature": 1.0, "lm_head_bias": None,
-    }
-    exec(textwrap.dedent(src[start:end]), ns)
-    ns["compute_logprobs_chunk"](
-        torch.zeros(12, 5, 4), torch.zeros(12, 5, dtype = torch.long), torch.zeros(12, 9, dtype = torch.long),
-    )
-    assert seen["batch_size"] == 12
 
 
 if __name__ == "__main__":

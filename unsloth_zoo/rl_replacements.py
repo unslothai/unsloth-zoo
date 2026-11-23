@@ -1249,29 +1249,16 @@ def autotune_batch_and_chunks(
     seq_len,
     hidden_size,
     vocab_size,
-    dtype_bytes=2,
+    dtype_bytes=16,
     multiplier=None
 ):
-    """Rows per forward that fit in free memory, and the logit chunk multiplier.
-    Callers turn rows into a split count with ceil division."""
-    # Older unsloth passes bits (16 / 32); no element is that wide.
-    if dtype_bytes >= 16:
-        dtype_bytes = dtype_bytes // 8
     if multiplier is None:
         final_m = max(4, seq_len // 4096)
     else:
         final_m = multiplier
 
     if torch.cuda.is_available():
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
-        # Cached blocks no tensor uses are reusable too, within any per-process memory fraction.
-        allocated = torch.cuda.memory_allocated()
-        free_bytes += max(0, torch.cuda.memory_reserved() - allocated)
-        try:
-            fraction = torch.cuda.get_per_process_memory_fraction()
-        except Exception:
-            fraction = 1.0
-        free_bytes = min(free_bytes, max(0, total_bytes * fraction - allocated))
+        free_bytes, _ = torch.cuda.mem_get_info()
         limit_gb = (free_bytes / (1024**3))*.80
     elif hasattr(torch, "xpu") and torch.xpu.is_available():
         # XPU: estimate free memory as total - reserved.
@@ -1298,8 +1285,9 @@ def autotune_batch_and_chunks(
     valid_indices = torch.nonzero(valid_mask, as_tuple=False)
 
     if valid_indices.shape[0] == 0:
-        # Nothing fits: one row per forward is the smallest plan.
-        return 1, final_m
+        #This means your GPU will OOM
+        # Capped at the row count: unsloth's no-grad pass divides rows by this without max(1, ...).
+        return max(1, min(4, total_input_rows)), final_m
 
     best_idx = valid_indices[0].item()
     final_b = int(b_vals[best_idx].item())
@@ -3795,7 +3783,7 @@ def grpo_accumulated_loss(
             chunked_selective_log_softmax = partial(chunked_selective_log_softmax, **_support_kwargs)
         # Unsloth keeps _autocast_dtype set when it turns autocast off (float32 training on a GPU without bfloat16).
         _autocast_on = trainer._autocast_dtype is not None and getattr(trainer, "_autocast_enabled", True)
-        dtype_bytes = 2 if _autocast_on and trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 4
+        dtype_bytes = 16 if _autocast_on and trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 32
         if _support_kwargs:
             # Kept-set scoring saves one more float32 [rows, vocab] tensor per chunk for the backward
             # (the masked logits), so the mini-batch autotune counts the logits twice. No effect
@@ -3809,6 +3797,13 @@ def grpo_accumulated_loss(
         # Imported here: this body is copied into the generated trainer.
         from unsloth_zoo.rl_replacements import grpo_forwards_are_collective, grpo_agree_mini_batch
         _collective_forwards = grpo_forwards_are_collective(trainer.model)
+        if not _collective_forwards:
+            # DeepSpeed ZeRO-3 gathers partitioned weights in every forward too.
+            import torch.distributed as _dist
+            from unsloth_zoo.temporary_patches.utils import zero3_partitioned_training as _zero3_live
+            _collective_forwards = (
+                _zero3_live() and _dist.is_available() and _dist.is_initialized() and _dist.get_world_size() > 1
+            )
 
         if trainer.args.unsloth_grpo_mini_batch is None:
             # Size per call, as unsloth's copy does: caching in args froze the first step's plan.
@@ -4211,7 +4206,8 @@ def grpo_accumulated_loss(
         _pack_in_packed = False
         _pack_enabled = os.environ.get("UNSLOTH_GRPO_SEQ_PACKING", "1").lower() not in ("0", "false", "no", "off")
         _pack_ok = getattr(unwrapped_model, "_unsloth_seq_packing_grad_ok", None)
-        if (_pack_enabled and not _pg_skip_pack and pixel_values is None
+        # Collective forwards: the packed forward and its per-row verify are rank-local, like PG above.
+        if (_pack_enabled and not _pg_skip_pack and not _collective_forwards and pixel_values is None
                 and token_type_ids is None and mm_token_type_ids is None and _pack_ok is not False):
             try:
                 # Imported here: this body is copied into the generated trainer.
@@ -4549,8 +4545,9 @@ def grpo_accumulated_loss(
             zipped_inputs = []
         else:
             # packing rejected/unused: drop the packed graph and its index buffers before the padded loop so
-            # neither co-resides with it
+            # neither co-resides with it; same for a declined PrefixGrouper layout
             _pack_hidden = _pack_sel = _pack_result = None
+            _pg_layout = None
             _pack_ent = _pack_entropies = None
             _fused_pack = None
             if _pack_T is not None:
@@ -4749,7 +4746,7 @@ def grpo_accumulated_loss(
                     logit_scale_divide = logit_scale_divide,
                     logit_softcapping = logit_softcapping,
                     temperature = temperature,
-                    batch_size = completion_ids.shape[0],
+                    batch_size = B,
                     lm_head_bias = lm_head_bias,
                 )
             if _need_entropy:

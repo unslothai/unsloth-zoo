@@ -475,12 +475,12 @@ def test_cuda_opt_in_kwargs_score_the_kept_set(monkeypatch, sampling, triple):
 
 def test_loss_autotune_counts_the_kept_set_logits_twice():
     src = inspect.getsource(rr.grpo_accumulated_loss)
-    head, tail = src.split("dtype_bytes = 2 if _autocast_on", 1)
+    head, tail = src.split("dtype_bytes = 16 if _autocast_on", 1)
     block = tail.split("total_rows = input_ids.shape[0]", 1)[0]
     assert "if _support_kwargs:" in block and "dtype_bytes = dtype_bytes * 2" in block
     # Free memory that fits every row at the plain estimate still fits them doubled: unchanged plan.
-    rows_plain, _ = rr.autotune_batch_and_chunks(8, 512, 1024, 151936, 2, None)
-    rows_kept, _ = rr.autotune_batch_and_chunks(8, 512, 1024, 151936, 4, None)
+    rows_plain, _ = rr.autotune_batch_and_chunks(8, 512, 1024, 151936, 16, None)
+    rows_kept, _ = rr.autotune_batch_and_chunks(8, 512, 1024, 151936, 32, None)
     assert rows_kept <= rows_plain
 
 
