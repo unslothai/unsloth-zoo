@@ -35,6 +35,10 @@ from ._gc_passes import collect_garbage
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config, set_dtype_in_config, HAS_TORCH_DTYPE
 
+# Feature flag read by unsloth: patch_model_and_tokenizer gives fused 4-bit expert stacks (bare Params4bit) the
+# compute dtype. unsloth routes 4-bit loads to pre-quantized repos with such stacks only when this is True.
+BARE_PARAMS4BIT_COMPUTE_DTYPE = True
+
 def patch_compiling_bitsandbytes():
     # All Unsloth Zoo code licensed under LGPLv3
     os.environ["UNSLOTH_PATCHED"] = "1"

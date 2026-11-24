@@ -81,3 +81,10 @@ def test_matching_dtype_and_forced_float32_are_untouched():
     _patch(model, torch.bfloat16, forced = True)
     assert model.experts.gate_up_proj.quant_state.dtype == torch.bfloat16
     assert model.experts.down_proj.quant_state.dtype == torch.bfloat16
+
+
+def test_feature_flag_for_unsloth():
+    # unsloth reads this to decide whether a 4-bit load may use a pre-quantized repo with bare 4-bit stacks.
+    from unsloth_zoo import patching_utils
+
+    assert patching_utils.BARE_PARAMS4BIT_COMPUTE_DTYPE is True
