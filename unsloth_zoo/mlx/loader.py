@@ -943,7 +943,6 @@ _INKLING2_LOOP_INPUTS = ("attn", "k", "v", "mlp")  # omlx's row order in loop_do
 
 
 def _split_rows(out, prefix, tensors, sizes, names):
-    """Each tensor of one stacked projection (``{leaf: array}``) cut by rows into ``prefix + name`` per name."""
     import mlx.core as mx
 
     for leaf, value in tensors.items():
@@ -955,9 +954,9 @@ def _split_rows(out, prefix, tensors, sizes, names):
 
 
 def _omlx_inkling2_weights(weights):
-    """Inkling 2 oQ quants in omlx's runtime layout, back to the source checkpoint's names mlx-vlm's sanitize maps
-    (the inverse of omlx's ``patches/inkling2/loader.py``). Routed experts, the quantized embedding and head, and the
-    loop's message queries take mlx-vlm's own names: the source path renames only unpacked weights."""
+    """omlx's Inkling 2 runtime layout back to source names (inverse of omlx ``patches/inkling2/loader.py``). Routed
+    experts, the quantized embedding and head, and loop message queries take mlx-vlm's final names: its source path
+    renames only unpacked weights."""
     if not any(key.startswith("model.layers.") for key in weights):
         return weights
     import mlx.core as mx
@@ -982,14 +981,14 @@ def _omlx_inkling2_weights(weights):
         stack = lambda name: {key.removeprefix(name + "."): d.pop(key) for key in [key for key in d if key.startswith(name + ".")]}
         heads, head_dim = d["attn.q_scale"].shape
         q, r = heads * head_dim, d["attn.r_scale"].size
-        if "attn.in_proj.weight" in d:  # sliding layers stack q, k, v, r, the output gate and the sink
+        if "attn.in_proj.weight" in d:  # sliding layer
             kv = d["attn.k_conv"].shape[0]
             _split_rows(out, source + "attn.", stack("attn.in_proj"), (q, kv, kv, r, q, heads),
                         ("wq_du", "wk_dv", "wv_dv", "wr_du", "gate_attn", "attn_sink_proj"))
             for name in ("k", "v"):
                 conv = d.pop(f"attn.{name}_conv")
                 out[f"{source}attn.{name}_sconv.weight"] = conv.reshape(conv.shape[0], 1, -1)
-        else:  # global layers stack q, r, the gate and the sink, and each of k, v with its dynamic convolution's projection
+        else:  # global: k / v each fused with their dynamic convolution's weight_proj
             _split_rows(out, source + "attn.", stack("attn.q_proj"), (q, r, q, heads), ("wq_du", "wr_du", "gate_attn", "attn_sink_proj"))
             for name in ("k", "v"):
                 static = out[f"{source}attn.{name}_sconv.static_w"] = d.pop(f"attn.{name}_static")
