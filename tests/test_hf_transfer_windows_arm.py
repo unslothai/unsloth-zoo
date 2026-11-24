@@ -69,8 +69,9 @@ def _fake_ctypes(*, native_machine = None, call_fails = False, api_absent = Fals
 
 def _resolve(
     *, platform_name, machine, environ, offline = False, ctypes_module = None, hf_transfer_installed = True,
+    hub_version = "0.34.0",
 ):
-    """Execute the three statements against a fake platform and return the env."""
+    """Execute the enablement logic against a fake platform and return the env."""
     detect, assign, enable = _statements()
     env = dict(environ)
     namespace = {
@@ -80,11 +81,15 @@ def _resolve(
         "_offline_env": offline,
         "_hf_transfer_installed": hf_transfer_installed,
     }
-    body = [detect, assign, enable]
+    supports_transfer = next(
+        node for node in _TREE.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_hub_supports_hf_transfer"
+    )
+    body = [detect, assign, supports_transfer, enable]
     code = compile(ast.Module(body = body, type_ignores = []), _INIT, "exec")
     # The detector does import ctypes at call time, so swapping sys.modules is what lets a Linux box drive the Windows branch.
     patched = {"ctypes": ctypes_module} if ctypes_module is not None else {}
-    with mock.patch.dict(sys.modules, patched):
+    with mock.patch.dict(sys.modules, patched), mock.patch("importlib.metadata.version", return_value = hub_version):
         if ctypes_module is None:
             sys.modules.pop("ctypes", None)
         exec(code, namespace)
@@ -211,6 +216,11 @@ class TestPrecedence:
             environ = {"HF_HUB_ENABLE_HF_TRANSFER": "0"},
         )
         assert env["HF_HUB_ENABLE_HF_TRANSFER"] == "0"
+
+    @pytest.mark.parametrize("hub_version", ["1.0.0rc7", "1.0.0", "2.4.0"])
+    def test_modern_hub_leaves_hf_transfer_unset(self, hub_version):
+        env = _resolve(platform_name = "linux", machine = "x86_64", environ = {}, hub_version = hub_version)
+        assert "HF_HUB_ENABLE_HF_TRANSFER" not in env
 
     def test_offline_still_wins(self):
         env = _resolve(
