@@ -273,7 +273,7 @@ def test_an_inkling2_oq_quant_loads_as_mlx_vlms_own_layout(tmp_path, monkeypatch
     config = {"model_type": model_type, "text_config": text, "vision_config": vision}
     model = ink.Model(ModelConfig.from_dict(json.loads(json.dumps(config))))
     if loop and "message_queries" not in model.language_model.model:
-        pytest.skip("this mlx-vlm has no Inkling 2 Loop")
+        pytest.skip(reason = "Inkling 2 Loop needs mlx-vlm >= 0.8.1 (unsloth-zoo#2723)")
     mx.random.seed(0)
     model.update(tree_map(lambda value: mx.random.normal(value.shape) * 0.05, model.parameters()))
     eight, nvfp4 = {"group_size": 64, "bits": 8, "mode": "affine"}, {"group_size": 16, "bits": 4, "mode": "nvfp4"}
