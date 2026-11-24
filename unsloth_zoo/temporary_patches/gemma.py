@@ -273,10 +273,10 @@ pass
 def _resolve_Gemma3ProcessorKwargs():
     """Gemma3ProcessorKwargs without touching transformers' deprecated alias.
 
-    transformers 5.24 turned `Gemma3ProcessorKwargs` into a module `__getattr__`
+    transformers 5.23 turned `Gemma3ProcessorKwargs` into a module `__getattr__`
     alias of `ProcessingKwargs` that emits a FutureWarning on every access, and
     5.29 removes it. Use the real class when the module still defines it
-    (4.57.6 .. 5.23, it carries the Gemma 3 `_defaults`), else `ProcessingKwargs`,
+    (4.57.6 .. 5.22, it carries the Gemma 3 `_defaults`), else `ProcessingKwargs`,
     which is exactly what the alias resolves to.
     """
     import transformers.models.gemma3.processing_gemma3 as processing_gemma3
