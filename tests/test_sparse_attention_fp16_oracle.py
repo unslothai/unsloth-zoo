@@ -24,8 +24,10 @@ vs fp64 is bounded against
   * the fp32-math torch reference (FlashAttention's own test bound is 2x the PyTorch error; we allow 2.5x).
 
 Measured on T4 (sm75), L4 (sm89) and B200 (sm100), 5 seeds x 3 lengths x head_dim 64 / 128 / 256 / 512: kernel /
-design error is 0.84-1.09 (max) and 0.99-1.01 (mean) for dq and dkv, dq / fp32-torch 1.0-2.0 (max), dkv is 4-10x
-below the fp32-torch arm (which rounds every gathered row's gradient to fp16), dsink relative error <= 8e-4.
+design error is 0.84-1.09 (max) for dq and dkv, dq / fp32-torch 1.0-2.0 (max), dkv is 4-10x below the fp32-torch
+arm (which rounds every gathered row's gradient to fp16), dsink relative error <= 8e-4. The mean ratio is
+0.9989-1.0006 over these cases on T4 and B200, so its bound is 1.01: fp16 logits (1.015-1.025) and an fp16
+accumulator fail every case; delta rounded to fp16 (1.001-1.012) is below what the gate resolves.
 """
 
 import pytest
@@ -33,7 +35,9 @@ import torch
 
 from unsloth_zoo import sparse_attention as sa
 
-_CUDA = torch.cuda.is_available()
+# NVIDIA CUDA only: the forced index kernel skips its own HIP exclusion (sparse_mqa_supported), and a CPU wheel under
+# the consolidated is_available() spoof has no torch.version.cuda.
+_CUDA = torch.cuda.is_available() and torch.version.cuda is not None and torch.version.hip is None
 _F16_EPS = torch.finfo(torch.float16).eps
 
 
@@ -50,8 +54,10 @@ def _inputs(b, s, h, d, n, k, seed):
 
 
 def _grads(fn, q, kv, sink, do):
+    """(dq, dkv, dsink), and the forward output those gradients were taken through."""
     q, kv, sink = (t.detach().clone().requires_grad_() for t in (q, kv, sink))
-    return torch.autograd.grad(fn(q, kv, sink), (q, kv, sink), do)
+    out = fn(q, kv, sink)
+    return torch.autograd.grad(out, (q, kv, sink), do), out.detach()
 
 
 def _designed_grads(q, kv, sink, idxs, scale, do, out16):
@@ -83,26 +89,56 @@ def _err(x, r):
     return e.max().item(), e.mean().item()
 
 
-@pytest.mark.skipif(not _CUDA, reason = "CUDA Triton kernel")
+def _kernel_module():
+    pytest.importorskip("triton")
+    from unsloth_zoo import sparse_mqa_kernel as mk
+    return mk
+
+
+@pytest.mark.skipif(not _CUDA, reason = "NVIDIA CUDA Triton kernel")
 @pytest.mark.parametrize("seed", [0, 1, 2])
 @pytest.mark.parametrize("shape", [(1, 128, 16, 64, 192, 48), (1, 128, 16, 128, 192, 48), (1, 128, 16, 256, 192, 48),
                                    (1, 131, 8, 256, 140, 33), (1, 128, 16, 512, 192, 48), (1, 512, 16, 256, 768, 192)])
 def test_triton_fp16_backward_precision_vs_fp64(monkeypatch, shape, seed):
-    from unsloth_zoo import sparse_mqa_kernel as mk
-    b, s, h, d, n, k = shape
+    _check_backward_precision(monkeypatch, _kernel_module(), shape, seed)
+
+
+@pytest.mark.skipif(not _CUDA, reason = "NVIDIA CUDA Triton kernel")
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_triton_fp16_backward_precision_vs_fp64_split_d(monkeypatch, seed):
+    # Parts with >= 96 KB of shared memory launch head_dim 512 unsplit; force the 64 KB (T4) split-D backward here.
+    mk = _kernel_module()
+    configs = mk._configs
+    monkeypatch.setattr(mk, "_configs", lambda device, d, backward: configs(device, d, backward)[-1:])
+    monkeypatch.setattr(mk, "_CHOSEN", {})
+    assert configs(torch.device("cuda"), 512, True)[-1][3] == 256
+    _check_backward_precision(monkeypatch, mk, (1, 128, 16, 512, 192, 48), seed)
+
+
+def _check_backward_precision(monkeypatch, mk, shape, seed):
     monkeypatch.setenv("UNSLOTH_SPARSE_ATTN_BACKEND", "triton")
+    # Both torch arms are fp32 / fp64 einsums: TF32 left on by another test would move the bounds. Saved and
+    # restored by hand: monkeypatch cannot undo an attribute of torch's cuBLASModule.
+    tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        _check_backward_precision_fp32(mk, shape, seed)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = tf32
+
+
+def _check_backward_precision_fp32(mk, shape, seed):
+    b, s, h, d, n, k = shape
     q, kv, sink, idxs, do = _inputs(b, s, h, d, n, k, 1000 * seed + d + s)
     scale = d ** -0.5
     before, calls = dict(sa.SPARSE_ATTN_STATS), mk.SPARSE_MQA_STATS["bwd"]
-    got = _grads(lambda q, kv, sk: sa.sparse_attn(q, kv, sk, idxs, scale), q, kv, sink, do)
+    got, out16 = _grads(lambda q, kv, sk: sa.sparse_attn(q, kv, sk, idxs, scale), q, kv, sink, do)
     torch.cuda.synchronize()
     # The Triton backward ran (no silent fallback to the torch path).
     assert sa.SPARSE_ATTN_STATS["triton"] == before["triton"] + 1 and sa.SPARSE_ATTN_STATS["fallback"] == before["fallback"]
     assert mk.SPARSE_MQA_STATS["bwd"] == calls + 1
-    ref = _grads(lambda q, kv, sk: sa.sparse_attn_reference(q, kv, sk, idxs, scale), q.double(), kv.double(), sink.double(), do.double())
-    fp32_math = _grads(lambda q, kv, sk: sa.sparse_attn_reference(q, kv, sk, idxs, scale), q, kv, sink, do)
-    with torch.no_grad():
-        out16 = sa.sparse_attn(q, kv, sink, idxs, scale)
+    ref, _ = _grads(lambda q, kv, sk: sa.sparse_attn_reference(q, kv, sk, idxs, scale), q.double(), kv.double(), sink.double(), do.double())
+    fp32_math, _ = _grads(lambda q, kv, sk: sa.sparse_attn_reference(q, kv, sk, idxs, scale), q, kv, sink, do)
     designed = _designed_grads(q, kv, sink, idxs, scale, do, out16)
     for name, x, r, des, f32 in zip(("dq", "dkv", "dsink"), got, ref, designed, fp32_math):
         e_max, e_mean = _err(x, r)
@@ -117,5 +153,6 @@ def test_triton_fp16_backward_precision_vs_fp64(monkeypatch, shape, seed):
             assert e_max <= 2 * _F16_EPS * max(scale_r, 1.0), msg
             continue
         assert e_max <= 1.25 * d_max, msg
-        assert e_mean <= 1.05 * d_mean, msg
+        # A whole-tensor mean is stable to ~1e-3 (module docstring), so 1.01 catches fp16 logits, which 1.05 let through.
+        assert e_mean <= 1.01 * d_mean, msg
         assert e_max <= 2.5 * t_max, msg
