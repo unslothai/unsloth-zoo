@@ -116,6 +116,16 @@ def _quantize_like(engine_model, model):
     return engine_model
 
 
+def _counterpart(engine_model, model):
+    """The part of ``model`` laid out like ``engine_model``: itself, or its language model when the engine serves a
+    multimodal checkpoint with a text-only mlx-lm model that names its weights without ``language_model.``."""
+    paths = {path for path, _ in engine_model.named_modules()}
+    for part in (model, getattr(model, "language_model", None)):
+        if part is not None and paths <= {path for path, _ in part.named_modules()}:
+            return part
+    return model
+
+
 def _share_weights(engine_model, model):
     """Point the engine's (lazily loaded) arrays at ``model``'s when every name and shape matches and dtypes differ only
     in float precision; the engine then runs at the training model's dtypes, float32 parameters a model keeps included."""
@@ -136,8 +146,8 @@ def _share_weights(engine_model, model):
 
 @contextlib.contextmanager
 def _in_process_engine_loads(model):
-    """While an in-process engine starts, its mlx-lm or mlx-vlm model takes the training model's weights instead of a
-    second copy, and its layers skip Unsloth's class-level gradient checkpointing."""
+    """While an in-process engine starts, its mlx-lm or mlx-vlm model (and Gemma 4's vision sidecar) takes the training
+    model's weights instead of a second copy, and its layers skip Unsloth's class-level gradient checkpointing."""
     try:
         import vllm_metal.v1.model_lifecycle as lifecycle
     except ImportError:
@@ -151,7 +161,8 @@ def _in_process_engine_loads(model):
         # Lazy, so the checkpoint's arrays are never read when the training model's replace them. This has to
         # happen inside the load: the runner compiles blocks over the weights it holds right after it.
         engine_model, *rest = load_engine(True)
-        if not _share_weights(_quantize_like(engine_model, model), model):
+        source = _counterpart(engine_model, model)
+        if not _share_weights(_quantize_like(engine_model, source), source):
             engine_model, *rest = load_engine(lazy)
             if _training_dtype(model) is not None:  # load_vllm gives vLLM this dtype for the KV cache
                 from .loader import _convert_mlx_dtype
@@ -165,11 +176,24 @@ def _in_process_engine_loads(model):
     def load_vlm(model_path, lazy=False, **kwargs):
         return shared(lambda lazy: (original_vlm(model_path, lazy=lazy, **kwargs),), lazy)[0]
 
+    try:  # Gemma 4 serves vision from towers of an mlx-vlm composite it loads itself, next to the mlx-lm text model.
+        from vllm_metal.multimodal.gemma4.sidecar import Gemma4VisionSidecar
+    except ImportError:
+        Gemma4VisionSidecar = None
+    original_sidecar = Gemma4VisionSidecar and Gemma4VisionSidecar.__dict__["load"]
+
+    def load_sidecar(cls, model_path, **kwargs):
+        return original_sidecar.__func__(cls, model_path, **{"load_composite": lambda path: load_vlm(path, lazy=True), **kwargs})
+
     lifecycle.mlx_lm_load_model, lifecycle.mlx_vlm_load_model = load, load_vlm
+    if Gemma4VisionSidecar is not None:
+        Gemma4VisionSidecar.load = classmethod(load_sidecar)
     try:
         yield
     finally:
         lifecycle.mlx_lm_load_model, lifecycle.mlx_vlm_load_model = original, original_vlm
+        if Gemma4VisionSidecar is not None:
+            Gemma4VisionSidecar.load = original_sidecar
 
 
 def load_vllm(model, *, max_seq_length, gpu_memory_utilization=0.5, max_lora_rank=64, enable_lora=True, seed=0):

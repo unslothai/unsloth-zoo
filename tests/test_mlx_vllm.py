@@ -126,20 +126,23 @@ def test_an_in_process_engine_shares_only_matching_weights(monkeypatch, width, d
     from mlx.utils import tree_flatten
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", multiprocess)
     _fake_vllm(monkeypatch, "vllm_metal.platform")
-    calls, model = [], _tiny(0, width, dtype)
+    calls, model = [], (lm := _tiny(0, width, dtype))
     model.model.norm.set_dtype(mx.float32)  # a layer kept in float32 is shared as is; the training dtype is the majority's
     if quant:  # as load_in_8bit / load_in_mxfp4 leave it; the engine must mirror it per layer
         nn.quantize(model, *quant[:2], mode=quant[2], class_predicate=lambda path, m: quant[3] in path and hasattr(m, "to_quantized"))
+    if dtype == "float16":  # a multimodal training model whose language model an engine serves alone
+        (model := nn.Module()).language_model = lm
     engine_model = lambda: (e := _tiny(1), quant and quant[4] and nn.quantize(e, *quant[:2], mode=quant[4]))[0]  # a checkpoint already quantized otherwise
     life = types.SimpleNamespace(mlx_lm_load_model=lambda path, lazy=False: (calls.append(lazy), (engine_model(), {}))[1], mlx_vlm_load_model=lambda path, lazy=False: (calls.append(lazy), engine_model())[1])
+    Sidecar = type("Sidecar", (), {"load": classmethod(lambda cls, path, load_composite=lambda path: engine_model(): load_composite(path))})  # Gemma 4's vision towers: a composite it loads itself
     v1, original, model._src_path = types.SimpleNamespace(model_lifecycle=life), life.mlx_lm_load_model, "/snap"
-    for item in (("vllm_metal", types.SimpleNamespace(v1=v1)), ("vllm_metal.v1", v1), ("vllm_metal.v1.model_lifecycle", life)):
+    for item in (("vllm_metal", types.SimpleNamespace(v1=v1)), ("vllm_metal.v1", v1), ("vllm_metal.v1.model_lifecycle", life), ("vllm_metal.multimodal.gemma4.sidecar", types.SimpleNamespace(Gemma4VisionSidecar=Sidecar))):
         monkeypatch.setitem(sys.modules, *item)
-    monkeypatch.setattr(sys.modules["vllm"], "LLM", lambda **kw: types.SimpleNamespace(kwargs=kw, models=(life.mlx_lm_load_model(kw["model"])[0], life.mlx_vlm_load_model(kw["model"]))))
-    (engine, vision), types_of = (llm := vllm_utils.load_vllm(model, max_seq_length=64)).models, lambda m: [(p, type(x)) for p, x in m.named_modules()]
-    assert llm.kwargs.get("dtype") == (dtype if multiprocess == "0" else None) and (not quant or types_of(engine) == types_of(model)) and vllm_utils._training_dtype(engine) == getattr(mx, dtype if multiprocess == "0" else "bfloat16")
-    aliased = [array is dict(tree_flatten(model.parameters())).get(name) for e in (engine, vision) for name, array in tree_flatten(e.parameters())]
-    assert calls == loads * 2 and life.mlx_lm_load_model is original and all(aliased) == (loads == [True]) == any(aliased)
+    monkeypatch.setattr(sys.modules["vllm"], "LLM", lambda **kw: types.SimpleNamespace(kwargs=kw, models=(life.mlx_lm_load_model(kw["model"])[0], life.mlx_vlm_load_model(kw["model"]), Sidecar.load(kw["model"]))))
+    (engine, vision, sidecar), types_of = (llm := vllm_utils.load_vllm(model, max_seq_length=64)).models, lambda m: [(p, type(x)) for p, x in m.named_modules()]
+    assert llm.kwargs.get("dtype") == (dtype if multiprocess == "0" else None) and (not quant or types_of(engine) == types_of(lm)) and vllm_utils._training_dtype(engine) == getattr(mx, dtype if multiprocess == "0" else "bfloat16")
+    aliased = [array is dict(tree_flatten(lm.parameters())).get(name) for e in (engine, vision, sidecar) for name, array in tree_flatten(e.parameters())]
+    assert calls[:2 * len(loads)] == loads * 2 and life.mlx_lm_load_model is original and Sidecar.load.__func__.__name__ == "<lambda>" and all(aliased) == (loads == [True]) == any(aliased)
     assert all(getattr(m, "_unsloth_no_checkpoint", False) == (multiprocess == "0") for x in (engine, vision) for _, m in x.named_modules())
 
 
