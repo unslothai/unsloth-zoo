@@ -389,6 +389,107 @@ def _patch_cpu_fp16_accelerator(trainer_cls):
     trainer_cls.create_accelerator_and_postprocess = create_accelerator_and_postprocess
 
 
+def _chunked_ce_model(trainer, model):
+    """The CPU model whose forward Unsloth patched (patch_chunked_causal_lm_loss), behind accelerate / PEFT wrappers."""
+    unwrapped = trainer.accelerator.unwrap_model(model) if getattr(trainer, "accelerator", None) is not None else model
+    for candidate in (unwrapped, getattr(unwrapped, "base_model", None), getattr(getattr(unwrapped, "base_model", None), "model", None)):
+        # vars(), not getattr: PEFT forwards attribute reads to the inner model, but writes stay on the wrapper.
+        if candidate is not None and vars(candidate).get("_unsloth_cpu_chunked_ce", False):
+            return candidate
+    return None
+
+
+def _orpo_chunked_forward(trainer, original):
+    """TRL's ORPO concatenated_forward without the [2B, L, V] logits: the policy's next-token log-probs come from the
+    last hidden state in row chunks (cpu_chunked_log_probs, the CPU twin of TRL's fused LM head, which TRL's DPO / KTO
+    already use). Its nll loss, length-averaged log-probs and logits metric are those same per-token values. Only
+    the plain decoder case; anything else, or UNSLOTH_CPU_CHUNKED_PREFERENCE=0, runs TRL's own forward."""
+    from .ops import _plain_head_weight, cpu_chunked_log_probs
+
+    def concatenated_forward(model, batch):
+        target = _chunked_ce_model(trainer, model)
+        head = _plain_head_weight(target.get_output_embeddings()) if target is not None else None
+        if head is None or getattr(trainer, "is_encoder_decoder", False) or getattr(trainer, "aux_loss_enabled", False) \
+                or getattr(trainer, "label_pad_token_id", -100) != -100 \
+                or any(key in batch for key in ("pixel_values", "pixel_attention_mask", "image_sizes")):
+            return original(model, batch)
+        concatenated = trainer.concatenated_inputs(
+            batch, is_encoder_decoder = False, padding_value = trainer.padding_value, device = trainer.accelerator.device,
+        )
+        input_ids = concatenated["concatenated_input_ids"]
+        attention_mask = concatenated["concatenated_attention_mask"]
+        labels = concatenated["concatenated_labels"][:, 1:]
+        targets = input_ids[:, 1:]
+        label_mask = labels != -100
+        if labels.shape != targets.shape or not torch.equal(labels[label_mask], targets[label_mask]):
+            return original(model, batch)  # labels that are not the next input token: TRL's two targets differ
+        len_chosen = batch["chosen_labels"].shape[0]
+        target._unsloth_cpu_hidden_only = True
+        try:
+            outputs = model(input_ids, attention_mask = attention_mask, use_cache = False)
+        finally:
+            target._unsloth_cpu_hidden_only = False
+        # accelerate hands back fp32 copies under mixed precision; the head's dtype (or autocast's) is what TRL used.
+        hidden = outputs.hidden_states[-1][:, :-1].to(head.dtype)
+        batch_size, length = targets.shape
+        # The dtype TRL's lm_head ran in: accelerate's autocast if it set one, else the weights'.
+        with trainer.accelerator.autocast():
+            log_probs, _, _, mean_logits, _ = cpu_chunked_log_probs(
+                hidden.reshape(batch_size * length, -1), head, None, targets.reshape(-1), 1.0, None,
+                outputs = ("mean_logits",),
+            )
+        log_probs = log_probs.view(batch_size, length)
+        mean_logits = mean_logits.view(batch_size, length)
+        # nn.CrossEntropyLoss over the chosen rows' attended next tokens (TRL's ORPO nll over prompt + response).
+        nll_mask = attention_mask[:len_chosen, 1:] == 1
+        chosen_nll_loss = -log_probs[:len_chosen][nll_mask].sum() / nll_mask.sum()
+        # get_batch_logps(average_log_prob = True)
+        all_logps = (log_probs * label_mask).sum(-1) / label_mask.sum(-1)
+        # TRL only ever takes .mean() of the logits it returns: per-token vocabulary means average to the same value.
+        return (all_logps[:len_chosen], all_logps[len_chosen:], mean_logits[:len_chosen], mean_logits[len_chosen:],
+                chosen_nll_loss)
+
+    concatenated_forward._unsloth_cpu = True
+    return concatenated_forward
+
+
+def _install_chunked_preference_forward(trainer):
+    """Per trainer instance: TRL's own ORPOTrainer (trl.trainer.orpo_trainer up to 0.2x, trl.experimental.orpo in 1.x),
+    not a subclass that overrides concatenated_forward."""
+    if os.environ.get("UNSLOTH_CPU_CHUNKED_PREFERENCE", "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    method = getattr(type(trainer), "concatenated_forward", None)
+    module = getattr(method, "__module__", "") or ""
+    if not (module.startswith("trl.") and module.endswith("orpo_trainer")) or not hasattr(trainer, "concatenated_inputs"):
+        return False
+    bound = getattr(trainer, "concatenated_forward")
+    if getattr(bound, "_unsloth_cpu", False):
+        return True
+    trainer.concatenated_forward = _orpo_chunked_forward(trainer, bound)
+    return True
+
+
+def _patch_cpu_preference_trainers(trainer_cls):
+    """Trainer.__init__ builds the accelerator once per trainer: the hook that sees every TRL trainer instance without
+    importing trl.experimental (which warns on import)."""
+    original = trainer_cls.create_accelerator_and_postprocess
+    if getattr(original, "_unsloth_cpu_preference", False):
+        return
+
+    @functools.wraps(original)
+    def create_accelerator_and_postprocess(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        try:
+            _install_chunked_preference_forward(self)
+        except Exception:
+            pass
+        return result
+
+    create_accelerator_and_postprocess._unsloth_cpu = getattr(original, "_unsloth_cpu", False)
+    create_accelerator_and_postprocess._unsloth_cpu_preference = True
+    trainer_cls.create_accelerator_and_postprocess = create_accelerator_and_postprocess
+
+
 def _count_sft_tokens(trainer, model, inputs):
     """TRL's `num_tokens` bookkeeping from SFTTrainer.compute_loss, which the chunked path bypasses."""
     metrics = getattr(trainer, "_metrics", None)
@@ -575,6 +676,7 @@ def install_cpu_training_defaults():
     _patch_post_init(TrainingArguments)
     if hasattr(Trainer, "create_accelerator_and_postprocess"):
         _patch_cpu_fp16_accelerator(Trainer)
+        _patch_cpu_preference_trainers(Trainer)
     try:
         import trl
         from trl.trainer import sft_trainer

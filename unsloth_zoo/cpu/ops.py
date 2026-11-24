@@ -619,6 +619,16 @@ def patch_chunked_causal_lm_loss(model):
                 logits_to_keep = 0, **kwargs):
         shift_labels = kwargs.pop("shift_labels", None)
         head_weight = _plain_head_weight(self.get_output_embeddings())
+        if getattr(self, "_unsloth_cpu_hidden_only", False) and head_weight is not None and labels is None \
+                and shift_labels is None:
+            # A preference trainer computing its log-probs from the last hidden state in row chunks (trainer.py).
+            kwargs.pop("return_dict", None)
+            outputs = getattr(self, inner_name)(
+                input_ids = input_ids, attention_mask = attention_mask, position_ids = position_ids,
+                past_key_values = past_key_values, inputs_embeds = inputs_embeds, use_cache = use_cache, **kwargs,
+            )
+            hidden = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
+            return CausalLMOutputWithPast(loss = None, logits = None, hidden_states = (hidden,))
         if (labels is None and shift_labels is None) or not torch.is_grad_enabled() \
                 or not getattr(self, "_unsloth_cpu_chunked_ce_active", False) or head_weight is None:
             if shift_labels is not None:
