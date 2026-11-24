@@ -257,6 +257,27 @@ def test_end_to_end_training_step_all_patches():
     assert any(float(mx.abs(g).max()) > 0 for g in flat), "all grads zero"
 
 
+def test_patched_attention_forwards_positional_position_embeddings():
+    # SenseNova Loop's decoder layer passes position_embeddings positionally.
+    import mlx_vlm.models.qwen3_5.language as qlang
+    from unsloth_zoo.mlx.loader import _fix_qwen35_attention_cache
+
+    attn = qlang.Qwen3_5Attention(_tiny_text_config())
+    mx.eval(attn.parameters())
+    _fix_qwen35_attention_cache(None)
+    attn.rotary_emb.fused_apply = False
+
+    mx.random.seed(0)
+    x = mx.random.normal((1, 5, 64))
+    ids = mx.tile(mx.arange(5)[None], (3, 1, 1))
+    # Spread, not shifted: RoPE is relative, so only a change in distances moves the output.
+    spread = attn.rotary_emb(x, ids * 3)
+    positional = attn(x, None, None, ids, spread)
+    keyword = attn(x, mask=None, cache=None, position_ids=ids, position_embeddings=spread)
+    assert mx.array_equal(positional, keyword)
+    assert not mx.allclose(positional, attn(x, None, None, ids), atol=1e-4)
+
+
 # Elementwise bound divides by each entry's own magnitude plus 1% of the tensor's largest, so a small bad entry cannot hide behind a large one.
 _Y_TOL = {mx.bfloat16: 5e-3, mx.float16: 5e-4, mx.float32: 5e-6}
 _Y_ELEM_TOL = {mx.bfloat16: 8e-3, mx.float16: 1e-3, mx.float32: 2e-5}
