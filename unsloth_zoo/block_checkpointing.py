@@ -23,6 +23,7 @@ import inspect
 import weakref
 
 import torch
+from unsloth_zoo.utils import is_activation_checkpointing as _is_activation_checkpointing
 import torch.utils.checkpoint
 
 __all__ = [
@@ -244,7 +245,7 @@ def enable_block_gradient_checkpointing(model, every_n_blocks = 1, use_reentrant
         setter, "gradient_checkpointing_func"
     ):
         # Enable once (it wires PEFT input grads; repeats stack embedding hooks), then the setter installs our function.
-        if getattr(model, "is_gradient_checkpointing", False) is not True:
+        if _is_activation_checkpointing(model) is not True:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": use_reentrant})
         setter(enable = True, gradient_checkpointing_func = function)
         return "transformers"

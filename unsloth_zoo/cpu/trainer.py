@@ -23,6 +23,7 @@ import json
 import os
 
 import torch
+from unsloth_zoo.utils import is_activation_checkpointing as _is_activation_checkpointing
 
 from .runtime import available_ram, cpu_bf16_supported, cpu_fp16_supported
 
@@ -333,7 +334,7 @@ def _auto_cpu_gradient_checkpointing(model, training_args):
     if needed * ranks > available // 4:
         return False
     _args_checkpointing_off(training_args)
-    if getattr(model, "is_gradient_checkpointing", False) and hasattr(model, "gradient_checkpointing_disable"):
+    if _is_activation_checkpointing(model) and hasattr(model, "gradient_checkpointing_disable"):
         # PEFT forwards this to the transformers model; input require-grads hooks stay (a no-op without checkpointing).
         model.gradient_checkpointing_disable()
     print(f"Unsloth (CPU): activations for {batch} x {length} tokens (~{needed / 1024 ** 3:.2f} GB) fit in RAM "
