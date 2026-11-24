@@ -9059,7 +9059,17 @@ def _finish_load(model, tokenizer):
     _freeze_text_only_full_finetune(model)
     _fix_full_finetune_modality_weights(model)
     _materialize_weights(model)
+    _stamp_remote_code_trust(model)
     return model, tokenizer
+
+
+def _stamp_remote_code_trust(model):
+    """Record trust_remote_code=True on the model so the GGUF converter honours the same decision."""
+    if _MLX_MODEL_FILE_TRUST.get():
+        try:
+            model._unsloth_trust_remote_code = True
+        except Exception:
+            pass
 
 
 def _warn_block_swap(kwargs):
