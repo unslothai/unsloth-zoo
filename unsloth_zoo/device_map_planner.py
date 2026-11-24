@@ -425,11 +425,14 @@ class DeviceMapPlan:
         reserves, headroom, quantizer haircuts) is only in :meth:`describe`.
         """
         placed = {d: w for d, w in sorted(self.weight_bytes.items()) if w > 0}
-        line = (
-            f"Unsloth: placed the model over {len(placed)} GPUs: "
-            + ", ".join(f"cuda:{d} {w / _GiB:.2f} GiB" for d, w in placed.items())
-        )
-        if self.head_module:
+        where = ", ".join(f"cuda:{d} {w / _GiB:.2f} GiB" for d, w in placed.items())
+        if not placed:
+            line = "Unsloth: placed no weights on a GPU"
+        elif len(placed) == 1:
+            line = f"Unsloth: placed the model on 1 GPU: {where}"
+        else:
+            line = f"Unsloth: placed the model over {len(placed)} GPUs: {where}"
+        if self.head_module and placed:
             line += f" ({self.head_module} on cuda:{self.head_device})"
         line += ". UNSLOTH_ENABLE_LOGGING=1 shows the full placement."
         risks = [f"Unsloth: note: {n}" for n in self.notes if any(m in n for m in _PLAN_RISK_NOTES)]
