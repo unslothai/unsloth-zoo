@@ -20,16 +20,33 @@ class _Encoding(dict):
 
 
 class _DummyPrefixTokenizer:
-    """One piece per character; standalone text that starts with "\\n" gets a lone dummy-prefix piece first."""
+    """One piece per character; standalone text that starts with "\\n" gets a lone dummy-prefix piece first.
+
+    "<CHAT>" is an added token, and ">" followed by "\\" merges into one piece (aya-vision-32b's ">" + "\\sigma").
+    """
+
+    ADDED = "<CHAT>"
+    MERGE = ">\\"
 
     def __init__(self):
         self.vocab = {PREFIX: 1}
+        self.added_tokens_decoder = {self._id(self.ADDED): self.ADDED}
 
     def _id(self, piece):
         return self.vocab.setdefault(piece, len(self.vocab) + 1)
 
     def __call__(self, text, add_special_tokens = False):
-        pieces = ([PREFIX] if text.startswith("\n") else []) + list(text)
+        pieces = [PREFIX] if text.startswith("\n") else []
+        i = 0
+        while i < len(text):
+            for unit in (self.ADDED, self.MERGE):
+                if text.startswith(unit, i):
+                    pieces.append(unit)
+                    i += len(unit)
+                    break
+            else:
+                pieces.append(text[i])
+                i += 1
         return _Encoding(input_ids = [self._id(p) for p in pieces])
 
     def convert_ids_to_tokens(self, ids):
@@ -60,3 +77,14 @@ def test_a_lone_piece_is_kept():
     tok = _DummyPrefixTokenizer()
     ids = [tok._id(PREFIX)]
     assert dataset_utils._without_dummy_prefix(ids, "\n", tok) == ids
+
+
+def test_a_mergeable_suffix_is_still_trimmed_after_the_prefix_is_dropped():
+    """The edge probes are normalized like the marker, so "\\n<CHAT>>" still drops its ">" (it merges with a "\\"
+    that starts the answer) instead of keeping a core no answer can match."""
+    tok = _DummyPrefixTokenizer()
+    core, _, right = dataset_utils._find_common_token_ids("\n<CHAT>>", tok, True)
+    assert tok.convert_ids_to_tokens(core) == ["\n", "<CHAT>"]
+    assert tok.convert_ids_to_tokens(right) == [">"]
+    conversation = tok("x</s>\n<CHAT>>\\sigma").input_ids
+    assert any(conversation[i : i + len(core)] == core for i in range(len(conversation) - len(core) + 1))

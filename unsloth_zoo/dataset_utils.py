@@ -210,7 +210,8 @@ def _stable_marker_edges(component, original, tokenizer):
         return start, end
     try:
         for c in _MARKER_EDGE_PROBES:
-            right = tokenizer(component + c, add_special_tokens = False).input_ids
+            # Normalized like `original`, or a dropped dummy-prefix piece offsets every comparison.
+            right = _without_dummy_prefix(tokenizer(component + c, add_special_tokens = False).input_ids, component + c, tokenizer)
             k = 0
             while k < min(n, len(right)) and right[k] == original[k]: k += 1
             end = min(end, k)
