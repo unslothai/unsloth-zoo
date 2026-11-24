@@ -4078,6 +4078,7 @@ def _build_qwen_position_ids(
     image_token_id,
     video_token_id,
     spatial_merge_size,
+    video_time_intervals=None,
 ):
     batch_size, seq_length = input_ids.shape
     position_ids = np.ones((3, batch_size, seq_length), dtype=np.int32)
@@ -4133,19 +4134,23 @@ def _build_qwen_position_ids(
                 llm_pos_ids_list.append(text_ids + start_idx)
                 start_idx += text_len
 
+            time_interval = 1
             if ed_image < ed_video:
                 t, h, w = image_grids[image_index]
                 image_index += 1
             else:
                 t, h, w = video_grids[video_index]
+                if video_time_intervals is not None:
+                    time_interval = video_time_intervals[video_index]
                 video_index += 1
 
             llm_grid_t = int(t)
             llm_grid_h = int(h) // spatial_merge_size
             llm_grid_w = int(w) // spatial_merge_size
 
+            # In float32 and truncated per frame, as mlx-vlm does: float64 lands a frame lower for some rates.
             t_index = np.broadcast_to(
-                np.arange(llm_grid_t, dtype=np.int32)[:, None],
+                (np.arange(llm_grid_t, dtype=np.float32) * np.float32(time_interval)).astype(np.int32)[:, None],
                 (llm_grid_t, llm_grid_h * llm_grid_w),
             ).reshape(-1)
             h_index = np.broadcast_to(
@@ -4734,6 +4739,16 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     return batch_dict
 
 
+@lru_cache(maxsize=None)
+def _qwen2_5_vl_spaces_video_by_time():
+    """Whether the installed mlx-vlm spaces Qwen2.5-VL video frames by tokens_per_second (HF parity, 0.8.1+)."""
+    try:
+        language = importlib.import_module("mlx_vlm.models.qwen2_5_vl.language")
+        return "tokens_per_second" in inspect.getsource(language.LanguageModel.get_rope_index)
+    except Exception:
+        return False
+
+
 def _vlm_positions_for_compile(batch_dict, config):
     """Records absolute-position constants and width-derived sidecars from the final text arrays; planned padding tails never shift a content position."""
     model_type = _config_get(config, "model_type")
@@ -4741,6 +4756,14 @@ def _vlm_positions_for_compile(batch_dict, config):
     vision_config = _config_to_mapping(_config_get(config, "vision_config", {}))
     image_grid_thw = _normalize_grid_thw(batch_dict.get("image_grid_thw"))
     video_grid_thw = _normalize_grid_thw(batch_dict.get("video_grid_thw"))
+    video_timing = batch_dict.pop("_unsloth_second_per_grid_ts", None)
+    video_time_intervals = None
+    if model_type == "qwen2_5_vl" and video_grid_thw and _qwen2_5_vl_spaces_video_by_time():
+        tokens_per_second = vision_config.get("tokens_per_second", 2)
+        video_time_intervals = [
+            np.float32(tokens_per_second) * np.float32(video_timing[i] if video_timing else 1)
+            for i in range(len(video_grid_thw))
+        ]
 
     if model_type in _VLM_QWEN_POSITION_MODEL_TYPES:
         if model_type in _VLM_QWEN_FRAME_SPLIT_MODEL_TYPES and video_grid_thw:
@@ -4763,6 +4786,7 @@ def _vlm_positions_for_compile(batch_dict, config):
                 image_token_id=int(_config_get(config, "image_token_id", _config_get(config, "image_token_index"))),
                 video_token_id=int(_config_get(config, "video_token_id", _config_get(config, "video_token_index"))),
                 spatial_merge_size=int(vision_config.get("spatial_merge_size", 2)),
+                video_time_intervals=video_time_intervals,
             )
             batch_dict["_unsloth_collated_position_ids"] = True
 
@@ -9547,8 +9571,10 @@ def _processor_vlm_inputs(
 
     if audio_kwarg is None:
         inputs = _require_video_output(_run_layouts())
-        # Unused on MLX; as free-form floats/Mappings they fracture compile families.
-        inputs.pop("second_per_grid_ts", None)
+        # As free-form floats/Mappings they fracture compile families; the positions phase consumes the timing.
+        timing = inputs.pop("second_per_grid_ts", None)
+        if timing is not None:
+            inputs["_unsloth_second_per_grid_ts"] = tuple(float(t) for t in np.asarray(timing).reshape(-1))
         inputs.pop("video_metadata", None)
         if text_only and "text_pair" in base_kwargs:
             inputs["labels"] = np.where(
