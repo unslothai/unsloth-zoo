@@ -1099,17 +1099,58 @@ def _patch_deepseek_ocr_transformers_import_compat(model_type):
         from transformers.models.llama import modeling_llama
     except Exception:
         return
-    if (
-        not hasattr(modeling_llama, "LlamaFlashAttention2")
-        and hasattr(modeling_llama, "LlamaAttention")
-    ):
-        modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
+    try:
+        if (
+            not hasattr(modeling_llama, "LlamaFlashAttention2")
+            and hasattr(modeling_llama, "LlamaAttention")
+        ):
+            modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
+    except ImportError:
+        # Torch-free placeholder: attribute access raises ImportError, which hasattr does not catch.
+        pass
     try:
         from transformers.utils import import_utils
     except Exception:
         return
     if not hasattr(import_utils, "is_torch_fx_available"):
         import_utils.is_torch_fx_available = lambda: False
+
+
+def _patch_torch_free_image_processor_lookup():
+    """Transformers 5.x (< 5.14) tags the Idefics2/3 and SmolVLM PIL image processors as needing torch, so torch-free
+    installs get a placeholder; resolve it from the module that defines the class."""
+    try:
+        # Not `from transformers.models.auto import ...`: before anything imports it, that yields a torch-free placeholder.
+        image_processing_auto = importlib.import_module("transformers.models.auto.image_processing_auto")
+        from transformers.utils.import_utils import DummyObject
+        lookup = image_processing_auto.get_image_processor_class_from_name
+    except Exception:
+        return
+    if getattr(lookup, "_unsloth_torch_free", False):
+        return
+    names = vars(image_processing_auto).get("IMAGE_PROCESSOR_MAPPING_NAMES") or {}
+    to_module = vars(image_processing_auto).get("model_type_to_module_name")
+
+    def get_image_processor_class_from_name(class_name):
+        found = lookup(class_name)
+        if not isinstance(found, DummyObject) or to_module is None:
+            return found
+        for model_type, classes in names.items():
+            # Transformers 4 maps a model type to a (slow, fast) tuple with no PIL entry.
+            if not isinstance(classes, dict) or class_name != classes.get("pil"):
+                continue
+            try:
+                package = importlib.import_module(f"transformers.models.{to_module(model_type)}")
+                submodule = package._class_to_module[class_name]
+                real = getattr(importlib.import_module(f"{package.__name__}.{submodule}"), class_name)
+            except Exception:
+                continue
+            if not isinstance(real, DummyObject):
+                return real
+        return found
+
+    get_image_processor_class_from_name._unsloth_torch_free = True
+    image_processing_auto.get_image_processor_class_from_name = get_image_processor_class_from_name
 
 
 def _deepseek_ocr_config_model_type(config_data):
@@ -10137,6 +10178,7 @@ class FastMLXModel:
                     return operation(*args, **kwargs)
                 return vlm_config_view_owner.call(operation, *args, **kwargs)
 
+            _patch_torch_free_image_processor_lookup()
             if want_runtime_quant:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM, "
                       f"runtime {quantization_spec.bits}-bit {quantization_spec.mode} quantization)...")

@@ -194,6 +194,22 @@
       "file": "unsloth_zoo/mlx/loader.py",
       "rule": "dynamic-import",
       "sink": "import_module",
+      "digest": "3d2acc32fae28e7e",
+      "count": 1,
+      "reason": "Transformers model package named by transformers' own IMAGE_PROCESSOR_MAPPING_NAMES, under transformers.models."
+    },
+    {
+      "file": "unsloth_zoo/mlx/loader.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "428d251c9f7207d8",
+      "count": 1,
+      "reason": "Submodule of a transformers model package, named by that package's own _class_to_module."
+    },
+    {
+      "file": "unsloth_zoo/mlx/loader.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
       "digest": "59e72c01edb14c86",
       "count": 3,
       "reason": "Prefix-bounded to the installed mlx_lm / mlx_vlm package: a model's model_type can only select one of that package's own modules (#1083 removed the unbounded form). The model_file guard's site iterates the fixed names mlx_lm.utils / mlx_vlm.utils; the exact-verify sum promotion iterates three fixed mlx_vlm module names."
