@@ -1745,6 +1745,40 @@ def test_cce_rotates_hidden_states_into_a_hadamard_packed_head(monkeypatch, pack
 
 
 @metal_only
+@pytest.mark.parametrize("vlm", [False, True])
+@pytest.mark.parametrize("own_knob", [False, True])
+def test_cce_reads_the_logit_softcap_from_the_text_config(monkeypatch, vlm, own_knob):
+    # Inkling 2 keeps final_logit_softcapping only on its text config; Gemma 4 turns its cap off by setting the knob
+    # on the model to None while its config keeps one.
+    from types import SimpleNamespace
+
+    mx.random.seed(0)
+    calls = []
+    model = _cce_text_model(2053, 64, quantized=False, softcap=0.0 if own_knob else 2.0, calls=calls)
+    model.args = SimpleNamespace(tie_word_embeddings=False)
+    model.config = SimpleNamespace(final_logit_softcapping=2.0)
+    if own_knob:
+        model.final_logit_softcapping = None
+    model.model.embed_tokens.weight *= 20  # logits well past the cap
+    ids = mx.random.randint(0, 2053, (1, 65))
+    logits = model(ids[:, :-1]).astype(mx.float32)
+    dense = nn.losses.cross_entropy(logits, ids[:, 1:], reduction="mean").item()
+    if vlm:
+        model.get_input_embeddings = lambda *args, **kwargs: None
+        monkeypatch.setattr(mlx_utils, "_vlm_cce_forward", lambda m, b, **kwargs: (
+            m.model(b["input_ids"][:, :-1]), b["input_ids"][:, 1:], mx.array(b["input_ids"][:, 1:].size)))
+        loss_fn = mlx_utils.make_vlm_cce_loss_fn(model)
+        run = lambda: loss_fn(model, {"input_ids": ids})[0]
+    else:
+        loss_fn = mlx_utils.make_cce_loss_fn(model)
+        run = lambda: loss_fn(model, ids, mx.array([[0, 65]], dtype=mx.int32))[0]
+    assert loss_fn._unsloth_cce_backend == "runtime-cce"
+    calls.clear()
+    assert run().item() == pytest.approx(dense, rel=1e-4)
+    assert "model" not in calls
+
+
+@metal_only
 @pytest.mark.parametrize("head", ["dense", "quantized", "lora"])
 def test_cce_scores_only_the_head_rows_the_forward_keeps(monkeypatch, head):
     # Inkling 2 pads its head past the vocabulary and slices logits to unpadded_vocab_size.

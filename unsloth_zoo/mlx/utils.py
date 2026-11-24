@@ -2302,12 +2302,19 @@ def _is_quantized_layer(layer):
     return hasattr(layer, "scales")
 
 
+def _logit_softcap_unset(tm):
+    return not any(hasattr(holder, "final_logit_softcapping") for holder in (tm, getattr(tm, "args", None)))
+
+
 def _get_logit_softcap(model):
     """Get logit softcapping value if model uses it (e.g. Gemma-2/4), else 0.0."""
     tm = _get_output_transform_owner(model)
     softcap = getattr(tm, "final_logit_softcapping", None)
     if softcap is None and hasattr(tm, "args"):
         softcap = getattr(tm.args, "final_logit_softcapping", None)
+    # Inkling 2 caps from its text config alone; a model that sets the knob itself, even to None (Gemma 4), decides.
+    if _logit_softcap_unset(tm):
+        softcap = getattr(getattr(tm, "config", None), "final_logit_softcapping", None)
     return float(softcap) if softcap is not None and softcap > 0 else 0.0
 
 
@@ -2412,6 +2419,8 @@ def _detect_logit_softcap(model):
     legacy = getattr(tm, "final_logit_softcapping", _KNOB_MISSING)
     if legacy is _KNOB_MISSING and hasattr(tm, "args"):
         legacy = getattr(tm.args, "final_logit_softcapping", _KNOB_MISSING)
+    if _logit_softcap_unset(tm):
+        legacy = getattr(getattr(tm, "config", None), "final_logit_softcapping", _KNOB_MISSING)
     alias, conflict = _knob_value(tm, "logits_soft_cap", ("args", "config"))
     if conflict:
         return 0.0, ("logits_soft_cap differs between its configuration "
