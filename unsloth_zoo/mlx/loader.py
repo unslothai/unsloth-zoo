@@ -2820,14 +2820,14 @@ def _fix_qwen35_attention_cache(model):
 
     original_attn_call = attn_cls.__call__
 
-    def patched_attn_call(self, x, mask=None, cache=None, position_ids=None, **kwargs):
+    def patched_attn_call(self, x, mask=None, cache=None, position_ids=None, *args, **kwargs):
         if cache is None and position_ids is None:
             import mlx.core as mx
             L = x.shape[1]
             position_ids = mx.arange(L)
             position_ids = mx.expand_dims(position_ids, axis=0)
             position_ids = mx.tile(position_ids, (3, 1, 1))
-        return original_attn_call(self, x, mask=mask, cache=cache, position_ids=position_ids, **kwargs)
+        return original_attn_call(self, x, mask, cache, position_ids, *args, **kwargs)
 
     attn_cls.__call__ = patched_attn_call
     attn_cls._unsloth_cache_patched = True
