@@ -91,6 +91,23 @@ def _longest_common_sublist(lists):
 pass
 
 
+def _without_dummy_prefix(ids, text, tokenizer):
+    """Drop a bare leading SentencePiece dummy-prefix piece from a standalone tokenization.
+
+    transformers 5 SentencePiece tokenizers prepend a lone "\u2581" to text that starts with a byte-fallback
+    character (Zephyr "\n<|assistant|>\n" -> "\u2581", "<0x0A>", "<", ...). Mid-text, after the previous turn,
+    the marker never carries it, so a core that keeps it matches nothing. Text that starts with a space keeps it.
+    """
+    if len(ids) < 2 or text.startswith(" "):
+        return ids
+    try:
+        first = tokenizer.convert_ids_to_tokens(ids[0])
+    except Exception:
+        return ids
+    return ids[1:] if first == "\u2581" else ids
+pass
+
+
 def _find_common_token_ids(component, tokenizer, force_match = False):
     """Find the middle-most repeated token sequence for a chat component.
 
@@ -113,16 +130,16 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
     if not force_match:
         for left in range(3):
             for right in range(3):
-                x = left*left_text + stripped + right*right_text
-                x = tokenizer(x, add_special_tokens = False).input_ids
-                all_input_ids.append(x)
+                text = left*left_text + stripped + right*right_text
+                x = tokenizer(text, add_special_tokens = False).input_ids
+                all_input_ids.append(_without_dummy_prefix(x, text, tokenizer))
 
-                x = left*"\n" + stripped + right*"\n"
-                x = tokenizer(x, add_special_tokens = False).input_ids
-                all_input_ids.append(x)
+                text = left*"\n" + stripped + right*"\n"
+                x = tokenizer(text, add_special_tokens = False).input_ids
+                all_input_ids.append(_without_dummy_prefix(x, text, tokenizer))
     else:
         x = tokenizer(component, add_special_tokens = False).input_ids
-        all_input_ids.append(x)
+        all_input_ids.append(_without_dummy_prefix(x, component, tokenizer))
     pass
 
     substring = _longest_common_sublist([x + [0] for x in all_input_ids])
@@ -149,7 +166,7 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
     # an appended [0] sentinel, so it need not be a sublist of `original`; track the
     # match index explicitly rather than letting the loop fall through (which sliced
     # at the last index, or left `j` unbound on an empty tokenization).
-    original = tokenizer(component, add_special_tokens = False).input_ids
+    original = _without_dummy_prefix(tokenizer(component, add_special_tokens = False).input_ids, component, tokenizer)
     where = -1
     for j in range(len(original)):
         if original[j : j + len(substring)] == substring:
@@ -193,7 +210,8 @@ def _stable_marker_edges(component, original, tokenizer):
         return start, end
     try:
         for c in _MARKER_EDGE_PROBES:
-            right = tokenizer(component + c, add_special_tokens = False).input_ids
+            # Normalized like `original`, or a dropped dummy-prefix piece offsets every comparison.
+            right = _without_dummy_prefix(tokenizer(component + c, add_special_tokens = False).input_ids, component + c, tokenizer)
             k = 0
             while k < min(n, len(right)) and right[k] == original[k]: k += 1
             end = min(end, k)
