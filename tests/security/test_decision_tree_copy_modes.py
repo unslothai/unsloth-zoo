@@ -95,7 +95,7 @@ def test_first_copy_of_restricted_file_private_while_written(tmp_path, umask022,
     src, dst = tmp_path / "secret.bin", tmp_path / "out.bin"
     src.write_bytes(b"x" * 4096); os.chmod(src, 0o600)
     seen = []
-    for name in ("_fastcopy_sendfile", "copyfileobj"):
+    for name in ("_fastcopy_sendfile", "_fastcopy_fcopyfile", "copyfileobj"):  # Linux, macOS, fallback
         original = getattr(shutil, name, None)
         if original is None:
             continue
