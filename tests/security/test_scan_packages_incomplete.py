@@ -108,3 +108,21 @@ def test_pip_does_not_run_from_cwd(tmp_path, monkeypatch):
     sp.download_packages(["requests==2.32.5"], str(tmp_path / "dest"))
     sp.download_packages(["requests==2.32.5"], str(tmp_path / "dest2"), with_deps = True)
     assert not marker.exists()
+
+
+def test_dotdot_pth_member_is_not_clean(tmp_path):
+    # pip normalises `pkg/../evil.pth` and installs it at the site-packages root, where it runs at startup.
+    whl = tmp_path / "pkg-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(whl, "w") as zf:
+        zf.writestr("pkg/__init__.py", "x = 1\n")
+        zf.writestr("pkg/../evil.pth", "import os; os.system('id')\n")
+    findings = sp.scan_archive(str(whl), "pkg")
+    assert "scan_incomplete" in _checks(findings)
+
+
+def test_dotdot_binary_member_stays_a_warning(tmp_path):
+    whl = tmp_path / "pkg-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(whl, "w") as zf:
+        zf.writestr("pkg/__init__.py", "x = 1\n")
+        zf.writestr("pkg/../blob.bin", b"\0" * 16)
+    assert "scan_incomplete" not in _checks(sp.scan_archive(str(whl), "pkg"))
