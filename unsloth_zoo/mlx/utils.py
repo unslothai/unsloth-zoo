@@ -5025,8 +5025,8 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None, los
 
 def _get_vlm_image_size(config, processor):
     """Target size for uniform resizing, from vision_config.image_size then processor.image_processor.size, else 512;
-    None for a processor that sizes images to its own token budget; area-style size dicts (Qwen2.5-VL min/max pixels)
-    are skipped: as dimensions they upsample to 3136x3136 and OOM."""
+    None for a processor that sizes images to its own token budget; encoder-tile sizes (<= patch * merge) and
+    area-style size dicts (Qwen2.5-VL min/max pixels: as dimensions they upsample to 3136x3136 and OOM) are skipped."""
     vc = config.get("vision_config") if isinstance(config, dict) else getattr(config, "vision_config", None)
     if vc is not None:
         sz = vc.get("image_size") if isinstance(vc, dict) else getattr(vc, "image_size", None)
@@ -5038,6 +5038,7 @@ def _get_vlm_image_size(config, processor):
         return None
     if ip is not None:
         sz = getattr(ip, "size", None)
+        candidate = None
         if isinstance(sz, dict):
             # Skip area-pixel-count dicts (Qwen2.5-VL style): their shortest_edge and longest_edge are area bounds, not dimensions.
             if "longest_edge" in sz and sz.get("longest_edge", 0) > 1_000_000:
@@ -5045,9 +5046,26 @@ def _get_vlm_image_size(config, processor):
             else:
                 h = sz.get("height", sz.get("shortest_edge", 0))
                 if isinstance(h, int) and 0 < h < 4096:
-                    return h
+                    candidate = h
         elif isinstance(sz, int) and sz > 0:
-            return sz
+            candidate = sz
+        if candidate is not None:
+            def _pos_int(obj, *keys):
+                for key in keys:
+                    val = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+                    if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+                        return val
+                return None
+
+            tile = 0
+            for src in (vc, ip):
+                if src is not None:
+                    patch = _pos_int(src, "native_patch_size", "patch_size")
+                    if patch is not None:
+                        merge = _pos_int(src, "adapter_merge_size", "spatial_merge_size", "merge_size") or 1
+                        tile = max(tile, patch * merge)
+            if candidate > tile:
+                return candidate
     return 512
 
 
