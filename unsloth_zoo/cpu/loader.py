@@ -70,17 +70,57 @@ def _pop_gpu_loader_kwargs(kwargs):
         kwargs.pop("rope_scaling")
 
 
-def _print_full_finetuning_precision(dtype, master_fp32):
-    """The GPU loaders' full finetuning precision notes. bfloat16 weights take AdamW's bfloat16 update directly, so
-    updates below a weight's bfloat16 spacing round away (on SmolLM2-135M at lr 2e-5, 4 steps changed 4% of the
-    weights, against all of them with float32 master weights)."""
-    if dtype == torch.bfloat16:
-        _print("Using bfloat16 full finetuning, which halves memory, but small updates can round away in bfloat16 "
-               "weights. float32_mixed_precision = True keeps float32 weights and optimizer states, computing in "
-               "bfloat16 autocast.")
-    elif dtype == torch.float32 and master_fp32 and cpu_bf16_supported():
-        _print("float32_mixed_precision = True: full finetuning keeps float32 weights and optimizer states, "
-               "computing in bfloat16 autocast.")
+# fp32 weights + fp32 grads + AdamW's two fp32 states, per parameter.
+_FP32_MASTER_BYTES_PER_PARAM = 16
+
+
+def _fp32_master_fit(model_name, config, token, revision, trust_remote_code, **kwargs):
+    """(bytes, free RAM, fits) for float32 full finetuning: weights, grads and AdamW states take at most half of the
+    free RAM (times the local ranks); activations are sized separately (gradient checkpointing auto-off). None when
+    the parameter count or the free RAM is unknown."""
+    if config is None:
+        try:
+            from transformers import AutoConfig
+            config = AutoConfig.from_pretrained(model_name, token = token, revision = revision,
+                                                trust_remote_code = trust_remote_code, **kwargs)
+        except Exception:
+            return None
+    count = _dense_parameter_count(config)
+    available = available_ram()
+    if count is None or available is None:
+        return None
+    try:
+        ranks = max(1, int(os.environ.get("LOCAL_WORLD_SIZE", "1")))
+    except ValueError:
+        ranks = 1
+    needed = count * _FP32_MASTER_BYTES_PER_PARAM
+    return needed, available, needed * ranks * 2 <= available
+
+
+def _print_full_finetuning_precision(dtype, choice, fit = None):
+    """One line on full finetuning precision. bfloat16 weights take AdamW's bfloat16 update directly, so updates below
+    a weight's bfloat16 spacing round away (SmolLM2-135M, lr 2e-5, 4 steps: 3.9% of the weights changed, against
+    99.99% with float32 master weights)."""
+    gb = lambda value: f"{value / 1024 ** 3:.1f} GB"  # noqa: E731
+    if choice == "fits":
+        _print(f"full finetuning keeps float32 master weights and computes in bfloat16 autocast: float32 weights, grads "
+               f"and AdamW states ({gb(fit[0])}) fit in RAM ({gb(fit[1])} free), and bfloat16 weights round away "
+               "small updates. float32_mixed_precision = False (or dtype = torch.bfloat16) keeps bfloat16 weights.")
+    elif choice == "forced":
+        if dtype == torch.float32 and cpu_bf16_supported():
+            _print("float32_mixed_precision = True: full finetuning keeps float32 weights and optimizer states, "
+                   "computing in bfloat16 autocast.")
+    elif dtype == torch.bfloat16:
+        if choice == "too_big":
+            reason = (f"float32 weights, grads and AdamW states ({gb(fit[0])}) do not fit in RAM ({gb(fit[1])} free)"
+                      if fit is not None else "the float32 training state could not be sized")
+            _print(f"bfloat16 full finetuning: {reason}, so weights stay bfloat16 and updates below a weight's "
+                   "bfloat16 spacing can be rounded away at small learning rates. float32_mixed_precision = True "
+                   "forces float32 master weights.")
+        else:
+            _print("bfloat16 full finetuning (your dtype / float32_mixed_precision): halves memory, but updates below "
+                   "a weight's bfloat16 spacing can be rounded away at small learning rates. float32_mixed_precision "
+                   "= True keeps float32 master weights.")
 
 
 def _dtype_kwarg():
@@ -726,10 +766,12 @@ class FastCPUModel:
         torch_dtype = kwargs.pop("torch_dtype", None)
         if dtype is None and torch_dtype is not None:
             dtype = torch_dtype
+        user_dtype = dtype is not None
         # "auto" keeps the checkpoint's own dtype (fp16 checkpoints still move off fp16 after loading).
         auto_dtype = isinstance(dtype, str) and dtype == "auto"
         dtype = _resolve_dtype(None if auto_dtype else dtype)
         master_fp32 = bool(full_finetuning) and float32_mixed_precision is True
+        master_choice = "forced" if master_fp32 else "user"
         if master_fp32 and dtype == torch.bfloat16 and not auto_dtype:
             dtype = torch.float32
 
@@ -750,6 +792,15 @@ class FastCPUModel:
             _print(f"{adapter_name} is a LoRA adapter; loading its base {model_name} first.")
         # The config the model load reads: an explicit config= decides, else the checkpoint's (in its subfolder).
         probe_kwargs = dict(hub_kwargs, **({"subfolder": kwargs["subfolder"]} if kwargs.get("subfolder") else {}))
+        master_fit = None
+        if full_finetuning and float32_mixed_precision is None and not user_dtype and dtype == torch.bfloat16:
+            # No dtype and no float32_mixed_precision from the caller: float32 master weights when they fit.
+            master_fit = _fp32_master_fit(model_name, kwargs.get("config"), token, revision, trust_remote_code,
+                                          **probe_kwargs)
+            if master_fit is not None and master_fit[2]:
+                master_fp32, master_choice, dtype = True, "fits", torch.float32
+            else:
+                master_choice = "too_big"
         if use_4bit:
             # A checkpoint quantized with another method (fp8, compressed-tensors, mxfp4) keeps its own config, as
             # on GPU: transformers refuses a BitsAndBytesConfig on top of it.
@@ -853,7 +904,7 @@ class FastCPUModel:
                 dtype = torch.float32
                 model = model.to(dtype)
         if full_finetuning:
-            _print_full_finetuning_precision(dtype, master_fp32)
+            _print_full_finetuning_precision(dtype, master_choice, master_fit)
         max_seq_length = _clamp_to_learned_positions(model, max_seq_length)
         tokenizer_kwargs = dict(
             token = token, revision = revision, trust_remote_code = trust_remote_code,
