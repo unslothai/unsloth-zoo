@@ -19491,6 +19491,8 @@ def save_pretrained_gguf(
         _download_convert_hf_to_gguf,
         _converter_dir_is_incomplete,
         internal_scripts_dir_pin,
+        converter_remote_code_guard,
+        loaded_remote_code,
     )
 
     # Normalize once so every later comparison agrees. The direct-conversion test below and the
@@ -19719,8 +19721,11 @@ def save_pretrained_gguf(
                 if not original_pythonpath
                 else gguf_py_dir + os.pathsep + original_pythonpath
             )
+        # The converter may load the tokenizer with trust_remote_code=True; only a load that approved remote
+        # code (FastMLXModel.from_pretrained(trust_remote_code=True)) lets it import auto_map code.
         try:
-            produced_files, _ = convert_to_gguf(**kwargs)
+            with converter_remote_code_guard(loaded_remote_code(model, tokenizer)):
+                produced_files, _ = convert_to_gguf(**kwargs)
         finally:
             if has_local_gguf:
                 if original_pythonpath is None:
