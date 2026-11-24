@@ -5158,23 +5158,19 @@ def test_grpo_plan_samples_through_the_vllm_engine_with_the_live_adapter(monkeyp
 
 @pytest.mark.parametrize("engine, adapted, use_vllm, outcome", [
     (False, True, True, "this model has none"),
-    (True, False, True, "needs LoRA-only training"),
+    (True, False, True, "needs plain LoRA training"),
     (True, True, False, True),  # an engine samples GRPO without use_vllm, as on CUDA
-    (True, False, False, False),  # full fine-tuning samples on MLX
-    (True, "full", False, False),  # so do LoRA with trained full modules, which the engine would not see
+    (True, False, False, False),  # full fine-tuning, DoRA, QAT, expert LoRA or full modules sample on MLX
     (False, True, False, False),
 ])
 def test_grpo_samples_through_a_vllm_engine_only_with_lora(tmp_path, monkeypatch, engine, adapted, use_vllm, outcome):
-    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx import vllm_utils
     from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
 
-    lora = trainer_module.iter_mlx_lora_modules
-    monkeypatch.setattr(trainer_module, "iter_mlx_lora_modules", lambda model: iter([("q_proj", None)]) if adapted else lora(model))
+    monkeypatch.setattr(vllm_utils, "plain_lora", lambda model: adapted)
     model = _tiny_model()
     if engine:
         model.vllm_engine = object()
-    if adapted == "full":
-        model._unsloth_cpt_full_module_weight_keys = {"model.embed_tokens.weight"}
 
     def build():
         return MLXGRPOTrainer(model, DecodingTokenizer(), _grpo_rows(), args=_grpo_config(tmp_path, compile=False, use_vllm=use_vllm),
@@ -5190,7 +5186,7 @@ def test_grpo_samples_through_a_vllm_engine_only_with_lora(tmp_path, monkeypatch
 
 
 def test_grpo_trains_and_evaluates_through_the_vllm_engine(tmp_path, monkeypatch):
-    from unsloth_zoo.mlx import grpo as grpo_module
+    from unsloth_zoo.mlx import grpo as grpo_module, vllm_utils
     from unsloth_zoo.mlx.trainer import MLXGRPOTrainer
 
     plans = []
@@ -5199,6 +5195,7 @@ def test_grpo_trains_and_evaluates_through_the_vllm_engine(tmp_path, monkeypatch
         plans.append(id(self))
         return [grpo_module._VLLMRollout(types.SimpleNamespace(token_ids=[1, 2])) for _ in prompts]
     monkeypatch.setattr(grpo_module.GRPOBatchPlan, "_generate_vllm", fake_vllm)
+    monkeypatch.setattr(vllm_utils, "plain_lora", lambda model: True)  # the stand-in LoRA module is not mlx-lm's LoRALinear
     model, calls = _tiny_model(lora=True), []
     model.vllm_engine = object()
     trainer = MLXGRPOTrainer(model, DecodingTokenizer(), _grpo_rows(), eval_dataset=_grpo_rows(2),

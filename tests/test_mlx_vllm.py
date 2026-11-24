@@ -181,9 +181,12 @@ def test_an_in_process_engine_reads_the_live_lora_from_memory(monkeypatch):
     assert len(vllm_utils._IN_MEMORY_LORAS) == 0 and model.vllm_engine._unsloth_live_lora is None and worker.load_peft_adapter("/saved", lora_id=4) == ("disk", "/saved")
     vllm_utils.load_lora(model, load_tensors=True)
     model.vllm_engine = None  # an engine dropped without a release takes its live adapter with it
-    assert len(vllm_utils._IN_MEMORY_LORAS) == 0 and vllm_utils._live_adapter(model) is not None
+    assert len(vllm_utils._IN_MEMORY_LORAS) == 0 and vllm_utils.plain_lora(model) and vllm_utils._live_adapter(model) is not None
     model._unsloth_cpt_full_module_weight_keys = {"model.embed_tokens.weight"}  # A/B alone would leave the embedding stale
-    assert vllm_utils._live_adapter(model) is None
+    assert not vllm_utils.plain_lora(model) and vllm_utils._live_adapter(model) is None
+    model._unsloth_cpt_full_module_weight_keys, (_, wrapper) = set(), next(iter_mlx_lora_modules(model))
+    wrapper.__class__ = type("QATLoRALinear", (type(wrapper),), {})  # a subclass with its own forward, as QAT's
+    assert not vllm_utils.plain_lora(model) and not vllm_utils.plain_lora(_tiny(0))
 
 
 def test_load_vllm_refuses_a_non_metal_vllm(monkeypatch):

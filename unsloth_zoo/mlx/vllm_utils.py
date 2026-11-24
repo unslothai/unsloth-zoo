@@ -294,19 +294,28 @@ def _serve_in_memory_loras(engine):
     return True
 
 
-def _live_adapter(model):
-    """The live LoRA in PEFT layout per module (A = lora_a.T, B = lora_b.T, scale), or None when only a PEFT directory
-    can carry it (DoRA, other wrappers, full-state modules)."""
-    import mlx.core as mx
+def plain_lora(model):
+    """Whether vLLM's LoRA reproduces the trained policy: every adapter a plain ``LoRALinear`` and nothing else trained.
+    DoRA, QAT, MoE expert LoRA and trained full modules change the forward beyond A/B, so they keep MLX generation."""
     from mlx_lm.tuner.lora import LoRALinear
 
     from .utils import iter_mlx_lora_modules
 
     modules = list(iter_mlx_lora_modules(model))
     full_modules = getattr(model, "_unsloth_full_state_modules", None) or getattr(model, "_unsloth_cpt_full_module_weight_keys", None)
-    if not modules or full_modules or any(type(m) is not LoRALinear for _, m in modules):
+    return bool(modules) and not full_modules and all(type(m) is LoRALinear for _, m in modules)
+
+
+def _live_adapter(model):
+    """The live LoRA in PEFT layout per module (A = lora_a.T, B = lora_b.T, scale), or None when only a PEFT directory
+    can carry it."""
+    import mlx.core as mx
+
+    from .utils import iter_mlx_lora_modules
+
+    if not plain_lora(model):
         return None
-    adapter = {name: (module.lora_a.T, module.lora_b.T, float(module.scale)) for name, module in modules}
+    adapter = {name: (module.lora_a.T, module.lora_b.T, float(module.scale)) for name, module in iter_mlx_lora_modules(model)}
     mx.eval([array for a, b, _ in adapter.values() for array in (a, b)])
     return adapter
 
