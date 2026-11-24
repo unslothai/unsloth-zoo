@@ -14985,8 +14985,8 @@ def _inherit_target_permissions(tmp_file, target):
     try:
         # Group before mode: chown clears the setgid bit on some systems, so applying the mode afterwards keeps it; the owner is left alone.
         os.chown(str(tmp_file), -1, info.st_gid)
-    except OSError:
-        pass  # Not a member of that group, or a filesystem without ownership.
+    except (OSError, AttributeError):
+        pass  # Not a member of that group, a filesystem without ownership, or Windows (no os.chown).
     try:
         os.chmod(str(tmp_file), info.st_mode & 0o7777)
     except OSError:
