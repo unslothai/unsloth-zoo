@@ -1542,6 +1542,11 @@ def push_to_hub_merged(self, repo_id, tokenizer = None, save_method = "merged_16
     return repo_id
 
 
+# Shared with the MLX GGUF export (one guard for both converter paths).
+from unsloth_zoo.llama_cpp import loaded_remote_code as _loaded_remote_code  # noqa: E402
+from unsloth_zoo.llama_cpp import converter_remote_code_guard as _converter_remote_code  # noqa: E402
+
+
 def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_method = "q8_0", **kwargs):
     """Merge to 16-bit, then llama.cpp's converter (+ llama-quantize for k-quants). Returns the GGUF paths."""
     from unsloth_zoo.llama_cpp import install_llama_cpp, convert_to_gguf, quantize_gguf
@@ -1571,10 +1576,12 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
     direct = {"bf16", "f16", "q8_0", "f32"}
     # llama-quantize refuses to requantize from q8_0, so k-quants are made from a bf16 GGUF.
     first = "bf16" if len(methods) > 1 or any(m not in direct for m in methods) else methods[0]
-    outputs, _ = convert_to_gguf(
-        os.path.join(save_directory, base_name), merged_directory, model_dtype = "bf16",
-        quantization_type = first, converter_location = converter,
-    )
+    approved = getattr(self, "_unsloth_trust_remote_code", False) is True or _loaded_remote_code(self, tokenizer)
+    with _converter_remote_code(approved):
+        outputs, _ = convert_to_gguf(
+            os.path.join(save_directory, base_name), merged_directory, model_dtype = "bf16",
+            quantization_type = first, converter_location = converter,
+        )
     first_file = outputs[0]
     results = list(outputs)
     for method in methods:
@@ -1582,10 +1589,11 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
             continue
         if method in unrounded:
             # Straight from the unrounded staging checkpoint; llama-quantize would re-cast the bf16 GGUF.
-            direct_outputs, _ = convert_to_gguf(
-                os.path.join(save_directory, base_name), merged_directory, model_dtype = "bf16",
-                quantization_type = method, converter_location = converter,
-            )
+            with _converter_remote_code(approved):
+                direct_outputs, _ = convert_to_gguf(
+                    os.path.join(save_directory, base_name), merged_directory, model_dtype = "bf16",
+                    quantization_type = method, converter_location = converter,
+                )
             results.extend(direct_outputs)
             continue
         target = first_file.replace(f".{first.upper()}.gguf", f".{method.upper()}.gguf")

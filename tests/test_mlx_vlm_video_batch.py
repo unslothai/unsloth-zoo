@@ -58,6 +58,7 @@ class _FakeVideoProcessor:
             "attention_mask": np.ones((rows, 8), dtype = np.int32),
             "pixel_values_videos": np.zeros((4, 8), dtype = np.float32) if videos else None,
             "video_grid_thw": np.array([[1, 2, 2]]) if videos else None,
+            **({"second_per_grid_ts": [2.0]} if videos else {}),
         }
 
     def __call__(self, text = None, padding = None, return_tensors = None, add_special_tokens = None, videos = None, fps = None, **kwargs):
@@ -165,12 +166,14 @@ def test_no_media_row_stays_empty():
 
 def test_processor_receives_nested_videos_and_rate_metadata():
     processor = _FakeVideoProcessor()
-    _processor_vlm_inputs(
+    inputs = _processor_vlm_inputs(
         processor, ["t1", "t2"], [[], []], 32,
         all_videos = [["clip-a"], []],
         all_video_kwargs = [{"fps": [1.0]}, {}],
     )
     assert processor.seen["videos"] == ["clip-a"]
+    # The clip timing reaches the position builder under a private key, never the model call.
+    assert "second_per_grid_ts" not in inputs and inputs["_unsloth_second_per_grid_ts"] == (2.0,)
     # transformers 5.x reads per-clip rates from video_metadata; 4.x takes fps=.
     rate = processor.seen.get("video_metadata") or processor.seen.get("fps")
     assert rate is not None
@@ -455,23 +458,34 @@ def test_video_positions_match_mlx_vlm_rope_index(model_type, module):
         pytest.skip("this mlx-vlm predates the per-frame video grid split that HF's Qwen3-VL get_rope_index does")
     start, end, video, image = 90, 91, 92, 93
     frame = [start] + [video] * 4 + [end]
+    batch, timing = {}, ()
     if model_type == "qwen2_5_vl":
-        ids = [1, 2] + [start] + [video] * 8 + [end] + [5, 6]
+        # Two clips sampled at different rates: each spaces its frames by its own seconds per grid. At 1.2 fps the
+        # fourth grid lands on 10 in float32 but 9 in float64.
+        ids = [1, 2] + [start] + [video] * 8 + [end] + [5] + [start] + [video] * 16 + [end] + [6]
+        grid = np.array([[2, 4, 4], [4, 4, 4]], dtype = np.int32)
+        timing = (1.0, float(np.float32(2 / 1.2)))
+        batch["_unsloth_second_per_grid_ts"] = timing
     else:
         ids = [1, 2, 7, 8] + frame + [7, 9] + frame + [5, 6]
+        grid = np.array([[2, 4, 4]], dtype = np.int32)
     ids = np.array([ids], dtype = np.int32)
     mask = np.ones_like(ids)
-    grid = np.array([[2, 4, 4]], dtype = np.int32)
     config = {"model_type": model_type, "image_token_id": image, "video_token_id": video,
-              "vision_start_token_id": start, "vision_config": {"spatial_merge_size": 2}}
-    ours = _vlm_positions_for_compile(
-        {"input_ids": ids, "attention_mask": mask, "video_grid_thw": grid}, config,
-    )["position_ids"]
+              "vision_start_token_id": start, "vision_config": {"spatial_merge_size": 2, "tokens_per_second": 2}}
+    collated = _vlm_positions_for_compile(
+        {"input_ids": ids, "attention_mask": mask, "video_grid_thw": grid, **batch}, config,
+    )
+    assert "_unsloth_second_per_grid_ts" not in collated
+    ours = collated["position_ids"]
     owner = types.SimpleNamespace(config = types.SimpleNamespace(
-        vision_config = types.SimpleNamespace(spatial_merge_size = 2),
+        vision_config = types.SimpleNamespace(spatial_merge_size = 2, tokens_per_second = 2),
         image_token_id = image, video_token_id = video, vision_start_token_id = start,
     ))
-    ref, _ = language.LanguageModel.get_rope_index(owner, mx.array(ids), None, mx.array(grid), mx.array(mask))
+    args = [owner, mx.array(ids), None, mx.array(grid), mx.array(mask)]
+    if "second_per_grid_ts" in inspect.signature(language.LanguageModel.get_rope_index).parameters:
+        args.append(mx.array(timing) if timing else None)
+    ref, _ = language.LanguageModel.get_rope_index(*args)
     np.testing.assert_array_equal(np.asarray(ours), np.asarray(ref))
 
 

@@ -939,18 +939,16 @@ def saved_attention_skip_slot():
         _strict_slot(_SLOT_TOKEN, torch.is_grad_enabled())
 
 
-def _rocm_without_frame():
-    # ROCm: a call outside any frame (no Unsloth checkpoint, or a device whose SDPA keeps nothing) stays
-    # in the caller's graph instead of reaching the compiler-disabled helpers, which a fullgraph=True
-    # training compile cannot cross. Dynamo guards on the thread-local read. Inside a frame, only a call
-    # traced by a compile that may not graph break stays in the graph: it keeps nothing, and its slot op
-    # fills or takes that call's entry, so a pass that falls back to eager (a fullgraph=False compile
-    # under error_on_graph_break at its recompile limit) still lines up with the other. Any other compile (Unsloth's
-    # blocks, a user's fullgraph=False) breaks into the helpers as eager code does: a fullgraph=False
-    # frame can fall back to eager on one pass only (recompile limit), and the frame's entries are
-    # matched by call order, so both passes must take the same route whatever the compile does.
-    if not getattr(torch.version, "hip", None):
-        return False
+def _stay_in_caller_graph():
+    # A call outside any frame (no Unsloth checkpoint, or a device whose SDPA keeps nothing) stays in the
+    # caller's graph instead of reaching the compiler-disabled helpers, which a fullgraph=True training
+    # compile cannot cross. Dynamo guards on the thread-local read. Inside a frame, only a call traced by
+    # a compile that may not graph break stays in the graph: it keeps nothing, and its slot op fills or
+    # takes that call's entry, so a pass that falls back to eager (a fullgraph=False compile under
+    # error_on_graph_break at its recompile limit) still lines up with the other. Any other compile
+    # (Unsloth's blocks, a user's fullgraph=False) breaks into the helpers as eager code does: a
+    # fullgraph=False frame can fall back to eager on one pass only (recompile limit), and the frame's
+    # entries are matched by call order, so both passes must take the same route whatever the compile does.
     if getattr(_TLS, "frame", None) is None:
         return True
     if not torch.compiler.is_compiling() or _in_unsloth_compiled_block():
@@ -968,7 +966,7 @@ def _wrap_attention_interface(fn):
 
     @functools.wraps(fn)
     def attention_forward(module, query, key, value, *args, **kwargs):
-        if not getattr(module, "training", False) or _rocm_without_frame():
+        if not getattr(module, "training", False) or _stay_in_caller_graph():
             return fn(module, query, key, value, *args, **kwargs)
         return saved_attention_call(
             lambda q, k, v: fn(module, q, k, v, *args, **kwargs), query, key, value,
@@ -985,7 +983,7 @@ def _wrap_flex_kernel(fn):
 
     @functools.wraps(fn)
     def flex_kernel(query, key, value, *args, **kwargs):
-        if not kwargs.get("training", True) or _rocm_without_frame():
+        if not kwargs.get("training", True) or _stay_in_caller_graph():
             return fn(query, key, value, *args, **kwargs)
         return saved_function_call(fn, 3, query, key, value, *args, **kwargs)
 

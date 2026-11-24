@@ -68,7 +68,7 @@ class _Model(torch.nn.Module):
 def _trainer(model, beta = 0.0, scaler = None, entropy_coef = 0.0, use_vllm = False, is_correction = False,
              importance_sampling_level = "token", **extra):
     args = types.SimpleNamespace(
-        unsloth_grpo_mini_batch = 2, unsloth_logit_chunk_multiplier = 1, steps_per_generation = 2,
+        unsloth_grpo_mini_batch = extra.pop("mini_batch", 2), unsloth_logit_chunk_multiplier = 1, steps_per_generation = 2,
         use_bias_correction_kl = extra.pop("use_bias_correction_kl", False), top_entropy_quantile = 1.0,
         entropy_coef = entropy_coef, use_adaptive_entropy = False,
         vllm_importance_sampling_mode = extra.pop("vllm_importance_sampling_mode", "token_truncate"),
@@ -117,6 +117,8 @@ def _run(fused, monkeypatch, *, loss_type = "grpo", old = None, ref = None, samp
     monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0" if pg_funcs is None else "1")
     model = _Model(head_grad, bias).to(DEVICE)
     model.device = DEVICE
+    # Packing and PrefixGrouper only run within one mini-batch's tokens: one split keeps them on.
+    trainer_kwargs.setdefault("mini_batch", 1 if packed or pg_funcs is not None else 2)
     trainer = _trainer(model, **trainer_kwargs)
     if completion_mask is None:
         completion_mask = (input_ids[:, -ltk:] != 0).long()

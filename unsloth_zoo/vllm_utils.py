@@ -972,8 +972,13 @@ def patch_vllm_enable_sleep_mode():
     def sleep(
             self,
             offload_tags: Optional[Union[Tuple[str, ...],
-                                            str]] = None) -> None:
+                                            str]] = None,
+            discardable = (),
+            *args, **kwargs) -> None:
         """Sleep mode: offload allocations with offload_tags to CPU, discard the rest."""
+        # vLLM >= 0.34 calls sleep(offload_tags, discardable). `discardable` names weight tensors vLLM may drop
+        # instead of backing up; Unsloth never offloads or frees "weights" (they are shared with training), so it
+        # is accepted and has nothing to act on. *args/**kwargs keep later additions from breaking the call.
         if offload_tags is None:
             # by default, allocated tensors are offloaded on sleep
             offload_tags = (MemAllocator.default_tag, )
@@ -997,6 +1002,9 @@ def patch_vllm_enable_sleep_mode():
             if data.tag == 'weights':
                 # Weights are unsloth-managed; don't offload/delete them here.
                 continue
+            if getattr(data, "is_asleep", False):
+                # vLLM >= 0.34 tracks is_asleep; an already released handle must not be released twice.
+                continue
             if data.tag in offload_tags:
                 size_in_bytes = handle[1]
                 cpu_backup_tensor = torch.empty(
@@ -1011,6 +1019,8 @@ def patch_vllm_enable_sleep_mode():
             logger.debug(f"data's tag is {data.tag} and is offloaded to cpu? {data.tag in offload_tags}")
 
             unmap_and_release(handle)
+            if hasattr(data, "is_asleep"):
+                data.is_asleep = True
             true_offloads += 1
         pass
 
@@ -1026,9 +1036,14 @@ def patch_vllm_enable_sleep_mode():
             if data.tag == "weights":
                 # Weights are unsloth-managed; don't onload/create them here.
                 continue
+            if hasattr(data, "is_asleep") and not data.is_asleep:
+                # vLLM >= 0.34: still mapped, mapping it again would fail.
+                continue
             if tags is None or data.tag in tags:
                 handle = data.handle
                 create_and_map(handle)
+                if hasattr(data, "is_asleep"):
+                    data.is_asleep = False
                 if data.cpu_backup_tensor is not None:
                     cpu_backup_tensor = data.cpu_backup_tensor
                     if cpu_backup_tensor is not None:
@@ -6196,12 +6211,8 @@ pass
 def create_batches(requests, num_sequences = 64):
     # All Unsloth Zoo code licensed under LGPLv3
     # llm.generate must be batched
-    n_splits = int(math.ceil(len(requests) / num_sequences))
-    offsets = np.arange(0, len(requests), num_sequences)
-    if offsets[-1] != len(requests):
-        offsets = np.hstack((offsets, len(requests)))
-    batches = [requests[offsets[i]:offsets[i+1]] for i in range(len(offsets)-1)]
-    return batches
+    num_sequences = max(int(num_sequences), 1)
+    return [requests[i:i+num_sequences] for i in range(0, len(requests), num_sequences)]
 pass
 
 
@@ -6246,11 +6257,13 @@ def _save_dir_atomically(save_fn, save_directory, rank):
     """
     # All Unsloth Zoo code licensed under LGPLv3
     save_directory = os.fspath(save_directory)
-    tmp = f"{save_directory.rstrip(os.sep)}.unsloth_tmp_rank{rank}_{os.getpid()}"
-    shutil.rmtree(tmp, ignore_errors = True)
+    import tempfile
+    parent, base = os.path.split(save_directory.rstrip(os.sep) or save_directory)
+    parent = parent or os.curdir
+    os.makedirs(parent, exist_ok = True)
+    # mkdtemp: owner-only, unpredictable O_EXCL name a peer writing the parent cannot pre-create or link.
+    tmp = tempfile.mkdtemp(prefix = f"{base}.unsloth_tmp_rank{rank}_", dir = parent)
     try:
-        # Owner-only, so adapters a private output folder protects are not readable beside it while written.
-        os.makedirs(tmp, mode = 0o700, exist_ok = True)
         save_fn(tmp)
         for root, _, files in os.walk(tmp):
             rel = os.path.relpath(root, tmp)
@@ -7803,7 +7816,8 @@ pass
 
 def _merged_rollout_restore(state):
     """Copy W back from P, retried once (idempotent); two failures poison the state.
-    Exact mode unfolds once: an unfold is not idempotent, so any failure poisons."""
+    Exact mode unfolds once: an unfold is not idempotent, so any failure poisons, except an out-of-memory error raised
+    before any weight changed (retried once)."""
     # All Unsloth Zoo code licensed under LGPLv3
     if state.entries and state.entries[0][2] is None:
         from .merged_rollout_exact import exact_unfold
@@ -7813,7 +7827,18 @@ def _merged_rollout_restore(state):
         try:
             _merged_rollout_synchronize(state)
             with torch.inference_mode():
-                exact_unfold(targets, stream = state.stream)
+                retry = False
+                try:
+                    exact_unfold(targets, stream = state.stream)
+                except torch.cuda.OutOfMemoryError:
+                    # Raised before the first in-place write (no target restoring): no weight changed, so run it once
+                    # more. A restoring target cannot be retried.
+                    if any(t.restoring for t in targets): raise
+                    retry = True
+                if retry:
+                    # Outside the handler, so the failed attempt's traceback (and the scratch its frames hold) is freed.
+                    torch.cuda.empty_cache()
+                    exact_unfold(targets, stream = state.stream)
             state.record()
         except BaseException as error:
             state.poisoned = repr(error)
@@ -8285,6 +8310,8 @@ def generate_batches(llm, inputs, n_batches = None, lora_request = None, *args, 
     if n_batches is None:
         if "UNSLOTH_VLLM_BATCHES" in os.environ:
             n_batches = int(os.environ["UNSLOTH_VLLM_BATCHES"])
+        elif getattr(llm, "_unsloth_batches", None) is not None:
+            n_batches = llm._unsloth_batches
         else:
             free_memory, total_memory = get_mem_info()
             total_memory_gb = round(total_memory / 1024 / 1024 / 1024, 2)
@@ -8292,8 +8319,11 @@ def generate_batches(llm, inputs, n_batches = None, lora_request = None, *args, 
             elif total_memory_gb <= 16: n_batches = llm.approx_max_num_seqs // 5
             elif total_memory_gb <= 24: n_batches = llm.approx_max_num_seqs // 2
             else: n_batches = llm.approx_max_num_seqs
-
-            os.environ["UNSLOTH_VLLM_BATCHES"] = str(n_batches)
+            # Small engines round to 0. Keep the width on this engine, not the environment,
+            # so another engine in the same process sizes its own.
+            n_batches = max(n_batches, 1)
+            try: llm._unsloth_batches = n_batches
+            except Exception: pass
 
             if n_batches != llm.approx_max_num_seqs:
                 print(f"Unsloth: Will use {n_batches} batches to reduce memory usage for generation!")

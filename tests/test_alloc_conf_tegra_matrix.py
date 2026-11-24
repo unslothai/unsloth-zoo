@@ -14,6 +14,7 @@ import sys
 import textwrap
 
 import pytest
+from _zoo_forkserver import run_python
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "linux",
@@ -149,7 +150,7 @@ _CHILD = textwrap.dedent(
 )
 
 
-def _conf(*, torch_version, jetson, tmp_path = None, preset = None, force = None):
+def _conf(*, torch_version, jetson, tmp_path = None, preset = None, force = None, pristine = False):
     env = {k: v for k, v in os.environ.items() if k not in _WIPE}
     env["_ZOO_ROOT"] = _REPO_ROOT
     env["_FAKE_TORCH_VERSION"] = torch_version
@@ -165,10 +166,16 @@ def _conf(*, torch_version, jetson, tmp_path = None, preset = None, force = None
     for key, value in (preset or {}).items():
         env[key] = value
 
-    proc = subprocess.run(
-        [sys.executable, "-c", _CHILD],
-        env = env, cwd = _REPO_ROOT, capture_output = True, text = True, timeout = 600,
-    )
+    if pristine:
+        # torch must not be in the process yet: the case asserts the detector itself never imports it.
+        proc = subprocess.run(
+            [sys.executable, "-c", _CHILD],
+            env = env, cwd = _REPO_ROOT, capture_output = True, text = True, timeout = 600,
+        )
+    else:
+        # Only the allocator env is read: fork from a server that already imported the third-party packages,
+        # the zoo is still imported fresh in every child.
+        proc = run_python(_CHILD, env = env, cwd = _REPO_ROOT, timeout = 600)
     lines = [line for line in (proc.stdout + proc.stderr).splitlines() if line.startswith("RESULT:")]
     if not lines:
         raise AssertionError(
@@ -195,7 +202,7 @@ class TestTegraGetsNothing:
             assert "roundup" not in (value or ""), (key, value)
 
     def test_detection_neither_imports_torch_nor_initializes_cuda(self, tmp_path):
-        result = _conf(torch_version = "2.14.0", jetson = True, tmp_path = tmp_path)
+        result = _conf(torch_version = "2.14.0", jetson = True, tmp_path = tmp_path, pristine = True)
         if not result["detector_present"]:
             pytest.skip("this checkout has no unsloth_zoo/integrated_device.py")
         cost = result["detector_cost"]

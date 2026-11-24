@@ -78,7 +78,19 @@ print("RESULT " + json.dumps(result))
 """
 
 
+# Each call is a fresh process and the tests already require its result to be reproducible across processes (after ==
+# fresh, bit for bit), so an identical call (the fresh bf16 reference shared by both fp16_passes) runs once per module.
+_RUNS = {}
+
+
 def _run(flags, dtype, attn = "sdpa"):
+    key = (tuple(flags), dtype, attn)
+    if key not in _RUNS:
+        _RUNS[key] = _run_fresh(flags, dtype, attn)
+    return json.loads(json.dumps(_RUNS[key]))
+
+
+def _run_fresh(flags, dtype, attn):
     env = dict(
         os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1",
         UNSLOTH_ZOO_DISABLE_GPU_INIT = "1", TORCHDYNAMO_DISABLE = "1",

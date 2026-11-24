@@ -1238,10 +1238,11 @@ def iter_archive_files(archive_path: str, incomplete: list | None = None):
                     return
                 reason = _refuse_unsafe_member_name(info.filename)
                 if reason is not None:
-                    print(
-                        f"  [WARN] {path.name}: refused member ({reason})",
-                        file = sys.stderr,
-                    )
+                    # pip normalises `pkg/../x.pth` to `x.pth` and installs it, so an unread scanned member is a gap.
+                    if _is_scanned_member(info.filename):
+                        _scan_incomplete(incomplete, path, f"refused member ({reason})")
+                    else:
+                        print(f"  [WARN] {path.name}: refused member ({reason})", file = sys.stderr)
                     continue
                 if not _is_scanned_member(info.filename):
                     continue  # never pattern-checked, so never read
@@ -1306,10 +1307,10 @@ def iter_archive_files(archive_path: str, incomplete: list | None = None):
                     continue
                 reason = _refuse_unsafe_member_name(member.name)
                 if reason is not None:
-                    print(
-                        f"  [WARN] {path.name}: refused member ({reason})",
-                        file = sys.stderr,
-                    )
+                    if _is_scanned_member(member.name):
+                        _scan_incomplete(incomplete, path, f"refused member ({reason})")
+                    else:
+                        print(f"  [WARN] {path.name}: refused member ({reason})", file = sys.stderr)
                     continue
                 if not _is_scanned_member(member.name):
                     continue  # never pattern-checked, so never read

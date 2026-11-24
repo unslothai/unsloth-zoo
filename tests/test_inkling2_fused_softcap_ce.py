@@ -20,6 +20,7 @@ LM-head CE must take it as `logit_softcapping` instead of declining and material
 import importlib
 import inspect
 import os
+import re
 
 import pytest
 import torch
@@ -36,6 +37,8 @@ _INKLING = {
 }
 _STATEMENT = "logits = torch.tanh(logits / self.logit_softcap.softcap) * self.logit_softcap.softcap"
 _MODULE_CALL = "logits = self.logit_softcap(logits)"
+# transformers 5.23: `logits = logits[..., : self.config.unpadded_vocab_size]` (`text_config.` on the VLM).
+_VOCAB_SLICE = re.compile(r"logits = logits\[\.\.\., *: *[\w.]*unpadded_vocab_size\]")
 
 
 def _inkling_classes():
@@ -52,9 +55,18 @@ def _inkling_classes():
 @pytest.mark.parametrize("entry", _inkling_classes() or [None], ids = lambda e: e[1].__name__ if e else "absent")
 def test_inkling_forwards_fuse_with_the_module_softcap(entry):
     if entry is None:
-        pytest.skip("transformers has no Inkling 2 (needs >= 5.24)")
+        pytest.skip("transformers has no Inkling 2 (needs >= 5.23)")
     mod, cls = entry
     src = inspect.getsource(cls.forward)
+    if _VOCAB_SLICE.search(src):
+        # transformers 5.23 builds lm_head on the padded vocab and slices the logits after it. The fused kernel
+        # reads the vocab from lm_head.weight, so fusing would softmax over the padding columns: stay unfused.
+        assert "unsloth_fused_lm_head_loss(" not in src
+        new, route, _ = compiler.fused_lm_head_forward(cls.__name__, cls, mod.__name__, src)
+        assert route is None, route
+        assert "unsloth_fused_lm_head_loss(" not in new and _VOCAB_SLICE.search(new)
+        assert _STATEMENT not in new and _MODULE_CALL in new
+        return
     if "unsloth_fused_lm_head_loss(" in src:
         # The import hook already installed the fused forward (*ForCausalLM once unsloth_zoo is imported).
         assert forward_install.audit()["patched"][cls.__qualname__]["head_attr"] == "lm_head"
@@ -128,6 +140,38 @@ def _make_class(name, cap_cls):
     return Toy
 
 
+class PaddedHeadToyForCausalLM(nn.Module):
+    """transformers 5.23's Inkling 2 shape: lm_head over a padded vocab, then the logits sliced to the real one."""
+
+    def __init__(self):
+        super().__init__()
+        self.body = nn.Linear(16, 16)
+        self.lm_head = nn.Linear(16, 320, bias = False)
+        self.logit_softcap = _Softcap(30.0)
+        self.unpadded_vocab_size = 300
+
+    def forward(self, x = None, labels = None, **kwargs):
+        hidden_states = self.body(x)
+        logits = self.lm_head(hidden_states).float()
+        logits = logits[..., : self.unpadded_vocab_size]
+        logits = self.logit_softcap(logits)
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=logits.shape[-1], **kwargs)
+        return _Out(loss, logits)
+
+
+def test_a_padded_head_with_a_vocab_slice_is_not_fused():
+    """The kernel takes the vocab from lm_head.weight, so fusing would softmax over the 20 padding columns."""
+    cls = PaddedHeadToyForCausalLM
+    src = inspect.getsource(cls.forward)
+    assert _VOCAB_SLICE.search(src)
+    new, route, _ = compiler.fused_lm_head_forward(cls.__name__, cls, cls.__module__, src)
+    assert route is None, route
+    assert "unsloth_fused_lm_head_loss(" not in new and _MODULE_CALL in new
+    assert not forward_install.install_for_class(cls)
+
+
 def test_lookalike_module_call_is_left_alone():
     cls = _make_class("ShiftedToyForCausalLM", _ShiftedSoftcap)
     src = inspect.getsource(cls.forward)
@@ -192,8 +236,8 @@ def _lora_head(base):
 
 
 def test_unmerged_peft_adapter_on_the_head_still_trains(monkeypatch):
-    """A PEFT LoRA head adds its adapter in forward; the fused kernel reads only lm_head.weight, so such a head takes
-    the exact path and its adapter gets the gradient UNSLOTH_RETURN_LOGITS=1 gives. Disabled and unmerged: fused."""
+    """A PEFT LoRA head adds its adapter in forward; the fused loss runs the head's own forward (no logits returned)
+    and its adapter gets the gradient UNSLOTH_RETURN_LOGITS=1 gives. Disabled and unmerged: the kernel on the weight."""
     cls = _make_class("AdapterHeadToyForCausalLM", _Softcap)
     assert forward_install.install_for_class(cls)
     torch.manual_seed(0)
@@ -209,6 +253,7 @@ def test_unmerged_peft_adapter_on_the_head_still_trains(monkeypatch):
         out.loss.backward()
         grads.append(model.lm_head.lora_B["default"].weight.grad)
         losses.append(out.loss.detach())
+        assert (out.logits.numel() == 0) == (mode == "0")   # live adapter: fused, not the materialized path
     assert grads[1] is not None
     torch.testing.assert_close(grads[1], grads[0])
     torch.testing.assert_close(losses[1], losses[0])

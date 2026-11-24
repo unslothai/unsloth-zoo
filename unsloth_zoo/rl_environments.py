@@ -534,6 +534,8 @@ _DENIED_ATTR_NAMES = frozenset({
     "f_locals", "f_trace",
     "gi_code", "gi_frame", "gi_running", "gi_yieldfrom",
     "tb_frame", "tb_lasti", "tb_lineno", "tb_next",
+    # ABCMeta.register adds a virtual subclass to a host ABC (collections.abc.Sequence, numbers.Number) for the whole process.
+    "register",
 })
 # 3.14 ForwardRef.evaluate runs its string with the real builtins; denied only where it exists.
 if sys.version_info >= (3, 14):
@@ -584,6 +586,11 @@ class _SafeModule:
                     f"Access to module '{dotted}' is not allowed in generated code."
                 )
             return _SafeModule(value, dotted)
+        # Registries are host state (`copy.dispatch_table[cls] = f` rewires every copy.copy): read-only view.
+        if type(value) is dict:
+            return types.MappingProxyType(value)
+        if type(value) in (list, set, bytearray):
+            return {list: tuple, set: frozenset, bytearray: bytes}[type(value)](value)
         return value
 
     def __repr__(self):

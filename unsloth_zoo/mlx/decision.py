@@ -35,7 +35,7 @@ import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
-from unsloth_zoo.private_staging import copy_keep_mode, keep_mode, precreate_private_temp
+from unsloth_zoo.private_staging import copytree_keep_mode, keep_mode, precreate_private_temp
 
 __all__ = [
     "DecisionModel",
@@ -2018,7 +2018,7 @@ def save_decision_model(model, folder, source, agent_config = None):
     os.replace(partial, folder / "model.safetensors")
     if folder.resolve() != source.resolve():
         for name in ("encoder", "tokenizer"):
-            shutil.copytree(source / name, folder / name, dirs_exist_ok = True, copy_function = copy_keep_mode)
+            copytree_keep_mode(source / name, folder / name)
     # Written last: a folder with rl_agent_config.json is a complete checkpoint.
     partial = folder / "rl_agent_config.json.tmp"
     partial.write_text(json.dumps(agent_config, indent = 2), encoding = "utf-8")

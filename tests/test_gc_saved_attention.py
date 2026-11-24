@@ -443,9 +443,15 @@ def test_rocm_probe_dtype(monkeypatch, arch, bf16, dtype):
     assert SA._rocm_probe_dtype(torch.device("cuda", 0)) is dtype
 
 
+@pytest.fixture(params = ["7.13.0", None], ids = ["rocm", "not_rocm"])
+def hip_build(request, monkeypatch):
+    """The transformers wrappers route the same on every build: run their tests as ROCm and as CUDA / CPU."""
+    monkeypatch.setattr(torch.version, "hip", request.param, raising = False)
+    return request.param
+
+
 @pytest.mark.parametrize("kind", ["interface", "flex"])
-def test_rocm_transformers_wrappers_stay_in_a_fullgraph_compile_without_a_frame(monkeypatch, kind):
-    monkeypatch.setattr(torch.version, "hip", "7.13.0", raising = False)
+def test_transformers_wrappers_stay_in_a_fullgraph_compile_without_a_frame(monkeypatch, hip_build, kind):
     module = torch.nn.Module()
     module.train()
     if kind == "interface":
@@ -463,9 +469,8 @@ def test_rocm_transformers_wrappers_stay_in_a_fullgraph_compile_without_a_frame(
     torch.testing.assert_close(out, _sdpa(q, q, q))
 
 
-def _rocm_frame_wrapper(monkeypatch, kind):
+def _frame_wrapper(monkeypatch, kind):
     monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
-    monkeypatch.setattr(torch.version, "hip", "7.13.0", raising = False)
     module = torch.nn.Module()
     module.train()
     if kind == "interface":
@@ -476,11 +481,11 @@ def _rocm_frame_wrapper(monkeypatch, kind):
 
 
 @pytest.mark.parametrize("kind", ["interface", "flex"])
-def test_rocm_transformers_wrappers_stay_in_a_fullgraph_compile_inside_a_frame(monkeypatch, kind):
-    """A live checkpoint frame on an eligible ROCm device (CPU tensors are kept) must not send a user's
+def test_transformers_wrappers_stay_in_a_fullgraph_compile_inside_a_frame(monkeypatch, hip_build, kind):
+    """A live checkpoint frame on an eligible device (CPU tensors are kept) must not send a user's
     fullgraph=True training compile into the compiler-disabled helpers: forward + backward compile, and
     both checkpoint passes take the in-graph route, so the frame keeps nothing."""
-    call = _rocm_frame_wrapper(monkeypatch, kind)
+    call = _frame_wrapper(monkeypatch, kind)
     q = torch.randn(1, 2, 8, 16, requires_grad = True)
     frame = SA.new_saved_attention_frame([q])
     assert frame is not None
@@ -503,12 +508,12 @@ def test_rocm_transformers_wrappers_stay_in_a_fullgraph_compile_inside_a_frame(m
     assert SA.SAVED_ATTENTION_STATS.get("unmatched", 0) == 0
 
 
-def test_rocm_frame_still_keeps_inside_an_unsloth_compiled_block(monkeypatch):
+def test_frame_still_keeps_inside_an_unsloth_compiled_block(monkeypatch, hip_build):
     """Unsloth's own block compile (fullgraph=False) may break the graph: there the frame keeps and the
     replay reuses as in eager code."""
     import types
 
-    call = _rocm_frame_wrapper(monkeypatch, "interface")
+    call = _frame_wrapper(monkeypatch, "interface")
     block = types.ModuleType("unsloth.models._block_compile")
     block._IN_COMPILED_REGION = [True]
     monkeypatch.setitem(sys.modules, "unsloth.models._block_compile", block)
@@ -527,9 +532,8 @@ def test_rocm_frame_still_keeps_inside_an_unsloth_compiled_block(monkeypatch):
     assert SA.SAVED_ATTENTION_STATS["stored"] >= 1
 
 
-def _rocm_frame_qkv_wrapper(monkeypatch, kind):
+def _frame_qkv_wrapper(monkeypatch, kind):
     monkeypatch.setenv("UNSLOTH_GC_SAVE_ATTENTION", "1")
-    monkeypatch.setattr(torch.version, "hip", "7.13.0", raising = False)
     module = torch.nn.Module()
     module.train()
     if kind == "interface":
@@ -567,11 +571,11 @@ def _two_attention_reference(inputs):
 
 
 @pytest.mark.parametrize("kind", ["interface", "flex"])
-def test_rocm_frame_replays_the_right_call_when_a_compile_falls_back_to_eager(monkeypatch, kind):
+def test_frame_replays_the_right_call_when_a_compile_falls_back_to_eager(monkeypatch, hip_build, kind):
     """A user's fullgraph=False compile at its recompile limit runs the replay eagerly while the first
     pass was compiled. Both passes must take the same route, or the replay of one call takes the entry
     another call kept (entries are matched by call order) and its gradients are wrong."""
-    call = _rocm_frame_qkv_wrapper(monkeypatch, kind)
+    call = _frame_qkv_wrapper(monkeypatch, kind)
     torch.manual_seed(0)
     inputs = tuple(torch.randn(1, 2, 32, 16) for _ in range(3))
     ref_loss, ref_grads = _two_attention_reference(inputs)
@@ -589,10 +593,10 @@ def test_rocm_frame_replays_the_right_call_when_a_compile_falls_back_to_eager(mo
 
 
 @pytest.mark.parametrize("kind", ["interface", "flex"])
-def test_rocm_frame_keeps_inside_a_fullgraph_false_user_compile(monkeypatch, kind):
+def test_frame_keeps_inside_a_fullgraph_false_user_compile(monkeypatch, hip_build, kind):
     """A user's fullgraph=False compile may break the graph: inside a frame it keeps and the replay
     reuses, as in eager code and in Unsloth's own blocks."""
-    call = _rocm_frame_qkv_wrapper(monkeypatch, kind)
+    call = _frame_qkv_wrapper(monkeypatch, kind)
     torch.manual_seed(0)
     inputs = tuple(torch.randn(1, 2, 32, 16) for _ in range(3))
     ref_loss, ref_grads = _two_attention_reference(inputs)
@@ -609,11 +613,11 @@ def test_rocm_frame_keeps_inside_a_fullgraph_false_user_compile(monkeypatch, kin
     assert SA.SAVED_ATTENTION_STATS.get("reused", 0) == 2, dict(SA.SAVED_ATTENTION_STATS)
 
 
-def test_rocm_frame_stays_in_the_graph_under_error_on_graph_break(monkeypatch):
+def test_frame_stays_in_the_graph_under_error_on_graph_break(monkeypatch, hip_build):
     """torch._dynamo.error_on_graph_break(True) inside a fullgraph=False compile is as strict as fullgraph."""
     if not hasattr(torch._dynamo, "error_on_graph_break"):
         pytest.skip("torch._dynamo.error_on_graph_break is torch 2.9+")
-    call = _rocm_frame_wrapper(monkeypatch, "interface")
+    call = _frame_wrapper(monkeypatch, "interface")
     q = torch.randn(1, 2, 8, 16, requires_grad = True)
     frame = SA.new_saved_attention_frame([q])
 
@@ -636,13 +640,13 @@ def test_rocm_frame_stays_in_the_graph_under_error_on_graph_break(monkeypatch):
 
 @pytest.mark.parametrize("kind", ["interface", "flex"])
 @pytest.mark.parametrize("backend", ["eager", "aot_eager", "inductor"])
-def test_rocm_strict_frame_replays_the_right_call_when_a_compile_falls_back_to_eager(monkeypatch, kind, backend):
+def test_strict_frame_replays_the_right_call_when_a_compile_falls_back_to_eager(monkeypatch, hip_build, kind, backend):
     """error_on_graph_break(True) in a fullgraph=False compile: the first pass (no_grad) compiles and
     keeps nothing for that call, the replay hits the recompile limit and runs eagerly. The eager replay
     of the strict call must not take the entry the next (eager) call kept."""
     if not hasattr(torch._dynamo, "error_on_graph_break"):
         pytest.skip("torch._dynamo.error_on_graph_break is torch 2.9+")
-    call = _rocm_frame_qkv_wrapper(monkeypatch, kind)
+    call = _frame_qkv_wrapper(monkeypatch, kind)
     torch.manual_seed(0)
     inputs = tuple(torch.randn(1, 2, 32, 16) for _ in range(3))
     ref_loss, ref_grads = _two_attention_reference(inputs)
@@ -665,12 +669,12 @@ def test_rocm_strict_frame_replays_the_right_call_when_a_compile_falls_back_to_e
 
 
 @pytest.mark.parametrize("kind", ["interface", "flex"])
-def test_rocm_strict_replay_after_an_eager_first_pass_keeps_call_order(monkeypatch, kind):
+def test_strict_replay_after_an_eager_first_pass_keeps_call_order(monkeypatch, hip_build, kind):
     """The reverse: the first pass runs the strict call eagerly (it keeps an entry), the replay runs it
     compiled in the graph. The compiled replay must consume that entry so the next call takes its own."""
     if not hasattr(torch._dynamo, "error_on_graph_break"):
         pytest.skip("torch._dynamo.error_on_graph_break is torch 2.9+")
-    call = _rocm_frame_qkv_wrapper(monkeypatch, kind)
+    call = _frame_qkv_wrapper(monkeypatch, kind)
     torch.manual_seed(0)
     inputs = tuple(torch.randn(1, 2, 32, 16) for _ in range(3))
     ref_loss, ref_grads = _two_attention_reference(inputs)
@@ -688,6 +692,26 @@ def test_rocm_strict_replay_after_an_eager_first_pass_keeps_call_order(monkeypat
     torch.testing.assert_close(loss, ref_loss)
     for got, want in zip(grads, ref_grads):
         torch.testing.assert_close(got, want, rtol = 1e-4, atol = 1e-6)
+
+
+@pytest.mark.parametrize("kind", ["interface", "flex"])
+def test_wrappers_in_eager_code_are_bitwise_the_plain_call(monkeypatch, hip_build, kind):
+    """Eager calls, with or without a frame, return exactly what the unwrapped attention returns."""
+    call = _frame_wrapper(monkeypatch, kind)
+    q = torch.randn(1, 2, 8, 16, requires_grad = True)
+    ref_q = q.detach().requires_grad_()
+    ref = _sdpa(ref_q, ref_q, ref_q)
+    ref.sum().backward()
+    assert torch.equal(call(q), ref)
+    frame = SA.new_saved_attention_frame([q])
+    with SA.saved_attention_scope(frame, False), torch.no_grad():
+        first = call(q)
+    with SA.saved_attention_scope(frame, True):
+        out = call(q)
+        out.sum().backward()
+    assert torch.equal(first, ref.detach()) and torch.equal(out, ref)
+    assert torch.equal(q.grad, ref_q.grad)
+    assert SA.SAVED_ATTENTION_STATS["stored"] >= 1 and SA.SAVED_ATTENTION_STATS["reused"] >= 1
 
 
 def test_rocm_hooks_install_from_the_setting_not_the_current_gpu(monkeypatch):

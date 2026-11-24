@@ -4928,6 +4928,26 @@ def _reinstall_converter_deps(python_exe, print_output = False):
     return result
 
 
+def _require_safe_bin_checkpoint_load(input_folder):
+    # torch < 2.6 runs code from a crafted pickle even with weights_only=True (CVE-2025-32434). Both the MTP inspection
+    # below and llama.cpp's converter (same interpreter) torch.load a `.bin`-only checkpoint, so refuse it here, once.
+    # Safetensors folders (every Unsloth save) and torch >= 2.6 are unaffected.
+    input_folder = Path(input_folder)
+    if any(input_folder.glob("model*.safetensors")) or not any(input_folder.glob("pytorch_model*.bin")):
+        return
+    from importlib.metadata import version as _installed_version
+    from packaging.version import Version
+    try:
+        version = str(torch.__version__) if torch is not None else _installed_version("torch")
+    except Exception:
+        return
+    if Version(version).release < (2, 6):
+        raise ValueError(
+            f"Unsloth: {input_folder} holds only pytorch_model*.bin pickles, and torch {version} cannot load one "
+            "safely. Upgrade torch to 2.6 or newer, or save the model as safetensors."
+        )
+
+
 def _has_mtp_weight_tensors(input_folder, num_layers):
     """Return whether the checkpoint's tensor names include an MTP layer."""
     input_folder = Path(input_folder)
@@ -4983,6 +5003,7 @@ def _has_mtp_weight_tensors(input_folder, num_layers):
             return any(_is_mtp(name) for name in _names_from_index(index_path))
         if torch is None:
             raise RuntimeError("Unsloth: PyTorch is required to inspect `.bin` model weights.")
+        _require_safe_bin_checkpoint_load(input_folder)
         for part in parts:
             try:
                 state_dict = torch.load(
@@ -5678,6 +5699,44 @@ def _probe_child_gguf(python_exe, env, requirements, converter_location = None, 
     return None
 
 
+def loaded_remote_code(*objects):
+    """True when a model / tokenizer class comes from transformers_modules: the load ran (and so approved) auto_map
+    code, or the model carries the loader's `_unsloth_trust_remote_code` stamp."""
+    seen, queue = set(), list(objects)
+    while queue and len(seen) < 16:
+        node = queue.pop(0)
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        if getattr(node, "_unsloth_trust_remote_code", False) is True:
+            return True
+        module = getattr(type(node), "__module__", None)
+        if isinstance(module, str) and module.startswith("transformers_modules"):
+            return True
+        for attr in ("base_model", "model", "tokenizer", "_tokenizer"):
+            queue.append(getattr(node, attr, None))
+    return False
+
+
+@contextlib.contextmanager
+def converter_remote_code_guard(approved):
+    """convert_hf_to_gguf.py loads several architectures' tokenizers with trust_remote_code=True. Transformers
+    imports auto_map code only from HF_MODULES_CACHE, which the converter child inherits, so unless the load
+    approved remote code that is pointed at a path no directory can be created at, as the GPU export does."""
+    if approved:
+        yield
+        return
+    existing = os.environ.get("HF_MODULES_CACHE")
+    os.environ["HF_MODULES_CACHE"] = os.path.join(os.path.abspath(__file__), "no_remote_code")
+    try:
+        yield
+    finally:
+        if existing is None:
+            os.environ.pop("HF_MODULES_CACHE", None)
+        else:
+            os.environ["HF_MODULES_CACHE"] = existing
+
+
 def _converter_child_env(gguf_py_dir = None, base_env = None):
     """The environment a converter child should run with.
 
@@ -6087,6 +6146,8 @@ def convert_to_gguf(
             f"16bit weights. Saving a quantized model that has no adapter does "
             f"not dequantize it."
         )
+
+    _require_safe_bin_checkpoint_load(input_folder)
 
     # Decided BEFORE resolving the converter, so the resolution is scoped to the
     # halves this call really converts.

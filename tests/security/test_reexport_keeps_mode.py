@@ -36,9 +36,7 @@ def _helpers(ns):
     try:
         from unsloth_zoo import private_staging
         assert Path(private_staging.__file__).resolve().parent == ROOT  # this arm's own tree
-        ns.update(keep_mode = private_staging.keep_mode, copy_keep_mode = private_staging.copy_keep_mode,
-                  current_umask = private_staging.current_umask,
-                  precreate_private_temp = private_staging.precreate_private_temp)
+        ns.update({name: getattr(private_staging, name) for name in private_staging.__all__})
     except (ImportError, AttributeError):
         pass
     return ns
