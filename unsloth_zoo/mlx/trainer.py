@@ -653,6 +653,7 @@ from .grpo import (
     make_grpo_eval_fn,
     make_grpo_loss_fn,
     resolve_grpo_config,
+    vllm_rollout_params,
 )
 from .compile import (
     build_compile_policy,
@@ -1674,6 +1675,7 @@ class MLXTrainingConfig:
             "log_completions",
             "num_completions_to_print",
             "use_vllm",
+            "vllm_sampling_params",
             "use_liger_loss",
             "zero_variance_exclude",
             "loss_aggregation",
@@ -1849,6 +1851,8 @@ class MLXGRPOConfig(MLXTrainingConfig):
     log_completions: bool = field(default=False, kw_only=True)
     num_completions_to_print: int | None = field(default=None, kw_only=True)
     use_vllm: bool = field(default=False, kw_only=True)
+    # vllm.SamplingParams overriding rollout sampling, as on CUDA Unsloth.
+    vllm_sampling_params: object = field(default=None, kw_only=True)
     use_liger_loss: bool = field(default=False, kw_only=True)
     # ScaleRL options; None reads CUDA Unsloth's UNSLOTH_GRPO_ZERO_VARIANCE_EXCLUDE / UNSLOTH_GRPO_LOSS_AGGREGATION.
     zero_variance_exclude: bool | None = field(default=None, kw_only=True)
@@ -6407,6 +6411,7 @@ class MLXTrainer:
                 keep_completions=bool(args.log_completions),
                 scorer=loss_fn._unsloth_grpo_scorer,
                 step_compiled=lambda: _use_compile,
+                vllm_params=self._grpo_vllm_params(batches),
             )
 
         _compiled_loss_fn = getattr(loss_fn, "_unsloth_compiled_loss_fn", None)
@@ -7131,6 +7136,7 @@ class MLXTrainer:
                             rollout_context=_training_patches_paused,
                             keep_completions=bool(args.log_completions),
                             scorer=loss_fn._unsloth_grpo_scorer,
+                            vllm_params=self._grpo_vllm_params(plan),
                         )
                         return plan
                     prompt_sink = (
@@ -10057,6 +10063,30 @@ class MLXGRPOTrainer(MLXTrainer):
                 f"Unsloth MLX GRPO: {len(args.reward_weights)} reward_weights for "
                 f"{len(self.reward_funcs)} reward functions."
             )
+        # As on CUDA, a vLLM engine samples rollouts; only for plain LoRA on an engine sharing the trained base.
+        from . import vllm_utils
+
+        engine = getattr(self.model, "vllm_engine", None)
+        adapted = vllm_utils.plain_lora(self.model)
+        shared = getattr(self.model, "_unsloth_vllm_shared", False)
+        if args.use_vllm and engine is None:
+            raise ValueError(
+                "Unsloth MLX GRPO: use_vllm samples with the vLLM engine that "
+                "from_pretrained(fast_inference=True) starts when vllm-metal is installed; this model has none."
+            )
+        if args.use_vllm and not adapted:
+            raise ValueError(
+                "Unsloth MLX GRPO: use_vllm needs plain LoRA training; the vLLM engine keeps the loaded weights and "
+                "applies only LoRA A/B, so full fine-tuning, DoRA, QAT, MoE expert LoRA and trained full modules "
+                "sample on MLX."
+            )
+        if args.use_vllm and not shared:
+            raise ValueError(
+                "Unsloth MLX GRPO: use_vllm needs an in-process vLLM engine that shares the training model's weights; "
+                "this one loaded its own copy (a multiprocess engine, or a layout it could not match), so its base "
+                "differs from the one being trained and GRPO samples on MLX."
+            )
+        self._grpo_vllm = engine is not None and adapted and shared
         max_tokens = grpo_sampling(args).max_tokens
         if max_tokens >= args.max_seq_length:
             raise ValueError(
@@ -10074,6 +10104,12 @@ class MLXGRPOTrainer(MLXTrainer):
 
     def _uses_reference(self, args):
         return float(args.beta) != 0.0
+
+    def _grpo_vllm_params(self, plan):
+        """Rollout SamplingParams kwargs when this GRPO run samples through the model's vLLM engine, else None."""
+        if not getattr(self, "_grpo_vllm", False):
+            return None
+        return vllm_rollout_params(grpo_sampling(self.args), plan.eos_id, self.args.vllm_sampling_params)
 
     def _syncs_reference(self, args):
         adapted = next(iter_mlx_lora_modules(self.model), None) is not None
@@ -10103,7 +10139,8 @@ class MLXGRPOTrainer(MLXTrainer):
             with_reference=self._uses_reference(args),
             max_prompt_length=args.max_prompt_length, shuffle=args.shuffle_dataset,
             seed=args.seed, num_batches=num_batches, num_epochs=num_epochs,
-            rollout_logprobs_as_old=args.rollout_logprobs_as_old,
+            # vLLM rollouts return no MLX log-prob arrays.
+            rollout_logprobs_as_old=args.rollout_logprobs_as_old and not self._grpo_vllm,
             **self._grpo_vision_options(), **grpo_layout_options(
                 grpo_objective(args), distributed=getattr(self, "distributed_world_size", 1) > 1,
             ),

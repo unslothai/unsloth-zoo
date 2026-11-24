@@ -1151,6 +1151,14 @@ def gradient_checkpointing_bypassed():
         _GC_BYPASS_DEPTH.set(depth)
 
 
+def exempt_from_gradient_checkpointing(model):
+    """Layers of ``model`` skip the class-level checkpoint wrapper, which an inference engine sharing the layer classes
+    would otherwise run, re-assigning its parameters, on every forward."""
+    for _, module in model.named_modules():
+        module._unsloth_no_checkpoint = True
+    return model
+
+
 def _patch_layer_class_for_gc(layer_cls):
     if getattr(layer_cls, '_orig_call', None) is not None:
         return  # already patched
@@ -1158,7 +1166,7 @@ def _patch_layer_class_for_gc(layer_cls):
     fn = layer_cls.__call__
 
     def checkpointed_fn(self, *args, **kwargs):
-        if _GC_BYPASS_DEPTH.get() and not self.training:
+        if getattr(self, "_unsloth_no_checkpoint", False) or (_GC_BYPASS_DEPTH.get() and not self.training):
             return fn(self, *args, **kwargs)
         slot = next((a for a in args if isinstance(a, (_SharedKVSlot, _PrefixKVSlot, _PrefixStateSlot))), None)
         if slot is None and isinstance(kwargs.get("cache"), (_PrefixKVSlot, _PrefixStateSlot)):
@@ -15008,8 +15016,8 @@ def _inherit_target_permissions(tmp_file, target):
     try:
         # Group before mode: chown clears the setgid bit on some systems, so applying the mode afterwards keeps it; the owner is left alone.
         os.chown(str(tmp_file), -1, info.st_gid)
-    except OSError:
-        pass  # Not a member of that group, or a filesystem without ownership.
+    except (OSError, AttributeError):
+        pass  # Not a member of that group, a filesystem without ownership, or Windows (no os.chown).
     try:
         os.chmod(str(tmp_file), info.st_mode & 0o7777)
     except OSError:

@@ -8142,6 +8142,8 @@ def _patch_mlx_saving(model, tokenizer):
     model.push_to_hub_merged     = types.MethodType(_mlx_push_to_hub_merged, model)
     model.push_to_hub_gguf       = types.MethodType(_mlx_push_to_hub_gguf, model)
     model.save_lora_adapters     = types.MethodType(_mlx_save_lora_adapters, model)
+    from .vllm_utils import save_lora
+    model.save_lora              = types.MethodType(save_lora, model)
 
 
 # Searched first, so a tree that resolves today keeps resolving the same way.
