@@ -1149,6 +1149,25 @@ pass
 RL_REPLACEMENTS["create_completion_attention_mask"] = create_completion_attention_mask
 
 
+def grpo_trainer_eos_token_ids(trainer) -> set:
+    """Every EOS id a GRPO trainer stops on: trainer.eos_token_id, TRL 1.x's eos_token_ids, and the tokenizer's."""
+    processing_class = getattr(trainer, "processing_class", None)
+    tokenizer = getattr(processing_class, "tokenizer", processing_class)
+    eos_ids = set()
+    for value in (
+        getattr(trainer, "eos_token_ids", None),
+        getattr(trainer, "eos_token_id", None),
+        getattr(tokenizer, "eos_token_id", None),
+    ):
+        if isinstance(value, int):
+            eos_ids.add(value)
+        elif isinstance(value, (list, tuple, set)):
+            eos_ids.update(v for v in value if isinstance(v, int))
+    return eos_ids
+pass
+RL_REPLACEMENTS["grpo_trainer_eos_token_ids"] = grpo_trainer_eos_token_ids
+
+
 def grpo_pad_is_eos_rows(trainer, completion_ids: torch.Tensor) -> Optional[torch.Tensor]:
     """Rows whose completion ended in an EOS that shares the pad id, or None when the pad id is no EOS id.
 
@@ -1163,17 +1182,7 @@ def grpo_pad_is_eos_rows(trainer, completion_ids: torch.Tensor) -> Optional[torc
     pad_token_id = getattr(processing_class, "pad_token_id", None)
     if pad_token_id is None:
         return None
-    tokenizer = getattr(processing_class, "tokenizer", processing_class)
-    eos_ids = set()
-    for value in (
-        getattr(trainer, "eos_token_ids", None),
-        getattr(trainer, "eos_token_id", None),
-        getattr(tokenizer, "eos_token_id", None),
-    ):
-        if isinstance(value, int):
-            eos_ids.add(value)
-        elif isinstance(value, (list, tuple, set)):
-            eos_ids.update(v for v in value if isinstance(v, int))
+    eos_ids = grpo_trainer_eos_token_ids(trainer)
     if pad_token_id not in eos_ids:
         return None
     # Only the first EOS-set token terminates the row: a completion that stopped on another EOS id
@@ -1242,6 +1251,41 @@ def left_pack_padding(tensor: torch.Tensor, pad_id: int) -> torch.Tensor:
     return packed_tensor
 pass
 RL_REPLACEMENTS["left_pack_padding"] = left_pack_padding
+
+
+def grpo_prompt_real_mask(
+    input_ids: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    logits_to_keep: int,
+    pad_token_id: int,
+    eos_token_ids = None,
+) -> Optional[torch.Tensor]:
+    """Real-token mask for [left-padded prompt | right-padded completion] rows, or None when the id rule already gives it.
+
+    The GRPO text path finds prompt padding by token id. When the pad id is also a real prompt token
+    (``tokenizer.pad_token = "<|im_end|>"`` with a chat template that ends every turn in it), those
+    tokens are counted as left padding and moved out of the prompt. TRL's prompt_mask knows which
+    prompt tokens are real, so only pad-id prompt tokens it marks as real are kept here. The
+    completion section keeps the id rule. Returns None, and so changes nothing, unless some prompt
+    token has the pad id and attention mask 1, and (when eos_token_ids is given) the pad id is an EOS id.
+    """
+    if (
+        pad_token_id is None
+        or (eos_token_ids is not None and pad_token_id not in eos_token_ids)
+        or not torch.is_tensor(attention_mask)
+        or attention_mask.shape != input_ids.shape
+        or logits_to_keep >= input_ids.shape[1]
+    ):
+        return None
+    real = input_ids != pad_token_id
+    prompt_pad_kept = (~real[:, :-logits_to_keep]) & attention_mask[:, :-logits_to_keep].to(torch.bool)
+    if not bool(prompt_pad_kept.any()):
+        return None
+    real[:, :-logits_to_keep] |= prompt_pad_kept
+    return real
+pass
+RL_REPLACEMENTS["grpo_prompt_real_mask"] = grpo_prompt_real_mask
+
 
 def align_logprobs_with_mask(
     logprob_tensor: torch.Tensor,
@@ -3885,8 +3929,28 @@ def grpo_accumulated_loss(
         ):
             kept_completion_rows = completion_mask.sum(dim = 1, keepdim = True) > 0
 
+        prompt_real_mask = None
         if pixel_values is None:
             left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
+
+            # pad == eos and that id inside the prompt as a real token (a chat turn end): take prompt
+            # padding from TRL's attention mask instead (None otherwise, no change).
+            from unsloth_zoo.rl_replacements import grpo_prompt_real_mask, grpo_trainer_eos_token_ids
+            prompt_real_mask = grpo_prompt_real_mask(
+                input_ids, attention_mask, logits_to_keep, trainer.processing_class.pad_token_id,
+                eos_token_ids = grpo_trainer_eos_token_ids(trainer),
+            )
+            # Old / ref logps must use the same layout. Unsloth's scorer packs by pad id unless it sets
+            # _unsloth_grpo_logps_prompt_from_mask; without that keep today's layout so columns line up.
+            # Old logps this function stored from a pass in this layout carry their own mark.
+            _logps_prompt_from_mask = getattr(trainer, "_unsloth_grpo_logps_prompt_from_mask", False)
+            if prompt_real_mask is not None and not (
+                (old_logps is None or _logps_prompt_from_mask or getattr(old_logps, "_unsloth_grpo_prompt_from_mask", False))
+                and (ref_logps is None or _logps_prompt_from_mask)
+            ):
+                prompt_real_mask = None
+            if prompt_real_mask is not None:
+                left_pad_tokens_per_prompt = (~prompt_real_mask[:, :-logits_to_keep]).sum(dim = 1)
 
             # Determine max_left_pad from precomputed logprobs shape for consistency
             if old_logps is not None:
@@ -3909,7 +3973,13 @@ def grpo_accumulated_loss(
             ):
                 pad_eos_rows = None
 
-            input_ids = left_pack_padding(input_ids, trainer.processing_class.pad_token_id)
+            if prompt_real_mask is None:
+                input_ids = left_pack_padding(input_ids, trainer.processing_class.pad_token_id)
+            else:
+                # left_pack_padding, keyed on the real-token mask instead of the pad id.
+                _real_order = torch.argsort(prompt_real_mask, dim = 1, descending = True, stable = True)
+                input_ids = torch.gather(input_ids, 1, _real_order)
+                prompt_real_mask = torch.gather(prompt_real_mask, 1, _real_order)
 
             completion_input_ids = input_ids[:, -(logits_to_keep +max_left_pad):]
             completion_mask = create_completion_attention_mask(completion_input_ids, left_pad_tokens_per_prompt, max_left_pad, trainer.processing_class.pad_token_id, eos_rows = pad_eos_rows).to(attention_mask.dtype)
@@ -3920,6 +3990,9 @@ def grpo_accumulated_loss(
                 sampling_per_token_logps = None
             completion_mask = align_completion_tool_mask(tool_mask, completion_mask)
             attention_mask =  input_ids != trainer.processing_class.pad_token_id
+            if prompt_real_mask is not None:
+                # Real prompt tokens that share the pad id stay visible (completion section: id rule).
+                attention_mask = prompt_real_mask.clone()
             if pad_eos_rows is not None:
                 # The kept EOS is a real token: the packed forward below must score it.
                 _eos_width = completion_input_ids.shape[1]
@@ -4164,6 +4237,8 @@ def grpo_accumulated_loss(
         _pg_engage = _pg_engage and not _collective_forwards
         # The shared-prefix layout finds tokens by pad id, so it would drop a kept EOS that shares it.
         _pg_engage = _pg_engage and pad_eos_rows is None
+        # Same for real prompt tokens that share the pad id (prompt_real_mask).
+        _pg_engage = _pg_engage and prompt_real_mask is None
 
         # ---- PrefixGrouper (GRPO shared-prompt dedup; UNSLOTH_GRPO_PREFIX_GROUPER=0 disables) ----
         # Each prompt's G completions share the prefix; PG forwards it once + the G suffixes
@@ -4286,8 +4361,8 @@ def grpo_accumulated_loss(
                 from unsloth_zoo.rl_replacements import grpo_nonzero_static, grpo_host_lengths_to_device
                 _pack_pad_id = trainer.processing_class.pad_token_id
                 _pack_keep = input_ids != _pack_pad_id
-                if pad_eos_rows is not None:
-                    # Same tokens as attention_mask: keep the real EOS that shares the pad id.
+                if pad_eos_rows is not None or prompt_real_mask is not None:
+                    # Same tokens as attention_mask: keep the real EOS / prompt tokens that share the pad id.
                     _pack_keep = attention_mask.to(torch.bool)
                 _pack_lengths = _pack_keep.sum(dim = 1)
                 _pack_L = input_ids.shape[1]
@@ -4952,6 +5027,9 @@ def grpo_accumulated_loss(
                 if pad_eos_rows is not None:
                     # Scored with the EOS slot kept: later num_iterations passes over this rollout keep it too.
                     trainer._unsloth_grpo_stored_old_logps._unsloth_grpo_covers_eos = True
+                if prompt_real_mask is not None:
+                    # Later num_iterations passes get these back as old_logps: they keep this layout.
+                    trainer._unsloth_grpo_stored_old_logps._unsloth_grpo_prompt_from_mask = True
         _rollout_unscored = None
         if _rollout_logps_as_old:
             old_logps, _rollout_unscored = grpo_rollout_old_fill_unscored(old_logps, new_logprobs)
