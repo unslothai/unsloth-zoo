@@ -7816,7 +7816,8 @@ pass
 
 def _merged_rollout_restore(state):
     """Copy W back from P, retried once (idempotent); two failures poison the state.
-    Exact mode unfolds once: an unfold is not idempotent, so any failure poisons."""
+    Exact mode unfolds once: an unfold is not idempotent, so any failure poisons, except an out-of-memory error raised
+    before any weight changed (retried once)."""
     # All Unsloth Zoo code licensed under LGPLv3
     if state.entries and state.entries[0][2] is None:
         from .merged_rollout_exact import exact_unfold
@@ -7826,7 +7827,14 @@ def _merged_rollout_restore(state):
         try:
             _merged_rollout_synchronize(state)
             with torch.inference_mode():
-                exact_unfold(targets, stream = state.stream)
+                try:
+                    exact_unfold(targets, stream = state.stream)
+                except torch.cuda.OutOfMemoryError:
+                    # Raised before the first in-place write (no target restoring): no weight changed, so free
+                    # cached memory and run it once more. A restoring target cannot be retried.
+                    if any(t.restoring for t in targets): raise
+                    torch.cuda.empty_cache()
+                    exact_unfold(targets, stream = state.stream)
             state.record()
         except BaseException as error:
             state.poisoned = repr(error)

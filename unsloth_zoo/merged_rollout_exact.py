@@ -741,35 +741,54 @@ def _offload(targets, stream):
 pass
 
 
-def _escape_slice(t, start, n, idx, val):
-    # Escapes overwrite what the kernel restored there; the checksum takes the difference. Everything is allocated
-    # here, before the unfold kernels: W viewed as one strided run of its storage, addressed by storage offsets.
-    flat = idx[start:start + n].to(torch.int64)
-    val = val[start:start + n]
+def _escape_slices(s, group, idx, val, after):
+    # One target (one op per weight), part of a store or ROCm: each target's escapes on their own. Escapes overwrite
+    # what the kernel restored there; the checksum takes the difference. Everything is allocated here, before the
+    # unfold kernels; the scratch is shared (the targets run one after another on the stream).
+    group = [t for t in group if s.escs[t.slot][1]]
+    if not group:
+        return []
+    n_max = max(s.escs[t.slot][1] for t in group)
+    wrong = torch.empty(n_max, dtype = torch.int16, device = s.device)
+    wrong_sum = torch.empty((), dtype = torch.int64, device = s.device)
+    flat = torch.empty(n_max, dtype = torch.int64, device = s.device) if any(t.w.is_contiguous() for t in group) else None
+    return [_escape_slice(t, *s.escs[t.slot], idx, val, after, wrong, wrong_sum, flat) for t in group]
+pass
+
+
+def _escape_slice(t, start, n, idx, val, after, wrong, wrong_sum, flat):
     w = t.w
-    if not w.is_contiguous():
+    idx, val = idx[start:start + n], val[start:start + n]
+    # The saved bits count now; the write subtracts the ones it overwrites.
+    after[t.slot].add_(val.sum(dtype = torch.int64))
+    if w.is_contiguous():
+        # Flat indices: widened into the shared buffer by the write.
+        flat = flat[:n]
+    else:
+        # Storage offsets, kept per target (a non-contiguous W is the rare case).
         E, N, K = w.shape
+        flat = idx.to(torch.int64)
         e, rem = flat // (N * K), flat % (N * K)
         flat = e * w.stride(0) + (rem // K) * w.stride(1) + (rem % K) * w.stride(2)
+        idx = None
+    # W as one strided run of its storage; detached, so a grad-enabled view takes the out= gather as before.
     span = 1 + sum((size - 1) * st for size, st in zip(w.shape, w.stride()))
-    run = w.as_strided((span,), (1,))
-    wrong = torch.empty(n, dtype = w.dtype, device = w.device)
-    return _write_escape_slice, _count_escape_slice, (t.slot, run, flat, val.view(w.dtype), wrong, val.to(torch.int64).sum())
+    run = w.detach().as_strided((span,), (1,))
+    return _write_escape_slice, (run, flat, idx, val.view(w.dtype), wrong[:n].view(w.dtype), wrong_sum, after[t.slot])
 pass
 
 
-def _write_escape_slice(slot, run, flat, val, wrong, val_sum):
+def _write_escape_slice(run, flat, idx, val, wrong, wrong_sum, total):
+    # In place and out= only: nothing is allocated after the unfold kernels.
+    if idx is not None: flat.copy_(idx)
     torch.index_select(run, 0, flat, out = wrong)
     run.index_copy_(0, flat, val)
+    torch.sum(wrong.view(torch.int16), 0, dtype = torch.int64, out = wrong_sum)
+    total.sub_(wrong_sum)
 pass
 
 
-def _count_escape_slice(after, slot, run, flat, val, wrong, val_sum):
-    after[slot] += val_sum - wrong.view(torch.int16).to(torch.int64).sum()
-pass
-
-
-def _escape_table(s, group, idx, val):
+def _escape_table(s, group, idx, val, after):
     # All of the store's targets are being unfolded: every escape in one launch, its buffers allocated here.
     n_esc = s.shapes[2][0]
     if not n_esc:
@@ -786,19 +805,15 @@ def _escape_table(s, group, idx, val):
     counts = _status([n for _, n in s.escs], s.device)
     slots = torch.repeat_interleave(torch.arange(len(group), device = s.device), counts, output_size = n_esc)
     wrong = torch.empty(n_esc, dtype = torch.int16, device = s.device)
-    return [(_write_escape_table, _count_escape_table, (base, table, slots, idx, val, wrong, n_esc, val.to(torch.int64)))]
+    return [(_write_escape_table, (base, table, slots, idx, val, wrong, n_esc, val.to(torch.int64), after))]
 pass
 
 
-def _write_escape_table(base, table, slots, idx, val, wrong, n_esc, diff):
+def _write_escape_table(base, table, slots, idx, val, wrong, n_esc, diff, after):
     block = 1024
     _escape_kernel[(triton.cdiv(n_esc, block),)](
         base, table, slots, idx, val, wrong, n_esc, BLOCK = block, num_warps = 4, enable_fp_fusion = True,
     )
-pass
-
-
-def _count_escape_table(after, base, table, slots, idx, val, wrong, n_esc, diff):
     after.index_add_(0, slots, diff.sub_(wrong))
 pass
 
@@ -820,57 +835,52 @@ def exact_unfold(targets, stream = None):
         (stream or current).wait_event(ready)
     # One upload per store; a store whose offload failed is still on the device.
     uploads = [s for s in stores if s.dev is None]
-    if stream is not None and uploads:
-        stream.wait_stream(current)
-        with torch.cuda.stream(stream):
-            for s in uploads: s.dev = s.host.to(s.device, non_blocking = s.host.is_pinned())
-        # The unfold pass reads the uploaded stream: it runs on the current stream after the uploads land.
-        current.wait_stream(stream)
-        for s in uploads: s.dev.record_stream(current)
-    else:
-        for s in uploads: s.dev = s.host.to(s.device)
     members = {id(s): [] for s in stores}
     for t in targets: members[id(t.store)].append(t)
     # Every allocation of the restore runs before its first in-place write: an out-of-memory error up to there leaves
     # every weight folded with restoring False (the caller may free memory and retry), and none can come after it.
     plans = []
-    for s in stores:
-        with _device_ctx(s.device):
-            words, wcnt, idx, val = _carve(s.dev, s.shapes)
-            counts = wcnt.to(torch.int64)
-            woff = torch.cumsum(counts, 0) - counts
-            del counts
-            after = torch.zeros_like(s.checksum)
-            for dtype in (torch.int32, s.idx_dtype, torch.int16, torch.int64): _dummy(s.device, dtype)
-            group = members[id(s)]
-            if len(group) == len(s.tiles) and len(group) > 1 and torch.version.hip is None:
-                esc = _escape_table(s, group, idx, val)
-            else:
-                # One target (one op per weight), part of a store or ROCm: the escapes of each target on their own.
-                esc = [_escape_slice(t, *s.escs[t.slot], idx, val) for t in group if s.escs[t.slot][1]]
-            plans.append((s, group, woff, wcnt, words, after, esc))
-    for s, group, woff, wcnt, words, after, esc in plans:
+    try:
+        if stream is not None and uploads:
+            stream.wait_stream(current)
+            with torch.cuda.stream(stream):
+                for s in uploads: s.dev = s.host.to(s.device, non_blocking = s.host.is_pinned())
+            # The unfold pass reads the uploaded stream: it runs on the current stream after the uploads land.
+            current.wait_stream(stream)
+            for s in uploads: s.dev.record_stream(current)
+        else:
+            for s in uploads: s.dev = s.host.to(s.device)
+        for s in stores:
+            with _device_ctx(s.device):
+                words, wcnt, idx, val = _carve(s.dev, s.shapes)
+                counts = wcnt.to(torch.int64)
+                woff = torch.cumsum(counts, 0) - counts
+                del counts
+                # [expected, restored] per target, read back once; the kernels and escape writes add into row 1.
+                check = torch.stack([s.checksum, torch.zeros_like(s.checksum)])
+                after = check[1]
+                for dtype in (torch.int32, s.idx_dtype, torch.int16, torch.int64): _dummy(s.device, dtype)
+                group = members[id(s)]
+                if len(group) == len(s.tiles) and len(group) > 1 and torch.version.hip is None:
+                    esc = _escape_table(s, group, idx, val, after)
+                else:
+                    esc = _escape_slices(s, group, idx, val, after)
+                plans.append((s, group, woff, wcnt, words, after, check, esc))
+    except BaseException:
+        # Nothing was written: drop this attempt's uploads (an allocation on the side stream is freed in its order).
+        plans.clear()
+        for s in uploads: s.dev = None
+        raise
+    for s, group, woff, wcnt, words, after, check, esc in plans:
         with _device_ctx(s.device):
             for t in group:
                 if s.tiles[t.slot]: _launch(t, _UNFOLD, woff = woff, wcnt = wcnt, words = words, checksum = after)
                 t.restoring = True
-            for write, _, args in esc: write(*args)
-    # Every weight holds its original bits now; what follows only verifies them.
-    try:
-        checks = []
-        for s, group, woff, wcnt, words, after, esc in plans:
-            with _device_ctx(s.device):
-                for _, count, args in esc: count(after, *args)
-                checks.append(torch.stack([s.checksum, after], 1))
-        del plans
-        # The one host sync of the unfold.
-        pairs = [c.tolist() for c in checks]
-    except BaseException:
-        # Restored but unverified: mark the weights unfolded (a retry is a no-op) instead of leaving them poisoned.
-        for s in stores:
-            if s.device.type == "cuda": torch.cuda.synchronize(s.device)
-        _unfolded(stores, members, None)
-        raise
+            for write, args in esc: write(*args)
+    checks = [check for _, _, _, _, _, _, check, _ in plans]
+    del plans
+    # The one host sync of the unfold. Should it raise, the targets stay restoring: the checksum was not compared.
+    pairs = [list(zip(*c.tolist())) for c in checks]
     bad = _unfolded(stores, members, pairs)
     if bad:
         raise RuntimeError(
@@ -884,12 +894,12 @@ def _unfolded(stores, members, pairs):
     bad = []
     for i, s in enumerate(stores):
         for t in members[id(s)]:
-            if pairs is not None and pairs[i][t.slot][0] != pairs[i][t.slot][1]: bad.append(t)
+            if pairs[i][t.slot][0] != pairs[i][t.slot][1]: bad.append(t)
             t.folded = False
             t.restoring = False
             t.store = None
             s.live -= 1
-        # The checksum readback (or the synchronize) waited for the device: every copy out of the store has landed.
+        # The checksum readback synchronised the device: every copy out of the store has landed.
         if s.live <= 0: s.release()
     return bad
 pass
@@ -998,8 +1008,9 @@ def _unfold_weights_impl(
         # Read the folded bits from w as given now (functionalization may pass a copy); the adapter must be the folded one.
         t.w, t.a, t.b = _as_3d(w, a, b)
         t.scale = float(scale)
-    rows = [[t.bad, 0] for t in found]
     try:
+        # The status first: an allocation failure after the restore would lose the keys of verified weights.
+        status = _status([[t.bad, 0] for t in found], ws[0].device)
         exact_unfold(found, stream = _op_stream(ws[0].device))
     except BaseException:
         # Raised before restoring (say an upload OOM): untouched folded targets keep their keys for a retry.
@@ -1007,7 +1018,7 @@ def _unfold_weights_impl(
             for w, k, t in zip(ws, keys, found):
                 if t.folded and not t.restoring: _OP_LIVE[(int(k), tuple(w.shape), w.dtype)] = t
         raise
-    return _status(rows, ws[0].device)
+    return status
 pass
 
 
