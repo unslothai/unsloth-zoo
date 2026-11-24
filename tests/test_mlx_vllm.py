@@ -245,7 +245,7 @@ def test_save_lora_writes_peft_and_replaces_an_earlier_save(tmp_path):
     os.chmod(target / "adapter_model.safetensors", 0o600)  # a private adapter stays private when saved again
     vllm_utils.save_lora(model, target)
     assert (target / "adapter_model.safetensors").read_text() == (target / "adapter_config.json").read_text() == "2"
-    assert (target / "adapter_model.safetensors").stat().st_mode & 0o777 == 0o600
+    assert os.name == "nt" or (target / "adapter_model.safetensors").stat().st_mode & 0o777 == 0o600  # POSIX modes
     assert sorted(os.listdir(tmp_path)) == ["grpo_saved_lora"]
     mlx_dir = tmp_path / "mlx"
     mlx_dir.mkdir()
