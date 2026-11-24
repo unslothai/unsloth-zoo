@@ -138,6 +138,7 @@ import inspect
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
@@ -2208,7 +2209,19 @@ def _runtime_quantization_config(kwargs: dict[str, Any]) -> Any:
 
 
 class _DropUnknownQuantizationWarning(logging.Filter):
+    """Drops "Unknown quantization type" only when the probing thread itself logged it.
+
+    The quantizer logger is shared, so a filter that dropped every match would also hide
+    that warning from a ``from_pretrained`` running in another thread meanwhile.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.thread = threading.get_ident()
+
     def filter(self, record: logging.LogRecord) -> bool:
+        if record.thread != self.thread:
+            return True
         return not str(record.getMessage()).startswith("Unknown quantization type")
 
 
