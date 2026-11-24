@@ -117,12 +117,23 @@ def test_load_vllm_starts_an_in_process_metal_engine_on_the_loaded_checkpoint(mo
     model = types.SimpleNamespace(_src_path="/snap/qwen", _hf_repo="Qwen/Qwen3-0.6B", parameters=dict)
     engine = vllm_utils.load_vllm(model, max_seq_length=512, gpu_memory_utilization=0.3, max_lora_rank=32, seed=7)
     assert engine.kwargs == dict(
-        model="/snap/qwen", max_model_len=512, gpu_memory_utilization=0.3, seed=7,
+        model="/snap/qwen", max_model_len=512, gpu_memory_utilization=0.3, seed=7, trust_remote_code=False,
         enable_lora=True, max_lora_rank=32, max_loras=1,
     )
+    # trust_remote_code=True at from_pretrained reaches vLLM and the model_file guard of the engine's own load.
+    from unsloth_zoo.mlx.loader import _MLX_MODEL_FILE_TRUST
+
+    seen = []
+    original_init = created[0].__class__.__init__
+    monkeypatch.setattr(created[0].__class__, "__init__",
+                        lambda self, **kw: seen.append(_MLX_MODEL_FILE_TRUST.get()) or original_init(self, **kw))
+    model._unsloth_trust_remote_code = True
+    trusted = vllm_utils.load_vllm(model, max_seq_length=512)
+    assert trusted.kwargs["trust_remote_code"] is True and seen == [True] and _MLX_MODEL_FILE_TRUST.get() is False
+    del model._unsloth_trust_remote_code
     assert os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] == "0"
     full = vllm_utils.load_vllm(model, max_seq_length=512, enable_lora=False)
-    assert "enable_lora" not in full.kwargs and len(created) == 2
+    assert "enable_lora" not in full.kwargs and len(created) == 3
     vllm_utils.attach_vllm_engine(model, engine)
     assert model.vllm_engine is engine and model.fast_generate("hi")[0] == "generated"
 

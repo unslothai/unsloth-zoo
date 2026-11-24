@@ -245,6 +245,8 @@ def load_vllm(model, *, max_seq_length, gpu_memory_utilization=0.5, max_lora_ran
         max_model_len=int(max_seq_length),
         gpu_memory_utilization=float(gpu_memory_utilization),
         seed=seed,
+        # Consent from_pretrained recorded; its loader scope has ended by now.
+        trust_remote_code=bool(getattr(model, "_unsloth_trust_remote_code", False)),
     )
     if enable_lora:
         engine_kwargs.update(enable_lora=True, max_lora_rank=int(max_lora_rank), max_loras=1)
@@ -255,8 +257,14 @@ def load_vllm(model, *, max_seq_length, gpu_memory_utilization=0.5, max_lora_ran
     if dtype is not None:
         # vllm-metal sizes its KV cache by this dtype.
         engine_kwargs["dtype"] = str(dtype).rsplit(".", 1)[-1]
-    with _in_process_engine_loads(model):
-        engine = LLM(**engine_kwargs)
+    from .loader import _MLX_MODEL_FILE_TRUST
+
+    token = _MLX_MODEL_FILE_TRUST.set(engine_kwargs["trust_remote_code"])
+    try:
+        with _in_process_engine_loads(model):
+            engine = LLM(**engine_kwargs)
+    finally:
+        _MLX_MODEL_FILE_TRUST.reset(token)
     engine._unsloth_in_memory_lora = _serve_in_memory_loras(engine)
     return engine
 
