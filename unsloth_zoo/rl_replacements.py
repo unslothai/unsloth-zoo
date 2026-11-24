@@ -2419,6 +2419,16 @@ def grpo_forwards_are_collective(model):
     from unsloth_zoo.temporary_patches.utils import zero3_partitioned_training
     if zero3_partitioned_training():
         return True
+    # A partitioned model keeps ds_id after the global config is cleared or names another stage
+    # (Accelerate multi-plugin). ZeRO-3 converts every parameter, so the first one answers (O(1));
+    # read only once DeepSpeed is loaded, and a positive never reverts.
+    if model.__dict__.get("_unsloth_grpo_zero3_partitioned", False):
+        return True
+    if "deepspeed.runtime.zero.partition_parameters" in sys.modules and hasattr(
+        next(iter(model.parameters()), None), "ds_id"
+    ):
+        model.__dict__["_unsloth_grpo_zero3_partitioned"] = True
+        return True
     cached = model.__dict__.get("_unsloth_grpo_collective_forwards", None)
     if cached is None:
         cached = any(
