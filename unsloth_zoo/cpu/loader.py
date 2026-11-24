@@ -70,6 +70,19 @@ def _pop_gpu_loader_kwargs(kwargs):
         kwargs.pop("rope_scaling")
 
 
+def _print_full_finetuning_precision(dtype, master_fp32):
+    """The GPU loaders' full finetuning precision notes. bfloat16 weights take AdamW's bfloat16 update directly, so
+    updates below a weight's bfloat16 spacing round away (on SmolLM2-135M at lr 2e-5, 4 steps changed 4% of the
+    weights, against all of them with float32 master weights)."""
+    if dtype == torch.bfloat16:
+        _print("Using bfloat16 full finetuning, which halves memory, but small updates can round away in bfloat16 "
+               "weights. float32_mixed_precision = True keeps float32 weights and optimizer states, computing in "
+               "bfloat16 autocast.")
+    elif dtype == torch.float32 and master_fp32 and cpu_bf16_supported():
+        _print("float32_mixed_precision = True: full finetuning keeps float32 weights and optimizer states, "
+               "computing in bfloat16 autocast.")
+
+
 def _dtype_kwarg():
     # from_pretrained took `torch_dtype` before transformers 4.56; older ones drop `dtype` silently.
     from transformers import __version__
@@ -697,6 +710,8 @@ class FastCPUModel:
             raise NotImplementedError("Unsloth (CPU): fast_inference (vLLM) needs a GPU.")
         # A quantization config the caller built is a choice of quantization: never swapped for 16-bit weights.
         user_quantization = kwargs.get("quantization_config", None) is not None
+        # As on GPU: full finetuning in bfloat16 keeps bfloat16 weights and optimizer states unless this is True.
+        float32_mixed_precision = kwargs.get("float32_mixed_precision", None)
         # Before anything downloads: a refused GPU-only feature fails fast.
         _pop_gpu_loader_kwargs(kwargs)
         # Chunked CE returns logits = None in training steps; return_logits keeps the full-logit loss.
@@ -714,6 +729,9 @@ class FastCPUModel:
         # "auto" keeps the checkpoint's own dtype (fp16 checkpoints still move off fp16 after loading).
         auto_dtype = isinstance(dtype, str) and dtype == "auto"
         dtype = _resolve_dtype(None if auto_dtype else dtype)
+        master_fp32 = bool(full_finetuning) and float32_mixed_precision is True
+        if master_fp32 and dtype == torch.bfloat16 and not auto_dtype:
+            dtype = torch.float32
 
         # 4-bit only where bitsandbytes' CPU backend really runs; full finetuning never quantizes.
         use_4bit = bool(load_in_4bit) and not load_in_8bit and not load_in_16bit and not full_finetuning
@@ -831,6 +849,11 @@ class FastCPUModel:
             if dtype == torch.float16 and not use_4bit:
                 dtype = _resolve_dtype(torch.float16)
                 model = model.to(dtype)
+            if master_fp32 and dtype == torch.bfloat16:
+                dtype = torch.float32
+                model = model.to(dtype)
+        if full_finetuning:
+            _print_full_finetuning_precision(dtype, master_fp32)
         max_seq_length = _clamp_to_learned_positions(model, max_seq_length)
         tokenizer_kwargs = dict(
             token = token, revision = revision, trust_remote_code = trust_remote_code,
