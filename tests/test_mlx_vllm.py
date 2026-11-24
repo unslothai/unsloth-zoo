@@ -119,10 +119,11 @@ def _tiny(seed, width=128, dtype="bfloat16"):
     return model.set_dtype(getattr(mx, dtype)) or model
 
 
-@pytest.mark.parametrize("width, dtype, quant, multiprocess, loads", [(128, "bfloat16", None, "0", [True]), (256, "float16", None, "0", [True, False]), (128, "float16", None, "0", [True]), (128, "bfloat16", (64, 8, "affine", "mlp", None), "0", [True]), (128, "float16", (32, 4, "mxfp4", "", None), "0", [True]), (128, "bfloat16", (32, 8, "affine", "", "mxfp8"), "0", [True, False]), (128, "bfloat16", None, "1", [False])])
+@pytest.mark.parametrize("width, dtype, quant, multiprocess, loads", [(128, "bfloat16", None, "0", [True]), (256, "float16", None, "0", [True, False]), (128, "float16", None, "0", [True]), (128, "bfloat16", (64, 8, "affine", "mlp", "lora"), "0", [True]), (128, "float16", (32, 4, "mxfp4", "", None), "0", [True]), (128, "bfloat16", (32, 8, "affine", "", "mxfp8"), "0", [True, False]), (128, "bfloat16", None, "1", [False])])
 def test_an_in_process_engine_shares_only_matching_weights(monkeypatch, width, dtype, quant, multiprocess, loads):
     import mlx.core as mx
     import mlx.nn as nn
+    from mlx_lm.tuner.utils import linear_to_lora_layers
     from mlx.utils import tree_flatten
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", multiprocess)
     _fake_vllm(monkeypatch, "vllm_metal.platform")
@@ -130,9 +131,12 @@ def test_an_in_process_engine_shares_only_matching_weights(monkeypatch, width, d
     model.model.norm.set_dtype(mx.float32)  # a layer kept in float32 is shared as is; the training dtype is the majority's
     if quant:  # as load_in_8bit / load_in_mxfp4 leave it; the engine must mirror it per layer
         nn.quantize(model, *quant[:2], mode=quant[2], class_predicate=lambda path, m: quant[3] in path and hasattr(m, "to_quantized"))
+    bare = [(p, type(x)) for p, x in lm.named_modules()]
+    if quant and quant[4] == "lora":  # from_pretrained of a saved adapter wraps the base layers before the engine starts
+        linear_to_lora_layers(lm, 2, {"rank": 4, "scale": 2.0, "dropout": 0.0})
     if dtype == "float16":  # a multimodal training model whose language model an engine serves alone
         (model := nn.Module()).language_model = lm
-    engine_model = lambda: (e := _tiny(1), quant and quant[4] and nn.quantize(e, *quant[:2], mode=quant[4]))[0]  # a checkpoint already quantized otherwise
+    engine_model = lambda: (e := _tiny(1), quant and quant[4] not in (None, "lora") and nn.quantize(e, *quant[:2], mode=quant[4]))[0]  # a checkpoint already quantized otherwise
     life = types.SimpleNamespace(mlx_lm_load_model=lambda path, lazy=False: (calls.append(lazy), (engine_model(), {}))[1], mlx_vlm_load_model=lambda path, lazy=False: (calls.append(lazy), engine_model())[1])
     Sidecar = type("Sidecar", (), {"load": classmethod(lambda cls, path, load_composite=lambda path: engine_model(): load_composite(path))})  # Gemma 4's vision towers: a composite it loads itself
     v1, original, model._src_path = types.SimpleNamespace(model_lifecycle=life), life.mlx_lm_load_model, "/snap"
@@ -140,8 +144,9 @@ def test_an_in_process_engine_shares_only_matching_weights(monkeypatch, width, d
         monkeypatch.setitem(sys.modules, *item)
     monkeypatch.setattr(sys.modules["vllm"], "LLM", lambda **kw: types.SimpleNamespace(kwargs=kw, models=(life.mlx_lm_load_model(kw["model"])[0], life.mlx_vlm_load_model(kw["model"]), Sidecar.load(kw["model"]))))
     (engine, vision, sidecar), types_of = (llm := vllm_utils.load_vllm(model, max_seq_length=64)).models, lambda m: [(p, type(x)) for p, x in m.named_modules()]
-    assert llm.kwargs.get("dtype") == (dtype if multiprocess == "0" else None) and (not quant or types_of(engine) == types_of(lm)) and vllm_utils._training_dtype(engine) == getattr(mx, dtype if multiprocess == "0" else "bfloat16")
-    aliased = [array is dict(tree_flatten(lm.parameters())).get(name) for e in (engine, vision, sidecar) for name, array in tree_flatten(e.parameters())]
+    assert llm.kwargs.get("dtype") == (dtype if multiprocess == "0" else None) and (not quant or types_of(engine) == bare) and vllm_utils._training_dtype(engine) == getattr(mx, dtype if multiprocess == "0" else "bfloat16")
+    trained = {id(a) for _, a in tree_flatten(lm.parameters())}
+    aliased = [id(array) in trained for e in (engine, vision, sidecar) for _, array in tree_flatten(e.parameters())]
     assert calls[:2 * len(loads)] == loads * 2 and life.mlx_lm_load_model is original and Sidecar.load.__func__.__name__ == "<lambda>" and all(aliased) == (loads == [True]) == any(aliased)
     assert all(getattr(m, "_unsloth_no_checkpoint", False) == (multiprocess == "0") for x in (engine, vision) for _, m in x.named_modules())
 
@@ -176,7 +181,9 @@ def test_an_in_process_engine_reads_the_live_lora_from_memory(monkeypatch):
     assert len(vllm_utils._IN_MEMORY_LORAS) == 0 and model.vllm_engine._unsloth_live_lora is None and worker.load_peft_adapter("/saved", lora_id=4) == ("disk", "/saved")
     vllm_utils.load_lora(model, load_tensors=True)
     model.vllm_engine = None  # an engine dropped without a release takes its live adapter with it
-    assert len(vllm_utils._IN_MEMORY_LORAS) == 0
+    assert len(vllm_utils._IN_MEMORY_LORAS) == 0 and vllm_utils._live_adapter(model) is not None
+    model._unsloth_cpt_full_module_weight_keys = {"model.embed_tokens.weight"}  # A/B alone would leave the embedding stale
+    assert vllm_utils._live_adapter(model) is None
 
 
 def test_load_vllm_refuses_a_non_metal_vllm(monkeypatch):

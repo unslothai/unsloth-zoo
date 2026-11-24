@@ -5158,9 +5158,10 @@ def test_grpo_plan_samples_through_the_vllm_engine_with_the_live_adapter(monkeyp
 
 @pytest.mark.parametrize("engine, adapted, use_vllm, outcome", [
     (False, True, True, "this model has none"),
-    (True, False, True, "needs LoRA adapters"),
+    (True, False, True, "needs LoRA-only training"),
     (True, True, False, True),  # an engine samples GRPO without use_vllm, as on CUDA
     (True, False, False, False),  # full fine-tuning samples on MLX
+    (True, "full", False, False),  # so do LoRA with trained full modules, which the engine would not see
     (False, True, False, False),
 ])
 def test_grpo_samples_through_a_vllm_engine_only_with_lora(tmp_path, monkeypatch, engine, adapted, use_vllm, outcome):
@@ -5172,6 +5173,8 @@ def test_grpo_samples_through_a_vllm_engine_only_with_lora(tmp_path, monkeypatch
     model = _tiny_model()
     if engine:
         model.vllm_engine = object()
+    if adapted == "full":
+        model._unsloth_cpt_full_module_weight_keys = {"model.embed_tokens.weight"}
 
     def build():
         return MLXGRPOTrainer(model, DecodingTokenizer(), _grpo_rows(), args=_grpo_config(tmp_path, compile=False, use_vllm=use_vllm),

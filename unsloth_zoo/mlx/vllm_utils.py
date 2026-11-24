@@ -104,11 +104,35 @@ def _training_dtype(model):
     return counts.most_common(1)[0][0] if counts else None
 
 
+def _bare_path(model):
+    """Maps ``model``'s paths to the bare model's: a LoRA wrapper's base layer (e.g. ``q_proj.linear``) to the wrapper's
+    path, as when ``from_pretrained`` applied a saved adapter before the engine starts."""
+    from .utils import iter_mlx_lora_modules
+
+    bases = {}
+    for name, module in iter_mlx_lora_modules(model):
+        for child in ("linear", "embedding"):
+            if hasattr(module, child):
+                bases[f"{name}.{child}" if name else child] = name
+                break
+
+    def bare(path):
+        parts = path.split(".")
+        for end in range(len(parts), 0, -1):
+            prefix = ".".join(parts[:end])
+            if prefix in bases:
+                return ".".join(filter(None, (bases[prefix], *parts[end:])))
+        return path
+
+    return bare
+
+
 def _quantize_like(engine_model, model):
     """Quantize each engine layer the training model has quantized, with its group size, bits and mode."""
     import mlx.nn as nn
 
-    quantized = {path: m for path, m in model.named_modules() if hasattr(m, "scales") and hasattr(m, "bits")}
+    bare = _bare_path(model)
+    quantized = {bare(path): m for path, m in model.named_modules() if hasattr(m, "scales") and hasattr(m, "bits")}
     if quantized:
         nn.quantize(engine_model, class_predicate=lambda path, module: (
             path in quantized and hasattr(module, "to_quantized")
@@ -133,7 +157,8 @@ def _share_weights(engine_model, model):
     from mlx.utils import tree_flatten, tree_unflatten
 
     wanted = dict(tree_flatten(engine_model.parameters()))
-    trained = dict(tree_flatten(model.parameters()))
+    bare = _bare_path(model)
+    trained = {bare(name): array for name, array in tree_flatten(model.parameters())}
     floating = lambda a: mx.issubdtype(a.dtype, mx.floating)
     # Integer dtypes must match: packed weights and uint8 scales of another quantization mode can share a shape.
     if any(name not in trained or trained[name].shape != array.shape
@@ -278,7 +303,8 @@ def _live_adapter(model):
     from .utils import iter_mlx_lora_modules
 
     modules = list(iter_mlx_lora_modules(model))
-    if not modules or getattr(model, "_unsloth_full_state_modules", None) or any(type(m) is not LoRALinear for _, m in modules):
+    full_modules = getattr(model, "_unsloth_full_state_modules", None) or getattr(model, "_unsloth_cpt_full_module_weight_keys", None)
+    if not modules or full_modules or any(type(m) is not LoRALinear for _, m in modules):
         return None
     adapter = {name: (module.lora_a.T, module.lora_b.T, float(module.scale)) for name, module in modules}
     mx.eval([array for a, b, _ in adapter.values() for array in (a, b)])
