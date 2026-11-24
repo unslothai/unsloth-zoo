@@ -34,6 +34,23 @@ BPE_REPO = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"       # no tokenizer
 TARGET = "fakeuser/merged"
 
 
+def _hub_reachable():
+    # Offline, the base resolves to its cached snapshot and the merge takes the local directory
+    # path, which carries tokenizer.model in Step 2: the asserts below would test the wrong path.
+    from huggingface_hub import HfApi, constants
+    if constants.HF_HUB_OFFLINE: return False
+    try:
+        HfApi().model_info(SPM_REPO, timeout = 10)
+        return True
+    except Exception:
+        return False
+
+
+@pytest.fixture(autouse = True, scope = "module")
+def _needs_hub():
+    if not _hub_reachable(): pytest.skip("reads tiny base repos from the Hugging Face Hub")
+
+
 @pytest.fixture(autouse = True)
 def _cpu_and_mocked_hub_writes(monkeypatch, tmp_path):
     os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1")
