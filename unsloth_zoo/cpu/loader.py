@@ -93,11 +93,12 @@ def _multi_process():
         return False
 
 
-def _fp32_master_fit(model_name, token, revision, trust_remote_code, vocab_size = None, **kwargs):
+def _fp32_master_fit(model_name, token, revision, trust_remote_code, resize_vocab = None, /, **kwargs):
     """(bytes, free RAM, fits) for float32 full finetuning: weights, grads and AdamW states take at most half of the
     free RAM; activations are sized separately (gradient checkpointing auto-off). ``kwargs`` are the model load's: an
-    explicit config object decides, else the checkpoint's config with the load's overrides (as AutoModel reads it).
-    ``vocab_size`` is a pending resize. None when the parameter count or the free RAM is unknown."""
+    explicit config object decides, else the checkpoint's config with the load's overrides (as AutoModel reads it,
+    ``vocab_size`` included). ``resize_vocab`` is a pending resize, counted when larger. Positional-only, so no load
+    kwarg can collide with them. None when the parameter count or the free RAM is unknown."""
     try:
         from transformers import AutoConfig, PretrainedConfig
         config = kwargs.pop("config", None)
@@ -107,6 +108,11 @@ def _fp32_master_fit(model_name, token, revision, trust_remote_code, vocab_size 
                                                    **kwargs)
     except Exception:
         return None
+    vocab_size = resize_vocab
+    if resize_vocab is not None:
+        loaded = getattr(getattr(config, "get_text_config", lambda: config)(), "vocab_size", None)
+        if isinstance(loaded, int) and not isinstance(loaded, bool):
+            vocab_size = max(loaded, resize_vocab)
     count = _dense_parameter_count(config, vocab_size = vocab_size)
     available = available_ram()
     if count is None or available is None:
@@ -864,8 +870,8 @@ class FastCPUModel:
             if _multi_process():
                 master_choice = "distributed"
             else:
-                master_fit = _fp32_master_fit(model_name, token, revision, trust_remote_code,
-                                              vocab_size = resize_model_vocab, **kwargs)
+                master_fit = _fp32_master_fit(model_name, token, revision, trust_remote_code, resize_model_vocab,
+                                              **kwargs)
                 master_choice = "too_big"
                 if master_fit is not None and master_fit[2]:
                     master_fp32, master_choice, dtype = True, "fits", torch.float32

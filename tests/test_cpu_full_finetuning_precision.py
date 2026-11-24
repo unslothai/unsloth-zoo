@@ -228,6 +228,21 @@ def test_fit_check_counts_a_resized_vocabulary(tiny, monkeypatch):
 
 
 @pytest.mark.usefixtures("bf16_cpu")
+@pytest.mark.parametrize("vocab_size, resize, expected", [
+    (256, None, torch.float32), (256, 128, torch.float32),       # the override sizes the load
+    (4096, None, torch.bfloat16), (4096, 256, torch.bfloat16),   # a larger override than the resize counts
+    (128, 4096, torch.bfloat16),                                 # a larger resize than the override counts
+])
+def test_fit_check_takes_a_vocab_size_override(tiny, monkeypatch, vocab_size, resize, expected):
+    # vocab_size is a config override of the load, never a duplicate of the pending resize argument.
+    _ram(monkeypatch, 2 * _bytes_needed(tiny, vocab_size = 256))
+    extra = {} if resize is None else dict(resize_model_vocab = resize)
+    loaded, _ = _load_dtype(monkeypatch, tiny, full_finetuning = True, vocab_size = vocab_size,
+                            ignore_mismatched_sizes = True, **extra)
+    assert loaded == expected
+
+
+@pytest.mark.usefixtures("bf16_cpu")
 def test_fit_check_applies_config_overrides(tiny, monkeypatch):
     _ram(monkeypatch, 2 * _bytes_needed(tiny))
     loaded, _ = _load_dtype(monkeypatch, tiny, full_finetuning = True, intermediate_size = 4096,
