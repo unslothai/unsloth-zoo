@@ -3901,8 +3901,12 @@ def grpo_accumulated_loss(
             pad_eos_rows = grpo_pad_is_eos_rows(trainer, input_ids[:, -logits_to_keep:])
             # Unsloth's old / ref log-prob path must have scored the EOS slot too (its packed path
             # skips pad-id tokens); without that promise keep today's mask rather than mix in a 0 logp.
-            if pad_eos_rows is not None and (old_logps is not None or ref_logps is not None) \
-                    and not getattr(trainer, "_unsloth_grpo_logps_cover_eos", False):
+            # Old logps this function stored from a pass that kept the EOS carry their own mark.
+            _logps_cover_eos = getattr(trainer, "_unsloth_grpo_logps_cover_eos", False)
+            if pad_eos_rows is not None and not (
+                (old_logps is None or _logps_cover_eos or getattr(old_logps, "_unsloth_grpo_covers_eos", False))
+                and (ref_logps is None or _logps_cover_eos)
+            ):
                 pad_eos_rows = None
 
             input_ids = left_pack_padding(input_ids, trainer.processing_class.pad_token_id)
@@ -4945,6 +4949,9 @@ def grpo_accumulated_loss(
                 trainer._unsloth_grpo_stored_old_logps = _grpo_old_logps_store(
                     old_logps, _row_keep, _full_rows if _row_keep is not None else None,
                 )
+                if pad_eos_rows is not None:
+                    # Scored with the EOS slot kept: later num_iterations passes over this rollout keep it too.
+                    trainer._unsloth_grpo_stored_old_logps._unsloth_grpo_covers_eos = True
         _rollout_unscored = None
         if _rollout_logps_as_old:
             old_logps, _rollout_unscored = grpo_rollout_old_fill_unscored(old_logps, new_logprobs)

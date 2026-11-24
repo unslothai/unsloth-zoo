@@ -73,7 +73,8 @@ def _batch(pad):
     return torch.tensor([p + c for p, c in zip(prompts, completions)])
 
 
-def _loss_mask(monkeypatch, input_ids, pad, ref_logps = None, eos_ids = EOS, **trainer_attrs):
+def _loss_mask(monkeypatch, input_ids, pad, ref_logps = None, eos_ids = EOS, old_logps = None,
+               loss_kwargs = (), trainer_out = None, **trainer_attrs):
     seen = {}
 
     class _Loss:
@@ -99,9 +100,11 @@ def _loss_mask(monkeypatch, input_ids, pad, ref_logps = None, eos_ids = EOS, **t
     )
     _rl.grpo_accumulated_loss(
         trainer, input_ids, attention_mask, keep, completion_mask,
-        torch.zeros(input_ids.shape[0]), None, ref_logps,
-        loss_type = "dapo", num_items_in_batch = int(completion_mask.sum()),
+        torch.zeros(input_ids.shape[0]), old_logps, ref_logps,
+        loss_type = "dapo", num_items_in_batch = int(completion_mask.sum()), **dict(loss_kwargs),
     )
+    if trainer_out is not None:
+        trainer_out.append(trainer)
     return seen["mask"].bool(), completion_mask.bool()
 
 
@@ -264,3 +267,19 @@ def test_packed_forward_scores_the_kept_eos(monkeypatch):
         want = logps[row, full_col - 1, EOS]
         torch.testing.assert_close(got[row, col].float(), want, rtol = 1e-4, atol = 1e-4)
         assert packed[row, full_col] == EOS
+
+
+def test_stored_old_logps_keep_the_eos_on_later_iterations(monkeypatch):
+    # num_iterations = 2, beta = 0, old logps kept from the first pass (store_old_logps): the second
+    # pass over the same rollout must keep the same mask, EOS slot included.
+    input_ids = _batch(EOS)
+    store = {"old_logps_from_new": True, "store_old_logps": True}
+    trainers = []
+    first, completion_mask = _loss_mask(monkeypatch, input_ids, EOS, loss_kwargs = store, trainer_out = trainers)
+    stored = trainers[0]._unsloth_grpo_stored_old_logps
+    second, _ = _loss_mask(monkeypatch, input_ids, EOS, old_logps = stored)
+    assert torch.equal(second, first)
+    assert _per_row_kept(second) == _per_row_kept(completion_mask)
+    # External or unmarked old logps keep the previous mask.
+    unmarked, _ = _loss_mask(monkeypatch, input_ids, EOS, old_logps = stored.clone())
+    assert torch.equal(unmarked, _frozen_id_rule(input_ids, input_ids.shape[1] - PROMPT_LEN, EOS))
