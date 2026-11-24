@@ -3,17 +3,18 @@
 
 """Import-time allocator env setup in unsloth_zoo/__init__.py: torch <=2.9 uses legacy per-backend vars, 2.10+ the
 unified PYTORCH_ALLOC_CONF; WSL/Windows get roundup_power2_divisions (unslothai/unsloth issue 7203); each case runs
-in a fresh subprocess with faked torch and backend."""
+in a fresh child with faked torch and backend (forked from a server that preloaded the third-party packages,
+_zoo_forkserver.py)."""
 
 from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 import textwrap
 
 import pytest
+from _zoo_forkserver import run_python
 
 # The child fakes a Linux CUDA box: os.name == "nt" always takes the Windows branch and macOS has no CUDA device.
 pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux CUDA allocator matrix")
@@ -108,10 +109,9 @@ def _conf(*, torch_version, wsl=False, wsl_interop=False, windows=False,
     # windows (os.name == 'nt') cannot be faked on Linux (pathlib raises), so the source drift guard test covers it instead.
     assert not windows
 
-    proc = subprocess.run(
-        [sys.executable, "-c", _CHILD],
-        env=env, cwd=_REPO_ROOT, capture_output=True, text=True, timeout=300,
-    )
+    # Forked from a server that already imported torch / transformers: the case only reads what unsloth_zoo's
+    # import-time block leaves in os.environ, and the zoo itself is imported fresh in every child.
+    proc = run_python(_CHILD, env=env, cwd=_REPO_ROOT, timeout=300)
     lines = [l for l in (proc.stdout + proc.stderr).splitlines() if l.startswith("RESULT:")]
     if not lines:
         raise AssertionError(
