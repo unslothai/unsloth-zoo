@@ -78,7 +78,7 @@ def vllm_metal_available():
 
 
 def use_vllm(fast_inference):
-    """Whether ``fast_inference=True`` gets a vLLM engine: vllm-metal when it works, MLX batched generation otherwise."""
+    """Whether ``fast_inference=True`` gets a vLLM engine (vllm-metal) instead of MLX batched generation."""
     choice = os.environ.get(VLLM_ENV, "").strip()
     if choice not in ("", "0", "1"):
         raise ValueError(f"Unsloth MLX: {VLLM_ENV}={choice!r}; expected 0 (MLX generation) or 1 (vLLM).")
@@ -105,8 +105,7 @@ def _training_dtype(model):
 
 
 def _bare_path(model):
-    """Maps ``model``'s paths to the bare model's: a LoRA wrapper's base layer (e.g. ``q_proj.linear``) to the wrapper's
-    path, as when ``from_pretrained`` applied a saved adapter before the engine starts."""
+    """Maps a LoRA wrapper's base layer path (``q_proj.linear``) to the bare model's (``q_proj``)."""
     from .utils import iter_mlx_lora_modules
 
     bases = {}
@@ -128,7 +127,7 @@ def _bare_path(model):
 
 
 def _quantize_like(engine_model, model):
-    """Quantize each engine layer the training model has quantized, with its group size, bits and mode."""
+    """Quantize engine layers as the training model's: same group size, bits and mode."""
     import mlx.nn as nn
 
     bare = _bare_path(model)
@@ -151,8 +150,7 @@ def _counterpart(engine_model, model):
 
 
 def _share_weights(engine_model, model):
-    """Point the engine's (lazily loaded) arrays at ``model``'s when every name and shape matches and dtypes differ only
-    in float precision; the engine then runs at the training model's dtypes, float32 parameters a model keeps included."""
+    """Point the engine's lazy arrays at ``model``'s when every name and shape matches; float precision may differ."""
     import mlx.core as mx
     from mlx.utils import tree_flatten, tree_unflatten
 
@@ -171,8 +169,8 @@ def _share_weights(engine_model, model):
 
 @contextlib.contextmanager
 def _in_process_engine_loads(model):
-    """While an in-process engine starts, its mlx-lm or mlx-vlm model (and Gemma 4's vision sidecar) takes the training
-    model's weights instead of a second copy, and its layers skip Unsloth's class-level gradient checkpointing."""
+    """While an in-process engine starts, its mlx-lm / mlx-vlm model (and Gemma 4's vision sidecar) takes the training
+    model's weights instead of a second copy, and skips Unsloth's class-level gradient checkpointing."""
     try:
         import vllm_metal.v1.model_lifecycle as lifecycle
     except ImportError:
@@ -184,8 +182,7 @@ def _in_process_engine_loads(model):
     outcomes = []
 
     def shared(load_engine, lazy):
-        # Lazy, so the checkpoint's arrays are never read when the training model's replace them. This has to
-        # happen inside the load: the runner compiles blocks over the weights it holds right after it.
+        # Lazy so replaced checkpoint arrays are never read; inside the load, since the runner compiles over them next.
         engine_model, *rest = load_engine(True)
         source = _counterpart(engine_model, model)
         outcomes.append(_share_weights(_quantize_like(engine_model, source), source))
@@ -226,7 +223,7 @@ def _in_process_engine_loads(model):
 
 
 def load_vllm(model, *, max_seq_length, gpu_memory_utilization=0.5, max_lora_rank=64, enable_lora=True, seed=0):
-    """Start an in-process vllm-metal engine on the checkpoint ``model`` was loaded from, sharing its weights."""
+    """In-process vllm-metal engine on ``model``'s checkpoint, sharing its weights."""
     if getattr(model, "_unsloth_full_finetuning", False):
         # As on CUDA: the engine keeps the loaded base, which full fine-tuning replaces at every optimizer step.
         raise NotImplementedError(
@@ -256,7 +253,7 @@ def load_vllm(model, *, max_seq_length, gpu_memory_utilization=0.5, max_lora_ran
         return LLM(**engine_kwargs)
     dtype = _training_dtype(model)
     if dtype is not None:
-        # The engine shares the training model's arrays at this dtype; vllm-metal sizes its KV cache by it.
+        # vllm-metal sizes its KV cache by this dtype.
         engine_kwargs["dtype"] = str(dtype).rsplit(".", 1)[-1]
     with _in_process_engine_loads(model):
         engine = LLM(**engine_kwargs)
@@ -265,7 +262,7 @@ def load_vllm(model, *, max_seq_length, gpu_memory_utilization=0.5, max_lora_ran
 
 
 def _serve_in_memory_loras(engine):
-    """Let vllm-metal's adapter loader answer in-memory request paths from ``_IN_MEMORY_LORAS``; False without it."""
+    """vllm-metal's adapter loader answers in-memory request paths from ``_IN_MEMORY_LORAS``; False without it."""
     try:
         from vllm_metal.v1.lora import worker_manager
     except ImportError:
@@ -319,8 +316,7 @@ def plain_lora(model):
 
 
 def _live_adapter(model):
-    """The live LoRA in PEFT layout per module (A = lora_a.T, B = lora_b.T, scale), or None when only a PEFT directory
-    can carry it."""
+    """The live LoRA per module as PEFT's (A = lora_a.T, B = lora_b.T, scale); None when only a PEFT dir can carry it."""
     import mlx.core as mx
 
     from .utils import iter_mlx_lora_modules
@@ -399,7 +395,6 @@ def load_lora(model, save_directory=None, load_tensors=False, lora_request_id=No
             release_lora(model, model.vllm_engine._unsloth_live_lora[0])
         path = next(_IN_MEMORY_PATHS)
     elif load_tensors:
-        # A multiprocess engine, or an adapter only PEFT can describe, reads the live weights from a PEFT directory.
         path = os.path.join(_scratch_dir(), "peft")
         model.save_lora_adapters(path, adapter_format="peft")
     else:

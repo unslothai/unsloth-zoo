@@ -1851,7 +1851,7 @@ class MLXGRPOConfig(MLXTrainingConfig):
     log_completions: bool = field(default=False, kw_only=True)
     num_completions_to_print: int | None = field(default=None, kw_only=True)
     use_vllm: bool = field(default=False, kw_only=True)
-    # vllm.SamplingParams; fields it changes from vLLM's defaults override rollout sampling, as on CUDA Unsloth.
+    # vllm.SamplingParams overriding rollout sampling, as on CUDA Unsloth.
     vllm_sampling_params: object = field(default=None, kw_only=True)
     use_liger_loss: bool = field(default=False, kw_only=True)
     # ScaleRL options; None reads CUDA Unsloth's UNSLOTH_GRPO_ZERO_VARIANCE_EXCLUDE / UNSLOTH_GRPO_LOSS_AGGREGATION.
@@ -10063,9 +10063,7 @@ class MLXGRPOTrainer(MLXTrainer):
                 f"Unsloth MLX GRPO: {len(args.reward_weights)} reward_weights for "
                 f"{len(self.reward_funcs)} reward functions."
             )
-        # A model with a vLLM engine samples through it, as on CUDA. The engine keeps the loaded weights, so only
-        # plain LoRA training, whose adapter it loads each generation, on an engine that shares the training model's
-        # weights (the same base) can use it.
+        # As on CUDA, a vLLM engine samples rollouts; only for plain LoRA on an engine sharing the trained base.
         from . import vllm_utils
 
         engine = getattr(self.model, "vllm_engine", None)

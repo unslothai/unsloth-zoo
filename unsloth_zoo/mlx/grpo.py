@@ -120,8 +120,7 @@ def _is_conversational_prompt(prompt):
 
 
 class _VLLMRollout:
-    """A vLLM completion for cut_completion. vLLM keeps the token it stopped on in token_ids, so nothing is
-    appended and, as TRL reads vLLM's ids, only an EOS ends a completion untruncated."""
+    """A vLLM completion for cut_completion: vLLM keeps its stop token in token_ids, so only an EOS ends it untruncated."""
 
     finish_reason = None
 
@@ -134,9 +133,8 @@ _VLLM_CONFIG_OWNED = ("seed", "n", "temperature", "max_tokens", "logprobs")
 
 
 def vllm_rollout_params(sampling, eos_id, vllm_sampling_params=None):
-    """SamplingParams kwargs for GRPO rollouts: the config's sampling, then every field vllm_sampling_params sets
-    (its ``_set_kwargs`` from Unsloth's vLLMSamplingParams, else what differs from vLLM's defaults), except those
-    GRPOConfig owns."""
+    """SamplingParams kwargs for GRPO rollouts: the config's sampling, then the fields vllm_sampling_params sets
+    (``_set_kwargs``, else what differs from vLLM's defaults) except those GRPOConfig owns."""
     import inspect
 
     params = dict(
@@ -985,7 +983,6 @@ class GRPOBatchPlan:
         self._reference_policy = reference_policy
         self._trainer_state = trainer_state
         self._rollout_context = rollout_context or nullcontext
-        # SamplingParams kwargs for rollouts through the model's vLLM engine; None samples on MLX.
         self._vllm_params = vllm_params
         self._keep_completions = keep_completions
         self._logps = grpo_logps(self.score_temperature, scorer, differentiated=False)
