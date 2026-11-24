@@ -35,6 +35,10 @@ from ._gc_passes import collect_garbage
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config, set_dtype_in_config, HAS_TORCH_DTYPE
 
+# Feature flag read by unsloth: patch_model_and_tokenizer gives fused 4-bit expert stacks (bare Params4bit) the
+# compute dtype. unsloth routes 4-bit loads to pre-quantized repos with such stacks only when this is True.
+BARE_PARAMS4BIT_COMPUTE_DTYPE = True
+
 def patch_compiling_bitsandbytes():
     # All Unsloth Zoo code licensed under LGPLv3
     os.environ["UNSLOTH_PATCHED"] = "1"
@@ -786,6 +790,20 @@ def patch_model_and_tokenizer(
 
             if hasattr(module, "compute_dtype"):
                 module.compute_dtype = setted_dtype
+        elif not do_forced_float32:
+            # Fused MoE expert stacks quantized in place (bare Params4bit, moe_utils_bnb4bit) dequantize to
+            # quant_state.dtype too. A pre-quantized checkpoint stores the dtype it was quantized in, so one
+            # made in bfloat16 would dequantize its experts in bfloat16 on a float16 GPU (T4: slower, more
+            # memory, and not the float16 weights a quantize-on-load gives). A quantize-on-load stack already
+            # has the load dtype here; forced float32 keeps the stacks as loaded.
+            setted_dtype = getattr(module, "_pre_set_compute_dtype", correct_dtype)
+            for param in module.parameters(recurse = False):
+                quant_state = getattr(param, "quant_state", None)
+                if quant_state is None or type(quant_state) is list:
+                    continue
+                if getattr(quant_state, "dtype", None) in (torch.float16, torch.bfloat16, torch.float32) \
+                    and setted_dtype in (torch.float16, torch.bfloat16, torch.float32):
+                    quant_state.dtype = setted_dtype
         pass
         # Downcast RoPE embedding to correct data type
         if downcast_rope and ((name.endswith("rotary_emb") or hasattr(module, "cos_cached"))):
