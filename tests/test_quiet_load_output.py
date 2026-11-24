@@ -69,6 +69,20 @@ def test_gemma3_processor_patch_survives_alias_removal(monkeypatch):
 
     monkeypatch.setitem(namespace, "__getattr__", _removed)
     assert gemma._resolve_Gemma3ProcessorKwargs() is ProcessingKwargs
+    # And the patch itself still installs: reading the removed name would make it bail out.
+    processor = processing_gemma3.Gemma3Processor
+
+    def upstream_call(self, images = None, text = None, videos = None, audio = None, **kwargs):
+        raise AssertionError("upstream __call__ was not replaced")
+
+    monkeypatch.setattr(processor, "__call__", upstream_call)
+    with warnings.catch_warnings(record = True) as record:
+        warnings.simplefilter("always")
+        gemma.patch_Gemma3Processor()
+    assert _future_warnings(record, "ProcessorKwargs") == [], [str(w.message) for w in record]
+    call = processor.__call__
+    assert call is not upstream_call
+    assert "unsloth_zoo" in (getattr(call, "__module__", "") or "")
 
 
 class _Capture(logging.Handler):
@@ -83,24 +97,73 @@ class _Capture(logging.Handler):
 _MODELOPT = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
 
 
-def test_planner_quantization_probe_is_quiet_and_loader_check_is_not():
+@pytest.fixture
+def quantizer_log():
+    """Capture the quantizer logger at WARNING whatever TRANSFORMERS_VERBOSITY / earlier tests set."""
+    auto_logger = logging.getLogger("transformers.quantizers.auto")
+    capture = _Capture()
+    level = auto_logger.level
+    auto_logger.setLevel(logging.WARNING)
+    auto_logger.addHandler(capture)
+    try:
+        yield auto_logger, capture
+    finally:
+        auto_logger.removeHandler(capture)
+        auto_logger.setLevel(level)
+
+
+def _unknown(messages):
+    return [m for m in messages if m.startswith("Unknown quantization type")]
+
+
+def test_planner_quantization_probe_is_quiet_and_loader_check_is_not(quantizer_log):
     from transformers.quantizers import AutoHfQuantizer
     from unsloth_zoo import device_map_planner as planner
 
-    auto_logger = logging.getLogger("transformers.quantizers.auto")
-    capture = _Capture()
-    auto_logger.addHandler(capture)
-    try:
-        known = planner._quantization_method_is_known(dict(_MODELOPT))
-        probe_messages = list(capture.messages)
-        # transformers' own check (what from_pretrained runs) still warns: nothing is hidden there.
-        AutoHfQuantizer.supports_quant_method(dict(_MODELOPT))
-    finally:
-        auto_logger.removeHandler(capture)
-    if known:
+    auto_logger, capture = quantizer_log
+    # transformers' own check (what from_pretrained runs) decides the case and must still warn.
+    supported = bool(AutoHfQuantizer.supports_quant_method(dict(_MODELOPT)))
+    loader_messages = list(capture.messages)
+    if supported:
         pytest.skip("this transformers knows modelopt, so neither path warns")
-    assert not [m for m in probe_messages if m.startswith("Unknown quantization type")], probe_messages
-    assert any(m.startswith("Unknown quantization type") for m in capture.messages[len(probe_messages):])
+    assert _unknown(loader_messages), loader_messages
+    del capture.messages[:]
+    # The planner gives the same answer, quietly.
+    assert planner._quantization_method_is_known(dict(_MODELOPT)) is False
+    assert _unknown(capture.messages) == [], capture.messages
+    assert not any(isinstance(f, planner._DropUnknownQuantizationWarning) for f in auto_logger.filters)
+
+
+def test_planner_probe_does_not_silence_another_thread(quantizer_log, monkeypatch):
+    # A from_pretrained in another thread, overlapping the sizing probe, keeps its warning.
+    import threading
+
+    from transformers.quantizers import AutoHfQuantizer
+    from unsloth_zoo import device_map_planner as planner
+
+    auto_logger, capture = quantizer_log
+    inside, release = threading.Event(), threading.Event()
+
+    def blocking_probe(quantization_config):
+        auto_logger.warning("Unknown quantization type, got modelopt (from the probe)")
+        inside.set()
+        assert release.wait(30)
+        return False
+
+    monkeypatch.setattr(AutoHfQuantizer, "supports_quant_method", staticmethod(blocking_probe))
+    answers = []
+    probe = threading.Thread(
+        target = lambda: answers.append(planner._quantization_method_is_known(dict(_MODELOPT)))
+    )
+    probe.start()
+    try:
+        assert inside.wait(30)
+        auto_logger.warning("Unknown quantization type, got modelopt (from the loader)")
+    finally:
+        release.set()
+        probe.join(30)
+    assert answers == [False]
+    assert _unknown(capture.messages) == ["Unknown quantization type, got modelopt (from the loader)"]
     assert not any(isinstance(f, planner._DropUnknownQuantizationWarning) for f in auto_logger.filters)
 
 
@@ -158,3 +221,47 @@ def test_plan_summary_skips_empty_devices():
     assert plan.summary().startswith(
         "Unsloth: placed the model over 2 GPUs: cuda:0 3.00 GiB, cuda:2 2.00 GiB (lm_head on cuda:2)."
     )
+
+
+def test_plan_summary_wording_for_one_or_no_gpu():
+    plan = _plan()
+    plan.weight_bytes = {0: 3 * _GiB, 1: 0}
+    plan.head_device = 0
+    assert plan.summary().startswith(
+        "Unsloth: placed the model on 1 GPU: cuda:0 3.00 GiB (lm_head on cuda:0)."
+    )
+    plan.weight_bytes = {0: 0, 1: 0}
+    line = plan.summary().splitlines()[0]
+    assert line == "Unsloth: placed no weights on a GPU. UNSLOTH_ENABLE_LOGGING=1 shows the full placement."
+
+
+def test_activation_checkpointing_read_without_deprecated_alias():
+    import types
+
+    from transformers import LlamaConfig, LlamaForCausalLM
+    from unsloth_zoo.utils import is_activation_checkpointing
+
+    model = LlamaForCausalLM(LlamaConfig(
+        hidden_size = 16, intermediate_size = 32, num_hidden_layers = 1,
+        num_attention_heads = 2, num_key_value_heads = 2, vocab_size = 32,
+    ))
+    assert is_activation_checkpointing(model) is False
+    model.gradient_checkpointing_enable()
+    with warnings.catch_warnings(record = True) as record:
+        warnings.simplefilter("always")
+        assert is_activation_checkpointing(model) is True
+    assert not [w for w in record if "is_gradient_checkpointing" in str(w.message)]
+    # Old name only (transformers < 5.23, TRL wrappers), then the default.
+    assert is_activation_checkpointing(types.SimpleNamespace(is_gradient_checkpointing = True)) is True
+    assert is_activation_checkpointing(object()) is False
+
+
+def test_no_zoo_site_reads_the_deprecated_model_alias():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "unsloth_zoo"
+    offenders = [
+        str(p.relative_to(root)) for p in root.rglob("*.py")
+        if '"is_gradient_checkpointing", False' in p.read_text(errors = "ignore")
+    ]
+    assert offenders == []

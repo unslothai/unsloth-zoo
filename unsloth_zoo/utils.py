@@ -24,6 +24,7 @@ __all__ = [
     "distributed_function",
     "distributed_any",
     "torch_distributed_get_rank",
+    "is_activation_checkpointing",
 ]
 
 from packaging.version import Version as TrueVersion
@@ -355,3 +356,20 @@ def get_quant_type(config):
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
+def is_activation_checkpointing(model, default = False):
+    """Whether activation (gradient) checkpointing is on for ``model``, read quietly.
+
+    transformers 5.23 renamed ``PreTrainedModel.is_gradient_checkpointing`` to
+    ``is_activation_checkpointing`` and left the old name as a property that emits a
+    FutureWarning on every read (removed in v6). Read the new name first and fall back
+    to the old one (transformers 4.57.6 .. 5.22, TRL wrappers that set it as a plain
+    attribute), then ``default`` when the object has neither.
+    """
+    for name in ("is_activation_checkpointing", "is_gradient_checkpointing"):
+        try:
+            return getattr(model, name)
+        except AttributeError:
+            continue
+    return default

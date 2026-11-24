@@ -26,6 +26,7 @@ import warnings
 import weakref
 
 import torch
+from unsloth_zoo.utils import is_activation_checkpointing as _is_activation_checkpointing
 
 from unsloth_zoo.private_staging import keep_mode, precreate_private_temp
 from .runtime import available_ram, cpu_bf16_supported, cpu_bnb_4bit_supported
@@ -651,7 +652,7 @@ def _cpu_compile_wanted(model):
 
 def _non_reentrant_checkpointing_on(model):
     # Re-enabling would drop an every_n_layers selection; reentrant or unknown funcs still get switched.
-    if not getattr(model, "is_gradient_checkpointing", False):
+    if not _is_activation_checkpointing(model):
         return False
     funcs = [m.__dict__["_gradient_checkpointing_func"] for m in model.modules() if "_gradient_checkpointing_func" in m.__dict__]
     return bool(funcs) and all(isinstance(getattr(f, "keywords", None), dict) and f.keywords.get("use_reentrant", True) is False for f in funcs)
@@ -1024,7 +1025,7 @@ class FastCPUModel:
             if use_gradient_checkpointing:
                 if not _non_reentrant_checkpointing_on(model):
                     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": False})
-            elif getattr(model, "is_gradient_checkpointing", False):
+            elif _is_activation_checkpointing(model):
                 model.gradient_checkpointing_disable()
         return model
 

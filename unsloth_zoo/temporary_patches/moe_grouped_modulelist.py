@@ -37,6 +37,8 @@ UNSLOTH_MOE_STACKED_LORA=0 keeps PEFT's per-expert LoRA Parameters (see _Stacked
 optimizer state saved before stacking does not load into a stacked model).
 """
 from __future__ import annotations
+
+from unsloth_zoo.utils import is_activation_checkpointing as _is_activation_checkpointing
 import collections
 import os
 import types
@@ -1019,7 +1021,7 @@ def _block_is_eligible(block):
 
 
 def _uses_grad_checkpointing(model) -> bool:
-    if getattr(model, "is_gradient_checkpointing", False):
+    if _is_activation_checkpointing(model):
         return True
     return any(getattr(m, "gradient_checkpointing", False) for m in model.modules())
 
