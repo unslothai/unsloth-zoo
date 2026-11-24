@@ -404,7 +404,7 @@ def _orpo_chunked_forward(trainer, original):
     last hidden state in row chunks (cpu_chunked_log_probs, the CPU twin of TRL's fused LM head, which TRL's DPO / KTO
     already use). Its nll loss, length-averaged log-probs and logits metric are those same per-token values. Only
     the plain decoder case; anything else, or UNSLOTH_CPU_CHUNKED_PREFERENCE=0, runs TRL's own forward."""
-    from .ops import _plain_head_weight, cpu_chunked_log_probs
+    from .ops import _plain_head_weight
 
     def concatenated_forward(model, batch):
         target = _chunked_ce_model(trainer, model)
@@ -424,22 +424,16 @@ def _orpo_chunked_forward(trainer, original):
         if labels.shape != targets.shape or not torch.equal(labels[label_mask], targets[label_mask]):
             return original(model, batch)  # labels that are not the next input token: TRL's two targets differ
         len_chosen = batch["chosen_labels"].shape[0]
-        target._unsloth_cpu_hidden_only = True
+        # The head runs inside the patched forward (ops.patch_chunked_causal_lm_loss), so a trainable lm_head under
+        # DDP is used inside the wrapped forward, and accelerate's autocast covers it as it covered TRL's lm_head.
+        target._unsloth_cpu_logps_targets = targets
         try:
             outputs = model(input_ids, attention_mask = attention_mask, use_cache = False)
         finally:
-            target._unsloth_cpu_hidden_only = False
-        # accelerate hands back fp32 copies under mixed precision; the head's dtype (or autocast's) is what TRL used.
-        hidden = outputs.hidden_states[-1][:, :-1].to(head.dtype)
-        batch_size, length = targets.shape
-        # The dtype TRL's lm_head ran in: accelerate's autocast if it set one, else the weights'.
-        with trainer.accelerator.autocast():
-            log_probs, _, _, mean_logits, _ = cpu_chunked_log_probs(
-                hidden.reshape(batch_size * length, -1), head, None, targets.reshape(-1), 1.0, None,
-                outputs = ("mean_logits",),
-            )
-        log_probs = log_probs.view(batch_size, length)
-        mean_logits = mean_logits.view(batch_size, length)
+            target.__dict__.pop("_unsloth_cpu_logps_targets", None)
+        if not isinstance(outputs, dict) or "log_probs" not in outputs:
+            return original(model, batch)  # a wrapper replaced the patched forward
+        log_probs, mean_logits = outputs["log_probs"], outputs["mean_logits"]
         # nn.CrossEntropyLoss over the chosen rows' attended next tokens (TRL's ORPO nll over prompt + response).
         nll_mask = attention_mask[:len_chosen, 1:] == 1
         chosen_nll_loss = -log_probs[:len_chosen][nll_mask].sum() / nll_mask.sum()

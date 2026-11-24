@@ -119,3 +119,99 @@ def test_opt_out_and_subclasses_keep_trl_forward(tmp_path, monkeypatch):
     trainer.__class__ = Custom
     trainer.__dict__.pop("concatenated_forward", None)
     assert _install_chunked_preference_forward(trainer) is False
+
+
+_DDP_SCRIPT = r'''
+import dataclasses, json, os, sys, tempfile
+import torch, torch.distributed as dist
+from datasets import Dataset
+from transformers import TrainerCallback
+from unsloth_zoo.cpu import loader
+from unsloth_zoo.cpu.trainer import install_cpu_training_defaults
+install_cpu_training_defaults()
+model, tok = loader.FastCPUModel.from_pretrained(sys.argv[1], dtype = torch.float32, full_finetuning = True,
+                                                 load_in_4bit = False)
+head = model.get_output_embeddings()
+head.weight = torch.nn.Parameter(head.weight.detach().clone())  # untied, trainable lm_head
+model.config.tie_word_embeddings = False
+import trl
+if hasattr(trl, "ORPOTrainer"):
+    C, T = trl.ORPOConfig, trl.ORPOTrainer
+else:
+    from trl.experimental.orpo import ORPOConfig as C, ORPOTrainer as T
+words = "the a cat dog sat ran on under mat tree big small red blue".split()
+g = torch.Generator().manual_seed(0)
+text = lambda n: " ".join(words[int(i)] for i in torch.randint(0, len(words), (n,), generator = g))
+rows = [{"prompt": text(3 + i % 4), "chosen": text(4 + 2 * (i % 4)), "rejected": text(9 - i % 4)} for i in range(8)]
+values = dict(output_dir = tempfile.mkdtemp(), per_device_train_batch_size = 4, max_length = 48, max_prompt_length = 16,
+              report_to = "none", beta = 0.1, remove_unused_columns = False, use_cpu = True, max_steps = 1, bf16 = False,
+              ddp_find_unused_parameters = True, ddp_backend = "gloo", save_strategy = "no", seed = 0)
+fields = {f.name for f in dataclasses.fields(C)}
+seen = {}
+head.weight.register_hook(lambda grad: seen.setdefault("local", grad.detach().clone()))
+
+class Grab(TrainerCallback):
+    def on_pre_optimizer_step(self, args, state, control, **kwargs):
+        seen.setdefault("reduced", head.weight.grad.detach().clone())
+
+trainer = T(model = model, args = C(**{k: v for k, v in values.items() if k in fields}), callbacks = [Grab()],
+            train_dataset = Dataset.from_list(rows), processing_class = tok)
+trainer.train()
+
+
+def gather(tensor):
+    parts = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(parts, tensor)
+    return parts
+
+
+local, reduced = gather(seen["local"]), gather(seen["reduced"])
+if dist.get_rank() == 0:
+    torch.save(dict(chunked = getattr(trainer.concatenated_forward, "_unsloth_cpu", False),
+                    wrapped = type(trainer.model_wrapped).__name__, local = local, reduced = reduced), sys.argv[2])
+'''
+
+
+def _ddp_step(tmp_path, chunked):
+    import socket
+    import subprocess
+    import sys
+    script = tmp_path / "ddp_orpo.py"
+    script.write_text(_DDP_SCRIPT)
+    result = tmp_path / f"result_{chunked}.pt"
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Not ACCELERATE_*: TrainingArguments exports ACCELERATE_MIXED_PRECISION, so earlier tests would set bf16 here.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ACCELERATE_")}
+    env.update(UNSLOTH_CPU_CHUNKED_PREFERENCE = chunked, CUDA_VISIBLE_DEVICES = "", OMP_NUM_THREADS = "2",
+               PYTHONPATH = os.pathsep.join([root, os.environ.get("PYTHONPATH", "")]))
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    run = subprocess.run([sys.executable, "-m", "torch.distributed.run", "--nproc_per_node", "2",
+                          "--master_port", str(port), str(script), TINY, str(result)],
+                         env = env, capture_output = True, text = True, timeout = 900)
+    assert run.returncode == 0, run.stderr[-3000:]
+    return torch.load(result)
+
+
+def test_ddp_trainable_head_grads_synced(tmp_path):
+    """CPU gloo DDP, 2 ranks with different rows, untied trainable lm_head, find_unused_parameters = True (the Trainer
+    default without gradient checkpointing): the head runs inside DDP's forward, so the step runs and the head
+    gradient is all-reduced across ranks, equal to TRL's own forward."""
+    if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
+        pytest.skip("no gloo")
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(TINY)
+    except Exception as error:
+        pytest.skip(f"{TINY} unavailable: {error}")
+    chunked, stock = _ddp_step(tmp_path, "1"), _ddp_step(tmp_path, "0")
+    assert (chunked["chunked"], stock["chunked"]) == (True, False)
+    for out in (chunked, stock):
+        assert out["wrapped"] == "DistributedDataParallel"
+        local, reduced = out["local"], out["reduced"]
+        assert not torch.equal(local[0], local[1]), "ranks saw the same rows"
+        assert torch.equal(reduced[0], reduced[1]), "lm_head gradient not synced across ranks"
+        torch.testing.assert_close(reduced[0], (local[0] + local[1]) / 2, rtol = 1e-4, atol = 1e-7)
+    scale = float(stock["reduced"][0].abs().max())
+    assert float((chunked["reduced"][0] - stock["reduced"][0]).abs().max()) / scale < 1e-4

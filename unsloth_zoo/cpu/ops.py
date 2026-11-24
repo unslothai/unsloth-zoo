@@ -619,16 +619,23 @@ def patch_chunked_causal_lm_loss(model):
                 logits_to_keep = 0, **kwargs):
         shift_labels = kwargs.pop("shift_labels", None)
         head_weight = _plain_head_weight(self.get_output_embeddings())
-        if getattr(self, "_unsloth_cpu_hidden_only", False) and head_weight is not None and labels is None \
-                and shift_labels is None:
-            # A preference trainer computing its log-probs from the last hidden state in row chunks (trainer.py).
+        logps_targets = vars(self).get("_unsloth_cpu_logps_targets", None)
+        if logps_targets is not None and head_weight is not None and labels is None and shift_labels is None:
+            # A preference trainer's next-token log-probs from the last hidden state in row chunks (trainer.py). The
+            # head runs here, inside the forward, so DDP / FSDP see a trainable lm_head as used in this forward.
             kwargs.pop("return_dict", None)
             outputs = getattr(self, inner_name)(
                 input_ids = input_ids, attention_mask = attention_mask, position_ids = position_ids,
                 past_key_values = past_key_values, inputs_embeds = inputs_embeds, use_cache = use_cache, **kwargs,
             )
             hidden = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
-            return CausalLMOutputWithPast(loss = None, logits = None, hidden_states = (hidden,))
+            hidden = hidden[:, :-1].to(head_weight.dtype)
+            batch_size, length = logps_targets.shape
+            log_probs, _, _, mean_logits, _ = cpu_chunked_log_probs(
+                hidden.reshape(batch_size * length, -1), head_weight, None, logps_targets.reshape(-1), 1.0, None,
+                outputs = ("mean_logits",),
+            )
+            return {"log_probs": log_probs.view(batch_size, length), "mean_logits": mean_logits.view(batch_size, length)}
         if (labels is None and shift_labels is None) or not torch.is_grad_enabled() \
                 or not getattr(self, "_unsloth_cpu_chunked_ce_active", False) or head_weight is None:
             if shift_labels is not None:
