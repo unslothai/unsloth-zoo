@@ -28,6 +28,7 @@ from unsloth_zoo.saving_utils import merge_and_overwrite_lora
 SPM_REPO = "hf-internal-testing/tiny-random-LlamaForCausalLM"     # ships tokenizer.model
 BPE_REPO = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"       # no tokenizer.model at all
 TARGET = "fakeuser/merged"
+_UPLOADED_BYTES = {}    # path_in_repo -> bytes of the last upload_file call
 
 
 def _hub_reachable():
@@ -54,6 +55,7 @@ def _cpu_and_mocked_hub_writes(monkeypatch, tmp_path):
     from huggingface_hub import HfApi, ModelCard
 
     events = []
+    _UPLOADED_BYTES.clear()
 
     def upload_folder(self, *args, folder_path = None, **kwargs):
         names = set()
@@ -65,6 +67,7 @@ def _cpu_and_mocked_hub_writes(monkeypatch, tmp_path):
 
     def upload_file(self, *args, path_or_fileobj = None, path_in_repo = None, **kwargs):
         assert os.path.isfile(path_or_fileobj), path_or_fileobj
+        with open(path_or_fileobj, "rb") as f: _UPLOADED_BYTES[path_in_repo] = f.read()
         events.append(("file", path_in_repo))
 
     class _Info:
@@ -165,8 +168,11 @@ def test_low_disk_push_does_not_reupload_tokenizer_model_already_sent(_cpu_and_m
 
 def test_low_disk_push_resends_tokenizer_model_replaced_after_step_2(_cpu_and_mocked_hub_writes, tmp_path):
     events = _cpu_and_mocked_hub_writes
+    # Prime the HF cache so Step 4's cache copy replaces tokenizer.model after Step 2 on a cold runner too.
+    base = _base_tokenizer_model_bytes()
     _push(SPM_REPO, _tokenizer_writing(tmp_path, b"not the base tokenizer.model"), low_disk_space_usage = True)
     assert _tokenizer_model_uploads(events) == (1, 1), events
+    assert _UPLOADED_BYTES["tokenizer.model"] == base    # the Hub ends with the bytes left on disk
 
 
 def test_full_disk_push_unchanged(_cpu_and_mocked_hub_writes, tmp_path):
