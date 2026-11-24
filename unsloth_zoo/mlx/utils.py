@@ -2119,8 +2119,9 @@ def _embedding_dims(emb):
 
 def _linear_semantic_dims(layer):
     out_dim, in_dim = int(layer.weight.shape[0]), int(layer.weight.shape[1])
-    if type(layer) is nn.QuantizedLinear:
-        in_dim = in_dim * 32 // int(layer.bits)
+    bits = getattr(layer, "bits", None)
+    if isinstance(bits, int) and bits > 0 and hasattr(layer, "scales"):
+        in_dim = in_dim * 32 // int(bits)
     return out_dim, in_dim
 
 
@@ -15195,33 +15196,54 @@ def _unpack_hadamard_modules(model):
     return bool(dense)
 
 
+def _scaled_switch_linear_class(module):
+    if type(module).__module__.startswith("mlx_vlm."):
+        from mlx_vlm.models.switch_layers import SwitchLinear
+        return SwitchLinear
+    from mlx_lm.models.switch_layers import SwitchLinear
+    return SwitchLinear
+
+
+def _scaled_quantized_weight_components(module):
+    scale_name = getattr(module, "_scale_name", None) or next(
+        (key for key in ("weight_scale_2", "weight_global_scale")
+         if getattr(module, key, None) is not None),
+        None,
+    )
+    packed = getattr(module, "weight", None)
+    if scale_name is None or getattr(module, "scales", None) is None or getattr(packed, "dtype", None) != mx.uint32:
+        return None
+    base_weight = mx.dequantize(
+        packed, module.scales, getattr(module, "biases", None),
+        module.group_size, module.bits, module.mode, dtype=mx.float32,
+    )
+    scale = getattr(module, scale_name).astype(mx.float32)
+    if scale.size > 1:
+        scale = scale.reshape(*base_weight.shape[:-2], -1, 1)
+    weight = base_weight / scale if scale_name == "weight_global_scale" else base_weight * scale
+    pre = getattr(module, "pre_quant_scale", None)
+    if pre is not None:
+        pre = pre.astype(mx.float32)
+        pre = pre.reshape(*pre.shape[:-1], 1, pre.shape[-1]) if pre.ndim > 1 else pre
+        weight = weight * pre
+    return base_weight, weight, scale_name, scale, pre
+
+
 def _dense_scaled_quantized_modules(model):
     """mlx-lm's dequantize_model skips NVFP4 modules with a global scale (mlx-vlm's ScaledQuantized*, the loader's scaled
     embedding) and would save their packed weights as dense; fold the scale and any AWQ pre_quant_scale in instead."""
     dense = []
     for name, module in model.named_modules():
-        scale_name = next((key for key in ("weight_scale_2", "weight_global_scale")
-                           if getattr(module, key, None) is not None), None)
-        packed = getattr(module, "weight", None)
-        if scale_name is None or getattr(module, "scales", None) is None or getattr(packed, "dtype", None) != mx.uint32:
+        components = _scaled_quantized_weight_components(module)
+        if components is None:
             continue
-        weight = mx.dequantize(packed, module.scales, getattr(module, "biases", None), module.group_size,
-                               module.bits, module.mode, dtype=mx.float32)
-        scale = getattr(module, scale_name).astype(mx.float32)
-        if scale.size > 1:
-            scale = scale.reshape(*weight.shape[:-2], -1, 1)
-        weight = weight / scale if scale_name == "weight_global_scale" else weight * scale
-        pre = getattr(module, "pre_quant_scale", None)
-        if pre is not None:
-            pre = pre.astype(mx.float32)
-            weight = weight * (pre.reshape(*pre.shape[:-1], 1, pre.shape[-1]) if pre.ndim > 1 else pre)
-        weight = weight.astype(mx.bfloat16)
+        weight = components[1].astype(mx.bfloat16)
         bias = getattr(module, "bias", None)
         if hasattr(module, "num_embeddings"):
             layer = nn.Embedding(*weight.shape)
         elif weight.ndim == 3:
-            from mlx_lm.models.switch_layers import SwitchLinear
-            layer = SwitchLinear(weight.shape[2], weight.shape[1], weight.shape[0], bias=bias is not None)
+            switch_cls = _scaled_switch_linear_class(module)
+            layer = switch_cls(weight.shape[2], weight.shape[1], weight.shape[0], bias=bias is not None)
         else:
             layer = nn.Linear(weight.shape[1], weight.shape[0], bias=bias is not None)
         layer.weight = weight
@@ -15289,6 +15311,133 @@ class LoRAHadamardLinear(nn.Module):
         return fused
 
 
+def _vlm_nvfp4_types():
+    mod = sys.modules.get("mlx_vlm.quantization.nvfp4")
+    if mod is None:
+        return ()
+    return tuple(
+        t for t in (
+            getattr(mod, "ScaledQuantizedLinear", None),
+            getattr(mod, "ScaledQuantizedSwitchLinear", None),
+        )
+        if isinstance(t, type)
+    )
+
+
+def _fuse_scaled_quantized(linear, delta, dequantize):
+    base_weight, effective_weight, scale_name, scale, pre = _scaled_quantized_weight_components(linear)
+    bias = getattr(linear, "bias", None)
+    delta = delta.astype(mx.float32)
+    if dequantize:
+        weight = (effective_weight + delta).astype(mx.bfloat16)
+    else:
+        pre_delta = delta / pre if pre is not None else delta
+        weight = base_weight + (pre_delta * scale if scale_name == "weight_global_scale" else pre_delta / scale)
+    is_switch = weight.ndim == 3
+    layer = (
+        _scaled_switch_linear_class(linear)(weight.shape[2], weight.shape[1], weight.shape[0], bias=bias is not None)
+        if is_switch
+        else nn.Linear(weight.shape[1], weight.shape[0], bias=bias is not None)
+    )
+    layer.weight = weight
+    if bias is not None:
+        layer.bias = bias
+    if dequantize:
+        return layer
+    quantized = (
+        layer.to_quantized(group_size=linear.group_size, bits=linear.bits, mode=linear.mode)
+        if is_switch
+        else nn.QuantizedLinear.from_linear(layer, linear.group_size, linear.bits, mode=linear.mode)
+    )
+    pre_quant_scale = getattr(linear, "pre_quant_scale", None)
+    extra = (pre_quant_scale,) if pre_quant_scale is not None else ()
+    return type(linear)(quantized, getattr(linear, scale_name), scale_name, *extra)
+
+
+class LoRAScaledQuantizedLinear(nn.Module):
+    @staticmethod
+    def supports(module):
+        types = _vlm_nvfp4_types()
+        return (
+            len(types) == 2
+            and isinstance(module, types[0])
+            and not isinstance(module, types[1])
+            and not getattr(module, "_quantize_activations", False)
+        )
+
+    @staticmethod
+    def from_base(linear, r=8, dropout=0.0, scale=20.0):
+        if not LoRAScaledQuantizedLinear.supports(linear):
+            raise ValueError("LoRA requires a non-activation-quantized ScaledQuantizedLinear.")
+        output_dims = linear.weight.shape[0]
+        input_dims = linear.scales.shape[-1] * linear.group_size
+        module = LoRAScaledQuantizedLinear()
+        module.linear = linear
+        module.dropout = nn.Dropout(p=dropout)
+        module.scale = scale
+        bound = 1 / math.sqrt(input_dims)
+        module.lora_a = mx.random.uniform(low=-bound, high=bound, shape=(input_dims, r))
+        module.lora_b = mx.zeros((r, output_dims))
+        return module
+
+    def __call__(self, x):
+        y = self.linear(x)
+        z = (self.dropout(x) @ self.lora_a) @ self.lora_b
+        return y + (self.scale * z).astype(x.dtype)
+
+    def fuse(self, dequantize=False):
+        delta = (self.scale * self.lora_b.T) @ self.lora_a.T
+        return _fuse_scaled_quantized(self.linear, delta, dequantize)
+
+
+class LoRAScaledQuantizedSwitchLinear(nn.Module):
+    @staticmethod
+    def supports(module):
+        types = _vlm_nvfp4_types()
+        return (
+            len(types) == 2
+            and isinstance(module, types[1])
+            and not getattr(module, "_quantize_activations", False)
+        )
+
+    @staticmethod
+    def from_base(linear, r=8, dropout=0.0, scale=20.0):
+        if not LoRAScaledQuantizedSwitchLinear.supports(linear):
+            raise ValueError("LoRA requires a non-activation-quantized ScaledQuantizedSwitchLinear.")
+        input_dims = linear.input_dims
+        output_dims = linear.output_dims
+        num_experts = linear.num_experts
+        module = LoRAScaledQuantizedSwitchLinear()
+        module.linear = linear
+        module.dropout = nn.Dropout(p=dropout)
+        module.scale = scale
+        module.num_experts = num_experts
+        bound = 1 / math.sqrt(input_dims)
+        module.lora_a = mx.random.uniform(low=-bound, high=bound, shape=(num_experts, r, input_dims))
+        module.lora_b = mx.zeros((num_experts, output_dims, r))
+        return module
+
+    def __call__(self, x, indices, sorted_indices=False):
+        y = self.linear(x, indices, sorted_indices=sorted_indices)
+        z = mx.gather_mm(
+            self.dropout(x),
+            self.lora_a.swapaxes(-1, -2),
+            rhs_indices=indices,
+            sorted_indices=sorted_indices,
+        )
+        z = mx.gather_mm(
+            z,
+            self.lora_b.swapaxes(-1, -2),
+            rhs_indices=indices,
+            sorted_indices=sorted_indices,
+        )
+        return y + (self.scale * z).astype(x.dtype)
+
+    def fuse(self, dequantize=False):
+        delta = (self.scale * self.lora_b) @ self.lora_a
+        return _fuse_scaled_quantized(self.linear, delta, dequantize)
+
+
 def _extract_mlx_lora_parameters(model):
     """Extract global rank, scale, and dropout from the model's first LoRA module."""
     rank, scale, dropout = 8, 1.0, 0.0
@@ -15350,6 +15499,9 @@ _LORA_WRAPPED_BASE_SUFFIXES = (
     ".linear.weight",
     ".linear.scales",
     ".linear.biases",
+    ".linear.weight_scale_2",
+    ".linear.weight_global_scale",
+    ".linear.pre_quant_scale",
     ".embedding.weight",
     ".embedding.scales",
     ".embedding.biases",
@@ -15359,6 +15511,7 @@ _LORA_WRAPPED_BASE_SUFFIXES = (
 _ROOT_LORA_WRAPPED_BASE_KEYS = frozenset({
     "weight", "scales", "biases",
     "linear.weight", "linear.scales", "linear.biases",
+    "linear.weight_scale_2", "linear.weight_global_scale", "linear.pre_quant_scale",
     "embedding.weight", "embedding.scales", "embedding.biases",
 })
 
@@ -15812,18 +15965,8 @@ def _infer_snapshot_commit(path):
 
 
 def _effective_mlx_quantization_map(model):
-    from mlx_lm.models.switch_layers import QuantizedSwitchLinear
-
-    quantized_types = [
-        nn.QuantizedLinear,
-        nn.QuantizedEmbedding,
-        QuantizedSwitchLinear,
-    ]
-    vlm_switch_module = sys.modules.get("mlx_vlm.models.switch_layers")
-    if vlm_switch_module is not None:
-        quantized_types.append(vlm_switch_module.QuantizedSwitchLinear)
-    # Drop non-class placeholders a stand-in runtime exports, else isinstance() raises.
-    quantized_types = tuple(t for t in quantized_types if isinstance(t, type))
+    from .loader import _mlx_quantized_module_types
+    quantized_types = _mlx_quantized_module_types()
 
     quantized = {}
     config = getattr(model, "_config", None)
@@ -16084,10 +16227,12 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     if resolved_map:
         adapter_config["base_resolved_quantization_map"] = resolved_map
         adapter_config["base_resolved_quantization_map_supports_switch"] = True
+        adapter_config["base_resolved_quantization_map_supports_scaled_nvfp4"] = True
         adapter_config.pop("base_quantization_map", None)
     else:
         adapter_config.pop("base_resolved_quantization_map", None)
         adapter_config.pop("base_resolved_quantization_map_supports_switch", None)
+        adapter_config.pop("base_resolved_quantization_map_supports_scaled_nvfp4", None)
         adapter_config.pop("base_quantization_map", None)
 
     requires_runtime = False
