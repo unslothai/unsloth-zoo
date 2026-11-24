@@ -135,6 +135,7 @@ Nothing here is specific to one architecture:
 from __future__ import annotations
 
 import inspect
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -380,6 +381,10 @@ def logit_headroom_bytes(
 # --------------------------------------------------------------------------- #
 # plan object
 # --------------------------------------------------------------------------- #
+# Plan notes warning that the load may still fail; DeviceMapPlan.summary keeps them visible.
+_PLAN_RISK_NOTES = ("run out of memory", "device mismatch")
+
+
 @dataclass
 class DeviceMapPlan:
     """Result of :func:`plan_device_map`."""
@@ -410,6 +415,24 @@ class DeviceMapPlan:
     def free_bytes(self) -> dict[int, int]:
         """Budget minus placed weights, per device (what activations may use)."""
         return {d: self.raw_budgets[d] - self.weight_bytes.get(d, 0) for d in self.raw_budgets}
+
+    def summary(self) -> str:
+        """One line for the default load log; :meth:`describe` is the full table.
+
+        Notes that warn the load itself may still fail (run out of memory, hit a device
+        mismatch) follow on their own lines; the rest of the planner's working (budgets,
+        reserves, headroom, quantizer haircuts) is only in :meth:`describe`.
+        """
+        placed = {d: w for d, w in sorted(self.weight_bytes.items()) if w > 0}
+        line = (
+            f"Unsloth: placed the model over {len(placed)} GPUs: "
+            + ", ".join(f"cuda:{d} {w / _GiB:.2f} GiB" for d, w in placed.items())
+        )
+        if self.head_module:
+            line += f" ({self.head_module} on cuda:{self.head_device})"
+        line += ". UNSLOTH_ENABLE_LOGGING=1 shows the full placement."
+        risks = [f"Unsloth: note: {n}" for n in self.notes if any(m in n for m in _PLAN_RISK_NOTES)]
+        return "\n".join([line] + risks)
 
     def describe(self) -> str:
         lines = [
@@ -2184,14 +2207,32 @@ def _runtime_quantization_config(kwargs: dict[str, Any]) -> Any:
     return quantization_config
 
 
+class _DropUnknownQuantizationWarning(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not str(record.getMessage()).startswith("Unknown quantization type")
+
+
 def _quantization_method_is_known(quantization_config: Any) -> bool:
-    """``get_hf_quantizer``'s own check; anything it cannot judge is left to transformers."""
+    """``get_hf_quantizer``'s own check; anything it cannot judge is left to transformers.
+
+    Asked quietly: this is a sizing probe, and the real ``from_pretrained`` that
+    follows runs the same check and prints transformers' "Unknown quantization type"
+    warning itself when it still applies. Asking loudly printed it a second time, and
+    for a config the loader had already cleaned (Inkling 2 drops its ModelOpt block
+    before loading, but the planner reads the repo's config) it printed it for a
+    quantization_config the load never sees.
+    """
     from transformers.quantizers import AutoHfQuantizer
 
+    quiet = _DropUnknownQuantizationWarning()
+    auto_logger = logging.getLogger("transformers.quantizers.auto")
+    auto_logger.addFilter(quiet)
     try:
         return bool(AutoHfQuantizer.supports_quant_method(quantization_config))
     except Exception:
         return True
+    finally:
+        auto_logger.removeFilter(quiet)
 
 
 def _apply_config_overrides(config: Any, overrides: Mapping[str, Any]) -> Any:

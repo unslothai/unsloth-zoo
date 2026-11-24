@@ -270,11 +270,29 @@ def _fix_double_bos_and_pad(
 pass
 
 
+def _resolve_Gemma3ProcessorKwargs():
+    """Gemma3ProcessorKwargs without touching transformers' deprecated alias.
+
+    transformers 5.24 turned `Gemma3ProcessorKwargs` into a module `__getattr__`
+    alias of `ProcessingKwargs` that emits a FutureWarning on every access, and
+    5.29 removes it. Use the real class when the module still defines it
+    (4.57.6 .. 5.23, it carries the Gemma 3 `_defaults`), else `ProcessingKwargs`,
+    which is exactly what the alias resolves to.
+    """
+    import transformers.models.gemma3.processing_gemma3 as processing_gemma3
+    kwargs_class = vars(processing_gemma3).get("Gemma3ProcessorKwargs", None)
+    if kwargs_class is not None:
+        return kwargs_class
+    from transformers.processing_utils import ProcessingKwargs
+    return ProcessingKwargs
+pass
+
+
 def patch_Gemma3Processor():
     import re
     try:
         import transformers.models.gemma3.processing_gemma3
-        from transformers.models.gemma3.processing_gemma3 import Gemma3ProcessorKwargs
+        Gemma3ProcessorKwargs = _resolve_Gemma3ProcessorKwargs()
         from transformers.image_utils import make_nested_list_of_images
         from transformers.feature_extraction_utils import BatchFeature
         from transformers.utils import to_py_obj
