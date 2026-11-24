@@ -1548,7 +1548,7 @@ def test_lora_sft_baseline_loss_value_clip(tmp_path):
 _NormTok = type("Tok", (), {"pad_token_id": 0, "eos_token_id": 0})
 
 
-def _cce_text_model(rows, dim, *, quantized, lora=False, calls=None, softcap=0.0):
+def _cce_text_model(rows, dim, *, quantized, lora=False, calls=None, softcap=0.0, kept=None):
     from types import SimpleNamespace
     from mlx_lm.tuner.lora import LoRALinear
     from unsloth_zoo.mlx.cce.runtime_cce import _apply_softcap
@@ -1588,11 +1588,12 @@ def _cce_text_model(rows, dim, *, quantized, lora=False, calls=None, softcap=0.0
             else:
                 self.lm_head = base
             self.args = SimpleNamespace(tie_word_embeddings=False, final_logit_softcapping=softcap)
+            self.config = SimpleNamespace(unpadded_vocab_size=kept)
 
         def __call__(self, ids):
             if calls is not None:
                 calls.append("model")
-            return _apply_softcap(self.lm_head(self.model(ids)), softcap)
+            return _apply_softcap(self.lm_head(self.model(ids)), softcap)[..., :kept]
 
     return Model()
 
@@ -1735,6 +1736,49 @@ def test_cce_rotates_hidden_states_into_a_hadamard_packed_head(monkeypatch, pack
     logits = model(ids[:, :-1]).astype(mx.float32)
     dense = nn.losses.cross_entropy(logits, ids[:, 1:], reduction="none")
     assert mx.allclose(ce, dense * supervised, atol=1e-4, rtol=1e-4).item()
+    model.get_input_embeddings = lambda *args, **kwargs: None
+    monkeypatch.setattr(mlx_utils, "_vlm_cce_forward", lambda m, b, **kwargs: (
+        m.model(b["input_ids"][:, :-1]), b["input_ids"][:, 1:], mx.array(b["input_ids"][:, 1:].size)))
+    vlm_loss = mlx_utils.make_vlm_cce_loss_fn(model)
+    assert vlm_loss._unsloth_cce_backend == "runtime-cce"
+    assert vlm_loss(model, {"input_ids": ids})[0].item() == pytest.approx(dense.mean().item(), rel=1e-4)
+
+
+@metal_only
+@pytest.mark.parametrize("head", ["dense", "quantized", "lora"])
+def test_cce_scores_only_the_head_rows_the_forward_keeps(monkeypatch, head):
+    # Inkling 2 pads its head past the vocabulary and slices logits to unpadded_vocab_size.
+    from unsloth_zoo.mlx import preference
+
+    mx.random.seed(0)
+    lora = head == "lora"
+    calls = []
+    model = _cce_text_model(2049, 1024 if lora else 64, quantized=head == "quantized", lora=lora, calls=calls,
+                            kept=2049)
+    tokens = 2048 if lora else 64
+    # The last kept row is a target: scoring one row too few drops it.
+    ids = mx.concatenate([mx.random.randint(0, 2049, (1, tokens)), mx.array([[2048]])], axis=1)
+    lengths = mx.array([[0, tokens + 1]], dtype=mx.int32)
+    want = nn.value_and_grad(model, make_baseline_loss_fn())(model, ids, lengths)
+    loss_fn = mlx_utils.make_cce_loss_fn(model)
+    loss_fn = getattr(loss_fn, "_unsloth_compiled_loss_fn", loss_fn)
+    assert loss_fn._unsloth_cce_backend == ("runtime-cce-lora-head" if lora else "runtime-cce")
+    calls.clear()
+    got = nn.value_and_grad(model, loss_fn)(model, ids, lengths)
+    mx.eval(want, got)
+    assert "model" not in calls
+    assert got[0][0].item() == pytest.approx(want[0][0].item(), rel=1e-4)
+    for (_, expected), (_, actual) in zip(tree_flatten(want[1]), tree_flatten(got[1])):
+        assert mx.allclose(expected, actual, atol=1e-5, rtol=1e-3).item()
+    if lora:
+        return
+    logits = model(ids[:, :-1]).astype(mx.float32)
+    dense = nn.losses.cross_entropy(logits, ids[:, 1:], reduction="none")
+    score = preference._make_preference_cce_scorer(model)
+    ce, sums = score(model, ids, mx.ones(dense.shape, dtype=mx.bool_), differentiated=False)
+    assert score.vocab == 2049
+    assert mx.allclose(ce, dense, atol=1e-4, rtol=1e-4).item()
+    assert mx.allclose(sums, logits.sum(-1), atol=1e-2, rtol=1e-4).item()
     model.get_input_embeddings = lambda *args, **kwargs: None
     monkeypatch.setattr(mlx_utils, "_vlm_cce_forward", lambda m, b, **kwargs: (
         m.model(b["input_ids"][:, :-1]), b["input_ids"][:, 1:], mx.array(b["input_ids"][:, 1:].size)))

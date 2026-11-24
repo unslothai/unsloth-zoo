@@ -3075,6 +3075,7 @@ def _make_preference_cce_scorer(model, *, temperature=1.0):
     options = dict(ignore_index=-100, logit_softcap=softcap, quantized=desc.quantized,
                    weight_is_frozen=frozen, **quantization)
     by_mode, loss_only = utils._runtime_cce_by_mode(**options), utils._get_runtime_cce(**options)
+    kept = utils._kept_head_rows(model, desc.module.weight.shape[0])
 
     def score(model, batch, supervised, indices=None, *, every_position=False, logit_sums=True,
               differentiated, hidden=None, shared=None):
@@ -3100,6 +3101,8 @@ def _make_preference_cce_scorer(model, *, temperature=1.0):
             scales, biases = head.scales, head.get("biases")
             if biases is None and quantization["mode"] == "affine":
                 biases = mx.zeros_like(scales)
+        weight, scales, biases = utils._head_rows(kept, weight, scales, biases)
+        if desc.quantized:
             ce = kernel(rows, weight, scales, biases, labels)
         else:
             ce = kernel(rows, weight, labels)
@@ -3118,7 +3121,7 @@ def _make_preference_cce_scorer(model, *, temperature=1.0):
             sums = _scatter_rows(sums, indices, targets.size)
         return ce.reshape(targets.shape), mx.stop_gradient(sums.reshape(targets.shape))
 
-    score.vocab = desc.module.weight.shape[0]
+    score.vocab = kept or desc.module.weight.shape[0]
     score.compaction = score.vocab >= 8192
     return score
 

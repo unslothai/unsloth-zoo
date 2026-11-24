@@ -2552,7 +2552,22 @@ def _supports_text_lora_cce(desc, label_smoothing):
     return type(head.linear) is not nn.QuantizedLinear or head.lora_a.shape[1] <= 32
 
 
-def _make_text_lora_cce_loss_fn(head_desc, logit_scale, softcap):
+def _kept_head_rows(model, rows):
+    """Leading head rows whose logits the forward keeps, or None for all: Inkling slices its padded head's logits to
+    unpadded_vocab_size, and CCE must not score the rest."""
+    tm = _get_text_model(model)
+    for holder in (tm, getattr(tm, "args", None), getattr(tm, "config", None)):
+        kept = getattr(holder, "unpadded_vocab_size", None)
+        if isinstance(kept, int) and 0 < kept < rows:
+            return kept
+    return None
+
+
+def _head_rows(rows, *arrays):
+    return arrays if rows is None else tuple(None if a is None else a[:rows] for a in arrays)
+
+
+def _make_text_lora_cce_loss_fn(head_desc, logit_scale, softcap, rows=None):
     from unsloth_zoo.mlx.cce.runtime_cce import make_lora_head_cce
 
     head = head_desc.module
@@ -2588,11 +2603,11 @@ def _make_text_lora_cce_loss_fn(head_desc, logit_scale, softcap):
         base = live_head.linear
         hidden = hidden.reshape((-1, hidden.shape[-1]))
         rank_hidden = live_head.dropout(hidden) @ live_head.lora_a
-        losses = kernel(
-            hidden, base.weight, base.scales if quantized else None,
-            base.get("biases") if quantized else None,
-            rank_hidden, live_head.lora_b, base.get("bias"), targets.reshape((-1,)),
-        )
+        weight, scales, biases, bias = _head_rows(
+            rows, base.weight, base.scales if quantized else None, base.get("biases") if quantized else None,
+            base.get("bias"))
+        lora_b = live_head.lora_b if rows is None else live_head.lora_b[:, :rows]
+        losses = kernel(hidden, weight, scales, biases, rank_hidden, lora_b, bias, targets.reshape((-1,)))
         return losses.sum() / _safe_token_denominator(count), count
 
     loss_fn._unsloth_cce_backend = "runtime-cce-lora-head"
@@ -2657,7 +2672,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0, loss_type="nll"):
         loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
         loss_fn._unsloth_cce_backend = "baseline-fallback"
         loss_fn._unsloth_compiled_loss_fn = _make_text_lora_cce_loss_fn(
-            head_desc, logit_scale, softcap,
+            head_desc, logit_scale, softcap, _kept_head_rows(model, head_desc.module.linear.weight.shape[0]),
         )
         return loss_fn
 
@@ -2667,6 +2682,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0, loss_type="nll"):
         print(f"Unsloth: CCE using logit_scale={logit_scale} for this model.")
 
     lm_layer = head_desc.module
+    _rows = _kept_head_rows(model, lm_layer.weight.shape[0])
     use_quantized = _is_quantized_layer(lm_layer)
 
     _head_path = head_desc.path
@@ -2723,6 +2739,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0, loss_type="nll"):
             bi = layer.biases if _has_biases else None
             if bi is None and quant_mode == "affine":
                 bi = mx.zeros_like(sc)
+            w, sc, bi = _head_rows(_rows, w, sc, bi)
             steps = mx.arange(1, targets.shape[1] + 1)
             length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
             # Widen unsigned dtypes so mx.where can inject the signed -100; mx.where on uint crashes the torch-backed shim.
@@ -2765,7 +2782,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0, loss_type="nll"):
                 inputs = batch[:, :-1]
                 targets = labels[:, 1:]
             hidden = _get_backbone(model)(model, inputs)
-            w = _get_lm_weight_layer(model).weight
+            w, = _head_rows(_rows, _get_lm_weight_layer(model).weight)
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             steps = mx.arange(1, targets.shape[1] + 1)
@@ -4888,6 +4905,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None, los
     if logit_scale is not None:
         print(f"Unsloth: VLM CCE using logit_scale={logit_scale} for this model.")
     lm_layer = head_desc.module
+    _rows = _kept_head_rows(model, lm_layer.weight.shape[0])
     use_quantized = _is_quantized_layer(lm_layer)
     _head_path = head_desc.path
     # Evaluate once (after LoRA setup); trainability doesn't change mid-training.
@@ -4938,6 +4956,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None, los
             bi = getattr(lm_head, "biases", None)
             if bi is None and quant_mode == "affine":
                 bi = mx.zeros_like(sc)
+            w, sc, bi = _head_rows(_rows, w, sc, bi)
             # Quantized backward already returns zero weight/scales/biases gradients (see runtime_cce.py VJP), so
             # stop_gradient is redundant here even when the LM head is frozen.
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
@@ -4969,7 +4988,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None, los
             hidden, masked_targets, ntoks = _vlm_cce_forward(
                 model, batch_dict, image_token_ids=_image_token_ids,
                 assistant_token_id=_assistant_token_id)
-            w = _resolve_module_path(model, _head_path).weight
+            w, = _head_rows(_rows, _resolve_module_path(model, _head_path).weight)
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
