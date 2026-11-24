@@ -4463,7 +4463,11 @@ def test_cce_embedding_signature_uses_ids_and_preserves_media(capsys, monkeypatc
     class Positional:
         def __call__(self, ids, inputs_embeds=None, /):
             pass
+    class Forwarding(Alias):
+        def __call__(self, ids, *args, **kwargs):
+            return super().__call__(ids, *args, **kwargs)
     assert mlx_utils._get_backbone_embed_kwarg(Alias()) == "input_embeddings"
+    assert mlx_utils._get_backbone_embed_kwarg(Forwarding()) == "input_embeddings"
     assert mlx_utils._get_backbone_embed_kwarg(Unknown()) is None
     assert mlx_utils._get_backbone_embed_kwarg(Positional()) is None
 

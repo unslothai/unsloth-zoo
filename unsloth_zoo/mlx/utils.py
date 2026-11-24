@@ -3528,16 +3528,21 @@ def _unpack_embed_result(embed_result, model, input_ids=None, attention_mask=Non
 
 
 def _get_backbone_embed_kwarg(backbone):
-    # A backbone without its own __call__ (a bare nn.Module) takes no embeddings kwarg either.
-    try:
-        params = inspect.signature(backbone.__call__).parameters
-    except (AttributeError, TypeError, ValueError):
-        return None
-    for name in ("inputs_embeds", "input_embeddings", "input_embeds"):
-        if name in params and params[name].kind in (
-            inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY,
-        ):
-            return name
+    # A backbone without its own __call__ (a bare nn.Module) takes no embeddings kwarg either. An override that only
+    # forwards **kwargs (SenseNova Loop over Qwen3.5) hides its parent's, so the MRO is walked past it.
+    calls = [klass.__dict__["__call__"] for klass in type(backbone).__mro__ if "__call__" in klass.__dict__]
+    for call in calls or [getattr(backbone, "__call__", None)]:
+        try:
+            params = inspect.signature(call).parameters
+        except (TypeError, ValueError):
+            return None
+        for name in ("inputs_embeds", "input_embeddings", "input_embeds"):
+            if name in params and params[name].kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY,
+            ):
+                return name
+        if not any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+            return None
     return None
 
 
