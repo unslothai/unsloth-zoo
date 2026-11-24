@@ -460,6 +460,96 @@ def test_a_checkpointed_layer_hands_its_shared_dict_writes_to_later_layers():
 
 
 @metal_only
+@pytest.mark.parametrize("appends", ["input", "output"])
+@pytest.mark.parametrize("keyword", [False, True])
+def test_a_checkpointed_layer_hands_its_list_appends_to_later_layers(appends, keyword):
+    # Inkling 2's layers append to `blocks`, the residual history every later layer mixes.
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(8, 8)
+
+        def __call__(self, x, blocks):
+            if blocks:
+                blocks[-1] = blocks[-1] * 0.5  # replaced in place, not appended
+            blocks.append(mx.stop_gradient(x * 2))  # a write with no gradient must not shift the others' cotangents
+            if appends == "input":
+                blocks.append(x)
+            out = self.proj(mx.stack([*blocks, x]).sum(0))
+            if appends == "output":
+                blocks.append(out)  # also an output: its cotangent must not be dropped
+            return out
+
+    mx.random.seed(0)
+    layers, x = [Layer() for _ in range(3)], mx.random.normal((2, 3, 8))
+
+    def loss(params, x):
+        for layer, p in zip(layers, params):
+            layer.update(p)
+        blocks = []
+        for layer in layers:
+            x = layer(x, blocks=blocks) if keyword else layer(x, blocks)
+        return (x ** 2).sum() + mx.stack(blocks).sum()
+
+    params = [layer.trainable_parameters() for layer in layers]
+    expected = mx.value_and_grad(loss, argnums=(0, 1))(params, x)
+    mlx_utils._patch_layer_class_for_gc(Layer)
+    try:
+        got = mx.value_and_grad(loss, argnums=(0, 1))(params, x)
+    finally:
+        mlx_utils._unpatch_layer_class_gc(Layer)
+    (loss_got, (grads, dx)), (loss_ref, (ref_grads, ref_dx)) = got, expected
+    assert mx.allclose(loss_got, loss_ref).item() and mx.allclose(dx, ref_dx, atol=1e-4).item()
+    for layer_grads, layer_ref in zip(grads, ref_grads):
+        for key in ("weight", "bias"):
+            assert mx.allclose(layer_grads["proj"][key], layer_ref["proj"][key], atol=1e-4).item()
+
+
+@metal_only
+@pytest.mark.parametrize("shared", [list, dict])
+def test_a_compiled_step_with_checkpointed_shared_writes_frees_its_layers(shared):
+    import gc
+    import weakref
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(8, 8)
+
+        def __call__(self, x, state):
+            if isinstance(state, list):
+                state.append(x)
+            else:
+                state[len(state)] = x
+            return self.proj(mx.stack(list(state.values()) if isinstance(state, dict) else state).sum(0))
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [Layer() for _ in range(2)]
+
+        def __call__(self, x):
+            state = shared()
+            for layer in self.layers:
+                x = layer(x, state)
+            return (x ** 2).sum()
+
+    def run():
+        model = Model()
+        step = mx.compile(nn.value_and_grad(model, model), inputs=model.state, outputs=model.state)
+        mx.eval(step(mx.random.normal((2, 3, 8))))
+        return weakref.ref(model.layers[0])
+
+    mlx_utils._patch_layer_class_for_gc(Layer)
+    try:
+        ref = run()
+    finally:
+        mlx_utils._unpatch_layer_class_gc(Layer)
+    gc.collect()
+    assert ref() is None
+
+
+@metal_only
 @pytest.mark.parametrize("heads, T, dim, pays", [
     (8, 1536, 256, False), (8, 2048, 256, True), (8, 2048, 512, False), (8, 4096, 512, True)])
 def test_windowing_pays_only_past_the_break_even(heads, T, dim, pays):

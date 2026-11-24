@@ -1114,6 +1114,25 @@ def _traced_writes(written: dict, seen: dict) -> dict:
     return {k: v for k, v in written.items() if seen.get(k) is not v and traced(v)}
 
 
+def _shared_containers(args, kwargs):
+    """Keys of the dict and list arguments a layer may write into for later layers to read."""
+    return [k for k, v in (*enumerate(args), *kwargs.items()) if isinstance(v, (dict, list))]
+
+
+def _argument(args, kwargs, key):
+    return args[key] if isinstance(key, int) else kwargs[key]
+
+
+def _entries(container):
+    return dict(enumerate(container)) if isinstance(container, list) else dict(container)
+
+
+def _passthrough(x):
+    # A Depends node (no copy) gives each returned write its own cotangent: mx.vjp skips a stop_gradient output,
+    # shifting the rest, and seeds an output returned twice only once.
+    return mx.depends([x], [x])[0]
+
+
 @mx.custom_function
 def _tie_shared_kv_cotangent(x, shared_kv):
     return x, shared_kv
@@ -1169,9 +1188,13 @@ def _patch_layer_class_for_gc(layer_cls):
             if "shared_kv" in kwargs:
                 args, kwargs["shared_kv"] = _tie_to_hidden_state(
                     args, kwargs["shared_kv"])
-            outer = (args, kwargs)
-            # Mistral Large 4 writes K/V into a dict later layers read; the checkpoint copies it, so return the writes.
-            shared = [i for i, a in enumerate(args) if isinstance(a, dict)]
+            # Layers can write into a dict or list later layers read (Mistral Large 4's K/V, Inkling 2's residual
+            # history); the checkpoint copies its arguments, so return the writes.
+            shared = _shared_containers(args, kwargs)
+            # The closure must not hold those containers: they get its outputs, a cycle through the MLX graph that
+            # Python's gc cannot see, which kept compiled traces and their layers alive.
+            outer = (tuple(None if i in shared else a for i, a in enumerate(args)),
+                     {k: None if k in shared else v for k, v in kwargs.items()})
             wrote = False
 
             def inner_fn(params, *args, **kwargs):
@@ -1180,10 +1203,12 @@ def _patch_layer_class_for_gc(layer_cls):
                 _carry_window_masks(outer, (args, kwargs))
                 args = tuple(_detach_integer_arrays(a) for a in args)
                 kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
-                before = [dict(args[i]) for i in shared]
+                containers = [_argument(args, kwargs, key) for key in shared]
+                before = [_entries(c) for c in containers]
                 with _padding_free_scope(layout):
                     out = fn(self, *args, **kwargs)
-                writes = [_traced_writes(args[i], seen) for i, seen in zip(shared, before)]
+                writes = [mlx.utils.tree_map(_passthrough, _traced_writes(_entries(c), seen))
+                          for c, seen in zip(containers, before)]
                 wrote = any(writes)
                 # Writes go first: mx.checkpoint misaligns cotangents after an output with no gradient (an index).
                 return (writes, out) if wrote else out
@@ -1192,8 +1217,13 @@ def _patch_layer_class_for_gc(layer_cls):
             if not wrote:
                 return out
             writes, out = out
-            for i, written in zip(shared, writes):
-                args[i].update(written)
+            for key, written in zip(shared, writes):
+                target = _argument(args, kwargs, key)
+                if isinstance(target, dict):
+                    target.update(written)
+                else:
+                    for k in sorted(written):
+                        target[k:k + 1] = [written[k]]
             return out
 
         # Shared K/V must cross the checkpoint boundary as a traced argument and traced result; reading it off the slot makes the VJP drop the gradient.
