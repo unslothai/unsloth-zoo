@@ -161,6 +161,7 @@ def test_an_in_process_engine_reads_the_live_lora_from_memory(monkeypatch):
         monkeypatch.setitem(sys.modules, *item)
     _fake_vllm(monkeypatch, "vllm_metal.platform")
     model = _tiny(0)
+    model.freeze()  # as get_peft_model leaves it: only LoRA A/B trainable
     linear_to_lora_layers(model, 2, {"rank": 4, "scale": 2.0, "dropout": 0.0})
     model.vllm_engine = type("LLM", (), {"llm_engine": types.SimpleNamespace(remove_lora=lambda i: None, add_request=lambda *a, lora_request: "added")})()  # weak-referenceable, as vLLM's is
     model.vllm_engine._unsloth_in_memory_lora = vllm_utils._serve_in_memory_loras(model.vllm_engine)
@@ -182,9 +183,10 @@ def test_an_in_process_engine_reads_the_live_lora_from_memory(monkeypatch):
     vllm_utils.load_lora(model, load_tensors=True)
     model.vllm_engine = None  # an engine dropped without a release takes its live adapter with it
     assert len(vllm_utils._IN_MEMORY_LORAS) == 0 and vllm_utils.plain_lora(model) and vllm_utils._live_adapter(model) is not None
-    model._unsloth_cpt_full_module_weight_keys = {"model.embed_tokens.weight"}  # A/B alone would leave the embedding stale
+    model.model.embed_tokens.unfreeze()  # a trained full module (or full fine-tuning): A/B alone would leave it stale
     assert not vllm_utils.plain_lora(model) and vllm_utils._live_adapter(model) is None
-    model._unsloth_cpt_full_module_weight_keys, (_, wrapper) = set(), next(iter_mlx_lora_modules(model))
+    model.model.embed_tokens.freeze()
+    _, wrapper = next(iter_mlx_lora_modules(model))
     wrapper.__class__ = type("QATLoRALinear", (type(wrapper),), {})  # a subclass with its own forward, as QAT's
     assert not vllm_utils.plain_lora(model) and not vllm_utils.plain_lora(_tiny(0))
 
@@ -211,8 +213,10 @@ class _AdapterModel:
 def test_save_lora_writes_peft_and_replaces_an_earlier_save(tmp_path):
     model, target = _AdapterModel(), tmp_path / "grpo_saved_lora"
     vllm_utils.save_lora(model, target)
+    os.chmod(target / "adapter_model.safetensors", 0o600)  # a private adapter stays private when saved again
     vllm_utils.save_lora(model, target)
     assert (target / "adapter_model.safetensors").read_text() == (target / "adapter_config.json").read_text() == "2"
+    assert (target / "adapter_model.safetensors").stat().st_mode & 0o777 == 0o600
     assert sorted(os.listdir(tmp_path)) == ["grpo_saved_lora"]
     mlx_dir = tmp_path / "mlx"
     mlx_dir.mkdir()

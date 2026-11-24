@@ -300,15 +300,16 @@ def _serve_in_memory_loras(engine):
 
 
 def plain_lora(model):
-    """Whether vLLM's LoRA reproduces the trained policy: every adapter a plain ``LoRALinear`` and nothing else trained.
-    DoRA, QAT, MoE expert LoRA and trained full modules change the forward beyond A/B, so they keep MLX generation."""
+    """Whether vLLM's LoRA reproduces the trained policy: every adapter a plain ``LoRALinear`` and nothing but LoRA A/B
+    trainable. DoRA, QAT, MoE expert LoRA, trained full modules and full fine-tuning keep MLX generation."""
+    from mlx.utils import tree_flatten
     from mlx_lm.tuner.lora import LoRALinear
 
     from .utils import iter_mlx_lora_modules
 
     modules = list(iter_mlx_lora_modules(model))
-    full_modules = getattr(model, "_unsloth_full_state_modules", None) or getattr(model, "_unsloth_cpt_full_module_weight_keys", None)
-    return bool(modules) and not full_modules and all(type(m) is LoRALinear for _, m in modules)
+    trainable = (name.rsplit(".", 1)[-1] for name, _ in tree_flatten(model.trainable_parameters()))
+    return bool(modules) and all(type(m) is LoRALinear for _, m in modules) and all(n in ("lora_a", "lora_b") for n in trainable)
 
 
 def _live_adapter(model):
@@ -356,7 +357,10 @@ def save_lora(model, save_directory):
         staged = os.path.join(scratch, "peft")
         model.save_lora_adapters(staged, adapter_format="peft")
         os.makedirs(target, exist_ok=True)
+        from .utils import _inherit_target_permissions
+
         for name in os.listdir(staged):
+            _inherit_target_permissions(os.path.join(staged, name), os.path.join(target, name))
             os.replace(os.path.join(staged, name), os.path.join(target, name))
     finally:
         shutil.rmtree(scratch, ignore_errors=True)

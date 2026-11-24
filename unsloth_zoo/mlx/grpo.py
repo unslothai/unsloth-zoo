@@ -1327,10 +1327,11 @@ class GRPOBatchPlan:
             for row, prompt in enumerate(prompts)
         ]
         try:
-            outputs = self._model.vllm_engine.generate(
-                [{"prompt_token_ids": list(self._prompt_ids[prompt])} for prompt in prompts],
-                params, lora_request=request, use_tqdm=False,
-            )
+            with self._rollout_context():  # an in-process engine runs its MLX layers on this thread
+                outputs = self._model.vllm_engine.generate(
+                    [{"prompt_token_ids": list(self._prompt_ids[prompt])} for prompt in prompts],
+                    params, lora_request=request, use_tqdm=False,
+                )
         finally:
             release_lora(self._model, request)
         return [_VLLMRollout(output.outputs[0]) for output in outputs]
