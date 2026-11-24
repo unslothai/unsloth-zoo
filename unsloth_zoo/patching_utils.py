@@ -786,6 +786,20 @@ def patch_model_and_tokenizer(
 
             if hasattr(module, "compute_dtype"):
                 module.compute_dtype = setted_dtype
+        elif not do_forced_float32:
+            # Fused MoE expert stacks quantized in place (bare Params4bit, moe_utils_bnb4bit) dequantize to
+            # quant_state.dtype too. A pre-quantized checkpoint stores the dtype it was quantized in, so one
+            # made in bfloat16 would dequantize its experts in bfloat16 on a float16 GPU (T4: slower, more
+            # memory, and not the float16 weights a quantize-on-load gives). A quantize-on-load stack already
+            # has the load dtype here; forced float32 keeps the stacks as loaded.
+            setted_dtype = getattr(module, "_pre_set_compute_dtype", correct_dtype)
+            for param in module.parameters(recurse = False):
+                quant_state = getattr(param, "quant_state", None)
+                if quant_state is None or type(quant_state) is list:
+                    continue
+                if getattr(quant_state, "dtype", None) in (torch.float16, torch.bfloat16, torch.float32) \
+                    and setted_dtype in (torch.float16, torch.bfloat16, torch.float32):
+                    quant_state.dtype = setted_dtype
         pass
         # Downcast RoPE embedding to correct data type
         if downcast_rope and ((name.endswith("rotary_emb") or hasattr(module, "cos_cached"))):
