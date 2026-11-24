@@ -1542,6 +1542,41 @@ def push_to_hub_merged(self, repo_id, tokenizer = None, save_method = "merged_16
     return repo_id
 
 
+def _loaded_remote_code(*objects):
+    # A class from transformers_modules proves the load ran (and so approved) auto_map code.
+    seen, queue = set(), list(objects)
+    while queue and len(seen) < 16:
+        node = queue.pop(0)
+        if node is None or id(node) in seen:
+            continue
+        seen.add(id(node))
+        module = getattr(type(node), "__module__", None)
+        if isinstance(module, str) and module.startswith("transformers_modules"):
+            return True
+        for attr in ("base_model", "model", "tokenizer"):
+            queue.append(getattr(node, attr, None))
+    return False
+
+
+@contextlib.contextmanager
+def _converter_remote_code(approved):
+    """convert_hf_to_gguf.py loads several architectures' tokenizers with trust_remote_code=True. Transformers
+    imports auto_map code only from HF_MODULES_CACHE, so unless the load approved remote code that is pointed
+    at a path no directory can be created at, as the GPU export does."""
+    if approved:
+        yield
+        return
+    existing = os.environ.get("HF_MODULES_CACHE")
+    os.environ["HF_MODULES_CACHE"] = os.path.join(os.path.abspath(__file__), "no_remote_code")
+    try:
+        yield
+    finally:
+        if existing is None:
+            os.environ.pop("HF_MODULES_CACHE", None)
+        else:
+            os.environ["HF_MODULES_CACHE"] = existing
+
+
 def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_method = "q8_0", **kwargs):
     """Merge to 16-bit, then llama.cpp's converter (+ llama-quantize for k-quants). Returns the GGUF paths."""
     from unsloth_zoo.llama_cpp import install_llama_cpp, convert_to_gguf, quantize_gguf
@@ -1571,10 +1606,12 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
     direct = {"bf16", "f16", "q8_0", "f32"}
     # llama-quantize refuses to requantize from q8_0, so k-quants are made from a bf16 GGUF.
     first = "bf16" if len(methods) > 1 or any(m not in direct for m in methods) else methods[0]
-    outputs, _ = convert_to_gguf(
-        os.path.join(save_directory, base_name), merged_directory, model_dtype = "bf16",
-        quantization_type = first, converter_location = converter,
-    )
+    approved = getattr(self, "_unsloth_trust_remote_code", False) is True or _loaded_remote_code(self, tokenizer)
+    with _converter_remote_code(approved):
+        outputs, _ = convert_to_gguf(
+            os.path.join(save_directory, base_name), merged_directory, model_dtype = "bf16",
+            quantization_type = first, converter_location = converter,
+        )
     first_file = outputs[0]
     results = list(outputs)
     for method in methods:
@@ -1582,10 +1619,11 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
             continue
         if method in unrounded:
             # Straight from the unrounded staging checkpoint; llama-quantize would re-cast the bf16 GGUF.
-            direct_outputs, _ = convert_to_gguf(
-                os.path.join(save_directory, base_name), merged_directory, model_dtype = "bf16",
-                quantization_type = method, converter_location = converter,
-            )
+            with _converter_remote_code(approved):
+                direct_outputs, _ = convert_to_gguf(
+                    os.path.join(save_directory, base_name), merged_directory, model_dtype = "bf16",
+                    quantization_type = method, converter_location = converter,
+                )
             results.extend(direct_outputs)
             continue
         target = first_file.replace(f".{first.upper()}.gguf", f".{method.upper()}.gguf")
