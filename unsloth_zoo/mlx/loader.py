@@ -939,6 +939,104 @@ def _omlx_deepseek_v41_weights(weights):
     return weights
 
 
+_INKLING2_LOOP_INPUTS = ("attn", "k", "v", "mlp")  # omlx's row order in loop_down, loop_gain_forget and loop_message
+
+
+def _split_rows(out, prefix, tensors, sizes, names):
+    """Each tensor of one stacked projection (``{leaf: array}``) cut by rows into ``prefix + name`` per name."""
+    import mlx.core as mx
+
+    for leaf, value in tensors.items():
+        if sum(sizes) != value.shape[0]:
+            raise ValueError(f"Unsloth: {prefix}{names} stack {sizes} rows, but the checkpoint stores {value.shape[0]}")
+        cuts = [sum(sizes[: end]) for end in range(1, len(sizes))]
+        for name, part in zip(names, mx.split(value, cuts, axis = 0)):
+            out[f"{prefix}{name}.{leaf}"] = part
+
+
+def _omlx_inkling2_weights(weights):
+    """Inkling 2 oQ quants in omlx's runtime layout, back to the source checkpoint's names mlx-vlm's sanitize maps
+    (the inverse of omlx's ``patches/inkling2/loader.py``). Routed experts, the quantized embedding and head, and the
+    loop's message queries take mlx-vlm's own names: the source path renames only unpacked weights."""
+    if not any(key.startswith("model.layers.") for key in weights):
+        return weights
+    import mlx.core as mx
+    from mlx_vlm.models.inkling.inkling import _split_gate_up
+
+    out, layers, messages = {}, {}, {}
+    for key, value in weights.items():
+        if match := re.match(r"model\.layers\.(\d+)\.(.+)", key):
+            layers.setdefault(int(match[1]), {})[match[2]] = value
+        elif key.startswith("vision_tower."):
+            out["model.visual." + key.removeprefix("vision_tower.")] = value
+        elif key.startswith("model.embed."):
+            out["language_model.model.embed_tokens." + key.removeprefix("model.embed.")] = value
+        elif key.startswith("lm_head."):
+            out["language_model." + key] = value
+        elif key == "model.final_input.query":
+            out["model.llm.attn_res.output_query"] = value.reshape(-1)
+        else:
+            out[re.sub(r"^model\.", "model.llm.", key)] = value
+    for idx, d in layers.items():
+        source = f"model.llm.layers.{idx}."
+        stack = lambda name: {key.removeprefix(name + "."): d.pop(key) for key in [key for key in d if key.startswith(name + ".")]}
+        heads, head_dim = d["attn.q_scale"].shape
+        q, r = heads * head_dim, d["attn.r_scale"].size
+        if "attn.in_proj.weight" in d:  # sliding layers stack q, k, v, r, the output gate and the sink
+            kv = d["attn.k_conv"].shape[0]
+            _split_rows(out, source + "attn.", stack("attn.in_proj"), (q, kv, kv, r, q, heads),
+                        ("wq_du", "wk_dv", "wv_dv", "wr_du", "gate_attn", "attn_sink_proj"))
+            for name in ("k", "v"):
+                conv = d.pop(f"attn.{name}_conv")
+                out[f"{source}attn.{name}_sconv.weight"] = conv.reshape(conv.shape[0], 1, -1)
+        else:  # global layers stack q, r, the gate and the sink, and each of k, v with its dynamic convolution's projection
+            _split_rows(out, source + "attn.", stack("attn.q_proj"), (q, r, q, heads), ("wq_du", "wr_du", "gate_attn", "attn_sink_proj"))
+            for name in ("k", "v"):
+                static = out[f"{source}attn.{name}_sconv.static_w"] = d.pop(f"attn.{name}_static")
+                fused = stack(f"attn.{name}_proj")
+                kv = static.shape[1]
+                _split_rows(out, source + "attn.", fused, (kv, fused["weight"].shape[0] - kv), (f"w{name}_dv", f"{name}_sconv.weight_proj"))
+        for name in ("attn_conv", "mlp_conv"):
+            conv = d.pop(name)
+            out[f"{source}{name.replace('_conv', '_sconv')}.weight"] = conv.reshape(conv.shape[0], 1, -1)
+        for leaf, value in stack("attn.o_proj").items():
+            out[f"{source}attn.wo_ud.{leaf}"] = value
+        base = f"language_model.model.layers.{idx}.mlp.switch_mlp."
+        for fused, projections in (("w13", ("gate_proj", "up_proj")), ("w2", ("down_proj",))):
+            tensors = stack(f"mlp.experts.{fused}")
+            outer = tensors.pop("global_scale", None)
+            for leaf, value in tensors.items():
+                for projection, part in zip(projections, _split_gate_up(value) if len(projections) == 2 else (value,)):
+                    out[base + f"{projection}.{leaf}"] = part
+            for projection in projections if outer is not None else ():
+                out[base + f"{projection}.weight_scale_2"] = outer / (6 * 448)  # omlx keeps the amax, over E2M1 x E4M3 max
+        if "loop_down" in d:
+            down, gates = d.pop("loop_down"), d.pop("loop_gain_forget")  # [4, 2, H, rank], [4, rank, 2H]
+            hidden = down.shape[2]
+            for i, name in enumerate(_INKLING2_LOOP_INPUTS):
+                out[f"{source}controllers.{name}.down_weight"] = down[i].transpose(2, 0, 1).reshape(down.shape[3], -1)
+                out[f"{source}controllers.{name}.gain_weight"] = gates[i][:, :hidden].T
+                out[f"{source}controllers.{name}.forget_weight"] = gates[i][:, hidden:].T
+        if "loop_message.query" in d:
+            messages[idx] = d.pop("loop_message.query")
+        for name, renamed in (("attn_input.query", f"attn_res.attn_queries.{idx - 1}"), ("mlp_input.query", f"attn_res.mlp_queries.{idx}")):
+            if name in d:
+                query = d.pop(name)
+                out["model.llm." + renamed] = query[0] if query.shape[0] == 1 else query
+        renames = {"attn.q_scale": "attn.q_l2_clip.scale", "attn.r_scale": "attn.rel_l2_clip.scale",
+                   "attn.rel_proj": "attn.rel_logits_proj.proj", "mlp.router_weight": "mlp.gate.weight", "mlp.router_bias": "mlp.gate.bias"}
+        out.update((source + renames.get(key, key), value) for key, value in d.items())
+    if messages:
+        out["language_model.model.message_queries"] = mx.stack([messages[idx] for idx in sorted(messages)])
+    return out
+
+
+def _inkling2_model():
+    from mlx_vlm.models.inkling2.inkling2 import Model
+
+    return Model
+
+
 def _deepseek_v41_model():
     from mlx_vlm.models.deepseek_v41.deepseek_v41 import Model
 
@@ -955,6 +1053,8 @@ def _glm5_next_model():
 _OMLX_LAYOUTS = {
     "deepseek_v41": (_deepseek_v41_model, _omlx_deepseek_v41_weights),
     "glm5_next": (_glm5_next_model, _omlx_glm5_next_weights),
+    "inkling2": (_inkling2_model, _omlx_inkling2_weights),
+    "inkling2_loop": (_inkling2_model, _omlx_inkling2_weights),
 }
 
 

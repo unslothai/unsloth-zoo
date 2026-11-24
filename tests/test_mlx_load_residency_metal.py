@@ -254,6 +254,104 @@ def test_a_glm5_next_oq_quant_loads_as_its_model(tmp_path, monkeypatch):
         assert value.dtype == params[key].dtype and mx.array_equal(value, params[key]), key
 
 
+@pytest.mark.parametrize("model_type", ["inkling2", "inkling2_loop"])
+def test_an_inkling2_oq_quant_loads_as_mlx_vlms_own_layout(tmp_path, monkeypatch, model_type):
+    ink = pytest.importorskip("mlx_vlm.models.inkling2.inkling2")
+    import mlx_vlm.utils as vlm_utils
+    from mlx_vlm.models.inkling2.config import ModelConfig
+    from unsloth_zoo.mlx.loader import _ensure_omlx_layout, _ensure_vlm_checkpoint_quantization
+
+    monkeypatch.setattr(ink.Model, "sanitize", ink.Model.sanitize)
+    for name in ("load_model_weights", "replace_scaled_quantized_linears"):
+        monkeypatch.setattr(vlm_utils, name, getattr(vlm_utils, name))
+    loop = {"loop_config": {"core_start": 2, "core_end": 4, "num_passes": 2, "gate_rank": 8, "is_varloop": False}} if model_type == "inkling2_loop" else {}
+    text = dict(model_type = f"{model_type}_text", vocab_size = 256, hidden_size = 128, num_hidden_layers = 6, num_attention_heads = 4,
+                num_key_value_heads = 2, head_dim = 32, swa_num_attention_heads = 4, swa_num_key_value_heads = 2, swa_head_dim = 32,
+                sliding_window_size = 8, local_layer_ids = [0, 1, 3, 4], d_rel = 4, rel_extent = 8, sconv_kernel_size = 4,
+                intermediate_size = 64, n_routed_experts = 4, num_experts_per_tok = 2, n_layers_per_attn_res_block = 2, **loop)
+    vision = dict(hidden_size = 64, num_hidden_layers = 1, num_attention_heads = 2, projection_hidden_dim = 64, text_hidden_size = 128)
+    config = {"model_type": model_type, "text_config": text, "vision_config": vision}
+    model = ink.Model(ModelConfig.from_dict(json.loads(json.dumps(config))))
+    if loop and "message_queries" not in model.language_model.model:
+        pytest.skip("this mlx-vlm has no Inkling 2 Loop")
+    mx.random.seed(0)
+    model.update(tree_map(lambda value: mx.random.normal(value.shape) * 0.05, model.parameters()))
+    eight, nvfp4 = {"group_size": 64, "bits": 8, "mode": "affine"}, {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    nn.quantize(model, class_predicate = lambda path, module: hasattr(module, "to_quantized") and not path.startswith("vision") and (
+        (nvfp4 if ".layers.1." in path else {"group_size": 64, "bits": 4, "mode": "affine"}) if ".switch_mlp." in path
+        else eight if ".self_attn." in path or path.endswith(("embed_tokens", "lm_head")) else False))
+    params = dict(tree_flatten(model.parameters()))
+    experts = "language_model.model.layers.1.mlp.switch_mlp."
+    for projection, scale in (("gate_proj", 0.5), ("up_proj", 0.5), ("down_proj", 2.0)):  # gate and up share w13's outer scale
+        params[f"{experts}{projection}.weight_scale_2"] = mx.array([scale, 1.0, 4.0, 0.25])
+
+    # The layout omlx writes (the forward map of its patches/inkling2/loader.py), from mlx-vlm's names.
+    stored, hidden = {}, 128
+    get = lambda key: params.pop(key)
+    leaves = lambda prefix: [leaf for leaf in ("weight", "scales", "biases") if f"{prefix}.{leaf}" in params]
+    for i in range(6):
+        src, dst = f"language_model.model.layers.{i}.", f"model.layers.{i}."
+        attn = src + "self_attn."
+        stack = lambda target, parts: stored.update(
+            {f"{dst}attn.{target}.{leaf}": mx.concatenate([get(f"{attn}{part}.{leaf}") for part in parts]) for leaf in leaves(attn + parts[0])})
+        if i in text["local_layer_ids"]:
+            stack("in_proj", ["q_proj", "k_proj", "v_proj", "r_proj", "gate_proj", "sink_proj"])
+            for name in ("k", "v"):
+                stored[f"{dst}attn.{name}_conv"] = get(f"{attn}{name}_sconv.conv.weight").reshape(-1, 4)
+        else:
+            stack("q_proj", ["q_proj", "r_proj", "gate_proj", "sink_proj"])
+            for name in ("k", "v"):
+                stack(f"{name}_proj", [f"{name}_proj", f"{name}_sconv.weight_proj"])
+                stored[f"{dst}attn.{name}_static"] = get(f"{attn}{name}_sconv.static_weight")
+        for name in ("attn", "mlp"):
+            stored[f"{dst}{name}_conv"] = get(f"{src}{name}_sconv.conv.weight").reshape(-1, 4)
+        for gate_up in leaves(f"{src}mlp.switch_mlp.gate_proj"):
+            gate, up = get(f"{src}mlp.switch_mlp.gate_proj.{gate_up}"), get(f"{src}mlp.switch_mlp.up_proj.{gate_up}")
+            stored[f"{dst}mlp.experts.w13.{gate_up}"] = mx.stack([gate, up], axis = -2).reshape(4, -1, gate.shape[-1])
+            stored[f"{dst}mlp.experts.w2.{gate_up}"] = get(f"{src}mlp.switch_mlp.down_proj.{gate_up}")
+        if i == 1:
+            stored[f"{dst}mlp.experts.w13.global_scale"] = params[f"{experts}gate_proj.weight_scale_2"] * 2688
+            stored[f"{dst}mlp.experts.w2.global_scale"] = params[f"{experts}down_proj.weight_scale_2"] * 2688
+        if f"{src}controllers.attn.down_weight" in params:
+            controllers = [[get(f"{src}controllers.{name}.{part}_weight") for part in ("down", "gain", "forget")] for name in ("attn", "k", "v", "mlp")]
+            stored[dst + "loop_down"] = mx.stack([down.reshape(8, 2, hidden).transpose(1, 2, 0) for down, _, _ in controllers])
+            stored[dst + "loop_gain_forget"] = mx.stack([mx.concatenate([gain.T, forget.T], axis = 1) for _, gain, forget in controllers])
+            stored[dst + "loop_message.query"] = params["language_model.model.message_queries"][i - 2]
+        renames = {"q_input_layernorm": "q_input_norm", "k_input_layernorm": "k_input_norm", "v_input_layernorm": "v_input_norm",
+                   "input_layernorm": "attn_norm", "post_attention_layernorm": "mlp_norm", "self_attn.": "attn.", "attention_input": "attn_input",
+                   "mlp.gate_weight": "mlp.router_weight", "mlp.e_score_correction_bias": "mlp.router_bias", "rel_scale": "r_scale"}
+        for key in [key for key in params if key.startswith(src) and ".switch_mlp." not in key]:
+            name = key.removeprefix(src)
+            for old, new in renames.items():
+                name = name.replace(old, new)
+            value = get(key)
+            stored[dst + name] = value.reshape(-1, hidden) if name.endswith(".query") else value
+    vision = {"pre_layernorm": "ln_pre", "layernorm_before": "ln_1", "layernorm_after": "ln_2", "lambda_1": "ls_1.gamma",
+              "lambda_2": "ls_2.gamma", "mlp.fc1": "mlp.c_fc", "mlp.fc2": "mlp.c_proj"}
+    for key in [key for key in params if not key.startswith("language_model.model.layers.") or ".switch_mlp." in key]:
+        if key.startswith("vision_tower."):
+            name = key.removeprefix("vision_tower.")
+            for old, new in vision.items():
+                name = name.replace(old, new)
+            stored["vision_tower." + ("" if name.startswith("proj_") else "backbone.") + name] = params[key]
+        elif not key.startswith(("language_model.model.layers.", "language_model.model.message_queries")):
+            name = key.replace("language_model.model.embed_tokens.", "model.embed.").replace("language_model.model.", "model.")
+            stored[name.removeprefix("language_model.")] = params[key].reshape(1, -1) if key.endswith("final_input.query") else params[key]
+    params = dict(tree_flatten(model.parameters())) | {key: value for key, value in params.items() if key.endswith("weight_scale_2")}
+
+    _ensure_vlm_checkpoint_quantization()
+    _ensure_omlx_layout(model_type)
+    loaded = {}
+    for layout, weights in (("mlx-vlm", params), ("omlx", stored)):
+        (tmp_path / layout).mkdir()
+        mx.save_safetensors(str(tmp_path / layout / "model.safetensors"), weights)
+        (tmp_path / layout / "config.json").write_text(json.dumps({**config, "quantization": {"group_size": 64, "bits": 4, "mode": "affine"}}))
+        loaded[layout] = dict(tree_flatten(vlm_utils.load_model(tmp_path / layout).parameters()))
+    assert len(stored) < len(params) and loaded["omlx"].keys() == loaded["mlx-vlm"].keys() >= params.keys() - {f"{experts}gate_proj.weight_scale_2"}
+    for key, value in loaded["mlx-vlm"].items():
+        assert value.dtype == loaded["omlx"][key].dtype and mx.array_equal(value, loaded["omlx"][key]), key
+
+
 def test_a_mixed_fp_checkpoint_with_a_scaled_embedding_loads_as_packed(tmp_path, monkeypatch):
     qwen2_vl = pytest.importorskip("mlx_vlm.models.qwen2_vl")
     import mlx_vlm.utils as vlm_utils
