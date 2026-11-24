@@ -1544,12 +1544,15 @@ def process_vision_info(
 def get_padding_tokens_ids(tokenizer):
     global IMAGE_TOKENS, AUDIO_TOKENS
 
+    # Some processors (Inkling 2: <|unused_200054|>) keep the placeholder on the processor only.
+    processor = tokenizer
     tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
     placeholder_tokens = IMAGE_TOKENS + AUDIO_TOKENS
-    if hasattr(tokenizer, "image_token"):
-        placeholder_tokens = placeholder_tokens + [tokenizer.image_token]
-    if hasattr(tokenizer, "audio_token"):
-        placeholder_tokens = placeholder_tokens + [tokenizer.audio_token]
+    for owner in (tokenizer, processor):
+        for name in ("image_token", "audio_token"):
+            token = getattr(owner, name, None)
+            if isinstance(token, str) and token and token not in placeholder_tokens:
+                placeholder_tokens = placeholder_tokens + [token]
 
     padding_token_ids = tokenizer.convert_tokens_to_ids(placeholder_tokens)
     # Tokens missing from this tokenizer map to the unk id, so unk is not masked from loss (mirrors mlx/utils.py); pad_token_id is added separately below.
