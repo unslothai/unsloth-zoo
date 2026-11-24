@@ -1020,6 +1020,29 @@ def test_torch_free_image_processor_lookup_resolves_mis_tagged_pil_class(monkeyp
     assert lookup("Missing") is None
 
 
+def test_torch_free_image_processor_lookup_ignores_lazy_placeholder_attribute(monkeypatch):
+    import transformers.models.auto as auto_package
+    from transformers.models.auto import image_processing_auto
+    from transformers.utils.import_utils import DummyObject
+
+    from unsloth_zoo.mlx.loader import _patch_torch_free_image_processor_lookup
+
+    # Torch-free, the package attribute is a placeholder until the real submodule is imported.
+    class Placeholder(metaclass=DummyObject):
+        _backends = ["torch", "torchvision"]
+
+    monkeypatch.setattr(auto_package, "image_processing_auto", Placeholder)
+    monkeypatch.setattr(
+        image_processing_auto,
+        "get_image_processor_class_from_name",
+        image_processing_auto.get_image_processor_class_from_name,
+    )
+
+    _patch_torch_free_image_processor_lookup()
+
+    assert image_processing_auto.get_image_processor_class_from_name._unsloth_torch_free
+
+
 def test_deepseek_rendering_repairs_missing_image_token():
     from unsloth_zoo.mlx.utils import _render_vlm_messages
 

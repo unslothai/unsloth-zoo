@@ -1105,7 +1105,7 @@ def _patch_deepseek_ocr_transformers_import_compat(model_type):
         ):
             modeling_llama.LlamaFlashAttention2 = modeling_llama.LlamaAttention
     except ImportError:
-        # Without torch, modeling_llama is a placeholder whose attributes raise ImportError, not AttributeError.
+        # Torch-free placeholder: attribute access raises ImportError, which hasattr does not catch.
         pass
     try:
         from transformers.utils import import_utils
@@ -1116,15 +1116,15 @@ def _patch_deepseek_ocr_transformers_import_compat(model_type):
 
 
 def _patch_torch_free_image_processor_lookup():
-    """Transformers 5 tags some PIL image processors (Idefics2, Idefics3, SmolVLM) as needing torch and torchvision,
-    which they never import, so a torch-free install resolves them to a placeholder and AutoImageProcessor rejects the
-    checkpoint; resolve such a placeholder from the module that defines it."""
+    """Transformers 5.x (< 5.14) tags the Idefics2/3 and SmolVLM PIL image processors as needing torch, so torch-free
+    installs get a placeholder; resolve it from the module that defines the class."""
     try:
-        from transformers.models.auto import image_processing_auto
+        # Not `from transformers.models.auto import ...`: before anything imports it, that yields a torch-free placeholder.
+        image_processing_auto = importlib.import_module("transformers.models.auto.image_processing_auto")
         from transformers.utils.import_utils import DummyObject
+        lookup = image_processing_auto.get_image_processor_class_from_name
     except Exception:
         return
-    lookup = image_processing_auto.get_image_processor_class_from_name
     if getattr(lookup, "_unsloth_torch_free", False):
         return
     names = vars(image_processing_auto).get("IMAGE_PROCESSOR_MAPPING_NAMES") or {}
