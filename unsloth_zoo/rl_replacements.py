@@ -1149,7 +1149,11 @@ pass
 RL_REPLACEMENTS["create_completion_attention_mask"] = create_completion_attention_mask
 
 
-def grpo_pad_is_eos_rows(trainer, completion_ids: torch.Tensor) -> Optional[torch.Tensor]:
+def grpo_pad_is_eos_rows(
+    trainer,
+    completion_ids: torch.Tensor,
+    completion_mask: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
     """Rows whose completion ended in an EOS that shares the pad id, or None when the pad id is no EOS id.
 
     TRL keeps the first EOS of each completion in completion_mask and pads after it with the pad id.
@@ -1158,6 +1162,9 @@ def grpo_pad_is_eos_rows(trainer, completion_ids: torch.Tensor) -> Optional[torc
     completion_ids is the right-padded completion section before left packing. Only the
     tokenizer EOS and TRL's eos_token_ids (TRL >= 1.x also stops on generation_config EOS ids)
     count, matching TRL's own completion_mask.
+    completion_mask (TRL's, same shape) limits the search to sampled tokens: a completion that stopped
+    without an EOS (a stop string, a tool turn) is right padded with the pad id too, and that padding
+    is no EOS. Without it every pad-id token counts.
     """
     processing_class = getattr(trainer, "processing_class", None)
     pad_token_id = getattr(processing_class, "pad_token_id", None)
@@ -1179,6 +1186,8 @@ def grpo_pad_is_eos_rows(trainer, completion_ids: torch.Tensor) -> Optional[torc
     # Only the first EOS-set token terminates the row: a completion that stopped on another EOS id
     # is right padded with the pad id, and that padding must not read as a second EOS target.
     is_eos = torch.isin(completion_ids, torch.tensor(sorted(eos_ids), device = completion_ids.device))
+    if torch.is_tensor(completion_mask) and completion_mask.shape == completion_ids.shape:
+        is_eos = is_eos & completion_mask.to(device = completion_ids.device, dtype = torch.bool)
     first_eos = is_eos.int().argmax(dim = 1, keepdim = True)
     return is_eos.any(dim = 1) & (completion_ids.gather(1, first_eos).squeeze(1) == pad_token_id)
 pass
@@ -3898,7 +3907,8 @@ def grpo_accumulated_loss(
 
             # pad == eos: the rows whose real EOS shares the pad id (None otherwise, no change).
             from unsloth_zoo.rl_replacements import grpo_pad_is_eos_rows
-            pad_eos_rows = grpo_pad_is_eos_rows(trainer, input_ids[:, -logits_to_keep:])
+            # TRL's completion_mask (still the incoming one here) tells the EOS from pad-id padding.
+            pad_eos_rows = grpo_pad_is_eos_rows(trainer, input_ids[:, -logits_to_keep:], completion_mask = completion_mask)
             # Unsloth's old / ref log-prob path must have scored the EOS slot too (its packed path
             # skips pad-id tokens); without that promise keep today's mask rather than mix in a 0 logp.
             # Old logps this function stored from a pass that kept the EOS carry their own mark.

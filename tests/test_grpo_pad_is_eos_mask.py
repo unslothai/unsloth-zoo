@@ -74,7 +74,7 @@ def _batch(pad):
 
 
 def _loss_mask(monkeypatch, input_ids, pad, ref_logps = None, eos_ids = EOS, old_logps = None,
-               loss_kwargs = (), trainer_out = None, **trainer_attrs):
+               loss_kwargs = (), trainer_out = None, completion_mask = None, **trainer_attrs):
     seen = {}
 
     class _Loss:
@@ -86,7 +86,8 @@ def _loss_mask(monkeypatch, input_ids, pad, ref_logps = None, eos_ids = EOS, old
 
     monkeypatch.setattr(_rl, "UnslothEfficientGRPO", _Loss)
     keep = input_ids.shape[1] - PROMPT_LEN
-    completion_mask = _trl_completion_mask(input_ids[:, PROMPT_LEN:], eos_ids)
+    if completion_mask is None:
+        completion_mask = _trl_completion_mask(input_ids[:, PROMPT_LEN:], eos_ids)
     attention_mask = torch.cat([(input_ids[:, :PROMPT_LEN] != pad).long(), completion_mask], dim = 1)
     trainer = types.SimpleNamespace(
         args = types.SimpleNamespace(unsloth_grpo_mini_batch = 2, unsloth_logit_chunk_multiplier = 1),
@@ -187,6 +188,22 @@ def test_other_eos_terminator_with_pad_id_padding_gets_no_extra_slot(monkeypatch
     # [1, 8, 9, 9] -> [1, 1, 0, 0], as TRL's completion_mask; [1, 9, 9, 9] keeps its EOS.
     assert completion_mask.int().tolist()[0] == [1, 1, 0, 0]
     assert _per_row_kept(mask) == completion_mask.sum(dim = 1).tolist() == [2, 2, 1, 4]
+
+
+def test_right_padding_after_a_completion_without_eos_stays_out(monkeypatch):
+    # A completion that stopped without an EOS (a stop string) is right padded with the pad id too.
+    # TRL's completion_mask (from the sampled lengths) leaves that padding out; so must the loss.
+    ids = _batch(EOS)
+    ids[1, PROMPT_LEN:] = torch.tensor([5, 6, EOS, EOS, EOS])
+    completion_mask = _trl_completion_mask(ids[:, PROMPT_LEN:], EOS)
+    completion_mask[1] = torch.tensor([1, 1, 0, 0, 0])
+    trainer = types.SimpleNamespace(processing_class = types.SimpleNamespace(pad_token_id = EOS, eos_token_id = EOS))
+    assert _rl.grpo_pad_is_eos_rows(trainer, ids[:, PROMPT_LEN:]).tolist() == [True, True, False, True]
+    assert _rl.grpo_pad_is_eos_rows(
+        trainer, ids[:, PROMPT_LEN:], completion_mask = completion_mask,
+    ).tolist() == [True, False, False, True]
+    mask, trl = _loss_mask(monkeypatch, ids, EOS, completion_mask = completion_mask)
+    assert _per_row_kept(mask) == _per_row_kept(trl) == [3, 2, 5, 1]
 
 
 def test_ref_logps_without_eos_coverage_keep_the_old_mask(monkeypatch):
