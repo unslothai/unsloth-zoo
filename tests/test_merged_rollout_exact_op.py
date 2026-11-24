@@ -198,7 +198,7 @@ def test_failed_coalesce_leaves_a_consistent_arena():
 def run_hip_escapes_per_target(device):
     # ROCm restores each target's escapes on its own (one launch cannot address other allocations there).
     ws, As, Bs, before = _lists(device, 3, seed = 95, scale = 1)
-    with mock.patch.object(torch.version, "hip", "7.0"), mock.patch.object(ex, "_apply_escapes", wraps = ex._apply_escapes) as per:
+    with mock.patch.object(torch.version, "hip", "7.0"), mock.patch.object(ex, "_escape_slice", wraps = ex._escape_slice) as per:
         ex.fold_weights_(ws, As, Bs, [0.5] * 3, [841, 842, 843])
         ex.unfold_weights_(ws, As, Bs, [0.5] * 3, [841, 842, 843])
     _restored(ws, before)
@@ -437,11 +437,11 @@ def run_unfold_failure_keeps_keys(device):
 
 
 def run_partial_unfold_is_not_retried(device):
-    # An unfold that raises after its inverse kernels ran (escape restore OOM) must drop its keys: a retry would
+    # An unfold that raises after its inverse kernels ran (escape launch failure) must drop its keys: a retry would
     # subtract the adapter a second time.
     ws, As, Bs, before = _lists(device, 2, seed = 80)
     ex.fold_weights_(ws, As, Bs, [0.5, 0.5], [821, 822])
-    with mock.patch.object(ex, "_restore_escapes", side_effect = torch.OutOfMemoryError("out of memory")):
+    with mock.patch.object(ex, "_write_escape_table", side_effect = torch.OutOfMemoryError("out of memory")):
         with pytest.raises(torch.OutOfMemoryError):
             ex.unfold_weights_(ws, As, Bs, [0.5, 0.5], [821, 822])
     after = [_bits(w).clone() for w in ws]
