@@ -34,6 +34,7 @@ __all__ = [
     "inkling2_residual_eager_unless_decode",
     "inkling2_block_residual_reference",
     "inkling2_block_residual_op",
+    "patch_hybrid_sliding_generate_masks",
 ]
 
 # Training dequantizes a frozen 4-bit expert stack per projection call: a whole Mini gate_up stack is 1.27 GiB, a
@@ -266,3 +267,29 @@ def inkling2_residual_eager_unless_decode(func):
         return disabled(self, *args, **kwargs)
     forward._unsloth_undisabled = plain
     return forward
+
+
+def patch_hybrid_sliding_generate_masks():
+    """generate prebuilds the attention masks for a compileable cache (StaticCache) from the layer pattern table, which
+    in transformers 5.24 gives the sliding side of "hybrid_sliding" layers (inkling, inkling2, inkling2_loop, zaya) a
+    full causal mask. Those models build a sliding window mask in their own forward, and the full one is sized to the
+    whole static buffer while the sliding layers return window bounded states, so a prefill longer than the window
+    fails with a size mismatch. Point that entry at the sliding window mask, as the models do; a no-op where
+    transformers already maps it so."""
+    try:
+        import transformers.masking_utils as masking_utils
+    except Exception:
+        return
+    mapping = getattr(masking_utils, "LAYER_PATTERN_TO_MASK_FUNCTION_MAPPING", None)
+    entry = mapping.get("hybrid_sliding") if isinstance(mapping, dict) else None
+    causal = getattr(masking_utils, "create_causal_mask", None)
+    sliding = getattr(masking_utils, "create_sliding_window_causal_mask", None)
+    if not isinstance(entry, dict) or causal is None or sliding is None:
+        return
+    if entry.get("sliding_attention") is causal:
+        entry["sliding_attention"] = sliding
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info("Unsloth: hybrid_sliding layers get a sliding window mask in generate.")
+
+
+TEMPORARY_PATCHES.append(patch_hybrid_sliding_generate_masks)
