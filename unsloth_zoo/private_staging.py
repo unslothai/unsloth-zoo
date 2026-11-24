@@ -101,8 +101,12 @@ def copy_keep_mode(src, dst, *, follow_symlinks = True):
     created = False
     if existing is None and os.name != "nt" and (follow_symlinks or not os.path.islink(src)):
         try:
-            os.close(os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600))
+            fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
             created = True
+            try:
+                os.fchmod(fd, 0o600)  # owner-writable even under a umask like 0222, so copyfile can reopen it
+            finally:
+                os.close(fd)
         except OSError:
             pass
     try:

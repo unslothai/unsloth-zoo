@@ -129,3 +129,18 @@ def test_symlink_copied_as_link(tmp_path, umask022):
     os.symlink("target.txt", tmp_path / "link.txt")
     staging.copy_keep_mode(str(tmp_path / "link.txt"), str(tmp_path / "copy.txt"), follow_symlinks = False)
     assert os.path.islink(tmp_path / "copy.txt")
+
+
+@pytest.mark.skipif(os.name != "posix" or (hasattr(os, "geteuid") and os.geteuid() == 0), reason = "POSIX modes, non-root")
+def test_first_copy_works_under_a_umask_without_owner_write(tmp_path):
+    from unsloth_zoo.private_staging import copy_keep_mode
+    src = tmp_path / "src.bin"
+    src.write_bytes(b"weights")
+    dst = tmp_path / "dst.bin"
+    old = os.umask(0o222)
+    try:
+        copy_keep_mode(str(src), str(dst))
+    finally:
+        os.umask(old)
+    assert dst.read_bytes() == b"weights"
+    assert stat.S_IMODE(os.stat(dst).st_mode) == 0o444
