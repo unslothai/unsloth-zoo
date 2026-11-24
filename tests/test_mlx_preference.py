@@ -5162,6 +5162,8 @@ def test_grpo_plan_samples_through_the_vllm_engine_with_the_live_adapter(monkeyp
     (True, True, False, True),  # an engine samples GRPO without use_vllm, as on CUDA
     (True, False, False, False),  # full fine-tuning, DoRA, QAT, expert LoRA or full modules sample on MLX
     (False, True, False, False),
+    ("copy", True, True, "loaded its own copy"),  # an engine on its own weights samples from another base
+    ("copy", True, False, False),
 ])
 def test_grpo_samples_through_a_vllm_engine_only_with_lora(tmp_path, monkeypatch, engine, adapted, use_vllm, outcome):
     from unsloth_zoo.mlx import vllm_utils
@@ -5170,7 +5172,7 @@ def test_grpo_samples_through_a_vllm_engine_only_with_lora(tmp_path, monkeypatch
     monkeypatch.setattr(vllm_utils, "plain_lora", lambda model: adapted)
     model = _tiny_model()
     if engine:
-        model.vllm_engine = object()
+        model.vllm_engine, model._unsloth_vllm_shared = object(), engine is True
 
     def build():
         return MLXGRPOTrainer(model, DecodingTokenizer(), _grpo_rows(), args=_grpo_config(tmp_path, compile=False, use_vllm=use_vllm),
@@ -5197,7 +5199,7 @@ def test_grpo_trains_and_evaluates_through_the_vllm_engine(tmp_path, monkeypatch
     monkeypatch.setattr(grpo_module.GRPOBatchPlan, "_generate_vllm", fake_vllm)
     monkeypatch.setattr(vllm_utils, "plain_lora", lambda model: True)  # the stand-in LoRA module is not mlx-lm's LoRALinear
     model, calls = _tiny_model(lora=True), []
-    model.vllm_engine = object()
+    model.vllm_engine, model._unsloth_vllm_shared = object(), True
     trainer = MLXGRPOTrainer(model, DecodingTokenizer(), _grpo_rows(), eval_dataset=_grpo_rows(2),
                              reward_funcs=lambda completions, **_: [0.0] * len(completions),
                              args=_grpo_config(tmp_path, max_steps=2, eval_steps=2, per_device_eval_batch_size=4))

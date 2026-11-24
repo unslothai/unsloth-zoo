@@ -181,13 +181,15 @@ def _in_process_engine_loads(model):
     from .utils import exempt_from_gradient_checkpointing
 
     original, original_vlm = lifecycle.mlx_lm_load_model, lifecycle.mlx_vlm_load_model
+    outcomes = []
 
     def shared(load_engine, lazy):
         # Lazy, so the checkpoint's arrays are never read when the training model's replace them. This has to
         # happen inside the load: the runner compiles blocks over the weights it holds right after it.
         engine_model, *rest = load_engine(True)
         source = _counterpart(engine_model, model)
-        if not _share_weights(_quantize_like(engine_model, source), source):
+        outcomes.append(_share_weights(_quantize_like(engine_model, source), source))
+        if not outcomes[-1]:
             engine_model, *rest = load_engine(lazy)
             if _training_dtype(model) is not None:  # load_vllm gives vLLM this dtype for the KV cache
                 from .loader import _convert_mlx_dtype
@@ -215,6 +217,8 @@ def _in_process_engine_loads(model):
         Gemma4VisionSidecar.load = classmethod(load_sidecar)
     try:
         yield
+        # Only an engine holding the training arrays samples from the base being trained (see the GRPO trainer).
+        model._unsloth_vllm_shared = bool(outcomes) and all(outcomes)
     finally:
         lifecycle.mlx_lm_load_model, lifecycle.mlx_vlm_load_model = original, original_vlm
         if Gemma4VisionSidecar is not None:
@@ -241,6 +245,7 @@ def load_vllm(model, *, max_seq_length, gpu_memory_utilization=0.5, max_lora_ran
     )
     if enable_lora:
         engine_kwargs.update(enable_lora=True, max_lora_rank=int(max_lora_rank), max_loras=1)
+    model._unsloth_vllm_shared = False  # until this engine's in-process loads share every weight
     if os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] != "0":
         return LLM(**engine_kwargs)
     dtype = _training_dtype(model)

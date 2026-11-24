@@ -10064,11 +10064,13 @@ class MLXGRPOTrainer(MLXTrainer):
                 f"{len(self.reward_funcs)} reward functions."
             )
         # A model with a vLLM engine samples through it, as on CUDA. The engine keeps the loaded weights, so only
-        # plain LoRA training, whose adapter it loads each generation, can use it.
+        # plain LoRA training, whose adapter it loads each generation, on an engine that shares the training model's
+        # weights (the same base) can use it.
         from . import vllm_utils
 
         engine = getattr(self.model, "vllm_engine", None)
         adapted = vllm_utils.plain_lora(self.model)
+        shared = getattr(self.model, "_unsloth_vllm_shared", False)
         if args.use_vllm and engine is None:
             raise ValueError(
                 "Unsloth MLX GRPO: use_vllm samples with the vLLM engine that "
@@ -10080,7 +10082,13 @@ class MLXGRPOTrainer(MLXTrainer):
                 "applies only LoRA A/B, so full fine-tuning, DoRA, QAT, MoE expert LoRA and trained full modules "
                 "sample on MLX."
             )
-        self._grpo_vllm = engine is not None and adapted
+        if args.use_vllm and not shared:
+            raise ValueError(
+                "Unsloth MLX GRPO: use_vllm needs an in-process vLLM engine that shares the training model's weights; "
+                "this one loaded its own copy (a multiprocess engine, or a layout it could not match), so its base "
+                "differs from the one being trained and GRPO samples on MLX."
+            )
+        self._grpo_vllm = engine is not None and adapted and shared
         max_tokens = grpo_sampling(args).max_tokens
         if max_tokens >= args.max_seq_length:
             raise ValueError(

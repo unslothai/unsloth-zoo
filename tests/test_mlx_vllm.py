@@ -139,7 +139,7 @@ def test_an_in_process_engine_shares_only_matching_weights(monkeypatch, width, d
     engine_model = lambda: (e := _tiny(1), quant and quant[4] not in (None, "lora") and nn.quantize(e, *quant[:2], mode=quant[4]))[0]  # a checkpoint already quantized otherwise
     life = types.SimpleNamespace(mlx_lm_load_model=lambda path, lazy=False: (calls.append(lazy), (engine_model(), {}))[1], mlx_vlm_load_model=lambda path, lazy=False: (calls.append(lazy), engine_model())[1])
     Sidecar = type("Sidecar", (), {"load": classmethod(lambda cls, path, load_composite=lambda path: engine_model(): load_composite(path))})  # Gemma 4's vision towers: a composite it loads itself
-    v1, original, model._src_path = types.SimpleNamespace(model_lifecycle=life), life.mlx_lm_load_model, "/snap"
+    v1, original, model._src_path, model._unsloth_vllm_shared = types.SimpleNamespace(model_lifecycle=life), life.mlx_lm_load_model, "/snap", True  # True: a previous engine's
     for item in (("vllm_metal", types.SimpleNamespace(v1=v1)), ("vllm_metal.v1", v1), ("vllm_metal.v1.model_lifecycle", life), ("vllm_metal.multimodal.gemma4.sidecar", types.SimpleNamespace(Gemma4VisionSidecar=Sidecar))):
         monkeypatch.setitem(sys.modules, *item)
     monkeypatch.setattr(sys.modules["vllm"], "LLM", lambda **kw: types.SimpleNamespace(kwargs=kw, models=(life.mlx_lm_load_model(kw["model"])[0], life.mlx_vlm_load_model(kw["model"]), Sidecar.load(kw["model"]))))
@@ -147,7 +147,7 @@ def test_an_in_process_engine_shares_only_matching_weights(monkeypatch, width, d
     assert llm.kwargs.get("dtype") == (dtype if multiprocess == "0" else None) and (not quant or types_of(engine) == bare) and vllm_utils._training_dtype(engine) == getattr(mx, dtype if multiprocess == "0" else "bfloat16")
     trained = {id(a) for _, a in tree_flatten(lm.parameters())}
     aliased = [id(array) in trained for e in (engine, vision, sidecar) for _, array in tree_flatten(e.parameters())]
-    assert calls[:2 * len(loads)] == loads * 2 and life.mlx_lm_load_model is original and Sidecar.load.__func__.__name__ == "<lambda>" and all(aliased) == (loads == [True]) == any(aliased)
+    assert calls[:2 * len(loads)] == loads * 2 and life.mlx_lm_load_model is original and Sidecar.load.__func__.__name__ == "<lambda>" and all(aliased) == (loads == [True]) == any(aliased) == getattr(model, "_unsloth_vllm_shared", False)
     assert all(getattr(m, "_unsloth_no_checkpoint", False) == (multiprocess == "0") for x in (engine, vision) for _, m in x.named_modules())
 
 
