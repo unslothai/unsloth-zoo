@@ -2238,19 +2238,25 @@ def _exec_verified_source(source, file_location, module_name):
     return new_module
 pass
 
-def _compiled_cache_decision(function_location, write_new_source, overwrite):
+def _compiled_cache_decision(function_location, write_new_source, overwrite, keep_retained = True):
     """Rank 0's write decision, plus a digest of the bytes it will import.
 
     Not only cross-rank agreement: a single process re-reads the cache against
-    this digest under the import lock too.
+    this digest under the import lock too. keep_retained=False (no
+    UNSLOTH_COMPILE_OVERWRITE=0) approves only our own bytes: a file swapped in
+    after the caller's equality check is rewritten, never digested and run.
     """
     should_write = overwrite or not os.path.isfile(function_location)
+    generated_digest = hashlib.sha256(write_new_source.encode("utf-8")).hexdigest()
     if should_write:
-        return True, hashlib.sha256(write_new_source.encode("utf-8")).hexdigest()
+        return True, generated_digest
     # Digest the file on disk, not write_new_source: UNSLOTH_COMPILE_OVERWRITE=0 keeps an older cache file on purpose.
     try:
         with open(function_location, "rb") as f:
-            return False, hashlib.sha256(f.read()).hexdigest()
+            retained_digest = hashlib.sha256(f.read()).hexdigest()
+        if not keep_retained and retained_digest != generated_digest:
+            return True, generated_digest
+        return False, retained_digest
     except Exception:
         # Unknown retained bytes cannot establish cross-rank agreement.
         return True, hashlib.sha256(write_new_source.encode("utf-8")).hexdigest()
@@ -2819,6 +2825,7 @@ def create_new_function(
     # and desynchronise the group, so rank 0 decides and broadcasts.
     should_write_cache_file, cache_file_digest = distributed_function(
         2, _compiled_cache_decision, function_location, write_new_source, overwrite,
+        os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0",
     )
     # Tracks the WRITE, not the decision; the pyc drop is unconditional now, so
     # this is carried for the rank agreement only. Cost of that, measured: no pyc
