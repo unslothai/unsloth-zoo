@@ -441,7 +441,9 @@ def run_partial_unfold_is_not_retried(device):
     # subtract the adapter a second time.
     ws, As, Bs, before = _lists(device, 2, seed = 80)
     ex.fold_weights_(ws, As, Bs, [0.5, 0.5], [821, 822])
-    with mock.patch.object(ex, "_write_escape_table", side_effect = torch.OutOfMemoryError("out of memory")):
+    # CUDA writes one escape table; ROCm writes per-target slices: fail whichever writer runs.
+    oom = torch.OutOfMemoryError("out of memory")
+    with mock.patch.object(ex, "_write_escape_table", side_effect = oom), mock.patch.object(ex, "_write_escape_slice", side_effect = oom):
         with pytest.raises(torch.OutOfMemoryError):
             ex.unfold_weights_(ws, As, Bs, [0.5, 0.5], [821, 822])
     after = [_bits(w).clone() for w in ws]
