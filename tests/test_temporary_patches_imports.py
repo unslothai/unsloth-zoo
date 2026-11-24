@@ -72,6 +72,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.inductor_stride_guard",
     "unsloth_zoo.temporary_patches.inkling",
     "unsloth_zoo.temporary_patches.inkling2",
+    "unsloth_zoo.temporary_patches.hybrid_sliding_masks",
     "unsloth_zoo.temporary_patches.lfm2_moe",
     "unsloth_zoo.temporary_patches.llama4_moe",
     "unsloth_zoo.temporary_patches.ministral",
