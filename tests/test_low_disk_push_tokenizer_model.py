@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A low disk push (what push_to_hub_merged runs) must upload the base repo's tokenizer.model.
-
-Step 2 is the only folder upload in low disk mode, and tokenizer.model is copied from the HF
-cache or downloaded after it. Hub writes are mocked; the tiny base repo is read from the Hub.
-"""
+"""A low disk push must upload the base repo's tokenizer.model, which lands after Step 2's only folder upload."""
 
 import os
 import shutil
@@ -35,8 +31,7 @@ TARGET = "fakeuser/merged"
 
 
 def _hub_reachable():
-    # Offline, the base resolves to its cached snapshot and the merge takes the local directory
-    # path, which carries tokenizer.model in Step 2: the asserts below would test the wrong path.
+    # Offline, the merge takes the local-directory path (tokenizer.model in Step 2): wrong path under test.
     from huggingface_hub import HfApi, constants
     if constants.HF_HUB_OFFLINE: return False
     try:
@@ -148,7 +143,6 @@ def _push(repo, tokenizer, low_disk_space_usage):
 
 
 def _tokenizer_model_uploads(events):
-    """How many uploads carried tokenizer.model, by kind."""
     return (
         sum(1 for kind, x in events if kind == "folder" and "tokenizer.model" in x),
         sum(1 for kind, x in events if kind == "file" and x == "tokenizer.model"),
@@ -159,7 +153,6 @@ def test_low_disk_push_uploads_base_tokenizer_model_once(_cpu_and_mocked_hub_wri
     events = _cpu_and_mocked_hub_writes
     _push(SPM_REPO, _tokenizer_without_spm_file(tmp_path), low_disk_space_usage = True)
     assert _tokenizer_model_uploads(events) == (0, 1), events
-    # The shards still go up one by one, after Step 2's folder upload.
     assert [kind for kind, _ in events].count("folder") == 1
     assert ("file", "model.safetensors") in events
 
@@ -171,14 +164,12 @@ def test_low_disk_push_does_not_reupload_tokenizer_model_already_sent(_cpu_and_m
 
 
 def test_low_disk_push_resends_tokenizer_model_replaced_after_step_2(_cpu_and_mocked_hub_writes, tmp_path):
-    """Step 4 overwrites it with the base repo's copy: the Hub gets the bytes the local save ends with."""
     events = _cpu_and_mocked_hub_writes
     _push(SPM_REPO, _tokenizer_writing(tmp_path, b"not the base tokenizer.model"), low_disk_space_usage = True)
     assert _tokenizer_model_uploads(events) == (1, 1), events
 
 
 def test_full_disk_push_unchanged(_cpu_and_mocked_hub_writes, tmp_path):
-    """Outside low disk mode the final folder upload already carries it; no single file upload is added."""
     events = _cpu_and_mocked_hub_writes
     _push(SPM_REPO, _tokenizer_without_spm_file(tmp_path), low_disk_space_usage = False)
     assert _tokenizer_model_uploads(events) == (1, 0), events

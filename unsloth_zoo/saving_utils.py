@@ -5901,8 +5901,7 @@ def merge_and_overwrite_lora(
     fix_tokenizer_config_json(tokenizer, save_directory)
     if push_to_hub:
         upload_items()
-    # Low disk mode has no final folder upload, so a tokenizer.model that Step 4 adds or
-    # replaces after this point never reaches the Hub. Remember what this upload carried.
+    # Low disk mode has no final folder upload: Step 4 re-pushes tokenizer.model if it changes.
     _uploaded_tokenizer_model = (
         _file_sha256(os.path.join(save_directory, "tokenizer.model"))
         if push_to_hub and low_disk_space_usage else None
@@ -6171,7 +6170,6 @@ def merge_and_overwrite_lora(
                 # It's OK if the file doesn't exist (not all models have it)
                 print(f"Note: tokenizer.model not found (this is OK for non-SentencePiece models)")
 
-    # Copied from the HF cache or downloaded after Step 2's folder upload: push it on its own.
     if push_to_hub and low_disk_space_usage:
         _tokenizer_model_digest = _file_sha256(os.path.join(save_directory, "tokenizer.model"))
         if _tokenizer_model_digest is not None and _tokenizer_model_digest != _uploaded_tokenizer_model:
@@ -6547,7 +6545,6 @@ pass
 
 
 def _file_sha256(path):
-    """SHA-256 hex digest of a regular file, or None when there is none."""
     if not os.path.isfile(path): return None
     import hashlib
     digest = hashlib.sha256()
