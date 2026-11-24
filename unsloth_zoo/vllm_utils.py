@@ -7827,12 +7827,16 @@ def _merged_rollout_restore(state):
         try:
             _merged_rollout_synchronize(state)
             with torch.inference_mode():
+                retry = False
                 try:
                     exact_unfold(targets, stream = state.stream)
                 except torch.cuda.OutOfMemoryError:
-                    # Raised before the first in-place write (no target restoring): no weight changed, so free
-                    # cached memory and run it once more. A restoring target cannot be retried.
+                    # Raised before the first in-place write (no target restoring): no weight changed, so run it once
+                    # more. A restoring target cannot be retried.
                     if any(t.restoring for t in targets): raise
+                    retry = True
+                if retry:
+                    # Outside the handler, so the failed attempt's traceback (and the scratch its frames hold) is freed.
                     torch.cuda.empty_cache()
                     exact_unfold(targets, stream = state.stream)
             state.record()

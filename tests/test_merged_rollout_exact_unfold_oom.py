@@ -27,6 +27,7 @@ import os
 import subprocess
 import sys
 import types
+import weakref
 from unittest import mock
 
 import pytest
@@ -290,11 +291,17 @@ def test_vllm_exact_restore_retries_one_oom_before_any_write():
         target = types.SimpleNamespace(folded = True, restoring = False)
         calls = []
 
+        held = []
+
         def unfold(targets, stream = None):
             calls.append(1)
             if len(calls) == 1:
                 target.restoring = restoring
+                scratch = torch.zeros(4)  # held by this frame through the traceback
+                held.append(weakref.ref(scratch))
                 raise torch.cuda.OutOfMemoryError("CUDA out of memory (injected)")
+            # The retry runs after the failed attempt's traceback was released.
+            assert held[0]() is None, "the failed attempt's scratch is still alive during the retry"
         state = types.SimpleNamespace(
             entries = [(None, torch.zeros(1), None)], exact_targets = [target], stream = None, poisoned = None,
             record = lambda: None,
