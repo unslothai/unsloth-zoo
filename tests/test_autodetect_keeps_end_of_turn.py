@@ -38,6 +38,8 @@ INKLING_LIKE = (
     "{%- else -%}{{- '<|message_model|><|content_text|>' + m.content + '<|end_message|><|content_model_end_sampling|>' -}}"
     "{%- endif -%}{%- endfor -%}"
 )
+# unsloth/Inkling-2-Mini at ae70da4f added a generation prompt; add_generation_prompt=False renders are unchanged.
+INKLING_LIKE_GENPROMPT = INKLING_LIKE + "{%- if add_generation_prompt -%}{{- '<|message_model|>' -}}{%- endif -%}"
 INKLING_SPECIALS = ["<|message_system|>", "<|message_user|>", "<|message_model|>", "<|content_text|>",
                     "<|end_message|>", "<|content_model_end_sampling|>"]
 # GLM-4.x: every sample opens with "[gMASK]<sop>", no bos, no assistant end token.
@@ -66,6 +68,9 @@ CHATML = (
 # family -> (repo, override template, extra special tokens, end-of-turn strings an assistant turn may end with)
 FAMILIES = {
     "inkling2":      ("thinkingmachines/Inkling-2-Mini", None, None, ("<|end_message|><|content_model_end_sampling|>",)),
+    "inkling2_genprompt": ("unsloth/Inkling-2-Mini@ae70da4f", None, None, ("<|end_message|><|content_model_end_sampling|>",)),
+    "inkling_like_genprompt": ("hf-internal-testing/llama-tokenizer", INKLING_LIKE_GENPROMPT, INKLING_SPECIALS,
+                      ("<|end_message|><|content_model_end_sampling|>",)),
     "inkling_like":  ("hf-internal-testing/llama-tokenizer", INKLING_LIKE, INKLING_SPECIALS,
                       ("<|end_message|><|content_model_end_sampling|>",)),
     "chatml":        ("hf-internal-testing/llama-tokenizer", CHATML, ["<|im_start|>", "<|im_end|>"], ("<|im_end|>",)),
@@ -87,8 +92,9 @@ FAMILIES = {
 @functools.lru_cache(maxsize = None)
 def _base_tokenizer(repo):
     from transformers import AutoTokenizer
+    repo, _, revision = repo.partition("@")
     try:
-        return AutoTokenizer.from_pretrained(repo, local_files_only = True)
+        return AutoTokenizer.from_pretrained(repo, revision = revision or None, local_files_only = True)
     except Exception:
         return None
 
