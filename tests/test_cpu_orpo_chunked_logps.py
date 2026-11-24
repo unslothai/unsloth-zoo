@@ -37,17 +37,21 @@ def _orpo():
     return ORPOConfig, ORPOTrainer
 
 
-def _trainer(tmp_path, dtype, bf16):
+def _trainer(tmp_path, dtype, bf16, lora = False, trainer_cls = None):
     from datasets import Dataset
     from unsloth_zoo.cpu import loader
     from unsloth_zoo.cpu.trainer import install_cpu_training_defaults
     install_cpu_training_defaults()
     try:
-        model, tokenizer = loader.FastCPUModel.from_pretrained(TINY, dtype = dtype, full_finetuning = True, load_in_4bit = False)
+        model, tokenizer = loader.FastCPUModel.from_pretrained(TINY, dtype = dtype, full_finetuning = not lora,
+                                                               load_in_4bit = False)
     except OSError as error:  # offline without the tiny model cached
         pytest.skip(f"{TINY} unavailable: {error}")
     assert getattr(model, "_unsloth_cpu_chunked_ce", False)
-    config_cls, trainer_cls = _orpo()
+    if lora:  # frozen lm_head: the _ChunkedLogProbs path behind PEFT's wrappers
+        model = loader.FastCPUModel.get_peft_model(model, r = 8, target_modules = ["q_proj", "v_proj"])
+    config_cls, default_cls = _orpo()
+    trainer_cls = trainer_cls or default_cls
     words = "the a cat dog sat ran on under mat tree big small red blue".split()
     g = torch.Generator().manual_seed(0)
     text = lambda n: " ".join(words[int(i)] for i in torch.randint(0, len(words), (n,), generator = g))  # noqa: E731
@@ -61,38 +65,78 @@ def _trainer(tmp_path, dtype, bf16):
     return trainer, model
 
 
-def _step(trainer, model, forward):
+def _base_head(model):
+    head = model.get_output_embeddings()
+    return getattr(head, "original_module", head)
+
+
+def _step(trainer, model, forward, backward = True):
     trainer.concatenated_forward = forward
     model.zero_grad(set_to_none = True)
     calls = []
-    hook = model.get_output_embeddings().register_forward_hook(lambda *a: calls.append(1))
+    head = _base_head(model)
+    # Counted on the class: a hook or an instance forward on the head itself sends it back to TRL's forward.
+    linear_forward = torch.nn.Linear.forward
+
+    def counting(self, x):
+        if self is head:
+            calls.append(1)
+        return linear_forward(self, x)
+
+    torch.nn.Linear.forward = counting
     try:
-        with trainer.accelerator.autocast():
+        with trainer.accelerator.autocast(), torch.set_grad_enabled(backward):
             loss, metrics = trainer.get_batch_loss_metrics(model, trainer._unsloth_test_batch, train_eval = "train")
-        loss.backward()
+        if backward:
+            loss.backward()
     finally:
-        hook.remove()
+        torch.nn.Linear.forward = linear_forward
     grads = {n: p.grad.detach().float().clone() for n, p in model.named_parameters() if p.grad is not None}
     metrics = {k: float(v) for k, v in metrics.items()}
-    return float(loss), metrics, grads, len(calls)
+    return float(loss.detach()), metrics, grads, len(calls)
 
 
-@pytest.mark.parametrize("dtype, bf16, tol", [(torch.float32, False, 1e-5), (torch.bfloat16, True, 2e-2)])
-def test_chunked_orpo_matches_trl_full_logits(tmp_path, dtype, bf16, tol):
+@pytest.fixture(autouse = True)
+def _restore_accelerate_env():
+    """TrainingArguments exports ACCELERATE_MIXED_PRECISION: a bf16 test would autocast every later trainer."""
+    saved = {k: v for k, v in os.environ.items() if k.startswith("ACCELERATE_")}
+    yield
+    for key in [k for k in os.environ if k.startswith("ACCELERATE_")]:
+        del os.environ[key]
+    os.environ.update(saved)
+
+
+@pytest.mark.parametrize("dtype, bf16, tol, lora, chunk_rows", [
+    (torch.float32, False, 1e-5, False, 37), (torch.bfloat16, True, 2e-2, False, None),
+    (torch.float32, False, 1e-5, True, 37),
+])
+def test_chunked_orpo_matches_trl_full_logits(tmp_path, monkeypatch, dtype, bf16, tol, lora, chunk_rows):
     from unsloth_zoo.cpu.runtime import cpu_bf16_supported
     if bf16 and not cpu_bf16_supported():
         pytest.skip("no native bfloat16")
-    trainer, model = _trainer(tmp_path, dtype, bf16)
+    trainer, model = _trainer(tmp_path, dtype, bf16, lora = lora)
+    if chunk_rows is not None:  # several row chunks with a ragged last one
+        monkeypatch.setenv("UNSLOTH_CPU_CE_CHUNK_ELEMENTS", str(chunk_rows * _base_head(model).weight.shape[0]))
+    assert _base_head(model).weight.requires_grad is not lora
     chunked = trainer.concatenated_forward
     assert getattr(chunked, "_unsloth_cpu", False), "the CPU ORPO forward was not installed"
     stock = type(trainer).concatenated_forward.__get__(trainer)
     trainer._unsloth_test_batch = next(iter(trainer.get_train_dataloader()))
     assert int((trainer._unsloth_test_batch["chosen_attention_mask"] == 0).sum()) > 0
+    if chunk_rows is not None:
+        batch = trainer._unsloth_test_batch
+        length = max(batch["chosen_input_ids"].shape[1], batch["rejected_input_ids"].shape[1])
+        rows = 2 * batch["chosen_input_ids"].shape[0] * (length - 1)
+        assert rows > 2 * chunk_rows and rows % chunk_rows, rows
     loss_c, metrics_c, grads_c, head_calls_c = _step(trainer, model, chunked)
     loss_s, metrics_s, grads_s, head_calls_s = _step(trainer, model, stock)
     # The chunked path never runs lm_head (no [2B, L, V] logits); TRL's runs it once.
     assert (head_calls_c, head_calls_s) == (0, 1)
     assert loss_c == pytest.approx(loss_s, rel = tol, abs = tol)
+    # Evaluation (no grad): the frozen-scorer path.
+    eval_c, _, _, eval_calls_c = _step(trainer, model, chunked, backward = False)
+    eval_s, _, _, _ = _step(trainer, model, stock, backward = False)
+    assert eval_calls_c == 0 and eval_c == pytest.approx(eval_s, rel = tol, abs = tol)
     assert metrics_c.keys() == metrics_s.keys()
     for key in metrics_s:
         if "accuracies" in key and dtype != torch.float32:
@@ -119,6 +163,124 @@ def test_opt_out_and_subclasses_keep_trl_forward(tmp_path, monkeypatch):
     trainer.__class__ = Custom
     trainer.__dict__.pop("concatenated_forward", None)
     assert _install_chunked_preference_forward(trainer) is False
+
+    # Overriding what the chunked forward replaces (the scoring) or feeds (the [B, L, V] logits consumer).
+    class CustomLogps(trainer_cls):
+        @staticmethod
+        def get_batch_logps(logits, labels, average_log_prob = False, **kwargs):
+            return trainer_cls.get_batch_logps(logits, labels, average_log_prob = False, **kwargs)
+
+    class CustomMetrics(trainer_cls):
+        def get_batch_loss_metrics(self, model, batch, train_eval = "train"):
+            return super().get_batch_loss_metrics(model, batch, train_eval)
+
+    for cls in (CustomLogps, CustomMetrics, trainer_cls):
+        trainer.__class__ = cls
+        trainer.__dict__.pop("concatenated_forward", None)
+        assert _install_chunked_preference_forward(trainer) is (cls is trainer_cls), cls.__name__
+
+
+def _tiny_llama():
+    from transformers import LlamaConfig, LlamaForCausalLM
+    from unsloth_zoo.cpu.ops import patch_chunked_causal_lm_loss
+    torch.manual_seed(0)
+    config = LlamaConfig(vocab_size = 64, hidden_size = 16, intermediate_size = 32, num_hidden_layers = 1,
+                         num_attention_heads = 2, num_key_value_heads = 2, tie_word_embeddings = False)
+    model = LlamaForCausalLM(config)
+    assert patch_chunked_causal_lm_loss(model)
+    return model
+
+
+def test_plain_head_weight_disabled_adapters_and_hooks():
+    """The raw-weight projection must equal calling the head: PEFT's disable_adapter() runs the base head, and hooks
+    or an instance forward act on the module call."""
+    from peft import LoraConfig, get_peft_model
+    from unsloth_zoo.cpu.ops import _plain_head_weight
+    model = get_peft_model(_tiny_llama(), LoraConfig(r = 2, target_modules = ["q_proj"], modules_to_save = ["lm_head"]))
+    head = model.get_output_embeddings()
+    assert _plain_head_weight(head) is head.modules_to_save["default"].weight
+    with model.disable_adapter():
+        assert _plain_head_weight(head) is head.original_module.weight
+    assert _plain_head_weight(head) is head.modules_to_save["default"].weight
+
+    linear = torch.nn.Linear(4, 8, bias = False)
+    assert _plain_head_weight(linear) is linear.weight
+    for register in (lambda m: m.register_forward_hook(lambda mod, i, o: o * 2),
+                     lambda m: m.register_forward_pre_hook(lambda mod, i: i),
+                     lambda m: m.register_full_backward_hook(lambda mod, gi, go: None)):
+        handle = register(linear)
+        assert _plain_head_weight(linear) is None
+        handle.remove()
+    linear.forward = lambda x: torch.nn.functional.linear(x, linear.weight) * 2
+    assert _plain_head_weight(linear) is None
+
+
+def test_hooked_head_keeps_trl_scoring(tmp_path):
+    trainer, model = _trainer(tmp_path, torch.float32, False)
+    chunked = trainer.concatenated_forward
+    stock = type(trainer).concatenated_forward.__get__(trainer)
+    trainer._unsloth_test_batch = next(iter(trainer.get_train_dataloader()))
+    handle = model.get_output_embeddings().register_forward_hook(lambda mod, i, o: o * 2)
+    try:
+        loss_c = _step(trainer, model, chunked, backward = False)[0]
+        loss_s = _step(trainer, model, stock, backward = False)[0]
+    finally:
+        handle.remove()
+    assert loss_c == pytest.approx(loss_s, rel = 1e-6, abs = 1e-6)
+
+
+def test_one_token_rows_match_trl(tmp_path):
+    """One-token rows leave no next-token target: TRL returns NaN (0 / 0), the chunked forward must not raise."""
+    trainer, model = _trainer(tmp_path, torch.float32, False)
+    chunked = trainer.concatenated_forward
+    stock = type(trainer).concatenated_forward.__get__(trainer)
+    batch = next(iter(trainer.get_train_dataloader()))
+    trainer._unsloth_test_batch = {k: v[:, :1] if torch.is_tensor(v) and v.ndim == 2 else v for k, v in batch.items()}
+    loss_c, metrics_c = _step(trainer, model, chunked, backward = False)[:2]
+    loss_s, metrics_s = _step(trainer, model, stock, backward = False)[:2]
+    assert torch.isnan(torch.tensor(loss_s)) and torch.isnan(torch.tensor(loss_c))
+    assert metrics_c.keys() == metrics_s.keys()
+
+
+def test_head_off_cpu_keeps_trl_forward():
+    """The chunked scorer allocates CPU buffers: a CPU-patched model moved to another device keeps TRL's forward."""
+    import types
+    from unsloth_zoo.cpu.trainer import _orpo_chunked_forward
+    model = _tiny_llama().to("meta")
+    trainer = types.SimpleNamespace(is_encoder_decoder = False, aux_loss_enabled = False, label_pad_token_id = -100)
+    forward = _orpo_chunked_forward(trainer, lambda model, batch: "trl")
+    assert forward(model, {}) == "trl"
+
+
+def test_trainable_head_metrics_only_requested(monkeypatch):
+    """Trainable head: only the requested detached metrics are computed (ORPO asks for mean_logits alone), and the
+    values match an fp64 oracle."""
+    from unsloth_zoo.cpu.ops import cpu_chunked_log_probs
+    torch.manual_seed(0)
+    hidden = torch.randn(13, 8, requires_grad = True)
+    weight = torch.nn.Parameter(torch.randn(32, 8))
+    targets = torch.randint(0, 32, (13,))
+    logits = hidden.double() @ weight.double().t()
+    oracle_lp = torch.log_softmax(logits, -1).gather(-1, targets[:, None]).squeeze(-1)
+    oracle_mean = logits.mean(-1)
+    monkeypatch.setenv("UNSLOTH_CPU_CE_CHUNK_ELEMENTS", str(5 * 32))
+    calls = []
+    for name in ("log_softmax", "logsumexp"):
+        original = getattr(torch, name)
+        monkeypatch.setattr(torch, name, lambda *a, _f = original, _n = name, **k: calls.append(_n) or _f(*a, **k))
+    log_probs, entropy, sq, mean, top1 = cpu_chunked_log_probs(hidden, weight, None, targets, 1.0, None,
+                                                               outputs = ("mean_logits",))
+    monkeypatch.undo()
+    assert entropy is None and sq is None and top1 is None
+    # 3 row chunks: one logsumexp each in the differentiable pass, none for the metrics pass.
+    assert calls == ["logsumexp"] * 3, calls
+    torch.testing.assert_close(log_probs.double(), oracle_lp, rtol = 1e-5, atol = 1e-5)
+    torch.testing.assert_close(mean.double(), oracle_mean, rtol = 1e-5, atol = 1e-5)
+    log_probs.sum().backward()
+    oracle_hidden, oracle_weight = hidden.detach().double().requires_grad_(), weight.detach().double().requires_grad_()
+    torch.log_softmax(oracle_hidden @ oracle_weight.t(), -1).gather(-1, targets[:, None]).sum().backward()
+    torch.testing.assert_close(hidden.grad.double(), oracle_hidden.grad, rtol = 1e-5, atol = 1e-5)
+    torch.testing.assert_close(weight.grad.double(), oracle_weight.grad, rtol = 1e-5, atol = 1e-5)
 
 
 _DDP_SCRIPT = r'''

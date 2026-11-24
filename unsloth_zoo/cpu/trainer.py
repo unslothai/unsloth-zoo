@@ -409,8 +409,9 @@ def _orpo_chunked_forward(trainer, original):
     def concatenated_forward(model, batch):
         target = _chunked_ce_model(trainer, model)
         head = _plain_head_weight(target.get_output_embeddings()) if target is not None else None
-        if head is None or getattr(trainer, "is_encoder_decoder", False) or getattr(trainer, "aux_loss_enabled", False) \
-                or getattr(trainer, "label_pad_token_id", -100) != -100 \
+        # head.device: a CPU-patched model moved to an accelerator keeps TRL's forward (the chunked scorer is CPU-only).
+        if head is None or head.device.type != "cpu" or getattr(trainer, "is_encoder_decoder", False) \
+                or getattr(trainer, "aux_loss_enabled", False) or getattr(trainer, "label_pad_token_id", -100) != -100 \
                 or any(key in batch for key in ("pixel_values", "pixel_attention_mask", "image_sizes")):
             return original(model, batch)
         concatenated = trainer.concatenated_inputs(
@@ -449,13 +450,13 @@ def _orpo_chunked_forward(trainer, original):
 
 def _install_chunked_preference_forward(trainer):
     """Per trainer instance: TRL's own ORPOTrainer (trl.trainer.orpo_trainer up to 0.2x, trl.experimental.orpo in 1.x),
-    not a subclass that overrides concatenated_forward."""
+    not a subclass that overrides concatenated_forward or what it replaces / feeds (its scoring and logits consumer)."""
     if os.environ.get("UNSLOTH_CPU_CHUNKED_PREFERENCE", "1").strip().lower() in ("0", "false", "no", "off"):
         return False
-    method = getattr(type(trainer), "concatenated_forward", None)
-    module = getattr(method, "__module__", "") or ""
-    if not (module.startswith("trl.") and module.endswith("orpo_trainer")) or not hasattr(trainer, "concatenated_inputs"):
-        return False
+    for name in ("concatenated_forward", "concatenated_inputs", "get_batch_logps", "get_batch_loss_metrics"):
+        module = getattr(getattr(type(trainer), name, None), "__module__", "") or ""
+        if not (module.startswith("trl.") and module.endswith("orpo_trainer")):
+            return False
     bound = getattr(trainer, "concatenated_forward")
     if getattr(bound, "_unsloth_cpu", False):
         return True

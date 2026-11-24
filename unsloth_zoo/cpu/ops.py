@@ -287,16 +287,21 @@ def _checkpointed_log_probs(hidden, weight, bias, targets, inv_t, softcap, logit
     log_probs = torch.cat(log_probs)
     entropy = torch.cat(entropy) if want_entropy else None
     extras = {}
-    if any(name in outputs for name in ("log_sum_sq_probs", "mean_logits", "is_top1")):
+    metrics = {
+        "log_sum_sq_probs": lambda z, y: torch.logsumexp(2 * torch.log_softmax(z, dim = -1), dim = -1),
+        "mean_logits": lambda z, y: z.mean(-1),
+        "is_top1": lambda z, y: z.argmax(-1) == y,
+    }
+    metrics = {name: metric for name, metric in metrics.items() if name in outputs}  # only the requested ones
+    if metrics:
         # Metrics only (TRL marks them non-differentiable): one more pass without autograd.
         with torch.no_grad():
-            sq, mean, top1 = [], [], []
+            parts = {name: [] for name in metrics}
             for start in range(0, hidden.shape[0], rows):
                 z, _ = _transformed_logits(hidden[start:start + rows], weight, bias, inv_t, softcap, logit_scale)
-                sq.append(torch.logsumexp(2 * torch.log_softmax(z, dim = -1), dim = -1))
-                mean.append(z.mean(-1))
-                top1.append(z.argmax(-1) == targets[start:start + rows])
-            extras = {"log_sum_sq_probs": torch.cat(sq), "mean_logits": torch.cat(mean), "is_top1": torch.cat(top1)}
+                for name, metric in metrics.items():
+                    parts[name].append(metric(z, targets[start:start + rows]))
+            extras = {name: torch.cat(values) for name, values in parts.items()}
     return log_probs, entropy, extras.get("log_sum_sq_probs"), extras.get("mean_logits"), extras.get("is_top1")
 
 
@@ -588,14 +593,21 @@ def _plain_lm_head(model):
 
 def _plain_head_weight(head):
     """The weight that alone produces this head's logits, or None (e.g. a LoRA-wrapped lm_head)."""
+    if not isinstance(head, torch.nn.Module) or "forward" in vars(head) or any(
+        getattr(head, name, None) for name in ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks")
+    ):
+        return None  # hooks / an instance forward (user code, DeepSpeed ZeRO-3 gathers) act on the module call
     if type(head) is torch.nn.Linear and head.bias is None:
         return head.weight
     if type(head).__name__ == "ModulesToSaveWrapper":
+        original = getattr(head, "original_module", None)
+        if getattr(head, "disable_adapters", False):
+            return _plain_head_weight(original)  # PEFT's disable_adapter(): the wrapper runs the base head
         adapter = getattr(head, "active_adapter", None)
         adapter = adapter[0] if isinstance(adapter, (list, tuple)) else adapter
         copies = getattr(head, "modules_to_save", None)
         active = copies[adapter] if copies is not None and adapter in copies else None
-        return _plain_head_weight(active if active is not None else getattr(head, "original_module", None))
+        return _plain_head_weight(active if active is not None else original)
     return None
 
 
@@ -632,7 +644,7 @@ def patch_chunked_causal_lm_loss(model):
             hidden = hidden[:, :-1].to(head_weight.dtype)
             batch_size, length = logps_targets.shape
             log_probs, _, _, mean_logits, _ = cpu_chunked_log_probs(
-                hidden.reshape(batch_size * length, -1), head_weight, None, logps_targets.reshape(-1), 1.0, None,
+                hidden.reshape(batch_size * length, hidden.shape[-1]), head_weight, None, logps_targets.reshape(-1), 1.0, None,
                 outputs = ("mean_logits",),
             )
             return {"log_probs": log_probs.view(batch_size, length), "mean_logits": mean_logits.view(batch_size, length)}
