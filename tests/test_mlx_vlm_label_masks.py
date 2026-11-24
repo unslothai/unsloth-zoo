@@ -969,7 +969,6 @@ def test_deepseek_ocr_loader_patch_tolerates_torch_free_transformers(monkeypatch
 def test_mlx_vlm_loads_install_the_torch_free_image_processor_lookup():
     from unsloth_zoo.mlx import loader
 
-    # Ahead of the runtime-quantized, distributed and plain VLM loads alike.
     source = inspect.getsource(loader.FastMLXModel.from_pretrained)
     patch = source.index("_patch_torch_free_image_processor_lookup()")
     assert patch < source.index("if want_runtime_quant:\n                print(")
