@@ -59,7 +59,7 @@ class _Model(torch.nn.Module):
 
 def _trl_completion_mask(completion_ids, eos):
     # GRPOTrainer._generate_and_score_completions (TRL 0.22.2 to 1.18): keep through the first EOS.
-    is_eos = completion_ids == eos
+    is_eos = torch.isin(completion_ids, torch.as_tensor(eos))
     eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype = torch.long)
     eos_idx[is_eos.any(dim = 1)] = is_eos.int().argmax(dim = 1)[is_eos.any(dim = 1)]
     return (torch.arange(is_eos.size(1)).expand(is_eos.size(0), -1) <= eos_idx.unsqueeze(1)).int()
@@ -73,7 +73,7 @@ def _batch(pad):
     return torch.tensor([p + c for p, c in zip(prompts, completions)])
 
 
-def _loss_mask(monkeypatch, input_ids, pad, ref_logps = None, **trainer_attrs):
+def _loss_mask(monkeypatch, input_ids, pad, ref_logps = None, eos_ids = EOS, **trainer_attrs):
     seen = {}
 
     class _Loss:
@@ -85,7 +85,7 @@ def _loss_mask(monkeypatch, input_ids, pad, ref_logps = None, **trainer_attrs):
 
     monkeypatch.setattr(_rl, "UnslothEfficientGRPO", _Loss)
     keep = input_ids.shape[1] - PROMPT_LEN
-    completion_mask = _trl_completion_mask(input_ids[:, PROMPT_LEN:], EOS)
+    completion_mask = _trl_completion_mask(input_ids[:, PROMPT_LEN:], eos_ids)
     attention_mask = torch.cat([(input_ids[:, :PROMPT_LEN] != pad).long(), completion_mask], dim = 1)
     trainer = types.SimpleNamespace(
         args = types.SimpleNamespace(unsloth_grpo_mini_batch = 2, unsloth_logit_chunk_multiplier = 1),
@@ -167,6 +167,23 @@ def test_trl_eos_token_ids_count_as_eos(monkeypatch):
     )
     rows = _rl.grpo_pad_is_eos_rows(trainer, torch.tensor([[1, 8, 8], [1, 2, 3]]))
     assert rows.tolist() == [True, False]
+
+
+def test_other_eos_terminator_with_pad_id_padding_gets_no_extra_slot(monkeypatch):
+    # pad 9 is one of TRL 1.x's eos_token_ids [8, 9]; a row that stopped on 8 is then padded with 9.
+    # Only a row whose first EOS-set token is the pad id needs the extra slot.
+    trainer = types.SimpleNamespace(
+        processing_class = types.SimpleNamespace(pad_token_id = EOS, eos_token_id = EOS), eos_token_ids = [8, EOS],
+    )
+    completions = torch.tensor([[1, 8, EOS, EOS], [1, EOS, EOS, EOS], [8, EOS, EOS, EOS], [1, 2, 3, 4]])
+    assert _rl.grpo_pad_is_eos_rows(trainer, completions).tolist() == [False, True, False, False]
+
+    prompts = torch.tensor([[EOS, 1, 2], [3, 4, 5], [EOS, EOS, 6], [7, 1, 2]])
+    input_ids = torch.cat([prompts, completions], dim = 1)
+    mask, completion_mask = _loss_mask(monkeypatch, input_ids, EOS, eos_ids = [8, EOS], eos_token_ids = [8, EOS])
+    # [1, 8, 9, 9] -> [1, 1, 0, 0], as TRL's completion_mask; [1, 9, 9, 9] keeps its EOS.
+    assert completion_mask.int().tolist()[0] == [1, 1, 0, 0]
+    assert _per_row_kept(mask) == completion_mask.sum(dim = 1).tolist() == [2, 2, 1, 4]
 
 
 def test_ref_logps_without_eos_coverage_keep_the_old_mask(monkeypatch):

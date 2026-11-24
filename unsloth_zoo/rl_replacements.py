@@ -1176,7 +1176,11 @@ def grpo_pad_is_eos_rows(trainer, completion_ids: torch.Tensor) -> Optional[torc
             eos_ids.update(v for v in value if isinstance(v, int))
     if pad_token_id not in eos_ids:
         return None
-    return (completion_ids == pad_token_id).any(dim = 1)
+    # Only the first EOS-set token terminates the row: a completion that stopped on another EOS id
+    # is right padded with the pad id, and that padding must not read as a second EOS target.
+    is_eos = torch.isin(completion_ids, torch.tensor(sorted(eos_ids), device = completion_ids.device))
+    first_eos = is_eos.int().argmax(dim = 1, keepdim = True)
+    return is_eos.any(dim = 1) & (completion_ids.gather(1, first_eos).squeeze(1) == pad_token_id)
 pass
 
 
