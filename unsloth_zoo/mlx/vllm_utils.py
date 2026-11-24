@@ -227,6 +227,12 @@ def _in_process_engine_loads(model):
 
 def load_vllm(model, *, max_seq_length, gpu_memory_utilization=0.5, max_lora_rank=64, enable_lora=True, seed=0):
     """Start an in-process vllm-metal engine on the checkpoint ``model`` was loaded from, sharing its weights."""
+    if getattr(model, "_unsloth_full_finetuning", False):
+        # As on CUDA: the engine keeps the loaded base, which full fine-tuning replaces at every optimizer step.
+        raise NotImplementedError(
+            "Unsloth: `fast_inference=True` cannot be used together with `full_finetuning=True`. "
+            "Workaround: disable fast_inference, or use parameter-efficient fine-tuning (LoRA)."
+        )
     # In-process engine core: a spawned one re-imports the notebook or script's __main__.
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     error = _metal_platform_error()

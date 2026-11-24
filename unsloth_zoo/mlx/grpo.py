@@ -156,6 +156,8 @@ def vllm_rollout_params(sampling, eos_id, vllm_sampling_params=None):
             }
         params.update((name, value) for name, value in overrides.items()
                       if name in names and name not in _VLLM_CONFIG_OWNED)
+    if params["top_p"] == 0:  # keeps only the most likely token (HF's min_tokens_to_keep=1); vLLM wants 0 < top_p <= 1
+        params.update(top_p=1.0, top_k=1)
     return params
 
 

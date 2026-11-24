@@ -195,6 +195,8 @@ def test_load_vllm_refuses_a_non_metal_vllm(monkeypatch):
     _fake_vllm(monkeypatch, "vllm.platforms.cpu")
     with pytest.raises(ImportError, match="not vllm-metal"):
         vllm_utils.load_vllm(types.SimpleNamespace(_src_path="/snap"), max_seq_length=64)
+    with pytest.raises(NotImplementedError, match="full_finetuning"):  # as on CUDA: the engine would keep the initial base
+        vllm_utils.load_vllm(types.SimpleNamespace(_src_path="/snap", _unsloth_full_finetuning=True), max_seq_length=64)
 
 
 class _AdapterModel:

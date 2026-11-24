@@ -5107,6 +5107,10 @@ def test_vllm_rollout_params_let_vllm_sampling_params_override_all_but_what_grpo
     # Unsloth's vLLMSamplingParams records what was passed, so an explicit default still overrides.
     user._set_kwargs = dict(top_p=1.0, seed=1, bogus=2)
     assert vllm_rollout_params(sampling, 5, user) == {**base, "top_p": 1.0}
+    # top_p=0 keeps the most likely token, which vLLM spells top_k=1 (it rejects top_p=0).
+    zero = GRPOSampling(max_tokens=8, top_p=0.0, top_k=5)
+    assert vllm_rollout_params(zero, 5) == {**base, "temperature": 1.0, "top_p": 1.0, "top_k": 1}
+    assert vllm_rollout_params(zero, 5, user)["top_k"] == 5  # unless vllm_sampling_params sets its own top_p
 
 
 def test_grpo_plan_samples_through_the_vllm_engine_with_the_live_adapter(monkeypatch):
