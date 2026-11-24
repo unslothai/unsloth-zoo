@@ -560,6 +560,7 @@ jobs:
               tests/test_mlx_gkd_guards.py \
               tests/test_output_collector_compile.py \
               tests/test_cpu_loader_prequantized_checkpoint.py \
+              tests/test_cpu_full_finetuning_precision.py \
               tests/test_fp8_partial_block_dequant.py \
               -v
           }
