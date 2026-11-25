@@ -16,6 +16,7 @@
 
 """The compiler's standalone class must re-apply the 5.24 `cache` adapter or `cache=` is lost in **kwargs."""
 
+import functools
 import importlib.util
 import sys
 import textwrap
@@ -64,12 +65,22 @@ def _fake_module(tmp_path, monkeypatch):
     return name, module
 
 
-def test_standalone_class_keeps_the_cache_keyword_adapter(tmp_path, monkeypatch):
+@pytest.mark.parametrize("outer_wraps", [False, True], ids = ["adapter", "wrapped_adapter"])
+def test_standalone_class_keeps_the_cache_keyword_adapter(tmp_path, monkeypatch, outer_wraps):
     name, module = _fake_module(tmp_path, monkeypatch)
     cls = module.FakeCacheAttention
     monkeypatch.setattr(cls, "forward", cls.forward)
     assert U.patch_function(cls, "forward", module.zoo_attention_forward)
     assert getattr(cls.forward, "_unsloth_cache_kwarg_adapter", None) == ("past_key_values", "cache")
+    if outer_wraps:
+        # e.g. the checkpoint wrapper keep_layer_checkpointing restores; wraps copies the marker outward.
+        adapter = cls.forward
+
+        @functools.wraps(adapter)
+        def outer(*args, **kwargs):
+            return adapter(*args, **kwargs)
+
+        monkeypatch.setattr(cls, "forward", outer)
 
     generated = compiler.create_standalone_class("FakeCacheAttention", name, dir(module), disable = True)
     namespace = {

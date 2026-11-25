@@ -3257,12 +3257,17 @@ def create_standalone_class(
     real_forward = _unwrap_undecorated_method(f.forward, f.__qualname__)
     old_source = inspect.getsource(real_forward)
     # 5.24: the adapter shows `cache` but wraps past_key_values source; emit its names, re-apply the adapter.
+    # functools.wraps copies the marker onto outer wrappers: walk to the innermost carrier, the adapter itself.
     cache_adapter, _adapted = None, f.forward
-    for _ in range(10):  # under a checkpoint / functools.wraps wrapper too
-        cache_adapter = getattr(_adapted, "_unsloth_cache_kwarg_adapter", None)
-        if cache_adapter is not None or getattr(_adapted, "__wrapped__", None) is None:
+    for _ in range(10):
+        _inner = getattr(_adapted, "__wrapped__", None)
+        _marker = getattr(_adapted, "_unsloth_cache_kwarg_adapter", None)
+        if _marker is not None and getattr(_inner, "_unsloth_cache_kwarg_adapter", None) is None:
+            cache_adapter = _marker
             break
-        _adapted = _adapted.__wrapped__
+        if _inner is None:
+            break
+        _adapted = _inner
     old_init = inspect.getsource(f.__init__)
     if forward_source is None:
         forward_source = old_source
