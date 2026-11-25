@@ -25,7 +25,7 @@ import unsloth_zoo.vllm_utils as vu
 
 NOT_PERMITTED = 800
 FABRIC, POSIX_FD = 8, 1
-FAB_ATTR, RDMA_ATTR = 128, 116
+FAB_ATTR, RDMA_VMM_ATTR, RDMA_ATTR = 128, 110, 116
 
 
 class FakeDriver:
@@ -35,7 +35,8 @@ class FakeDriver:
         self.next_handle = 0xABC0
 
     def cuDeviceGetAttribute(self, out, attr, device):
-        out._obj.value = {FAB_ATTR: self.fabric_attr, RDMA_ATTR: 1}.get(attr, 0)
+        # 116 (non-VMM RDMA) answers 0 so a wrong attribute would leave the RDMA flag unset
+        out._obj.value = {FAB_ATTR: self.fabric_attr, RDMA_VMM_ATTR: 1, RDMA_ATTR: 0}.get(attr, 0)
         return 0
 
     def cuMemGetAllocationGranularity(self, out, prop, option):

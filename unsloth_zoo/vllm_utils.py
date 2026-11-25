@@ -958,8 +958,8 @@ def _cumem_prop(device, handle_type):
     prop.location.type = 1             # CU_MEM_LOCATION_TYPE_DEVICE
     prop.location.id = device
     rdma = ctypes.c_int(0)
-    # CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED = 116, as vLLM sets it
-    if lib.cuDeviceGetAttribute(ctypes.byref(rdma), 116, device) == 0 and rdma.value:
+    # CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED = 110 (116 is the non-VMM attribute), as vLLM queries it
+    if lib.cuDeviceGetAttribute(ctypes.byref(rdma), 110, device) == 0 and rdma.value:
         prop.allocFlags.gpuDirectRDMACapable = 1
     return prop
 pass
