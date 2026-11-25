@@ -562,3 +562,22 @@ def test_scaled_nvfp4_save_merged_model_roundtrip(tmp_path):
     assert type(rblk.dense) is nn.Linear and type(rblk.switch) is VlmSwitchLinear
     assert mx.allclose(rblk.dense(x_d), q_d, atol=5e-2, rtol=2e-2)
     assert mx.allclose(rblk.switch(x_s, idx), q_s, atol=5e-2, rtol=2e-2)
+
+
+def test_dequantized_save_densifies_mlx_vlms_own_quantized_experts(tmp_path):
+    """mlx-lm's dequantize_model knows only its own QuantizedSwitchLinear; experts left without a LoRA stay packed."""
+    vlm_switch = pytest.importorskip("mlx_vlm.models.switch_layers")
+    from mlx_lm.models import switch_layers as lm_switch
+    from unsloth_zoo.mlx.utils import save_merged_model
+
+    mx.random.seed(3)
+    model = nn.Module()
+    model.vlm, model.lm = vlm_switch.QuantizedSwitchLinear(64, 32, 4, bias=False), lm_switch.QuantizedSwitchLinear(64, 32, 4, bias=False)
+    model.vlm.scales, model.vlm.biases = model.vlm.scales.astype(mx.float16), model.vlm.biases.astype(mx.float16)
+    want = {name: mx.dequantize(m.weight, m.scales, m.biases, m.group_size, m.bits, m.mode) for name, m in (("vlm", model.vlm), ("lm", model.lm))}
+    model._config = {"model_type": "qwen3_moe"}
+    save_merged_model(model, type("Tokenizer", (), {"save_pretrained": lambda self, path: None})(), tmp_path, dequantize=True)
+    saved = {k: v for f in tmp_path.glob("*.safetensors") for k, v in mx.load(str(f)).items()}
+    assert set(saved) == {"vlm.weight", "lm.weight"}
+    for name, expected in want.items():
+        assert saved[f"{name}.weight"].dtype == expected.dtype and mx.array_equal(saved[f"{name}.weight"], expected).item(), name

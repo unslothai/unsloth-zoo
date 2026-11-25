@@ -15309,15 +15309,23 @@ def _scaled_quantized_weight_components(module):
     return base_weight, weight, scale_name, scale, pre
 
 
-def _dense_scaled_quantized_modules(model):
+def _dense_quantized_modules_mlx_lm_skips(model):
     """mlx-lm's dequantize_model skips NVFP4 modules with a global scale (mlx-vlm's ScaledQuantized*, the loader's scaled
-    embedding) and would save their packed weights as dense; fold the scale and any AWQ pre_quant_scale in instead."""
+    embedding) and mlx-vlm's own QuantizedSwitchLinear experts, and would save their packed weights as dense; dequantize
+    them here, folding in the global scale and any AWQ pre_quant_scale."""
+    vlm_switch = getattr(sys.modules.get("mlx_vlm.models.switch_layers"), "QuantizedSwitchLinear", None)
+    vlm_switch = vlm_switch if isinstance(vlm_switch, type) else ()
     dense = []
     for name, module in model.named_modules():
         components = _scaled_quantized_weight_components(module)
-        if components is None:
+        if components is not None:
+            weight = components[1].astype(mx.bfloat16)
+        elif isinstance(module, vlm_switch) and getattr(module.weight, "dtype", None) == mx.uint32:
+            # as dequantize_model does for mlx-lm's own experts
+            weight = mx.dequantize(module.weight, module.scales, getattr(module, "biases", None),
+                                   module.group_size, module.bits, module.mode)
+        else:
             continue
-        weight = components[1].astype(mx.bfloat16)
         bias = getattr(module, "bias", None)
         if hasattr(module, "num_embeddings"):
             layer = nn.Embedding(*weight.shape)
@@ -19140,7 +19148,7 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
 
     if dequantize:
         unpacked = _unpack_hadamard_modules(model)
-        _dense_scaled_quantized_modules(model)
+        _dense_quantized_modules_mlx_lm_skips(model)
         model = dequantize_model(model)
         # Rewrite what is saved: it may resolve from `model.config` or `model.args`.
         cfg = _get_model_config(model)
