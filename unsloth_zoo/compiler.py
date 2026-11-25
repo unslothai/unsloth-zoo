@@ -3228,6 +3228,20 @@ def _unwrap_undecorated_method(func, owner_qualname):
 pass
 
 
+def _def_parameter_names(source):
+    """Parameter names of the first `def` header in source (header only, so a cut-off body still parses)."""
+    match = re.search(r"def\s+\w+\s*\([^)]*\)[^:]*:", source)
+    if match is None:
+        return ()
+    try:
+        node = ast.parse(textwrap.dedent(match.group(0)).strip() + " pass").body[0]
+    except SyntaxError:
+        return ()
+    args = node.args
+    return tuple(a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs))
+pass
+
+
 def create_standalone_class(
     module,
     model_location,
@@ -3411,6 +3425,12 @@ def create_standalone_class(
     cache_value = {}
     if cache_adapter is not None and patched_forward_info:
         cache_value = {cache_adapter[0]: cache_adapter[1]}
+    if patched_forward_info:
+        # Direct-assigned replacement (Qwen4ExpTextPLELayer) keeps the old name; the emitted stock definition has `cache`.
+        defined = _def_parameter_names(patched_forward_info[1])
+        for old_name in ("past_key_values", "cache_params"):
+            if old_name in parameters and old_name not in defined and "cache" in defined:
+                cache_value.setdefault(old_name, "cache")
     # Build the forwarding call using keyword arguments (name=name) for regular
     # parameters so that decorators like @merge_with_config_defaults can find
     # them in **kwargs.  When args are passed positionally, the decorator's
