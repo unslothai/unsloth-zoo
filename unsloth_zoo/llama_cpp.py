@@ -55,6 +55,8 @@ import tempfile
 import logging
 import shlex
 import shutil
+import site
+import sysconfig
 import stat as stat_module
 import tarfile
 import zipfile
@@ -155,8 +157,10 @@ LLAMA_CPP_TARGETS = [
     "llama-server",
 ]
 
+_RUNNING_PIP = f'"{sys.executable}" -m pip'
+
 PIP_OPTIONS = [
-    f'"{sys.executable}" -m pip',  # Always prefer the running interpreter's pip
+    _RUNNING_PIP,  # Always prefer the running interpreter's pip
     "uv pip", # Astral's uv
     "pip",
     "pip3",
@@ -825,9 +829,58 @@ def check_pip():
         # For non-uv candidates, require pip-like output to avoid selecting arbitrary commands.
         if not pip.startswith("uv pip") and "pip" not in output.lower():
             continue
+        # A bare `pip` / `python3 -m pip` on PATH can belong to another interpreter (the system
+        # Python from inside a uv venv, which has no pip): installing there never reaches us.
+        if pip != _RUNNING_PIP and not pip.startswith("uv pip") and not _pip_is_for_running_python(output):
+            continue
         return pip
     pass
+    # uv-created venvs ship without pip and uv need not be on PATH: bootstrap this interpreter's pip.
+    ensurepip = subprocess.run(
+        [sys.executable, "-m", "ensurepip", "--upgrade"],
+        stdout = subprocess.PIPE,
+        stderr = subprocess.STDOUT,
+        text = True,
+        encoding = "utf-8",
+        errors = "replace",
+    )
+    if ensurepip.returncode == 0:
+        probe = subprocess.run(
+            [sys.executable, "-m", "pip", "--version"],
+            stdout = subprocess.PIPE,
+            stderr = subprocess.STDOUT,
+            text = True,
+            encoding = "utf-8",
+            errors = "replace",
+        )
+        if probe.returncode == 0:
+            return _RUNNING_PIP
     raise RuntimeError(f"[FAIL] Unsloth: Tried all of `{', '.join(PIP_OPTIONS)}` but failed.")
+pass
+
+
+def _pip_is_for_running_python(version_output):
+    # `pip --version` prints "pip X from <site-packages>/pip (python X.Y)"; an unknown format is kept.
+    match = re.search(r" from (.+?) \(python ", version_output or "")
+    if match is None:
+        return True
+    location = os.path.normcase(os.path.realpath(match.group(1)))
+    roots = list(getattr(site, "getsitepackages", lambda: [])())
+    roots.append(site.getusersitepackages())
+    roots.extend(sysconfig.get_paths()[key] for key in ("purelib", "platlib"))
+    for root in roots:
+        root = os.path.normcase(os.path.realpath(root))
+        if location == root or location.startswith(root.rstrip(os.sep) + os.sep):
+            return True
+    return False
+pass
+
+
+def _pip_install_command(pip, packages):
+    # `uv pip install` targets $VIRTUAL_ENV (and fails without one), not necessarily this interpreter.
+    if pip.startswith("uv pip"):
+        return f'{pip} install --python "{sys.executable}" {packages}'
+    return f"{pip} install {packages}"
 pass
 
 
@@ -2266,7 +2319,7 @@ def _install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_out
                 logger.warning("Unsloth: Prebuilt %s failed (%s) - trying next option.", asset_name, e)
                 continue
             try:
-                try_execute(f"{check_pip()} install gguf protobuf sentencepiece mistral_common", print_output = print_output)
+                try_execute(_pip_install_command(check_pip(), "gguf protobuf sentencepiece mistral_common"), print_output = print_output)
             except Exception as e:
                 logger.warning("Unsloth: Converter dependency install failed (%s); conversion self-heals if needed.", e)
             return result
@@ -2298,7 +2351,7 @@ def _ensure_converter_python_deps(print_output = False):
         except (ImportError, ValueError):
             return True
     if _auto_install_enabled() and any(map(_missing, _CONVERTER_PYTHON_IMPORTS)):
-        try_execute(f"{check_pip()} install gguf protobuf sentencepiece mistral_common", print_output = print_output)
+        try_execute(_pip_install_command(check_pip(), "gguf protobuf sentencepiece mistral_common"), print_output = print_output)
 pass
 
 
@@ -2443,7 +2496,7 @@ def install_llama_cpp(
     pip = check_pip()
 
     # Install Python packages (only if not already satisfied)
-    try_execute(f"{pip} install gguf protobuf sentencepiece mistral_common", **kwargs)
+    try_execute(_pip_install_command(pip, "gguf protobuf sentencepiece mistral_common"), **kwargs)
     if just_clone_repo: return llama_cpp_folder
 
     if needs_build:
