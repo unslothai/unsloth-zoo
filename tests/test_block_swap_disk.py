@@ -28,6 +28,12 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# block_swap finds its disk tier in sys.modules when it is loaded from file.
+_dspec = importlib.util.spec_from_file_location(
+    "unsloth_zoo.block_swap_disk", os.path.join(_HERE, "unsloth_zoo", "block_swap_disk.py"))
+_dmod = importlib.util.module_from_spec(_dspec)
+_dspec.loader.exec_module(_dmod)
+sys.modules.setdefault("unsloth_zoo.block_swap_disk", _dmod)
 _spec = importlib.util.spec_from_file_location(
     "block_swap_disk_under_test", os.path.join(_HERE, "unsloth_zoo", "block_swap.py"))
 _mod = importlib.util.module_from_spec(_spec)

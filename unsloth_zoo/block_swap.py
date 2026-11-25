@@ -106,18 +106,32 @@ def _codec():
 _DISK = []
 
 
+class _NoDiskTier:
+    """Stands in when block_swap_disk cannot be imported: no disk tier, the host RAM refusal stays."""
+
+    @staticmethod
+    def disk_tier_reason():
+        return "unsloth_zoo.block_swap_disk unavailable"
+
+    @staticmethod
+    def host_limit_bytes():
+        return None
+
+    @staticmethod
+    def disk_ref(p):
+        return None
+
+
 def _disk():
-    """unsloth_zoo.block_swap_disk (the sibling file when this one is loaded standalone)."""
+    """unsloth_zoo.block_swap_disk (a copy already in sys.modules first: tests load both files standalone)."""
     if not _DISK:
         mod = sys.modules.get("unsloth_zoo.block_swap_disk")
         if mod is None and __package__ == "unsloth_zoo":
-            from unsloth_zoo import block_swap_disk as mod
-        if mod is None:
-            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "block_swap_disk.py")
-            spec = importlib.util.spec_from_file_location("unsloth_zoo_block_swap_disk", path)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-        _DISK.append(mod)
+            try:
+                from unsloth_zoo import block_swap_disk as mod
+            except Exception:
+                mod = None
+        _DISK.append(mod if mod is not None else _NoDiskTier)
     return _DISK[0]
 
 
