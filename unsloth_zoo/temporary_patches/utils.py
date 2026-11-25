@@ -93,20 +93,36 @@ _OLD_CACHE_NAMES = ("past_key_values", "cache_params")
 _OUTPUT_CACHE_FIELD = {}
 
 
-def _rename_cache_key_for_output(output_class, return_dict):
-    """Hand an output class its own cache field name, so 5.24's deprecated-alias path (and its warning) is skipped."""
-    field = _OUTPUT_CACHE_FIELD.get(output_class)
-    if field is None:
+def _output_cache_renames(output_class):
+    """{old key: field} for the cache fields 5.24 renamed on this output class, e.g. past_key_values -> cache,
+    depth_decoder_past_key_values -> depth_decoder_cache (CSM); empty before 5.24."""
+    renames = _OUTPUT_CACHE_FIELD.get(output_class)
+    if renames is None:
         names = set(getattr(output_class, "__dataclass_fields__", None) or ())
-        field = "cache" if "cache" in names and not names.intersection(_OLD_CACHE_NAMES) else ""
-        _OUTPUT_CACHE_FIELD[output_class] = field
-    if not field or "cache" in return_dict:
+        renames = {}
+        if "cache" in names:
+            renames.update({old: "cache" for old in _OLD_CACHE_NAMES if old not in names})
+        for name in names:
+            if name.endswith("_cache") and name != "cache":
+                old = name[: -len("cache")] + "past_key_values"
+                if old not in names:
+                    renames[old] = name
+        _OUTPUT_CACHE_FIELD[output_class] = renames
+    return renames
+
+
+def _rename_cache_key_for_output(output_class, return_dict):
+    """Hand an output class its own cache field names, so 5.24's deprecated-alias path (and its warning) is skipped
+    and a renamed field without an alias (CsmOutputWithPast.depth_decoder_cache) is not dropped."""
+    renames = _output_cache_renames(output_class)
+    if not renames or not any(old in return_dict for old in renames):
         return return_dict
-    for old_name in _OLD_CACHE_NAMES:
-        if old_name in return_dict:
-            return_dict = dict(return_dict)
-            return_dict["cache"] = return_dict.pop(old_name)
-            break
+    return_dict = dict(return_dict)
+    for old, field in renames.items():
+        if old in return_dict:
+            value = return_dict.pop(old)
+            if return_dict.get(field) is None:
+                return_dict[field] = value
     return return_dict
 
 

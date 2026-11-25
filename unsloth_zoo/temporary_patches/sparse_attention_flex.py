@@ -63,11 +63,9 @@ def _indexer_base(cls, model_type, skip_forward, skip_installer):
 
 
 def _source_has(function, needles):
-    try:
-        source = inspect.getsource(function)
-    except Exception:
-        return False
-    return all(n in source for n in needles)
+    # Needles use the pre-5.24 cache spelling; _skip._source maps 5.24's `cache` onto it.
+    source = _skip._source(function)
+    return bool(source) and all(n in source for n in needles)
 
 
 def _dsa_min_keys():
@@ -238,9 +236,11 @@ def patch_minimax_m3_sparse_flex():
         unsloth_minimax_m3_indexer_forward = unsloth_minimax_m3_indexer_forward,
     )
 
-    def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values = None, **kwargs):
+    # `cache`: transformers 5.24+ decoder layers pass the cache as cache=; past_key_values before.
+    def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values = None, cache = None, **kwargs):
         return unsloth_minimax_m3_sparse_attention_forward(
-            self, hidden_states, position_embeddings, attention_mask, past_key_values, **kwargs
+            self, hidden_states, position_embeddings, attention_mask,
+            past_key_values if cache is None else cache, **kwargs
         )
 
     def indexer_forward(self, hidden_states, position_embeddings, past_key_values, position_ids):
@@ -289,7 +289,7 @@ def unsloth_dsa_indexer_forward(self, hidden_states, q_resid, position_embedding
         )
     # Within the budget: the exact skip (or upstream when the skip is off / not installed).
     return _INNER_INDEXER[family](
-        self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids, past_key_values = past_key_values,
+        self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids, past_key_values,
     )
 
 
@@ -409,12 +409,12 @@ def _patch_dsa_family(family, attn_name, indexer_name, attention_forward):
         or not hasattr(m, "apply_rotary_pos_emb_interleave")
         or not _source_has(attn.forward, _DSA_ATTN_NEEDLES)
         or not _source_has(base[0], _DSA_INDEXER_NEEDLES)
-        or _DSA_INDEXER_ROPE[family] + "(q_rot, k_rot, cos, sin, unsqueeze_dim=2)" not in inspect.getsource(base[0])
+        or _DSA_INDEXER_ROPE[family] + "(q_rot, k_rot, cos, sin, unsqueeze_dim=2)" not in _skip._source(base[0])
     ):
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: {family} attention source differs from the supported layout; sparse flex not installed.")
         return False
-    source = inspect.getsource(attn.forward)
+    source = _skip._source(attn.forward)
     expanded, latent = _DSA_CACHE_EXPANDED in source, _DSA_CACHE_LATENT in source
     if expanded == latent:
         return False
@@ -425,19 +425,25 @@ def _patch_dsa_family(family, attn_name, indexer_name, attention_forward):
         **{f"unsloth_{family}_sparse_attention_forward": attention_forward},
         unsloth_dsa_indexer_forward = unsloth_dsa_indexer_forward,
     )
+    # `cache`: transformers 5.24+ passes the cache as cache= (decoder layer -> attention -> indexer); past_key_values before.
     if family == "deepseek_v32":
-        def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values = None, position_ids = None, **kwargs):
+        def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values = None, position_ids = None, cache = None, **kwargs):
             return unsloth_deepseek_v32_sparse_attention_forward(
-                self, hidden_states, position_embeddings, attention_mask, past_key_values, position_ids, **kwargs
+                self, hidden_states, position_embeddings, attention_mask,
+                past_key_values if cache is None else cache, position_ids, **kwargs
             )
     else:
-        def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values = None, position_ids = None, prev_topk_indices = None, **kwargs):
+        def forward(self, hidden_states, position_embeddings, attention_mask, past_key_values = None, position_ids = None, prev_topk_indices = None, cache = None, **kwargs):
             return unsloth_glm_moe_dsa_sparse_attention_forward(
-                self, hidden_states, position_embeddings, attention_mask, past_key_values, position_ids, prev_topk_indices, **kwargs
+                self, hidden_states, position_embeddings, attention_mask,
+                past_key_values if cache is None else cache, position_ids, prev_topk_indices, **kwargs
             )
 
-    def indexer_forward(self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids = None, past_key_values = None):
-        return unsloth_dsa_indexer_forward(self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids, past_key_values)
+    def indexer_forward(self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids = None, past_key_values = None, cache = None):
+        return unsloth_dsa_indexer_forward(
+            self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids,
+            past_key_values if cache is None else cache,
+        )
 
     indexer._unsloth_original_forward, indexer._unsloth_inner_forward = base
     _INNER_INDEXER[family] = base[1]
