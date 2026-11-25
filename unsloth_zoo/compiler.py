@@ -789,7 +789,7 @@ from unsloth_zoo.loss_utils import (
     unsloth_fused_ce_loss,
 )
 from unsloth_zoo.fused_losses.forward_adapter import lm_head_fake_quantize, lm_head_needs_module_forward, unsloth_fused_lm_head_loss
-from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss, _fuses_model
 from unsloth_zoo.compiler import lm_head_on_old_cuda_arch
 from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs, unsloth_fsdp_unshard
 from unsloth_zoo.fused_losses.aux_loss import unsloth_ga_scale_aux_loss

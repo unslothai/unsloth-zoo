@@ -32,7 +32,7 @@ if not hasattr(torch.compiler, "set_stance"):
     pytest.skip("torch < 2.6 has no torch.compiler.set_stance, so Unsloth never switches the stance", allow_module_level = True)
 
 from unsloth_zoo import compiler
-from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss, _fuses_model
 from unsloth_zoo.temporary_patches.utils import (
     UNSLOTH_DECODE_COMPILE,
     UNSLOTH_EAGER_STANCE_OWNED,
@@ -108,6 +108,7 @@ def _generated_module(compiled, name = "unsloth_compiled_module_test"):
         "UNSLOTH_COMPILE_DISABLE": True,
         "unsloth_fused_ce_loss": _fused_ce,
         "_can_fuse_loss": _can_fuse_loss,
+        "_fuses_model": _fuses_model,
         "UNSLOTH_DECODE_COMPILE": UNSLOTH_DECODE_COMPILE,
         "UNSLOTH_ENABLE_LOGGING": False,
         "logger_compiler": logging.getLogger(__name__),

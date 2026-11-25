@@ -28,6 +28,8 @@ __all__ = [
     "register_canonical",
     "audit",
     "is_enabled",
+    "mark_model",
+    "require_model_marker",
     "EMPTY_LOGITS",
     "unsloth_fused_lm_head_loss",
 ]
@@ -54,6 +56,7 @@ from .ast_rewriter import (
 from .cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs
 from .forward_adapter import EMPTY_LOGITS, unsloth_fused_lm_head_loss
 from .aux_loss import rewrite_aux_loss_ga, unscaled_extra_loss_terms, unsloth_ga_scale_aux_loss
+from ..model_marker import is_unsloth_model, mark_model, require_model_marker
 
 
 logger = logging.getLogger("unsloth_zoo.fused_forward")
@@ -67,6 +70,12 @@ _FAILED: dict[str, str] = {}               # qualname -> error
 _CANONICAL_FORWARDS: dict[str, Any] = {}   # forward_hash -> replacement forward fn
 
 _INSTALL_DONE = False  # set once install_modeling_import_hook has run
+
+
+def _fuses_model(module) -> bool:
+    # The installed forward replaces the class forward, so a model loaded with plain transformers runs it
+    # too: only Unsloth's models (model_marker) take the fused branch and its empty logits.
+    return is_unsloth_model(module)
 
 
 def is_enabled() -> bool:
@@ -293,6 +302,7 @@ def install_for_class(cls) -> bool:
     ns.pop("__name__", None)
     ns["unsloth_fused_lm_head_loss"] = unsloth_fused_lm_head_loss
     ns["_can_fuse_loss"] = _can_fuse_loss
+    ns["_fuses_model"] = _fuses_model
     ns["unsloth_count_aware_cross_entropy"] = unsloth_count_aware_cross_entropy
     ns["unsloth_loss_count_kwargs"] = unsloth_loss_count_kwargs
     ns["EMPTY_LOGITS"] = EMPTY_LOGITS

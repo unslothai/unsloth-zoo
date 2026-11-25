@@ -23,6 +23,8 @@ from .forward_install import (
     register_canonical,
     audit,
     is_enabled,
+    mark_model,
+    require_model_marker,
 )
 from .chunked_logprob import (
     UnslothChunkedLogProbs,

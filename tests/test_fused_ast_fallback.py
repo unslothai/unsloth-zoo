@@ -31,7 +31,7 @@ from unsloth_zoo.fused_losses.ast_rewriter import (
 )
 from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy
 from unsloth_zoo.fused_losses.forward_adapter import EMPTY_LOGITS, unsloth_fused_lm_head_loss
-from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss, _fuses_model
 
 # transformers 5.16.0+ CohereCompassForConditionalGeneration: guarded logit scale.
 COHERE_COMPASS = """
@@ -176,6 +176,7 @@ def _ns():
         EMPTY_LOGITS = EMPTY_LOGITS,
         ForCausalLMLoss = ForCausalLMLoss,
         _can_fuse_loss = _can_fuse_loss,
+        _fuses_model = _fuses_model,
     )
 
 
