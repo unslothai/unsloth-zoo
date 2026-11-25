@@ -138,7 +138,6 @@ def _candidate_dirs():
     env = os.environ.get(_DIR_ENV, "").strip()
     if env:
         return [env]
-    # Colab's local NVMe first, then where the checkpoints live, then the usual scratch places.
     for d in ("/mnt/local-scratch", os.environ.get("HF_HUB_CACHE"), os.environ.get("HF_HOME"),
               os.path.expanduser("~/.cache"), os.getcwd()):
         if d and d not in out:
@@ -167,7 +166,6 @@ def pick_spill_dir(need_bytes):
         except (OSError, AttributeError):  # no statvfs off POSIX
             continue
         seen.append(f"{d} ({free / 2**30:.0f} GiB free)")
-        # A plain local disk with room first, then the most free space.
         key = (free >= need_bytes + _MARGIN_BYTES, not _layered(d), free)
         if best_key is None or key > best_key:
             best, best_key, best_free = d, key, free
@@ -389,8 +387,8 @@ class DiskTier:
         self.ring = [_aligned_empty(self.slot_bytes, pin = True) for _ in range(max(1, slots))]
         self.pinned = all(r[0].pinned for r in self.ring)
         self.free = deque(range(len(self.ring)))
-        self.slot_done = [None] * len(self.ring)   # event after the last card copy out of each staging slot
-        self.waiting = deque()                     # blocks waiting for a staging slot
+        self.slot_done = [None] * len(self.ring)   # last card copy out of each staging slot
+        self.waiting = deque()
         self.inflight = deque()                    # blocks being read (or read, card copy not enqueued yet)
         self.orphans = []                          # (staging slot, futures) of reads whose block was evicted
         self.pool = ThreadPoolExecutor(max_workers = _qd(), thread_name_prefix = "unsloth_disk")
@@ -404,7 +402,6 @@ class DiskTier:
     def host_bytes(self):
         return sum(r[1].numel() for r in self.ring)
 
-    # Reads ---------------------------------------------------------------------------------------------------
     def _read_run(self, store, offset, dst):
         t0 = time.perf_counter()
         store.read(offset, dst)
@@ -499,7 +496,7 @@ class DiskTier:
             return
         t0 = time.perf_counter()
         while block in self.waiting:
-            # No staging slot: finish the reads ahead of it (they are needed first anyway).
+            # No staging slot: finish the reads ahead of it, needed first anyway.
             if self.inflight:
                 self._finish(self.inflight[0])
             elif self.orphans:
