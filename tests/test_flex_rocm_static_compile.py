@@ -81,6 +81,7 @@ def rocm(monkeypatch):
 
     def install(hip = "7.13.0", cpu_is_rocm_gpu = True):
         monkeypatch.setattr(torch.version, "hip", hip, raising = False)
+        monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if hip else "+cu130"))
         monkeypatch.setattr(flex_module, "compile_friendly_flex_attention", ORIGINAL_HELPER)
         monkeypatch.setattr(flex_module, "flex_attention", math_flex)
         monkeypatch.setattr(flex_module.WrappedFlexAttention, "__call__", ORIGINAL_CALL)
@@ -323,6 +324,7 @@ def test_padding_mask_width_is_not_marked_dynamic_on_rocm(rocm, monkeypatch):
 
     def run(hip):
         monkeypatch.setattr(torch.version, "hip", hip, raising = False)
+        monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if hip else "+cu130"))
         monkeypatch.setattr(masking_utils, "flex_attention_mask", original)
         misc.patch_flex_mask_keeps_padding_mask_mod()
         marked.clear()
@@ -493,6 +495,7 @@ def test_incompatible_helper_signature_skips_install(rocm, monkeypatch):
     _, install = rocm
     install(None)
     monkeypatch.setattr(torch.version, "hip", "7.13.0", raising = False)
+    monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if "7.13.0" else "+cu130"))
     monkeypatch.setattr(flex_module, "compile_friendly_flex_attention", incompatible)
     misc.patch_flex_attention_static_shapes_on_rocm()
     assert flex_module.WrappedFlexAttention.__call__ is ORIGINAL_CALL
@@ -515,6 +518,7 @@ def test_zoo_flex_wrapper_dispatch(monkeypatch):
 
     calls, compiled = [], []
     monkeypatch.setattr(torch.version, "hip", "7.13.0", raising = False)
+    monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if "7.13.0" else "+cu130"))
     monkeypatch.setattr(rocm_flex_static, "_affected_device", lambda device: True)
     monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: compiled.append(kwargs) or fn)
 
@@ -532,6 +536,7 @@ def test_zoo_flex_wrapper_dispatch(monkeypatch):
     fn(*_qkv(8, grad = False))
     assert calls == ["static", "auto", "auto"] and [c["dynamic"] for c in compiled] == [False]
     monkeypatch.setattr(torch.version, "hip", None, raising = False)
+    monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if None else "+cu130"))
     assert rocm_flex_static.rocm_static_flex(auto, entry) is auto
 
 
@@ -540,6 +545,7 @@ def test_sparse_attention_compile_gets_the_static_variant(monkeypatch):
     from unsloth_zoo.temporary_patches import deepseek_v4_sparse_flex
 
     monkeypatch.setattr(torch.version, "hip", "7.13.0", raising = False)
+    monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if "7.13.0" else "+cu130"))
     for module in (sparse_attention, deepseek_v4_sparse_flex):
         monkeypatch.setattr(module, "_FLEX", None)
         assert getattr(module._compiled_flex(), "_unsloth_rocm_static", False), module.__name__

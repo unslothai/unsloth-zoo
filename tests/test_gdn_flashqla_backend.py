@@ -292,6 +292,7 @@ def test_load_rejects_flashqla_before_0_1_2(monkeypatch, chunk, version, accepte
     import torch
     monkeypatch.setattr(fv, "_flashqla_version", lambda module: version)
     monkeypatch.setattr(torch.version, "hip", None, raising = False)
+    monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if None else "+cu130"))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (9, 0))
     monkeypatch.setitem(sys.modules, "flash_qla", types.SimpleNamespace(chunk_gated_delta_rule = chunk))
@@ -308,6 +309,7 @@ def test_load_keeps_fla_on_sm120_unless_allowed(monkeypatch, capability, allow, 
     import torch
     monkeypatch.setattr(fv, "_flashqla_version", lambda module: "0.1.3")
     monkeypatch.setattr(torch.version, "hip", None, raising = False)
+    monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if None else "+cu130"))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: capability)
     monkeypatch.setitem(sys.modules, "flash_qla", types.SimpleNamespace(chunk_gated_delta_rule = _qla_chunk_011))
