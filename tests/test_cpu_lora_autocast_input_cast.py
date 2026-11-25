@@ -59,12 +59,19 @@ class _InputUpcasts(TorchDispatchMode):
         return func(*args, **kwargs)
 
 
-def _model(dtype, dropout = 0.0, use_dora = False, seed = 0):
+def _model(dtype, dropout = 0.0, use_dora = False, seed = 0, adapters = 1):
     torch.manual_seed(seed)
     net = _Net().to(dtype)
-    model = get_peft_model(net, LoraConfig(r = 8, lora_alpha = 16, target_modules = ["up", "down"],
-                                           lora_dropout = dropout, use_dora = use_dora))
+    config = lambda: LoraConfig(r = 8, lora_alpha = 16, target_modules = ["up", "down"],  # noqa: E731
+                                lora_dropout = dropout, use_dora = use_dora)
+    model = get_peft_model(net, config())
+    for k in range(1, adapters):
+        model.add_adapter(f"extra{k}", config())
+    if adapters > 1:
+        model.base_model.set_adapter(["default"] + [f"extra{k}" for k in range(1, adapters)])
     for name, p in model.named_parameters():
+        if "lora_" in name:
+            p.data = p.data.float()  # PEFT < 0.19 adds extra adapters in the base dtype
         if "lora_B" in name:
             torch.nn.init.normal_(p, std = 0.05)
     assert all(p.dtype == torch.float32 for n, p in model.named_parameters() if "lora_" in n)
@@ -110,10 +117,12 @@ def test_no_input_upcast_and_same_bits_under_autocast(dtype, stock_cast):
         assert torch.equal(grads[name], ref_grads[name]), name
 
 
-@pytest.mark.parametrize("case", ["no_autocast", "dropout", "dora", "autocast_other_dtype"])
+@pytest.mark.parametrize("case", ["no_autocast", "dropout", "dora", "autocast_other_dtype", "two_adapters",
+                                  "three_adapters"])
 def test_cast_kept_where_autocast_would_not_undo_it(case, stock_cast):
     dtype = torch.bfloat16
-    model = _model(dtype, dropout = 0.1 if case == "dropout" else 0.0, use_dora = case == "dora")
+    adapters = {"two_adapters": 2, "three_adapters": 3}.get(case, 1)
+    model = _model(dtype, dropout = 0.1 if case == "dropout" else 0.0, use_dora = case == "dora", adapters = adapters)
     x = torch.randn(32, 48).to(dtype)
     amp = {"no_autocast": None, "autocast_other_dtype": torch.float16}.get(case, dtype)
     LoraLinear._cast_input_dtype = stock_cast

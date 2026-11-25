@@ -422,7 +422,8 @@ def patch_cpu_sdpa_gqa():
 
 def _lora_input_cast_is_undone(layer, x, dtype):
     """True when lora_A would only cast x back: a bf16 / fp16 CPU input, fp32 adapters, CPU autocast in x's dtype,
-    and only vanilla adapters behind an identity dropout (DoRA and friends read the fp32 input themselves)."""
+    and one vanilla adapter behind an identity dropout (DoRA and friends read the fp32 input themselves; several
+    active adapters share PEFT's fp32 copy, so their input grads are summed in fp32)."""
     if not isinstance(x, torch.Tensor) or dtype != torch.float32 or x.dtype not in (torch.bfloat16, torch.float16):
         return False
     if x.device.type != "cpu" or not torch.is_autocast_enabled("cpu") or torch.get_autocast_dtype("cpu") != x.dtype:
@@ -432,13 +433,12 @@ def _lora_input_cast_is_undone(layer, x, dtype):
     lora_A = getattr(layer, "lora_A", None)
     if dropouts is None or lora_A is None:
         return False
-    for adapter in layer.active_adapters:
-        if adapter not in lora_A:
-            continue
-        if adapter in variants or type(lora_A[adapter]) is not torch.nn.Linear or \
-                type(dropouts[adapter]) is not torch.nn.Identity:
-            return False
-    return True
+    active = [adapter for adapter in layer.active_adapters if adapter in lora_A]
+    if len(active) != 1:
+        return False
+    adapter = active[0]
+    return adapter not in variants and type(lora_A[adapter]) is torch.nn.Linear and \
+        type(dropouts[adapter]) is torch.nn.Identity
 
 
 def patch_peft_lora_autocast_input():
