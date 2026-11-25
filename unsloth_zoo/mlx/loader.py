@@ -389,11 +389,24 @@ def _mlx_lora_type_specs(*, include_convolutions=False):
                 vlm_lora_module.LoRASwitchLinear,
             )
         )
-    from .utils import LoRAHadamardLinear, _hadamard_pack_modules
+    from .utils import (
+        LoRAHadamardLinear,
+        LoRAScaledQuantizedLinear,
+        LoRAScaledQuantizedSwitchLinear,
+        _hadamard_pack_modules,
+        _vlm_nvfp4_types,
+    )
     packs = _hadamard_pack_modules()
     if packs:
         specs.append(_MLXLoRATypeSpec(
             tuple(pack.HadamardQuantizedLinear for pack in packs), LoRAHadamardLinear,
+        ))
+    nvfp4_types = _vlm_nvfp4_types()
+    if len(nvfp4_types) == 2:
+        scaled_linear, scaled_switch = nvfp4_types
+        specs.extend((
+            _MLXLoRATypeSpec((scaled_switch,), LoRAScaledQuantizedSwitchLinear),
+            _MLXLoRATypeSpec((scaled_linear,), LoRAScaledQuantizedLinear),
         ))
     if include_convolutions:
         from .utils import LoRAPointwiseConv2d
@@ -428,22 +441,30 @@ def _is_mlx_lora_base(module, specs=None):
 
 def _mlx_quantized_switch_module_types():
     from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+    from .utils import _vlm_nvfp4_types
 
     types = [QuantizedSwitchLinear]
     vlm_switch_module = sys.modules.get("mlx_vlm.models.switch_layers")
     if vlm_switch_module is not None:
         types.append(vlm_switch_module.QuantizedSwitchLinear)
+    nvfp4_types = _vlm_nvfp4_types()
+    if len(nvfp4_types) == 2:
+        types.append(nvfp4_types[1])
     return tuple(types)
 
 
 def _mlx_quantized_module_types():
     import mlx.nn as nn
+    from .utils import _vlm_nvfp4_types
 
+    nvfp4_types = _vlm_nvfp4_types()
+    extra = (nvfp4_types[0],) if len(nvfp4_types) == 2 else ()
     # Drop non-class placeholders a stand-in runtime exports, else isinstance() raises.
     return tuple(
         t for t in (
             nn.QuantizedLinear,
             nn.QuantizedEmbedding,
+            *extra,
             *_mlx_quantized_switch_module_types(),
         )
         if isinstance(t, type)
@@ -5063,6 +5084,14 @@ def _validate_mlx_adapter_base(model, adapter_cfg):
         ) or not expected_paths.isdisjoint(legacy_switch_paths)
         if not switch_aware_map:
             extra -= legacy_switch_paths
+        from .utils import _vlm_nvfp4_types
+        scaled_types = _vlm_nvfp4_types()
+        if scaled_types and not adapter_cfg.get("base_resolved_quantization_map_supports_scaled_nvfp4"):
+            extra -= {
+                _canonical_mlx_quantization_path(path)
+                for path, module in model.named_modules()
+                if path and isinstance(module, scaled_types)
+            }
         extra = sorted(extra)
         if missing or extra or changed:
             details = []
@@ -8142,6 +8171,8 @@ def _patch_mlx_saving(model, tokenizer):
     model.push_to_hub_merged     = types.MethodType(_mlx_push_to_hub_merged, model)
     model.push_to_hub_gguf       = types.MethodType(_mlx_push_to_hub_gguf, model)
     model.save_lora_adapters     = types.MethodType(_mlx_save_lora_adapters, model)
+    from .vllm_utils import save_lora
+    model.save_lora              = types.MethodType(save_lora, model)
 
 
 # Searched first, so a tree that resolves today keeps resolving the same way.

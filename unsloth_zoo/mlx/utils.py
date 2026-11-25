@@ -1114,6 +1114,25 @@ def _traced_writes(written: dict, seen: dict) -> dict:
     return {k: v for k, v in written.items() if seen.get(k) is not v and traced(v)}
 
 
+def _shared_containers(args, kwargs):
+    """Keys of the dict and list arguments a layer may write into for later layers to read."""
+    return [k for k, v in (*enumerate(args), *kwargs.items()) if isinstance(v, (dict, list))]
+
+
+def _argument(args, kwargs, key):
+    return args[key] if isinstance(key, int) else kwargs[key]
+
+
+def _entries(container):
+    return dict(enumerate(container)) if isinstance(container, list) else dict(container)
+
+
+def _passthrough(x):
+    # A Depends node (no copy) gives each returned write its own cotangent: mx.vjp skips a stop_gradient output,
+    # shifting the rest, and seeds an output returned twice only once.
+    return mx.depends([x], [x])[0]
+
+
 @mx.custom_function
 def _tie_shared_kv_cotangent(x, shared_kv):
     return x, shared_kv
@@ -1151,6 +1170,14 @@ def gradient_checkpointing_bypassed():
         _GC_BYPASS_DEPTH.set(depth)
 
 
+def exempt_from_gradient_checkpointing(model):
+    """Layers of ``model`` skip the class-level checkpoint wrapper, which an inference engine sharing the layer classes
+    would otherwise run, re-assigning its parameters, on every forward."""
+    for _, module in model.named_modules():
+        module._unsloth_no_checkpoint = True
+    return model
+
+
 def _patch_layer_class_for_gc(layer_cls):
     if getattr(layer_cls, '_orig_call', None) is not None:
         return  # already patched
@@ -1158,7 +1185,7 @@ def _patch_layer_class_for_gc(layer_cls):
     fn = layer_cls.__call__
 
     def checkpointed_fn(self, *args, **kwargs):
-        if _GC_BYPASS_DEPTH.get() and not self.training:
+        if getattr(self, "_unsloth_no_checkpoint", False) or (_GC_BYPASS_DEPTH.get() and not self.training):
             return fn(self, *args, **kwargs)
         slot = next((a for a in args if isinstance(a, (_SharedKVSlot, _PrefixKVSlot, _PrefixStateSlot))), None)
         if slot is None and isinstance(kwargs.get("cache"), (_PrefixKVSlot, _PrefixStateSlot)):
@@ -1169,9 +1196,13 @@ def _patch_layer_class_for_gc(layer_cls):
             if "shared_kv" in kwargs:
                 args, kwargs["shared_kv"] = _tie_to_hidden_state(
                     args, kwargs["shared_kv"])
-            outer = (args, kwargs)
-            # Mistral Large 4 writes K/V into a dict later layers read; the checkpoint copies it, so return the writes.
-            shared = [i for i, a in enumerate(args) if isinstance(a, dict)]
+            # Layers can write into a dict or list later layers read (Mistral Large 4's K/V, Inkling 2's residual
+            # history); the checkpoint copies its arguments, so return the writes.
+            shared = _shared_containers(args, kwargs)
+            # The closure must not hold those containers: they get its outputs, a cycle through the MLX graph that
+            # Python's gc cannot see, which kept compiled traces and their layers alive.
+            outer = (tuple(None if i in shared else a for i, a in enumerate(args)),
+                     {k: None if k in shared else v for k, v in kwargs.items()})
             wrote = False
 
             def inner_fn(params, *args, **kwargs):
@@ -1180,10 +1211,12 @@ def _patch_layer_class_for_gc(layer_cls):
                 _carry_window_masks(outer, (args, kwargs))
                 args = tuple(_detach_integer_arrays(a) for a in args)
                 kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
-                before = [dict(args[i]) for i in shared]
+                containers = [_argument(args, kwargs, key) for key in shared]
+                before = [_entries(c) for c in containers]
                 with _padding_free_scope(layout):
                     out = fn(self, *args, **kwargs)
-                writes = [_traced_writes(args[i], seen) for i, seen in zip(shared, before)]
+                writes = [mlx.utils.tree_map(_passthrough, _traced_writes(_entries(c), seen))
+                          for c, seen in zip(containers, before)]
                 wrote = any(writes)
                 # Writes go first: mx.checkpoint misaligns cotangents after an output with no gradient (an index).
                 return (writes, out) if wrote else out
@@ -1192,8 +1225,13 @@ def _patch_layer_class_for_gc(layer_cls):
             if not wrote:
                 return out
             writes, out = out
-            for i, written in zip(shared, writes):
-                args[i].update(written)
+            for key, written in zip(shared, writes):
+                target = _argument(args, kwargs, key)
+                if isinstance(target, dict):
+                    target.update(written)
+                else:
+                    for k in sorted(written):
+                        target[k:k + 1] = [written[k]]
             return out
 
         # Shared K/V must cross the checkpoint boundary as a traced argument and traced result; reading it off the slot makes the VJP drop the gradient.
@@ -2111,8 +2149,9 @@ def _embedding_dims(emb):
 
 def _linear_semantic_dims(layer):
     out_dim, in_dim = int(layer.weight.shape[0]), int(layer.weight.shape[1])
-    if type(layer) is nn.QuantizedLinear:
-        in_dim = in_dim * 32 // int(layer.bits)
+    bits = getattr(layer, "bits", None)
+    if isinstance(bits, int) and bits > 0 and hasattr(layer, "scales"):
+        in_dim = in_dim * 32 // int(bits)
     return out_dim, in_dim
 
 
@@ -2272,12 +2311,19 @@ def _is_quantized_layer(layer):
     return hasattr(layer, "scales")
 
 
+def _logit_softcap_unset(tm):
+    return not any(hasattr(holder, "final_logit_softcapping") for holder in (tm, getattr(tm, "args", None)))
+
+
 def _get_logit_softcap(model):
     """Get logit softcapping value if model uses it (e.g. Gemma-2/4), else 0.0."""
     tm = _get_output_transform_owner(model)
     softcap = getattr(tm, "final_logit_softcapping", None)
     if softcap is None and hasattr(tm, "args"):
         softcap = getattr(tm.args, "final_logit_softcapping", None)
+    # Inkling 2 caps from its text config alone; a model that sets the knob itself, even to None (Gemma 4), decides.
+    if _logit_softcap_unset(tm):
+        softcap = getattr(getattr(tm, "config", None), "final_logit_softcapping", None)
     return float(softcap) if softcap is not None and softcap > 0 else 0.0
 
 
@@ -2382,6 +2428,8 @@ def _detect_logit_softcap(model):
     legacy = getattr(tm, "final_logit_softcapping", _KNOB_MISSING)
     if legacy is _KNOB_MISSING and hasattr(tm, "args"):
         legacy = getattr(tm.args, "final_logit_softcapping", _KNOB_MISSING)
+    if _logit_softcap_unset(tm):
+        legacy = getattr(getattr(tm, "config", None), "final_logit_softcapping", _KNOB_MISSING)
     alias, conflict = _knob_value(tm, "logits_soft_cap", ("args", "config"))
     if conflict:
         return 0.0, ("logits_soft_cap differs between its configuration "
@@ -2522,7 +2570,22 @@ def _supports_text_lora_cce(desc, label_smoothing):
     return type(head.linear) is not nn.QuantizedLinear or head.lora_a.shape[1] <= 32
 
 
-def _make_text_lora_cce_loss_fn(head_desc, logit_scale, softcap):
+def _kept_head_rows(model, rows):
+    """Leading head rows whose logits the forward keeps, or None for all: Inkling slices its padded head's logits to
+    unpadded_vocab_size, and CCE must not score the rest."""
+    tm = _get_text_model(model)
+    for holder in (tm, getattr(tm, "args", None), getattr(tm, "config", None)):
+        kept = getattr(holder, "unpadded_vocab_size", None)
+        if isinstance(kept, int) and 0 < kept < rows:
+            return kept
+    return None
+
+
+def _head_rows(rows, *arrays):
+    return arrays if rows is None else tuple(None if a is None else a[:rows] for a in arrays)
+
+
+def _make_text_lora_cce_loss_fn(head_desc, logit_scale, softcap, rows=None):
     from unsloth_zoo.mlx.cce.runtime_cce import make_lora_head_cce
 
     head = head_desc.module
@@ -2558,11 +2621,11 @@ def _make_text_lora_cce_loss_fn(head_desc, logit_scale, softcap):
         base = live_head.linear
         hidden = hidden.reshape((-1, hidden.shape[-1]))
         rank_hidden = live_head.dropout(hidden) @ live_head.lora_a
-        losses = kernel(
-            hidden, base.weight, base.scales if quantized else None,
-            base.get("biases") if quantized else None,
-            rank_hidden, live_head.lora_b, base.get("bias"), targets.reshape((-1,)),
-        )
+        weight, scales, biases, bias = _head_rows(
+            rows, base.weight, base.scales if quantized else None, base.get("biases") if quantized else None,
+            base.get("bias"))
+        lora_b = live_head.lora_b if rows is None else live_head.lora_b[:, :rows]
+        losses = kernel(hidden, weight, scales, biases, rank_hidden, lora_b, bias, targets.reshape((-1,)))
         return losses.sum() / _safe_token_denominator(count), count
 
     loss_fn._unsloth_cce_backend = "runtime-cce-lora-head"
@@ -2627,7 +2690,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0, loss_type="nll"):
         loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
         loss_fn._unsloth_cce_backend = "baseline-fallback"
         loss_fn._unsloth_compiled_loss_fn = _make_text_lora_cce_loss_fn(
-            head_desc, logit_scale, softcap,
+            head_desc, logit_scale, softcap, _kept_head_rows(model, head_desc.module.linear.weight.shape[0]),
         )
         return loss_fn
 
@@ -2637,6 +2700,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0, loss_type="nll"):
         print(f"Unsloth: CCE using logit_scale={logit_scale} for this model.")
 
     lm_layer = head_desc.module
+    _rows = _kept_head_rows(model, lm_layer.weight.shape[0])
     use_quantized = _is_quantized_layer(lm_layer)
 
     _head_path = head_desc.path
@@ -2693,6 +2757,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0, loss_type="nll"):
             bi = layer.biases if _has_biases else None
             if bi is None and quant_mode == "affine":
                 bi = mx.zeros_like(sc)
+            w, sc, bi = _head_rows(_rows, w, sc, bi)
             steps = mx.arange(1, targets.shape[1] + 1)
             length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
             # Widen unsigned dtypes so mx.where can inject the signed -100; mx.where on uint crashes the torch-backed shim.
@@ -2735,7 +2800,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0, loss_type="nll"):
                 inputs = batch[:, :-1]
                 targets = labels[:, 1:]
             hidden = _get_backbone(model)(model, inputs)
-            w = _get_lm_weight_layer(model).weight
+            w, = _head_rows(_rows, _get_lm_weight_layer(model).weight)
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             steps = mx.arange(1, targets.shape[1] + 1)
@@ -4887,6 +4952,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None, los
     if logit_scale is not None:
         print(f"Unsloth: VLM CCE using logit_scale={logit_scale} for this model.")
     lm_layer = head_desc.module
+    _rows = _kept_head_rows(model, lm_layer.weight.shape[0])
     use_quantized = _is_quantized_layer(lm_layer)
     _head_path = head_desc.path
     # Evaluate once (after LoRA setup); trainability doesn't change mid-training.
@@ -4937,6 +5003,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None, los
             bi = getattr(lm_head, "biases", None)
             if bi is None and quant_mode == "affine":
                 bi = mx.zeros_like(sc)
+            w, sc, bi = _head_rows(_rows, w, sc, bi)
             # Quantized backward already returns zero weight/scales/biases gradients (see runtime_cce.py VJP), so
             # stop_gradient is redundant here even when the LM head is frozen.
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
@@ -4968,7 +5035,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None, los
             hidden, masked_targets, ntoks = _vlm_cce_forward(
                 model, batch_dict, image_token_ids=_image_token_ids,
                 assistant_token_id=_assistant_token_id)
-            w = _resolve_module_path(model, _head_path).weight
+            w, = _head_rows(_rows, _resolve_module_path(model, _head_path).weight)
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
@@ -5017,8 +5084,8 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None, los
 
 def _get_vlm_image_size(config, processor):
     """Target size for uniform resizing, from vision_config.image_size then processor.image_processor.size, else 512;
-    None for a processor that sizes images to its own token budget; area-style size dicts (Qwen2.5-VL min/max pixels)
-    are skipped: as dimensions they upsample to 3136x3136 and OOM."""
+    None for a processor that sizes images to its own token budget; encoder-tile sizes (<= patch * merge) and
+    area-style size dicts (Qwen2.5-VL min/max pixels: as dimensions they upsample to 3136x3136 and OOM) are skipped."""
     vc = config.get("vision_config") if isinstance(config, dict) else getattr(config, "vision_config", None)
     if vc is not None:
         sz = vc.get("image_size") if isinstance(vc, dict) else getattr(vc, "image_size", None)
@@ -5030,6 +5097,7 @@ def _get_vlm_image_size(config, processor):
         return None
     if ip is not None:
         sz = getattr(ip, "size", None)
+        candidate = None
         if isinstance(sz, dict):
             # Skip area-pixel-count dicts (Qwen2.5-VL style): their shortest_edge and longest_edge are area bounds, not dimensions.
             if "longest_edge" in sz and sz.get("longest_edge", 0) > 1_000_000:
@@ -5037,10 +5105,31 @@ def _get_vlm_image_size(config, processor):
             else:
                 h = sz.get("height", sz.get("shortest_edge", 0))
                 if isinstance(h, int) and 0 < h < 4096:
-                    return h
+                    candidate = h
         elif isinstance(sz, int) and sz > 0:
-            return sz
+            candidate = sz
+        if candidate is not None and candidate > _vlm_encoder_tile(vc, ip):
+            return candidate
     return 512
+
+
+def _vlm_pos_int(obj, *keys):
+    for key in keys:
+        val = obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+        if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+            return val
+    return None
+
+
+def _vlm_encoder_tile(*sources):
+    """Largest patch * merge side across vision_config / image processor (Inkling 2: 20 * 2 = 40)."""
+    tile = 0
+    for src in sources:
+        patch = None if src is None else _vlm_pos_int(src, "native_patch_size", "patch_size")
+        if patch is not None:
+            merge = _vlm_pos_int(src, "adapter_merge_size", "spatial_merge_size", "merge_size") or 1
+            tile = max(tile, patch * merge)
+    return tile
 
 
 def _is_vlm_no_resize_image_size(image_size):
@@ -15008,8 +15097,8 @@ def _inherit_target_permissions(tmp_file, target):
     try:
         # Group before mode: chown clears the setgid bit on some systems, so applying the mode afterwards keeps it; the owner is left alone.
         os.chown(str(tmp_file), -1, info.st_gid)
-    except OSError:
-        pass  # Not a member of that group, or a filesystem without ownership.
+    except (OSError, AttributeError):
+        pass  # Not a member of that group, a filesystem without ownership, or Windows (no os.chown).
     try:
         os.chmod(str(tmp_file), info.st_mode & 0o7777)
     except OSError:
@@ -15187,33 +15276,54 @@ def _unpack_hadamard_modules(model):
     return bool(dense)
 
 
+def _scaled_switch_linear_class(module):
+    if type(module).__module__.startswith("mlx_vlm."):
+        from mlx_vlm.models.switch_layers import SwitchLinear
+        return SwitchLinear
+    from mlx_lm.models.switch_layers import SwitchLinear
+    return SwitchLinear
+
+
+def _scaled_quantized_weight_components(module):
+    scale_name = getattr(module, "_scale_name", None) or next(
+        (key for key in ("weight_scale_2", "weight_global_scale")
+         if getattr(module, key, None) is not None),
+        None,
+    )
+    packed = getattr(module, "weight", None)
+    if scale_name is None or getattr(module, "scales", None) is None or getattr(packed, "dtype", None) != mx.uint32:
+        return None
+    base_weight = mx.dequantize(
+        packed, module.scales, getattr(module, "biases", None),
+        module.group_size, module.bits, module.mode, dtype=mx.float32,
+    )
+    scale = getattr(module, scale_name).astype(mx.float32)
+    if scale.size > 1:
+        scale = scale.reshape(*base_weight.shape[:-2], -1, 1)
+    weight = base_weight / scale if scale_name == "weight_global_scale" else base_weight * scale
+    pre = getattr(module, "pre_quant_scale", None)
+    if pre is not None:
+        pre = pre.astype(mx.float32)
+        pre = pre.reshape(*pre.shape[:-1], 1, pre.shape[-1]) if pre.ndim > 1 else pre
+        weight = weight * pre
+    return base_weight, weight, scale_name, scale, pre
+
+
 def _dense_scaled_quantized_modules(model):
     """mlx-lm's dequantize_model skips NVFP4 modules with a global scale (mlx-vlm's ScaledQuantized*, the loader's scaled
     embedding) and would save their packed weights as dense; fold the scale and any AWQ pre_quant_scale in instead."""
     dense = []
     for name, module in model.named_modules():
-        scale_name = next((key for key in ("weight_scale_2", "weight_global_scale")
-                           if getattr(module, key, None) is not None), None)
-        packed = getattr(module, "weight", None)
-        if scale_name is None or getattr(module, "scales", None) is None or getattr(packed, "dtype", None) != mx.uint32:
+        components = _scaled_quantized_weight_components(module)
+        if components is None:
             continue
-        weight = mx.dequantize(packed, module.scales, getattr(module, "biases", None), module.group_size,
-                               module.bits, module.mode, dtype=mx.float32)
-        scale = getattr(module, scale_name).astype(mx.float32)
-        if scale.size > 1:
-            scale = scale.reshape(*weight.shape[:-2], -1, 1)
-        weight = weight / scale if scale_name == "weight_global_scale" else weight * scale
-        pre = getattr(module, "pre_quant_scale", None)
-        if pre is not None:
-            pre = pre.astype(mx.float32)
-            weight = weight * (pre.reshape(*pre.shape[:-1], 1, pre.shape[-1]) if pre.ndim > 1 else pre)
-        weight = weight.astype(mx.bfloat16)
+        weight = components[1].astype(mx.bfloat16)
         bias = getattr(module, "bias", None)
         if hasattr(module, "num_embeddings"):
             layer = nn.Embedding(*weight.shape)
         elif weight.ndim == 3:
-            from mlx_lm.models.switch_layers import SwitchLinear
-            layer = SwitchLinear(weight.shape[2], weight.shape[1], weight.shape[0], bias=bias is not None)
+            switch_cls = _scaled_switch_linear_class(module)
+            layer = switch_cls(weight.shape[2], weight.shape[1], weight.shape[0], bias=bias is not None)
         else:
             layer = nn.Linear(weight.shape[1], weight.shape[0], bias=bias is not None)
         layer.weight = weight
@@ -15281,6 +15391,145 @@ class LoRAHadamardLinear(nn.Module):
         return fused
 
 
+def _vlm_nvfp4_types():
+    mod = sys.modules.get("mlx_vlm.quantization.nvfp4")
+    if mod is None:
+        return ()
+    return tuple(
+        t for t in (
+            getattr(mod, "ScaledQuantizedLinear", None),
+            getattr(mod, "ScaledQuantizedSwitchLinear", None),
+        )
+        if isinstance(t, type)
+    )
+
+
+_NVFP4_MAX = 6.0 * 448.0
+
+
+def _fuse_scaled_quantized(linear, delta, dequantize):
+    base_weight, effective_weight, scale_name, scale, pre = _scaled_quantized_weight_components(linear)
+    bias = getattr(linear, "bias", None)
+    delta = delta.astype(mx.float32)
+    if dequantize:
+        weight = (effective_weight + delta).astype(mx.bfloat16)
+    else:
+        ws2 = scale_name == "weight_scale_2"
+        # Grow the global scale only where the merge passes NVFP4's 6 * 448 (or it is 0); else keep it bit-exact.
+        target = base_weight * (scale if ws2 else 1 / scale) + (delta / pre if pre is not None else delta)
+        need = mx.abs(target).max(axis=-1, keepdims=True) / _NVFP4_MAX
+        need = need.max() if scale.size == 1 else need.max(axis=-2, keepdims=True) if scale.shape[-2] == 1 else need
+        stored = getattr(linear, scale_name)
+        grow = need > (scale if ws2 else 1 / scale)
+        new_scale = mx.where(grow, need if ws2 else 1 / mx.where(grow, need, 1), scale).astype(stored.dtype)
+        used = new_scale.astype(mx.float32)
+        weight = mx.where(used > 0, target / mx.where(used > 0, used, 1), 0) if ws2 else target * used
+        global_scale = new_scale.reshape(stored.shape)
+    is_switch = weight.ndim == 3
+    layer = (
+        _scaled_switch_linear_class(linear)(weight.shape[2], weight.shape[1], weight.shape[0], bias=bias is not None)
+        if is_switch
+        else nn.Linear(weight.shape[1], weight.shape[0], bias=bias is not None)
+    )
+    layer.weight = weight
+    if bias is not None:
+        layer.bias = bias
+    if dequantize:
+        return layer
+    quantized = (
+        layer.to_quantized(group_size=linear.group_size, bits=linear.bits, mode=linear.mode)
+        if is_switch
+        else nn.QuantizedLinear.from_linear(layer, linear.group_size, linear.bits, mode=linear.mode)
+    )
+    pre_quant_scale = getattr(linear, "pre_quant_scale", None)
+    extra = (pre_quant_scale,) if pre_quant_scale is not None else ()
+    return type(linear)(quantized, global_scale, scale_name, *extra)
+
+
+class LoRAScaledQuantizedLinear(nn.Module):
+    @staticmethod
+    def supports(module):
+        types = _vlm_nvfp4_types()
+        return (
+            len(types) == 2
+            and isinstance(module, types[0])
+            and not isinstance(module, types[1])
+            and not getattr(module, "_quantize_activations", False)
+        )
+
+    @staticmethod
+    def from_base(linear, r=8, dropout=0.0, scale=20.0):
+        if not LoRAScaledQuantizedLinear.supports(linear):
+            raise ValueError("LoRA requires a non-activation-quantized ScaledQuantizedLinear.")
+        output_dims = linear.weight.shape[0]
+        input_dims = linear.scales.shape[-1] * linear.group_size
+        module = LoRAScaledQuantizedLinear()
+        module.linear = linear
+        module.dropout = nn.Dropout(p=dropout)
+        module.scale = scale
+        bound = 1 / math.sqrt(input_dims)
+        module.lora_a = mx.random.uniform(low=-bound, high=bound, shape=(input_dims, r))
+        module.lora_b = mx.zeros((r, output_dims))
+        return module
+
+    def __call__(self, x):
+        y = self.linear(x)
+        z = (self.dropout(x) @ self.lora_a) @ self.lora_b
+        return y + (self.scale * z).astype(x.dtype)
+
+    def fuse(self, dequantize=False):
+        delta = (self.scale * self.lora_b.T) @ self.lora_a.T
+        return _fuse_scaled_quantized(self.linear, delta, dequantize)
+
+
+class LoRAScaledQuantizedSwitchLinear(nn.Module):
+    @staticmethod
+    def supports(module):
+        types = _vlm_nvfp4_types()
+        return (
+            len(types) == 2
+            and isinstance(module, types[1])
+            and not getattr(module, "_quantize_activations", False)
+        )
+
+    @staticmethod
+    def from_base(linear, r=8, dropout=0.0, scale=20.0):
+        if not LoRAScaledQuantizedSwitchLinear.supports(linear):
+            raise ValueError("LoRA requires a non-activation-quantized ScaledQuantizedSwitchLinear.")
+        input_dims = linear.input_dims
+        output_dims = linear.output_dims
+        num_experts = linear.num_experts
+        module = LoRAScaledQuantizedSwitchLinear()
+        module.linear = linear
+        module.dropout = nn.Dropout(p=dropout)
+        module.scale = scale
+        module.num_experts = num_experts
+        bound = 1 / math.sqrt(input_dims)
+        module.lora_a = mx.random.uniform(low=-bound, high=bound, shape=(num_experts, r, input_dims))
+        module.lora_b = mx.zeros((num_experts, output_dims, r))
+        return module
+
+    def __call__(self, x, indices, sorted_indices=False):
+        y = self.linear(x, indices, sorted_indices=sorted_indices)
+        z = mx.gather_mm(
+            self.dropout(x),
+            self.lora_a.swapaxes(-1, -2),
+            rhs_indices=indices,
+            sorted_indices=sorted_indices,
+        )
+        z = mx.gather_mm(
+            z,
+            self.lora_b.swapaxes(-1, -2),
+            rhs_indices=indices,
+            sorted_indices=sorted_indices,
+        )
+        return y + (self.scale * z).astype(x.dtype)
+
+    def fuse(self, dequantize=False):
+        delta = (self.scale * self.lora_b) @ self.lora_a
+        return _fuse_scaled_quantized(self.linear, delta, dequantize)
+
+
 def _extract_mlx_lora_parameters(model):
     """Extract global rank, scale, and dropout from the model's first LoRA module."""
     rank, scale, dropout = 8, 1.0, 0.0
@@ -15342,6 +15591,9 @@ _LORA_WRAPPED_BASE_SUFFIXES = (
     ".linear.weight",
     ".linear.scales",
     ".linear.biases",
+    ".linear.weight_scale_2",
+    ".linear.weight_global_scale",
+    ".linear.pre_quant_scale",
     ".embedding.weight",
     ".embedding.scales",
     ".embedding.biases",
@@ -15351,6 +15603,7 @@ _LORA_WRAPPED_BASE_SUFFIXES = (
 _ROOT_LORA_WRAPPED_BASE_KEYS = frozenset({
     "weight", "scales", "biases",
     "linear.weight", "linear.scales", "linear.biases",
+    "linear.weight_scale_2", "linear.weight_global_scale", "linear.pre_quant_scale",
     "embedding.weight", "embedding.scales", "embedding.biases",
 })
 
@@ -15804,18 +16057,8 @@ def _infer_snapshot_commit(path):
 
 
 def _effective_mlx_quantization_map(model):
-    from mlx_lm.models.switch_layers import QuantizedSwitchLinear
-
-    quantized_types = [
-        nn.QuantizedLinear,
-        nn.QuantizedEmbedding,
-        QuantizedSwitchLinear,
-    ]
-    vlm_switch_module = sys.modules.get("mlx_vlm.models.switch_layers")
-    if vlm_switch_module is not None:
-        quantized_types.append(vlm_switch_module.QuantizedSwitchLinear)
-    # Drop non-class placeholders a stand-in runtime exports, else isinstance() raises.
-    quantized_types = tuple(t for t in quantized_types if isinstance(t, type))
+    from .loader import _mlx_quantized_module_types
+    quantized_types = _mlx_quantized_module_types()
 
     quantized = {}
     config = getattr(model, "_config", None)
@@ -16076,10 +16319,12 @@ def _enrich_mlx_adapter_config(model, adapter_config):
     if resolved_map:
         adapter_config["base_resolved_quantization_map"] = resolved_map
         adapter_config["base_resolved_quantization_map_supports_switch"] = True
+        adapter_config["base_resolved_quantization_map_supports_scaled_nvfp4"] = True
         adapter_config.pop("base_quantization_map", None)
     else:
         adapter_config.pop("base_resolved_quantization_map", None)
         adapter_config.pop("base_resolved_quantization_map_supports_switch", None)
+        adapter_config.pop("base_resolved_quantization_map_supports_scaled_nvfp4", None)
         adapter_config.pop("base_quantization_map", None)
 
     requires_runtime = False

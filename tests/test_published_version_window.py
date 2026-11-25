@@ -580,6 +580,7 @@ def test_the_datasets_checker_rejects_the_window_that_would_ship_the_defect() ->
 TRL_1_DATASETS_FLOOR = Version("4.7.0")
 DATASETS_RELEASES = (
     "4.3.0", "4.4.0", "4.4.1", "4.4.2", "4.5.0", "4.6.0", "4.6.1", "4.7.0", "4.8.0", "4.8.5",
+    "5.0.0", "5.0.1", "5.1.0", "5.2.0",
 )
 
 

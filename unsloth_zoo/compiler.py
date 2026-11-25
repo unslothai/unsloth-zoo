@@ -789,7 +789,7 @@ from unsloth_zoo.loss_utils import (
     unsloth_fused_ce_loss,
 )
 from unsloth_zoo.fused_losses.forward_adapter import lm_head_fake_quantize, lm_head_needs_module_forward, unsloth_fused_lm_head_loss
-from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss, _fuses_model
 from unsloth_zoo.compiler import lm_head_on_old_cuda_arch
 from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs, unsloth_fsdp_unshard
 from unsloth_zoo.fused_losses.aux_loss import unsloth_ga_scale_aux_loss
@@ -3228,6 +3228,20 @@ def _unwrap_undecorated_method(func, owner_qualname):
 pass
 
 
+def _def_parameter_names(source):
+    """Parameter names of the first `def` header in source (header only, so a cut-off body still parses)."""
+    match = re.search(r"def\s+\w+\s*\([^)]*\)[^:]*:", source)
+    if match is None:
+        return ()
+    try:
+        node = ast.parse(textwrap.dedent(match.group(0)).strip() + " pass").body[0]
+    except SyntaxError:
+        return ()
+    args = node.args
+    return tuple(a.arg for a in (*args.posonlyargs, *args.args, *args.kwonlyargs))
+pass
+
+
 def create_standalone_class(
     module,
     model_location,
@@ -3256,6 +3270,18 @@ def create_standalone_class(
     # the undecorated function instead of off the class attribute.
     real_forward = _unwrap_undecorated_method(f.forward, f.__qualname__)
     old_source = inspect.getsource(real_forward)
+    # 5.24: the adapter shows `cache` but wraps past_key_values source; emit its names, re-apply the adapter.
+    # functools.wraps copies the marker onto outer wrappers: walk to the innermost carrier, the adapter itself.
+    cache_adapter, _adapted = None, f.forward
+    for _ in range(10):
+        _inner = getattr(_adapted, "__wrapped__", None)
+        _marker = getattr(_adapted, "_unsloth_cache_kwarg_adapter", None)
+        if _marker is not None and getattr(_inner, "_unsloth_cache_kwarg_adapter", None) is None:
+            cache_adapter = _marker
+            break
+        if _inner is None:
+            break
+        _adapted = _inner
     old_init = inspect.getsource(f.__init__)
     if forward_source is None:
         forward_source = old_source
@@ -3392,7 +3418,19 @@ def create_standalone_class(
         compile = ""
 
     # Create new forward calling optimized function
-    parameters = inspect.signature(real_forward).parameters
+    signature_source = real_forward
+    if cache_adapter is not None:
+        signature_source = getattr(_adapted, "__wrapped__", real_forward)
+    parameters = inspect.signature(signature_source).parameters
+    cache_value = {}
+    if cache_adapter is not None and patched_forward_info:
+        cache_value = {cache_adapter[0]: cache_adapter[1]}
+    if patched_forward_info:
+        # Direct-assigned replacement (Qwen4ExpTextPLELayer) keeps the old name; the emitted stock definition has `cache`.
+        defined = _def_parameter_names(patched_forward_info[1])
+        for old_name in ("past_key_values", "cache_params"):
+            if old_name in parameters and old_name not in defined and "cache" in defined:
+                cache_value.setdefault(old_name, "cache")
     # Build the forwarding call using keyword arguments (name=name) for regular
     # parameters so that decorators like @merge_with_config_defaults can find
     # them in **kwargs.  When args are passed positionally, the decorator's
@@ -3411,7 +3449,7 @@ def create_standalone_class(
         elif key == "self":
             forwarding_parts.append("self")
         else:
-            forwarding_parts.append(f"{key}={key}")
+            forwarding_parts.append(f"{key}={cache_value.get(key, key)}")
     pass
     parameters = ", ".join(forwarding_parts)
 
@@ -3487,6 +3525,11 @@ def create_standalone_class(
 
     # Combine all into file
     source = source + full_class
+    if cache_adapter is not None and not patched_forward_info:
+        source += (
+            "\nfrom unsloth_zoo.temporary_patches.utils import ensure_cache_kwarg as _unsloth_ensure_cache_kwarg\n"
+            f"{module}.forward = _unsloth_ensure_cache_kwarg({module}.forward, {cache_adapter[0]!r}, {cache_adapter[1]!r})\n"
+        )
     if supports_return_hidden_states:
         source += f"\n{module}.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True\n"
 

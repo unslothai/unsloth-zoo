@@ -80,6 +80,10 @@ from .utils import (
     logger,
     Cache,
     process_return,
+    cache_kwarg_name,
+    adapt_cache_kwarg,
+    output_cache,
+    _renamed_cache_param,
 )
 from unsloth_zoo.hf_utils import dtype_from_config
 torch_cuda_device = torch.cuda.device
@@ -151,7 +155,9 @@ def _gpt_oss_mask_device(input_embeds, args, kwargs):
     for x in args:
         if isinstance(x, torch.Tensor) and x.device.type != "cpu":
             return x.device
-    cache = kwargs.get("past_key_values", None)
+    cache = kwargs.get("cache", None)
+    if cache is None:
+        cache = kwargs.get("past_key_values", None)
     for layer in getattr(cache, "layers", None) or ():
         keys = getattr(layer, "keys", None)
         if isinstance(keys, torch.Tensor) and keys.device.type not in ("cpu", "meta"):
@@ -4022,16 +4028,19 @@ def patch_GptOssModel():
             return {"config", "input_embeds", "attention_mask",
                     "cache_position", "past_key_values", "position_ids"}
         return {"config", "inputs_embeds", "attention_mask",
-                "past_key_values", "position_ids"}
+                "cache" if transformers_version >= Version("5.24.0") else "past_key_values", "position_ids"}
     _ccm_params = _mask_factory_params(create_causal_mask, "create_causal_mask")
     _cswc_params = _mask_factory_params(create_sliding_window_causal_mask, "create_sliding_window_causal_mask")
     _mask_params = _ccm_params | _cswc_params
+
+    # 5.24 factories take `cache`; the filter below drops past_key_values, building masks with no cache.
+    _mask_cache_kwarg = "cache" if "cache" in _mask_params else "past_key_values"
 
     def _build_mask_kwargs(config, inputs_embeds, attention_mask, cache_position, past_key_values):
         mk = {
             "config": config,
             "attention_mask": attention_mask,
-            "past_key_values": past_key_values,
+            _mask_cache_kwarg: past_key_values,
         }
         if "inputs_embeds" in _mask_params:
             mk["inputs_embeds"] = inputs_embeds
@@ -4045,6 +4054,10 @@ def patch_GptOssModel():
         is_flex_attention_decoding,
         flex_attention_with_sink_decoding,
     )
+
+    _modeling = transformers.models.gpt_oss.modeling_gpt_oss
+    _layer_cache_kwarg = cache_kwarg_name(_modeling.GptOssDecoderLayer.forward)
+    _attn_cache_kwarg = cache_kwarg_name(_modeling.GptOssAttention.forward)
 
     apply_rotary_pos_emb = torch_compile(apply_rotary_pos_emb)
     try:
@@ -4081,7 +4094,7 @@ def patch_GptOssModel():
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            **{_attn_cache_kwarg: past_key_values},
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
@@ -4126,7 +4139,7 @@ def patch_GptOssModel():
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            **{_attn_cache_kwarg: past_key_values},
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
@@ -4350,7 +4363,7 @@ def patch_GptOssModel():
                         hidden_states,
                         attention_mask=mask,
                         position_ids=position_ids,
-                        past_key_values=past_key_values,
+                        **{_layer_cache_kwarg: past_key_values},
                         use_cache=use_cache,
                         cache_position=cache_position,
                         position_embeddings=position_embeddings,
@@ -4880,6 +4893,8 @@ def patch_gpt_oss_for_grpo(phase="post_compile"):
             return
 
         _original_causal_lm_forward = GptOssForCausalLM.forward
+        _causal_cache_kwarg = cache_kwarg_name(_original_causal_lm_forward)
+        _model_cache_kwarg = cache_kwarg_name(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel.forward)
 
         def _patched_causal_lm_forward(
             self,
@@ -4917,7 +4932,7 @@ def patch_gpt_oss_for_grpo(phase="post_compile"):
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
-                    past_key_values=past_key_values,
+                    **{_causal_cache_kwarg: past_key_values},
                     inputs_embeds=inputs_embeds,
                     labels=labels,
                     use_cache=use_cache,
@@ -4933,7 +4948,7 @@ def patch_gpt_oss_for_grpo(phase="post_compile"):
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_values=past_key_values,
+                **{_model_cache_kwarg: past_key_values},
                 inputs_embeds=inputs_embeds,
                 use_cache=use_cache,
                 output_attentions=output_attentions,
@@ -4950,19 +4965,22 @@ def patch_gpt_oss_for_grpo(phase="post_compile"):
                 hidden_states = hidden_states[:, slice_indices, :]
 
             # Return hidden_states as "logits" for GRPO to use
-            return MoeCausalLMOutputWithPast(
+            return process_return(MoeCausalLMOutputWithPast, dict(
                 loss=None,
                 aux_loss=getattr(outputs, 'aux_loss', None),
                 logits=hidden_states,
-                past_key_values=outputs.past_key_values,
+                past_key_values=output_cache(outputs),
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,
                 router_logits=getattr(outputs, 'router_logits', None),
-            )
+            ))
 
         # Preserve __qualname__ so _unsloth_get_batch_samples can detect
         # this is a CausalLM forward and compute num_items_in_batch properly.
         _patched_causal_lm_forward.__qualname__ = _original_causal_lm_forward.__qualname__
+        _old_cache_name = _renamed_cache_param(_original_causal_lm_forward, _patched_causal_lm_forward)
+        if _old_cache_name is not None:
+            _patched_causal_lm_forward = adapt_cache_kwarg(_patched_causal_lm_forward, _old_cache_name)
         GptOssForCausalLM.forward = _patched_causal_lm_forward
         GptOssForCausalLM._unsloth_grpo_patched = True
         if UNSLOTH_ENABLE_LOGGING:

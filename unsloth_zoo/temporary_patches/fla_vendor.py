@@ -1636,6 +1636,232 @@ def _install_cpu_torch_path():
     return installed
 
 
+# sm75 (T4, RTX 20xx): Triton 3.4+ lowers every tl.dot to FMA there (0 mma.sync; 3.2 still emitted m16n8k8, 3.3 fails
+# to compile a float16 dot), so fla's chunk kernels run on CUDA cores. sm75 calls take unsloth_zoo.gdn_torch_chunk
+# instead; other GPUs, ROCm, CPU, context parallel, the in-kernel gate and packed rows with per-document states keep
+# fla. UNSLOTH_GDN_SM75_TORCH=0 keeps fla everywhere.
+_SM75_TORCH_MARK = "_unsloth_sm75_torch_path"
+_sm75_state = {"capability": None, "calls": 0, "logged": False, "budget": {}, "over_budget": 0, "logged_budget": False}
+
+
+def _sm75_torch_enabled():
+    return os.environ.get("UNSLOTH_GDN_SM75_TORCH", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def _triton_lacks_sm75_dots():
+    try:
+        import triton
+        return _version_at_least(triton.__version__, "3.3.0")
+    except Exception:
+        return False
+
+
+# sm75 without tensor cores (GTX 16xx, Quadro T400-T2000) keeps fla: only T4 and Turing RTX parts.
+_SM75_TENSOR_CORE_NAME = re.compile(r"\bT4\b|RTX", re.IGNORECASE)
+
+
+def _sm75_capabilities():
+    """{device index: (7, 5)} for visible sm75 GPUs with tensor cores, other GPUs their capability; read once
+    outside tracing; {} on ROCm / CPU."""
+    caps = _sm75_state["capability"]
+    if caps is None:
+        caps = {}
+        try:
+            import torch
+            if getattr(torch.version, "hip", None) is None and torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    cap = tuple(torch.cuda.get_device_capability(i))
+                    if cap == (7, 5) and not _SM75_TENSOR_CORE_NAME.search(torch.cuda.get_device_name(i) or ""):
+                        cap = ("sm75 without tensor cores",)
+                    caps[i] = cap
+        except Exception:
+            caps = {}
+        _sm75_state["capability"] = caps
+    return caps
+
+
+def _on_sm75(t):
+    """``t`` is a CUDA tensor on an sm75 GPU (by the tensor's own device, not device 0)."""
+    import torch
+    if not isinstance(t, torch.Tensor) or t.device.type != "cuda":
+        return False
+    index = t.device.index
+    if index is None:
+        index = torch.cuda.current_device()
+    return _sm75_capabilities().get(index) == (7, 5)
+
+
+def _sm75_torch_chunk_gated_delta_rule(
+    q, k, v, g, beta = None, scale = None, initial_state = None, output_final_state = False,
+    use_qk_l2norm_in_kernel = False, use_beta_sigmoid_in_kernel = False, allow_neg_eigval = False,
+    state_v_first = False, cu_seqlens = None, **kwargs,
+):
+    """fla's chunk_gated_delta_rule contract on unsloth_zoo.gdn_torch_chunk (context parallel excluded by the caller)."""
+    from unsloth_zoo.gdn_torch_chunk import torch_chunk_gated_delta_rule
+    if "transpose_state_layout" in kwargs:
+        # fla's deprecated name for state_v_first, with fla's conflict check.
+        if state_v_first:
+            raise ValueError("Cannot pass both `state_v_first` and the deprecated `transpose_state_layout`.")
+        state_v_first = kwargs.pop("transpose_state_layout")
+    if use_beta_sigmoid_in_kernel:
+        beta = beta.float().sigmoid() * (2.0 if allow_neg_eigval else 1.0)
+    if initial_state is not None and state_v_first:
+        initial_state = initial_state.transpose(-1, -2)
+    o, final_state = torch_chunk_gated_delta_rule(
+        q, k, v, g, beta, scale = scale, initial_state = initial_state,
+        output_final_state = output_final_state, use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel,
+        cu_seqlens = cu_seqlens,
+    )
+    if final_state is not None and state_v_first:
+        final_state = final_state.transpose(-1, -2).contiguous()
+    return o, final_state
+
+
+# The torch path keeps every chunk's intermediates for backward: measured peak per (token x value head) of one
+# fwd + bwd, K = V = 128: float16 12 KB compiled / 16 KB eager, bfloat16 13 / 17 KB (fla recomputes in backward and
+# keeps far less). Calls whose estimate (eager bound, float32 matmuls above it) exceeds a fraction of the GPU memory
+# free at the first sm75 call keep fla, so a config that fits with fla still fits.
+_SM75_BYTES_PER_TOKEN_HEAD = {"float16": 16 * 1024, "other": 24 * 1024}
+_SM75_MEM_FRACTION = 0.5
+
+
+def _sm75_mem_fraction():
+    try:
+        return float(os.environ.get("UNSLOTH_GDN_SM75_MEM_FRACTION", _SM75_MEM_FRACTION))
+    except ValueError:
+        return _SM75_MEM_FRACTION
+
+
+def _sm75_budget_impl(index):
+    """Bytes the torch path may use on GPU ``index``: a fraction of the memory free (driver free + the caching
+    allocator's unused reserve) at the first sm75 call, read once per device so every call (forward, checkpoint
+    recompute, every compiled graph) decides alike for a given shape."""
+    budgets = _sm75_state["budget"]
+    if index not in budgets:
+        try:
+            import torch
+            free, _ = torch.cuda.mem_get_info(index)
+            free += torch.cuda.memory_reserved(index) - torch.cuda.memory_allocated(index)
+            budgets[index] = int(free * _sm75_mem_fraction())
+        except Exception:
+            budgets[index] = 0
+    return budgets[index]
+
+
+def _sm75_budget(index):
+    return _sm75_budget_impl(index)
+
+
+try:
+    import torch._dynamo as _dynamo
+    # Traced calls read the cached budget as a constant: no graph break, and the shape comparison becomes a guard
+    # (at most one more graph: the fla one, for shapes over the budget).
+    _sm75_budget = _dynamo.assume_constant_result(_sm75_budget)
+except Exception:
+    pass
+
+
+def _sm75_over_budget(q, v):
+    import torch
+    index = q.device.index
+    if index is None:
+        index = torch.cuda.current_device() if q.is_cuda else 0
+    per =_SM75_BYTES_PER_TOKEN_HEAD["float16" if q.dtype == torch.float16 else "other"]
+    return q.shape[0] * q.shape[1] * v.shape[2] * per > _sm75_budget(index)
+
+
+def _make_sm75_chunk_gated_delta_rule(original):
+    """sm75 CUDA calls that fit the torch path -> unsloth_zoo.gdn_torch_chunk; everything else -> ``original``.
+    Plain Python, so an enclosing torch.compile traces it (the recurrence inside is an opaque op)."""
+    import torch
+    signature = inspect.signature(original)
+
+    @functools.wraps(original, updated = ())
+    def chunk_gated_delta_rule(*args, **kwargs):
+        try:
+            a = signature.bind(*args, **kwargs).arguments
+        except TypeError:
+            return original(*args, **kwargs)
+        extra = dict(a.pop("kwargs", {}))
+        q, k, v, g = a.get("q"), a.get("k"), a.get("v"), a.get("g")
+        if (
+            not _on_sm75(q)
+            # Packed documents: one row, no per-document initial / final states (what training passes).
+            or (a.get("cu_seqlens") is not None and (
+                q.shape[0] != 1 or a.get("initial_state") is not None or a.get("output_final_state")
+            ))
+            or a.get("cp_context") is not None
+            or extra.get("use_gate_in_kernel")
+            # Keywords fla reads (or rejects) that the torch path does not implement: fla decides.
+            or set(extra) - {"use_gate_in_kernel", "A_log", "dt_bias", "transpose_state_layout"}
+            or (a.get("allow_neg_eigval") and not a.get("use_beta_sigmoid_in_kernel"))
+            or g is None
+            or a.get("beta") is None
+            or q.dim() != 4
+            or q.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+            or k.shape != q.shape
+            or v.shape[2] % q.shape[2] != 0
+        ):
+            return original(*args, **kwargs)
+        if _sm75_over_budget(q, v):
+            # The torch path's workspace would not fit beside what fla needs: fla, as without this path.
+            if not _compiling():
+                _sm75_state["over_budget"] += 1
+                if not _sm75_state["logged_budget"]:
+                    _sm75_state["logged_budget"] = True
+                    logger.info(
+                        "Unsloth: gated delta calls this large keep fla's kernels on this sm75 GPU: the torch chunked "
+                        "path's workspace would not fit in the free GPU memory."
+                    )
+            return original(*args, **kwargs)
+        for name in ("cu_seqlens_cpu", "cp_context"):
+            a.pop(name, None)
+        for name in ("use_gate_in_kernel", "A_log", "dt_bias"):
+            extra.pop(name, None)
+        # Host-side bookkeeping only outside tracing: a traced global counter is a guard, recompiling every call.
+        if not _compiling():
+            _sm75_state["calls"] += 1
+            if not _sm75_state["logged"]:
+                _sm75_state["logged"] = True
+                logger.info(
+                    "Unsloth: gated delta (linear attention) on this sm75 GPU runs the torch chunked path: "
+                    "Triton has no tensor-core dot on sm75. UNSLOTH_GDN_SM75_TORCH=0 keeps fla's kernels."
+                )
+        return _sm75_torch_chunk_gated_delta_rule(**a, **extra)
+
+    setattr(chunk_gated_delta_rule, _SM75_TORCH_MARK, "torch")
+    # The CPU wrapper underneath stays visible to its installer, so a later patch pass does not wrap this wrapper
+    # again (each pass stacked another CPU / sm75 pair, and the kernel-hub closure bound a middle one).
+    cpu_mark = getattr(original, _CPU_TORCH_MARK, None)
+    if cpu_mark is not None:
+        setattr(chunk_gated_delta_rule, _CPU_TORCH_MARK, cpu_mark)
+    return chunk_gated_delta_rule
+
+
+def _install_sm75_torch_path():
+    """An sm75 GPU is visible and Triton has no sm75 tensor-core dot: route the live fla's chunk_gated_delta_rule
+    through _make_sm75_chunk_gated_delta_rule (every export and the modeling modules that bound it). Anything else:
+    nothing is touched. Idempotent."""
+    if not _sm75_torch_enabled() or not _triton_lacks_sm75_dots():
+        return False
+    if not any(cap == (7, 5) for cap in _sm75_capabilities().values()):
+        return False
+    package = sys.modules.get("fla.ops.gated_delta_rule")
+    original = getattr(package, "chunk_gated_delta_rule", None) if package is not None else None
+    if original is None:
+        return False
+    if getattr(original, _SM75_TORCH_MARK, None) is not None:
+        return True
+    from unsloth_zoo.gdn_torch_chunk import scan_ops
+    if scan_ops() is None:
+        return False
+    wrapped = _make_sm75_chunk_gated_delta_rule(original)
+    _rebind_gated_delta_exports("chunk_gated_delta_rule", original, wrapped, _l2norm_modules(_GATED_DELTA_MODELING))
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info("Unsloth: sm75 gated delta calls take the torch chunked path (unsloth_zoo.gdn_torch_chunk).")
+    return True
+
+
 _FP32_IEEE_MARK = "_unsloth_fp32_ieee_dots"
 
 
@@ -1813,6 +2039,10 @@ def patch_vendor_fla(phase=None):
                 _install_fp32_ieee_dots()
             except Exception as e:
                 logger.warning(f"Unsloth: could not make float32 gated delta use IEEE float32 dots: {e}")
+            try:
+                _install_sm75_torch_path()
+            except Exception as e:
+                logger.warning(f"Unsloth: could not route sm75 gated delta to the torch chunked path: {e}")
             try:
                 _install_gdn_backend()
             except Exception as e:

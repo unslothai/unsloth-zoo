@@ -35,9 +35,23 @@ def _native_cpu_grouped_mm_works():
 pytestmark = pytest.mark.skipif(not _native_cpu_grouped_mm_works(), reason = "torch._grouped_mm has no CPU kernel")
 
 
+def _dynamo_resolves_the_real_grouped_mm():
+    """Dynamo reads `torch._grouped_mm` into its in-graph op table once per process, at the first trace. Built while
+    a spy is installed, the table holds the spy, and the real op then graph-breaks as a skipped builtin for every
+    later compile in that worker. Build (or rebuild) it with the real op before any spy goes in."""
+    trace_rules = getattr(getattr(torch, "_dynamo", None), "trace_rules", None)
+    get_rules = getattr(trace_rules, "get_torch_obj_rule_map", None)
+    if get_rules is None:
+        return
+    if torch._grouped_mm not in get_rules():
+        get_rules.cache_clear()
+        get_rules()
+
+
 @pytest.fixture
 def native(monkeypatch):
     """Route to the real torch._grouped_mm on CPU (the probes say no on CPU) and count its calls."""
+    _dynamo_resolves_the_real_grouped_mm()
     monkeypatch.setattr(M, "_grouped_mm_supported_on", lambda device: True)
     monkeypatch.setattr(M, "_transposed_view_safe_on", lambda device: True)
     real = torch._grouped_mm

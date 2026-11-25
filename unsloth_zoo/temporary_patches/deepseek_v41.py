@@ -182,7 +182,7 @@ def patch_deepseek_v41_gradient_checkpointing():
         if kwargs.get("use_cache"):
             kwargs["use_cache"] = False
         if not getattr(self, "_can_checkpoint_with_cache", False):
-            for key in ("past_key_values", "layer_past"):
+            for key in ("cache", "past_key_values", "layer_past"):
                 if kwargs.get(key) is not None:
                     kwargs[key] = None
 

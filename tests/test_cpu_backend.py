@@ -126,6 +126,38 @@ def test_chunked_ce_all_ignored_matches_mean_nan():
     assert chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = 1).item() == 0.0
 
 
+@pytest.mark.parametrize("amp", [None, torch.bfloat16])
+def test_chunked_ce_casts_an_fp32_head_once_under_autocast(amp):
+    """The detached head misses autocast's cast cache: it is cast once per call, not twice per chunk."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from unsloth_zoo.cpu.ops import chunked_linear_cross_entropy
+
+    class HeadCasts(TorchDispatchMode):
+        count = 0
+        def __torch_dispatch__(self, func, types, args = (), kwargs = None):
+            if func is torch.ops.aten._to_copy.default and tuple(args[0].shape) in ((97, 16), (16, 97)):
+                HeadCasts.count += 1
+            return func(*args, **(kwargs or {}))
+
+    torch.manual_seed(0)
+    hidden = torch.randn(3, 11, 16, requires_grad = True)
+    weight = (torch.randn(97, 16) * 0.2).requires_grad_()
+    labels = torch.randint(0, 97, (3, 11))
+    labels[0, :4] = -100
+    with HeadCasts(), torch.autocast("cpu", dtype = amp or torch.bfloat16, enabled = amp is not None):
+        loss = chunked_linear_cross_entropy(hidden, weight, labels, chunk_rows = 5)
+    assert HeadCasts.count == (0 if amp is None else 1)
+    loss.backward()
+    h = hidden.detach().clone().requires_grad_(); w = weight.detach().clone().requires_grad_()
+    with torch.autocast("cpu", dtype = amp or torch.bfloat16, enabled = amp is not None):
+        ref = _reference(h, w, labels, None)
+    ref.backward()
+    tol = dict(atol = 1e-5, rtol = 1e-5) if amp is None else dict(atol = 2e-2, rtol = 2e-2)
+    torch.testing.assert_close(loss.float(), ref.float(), **tol)
+    torch.testing.assert_close(hidden.grad, h.grad, **tol)
+    torch.testing.assert_close(weight.grad, w.grad, **tol)
+
+
 def test_bf16_policy_override(monkeypatch):
     from unsloth_zoo.cpu import runtime
     runtime.cpu_bf16_supported.cache_clear()
@@ -225,6 +257,40 @@ def test_fp16_trainer_gets_cpu_autocast_and_grad_scaler(monkeypatch, tmp_path, d
     prepared = trainer.accelerator.prepare(model)
     prepared(torch.randn(2, 8))
     assert seen == [torch.float16]
+
+
+@pytest.mark.parametrize("half", ["bf16", "fp16"])
+def test_cpu_autocast_does_not_hand_a_no_grad_cast_to_the_grad_pass(monkeypatch, tmp_path, dtype_policy, half):
+    """A no_grad forward before the grad forward in one loss (KTO's KL pass) must not leave the grad pass a detached
+    low-precision copy of a fp32 weight (a LoRA adapter): torch.autocast caches it for the whole region otherwise."""
+    from unsloth_zoo.cpu.trainer import _patch_cpu_autocast_cache, _patch_cpu_fp16_accelerator, _patch_post_init
+    from transformers import Trainer, TrainingArguments
+    dtype_policy(*(("1", "0") if half == "bf16" else ("0", "1")))
+    monkeypatch.setattr(Trainer, "create_accelerator_and_postprocess", Trainer.create_accelerator_and_postprocess)
+    monkeypatch.setattr(Trainer, "autocast_smart_context_manager", Trainer.autocast_smart_context_manager)
+    monkeypatch.setattr(TrainingArguments, "__post_init__", TrainingArguments.__post_init__)
+    _patch_cpu_fp16_accelerator(Trainer)
+    _patch_cpu_autocast_cache(Trainer)
+    _patch_post_init(TrainingArguments)
+    model = torch.nn.Sequential(torch.nn.Linear(8, 8))
+    seen = []
+    model[0].register_forward_hook(lambda m, i, o: seen.append(o.dtype))
+    args = TrainingArguments(output_dir = str(tmp_path), report_to = [], max_steps = 1, **{half: True})
+    trainer = Trainer(model = model, args = args)
+    assert trainer.accelerator.native_amp
+    prepared = trainer.accelerator.prepare(model)
+    x = torch.randn(2, 8)
+    # The trainer's loss context (transformers 4.x) and accelerate's own autocast (5.x, and every custom loop).
+    for context in (trainer.compute_loss_context_manager, trainer.accelerator.autocast):
+        model.zero_grad(set_to_none = True)
+        seen.clear()
+        with context():
+            with torch.no_grad():
+                prepared(x)
+            out = prepared(x)
+        assert seen == [{"bf16": torch.bfloat16, "fp16": torch.float16}[half]] * 2  # autocast really ran
+        out.float().sum().backward()
+        assert model[0].weight.grad is not None, context.__name__
 
 
 @pytest.mark.parametrize("packing_supported", [False, True])

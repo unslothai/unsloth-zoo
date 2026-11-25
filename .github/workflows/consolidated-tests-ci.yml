@@ -507,6 +507,7 @@ jobs:
               tests/test_grpo_mask_truncated_rows.py \
               tests/test_grpo_autotune_units.py \
               tests/test_grpo_policy_token_caps.py \
+              tests/test_grpo_zero3_collective_forwards_gloo.py \
               tests/test_deepseek_v41_compile_entries.py \
               tests/test_moe_weight_preprocessor_registry_shared.py \
               tests/test_moe_triton_down_lora_roworder.py \
@@ -560,6 +561,7 @@ jobs:
               tests/test_mlx_gkd_guards.py \
               tests/test_output_collector_compile.py \
               tests/test_cpu_loader_prequantized_checkpoint.py \
+              tests/test_cpu_full_finetuning_precision.py \
               tests/test_fp8_partial_block_dequant.py \
               -v
           }

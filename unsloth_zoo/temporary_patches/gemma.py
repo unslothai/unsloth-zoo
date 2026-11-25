@@ -270,11 +270,29 @@ def _fix_double_bos_and_pad(
 pass
 
 
+def _resolve_Gemma3ProcessorKwargs():
+    """Gemma3ProcessorKwargs without touching transformers' deprecated alias.
+
+    transformers 5.23 turned `Gemma3ProcessorKwargs` into a module `__getattr__`
+    alias of `ProcessingKwargs` that emits a FutureWarning on every access, and
+    5.29 removes it. Use the real class when the module still defines it
+    (4.57.6 .. 5.22, it carries the Gemma 3 `_defaults`), else `ProcessingKwargs`,
+    which is exactly what the alias resolves to.
+    """
+    import transformers.models.gemma3.processing_gemma3 as processing_gemma3
+    kwargs_class = vars(processing_gemma3).get("Gemma3ProcessorKwargs", None)
+    if kwargs_class is not None:
+        return kwargs_class
+    from transformers.processing_utils import ProcessingKwargs
+    return ProcessingKwargs
+pass
+
+
 def patch_Gemma3Processor():
     import re
     try:
         import transformers.models.gemma3.processing_gemma3
-        from transformers.models.gemma3.processing_gemma3 import Gemma3ProcessorKwargs
+        Gemma3ProcessorKwargs = _resolve_Gemma3ProcessorKwargs()
         from transformers.image_utils import make_nested_list_of_images
         from transformers.feature_extraction_utils import BatchFeature
         from transformers.utils import to_py_obj
@@ -559,6 +577,9 @@ def patch_Gemma3TextScaledWordEmbedding():
             weight = self.weight,
             padding_idx = self.padding_idx,
         )
+        # Forced float32 loads never keep bf16 weights; a bf16 one is a model loaded outside Unsloth in this process.
+        if self.weight.dtype == torch.bfloat16:
+            return input_embeds * self.embed_scale.to(self.weight.dtype)
         return input_embeds.to(torch.float32) * self.embed_scale
     pass
     _patch_forced_float32(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding, "forward", forward, fullgraph = True)
@@ -612,11 +633,20 @@ def patch_Gemma3RMSNorm():
         flatten_for_elementwise_norm = flatten_for_elementwise_norm,
         unwrap_norm_weight           = unwrap_norm_weight,
         _gemma3_rms_norm_float32     = _gemma3_rms_norm_float32,
+        _gemma3_rms_norm_generic     = _gemma3_rms_norm_generic,
     )
 
     def forward(self, x): # x can be fp32 (from embeddings) or fp16 (from MLP/Attn)
         x_2d, shape = flatten_for_elementwise_norm(x)
-        out = _gemma3_rms_norm_float32(x_2d, unwrap_norm_weight(self.weight), self.eps)
+        weight = unwrap_norm_weight(self.weight)
+        # A forced float32 load leaves norm weights fp16, or fp32 pinned by `_pre_set_compute_dtype`
+        # (UNSLOTH_HIGH_PRECISION_LAYERNORM, set for every Gemma 3 load). Any other norm belongs to a model
+        # loaded without Unsloth later in this process; the class patch is global, so it keeps the input
+        # dtype as transformers does (else fp16 meets its bf16 / fp32 lm_head).
+        if weight.dtype == torch.float16 or getattr(self, "_pre_set_compute_dtype", None) is torch.float32:
+            out = _gemma3_rms_norm_float32(x_2d, weight, self.eps)
+        else:
+            out = _gemma3_rms_norm_generic(x_2d, weight, self.eps)
         return out.reshape(shape)
     pass
     # No `fullgraph`: the kernel is the compiled unit; compiling this wrapper too

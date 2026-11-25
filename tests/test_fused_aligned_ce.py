@@ -32,7 +32,7 @@ from unsloth_zoo.fused_losses.ast_rewriter import (
 )
 from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy
 from unsloth_zoo.fused_losses.forward_adapter import EMPTY_LOGITS, unsloth_fused_lm_head_loss
-from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss, _fuses_model
 
 
 @pytest.fixture(autouse = True, scope = "module")
@@ -204,6 +204,7 @@ def _compile(src):
         unsloth_fused_lm_head_loss = unsloth_fused_lm_head_loss, EMPTY_LOGITS = EMPTY_LOGITS,
         ForCausalLMLoss = ForCausalLMLoss,
         _can_fuse_loss = _can_fuse_loss,
+        _fuses_model = _fuses_model,
         unsloth_count_aware_cross_entropy = unsloth_count_aware_cross_entropy,
     )
     exec(textwrap.dedent(src), ns)

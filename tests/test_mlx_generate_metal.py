@@ -1653,7 +1653,8 @@ def test_lane_qmm_rows_do_not_depend_on_the_call_and_stay_within_fp32_reordering
     assert any("paired" in name for name in built) == (bits in (2, 4))   # 136 wide is never on the tensor units
     column_tiles = 192 // 8 // matmul._lane_launch(1, 192, K, group_size, bits, dtype).keywords["grid"][1]
     assert tensor or column_tiles == (4 if bits in (2, 4) else 2)
-    assert matmul._lane_launch(1, 160, K, group_size, bits, dtype).keywords["threadgroup"][0] == 32 * 8
+    folded = tensor and bits == 8 and dtype == mx.bfloat16   # the bias reader splits K four ways
+    assert matmul._lane_launch(1, 160, K, group_size, bits, dtype).keywords["threadgroup"][0] == 32 * (4 if folded else 8)
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
@@ -1672,21 +1673,25 @@ def test_tensor_lane_readers_keep_each_rows_bits_within_fp32_reordering(monkeypa
     monkeypatch.setattr(mx.fast, "metal_kernel", nan_filled)
     matmul._lane_launch.cache_clear()
     matmul._lane_sums_launch.cache_clear()
-    wide = "bias" if bits == 4 and dtype == mx.bfloat16 else "slices" if bits == 8 else "staged"
+    wide = "bias" if dtype == mx.bfloat16 else "slices" if bits == 8 else "staged"
     # 20 groups: a whole 16 of them and four past it; 19 groups cannot be staged four at a time. 24 groups: slices
     # starting inside a run of eight; 256: deep enough for the partials to reuse the scale stages.
     narrow, runs = "slices" if bits == 4 else "staged", "scales" if bits == 4 else "staged"
+    if bits == 8 and dtype == mx.bfloat16:
+        narrow = runs = "bias"
     for (N, K), reader in (((matmul._LANE_TENSOR_WIDE, 1280), wide), ((96, 1280), narrow), ((96, 1216), "slices"),
                            ((96, 1536), runs), ((32, 16384), runs)):
         built.clear()
         w, scales, biases = _quantized(N, K, 64, dtype, bits, seed = N + K)
         x = (mx.random.normal((32, K), key = mx.random.key(K)) * (1 + mx.arange(32)[:, None] % 5)).astype(dtype)
+        assert matmul._lane_tensor_x(x, bits).shape == (x.T.shape if bits == 8 else x.shape)
         full = matmul.lane_qmm(x, w, scales, biases, 64, bits)
         widened = matmul.lane_qmm(x, w, scales, biases, 64, bits, output_dtype = mx.float32)
         assert _same_bits([widened.astype(dtype)], [full]) and mx.any(widened != full.astype(mx.float32)).item()
         for start, M in ((5, 1), (2, 3), (7, 8), (11, 9), (16, 16), (1, 17), (0, 32)):
             part = matmul.lane_qmm(x[start:start + M], w, scales, biases, 64, bits)
-            assert _same_bits([part], [full[start:start + M]]), (N, K, start, M)
+            wide_part = matmul.lane_qmm(x[start:start + M], w, scales, biases, 64, bits, output_dtype = mx.float32)
+            assert _same_bits([part, wide_part], [full[start:start + M], widened[start:start + M]]), (N, K, start, M)
         assert {name.split("_")[4] for name in built if "tensor" in name} == {reader}, (N, K, built)
         if reader == "scales":   # also over K's first half, as the shortlist reads it
             for groups in (None, K // 128):
@@ -1812,7 +1817,8 @@ def test_lane_qmms_keeps_each_weights_bits_on_every_reader():
     from unsloth_zoo.mlx import matmul
 
     tensor, readers = matmul._lane_tensor_units(32, 4), set()
-    for bits, dtype, K, Ns in ((8, mx.bfloat16, 512, (96, 32)), (4, mx.float16, 576, (64, 32)), (4, mx.bfloat16, 256, (16384, 16384))):
+    for bits, dtype, K, Ns in ((8, mx.bfloat16, 512, (96, 32)), (8, mx.float16, 512, (96, 32)), (4, mx.float16, 576, (64, 32)),
+                               (4, mx.bfloat16, 256, (16384, 16384))):
         ws = [mx.quantize(mx.random.normal((N, K), key = mx.random.key(N + i)).astype(dtype) * 0.05, group_size = 64, bits = bits)
               for i, N in enumerate(Ns)]
         readers.add(matmul.lane_qmms_reader(Ns[0], K, 64, bits, dtype))

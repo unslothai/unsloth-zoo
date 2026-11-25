@@ -1732,8 +1732,11 @@ class SpeculativeEngine:
         rows = budget.choose()
         draft = self._rows[0].draft
         draft.tree_rows = rows
-        # A block drafted ahead keeps the width it was drafted at; a choice applies from the next block.
-        rows = rows if draft.prefetched_tree is None else draft.prefetched_tree.tokens.size
+        # Only dense budgets vary the draft width between rounds.
+        if isinstance(budget, TreeBudget) and draft.prefetched_tree is not None:
+            width = draft.prefetched_tree.tokens.size
+            if width in budget.tree_costs:
+                rows = width
         if not rows or states[0].remaining == 1:
             return plan
         return replace(plan, tree = rows)
@@ -3015,10 +3018,12 @@ class ContextDrafter:
         return block
 
     def tree(self, row: ContextRow, rows: int):
-        """The next `DraftTree` of about ``rows`` rows: one already drafted ahead, whichever width it was drafted at."""
+        """Reuse a tree drafted ahead at the scheduled width."""
         tree, row.prefetched_tree = row.prefetched_tree, None
         row.prefetched = row.prefetched_confidence = None
-        return self._tree(row.pending, self._context(row), row.cache, rows, row.scan) if tree is None else tree
+        if tree is not None and tree.tokens.size == rows:
+            return tree
+        return self._tree(row.pending, self._context(row), row.cache, rows, row.scan)
 
     def _tree(self, anchor, context: mx.array, cache: list, rows: int, scan = None):
         # Rows within the trained block read its lattice, which accepts a little more than a deeper block's first rows.
@@ -3173,13 +3178,18 @@ _MIN_SIZED_TREE = 3   # two rows cannot fork, and the fused verify block starts 
 
 def _warm_trees(engine: SpeculativeEngine, drafter: ContextDrafter) -> None:
     """Admit draft trees where their rows match their paths' chains here, and time a cycle at each width they may verify."""
-    from .inference import _unless_failed_buffer, tree_verify_matches
+    from .inference import _LANE_LOW_ROWS, _unless_failed_buffer, tree_verify_matches
 
+    drafter.tree_budget = None
     if not drafter.tree_widths or not engine.lm.__dict__.get("_unsloth_tree_verify") or not tree_verify_matches(engine):
         return
+    widths = drafter.tree_widths
+    if vars(engine.lm).get("_unsloth_pathsum_verify"):
+        widths = tuple(n for n in widths if n == 4 or n <= _LANE_LOW_ROWS or tree_verify_matches(engine, n))
+        if not widths:
+            return
     row = engine._rows[0]
-    drafter.tree_budget = None   # A sized budget from an earlier warm-up would resize the widths timed here.
-    depths = max(drafter.tree_widths) - 1
+    depths = max(widths) - 1
     drafter.tree_calibration = TreeCalibration(depths)   # the rounds timed here compile the kernel replies grow trees on
 
     def cycles(plan: RoundPlan) -> float:
@@ -3194,18 +3204,18 @@ def _warm_trees(engine: SpeculativeEngine, drafter: ContextDrafter) -> None:
 
     plan = lambda n: RoundPlan("round", rows = (RowPlan("draft", n - 1),), tree = n)
     if drafter.sized_trees:
-        drafter.tree_budget = pinned = SizedTreeBudget(dict.fromkeys(drafter.tree_widths, 1.0))
+        drafter.tree_budget = pinned = SizedTreeBudget(dict.fromkeys(widths, 1.0))
 
     def timed(n: int) -> float:
         if not drafter.sized_trees:
             return cycles(plan(n))
         # As a reply's round: the widest tree drafted, its first rows verified.
         pinned.pinned = n
-        return cycles(plan(max(drafter.tree_widths)))
+        return cycles(plan(max(widths)))
 
     try:
-        trees = {n: timed(n) for n in drafter.tree_widths}
-        timed(drafter.tree_widths[0])   # A narrower tree folding a wider one's rows is a check of its own.
+        trees = {n: timed(n) for n in widths}
+        timed(widths[0])   # A narrower tree folding a wider one's rows is a check of its own.
     except RuntimeError as error:   # A width whose fused verify block was refused has no tree.
         _unless_failed_buffer(error)
         return

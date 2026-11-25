@@ -67,12 +67,17 @@ def _chunked_ce_forward_impl(hidden: torch.Tensor, weight: torch.Tensor, labels:
     with torch.autocast("cpu", dtype = amp_dtype, enabled = amp):
         return _chunked_ce_forward_loop(
             hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad, need_weight_grad, exact,
+            amp_dtype if amp else None,
         )
 
 
 def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad,
-                             need_weight_grad, exact):
+                             need_weight_grad, exact, amp_dtype = None):
     rows = hidden.shape[0]
+    # A detached head misses autocast's cast cache, so cast it once instead of per chunk.
+    mm_weight = weight
+    if amp_dtype is not None and weight.is_floating_point() and weight.dtype not in (amp_dtype, torch.float64):
+        mm_weight = weight.to(amp_dtype)
     grad_dtype = torch.float32 if exact else hidden.dtype
     grad_hidden = torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else torch.empty(0)
     grad_weight = torch.zeros(weight.shape, dtype = torch.float32) if need_weight_grad else torch.empty(0)
@@ -83,7 +88,7 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
         valid = y != ignore_index
         # Zero ignored rows first: fp16 can overflow to inf in the projection, and NaN * 0 stays NaN.
         h = torch.where(valid.unsqueeze(-1), hidden[start:end], hidden.new_zeros(()))
-        logits = (h @ weight.t()).float()
+        logits = (h @ mm_weight.t()).float()
         safe_y = torch.where(valid, y, torch.zeros_like(y)).unsqueeze(-1)
         logits, log_p_target, _ = _softmax_without_collapse(logits, safe_y)
         total -= (log_p_target.squeeze(-1) * valid).sum()
@@ -96,9 +101,11 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
                     with torch.autocast("cpu", enabled = False):
                         grad_hidden[start:end] = logits @ weight.float()
                 else:
-                    grad_hidden[start:end] = logits.to(h.dtype) @ weight
+                    grad_hidden[start:end] = logits.to(h.dtype) @ mm_weight
             if need_weight_grad:
                 grad_weight.addmm_(logits.t(), h.float())
+        # Free logits before the next projection, else two chunks' logits coexist beside the head copy.
+        del logits
     return total, grad_hidden, grad_weight
 
 
@@ -287,16 +294,21 @@ def _checkpointed_log_probs(hidden, weight, bias, targets, inv_t, softcap, logit
     log_probs = torch.cat(log_probs)
     entropy = torch.cat(entropy) if want_entropy else None
     extras = {}
-    if any(name in outputs for name in ("log_sum_sq_probs", "mean_logits", "is_top1")):
+    metrics = {
+        "log_sum_sq_probs": lambda z, y: torch.logsumexp(2 * torch.log_softmax(z, dim = -1), dim = -1),
+        "mean_logits": lambda z, y: z.mean(-1),
+        "is_top1": lambda z, y: z.argmax(-1) == y,
+    }
+    metrics = {name: metric for name, metric in metrics.items() if name in outputs}  # only the requested ones
+    if metrics:
         # Metrics only (TRL marks them non-differentiable): one more pass without autograd.
         with torch.no_grad():
-            sq, mean, top1 = [], [], []
+            parts = {name: [] for name in metrics}
             for start in range(0, hidden.shape[0], rows):
                 z, _ = _transformed_logits(hidden[start:start + rows], weight, bias, inv_t, softcap, logit_scale)
-                sq.append(torch.logsumexp(2 * torch.log_softmax(z, dim = -1), dim = -1))
-                mean.append(z.mean(-1))
-                top1.append(z.argmax(-1) == targets[start:start + rows])
-            extras = {"log_sum_sq_probs": torch.cat(sq), "mean_logits": torch.cat(mean), "is_top1": torch.cat(top1)}
+                for name, metric in metrics.items():
+                    parts[name].append(metric(z, targets[start:start + rows]))
+            extras = {name: torch.cat(values) for name, values in parts.items()}
     return log_probs, entropy, extras.get("log_sum_sq_probs"), extras.get("mean_logits"), extras.get("is_top1")
 
 
@@ -412,6 +424,51 @@ def patch_cpu_sdpa_gqa():
 
     use_gqa_in_sdpa._unsloth_cpu = True
     sdpa_attention.use_gqa_in_sdpa = use_gqa_in_sdpa
+    return True
+
+
+def _lora_input_cast_is_undone(layer, x, dtype):
+    """True when lora_A would only cast x back: a bf16 / fp16 CPU input, fp32 adapters, CPU autocast in x's dtype,
+    and one vanilla adapter behind an identity dropout (DoRA and friends read the fp32 input themselves; several
+    active adapters share PEFT's fp32 copy, so their input grads are summed in fp32)."""
+    if not isinstance(x, torch.Tensor) or dtype != torch.float32 or x.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    if x.device.type != "cpu" or not torch.is_autocast_enabled("cpu") or torch.get_autocast_dtype("cpu") != x.dtype:
+        return False
+    variants = getattr(layer, "lora_variant", None) or {}
+    dropouts = getattr(layer, "lora_dropout", None)
+    lora_A = getattr(layer, "lora_A", None)
+    if dropouts is None or lora_A is None:
+        return False
+    active = [adapter for adapter in layer.active_adapters if adapter in lora_A]
+    if len(active) != 1:
+        return False
+    adapter = active[0]
+    return adapter not in variants and type(lora_A[adapter]) is torch.nn.Linear and \
+        type(dropouts[adapter]) is torch.nn.Identity
+
+
+def patch_peft_lora_autocast_input():
+    """PEFT upcasts each LoRA input to the fp32 adapter dtype and CPU autocast casts it straight back (exact round
+    trip): two activation copies per module in forward, one in backward, and lora_A saves its own copy. Skip it there."""
+    try:
+        from peft.tuners.lora.layer import Linear as LoraLinear
+    except Exception:
+        return False
+    original = getattr(LoraLinear, "_cast_input_dtype", None)
+    if original is None:
+        return False
+    if getattr(original, "_unsloth_cpu", False):
+        return True
+
+    @functools.wraps(original)
+    def _cast_input_dtype(self, x, dtype):
+        if _lora_input_cast_is_undone(self, x, dtype):
+            return x
+        return original(self, x, dtype)
+
+    _cast_input_dtype._unsloth_cpu = True
+    LoraLinear._cast_input_dtype = _cast_input_dtype
     return True
 
 
@@ -588,15 +645,54 @@ def _plain_lm_head(model):
 
 def _plain_head_weight(head):
     """The weight that alone produces this head's logits, or None (e.g. a LoRA-wrapped lm_head)."""
+    if not isinstance(head, torch.nn.Module) or "forward" in vars(head) or any(
+        getattr(head, name, None) for name in ("_forward_hooks", "_forward_pre_hooks", "_backward_hooks", "_backward_pre_hooks")
+    ):
+        return None  # hooks / an instance forward (user code, DeepSpeed ZeRO-3 gathers) act on the module call
     if type(head) is torch.nn.Linear and head.bias is None:
         return head.weight
     if type(head).__name__ == "ModulesToSaveWrapper":
+        original = getattr(head, "original_module", None)
+        if getattr(head, "disable_adapters", False):
+            return _plain_head_weight(original)  # PEFT's disable_adapter(): the wrapper runs the base head
         adapter = getattr(head, "active_adapter", None)
         adapter = adapter[0] if isinstance(adapter, (list, tuple)) else adapter
         copies = getattr(head, "modules_to_save", None)
         active = copies[adapter] if copies is not None and adapter in copies else None
-        return _plain_head_weight(active if active is not None else getattr(head, "original_module", None))
+        return _plain_head_weight(active if active is not None else original)
     return None
+
+
+@functools.lru_cache(maxsize = None)
+def _forward_takes_index_logits_to_keep(cls):
+    """True when cls.forward slices with transformers' `slice(-k, None) if isinstance(logits_to_keep, int) else
+    logits_to_keep`, or (newer transformers, after 5.18) hands it to `slice_logits_to_keep`, which indexes with a
+    1D tensor the same way; i.e. it also takes a tensor of positions."""
+    try:
+        source = inspect.getsource(cls.forward)
+    except (OSError, TypeError):
+        return False
+    if "slice_logits_to_keep(hidden_states, logits_to_keep)" in source:
+        return True
+    return "isinstance(logits_to_keep, int)" in source and "slice(-logits_to_keep, None)" in source
+
+
+def _logits_to_keep_as_index(model, input_ids, inputs_embeds, logits_to_keep):
+    """An int logits_to_keep slices hidden[:, -k:] as a strided view, which torch < 2.14 does not fold into one GEMM
+    for a bf16 / fp16 head: matmul expands the [V, H] head per row and copies it ([B, H, V], 4.6 s and 1.2 GB for
+    Qwen3-0.6B at B = 4, every generate() prefill and GRPO log-prob pass). The same positions as an index tensor
+    gather a contiguous [B, k, H] and run one GEMM: bit-identical logits. fp32 heads already fold."""
+    if not isinstance(logits_to_keep, int) or isinstance(logits_to_keep, bool) or logits_to_keep <= 0:
+        return logits_to_keep
+    tokens = input_ids if input_ids is not None else inputs_embeds
+    if tokens is None or tokens.dim() < 2 or tokens.shape[1] <= logits_to_keep:
+        return logits_to_keep  # decode steps (one new token) and nothing-to-slice calls stop here
+    weight = getattr(model.get_output_embeddings(), "weight", None)
+    if not isinstance(weight, torch.Tensor) or weight.dtype not in (torch.bfloat16, torch.float16) \
+            or weight.device.type != "cpu" or not _forward_takes_index_logits_to_keep(type(model)):
+        return logits_to_keep
+    length = tokens.shape[1]
+    return torch.arange(length - logits_to_keep, length, device = tokens.device)
 
 
 def patch_chunked_causal_lm_loss(model):
@@ -613,20 +709,53 @@ def patch_chunked_causal_lm_loss(model):
     # outer method, and a bound original would run the source model's weights.
     original_func = original_forward.__func__ if getattr(original_forward, "__self__", None) is model else None
     inner_name = getattr(model, "base_model_prefix", "model")
+    try:
+        params = inspect.signature(original_forward).parameters
+    except (TypeError, ValueError):
+        params = {}
+    cache_kwarg = "cache" if "cache" in params else "past_key_values"
+    output_cache_field = "cache" if "cache" in getattr(CausalLMOutputWithPast, "__dataclass_fields__", {}) \
+        else "past_key_values"
 
     def forward(self, input_ids = None, attention_mask = None, position_ids = None,
                 past_key_values = None, inputs_embeds = None, labels = None, use_cache = None,
                 logits_to_keep = 0, **kwargs):
+        cache = kwargs.pop("cache", None)
+        if past_key_values is None:
+            past_key_values = cache
         shift_labels = kwargs.pop("shift_labels", None)
         head_weight = _plain_head_weight(self.get_output_embeddings())
+        logps_targets = vars(self).get("_unsloth_cpu_logps_targets", None)
+        if logps_targets is not None and head_weight is not None and labels is None and shift_labels is None:
+            # A preference trainer's next-token log-probs from the last hidden state in row chunks (trainer.py). The
+            # head runs here, inside the forward, so DDP / FSDP see a trainable lm_head as used in this forward.
+            kwargs.pop("return_dict", None)
+            outputs = getattr(self, inner_name)(
+                input_ids = input_ids, attention_mask = attention_mask, position_ids = position_ids,
+                **{cache_kwarg: past_key_values}, inputs_embeds = inputs_embeds, use_cache = use_cache, **kwargs,
+            )
+            hidden = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
+            batch_size, length = logps_targets.shape
+            # targets[:, t] is scored by position t: L - 1 targets (ORPO) drop the last position, L (DPO / KTO) keep it.
+            hidden = hidden[:, :length].to(head_weight.dtype)
+            wanted = ("mean_logits", "log_sum_sq_probs") if vars(self).get("_unsloth_cpu_logps_sq", False) else ("mean_logits",)
+            log_probs, _, sq, mean_logits, _ = cpu_chunked_log_probs(
+                hidden.reshape(batch_size * length, hidden.shape[-1]), head_weight, None, logps_targets.reshape(-1), 1.0, None,
+                outputs = wanted,
+            )
+            result = {"log_probs": log_probs.view(batch_size, length), "mean_logits": mean_logits.view(batch_size, length)}
+            if sq is not None:
+                result["log_sum_sq_probs"] = sq.view(batch_size, length)
+            return result
         if (labels is None and shift_labels is None) or not torch.is_grad_enabled() \
                 or not getattr(self, "_unsloth_cpu_chunked_ce_active", False) or head_weight is None:
             if shift_labels is not None:
                 kwargs["shift_labels"] = shift_labels
+            logits_to_keep = _logits_to_keep_as_index(self, input_ids, inputs_embeds, logits_to_keep)
             call = functools.partial(original_func, self) if original_func is not None else original_forward
             return call(
                 input_ids = input_ids, attention_mask = attention_mask, position_ids = position_ids,
-                past_key_values = past_key_values, inputs_embeds = inputs_embeds, labels = labels,
+                **{cache_kwarg: past_key_values}, inputs_embeds = inputs_embeds, labels = labels,
                 use_cache = use_cache, logits_to_keep = logits_to_keep, **kwargs,
             )
         num_items_in_batch = kwargs.pop("num_items_in_batch", None)
@@ -634,7 +763,7 @@ def patch_chunked_causal_lm_loss(model):
         kwargs.pop("return_dict", None)
         outputs = getattr(self, inner_name)(
             input_ids = input_ids, attention_mask = attention_mask, position_ids = position_ids,
-            past_key_values = past_key_values, inputs_embeds = inputs_embeds, use_cache = use_cache,
+            **{cache_kwarg: past_key_values}, inputs_embeds = inputs_embeds, use_cache = use_cache,
             **kwargs,
         )
         hidden = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
@@ -644,7 +773,8 @@ def patch_chunked_causal_lm_loss(model):
         )
         return CausalLMOutputWithPast(
             loss = loss, logits = None,
-            past_key_values = getattr(outputs, "past_key_values", None),
+            **{output_cache_field: outputs.get("cache", outputs.get("past_key_values")) if hasattr(outputs, "get")
+               else getattr(outputs, "past_key_values", None)},
             hidden_states = getattr(outputs, "hidden_states", None),
             attentions = getattr(outputs, "attentions", None),
         )

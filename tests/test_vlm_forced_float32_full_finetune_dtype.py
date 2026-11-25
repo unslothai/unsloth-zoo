@@ -107,6 +107,8 @@ def test_gemma3_projector_float32_full_finetune(forced):
     gemma_patches.patch_Gemma3RMSNorm()
     _apply(gemma_patches, "patch_Gemma3MultiModalProjector")
     projector, vision_outputs = _gemma3_projector(torch.float32)
+    # Every Gemma 3 load pins its norms to float32 (UNSLOTH_HIGH_PRECISION_LAYERNORM); only those take the forced norm.
+    projector.mm_soft_emb_norm._pre_set_compute_dtype = torch.float32
     # The forced norm really does hand the matmul fp16: the crash precondition.
     assert projector.mm_soft_emb_norm(torch.randn(1, 4, 16)).dtype == torch.float16
 

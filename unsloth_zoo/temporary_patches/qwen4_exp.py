@@ -482,6 +482,9 @@ def qwen4_exp_attention_forward(self, hidden_states, position_embeddings, attent
     from unsloth_zoo.temporary_patches.qwen4_exp import (
         _qwen4_exp_sparse_attention, _reference_attention_forward, QWEN4_EXP_SPARSE_STATS,
     )
+    cache = kwargs.pop("cache", None)
+    if past_key_values is None:
+        past_key_values = cache
     out = _qwen4_exp_sparse_attention(self, hidden_states, position_embeddings, attention_mask, past_key_values, kwargs)
     if out is not None:
         if not torch.compiler.is_compiling():
@@ -542,7 +545,12 @@ def qwen4_exp_ple_layer_forward(self, hidden_states, input_ids, past_key_values,
 
 
 def _is_transformers_indexer_forward(function):
-    """By code file: the compiled copy keeps transformers' ``__module__``."""
+    """By code file: the compiled copy keeps transformers' ``__module__``; read through 5.24's ``deprecate_kwarg`` wrapper."""
+    import inspect
+    try:
+        function = inspect.unwrap(function)
+    except ValueError:
+        pass
     code = getattr(function, "__code__", None)
     filename = str(getattr(code, "co_filename", "")).replace("\\", "/")
     return "/transformers/models/qwen4_exp/" in filename

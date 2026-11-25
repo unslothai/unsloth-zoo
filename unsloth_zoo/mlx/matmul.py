@@ -516,6 +516,130 @@ def qmv_rows(x, w, scales, biases, group_size, bits, inputs = None, staged = Fal
         output_shapes = [(M, N)], output_dtypes = [x.dtype])[0]
 
 
+
+_FP_QMV_ROWS = """
+template <typename T, int GS, int BITS, int TILE, bool CONTIGUOUS>
+METAL_FUNC void fp_qmv_rows(
+    const device T* x, const constant int* shape, const constant int64_t* xs,
+    const device uint* w, const constant int64_t* ws,
+    const device uchar* s, const constant int64_t* ss,
+    device T* y, int K, int N, int n, int lane, uint first, uint row_count) {
+  // Match the native dot's contraction while rounding the scaled partial before adding it.
+  #pragma clang fp contract(off)
+  constexpr int V = 64 / BITS, STEP = 32 * V;
+  const int64_t x_col = CONTIGUOUS ? 1 : xs[2], w_col = CONTIGUOUS ? 1 : ws[1];
+  const int64_t s_col = CONTIGUOUS ? 1 : ss[1];
+  const int64_t w_row = CONTIGUOUS ? K * BITS / 32 : ws[0], s_row = CONTIGUOUS ? K / GS : ss[0];
+  w += n * w_row + 2 * lane * w_col;
+  s += n * s_row + lane / (GS / V) * s_col;
+  const device T* rows[TILE];
+  UNROLL for (int r = 0; r < TILE; ++r) {
+    const uint row = min(first + r, row_count - 1);
+    rows[r] = x + (CONTIGUOUS ? row * K : row / shape[1] * xs[0] + row % shape[1] * xs[1])
+                  + lane * V * x_col;
+  }
+  float accum[TILE][4] = {};
+  float values[TILE][V];
+  Terms<float, V, BITS> terms;
+  for (int k = 0; k < K; k += STEP) {
+    UNROLL for (int r = 0; r < TILE; ++r) {
+      if constexpr (CONTIGUOUS) load_vector<T, float, V>(rows[r], values[r]);
+      else UNROLL for (int v = 0; v < V; ++v) values[r][v] = rows[r][v * x_col];
+      rows[r] += STEP * x_col;
+    }
+    UNROLL for (int o = 0; o < 4; ++o) {
+      const device uint* codes = w + o * w_row;
+      if constexpr (CONTIGUOUS) terms.load((const device uchar*)codes);
+      else {
+        UNROLL for (int j = 0; j < 2; ++j) {
+          const uint word = codes[j * w_col];
+          UNROLL for (int v = 0; v < V / 2; ++v)
+            terms.t[j * (V / 2) + v] = Dequantize<BITS>{}(word >> (v * BITS));
+        }
+      }
+      const float scale = dequantize_scale<float, GS>(s[o * s_row]);
+      UNROLL for (int r = 0; r < TILE; ++r) accum[r][o] += scale * terms.dot(values[r]);
+    }
+    w += STEP * BITS / 32 * w_col;
+    s += STEP / GS * s_col;
+  }
+  UNROLL for (int r = 0; r < TILE; ++r) {
+    UNROLL for (int o = 0; o < 4; ++o) {
+      const float sum = simd_sum(accum[r][o]);
+      if (lane == o && first + r < row_count) y[(first + r) * N + n + o] = T(sum);
+    }
+  }
+}
+"""
+
+_FP_QMV_ROWS_BODY = """
+  const int lane = thread_index_in_simdgroup;
+  int n = (threadgroup_position_in_grid.y * 2 + simdgroup_index_in_threadgroup) * 4;
+  const uint first = threadgroup_position_in_grid.z * TILE, rows = x_shape[0] * x_shape[1];
+  const int K = x_shape[2];
+  const device uint* w;
+  const device uchar* s;
+  const constant int64_t *ws, *ss;
+  device T* y;
+  int N;
+  SELECT
+  const bool contiguous = x_strides[2] == 1 && (x_shape[1] == 1 || x_strides[1] == K)
+      && (x_shape[0] == 1 || x_strides[0] == x_shape[1] * K)
+      && ws[1] == 1 && ws[0] == K * BITS / 32 && ss[1] == 1 && ss[0] == K / GS;
+  if (contiguous)
+    fp_qmv_rows<T, GS, BITS, TILE, true>(x, x_shape, x_strides, w, ws, s, ss, y, K, N, n, lane, first, rows);
+  else
+    fp_qmv_rows<T, GS, BITS, TILE, false>(x, x_shape, x_strides, w, ws, s, ss, y, K, N, n, lane, first, rows);
+"""
+
+
+@functools.cache
+def _fp_qmv_rows_kernel(header, count):
+    select = []
+    for i in range(count):
+        bind = f"w = w{i}; ws = w{i}_strides; s = s{i}; ss = s{i}_strides; y = y{i}; N = w{i}_shape[0];"
+        select.append(f"if (n < w{i}_shape[0]) {{ {bind} }} else {{ n -= w{i}_shape[0];" if i + 1 < count else bind)
+    select.extend("}" for _ in range(count - 1))
+    return mx.fast.metal_kernel(
+        name = f"unsloth_fp_qmv_rows_{count}",
+        input_names = ["x", *(f"{name}{i}" for i in range(count) for name in ("w", "s"))],
+        output_names = [f"y{i}" for i in range(count)],
+        header = header + _FP_QMV_ROWS,
+        source = _FP_QMV_ROWS_BODY.replace("SELECT", "\n  ".join(select)),
+        ensure_row_contiguous = False,
+    )
+
+
+@functools.lru_cache(maxsize = 256)
+def _fp_qmv_rows_launch(header, shape, dtype, widths, group_size, bits, tiled):
+    batch, length, _ = shape
+    rows = batch * length
+    tile = 4 if tiled and rows >= 7 else rows
+    kernel = _fp_qmv_rows_kernel(header, len(widths))
+    return functools.partial(
+        kernel, template = [("T", dtype), ("BITS", bits), ("GS", group_size), ("TILE", tile)],
+        grid = (64, sum(widths) // 8, -(-rows // tile)), threadgroup = (64, 1, 1),
+        output_shapes = [(batch, length, n) for n in widths], output_dtypes = [dtype] * len(widths),
+    )
+
+
+def fp_qmv_rows(x, weights, group_size, bits, header, *, tiled):
+    launch = _fp_qmv_rows_launch(header, x.shape, x.dtype, tuple(w.shape[0] for w, _ in weights), group_size, bits, tiled)
+    return launch(inputs = [x, *itertools.chain.from_iterable(weights)])
+
+
+
+@functools.cache
+def compile_fp_qmv_rows(header, group_size, bits, tiled):
+    # Stock shapes are passed as metadata, so these tiny matrices warm the same pipelines as the real projections.
+    k = 2048 // bits
+    weight = (mx.zeros((16, k * bits // 32), mx.uint32), mx.zeros((16, k // group_size), mx.uint8))
+    counts = range(1, 5) if tiled else (1,)
+    rows = range(2, 7 if tiled else 9)
+    mx.eval([fp_qmv_rows(mx.zeros((1, m, k), mx.bfloat16), (weight,) * count, group_size, bits, header, tiled = tiled)
+             for m, count in itertools.product(rows, counts)])
+
+
 def qmv_rows_most(kind):
     return QMV_ROWS_STAGED_MAX if kind == "staged" else QMV_ROWS_MAX
 
@@ -824,18 +948,20 @@ _LANE_TENSOR_ONE = """
 _LANE_TENSOR_HEAD = """
     constexpr int G = K / GS;
     using W = metal::conditional_t<BITS == 4, uint4b_format, uchar>;
-    const int M = x_shape[0];
+    const int M = x_shape[XT];
     const uint simd = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
     const uint c0 = 4 * (lane & 1) + 8 * ((lane >> 3) & 1);
     const uint r0 = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
-    // Dynamic row extents keep each tile's reads within M.
-    auto a0 = tensor((device T*)x, dextents<int, 2>{K, min(M, 16)}, array<int, 2>{1, K});
-    auto a1 = tensor((device T*)x + (RT > 1 ? 16 * K : 0), dextents<int, 2>{K, RT > 1 ? max(M - 16, 1) : 1},
-                     array<int, 2>{1, K});
+    // Dynamic row extents keep each tile's reads within M. XT: x is [K, M], a group's rows one run.
+    const int m0 = min(M, 16), m1 = RT > 1 ? max(M - 16, 1) : 1;
+    auto a0 = tensor((device T*)x, dextents<int, 2>{XT ? m0 : K, XT ? K : m0}, array<int, 2>{1, XT ? M : K});
+    auto a1 = tensor((device T*)x + (RT > 1 ? 16 * (XT ? 1 : K) : 0), dextents<int, 2>{XT ? m1 : K, XT ? K : m1},
+                     array<int, 2>{1, XT ? M : K});
+    const int xk = XT ? 0 : GS, xm = XT ? GS : 0;   // a group's step along each axis of x
     tensor<device W, dextents<int, 2>, tensor_inline> b(
         (device uchar*)w + ulong(n0) * K * BITS / 8, dextents<int, 2>{K, 32}, array<int, 2>{1, K});
-    constexpr auto desc = matmul2d_descriptor(16, 32, GS, false, true, false);
+    constexpr auto desc = matmul2d_descriptor(16, 32, GS, bool(XT), true, false);
     matmul2d<desc, execution_simdgroup> op;
     auto a_first = a0.slice(0, 0);
     auto b_first = b.template slice<GS, 32>(0, 0);
@@ -849,8 +975,8 @@ _LANE_TENSOR_HEAD = """
 """
 _LANE_TENSOR_FOLD = """
             for (int t = 0; t < RT; ++t) {
-                if (t == 0) { auto as = a0.slice(int(g * GS), 0); op.run(as, bs, p); }
-                else { auto as = a1.slice(int(g * GS), 0); op.run(as, bs, p); }
+                if (t == 0) { auto as = a0.slice(int(g) * xk, int(g) * xm); op.run(as, bs, p); }
+                else { auto as = a1.slice(int(g) * xk, int(g) * xm); op.run(as, bs, p); }
                 for (int h = 0; h < H; ++h) {
                     if (16 * t + int(r0) + 8 * h >= M) continue;
                     const float sum = xs[t][h][g];
@@ -942,8 +1068,8 @@ _LANE_BIAS_LOOP = """
         auto bs = b.template slice<GS, 32>(int(g * GS), 0);
         for (int j = 0; j < 8; ++j) sv[j] = float(sp[((j & 3) + 16 * (j >> 2)) * G + g]);
         for (int t = 0; t < RT; ++t) {
-            if (t == 0) { auto as = a0.slice(int(g * GS), 0); op.run(as, bs, p); }
-            else { auto as = a1.slice(int(g * GS), 0); op.run(as, bs, p); }
+            if (t == 0) { auto as = a0.slice(int(g) * xk, int(g) * xm); op.run(as, bs, p); }
+            else { auto as = a1.slice(int(g) * xk, int(g) * xm); op.run(as, bs, p); }
             for (int h = 0; h < H; ++h) {
                 if (16 * t + int(r0) + 8 * h >= M) continue;
                 for (int k = 0; k < 8; ++k) {
@@ -1089,7 +1215,7 @@ _LANE_PARTS = """
 """
 _LANE_TENSOR_BITS = (4, 8)
 _LANE_TENSOR_COLUMNS = 32
-_LANE_TENSOR_WIDE = 16384   # outputs from which 8-bit weights read K slices, and 4-bit bf16 ones outside `scales` fold the bias term
+_LANE_TENSOR_WIDE = 16384   # outputs from which 8-bit fp16 weights read K slices, and 4-bit bf16 ones outside `scales` fold the bias term
 _LANE_STAGED_GROUPS = 16
 _LANE_DEEP_GROUPS = 256
 _LANE_WIDE_COLUMNS = 8192   # from here four column tiles per threadgroup read paired codes faster than two
@@ -1135,15 +1261,21 @@ def _lane_tensor_reader(N, K, group_size, bits, dtype):
     """The tensor-unit reader of an `[N, K]` weight's calls, from its shape alone so that a row's bits do not depend on
     its call: the one measured fastest when each call waits on the one before, as in a forward. 4-bit weights read K
     slices with their scales staged eight groups at a time, where each column's scales are whole 16-byte runs.
-    Otherwise narrower weights read K slices at 4 bits and stage their scales and biases at 8; wider ones fold the bias
-    term as one matmul at 4 bits (bf16 only, where a sum's two halves cannot overflow) and read K slices at 8."""
+    8-bit weights and wide 4-bit ones fold the bias term as one matmul (bf16 only, where a sum's two halves cannot
+    overflow); the rest read K slices, or at 8 bits below the wide width stage their scales and biases."""
     if K // group_size % 4:   # the staged rounds load four groups at once
         return "slices"
     if bits == 4 and K // group_size % 8 == 0:
         return "scales"
+    if bits == 8 and dtype == mx.bfloat16:
+        return "bias"
     if N < _LANE_TENSOR_WIDE:
         return "slices" if bits == 4 else "staged"
     return "slices" if bits == 8 else "bias" if dtype == mx.bfloat16 else "staged"
+
+
+def _lane_tensor_x(x, bits):
+    return mx.contiguous(x.T) if bits == 8 else x   # K-major: the copy pays for itself at 8 bits, not at 4
 
 
 def _lane_paired(group_size, bits):
@@ -1174,7 +1306,7 @@ def _lane_tensor_launch(M, Ns, K, group_size, bits, dtype, output_dtype, groups,
                   "scales": _lane_tensor_simdgroups(K, group_size, bits)}[reader]
     # H: row halves a tile can fill; up to 8 rows the second half is padding, and skipping it per group is not free.
     constants = dict(K = K, GS = group_size, BITS = bits, RT = 1 if M <= 16 else 2, NSG = simdgroups, H = 1 if M <= 8 else 2, RG = groups,
-                     ILV = int(reader == "interleaved"), CG = _LANE_STAGED_GROUPS,
+                     ILV = int(reader == "interleaved"), CG = _LANE_STAGED_GROUPS, XT = int(bits == 8),
                      # Deep weights run faster with the partials in the spent scale stages; the rest slower.
                      **(dict(REUSE = int(K // group_size >= _LANE_DEEP_GROUPS)) if reader == "scales" else {}))
     header = (nax._QMM_HEADER + _LANE_TYPE.format("T", _LANE_METAL_TYPES[dtype])
@@ -1273,6 +1405,7 @@ def lane_qmm(x, w, scales, biases, group_size, bits, *, output_dtype = None, gro
     if _lane_tensor_units(N, bits):
         reader = reader or _lane_tensor_reader(N, K, group_size, bits, x.dtype)
         inputs += _lane_sums_launch(M, K, group_size, x.dtype, reader == "bias")(inputs = [x])
+        inputs[0] = _lane_tensor_x(x, bits)
     return _lane_launch(M, N, K, group_size, bits, x.dtype, output_dtype = output_dtype, groups = groups,
                         reader = reader)(inputs = inputs)[0]
 
@@ -1301,7 +1434,7 @@ def lane_qmms(x, weights, group_size, bits):
         return _lane_shared_launch(M, Ns, K, group_size, bits, x.dtype)(inputs = [x, *(a for weight in weights for a in weight)])
     sums = _lane_sums_launch(M, K, group_size, x.dtype, reader == "bias")(inputs = [x])
     return _lane_tensor_launch(M, Ns, K, group_size, bits, x.dtype, x.dtype, K // group_size, reader)(
-        inputs = [x, *(a for weight in weights for a in weight), *sums])
+        inputs = [_lane_tensor_x(x, bits), *(a for weight in weights for a in weight), *sums])
 
 
 def lane_shortlist_reader(M, bits):

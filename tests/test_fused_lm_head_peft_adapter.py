@@ -35,7 +35,7 @@ from unsloth_zoo import compiler  # noqa: E402
 from unsloth_zoo.fused_losses import cross_entropy_loss as ce  # noqa: E402
 from unsloth_zoo.fused_losses import unsloth_fused_ce_loss, unsloth_fused_lm_head_loss  # noqa: E402
 from unsloth_zoo.fused_losses.forward_adapter import lm_head_needs_module_forward  # noqa: E402
-from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss  # noqa: E402
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss, _fuses_model  # noqa: E402
 
 V, H = 96, 32
 
@@ -573,7 +573,7 @@ def _exec_forward(source, base_scope = None, header = True):
         scope.update(fused_loss_header_names())
         scope.update(
             UNSLOTH_ENABLE_CCE = False, HAS_CUT_CROSS_ENTROPY = False, UNSLOTH_COMPILE_DISABLE = True,
-            unsloth_fused_ce_loss = unsloth_fused_ce_loss, _can_fuse_loss = _can_fuse_loss,
+            unsloth_fused_ce_loss = unsloth_fused_ce_loss, _can_fuse_loss = _can_fuse_loss, _fuses_model = _fuses_model,
             unsloth_training_stance = lambda: None, EMPTY_LOGITS = torch.empty(0),
         )
     source = textwrap.dedent(source)
@@ -621,7 +621,7 @@ def test_ast_rewritten_forward_trains_the_head_adapter(use_dora, monkeypatch):
     assert "unsloth_fused_lm_head_loss(" in new
     # Row 25: only the names forward_install puts in the namespace, no compiler header.
     rewritten = _exec_forward(new, dict(
-        unsloth_fused_lm_head_loss = unsloth_fused_lm_head_loss, _can_fuse_loss = _can_fuse_loss,
+        unsloth_fused_lm_head_loss = unsloth_fused_lm_head_loss, _can_fuse_loss = _can_fuse_loss, _fuses_model = _fuses_model,
         EMPTY_LOGITS = torch.empty(0),
     ), header = False)
     model, inner = _wrap(use_dora = use_dora)
@@ -793,7 +793,7 @@ def test_qat_head_is_quantized_once_on_the_module_route(route, monkeypatch):
     if route == "ast":
         new, _ = rewrite_forward_source(pattern)
         rewritten = _exec_forward(new, dict(
-            unsloth_fused_lm_head_loss = unsloth_fused_lm_head_loss, _can_fuse_loss = _can_fuse_loss,
+            unsloth_fused_lm_head_loss = unsloth_fused_lm_head_loss, _can_fuse_loss = _can_fuse_loss, _fuses_model = _fuses_model,
             EMPTY_LOGITS = torch.empty(0),
         ), header = False)
     else:

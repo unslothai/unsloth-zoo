@@ -117,6 +117,8 @@ def _run(model, input_ids, **overrides):
         "autocaster": contextlib.nullcontext(),
         "pixel_values": None, "token_type_ids": None, "mm_token_type_ids": None,
         "_pg_skip_pack": False,
+        "pad_eos_rows": None,   # pad != eos here
+        "prompt_real_mask": None,   # no pad-id prompt tokens here
         "logit_scale_multiply": 0.0, "logit_scale_divide": 0.0,
         "logit_softcapping": 0.0, "temperature": 1.0,
         "_need_entropy": False,

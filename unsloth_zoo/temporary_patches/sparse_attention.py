@@ -26,6 +26,7 @@ __all__ = [
 
 import importlib.util
 import inspect
+import re
 
 import torch
 
@@ -85,9 +86,18 @@ def _is_transformers_function(function, model_type):
     return f"/transformers/models/{model_type}/" in filename
 
 
+# Needles below use the pre-5.24 spelling (past_key_values, no `kwargs=kwargs` in cache.update).
+_CACHE_WORD = re.compile(r"\bcache\b")
+
+
+def cache_spelling(source):
+    """Stock source in the pre-5.24 cache spelling, so one needle matches 5.17-5.23 and 5.24+."""
+    return _CACHE_WORD.sub("past_key_values", source).replace(", self.layer_idx, kwargs=kwargs)", ", self.layer_idx)")
+
+
 def _source(function):
     try:
-        return inspect.getsource(function)
+        return cache_spelling(inspect.getsource(function))
     except Exception:
         return ""
 
@@ -128,29 +138,28 @@ def _dsa_indexer_forward(self, model_type, hidden_states, q_resid, position_embe
             batch_size, seq_len, key_len
         )
     return _REFERENCE[f"{model_type}.indexer"](
-        self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids,
-        past_key_values=past_key_values,
+        self, hidden_states, q_resid, position_embeddings, attention_mask, position_ids, past_key_values,
     )
 
 
 def deepseek_v32_indexer_forward(self, hidden_states, q_resid, position_embeddings, attention_mask,
-                                 position_ids=None, past_key_values=None):
+                                 position_ids=None, past_key_values=None, cache=None):
     # Copied into the compiler cache: only torch, self, the arguments and the lazy import.
     from unsloth_zoo.temporary_patches.sparse_attention import _dsa_indexer_forward
     with torch.no_grad():
         return _dsa_indexer_forward(
             self, "deepseek_v32", hidden_states, q_resid, position_embeddings, attention_mask,
-            position_ids, past_key_values,
+            position_ids, past_key_values if cache is None else cache,
         )
 
 
 def glm_moe_dsa_indexer_forward(self, hidden_states, q_resid, position_embeddings, attention_mask,
-                                position_ids=None, past_key_values=None):
+                                position_ids=None, past_key_values=None, cache=None):
     from unsloth_zoo.temporary_patches.sparse_attention import _dsa_indexer_forward
     with torch.no_grad():
         return _dsa_indexer_forward(
             self, "glm_moe_dsa", hidden_states, q_resid, position_embeddings, attention_mask,
-            position_ids, past_key_values,
+            position_ids, past_key_values if cache is None else cache,
         )
 
 

@@ -44,6 +44,8 @@ from .utils import (
     HybridCache,
     Unpack,
     _get_unique_storage_name,
+    cache_kwarg_name,
+    output_cache,
 )
 from textwrap import dedent
 import re
@@ -202,6 +204,14 @@ pass
 TEMPORARY_PATCHES.append(patch_merge_quantization_configs)
 
 
+def _cache_as_past_key_values(kwargs):
+    if "cache" in kwargs:
+        cache = kwargs.pop("cache")
+        if cache is not None or kwargs.get("past_key_values") is None:
+            kwargs["past_key_values"] = cache
+    return kwargs
+
+
 def patch_CsmDepthDecoderForCausalLM_forward():
     try:
         import transformers.models.csm.modeling_csm
@@ -211,6 +221,7 @@ def patch_CsmDepthDecoderForCausalLM_forward():
         return raise_error("CsmDepthDecoderForCausalLM.forward", e)
 
     target_cls = transformers.models.csm.modeling_csm.CsmDepthDecoderForCausalLM
+    _model_cache_kwarg = cache_kwarg_name(transformers.models.csm.modeling_csm.CsmDepthDecoderModel.forward)
 
     def forward(
         self,
@@ -266,7 +277,7 @@ def patch_CsmDepthDecoderForCausalLM_forward():
             backbone_last_hidden_state = backbone_last_hidden_state,
             attention_mask = attention_mask,
             position_ids = position_ids,
-            past_key_values = past_key_values,
+            **{_model_cache_kwarg: past_key_values},
             inputs_embeds = inputs_embeds,
             use_cache = use_cache,
             # Moved outputs to kwargs since transformers 4.54.0 deletes them
@@ -302,7 +313,7 @@ def patch_CsmDepthDecoderForCausalLM_forward():
         return process_return(CausalLMOutputWithPast, {
             "loss" : loss,
             "logits" : logits,
-            "past_key_values" : outputs.past_key_values,
+            "past_key_values" : output_cache(outputs),
             "hidden_states" : outputs.hidden_states,
             "attentions" : outputs.attentions,
         })
@@ -315,7 +326,7 @@ def patch_CsmDepthDecoderForCausalLM_forward():
     _original_forward_signature = inspect.signature(target_cls.forward)
     _full_forward = forward
     def forward(self, *args, **kwargs):
-        return _full_forward(self, *args, **kwargs)
+        return _full_forward(self, *args, **_cache_as_past_key_values(kwargs))
     forward.__signature__ = _original_forward_signature
     patch_function(target_cls, "forward", forward, match_level="relaxed")
 pass
@@ -336,6 +347,15 @@ def patch_CsmDepthDecoderModel_forward():
         return  # transformers 4.x: positions come from generate's cache_position
     if getattr(target_cls.forward, "_unsloth_device_positions", False):
         return
+    _layer_cache_kwarg = cache_kwarg_name(modeling_csm.CsmDecoderLayer.forward)
+    import transformers.masking_utils as _masking_utils
+    _mask_cache_kwarg = cache_kwarg_name(getattr(
+        _masking_utils, "_unsloth_original_create_causal_mask", _masking_utils.create_causal_mask,
+    ))
+    _output_cache_field = (
+        "cache" if "cache" in getattr(modeling_csm.BaseModelOutputWithPast, "__dataclass_fields__", {})
+        else "past_key_values"
+    )
 
     def forward(
         self,
@@ -350,6 +370,9 @@ def patch_CsmDepthDecoderModel_forward():
     ):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds.")
+        cache = kwargs.pop("cache", None)
+        if past_key_values is None:
+            past_key_values = cache
         if use_cache and past_key_values is None:
             past_key_values = modeling_csm.DynamicCache(config = self.config)
         past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
@@ -370,8 +393,8 @@ def patch_CsmDepthDecoderModel_forward():
             config = self.config,
             inputs_embeds = inputs_embeds,
             attention_mask = attention_mask,
-            past_key_values = past_key_values,
             position_ids = position_ids,
+            **{_mask_cache_kwarg: past_key_values},
         )
         hidden_states = inputs_embeds
         position_ids = position_ids.unsqueeze(0)
@@ -381,7 +404,7 @@ def patch_CsmDepthDecoderModel_forward():
                 hidden_states,
                 attention_mask = causal_mask,
                 position_ids = position_ids,
-                past_key_values = past_key_values,
+                **{_layer_cache_kwarg: past_key_values},
                 use_cache = use_cache,
                 position_embeddings = position_embeddings,
                 **kwargs,
@@ -389,7 +412,7 @@ def patch_CsmDepthDecoderModel_forward():
         hidden_states = self.norm(hidden_states)
         return modeling_csm.BaseModelOutputWithPast(
             last_hidden_state = hidden_states,
-            past_key_values = past_key_values if use_cache else None,
+            **{_output_cache_field: past_key_values if use_cache else None},
         )
     pass
 
@@ -410,6 +433,7 @@ def patch_CsmForConditionalGeneration_forward():
         return raise_error("CsmForConditionalGeneration.forward", e)
 
     target_cls = transformers.models.csm.modeling_csm.CsmForConditionalGeneration
+    _backbone_cache_kwarg = cache_kwarg_name(transformers.models.csm.modeling_csm.CsmBackboneModel.forward)
 
     def forward(
         self,
@@ -443,7 +467,7 @@ def patch_CsmForConditionalGeneration_forward():
             input_ids = input_ids,
             attention_mask = attention_mask,
             position_ids = position_ids,
-            past_key_values = past_key_values,
+            **{_backbone_cache_kwarg: past_key_values},
             inputs_embeds = inputs_embeds,
             use_cache = use_cache,
             # Moved outputs to kwargs since transformers 4.54.0 deletes them
@@ -520,13 +544,11 @@ def patch_CsmForConditionalGeneration_forward():
             "backbone_loss" : backbone_loss,
             "depth_decoder_loss" : depth_decoder_loss,
             "logits" : backbone_logits,
-            "past_key_values" : backbone_outputs.past_key_values,
+            "past_key_values" : output_cache(backbone_outputs),
             "hidden_states" : backbone_outputs.hidden_states,
             "attentions" : backbone_outputs.attentions,
             "depth_decoder_logits" : depth_decoder_outputs.logits if depth_decoder_outputs is not None else None,
-            "depth_decoder_past_key_values" : depth_decoder_outputs.past_key_values
-            if depth_decoder_outputs is not None
-            else None,
+            "depth_decoder_past_key_values" : output_cache(depth_decoder_outputs),
             "depth_decoder_hidden_states" : depth_decoder_outputs.hidden_states
             if depth_decoder_outputs is not None
             else None,
@@ -539,7 +561,7 @@ def patch_CsmForConditionalGeneration_forward():
     _original_forward_signature = inspect.signature(target_cls.forward)
     _full_forward = forward
     def forward(self, *args, **kwargs):
-        return _full_forward(self, *args, **kwargs)
+        return _full_forward(self, *args, **_cache_as_past_key_values(kwargs))
     forward.__signature__ = _original_forward_signature
     patch_function(target_cls, "forward", forward, match_level="relaxed")
 pass
@@ -692,7 +714,7 @@ _SKIP_RIGHT_PADDING_MASK_ENV = "UNSLOTH_SKIP_RIGHT_PADDING_MASK"
 # Any other non-None argument (or/and_mask_function, encoder_hidden_states, ...) keeps the mask.
 _PLAIN_CAUSAL_MASK_ARGUMENTS = frozenset((
     "config", "inputs_embeds", "input_embeds", "attention_mask", "cache_position",
-    "past_key_values", "position_ids", "layer_idx", "allow_is_causal_skip",
+    "past_key_values", "cache", "position_ids", "layer_idx", "allow_is_causal_skip",
 ))
 
 
@@ -918,6 +940,26 @@ def _calling_model_spans_devices(max_depth = 8):
     return spans
 
 
+def _mask_built_for_plain_model(max_depth = 8):
+    """A plain transformers model (unmarked) builds this mask: give it transformers' own mask."""
+    from unsloth_zoo.model_marker import is_unsloth_model, model_marker_required
+    if not model_marker_required() or _is_tracing_masks():
+        return False
+    try:
+        from transformers import PreTrainedModel
+    except Exception:
+        return False
+    frame = sys._getframe(1)
+    for _ in range(max_depth):
+        frame = frame.f_back
+        if frame is None:
+            return False
+        module = frame.f_locals.get("self", None)
+        if isinstance(module, nn.Module):
+            return isinstance(module, PreTrainedModel) and not is_unsloth_model(module)
+    return False
+
+
 def _maskless_causal_arguments(signature, args, kwargs):
     """Arguments for an eager create_causal_mask call that may return None, else None.
 
@@ -930,6 +972,11 @@ def _maskless_causal_arguments(signature, args, kwargs):
         return None
     if os.environ.get(_SKIP_CAUSAL_MASK_ENV, "1") == "0":
         return None
+    parameters = signature.parameters
+    if "past_key_values" in kwargs and "cache" in parameters:
+        # 5.24 factories: `cache` required, past_key_values a keyword-only deprecated alias.
+        kwargs = dict(kwargs)
+        kwargs.setdefault("cache", kwargs.pop("past_key_values"))
     try:
         bound = signature.bind(*args, **kwargs)
     except TypeError:
@@ -958,7 +1005,7 @@ def _maskless_causal_arguments(signature, args, kwargs):
         return None
     if getattr(config, "is_causal", True) is not True:
         return None
-    if arguments.get("past_key_values", None) is not None:
+    if arguments.get("past_key_values", None) is not None or arguments.get("cache", None) is not None:
         return None
     embeds = arguments.get("inputs_embeds", arguments.get("input_embeds", None))
     if not isinstance(embeds, torch.Tensor) or embeds.ndim != 3:
@@ -1133,6 +1180,8 @@ def patch_transformers_masks():
                         kwargs[embeds_name] = kwargs.pop(other)
             for name in drop:
                 kwargs.pop(name, None)
+            if _mask_built_for_plain_model():
+                return original(*args, **kwargs)
             input_embeds = kwargs.get("inputs_embeds", kwargs.get("input_embeds", None))
             if (
                 prepared_mask_shortcut
@@ -2911,7 +2960,7 @@ def patch_GradientCheckpointingLayer_keyword_inputs():
             message += " `use_cache=False`,"
             changed = True
         if not getattr(self, "_can_checkpoint_with_cache", False):
-            for name in ("past_key_values", "layer_past"):
+            for name in ("past_key_values", "cache", "layer_past"):
                 if kwargs.get(name) is not None:
                     kwargs[name] = None
                     message += f" `{name}=None`,"
