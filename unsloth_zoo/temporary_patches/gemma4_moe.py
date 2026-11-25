@@ -18,7 +18,7 @@ import os
 import torch
 import torch.nn as nn
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING
-from .utils import patch_function, process_return, raise_error, logger
+from .utils import patch_function, process_return, raise_error, logger, cache_kwarg_name, output_cache
 from .moe_utils import (
     patch_param_wrapper_for_moe,
     get_forward_moe_backend,
@@ -86,6 +86,8 @@ def patch_gemma4_grpo_hidden_states():
 
     _original_causal_lm_forward = Gemma4ForConditionalGeneration.forward
 
+    _cache_kwarg = cache_kwarg_name(_original_causal_lm_forward)
+
     def _patched_causal_lm_forward(
         self,
         input_ids=None,
@@ -105,6 +107,11 @@ def patch_gemma4_grpo_hidden_states():
         logits_to_keep=0,
         **kwargs,
     ):
+        # transformers 5.24 passes the cache as `cache=`, which lands in **kwargs here: fold it in and hand it on
+        # under the callee's own name, or stock sees both names and warns on every call.
+        _cache = kwargs.pop("cache", None)
+        if past_key_values is None:
+            past_key_values = _cache
         # Inject mm_token_type_ids=0 for text-only SFT.
         if mm_token_type_ids is None and self.training:
             _ids = input_ids if input_ids is not None else inputs_embeds
@@ -132,7 +139,7 @@ def patch_gemma4_grpo_hidden_states():
                 position_ids=position_ids,
                 image_position_ids=image_position_ids,
                 video_position_ids=video_position_ids,
-                past_key_values=past_key_values,
+                **{_cache_kwarg: past_key_values},
                 mm_token_type_ids=mm_token_type_ids,
                 inputs_embeds=inputs_embeds,
                 labels=labels,
@@ -150,7 +157,7 @@ def patch_gemma4_grpo_hidden_states():
             attention_mask=attention_mask,
             input_features_mask=input_features_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            **{_cache_kwarg: past_key_values},
             mm_token_type_ids=mm_token_type_ids,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
@@ -176,7 +183,7 @@ def patch_gemma4_grpo_hidden_states():
             {
                 "loss": None,
                 "logits": sliced_hidden_states,
-                "past_key_values": outputs.past_key_values,
+                "past_key_values": output_cache(outputs),
                 "hidden_states": outputs.hidden_states,
                 "attentions": outputs.attentions,
                 "image_hidden_states": getattr(outputs, "image_hidden_states", None),

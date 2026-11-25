@@ -410,6 +410,9 @@ def patch_CsmForConditionalGeneration_forward():
         return raise_error("CsmForConditionalGeneration.forward", e)
 
     target_cls = transformers.models.csm.modeling_csm.CsmForConditionalGeneration
+    from .utils import adapt_cache_kwarg, cache_kwarg_name, output_cache, _renamed_cache_param
+    # transformers 5.24 names the backbone's cache `cache`; pass it under that name (no "both set" warning).
+    _backbone_cache_kwarg = cache_kwarg_name(transformers.models.csm.modeling_csm.CsmBackboneModel.forward)
 
     def forward(
         self,
@@ -443,7 +446,7 @@ def patch_CsmForConditionalGeneration_forward():
             input_ids = input_ids,
             attention_mask = attention_mask,
             position_ids = position_ids,
-            past_key_values = past_key_values,
+            **{_backbone_cache_kwarg: past_key_values},
             inputs_embeds = inputs_embeds,
             use_cache = use_cache,
             # Moved outputs to kwargs since transformers 4.54.0 deletes them
@@ -520,7 +523,7 @@ def patch_CsmForConditionalGeneration_forward():
             "backbone_loss" : backbone_loss,
             "depth_decoder_loss" : depth_decoder_loss,
             "logits" : backbone_logits,
-            "past_key_values" : backbone_outputs.past_key_values,
+            "past_key_values" : output_cache(backbone_outputs),
             "hidden_states" : backbone_outputs.hidden_states,
             "attentions" : backbone_outputs.attentions,
             "depth_decoder_logits" : depth_decoder_outputs.logits if depth_decoder_outputs is not None else None,
@@ -538,6 +541,9 @@ def patch_CsmForConditionalGeneration_forward():
     # transformers._validate_model_kwargs) still sees the real named parameters.
     _original_forward_signature = inspect.signature(target_cls.forward)
     _full_forward = forward
+    if _renamed_cache_param(target_cls.forward, _full_forward) is not None:
+        # The copied stock signature hides 5.24's `cache` from patch_function: map it onto past_key_values here.
+        _full_forward = adapt_cache_kwarg(_full_forward, "past_key_values")
     def forward(self, *args, **kwargs):
         return _full_forward(self, *args, **kwargs)
     forward.__signature__ = _original_forward_signature
@@ -2911,7 +2917,8 @@ def patch_GradientCheckpointingLayer_keyword_inputs():
             message += " `use_cache=False`,"
             changed = True
         if not getattr(self, "_can_checkpoint_with_cache", False):
-            for name in ("past_key_values", "layer_past"):
+            # `cache` is transformers 5.24's name for past_key_values.
+            for name in ("past_key_values", "cache", "layer_past"):
                 if kwargs.get(name) is not None:
                     kwargs[name] = None
                     message += f" `{name}=None`,"

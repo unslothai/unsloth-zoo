@@ -37,6 +37,8 @@ from .utils import (
     logger,
     Cache,
     process_return,
+    cache_kwarg_name,
+    output_cache,
 )
 from unsloth_zoo.hf_utils import dtype_from_config
 from .moe_utils import (
@@ -136,6 +138,9 @@ def _patch_deepseek_v3_causal_lm_forward():
         if getattr(_original_causal_lm_forward, "_unsloth_hidden_states_wrapper", False):
             return True
 
+        _cache_kwarg = cache_kwarg_name(_original_causal_lm_forward)
+        _output_cache_field = "cache" if "cache" in getattr(_output_class, "__dataclass_fields__", {}) else "past_key_values"
+
         def _patched_causal_lm_forward(
             self,
             input_ids=None,
@@ -150,6 +155,11 @@ def _patch_deepseek_v3_causal_lm_forward():
             logits_to_keep=0,
             **kwargs,
         ):
+            # transformers 5.24 passes the cache as `cache=`, which lands in **kwargs here: fold it in and hand it on
+            # under the callee's own name, or stock sees both names and warns on every call.
+            _cache = kwargs.pop("cache", None)
+            if past_key_values is None:
+                past_key_values = _cache
             # This Unsloth Zoo code section is licensed under AGPL3
 
             RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
@@ -160,7 +170,7 @@ def _patch_deepseek_v3_causal_lm_forward():
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
-                    past_key_values=past_key_values,
+                    **{_cache_kwarg: past_key_values},
                     inputs_embeds=inputs_embeds,
                     labels=labels,
                     use_cache=use_cache,
@@ -174,7 +184,7 @@ def _patch_deepseek_v3_causal_lm_forward():
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_values=past_key_values,
+                **{_cache_kwarg: past_key_values},
                 inputs_embeds=inputs_embeds,
                 use_cache=use_cache,
                 output_router_logits=output_router_logits,
@@ -196,7 +206,7 @@ def _patch_deepseek_v3_causal_lm_forward():
             return _output_class(
                 loss=None,
                 logits=hidden_states,
-                past_key_values=outputs.past_key_values,
+                **{_output_cache_field: output_cache(outputs)},
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,
                 **extra,
