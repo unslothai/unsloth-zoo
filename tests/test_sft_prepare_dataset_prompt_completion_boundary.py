@@ -183,7 +183,7 @@ def test_boundary_warns_once_per_cause(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert out.count("renders earlier turns of the prompt differently") == 1
     assert out.count("merges with the completion's first token") == 1
-    assert out.count("could not be lined up") == 1
+    assert out.count("renders earlier turns into different tokens") == 1
 
 
 GPT_OSS = ("openai/gpt-oss-20b", "6cee5e81ee83917806bbde320786a8fb61efebee")

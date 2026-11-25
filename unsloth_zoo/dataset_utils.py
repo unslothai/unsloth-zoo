@@ -2813,7 +2813,11 @@ def _batched_columns(dataset):
 pass
 
 
-def _prompt_completion_boundary(prompt_ids, pc_ids, anchor = 4):
+# Prompt ids that must continue pc_ids after a skipped span; a shorter unmatched prompt tail counts as a merge.
+_PROMPT_COMPLETION_ANCHOR = 4
+
+
+def _prompt_completion_boundary(prompt_ids, pc_ids, anchor = _PROMPT_COMPLETION_ANCHOR):
     # "Answer: " + "two" tokenizes "Answer:", " two": start where the tokenizations diverge (huggingface/trl#7463).
     # GPT-OSS also drops the analysis of every tool-calling turn once a final answer follows: skip each deleted
     # prompt span (the shortest one after which `anchor` prompt ids continue pc_ids) and start where the prompt ends.
@@ -2854,10 +2858,8 @@ def _prompt_completion_boundary(prompt_ids, pc_ids, anchor = 4):
             )
         elif kind == "unaligned":
             print(
-                "Unsloth: Warning: the chat template renders earlier turns of the prompt into different tokens "
-                "once the completion is appended, and the prompt could not be lined up with prompt + completion. "
-                "For these rows the completion is trained from where the prompt's last tokens end in prompt + "
-                "completion. Check the labels of such rows."
+                "Unsloth: Warning: the chat template renders earlier turns into different tokens once the completion "
+                "is appended; the completion is trained from where the prompt's last tokens end. Check these labels."
             )
         else:
             print(
