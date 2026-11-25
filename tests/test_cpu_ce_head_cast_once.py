@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU chunked CE with an fp32 head (full finetuning's fp32 master weights) under bf16 / fp16 autocast: the head is
-cast to the autocast dtype once per call, not once per row chunk for the logits and again for dX, with the same bits."""
+"""CPU chunked CE, fp32 head under bf16 / fp16 autocast: one head cast per call, not per chunk, same bits."""
 
 from __future__ import annotations
 
@@ -27,7 +26,6 @@ from unsloth_zoo.cpu import ops
 
 
 class _HeadCasts(TorchDispatchMode):
-    """Counts whole-head casts of `w` to a low-precision dtype (autocast's casts reach the dispatcher as _to_copy)."""
 
     def __init__(self, w):
         super().__init__()
