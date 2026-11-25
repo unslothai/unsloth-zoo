@@ -3017,6 +3017,19 @@ def _nvfp4_bases(keys):
     return {k[: -len(_NVFP4_PACKED_SUFFIX)] for k in keys if isinstance(k, str) and k.endswith(_NVFP4_PACKED_SUFFIX)}
 pass
 
+_FP8_TABLE_SHARD = re.compile(r"^(.*)\.shard_\d+$")
+
+def _fp8_shared_shard_scale(file, header_metadata, base, extra_scale_lookup = None):
+    """`<table>.weight_scale` shared by `<table>.shard_<i>.weight` (Qwen3.8-Flash-Next-FP8 n-gram table); only a single value is broadcast."""
+    m = _FP8_TABLE_SHARD.match(base)
+    if m is None:
+        return None
+    key = m.group(1) + ".weight_scale"
+    scale = file.get_tensor(key) if key in header_metadata else (
+        extra_scale_lookup(key) if extra_scale_lookup is not None else None)
+    return scale if scale is not None and scale.numel() == 1 else None
+pass
+
 def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size = None, extra_scale_lookup = None):
     """Dequantize one FP8 weight; return (W_real, [scale_keys to drop]).
 
@@ -3044,6 +3057,8 @@ def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size 
             scale_inv = extra_scale_lookup(base + suffix)
             if scale_inv is not None:
                 break
+    if scale_inv is None:
+        scale_inv = _fp8_shared_shard_scale(file, header_metadata, base, extra_scale_lookup)
     if scale_inv is None:
         raise RuntimeError(
             f"Unsloth: FP8 weight '{weight_key}' has no companion weight_scale / "
@@ -3197,13 +3212,18 @@ def _drop_resolved_fp8_scales_after_rewrite(save_directory, filenames, prerewrit
             continue
         headers[filename] = header
 
+    # A row-sharded table's shared `<table>.weight_scale` belongs to its `<table>.shard_<i>.weight` weights.
+    sharded_tables = {m.group(1) for m in (_FP8_TABLE_SHARD.match(k[: -len(".weight")])
+                      for k in prerewrite_fp8_keys if k.endswith(".weight")) if m is not None}
     removed = set()
     for filename, header in headers.items():
         drop = set()
         for key in header:
             if key == "__metadata__":
                 continue
-            if any(wk in prerewrite_fp8_keys for wk in _fp8_scale_key_weight_bases(key)):
+            if any(wk in prerewrite_fp8_keys for wk in _fp8_scale_key_weight_bases(key)) or (
+                key.endswith(".weight_scale") and key[: -len(".weight_scale")] in sharded_tables
+            ):
                 drop.add(key)
         if not drop:
             continue
