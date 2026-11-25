@@ -806,6 +806,33 @@ def test_vlm_gemma4_images_reach_the_processor_unshrunk():
     assert _resolve_vlm_image_size(None, {"vision_config": {}}, sized) == 448
 
 
+def test_vlm_image_size_skips_encoder_tile_size():
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.utils import _resolve_vlm_image_size
+
+    inkling2_cfg = {"vision_config": {"native_patch_size": 20, "adapter_merge_size": 2}}
+    inkling2_proc = SimpleNamespace(image_processor=SimpleNamespace(size={"height": 40, "width": 40}))
+    assert _resolve_vlm_image_size(None, inkling2_cfg, inkling2_proc) == 512
+    sub_tile_proc = SimpleNamespace(image_processor=SimpleNamespace(size={"height": 20, "width": 20}))
+    assert _resolve_vlm_image_size(None, inkling2_cfg, sub_tile_proc) == 512
+
+    inkling1_cfg = SimpleNamespace(vision_config=SimpleNamespace(patch_size=40))
+    inkling1_proc = SimpleNamespace(
+        image_processor=SimpleNamespace(size={"height": 40, "width": 40}, patch_size=40)
+    )
+    assert _resolve_vlm_image_size(None, inkling1_cfg, inkling1_proc) == 512
+
+    ip_only_proc = SimpleNamespace(image_processor=SimpleNamespace(size=40, patch_size=40))
+    assert _resolve_vlm_image_size(None, {"vision_config": {}}, ip_only_proc) == 512
+
+    small_cfg = {"vision_config": {"patch_size": 14, "spatial_merge_size": 2}}
+    tile_merged_proc = SimpleNamespace(image_processor=SimpleNamespace(size={"height": 28, "width": 28}))
+    assert _resolve_vlm_image_size(None, small_cfg, tile_merged_proc) == 512
+    small_proc = SimpleNamespace(image_processor=SimpleNamespace(size={"height": 224, "width": 224}))
+    assert _resolve_vlm_image_size(None, small_cfg, small_proc) == 224
+
+
 def test_vlm_processor_inputs_retries_duplicate_add_special_tokens():
     from unsloth_zoo.mlx.utils import _processor_vlm_inputs
 
