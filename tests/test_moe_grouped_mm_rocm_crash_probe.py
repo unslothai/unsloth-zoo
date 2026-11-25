@@ -28,6 +28,7 @@ from unsloth_zoo.temporary_patches import moe_utils
 @pytest.fixture
 def fake_rocm(monkeypatch):
     monkeypatch.setattr(torch.version, "hip", "7.1.0", raising = False)
+    monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if "7.1.0" else "+cu130"))
     monkeypatch.setattr(moe_utils, "_GROUPED_MM_SURVIVES", None)
     return torch.device("cuda", 0)
 
@@ -65,6 +66,7 @@ def test_crash_probe_timeout_is_unsupported(monkeypatch, fake_rocm):
 def test_crash_probe_never_runs_on_nvidia_or_intel(monkeypatch, device):
     def boom(*a, **k): raise AssertionError("child probe launched off AMD")
     monkeypatch.setattr(torch.version, "hip", None, raising = False)
+    monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if None else "+cu130"))
     monkeypatch.setattr(moe_utils, "_GROUPED_MM_SURVIVES", None)
     monkeypatch.setattr(subprocess, "run", boom)
     monkeypatch.setattr(torch._C, "_dispatch_dump", boom)

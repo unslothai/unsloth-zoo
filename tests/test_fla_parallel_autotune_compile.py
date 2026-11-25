@@ -186,6 +186,7 @@ def test_stage_twins_dropped_only_before_sm80(cache_mod, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (8, 9))
     assert cache_mod._drop_stage_only_twins(tuner, configs, {"x": x}) == configs
     monkeypatch.setattr(torch.version, "hip", "6.4", raising = False)
+    monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if "6.4" else "+cu130"))
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (7, 5))
     assert cache_mod._drop_stage_only_twins(tuner, configs, {"x": x}) == configs
 

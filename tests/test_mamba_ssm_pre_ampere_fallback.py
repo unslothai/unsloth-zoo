@@ -86,6 +86,7 @@ def env(monkeypatch):
     """Pre-Ampere NVIDIA CUDA with mamba_ssm installed and a model imported."""
     monkeypatch.setattr(torch, "cuda", _FakeCuda(), raising = False)
     monkeypatch.setattr(torch.version, "hip", None, raising = False)
+    monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if None else "+cu130"))
     monkeypatch.delenv("UNSLOTH_MAMBA_PRE_AMPERE_FAST", raising = False)
     # Triton 3.3, where the sm_75 compile fails, unless a test says otherwise.
     _set_triton(monkeypatch, "3.3.1")
@@ -453,6 +454,7 @@ def test_hopper_keeps_fast_path(env, monkeypatch):
 def test_rocm_is_untouched(env, monkeypatch):
     model_mod, iu, _hk = env
     monkeypatch.setattr(torch.version, "hip", "6.2.0", raising = False)
+    monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if "6.2.0" else "+cu130"))
     assert patch() is None
     assert model_mod.is_fast_path_available is True
     assert iu.is_mamba_ssm_available() is True
@@ -835,6 +837,7 @@ def test_missing_kernels_take_the_slow_path_on_any_gpu(
 def test_missing_kernels_take_the_slow_path_without_cuda_or_on_rocm(env, monkeypatch, hip):
     monkeypatch.setattr(torch, "cuda", _FakeCuda(available = hip is not None), raising = False)
     monkeypatch.setattr(torch.version, "hip", hip, raising = False)
+    monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if hip else "+cu130"))
     _set_specs(monkeypatch, ())
     _mod, Config = _fake_config_module(CONFIG_MODS[0], "JambaConfig")
     missing_patch()

@@ -178,5 +178,6 @@ def test_kda_decode_config_by_arch(monkeypatch, capability, hip, expected):
     namespace = {"functools": functools, "torch": torch}
     exec(source[start:source.index("@torch.compiler.disable\ndef fused_recurrent_kda_fwd(")], namespace)
     monkeypatch.setattr(torch.version, "hip", hip, raising = False)
+    monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if hip else "+cu130"))
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: capability)
     assert namespace["_kda_decode_config"](torch.device("cuda", 0)) == expected
