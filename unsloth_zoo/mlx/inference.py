@@ -40,6 +40,7 @@ from pathlib import Path
 from threading import RLock, local
 from types import FunctionType, ModuleType
 from typing import Callable, NamedTuple
+from weakref import ref
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -8371,6 +8372,78 @@ def _verify_qmv_rows(native, linears, x):
     return tuple(outs) if len(outs) > 1 else outs[0]
 
 
+
+_FP_QMV_FORMATS = {("mxfp4", 32, 4), ("nvfp4", 16, 4), ("mxfp8", 32, 8)}
+_FP_QMV_MODES = {mode for mode, _, _ in _FP_QMV_FORMATS}
+# A wrapped quantized_matmul may change what the stock layer computes, so the native-equivalent rows defer to it.
+_NATIVE_QMM = mx.quantized_matmul
+
+
+@functools.cache
+def _fp_qmv_header():
+    try:
+        return _mlx_headers(False) + _QDOT if mx.metal.is_available() else None
+    except (OSError, RuntimeError):
+        return None
+
+
+def _fp_qmv_operand(p, K, linear):
+    if (not isinstance(p, nn.QuantizedLinear) or p.training or p.mode not in _FP_QMV_MODES
+            or (type(p).__call__ is not linear and _stock_call(p, 1) not in _ONE_ROW_STOCK_CALLS)
+            or p.get("global_scale") is not None or p.trainable_parameters()):
+        return None
+    w, scales, biases, bias = (p.get(name) for name in ("weight", "scales", "biases", "bias"))
+    fmt = (p.mode, p.group_size, p.bits)
+    signature = (K, fmt)
+    settled = vars(p).get("_unsloth_fp_qmv")
+    if (settled is None or settled[0] != signature
+            or any((r() if r is not None else None) is not a for r, a in zip(settled[1], (w, scales, biases, bias)))):
+        if (K <= 0 or not all(isinstance(a, mx.array) and a.ndim == 2 for a in (w, scales))
+                or w.nbytes >= 1 << 31 or _one_row_kernel(*fmt, mx.bfloat16, K, w.shape[0], w, scales, biases) != 1):
+            vars(p).pop("_unsloth_fp_qmv", None)
+            return None
+        vars(p)["_unsloth_fp_qmv"] = signature, tuple(ref(a) if isinstance(a, mx.array) else None
+                                                    for a in (w, scales, biases, bias))
+    return (w, scales), fmt, bias
+
+
+def _verify_fp_qmv_rows(linears, x):
+    # Metal defaults to a GPU stream even when the current execution context selects the CPU.
+    if mx.default_device() != mx.gpu:
+        return None
+    if (not getattr(_VERIFY_STATE, "serving", False) or getattr(_VERIFY_STATE, "plain_decode", False)
+            or x.dtype != mx.bfloat16 or x.ndim != 3 or not 2 <= x.shape[0] * x.shape[1] <= 8
+            or os.environ.get("UNSLOTH_MLX_VERIFY_QMV_ROWS") == "0" or mx.quantized_matmul is not _NATIVE_QMM):
+        return None
+    linear = nn.QuantizedLinear.__call__
+    if not _stock_linear_pinned(linear) or (header := _fp_qmv_header()) is None:
+        return None
+    operands = [_fp_qmv_operand(p, x.shape[-1], linear) for p in linears]
+    if any(operand is None for operand in operands):
+        return None
+    weights, formats, biases = zip(*operands)
+    code_bytes = sum(w.nbytes for w, _ in weights)
+    if code_bytes < 4 << 20:
+        return None
+    if nax.nax_available():
+        ys = [matmul.fp_qmv_rows(x, (weight,), *fmt[1:], header, tiled = False)[0] for weight, fmt in zip(weights, formats)]
+    elif len(set(formats)) == 1:
+        _, group_size, bits = formats[0]
+        ys = matmul.fp_qmv_rows(x, weights, group_size, bits, header, tiled = True)
+    else:
+        return None
+    outs = tuple(y if bias is None else y + bias for y, bias in zip(ys, biases))
+    return outs if len(outs) > 1 else outs[0]
+
+
+def _verify_projection_rows(native, linears, x):
+    if linears and getattr(linears[0], "mode", None) in _FP_QMV_MODES:
+        output = _verify_fp_qmv_rows(linears, x)
+        if output is not None:
+            return output
+    return _verify_qmv_rows(native, linears, x)
+
+
 def _exact_attention_rows_source():
     # Unit feature strides take the source as written without them; other views read through their strides.
     contiguous = _EXACT_ATTENTION_ROWS
@@ -8743,7 +8816,7 @@ def _exact_verify_class(base, name, *cache_key):
         if x.size == x.shape[-1]:
             return base._linear(self, linear, x)
         project = lambda rows: projected(self, linear, rows)
-        return _verify_qmv_rows(lambda: _verify_sliced(project, (linear,), x, eligible), (linear,), x)
+        return _verify_projection_rows(lambda: _verify_sliced(project, (linear,), x, eligible), (linear,), x)
 
     def sliced_linears(self, linears, x):
         if x.size == x.shape[-1]:
@@ -8752,7 +8825,7 @@ def _exact_verify_class(base, name, *cache_key):
             project = lambda rows: tuple(projected(self, p, rows) for p in linears)
         else:
             project = lambda rows: base._linears(self, linears, rows)
-        return _verify_qmv_rows(lambda: _verify_sliced(project, linears, x, eligible), linears, x)
+        return _verify_projection_rows(lambda: _verify_sliced(project, linears, x, eligible), linears, x)
 
     def submitted_layer(self, layer, hidden, mask, cache, *args):
         hidden = base._layer(self, layer, _tree_head_rows(hidden, cache), mask, cache, *args)
@@ -12120,9 +12193,19 @@ def _warm_qmv_rows(model):
         return
     with exact_speculative_verify(model), exact_batch_invariant_decode(model):
         served = [language for _, language in model.named_modules() if vars(language).get("_unsloth_verify_scopes")]
+        fp_formats = set()
         for p in {id(p): p for language in served for _, p in language.named_modules()
                   if isinstance(p, nn.QuantizedLinear)}.values():
-            _qmv_rows_kernel(p)
+            if p.mode in _FP_QMV_MODES:
+                w, fmt = p.get("weight"), (p.mode, p.group_size, p.bits)
+                if fmt in _FP_QMV_FORMATS and isinstance(w, mx.array) and w.ndim == 2:
+                    fp_formats.add((p.group_size, p.bits))
+            else:
+                _qmv_rows_kernel(p)
+    if fp_formats and mx.default_device() == mx.gpu and (header := _fp_qmv_header()) is not None:
+        tiled = not nax.nax_available()
+        for group_size, bits in sorted(fp_formats):
+            matmul.compile_fp_qmv_rows(header, group_size, bits, tiled)
 
 
 _MOE_PACK_MRO = _PackedMoEGateUp.__mro__

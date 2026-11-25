@@ -615,6 +615,95 @@ def test_a_verify_block_runs_its_rows_together_and_matches_one_token_decode_step
         assert len(calls) > count
 
 
+
+@pytest.mark.parametrize("mode,group_size,bits", [("mxfp4", 32, 4), ("nvfp4", 16, 4), ("mxfp8", 32, 8)])
+@pytest.mark.parametrize("tensor", [False, True])
+def test_fp_verify_rows_match_native_and_keep_groups(monkeypatch, mode, group_size, bits, tensor):
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import inference, matmul, nax
+
+    k = 4096 if group_size == 16 else 8192
+    mx.random.seed(12)
+    monkeypatch.setattr(nax, "nax_available", lambda: tensor)
+    code_bytes = 4 << 20
+    projections = tuple(nn.QuantizedLinear(k, n, bias = i == 1, group_size = group_size, bits = bits, mode = mode).eval()
+                        for i, n in enumerate((code_bytes // (k * bits // 8) - 16, 16)))
+    for p in projections:
+        p.set_dtype(mx.bfloat16)
+    a, b = projections
+    a.scales = mx.full(a.scales.shape, 0x60 if group_size == 16 else 132, mx.uint8)
+    b.weight, b.scales = (mx.contiguous(param.T).T for param in (b.weight, b.scales))
+    b.bias = mx.linspace(-1, 1, b.bias.size).astype(mx.bfloat16)
+    normal = mx.random.normal((1, 6, k), key = mx.random.key(45)).astype(mx.bfloat16)
+    # Finite BF16 normals at the FP32 product underflow boundary.
+    tiny = mx.random.randint(0x80, 0x140, (1, 2, k), mx.uint16, key = mx.random.key(30)).view(mx.bfloat16)
+    hidden = mx.concatenate([normal, tiny], axis = 1)
+    launch = matmul._fp_qmv_rows_launch
+    seen = []
+
+    def tracked(*args):
+        fn = launch(*args)
+        def run(*, inputs):
+            seen.append((fn.keywords["grid"], inputs))
+            return fn(inputs = inputs)
+        return run
+    monkeypatch.setattr(matmul, "_fp_qmv_rows_launch", tracked)
+    monkeypatch.setattr(inference._VERIFY_STATE, "serving", True, raising = False)
+    fallback = object()
+    project = lambda ps, x: inference._verify_projection_rows(lambda: fallback, ps, x)
+    interleaved = mx.stack([hidden, -hidden], axis = -1).reshape(1, 8, -1)
+    for width in range(2, 9):
+        x = interleaved[:, :width, ::2] if width == 7 else hidden[:, :width]
+        if width == 8:
+            x = mx.stack([hidden[:, :4], -hidden[:, :4], hidden[:, 4:]]).reshape(3, 4, k)[::2]
+        seen.clear()
+        got = project(projections, x)
+        assert len(seen) == (2 if tensor else 1)
+        assert [grid[2] for grid, _ in seen] == ([1, 1] if tensor else [2 if width >= 7 else 1])
+        payload = [a for _, inputs in seen for a in inputs[1:]]
+        assert all(a is b for a, b in zip(payload, (a for p in projections for a in (p.weight, p.scales)), strict = True))
+        for p, y in zip(projections, got, strict = True):
+            expected = mx.concatenate([p(row[None]) for row in x.reshape(-1, k)], axis = 0).reshape(y.shape)
+            assert mx.array_equal(y.view(mx.uint16), expected.view(mx.uint16)).item()
+    seen.clear()
+    assert project((a,), hidden[:, :7]) is fallback and not seen
+    assert project(projections, hidden.astype(mx.float16)) is fallback and not seen
+    with mx.stream(mx.cpu):
+        assert project(projections, hidden) is fallback and not seen
+    with monkeypatch.context() as patch:
+        patch.setattr(inference._VERIFY_STATE, "plain_decode", True, raising = False)
+        assert project(projections, hidden) is fallback and not seen
+    if not tensor:
+        mode2, bits2 = ("mxfp8", 8) if bits == 4 else ("mxfp4", 4)
+        other = nn.QuantizedLinear(k, 16, bias = False, group_size = 32, bits = bits2, mode = mode2).eval()
+        assert project((*projections, other), hidden) is fallback and not seen
+    b.train()
+    assert project((a, b, a), hidden) is fallback and not seen
+    b.eval()
+    scales = b.scales
+    b.scales = scales[:, :-1]
+    assert project(projections, hidden) is fallback and not seen
+    b.scales, a.weight = scales, mx.zeros_like(a.weight)
+    assert mx.all(project(projections, hidden)[0] == 0).item()
+    monkeypatch.setenv("UNSLOTH_MLX_VERIFY_QMV_ROWS", "0")
+    assert project(projections, hidden) is fallback
+
+
+def test_nvfp4_verify_rows_do_not_contract():
+    from unsloth_zoo.mlx import inference, matmul
+
+    k, n = 1024, 16
+    x = mx.array([1, 2**-23] + [0] * 510 + [-1, -2**-23] + [0] * 510, dtype = mx.bfloat16)
+    x = x + (mx.arange(8, dtype = mx.bfloat16)[:, None] * (mx.arange(k) == 16))[None]
+    w = mx.full((n, k // 8), 0x22222222, mx.uint32)
+    scales = mx.full((n, k // 16), 0x39, mx.uint8)
+    y, = matmul.fp_qmv_rows(x, ((w, scales),), 16, 4, inference._fp_qmv_header(), tiled = True)
+    ref = mx.concatenate([mx.quantized_matmul(row[None], w, scales, transpose = True, group_size = 16, bits = 4,
+                                              mode = "nvfp4") for row in x[0]])[None]
+    assert mx.all(ref[:, 0] == 0).item() and mx.all(ref[:, 1:] != 0).item()
+    assert mx.array_equal(y.view(mx.uint16), ref.view(mx.uint16)).item()
+
+
 def _spilling_costs(most, prepared = 0.9, staged = 1):  # one unit per launch and per row; launches over `most` rows spill
     per_row = {"inline": 1, "prepared": prepared, "staged": staged}
     return {(m, kind): 1 + m * per_row[kind] if m <= most else 100 for kind in per_row
