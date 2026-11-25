@@ -630,12 +630,13 @@ def _logits_to_keep_as_index(model, input_ids, inputs_embeds, logits_to_keep):
     if not isinstance(logits_to_keep, int) or isinstance(logits_to_keep, bool) or logits_to_keep <= 0:
         return logits_to_keep
     tokens = input_ids if input_ids is not None else inputs_embeds
-    length = tokens.shape[1] if tokens is not None and tokens.dim() >= 2 else 0
+    if tokens is None or tokens.dim() < 2 or tokens.shape[1] <= logits_to_keep:
+        return logits_to_keep  # decode steps (one new token) and nothing-to-slice calls stop here
     weight = getattr(model.get_output_embeddings(), "weight", None)
-    if length <= logits_to_keep or not isinstance(weight, torch.Tensor) \
-            or weight.dtype not in (torch.bfloat16, torch.float16) or weight.device.type != "cpu" \
-            or not _forward_takes_index_logits_to_keep(type(model)):
+    if not isinstance(weight, torch.Tensor) or weight.dtype not in (torch.bfloat16, torch.float16) \
+            or weight.device.type != "cpu" or not _forward_takes_index_logits_to_keep(type(model)):
         return logits_to_keep
+    length = tokens.shape[1]
     return torch.arange(length - logits_to_keep, length, device = tokens.device)
 
 
