@@ -37,6 +37,8 @@ from .utils import (
     logger,
     Cache,
     process_return,
+    cache_kwarg_name,
+    output_cache,
 )
 try:
     from .moe_router_triton import fused_route_or_none as _fused_route_or_none
@@ -491,6 +493,10 @@ def patch_qwen3_vl_moe():
         if getattr(_original_causal_lm_forward, "_unsloth_hidden_states_wrapper", False):
             return
 
+        _cache_kwarg = cache_kwarg_name(_original_causal_lm_forward)
+        _output_cache_field = "cache" if "cache" in getattr(Qwen3VLMoeCausalLMOutputWithPast, "__dataclass_fields__", {}) else "past_key_values"
+        _output_has_rope_deltas = "rope_deltas" in getattr(Qwen3VLMoeCausalLMOutputWithPast, "__dataclass_fields__", {})
+
         def _patched_causal_lm_forward(
             self,
             input_ids=None,
@@ -507,6 +513,10 @@ def patch_qwen3_vl_moe():
             logits_to_keep=0,
             **kwargs,
         ):
+            # Fold 5.24's `cache=` from **kwargs, else stock sees both names and warns every call.
+            _cache = kwargs.pop("cache", None)
+            if past_key_values is None:
+                past_key_values = _cache
             RETURN_HIDDEN_STATES = (
                 os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
             )
@@ -518,7 +528,7 @@ def patch_qwen3_vl_moe():
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
-                    past_key_values=past_key_values,
+                    **{_cache_kwarg: past_key_values},
                     inputs_embeds=inputs_embeds,
                     labels=labels,
                     pixel_values=pixel_values,
@@ -539,7 +549,7 @@ def patch_qwen3_vl_moe():
                 video_grid_thw=video_grid_thw,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
-                past_key_values=past_key_values,
+                **{_cache_kwarg: past_key_values},
                 inputs_embeds=inputs_embeds,
                 cache_position=cache_position,
                 **kwargs,
@@ -560,10 +570,10 @@ def patch_qwen3_vl_moe():
                 loss=None,
                 aux_loss=None,
                 logits=logits,
-                past_key_values=outputs.past_key_values,
+                **{_output_cache_field: output_cache(outputs)},
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,
-                rope_deltas=outputs.rope_deltas,
+                **({"rope_deltas": getattr(outputs, "rope_deltas", None)} if _output_has_rope_deltas else {}),
             )
 
         # Preserve __qualname__ so _unsloth_get_batch_samples can detect this is

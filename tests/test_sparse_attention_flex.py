@@ -381,6 +381,8 @@ def test_dsa_cache_layout_matches_installed_source():
     import inspect
     from transformers.models.deepseek_v32 import modeling_deepseek_v32 as a
     source = inspect.getsource(a.DeepseekV32Attention._unsloth_upstream_forward)
+    source = s._skip.cache_spelling(source)
+    assert s._DSA_CACHE_LATENT in source or s._DSA_CACHE_EXPANDED in source
     assert s._DSA_LATENT_CACHE["deepseek_v32"] == (s._DSA_CACHE_LATENT in source)
 
 

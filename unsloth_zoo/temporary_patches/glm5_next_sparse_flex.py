@@ -439,8 +439,9 @@ def unsloth_glm5_next_attention_forward(self, hidden_states, attention_mask, pas
 
 
 def _source(function):
+    from .sparse_attention import cache_spelling
     try:
-        return inspect.getsource(inspect.unwrap(function))
+        return cache_spelling(inspect.getsource(inspect.unwrap(function)))
     except Exception:
         return ""
 
@@ -491,14 +492,16 @@ def patch_glm5_next_sparse():
         unsloth_glm5_next_indexer_forward = unsloth_glm5_next_indexer_forward,
     )
 
-    def forward(self, hidden_states, attention_mask, past_key_values = None, prev_topk_indices = None, **kwargs):
+    def forward(self, hidden_states, attention_mask, past_key_values = None, prev_topk_indices = None, cache = None, **kwargs):
         return unsloth_glm5_next_attention_forward(
-            self, hidden_states, attention_mask, past_key_values, prev_topk_indices, **kwargs
+            self, hidden_states, attention_mask, past_key_values if cache is None else cache, prev_topk_indices, **kwargs
         )
 
-    def indexer_forward(self, hidden_states, q_resid, attention_mask, past_key_values):
+    def indexer_forward(self, hidden_states, q_resid, attention_mask, past_key_values = None, cache = None):
         with torch.no_grad():
-            return unsloth_glm5_next_indexer_forward(self, hidden_states, q_resid, attention_mask, past_key_values)
+            return unsloth_glm5_next_indexer_forward(
+                self, hidden_states, q_resid, attention_mask, past_key_values if cache is None else cache,
+            )
 
     forward._unsloth_sparse_flex = True
     indexer_forward._unsloth_sparse_flex = True

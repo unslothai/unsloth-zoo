@@ -178,3 +178,27 @@ def test_disabling_a_requested_cache_still_warns(monkeypatch):
     vision = nn.Linear(8, 8)(torch.randn(2, 8))
     cross(torch.randn(2, 8, requires_grad = True), cross_attention_states = vision, use_cache = True)
     assert seen and "use_cache=False" in seen[0] and "_CacheLayer" in seen[0]
+
+
+@pytest.mark.parametrize("cache_name", ["past_key_values", "cache", "layer_past"])
+def test_a_cache_under_any_name_is_dropped_while_checkpointing(cache_name):
+    # Stock nulls `cache` (5.24); else the recompute writes the cache twice.
+    seen = {}
+
+    class _CachedLayer(GradientCheckpointingLayer):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(8, 8, bias = False)
+
+        def forward(self, hidden_state, scale = None, **kwargs):
+            seen.setdefault("cache", []).append(kwargs.get(cache_name))
+            return (hidden_state + scale * self.proj(hidden_state),)
+
+    torch.manual_seed(0)
+    layer = _CachedLayer().train()
+    layer.gradient_checkpointing = True
+    layer._gradient_checkpointing_func = _CHECKPOINTERS["torch_reentrant"]
+    scale = torch.ones((), requires_grad = True)
+    out = layer(torch.randn(2, 8, requires_grad = True), scale = scale, **{cache_name: object()})[0]
+    out.sum().backward()
+    assert seen["cache"] and all(value is None for value in seen["cache"]), seen

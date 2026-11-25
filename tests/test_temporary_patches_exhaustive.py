@@ -316,6 +316,20 @@ def _resolve_for_arity(func, expected_name = None):
 
 # bitsandbytes.py patches the top-level bitsandbytes.nn.Linear4bit alias and its .forward; nn.modules.Linear4bit.forward is covered elsewhere.
 
+def _constructible_with(cls, field_names, req):
+    """cls(req=...) works: a declared field or the 5.24 past_key_values -> cache alias."""
+    if req in field_names:
+        return True
+    if req != "past_key_values" or "cache" not in field_names:
+        return False
+    sentinel = object()
+    try:
+        out = cls(past_key_values = sentinel)
+    except TypeError:
+        return False
+    return getattr(out, "cache", None) is sentinel
+
+
 def test_bitsandbytes_top_level_Linear4bit_alias():
     """bitsandbytes.py:110 patches the top-level bitsandbytes.nn.Linear4bit alias; pins its presence and .forward method."""
     bnb = _bitsandbytes_or_skip()
@@ -708,7 +722,7 @@ def test_gemma4_causal_lm_output_with_past_kwargs():
     sig = inspect.signature(cls)
     field_names = list(sig.parameters.keys())
     for req in ("loss", "logits", "past_key_values", "hidden_states", "attentions"):
-        if req not in field_names:
+        if not _constructible_with(cls, field_names, req):
             pytest.fail(
                 f"DRIFT DETECTED: zoo temporary_patches/gemma4_moe.py:189 "
                 f"constructs Gemma4CausalLMOutputWithPast({req}=...) but "
@@ -805,7 +819,7 @@ def test_gpt_oss_moe_causal_lm_output_kwargs():
     field_names = list(sig.parameters.keys())
     for req in ("loss", "aux_loss", "logits", "past_key_values",
                 "hidden_states", "attentions", "router_logits"):
-        if req not in field_names:
+        if not _constructible_with(cls, field_names, req):
             pytest.fail(
                 f"DRIFT DETECTED: zoo temporary_patches/gpt_oss.py:2949 "
                 f"constructs MoeCausalLMOutputWithPast({req}=...) but "
@@ -1073,7 +1087,7 @@ def test_csm_output_with_past_kwargs():
     sig = inspect.signature(cls)
     field_names = list(sig.parameters.keys())
     for req in ("loss", "logits", "past_key_values"):
-        if req not in field_names:
+        if not _constructible_with(cls, field_names, req):
             pytest.fail(
                 f"DRIFT DETECTED: zoo temporary_patches/misc.py constructs "
                 f"CsmOutputWithPast({req}=...) but installed dataclass on "
@@ -1657,9 +1671,12 @@ def test_qwen3_vl_moe_causal_lm_output_with_past_kwargs():
         )
     sig = inspect.signature(cls)
     field_names = list(sig.parameters.keys())
+    optional = ("rope_deltas",)
     for req in ("loss", "logits", "past_key_values", "hidden_states",
                 "attentions", "rope_deltas"):
-        if req not in field_names:
+        if req in optional and req not in field_names:
+            continue
+        if not _constructible_with(cls, field_names, req):
             pytest.fail(
                 f"DRIFT DETECTED: zoo temporary_patches/qwen3_vl_moe.py:466 "
                 f"constructs Qwen3VLMoeCausalLMOutputWithPast({req}=...) but "
@@ -2069,7 +2086,7 @@ def test_modeling_outputs_causal_lm_output_with_past_kwargs():
     field_names = list(sig.parameters.keys())
     for req in ("loss", "logits", "past_key_values", "hidden_states",
                 "attentions"):
-        if req not in field_names:
+        if not _constructible_with(CausalLMOutputWithPast, field_names, req):
             pytest.fail(
                 f"DRIFT DETECTED: zoo constructs CausalLMOutputWithPast"
                 f"({req}=...) but installed dataclass has fields {field_names}"
@@ -2083,7 +2100,7 @@ def test_modeling_outputs_moe_causal_lm_output_with_past_kwargs():
     field_names = list(sig.parameters.keys())
     for req in ("loss", "logits", "past_key_values", "hidden_states",
                 "attentions", "aux_loss", "router_logits"):
-        if req not in field_names:
+        if not _constructible_with(MoeCausalLMOutputWithPast, field_names, req):
             pytest.fail(
                 f"DRIFT DETECTED: zoo constructs MoeCausalLMOutputWithPast"
                 f"({req}=...) but installed dataclass has fields {field_names}"

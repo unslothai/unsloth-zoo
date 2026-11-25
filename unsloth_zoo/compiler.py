@@ -3256,6 +3256,18 @@ def create_standalone_class(
     # the undecorated function instead of off the class attribute.
     real_forward = _unwrap_undecorated_method(f.forward, f.__qualname__)
     old_source = inspect.getsource(real_forward)
+    # 5.24: the adapter shows `cache` but wraps past_key_values source; emit its names, re-apply the adapter.
+    # functools.wraps copies the marker onto outer wrappers: walk to the innermost carrier, the adapter itself.
+    cache_adapter, _adapted = None, f.forward
+    for _ in range(10):
+        _inner = getattr(_adapted, "__wrapped__", None)
+        _marker = getattr(_adapted, "_unsloth_cache_kwarg_adapter", None)
+        if _marker is not None and getattr(_inner, "_unsloth_cache_kwarg_adapter", None) is None:
+            cache_adapter = _marker
+            break
+        if _inner is None:
+            break
+        _adapted = _inner
     old_init = inspect.getsource(f.__init__)
     if forward_source is None:
         forward_source = old_source
@@ -3392,7 +3404,13 @@ def create_standalone_class(
         compile = ""
 
     # Create new forward calling optimized function
-    parameters = inspect.signature(real_forward).parameters
+    signature_source = real_forward
+    if cache_adapter is not None:
+        signature_source = getattr(_adapted, "__wrapped__", real_forward)
+    parameters = inspect.signature(signature_source).parameters
+    cache_value = {}
+    if cache_adapter is not None and patched_forward_info:
+        cache_value = {cache_adapter[0]: cache_adapter[1]}
     # Build the forwarding call using keyword arguments (name=name) for regular
     # parameters so that decorators like @merge_with_config_defaults can find
     # them in **kwargs.  When args are passed positionally, the decorator's
@@ -3411,7 +3429,7 @@ def create_standalone_class(
         elif key == "self":
             forwarding_parts.append("self")
         else:
-            forwarding_parts.append(f"{key}={key}")
+            forwarding_parts.append(f"{key}={cache_value.get(key, key)}")
     pass
     parameters = ", ".join(forwarding_parts)
 
@@ -3487,6 +3505,11 @@ def create_standalone_class(
 
     # Combine all into file
     source = source + full_class
+    if cache_adapter is not None and not patched_forward_info:
+        source += (
+            "\nfrom unsloth_zoo.temporary_patches.utils import ensure_cache_kwarg as _unsloth_ensure_cache_kwarg\n"
+            f"{module}.forward = _unsloth_ensure_cache_kwarg({module}.forward, {cache_adapter[0]!r}, {cache_adapter[1]!r})\n"
+        )
     if supports_return_hidden_states:
         source += f"\n{module}.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True\n"
 

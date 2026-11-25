@@ -25,6 +25,10 @@ __all__ = [
     "torch_compiler_disable_unless_decode",
     "compile_with_eager_fallback",
     "patch_function_past_key_values",
+    "cache_kwarg_name",
+    "adapt_cache_kwarg",
+    "ensure_cache_kwarg",
+    "output_cache",
     "process_return",
     "process_output_options",
     "KWARGS_TYPE",
@@ -84,11 +88,129 @@ pass
 # Fastpath: output classes sometimes drop args.
 global PROCESS_RETURN_ALLOWED_TYPES
 PROCESS_RETURN_ALLOWED_TYPES = {}
+# transformers 5.24 renamed past_key_values / cache_params to `cache`; old names are aliases until 5.40.
+_OLD_CACHE_NAMES = ("past_key_values", "cache_params")
+_OUTPUT_CACHE_FIELD = {}
+
+
+def _output_cache_renames(output_class):
+    """{old key: field} for the cache fields 5.24 renamed on this output class, e.g. past_key_values -> cache,
+    depth_decoder_past_key_values -> depth_decoder_cache (CSM); empty before 5.24."""
+    renames = _OUTPUT_CACHE_FIELD.get(output_class)
+    if renames is None:
+        names = set(getattr(output_class, "__dataclass_fields__", None) or ())
+        renames = {}
+        if "cache" in names:
+            renames.update({old: "cache" for old in _OLD_CACHE_NAMES if old not in names})
+        for name in names:
+            if name.endswith("_cache") and name != "cache":
+                old = name[: -len("cache")] + "past_key_values"
+                if old not in names:
+                    renames[old] = name
+        _OUTPUT_CACHE_FIELD[output_class] = renames
+    return renames
+
+
+def _rename_cache_key_for_output(output_class, return_dict):
+    """Hand an output class its own cache field names, so 5.24's deprecated-alias path (and its warning) is skipped
+    and a renamed field without an alias (CsmOutputWithPast.depth_decoder_cache) is not dropped."""
+    renames = _output_cache_renames(output_class)
+    if not renames or not any(old in return_dict for old in renames):
+        return return_dict
+    return_dict = dict(return_dict)
+    for old, field in renames.items():
+        if old in return_dict:
+            value = return_dict.pop(old)
+            if return_dict.get(field) is None:
+                return_dict[field] = value
+    return return_dict
+
+
+def cache_kwarg_name(func, default = "past_key_values"):
+    """Keyword `func` takes the KV cache under: `cache` from transformers 5.24, else the older name it declares.
+
+    Use it when calling a stock forward / mask factory so 5.24 gets `cache` (no deprecation warning) and older
+    releases keep `past_key_values` / `past_key_value` / `cache_params`.
+    """
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return default
+    for name in ("cache", "past_key_values", "past_key_value", "cache_params"):
+        if name in params:
+            return name
+    return default
+
+
+def output_cache(outputs):
+    """The cache a model output carries: field `cache` from transformers 5.24, `past_key_values` before."""
+    if outputs is None:
+        return None
+    getter = getattr(outputs, "get", None)
+    if getter is None:
+        return getattr(outputs, "past_key_values", None)
+    cache = getter("cache", None)
+    return getter("past_key_values", None) if cache is None else cache
+
+
+def _renamed_cache_param(original_func, new_func):
+    """Old cache name new_func declares where the stock function now takes `cache`, else None."""
+    try:
+        old = inspect.signature(original_func).parameters
+        new = inspect.signature(new_func).parameters
+    except (TypeError, ValueError):
+        return None
+    if "cache" not in old or "cache" in new:
+        return None
+    for name in _OLD_CACHE_NAMES:
+        if name in new and name not in old:
+            return name
+    return None
+
+
+def adapt_cache_kwarg(new_func, old_name, new_name = "cache"):
+    """new_func declaring `old_name`, exposed as declaring `new_name` in the same position.
+
+    transformers 5.24 callers pass `cache=`; a replacement written against `past_key_values` would see it
+    land in **kwargs and run with no cache (decode attends to the new token only), and the signature
+    check refuses the patch outright. The wrapper renames the keyword back, positional calls are unchanged.
+    """
+    signature = inspect.signature(new_func)
+    parameters = [
+        p.replace(name = new_name) if p.name == old_name else p
+        for p in signature.parameters.values()
+    ]
+
+    @functools.wraps(new_func)
+    def forward(*args, **kwargs):
+        if new_name in kwargs:
+            value = kwargs.pop(new_name)
+            if value is not None or kwargs.get(old_name) is None:
+                kwargs[old_name] = value
+        return new_func(*args, **kwargs)
+
+    forward.__signature__ = signature.replace(parameters = parameters)
+    forward._unsloth_cache_kwarg_adapter = (old_name, new_name)
+    return forward
+
+
+def ensure_cache_kwarg(func, old_name, new_name = "cache"):
+    """adapt_cache_kwarg(func, old_name) when func still declares old_name and not new_name, else func."""
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return func
+    if old_name in params and new_name not in params:
+        return adapt_cache_kwarg(func, old_name, new_name)
+    return func
+
+
 def process_return(
     output_class : type,
     return_dict : Dict,
 ) -> Any:
     """ CausalLMOutputWithPast(...) might change arguments! """
+    return_dict = _rename_cache_key_for_output(output_class, return_dict)
     try:
         if output_class in PROCESS_RETURN_ALLOWED_TYPES:
             allowed_keys = PROCESS_RETURN_ALLOWED_TYPES[output_class]
@@ -2526,6 +2648,11 @@ def patch_function(
             new_func = eager_under_zero3(_eager_func, new_func)
     pass
 
+    _old_cache_name = _renamed_cache_param(original_func, new_func)
+    if _old_cache_name is not None:
+        new_func = adapt_cache_kwarg(new_func, _old_cache_name)
+    pass
+
     # Stash original under a unique name for later restoration.
     if store_original:
         unique_name = _get_unique_storage_name(target_obj, attr_name)
@@ -2586,7 +2713,9 @@ def patch_function_past_key_values(
             continue
         # Check if either is provided
         for key in ("past_key_value", "past_key_values",):
-            if key in new_keys and key in old_keys:
+            if key in new_keys and (key in old_keys or (
+                key == "past_key_values" and "cache" in old_keys and "cache" not in new_keys
+            )):
                 try:
                     success = patch_function(
                         target_obj = target_obj,

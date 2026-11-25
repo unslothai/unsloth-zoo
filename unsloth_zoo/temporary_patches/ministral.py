@@ -23,6 +23,9 @@ from .utils import (
     KWARGS_TYPE,
     raise_error,
     Cache,
+    adapt_cache_kwarg,
+    cache_kwarg_name,
+    _renamed_cache_param,
 )
 
 def patch_MinistralAttention():
@@ -96,6 +99,9 @@ def patch_MinistralAttention():
     target_cls = transformers.models.ministral.modeling_ministral.MinistralAttention
     _original_forward_signature = inspect.signature(target_cls.forward)
     _full_forward = forward
+    if _renamed_cache_param(target_cls.forward, _full_forward) is not None:
+        # The copied stock signature hides 5.24's `cache` from patch_function: map it here or decode loses the cache.
+        _full_forward = adapt_cache_kwarg(_full_forward, "past_key_values")
     def forward(self, *args, **kwargs):
         return _full_forward(self, *args, **kwargs)
     forward.__signature__ = _original_forward_signature
@@ -123,6 +129,7 @@ def patch_MinistralModel_forward():
         return raise_error("MinistralModel", e)
 
     original_forward = MinistralModel.forward
+    _cache_kwarg = cache_kwarg_name(original_forward)
 
     def patched_forward(
         self,
@@ -136,6 +143,19 @@ def patch_MinistralModel_forward():
         *args,
         **kwargs,
     ):
+        def _stock_kwargs():
+            stock_kwargs = dict(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                **kwargs,
+            )
+            stock_kwargs[_cache_kwarg] = past_key_values
+            return stock_kwargs
+
         sw = getattr(self.config, "sliding_window", None)
         has_sliding_layers = any(
             lt == "sliding_attention"
@@ -150,32 +170,10 @@ def patch_MinistralModel_forward():
                 self.config, "max_position_embeddings", 32768
             )
             try:
-                return original_forward(
-                    self,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    inputs_embeds=inputs_embeds,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    *args,
-                    **kwargs,
-                )
+                return original_forward(self, *args, **_stock_kwargs())
             finally:
                 self.config.sliding_window = None
-        return original_forward(
-            self,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            *args,
-            **kwargs,
-        )
+        return original_forward(self, *args, **_stock_kwargs())
 
     patch_function(
         MinistralModel,

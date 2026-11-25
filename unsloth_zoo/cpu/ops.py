@@ -654,10 +654,20 @@ def patch_chunked_causal_lm_loss(model):
     # outer method, and a bound original would run the source model's weights.
     original_func = original_forward.__func__ if getattr(original_forward, "__self__", None) is model else None
     inner_name = getattr(model, "base_model_prefix", "model")
+    try:
+        params = inspect.signature(original_forward).parameters
+    except (TypeError, ValueError):
+        params = {}
+    cache_kwarg = "cache" if "cache" in params else "past_key_values"
+    output_cache_field = "cache" if "cache" in getattr(CausalLMOutputWithPast, "__dataclass_fields__", {}) \
+        else "past_key_values"
 
     def forward(self, input_ids = None, attention_mask = None, position_ids = None,
                 past_key_values = None, inputs_embeds = None, labels = None, use_cache = None,
                 logits_to_keep = 0, **kwargs):
+        cache = kwargs.pop("cache", None)
+        if past_key_values is None:
+            past_key_values = cache
         shift_labels = kwargs.pop("shift_labels", None)
         head_weight = _plain_head_weight(self.get_output_embeddings())
         logps_targets = vars(self).get("_unsloth_cpu_logps_targets", None)
@@ -667,7 +677,7 @@ def patch_chunked_causal_lm_loss(model):
             kwargs.pop("return_dict", None)
             outputs = getattr(self, inner_name)(
                 input_ids = input_ids, attention_mask = attention_mask, position_ids = position_ids,
-                past_key_values = past_key_values, inputs_embeds = inputs_embeds, use_cache = use_cache, **kwargs,
+                **{cache_kwarg: past_key_values}, inputs_embeds = inputs_embeds, use_cache = use_cache, **kwargs,
             )
             hidden = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
             batch_size, length = logps_targets.shape
@@ -690,7 +700,7 @@ def patch_chunked_causal_lm_loss(model):
             call = functools.partial(original_func, self) if original_func is not None else original_forward
             return call(
                 input_ids = input_ids, attention_mask = attention_mask, position_ids = position_ids,
-                past_key_values = past_key_values, inputs_embeds = inputs_embeds, labels = labels,
+                **{cache_kwarg: past_key_values}, inputs_embeds = inputs_embeds, labels = labels,
                 use_cache = use_cache, logits_to_keep = logits_to_keep, **kwargs,
             )
         num_items_in_batch = kwargs.pop("num_items_in_batch", None)
@@ -698,7 +708,7 @@ def patch_chunked_causal_lm_loss(model):
         kwargs.pop("return_dict", None)
         outputs = getattr(self, inner_name)(
             input_ids = input_ids, attention_mask = attention_mask, position_ids = position_ids,
-            past_key_values = past_key_values, inputs_embeds = inputs_embeds, use_cache = use_cache,
+            **{cache_kwarg: past_key_values}, inputs_embeds = inputs_embeds, use_cache = use_cache,
             **kwargs,
         )
         hidden = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
@@ -708,7 +718,8 @@ def patch_chunked_causal_lm_loss(model):
         )
         return CausalLMOutputWithPast(
             loss = loss, logits = None,
-            past_key_values = getattr(outputs, "past_key_values", None),
+            **{output_cache_field: outputs.get("cache", outputs.get("past_key_values")) if hasattr(outputs, "get")
+               else getattr(outputs, "past_key_values", None)},
             hidden_states = getattr(outputs, "hidden_states", None),
             attentions = getattr(outputs, "attentions", None),
         )
