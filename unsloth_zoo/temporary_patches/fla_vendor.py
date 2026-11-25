@@ -1641,7 +1641,7 @@ def _install_cpu_torch_path():
 # instead; other GPUs, ROCm, CPU, context parallel, the in-kernel gate and packed rows with per-document states keep
 # fla. UNSLOTH_GDN_SM75_TORCH=0 keeps fla everywhere.
 _SM75_TORCH_MARK = "_unsloth_sm75_torch_path"
-_sm75_state = {"capability": None, "calls": 0, "logged": False}
+_sm75_state = {"capability": None, "calls": 0, "logged": False, "budget": {}, "over_budget": 0, "logged_budget": False}
 
 
 def _sm75_torch_enabled():
@@ -1717,6 +1717,59 @@ def _sm75_torch_chunk_gated_delta_rule(
     return o, final_state
 
 
+# The torch path keeps every chunk's intermediates for backward: measured peak per (token x value head) of one
+# fwd + bwd, K = V = 128: float16 12 KB compiled / 16 KB eager, bfloat16 13 / 17 KB (fla recomputes in backward and
+# keeps far less). Calls whose estimate (eager bound, float32 matmuls above it) exceeds a fraction of the GPU memory
+# free at the first sm75 call keep fla, so a config that fits with fla still fits.
+_SM75_BYTES_PER_TOKEN_HEAD = {"float16": 16 * 1024, "other": 24 * 1024}
+_SM75_MEM_FRACTION = 0.5
+
+
+def _sm75_mem_fraction():
+    try:
+        return float(os.environ.get("UNSLOTH_GDN_SM75_MEM_FRACTION", _SM75_MEM_FRACTION))
+    except ValueError:
+        return _SM75_MEM_FRACTION
+
+
+def _sm75_budget_impl(index):
+    """Bytes the torch path may use on GPU ``index``: a fraction of the memory free (driver free + the caching
+    allocator's unused reserve) at the first sm75 call, read once per device so every call (forward, checkpoint
+    recompute, every compiled graph) decides alike for a given shape."""
+    budgets = _sm75_state["budget"]
+    if index not in budgets:
+        try:
+            import torch
+            free, _ = torch.cuda.mem_get_info(index)
+            free += torch.cuda.memory_reserved(index) - torch.cuda.memory_allocated(index)
+            budgets[index] = int(free * _sm75_mem_fraction())
+        except Exception:
+            budgets[index] = 0
+    return budgets[index]
+
+
+def _sm75_budget(index):
+    return _sm75_budget_impl(index)
+
+
+try:
+    import torch._dynamo as _dynamo
+    # Traced calls read the cached budget as a constant: no graph break, and the shape comparison becomes a guard
+    # (at most one more graph: the fla one, for shapes over the budget).
+    _sm75_budget = _dynamo.assume_constant_result(_sm75_budget)
+except Exception:
+    pass
+
+
+def _sm75_over_budget(q, v):
+    import torch
+    index = q.device.index
+    if index is None:
+        index = torch.cuda.current_device() if q.is_cuda else 0
+    per =_SM75_BYTES_PER_TOKEN_HEAD["float16" if q.dtype == torch.float16 else "other"]
+    return q.shape[0] * q.shape[1] * v.shape[2] * per > _sm75_budget(index)
+
+
 def _make_sm75_chunk_gated_delta_rule(original):
     """sm75 CUDA calls that fit the torch path -> unsloth_zoo.gdn_torch_chunk; everything else -> ``original``.
     Plain Python, so an enclosing torch.compile traces it (the recurrence inside is an opaque op)."""
@@ -1750,6 +1803,17 @@ def _make_sm75_chunk_gated_delta_rule(original):
             or v.shape[2] % q.shape[2] != 0
         ):
             return original(*args, **kwargs)
+        if _sm75_over_budget(q, v):
+            # The torch path's workspace would not fit beside what fla needs: fla, as without this path.
+            if not _compiling():
+                _sm75_state["over_budget"] += 1
+                if not _sm75_state["logged_budget"]:
+                    _sm75_state["logged_budget"] = True
+                    logger.info(
+                        "Unsloth: gated delta calls this large keep fla's kernels on this sm75 GPU: the torch chunked "
+                        "path's workspace would not fit in the free GPU memory."
+                    )
+            return original(*args, **kwargs)
         for name in ("cu_seqlens_cpu", "cp_context"):
             a.pop(name, None)
         for name in ("use_gate_in_kernel", "A_log", "dt_bias"):
@@ -1766,6 +1830,11 @@ def _make_sm75_chunk_gated_delta_rule(original):
         return _sm75_torch_chunk_gated_delta_rule(**a, **extra)
 
     setattr(chunk_gated_delta_rule, _SM75_TORCH_MARK, "torch")
+    # The CPU wrapper underneath stays visible to its installer, so a later patch pass does not wrap this wrapper
+    # again (each pass stacked another CPU / sm75 pair, and the kernel-hub closure bound a middle one).
+    cpu_mark = getattr(original, _CPU_TORCH_MARK, None)
+    if cpu_mark is not None:
+        setattr(chunk_gated_delta_rule, _CPU_TORCH_MARK, cpu_mark)
     return chunk_gated_delta_rule
 
 

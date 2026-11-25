@@ -192,10 +192,12 @@ def _fake_fla(monkeypatch):
     return package, chunk, modeling, calls
 
 
-def _sm75_host(monkeypatch, caps = {0: (7, 5)}, triton_ok = True):
+def _sm75_host(monkeypatch, caps = {0: (7, 5)}, triton_ok = True, budget = 1 << 62):
     """Pretend the visible GPUs have ``caps``, and that CPU test tensors live on device 0 of them."""
     monkeypatch.setitem(fla_vendor._sm75_state, "capability", dict(caps))
     monkeypatch.setitem(fla_vendor._sm75_state, "calls", 0)
+    monkeypatch.setitem(fla_vendor._sm75_state, "over_budget", 0)
+    monkeypatch.setitem(fla_vendor._sm75_state, "budget", {0: budget})
     monkeypatch.setattr(fla_vendor, "_triton_lacks_sm75_dots", lambda: triton_ok)
     monkeypatch.setattr(fla_vendor, "_on_sm75", lambda t: isinstance(t, torch.Tensor) and caps.get(0) == (7, 5))
 
@@ -237,6 +239,91 @@ def test_sm75_routes_packed_rows(monkeypatch):
     ref = torch.cat([_recurrent_fp64(*(x[:, a:b] for x in (q, k, v, g, beta)), 0.3)[0] for a, b in ((0, 30), (30, 70))], 1)
     torch.testing.assert_close(o.double(), ref, atol = 2e-3, rtol = 2e-3)
     assert ht is None and calls == [] and fla_vendor._sm75_state["calls"] == 1
+
+
+def test_repeated_patch_passes_wrap_once(monkeypatch):
+    """patch_vendor_fla runs more than once: the CPU and sm75 installers each wrap the kernel once in total, so the
+    kernel-hub closure and Unsloth's caller walk see one sm75 router over one CPU wrapper over fla."""
+    package, chunk, modeling, calls = _fake_fla(monkeypatch)
+    _sm75_host(monkeypatch)
+    kernel = package.chunk_gated_delta_rule
+    for _ in range(3):
+        fla_vendor._install_cpu_torch_path()
+        assert fla_vendor._install_sm75_torch_path()
+    top = package.chunk_gated_delta_rule
+    assert getattr(top, fla_vendor._SM75_TORCH_MARK, None) == "torch"
+    cpu = top.__wrapped__
+    assert getattr(cpu, fla_vendor._SM75_TORCH_MARK, None) is None and getattr(cpu, fla_vendor._CPU_TORCH_MARK, None) is not None
+    assert cpu.__wrapped__ is kernel
+    assert chunk.chunk_gated_delta_rule is top and modeling.chunk_gated_delta_rule is top
+
+
+def test_sm75_calls_over_the_memory_budget_keep_fla(monkeypatch):
+    """The torch path's workspace estimate (tokens x value heads x bytes) over the budget: fla, counted; under it:
+    the torch path. The edge is exact, so the decision is a pure function of the shape."""
+    package, _, _, calls = _fake_fla(monkeypatch)
+    per = fla_vendor._SM75_BYTES_PER_TOKEN_HEAD["float16"]
+    B, T, HV = 2, 70, 4
+    _sm75_host(monkeypatch, budget = B * T * HV * per)
+    assert fla_vendor._install_sm75_torch_path()
+    q, k, v, g, beta, _ = _half_inputs(B, T, 2, HV, 16, 8)
+    o, _ = package.chunk_gated_delta_rule(q, k, v, g = g, beta = beta, use_qk_l2norm_in_kernel = True)
+    assert o.dtype == torch.float16 and calls == [] and fla_vendor._sm75_state["calls"] == 1
+    q, k, v, g, beta, _ = _half_inputs(B, T + 1, 2, HV, 16, 8)
+    o, _ = package.chunk_gated_delta_rule(q, k, v, g = g, beta = beta, use_qk_l2norm_in_kernel = True)
+    assert o == "fla" and len(calls) == 1
+    assert fla_vendor._sm75_state["calls"] == 1 and fla_vendor._sm75_state["over_budget"] == 1
+    # Non-float16 inputs (float32 / bfloat16 matmuls) count more bytes per token.
+    q, k, v, g, beta, _ = _half_inputs(B, T, 2, HV, 16, 8)
+    o, _ = package.chunk_gated_delta_rule(q.float(), k.float(), v.float(), g = g, beta = beta.float(), use_qk_l2norm_in_kernel = True)
+    assert o == "fla" and fla_vendor._sm75_state["over_budget"] == 2
+
+
+def test_sm75_budget_is_read_once_per_device(monkeypatch):
+    """A fraction of driver-free + allocator-unused memory at the first call, cached: a checkpoint recompute (less
+    free memory) decides like its forward. UNSLOTH_GDN_SM75_MEM_FRACTION overrides the fraction."""
+    reads = []
+
+    def mem_get_info(index):
+        reads.append(index)
+        return (8 << 30) - len(reads), 16 << 30
+
+    monkeypatch.setitem(fla_vendor._sm75_state, "budget", {})
+    monkeypatch.setattr(torch.cuda, "mem_get_info", mem_get_info)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda index: 3 << 30)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda index: 1 << 30)
+    monkeypatch.setenv("UNSLOTH_GDN_SM75_MEM_FRACTION", "0.25")
+    first = fla_vendor._sm75_budget_impl(0)
+    assert first == int(((8 << 30) - 1 + (2 << 30)) * 0.25)
+    assert fla_vendor._sm75_budget_impl(0) == first and reads == [0]
+    fla_vendor._sm75_budget_impl(1)
+    assert reads == [0, 1]
+    # No memory reading: no budget, fla.
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda index: 1 / 0)
+    assert fla_vendor._sm75_budget_impl(2) == 0
+
+
+def test_sm75_budget_compiles_without_graph_break(monkeypatch):
+    """Traced calls read the budget as a constant (no graph break); the shape check is a guard, so lengths under the
+    budget share the torch graph and a call over it compiles once more, to fla."""
+    from torch._dynamo.utils import counters
+    package, _, _, calls = _fake_fla(monkeypatch)
+    per = fla_vendor._SM75_BYTES_PER_TOKEN_HEAD["other"]
+    _sm75_host(monkeypatch, budget = 1 * 200 * 2 * per)
+    assert fla_vendor._install_sm75_torch_path()
+    torch._dynamo.reset()
+    counters.clear()
+    fn = package.chunk_gated_delta_rule
+    f = torch.compile(lambda *a: fn(*a, use_qk_l2norm_in_kernel = True)[0], backend = "aot_eager", fullgraph = True, dynamic = True)
+    for T in (70, 130, 200):
+        ins = [x.float().requires_grad_() for x in _inputs(1, T, 2, 2, 16, 8)[:5]]
+        o = f(*ins)
+        o.sum().backward()
+    assert sum(counters["graph_break"].values()) == 0 and calls == []
+    assert counters["stats"]["unique_graphs"] <= 2
+    g = torch.compile(lambda *a: fn(*a, use_qk_l2norm_in_kernel = True)[0], backend = "aot_eager", dynamic = True)
+    ins = [x.float() for x in _inputs(1, 201, 2, 2, 16, 8)[:5]]
+    assert g(*ins) == "fla" and len(calls) == 1
 
 
 @pytest.mark.parametrize("extra", [
