@@ -126,6 +126,38 @@ def test_chunked_ce_all_ignored_matches_mean_nan():
     assert chunked_linear_cross_entropy(hidden, weight, labels, num_items_in_batch = 1).item() == 0.0
 
 
+@pytest.mark.parametrize("amp", [None, torch.bfloat16])
+def test_chunked_ce_casts_an_fp32_head_once_under_autocast(amp):
+    """The detached head misses autocast's cast cache: it is cast once per call, not twice per chunk."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from unsloth_zoo.cpu.ops import chunked_linear_cross_entropy
+
+    class HeadCasts(TorchDispatchMode):
+        count = 0
+        def __torch_dispatch__(self, func, types, args = (), kwargs = None):
+            if func is torch.ops.aten._to_copy.default and tuple(args[0].shape) in ((97, 16), (16, 97)):
+                HeadCasts.count += 1
+            return func(*args, **(kwargs or {}))
+
+    torch.manual_seed(0)
+    hidden = torch.randn(3, 11, 16, requires_grad = True)
+    weight = (torch.randn(97, 16) * 0.2).requires_grad_()
+    labels = torch.randint(0, 97, (3, 11))
+    labels[0, :4] = -100
+    with HeadCasts(), torch.autocast("cpu", dtype = amp or torch.bfloat16, enabled = amp is not None):
+        loss = chunked_linear_cross_entropy(hidden, weight, labels, chunk_rows = 5)
+    assert HeadCasts.count == (0 if amp is None else 1)
+    loss.backward()
+    h = hidden.detach().clone().requires_grad_(); w = weight.detach().clone().requires_grad_()
+    with torch.autocast("cpu", dtype = amp or torch.bfloat16, enabled = amp is not None):
+        ref = _reference(h, w, labels, None)
+    ref.backward()
+    tol = dict(atol = 1e-5, rtol = 1e-5) if amp is None else dict(atol = 2e-2, rtol = 2e-2)
+    torch.testing.assert_close(loss.float(), ref.float(), **tol)
+    torch.testing.assert_close(hidden.grad, h.grad, **tol)
+    torch.testing.assert_close(weight.grad, w.grad, **tol)
+
+
 def test_bf16_policy_override(monkeypatch):
     from unsloth_zoo.cpu import runtime
     runtime.cpu_bf16_supported.cache_clear()

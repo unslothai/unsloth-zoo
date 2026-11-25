@@ -67,12 +67,17 @@ def _chunked_ce_forward_impl(hidden: torch.Tensor, weight: torch.Tensor, labels:
     with torch.autocast("cpu", dtype = amp_dtype, enabled = amp):
         return _chunked_ce_forward_loop(
             hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad, need_weight_grad, exact,
+            amp_dtype if amp else None,
         )
 
 
 def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad,
-                             need_weight_grad, exact):
+                             need_weight_grad, exact, amp_dtype = None):
     rows = hidden.shape[0]
+    # A detached head misses autocast's weight-cast cache, so every chunk would recast all of it: cast it once.
+    mm_weight = weight
+    if amp_dtype is not None and weight.is_floating_point() and weight.dtype not in (amp_dtype, torch.float64):
+        mm_weight = weight.to(amp_dtype)
     grad_dtype = torch.float32 if exact else hidden.dtype
     grad_hidden = torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else torch.empty(0)
     grad_weight = torch.zeros(weight.shape, dtype = torch.float32) if need_weight_grad else torch.empty(0)
@@ -83,7 +88,7 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
         valid = y != ignore_index
         # Zero ignored rows first: fp16 can overflow to inf in the projection, and NaN * 0 stays NaN.
         h = torch.where(valid.unsqueeze(-1), hidden[start:end], hidden.new_zeros(()))
-        logits = (h @ weight.t()).float()
+        logits = (h @ mm_weight.t()).float()
         safe_y = torch.where(valid, y, torch.zeros_like(y)).unsqueeze(-1)
         logits, log_p_target, _ = _softmax_without_collapse(logits, safe_y)
         total -= (log_p_target.squeeze(-1) * valid).sum()
@@ -96,7 +101,7 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
                     with torch.autocast("cpu", enabled = False):
                         grad_hidden[start:end] = logits @ weight.float()
                 else:
-                    grad_hidden[start:end] = logits.to(h.dtype) @ weight
+                    grad_hidden[start:end] = logits.to(h.dtype) @ mm_weight
             if need_weight_grad:
                 grad_weight.addmm_(logits.t(), h.float())
     return total, grad_hidden, grad_weight
