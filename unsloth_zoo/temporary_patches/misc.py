@@ -2944,7 +2944,8 @@ def patch_GradientCheckpointingLayer_keyword_inputs():
             message += " `use_cache=False`,"
             changed = True
         if not getattr(self, "_can_checkpoint_with_cache", False):
-            for name in ("past_key_values", "layer_past"):
+            # `cache` is transformers 5.24's name for past_key_values.
+            for name in ("past_key_values", "cache", "layer_past"):
                 if kwargs.get(name) is not None:
                     kwargs[name] = None
                     message += f" `{name}=None`,"

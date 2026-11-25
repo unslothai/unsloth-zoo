@@ -203,7 +203,10 @@ class _Eagle3Layer(nn.Module):
         import inspect
 
         params = inspect.signature(self.self_attn.forward).parameters
-        self._cache_kw = "past_key_values" if "past_key_values" in params else "past_key_value"
+        # transformers 5.24 renamed past_key_values to cache; the singular is 4.x's name.
+        self._cache_kw = next(
+            (name for name in ("cache", "past_key_values") if name in params), "past_key_value"
+        )
 
     def forward(self, embeds, hidden, attention_mask, position_embeddings, past_key_values):
         residual = hidden

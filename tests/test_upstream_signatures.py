@@ -1007,13 +1007,16 @@ def test_DeepseekV3ForCausalLM_forward_signature():
         )
     except ImportError:
         pytest.skip("transformers.models.deepseek_v3 not installed")
+    # transformers 5.24 renamed past_key_values to cache; the patch passes the stock forward's own name.
+    _params = inspect.signature(DeepseekV3ForCausalLM.forward).parameters
+    _cache_name = "cache" if "cache" in _params else "past_key_values"
     _assert_params_superset(
         DeepseekV3ForCausalLM.forward,
         required=[
             "input_ids",
             "attention_mask",
             "position_ids",
-            "past_key_values",
+            _cache_name,
             "inputs_embeds",
             "labels",
             "use_cache",

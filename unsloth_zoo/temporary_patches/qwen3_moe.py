@@ -30,6 +30,8 @@ from .utils import (
     raise_error,
     logger,
     torch_compiler_disable_unless_decode,
+    cache_kwarg_name,
+    output_cache,
 )
 
 
@@ -155,6 +157,9 @@ def _patch_causal_lm_forward_for_hidden_states(
     if getattr(_original_causal_lm_forward, "_unsloth_hidden_states_wrapper", False):
         return
 
+    _cache_kwarg = cache_kwarg_name(_original_causal_lm_forward)
+    _output_cache_field = "cache" if "cache" in getattr(output_cls, "__dataclass_fields__", {}) else "past_key_values"
+
     def _patched_causal_lm_forward(
         self,
         input_ids=None,
@@ -169,6 +174,11 @@ def _patch_causal_lm_forward_for_hidden_states(
         logits_to_keep=0,
         **kwargs,
     ):
+        # transformers 5.24 passes the cache as `cache=`, which lands in **kwargs here: fold it in and hand it on
+        # under the callee's own name, or stock sees both names and warns on every call.
+        _cache = kwargs.pop("cache", None)
+        if past_key_values is None:
+            past_key_values = _cache
         RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
 
         if not RETURN_HIDDEN_STATES:
@@ -177,7 +187,7 @@ def _patch_causal_lm_forward_for_hidden_states(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_values=past_key_values,
+                **{_cache_kwarg: past_key_values},
                 inputs_embeds=inputs_embeds,
                 labels=labels,
                 use_cache=use_cache,
@@ -191,7 +201,7 @@ def _patch_causal_lm_forward_for_hidden_states(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
-            past_key_values=past_key_values,
+            **{_cache_kwarg: past_key_values},
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_router_logits=output_router_logits,
@@ -211,7 +221,7 @@ def _patch_causal_lm_forward_for_hidden_states(
         return output_cls(
             loss=None,
             logits=hidden_states,
-            past_key_values=outputs.past_key_values,
+            **{_output_cache_field: output_cache(outputs)},
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             **extra_output_kwargs,

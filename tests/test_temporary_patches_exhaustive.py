@@ -1672,8 +1672,12 @@ def test_qwen3_vl_moe_causal_lm_output_with_past_kwargs():
         )
     sig = inspect.signature(cls)
     field_names = list(sig.parameters.keys())
+    # rope_deltas is passed only when the class declares it (transformers 5.24 dropped it).
+    optional = ("rope_deltas",)
     for req in ("loss", "logits", "past_key_values", "hidden_states",
                 "attentions", "rope_deltas"):
+        if req in optional and req not in field_names:
+            continue
         if not _constructible_with(cls, field_names, req):
             pytest.fail(
                 f"DRIFT DETECTED: zoo temporary_patches/qwen3_vl_moe.py:466 "
