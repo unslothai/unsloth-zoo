@@ -227,6 +227,40 @@ def test_fp16_trainer_gets_cpu_autocast_and_grad_scaler(monkeypatch, tmp_path, d
     assert seen == [torch.float16]
 
 
+@pytest.mark.parametrize("half", ["bf16", "fp16"])
+def test_cpu_autocast_does_not_hand_a_no_grad_cast_to_the_grad_pass(monkeypatch, tmp_path, dtype_policy, half):
+    """A no_grad forward before the grad forward in one loss (KTO's KL pass) must not leave the grad pass a detached
+    low-precision copy of a fp32 weight (a LoRA adapter): torch.autocast caches it for the whole region otherwise."""
+    from unsloth_zoo.cpu.trainer import _patch_cpu_autocast_cache, _patch_cpu_fp16_accelerator, _patch_post_init
+    from transformers import Trainer, TrainingArguments
+    dtype_policy(*(("1", "0") if half == "bf16" else ("0", "1")))
+    monkeypatch.setattr(Trainer, "create_accelerator_and_postprocess", Trainer.create_accelerator_and_postprocess)
+    monkeypatch.setattr(Trainer, "autocast_smart_context_manager", Trainer.autocast_smart_context_manager)
+    monkeypatch.setattr(TrainingArguments, "__post_init__", TrainingArguments.__post_init__)
+    _patch_cpu_fp16_accelerator(Trainer)
+    _patch_cpu_autocast_cache(Trainer)
+    _patch_post_init(TrainingArguments)
+    model = torch.nn.Sequential(torch.nn.Linear(8, 8))
+    seen = []
+    model[0].register_forward_hook(lambda m, i, o: seen.append(o.dtype))
+    args = TrainingArguments(output_dir = str(tmp_path), report_to = [], max_steps = 1, **{half: True})
+    trainer = Trainer(model = model, args = args)
+    assert trainer.accelerator.native_amp
+    prepared = trainer.accelerator.prepare(model)
+    x = torch.randn(2, 8)
+    # The trainer's loss context (transformers 4.x) and accelerate's own autocast (5.x, and every custom loop).
+    for context in (trainer.compute_loss_context_manager, trainer.accelerator.autocast):
+        model.zero_grad(set_to_none = True)
+        seen.clear()
+        with context():
+            with torch.no_grad():
+                prepared(x)
+            out = prepared(x)
+        assert seen == [{"bf16": torch.bfloat16, "fp16": torch.float16}[half]] * 2  # autocast really ran
+        out.float().sum().backward()
+        assert model[0].weight.grad is not None, context.__name__
+
+
 @pytest.mark.parametrize("packing_supported", [False, True])
 def test_cpu_training_arguments_turn_off_packing_and_gpu_optimizers(dtype_policy, monkeypatch, packing_supported):
     """Packing / padding_free stay on only where transformers keeps packed examples apart (masking_utils + torch 2.6);
