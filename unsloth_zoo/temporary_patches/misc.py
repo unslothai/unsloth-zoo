@@ -1663,8 +1663,7 @@ def patch_CsmForConditionalGeneration_merge():
                         start_idx = batch_input_values_cutoffs[i]
                         end_idx = batch_input_values_cutoffs[i + 1]
                         audio_batch = batch_input_values[..., start_idx:end_idx]
-                        # Zero-pad to whole frames like kyutai's reference encoder (CSM's training labels): HF Mimi
-                        # pads each conv instead, so the last frame's codes drift off-distribution. Frame count unchanged.
+                        # Whole frames like kyutai's encoder (CSM's labels); HF Mimi pads per conv and moves the last frame (#19438).
                         if frame_size:
                             audio_batch = torch.nn.functional.pad(audio_batch, (0, -audio_batch.shape[-1] % frame_size))
                         codec_outputs = self.codec_model.encode(audio_batch.unsqueeze(0))

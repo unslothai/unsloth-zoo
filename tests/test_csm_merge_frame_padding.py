@@ -49,8 +49,7 @@ def _tiny_csm():
 
 
 def test_merge_encodes_whole_frames():
-    # kyutai's encoder (CSM's training labels) zero-pads each clip to whole frames; HF Mimi pads per conv,
-    # which moves the last frame's codes (unsloth#19438).
+    # kyutai's encoder (CSM's labels) zero-pads clips to whole frames (unsloth#19438).
     from unsloth_zoo.temporary_patches.misc import patch_CsmForConditionalGeneration_merge
 
     patch_CsmForConditionalGeneration_merge()
