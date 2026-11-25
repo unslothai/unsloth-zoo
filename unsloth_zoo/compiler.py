@@ -3426,8 +3426,7 @@ def create_standalone_class(
     if cache_adapter is not None and patched_forward_info:
         cache_value = {cache_adapter[0]: cache_adapter[1]}
     if patched_forward_info:
-        # A replacement assigned onto the class without the adapter (Qwen4ExpTextPLELayer) still declares the old name,
-        # while the definition emitted below is the stock 5.24 one declaring `cache`: pass that under the old keyword.
+        # Direct-assigned replacement (Qwen4ExpTextPLELayer) keeps the old name; the emitted stock definition has `cache`.
         defined = _def_parameter_names(patched_forward_info[1])
         for old_name in ("past_key_values", "cache_params"):
             if old_name in parameters and old_name not in defined and "cache" in defined:
