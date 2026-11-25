@@ -74,7 +74,7 @@ def _chunked_ce_forward_impl(hidden: torch.Tensor, weight: torch.Tensor, labels:
 def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad,
                              need_weight_grad, exact, amp_dtype = None):
     rows = hidden.shape[0]
-    # A detached head misses autocast's weight-cast cache, so every chunk would recast all of it: cast it once.
+    # A detached head misses autocast's cast cache, so cast it once instead of per chunk.
     mm_weight = weight
     if amp_dtype is not None and weight.is_floating_point() and weight.dtype not in (amp_dtype, torch.float64):
         mm_weight = weight.to(amp_dtype)
@@ -104,7 +104,7 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
                     grad_hidden[start:end] = logits.to(h.dtype) @ mm_weight
             if need_weight_grad:
                 grad_weight.addmm_(logits.t(), h.float())
-        # Free this chunk's logits before the next projection: with the head copy held, both would be live at once.
+        # Free logits before the next projection, else two chunks' logits coexist beside the head copy.
         del logits
     return total, grad_hidden, grad_weight
 
