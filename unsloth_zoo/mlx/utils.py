@@ -15334,16 +15334,18 @@ def _fuse_scaled_quantized(linear, delta, dequantize):
     if dequantize:
         weight = (effective_weight + delta).astype(mx.bfloat16)
     else:
-        pre_delta = delta / pre if pre is not None else delta
-        weight = base_weight + (pre_delta * scale if scale_name == "weight_global_scale" else pre_delta / scale)
-        # NVFP4 saturates at 6 * 448: widen the global scale where the merged weight outgrows it, else keep it.
-        amax = mx.abs(weight).max(axis=-1, keepdims=True)
-        amax = amax.max() if scale.size == 1 else amax.max(axis=-2, keepdims=True) if scale.shape[-2] == 1 else amax
-        factor = mx.maximum(amax / _NVFP4_MAX, 1.0)
+        ws2 = scale_name == "weight_scale_2"
+        # Decoded weight before pre_quant_scale; the global scale only grows where it would pass NVFP4's 6 * 448
+        # (a zero scale of an all-zero expert included), so an in-range merge keeps the stored scale bit-exact.
+        target = base_weight * (scale if ws2 else 1 / scale) + (delta / pre if pre is not None else delta)
+        need = mx.abs(target).max(axis=-1, keepdims=True) / _NVFP4_MAX
+        need = need.max() if scale.size == 1 else need.max(axis=-2, keepdims=True) if scale.shape[-2] == 1 else need
         stored = getattr(linear, scale_name)
-        widened = (scale / factor if scale_name == "weight_global_scale" else scale * factor).astype(stored.dtype)
-        weight = weight * (widened.astype(mx.float32) / scale if scale_name == "weight_global_scale" else scale / widened.astype(mx.float32))
-        global_scale = widened.reshape(stored.shape)
+        grow = need > (scale if ws2 else 1 / scale)
+        new_scale = mx.where(grow, need if ws2 else 1 / mx.where(grow, need, 1), scale).astype(stored.dtype)
+        used = new_scale.astype(mx.float32)
+        weight = mx.where(used > 0, target / mx.where(used > 0, used, 1), 0) if ws2 else target * used
+        global_scale = new_scale.reshape(stored.shape)
     is_switch = weight.ndim == 3
     layer = (
         _scaled_switch_linear_class(linear)(weight.shape[2], weight.shape[1], weight.shape[0], bias=bias is not None)
