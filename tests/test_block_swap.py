@@ -1377,6 +1377,8 @@ def _land(layer):
 
 
 def test_host_load_refuses_before_moving_any_layer(monkeypatch):
+    # The refusal itself (the disk tier, on by default, would take the overflow instead).
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK", "0")
     import sys
     import pytest
     # Each 64x64 fp32 layer is 16 KiB and the CPU-built one counts as already on host: room for 2 of 3.
@@ -1403,6 +1405,8 @@ def test_host_load_moves_layers_that_fit(monkeypatch):
 
 
 def test_host_load_counts_layers_already_moved_as_used(monkeypatch):
+    # The refusal itself (the disk tier, on by default, would take the overflow instead).
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK", "0")
     import sys
     import pytest
     total = 64 * _GiB
@@ -1421,6 +1425,8 @@ def test_host_load_counts_layers_already_moved_as_used(monkeypatch):
 
 
 def test_host_load_counts_streamed_embeddings_still_to_come(monkeypatch):
+    # The refusal itself (the disk tier, on by default, would take the overflow instead).
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK", "0")
     import sys
     import pytest
     # Three 16 KiB layers fit, but a 64 MiB streamed table still on meta does not: refuse before any layer moves.
@@ -2349,6 +2355,8 @@ def test_an_in_flight_wait_only_sample_is_kept():
 
 
 def test_block_swap_gives_no_credit_for_a_storage_several_layers_view(monkeypatch):
+    # The refusal itself (the disk tier, on by default, would take the overflow instead).
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK", "0")
     import sys, os, pytest
     if not torch.cuda.is_available() or os.name == "nt" or not _mod._can_register():
         pytest.skip("needs CUDA")
@@ -2400,6 +2408,8 @@ def test_a_peer_still_loading_keeps_its_published_reservation(monkeypatch, tmp_p
 
 
 def test_block_swap_gives_no_credit_for_a_storage_a_buffer_still_views(monkeypatch):
+    # The refusal itself (the disk tier, on by default, would take the overflow instead).
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK", "0")
     import sys, os, pytest
     if not torch.cuda.is_available() or os.name == "nt" or not _mod._can_register():
         pytest.skip("needs CUDA")
@@ -2417,6 +2427,8 @@ def test_block_swap_gives_no_credit_for_a_storage_a_buffer_still_views(monkeypat
 
 
 def test_block_swap_gives_no_credit_for_a_storage_the_inferred_owner_still_views(monkeypatch):
+    # The refusal itself (the disk tier, on by default, would take the overflow instead).
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_DISK", "0")
     # The usual call, BlockSwap(find_decoder_layers(model), ...): an alias held by the model outside the decoder
     # list keeps the storage alive, so it must be found through the remembered owner, not only the layers.
     import sys, os, weakref, pytest
