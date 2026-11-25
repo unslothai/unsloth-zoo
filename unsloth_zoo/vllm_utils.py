@@ -1107,12 +1107,17 @@ def patch_vllm_enable_sleep_mode():
 pass
 
 
+# Shared by every wrapper patch_vllm_reset_caches_on_sleep installs (it runs on every load), so nesting is seen across them.
+_VLLM_SLEEP_DEPTH = __import__("threading").local()
+
+
 def patch_vllm_reset_caches_on_sleep():
     # Vision GRPO + standby crashes: multimodal (P0/P1) and encoder caches hold GPU tensors that sleep() unmaps; reset
     # them before each sleep, while still mapped, or the next access faults or caches desync; no-op for text; wrap every
     # engine class so use_async/use_engine can't bypass it.
     import functools
     _warned = set()
+    _sleep_depth = _VLLM_SLEEP_DEPTH
 
     def _reset_caches(obj):
         # reset_encoder_cache lives on llm_engine for LLM, on the engine itself otherwise.
@@ -1134,8 +1139,16 @@ def patch_vllm_reset_caches_on_sleep():
         @functools.wraps(_orig_sleep)
         def new_sleep(self, *args, **kwargs):
             _reset_caches(self)
+            # LLM.sleep calls llm_engine.sleep, which is wrapped too: one full collection per outermost sleep. A full
+            # gc costs ~0.1 s per pass on a GRPO process heap, and standby sleeps every step.
+            if getattr(_sleep_depth, "n", 0):
+                return _orig_sleep(self, *args, **kwargs)
             gc.collect()
-            return _orig_sleep(self, *args, **kwargs)
+            _sleep_depth.n = 1
+            try:
+                return _orig_sleep(self, *args, **kwargs)
+            finally:
+                _sleep_depth.n = 0
         cls.sleep = new_sleep
         cls._unsloth_reset_caches_on_sleep = True
 
