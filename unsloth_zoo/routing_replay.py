@@ -123,8 +123,7 @@ def routing_replay_engine_args(config):
         )
         return {}
     if _config_is_hybrid_attention(config) and not _vllm_at_least(0, 21):
-        # vLLM 0.14 to 0.20 size the capture buffer by KV cache tokens of one group but index by
-        # slot, so hybrid models' first generate dies with IndexError; 0.21 indexes by position.
+        # vLLM 0.14-0.20 IndexError on hybrid models' first generate; 0.21 indexes by position.
         warnings.warn(
             f"Unsloth: {ROUTING_REPLAY_ENV}=1 needs vLLM 0.21 or newer for hybrid attention MoE "
             "models. Routing replay is off.",
@@ -197,8 +196,7 @@ _DISPUTED = -2
 
 
 def _agreed(a, b):
-    """Rows of two captures of the same tokens: where their expert sets differ, natural; where both
-    were routed (or either was already disputed), _DISPUTED rather than -1 (unknown)."""
+    """Disagreeing rows: _DISPUTED (not -1) if both routed or either disputed, else natural."""
     if a.shape != b.shape:
         return a
     same = (a.sort(dim = -1).values == b.sort(dim = -1).values).all(dim = -1, keepdim = True)
@@ -246,8 +244,7 @@ def _fill_prefix(rows, full, start, store):
 
 
 def record_routed_experts(request_outputs, pad_token_id = None, prompt_starts = None):
-    """Store vLLM's per-token expert ids per finished completion. prompt_starts: per-request
-    `SamplingParams.routed_experts_prompt_start` (prompt position of the first returned row)."""
+    """Store per-token expert ids per completion; prompt_starts = routed_experts_prompt_start."""
     if pad_token_id is None:
         pad_token_id = _STATE.pad_token_id
     store = {}
@@ -532,8 +529,7 @@ def _signature_fake(x):
 
 
 def _input_signature(args, tokens):
-    # Per-token fp32 random projections of the router input, to tell apart forwards with equal
-    # natural routes; not a plain sum, as LayerNorm inputs sum to about zero.
+    # Per-token fp32 random projections, not a plain sum: LayerNorm inputs sum to ~0.
     x = args[0] if args and torch.is_tensor(args[0]) else None
     if x is None or not x.is_floating_point() or tokens == 0 or x.numel() % tokens != 0:
         return None
@@ -599,8 +595,7 @@ def _pick_recorded(layer_index, ids2, signature, layer_input):
     fp = _fingerprint(ids2)
     match = (torch.stack([c[0] for c in candidates]) == fp).flatten(1).all(-1)
     if torch.is_tensor(layer_input):
-        # Recompute reuses the forward's input tensors, so the forward sharing the most addresses
-        # is the one recomputed. A mask, not a narrowed list: in a compiled layer the addresses are only known at run time.
+        # Most-shared-address forward wins; mask, as compiled addresses are known at run time.
         recorded = [c[4] if len(c) > 4 and torch.is_tensor(c[4]) else layer_input[:0] for c in candidates]
         mask = _IDENTITY_MASK_OP(layer_input, recorded) if torch.compiler.is_compiling() \
             else _identity_mask(layer_input, recorded)
@@ -643,9 +638,8 @@ def _probs_gather(probs, ids, renorm):
     w = probs.float().gather(-1, ids)
     if not renorm:
         return w
-    # Forced experts (nearly) underflowed: w / total is 0 / 0 and a subnormal total overflows the
-    # backward (~1 / total), so zeros are returned (router keeps natural routing); dividing by 1
-    # keeps the masked branch's gradient finite.
+    # Forced experts (nearly) underflowed: 0/0 and subnormal totals overflow backward (~1/total), so
+    # return zeros (natural routing kept); divide by 1 keeps masked branch's gradient finite.
     total = w.sum(dim = -1, keepdim = True)
     ok = total > _MIN_RENORM_TOTAL
     out = w / torch.where(ok, total, torch.ones_like(total))
@@ -668,8 +662,7 @@ def _looks_like_probs(logits2):
 
 
 def _split_router_output(output):
-    """(logits position, weights position, ids position, dense) in a (logits, weights, ids) style
-    tuple. dense: the weights are [tokens, experts] scores, zero off the top-k (Unsloth's GPT-OSS)."""
+    """Positions of (logits, weights, ids); dense: weights [tokens, experts], zero off top-k."""
     if not isinstance(output, tuple) or len(output) != 3:
         return None
     ids_pos = [i for i, x in enumerate(output) if torch.is_tensor(x) and not x.is_floating_point()]
@@ -940,8 +933,7 @@ def _layer_pre_hook(layer_index):
 
 
 class _RecordingCall(functools.partial):
-    # transformers >= 5.23 checkpoints call forward, not __call__, so inputs are recorded here; a
-    # partial over the layer lets checkpoint unwrapping still find it.
+    # transformers>=5.23 calls forward, not __call__; the partial keeps checkpoint unwrapping.
     def __call__(self, *args, **kwargs):
         # Python may flatten a wrapped partial into this one: its bound keywords are ours then.
         inner = getattr(self.func, "keywords", None)

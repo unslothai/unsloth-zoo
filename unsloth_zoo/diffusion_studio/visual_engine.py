@@ -193,8 +193,7 @@ class VisualServer:
         self.server_bin = _resolve_bin(server_bin)
         self.maxtok_req = int(maxtok)
         req_dir = "/dev/shm" if os.path.isdir("/dev/shm") else tempfile.gettempdir()
-        # /dev/shm and /tmp are 1777 with enumerable PIDs, so a PID-derived name is world readable and can be
-        # pre-empted; each server gets its own 0700 dir with an unpredictable name.
+        # PID-derived names in /dev/shm or /tmp can be pre-empted; use a random 0700 dir.
         self._req_dir = None
         if req_path:
             self.req = req_path
@@ -246,9 +245,8 @@ class VisualServer:
         # Forward tools so the server renders them into the chat template (inputs.tools) for schema-correct <|tool_call> args.
         if tools:
             req["tools"] = tools
-        # The request body carries the whole conversation: no link, not world
-        # readable, and no FIFO. O_NONBLOCK refuses one with no reader; one whose read
-        # end is already held open opens fine, so the fstat is what refuses that.
+        # Request body holds the whole conversation: no symlink, not world readable, no FIFO;
+        # O_NONBLOCK misses a FIFO with an open reader, so fstat also checks.
         no_follow = getattr(os, "O_NOFOLLOW", 0)
         if not no_follow:
             # No atomic no-follow open here, and an lstat first is only a time of check.
@@ -305,8 +303,7 @@ def _parse_stats(line):
 
 
 def generate_visual(server, messages, seed=3407, max_blocks=8, on_frame=None, on_commit=None, on_stats=None, tools=None):
-    """Streams a turn via on_frame(block, step, total, text), on_commit(cumulative_text) and on_stats(dict), returns the
-    committed reply, raises ContextOverflow past the budget; a crash before any frame is retried once."""
+    """Returns the reply; crash before any frame is retried once; ContextOverflow past budget."""
     progressed = {"emitted": False}
 
     def _frame(b, s, t, x):
@@ -369,7 +366,6 @@ def _generate_visual_once(server, messages, seed, max_blocks, on_frame, on_commi
 
 
 if __name__ == "__main__":
-    # standalone smoke: one prompt end to end, printing a couple of frames per block
     import sys, time
     gguf = sys.argv[1] if len(sys.argv) > 1 else "diffusion-gemma-Q8_0.gguf"
     prompt = sys.argv[2] if len(sys.argv) > 2 else "In one sentence, what is a transformer in ML?"

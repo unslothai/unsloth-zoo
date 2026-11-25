@@ -29,7 +29,6 @@ __all__ = [
     "VLM_PLACEHOLDER_TOKENS",
 ]
 
-# Image / vision placeholder tokens, keyed by the models that use them.
 IMAGE_TOKENS = [
     "<|image|>",          # Llama 3.2 Vision, Phi 3.5, Gemma 4
     "<|vision_start|>",   # Qwen
@@ -66,7 +65,6 @@ IMAGE_TOKENS = [
     "<|media_end|>",      # Kimi K2.5 / K2.7 (end media)
 ]
 
-# Audio placeholder tokens.
 AUDIO_TOKENS = [
     "<|audio|>",          # Gemma 4
     "<|audio>",           # Gemma 4 (begin audio)

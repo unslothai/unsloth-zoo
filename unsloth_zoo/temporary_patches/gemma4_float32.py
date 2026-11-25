@@ -84,8 +84,7 @@ def _unsloth_gemma4_ple_cast_input(module, x):
     dtype = getattr(weight, "dtype", None)
     if dtype is None or not getattr(dtype, "is_floating_point", False):
         return x
-    # Skip sub-2-byte floats such as float8 (casting the fp32 carrier to fp8 destroys it; fp8 matmuls scale internally);
-    # getattr keeps older torch dtypes without itemsize a no-op.
+    # Skip sub-2-byte floats (fp8 casts destroy the fp32 carrier); missing itemsize is a no-op.
     if getattr(dtype, "itemsize", 2) < 2:
         return x
     return x if x.dtype == dtype else x.to(dtype)

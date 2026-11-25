@@ -172,7 +172,6 @@ def patch_torch_functions():
 pass
 
 
-# Patch TorchAO functions
 try:
     import torchao.quantization.qat.fake_quantizer
     if not hasattr(torchao.quantization.qat.fake_quantizer, "__UNSLOTH_PATCHED__"):

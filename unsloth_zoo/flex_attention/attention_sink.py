@@ -89,7 +89,6 @@ pass
 @functools.lru_cache
 def generate_sink_score_mod(sink_weights : torch.Tensor):
     def sink_score_mod(score, batch, head, q_idx, kv_idx):
-        # Sink token is at the first location
         return torch.where(
             kv_idx == 0,
             sink_weights[head].to(score.dtype) + 0.0, # Add +0 to allow gradients
@@ -216,7 +215,6 @@ def flex_attention_with_sink(
             block_mask = self_attn._flex_attention_cache(key)
         pass
     pass
-    # mask_mod for training and decoding steps
     if mask_mod is None:
         mask_mod = \
             generate_sliding_window_mask(sliding_window) \
@@ -246,7 +244,6 @@ def flex_attention_with_sink(
     
     # Version 2 (commented out) uses logaddexp, i.e. log(exp(x1) + exp(x2)), to add the sink to the logsumexp.
 
-    ### Version 3: Most simple uses sigmoid and scale
     sink_scale = torch.sigmoid(logsumexp - self_attn.sinks.unsqueeze(1))
 
     # All 3 versions scale the original attn_output!
@@ -382,7 +379,6 @@ def flash_attention_left_padded(
         scale = 1.0 / math.sqrt(head_dim)
 
     kwargs = dict( scale = scale,)
-    # Only pass window sizes if you actually want sliding window
     if window_size_left is not None:
         kwargs["window_size_left"] = int(window_size_left)
         kwargs["window_size_right"] = 0  # causal right window

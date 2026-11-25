@@ -57,15 +57,13 @@ __all__ = [
 # Escape hatch: a positive integer forces that count verbatim (no cap, no start-method veto); 0 or none forces in-process tokenization.
 NUM_PROC_ENV_VAR = "UNSLOTH_DATASET_NUM_PROC"
 
-# Upper bound for the auto count only, raised via NUM_PROC_ENV_VAR; the old heuristic forked up to 64 workers, each
-# handed a dill-pickled tokenizer closure and an Arrow shard, and more workers were slower than none at every size.
+# Auto count cap, raised via NUM_PROC_ENV_VAR; more workers were slower than none at any size.
 AUTO_NUM_PROC_CAP = 8
 
 # ~680 MB peak RSS per worker on that run, flat across counts; 1 GB for headroom.
 WORKER_MEMORY_BUDGET_GB = 1.0
 
-# Share of available RAM tokenization may spend, the rest left for the run; bounds issue 2693, where OOM-killed workers
-# surface only as 'One of the subprocesses has abruptly died during map operation', hiding the real cause.
+# Share of RAM tokenization may use; OOM-killed workers hide the real cause (issue 2693).
 MEMORY_BUDGET_FRACTION = 0.5
 
 # Mirrors _MIN_ROWS_FOR_MULTIPROC, a local inside
@@ -120,8 +118,7 @@ def _module_start_method(module_name: str) -> Optional[str]:
 
 
 def multiprocessing_start_method() -> Optional[str]:
-    """Start method datasets will use, or None: datasets imports Pool from multiprocess, not stdlib multiprocessing, so
-    multiprocess decides, falling back to stdlib; None means the caller treats forking as unavailable."""
+    """Start method datasets uses (multiprocess, else stdlib); None means forking unavailable."""
     for module_name in ("multiprocess", "multiprocessing"):
         try:
             return _module_start_method(module_name)
@@ -131,9 +128,8 @@ def multiprocessing_start_method() -> Optional[str]:
 
 
 def _workers_unusable_reason() -> Optional[str]:
-    """Non-fork workers cannot re-import the dynamically generated trainer module; macOS stays in-process by stated
-    policy, not as a probe side effect, since fork can crash there (CPython moved its default to spawn in 3.8,
-    bpo-33725; multiprocess never copied that)."""
+    """Non-fork workers can't re-import the generated trainer; macOS stays in-process by policy
+    (fork can crash; CPython defaults to spawn since 3.8, bpo-33725; multiprocess never did)."""
     start_method = multiprocessing_start_method()
     if start_method != "fork":
         return f"this process uses the {start_method!r} start method"
@@ -157,8 +153,7 @@ CGROUP_ROOT = "/sys/fs/cgroup"
 
 def _cgroup_first_line(path: str) -> Optional[str]:
     try:
-        # Encoding is explicit: these kernel files are ASCII, but a locale-dependent read crashes or produces mojibake
-        # on a Windows console codepage, and CI checks every read and write for it.
+        # Explicit utf-8: Windows locale reads crash or mojibake; CI checks every read/write.
         with open(path, "r", encoding = "utf-8") as f:
             return f.readline().strip()
     except OSError:
@@ -250,8 +245,7 @@ def _cgroup_free_bytes_unaided() -> Optional[int]:
 
 
 def _cgroup_free_bytes() -> Optional[int]:
-    """Bytes free under the binding cgroup memory limit, or None; each limit pairs with its setter's
-    usage, since ancestor usage counts unseen siblings; never subtract root memory.current."""
+    """Binding limit's free bytes or None; usage per limit, never root (counts siblings)."""
     try:
         from unsloth_zoo.hf_xet_tuning import (
             _cgroup_v1_dirs,
@@ -334,8 +328,7 @@ def _affordable_workers() -> Optional[int]:
 
 
 def _clamp_by_memory(num_proc: int) -> Optional[int]:
-    """Bound a worker count by RAM; None means do not use workers. Applies to explicit counts too, since a caller's
-    number (Studio passes max(1, cpu_count // 4)) could OOM a machine with no room."""
+    """Bound worker counts by RAM, explicit ones too (callers may OOM); None means no workers."""
     affordable = _affordable_workers()
     if affordable is None:
         # Without a memory reading, honour the requested count rather than serialise a machine that may be perfectly capable.
@@ -438,10 +431,9 @@ def environment_override() -> "tuple[bool, Optional[int]]":
 def get_dataset_num_proc(
     desired: Optional[int] = None, *, serial_as_none: bool = True
 ) -> Optional[int]:
-    """Safe num_proc for map/filter: None is in-process (only value with no pool on every supported
-    datasets release; 4.x pools for num_proc >= 1); counts memory-bounded except
-    NUM_PROC_ENV_VAR; returns >= 2 or sentinel; serial_as_none=False gives 1 for configs (None
-    means auto-size)."""
+    """None is in-process, the only no-pool value on all supported datasets (4.x pools for num_proc
+    >= 1); returns >= 2 or None; memory-bounded except NUM_PROC_ENV_VAR; serial_as_none=False
+    gives 1 for configs."""
     # 1. The environment override wins over everything, uncapped and unvetoed, so a user who knows their workload is fork-safe is never downgraded.
     env_set, env_value = _from_environment()
     if env_set:

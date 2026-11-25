@@ -130,8 +130,7 @@ def _bnb_version_in_window():
 
 
 def _default_stream_on(p):
-    # bitsandbytes launches optimizer kernels on the legacy default stream (raw handle 0); skipping the sync preserves
-    # order only if torch also runs on that stream for p's device.
+    # bnb launches on the legacy default stream (raw 0); skip sync only if torch uses it for p.
     return p.device.type == "cuda" and torch._C._cuda_getCurrentRawStream(p.device.index) == 0
 
 

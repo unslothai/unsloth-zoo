@@ -34,8 +34,7 @@ from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH, device_empty_cache
 from unsloth_zoo.temporary_patches.common import UNSLOTH_ENABLE_LOGGING, logger
 from collections import defaultdict
 
-# Import separately: convert_moe_packed_tensors_cpu is injected by Unsloth's mxfp4 patch, absent in
-# stock transformers; a combined import wrongly nulls convert_moe_packed_tensors too.
+# Import separately: convert_moe_packed_tensors_cpu is patch-only; combined import nulls both.
 try:
     from transformers.integrations.mxfp4 import convert_moe_packed_tensors
 except (ImportError, ModuleNotFoundError):
@@ -216,9 +215,8 @@ def drop_skip_module_aliases_that_widen(skipped_modules, aliased, module_names):
     added = [name for name in aliased if name not in set(skipped_modules)]
     if not added: return aliased
 
-    # Checked against matcher semantics, not the installed function, since the reloading transformers differs from the
-    # saver; matching is monotone, so an alias is safe if it hits no already-convertible module, tested per matcher
-    # since no matcher is a superset of the others.
+    # An alias is safe only if it hits no convertible module; check per matcher semantics, not the
+    # installed function, since the reloading transformers differs from the saver.
     safe = set(added)
     for build in _SKIP_MATCHERS:
         try:
@@ -431,9 +429,7 @@ def _active_merge_device():
     return "cpu"
 pass
 
-# Architectures whose bnb-4bit merged_16bit export folds the adapter onto dequant(W4), not W16 (see _merge_lora); kept
-# narrow since dequant noise regresses Qwen2.5 perplexity ~20%, so only models whose quant error swamps the fine-tune
-# delta (huge MuP base norms in a deep hybrid stack) belong.
+# Dequant base only where quant error swamps the delta; it regresses Qwen2.5 ~20%.
 _DEQUANT_MERGE_BASE_MODEL_TYPES = frozenset({"falcon_h1"})
 
 
@@ -1040,7 +1036,6 @@ import safetensors
 import json
 import mmap
 import ctypes
-# Mapping from BF16 to torch.blfloat16 etc
 try:
     SAFETENSORS_DTYPES = safetensors.torch._TYPES
 except:
@@ -1556,9 +1551,8 @@ def _merge_and_overwrite_lora(
     return count, safetensor_keys_seen
 pass
 
-# Per-expert MoE LoRA merge helpers (ref 5410): PEFT 0.18 is "swapped", 0.19+ is "standard" (huggingface/peft 3165);
-# layout is matched by shape vs the per-expert disk weight; unrecognised shapes count as fallback and the outer call
-# raises, so a partial merge cannot be saved.
+# PEFT 0.18 is swapped, 0.19+ standard (huggingface/peft 3165), per ref 5410; layout matched by
+# shape, and unknown shapes raise so a partial merge cannot be saved.
 
 _MOE_MERGE_STATE = {
     "attempted":   0,
@@ -1635,8 +1629,7 @@ def _resolve_num_experts_from_lora_stats(lora_stats, fallback):
     return fallback
 
 
-# MoE-quant save dispatch: each quant kind (FP8 now, bnb4bit later) registers a handler in
-# unsloth_zoo.temporary_patches.moe_utils_fp8._MOE_QUANT_HANDLERS, reached via apply_moe_quant_load.
+# Quant kinds register in unsloth_zoo.temporary_patches.moe_utils_fp8._MOE_QUANT_HANDLERS.
 try:
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
         apply_moe_quant_load as _apply_moe_quant_load,
@@ -3917,7 +3910,6 @@ def fix_tokenizer_config_json(tokenizer, saved_folder):
         except:
             pass
     pass
-    # Fix config.json using torch_dtype / dtype
     config_file_path = os.path.join(saved_folder, "config.json")
     if os.path.exists(config_file_path):
         try:
@@ -4163,8 +4155,7 @@ pass
 
 
 def _config_vocab_size(config):
-    # Nested first: a composite can carry both, and `resize_token_embeddings` updates only the
-    # nested one (PaliGemma leaves a stale top-level copy that would read as "no resize").
+    # Nested first: resize_token_embeddings updates only nested copies; top-level may be stale.
     for holder in _text_configs(config):
         if holder is config: continue
         vocab_size = getattr(holder, "vocab_size", None)
@@ -4246,7 +4237,6 @@ def _rotary_ignored_rope_scaling(model, rope):
         # YaRN can leave every frequency unchanged and scale only cos / sin, which the fallback never does.
         if getattr(module, "attention_scaling", 1.0) != 1.0: continue
         try:
-            # The exact expression of the unscaled fallback.
             unscaled = 1.0 / (base ** (torch.arange(0, dim, 2, dtype = torch.int64, device = "cpu").float() / dim))
             if inv_freq.shape == unscaled.shape and torch.equal(inv_freq.detach().float().cpu(), unscaled): return True
         except Exception:
@@ -4743,8 +4733,7 @@ def _export_index_atomically(source_path, destination, payload, mode_from = None
         if source_path is not None:
             shutil.copystat(source_path, _staging)
         else:
-            # mkstemp gives 0o600 but open("w") gives the umask, so copy the mode from a file the export just wrote,
-            # keeping the index as readable as the weights; os.umask has no getter, so reading it races other threads.
+            # mkstemp gives 0o600; copy a written file's mode (os.umask has no safe getter).
             _mode = 0o644
             if mode_from is not None:
                 try:
@@ -6511,8 +6500,7 @@ def merge_and_overwrite_lora(
 pass
 
 def _cached_file_matching_revision(repo_id, filename, hf_cache_dir, token, revision):
-    # Finds a cached blob of the file at revision whichever snapshot fetched it (refs/main may have moved); blobs are
-    # named by content hash (LFS sha256, xet hash or git blob id); unverifiable gives None.
+    # Cached blob at revision, matched by content hash (LFS sha256, xet or git); else None.
     from huggingface_hub import HfApi
     try:
         from huggingface_hub.constants import HF_HUB_CACHE
@@ -6658,8 +6646,7 @@ def _copy_file_from_source(src_path: Union[str, Path], target_dir_str: str, file
         raise FileNotFoundError(f"Source {src_path} is not a valid file.")
     if not os.access(src_path, os.R_OK):
          raise PermissionError(f"No read permission for source file: {src_path}")
-    # Target dir creation and permission checks are done by the caller (_try_copy_all_from_cache); copy2 onto an
-    # existing read-only dst fails, so stage then os.replace and add owner-write.
+    # copy2 onto a read-only dst fails, so stage, os.replace, and add owner-write.
     _staging = None
     try:
         _fd, _staging = tempfile.mkstemp(
@@ -6681,8 +6668,7 @@ pass
 
 def _get_hf_cache_dir() -> Optional[Path]:
     """Determines the Hugging Face Hub cache directory."""
-    # Resolve via hf_cache._active_caches so cache reuse sees the location Hub uses (XDG_CACHE_HOME, legacy
-    # HUGGINGFACE_HUB_CACHE, expanded env values, unresolvable home).
+    # Use hf_cache._active_caches: the Hub's cache dir (XDG_CACHE_HOME, HUGGINGFACE_HUB_CACHE).
     from .hf_cache import _active_caches
     _, cache_dir, _ = _active_caches()
 
@@ -7118,9 +7104,8 @@ def _registry_checkpoint_conversion_mapping(model_class_name):
 pass
 
 
-# Checkpoint layouts Unsloth's loader renames itself (a key_mapping Transformers does not register), so a
-# merge rereading the original checkpoint can place adapters. Must match unsloth's
-# _QWEN3_ASR_PACKAGE_KEY_MAPPING: Qwen/Qwen3-ASR-0.6B and -1.7B store weights under thinker.*.
+# Renames must match _QWEN3_ASR_PACKAGE_KEY_MAPPING (a key_mapping Transformers does not register);
+# Qwen/Qwen3-ASR-0.6B and -1.7B store weights under thinker.*.
 _LOADER_CHECKPOINT_CONVERSION_MAPPINGS = {
     "Qwen3ASRForConditionalGeneration": {
         r"^thinker\.audio_tower\.proj1\.": "model.multi_modal_projector.linear_1.",
@@ -7793,9 +7778,8 @@ def _disk_module_shapes(save_directory, safetensors_list, sources = None):
                     keys.add(key)
                     module_key = _safetensor_module_key(key)
                     if module_key is None:
-                        # An mxfp4 target has no .weight, so the disk_shape is None check skipped it (the 5290 shape
-                        # again); _blocks is (*out, G, B) with two 4-bit values per byte, so width is G * B * 2; only
-                        # rank 3 qualifies, since a 3D MoE stack could never equal (out_features, in_features).
+                        # Mxfp4 _blocks (5290 shape, rank 3 only): width is G * B * 2 (two 4-bit
+                        # values per byte).
                         if key.endswith("_blocks") and (key[: -len("_blocks")] + "_scales") in file_keys:
                             packed_key = key[: -len("_blocks")]
                             try:
@@ -7963,8 +7947,7 @@ def _check_lora_merge_is_complete(save_directory, safetensors_list, lora_weights
     ]
     total_lora_modules = len(lora_keys)
     if unresolved:
-        # Every report refuses regardless of size: a size threshold would downgrade a genuine 14-module under-merge on a
-        # text encoder to a notice; the env var is the escape hatch.
+        # Refuses at any size; a threshold would hide a 14-module under-merge; env var escapes.
         message = _format_partial_merge_error(unresolved, model_class_name, total_lora_modules)
     elif total_lora_modules and disk_keys and _renamed_lora_counterparts(
         lora_weights, disk_keys, disk_module_shapes, model_class_name,
@@ -8243,8 +8226,7 @@ def _hub_addresses_typed_model_uris():
             return True
     except Exception:
         pass
-    # The prefix counts only where resolve_path delegates to the URI parser, so check the code
-    # object, not source text (a comment can mention parse_hf_uri; getsource fails without source).
+    # Only where resolve_path delegates to the URI parser; check the code object, not source.
     try:
         code = HfFileSystem.resolve_path.__code__
         referenced = set(code.co_names)
@@ -8289,8 +8271,7 @@ def _as_hub_addressed(model_name):
     # probe another repo.
     if explicit_uri and name.startswith("models/") and _hub_addresses_typed_model_uris():
         name = name[len("models/"):]
-    # Split a revision only when what precedes it is addressable (zero or one slash), leaving an @ in ordinary paths
-    # alone; 0.36.2 answers repo_id gpt2 for gpt2@main.
+    # Split @ only if the part before has at most one slash; 0.36.2 answers gpt2 for gpt2@main.
     if "@" in name:
         repo_id = name.split("@", 1)[0]
         if repo_id.count("/") <= 1: name = repo_id
@@ -8330,16 +8311,14 @@ def _is_single_segment_id_rejection(model_name, e):
     return bool(_SINGLE_SEGMENT_REJECTION.search(str(e)))
 pass
 
-# HfFileSystem.ls raises FileNotFoundError for an absent repo, revision or path; 429, 5xx, DNS,
-# timeouts and OfflineModeIsEnabled propagate, so absent is told apart from unreachable.
+# HfFileSystem.ls raises FileNotFoundError when absent; 429, 5xx, DNS and timeouts propagate.
 _HUB_ABSENT_ERRORS = (
     FileNotFoundError,
     RepositoryNotFoundError,
     RevisionNotFoundError,
     EntryNotFoundError,
     GatedRepoError,
-# Invalid-repo-id errors (both ValueError subclasses) say the argument cannot name a repo, never a connectivity problem,
-# so they answer False; naming the types keeps plain ValueError transport failures from being swallowed.
+# Invalid repo ids (ValueError subclasses) answer False; other ValueErrors must still raise.
 ) + _HUB_INVALID_ID_ERRORS + _HUB_DISABLED_REPO_ERRORS
 
 def _is_hub_repo_id(model_name):
@@ -8359,8 +8338,7 @@ def _is_hub_repo_id(model_name):
     """
     # `hf://namespace/name` and `namespace/name@revision` are ls syntax, so neither may read as a filesystem path here; shared with `_as_hub_addressed`.
     name = _as_hub_addressed(model_name)
-    # ls addresses at most namespace/name, so a deeper path (/home/me/base) or one starting with . / or ~ (./base,
-    # ~/base) is a filesystem path and nothing else.
+    # ls addresses only namespace/name, so deeper paths or ./ ~/ prefixes are filesystem paths.
     if name.count("/") > 1: return False
     if name.startswith((".", "/", "~")): return False
     if "\\" in name: return False
@@ -8483,12 +8461,10 @@ def check_hf_model_exists(model_name, token=None):
         if gated is not None: _warn_gated_repo(model_name, gated)
         return False
     except NotImplementedError:
-        # A NotImplementedError ('I will not list that') is a namespace or bucket listing 0.x falls back to for a single
-        # segment name with no canonical repo; never a transport failure.
+        # NotImplementedError means a namespace or bucket listing, never a transport failure.
         return False
     except ValueError as e:
-        # The single segment rejection is a plain ValueError raised before any socket opens; any other ValueError, such
-        # as a JSONDecodeError from a proxy, is a connectivity failure.
+        # Only the single-segment ValueError means absent; other ValueErrors mean unreachable.
         if _is_single_segment_id_rejection(model_name, e): return False
         raise _hub_unreachable_error(model_name, e) from e
     except Exception as e:
@@ -8544,7 +8520,6 @@ def check_local_model_exists(model_path):
 
         for i, part in enumerate(parts):
             if i == 0:
-                # Handle first part (could be relative or absolute)
                 if part == "":  # absolute path starting with /
                     current_path = os.sep
                     continue
@@ -9119,8 +9094,7 @@ def determine_base_model_source(model_name, token=None, save_method=None):
     strictest behaviour, so callers that do not know it are unaffected.
     """
 
-    # Check disk first: it needs no network, and local priorities 1 and 2 outrank every Hub answer, so an unreachable
-    # Hub must not fail a request local weights could satisfy.
+    # Local is checked first and needs no network, so an unreachable Hub must not fail it.
     local_path = check_local_model_exists(model_name)
 
     local_is_quantized, local_quant_type = None, None
@@ -9134,11 +9108,9 @@ def determine_base_model_source(model_name, token=None, save_method=None):
             local_config_error = e
             local_path = None
 
-    # Priority 1: Local unquantized
     if local_path and not local_is_quantized:
         return (local_path, True, "local_unquantized", False, None)
 
-    # Priority 2: Local mxfp4
     if local_path and local_is_quantized and local_quant_type == "mxfp4":  # local_quant_type == "mxfp4"
         return (local_path, True, "local_mxfp4", True, "mxfp4")
 
@@ -9169,7 +9141,6 @@ def determine_base_model_source(model_name, token=None, save_method=None):
     if hf_exists and hf_is_quantized:
         return (model_name, False, f"HF_{hf_quant_type}", True, hf_quant_type)
 
-    # Priority 5: Local other quantization
     if local_path and local_is_quantized:
         return (local_path, True, f"local_{local_quant_type}", True, local_quant_type)
 

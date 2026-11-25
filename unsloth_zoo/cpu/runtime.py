@@ -245,8 +245,7 @@ def _cgroup_cpu_limit(proc_cgroup = "/proc/self/cgroup", root = "/sys/fs/cgroup"
 
 
 def cpu_compute_cores():
-    """Cores this process can really compute on: physical cores in its affinity mask (SMT siblings share one core's
-    vector / AMX units), capped by a cgroup CPU quota. Linux only; None elsewhere (keep torch's default)."""
+    """Physical cores (SMT siblings share units), affinity mask, quota-capped; None off Linux."""
     if not sys.platform.startswith("linux"):
         return None
     try:
@@ -264,8 +263,7 @@ def cpu_compute_cores():
 
 
 def _affinity_split_per_rank(ranks):
-    """True when a launcher (torchrun --numa-binding, mpirun --bind-to) gave this rank its own CPU
-    slice (the parent mask is wider); a taskset-pinned job still splits its shared mask."""
+    """True if torchrun --numa-binding or mpirun --bind-to gave the rank a slice; not taskset."""
     if ranks <= 1 or not sys.platform.startswith("linux"):
         return False
     try:
@@ -302,9 +300,8 @@ _THREADS_FITTED = None
 
 
 def fit_cpu_threads():
-    """Sizes torch's intra-op threads (idempotent). UNSLOTH_CPU_THREADS wins; user OMP_NUM_THREADS /
-    MKL_NUM_THREADS kept; else one thread per physical core (affinity/cgroup quota), split across
-    local ranks; never above torch's default unless undoing launcher's OMP_NUM_THREADS=1."""
+    """UNSLOTH_CPU_THREADS wins, user OMP_NUM_THREADS/MKL_NUM_THREADS kept, else physical cores
+    split over local ranks; capped at torch default unless undoing launcher OMP_NUM_THREADS=1."""
     global _THREADS_FITTED
     import torch
     if _THREADS_FITTED is not None:
@@ -374,8 +371,7 @@ _PROC_SELF_CGROUP = "/proc/self/cgroup"
 
 
 def _cgroup_memory_headroom():
-    """Smallest memory.max - memory.current over this process's cgroup v2 and every ancestor (a limit set on an
-    enclosing job / slice applies even when the leaf says max), or None when no finite limit is readable."""
+    """Min memory.max - memory.current over cgroup v2 and ancestors; None if no finite limit."""
     try:
         with open(_PROC_SELF_CGROUP) as f:
             path = next((line.split(":", 2)[2].strip() for line in f if line.startswith("0::")), None)
@@ -423,8 +419,7 @@ def available_ram():
         headroom = None
     if headroom is not None:
         available = min(available or 1 << 62, headroom)
-    # memory_budget also knows cgroup v1 (a v1 container sees the host's MemAvailable), memory.high and the ancestors
-    # it can read; the stricter of the two readings wins.
+    # memory_budget reads cgroup v1 and memory.high (v1 sees host MemAvailable); stricter wins.
     try:
         from unsloth_zoo.memory_budget import host_memory_bytes
         budget = host_memory_bytes()[1]

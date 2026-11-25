@@ -136,9 +136,8 @@ def health_state_path() -> Optional[Path]:
         from .hf_cache import _is_writable
 
         hf_home, hub_cache, _ = _active_caches()
-        # HF_HOME resolves to a default even when read-only, so preferring it unconditionally sent
-        # verdicts to an unwritable path when only HF_HUB_CACHE was relocated; writes failed
-        # silently and, the streak being rebuilt from this file, the machine could never be demoted.
+        # HF_HOME resolves even read-only, so preferring it unconditionally sent verdicts to an
+        # unwritable path when only HF_HUB_CACHE moved; the machine could never be demoted.
         candidates = [hf_home, hub_cache.parent if hub_cache is not None else None]
         for base in candidates:
             if base is not None and _is_writable(base):
@@ -289,8 +288,7 @@ def _probe_cas_reachable_inner() -> "tuple[Optional[bool], str]":
     except urllib.error.HTTPError as e:
         # The endpoint ANSWERED, which is all this probe measures.
         if e.code in (404, 401, 429):
-            # 404, 401 and 429 say nothing about Xet: one NAT exhausts the anonymous /api/ quota
-            # (500/5min/IP, 1,000/user); 403/407 still demote: a blocking proxy answers.
+            # 404/401/429 say nothing (NAT quota); 403/407 demote: a blocking proxy answers.
             return (None, "Xet probe inconclusive on this endpoint; assuming Xet")
         return (False, f"Xet token endpoint returned HTTP {e.code}")
     except Exception as e:

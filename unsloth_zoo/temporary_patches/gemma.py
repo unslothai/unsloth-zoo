@@ -52,9 +52,8 @@ _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION
 
 
 def _storage_only_float_dtypes():
-    """Float8 dtypes are storage formats, not compute dtypes: is_floating_point is True, but transformers' FP8Linear /
-    FbgemmFp8Linear take bfloat16 or float16 and do their own scaled quantization; looked up by name so a torch that
-    predates one (or adds one) neither raises nor stops excluding it."""
+    """Float8 dtypes are storage formats, not compute (is_floating_point is True); looked up by name
+    so a torch missing or adding one neither raises nor stops excluding it."""
     names = ("float8_e4m3fn", "float8_e4m3fnuz", "float8_e5m2", "float8_e5m2fnuz",
              "float8_e8m0fnu")
     return frozenset(
@@ -67,9 +66,8 @@ _STORAGE_ONLY_FLOAT_DTYPES = _storage_only_float_dtypes()
 
 
 def _linear_boundary_dtype(module, *attr_names):
-    """Dtype the projections expect, read from the first float weight that does the multiply (a hard-coded float16
-    breaks full-finetune fp32 weights); quant_state weights never answer, since their dtype is only the
-    bnb_4bit_quant_storage; None means leave the activation alone, not float16."""
+    """Projection dtype from the first float weight (hard-coded fp16 breaks fp32); quant_state
+    weights skipped (dtype is only bnb_4bit_quant_storage); None means no cast, not fp16."""
     for name in attr_names:
         module_or_param = getattr(module, name, None)
         if module_or_param is None: continue
@@ -93,8 +91,7 @@ pass
 
 
 def _to_forced_output_dtype(x, dtype):
-    """Downcasts a forced float32 reduction before its output projection; None means float16, not identity: on 4bit
-    QLoRA nothing answers and Linear4bit echoes the input dtype. Kept separate from _to_boundary_dtype."""
+    """Forced fp32 output downcast; None means float16 since 4bit QLoRA echoes the input dtype."""
     if dtype is None: dtype = torch.float16
     if x.dtype == dtype: return x
     return x.to(dtype)
@@ -220,9 +217,8 @@ def _fix_double_bos_and_pad(
     return_mm_token_type_ids, padding, padding_side, return_tensors,
     max_length = None, pad_to_multiple_of = None, model_max_length = None,
 ):
-    # Gemma3 doubles BOS (chat template plus tokenizer): strip the duplicate per row and in every per-token field, then
-    # re-pad so ragged rows stack; honours do_not_pad, max_length, model max, pad_to_multiple_of and return_tensors=None
-    # lists.
+    # Gemma3 doubles BOS (chat template + tokenizer): strip per row and per-token fields, re-pad;
+    # honours do_not_pad, max_length, model max, pad_to_multiple_of, return_tensors=None lists.
     n_rows = len(text_inputs["input_ids"])
     input_lens = [len(x) for x in text_inputs["input_ids"]]
     double_bos = [bos_token_id, bos_token_id]

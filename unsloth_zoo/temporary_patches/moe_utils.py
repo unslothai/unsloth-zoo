@@ -762,8 +762,7 @@ def _routing_signature(inputs, offsets):
     matvec runs in the input dtype with no FP32 copy."""
     inputs = inputs.detach()
     hidden = inputs.shape[-1]
-    # Autocast explicitly off: mv/mm are on autocast's lower-precision list and only one of forward/backward saw it, so
-    # fp32 inputs hashed differently and backward raised a spurious routing error.
+    # Autocast off: mv/mm cast in only one of forward/backward gave a spurious routing error.
     with torch.autocast(device_type = inputs.device.type, enabled = False):
         weights = torch.linspace(
             1.0, 2.0, hidden, device = inputs.device, dtype = torch.float32)
@@ -1144,8 +1143,7 @@ class _ExpertBiasGather(torch.autograd.Function):
         # The one-hot is at most _EXPERT_BIAS_ONE_HOT_ELEMENTS: long contexts go in row chunks, summed in fp32.
         chunk = max(1, _EXPERT_BIAS_ONE_HOT_ELEMENTS // ctx.num_experts)
         rows = grad.shape[0]
-        # Autocast off: under fp16 autocast, including compiled backward's same_as_forward, mm rounds the per-expert sum
-        # of fp32 grads to fp16 and overflows past 65504.
+        # Autocast off: fp16 mm rounds per-expert fp32 grad sums, overflowing past 65504.
         with torch.autocast(device_type = grad.device.type, enabled = False):
             if rows <= chunk:
                 return (expert_ids.unsqueeze(0) == experts).to(grad.dtype) @ grad, None
@@ -1306,8 +1304,7 @@ def _nf4_fused_base_mm(inputs, offsets, source, proj_type, hidden_dim, model_typ
         not torch.compiler.is_compiling() and nf4_fused_mode() == "auto"
         and not nf4_auto_fused(inputs.shape[0], offsets.shape[0], inputs.device)
     ):
-        # Eager has no recompile to avoid: above the cap take the regular dequant path, where the LoRA fold and the
-        # kept checkpoint base apply (the in-op dequant branch has neither).
+        # Above the cap, use the regular dequant path: it applies the LoRA fold and kept base.
         return None
     preprocess = lambda w: preprocess_weight(w, proj_type, hidden_dim, model_type, experts_module = experts_module)
     return maybe_nf4_grouped_mm(inputs, offsets, source, preprocess)
@@ -1495,8 +1492,7 @@ def _bnb4bit_expert_split(param):
     return E, tuple(int(x) for x in shape[1:])
 
 
-# Gathered ids decode in pieces of at least _SELECTIVE_GATHER_MIN experts and at most 1/8 of the request, keeping the
-# packed copy near 1/32 of the fp16 output without a launch per expert.
+# Pieces span _SELECTIVE_GATHER_MIN to 1/8 of the request; packed copy near 1/32 of fp16.
 _SELECTIVE_GATHER_PIECES = 8
 _SELECTIVE_GATHER_MIN = 32
 
@@ -2805,7 +2801,6 @@ def _fused_moe_activation(module, gate_up, interleaved, allow_gptoss = True):
     return _sw.moe_fused_swiglu(gate_up, act, interleaved, alpha, limit, eager_rounding)
 
 
-# Separated LoRA helpers.
 
 
 def _active_lora_adapter_names(wrapper) -> Optional[list]:
@@ -3035,8 +3030,7 @@ def _canonical_lora_weights_for_grouped_mm(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     first_weight = weight_A.view(num_experts, rank_per_expert, dim_A)
     first_weight = first_weight.permute(0, 2, 1).contiguous()
-    # Builds (num_experts, rank, out) in one copy; unflatten_moe_lora_b plus transpose copies twice,
-    # an extra saved tensor makes non-reentrant checkpoint recompute a different tensor count.
+    # One copy builds it: a second copy adds a saved tensor, changing non-reentrant recompute.
     second_weight = _ExpertMajorGroupedOperand.apply(
         weight_B, num_experts, rank_per_expert, _resolve_moe_lora_b_layout(None),
     )
@@ -3244,7 +3238,6 @@ def _extract_lora_from_wrapper(
         if experts_module is None:
             experts_module = wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
 
-        # Model-specific LoRA extractor attached to the experts module, if any.
         extractor_fn = getattr(experts_module, "_unsloth_lora_extractor_fn", None)
 
         if extractor_fn is not None:
@@ -3716,7 +3709,6 @@ def preprocess_weight(
     return weight.transpose(-2, -1)
 
 
-# Generic MoE detection and ParamWrapper patching.
 
 
 def _normalize_model_type(value) -> str:
@@ -3888,30 +3880,9 @@ _get_moe_lora_weights = _extract_lora_from_wrapper
 
 
 # ---------------------------------------------------------------------------------------
-# Which convention packs lora_B's (num_experts * rank) axis.
-#
-# PEFT's ParamWrapper builds lora_A as (E*R, in) and lora_B as (out, E*R) and pairs them
-# in get_delta_weight by reading A as (E, R, in) and B as (out, R, E): lora_A is grouped
-# by expert, lora_B is NOT, its expert index is the fastest axis. That reading is
-# unchanged in PEFT 0.18.0, 0.19.0, 0.19.1, 0.20.0 and 0.21.0, and it is what vLLM's
-# `_stack_moe_lora_weights` and every other consumer of a saved adapter implements, so it
-# is the only reading a stored fused expert lora_B can be expected to have.
-#
-# Unsloth's separated forward read the same lora_B as (out, E, R) instead
-# (`_canonical_lora_weights_for_grouped_mm`), so a rank-contiguous block of columns
-# belonged to one expert. Both reshapes always fit, since E*R == R*E, so nothing ever
-# raises and the disagreement is always silent. They disagree whenever num_experts > 1
-# and rank > 1, which is every real MoE checkpoint: equal num_experts and rank does not
-# make them agree, because the two readings send flat column r*E + e and flat column
-# e*R + r to the same place and those coincide for all (e, r) only when E == 1 or R == 1.
-#
-# The separated forward is being moved onto PEFT's packing (the `lora_B` packing fix,
-# unsloth_zoo#1269), with `UNSLOTH_MOE_LORA_B_LAYOUT=grouped_by_expert` left as the
-# opt-in for reading an adapter an older Unsloth trained. What stays here is the
-# *recording* side: which packing the adapter on this model was trained with, written
-# into adapter_config.json on save (unsloth#6930), because a downstream converter has no
-# wrapper to ask and Unsloth stamps no version into the file either, so a marker-less
-# adapter cannot be dated from its bytes.
+# PEFT 0.18-0.21 and vLLM pack lora_B expert-fastest; the separated forward read (out, E, R), a
+# silent mismatch whenever E>1 and R>1 (reshape never raises); adapter_config.json stamps it
+# (unsloth issue 6930).
 # ---------------------------------------------------------------------------------------
 
 # Also defined by unsloth_zoo 1269 with the same strings, so the two definitions are interchangeable and either branch can land first.
@@ -4007,8 +3978,7 @@ def moe_lora_b_layout_for_wrapper(wrapper, adapter_name = None) -> str:
             # A compiled-only run never reaches the eager probe.
             verdict = _wrapper_forward_applies_stash(wrapper, _MOE_LORA_COMPILED_VERDICT_ATTR)
         if verdict is False:
-            # Only a measured False overrides the structural test: unpatched stacked-expert families
-            # (Olmoe) are rank-major and would be mislabeled; None means unmeasured.
+            # Only a measured False overrides the structural test; None means unmeasured.
             return LORA_B_LAYOUT_RANK_MAJOR
         return _process_lora_b_layout()
     return LORA_B_LAYOUT_RANK_MAJOR
@@ -4225,9 +4195,8 @@ def _forward_statically_reads_stash(experts_module):
 def _code_reaches_stash(forward):
     # This Unsloth Zoo code section is licensed under AGPL3
     code = forward.__code__
-    # Visited (code, shallowest depth) pairs matched by is: id() is untraceable on some torch versions, equality merges
-    # same-source functions with other __globals__, and a plain visited set hides deeper callees of a helper first
-    # reached at the depth limit (hash-seed dependent).
+    # Visited (code, shallowest depth) pairs matched by is: id() untraceable on some torch, equality
+    # merges same-source functions with other globals; a plain visited set hides deeper callees.
     seen_code = []
     pending = [(code, getattr(forward, "__globals__", {}), 0)]
 
@@ -5463,8 +5432,7 @@ def patch_param_wrapper_for_moe():
         from peft.tuners.lora.layer import ParamWrapper
 
         if _original_param_wrapper_forward is None:
-            # Another moe_utils copy (the package, or a cache copy from an earlier UNSLOTH_COMPILE_LOCATION) may have
-            # patched it already: keep PEFT's own forward, or the separated-LoRA forward runs once per copy.
+            # Another copy may be patched: keep PEFT's forward, else LoRA runs once per copy.
             current = ParamWrapper.forward
             _original_param_wrapper_forward = getattr(current, "_unsloth_moe_peft_forward", current)
         _patched_param_wrapper_forward._unsloth_moe_peft_forward = _original_param_wrapper_forward
@@ -5491,9 +5459,8 @@ def patch_param_wrapper_for_moe():
         return False
 
 
-# Gate grad via identity dGate = <A, dA> / gate instead of <dOut, Y>, which pins the down output Y on the tape; output
-# unchanged, on by default to save memory, auto-disabled for fp16, down-bias and frozen routers; UNSLOTH_MOE_GATEGRAD=0
-# reverts to the standard <dOut, Y> path.
+# Gate grad via identity dGate = <A, dA>/gate avoids pinning Y; output unchanged; auto-disabled for
+# fp16, down-bias and frozen routers; UNSLOTH_MOE_GATEGRAD=0 reverts to <dOut, Y>.
 
 
 _WEIGHTED_UNPERMUTE = None
@@ -5661,7 +5628,6 @@ def forward_native_grouped_mm(
         elif _stack is not None and _stack.dtype != torch.float32:
             hidden_states = hidden_states.to(moe_compute_dtype(hidden_states))
 
-    # Routing: count tokens per expert, sort to group by expert, gather inputs.
     flat_top_k = top_k_index.view(-1)
     num_tokens_per_expert, sorted_indices, offsets = moe_routing_sort(top_k_index, self.num_experts)
     permuted_input = gather_routed_rows(hidden_states, sorted_indices, top_k_index.shape[-1])
@@ -5799,7 +5765,6 @@ def forward_native_grouped_mm(
         gate = _grouped_mm_with_backward_fix(permuted_input, w1, offsets)
         up = _grouped_mm_with_backward_fix(permuted_input, w3, offsets)
 
-        # Add LoRA for w1 and w3 separately if present.
         if use_separated_lora:
             if _has_lora_adapters(self.w1):
                 w1_lora = _extract_lora_weights(self.w1, experts_module=self)
@@ -5829,13 +5794,11 @@ def forward_native_grouped_mm(
     else:
         raise AttributeError("MoE layer must have 'gate_up_proj' or 'w1'/'w3'.")
 
-    # Activation
     if own_gate_up is not None:
         inter = _apply_own_gate(self, own_gate_up)
     elif fused_inter is not None:
         inter = fused_inter
     elif "GptOssExperts" in self.__class__.__name__:
-        # Custom GptOss activation.
         limit = getattr(self, "limit", 7.0)
         alpha = getattr(self, "alpha", 1.702)
 
@@ -5848,9 +5811,8 @@ def forward_native_grouped_mm(
     else:
         inter = F.silu(gate) * up
 
-    # Env-gated gate-grad identity; off with a down bias (identity assumes linear down), a frozen router, or fp16 (kept
-    # on the standard multiply, since grad_inter = gate * (W2 @ dOut) underflows to 0 for near-zero gates); bf16/fp32
-    # unaffected.
+    # Gate-grad identity is off with a down bias, a frozen router, or fp16 (underflows near zero
+    # gates).
     _gategrad = (
         _moe_gategrad_enabled()
         and getattr(self, "down_proj_bias", None) is None
@@ -5860,9 +5822,8 @@ def forward_native_grouped_mm(
     permuted_weights = None
     if _gategrad:
         raw_weights = top_k_weights.reshape(-1)[sorted_indices]
-        # Sign-floor the gate away from zero (straight-through to top_k_weights), with the same value in multiply and
-        # identity divide so <Y, dOut> survives a zero weight; fp16 cannot represent eps=1e-12, so upcast to float32;
-        # forward changes by at most 1e-12 * |Y| when |gate| < 1e-12.
+        # Sign-floor gate away from zero (straight-through to top_k_weights, eps=1e-12) so identity
+        # divide survives zero weights; fp16 cannot hold eps, so upcast to float32.
         if raw_weights.dtype == torch.float16:
             raw_weights = raw_weights.to(torch.float32)
         eps = 1e-12
@@ -5968,7 +5929,6 @@ def forward_native_grouped_mm(
     else:
         raise AttributeError("MoE layer must have 'down_proj' or 'w2'.")
 
-    # Apply routing weights and scatter-add (reduce).
     if _gategrad:
         # Gate grad comes from the identity; detach so the multiply does not pin Y.
         permuted_weights = permuted_weights.detach()
@@ -6108,7 +6068,6 @@ def forward_triton_grouped_gemm(
             self.gate_up_proj, num_experts=self.num_experts
         )
 
-    # Flatten 3D inputs (batch_size, seq_len, hidden_dim).
     is_3d = hidden_states.dim() == 3
     if is_3d:
         batch_size, seq_len, hidden_dim = hidden_states.shape
@@ -6185,7 +6144,6 @@ def forward_triton_grouped_gemm(
     else:
         w1 = self.gate_up_proj
 
-    # First grouped GEMM: gate_up projection.
     first_gemm_output = grouped_gemm(
         X=gemm_hidden_states,
         W=w1,
@@ -6221,7 +6179,6 @@ def forward_triton_grouped_gemm(
     if first_gemm_output.dtype != compute_dtype:
         first_gemm_output = first_gemm_output.to(compute_dtype)
 
-    # Activation + gate*up.
     fused_intermediate = None
     if not _uses_own_apply_gate(self):
         fused_intermediate = _fused_moe_activation(self, first_gemm_output, False, allow_gptoss = False)
@@ -6235,7 +6192,6 @@ def forward_triton_grouped_gemm(
     else:
         intermediate = _silu_and_mul(first_gemm_output)
 
-    # Grouped GEMM 2: down projection.
     down_lora = None
     _stashed_down_lora = take_moe_lora_stash(self, "down_proj")
     if _stashed_down_lora is not None:
@@ -6283,8 +6239,7 @@ def forward_triton_grouped_gemm(
             grouped_mm_func=native_moe_grouped_mm
         )
 
-        # permute_y=True puts second_gemm_output in token order while lora_delta is still expert-sorted, so it is
-        # scattered with index_add_ rather than added row-for-row.
+        # permute_y=True gives token order, but lora_delta is expert-sorted; use index_add_.
         if lora_delta.dtype == second_gemm_output.dtype:
             second_gemm_output.index_add_(0, gather_indices, lora_delta)
         else:

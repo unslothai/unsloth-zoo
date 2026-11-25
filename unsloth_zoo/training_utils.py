@@ -370,8 +370,7 @@ def _wrap_forward_in_bf16_autocast(model, compute_dtype):
 
     instance_forward = model.__dict__.get("forward")
     if instance_forward is not None:
-        # An instance-level forward shadows the class override, so swapping __class__ alone won't intercept it; move it
-        # off the instance and route via instance_mode so forward stays a class attribute (picklable/deepcopy-safe)
+        # Instance forward shadows class override; keep it a class attr (picklable/deepcopy).
         model._unsloth_autocast_orig_forward = instance_forward
         del model.__dict__["forward"]
         model.__class__ = _make_bf16_autocast_subclass(
@@ -417,8 +416,7 @@ def _iter_configs(config):
                 stack.append(sub)
 
 
-# Marks a config with no use_cache, distinct from None; a class, not object(), because
-# deepcopy/pickle keep a class's identity but not an instance's.
+# Marks a config with no use_cache (not None); a class so deepcopy/pickle keep its identity.
 class _ABSENT:
     """Marker type; never instantiated."""
 
@@ -725,7 +723,6 @@ def prepare_model_for_training(
         if use_gradient_checkpointing in (True, "unsloth"):
             model._set_gradient_checkpointing()
         else:
-            # Ensure checkpointing stays disabled if explicitly requested.
             for module in model.modules():
                 if hasattr(module, "gradient_checkpointing"):
                     module.gradient_checkpointing = False
@@ -746,7 +743,6 @@ def prepare_model_for_training(
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
     pass
 
-    # Upcast modules_to_save
     if patch_modules_to_save:
         try:
             from peft.utils import ModulesToSaveWrapper
@@ -858,7 +854,6 @@ def unsloth_train(trainer):
         )
     pass
 
-    # Separate weight decay for parameters
     optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(training_args)
     decay_parameters = frozenset(Trainer.get_decay_parameter_names(None, model))
     yes_decay, no_decay = [], []
@@ -985,7 +980,6 @@ def unsloth_train(trainer):
                     torch.count_nonzero(x["labels"][..., 1:] != -100) for x in batches
                 ]).sum()
 
-                # Gradient accumulation
                 for batch in batches:
                     input_ids = batch["input_ids"]
                     labels    = batch["labels"]

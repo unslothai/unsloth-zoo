@@ -72,8 +72,7 @@ class TiledMLP(torch.autograd.Function):
     @staticmethod
     @torch_amp_custom_fwd
     def forward(ctx, mlp_forward, mlp_module, x, preserve_rng_state, num_shards, max_flat_qlen):
-        # num_shards is probably the wrong name (should be n_splits); the shard count may be
-        # num_shards + 1, and the last shard takes any remainder.
+        # Misnamed: should be n_splits; shard count may be num_shards + 1; last takes rest.
         ctx.shard_dim = -2
         B, S, H = x.shape
         ctx.num_shards = num_shards
@@ -134,8 +133,7 @@ class TiledMLP(torch.autograd.Function):
     @torch_amp_custom_bwd
     def backward(ctx, grad_output, *args):
         rng_devices = []
-        # x_split is a no_grad view and the fused LoRA MLP writes dX into it in place; if x requires grad
-        # (a compiled block's output), AccumulateGrad raises "A view was created in no_grad mode".
+        # No_grad view, written in place by fused LoRA; grad-requiring x breaks AccumulateGrad.
         x = ctx.saved_tensors[0].detach()
         B, S, H = x.shape
         if ctx.preserve_rng_state and ctx.had_device_in_fwd:

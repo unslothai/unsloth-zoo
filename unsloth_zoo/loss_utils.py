@@ -93,8 +93,7 @@ if DEVICE_TYPE == "cuda" and not torch.cuda.is_available():
     HAS_CUT_CROSS_ENTROPY = False
 elif DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
-    # Checks every visible device, not just the current one: device_map can put lm_head on an sm_75 GPU while device 0
-    # is sm_80; the failure aborts rather than raises.
+    # All visible devices: device_map may put lm_head on sm_75 while device 0 is sm_80; aborts.
     _miscompiling_devices = _triton_miscompiles_cce_on_any_visible_device()
     if (Version(torch.__version__) >= Version("2.4.0")) and \
         (not ((major <= 7) and (minor < 5))) and \
@@ -315,8 +314,7 @@ pass
 global ALLOWED_NUM_ITEMS_IN_BATCH
 ALLOWED_NUM_ITEMS_IN_BATCH = dict()
 
-# Heads whose labels are not shifted next-token targets, so the counter cannot describe them; matched on the top-level
-# class name, since the walk descends into the backbone.
+# Non-next-token heads, not counted; matched on top-level class name since the walk descends.
 NON_CAUSAL_HEADS = (
     "ForSequenceClassification",
     "ForTokenClassification",

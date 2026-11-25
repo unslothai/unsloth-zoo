@@ -197,8 +197,7 @@ def _config_declared_pad(inner, cfg, eos_token, eos_token_ids, vocab_size):
         return None
     try:
         candidate = convert_ids_to_tokens(pad_token_id)
-        # Require a clean id/token round-trip so unknown or unstable ids are never promoted; reject the eos token by
-        # name too, since a tokenizer without eos_token_id would let a config-declared pad == eos slip through.
+        # Round-trip check: unstable ids out; eos rejected by name (eos_token_id may be unset).
         if candidate is None or candidate == eos_token:
             return None
         if convert_tokens_to_ids(candidate) != pad_token_id:
@@ -273,8 +272,7 @@ def _find_reserved_pad(inner, eos_token, vocab_size, eos_token_ids=frozenset()):
             if _single_token_id(inner, candidate, vocab_size, eos_token_ids) is not None:
                 return candidate
 
-    # Last resort: any bracketed *pad* sentinel (e.g. <|fim_pad|>) outside the curated families; the bracket form in
-    # _is_pad_named excludes words like keypad or padding, which would be masked out of attention and loss.
+    # Last resort: bracketed pad sentinels (<|fim_pad|>); bare keypad/padding would be masked.
     for candidate in added:
         if candidate == eos_token or not _is_pad_named(candidate):
             continue

@@ -67,7 +67,6 @@ def _is_gemma4_config(config):
 pass
 
 def is_comparable(val):
-    # Only basic types, not tensors
     from enum import Enum
     return isinstance(val, (int, float, bool, str, list, tuple, type(None), torch.dtype, Enum))
 
@@ -109,19 +108,16 @@ def compare_attributes(original_model, new_model):
         buffer_names = {name for name,_ in original_module.named_buffers(recurse=False)}
 
 
-        # Missing: in original but not in new
         missing_in_new = orig_attrs - new_attrs
         missing_in_new = missing_in_new - {'hf_device_map', 'source_cls'}
         if missing_in_new:
             for attr in sorted(missing_in_new):
                 missing_attrs.append(f"{name}.{attr}")
 
-        # Extra: in new but not in original
         extra_in_new = new_attrs - orig_attrs
         if extra_in_new:
             print(f'Found some extra attributes like: {list(extra_in_new)[:5]}...')
 
-        # Compare common attributes and buffer names
         common_attrs = orig_attrs & new_attrs
         common_buffers = orig_attrs | buffer_names
         for attr in sorted(common_attrs):
@@ -1609,7 +1605,6 @@ def get_model_layer_counts(config):
             "vision_layers": getattr(vision_config, "num_hidden_layers", 12),
         }
     else:
-        # Standard causal LM
         return getattr(config, "num_hidden_layers", 32)
 
 

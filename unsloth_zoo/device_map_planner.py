@@ -319,7 +319,6 @@ def detect_logit_transforms(model_or_config) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# headroom formula
 # --------------------------------------------------------------------------- #
 def logit_headroom_bytes(
     vocab_size: int,
@@ -376,7 +375,6 @@ def logit_headroom_bytes(
 
 
 # --------------------------------------------------------------------------- #
-# plan object
 # --------------------------------------------------------------------------- #
 # Plan notes warning that the load may still fail; DeviceMapPlan.summary keeps them visible.
 _PLAN_RISK_NOTES = ("run out of memory", "device mismatch")
@@ -1198,16 +1196,14 @@ def _split_units(
             sizes.get(f"{prefix}.{child_name}" if prefix else child_name, 0)
             for child_name, _ in children
         )
-        # Emit the unit even at zero bytes: a tensor tied to one counted elsewhere weighs nothing
-        # here, and dropping it would leave the parameter uncovered and fail plan_device_map's
-        # coverage check.
+        # Emit even at zero bytes: a tensor tied elsewhere weighs nothing, and dropping it fails
+        # coverage.
         own = max(0, size - child_bytes) if own_tensors else 0
         if own_tensors and prefix:
             units.append((prefix, own))
         elif own_tensors:
-            # Root-level state has an empty prefix, which accelerate reads as a catch-all default
-            # that would fight explicit entries, so each tensor is named; its lookup tries the full
-            # name first, and without this plan_device_map's coverage check raises on a root-level
+            # Root tensors are named: empty prefix is the accelerate catch-all that would fight
+            # explicit entries; lookup tries the full name first; unnamed, coverage raises on root
             # scale or bias.
             for tensor_name, tensor in own_tensors:
                 units.append((tensor_name, sizes.get(
@@ -1375,7 +1371,6 @@ def _usable_devices(max_memory: Mapping[Any, Any] | None) -> list[int]:
 
 
 # --------------------------------------------------------------------------- #
-# the planner
 # --------------------------------------------------------------------------- #
 def plan_device_map(
     model: nn.Module,
@@ -1576,8 +1571,7 @@ def plan_device_map(
             )
 
     unit_size = dict(units)
-    # Pin units above and below each pinned module by prefix: a head split into lm_head.proj or
-    # inside an atomic ancestor never shows by name; exact matching misplaces its headroom.
+    # Pin by prefix: exact names miss split heads or atomic ancestors, misplacing headroom.
     pinned = list(dict.fromkeys(
         u for p in pinned for u, _ in units
         if u == p or u.startswith(p + ".") or p.startswith(u + ".")
@@ -1668,14 +1662,12 @@ def plan_device_map(
         value = requested_reserve
         if value is None:
             if free_space_policy == "balanced":
-                # An equal activation split plus logit headroom on the head's device is a heuristic
-                # for symmetric demand; a vision-LM whose GPU 0 also holds the vision tower,
-                # embedding and KV cache can OOM there; pass a per-device mapping when measured.
+                # An equal split plus head headroom assumes symmetric demand; a vision-LM with its
+                # tower, embedding and KV cache on GPU 0 can OOM, so pass a per-device mapping.
                 slack = sum(raw_budgets.values()) - total
                 value = max(0, (slack - headroom) // len(devices))
-                # Cap each device at its own budget less the weight it holds, the head card also paying headroom,
-                # clamped at 0 so attempt never gets a negative head budget; the smaller of flat and prorated share
-                # keeps each card reserve at least the flat planner; shared pinned floor zeroes small cards
+                # Card cap = budget less weight (head also pays headroom), floored at 0; smaller of
+                # flat/prorated share keeps reserve >= flat; pinned floor zeroes small cards.
                 capacity = sum(raw_budgets.values()) or 1
                 flat = -(-total // len(devices))
                 share = {
@@ -1749,8 +1741,7 @@ def plan_device_map(
                 out.append(dict.fromkeys(devices, floor * (20 - step) // 20))
             return out
 
-        # Both ladders are tried, because a rung is 5% of the mapping it scales from: prorating raises non-head asks on
-        # unequal cards, and the coarser ladder can step straight past a flat-average rung that fits
+        # Both ladders: rungs step 5% of base; coarser can skip a fitting flat-average rung.
         candidates = ladder(reserve)
         flat = flat_reserve.get(head_device)
         legacy = ladder(flat) if flat is not None and flat != reserve else []
@@ -1813,12 +1804,10 @@ def plan_device_map(
             return None
         used, assign = _walk_in_order(free_groups, budget, head_device)
         if used is None:
-            # The in-order walk cannot backtrack, so a largest-first best-fit repack runs only after it fails; in-order
-            # keeps consecutive layers together for fewer cross-device hops.
+            # No backtracking: best-fit runs after it fails. In-order keeps layers together.
             used, assign = _best_fit(free_groups, budget, head_device)
         if used is None:
-            # Best-fit is not exact either: capacities 10 and 10 with units 6,5,3,2,2,2 reject a fitting packing, so
-            # exact fit is the last resort before refusing.
+            # Best-fit can miss packings (caps 10,10; units 6,5,3,2,2,2); exact fit runs last.
             used, assign = _exact_fit(free_groups, budget, head_device)
         if used is None:
             return None
@@ -2139,7 +2128,6 @@ def plan_device_map(
 
 
 # --------------------------------------------------------------------------- #
-# pre-load convenience
 # --------------------------------------------------------------------------- #
 def _runtime_quantization_config(kwargs: dict[str, Any]) -> Any:
     """The quantisation the CALLER asked for, popped out of the loader kwargs.

@@ -81,7 +81,6 @@ _TORCH_SCALED_GROUPED_MM_SUPPORTED_BY_DEVICE = {}
 
 
 def _check_torch_scaled_grouped_mm_supported(device=None):
-    # Non-None module value = forced answer.
     if _TORCH_SCALED_GROUPED_MM_SUPPORTED is not None:
         return _TORCH_SCALED_GROUPED_MM_SUPPORTED
 
@@ -198,7 +197,6 @@ def _dequantize_expert_slice(
     # FP16 flushes small scales: multiply in FP32, mul_ rounds once into w.
     scale_dtype = torch.float32 if target_dtype == torch.float16 else target_dtype
 
-    # Per-tensor scale
     if s.numel() == 1:
         return w.mul_(s.view(1, 1).to(scale_dtype))
 
@@ -237,7 +235,6 @@ def _dequantize_expert_slice(
                 else:
                     return expert_weight.to(target_dtype)
         else:
-            # Infer block size from scale grid
             bm = _ceil_div(M, p)
             bn = _ceil_div(N, q)
 
@@ -263,7 +260,6 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
     # FP16 flushes small scales: multiply in FP32 and round once into the target dtype.
     scale_dtype = torch.float32 if target_dtype == torch.float16 else target_dtype
 
-    # Per-tensor scalar
     if s.numel() == 1:
         return weight.to(target_dtype).mul_(s.to(scale_dtype).view(1, 1, 1))
 
@@ -1344,8 +1340,7 @@ def _fp8_save_handler(file, header_metadata, weight_key, block_size = None):
         return _MOE_QUANT_UNSAFE, None
     rows, cols = W.shape
     srows, scols = scale_inv.shape
-    # Prefer the configured block size when its grid tiles the weight (handles partial final blocks, e.g. 130x256 with
-    # 128x128); else infer by exact division, covering per-channel (rows, 1) scales.
+    # Configured block size if its grid tiles the weight (partial blocks ok); else infer.
     block_shape = None
     if block_size is not None and len(block_size) == 2:
         cand_bm, cand_bn = block_size
@@ -1384,7 +1379,6 @@ def apply_moe_quant_load(file, header_metadata, key, block_size = None):
 
 
 # ============================================================================
-# Hook FP8 experts dispatch + relax HF Trainer FP8 guard
 # ============================================================================
 # Per-arch patches miss FP8Experts; override registry so forwards use forward_moe_backend_fp8.
 

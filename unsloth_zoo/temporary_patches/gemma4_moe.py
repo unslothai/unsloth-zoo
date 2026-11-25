@@ -272,7 +272,6 @@ def _patch_gemma4_moe_legacy():
     _moe_backend = get_forward_moe_backend()
 
     def _gemma4_moe_forward(self, hidden_states, top_k_index, top_k_weights):
-        # Fold per_expert_scale into routing weights before grouped_mm.
         router_ref = getattr(self, "_router_ref", None)
         if router_ref is not None:
             pes = router_ref.per_expert_scale

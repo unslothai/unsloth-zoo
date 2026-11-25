@@ -140,8 +140,7 @@ def _quantize_like(engine_model, model):
 
 
 def _counterpart(engine_model, model):
-    """The part of ``model`` laid out like ``engine_model``: itself, or its language model when the engine serves a
-    multimodal checkpoint with a text-only mlx-lm model that names its weights without ``language_model.``."""
+    """Model, or its language_model when mlx-lm names weights without ``language_model.``."""
     paths = {path for path, _ in engine_model.named_modules()}
     for part in (model, getattr(model, "language_model", None)):
         if part is not None and paths <= {path for path, _ in part.named_modules()}:
@@ -169,8 +168,7 @@ def _share_weights(engine_model, model):
 
 @contextlib.contextmanager
 def _in_process_engine_loads(model):
-    """While an in-process engine starts, its mlx-lm / mlx-vlm model (and Gemma 4's vision sidecar) takes the training
-    model's weights instead of a second copy, and skips Unsloth's class-level gradient checkpointing."""
+    """While an engine loads: reuse training weights, skip class-level gradient checkpointing."""
     try:
         import vllm_metal.v1.model_lifecycle as lifecycle
     except ImportError:

@@ -300,8 +300,7 @@ def _zero3(module):
 
 
 def _collective(module):
-    # FSDP2 (Unsloth's resharding layout or any DTensor-sharded tower) and ZeRO-3 towers all-gather per
-    # forward; a rank-local self-check or fallback forward would hang the other ranks.
+    # FSDP2/ZeRO-3 towers all-gather per forward; rank-local self-checks/fallbacks hang peers.
     if _zero3(module):
         return True
     try:
@@ -430,7 +429,6 @@ def _make_wrapper(module, original):
             _fallback(module, f"unmappable output: {e}")
             return original(*args, **kwargs)
         if not module.__dict__.get(_VERIFIED, False) and os.environ.get("UNSLOTH_GRPO_IMAGE_DEDUP_VERIFY", "1") != "0":
-            # First use per module: self-check the mapping against a full encode.
             with torch.no_grad():
                 full = original(*args, **kwargs)
             reason = _outputs_mismatch(mapped, full, inverse)

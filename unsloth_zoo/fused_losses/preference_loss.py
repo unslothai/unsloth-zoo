@@ -194,8 +194,7 @@ class _ChunkedLinearTokenLogps(torch.autograd.Function):
         # A trainable half precision head runs the vocab sliced backward, which needs each row's lse.
         sliced = ctx.needs_input_grad[1] and weight.dtype in _HALF_DTYPES
         if sliced and ctx.needs_input_grad[0]:
-            # Sliced backward only when its memory estimate beats the per-chunk loop's float32
-            # copies (10 V H).
+            # Sliced backward only if it beats the per-chunk loop's float32 copies (10 V H).
             vocab_size = weight.shape[0]
             hidden_bytes = hidden.element_size()
             cast_bytes = hidden_bytes if hidden.dtype != torch.float32 else 0

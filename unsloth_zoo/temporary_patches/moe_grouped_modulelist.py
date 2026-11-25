@@ -57,8 +57,7 @@ __all__ = [
 try:
     import bitsandbytes as bnb
     from bitsandbytes.nn import Params4bit
-    # The zoo injects a bitsandbytes stub where the package is absent (e.g. macOS arm64); its attributes are placeholder
-    # objects, so isinstance raises TypeError; a non-class Params4bit therefore counts as no bitsandbytes.
+    # isinstance on zoo's bnb stub placeholders raises TypeError, so non-class means no bnb.
     HAS_BNB = isinstance(Params4bit, type)
     if not HAS_BNB:
         Params4bit = None
@@ -173,8 +172,7 @@ def _grouped_mm_fix(x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor) -> tor
             raise
         if not w.is_contiguous():   # an unaligned view (e.g. storage offset): the copy may pass
             return _grouped_mm_fix(x, w.contiguous(), offs)
-        # Shared with moe_utils, not a Python loop: a loop tapes each per-group slice, whose router-decided shape makes
-        # non-reentrant checkpointing abort the backward; two callers tape it, so the hazard is reachable.
+        # Python loop tapes router-decided slices; non-reentrant checkpoint aborts backward.
         try:
             from .moe_utils import _manual_grouped_mm
         except Exception:
@@ -945,13 +943,11 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
         cu = getattr(self, "_cached_gate_up", None)
         if cu is None or cu.device != dev or cu.dtype != dtype:
             with torch.no_grad():
-                # Resident stacks: one contiguous copy at build time.
                 self._cached_gate_up = _build_gate_up_stack(experts, spec, dtype, projs).contiguous()
                 self._cached_down = _build_down_stack(experts, spec, dtype, projs).contiguous()
         gate_up = _grouped_mm_fix(permuted, self._cached_gate_up, offsets)
     else:
         gate_up = _grouped_expert_gemm(permuted, offsets, lambda: _build_gate_up_stack(experts, spec, dtype, projs), recompute)
-    # Expert LoRA: each wrapped projection adds its grouped delta to its base output, as the loop does.
     gate, up = gate_up.chunk(2, dim=-1)
     if lora["gate"] is not None:
         gate = gate + _lora_delta(permuted, offsets, projs.gate, lora["gate"], dtype)

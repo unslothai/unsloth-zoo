@@ -192,8 +192,7 @@ TEMPORARY_PATCHES.append(patch_Gemma4TextConfig_kv_shared_zero)
 # ----------------------------------------------------------------------------
 
 def _make_kv_shared_zero_safe_init(_orig_init, _resolve_decoder_config):
-    """Hardened cache __init__ that transiently deletes num_kv_shared_layers==0 around the original init and restores it
-    in finally; if deletion fails, the original init runs unchanged."""
+    """Drops num_kv_shared_layers==0 in init, restored in finally; plain init if delete fails."""
 
     def __init__(self, *args, **kwargs):
         decoder_config = None
@@ -211,12 +210,10 @@ def _make_kv_shared_zero_safe_init(_orig_init, _resolve_decoder_config):
             try:
                 del decoder_config.num_kv_shared_layers
             except (AttributeError, TypeError):
-                # Cannot mutate; fall through to original init.
                 return _orig_init(self, *args, **kwargs)
             try:
                 _orig_init(self, *args, **kwargs)
             finally:
-                # Always restore, even if __init__ raised.
                 try:
                     object.__setattr__(decoder_config, "num_kv_shared_layers", 0)
                 except Exception:
@@ -402,9 +399,8 @@ def _gemma4_model_has_kv_sharing(model):
 
 
 def _gemma4_force_nonreentrant_checkpointing(model):
-    """Forces non-reentrant GC on E-series layers so shared K/V stays grad-connected: reentrant recompute reads detached
-    K/V and gives wrong producer k/v_proj grads; non-reentrant matches the use_cache=True reference (cosine 1.0 on
-    5.5.0 and 5.12.1); trades CPU offload for correctness; no-op without GC or KV sharing."""
+    """Non-reentrant GC on E-series keeps shared K/V grad-connected (reentrant: wrong k/v_proj
+    grads; cosine 1.0 on 5.5.0, 5.12.1); trades CPU offload; no-op without GC/KV sharing."""
     if not _gemma4_model_has_kv_sharing(model):
         return
     import functools
@@ -485,9 +481,8 @@ def _gemma4_clear_shared_kv_carrier(model):
 
 
 def _gemma4_carrier_overlap_unsafe(model):
-    """Overlapping checkpointed forwards corrupt grads via the module-scoped carrier only with KV sharing AND gradient
-    checkpointing on a Gemma-4 layer, since recompute re-reads it; without GC, two forwards before one backward are
-    safe; 31B/26B-A4B have no carrier."""
+    """Overlapping checkpointed forwards corrupt grads only with KV sharing and GC on a layer
+    (recompute re-reads the carrier); safe without GC; 31B/26B-A4B have no carrier."""
     if not _gemma4_model_has_kv_sharing(model):
         return False
     layers = getattr(model, "_unsloth_gemma4_decoder_layers", None)
@@ -629,9 +624,8 @@ def _gemma4_receiver_is_inputs_embeds(node):
 
 
 def _gemma4_audio_merge_casts(forward_node):
-    """Returns (buggy_casts, fixed_casts) of audio masked_scatter source args split by whether dtype is carried;
-    unmatched shapes match neither (patch no-ops); receiver must be inputs_embeds;
-    tests/test_gemma4_dtype_drift_guards.py reuses it as the drift canary."""
+    """Splits audio masked_scatter casts into (buggy, fixed) by dtype carry; unmatched shapes no-op;
+    receiver must be inputs_embeds; used by tests/test_gemma4_dtype_drift_guards.py."""
     buggy_casts = []
     fixed_casts = []
     for node in ast.walk(forward_node):

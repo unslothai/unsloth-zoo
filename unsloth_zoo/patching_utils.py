@@ -48,15 +48,13 @@ def patch_compiling_bitsandbytes():
         if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
             print("Unsloth: Bitsandbytes >= 0.46.0 supports torch.compile - enabling.")
     else:
-        # Disable dynamo on Linear4bit, Linear8bit etc
         if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
             print("Unsloth: Bitsandbytes < 0.46.0 does not support torch.compile - disabling.")
         for x in ["bitsandbytes.nn.modules", "peft.tuners.lora.bnb",]:
             try:
                 module = importlib.import_module(x)
             except ImportError as e:
-                # Only an absent package (the missing module is the target or one of its parents) gets an install hint;
-                # any other ImportError, such as a broken transitive dependency, must surface its real error.
+                # Install hint only for absent packages; other ImportErrors re-raise as-is.
                 missing = getattr(e, "name", "") or ""
                 target_missing = isinstance(e, ModuleNotFoundError) and missing and (
                     x == missing or x.startswith(missing + ".")
@@ -1175,7 +1173,6 @@ if (_transformers_bnb is None or not hasattr(_transformers_bnb, "_replace_with_b
         return not should_not_convert
 
     _quantizers_utils.should_convert_module = _unsloth_should_convert_module
-    # Also patch the imported reference in bitsandbytes module
     if _transformers_bnb is not None and hasattr(_transformers_bnb, "should_convert_module"):
         _transformers_bnb.should_convert_module = _unsloth_should_convert_module
 pass

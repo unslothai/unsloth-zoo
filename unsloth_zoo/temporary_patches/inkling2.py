@@ -68,21 +68,18 @@ def patch_inkling2_moe_experts():
 TEMPORARY_PATCHES.append(patch_inkling2_moe_experts)
 
 
-# Block attention residuals. Compiled with Inductor (dynamic = True, CUDA), the one-query form over 3+ stacked blocks
-# returns correct values but wrong input grads, so the compiler keeps them eager. A torch.compiler.disable boundary
-# does that outside any graph, but inside an enclosing compiled graph it is a graph break, and under fullgraph = True
-# a hard Unsupported. The opaque custom ops below keep the same eager forward and backward inside the graph instead.
+# Inductor (dynamic = True, CUDA) gives correct values but wrong input grads for the one-query form
+# over 3+ stacked blocks; torch.compiler.disable works outside graphs but graph-breaks inside them
+# (Unsupported under fullgraph = True), so opaque custom ops keep eager fwd and bwd.
 def inkling2_block_residual_reference(block_states, partial_block_states, query, eps, sdpa = False):
-    """transformers' Inkling2{,Loop}BlockAttentionResidual.forward (sdpa, else eager attention), stacked as
-    [..., num_queries, hidden] instead of unbound."""
+    """transformers' BlockAttentionResidual; stacks [..., num_queries, hidden], not unbound."""
     stacked = torch.cat([block_states, partial_block_states.unsqueeze(-2)], dim = -2).float()
     stacked = stacked * torch.rsqrt(stacked.square().mean(-1, keepdim = True) + eps)
     hidden = stacked.shape[-1]
     q = query.float().view(-1, hidden)
     if sdpa:
-        # The module's own call, on the operands autocast would give it (each cast on its own, after the expand, so
-        # the grads accumulate in fp32 as there). Cast by hand: torch.func.vjp through the math backend under an
-        # active autocast fails ("expected scalar type Float but found Half", torch 2.10).
+        # Cast by hand as the module's autocast would, each after the expand so grads accumulate in
+        # fp32; torch.func.vjp via the math backend fails under active autocast on torch 2.10.
         q, k, v = q.expand(*stacked.shape[:-2], -1, -1), stacked, stacked
         device_type = stacked.device.type
         autocast, autocast_dtype = _autocast_state(device_type)

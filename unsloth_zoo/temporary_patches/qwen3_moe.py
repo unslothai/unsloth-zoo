@@ -41,7 +41,6 @@ except Exception:
     def _fused_route_or_none(*args, **kwargs):
         return None
 
-# Grouped GEMM kernel integration for MoE training acceleration
 from .moe_utils import (
     patch_param_wrapper_for_moe,
     get_forward_moe_backend,

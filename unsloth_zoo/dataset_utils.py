@@ -142,8 +142,7 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
 
     substring = _longest_common_sublist([x + [0] for x in all_input_ids])
 
-    # substring == [0] may be the original single token (Mistral [INST] [/INST] outputs [0] but
-    # needs [3] [4]); fixes https://github.com/unslothai/unsloth/issues/1290.
+    # [0] may be a real token (Mistral); fixes https://github.com/unslothai/unsloth/issues/1290
     if substring == [0] and len(all_input_ids[0]) == 1:
         single_token = all_input_ids[0][0]
         if all(single_token in x for x in all_input_ids):
@@ -158,9 +157,8 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
         substring = all_input_ids[0]
     pass
 
-    # Recover optional left/right tokens around the matched core; substring carries an appended [0]
-    # sentinel, so may not be a sublist of original: track the match index explicitly, not by loop
-    # fall-through (which sliced the last index or left j unbound on empty tokenization).
+    # [0] sentinel: substring may not be a sublist, so track the match in where (loop j can be
+    # unbound).
     original = _without_dummy_prefix(tokenizer(component, add_special_tokens = False).input_ids, component, tokenizer)
     where = -1
     for j in range(len(original)):
@@ -168,15 +166,12 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
             where = j
             break
     if where == -1:
-        # Core not located in the component's own tokenization is unverified: the bare [0] sentinel,
-        # or a token with it glued (Phi-3 [32010, 0]); returning it sets A_first == 0 and matches
-        # every <unk>/<pad>, or masks all data, so report no core (both empty-core guards handle
-        # it).
+        # A core not located in its own component tokenization is unverified (bare [0] or glued,
+        # e.g. Phi-3 [32010, 0]); it matches every <unk>/<pad>, so report no core.
         return [], [], []
     optional_left  = original[:where]
     optional_right = original[where+len(substring):]
-    # Plain-text marker edges can BPE-merge with the next message (aya-vision-32b: ">" + "\\sigma" -> ">\\"),
-    # so make them optional, but only while an added token anchors the core: "Q:" -> "Q" hits user text.
+    # Edges may BPE-merge (aya-vision-32b): optional only if an added token anchors the core.
     start, end = _stable_marker_edges(component, original, tokenizer)
     new_start, new_end = max(where, start), min(where + len(substring), end)
     if new_end > new_start and (new_start, new_end) != (where, where + len(substring)):
@@ -634,8 +629,7 @@ def _keep_media_columns(trainer, keys):
         pass
 
 
-# Every missing suffix is a VLM row silently trained as text; cover modern web formats (.avif) and
-# older spellings of the listed ones.
+# Missing suffixes train VLM rows as text silently; include modern (.avif) and older spellings.
 _MEDIA_SUFFIXES = (
     ".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".apng", ".gif", ".bmp", ".dib",
     ".webp", ".avif", ".tif", ".tiff", ".svg", ".heic", ".heif", ".heics",
@@ -658,14 +652,12 @@ def _looks_like_media_value(value, _depth = 0):
     if not isinstance(value, str): return False
     text = value.strip().lower()
     if text.startswith(("data:image/", "data:video/", "data:audio/")): return True
-    # Drop a query string/fragment: `.../cat.jpg?width=64`.
     for sep in ("?", "#"):
         text = text.split(sep, 1)[0]
     return text.endswith(_MEDIA_SUFFIXES)
 
 
-# Prose that goes with the media: raw columns the vision collator reads (tokenizer outputs live in
-# _TEXT_COLUMNS); a keep-list holding the image but not its prompt leaves nothing to tokenize.
+# Raw text companions the vision collator reads; an image alone leaves nothing to tokenize.
 _RAW_TEXT_COMPANION_COLUMNS = frozenset((
     "text", "texts", "prompt", "prompts", "question", "questions",
     "caption", "captions", "instruction", "instructions", "input", "inputs",
@@ -710,9 +702,8 @@ class _MediaAwareCollator:
         self.ambiguous_keys = frozenset(ambiguous_keys)
         self.media_keys = frozenset(media_keys) - self.ambiguous_keys
 
-    # Raw conversational columns hold images inside typed content parts, so no top-level key names
-    # them; route on the column's presence to the media collator, since the text one cannot read
-    # conversations.
+    # Images sit in typed content parts, so no top-level key names them; route on the column
+    # presence to the media collator, since the text collator cannot read conversations.
     _CONVERSATION_KEYS = frozenset((
         "messages", "conversations", "conversation", "chat",
     ))
@@ -723,9 +714,8 @@ class _MediaAwareCollator:
             for k in keys:
                 if not isinstance(k, str): continue
                 lowered = k.lower()
-                # An ambiguous name (path/url) is weighed by its VALUE, like the initial-split
-                # guard: it may be a media reference or plain provenance, and name alone would send
-                # every plain URL to vision.
+                # Ambiguous names (path/url) are judged by value: name alone would send every plain
+                # URL to vision.
                 if lowered in self.ambiguous_keys:
                     if _looks_like_media_value(feature.get(k)): return True
                     continue
@@ -737,10 +727,9 @@ class _MediaAwareCollator:
     def __call__(self, features):
         if self._has_media(features):
             return self.media(features)
-        # Drops media-only columns from text batches (global whitelist keeps them):
-        # ambiguous/companion names by value (raw strings only), media names on sight; copies rows;
-        # removed here, not keep-list, as media path needs them; with remove_unused_columns=False a
-        # tensor/number named output stays.
+        # Drops media-only columns from text batches (global whitelist keeps them): ambiguous or
+        # companion names by value (raw strings only), media names on sight; media path needs them;
+        # remove_unused_columns=False keeps tensor or number output.
         maybe = self.ambiguous_keys | self.companion_keys
         def _keep(key, value):
             if not isinstance(key, str): return True

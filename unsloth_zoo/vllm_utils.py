@@ -97,7 +97,6 @@ def _maybe_set_flashinfer_workspace_base():
 pass
 _maybe_set_flashinfer_workspace_base()
 
-# Ignore logging messages
 import logging
 class HideLoggingMessage(logging.Filter):
     def __init__(self, text): self.text = text
@@ -458,7 +457,6 @@ if importlib.util.find_spec("vllm") is not None:
         except ImportError:
             vllm_version = "0.0.0"
 
-    # Patch excessive warning messages
     if not UNSLOTH_ENABLE_LOGGING:
         # Hide the 'only supports adding LoRA' warning: for multimodal models vLLM currently only supports LoRA on the language model.
         try:
@@ -478,13 +476,11 @@ if importlib.util.find_spec("vllm") is not None:
     # Allow unsloth dynamic quants to work
     def is_layer_skipped_bnb(prefix: str, llm_int8_skip_modules):
         components = prefix.split('.')
-        # Any skip module exactly matching a component
         vllm_check = any(
             module_name in components
             for module_name in llm_int8_skip_modules
         )
 
-        # Allow certain layers to not be quantized
         components = set(".".join(components[:i+1]) for i in range(len(components)))
         unsloth_check = len(set(llm_int8_skip_modules) & components) != 0
 
@@ -624,7 +620,6 @@ if importlib.util.find_spec("vllm") is not None:
         _vllm_bnb.is_layer_skipped_bnb = is_layer_skipped_bnb
         _vllm_bnb.BitsAndBytesLinearMethod._apply_4bit_weight = _apply_4bit_weight
 
-        # Disable all not supported messages
         try:
             from vllm.config import logger as vllm_config_logger
         except:
@@ -792,7 +787,6 @@ if _bitsandbytes_is_usable():
         `quant_state.bitsandbytes__[nf4/fp4]` item may hold minor non-tensor items.
         """
 
-        # unpacking tensor with non-tensor components
         qs_key = [k for k, v in qs_dict.items() if "quant_state" in k and isinstance(v, torch.Tensor)]
         if not len(qs_key) and "quant_type" not in qs_dict:
             raise ValueError("Expected packed or unpacked quant_state items, found neither")
@@ -801,7 +795,6 @@ if _bitsandbytes_is_usable():
                 f"There should be exactly one `quant_state` item with ending from {cls.valid_qs_type_keys}.\nDetected {qs_key}.",
             )
 
-        # unpacking minor and non-tensor quant state items if necessary
         if len(qs_key) == 1:
             first_qs_key = qs_key[0]
             qs_dict.update(unpack_tensor_to_dict(qs_dict.pop(first_qs_key)))
@@ -1247,8 +1240,7 @@ def _vllm_cublas_workspace_held(enabled = True):
         stream = torch.cuda.current_stream()
         if threading.get_ident() == owner and stream.device == device and stream.cuda_stream not in seen:
             try:
-                # An earlier capture's holds go back to the pool only once this one captures (a no-capture call keeps
-                # them); reuse is safe: all graphs replay serially on one stream.
+                # Old holds return once a capture runs; graphs replay serially on one stream.
                 if not seen: held[1] = []
                 clear()
                 _cublas_workspaces_into(pool, stream.device, use_mem_pool)
@@ -1481,8 +1473,7 @@ pass
 
 
 def _get_multimodal_engine_args(config, is_vision_model):
-    # Audio = 0: profiling the Gemma-4 audio tower aborts with Unsloth's compiled audio modules.
-    # Other audio models (Gemma3n, Qwen2-Audio) keep vLLM's default audio quota.
+    # Gemma-4 only: audio = 0, since profiling aborts with Unsloth's compiled audio modules.
     limits = {"image": 1, "video": 0}
     is_gemma4 = _is_gemma4_config(config)
     if is_gemma4 and getattr(config, "audio_config", None) is not None:
@@ -1529,8 +1520,7 @@ def get_vllm_state_dict(
     is_vision_model = False,
     load_in_fp8 = False,
 ):
-    # torchao-quantized state dicts hit "Cannot set version_counter for inference tensor" on aten.t() in inference_mode
-    # (PyTorch bug for tensor subclasses, pytorch/pytorch issue 164872); use no_grad instead.
+    # no_grad for torchao: inference_mode hits a subclass bug (pytorch/pytorch issue 164872).
     if get_quant_type(config) == "torchao" or load_in_fp8:
         ctx_manager = torch.no_grad()
     else:
@@ -2688,8 +2678,7 @@ def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False
     except Exception:
         pass
 
-    # Skip entries spell text layers as language_model.model.*, model.language_model.* or model.*; matching is anchored,
-    # so model.layers.0 never matches vision_tower...layers.0.
+    # Skip-entry matching is anchored: model.layers.0 never matches vision_tower...layers.0.
     def _norm(name):
         return "." + ".".join(x for x in name.split(".") if x != "model") + "."
     skip_modules = []
@@ -2905,7 +2894,6 @@ def approximate_vllm_memory_usage(
     q_size  = head_dim * n_heads
     kv_size = head_dim * n_kv_heads
 
-    # Modules
     qkvo = q_size + kv_size + kv_size + q_size
     qkvo = qkvo * hd
     if is_moe:
@@ -2920,7 +2908,6 @@ def approximate_vllm_memory_usage(
     embed_tokens = vocab_size * hd
     lm_head = 0 if getattr(config, "tie_word_embeddings", True) else vocab_size * hd
 
-    # LoRA modules on all QKVO, MLP
     qkvo_A = max_lora_rank * (hd * 3 + q_size) # o_proj reads the attention width
     qkvo_B = max_lora_rank * (q_size + kv_size + kv_size + hd)
     mlp_A  = hd * max_lora_rank * 2 + mlp_size * max_lora_rank
@@ -2947,7 +2934,6 @@ def approximate_vllm_memory_usage(
     # Parameter left in float32
     parameter_lora_elements = lora_elements*4
 
-    # Activation memory - assume bsz=2
     bsz = 2
     # Stays on hidden_size / heads: it sets vLLM's gpu_memory_utilization, and the real head_dim broke long-context loads.
     kv_size_hidden  = hd // n_heads * n_kv_heads
@@ -3173,7 +3159,6 @@ def vllm_supports_flashinfer(config) -> bool:
         if not matches:
             return False
 
-        # If any guard's allowed set includes FLASHINFER, don't disallow.
         for m in matches:
             body = m.group("body")
             if "FLASHINFER" in body:
@@ -3295,7 +3280,6 @@ def _vllm_online_fp8_moe_ignore(config):
 pass
 
 
-# Idempotency flag so the piecewise-compile fix is only installed once per process.
 _UNSLOTH_VLLM_DECOMPOSE_SIZE_FIX_INSTALLED = False
 
 
@@ -3359,8 +3343,7 @@ def _install_vllm_decompose_size_nodes_fix():
         return s
 
     def _replace_size_in_args(args, node, dims):
-        # Recursively replace `node` in args: top-level and tuple/list positions expand to per-dim values (view(x, size)
-        # becomes view(x, d0, d1, ...)); slice bounds get one scalar dim.
+        # `node` expands per-dim in args, tuples and lists; slice bounds get one scalar dim.
         result = []
         for arg in args:
             if isinstance(arg, fx.Node) and arg is node:
@@ -3440,18 +3423,15 @@ def _install_vllm_decompose_size_nodes_fix():
                         and user.args[0] is n
                     ):
                         index = user.args[1]
-                        # size()[i] -> dims[i] (plain ints included).
                         if isinstance(index, int):
                             user.replace_all_uses_with(ds[index])
                             graph.graph.erase_node(user)
                             continue
-                        # size()[start:stop] -> derived tuple; process on its turn.
                         if isinstance(index, slice):
                             worklist.append((user, ds[index]))
                             continue
 
-                    # Everything else rewires args (size nodes nested in slices, tuples and lists expand per-dim) and
-                    # kwargs; a kwarg whose value is the size node takes the full dims tuple.
+                    # Size nodes in args expand per-dim; size-node kwargs take full dims tuple.
                     user.args = tuple(_replace_size_in_args(user.args, n, ds))
                     if user.kwargs:
                         user.kwargs = {
@@ -3529,9 +3509,8 @@ def _multiarch_linker_dirs() -> "Tuple[str, ...]":
     )
 
 
-# Fallback when ld --verbose cannot run; deliberately generous since a nonexistent dir costs nothing but a missing one
-# costs FlashInfer; multiarch dirs come first, as on the most common CUDA platform they are the only place the driver's
-# unversioned libcuda.so appears.
+# Fallback if ld --verbose fails: generous: a missing dir costs FlashInfer, an extra one nothing;
+# multiarch first: on the most common CUDA platform they alone hold unversioned libcuda.so.
 _FALLBACK_LINKER_DIRS = _multiarch_linker_dirs() + (
     "/usr/lib",
     "/lib",
@@ -3643,8 +3622,7 @@ def _can_link_libcuda() -> bool:
     return any(os.path.exists(os.path.join(d, "libcuda.so")) for d in search)
 
 def _clear_flashinfer_env_on_hip():
-    # ROCm/NPU: FlashInfer needs CUDA nvcc and never applies; forced FlashInfer env vars are removed
-    # even if the package is absent; returns True so the caller skips CUDA FlashInfer setup.
+    # ROCm/NPU: no FlashInfer; clears forced env vars even without package; True skips setup.
     if not is_hip() and DEVICE_TYPE != "npu":
         return False
     _fi_forced = False
@@ -3976,7 +3954,6 @@ def _vllm_speculative_methods():
 
 
 def _vllm_release():
-    # (major, minor) of the installed vLLM, or None.
     try:
         return tuple(Version(str(globals().get("vllm_version"))).release[:2])
     except Exception:
@@ -4128,8 +4105,7 @@ def _patch_vllm_log_non_default_args():
     return True
 
 
-# Speculative methods vLLM's Model Runner V2 refuses, per release (vllm/config/vllm.py
-# _get_v2_model_runner_unsupported_features); 0.34 removed Model Runner V1, so V2 runs every method it accepts.
+# Methods MRV2 refuses per release (vllm/config/vllm.py); 0.34 dropped V1, so V2 runs the rest.
 _MRV2_UNSUPPORTED_BY_RELEASE = (
     ((0, 31), frozenset(("ngram", "ngram_gpu", "suffix", "medusa", "mlp_speculator", "custom_class"))),
     ((0, 32), frozenset(("suffix", "medusa", "mlp_speculator", "custom_class"))),
@@ -4723,7 +4699,6 @@ def _vllm_mamba_ssm_cache_dtype_args(config, engine_arg_keys, training, choices 
 
 
 def _vllm_replayssm_mode():
-    # "auto" (unset), "on" or "off".
     value = os.environ.get("UNSLOTH_VLLM_REPLAYSSM", "").strip().lower()
     if value in ("0", "false", "off", "no"):
         return "off"
@@ -4733,7 +4708,6 @@ def _vllm_replayssm_mode():
 
 
 def _vllm_replayssm_skip_reason(config, engine_arg_keys, device_type):
-    # None when ReplaySSM should be requested, else why it is not.
     model_type = getattr(getattr(config, "text_config", None) or config, "model_type", None)
     if model_type not in _REPLAYSSM_MODEL_TYPES:
         return f"model type {model_type!r} has no ReplaySSM support in vLLM"
@@ -6373,14 +6347,12 @@ def prepare_vllm_lora_loading(model):
         vllm_loras_B .append((v_layer.mlp.down_proj.lora_b_stacked[0], sd,))
     pass
 
-    # Check all shapes
     for model_lora_A, vllm_lora_A in zip(model_loras_A, vllm_loras_A):
         assert(model_lora_A.squeeze().shape == vllm_lora_A.squeeze().shape)
     for model_lora_B, (vllm_lora_B, s,) in zip(model_loras_B, vllm_loras_B):
         assert(model_lora_B.squeeze().shape == vllm_lora_B.squeeze().shape)
     pass
 
-    # Set model items
     model.model_loras_A = model_loras_A
     model.model_loras_B = model_loras_B
     model. vllm_loras_A = vllm_loras_A
@@ -6464,8 +6436,7 @@ def return_lora_modules(
 pass
 
 
-# Matches whole dotted segments, not substrings, so Qwen MoE's dense shared_expert stays servable; moe is the Gemma 4
-# spelling saving_utils.py remaps to .experts.
+# Whole segments: Qwen shared_expert stays servable; Gemma 4 moe remapped by saving_utils.py.
 _MOE_EXPERT_LORA_SEGMENTS = ("experts", "moe")
 
 # Names meaning expert only under their parent: GraniteMoE experts on transformers 4.57 to 5.0; the same pair is a DENSE
@@ -7006,8 +6977,7 @@ _MERGED_ROLLOUT_EMBEDDING_LEAVES = frozenset((
     "embed_tokens", "lm_head", "wte", "wpe", "embed_in", "embed_out", "word_embeddings", "output",
 ))
 _MERGED_ROLLOUT_ATTENTION = re.compile(r"(?:^|\.)(?:self_attn|attn|attention|self_attention)(?:\.|$)")
-# vLLM module suffixes left on LoRA in attention mode (MLP, MoE experts, linear attention, conv); over-inclusion only
-# wraps a module with no LoRA, while a missing suffix fails loudly in _check_lora_is_servable.
+# Suffixes left on LoRA in attention mode; extras are harmless, a missing one fails loudly.
 _MERGED_ROLLOUT_PUNICA_MODULES = (
     "gate_up_proj", "gate_proj", "up_proj", "down_proj", "experts",
     "w1", "w2", "w3", "w13", "fc1", "fc2", "c_fc", "dense_h_to_4h", "dense_4h_to_h",
@@ -8212,7 +8182,6 @@ def _build_lora_request(model, save_directory, load_tensors, lora_request_id, ex
 
     from vllm.lora.request import LoRARequest
     if load_tensors:
-        # We extract it directly from the model's state_dict
         peft_config = _live_lora_config(model, save_directory)
         state_dict = {k.replace(".default", ""):v for k, v in _lora_state_dict(model, reuse_gathered).items()}
         if exclude:
@@ -8302,7 +8271,6 @@ def delete_vllm(llm = None):
     global _UNSLOTH_FLASHINFER_UNUSABLE, _UNSLOTH_FLASHINFER_BLOCK_OWNERS
     if _UNSLOTH_FLASHINFER_BLOCK_OWNERS > 0:
         _UNSLOTH_FLASHINFER_BLOCK_OWNERS -= 1
-    # Only once the last engine that needed it is gone.
     if _UNSLOTH_FLASHINFER_BLOCK_OWNERS == 0:
         _unblock_flashinfer_import()
         _UNSLOTH_FLASHINFER_UNUSABLE = False
@@ -8593,7 +8561,6 @@ def _test_is_same_vlm(model, new_model, processor, test_backward=False):
         original_outputs.loss.backward()
         new_outputs.loss.backward()
 
-        # Compare backward gradient statistics
         matches = []
         mismatches = []
         for layer_name in original_model_stats['backward'].keys():

@@ -39,7 +39,6 @@ DEFAULT_BITS = 8
 SUPPORTED_GROUP_SIZES = (32, 64, 128)
 # Below this many elements, packing saves bytes that do not matter on parameters that tolerate error poorly; matches bitsandbytes min_8bit_size default.
 MIN_QUANTIZE_SIZE = 4096
-# Names already announced in this process; see announce_quantized_optimizer.
 _ANNOUNCED = set()
 
 
@@ -74,9 +73,8 @@ class _QuantizedFirstMomentMixin:
         self.bits = bits
 
     def is_quantizable(self, parameter):
-        """Eligibility is by element count, not shape: mx.quantize only constrains the last axis, so flattened moments
-        admit 3-D expert stacks and LoRA_B at rank 16/32; tensors under MIN_QUANTIZE_SIZE (norms, biases) stay full
-        width, as bitsandbytes min_8bit_size does."""
+        """Eligibility is by element count, not shape: mx.quantize only constrains the last axis, so
+        flattened moments fit 3-D expert stacks and LoRA_B; small tensors stay full width."""
         return (
             parameter.size >= MIN_QUANTIZE_SIZE
             and parameter.size % self.group_size == 0

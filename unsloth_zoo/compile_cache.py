@@ -112,8 +112,7 @@ def _is_trusted_directory(path, *, allow_missing = True):
                     if directory_stat.st_uid != os.geteuid():
                         return False
                 writable_by_others = directory_stat.st_mode & 0o022
-                # Sticky exception only for root- or self-owned parents such as /tmp: a sticky dir's owner can still
-                # rename its entries, so never trust an attacker-owned one.
+                # Sticky exemption only for root/self-owned dirs (owner can rename entries).
                 sticky_trusted = (directory_stat.st_mode & stat.S_ISVTX) and (
                     directory_stat.st_uid in (0, os.geteuid())
                 )
@@ -480,8 +479,7 @@ pass
 
 
 def _probe_os_lock(path):
-    """Non-blocking flock probe before filelock's acquire: filelock retries every flock error but ENOSYS until the
-    timeout, so ENOLCK / EOPNOTSUPP (NFS without a lock manager) would stall exit for _LOCK_TIMEOUT."""
+    """Flock probe: filelock retries ENOLCK/EOPNOTSUPP (NFS) until timeout, stalling exit."""
     if os.name != "posix":
         return
     import fcntl
@@ -532,8 +530,7 @@ pass
 
 
 def megacache_load(model_type, compile_kwargs = None, torch_compile_options = None):
-    """Pre-load artifacts for model_type before any @torch.compile region runs (via unsloth_compile_transformers in
-    from_pretrained); registers the exit save; never raises; a miss compiles locally."""
+    """Pre-load artifacts before @torch.compile runs; never raises, a miss compiles locally."""
     if not megacache_is_enabled():
         return False
     if not _mega_cache_supported():
@@ -557,8 +554,7 @@ def megacache_load(model_type, compile_kwargs = None, torch_compile_options = No
         atexit.register(megacache_save)
         _STATE["atexit_registered"] = True
 
-    # Missing paths are safe to create but never to read from; revalidate the existing key dir right before opening the
-    # manifest (an attacker could win a create-after-check race under a sticky shared parent such as /tmp).
+    # Missing dirs are never read; revalidate before opening the manifest (sticky /tmp race).
     if not _is_trusted_directory(directory, allow_missing = False):
         _log(f"no trusted bundle for key {key} (will compile locally and save on exit)")
         return False

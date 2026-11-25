@@ -79,8 +79,7 @@ def _staged_ids(x):
 
 
 def read_staged():
-    """Read the rows this thread's forward staged, then submit what it held back for them. Anything about to read
-    the forward's arrays on the host calls this first: they could read rows not yet filled."""
+    """Fill staged rows, submit what it held; call before host reads, as rows may be unfilled."""
     fills = getattr(STAGED_FILLS, "fills", None)
     if not fills:
         return
@@ -331,8 +330,7 @@ class _RowTable:
             return local
         seen = (self.seen[local >> 3] >> (local & 7).astype(np.uint8)) & 1 == 1
         if seen.any():
-            # Through the map an evicted row is a page fault taken with the GIL held; a check walks every page its rows
-            # span, so a spread sample is checked row by row before all rows are.
+            # Map faults hold the GIL: a spread sample is checked row by row before all rows.
             rows = local[seen]
             sample = rows[np.linspace(0, rows.size - 1, min(rows.size, _RESIDENCY_SAMPLE)).astype(np.int64)]
             if not all(_in_core(field.map, sample[i:i + 1], field.row_bytes)[0] for field in self.fields for i in range(sample.size)):
@@ -361,8 +359,7 @@ def _by_shard(shard):
 
 
 class DiskEmbedding(nn.Module):
-    """Stands in for nn.Embedding or nn.QuantizedEmbedding (or a row-sharded one) with rows left on disk; each row goes
-    through the same dequantize, so output matches the module bit for bit."""
+    """Stand-in for nn.Embedding, nn.QuantizedEmbedding or sharded; same dequantize, bit-exact."""
 
     def __init__(self, tables, quantization, dims, normalize_zero):
         super().__init__()
@@ -805,8 +802,7 @@ def _slot_projection(projection, arrays, full_experts):
 
 
 class _ExpertSlots:
-    """One layer's experts in capacity slots; a miss evicts the lowest decayed routing count (+1 per route, x``decay[0]``
-    every ``decay[1]`` calls) among experts the call does not use."""
+    """Experts in capacity slots; misses evict lowest decayed route count not used by the call."""
 
     def __init__(self, fields, experts, capacity, decay = (_SCORE_DECAY, _SCORE_DECAY_EVERY)):
         self.fields = fields  # [(projection, name, _Field)]
@@ -935,8 +931,7 @@ class OffloadSwitchGLU(nn.Module):
         return routes, np.unique(routes)
 
     def _table(self, spare = None):
-        """Returns the stock module on spare or a full table, with a fill function copying resident
-        experts and reading others; None if a field is cast at load (disk bytes differ)."""
+        """Stock module with resident-expert fill; None if cast at load (disk bytes differ)."""
         slots = self._slots
         if any(field.cast is not None for _, _, field in slots.fields):
             return None
@@ -1298,8 +1293,7 @@ _prefill_capture = threading.local()
 
 
 def wide_prefill_step(model):
-    """The step every wide single-row prefill call of model runs in, as a prefill chunked at it; None when a layer may
-    run a call whole (unregistered layer, DeepSeek V4 image rows)."""
+    """Step for wide single-row prefill; None for unregistered layer or DeepSeek V4 image rows."""
     modules = dict(model.named_modules())
     switches = [module for module in modules.values() if isinstance(module, OffloadSwitchGLU)]
     wide = {path for path, layer in modules.items() if isinstance(layer, _WideLayer)}
@@ -1462,8 +1456,7 @@ def offloadable(model, model_dir, *, cast_dtype = None):
 
 
 def offload_experts(model, model_dir, fraction, *, cast_dtype = None):
-    """Replaces each quantized SwitchGLU with an OffloadSwitchGLU keeping 1-fraction of experts in
-    slots (at least max(8, top_k)); run before any evaluation; returns a report dict."""
+    """Offloads quantized SwitchGLU; run before any evaluation; slots at least max(8, top_k)."""
     cast_for = _cast_rule(model, cast_dtype)
     store = CheckpointTensors(model_dir)
     report = {"layers": 0, "on_disk_bytes": 0, "resident_bytes": 0, "skipped": []}

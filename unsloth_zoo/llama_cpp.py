@@ -477,7 +477,6 @@ def use_local_gguf(gguf_py_path = None):
 
 def _use_local_gguf(gguf_py_path):
     """The swap itself, run under `_GGUF_MODULE_SWAP_LOCK`."""
-    # Store original state
     original_sys_path = sys.path.copy()
     original_modules = set(sys.modules.keys())
     if gguf_py_path is None:
@@ -503,7 +502,6 @@ def _use_local_gguf(gguf_py_path):
     finally:
         sys.path[:] = original_sys_path
 
-        # Remove any newly imported gguf modules
         new_modules = set(sys.modules.keys()) - original_modules
         gguf_modules_to_remove = [m for m in new_modules if m.startswith('gguf')]
         for module in gguf_modules_to_remove:
@@ -706,7 +704,6 @@ def do_we_need_sudo(system_type="debian"):
     sudo = False
     print("Unsloth: Updating system package directories")
 
-    # Choose update command based on system type
     if system_type == "rpm":
         pkg_manager = "yum" if os.path.exists('/usr/bin/yum') else "dnf"
         update_cmd = f"{pkg_manager} check-update"
@@ -738,7 +735,6 @@ def do_we_need_sudo(system_type="debian"):
                 sp.terminate()
                 raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
             elif time.time() - start_time >= 180:
-                # Failure if longer than 3 minutes
                 sp.terminate()
                 raise RuntimeError("[FAIL] Unsloth: You do not have internet connection!")
         pass
@@ -852,7 +848,6 @@ def try_execute(command, sudo = False, print_output = False, print_outputs = Non
             if line.rstrip().endswith(SHELL_COMMAND_NOT_FOUND):
                 raise RuntimeError(f"Command not found: {command}")
 
-            # Check for other bad outcomes
             for key, value in BAD_OUTCOMES.items():
                 if key in line:
                     error_msg = f"[FAIL] Command `{command}` failed with error `{line.strip()}`\n"
@@ -878,7 +873,6 @@ def try_execute_with_auto_install(command, sudo=False, print_output=False, print
             package_name = command.split(" ", 1)[0]
             print(f"Trying to install missing package: {package_name}")
             install_package(package_name, sudo, print_output, print_outputs, system_type)
-            # Retry once
             try_execute(command, sudo, print_output, print_outputs, cwd, system_type, ignore_deprecation)
         else:
             raise
@@ -2741,7 +2735,6 @@ _UNSLOTH_BRANDING_MARKER = b"# UNSLOTH_BRANDING_APPLIED"
 # Idempotency marker for the monolith branding patch, which edits the in-memory entrypoint and so cannot add a marker comment of its own.
 _UNSLOTH_BRANDING_LINE = b"self.metadata.quantized_by = 'Unsloth'"
 
-# Same for the gguf attribute guard patch.
 _GGUF_GUARD_LINE = b"except AttributeError: gguf."
 # Anchored on the except half, since `try: gguf.X` also matches the reference scan.
 _GGUF_GUARD_PATTERN = re.compile(rb"except AttributeError: gguf\.([\.A-Z_0-9]{3,}) = None")
@@ -3223,7 +3216,6 @@ def _stays_within(root, path):
 def _source_beside(root, name):
     """The .py this cache would be rebuilt from, or None when there is none."""
     if os.path.basename(root) == "__pycache__":
-        # base.cpython-313.pyc -> ../base.py
         candidate = os.path.join(os.path.dirname(root), name.split(".")[0] + ".py")
     else:
         suffix = os.path.splitext(name)[1]
@@ -4635,9 +4627,8 @@ def _download_convert_hf_to_gguf_cached(
 pass
 
 
-# Keeps the lru_cache surface (cache_clear, cache_info, cache_parameters) for external callers;
-# __wrapped__ is not forwarded because the inner function takes a private (name, _local_script_info)
-# pair while the public wrapper is single-arg.
+# Keeps cache_clear/cache_info/cache_parameters for external callers; __wrapped__ is not forwarded:
+# the inner takes a private (name, _local_script_info) pair, the wrapper is single-arg.
 _download_convert_hf_to_gguf.cache_clear = _download_convert_hf_to_gguf_cached.cache_clear
 _download_convert_hf_to_gguf.cache_info = _download_convert_hf_to_gguf_cached.cache_info
 _download_convert_hf_to_gguf.cache_parameters = _download_convert_hf_to_gguf_cached.cache_parameters
@@ -6797,10 +6788,9 @@ GGUF_UNIVERSAL_REQUIRED_KEYS = (
     "{arch}.block_count",       # ml.get_key(LLM_KV_BLOCK_COUNT,      hparams.n_layer_all)
 )
 
-# A tensor namespace implies its metadata keys: required only if every architecture with it reads
-# them with no trailing `false` in `src/models/*.cpp`; optional readers are exempt, weaker ones
-# advisory; a hit refuses to publish; verified against llama.cpp
-# b49650adb31f2e49a0d76113aeb1792134fd8413.
+# A tensor namespace implies metadata keys: required only if every architecture with it reads them
+# with no trailing `false` in `src/models/*.cpp`; optional readers are exempt, weaker ones advisory;
+# a hit refuses to publish; verified on llama.cpp b49650adb31f2e49a0d76113aeb1792134fd8413.
 GGUF_CONDITIONAL_REQUIRED_KEYS = (
     (
         ".indexer",
@@ -6831,8 +6821,7 @@ GGUF_CONDITIONAL_REQUIRED_KEYS = (
     ),
 )
 
-# Same shape as the required keys but warnings only: llama.cpp loads these files, so refusing would fail a working
-# export even though the result is likely wrong.
+# Warn only: llama.cpp loads these, so refusing would break a working but likely wrong export.
 GGUF_CONDITIONAL_ADVISORY_KEYS = (
     (
         "_exps",
@@ -6952,7 +6941,6 @@ def _gguf_field_int(reader, key):
         return None
 
 
-# A block index in a parameter name: `model.layers.31.mlp...`, `transformer.h.5...`.
 _HF_BLOCK_INDEX_RE = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
 
 
@@ -7749,7 +7737,6 @@ def check_build_requirements():
         if cmake_generator is None:
             missing.append('build-essential')
 
-        # Check OpenSSL dev
         is_installed, package_name = check_libcurl_dev()
         if not is_installed:
             missing.append(package_name)
@@ -7883,11 +7870,9 @@ def check_linux_type():
     if os.path.exists('/etc/debian_version'):
         return 'debian'
 
-    # Check if it's RPM-based (CentOS/RHEL/Fedora):
     elif any(os.path.exists(f) for f in ['/etc/redhat-release', '/etc/fedora-release']):
         return 'rpm'
 
-    # Check if it's Arch-based (Arch/Manjaro):
     elif os.path.exists('/etc/arch-release'):
         return 'arch'
 

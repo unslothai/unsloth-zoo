@@ -917,7 +917,6 @@ class _QwenModel(DecisionPipeline):
             from .utils import _AUDIO_QUALIFIED_FAMILIES, _installed_mlx_vlm_version
 
             owner = self._TOWERS[self._architecture]
-            # Audio only on the mlx-vlm releases the trainer qualifies for this architecture's processing.
             qualified = _AUDIO_QUALIFIED_FAMILIES.get(self._architecture)
             if tower == "audio_tower" and not (qualified and qualified.admits(_installed_mlx_vlm_version())):
                 return False
@@ -1102,8 +1101,7 @@ class _QwenModel(DecisionPipeline):
         return _forward_text_hidden_states(self.model, ids, **self._merged(ids, media))[0]
 
     def _hidden_states(self, prompts, media = None, images_end = 0):
-        """Hidden states of each prompt; the prefix the prompts share is run once and continued per
-        prompt, with images ending at token `images_end` read in that shared pass."""
+        """Hidden states per prompt; the shared prefix, through `images_end`, runs once."""
         from .utils import _forward_text_hidden_states, _get_text_model
 
         # Every prompt keeps at least one token of its own to continue with.
@@ -1409,7 +1407,6 @@ class _KevModel(_QwenModel):
         return ((keys @ query) * self.scale).tolist()
 
 
-# The head's type embedding rows.
 _TYPE_IDS = ("noul", "choice", "score")
 
 
@@ -1505,7 +1502,6 @@ class _JointHead(nn.Module):
         )
         for layer in self.evidence_layers:
             options = layer(options, memory)
-        # Each question starts from its own text plus a summary of its options, weighted by how well each matches it.
         fields = self.question_projection(questions)
         own = mx.array(owner)[None, :] == mx.arange(len(question_spans))[:, None]
         match = mx.where(own, (fields @ options.T) / math.sqrt(options.shape[-1]), -mx.inf)
@@ -1683,7 +1679,6 @@ class ClefModel(_QwenModel):
         """One logit per option of the prompt, in question order; `types` index `_TYPE_IDS`."""
         output = output or self._output_head()
         hidden = self._hidden(ids, media).astype(mx.float32)
-        # The head reads the output embedding but does not train it.
         lexical = [mx.stop_gradient(_output_rows(output, ids[start:end])) for spans in option_spans for start, end in spans]
         return self.head(hidden, lexical, question_spans, option_spans, types)
 
@@ -1886,10 +1881,9 @@ def _refuse_untrusted_model_file():
 
 
 def load_decision_model(folder, compute_dtype = None, *, family = None, subfolder = None, base_model = None, token = None, load_in_4bit = False):
-    """Loads a decision model; compute_dtype defaults to float32 for encoders, else the base's;
-    family names the model if identifying files are missing; base_model replaces an adapter's
-    base; load_in_4bit quantizes a Clef's decoder for LoRA, which save_clef_model merges into
-    full-precision weights."""
+    """compute_dtype defaults to float32 for encoders, else the base's; family names the model if
+    identifying files are missing; base_model replaces an adapter's base; load_in_4bit quantizes
+    a Clef's decoder for LoRA, which save_clef_model merges into full-precision weights."""
     _refuse_untrusted_model_file()
     source, folder = folder, Path(folder)
     if not folder.is_dir():
@@ -2380,8 +2374,7 @@ def collate_decisions(items, pad_token_id):
 
 
 def _decision_losses(logits, target, mask, objective = None):
-    """Cross-entropy (smoothed toward uniform over options), Brier and expected distance from gold;
-    objective (label_smoothing, brier_weight, ordinal_weight); off-mask logits hold -1e4."""
+    """Smoothed cross-entropy, Brier and expected distance from gold; off-mask logits are -1e4."""
     smoothing, brier, ordinal = objective or (0.0, 0.0, 0.0)
     log_p = nn.log_softmax(logits, axis = -1)
     options = mask.sum(-1, keepdims = True)
@@ -2687,7 +2680,6 @@ def _decoder_for_training(pipeline, full_finetuning, r, lora_alpha, target_modul
     if full_finetuning and pipeline._experts_apart:
         raise ValueError("Unsloth: this checkpoint stores each expert of its mixture apart, so it trains through LoRA adapters only; pass full_finetuning = False.")
     if any("lora_a" in module for _, module in pipeline.model.named_modules()):
-        # Adapters the checkpoint was loaded with go on training as they are.
         if full_finetuning:
             raise ValueError("Unsloth: a Clef loaded from LoRA adapters trains through them; pass full_finetuning = False.")
         pipeline.model.unfreeze(keys = ["lora_a", "lora_b"], strict = False)
@@ -2822,9 +2814,8 @@ def clef_option_keys(pipeline, question):
 
 
 def clef_training_item(pipeline, state, questions, max_length = None, images = None, audio = None):
-    """Tokenize one record as a Clef training item; the caller adds targets over clef_option_keys; images are PIL or
-    data URLs, merged with state image parts as in a request; audio clips are data URLs or decoded {array,
-    sampling_rate} at 16 kHz mono; source keeps the record for permute_fields."""
+    """Tokenizes a record as a Clef item; caller adds clef_option_keys targets; images PIL or data
+    URLs merged with state images; audio data URLs or {array, sampling_rate} at 16 kHz mono."""
     parsed = pipeline._parse_questions(questions)
     given = list(images or ())
     urls = _image_urls(state, [image for image in given if isinstance(image, str)])
@@ -2903,7 +2894,6 @@ def d1_training_item(pipeline, state, questions, images = None, audio = None):
     if len(parsed) > engine.set_size:
         raise DecisionRequestError(f"too many questions for one record, the maximum is {engine.set_size}")
     asked = [engine.ask(pipeline._question(question)) for question in parsed]
-    # Merged with the state's image parts, as a request is served.
     given = list(images or ())
     urls = _image_urls(state, [image for image in given if isinstance(image, str)])
     images, audio = given + urls[sum(isinstance(image, str) for image in given):], list(audio or ())
@@ -2951,8 +2941,7 @@ def d1_answer(pipeline, question, probabilities):
 
 
 def save_d1_model(pipeline, folder, source = None, temperatures = None):
-    """Writes a trained d1 checkpoint for mlx-vlm and load_decision_model; LoRA is merged in; the
-    source's calibration is replaced by `temperatures`, fit per question type after training."""
+    """Writes a d1 checkpoint, LoRA merged; `temperatures` replace the source's calibration."""
     folder, source = _apart(folder, source or pipeline.source)
     folder.mkdir(parents = True, exist_ok = True)
     staging = Path(tempfile.mkdtemp(dir = folder, prefix = ".saving-"))

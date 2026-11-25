@@ -482,7 +482,6 @@ pass
 KWARGS_TYPE = t_Unpack[t_TypedDictMeta]
 
 
-# Account for output classes changing across versions.
 def process_output_options(
     self : Any,
     locals_items : Dict,
@@ -523,7 +522,6 @@ except Exception as e:
     raise Exception(e)
 pass
 
-# Get FlashAttentionKwargs
 FlashAttentionKwargs = t_TypedDictMeta
 try:
     from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
@@ -535,7 +533,6 @@ except:
     pass
 pass
 
-# Get LossKwargs and KwargsForCausalLM
 LossKwargs = t_TypedDictMeta
 KwargsForCausalLM = t_TypedDictMeta
 try:
@@ -555,7 +552,6 @@ except:
         )
 pass
 
-# Get Cache
 Cache = t.Any
 try: from transformers.cache_utils import Cache
 except: pass
@@ -573,7 +569,6 @@ StaticCache = t.Any
 try: from transformers.cache_utils import StaticCache
 except: pass
 
-# Get text and image utils and typings
 TextInput = str
 try: from transformers.tokenization_utils_base import TextInput
 except: pass
@@ -596,7 +591,6 @@ ProcessorMixin = t.Any
 try: from transformers.processing_utils import ProcessorMixin
 except: pass
 
-# Normalize common built-in types to their typing equivalents
 VAR_KEYWORD_ID    = inspect.Parameter.VAR_KEYWORD.value
 VAR_POSITIONAL_ID = inspect.Parameter.VAR_POSITIONAL.value
 TYPE_MAPPINGS = {
@@ -657,14 +651,12 @@ def canonicalize_annotation(annotation: Any) -> Any:
             args.sort(key = lambda x: str(x))
             args = tuple(args)
             annotation = (annotation[0], args,)
-        # Normalize Unpack[...Kwargs] to Unpack[_TypedDictMeta].
         elif annotation[0] == t_Unpack and \
             type(annotation[1]) is tuple and \
             len(annotation[1]) == 1 and \
             "Kwargs" in str(annotation[1][0]):
             annotation = (t_Unpack, (t_TypedDictMeta,),)
 
-        # Same normalization for the bare-type Unpack form.
         elif annotation[0] == t_Unpack and \
             type(annotation[1]) is type and \
             "Kwargs" in str(annotation[1]):
@@ -746,7 +738,6 @@ def can_safely_patch(
     except ValueError as e:
         return False, f"Signature inspection failed: {e}"
 
-    # If relaxed, allow matching with *args, **kwargs
     def check_args_kwargs(old_fp, new_fp, removed_flags_list):
         if (len(new_fp) >= 2) and (
             new_fp[-1]["kind"] == VAR_KEYWORD_ID and new_fp[-1]["name"] == "kwargs"
@@ -804,7 +795,6 @@ def can_safely_patch(
         if new_param['is_required'] and not old_param['is_required']:
             return False, f"Parameter '{new_param['name']}' changed from optional to required"
 
-        # Strict matching also compares type annotations.
         if match_level == "strict" and old_param['annotation'] != new_param['annotation']:
             return False, \
             f"Parameter '{old_param['name']}' type annotation changed from:\n"\
@@ -827,7 +817,6 @@ def _get_unique_storage_name(
     else:
         obj_name = str(type(target_obj).__name__)
 
-    # Include module for extra uniqueness when available.
     if hasattr(target_obj, '__module__'):
         module_name = target_obj.__module__.split('.')[-1]
         return f"_original_{module_name}_{obj_name}_{attr_name}"
@@ -1014,9 +1003,8 @@ def _dynamo_is_tracing():
     return False
 
 
-# Budget of fruitless stack walks per step (_CHECKPOINT_PROBE_MISS_BUDGET): with no hook accessor the walk is the only
-# signal, and a run that never latches would pay it every call; reset each step and on latch; non-reentrant
-# checkpointing usually latches on its first calls.
+# Caps fruitless stack walks per step (_CHECKPOINT_PROBE_MISS_BUDGET; the walk is the only signal
+# without a hook accessor), reset each step and on latch; non-reentrant usually latches early.
 _CHECKPOINT_PROBE_MISSES = 0
 _CHECKPOINT_PROBE_MISS_BUDGET = 64
 
@@ -1313,8 +1301,7 @@ def _call_noting_skipped_frames(fn, args, kwargs):
     return result, compiled == 0 and bool(get_reasons())
 
 
-# Complete set of Dynamo refusal texts for a disabled callable (only the _torchdynamo_disable branch emits them); torch
-# 2.4-2.6 and 2.7+ wordings both kept since pyproject allows torch>=2.4.
+# Complete refusals of _torchdynamo_disable: torch 2.4-2.6 and 2.7+ wordings (torch>=2.4).
 _DISABLED_HOOK_SIGNATURES = (
     ("Skip calling", "torch.compiler.disable"),
     ("torch._dynamo.disable() wrapped function",),
@@ -1383,9 +1370,8 @@ _RECOMPILE_LIMIT_NAMES = (
 _RECOMPILE_LIMIT_BUMP = 16
 _MAX_RECOMPILE_LIMIT_BUMPS = 4
 
-# Budgets live on process-global torch._dynamo.config, so a per-wrapper cap alone bounds nothing: N
-# wrappers or models in one process each spend 4 bumps and leave the global limit hundreds higher
-# permanently; cap the total and restore originals once the debt is settled.
+# Budgets are process-global (torch._dynamo.config), so a per-wrapper cap bounds nothing: N wrappers
+# each spend 4 bumps and leave the limit raised; cap the total and restore once settled.
 _MAX_TOTAL_RECOMPILE_LIMIT_BUMPS = 8
 _GLOBAL_BUMPS = 0
 _ORIGINAL_RECOMPILE_LIMITS = {}
@@ -1454,9 +1440,8 @@ def _restore_recompile_limits():
     # A new step packs its own activations; last step's are long since freed.
     _PACKED_COMPILED_IN_CHECKPOINT = False
     _CHECKPOINT_PROBE_MISSES = 0
-    # _COMPILED_OK_LABELS is deliberately not cleared on mid-step budget release: clearing it there erases another
-    # wrapper record of packed compiled work, so that pack gets recomputed eagerly; apply_pending_eager_fallbacks clears
-    # it at the step boundary.
+    # _COMPILED_OK_LABELS kept on mid-step budget release: clearing erases another wrapper's packed
+    # record, so that pack is recomputed eagerly; apply_pending_eager_fallbacks clears it.
     if not _ORIGINAL_RECOMPILE_LIMITS:
         return 0
     try:
@@ -1807,8 +1792,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             (_in_non_reentrant_checkpoint() or _PACKED_COMPILED_IN_CHECKPOINT)
             and label in _COMPILED_OK_LABELS
         )
-        # _note_packed_under_checkpoint sets the marker before a compile-time refusal, so nothing
-        # compiled was packed; restore it or an unrelated wrapper's _give_up ends the step.
+        # A refusal packs nothing: restore the marker, or an unrelated _give_up ends the step.
         _PACKED_COMPILED_IN_CHECKPOINT = marker_before
         state["eager"] = True
         _LATCHED_EAGER_LABELS.add(label)
@@ -2034,9 +2018,8 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
         except backend_errors as e:
             # Ordered before the recompile-limit clause: the classes are disjoint, but a backend refusal is never a budget problem and must not consume budget.
             if not _is_backend_refusal_we_handle(e):
-                # Only Inductor's simplifier gaps are known-benign enough to run eagerly; anything
-                # else is re-raised, since a caller's hard-failure request must not be hidden and
-                # hiding a custom backend's error would cost the user their diagnosis.
+                # Only Inductor's simplifier gaps run eagerly; other backend errors are re-raised so
+                # a caller's hard-failure request and custom backend diagnoses stay visible.
                 raise
             return _give_up_on_backend(e, args, kwargs, marker_before)
         except errors as e:
@@ -2047,9 +2030,8 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
                 # Return the eager retry's value as is; marking it compiled would recompute a pack in the wrong mode.
                 return result.value
             if result is not _NO_RESULT:
-                # The retry compiled, so this region may now hold compiled packs; skipping
-                # _note_compiled_ok() lets a later backend refusal in the same step fall back to
-                # eager against a compiled pack.
+                # The retry compiled, so this region may hold compiled packs; skipping
+                # _note_compiled_ok() lets a same-step backend refusal run eager on a compiled pack.
                 _note_compiled_ok()
                 return result
             return _give_up(e, args, kwargs)
@@ -2058,8 +2040,7 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
             if _is_recompile_limit_unsupported(e):
                 # The torch 2.4 route needs the typed arm's two steps: a retry refusal must reach
                 # the backend fallback, and a compiled retry must be recorded as packed; without
-                # both, a codegen refusal after cache exhaustion on 2.4 takes the opposite decision
-                # from 2.7+.
+                # both, a codegen refusal after cache exhaustion decides opposite to 2.7+.
                 result = _retry_catching_backend_refusal(
                     args, kwargs, marker_before)
                 if type(result) is _EagerFallbackTaken:

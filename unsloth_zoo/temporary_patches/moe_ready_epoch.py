@@ -13,8 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Expert-state stamp bumped by hooks, _apply, PEFT, optimizer steps lets MoE/NF4 checks skip scans;
-accelerate-hooked/FSDP2-gathered subtrees never cached; UNSLOTH_MOE_FAST_READY=0 disables."""
+"""Stamp skips MoE/NF4 scans; accelerate/FSDP2 subtrees uncached; UNSLOTH_MOE_FAST_READY=0 off."""
 import functools
 import os
 import weakref
@@ -244,8 +243,7 @@ class Lean:
 
 
 class Record:
-    """Snapshot of a full check (stamp, call context, end-expert spot signature, Lean view, dropouts); the NF4 table
-    token is new per full check, so tables re-key once after any expert-state change (step re-validation keeps it)."""
+    """Full-check snapshot; NF4 table tokens re-key per expert-state change, not per step."""
     __slots__ = ("stamp", "ctx", "spot", "lean", "drops", "drop_state", "gen", "refs")
 
     def __init__(self, ctx, spot, dicts, drops, refs):

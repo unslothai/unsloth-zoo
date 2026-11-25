@@ -52,11 +52,9 @@ UNSLOTH_COMPILE_DISABLE_PARTIAL = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0")
 # conversion_mapping_rescope.py and read by bitsandbytes.py before it blames the transformers version.
 RESCOPE_PATCH_FLAG = "_unsloth_zoo_patched_composite_prefix_renaming"
 
-# Links a wrapper to the callable it wraps; deliberately not __wrapped__, because rescope unwraps __wrapped__ to pick
-# its target and would replace a surviving wrapper, dropping its behaviour.
+# Not __wrapped__: rescope unwraps it to find its target and would replace a surviving wrapper.
 WRAPPER_INNER_ATTR = "_unsloth_wrapper_inner"
 
-# Get only allowed options
 import inspect
 import torch
 # torch 2.4 does not load torch._inductor.config on `import torch`.
@@ -273,7 +271,6 @@ def get_torch_compile_options(
     multi_kernel = 1 if multi_kernel else 0
     if memory_planning: allow_inductor_pool_aliasing()
 
-    # Relabel Inductor's compile progress bar
     try:
         import torch._inductor.async_compile
         from torch.hub import tqdm

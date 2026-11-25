@@ -162,7 +162,6 @@ pass
 
 @functools.cache
 def _detect_amd_rocm_runtime():
-    # Fast path for Linux ROCm installs.
     if os.path.exists("/dev/kfd"):
         return True
     for env_key in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):

@@ -76,8 +76,7 @@ def _is_local_name(hostname):
         return ipaddress.ip_address(hostname).is_loopback
     except ValueError:
         pass
-    # Shorthand such as 127.1 is a user reaching their own machine; inet_aton parses it as the Studio host_policy does,
-    # and a numeric literal cannot be rebound, so it is loopback or fails is_loopback.
+    # inet_aton parses shorthand like 127.1 as host_policy does; numeric IPs can't be rebound.
     try:
         return ipaddress.ip_address(socket.inet_ntoa(socket.inet_aton(hostname))).is_loopback
     except (OSError, ValueError):
@@ -146,8 +145,7 @@ _THOUGHT_MARKERS = (
 
 
 def _split_thought_channels(full):
-    """Splits text into (reasoning, content) with markers removed from both; an unterminated thought, e.g.
-    length-truncated, is all reasoning; either marker dialect works."""
+    """Splits into (reasoning, content); unterminated thought is all reasoning; both dialects."""
     reasoning, content = [], []
     rest = full
     while True:
@@ -286,7 +284,6 @@ def health():
 
 
 def _tools_for_choice(tools, tool_choice):
-    # Honor tool_choice before advertising tools: 'none' hides them, a forced function narrows to that one, anything else forwards all.
     if isinstance(tool_choice, str) and tool_choice.lower() == "none":
         return None
     if isinstance(tool_choice, dict):
@@ -301,7 +298,6 @@ def _tools_for_choice(tools, tool_choice):
 async def chat(req: Request):
     body = await req.json()
     messages = body.get("messages", [])
-    # forwarded to the visual server, honoring tool_choice
     tools = _tools_for_choice(body.get("tools"), body.get("tool_choice"))
     stream = bool(body.get("stream", False))
     max_blocks, capped = _max_blocks(body)

@@ -396,8 +396,7 @@ def warm_moe_probes_on_expert_devices(model) -> None:
         return
     try:
         devices = _expert_devices(model)
-        # One accelerator on the host is the home card; count every backend, since one CUDA card plus one XPU card are
-        # each a single device of their type, yet the XPU is foreign to a CUDA home.
+        # Count every backend: CUDA and XPU each look single, yet XPU is foreign to CUDA home.
         if not devices or _accelerator_count() <= 1:
             return
         moe_utils = _moe_utils_module()

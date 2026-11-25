@@ -274,7 +274,6 @@ def check_signal_escape_patterns(code: str):
             func_name = None
 
             if isinstance(func, ast.Attribute):
-                # signal.signal(...), signal.setitimer(...), etc.
                 if isinstance(func.value, ast.Name):
                     if func.value.id in self.signal_aliases:
                         func_name = f"signal.{func.attr}"
@@ -516,8 +515,7 @@ _SELF_MATCHING_TYPES = frozenset({
     "set", "str", "tuple",
 })
 
-# Interpreter walks (frames, generators, coroutines, tracebacks) reach the trusted caller's real
-# builtins, invisible to attribute/import checks; indexing __import__ out restores everything.
+# Interpreter walks reach real builtins unseen by checks; indexing __import__ restores them.
 _DENIED_ATTR_NAMES = frozenset({
     "ag_await", "ag_code", "ag_frame",
     "cr_await", "cr_code", "cr_frame", "cr_origin",
@@ -532,8 +530,7 @@ _DENIED_ATTR_NAMES = frozenset({
 if sys.version_info >= (3, 14):
     _DENIED_ATTR_NAMES = _DENIED_ATTR_NAMES | {"evaluate"}
 
-# Allowed dunder defs include __init__ and comparison/arithmetic; def names escape the
-# Name/Attribute walk, so __setattr__/__getattr__ would hook copy helpers' attribute machinery.
+# Def names escape the Name/Attribute walk; __setattr__/__getattr__ would hook copy helpers.
 _ALLOWED_DUNDER_DEFS = frozenset({
     "__abs__", "__add__", "__bool__", "__call__", "__contains__", "__enter__",
     "__eq__", "__exit__", "__float__", "__floordiv__", "__ge__", "__getitem__",
@@ -645,10 +642,9 @@ def _allowlist_builtins():
 pass
 
 
-# Allowlisted modules hand out real classes (collections.Counter, random.Random, ...), and type(x) reaches the class
-# of any host object, so `Counter.most_common = f` would rewrite the host's class: every later evaluation and the
-# reward code see it. _guard_attribute_targets routes every attribute store/delete target through this check, which
-# refuses classes the generated code did not define itself; instances and its own classes stay assignable.
+# Allowlisted modules expose real classes; type(x) reaches any host class, so `Counter.most_common =
+# f` would rewrite the host class for later evaluations and reward code; _guard_attribute_targets
+# refuses stores on classes generated code did not define (instances stay assignable).
 _ATTR_TARGET_GUARD = "__unsloth_attr_target__"
 
 
@@ -895,8 +891,7 @@ def _reject_dunder_access(tree):
             raise RuntimeError(
                 f"Name '{node.id}' is not allowed in generated code."
             )
-        # case object(__class__=x) is a getattr with no Attribute node; kwd_attrs is the only identifier field that
-        # reads an attribute, and the Name rule refuses it.
+        # kwd_attrs reads an attribute with no Attribute node; the Name rule refuses it.
         if _MATCH_CLASS_NODES and isinstance(node, _MATCH_CLASS_NODES):
             if node.patterns and bindings is None:
                 bindings = _bound_names(tree)
@@ -1084,7 +1079,6 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
             raise _TimeLimitExceeded()
         fired = True
         fired_at = time.monotonic()
-        # include the intended arming deadline for debugging
         raise TimeoutError(f"Timed out after {deadline:g}s")
 
     setattr(_handler, "__time_limit_handler__", True)
@@ -1112,7 +1106,6 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
             finally:
                 _retry_eintr(signal.signal, signal.SIGALRM, old_handler)
 
-            # Restore prior timer with corrected remaining time.
             if prev_remaining != 0.0 or prev_interval != 0.0:
                 elapsed = max(time.monotonic() - start, 0.0)
                 remaining = max(prev_remaining - elapsed, 0.0)
@@ -1169,7 +1162,6 @@ def _run_in_subprocess(func, seconds, args, kwargs, *, start_method="spawn", kil
                 name, msg, tb = payload
                 raise RemoteTracebackError(f"{name}: {msg}\nRemote traceback:\n{tb}")
         else:
-            # Timeout: terminate, then kill if stubborn
             proc.terminate()
             proc.join(kill_grace)
             if proc.is_alive():
@@ -1407,7 +1399,6 @@ def execute_with_time_limit(
         )
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
-        # Determine effective backend based on function safety
         effective_backend = backend
         if backend in ("signal", "auto"):
             try:
@@ -1542,16 +1533,13 @@ def _get_openenv_pythonpath(working_directory: str) -> str:
         # Old structure: everything in src
         return src_path
     else:
-        # Fallback: try both paths
         return f"{working_directory}{os.pathsep}{src_path}"
 
 
-# Maps endpoint (host, port) to the Popen we spawned there; /health only shows something listens, not that it is ours;
-# two children can hold one port on different addresses.
+# Endpoint -> our Popen; /health can't prove a child is ours (same port, other address).
 _OPENENV_CHILDREN = {}
 
-# Held on every registry access: poll() calls waitpid, releasing the GIL, so iteration can be resized and get-poll-pop
-# is check-then-mutate (python/cpython#87664); WNOHANG does not block, so holding it across poll() is cheap.
+# Held on every access: poll() releases the GIL, so get-poll-pop races (python/cpython#87664).
 _OPENENV_CHILDREN_LOCK = threading.Lock()
 
 # Endpoints claimed but not yet spawned onto; the lock makes each operation atomic, not check-then-spawn-then-register;
@@ -1796,7 +1784,6 @@ def launch_openenv(
     healthy and yours: a second uvicorn is spawned and the passed client dropped.
     /health cannot distinguish it from a process that took the port.
     """
-    # Check if OpenEnv is working first
     assert type(environment) is dict
     assert type(port) is int and port >= 0 and port <= (65535-1)
     assert type(working_directory) is str
@@ -1810,8 +1797,7 @@ def launch_openenv(
         environment = dict(environment)  # Don't mutate original
         environment["PYTHONPATH"] = correct_pythonpath
 
-    # Client shares the server's address family, never localhost: asyncio create_server sets IPV6_V6ONLY, so a :: server
-    # answers on ::1 and not 127.0.0.1 even on dual stack hosts.
+    # Client shares server family, not localhost; a :: server (IPV6_V6ONLY) ignores 127.0.0.1.
     client_host = {"0.0.0.0" : "127.0.0.1", "::" : "::1"}.get(host, host)
     localhost = _openenv_url(client_host, port)
     _reap_exited_openenv_children()
@@ -1831,14 +1817,12 @@ def launch_openenv(
                     except: pass
                     process = None
                 else:
-                    # It should work, so simply return the old one!
                     return process
             except:
                 process = None
         return process
     openenv_process = check_openenv_works(openenv_process)
 
-    # Otherwise, find the next port which can be used
     trials = 0
     while openenv_process is None:
         # Port ID must be less than uint16_MAX

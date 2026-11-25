@@ -40,9 +40,8 @@ def _softplus(x):
 
 
 def _centred(z, target):
-    """Returns (log p_t, logsumexp(z) - m, m, z - m) with m the detached row max; centred so a shared offset cannot
-    round the normaliser away; normaliser is logaddexp(lse_others, z_t), not z_t - logp; masked-sum target, not
-    gather; finfo.min, not -inf, keeps target-only support NaN free."""
+    """Returns (log p_t, logsumexp(z) - m, m, z - m), m the detached row max; centred against
+    rounding, logaddexp not z_t - logp, masked-sum not gather, finfo.min not -inf for NaN-free."""
     m = z.detach().amax(-1, keepdim = True)
     m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
     z = z - m

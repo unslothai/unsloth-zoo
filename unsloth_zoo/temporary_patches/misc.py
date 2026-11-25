@@ -2843,7 +2843,6 @@ pass
 TEMPORARY_PATCHES.append(fix_mamba_ssm_float32)
 
 
-# Mllama Patches
 
 def patch_MllamaVisionEncoderLayer():
     try:
@@ -3514,8 +3513,7 @@ _SFT_SHIELDED_INPUT_TYPES = {}
 
 
 def _sft_shielded_inputs(inputs, contents):
-    """Copy without liger-only kwargs, in the caller's mapping type (BatchEncoding stays one),
-    cached per type; compute_loss injects on the caller's mapping, its only interception point."""
+    """Liger-only kwargs dropped in the same mapping type, as compute_loss injects only there."""
     if not isinstance(inputs, Mapping):
         return contents
     cls = type(inputs)

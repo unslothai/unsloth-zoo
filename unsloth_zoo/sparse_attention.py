@@ -449,8 +449,7 @@ def _gather_call(q, local_kv, sparse_kv, idxs, attn_sink, softmax_scale, window)
         width = max(16, 1 << (k - 1).bit_length())
         if width != k:
             idxs = torch.cat([idxs, idxs.new_full((*idxs.shape[:-1], width - k), -1)], dim = -1)
-    # One KV head ([b, 1, n, d]): gather_attn records share_kv = True, so the backward keeps the shared schedule
-    # (a pre-expanded [b, heads, n, d] view is treated as per-head KV and allocates per-head gradients).
+    # One KV head with share_kv = True; a pre-expanded view would allocate per-head grads.
     out = _gather_fn()(
         q.transpose(1, 2), _single_kv_head(local_kv), _single_kv_head(sparse_kv), idxs, sink,
         sliding_window_size = int(window), scale = float(softmax_scale),
@@ -685,13 +684,10 @@ def sparse_attn_window(q, window_kv, compress_kv, compress_idxs, attn_sink, soft
 
 
 def sparse_gqa_attn(query, key, value, topk_idxs, softmax_scale, *, backend = None):
-    """Softmax attention of each query over its listed keys only (no sink), K != V, grouped-query heads.
-
-    query [b, hq, s, dk], key [b, hk, n, dk], value [b, hk, n, dv], topk_idxs [b, s, K] shared by every head
-    (-1 = unused) -> [b, s, hq, dv]. Head j reads kv head j // (hq // hk), as transformers' repeat_kv does.
-    The shared-KV kernels take one tensor as both key and value, so this runs them on [K | V] with the query
-    zero-padded over V: the logits are exactly q.K and the second half of the output is the V-weighted sum.
-    """
+    """Softmax over listed keys (no sink, K != V, GQA): query [b,hq,s,dk], key [b,hk,n,dk], value
+    [b,hk,n,dv], topk_idxs [b,s,K] (-1 unused) -> [b,s,hq,dv]; head j reads kv head j//(hq//hk);
+    shared-KV kernels run on [K|V] with zero-padded query (logits exact q.K, second half
+    V-weighted)"""
     if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
         raise ValueError("sparse_gqa_attn expects query [b, hq, s, dk], key [b, hk, n, dk], value [b, hk, n, dv]")
     b, hq, s, dk = query.shape
@@ -781,8 +777,7 @@ def _contiguous_rows(visible):
     hi = n - 1 - visible.flip(-1).to(torch.int8).argmax(-1)
     ok = (count > 0) & (count == hi - lo + 1)
     if n == s:
-        # Every key inside [lo, hi] must start at the same first key, not only the endpoints: rows with equal lo
-        # must form one run (segment id equal at both ends of the interval).
+        # Every key in [lo, hi] must start at the same first key; equal lo rows form one run.
         seg = torch.cat([lo.new_zeros(b, 1), (lo[:, 1:] != lo[:, :-1]).long()], 1).cumsum(1)
         ok = ok & (lo.gather(1, lo) == lo) & (seg.gather(1, lo) == seg.gather(1, hi))
     else:
@@ -793,8 +788,7 @@ def _contiguous_rows(visible):
 
 
 def _qsa_geometry(attention_mask, ratio):
-    """Returns (lo, hi, block starts) per row or None for non-interval masks; host-sync scan cached
-    per mask _version, shared by QSA layers and recompute; rescanned for inference tensors."""
+    """Returns (lo, hi, block starts) or None; cached per _version, not for inference tensors."""
     # One shared selection per batch row: per-head masks ([b, h > 1, s, n]) cannot be represented.
     if not isinstance(attention_mask, torch.Tensor) or attention_mask.dim() != 4 or attention_mask.shape[1] != 1:
         return None
@@ -813,7 +807,6 @@ def _qsa_geometry(attention_mask, ratio):
         positions = torch.arange(seq, device = visible.device)
         starts = []
         for b in range(lo.shape[0]):
-            # Block starts: every ratio-th key from its row's first visible key, whole block inside the sequence.
             is_start = ((positions - lo[b]) % ratio == 0) & (positions + ratio - 1 < seq)
             starts.append(torch.nonzero(is_start).flatten())
         result = (lo, hi, starts)

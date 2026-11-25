@@ -73,7 +73,6 @@ __all__ = [
     "get_activation_offload_stats",
 ]
 
-# Initial buffer sizes for gradient checkpointing
 INITIAL_CPU_BUFFER_SIZE = 128 * 1024       # per CPU buffer
 INITIAL_GPU_BUFFER_SIZE = 2 * 256 * 2048   # per GPU buffer
 INITIAL_CPU_BUFFER_COUNT = 200             # number of CPU buffers
@@ -101,8 +100,7 @@ def _keep_on_device_indices():
 
 _WARNED_KEEP_ON_DEVICE = False
 _WARNED_KEEP_LOW_MEMORY = False
-# Free device memory below which a unified device offloads again (the old path): the device budget can still be
-# smaller than host RAM there (a GTT limit, a partial carve-out), so a run that only fits with offload keeps fitting.
+# Free memory below which unified devices offload again; their budget may be under host RAM.
 KEEP_ON_DEVICE_HEADROOM_MIN  = 2 * 1024 * 1024 * 1024
 KEEP_ON_DEVICE_HEADROOM_FRAC = 0.05
 # _KEEP_BUDGET tracks free as last mem_get_info minus later allocs; re-reads see outside use.
@@ -155,8 +153,7 @@ def _keep_on_device_forced():
     return _env_tristate(KEEP_ON_DEVICE_ENV) is True
 
 
-# WSL2 caps pinned memory near 1-2GB, falls back to pageable; unslothai/unsloth 338, 1552, 1744,
-# 1797.
+# WSL2 caps pinned memory near 1-2GB, else pageable; unslothai/unsloth 338, 1552, 1744, 1797.
 PINNED_MEMORY_AVAILABLE = True
 _WARNED_ABOUT_PINNED_MEMORY = False
 
@@ -187,9 +184,8 @@ def _warn_pinned_unavailable(detail):
     )
 
 
-# Cache the pinned flag on the buffer: is_pinned() is a driver query, and a parallel list can drift
-# and call a pageable buffer pinned, so an async copy runs from pageable memory; unmarked costs only
-# a sync copy.
+# Pinned flag lives on the buffer (is_pinned() is a driver query): a drifted parallel list would
+# mark pageable buffers pinned, so async copies read pageable memory; unmarked costs a sync copy.
 HOST_PINNED_ATTR = "_unsloth_is_pinned"
 
 
@@ -492,8 +488,7 @@ def _empty_host_cache():
     if DEVICE_TYPE not in ("cuda", "hip"): return False
     ours = sum(k * v for k, v in _PINNED_CACHED.items())
     free = _host_allocator_free_bytes()
-    # host_memory_stats() misses pending non_blocking copies, so our released blocks justify a
-    # flush.
+    # host_memory_stats() misses pending non_blocking copies; released blocks justify a flush.
     released = _PINNED_RELEASED
     if not (ours or released or free): return False
     if ours or released:
@@ -703,9 +698,8 @@ def _view_bytes_as(buffer, nbytes, dtype, shape):
     return buffer.view(torch.uint8)[:nbytes].view(dtype).view(shape)
 
 
-# UNSLOTH_OFFLOAD_FP32=exact or bf16 forces a mode; auto stores autocast fp32 offloads as bf16 (fp16
-# overflows gemma3 residuals; per-row fp16 spiked grad norms 20x on T4; bf16 drifted LoRA grads
-# ~0.1%), else exact.
+# UNSLOTH_OFFLOAD_FP32=exact|bf16 forces; auto stores autocast fp32 offloads as bf16 (fp16 overflows
+# gemma3 residuals, spiked grad norms 20x on T4; bf16 drifts LoRA grads ~0.1%), else exact.
 def _fp32_offload_mode():
     mode = os.environ.get("UNSLOTH_OFFLOAD_FP32", "auto").strip().lower()
     if mode in ("exact", "fp32", "float32"): return "exact"
@@ -836,7 +830,6 @@ pass
 
 
 # ---------------------------------------------------------------------------
-# Gradient-checkpoint recompute marker
 # ---------------------------------------------------------------------------
 # Thread-local, True only while checkpoint backward re-runs forward (MoE recompute policy reads it);
 # context manager always restores the prior value, is idempotent, safe under nesting and exceptions,
@@ -925,9 +918,8 @@ def gradient_checkpoint_replay_module():
 # ---------------------------------------------------------------------------
 # Same MoE routing in the checkpoint replay as in the forward that made the loss
 # ---------------------------------------------------------------------------
-# Replay reuses first-pass MoE routing (compile rounds differ by a bf16 ulp); read at run time by
-# eager code or opaque ops, never traced code, so no graph guards; UNSLOTH_MOE_GC_SAME_ROUTING=0
-# disables.
+# Replay reuses first-pass MoE routing (compile rounds differ by a bf16 ulp); read by eager or
+# opaque ops, never traced code, so no graph guards; UNSLOTH_MOE_GC_SAME_ROUTING=0 disables.
 _GC_ROUTING_TLS = threading.local()
 MOE_GC_ROUTING_STATS = collections.Counter()   # stored / reused / mismatch / unmatched
 
@@ -1210,7 +1202,6 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
         with torch.enable_grad(), _gradient_checkpoint_recompute_marker(ctx.forward_function), \
                 _checkpoint_routing_scope(getattr(ctx, "_routing_frame", None), True):
             output = ctx.forward_function(hidden_states, *recompute_args)
-        # Outputs may be a tensor or tuple; backprop only the outputs that received a grad.
         outputs = output if isinstance(output, tuple) else (output,)
         pairs = [(o, g) for o, g in zip(outputs, dY)
                  if torch.is_tensor(o) and o.requires_grad and g is not None]
@@ -1227,9 +1218,8 @@ pass
 
 
 
-# Checkpoint-only keywords the reentrant shims deliberately ignore, to keep today's behaviour;
-# binding one onto the wrapped block raises TypeError; early_stop (torch 2.10 and 2.13) is
-# documented as ignored when use_reentrant=True, so dropping it is faithful.
+# Checkpoint-only keywords the reentrant shims ignore to keep behaviour; binding one to the wrapped
+# block raises TypeError; early_stop (torch 2.10, 2.13) is ignored when use_reentrant=True.
 _TORCH_CHECKPOINT_KEYWORDS_LITERAL = frozenset({
     "preserve_rng_state",
     "context_fn",
@@ -1391,9 +1381,8 @@ _UNSLOTH_CKPT_SHIM_NAMES = frozenset({
 
 
 def _capture_pristine_checkpoint_once():
-    # Stash the genuine torch checkpoint on the first patch only: a second patch overwrites
-    # _old_checkpoint with the first shim, losing the pristine fn; the Gemma-4 KV-sharing fix reads
-    # this ref to force use_reentrant=False.
+    # Stash torch's checkpoint on first patch only: a second patch overwrites _old_checkpoint with
+    # the shim, losing it; the Gemma-4 KV-sharing fix reads it to force use_reentrant=False.
     ck = torch.utils.checkpoint
     if getattr(ck, "_unsloth_pristine_checkpoint", None) is not None:
         return
@@ -1427,8 +1416,7 @@ pass
 
 
 def _bind_transformers_checkpoint(shim):
-    # Keep transformers' prior checkpoint binding (may be a caller's wrapper or another shim) in one
-    # slot, like torch's _old_checkpoint, so unpatch stays in step.
+    # Keep transformers' prior checkpoint (maybe a wrapper) like _old_checkpoint for unpatch.
     import transformers.modeling_utils
     current = getattr(transformers.modeling_utils, "checkpoint", None)
     if current is not shim:
@@ -3107,8 +3095,7 @@ def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None,
     function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
     if not torch.is_grad_enabled():
         return _call_without_checkpoint(function, *args, *tensor_args)
-    # Test for None, not `not CPU_BUFFERS`: the pool stays empty by design when every device keeps
-    # inputs (unified memory, UNSLOTH_GC_KEEP_ON_DEVICE=1); re-init resets streams and buffers.
+    # Test None, not emptiness: CPU_BUFFERS stays [] when all devices keep inputs (by design).
     if CPU_BUFFERS is None or GPU_BUFFERS is None:
         initialize_unsloth_gradient_checkpointing(args[0].dtype)
     return UnslothCheckpointFunction.apply(function, preserve, *args, *tensor_args)

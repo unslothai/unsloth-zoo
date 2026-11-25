@@ -142,9 +142,8 @@ def _call_sites(path: Path, target: str) -> list[dict]:
         ref = value.strip()
         if not ref.startswith("./"):
             continue
-        # Compare the full local reference: actions a/cache and b/cache share the last component, so
-        # matching it pooled their call sites; bare names work for self-tests and shell-head
-        # narrowing.
+        # Compare the full local ref: a/cache and b/cache share the last component, so matching it
+        # pooled call sites; bare names work for self-tests and shell-head narrowing.
         full = ref[2:].rstrip("/") if ref.startswith("./") else ref.rstrip("/")
         # ./repo/ prefixed refs name the same action; strip it here as reachability does.
         segments = full.split("/")
@@ -371,7 +370,6 @@ def _delegation_is_read(expression: str, producers: dict, scope = None) -> bool:
     step_id, output = match.group(1), match.group(2)
     if scope is not None:
         return output in producers.get((scope[0], scope[1], step_id), set())
-    # Unscoped: every same-id step must recover the output; one unreadable namesake vetoes.
     seen = [names for ident, names in producers.items() if ident[2] == step_id]
     return bool(seen) and all(output in names for names in seen)
 
@@ -405,9 +403,8 @@ def _resolved_inputs(caller_paths: list, target: str, _depth: int = 0) -> dict:
         sites.extend(_call_sites(pth, target))
     if not sites:
         return {}
-    # Collect all input names before counting omissions: counting in the same pass let a composite
-    # called without `name`, then with `name: safe`, narrow the namespace to {'safe'} as fully
-    # resolved.
+    # Collect all input names before counting omissions: counting in one pass let a composite called
+    # without `name`, then with `name: safe`, narrow to {'safe'} as fully resolved.
     names = {str(name) for site, _scope in sites for name in site}
     # Maps input name to (wrapper's own input, wrapper scope) pairs: values a wrapper forwards from its own inputs, resolved against its call sites.
     forwarded_inputs: dict = {}
@@ -446,8 +443,7 @@ def _resolved_inputs(caller_paths: list, target: str, _depth: int = 0) -> dict:
                 # Explicit unexpandable values are dynamic: the caller overrode any default.
                 dynamic += 1
         for wrapper_input, wrapper_scope in forwarded_inputs.get(name, ()):
-            # Forwarded values resolve against the wrapper's own callers, not the wrapper file; only one level is
-            # followed, and past it _depth falls back to unresolved.
+            # Forwards resolve via wrapper callers; one level, then _depth marks unresolved.
             outer = (
                 {}
                 if _depth
@@ -594,9 +590,8 @@ def _shell_built_key_prefixes(
         r"""echo\s+["']?(?:key|prefix)=([A-Za-z0-9][A-Za-z0-9._-]*?-)(?=\$|\{)""", text
     ):
         heads.append(m.group(1))
-    # Heads after a variable, like ${name}-pip-..., are missed (the pattern needs an alphanumeric
-    # start) until caller values are substituted; else steps.* keys were dismissed as delegation,
-    # leaving shared-pip- nothing to compare.
+    # Heads after a ${name} variable are missed until caller values are substituted (needs alnum
+    # start); else steps.* keys are dismissed as delegation.
     for value in sorted(inputs or ()):
         substituted = re.sub(
             r"\$\{\s*[\w-]+\s*\}|\$\{\{\s*inputs\.[\w-]+\s*\}\}", value, text
@@ -723,13 +718,11 @@ def _expand_key(
 
 
 def _input_namespaces(callers: list, targets: list) -> dict:
-    """Merged view of _namespaces_by_target for shell-head narrowing only; merging is wrong for key values, but there a
-    borrowed value only widens the namespace, the safe direction."""
+    """Shell-head narrowing only: merged values are wrong for keys, but here they only widen."""
     merged: dict = {}
     for target in targets:
         resolved = _resolved_inputs(callers, _target_name(target))
-        # A declared default joins the namespace and settles only the missing-input case; an explicit caller passing an
-        # unexpandable expression still leaves it undecided; treating defaults as blanket resolution hid that caller.
+        # Defaults are not blanket resolution: that hides callers passing unexpandable values.
         defaults = _declared_defaults(target)
         for field, value in defaults.items():
             entry = resolved.get(field, (set(), True, 0, 0, set()))
@@ -780,8 +773,7 @@ def _declared_defaults(path: Path) -> dict:
 
 
 def _local_ref_candidates(ref: str, root: Path) -> list:
-    """Source-tree paths a ./ ref could name: as written first, then from its embedded .github part, for jobs that check
-    the repo out into a subdirectory; notebooks-ci.yml and version-compat-ci.yml use that form."""
+    """Paths for a ./ ref: as written, then from its .github part (subdirectory checkouts)."""
     ref = ref.strip()
     if ref.startswith("./"):
         ref = ref[2:]
@@ -907,8 +899,7 @@ def main() -> int:
         built = _shell_built_key_prefixes(action_path.read_text(ENC), names, all_literal)
         composite_keys.extend(built)
         shell_literals.update(_shell_output_keys(action_path.read_text(ENC)))
-        # A shell-built value is a literal key head, truncated by construction; without it, publish
-        # prefixes longer than the head (pip-v2-shared- vs pip-v2-) went unexamined.
+        # Shell-built heads are truncated; without them, longer publish prefixes go unexamined.
         shell_built.update(built)
 
     # Publish-side composites hold actions/cache/restore keys too; an empty side would pass.
@@ -947,7 +938,6 @@ def main() -> int:
     publish_producers: dict = {}
     for pth in publish_callers + publish_reachable:
         publish_producers.update(_producer_steps(pth))
-    # Each definition keeps its OWN inputs. See `_namespaces_by_target`.
     pr_by_target = _namespaces_by_target(pr_callers, pr_reachable)
     publish_by_target = _namespaces_by_target(publish_callers, publish_reachable)
 
@@ -1048,11 +1038,9 @@ def main() -> int:
                     if _DELEGATED_KEY.fullmatch(k.strip()) and _delegation_is_read(
                         k.strip(), publish_producers, pub_scope
                     ):
-                        # Delegated AND read. See the PR side above.
                         continue
-                    # Unresolved publish keys fail closed like PR keys; a key with no literal head is expression-led and
-                    # could be any value, so every PR key is a candidate; requiring a head would exempt the least
-                    # decidable keys.
+                    # Unresolved publish keys fail closed: with no literal head, every PR key is a
+                    # candidate; requiring a head would exempt the least decidable keys.
                     heads = [h for h in _prefix_candidates(k) if h]
                     reported = False
                     for literal in sorted(pr_keys):

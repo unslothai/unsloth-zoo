@@ -48,8 +48,7 @@ import os
 
 import torch
 
-# Eager calls only (traced ones show in moe_grouped_fp16.LORA_CALLS, counted inside the op): fold / accumulate:
-# forward launches; backward: folded dX launches; declined: eligibility misses (by reason in DECLINE_REASONS).
+# Eager-only (traced: moe_grouped_fp16.LORA_CALLS); declines by reason in DECLINE_REASONS.
 LORA_FOLD_STATS = {"fold": 0, "accumulate": 0, "backward": 0, "declined": 0}
 LAST_DECLINE = {"reason": None}
 DECLINE_REASONS = collections.Counter()

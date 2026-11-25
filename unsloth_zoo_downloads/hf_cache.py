@@ -48,8 +48,7 @@ def _is_safe_private_dir(path: Path) -> bool:
     # so cached models and the HF_HOME token stay private; ownership check is POSIX-only.
     try:
         if hasattr(os, "getuid"):
-            # /tmp is race-safe thanks to the sticky bit; a group- or world-writable non-sticky ancestor we do not own
-            # is not (anyone it lets write can rename our folder away and plant their own), so refuse a fallback there.
+            # Non-sticky writable ancestors we do not own allow rename-and-plant; refuse them.
             for ancestor in (path, *path.parents):
                 if not ancestor.exists():
                     continue
@@ -148,7 +147,6 @@ def redirect_hf_cache_if_readonly() -> str | None:
         reason = "xet cache location could not be resolved"
     else:
         reason = f"xet cache '{xet_cache}' is not writable"
-    # An explicitly set writable HF_XET_CACHE is kept as the user chose.
     keep_explicit_xet = xet_ok and "HF_XET_CACHE" in os.environ
 
     for base in _fallback_bases():

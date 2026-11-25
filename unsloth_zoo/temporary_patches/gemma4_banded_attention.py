@@ -73,9 +73,8 @@ def _packed_documents(packed_seq_lengths):
 
 
 def _mask_is_plain_band(mask, S, w, _block=1024, packed_seq_lengths=None):
-    """True only if mask is exactly the causal+sliding band with no padding (every row checked; packed and per-head
-    masks rejected; a mask-free multi-document row is not plain); shared by FA2 and banded SDPA; cached on the tensor
-    by version and band params."""
+    """True only if mask is exactly the causal+sliding band with no padding (packed or per-head
+    masks and mask-free multi-doc rows fail); cached by version and band params."""
     if mask is None:
         return not _packed_documents(packed_seq_lengths)
     if not torch.is_tensor(mask) or mask.dim() != 4:
@@ -94,8 +93,7 @@ def _mask_is_plain_band(mask, S, w, _block=1024, packed_seq_lengths=None):
     else:
         # Every batch row, not just 0: per-sample left padding is dropped by both kernels.
         m = mask[:, 0]                                    # (B, S, S)
-        # Scan in row blocks to avoid a dense S x S band (gigabytes at 16k/32k); a float mask must also have no in-band
-        # bias (exactly 0), else the bias is silently dropped.
+        # Row blocks avoid dense SxS bands; float in-band bias must be 0 else silently dropped.
         is_bool = m.dtype == torch.bool
         idx = torch.arange(S, device=m.device)
         ok = True

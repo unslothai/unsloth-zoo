@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Makes transformers' kernel-hub fallback see real torch.export state under torch.compile: torch < 2.12 constant-folds
-is_exporting() to True, skipping fla/mamba_ssm/causal_conv1d; the patch reads torch.compiler._is_exporting_flag as
-2.12 does; only the hub_kernels global is swapped."""
+"""Makes kernel-hub fallback see real torch.export state under torch.compile: torch < 2.12 folds
+is_exporting() to True, skipping fla/mamba_ssm/causal_conv1d; swaps hub_kernels only."""
 
 __all__ = [
     "patch_hub_kernel_export_check",

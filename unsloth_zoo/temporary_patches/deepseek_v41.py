@@ -86,8 +86,7 @@ REPLAY_STATS = {"runs": 0, "compressor_lora": 0}
 
 
 def prepare_compiled_checkpoint():
-    """Sets specialize_float so checkpoint recompute saves forward's tensors (unspecialized floats
-    reorder LoRA saves); set once at load before compiling, as Dynamo guards config."""
+    """Set specialize_float at load, before compiling: unspecialized floats reorder LoRA saves."""
     dynamo_config = getattr(getattr(torch, "_dynamo", None), "config", None)
     if dynamo_config is None or not hasattr(dynamo_config, "specialize_float"):
         return False
@@ -222,9 +221,7 @@ TEMPORARY_PATCHES.append(patch_deepseek_v41_gradient_checkpointing)
 
 
 def _non_reentrant_checkpoint(layer = None):
-    """The non-reentrant checkpoint for this layer: Unsloth's wrapper when the model bound one (it offloads the saved
-    inputs for use_gradient_checkpointing = "unsloth" and forces use_reentrant = False), else torch's own, also when
-    Unsloth's smart (reentrant) checkpointing replaced torch.utils.checkpoint.checkpoint."""
+    """Unsloth's layer wrapper if bound (forces use_reentrant=False), else torch's, even if patched."""
     import torch.utils.checkpoint as ckpt
     bound = getattr(layer, "_gradient_checkpointing_func", None) or ckpt.checkpoint
     bound = getattr(bound, "func", bound)  # functools.partial(checkpoint, **gradient_checkpointing_kwargs)
@@ -469,8 +466,7 @@ class _MergedLoraWeight:
         return torch.nn.functional.linear(x, self.merged_weight().to(x.dtype))
 
     def __getattr__(self, name):
-        # Not a property: an AttributeError inside a property would fall back to __getattr__ and hand out the
-        # base weight silently.
+        # Not a property: AttributeError falls to __getattr__, silently giving base weight.
         if name == "weight":
             return self.merged_weight()
         return getattr(self.module, name)

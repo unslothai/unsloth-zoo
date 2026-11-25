@@ -138,8 +138,7 @@ def _virtual_kv_heads(query, key, value):
 
 def _flex(query, key, value, block_mask, scale, score_mod = None):
     key, value = _virtual_kv_heads(query, key, value)
-    # Shared dynamic=None compile: the first length keeps a static kernel (much faster than dynamic for fixed-length
-    # packed or padded training); varying lengths settle on the dynamic kernel.
+    # dynamic=None: static for first length (much faster if fixed), varying lengths go dynamic.
     from unsloth_zoo.flex_attention.utils import flex_attention, decode_kernel_kwargs
     # Queries under 128 rows can go to flex_decoding, which cannot compile on some torch / Triton pairs.
     return flex_attention(
@@ -369,9 +368,8 @@ def dsa_select_topk(indexer, hidden_states, q_resid, position_embeddings, attent
 
 
 def dsa_flex_attention(query, key, value, topk_indices, attention_mask, scaling, model_type = "dsa"):
-    """Flex attention over top-k AND base mask, returns [B, S, H, D_v]; the BlockMask is cached on topk_indices so GLM's
-    shared layers reuse it; float mask entries at or below half the dtype minimum (and -inf) are masked, other
-    nonzero values are added to the score."""
+    """Flex attention over top-k AND base mask ([B, S, H, D_v]); BlockMask cached on topk_indices
+    for GLM's shared layers; float mask: <= half dtype min or -inf masked, else added."""
     _eager_only("dsa_flex_attention")
     cached = getattr(topk_indices, "_unsloth_dsa_flex", None)
     if cached is not None and cached[0] is attention_mask and cached[1] == key.shape[2]:

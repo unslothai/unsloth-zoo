@@ -131,8 +131,7 @@ def _any_device_integrated():
         return False
 
 
-# AMD APU graphics have no memory of their own, only a carve-out of system RAM; gcnArchName is read
-# since hipDeviceProp_t::integrated is unreliable before ROCm 6.2.
+# APUs share RAM; use gcnArchName: hipDeviceProp_t::integrated is unreliable before ROCm 6.2
 _HIP_APU_ARCHS = frozenset((
     "gfx902", "gfx909", "gfx90c", "gfx1033", "gfx1035", "gfx1036", "gfx1037",
     "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153",

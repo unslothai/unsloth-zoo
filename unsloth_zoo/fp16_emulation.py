@@ -94,15 +94,13 @@ def pow2_exponent(x: torch.Tensor, target_exp: int = 14) -> torch.Tensor:
     return torch.where(torch.isfinite(m) & (m > 0), n, torch.zeros_like(n))
 
 
-# Rounding must survive Inductor, which otherwise fuses x.to(float16).to(float32) into a no-op (residual 0, split
-# silently degrades to plain float16); an opaque custom op forces a real round trip.
+# Inductor folds x.to(float16).to(float32) to a no-op (split degrades); an opaque op stops it.
 _HAS_CUSTOM_OP = hasattr(torch.library, "custom_op")
 
 if _HAS_CUSTOM_OP:
     @torch.library.custom_op("unsloth_zoo::fp16_emulation_round", mutates_args = ())
     def _round_to(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        # Clone when dtype already matches: .to() returns the input itself, and a custom op with no aliasing may not
-        # return an input; otherwise split_terms(x, x.dtype, ...) raises.
+        # Clone on matching dtype: .to() returns the input, which a custom op may not return.
         return x.clone() if x.dtype == dtype else x.to(dtype)
 
     @_round_to.register_fake
@@ -130,8 +128,7 @@ _SPLIT_RANGE_LIMIT = 2.0 ** 28
 
 
 def _split_can_represent(x: torch.Tensor) -> bool:
-    """Per-tensor scale can carry the operand: False for non-finite entries (inf - inf = NaN) or a
-    range wider than the split window; True under torch.compile (host reads break graph)."""
+    """False if non-finite (inf - inf = NaN) or wide range; True in torch.compile (host reads)."""
     if torch.compiler.is_compiling():
         return True
     absx = x.abs()

@@ -155,8 +155,7 @@ def _rescoped_renaming(conversion, prefix, sample_keys, model_keys):
 
 
 def _leaked_submodule_prefix_renamings(model):
-    """Renamings the submodule recursion wrongly merged into the mapping; walks submodules in order
-    with first model type winning; skips the parent's own renamings; empty if none leaked."""
+    """Leaked submodule renamings; first model type wins, parent's own skipped; empty if none."""
     from transformers.conversion_mapping import extract_weight_conversions_for_model
     from transformers.core_model_loading import WeightRenaming
     from transformers.modeling_utils import PreTrainedModel

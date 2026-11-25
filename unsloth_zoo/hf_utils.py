@@ -91,7 +91,6 @@ def _dtype_stringify(x):
             return str(x).split(".", 1)[-1]
         if isinstance(x, str) and x.startswith("torch."):
             tail = x.split(".", 1)[-1]
-            # Only strip "torch." if the tail is actually a dtype on torch
             if hasattr(torch, tail) and isinstance(getattr(torch, tail), torch.dtype):
                 return tail
     except Exception:

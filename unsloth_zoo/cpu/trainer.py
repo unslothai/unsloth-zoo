@@ -192,9 +192,8 @@ def _check_cpu_packing(model, training_args):
     return False
 
 
-# Compiling the decoder layers cost 7 s (warm Inductor cache) to 138 s (cold, Qwen3-0.6B on a loaded 2-core slot) and
-# saved 24% of a SmolLM2-135M step. Auto mode times eager steps first and compiles only when the steps left would repay a
-# cold compile at a conservative saving: UNSLOTH_CPU_COMPILE_COST_S / UNSLOTH_CPU_COMPILE_SAVING override the estimates.
+# Auto mode times eager steps, then compiles only if steps left repay a conservative cold compile at
+# a conservative saving; UNSLOTH_CPU_COMPILE_COST_S / UNSLOTH_CPU_COMPILE_SAVING override.
 _COMPILE_COLD_SECONDS = 150.0
 
 

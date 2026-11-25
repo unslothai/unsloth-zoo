@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4 attention on flex rather than transformers' eager-only path, for prefill and training above a measured
-key length; sink applied exactly from the logsumexp; eager failures latch per shape; UNSLOTH_SPARSE_ATTN_FLEX=0
-forces eager, 1 adds other sm80+ parts with 160 KB+ shared memory."""
+"""DeepSeek-V4 flex attention above a measured key length; sink exact via logsumexp; eager failures
+latch per shape; UNSLOTH_SPARSE_ATTN_FLEX=0 forces eager, 1 adds sm80+ with 160 KB+ smem."""
 
 __all__ = ["patch_deepseek_v4_sparse_flex", "DEEPSEEK_V4_FLEX_STATS"]
 
@@ -102,8 +101,7 @@ def _compiled_flex():
     global _FLEX
     if _FLEX is None:
         from torch.nn.attention.flex_attention import flex_attention
-        # dynamic=None keeps a static kernel for fixed lengths (packed or padded runs), faster than the dynamic one;
-        # varying lengths settle on dynamic after a few graphs.
+        # dynamic=None: static kernel for fixed lengths (faster); varying lengths turn dynamic.
         from unsloth_zoo.rocm_flex_static import rocm_static_flex
 
         def rocm_static_entry(query, key, value, *args, **kwargs):

@@ -40,8 +40,7 @@ QWEN4_EXP_INDEXER_STATS = {"vectorised": 0}
 
 
 _reference_qsa_forward = None
-# Whether the reference converts its selection back to an additive float mask for a float (eager) attention mask:
-# transformers up to 5.22 does; 5.23 always returns the boolean selection and combines it in the attention layer.
+# Reference: additive float mask up to transformers 5.22; 5.23 returns the boolean selection.
 _qsa_returns_float_mask = True
 
 
@@ -114,8 +113,7 @@ def _qwen4_exp_vectorised_indexer_mask(indexer, hidden_states, position_embeddin
 
 def qwen4_exp_qsa_indexer_forward_guarded(self, hidden_states, position_embeddings, attention_mask,
                                           past_key_values=None):
-    """Indexer on filled cache slots only, used alone under UNSLOTH_QWEN4_EXP_FAST_QSA=0; unfilled
-    static-cache slots would overrun the position table (CUDA assert in batched generate)"""
+    """Filled slots only under UNSLOTH_QWEN4_EXP_FAST_QSA=0; unfilled ones overrun positions."""
     # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
     if attention_mask is not None and attention_mask.dim() == 4:
         n_positions = position_embeddings[0].shape[-2]
@@ -380,9 +378,7 @@ def _qsa_cached_select(indexer, layer, hidden_states, full_cos, full_sin, attent
 
 
 def _qwen4_exp_cached_decode(module, hidden_states, position_embeddings, attention_mask, past_key_values, kwargs):
-    """QSA into a filled DynamicCache (decode/MTP), else None; caches roped fp32 block keys per
-    layer; assumes each query sees its visible keys up to itself; other masks: reference on host,
-    else counted in QWEN4_EXP_CACHED_DECODE_MISMATCH and intersected so no hidden key is read."""
+    """QSA into a filled DynamicCache (decode/MTP), else None; assumes queries see their visible keys."""
     if not _cached_decode_enabled() or past_key_values is None:
         return None
     output_attentions = kwargs.get("output_attentions")
@@ -496,8 +492,7 @@ def qwen4_exp_attention_forward(self, hidden_states, position_embeddings, attent
             return out
     if not torch.compiler.is_compiling():
         QWEN4_EXP_SPARSE_STATS["reference"] += 1
-    # fp32 RoPE tables with half-precision projections (4-bit) promote Q/K but not V after RoPE;
-    # compiler rewrites skip this wrapper, so cast tables to the activation dtype here
+    # fp32 RoPE tables promote Q/K, not V, on half projections; compiler skips this; cast here.
     if (
         hidden_states.dtype in (torch.float16, torch.bfloat16)
         and isinstance(position_embeddings, (tuple, list))

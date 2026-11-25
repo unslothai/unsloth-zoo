@@ -228,9 +228,8 @@ pass
 def distributed_function(n = 1, function = None, *args, **kwargs):
     assert function is not None
 
-    # Runs independently when the process group is not initialized (not distributed, or torchrun
-    # before init_process_group(), e.g. at import); see
-    # https://github.com/unslothai/unsloth/issues/3703
+    # Runs without an initialized process group (not distributed, or torchrun before
+    # init_process_group(), e.g. at import); see https://github.com/unslothai/unsloth/issues/3703
     if not torch_distributed_is_initialized():
         out = function(*args, **kwargs)
         return out if n == 1 else out

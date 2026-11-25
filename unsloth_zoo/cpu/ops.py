@@ -388,8 +388,7 @@ def patch_trl_fused_lm_head():
 
 
 def patch_cpu_sdpa_gqa():
-    """Lets CPU SDPA take a mask with enable_gqa (torch >= 2.5) so transformers skips repeating K/V
-    (CUDA GQA rejects masks); CPU tensors only; idempotent; returns True if installed."""
+    """CPU SDPA takes enable_gqa masks (torch >= 2.5) to skip K/V repeats; CUDA rejects them."""
     try:
         from transformers.integrations import sdpa_attention
     except Exception:
@@ -440,8 +439,7 @@ def _lora_input_cast_is_undone(layer, x, dtype):
 
 
 def patch_peft_lora_autocast_input():
-    """PEFT upcasts each LoRA input to the fp32 adapter dtype and CPU autocast casts it straight back (exact round
-    trip): two activation copies per module in forward, one in backward, and lora_A saves its own copy. Skip it there."""
+    """Skip PEFT's fp32 LoRA input upcast that CPU autocast casts back exactly (extra copies)."""
     try:
         from peft.tuners.lora.layer import Linear as LoraLinear
     except Exception:
@@ -514,8 +512,7 @@ def store_frozen_linears_in_bf16(model):
 
 
 def set_bf16_stored_dtype(model, dtype):
-    """Moves Bf16StoredLinear weights to fp32 or back to bf16 (lossless: bf16 checkpoint values),
-    returns count; only frozen upcast weights go back, so modules_to_save is never rounded."""
+    """Bf16StoredLinear to dtype (lossless); frozen upcasts revert; modules_to_save kept exact."""
     moved = 0
     for module in model.modules():
         weight = getattr(module, "weight", None)
@@ -669,9 +666,8 @@ def _forward_takes_index_logits_to_keep(cls):
 
 
 def _logits_to_keep_as_index(model, input_ids, inputs_embeds, logits_to_keep):
-    """An int logits_to_keep slices hidden as a strided view that torch < 2.14 does not fold into
-    one GEMM for bf16/fp16 heads, so matmul copies the head per row; an index tensor gives one
-    GEMM with bit-identical logits; fp32 heads already fold."""
+    """Int logits_to_keep is a strided view torch < 2.14 won't fold into one GEMM for bf16/fp16
+    heads (matmul copies head per row); an index tensor avoids it, bit-identical; fp32 folds."""
     if not isinstance(logits_to_keep, int) or isinstance(logits_to_keep, bool) or logits_to_keep <= 0:
         return logits_to_keep
     tokens = input_ids if input_ids is not None else inputs_embeds
@@ -716,8 +712,7 @@ def patch_chunked_causal_lm_loss(model):
         head_weight = _plain_head_weight(self.get_output_embeddings())
         logps_targets = vars(self).get("_unsloth_cpu_logps_targets", None)
         if logps_targets is not None and head_weight is not None and labels is None and shift_labels is None:
-            # A preference trainer's next-token log-probs from the last hidden state in row chunks (trainer.py). The
-            # head runs here, inside the forward, so DDP / FSDP see a trainable lm_head as used in this forward.
+            # Head runs in forward so DDP / FSDP see a trainable lm_head as used (trainer.py).
             kwargs.pop("return_dict", None)
             outputs = getattr(self, inner_name)(
                 input_ids = input_ids, attention_mask = attention_mask, position_ids = position_ids,

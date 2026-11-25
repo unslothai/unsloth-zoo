@@ -954,9 +954,8 @@ def _candidates(model):
 
 
 def prepare_ane_prefill(model, *, tile = _TILE, share = None):
-    """Compile a Neural Engine split per dense SwiGLU MLP, attached only if at least 5% faster than
-    GPU; default share (Neural Engine channel fraction) is calibrated on the first layer of the
-    most common quantization and cached per machine, macOS build, MLX version and shape."""
+    """Split dense SwiGLU MLPs onto the ANE if 5%+ faster than GPU; default share (channel fraction)
+    calibrated on 1st layer of most common quant; cached per machine, macOS, MLX, shape."""
     started = time.perf_counter()
     try:
         status = _prepare(model, tile, share)

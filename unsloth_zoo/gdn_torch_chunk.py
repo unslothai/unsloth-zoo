@@ -134,9 +134,8 @@ scan_ops()
 
 
 def _chunked(q, k, v, g, beta, scale, initial_state, output_final_state, mm_dtype, seg = None):
-    """q/k [B,T,H,K] (l2-normalised if asked, H == HV), v [B,T,H,V], g/beta [B,T,H]; returns o
-    [B,T,H,V] float32 and final state [B,H,K,V] float32 or None; seg [B,T] gives packed document
-    ids (B=1), masks keep state inside one document; 64-token chunks, no host sync."""
+    """q/k [B,T,H,K] (l2-normalised if asked, H == HV), v [B,T,H,V], g/beta [B,T,H]; float32 o
+    [B,T,H,V], state [B,H,K,V] or None; seg [B,T] packs docs (B=1), masks state; no host sync."""
     scan, _ = scan_ops()
     B, T, H, K = q.shape
     V = v.shape[-1]

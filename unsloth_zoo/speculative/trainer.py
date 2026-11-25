@@ -99,8 +99,7 @@ def mtp_step_losses(head, parts, final_hidden, input_ids, attention_mask, data_l
     supervised = data_labels != -100
     teacher_ids_all = None
     if args.mtp_label_source == "teacher":
-        # Step k's teacher rows are final_hidden[:, k:k + length]: one [rows, V] projection per batch serves every
-        # depth (shifted below), not one per depth. Same logits budget as chunked_lm_loss.
+        # One [rows, V] projection shared by all depths; same logits budget as chunked_lm_loss.
         w = target_lm_head_weight
         per_row = w.shape[0] * w.element_size()
         rows = max(1, min(args.mtp_chunk_size, losses.LOGITS_BUDGET_BYTES // per_row))

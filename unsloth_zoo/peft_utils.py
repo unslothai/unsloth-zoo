@@ -264,8 +264,7 @@ def get_peft_regex(
     # No trailing .*?: fullmatch would let attn.proj_drop (Dropout) match; the dot anchors leaf
     # names.
     if regex_model_parts == "":
-        # With no vision/language model part selected (e.g. audio-only finetuning), the standard matcher would match
-        # every attention/mlp leaf, so the base is made inert and only the dedicated audio branches below apply.
+        # Audio-only: base matcher would hit every attn/mlp leaf, so only audio branches apply.
         regex_matcher = r"(?!x)x"  # never matches
     else:
         regex_matcher = \
@@ -303,8 +302,7 @@ def get_peft_regex(
     )
 
     def _linear_aware_branches(cores):
-        # Only real nn.Linear cores; a blanket optional .linear would double-process the inner
-        # Linear.
+        # Only real nn.Linear cores: optional .linear would double-process the inner Linear.
         out = []
         for core in cores:
             if any(re.fullmatch(r".*?" + core + r"\.linear", name, flags = re.DOTALL) for name in linear_modules):
@@ -375,9 +373,8 @@ def get_peft_regex(
         regex_matcher = r"(?:" + regex_matcher + r")|" + "|".join(extra_branches)
     pass
 
-    # Fallback, only for a requested vision/language part with no match (e.g. untagged VLM vision modules), drops the
-    # model-part requirement; never for audio-only, which would pull in the whole language stack; fullmatch since
-    # re.search would match CSM's depth_decoder.model.layers., which PEFT rejects.
+    # Fallback for unmatched vision/language part, dropping the part check; never audio-only (pulls
+    # in language stack); fullmatch, not re.search (hits CSM's depth_decoder; PEFT rejects).
     if regex_model_parts != "":
         check = any(re.fullmatch(regex_matcher, name, flags = re.DOTALL) for name in linear_modules)
         if not check:
@@ -799,7 +796,6 @@ def requires_grad_for_gradient_checkpointing(model):
                     forward = cached[1]
                     if forward is None: continue
 
-                    # Normal self.language_model(...)
                     if f"self.{name_curr}(" in forward:
                         final_where = j + 1
                         break
@@ -860,7 +856,6 @@ def requires_grad_for_gradient_checkpointing(model):
 
         still_need_patching = True
         if hasattr(module, "get_input_embeddings"):
-            # Use forward hook after Embedding() is called
             embeddings = None
             try:
                 embeddings = module.get_input_embeddings()
@@ -908,7 +903,6 @@ def requires_grad_for_gradient_checkpointing(model):
         pass
 
         if still_need_patching:
-            # Use forward pre hook before module is called
             register_other_hooks(
                 "requires_grad_pre_hook",
                 "requires_grad_pre_hook",

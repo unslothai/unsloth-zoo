@@ -58,7 +58,6 @@ def _relative(path: Path) -> str:
 def _is_interpolated(node: ast.AST) -> str | None:
     """Returns why `node` is a built string, or None if it is not one."""
     if isinstance(node, ast.JoinedStr):
-        # An f-string with no placeholders is just a literal.
         if any(isinstance(v, ast.FormattedValue) for v in node.values):
             return "f-string"
         return None
@@ -85,8 +84,7 @@ def _sink_name(function: ast.AST) -> str | None:
 
 
 def _source_argument(node: ast.Call, sink: str) -> ast.AST | None:
-    """Source argument of a sink call: exec and eval take it positionally as args[0], but compile also accepts source=
-    by keyword, which args[0] alone skipped; studio/backend/core/inference/tools.py resolves sink arguments this way."""
+    """args[0] for exec/eval, source= for compile (args[0] alone missed it); tools.py matches."""
     if node.args:
         return node.args[0]
     if sink.rpartition(".")[2] == "compile":
@@ -245,7 +243,6 @@ def write_allowlist(findings: list[dict], reason: str) -> None:
     )
 
 
-# --- self test ---------------------------------------------------------------
 
 _BAD = """
 def f(model_type):

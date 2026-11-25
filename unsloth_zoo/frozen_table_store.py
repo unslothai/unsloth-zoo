@@ -148,7 +148,6 @@ def _bump(**kw):
 
 
 # ----------------------------------------------------------------------------------------------
-# safetensors headers
 # ----------------------------------------------------------------------------------------------
 _ST_DTYPES = {
     "BOOL": (torch.bool, 1),
@@ -285,8 +284,7 @@ def resolve_tensor_locations(
 _PAGE = mmap.PAGESIZE
 _FILES_LOCK = threading.Lock()
 _FILES: Dict[str, "_MappedFile"] = {}
-# Releases waiting for _FILES_LOCK. A table's finalizer can run inside any allocation, including one made while this
-# thread already holds the lock (a cyclic GC pass inside _acquire_file), so it queues instead of blocking on itself.
+# Finalizers can run in any allocation, even under _FILES_LOCK; queue releases, don't block.
 _PENDING_RELEASES: List[List["_MappedFile"]] = []
 
 
@@ -397,7 +395,6 @@ def _release_files(files: List["_MappedFile"]):
 
 
 # ----------------------------------------------------------------------------------------------
-# Decoders
 # ----------------------------------------------------------------------------------------------
 def decode_bf16_rows(planes: Dict[str, torch.Tensor], dtype: Optional[torch.dtype] = None) -> torch.Tensor:
     """Single plane of bf16 rows (Qwen4Exp n-gram table)."""
@@ -479,7 +476,6 @@ def make_fp8_block_decode(block_size: int = 32, weight_plane: str = "weight", sc
 
 
 # ----------------------------------------------------------------------------------------------
-# Mode
 # ----------------------------------------------------------------------------------------------
 _MODES = ("auto", "disk", "ram", "gpu")
 
@@ -530,7 +526,6 @@ def resolve_frozen_table_mode(table_bytes: int, device: Optional[torch.device] =
 
 
 # ----------------------------------------------------------------------------------------------
-# Store
 # ----------------------------------------------------------------------------------------------
 @dataclass
 class _Shard:
@@ -765,7 +760,6 @@ class FrozenTableStore:
         jobs = []
         for s, local, a, b in self._segments(plane, uniq):
             ids = local.tolist()
-            # coalesce consecutive rows into one read
             run_start = 0
             for j in range(1, len(ids) + 1):
                 if j == len(ids) or ids[j] != ids[j - 1] + 1:
@@ -1005,11 +999,9 @@ class UnslothFrozenTableEmbedding(nn.Module):
         return f"{self.num_embeddings}, {self.embedding_dim}, dtype={self.table_dtype}, store={self.frozen_table_store!r}"
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        # One opaque op: torch.compile (and block compile) sees a lookup of known shape and dtype, not the host-side
-        # unique / page-in / copy, so the caller's graph neither breaks nor recompiles on it.
+        # Hides host unique/page-in/copy from torch.compile; no graph break or recompile.
         if _LOOKUP_OP is not None:
-            # The dtype is an argument, not state the fake reads: a cast after compile (.double(), .half()) then
-            # fails the graph's guard and recompiles, instead of a stale graph reading the new rows as the old dtype.
+            # dtype is an argument: a cast after compile recompiles rather than going stale.
             return _LOOKUP_OP(ids, self._handle, self.table_dtype)
         return self._lookup(ids)
 
@@ -1045,8 +1037,7 @@ class UnslothFrozenTableEmbedding(nn.Module):
             rows = store.gather(ids, dtype=self.table_dtype, host_ids=host)
             snapshot = ids.detach().clone() if host is None else host
         _bump(memo_misses=1)
-        # Hold ids (no other tensor can take its address while the key names it) and a snapshot of its values
-        # (an in-place update of ids must not make the equality check compare the tensor with itself).
+        # Hold ids (address not reused while keyed); a value snapshot guards in-place edits.
         slots = max(1, int(getattr(self, "memo_slots", 1)))
         self._memo = [(ids, snapshot, key, rows), *(self._memo or ())][:slots]
         return rows
@@ -1223,7 +1214,6 @@ def iter_frozen_table_modules(model: nn.Module):
 
 
 # ----------------------------------------------------------------------------------------------
-# Binding to a checkpoint
 # ----------------------------------------------------------------------------------------------
 # Plane name to key-suffix regexes after the prefix, in order; group 1 is the shard index.
 DEFAULT_CHECKPOINT_PLANES = {"weight": (r"shard_(\d+)\.weight", r"weight")}

@@ -29,7 +29,6 @@ _FLAG = "_unsloth_fast_grad_params"
 _CACHE = "_unsloth_flat_params"
 _TRACKED = "_unsloth_fast_grad_tracked"   # set on every module of a cached tree
 _GEN = [0]
-# Engagement counters: fast zero_grad / clip calls and tuple rebuilds.
 FAST_GRAD_CALLS = {"zero_grad": 0, "clip": 0, "rebuild": 0}
 _INSTALLED = [False]
 _PARAMETERS_CODE = torch.nn.Module.parameters.__code__

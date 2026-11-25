@@ -299,7 +299,6 @@ def _tensor_on_hopper(x):
         return True
 
 
-# Why fla was disabled, for unsloth's loader message.
 _FLA_DISABLED_REASON = None
 
 
@@ -959,7 +958,6 @@ def _resolved_implementation(wrapper):
         except ValueError:
             continue
         if callable(value):
-            # glm5_next's safe_gate partial: report the fla kernel it wraps.
             return getattr(value, _KDA_SAFE_GATE_INNER, value)
     return None
 
@@ -1612,8 +1610,7 @@ def _install_cpu_torch_path():
             continue
         try:
             # Resolved here, not in the first (possibly traced) call where an import breaks the
-            # graph; GPU hosts skip it unless already imported (Qwen3-Next import costs about 1s per
-            # import unsloth); no-GPU hosts import.
+            # graph; GPU hosts skip the costly import unless already loaded; no-GPU hosts import.
             _torch_reference_gated_delta_rule(recurrent, import_missing = not _has_gpu())
         except Exception:
             pass

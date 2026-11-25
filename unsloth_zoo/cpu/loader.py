@@ -1166,8 +1166,7 @@ _FUSED_PROJECTIONS = {"q_proj": "qkv_proj", "k_proj": "qkv_proj", "v_proj": "qkv
 
 
 def _with_fused_projections(target_modules, leaf_names):
-    """Add the fused projection a split name maps to when the model has it, so a Llama-style target list does not
-    silently leave Phi-3's Q/K/V and MLP input projections frozen."""
+    """Add fused projections for split names, else Llama-style targets freeze Phi-3's Q/K/V."""
     out = list(target_modules)
     for name in target_modules:
         fused = _FUSED_PROJECTIONS.get(name)
@@ -1233,8 +1232,7 @@ def _set_inference_mode(model, inference):
 
 
 def _frozen_bf16_for(model, training):
-    """Default frozen bf16 storage is for training only: generation upcasts the weights to fp32 (decode speed), and
-    training stores them in bf16 again (half their RAM). UNSLOTH_CPU_FROZEN_BF16=1 keeps bf16 throughout."""
+    """bf16 only for training (fp32 for decode speed); UNSLOTH_CPU_FROZEN_BF16=1 keeps bf16."""
     inner, mode = model, None
     for _ in range(4):
         mode = mode or getattr(inner, "_unsloth_cpu_frozen_bf16", None)
@@ -1674,8 +1672,7 @@ def save_pretrained_gguf(self, save_directory, tokenizer = None, quantization_me
         )
     os.makedirs(save_directory, exist_ok = True)
     merged_directory = os.path.join(save_directory, "merged_16bit")
-    # Stage merged weights unrounded: the converter casts once per requested type instead of rounding through fp16/bf16
-    # first; fp16 without native bf16 would also clip bf16's range.
+    # Merged weights stay fp32 so converter casts once; fp16 (no native bf16) clips bf16 range.
     unrounded = [m for m in methods if m in ("f32", "f16")]
     _save_merged(self, merged_directory, "merged_32bit")
     if tokenizer is not None:

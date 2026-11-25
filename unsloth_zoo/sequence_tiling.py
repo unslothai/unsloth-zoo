@@ -50,8 +50,7 @@ pass
 
 
 def _checkpoint(fn, args, preserve_rng_state):
-    # Inductor min-cut partitioner fails on checkpointed one-row tiles (torch 2.14+); skip
-    # checkpoint.
+    # Inductor min-cut fails on checkpointed one-row tiles (torch 2.14+); skip checkpoint.
     if _is_compiling() and args[0].numel() <= args[0].shape[-1]:
         return _owned(fn, *args)
     body = functools.partial(_owned, fn)
@@ -85,8 +84,7 @@ pass
 
 
 def _tile_gc_flag():
-    # Both runs must read "not in a checkpoint recompute" (same saved tensors); pinning in every tile replay instead
-    # raised the eager OLMoE 8k peak by 2.5 GiB on G4.
+    # Runs must read 'not in a checkpoint recompute'; per-tile pinning raised eager peak on G4.
     return None if _gc_tls() is None else False
 pass
 

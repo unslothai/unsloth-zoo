@@ -61,8 +61,7 @@ class MTPFamily:
     config_overrides: tuple = ()     # (attribute, value) set on the head config
     # Per-layer head-count override for sliding MTP layers (Step's per_layer_config).
     sliding_heads_attr: str = None
-    # llama.cpp status from drafting tiny random models via convert_hf_to_gguf.py + llama-server draft-mtp: drafts (our
-    # drafts match), partial, no_graph (no MTP graph or converter drops the head), unverified.
+    # llama.cpp: drafts (ours match), partial, no_graph (no graph or head dropped), unverified.
     llama_cpp: str = "drafts"
 
     def num_heads(self, config):

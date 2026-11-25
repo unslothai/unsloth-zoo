@@ -71,9 +71,7 @@ __all__ = [
 
 
 class NgramProposer:
-    """Prompt lookup: continue the prompt from where the reply's last tokens occur in it; only the
-    prompt is indexed, since a reply repeating itself predicts poorly but one quoting the prompt
-    keeps quoting it."""
+    """Only the prompt is indexed: a reply repeating itself predicts poorly, one quoting the prompt well."""
 
     def __init__(
         self,
@@ -127,10 +125,7 @@ class RowPlan:
 
 @dataclass(frozen = True)
 class RoundPlan:
-    """A plain window or a verify round; split times drafts apart from the verify; a nonzero
-    controller_depth marks a round drafted deeper than planned, teaching acceptance only at that
-    depth; trim picks the verified prefix from drafter confidences; tree verifies that many rows
-    of a draft tree instead."""
+    """Deeper-than-planned rounds (nonzero controller_depth) teach acceptance only at that depth."""
 
     kind: Literal["plain", "round"]
     length: int = 0
@@ -366,10 +361,9 @@ def _bucket(batch: int) -> int:
 
 
 class DraftController:
-    """Picks each round by measured expected tokens/sec vs plain decoding; a drafter forward or
-    catch-up is paid only if it beats a free copy; fixed_depth never trades drafting for plain
-    decoding; with trims, the width is picked by calibrated tokens/sec and every full_every-th
-    round verifies all."""
+    """Each round picked by measured tokens/sec vs plain decoding; drafter forward or catch-up paid
+    only if it beats a free copy; fixed_depth never trades drafting for plain decoding; with
+    trims, width picked by calibrated tokens/sec and every full_every-th round verifies all"""
 
     def __init__(
         self,
@@ -815,7 +809,6 @@ class DraftController:
                 self._probe, self._probe_left = self._identity(probe, bucket), self.probe_rounds - 1
                 self._reference = top
                 if self.score(probe, rows) * self.probe_margin < top:
-                    # A rival that keeps losing is re-measured exponentially less often.
                     gap = self._stale_gap.get(self._probe, self.stale_after)
                     self._stale_gap[self._probe] = min(2 * gap, self.max_stale_after)
                 return self._shorten(probe), True
@@ -933,8 +926,7 @@ class DraftController:
         return self._extrapolate(sorted(self.deepened_profile[1].items()), width, 0.0)
 
     def _deepened_seconds(self, cycle: _CycleCosts, width: int) -> float:
-        # The load's timed shape at this reply's level: the mean excess of its deepened cycles over the shape (roughly
-        # constant: re-drafting a block not prefetched deep), or before two of them, its regular full-width cycle's.
+        # Deepened excess over the shape (roughly constant); before two, the regular cycle.
         excess = self._deepened_excess
         offset = sum(excess) / len(excess) if len(excess) >= 2 else cycle.seconds(self.max_depth + 1) - self.deepened_profile[0]
         return max(self._deepened_shape(width) + offset, 1e-9)
@@ -974,10 +966,9 @@ class DraftController:
         confidences: Sequence[Sequence[float] | None] | None = None,
         cycle_seconds: float | None = None,
     ) -> None:
-        """Account a finished round: accepted[i] counts row i's accepted drafts; split rounds time
-        their parts apart, fused rounds measure the drafting they hid, first_use rounds update no
-        cost and leave their width unmeasured, and trim rounds' confidences calibrate the
-        verified drafts."""
+        """Accounting: accepted[i] counts row i's drafts; split rounds time parts apart; fused
+        rounds measure the drafting they hid; first_use rounds update no cost, width unmeasured;
+        trim rounds calibrate verified drafts."""
         self._plan_epoch += 1
         bucket = _bucket(len(rows))
         alpha = self.acceptance_alpha
@@ -1068,10 +1059,9 @@ class DraftController:
 
 
 class TreeBudget:
-    """Picks tree rows or a chain to verify by measured tokens/sec; the widest tree runs until
-    enough rounds score the rest; it runs unless its rate is under PROBE_SETTLED_RATE of the
-    best, when the best runs and the widest runs one round in PROBE_SETTLED_EVERY; a nearer tie
-    is within noise."""
+    """Tree or chain by measured tokens/sec; widest tree runs until enough rounds score the rest,
+    then runs unless under PROBE_SETTLED_RATE of the best; if under, best runs and widest one
+    round in PROBE_SETTLED_EVERY."""
 
     MIN_SAMPLES = 24
     PROBE_EVERY, PROBE_SETTLED_EVERY, PROBE_SETTLED_RATE = 8, 64, 0.95
@@ -1307,18 +1297,7 @@ class _RowSampler:
 
 @dataclass(eq = False)
 class EngineRow:
-    """A prefilled reply joining the engine.
-
-    ``cache`` holds the prompt; ``pending`` is the last sampled token, already emitted but not yet
-    forwarded; ``emitted`` counts the tokens emitted so far, ``pending`` included, and is the
-    position of the next draw. ``hidden`` is the target's last-layer hidden ``[1, N, H]`` at the
-    last N prompt positions, which a drafter starts from. A row speculates only if ``drafts`` and
-    each of its ``processors`` sets ``history_only = True``: after its first call its output depends
-    only on the ``(tokens, logits)`` it is given, so it can be asked about positions that are then
-    rejected; or defines ``settle(tokens)``, which is given the row's committed history when the row
-    joins and after every token taken, while its calls may run ahead of it by tokens that are then
-    rejected.
-    """
+    """Rows speculate only if drafts and processors set history_only = True, or define settle(tokens)."""
 
     cache: list
     pending: int
@@ -1459,10 +1438,9 @@ def _language_call(family: str):
 
 
 def _rows_trimmed(transaction):
-    """``transaction`` committing a ragged block row by row in qwen4_exp's QSA caches too.
-
-    Their ``prepare``/``finalize`` roll each row's rejected tail out, but mlx-vlm's commit takes that path only for a
-    cache exposing ``keys``, which ``BatchQSAKVCache`` does not, so it trimmed every row to the longest acceptance."""
+    """Wraps transaction so ragged blocks commit row by row in qwen4_exp QSA caches
+    (prepare/finalize roll each rejected tail out); BatchQSAKVCache lacks keys, so mlx-vlm's
+    commit would trim every row to the longest acceptance."""
     qsa = getattr(sys.modules.get("mlx_vlm.models.qwen4_exp.language"), "BatchQSAKVCache", None)
     if qsa is None or hasattr(qsa, "keys"):
         return transaction
@@ -1526,9 +1504,7 @@ def _committed_eval_state(cache):
 
 
 class SpeculativeEngine:
-    """Each step decodes B rows as the controller chooses: a verify round at one width (each row
-    commits its accepted count), or a window of ordinary decode steps; rows join and leave only
-    between steps, when each holds one pending token and the caches hold all before it."""
+    """Rows join and leave only between steps, each holding one pending token; caches hold the rest."""
 
     def __init__(self, model, controller: DraftController, drafter = None, logprobs: bool = False):
         from mlx_vlm.speculative.common import generation_stream, verify_forward
@@ -2065,10 +2041,8 @@ def _shown_from(processor: Callable, start: int) -> Callable:
 
 
 class SpeculativeDraft:
-    """Draft model for mlx-vlm's ``generate_step`` (``draft_kind = draft.draft_kind``) after
-    ``install_speculative_seam``; call ``prepare`` before each generation and pass the prompt,
-    sampling and processors to ``generate_step``, as mlx-vlm does not; ``admit`` prefills one row
-    for a shared engine."""
+    """Call prepare before each generation and pass prompt, sampling and processors to generate_step
+    (mlx-vlm does not); admit prefills one row for a shared engine."""
 
     def __init__(self, controller: DraftController, drafter = None):
         self.controller = controller
@@ -2184,8 +2158,7 @@ def _engine_rounds(upstream: Callable) -> Callable:
 
 
 def _prompt_tail_prefill(upstream: type) -> type:
-    # A chunked prefill keeps hidden states only for dflash/eagle3, so an MTP drafter would start from the
-    # prompt's last position alone; keep the drafter's tail of them across chunks instead.
+    # Chunked prefill keeps hidden states only for dflash/eagle3; MTP keeps a prompt tail.
     class SpeculativePrefill(upstream):
         unsloth_upstream = upstream
 
@@ -2224,7 +2197,6 @@ def speculative_unavailable_reason() -> str | None:
     return None
 
 
-# Draft sources for the speculative engine.
 
 
 class DraftRow:
@@ -2447,8 +2419,7 @@ class MTPDrafter:
         return mx.concatenate(drafts, axis = 1)
 
     def settle(self, cache: list, rows: Sequence[DraftRow | None], appended: int, keep: Sequence[int]) -> list[int]:
-        """Drop every entry the round's drafting appended, accepted or not: each paired a draft with the head's own
-        output instead of the target hidden, so accepted drafts are recorded again from the verify forward."""
+        """Drops every drafting entry; accepted drafts are re-recorded by the verify forward."""
         if appended:
             for entry in cache:
                 entry.trim(appended)
@@ -2558,9 +2529,7 @@ class HeadRow:
 
 
 class HeadDrafter:
-    """Drafts with any other native MTP head, one reply at a time, through the head's own methods:
-    ``accept_verified_tokens`` replays (token, target hidden) pairs and, with nothing accepted, undoes a
-    draft. Heads keep that state on the module, so each reply drafts with its own shallow copy."""
+    """Heads keep draft state on the module, so each reply drafts with its own shallow copy."""
 
     # Greedy heads may take their tokens from the target table's shortlist (`_ShortlistHead`) instead of a full pass.
     shortlist_head = False
@@ -2988,8 +2957,7 @@ class ContextDrafter:
                                 None if calibration is None else calibration.parameters)
 
     def extension_serves(self, row: ContextRow, depth: int) -> bool:
-        """Whether a block of ``depth`` drafts for ``row`` now runs on the sparse producer, the only one deeper rounds are
-        admitted for, under Fast Verify, whose verify cost model they rely on."""
+        """Deeper blocks run only on the sparse producer, under Fast Verify's cost model."""
         from .inference import _SparseDrafter
 
         return (self.fast_verify and isinstance(self._draft, _SparseDrafter)
@@ -3183,9 +3151,7 @@ def _warm_trees(engine: SpeculativeEngine, drafter: ContextDrafter) -> None:
 
 
 def warm_speculative_rounds(model) -> None:
-    """Run one round at every verify width a reply can reach, so their first-use work stays out of replies: draft rounds
-    at each depth (deepened where the sparse producer serves it), then timed copy rounds from the trained block's width
-    up, which replies price copies on. A deepening drafter reporting confidences then has its deepened cycles timed."""
+    """Runs one round at every verify width a reply can reach, so first-use work stays out of replies."""
     from .inference import fast_verify_enabled
 
     reference = vars(getattr(model, "language_model", model)).get("_unsloth_warm_drafter")
@@ -3399,9 +3365,8 @@ def _merged_assistant_drafter(path: Path, target: nn.Module, *, lazy: bool, fast
 
 
 def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, fast_verify: bool | None = None, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | AssistantDrafter | None:
-    """A drafter for the target's own MTP head, built in memory from only the MTP tensors of its
-    checkpoint as mlx-vlm's MTP splitter would write it, or from a Gemma 4 assistant merged into it
-    (``_merged_assistant``); None when the checkpoint has neither. ``fast_verify`` as in `companion_drafter`."""
+    """Drafter for the target's own MTP head, or a Gemma 4 assistant merged into it; None when the
+    checkpoint has neither."""
     from mlx_vlm.fp8 import transform_fp8_weights
     from mlx_vlm.speculative.drafters.mtp_split import _is_mlx_safetensors
 

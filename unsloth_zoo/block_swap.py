@@ -354,8 +354,7 @@ def _chunked_commits(block_sizes):
     return out
 
 
-# glibc serves allocations below its mmap threshold (dynamic, up to 32 MiB on 64-bit) from the heap, and free()
-# keeps those pages resident until malloc_trim. Larger ones are mmapped and go back to the OS on free.
+# glibc keeps freed heap pages (below the mmap threshold, max 32 MiB) until malloc_trim.
 _HEAP_MAX_BYTES = 32 * 2**20
 _MALLOC_TRIM = []
 
@@ -807,10 +806,9 @@ class BlockSwap:
         self._peak_devs = sorted({torch.device(dv) for b in self.blocks for dv in (*b.sizes, b.home) if dv is not None
                                   and torch.device(dv).type == "cuda"}, key = lambda d: d.index or 0)
         _begin_host_session()
-        # Host copies freed as each block packs (Linux pageable arena fills block by block; Windows
-        # commits up front, no credit); chunked fallback holds at most one chunk plus the block;
-        # storage credited only if its tensors all lie in one swapped layer (outside aliases keep it
-        # alive).
+        # Host copies freed as blocks pack: Linux pageable arena fills block by block, Windows
+        # commits up front (no credit); chunked fallback holds at most one chunk plus the block;
+        # storage credited only if tensors lie in one swapped layer (outside aliases keep it alive).
         owner = model
         if owner is None:
             try:
@@ -918,8 +916,7 @@ class BlockSwap:
 
             self._arm(forward = True)
             if self._auto:
-                # Fresh allocator peak window before training: the load's peak would hide training
-                # peaks; in-layer temporaries never reach a hook sample.
+                # Reset peak stats before training; the load's peak would hide training peaks.
                 try:
                     for dv in self._peak_devs:
                         torch.cuda.reset_peak_memory_stats(dv)
@@ -1186,8 +1183,7 @@ class BlockSwap:
             self._note_block_peak(b)
         self._fetch(b, steal = True)
         marks = getattr(b, "marks", None)
-        # Samples in flight are kept for _harvest (re-recording loses them); mark_open 1 = waiting,
-        # 2 = full, 3 = wait-only closed (forward hook never ran, events may be in flight).
+        # mark_open 1 waiting, 2 full, 3 wait-only; in-flight samples are kept for _harvest.
         in_flight = marks is not None and (
             (b.mark_open == 2 and not marks[2].query()) or (b.mark_open in (1, 3) and not marks[1].query()))
         if marks is not None and not in_flight:
@@ -1263,8 +1259,7 @@ class BlockSwap:
         def hook(grad):
             if self._auto and not self._settled:
                 self._note_block_peak(self.blocks[i])
-            # Reentrant checkpoint: the input grad can land before a token-id-only branch (Qwen4Exp n-gram keys)
-            # reads its frozen weights, so release only once the inner backward is done.
+            # Reentrant checkpoint: release after the inner backward, not at the input grad.
             task = _graph_task_id()
             if grad is not None and task != -1 and self._forward_task[i] not in (-1, task):
                 try:
@@ -1273,8 +1268,7 @@ class BlockSwap:
                     self._release(self.blocks[i])
             else:
                 self._release(self.blocks[i])
-            # Queue here only when the output's grad hook did not; else a checkpoint replay ends the
-            # step twice.
+            # Queue only if the output's grad hook did not; else a replay ends the step twice.
             if i == 0 and not self._step_queued:
                 self._step_queued = True
                 try:
@@ -1296,8 +1290,7 @@ class BlockSwap:
             if getattr(b, "marks", None) is not None and getattr(b, "mark_open", 0) == 1:
                 b.mark_open = 3
         if self._step_queued:
-            # Clear the mark queued behind deferred releases, so a late _bwd(0) cannot end the step
-            # again.
+            # Clear the queued mark so a late _bwd(0) cannot end the step again.
             try:
                 torch.autograd.Variable._execution_engine.queue_callback(self._clear_step_queued)
             except RuntimeError:
@@ -1309,8 +1302,7 @@ class BlockSwap:
         self._last_peak, self._step_peak = self._step_peak or {}, {}
         self._steps += 1
         if self._steps == 1 and self._tot is not None:
-            # Step 1 includes copies armed at install and warmup: windows start after it. Wait for its events once,
-            # so none of its samples is still pending (and later counted in the first window) when the baseline is set.
+            # Step 1 holds install/warmup copies; wait for them once so windows start after it.
             for dv in {d for d in self.streams if isinstance(d, torch.device) and d.type == "cuda"} | set(self._peak_devs):
                 torch.cuda.synchronize(dv)
             self._harvest()
@@ -1422,11 +1414,10 @@ class BlockSwap:
                             except torch.cuda.OutOfMemoryError:
                                 oom = True
                             if oom:
-                                # Outside the except block, so its traceback no longer holds the decoded region.
-                                # No room for a decoded region beside the weights: decode on the host, upload each.
-                                # The decode streams were drained above, so their staging ring and aux buffers can
-                                # go now (the rest of the restore decodes on the host); empty_cache can then hand
-                                # their memory to the uploads.
+                                # Outside the except block so its traceback drops the region; with
+                                # no room beside the weights, decode on the host and upload each.
+                                # After the decode streams are drained, free their staging ring and
+                                # aux buffers so empty_cache can reclaim them
                                 self._release_decoders()
                                 torch.cuda.empty_cache()
                                 c = b.codec.get(d)
@@ -1550,8 +1541,7 @@ class BlockSwap:
         self._adapt_seen = dict(self._tot)
         busy = d["compute_ms"] + d["stall_ms"]
         stall = d["stall_ms"] / busy if busy > 0 else 0.0
-        # Measured, not predicted: a slot that does not cut the stall (a bus slower than compute, or noise)
-        # is given back, so a slow bus costs one slot for a couple of steps.
+        # A slot that does not cut the stall is given back; a slow bus costs one slot briefly.
         if self._last_stall is not None and stall > 0.75 * self._last_stall:
             self._shrink_pool()
             self.depth -= 1
@@ -1579,8 +1569,7 @@ class BlockSwap:
         # At grad landing only the grad is allocated (loss held output, grad and a same-size temp);
         # node hook, as callers keep only the loss and a tensor hook dies with the output.
         hooks = [(node, out.device, out.nbytes)] if node is not None else []
-        # The loss too: fused cross entropy (Unsloth's) computes it from the hidden states, so returned logits
-        # (UNSLOTH_RETURN_LOGITS=1) need not be its ancestors and backward from the loss never reaches them.
+        # Fused loss from hidden states: UNSLOTH_RETURN_LOGITS=1 logits are not ancestors.
         loss = getattr(output, "loss", None)
         if loss is None and isinstance(output, (tuple, list)) and output and isinstance(output[0], torch.Tensor):
             loss = output[0] if output[0].numel() == 1 else None
@@ -1594,8 +1583,7 @@ class BlockSwap:
                     for dv in homes:
                         self._note_peak(dv, extra = 2 * size if dev is not None and _cuda_index(dv) == _cuda_index(dev)
                                         else 0)
-                    # Queued from the outer graph, so it runs after the whole backward: a reentrant checkpoint's
-                    # inner backward per layer, layers below the first swapped one and a frozen first block included.
+                    # Queued from the outer graph: runs after all reentrant inner backwards.
                     if not self._step_queued:
                         self._step_queued = True
                         torch.autograd.Variable._execution_engine.queue_callback(self._end_step)
@@ -1651,16 +1639,14 @@ class BlockSwap:
             # Between steps the activations are gone; keep room for the next step's peak.
             k = _cuda_index(dv)
             peak = (self._last_peak or {}).get(torch.device(dv).index, 0)
-            # Hook samples miss temporaries made and freed inside a layer or the loss: once the allocator's
-            # high-water mark has risen past where it stood at install, that mark is a real training peak.
+            # Samples miss temporaries; a high-water mark risen past install is a real peak.
             hwm = torch.cuda.max_memory_allocated(dv)
             if self._hwm_fresh or hwm > self._hwm_base.get(k, hwm):
                 peak = max(peak, hwm)
             transient = max(0, peak - torch.cuda.memory_allocated(dv))
             # Still keep a workspace margin for intra-op temporaries the samples cannot see.
             transient += max(_WORKSPACE_MIN_BYTES, int(torch.cuda.get_device_properties(dv).total_memory * _WORKSPACE_FRACTION))
-            # optimizer.step() runs after every peak sample: keep room for AdamW's two moments (lazily allocated on
-            # the first step) and the foreach temporary, as plan_block_swap budgets them.
+            # optimizer.step runs after peak samples; reserve its two moments and foreach temp.
             transient += reserve.get(_cuda_index(dv), 0)
             if _free_device_bytes(dv) - transient < 2 * n:
                 return False
@@ -2148,8 +2134,7 @@ class _HostLoad:
         `size` bytes loaded), since layers can be quantized differently (skip modules) and each later eviction
         re-checks with real sizes."""
         left = [j for j in self.indices if j not in self.done]
-        # The layer being moved first: a storage it shares with a later-loaded selected layer is its own (credited
-        # by the caller), never also counted in cpu_to_come for the other layer.
+        # Shared storages belong to the first-moved layer, never double-counted in cpu_to_come.
         if ref in left:
             left.remove(ref)
             left.insert(0, ref)
@@ -2262,8 +2247,7 @@ class _HostLoad:
                    if p.device.type == "meta" or p.untyped_storage().data_ptr() not in self.moved_storages}
         # Layers still to come are scaled from this one by their meta sizes; the first check runs before any moved.
         size = sum(p.nbytes for p in params if p.device.type != "meta" and id(p) in counted)
-        # The storage ratio compares like with like: the params bind() charged to this layer, loaded vs declared.
-        # A shared weight this layer happens to load first is not in its declared bytes.
+        # Loaded vs declared bytes of params bind() charged here, excluding shared weights.
         owned = self.owned_names.get(i)
         owned_size = size if owned is None else sum(
             p.nbytes for n, p in _counted_named(layer) if n in owned and p.device.type != "meta")

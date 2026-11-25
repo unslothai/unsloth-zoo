@@ -395,8 +395,7 @@ def xet_env_overrides(
 
 
 def xet_log_env(log_dir: "str | Path", *, diagnostics: bool = False) -> dict[str, str]:
-    """Points hf_xet's logger at log_dir (read back via scan_xet_log); the trailing separator makes hf_xet treat it as a
-    directory; diagnostics also enables its CPU/RAM sampler."""
+    """Trailing separator: hf_xet treats log_dir as a dir; diagnostics adds CPU/RAM sampler."""
     log_dir = Path(log_dir)
     env = {
         "HF_XET_LOG_DEST": os.path.join(str(log_dir), ""),
@@ -423,25 +422,10 @@ def apply_xet_env(
     fail_fast: bool = False,
     cache_dir: "Optional[str | Path]" = None,
 ) -> dict[str, str]:
-    """Apply the overrides to *env* (default: ``os.environ``) and return only what was written.
-
-    ``setdefault`` semantics: a user-set variable is left alone, so a shell's
-    ``HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT=16gb`` still wins -- and that now includes
-    ``HF_XET_HIGH_PERFORMANCE``, so our sizing (``_CAPS_VOIDED_BY_HIGH_PERFORMANCE``) stands
-    down and the flag is left alone. Measured on a 192-core / 1996 GiB box, overriding it cost
-    2.55x download throughput (16684 -> 6553 Mbit/s), to defend RAM that machine was never short of.
-    Set ``UNSLOTH_XET_FORCE_CAPS=1`` to get the old behaviour and cap a machine regardless.
-
-    *force* overwrites every variable we would otherwise leave alone. It does not revoke a user-set
-    high-performance flag: that stand-down is our own sizing standing aside, not a default to force
-    through. *fail_fast*
-    defaults to False here, unlike ``xet_env_overrides``, because this runs at import: the shortened
-    timeouts would otherwise apply to every direct ``huggingface_hub`` download and upload in the
-    process, none of which our ladder supervises. Supervised children pass ``fail_fast = True``.
-
-    *cache_dir* is the destination the sized process will pass huggingface_hub; naming it keeps the
-    disk clamp off an unrelated filesystem in both directions.
-    """
+    """Setdefault-style: returns only HF_XET_* vars it wrote to env; user-set
+    HF_XET_HIGH_PERFORMANCE stands our sizing down (overriding it cost throughput) unless
+    UNSLOTH_XET_FORCE_CAPS=1; force overwrites all but that flag; fail_fast defaults False (runs
+    at import); cache_dir scopes the disk clamp."""
     target = os.environ if env is None else env
     overrides = xet_env_overrides(
         profile, throttled = throttled, fail_fast = fail_fast, cache_dir = cache_dir,
@@ -460,8 +444,7 @@ def apply_xet_env(
     primary, alias = XET_HIGH_PERFORMANCE_VARS
     user_wants_hp = _is_true(target[primary]) if primary in target else _is_true(target.get(alias))
     forcing_caps = _is_true(os.environ.get("UNSLOTH_XET_FORCE_CAPS"))
-    # Either the user's flag wins and our sizing stands down, or the caps win and the flag is turned off (xet-core <= 1.6
-    # would otherwise void them); overwritable lists the values we may replace when already set.
+    # User flag wins and we stand down; else it is turned off, as xet-core <= 1.6 voids caps.
     overwritable: tuple = ()
     if user_wants_hp and not forcing_caps:
         for var in (*XET_HIGH_PERFORMANCE_VARS, *_CAPS_VOIDED_BY_HIGH_PERFORMANCE):
@@ -505,8 +488,7 @@ _LOG_ERROR_RE = re.compile(r'"level"\s*:\s*"(ERROR|WARN)"', re.IGNORECASE)
 
 
 def scan_xet_log(log_dir: "Optional[str | Path]", *, max_messages: int = 5) -> list[str]:
-    """Up to max_messages ERROR/WARN lines from hf_xet's json logs in log_dir, to explain a quiet Xet failure;
-    best-effort: a missing or unreadable directory yields an empty list, never an exception."""
+    """Up to max_messages ERROR/WARN hf_xet log lines; best-effort, [] on any read failure."""
     if not log_dir:
         return []
     try:

@@ -169,7 +169,6 @@ def compute_fused_ce_loss(
     ignore_index = int(kwargs.get("ignore_index", -100))
     device = lm_head_weight.device
     if shift_labels:
-        # Get shifted labels first
         _labels = torch.empty_like(labels, device = device)
         _labels[..., :-1] = labels[..., 1:]
         _labels[..., -1] = ignore_index
@@ -206,7 +205,6 @@ def _logits_ce_loss(logits, labels, n_items, kwargs):
         logits = logits.to(torch.promote_types(logits.dtype, logits_bias.dtype)) + logits_bias
     vocab_size = logits.shape[-1]
 
-    # Apply softcapping and other functions
     logit_scale_multiply = kwargs.get("logit_scale_multiply", None)
     logit_scale_divide = kwargs.get("logit_scale_divide", None)
     logit_softcapping = kwargs.get("logit_softcapping", None)
@@ -255,8 +253,7 @@ def _free_target_gb(device = None):
     the same bug again, one module over.
     """
 
-    # Absolute import, not `from ..memory_budget`: transformers' dynamic_module_utils joins the raw regex capture onto this
-    # directory and looks for fused_losses/.memory_budget.py, so remote-code saves walking this graph fail.
+    # Absolute import: relative imports break remote-code saves via dynamic_module_utils.
     from unsloth_zoo.memory_budget import _default_target_gb  # noqa: PLC0415  (avoids an import cycle)
 
     return min(_default_target_gb(device), _CE_TARGET_GB_CAP)
@@ -312,7 +309,6 @@ def get_chunk_size(bsz, qlen, vocab_size, target_gb = None, fixed_gb = 0.0, devi
 pass
 
 class UnslothFusedLoss(torch.autograd.Function):
-    # Log the "scaling=0" info message at most once per process.
     _scaling_zero_logged = False
 
     @staticmethod
@@ -351,11 +347,9 @@ class UnslothFusedLoss(torch.autograd.Function):
         # Thread ignore_index through label-shift and the inner CE call.
         ignore_index = int(extra_kwargs.get("ignore_index", -100))
 
-        # Get shifted labels first
         if shift_labels:
             _labels = torch.empty_like(labels, device = device)
             _labels[..., :-1] = labels[..., 1:]
-            # Also check mask
             if mask is not None:
                 mask = mask.to(device = device)
                 _labels[..., :-1][mask[..., 1:] == 0] = ignore_index
@@ -368,7 +362,6 @@ class UnslothFusedLoss(torch.autograd.Function):
             labels = labels.contiguous().view(-1).to(device = device)
         pass
 
-        # N items divisor
         divisor = n_items if n_items is not None else (labels != ignore_index).sum()
         if not torch.is_tensor(divisor):
             # torch.full is a fill kernel; torch.tensor(..., device = cuda) is a blocking H2D copy.
@@ -376,12 +369,10 @@ class UnslothFusedLoss(torch.autograd.Function):
         # Counteract DataParallel having multiple items since it does scatter & gather
         if divisor.numel() != 1: divisor = divisor.ravel()[0]
         divisor = _nonzero_count(divisor.to(dtype = torch.float32, device = device))
-        # Check what needs gradients
         lm_head_requires_grad = lm_head_weight is not None and lm_head_weight.requires_grad
         lm_head_bias_requires_grad = lm_head_bias is not None and lm_head_bias.requires_grad
         vocab_size = lm_head_weight.shape[0]
 
-        # Create backwards output
         grad_inputs = None
         if compute_gradients:
             grad_inputs = torch.empty_like(hidden_states, device = device) if not overwrite else hidden_states
@@ -398,7 +389,6 @@ class UnslothFusedLoss(torch.autograd.Function):
         bsz, qlen, hd = hidden_states.shape
         # 0-dim, not a [0] view: MoE forwards on transformers 4.x add their aux loss in place.
         accumulated_loss = torch.zeros((), device = device)
-        # Chunk hidden_states and labels
         if "n_chunks" in extra_kwargs:
             n_chunks = extra_kwargs.pop("n_chunks")
         else:
@@ -549,7 +539,6 @@ class UnslothFusedLoss(torch.autograd.Function):
                 _FUSED_CE_COMPILE_SUPPORTED = False
                 accumulate_chunk = uncompiled_accumulate_chunk
 
-        # Probe path: first-ever forward pass, test if compiled version works
         if _FUSED_CE_COMPILE_SUPPORTED is None and torch_compile and \
             accumulate_chunk is not uncompiled_accumulate_chunk:
 
@@ -595,7 +584,6 @@ class UnslothFusedLoss(torch.autograd.Function):
                     shift_labels = shift_labels,
                     **extra_kwargs,
                 )
-            # Process remaining chunks via fast path
             for (grad_inputs_j, hidden_states_j, labels_j,) in _iter:
                 accumulate_chunk(
                     n_chunks = n_chunks,
@@ -612,7 +600,6 @@ class UnslothFusedLoss(torch.autograd.Function):
                     **extra_kwargs,
                 )
         else:
-            # Fast path: compile status already known, original main branch loop
             for (grad_inputs_j, hidden_states_j, labels_j,) in \
                 zip(__grad_inputs, __shift_states, __shift_labels,):
                 accumulate_chunk(
@@ -715,8 +702,7 @@ class UnslothFusedLoss(torch.autograd.Function):
         return (None, grad_inputs, grad_lm_head, grad_lm_head_bias, None, None, None, None, None, None, None, None, None, None,)
 pass
 
-# Resolved once at import, not per call: under torch.compile dynamo ignores functools.cache, traces inspect.signature
-# and graph-breaks, since it cannot key a dict on or getattr an autograd.Function.
+# Resolved at import: torch.compile ignores functools.cache; inspect.signature graph-breaks.
 _FUSED_LOSS_PARAMETERS, _FUSED_LOSS_DEFAULTS = _get_mapping(UnslothFusedLoss)
 
 # torch 2.11 alone traces UnslothFusedLoss into a graph that saves zero gradients (right loss, nothing trains).
@@ -1181,9 +1167,8 @@ def unsloth_fused_ce_loss(
     if TARGET_GB: target_gb = float(TARGET_GB)
     elif N_CHUNKS: kwargs["n_chunks"] = max(int(N_CHUNKS), 1)
 
-    # Move hidden_states to lm_head's device (multi-GPU device_map balanced): torch.func.grad_and_value fails with
-    # 'Cannot access storage of TensorWrapper' across devices; autograd tracks .to() and returns gradients to the
-    # original device.
+    # Move hidden_states to lm_head's device (multi-GPU): torch.func.grad_and_value fails with
+    # 'Cannot access storage of TensorWrapper'; autograd .to() returns grads to original device.
     device = lm_head_weight.device
     if hidden_states.device != device:
         hidden_states = hidden_states.to(device = device)

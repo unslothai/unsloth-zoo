@@ -110,8 +110,7 @@ MHC_PROJECTION_REWRITES = (
 )
 
 
-# Unsloth's native DeepSeek-V4.1 (unsloth/models/deepseek_v41/modeling.py): the reference order, projection first and
-# the one RMS statistic of the flattened streams applied after it (inference/model.py:953-956), local `eps`.
+# Per inference/model.py:953-956: projection, then one RMS stat on flattened streams; local eps
 MHC_NATIVE_SINKHORN_SOURCE = (
     "        comb = comb / (comb.sum(dim = -2, keepdim = True) + eps)\n"
     "        for _ in range(self.sinkhorn_iters - 1):\n"

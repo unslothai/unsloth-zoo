@@ -141,8 +141,7 @@ def model_16bit_bytes(model):
     return model_logical_numel(model) * 2
 
 
-# Effective GGUF bits per weight, incl. embedding and output tensors kept at higher precision; llama.cpp's nominal bpw
-# rounded up where mixed types make it model dependent, since under-estimating costs the whole export.
+# Effective bpw incl. embedding/output; mixed types round up: underestimating costs the export.
 GGUF_BITS_PER_WEIGHT = {
     "f32": 32.0,
     "f16": 16.0,
@@ -177,7 +176,6 @@ GGUF_BITS_PER_WEIGHT = {
     "iq1_s": 1.56,
 }
 
-# The friendly aliases unsloth accepts, mapped onto what actually gets written.
 GGUF_QUANT_ALIASES = {
     "not_quantized": "f16",
     "fast_quantized": "q8_0",

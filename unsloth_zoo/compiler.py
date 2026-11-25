@@ -106,7 +106,6 @@ try:
 except:
     ScriptFunction = None
 
-# Compiled cache location
 global COMBINED_UNSLOTH_NAME
 COMBINED_UNSLOTH_NAME = "unsloth_compiled_module"
 
@@ -121,7 +120,6 @@ if "UNSLOTH_COMPILE_LOCATION" not in globals():
 global UNSLOTH_COMPILE_USE_TEMP
 UNSLOTH_COMPILE_USE_TEMP = False
 
-# Disable some compilations if old versions are seen
 OLD_TORCH_VERSION = Version(torch.__version__) < Version("2.5.0")
 
 # device capability
@@ -823,7 +821,6 @@ pass
 
 """
 
-# Patch Layernorm, Conv
 _patch_functions = [
     "Conv1d",
     "Conv2d",
@@ -863,7 +860,6 @@ def make_no_update_causal_mask(original):
     return _update_causal_mask
 
 
-# Patch SDPA
 _SYMBOOL_IS_CAUSAL = re.compile(
     r"^(?P<pad>[ \t]*)is_causal = (?P<b>bool\()?(?P<mask>[A-Za-z_][A-Za-z0-9_]*) is None and "
     r"(?P<len>[A-Za-z_][A-Za-z0-9_]*) > 1(?(b)\))[ \t]*$",
@@ -1549,7 +1545,6 @@ def fix_attention_dtype_consistency(source):
 pass
 
 
-# Use float32 for layernorms if we find evidence for it
 def higher_precision_layernorms(modeling_file):
     norm_modules = list(
         re.finditer(
@@ -1565,8 +1560,7 @@ def higher_precision_layernorms(modeling_file):
         return modeling_file
     norm_module = norm_modules[0]
     start, end = norm_module.span(0)
-    # The match runs into the next class's name, so searching from its end overshoots by one class;
-    # the regex guarantees a later top-level class, so -1 is only future proofing.
+    # Search from start + 1: match runs into the next class; regex guarantees a later class.
     end = modeling_file.find("\nclass", start + 1)
     if end == -1: end = len(modeling_file)
     norm_module = modeling_file[start:end]
@@ -2097,8 +2091,7 @@ def _replace_compiled_cache_file(function_location, new_write_bytes):
         dir = directory,
     )
     try:
-        # Write via the descriptor, not by reopening the name: mkstemp settles who created the file, and reopening would
-        # put the write and mode wherever the name resolves by then.
+        # Write via the mkstemp descriptor; reopening could misplace the write and mode.
         with os.fdopen(descriptor, "wb") as file:
             descriptor = None
             file.write(new_write_bytes)
@@ -5816,7 +5809,6 @@ def fixup_dropped_logit_scale(source, module = None):
     )
 
 
-# Pre fix up some modules like Gemma3n
 def fixup_fused_lm_head(source):
     # PaliGemma (transformers 5.23): the softcap is read through getattr, since PaliGemma 1's Gemma text config has
     # none. Keep the getattr (a plain attribute read raises there) in the space-free form the softcap pattern takes.
@@ -6224,8 +6216,7 @@ def patch_output_capture_targets(modeling_file, replacement_classes=None):
 
 def calls_output_capture_target(init, source, target_names):
     """Detect direct calls to submodules targeted by Transformers output hooks."""
-    # A forward decorated with @capture_outputs installs the hooks itself, even
-    # when its captured submodules are built indirectly (e.g. via helpers).
+    # @capture_outputs installs the hooks itself, even if submodules are built indirectly.
     if re.search(r"^\s*@capture_outputs\b", source, flags=re.MULTILINE):
         return True
     for target_name in target_names:
@@ -6353,9 +6344,7 @@ def _dtype_safe_forward(original_forward, is_conv, disable, is_batchnorm = False
         return original_forward(self, tensor, *rest, **kwargs).to(original_dtype)
 
     forward.__unsloth_dtype_wrapped__ = True
-    # `disable` is baked into the closure above, so a later load in the same
-    # process with the other setting needs a new wrapper built from the same
-    # original rather than one stacked on this one.
+    # `disable` is baked into the closure; a same-process reload wraps the original, not this.
     forward.__unsloth_dtype_disable__ = disable
     forward.__unsloth_dtype_original__ = original_forward
     return forward
@@ -6598,8 +6587,7 @@ def _reconcile_lora_forwards():
 
 # model_location -> {(dict name or None, key): original}, recorded before the first replacement.
 _MODELING_FILE_ORIGINALS = {}
-# model_location -> _compiled_source_key() of its last pass. Not a module attribute:
-# dir(modeling_file) feeds an unstable argsort, so one more name reorders the imports.
+# model_location -> _compiled_source_key(); not an attribute: dir() argsort reorders imports.
 _MODELING_FILE_KEYS = {}
 
 

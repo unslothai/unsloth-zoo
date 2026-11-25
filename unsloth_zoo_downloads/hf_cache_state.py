@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Sparse-aware introspection of the active HF_HUB_CACHE (on-disk bytes, .incomplete partials) for the stall watchdog;
-snapshot_dir_is_complete is conservative: a false complete would let a load fetch over un-killable Xet."""
+"""Stall-watchdog view of HF_HUB_CACHE; a false complete lets loads fetch over un-killable Xet."""
 
 from __future__ import annotations
 
@@ -236,8 +235,7 @@ def _is_canonical_component_shard_index(name: str) -> bool:
 
 
 def _component_index_weight_probe(index_name: str, dir_rel: str) -> "Optional[str]":
-    """Component-relative weight path a shard index enumerates, keeping its base, format and variant so ignore globs
-    (unet/diffusion_pytorch_model*) match; None if not an index."""
+    """Component-relative weight path of a shard index, variant kept for globs; else None."""
     m = _COMPONENT_SHARD_INDEX_RE.match(index_name)
     if m is None:
         return None
@@ -504,16 +502,14 @@ def _canonical_root_weights_complete(
     index_by_read = {_index_weight_probe(e.name): e for e in root_indices}
     st_index = index_by_read.get("model.safetensors")
     bin_index = index_by_read.get("pytorch_model.bin")
-    # Mirrors transformers' local precedence (single safetensors, safetensors index, single bin, bin index): a complete
-    # single weight beats a stale index, and an incomplete preferred safetensors index is not masked by a complete .bin;
-    # ignored formats are skipped.
+    # Mirrors transformers' precedence (safetensors, its index, bin, bin index): a complete single
+    # weight beats a stale index; an incomplete safetensors index is not masked by .bin.
     if "model.safetensors" in root_files and _read_format_kept("model.safetensors", ignore_patterns):
         return True
     if st_index is not None and _read_format_kept("model.safetensors", ignore_patterns):
         return _weight_shard_index_complete(st_index)
     if prefer_safetensors and _read_format_kept("model.safetensors", ignore_patterns):
-        # Strict gate: safetensors is preferred but absent, and a bin-only cache cannot prove it absent remotely, so a
-        # default load would fetch it over Xet; defer.
+        # Strict: bin-only cache can't prove safetensors absent; defer (else load fetches Xet).
         return False
     if "pytorch_model.bin" in root_files and _read_format_kept("pytorch_model.bin", ignore_patterns):
         return True
@@ -549,8 +545,7 @@ def snapshot_dir_is_complete(
     )
 
 
-# sentence-transformers modules.json types: weightless (pooling, normalize, layernorm, dropout) vs weight-bearing
-# (dense, cnn, lstm), matched on the final dotted component.
+# ST modules.json types matched on final dotted component: weightless vs weight-bearing sets.
 _ST_WEIGHTLESS_MODULE_TYPES = frozenset({"pooling", "normalize", "layernorm", "dropout"})
 _ST_WEIGHTED_MODULE_TYPES = frozenset({"dense", "cnn", "lstm"})
 
@@ -601,8 +596,7 @@ def _sentence_transformers_subfolder_incomplete(
         st_present = "model.safetensors" in names and st_read
         bin_present = "pytorch_model.bin" in names and bin_read
         if prefer_safetensors and st_read:
-            # When safetensors is read and not ignored, a bin-only subfolder cannot prove the preferred safetensors
-            # absent remotely, so defer (the load would fetch it over Xet).
+            # Bin-only subfolder can't prove safetensors absent; defer (else load fetches Xet).
             if not st_present:
                 return True
             continue
@@ -672,7 +666,6 @@ def _has_incomplete_variant_root_shards(
                 else:
                     has_bin_shard = True
         elif dot_infix in name and _ROOT_MODEL_VARIANT_WEIGHT_RE.match(name):
-            # a single-file ROOT model variant weight (model.<variant>.safetensors / .bin).
             if _safe_is_file(entry) and _read_format_kept(name, ignore_patterns):
                 if name.endswith(".safetensors"):
                     has_single_st = True
@@ -740,8 +733,7 @@ def _index_shard_rel_paths(index_path: Path, dir_rel: str) -> "Optional[list]":
 
 
 def _index_shard_probe(index_name: str, dir_rel: str) -> "Optional[str]":
-    """Representative first-shard path (index base + format under dir_rel) for a malformed index, so filters judge the
-    weight not the .json name; None if unrecognized."""
+    """First-shard path for a malformed index (filters judge the weight, not .json); else None."""
     for marker, ext in ((".safetensors.index.", "safetensors"), (".bin.index.", "bin")):
         if marker in index_name:
             base = index_name.split(marker, 1)[0]
@@ -828,7 +820,6 @@ def _selected_shard_index_incomplete(
                 continue
             ckpt_dirs = [p for p in rel.split("/")[:-1] if _CHECKPOINT_DIR_RE.match(p)]
             if ckpt_dirs and not _request_scopes_into_dir(allow_patterns, ckpt_dirs[0]):
-                # Skips leftover checkpoint subtrees unless the request allow scopes into one.
                 continue
             if not _filter_paths([rel], allow_patterns, ignore_patterns):
                 continue  # the load does not read this shard (out of scope / ignored format)

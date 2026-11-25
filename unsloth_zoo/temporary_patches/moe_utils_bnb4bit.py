@@ -75,7 +75,6 @@ __all__ = [
 
 
 # ============================================================================
-# Detection
 # ============================================================================
 
 def _is_bnb4bit_param(param) -> bool:
@@ -133,7 +132,6 @@ def _log_unhandled_expert_module_once(module_name: str, module: nn.Module):
 
 
 # ============================================================================
-# Quantization of oversized expert stacks
 # ============================================================================
 
 # bitsandbytes counts elements with a signed 32-bit int inside the 4-bit
@@ -242,7 +240,6 @@ def _make_expert_params4bit(value, **kwargs):
 
 
 # ============================================================================
-# Dequantization
 # ============================================================================
 
 def _dequantize_4bit_in_slices(weight):
@@ -350,7 +347,6 @@ def _dequantize_bnb4bit_expert_weights_once(weight, target_dtype):
 
 
 # ============================================================================
-# Forward dispatcher
 # ============================================================================
 
 _LOGGED_BACKENDS = set()
