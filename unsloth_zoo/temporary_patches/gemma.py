@@ -577,6 +577,9 @@ def patch_Gemma3TextScaledWordEmbedding():
             weight = self.weight,
             padding_idx = self.padding_idx,
         )
+        # Forced float32 loads never keep bf16 weights; a bf16 one is a model loaded outside Unsloth in this process.
+        if self.weight.dtype == torch.bfloat16:
+            return input_embeds * self.embed_scale.to(self.weight.dtype)
         return input_embeds.to(torch.float32) * self.embed_scale
     pass
     _patch_forced_float32(transformers.models.gemma3.modeling_gemma3.Gemma3TextScaledWordEmbedding, "forward", forward, fullgraph = True)
@@ -630,11 +633,18 @@ def patch_Gemma3RMSNorm():
         flatten_for_elementwise_norm = flatten_for_elementwise_norm,
         unwrap_norm_weight           = unwrap_norm_weight,
         _gemma3_rms_norm_float32     = _gemma3_rms_norm_float32,
+        _gemma3_rms_norm_generic     = _gemma3_rms_norm_generic,
     )
 
     def forward(self, x): # x can be fp32 (from embeddings) or fp16 (from MLP/Attn)
         x_2d, shape = flatten_for_elementwise_norm(x)
-        out = _gemma3_rms_norm_float32(x_2d, unwrap_norm_weight(self.weight), self.eps)
+        weight = unwrap_norm_weight(self.weight)
+        # Forced float32 loads keep norm weights in float32. A bf16 weight is a model loaded outside
+        # Unsloth later in this process; the class patch is global, so keep its dtype (else fp16 hits a bf16 lm_head).
+        if weight.dtype == torch.bfloat16:
+            out = _gemma3_rms_norm_generic(x_2d, weight, self.eps)
+        else:
+            out = _gemma3_rms_norm_float32(x_2d, weight, self.eps)
         return out.reshape(shape)
     pass
     # No `fullgraph`: the kernel is the compiled unit; compiling this wrapper too
