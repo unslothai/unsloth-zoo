@@ -14,10 +14,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A plain transformers bf16 Gemma 3 built after an fp16 (forced float32) Unsloth load must keep bf16 activations.
+"""A plain transformers bf16 / fp32 Gemma 3 built after an fp16 (forced float32) Unsloth load must keep its dtype.
 
 The forced float32 patches live on the shared transformers classes and nothing reruns them for a model loaded
-without Unsloth, so the final RMSNorm used to emit fp16 into the bf16 lm_head (inference and generate crashed)."""
+without Unsloth, so the final RMSNorm used to emit fp16 into the bf16 / fp32 lm_head (inference and generate crashed)."""
 
 import json
 import os
@@ -38,6 +38,7 @@ import unsloth_zoo.temporary_patches.gemma as gemma_patches
 from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
 
 flags = json.loads(sys.argv[1])
+dtype = getattr(torch, sys.argv[2])
 patches = [p for p in TEMPORARY_PATCHES if getattr(p, "__module__", "") == gemma_patches.__name__]
 for flag in flags:
     os.environ["UNSLOTH_FORCE_FLOAT32"] = flag
@@ -53,7 +54,7 @@ config = Gemma3TextConfig(
 )
 config._attn_implementation = "sdpa"
 torch.manual_seed(0)
-model = Gemma3ForCausalLM(config).to(torch.bfloat16)
+model = Gemma3ForCausalLM(config).to(dtype)
 ids = torch.randint(0, config.vocab_size, (2, 12))
 result = {}
 try:
@@ -66,14 +67,17 @@ try:
 except Exception as exception:
     result["error"] = f"{type(exception).__name__}: {exception}"
 
-# The forced path itself is unchanged: a float32 norm weight (what a forced float32 load keeps) still emits fp16.
-norm = modeling.Gemma3RMSNorm(32).to(torch.float32)
-result["forced_norm_dtype"] = str(norm(torch.randn(2, 3, 32)).dtype)
+# The forced path itself is unchanged: a forced float32 load keeps norms fp16, or fp32 pinned by
+# `_pre_set_compute_dtype` (UNSLOTH_HIGH_PRECISION_LAYERNORM), and both still emit fp16.
+pinned = modeling.Gemma3RMSNorm(32).to(torch.float32)
+pinned._pre_set_compute_dtype = torch.float32
+half = modeling.Gemma3RMSNorm(32).to(torch.float16)
+result["forced_norm_dtypes"] = [str(pinned(torch.randn(2, 3, 32)).dtype), str(half(torch.randn(2, 3, 32)).dtype)]
 print("RESULT " + json.dumps(result))
 """
 
 
-def _run(flags):
+def _run(flags, dtype):
     env = dict(
         os.environ, CUDA_VISIBLE_DEVICES = "", UNSLOTH_IS_PRESENT = "1",
         UNSLOTH_ZOO_DISABLE_GPU_INIT = "1", TORCHDYNAMO_DISABLE = "1",
@@ -82,7 +86,7 @@ def _run(flags):
     for key in ("UNSLOTH_FORCE_FLOAT32", "UNSLOTH_MODEL_NAME"):
         env.pop(key, None)
     proc = subprocess.run(
-        [sys.executable, "-c", SCRIPT, json.dumps(flags)],
+        [sys.executable, "-c", SCRIPT, json.dumps(flags), dtype],
         capture_output = True, text = True, timeout = 900, env = env,
     )
     lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
@@ -95,13 +99,15 @@ def _needs_gemma3():
     pytest.importorskip("transformers.models.gemma3.modeling_gemma3")
 
 
-def test_plain_bf16_gemma3_after_forced_float32_patches():
-    fresh = _run([])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
+def test_plain_gemma3_after_forced_float32_patches(dtype):
+    fresh = _run([], dtype)
     assert "error" not in fresh, fresh
-    after = _run(["1"])
+    after = _run(["1"], dtype)
     assert "error" not in after, after["error"]
-    assert after["logits_dtype"] == "torch.bfloat16"
-    assert after["hidden_dtypes"] == ["torch.bfloat16"]
+    assert after["logits_dtype"] == f"torch.{dtype}"
+    assert after["hidden_dtypes"] == [f"torch.{dtype}"]
+    assert after["forced_norm_dtypes"] == ["torch.float16", "torch.float16"]
     # MLP / attention keep their forced float32 internals, so only bf16 rounding separates the two.
     assert abs(after["loss"] - fresh["loss"]) < 1e-2 * abs(fresh["loss"])
     max_diff = max(abs(a - b) for a, b in zip(after["logits"], fresh["logits"]))

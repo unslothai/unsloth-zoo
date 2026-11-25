@@ -639,12 +639,14 @@ def patch_Gemma3RMSNorm():
     def forward(self, x): # x can be fp32 (from embeddings) or fp16 (from MLP/Attn)
         x_2d, shape = flatten_for_elementwise_norm(x)
         weight = unwrap_norm_weight(self.weight)
-        # Forced float32 loads keep norm weights in float32. A bf16 weight is a model loaded outside
-        # Unsloth later in this process; the class patch is global, so keep its dtype (else fp16 hits a bf16 lm_head).
-        if weight.dtype == torch.bfloat16:
-            out = _gemma3_rms_norm_generic(x_2d, weight, self.eps)
-        else:
+        # A forced float32 load leaves norm weights fp16, or fp32 pinned by `_pre_set_compute_dtype`
+        # (UNSLOTH_HIGH_PRECISION_LAYERNORM, set for every Gemma 3 load). Any other norm belongs to a model
+        # loaded without Unsloth later in this process; the class patch is global, so it keeps the input
+        # dtype as transformers does (else fp16 meets its bf16 / fp32 lm_head).
+        if weight.dtype == torch.float16 or getattr(self, "_pre_set_compute_dtype", None) is torch.float32:
             out = _gemma3_rms_norm_float32(x_2d, weight, self.eps)
+        else:
+            out = _gemma3_rms_norm_generic(x_2d, weight, self.eps)
         return out.reshape(shape)
     pass
     # No `fullgraph`: the kernel is the compiled unit; compiling this wrapper too
