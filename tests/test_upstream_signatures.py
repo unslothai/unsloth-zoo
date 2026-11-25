@@ -82,7 +82,12 @@ def _assert_params_superset(
 ):
     """Asserts every name in required is a parameter of func; upstream may add params but must not drop one zoo forwards by name."""
     got = _param_names(func)
-    missing = [name for name in required if name not in got]
+    # transformers 5.24 renamed past_key_values to cache: patch_function adapts the keyword and
+    # @deprecate_kwarg renames it on calls, so a stock `cache` still serves zoo's past_key_values.
+    missing = [
+        name for name in required
+        if name not in got and not (name == "past_key_values" and "cache" in got)
+    ]
     if missing:
         pytest.fail(
             f"DRIFT DETECTED: {zoo_callsite}: "

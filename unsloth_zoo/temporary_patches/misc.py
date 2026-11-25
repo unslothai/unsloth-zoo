@@ -692,7 +692,7 @@ _SKIP_RIGHT_PADDING_MASK_ENV = "UNSLOTH_SKIP_RIGHT_PADDING_MASK"
 # Any other non-None argument (or/and_mask_function, encoder_hidden_states, ...) keeps the mask.
 _PLAIN_CAUSAL_MASK_ARGUMENTS = frozenset((
     "config", "inputs_embeds", "input_embeds", "attention_mask", "cache_position",
-    "past_key_values", "position_ids", "layer_idx", "allow_is_causal_skip",
+    "past_key_values", "cache", "position_ids", "layer_idx", "allow_is_causal_skip",
 ))
 
 
@@ -930,6 +930,12 @@ def _maskless_causal_arguments(signature, args, kwargs):
         return None
     if os.environ.get(_SKIP_CAUSAL_MASK_ENV, "1") == "0":
         return None
+    parameters = signature.parameters
+    if "past_key_values" in kwargs and "cache" in parameters:
+        # transformers 5.24 renamed the factories' past_key_values to cache; the old name is a deprecated
+        # alias (5.24.1 lists it keyword-only, while `cache` stays required).
+        kwargs = dict(kwargs)
+        kwargs.setdefault("cache", kwargs.pop("past_key_values"))
     try:
         bound = signature.bind(*args, **kwargs)
     except TypeError:
@@ -958,7 +964,7 @@ def _maskless_causal_arguments(signature, args, kwargs):
         return None
     if getattr(config, "is_causal", True) is not True:
         return None
-    if arguments.get("past_key_values", None) is not None:
+    if arguments.get("past_key_values", None) is not None or arguments.get("cache", None) is not None:
         return None
     embeds = arguments.get("inputs_embeds", arguments.get("input_embeds", None))
     if not isinstance(embeds, torch.Tensor) or embeds.ndim != 3:
