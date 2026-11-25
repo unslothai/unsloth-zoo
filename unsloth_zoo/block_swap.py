@@ -577,9 +577,6 @@ class _Block:
             if not all(r is not None for r in refs):
                 raise RuntimeError("Unsloth: offload_layers found a layer only partly spilled to disk.")
             self.set_disk(refs)
-            for p in self.params:
-                # From here the block owns the weight's disk copy; a later restore gives back real data.
-                del p._unsloth_disk
 
     def set_disk(self, refs):
         """Serve this block from the spill file: one O_DIRECT read when the file holds the slot layout as is."""
@@ -1088,6 +1085,12 @@ class BlockSwap:
                     self._hwm_fresh = True
                 except Exception:
                     self._hwm_fresh = False
+            # Installed: the blocks own the disk copies now. Until here a failed install keeps every load-time
+            # spill tagged, so a retry still finds it instead of reading the placeholders as weights.
+            for b in self.blocks:
+                if b.disk is not None:
+                    for p in b.params:
+                        p.__dict__.pop("_unsloth_disk", None)
         except Exception:
             self.remove()
             raise
@@ -1658,6 +1661,7 @@ class BlockSwap:
                         # One block at a time from the spill file, straight onto its card.
                         for p, t in zip(b.params, b.disk_views(b.devices[0])):
                             p.data = t
+                            p.__dict__.pop("_unsloth_disk", None)
                     elif getattr(b, "codec", None) and b.compressed():
                         # Decoded on the card one region at a time, then each weight gets its own storage; with
                         # no room for a decoded region next to the weights, decoded on the host instead.

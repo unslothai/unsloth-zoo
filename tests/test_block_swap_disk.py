@@ -348,3 +348,39 @@ def test_interrupted_forward_then_reset_stays_bitwise(monkeypatch):
     sw.reset()
     _equal(ref, _train(layers))
     sw.remove()
+
+
+@_cuda
+def test_failed_install_keeps_load_time_spills_for_a_retry(monkeypatch):
+    """An install that fails after a load-time spill leaves the layers recoverable: a retry still reads them from
+    disk instead of taking the placeholders for weights."""
+    base = _stack()
+    ref = _train(copy.deepcopy(base))
+    layers = copy.deepcopy(base)
+    for p in layers.parameters():
+        p.requires_grad_(False)
+    state = _mod._HostLoad(9, "tail")
+    state.layers, state.indices = layers, _mod.swap_indices(len(layers), 9, "tail")
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", str(_limit_for(base, 2)))
+    for i in state.indices:
+        state.evict(i)
+    for name, p in layers.named_parameters():
+        p.requires_grad_("lora_" in name)
+    # Host RAM shrank between load and install: not even the staging ring fits, so the install refuses.
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", "4096")
+    with pytest.raises(ValueError):
+        BlockSwap(layers, state.indices, prefetch_depth = 1, placement = "tail")
+    real = _mod.BlockSwap._pack
+
+    def boom(self):
+        raise RuntimeError("install failed")
+    # Room again, but the install fails later (after the checks): rolled back, still recoverable.
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_HOST_LIMIT", str(_limit_for(base, 2)))
+    monkeypatch.setattr(_mod.BlockSwap, "_pack", boom)
+    with pytest.raises(RuntimeError, match = "install failed"):
+        BlockSwap(layers, state.indices, prefetch_depth = 1, placement = "tail")
+    monkeypatch.setattr(_mod.BlockSwap, "_pack", real)
+    sw = BlockSwap(layers, state.indices, prefetch_depth = 1, placement = "tail")
+    assert sw.stats()["disk_layers"] >= len(state.disk)
+    _equal(ref, _train(layers))
+    sw.remove()
