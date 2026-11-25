@@ -420,6 +420,53 @@ def patch_cpu_sdpa_gqa():
     return True
 
 
+def _lora_input_cast_is_undone(layer, x, dtype):
+    """True when lora_A would only cast x back: a bf16 / fp16 CPU input, fp32 adapters, CPU autocast in x's dtype,
+    and only vanilla adapters behind an identity dropout (DoRA and friends read the fp32 input themselves)."""
+    if not isinstance(x, torch.Tensor) or dtype != torch.float32 or x.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    if x.device.type != "cpu" or not torch.is_autocast_enabled("cpu") or torch.get_autocast_dtype("cpu") != x.dtype:
+        return False
+    variants = getattr(layer, "lora_variant", None) or {}
+    dropouts = getattr(layer, "lora_dropout", None)
+    lora_A = getattr(layer, "lora_A", None)
+    if dropouts is None or lora_A is None:
+        return False
+    for adapter in layer.active_adapters:
+        if adapter not in lora_A:
+            continue
+        if adapter in variants or type(lora_A[adapter]) is not torch.nn.Linear or \
+                type(dropouts[adapter]) is not torch.nn.Identity:
+            return False
+    return True
+
+
+def patch_peft_lora_autocast_input():
+    """PEFT's LoRA Linear casts its input to the adapter dtype (fp32) before lora_A, and under CPU bf16 / fp16
+    autocast lora_A casts it straight back: two activation-sized copies per LoRA module in the forward and two more
+    in the backward, for the same bits (the round trip is exact). Skip the cast exactly when autocast would undo it.
+    Idempotent; returns True when installed."""
+    try:
+        from peft.tuners.lora.layer import Linear as LoraLinear
+    except Exception:
+        return False
+    original = getattr(LoraLinear, "_cast_input_dtype", None)
+    if original is None:
+        return False
+    if getattr(original, "_unsloth_cpu", False):
+        return True
+
+    @functools.wraps(original)
+    def _cast_input_dtype(self, x, dtype):
+        if _lora_input_cast_is_undone(self, x, dtype):
+            return x
+        return original(self, x, dtype)
+
+    _cast_input_dtype._unsloth_cpu = True
+    LoraLinear._cast_input_dtype = _cast_input_dtype
+    return True
+
+
 class _Bf16StoredLinearFunction(torch.autograd.Function):
     """F.linear with a frozen bf16 weight upcast per call; saves the bf16 weight, backward is dX = dY @ W."""
 
