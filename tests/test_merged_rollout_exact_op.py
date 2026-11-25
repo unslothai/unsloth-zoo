@@ -115,7 +115,6 @@ def run_compiled(device):
             folded = (W.float() + (B.double() @ A.double() * 0.5).float()).to(W.dtype)
             y, status = fn(W, A, B)
             assert torch.equal(_bits(W), _bits(W0)), (backend, n, k)
-            # The traced region saw the folded weight.
             assert abs(float(y) - float(folded.float().sum())) <= 1e-2 * max(1.0, abs(float(y))), (backend, n, k)
             assert int(status[0]) > 0
         if backend == "count":

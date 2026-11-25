@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Checkpoint replay of an MoE block must route to the same experts as the no-grad first pass; block
-compile's rounding can flip top-k choices, so the toy router flips in grad mode."""
+"""Replay must match the no-grad pass's experts; compile rounding can flip top-k in grad mode."""
 
 import os
 
@@ -215,8 +214,7 @@ def test_same_set_gradient_matches_the_fixed_expert_oracle_fp64():
 
 
 def test_changed_set_sends_no_gradient_to_a_replay_only_expert_fp64():
-    """Review repro: forward picks experts [0, 1], a 2e-7 nudge makes the replay pick [0, 2]. The replay's weights are
-    normalized over expert 2, which the loss never used, so no router gradient may come from them."""
+    """A 2e-7 nudge makes replay pick expert 2, unused by the loss: no router gradient from it."""
     logits = torch.tensor([[1.0, 0.5, 0.5 - 1e-7]], dtype = torch.float64)
     idx0, w0 = _softmax_topk_renorm(logits, 2)
     assert idx0.tolist() == [[0, 1]]
@@ -272,8 +270,7 @@ def test_compiled_replay_reuses_first_pass_routing(backend):
 
 
 def test_probe_forward_inside_trial_does_not_store():
-    """Block compile's grad-mode trial runs inside the first pass, and the LoRA stash probe inside it runs a no_grad
-    throwaway forward: a suspended frame keeps that routing (the grad graph's) out of the replay."""
+    """A suspended frame keeps the no_grad LoRA probe run inside the grad trial out of replay."""
     torch.manual_seed(0)
     x = torch.randn(T, H)
     layer = ToyMoE(0)

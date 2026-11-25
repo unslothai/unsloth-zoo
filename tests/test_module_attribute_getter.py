@@ -165,7 +165,6 @@ def test_a_unicode_named_submodule_resolves():
         assert _get_module_attribute(model, path) is oracle, path
     # The dotted-index spelling too, which eval could never parse at all.
     assert _get_module_attribute(model, "层.0") is model.层[0]
-    # And the subscript is still digits only.
     for hostile in ("层[x]", "层[0+0]", "层[-1]", "层['a']"):
         try:
             _get_module_attribute(model, hostile)

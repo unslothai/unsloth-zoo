@@ -68,7 +68,6 @@ def test_trainer_logps_are_biased_by_kept_mass(top_p, top_k, min_p):
 
     full = torch.log_softmax(logits / temperature, dim = -1)
     kept_mass = torch.logsumexp(full.masked_fill(~torch.isfinite(processed), float("-inf")), dim = -1)
-    # vLLM's logp exceeds the trainer's by exactly -log(kept mass) on every sampled token.
     torch.testing.assert_close(vllm_logps - trainer_logps, -kept_mass, atol = 1e-4, rtol = 0)
     assert (vllm_logps - trainer_logps).mean() > 0.01
 
@@ -325,8 +324,7 @@ def test_kill_switch_loss_and_gradient_are_the_full_vocabulary_ones(monkeypatch,
     ([[4.0, 0.0, -1.0]], 0, 0.1),    # min_p leaves one token
 ], ids = ["top_k_1", "min_p_singleton"])
 def test_singleton_kept_set_gradient_per_setting(monkeypatch, logits, top_k, min_p):
-    # A kept set of one token renormalises to log 1 = 0, so scoring over it gives zero policy gradient whatever the
-    # advantage (as in TRL >= 1.17); =0 keeps the full-vocabulary signal.
+    # Singleton kept set: log 1 = 0, zero gradient (TRL >= 1.17); =0 keeps full-vocab signal.
     logits = torch.tensor(logits, dtype = torch.float64)
     ids = torch.tensor([0])
     processed = _vllm_processed_logprobs(logits, 1.0, top_k, 1.0, min_p)

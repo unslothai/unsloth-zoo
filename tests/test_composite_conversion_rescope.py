@@ -100,7 +100,6 @@ def composite_model():
 def test_prefixed_pattern_keeps_an_anchor_anchored():
     assert rescope._prefixed_pattern("^model.", "model.language_model") == \
         "^model.language_model.model."
-    # and does not invent one
     assert rescope._prefixed_pattern("gate.", "model.language_model") == \
         "model.language_model.gate."
 
@@ -163,7 +162,6 @@ def test_rescoped_renaming_reproduces_the_doubled_prefix():
     source, target = rescope._patterns(scoped)
     assert source[0] == "^model.language_model.model.language_model."
     assert target[0] == "model.language_model.model."
-    # and it is inert on the real keys, which is the whole point
     for key in sample:
         renamed, _ = scoped.rename_source_key(key)
         assert renamed == key
@@ -264,7 +262,6 @@ def test_repair_detection_sees_both_packages_marks():
     setattr(unsloth_marked, "_unsloth_patched_composite_prefix_renaming", True)
     assert rescope._repair_already_installed(unsloth_marked) is True
 
-    # Under a wrapper that publishes __wrapped__.
     def on_top():
         pass
     on_top.__wrapped__ = unsloth_marked
@@ -278,10 +275,8 @@ def test_repair_detection_sees_both_packages_marks():
 
 
 def test_the_moe_wrapper_does_not_hide_the_repair_from_either_probe():
-    """Regression: the MoE wrapper, outermost with no link down from pass 1, hid the repair from
-    _composite_renaming_repair_installed on transformers 5.5.4; pass 2 then stacked a second rescope."""
-    # Use importorskip, not a bare import: transformers 4.x (4.57.6 CI lane) has no conversion_mapping, so a bare import
-    # was a collection-time ModuleNotFoundError.
+    """Regression: MoE wrapper hid the repair from the probes on transformers 5.5.4."""
+    # Use importorskip: transformers 4.x (4.57.6) has no conversion_mapping; bare import fails.
     cm = pytest.importorskip("transformers.conversion_mapping")
     moe = pytest.importorskip("unsloth_zoo.temporary_patches.moe_utils_bnb4bit")
     patch_bnb4bit_model_conversion_mapping = moe.patch_bnb4bit_model_conversion_mapping
@@ -387,8 +382,7 @@ def test_repair_probe_never_raises_without_transformers(monkeypatch):
 
 
 def test_the_sweep_leaves_a_wrapper_it_does_not_supersede(monkeypatch):
-    """The sweep rebinds from-import aliases, which hold the function object, but must not overwrite
-    a third-party wrapper there, since that silently drops its behaviour."""
+    """Sweep must not overwrite third-party wrappers in from-import aliases (silently dropped)."""
     conversion_mapping = _requires_submodule_extraction()
     if rescope._transformers_rescopes_submodule_prefix_renamings():
         pytest.skip("this transformers carries the upstream fix; the re-scope declines")

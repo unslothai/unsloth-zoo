@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""llama.cpp has no bitsandbytes dequantizer and refuses only after reading the model, so the guard
-must fire before the subprocess; the detector recurses into VLM sub-configs."""
+"""Guard must precede llama.cpp (no bnb dequantizer, refuses late); recurses VLM sub-configs."""
 
 import ast
 from pathlib import Path

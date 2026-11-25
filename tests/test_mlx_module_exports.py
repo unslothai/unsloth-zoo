@@ -164,8 +164,7 @@ def test_trainer_config_smoke():
     assert ok
 
 
-# Warm-start contract: from_pretrained's docstring must say the reload restores non-adapter tensors recorded as
-# trainable in a save_trainable_adapters checkpoint, rather than promising an adapter-only trainable set.
+# Docstring must say reloads restore non-adapter trainables from save_trainable_adapters.
 
 def test_from_pretrained_documents_restored_non_adapter_trainables():
     import inspect

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pins the pip-cache contract: actions/setup-python's built-in cache: pip must not be used, since a pull_request-ref
-cache is restorable only by that PR and competes with main's 20 GiB budget; re-adding it looks right in review."""
+"""No setup-python built-in pip cache: PR-scoped caches compete with main's 20 GiB budget."""
 
 import re
 import fnmatch

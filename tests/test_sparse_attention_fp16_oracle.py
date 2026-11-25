@@ -146,8 +146,7 @@ def _check_backward_precision_fp32(mk, shape, seed):
         msg = (f"d{d} s{s} seed{seed} {name}: kernel max {e_max:.3e} mean {e_mean:.3e} | designed max {d_max:.3e} "
                f"mean {d_mean:.3e} | fp32-torch max {t_max:.3e} | |ref| {scale_r:.3e}")
         if name == "dsink":
-            # dsink = -sum p_sink * delta is reduced in torch; delta comes from the fp16 output by design, so its
-            # error is fp16-level relative to |dsink| (measured <= 8e-4 relative).
+            # Delta comes from the fp16 output by design, so the dsink error is fp16-level.
             assert e_max <= 2 * _F16_EPS * max(scale_r, 1.0), msg
             continue
         assert e_max <= 1.25 * d_max, msg

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Guards that unsloth_zoo.tokenizer_utils imports and runs patch_tokenizer without torch; a
-top-level `import torch` or `@torch.inference_mode` would break the MLX tokenizer path."""
+"""Keep tokenizer_utils torch-free: top-level import torch or @torch.inference_mode breaks MLX."""
 
 import subprocess
 import sys

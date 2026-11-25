@@ -32,7 +32,6 @@ except ModuleNotFoundError:  # Python 3.10
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Import name -> distribution name, where they differ.
 DISTRIBUTION = {"PIL": "pillow"}
 
 # Imported at module level but deliberately undeclared: each is a hard requirement of the declared dependency that guarantees it, not a resolver accident.

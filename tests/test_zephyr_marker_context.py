@@ -1,6 +1,5 @@
-"""Zephyr role markers are not special tokens, so get_chat_template_parts needs context-aware auto-detect: it probes
-leading-newline candidates and prefers ones matching at least twice in a 3-turn probe; skips when no offline
-tokenizer or unsloth_zoo is available."""
+"""Zephyr markers are not special tokens: auto-detect probes leading-newline candidates, prefers
+ones matching at least twice in a 3-turn probe; skips without offline tokenizer or unsloth_zoo."""
 import pytest
 
 # unsloth_zoo is imported lazily in _setup(): its __init__ raises ImportError without the separate unsloth package, which would break collection.
@@ -99,8 +98,7 @@ def test_zephyr_autodetects_context_dependent_markers():
 
 
 def test_zephyr_first_user_turn_variant_not_picked():
-    # The '<|user|>' plus newline marker matches ONLY at text start; a single text-start match must not beat 2+ mid-text
-    # matches or later user turns get trained.
+    # Text-start '<|user|>' must not beat 2+ mid-text matches, or later user turns get trained.
     tok, get_chat_template_parts, train_on_responses_only = _setup()
     tok.chat_template = ZEPHYR
     ins, _ = get_chat_template_parts(tok)

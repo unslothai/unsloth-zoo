@@ -512,11 +512,9 @@ def test_our_own_partial_is_cleared_even_with_the_table_unreadable(monkeypatch, 
 
 
 def test_a_writer_busy_in_another_repo_does_not_shield_this_one(monkeypatch, tmp_path):
-    """Partials are etag-named; identical files collide across repos; bare-name match lets another
-    repo's live writer shield this repo's dead partial, forcing a repo-wide force_download."""
+    """Another repo's live writer on the same etag must not shield this repo's dead partial."""
     _build_cache(tmp_path, partial_age_s = 1800.0)
     stale = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
-    # The same etag, in a different repo's cache, with a live writer on it.
     elsewhere = tmp_path / "models--acme--twin" / "blobs"
     elsewhere.mkdir(parents = True)
     (elsewhere / stale).write_bytes(b"\xa5" * 64)
@@ -629,8 +627,7 @@ def test_a_baseline_scan_that_failed_is_unknown_rather_than_empty(tmp_path, monk
 
 
 def test_a_link_that_stops_dangling_before_the_unlink_is_left_alone(monkeypatch, tmp_path):
-    """A link resolving before the unlink is kept, as old revision links are not recreated, breaking
-    later offline loads; a partial beside the target means a download."""
+    """Old revision links are not recreated, so a link that resolves again must be kept."""
     monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
     snap = _build_cache(tmp_path, partial_age_s = 5.0)
     blobs = tmp_path / REPO_DIR / "blobs"
@@ -661,8 +658,7 @@ def test_a_link_that_stops_dangling_before_the_unlink_is_left_alone(monkeypatch,
 
 
 def test_a_nonce_suffixed_partial_still_says_the_blob_is_being_written(monkeypatch, tmp_path):
-    """Hub writes a process-unique `<etag>.<nonce>.incomplete` then renames (huggingface_hub PR 4228: a shared name
-    corrupts the cache where flock silently succeeds); the exact name alone misses live partials."""
+    """Per-process nonce partials (huggingface_hub PR 4228) are missed by the exact name."""
     monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
     snap = _build_cache(tmp_path, partial_age_s = 5.0)
     blobs = tmp_path / REPO_DIR / "blobs"
@@ -823,8 +819,7 @@ def test_an_orphan_snapshot_link_is_cleared_instead_of_forcing_the_whole_repo(
     orphan.symlink_to(os.path.relpath(blobs / _blob_name("tokenizer.model"), snap))
     assert orphan.is_symlink() and not orphan.exists()
 
-    # Uses the module handle loaded hermetically, not a package import: unsloth_zoo/__init__ raises without the separate
-    # unsloth install, which CI installs only best-effort.
+    # Load by handle: unsloth_zoo/__init__ raises without unsloth; CI installs it best-effort.
     assert hcs.has_active_incomplete_blobs("model", REPO, cache_dir = str(tmp_path)) is True
     before = _identity(tmp_path)
 
@@ -841,9 +836,7 @@ def test_an_orphan_snapshot_link_is_cleared_instead_of_forcing_the_whole_repo(
 
 
 def test_a_dangling_link_whose_partial_is_still_being_written_is_kept(monkeypatch, tmp_path):
-    """A dangling link whose `.incomplete` partner may still be running is kept: hub creates the link on finalise, so
-    removing it loses a file a live writer is about to complete; while the partial survives, a repo-wide force is
-    right anyway."""
+    """A dangling link with a live `.incomplete` partner is kept: hub creates links on finalise."""
     stranger = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
     monkeypatch.setattr(
         xf, "_partial_paths_with_a_live_writer", lambda: {_held(tmp_path, stranger)}
@@ -1117,8 +1110,7 @@ def _confirmation(monkeypatch, *, names, active):
 
 
 def test_a_cache_that_cannot_be_read_after_the_clear_does_not_release_the_force(monkeypatch):
-    """has_active_incomplete_blobs swallows OSError, so an unreadable or unmounted cache answers False like a clean one
-    and releases the force; HTTP then resumes the partial, finalizing it under its sha256."""
+    """Unreadable cache must not lift the force: has_active_incomplete_blobs swallows OSError."""
     assert _confirmation(monkeypatch, names = None, active = False) is False
 
 
@@ -1149,8 +1141,7 @@ def test_the_release_after_the_scoped_clear_asks_the_confirmation_probe():
 
 
 def test_a_sibling_that_reopened_our_partials_name_is_not_unlinked(monkeypatch, tmp_path):
-    """The older hub's deterministic `<etag>.incomplete` can be recreated by a sibling after our purge, so the captured
-    basename may name someone else's open download."""
+    """Older hub's `<etag>.incomplete` may be recreated by a sibling; the name may be theirs."""
     _build_cache(tmp_path, partial_age_s = 5.0)
     mine = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
     reopened = tmp_path / REPO_DIR / "blobs" / mine
@@ -1246,8 +1237,7 @@ def test_a_reopened_owned_name_is_spared_when_the_walk_cannot_see_every_writer(
 
 
 def test_a_sibling_container_on_a_shared_volume_keeps_its_reopened_name(monkeypatch, tmp_path):
-    """Privacy checks only UIDs; a sibling container shares our UID in another namespace, so a shared volume passes
-    `_cache_is_private_to_this_user` yet the sibling is invisible, and an empty writer set is no evidence."""
+    """Privacy checks UIDs only, so a sibling container with our UID is invisible, not empty."""
     _build_cache(tmp_path, partial_age_s = 5.0)
     mine = _blob_name(IN_FLIGHT) + xf.INCOMPLETE_SUFFIX
     monkeypatch.setattr(xf, "_partial_paths_with_a_live_writer", lambda: set())
@@ -1353,7 +1343,6 @@ def test_a_process_of_our_own_that_nothing_can_describe_raises_the_age_bar(
     assert xf._unowned_partials_safe_to_clear("model", REPO, str(tmp_path), 180.0, None) == set()
     assert xf._live_writer_walk_missed_our_own_uid() is True
 
-    # The same partial once it is genuinely stale clears, so the fix still works here.
     blobs = tmp_path / REPO_DIR / "blobs"
     old = time.time() - 4000.0
     os.utime(blobs / partial, (old, old))

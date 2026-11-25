@@ -88,8 +88,7 @@ def test_gate_gradient_skipped_when_router_frozen():
 
 
 def test_matches_autograd_with_zero_gate():
-    # A zero or sub-floor routing weight must still get the true gradient <Y, dOut>; the call site sign-floors the gate
-    # away from zero (straight-through), and multiply and divide share it so the floor cancels
+    # Zero/sub-floor routes get true <Y, dOut>; the straight-through floor cancels in mul/div
     torch.manual_seed(3)
     inter0 = torch.randn(12, 16)
     gate0 = torch.randn(12) * 0.5
@@ -114,8 +113,7 @@ def test_matches_autograd_with_zero_gate():
 
 
 def test_fp16_gate_floors_in_fp32_without_output_leak():
-    # fp16 gates are floored in fp32 (eps 1e-12), not at fp16's smallest normal (~6e-5), which would
-    # leak eps*|Y| into masked routes; mirrors the upcast in forward_native_grouped_mm.
+    # fp32 floor (eps 1e-12), not fp16's ~6e-5 normal: it would leak eps*|Y| into masked routes
     torch.manual_seed(5)
     gate16 = torch.rand(8, dtype=torch.float16) * 0.5
     gate16[0] = 0.0
@@ -134,7 +132,6 @@ def test_fp16_gate_floors_in_fp32_without_output_leak():
     leak = out[0].abs().max().item()
     assert leak < 1e-10, leak
 
-    # The zero route still gets its true gradient <Y, dOut>.
     dOut = torch.randn(8, 10)
     out.backward(dOut)
     ref = ((inter[0] @ W2) * dOut[0]).sum()

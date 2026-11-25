@@ -214,7 +214,6 @@ def test_auto_inside_the_block_tiles_only_when_it_pays(in_unsloth_block, monkeyp
     x = torch.randn(1, 64, H, requires_grad = True)
     _, breaks = _run(block, x)
     assert seen == [] and breaks == 0
-    # Same rows once the estimated saving clears the floor: tiled, and still one graph.
     monkeypatch.setattr(R, "AUTO_MIN_SAVING_MIB", 0)
     monkeypatch.setattr(R, "AUTO_MIN_SAVING_FRACTION", 0.0)
     torch._dynamo.reset()
@@ -246,7 +245,6 @@ def test_shared_adapters_over_different_weights_keep_the_tile_frame_route(in_uns
 
 
 def test_parameter_hooks_run_once(in_unsloth_block):
-    # A register_hook on a parameter runs once, on the op's returned gradient, not once per tile as well.
     torch.manual_seed(0)
     mlp = _LoraMLP()
     ref = copy.deepcopy(mlp)

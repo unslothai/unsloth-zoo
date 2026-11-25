@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Patches a torch ConfigModule key for one test; not monkeypatch.setattr, since pytest >= 9.2 reads
-the old value from __dict__, where such keys never live, so undo calls delattr, hiding the key
-from torch for the rest of the process; later torch.compile fails with
-'torch._dynamo.config.suppress_errors does not exist'."""
+"""Patches one torch ConfigModule key for a test; not monkeypatch.setattr: pytest >= 9.2 reads old
+values from __dict__, where such keys never live, so undo's delattr hides the key process-wide,
+and later torch.compile fails ('torch._dynamo.config.suppress_errors does not exist')."""
 
 
 def patch_torch_config(request, config, name, value):

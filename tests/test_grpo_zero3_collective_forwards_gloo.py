@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSpeed ZeRO-3 GRPO: grpo_forwards_are_collective knew only FSDP2, so ranks with longer
-sequences ran extra forwards and hung all-gathers."""
+"""grpo_forwards_are_collective must detect ZeRO-3, else uneven-length ranks hang all-gathers."""
 
 from __future__ import annotations
 

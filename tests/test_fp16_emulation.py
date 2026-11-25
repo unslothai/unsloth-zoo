@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests for the dormant float16 matmul emulation; the key property is that the unscaled split collapses at small
-magnitudes (float16 5-bit exponent), and test_unscaled_underflows_at_small_magnitude fails if that cliff is absent."""
+"""Dormant float16 emulation: unscaled split collapses at small magnitudes (5-bit exponent)."""
 import os
 import sys
 
@@ -103,7 +102,6 @@ def test_scaled_split_holds_ieee_parity(magnitude):
     split = _rel_l2(fp16_split_mm(A, B, scale = True), ref)
     direct = _rel_l2(_fp16_direct(A, B), ref)
 
-    # Within 2x of IEEE, and far better than plain float16.
     assert split < ieee * 2.0, f"scaled split {split:.3e} vs ieee {ieee:.3e}"
     assert split < direct / 10.0, f"scaled split {split:.3e} vs float16 {direct:.3e}"
 

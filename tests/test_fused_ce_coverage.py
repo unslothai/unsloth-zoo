@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Checks fused CE coverage on installed transformers against tests/fused_ce_coverage.json; recorded classes that fused
-must still fuse; new non-fusing classes are reported, not failed."""
+"""Recorded fused classes must still fuse; new non-fusing classes are reported, not failed."""
 import json
 import os
 import subprocess

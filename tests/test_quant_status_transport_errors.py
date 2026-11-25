@@ -171,8 +171,7 @@ def test_a_mangled_proxy_response_on_the_download_raises(monkeypatch):
     pytest.param("<html>proxy error</html>",  "proxy-page", id = "proxy-error-page"),
 ])
 def test_a_config_that_cannot_be_parsed_raises(monkeypatch, tmp_path, body, label):
-    """A downloaded config that cannot be parsed must raise: (False, None) would skip the nf4/fp4 guard and merge 16bit
-    over quantized weights; a proxy HTML error page lands here."""
+    """Unparseable config must raise: (False, None) skips the nf4/fp4 guard and merges 16bit."""
     blob = tmp_path / "config.json"
     blob.write_text(body, encoding = "utf-8")
     _patch_ls_present(monkeypatch)
@@ -258,8 +257,7 @@ def _require_a_case_sensitive_filesystem(tmp_path):
 def test_local_4bit_still_resolves_when_only_the_config_fetch_fails(
     monkeypatch, tmp_path, save_method,
 ):
-    """A config fetch failure with ls succeeding must reach the same local fallback as a total outage, since both 4bit
-    merges fold LoRA into weights already in memory."""
+    """A failed config fetch must fall back like an outage; 4bit merges fold LoRA in memory."""
     directory = _make_local_model(
         tmp_path.joinpath(*_ON_DISK),
         quant_config = {"load_in_4bit": True, "bnb_4bit_quant_type": "nf4"},
@@ -368,8 +366,7 @@ def test_a_disabled_repo_is_not_announced_as_a_connectivity_problem(monkeypatch)
 def test_the_download_is_addressed_as_a_repo_and_a_revision(
     monkeypatch, given, expected_repo, expected_revision,
 ):
-    """hf_hub_download rejects hf://ns/name and ns/name@dev with HFValidationError, which the absent set would read as
-    unquantized; pass repo_id and revision separately."""
+    """hf_hub_download's HFValidationError reads as unquantized; pass repo_id and revision."""
     seen = {}
 
     def fake_download(*args, **kwargs):

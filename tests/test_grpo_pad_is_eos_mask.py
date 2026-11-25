@@ -285,7 +285,6 @@ def test_packed_forward_scores_the_kept_eos(monkeypatch):
 
 
 def test_stored_old_logps_keep_the_eos_on_later_iterations(monkeypatch):
-    # With store_old_logps, a second num_iterations pass must keep the same mask and EOS slot.
     input_ids = _batch(EOS)
     store = {"old_logps_from_new": True, "store_old_logps": True}
     trainers = []

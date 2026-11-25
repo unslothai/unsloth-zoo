@@ -64,7 +64,6 @@ def test_matches_reference(B, D, T, W, L, dtype, bias, act):
     ref_state = state.clone()
     ref = gcc.causal_conv1d_update_reference(x, ref_state, w, b, act)
     ours = gcc.triton_causal_conv1d_update(x, state, w, b, act)
-    # The new state is a copy of inputs: exact.
     assert torch.equal(state, ref_state)
     assert ours.shape == ref.shape and ours.dtype == ref.dtype
     if dtype == torch.float32:
@@ -182,10 +181,8 @@ def test_cached_launch_matches_reference_over_many_steps(monkeypatch, dtype):
         ours = gcc._try_fast_update(x, state, w, b, "silu")
         assert ours is not None and ours.stride() == x.stride()
         assert torch.equal(state, ref_state), step
-        # Same kernel either way: the cached launch is bitwise the full launch.
         assert torch.equal(ours, full), step
         assert _rel(ours, ref) < (1e-5 if dtype == torch.float32 else 5e-3), step
-    # One plan for the repeated shape, and the cached launcher is used only where it was verified.
     assert len(gcc._update_plans) == 1
     assert gcc._fast_launch_mode == ("all" if gcc._triton_launcher_verified() else False)
 
@@ -272,8 +269,7 @@ def test_counters_untouched_while_tracing(monkeypatch):
 
 
 def test_legacy_module_globals_rebound():
-    # transformers 4.57.6 qwen3_next: module global is None unless the package is imported; the layer copies
-    # causal_conv1d_update or torch_causal_conv1d_update at __init__.
+    # 4.57.6 qwen3_next: module global is None unless imported; layer copies it at __init__.
     legacy = types.ModuleType("transformers.models.qwen3_next.modeling_qwen3_next")
     legacy.causal_conv1d_fn = None
     legacy.causal_conv1d_update = None
@@ -334,11 +330,9 @@ def test_patch_rebinds_real_update_and_package_wins(hub_kernels, monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.version, "hip", None)
 
-    # A usable causal_conv1d package wins: nothing is rebound.
     monkeypatch.setattr(gcc, "_real_causal_conv1d_available", lambda: True)
     gcc.patch_gdn_causal_conv1d()
     assert not gcc._is_marked(modeling.causal_conv1d_update)
-    # Kill switch: nothing is rebound either.
     monkeypatch.setattr(gcc, "_real_causal_conv1d_available", lambda: False)
     monkeypatch.setenv(gcc._KILL_SWITCH, "1")
     gcc.patch_gdn_causal_conv1d()

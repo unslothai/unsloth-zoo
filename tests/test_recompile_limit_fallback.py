@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Cache exhaustion must slow a run, not end it: patch_function(..., fullgraph=True) raises FailOnRecompileLimitHit,
-which the wrapper handles by going eager; a genuine graph break still raises."""
+"""fullgraph=True: exhaustion (FailOnRecompileLimitHit) runs eager; real graph breaks raise."""
 
 import contextlib
 import sys
@@ -207,8 +206,7 @@ def test_compiled_callable_stays_reachable():
 
 
 def test_no_wrapper_when_torch_exposes_no_such_errors(monkeypatch):
-    # Compiled fn is returned as is only if recompile, checkpoint-hook and Inductor errors are
-    # empty.
+    # Returned as is only if recompile, checkpoint-hook and Inductor errors are empty.
     import unsloth_zoo.temporary_patches.utils as u
     monkeypatch.setattr(u, "_recompile_limit_errors", lambda: ())
     monkeypatch.setattr(u, "_disabled_hook_graph_break_error", lambda: ())
@@ -246,9 +244,8 @@ def test_the_dynamo_limit_keys_exist_on_this_torch():
     "recompile_limit reached",
 ])
 def test_cache_exhaustion_reported_as_a_bare_unsupported_falls_back(message):
-    """torch 2.4 has no cache-limit exception: convert_frame ends that branch in unimplemented, so exhaustion arrives as
-    a plain Unsupported and re-raising ends the run; 2.5 and 2.6 reach the same unimplemented with
-    skip_code_recursive_on_cache_limit_hit off."""
+    """torch 2.4 has no cache-limit exception: exhaustion is a plain Unsupported, so re-raising ends
+    the run; 2.5-2.6 reach the same only with skip_code_recursive_on_cache_limit_hit off."""
     from torch._dynamo.exc import Unsupported
     c, e, calls = _pair(Unsupported(message))
     w = _fall_back_to_eager_on_recompile_limit(c, e, "M.forward")
@@ -374,8 +371,7 @@ def test_a_torch_without_the_flag_still_falls_back():
 
 
 def test_an_unrelated_error_from_the_retry_is_not_swallowed():
-    """Only recompile-limit failures may reach eager: a model error in the single bumped retry would otherwise run the
-    call twice, reapply mutations and bury the error."""
+    """Only recompile-limit errors go eager; a model error in a retry would run the call twice."""
     calls = {"c": 0, "e": 0}
     boom = RuntimeError("a real model failure, not a compiler one")
 
@@ -425,8 +421,7 @@ def test_the_recompile_budget_is_bounded_and_handed_back():
 
 
 def test_exhausting_the_budget_takes_the_other_borrowers_with_it():
-    """Wrappers that borrowed from an exhausted budget switch together, since one checkpointed region spans several
-    patched functions; a wrapper that never borrowed stays compiled."""
+    """Borrowers switch together (one checkpoint spans many fns); non-borrowers stay compiled."""
     from unsloth_zoo.temporary_patches import utils as u
 
     borrower_calls = {"c": 0, "e": 0}
@@ -473,8 +468,7 @@ def _dead_ref():
 
 
 def test_a_collected_borrower_does_not_strand_the_raised_limit():
-    """A bumped wrapper dropped before the step boundary must still settle: the registry holds it weakly, and an early
-    return would leave torch._dynamo.config raised for the process."""
+    """A collected bumped wrapper must still settle, or torch._dynamo.config stays raised."""
     from unsloth_zoo.temporary_patches import utils as u
     import torch._dynamo.config as config
 
@@ -553,8 +547,7 @@ def _isolated_budget():
     saved_orig = dict(u._ORIGINAL_RECOMPILE_LIMITS)
     saved_bumped = dict(u._BUMPED_RECOMPILE_LIMITS)
     saved_registry = list(u._EAGER_FALLBACK_WRAPPERS)
-    # A wrapper run inside a real checkpoint sets the flags saved below; only a settled boundary clears them. Left true,
-    # _give_up re-raises in every later test instead of falling back, reading as a broken kernel elsewhere.
+    # Flags left true make _give_up re-raise in later tests; a settled boundary clears them.
     saved_packed = u._PACKED_COMPILED_IN_CHECKPOINT
     saved_raised = u._RAISED_INSIDE_CHECKPOINT
     u._GLOBAL_BUMPS, u._ORIGINAL_RECOMPILE_LIMITS = 0, {}
@@ -748,8 +741,7 @@ def _reset_bump_state(U):
     # Same scoping rule for the labels the give-up decision now lives in.
     U._LATCHED_EAGER_LABELS -= set(_OUR_LABELS)
     U._PENDING_EAGER_LABELS -= set(_OUR_LABELS)
-    # Clearing the bookkeeping alone left a real bump standing: an exhausted wrapper raised both budgets by 16 before
-    # signalling, so later tests ran against enlarged limits and could stop reaching the exhaustion they test.
+    # Clearing only bookkeeping leaves real bumps; later tests would see the enlarged limits.
     for name, value in _PRISTINE_LIMITS.items():
         setattr(cfg, name, value)
 
@@ -854,8 +846,7 @@ def test_the_early_stop_signal_is_resolvable():
 
 
 def test_early_stop_counts_as_a_finished_retry():
-    """_StopRecomputationError from checkpoint's recompute hook is a finished retry, not a failure: releasing the bump
-    and re-raising reset the counters, letting variants borrow past both caps."""
+    """_StopRecomputationError is a finished retry; releasing the bump lets borrows pass caps."""
     U = _utils()
     errs = U._checkpoint_early_stop_errors()
     if not errs:
@@ -907,8 +898,7 @@ def test_a_hidden_branch_survives_restoring_a_visible_one():
 
 
 def test_the_allowance_counts_what_is_actually_in_effect():
-    """The allowance counts the chain depth under the live value: zeroing it let scoped patches re-borrow everything,
-    while counting every recorded branch starved wrappers of budget."""
+    """Allowance counts chain depth as in effect; zeroing it let scoped patches re-borrow all."""
     import torch._dynamo.config as cfg
     U = _utils()
     name = _limit_names()[0]
@@ -1026,8 +1016,7 @@ def test_the_reset_helper_puts_the_real_budgets_back():
 
 
 def test_giving_up_ends_the_step_when_an_earlier_layer_packed_compiled():
-    """Give-up must end the step if an earlier layer packed compiled, since a checkpointed forward returns before
-    backward and _in_non_reentrant_checkpoint() then reads False; eager recompute aborts or gives wrong grads."""
+    """Give-up must end the step if an earlier layer packed compiled (eager recompute aborts)."""
     U = _utils()
     _reset_bump_state(U)
     U._PACKED_COMPILED_IN_CHECKPOINT = False
@@ -1206,8 +1195,7 @@ def test_an_uninspectable_accessor_that_raises_still_latches():
 
 
 def test_an_unsettled_boundary_says_so(caplog):
-    """apply_pending_eager_fallbacks dropped its settlement result, so an unsettled boundary looked
-    clean."""
+    """apply_pending_eager_fallbacks must log an unsettled boundary, not report it clean."""
     import logging
     U = _utils()
     real = U._saved_tensor_hook_accessor
@@ -1236,8 +1224,7 @@ def test_a_settled_boundary_is_quiet(caplog):
 
 
 def test_a_user_hook_above_the_checkpoints_does_not_hide_it():
-    """The accessor sees only the top hook, so a save_on_cpu or saved_tensors_hooks entered inside the region must not
-    hide the checkpoint beneath it; else give-up recomputes an earlier compiled activation eagerly."""
+    """Top-hook accessor: a user save_on_cpu hook must not hide the checkpoint beneath it."""
     U = _utils()
     def _mine(*a, **k): ...
     _mine.__qualname__ = "save_on_cpu.<locals>.pack_to_cpu"
@@ -1449,8 +1436,7 @@ def test_the_probe_does_not_walk_the_stack_under_inference_mode():
 
 
 def test_the_probe_still_fires_with_grad_off_inside_a_function_forward():
-    """Do not gate the probe on is_grad_enabled(): autograd.Function.forward runs with grad off, and Unsloth's gradient
-    checkpointing is such a Function, so gating skipped the probe."""
+    """Probe must not gate on is_grad_enabled(); autograd.Function.forward runs with grad off."""
     with _pre_2_8_probe(lambda: True) as (U, calls):
 
         class _Region(torch.autograd.Function):
@@ -1470,8 +1456,7 @@ def test_the_probe_still_fires_with_grad_off_inside_a_function_forward():
 
 
 def test_the_probe_stops_walking_after_a_step_of_fruitless_walks():
-    """Without non-reentrant checkpointing the marker never latches, so with no accessor the walk would run on every
-    call; the probe stops after a per-step miss budget."""
+    """Marker latches only under non-reentrant checkpointing; the probe caps walks per step."""
     with _pre_2_8_probe(lambda: False) as (U, calls):
         for _ in range(U._CHECKPOINT_PROBE_MISS_BUDGET * 4):
             U._note_packed_under_checkpoint()

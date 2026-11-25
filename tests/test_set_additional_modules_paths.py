@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Tests the set_additional_modules key walk, which replaced exec: each key tries both candidates
-(leading model. consumed, or as is) and handles numeric segments like a.0.weight, which exec
-rejects; CPU-only, network-free."""
+"""Tests set_additional_modules key walk: each key tries both candidates (model. prefix consumed or
+as is), and numeric segments like a.0.weight, which exec rejects; CPU-only, network-free."""
 
 import pytest
 import torch

@@ -62,7 +62,6 @@ def test_payload_cannot_reach_a_module_path(model_type):
     assert not re.fullmatch(r"[a-z0-9_.]+", location), location
 
 
-# --- the compiled-cache filename ---------------------------------------------
 
 @pytest.mark.parametrize("name", [
     "../../../etc/passwd",
@@ -91,7 +90,6 @@ def test_legitimate_generated_module_names_accepted(name):
     assert re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
 
 
-# --- no legitimate model_type may be rejected --------------------------------
 
 def test_every_shipped_model_type_passes_the_sink_guard():
     """Emitted model types must pass the sink guard, or real models stop loading."""

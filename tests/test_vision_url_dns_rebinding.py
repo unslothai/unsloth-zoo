@@ -427,7 +427,6 @@ def test_a_missing_or_foreign_pin_is_refused_rather_than_resolved_again():
     with pytest.raises(ValueError, match="nothing pins"):
         pinned_class("images.invalid")._new_conn()
 
-    # A host that is not the one checked, a proxy hop for instance
     token = vision_utils._PINNED_ADDRESSES.set((("example.invalid",), (PUBLIC_IP,)))
     try:
         with pytest.raises(ValueError, match="checked host was"):

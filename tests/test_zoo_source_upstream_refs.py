@@ -17,7 +17,6 @@ from typing import Iterable
 import pytest
 
 
-# Helpers.
 
 def _resolve(dotted: str) -> object:
     """Resolves a dotted name via import_module and getattr; any failure (missing module, import error, or missing attribute) reports DRIFT, never SKIP."""
@@ -88,8 +87,7 @@ def _skip_if_missing(module_name: str) -> None:
 # unsloth_zoo/compiler.py
 
 def test_compiler_modeling_flash_attention_utils_top_level():
-    """compiler.py:218 has a TOP-LEVEL unguarded import of is_flash_attn_available from
-    transformers.modeling_flash_attention_utils; a removal makes import unsloth_zoo raise ImportError."""
+    """compiler.py:218 top-level unguarded import; removing it makes `import unsloth_zoo` fail."""
     _resolve_all([
         "transformers.modeling_flash_attention_utils",
         "transformers.modeling_flash_attention_utils.is_flash_attn_available",
@@ -176,14 +174,12 @@ def test_dataset_utils_data_collator_for_seq2seq():
 # unsloth_zoo/saving_utils.py
 
 def test_saving_utils_pushtohubmixin():
-    """saving_utils.py:76 has a TOP-LEVEL unguarded import of PushToHubMixin from transformers.modeling_utils; it calls
-    _upload_modified_files and _get_files_timestamps."""
+    """saving_utils.py:76 has a top-level unguarded PushToHubMixin import from transformers."""
     _resolve("transformers.modeling_utils.PushToHubMixin")
 
 
 def test_saving_utils_peft_top_level():
-    """saving_utils.py:82 and 270 have TOP-LEVEL unguarded imports of PeftModelForCausalLM and PeftModel from peft, plus
-    dequantize_module_weight from peft.utils.integrations."""
+    """saving_utils.py:82,270 unguarded top-level peft imports, incl. dequantize_module_weight."""
     _resolve_all([
         "peft.PeftModelForCausalLM",
         "peft.PeftModel",
@@ -230,7 +226,6 @@ def test_patching_utils_quantizers_utils_module():
     _resolve("transformers.quantizers.quantizers_utils")
 
 
-# unsloth_zoo/hf_utils.py
 
 def test_hf_utils_pretrainedconfig_either_name():
     """hf_utils.py:25-28 tries PreTrainedConfig (5.x) then falls back to PretrainedConfig (4.x); at least one must exist on top-level transformers."""
@@ -269,14 +264,12 @@ def test_hf_utils_peft_config_top_level():
     _resolve("peft.PeftConfig")
 
 
-# unsloth_zoo/utils.py
 
 def test_utils_auto_quantization_config():
     """utils.py:197 imports AutoQuantizationConfig from transformers.quantizers."""
     _resolve("transformers.quantizers.AutoQuantizationConfig")
 
 
-# unsloth_zoo/empty_model.py
 
 def test_empty_model_accelerate_init_empty_weights():
     """empty_model.py:238 and 322 import init_empty_weights from accelerate without try/except; removal makes meta-model loading crash."""
@@ -293,21 +286,18 @@ def test_empty_model_auto_model_for_causal_lm():
     _resolve("transformers.AutoModelForCausalLM")
 
 
-# unsloth_zoo/tokenizer_utils.py + unsloth_zoo/training_utils.py
 
 def test_top_level_datasets_module():
     """tokenizer_utils.py:21 and training_utils.py:19 import datasets at module top-level."""
     _resolve("datasets")
 
 
-# unsloth_zoo/peft_utils.py
 
 def test_peft_utils_peft_tuners_lora_module():
     """peft_utils.py:157 imports peft.tuners.lora to enumerate LoRA-eligible layers."""
     _resolve("peft.tuners.lora")
 
 
-# unsloth_zoo/temporary_patches/utils.py
 
 def test_temporary_patches_utils_kwargs_typing():
     """KWARGS_TYPE tries four transformers types; none resolving gives NameError at zoo import."""
@@ -335,7 +325,6 @@ def test_temporary_patches_utils_transformers_version():
     _resolve("transformers.__version__")
 
 
-# unsloth_zoo/temporary_patches/misc.py
 
 def test_temp_patches_misc_loss_for_causal_lm_loss():
     """CSM patches monkey-rebind ForCausalLMLoss; a rename silently disables them."""
@@ -374,12 +363,10 @@ def test_temp_patches_misc_pretrained_tokenizer_base_top_level():
     _resolve("transformers.PreTrainedTokenizerBase")
 
 
-# unsloth_zoo/temporary_patches/gemma.py
 
 def test_temp_patches_gemma_processing_surface():
-    """unsloth_zoo/temporary_patches/gemma.py rebuilds the Gemma3 processor from these, all must
-    resolve; Gemma3ProcessorKwargs is optional: transformers 5.23 made it a deprecated alias of
-    ProcessingKwargs and 5.29 removes it, so the patch falls back to ProcessingKwargs."""
+    """gemma.py: all names must resolve except Gemma3ProcessorKwargs (deprecated 5.23, removed 5.29;
+    the patch falls back to ProcessingKwargs)."""
     _resolve_all([
         "transformers.models.gemma3.processing_gemma3.Gemma3Processor",
         "transformers.processing_utils.ProcessingKwargs",
@@ -389,7 +376,6 @@ def test_temp_patches_gemma_processing_surface():
     ])
 
 
-# unsloth_zoo/temporary_patches/gpt_oss.py
 
 def test_temp_patches_gpt_oss_modeling_rope_utils():
     """unsloth_zoo/temporary_patches/gpt_oss.py:2602 imports rope_config_validation from transformers.modeling_rope_utils; it must resolve."""
@@ -405,7 +391,6 @@ def test_temp_patches_gpt_oss_layer_type_validation():
     )
 
 
-# unsloth_zoo/temporary_patches/gemma4.py
 
 def test_temp_patches_gemma4_cache_utils():
     """unsloth_zoo/temporary_patches/gemma4.py:308, 334, 460 import DynamicCache and StaticCache from transformers.cache_utils; forward rewrite branches on them."""
@@ -415,14 +400,12 @@ def test_temp_patches_gemma4_cache_utils():
     ])
 
 
-# unsloth_zoo/temporary_patches/moe_utils.py
 
 def test_temp_patches_moe_utils_param_wrapper():
     """unsloth_zoo/temporary_patches/moe_utils.py:897 imports peft.tuners.lora.layer.ParamWrapper, required by zoo PR 618's 3D-weight LoRA dispatch."""
     _resolve("peft.tuners.lora.layer.ParamWrapper")
 
 
-# unsloth_zoo/logging_utils.py
 
 def test_logging_utils_utils_notebook():
     """unsloth_zoo/logging_utils.py:50 imports IPython progress-bar helpers from transformers.utils.notebook; that module must resolve."""
@@ -443,7 +426,6 @@ def test_logging_utils_trl_trainer_module():
     _resolve("trl.trainer")
 
 
-# unsloth_zoo/temporary_patches/pixtral.py
 
 def test_temp_patches_pixtral_rotary_emb():
     """unsloth_zoo/temporary_patches/pixtral.py:30 imports apply_rotary_pos_emb from transformers.models.pixtral.modeling_pixtral for the attention rewrite."""
@@ -452,12 +434,10 @@ def test_temp_patches_pixtral_rotary_emb():
     )
 
 
-# unsloth_zoo/vllm_lora_worker_manager.py
 
 def test_vllm_lora_worker_manager_top_level():
-    """vllm_lora_worker_manager.py:22,23,32-34 has five unguarded top-level imports: vllm.config.LoRAConfig,
-    vllm.logger.init_logger, vllm.lora.peft_helper.PEFTHelper, vllm.lora.request.LoRARequest,
-    vllm.lora.utils.get_adapter_absolute_path; module fails to import if any is missing."""
+    """vllm_lora_worker_manager.py: five unguarded top-level vllm imports; module fails if any is
+    missing."""
     _skip_if_missing("vllm")
     _resolve_all([
         "vllm.config.LoRAConfig",
@@ -474,7 +454,6 @@ def test_vllm_lora_worker_manager_vllm_config_top_level():
     _resolve("vllm.config.VllmConfig")
 
 
-# unsloth_zoo/vllm_utils.py
 
 def test_vllm_utils_top_level_peft_type():
     """unsloth_zoo/vllm_utils.py:2520 imports PeftType from peft at module top level with no try/except guard."""
@@ -493,7 +472,6 @@ def test_vllm_utils_models_registry():
     _resolve("vllm.model_executor.models.registry.ModelRegistry")
 
 
-# unsloth_zoo/temporary_patches/mxfp4.py
 
 def test_temp_patches_mxfp4_module_path():
     """unsloth_zoo/temporary_patches/mxfp4.py has three sites importing transformers.integrations.mxfp4; it must resolve so the patch can rebind FP4 conversion."""
@@ -507,7 +485,6 @@ def test_temp_patches_mxfp4_tensor_parallel_helper():
     )
 
 
-# qwen2_vl + qwen2_5_vl image-processing surface
 
 def test_qwen2_vl_image_processor_class():
     """misc.py:1485 patch is wrapped in try/except; Qwen2VLImageProcessor is reached on transformers >= 5.0, so the path

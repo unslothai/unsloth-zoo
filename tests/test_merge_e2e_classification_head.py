@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests merging a trained head the base lacks: merged_16bit rewrites shards in place and silently
-dropped it; assert bit-identical reload, since a shape match passes for random init."""
+"""merged_16bit silently dropped a trained head; shape passes on random init, so compare bits."""
 
 from __future__ import annotations
 

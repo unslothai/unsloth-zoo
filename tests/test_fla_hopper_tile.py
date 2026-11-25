@@ -380,8 +380,7 @@ def test_in_place_patch_fixes_an_unpatched_tree(monkeypatch):
             assert torch.isfinite(b).all(), f"{name} not finite after the in-place patch"
             rel = (a - b).norm() / a.norm().clamp_min(1e-12)
             assert rel < 5e-3, f"{name} diverged after the in-place patch (rel L2 {rel:.3e})"
-        # The patch must not save, mutate and restore module globals per call, since autograd runs one thread per
-        # device; the guard flag is cleared once and the tile override is thread-local.
+        # Autograd threads per device: the tile override is thread-local, not a saved global.
         assert chunk_o.IS_NVIDIA_HOPPER is False
         assert fv._installed_fla_forcing_small_tile() is False
         assert chunk_o.check_shared_mem.__wrapped__ is pristine_check
@@ -531,9 +530,8 @@ def test_in_place_patch_is_thread_safe(monkeypatch):
 
 
 def test_opt_out_forces_pure_torch(monkeypatch, fake_gated_delta_modeling):
-    """UNSLOTH_DISABLE_HOPPER_FLA_BWD=1 forces pure torch only on the pre-47630 Transformers layout (probe False and
-    module global unbound), so this test is pinned there; post-47630 see
-    test_optout_falls_through_to_protection_on_the_new_layout."""
+    """UNSLOTH_DISABLE_HOPPER_FLA_BWD=1 forces pure torch only on the pre-47630 Transformers layout;
+    post-47630 see test_optout_falls_through_to_protection_on_the_new_layout."""
     import transformers.utils.import_utils as iu
 
     from unsloth_zoo.temporary_patches import fla_vendor as fv
@@ -805,8 +803,7 @@ def test_optout_does_not_patch_the_kernel_on_the_old_layout(monkeypatch, fake_ga
 
 
 def test_degraded_optout_outranks_disable_vendored(monkeypatch, fake_gated_delta_modeling):
-    """UNSLOTH_DISABLE_VENDORED_FLA is only a source preference; on post-47630 layouts the Hopper opt-out must win, or
-    the decorator would resolve an unpatched BK=64 fla."""
+    """UNSLOTH_DISABLE_VENDORED_FLA is a source preference; post-47630 Hopper opt-out must win."""
     from unsloth_zoo.temporary_patches import fla_vendor as fv
 
     monkeypatch.setenv("UNSLOTH_DISABLE_HOPPER_FLA_BWD", "1")
@@ -897,7 +894,6 @@ def test_vendored_guard_uses_the_tensor_device_not_device_zero(monkeypatch):
     if not (chunk_o.TRITON_ABOVE_3_4_0 and not chunk_o.TRITON_ABOVE_3_7_1):
         pytest.skip("host Triton is outside the affected [3.4.0, 3.7.1) range")
 
-    # Device 0 reports Hopper but this call's tensor is not on Hopper, so the normal tile must survive.
     monkeypatch.setattr(chunk_o, "IS_NVIDIA_HOPPER", True)
     monkeypatch.setattr(chunk_o, "_is_hopper_tensor", lambda x: False)
     assert _record_bk(chunk_o, K=64, V=128, hopper=True, monkeypatch=monkeypatch)["BK"] == 64

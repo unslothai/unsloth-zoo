@@ -213,8 +213,7 @@ def test_two_outstanding_packs_of_one_wrapper_agree():
 
 
 def test_a_completed_checkpointed_step_leaves_no_state_to_expire():
-    """The mode belongs to the wrapper and needs no expiry, since nothing here calls apply_pending_eager_fallbacks;
-    whether torch runs a compiled region after the flag is set is torch's"""
+    """Mode lives on the wrapper; apply_pending_eager_fallbacks is never called, so no expiry."""
     prev = torch._dynamo.config.disable
     torch._dynamo.config.disable = False
     try:

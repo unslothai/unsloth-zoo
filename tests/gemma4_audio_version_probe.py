@@ -68,9 +68,8 @@ RATE = 16000
 
 results = {}
 
-# Margin for the two-tone gap over platform jitter; on macos-14 (mlx-vlm 0.6.3, mlx 0.32.0) the identical-input spread
-# (0.8-2.3) is as large as the tone gap (0.7-1.3), so no margin rescues it and the stage is Inconclusive; Linux gives
-# noise 0, signal 0.327.
+# Margin over platform jitter; on macos-14 (mlx-vlm 0.6.3, mlx 0.32.0) identical-input spread is as
+# large as the tone gap, so no margin rescues it (Inconclusive); Linux: noise 0, signal 0.327.
 TWO_TONE_MARGIN = 4.0
 
 TWO_TONE_REASONS = {
@@ -83,15 +82,13 @@ TWO_TONE_REASONS = {
 
 
 def two_tone_verdict(repeats, other):
-    """Did the second tone move the loss beyond platform jitter? repeats (one tone, several runs) give the spread, other
-    is the second tone; split out to test without a model or Mac, since the branch only fires where the model is not
-    reproducible."""
+    """Did the second tone (other) move the loss beyond the repeats' spread (one tone); split out to
+    test without a model, since the branch only fires where the model is not reproducible."""
     noise = max(repeats) - min(repeats)
     # Use the mean, not the first sample: the printed figure is what a reader compares against other.
     base = sum(repeats) / len(repeats)
     signal = abs(base - other)
-    # Print the repeats, not just their spread: jitter and monotone drift give the same spread but need opposite
-    # responses (platform fact vs forward-path bug); this string is the only artifact the macOS matrix leaves.
+    # Print repeats: jitter and drift share a spread; the string is the only macOS artifact.
     detail = (f"440Hz={base:.4f} 1760Hz={other:.4f} "
               f"signal={signal:.3g} noise={noise:.3g} "
               f"repeats=[{', '.join(f'{r:.4f}' for r in repeats)}]")
@@ -107,9 +104,8 @@ class Inconclusive(Exception):
 
 
 def gating_stages(stages):
-    """Stages gating the exit code: stage 0 and its subchecks are diagnostic and never gated, and so are inconclusive
-    stages (stage 4 on Apple Silicon, see TWO_TONE_MARGIN); stages 1 to 3 still gate; the verdict still appears in
-    PROBE_RESULT."""
+    """Returns the stages that gate the exit code: stage 0 and its subchecks and inconclusive stages
+    (stage 4 on Apple Silicon) are excluded; their verdicts still appear in PROBE_RESULT."""
     return {k: v for k, v in stages.items()
             if not k.startswith("0_") and not v.get("inconclusive")}
 
@@ -196,8 +192,7 @@ def check_tower(_repo):
 
 @stage("3_placeholders_match_the_audio_tower")
 def check_alignment(_repo):
-    """Checks the placeholder count zoo derives (framing changed in 0.5.0) against audio_tower's
-    returned mask count; deriving it from _gemma4_audio_encoder_positions would be circular."""
+    """Placeholder count vs tower mask (framing changed in 0.5.0); encoder-derived is circular."""
     import mlx.core as mx
     import numpy as np
 

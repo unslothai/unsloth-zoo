@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU bf16 speed probe (no /proc/cpuinfo: Windows, macOS): runs in a child process, so an illegal-instruction crash
-falls back to fp32 instead of killing the caller, and it runs once per process."""
+"""CPU bf16 probe (no /proc/cpuinfo): in a child, once per process; crash falls back to fp32."""
 
 import subprocess
 import warnings

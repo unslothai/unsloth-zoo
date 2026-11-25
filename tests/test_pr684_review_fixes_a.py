@@ -340,7 +340,6 @@ def test_thread5_fast_tokenizer_is_returned_as_is_not_rust_backend():
 
     tok = _FastTokenizer()
     result = _get_processor_tokenizer(tok)
-    # Must be the HF tokenizer itself, never the Rust backend.
     assert result is tok
     assert not isinstance(result, _RustBackend)
     assert hasattr(result, "convert_tokens_to_ids")

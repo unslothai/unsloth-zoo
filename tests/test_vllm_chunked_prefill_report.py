@@ -84,8 +84,7 @@ def test_banner_is_printed_after_the_unsupported_key_filter():
 
 
 def test_budget_is_clamped_when_chunked_prefill_is_off():
-    # vLLM raises when max_num_batched_tokens < max_model_len and cannot chunk; the clamp is gated, since a blanket
-    # floor would disable chunking for text models.
+    # vLLM raises when budget < max_model_len and cannot chunk; clamp only if chunking is off.
     for node in ast.walk(_load_vllm_node()):
         if not isinstance(node, ast.If): continue
         if not (isinstance(node.test, ast.UnaryOp) and isinstance(node.test.op, ast.Not)

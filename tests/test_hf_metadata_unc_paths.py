@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Repo metadata must never name a probed path outside the snapshot: on Windows a UNC name opens an
-SMB connection that sends the NTLM hash; the POSIX join here records probed names instead."""
+"""Never name probed paths outside the snapshot: Windows UNC names send the NTLM hash over SMB."""
 import json
 from pathlib import Path
 

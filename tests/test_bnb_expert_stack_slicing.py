@@ -175,8 +175,7 @@ def test_the_configured_quant_storage_survives_slicing(small_threshold, quant_st
 
 
 def test_the_forward_read_slices_too(small_threshold, monkeypatch):
-    """The recompute and grouped-mm providers read the stack via moe_utils._get_base_weight on every forward and
-    backward recompute; that read is one dequantize call that aborts at the same element count as the load-time one."""
+    """Forward/recompute reads via moe_utils._get_base_weight must slice; unsliced they abort."""
     from unsloth_zoo.temporary_patches import moe_utils as MU
 
     value = _stack()
@@ -228,8 +227,7 @@ def test_get_base_weight_is_unchanged_below_the_threshold(monkeypatch):
 
 
 def test_sliced_dequant_does_not_hold_every_slice_at_once(small_threshold, monkeypatch):
-    """Avoids torch.cat, which keeps every dense slice alive beside the result (peak of two full stacks); the test
-    asserts torch.cat is not called, as fixture-size peak memory is allocator-dominated."""
+    """Avoids torch.cat (all slices live at once, 2x peak); mocked: allocator peaks are noisy."""
     value = _stack()
     param = M._make_expert_params4bit(
         value, requires_grad=False, blocksize=64, quant_type="nf4",
@@ -258,8 +256,7 @@ def test_sliced_dequant_does_not_hold_every_slice_at_once(small_threshold, monke
 def test_the_forward_read_still_slices_from_the_cached_top_level_module(
     small_threshold, monkeypatch, tmp_path
 ):
-    """compiler.py emits from moe_utils import, so the cache loads it top-level where a relative import raises; the
-    guard then falls back to one aborting whole-stack call, so it must be absolute."""
+    """Absolute import (compiler.py emits it): relative raises when cached; fallback aborts."""
     import importlib.util
     import shutil
     import sys

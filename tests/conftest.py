@@ -263,8 +263,7 @@ def _isolate_xet_health_state(tmp_path_factory, monkeypatch):
 import os as _os
 
 _HIDDEN_STATES_FLAG = "UNSLOTH_RETURN_HIDDEN_STATES"
-# Library code writes these process-wide (get_transformers_model_type records UNSLOTH_MODEL_NAME), and later tests
-# read them: the Gemma 3 patches skip or repatch by model name, and subprocess tests inherit the environment.
+# Library code sets these process-wide; Gemma 3 patches and subprocess tests read them later.
 _RESTORED_ENV = (_HIDDEN_STATES_FLAG, "UNSLOTH_MODEL_NAME")
 
 
@@ -358,9 +357,8 @@ def _is_module_stub(mod):
 
 
 def _is_unsloth_stub(mod):
-    """unsloth_zoo's bitsandbytes stub (stubs/bitsandbytes_stub.py, used where no wheel exists) is process-wide and
-    deliberate, so the first test importing bitsandbytes.nn is not a polluter; all stub modules carry
-    IS_UNSLOTH_STUB, finder-minted ones included."""
+    """unsloth_zoo's bitsandbytes stub (stubs/bitsandbytes_stub.py) is process-wide by design, so it
+    is not a leak; all stub modules carry IS_UNSLOTH_STUB, finder-minted ones included."""
     return bool(getattr(mod, "IS_UNSLOTH_STUB", False))
 
 
@@ -374,8 +372,7 @@ def pytest_runtest_setup(item):
     setattr(item, _CHECKPOINT_SNAPSHOT_KEY, _checkpoint_snapshot())
 
 
-# patch_unsloth_*_gradient_checkpointing swap these process-wide; a test that does not unpatch leaks
-# the Unsloth checkpoint to later tests on its worker, so each test restores its checkpoint.
+# patch_unsloth_*_gradient_checkpointing swap process-wide; each test restores its checkpoint.
 _CHECKPOINT_SNAPSHOT_KEY = "_unsloth_checkpoint_snapshot"
 _CHECKPOINT_ATTRS = (
     "checkpoint", "CheckpointFunction", "_old_checkpoint", "_old_CheckpointFunction", "_unsloth_pristine_checkpoint",
@@ -433,8 +430,7 @@ def pytest_runtest_teardown(item, nextitem):
                 leaked.append(name)
             continue
         if was is None and (not _is_module_stub(now) or _is_unsloth_stub(now)):
-            # Nothing was there before and the test imported the real package or the zoo's bitsandbytes stub; that is an
-            # import, not a swap, and flagging it would fail every test touching it.
+            # Nothing was there before: an import of the real package or zoo stub, not a swap.
             continue
         leaked.append(name)
     if leaked:
@@ -591,7 +587,6 @@ def pytest_configure(config):
 
 @_pytest.fixture(autouse = True)
 def _cpu_backend_compiles_only_when_asked(monkeypatch):
-    """The CPU backend compiles decoder layers by default for dense models; one Inductor build per test would dominate
-    the suite. Tests of that path set or delete UNSLOTH_CPU_COMPILE themselves."""
+    """Tests turn CPU compile off unless set: a build per test would dominate the suite."""
     if "UNSLOTH_CPU_COMPILE" not in _os.environ:
         monkeypatch.setenv("UNSLOTH_CPU_COMPILE", "0")

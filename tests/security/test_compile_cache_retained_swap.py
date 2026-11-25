@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Guards against a cache-folder writer swapping the file between create_new_function(overwrite =
-False)'s equality read and rank 0's second digest, which approved and executed its bytes even
-without UNSLOTH_COMPILE_OVERWRITE=0; the swap is simulated by wrapping the decision."""
+"""Guards a cache-file swap between create_new_function(overwrite = False)'s equality read and rank
+0's second digest, which executed its bytes even without UNSLOTH_COMPILE_OVERWRITE=0."""
 import os
 import sys
 import tempfile

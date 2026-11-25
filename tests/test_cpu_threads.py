@@ -53,8 +53,7 @@ def _fit_in_subprocess(extra, cores = None):
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
-# "user": the count torch derived from the user's OMP_NUM_THREADS / MKL_NUM_THREADS is kept as is. Newer torch builds
-# cap those to the CPUs it sees (a 2-vCPU CI runner reports 2 for OMP_NUM_THREADS=8), so compare with torch's own count.
+# user: torch's count from OMP_NUM_THREADS/MKL_NUM_THREADS; newer torch caps it to CPUs seen.
 _USER = "user"
 
 
@@ -91,8 +90,7 @@ def test_fit_cpu_threads_default_drops_smt_siblings_never_raises():
 @pytest.mark.parametrize("variable", ["LOCAL_WORLD_SIZE", "MPI_LOCALNRANKS", "OMPI_COMM_WORLD_LOCAL_SIZE",
                                       "MV2_COMM_WORLD_LOCAL_SIZE"])
 def test_fit_cpu_threads_splits_across_local_ranks_without_launcher_marker(variable):
-    # Every local-size variable get_cpu_distributed_information reads (MVAPICH included) ends at 1
-    # thread per rank on 2 cores; Intel / Open MPI may set 1 thread already: nothing to fit.
+    # Local-size vars (MVAPICH too) give 1 thread/rank on 2 cores; Intel/Open MPI may preset 1.
     _, fitted, reason, _, _ = _fit_in_subprocess({variable: "2"}, 2)
     assert fitted == 1 and ("local ranks" in reason or reason == "default")
 

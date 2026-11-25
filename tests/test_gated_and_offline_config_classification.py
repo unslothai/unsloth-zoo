@@ -194,8 +194,7 @@ def test_offline_config_download_never_selects_hf_unquantized(monkeypatch, tmp_p
 def test_an_unreadable_local_config_raises_for_every_save_method(
     monkeypatch, tmp_path, save_method,
 ):
-    """An unreadable base config must raise for every save method: guessing unquantized for an mxfp4 base makes
-    _merge_and_overwrite_lora take the in place writer, not the full rewrite."""
+    """Unreadable config must raise, else mxfp4 uses _merge_and_overwrite_lora's in-place path."""
     directory = tmp_path / "base"
     directory.mkdir()
     (directory / "model.safetensors").write_bytes(b"")
@@ -368,8 +367,7 @@ def test_an_unreachable_hub_still_wins_over_an_unreadable_local_config(monkeypat
 
 
 def test_a_local_quantized_copy_does_not_answer_for_an_unquantized_hub_repo(monkeypatch, tmp_path):
-    """A local nf4 copy must not answer the Hub-side check: check_model_quantization_status prefers
-    the directory (HF_nf4, priority 4 not 3), so merged_16bit refused a full-precision Hub base."""
+    """Local nf4 copy must not answer for unquantized Hub repo (HF_nf4 priority 4 > Hub's 3)."""
     _require_a_case_sensitive_filesystem(tmp_path)
     monkeypatch.chdir(tmp_path)
     directory = os.path.join("outputs", "mymodel")

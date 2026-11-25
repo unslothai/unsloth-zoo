@@ -115,8 +115,7 @@ def test_two_failures_demote_and_a_success_recovers(monkeypatch):
 
 
 def test_a_success_racing_a_failure_cannot_fabricate_a_demotion(monkeypatch):
-    """A success resets the streak and a failure increments it, so from a streak of 1 no serial
-    order reaches the threshold; a demotion would be a lost update, costing a day on HTTP."""
+    """Racing outcomes must not fabricate a demotion: a lost update would fake the streak."""
     import threading
 
     health.record_xet_outcome(False, "seed")           # streak = 1
@@ -355,8 +354,7 @@ def test_a_real_verdict_still_short_circuits_every_caller(monkeypatch):
 
 
 def test_a_foreign_nodes_verdict_is_ignored(monkeypatch, tmp_path):
-    """HF_HOME is often shared across a cluster, so verdicts must be machine-scoped: one node with blocked CAS would
-    demote every node for 24h, and none could record a clearing success."""
+    """HF_HOME is often shared across a cluster, so verdicts must be scoped to one machine."""
     _big_machine(monkeypatch)
     monkeypatch.setattr(health, "_probe_cas_reachable", lambda: (True, "probe ok"))
 

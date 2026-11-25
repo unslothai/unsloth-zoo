@@ -31,13 +31,11 @@ import pytest
 # Importing unsloth_zoo on a GPU host runs init, which asserts Unsloth is present; default UNSLOTH_IS_PRESENT so the test stays self-contained.
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
-# Skip gate imports fla_vendor, whose import-time patch_vendor_fla() would inject fla into this pytest process on CUDA;
-# suppress only that autorun via UNSLOTH_VENDORED_FLA_NO_AUTORUN; subprocess tests call patch_vendor_fla() explicitly,
-# so real injection still runs there.
+# Import-time patch_vendor_fla() would inject fla into this pytest process on CUDA;
+# UNSLOTH_VENDORED_FLA_NO_AUTORUN suppresses only that autorun; subprocess tests call it explicitly.
 os.environ.setdefault("UNSLOTH_VENDORED_FLA_NO_AUTORUN", "1")
 
-# Zoo-only envs (no separate unsloth package) make unsloth_zoo init raise on find_spec('unsloth'), which the flag above
-# does not satisfy; skip the module there, CI installs unsloth.
+# Zoo-only envs: the flag can't pass unsloth_zoo's find_spec('unsloth'); skip, CI installs it.
 try:
     import unsloth_zoo  # noqa: F401
 except ImportError as _e:
@@ -113,7 +111,6 @@ def test_vendored_tree_layout():
 
     top = (VENDORED / "__init__.py").read_text()
     assert '__version__ = "0.5.1"' in top
-    # narrowed: the eager layers/models imports must be gone
     assert "import fla.layers" not in top
     assert "_import_optional_public_module" not in top
 
@@ -222,7 +219,6 @@ def test_prepare_wy_repr_bwd_num_stages_policy():
     # The warp pin is separate and unconditional.
     wy = src.read_text()
     assert "PREPARE_WY_REPR_BWD_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4]" in wy
-    # The gate is wired to the real constant, not left hardcoded.
     assert "PREPARE_WY_REPR_BWD_NUM_STAGES = _prepare_wy_repr_bwd_num_stages(\n" \
            "    IS_NVIDIA_BLACKWELL, TRITON_ABOVE_3_6_0,\n)" in wy
     compat = (VENDORED / "utils" / "_compat.py").read_text()
@@ -331,8 +327,7 @@ def test_decode_alias_added_when_missing(monkeypatch):
     added = _alias_into(fake, monkeypatch)
 
     assert added == ("recurrent_gated_delta_rule",), added
-    # Exact lookup transformers' use_kernel_func_from_hub_with_fallback performs; without the alias it returns None and
-    # the decorator silently keeps pure PyTorch.
+    # Exact transformers lookup; a miss returns None and the decorator silently keeps PyTorch.
     assert fake.recurrent_gated_delta_rule is fused_recurrent_gated_delta_rule
     assert "recurrent_gated_delta_rule" in fake.__all__
 
@@ -400,7 +395,6 @@ def test_decode_alias_follows_the_cpu_torch_wrapper(monkeypatch):
     wrapped = fake.fused_recurrent_gated_delta_rule
     assert wrapped is not fused_recurrent_gated_delta_rule
     assert fake.recurrent_gated_delta_rule is wrapped
-    # A second install keeps the one wrapper on both names.
     assert fla_vendor._install_cpu_torch_path()
     assert fake.fused_recurrent_gated_delta_rule is wrapped
     assert fake.recurrent_gated_delta_rule is wrapped
@@ -478,13 +472,11 @@ def test_probe_covers_only_vendor_complete_models():
             {"probe": _vendored_availability_probe, "__name__": module_name},
         )
 
-    # Covered gated-deltanet models get the fast path.
     assert call_as("transformers.models.qwen3_5.modeling_qwen3_5") is True
     assert call_as("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe") is True
     assert call_as("transformers.models.qwen3_next.modeling_qwen3_next") is True
     # olmo_hybrid is not validated on the vendored tree: it must answer False so its modeling module keeps the pure torch fallback.
     assert call_as("transformers.models.olmo_hybrid.modeling_olmo_hybrid") is False
-    # Non-modeling callers see the vendored fla as available.
     assert call_as("unsloth.models.loader") is True
     assert call_as("__main__") is True
 
@@ -654,7 +646,6 @@ def test_rocm_major9_device_not_treated_as_hopper():
     # AMD Instinct on a ROCm build: major 9 but not Hopper -> keep the fast path.
     amd = fake_torch("AMD Instinct MI300X", 9, "6.0.32830")
     assert _hopper_dqkwg_suspect(amd, bad) is False
-    # A real Hopper on a CUDA build (hip=None) still trips, by name and by major.
     nvidia_named = fake_torch("NVIDIA H100 80GB HBM3", 9, None)
     nvidia_unnamed = fake_torch("", 9, None)
     assert _hopper_dqkwg_suspect(nvidia_named, bad) is True
@@ -680,7 +671,6 @@ def test_hopper_at_nonzero_device_index_trips_guard():
         {0: (8, 9), 1: (9, 0)},
         {0: "NVIDIA RTX 6000 Ada Generation", 1: "NVIDIA H100 80GB HBM3"},
     )
-    # cuda:0 Ada, cuda:1 Ada (no Hopper anywhere): fast path stays enabled.
     ada_only = mixed_torch(
         {0: (8, 9), 1: (8, 9)},
         {0: "NVIDIA RTX 6000 Ada Generation", 1: "NVIDIA RTX 6000 Ada Generation"},
@@ -709,13 +699,10 @@ def test_blackwell_import_device_scans_visible_devices():
         )
         return types.SimpleNamespace(cuda=cuda)
 
-    # cuda:0 Ada current, cuda:1 B200 (sm100): switch the import to index 1.
     assert _blackwell_import_device(fake_torch({0: (8, 9), 1: (10, 0)}, 0)) == 1
     # sm120 consumer Blackwell is also covered.
     assert _blackwell_import_device(fake_torch({0: (8, 9), 1: (12, 0)}, 0)) == 1
-    # Already Blackwell-current: no switch needed.
     assert _blackwell_import_device(fake_torch({0: (10, 0), 1: (8, 9)}, 0)) is None
-    # No Blackwell anywhere: no switch.
     assert _blackwell_import_device(fake_torch({0: (8, 9), 1: (9, 0)}, 0)) is None
 
 
@@ -844,8 +831,7 @@ def test_reenabled_intracard_stays_unavailable_subprocess():
 
 
 def test_failed_injection_restores_backend_env(monkeypatch, tmp_path):
-    # A failed vendored import forces FLA_TILELANG and FLA_INTRACARD_CP off, so it must restore the user's values, or a
-    # shadowed real fla stays without those backends.
+    # Failed import: restore FLA_TILELANG/FLA_INTRACARD_CP or a shadowed real fla loses them.
     from unsloth_zoo.temporary_patches import fla_vendor
 
     bad = tmp_path / "fla"
@@ -930,8 +916,7 @@ def test_force_rebinds_already_loaded_real_fla_subprocess():
 # Kernel-hub closures frozen by an import that happened before fla was live.
 
 def _has_kernel_hub_fallback() -> bool:
-    # use_kernel_func_from_hub_with_fallback arrived in huggingface/transformers, tracked as 47630; on older versions
-    # the repair correctly returns () and nothing is patched.
+    # Hub fallback arrived in transformers (tracked as 47630); older versions patch nothing.
     try:
         from transformers.integrations.hub_kernels import (  # noqa: F401
             use_kernel_func_from_hub_with_fallback,
@@ -1281,7 +1266,6 @@ def test_fp32_l2norm_matches_fp32_reference_and_keeps_dtype():
     assert out.dtype == torch.float16
     ref = _transformers_style_l2norm(x.float())
     torch.testing.assert_close(out.float(), ref, atol = 2e-3, rtol = 2e-3)
-    # Rows end up unit length, as l2norm promises.
     torch.testing.assert_close(out.float().norm(dim = -1), torch.ones(4), atol = 5e-3, rtol = 0)
 
 
@@ -1332,7 +1316,6 @@ def test_l2norm_patch_rebinds_only_imported_gated_delta_modules(monkeypatch):
     assert mod.l2norm is fla_vendor._fp32_l2norm
     assert compiled.l2norm is fla_vendor._fp32_l2norm
     assert not hasattr(plain, "l2norm")
-    # Idempotent: a second pass finds nothing left to do.
     assert fla_vendor._patch_l2norm_fp32_on_torch_path(packages = (fake_pkg, plain_pkg)) == []
     assert mod.l2norm is fla_vendor._fp32_l2norm
 

@@ -133,8 +133,7 @@ def test_quantised_sizes_use_the_storage_dtype():
     from accelerate.utils import CustomDtype
 
     class Q:
-        """Fake quantiser implementing both protocols: transformers' compute_module_sizes asks for param_element_size,
-        accelerate's takes a storage dtype and not-converted modules; the answer must match either way."""
+        """Fake quantiser for both protocols (param_element_size, dtype); answers must match."""
         modules_to_not_convert = ["lm_head"]
 
         def _skipped(self, name):
@@ -144,7 +143,6 @@ def test_quantised_sizes_use_the_storage_dtype():
         def param_element_size(self, model, name, param):
             return 2 if self._skipped(name) else 0.5
 
-        # accelerate
         def adjust_target_dtype(self, dtype):
             return CustomDtype.INT4
 
@@ -294,8 +292,7 @@ def test_the_auto_reserve_is_still_relaxable():
 
 
 def test_remote_code_config_picks_the_auto_class_the_repo_registered():
-    """Dynamic configs are in no _model_mapping, so from_config falls to AutoModel and fails instead of honouring
-    trust_remote_code; use the Auto class the repo registered."""
+    """Dynamic configs skip _model_mapping; honour trust_remote_code via the repo's Auto class."""
     transformers = pytest.importorskip("transformers")
 
     class RemoteConfig:
@@ -944,8 +941,7 @@ def test_runtime_quantization_options_build_a_quantizer(monkeypatch):
 
 
 def test_the_pretrained_helper_forwards_the_no_split_override(monkeypatch):
-    """Passing the no-split override via `**config_kwargs` sends it to AutoConfig, so the plan silently used detected
-    classes and refused a model the planner can place."""
+    """Override via **config_kwargs goes to AutoConfig, so a placeable model gets refused."""
     import unsloth_zoo.device_map_planner as planner
 
     with torch.device("meta"):
@@ -1181,7 +1177,6 @@ def test_identical_cards_still_get_the_flat_average_share():
         plan = plan_device_map(model, max_memory = {d: budget for d in range(n)})
         assert plan is not None, f"{n} x 14.56 GiB was refused"
 
-        # Pre-proration: one flat average share, pinned head as its floor.
         total = plan.total_weight_bytes
         headroom = plan.headroom_bytes
         value = max(0, (n * budget - total - headroom) // n)
@@ -1559,8 +1554,7 @@ def test_a_sub_config_left_as_a_dict_is_still_read():
 
 @pytest.mark.parametrize("model_type", ["aya_vision", "cohere2_vision"])
 def test_a_wrapper_that_re_heads_its_text_tower_claims_no_transform(model_type):
-    """Aya Vision and Cohere 2 Vision use unscaled nn.Linear lm_head and omit logit_scale; the
-    Cohere 2 config declares it, but crediting it reserves nothing real, so claim no transform."""
+    """Aya/Cohere 2 Vision: unscaled lm_head; declared logit_scale is unused, so no transform."""
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
     config = CONFIG_MAPPING[model_type]()

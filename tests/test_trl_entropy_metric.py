@@ -61,13 +61,11 @@ def patched():
     import trl.trainer.sft_trainer as sft
     from unsloth_zoo.temporary_patches.misc import patch_trl_entropy_from_logits
 
-    # entropy_from_logits landed in trl 0.20.0 and pyproject allows >= 0.18.2, so an allowed build can lack it;
-    # production no-ops there, so skip rather than error.
+    # entropy_from_logits is trl 0.20.0+; pyproject allows >= 0.18.2, so skip there, not error.
     original = getattr(trl_utils, "entropy_from_logits", None)
     if original is None:
         pytest.skip("this trl predates entropy_from_logits (added in 0.20.0)")
-    # Importing unsloth_zoo applies TEMPORARY_PATCHES, so the name may be the wrapper; the control
-    # unwraps __wrapped__ or it would call the wrapper and conclude the bug never existed.
+    # Unwrap __wrapped__ or the control calls the TEMPORARY_PATCHES wrapper and finds no bug.
     while getattr(original, "_unsloth_patched", False) and \
             getattr(original, "__wrapped__", None) is not None:
         original = original.__wrapped__
@@ -96,8 +94,7 @@ def test_other_unusable_logits_degrade_too(patched, logits):
 
 
 def test_the_result_broadcasts_the_way_the_caller_uses_it(patched):
-    """The caller uses sum(entropy * attention_mask) / sum(mask) in one branch and mean(entropy) in the other, so the
-    result must work with both; a shape that raises in either is no better than the original failure."""
+    """Caller uses sum(entropy * attention_mask) / sum(mask) and mean(entropy); both must work."""
     trl_utils, _, _ = patched
     e = trl_utils.entropy_from_logits(EmptyLogits())
     mask = torch.ones(2, 5)

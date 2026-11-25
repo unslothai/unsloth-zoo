@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Listing a helper in DISABLE_COMPILE_FUNCTIONS must reach its callers too: called_functions only holds names the file
-both calls and defines, so an imported-only helper is left raw for Dynamo to inline and its caller is demoted."""
+"""DISABLE_COMPILE_FUNCTIONS must reach callers; called_functions omits imported-only helpers."""
 
 import importlib.util
 import inspect
@@ -111,8 +110,7 @@ def _decorator_above(generated, function_name):
     return generated[:where].rsplit("\n@", 1)[-1]
 
 
-# No shipped model has this shape (see _upstream_shape_is_shipped), so a real modeling package is written to disk, where
-# inspect.getsource and linecache behave as upstream, and put on transformers.models.__path__ for the compiler's import.
+# No shipped model has this shape; a modeling package on disk keeps inspect.getsource working.
 _SYNTHETIC_CHILD = r'''
 import os, sys, json, importlib, io, contextlib, textwrap
 os.environ["UNSLOTH_COMPILE_LOCATION"] = "unsloth_compiled_cache"

@@ -310,8 +310,7 @@ def _padded_engine_trainer(ids, bias = float("-inf"), **args):
 
 
 def test_engine_suppressed_padded_rows_leave_the_scored_support(sampler):
-    # zoo 1831: 61 real tokens and 64 alignment rows biased to -inf; vLLM adds logit_bias before
-    # processed logprobs, so it scores -log(61), not -log(125): 0.488 ratio at identical weights.
+    # zoo 1831: vLLM adds logit_bias before processed logprobs, so -log(61), not -log(125).
     sampler("0.11.2")
     pad = list(range(61, 125))
     logits = torch.zeros(1, 2, 125)

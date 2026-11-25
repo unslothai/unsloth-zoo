@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""No test module may bind a top-level name twice: the later binding silently shadows the earlier
-one; two `_SHRUNK_VLM_STACKS` tables with different shapes broke nightly Mac Metal tests."""
+"""Test modules bind each top-level name once; a duplicate _SHRUNK_VLM_STACKS silently shadows."""
 
 import ast
 import collections

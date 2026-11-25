@@ -202,7 +202,6 @@ def test_the_modulelist_stride_fallback_shares_the_same_helper():
         [tuple(t.shape) for t in saved]
 
 
-# --- what the first review round found --------------------------------------
 
 def test_a_routing_change_in_the_replay_is_named_not_swallowed(unsupported):
     """A replayed routing change must be named, not swallowed: non-reentrant checkpointing would pair the original
@@ -445,8 +444,7 @@ def test_the_norm_does_not_materialize_fp32_copies(unsupported):
 
 
 def _backward_matmul_out_usage(out, seed):
-    """Records which torch.matmul calls during out.backward(seed) passed out=; only the in-place branch calls
-    torch.matmul by name, so an empty record means the casting branch ran."""
+    """Records torch.matmul calls with out= in backward; empty means the casting branch ran."""
     from unittest import mock
 
     seen = []
@@ -513,9 +511,8 @@ def test_writing_in_place_changes_no_gradient(unsupported):
 
 
 def test_higher_order_gradients_still_work(unsupported):
-    """out= refuses autograd, so the in-place write must stand down when the backward is itself differentiated;
-    torch._grouped_mm double-backwards on a supported device (B200, torch 2.9.1), so a raising fallback would make
-    results depend on the card."""
+    """out= refuses autograd, so in-place writes skip double backward; torch._grouped_mm supports it
+    on B200 with torch 2.9.1, so a raising fallback would make results card-dependent."""
     inputs, weight, offsets = _case()
     x = inputs.detach().clone().requires_grad_(True)
     w = weight.detach().clone().requires_grad_(True)
@@ -523,7 +520,6 @@ def test_higher_order_gradients_still_work(unsupported):
     (grad_x,) = torch.autograd.grad(out.sum(), x, create_graph = True)
     (second,) = torch.autograd.grad(grad_x.sum(), w)
 
-    # Same quantity off plain autograd over the per-group loop.
     rx = inputs.detach().clone().requires_grad_(True)
     rw = weight.detach().clone().requires_grad_(True)
     parts, start = [], 0

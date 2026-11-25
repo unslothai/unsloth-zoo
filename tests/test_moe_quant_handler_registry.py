@@ -139,7 +139,6 @@ def test_fp8_handler_returns_none_for_non_fp8_keys():
         def get_tensor(self, key):
             return torch.randn(8, 8, dtype=torch.bfloat16)
 
-    # dtype hint is bf16 → handler bails without touching the file.
     header = {"Z.weight": {"dtype": "BF16"}}
     assert _fp8_save_handler(FakeFile(), header, "Z.weight") is None
 

@@ -131,7 +131,6 @@ def test_recompute_helper_takes_the_truncated_support(monkeypatch):
     full = _new_logps(monkeypatch, support = False)
     assert not torch.allclose(truncated, full)
     torch.testing.assert_close(_new_logps(monkeypatch, support = True, recompute = True), truncated)
-    # Off, the recompute helper is untouched.
     torch.testing.assert_close(_new_logps(monkeypatch, support = False, recompute = True), full)
 
 

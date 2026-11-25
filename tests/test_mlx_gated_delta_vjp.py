@@ -29,8 +29,7 @@ import pytest
 
 from mlx_simulation import mlx_is_simulated, simulate_mlx_on_torch
 
-# find_spec on mlx cannot show real MLX once a sibling installed the torch shim (sys.modules,
-# sys.meta_path); requires_real_mlx tests then hit a _Noop mx.argpartition, depending on order.
+# Sibling's torch shim fools find_spec(mlx); real-MLX tests hit _Noop, order-dependent.
 _HAS_REAL_MLX = importlib.util.find_spec("mlx") is not None and not mlx_is_simulated()
 if not _HAS_REAL_MLX:
     simulate_mlx_on_torch()
@@ -51,8 +50,7 @@ requires_metal = pytest.mark.skipif(
 )
 requires_real_mlx = pytest.mark.skipif(not _HAS_REAL_MLX, reason="needs real MLX")
 
-# Snapshot real mlx/mlx_lm before sibling tests install the mlx_simulation torch stub; the explicit
-# import loads mlx_lm.models.gated_delta, which the kernel path from-imports at call time.
+# Load real mlx_lm.models.gated_delta before the shim; kernel path from-imports it per call.
 if _HAS_REAL_MLX:
     import mlx_lm.models.gated_delta  # noqa: F401
 
@@ -171,7 +169,6 @@ def test_second_call_sweeps_consumers_imported_after_first_patch(
 
     _patch()
     assert late.gated_delta_update is patched
-    # No double-wrap: the patched function is stable across calls.
     assert fake_mlx_lm.gated_delta.gated_delta_update is patched
 
 
@@ -424,7 +421,6 @@ def test_vlm_patch_rebinds_both_namespaces_and_sweep_skips_it(
     assert verifier.gated_delta_update is patched
     assert vlm_gd._unsloth_gated_delta_patched
 
-    # Inference (state provided) delegates to the original implementation.
     y, state = patched(*[object()] * 7, state="kv-cache")
     assert (y, state) == ("y", "kv-cache") and calls["inference"] == "kv-cache"
 
@@ -434,8 +430,7 @@ def test_vlm_patch_rebinds_both_namespaces_and_sweep_skips_it(
 
 
 def test_vlm_patch_rebinds_language_holding_a_stale_copy(fake_mlx_lm, monkeypatch):
-    """language from-imports the function at import time, so a reload of .gated_delta leaves it stale and the identity
-    sweep cannot see that; the patch must bind language by name or qwen3_5 trains without the memory-efficient VJP."""
+    """A reload leaves the from-imported copy stale; bind it by name or qwen3_5 loses the VJP."""
     def _update(q, k, v, a, b, A_log, dt_bias, state=None, mask=None, use_kernel=True):
         return "y", state
 
@@ -482,8 +477,7 @@ def test_kernel_dispatch_guards_partial_threadgroup_rows():
 
 @pytest.mark.skipif(_HAS_METAL, reason="the off-Metal answer is what is pinned here")
 def test_kernel_support_declines_off_metal_without_touching_the_layout_search():
-    """Off Metal the predicate returns False, not raise: the layout search reads dtype.size (real
-    mx.Dtype only), so run it after the device guard or shim training hits AttributeError."""
+    """Off Metal returns False; the layout search needs real mx.Dtype, so the guard runs first."""
     import unsloth_zoo.gated_delta_vjp as gv
 
     q = mx.zeros((1, 8, 2, 64))
@@ -957,8 +951,7 @@ def test_pre_0_6_9_upstream_is_never_handed_a_keyword_it_lacks(monkeypatch):
 
 @requires_real_mlx
 def test_patched_wrappers_accept_every_keyword_the_installed_mlx_vlm_declares():
-    """Upstream adds keywords faster than this patch is revised (0.6.9 added lower_bound, 0.7.1
-    three more); each reached training as a TypeError, so fail here."""
+    """Upstream keyword adds in 0.6.9 and 0.7.1 outpace this patch; fail here, not in training."""
     pytest.importorskip("mlx_vlm")
     import inspect
 
@@ -1025,8 +1018,7 @@ def test_disabling_a_fusion_targets_only_fused_modules(disable, flag, extra):
 
 
 def _has_glm5_next() -> bool:
-    """find_spec on a submodule imports mlx_vlm and raises if missing or broken (torch/mlx-vlm
-    skew), failing collection at module level; only the shim's catch-all finder hid it."""
+    """find_spec imports mlx_vlm and can raise on torch/mlx-vlm skew, so the except is needed."""
     try:
         return importlib.util.find_spec("mlx_vlm.models.glm5_next") is not None
     except Exception:

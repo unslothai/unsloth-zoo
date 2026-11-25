@@ -306,8 +306,7 @@ def test_registration_adds_a_custom_key_and_installs_the_device_transfer(monkeyp
 
 
 class _HostTensorSpy(torch.utils._python_dispatch.TorchDispatchMode):
-    """Records every op that reads or makes a CPU tensor. With the work on the meta device, any hit is a tensor built
-    on the host or copied from it: under CUDA graph capture that is a pageable host-to-device copy, which raises."""
+    """Logs CPU tensor ops; under CUDA graph capture these are pageable H2D copies that raise."""
 
     def __enter__(self):
         self.hits = []

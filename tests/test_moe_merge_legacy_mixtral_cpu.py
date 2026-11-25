@@ -257,9 +257,8 @@ def test_legacy_mixtral_down_proj_keyed_adapter_is_merged(tmp_path):
 
 
 def test_legacy_mixtral_both_fused_keys_resolve_num_experts(tmp_path):
-    """Fused .gate_up_proj and .down_proj keys with no .base_layer or bare .experts: neither matches the issue 5410
-    num_experts override, so num_experts must come from the wrapped module (lora_stats), not the shard key scan, or
-    the fused rank slices are wrong."""
+    """Fused .gate_up_proj/.down_proj keys without .base_layer or bare .experts miss issue 5410's
+    override; take num_experts from lora_stats, not the shard key scan, or slices are wrong."""
     num_layers, num_experts, rank_per = 1, 4, 3
     hidden, intermediate = 12, 8
     alpha = 2.0
@@ -416,8 +415,7 @@ def test_legacy_mixtral_fp8_shard_is_quant_aware(tmp_path):
 
 
 def test_legacy_mixtral_fp8_dequant_then_merge_16bit(tmp_path):
-    """Option C: FP8 legacy-Mixtral shard dequantized to 16bit, then expert LoRA merged; bf16 output
-    with scales dropped matches the analytic delta, as in the orchestrator's FP8 export."""
+    """FP8 legacy-Mixtral dequant to 16bit, LoRA merge; bf16 output matches analytic delta."""
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import (
         _fp8_dequant_blockwise, _fp8_requant_blockwise,
     )

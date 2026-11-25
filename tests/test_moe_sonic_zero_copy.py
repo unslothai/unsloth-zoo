@@ -13,8 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Layout algebra for the sonic-moe zero-copy gate_up path (concat_layout B); CPU tests emulate quack's
-concat_to_interleave with as_strided, GPU test needs kernels-community/sonic-moe on sm90/sm100."""
+"""Zero-copy gate_up layout; GPU test needs kernels-community/sonic-moe on sm90/sm100."""
 import pytest
 import torch
 import torch.nn.functional as F
@@ -280,7 +279,6 @@ def test_alignment_verdict_survives_compile_and_declines_unverified():
     # No eager verdict yet: zero-copy is declined under compile, not assumed.
     assert run(aligned.transpose(-2, -1), aligned) == 3
     assert run(misaligned.transpose(-2, -1), misaligned) == 3
-    # Eager verdicts, then the compiled region reads them.
     assert S._is_k_major_gate_up(aligned.transpose(-2, -1), aligned)
     assert not S._is_k_major_gate_up(misaligned.transpose(-2, -1), misaligned)
     assert run(aligned.transpose(-2, -1), aligned) == 2

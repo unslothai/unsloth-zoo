@@ -306,8 +306,7 @@ def test_settlement_retries_until_the_generator_is_actually_collected():
             cycle = {"exc": exc}                # a cycle, as raising through
             cycle["self"] = cycle               # compiled frames leaves
             U._RAISED_INSIDE_CHECKPOINT = True
-            # Newer torch (gen.throw in torch/utils/checkpoint.py, present in 2.13) unwinds the region itself, so
-            # nothing is abandoned; older releases drop the generator, the case the retry covers; check which runs.
+            # torch 2.13: gen.throw unwinds; older torch abandons it, which the retry covers.
             abandoned = U._in_non_reentrant_checkpoint() is True
             # The traceback is still live, so no collection can finalise anything.
             U.apply_pending_eager_fallbacks()
@@ -426,9 +425,8 @@ def hook_label():
     reason = "torch < 2.8 cannot report whether a checkpoint region is live",
 )
 def test_a_disabled_hook_does_not_flip_a_region_that_packed_compiled(hook_label):
-    """Gemma4 abort: Dynamo finds a disabled hook only while tracing, often in the backward recompute of a region
-    already packed compiled; eager there makes torch raise CheckpointError, so it must ask the checkpoint question
-    like the other give-up arms."""
+    """Gemma4 abort: Dynamo finds a disabled hook only while tracing, often in backward recompute of
+    a packed-compiled region; eager raises CheckpointError, so ask the checkpoint question."""
     calls = {"n": 0}
 
     def compiled(*args, **kwargs):

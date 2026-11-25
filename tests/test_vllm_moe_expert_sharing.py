@@ -319,7 +319,6 @@ def test_a_router_rebuilt_without_the_meta_model_gets_its_real_hidden_dim():
     linear = torch.nn.Linear(1, 1, bias = False)
     vu._refresh_placeholder_dims(linear, "weight", torch.randn(4, 5))
     assert (linear.out_features, linear.in_features) == (4, 5)
-    # Other parameters and modules without router sizes are left alone.
     plain = torch.nn.Module(); plain.hidden_dim = 1
     vu._refresh_placeholder_dims(plain, "weight", real)
     assert plain.hidden_dim == 1

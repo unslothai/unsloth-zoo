@@ -968,8 +968,7 @@ def test_an_ambiguous_column_of_media_lists_is_refused(column):
 
 
 def test_an_ambiguous_image_column_is_never_decoded_by_the_scan(monkeypatch):
-    """`media` has dtype PIL.Image.Image, so no string in it can name a file; the scan must not
-    decode it."""
+    """media is PIL.Image.Image: no string in it names a file, so the scan must not decode it."""
     import io
     import datasets.features.image as image_feature
     from PIL import Image as PILImage
@@ -1594,8 +1593,7 @@ def test_a_seq2seq_collator_holding_a_processor_is_still_repaired_without_packin
 
 
 def test_a_model_input_column_survives_raw_text_tokenization():
-    """Fields the model is fed but the tokenizer does not recreate, like a per-row sample_weight, must survive raw-text
-    tokenization or a required forward argument goes missing."""
+    """Fields like sample_weight must survive raw-text tokenization or a forward arg is lost."""
     class _ModelWithExtraInput:
         def forward(self, input_ids = None, attention_mask = None, labels = None,
                     sample_weight = None):
@@ -2029,8 +2027,7 @@ def test_a_raw_bypass_without_packing_is_untouched():
 
 
 def test_remove_unused_columns_false_still_drops_the_raw_text():
-    """sft_prepare_dataset enables the opt-out for token-type-id models; a pretokenized split's raw `text` must still be
-    dropped, or the collator dies tensorizing it."""
+    """With the opt-out, raw `text` must still be dropped or the collator dies tensorizing it."""
     rows = Dataset.from_dict({
         "input_ids": [list(ROW), list(ROW)],
         "attention_mask": [[1] * len(ROW), [1] * len(ROW)],
@@ -2170,8 +2167,7 @@ def test_picture_and_photo_name_media_as_plainly_as_image(column):
 
 
 def test_a_nested_integer_column_is_refused_rather_than_dropped():
-    """Nested wide-int sequences like `Sequence(Sequence(int64))` are numeric blocks, not token ids; the leaf-dtype
-    allowance passed them, replacing the vision collator."""
+    """Nested int sequences are numeric, not token ids; a leaf-dtype check wrongly passed them."""
     rows = Dataset.from_dict({
         "input_ids": [list(ROW), list(ROW)],
         "frames": [[[1, 2], [3, 4]], [[5, 6], [7, 8]]],
@@ -2891,8 +2887,7 @@ def test_a_scalar_labels_column_is_dropped_even_under_the_opt_out():
 
 
 def test_a_configured_label_name_survives_raw_tokenization():
-    """A label used by a custom `compute_loss` is not declared by forward, and remove_columns deletes it for good, so
-    the later `label_names` keep-lists never see it."""
+    """A label only custom compute_loss uses is dropped by remove_columns before label_names."""
     trainer = StubTrainer(MyVisionCollator(StubProcessor()),
                           _raw_text_split(my_reward = [0.5, 1.5]))
     trainer.args.label_names = ["my_reward"]

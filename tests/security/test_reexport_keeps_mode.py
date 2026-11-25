@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Re-exports and re-saves keep a user-restricted weights file's mode (chmod 600), not the base
-checkpoint's, umask's or 0644; first saves respect the user's umask (0644 under 022)."""
+"""Re-exports and re-saves keep a restricted mode (600), not the base's; first saves use umask."""
 
 import ast, json, os, shutil, stat, struct, tempfile, time, types
 from pathlib import Path

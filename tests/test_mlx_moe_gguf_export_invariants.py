@@ -275,7 +275,6 @@ def test_a_helper_called_from_inside_a_comprehension_is_still_read():
 
 
 def _renamed_through_a_comprehension(weights):
-    # The call this test is about: reached only from inside the comprehension.
     return {_a_spelling_only_the_helper_holds(name): tensor
             for name, tensor in weights.items()}
 
@@ -304,8 +303,7 @@ def test_experts_come_back_in_the_order_the_sanitizer_stacked_them(tmp_path):
 
 
 def test_a_merge_survives_a_sanitizer_that_offsets_a_norm_in_place(tmp_path):
-    """qwen3_5_moe sanitize() splits experts.gate_up_proj and offsets a norm in place; the uncopied
-    floor's markers hid the merge proof, so export kept MLX spelling llama.cpp cannot map."""
+    """sanitize() offsets a norm in place; uncopied markers hid the merge, so MLX names leaked."""
     import unsloth_zoo.mlx.utils as mutils
 
     mx = mutils.mx

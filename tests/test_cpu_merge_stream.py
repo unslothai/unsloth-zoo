@@ -92,7 +92,6 @@ def test_streamed_merge_matches_the_copying_path(tmp_path, monkeypatch, case, sa
     assert new_config == ref_config
     if case == "sharded":
         assert os.path.exists(streamed / "model.safetensors.index.json")
-    # The live model is untouched (weights, adapters, merge state).
     after = model.state_dict()
     assert set(after) == set(before) and all(torch.equal(after[k], before[k]) for k in before)
 
@@ -317,8 +316,7 @@ print("OK")
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 def test_streamed_merge_into_the_directory_the_model_was_loaded_from(tmp_path, dtype):
-    """from_pretrained memory-maps the weights: overwriting model.safetensors in place crashed (SIGBUS) or failed
-    with EFAULT and destroyed the source checkpoint. Files are now written aside and moved into place."""
+    """In-place overwrite of mmapped weights destroyed the source (SIGBUS); write aside, move."""
     script = tmp_path / "run.py"
     script.write_text(_SOURCE_DIR_SCRIPT)
     env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", "")}

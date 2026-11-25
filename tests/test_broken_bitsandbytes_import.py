@@ -20,8 +20,7 @@ _STUB = f'raise AttributeError("{_BREAKAGE}")\n'
 
 
 def _run(code, *, poisoned):
-    """Runs code in a fresh interpreter, optionally with the broken dep first on sys.path; repo root goes on PYTHONPATH
-    so the tree under test is imported, not an installed unsloth_zoo."""
+    """Runs in a fresh interpreter; repo root on PYTHONPATH so the tree under test is imported."""
     path = [str(_ROOT)]
     if poisoned:
         path.insert(0, str(poisoned))
@@ -66,8 +65,7 @@ def test_patching_utils_imports_when_bitsandbytes_cannot(poisoned_bitsandbytes):
     """Regression: patching_utils is on the path import unsloth walks via unsloth/models/_utils.py, so its failure takes the whole import down."""
     out = _run(
         "import sys, importlib\n"
-        # Precondition: transformers must really import the poisoned bitsandbytes on this version, or patching_utils was
-        # never at risk and the case proves nothing.
+        # Transformers must import poisoned bitsandbytes or patching_utils was never at risk.
         "try:\n"
         "    importlib.import_module('transformers.integrations.bitsandbytes')\n"
         "except AttributeError:\n"

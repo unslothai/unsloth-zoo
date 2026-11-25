@@ -219,8 +219,7 @@ def test_ragged_chunks(monkeypatch, chunks):
 @pytest.mark.parametrize("limit, sparse_calls", [("0.001", 0), ("1.0", 1)])
 @pytest.mark.parametrize("softcap", [0.0, 30.0])
 def test_crossover_routes_by_union_density(monkeypatch, limit, sparse_calls, softcap):
-    # top_k 8 over 111 rows is saved as CSR (68 bytes a row vs 376 packed); its union is ~25% of V, so a 0.001
-    # cutoff sends it through the full-width CSR backward and 1.0 through W[U]. Both equal the kill switch.
+    # Union ~25% of V: cutoff 0.001 gives full-width CSR, 1.0 gives W[U]; both match dense.
     hidden, head, index, _ = _inputs(seed = 15)
     _, gd, _, _, _ = _run(monkeypatch, "dense", hidden, head, index, 1.0, 8, 1.0, 0.0, softcap, chunks = 1)
     monkeypatch.delenv("UNSLOTH_GRPO_KEPT_SET_SPARSE", raising = False)
@@ -237,8 +236,7 @@ def test_crossover_routes_by_union_density(monkeypatch, limit, sparse_calls, sof
 
 
 def test_wide_head_short_chunk_stays_dense(monkeypatch):
-    # 4 rows under a 4096-wide head: the union passes the density cutoff but gathering W[U] costs more than the
-    # 4 x V buffers it replaces, so the byte guard keeps the full-width backward.
+    # 4 rows, 4096-wide head: gathering W[U] costs more than 4 x V; byte guard keeps it dense.
     g = torch.Generator().manual_seed(21)
     hidden = torch.randn(1, 4, 4096, generator = g)
     head = torch.randn(V, 4096, generator = g) * 0.05

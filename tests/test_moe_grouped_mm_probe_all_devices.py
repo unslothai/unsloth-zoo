@@ -55,7 +55,6 @@ def spoof(monkeypatch):
         monkeypatch.setattr(moe_utils, "_GROUPED_MM_HOME", None, raising = False)
         monkeypatch.setattr(moe_utils, "_GROUPED_MM_HOMOGENEOUS", False, raising = False)
         monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", None)
-        # Warm-up selects grouped_mm; teardown restores _SELECTED_MOE_BACKEND for absent cards.
         monkeypatch.setattr(moe_utils, "_SELECTED_MOE_BACKEND", None, raising = False)
         for name in ("_GROUPED_MM_FOREIGN", "_TORCH_GROUPED_MM_SUPPORTED_BY_KIND", "_GROUPED_MM_SURVIVES_BY_KIND",
                      "_TRANSPOSED_VIEW_SAFE_BY_KIND"):
@@ -134,7 +133,6 @@ def test_a_current_device_switch_does_not_borrow_the_first_cards_answer(spoof, m
 
 
 def test_first_callers_on_different_cards_agree_on_the_home_card(spoof, monkeypatch):
-    # Two first callers on different-model cards, neither probed yet: the second must not also claim "home".
     seen = spoof(2, failing = (1,), models = ["H100", "RTX4090"])
     assert moe_utils._grouped_mm_foreign_kind(cuda(0)) is None
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
@@ -345,7 +343,6 @@ def test_view_probe_runs_on_the_input_card(spoof, monkeypatch):
     probed = []
     monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda d: probed.append(d.index) or d.index == 1)
     assert moe_utils._grouped_mm_supported_on(cuda(1)) is True
-    # Probed with support, in the same eager region: the view check opens no second one.
     assert probed == [1]
     def no_second_region(fn): raise AssertionError("second compiler-disabled region")
     monkeypatch.setattr(moe_utils, "_run_probe_eagerly", no_second_region)
@@ -432,7 +429,6 @@ def test_eager_warmup_lets_a_trace_on_the_other_model_read_its_own_answer(spoof,
     monkeypatch.setattr(moe_utils, "_transposed_view_probe", lambda d: views.append(d.index) or True)
     # Even where torch would fall back internally, a warmed card answers for itself.
     monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_FALLS_BACK", True, raising = False)
-    # The eager warm-up with the experts split across both models (device_map).
     _warm_moe_backend(monkeypatch, [cuda(0), cuda(1)])
     assert moe_utils._TORCH_GROUPED_MM_SUPPORTED is True
     assert moe_utils._TRANSPOSED_VIEW_GROUPED_MM_SAFE is True
@@ -450,7 +446,6 @@ def test_eager_warmup_lets_a_trace_on_the_other_model_read_its_own_answer(spoof,
 
 
 def _warm_moe_backend(monkeypatch, expert_devices):
-    # The real eager entry point on a model whose stacked expert weights sit on `expert_devices`.
     from unsloth_zoo.temporary_patches import moe_experts_interface as mei
     monkeypatch.setattr(moe_utils, "get_forward_moe_backend", lambda: moe_utils.forward_moe_backend)
     experts = [types.SimpleNamespace(_parameters = {"gate_up_proj": types.SimpleNamespace(device = d)}) for d in expert_devices]
@@ -471,7 +466,6 @@ def _distributed(monkeypatch):
 
 
 def test_a_rank_never_probes_a_card_its_experts_do_not_use(spoof, monkeypatch):
-    # Only the home card and the experts' cards are probed, never another rank's card.
     seen = spoof(2, failing = (1,), models = ["H100", "RTX4090"])
     _distributed(monkeypatch)
     views = []
@@ -627,8 +621,7 @@ def _split_model(*devices, others = ()):
 
 
 def test_loader_warms_a_foreign_expert_card_before_compile(spoof, monkeypatch):
-    # H100 home with an A100 holding later layers: the loader resolves the A100 eagerly, so the compiled forward's first
-    # A100 query traces under fullgraph=True, not the disabled probe
+    # Loader resolves A100 eagerly; first query traces fullgraph=True, not the disabled probe.
     from unsloth_zoo.temporary_patches.moe_grouped_modulelist import auto_enable_grouped_moe
     seen = spoof(3, models = ["H100", "A100", "L4"])
     assert moe_utils._check_torch_grouped_mm_supported() is True

@@ -171,7 +171,6 @@ def _load_args(monkeypatch, **kwargs):
     monkeypatch.setattr(vllm_utils, "get_mem_info", lambda: (80 * GiB, 80 * GiB))
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
     if "vllm_version" not in vars(vllm_utils):
-        # load_vllm imports and patches vLLM's modules, so these engine-arg checks need vLLM installed.
         pytest.skip(reason = "load_vllm needs vLLM installed: it imports and patches vLLM modules")
     config = _config(head_dim = 128, architectures = ["Qwen3ForCausalLM"], torch_dtype = "bfloat16")
     return vllm_utils.load_vllm(

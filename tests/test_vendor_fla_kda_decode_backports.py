@@ -41,7 +41,6 @@ def test_kda_decode_backports_present():
     assert "num_warps=decode_warps,\n        num_stages=decode_stages," in code
     # 1416: dense outputs skip the zero fill, packed outputs keep it.
     assert "out = torch.empty_like(v) if cu_seqlens is None else torch.zeros_like(v)" in code
-    # 1329 / 1135 / 1571 / 1414.
     assert "pid = tl.program_id(0).to(tl.int64)" in code
     assert "b_g = tl.load(p_g, mask=mask_k, other=0, eviction_policy='evict_last')" in code
     assert "if T == 0 and IS_CONTINUOUS_BATCHING:" in code

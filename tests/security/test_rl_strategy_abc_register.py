@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""A generated strategy must not add virtual subclasses to host ABCs: `Sequence.register(dict)` rewrites the process-wide
-ABC registry, so trusted code's isinstance checks change for the rest of the run."""
+"""A generated strategy must not register into host ABCs: it changes trusted isinstance checks."""
 
 import collections.abc
 import numbers

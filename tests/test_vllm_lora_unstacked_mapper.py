@@ -166,7 +166,6 @@ def test_unstacked_mapper_used_for_local_checkpoint(mapper_cls):
 
 
 def test_rename_mapper_wins_when_both_helpers_exist():
-    # A version exposing both must not be served by the deprecated spelling.
     record = {}
 
     class _Both(_StackedMapper):
@@ -211,7 +210,6 @@ def test_legacy_mapper_without_unstack_is_forwarded_unchanged():
 
 
 def test_noncallable_unstacked_attribute_is_forwarded_unchanged():
-    # Defensive: an attribute exists but is not callable -> do not invoke it
     record = {}
     weird_mapper = types.SimpleNamespace(get_unstacked_mapper="not-callable")
     mgr = _make_manager(record, mapper=weird_mapper)

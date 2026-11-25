@@ -209,8 +209,7 @@ def _resolve_key(adapted_key: str, base_keys: set[str]) -> str | None:
 
 
 def _load_named_params(model_dir: str) -> dict[str, torch.Tensor]:
-    """Load a saved model as {param_name: cpu tensor}; in-memory names match PEFT adapted keys even when on-disk layout
-    differs (composite-VLM prefixes, per-expert shards), since transformers re-packs experts on load."""
+    """Loads params as {name: cpu tensor} in the re-packed in-memory layout PEFT keys match."""
     from transformers import AutoModelForCausalLM
     model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.float32)
     return {n: p.detach().cpu() for n, p in model.named_parameters()}
@@ -278,8 +277,7 @@ def assert_merge_correct(*, family, base_tensors, out_dir, save_dtype,
     leaked = [k for k in merged if any(m in k for m in _LORA_REMNANT_MARKERS)]
     assert not leaked, f"[{family}] adapter remnants in merged output: {leaked[:5]}"
 
-    # Fused experts may be saved per-expert (e.g. qwen3_5_moe), so the adapted key has no single
-    # safetensor; saving_utils._merge_moe_* handles it; verify in-memory, where names match.
+    # Per-expert saves (e.g. qwen3_5_moe) have no single safetensor key; verify in-memory.
     if any(a.fused and _resolve_key(ak, base_keys) is None for ak, a in adapted.items()):
         assert base_dir is not None, (
             f"[{family}] base_dir is required to verify per-expert-serialized "
@@ -501,9 +499,8 @@ def build_and_save_base(spec: FamilySpec, base_dir: str, *, dtype=torch.float32,
     try:
         model = AutoModelForCausalLM.from_config(cfg).to(dtype)
     except AttributeError:
-        # Composite MoE configs keep vocab_size under text_config; some transformers releases build the backbone from
-        # the top-level config and raise AttributeError (e.g. qwen3_5_moe on 5.5.0); mirror
-        # unsloth_zoo.create_empty_causal_lm and retry from text_config so the fused-expert path still runs.
+        # Composite MoE configs keep vocab_size under text_config; some transformers raise
+        # AttributeError on the top-level config (qwen3_5_moe on 5.5.0), so retry from text_config.
         if hasattr(cfg, "vocab_size") or not hasattr(cfg, "text_config"):
             raise
         model = AutoModelForCausalLM.from_config(cfg.text_config).to(dtype)

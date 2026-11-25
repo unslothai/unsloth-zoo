@@ -12,8 +12,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""A removed PARENT package is upstream drift: ModuleNotFoundError.name is the deepest missing
-package, so matching only the full path or top-level name skipped it and let a hard gate pass."""
+"""A removed parent package is drift; ModuleNotFoundError.name is the deepest missing package."""
 
 import importlib
 import pathlib

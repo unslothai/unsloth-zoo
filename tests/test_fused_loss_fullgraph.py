@@ -69,7 +69,6 @@ def test_preference_logps_fullgraph_no_count_recompiles(dynamic):
     torch._dynamo.reset()
     counters.clear()
     compiled = torch.compile(_score, backend = "aot_eager", fullgraph = True, dynamic = dynamic)
-    # Same shape, every valid token count, including none and all.
     for valid in (8, 5, 1, 0, 7):
         eager = _run(_score, _inputs(8, valid))
         got = _run(compiled, _inputs(8, valid))
@@ -122,7 +121,6 @@ def test_preference_logps_matches_autograd_function_path(dtype, head_grad, monke
             assert (x is None) == (y is None)
             if x is not None:
                 assert x.dtype == y.dtype and torch.equal(x, y)
-    # Unselected rows get exact zero gradient.
     assert torch.count_nonzero(b[3][0][~_inputs(8, 0)[3]]) == 0
 
 
@@ -140,8 +138,7 @@ def test_preference_logps_custom_op_opcheck():
 
 @pytest.mark.parametrize("seq_len, valid", [(8, 5), (64, 60)])
 def test_preference_logps_custom_op_opcheck_half_head_hidden_grad(seq_len, valid):
-    # Trainable fp16 head with hidden grads: (8, 5) keeps the vocab sliced backward, while (64, 60), selecting more than
-    # 2 * vocab rows, switches to the per chunk backward; real op must return lse at the fake shape.
+    # fp16: (64, 60) (>2*vocab rows) uses per-chunk backward; op must return lse at fake shape.
     if not hasattr(torch.library, "opcheck"):
         pytest.skip("torch.library.opcheck unavailable")
     states, weight, labels, mask = _inputs(seq_len, valid, dtype = torch.float16)

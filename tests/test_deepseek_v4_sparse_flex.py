@@ -246,8 +246,7 @@ def test_flex_keeps_finite_mask_biases_in_float32():
 
 @needs_flex_gpu
 def test_flex_compiles_fullgraph_with_a_biased_mask():
-    """Inside a fullgraph compile the bias check must not branch on data; output and dq match eager flex; compiled
-    no_grad inference falls back to eager, not a lowering failure."""
+    """Fullgraph compile: bias check must not branch on data; no_grad inference goes eager."""
     attn, q, kv, mask, _ = _function_case(torch.bfloat16)
     visible = mask > torch.finfo(mask.dtype).min / 2
     mask = torch.where(visible, mask - 0.5, mask)
@@ -565,8 +564,7 @@ def test_cuda_graph_capture_matches_eager(finite_bias):
 
 @needs_flex_gpu
 def test_cold_fullgraph_compile_is_one_graph(monkeypatch):
-    """Right after install a fullgraph dynamic compile is one graph; setting the compiled flex callable lazily inside
-    the trace made its `_FLEX is None` guard recompile the next call."""
+    """Cold fullgraph compile is one graph; lazily setting _FLEX inside the trace recompiles."""
     import torch._dynamo
     monkeypatch.setattr(modeling, "eager_attention_forward", ORIGINAL)
     monkeypatch.setattr(F4, "_FLEX", None)

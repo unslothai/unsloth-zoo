@@ -140,7 +140,6 @@ class TestDiscreteIsUntouched:
         assert calls == []
 
     def test_hip_never_calls_mem_get_info(self, monkeypatch):
-        # The ROCm path keeps whatever it did before, untouched by this probe.
         calls = _install(monkeypatch, _Props(96 * GIB, 1), driver_total = None, hip = "6.4.0")
         assert integrated_device.cuda_total_memory(0) == 96 * GIB
         assert calls == []

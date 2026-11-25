@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Local base models resolve offline: path-shaped names never reach the Hub, local copies win,
-single names like gpt2 are still probed; HfFileSystem.ls error types differ across versions."""
+"""Path-shaped names skip the Hub; local copies win; HfFileSystem.ls errors vary by version."""
 
 import json
 import os
@@ -206,8 +205,7 @@ def test_local_base_model_resolves_without_network(monkeypatch, tmp_path, shape)
 
 
 def test_absolute_local_path_resolves_under_hf_hub_offline(monkeypatch, tmp_path):
-    """HF_HUB_OFFLINE=1 is read at import, so it cannot offline an imported hub;
-    OfflineModeIsEnabled is never reached for absolute paths; removing either still fails."""
+    """HF_HUB_OFFLINE is read at import; absolute paths never reach OfflineModeIsEnabled."""
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.chdir(tmp_path)
     _make_local_model("base")

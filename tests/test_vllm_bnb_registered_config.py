@@ -74,8 +74,7 @@ def test_an_unregistered_method_is_left_alone(monkeypatch):
 
 
 def test_the_missing_plugin_error_is_raised_where_4bit_is_decided():
-    """The missing-plugin install hint must be raised where 4-bit is decided: patch_vllm_bitsandbytes never installs the
-    no-bnb `_apply_4bit_weight`, so vLLM >= 0.28 gave a generic error."""
+    """Install hint belongs where 4-bit is decided, else vLLM >= 0.28 gives a generic error."""
     import inspect
 
     from unsloth_zoo import vllm_utils

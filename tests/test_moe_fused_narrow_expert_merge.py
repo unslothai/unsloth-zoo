@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU regression: fused-3D MoE LoRA merge must still apply the delta on narrow-expert layouts (2*intermediate <
-hidden), where the shape heuristic mislabels them transposed; the LoRA-dimension layout wins even with a wrong
-is_transposed=True hint"""
+"""CPU regression: fused-3D MoE LoRA merge applies the delta on narrow layouts (2*intermediate <
+hidden) that the shape heuristic mislabels; LoRA dims beat a wrong is_transposed=True hint."""
 
 from __future__ import annotations
 
@@ -52,8 +51,7 @@ def _build(hidden, intermediate, dtype=torch.float32):
 
 
 def _reference(W, A, B, alpha):
-    """PEFT's packing written out independently: lora_A is expert-slowest (contiguous row block per
-    expert), lora_B expert-fastest; so the expectation cannot mirror the helper under test."""
+    """Independent PEFT packing, not the helper: lora_A expert-slowest, lora_B expert-fastest."""
     out = W.clone().to(torch.float64)
     for e in range(NUM_EXPERTS):
         b_e = B.reshape(B.shape[0], RANK, NUM_EXPERTS)[:, :, e].to(torch.float64)
@@ -84,7 +82,6 @@ def test_fused_narrow_expert_merge_applies_delta(model, hint):
     assert _MOE_MERGE_STATE["fallback"] == 0, _MOE_MERGE_STATE["first_error"]
     assert _MOE_MERGE_STATE["applied"] == 2
     assert gu_err < 1e-4 and dn_err < 1e-4, f"gate_up={gu_err:.2e} down={dn_err:.2e}"
-    # delta must actually be applied, not the base written through
     assert not torch.equal(gu_out.cpu(), gate_up_W)
     assert not torch.equal(dn_out.cpu(), down_W)
     _reset_moe_merge_state()

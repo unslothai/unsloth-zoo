@@ -138,9 +138,8 @@ def test_config_layer_never_returns_none_while_forking_is_available(monkeypatch,
 @pytest.mark.parametrize("method", ["spawn", "forkserver", None])
 @pytest.mark.parametrize("desired", [None, 1, 16])
 def test_config_layer_is_none_not_one_on_a_non_fork_start_method(monkeypatch, dnp, method, desired):
-    """Config sentinel 1 reached unpatched TRL map sites (DPO, KTO, CPO, ORPO, Reward, PRM; SFT is rewritten) and built
-    a spawn Pool(1) that re-imports __main__ (issues 3211 and 3397); None is safe where forking is unavailable, since
-    auto-sizers also veto non-fork methods."""
+    """Sentinel 1 reached unpatched TRL map sites and built a spawn Pool(1) that re-imports __main__
+    (issues 3211 and 3397); None is safe as auto-sizers also veto non-fork methods."""
     _force_start_method(monkeypatch, dnp, method)
     assert dnp.get_dataset_num_proc(desired, serial_as_none = False) is None
 
@@ -358,8 +357,7 @@ def test_start_method_probe_prefers_the_real_default_over_list_order(monkeypatch
 
 
 def test_macos_stays_in_process_even_though_multiprocess_forks(monkeypatch, dnp, capsys):
-    """The probe reports fork on macOS but policy still refuses it: CPython moved macOS to spawn in 3.8 (bpo-33725)
-    because forking can crash, and this parent holds Torch and a threaded BLAS."""
+    """macOS spawn since CPython 3.8 (bpo-33725): fork can crash with Torch and threaded BLAS."""
     _force_start_method(monkeypatch, dnp, "fork")
     # Pin memory so the contrast is about policy, not the runner's free RAM.
     monkeypatch.setattr(dnp, "_affordable_workers", lambda: 1000)
@@ -687,8 +685,7 @@ def _force_stdlib_start_method(monkeypatch, dnp, method):
 
 
 def test_serial_is_one_when_the_two_modules_disagree(monkeypatch, dnp, capsys):
-    """None to train_on_responses_only means auto-size, which asks stdlib multiprocessing; where that says fork and
-    multiprocess says spawn it picks cpu_count + 4 workers on spawn (issues 3211 and 3397)."""
+    """Stdlib fork vs multiprocess spawn picks cpu_count + 4 workers (issues 3211 and 3397)."""
     _force_start_method(monkeypatch, dnp, "spawn")
     _force_stdlib_start_method(monkeypatch, dnp, "fork")
 
@@ -806,8 +803,7 @@ def _old_zoo(monkeypatch, memory_limit = None):
 
 
 def test_the_unaided_reader_subtracts_usage_too(monkeypatch, dnp, tmp_path):
-    """cgroup_memory_limit() alone reports an 8GB cgroup holding 6GB as 8GB free, so an older Zoo must still subtract
-    usage or map() children get OOM-killed (issue 2693)."""
+    """Limit alone counts usage as free: subtract it or map() children OOM-killed (issue 2693)."""
     _old_zoo(monkeypatch, memory_limit = 8 * 1024**3)
     leaf = tmp_path / "kubepods" / "podabc"
     leaf.mkdir(parents = True)
@@ -930,8 +926,7 @@ def test_no_unsloth_zoo_still_reads_the_cgroup(monkeypatch, dnp, tmp_path):
 
 
 def test_env_forced_serial_is_in_process_on_a_small_split(monkeypatch, dnp):
-    """With UNSLOTH_DATASET_NUM_PROC=0 the config sentinel 1 must become None, since returning 1 bypasses the
-    small-split guard and builds Pool(1) on datasets >= 4.1."""
+    """UNSLOTH_DATASET_NUM_PROC=0 must give None, not 1: 1 bypasses the small-split guard."""
     _force_start_method(monkeypatch, dnp, "fork")
     _force_stdlib_start_method(monkeypatch, dnp, "fork")
     monkeypatch.setenv(dnp.NUM_PROC_ENV_VAR, "0")

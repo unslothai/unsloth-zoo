@@ -69,7 +69,6 @@ requires_packing_fix = pytest.mark.skipif(
 
 
 # ---------------------------------------------------------------------------------------
-# Fixtures
 # ---------------------------------------------------------------------------------------
 
 
@@ -225,8 +224,7 @@ def test_peft_still_packs_lora_b_rank_major():
     scaling = wrapper.scaling["default"]
     got = _pristine_get_delta_weight()(wrapper, "default").float()
 
-    # PEFT 3165 (0.19.1) flipped which 3D axis counts as in_features, so which einsum runs depends on the release; this
-    # is in/out orientation only, not expert-vs-rank order; read _did_swap_in_out_features from the wrapper.
+    # PEFT 3165 (0.19.1) flipped in/out axis; read _did_swap_in_out_features; not expert/rank.
     dim_B = weight_B.shape[0]
     subscript = "e o i" if getattr(wrapper, "_did_swap_in_out_features", False) else "e i o"
     A = weight_A.reshape(NUM_EXPERTS, RANK, -1).float()
@@ -330,8 +328,7 @@ def test_get_delta_weight_is_pefts_own_unless_the_legacy_layout_is_declared(
 def test_get_delta_weight_reconstructs_the_separated_forward_delta(
     moe_param_wrapper_patch, legacy_lora_b_layout,
 ):
-    """Declared legacy, the merge must rebuild the forward's delta: PEFT's own reconstruction pairs lora_A rows with the
-    wrong lora_B columns, so merge_and_unload, merge_adapter and unmerge would bake a scrambled delta."""
+    """Legacy merge must rebuild the forward delta; PEFT mispairs lora_A rows, lora_B columns."""
     _, wrappers = _wrap(["experts.gate_up_proj"])
     wrapper = wrappers["gate_up_proj"]
     _seed_lora_b(wrapper)
@@ -462,7 +459,6 @@ def test_the_patches_are_idempotent(moe_param_wrapper_patch):
 
 
 # ---------------------------------------------------------------------------------------
-# The marker in adapter_config.json
 # ---------------------------------------------------------------------------------------
 
 
@@ -488,8 +484,7 @@ def test_layout_marker_is_written_to_adapter_config(
 def test_the_marker_records_rank_major_for_an_adapter_trained_after_the_fix(
     tmp_path, moe_param_wrapper_patch, default_lora_b_layout,
 ):
-    """The marker records how this adapter was trained: rank_major needs no conversion, while grouped_by_expert is a
-    column permutation (flat column e*r + j becomes j*E + e); always-grouped carries no information."""
+    """rank_major needs no conversion; grouped_by_expert permutes columns (e*r+j to j*E+e)."""
     model, _ = _wrap(["experts.gate_up_proj"])
     model.save_pretrained(str(tmp_path))
 
@@ -709,7 +704,6 @@ def test_a_save_that_writes_no_config_is_not_an_error(tmp_path, moe_param_wrappe
 
 
 # ---------------------------------------------------------------------------------------
-# The condition under which any of this matters
 # ---------------------------------------------------------------------------------------
 
 
@@ -721,8 +715,7 @@ def test_a_save_that_writes_no_config_is_not_an_error(tmp_path, moe_param_wrappe
 def test_the_two_packings_differ_whenever_experts_and_rank_both_exceed_one(
     num_experts, rank,
 ):
-    """Both lora_B readings always fit (E*R == R*E), so a wrong merge is silent; they agree only when E == 1 or R == 1,
-    and equal num_experts and rank does not make them agree."""
+    """Both lora_B readings fit, so a wrong merge is silent; they agree only when E or R is 1."""
     out_features, in_features = 5, 7
     generator = torch.Generator().manual_seed(0)
     weight_A = torch.randn(num_experts * rank, in_features, generator=generator,
@@ -993,8 +986,7 @@ def test_a_forward_that_never_reads_the_stash_is_reported_rank_major(
 def test_an_unmeasured_verdict_does_not_override_the_structural_answer(
     moe_param_wrapper_patch, legacy_lora_b_layout,
 ):
-    """None means not measured yet, not evidence the forward ignores the stash; treating it as False would report
-    rank_major for every wrapper before its first forward, including on save."""
+    """None is unmeasured; read as False, all wrappers report rank_major before any forward."""
     _, wrappers = _wrap(["experts.gate_up_proj"])
     wrapper = wrappers["gate_up_proj"]
     assert MU.moe_lora_forward_applies_stash(

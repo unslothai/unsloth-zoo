@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests unsloth_zoo.fast_grad_params (per-step clip and zero_grad over a cached parameter tuple);
-training runs must match UNSLOTH_FAST_GRAD_PARAMS=0 bitwise, with FAST_GRAD_CALLS engaged."""
+"""Fast grad clip/zero_grad: match UNSLOTH_FAST_GRAD_PARAMS=0 bitwise, FAST_GRAD_CALLS engaged."""
 import contextlib
 import functools
 import json
@@ -85,8 +84,7 @@ def _first_lora(model):
 
 def _train(model, out, kind = "hf", ga = 1, max_grad_norm = 1.0, steps = 10, events = None, set_to_none = True,
            calls = 1, between = None, **extra):
-    """Result tuple: exact per-microstep losses, logged grad norms and final weights; events[k](model) runs after
-    microstep k's backward; between(trainer) runs between train() calls."""
+    """Returns losses, grad norms, final weights; events[k] runs after microstep k's backward."""
     from transformers import TrainerCallback, TrainingArguments, Trainer
     if kind == "sft":
         from trl import SFTConfig, SFTTrainer
@@ -96,8 +94,7 @@ def _train(model, out, kind = "hf", ga = 1, max_grad_norm = 1.0, steps = 10, eve
         tok.pad_token = tok.eos_token
         kw = dict(processing_class = tok, train_dataset = _dataset(labels = False))
         extra.setdefault("max_length", 64)
-        # SFTConfig defaults bf16 on, which TrainingArguments refuses without a bf16 accelerator; bf16 is set only when
-        # CUDA supports it, matching the hf arm's default off.
+        # bf16 defaults on in SFTConfig; TrainingArguments refuses w/o bf16, so gate on CUDA.
         extra.setdefault("bf16", torch.cuda.is_available() and torch.cuda.is_bf16_supported())
     else:
         base, Args = Trainer, TrainingArguments

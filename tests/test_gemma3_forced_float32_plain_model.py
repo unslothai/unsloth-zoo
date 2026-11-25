@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Plain transformers bf16/fp32 Gemma 3 keeps its dtype after an fp16 forced-float32 Unsloth load:
-patches live on shared classes and nothing reruns them for non-Unsloth loads, so the final
-RMSNorm must not emit fp16 into lm_head (inference and generate crashed)."""
+"""Plain bf16/fp32 Gemma 3 keeps dtype after fp16 forced-float32 load; nothing reruns shared-class
+patches on plain loads, so final RMSNorm must not emit fp16 (inference, generate crashed)."""
 
 import json
 import os

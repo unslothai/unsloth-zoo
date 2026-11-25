@@ -132,7 +132,6 @@ def _gemma3n():
         conf += [f"{b}.ffw_layer_start.ffw_layer_1", f"{b}.ffw_layer_start.ffw_layer_2"]
         conf += [f"{b}.ffw_layer_end.ffw_layer_1",   f"{b}.ffw_layer_end.ffw_layer_2"]
         conf += [f"{b}.lconv1d.linear_start", f"{b}.lconv1d.linear_end"]
-        # non-Linear decoys under audio_tower:
         others += [(f"{b}.lconv1d.depthwise_conv1d", lambda: nn.Conv1d(8, 8, 3)),
                    (f"{b}.lconv1d.conv_norm", lambda: nn.LayerNorm(8)),
                    (f"{b}.attention.post_norm", lambda: nn.LayerNorm(8))]
@@ -303,7 +302,6 @@ def test_audio_respects_explicit_target_modules():
     assert {"q_proj", "v_proj"} <= at
     assert "k_proj" not in at and "ffw_layer_1" not in at and "post" not in at, \
         f"explicit target_modules not respected by audio branch: {at}"
-    # embedding_projection was not in the list -> the projector is not attached
     assert not any(n.endswith("embed_audio.embedding_projection") for n in on)
 
 
@@ -319,8 +317,7 @@ def test_gemma4_audio_matches_inner_linear_not_wrapper(builder, name):
     r = get_peft_regex(model, finetune_vision_layers=True, finetune_language_layers=True,
                        finetune_audio_layers=True)
     lin = set(linear_names(model))
-    # The audio branch must not match any non-Linear module under audio_tower or the embedders, since PEFT iterates
-    # every module; vision_tower.encoder wrappers are handled by the main regex and _create_and_replace monkeypatch.
+    # Only Linears may match under audio_tower/embedders (PEFT iterates every module).
     def _ours(n):
         return ".audio_tower." in n or "embed_audio" in n or "embed_vision" in n
     bad = [n for n in all_module_names(model) if _ours(n) and n not in lin and re.fullmatch(r, n)]
@@ -382,8 +379,7 @@ def test_positional_tag_overrides_not_shadowed():
 
 
 def test_embedder_branches_gated_to_gemma_model_type():
-    # empty_model.py lists embed_vision.embedding_projection and vision_tower.patch_embedder.input_proj for Mistral3; a
-    # non-Gemma checkpoint with those Linears must stay byte-identical under finetune_vision_layers=True.
+    # Gemma-gated: Mistral3 embedder Linears stay byte-identical under finetune_vision_layers.
     shared = ["embed_vision.embedding_projection",
               "vision_tower.patch_embedder.input_proj"]
     mistral = FakeModel(_text_stack("language_model.layers") + shared,

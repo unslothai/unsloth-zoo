@@ -240,8 +240,7 @@ def test_declines_a_one_dimensional_tensor(M):
 
 
 def test_declines_an_expert_that_is_not_whole_blocks(M):
-    """A block straddling two slices is rescaled by the wrong absmax when packed bytes are concatenated; 2 elements per
-    expert is even, so only the block check can decline it, while an odd count would hide a dropped check."""
+    """Straddling blocks get wrong absmax; 2 per expert is even, so only block check declines."""
     value = torch.zeros(8, 1, 2, dtype = torch.bfloat16)
     per_expert = value[0].numel()
     assert per_expert % BLOCKSIZE != 0 and per_expert % 2 == 0
@@ -380,8 +379,7 @@ class _PretendCuda(torch.Tensor):
 
 
 def test_the_cap_is_the_measured_bitsandbytes_limit():
-    """bitsandbytes 0.50.2: quantize_4bit takes 2**31 - 64 and aborts at 2**31 (csrc/ops.cu line 74); dequantize_4bit
-    takes 2146435072 and aborts at 2**31 (line 93); raising re-enables the abort, lowering slices stacks needlessly"""
+    """0.50.2 aborts at 2**31 (csrc/ops.cu); higher caps re-abort, lower caps slice needlessly."""
     real = pytest.importorskip("unsloth_zoo.temporary_patches.moe_utils_bnb4bit")
     assert real._BNB_MAX_QUANTIZE_NUMEL == 2 ** 31
 
@@ -408,7 +406,6 @@ def test_every_threshold_comparison_is_inclusive_at_the_cap():
         f"{seen}. A rename would empty this test rather than fail it."
     )
     for lineno, text, ops in seen:
-        # numel >= CAP slices at the cap and numel < CAP declines below it; > or <= would let a stack of exactly CAP reach the aborting call.
         assert ops in (["GtE"], ["Lt"]), (
             f"line {lineno}: `{text}` is exclusive at the cap, so a stack of "
             f"exactly {2 ** 31} elements reaches the bitsandbytes call that aborts"
@@ -459,8 +456,7 @@ def test_dequant_slices_a_stack_of_exactly_the_cap(M):
 
 
 def test_a_plain_tuple_original_shape_counts_the_same(M):
-    """Size check uses torch.Size.numel() when available, else multiplies dims, so a plain tuple
-    _original_shape must count alike; other tests use torch.Size and miss a broken fallback."""
+    """Plain tuple _original_shape must count like torch.Size; others miss a broken fallback."""
     value = _stack(experts = 8)
     assert value.numel() > SMALL_CAP
 

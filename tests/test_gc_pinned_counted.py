@@ -230,8 +230,7 @@ def test_unset_settings_keep_the_simulated_path(monkeypatch, gc_module, allocato
 
 @pytest.mark.parametrize("settings", ["pinned_max_round_threshold_mb:1", "pinned_max_cached_size_mb:1"])
 def test_foreign_pin_between_reservations_counts_against_the_cap(gc_module, allocator, settings):
-    # Codex 4405981969: cap 10 MiB, reserve 3, another user pins 6 (training_utils.py's input_ids /
-    # labels, a pin_memory DataLoader), reserve 3. 12 MiB would really be held.
+    # Codex 4405981969: foreign 6 MiB DataLoader pin still counts against the 10 MiB cap.
     fake = allocator(settings, cap_bytes = 10 * MIB)
     a = pin(gc_module, fake, 3 * MIB)
     assert a and fake.held() == pytest.approx(3 * MIB, abs = 64)
@@ -246,8 +245,7 @@ def test_foreign_pin_between_reservations_counts_against_the_cap(gc_module, allo
 
 @pytest.mark.parametrize("settings", ["pinned_max_round_threshold_mb:1", "pinned_max_cached_size_mb:1"])
 def test_foreign_pin_present_at_the_baseline_and_then_freed_cannot_lift_the_cap(gc_module, allocator, settings):
-    # A user-set cap bounds all pinned memory the allocator holds: a pin_memory DataLoader's 6 MiB counts
-    # while held, and once returned to the OS it frees exactly that much room, never more.
+    # Foreign pins count toward a user cap while held; returning them frees exactly their size.
     fake = allocator(settings, cap_bytes = 10 * MIB)
     foreign = fake.allocate(6 * MIB)
     assert pin(gc_module, fake, 3 * MIB) is not None

@@ -105,8 +105,7 @@ def _trainer(sftmod = None):
     self._metrics = {"train": collections.defaultdict(list),
                      "eval": collections.defaultdict(list)}
     self._total_train_tokens = 0
-    # _tp_size is 1: tensor parallel ranks see the same batch and trl divides the gathered token count by it; one
-    # process runs here. object.__new__ skips the __init__ that would set it, see test_the_stub_covers_what_trl_reads.
+    # _tp_size=1 (trl divides token count by it); object.__new__ skips __init__ that sets it.
     self._tp_size = 1
     self.aux_loss_enabled = False
     self.compute_loss_func = None
@@ -258,8 +257,7 @@ def _self_reads(func):
 
 
 def test_the_stub_covers_what_trl_reads(sft):
-    """_trainer hand-seeds state after object.__new__, so a new trl __init__ attribute (_tp_size on trl 1.13) breaks
-    every test at once; this test alone goes red, via hasattr on a real SFTTrainer."""
+    """_trainer hand-seeds state; a new trl __init__ attribute (_tp_size on 1.13) breaks it."""
     self = _trainer(sft)
     missing = sorted(name for name in _self_reads(sft.SFTTrainer.compute_loss)
                      if not hasattr(self, name))
@@ -383,8 +381,7 @@ def test_the_1x_shape_keeps_real_metrics():
 
 @pytest.fixture(scope = "module")
 def trl_logs_aux(sft):
-    """Probes whether the installed trl logs aux_loss when the metric block is skipped: 0.23.0-0.25.x keep it inside
-    use_liger_kernel, 0.29.0 and 1.x move it out; asked by running trl, so either move is caught."""
+    """aux_loss sits inside use_liger_kernel in trl 0.23.0-0.25.x, outside in 0.29.0 and 1.x."""
     from transformers import Trainer
     Out = collections.namedtuple("Out", "loss logits aux_loss")
     loss, aux = torch.tensor(1.0), torch.tensor(0.25)
@@ -710,8 +707,7 @@ def test_aux_loss_survives_an_eval_step_too(sft, sentinel):
 
 
 def test_a_failing_retry_does_not_latch_the_fast_path():
-    """Latch only after the retry succeeds: loss_type='dft' or custom loss make the retry raise, and
-    an early latch sticks even with UNSLOTH_RETURN_LOGITS=1; detector reads local outputs."""
+    """Latch only after retry succeeds; early latch sticks under UNSLOTH_RETURN_LOGITS=1."""
     from unsloth_zoo.temporary_patches.misc import _sft_wrap_compute_loss
     Out = collections.namedtuple("Out", "loss logits")
     calls = []

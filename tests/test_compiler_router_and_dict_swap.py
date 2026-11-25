@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Routers rewritten for the routing-weights cast stay compiled; dict entries are swapped only for the exact class
-replaced, since a substring match turned Jamba's attention decoder layer into bare attention."""
+"""Routers stay compiled; dict swaps are exact-class only (substring broke Jamba's attention)."""
 
 import json
 import os

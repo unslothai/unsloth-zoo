@@ -85,8 +85,7 @@ def unpatched_quantizer(monkeypatch):
     try:
         yield auto, misc, recorded, set_module_dir
     finally:
-        # Strip every exec'd name: monkeypatch.delitem would reinstate the generated object at
-        # teardown.
+        # Strip exec'd names: monkeypatch.delitem would reinstate their objects at teardown.
         _strip_generated_globals(misc.__dict__, globals_before)
         auto.__dict__.pop("__dir__", None)
         for name in names:
@@ -104,8 +103,7 @@ def test_an_empty_name_list_no_longer_ends_the_import(monkeypatch, unpatched_qua
     set_module_dir([])
     assert dir(auto) == []
 
-    # Set by hand: the fixture removes new globals itself, since monkeypatch undo would fail on
-    # them.
+    # Set by hand: the fixture removes new globals, since monkeypatch undo would fail on them.
     execd = []
     def recording_exec(source, *args, **kwargs):
         execd.append(source)
@@ -339,7 +337,6 @@ def test_the_flag_the_warning_now_names_really_is_set_for_torch_28():
         ([(8, 0), (7, 5)], [1]),
         ([(7, 5), (8, 0)], [0]),
         ([(7, 5), (7, 5)], [0, 1]),
-        # Negative controls: a homogeneous host that is not sm_75, and a host with no devices at all, are both left untouched.
         ([(8, 0), (9, 0)], []),
         ([], []),
     ],

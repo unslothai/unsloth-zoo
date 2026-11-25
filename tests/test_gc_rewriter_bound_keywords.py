@@ -157,7 +157,6 @@ _TOY_REPLACE = """hidden_states = layer(
                 extra=extra,
                 **kwargs,
             )"""
-# Same call site with no keyword expansion left at all.
 _TOY_REPLACE_NO_KWARGS = """hidden_states = layer(
                 hidden_states,
                 extra=extra,
@@ -394,7 +393,6 @@ def test_generated_module_imports_functools():
     assert '"import functools\\n"' in source
 
 
-# Checkpoint shims
 
 def test_bind_checkpoint_kwargs_is_identity_without_kwargs():
     def fn(x):
@@ -652,9 +650,8 @@ def test_reentrant_checkpointer_returns_gradients_for_tensor_args():
     assert torch.allclose(leaf.grad, torch.full_like(leaf, 6.0))
 
 
-# UnslothCheckpointFunction decided it had a gradient to produce from positional input zero alone, so a frozen input
-# zero hit the early return and gave one None where a gradient per input was needed; torch's reentrant
-# CheckpointFunction saves every tensor input unconditionally.
+# UnslothCheckpointFunction keyed its grad check on positional input 0 alone, so a frozen input 0
+# returned one None; torch's reentrant CheckpointFunction saves every input unconditionally.
 
 
 def _frozen_first_input(checkpoint_fn, as_keyword):

@@ -112,8 +112,7 @@ def test_single_pass_writer_keeps_restricted_output_mode(tmp_path, umask022):
 
 
 def test_mlx_optimizer_resave_temp_is_private_while_written(tmp_path, umask022):
-    # MLX cannot run on Linux: extract save_optimizer_state and drive it with an mx stub that, like mlx's FileWriter,
-    # opens O_CREAT | O_TRUNC (an existing file keeps its mode).
+    # No MLX on Linux: an mx stub mirrors FileWriter's O_CREAT | O_TRUNC, which keeps the mode.
     seen = []
     def save_safetensors(path, flat, metadata = None):
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)

@@ -266,8 +266,7 @@ if __name__ == "__main__":
 
 
 def test_a_previous_models_latch_is_not_evidence_for_the_next():
-    """_LATCHED_EAGER_LABELS is permanent, so it cannot mean fell back just now: an earlier model's labels answered for
-    the next, faking a mode flip that caused a retry instead of a re-raise."""
+    """_LATCHED_EAGER_LABELS is permanent: old model's labels faked a mode flip for the next."""
     U._LATCHED_EAGER_LABELS.add("model_a.SomeNorm.forward")   # discarded model
     assert U.force_eager_fallback(only_if_already_triggered = True) == 0
 
@@ -284,8 +283,7 @@ def test_the_settle_clears_the_recent_labels():
 
 
 def test_a_boundary_with_nothing_pending_still_expires_the_recent_labels():
-    """A give-up outside a checkpoint records its label with no pending entry, so later boundaries took the early return
-    and the label never expired; a later real checkpoint failure was read as a mode flip."""
+    """Give-up outside a checkpoint never expired its label; later failures read as mode flips."""
     U._RECENT_EAGER_LABELS.add("gave_up_outside_a_checkpoint.forward")
     # Nothing pending: no wrapper was registered, so this is the early return.
     assert U.force_eager_fallback() == 0

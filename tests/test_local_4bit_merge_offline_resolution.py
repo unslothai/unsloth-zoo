@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A 4bit merge of a local 4bit base must not depend on the Hub: merged_4bit and forced_merged_4bit never read base
-weights, so a Hub outage falls back to local; nf4/fp4 under merged_16bit must keep raising, since it writes nothing
-and a fallback would be a silent no-op."""
+"""Local 4bit merges must not need the Hub: merged_4bit and forced_merged_4bit never read base
+weights, so outages fall back; nf4/fp4 under merged_16bit must raise (fallback = silent no-op)."""
 
 import ast
 import inspect
@@ -270,8 +269,7 @@ def test_reachable_hub_16bit_repo_still_outranks_the_local_4bit_copy(
     monkeypatch.setattr(saving_utils.HfFileSystem, "ls", fake_ls, raising = True)
     monkeypatch.setattr(
         saving_utils, "check_model_quantization_status",
-        # The local copy is checked by absolute path and the Hub by the name as given, which tells the two calls apart;
-        # the Hub-side call passes local_ok = False (absorbed by **kwargs) when the name is also a directory.
+        # Absolute path = local copy; **kwargs absorbs local_ok = False for dir-named repos.
         lambda name, token = None, **kwargs: (True, "nf4") if os.path.isabs(str(name)) else (False, None),
     )
 

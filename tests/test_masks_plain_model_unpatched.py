@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""patch_transformers_masks replaces create_causal_mask process-wide; under a cache it built a
-boolean mask where transformers gives None, losing maskless causal SDPA and moving bf16 logits;
-with require_model_marker() on, models Unsloth neither loads nor trains keep transformers' mask."""
+"""Models Unsloth neither loads nor trains keep transformers' mask when require_model_marker() is on."""
 
 import json
 import os
@@ -104,7 +102,6 @@ def _run(arm):
 def test_plain_model_keeps_transformers_mask():
     out = _run("marker")
     assert out["ref_maskless"]
-    # The plain model runs exactly as without the patch.
     assert out["plain"]["maskless"]
     assert out["plain"]["equal"], out
     assert not out["marked"]["maskless"]

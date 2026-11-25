@@ -279,8 +279,7 @@ def test_named_backend_is_left_alone(requested):
 
 
 def test_partial_backward_tile_override_is_not_mixed_with_preset_tiles():
-    # A 32-row preset with a caller's BLOCK_M1 = 64 would pair BLOCK_M1 = 64 with the preset BLOCK_N1 = 32, which the
-    # backward template rejects; without the guard the caller's dict replaced the presets.
+    # Caller's BLOCK_M1=64 + preset BLOCK_N1=32 is rejected by backward; guard keeps presets.
     seen = []
     forced = {"BLOCK_M": 32, "BLOCK_N": 32, "BLOCK_M1": 32, "BLOCK_N1": 32, "BLOCK_M2": 32, "BLOCK_N2": 32,
               "FORCE_USE_FLEX_ATTENTION": True}

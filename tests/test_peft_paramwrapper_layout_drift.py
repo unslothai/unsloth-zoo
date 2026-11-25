@@ -47,8 +47,7 @@ class _ToyExperts(nn.Module):
 
 
 class _ToyMoE(nn.Module):
-    """Nests the fused parameter one level like GPT-OSS (mlp.experts.gate_up_proj): PEFT 0.20.0 refuses to target an
-    nn.Parameter on the top-level module; a flat fixture raised and the wrap-failure skip hid it."""
+    """Nested like GPT-OSS: PEFT 0.20.0 refuses to target a top-level nn.Parameter."""
     num_experts = NUM_EXPERTS
 
     def __init__(self):

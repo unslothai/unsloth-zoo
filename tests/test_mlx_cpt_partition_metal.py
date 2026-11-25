@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CUDA-parity continued pretraining end to end on real MLX (Apple Silicon); drives get_peft_model and save routing (LR
-key, full-module unfreeze, save/reload); fine-grained matrix: analysis_artifacts/2026-07-21_mlx-cpt-validation/"""
+"""CUDA-parity CPT end to end on real MLX; covers get_peft_model, save routing and reload."""
 
 from __future__ import annotations
 
@@ -152,9 +151,8 @@ def test_all_linear_expands_inside_a_mixed_cpt_target_list():
 
 
 def test_full_module_only_checkpoint_reloads_without_unfreezing_the_base():
-    # With no LoRA the artifact is stamped fine_tune_type="full" with no LoRA paths and reload takes the pathless route;
-    # mlx-lm load_adapters never freezes, so without a selective freeze every base tensor came back trainable and
-    # scoped-LR keys were lost
+    # No-LoRA artifacts (fine_tune_type=full) reload pathless; mlx-lm load_adapters never freezes,
+    # so without a selective freeze base tensors stayed trainable and scoped-LR keys were lost.
     import json
 
     from unsloth_zoo.mlx.loader import (

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The GRPO policy pass must keep packing and PrefixGrouper within one padded mini-batch's tokens, and keep
-PrefixGrouper off when forwards are collective (sharded FSDP2), so every rank runs the same forwards."""
+"""Packing and PrefixGrouper capped per mini-batch; off for collective forwards so ranks match."""
 
 import collections
 import importlib.util

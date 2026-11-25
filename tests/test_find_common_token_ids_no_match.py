@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""_find_common_token_ids returns no core when absent, never the bare [0] sentinel (masks every
-<unk>/<pad>) or a sentinel-glued id (masks the whole dataset); train_on_responses_only raises."""
+"""No core when absent: never the bare [0] sentinel (masks <unk>/<pad>) or a sentinel-glued id."""
 
 import pytest
 

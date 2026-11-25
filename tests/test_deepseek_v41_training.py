@@ -114,7 +114,6 @@ def test_gradient_checkpointing_replays_group_state(impl):
     assert g0.keys() == g1.keys()
     for name in g0:
         torch.testing.assert_close(g0[name], g1[name], rtol = 1e-4, atol = 1e-6, msg = name)
-    # Every non-indexer weight learns from the LM loss (window KV included).
     zero = [n for n, g in g0.items() if g.abs().sum() == 0 and ".indexer." not in n]
     assert zero == []
 
@@ -208,7 +207,6 @@ def test_auto_targets_cover_engram_and_skip_indexer(impl):
     }
     assert {n.rsplit(".", 1)[-1] for n in hit} == expected
     assert "lm_head" not in hit
-    # An explicit list still reaches the indexer.
     explicit = get_peft_regex(model, True, True, True, True, target_modules = ["q_b_proj"])
     assert any(re.fullmatch(explicit, n) for n in linears if ".indexer." in n)
 
@@ -289,7 +287,6 @@ def test_no_placement_bare_names_are_relative_to_no_split_modules(impl):
     else:
         assert hit == ["model.engram_tables.1.weight", "model.engram_tables.1.weight_scale_inv"]
         assert drop_no_placement_modules(model) == ["model.engram_tables.1"]
-    # Dotted names (Qwen4Exp) keep the suffix match.
     dotted = no_placement_matcher(model, ["engram_tables.1.weight"])
     assert dotted("model.engram_tables.1.weight") and not dotted("lm_head.weight")
 
@@ -323,8 +320,7 @@ def test_pooled_compressor_lora_is_applied_and_trains(impl):
 
 
 def test_gradient_checkpointing_keeps_shared_state_grads_under_a_reentrant_shim(impl, monkeypatch):
-    """Unsloth's smart checkpointer replaces torch.utils.checkpoint.checkpoint with a reentrant one: the patched layer
-    still checkpoints non-reentrantly, so the layers reading another layer's shared KV still send it gradient."""
+    """Layers stay non-reentrant under the reentrant shim, so shared-KV readers get gradient."""
     _patches()
     import torch.utils.checkpoint as ckpt
 
@@ -347,8 +343,7 @@ def test_gradient_checkpointing_keeps_shared_state_grads_under_a_reentrant_shim(
 
 
 def test_gradient_checkpointing_uses_the_bound_non_reentrant_wrapper(impl, monkeypatch):
-    """Unsloth binds a non-reentrant wrapper (it offloads the saved inputs for use_gradient_checkpointing="unsloth")
-    as each layer's _gradient_checkpointing_func; the replaying layer must checkpoint through it, not around it."""
+    """Replay must checkpoint through Unsloth's bound non-reentrant wrapper, not around it."""
     _patches()
     import functools
     import torch.utils.checkpoint as ckpt

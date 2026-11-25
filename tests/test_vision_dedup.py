@@ -253,8 +253,7 @@ def test_block_expand_backward_sums_half_copies_without_overflow(dtype):
 
 
 def test_zero3_partitioned_towers_never_dedup(monkeypatch):
-    # ZeRO-3 all-gathers every partitioned parameter per forward: the first deduplicated call's
-    # self-check encode runs only on ranks that saw a duplicate image, so the others would hang.
+    # ZeRO-3 all-gathers each forward, so a self-check on only some ranks would hang the rest.
     import unsloth_zoo.temporary_patches.utils as tp
     monkeypatch.setattr(tp, "zero3_partitioned_training", lambda: True)
     _, model = _load("qwen2_5_vl")

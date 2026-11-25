@@ -1,5 +1,4 @@
-"""Fused cross entropy chunk sizing stays active on big-memory GPUs: the per-chunk target is capped, since a very large
-free pool would round the chunk count to one, materializing full logits and their float32 upcast."""
+"""Fused CE chunking stays on for big GPUs; capped target avoids one chunk holding full logits."""
 import importlib
 import types
 
@@ -111,8 +110,7 @@ def test_cap_bounds_target_independent_of_free(monkeypatch):
 
 
 def _no_device_pool(monkeypatch, device_type, host_gb = 64.0):
-    """Fakes a device with no memory pool (CPU, MLX, torch built without CUDA) by replacing only mem_get_info and
-    is_available; a stand-in torch.cuda namespace breaks manual_seed, which reaches torch.cuda._is_in_bad_fork."""
+    """Only mem_get_info and is_available are faked; a stand-in torch.cuda breaks manual_seed."""
     ce, tiled = _modules()
     monkeypatch.setattr(tiled, "DEVICE_TYPE", device_type, raising = False)
 

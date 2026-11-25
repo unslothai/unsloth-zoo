@@ -33,7 +33,6 @@ class _StubTokenizer:
 def _requested_num_proc(monkeypatch, *, cpus, host_gb, cgroup_free_gb = None):
     monkeypatch.delenv(dnp.NUM_PROC_ENV_VAR, raising = False)
     dnp.reset_warning_state()
-    # A forking Linux host with many CPUs and plenty of host RAM, as both the old and the new code see it.
     monkeypatch.setattr(multiprocessing, "get_start_method", lambda allow_none = False: "fork")
     monkeypatch.setattr(dnp, "multiprocessing_start_method", lambda: "fork")
     monkeypatch.setattr(dnp.sys, "platform", "linux")
@@ -41,7 +40,6 @@ def _requested_num_proc(monkeypatch, *, cpus, host_gb, cgroup_free_gb = None):
     monkeypatch.setattr(
         psutil, "virtual_memory", lambda: types.SimpleNamespace(available = host_gb * 1024**3)
     )
-    # What this process may actually use.
     monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(cpus)), raising = False)
     monkeypatch.setattr(dnp, "_cgroup_cpu_quota", lambda: None)
     monkeypatch.setattr(

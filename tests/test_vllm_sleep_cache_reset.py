@@ -1,5 +1,4 @@
-"""patch_vllm_reset_caches_on_sleep: reset_mm_cache and reset_encoder_cache precede gc.collect() and
-original sleep; missing methods are no-ops, raising resets swallowed, patching idempotent."""
+"""Resets precede gc.collect/sleep; missing methods no-op, errors swallowed, patch idempotent."""
 
 from __future__ import annotations
 

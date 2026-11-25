@@ -102,8 +102,7 @@ def test_the_byte_view_reinterprets_without_casting():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "initialisation allocates GPU buffers")
 @pytest.mark.parametrize("offload", [(torch.bfloat16, "bf16"), (torch.bfloat16, "exact")], indirect = True)
 def test_the_offload_cutoff_counts_stored_bytes(offload):
-    # bf16-stored float32 must offload exactly where the old bf16 buffers did (numel > 1M) so host memory does not grow;
-    # exact float32 storage counts 4 bytes per element.
+    # bf16-stored fp32 offloads like old bf16 (host memory unchanged); exact fp32 is 4B/elem.
     assert gc.MINIMUM_SIZE == 2 * 1024 * 1024
     for dtype in (torch.float16, torch.float32):
         gc.initialize_unsloth_gradient_checkpointing(dtype)

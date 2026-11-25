@@ -110,9 +110,8 @@ def test_routed_forwards_run_their_eager_branch_without_dynamo():
         assert fn.__wrapped__ is not None  # wrapped with _eager_out_of_dynamo
 
 
-# Behavioural checks on the real forwards: each one's eager branch reaches an untraceable call inside a compiled
-# frame the backend skips (every graph but the tail's is declined, as Inductor declines bfloat16 below sm80). The
-# protected forward runs that branch with Dynamo off; without the protection Dynamo converts the nested frame.
+# Forwards' eager branch hits an untraceable call in a skipped frame (all but tail; bf16 below
+# sm80); protected forward runs it with Dynamo off, else Dynamo converts the nested frame.
 def _skip_all_but_tail():
     from torch._dynamo.exc import SkipFrame
 

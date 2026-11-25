@@ -236,7 +236,6 @@ def test_windows_still_installs_without_the_opt_out(monkeypatch):
 
 
 def test_an_unrelated_RuntimeError_is_not_read_as_consent(installer, monkeypatch):
-    # RuntimeError for a lost stdout/stderr with a live stdin is not a missing prompt.
     with pytest.raises(RuntimeError, match = "lost sys.stdout"):
         installer(RuntimeError("input(): lost sys.stdout"), isatty = False)
     assert installer.calls == []

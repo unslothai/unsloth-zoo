@@ -95,7 +95,6 @@ def test_eval_branch_by_size(monkeypatch, which, num_tokens, dense):
         out = experts(x, router_indices = idx, routing_weights = weights)
         fed = sum(rows)
         ref = _reference(experts, x[0], idx, weights)
-    # Dense feeds every token to every expert; routed only the top_k picks.
     assert fed == (E * num_tokens if dense else TOP_K * num_tokens)
     assert out.dtype == x.dtype
     torch.testing.assert_close(out[0], ref, rtol = 1e-4, atol = 1e-4)

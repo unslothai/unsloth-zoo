@@ -142,7 +142,6 @@ def test_released_blocks_stay_charged_and_are_reused(monkeypatch, gc_module):
     assert gc_module._reserve_pinned(3000)          # 4096 block
     gc_module._release_pinned(3000)
     assert gc_module.GC_PINNED_BYTES == 4096
-    # Another size class cannot pile on top of the cached block past the cap.
     assert not gc_module._reserve_pinned(7000)      # 4096 cached + 8192 > 10000
     # The same size class takes the cached block back without a new charge.
     assert gc_module._reserve_pinned(4000)
@@ -184,7 +183,6 @@ def test_cached_block_taken_by_another_user_is_not_reused_past_the_cap(monkeypat
     free["bytes"] = 0
     # A new 4096 block would make 8192 pinned, past the 6000 cap.
     assert not gc_module._reserve_pinned(4096)
-    # Still reusable when the allocator really holds it free.
     gc_module._release_pinned(4096)
     free["bytes"] = 4096
     assert gc_module._reserve_pinned(4096)
@@ -306,7 +304,6 @@ def test_cap_flush_counts_only_blocks_the_allocator_released(monkeypatch, gc_mod
     gc_module._release_pinned(3000)                 # cached, then reused by another pinned user
     assert not gc_module._reserve_pinned(7000)
     assert emptied == [True]
-    # Once the allocator really frees it, the same request fits.
     held["bytes"] = 0
     assert gc_module._reserve_pinned(7000)
 

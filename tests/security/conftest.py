@@ -1,5 +1,4 @@
-"""Shared fixtures for security tests: an autouse, function-scoped network blocker refusing non-loopback
-socket.connect(); function scope because a session-scoped socket.socket swap broke network tests elsewhere."""
+"""Autouse blocker refuses non-loopback socket.connect(); function scope, session broke tests."""
 
 from __future__ import annotations
 

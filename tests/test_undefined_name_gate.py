@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pins the two real undefined-name defects, reachable from ordinary use, that the narrow ruff gate hid under
-continue-on-error; the other 11 were names exec defines."""
+"""Two real undefined names the ruff gate hid under continue-on-error; 11 others exec defines."""
 
 
 import subprocess
@@ -29,10 +28,9 @@ REPO = Path(__file__).resolve().parents[1]
 
 
 def test_the_float32_grpo_path_can_build_its_autocast_context():
-    """nullcontext is unbound in grpo_accumulated_loss on the UNSLOTH_FORCE_FLOAT32=1 path
-    (NameError); the function is copied into the generated trainer without module imports, so
-    test its source in a bare namespace, since a module-level import would pass while the trainer
-    still raises."""
+    """nullcontext unbound on UNSLOTH_FORCE_FLOAT32=1 (NameError); trainer copy has no module
+    imports, so test its source in a bare namespace; a module-level import would pass while the
+    trainer still raises."""
     import inspect
 
     import unsloth_zoo.rl_replacements as rl
@@ -42,7 +40,6 @@ def test_the_float32_grpo_path_can_build_its_autocast_context():
     exec(compile(source, "<generated-trainer>", "exec"), namespace)
     rebuilt = namespace["grpo_accumulated_loss"]
 
-    # Module globals are not in the generated trainer, so import nullcontext inside the body.
     assert "nullcontext" in rebuilt.__code__.co_varnames, (
         "nullcontext resolves as a global, so the generated UnslothGRPOTrainer raises "
         "NameError on the UNSLOTH_FORCE_FLOAT32 path; bind it inside the function body"

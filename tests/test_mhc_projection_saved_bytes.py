@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests eager mHC mixer saves bf16 input, not FP32 (2x bytes); MODULE_FORWARD_EAGER_REWRITES routes
-input_norm and fn projection via unsloth_mhc_projection, which reruns them in backward."""
+"""Eager mHC mixer saves bf16, not FP32; unsloth_mhc_projection reruns norm and fn in backward."""
 
 import importlib
 import textwrap

@@ -51,7 +51,6 @@ def test_training_deepcopy_of_eval_original_replays_dropout(target_arctic):
     x = torch.randn(2, 32, HIDDEN)
     grad_out = torch.randn(2, 32, HIDDEN)
 
-    # Reference: same tiles, same RNG order, ordinary autograd (no recompute).
     torch.manual_seed(3)
     x_ref = x.clone().requires_grad_(True)
     tiles = [reference(t.unsqueeze(0)) for t in torch.tensor_split(x_ref.view(-1, HIDDEN), 4, dim = 0)]

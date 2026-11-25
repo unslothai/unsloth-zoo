@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""train_on_responses_only on a text-only fine-tune of a multimodal model must not hit the vision-collator check;
-already-tokenized rows keep dataset-level masking; CPU-only with a stub tokenizer."""
+"""train_on_responses_only: no vision-collator check on text-only; tokenized rows keep masking."""
 
 import pytest
 from datasets import Dataset

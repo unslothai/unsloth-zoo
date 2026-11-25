@@ -166,12 +166,10 @@ def test_lru_cache_freezes_first_result(spoof_accelerator):
     first = _active_merge_device()
     assert first == "cuda"
 
-    # Simulate a transient spoof change WITHOUT clearing the cache.
     with mock.patch.object(torch.cuda, "is_available", return_value=False):
         cached = _active_merge_device()
         assert cached == "cuda", "lru_cache should freeze the first result"
 
-    # After cache_clear, re-probing picks up the new state.
     _active_merge_device.cache_clear()
     with mock.patch.object(torch.cuda, "is_available", return_value=False), \
          mock.patch.object(torch.backends.mps, "is_available", return_value=True):

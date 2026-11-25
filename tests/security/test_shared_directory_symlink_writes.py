@@ -283,7 +283,6 @@ def test_gpt_oss_keeps_a_group_shared_cache_built_by_another_user(tmp_path, monk
     module.write_text("# built by user A\n")
     (cache / gpt_oss._GPT_OSS_FLAVOR_MARKER).write_text("stock")
 
-    # We are user B: same group, write access, not the owner.
     other_uid = os.geteuid() + 1
     monkeypatch.setattr(gpt_oss.os, "geteuid", lambda: other_uid)
     monkeypatch.setattr(gpt_oss, "_gpt_oss_cache_locations", lambda: [str(cache)])

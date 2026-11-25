@@ -125,7 +125,6 @@ def test_aliasing_is_what_the_dtype_gap_prevents():
     different = training_weight.to(device = None, dtype = torch.bfloat16)
     assert different.data_ptr() != training_weight.data_ptr()
 
-    # and the alias is writable straight through to the training weight
     before = training_weight.clone()
     same *= 2.0
     assert not torch.equal(training_weight, before), \

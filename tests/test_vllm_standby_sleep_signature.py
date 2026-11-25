@@ -126,12 +126,10 @@ def test_is_asleep_tracked_and_no_double_release(vllm_utils, monkeypatch):
     alloc.sleep(("weights", "runtime", "cudagraph"), set())
     assert [d.is_asleep for d in alloc.pointer_to_data.values()] == [False, True, True, True]
     del calls[:]
-    # A second sleep must not release handles that are already released.
     alloc.sleep(("weights", "runtime", "cudagraph"), set())
     assert [c for c in calls if c[0] == "unmap"] == []
     alloc.wake_up()
     assert [d.is_asleep for d in alloc.pointer_to_data.values()] == [False] * 4
     del calls[:]
-    # A second wake_up must not map still-mapped handles again.
     alloc.wake_up()
     assert calls == []

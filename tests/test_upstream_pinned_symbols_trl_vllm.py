@@ -29,8 +29,7 @@ TRL_ANCHOR_TAGS = ("v0.22.2", "v0.27.1", "v1.0.0")
 # Optional fetch shim: reuse the sibling audit suite's _fetch.py if it is on this machine; if missing, network-based checks skip instead of failing.
 # ---------------------------------------------------------------------------
 def _try_load_fetch_shim():
-    """Returns _fetch.py helpers or None; path comes from __file__, not hardcoded; OSError is caught
-    per candidate since is_file() can raise PermissionError (a fatal collection error)."""
+    """Returns _fetch.py helpers or None; OSError caught: is_file() can raise PermissionError."""
     candidates = [
         Path(__file__).resolve().parents[2] / "_postmerge_audit/tests/version_compat/_fetch.py",
     ]
@@ -201,7 +200,6 @@ def test_trl_dpo_vision_mapping_attr_installed():
         "trl.trainer.dpo_trainer.MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES; "
         "if TRL renames this constant, the patch silently no-ops"
     )
-    # DPOTrainer must stay importable from trl.trainer.dpo_trainer; the VLM patch entry point assumes that module exists.
     assert hasattr(dpo_mod, "DPOTrainer"), (
         "trl.trainer.dpo_trainer.DPOTrainer missing -- "
         "unsloth_zoo VLM patch entry point broken"

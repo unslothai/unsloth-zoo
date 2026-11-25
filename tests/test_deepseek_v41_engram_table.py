@@ -224,8 +224,7 @@ def test_disk_engram_matches_the_ports_table(tiny_dsv41, monkeypatch, kind):
     if NATIVE:
         assert not [k for k in model.state_dict() if "engram_tables" in k]
         return
-    # Only full saves export (adapter saves never decode): bf16 is zero-copy; fp8 exports decoded
-    # rows equal to the port's dequantized table, since fp8 rows plus scales would reload raw.
+    # Full saves only; bf16 zero-copy; fp8 decoded, as raw fp8 plus scales would reload raw.
     sd = model.state_dict()
     if kind == "bf16":
         assert {k for k in sd if "engram_tables" in k} == {f"{t}.weight" for t in TABLES}
@@ -241,7 +240,6 @@ def test_disk_engram_matches_the_ports_table(tiny_dsv41, monkeypatch, kind):
         assert fts._prepare_full_table_save(model, (), {"state_dict": supplied})
         for t in TABLES:
             assert torch.equal(supplied[t + ".weight"], ref.state_dict()[t + ".weight"]), t
-        # An adapter-only save (transformers' PEFT integration) never decodes the tables.
         calls = []
         monkeypatch.setattr(UnslothFrozenTableEmbedding, "_decode_all", lambda self, *a, **k: calls.append(1))
         monkeypatch.setattr(model, "_hf_peft_config_loaded", True, raising=False)

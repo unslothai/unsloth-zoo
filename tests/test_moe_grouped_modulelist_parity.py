@@ -210,7 +210,6 @@ def test_auto_enable_reevaluates_after_adapter_attaches():
     assert frozen_blk.forward.__func__ is grouped_moe_forward
     assert lora_blk.forward.__func__ is grouped_moe_forward
 
-    # Simulate an adapter that wraps one expert of the second block only.
     getattr(lora_blk.experts[0], spec[0]).lora_A = nn.Identity()
 
     auto_enable_grouped_moe(model)  # exactly what loader.py calls after patch_peft_model

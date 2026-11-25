@@ -107,7 +107,6 @@ def test_missing_or_unreadable_adapter_is_not_our_error(tmp_path):
 
 
 def test_non_lora_expert_tensors_are_ignored(tmp_path):
-    # A stray expert base weight is not an adapter.
     _write_safetensors(str(tmp_path / "adapter_model.safetensors"), [
         "base_model.model.model.layers.0.mlp.experts.gate_up_proj.weight",
     ])
@@ -135,8 +134,7 @@ def test_moe_spelling_is_still_segment_matched():
     assert not _is_moe_expert_lora_key("base_model.model.model.layers.0.mlp.shared_expert.up_proj.lora_A.weight")
 
 
-# GraniteMoE experts on transformers 4.57 to 5.0 are block_sparse_moe.input_linear / .output_linear, matching neither
-# experts nor moe; bare matching would reject the dense shared_mlp pair, so match on (parent, child).
+# GraniteMoE 4.57-5.0: block_sparse_moe.input_linear/.output_linear; match (parent, child).
 
 GRANITE_EXPERT_KEYS = [
     "base_model.model.model.layers.0.block_sparse_moe.input_linear.lora_A.default.weight",
@@ -213,8 +211,7 @@ from unsloth_zoo.vllm_utils import (
     _vllm_lora_target_names,
 )
 
-# vLLM is optional (not in pyproject or CPU CI), so a top-level import broke collection; skip only
-# tests needing vLLM like tests/test_upstream_signatures.py (importorskip skips whole module).
+# vLLM is optional (not in CPU CI): a top-level import broke collection; skip only vLLM tests.
 try:
     from vllm.model_executor.layers.linear import LinearBase
     from vllm.model_executor.layers.fused_moe import MoERunner
@@ -482,8 +479,7 @@ def test_peft_max_rank_handles_objects_and_missing_values():
     assert _peft_max_rank(None) is None
 
 
-# A live enable_lora engine wraps each target in BaseLayerWithLoRA holding LinearBase / MoERunner at
-# <module>.base_layer; walking for LinearBase alone would flag every adapter key, so both layouts must resolve.
+# Wrapped live engines nest LinearBase/MoERunner at <module>.base_layer; resolve both layouts.
 
 WRAPPED_PATHS = {
     "model.layers.0.self_attn.qkv_proj.base_layer": _FakeLinear,

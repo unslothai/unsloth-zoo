@@ -187,7 +187,6 @@ def test_seq_idx_shape_mismatch_raises():
     for dtype in (torch.bool, torch.complex64):
         with pytest.raises(ValueError, match = "seq_idx"):
             gcc._legacy_causal_conv1d_fn(x = x, weight = w, seq_idx = torch.zeros(1, 10, dtype = dtype))
-    # Optional inputs default like the public entry points.
     torch.testing.assert_close(gcc._causal_conv1d_any(x, w), gcc.causal_conv1d_reference(x, w))
 
 
@@ -411,7 +410,6 @@ def test_seq_idx_on_cpu_with_cuda_activations(monkeypatch):
     for fn in (_triton, _reference, gcc._legacy_causal_conv1d_fn):
         for name, o, r in zip(("y", "dx", "dw", "db"), _run(fn, x, w, b, dy, "silu", seq_idx.cpu()), oracle):
             assert _rel(o, r) < 1e-5, (fn, name, _rel(o, r))
-    # Direct entry and dispatch both ran the kernel, not the fallback.
     assert gcc.GDN_CAUSAL_CONV1D_STATS["triton_seq_idx"] - before == 2
     monkeypatch.setenv(gcc._KILL_SWITCH, "1")
     y = gcc._legacy_causal_conv1d_fn(x, w, b, "silu", seq_idx = seq_idx.cpu())
@@ -442,7 +440,6 @@ def test_seq_idx_randomized_against_per_document():
         dtype = (torch.int64, torch.int32)[case % 2]
         x, w, b, dy = _inputs(B, 64, T, W, torch.float32, True, seed = case)
         rows = [_random_seq_idx(g, T, W, dtype) for _ in range(B)]
-        # Strided (B, T) view of a wider buffer.
         storage = torch.full((B, 2 * T), 99, dtype = dtype, device = "cuda")
         seq_idx = storage[:, ::2]
         seq_idx.copy_(torch.tensor(rows, dtype = dtype))

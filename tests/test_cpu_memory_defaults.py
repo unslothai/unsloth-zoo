@@ -68,7 +68,6 @@ def test_auto_gradient_checkpointing(monkeypatch, choice, ram, env, expect_off):
     assert bool(result) is expect_off
     assert args.gradient_checkpointing is (not expect_off)
     assert model.is_gradient_checkpointing is (not expect_off)
-    # Idempotent: a second trainer on the same model / args changes nothing more.
     trainer._auto_cpu_gradient_checkpointing(model, args)
     assert args.gradient_checkpointing is (not expect_off)
 
@@ -216,8 +215,7 @@ def test_auto_gradient_checkpointing_counts_sdpa_dropout_scores(monkeypatch, dro
 
 
 def test_available_ram_honours_a_cgroup_v1_container_limit(monkeypatch, tmp_path):
-    """A cgroup v1 container (Docker on RHEL 8 / Amazon Linux 2) sees the host's MemAvailable in /proc/meminfo: the
-    16-bit and no-checkpointing decisions must use the container's own limit, or a model that fits the host OOMs."""
+    """cgroup v1 sees host MemAvailable: use the container limit, or a host-fitting model OOMs."""
     import types
     import psutil
     import unsloth_zoo.hf_xet_tuning as xet

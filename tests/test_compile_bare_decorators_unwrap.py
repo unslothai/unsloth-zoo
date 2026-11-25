@@ -213,8 +213,7 @@ def test_patch_function_keeps_a_bound_method_bound():
 
 
 def test_patch_function_survives_a_compiler_that_refuses():
-    """A carrier with no __wrapped__ is handed to torch untouched instead of raising AttributeError; the load survives
-    whatever torch does, as _compile_or_fall_back guarantees"""
+    """Carrier without __wrapped__ goes to torch as-is, not AttributeError; the load survives."""
     _run("""
         import torch
         from unsloth_zoo.temporary_patches.utils import patch_function

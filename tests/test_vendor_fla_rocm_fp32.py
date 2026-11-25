@@ -60,7 +60,6 @@ def test_gfx11_is_detected_on_rocm_only():
     assert detect(_fake_torch(True, ["gfx942", "gfx1151"])) is True
     for arch in ("gfx1030", "gfx1201", "gfx942", "gfx90a", "gfx1010", ""):
         assert detect(_fake_torch(True, [arch])) is False, arch
-    # CUDA builds, no accelerator, no devices, or a torch that raises: never.
     assert detect(_fake_torch(False, ["gfx1151"])) is False
     assert detect(_fake_torch(True, ["gfx1151"], available = False)) is False
     assert detect(_fake_torch(True, [])) is False
@@ -213,7 +212,6 @@ def test_gfx11_routes_only_float32_to_torch(monkeypatch):
     wrapped = package.chunk_gated_delta_rule
     assert wrapped is not original
     assert chunk.chunk_gated_delta_rule is wrapped and modeling.chunk_gated_delta_rule is wrapped
-    # Idempotent: a second pass does not wrap again.
     assert fla_vendor._install_rocm_fp32_torch_path(_fake_torch(True, ["gfx1151"])) is True
     assert package.chunk_gated_delta_rule is wrapped
 

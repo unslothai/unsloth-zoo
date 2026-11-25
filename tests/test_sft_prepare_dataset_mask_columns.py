@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pretokenized completion_mask / assistant_masks train only masked tokens on TRL < 1.7 (collator applies masks) and >=
-1.7 (_prepare_dataset builds labels); CPU-only, offline."""
+"""Mask columns train only masked tokens: TRL<1.7 collator applies, >=1.7 labels; CPU-only."""
 
 import pytest
 import torch

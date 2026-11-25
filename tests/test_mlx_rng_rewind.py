@@ -30,8 +30,7 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 nn = pytest.importorskip("mlx.nn")
 
-# importorskip is not enough: most test_mlx_*.py files leave the tests/mlx_simulation stub in
-# sys.modules; these need real mlx >= 0.32.1, where mx.random.state refuses item assignment.
+# Other tests' stub defeats importorskip; mlx>=0.32.1 mx.random.state refuses item assignment.
 if "mlx_simulation" in (getattr(mx, "__file__", "") or ""):
     pytest.skip("mlx.core is the tests/mlx_simulation stub, not real MLX",
                 allow_module_level = True)
@@ -188,8 +187,7 @@ def test_words_that_are_not_32_bit_are_declined_not_truncated(words):
         with pytest.warns(RuntimeWarning, match = "not a 32-bit word"):
             assert _mlx_rng_key() is None
 
-    # Restore is total: bad words must give a no-op and a warning, never a raise into a finally or a wrong key; cleared
-    # first so the restore path reports on its own.
+    # Bad words warn and no-op, never raise or yield a wrong key; report set cleared first.
     _reported_unrewindable_keys.clear()
     with pytest.warns(RuntimeWarning, match = "not a 32-bit word"):
         _restore_mlx_rng_key(words)

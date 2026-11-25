@@ -75,7 +75,6 @@ def test_token_logps_match_full_logits(multiply, divide, softcap, bias, chunk_si
     want = torch.autograd.grad((expected * upstream).sum(), params)
     for g, w in zip(got, want):
         torch.testing.assert_close(g, w, rtol = 0, atol = 1e-11)
-    # Off-mask positions get exactly zero gradient.
     assert got[0][~mask].abs().max() == 0
 
 
@@ -196,8 +195,7 @@ def test_trainable_head_grad_over_vocab_slices(monkeypatch, dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_trainable_head_grad_has_no_head_sized_float32_temporaries(monkeypatch, dtype):
-    # A trainable half-precision head runs vocab sliced backward: float32 accumulators are one slice, so no head-sized
-    # tensor in another dtype; per chunk head-sized GEMM / cast copies would add GiBs of peak memory.
+    # Trainable half head: sliced backward avoids head-sized fp32 copies (GiBs of peak memory).
     from torch.utils._python_dispatch import TorchDispatchMode
     import unsloth_zoo.fused_losses.preference_loss as module
 

@@ -19,7 +19,6 @@ class _StubConfig:
         return {"model_type": self._model_type}
 
 
-# --- rejection ---------------------------------------------------------------
 
 @pytest.mark.parametrize("model_type", [
     "llama'); import os; os.system('touch /tmp/pwned",
@@ -44,7 +43,6 @@ def test_path_traversal_cannot_survive():
         assert all(re.fullmatch(r"[a-z0-9_]+", t) for t in result), result
 
 
-# --- no legitimate model_type may be rejected --------------------------------
 
 def test_every_shipped_model_type_accepted():
     """A false rejection breaks loading a real model, so the whole transformers set plus known remote-code model types must stay accepted."""

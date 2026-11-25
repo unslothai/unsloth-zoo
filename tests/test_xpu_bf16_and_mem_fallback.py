@@ -451,8 +451,7 @@ def test_vllm_xpu_bf16_refusal_switches_beside_any_unsloth(on_xpu, vu, monkeypat
 @pytest.mark.parametrize("flags", [(True,), (_PROVEN_NO_BF16,)])
 @pytest.mark.parametrize("dtype", [None, "bfloat16"])
 def test_vllm_xpu_a770_refusal_beside_released_unsloth_main(on_xpu, vu, monkeypatch, flags, dtype):
-    # Issues zoo 1947, 1929, unsloth 14493: explicit or automatic bf16 must not reach vLLM A770
-    # refusal.
+    # Issues zoo 1947, 1929, unsloth 14493: explicit/auto bf16 must not reach A770 refusal.
     on_xpu(_fake_xpu(flags))
     _fake_vllm_platforms(monkeypatch, refuses = True)
     core = types.ModuleType("unsloth.device_type")

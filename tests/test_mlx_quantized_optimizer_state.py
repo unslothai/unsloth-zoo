@@ -232,8 +232,7 @@ def test_compiled_and_uncompiled_agree():
     )
 
     worst = max(abs(a - b) for a, b in zip(plain, compiled))
-    # Tolerance, not equality: mx.compile fuses and reassociates ops; macos-15 differs by 5.96e-08
-    # (2**-24), 1e-6 is ~8 fp32 ULP; real divergence grows monotonically across steps.
+    # mx.compile reassociates ops, so 1e-6 (~8 fp32 ULP) tolerates rounding; real drift grows.
     assert worst <= 1e-6, f"mx.compile changed the loss trajectory by {worst:.3e}: {plain} vs {compiled}"
 
 

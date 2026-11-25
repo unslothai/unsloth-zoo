@@ -28,8 +28,7 @@ BLOCKED = [
     ("socket", "def matmul(A, B):\n    import socket\n    return socket.socket()\n", ImportError),
     # The dunder is a string constant, so the AST check misses it; the case still fails because getattr is not in the allowlist at all.
     ("getattr", 'def matmul(A, B):\n    return getattr(A, "__class__")\n', NameError),
-    # Allowlisted modules re-export unsafe ones: random keeps a private handle on os and typing keeps sys; the
-    # private-attribute rule catches random._os, but only the facade stops typing.sys. Both are needed.
+    # Both are needed: the private rule catches random._os; only the facade stops typing.sys.
     ("random._os", 'def matmul(A, B):\n    import random\n    return random._os.system("echo pwned")\n', RuntimeError),
     ("typing.sys", 'def matmul(A, B):\n    import typing\n    return typing.sys.modules["os"].getpid()\n', AttributeError),
     # attrgetter takes a dotted string, so it walks dunders the AST check never sees; the member is denied while operator itself stays allowed.
@@ -219,8 +218,7 @@ def test_full_policy_remains_available():
 
 
 def test_dunder_method_definitions_are_denied():
-    # A method name is FunctionDef.name, not a Name or Attribute node, so the walk cannot see it; without the
-    # fail-closed rule, a custom __setattr__ captures what functools.update_wrapper copies.
+    # FunctionDef.name is not a Name node, so only fail-closed stops a custom __setattr__.
     source = (
         "def matmul(A, B):\n"
         "    import functools\n"

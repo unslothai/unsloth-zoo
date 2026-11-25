@@ -1,6 +1,5 @@
-"""A dict image row whose path is bytes must hit the same network-share guard as a str path; PIL's
-Image.open accepts bytes, so a UNC bytes path would open an SMB connection (NTLM leak) on
-Windows; _WINDOWS is patched and Image.open replaced so nothing is opened."""
+"""A dict image row with bytes path must hit the same network-share guard as str; PIL's Image.open
+accepts bytes, so a UNC bytes path would open an SMB connection (NTLM leak) on Windows."""
 import os
 
 import pytest

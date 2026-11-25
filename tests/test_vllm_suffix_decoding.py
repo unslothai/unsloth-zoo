@@ -182,8 +182,7 @@ def test_load_vllm_memory_retry_uses_the_refitting_shrink():
 
 
 def test_return_args_callers_get_no_speculative_config():
-    # SyntheticDataKit stringifies load_vllm(return_args = True) into vllm serve flags; str(dict) is not JSON, so
-    # --speculative-config would make the parser exit.
+    # str(dict) is not JSON: --speculative-config in return_args would make vllm serve exit.
     load_vllm = next(n for n in ast.walk(_tree()) if isinstance(n, ast.FunctionDef) and n.name == "load_vllm")
     assigns = [
         n for n in ast.walk(load_vllm)

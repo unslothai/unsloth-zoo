@@ -147,8 +147,7 @@ def test_positional_num_proc_is_retried():
 
 
 def test_the_retry_disables_multiprocessing_rather_than_asking_for_one_worker():
-    """datasets >= 4.1.0 gates its pool on `num_proc is not None and num_proc >= 1` (arrow_dataset.py, changed from > 1
-    in 4.1.0, same in 4.4.1), so a retry at num_proc = 1 forks a killable worker; only None is in-process."""
+    """datasets >= 4.1 pools num_proc >= 1, so retry with None: 1 forks a killable worker."""
     calls = []
 
     def original(self, fn, num_proc = None, **kw):

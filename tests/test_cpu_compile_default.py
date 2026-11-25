@@ -269,8 +269,7 @@ def test_backward_only_compile_error_falls_back_to_eager(monkeypatch, capsys):
             raise RuntimeError("backward lowering failed")
         return original(*args, **kwargs)
     monkeypatch.setattr(compile_fx, "_compile_fx_inner", backward_fails)
-    # Importing unsloth's GPU model utilities (as other tests in this process may) sets suppress_errors = True, and
-    # Dynamo then swallows the injected failure before the fallback sees it; a CPU-only Unsloth process leaves it False.
+    # Importing GPU utils sets suppress_errors True, so Dynamo swallows the injected failure.
     monkeypatch.setattr(torch._dynamo.config, "suppress_errors", False, raising = False)  # gone from newer torch
     from peft import LoraConfig, get_peft_model
     torch._dynamo.reset()
@@ -333,9 +332,8 @@ def test_compile_error_on_a_later_layer_keeps_checkpoint_recompute_compiled(monk
 
 
 def test_compile_error_after_a_graph_break_restarts_the_checkpoint_eagerly(monkeypatch, capsys):
-    """A layer with a graph break runs its first compiled segment (Linear / GELU), then the second segment fails to
-    compile. Rerunning eagerly inside the same non-reentrant checkpoint would leave the first segment's saved tensors
-    in it and backward raises CheckpointError; the whole checkpointed call restarts eagerly instead."""
+    """After a graph break, the failing second segment restarts the whole non-reentrant checkpoint
+    eagerly: a partial rerun keeps the first segment's saved tensors (CheckpointError)."""
     from functools import partial
     from transformers.modeling_layers import GradientCheckpointingLayer
     from unsloth_zoo.cpu import loader
@@ -352,8 +350,7 @@ def test_compile_error_after_a_graph_break_restarts_the_checkpoint_eagerly(monke
             return self.down(x) * 2.0
 
     if loader._checkpoints_inside_forward(Block()):
-        # transformers >= 5.23 checkpoints inside forward, so the compiled call contains the checkpoint and Dynamo
-        # cannot split it at a graph break: no segment compiles before the failure, the case this test pins.
+        # transformers >= 5.23 checkpoints inside forward: Dynamo can't split at a graph break.
         pytest.skip("this transformers checkpoints inside forward; no compiled segment precedes the graph break")
 
     graphs = []

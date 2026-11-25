@@ -1,5 +1,4 @@
-"""_resolve_autodetect_template_source reads markers from the batch template (the VLM processor or a
-chat_template override); skips, never fails, without tokenizer cache or unsloth_zoo."""
+"""Autodetect template-source tests; skip, never fail, without tokenizer cache or unsloth_zoo."""
 import pytest
 
 
@@ -130,7 +129,6 @@ def test_vlm_processor_only_template_is_used_for_detection():
     with pytest.raises(Exception):
         get_parts(resolved)
 
-    # NEW behavior: the resolver hands back the processor for detection.
     tr = _Trainer(proc, _Args(), is_vlm=True, processor=proc)
     detect = T._resolve_autodetect_template_source(tr, proc, resolved)
     assert detect is proc

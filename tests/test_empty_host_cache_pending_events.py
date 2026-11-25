@@ -2,8 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""_empty_host_cache must still flush it: after a pinned offload slot goes pageable on growth, its old block stays in
-torch's host cache, counted active by host_memory_stats() until the non_blocking copy event is processed."""
+"""_empty_host_cache must flush a pinned block that stays counted active until its copy event."""
 import pytest
 import torch
 

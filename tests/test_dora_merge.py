@@ -145,7 +145,6 @@ def test_dora_on_mxfp4_packed_moe_is_refused(monkeypatch, tmp_path):
 
     E, rank, H, I = 2, 4, 8, 6
     base = "model.layers.0.mlp.experts.gate_up_proj"
-    # Minimal on-disk mxfp4-style file: one packed expert group (blocks + scales).
     save_file(
         {
             base + "_blocks": torch.zeros(E, 2 * I, H // 2, dtype=torch.uint8),

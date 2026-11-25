@@ -296,8 +296,7 @@ def test_rollout_rs_warning_follows_bypass_support(monkeypatch, as_old):
 @pytest.mark.parametrize("options,thresholds", RS)
 @pytest.mark.parametrize("bypass", [False, True])
 def test_reported_kl_leaves_out_rejected_tokens(options, thresholds, bypass):
-    # mean_kl: per-row sum of KL over kept tokens divided by all completion tokens of that row (the loss normaliser's
-    # count), averaged over rows that have tokens.
+    # mean_kl: per-row KL over kept tokens / all completion tokens (rejected still counted).
     ref, new, old, sampling, mask, adv = _data(5)
     parsed = rr.grpo_parse_rollout_rs(options, thresholds)
     if bypass:
@@ -337,7 +336,6 @@ def test_reported_kl_without_rejection_is_unchanged():
 @pytest.mark.parametrize("options,thresholds", RS)
 @pytest.mark.parametrize("bypass", [False, True])
 def test_keep_helper_matches_the_loss(options, thresholds, bypass):
-    # grpo_rollout_rs_keep (caller side) must reject exactly the tokens grpo_compute_loss rejects.
     ref, new, old, sampling, mask, adv = _data(9)
     parsed = rr.grpo_parse_rollout_rs(options, thresholds)
     if bypass:

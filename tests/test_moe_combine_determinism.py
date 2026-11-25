@@ -96,8 +96,7 @@ def _inverse_permutation(sorted_indices):
 
 
 def test_combine_casts_to_out_dtype_after_the_sum_not_before():
-    """fp32 summands, bf16 output: an fp32 router (Gemma 4, DeepSeek V3) makes cast placement visible; casting last sums
-    in fp32 and rounds once, as transformers' grouped_mm does; a second assertion keeps it discriminating."""
+    """fp32 summands, bf16 output: cast after the sum, rounding once as transformers' grouped_mm does."""
     num_tokens, top_k, hidden, num_experts = 512, 4, 64, 16
     device = "cuda" if torch.cuda.is_available() else "cpu"
     sorted_indices, permuted = _make_case(

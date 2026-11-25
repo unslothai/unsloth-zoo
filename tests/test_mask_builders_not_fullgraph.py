@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Mask builders must never compile fullgraph: flex_attention_mask's fast_all(attention_mask) branch
-is data-dependent; the detector is call-shaped since a literal match broke on a new kwarg."""
+"""Mask builders never compile fullgraph; flex_attention_mask's fast_all is data-dependent."""
 
 import inspect
 

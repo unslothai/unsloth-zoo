@@ -448,9 +448,7 @@ def test_the_measurement_happens_once_and_costs_one_forward_afterwards(restore_p
 
 
 def test_a_quantized_expert_weight_is_never_handed_to_the_peft_fold(monkeypatch):
-    """PEFT folds by adding a delta, which needs a real float, so Params4bit, MXFP4 and FP8 expert weights must decline
-    the reroute; MXFP4 GPT-OSS gets False because _get_lora_wrapper_for_param resolves to None under
-    target_parameters."""
+    """PEFT fold needs a real float: Params4bit, MXFP4 and FP8 expert weights decline the reroute."""
     # Set through monkeypatch: a saved forward left behind would be called by every later test, and a None stand-in would look like a model producing no output.
     monkeypatch.setattr(
         MU,
@@ -618,8 +616,7 @@ def test_the_probe_still_reports_a_raising_forward_as_no_evidence(monkeypatch):
 
 
 def test_the_probe_names_the_backend_rather_than_letting_fork_rng_guess(monkeypatch):
-    """fork_rng's devices are within device_type, which otherwise comes from torch.accelerator.current_accelerator()
-    (cuda fallback); unnamed, XPU forks ask the wrong module for RNG state."""
+    """Pass device_type to fork_rng: unnamed, XPU forks ask the wrong module for RNG state."""
     seen = {}
 
     def _record(devices = None, enabled = True, device_type = None, **kwargs):
@@ -750,8 +747,7 @@ def test_a_compiled_first_call_keeps_the_stash_path_for_a_stash_reading_family(
 
 
 def test_the_static_answer_recognises_a_stash_reading_forward():
-    """_forward_statically_reads_stash finds take_moe_lora_stash in a forward's code object; assuming unread hard-fails
-    fullgraph for supported families, assuming read drops the LoRA from stash-ignoring ones."""
+    """Scan for take_moe_lora_stash; a wrong guess breaks fullgraph or drops LoRA."""
     assert MU._forward_statically_reads_stash(_StashReadingExperts(4, 8, 4)) is True
     assert MU._forward_statically_reads_stash(_StashIgnoringExperts(4, 8, 4)) is False
 
@@ -772,8 +768,7 @@ def test_the_static_answer_recognises_a_stash_reading_forward():
 
 
 def test_a_stash_ignoring_family_compiles_under_fullgraph(restore_param_wrapper):
-    """The reroute must not cost full-graph compilation: PEFT _activate_lora registers a parametrization and calls set_
-    on the stored parameter, which Dynamo refuses under fullgraph; the fold must match PEFT numbers and gradients."""
+    """Fold must match PEFT and compile fullgraph; Dynamo refuses PEFT's set_ on the parameter."""
     skip_without_cpu_inductor()  # CPU tensors compile through C++ Inductor
     assert MU.patch_param_wrapper_for_moe()
     model = _build(_StashIgnoringExperts)
@@ -806,8 +801,7 @@ def test_a_stash_ignoring_family_compiles_under_fullgraph(restore_param_wrapper)
 
 
 def test_the_fold_swaps_inside_parameters_and_never_shadows_through_dunder_dict(restore_param_wrapper):
-    """Swap the value inside _parameters, not the instance __dict__: Dynamo cannot trace removing the shadow from
-    __dict__ (Unsupported on torch 2.10); _parameters traces on the whole range."""
+    """Swap in _parameters, not __dict__ (Dynamo cannot trace removing shadow on torch 2.10)."""
     assert MU.patch_param_wrapper_for_moe()
     model = _build(_StashIgnoringExperts)
     wrapper = next(
@@ -897,8 +891,7 @@ def test_one_adapter_over_many_experts_folds_through_the_factors(restore_param_w
 
 
 def test_a_peft_without_the_factored_api_still_folds(restore_param_wrapper, monkeypatch):
-    """NEGATIVE CONTROL: get_delta_factors is newer than the oldest PEFT with target_parameters, so its absence must
-    fall back to the dense delta, not to nothing; 0.21.0 ships it, so the test simulates the absence."""
+    """Without get_delta_factors (PEFT 0.21.0 has it) fold uses the dense delta, not nothing."""
     assert MU.patch_param_wrapper_for_moe()
     model = _build(_StashIgnoringExperts)
     wrapper = next(m for m in model.modules() if type(m).__name__ == "ParamWrapper")

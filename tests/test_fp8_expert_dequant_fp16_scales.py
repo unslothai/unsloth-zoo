@@ -71,7 +71,6 @@ def test_vectorized_bf16_unchanged(device, layout):
     q = _fp8((E, M, N), device)
     s, expand = _layouts(device, 3e-5)[layout]
     out = F._dequantize_full_expert_weights_vectorized(q, s, torch.bfloat16)
-    # bf16 keeps its scale-in-target-dtype product, bit for bit.
     assert torch.equal(out, q.to(torch.bfloat16) * expand(s).to(torch.bfloat16))
 
 

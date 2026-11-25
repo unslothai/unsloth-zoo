@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-"""Name a half-installed torchvision (io/__init__.py still imports io/video.py, gone after a partial overwrite; 0.25
-ships it, 0.26 removed it) instead of re-raising its ImportError (not a version boundary). Tests run the real guard
-in a subprocess, not a source grep."""
+"""Name a half-installed torchvision (io/__init__.py still imports io/video.py, gone after a partial
+overwrite; 0.25 ships it, 0.26 removed it) instead of re-raising; not a version boundary."""
 from __future__ import annotations
 
 import importlib
@@ -14,7 +13,6 @@ from pathlib import Path
 
 import pytest
 
-# (case name, exception class to raise, message)
 CASES = [
     ("io_video",      "ImportError",  "No module named 'torchvision.io.video'"),
     ("io_video_priv", "ImportError",  "No module named 'torchvision.io._video'"),

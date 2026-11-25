@@ -118,8 +118,7 @@ def env(monkeypatch):
     sys.modules["transformers.integrations"] = integrations
     sys.modules["transformers.integrations.hub_kernels"] = hk
 
-    # The config step imports these by name; empty stubs stop tests from permanently rewriting the real
-    # ZambaConfig.__init__, a module with no config class is skipped, and teardown restores them.
+    # Empty stubs stop tests rewriting the real ZambaConfig.__init__; teardown restores them.
     for cfg_mod_name in CONFIG_MODS:
         saved[cfg_mod_name] = sys.modules.get(cfg_mod_name)
         sys.modules[cfg_mod_name] = types.ModuleType(cfg_mod_name)
@@ -426,8 +425,7 @@ def test_the_mixer_scan_does_not_walk_sys_modules(env):
 
 
 def test_alias_modules_are_not_probed_through_getattr():
-    """transformers 5 registers image_processing_<m>_fast alias modules whose catch-all __getattr__ imports the real
-    processor; getattr can raise ImportError out of import unsloth, so the scan must read __dict__ instead."""
+    """Use __dict__, not getattr: transformers 5 alias modules' __getattr__ raises ImportError."""
     assert '_mod.__dict__.get("is_fast_path_available", False)' in _SRC
     assert 'getattr(_mod, "is_fast_path_available", False)' not in _SRC
 
@@ -907,8 +905,7 @@ def _scan_args():
 
 
 def test_the_forced_reference_refuses_packed_calls(monkeypatch):
-    # The reference scan ignores seq_idx, so a packed call would mix documents: transformers 5.22+ refuses
-    # it on its own reference path, and the forced reference must keep doing so on every version.
+    # Reference scan ignores seq_idx; 5.22+ refuses packed calls and the forced path must too.
     hk = pytest.importorskip("transformers.integrations.hub_kernels")
     if getattr(hk, "use_kernel_func_from_hub_with_fallback", None) is None:
         # Skip because transformers < 5.15 has no hub factory to patch (is_fast_path_available gates it there).

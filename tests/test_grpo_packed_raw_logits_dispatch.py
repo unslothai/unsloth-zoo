@@ -32,11 +32,9 @@ SRC = (ROOT / "unsloth_zoo" / "rl_replacements.py").read_text(encoding = "utf-8"
 TREE = ast.parse(SRC)
 
 
-# the message
 
 def _mismatched_call(fn, torch):
-    """Vocab-wide logits where hidden states are expected, as an unpatched forward returns;
-    shape-static lm_head Parameter (real report: [1536, 151936] beside symbolic s33)."""
+    """Vocab-wide logits for hidden states; real report [1536, 151936] beside symbolic s33."""
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     hidden, vocab = 32, 128
     logits  = torch.randn(2, 8, vocab, device = dev, dtype = torch.float32)
@@ -61,7 +59,6 @@ def test_the_width_mismatch_names_both_operands():
     assert "32" in message and "128" in message, message
 
 
-# the dispatch
 
 def _packed_block():
     """Locates the packed call inside grpo_accumulated_loss by AST, so reformatting cannot make the test vacuous."""

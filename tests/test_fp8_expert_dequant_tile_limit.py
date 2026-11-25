@@ -154,8 +154,7 @@ def test_finer_scales_still_go_through_triton_and_agree():
 
 
 def test_a_per_expert_scalar_scale_is_broadcast_not_materialized(monkeypatch):
-    """Broadcast the (E, 1, 1) scale, never expand to (E, M, N): at the Mistral layout that extra 4.00 GiB turns the
-    crash into an OOM; assert on the call, as allocator reuse hides peak memory."""
+    """Never expand the (E,1,1) scale (OOMs at Mistral); allocator reuse hides peak memory."""
     E, M, N = 4, 256, 512
     w = torch.zeros(E, M, N).to(torch.float8_e4m3fn)
     s = torch.full((E, 1, 1), 0.05)

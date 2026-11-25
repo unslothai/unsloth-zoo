@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Ling 3.x GGUF export on transformers 5.20 (unslothai/unsloth 14916): the built-in bailing_hybrid save renames
-norm_topk_prob to moe_renormalize and rewrites head_dim, dropping keys the llama.cpp BailingMoeV3 converter reads;
-and the converter was handed the built-in class's to_dict()."""
+"""Ling 3.x GGUF export, transformers 5.20 (unslothai/unsloth 14916): built-in save renames
+norm_topk_prob, rewrites head_dim, drops keys llama.cpp reads; converter gets built-in to_dict()."""
 
 from __future__ import annotations
 
@@ -91,7 +90,6 @@ def test_ling_export_gets_the_checkpoint_keys_back(tmp_path):
         assert out[key] == _LING_SOURCE[key]
     assert out["head_dim"] == 128
     assert "moe_renormalize" not in out and "linear_head_dim" not in out and "rope_parameters" not in out
-    # What the export set itself stays.
     assert out["vocab_size"] == 157200
     assert out["dtype"] == "bfloat16" and "torch_dtype" not in out
     assert out["transformers_version"] == "5.20.2"
@@ -100,8 +98,7 @@ def test_ling_export_gets_the_checkpoint_keys_back(tmp_path):
 
 
 def test_carried_window_under_an_alias_goes_back_under_the_checkpoint_spelling(tmp_path):
-    """The export widened the window to what training used; BailingHybrid saves it as model_max_length, and the
-    checkpoint spells it max_position_embeddings, so the restore must not put the checkpoint's 131072 back."""
+    """Window saves as model_max_length; restore must not put the checkpoint's 131072 back."""
     path = _write(tmp_path, {**_LING_NATIVE_SAVE, "model_max_length": 524288})
     assert _restore_checkpoint_config_keys(
         path, json.loads(json.dumps(_LING_SOURCE)), _BailingHybridLikeConfig, carried = ("max_position_embeddings",))
@@ -156,7 +153,6 @@ def test_real_bailing_hybrid_save_round_trips(tmp_path):
     out = json.loads(path.read_text(encoding = "utf-8"))
     assert {k: out[k] for k in ("norm_topk_prob", "n_group", "num_experts_per_tok", "head_dim")} == \
         {"norm_topk_prob": True, "n_group": 8, "num_experts_per_tok": 8, "head_dim": 128}
-    # The export still loads on the built-in class exactly like the checkpoint does.
     reloaded = config_class.from_pretrained(tmp_path).to_dict()
     for key in ("moe_renormalize", "num_expert_group", "num_experts_per_token", "linear_head_dim", "head_dim"):
         assert reloaded[key] == config.to_dict()[key]

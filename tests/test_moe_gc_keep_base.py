@@ -245,8 +245,7 @@ def test_with_lora_fold(monkeypatch, nf4):
 
 @needs_gpu
 def test_nf4_auto_above_cap_takes_kept_path(monkeypatch):
-    """UNSLOTH_MOE_NF4_FUSED=auto in eager: above the row cap the regular dequant path runs (so the kept base and the
-    LoRA fold apply), at or below it the fused NF4 GEMM does."""
+    """UNSLOTH_MOE_NF4_FUSED=auto in eager: above row cap dequant (kept path); else fused GEMM"""
     pytest.importorskip("bitsandbytes")
     from unsloth_zoo.temporary_patches import moe_nf4_grouped as NF
     if not NF._device_ok(torch.device("cuda"), "auto"):
@@ -281,8 +280,7 @@ class _Headroom(nn.Module):
 @needs_gpu
 @pytest.mark.parametrize("fold", ["0", "1"])
 def test_auto_dequant_chunk_decision_is_per_checkpoint_call(monkeypatch, fold):
-    """Two QLoRA layers on one card: the first has headroom (whole stack), the second is chunked;
-    each replay reuses its own first-pass decision (bitwise), not a device-wide one."""
+    """Each replay reuses its own first-pass chunk decision (bitwise), not a device-wide one"""
     pytest.importorskip("bitsandbytes")
     for name in ("UNSLOTH_MOE_SELECTIVE_DEQUANT", "UNSLOTH_MOE_DEQUANT_CHUNK_EXPERTS", "UNSLOTH_MOE_DEQUANT_MAX_MB"):
         monkeypatch.delenv(name, raising = False)

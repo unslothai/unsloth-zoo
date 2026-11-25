@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Unreadable modeling source must not fail the load: unsloth_compile_transformers returns early on OSError, never with
-an empty full_source, since a not-in check is true for an empty string and would silently enable unsupported paths;
-slower is fine, wrong is not."""
+"""Unreadable source must not fail load: returns early on OSError, never empty full_source."""
 
 import ast
 import inspect
@@ -43,8 +41,7 @@ def _require_index(anchor: str, what: str) -> int:
 
 
 def _guard_region() -> str:
-    """Returns the modeling-file guard region, anchored on the call rather than on except (OSError,
-    TypeError), which the earlier torch forward guard also uses."""
+    """Modeling-file guard, anchored on the getsource call rather than the except clause."""
     i = _require_index(
         "full_source = inspect.getsource(modeling_file)",
         "the modeling-file guard")
@@ -125,8 +122,7 @@ def test_it_warns_so_the_slowdown_is_not_silent():
 
 
 def test_the_logger_name_exists_in_this_module():
-    """compiler.py imports `logger` from .log and has no module-level `logger_compiler`; a warning
-    raising NameError in a handler would replace a clear failure with a confusing one."""
+    """compiler.py imports logger from .log; a NameError in a handler masks the failure."""
     import unsloth_zoo.compiler as C
     assert hasattr(C, "logger")
 
@@ -172,8 +168,7 @@ def test_a_bare_return_is_the_functions_contract():
 
 
 def _nn_forward_read() -> tuple:
-    """Returns (name, statement) of the forward read, shape-matched so renames like issue 967's
-    original_forward pass; pinned by test_the_forward_source_is_read_from_the_pinned_original."""
+    """Returns (name, statement) of forward read; shape-matched so issue 967's renames pass."""
     found = []
     for node in ast.walk(ast.parse(SRC)):
         if not isinstance(node, ast.Assign) or len(node.targets) != 1:
@@ -214,9 +209,7 @@ def _nn_patch_region() -> str:
 
 
 def test_the_forward_source_is_read_from_the_pinned_original():
-    """The read operand must be function.forward or a local assigned from it in the same loop (issue 967 pin), keeping
-    the read idempotent across a vision load's two passes; otherwise _nn_forward_read could latch onto a non-forward
-    rename and every test would still pass."""
+    """Read operand: function.forward or a local from it in the same loop (issue 967 pin); idempotent."""
     if NN_FORWARD_NAME == "function":
         pytest.skip("read directly off `function.forward`, nothing to pin")
     pin = f"{NN_FORWARD_NAME} = function.forward"
@@ -304,8 +297,7 @@ def unreadable_llama(monkeypatch):
     import transformers.models.llama.modeling_llama as modeling
 
     _break_getsource(monkeypatch, modeling)
-    # Both markers must be restored: __UNSLOTH_PATCHED__ alone leaves a module reporting done yet
-    # declining to answer, and a later test's supports_sdpa accumulator is left untouched.
+    # Restore both: __UNSLOTH_PATCHED__ alone reports done yet declines; supports_sdpa leaks.
     _MISSING = object()
     saved = {name: getattr(modeling, name, _MISSING)
              for name in ("__UNSLOTH_PATCHED__", "__UNSLOTH_SUPPORTS_SDPA__")}

@@ -251,8 +251,7 @@ def test_separated_forward_matches_stock_peft_forward():
             torch.nn.init.normal_(parameter, std = 0.05)
 
     moe_utils.patch_param_wrapper_for_moe()
-    # Take PEFT's forward from the module that installed the patch: importing unsloth_zoo may already patch
-    # ParamWrapper.forward, which would make this test vacuous.
+    # Take PEFT's forward from the patch-installing module; unsloth_zoo import may already patch it.
     import sys
     stock_forward = None
     for module in list(sys.modules.values()):
@@ -284,8 +283,7 @@ def test_separated_forward_matches_stock_peft_forward():
         with torch.no_grad():
             return wrapper(x, top_k_index, top_k_weights)
 
-    # Reference first: a skip when PEFT cannot run cannot hide a separated-path regression; pytest
-    # resolves uncallable experts for unloaded configs (scripts/verify_lora_b_packing_fix.py).
+    # Reference first, else a PEFT skip hides regressions (scripts/verify_lora_b_packing_fix.py).
     ParamWrapper.forward = stock_forward
     try:
         reference = run()
@@ -367,8 +365,7 @@ def test_the_saving_utils_fallback_agrees_with_the_real_helpers(layout):
 
 
 def test_the_saving_utils_fallback_rejects_a_misspelled_layout(monkeypatch):
-    """Fallback must reject the same UNSLOTH_MOE_LORA_B_LAYOUT typos: a rank_major default would
-    merge legacy adapters wrongly and bake the scramble into the checkpoint."""
+    """Fallback must reject typos in UNSLOTH_MOE_LORA_B_LAYOUT, or legacy adapters merge wrongly."""
     from unsloth_zoo.saving_utils import _fallback_layout
 
     monkeypatch.delenv("UNSLOTH_MOE_LORA_B_LAYOUT", raising = False)
@@ -498,8 +495,7 @@ def test_the_column_reorder_saves_nothing_for_backward():
 
 
 def test_a_misspelled_layout_aborts_the_merge_before_anything_is_written(monkeypatch):
-    """A layout typo is a config error, not a skippable expert: it must escape the helpers' except Exception, since
-    merge_and_overwrite_lora writes and uploads shards before checking _MOE_MERGE_STATE['fallback']."""
+    """A layout typo must not be swallowed: the merge writes and uploads shards before checking fallback."""
     import unsloth_zoo.saving_utils as SU
 
     num_experts, rank, I, H = 4, 2, 3, 5

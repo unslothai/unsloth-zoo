@@ -61,7 +61,6 @@ def _locally_defined_grid_helpers():
         except OSError:
             continue
         for name in _DEFINITION.findall(source):
-            # Exclude the definition while retaining calls before and after it.
             callers = re.sub(r"^def " + re.escape(name) + r"\s*\(", "", source, flags = re.MULTILINE)
             if not re.search(r"[^\w.]" + re.escape(name) + r"\s*\(", callers):
                 continue

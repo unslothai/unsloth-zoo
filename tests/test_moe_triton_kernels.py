@@ -77,8 +77,7 @@ def test_nf4_dequant_matches_bitsandbytes_bitwise(shape, nested, dtype):
     numel = 1
     for s in shape:
         numel *= s
-    # Peak is the weight, or the 4-bit bytes plus both decodes and the bitsandbytes workspace; the largest shape needs
-    # ~5.5 GB fp32, so it skips only on a short card (e.g. a shared 15 GB T4) and never shrinks.
+    # Largest shape needs ~5.5 GB fp32: skip only on a short card (15 GB T4), never shrink.
     need = numel * dtype.itemsize * 2 + numel // 2 + (512 << 20)
     free = torch.cuda.mem_get_info()[0]
     if free < need:

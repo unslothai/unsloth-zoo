@@ -141,7 +141,6 @@ def test_upcast_shard_casts_only_16bit_floats(tmp_path):
     for key, t in tensors.items():
         want = t.float() if t.dtype in (torch.bfloat16, torch.float16) else t
         assert out[key].dtype == want.dtype and torch.equal(out[key], want), key
-    # Idempotent: a second pass leaves the file untouched.
     before = path.read_bytes()
     _upcast_shard_to_float32(str(tmp_path), "model.safetensors")
     assert path.read_bytes() == before

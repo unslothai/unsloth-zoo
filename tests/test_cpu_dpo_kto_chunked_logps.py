@@ -161,8 +161,7 @@ def _compare(trainer, model, method, tol, grad_tol, chunk_rows = None, monkeypat
     assert metrics_c.keys() == metrics_s.keys()
     for key in metrics_s:
         if "accuracies" in key and (tol > 1e-4 or abs(metrics_s.get("rewards/margins", 1.0)) < 1e-4):
-            # chosen > rejected flips on rounding: bf16, or a full finetune's first step (policy == reference
-            # copy, every reward about 0; the trainable-head policy and the frozen reference use different kernels)
+            # Accuracy flips on rounding: bf16, or a full finetune's first step (rewards ~0).
             continue
         _close(metrics_c[key], metrics_s[key], tol * (10 if "logits" in key else 1), key)
     assert grads_c.keys() == grads_s.keys() and len(grads_s) > 0
@@ -211,8 +210,7 @@ def test_chunked_bf16_close_to_trl(tmp_path, kind):
 
 @pytest.mark.parametrize("preference", ["1", "0"], ids = ["chunked", "trl"])
 def test_bf16_kto_lora_step_trains_the_adapters(tmp_path, monkeypatch, preference):
-    """KTO's no_grad scoring: a cached fp32 adapter cast left them without grads and broke
-    checkpoint recompute; UNSLOTH_CPU_BF16=1 forces bf16 on CPUs without native bf16 (emulated)."""
+    """KTO no_grad: a cached fp32 adapter cast broke grads; UNSLOTH_CPU_BF16=1 forces bf16."""
     from unsloth_zoo.cpu import runtime
     monkeypatch.setenv("UNSLOTH_CPU_BF16", "1")
     monkeypatch.setenv("UNSLOTH_CPU_CHUNKED_PREFERENCE", preference)

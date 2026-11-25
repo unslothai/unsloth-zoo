@@ -35,8 +35,7 @@ FUNCS = [
 
 
 def _probe(value):
-    """Import rl_replacements in a subprocess with the flag set and report whether each helper came out compiled; a
-    subprocess is needed since the flag is read at import and the module is then cached in sys.modules."""
+    """Subprocess needed: the flag is read at import and sys.modules then caches the module."""
     script = textwrap.dedent("""
         import json, torch
         import unsloth_zoo.rl_replacements as R

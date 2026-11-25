@@ -27,8 +27,7 @@ from unsloth_zoo.patching_utils import verify_and_set_device
 
 
 def _an_accelerator_index_is_constructible() -> bool:
-    """Integer devices need a default accelerator: torch 2.10.0+cpu raises on torch.device(2) but
-    not cuda:3; CUDA_VISIBLE_DEVICES hiding does not reproduce it, so these tests are gated."""
+    """torch 2.10.0+cpu raises on torch.device(2), not cuda:3; CUDA_VISIBLE_DEVICES can't repro"""
     try:
         torch.device(0)
     except RuntimeError:
@@ -132,8 +131,7 @@ def test_real_module_on_cuda():
 
 
 def test_a_meta_layer_publishes_nothing_rather_than_meta():
-    """meta passes every reader's type check and propagates through matmul without raising, so publishing it would turn
-    the ref 3538 ValueError into a silent empty decode."""
+    """Publishing meta would turn the ref 3538 ValueError into a silent empty decode."""
     activation = torch.ones(2, 4)
     assert activation.to("meta").device.type == "meta"
     assert torch.matmul(activation.to("meta"), torch.ones(4, 4)).device.type == "meta"

@@ -139,7 +139,6 @@ def test_model_file_allowed_when_caller_trusts(fake_loaders, tmp_path):
     assert not marker.exists()
     from_pretrained(model_path, trust_remote_code=True)
     assert marker.exists()
-    # Trust is scoped to the call: a later untrusted load is refused again.
     marker.unlink()
     with pytest.raises(ValueError):
         from_pretrained(model_path, None, False)

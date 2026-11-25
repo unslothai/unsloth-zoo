@@ -47,8 +47,7 @@ def _ls(lora_A: torch.Tensor, lora_B: torch.Tensor, alpha: float) -> LoraStats:
     return LoraStats(module=None, lora_A=lora_A, lora_B=lora_B, alpha=alpha)
 
 
-# PEFT packs lora_A expert-slowest (rows e*rank:(e+1)*rank) and lora_B expert-fastest (columns
-# e::num_experts); expectation written out, not from moe_utils, so the test can fail.
+# PEFT packs lora_A expert-slowest, lora_B expert-fastest; expectation is not from moe_utils.
 
 def _peft_expert_lora_b(lora_B: torch.Tensor, expert_idx: int, num_experts: int) -> torch.Tensor:
     """Expert `expert_idx`'s `(out, rank)` block of a fused `lora_B`, as PEFT packs it."""
@@ -163,8 +162,7 @@ def test_merge_lora_returns_W_when_lora_missing():
 def test_merge_moe_gate_expert():
     """gate_W shape (inter_dim, hidden_dim).  delta = (B @ gate_a).T."""
     torch.manual_seed(SEED)
-    # num_experts != rank_per so confusing the two axes cannot pass unnoticed; factors are scaled so the delta is large
-    # against atol, since at 0.05 either lora_B packing passed.
+    # num_experts != rank_per so axes cannot be confused; scaled factors keep delta above atol.
     num_experts, rank_per, inter_dim, hidden_dim = 4, 3, 8, 12
     total_rank = num_experts * rank_per
     two_inter = 2 * inter_dim
@@ -286,8 +284,7 @@ def test_merge_moe_fused_gate_up_expert(is_transposed):
 
 @pytest.mark.parametrize("is_transposed", [True, False])
 def test_merge_moe_fused_down_proj_expert(is_transposed):
-    """Fused 3D down weight (E, dim1, dim2): layout is detected by matching A.shape[1] to dim1 when transposed or dim2
-    otherwise; delta (dim_B, dim_A) is transposed when use_transpose."""
+    """A.shape[1] picks dim1 if transposed, else dim2; delta is transposed when use_transpose."""
     torch.manual_seed(SEED)
     num_experts, rank_per = 4, 3
     total_rank = num_experts * rank_per

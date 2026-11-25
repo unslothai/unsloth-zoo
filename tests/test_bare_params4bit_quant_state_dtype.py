@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Bare Params4bit expert stacks dequantize to quant_state.dtype; pre-quantized bfloat16 checkpoints
-on float16 GPUs then gave bfloat16 experts (slower, more memory, different losses), so
-patch_model_and_tokenizer uses the compute dtype like Linear4bit; forced float32 keeps them as
-loaded."""
+"""Bare Params4bit expert stacks dequantize to quant_state.dtype; patch_model_and_tokenizer uses the
+compute dtype like Linear4bit (pre-quantized bf16 checkpoints on fp16 GPUs gave bf16 experts:
+slower, more memory, different losses); forced float32 keeps loaded dtype."""
 
 import pytest
 import torch

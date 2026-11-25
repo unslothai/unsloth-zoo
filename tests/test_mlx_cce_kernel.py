@@ -407,8 +407,7 @@ def test_is_lm_head_trainable_follows_descriptor_path():
 
 
 def test_backboneless_text_model_selects_baseline_fallback(capsys):
-    # nanochat stack under .transformer with no separable .model: biased head would trip the eligibility gate, so
-    # topology is pinned at construction, not first use
+    # nanochat (.transformer, no .model): biased head fails eligibility; pin topology at init.
     from unsloth_zoo.mlx import utils as U
 
     nn = U.nn
@@ -560,15 +559,12 @@ def test_describe_output_head_evidence_ladder():
         # Helium-style dead lm_head + True flag -> tied via embedding
         (_lm(nn, args_flag=True, head=nn.Linear(32, 96, bias=False)),
          "tied", "model.embed_tokens", None),
-        # flag False blocks source evidence; alt head -> candidate
         (_lm(nn, tied_flag=False, alt="output", call_src="as_linear"),
          "unknown", None, "model.output"),
         # Conflicting flags fail closed; the head surfaces as an exclusion candidate (identity, not proof of tying)
         (_lm(nn, tied_flag=True, args_flag=False, head=nn.Linear(32, 96, bias=False)),
          "unknown", None, "lm_head"),
-        # No flag: unconditional as_linear source evidence -> tied
         (_lm(nn, call_src="as_linear"), "tied", "model.embed_tokens", None),
-        # GPT-NeoX embed_in/embed_out shapes -> alt-name candidate
         (_lm(nn, emb_name="embed_in", alt="embed_out"), "unknown", None, "model.embed_out"),
     ]
     for i, (model, status, path, cand) in enumerate(rows):

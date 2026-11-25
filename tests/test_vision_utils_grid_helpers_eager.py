@@ -76,8 +76,7 @@ def test_grid_helpers_are_discoverable():
 
 @pytest.mark.parametrize("name", sorted(_grid_helpers()))
 def test_uncompilable_grid_helpers_are_listed(name):
-    """Anything Dynamo cannot capture fullgraph must be in DISABLE_COMPILE_FUNCTIONS; the assert only runs inside
-    `except`, so an upstream-traceable helper cannot fail it."""
+    """Helpers Dynamo cannot capture fullgraph must be listed in DISABLE_COMPILE_FUNCTIONS."""
     fn, kwargs = _grid_helpers()[name]
 
     eager = fn(**kwargs)

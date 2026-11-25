@@ -59,8 +59,7 @@ INDEXER = {
 
 def write_gguf(path, architecture = "llama", keys = None, tensors = None,
                raw_dtype = None):
-    """Writes a minimal GGUF with exactly the given keys; `tensors` maps names to arrays (None gives a 2x2 of ones) and
-    `raw_dtype` marks arrays as quantized block bytes."""
+    """Writes GGUF with given keys; None tensor is 2x2 ones; raw_dtype marks quantized blocks."""
     writer = GGUFWriter(str(path), architecture)
     for key, value in (keys or {}).items():
         if isinstance(value, str):
@@ -231,7 +230,6 @@ def test_unreadable_file_is_reported_not_raised(llama_cpp, tmp_path):
     assert problems and "could not be read" in problems[0], problems
 
 
-# --- Split exports ---
 
 def test_any_shard_resolves_to_the_whole_set(llama_cpp, tmp_path):
     """Only shard 1 carries the KV metadata, so given shard 2 the gate must read shard 1 for metadata and still check shard 2's tensors."""
@@ -261,7 +259,6 @@ def test_a_missing_middle_shard_is_reported(llama_cpp, tmp_path):
                        tensors = {"blk.0.attn_q.weight": None})
     write_gguf(tmp_path / "m-00003-of-00003.gguf", architecture = "llama",
                keys = {}, tensors = {"blk.2.attn_q.weight": None})
-    # Shard 2 was never written.
 
     assert llama_cpp._gguf_missing_shards(first) == ["m-00002-of-00003.gguf"]
     problems = llama_cpp.gguf_metadata_problems(first)
@@ -428,7 +425,6 @@ def test_an_f16_infinity_is_caught(llama_cpp, tmp_path):
     assert any("NaN or Inf" in problem for problem in problems), problems
 
 
-# --- Sampling ---
 
 def test_sampling_is_deterministic_and_covers_the_ends(llama_cpp):
     first = llama_cpp._gguf_sample_indices(236, 8, ("model.gguf", 236))
@@ -454,7 +450,6 @@ def test_sample_size_env_is_read_at_the_call(llama_cpp, monkeypatch):
     assert llama_cpp._gguf_sample_size() == llama_cpp.GGUF_VERIFY_SAMPLE_DEFAULT
 
 
-# --- The gate `convert_to_gguf` runs ---
 
 def test_the_gate_refuses_a_file_missing_required_metadata(llama_cpp, tmp_path):
     keys = {k: v for k, v in UNIVERSAL.items() if k != "llama.block_count"}
@@ -673,7 +668,6 @@ def test_the_gate_checks_a_split_set_once(llama_cpp, tmp_path):
     assert len(opened) == 2, opened
 
 
-# --- What the rebuild removed ---
 
 def test_the_reader_is_no_longer_rebuilt_with_exec(llama_cpp):
     """The validator must not rebuild `GGUFReader.__init__` through exec (it read only the final tensor); ast-parsed because the docstrings still name exec."""
@@ -924,8 +918,7 @@ def test_an_unreadable_later_shard_does_not_break_the_shape_pass(llama_cpp, tmp_
     readers = [readers[0], (readers[1][0], None)]
     assert llama_cpp._gguf_shape_problems(model, readers, sample_size = 8) == []
 
-    # With only the unreadable shard left there is nothing to compare rather than an exception; the second set gets its
-    # own directory since the first is still mapped.
+    # Unreadable-only: nothing to compare, no exception; 2nd set needs own dir, 1st is mapped.
     model, readers = _two_shard_readers(llama_cpp, tmp_path / "second", (2, 2))
     assert llama_cpp._gguf_shape_problems(
         model, [(readers[0][0], None)], sample_size = 8,
@@ -997,7 +990,6 @@ def test_the_conversion_passes_the_derived_tree_to_the_verifier(llama_cpp):
     fn = next(n for n in _ast.walk(tree)
               if isinstance(n, _ast.FunctionDef) and n.name == "convert_to_gguf")
 
-    # Names assigned from an expression that mentions _gguf_readback_tree.
     derived = set()
     for node in _ast.walk(fn):
         if isinstance(node, _ast.Assign) and any(
@@ -1149,8 +1141,7 @@ def _many_parameter_model(llama_cpp, tmp_path, block_count_key = True):
 def test_the_name_map_is_sized_by_the_blocks_not_the_parameters(
     llama_cpp, tmp_path, monkeypatch, block_count_key,
 ):
-    """TensorNameMap's second argument is the block count; sizing it by parameter count builds names for nonexistent
-    layers, so use the file's declared block count, with parameter names as fallback."""
+    """TensorNameMap: block count not param count (names absent layers); param names fallback."""
     import gguf.tensor_mapping as tensor_mapping
 
     _RecordingNameMap.calls = []
@@ -1224,7 +1215,6 @@ def test_the_conversion_drops_only_the_failed_optional_runs_files(llama_cpp):
     calls = [n for n in _ast.walk(fn) if isinstance(n, _ast.Call)
              and isinstance(n.func, _ast.Name) and n.func.id == "_verify_run_outputs"]
     assert calls, "convert_to_gguf no longer verifies per run"
-    # The required flag must be passed through, not hardcoded.
     for call in calls:
         args = [a for a in call.args if isinstance(a, _ast.Name)]
         assert any(a.id.endswith("required") for a in args), \

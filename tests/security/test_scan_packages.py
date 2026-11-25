@@ -19,7 +19,6 @@ from scripts import scan_packages as sp  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Fixture sanity.
 # ---------------------------------------------------------------------------
 
 
@@ -30,7 +29,6 @@ def test_fixture_files_exist():
 
 def test_fixture_bytes_are_deterministic(tmp_path):
     """Rebuilding the fixtures with _build.py must give byte-identical archives, since it pins member mtime, uid, gid and mode and sorts members."""
-    # Snapshot committed hashes.
     expected: dict[str, str] = {}
     for name in ("malicious_wheel.whl", "clean_wheel.whl", "malicious_sdist.tar.gz"):
         expected[name] = hashlib.sha256((FIXTURES / name).read_bytes()).hexdigest()
@@ -72,7 +70,6 @@ def test_fixture_bytes_are_deterministic(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# scan_archive() against the fixture wheel + sdist.
 # ---------------------------------------------------------------------------
 
 
@@ -112,7 +109,6 @@ def test_clean_wheel_no_findings():
 
 
 # ---------------------------------------------------------------------------
-# Fork 1 constants -- gated on availability.
 # ---------------------------------------------------------------------------
 
 
@@ -149,7 +145,6 @@ def test_re_may12_ioc_catches_each_literal():
     pattern: re.Pattern = sp.RE_MAY12_IOC
     for lit in expected_literals:
         assert pattern.search(lit), f"RE_MAY12_IOC missed literal {lit!r}"
-    # Clean control: a plain string with none of the literals must not match.
     assert not pattern.search("import numpy as np")
 
 
@@ -158,20 +153,14 @@ def test_re_may12_ioc_catches_each_literal():
     reason = "Fork 1 (RE_MAY12_IOC integration) not merged yet",
 )
 def test_may12_ioc_caught_by_scan_archive():
-    """Once RE_MAY12_IOC is wired into check_py_file (per Fork 1's
-    plan), the malicious wheel's setup.py must produce a finding
-    that explicitly references the May-12 IOC string.
-    """
+    """With RE_MAY12_IOC wired into check_py_file, malicious setup.py must cite the May-12 IOC."""
     findings = sp.scan_archive(
         str(FIXTURES / "malicious_wheel.whl"),
         "malicious_fixture",
     )
-    # The IOC literals are built at runtime so CodeQL's
-    # py/incomplete-url-substring-sanitization rule does not false-
-    # positive on the (literal `in` operand) pattern -- the operand is
-    # the scanner's own evidence string, not a URL being sanitized.
-    # Runtime construction also survives pre-commit reformatting that
-    # would otherwise detach an inline lgtm comment from the operator.
+    # IOC literals are built at runtime so CodeQL's py/incomplete-url-substring-sanitization rule
+    # does not flag the `in` operand (evidence, not a URL); runtime construction survives
+    # reformatting that would detach an inline lgtm comment.
     _ioc_host = "git-tanstack." + "com"
     _ioc_drop = "transformers." + "pyz"
     hit = any(
@@ -187,18 +176,12 @@ def test_may12_ioc_caught_by_scan_archive():
 
 
 # ---------------------------------------------------------------------------
-# Silent-failure-class hardening (Fork C).
 # ---------------------------------------------------------------------------
 
 
 def test_scan_packages_pip_download_failure_propagates(tmp_path):
-    """A pip download failure must not be swallowed into a `0 findings,
-    exit 0` report: an unresolvable spec must make the orchestrator exit 2
-    (scan incomplete) with the SCAN INCOMPLETE banner on stderr.
-
-    The spec name is deliberately long + random so it can't resolve on any
-    real index; even an offline runner gets a clean "could not resolve".
-    """
+    """A pip download failure must not read as '0 findings, exit 0': an unresolvable spec must exit
+    2 with the SCAN INCOMPLETE banner on stderr; random name fails to resolve even offline."""
     script = REPO_ROOT / "scripts" / "scan_packages.py"
     assert script.is_file(), script
     unresolvable = "pkg-that-does-not-exist-0123456789-fork-c-silentfail==0.0.0"
@@ -231,7 +214,6 @@ def test_archive_corruption_produces_critical_finding(tmp_path):
     )
     assert all(f.severity == sp.CRITICAL for f in corrupted)
 
-    # Same check for a corrupted tarball.
     bad_tar = tmp_path / "broken-0.0.1.tar.gz"
     bad_tar.write_bytes(b"not-a-real-gzip-stream")
     findings_tar = sp.scan_archive(str(bad_tar), "broken_fixture")

@@ -114,7 +114,6 @@ def test_a_tool_result_is_not_supervised():
     assert TOOLRESULT not in supervised(row, labels), "the tool result was trained on"
     assert TOOLCALL in supervised(row, labels)
     assert FINAL in supervised(row, labels)
-    # No role header may be supervised: every <|im_start|> is a message opener.
     for position, token in enumerate(row):
         if token == IM_START:
             assert labels[position] == -100, f"role header at {position} was trained on"
@@ -142,7 +141,6 @@ def test_consecutive_assistant_messages_are_separate_spans():
 
     assert TOOLCALL in supervised(row, labels)
     assert FINAL in supervised(row, labels)
-    # The second assistant's own header sits between them and must stay masked.
     assert labels[row.index(ASSISTANT, row.index(ASSISTANT) + 1)] == -100
 
 
@@ -166,7 +164,6 @@ def test_padding_that_reuses_eos_is_not_supervised():
 
     labels = mask(tokenizer, row)
 
-    # The response keeps its own EOS target; the five pad copies do not.
     assert [l for l in labels if l == EOS] == [EOS]
 
 
@@ -197,7 +194,6 @@ def test_a_whitespace_special_token_is_not_a_message_boundary():
     )
     fn = train_on_responses_only(
         None, "\nUser\n", "\nAssistant\n", tokenizer=tokenizer, return_function=True)
-    # ...Assistant\n ANSWER_A \n ANSWER_B <end> <eos>: the answer spans a newline.
     row = [NEMO_NL, NEMO_USER, NEMO_NL, 200,
            NEMO_NL, NEMO_ASSISTANT, NEMO_NL, NEMO_ANSWER_A, NEMO_NL, NEMO_ANSWER_B,
            NEMO_END, NEMO_EOS]

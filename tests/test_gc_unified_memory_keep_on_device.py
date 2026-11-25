@@ -82,7 +82,6 @@ def test_carveout_decides_the_pool(monkeypatch, platform, carveout, total, pool)
     assert info["pool"] == pool and info["carveout"] == carveout and info["total_memory"] == total
     assert D.device_shares_host_memory(0) is (pool == "shared")
     assert D.unified_memory_device_indices() == (frozenset({0}) if pool == "shared" else frozenset())
-    # The env override still forces either way.
     monkeypatch.setenv(D.KEEP_ON_DEVICE_ENV, "1")
     assert D.unified_memory_device_indices() == frozenset({0})
 
@@ -338,9 +337,8 @@ def test_free_memory_is_re_read_periodically(G, monkeypatch):
 
 
 def test_offloaded_checkpoint_initializes_once_when_every_device_keeps(G, monkeypatch):
-    """unsloth_offloaded_gradient_checkpoint (patch_unsloth_gradient_checkpointing) took an empty CPU_BUFFERS for
-    "not initialized", but every device keeping its inputs leaves it empty on purpose: each checkpoint call
-    re-initialized, resetting the streams, GPU buffers and the free-memory budget (one driver read per call)."""
+    """The checkpoint reads empty CPU_BUFFERS as not initialized, but stays empty when every device
+    keeps inputs; re-init per call resets streams, GPU buffers and free-memory budget."""
     monkeypatch.setattr(G, "_keep_on_device_indices", lambda: frozenset({None}))
     monkeypatch.setattr(G, "_visible_device_count", lambda: 1)
     stubs = {n: getattr(G, n) for n in ("GPU_BUFFERS", "GPU_BUFFERS_B", "USE_DOUBLE_BUFFER", "EXTRA_STREAMS",
@@ -412,7 +410,6 @@ def test_reset_after_training_when_every_device_keeps(G, monkeypatch):
     assert (G.FIRST_PASS, G.LAST_GC_INDEX, G.CURRENT_GC_INDEX, G.BACKWARD_PASS) == (True, 0, 0, True)
     assert G.CPU_BUFFERS == []  # still no pinned pool
     assert emptied == [1]
-    # The next run counts its own checkpointed layers again and trains exactly.
     got = _grads(G, ckpt = True)
     assert G.LAST_GC_INDEX == L
     ref = _grads(G, ckpt = False)

@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Patched Qwen3-VL-MoE blocks must return router logits at index 1 (transformers 4.57.x); returning
-only hidden states makes the aux loss read hidden states as logits."""
+"""transformers 4.57.x: Qwen3-VL-MoE blocks return router logits at index 1, not hidden states."""
 import inspect
 
 import pytest

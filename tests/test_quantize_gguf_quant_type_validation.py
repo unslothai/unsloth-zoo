@@ -147,8 +147,7 @@ def test_surrounding_whitespace_is_trimmed_not_rejected(monkeypatch):
 
 @pytest.mark.parametrize("is_windows", [False, True])
 def test_command_is_byte_identical_across_platforms(monkeypatch, is_windows):
-    """The validated token is inserted bare, so cmd.exe and every POSIX shell
-    see exactly the command previous releases produced."""
+    """Validated token inserted bare: cmd.exe and POSIX shells see the same command as before."""
     llama_cpp = _load_llama_cpp_module()
     captured = _install_fake_subprocess_run(monkeypatch, llama_cpp)
     _stub_output_exists(monkeypatch)

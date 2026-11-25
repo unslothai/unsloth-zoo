@@ -107,8 +107,7 @@ def test_underscore_wins_when_both_converters_present(mod, monkeypatch, tmp_path
 
 
 def test_source_or_new_layout_checkout_also_resolves(mod, monkeypatch, tmp_path):
-    # The resolver keys only on conversion/__init__.py, conversion/base.py and the converter, so a new-layout checkout
-    # under LLAMA_CPP_DEFAULT_DIR also resolves locally; intended.
+    # New-layout checkout in LLAMA_CPP_DEFAULT_DIR also resolves by design; keys on file layout.
     src = _make_bundle(tmp_path / "src_checkout")
     (src / "ggml").mkdir()  # extra source-tree noise, ignored by the resolver
     monkeypatch.setattr(mod, "LLAMA_CPP_DEFAULT_DIR", str(src))

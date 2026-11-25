@@ -139,8 +139,7 @@ def union_operands(node):
 
 
 def looks_like_a_type_alias(node, known_typing_names):
-    """Needs name-shaped operands and one recognisable type (str | Path yes; defaults | extra, re.A | re.M no): a bare |
-    between plain names may be a PEP 584 dict merge valid on 3.9."""
+    """Needs a type operand: a bare | of plain names may be a valid 3.9 PEP 584 dict merge."""
     operands = union_operands(node)
     if not operands:
         return False
@@ -331,9 +330,8 @@ def strict_patch_calls(tree):
 
 
 def test_modules_with_strict_patches_do_not_defer_annotations():
-    """Do not defer annotations in patching modules: can_safely_patch compares inspect.signature annotations with no
-    get_type_hints, so a stringified one never matches at the default strict level and patch_function declines with
-    only a log; use typing.Optional or typing.Union."""
+    """Patching modules must not defer annotations: can_safely_patch compares inspect.signature (no
+    get_type_hints), so strings never match at strict level; use typing.Optional or Union."""
     offenders = []
     for path in scoped_files():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

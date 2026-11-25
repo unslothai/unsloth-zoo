@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""merged_16bit writes the base checkpoint's config (#1073), but Unsloth's loader puts RoPE scaling and the widened
-max_position_embeddings on the in-memory config only. The export must reload with the RoPE the weights trained with."""
+"""merged_16bit writes base config (#1073); in-memory RoPE and window must reach the export."""
 
 from __future__ import annotations
 
@@ -216,8 +215,7 @@ def test_rope_a_llama_rotary_could_not_apply_is_not_exported(tmp_path, applied):
 
 
 def test_checkpoint_key_restore_keeps_the_carried_rope(tmp_path):
-    """A repo-code checkpoint whose keys the built-in class renamed is written back from its own config.json; the RoPE
-    and window the export carried over from training must survive that, and nothing else changes."""
+    """Key restore from config.json keeps the carried RoPE and window; nothing else changes."""
     from unsloth_zoo.saving_utils import _restore_checkpoint_config_keys
 
     class AliasConfig:
@@ -239,8 +237,7 @@ def test_checkpoint_key_restore_keeps_the_carried_rope(tmp_path):
 
 @pytest.mark.parametrize("attention_scaling,exported", [(1.0, False), (1.1386, True)], ids=["fallback", "yarn_mscale_only"])
 def test_yarn_that_only_scales_attention_still_counts_as_applied(attention_scaling, exported):
-    """With a long original window every frequency can stay unscaled under YaRN and only cos / sin scale (mscale), as
-    on Qwen2 (theta 1e6, original 32768): that is applied scaling, unlike the fallback, which leaves both at 1."""
+    """YaRN that only scales cos/sin (mscale), as on Qwen2, still counts as applied scaling."""
     from unsloth_zoo.saving_utils import _carry_over_rope_scaling
 
     class LlamaRotaryEmbedding(torch.nn.Module):
@@ -261,8 +258,7 @@ def test_yarn_that_only_scales_attention_still_counts_as_applied(attention_scali
 
 
 def test_wrapper_whose_text_config_is_itself_moves_rope_into_llm_config():
-    """A repo-code composite (InternVL style) whose get_text_config() returns the wrapper keeps the language model's
-    RoPE and window in llm_config; a text-only export trains that config, and the reload reads llm_config."""
+    """A composite whose get_text_config() returns itself keeps RoPE and window in llm_config."""
     import transformers as T
     from unsloth_zoo.saving_utils import _carry_over_rope_scaling
 

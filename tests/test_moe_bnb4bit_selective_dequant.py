@@ -353,8 +353,7 @@ def test_auto_chunking_waits_for_memory_need(monkeypatch):
 
 
 def test_a_transient_shortfall_clears_once_memory_is_back(monkeypatch):
-    """A transient low reading must not chunk a device for good; the next call re-reads and returns
-    to the whole stack, and checkpoint replays keep their first-pass decision."""
+    """A transient memory shortfall must not chunk a device for good; replays keep the first decision."""
     monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
     monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, 0, int(21.96 * 2**30))   # L4
     cuda0 = torch.device("cuda", 0)
@@ -373,8 +372,7 @@ def test_a_transient_shortfall_clears_once_memory_is_back(monkeypatch):
 
 
 def test_replay_keeps_its_own_layers_first_pass_decision(monkeypatch):
-    """Two checkpointed layers on one card decide chunk sizes 0 and 55 at different headroom; each
-    replay keeps its own first-pass decision, or a device-wide verdict would give A B's 55."""
+    """Checkpointed layers on one card each keep their own first-pass chunk decision, not device-wide."""
     monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
     monkeypatch.setitem(mu._DEVICE_TOTAL_BYTES, 0, int(21.96 * 2**30))   # L4
     cuda0 = torch.device("cuda", 0)
@@ -401,8 +399,7 @@ def test_replay_keeps_its_own_layers_first_pass_decision(monkeypatch):
 
 
 def test_capture_check_asks_the_counts_device(monkeypatch):
-    """A graph captured on cuda:1 while cuda:0 is current: the plan must see the capture on the counts' device and
-    not read the counts on the host (a copy during capture fails)."""
+    """Plan sees the capture on counts' device (cuda:1), never via a host read (copies fail in capture)."""
     import contextlib
 
     experts = _Experts(True)
@@ -472,8 +469,7 @@ def test_scratch_cap_keeps_a_sparse_plan_that_already_fits(monkeypatch):
 
 
 def test_scratch_cap_chunks_only_the_routed_experts(monkeypatch):
-    """Over the cap the chunked plan reads counts on the host and only the routed experts, not every
-    expert a chunk reaches; values match the whole stack bit for bit."""
+    """Over the cap, chunks dequantize only routed experts, read on the host; output matches bit for bit."""
     monkeypatch.delenv("UNSLOTH_MOE_DEQUANT_MAX_MB", raising = False)
     torch.manual_seed(0)
     experts = _Experts(True)

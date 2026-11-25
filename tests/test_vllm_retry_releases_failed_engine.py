@@ -147,7 +147,6 @@ def test_release_unwraps_the_torch_compile_backend_wrapper():
     others = added - ours
     vllm_utils._release_failed_vllm_engine(snapshot)
     assert not (ours & set(eval_frame.cached_backends))
-    # Only vLLM's entries go: anything else registered meanwhile stays.
     assert others <= set(eval_frame.cached_backends)
 
 

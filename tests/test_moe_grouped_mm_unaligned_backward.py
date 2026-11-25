@@ -36,8 +36,7 @@ pytestmark = pytest.mark.skipif(not _native_cpu_grouped_mm_works(), reason = "to
 
 
 def _dynamo_resolves_the_real_grouped_mm():
-    """Dynamo reads `torch._grouped_mm` into its op table once per process, at first trace; built
-    under a spy, later compiles graph-break on the real op, so build it before any spy."""
+    """Dynamo reads torch._grouped_mm once per process at first trace; build it before any spy."""
     trace_rules = getattr(getattr(torch, "_dynamo", None), "trace_rules", None)
     get_rules = getattr(trace_rules, "get_torch_obj_rule_map", None)
     if get_rules is None:

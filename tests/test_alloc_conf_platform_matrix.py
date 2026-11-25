@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Tests the import-time allocator env setup in unsloth_zoo/__init__.py: torch <=2.9 uses legacy
-per-backend vars, 2.10+ unified PYTORCH_ALLOC_CONF; WSL/Windows get roundup_power2_divisions
-(unslothai/unsloth issue 7203); each case runs in a fresh child with faked torch and backend."""
+"""Allocator env: legacy per-backend vars for torch <=2.9, unified PYTORCH_ALLOC_CONF for 2.10+;
+WSL/Windows get roundup_power2_divisions (unslothai/unsloth issue 7203)."""
 
 from __future__ import annotations
 
@@ -22,8 +21,7 @@ ROUNDUP = "roundup_power2_divisions:[32:256,64:128,256:64,>:32]"
 _ALLOC_KEYS = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF")
 _WIPE = _ALLOC_KEYS + (
     "WSL_DISTRO_NAME", "WSL_INTEROP", "UNSLOTH_VLLM_STANDBY", "UNSLOTH_DISABLE_ALLOC_FALLBACK",
-    # Inheriting UNSLOTH_ZOO_DISABLE_GPU_INIT skips the allocator block in the child, so every case reports that nothing
-    # was written; hf_xet_fallback sets it on the parent around a spawn.
+    # Inherited, it skips the child's allocator block; hf_xet_fallback sets it on the parent.
     "UNSLOTH_ZOO_DISABLE_GPU_INIT",
 )
 
@@ -170,7 +168,6 @@ class TestWindowsWslFallback:
         assert conf["PYTORCH_ALLOC_CONF"] == "expandable_segments:True", conf
 
     def test_linux_2_10_no_fallback(self):
-        # Regression guard: native Linux keeps expandable, never gets roundup.
         conf = _conf(torch_version="2.10.0")
         assert conf["PYTORCH_ALLOC_CONF"] == "expandable_segments:True", conf
         assert "roundup" not in (conf["PYTORCH_ALLOC_CONF"] or ""), conf

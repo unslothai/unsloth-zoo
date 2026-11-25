@@ -27,12 +27,10 @@ import pytest
 import torch
 
 
-# torch.xpu partial build (is_available, symbol missing): 35dc451, e08c1df, 2564f39, d631837.
 
 def test_xpu_partial_build_all_three_helpers_silent_no_op():
-    """The three device_type helpers must no-op, not raise AttributeError, on a torch.xpu lacking synchronize /
-    empty_cache / is_bf16_supported; these partial builds crashed GGUF merge and VLM mmproj export (e08c1df, 35dc451,
-    d631837)."""
+    """The three device_type helpers must no-op, not raise AttributeError, on a partial torch.xpu
+    lacking synchronize/empty_cache/is_bf16_supported (e08c1df, 35dc451, d631837)."""
     from unsloth_zoo import device_type as dt
 
     class PartialXpu:
@@ -203,11 +201,9 @@ def test_apple_silicon_stub_injection_entrypoints_pinned():
         "Stub injection entry point inject_into_sys_modules vanished from "
         "unsloth_zoo/__init__.py — regresses commit 2053539 sub-bug (b)."
     )
-    # Pre-fix names that must NOT come back.
     assert "install_triton_stub" not in src
     assert "install_bitsandbytes_stub" not in src
 
-    # Sub-bug (a): the injection block must sit under positive 'if _SKIP_GPU_INIT:', not the negated 'if not _SKIP_GPU_INIT:' gate.
     assert "if _SKIP_GPU_INIT:" in src, (
         "Apple-Silicon stub-injection gate flipped — regresses commit "
         "2053539 sub-bug (a)."
@@ -535,7 +531,6 @@ def test_the_dequant_sees_the_real_wheel_not_the_stub(monkeypatch, tmp_path):
     monkeypatch.setattr(loader.tempfile, "mkdtemp", lambda **k: str(tmp_path))
 
     with _bnb_modules({"bitsandbytes": stub}):
-        # The lift reinstates cached real modules, standing in for the real import.
         loader._REAL_BITSANDBYTES_MODULES = {"bitsandbytes": real}
         loader._dequantize_bnb_to_tempdir(
             "some/repo", token = None, trust_remote_code = False,
@@ -583,8 +578,7 @@ def test_lifting_the_bnb_stub_keeps_a_finder_installed_while_the_block_ran():
         assert stub_finder in sys.meta_path, "the stub finder was not put back"
 
 
-# mlx_loader rejects full_finetuning on pre-quantized repos (7d2bb95): without it the CCE backward returns mx.zeros for
-# quantized weight grads, so most of the model never updates.
+# mlx_loader rejects full_finetuning on pre-quantized repos (7d2bb95); else CCE zeroes grads.
 
 def test_get_existing_mlx_quantization_detects_both_keys():
     """Must detect both 'quantization' (MLX native) and 'quantization_config' (HF style) keys; checking only one
@@ -615,8 +609,7 @@ def test_get_existing_mlx_quantization_detects_both_keys():
     )
 
 
-# target_modules='all-linear' must collect every nn.Linear name (7f8b0ca); pre-fix it was rewritten to None, collapsing
-# to the canonical 7 and dropping GatedDelta in_proj_* and out_proj for Qwen3.5.
+# all-linear must collect all nn.Linear names (7f8b0ca); pre-fix dropped GatedDelta in_proj_*.
 
 def test_collect_all_linear_target_names_finds_qkv_and_moe():
     """Must find fused-QKV, GatedDelta, vision tower and MoE linears, not only the canonical 7."""
@@ -659,7 +652,6 @@ def test_collect_all_linear_target_names_finds_qkv_and_moe():
     names = set(_collect_all_linear_target_names(FakeQwen3p5()))
     canonical = {"q_proj", "k_proj", "v_proj", "o_proj",
                  "gate_proj", "up_proj", "down_proj"}
-    # Canonical 7 must still resolve; an empty result means the walk matched nothing, so check the MLX stack before the targeting logic.
     assert canonical <= names, (
         f"all-linear lost canonical names {sorted(canonical - names)}; got {sorted(names)}. "
         f"An EMPTY result here means the walk matched nothing at all -- check the MLX stack "

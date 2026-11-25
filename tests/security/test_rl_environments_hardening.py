@@ -229,7 +229,6 @@ def test_checker_only_uses_ast_nodes_present_on_this_python(monkeypatch):
     assert {"strategy", "board", "x"} <= bound and "Literal" in literal_names and "typing" in typing_names
 
 
-# --- none of the hardening may cost ordinary generated code ------------------
 
 def test_ordinary_match_statements_still_work():
     """Public attributes, capture names and every benign pattern kind."""
@@ -269,7 +268,6 @@ def test_ordinary_bindings_still_work():
     assert create_locked_down_function(source)([5], []) == 7
 
 
-# --- launch_openenv ----------------------------------------------------------
 
 class _HealthyHandler(http.server.BaseHTTPRequestHandler):
     """A local process that answers /health and nothing else, i.e. a squatter."""
@@ -541,7 +539,6 @@ def test_ipv4_loopback_host_is_not_bracketed(monkeypatch, tmp_path):
     assert client.base_url == f"http://127.0.0.1:{port}"
 
 
-# --- the registry identifies an endpoint, not a port number -------------------
 
 def test_two_hosts_on_one_port_are_tracked_separately(monkeypatch, tmp_path):
     """A port-only key lost one of two live children and misassigned the other."""
@@ -577,7 +574,6 @@ def test_two_hosts_on_one_port_are_tracked_separately(monkeypatch, tmp_path):
     assert client_v4.base_url == "http://127.0.0.1:45000"
     assert client_v6.base_url == "http://[::1]:45000"
     assert len(spawned) == 2
-    # Both live children are still tracked; neither overwrote the other.
     assert set(rl_env._OPENENV_CHILDREN) == {("127.0.0.1", 45000), ("::1", 45000)}
 
 
@@ -597,7 +593,6 @@ def test_exited_children_are_reaped_rather_than_retained(monkeypatch, tmp_path):
     rl_env._OPENENV_CHILDREN[("127.0.0.1", 48002)] = _owned(live)
     _fake_launcher(monkeypatch, ports = [49000])
     rl_env.launch_openenv(working_directory = str(tmp_path), openenv_class = _DummyClient)
-    # The two exited children are gone, the live one and the new one remain.
     assert ("127.0.0.1", 48000) not in rl_env._OPENENV_CHILDREN
     assert ("::1", 48001) not in rl_env._OPENENV_CHILDREN
     assert _entry_child(("127.0.0.1", 48002)) is live
@@ -677,7 +672,6 @@ def test_reaping_survives_a_concurrent_launch():
     registrar.start(); reaper.start()
     reaper.join(); registrar.join()
     assert errors == [], f"reaping raised {errors!r}"
-    # The sweep still did its job: every dead child is gone, every live one stays.
     assert all(child.poll() is None for child, _ in rl_env._OPENENV_CHILDREN.values())
 
 
@@ -739,7 +733,6 @@ def test_a_second_thread_cannot_spawn_onto_a_claimed_endpoint(monkeypatch, tmp_p
     )
     assert chosen != port, "the second launch spawned onto a claimed endpoint"
     assert ("127.0.0.1", chosen) in rl_env._OPENENV_CHILDREN
-    # A's claim is untouched, and no child was ever spawned on it.
     assert ("127.0.0.1", port) in rl_env._OPENENV_RESERVED
 
 
@@ -750,7 +743,6 @@ def test_abandoning_a_child_does_not_delete_another_launchs_record():
     rl_env._OPENENV_CHILDREN[endpoint] = _owned(other_live)
     rl_env._release_openenv_endpoint(*endpoint, child = _DeadChild())
     assert _entry_child(endpoint) is other_live
-    # Our own record, though, is removed.
     mine = _DeadChild()
     rl_env._OPENENV_CHILDREN[endpoint] = _owned(mine)
     rl_env._release_openenv_endpoint(*endpoint, child = mine)
@@ -897,7 +889,6 @@ def test_child_output_retention_is_bounded():
     deadline = time.time() + 5
     while len(watcher.tail) == 0 and time.time() < deadline:
         time.sleep(0.01)
-    # Let the reader consume the whole stream.
     while time.time() < deadline:
         if watcher.tail and watcher.tail[-1] == chatty[-1]: break
         time.sleep(0.01)
@@ -950,7 +941,6 @@ def test_a_forked_worker_does_not_call_the_parents_server_dead():
         assert queue.get(timeout = 10) is True, (
             "the forked worker called the parent's live server dead"
         )
-        # And it must not have evicted the entry it does not own.
         assert _entry_child(endpoint) is holder
     finally:
         holder.terminate()
@@ -1029,5 +1019,4 @@ def test_an_unreaped_process_is_not_alive():
         assert not rl_env._openenv_pid_is_alive(zombie.pid)
     finally:
         zombie.wait(timeout = 10)
-    # Reaped: gone outright, and still not alive.
     assert not rl_env._openenv_pid_is_alive(zombie.pid)

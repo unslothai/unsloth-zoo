@@ -68,7 +68,6 @@ def test_supervised_counts_follow_the_response_mask(tmp_path):
     labels[:, :prompt] = -100
     final = run_frozen_target(target, input_ids)["final"]
     _, stats = mtp_step_losses(head, parts, final, input_ids, torch.ones_like(input_ids), labels, _args(tmp_path))
-    # Step k predicts x[p+k+1] for chains p >= 1: response tokens are indices prompt..S-1.
     for k, (_, n_tokens, _) in enumerate(stats):
         expected = sum(1 for p in range(1, S) if p + k + 1 < S and p + k + 1 >= prompt)
         assert n_tokens == expected, (k, n_tokens, expected)

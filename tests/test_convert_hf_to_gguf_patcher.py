@@ -258,7 +258,6 @@ def test_branding_patch_preserves_lines_around_target(package_layout):
     patched = base_py.read_bytes()
 
     assert b"self.metadata = gguf.Metadata.load(" in patched
-    # Code after the target survives: the patch only inserts lines.
     assert b"if self.remote_hf_model_id:" in patched
     assert b"self.metadata.name = self.remote_hf_model_id" in patched
     assert len(patched) > len(original)
@@ -412,7 +411,6 @@ def test_package_layout_does_not_require_module_import(tmp_path, monkeypatch):
     assert "LlamaForCausalLM" in text_archs
     assert text_archs == frozenset(text_archs)
     assert b"# UNSLOTH_BRANDING_APPLIED" in (conv / "base.py").read_bytes()
-    # Cleanup for follow-on tests.
     llama_cpp._download_convert_hf_to_gguf_cached.cache_clear()
 
 
@@ -437,10 +435,9 @@ def test_patcher_anchors_on_custom_dir_when_override_set(tmp_path):
     assert resolved == str(root)
     sib = llama_cpp._conversion_sibling_info(resolved)
     assert sib is not None
-    # This row is about the DIRECTORY: the tuple holds every conversion/ module by membership, so
-    # any change re-runs the scan; element 0 is the header, the rest one entry per module, pinned
-    # because widening the header in place silently handed this slice a bare flag, not a (path,
-    # digest) pair.
+    # Tuple holds every conversion/ module by membership, so any change re-runs the scan; element 0
+    # is the header, the rest one entry per module; pinned because widening the header in place
+    # silently handed this slice a bare flag, not a (path, digest) pair.
     assert isinstance(sib[0], tuple), sib[0]
     # Each sibling entry is a (path, size, digest) tuple; the slice is pinned rather than open-ended, so widening it is a deliberate edit.
     assert all(isinstance(entry, tuple) and len(entry) == 3 for entry in sib[1:]), sib
@@ -579,7 +576,6 @@ def test_num_experts_patch_preserves_the_line_ending(indent, newline):
     assert applied
     assert b"num_local_experts" in patched
     ast.parse(patched)
-    # No LF that is not part of the file's own ending.
     assert patched.count(b"\n") == patched.count(newline), patched
     assert patched.replace(newline, b"\n").count(b"\n") == source.count(newline) + 1
 
@@ -635,7 +631,6 @@ def test_num_experts_patch_is_not_fooled_by_a_similar_line():
     [
         (b"x = 1\n", True),
         (b"def f(:\n", False),
-        # CRLF source is valid Python.
         (b"def f():\r\n    return 1\r\n", True),
         # A utf-8 BOM must be accepted; parsing a decoded str would reject it.
         (b"\xef\xbb\xbfx = 1\n", True),
@@ -755,7 +750,6 @@ def test_choose_content_reports_no_drops_when_no_patch_applied():
     assert content == same
 
 
-# --- end to end through the patcher, monolith layout -----------------------
 
 _MONOLITH_HEAD = b"""\
 #!/usr/bin/env python3
@@ -892,7 +886,6 @@ def test_end_to_end_crlf_and_bom_monolith(tmp_path, monkeypatch, prefix):
     assert b"\n" not in written.replace(b"\r\n", b"")
 
 
-# --- network: the real monolith converter from a pinned upstream tag --------
 
 @pytest.fixture
 def real_monolith_converter(tmp_path):
@@ -942,7 +935,6 @@ def test_real_monolith_converter_patch_survives_a_crlf_checkout(real_monolith_co
     assert b"\n" not in patched.replace(b"\r\n", b"")
 
 
-# --- line endings of the inserted lines -------------------------------------
 
 @pytest.mark.parametrize(
     "content, expected",
@@ -1033,7 +1025,6 @@ def test_a_new_gguf_reference_is_guarded_on_a_converter_already_patched_once(
     assert b"except AttributeError: gguf." in once, "fixture did not reach the guard patch"
     assert b"gguf.LATER_ENUM" not in once
 
-    # The update: the same patched converter, now referencing a new enum from a body line.
     updated = once.replace(
         b"        return n_experts\n",
         b"        _later = gguf.LATER_ENUM\n        return n_experts\n",
@@ -1046,7 +1037,6 @@ def test_a_new_gguf_reference_is_guarded_on_a_converter_already_patched_once(
     assert b"except AttributeError: gguf.LATER_ENUM = None" in twice, (
         "the new reference was left unguarded because the file already held a guard"
     )
-    # And only that one is added: names already covered are not guarded twice.
     assert twice.count(b"except AttributeError: gguf.MODEL_ARCH.LLAMA = None") == 1
     assert twice.count(b"except AttributeError: gguf.LATER_ENUM = None") == 1
 
@@ -1078,7 +1068,6 @@ def test_an_unterminated_final_target_keeps_the_files_line_ending():
     patched, applied = llama_cpp._patch_num_experts(crlf)
     assert applied is True
     assert b"num_local_experts" in patched
-    # Every ending in the result is CRLF: no bare LF anywhere.
     assert patched.replace(b"\r\n", b"") .count(b"\n") == 0, patched
 
     # And an LF file is untouched by the change: its dominant ending is LF.

@@ -88,7 +88,6 @@ def test_first_full_then_checked_then_fast(fake_cuda):
         out = torch.empty(8)
         _call(k, x, out)
         assert torch.equal(out, x * 2 + 3), step
-    # Call 1 full (cached), call 2 full + checked fast launch, calls 3-4 fast only.
     assert len(k.full_calls) == 2 and len(k.fast_calls) == 3
     assert L._KERNEL_OK[id(k)] is True and L.FAST_LAUNCH_STATS["fast"] == 2
     assert k.fast_calls[-1][5:] == (16,)

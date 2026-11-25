@@ -171,7 +171,6 @@ def test_quantize_for_save_emits_a_loadable_top_level_grid():
     assert quantization["group_size"] == 64, quantization
     assert quantization["bits"] == 4, quantization
     assert quantization["mode"] == "affine", quantization
-    # Per-layer entries are what appear *instead of* the grid.
     assert not [k for k in quantization if k not in ("group_size", "bits", "mode")], (
         f"per-layer entries leaked into the saved grid: {quantization}"
     )

@@ -14,9 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""vLLM's PyTorch top-k/top-p masks copied verbatim so tests run without vLLM (from
-vllm/v1/sample/ops/topk_topp_sampler.py, v0.32.0 and v0.11.2, Apache-2.0); do not edit the bodies, the trainer's kept
-set is checked against them."""
+"""vLLM's PyTorch top-k/top-p masks copied verbatim from vllm/v1/sample/ops/topk_topp_sampler.py
+(v0.32.0, v0.11.2; Apache-2.0); do not edit, the trainer's kept set is checked against them."""
 
 import torch
 

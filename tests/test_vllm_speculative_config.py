@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""speculative_config / UNSLOTH_VLLM_SPECULATIVE_CONFIG takes any vLLM method, resolved before the
-memory estimate (draft weights reduce KV budget); wiring AST-checked as load_vllm needs GPU."""
+"""UNSLOTH_VLLM_SPECULATIVE_CONFIG resolved before memory estimate; AST-checked, no GPU."""
 
 import ast
 import json
@@ -98,9 +97,7 @@ def test_draft_sizing_edge_paths(ns, tmp_path):
         def model_info(self, repo, **k):
             called.append(repo); raise OSError("no")
     fn = ns(hf_api = Api)["_speculative_draft_gb"]
-    # A missing local path is never sent to the Hub as a repo id.
     assert fn({"method": "draft_model", "model": "./does/not/exist"}, "t") is None and called == []
-    # A dangling symlink does not discard the real weights.
     (tmp_path / "model.safetensors").write_bytes(b"\0" * (1 << 20))
     (tmp_path / "broken.safetensors").symlink_to(tmp_path / "gone.safetensors")
     assert fn({"method": "draft_model", "model": str(tmp_path)}, "t") == pytest.approx(1 / 1024)
@@ -286,7 +283,6 @@ class _FakeEngineArgs:
 
 @pytest.fixture
 def fake_parallel(ns):
-    # ns() installs the fake vllm modules; give its vllm.config a ParallelConfig.
     def make(**kw):
         out = ns(**kw)
         sys.modules["vllm.config"].ParallelConfig = lambda **k: types.SimpleNamespace(**k)
@@ -414,12 +410,10 @@ def test_load_vllm_wiring():
     assert -1 < resolve < replay < async_refusal < budget < sizing < counted < tiers < bnb < assign < depth < fit < banner < arg_filter
     assert "speculative=engine_args.get('speculative_config', None) is not None" in src
     assert "engine_args.get('speculative_config') if enable_lora else None" in src
-    # The banner never prints the raw config (14).
     assert "speculative_config = {user_speculative_config}" not in src
 
 
 def test_replay_arbitration_reads_the_release_table_and_drops_adaptive_verification():
-    # (5) / (17) on the real function source.
     src = ast.unparse(next(n for n in _tree().body if isinstance(n, ast.FunctionDef) and n.name == "_routing_replay_model_runner"))
     assert "_mrv2_unsupported_speculative_methods()" in src and "_MRV2_UNSUPPORTED_SPECULATIVE_METHODS" not in src
     assert "'enable_adaptive_verification': False" in src

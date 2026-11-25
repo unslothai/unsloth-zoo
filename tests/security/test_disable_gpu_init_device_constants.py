@@ -55,9 +55,8 @@ _needs_torch = pytest.mark.skipif(
 
 
 def _public_upper_names(body) -> set:
-    """Collects module-level UPPER_CASE names bound in __init__.py, descending into if but not def or class; annotated
-    and unpacked targets count, since a missed form shrinks the intersection and hides a gap; bare X: int binds
-    nothing."""
+    """Module-level UPPER_CASE names bound in __init__.py (into if blocks, not def/class); annotated
+    and unpacked targets count, since missing one hides a gap; bare X: int binds nothing."""
     found = set()
     stack = list(body)
     while stack:
@@ -156,7 +155,6 @@ def test_importing_the_package_does_not_pull_in_torch():
     )
 
 
-# Without the flag the init raises when unsloth is absent, as in the security lane.
 _needs_unsloth = pytest.mark.skipif(
     importlib.util.find_spec("unsloth") is None,
     reason = "unsloth is not installed; importing unsloth_zoo without the skip flag raises",

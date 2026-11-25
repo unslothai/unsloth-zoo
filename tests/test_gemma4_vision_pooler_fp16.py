@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Gemma-4 vision pooler fp16 overflow fix: buggy transformers <= 5.9.x scales by sqrt(hidden_size) in input dtype and
-overflows to inf; pooler runs in fp32 (matches upstream >= 5.10.1); last_hidden_state cast back to encoder dtype"""
+"""fp16 sqrt-scale overflow: transformers <= 5.9.x; fp32 pooler + cast back matches >= 5.10.1."""
 
 import types
 
@@ -139,7 +138,6 @@ def test_patched_fp16_finite_and_matches_fp32_reference():
     TinyPooler, TinyVisionModel = make_buggy_classes()
     x = fp16_overflow_input()
 
-    # fp32 reference on the UNPATCHED classes.
     _, RefVisionModel = make_buggy_classes()
     ref = make_model(RefVisionModel, torch.float32)(x.float()).last_hidden_state
 

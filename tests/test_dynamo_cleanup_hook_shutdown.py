@@ -27,7 +27,6 @@ from unsloth_zoo.patching_utils import patch_dynamo_cleanup_hook_shutdown
 def _fire_after_module_wipe(hook):
     saved = {k: dynamo_utils.__dict__[k] for k in ("_cleanup_owners", "CleanupManager")}
     try:
-        # What Python finalization does to module globals.
         for k in saved:
             dynamo_utils.__dict__[k] = None
         hook()
@@ -45,7 +44,6 @@ def test_cleanup_hook_shutdown_safe():
     hook = dynamo_utils.CleanupHook.create(scope, "__unsloth_test_name", 1)
     _fire_after_module_wipe(hook)  # must not raise
 
-    # Normal (non shutdown) behaviour is unchanged: the owner removes the name.
     hook()
     assert "__unsloth_test_name" not in scope
     dynamo_utils.CleanupManager.count = count

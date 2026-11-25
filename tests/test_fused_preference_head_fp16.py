@@ -37,8 +37,7 @@ def _run(hidden, weight, upstream):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_sliced_head_grad_does_not_overflow_fp16(monkeypatch, device):
-    # Two vocab slices double the rows per GEMM; opposite signed upstream grads (chosen vs rejected) cancel in the sum,
-    # but an fp16 GEMM output overflowed first and gave NaNs.
+    # Doubled rows per GEMM: fp16 GEMM overflowed (NaN) before opposite-signed grads canceled.
     monkeypatch.setattr(module, "_target_chunk_bytes", lambda: 1024 * 1024)
     hidden = torch.full((1, 4, 8), 1.5, device = device, dtype = torch.float16)
     weight = torch.zeros((65536, 8), device = device, dtype = torch.float16)
@@ -68,8 +67,7 @@ def test_sliced_hidden_grad_does_not_overflow_fp16(monkeypatch, device):
     (64, False, True),
 ])
 def test_long_context_keeps_per_chunk_backward(monkeypatch, n_rows, hidden_grad, want_sliced):
-    # Sliced backward's float32 rows x hidden grad outgrows the per chunk head-sized copies past about twice the vocab,
-    # so long contexts keep the per chunk loop.
+    # Past ~2x vocab rows, float32 sliced grads outgrow per-chunk copies, so keep per-chunk.
     monkeypatch.setattr(module, "_FUSED_LINEAR", False)
     calls = []
     real = module._sliced_backward

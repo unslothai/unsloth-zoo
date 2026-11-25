@@ -45,8 +45,7 @@ def _linux_with_no_ambient_cuda():
 
 
 def test_a_runtime_libcuda_without_the_stub_is_not_linkable(tmp_path):
-    """A runtime libcuda.so.1 without the libcuda.so stub must count as not linkable; every other check passes on the
-    image that motivated this and the link still fails."""
+    """libcuda.so.1 without the libcuda.so stub must count as not linkable; the link fails."""
     (tmp_path / "libcuda.so.1").write_bytes(b"")
     with _linux_with_no_ambient_cuda(), \
          mock.patch.object(vllm_utils, "_FLASHINFER_LINK_DIRS", (str(tmp_path),)), \
@@ -113,8 +112,7 @@ def test_an_empty_library_path_entry_is_not_a_directory(tmp_path):
 
 
 # ------------------------------------------- false negatives are the bad kind
-# False when a link would have succeeded disables FlashInfer where it works, while True only restores the pre-check
-# behaviour; two tests below cover false-negative paths.
+# False negatives disable FlashInfer where it works, so they are the bad kind.
 
 
 def test_a_stub_in_a_default_linker_directory_counts(tmp_path):
@@ -250,8 +248,7 @@ def test_a_runtime_only_multiarch_dir_is_still_not_linkable(tmp_path):
 
 
 def test_windows_looks_for_cuda_lib_not_a_posix_stub(tmp_path):
-    """Windows links cuda.lib from the toolkit and searches LIB; probing for libcuda.so there would find nothing and
-    wrongly disable FlashInfer on a working platform."""
+    """Windows links cuda.lib via LIB; a libcuda.so probe there wrongly disables FlashInfer."""
     libdir = tmp_path / "lib" / "x64"
     libdir.mkdir(parents = True)
     (libdir / "cuda.lib").write_bytes(b"")

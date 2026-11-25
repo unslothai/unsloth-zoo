@@ -623,7 +623,6 @@ def test_strip_fp8_suffix():
     assert _strip_fp8_suffix("unsloth/Llama-3.1-8B-Instruct-FP8-Block") == "unsloth/Llama-3.1-8B-Instruct"
     assert _strip_fp8_suffix("org/Model-FP8-Static") == "org/Model"
     assert _strip_fp8_suffix("org/model-fp8") == "org/model"
-    # No marker -> None (do not touch 16bit names).
     assert _strip_fp8_suffix("unsloth/GLM-5.2") is None
     assert _strip_fp8_suffix("unsloth/Llama-3.1-8B-Instruct") is None
 
@@ -642,7 +641,6 @@ def test_resolve_fp8_16bit_sibling_local(tmp_path):
     assert got is not None and str(got).endswith("GLM-5.2") and "FP8" not in str(got)
     # No sibling on disk -> None (fall back to FP8 dequant).
     assert _resolve_fp8_16bit_sibling(str(tmp_path / "Nonexistent-FP8")) is None
-    # Plain 16bit name (no FP8 marker) -> None (nothing to resolve).
     assert _resolve_fp8_16bit_sibling(str(tmp_path / "GLM-5.2")) is None
 
 

@@ -15,8 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""CPU logits must never be written by fp16 torch.mm(out=) into a strided buffer slice: avx512_fp16 (torch 2.10) reads
-stale data; ISA-dependent, so tests pin the call shape."""
+"""Never fp16 torch.mm(out=) into strided CPU logits: avx512_fp16 (torch 2.10) reads stale."""
 
 import pytest
 import torch

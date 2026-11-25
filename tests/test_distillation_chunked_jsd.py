@@ -6,9 +6,8 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""CPU numerics for distillation_chunked_jsd: chunked matches an inline dense reference in value and gradient
-(objectives differ across implementations); also checks beta endpoints, lm_head bias, logit_scale,
-final_logit_softcapping, frozen heads, no teacher gradient, one reduction."""
+"""CPU: distillation_chunked_jsd matches an inline dense reference in value and gradient (objectives
+differ across implementations); also lm_head bias, logit_scale, final_logit_softcapping."""
 
 from __future__ import annotations
 
@@ -201,7 +200,6 @@ def test_bias_and_softcapping_are_honoured(beta):
     )
     assert abs(plain.item() - scaled.item()) > 1e-6, "logit_scale was ignored"
 
-    # Whatever the post-processing, the chunk boundaries must not change the answer.
     for chunk_size in (2, 5):
         again, _, _ = rr.distillation_chunked_jsd(
             sh, th, swt, twt, mask, beta = beta, chunk_size = chunk_size,
@@ -435,7 +433,6 @@ def test_low_precision_inputs_are_scored_in_float32(dtype, beta):
 
     got, _, _ = rr.distillation_chunked_jsd(sh, th, swt, twt, mask, beta = beta, chunk_size = 16)
 
-    # Same inputs, every operation in float64.
     reference, _, _ = _dense_reference(
         sh.double(), th.double(), swt.double(), twt.double(), mask, beta = beta,
     )

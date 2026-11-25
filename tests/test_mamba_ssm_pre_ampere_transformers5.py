@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests patch_mamba_ssm_pre_ampere_fallback on transformers 5.15+, which binds mamba_ssm at
-modeling import (unsloth-zoo issue 2090); one subprocess per case with raising stub kernels."""
+"""Patch binds mamba_ssm at modeling import on transformers 5.15+ (unsloth-zoo issue 2090)."""
 
 import json
 import os

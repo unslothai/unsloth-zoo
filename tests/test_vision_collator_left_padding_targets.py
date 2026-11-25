@@ -76,7 +76,6 @@ def make_collator(padding_side):
     return collator
 
 
-# Unequal lengths, so the batch pads the second row.
 EXAMPLES = [
     {"prompt": "<bos> a b", "completion": "x y z w"},
     {"prompt": "<bos> a", "completion": "x"},

@@ -213,11 +213,9 @@ def test_forced_float32_overrides_any_explicit_dtype(tiny, dtype, monkeypatch):
     loaded, printed = _load_dtype(monkeypatch, tiny, full_finetuning = True, dtype = dtype,
                                   float32_mixed_precision = True)
     assert loaded == torch.float32
-    # No float16 fallback warning for a dtype float32_mixed_precision = True replaces.
     assert "using torch.bfloat16 instead" not in printed
 
 
-# The fit check sizes the model that will train.
 
 @pytest.mark.usefixtures("bf16_cpu")
 def test_fit_check_counts_a_resized_vocabulary(tiny, monkeypatch):

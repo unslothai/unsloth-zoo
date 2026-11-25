@@ -13,16 +13,14 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Pins the RMSNorm recompile fix: a bound method's Dynamo cache multiplies over width, rank, with_scale, dtype, grad
-mode and requires_grad (gemma-4-E2B hit recompile_limit on a T4); a pure tensor kernel stays in budget with
-bit-identical outputs."""
+"""Pins the RMSNorm recompile fix: a bound method's Dynamo cache multiplies over width, rank,
+with_scale, dtype and grad mode; a pure tensor kernel stays in budget with bit-identical outputs."""
 
 import pytest
 import torch
 
 
-# Dynamo renamed its cache-limit keys and exception in torch 2.7; config.patch raises on undefined keys, so select by
-# what exists (same as tests/test_recompile_limit_fallback.py).
+# Torch 2.7 renamed the cache keys; config.patch raises on undefined ones, so pick what exists.
 _HAS_NEW_NAMES = hasattr(torch._dynamo.config, "recompile_limit")
 _LIMIT_KEY = "recompile_limit" if _HAS_NEW_NAMES else "cache_size_limit"
 _FAIL_KEY = ("fail_on_recompile_limit_hit" if _HAS_NEW_NAMES
@@ -239,15 +237,13 @@ def test_the_kernels_fall_back_to_eager_instead_of_aborting():
             f"under fullgraph raises instead of falling back to eager"
         )
 
-    # Markers hold in any config; with UNSLOTH_COMPILE_DISABLE exhaustion cannot run in-process (see
-    # tests/test_generated_fullgraph_fallback.py::_run_in_fresh_interpreter).
+    # Markers hold always; exhaustion needs a fresh interpreter under UNSLOTH_COMPILE_DISABLE.
     from unsloth_zoo.temporary_patches import common
     if common.UNSLOTH_COMPILE_DISABLE:
         pytest.skip("compilation is off, so there is no cache left to exhaust")
 
-    # fail_on_recompile_limit_hit stays unset (it asks for a hard stop; real runs leave it off); limit plus fullgraph =
-    # True is the case that matters; widths cost nothing under dynamic = True, dtype and grad mode do; the latch
-    # survives reset(), so restore it or later tests get eager kernels.
+    # fail_on_recompile_limit_hit unset (real runs do); limit with fullgraph=True matters; only
+    # dtype and grad mode multiply cache under dynamic=True; reset() keeps latch, so restore it.
     saved = {k: dict(k._unsloth_fallback_state) for k in kernels}
     # Exhaustion no longer latches on its own: the wrapper borrows budget (a limit of 1 becomes 65), so patching
     # _bump_recompile_limits to return False denies the loan and forces eager or abort.

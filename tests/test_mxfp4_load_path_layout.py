@@ -90,9 +90,8 @@ def test_mxfp4_load_path_layout_matches_stock_transformers():
     env = dict(os.environ)
     # The subprocess misses conftest's GPU-free harness, and importing unsloth_zoo calls get_device_type() at import time.
     env["UNSLOTH_ALLOW_CPU"] = "1"
-    # UNSLOTH_ZOO_DISABLE_GPU_INIT skips the unsloth requirement (a transient git failure in the core-upstream `|| true`
-    # unsloth install would turn 5.x lanes red); UNSLOTH_IS_PRESENT guards a later check and does not cover it;
-    # UNSLOTH_ALLOW_CPU stops get_device_type() raising on driverless runners.
+    # UNSLOTH_ZOO_DISABLE_GPU_INIT skips unsloth requirement (transient git failure turns 5.x red);
+    # UNSLOTH_IS_PRESENT does not cover it; UNSLOTH_ALLOW_CPU stops get_device_type() raising.
     env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
     r = subprocess.run(
         [sys.executable, "-c", _PROBE], capture_output=True, text=True, env=env,

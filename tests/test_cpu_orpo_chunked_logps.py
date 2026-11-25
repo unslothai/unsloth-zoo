@@ -355,9 +355,8 @@ def _ddp_step(tmp_path, chunked, model_dir):
 
 
 def test_ddp_trainable_head_grads_synced(tmp_path):
-    """CPU gloo DDP, 2 ranks with different rows, untied trainable lm_head, find_unused_parameters = True (the Trainer
-    default without gradient checkpointing): the head runs inside DDP's forward, so the step runs and the head
-    gradient is all-reduced across ranks, equal to TRL's own forward."""
+    """CPU gloo DDP (2 ranks), untied trainable lm_head, find_unused_parameters=True (Trainer
+    default w/o grad checkpointing): head runs in DDP's forward; grad all-reduced, equals TRL's."""
     if not torch.distributed.is_available() or not torch.distributed.is_gloo_available():
         pytest.skip("no gloo")
     try:
@@ -365,8 +364,7 @@ def test_ddp_trainable_head_grads_synced(tmp_path):
         model_dir = snapshot_download(TINY)
     except Exception as error:
         pytest.skip(f"{TINY} unavailable: {error}")
-    # The ranks load this snapshot, not the repo id: conftest points HF_HOME at an empty per-test dir that the
-    # torchrun children inherit, and an HF_HUB_OFFLINE=1 set earlier in this worker would leave them nothing to load.
+    # Ranks load the snapshot: HF_HOME is empty per test; HF_HUB_OFFLINE=1 would break them.
     chunked, stock = _ddp_step(tmp_path, "1", model_dir), _ddp_step(tmp_path, "0", model_dir)
     assert (chunked["chunked"], stock["chunked"]) == (True, False)
     for out in (chunked, stock):

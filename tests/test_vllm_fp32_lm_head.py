@@ -167,8 +167,7 @@ def test_load_vllm_merges_override_before_arg_filter():
 
 
 def _fake_vllm_layers(monkeypatch, accepts_linear_method):
-    # Mirrors the head_dtype guard of LogitsProcessor._apply_head: vLLM 0.26.0 - 0.28.x accept only
-    # UnquantizedEmbeddingMethod; 0.29.0 also accepts UnquantizedLinearMethod.
+    # vLLM 0.26.0-0.28.x: UnquantizedEmbeddingMethod only; 0.29.0 adds UnquantizedLinearMethod.
     class UnquantizedLinearMethod:
         pass
 
@@ -247,10 +246,8 @@ def test_excluded_quant_head_fp32_on_vllm_026_028(monkeypatch):
     assert out.dtype == torch.float32
     torch.testing.assert_close(out, hidden.float() @ head.weight.float().t())
     assert type(head.quant_method) is Linear
-    # Default head dtype and plain embedding heads go through the original method untouched.
     processor.head_dtype = None
     assert processor._apply_head(head, hidden, None).dtype == torch.bfloat16
-    # Patching twice wraps once.
     patched = LogitsProcessor._apply_head
     assert ns["_patch_vllm_fp32_lm_head_excluded_quant"]() is False
     assert LogitsProcessor._apply_head is patched
@@ -278,8 +275,7 @@ def test_excluded_quant_patch_not_reached_when_off(monkeypatch):
 
 
 def test_return_args_callers_get_no_fp32_head_override():
-    # SyntheticDataKit turns load_vllm(return_args = True) into vllm serve flags with str(); vLLM json-parses
-    # --hf-overrides, so a dict from this flag would make the server exit.
+    # return_args is str()ed into flags; vLLM json-parses --hf-overrides, so a dict crashes it.
     load_vllm = next(
         n for n in ast.walk(_vllm_utils_tree()) if isinstance(n, ast.FunctionDef) and n.name == "load_vllm"
     )

@@ -15,9 +15,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""Every transformers mHC mixer with the V4 Sinkhorn chain must get the rewrite and eager fallback; the registry scans
-installed modeling files as text, so a copy (GLM-5.3-Flash did, verbatim) fails here instead of silently compiling
-stock."""
+"""V4 Sinkhorn mHC mixers in transformers need the rewrite and eager fallback; a verbatim copy
+(GLM-5.3-Flash) is caught by the registry's text scan instead of silently compiling stock."""
 
 import json
 import os

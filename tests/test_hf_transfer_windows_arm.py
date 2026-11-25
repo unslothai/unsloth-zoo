@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Tests the import-time HF_HUB_ENABLE_HF_TRANSFER default that unsloth_zoo/__init__.py sets; on
-Windows ARM it fails every download; AST-extracted block runs with fake platform and ctypes."""
+"""Tests the import default of HF_HUB_ENABLE_HF_TRANSFER; Windows ARM fails every download."""
 
 from __future__ import annotations
 

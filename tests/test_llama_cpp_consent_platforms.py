@@ -353,7 +353,6 @@ def test_ebadf_from_a_closed_stdout_is_not_consent(recorder, monkeypatch):
         builtins, "input",
         lambda prompt = "": (_ for _ in ()).throw(OSError(errno.EBADF, "Bad file descriptor")),
     )
-    # A live stdin: not closed, not a tty, and with a real descriptor behind it.
     monkeypatch.setattr(
         llama_cpp.sys, "stdin",
         types.SimpleNamespace(isatty = lambda: False, closed = False, fileno = lambda: 0),

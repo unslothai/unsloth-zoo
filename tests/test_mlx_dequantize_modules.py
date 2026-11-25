@@ -56,7 +56,6 @@ def test_dequantize_selected_mlx_modules_swap():
     import mlx.nn as nn
     from unsloth_zoo.mlx.loader import _dequantize_selected_mlx_modules
 
-    # 4-bit weight: 8 input dims (one group), 2 output dims, group_size=8.
     bits, group_size = 4, 8
     in_features, out_features = 8, 2
 

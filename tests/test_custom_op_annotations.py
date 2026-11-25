@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Static check that custom_op modules avoid postponed annotations; torch 2.4 rejects string Tensor params and torch 2.6
-evals string annotations where Tuple is undefined (issue 1934); this check catches it on any torch."""
+"""Checks custom_op modules avoid postponed annotations; torch 2.4/2.6 break them (issue 1934)."""
 
 import ast
 import pathlib

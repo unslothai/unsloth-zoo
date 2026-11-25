@@ -193,8 +193,7 @@ def test_a_first_compile_refusal_falls_back_even_under_a_checkpoint(monkeypatch)
 
 
 def test_a_later_refusal_after_a_successful_compile_still_raises(monkeypatch):
-    """A refusal after a successful compiled call inside the checkpoint must still raise, since recomputing that pack
-    eagerly aborts backward or gives wrong gradients."""
+    """After a compiled pack in a checkpoint, refusals must raise (eager recompute is wrong)."""
     monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
                         lambda **_: True)
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
@@ -315,8 +314,7 @@ def test_the_compiled_pack_marker_is_restored_after_a_refusal(monkeypatch):
 
 
 def test_a_non_inductor_backend_failure_still_raises():
-    """BackendCompilerFailed also wraps custom backends; swallowing a custom backend's failure would hide a config or
-    programming error behind a silent permanent switch to eager."""
+    """Custom backend failures must raise: swallowing them hides config bugs behind eager."""
     try:
         from torch._dynamo.exc import BackendCompilerFailed
     except Exception:
@@ -431,8 +429,7 @@ def test_a_torch_2_6_shaped_refusal_falls_back_to_eager(monkeypatch):
 
 
 def test_a_refusal_from_the_budget_retry_falls_back(monkeypatch):
-    """A refusal inside _retry_with_more_budget must fall back: its except BaseException re-raises past the sibling
-    backend_errors handler, so the refusal escaped the fallback."""
+    """A refusal in _retry_with_more_budget must fall back, not re-raise past backend_errors."""
     monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
                         lambda **_: False)
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
@@ -456,8 +453,7 @@ def test_a_refusal_from_the_budget_retry_falls_back(monkeypatch):
 
 
 def test_a_refusal_from_the_budget_retry_is_not_recorded_as_compiled(monkeypatch):
-    """An eager result from the budget retry must not be recorded as a compiled pack, or a later step ends for no reason
-    and a checkpoint recomputes in the wrong mode."""
+    """An eager budget-retry result must not count as a compiled pack (wrong recompute mode)."""
     monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
                         lambda **_: True)
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", True)
@@ -508,8 +504,7 @@ def test_a_legacy_budget_retry_is_recorded_as_compiled(monkeypatch):
 
 
 def test_a_compiled_call_outside_a_checkpoint_is_not_a_compiled_pack(monkeypatch):
-    """A compiled call outside a non-reentrant checkpoint packs nothing recomputed, so it must not count as a compiled
-    pack, or a training refusal would end the step."""
+    """Outside non-reentrant checkpoints nothing recomputes, so a compiled call is not a pack."""
     monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
                         lambda **_: False)
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
@@ -645,8 +640,7 @@ def test_a_successful_call_does_not_reprobe_once_the_marker_has_latched(
 
 def test_the_success_probe_latches_the_marker_when_it_finds_a_checkpoint(
         monkeypatch):
-    """A definite yes from the post-call probe must latch the process-wide _PACKED_COMPILED_IN_CHECKPOINT, not just the
-    label; otherwise a later refusal recomputes compiled packs eagerly."""
+    """A definite yes must latch _PACKED_COMPILED_IN_CHECKPOINT, or refusals recompute eagerly."""
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
     inside = {"yes": True}
     monkeypatch.setattr(patch_utils, "_in_non_reentrant_checkpoint",
@@ -692,11 +686,9 @@ def test_an_unknown_answer_does_not_latch_the_process_wide_marker(monkeypatch):
 
 
 def test_a_spent_walk_budget_does_not_invent_checkpoint_history(monkeypatch):
-    """The post-call probe stays unbudgeted and answers definitely: recording None once the walk budget is spent would
-    make a later checkpoint refusal re-raise as if a pack existed."""
+    """Probe is unbudgeted and definite: None after the walk budget makes a refusal re-raise."""
     monkeypatch.setattr(patch_utils, "_saved_tensor_hook_accessor",
                         lambda: None)
-    # No checkpoint anywhere: the walk always answers a definite False.
     monkeypatch.setattr(patch_utils, "_walk_for_checkpoint_frame",
                         lambda: False)
     monkeypatch.setattr(patch_utils, "_PACKED_COMPILED_IN_CHECKPOINT", False)
