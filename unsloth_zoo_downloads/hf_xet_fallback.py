@@ -3264,158 +3264,158 @@ def hf_hub_download_with_xet_fallback(
     )
 
 
-# Bound on the in-process metadata check below: hub's repo_info / list_repo_tree calls carry no timeout of their own,
-# and a stalled answer must reach the killable child instead of holding the load.
-DEFAULT_DRY_RUN_TIMEOUT = 10.0
+# Bound on the in-process metadata check below: hub's tree listing carries no timeout of its own, and a stalled answer
+# must reach the killable child instead of holding the load.
+DEFAULT_METADATA_TIMEOUT = 10.0
+# Above this many siblings repo_info's list is not trusted (hub's own LARGE_REPO_THRESHOLD); list the tree instead.
+_SIBLINGS_TRUST_LIMIT = 1000
 
 
-def _silent_hub_tqdm_class() -> Optional[type]:
-    """hub tqdm subclass that never draws, so the in-process dry run prints nothing (the child sets
-    HF_HUB_DISABLE_PROGRESS_BARS for the same reason); None when hub's tqdm is unavailable."""
+def _hub_tree_cache_module() -> Any:
+    """hub's tree listing cache module (huggingface_hub >= 1.25), or None when this hub keeps no such cache."""
     try:
-        from huggingface_hub.utils import tqdm as hub_tqdm
-    except Exception:
+        from huggingface_hub import _tree_cache
+    except ImportError:
         return None
-
-    class _SilentTqdm(hub_tqdm):  # type: ignore[misc, valid-type]
-        def __init__(self, *args, **kwargs):
-            kwargs["disable"] = True
-            super().__init__(*args, **kwargs)
-
-    return _SilentTqdm
+    return _tree_cache
 
 
-def _warm_snapshot_from_dry_run(
+def _repo_commit_and_files(
+    *, repo_id: str, repo_type: str, revision: Optional[str], token: Optional[str], tree_cache_files: Any,
+) -> "tuple[str, list]":
+    """(commit, repo file paths) from ONE repo_info call (plus a tree listing for an empty or very large sibling list),
+    on the caller's thread, with no executor. tree_cache_files(commit) supplies hub's cached tree listing when this hub
+    keeps one, which is the list its snapshot_download filters."""
+    from huggingface_hub import HfApi
+    from huggingface_hub.file_download import REGEX_COMMIT_HASH
+    from huggingface_hub.hf_api import RepoFile
+
+    api = HfApi(token = token)
+    rev = revision if revision is not None else "main"  # hub's DEFAULT_REVISION
+    info = None
+    if REGEX_COMMIT_HASH.fullmatch(rev):
+        commit = rev
+    else:
+        info = api.repo_info(repo_id, revision = rev, repo_type = repo_type, timeout = DEFAULT_METADATA_TIMEOUT)
+        commit = getattr(info, "sha", None)
+        if not isinstance(commit, str) or not REGEX_COMMIT_HASH.fullmatch(commit):
+            raise ValueError("repo_info returned no commit sha")
+    cached = tree_cache_files(commit)
+    if cached is not None:
+        return commit, list(cached)
+    if info is None:
+        info = api.repo_info(repo_id, revision = commit, repo_type = repo_type, timeout = DEFAULT_METADATA_TIMEOUT)
+    siblings = getattr(info, "siblings", None)
+    if siblings and len(siblings) <= _SIBLINGS_TRUST_LIMIT:
+        return commit, [s.rfilename for s in siblings]
+    # A superset of what any hub's snapshot_download lists, so a skip it allows is one the child would also make.
+    files = [
+        entry.path
+        for entry in api.list_repo_tree(repo_id, recursive = True, revision = commit, repo_type = repo_type)
+        if isinstance(entry, RepoFile)
+    ]
+    return commit, files
+
+
+def _warm_snapshot_without_child(
     *,
     repo_id: str,
     repo_type: str,
     revision: Optional[str],
     token: Optional[str],
-    cache_dir: Optional[str],
     allow_patterns: Any,
     ignore_patterns: Any,
     cancel_event: Optional[threading.Event],
     cached_dir: str,
 ) -> Optional[str]:
-    """cached_dir (the local_files_only answer) when hub's dry run proves the child would fetch nothing, else None.
+    """cached_dir (the local_files_only answer, i.e. the folder the child returns) when the Hub's file list proves the
+    child would fetch and write nothing, else None.
 
-    Runs snapshot_download(dry_run=True) (huggingface_hub >= 1.0) in-process with the child's arguments: metadata
-    only (repo_info / tree listing / HEAD), never a Xet or blob transfer, on a daemon thread bounded by
-    DEFAULT_DRY_RUN_TIMEOUT. Accepted only when every listed file is cached at one commit with its pointer present,
-    the branch ref already names that commit, the pointers sit in cached_dir (the folder snapshot_download returns
-    for that commit, so the child's path) and hub's tree listing cache (when this hub has one) is on disk, so the
-    child would write nothing either. Any doubt (offline, older hub, error, timeout, cancel, a file to fetch, no file
-    matched) returns None and the caller spawns the child as before."""
+    The metadata call runs on a daemon thread bounded by DEFAULT_METADATA_TIMEOUT with no executor, so an abandoned
+    call can neither hold the load nor delay interpreter exit; it transfers no Xet data and writes nothing. Accepted
+    only when the remote commit is the one cached_dir holds (so refs/<revision> already names it), every file hub's
+    own pattern filter selects has a pointer there that resolves (a dangling link to a missing blob defers), and
+    hub's tree listing cache, when this hub keeps one, is already on disk (else the child would write it). Any doubt
+    (offline, error, timeout, cancel, a missing file, nothing matched) returns None and the caller spawns the child."""
     try:
-        import inspect
-
         from huggingface_hub import constants as hub_constants
-        from huggingface_hub import snapshot_download
+        from huggingface_hub.utils import filter_repo_objects
 
         if getattr(hub_constants, "HF_HUB_OFFLINE", False):
-            return None  # the child resolves offline from cache; the dry run would only raise
-        if "dry_run" not in inspect.signature(snapshot_download).parameters:
-            return None  # huggingface_hub < 1.0
+            return None  # the child resolves offline from cache
+    except Exception:
+        return None
+    snapshots_dir, cached_commit = os.path.split(cached_dir)
+    if os.path.basename(snapshots_dir) != "snapshots":
+        return None
+    storage_folder = os.path.dirname(snapshots_dir)
+    try:
+        hub_tree_cache = _hub_tree_cache_module()
     except Exception:
         return None
 
-    kwargs: dict = {
-        "repo_id": repo_id,
-        "repo_type": repo_type,
-        "revision": revision,
-        "token": token,
-        "cache_dir": cache_dir,
-        "allow_patterns": allow_patterns,
-        "ignore_patterns": ignore_patterns,
-        "dry_run": True,
-    }
-    tqdm_class = _silent_hub_tqdm_class()
-    if tqdm_class is not None:
-        kwargs["tqdm_class"] = tqdm_class
+    def _tree_cache_files(commit: str):
+        if hub_tree_cache is None:
+            return None
+        # The child reads trees/<commit>.json and writes it when missing; only a cache already on disk keeps the dir
+        # identical, and its listing is exactly the one the child filters.
+        tree_path = hub_tree_cache._tree_cache_path(storage_folder, commit)
+        entries = hub_tree_cache.read_tree_cache(storage_folder, commit) if os.path.isfile(tree_path) else None
+        if entries is None:
+            # Stop before any further request: the child must run to write it.
+            raise LookupError(f"no cached tree listing for {commit}")
+        return list(entries.keys())
+
     box: dict = {}
 
     def _run() -> None:
         try:
-            box["result"] = snapshot_download(**kwargs)
+            box["result"] = _repo_commit_and_files(
+                repo_id = repo_id, repo_type = repo_type, revision = revision, token = token,
+                tree_cache_files = _tree_cache_files,
+            )
         except BaseException as e:  # noqa: BLE001 - any failure means "spawn the child"
             box["error"] = e
 
-    worker = threading.Thread(target = _run, name = "unsloth-hf-dry-run", daemon = True)
+    worker = threading.Thread(target = _run, name = "unsloth-hf-metadata", daemon = True)
     worker.start()
-    deadline = time.monotonic() + DEFAULT_DRY_RUN_TIMEOUT
+    deadline = time.monotonic() + DEFAULT_METADATA_TIMEOUT
     while worker.is_alive():
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            logger.debug("Dry run for %s did not answer in %.0fs; downloading.", repo_id, DEFAULT_DRY_RUN_TIMEOUT)
+            logger.debug("Metadata for %s did not answer in %.0fs; downloading.", repo_id, DEFAULT_METADATA_TIMEOUT)
             return None
         if cancel_event is not None and cancel_event.is_set():
             return None  # the caller raises Cancelled
         worker.join(min(remaining, _POLL_INTERVAL) if cancel_event is not None else remaining)
     if "error" in box:
-        logger.debug("Dry run for %s failed (%s); downloading.", repo_id, box["error"])
+        logger.debug("Metadata for %s failed (%s); downloading.", repo_id, box["error"])
         return None
-    infos = box.get("result")
-    if not isinstance(infos, list) or not infos:
-        return None  # nothing matched: the child decides what an empty selection returns
-    snapshot_folder = None
-    commit_hash = None
-    for info in infos:
-        filename = getattr(info, "filename", None)
-        local_path = getattr(info, "local_path", None)
-        commit = getattr(info, "commit_hash", None)
-        if (
-            getattr(info, "will_download", True) is not False
-            or getattr(info, "is_cached", False) is not True
-            or not isinstance(filename, str) or not filename
-            or not isinstance(local_path, str)
-            or not isinstance(commit, str) or not commit
-        ):
-            return None
-        if commit_hash is None:
-            commit_hash = commit
-        elif commit != commit_hash:
-            return None
-        relative = os.path.join(*filename.split("/"))
-        if not local_path.endswith(os.sep + relative):
-            return None
-        folder = local_path[: -len(relative) - 1]
-        if snapshot_folder is None:
-            snapshot_folder = folder
-        elif folder != snapshot_folder:
-            return None
-        # exists() follows the symlink: a dangling pointer means a missing blob the child would re-fetch.
-        if not os.path.exists(local_path):
-            return None
-    if snapshot_folder is None or commit_hash is None or snapshot_folder != cached_dir:
-        return None
-    snapshots_dir, commit_dir = os.path.split(snapshot_folder)
-    if commit_dir != commit_hash or os.path.basename(snapshots_dir) != "snapshots":
-        return None
-    storage_folder = os.path.dirname(snapshots_dir)
-    ref_name = revision if revision is not None else "main"  # hub's DEFAULT_REVISION
-    if ref_name != commit_hash:
-        # The child writes refs/<revision>; the dry run wrote it too, so a mismatch means a racing writer: defer.
+    commit, repo_files = box["result"]
+    if commit != cached_commit:
+        return None  # a newer remote commit is the child's to fetch
+    ref_name = revision if revision is not None else "main"
+    if ref_name != commit:
+        # The child rewrites refs/<revision>; it already names this commit unless a writer raced us.
         try:
             with open(os.path.join(storage_folder, "refs", ref_name)) as f:
-                if f.read() != commit_hash:
+                if f.read() != commit:
                     return None
         except OSError:
             return None
-    try:
-        from huggingface_hub import _tree_cache as hub_tree_cache
-    except ImportError:
-        hub_tree_cache = None  # this hub keeps no tree listing cache, so the child writes none
-    except Exception:
-        return None
-    if hub_tree_cache is not None:
-        # The child writes trees/<commit>.json when it is missing; let it, so the cache dir ends up identical.
-        try:
-            tree_path = hub_tree_cache._tree_cache_path(storage_folder, commit_hash)
-            if not os.path.isfile(tree_path) or hub_tree_cache.read_tree_cache(storage_folder, commit_hash) is None:
-                return None
-        except Exception:
+    selected = list(filter_repo_objects(
+        items = repo_files, allow_patterns = allow_patterns, ignore_patterns = ignore_patterns,
+    ))
+    if not selected:
+        return None  # nothing matched: the child decides what an empty selection returns
+    for name in selected:
+        parts = name.split("/") if isinstance(name, str) else []
+        if not parts or any(part in ("", ".", "..") for part in parts) or os.path.isabs(name):
+            return None  # hub refuses such a name; let the child raise its own error
+        # exists() follows the symlink: a dangling pointer means a missing blob the child would re-fetch.
+        if not os.path.exists(os.path.join(cached_dir, *parts)):
             return None
-    return snapshot_folder
+    return cached_dir
 
 
 def snapshot_download_with_xet_fallback(
@@ -3439,7 +3439,7 @@ def snapshot_download_with_xet_fallback(
 ) -> str:
     """Snapshot Xet-then-HTTP warm-up in a killable child before from_pretrained's in-process load; transient faults
     raise DownloadTransportError, not a bare RuntimeError a caller could mistake for a skippable pre-download
-    failure; variant forces the child unless hub's dry run proves nothing would be fetched."""
+    failure; variant forces the child unless the Hub's file list proves nothing would be fetched."""
     repo_type = repo_type or "model"  # HF treats None as the default model repo.
     # Expand ~ as huggingface_hub does, so the probe and the child resolve to the same location.
     if isinstance(cache_dir, (str, os.PathLike)):
@@ -3487,15 +3487,14 @@ def snapshot_download_with_xet_fallback(
         except Exception as e:
             cached_dir = None
             logger.debug("Snapshot not fully cached for %s (%s); downloading.", repo_id, e)
-        # Glob allow lists and caches the strict gate cannot prove land here even when nothing is missing; ask hub's
-        # metadata-only dry run first, so a warm cache returns without spawning a child that would fetch nothing.
+        # Glob allow lists and caches the strict gate cannot prove land here even when nothing is missing; ask the Hub
+        # for the file list first, so a warm cache returns without spawning a child that would fetch nothing.
         if isinstance(cached_dir, str):
-            warm_dir = _warm_snapshot_from_dry_run(
+            warm_dir = _warm_snapshot_without_child(
                 repo_id = repo_id,
                 repo_type = repo_type,
                 revision = revision,
                 token = token,
-                cache_dir = cache_dir,
                 allow_patterns = allow_patterns,
                 ignore_patterns = ignore_patterns,
                 cancel_event = cancel_event,
