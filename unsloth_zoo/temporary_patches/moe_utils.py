@@ -1850,6 +1850,22 @@ def _mxfp4_base_grouped_mm(inputs, offsets, counts, weight_provider, recompute, 
     return _base_grouped_mm(inputs, offsets, weight_provider, recompute)
 
 
+def _is_fp8_block_layout(layout) -> bool:
+    return layout is not None and getattr(layout[0], "packed_format", None) == "fp8_block"
+
+
+def _fp8_block_base_mm(inputs, offsets, counts, layout, lora, keep_slot, proj):
+    """Block-FP8 experts on the W8A16 grouped GEMM (moe_fp8_grouped): (output, LoRA left for the separated path)."""
+    from unsloth_zoo.temporary_patches.moe_fp8_grouped import fp8_block_base_and_lora
+    param, transpose_b = layout
+    if (
+        inputs.dtype == torch.float32 and inputs.device.type == "cuda"
+        and torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") == torch.bfloat16
+    ):
+        inputs = inputs.to(torch.bfloat16)
+    return fp8_block_base_and_lora(inputs, param, counts, offsets, transpose_b, lora, keep_slot = keep_slot, proj = proj)
+
+
 _GROUPED_GEMM_AVAILABLE = None
 _TORCH_GROUPED_MM_AVAILABLE = hasattr(torch, "_grouped_mm")
 
@@ -5704,7 +5720,11 @@ def forward_native_grouped_mm(
         def _gate_up_provider(experts=None, _src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self, _n=num_tokens_per_expert):
             return preprocess_weight(_get_base_weight(_src, _dt, _n, experts), "gate_up", _h, _mt, experts_module=_mod)
         _gate_up_layout = _mxfp4_expert_layout(_gate_up_src, "gate_up", hidden_dim, model_type, self)
-        if _gate_up_layout is not None:
+        if _is_fp8_block_layout(_gate_up_layout):
+            mm1_out, gate_up_lora = _fp8_block_base_mm(
+                permuted_input, offsets, num_tokens_per_expert, _gate_up_layout, gate_up_lora, keep_slot, "gate_up",
+            )
+        elif _gate_up_layout is not None:
             mm1_out = _mxfp4_base_grouped_mm(
                 permuted_input, offsets, num_tokens_per_expert, _gate_up_provider,
                 _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype), _gate_up_layout,
@@ -5896,7 +5916,11 @@ def forward_native_grouped_mm(
         def _down_provider(experts=None, _src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self, _n=num_tokens_per_expert):
             return preprocess_weight(_get_base_weight(_src, _dt, _n, experts), "down", _h, _mt, experts_module=_mod)
         _down_layout = _mxfp4_expert_layout(_down_src, "down", hidden_dim, model_type, self)
-        if _down_layout is not None:
+        if _is_fp8_block_layout(_down_layout):
+            mm2_out, down_lora = _fp8_block_base_mm(
+                inter, offsets, num_tokens_per_expert, _down_layout, down_lora, keep_slot, "down",
+            )
+        elif _down_layout is not None:
             mm2_out = _mxfp4_base_grouped_mm(
                 inter, offsets, num_tokens_per_expert, _down_provider,
                 _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype), _down_layout,
