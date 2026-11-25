@@ -59,14 +59,19 @@ def _min_p_mask(logits, min_p):
     return logits.masked_fill(probs < min_p * probs.amax(-1, keepdim = True), float("-inf"))
 
 
-def _fake_v1(monkeypatch):
+def _fake_v1(monkeypatch, static = True):
+    def _temperature(logits, temp, all_random):
+        return logits.div_(temp.unsqueeze(1))
+
     class Sampler:
         def __init__(self, mode):
             self.logprobs_mode = mode
 
-        @staticmethod
-        def apply_temperature(logits, temp, all_random):
-            return logits.div_(temp.unsqueeze(1))
+        if static:
+            apply_temperature = staticmethod(_temperature)
+        else:  # vLLM 0.11.0: an instance method
+            def apply_temperature(self, logits, temp, all_random):
+                return logits.div_(temp.unsqueeze(1))
 
         def sample(self, logits, sampling_metadata, logprobs_mode_override = None):
             logits = self.apply_temperature(logits, sampling_metadata.temperature, True)
@@ -123,9 +128,10 @@ def _logits():
     return torch.randn(4, 50) * 3
 
 
+@pytest.mark.parametrize("static", [True, False])
 @pytest.mark.parametrize("on", [True, False])
-def test_v1_returns_scaled_untruncated_logprobs(monkeypatch, on):
-    Sampler = _fake_v1(monkeypatch)
+def test_v1_returns_scaled_untruncated_logprobs(monkeypatch, on, static):
+    Sampler = _fake_v1(monkeypatch, static)
     ns = _load()
     monkeypatch.delenv("UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS", raising = False)
     assert ns["set_vllm_untruncated_logprobs"](on) is on

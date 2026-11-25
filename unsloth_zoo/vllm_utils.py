@@ -1586,12 +1586,14 @@ def patch_vllm_untruncated_logprobs():
     except Exception:
         V1Sampler = None
     if V1Sampler is not None and hasattr(V1Sampler, "apply_temperature") and hasattr(V1Sampler, "sample"):
-        original_temperature = V1Sampler.__dict__["apply_temperature"]
-        original_temperature = getattr(original_temperature, "__func__", original_temperature)
+        descriptor = V1Sampler.__dict__["apply_temperature"]
+        is_static = isinstance(descriptor, staticmethod)
+        original_temperature = descriptor.__func__ if is_static else descriptor
         original_sample = V1Sampler.sample
 
-        def apply_temperature(logits, *args, **kwargs):
-            out = original_temperature(logits, *args, **kwargs)
+        # A static method from vLLM 0.11.2 on, an instance method before (0.11.0): keep whichever it is.
+        def apply_temperature(*args, **kwargs):
+            out = original_temperature(*args, **kwargs)
             if capture["on"]:
                 capture["scaled"] = out.clone()
             return out
@@ -1616,7 +1618,7 @@ def patch_vllm_untruncated_logprobs():
                 state["calls"] += 1
             return sampled, processed
 
-        V1Sampler.apply_temperature = staticmethod(apply_temperature)
+        V1Sampler.apply_temperature = staticmethod(apply_temperature) if is_static else apply_temperature
         V1Sampler.sample = sample
         installed = True
     try:
