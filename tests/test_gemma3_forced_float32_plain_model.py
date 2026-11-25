@@ -108,8 +108,7 @@ def test_plain_gemma3_after_forced_float32_patches(dtype):
     assert after["logits_dtype"] == f"torch.{dtype}"
     assert after["hidden_dtypes"] == [f"torch.{dtype}"]
     assert after["forced_norm_dtypes"] == ["torch.float16", "torch.float16"]
-    # MLP / attention keep their forced float32 internals, so only bf16 rounding separates the two.
+    # MLP / attention keep their forced float32 internals, so only rounding separates the two.
     assert abs(after["loss"] - fresh["loss"]) < 1e-2 * abs(fresh["loss"])
     max_diff = max(abs(a - b) for a, b in zip(after["logits"], fresh["logits"]))
     assert max_diff < 5e-2, max_diff
-    assert after["forced_norm_dtype"] == "torch.float16"
