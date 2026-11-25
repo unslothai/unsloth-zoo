@@ -41,6 +41,8 @@ _CASES = {
 def _set_env(monkeypatch, env):
     for name in _ENVS:
         monkeypatch.delenv(name, raising = False)
+    # Unset is on for CUDA hosts: pin it off so each case names the head precision it tests.
+    monkeypatch.setenv("UNSLOTH_VLLM_FP32_LM_HEAD", "0")
     for name, value in env.items():
         monkeypatch.setenv(name, value)
 
@@ -54,6 +56,24 @@ def _efficient_log_softmax(support, scorer):
           "chunked_hidden_states_selective_log_softmax": scorer}
     exec(textwrap.dedent(src[start:end]), ns)
     return ns
+
+
+@pytest.fixture(autouse = True)
+def _fp32_head_without_fused_fp32_logits(monkeypatch):
+    # Pins the hosts whose fused kernels give 16-bit logits (CPU, ROCm): there an fp32 head takes the old scorer.
+    from unsloth_zoo.fused_losses import chunked_logprob as cl
+    monkeypatch.setattr(cl, "_FUSED_FP32_LOGITS", False)
+
+
+def test_fp32_head_keeps_the_fused_scorer_where_it_is_float32_out(monkeypatch):
+    from unsloth_zoo.fused_losses import chunked_logprob as cl
+    _set_env(monkeypatch, {})
+    monkeypatch.setattr(cl, "_FUSED_FP32_LOGITS", True)
+    assert not rr.grpo_scorer_keeps_logits(fp32_lm_head = True)
+    monkeypatch.setenv("UNSLOTH_VLLM_FP32_LM_HEAD", "1")
+    assert not rr.grpo_scorer_keeps_logits()
+    # A CPU head gets 16-bit fused logits: the fp32 head takes the old scorer there.
+    assert rr.grpo_scorer_keeps_logits(lm_head = torch.zeros(4, 2))
 
 
 def test_grpo_scorer_keeps_logits_truth_table(monkeypatch):

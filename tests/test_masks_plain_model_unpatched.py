@@ -92,8 +92,13 @@ SCRIPT = textwrap.dedent(
 )
 
 
-def _run(arm):
+def _run(arm, compile_disable = None):
     env = dict(os.environ, PYTHONPATH = ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""), CUDA_VISIBLE_DEVICES = "")
+    # CI sets UNSLOTH_COMPILE_DISABLE=1, under which the patch keeps transformers' own builder and never
+    # reaches the compiled one stubbed above: state it per test instead of inheriting it.
+    env.pop("UNSLOTH_COMPILE_DISABLE", None)
+    if compile_disable is not None:
+        env["UNSLOTH_COMPILE_DISABLE"] = compile_disable
     proc = subprocess.run(
         [sys.executable, "-c", SCRIPT, arm], capture_output = True, text = True, env = env, cwd = ROOT, timeout = 600,
     )
@@ -116,3 +121,10 @@ def test_without_marker_requirement_every_model_gets_the_patched_mask():
     out = _run("legacy")
     assert not out["plain"]["maskless"]
     assert not out["marked"]["maskless"]
+
+
+def test_compile_disabled_keeps_transformers_mask_for_every_model():
+    out = _run("legacy", compile_disable = "1")
+    for name in ("plain", "marked"):
+        assert out[name]["maskless"], out
+        assert out[name]["equal"], out

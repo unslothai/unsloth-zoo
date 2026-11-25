@@ -905,6 +905,142 @@ def patch_vllm_stacked_moe_lora(config):
 pass
 
 
+
+# vLLM >= 0.16 (csrc/cumem_allocator.cpp) asks cuMemCreate for a FABRIC handle whenever the device reports fabric
+# support, and on CUDA_ERROR_NOT_PERMITTED / NOT_SUPPORTED (no IMEX channel, i.e. every single-node box) creates
+# again with a POSIX fd. It does that on every standby wake_up, and the refused attempt is the slow part: about
+# 0.45 s per wake for a 16 GB KV cache on an L4. The refusal is fixed per process and device, so it is probed once
+# here; afterwards the wake maps a POSIX fd handle directly with the flags vLLM's own fallback would use, and writes
+# the handle back where vLLM's unmap_and_release reads it. Any failure falls back to vLLM's create_and_map.
+_CUMEM_FAST_STATE = {}
+
+
+def _cumem_driver():
+    import ctypes
+    state = _CUMEM_FAST_STATE
+    if "lib" in state: return state["lib"]
+    lib = None
+    try:
+        lib = ctypes.CDLL("libcuda.so.1")
+    except OSError:
+        lib = None
+    state["lib"] = lib
+    return lib
+pass
+
+
+def _cumem_prop(device, handle_type):
+    import ctypes
+
+    class _Location(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
+
+    class _AllocFlags(ctypes.Structure):
+        _fields_ = [("compressionType", ctypes.c_ubyte), ("gpuDirectRDMACapable", ctypes.c_ubyte),
+                    ("usage", ctypes.c_ushort), ("reserved", ctypes.c_ubyte * 4)]
+
+    class _Prop(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_int), ("requestedHandleTypes", ctypes.c_int), ("location", _Location),
+                    ("win32HandleMetaData", ctypes.c_void_p), ("allocFlags", _AllocFlags)]
+
+    lib = _cumem_driver()
+    prop = _Prop()
+    prop.type = 1                      # CU_MEM_ALLOCATION_TYPE_PINNED
+    prop.requestedHandleTypes = handle_type
+    prop.location.type = 1             # CU_MEM_LOCATION_TYPE_DEVICE
+    prop.location.id = device
+    rdma = ctypes.c_int(0)
+    # CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED = 110 (116 is the non-VMM attribute), as vLLM queries it
+    if lib.cuDeviceGetAttribute(ctypes.byref(rdma), 110, device) == 0 and rdma.value:
+        prop.allocFlags.gpuDirectRDMACapable = 1
+    return prop
+pass
+
+
+def _cumem_fabric_refused(device):
+    """True when this device reports fabric support but cuMemCreate refuses a FABRIC handle (vLLM then retries)."""
+    import ctypes
+    state = _CUMEM_FAST_STATE.setdefault("fabric_refused", {})
+    if device in state: return state[device]
+    refused = False
+    lib = _cumem_driver()
+    fab = ctypes.c_int(0)
+    # CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED = 128
+    if lib is not None and lib.cuDeviceGetAttribute(ctypes.byref(fab), 128, device) == 0 and fab.value:
+        handle = ctypes.c_ulonglong(0)
+        granularity = ctypes.c_size_t(0)
+        prop = _cumem_prop(device, 8)  # CU_MEM_HANDLE_TYPE_FABRIC
+        lib.cuMemGetAllocationGranularity(ctypes.byref(granularity), ctypes.byref(prop), 0)
+        ret = lib.cuMemCreate(ctypes.byref(handle), ctypes.c_size_t(max(granularity.value, 1 << 21)),
+                              ctypes.byref(prop), ctypes.c_ulonglong(0))
+        if ret == 0:
+            lib.cuMemRelease(handle)
+        refused = ret in (800, 801)  # CUDA_ERROR_NOT_PERMITTED, CUDA_ERROR_NOT_SUPPORTED
+    state[device] = refused
+    return refused
+pass
+
+
+def _vllm_cumem_requests_fabric():
+    # The FABRIC first attempt is in vLLM 0.16.0 and later; older vLLM creates with no handle type at all.
+    state = _CUMEM_FAST_STATE
+    if "requests_fabric" not in state:
+        try:
+            state["requests_fabric"] = Version(vllm_version) >= Version("0.16.0")
+        except Exception:
+            state["requests_fabric"] = False
+    return state["requests_fabric"]
+pass
+
+
+def _cumem_create_and_map(handle, vllm_create_and_map):
+    """vLLM's create_and_map, without the refused FABRIC attempt it repeats on every wake (see above)."""
+    import ctypes
+    if (
+        os.environ.get("UNSLOTH_VLLM_STANDBY_FAST_WAKE", "1") == "0"
+        or getattr(torch.version, "hip", None) is not None
+        or not isinstance(handle, tuple) or len(handle) != 4
+        or not _vllm_cumem_requests_fabric()
+        or _cumem_driver() is None
+    ):
+        return vllm_create_and_map(handle)
+    try:
+        device, size, d_mem, p_handle = (int(x) for x in handle)
+        if not p_handle or not _cumem_fabric_refused(device):
+            return vllm_create_and_map(handle)
+        lib = _cumem_driver()
+        current = ctypes.c_void_p(0)
+        if lib.cuCtxGetCurrent(ctypes.byref(current)) != 0 or not current.value:
+            return vllm_create_and_map(handle)
+        new_handle = ctypes.c_ulonglong(0)
+        prop = _cumem_prop(device, 1)  # CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, vLLM's fallback
+        if lib.cuMemCreate(ctypes.byref(new_handle), ctypes.c_size_t(size), ctypes.byref(prop), ctypes.c_ulonglong(0)) != 0:
+            return vllm_create_and_map(handle)
+        if lib.cuMemMap(ctypes.c_ulonglong(d_mem), ctypes.c_size_t(size), ctypes.c_size_t(0), new_handle, ctypes.c_ulonglong(0)) != 0:
+            lib.cuMemRelease(new_handle)
+            return vllm_create_and_map(handle)
+
+        class _Location(ctypes.Structure):
+            _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
+
+        class _Access(ctypes.Structure):
+            _fields_ = [("location", _Location), ("flags", ctypes.c_int)]
+
+        access = _Access()
+        access.location.type, access.location.id, access.flags = 1, device, 3  # device, PROT_READWRITE
+        if lib.cuMemSetAccess(ctypes.c_ulonglong(d_mem), ctypes.c_size_t(size), ctypes.byref(access), ctypes.c_size_t(1)) != 0:
+            lib.cuMemUnmap(ctypes.c_ulonglong(d_mem), ctypes.c_size_t(size))
+            lib.cuMemRelease(new_handle)
+            return vllm_create_and_map(handle)
+        # vLLM's unmap_and_release reads the handle through this pointer on the next sleep.
+        ctypes.c_ulonglong.from_address(p_handle).value = new_handle.value
+        _CUMEM_FAST_STATE["fast_maps"] = _CUMEM_FAST_STATE.get("fast_maps", 0) + 1
+        return None
+    except Exception:
+        return vllm_create_and_map(handle)
+pass
+
+
 def patch_vllm_enable_sleep_mode():
     if DEVICE_TYPE == "xpu":
         # Probe the module, not the version: nightly XPU builds before 0.23.0 ship it.
@@ -1032,7 +1168,8 @@ def patch_vllm_enable_sleep_mode():
                 continue
             if tags is None or data.tag in tags:
                 handle = data.handle
-                create_and_map(handle)
+                if DEVICE_TYPE == "xpu": create_and_map(handle)
+                else: _cumem_create_and_map(handle, create_and_map)
                 if hasattr(data, "is_asleep"):
                     data.is_asleep = False
                 if data.cpu_backup_tensor is not None:
@@ -1098,12 +1235,17 @@ def patch_vllm_enable_sleep_mode():
 pass
 
 
+# Shared by every wrapper patch_vllm_reset_caches_on_sleep installs (it runs on every load), so nesting is seen across them.
+_VLLM_SLEEP_DEPTH = __import__("threading").local()
+
+
 def patch_vllm_reset_caches_on_sleep():
     # Vision GRPO + standby crashes: multimodal (P0/P1) and encoder caches hold GPU tensors that sleep() unmaps; reset
     # them before each sleep, while still mapped, or the next access faults or caches desync; no-op for text; wrap every
     # engine class so use_async/use_engine can't bypass it.
     import functools
     _warned = set()
+    _sleep_depth = _VLLM_SLEEP_DEPTH
 
     def _reset_caches(obj):
         # reset_encoder_cache lives on llm_engine for LLM, on the engine itself otherwise.
@@ -1125,8 +1267,16 @@ def patch_vllm_reset_caches_on_sleep():
         @functools.wraps(_orig_sleep)
         def new_sleep(self, *args, **kwargs):
             _reset_caches(self)
+            # LLM.sleep calls llm_engine.sleep, which is wrapped too: one full collection per outermost sleep. A full
+            # gc costs ~0.1 s per pass on a GRPO process heap, and standby sleeps every step.
+            if getattr(_sleep_depth, "n", 0):
+                return _orig_sleep(self, *args, **kwargs)
             gc.collect()
-            return _orig_sleep(self, *args, **kwargs)
+            _sleep_depth.n = 1
+            try:
+                return _orig_sleep(self, *args, **kwargs)
+            finally:
+                _sleep_depth.n = 0
         cls.sleep = new_sleep
         cls._unsloth_reset_caches_on_sleep = True
 
@@ -4524,8 +4674,29 @@ def _warn_padded_vocab_for_serve(config):
 pass
 
 
+def _fp32_lm_head_mode():
+    # "on" (=1), "off" (=0), or "auto" (unset): the colocated GRPO default, which follows the trainer scorers.
+    value = os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip().lower()
+    if value in ("1", "true", "on", "yes"):
+        return "on"
+    if value in ("0", "false", "off", "no"):
+        return "off"
+    return "auto"
+
+
 def _fp32_lm_head_requested():
-    return os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes")
+    return _fp32_lm_head_mode() == "on"
+
+
+def _trainer_fp32_lm_head_default():
+    # The trainer scorers read the flag once, at import, as a def-time default: the rollout head follows it, so an
+    # fp32 head is only requested where old / new logps project in fp32 too (CUDA, not ROCm, fp32 fused logits).
+    try:
+        from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax as scorer
+        params = inspect.signature(scorer).parameters
+        return any(name in params and params[name].default is True for name in ("fp32_lm_head", "fp32_lm_head_cuda"))
+    except Exception:
+        return False
 
 
 def _vllm_supports_fp32_lm_head():
@@ -4542,7 +4713,8 @@ def _patch_vllm_fp32_lm_head_excluded_quant():
     # vLLM 0.26.0 - 0.28.x only accept UnquantizedEmbeddingMethod for a head_dtype override, but a
     # quant config that excludes lm_head (ModelOpt FP8 / NVFP4) hands out UnquantizedLinearMethod,
     # so _apply_head raises although the weight is plain. Backport the 0.29.0 guard: swap in an
-    # UnquantizedEmbeddingMethod for that one call. Only reached with UNSLOTH_VLLM_FP32_LM_HEAD=1.
+    # UnquantizedEmbeddingMethod for that one call. A truly quantized head (GGUF, AWQ / GPTQ lm_head)
+    # cannot run in fp32, and every vLLM raises for it: project it in the model dtype instead, once noted.
     try:
         from vllm.model_executor.layers.logits_processor import LogitsProcessor
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -4553,19 +4725,24 @@ def _patch_vllm_fp32_lm_head_excluded_quant():
     if original is None or getattr(original, "_unsloth_excluded_quant_patched", False):
         return False
     code = getattr(original, "__code__", None)
-    if code is None or "UnquantizedLinearMethod" in code.co_names:
-        # vLLM >= 0.29.0 already accepts both.
-        return False
+    # vLLM >= 0.29.0 already accepts both.
+    backport = code is not None and "UnquantizedLinearMethod" not in code.co_names
     embedding_method = UnquantizedEmbeddingMethod()
+    noted = []
 
     def _apply_head(self, lm_head, hidden_states, embedding_bias):
         quant_method = getattr(lm_head, "quant_method", None)
-        if (
-            getattr(self, "head_dtype", None) is not None
-            and self.head_dtype != hidden_states.dtype
-            and isinstance(quant_method, UnquantizedLinearMethod)
-            and not isinstance(quant_method, UnquantizedEmbeddingMethod)
-        ):
+        if getattr(self, "head_dtype", None) is None or self.head_dtype == hidden_states.dtype:
+            return original(self, lm_head, hidden_states, embedding_bias)
+        if not isinstance(quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)):
+            if not noted:
+                noted.append(True)
+                print(
+                    f"Unsloth: the lm_head is quantized ({type(quant_method).__name__}), so vLLM keeps "
+                    f"rollout logits in {hidden_states.dtype} instead of an fp32 lm_head."
+                )
+            return quant_method.apply(lm_head, hidden_states, bias = embedding_bias)
+        if backport and not isinstance(quant_method, UnquantizedEmbeddingMethod):
             lm_head.quant_method = embedding_method
             try:
                 return original(self, lm_head, hidden_states, embedding_bias)
@@ -4580,10 +4757,21 @@ def _patch_vllm_fp32_lm_head_excluded_quant():
 
 
 def _vllm_fp32_lm_head_overrides(training):
-    # Raises rather than half-applying: the trainer reads the same flag, and only both sides in fp32 pays off.
-    if not training or not _fp32_lm_head_requested():
+    # Explicit =1 raises rather than half-applying: the trainer reads the same flag, and only both sides in
+    # fp32 pays off. Unset (auto) requests it only where it holds on both sides and is silent otherwise.
+    mode = _fp32_lm_head_mode()
+    if not training or mode == "off":
         return {}
-    if not _vllm_supports_fp32_lm_head():
+    if mode == "auto":
+        if not _trainer_fp32_lm_head_default() or not _vllm_supports_fp32_lm_head():
+            return {}
+        try:
+            from vllm.platforms import current_platform
+            if not current_platform.is_cuda():
+                return {}
+        except Exception:
+            return {}
+    elif not _vllm_supports_fp32_lm_head():
         raise RuntimeError(
             f"Unsloth: UNSLOTH_VLLM_FP32_LM_HEAD=1 needs vLLM >= 0.26.0 for an fp32 lm_head, "
             f"but found vLLM {vllm_version}. Upgrade vLLM or unset UNSLOTH_VLLM_FP32_LM_HEAD."
@@ -4600,10 +4788,13 @@ def _warn_fp32_lm_head_set_late():
     stale = []
     for name in ("chunked_hidden_states_selective_log_softmax", "chunked_hidden_states_selective_log_softmax_recompute"):
         try:
-            default = inspect.signature(getattr(rl, name)).parameters["fp32_lm_head"].default
+            params = inspect.signature(getattr(rl, name)).parameters
+            default = params["fp32_lm_head"].default
         except Exception:
             continue
-        if default is False:
+        # The unset default already projects a CUDA head in fp32.
+        cuda_default = params["fp32_lm_head_cuda"].default if "fp32_lm_head_cuda" in params else False
+        if default is False and cuda_default is not True:
             stale.append(name)
     if stale:
         print(
@@ -5829,8 +6020,14 @@ def load_vllm(
         fp32_head_overrides = {} if return_args else _vllm_fp32_lm_head_overrides(training)
         if fp32_head_overrides:
             engine_args["hf_overrides"] = {**engine_args.get("hf_overrides", {}), **fp32_head_overrides}
-            print("Unsloth: vLLM computes rollout logits with an fp32 lm_head (UNSLOTH_VLLM_FP32_LM_HEAD=1).")
-            _warn_fp32_lm_head_set_late()
+            if _fp32_lm_head_requested():
+                print("Unsloth: vLLM computes rollout logits with an fp32 lm_head (UNSLOTH_VLLM_FP32_LM_HEAD=1).")
+                _warn_fp32_lm_head_set_late()
+            else:
+                print(
+                    "Unsloth: vLLM computes rollout logits with an fp32 lm_head to match the trainer's logprobs "
+                    "(UNSLOTH_VLLM_FP32_LM_HEAD=0 turns it off)."
+                )
 
         # Pin the backend for the worker, which the sys.modules block only reaches under
         # fork. An explicit backend is a HARD pin: cuda.py raises "Selected backend ... is

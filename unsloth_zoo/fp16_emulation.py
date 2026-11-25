@@ -54,6 +54,8 @@ def _has_out_dtype() -> bool:
                 zero = torch.zeros(1, 1, dtype = torch.float16, device = "cuda")
                 torch.mm(zero, zero, out_dtype = torch.float32)
                 _HAS_OUT_DTYPE = True
+            except torch.cuda.OutOfMemoryError:
+                return False  # transient: the float32 matmul serves this call, the next one probes again
             except (TypeError, RuntimeError):
                 _HAS_OUT_DTYPE = False
     return _HAS_OUT_DTYPE

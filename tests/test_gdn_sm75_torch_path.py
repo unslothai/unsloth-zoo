@@ -366,6 +366,7 @@ def test_sm75_needs_tensor_cores(monkeypatch, name, routed):
     """sm75 parts without tensor cores (GTX 16xx, Quadro T-series) report sm75 too: they keep fla."""
     monkeypatch.setitem(fla_vendor._sm75_state, "capability", None)
     monkeypatch.setattr(torch.version, "hip", None, raising = False)
+    monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if None else "+cu130"))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda i = 0: (7, 5))
@@ -377,6 +378,7 @@ def test_rocm_reports_no_sm75(monkeypatch):
     """ROCm builds report CUDA-style capabilities; the probe returns none there, so the path never installs."""
     monkeypatch.setitem(fla_vendor._sm75_state, "capability", None)
     monkeypatch.setattr(torch.version, "hip", "6.4.0", raising = False)
+    monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if "6.4.0" else "+cu130"))
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda i = 0: (7, 5))

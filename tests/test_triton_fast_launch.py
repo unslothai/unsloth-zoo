@@ -40,6 +40,8 @@ class _Compiled:
         mode = self.owner.fast_mode
         if mode == "raise":
             raise TypeError("launcher takes other arguments")
+        if mode == "oom":
+            raise torch.cuda.OutOfMemoryError("CUDA out of memory")
         if mode == "noop":
             return
         x, out, n, scale, flag = args[:5]
@@ -120,6 +122,39 @@ def test_launcher_error_on_self_check_disables_everything(fake_cuda):
     for _ in range(2):
         _call(other, x, torch.empty(8))
     assert len(other.fast_calls) == n_fast
+
+
+def test_oom_on_self_check_keeps_fast_launch(fake_cuda):
+    # A transient OOM is no verdict: base disabled fast launch for every kernel for the rest of the process.
+    k, other = _Kernel("oom"), _Kernel()
+    x = torch.arange(8, dtype = torch.float32)
+    _call(other, x, torch.empty(8))
+    _call(k, x, torch.empty(8))
+    out = torch.empty(8)
+    _call(k, x, out)
+    assert torch.equal(out, x * 2 + 3)
+    assert L._ENABLED is True and id(k) not in L._KERNEL_OK and L._PLANS
+    k.fast_mode = "ok"
+    for _ in range(2):
+        out = torch.empty(8)
+        _call(k, x, out)
+        assert torch.equal(out, x * 2 + 3)
+    assert L._KERNEL_OK[id(k)] is True and L.FAST_LAUNCH_STATS["fast"] == 1
+
+
+def test_oom_after_check_keeps_fast_launch(fake_cuda):
+    k = _Kernel()
+    x = torch.arange(8, dtype = torch.float32)
+    _call(k, x, torch.empty(8))
+    _call(k, x, torch.empty(8))
+    k.fast_mode = "oom"
+    out = torch.empty(8)
+    _call(k, x, out)
+    assert torch.equal(out, x * 2 + 3)
+    assert L._ENABLED is True and L._PLANS
+    k.fast_mode = "ok"
+    _call(k, x, torch.empty(8))
+    assert L.FAST_LAUNCH_STATS["fast"] == 1
 
 
 def test_noop_launch_fails_check_on_nan_output(fake_cuda):

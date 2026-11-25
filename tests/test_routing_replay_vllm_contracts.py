@@ -50,9 +50,10 @@ def _routes(n, seed):
 
 
 @pytest.mark.parametrize("version, expected", [
-    ("0.20.2", None), ("0.21.0", False), ("0.21.1rc0", False), ("0.22.0", None), ("0.32.0", None),
+    ("0.20.2", None), ("0.21.0", False), ("0.21.1rc0", False), ("0.22.0", None), ("0.30.0", None),
+    ("0.31.0", False), ("0.34.0", False),
 ])
-def test_vllm_021_turns_async_scheduling_off(replay, monkeypatch, version, expected):
+def test_vllm_021_and_031_plus_turn_async_scheduling_off(replay, monkeypatch, version, expected):
     import importlib.metadata
     monkeypatch.setattr(rr, "_engine_arg_names", lambda: {"enable_return_routed_experts", "async_scheduling"})
     monkeypatch.setattr(importlib.metadata, "version", lambda name: version)

@@ -241,17 +241,18 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     # Cache kernel generations for faster restarts. See
     # https://pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html
     # https://dev-discuss.pytorch.org/t/impact-of-multithreading-and-local-caching-on-torch-compile/2498/3
-    os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
-    os.environ["TORCHINDUCTOR_AUTOTUNE_REMOTE_CACHE"] = "1"
+    # setdefault: a user's "0" opts out. No TORCHINDUCTOR_AUTOTUNE_REMOTE_CACHE: it needs a Redis
+    # server, and on OSS torch every autotune cache it forces on fails to connect and logs.
+    os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
     # Duplicate functions break hashing if Inductor's cache shares the compiled cache folder.
     _drop_inductor_cache_dir_in_compile_location()
 
     # https://github.com/sayakpaul/diffusers-torchao?tab=readme-ov-file#things-to-keep-in-mind-when-benchmarking
-    os.environ["ENABLE_AOT_AUTOGRAD_CACHE"] = "1"
+    os.environ.setdefault("ENABLE_AOT_AUTOGRAD_CACHE", "1")
     # ENABLE_AOT_AUTOGRAD_CACHE is no longer read by torch >= 2.12; the
     # AOTAutograd cache env override was renamed. Set the current name too so
     # backward graphs are also cached on disk across process restarts.
-    os.environ["TORCHINDUCTOR_AUTOGRAD_CACHE"] = "1"
+    os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "1")
 
     # Torch compile arguments
     torch_compile_arguments = [
@@ -280,8 +281,8 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         "config.freezing = False", # Freezes weights --> ** only useful for inference **
         # f"config.triton.multi_kernel = {O3}", # use tuning to pick between different subkernels
         "config.cuda.enable_cuda_lto = True",
-        "config.cuda.use_fast_math = True",
-        f"config.cuda.compile_opt_level = {'-O2' if O3 else '-O1'}",
+        # cuda.use_fast_math stays off as in get_torch_compile_options. cuda.compile_opt_level was written
+        # unquoted, so it never applied; cuda.* only reaches CUTLASS, which the backends above leave out.
         # See torch.compile, the missing manual
         # https://docs.google.com/document/d/1y5CRfMLdwEoF1nTk9q8qEu1mgMUuUtvhklPKJ2emLU8
         # f"config.emulate_precision_casts = {not debug}", # Force X.to(f32).to(f16) instead of X.to(f16)
@@ -317,8 +318,12 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     pass
     _log_skips = debug or os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
     from unsloth_zoo.log import logger
+    def _is_deprecated(config, argument):
+        _key = argument.split("=", 1)[0].strip()[len("config."):]
+        return getattr(getattr(config, "_config", {}).get(_key), "deprecated", False)
     import torch._inductor.config as config
     for _try_compile_argument in torch_compile_arguments:
+        if _is_deprecated(config, _try_compile_argument): continue
         try:    exec(_try_compile_argument)
         except Exception as _error:
             if _log_skips: logger.warning(f"Unsloth: Skipped Inductor `{_try_compile_argument}` on torch {torch.__version__}: {_error!r}")
@@ -326,8 +331,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     import torch._dynamo.config as config
     for _try_dynamo_argument in torch_dynamo_arguments:
         # Torch 2.13 deprecates inline_inbuilt_nn_modules (always True) and warns on every write.
-        _key = _try_dynamo_argument.split("=", 1)[0].strip()[len("config."):]
-        if getattr(getattr(config, "_config", {}).get(_key), "deprecated", False): continue
+        if _is_deprecated(config, _try_dynamo_argument): continue
         try:    exec(_try_dynamo_argument)
         except Exception as _error:
             if _log_skips: logger.warning(f"Unsloth: Skipped Dynamo `{_try_dynamo_argument}` on torch {torch.__version__}: {_error!r}")

@@ -302,6 +302,9 @@ def _mm(x, w, out_dtype):
                 y = torch.mm(x, w, out_dtype = torch.float32)
                 _MM_OUT_DTYPE[x.dtype] = True
                 return y
+            except torch.OutOfMemoryError:
+                # Transient: caching it would drop the fp32-accumulate GEMM for the whole process.
+                raise
             except Exception:
                 _MM_OUT_DTYPE[x.dtype] = False
         return x.float() @ w.float()

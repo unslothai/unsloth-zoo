@@ -43,6 +43,7 @@ import threading
 import importlib
 import importlib.util
 
+from unsloth_zoo.rocm_build import is_rocm_torch
 from .common import (
     TEMPORARY_PATCHES,
     UNSLOTH_ENABLE_LOGGING,
@@ -125,7 +126,7 @@ def _hopper_dqkwg_suspect(torch_mod, triton_mod):
         if not (version.parse("3.4.0") <= v < version.parse("3.7.1")):
             return False
         # ROCm Instinct also reports major 9: trust bare major==9 only on CUDA.
-        is_nvidia = getattr(getattr(torch_mod, "version", None), "hip", None) is None
+        is_nvidia = not is_rocm_torch(torch_mod)
         try:
             count = int(torch_mod.cuda.device_count())
         except Exception:
@@ -178,7 +179,7 @@ def _gpu_lacks_dot_instructions(torch_mod=None):
     try:
         if torch_mod is None:
             import torch as torch_mod
-        if getattr(getattr(torch_mod, "version", None), "hip", None) is None:
+        if not is_rocm_torch(torch_mod):
             return False
         if not torch_mod.cuda.is_available():
             return False
@@ -277,7 +278,7 @@ def _device_index_is_hopper(index):
     """Whether a CUDA device is NVIDIA Hopper; None if unknown. HIP -> False."""
     try:
         import torch
-        if getattr(getattr(torch, "version", None), "hip", None) is not None:
+        if is_rocm_torch(torch):
             return False
         if index is None:
             index = torch.cuda.current_device()
@@ -381,7 +382,7 @@ def _withhold_kda_on_rocm():
     and kernel-hub wrappers keep the torch fallback."""
     try:
         import torch
-        if getattr(torch.version, "hip", None) is None:
+        if not is_rocm_torch(torch):
             return False
     except Exception:
         return False
@@ -837,7 +838,7 @@ def _kda_safe_gate_hardware_ok():
     try:
         import torch
         from fla.utils import TRITON_ABOVE_3_6_0
-        if not TRITON_ABOVE_3_6_0 or getattr(torch.version, "hip", None) is not None:
+        if not TRITON_ABOVE_3_6_0 or is_rocm_torch(torch):
             return False
         n = torch.cuda.device_count()
         return n > 0 and all(torch.cuda.get_device_capability(i) >= (8, 0) for i in range(n))
@@ -1069,7 +1070,7 @@ def _load_flashqla():
         return None
     try:
         import torch
-        if getattr(torch.version, "hip", None) is not None or not torch.cuda.is_available():
+        if is_rocm_torch(torch) or not torch.cuda.is_available():
             raise RuntimeError("FlashQLA needs an NVIDIA GPU")
         capability = tuple(torch.cuda.get_device_capability())
         if capability not in _FLASHQLA_ARCHES:
@@ -1269,7 +1270,7 @@ def _rocm_has_fp32_faulting_gpu(torch_mod=None):
     try:
         if torch_mod is None:
             import torch as torch_mod
-        if getattr(getattr(torch_mod, "version", None), "hip", None) is None:
+        if not is_rocm_torch(torch_mod):
             return False
         if not torch_mod.cuda.is_available():
             return False
@@ -1284,7 +1285,7 @@ def _rocm_has_fp32_faulting_gpu(torch_mod=None):
 def _rocm_fp32_on_faulting_gpu(*tensors):
     """Any float32 tensor among ``tensors`` sits on a ROCm gfx11 device."""
     import torch
-    if getattr(torch.version, "hip", None) is None:
+    if not is_rocm_torch(torch):
         return False
     for t in tensors:
         if not isinstance(t, torch.Tensor) or t.dtype != torch.float32 or t.device.type != "cuda":
@@ -1658,7 +1659,7 @@ def _sm75_capabilities():
         caps = {}
         try:
             import torch
-            if getattr(torch.version, "hip", None) is None and torch.cuda.is_available():
+            if not is_rocm_torch(torch) and torch.cuda.is_available():
                 for i in range(torch.cuda.device_count()):
                     cap = tuple(torch.cuda.get_device_capability(i))
                     if cap == (7, 5) and not _SM75_TENSOR_CORE_NAME.search(torch.cuda.get_device_name(i) or ""):

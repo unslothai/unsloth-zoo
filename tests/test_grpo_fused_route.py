@@ -382,7 +382,12 @@ def test_route_switches(monkeypatch):
     assert not rr.grpo_fused_route_ok(ok)
     monkeypatch.setenv("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0")
     monkeypatch.setenv("UNSLOTH_VLLM_FP32_LM_HEAD", "1")
+    # An fp32 head keeps the fused route only where its logits are already float32-out.
+    from unsloth_zoo.fused_losses import chunked_logprob as cl
+    monkeypatch.setattr(cl, "_FUSED_FP32_LOGITS", False)
     assert not rr.grpo_fused_route_ok(ok)
+    monkeypatch.setattr(cl, "_FUSED_FP32_LOGITS", True)
+    assert rr.grpo_fused_route_ok(ok)
     monkeypatch.setenv("UNSLOTH_VLLM_FP32_LM_HEAD", "0")
     monkeypatch.setenv("UNSLOTH_GRPO_CHUNKED_LOGPROBS", "0")
     assert not rr.grpo_fused_route_ok(ok)
