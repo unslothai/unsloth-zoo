@@ -2464,10 +2464,14 @@ pass
 
 
 def grpo_forwards_are_collective(model):
-    """FSDP2 sharded layout or DeepSpeed ZeRO-3: every forward all-gathers, so ranks must run the same number of forwards."""
+    """FSDP2 sharded layout, DeepSpeed ZeRO-3 or expert parallel: every forward all-gathers (or, under expert
+    parallel, every MoE block all-to-alls), so ranks must run the same number of forwards."""
     import torch.distributed as dist
     if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
         return False
+    # Unsloth's apply_expert_parallel stamps its ep mesh on every model level (PeftModel included).
+    if model.__dict__.get("_unsloth_ep", None) is not None:
+        return True
     # ZeRO-3 is read live, not cached: the DeepSpeed config can go live after the first call.
     from unsloth_zoo.temporary_patches.utils import zero3_partitioned_training
     if zero3_partitioned_training():
@@ -2486,6 +2490,8 @@ def grpo_forwards_are_collective(model):
     if cached is None:
         cached = any(
             module.__dict__.get("_unsloth_reshard_after_forward", False) not in (False, None, 0)
+            # Expert parallel under a wrapper that is not a model level (a DDP module).
+            or module.__dict__.get("_unsloth_ep", None) is not None
             for module in model.modules()
         )
         model.__dict__["_unsloth_grpo_collective_forwards"] = cached
