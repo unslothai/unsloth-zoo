@@ -104,6 +104,8 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
                     grad_hidden[start:end] = logits.to(h.dtype) @ mm_weight
             if need_weight_grad:
                 grad_weight.addmm_(logits.t(), h.float())
+        # Free this chunk's logits before the next projection: with the head copy held, both would be live at once.
+        del logits
     return total, grad_hidden, grad_weight
 
 
