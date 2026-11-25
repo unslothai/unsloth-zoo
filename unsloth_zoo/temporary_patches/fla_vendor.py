@@ -1697,7 +1697,7 @@ def _sm75_torch_chunk_gated_delta_rule(
     state_v_first = False, cu_seqlens = None, **kwargs,
 ):
     """fla's chunk_gated_delta_rule contract on unsloth_zoo.gdn_torch_chunk (context parallel excluded by the caller)."""
-    from ..gdn_torch_chunk import torch_chunk_gated_delta_rule
+    from unsloth_zoo.gdn_torch_chunk import torch_chunk_gated_delta_rule
     if "transpose_state_layout" in kwargs:
         # fla's deprecated name for state_v_first, with fla's conflict check.
         if state_v_first:
@@ -1783,7 +1783,7 @@ def _install_sm75_torch_path():
         return False
     if getattr(original, _SM75_TORCH_MARK, None) is not None:
         return True
-    from ..gdn_torch_chunk import scan_ops
+    from unsloth_zoo.gdn_torch_chunk import scan_ops
     if scan_ops() is None:
         return False
     wrapped = _make_sm75_chunk_gated_delta_rule(original)
