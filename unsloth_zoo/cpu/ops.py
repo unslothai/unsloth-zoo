@@ -64,14 +64,18 @@ def _chunked_ce_forward_impl(hidden: torch.Tensor, weight: torch.Tensor, labels:
                         amp_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Opaque to Dynamo/AOT: the runtime loop keeps logits bounded without specialising symbolic rows.
     # Compiled graphs run with autocast off, so the caller's CPU autocast is passed in and restored here.
+    # An fp32 head (full finetuning keeps fp32 master weights) under bf16 / fp16 autocast: autocast would cast the
+    # whole [V, H] weight again for every chunk's logits and dX matmuls. Cast it once; same bits.
+    low = weight.to(amp_dtype) if amp and weight.dtype == torch.float32 and amp_dtype != torch.float32 else weight
     with torch.autocast("cpu", dtype = amp_dtype, enabled = amp):
         return _chunked_ce_forward_loop(
-            hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad, need_weight_grad, exact,
+            hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad, need_weight_grad, exact, low,
         )
 
 
 def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, need_hidden_grad,
-                             need_weight_grad, exact):
+                             need_weight_grad, exact, low = None):
+    low = weight if low is None else low
     rows = hidden.shape[0]
     grad_dtype = torch.float32 if exact else hidden.dtype
     grad_hidden = torch.empty(hidden.shape, dtype = grad_dtype) if need_hidden_grad else torch.empty(0)
@@ -83,7 +87,7 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
         valid = y != ignore_index
         # Zero ignored rows first: fp16 can overflow to inf in the projection, and NaN * 0 stays NaN.
         h = torch.where(valid.unsqueeze(-1), hidden[start:end], hidden.new_zeros(()))
-        logits = (h @ weight.t()).float()
+        logits = (h @ low.t()).float()
         safe_y = torch.where(valid, y, torch.zeros_like(y)).unsqueeze(-1)
         logits, log_p_target, _ = _softmax_without_collapse(logits, safe_y)
         total -= (log_p_target.squeeze(-1) * valid).sum()
@@ -96,7 +100,7 @@ def _chunked_ce_forward_loop(hidden, weight, labels, chunk_rows, ignore_index, n
                     with torch.autocast("cpu", enabled = False):
                         grad_hidden[start:end] = logits @ weight.float()
                 else:
-                    grad_hidden[start:end] = logits.to(h.dtype) @ weight
+                    grad_hidden[start:end] = logits.to(h.dtype) @ low
             if need_weight_grad:
                 grad_weight.addmm_(logits.t(), h.float())
     return total, grad_hidden, grad_weight
