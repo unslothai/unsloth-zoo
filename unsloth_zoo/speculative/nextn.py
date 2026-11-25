@@ -50,7 +50,8 @@ class _ChainKV:
     def add_positions(self, positions):
         self.positions = positions if self.positions is None else torch.cat([self.positions, positions], dim = 1)
 
-    def update(self, key_states, value_states, layer_idx, cache_kwargs = None):
+    # transformers 5.24 attention passes `kwargs=kwargs` too.
+    def update(self, key_states, value_states, layer_idx, cache_kwargs = None, **kwargs):
         if layer_idx in self.keys:
             self.keys[layer_idx] = torch.cat([self.keys[layer_idx], key_states], dim = -2)
             self.values[layer_idx] = torch.cat([self.values[layer_idx], value_states], dim = -2)
@@ -138,6 +139,15 @@ def _call_kwargs(layer):
     return set(params)
 
 
+def _cache_kwarg(layer):
+    """The decoder layer's cache keyword: `cache` from transformers 5.24, past_key_values before."""
+    try:
+        params = inspect.signature(layer.forward).parameters
+    except (TypeError, ValueError):
+        return "past_key_values"
+    return "cache" if "cache" in params and "past_key_values" not in params else "past_key_values"
+
+
 class NextNHead(nn.Module):
     """Native MTP head(s) of a DeepSeek-V3 style family; state_dict() uses canonical names, mtp_state_dict() the
     checkpoint's; embedding and lm_head are the target's or frozen copies."""
@@ -172,6 +182,7 @@ class NextNHead(nn.Module):
                 block._unsloth_layer_type = kind
                 block._unsloth_window = int(window) if kind == "sliding_attention" and window else None
         self._block_kwargs = _call_kwargs(self.heads[0].block[0])
+        self._cache_kwarg = _cache_kwarg(self.heads[0].block[0])
         self._embedding_first = True
 
     @property
@@ -223,7 +234,7 @@ class NextNHead(nn.Module):
         kwargs = {
             "attention_mask": mask,
             "position_ids": positions,
-            "past_key_values": cache,
+            getattr(self, "_cache_kwarg", "past_key_values"): cache,
             "use_cache": True,
             "position_embeddings": position_embeddings,
         }
