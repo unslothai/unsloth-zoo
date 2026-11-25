@@ -1114,6 +1114,25 @@ def _traced_writes(written: dict, seen: dict) -> dict:
     return {k: v for k, v in written.items() if seen.get(k) is not v and traced(v)}
 
 
+def _shared_containers(args, kwargs):
+    """Keys of the dict and list arguments a layer may write into for later layers to read."""
+    return [k for k, v in (*enumerate(args), *kwargs.items()) if isinstance(v, (dict, list))]
+
+
+def _argument(args, kwargs, key):
+    return args[key] if isinstance(key, int) else kwargs[key]
+
+
+def _entries(container):
+    return dict(enumerate(container)) if isinstance(container, list) else dict(container)
+
+
+def _passthrough(x):
+    # A Depends node (no copy) gives each returned write its own cotangent: mx.vjp skips a stop_gradient output,
+    # shifting the rest, and seeds an output returned twice only once.
+    return mx.depends([x], [x])[0]
+
+
 @mx.custom_function
 def _tie_shared_kv_cotangent(x, shared_kv):
     return x, shared_kv
@@ -1177,9 +1196,13 @@ def _patch_layer_class_for_gc(layer_cls):
             if "shared_kv" in kwargs:
                 args, kwargs["shared_kv"] = _tie_to_hidden_state(
                     args, kwargs["shared_kv"])
-            outer = (args, kwargs)
-            # Mistral Large 4 writes K/V into a dict later layers read; the checkpoint copies it, so return the writes.
-            shared = [i for i, a in enumerate(args) if isinstance(a, dict)]
+            # Layers can write into a dict or list later layers read (Mistral Large 4's K/V, Inkling 2's residual
+            # history); the checkpoint copies its arguments, so return the writes.
+            shared = _shared_containers(args, kwargs)
+            # The closure must not hold those containers: they get its outputs, a cycle through the MLX graph that
+            # Python's gc cannot see, which kept compiled traces and their layers alive.
+            outer = (tuple(None if i in shared else a for i, a in enumerate(args)),
+                     {k: None if k in shared else v for k, v in kwargs.items()})
             wrote = False
 
             def inner_fn(params, *args, **kwargs):
@@ -1188,10 +1211,12 @@ def _patch_layer_class_for_gc(layer_cls):
                 _carry_window_masks(outer, (args, kwargs))
                 args = tuple(_detach_integer_arrays(a) for a in args)
                 kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
-                before = [dict(args[i]) for i in shared]
+                containers = [_argument(args, kwargs, key) for key in shared]
+                before = [_entries(c) for c in containers]
                 with _padding_free_scope(layout):
                     out = fn(self, *args, **kwargs)
-                writes = [_traced_writes(args[i], seen) for i, seen in zip(shared, before)]
+                writes = [mlx.utils.tree_map(_passthrough, _traced_writes(_entries(c), seen))
+                          for c, seen in zip(containers, before)]
                 wrote = any(writes)
                 # Writes go first: mx.checkpoint misaligns cotangents after an output with no gradient (an index).
                 return (writes, out) if wrote else out
@@ -1200,8 +1225,13 @@ def _patch_layer_class_for_gc(layer_cls):
             if not wrote:
                 return out
             writes, out = out
-            for i, written in zip(shared, writes):
-                args[i].update(written)
+            for key, written in zip(shared, writes):
+                target = _argument(args, kwargs, key)
+                if isinstance(target, dict):
+                    target.update(written)
+                else:
+                    for k in sorted(written):
+                        target[k:k + 1] = [written[k]]
             return out
 
         # Shared K/V must cross the checkpoint boundary as a traced argument and traced result; reading it off the slot makes the VJP drop the gradient.
@@ -2280,12 +2310,19 @@ def _is_quantized_layer(layer):
     return hasattr(layer, "scales")
 
 
+def _logit_softcap_unset(tm):
+    return not any(hasattr(holder, "final_logit_softcapping") for holder in (tm, getattr(tm, "args", None)))
+
+
 def _get_logit_softcap(model):
     """Get logit softcapping value if model uses it (e.g. Gemma-2/4), else 0.0."""
     tm = _get_output_transform_owner(model)
     softcap = getattr(tm, "final_logit_softcapping", None)
     if softcap is None and hasattr(tm, "args"):
         softcap = getattr(tm.args, "final_logit_softcapping", None)
+    # Inkling 2 caps from its text config alone; a model that sets the knob itself, even to None (Gemma 4), decides.
+    if _logit_softcap_unset(tm):
+        softcap = getattr(getattr(tm, "config", None), "final_logit_softcapping", None)
     return float(softcap) if softcap is not None and softcap > 0 else 0.0
 
 
@@ -2390,6 +2427,8 @@ def _detect_logit_softcap(model):
     legacy = getattr(tm, "final_logit_softcapping", _KNOB_MISSING)
     if legacy is _KNOB_MISSING and hasattr(tm, "args"):
         legacy = getattr(tm.args, "final_logit_softcapping", _KNOB_MISSING)
+    if _logit_softcap_unset(tm):
+        legacy = getattr(getattr(tm, "config", None), "final_logit_softcapping", _KNOB_MISSING)
     alias, conflict = _knob_value(tm, "logits_soft_cap", ("args", "config"))
     if conflict:
         return 0.0, ("logits_soft_cap differs between its configuration "
@@ -2530,7 +2569,22 @@ def _supports_text_lora_cce(desc, label_smoothing):
     return type(head.linear) is not nn.QuantizedLinear or head.lora_a.shape[1] <= 32
 
 
-def _make_text_lora_cce_loss_fn(head_desc, logit_scale, softcap):
+def _kept_head_rows(model, rows):
+    """Leading head rows whose logits the forward keeps, or None for all: Inkling slices its padded head's logits to
+    unpadded_vocab_size, and CCE must not score the rest."""
+    tm = _get_text_model(model)
+    for holder in (tm, getattr(tm, "args", None), getattr(tm, "config", None)):
+        kept = getattr(holder, "unpadded_vocab_size", None)
+        if isinstance(kept, int) and 0 < kept < rows:
+            return kept
+    return None
+
+
+def _head_rows(rows, *arrays):
+    return arrays if rows is None else tuple(None if a is None else a[:rows] for a in arrays)
+
+
+def _make_text_lora_cce_loss_fn(head_desc, logit_scale, softcap, rows=None):
     from unsloth_zoo.mlx.cce.runtime_cce import make_lora_head_cce
 
     head = head_desc.module
@@ -2566,11 +2620,11 @@ def _make_text_lora_cce_loss_fn(head_desc, logit_scale, softcap):
         base = live_head.linear
         hidden = hidden.reshape((-1, hidden.shape[-1]))
         rank_hidden = live_head.dropout(hidden) @ live_head.lora_a
-        losses = kernel(
-            hidden, base.weight, base.scales if quantized else None,
-            base.get("biases") if quantized else None,
-            rank_hidden, live_head.lora_b, base.get("bias"), targets.reshape((-1,)),
-        )
+        weight, scales, biases, bias = _head_rows(
+            rows, base.weight, base.scales if quantized else None, base.get("biases") if quantized else None,
+            base.get("bias"))
+        lora_b = live_head.lora_b if rows is None else live_head.lora_b[:, :rows]
+        losses = kernel(hidden, weight, scales, biases, rank_hidden, lora_b, bias, targets.reshape((-1,)))
         return losses.sum() / _safe_token_denominator(count), count
 
     loss_fn._unsloth_cce_backend = "runtime-cce-lora-head"
@@ -2635,7 +2689,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0, loss_type="nll"):
         loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
         loss_fn._unsloth_cce_backend = "baseline-fallback"
         loss_fn._unsloth_compiled_loss_fn = _make_text_lora_cce_loss_fn(
-            head_desc, logit_scale, softcap,
+            head_desc, logit_scale, softcap, _kept_head_rows(model, head_desc.module.linear.weight.shape[0]),
         )
         return loss_fn
 
@@ -2645,6 +2699,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0, loss_type="nll"):
         print(f"Unsloth: CCE using logit_scale={logit_scale} for this model.")
 
     lm_layer = head_desc.module
+    _rows = _kept_head_rows(model, lm_layer.weight.shape[0])
     use_quantized = _is_quantized_layer(lm_layer)
 
     _head_path = head_desc.path
@@ -2701,6 +2756,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0, loss_type="nll"):
             bi = layer.biases if _has_biases else None
             if bi is None and quant_mode == "affine":
                 bi = mx.zeros_like(sc)
+            w, sc, bi = _head_rows(_rows, w, sc, bi)
             steps = mx.arange(1, targets.shape[1] + 1)
             length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
             # Widen unsigned dtypes so mx.where can inject the signed -100; mx.where on uint crashes the torch-backed shim.
@@ -2743,7 +2799,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0, loss_type="nll"):
                 inputs = batch[:, :-1]
                 targets = labels[:, 1:]
             hidden = _get_backbone(model)(model, inputs)
-            w = _get_lm_weight_layer(model).weight
+            w, = _head_rows(_rows, _get_lm_weight_layer(model).weight)
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             steps = mx.arange(1, targets.shape[1] + 1)
@@ -4895,6 +4951,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None, los
     if logit_scale is not None:
         print(f"Unsloth: VLM CCE using logit_scale={logit_scale} for this model.")
     lm_layer = head_desc.module
+    _rows = _kept_head_rows(model, lm_layer.weight.shape[0])
     use_quantized = _is_quantized_layer(lm_layer)
     _head_path = head_desc.path
     # Evaluate once (after LoRA setup); trainability doesn't change mid-training.
@@ -4945,6 +5002,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None, los
             bi = getattr(lm_head, "biases", None)
             if bi is None and quant_mode == "affine":
                 bi = mx.zeros_like(sc)
+            w, sc, bi = _head_rows(_rows, w, sc, bi)
             # Quantized backward already returns zero weight/scales/biases gradients (see runtime_cce.py VJP), so
             # stop_gradient is redundant here even when the LM head is frozen.
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
@@ -4976,7 +5034,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None, los
             hidden, masked_targets, ntoks = _vlm_cce_forward(
                 model, batch_dict, image_token_ids=_image_token_ids,
                 assistant_token_id=_assistant_token_id)
-            w = _resolve_module_path(model, _head_path).weight
+            w, = _head_rows(_rows, _resolve_module_path(model, _head_path).weight)
             if _skip_weight_grad:
                 w = mx.stop_gradient(w)
             hidden_flat = hidden.reshape((-1, hidden.shape[-1]))

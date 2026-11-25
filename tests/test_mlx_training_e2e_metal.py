@@ -460,6 +460,96 @@ def test_a_checkpointed_layer_hands_its_shared_dict_writes_to_later_layers():
 
 
 @metal_only
+@pytest.mark.parametrize("appends", ["input", "output"])
+@pytest.mark.parametrize("keyword", [False, True])
+def test_a_checkpointed_layer_hands_its_list_appends_to_later_layers(appends, keyword):
+    # Inkling 2's layers append to `blocks`, the residual history every later layer mixes.
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(8, 8)
+
+        def __call__(self, x, blocks):
+            if blocks:
+                blocks[-1] = blocks[-1] * 0.5  # replaced in place, not appended
+            blocks.append(mx.stop_gradient(x * 2))  # a write with no gradient must not shift the others' cotangents
+            if appends == "input":
+                blocks.append(x)
+            out = self.proj(mx.stack([*blocks, x]).sum(0))
+            if appends == "output":
+                blocks.append(out)  # also an output: its cotangent must not be dropped
+            return out
+
+    mx.random.seed(0)
+    layers, x = [Layer() for _ in range(3)], mx.random.normal((2, 3, 8))
+
+    def loss(params, x):
+        for layer, p in zip(layers, params):
+            layer.update(p)
+        blocks = []
+        for layer in layers:
+            x = layer(x, blocks=blocks) if keyword else layer(x, blocks)
+        return (x ** 2).sum() + mx.stack(blocks).sum()
+
+    params = [layer.trainable_parameters() for layer in layers]
+    expected = mx.value_and_grad(loss, argnums=(0, 1))(params, x)
+    mlx_utils._patch_layer_class_for_gc(Layer)
+    try:
+        got = mx.value_and_grad(loss, argnums=(0, 1))(params, x)
+    finally:
+        mlx_utils._unpatch_layer_class_gc(Layer)
+    (loss_got, (grads, dx)), (loss_ref, (ref_grads, ref_dx)) = got, expected
+    assert mx.allclose(loss_got, loss_ref).item() and mx.allclose(dx, ref_dx, atol=1e-4).item()
+    for layer_grads, layer_ref in zip(grads, ref_grads):
+        for key in ("weight", "bias"):
+            assert mx.allclose(layer_grads["proj"][key], layer_ref["proj"][key], atol=1e-4).item()
+
+
+@metal_only
+@pytest.mark.parametrize("shared", [list, dict])
+def test_a_compiled_step_with_checkpointed_shared_writes_frees_its_layers(shared):
+    import gc
+    import weakref
+
+    class Layer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(8, 8)
+
+        def __call__(self, x, state):
+            if isinstance(state, list):
+                state.append(x)
+            else:
+                state[len(state)] = x
+            return self.proj(mx.stack(list(state.values()) if isinstance(state, dict) else state).sum(0))
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = [Layer() for _ in range(2)]
+
+        def __call__(self, x):
+            state = shared()
+            for layer in self.layers:
+                x = layer(x, state)
+            return (x ** 2).sum()
+
+    def run():
+        model = Model()
+        step = mx.compile(nn.value_and_grad(model, model), inputs=model.state, outputs=model.state)
+        mx.eval(step(mx.random.normal((2, 3, 8))))
+        return weakref.ref(model.layers[0])
+
+    mlx_utils._patch_layer_class_for_gc(Layer)
+    try:
+        ref = run()
+    finally:
+        mlx_utils._unpatch_layer_class_gc(Layer)
+    gc.collect()
+    assert ref() is None
+
+
+@metal_only
 @pytest.mark.parametrize("heads, T, dim, pays", [
     (8, 1536, 256, False), (8, 2048, 256, True), (8, 2048, 512, False), (8, 4096, 512, True)])
 def test_windowing_pays_only_past_the_break_even(heads, T, dim, pays):
@@ -1458,7 +1548,7 @@ def test_lora_sft_baseline_loss_value_clip(tmp_path):
 _NormTok = type("Tok", (), {"pad_token_id": 0, "eos_token_id": 0})
 
 
-def _cce_text_model(rows, dim, *, quantized, lora=False, calls=None, softcap=0.0):
+def _cce_text_model(rows, dim, *, quantized, lora=False, calls=None, softcap=0.0, kept=None):
     from types import SimpleNamespace
     from mlx_lm.tuner.lora import LoRALinear
     from unsloth_zoo.mlx.cce.runtime_cce import _apply_softcap
@@ -1498,11 +1588,12 @@ def _cce_text_model(rows, dim, *, quantized, lora=False, calls=None, softcap=0.0
             else:
                 self.lm_head = base
             self.args = SimpleNamespace(tie_word_embeddings=False, final_logit_softcapping=softcap)
+            self.config = SimpleNamespace(unpadded_vocab_size=kept)
 
         def __call__(self, ids):
             if calls is not None:
                 calls.append("model")
-            return _apply_softcap(self.lm_head(self.model(ids)), softcap)
+            return _apply_softcap(self.lm_head(self.model(ids)), softcap)[..., :kept]
 
     return Model()
 
@@ -1645,6 +1736,83 @@ def test_cce_rotates_hidden_states_into_a_hadamard_packed_head(monkeypatch, pack
     logits = model(ids[:, :-1]).astype(mx.float32)
     dense = nn.losses.cross_entropy(logits, ids[:, 1:], reduction="none")
     assert mx.allclose(ce, dense * supervised, atol=1e-4, rtol=1e-4).item()
+    model.get_input_embeddings = lambda *args, **kwargs: None
+    monkeypatch.setattr(mlx_utils, "_vlm_cce_forward", lambda m, b, **kwargs: (
+        m.model(b["input_ids"][:, :-1]), b["input_ids"][:, 1:], mx.array(b["input_ids"][:, 1:].size)))
+    vlm_loss = mlx_utils.make_vlm_cce_loss_fn(model)
+    assert vlm_loss._unsloth_cce_backend == "runtime-cce"
+    assert vlm_loss(model, {"input_ids": ids})[0].item() == pytest.approx(dense.mean().item(), rel=1e-4)
+
+
+@metal_only
+@pytest.mark.parametrize("vlm", [False, True])
+@pytest.mark.parametrize("own_knob", [False, True])
+def test_cce_reads_the_logit_softcap_from_the_text_config(monkeypatch, vlm, own_knob):
+    # Inkling 2 keeps final_logit_softcapping only on its text config; Gemma 4 turns its cap off by setting the knob
+    # on the model to None while its config keeps one.
+    from types import SimpleNamespace
+
+    mx.random.seed(0)
+    calls = []
+    model = _cce_text_model(2053, 64, quantized=False, softcap=0.0 if own_knob else 2.0, calls=calls)
+    model.args = SimpleNamespace(tie_word_embeddings=False)
+    model.config = SimpleNamespace(final_logit_softcapping=2.0)
+    if own_knob:
+        model.final_logit_softcapping = None
+    model.model.embed_tokens.weight *= 20  # logits well past the cap
+    ids = mx.random.randint(0, 2053, (1, 65))
+    logits = model(ids[:, :-1]).astype(mx.float32)
+    dense = nn.losses.cross_entropy(logits, ids[:, 1:], reduction="mean").item()
+    if vlm:
+        model.get_input_embeddings = lambda *args, **kwargs: None
+        monkeypatch.setattr(mlx_utils, "_vlm_cce_forward", lambda m, b, **kwargs: (
+            m.model(b["input_ids"][:, :-1]), b["input_ids"][:, 1:], mx.array(b["input_ids"][:, 1:].size)))
+        loss_fn = mlx_utils.make_vlm_cce_loss_fn(model)
+        run = lambda: loss_fn(model, {"input_ids": ids})[0]
+    else:
+        loss_fn = mlx_utils.make_cce_loss_fn(model)
+        run = lambda: loss_fn(model, ids, mx.array([[0, 65]], dtype=mx.int32))[0]
+    assert loss_fn._unsloth_cce_backend == "runtime-cce"
+    calls.clear()
+    assert run().item() == pytest.approx(dense, rel=1e-4)
+    assert "model" not in calls
+
+
+@metal_only
+@pytest.mark.parametrize("head", ["dense", "quantized", "lora"])
+def test_cce_scores_only_the_head_rows_the_forward_keeps(monkeypatch, head):
+    # Inkling 2 pads its head past the vocabulary and slices logits to unpadded_vocab_size.
+    from unsloth_zoo.mlx import preference
+
+    mx.random.seed(0)
+    lora = head == "lora"
+    calls = []
+    model = _cce_text_model(2049, 1024 if lora else 64, quantized=head == "quantized", lora=lora, calls=calls,
+                            kept=2049)
+    tokens = 2048 if lora else 64
+    # The last kept row is a target: scoring one row too few drops it.
+    ids = mx.concatenate([mx.random.randint(0, 2049, (1, tokens)), mx.array([[2048]])], axis=1)
+    lengths = mx.array([[0, tokens + 1]], dtype=mx.int32)
+    want = nn.value_and_grad(model, make_baseline_loss_fn())(model, ids, lengths)
+    loss_fn = mlx_utils.make_cce_loss_fn(model)
+    loss_fn = getattr(loss_fn, "_unsloth_compiled_loss_fn", loss_fn)
+    assert loss_fn._unsloth_cce_backend == ("runtime-cce-lora-head" if lora else "runtime-cce")
+    calls.clear()
+    got = nn.value_and_grad(model, loss_fn)(model, ids, lengths)
+    mx.eval(want, got)
+    assert "model" not in calls
+    assert got[0][0].item() == pytest.approx(want[0][0].item(), rel=1e-4)
+    for (_, expected), (_, actual) in zip(tree_flatten(want[1]), tree_flatten(got[1])):
+        assert mx.allclose(expected, actual, atol=1e-5, rtol=1e-3).item()
+    if lora:
+        return
+    logits = model(ids[:, :-1]).astype(mx.float32)
+    dense = nn.losses.cross_entropy(logits, ids[:, 1:], reduction="none")
+    score = preference._make_preference_cce_scorer(model)
+    ce, sums = score(model, ids, mx.ones(dense.shape, dtype=mx.bool_), differentiated=False)
+    assert score.vocab == 2049
+    assert mx.allclose(ce, dense, atol=1e-4, rtol=1e-4).item()
+    assert mx.allclose(sums, logits.sum(-1), atol=1e-2, rtol=1e-4).item()
     model.get_input_embeddings = lambda *args, **kwargs: None
     monkeypatch.setattr(mlx_utils, "_vlm_cce_forward", lambda m, b, **kwargs: (
         m.model(b["input_ids"][:, :-1]), b["input_ids"][:, 1:], mx.array(b["input_ids"][:, 1:].size)))
