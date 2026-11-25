@@ -2469,7 +2469,9 @@ def test_disable_xet_read_under_spawn_lock(monkeypatch):
     assert seen.get("held") is True
 
 
-# Pre-download is strict and fast-paths only the canonical model cache; post-download is lenient.
+# Conservative fast-path gate + pre/post-download acceptance split. The gate fast-paths ONLY the
+# unambiguous canonical model cache, deferring everything else to the watched child. Pre-download
+# (skip the child?) and post-download (accept the result?) are asymmetric: strict pre, lenient post.
 def _mk_snapshot(tmp_path, name):
     blob = tmp_path / "_blob"
     if not blob.exists():
@@ -2676,9 +2678,11 @@ def test_pre_download_does_not_skip_diffusers_but_post_accepts(tmp_path):
 
 
 def test_post_accepts_nonstandard_sharded_safetensors_names(tmp_path):
-    """Regression for issue 889: unsloth/Qwen3.5-4B shards with a non-standard mid-suffix name
-    (model.safetensors-00001-of-00002.safetensors) named in the index must be accepted, not raise
-    a spurious DownloadStallError; a missing shard is still rejected."""
+    """Regression for issue #889: unsloth/Qwen3.5-4B shards its safetensors with a NON-standard name that
+    keeps the format suffix in the middle (model.safetensors-00001-of-00002.safetensors), referenced that
+    way by model.safetensors.index.json. transformers enumerates the weight through the index, so the
+    post-download gate must accept it rather than raise a spurious DownloadStallError. Shard completeness
+    is still enforced: a missing shard is rejected, and the standard sharded layout is unaffected."""
     shards = ["model.safetensors-00001-of-00002.safetensors",
               "model.safetensors-00002-of-00002.safetensors"]
     # Complete cache with the non-standard shard names -> accepted (the #889 fix).
@@ -2712,9 +2716,10 @@ def test_post_accepts_nonstandard_sharded_safetensors_names(tmp_path):
 
 
 def test_pre_download_defers_sentence_transformers_missing_subfolder_weight(tmp_path):
-    """A weight-bearing ST subfolder (2_Dense) missing its weight must defer to the child, else the
-    ST load fetches it over un-killable Xet; a complete ST cache still fast-paths; weightless
-    Pooling needs no weight."""
+    """A sentence-transformers model reads a weight-bearing subfolder module (2_Dense) the canonical root
+    gate does not check, so a partial cache holding the root weight but missing the 2_Dense weight must
+    defer to the child (else the ST load fetches it over un-killable Xet). A weightless module (Pooling)
+    needs no weight, and a complete ST cache still fast-paths."""
     def _modules(*mods):
         return json.dumps([
             {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
@@ -2765,7 +2770,9 @@ def test_pre_download_defers_sentence_transformers_missing_subfolder_weight(tmp_
 
 
 def test_post_download_rejects_sentence_transformers_missing_known_subfolder_weight(tmp_path):
-    """POST rejects a known weight-bearing ST module missing its weight; unknown custom modules pass."""
+    """POST mirrors the ST subfolder guard but leniently: a KNOWN weight-bearing module (2_Dense) missing
+    its weight is rejected so it retries over HTTP, while an UNKNOWN / custom module type with no weight
+    must NOT false-reject a finished download."""
     def _modules(*mods):
         return json.dumps([
             {"idx": 0, "name": "0", "path": "", "type": "sentence_transformers.models.Transformer"},
@@ -2837,9 +2844,10 @@ def test_post_download_rejects_canonical_only_for_variant(tmp_path):
 
 
 def test_post_accepts_nonstandard_sharded_variant_names(tmp_path):
-    """Variant analog of issue 889: variant shards with a mid-name format suffix, missed by the
-    variant-weight regex, are enumerated via model.safetensors.index.fp16.json and must pass; a
-    missing shard is rejected."""
+    """Variant analog of #889: a variant sharded with NON-standard shard names the variant-weight regex
+    misses (the format suffix kept in the middle) is enumerated through model.safetensors.index.fp16.json,
+    so the post-download gate must accept it rather than raise a spurious DownloadStallError. Shard
+    completeness is still enforced via the index: a missing shard is rejected."""
     shards = ["model.fp16.safetensors-00001-of-00002.safetensors",
               "model.fp16.safetensors-00002-of-00002.safetensors"]
     snap, blob = _mk_snapshot(tmp_path, "varnonstd")
@@ -3119,7 +3127,8 @@ def test_post_download_checks_explicit_checkpoint_shard_completeness(tmp_path):
     (snap3 / "checkpoint-7" / "model-00001-of-00002.safetensors").symlink_to(blob3)  # lone, but not read
     assert xf._download_result_usable(
         snap3, repo_type = "model", allow_patterns = ["unet/*"], ignore_patterns = None) is True
-    # A targeted nested checkpoint still rejects a lone shard; scope matches at any leading segment.
+    # A nested checkpoint the request targets (allow=['foo/checkpoint-7/*']) still rejects its lone
+    # shard: the scope check matches a checkpoint dir at any leading segment.
     snap4, blob4 = _mk_snapshot(tmp_path, "ckpt_nested")
     (snap4 / "foo" / "checkpoint-7").mkdir(parents = True)
     (snap4 / "foo" / "checkpoint-7" / "model-00001-of-00002.safetensors").symlink_to(blob4)
@@ -3367,9 +3376,11 @@ def test_post_download_rejects_incomplete_diffusers_component_shards_unpatterned
 
 
 def test_post_accepts_nonstandard_sharded_diffusers_component_names(tmp_path):
-    """Diffusers analog of issue 889: a component sharded with the non-standard mid-suffix name,
-    enumerated via its component index, must pass, not raise a spurious DownloadStallError; an
-    ignored format is not rescued."""
+    """Diffusers analog of issue #889: a pipeline COMPONENT (unet/) sharded with the NON-standard name that
+    keeps the format suffix in the middle (diffusion_pytorch_model.safetensors-00001-of-00002.safetensors),
+    enumerated via unet/diffusion_pytorch_model.safetensors.index.json, must be accepted rather than raise a
+    spurious DownloadStallError. The presence check reads the component index like the root does; shard
+    completeness stays the component-shard check's job, and an ignored format is not rescued."""
     shards = ["diffusion_pytorch_model.safetensors-00001-of-00002.safetensors",
               "diffusion_pytorch_model.safetensors-00002-of-00002.safetensors"]
 
@@ -3390,6 +3401,7 @@ def test_post_accepts_nonstandard_sharded_diffusers_component_names(tmp_path):
         (snap / "vae" / "diffusion_pytorch_model.safetensors").symlink_to(blob)
         return snap
 
+    # Complete non-standard unet shards -> accepted (the fix).
     assert xf._download_result_usable(
         _pipe("diff_nonstd", shards), repo_type = "model", allow_patterns = None,
         ignore_patterns = None) is True
@@ -3411,9 +3423,10 @@ def test_post_accepts_nonstandard_sharded_diffusers_component_names(tmp_path):
 
 
 def test_diffusers_component_index_review_hardening(tmp_path):
-    """Component index: a component-scoped ignore matches its own base (not model.*), leaving the
-    component unproven; a malformed sidecar never counts; a variant load takes a canonical
-    fallback index only if its shards are complete."""
+    """Hardening of the component-index presence path: (a) a component-scoped ignore matches the component's
+    OWN base (not model.*), so ignoring unet/ weights leaves the component unproven; (b) a stale malformed
+    index sidecar is not accepted as a component index; (c) a variant load accepts a canonical FALLBACK
+    index only when its shards are complete (the variant completeness pass does not validate it)."""
     nonstd = ["diffusion_pytorch_model.safetensors-00001-of-00002.safetensors",
               "diffusion_pytorch_model.safetensors-00002-of-00002.safetensors"]
 
@@ -3594,8 +3607,10 @@ def test_post_download_diffusers_variant_presence_scoped_to_declared(tmp_path):
 
 
 def test_post_download_rejects_diffusers_missing_declared_component(tmp_path):
-    """Absent or config-only weight-bearing components fail (else the in-process pipeline load
-    fetches them over un-killable Xet); [null, null] and weightless components are exempt."""
+    """A declared weight-bearing component absent (or holding only its config) is retried over HTTP, not
+    accepted -- else the in-process pipeline load fetches the missing component over un-killable Xet. A
+    ``[null, null]`` (disabled) component and weightless components (scheduler / tokenizer) are not
+    required."""
     def _mi():
         return json.dumps({
             "_class_name": "StableDiffusionPipeline",
@@ -3676,7 +3691,10 @@ def test_post_download_rejects_diffusers_missing_declared_component(tmp_path):
 
 
 def test_post_download_rejects_diffusers_component_dir_without_weight_or_config(tmp_path):
-    """A component dir with no config.json, readable weight, or weightless sidecar is incomplete."""
+    """A declared active component dir that is non-empty but holds NEITHER a config.json NOR a readable
+    weight NOR a weightless sidecar (only a stray file or a nested checkpoint) is an incomplete model
+    component -> retried over HTTP, not accepted. A weightless component (its *_config.json sidecar) still
+    passes without a weight."""
     def _mi():
         return json.dumps({
             "_class_name": "StableDiffusionPipeline",
@@ -3725,8 +3743,9 @@ def test_post_download_rejects_diffusers_component_dir_without_weight_or_config(
 
 
 def test_post_download_rejects_diffusers_component_with_only_sidecar_weight(tmp_path):
-    """A non-canonical sidecar weight (unet/adapter_model.safetensors) does not make a component
-    warm: the pipeline still loads unet/diffusion_pytorch_model.* and would fetch it over Xet."""
+    """A declared component whose only weight is a non-canonical sidecar (unet/adapter_model.safetensors)
+    is NOT a warm component: the pipeline still loads unet/diffusion_pytorch_model.* and would fetch it
+    over Xet. Only the canonical component weight names count."""
     snap, blob = _mk_snapshot(tmp_path, "comp_sidecar_only")
     (snap / "model_index.json").write_text(json.dumps(
         {"_class_name": "P", "unet": ["diffusers", "UNet2DConditionModel"]}))
@@ -3742,8 +3761,9 @@ def test_post_download_rejects_diffusers_component_with_only_sidecar_weight(tmp_
 
 
 def test_post_download_diffusers_component_weight_must_be_at_component_root(tmp_path):
-    """Only a component-root weight counts; a stale nested copy must not mask a missing top-level
-    one, else the pipeline load fetches the real component weight over Xet."""
+    """A component weight counts only at the component ROOT (unet/diffusion_pytorch_model.safetensors); a
+    stale NESTED file (unet/old/diffusion_pytorch_model.safetensors) must not mask a missing top-level
+    weight, else the pipeline load fetches the real component weight over Xet."""
     snap, blob = _mk_snapshot(tmp_path, "comp_nested_only")
     (snap / "model_index.json").write_text(json.dumps(
         {"_class_name": "P", "unet": ["diffusers", "UNet2DConditionModel"]}))
@@ -3760,7 +3780,8 @@ def test_post_download_diffusers_component_weight_must_be_at_component_root(tmp_
 
 
 def test_post_download_disabled_diffusers_component_shard_index_not_rejected(tmp_path):
-    """A [null, null] disabled component is not loaded, so a stale shard index under it must not fail."""
+    """A [null, null] disabled component (safety_checker) that the pipeline does not load must not
+    force-fail a complete pipeline: a stale incomplete shard index under it is ignored by the shard check."""
     snap, blob = _mk_snapshot(tmp_path, "disabled_comp_stale_index")
     (snap / "model_index.json").write_text(json.dumps({
         "_class_name": "StableDiffusionPipeline",
@@ -3782,7 +3803,9 @@ def test_post_download_disabled_diffusers_component_shard_index_not_rejected(tmp
 
 
 def test_post_download_subfolder_single_weight_beats_stale_index(tmp_path):
-    """A single subfolder weight is read before a same-format index, so a stale index must not reject it."""
+    """In a selected subfolder, a single canonical weight is read before a same-format shard index
+    (transformers precedence), so a stale co-resident index must not false-reject the warm; a shard index
+    with no single is still required complete."""
     snap, blob = _mk_snapshot(tmp_path, "subdir_single_beats_index")
     enc = snap / "encoder"
     enc.mkdir()
@@ -3834,7 +3857,10 @@ def test_post_download_single_variant_beats_stale_variant_index(tmp_path):
 
 
 def test_post_download_variant_component_sidecar_is_not_warm(tmp_path):
-    """A variant component counts only canonical weights; a variant-named sidecar must not make it warm."""
+    """A variant diffusers load must count only CANONICAL component variant weights: a variant-named
+    SIDECAR (unet/adapter_model.fp16.safetensors) is not the weight the pipeline reads
+    (unet/diffusion_pytorch_model.fp16.*), so a component holding only the sidecar is retried over Xet,
+    not accepted. Mirrors the plain-branch canonical-basename filter."""
     snap, blob = _mk_snapshot(tmp_path, "variant_comp_sidecar_only")
     (snap / "model_index.json").write_text(json.dumps(
         {"_class_name": "P", "unet": ["diffusers", "UNet2DConditionModel"]}))
@@ -3852,7 +3878,9 @@ def test_post_download_variant_component_sidecar_is_not_warm(tmp_path):
 
 
 def test_post_download_diffusers_component_single_beats_stale_index(tmp_path):
-    """A component reads its single weight before a same-format index; a stale index must not reject it."""
+    """A diffusers pipeline component reads a single canonical weight before a same-format shard index in
+    its own subfolder, so a stale co-resident index must not false-reject a complete component; a component
+    holding only a stale index (no single) is still incomplete."""
     snap, blob = _mk_snapshot(tmp_path, "diff_comp_single_beats_index")
     (snap / "model_index.json").write_text(json.dumps(
         {"_class_name": "P", "unet": ["diffusers", "UNet2DConditionModel"]}))
@@ -3880,7 +3908,9 @@ def test_post_download_diffusers_component_single_beats_stale_index(tmp_path):
 
 
 def test_post_download_adapter_single_beats_stale_index(tmp_path):
-    """A PEFT adapter reads its single weight before its index; a stale adapter index must not reject it."""
+    """A PEFT adapter load (allow=['adapter_model*', 'adapter_config.json']) reads a single
+    adapter_model.safetensors before a shard index, so a stale co-resident adapter_model.safetensors.index.json
+    must not false-reject the warm; a sharded adapter missing a shard is still incomplete."""
     snap, blob = _mk_snapshot(tmp_path, "adapter_single_beats_index")
     (snap / "adapter_config.json").write_text("{}")
     (snap / "adapter_model.safetensors").symlink_to(blob)
@@ -3902,7 +3932,10 @@ def test_post_download_adapter_single_beats_stale_index(tmp_path):
 
 
 def test_post_download_model_component_stray_sidecar_rejected(tmp_path):
-    """A model component with only a stray sidecar is rejected: its weight-bearing class cannot pass."""
+    """A declared MODEL component (unet) holding only a stray weightless sidecar (a lone
+    tokenizer_config.json), no config.json and no weight, is an incomplete component -> rejected: its
+    declared class (UNet2DConditionModel) is weight-bearing, so a stray sidecar cannot pass it as
+    weightless. A genuinely weightless component (PNDMScheduler) needs no weight."""
     snap, blob = _mk_snapshot(tmp_path, "model_comp_stray_sidecar")
     (snap / "model_index.json").write_text(json.dumps({
         "_class_name": "StableDiffusionPipeline",
@@ -3927,7 +3960,10 @@ def test_post_download_model_component_stray_sidecar_rejected(tmp_path):
 
 
 def test_http_prep_empty_owned_set_scopes_to_nothing(tmp_path):
-    """An empty owned-set purges nothing, so a stall before any partial must pass None, not an empty set."""
+    """An EMPTY owned-set scopes the purge to nothing (own nothing -> delete nothing). A stall that fires
+    before the child opens any partial must therefore pass ownership=None (unscoped), not the empty set, or
+    an aged pre-existing stale blob/link is stranded for the retry to inherit. Documents the semantic the
+    stall path relies on when it normalises an empty ownership set to None."""
     repo = "ztest/empty-owned"
     repo_dir = tmp_path / f"models--{repo.replace('/', '--')}"
     blobs = repo_dir / "blobs"
@@ -4539,7 +4575,9 @@ def test_http_prep_scopes_blob_cleanup_to_owned_partials(tmp_path):
 # Tiered stall detection: a hang BEFORE the first byte used to be invisible.
 
 def test_connect_phase_hang_is_detected(hf_cache):
-    """A child stuck in DNS, TLS or metadata makes no .incomplete, so connect_timeout must govern it."""
+    """A child stuck in DNS / TLS / metadata never creates a .incomplete. The watchdog used to reset
+    its clock whenever no partial existed, so this state (a Xet download "hanging at 0%") could not
+    be detected at all; connect_timeout governs it now."""
     calls: list[str] = []
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
@@ -4556,7 +4594,8 @@ def test_connect_phase_hang_is_detected(hf_cache):
 
 
 def test_connect_grace_is_longer_than_the_stall_trip():
-    """Congested-link metadata is legitimately slow; only the active phase gets the 30s trip."""
+    """Metadata round trips on a congested link are legitimately slow; only the ACTIVE phase gets
+    the aggressive 30s trip."""
     assert xf.DEFAULT_CONNECT_TIMEOUT > xf.DEFAULT_STALL_TIMEOUT
     assert xf.DEFAULT_STALL_TIMEOUT == 30.0
     # HTTP is the fallback of last resort: killing it has nowhere left to go.
@@ -4568,7 +4607,8 @@ def test_connect_grace_is_longer_than_the_stall_trip():
     [(False, xf.DEFAULT_STALL_TIMEOUT), (True, xf.DEFAULT_HTTP_STALL_TIMEOUT)],
 )
 def test_default_stall_timeout_is_transport_aware(hf_cache, monkeypatch, xet_disabled, expected):
-    """No explicit timeout: aggressive on Xet, which can fall back; patient on HTTP, which cannot."""
+    """No explicit timeout: aggressive on Xet (a stall there has somewhere to fall back to), patient
+    on HTTP (it does not)."""
     defaults: dict[str, float] = {}
 
     def _record(name, default):
@@ -4597,7 +4637,8 @@ def test_stall_timeout_env_ignores_junk(monkeypatch, bad):
 
 
 def test_post_download_init_is_not_a_stall(hf_cache):
-    """After a partial appears and vanishes, post-download init and lock waits must not read as a stall."""
+    """Once a partial has appeared and then gone, the transfer is done: model init and lock waits
+    that follow must never be read as a stall."""
     blobs = _blobs_dir(hf_cache)
     part = blobs / "finishing.incomplete"
     part.write_bytes(b"\0" * 1024)
@@ -4608,8 +4649,9 @@ def test_post_download_init_is_not_a_stall(hf_cache):
         interval = 0.05, stall_timeout = 5.0, connect_timeout = 5.0,
     )
     try:
-        # Hold the partial long enough to be measured once; a short hold raced the unlink under
-        # load.
+        # Hold the partial long enough that the watchdog thread certainly measured it once: a 0.15s
+        # hold passed on an idle box but not under a loaded suite, where the thread could first run
+        # AFTER the unlink, and a watchdog that never saw a partial cannot tell finished from never started.
         time.sleep(0.6)
         part.unlink()                      # download completed
         (blobs / "finishing").write_bytes(b"\0" * 1024)
@@ -4620,7 +4662,9 @@ def test_post_download_init_is_not_a_stall(hf_cache):
 
 
 def test_lock_wait_behind_a_live_peer_is_not_a_stall(hf_cache):
-    """A lock waiter owns no .incomplete; repo-wide growth tells it apart from a child stuck connecting."""
+    """Two callers of the same uncached file serialise on the hub's per-file lock. The waiter owns no
+    .incomplete, so in watch_new_partials_only mode it looks like a child stuck before the first byte
+    and the connect clock killed it; repo-wide growth tells the two apart."""
     blobs = _blobs_dir(hf_cache)
     peer = blobs / "held-by-the-other-writer.incomplete"
     peer.write_bytes(b"\0" * 1024)
@@ -4664,7 +4708,9 @@ def test_connect_timeout_still_trips_when_nothing_is_moving(hf_cache):
 
 
 def test_empty_partial_gets_the_connect_deadline_not_the_stall_one(hf_cache):
-    """A pre-byte .incomplete must get the connect deadline; only received bytes mark the data phase."""
+    """An .incomplete created before the first byte must not consume the 30s data budget: hub/hf_xet
+    can open the destination before CAS setup finishes, so phasing on the file's existence handed a
+    healthy-but-slow connect the short deadline. Bytes mark the transition."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "opened-but-empty.incomplete").write_bytes(b"")
 
@@ -4700,7 +4746,9 @@ def test_a_partial_that_stops_growing_still_trips(hf_cache):
 
 
 def test_owned_partial_is_purged_even_when_freshly_killed(hf_cache):
-    """A killed child's partial must be purged, or has_active_incomplete_blobs forces a full re-download."""
+    """The child we just killed leaves a ~30s-old partial and the sibling grace is 180s. Sparing it
+    made has_active_incomplete_blobs() force force_download, re-downloading every complete shard over
+    the slower transport. Uses the real prepare (the autouse fixture stubs it out)."""
     blobs = _blobs_dir(hf_cache)
     mine = blobs / "killed-child.incomplete"
     theirs = blobs / "live-sibling.incomplete"
@@ -4718,7 +4766,10 @@ def test_owned_partial_is_purged_even_when_freshly_killed(hf_cache):
 
 
 def test_cached_blobs_do_not_consume_the_connect_budget(hf_cache):
-    """Repo-wide bytes include pre-existing blobs, so phasing on them wrongly latches the data deadline."""
+    """A snapshot whose config/tokenizer are already cached is still in its connect phase. Repo-wide
+    bytes include blobs completed before this download began, so phasing on that total latched the
+    data deadline and charged a healthy CAS setup the 30s budget instead of 90s -- i.e. every resume,
+    and every snapshot where a small file landed first."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "already-complete-config").write_bytes(b"\0" * 65536)  # no .incomplete suffix
     (blobs / "opened-but-empty.incomplete").write_bytes(b"")
@@ -4736,7 +4787,10 @@ def test_cached_blobs_do_not_consume_the_connect_budget(hf_cache):
 
 
 def test_a_child_buffering_from_the_network_is_not_a_stall(hf_cache, monkeypatch):
-    """Thin links show a flat .incomplete for minutes while healthy, so RSS, not rchar, is the sensor."""
+    """xet-core writes strictly sequentially, so a thin link shows a flat partial for minutes:
+    measured at a 20 Mbit/s proxy, 431 MB arrived while the .incomplete stayed at 0.5 MB for 171
+    consecutive seconds. RSS is the sensor because /proc io rchar counts VFS reads and reqwest reads
+    sockets with recv(2), so rchar is frozen on a healthy download."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "buffering.incomplete").write_bytes(b"\0" * 4096)
 
@@ -4801,7 +4855,10 @@ def test_the_buffering_grace_is_skipped_when_rss_is_unreadable(hf_cache, monkeyp
 
 
 def test_snapshot_lock_waiter_is_not_killed_while_a_peer_owns_the_partial(hf_cache, monkeypatch):
-    """Snapshot phase is repo-wide, so a lock waiter inherits the peer's bytes and must not be killed."""
+    """In snapshot mode the phase signal is repo-wide, so a lock waiter inherits the PEER's bytes and
+    lands in the data branch where its own disk and RSS are flat by definition. It was killed at
+    stall_timeout and charged a Xet failure, hitting the demotion threshold on a multi-rank launch's
+    first run."""
     blobs = _blobs_dir(hf_cache)
     peer = blobs / "owned-by-the-writer.incomplete"
     peer.write_bytes(b"\0" * (8 * 1024 * 1024))   # peer is buffering: present, fresh, not growing
@@ -4845,9 +4902,10 @@ def test_snapshot_child_that_owns_a_frozen_partial_still_trips(hf_cache, monkeyp
 
 
 def test_a_hang_between_snapshot_files_is_detected(hf_cache):
-    """No open partial is normal mid-snapshot (metadata and cache lock precede the next
-    .incomplete), so a hang between files must be caught; resetting there hid a hung child from
-    both clocks."""
+    """A snapshot does metadata and the cache lock BEFORE creating the next .incomplete, so "bytes
+    flowed and no partial is open" is a normal mid-download state, not only the finished one.
+    Resetting the clock there made a child hung between files invisible to both clocks forever once
+    any byte had been seen, so the connect clock only ever protected the FIRST file."""
     blobs = _blobs_dir(hf_cache)
     part = blobs / "first-file.incomplete"
     part.write_bytes(b"\0" * 1024)
@@ -4871,7 +4929,10 @@ def test_a_hang_between_snapshot_files_is_detected(hf_cache):
 
 
 def test_single_file_lock_waiter_survives_a_buffering_peer(hf_cache):
-    """A buffering peer's partial stays flat for minutes, so a waiter must not require continuous growth."""
+    """The peer's disk stays FLAT while it buffers, so growth alone cannot prove it is alive: a
+    healthy Xet transfer writes strictly sequentially and the .incomplete sat unchanged for 171s at
+    20 Mbit/s. Requiring continuous growth killed the waiter at connect_timeout while the lock holder
+    downloaded normally."""
     blobs = _blobs_dir(hf_cache)
     peer = blobs / "held-by-a-buffering-peer.incomplete"
     peer.write_bytes(b"\0" * 4096)          # present and fresh, and it never grows
@@ -4919,7 +4980,9 @@ def test_a_stale_peer_partial_does_not_mask_a_real_hang(hf_cache):
 
 
 def test_a_second_buffering_episode_after_a_drain_is_not_a_stall(hf_cache, monkeypatch):
-    """The buffer is reused across files, so later fills sit below the peak: baseline per episode."""
+    """xet's reconstruction buffer is a process-wide budget reused across files, so episode N+1
+    refills BELOW episode N's peak. A lifetime high-water baseline made that fill invisible and
+    killed a child receiving at wire rate, on any multi-shard snapshot."""
     blobs = _blobs_dir(hf_cache)
     part = blobs / "shard.incomplete"
     part.write_bytes(b"\0" * 4096)
@@ -4948,7 +5011,9 @@ def test_a_second_buffering_episode_after_a_drain_is_not_a_stall(hf_cache, monke
 
 
 def test_a_thin_link_buffering_slowly_is_not_a_stall(hf_cache, monkeypatch):
-    """Pins not comparing consecutive samples: an epsilon between polls would false-trip slow links."""
+    """Pins the decision NOT to compare consecutive samples: requiring the epsilon between polls
+    demands a sustained ~6.7 Mbit/s floor at production constants, so a slower link would false-trip
+    on its first buffering episode."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "slow.incomplete").write_bytes(b"\0" * 4096)
 
@@ -4974,7 +5039,9 @@ def test_a_thin_link_buffering_slowly_is_not_a_stall(hf_cache, monkeypatch):
 
 
 def test_a_later_snapshot_file_gets_the_connect_deadline_too(hf_cache):
-    """Latched seen_bytes charged later files the 30s data deadline instead of the connect clock."""
+    """The phase latch left files 2..N unprotected: once file 1 had bytes `seen_bytes` stayed true,
+    so file 2's empty .incomplete was charged the 30s data deadline with elapsed still running from
+    file 1's last write."""
     blobs = _blobs_dir(hf_cache)
     first = blobs / "file-one.incomplete"
     first.write_bytes(b"\0" * 4096)
@@ -4995,7 +5062,10 @@ def test_a_later_snapshot_file_gets_the_connect_deadline_too(hf_cache):
 
 
 def test_a_slow_peers_partial_stays_live_past_the_http_stall_window(hf_cache, monkeypatch):
-    """Peer liveness uses the suppression ceiling: slow links keep a peer's disk flat for minutes."""
+    """The peer liveness window used to be max(connect_timeout, 180s), only 9s above the measured
+    171s of flat disk at 20 Mbit/s, so any slower link expired the peer mid-transfer and killed the
+    waiter -- reaching the demotion threshold on a multi-rank launch's first run. The window is the
+    suppression ceiling now."""
     import os as _os
 
     blobs = _blobs_dir(hf_cache)
@@ -5022,7 +5092,9 @@ def test_a_slow_peers_partial_stays_live_past_the_http_stall_window(hf_cache, mo
 
 
 def test_a_peer_hold_after_bytes_is_bounded_by_the_ceiling(hf_cache, monkeypatch):
-    """The hold ceiling bounds post-byte suppression, since mtime no longer bounds a stale peer partial."""
+    """Widening the peer window to an hour means the mtime no longer bounds a stale leftover, so the
+    ceiling has to. The post-byte branches suppress while seen_bytes is true, exactly when the
+    pre-byte branch clears its bookkeeping, so they need a bound of their own."""
     import os as _os
     import threading as _threading
 
@@ -5065,13 +5137,15 @@ def test_a_peer_hold_after_bytes_is_bounded_by_the_ceiling(hf_cache, monkeypatch
 
 
 def test_a_link_below_the_rss_epsilon_rate_is_not_a_stall(hf_cache, monkeypatch):
-    """4 MiB over the 30s deadline is a 1.12 Mbit/s floor; xet writes only at head-of-line term
-    boundaries, so below it disk and RSS gain are both flat, killing healthy slow links; growth
-    above noise but below epsilon earns the patient deadline."""
+    """4 MiB over the 30s deadline is a 1.12 Mbit/s floor, and xet writes only at head-of-line term
+    boundaries, so under that rate the disk is flat AND the RSS gain is below the epsilon at once,
+    killing a healthy tethered-mobile or rural-DSL transfer mid-flight. Growth above the noise floor
+    but below the epsilon means receiving-but-slow and earns the patient deadline."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "shard.incomplete").write_bytes(b"\0" * 4096)   # opened, then flat for the whole run
 
-    # 400 KiB per tick: over the 256 KiB noise floor, under the 4 MiB epsilon.
+    # 400 KiB per 0.05s tick against a 0.4s deadline: over the 256 KiB noise floor, under the 4 MiB
+    # epsilon -- the regime that used to trip.
     rss = {"v": 100 * 1024 * 1024}
     monkeypatch.setattr(xf, "_child_rss", lambda _pid: rss["v"])
     monkeypatch.setattr(xf, "DEFAULT_HTTP_STALL_TIMEOUT", 30.0)
@@ -5092,7 +5166,9 @@ def test_a_link_below_the_rss_epsilon_rate_is_not_a_stall(hf_cache, monkeypatch)
 
 
 def test_a_frozen_child_still_trips_on_the_short_deadline(hf_cache, monkeypatch):
-    """Flat RSS and disk mean nothing arrives, so a frozen child must still trip the short deadline."""
+    """The patient deadline is for a child demonstrably receiving. Flat RSS plus flat disk means both
+    sensors say nothing is arriving, and must still fall back fast, else the slow-link fix would turn
+    every 30s stall into a 180s one."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "shard.incomplete").write_bytes(b"\0" * 4096)
 
@@ -5113,8 +5189,10 @@ def test_a_frozen_child_still_trips_on_the_short_deadline(hf_cache, monkeypatch)
 
 
 def test_a_whole_load_caller_is_not_charged_the_connect_clock(hf_cache):
-    """Whole-load callers normally see no partial, so only the partial-gated stall clock applies to
-    them; both connect trips would fire on a download that already succeeded."""
+    """Callers wrapping start_watchdog around the ENTIRE load_model see "no partial and a frozen byte
+    count" as the normal case: the repo is cached and the time goes into quantising to 4-bit. Both
+    connect trips would fire on a download that already succeeded. Only the stall clock, which needs
+    a demonstrably open partial, applies to them."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "cached-weights").write_bytes(b"\0" * 4096)   # fully cached, nothing in flight
 
@@ -5132,7 +5210,8 @@ def test_a_whole_load_caller_is_not_charged_the_connect_clock(hf_cache):
 
 
 def test_an_exited_child_is_finalising_not_hung(hf_cache):
-    """An exited child is finalising, not wedged, so tripping would wrongly charge a Xet failure."""
+    """An exited downloader cannot be wedged and its exit code is what the ladder acts on; tripping
+    would kill a dead process group and charge the machine a Xet failure it did not earn."""
     blobs = _blobs_dir(hf_cache)
     (blobs / "done").write_bytes(b"\0" * 4096)
 
