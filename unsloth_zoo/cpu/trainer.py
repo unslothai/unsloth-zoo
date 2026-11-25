@@ -579,7 +579,7 @@ def _kto_chunked_forward(trainer, original):
     from .ops import _plain_head_weight
 
     def scores(target, model, input_ids, attention_mask, labels):
-        pad = trainer.label_pad_token_id
+        pad = getattr(trainer, "label_pad_token_id", -100)  # TRL 0.27+ (trl.experimental.kto) hardcodes -100
         shifted = labels[:, 1:]
         loss_mask = shifted != pad
         # One target per position (the last one a dummy) so every position's logits sum is scored, as TRL sums them.
