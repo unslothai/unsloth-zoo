@@ -217,16 +217,17 @@ def chunked_hidden_states_selective_log_softmax(
     support_triton_sampler: bool = False,
     support_excluded_ids: Optional[torch.Tensor] = None,
     # Read in the default for the same Dynamo reason as max_rows_per_chunk. Pairs with vLLM's
-    # head_dtype=float32 that load_vllm requests under the same flag: on by default on CUDA (not ROCm),
-    # UNSLOTH_VLLM_FP32_LM_HEAD=0 turns both sides off.
+    # head_dtype=float32 that load_vllm requests under the same flag (UNSLOTH_VLLM_FP32_LM_HEAD=0 turns both off).
     fp32_lm_head: bool = (
-        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip().lower() in ("1", "true", "on", "yes")
-        or (
-            os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip() == ""
-            and torch.version.hip is None and torch.cuda.is_available()
-            and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
-            and hasattr(torch.ops.aten.mm, "dtype")
-        )
+        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes")
+    ),
+    # The default when the flag is unset: fp32 for a CUDA head only (not ROCm, aten::mm.dtype present), where the
+    # fused kernels' logits are float32-out already, so vLLM's default fp32 rollout head matches them.
+    fp32_lm_head_cuda: bool = (
+        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip() == ""
+        and torch.version.hip is None and torch.cuda.is_available()
+        and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
+        and hasattr(torch.ops.aten.mm, "dtype")
     ),
     # Older Unsloth scores old / ref log-probs here and the policy with the fused kernel: one scorer keeps ratio at 1.
     fused_linear: bool = (
@@ -236,6 +237,7 @@ def chunked_hidden_states_selective_log_softmax(
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
+    fp32_lm_head = fp32_lm_head or (fp32_lm_head_cuda and lm_head.is_cuda)
     # The fused kernel's logits are already float32-out wherever _FUSED_FP32_LOGITS holds, so an fp32 head keeps it.
     if (fused_linear and _chunked_logprob._FUSED_LINEAR
             and (not fp32_lm_head or _chunked_logprob.fused_fp32_logits_ok(lm_head))
@@ -375,13 +377,15 @@ def chunked_hidden_states_selective_log_softmax_recompute(
     # Same flag and default as chunked_hidden_states_selective_log_softmax, which scores old / ref
     # logps: entropy and recompute scoring must project the head in the same precision.
     fp32_lm_head: bool = (
-        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip().lower() in ("1", "true", "on", "yes")
-        or (
-            os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip() == ""
-            and torch.version.hip is None and torch.cuda.is_available()
-            and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
-            and hasattr(torch.ops.aten.mm, "dtype")
-        )
+        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes")
+    ),
+    # The default when the flag is unset: fp32 for a CUDA head only (not ROCm, aten::mm.dtype present), where the
+    # fused kernels' logits are float32-out already, so vLLM's default fp32 rollout head matches them.
+    fp32_lm_head_cuda: bool = (
+        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip() == ""
+        and torch.version.hip is None and torch.cuda.is_available()
+        and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
+        and hasattr(torch.ops.aten.mm, "dtype")
     ),
     fused_linear: bool = (
         os.environ.get("UNSLOTH_FUSED_LINEAR", "1") != "0"
@@ -393,6 +397,7 @@ def chunked_hidden_states_selective_log_softmax_recompute(
     # All Unsloth Zoo code licensed under AGPL3
     # Body-local: this source is copied into the generated trainer without its imports.
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
+    fp32_lm_head = fp32_lm_head or (fp32_lm_head_cuda and lm_head is not None and lm_head.is_cuda)
     # hidden_states None is the import-time build call below: it only sets up the recompute function.
     if (hidden_states is not None and fused_linear and _chunked_logprob._FUSED_LINEAR
             and (not fp32_lm_head or _chunked_logprob.fused_fp32_logits_ok(lm_head))):
@@ -640,16 +645,17 @@ chunked_hidden_states_selective_log_softmax_recompute(None, None, None)
 RL_REPLACEMENTS["grpo_selective_log_softmax_recompute"] = chunked_hidden_states_selective_log_softmax_recompute
 
 
-def grpo_fp32_lm_head_default():
-    """The scorers' fp32 lm_head default (their def-time `fp32_lm_head`), read now: UNSLOTH_VLLM_FP32_LM_HEAD=1 on,
-    =0 off, unset on for CUDA (not ROCm) with fp32 fused logits (torch >= 2.8, aten::mm.dtype)."""
+def grpo_fp32_lm_head_default(lm_head = None):
+    """The scorers' fp32 lm_head default for this head, read now: UNSLOTH_VLLM_FP32_LM_HEAD=1 on, =0 off, unset on
+    for a CUDA head (not ROCm) with fp32 fused logits (torch >= 2.8, aten::mm.dtype)."""
     value = os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip()
     if value.lower() in ("1", "true", "on", "yes"):
         return True
-    return (
+    return bool(
         value == "" and torch.version.hip is None and torch.cuda.is_available()
         and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
         and hasattr(torch.ops.aten.mm, "dtype")
+        and (lm_head is None or (torch.is_tensor(lm_head) and lm_head.is_cuda))
     )
 
 
@@ -657,7 +663,7 @@ def grpo_scorer_keeps_logits(support_kwargs = None, lm_head = None, **extra_kwar
     """True when GRPO falls back to the old chunked scorer, which keeps every chunk's logits for backward. An fp32
     head stays on the fused scorers where their logits are float32-out (CUDA; lm_head pins the device when given)."""
     support = dict(support_kwargs or {}, **extra_kwargs)
-    fp32_head = support.get("fp32_lm_head", grpo_fp32_lm_head_default())
+    fp32_head = support.get("fp32_lm_head", grpo_fp32_lm_head_default(lm_head))
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
     fused_fp32 = _chunked_logprob._FUSED_FP32_LOGITS if lm_head is None else _chunked_logprob.fused_fp32_logits_ok(lm_head)
     return bool(
@@ -1097,7 +1103,7 @@ def grpo_chunked_hidden_states_logprobs(
             env_rows = os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip()
             max_rows_per_chunk = int(env_rows) if env_rows.isdigit() else 0
         kwargs = dict(extra_kwargs)
-        kwargs.setdefault("fp32_lm_head", grpo_fp32_lm_head_default())
+        kwargs.setdefault("fp32_lm_head", grpo_fp32_lm_head_default(lm_head))
         return grpo_kept_set_logprobs(
             hidden_states, lm_head, index, chunks,
             logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
@@ -3859,7 +3865,11 @@ def grpo_accumulated_loss(
             zero3_partitioned_training as _zero3_training,
             _devices_without_native_bf16 as _no_native_bf16,
         )
-        _fp32_lm_head = _inspect.signature(_projector).parameters["fp32_lm_head"].default
+        _projector_params = _inspect.signature(_projector).parameters
+        _fp32_lm_head = _projector_params["fp32_lm_head"].default is True or (
+            "fp32_lm_head_cuda" in _projector_params and _projector_params["fp32_lm_head_cuda"].default is True
+            and lm_head.is_cuda
+        )
         try:
             import torch._functorch.config as _functorch_config
             # A backward compiled outside autocast saves the scorer's in-graph fp32 cast per call: pre-cast once instead.

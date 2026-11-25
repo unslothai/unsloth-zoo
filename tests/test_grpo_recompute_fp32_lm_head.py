@@ -114,11 +114,14 @@ def test_recompute_default_is_bit_identical_to_the_def_time_flag():
     assert torch.equal(a, b)
 
 
-# Unset is on for CUDA (not ROCm) with aten::mm.dtype, matching vLLM's default fp32 rollout head.
+# Unset: fp32 for CUDA heads (fp32_lm_head_cuda) on CUDA (not ROCm) torch with aten::mm.dtype, matching vLLM's
+# default fp32 rollout head.
 _AUTO = str(torch.version.hip is None and torch.cuda.is_available() and hasattr(torch.ops.aten.mm, "dtype"))
 
 
-@pytest.mark.parametrize("value, expected", [(None, f"{_AUTO} {_AUTO}"), ("0", "False False"), ("1", "True True")])
+@pytest.mark.parametrize("value, expected", [
+    (None, f"False False {_AUTO} {_AUTO}"), ("0", "False False False False"), ("1", "True True False False"),
+])
 def test_env_sets_both_defaults(value, expected):
     env = {k: v for k, v in os.environ.items() if k != "UNSLOTH_VLLM_FP32_LM_HEAD"}
     if value is not None:
@@ -129,7 +132,9 @@ def test_env_sets_both_defaults(value, expected):
         "import unsloth_zoo.rl_replacements as rr\n"
         "a = inspect.signature(rr.chunked_hidden_states_selective_log_softmax).parameters['fp32_lm_head'].default\n"
         "b = inspect.signature(rr.chunked_hidden_states_selective_log_softmax_recompute).parameters['fp32_lm_head'].default\n"
-        "print(a, b)\n"
+        "c = inspect.signature(rr.chunked_hidden_states_selective_log_softmax).parameters['fp32_lm_head_cuda'].default\n"
+        "d = inspect.signature(rr.chunked_hidden_states_selective_log_softmax_recompute).parameters['fp32_lm_head_cuda'].default\n"
+        "print(a, b, c, d)\n"
     )
     out = subprocess.run([sys.executable, "-c", code], env = env, capture_output = True, text = True, timeout = 600)
     assert out.returncode == 0, out.stderr[-2000:]

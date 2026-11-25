@@ -81,7 +81,7 @@ def test_fp32_head_gradients_flow():
 
 
 def test_default_is_bit_identical_to_the_def_time_flag():
-    # The default is the flag bound at import (on for CUDA hosts, off on CPU / ROCm or with =0), nothing else.
+    # A CPU head: the default is the explicit flag bound at import (the unset default covers CUDA heads only).
     import inspect
     flag = inspect.signature(chunked_hidden_states_selective_log_softmax).parameters["fp32_lm_head"].default
     states, weight, index = _inputs(2)
@@ -93,10 +93,13 @@ def test_default_is_bit_identical_to_the_def_time_flag():
     assert torch.equal(a, b)
 
 
+# Unset: fp32 for CUDA heads only (fp32_lm_head_cuda), on CUDA (not ROCm) torch with aten::mm.dtype.
 _AUTO_DEFAULT = str(torch.version.hip is None and torch.cuda.is_available() and hasattr(torch.ops.aten.mm, "dtype"))
 
 
-@pytest.mark.parametrize("value, expected", [(None, _AUTO_DEFAULT), ("0", "False"), ("1", "True")])
+@pytest.mark.parametrize("value, expected", [
+    (None, f"False {_AUTO_DEFAULT}"), ("", f"False {_AUTO_DEFAULT}"), ("0", "False False"), ("1", "True False"),
+])
 def test_env_sets_the_default(value, expected):
     # The default is bound when the function is defined, so probe a fresh interpreter.
     env = {k: v for k, v in os.environ.items() if k != "UNSLOTH_VLLM_FP32_LM_HEAD"}
@@ -106,7 +109,8 @@ def test_env_sets_the_default(value, expected):
     code = (
         "import inspect\n"
         "from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax as f\n"
-        "print(inspect.signature(f).parameters['fp32_lm_head'].default)\n"
+        "p = inspect.signature(f).parameters\n"
+        "print(p['fp32_lm_head'].default, p['fp32_lm_head_cuda'].default)\n"
     )
     out = subprocess.run([sys.executable, "-c", code], env = env, capture_output = True, text = True, timeout = 600)
     assert out.returncode == 0, out.stderr[-2000:]
@@ -183,7 +187,8 @@ def test_zero_opts_out_on_supported_vllm(monkeypatch):
 def test_trainer_default_reads_the_real_scorer():
     import inspect as _inspect
     ns = _exec_helpers("0.34.0")
-    real = _inspect.signature(chunked_hidden_states_selective_log_softmax).parameters["fp32_lm_head"].default
+    params = _inspect.signature(chunked_hidden_states_selective_log_softmax).parameters
+    real = params["fp32_lm_head"].default or params["fp32_lm_head_cuda"].default
     assert ns["_trainer_fp32_lm_head_default"]() is real
 
 
@@ -394,12 +399,14 @@ def test_flag_set_after_import_warns(monkeypatch, capsys, trainer_default, warns
 
 
 def test_flag_set_late_against_the_real_projectors(monkeypatch, capsys):
-    # Warns exactly when the real projectors were defined with the flag off (unset on CPU / ROCm, or =0).
+    # Warns exactly when the real projectors were defined with the flag off and no CUDA default (CPU / ROCm, or =0).
     import inspect
     import unsloth_zoo.rl_replacements as rl
     monkeypatch.setitem(sys.modules, "unsloth_zoo.rl_replacements", rl)
-    default = inspect.signature(rl.chunked_hidden_states_selective_log_softmax).parameters["fp32_lm_head"].default
-    assert _late_warning_helper()() is (default is False)
+    params = inspect.signature(rl.chunked_hidden_states_selective_log_softmax).parameters
+    assert _late_warning_helper()() is (
+        params["fp32_lm_head"].default is False and params["fp32_lm_head_cuda"].default is not True
+    )
 
 
 def test_load_vllm_warns_when_the_override_is_applied():

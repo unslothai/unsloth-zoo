@@ -155,7 +155,7 @@ def test_chunk_rows_floor():
 def test_grpo_accumulated_loss_routes_through_the_recompute_kernel():
     src = inspect.getsource(rr.grpo_accumulated_loss)
     assert "grpo_chunked_hidden_states_logprobs as chunked_hidden_states_selective_log_softmax" in src
-    assert "_keeps_logits()" in src
+    assert "_keeps_logits(lm_head = lm_head)" in src
 
 
 def _old(*args, **kwargs):

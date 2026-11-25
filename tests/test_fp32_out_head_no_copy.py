@@ -126,3 +126,23 @@ def test_fp32_out_linear_matches_the_fp32_copy_on_cuda(dtype):
     assert a_x.grad.dtype == dtype and a_w.grad.dtype == dtype
     for got, want in ((a_x.grad, b_x.grad), (a_w.grad, b_w.grad)):
         assert ((got.float() - want.float()).norm() / want.float().norm()).item() < 1e-2
+
+
+def test_unset_default_covers_cuda_heads_only(monkeypatch):
+    # fp32_lm_head_cuda (the unset default on CUDA hosts) leaves a CPU head on its 16-bit path, fused route included.
+    hidden, weight, index = _inputs(4)
+    with torch.no_grad():
+        for fused in (True, False):
+            auto = rr.chunked_hidden_states_selective_log_softmax(
+                hidden, weight, index, 3, 0.0, 0.0, 0.0, 1.0, fp32_lm_head = False, fp32_lm_head_cuda = True,
+                fused_linear = fused,
+            )
+            off = rr.chunked_hidden_states_selective_log_softmax(
+                hidden, weight, index, 3, 0.0, 0.0, 0.0, 1.0, fp32_lm_head = False, fp32_lm_head_cuda = False,
+                fused_linear = fused,
+            )
+            assert torch.equal(auto, off)
+    monkeypatch.delenv("UNSLOTH_VLLM_FP32_LM_HEAD", raising = False)
+    assert rr.grpo_fp32_lm_head_default(weight) is False
+    monkeypatch.setenv("UNSLOTH_VLLM_FP32_LM_HEAD", "1")
+    assert rr.grpo_fp32_lm_head_default(weight) is True

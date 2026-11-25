@@ -4589,7 +4589,8 @@ def _trainer_fp32_lm_head_default():
     # fp32 head is only requested where old / new logps project in fp32 too (CUDA, not ROCm, fp32 fused logits).
     try:
         from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax as scorer
-        return inspect.signature(scorer).parameters["fp32_lm_head"].default is True
+        params = inspect.signature(scorer).parameters
+        return any(name in params and params[name].default is True for name in ("fp32_lm_head", "fp32_lm_head_cuda"))
     except Exception:
         return False
 
@@ -4684,10 +4685,13 @@ def _warn_fp32_lm_head_set_late():
     stale = []
     for name in ("chunked_hidden_states_selective_log_softmax", "chunked_hidden_states_selective_log_softmax_recompute"):
         try:
-            default = inspect.signature(getattr(rl, name)).parameters["fp32_lm_head"].default
+            params = inspect.signature(getattr(rl, name)).parameters
+            default = params["fp32_lm_head"].default
         except Exception:
             continue
-        if default is False:
+        # The unset default already projects a CUDA head in fp32.
+        cuda_default = params["fp32_lm_head_cuda"].default if "fp32_lm_head_cuda" in params else False
+        if default is False and cuda_default is not True:
             stale.append(name)
     if stale:
         print(
