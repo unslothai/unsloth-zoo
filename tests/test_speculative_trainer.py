@@ -20,7 +20,9 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("transformers.models.qwen3_5")
 
 from datasets import Dataset
+from transformers import Trainer
 
+from unsloth_zoo.loss_utils import NUM_ITEMS_LABELS_ATTR, _unsloth_get_batch_samples
 from unsloth_zoo.speculative.capture import resolve_text_parts, run_frozen_target
 from unsloth_zoo.speculative.mtp import build_mtp_head
 from unsloth_zoo.speculative.stitch import load_saved_mtp_head
@@ -133,8 +135,19 @@ def test_evaluate_and_resume(tmp_path):
     assert resumed.state.global_step == 4
 
 
-def test_gradient_accumulation_matches_one_big_batch(tmp_path):
+@pytest.mark.parametrize("unsloth_counter", [False, True])
+def test_gradient_accumulation_matches_one_big_batch(tmp_path, monkeypatch, unsloth_counter):
     # Unequal lengths: averaging microbatch means would weight short rows more than long ones.
+    if unsloth_counter:
+        # Unsloth patches the batch counter, and its Trainer.__init__ wrapper clears the count marker.
+        init_trainer = Trainer.__init__
+
+        def unsloth_init(self, *args, model = None, **kwargs):
+            model.__dict__.pop(NUM_ITEMS_LABELS_ATTR, None)
+            init_trainer(self, *args, model = model, **kwargs)
+
+        monkeypatch.setattr(Trainer, "__init__", unsloth_init)
+        monkeypatch.setattr(Trainer, "get_batch_samples", _unsloth_get_batch_samples)
     target = _target()
     config = resolve_text_parts(target)["config"]
     gen = torch.Generator().manual_seed(2)
