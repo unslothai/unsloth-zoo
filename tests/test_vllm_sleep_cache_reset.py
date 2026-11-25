@@ -113,3 +113,52 @@ def test_double_patch_is_idempotent(vllm_utils, monkeypatch):
     fake.LLM().sleep()
     assert calls == ["reset_mm_cache", "reset_encoder_cache",
                      "gc_collect", "orig_sleep"]
+
+
+def test_nested_engine_sleep_collects_once(vllm_utils, monkeypatch):
+    # LLM.sleep -> llm_engine.sleep, both wrapped: caches still reset at each level, but one full gc per sleep.
+    calls = []
+
+    class LLMEngine:
+        def reset_encoder_cache(self):
+            calls.append("reset_encoder_cache")
+
+        def sleep(self, *args, **kwargs):
+            calls.append("engine_sleep")
+
+    class LLM:
+        def __init__(self):
+            self.llm_engine = LLMEngine()
+
+        def reset_mm_cache(self):
+            calls.append("reset_mm_cache")
+
+        def sleep(self, *args, **kwargs):
+            calls.append("orig_sleep")
+            self.llm_engine.sleep(*args, **kwargs)
+
+    fake = types.SimpleNamespace(LLM=LLM, LLMEngine=LLMEngine)
+    _install(vllm_utils, monkeypatch, fake, calls)
+
+    llm = LLM()
+    llm.sleep(1)
+    assert calls.count("gc_collect") == 1
+    assert calls[:4] == ["reset_mm_cache", "reset_encoder_cache", "gc_collect", "orig_sleep"]
+    assert calls[-2:] == ["reset_encoder_cache", "engine_sleep"]
+
+    # The guard resets: a second sleep collects again, and a raising inner sleep does not leave it stuck.
+    calls.clear()
+    llm.sleep(1)
+    assert calls.count("gc_collect") == 1
+
+    def boom(self, *a, **k):
+        raise RuntimeError("inner sleep failed")
+    monkeypatch.setattr(LLMEngine, "sleep", boom)
+    monkeypatch.setattr(LLMEngine, "_unsloth_reset_caches_on_sleep", False, raising=False)
+    vllm_utils.patch_vllm_reset_caches_on_sleep()
+    with pytest.raises(RuntimeError):
+        llm.sleep(1)
+    calls.clear()
+    llm.llm_engine.sleep = lambda *a, **k: calls.append("engine_sleep")
+    llm.sleep(1)
+    assert calls.count("gc_collect") == 1

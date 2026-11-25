@@ -133,8 +133,13 @@ def routing_replay_engine_args(config):
         )
         return {}
     args = {"enable_return_routed_experts": True}
-    if _vllm_at_least(0, 21) and not _vllm_at_least(0, 22) and "async_scheduling" in _engine_arg_names():
-        # vLLM 0.21 refuses routed experts capture with (default-on) async scheduling.
+    if "async_scheduling" in _engine_arg_names() and (
+        (_vllm_at_least(0, 21) and not _vllm_at_least(0, 22)) or _vllm_at_least(0, 31)
+    ):
+        # vLLM 0.21 refuses routed experts capture with (default-on) async scheduling. From 0.31 the capture
+        # goes through the aux output connector, and with async scheduling a prefix cache reset between two
+        # generate calls (merged rollouts, weight syncs) fails the next step with "auxiliary output
+        # generation changed with output in flight" (Qwen3-30B-A3B GRPO, vLLM 0.34, rollout 4).
         args["async_scheduling"] = False
     # Fused FlashInfer MoE kernels (auto on Blackwell) pick experts internally and leave the
     # capture all zeros (vllm-project/vllm#44116); the Triton backend goes through the hook.
@@ -413,7 +418,17 @@ def _build_replay(input_ids, position_ids, attention_mask = None):
             # Padding is what the mask leaves out, so real pad id tokens keep their routing.
             cols = [start + i for i in range(end - start) if mask_list[row][start + i]]
             if cols:
-                routed = _lookup(tuple(ids_list[row][c] for c in cols), exact = True)
+                attended = tuple(ids_list[row][c] for c in cols)
+                routed = _lookup(attended, exact = True)
+                if routed is None and pad is not None and pad in attended:
+                    # An attended pad id is a real token (pad == eos): dropping it would match
+                    # another history, so a miss keeps the natural routing.
+                    unmatched += len(cols)
+                    continue
+        elif pad is not None and pad in tokens:
+            # Packed segments hold only attended tokens: try the whole history first.
+            cols = list(range(start, end))
+            routed = _lookup(tuple(tokens), exact = True)
         if routed is None:
             cols = [start + i for i, t in enumerate(tokens) if pad is None or t != pad]
             if not cols:

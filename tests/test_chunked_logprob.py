@@ -155,7 +155,7 @@ def test_chunk_rows_floor():
 def test_grpo_accumulated_loss_routes_through_the_recompute_kernel():
     src = inspect.getsource(rr.grpo_accumulated_loss)
     assert "grpo_chunked_hidden_states_logprobs as chunked_hidden_states_selective_log_softmax" in src
-    assert "_keeps_logits()" in src
+    assert "_keeps_logits(lm_head = lm_head)" in src
 
 
 def _old(*args, **kwargs):
@@ -325,7 +325,9 @@ def test_rows_honour_the_opt_in_128_row_alignment(monkeypatch):
     ({"fp32_lm_head": True}, "chunked_hidden_states_selective_log_softmax"),
 ])
 def test_grpo_route_hands_support_and_fp32_head_calls_to_their_scorers(monkeypatch, extra, target):
-    # Kept-set calls take the recompute kept-set scorer, an fp32 head the old chunked function.
+    # Kept-set calls take the recompute kept-set scorer, an fp32 head the old chunked function (where the fused
+    # logits are 16-bit; float32-out fused logits keep the fused scorer).
+    monkeypatch.setattr(cl, "_FUSED_FP32_LOGITS", False)
     seen = []
     monkeypatch.setattr(rr, target, lambda *a, **k: seen.append(k) or "routed")
     hidden = torch.randn(1, 4, 8, requires_grad = True)
@@ -373,10 +375,15 @@ def test_grpo_scorer_keeps_logits_truth_table(monkeypatch):
     monkeypatch.delenv("UNSLOTH_GRPO_CHUNKED_LOGPROBS", raising = False)
     monkeypatch.delenv("UNSLOTH_VLLM_FP32_LM_HEAD", raising = False)
     monkeypatch.setattr(cl, "_FUSED_LINEAR", True)
-    assert not rr.grpo_scorer_keeps_logits()
+    monkeypatch.setattr(cl, "_FUSED_FP32_LOGITS", False)
+    assert not rr.grpo_scorer_keeps_logits(fp32_lm_head = False)
     assert rr.grpo_scorer_keeps_logits({"support_top_k": 20})
     assert rr.grpo_scorer_keeps_logits({"support_top_p": 0.9})
     assert rr.grpo_scorer_keeps_logits(fp32_lm_head = True)
+    # Fused logits already float32-out: an fp32 head stays on the fused scorer.
+    monkeypatch.setattr(cl, "_FUSED_FP32_LOGITS", True)
+    assert not rr.grpo_scorer_keeps_logits(fp32_lm_head = True)
+    monkeypatch.setattr(cl, "_FUSED_FP32_LOGITS", False)
     monkeypatch.setenv("UNSLOTH_GRPO_CHUNKED_LOGPROBS", "0")
     assert rr.grpo_scorer_keeps_logits()
     monkeypatch.delenv("UNSLOTH_GRPO_CHUNKED_LOGPROBS")

@@ -258,7 +258,7 @@ def test_packed_forward_scores_the_kept_eos(monkeypatch):
         "create_completion_attention_mask": _rl.create_completion_attention_mask,
         "device_synchronize": lambda *a, **k: None, "UNSLOTH_ENABLE_LOGGING": False,
         "trainer": trainer, "unwrapped_model": model, "lm_head": lm_head,
-        "input_ids": packed, "attention_mask": attention_mask, "pad_eos_rows": eos_rows,
+        "input_ids": packed, "attention_mask": attention_mask, "pad_eos_rows": eos_rows, "prompt_real_mask": None,
         "left_pad_tokens_per_prompt": left_pad, "max_left_pad": max_left_pad,
         "completion_mask": completion_mask, "logits_to_keep": keep,
         "total_rows": ids.shape[0], "batch_size": ids.shape[0], "_collective_forwards": False, "multiplier": 1,

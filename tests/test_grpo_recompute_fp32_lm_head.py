@@ -101,16 +101,25 @@ def test_recompute_fp32_head_gradients_match_plain():
         assert (a - b).abs().max().item() <= 2e-2 * b.abs().max().item()
 
 
-def test_recompute_off_is_bit_identical_to_default():
+def test_recompute_default_is_bit_identical_to_the_def_time_flag():
+    import inspect
     states, weight, index, _ = _inputs(2)
     recompute = _standalone()
+    flag = inspect.signature(recompute).parameters["fp32_lm_head"].default
     with torch.autocast(device_type = "cpu", dtype = torch.bfloat16):
         a = recompute(states, weight, index, 2, 0.0, 0.0, 0.0, 0.9)
-        b = recompute(states, weight, index, 2, 0.0, 0.0, 0.0, 0.9, fp32_lm_head = False)
+        b = recompute(states, weight, index, 2, 0.0, 0.0, 0.0, 0.9, fp32_lm_head = flag)
     assert torch.equal(a, b)
 
 
-@pytest.mark.parametrize("value, expected", [(None, "False False"), ("0", "False False"), ("1", "True True")])
+# Unset: fp32 for CUDA heads (fp32_lm_head_cuda) on CUDA (not ROCm) torch with aten::mm.dtype, matching vLLM's
+# default fp32 rollout head.
+_AUTO = str(torch.version.hip is None and torch.cuda.is_available() and hasattr(torch.ops.aten.mm, "dtype"))
+
+
+@pytest.mark.parametrize("value, expected", [
+    (None, f"False False {_AUTO} {_AUTO}"), ("0", "False False False False"), ("1", "True True False False"),
+])
 def test_env_sets_both_defaults(value, expected):
     env = {k: v for k, v in os.environ.items() if k != "UNSLOTH_VLLM_FP32_LM_HEAD"}
     if value is not None:
@@ -121,7 +130,9 @@ def test_env_sets_both_defaults(value, expected):
         "import unsloth_zoo.rl_replacements as rr\n"
         "a = inspect.signature(rr.chunked_hidden_states_selective_log_softmax).parameters['fp32_lm_head'].default\n"
         "b = inspect.signature(rr.chunked_hidden_states_selective_log_softmax_recompute).parameters['fp32_lm_head'].default\n"
-        "print(a, b)\n"
+        "c = inspect.signature(rr.chunked_hidden_states_selective_log_softmax).parameters['fp32_lm_head_cuda'].default\n"
+        "d = inspect.signature(rr.chunked_hidden_states_selective_log_softmax_recompute).parameters['fp32_lm_head_cuda'].default\n"
+        "print(a, b, c, d)\n"
     )
     out = subprocess.run([sys.executable, "-c", code], env = env, capture_output = True, text = True, timeout = 600)
     assert out.returncode == 0, out.stderr[-2000:]

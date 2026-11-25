@@ -818,3 +818,31 @@ def test_prefix_reuse_keeps_a_route_duplicate_captures_disputed():
         assert int(after.min()) >= -1
     finally:
         rr.reset_routing_replay()
+
+
+def test_attended_pad_id_history_miss_keeps_natural_routing(replay):
+    # pad == eos: the rollout had an EOS between 6 and 7; the trainer row attends a different
+    # history with the same tokens once pad ids are dropped. Its routes must not be borrowed.
+    rr._STATE.pad_token_id = PAD
+    routed = np.arange(6 * NUM_LAYERS * TOP_K).reshape(6, NUM_LAYERS, TOP_K) % NUM_EXPERTS
+    rr.record_routed_experts([_request([3, 4], [5, 6, PAD, 7], routed)])
+    other = torch.tensor([[3, 4, 5, 6, 7, PAD]])
+    assert rr._build_replay(other, None, torch.ones_like(other)) is None
+    stats = rr.routing_replay_stats()
+    assert stats["replayed_tokens"] == 0 and stats["unmatched_tokens"] == 6
+    # The rollout's own history, attended, still replays every token.
+    own = torch.tensor([[PAD, 3, 4, 5, 6, PAD, 7]])
+    mask = torch.tensor([[0, 1, 1, 1, 1, 1, 1]])
+    out = rr._build_replay(own, None, mask)
+    assert out is not None and torch.equal(out[1:6], torch.as_tensor(routed[:5]).long())
+
+
+def test_packed_segment_with_a_real_pad_id_replays_it(replay):
+    # Packed forwards have no mask: the segment is the attended history, real pad ids included.
+    rr._STATE.pad_token_id = PAD
+    routed = np.arange(6 * NUM_LAYERS * TOP_K).reshape(6, NUM_LAYERS, TOP_K) % NUM_EXPERTS
+    rr.record_routed_experts([_request([3, PAD, 4], [5, 6, 7], routed)])
+    packed = torch.tensor([[3, PAD, 4, 5, 6, 7]])
+    out = rr._build_replay(packed, torch.arange(6).unsqueeze(0))
+    assert out is not None and torch.equal(out[:5], torch.as_tensor(routed[:5]).long())
+    assert rr.routing_replay_stats()["unmatched_tokens"] == 0

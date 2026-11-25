@@ -720,6 +720,8 @@ def mxfp4_grouped_mm_available(device = None) -> bool:
     try:
         with torch.autocast(device.type, enabled = False), torch.no_grad():
             ok = _probe(device)
+    except torch.cuda.OutOfMemoryError:
+        return False  # transient: dequantize this call, probe again on the next one
     except Exception as exception:
         import warnings
         warnings.warn(f"Unsloth: fused MXFP4 grouped GEMM unavailable ({exception}); dequantizing instead.")

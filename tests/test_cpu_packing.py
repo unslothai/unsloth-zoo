@@ -152,12 +152,19 @@ def test_eval_packing_needs_a_padding_free_collator(monkeypatch, padding_free, p
 
 
 def test_eval_packing_collator_really_has_no_resets():
-    """The reason for the rule above: TRL's collator without padding_free emits an attention mask, no position_ids."""
+    """The reason for the rule above: before TRL 1.19 the collator without padding_free gives packed rows an attention
+    mask and no position_ids, so their examples attend across each other. TRL 1.19 resets position_ids for packed
+    rows (seq_lengths) itself; the rule is then only conservative, never unsafe."""
+    import trl
+    from packaging.version import Version
     from trl.trainer.sft_trainer import DataCollatorForLanguageModeling
     batch = DataCollatorForLanguageModeling(pad_token_id = 0, padding_free = False)(
         [{"input_ids": [5, 6, 7, 8, 9], "seq_lengths": [3, 2]}]
     )
-    assert "position_ids" not in batch and "attention_mask" in batch
+    if Version(trl.__version__).release < (1, 19):
+        assert "position_ids" not in batch and "attention_mask" in batch
+    else:
+        assert batch["position_ids"].tolist() == [[0, 1, 2, 0, 1]] and "attention_mask" not in batch
 
 
 @pytest.mark.parametrize("model", ["facebook/opt-125m", Path("/some/checkpoint")])

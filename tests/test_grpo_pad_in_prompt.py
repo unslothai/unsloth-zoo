@@ -163,7 +163,8 @@ def test_prompt_real_mask_is_none_without_a_real_pad_id_prompt_token():
     got = rl.grpo_prompt_real_mask(ids, att, KEEP, EOS)
     assert got is not None
     assert torch.equal(got[:, :-KEEP], att[:, :-KEEP].bool())
-    assert torch.equal(got[:, -KEEP:], ids[:, -KEEP:] != EOS)
+    # Completion section: TRL's completion_mask keeps each completion's EOS.
+    assert torch.equal(got[:, -KEEP:], att[:, -KEEP:].bool() | (ids[:, -KEEP:] != EOS))
     assert rl.grpo_prompt_real_mask(ids, None, KEEP, EOS) is None
     # Only when the pad id is an EOS id: an uninformative all-ones mask over real pads changes nothing.
     assert rl.grpo_prompt_real_mask(ids, att, KEEP, EOS, eos_token_ids = {EOS}) is not None
@@ -214,14 +215,15 @@ def test_old_or_ref_logps_without_the_promise_keep_the_id_layout(monkeypatch):
     assert torch.equal(got["new"], base["new"]) and torch.equal(got["mask"], base["mask"])
     assert model.seen[0] == base_model.seen[0]
 
-    # With the scorer's promise the prompt layout is used with old / ref logps too.
+    # With the scorer's promise the real-token layout is used with old / ref logps too.
     real = rl.grpo_prompt_real_mask(ids, att, KEEP, EOS)
     width = KEEP + int((~real[:, :-KEEP]).sum(1).max())
     old = torch.zeros(ids.shape[0], width)
     trainer = _trainer(EOS, _CausalModel(), beta = 0.04)
     trainer._unsloth_grpo_logps_prompt_from_mask = True
-    _loss_inputs(trainer, ids, att, cmask, old = old, ref = old.clone())
-    assert trainer.model.seen[0] == _intended(ids, att, EOS)
+    seen = _loss_inputs(trainer, ids, att, cmask, old = old, ref = old.clone())
+    assert trainer.model.seen[0] == _intended(ids, att, EOS, cmask)
+    assert _at_mask(seen["ids"], seen["mask"]) == _at_mask(ids[:, -KEEP:], cmask)
 
 
 def test_stored_old_logps_keep_the_prompt_layout_on_later_iterations(monkeypatch):
@@ -231,7 +233,6 @@ def test_stored_old_logps_keep_the_prompt_layout_on_later_iterations(monkeypatch
     _loss_inputs(trainer, ids, att, cmask, old_logps_from_new = True, store_old_logps = True)
     stored = trainer._unsloth_grpo_stored_old_logps
     assert stored._unsloth_grpo_prompt_from_mask is True
-    assert stored._unsloth_grpo_covers_eos is True
     assert not getattr(trainer, "_unsloth_grpo_logps_prompt_from_mask", False)
     # The next num_iterations pass gets them back as old_logps and keeps the same layout.
     trainer.model = _CausalModel()
@@ -243,3 +244,62 @@ def test_stored_old_logps_keep_the_prompt_layout_on_later_iterations(monkeypatch
     trainer.model = _CausalModel()
     _loss_inputs(trainer, ids, att, cmask, old = stored.clone())
     assert trainer.model.seen[0] != _intended(ids, att, EOS)
+
+
+def _multi_turn_batch(pad):
+    # Tool-calling completions: assistant turn, EOS, tool result (tool_mask 0), EOS, assistant turn, EOS.
+    # TRL's completion_mask is 1 over every sampled and tool token; the inner EOS tokens are real.
+    prompts = [[pad, pad, 5, EOS, 6, 7], [8, EOS, 9, EOS, 10, 11]]
+    prompt_mask = [[0, 0, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]]
+    comps = [[16, EOS, 3, 4, EOS, 17, EOS, pad], [18, 19, EOS, 3, EOS, 20, EOS, pad]]
+    cmask = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 0], [1, 1, 1, 1, 1, 1, 1, 0]])
+    tool = torch.tensor([[1, 1, 0, 0, 0, 1, 1, 1], [1, 1, 1, 0, 0, 1, 1, 1]])
+    ids = torch.tensor([p + c for p, c in zip(prompts, comps)])
+    att = torch.cat([torch.tensor(prompt_mask), cmask], 1)
+    return ids, att, cmask, tool
+
+
+@pytest.mark.parametrize("packing", [True, False])
+@pytest.mark.parametrize("beta", [0.0, 0.04])
+def test_multi_turn_inner_eos_stays_in_place(packing, beta, monkeypatch):
+    # pad == eos == the turn end: the EOS tokens inside a multi-turn completion are real tokens TRL trains on.
+    monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "1" if packing else "0")
+    ids, att, cmask, tool = _multi_turn_batch(EOS)
+    keep = ids.shape[1] - 6
+    model = _CausalModel()
+    trainer = _trainer(EOS, model, beta = beta)
+    old = ref = None
+    if beta:
+        # Old / ref logps from Unsloth's scorer, which lays rows out the same way.
+        trainer._unsloth_grpo_logps_prompt_from_mask = True
+        real = rl.grpo_prompt_real_mask(ids, att, keep, EOS)
+        old = torch.zeros(ids.shape[0], keep + int((~real[:, :-keep]).sum(1).max()))
+        ref = old.clone()
+    seen = {}
+    real_forward = rl.UnslothEfficientGRPO.forward
+
+    class _Capture:
+        @staticmethod
+        def apply(*args):
+            bound = inspect.signature(real_forward).bind(None, *args).arguments
+            seen.update(new = bound["_new_logps"].detach().clone(), mask = bound["_mask"].clone(),
+                        ids = bound["_input_ids"].clone())
+            z = torch.zeros(())
+            return z, z, z, z, z, z
+
+    monkeypatch.setattr(rl, "UnslothEfficientGRPO", _Capture)
+    monkeypatch.setattr(fg, "GRPO_FWD_GRAD", False)
+    rl.grpo_accumulated_loss(trainer, ids, att, keep, cmask, torch.zeros(ids.shape[0]), old, ref,
+                             loss_type = "dapo", num_items_in_batch = int((cmask * tool).sum()), tool_mask = tool)
+    # The forward sees TRL's tokens in order: prompt turn ends and every completion EOS.
+    intended = [ids[r][att[r].bool()].tolist() for r in range(ids.shape[0])]
+    assert model.seen[0] == intended
+    # The loss trains on exactly TRL's completion_mask * tool_mask tokens, in order.
+    want = [ids[r, -keep:][(cmask[r] * tool[r]).bool()].tolist() for r in range(ids.shape[0])]
+    assert _at_mask(seen["ids"], seen["mask"]) == want
+    ref_lp = _reference_logps(model, intended)
+    for r in range(ids.shape[0]):
+        got = seen["new"][r][seen["mask"][r].bool()]
+        n_comp = int(cmask[r].sum())
+        full = torch.tensor(ref_lp[r][-n_comp:])[tool[r][cmask[r].bool()].bool()]
+        assert torch.allclose(got, full, atol = 1e-5), (r, got, full)

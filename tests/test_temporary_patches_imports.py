@@ -92,6 +92,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.moe_routed",
     "unsloth_zoo.temporary_patches.moe_router_triton",
     "unsloth_zoo.temporary_patches.moe_routing_triton",
+    "unsloth_zoo.temporary_patches.moe_fp8_grouped",
     "unsloth_zoo.temporary_patches.moe_utils",
     "unsloth_zoo.temporary_patches.moe_utils_bnb4bit",
     "unsloth_zoo.temporary_patches.moe_utils_fp8",

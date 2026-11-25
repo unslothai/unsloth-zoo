@@ -227,7 +227,7 @@ def _launch(x, w, s, counts, out, transpose_b, block, launcher, lora_in = None, 
         E_POW2 = max(16, _pow2(E)), BSK = BSK, BSN = BSN,
         BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK, GROUP_M = group_m, EVEN_K = K % BK == 0,
         HAS_A2 = has_a2, BLOCK_K2 = max(16, _pow2(K2)),
-        num_warps = warps, num_stages = stages,
+        num_warps = warps, num_stages = stages, enable_fp_fusion = True,
     )
     return out
 
@@ -550,6 +550,8 @@ def fp8_fused_enabled(device) -> bool:
             with torch.cuda.device(device), torch.autocast(device.type, enabled = False), torch.no_grad():
                 ok = _probe(device)
             FP8_FUSED_STATS.update(before)
+    except torch.cuda.OutOfMemoryError:
+        return False  # transient: dequantize this call, probe again on the next one
     except Exception as exc:
         logger.warning(f"Unsloth: FP8 W8A16 grouped GEMM unavailable ({type(exc).__name__}: {exc}); dequantizing instead.")
         ok = False
