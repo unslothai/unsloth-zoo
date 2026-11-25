@@ -1123,13 +1123,12 @@ def test_auto_min_seq_is_off(monkeypatch, capability, hip, cuda, setting):
 
 @pytest.mark.parametrize("arch", ["gfx1151", "gfx1151:sramecc-:xnack-"])
 def test_auto_min_seq_on_measured_rocm_arch(monkeypatch, arch):
-    # gfx1151 (AMD CI): Qwen3-0.6B LoRA at 8192 tokens measured -5.6% to -14.2% per step.
     _fake_gpu(monkeypatch, (11, 5), hip = "7.13.0", arch = arch)
     assert SA.save_attention_auto_min_seq() == 8192
     assert SA._AUTO_ACTIVE[0] is True
     monkeypatch.setattr(SA, "_rocm_sdpa_is_kept", lambda device = None: True)
     assert SA._auto_frame_min_seq(torch.device("cuda", 0)) == 8192
-    # SDPA on this device decomposes (or no answer): no frame, so no graph breaks for nothing.
+    # SDPA not kept (or no answer): no frame.
     for kept in (False, None):
         monkeypatch.setattr(SA, "_rocm_sdpa_is_kept", lambda device = None, kept = kept: kept)
         assert SA._auto_frame_min_seq(torch.device("cuda", 0)) is None
@@ -1144,8 +1143,7 @@ def test_auto_min_seq_off_on_unmeasured_rocm_arch(monkeypatch, arch):
 
 
 def test_auto_min_seq_is_decided_per_device(monkeypatch):
-    # A mixed host: cuda:0 an A100 (8K), cuda:1 an L4 (16K), cuda:2 unmeasured. The router routes from the
-    # shortest; each checkpoint applies its own device's length, read from that device, not cuda:0.
+    # Mixed host: A100 (8K), L4 (16K), unmeasured; each checkpoint uses its own device's length.
     caps = {0: (8, 0), 1: (8, 9), 2: (9, 0)}
     _fake_gpu(monkeypatch, None)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 3)
@@ -1172,7 +1170,7 @@ def test_auto_declines_calls_shorter_than_the_frame_device_length(monkeypatch, a
     assert not SA._auto_admit(frame, [short])
     assert SA.SAVED_ATTENTION_STATS["declined_short"] == 1
     assert SA._auto_admit(frame, [long])
-    assert SA._auto_admit(SA.SavedAttentionFrame(auto = True), [short])  # no length for this device: as before
+    assert SA._auto_admit(SA.SavedAttentionFrame(auto = True), [short])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA (the real allocator's peak and free memory)")

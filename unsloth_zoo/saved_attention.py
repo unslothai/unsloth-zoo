@@ -163,8 +163,7 @@ def save_attention_offload():
 # Automatic mode: compute capability -> the shortest query length where Colab measured it faster
 # than the A/A noise (Qwen3-4B LoRA): T4 and A100 from 8K, L4 from 16K (noisy and +1.6% at 8K).
 _AUTO_MIN_SEQ = {(7, 5): 8192, (8, 0): 8192, (8, 9): 16384}
-# ROCm: gcnArchName -> the same, measured on AMD CI (Qwen3-0.6B LoRA, 8192 tokens): gfx1151 (Strix
-# Halo) -5.6% to -14.2% per step, losses bit-identical. Other gfx targets stay off until measured.
+# ROCm gcnArchName -> same; gfx1151 measured on AMD CI (-5.6% to -14.2%/step). Others off until measured.
 _AUTO_MIN_SEQ_ROCM = {"gfx1151": 8192}
 _AUTO_ACTIVE = [False]
 
@@ -189,11 +188,8 @@ def _auto_min_seq_override(min_seq):
 
 
 def save_attention_auto_min_seq(device = None):
-    """Automatic mode: the query length from which training attention calls should go through
-    saved_attention_call, or None when the mode is off (=0, an explicit setting, CPU, an unmeasured
-    GPU). With no ``device``, the shortest over the visible GPUs (a caller routes from there, before its
-    rank picks a GPU); each checkpoint then applies its own device's length. A caller that routes calls
-    marks the mode active, which turns on the frames."""
+    """Auto mode: query length from which attention routes through saved_attention_call, or None (off).
+    No ``device``: the shortest over visible GPUs (and marks the mode active); checkpoints apply their own."""
     if _save_attention_setting() != "auto":
         return None
     try:
@@ -398,9 +394,8 @@ class SavedAttentionFrame:
 
 
 def _auto_frame_min_seq(device):
-    """Automatic mode: the query length from which a checkpoint on ``device`` keeps attention, or None
-    for no frame (an unmeasured GPU; on ROCm also an SDPA that selects no kernel kept here, or no
-    answer). CPU / meta: 0 (no budget reading there, so nothing is kept anyway)."""
+    """Auto mode: min query length for a checkpoint on ``device``; None = no frame (unmeasured GPU, or
+    ROCm SDPA not kept). CPU / meta: 0 (no budget reading, nothing kept anyway)."""
     if device.type != "cuda":
         return 0
     min_seq = save_attention_auto_min_seq(device)
