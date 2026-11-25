@@ -237,7 +237,7 @@ def _nvfp4_scaled_module(kind, scale_name, *, with_pre_quant=False, pre_2d=False
     from mlx_vlm.quantization.nvfp4 import ScaledQuantizedLinear, ScaledQuantizedSwitchLinear
 
     if with_pre_quant and not _nvfp4_supports_pre_quant():
-        pytest.skip("Requires mlx-vlm with pre_quant_scale support")
+        pytest.skip("pre_quant_scale first ships in mlx-vlm 0.8.0; 0.7.8-0.7.10 constructors take three arguments")
     mx.random.seed(seed)
     if kind == "switch":
         base = QuantizedSwitchLinear(32, 16, 4, bias=False, group_size=16, bits=4, mode="nvfp4")
@@ -275,6 +275,18 @@ def _scaled_nvfp4_model(seed=7):
             self.model.layers = [_Block()]
 
     return _ToyModel()
+
+
+def test_scaled_nvfp4_linear_reports_unpacked_input_width():
+    nvfp4 = pytest.importorskip("mlx_vlm.quantization.nvfp4")
+    from unsloth_zoo.mlx.loader import _feeds_text_width, _semantic_dims
+
+    packed = nn.QuantizedLinear.from_linear(nn.Linear(32, 32, bias=False), 16, 4, mode="nvfp4")
+    head = nn.Module()
+    head.proj = nvfp4.ScaledQuantizedLinear(packed, mx.array(0.5), "weight_scale_2")
+    assert _semantic_dims(head.proj) == (32, 32)
+    # A packed width read as the input width would make a text-width head look like a projector.
+    assert not _feeds_text_width("aux_head", head, 32)
 
 
 def test_scaled_nvfp4_default_targets_and_adapter_reload(tmp_path):
