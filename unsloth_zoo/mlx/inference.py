@@ -7900,7 +7900,6 @@ def probe_gdn_pathsum():
 
 
 def _pathsum_head_layout(key_heads, value_heads):
-    # The path kernel is probed with two and three value heads sharing each key head.
     return (isinstance(key_heads, int) and isinstance(value_heads, int) and key_heads > 0
             and value_heads in (2 * key_heads, 3 * key_heads)
             and value_heads * 128 * 128 <= 1 << 32
@@ -8063,7 +8062,6 @@ def _verify_gdn(self, layer, inputs, cache, route, with_states, qk_eps, l2 = Fal
                     and (pending_a.dtype, pending_b.dtype) == (a.dtype, b.dtype)):
                 retained = (pending_k, pending_v, pending_a, pending_b, rows)
                 if tree is not None or pathsum:
-                    # Both tree and path-sum kernels can read a retained path in the original block.
                     retained = (*retained[:4], rows, attention._invariant_depths(pending_k.shape[1])) if retained_path is None else (*retained_path[:4], rows, retained_path[4])
                 fold = (*key, *(("pathsum",) if pathsum else ()), retained[0].shape[1], tree is not None), lambda: _verify_gdn_folded_block(
                     *block(pending_entry), pending = retained, l2 = l2, sigmoid = sigmoid, tree = tree, pathsum = pathsum)
