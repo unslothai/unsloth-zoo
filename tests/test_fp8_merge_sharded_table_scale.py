@@ -97,11 +97,9 @@ def test_sharded_table_decodes_with_shared_scale(tmp_path, order):
     for key, want in expected.items():
         assert out[key].dtype == torch.bfloat16, key
         assert torch.equal(out[key], want), key
-    # The shared scale is folded into every shard, then dropped once all of them are 16bit.
     assert f"{TABLE}.weight_scale" not in out
     assert out["model.language_model.layers.0.self_attn.q_proj.weight"].dtype == torch.bfloat16
     assert "model.language_model.layers.0.self_attn.q_proj.weight_scale" not in out
-    # A `*.weight_scale` that belongs to no fp8 weight is model state, not a quantization scale.
     assert torch.equal(out["model.language_model.layers.0.router.weight_scale"], torch.ones(4, dtype = torch.bfloat16))
 
 

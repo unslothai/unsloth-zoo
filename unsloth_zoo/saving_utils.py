@@ -3020,9 +3020,7 @@ pass
 _FP8_TABLE_SHARD = re.compile(r"^(.*)\.shard_\d+$")
 
 def _fp8_shared_shard_scale(file, header_metadata, base, extra_scale_lookup = None):
-    """Per-tensor scale shared by a row-sharded fp8 table: `<table>.shard_<i>.weight` decodes with the one
-    `<table>.weight_scale` (Qwen3.8-Flash-Next-FP8's n-gram table, 128 shards over many files). None unless
-    that scale exists and holds a single value, so a block or per-row scale is never broadcast."""
+    """`<table>.weight_scale` shared by `<table>.shard_<i>.weight` (Qwen3.8-Flash-Next-FP8 n-gram table); only a single value is broadcast."""
     m = _FP8_TABLE_SHARD.match(base)
     if m is None:
         return None
