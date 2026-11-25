@@ -17157,6 +17157,137 @@ def _sync_gguf_nextn_layer_config(config, model):
     return changed
 
 
+_INKLING2_SOURCE_ATTN = {
+    "q_proj": "wq_du", "k_proj": "wk_dv", "v_proj": "wv_dv", "r_proj": "wr_du", "o_proj": "wo_ud",
+    "gate_proj": "gate_attn", "sink_proj": "attn_sink_proj",
+    "q_scale": "q_l2_clip.scale", "rel_scale": "rel_l2_clip.scale", "rel_proj": "rel_logits_proj.proj",
+}
+_INKLING2_SOURCE_NORMS = {
+    "input_layernorm": "attn_norm", "post_attention_layernorm": "mlp_norm",
+    "q_input_layernorm": "q_input_norm", "k_input_layernorm": "k_input_norm", "v_input_layernorm": "v_input_norm",
+}
+_INKLING2_SOURCE_SCONV = {"conv.weight": "weight", "static_weight": "static_w", "weight_proj.weight": "weight_proj"}
+_INKLING2_SOURCE_VISION = (
+    (".layernorm_before.", ".ln_1."), (".layernorm_after.", ".ln_2."), (".mlp.fc1.", ".mlp.c_fc."),
+    (".mlp.fc2.", ".mlp.c_proj."),
+)
+
+
+def _inkling2_source_weights(weights):
+    """Invert mlx-vlm's inkling2 sanitize: mlx-vlm names -> the source checkpoint layout llama.cpp converts.
+    Returns {source name: (mlx-vlm name it is stored beside, tensor)}."""
+    out, experts = {}, {}
+    conv = lambda value: value.transpose(0, 2, 1)
+    for key, value in weights.items():
+        if key.startswith("language_model.model.layers."):
+            layer, sub = key[len("language_model.model.layers."):].split(".", 1)
+            base = f"model.llm.layers.{layer}."
+            if sub.startswith("mlp.switch_mlp."):
+                projection, _, leaf = sub[len("mlp.switch_mlp."):].partition(".")
+                if leaf != "weight":
+                    raise RuntimeError(f"Unsloth: cannot export the Inkling 2 expert tensor {key} to GGUF.")
+                experts.setdefault(layer, {})[projection] = (key, value)
+                continue
+            if sub.startswith("self_attn."):
+                sub = sub[len("self_attn."):]
+                stem, dot, leaf = sub.partition(".")
+                if stem in ("k_sconv", "v_sconv") and leaf in _INKLING2_SOURCE_SCONV:
+                    if leaf == "conv.weight":
+                        value = conv(value)
+                    sub = f"{stem}.{_INKLING2_SOURCE_SCONV[leaf]}"
+                else:
+                    sub = _INKLING2_SOURCE_ATTN.get(stem, stem) + dot + leaf
+                sub = "attn." + sub
+            elif sub in ("attn_sconv.conv.weight", "mlp_sconv.conv.weight"):
+                sub, value = sub.replace(".conv.weight", ".weight"), conv(value)
+            elif sub in ("mlp.gate_weight", "mlp.e_score_correction_bias"):
+                sub = "mlp.gate.weight" if sub == "mlp.gate_weight" else "mlp.gate.bias"
+            elif sub in ("attention_input.query", "mlp_input.query"):
+                kind = "attn_queries" if sub == "attention_input.query" else "mlp_queries"
+                out[f"model.llm.attn_res.{kind}.{int(layer) - (kind == 'attn_queries')}"] = (key, value)
+                continue
+            else:
+                stem, dot, leaf = sub.partition(".")
+                sub = _INKLING2_SOURCE_NORMS.get(stem, stem) + dot + leaf
+            out[base + sub] = (key, value)
+        elif key == "language_model.lm_head.weight":
+            out["model.llm.unembed.weight"] = (key, value)
+        elif key == "language_model.model.final_input.query":
+            out["model.llm.attn_res.output_query"] = (key, value)
+        elif key == "language_model.model.message_queries":
+            # [attn, k, v, mlp] per core layer -> the source's (attn, mlp) and (k, v) pairs.
+            width = value.shape[-1]
+            out["model.llm.middle_cycle_cross_pass_queries"] = (key, mx.stack([value[:, 0], value[:, 3]], axis=1).reshape(-1, width))
+            out["model.llm.middle_cycle_cross_pass_kv_queries"] = (key, value[:, 1:3].reshape(-1, width))
+        elif key.startswith("language_model.model."):
+            sub = key[len("language_model.model."):]
+            out["model.llm." + ("embed.weight" if sub == "embed_tokens.weight" else sub)] = (key, value)
+        elif key.startswith("vision_tower."):
+            sub = key[len("vision_tower."):]
+            if sub.startswith("pre_layernorm."):
+                sub = "ln_pre." + sub[len("pre_layernorm."):]
+            for old, new in _INKLING2_SOURCE_VISION:
+                sub = sub.replace(old, new)
+            for index in ("1", "2"):
+                if sub.endswith(f".lambda_{index}"):
+                    sub = sub[: -len(f".lambda_{index}")] + f".ls_{index}.gamma"
+            out["model.visual." + ("" if sub.startswith(("proj_in.", "proj_out.")) else "backbone.") + sub] = (key, value)
+        else:
+            out[key] = (key, value)
+    for layer, projections in experts.items():
+        base = f"model.llm.layers.{layer}.mlp.experts."
+        (gate_key, gate), (_, up) = projections["gate_proj"], projections["up_proj"]
+        *lead, inter, hidden = gate.shape
+        out[base + "w13_weight"] = (gate_key, mx.stack([gate, up], axis=-2).reshape(*lead, 2 * inter, hidden))
+        out[base + "w2_weight"] = projections["down_proj"]
+    return out
+
+
+_MLX_GGUF_SOURCE_LAYOUTS = {
+    "inkling2": _inkling2_source_weights,
+    "inkling2_loop": _inkling2_source_weights,
+}
+
+
+def _restore_mlx_gguf_source_layout(path):
+    """Rewrite the export dir into the source layout of a model registered in _MLX_GGUF_SOURCE_LAYOUTS; returns the
+    tensor count, or None when the model is not registered and the generic passes apply."""
+    path = Path(path)
+    config_path = path / "config.json"
+    if not config_path.exists():
+        return None
+    restore = _MLX_GGUF_SOURCE_LAYOUTS.get(json.loads(config_path.read_text()).get("model_type"))
+    if restore is None:
+        return None
+    files = sorted(path.glob("*.safetensors"))
+    weights, shard_of = {}, {}
+    for file in files:
+        for name, tensor in mx.load(str(file)).items():
+            weights[name], shard_of[name] = tensor, file.name
+    shards = {file.name: {} for file in files}
+    restored = restore(weights)
+    for name, (source, tensor) in restored.items():
+        shards[shard_of[source]][name] = tensor
+    del weights, restored, tensor
+    # Loaded arrays hold their source file open, so a shard can be replaced while a later one still reads it. Only the
+    # names are kept once a shard is written, so its evaluated tensors are not held while later shards are written.
+    for file in files:
+        tensors, shards[file.name] = shards[file.name], sorted(shards[file.name])
+        if tensors:
+            tmp_file = file.with_name(f"{file.stem}.tmp{file.suffix}")
+            mx.save_safetensors(str(tmp_file), tensors, metadata={"format": "mlx"})
+            os.replace(tmp_file, file)
+        else:
+            file.unlink()
+        del tensors
+    index_path = path / "model.safetensors.index.json"
+    if index_path.exists():
+        index_data = json.loads(index_path.read_text())
+        index_data["weight_map"] = dict(sorted((name, shard) for shard, tensors in shards.items() for name in tensors))
+        index_path.write_text(json.dumps(index_data, indent=4))
+    return sum(map(len, shards.values()))
+
+
 def _prepare_mlx_gguf_export_directory(
     path, model=None, replay_sanitizers=True, norm_offsets=_UNMEASURED,
     relaid_out=None,
@@ -19873,18 +20004,20 @@ def save_pretrained_gguf(
         is_vlm_model = _is_vlm_model(model)
         print("Unsloth: Merging LoRA weights and saving to 16-bit...")
         save_merged_model(model, tokenizer, tmp_path, dequantize=True)
-        # Measured once so both passes subtract against the same answer.
-        norm_offsets = _mlx_sanitizer_norm_offsets(model)
-        relaid_out = set()
-        rewritten = _prepare_mlx_gguf_export_directory(
-            tmp_path, model=model, replay_sanitizers=is_vlm_model,
-            norm_offsets=norm_offsets, relaid_out=relaid_out,
-        )
-        # Must run after the norm pass, whose offsets are keyed by the saved names.
-        rewritten += _prepare_moe_gguf_export_directory(
-            tmp_path, model=model, source_norm_offsets=norm_offsets,
-            source_layouts=relaid_out,
-        )
+        rewritten = _restore_mlx_gguf_source_layout(tmp_path)
+        if rewritten is None:
+            # Measured once so both passes subtract against the same answer.
+            norm_offsets = _mlx_sanitizer_norm_offsets(model)
+            relaid_out = set()
+            rewritten = _prepare_mlx_gguf_export_directory(
+                tmp_path, model=model, replay_sanitizers=is_vlm_model,
+                norm_offsets=norm_offsets, relaid_out=relaid_out,
+            )
+            # Must run after the norm pass, whose offsets are keyed by the saved names.
+            rewritten += _prepare_moe_gguf_export_directory(
+                tmp_path, model=model, source_norm_offsets=norm_offsets,
+                source_layouts=relaid_out,
+            )
         if rewritten:
             print(
                 f"Unsloth: Rewrote {rewritten} MLX tensors "

@@ -279,3 +279,59 @@ def _bytes_identical(actual, expected):
     """The same tensor as stored: dtype, shape and bits, not numeric equality."""
     return (actual.dtype == expected.dtype and actual.shape == expected.shape
             and bool(mx.all(mx.view(actual, mx.uint8) == mx.view(expected, mx.uint8))))
+
+
+@metal_only
+@pytest.mark.parametrize("model_type", ["inkling2", "inkling2_loop"])
+def test_inkling2_export_is_the_source_layout_mlx_vlm_sanitizes_back_bitwise(tmp_path, model_type):
+    """llama.cpp's Inkling 2 converter reads only the source checkpoint names, which mlx-vlm's sanitize maps from."""
+    ink = pytest.importorskip("mlx_vlm.models.inkling2.inkling2")
+    from mlx.utils import tree_map
+    from mlx_vlm.models.inkling2.config import ModelConfig
+    from unsloth_zoo.mlx.utils import _restore_mlx_gguf_source_layout
+
+    loop = {"loop_config": {"core_start": 2, "core_end": 4, "num_passes": 2, "gate_rank": 8, "is_varloop": False}} if model_type == "inkling2_loop" else {}
+    text = dict(model_type=f"{model_type}_text", vocab_size=256, hidden_size=128, num_hidden_layers=6, num_attention_heads=4,
+                num_key_value_heads=2, head_dim=32, swa_num_attention_heads=4, swa_num_key_value_heads=2, swa_head_dim=32,
+                sliding_window_size=8, local_layer_ids=[0, 1, 3, 4], d_rel=4, rel_extent=8, sconv_kernel_size=4,
+                intermediate_size=64, n_routed_experts=4, num_experts_per_tok=2, n_layers_per_attn_res_block=2, **loop)
+    vision = dict(hidden_size=64, num_hidden_layers=1, num_attention_heads=2, projection_hidden_dim=64, text_hidden_size=128)
+    config = {"model_type": model_type, "text_config": text, "vision_config": vision}
+    model = ink.Model(ModelConfig.from_dict(json.loads(json.dumps(config))))
+    if loop and "message_queries" not in model.language_model.model:
+        pytest.skip(reason="Inkling 2 Loop needs mlx-vlm >= 0.8.1")
+    mx.random.seed(0)
+    model.update(tree_map(lambda value: mx.random.normal(value.shape) * 0.05, model.parameters()))
+    params = dict(tree_flatten(model.parameters()))
+
+    # Up, then everything else, then gate projections: the fused expert tensor lands in the last shard and reads the first.
+    shard = lambda k: 1 if "up_proj" in k else 3 if "gate_proj" in k else 2
+    shards = {f"model-0000{i}-of-00003.safetensors": {k: v for k, v in params.items() if shard(k) == i} for i in (1, 2, 3)}
+    for shard, tensors in shards.items():
+        mx.save_safetensors(str(tmp_path / shard), tensors)
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {k: s for s, t in shards.items() for k in t}}))
+    (tmp_path / "config.json").write_text(json.dumps(config))
+
+    count = _restore_mlx_gguf_source_layout(tmp_path)
+    located = {k: file.name for file in sorted(tmp_path.glob("*.safetensors")) for k in mx.load(str(file))}
+    exported = {k: v for file in sorted(tmp_path.glob("*.safetensors")) for k, v in mx.load(str(file)).items()}
+    assert count == len(exported) and json.loads((tmp_path / "model.safetensors.index.json").read_text())["weight_map"] == located
+    mlx_only = ("self_attn.", "switch_mlp.", "layernorm", "message_queries", "embed_tokens", ".conv.", "gate_weight", "e_score",
+                "_input.query", "static_weight", "attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.o_proj", "attn.r_proj",
+                "attn.gate_proj", "attn.sink_proj", "q_scale", "rel_scale", "rel_proj")
+    assert not [k for k in exported if not k.startswith(("model.llm.", "model.visual."))]
+    assert not [k for k in exported if k.startswith("model.llm.") and any(s in k for s in mlx_only)]
+    assert not [k for k in exported if k.startswith("model.visual.") and any(s in k for s in ("layernorm", "lambda_", ".fc1.", ".fc2."))]
+    assert "model.llm.layers.1.mlp.experts.w13_weight" in exported and "model.llm.layers.2.attn.k_sconv.static_w" in exported
+    assert ("model.llm.middle_cycle_cross_pass_kv_queries" in exported) == bool(loop)
+    # The converter squeezes axis 1 of the [channels, 1, kernel] source convolutions; mlx-vlm accepts either layout.
+    for name in ("attn_sconv", "mlp_sconv", "attn.k_sconv", "attn.v_sconv"):
+        assert exported[f"model.llm.layers.0.{name}.weight"].shape[1:] == (1, 4), name
+    if loop:  # two queries per core layer, as the converter checks
+        assert exported["model.llm.middle_cycle_cross_pass_queries"].shape == exported["model.llm.middle_cycle_cross_pass_kv_queries"].shape == (4, 128)
+    assert {"model.visual.backbone.ln_pre.weight", "model.visual.proj_in.weight", "model.visual.proj_out.weight"} <= exported.keys()
+
+    restored = model.sanitize(exported)
+    assert restored.keys() == params.keys()
+    for name, value in params.items():
+        assert _bytes_identical(restored[name], value), name
