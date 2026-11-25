@@ -193,6 +193,37 @@ def _drop_inductor_cache_dir_in_compile_location():
 pass
 
 
+_ALLOW_CUSTOM_AUTOGRAD_ENV = "TORCHINDUCTOR_AUTOGRAD_CACHE_ALLOW_CUSTOM_AUTOGRAD"
+
+
+def allow_custom_autograd_functions_in_aot_cache():
+    """A compiled graph holding a custom autograd.Function (the fused LoRA in a compiled decoder
+    block) bypasses the AOTAutograd cache by default, so every warm start traces it again. Dynamo
+    traces the Function's forward and backward into the graph that keys the cache, so an edited
+    forward or backward misses. Torch reads the env var at import and it outranks this write, so
+    a user's TORCHINDUCTOR_AUTOGRAD_CACHE_ALLOW_CUSTOM_AUTOGRAD=0 keeps it off. Older torch lacks it."""
+    if _ALLOW_CUSTOM_AUTOGRAD_ENV in os.environ:
+        return False
+    try:
+        import torch._functorch.config as functorch_config
+    except Exception:
+        return False
+    name = "autograd_cache_allow_custom_autograd_functions"
+    if not hasattr(functorch_config, name):
+        return False
+    try:
+        # torch >= 2.12 keeps config per thread; checkpoint recomputes compile on autograd's thread.
+        from unsloth_zoo.torch_config import set_torch_config
+        set_torch_config(functorch_config, name, True)
+    except Exception:
+        try:
+            setattr(functorch_config, name, True)
+        except Exception:
+            return False
+    return getattr(functorch_config, name, False) is True
+pass
+
+
 def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     # All Unsloth Zoo code licensed under LGPLv3
     assert(type(debug) is bool)
@@ -255,6 +286,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     # AOTAutograd cache env override was renamed. Set the current name too so
     # backward graphs are also cached on disk across process restarts.
     os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "1")
+    allow_custom_autograd_functions_in_aot_cache()
 
     # Torch compile arguments
     torch_compile_arguments = [
