@@ -14,8 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""CPU CPO / SimPO: log-probs from the last hidden state in row chunks, equal to TRL's full-logits forward."""
-
 import dataclasses
 import os
 
@@ -45,17 +43,16 @@ def _trainer(tmp_path, dtype, bf16, lora = False, trainer_cls = None, loss_type 
     try:
         model, tokenizer = loader.FastCPUModel.from_pretrained(TINY, dtype = dtype, full_finetuning = not lora,
                                                                load_in_4bit = False)
-    except OSError as error:  # offline without the tiny model cached
+    except OSError as error:
         pytest.skip(f"{TINY} unavailable: {error}")
     assert getattr(model, "_unsloth_cpu_chunked_ce", False)
-    if lora:  # frozen lm_head: the _ChunkedLogProbs path behind PEFT's wrappers
+    if lora:
         model = loader.FastCPUModel.get_peft_model(model, r = 8, target_modules = ["q_proj", "v_proj"])
     config_cls, default_cls = _cpo()
     trainer_cls = trainer_cls or default_cls
     words = "the a cat dog sat ran on under mat tree big small red blue".split()
     g = torch.Generator().manual_seed(0)
     text = lambda n: " ".join(words[int(i)] for i in torch.randint(0, len(words), (n,), generator = g))  # noqa: E731
-    # Uneven lengths: padding inside both the chosen and the rejected halves.
     rows = [{"prompt": text(3 + i), "chosen": text(4 + 2 * i), "rejected": text(9 - i)} for i in range(4)]
     values = dict(output_dir = str(tmp_path), per_device_train_batch_size = 4, max_length = 48, max_prompt_length = 16,
                   report_to = "none", bf16 = bf16, beta = 0.1, remove_unused_columns = False, use_cpu = True,
@@ -76,7 +73,7 @@ def _step(trainer, model, forward, backward = True):
     model.zero_grad(set_to_none = True)
     calls = []
     head = _base_head(model)
-    # Counted on the class: a hook or an instance forward on the head itself sends it back to TRL's forward.
+    # Counted on the class: a hook on the head itself sends it back to TRL's forward.
     linear_forward = torch.nn.Linear.forward
 
     def counting(self, x):
@@ -119,7 +116,7 @@ def test_chunked_cpo_matches_trl_full_logits(tmp_path, monkeypatch, dtype, bf16,
         pytest.skip("no native bfloat16")
     trainer, model = _trainer(tmp_path, dtype, bf16, lora = lora, loss_type = loss_type, cpo_alpha = cpo_alpha)
     assert (trainer.loss_type, trainer.cpo_alpha) == (loss_type, cpo_alpha)
-    if chunk_rows is not None:  # several row chunks with a ragged last one
+    if chunk_rows is not None:
         monkeypatch.setenv("UNSLOTH_CPU_CE_CHUNK_ELEMENTS", str(chunk_rows * _base_head(model).weight.shape[0]))
     assert _base_head(model).weight.requires_grad is not lora
     chunked = trainer.concatenated_forward
@@ -134,10 +131,8 @@ def test_chunked_cpo_matches_trl_full_logits(tmp_path, monkeypatch, dtype, bf16,
         assert rows > 2 * chunk_rows and rows % chunk_rows, rows
     loss_c, metrics_c, grads_c, head_calls_c = _step(trainer, model, chunked)
     loss_s, metrics_s, grads_s, head_calls_s = _step(trainer, model, stock)
-    # The chunked path never runs lm_head (no [2B, L, V] logits); TRL's runs it once.
     assert (head_calls_c, head_calls_s) == (0, 1)
     assert loss_c == pytest.approx(loss_s, rel = tol, abs = tol)
-    # Evaluation (no grad): the frozen-scorer path.
     eval_c, _, _, eval_calls_c = _step(trainer, model, chunked, backward = False)
     eval_s, _, _, _ = _step(trainer, model, stock, backward = False)
     assert eval_calls_c == 0 and eval_c == pytest.approx(eval_s, rel = tol, abs = tol)
@@ -145,7 +140,7 @@ def test_chunked_cpo_matches_trl_full_logits(tmp_path, monkeypatch, dtype, bf16,
     assert any("logits" in key for key in metrics_s) and any("nll_loss" in key for key in metrics_s)
     for key in metrics_s:
         if "accuracies" in key and dtype != torch.float32:
-            continue  # chosen > rejected flips on bf16 rounding of near-equal random-model log-probs
+            continue  # flips on bf16 rounding
         assert metrics_c[key] == pytest.approx(metrics_s[key], rel = tol, abs = tol), key
     assert grads_c.keys() == grads_s.keys() and len(grads_s) > 0
     for name, grad in grads_s.items():
@@ -169,7 +164,6 @@ def test_opt_out_and_subclasses_keep_trl_forward(tmp_path, monkeypatch):
     trainer.__dict__.pop("concatenated_forward", None)
     assert _install_chunked_preference_forward(trainer) is False
 
-    # Overriding what the chunked forward replaces (the scoring) or feeds (the [B, L, V] logits consumer).
     class CustomLogps(trainer_cls):
         @staticmethod
         def get_batch_logps(logits, labels, average_log_prob = False, **kwargs):
@@ -200,7 +194,7 @@ def test_hooked_head_keeps_trl_scoring(tmp_path):
 
 
 def test_one_token_rows_match_trl(tmp_path):
-    """One-token rows leave no next-token target: TRL returns NaN (0 / 0), the chunked forward must not raise."""
+    """TRL returns NaN (0 / 0) here; the chunked forward must not raise."""
     trainer, model = _trainer(tmp_path, torch.float32, False, loss_type = "simpo", cpo_alpha = 0.5)
     chunked = trainer.concatenated_forward
     stock = type(trainer).concatenated_forward.__get__(trainer)
@@ -213,7 +207,6 @@ def test_one_token_rows_match_trl(tmp_path):
 
 
 def test_head_off_cpu_keeps_trl_forward():
-    """The chunked scorer allocates CPU buffers: a CPU-patched model moved to another device keeps TRL's forward."""
     import types
     from transformers import LlamaConfig, LlamaForCausalLM
     from unsloth_zoo.cpu.ops import patch_chunked_causal_lm_loss

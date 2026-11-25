@@ -497,17 +497,13 @@ def _orpo_chunked_forward(trainer, original):
 
 
 def _cpo_chunked_forward(trainer, original):
-    """TRL's CPO / SimPO concatenated_forward without the [2B, L, V] logits, as for ORPO: per-token log-probs come
-    from the last hidden state in row chunks. Its nll loss (CrossEntropyLoss over the chosen labels), sum or length
-    average log-probs and logits metric are these same per-token values. Only the plain decoder case; anything else,
-    or UNSLOTH_CPU_CHUNKED_PREFERENCE=0, runs TRL's own forward."""
+    """TRL's CPO / SimPO concatenated_forward without the [2B, L, V] logits, as for ORPO. Plain decoder only."""
 
     def concatenated_forward(model, batch):
         target = _chunked_head_target(trainer, model)
         if target is None or getattr(trainer, "label_pad_token_id", -100) != -100 \
                 or any(key in batch for key in ("pixel_values", "pixel_attention_mask", "image_sizes")):
             return original(model, batch)
-        # TRL 0.2x pads with padding_value, 1.x (trl.experimental.cpo) with pad_token_id.
         padding_value = getattr(trainer, "padding_value", None)
         if padding_value is None:
             padding_value = trainer.pad_token_id
@@ -519,24 +515,22 @@ def _cpo_chunked_forward(trainer, original):
         labels = concatenated["concatenated_labels"][:, 1:]
         label_mask = labels != -100
         if labels.shape != input_ids[:, 1:].shape or not torch.equal(labels[label_mask], input_ids[:, 1:][label_mask]):
-            return original(model, batch)  # labels that are not the next input token
-        # L targets (the last one a dummy) so mean_logits covers every position of TRL's [B, L, V] logits.
+            return original(model, batch)
+        # Dummy last target so mean_logits covers every position of TRL's logits.
         targets = torch.cat([input_ids[:, 1:], torch.zeros_like(input_ids[:, :1])], dim = 1)
         len_chosen = batch["chosen_labels"].shape[0]
         outputs = _chunked_token_logps(target, model, input_ids, attention_mask, targets)
         if outputs is None:
-            return original(model, batch)  # a wrapper replaced the patched forward
+            return original(model, batch)
         log_probs, mean_logits = outputs["log_probs"][:, :-1], outputs["mean_logits"]
         if trainer.cpo_alpha == 0:
             nll_loss = torch.tensor(0.0).to(trainer.accelerator.device)
         else:
-            # nn.CrossEntropyLoss (mean over the chosen rows' non-ignored labels).
             nll_loss = -log_probs[:len_chosen][label_mask[:len_chosen]].sum() / label_mask[:len_chosen].sum()
-        # get_batch_logps(average_log_prob = loss_type in ["ipo", "simpo"])
         all_logps = (log_probs * label_mask).sum(-1)
         if trainer.loss_type in ["ipo", "simpo"]:
             all_logps = all_logps / label_mask.sum(-1)
-        # TRL only ever takes .mean() of the logits it returns: per-position vocabulary means average to the same value.
+        # TRL only takes .mean() of these logits, so per-position means suffice.
         return (all_logps[:len_chosen], all_logps[len_chosen:], mean_logits[:len_chosen], mean_logits[len_chosen:],
                 nll_loss)
 
@@ -712,9 +706,8 @@ _CHUNKED_PREFERENCE_FORWARDS = {
 
 
 def _install_chunked_preference_forward(trainer):
-    """Per trainer instance: TRL's own ORPOTrainer and CPOTrainer (CPO / SimPO; trl.trainer up to 0.2x,
-    trl.experimental in 1.x) and TRL 0.2x's DPOTrainer / KTOTrainer (1.x has neither method: its fused LM head is
-    already chunked on CPU), not a subclass that overrides the replaced method or what it relies on / feeds (its scoring and logits consumer)."""
+    """TRL's own ORPO / CPO trainers and TRL 0.2x DPO / KTO (1.x's fused LM head is already chunked), not a
+    subclass overriding the replaced method or what it relies on / feeds."""
     if os.environ.get("UNSLOTH_CPU_CHUNKED_PREFERENCE", "1").strip().lower() in ("0", "false", "no", "off"):
         return False
     module = getattr(getattr(type(trainer), "get_batch_loss_metrics", None), "__module__", "") or ""
