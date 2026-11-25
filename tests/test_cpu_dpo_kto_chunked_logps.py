@@ -209,6 +209,30 @@ def test_chunked_bf16_close_to_trl(tmp_path, kind):
     _compare(trainer, model, method, 2e-2, 0.1)
 
 
+@pytest.mark.parametrize("preference", ["1", "0"], ids = ["chunked", "trl"])
+def test_bf16_kto_lora_step_trains_the_adapters(tmp_path, monkeypatch, preference):
+    """KTO scores the KL completions under no_grad before the policy pass, inside the trainer's one autocast region:
+    a cached cast of the fp32 adapters left them without gradients, and gradient checkpointing's recompute failed.
+    UNSLOTH_CPU_BF16=1 forces bf16 so runners without native bf16 run it too (emulated, slower)."""
+    from unsloth_zoo.cpu import runtime
+    monkeypatch.setenv("UNSLOTH_CPU_BF16", "1")
+    monkeypatch.setenv("UNSLOTH_CPU_CHUNKED_PREFERENCE", preference)
+    runtime.cpu_bf16_supported.cache_clear()
+    try:
+        trainer, model, method = _trainer(tmp_path, "KTO", dtype = torch.bfloat16, bf16 = True, max_steps = 1,
+                                          learning_rate = 1e-2, save_strategy = "no", logging_steps = 1)
+        assert trainer.args.bf16 and trainer.accelerator.mixed_precision == "bf16"
+        assert getattr(getattr(trainer, method), "_unsloth_cpu", False) is (preference == "1")
+        before = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
+        assert before and all(p.dtype == torch.float32 for p in before.values())
+        trainer.train()
+    finally:
+        runtime.cpu_bf16_supported.cache_clear()
+    moved = [n for n, p in model.named_parameters() if n in before and not torch.equal(before[n], p.detach())]
+    # LoRA B starts at zero, so the first step moves exactly the B matrices.
+    assert sorted(moved) == sorted(n for n in before if "lora_B" in n)
+
+
 @pytest.mark.parametrize("kind", ["DPO", "KTO"])
 def test_opt_out_and_subclasses_keep_trl_forward(tmp_path, monkeypatch, kind):
     monkeypatch.setenv("UNSLOTH_CPU_CHUNKED_PREFERENCE", "0")

@@ -384,10 +384,38 @@ def _patch_cpu_fp16_accelerator(trainer_cls):
             import torch
             accelerator.native_amp = True
             accelerator.scaler = torch.amp.GradScaler("cpu")
+        if accelerator is not None and accelerator.device.type == "cpu" and accelerator.native_amp:
+            _disable_cpu_autocast_cache(accelerator)
         return result
 
     create_accelerator_and_postprocess._unsloth_cpu = True
     trainer_cls.create_accelerator_and_postprocess = create_accelerator_and_postprocess
+
+
+def _disable_cpu_autocast_cache(accelerator):
+    """torch.autocast caches the low-precision copy of a fp32 leaf weight (PEFT keeps LoRA adapters in fp32) for the
+    whole outermost autocast region, and caches it even under no_grad. KTO's no_grad KL pass then hands the policy pass
+    a detached copy: the adapters get no gradient, and with gradient checkpointing the recompute fails on mismatched
+    metadata. The model's own bf16 weights are never cast, so turning the cache off only re-casts the small adapters."""
+    from accelerate.utils import AutocastKwargs
+    handler = accelerator.autocast_handler
+    accelerator.autocast_handler = AutocastKwargs(enabled = handler.enabled if handler is not None else True,
+                                                  cache_enabled = False)
+
+
+def _patch_cpu_autocast_cache(trainer_cls):
+    """transformers 4.x enters its own CPU autocast around compute_loss (cache on by default); 5.x leaves autocast to
+    accelerate, whose handler _disable_cpu_autocast_cache already covers."""
+    original = getattr(trainer_cls, "autocast_smart_context_manager", None)
+    if original is None or getattr(original, "_unsloth_cpu", False):
+        return
+
+    @functools.wraps(original)
+    def autocast_smart_context_manager(self, cache_enabled = True):
+        return original(self, cache_enabled = False)
+
+    autocast_smart_context_manager._unsloth_cpu = True
+    trainer_cls.autocast_smart_context_manager = autocast_smart_context_manager
 
 
 def _chunked_ce_model(trainer, model):
@@ -864,6 +892,7 @@ def install_cpu_training_defaults():
     if hasattr(Trainer, "create_accelerator_and_postprocess"):
         _patch_cpu_fp16_accelerator(Trainer)
         _patch_cpu_preference_trainers(Trainer)
+    _patch_cpu_autocast_cache(Trainer)
     try:
         import trl
         from trl.trainer import sft_trainer
