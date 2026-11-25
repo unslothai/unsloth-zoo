@@ -202,6 +202,8 @@ def test_temporary_patch_exposes_original_init_for_probe(
         "process_output_options",
         "process_return",
         "raise_error",
+        "cache_kwarg_name",
+        "output_cache",
     ):
         setattr(utils, name, lambda *args, **kwargs: None)
     for name in (
