@@ -641,13 +641,18 @@ def patch_chunked_causal_lm_loss(model):
                 past_key_values = past_key_values, inputs_embeds = inputs_embeds, use_cache = use_cache, **kwargs,
             )
             hidden = outputs.last_hidden_state if hasattr(outputs, "last_hidden_state") else outputs[0]
-            hidden = hidden[:, :-1].to(head_weight.dtype)
             batch_size, length = logps_targets.shape
-            log_probs, _, _, mean_logits, _ = cpu_chunked_log_probs(
+            # targets[:, t] is scored by position t: L - 1 targets (ORPO) drop the last position, L (DPO / KTO) keep it.
+            hidden = hidden[:, :length].to(head_weight.dtype)
+            wanted = ("mean_logits", "log_sum_sq_probs") if vars(self).get("_unsloth_cpu_logps_sq", False) else ("mean_logits",)
+            log_probs, _, sq, mean_logits, _ = cpu_chunked_log_probs(
                 hidden.reshape(batch_size * length, hidden.shape[-1]), head_weight, None, logps_targets.reshape(-1), 1.0, None,
-                outputs = ("mean_logits",),
+                outputs = wanted,
             )
-            return {"log_probs": log_probs.view(batch_size, length), "mean_logits": mean_logits.view(batch_size, length)}
+            result = {"log_probs": log_probs.view(batch_size, length), "mean_logits": mean_logits.view(batch_size, length)}
+            if sq is not None:
+                result["log_sum_sq_probs"] = sq.view(batch_size, length)
+            return result
         if (labels is None and shift_labels is None) or not torch.is_grad_enabled() \
                 or not getattr(self, "_unsloth_cpu_chunked_ce_active", False) or head_weight is None:
             if shift_labels is not None:
