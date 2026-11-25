@@ -188,6 +188,33 @@ def test_interleave_cache_is_tied_to_the_source_weight(monkeypatch):
     assert not S._INTERLEAVE_CACHE
 
 
+def test_interleave_cache_built_in_inference_mode_is_saved_for_backward(monkeypatch):
+    # generate() runs under inference_mode and fills the cache; the next training step hits it and
+    # _SonicGatedGroupedMM saves the interleaved weight for backward. The sonic GEMMs are torch math here.
+    monkeypatch.setenv("UNSLOTH_MOE_SONIC_CACHE_GIB", "1")
+    S._INTERLEAVE_CACHE.clear()
+
+    def grouped(A, B, cu):
+        return torch.cat([A[cu[e]:cu[e + 1]] @ B[e] for e in range(B.shape[0])])
+
+    def gated(module, A, B, C, cu, concat_b=True):
+        pre = grouped(A, B, cu)
+        return pre, F.silu(pre[..., 0::2]) * pre[..., 1::2]
+
+    monkeypatch.setattr(S, "get_sonic_module", lambda: None)
+    monkeypatch.setattr(S, "_sonic_gated", gated)
+    monkeypatch.setattr(S, "_sonic_gemm", lambda module, A, B, cu, concat_b=False: grouped(A, B, cu))
+    base = torch.randn(2, 16, 8)
+    cu = torch.tensor([0, 3, 6], dtype=torch.int32)
+    offsets = torch.tensor([3, 6], dtype=torch.int32)
+    with torch.inference_mode():
+        S._interleaved_gate_up(base)
+    weight = S._interleaved_gate_up(base)
+    lora = torch.randn(16, 16, requires_grad=True)
+    S._SonicGatedGroupedMM.apply(torch.randn(6, 16) @ lora, None, cu, weight, offsets).sum().backward()
+    assert lora.grad is not None and torch.isfinite(lora.grad).all() and not weight.is_inference()
+
+
 def test_sonic_availability_probe_runs_outside_dynamo(monkeypatch):
     from unsloth_zoo.temporary_patches import moe_utils as MU
 
