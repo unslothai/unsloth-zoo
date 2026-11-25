@@ -36,6 +36,7 @@ NAMES = (
     "_UNTRUNCATED_CAPTURE",
     "patch_vllm_untruncated_logprobs",
     "set_vllm_untruncated_logprobs",
+    "_vllm_engine_speculative",
 )
 
 
@@ -197,6 +198,15 @@ def test_v1_token_specific_logprobs_are_left_alone(monkeypatch):
     md = SimpleNamespace(temperature = torch.full((4,), 0.7), max_num_logprobs = 0, logprob_token_ids = {0: [1]})
     truncated = torch.log_softmax(_min_p_mask(logits / 0.7, 0.1), -1)
     torch.testing.assert_close(Sampler("processed_logprobs").sample(logits.clone(), md)[1], truncated)
+
+
+def test_speculative_engines_keep_the_kept_set_path(monkeypatch):
+    _fake_v1(monkeypatch)
+    ns = _load()
+    spec = SimpleNamespace(llm_engine = SimpleNamespace(vllm_config = SimpleNamespace(speculative_config = {"method": "ngram"})))
+    plain = SimpleNamespace(llm_engine = SimpleNamespace(vllm_config = SimpleNamespace(speculative_config = None)))
+    assert ns["set_vllm_untruncated_logprobs"](True, spec) is False
+    assert ns["set_vllm_untruncated_logprobs"](True, plain) is True
 
 
 def test_kill_switch_and_unknown_vllm(monkeypatch):

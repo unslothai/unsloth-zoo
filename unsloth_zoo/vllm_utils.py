@@ -1684,11 +1684,20 @@ def patch_vllm_untruncated_logprobs():
 pass
 
 
-def set_vllm_untruncated_logprobs(on):
+def _vllm_engine_speculative(llm):
+    engine = getattr(llm, "llm_engine", None)
+    config = getattr(engine, "vllm_config", None)
+    return getattr(config, "speculative_config", None) is not None
+pass
+
+
+def set_vllm_untruncated_logprobs(on, llm = None):
     """Turn the untruncated rollout logprobs on or off (UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS=0 keeps them off).
+    Off for a speculative engine: draft positions are scored by the rejection sampler from truncated logits.
     Returns whether they are on."""
     state = UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS
     on = bool(on) and os.environ.get("UNSLOTH_VLLM_UNTRUNCATED_LOGPROBS", "1") != "0"
+    on = on and not (llm is not None and _vllm_engine_speculative(llm))
     state["on"] = on and patch_vllm_untruncated_logprobs()
     return state["on"]
 pass
