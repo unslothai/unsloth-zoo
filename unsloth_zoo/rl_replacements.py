@@ -968,8 +968,14 @@ class _KeptSetLogprobs(torch.autograd.Function):
                 grad_z = grad_z / scale_divide
             if scale_multiply != 0.0:
                 grad_z = grad_z * scale_multiply
-            # float32-out logits of a 16-bit head: the gradient GEMMs run in the head dtype, as for the plain head.
-            grad_logits = grad_z.to(lm_head.dtype if ctx.fp32_out else logits_dtype)
+            # float32-out logits of a 16-bit head: the gradient GEMMs run in the head dtype with float32 output, float16
+            # rescaled so small logit gradients survive the cast (half_logit_grad).
+            grad_scale = None
+            if ctx.fp32_out:
+                from unsloth_zoo.fused_losses.chunked_logprob import half_logit_grad
+                grad_logits, grad_scale = half_logit_grad(grad_z, lm_head.dtype)
+            else:
+                grad_logits = grad_z.to(logits_dtype)
             del grad_z
             if ids is not None:
                 # Gathered only now, after the probability / derivative buffers are gone.
@@ -981,7 +987,9 @@ class _KeptSetLogprobs(torch.autograd.Function):
                 head = lm_head if lm_head.dtype == grad_logits.dtype else lm_head.to(grad_logits.dtype)
                 half_to_float32 = grad_logits.dtype == torch.float16
             if need_hidden:
-                if half_to_float32 and hidden_states.dtype != torch.float16:
+                if grad_scale is not None:
+                    grad_chunk = mm_float32(grad_logits, head) * grad_scale
+                elif half_to_float32 and hidden_states.dtype != torch.float16:
                     grad_chunk = mm_float32(grad_logits, head)
                 else:
                     grad_chunk = grad_logits @ head
@@ -995,7 +1003,9 @@ class _KeptSetLogprobs(torch.autograd.Function):
                         lm_head.shape, device = device,
                         dtype = grad_logits.dtype if same_dtype else torch.float32,
                     )
-                if grad_head.dtype == grad_logits.dtype:
+                if grad_scale is not None:
+                    grad_head.add_(mm_float32(grad_logits.t(), x) * grad_scale)
+                elif grad_head.dtype == grad_logits.dtype:
                     grad_head.addmm_(grad_logits.t(), x)
                 elif half_to_float32:
                     grad_head.add_(mm_float32(grad_logits.t(), x))
@@ -1003,7 +1013,7 @@ class _KeptSetLogprobs(torch.autograd.Function):
                     grad_head.add_(grad_logits.t() @ x)
             if need_bias:
                 # A trainable bias forces the packed (dense) route in forward.
-                grad_bias.add_(grad_logits.to(torch.float32).sum(0))
+                grad_bias.add_(grad_logits.to(torch.float32).sum(0) * (1.0 if grad_scale is None else grad_scale))
             del grad_logits
             if ids is not None:
                 head = None

@@ -98,10 +98,20 @@ def fp32_out_linear_ok(weight):
     )
 
 
+def half_logit_grad(grad, dtype):
+    """A float32 logit gradient in a 16-bit GEMM dtype, plus the scale to multiply the float32 GEMM result by.
+    float16 flushes GRPO's small per-token weights (1 / tokens times small probabilities) to zero, so it gets the
+    gradient divided by its absolute max first; bfloat16 has float32's range and is cast as is (scale None)."""
+    if dtype != torch.float16:
+        return grad.to(dtype), None
+    scale = grad.abs().amax().to(torch.float32).clamp_min(torch.finfo(torch.float32).tiny)
+    return (grad / scale).to(dtype), scale
+
+
 class _Fp32OutLinear(torch.autograd.Function):
     # x @ w.T (+ b) in the 16-bit dtype with float32 accumulation and output: the float32 logits of an fp32
-    # lm_head, without a float32 copy of the weight. Backward rounds the logit gradient to the weight dtype,
-    # as autograd does for a 16-bit head.
+    # lm_head, without a float32 copy of the weight. Backward runs the 16-bit GEMMs with float32 output on the logit
+    # gradient in the weight dtype (float16 rescaled first, see half_logit_grad).
     @staticmethod
     def forward(ctx, x, w, b):
         out = torch.mm(x, w.t(), out_dtype = torch.float32)
@@ -116,9 +126,14 @@ class _Fp32OutLinear(torch.autograd.Function):
     def backward(ctx, grad):
         x, w = ctx.saved_tensors
         need_x, need_w, need_b = ctx.needs_input_grad
-        g = grad.to(w.dtype)
-        grad_x = torch.mm(g, w, out_dtype = torch.float32).to(x.dtype) if need_x else None
-        grad_w = torch.mm(g.t(), x.to(w.dtype), out_dtype = torch.float32).to(w.dtype) if need_w else None
+        g, scale = half_logit_grad(grad, w.dtype)
+        grad_x = grad_w = None
+        if need_x:
+            grad_x = torch.mm(g, w, out_dtype = torch.float32)
+            grad_x = (grad_x if scale is None else grad_x * scale).to(x.dtype)
+        if need_w:
+            grad_w = torch.mm(g.t(), x.to(w.dtype), out_dtype = torch.float32)
+            grad_w = (grad_w if scale is None else grad_w * scale).to(w.dtype)
         grad_b = grad.sum(0).to(ctx.bias_dtype) if (need_b and ctx.has_bias) else None
         return grad_x, grad_w, grad_b
 
