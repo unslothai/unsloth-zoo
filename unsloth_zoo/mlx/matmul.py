@@ -824,18 +824,20 @@ _LANE_TENSOR_ONE = """
 _LANE_TENSOR_HEAD = """
     constexpr int G = K / GS;
     using W = metal::conditional_t<BITS == 4, uint4b_format, uchar>;
-    const int M = x_shape[0];
+    const int M = x_shape[XT];
     const uint simd = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
     const uint c0 = 4 * (lane & 1) + 8 * ((lane >> 3) & 1);
     const uint r0 = ((lane >> 1) & 3) + 4 * ((lane >> 4) & 1);
-    // Dynamic row extents keep each tile's reads within M.
-    auto a0 = tensor((device T*)x, dextents<int, 2>{K, min(M, 16)}, array<int, 2>{1, K});
-    auto a1 = tensor((device T*)x + (RT > 1 ? 16 * K : 0), dextents<int, 2>{K, RT > 1 ? max(M - 16, 1) : 1},
-                     array<int, 2>{1, K});
+    // Dynamic row extents keep each tile's reads within M. XT: x is [K, M], a group's rows one run.
+    const int m0 = min(M, 16), m1 = RT > 1 ? max(M - 16, 1) : 1;
+    auto a0 = tensor((device T*)x, dextents<int, 2>{XT ? m0 : K, XT ? K : m0}, array<int, 2>{1, XT ? M : K});
+    auto a1 = tensor((device T*)x + (RT > 1 ? 16 * (XT ? 1 : K) : 0), dextents<int, 2>{XT ? m1 : K, XT ? K : m1},
+                     array<int, 2>{1, XT ? M : K});
+    const int xk = XT ? 0 : GS, xm = XT ? GS : 0;   // a group's step along each axis of x
     tensor<device W, dextents<int, 2>, tensor_inline> b(
         (device uchar*)w + ulong(n0) * K * BITS / 8, dextents<int, 2>{K, 32}, array<int, 2>{1, K});
-    constexpr auto desc = matmul2d_descriptor(16, 32, GS, false, true, false);
+    constexpr auto desc = matmul2d_descriptor(16, 32, GS, bool(XT), true, false);
     matmul2d<desc, execution_simdgroup> op;
     auto a_first = a0.slice(0, 0);
     auto b_first = b.template slice<GS, 32>(0, 0);
@@ -849,8 +851,8 @@ _LANE_TENSOR_HEAD = """
 """
 _LANE_TENSOR_FOLD = """
             for (int t = 0; t < RT; ++t) {
-                if (t == 0) { auto as = a0.slice(int(g * GS), 0); op.run(as, bs, p); }
-                else { auto as = a1.slice(int(g * GS), 0); op.run(as, bs, p); }
+                if (t == 0) { auto as = a0.slice(int(g) * xk, int(g) * xm); op.run(as, bs, p); }
+                else { auto as = a1.slice(int(g) * xk, int(g) * xm); op.run(as, bs, p); }
                 for (int h = 0; h < H; ++h) {
                     if (16 * t + int(r0) + 8 * h >= M) continue;
                     const float sum = xs[t][h][g];
@@ -942,8 +944,8 @@ _LANE_BIAS_LOOP = """
         auto bs = b.template slice<GS, 32>(int(g * GS), 0);
         for (int j = 0; j < 8; ++j) sv[j] = float(sp[((j & 3) + 16 * (j >> 2)) * G + g]);
         for (int t = 0; t < RT; ++t) {
-            if (t == 0) { auto as = a0.slice(int(g * GS), 0); op.run(as, bs, p); }
-            else { auto as = a1.slice(int(g * GS), 0); op.run(as, bs, p); }
+            if (t == 0) { auto as = a0.slice(int(g) * xk, int(g) * xm); op.run(as, bs, p); }
+            else { auto as = a1.slice(int(g) * xk, int(g) * xm); op.run(as, bs, p); }
             for (int h = 0; h < H; ++h) {
                 if (16 * t + int(r0) + 8 * h >= M) continue;
                 for (int k = 0; k < 8; ++k) {
@@ -1089,7 +1091,7 @@ _LANE_PARTS = """
 """
 _LANE_TENSOR_BITS = (4, 8)
 _LANE_TENSOR_COLUMNS = 32
-_LANE_TENSOR_WIDE = 16384   # outputs from which 8-bit weights read K slices, and 4-bit bf16 ones outside `scales` fold the bias term
+_LANE_TENSOR_WIDE = 16384   # outputs from which 8-bit fp16 weights read K slices, and 4-bit bf16 ones outside `scales` fold the bias term
 _LANE_STAGED_GROUPS = 16
 _LANE_DEEP_GROUPS = 256
 _LANE_WIDE_COLUMNS = 8192   # from here four column tiles per threadgroup read paired codes faster than two
@@ -1135,15 +1137,21 @@ def _lane_tensor_reader(N, K, group_size, bits, dtype):
     """The tensor-unit reader of an `[N, K]` weight's calls, from its shape alone so that a row's bits do not depend on
     its call: the one measured fastest when each call waits on the one before, as in a forward. 4-bit weights read K
     slices with their scales staged eight groups at a time, where each column's scales are whole 16-byte runs.
-    Otherwise narrower weights read K slices at 4 bits and stage their scales and biases at 8; wider ones fold the bias
-    term as one matmul at 4 bits (bf16 only, where a sum's two halves cannot overflow) and read K slices at 8."""
+    8-bit weights and wide 4-bit ones fold the bias term as one matmul (bf16 only, where a sum's two halves cannot
+    overflow); the rest read K slices, or at 8 bits below the wide width stage their scales and biases."""
     if K // group_size % 4:   # the staged rounds load four groups at once
         return "slices"
     if bits == 4 and K // group_size % 8 == 0:
         return "scales"
+    if bits == 8 and dtype == mx.bfloat16:
+        return "bias"
     if N < _LANE_TENSOR_WIDE:
         return "slices" if bits == 4 else "staged"
     return "slices" if bits == 8 else "bias" if dtype == mx.bfloat16 else "staged"
+
+
+def _lane_tensor_x(x, bits):
+    return mx.contiguous(x.T) if bits == 8 else x   # K-major: the copy pays for itself at 8 bits, not at 4
 
 
 def _lane_paired(group_size, bits):
@@ -1174,7 +1182,7 @@ def _lane_tensor_launch(M, Ns, K, group_size, bits, dtype, output_dtype, groups,
                   "scales": _lane_tensor_simdgroups(K, group_size, bits)}[reader]
     # H: row halves a tile can fill; up to 8 rows the second half is padding, and skipping it per group is not free.
     constants = dict(K = K, GS = group_size, BITS = bits, RT = 1 if M <= 16 else 2, NSG = simdgroups, H = 1 if M <= 8 else 2, RG = groups,
-                     ILV = int(reader == "interleaved"), CG = _LANE_STAGED_GROUPS,
+                     ILV = int(reader == "interleaved"), CG = _LANE_STAGED_GROUPS, XT = int(bits == 8),
                      # Deep weights run faster with the partials in the spent scale stages; the rest slower.
                      **(dict(REUSE = int(K // group_size >= _LANE_DEEP_GROUPS)) if reader == "scales" else {}))
     header = (nax._QMM_HEADER + _LANE_TYPE.format("T", _LANE_METAL_TYPES[dtype])
@@ -1273,6 +1281,7 @@ def lane_qmm(x, w, scales, biases, group_size, bits, *, output_dtype = None, gro
     if _lane_tensor_units(N, bits):
         reader = reader or _lane_tensor_reader(N, K, group_size, bits, x.dtype)
         inputs += _lane_sums_launch(M, K, group_size, x.dtype, reader == "bias")(inputs = [x])
+        inputs[0] = _lane_tensor_x(x, bits)
     return _lane_launch(M, N, K, group_size, bits, x.dtype, output_dtype = output_dtype, groups = groups,
                         reader = reader)(inputs = inputs)[0]
 
@@ -1301,7 +1310,7 @@ def lane_qmms(x, weights, group_size, bits):
         return _lane_shared_launch(M, Ns, K, group_size, bits, x.dtype)(inputs = [x, *(a for weight in weights for a in weight)])
     sums = _lane_sums_launch(M, K, group_size, x.dtype, reader == "bias")(inputs = [x])
     return _lane_tensor_launch(M, Ns, K, group_size, bits, x.dtype, x.dtype, K // group_size, reader)(
-        inputs = [x, *(a for weight in weights for a in weight), *sums])
+        inputs = [_lane_tensor_x(x, bits), *(a for weight in weights for a in weight), *sums])
 
 
 def lane_shortlist_reader(M, bits):
