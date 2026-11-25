@@ -3969,14 +3969,6 @@ def grpo_accumulated_loss(
             if prompt_real_mask is not None:
                 left_pad_tokens_per_prompt = (~prompt_real_mask[:, :-logits_to_keep]).sum(dim = 1)
 
-            # Determine max_left_pad from precomputed logprobs shape for consistency
-            if old_logps is not None:
-                max_left_pad = old_logps.shape[1] - logits_to_keep
-            elif ref_logps is not None:
-                max_left_pad = ref_logps.shape[1] - logits_to_keep
-            else:
-                max_left_pad = torch.max(left_pad_tokens_per_prompt).item()
-
             # pad == eos: the rows whose real EOS shares the pad id (None otherwise, no change).
             from unsloth_zoo.rl_replacements import grpo_pad_is_eos_rows
             # TRL's completion_mask (still the incoming one here) tells the EOS from pad-id padding.
@@ -3989,6 +3981,24 @@ def grpo_accumulated_loss(
                 (old_logps is None or _logps_cover_eos or getattr(old_logps, "_unsloth_grpo_covers_eos", False))
                 and (ref_logps is None or _logps_cover_eos)
             ):
+                pad_eos_rows = None
+
+            # Determine max_left_pad from precomputed logprobs shape for consistency
+            _eos_any = None
+            if old_logps is not None:
+                max_left_pad = old_logps.shape[1] - logits_to_keep
+            elif ref_logps is not None:
+                max_left_pad = ref_logps.shape[1] - logits_to_keep
+            elif pad_eos_rows is not None:
+                # One host read for both.
+                max_left_pad, _eos_any = torch.stack(
+                    [torch.max(left_pad_tokens_per_prompt), pad_eos_rows.any().to(left_pad_tokens_per_prompt.dtype)]
+                ).tolist()
+            else:
+                max_left_pad = torch.max(left_pad_tokens_per_prompt).item()
+            # No row ends on an EOS that shares the pad id (Qwen-style pad <|endoftext|>, stop <|im_end|>):
+            # the id rule is already exact, so drop the rows and leave PrefixGrouper on, as unsloth's scorer does.
+            if pad_eos_rows is not None and not (pad_eos_rows.any().item() if _eos_any is None else _eos_any):
                 pad_eos_rows = None
 
             if prompt_real_mask is None:
