@@ -2411,10 +2411,24 @@ pass
 
 
 def grpo_forwards_are_collective(model):
-    """FSDP2 sharded layout: every forward all-gathers, so ranks must run the same number of forwards."""
+    """FSDP2 sharded layout or DeepSpeed ZeRO-3: every forward all-gathers, so ranks must run the same number of forwards."""
     import torch.distributed as dist
     if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
         return False
+    # ZeRO-3 is read live, not cached: the DeepSpeed config can go live after the first call.
+    from unsloth_zoo.temporary_patches.utils import zero3_partitioned_training
+    if zero3_partitioned_training():
+        return True
+    # A partitioned model keeps ds_id after the global config is cleared or names another stage
+    # (Accelerate multi-plugin). ZeRO-3 converts every parameter, so the first one answers (O(1));
+    # read only once DeepSpeed is loaded, and a positive never reverts.
+    if model.__dict__.get("_unsloth_grpo_zero3_partitioned", False):
+        return True
+    if "deepspeed.runtime.zero.partition_parameters" in sys.modules and hasattr(
+        next(iter(model.parameters()), None), "ds_id"
+    ):
+        model.__dict__["_unsloth_grpo_zero3_partitioned"] = True
+        return True
     cached = model.__dict__.get("_unsloth_grpo_collective_forwards", None)
     if cached is None:
         cached = any(
@@ -3844,14 +3858,8 @@ def grpo_accumulated_loss(
         vocab_dim = lm_head.shape[0]
         # Imported here: this body is copied into the generated trainer.
         from unsloth_zoo.rl_replacements import grpo_forwards_are_collective, grpo_agree_mini_batch
+        # Covers FSDP2 sharding and DeepSpeed ZeRO-3; Core's old / ref scoring uses the same predicate.
         _collective_forwards = grpo_forwards_are_collective(trainer.model)
-        if not _collective_forwards:
-            # DeepSpeed ZeRO-3 gathers partitioned weights in every forward too.
-            import torch.distributed as _dist
-            from unsloth_zoo.temporary_patches.utils import zero3_partitioned_training as _zero3_live
-            _collective_forwards = (
-                _zero3_live() and _dist.is_available() and _dist.is_initialized() and _dist.get_world_size() > 1
-            )
 
         if trainer.args.unsloth_grpo_mini_batch is None:
             # Size per call, as unsloth's copy does: caching in args froze the first step's plan.
