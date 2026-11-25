@@ -37,6 +37,8 @@ import warnings
 import torch
 from typing import Optional
 
+from unsloth_zoo.rocm_build import is_rocm_torch
+
 try:
     import triton
     import triton.language as tl
@@ -79,7 +81,7 @@ _SPLIT_COLS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_SPLIT_COLS", 16384)), 0)
 _SPLIT_COLS = -(-_SPLIT_COLS // 16) * 16
 _SPLIT_BLOCK = max(int(_env_float("UNSLOTH_FUSED_LINEAR_SPLIT_BLOCK", 2048)), 16)
 # ROCm: small tiles are ~2x faster on gfx1151.
-_HIP_TILES = torch.version.hip is not None
+_HIP_TILES = is_rocm_torch(torch)
 _BWD_ROWS = max(int(_env_float("UNSLOTH_FUSED_LINEAR_BWD_ROWS", 1024 if _HIP_TILES else 4096)), 1)
 _BWD_TILE_BYTES = max(int(_env_float("UNSLOTH_FUSED_LINEAR_BWD_TILE_MB", 8 if _HIP_TILES else 256) * 1024**2), 1)
 _HALF = (torch.float16, torch.bfloat16)
@@ -109,7 +111,7 @@ def _flash_min_rows_auto(device):
     return 0 if total <= _SMALL_CARD_BYTES else 4096
 _FWD_TILE_COLS = (max(int(_env_float("UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS", 0)), 0)
                   if os.environ.get("UNSLOTH_FUSED_LINEAR_FWD_TILE_COLS") is not None else None)
-_IS_HIP = torch.version.hip is not None
+_IS_HIP = is_rocm_torch(torch)
 # Bump the suffix on any schema / backward change: Inductor / AOTAutograd caches key on neither.
 _LP_OP = "fused_linear_logprobs_v6"
 _LP_BWD_OP = "fused_linear_logprobs_bwd_v4"

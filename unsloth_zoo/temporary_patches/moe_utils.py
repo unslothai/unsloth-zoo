@@ -32,6 +32,7 @@ import importlib.util
 from typing import Optional, Tuple
 from torch.autograd import Function
 from unsloth_zoo.mlx import is_mlx_available
+from unsloth_zoo.rocm_build import is_rocm_torch
 from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
 from unsloth_zoo.packed_experts import is_new_packed_expert_param, is_packed_expert_param, packed_param_transposed
 
@@ -558,7 +559,7 @@ def _triton_grouped_mm_policy(index, kind, mode, disabled, override):
     mode = (mode or "auto").strip().lower()
     if mode in ("0", "false", "off") or disabled == "1":
         return 0
-    if torch.version.hip is not None or _GROUPED_MM_TRITON_OP is None or index is None:
+    if is_rocm_torch(torch) or _GROUPED_MM_TRITON_OP is None or index is None:
         return 0
     try:
         from unsloth_zoo.temporary_patches.moe_grouped_fp16 import triton as _triton
@@ -1211,7 +1212,7 @@ _MM_OUT_DTYPE = "dtype" in torch.ops.aten.mm.overloads()
 
 
 def _mm_fp32_out_ok(grad):
-    return _MM_OUT_DTYPE and grad.is_cuda and torch.version.hip is None and grad.dtype in (torch.float16, torch.bfloat16)
+    return _MM_OUT_DTYPE and grad.is_cuda and not is_rocm_torch(torch) and grad.dtype in (torch.float16, torch.bfloat16)
 
 
 def _one_hot_mm_fp32(one_hot, grad):
@@ -1724,7 +1725,7 @@ def _slice_reads_views(inputs, weight, plan):
     if _slice_takes_triton(inputs, weight, plan):
         return True
     device = inputs.device
-    if device.type != "cuda" or torch.version.hip is not None:
+    if device.type != "cuda" or is_rocm_torch(torch):
         return False
     index = device.index if device.index is not None else torch.cuda.current_device()
     return _triton_grouped_mm_capability(index)[0] in (9, 10) and _grouped_mm_supported_on(device)
@@ -1998,7 +1999,7 @@ def _torch_version_tuple():
 
 # CUDA not ROCm: torch 2.8 hard-raises unless dprops->major == 9 (Blas.cpp sm90_only); 2.9+ sends other archs to
 # _grouped_mm_fallback instead of raising (GroupedBlas.cpp, _grouped_mm_cuda).
-_TORCH_IS_CUDA_BUILD = getattr(torch.version, "hip", None) is None
+_TORCH_IS_CUDA_BUILD = not is_rocm_torch(torch)
 _TORCH_GROUPED_MM_SM90_ONLY = _TORCH_IS_CUDA_BUILD and _torch_version_tuple() == (2, 8)
 _TORCH_GROUPED_MM_FALLS_BACK = _TORCH_IS_CUDA_BUILD and _torch_version_tuple() >= (2, 9)
 
@@ -2075,7 +2076,7 @@ def _grouped_mm_survives_out_of_process(device):
 
 def _run_grouped_mm_crash_probe(device):
     # AMD only: CUDA and XPU keep the in-process probe.
-    if getattr(torch.version, "hip", None) is None or device.type != "cuda": return True
+    if not is_rocm_torch(torch) or device.type != "cuda": return True
     # Studio's Python _grouped_mm fallback (gfx120X) is active: this process never runs the native kernel.
     try:
         dump = torch._C._dispatch_dump("aten::_grouped_mm").splitlines()
@@ -2426,7 +2427,7 @@ def _select_moe_backend():
 
 def _unsloth_triton_beats_loop():
     """Below sm80 (T4 / V100) the Triton grouped GEMM ran 1.7x to 4x slower than the per-expert loop."""
-    if getattr(torch.version, "hip", None) is not None:
+    if is_rocm_torch(torch):
         return True
     try:
         return torch.cuda.get_device_capability()[0] >= 8
@@ -2450,7 +2451,7 @@ def moe_compute_dtype(hidden_states):
     # The activation's own device; is_bf16_supported() reads the current one and counts sm < 80 emulation.
     if (
         device_type == "cuda"
-        and torch.version.hip is None
+        and not is_rocm_torch(torch)
         and torch.cuda.get_device_capability(hidden_states.device)[0] < 8
     ):
         return torch.float16

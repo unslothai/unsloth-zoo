@@ -226,6 +226,7 @@ def _gate_env(monkeypatch, lora_patched = True):
     monkeypatch.delenv("UNSLOTH_MXFP4_KEEP_PACKED", raising = False)
     monkeypatch.delenv("UNSLOTH_ENABLE_FULL_FINETUNING", raising = False)
     monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if None else "+cu130"))
 
 
 def test_keep_packed_switch(monkeypatch):
@@ -249,6 +250,7 @@ def test_keep_packed_switch(monkeypatch):
     monkeypatch.setattr(mx, "mxfp4_kernel_available", lambda *a, **k: False)
     assert mx.keep_mxfp4_experts_packed() is True
     monkeypatch.setattr(torch.version, "hip", "6.4")
+    monkeypatch.setattr(torch, "__version__", str(torch.__version__).split("+")[0] + ("+rocm7.13.0" if "6.4" else "+cu130"))
     assert mx.keep_mxfp4_experts_packed() is True
     monkeypatch.setenv("UNSLOTH_MXFP4_KEEP_PACKED", "0")
     assert mx.keep_mxfp4_experts_packed() is False

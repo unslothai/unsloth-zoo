@@ -34,6 +34,7 @@ import torch
 from unsloth_zoo.fused_losses.stable_softmax import target_logprob, target_grad
 from typing import Optional
 
+from unsloth_zoo.rocm_build import is_rocm_torch
 from unsloth_zoo.temporary_patches.common import CHUNK_ALIGN_ROWS, torch_compile_options
 
 
@@ -150,7 +151,7 @@ def _run(name, fn, *args):
 
 
 # ROCm's half-in / fp32-out GEMM is a slow fallback.
-_FP32_OUT_GEMM = torch.version.hip is None
+_FP32_OUT_GEMM = not is_rocm_torch(torch)
 
 
 def _mm_fp32(a, b):

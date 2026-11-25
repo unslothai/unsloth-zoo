@@ -33,6 +33,8 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
+from unsloth_zoo.rocm_build import is_rocm_torch
+
 from unsloth_zoo.fused_losses.stable_softmax import target_grad, target_logprob_
 
 
@@ -78,7 +80,7 @@ def _linear_float32(hidden, weight, bias):
     # Half-precision head logits round to bf16 / fp16 before softmax and dominate the logp error; request float32 GEMM output (torch >= 2.8) where possible.
     key = (hidden.device.type, weight.dtype)
     # Not on ROCm: half-in / fp32-out GEMM is a slow fallback.
-    if torch.version.hip is None and weight.dtype in (torch.float16, torch.bfloat16) and _MM_OUT_DTYPE_OK.get(key, True):
+    if not is_rocm_torch(torch) and weight.dtype in (torch.float16, torch.bfloat16) and _MM_OUT_DTYPE_OK.get(key, True):
         try:
             logits = torch.mm(hidden, weight.t(), out_dtype = torch.float32)
             _MM_OUT_DTYPE_OK[key] = True
