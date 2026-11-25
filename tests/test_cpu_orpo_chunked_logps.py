@@ -334,7 +334,7 @@ if dist.get_rank() == 0:
 '''
 
 
-def _ddp_step(tmp_path, chunked):
+def _ddp_step(tmp_path, chunked, model_dir):
     import socket
     import subprocess
     import sys
@@ -350,7 +350,7 @@ def _ddp_step(tmp_path, chunked):
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     run = subprocess.run([sys.executable, "-m", "torch.distributed.run", "--nproc_per_node", "2",
-                          "--master_port", str(port), str(script), TINY, str(result)],
+                          "--master_port", str(port), str(script), model_dir, str(result)],
                          env = env, capture_output = True, text = True, timeout = 900)
     assert run.returncode == 0, run.stderr[-3000:]
     return torch.load(result)
@@ -364,10 +364,12 @@ def test_ddp_trainable_head_grads_synced(tmp_path):
         pytest.skip("no gloo")
     try:
         from huggingface_hub import snapshot_download
-        snapshot_download(TINY)
+        model_dir = snapshot_download(TINY)
     except Exception as error:
         pytest.skip(f"{TINY} unavailable: {error}")
-    chunked, stock = _ddp_step(tmp_path, "1"), _ddp_step(tmp_path, "0")
+    # The ranks load this snapshot, not the repo id: conftest points HF_HOME at an empty per-test dir that the
+    # torchrun children inherit, and an HF_HUB_OFFLINE=1 set earlier in this worker would leave them nothing to load.
+    chunked, stock = _ddp_step(tmp_path, "1", model_dir), _ddp_step(tmp_path, "0", model_dir)
     assert (chunked["chunked"], stock["chunked"]) == (True, False)
     for out in (chunked, stock):
         assert out["wrapped"] == "DistributedDataParallel"
