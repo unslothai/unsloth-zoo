@@ -943,7 +943,7 @@ def _calling_model_spans_devices(max_depth = 8):
 def _mask_built_for_plain_model(max_depth = 8):
     """True when a model Unsloth neither loaded nor trains builds this mask (model_marker): it gets
     transformers' own mask, so its SDPA calls (maskless causal included) run as without Unsloth."""
-    from ..model_marker import is_unsloth_model, model_marker_required
+    from unsloth_zoo.model_marker import is_unsloth_model, model_marker_required
     if not model_marker_required() or _is_tracing_masks():
         return False
     try:

@@ -56,7 +56,7 @@ from .ast_rewriter import (
 from .cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs
 from .forward_adapter import EMPTY_LOGITS, unsloth_fused_lm_head_loss
 from .aux_loss import rewrite_aux_loss_ga, unscaled_extra_loss_terms, unsloth_ga_scale_aux_loss
-from ..model_marker import is_unsloth_model, mark_model, require_model_marker
+from unsloth_zoo.model_marker import is_unsloth_model, mark_model, require_model_marker
 
 
 logger = logging.getLogger("unsloth_zoo.fused_forward")
