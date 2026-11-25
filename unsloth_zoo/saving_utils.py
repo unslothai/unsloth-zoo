@@ -6152,7 +6152,7 @@ def merge_and_overwrite_lora(
         raise
     _drop_previous_export_shards(_previous_export)
 
-    if low_disk_space_usage and not is_local_path and not copied_all_from_cache:
+    if low_disk_space_usage and not is_local_path and not copied_tokenizer_model_from_cache:
         tokenizer_model_path = os.path.join(save_directory, "tokenizer.model")
         if not os.path.exists(tokenizer_model_path):
             try:
@@ -6174,7 +6174,6 @@ def merge_and_overwrite_lora(
         _tokenizer_model_digest = _file_sha256(os.path.join(save_directory, "tokenizer.model"))
         if _tokenizer_model_digest is not None and _tokenizer_model_digest != _uploaded_tokenizer_model:
             upload_items("tokenizer.model")
-            _uploaded_tokenizer_model = _tokenizer_model_digest
 
     if needs_splitting:
         final_safetensors_list = renumber_safetensor_files(final_safetensors_list, save_directory)

@@ -32,7 +32,6 @@ _UPLOADED_BYTES = {}    # path_in_repo -> bytes of the last upload_file call
 
 
 def _hub_reachable():
-    # Offline, the merge takes the local-directory path (tokenizer.model in Step 2): wrong path under test.
     from huggingface_hub import HfApi, constants
     if constants.HF_HUB_OFFLINE: return False
     try:
@@ -44,7 +43,8 @@ def _hub_reachable():
 
 @pytest.fixture(autouse = True, scope = "module")
 def _needs_hub():
-    if not _hub_reachable(): pytest.skip("reads tiny base repos from the Hugging Face Hub")
+    if not _hub_reachable():
+        pytest.skip(reason = "needs the Hub: offline, the merge takes the local-directory path, not the one under test")
 
 
 @pytest.fixture(autouse = True)
@@ -169,14 +169,13 @@ def test_low_disk_push_does_not_reupload_tokenizer_model_already_sent(_cpu_and_m
 def test_low_disk_push_resends_tokenizer_model_replaced_after_step_2(_cpu_and_mocked_hub_writes, tmp_path, monkeypatch):
     from huggingface_hub import hf_hub_download
     events = _cpu_and_mocked_hub_writes
-    # Step 4's cache copy is what replaces tokenizer.model after Step 2: cache the base file, and point the zoo's
-    # cache lookup at the hub cache it landed in (conftest moves HF_HOME to an empty dir after Hub froze its path).
+    # Step 4's cache copy replaces tokenizer.model; conftest points HF_HOME elsewhere after Hub froze its cache path.
     cached = hf_hub_download(SPM_REPO, "tokenizer.model")
     monkeypatch.setenv("HF_HUB_CACHE", os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(cached)))))
     with open(cached, "rb") as f: base = f.read()
     _push(SPM_REPO, _tokenizer_writing(tmp_path, b"not the base tokenizer.model"), low_disk_space_usage = True)
     assert _tokenizer_model_uploads(events) == (1, 1), events
-    assert _UPLOADED_BYTES["tokenizer.model"] == base    # the Hub ends with the bytes left on disk
+    assert _UPLOADED_BYTES["tokenizer.model"] == base
 
 
 def test_full_disk_push_unchanged(_cpu_and_mocked_hub_writes, tmp_path):
@@ -192,3 +191,14 @@ def test_low_disk_push_without_sentencepiece_uploads_no_tokenizer_model(_cpu_and
     _push(BPE_REPO, AutoTokenizer.from_pretrained(BPE_REPO), low_disk_space_usage = True)
     assert _tokenizer_model_uploads(events) == (0, 0), events
     assert ("file", "model.safetensors") in events
+
+
+def test_low_disk_push_fetches_tokenizer_model_missing_from_cache_with_shards(_cpu_and_mocked_hub_writes, tmp_path, monkeypatch):
+    from huggingface_hub import hf_hub_download
+    events = _cpu_and_mocked_hub_writes
+    cache = str(tmp_path / "hub_cache")
+    hf_hub_download(SPM_REPO, "model.safetensors", cache_dir = cache)
+    monkeypatch.setenv("HF_HUB_CACHE", cache)
+    _push(SPM_REPO, _tokenizer_without_spm_file(tmp_path), low_disk_space_usage = True)
+    assert _tokenizer_model_uploads(events) == (0, 1), events
+    assert _UPLOADED_BYTES["tokenizer.model"] == _base_tokenizer_model_bytes()
