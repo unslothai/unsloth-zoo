@@ -280,6 +280,25 @@ def _restore_hidden_states_flag():
             _os.environ[name] = value
 
 
+@_pytest.fixture(autouse = True)
+def _isolate_model_marker_requirement():
+    """import unsloth (GPU backend) calls require_model_marker(), which makes the fused forward and the mask patch
+    skip every model not passed to mark_model (#2768). One test importing unsloth would leave that on for its xdist
+    worker, and later tests on plain models would silently take the stock path. Each test starts with zoo's own
+    default (off) and gets back whatever it found."""
+    marker = sys.modules.get("unsloth_zoo.model_marker")
+    if marker is None:
+        try:
+            from unsloth_zoo import model_marker as marker
+        except Exception:
+            yield
+            return
+    before = marker.model_marker_required()
+    marker.require_model_marker(False)
+    yield
+    marker.require_model_marker(before)
+
+
 _MOE_UTILS = "unsloth_zoo.temporary_patches.moe_utils"
 
 
