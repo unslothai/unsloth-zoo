@@ -28,7 +28,6 @@ __all__ = [
     "chunked_logprob_rows",
 ]
 
-import functools
 import os
 import torch
 from unsloth_zoo.fused_losses.stable_softmax import target_logprob, target_grad
@@ -74,6 +73,85 @@ def chunked_logprob_rows(vocab_size, target_gb = None, n_rows = None, device = N
 
 
 _FUSED_LINEAR = os.environ.get("UNSLOTH_FUSED_LINEAR", "1") != "0"
+# aten::mm.dtype (torch >= 2.8): a 16-bit GEMM with float32 output, CUDA / ROCm kernels only, no autograd formula.
+# Used on CUDA only: ROCm keeps the float32 head copy it always had.
+_MM_OUT_DTYPE = hasattr(torch.ops.aten, "mm") and hasattr(torch.ops.aten.mm, "dtype") and torch.version.hip is None
+# The fused kernels already score with float32-out logits here (fused_linear._logits_mode), so an fp32 lm_head
+# request keeps them instead of falling back to a float32 copy of the head. ROCm and
+# UNSLOTH_LOGPROB_FP32_LOGITS=0 / 2 give 16-bit logits there.
+_FUSED_FP32_LOGITS = (
+    _FUSED_LINEAR and _MM_OUT_DTYPE and torch.version.hip is None
+    and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
+    and torch.cuda.is_available()
+)
+
+
+def fused_fp32_logits_ok(weight):
+    """True when the fused kernels project this 16-bit CUDA head with float32-out logits. A float32 head is excluded:
+    under autocast the fused kernels round its weights to the autocast dtype, which an fp32 lm_head must not do."""
+    return (
+        _FUSED_FP32_LOGITS and torch.is_tensor(weight) and weight.is_cuda
+        and weight.dtype in (torch.float16, torch.bfloat16)
+    )
+
+
+def fp32_lm_head_auto_ok(weight):
+    """The unset default's scope: a 16-bit CUDA head (an fp32 head keeps its previous scorer unless =1)."""
+    return torch.is_tensor(weight) and weight.is_cuda and weight.dtype in (torch.float16, torch.bfloat16)
+
+
+def fp32_out_linear_ok(weight):
+    """True when `fp32_out_linear` can project through this head without a float32 copy of it. A trainable head keeps
+    the copy: its gradient then accumulates over the chunks in float32 and is rounded once."""
+    return (
+        _MM_OUT_DTYPE and torch.is_tensor(weight) and weight.is_cuda
+        and weight.dtype in (torch.float16, torch.bfloat16) and not weight.requires_grad
+    )
+
+
+def half_logit_grad(grad, dtype):
+    """A float32 logit gradient in a 16-bit GEMM dtype, plus the scale to multiply the float32 GEMM result by.
+    float16 flushes GRPO's small per-token weights (1 / tokens times small probabilities) to zero, so it gets the
+    gradient divided by its absolute max first; bfloat16 has float32's range and is cast as is (scale None)."""
+    if dtype != torch.float16:
+        return grad.to(dtype), None
+    scale = grad.abs().amax().to(torch.float32).clamp_min(torch.finfo(torch.float32).tiny)
+    return (grad / scale).to(dtype), scale
+
+
+class _Fp32OutLinear(torch.autograd.Function):
+    # x @ w.T (+ b) in the 16-bit dtype with float32 accumulation and output: the float32 logits of an fp32
+    # lm_head, without a float32 copy of the weight. Backward runs the 16-bit GEMMs with float32 output on the logit
+    # gradient in the weight dtype (float16 rescaled first, see half_logit_grad).
+    @staticmethod
+    def forward(ctx, x, w, b):
+        out = torch.mm(x, w.t(), out_dtype = torch.float32)
+        if b is not None:
+            out = out + b.to(torch.float32)
+        ctx.save_for_backward(x, w)
+        ctx.has_bias = b is not None
+        ctx.bias_dtype = b.dtype if b is not None else None
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        x, w = ctx.saved_tensors
+        need_x, need_w, need_b = ctx.needs_input_grad
+        g, scale = half_logit_grad(grad, w.dtype)
+        grad_x = grad_w = None
+        if need_x:
+            grad_x = torch.mm(g, w, out_dtype = torch.float32)
+            grad_x = (grad_x if scale is None else grad_x * scale).to(x.dtype)
+        if need_w:
+            grad_w = torch.mm(g.t(), x.to(w.dtype), out_dtype = torch.float32)
+            grad_w = (grad_w if scale is None else grad_w * scale).to(w.dtype)
+        grad_b = grad.sum(0).to(ctx.bias_dtype) if (need_b and ctx.has_bias) else None
+        return grad_x, grad_w, grad_b
+
+
+def fp32_out_linear(x, weight, bias = None):
+    """Float32 logits of a 16-bit head: `fp32_out_linear_ok(weight)` must hold; x is [rows, hidden]."""
+    return _Fp32OutLinear.apply(x.to(weight.dtype), weight, bias)
 
 
 def _transform(z, scalars, has_mul: bool, has_div: bool, has_cap: bool):

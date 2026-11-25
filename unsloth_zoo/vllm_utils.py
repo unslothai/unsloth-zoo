@@ -4707,8 +4707,29 @@ def _warn_padded_vocab_for_serve(config):
 pass
 
 
+def _fp32_lm_head_mode():
+    # "on" (=1), "off" (=0), or "auto" (unset): the colocated GRPO default, which follows the trainer scorers.
+    value = os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip().lower()
+    if value in ("1", "true", "on", "yes"):
+        return "on"
+    if value in ("0", "false", "off", "no"):
+        return "off"
+    return "auto"
+
+
 def _fp32_lm_head_requested():
-    return os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes")
+    return _fp32_lm_head_mode() == "on"
+
+
+def _trainer_fp32_lm_head_default():
+    # The trainer scorers read the flag once, at import, as a def-time default: the rollout head follows it, so an
+    # fp32 head is only requested where old / new logps project in fp32 too (CUDA, not ROCm, fp32 fused logits).
+    try:
+        from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax as scorer
+        params = inspect.signature(scorer).parameters
+        return any(name in params and params[name].default is True for name in ("fp32_lm_head", "fp32_lm_head_cuda"))
+    except Exception:
+        return False
 
 
 def _vllm_supports_fp32_lm_head():
@@ -4725,7 +4746,8 @@ def _patch_vllm_fp32_lm_head_excluded_quant():
     # vLLM 0.26.0 - 0.28.x only accept UnquantizedEmbeddingMethod for a head_dtype override, but a
     # quant config that excludes lm_head (ModelOpt FP8 / NVFP4) hands out UnquantizedLinearMethod,
     # so _apply_head raises although the weight is plain. Backport the 0.29.0 guard: swap in an
-    # UnquantizedEmbeddingMethod for that one call. Only reached with UNSLOTH_VLLM_FP32_LM_HEAD=1.
+    # UnquantizedEmbeddingMethod for that one call. A truly quantized head (GGUF, AWQ / GPTQ lm_head)
+    # cannot run in fp32, and every vLLM raises for it: project it in the model dtype instead, once noted.
     try:
         from vllm.model_executor.layers.logits_processor import LogitsProcessor
         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -4736,19 +4758,24 @@ def _patch_vllm_fp32_lm_head_excluded_quant():
     if original is None or getattr(original, "_unsloth_excluded_quant_patched", False):
         return False
     code = getattr(original, "__code__", None)
-    if code is None or "UnquantizedLinearMethod" in code.co_names:
-        # vLLM >= 0.29.0 already accepts both.
-        return False
+    # vLLM >= 0.29.0 already accepts both.
+    backport = code is not None and "UnquantizedLinearMethod" not in code.co_names
     embedding_method = UnquantizedEmbeddingMethod()
+    noted = []
 
     def _apply_head(self, lm_head, hidden_states, embedding_bias):
         quant_method = getattr(lm_head, "quant_method", None)
-        if (
-            getattr(self, "head_dtype", None) is not None
-            and self.head_dtype != hidden_states.dtype
-            and isinstance(quant_method, UnquantizedLinearMethod)
-            and not isinstance(quant_method, UnquantizedEmbeddingMethod)
-        ):
+        if getattr(self, "head_dtype", None) is None or self.head_dtype == hidden_states.dtype:
+            return original(self, lm_head, hidden_states, embedding_bias)
+        if not isinstance(quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)):
+            if not noted:
+                noted.append(True)
+                print(
+                    f"Unsloth: the lm_head is quantized ({type(quant_method).__name__}), so vLLM keeps "
+                    f"rollout logits in {hidden_states.dtype} instead of an fp32 lm_head."
+                )
+            return quant_method.apply(lm_head, hidden_states, bias = embedding_bias)
+        if backport and not isinstance(quant_method, UnquantizedEmbeddingMethod):
             lm_head.quant_method = embedding_method
             try:
                 return original(self, lm_head, hidden_states, embedding_bias)
@@ -4763,10 +4790,21 @@ def _patch_vllm_fp32_lm_head_excluded_quant():
 
 
 def _vllm_fp32_lm_head_overrides(training):
-    # Raises rather than half-applying: the trainer reads the same flag, and only both sides in fp32 pays off.
-    if not training or not _fp32_lm_head_requested():
+    # Explicit =1 raises rather than half-applying: the trainer reads the same flag, and only both sides in
+    # fp32 pays off. Unset (auto) requests it only where it holds on both sides and is silent otherwise.
+    mode = _fp32_lm_head_mode()
+    if not training or mode == "off":
         return {}
-    if not _vllm_supports_fp32_lm_head():
+    if mode == "auto":
+        if not _trainer_fp32_lm_head_default() or not _vllm_supports_fp32_lm_head():
+            return {}
+        try:
+            from vllm.platforms import current_platform
+            if not current_platform.is_cuda():
+                return {}
+        except Exception:
+            return {}
+    elif not _vllm_supports_fp32_lm_head():
         raise RuntimeError(
             f"Unsloth: UNSLOTH_VLLM_FP32_LM_HEAD=1 needs vLLM >= 0.26.0 for an fp32 lm_head, "
             f"but found vLLM {vllm_version}. Upgrade vLLM or unset UNSLOTH_VLLM_FP32_LM_HEAD."
@@ -4784,10 +4822,13 @@ def _warn_fp32_lm_head_set_late():
     stale = []
     for name in ("chunked_hidden_states_selective_log_softmax", "chunked_hidden_states_selective_log_softmax_recompute"):
         try:
-            default = inspect.signature(getattr(rl, name)).parameters["fp32_lm_head"].default
+            params = inspect.signature(getattr(rl, name)).parameters
+            default = params["fp32_lm_head"].default
         except Exception:
             continue
-        if default is False:
+        # The unset default already projects a CUDA head in fp32.
+        cuda_default = params["fp32_lm_head_cuda"].default if "fp32_lm_head_cuda" in params else False
+        if default is False and cuda_default is not True:
             stale.append(name)
     if stale:
         print(
@@ -6020,8 +6061,14 @@ def load_vllm(
         fp32_head_overrides = {} if return_args else _vllm_fp32_lm_head_overrides(training)
         if fp32_head_overrides:
             engine_args["hf_overrides"] = {**engine_args.get("hf_overrides", {}), **fp32_head_overrides}
-            print("Unsloth: vLLM computes rollout logits with an fp32 lm_head (UNSLOTH_VLLM_FP32_LM_HEAD=1).")
-            _warn_fp32_lm_head_set_late()
+            if _fp32_lm_head_requested():
+                print("Unsloth: vLLM computes rollout logits with an fp32 lm_head (UNSLOTH_VLLM_FP32_LM_HEAD=1).")
+                _warn_fp32_lm_head_set_late()
+            else:
+                print(
+                    "Unsloth: vLLM computes rollout logits with an fp32 lm_head to match the trainer's logprobs "
+                    "(UNSLOTH_VLLM_FP32_LM_HEAD=0 turns it off)."
+                )
 
         # Pin the backend for the worker, which the sys.modules block only reaches under
         # fork. An explicit backend is a HARD pin: cuda.py raises "Selected backend ... is
