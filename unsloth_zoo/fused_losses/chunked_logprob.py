@@ -75,12 +75,12 @@ def chunked_logprob_rows(vocab_size, target_gb = None, n_rows = None, device = N
 _FUSED_LINEAR = os.environ.get("UNSLOTH_FUSED_LINEAR", "1") != "0"
 # aten::mm.dtype (torch >= 2.8): a 16-bit GEMM with float32 output, CUDA / ROCm kernels only, no autograd formula.
 # Used on CUDA only: ROCm keeps the float32 head copy it always had.
-_MM_OUT_DTYPE = hasattr(torch.ops.aten, "mm") and hasattr(torch.ops.aten.mm, "dtype") and torch.version.hip is None
+_MM_OUT_DTYPE = hasattr(torch.ops.aten, "mm") and hasattr(torch.ops.aten.mm, "dtype") and not is_rocm_torch(torch)
 # The fused kernels already score with float32-out logits here (fused_linear._logits_mode), so an fp32 lm_head
 # request keeps them instead of falling back to a float32 copy of the head. ROCm and
 # UNSLOTH_LOGPROB_FP32_LOGITS=0 / 2 give 16-bit logits there.
 _FUSED_FP32_LOGITS = (
-    _FUSED_LINEAR and _MM_OUT_DTYPE and torch.version.hip is None
+    _FUSED_LINEAR and _MM_OUT_DTYPE and not is_rocm_torch(torch)
     and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
     and torch.cuda.is_available()
 )

@@ -126,6 +126,7 @@ from unsloth_zoo.fused_losses import chunked_logprob, fused_linear
 from unsloth_zoo.temporary_patches import moe_utils
 print("FLAGS " + json.dumps({
     "fp32_out_gemm": chunked_logprob._FP32_OUT_GEMM,
+    "mm_out_dtype": chunked_logprob._MM_OUT_DTYPE,
     "hip_tiles": fused_linear._HIP_TILES,
     "is_hip": fused_linear._IS_HIP,
     "bwd_rows": fused_linear._BWD_ROWS,
@@ -146,11 +147,15 @@ def _import_flags(local_tag):
 
 
 def test_import_time_rocm_flags_on_an_sdk_wheel():
+    # aten::mm.dtype (float32-out 16-bit GEMM) is used on CUDA only, so it is on for a CUDA build whose torch has it.
+    mm_dtype_op = hasattr(torch.ops.aten, "mm") and hasattr(torch.ops.aten.mm, "dtype")
     assert _import_flags("+rocm7.14.0") == {
-        "fp32_out_gemm": False, "hip_tiles": True, "is_hip": True, "bwd_rows": 1024, "cuda_build": False,
+        "fp32_out_gemm": False, "mm_out_dtype": False, "hip_tiles": True, "is_hip": True, "bwd_rows": 1024,
+        "cuda_build": False,
     }
     assert _import_flags("+cu130") == {
-        "fp32_out_gemm": True, "hip_tiles": False, "is_hip": False, "bwd_rows": 4096, "cuda_build": True,
+        "fp32_out_gemm": True, "mm_out_dtype": mm_dtype_op, "hip_tiles": False, "is_hip": False, "bwd_rows": 4096,
+        "cuda_build": True,
     }
 
 
