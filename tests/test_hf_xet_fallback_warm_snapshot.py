@@ -121,7 +121,6 @@ def test_nothing_to_fetch_returns_snapshot_without_child(tmp_path, monkeypatch, 
     seen = _hub(monkeypatch, snap, ["config.json", "tokenizer.json", "model.safetensors", "README.md"])
     assert _call(tmp_path) == str(snap)
     assert _isolated.calls == []
-    # One bounded call, with the child's token / revision / repo type.
     assert seen["repo_info"] == [dict(repo_id = REPO, revision = "main", repo_type = "model",
                                       timeout = xf.DEFAULT_METADATA_TIMEOUT, token = "hf_tok")]
     assert seen["list_repo_tree"] == []
