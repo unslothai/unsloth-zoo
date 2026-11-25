@@ -27,6 +27,7 @@ __all__ = [
     "patch_function_past_key_values",
     "cache_kwarg_name",
     "adapt_cache_kwarg",
+    "ensure_cache_kwarg",
     "output_cache",
     "process_return",
     "process_output_options",
@@ -192,6 +193,17 @@ def adapt_cache_kwarg(new_func, old_name, new_name = "cache"):
     forward.__signature__ = signature.replace(parameters = parameters)
     forward._unsloth_cache_kwarg_adapter = (old_name, new_name)
     return forward
+
+
+def ensure_cache_kwarg(func, old_name, new_name = "cache"):
+    """adapt_cache_kwarg(func, old_name) when func still declares old_name and not new_name, else func."""
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return func
+    if old_name in params and new_name not in params:
+        return adapt_cache_kwarg(func, old_name, new_name)
+    return func
 
 
 def process_return(
