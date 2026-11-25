@@ -44,6 +44,8 @@ import os
 import warnings
 import torch
 
+from unsloth_zoo.rocm_build import is_rocm_torch
+
 try:
     from torch._dynamo.comptime import comptime as _comptime
 except Exception:
@@ -75,7 +77,7 @@ def _warn_once(kind, message):
 
 
 def rocm_flex_static_enabled():
-    return bool(getattr(torch.version, "hip", None)) and os.environ.get("UNSLOTH_ROCM_FLEX_STATIC", "1") != "0"
+    return is_rocm_torch(torch) and os.environ.get("UNSLOTH_ROCM_FLEX_STATIC", "1") != "0"
 
 
 def _affected_device(device):
