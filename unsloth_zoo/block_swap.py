@@ -103,6 +103,43 @@ def _codec():
     return _CODEC[0]
 
 
+_DISK = []
+
+
+class _NoDiskTier:
+    """Stands in when block_swap_disk cannot be imported: no disk tier, the host RAM refusal stays."""
+
+    @staticmethod
+    def disk_tier_reason():
+        return "unsloth_zoo.block_swap_disk unavailable"
+
+    @staticmethod
+    def host_limit_bytes():
+        return None
+
+    @staticmethod
+    def disk_ref(p):
+        return None
+
+
+def _disk():
+    """unsloth_zoo.block_swap_disk (a copy already in sys.modules first: tests load both files standalone)."""
+    if not _DISK:
+        mod = sys.modules.get("unsloth_zoo.block_swap_disk")
+        if mod is None and __package__ == "unsloth_zoo":
+            try:
+                from unsloth_zoo import block_swap_disk as mod
+            except Exception:
+                mod = None
+        _DISK.append(mod if mod is not None else _NoDiskTier)
+    return _DISK[0]
+
+
+def _has_disk_ref(p):
+    """True for a weight spilled to disk at load whose placeholder BlockSwap has not taken over yet."""
+    return getattr(p, "_unsloth_disk", None) is not None and _disk().disk_ref(p) is not None
+
+
 def _host_copy(t):
     return t.detach().to("cpu", copy = True).contiguous()
 
@@ -253,6 +290,9 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
     else:
         # Ranks that finished already took their bytes out of `free`; only the others' remaining bytes are held back.
         avail = free - others + on_host
+    limit = _disk().host_limit_bytes()
+    if limit is not None:
+        avail = min(avail, limit)
     # A peer that is copying a layer has already taken those bytes out of `free` but lowers its reservation
     # only once the layer is in: give in-flight peers a moment before refusing.
     retries = _PEER_RETRIES if others else 0
@@ -265,6 +305,8 @@ def _check_host_fit(sizes, on_host = 0, slack = 0):
             return None
         others = _others_host_pending(own)
         avail = free - (others or 0) + on_host
+        if limit is not None:
+            avail = min(avail, limit)
     if need <= avail:
         _publish_host_pending(own)
         return own
@@ -499,7 +541,8 @@ def _swappable(module):
 class _Block:
     __slots__ = ("params", "host", "devices", "index", "streams", "events", "resident", "slot", "sig",
                  "pending", "layout", "sizes", "src", "empties", "host_buf", "home",
-                 "t_copy", "copy_open", "copy_pending", "marks", "mark_open", "codec", "decoders")
+                 "t_copy", "copy_open", "copy_pending", "marks", "mark_open", "codec", "decoders",
+                 "disk", "disk_store", "disk_runs", "disk_state", "disk_ready", "disk_futs", "stage", "tier")
 
     def __init__(self, layer, streams, device, shared = ()):
         self.params, self.host, self.devices = [], [], []
@@ -509,7 +552,7 @@ class _Block:
                 continue
             index[id(p)] = len(self.params)
             self.params.append(p)
-            self.devices.append(device if p.data.device.type == "cpu" else p.data.device)
+            self.devices.append(device if p.data.device.type in ("cpu", "meta") else p.data.device)
         self.index = index
         # Each device's weights sit back to back, so a fetch is one copy per device, not one per tensor.
         self.layout, self.sizes = [], {}
@@ -538,6 +581,36 @@ class _Block:
         self.codec, self.decoders = {}, None
         self.home = self.devices[0] if self.devices else None
         self.sig = tuple((tuple(p.shape), p.dtype, d, off) for p, d, off in zip(self.params, self.devices, self.layout))
+        self.disk, self.disk_store, self.disk_runs, self.disk_state = None, None, (), 0
+        self.disk_ready, self.disk_futs, self.stage, self.tier = {}, None, None, None
+        refs = [_disk().disk_ref(p) if getattr(p, "_unsloth_disk", None) is not None else None for p in self.params]
+        if any(r is not None for r in refs):
+            if not all(r is not None for r in refs):
+                raise RuntimeError("Unsloth: offload_layers found a layer only partly spilled to disk.")
+            self.set_disk(refs)
+
+    def set_disk(self, refs):
+        """Serve this block from the spill file (rewritten once if its layout differs from the slot's)."""
+        mod = _disk()
+        store = refs[0].store
+        if len(self.sizes) != 1:
+            raise RuntimeError("Unsloth: offload_layers serves a layer from disk only when it fetches onto one card.")
+        bases = {r.offset - off for r, off in zip(refs, self.layout)}
+        if any(r.store is not store for r in refs) or len(bases) != 1 or next(iter(bases)) % mod.ALIGN:
+            hold = []
+            pieces = []
+            for p, r, off in zip(self.params, refs, self.layout):
+                buf, owner = mod.read_bytes(r.store, r.offset, r.nbytes)
+                hold.append(owner)
+                pieces.append((buf.view(r.dtype).view(r.shape) if r.nbytes else buf, off))
+            base = store.write_region(pieces, self.nbytes())
+            refs = [mod.DiskRef(store, base + off, r.nbytes, r.shape, r.dtype) for r, off in zip(refs, self.layout)]
+            del hold, pieces
+        else:
+            base = next(iter(bases))
+        self.disk = {"refs": refs, "base": base}
+        self.disk_store = store
+        self.disk_runs = ((base, mod._round_up(self.nbytes()), 0),)
 
     def nbytes(self):
         return sum(self.sizes.values())
@@ -552,7 +625,27 @@ class _Block:
                 self.host.append(view)
 
     def compressible(self):
-        return bool(self.params) and all(p.dtype == torch.bfloat16 for p in self.params)
+        return self.disk is None and bool(self.params) and all(p.dtype == torch.bfloat16 for p in self.params)
+
+    def spill(self):
+        """Write the weights to the spill file and serve the block from disk."""
+        mod = _disk()
+        store = mod._shared_spill(self.nbytes())
+        base = store.write_region([(p.data, off) for p, off in zip(self.params, self.layout)], self.nbytes())
+        self.set_disk([mod.DiskRef(store, base + off, p.data.nbytes, p.data.shape, p.data.dtype)
+                       for p, off in zip(self.params, self.layout)])
+
+    def disk_views(self, target = "cpu"):
+        """The block's weights read back from disk, on `target`."""
+        mod = _disk()
+        buf, owner = mod.read_bytes(self.disk_store, self.disk["base"], self.nbytes())
+        out = []
+        for shape, dt, _, off in self.sig:
+            n = torch.Size(shape).numel() * torch.empty(0, dtype = dt).element_size()
+            v = buf[off:off + n].view(dt).view(shape)
+            out.append(v.clone() if torch.device(target).type == "cpu" else v.to(target, copy = True))
+        del owner
+        return out
 
     def pack_compressed(self, arena, used, encode_device):
         """Like pack, but each device's region is stored encoded (when that saves bytes) at arena[used:].
@@ -627,6 +720,8 @@ class _Block:
 
     def host_views(self, target = "cpu"):
         """The block's weights from the host copy (decoded when compressed). Views of one buffer per device."""
+        if self.disk is not None:
+            return self.disk_views(target)
         if not self.compressed() and torch.device(target).type == "cpu":
             return self.host
         regions = {d: self._region_on(d, target) for d in self.host_buf}
@@ -637,6 +732,8 @@ class _Block:
     def evict(self):
         if not self.resident:
             return
+        if self.disk_state:
+            self.tier.cancel(self)
         for p, e in zip(self.params, self.empties):
             p.data = e
         self.resident = False
@@ -648,6 +745,9 @@ class _Block:
         if self.resident:
             return
         bufs, views = slot
+        if self.disk is not None:
+            self._prefetch_disk(slot)
+            return
         if self.copy_open:
             # The last copy is still in flight: keep its events for _harvest_copy, record this one on new ones.
             self.copy_pending.append((self.t_copy, self.events))
@@ -677,7 +777,32 @@ class _Block:
         self.slot = slot
         self.resident = True
 
+    def _prefetch_disk(self, slot):
+        # The card copy (enqueued once the read lands) waits on this event: the slot's previous user.
+        if self.copy_open or getattr(self, "copy_pending", None):
+            self.copy_pending.append((self.t_copy, self.events))
+            self.t_copy = {d: torch.cuda.Event(enable_timing = True) for d in self.sizes} if _TIMING else None
+            self.events = {d: torch.cuda.Event(enable_timing = _TIMING) for d in self.sizes}
+            self.copy_open = False
+        else:
+            # Fresh events: the compute stream must never wait on one recorded for an earlier fetch.
+            self.events = {d: torch.cuda.Event(enable_timing = _TIMING) for d in self.sizes}
+        self.disk_ready = {}
+        for d in self.sizes:
+            ev = torch.cuda.Event()
+            ev.record(torch.cuda.current_stream(d))
+            self.disk_ready[d] = ev
+        for p, v in zip(self.params, slot[1]):
+            p.data = v
+        self.slot = slot
+        self.resident = True
+        self.disk_state = 1
+        self.tier.submit(self)
+
     def wait(self):
+        if self.disk_state:
+            # Waiting on a not yet recorded event is a no-op: enqueue the copy first.
+            self.tier.complete(self)
         for d, event in self.events.items():
             torch.cuda.current_stream(d).wait_event(event)
 
@@ -743,6 +868,9 @@ class BlockSwap:
     _hwm_fresh = False
     _hwm_base = {}
     _peak_devs = ()
+    _to_spill = frozenset()
+    _disk_tier = None
+    _disk_seen = {}
 
     def __init__(self, layers, n, prefetch_depth = 2, device = None, placement = "tail", model = None):
         self.blocks, self.handles = [], []
@@ -788,10 +916,17 @@ class BlockSwap:
             for _, p in _swappable(layer):
                 owners.setdefault(id(p), set()).add(li)
         shared = {pid for pid, o in owners.items() if len(o) > 1}
+        for li, layer in enumerate(layers):
+            name = next((n for n, p in layer.named_parameters() if p.requires_grad and _has_disk_ref(p)), None)
+            if name is not None:
+                raise ValueError(
+                    f"Unsloth: layer {li}'s weight {name} lives in offload_layers' disk tier, which holds frozen "
+                    "weights only (LoRA / QLoRA). Full finetuning needs every trained weight in GPU or host RAM."
+                )
         # Accelerate leaves layers that did not fit at load on `meta`, with the real weights behind its hooks.
         for li in self.indices:
             name = next((n for n, p in _swappable(layers[li])
-                         if p.device.type == "meta" and id(p) not in shared), None)
+                         if p.device.type == "meta" and id(p) not in shared and not _has_disk_ref(p)), None)
             if name is not None:
                 raise ValueError(
                     f"Unsloth: offload_layers cannot swap layer {li}: its weight {name} is on the meta device, "
@@ -806,7 +941,7 @@ class BlockSwap:
             # One canonical key: params report cuda:N, so a bare "cuda" would split peaks and homes in two.
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.blocks = [_Block(layer, self.streams, self.device, shared) for layer in swapped]
-        sizes = [b.nbytes() for b in self.blocks]
+        self._disk_tier, self._to_spill, self._disk_seen = None, set(), {}
         # Every card a block's frozen weights land on gets slots, not only its home card.
         self._peak_devs = sorted({torch.device(dv) for b in self.blocks for dv in (*b.sizes, b.home) if dv is not None
                                   and torch.device(dv).type == "cuda"}, key = lambda d: d.index or 0)
@@ -839,20 +974,24 @@ class BlockSwap:
                 self._host_credit[next(iter(users[ptr]))] += n
         # Peak is the largest committed through block k minus released before k, not total less
         # credits.
-        if not _can_register():
-            # The chunked fallback commits whole chunks, rounded up to powers of two (padding included).
-            commits = _chunked_commits([b.sizes for b in self.blocks])
-        elif os.name == "nt":
-            # Windows commits the whole registered arena up front.
-            commits = [sum(sizes)] * len(sizes)
-        else:
-            # The Linux registered arena is pageable and fills block by block as it is written.
-            commits = list(itertools.accumulate(sizes))
-        # A block's worth of margin over the walk, for release lag; never above committing everything.
-        self._host_walk = _HostWalk(commits, self._host_credit, max(sizes, default = 0))
-        need = commits[-1] if commits else 0
-        peak = self._host_walk.pending(-1)
-        slack = need - sum(sizes)
+        def host_walk():
+            on_disk = [b.disk is not None or k in self._to_spill for k, b in enumerate(self.blocks)]
+            sizes = [0 if d else b.nbytes() for b, d in zip(self.blocks, on_disk)]
+            if not _can_register():
+                # The chunked fallback commits whole chunks, rounded up to powers of two (padding included).
+                commits = _chunked_commits([{} if d else b.sizes for b, d in zip(self.blocks, on_disk)])
+            elif os.name == "nt":
+                # Windows commits the whole registered arena up front.
+                commits = [sum(sizes)] * len(sizes)
+            else:
+                # The Linux registered arena is pageable and fills block by block as it is written.
+                commits = list(itertools.accumulate(sizes))
+            # A block's worth of margin over the walk, for release lag; never above committing everything.
+            walk = _HostWalk(commits, self._host_credit, max(sizes, default = 0))
+            need = commits[-1] if commits else 0
+            return sizes, walk, need, walk.pending(-1), need - sum(sizes)
+
+        sizes, self._host_walk, need, peak, slack = host_walk()
         try:
             # Before the host check: compressing packs through one raw region of scratch at a time.
             self._compress = self._compress_check()
@@ -863,16 +1002,26 @@ class BlockSwap:
         self._encode_scratch = 0
         if self._compress:
             self._encode_scratch = max((b.nbytes() for b in self.blocks if b.compressible()), default = 0)
+        staging = self._staging_bytes()
         try:
             try:
-                self._host_own = _check_host_fit(sizes, on_host = need - peak, slack = slack + self._encode_scratch)
-            except ValueError:
-                if not self._compress:
+                try:
+                    self._host_own = _check_host_fit(sizes + ([staging] if staging else []), on_host = need - peak,
+                                                     slack = slack + self._encode_scratch)
+                except ValueError:
+                    if not self._compress:
+                        raise
+                    # Fits raw but not with the encoder's scratch: swap raw rather than refuse.
+                    self._compress, self._decoders, self._encode_scratch = False, {}, 0
+                    self._compress_note = "no host room for the encoder's scratch"
+                    self._host_own = _check_host_fit(sizes + ([staging] if staging else []), on_host = need - peak,
+                                                     slack = slack)
+            except ValueError as e:
+                if not self._plan_disk(e):
                     raise
-                # Fits raw but not with the encoder's scratch: swap raw rather than refuse.
                 self._compress, self._decoders, self._encode_scratch = False, {}, 0
-                self._compress_note = "no host room for the encoder's scratch"
-                self._host_own = _check_host_fit(sizes, on_host = need - peak, slack = slack)
+                sizes, self._host_walk, need, peak, slack = host_walk()
+                self._host_own = _check_host_fit(sizes + [self._staging_bytes()], on_host = need - peak, slack = slack)
         except Exception:
             self._decoders = {}
             _end_host_session()
@@ -913,11 +1062,15 @@ class BlockSwap:
                         self.handles.append(
                             layer.register_forward_pre_hook(_opaque(self._plain_peak), with_kwargs = True))
 
+            if self._staging_bytes():
+                self._disk_tier = _disk().DiskTier(self._staging_bytes() // 2, slots = 2)
             self._pack()
             if self._compress:
                 self._build_decoders()
             # What sits in host RAM: compressed regions are smaller than host_bytes() (the raw size).
-            total = sum(b.wire_bytes() for b in self.blocks) if self._compress else self.host_bytes()
+            total = sum(b.wire_bytes() for b in self.blocks) if self._compress else self.ram_bytes()
+            if self._disk_tier is not None:
+                self._report_disk()
             if self.pinned_bytes < total:
                 # Pageable copies are several times slower than pinned ones and cannot hide behind compute.
                 print(f"Unsloth: offload_layers pinned {self.pinned_bytes / 2**30:.1f} of {total / 2**30:.1f} GiB of host "
@@ -939,11 +1092,75 @@ class BlockSwap:
                     self._hwm_fresh = True
                 except Exception:
                     self._hwm_fresh = False
+            # Only once installed: a failed install must leave load-time spills tagged for a retry.
+            for b in self.blocks:
+                if b.disk is not None:
+                    for p in b.params:
+                        p.__dict__.pop("_unsloth_disk", None)
         except Exception:
             self.remove()
             raise
         finally:
             _end_host_session()
+
+    def _on_disk(self, k):
+        return getattr(self.blocks[k], "disk", None) is not None or k in self._to_spill
+
+    def _staging_bytes(self):
+        """Pinned staging the disk tier needs: two slots of its largest block (a read lands while one copies out)."""
+        largest = max((b.nbytes() for k, b in enumerate(self.blocks) if self._on_disk(k)), default = 0)
+        return 2 * _disk()._round_up(largest) if largest else 0
+
+    def _plan_disk(self, error):
+        """Host RAM refused: keep the blocks that fit (sweep order), mark the rest for disk. False = re-raise."""
+        mod = _disk()
+        reason = mod.disk_tier_reason()
+        if reason is not None:
+            return False
+        movable = [k for k, b in enumerate(self.blocks) if b.disk is None and len(b.sizes) == 1 and b.params]
+        if not movable:
+            return False
+        try:
+            _, free = _host_free()
+        except Exception:
+            return False
+        budget = free + sum(self._host_credit)
+        limit = mod.host_limit_bytes()
+        if limit is not None:
+            budget = min(budget, limit)
+        largest = max(b.nbytes() for k, b in enumerate(self.blocks) if k in movable or b.disk is not None)
+        # Staging ring, plus a block of release lag.
+        ring = 2 * mod._round_up(largest)
+        if budget < ring:
+            raise ValueError(
+                f"Unsloth: offload_layers cannot fit even the disk tier's staging ring ({ring / 2**30:.2f} GiB, two "
+                f"of the largest swapped layer) in host RAM ({max(budget, 0) / 2**30:.2f} GiB usable). {error}")
+        budget -= ring + largest
+        used, spill = 0, set()
+        for k, b in enumerate(self.blocks):
+            if b.disk is not None:
+                continue
+            if k in movable and used + b.nbytes() > budget:
+                spill.add(k)
+            else:
+                used += b.nbytes()
+        if not spill:
+            return False
+        mod._shared_spill(sum(self.blocks[k].nbytes() for k in spill))
+        self._to_spill = spill
+        return True
+
+    def _report_disk(self):
+        disk = [b for b in self.blocks if b.disk is not None]
+        if not disk:
+            return
+        nbytes = sum(b.nbytes() for b in disk)
+        store = disk[0].disk_store
+        print(f"Unsloth: offload_layers serves {len(disk)} of {len(self.blocks)} swapped layers "
+              f"({nbytes / 2**30:.2f} GiB) from disk at {store.directory}, since GPU and host RAM cannot hold them "
+              f"({self.ram_bytes() / 2**30:.2f} GiB stay in host RAM). Each forward and each backward reads them "
+              f"again, about {2 * nbytes / 2**30:.2f} GiB from disk per micro-batch, so steps are disk bound: use a "
+              f"larger batch with fewer gradient accumulation steps. {_disk()._ENV}=0 refuses instead.")
 
     def _compress_check(self):
         """Compression is opt in, needs the registered arena (pageable chunks keep raw copies) and a device
@@ -1031,11 +1248,15 @@ class BlockSwap:
         # Block by block, releasing each original as soon as it is packed: never two host copies of the tail.
         if self._pack_registered():
             return
-        left = sum(b.nbytes() for b in self.blocks)
-        chunk = max(_CHUNK_BYTES, _pow2_ceil(max(max(b.sizes.values(), default = 0) for b in self.blocks)))
+        left = sum(b.nbytes() for k, b in enumerate(self.blocks) if not self._on_disk(k))
+        chunk = max(_CHUNK_BYTES, _pow2_ceil(max((max(b.sizes.values(), default = 0)
+                                                  for k, b in enumerate(self.blocks) if not self._on_disk(k)),
+                                                 default = 0)))
         budget = _pin_budget()
         buf, used = None, 0
         for k, b in enumerate(self.blocks):
+            if self._to_disk(k, b):
+                continue
             regions = {}
             for d, need in b.sizes.items():
                 if buf is None or used + need > buf.numel():
@@ -1071,10 +1292,13 @@ class BlockSwap:
         global _PINNED_MEMORY_AVAILABLE
         if not _can_register():
             return False
-        total = sum(b.nbytes() for b in self.blocks)
+        total = sum(b.nbytes() for k, b in enumerate(self.blocks) if not self._on_disk(k))
         arena = _lazy_host_empty(total)
         used, ends = 0, []
         for k, b in enumerate(self.blocks):
+            if self._to_disk(k, b):
+                ends.append(used)
+                continue
             if self._compress and b.compressible():
                 # Encoded regions are never larger than raw ones, so they fit the arena; on Linux its unused tail
                 # is never written and so never committed (and never pinned).
@@ -1098,6 +1322,17 @@ class BlockSwap:
                 self.pinned_bytes = pin
             except Exception:
                 _PINNED_MEMORY_AVAILABLE = False
+        return True
+
+    def _to_disk(self, k, b):
+        """Packing step of a disk-tier block: spill it unless spilled at load, then release it."""
+        if not self._on_disk(k):
+            return False
+        if b.disk is None:
+            b.spill()
+        b.tier = self._disk_tier
+        self._release(b)
+        self._publish_packed(k)
         return True
 
     def _release(self, block):
@@ -1197,6 +1432,12 @@ class BlockSwap:
     def _enter(self, i, args, kwargs):
         b = self.blocks[i]
         self.current = self.indices[i]
+        tier = getattr(self, "_disk_tier", None)
+        if tier is not None:
+            tier.pump()
+            if b.disk is not None and any(p.requires_grad for p in b.params):
+                raise ValueError("Unsloth: offload_layers' disk tier holds frozen weights only; a weight of layer "
+                                 f"{self.current} was unfrozen (full finetuning needs it in GPU or host RAM).")
         if self._auto and not self._settled:
             self._note_block_peak(b)
         self._fetch(b, steal = True)
@@ -1358,7 +1599,7 @@ class BlockSwap:
             # Every caller gets real values: peft's adapter save selects keys after this (biases, modules_to_save,
             # embeddings), so nothing may be left as an evicted placeholder. A compressed block decodes once per
             # call, which costs its raw size in host RAM for as long as the caller keeps the dict.
-            host = None if b.compressed() else b.host
+            host = None if (b.compressed() or b.disk is not None) else b.host
             for name, p in module.named_parameters(remove_duplicate = False):
                 idx = b.index.get(id(p))
                 if idx is not None and prefix + name in state_dict:
@@ -1406,6 +1647,9 @@ class BlockSwap:
             else:
                 parent._unsloth_replay_checkpoint = fn.__wrapped__
         self._ckpt_wrapped = weakref.WeakSet()
+        tier = getattr(self, "_disk_tier", None)
+        if tier is not None:
+            tier.drain()
         # Drain every copy / decode stream before any slot, staging buffer or host arena can be freed.
         for dev in list(self.streams) + [dec.stream.device for dec in (getattr(self, "_decoders", {}) or {}).values()]:
             try:
@@ -1417,7 +1661,11 @@ class BlockSwap:
         with _no_inference_mode():
             for b in self.blocks:
                 if not b.resident:
-                    if getattr(b, "codec", None) and b.compressed():
+                    if getattr(b, "disk", None) is not None:
+                        for p, t in zip(b.params, b.disk_views(b.devices[0])):
+                            p.data = t
+                            p.__dict__.pop("_unsloth_disk", None)
+                    elif getattr(b, "codec", None) and b.compressed():
                         # Decoded on the card one region at a time, then each weight gets its own storage; with
                         # no room for a decoded region next to the weights, decoded on the host instead.
                         for d in list(b.host_buf):
@@ -1455,6 +1703,9 @@ class BlockSwap:
         self.blocks = []
         self._decoders = {}
         self._chunks = []
+        if tier is not None:
+            tier.close()
+            self._disk_tier = None
         # A removed controller must not keep the model's layers (and their restored GPU weights) alive.
         self._reserve_layers, self._reserve_owner = (), None
         for dev in self.streams:
@@ -1478,7 +1729,14 @@ class BlockSwap:
                     p.data = e
 
     def host_bytes(self):
+        """Bytes of the swapped layers, wherever they live off the card (host RAM or the disk tier)."""
         return sum(b.nbytes() for b in self.blocks)
+
+    def ram_bytes(self):
+        return sum(b.nbytes() for b in self.blocks if getattr(b, "disk", None) is None)
+
+    def disk_bytes(self):
+        return sum(b.nbytes() for b in self.blocks if getattr(b, "disk", None) is not None)
 
     def compression_stats(self):
         """Engagement of the lossless fetch codec: compressed layers, stored vs raw bytes, decoded fetches."""
@@ -1700,8 +1958,11 @@ class BlockSwap:
             self._seen = dict(self._tot)
         state = {}
         for li, b in zip(self.indices, self.blocks):
+            on_disk = getattr(b, "disk", None) is not None
             if not b.resident:
-                state[li] = "host"
+                state[li] = "disk" if on_disk else "host"
+            elif on_disk and b.disk_state:
+                state[li] = "reading"
             elif b.pending:
                 state[li] = "held"
             elif not all(e.query() for e in b.events.values()):
@@ -1717,12 +1978,28 @@ class BlockSwap:
             "auto_depth": self._auto,
             "depth_settled": self._settled,
             "host_bytes": self.host_bytes(),
+            "ram_bytes": self.ram_bytes(),
             "pinned_bytes": self.pinned_bytes,
             "pool_bytes": self.pool_bytes(),
             "timing": _TIMING,
             "compression": self.compression_stats(),
             **window,
+            **self._disk_stats(reset),
         }
+
+    def _disk_stats(self, reset):
+        """Disk layers, plus reads / bytes / time since the last stats()."""
+        tier = getattr(self, "_disk_tier", None)
+        disk = [b for b in self.blocks if getattr(b, "disk", None) is not None]
+        out = {"disk_layers": len(disk), "disk_bytes": sum(b.nbytes() for b in disk),
+               "disk_dir": disk[0].disk_store.directory if disk else None}
+        now = tier.stats() if tier is not None else {}
+        seen = getattr(self, "_disk_seen", None) or {}
+        for k in ("disk_reads", "disk_read_bytes", "disk_read_ms", "disk_wait_ms"):
+            out[k] = now.get(k, 0) - seen.get(k, 0)
+        if reset and tier is not None:
+            self._disk_seen = dict(now)
+        return out
 
 
 _STAT_KEYS = ("copies", "copy_ms", "copy_bytes", "wire_bytes", "stall_ms", "compute_ms", "layers")
@@ -1853,10 +2130,46 @@ def _pool_bytes(sizes, depth, sigs = None):
     return sum(b * min(depth + 1, c) for b, c in counts.values())
 
 
-def auto_swap_indices(layers, reserve_bytes, prefetch_depth = 2, free_bytes = None):
+def auto_swap_indices(layers, reserve_bytes, prefetch_depth = 2, free_bytes = None, tiers = False,
+                      host_free_bytes = None):
     """Fewest layers to move to host RAM so each GPU keeps `reserve_bytes` free, net of the slot pool.
 
-    Returns (indices, shortfall_left); shortfall_left > 0 when one layer per device must stay and it is not enough."""
+    Returns (indices, shortfall_left); shortfall_left > 0 when one layer per device must stay and it is not enough.
+    `tiers = True` also returns the indices host RAM cannot hold (`host_free_bytes`, default the measured free RAM
+    less the system reserve and UNSLOTH_OFFLOAD_HOST_LIMIT), which BlockSwap serves from the disk tier."""
+    indices, left = _auto_swap_indices(layers, reserve_bytes, prefetch_depth, free_bytes)
+    if not tiers:
+        return indices, left
+    return indices, left, _disk_tier_indices(layers, indices, host_free_bytes)
+
+
+def _disk_tier_indices(layers, indices, host_free_bytes = None):
+    """The swapped `indices` past what host RAM holds, as BlockSwap's install splits them."""
+    if not indices:
+        return []
+    sizes = [sum(p.nbytes for _, p in _swappable(layers[i])) for i in indices]
+    if host_free_bytes is None:
+        try:
+            host_free_bytes = _host_free()[1] + sum(
+                p.nbytes for i in indices for _, p in _swappable(layers[i]) if p.device.type == "cpu")
+        except Exception:
+            return []
+        limit = _disk().host_limit_bytes()
+        if limit is not None:
+            host_free_bytes = min(host_free_bytes, limit)
+    if sum(sizes) <= host_free_bytes:
+        return []
+    budget = host_free_bytes - 2 * _disk()._round_up(max(sizes)) - max(sizes)
+    used, out = 0, []
+    for i, n in zip(indices, sizes):
+        if used + n > budget:
+            out.append(i)
+        else:
+            used += n
+    return out
+
+
+def _auto_swap_indices(layers, reserve_bytes, prefetch_depth = 2, free_bytes = None):
     # Params shared across layers stay on the card under BlockSwap, so they free nothing.
     owners = {}
     for i, layer in enumerate(layers):
@@ -1978,6 +2291,40 @@ def _host_layer_bytes(make_layer, idx, tensors, compute_dtype, quantize_4bit, sk
     return total
 
 
+def _spill_layer_weights(layer, shared_ids, need_bytes):
+    """Spill a frozen layer's swappable weights in _Block's slot layout (a fetch is one read); the rest goes to
+    host RAM as usual. Returns the region's bytes."""
+    params = [p for _, p in _swappable(layer) if id(p) not in shared_ids]
+    layout, off = [], 0
+    for p in params:
+        layout.append(off)
+        off += -(-p.data.nbytes // _ALIGN) * _ALIGN
+    if params:
+        _disk().spill_params(params, layout, off, need_bytes = need_bytes(off))
+    spilled = {id(p) for p in params}
+    with torch.no_grad():
+        for p in layer.parameters():
+            if id(p) not in spilled and p.device.type not in ("cpu", "meta"):
+                p.data = p.data.to("cpu")
+    return off
+
+
+def _ram_layers_beside_disk(sizes):
+    """How many of `sizes` fit host RAM beside the staging ring; None when the disk tier is off."""
+    mod = _disk()
+    if mod.disk_tier_reason() is not None or not sizes:
+        return None
+    largest = max(sizes)
+    extra = [2 * mod._round_up(largest), largest]
+    for m in range(len(sizes), -1, -1):
+        try:
+            _check_host_fit(list(sizes[:m]) + extra)
+            return m
+        except ValueError:
+            continue
+    return None
+
+
 def build_host_layers(make_layer, first_idx, count, tensors, device, compute_dtype,
                       quantize_4bit = False, skip_modules = (), prefix = "model.layers."):
     """Build layers [first_idx, first_idx + count) with frozen weights in pinned host RAM; quant_state stays on `device`."""
@@ -1998,7 +2345,13 @@ def _build_host_layers(make_layer, first_idx, count, tensors, device, compute_dt
                        prefix, bnb):
     sizes = [_host_layer_bytes(make_layer, idx, tensors, compute_dtype, quantize_4bit, skip_modules, prefix)
              for idx in range(first_idx, first_idx + count)]
-    _check_host_fit(sizes)
+    ram = len(sizes)
+    try:
+        _check_host_fit(sizes)
+    except ValueError:
+        ram = _ram_layers_beside_disk(sizes)
+        if ram is None:
+            raise
     out = []
     pending = sum(sizes)
     for idx in range(first_idx, first_idx + count):
@@ -2057,6 +2410,9 @@ def _build_host_layers(make_layer, first_idx, count, tensors, device, compute_dt
         for bname, b in layer.named_buffers():
             if b.device.type == "meta":
                 raise RuntimeError(f"block_swap: {base}{bname} is a buffer with no checkpoint value")
+        if len(out) >= ram:
+            left = len(sizes) - len(out)
+            _spill_layer_weights(layer, (), lambda first, left = left: first * left)
         out.append(layer)
     return out
 
@@ -2134,6 +2490,7 @@ class _HostLoad:
         # bits.
         self.decl, self.kind_ratios = {}, {}
         self.cpu_to_come = 0
+        self.disk, self.disk_sizes = set(), []
 
     def bind(self, model):
         if self.layers is not None:
@@ -2288,10 +2645,19 @@ class _HostLoad:
             p.nbytes for n, p in _counted_named(layer) if n in owned and p.device.type != "meta")
         to_come = self._layers_to_come(owned_size, i)
         copied = sum(p.nbytes for p in params if p.device.type not in ("cpu", "meta") and id(p) in counted)
-        own = _check_host_fit(self.done_bytes + self.embedding_bytes + self._pending_embedding_bytes() + to_come,
-                              sum(self.done_bytes) + sum(self.embedding_bytes)
-                              + sum(p.nbytes for p in params if p.device.type == "cpu" and id(p) in counted)
-                              + self.cpu_to_come + self._pending_embedding_cpu_bytes())
+        on_host = sum(self.done_bytes) + sum(self.embedding_bytes) + \
+            sum(p.nbytes for p in params if p.device.type == "cpu" and id(p) in counted)
+        try:
+            if self.disk:
+                raise ValueError("spilling")
+            own = _check_host_fit(self.done_bytes + self.embedding_bytes + self._pending_embedding_bytes() + to_come,
+                                  on_host + self.cpu_to_come + self._pending_embedding_cpu_bytes())
+        except ValueError:
+            own = self._ram_or_disk(i, layer, params, size, on_host)
+            if own is False:
+                raise
+            if own == "disk":
+                return
         with torch.no_grad():
             for p in params:
                 if p.is_floating_point():
@@ -2310,6 +2676,41 @@ class _HostLoad:
         if own is not None:
             # Now in host RAM, so out of what other local ranks must hold back for this one.
             _publish_host_pending(max(0, own - copied))
+
+    def _ram_or_disk(self, i, layer, params, size, on_host):
+        """Host RAM if layer i fits beside those there and the staging ring, else disk ("disk"); False = tier off."""
+        mod = _disk()
+        if mod.disk_tier_reason() is not None or any(p.device.type == "meta" and not _has_disk_ref(p) for p in params):
+            return False
+        largest = max([size] + self.disk_sizes)
+        staging = 2 * mod._round_up(largest)
+        try:
+            # Streamed tables cannot go to disk: they keep their room.
+            return _check_host_fit(self.done_bytes + self.embedding_bytes + self._pending_embedding_bytes()
+                                   + [size, staging, largest], on_host + self._pending_embedding_cpu_bytes())
+        except ValueError:
+            pass
+        self._spill_layer(i, layer)
+        return "disk"
+
+    def _spill_layer(self, i, layer):
+        """Spill layer i's frozen weights; they become placeholders."""
+        mod = _disk()
+        with torch.no_grad():
+            for p in layer.parameters():
+                if p.is_floating_point():
+                    p.requires_grad_(False)
+        others = {id(p) for j, other in enumerate(self.layers) if j != i for p in other.parameters()}
+        left = len([j for j in self.indices if j not in self.done])
+        off = _spill_layer_weights(layer, others, lambda first: first * max(1, left))
+        self.done.add(i)
+        self.done_bytes.append(0)
+        self.disk.add(i)
+        self.disk_sizes.append(off)
+        self.last_done = i
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def on_param(self, model, target_name):
         self.bind(model)
