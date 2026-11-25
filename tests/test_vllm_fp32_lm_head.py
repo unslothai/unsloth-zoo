@@ -14,9 +14,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""UNSLOTH_VLLM_FP32_LM_HEAD=1 runs the output head in fp32 on both GRPO sides: trainer logits stay fp32 under bf16
-autocast and unchanged when off; load_vllm passes hf_overrides head_dtype=float32 only where vLLM honours it
-(LogitsProcessor._apply_head, vLLM >= 0.26.0) and refuses otherwise."""
+"""The fp32 output head on both GRPO sides: trainer logits stay fp32 under bf16 autocast and unchanged when off;
+load_vllm passes hf_overrides head_dtype=float32 only where vLLM honours it (LogitsProcessor._apply_head,
+vLLM >= 0.26.0). UNSLOTH_VLLM_FP32_LM_HEAD=1 refuses an older vLLM, =0 turns it off, and unset (the default)
+requests it on CUDA whenever the trainer scorers project in fp32, silently skipping it otherwise."""
 
 import ast
 import os
@@ -79,17 +80,23 @@ def test_fp32_head_gradients_flow():
     assert weight.grad is not None and weight.grad.dtype == torch.bfloat16
 
 
-def test_off_is_bit_identical_to_default():
+def test_default_is_bit_identical_to_the_def_time_flag():
+    # The default is the flag bound at import (on for CUDA hosts, off on CPU / ROCm or with =0), nothing else.
+    import inspect
+    flag = inspect.signature(chunked_hidden_states_selective_log_softmax).parameters["fp32_lm_head"].default
     states, weight, index = _inputs(2)
     with torch.autocast(device_type = "cpu", dtype = torch.bfloat16):
         a = chunked_hidden_states_selective_log_softmax(states, weight, index, 2, 0.0, 0.0, 0.0, 0.9)
         b = chunked_hidden_states_selective_log_softmax(
-            states, weight, index, 2, 0.0, 0.0, 0.0, 0.9, fp32_lm_head = False,
+            states, weight, index, 2, 0.0, 0.0, 0.0, 0.9, fp32_lm_head = flag,
         )
     assert torch.equal(a, b)
 
 
-@pytest.mark.parametrize("value, expected", [(None, "False"), ("0", "False"), ("1", "True")])
+_AUTO_DEFAULT = str(torch.version.hip is None and torch.cuda.is_available() and hasattr(torch.ops.aten.mm, "dtype"))
+
+
+@pytest.mark.parametrize("value, expected", [(None, _AUTO_DEFAULT), ("0", "False"), ("1", "True")])
 def test_env_sets_the_default(value, expected):
     # The default is bound when the function is defined, so probe a fresh interpreter.
     env = {k: v for k, v in os.environ.items() if k != "UNSLOTH_VLLM_FP32_LM_HEAD"}
@@ -113,12 +120,12 @@ def _vllm_utils_tree():
 def _helpers(monkeypatch, has_apply_head, version):
     tree = _vllm_utils_tree()
     wanted = {
-        "_fp32_lm_head_requested", "_vllm_supports_fp32_lm_head", "_vllm_fp32_lm_head_overrides",
-        "_patch_vllm_fp32_lm_head_excluded_quant",
+        "_fp32_lm_head_mode", "_fp32_lm_head_requested", "_trainer_fp32_lm_head_default",
+        "_vllm_supports_fp32_lm_head", "_vllm_fp32_lm_head_overrides", "_patch_vllm_fp32_lm_head_excluded_quant",
     }
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
     assert {n.name for n in nodes} == wanted
-    ns = {"os": os, "vllm_version": version}
+    ns = {"os": os, "inspect": __import__("inspect"), "vllm_version": version}
     exec(compile(ast.Module(body = nodes, type_ignores = []), "vllm_utils_helpers", "exec"), ns)
 
     class LogitsProcessor:
@@ -132,10 +139,52 @@ def _helpers(monkeypatch, has_apply_head, version):
     return ns
 
 
-def test_overrides_off_by_default(monkeypatch):
+def _fake_platform(monkeypatch, cuda):
+    platforms = types.ModuleType("vllm.platforms")
+    platforms.current_platform = types.SimpleNamespace(is_cuda = lambda: cuda)
+    monkeypatch.setitem(sys.modules, "vllm.platforms", platforms)
+
+
+def _fake_trainer_default(monkeypatch, ns, value):
+    monkeypatch.setitem(ns, "_trainer_fp32_lm_head_default", lambda: value)
+
+
+def test_default_is_silent_on_old_vllm(monkeypatch):
+    # Unset on a vLLM without head_dtype (0.11.2 - 0.25.x): no override and no error.
     monkeypatch.delenv("UNSLOTH_VLLM_FP32_LM_HEAD", raising = False)
     ns = _helpers(monkeypatch, has_apply_head = False, version = "0.11.2")
+    _fake_platform(monkeypatch, cuda = True)
+    _fake_trainer_default(monkeypatch, ns, True)
     assert ns["_vllm_fp32_lm_head_overrides"](True) == {}
+
+
+@pytest.mark.parametrize("cuda, trainer_fp32, expected", [
+    (True, True, {"head_dtype": "float32"}),
+    (False, True, {}),   # ROCm / XPU: the fused trainer logits are 16-bit there
+    (True, False, {}),   # the trainer scorers project in 16-bit (UNSLOTH_LOGPROB_FP32_LOGITS, ROCm torch)
+])
+def test_default_follows_the_trainer_on_supported_vllm(monkeypatch, cuda, trainer_fp32, expected):
+    monkeypatch.delenv("UNSLOTH_VLLM_FP32_LM_HEAD", raising = False)
+    ns = _helpers(monkeypatch, has_apply_head = True, version = "0.34.0")
+    _fake_platform(monkeypatch, cuda = cuda)
+    _fake_trainer_default(monkeypatch, ns, trainer_fp32)
+    assert ns["_vllm_fp32_lm_head_overrides"](True) == expected
+    assert ns["_vllm_fp32_lm_head_overrides"](False) == {}
+
+
+def test_zero_opts_out_on_supported_vllm(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_VLLM_FP32_LM_HEAD", "0")
+    ns = _helpers(monkeypatch, has_apply_head = True, version = "0.34.0")
+    _fake_platform(monkeypatch, cuda = True)
+    _fake_trainer_default(monkeypatch, ns, True)
+    assert ns["_vllm_fp32_lm_head_overrides"](True) == {}
+
+
+def test_trainer_default_reads_the_real_scorer():
+    import inspect as _inspect
+    ns = _exec_helpers("0.34.0")
+    real = _inspect.signature(chunked_hidden_states_selective_log_softmax).parameters["fp32_lm_head"].default
+    assert ns["_trainer_fp32_lm_head_default"]() is real
 
 
 def test_overrides_on_supported_vllm(monkeypatch):
@@ -215,11 +264,11 @@ def _fake_vllm_layers(monkeypatch, accepts_linear_method):
 
 def _exec_helpers(version):
     wanted = {
-        "_fp32_lm_head_requested", "_vllm_supports_fp32_lm_head", "_vllm_fp32_lm_head_overrides",
-        "_patch_vllm_fp32_lm_head_excluded_quant",
+        "_fp32_lm_head_mode", "_fp32_lm_head_requested", "_trainer_fp32_lm_head_default",
+        "_vllm_supports_fp32_lm_head", "_vllm_fp32_lm_head_overrides", "_patch_vllm_fp32_lm_head_excluded_quant",
     }
     nodes = [n for n in _vllm_utils_tree().body if isinstance(n, ast.FunctionDef) and n.name in wanted]
-    ns = {"os": os, "vllm_version": version}
+    ns = {"os": os, "inspect": __import__("inspect"), "vllm_version": version}
     exec(compile(ast.Module(body = nodes, type_ignores = []), "vllm_utils_helpers", "exec"), ns)
     return ns
 
@@ -264,11 +313,40 @@ def test_excluded_quant_head_untouched_on_vllm_029(monkeypatch):
     original = LogitsProcessor._apply_head
     ns = _exec_helpers("0.29.0")
     assert ns["_vllm_fp32_lm_head_overrides"](True) == {"head_dtype": "float32"}
-    assert LogitsProcessor._apply_head is original
+    # Wrapped only for the quantized-head fallback: plain heads reach vLLM's own method with their quant method.
+    assert LogitsProcessor._apply_head.__wrapped__ is original
+    head = _excluded_head(Linear)
+    hidden = torch.randn(3, 16).to(torch.bfloat16)
+    processor = LogitsProcessor()
+    processor.head_dtype = torch.float32
+    out = processor._apply_head(head, hidden, None)
+    assert out.dtype == torch.float32 and type(head.quant_method) is Linear
+
+
+@pytest.mark.parametrize("accepts_linear_method, version", [(False, "0.27.0"), (True, "0.34.0")])
+def test_quantized_head_keeps_the_model_dtype(monkeypatch, capsys, accepts_linear_method, version):
+    # vLLM raises for an fp32 head_dtype on a quantized lm_head (GGUF, AWQ / GPTQ heads): project it as usual.
+    monkeypatch.setenv("UNSLOTH_VLLM_FP32_LM_HEAD", "1")
+    LogitsProcessor, Linear, Embedding = _fake_vllm_layers(monkeypatch, accepts_linear_method = accepts_linear_method)
+    ns = _exec_helpers(version)
+    assert ns["_vllm_fp32_lm_head_overrides"](True) == {"head_dtype": "float32"}
+
+    class QuantMethod:
+        def apply(self, layer, x, bias = None):
+            return torch.nn.functional.linear(x, layer.weight, bias)
+
+    head = _excluded_head(QuantMethod)
+    hidden = torch.randn(3, 16).to(torch.bfloat16)
+    processor = LogitsProcessor()
+    processor.head_dtype = torch.float32
+    out = processor._apply_head(head, hidden, None)
+    processor._apply_head(head, hidden, None)
+    assert out.dtype == torch.bfloat16
+    assert capsys.readouterr().out.count("lm_head is quantized") == 1
 
 
 def test_excluded_quant_patch_not_reached_when_off(monkeypatch):
-    monkeypatch.delenv("UNSLOTH_VLLM_FP32_LM_HEAD", raising = False)
+    monkeypatch.setenv("UNSLOTH_VLLM_FP32_LM_HEAD", "0")
     LogitsProcessor, Linear, Embedding = _fake_vllm_layers(monkeypatch, accepts_linear_method = False)
     original = LogitsProcessor._apply_head
     ns = _exec_helpers("0.27.0")
@@ -316,10 +394,12 @@ def test_flag_set_after_import_warns(monkeypatch, capsys, trainer_default, warns
 
 
 def test_flag_set_late_against_the_real_projectors(monkeypatch, capsys):
-    # The real module was imported with the flag off in this process: its defaults are False.
+    # Warns exactly when the real projectors were defined with the flag off (unset on CPU / ROCm, or =0).
+    import inspect
     import unsloth_zoo.rl_replacements as rl
     monkeypatch.setitem(sys.modules, "unsloth_zoo.rl_replacements", rl)
-    assert _late_warning_helper()() is (os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0") != "1")
+    default = inspect.signature(rl.chunked_hidden_states_selective_log_softmax).parameters["fp32_lm_head"].default
+    assert _late_warning_helper()() is (default is False)
 
 
 def test_load_vllm_warns_when_the_override_is_applied():

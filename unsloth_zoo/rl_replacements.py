@@ -217,9 +217,16 @@ def chunked_hidden_states_selective_log_softmax(
     support_triton_sampler: bool = False,
     support_excluded_ids: Optional[torch.Tensor] = None,
     # Read in the default for the same Dynamo reason as max_rows_per_chunk. Pairs with vLLM's
-    # head_dtype=float32 that load_vllm requests under the same flag.
+    # head_dtype=float32 that load_vllm requests under the same flag: on by default on CUDA (not ROCm),
+    # UNSLOTH_VLLM_FP32_LM_HEAD=0 turns both sides off.
     fp32_lm_head: bool = (
-        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes")
+        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip().lower() in ("1", "true", "on", "yes")
+        or (
+            os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip() == ""
+            and torch.version.hip is None and torch.cuda.is_available()
+            and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
+            and hasattr(torch.ops.aten.mm, "dtype")
+        )
     ),
     # Older Unsloth scores old / ref log-probs here and the policy with the fused kernel: one scorer keeps ratio at 1.
     fused_linear: bool = (
@@ -229,7 +236,9 @@ def chunked_hidden_states_selective_log_softmax(
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
-    if (fused_linear and _chunked_logprob._FUSED_LINEAR and not fp32_lm_head
+    # The fused kernel's logits are already float32-out wherever _FUSED_FP32_LOGITS holds, so an fp32 head keeps it.
+    if (fused_linear and _chunked_logprob._FUSED_LINEAR
+            and (not fp32_lm_head or _chunked_logprob.fused_fp32_logits_ok(lm_head))
             and support_top_k == 0 and support_top_p == 1.0 and support_min_p == 0.0
             and support_excluded_ids is None):
         return _chunked_logprob.unsloth_chunked_logprobs(
@@ -278,8 +287,10 @@ def chunked_hidden_states_selective_log_softmax(
     chunked_hidden_states = [flat_hidden_states[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
     chunked_index = [flat_index[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
 
-    # Cast once, outside the loop, so every chunk shares one fp32 head copy (also for autograd).
-    if fp32_lm_head:
+    # A 16-bit CUDA head projects with float32 output (no head copy); elsewhere cast once, outside the loop,
+    # so every chunk shares one fp32 head copy (also for autograd).
+    fp32_out = fp32_lm_head and _chunked_logprob.fp32_out_linear_ok(lm_head)
+    if fp32_lm_head and not fp32_out:
         lm_head = lm_head.to(torch.float32)
         if lm_head_bias is not None:
             lm_head_bias = lm_head_bias.to(torch.float32)
@@ -297,7 +308,10 @@ def chunked_hidden_states_selective_log_softmax(
         # bit-identical to before.
         chunk_hidden_states = chunk_hidden_states.to(device = lm_head.device, dtype = lm_head.dtype)
         chunk_index = chunk_index.to(lm_head.device)
-        if fp32_lm_head:
+        if fp32_out:
+            with torch.autocast(device_type = chunk_hidden_states.device.type, enabled = False):
+                chunk_logits = _chunked_logprob.fp32_out_linear(chunk_hidden_states, lm_head, lm_head_bias)
+        elif fp32_lm_head:
             # The GRPO loss runs this under bf16 / fp16 autocast, which would downcast the matmul.
             with torch.autocast(device_type = chunk_hidden_states.device.type, enabled = False):
                 chunk_logits = torch.nn.functional.linear(chunk_hidden_states, lm_head, lm_head_bias)
@@ -361,7 +375,13 @@ def chunked_hidden_states_selective_log_softmax_recompute(
     # Same flag and default as chunked_hidden_states_selective_log_softmax, which scores old / ref
     # logps: entropy and recompute scoring must project the head in the same precision.
     fp32_lm_head: bool = (
-        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes")
+        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip().lower() in ("1", "true", "on", "yes")
+        or (
+            os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip() == ""
+            and torch.version.hip is None and torch.cuda.is_available()
+            and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
+            and hasattr(torch.ops.aten.mm, "dtype")
+        )
     ),
     fused_linear: bool = (
         os.environ.get("UNSLOTH_FUSED_LINEAR", "1") != "0"
@@ -374,7 +394,8 @@ def chunked_hidden_states_selective_log_softmax_recompute(
     # Body-local: this source is copied into the generated trainer without its imports.
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
     # hidden_states None is the import-time build call below: it only sets up the recompute function.
-    if hidden_states is not None and fused_linear and _chunked_logprob._FUSED_LINEAR and not fp32_lm_head:
+    if (hidden_states is not None and fused_linear and _chunked_logprob._FUSED_LINEAR
+            and (not fp32_lm_head or _chunked_logprob.fused_fp32_logits_ok(lm_head))):
         from unsloth_zoo.fused_losses.fused_linear import fused_linear_logprobs
         return fused_linear_logprobs(
             hidden_states, lm_head, index, bias = lm_head_bias, temperature = temperature,
@@ -619,17 +640,27 @@ chunked_hidden_states_selective_log_softmax_recompute(None, None, None)
 RL_REPLACEMENTS["grpo_selective_log_softmax_recompute"] = chunked_hidden_states_selective_log_softmax_recompute
 
 
+def grpo_fp32_lm_head_default():
+    """The scorers' fp32 lm_head default (their def-time `fp32_lm_head`), read now: UNSLOTH_VLLM_FP32_LM_HEAD=1 on,
+    =0 off, unset on for CUDA (not ROCm) with fp32 fused logits (torch >= 2.8, aten::mm.dtype)."""
+    value = os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "").strip()
+    if value.lower() in ("1", "true", "on", "yes"):
+        return True
+    return (
+        value == "" and torch.version.hip is None and torch.cuda.is_available()
+        and os.environ.get("UNSLOTH_LOGPROB_FP32_LOGITS", "1") == "1"
+        and hasattr(torch.ops.aten.mm, "dtype")
+    )
+
+
 def grpo_scorer_keeps_logits(support_kwargs = None, **extra_kwargs):
     """True when GRPO falls back to the old chunked scorer, which keeps every chunk's logits for backward."""
     support = dict(support_kwargs or {}, **extra_kwargs)
-    fp32_head = support.get(
-        "fp32_lm_head",
-        os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes"),
-    )
+    fp32_head = support.get("fp32_lm_head", grpo_fp32_lm_head_default())
     from unsloth_zoo.fused_losses import chunked_logprob as _chunked_logprob
     return bool(
         (not _chunked_logprob._FUSED_LINEAR)
-        or fp32_head
+        or (fp32_head and not _chunked_logprob._FUSED_FP32_LOGITS)
         or support.get("support_top_k", 0)
         or support.get("support_top_p", 1.0) != 1.0
         or support.get("support_min_p", 0.0)
@@ -721,8 +752,14 @@ def _kept_set_save(keep, sparse, z = None, logits = None, logits_dtype = None):
     return None
 
 
-def _kept_set_logits(chunk_hidden_states, lm_head, lm_head_bias):
+def _kept_set_logits(chunk_hidden_states, lm_head, lm_head_bias, fp32_out = False):
     chunk_hidden_states = chunk_hidden_states.to(device = lm_head.device, dtype = lm_head.dtype)
+    if fp32_out:
+        # fp32 lm_head on a 16-bit CUDA head: float32-out GEMM, no head copy (no grad here: _KeptSetLogprobs
+        # takes its own backward).
+        from unsloth_zoo.fused_losses.chunked_logprob import fp32_out_linear
+        with torch.no_grad():
+            return fp32_out_linear(chunk_hidden_states, lm_head, lm_head_bias)
     if lm_head_bias is None:
         return chunk_hidden_states @ lm_head.t()
     return torch.nn.functional.linear(chunk_hidden_states, lm_head, lm_head_bias)
@@ -762,8 +799,9 @@ class _KeptSetLogprobs(torch.autograd.Function):
     # Saves only per-row stats and the kept set: CSR ids with the forward's z there (frozen head, sparse), else a
     # 1-bit mask and the backward recomputes the logits. The kept set is detached.
     @staticmethod
-    def forward(ctx, hidden_states, lm_head, lm_head_bias, index, bounds, transforms, support):
+    def forward(ctx, hidden_states, lm_head, lm_head_bias, index, bounds, transforms, support, fp32_out = False):
         device_type = lm_head.device.type
+        ctx.fp32_out = fp32_out
         ctx.autocast_kwargs = dict(
             device_type = device_type,
             enabled = torch.is_autocast_enabled(device_type),
@@ -775,7 +813,7 @@ class _KeptSetLogprobs(torch.autograd.Function):
         max_density = 0.0 if _kept_set_is_compiling() else _kept_set_sparse_max_density()
         sparse = max_density > 0.0 and not any(ctx.needs_input_grad[1:3])
         for a, b in zip(bounds[:-1], bounds[1:]):
-            logits = _kept_set_logits(hidden_states[a:b], lm_head, lm_head_bias)
+            logits = _kept_set_logits(hidden_states[a:b], lm_head, lm_head_bias, fp32_out)
             z = _kept_set_transform(logits, *transforms)
             logits_dtype = logits.dtype
             # The softcap derivative needs the raw logits; without a softcap they are freed as before.
@@ -858,7 +896,7 @@ class _KeptSetLogprobs(torch.autograd.Function):
                 # W[U] (+ its cast) and the R x |U| buffers must cost less than the R x V buffers they replace:
                 # a short chunk under a wide head can pass the density cutoff and still gather more than that.
                 head_bytes = width * lm_head.shape[1] * lm_head.element_size()
-                if lm_head.dtype != logits_dtype:
+                if lm_head.dtype != logits_dtype and not ctx.fp32_out:
                     head_bytes += width * lm_head.shape[1] * torch.empty((), dtype = logits_dtype).element_size()
                 per_logit = z_vals.element_size() + 1 + torch.empty((), dtype = logits_dtype).element_size() \
                     + (raw_vals.element_size() if raw_vals is not None else 0)
@@ -888,7 +926,7 @@ class _KeptSetLogprobs(torch.autograd.Function):
                 _GRPO_TRUNCATED_SUPPORT_STATS[stat] = _GRPO_TRUNCATED_SUPPORT_STATS.get(stat, 0) + 1
             if z is None:
                 with torch.no_grad(), torch.autocast(**ctx.autocast_kwargs):
-                    logits = _kept_set_logits(chunk_hidden_states, lm_head, lm_head_bias)
+                    logits = _kept_set_logits(chunk_hidden_states, lm_head, lm_head_bias, ctx.fp32_out)
                 z = _kept_set_transform(logits, scale_multiply, scale_divide, softcapping, 1.0)
                 if temperature != 1.0:
                     z = z / temperature
@@ -922,7 +960,8 @@ class _KeptSetLogprobs(torch.autograd.Function):
                 grad_z = grad_z / scale_divide
             if scale_multiply != 0.0:
                 grad_z = grad_z * scale_multiply
-            grad_logits = grad_z.to(logits_dtype)
+            # float32-out logits of a 16-bit head: the gradient GEMMs run in the head dtype, as for the plain head.
+            grad_logits = grad_z.to(lm_head.dtype if ctx.fp32_out else logits_dtype)
             del grad_z
             if ids is not None:
                 # Gathered only now, after the probability / derivative buffers are gone.
@@ -964,7 +1003,7 @@ class _KeptSetLogprobs(torch.autograd.Function):
             grad_head = grad_head.to(lm_head.dtype)
         if need_bias:
             grad_bias = grad_bias.to(lm_head_bias.dtype)
-        return grad_hidden, grad_head, grad_bias, None, None, None, None
+        return grad_hidden, grad_head, grad_bias, None, None, None, None, None
 pass
 
 
@@ -1000,7 +1039,10 @@ def grpo_kept_set_logprobs(
     transforms = (float(logit_scale_multiply), float(logit_scale_divide), float(logit_softcapping), float(temperature))
     support = (int(support_top_k), float(support_top_p), float(support_min_p), bool(support_triton_sampler), support_excluded_ids)
     _GRPO_TRUNCATED_SUPPORT_STATS["kept_set_recompute"] = _GRPO_TRUNCATED_SUPPORT_STATS.get("kept_set_recompute", 0) + 1
-    if fp32_lm_head:
+    from unsloth_zoo.fused_losses.chunked_logprob import fp32_out_linear_ok
+    # A 16-bit CUDA head keeps its dtype and projects with float32 output; elsewhere one fp32 head copy.
+    fp32_out = bool(fp32_lm_head) and fp32_out_linear_ok(lm_head)
+    if fp32_lm_head and not fp32_out:
         lm_head = lm_head.to(torch.float32)
         if lm_head_bias is not None:
             lm_head_bias = lm_head_bias.to(torch.float32)
@@ -1013,13 +1055,13 @@ def grpo_kept_set_logprobs(
     with autocast_off if autocast_off is not None else nullcontext():
         if needs_grad:
             logps = _KeptSetLogprobs.apply(
-                flat_hidden_states, lm_head, lm_head_bias, flat_index, bounds, transforms, support,
+                flat_hidden_states, lm_head, lm_head_bias, flat_index, bounds, transforms, support, fp32_out,
             )
         else:
             out = []
             with torch.no_grad():
                 for a, b in zip(bounds[:-1], bounds[1:]):
-                    logits = _kept_set_logits(flat_hidden_states[a:b], lm_head, lm_head_bias)
+                    logits = _kept_set_logits(flat_hidden_states[a:b], lm_head, lm_head_bias, fp32_out)
                     z = _kept_set_transform(logits, *transforms)
                     del logits
                     logp, _, _ = _kept_set_chunk_forward(z, flat_index[a:b].to(lm_head.device), support)
@@ -1053,10 +1095,7 @@ def grpo_chunked_hidden_states_logprobs(
             env_rows = os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip()
             max_rows_per_chunk = int(env_rows) if env_rows.isdigit() else 0
         kwargs = dict(extra_kwargs)
-        kwargs.setdefault(
-            "fp32_lm_head",
-            os.environ.get("UNSLOTH_VLLM_FP32_LM_HEAD", "0").strip().lower() in ("1", "true", "on", "yes"),
-        )
+        kwargs.setdefault("fp32_lm_head", grpo_fp32_lm_head_default())
         return grpo_kept_set_logprobs(
             hidden_states, lm_head, index, chunks,
             logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
@@ -3809,7 +3848,7 @@ def grpo_accumulated_loss(
             _zero3_head = (unsloth_zero3_gathered(lm_head), unsloth_zero3_gathered(lm_head_bias))
             lm_head, lm_head_bias = _zero3_head
 
-        # UNSLOTH_VLLM_FP32_LM_HEAD: one fp32 head copy per call, shared by every mini-batch kept for the loss.
+        # fp32 lm_head (UNSLOTH_VLLM_FP32_LM_HEAD): one fp32 head copy per call, shared by every mini-batch kept for the loss.
         # Skipped for the compiled scorer: given an fp32 copy it saves a fresh bf16 cast per call (eager paths don't).
         import inspect as _inspect
         from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax as _projector
@@ -3825,7 +3864,14 @@ def grpo_accumulated_loss(
             _backward_autocast_off = getattr(_functorch_config, "backward_pass_autocast", None) == "off"
         except Exception:
             _backward_autocast_off = False
-        _fp32_precast = _fp32_lm_head and (
+        # Only a scorer without a float32-out path takes a head copy: the fused kernels (_FUSED_FP32_LOGITS) and a
+        # 16-bit CUDA head (fp32_out_linear) project the head as it is, so a copy would make them fp32 GEMMs.
+        from unsloth_zoo.fused_losses import chunked_logprob as _chunked_lp
+        _fp32_copy = _fp32_lm_head and not (
+            _chunked_lp.fp32_out_linear_ok(lm_head)
+            and (_chunked_lp._FUSED_FP32_LOGITS or os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") != "1")
+        )
+        _fp32_precast = _fp32_copy and (
             os.environ.get("UNSLOTH_GRPO_LOGPROB_RECOMPUTE", "0") == "1"
             or _scorer_eager or _zero3_training()
             # Without autocast the compiled scorer keeps its fp32 head as given: share one pre-cast copy.
@@ -3837,7 +3883,7 @@ def grpo_accumulated_loss(
 
         def _fp32_bind(entropy = False):
             nonlocal lm_head, lm_head_bias
-            if not _fp32_lm_head or lm_head.dtype == torch.float32 or not (_fp32_precast or entropy):
+            if not _fp32_copy or lm_head.dtype == torch.float32 or not (_fp32_precast or entropy):
                 return
             # FSDP2 unshard / ZeRO-3 gather swap the objects; a grad-mode change needs a fresh cast too.
             key = (lm_head, lm_head_bias, torch.is_grad_enabled())

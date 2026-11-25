@@ -29,7 +29,7 @@ _ENVS = ("UNSLOTH_GRPO_CHUNKED_LOGPROBS", "UNSLOTH_VLLM_FP32_LM_HEAD", "UNSLOTH_
          "UNSLOTH_GRPO_KEPT_SET_RECOMPUTE")
 
 _CASES = {
-    "default": ({}, {}),
+    "default": ({"UNSLOTH_VLLM_FP32_LM_HEAD": "0"}, {}),
     "fp32_head": ({"UNSLOTH_VLLM_FP32_LM_HEAD": "1"}, {}),
     "truncated_support": ({}, {"support_top_k": 20}),
     # The kept-set scorer's kill switch restores the old one, which keeps every chunk's logits.
@@ -56,8 +56,24 @@ def _efficient_log_softmax(support, scorer):
     return ns
 
 
-def test_grpo_scorer_keeps_logits_truth_table(monkeypatch):
+@pytest.fixture(autouse = True)
+def _fp32_head_without_fused_fp32_logits(monkeypatch):
+    # Pins the hosts whose fused kernels give 16-bit logits (CPU, ROCm): there an fp32 head takes the old scorer.
+    from unsloth_zoo.fused_losses import chunked_logprob as cl
+    monkeypatch.setattr(cl, "_FUSED_FP32_LOGITS", False)
+
+
+def test_fp32_head_keeps_the_fused_scorer_where_it_is_float32_out(monkeypatch):
+    from unsloth_zoo.fused_losses import chunked_logprob as cl
     _set_env(monkeypatch, {})
+    monkeypatch.setattr(cl, "_FUSED_FP32_LOGITS", True)
+    assert not rr.grpo_scorer_keeps_logits(fp32_lm_head = True)
+    monkeypatch.setenv("UNSLOTH_VLLM_FP32_LM_HEAD", "1")
+    assert not rr.grpo_scorer_keeps_logits()
+
+
+def test_grpo_scorer_keeps_logits_truth_table(monkeypatch):
+    _set_env(monkeypatch, {"UNSLOTH_VLLM_FP32_LM_HEAD": "0"})
     assert not rr.grpo_scorer_keeps_logits()
     assert rr.grpo_scorer_keeps_logits({"support_top_k": 20})
     assert rr.grpo_scorer_keeps_logits({"support_top_p": 0.9})
