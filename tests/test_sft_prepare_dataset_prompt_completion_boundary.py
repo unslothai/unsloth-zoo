@@ -170,6 +170,8 @@ def test_boundary_starts_after_the_prompt_tail_when_it_cannot_line_up():
     assert _prompt_completion_boundary([1, 2, 30, 31, 32, 40, 42, 5, 6, 7, 9], [1, 2, 41, 5, 6, 7, 9, 50, 51]) == 7
     # A completion that echoes the prompt's last ids [5, 6, 7, 9] stays trained.
     assert _prompt_completion_boundary([1, 2, 30, 31, 32, 40, 42, 5, 6, 7, 9], [1, 2, 41, 5, 6, 7, 9, 5, 6, 7, 9, 50]) == 7
+    # An echo after a repeated tail id still loses to the match within the prompt's length.
+    assert _prompt_completion_boundary([1, 2, 3, 8, 5, 6, 7, 8], [10, 5, 6, 7, 8, 5, 6, 7, 8, 99]) == 5
     # An earlier turn ending like the prompt [11, 5, 6, 7, 9] is not taken for the prompt's end.
     assert _prompt_completion_boundary([1, 2, 30, 31, 3, 5, 6, 7, 9, 4, 8, 12, 5, 6, 7, 9], [1, 2, 33, 3, 5, 6, 7, 9, 4, 8, 12, 5, 6, 7, 9, 50]) == 15
 

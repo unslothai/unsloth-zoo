@@ -2841,6 +2841,8 @@ def _prompt_completion_boundary(prompt_ids, pc_ids, anchor = _PROMPT_COMPLETION_
     # next word): start after the place in pc_ids that matches the most of the prompt's tail, so an earlier turn's
     # header or a completion echoing the prompt's last ids is not picked.
     tails = [r for r in range(j, len(q) - anchor + 1) if q[r : r + anchor] == p[-anchor:]] if len(p) - i >= anchor else []
+    # A template that drops or re-spaces text cannot grow the rest of the prompt, so prefer matches ending within it.
+    tails = [r for r in tails if r + anchor <= j + len(p) - i] or tails
     if tails:
         def tail_match(r):
             k = anchor
